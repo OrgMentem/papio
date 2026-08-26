@@ -75,10 +75,12 @@ for the full pre-split extension history.
   ScienceDirect is one: hidden, its page arrives without a working **View PDF**
   link, so *papio* concluded that the site had changed and asked you to fetch
   the paper by hand — while your own browser, once you looked at it, showed the
-  link plainly. *papio* now brings that window into view without taking your
-  focus and fetches the page again, so it reads the page you would see. Nothing
-  is asked of you, and pages that draw correctly while hidden are still never
-  surfaced.
+  link plainly. *papio* now brings that window into view, makes this paper the
+  active tab inside it, and fetches the page again without taking your
+  foreground focus. The active-tab step matters even after the work window is
+  already open: a later paper can otherwise leave ScienceDirect in a
+  background tab with the same disabled link. Nothing is asked of you, and
+  pages that draw correctly while hidden are still never surfaced.
 - **A PDF reached through your library now stays connected to its paper when
   the publisher changes.** A library route can end at a different publisher
   host. After *papio* asked you to finish that download yourself, it remembered

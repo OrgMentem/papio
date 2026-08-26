@@ -9077,6 +9077,15 @@ test("a resolver-routed landing on a visible-required adapter reloads instead of
   expect(h.tabs.reloaded).toContain(tabID);
   // No verdict for the unpainted document: the reload's completion classifies.
   expect(h.frames().filter((f) => f.type === "provider_outcome")).toEqual([]);
+  // Another paper later becomes active in the same now-normal work window.
+  // ScienceDirect still withholds hydration from this background tab; the
+  // visible-window check alone used to return early and record a second drift.
+  h.tabs.patch(tabID, { active: false });
+  const reloadsBeforeBackgroundReturn = h.tabs.reloaded.length;
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/123`);
+  expect(h.tabs.snapshot(tabID)?.active).toBe(true);
+  expect(h.tabs.reloaded).toHaveLength(reloadsBeforeBackgroundReturn + 1);
+  expect(h.frames().filter((f) => f.type === "provider_outcome")).toEqual([]);
 });
 
 test("work window is reused across offers and recreated after the user closes it", async () => {

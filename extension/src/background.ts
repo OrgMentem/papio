@@ -5620,23 +5620,26 @@ export class Bridge {
    * reload was issued; the reload's own completion re-enters classification, so
    * this deliberately does not wait for the load.
    *
-   * Un-minimizing alone is not enough, and that is the whole reason this exists.
-   * Measured 2026-08-24 on one entitled ScienceDirect article driven through the
-   * institutional resolver: the hidden window yields a 32 KB document whose View
-   * PDF control carries no href and `aria-disabled="true"`, so `article` cannot
-   * match and the job parks as a drift. The same article in a visible tab at the
-   * same 5000 ms settle yields 262 KB with `href=…/pdfft` enabled. Revealing the
-   * window after that first hidden load leaves the unpainted document in place,
-   * so the page has to be fetched again while visible. `onPageCaptureRequest`
-   * already relies on this fact for fixture capture (`surfaceWorkTab` there),
-   * which is why diagnostic captures always looked healthy while real drives
-   * parked.
+   * Restoring the window is necessary but not sufficient once another paper
+   * becomes its active tab. Measured 2026-08-26 after the first ScienceDirect
+   * repair: a normal work window with this paper in a background tab still
+   * yielded a 28 KB document whose View PDF anchor was disabled and had no
+   * href. Activating that tab and reloading is the same positive visibility
+   * boundary as restoring the minimized window.
+   *
+   * Measured 2026-08-24 on one entitled ScienceDirect article driven through
+   * the institutional resolver: the hidden window yielded a 32 KB document
+   * whose View PDF control carried no href and `aria-disabled="true"`, while
+   * the same active article at the same 5000 ms settle yielded 262 KB with an
+   * enabled `/pdfft` href. Changing visibility after the first load leaves the
+   * unpainted document in place, so the page has to be fetched again.
+   * `onPageCaptureRequest` already relies on this fact for fixture capture,
+   * which is why diagnostic captures looked healthy while real drives parked.
    *
    * Focus is never taken: the window is restored with `focused: false` and the
-   * tab is only made active within it, so the operator keeps their foreground.
-   * The `minimized` test also terminates the reload cycle - the reload's own
-   * completion re-enters classification, and by then the window is `normal`, so
-   * this answers false without reloading again. */
+   * tab is made active only inside it, so the operator keeps their foreground.
+   * Once the window is normal AND the target tab is active, the reload's own
+   * completion returns false here and terminates the cycle. */
   private async revealForHydration(
     spec: AdapterSpec,
     tabID: number,
@@ -5645,19 +5648,29 @@ export class Bridge {
     const windowID = this.store.workWindowID;
     const windows = this.deps.windows;
     if (windowID === undefined || windows === undefined) return false;
+    let changed = false;
     try {
       const win = await windows.get(windowID);
-      if (win.state !== "minimized") return false;
-      await windows.update(windowID, { focused: false, state: "normal" });
+      if (win.state === "minimized") {
+        await windows.update(windowID, { focused: false, state: "normal" });
+        changed = true;
+      }
     } catch {
       // The handoff continues assisted if the dedicated window disappeared.
       return false;
     }
     try {
-      await this.deps.tabs.update?.(tabID, { active: true });
+      const tab = await this.deps.tabs.get(tabID);
+      if (tab.active !== true) {
+        if (this.deps.tabs.update === undefined) return false;
+        await this.deps.tabs.update(tabID, { active: true });
+        changed = true;
+      }
     } catch {
-      // A background tab in a visible window still paints; activation is a bonus.
+      // An unreadable or unactivatable background tab cannot be made paint.
+      return false;
     }
+    if (!changed) return false;
     try {
       await this.deps.tabs.reload(tabID);
     } catch {
