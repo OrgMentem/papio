@@ -868,6 +868,20 @@ type actionHandoffTarget struct {
 	Tracked bool
 }
 
+// browserFocusableActionKind reports whether the daemon can surface this action
+// through the browser bridge instead of the OS launcher. It MUST agree with
+// internal/browser's FocusHandoffs, which accepts both kinds.
+//
+// A manual download carries the institution's route, not the bare DOI, so
+// handing it to the OS browser opens the canonical publisher link that
+// paywalls it. The two halves of that widening shipped apart: the bridge
+// learned manual_download while this predicate still named only
+// openurl_handoff, so every manual download went to the launcher, queued no
+// frame, recorded no event, and left papio reporting a handoff it never made.
+func browserFocusableActionKind(kind string) bool {
+	return kind == "openurl_handoff" || kind == "manual_download"
+}
+
 func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor func(string) (config.Institution, bool), limit int) (targets []actionHandoffTarget, droppedForMissingJob int) {
 	jobs := make(map[string]job.Row, len(rows))
 	for _, row := range rows {
@@ -890,7 +904,7 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 		if !ok {
 			continue
 		}
-		targets = append(targets, actionHandoffTarget{JobID: action.JobID, URL: target, Tracked: action.Kind == "openurl_handoff"})
+		targets = append(targets, actionHandoffTarget{JobID: action.JobID, URL: target, Tracked: browserFocusableActionKind(action.Kind)})
 		if limit > 0 && len(targets) >= limit {
 			break
 		}

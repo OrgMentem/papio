@@ -297,6 +297,63 @@ func TestActionsOpenFocusesTrackedHandoffWithoutChangingJSONURLs(t *testing.T) {
 	}
 }
 
+// TestActionsOpenFocusesAManualDownloadThroughTheBrowser pins the CLI half of
+// the widening internal/browser's FocusHandoffs already made. The bridge
+// accepts manual_download; this predicate named only openurl_handoff, so the
+// job id never reached actions.open — the URL went to the OS launcher, no
+// frame was queued, no event was recorded, and papio reported a handoff it had
+// not made. Reproduced live at f20db3a on a parked delegated manual download
+// with a live holder: zero events.
+//
+// The assertion is the job id reaching actions.open, not the printed URL. A
+// test checking only the URL passes under the defect, because the launcher path
+// prints the same string.
+func TestActionsOpenFocusesAManualDownloadThroughTheBrowser(t *testing.T) {
+	action := job.HumanAction{
+		ID: 1, JobID: "job_manual_001", Kind: "manual_download", Status: "open",
+		Detail: "download the PDF yourself",
+	}
+	row := job.Row{
+		ID:    action.JobID,
+		State: job.StateAwaitingHuman,
+		Work:  work.Work{DOI: "10.1097/nne.0000000000001879"},
+	}
+	cfg := config.Config{Browser: config.Browser{OpenURLBase: "https://resolver.example.test/openurl"}}
+	var out, errOut bytes.Buffer
+	var focusParams map[string]any
+	root := NewInProcessRoot(&out, &errOut, cfg, func(_ context.Context, method string, params any, result any) error {
+		switch method {
+		case "actions.list":
+			*result.(*[]job.HumanAction) = []job.HumanAction{action}
+		case "jobs.list_v2":
+			*result.(*api.JobsPage) = api.JobsPage{Jobs: []job.Row{row}}
+		case "actions.open":
+			focusParams = params.(map[string]any)
+			*result.(*api.ActionsOpenResult) = api.ActionsOpenResult{Queued: 1, SessionLive: true}
+		default:
+			t.Fatalf("unexpected method %q", method)
+		}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "actions", "open"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("actions open: %v (%s)", err, errOut.String())
+	}
+	if !reflect.DeepEqual(focusParams, map[string]any{"job_ids": []string{action.JobID}}) {
+		t.Fatalf("actions.open params = %#v, want the manual download focused through the browser", focusParams)
+	}
+	var page struct {
+		URLs      []string `json:"urls"`
+		Truncated bool     `json:"truncated"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.URLs) != 1 || !strings.HasPrefix(page.URLs[0], "https://resolver.example.test/openurl") {
+		t.Fatalf("JSON URLs = %+v, want the institution's route", page)
+	}
+}
+
 func TestCommandGroupsRejectUnknownVerbs(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(context.Context, string, any, any) error {

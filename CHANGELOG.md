@@ -234,6 +234,17 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **`papio actions open` on a paper you download yourself now goes through your
+  browser.** These papers reach your library through the institution's route,
+  and *papio* had already taught the daemon to surface them in the tab you are
+  signed into. The CLI half never followed: it still treated only an OpenURL
+  handoff as something the browser could open, so it handed the link to the
+  operating system instead. That opens a plain browser window on the publisher's
+  own page, which paywalls it, and *papio* recorded nothing — so the paper
+  looked opened while nothing had been surfaced and no trace was kept. Both
+  halves now agree, and these papers are focused in the signed-in tab and
+  recorded like every other handoff. Measured on a parked paper with a live
+  browser: no event before the fix, a recorded handoff after it.
 - **A paper's stale tab can now be retired while the paper is still being
   worked on.** *papio* keeps one tab per paper it has acquired, and a retry
   opens a fresh one. Retiring the previous tab needs the daemon's permission,
