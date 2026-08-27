@@ -67,15 +67,34 @@
   your library without handling your university credentials.
 </p>
 
+<!-- demo-loop GIF slot: after the recording is approved, save it as
+     docs/assets/demo-loop.gif and replace this comment with:
+<p align="center">
+  <img alt="papio acquires a paywalled paper: one command, one sign-in tab in the user's own browser, a verified PDF filed into Zotero with a receipt" src="docs/assets/demo-loop.gif" width="720">
+</p>
+-->
+
+<p align="center">
+  <strong>Your browser, your credentials — <em>papio</em> never sees them.</strong><br>
+  <strong>The wrong PDF never gets filed: identity is verified first.</strong><br>
+  <strong>Runs entirely on your machine; every PDF carries a
+  <a href="https://orgmentem.github.io/papio/privacy/">receipt</a>.</strong>
+</p>
+
 ```bash
 brew install orgmentem/tap/papio                          # or grab a signed binary from Releases
 papio init                                                # guided setup: config, data folder, database, browser connector, health check
 papio doctor                                              # checks the whole chain, including the browser extension and zotio
-papio search "appropriate reliance on AI" --limit 20 --year-from 2026
 papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
+papio acquire --from-zotio                                # backfill: queue Zotero items that lack an attached PDF
 papio acquire --batch refs.bib                            # or RIS, CSL-JSON, NBIB — start from the library you already have
 papio status --follow                                     # working / awaiting-human / needs-review / ready / failed
 papio actions list                                        # open browser handoffs and identity reviews
+```
+
+```bash
+# Driving papio from a coding agent? One skill teaches it the whole surface:
+npx skills add OrgMentem/papio   # Claude Code, Cursor, Codex, Cline, opencode, …
 ```
 
 ---
@@ -93,9 +112,6 @@ without handling institutional credentials.
   **in your ordinary Chrome or Firefox session** — login, MFA, and CAPTCHAs stay
   human decisions. `papio` never stores institution credentials and never does
   subscription crawling.
-- **Repeatable jobs.** Every request becomes a job with a stable ID — running it
-  again is safe and won't duplicate, batches are capped, and budgets and
-  allowed/blocked sources are enforced by *papio*.
 - **Validation before filing.** Every candidate PDF is quarantined and checked
   for structure, identity, and, when needed, OCR. An ambiguous identity waits
   in `needs_review` for a human verdict instead of being imported automatically.
@@ -168,9 +184,9 @@ then available for Zotero's zotio preview path or a best-effort generic hook
 handoff
 ([browser handoff](https://orgmentem.github.io/papio/concepts/browser-handoff/)).
 
-The extension's inbox keeps itself current on its own — no manual refresh
-needed — and its popup adds a compact acquisition-history and impact
-summary, with a one-click, 12-week history view.
+The extension's inbox keeps its counts fresh on a 15-second poll while open
+and reloads when you return to its tab, and its popup adds a compact
+acquisition-history and impact summary, with a one-click, 12-week history view.
 
 ---
 
