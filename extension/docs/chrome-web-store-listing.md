@@ -32,6 +32,7 @@ This extension is papio's browser half: it runs the institutional OpenURL handof
 What makes it different:
 - No credentials stored, no bulk scraping. papio never keeps your institution logins, and it fetches only the papers you explicitly request — one at a time — never mass-downloading from publishers.
 - Page scanning happens only when you ask, one page at a time. When you ask papio to find papers on a page, it reads only the top frame of that one tab, only at the moment you click, and never in the background. Detection runs inside the page; the identifiers it found go only to the local papio app, and only the papers you select are acquired.
+- Session checks stay with the paper that needs them. While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host can schedule a check of the matching configured library resolver. The trigger reads no publisher page content and never sets the popup verdict. Other hosts and queued-only work do not authorize it.
 - Your real session, not a bot. Native messaging and extension APIs only — no WebDriver, no CDP, no stealth — so your browser never looks automated.
 - Validated before trusted. Every candidate PDF is checked for structure and identity; anything ambiguous parks for your review instead of importing the wrong paper.
 - Built for AI agents. papio runs as an MCP server, so an assistant can drive the whole workflow.
@@ -52,6 +53,7 @@ Docs: https://orgmentem.github.io/papio/
   script, and no all-sites grant. Detection is local page JavaScript; the
   detected identifiers and the page's bare origin go only to the local *papio*
   application, and the display-only citation labels never leave the browser.
+- **Institution-session check:** While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host can schedule a check of the matching configured library resolver. The trigger reads no publisher page content and never sets the popup's signed-in or signed-out verdict. A tracked papio tab returning from authentication can still provide existing, same-origin release evidence for queued work. The trigger adds no landing URL, page-derived publisher data, title, path, query, fragment, cookie, credential, or session token to storage or native messages. Ranked DOM and browser-storage observations on the configured library page remain the only source of the popup verdict.
 - **Host-page acknowledgement:** After a successful popup action, and only when
   transient acknowledgements are set to all requests, a three-second
   noninteractive chip is drawn in the acted-on page. It carries one of four fixed
@@ -69,13 +71,13 @@ Docs: https://orgmentem.github.io/papio/
 | --- | --- |
 | `nativeMessaging` | Sole communication channel: connects to the local `com.orgmentem.papio` daemon to receive a job and report the download result. |
 | `downloads` | Performs the single requested PDF download per acquisition job. |
-| `tabs` / `activeTab` | Opens and manages the one handoff tab and correlates the download with the job. |
+| `tabs` / `activeTab` | Opens and manages the handoff tab, correlates its download, and observes completed HTTPS navigation while that job waits for sign-in. Only a hostname matching the job's declared provider can schedule the new resolver check; queued-only work does not authorize this trigger. |
 | `tabGroups` | Groups the handoff tab into a collapsed "papio" tab group in the user's own window, so a provider sign-in/download flow stays visually separate from their own tabs. |
-| `scripting` | Runs a small routine on the current page to locate the requested paper's download link, to detect paper identifiers when the user explicitly starts a scan, and to draw a three-second, noninteractive confirmation chip in the page after a popup action succeeds. |
-| `storage` | Stores extension settings and short-lived job/tab state across service-worker suspension. |
-| `alarms` | Schedules reconnect backoff to the local daemon without a persistently awake service worker. |
-| Host permissions (library resolver domains) | Read the library discovery/resolver pages needed to route a job to the right licensed source. |
-| Optional host permissions (publisher domains) | Access a publisher site only when a job needs its licensed PDF; requested at runtime, not at install. |
+| `scripting` | Runs a small routine on the requested provider page to locate its download link, on a configured library resolver to check session indicators while a paper waits for sign-in, on the current page when the user explicitly starts a scan, and on the acted-on page to draw a three-second confirmation. |
+| `storage` | Stores settings and short-lived job/tab state across service-worker suspension. An active institutional job can retain one configured bare resolver origin and one pending-session-check reason; no publisher landing or identity-provider data is added. |
+| `alarms` | Schedules reconnect backoff and bounded resolver keepalive checks without a persistently awake service worker. |
+| Host permissions (library resolver domains) | Read the configured library discovery/resolver page to route a requested paper and check that resolver session while the paper waits for sign-in. |
+| Optional host permissions (publisher domains) | Access a publisher page only when a job needs its licensed PDF; requested at runtime, not at install. The session trigger reads only a completed landing hostname from the `tabs` event and compares it with that job's declared providers; it does not read page content. |
 | Remote code use | None. All code is bundled and shipped in the package; no remote code is loaded. |
 
 ## Store visuals (screenshots + promo tiles)

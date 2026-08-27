@@ -159,6 +159,11 @@ export interface ActiveJob {
    * navigations locally. Not sensitive — these are the resolver's declared
    * destinations, never an IdP address. */
   provider_hosts: string[];
+  /** Configured institution resolver for this offer. A normalized bare HTTPS
+   * origin only; never a provider landing, IdP address, path, or permission
+   * pattern. Persisted so an auth-pending job keeps its institution binding
+   * across an MV3 worker restart that clears the offer URL map. */
+  institution_origin?: string;
   /** Access policy retained from the offer for local authority checks.
    * Only the exact `"delegated"` value authorizes autonomous effects.
    * Legacy jobs without this field remain parked until explicit operator
@@ -910,9 +915,9 @@ export function clearPendingDelivery(
  * page identity; version 7 (Slice 3 of surface-lifecycle-plan.md) drops the
  * `federatedLoginOwners` cross-job claim map and its per-job
  * `waiting_for_session`/`waiting_for_session_key`/`waiting_deadline`
- * markers — superseded by the daemon-arbitrated authentication-claim
- * protocol. */
-export const MANAGED_STATE_VERSION = 7;
+ * markers; version 8 adds a configured bare institution origin to active
+ * jobs, without retaining the worker-local offer URL. */
+export const MANAGED_STATE_VERSION = 8;
 const STORAGE_KEY = "papio_state_v1";
 type UnknownRecord = Record<string, unknown>;
 
@@ -1156,6 +1161,14 @@ function migratedJob(value: ActiveJob): ActiveJob {
   delete migrated.institution_claim_key;
   delete migrated.waiting_for_session_key;
   delete migrated.direct_envelope;
+  const institutionOrigin = safeOrigin(raw.institution_origin);
+  delete (migrated as unknown as UnknownRecord).institution_origin;
+  if (
+    institutionOrigin !== undefined &&
+    institutionOrigin.startsWith("https://")
+  ) {
+    migrated.institution_origin = institutionOrigin;
+  }
   // The pin the picker replaced. A blob persisted before the cutover still
   // carries it through the spread above, and it must not survive as untyped
   // ambient delivery authority. Only the pin justified a non-handoff
@@ -1585,6 +1598,7 @@ export function migrateManagedState(raw: unknown): StoreShape {
     version !== 4 &&
     version !== 5 &&
     version !== 6 &&
+    version !== 7 &&
     version !== MANAGED_STATE_VERSION
   )
     return emptyStore();

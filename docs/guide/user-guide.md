@@ -409,17 +409,33 @@ it does not automate your credentials.
 
 The popup's **Institution session** card reports the browser-local resolver
 state: **Signed in**, **Signed in <age> - due a recheck**, **Signed out or
-expired**, **Sign-in needed - papio paused**, or **Keep-warm off**. When every
-configured institution is signed in and freshly verified, the card says **All
-institutions signed in**. **Sign in now** focuses the ordinary resolver
-tab when a library route is configured. Sign in, complete any MFA or other
-institution step yourself, and return to the provider page; *papio* never fills
-credentials or copies cookies.
+expired**, **Sign-in needed - papio paused**, or **Keep-warm off**. An
+inconclusive new check says what papio could not verify instead of repeating an
+older signed-in or signed-out verdict. When every configured institution is
+signed in and freshly verified, the card says **All institutions signed in**.
+
+If a paper is waiting for sign-in, a completed HTTPS navigation on that
+paper's declared publisher host schedules a fresh check of the matching
+library resolver. The extension reads no publisher page content for this
+trigger. The publisher page cannot set the popup's signed-in or signed-out
+verdict. A tracked *papio* tab returning from authentication can still release
+same-institution queued work through its existing job-scoped evidence path.
+Other hosts, queued-only papers, unknown bindings, and ambiguous institutions
+do not authorize this publisher-triggered check. A same-document sign-in with
+no completed navigation falls back to the normal keep-warm refresh cycle.
+
+If the browser still needs access to the configured resolver, the card says
+**Library page access required** and offers **Allow** for that institution
+only. The permission is separate from the session verdict, so a missing grant
+does not mean you are signed out. **Sign in** focuses the ordinary resolver tab
+when a library route is configured. Sign in, complete any MFA or other
+institution step yourself, and return to the provider page; *papio* never
+fills credentials or copies cookies.
 
 The **Options** page controls this browser-local behavior. **Keep-warm
 session** enables or pauses refreshes of the pinned resolver tab, and
 **Refresh interval** chooses how often it is refreshed (2–30 minutes). The
-card and the options controls describe this browser's session only; they do not
+card and options controls describe this browser's session only; they do not
 change daemon access policy or send login details anywhere.
 
 ### Send a PDF already open in the browser

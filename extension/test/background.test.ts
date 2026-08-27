@@ -562,12 +562,17 @@ function makeHarness(
         pageBulkScans.current = store;
       },
     },
-    // No registered adapters and no granted host: these behavioural tests stay
-    // out of the adapter action path. Adapter mapping is covered in
-    // adapters.test.ts.
+    // Resolver access follows the daemon's configured exact origins by
+    // default. Provider hosts remain ungranted unless a test opts in.
     adapterSpecs: [],
     scripting: { executeScript: async () => [] },
-    permissions: { contains: async () => false },
+    permissions: {
+      contains: async ({ origins }) =>
+        origins.length === 1 &&
+        (backend.store.resolverOrigins ?? []).some(
+          (origin) => `${origin}/*` === origins[0],
+        ),
+    },
     settings: {
       getTermsConsent: async () => undefined,
       setTermsConsent: async () => {},
@@ -3107,7 +3112,6 @@ test("Slice 0: an offline wake releases nothing; the next online wake releases",
     noteResolverActivated: () => {},
     markDirty: async () => {},
     probeForeground: async () => {},
-    probeOriginAutomatically: async () => {},
     notifyConfiguredOriginsChanged: () => {},
     noteResolverNavigation: () => {},
     noteTabRemoved: () => {},
@@ -3162,7 +3166,6 @@ test("Slice 0: an online wake paces exactly one release even with four queued re
     noteResolverActivated: () => {},
     markDirty: async () => {},
     probeForeground: async () => {},
-    probeOriginAutomatically: async () => {},
     notifyConfiguredOriginsChanged: () => {},
     noteResolverNavigation: () => {},
     noteTabRemoved: () => {},
@@ -3212,7 +3215,6 @@ test("a permission grant reaches the keepalive manager", async () => {
     noteResolverActivated: () => {},
     markDirty: async () => {},
     probeForeground: async () => {},
-    probeOriginAutomatically: async () => {},
     notifyConfiguredOriginsChanged: () => {},
     noteResolverNavigation: () => {},
     noteTabRemoved: () => {},
@@ -7274,7 +7276,7 @@ test("a recent auth return drains durable queued handoffs during startup", async
 
 test("keepalive authentication evidence releases a restored queued handoff", async () => {
   const jobID = "job_0001a_keepalive_queue";
-  const queuedURL = "https://resolver.example.edu/openurl?keepalive=1";
+  const queuedURL = "https://resolver.example.edu/login/openurl?keepalive=1";
   const h = makeHarness({
     activeJobs: [
       {
@@ -7284,12 +7286,16 @@ test("keepalive authentication evidence releases a restored queued handoff", asy
         expires_at: 2,
         status: "queued",
         provider_hosts: [PROVIDER_HOST],
+        institution_origin: "https://resolver.example.edu",
       },
     ],
   });
 
   seedOfferURLs(h, { [jobID]: queuedURL });
   await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://resolver.example.edu"] }),
+  );
   expect(h.tabs.created).toEqual([]);
   await h.bridge.recordFreshSessionEvidence(
     freshEvidence(h, "https://resolver.example.edu"),
@@ -15636,7 +15642,7 @@ test("currentSessionEvidence for a job on B is not labelled warm or fresh by A's
   ).toMatchObject({ session_evidence: "none" });
 });
 
-test("an institutional landing marks its origin dirty, releases and reloads its own origin, and never touches another's", async () => {
+test("a tracked institutional landing rechecks, releases, and reloads only its origin", async () => {
   const landingJobID = "job_institutional_landing";
   const peerJobID = "job_institutional_landing_peer";
   const otherOriginJobID = "job_institutional_landing_other_origin";
@@ -15651,7 +15657,7 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
         tab_id: landingTabID,
         offered_at: 1,
         expires_at: 2,
-        status: "accepted",
+        status: "auth_pending",
         requires_auth: true,
         provider_hosts: [PROVIDER_HOST],
       },
@@ -15676,25 +15682,17 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
     ],
   });
   h.tabs.seed({ id: landingTabID, url: OPENURL });
-  const dirtied: string[] = [];
   const probedForeground: (string | undefined)[] = [];
-  const probedAutomatically: string[] = [];
+  const institutionalRechecks: string[] = [];
   h.bridge.attachKeepalive({
     getSnapshot: () => ({ pausedForReauth: false }),
     noteResolverActivated: () => {},
-    markDirty: async (origin: string) => {
-      dirtied.push(origin);
-    },
-    // issue C: recordInstitutionalSession fires from a tab NAVIGATION, an
-    // automatic path, not an operator action, so it must not take the 2s
-    // operator floor (MIN_FOREGROUND_PROBE_SPACING_MS in keepalive.ts). This
-    // spy still defines probeForeground so a regression back to the
-    // operator entry point fails loudly instead of silently no-op'ing.
+    markDirty: async () => {},
     probeForeground: async (origin?: string) => {
       probedForeground.push(origin);
     },
-    probeOriginAutomatically: async (origin: string) => {
-      probedAutomatically.push(origin);
+    noteInstitutionalLanding: async (origin: string) => {
+      institutionalRechecks.push(origin);
     },
     notifyConfiguredOriginsChanged: () => {},
     noteResolverNavigation: () => {},
@@ -15718,11 +15716,9 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
   await h.tabs.completeNavigation(landingTabID, OPENURL);
 
   // A landing is still only a reason to look again, never itself a verdict:
-  // exactly one dirty-mark and one probe, scoped to the landing's own
-  // origin, and routed through the automatic entry point — never the
-  // operator-floor probeForeground (issue C).
-  expect(dirtied).toEqual(["https://resolver.example.edu"]);
-  expect(probedAutomatically).toEqual(["https://resolver.example.edu"]);
+  // exactly one demand-gated recheck reaches the keepalive manager for the
+  // job's configured origin. The operator-floor probe remains unused.
+  expect(institutionalRechecks).toEqual(["https://resolver.example.edu"]);
   expect(probedForeground).toEqual([]);
 
   // But papio itself drove this tab past authentication onto a page resolving
@@ -15748,6 +15744,210 @@ test("an institutional landing marks its origin dirty, releases and reloads its 
   expect(h.tabs.reloaded).toEqual([]);
 });
 
+async function untrackedInstitutionalRechecks(
+  activeJobs: ActiveJob[],
+  landingURL: string,
+): Promise<string[]> {
+  const h = makeHarness({ ...emptyStore(), activeJobs });
+  const rechecks: string[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverActivated: () => {},
+    noteInstitutionalLanding: async (origin: string) => {
+      rechecks.push(origin);
+    },
+    notifyConfiguredOriginsChanged: () => {},
+    noteResolverNavigation: () => {},
+    noteTabRemoved: () => {},
+    onWake: async () => {},
+  } as unknown as KeepaliveManager);
+  await h.bridge.start();
+  const resolverOrigins = [
+    ...new Set(
+      activeJobs
+        .map((job) => job.institution_origin)
+        .filter((origin): origin is string => origin !== undefined),
+    ),
+  ];
+  await h.port.inbound(helloAck({ resolver_origins: resolverOrigins }));
+  h.tabs.seed({ id: 991, url: landingURL });
+  await h.tabs.completeNavigation(991, landingURL);
+  return rechecks;
+}
+
+test("a settled untracked provider landing rechecks its one parked institution", async () => {
+  const origin = "https://resolver.example.edu";
+  const rechecks = await untrackedInstitutionalRechecks(
+    [
+      {
+        job_id: "job_untracked_landing",
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "auth_pending",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+        institution_origin: origin,
+      },
+    ],
+    `https://${PROVIDER_HOST}/stable/123`,
+  );
+  expect(rechecks).toEqual([origin]);
+});
+
+test("queued requires-auth work does not authorize a publisher recheck", async () => {
+  const rechecks = await untrackedInstitutionalRechecks(
+    [
+      {
+        job_id: "job_queued_landing",
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "queued",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+        institution_origin: "https://resolver.example.edu",
+      },
+    ],
+    `https://${PROVIDER_HOST}/stable/123`,
+  );
+  expect(rechecks).toEqual([]);
+});
+
+test("an unrelated completed page never triggers a resolver recheck", async () => {
+  const rechecks = await untrackedInstitutionalRechecks(
+    [
+      {
+        job_id: "job_unrelated_landing",
+        tab_id: -1,
+        offered_at: 1,
+        expires_at: 2,
+        status: "auth_pending",
+        requires_auth: true,
+        provider_hosts: [PROVIDER_HOST],
+        institution_origin: "https://resolver.example.edu",
+      },
+    ],
+    "https://mail.example.com/inbox",
+  );
+  expect(rechecks).toEqual([]);
+});
+
+test("one provider mapped to two parked institutions fails closed", async () => {
+  const base: Omit<ActiveJob, "job_id" | "institution_origin"> = {
+    tab_id: -1,
+    offered_at: 1,
+    expires_at: 2,
+    status: "auth_pending",
+    requires_auth: true,
+    provider_hosts: [PROVIDER_HOST],
+  };
+  const rechecks = await untrackedInstitutionalRechecks(
+    [
+      {
+        ...base,
+        job_id: "job_ambiguous_a",
+        institution_origin: "https://resolver-a.example.edu",
+      },
+      {
+        ...base,
+        job_id: "job_ambiguous_b",
+        institution_origin: "https://resolver-b.example.edu",
+      },
+    ],
+    `https://${PROVIDER_HOST}/stable/123`,
+  );
+  expect(rechecks).toEqual([]);
+});
+
+test("one missing binding among matching parked jobs fails closed", async () => {
+  const base: Omit<ActiveJob, "job_id" | "institution_origin"> = {
+    tab_id: -1,
+    offered_at: 1,
+    expires_at: 2,
+    status: "auth_pending",
+    requires_auth: true,
+    provider_hosts: [PROVIDER_HOST],
+  };
+  const rechecks = await untrackedInstitutionalRechecks(
+    [
+      {
+        ...base,
+        job_id: "job_bound",
+        institution_origin: "https://resolver.example.edu",
+      },
+      {
+        ...base,
+        job_id: "job_unbound",
+      },
+    ],
+    `https://${PROVIDER_HOST}/stable/123`,
+  );
+  expect(rechecks).toEqual([]);
+});
+
+test("a tracked provider return uses its persisted institution after worker restart", async () => {
+  const origin = "https://resolver.example.edu";
+  const tabID = 992;
+  const providerURL = `https://${PROVIDER_HOST}/stable/restarted`;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: "job_tracked_restart",
+        tab_id: tabID,
+        offered_at: 1,
+        expires_at: 2,
+        status: "auth_pending",
+        requires_auth: true,
+        access_mode: "delegated",
+        provider_hosts: [PROVIDER_HOST],
+        institution_origin: origin,
+      },
+    ],
+  });
+  const rechecks: Array<[string, string | undefined]> = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverActivated: () => {},
+    noteInstitutionalLanding: async (
+      target: string,
+      cause?: string,
+    ) => {
+      rechecks.push([target, cause]);
+    },
+    notifyConfiguredOriginsChanged: () => {},
+    noteResolverNavigation: () => {},
+    noteTabRemoved: () => {},
+    onWake: async () => {},
+  } as unknown as KeepaliveManager);
+  h.tabs.seed({ id: tabID, url: providerURL });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ resolver_origins: [origin] }));
+
+  await h.tabs.completeNavigation(tabID, providerURL);
+
+  expect(rechecks).toContainEqual([origin, "tracked_auth_return"]);
+});
+
+test("a job offer persists its configured institution origin without its URL", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://resolver.example.edu"] }),
+  );
+  await h.port.inbound(jobOffer("job_persisted_institution"));
+
+  expect(
+    h.backend.store.activeJobs.find(
+      (job) => job.job_id === "job_persisted_institution",
+    ),
+  ).toMatchObject({
+    institution_origin: "https://resolver.example.edu",
+  });
+  expect(JSON.stringify(h.backend.store.activeJobs)).not.toContain("/openurl");
+});
+
 test("reloadAuthenticationHandoffs reloads only the evidenced origin's tabs, leaving another institution's IdP tab alone", async () => {
   const jobA = "job_reload_scope_a";
   const jobB = "job_reload_scope_b";
@@ -15768,6 +15968,7 @@ test("reloadAuthenticationHandoffs reloads only the evidenced origin's tabs, lea
         status: "accepted",
         provider_hosts: [PROVIDER_HOST],
         access_mode: "delegated",
+        institution_origin: originA,
       },
       {
         job_id: jobB,
@@ -15777,16 +15978,16 @@ test("reloadAuthenticationHandoffs reloads only the evidenced origin's tabs, lea
         status: "accepted",
         provider_hosts: ["link.springer.com"],
         access_mode: "delegated",
+        institution_origin: originB,
       },
     ],
   });
   h.tabs.seed({ id: tabA, url: idpA });
   h.tabs.seed({ id: tabB, url: idpB });
   await h.bridge.start();
-  seedOfferURLs(h, {
-    [jobA]: `${originA}/openurl?ctx=a`,
-    [jobB]: `${originB}/openurl?ctx=b`,
-  });
+  await h.port.inbound(
+    helloAck({ resolver_origins: [originA, originB] }),
+  );
 
   await h.bridge.recordFreshSessionEvidence(
     freshEvidence(h, originA, "live_tab"),

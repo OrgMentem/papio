@@ -913,6 +913,10 @@ function isOriginSnapshot(value: unknown): value is KeepaliveOriginSnapshot {
       snapshot["lastProbeOutcome"] === "no_tab" ||
       snapshot["lastProbeOutcome"] === "partial_scan" ||
       snapshot["lastProbeOutcome"] === "conflict") &&
+    (snapshot["hostPermission"] === undefined ||
+      snapshot["hostPermission"] === "granted" ||
+      snapshot["hostPermission"] === "required" ||
+      snapshot["hostPermission"] === "unknown") &&
     (snapshot["lastVerdictAt"] === null || typeof snapshot["lastVerdictAt"] === "number") &&
     typeof snapshot["checking"] === "boolean" &&
     typeof snapshot["likelyAuthenticated"] === "boolean" &&
@@ -961,6 +965,10 @@ function isSessionState(value: unknown): value is PopupSessionState {
       state["lastProbeOutcome"] === "no_tab" ||
       state["lastProbeOutcome"] === "partial_scan" ||
       state["lastProbeOutcome"] === "conflict") &&
+    (state["hostPermission"] === undefined ||
+      state["hostPermission"] === "granted" ||
+      state["hostPermission"] === "required" ||
+      state["hostPermission"] === "unknown") &&
     (state["lastVerdictAt"] === undefined ||
       state["lastVerdictAt"] === null ||
       typeof state["lastVerdictAt"] === "number") &&
@@ -1219,7 +1227,65 @@ function sessionEvidenceDetail(state: PopupSessionState): string {
 export interface SessionCardState {
   label: string;
   detail: string;
-  action: "none" | "signin";
+  action: "none" | "signin" | "grant";
+}
+
+function hasNewerInconclusiveAttempt(
+  state: Pick<
+    PopupSessionState,
+    "lastProbeOutcome" | "lastProbeAt" | "lastVerdictAt"
+  >,
+): boolean {
+  const outcome = state.lastProbeOutcome;
+  if (outcome === undefined || outcome === "markers") return false;
+  return (
+    typeof state.lastProbeAt === "number" &&
+    (typeof state.lastVerdictAt !== "number" ||
+      state.lastProbeAt > state.lastVerdictAt)
+  );
+}
+
+function latestInconclusiveCard(
+  state: PopupSessionState,
+): SessionCardState | undefined {
+  const outcome = state.lastProbeOutcome;
+  if (outcome === undefined || outcome === "markers") return undefined;
+  const verdict = state.verdict ?? (state.authenticated ? "in" : "unknown");
+  if (verdict !== "unknown" && !hasNewerInconclusiveAttempt(state)) {
+    return undefined;
+  }
+  switch (outcome) {
+    case "no_tab":
+      return {
+        label: "No library page open — open your library to verify",
+        detail: "",
+        action: "signin",
+      };
+    case "no_markers":
+      return {
+        label: "Signed-in state unclear on this page",
+        detail: "papio inspected your library tab but found no sign-in indicators",
+        action: "signin",
+      };
+    case "scan_failed":
+      return {
+        label: "papio couldn't read the library page — open it to retry",
+        detail: "",
+        action: "signin",
+      };
+    case "partial_scan":
+      return {
+        label: "Too many library tabs to check reliably",
+        detail: "",
+        action: "signin",
+      };
+    case "conflict":
+      return {
+        label: "Your library tabs disagree — open your library page",
+        detail: "",
+        action: "signin",
+      };
+  }
 }
 
 /** Convert a session snapshot into mutually exclusive card copy. In
@@ -1236,6 +1302,13 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
     };
   }
   const detail = sessionEvidenceDetail(state);
+  if (state.hostPermission === "required") {
+    return {
+      label: "Library page access required",
+      detail: `Allow papio to check ${resolverHost(state.resolverOrigin)}`,
+      action: "grant",
+    };
+  }
   if (!state.enabled) {
     return {
       label: "Keep-warm off",
@@ -1259,54 +1332,16 @@ export function deriveSessionCardState(state: PopupSessionState | undefined): Se
     };
   }
   const verdict = state.verdict ?? (state.authenticated ? "in" : "unknown");
-  // An "unknown" verdict never had a decisive commit — commitOriginProbe()
-  // (keepalive.ts) advances lastProbeAt/lastProbeOutcome for an
-  // inconclusive attempt but deliberately leaves lastVerdictAt untouched,
-  // so "unknown" is ALWAYS stale by the freshness check below. Resolving
-  // it here, before that check, is what turns a completed but
-  // inconclusive probe (no_tab/no_markers/etc.) into its own honest
-  // terminal label instead of the eternal "Checking session…" that block
-  // used to produce for every origin that has never landed a decisive
-  // verdict — the steady state whenever no library tab is open.
+  // A completed inconclusive attempt is newer information than a preserved
+  // verdict. It owns the presentation without mutating that verdict.
+  const inconclusive = latestInconclusiveCard(state);
+  if (inconclusive !== undefined) return inconclusive;
   if (verdict === "unknown") {
-    switch (state.lastProbeOutcome) {
-      case "no_tab":
-        return {
-          label: "No library page open — open your library to verify",
-          detail,
-          action: "signin",
-        };
-      case "no_markers":
-        return {
-          label: "Signed-in state unclear on this page",
-          detail: "papio inspected your library tab but found no sign-in indicators",
-          action: "signin",
-        };
-      case "scan_failed":
-        return {
-          label: "papio couldn't read the library page — check site access in Options",
-          detail,
-          action: "signin",
-        };
-      case "partial_scan":
-        return {
-          label: "Too many library tabs to check reliably",
-          detail,
-          action: "signin",
-        };
-      case "conflict":
-        return {
-          label: "Your library tabs disagree — open your library page",
-          detail,
-          action: "signin",
-        };
-      default:
-        return {
-          label: "Session unknown — open your library page to verify",
-          detail,
-          action: "signin",
-        };
-    }
+    return {
+      label: "Session unknown — open your library page to verify",
+      detail,
+      action: "signin",
+    };
   }
   // Only "in"/"out" verdicts reach here, and only a decisive commit ever
   // sets one, so lastVerdictAt is always a number below — an AGED verdict,
@@ -1479,7 +1514,110 @@ function staleDecisiveSessionKey(state: PopupSessionState | undefined): string |
  * re-delivered by every session poll must not resurrect a faded notice. */
 let sessionNoticeShownKey: string | undefined;
 
-const sessionSignInHandlers = new WeakMap<HTMLButtonElement, () => Promise<void>>();
+interface SessionButtonBinding {
+  run(): Promise<void>;
+  idleLabel: string;
+  pendingLabel: string;
+  failureLabel: string;
+  ariaLabel: string;
+  ownerKey: string;
+}
+
+const sessionActionHandlers = new WeakMap<
+  HTMLButtonElement,
+  SessionButtonBinding
+>();
+
+interface SessionActionState {
+  pending: boolean;
+  pendingLabel: string;
+  error?: string;
+}
+
+const sessionActionStates = new Map<string, SessionActionState>();
+
+function bindSessionButton(
+  button: HTMLButtonElement,
+  status: HTMLElement,
+  binding: SessionButtonBinding | undefined,
+): void {
+  button.hidden = binding === undefined;
+  if (binding === undefined) {
+    button.disabled = true;
+    sessionActionHandlers.delete(button);
+    return;
+  }
+  sessionActionHandlers.set(button, binding);
+  const actionState = sessionActionStates.get(binding.ownerKey);
+  button.disabled = actionState?.pending === true;
+  button.textContent =
+    actionState?.pending === true
+      ? actionState.pendingLabel
+      : binding.idleLabel;
+  if (actionState?.error !== undefined) {
+    status.textContent = actionState.error;
+  }
+  button.setAttribute("aria-label", binding.ariaLabel);
+  button.setAttribute("aria-describedby", status.id);
+  if (button.dataset.wired === "1") return;
+  button.dataset.wired = "1";
+  button.addEventListener("click", () => {
+    const current = sessionActionHandlers.get(button);
+    if (
+      current === undefined ||
+      sessionActionStates.get(current.ownerKey)?.pending === true
+    ) {
+      return;
+    }
+    sessionActionStates.set(current.ownerKey, {
+      pending: true,
+      pendingLabel: current.pendingLabel,
+    });
+    button.disabled = true;
+    button.textContent = current.pendingLabel;
+    void current.run().then(
+      () => {
+        sessionActionStates.delete(current.ownerKey);
+        const latest = sessionActionHandlers.get(button);
+        if (latest?.ownerKey !== current.ownerKey) return;
+        button.disabled = false;
+        button.textContent = latest.idleLabel;
+      },
+      (error: unknown) => {
+        const message =
+          error instanceof Error && error.message.length > 0
+            ? error.message
+            : current.failureLabel;
+        sessionActionStates.set(current.ownerKey, {
+          pending: false,
+          pendingLabel: current.pendingLabel,
+          error: message,
+        });
+        const latest = sessionActionHandlers.get(button);
+        if (latest?.ownerKey !== current.ownerKey) return;
+        button.disabled = false;
+        button.textContent = latest.idleLabel;
+        status.textContent = message;
+      },
+    );
+  });
+}
+
+const renderedSessionOrigins = new Set<string>();
+
+export async function grantInstitutionAccess(origin: string): Promise<void> {
+  if (
+    !isBareHTTPSOrigin(origin) ||
+    !renderedSessionOrigins.has(origin)
+  ) {
+    throw new Error("This institution is no longer configured");
+  }
+  const granted = await chrome.permissions.request({
+    origins: [`${origin}/*`],
+  });
+  if (!granted) throw new Error("Library page access was not granted");
+  await refresh();
+}
 
 function clearSessionNoticeTimers(): void {
   clearTimeout(sessionNoticeFadeTimer);
@@ -1501,6 +1639,7 @@ function renderSessionRows(
   container: HTMLElement,
   rows: readonly SessionRowState[],
   onSignIn: (origin?: string) => Promise<void>,
+  onGrant: (origin: string) => Promise<void>,
 ): void {
   container.replaceChildren();
   rows.forEach((row, index) => {
@@ -1510,7 +1649,8 @@ function renderSessionRows(
     copy.className = "institution-session-origin-copy";
     const host = doc.createElement("span");
     host.className = "institution-session-origin";
-    host.textContent = resolverHost(row.origin);
+    const hostLabel = resolverHost(row.origin);
+    host.textContent = hostLabel;
     const status = doc.createElement("p");
     status.className = "institution-session-status";
     status.id = `institution-session-status-${index}`;
@@ -1518,40 +1658,32 @@ function renderSessionRows(
     status.setAttribute("aria-live", "polite");
     status.textContent = sessionRowText(row);
     copy.append(host, status);
-    const signIn = doc.createElement("button");
-    signIn.className = "primary";
-    signIn.type = "button";
-    signIn.textContent = "Sign in";
-    signIn.setAttribute("aria-label", `Sign in to ${resolverHost(row.origin)}`);
-    signIn.setAttribute("aria-describedby", status.id);
-    signIn.hidden = row.action === "none";
-    signIn.disabled = row.action === "none";
-    sessionSignInHandlers.set(signIn, () => onSignIn(row.origin));
-    signIn.dataset.origin = row.origin;
-    if (!signIn.dataset.wired) {
-      signIn.dataset.wired = "1";
-      signIn.addEventListener("click", () => {
-        const action = sessionSignInHandlers.get(signIn);
-        if (action === undefined) return;
-        signIn.disabled = true;
-        signIn.textContent = "Opening…";
-        void action().then(
-          () => {
-            signIn.disabled = false;
-            signIn.textContent = "Sign in";
-          },
-          (error: unknown) => {
-            signIn.disabled = false;
-            signIn.textContent = "Sign in";
-            status.textContent =
-              error instanceof Error && error.message.length > 0
-                ? error.message
-                : "Could not open the institution sign-in";
-          },
-        );
-      });
-    }
-    item.append(copy, signIn);
+    const button = doc.createElement("button");
+    button.className = "primary";
+    button.type = "button";
+    button.id = `institution-session-action-${hostLabel.replace(/[^a-z0-9]+/gi, "-")}`;
+    const binding =
+      row.action === "grant"
+        ? {
+            run: () => onGrant(row.origin),
+            idleLabel: "Allow",
+            pendingLabel: "Requesting…",
+            failureLabel: "Could not request library page access",
+            ariaLabel: `Allow papio to check ${hostLabel}`,
+            ownerKey: row.origin,
+          }
+        : row.action === "signin"
+          ? {
+              run: () => onSignIn(row.origin),
+              idleLabel: "Sign in",
+              pendingLabel: "Opening…",
+              failureLabel: "Could not open the institution sign-in",
+              ariaLabel: `Sign in to ${hostLabel}`,
+              ownerKey: row.origin,
+            }
+          : undefined;
+    bindSessionButton(button, status, binding);
+    item.append(copy, button);
     container.append(item);
   });
 }
@@ -1583,6 +1715,7 @@ export function renderInstitutionSession(
   state: PopupSessionState | undefined,
   onSignIn: (origin?: string) => Promise<void> = openInstitutionSignIn,
   jobs: readonly ActiveJob[] = [],
+  onGrant: (origin: string) => Promise<void> = grantInstitutionAccess,
 ): void {
   const card = doc.getElementById("institution-session");
   const status = doc.getElementById("institution-session-status");
@@ -1600,6 +1733,16 @@ export function renderInstitutionSession(
     !(notice instanceof HTMLElement)
   ) {
     return;
+  }
+  renderedSessionOrigins.clear();
+  for (const configured of state?.origins ?? []) {
+    renderedSessionOrigins.add(configured.origin);
+  }
+  if (
+    state?.resolverOrigin !== undefined &&
+    state.resolverOrigin !== null
+  ) {
+    renderedSessionOrigins.add(state.resolverOrigin);
   }
   card.dataset.hasSession = state === undefined ? "false" : "true";
   card.hidden = state === undefined && waiting?.hidden !== false;
@@ -1632,6 +1775,11 @@ export function renderInstitutionSession(
   // Calm steady state — every session warm and fresh, nothing waiting, no
   // notice — renders NO card at all: quiet means live.
   if (rows.length === 0 && !waitingVisible && !noticeVisible) {
+    if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
+    if (rowsContainer instanceof HTMLElement) {
+      rowsContainer.hidden = true;
+      rowsContainer.replaceChildren();
+    }
     card.hidden = true;
     clearSessionNoticeTimers();
     return;
@@ -1642,7 +1790,7 @@ export function renderInstitutionSession(
     if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
     origin.textContent = "";
     rowsContainer.hidden = false;
-    renderSessionRows(doc, rowsContainer, rows, onSignIn);
+    renderSessionRows(doc, rowsContainer, rows, onSignIn, onGrant);
   } else if (rows.length === 0) {
     // Only the waiting list or a release notice justifies the card — and a
     // card with a bare heading reads as broken, so say WHY it is quiet:
@@ -1667,33 +1815,28 @@ export function renderInstitutionSession(
     const row = rows[0] as SessionRowState;
     status.textContent = sessionRowText(row);
     origin.textContent = resolverHost(row.origin);
-    signIn.disabled = row.action === "none";
-    signIn.hidden = row.action === "none";
-    signIn.setAttribute("aria-describedby", status.id);
-    sessionSignInHandlers.set(signIn, () => onSignIn(row.origin ?? undefined));
-    if (!signIn.dataset.wired) {
-      signIn.dataset.wired = "1";
-      signIn.addEventListener("click", () => {
-        const action = sessionSignInHandlers.get(signIn);
-        if (action === undefined) return;
-        signIn.disabled = true;
-        signIn.textContent = "Opening…";
-        void action().then(
-          () => {
-            signIn.disabled = false;
-            signIn.textContent = "Sign in";
-          },
-          (error: unknown) => {
-            signIn.disabled = false;
-            signIn.textContent = "Sign in";
-            status.textContent =
-              error instanceof Error && error.message.length > 0
-                ? error.message
-                : "Could not open the institution sign-in";
-          },
-        );
-      });
-    }
+    const hostLabel = resolverHost(row.origin);
+    const binding =
+      row.action === "grant"
+        ? {
+            run: () => onGrant(row.origin),
+            idleLabel: "Allow",
+            pendingLabel: "Requesting…",
+            failureLabel: "Could not request library page access",
+            ariaLabel: `Allow papio to check ${hostLabel}`,
+            ownerKey: row.origin,
+          }
+        : row.action === "signin"
+          ? {
+              run: () => onSignIn(row.origin),
+              idleLabel: "Sign in",
+              pendingLabel: "Opening…",
+              failureLabel: "Could not open the institution sign-in",
+              ariaLabel: `Sign in to ${hostLabel}`,
+              ownerKey: row.origin,
+            }
+          : undefined;
+    bindSessionButton(signIn, status, binding);
   }
 
   const released = Math.max(0, Math.trunc(state.releasedAuthJobs));
@@ -3730,8 +3873,15 @@ export function sessionWarmForJob(
   const session = sessionOrLegacyWarmth;
   const legacyWarmth =
     (session?.origins ?? []).some(
-      (origin) => origin.verdict === "in" && isFreshSessionTimestamp(origin.lastVerdictAt),
-    ) || session?.authenticated === true;
+      (origin) =>
+        origin.verdict === "in" &&
+        origin.hostPermission !== "required" &&
+        !hasNewerInconclusiveAttempt(origin) &&
+        isFreshSessionTimestamp(origin.lastVerdictAt),
+    ) ||
+    (session?.authenticated === true &&
+      session.hostPermission !== "required" &&
+      !hasNewerInconclusiveAttempt(session));
   const rawDemands = session?.authDemand;
   if (rawDemands === undefined) return session?.authDemandComplete === true ? false : legacyWarmth;
   if (!Array.isArray(rawDemands)) return false;
@@ -3745,6 +3895,8 @@ export function sessionWarmForJob(
   return demandedOrigin !== undefined &&
     demandedOrigin.verdict === "in" &&
     demandedOrigin.authenticated === true &&
+    demandedOrigin.hostPermission !== "required" &&
+    !hasNewerInconclusiveAttempt(demandedOrigin) &&
     demandedOrigin.checking === false &&
     isFreshSessionTimestamp(demandedOrigin.lastVerdictAt);
 }

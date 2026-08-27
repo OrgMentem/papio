@@ -636,8 +636,8 @@
       <h2>Your library</h2>
       <p class="lede">
         These resolver hosts come from your <em>papio</em> configuration and aren't covered by the generic
-        Ex Libris hosts below. Grant access so <em>papio</em> can follow your library's "full text" link
-        automatically instead of leaving it for you to click.
+        Ex Libris hosts below. Grant access so <em>papio</em> can follow your library's full-text links and
+        check that library session while a paper is waiting for sign-in.
       </p>
       <div class="card">
         <p id="configured-resolvers-message" class="inline-feedback-message hint" role="status" hidden></p>
@@ -649,7 +649,8 @@
       <h2>Library resolver access</h2>
       <p class="lede">
         Firefox asks you to grant this access at runtime; Chrome grants it when the extension is installed.
-        <em>papio</em> uses it to resolve your library's links when completing an explicitly requested download.
+        <em>papio</em> uses it to resolve library links for requested papers and to check the matching
+        library session while a paper is waiting for sign-in. It does not read credentials or cookies.
       </p>
       <div class="card">
         <ul id="library-resolvers" class="rows"></ul>

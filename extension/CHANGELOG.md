@@ -17,6 +17,7 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+- **A publisher sign-in can now refresh the matching library-session check.** While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host asks *papio* to check the configured library resolver again. The new publisher trigger reads no page content and never sets the popup verdict; a tracked *papio* tab can still use its existing, job-scoped return evidence to release same-institution work. Other hosts, queued-only work, missing bindings, and ambiguous institutions do not authorize the trigger. An inconclusive resolver check now says what could not be verified instead of repeating an older claim. The binding survives a sleeping extension without storing the landing URL. When a resolver grant is missing in either browser, the card offers **Allow** for that institution only; granting it rechecks only while matching work or a tracked return is pending.
 - **Cochrane reviews now download by themselves.** Every PDF button on a
   Cochrane review page, and the page's own PDF metadata, points at a viewer
   page rather than at the file, so *papio* had no route there and asked you to

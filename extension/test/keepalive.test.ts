@@ -19,6 +19,7 @@ import {
   MAX_SCANNED_CONTROLS,
   MIN_FOREGROUND_PROBE_SPACING_MS,
   MIN_PROBE_START_SPACING_MS,
+  permissionPatternCoversOrigin,
   SESSION_STALE_MS,
   type FreshSessionEvidence,
   type KeepaliveAPI,
@@ -225,6 +226,7 @@ interface HarnessResolver {
   storedOrigin?: unknown;
   grantedOrigins?: string[];
   knownOrigins?: string[];
+  demandOrigins?: string[];
   storageValues?: Record<string, unknown>;
 }
 
@@ -246,6 +248,7 @@ function makeHarness(
   reauthState: boolean[];
   freshEvidence: FreshSessionEvidence[];
   authChanges: { origin: string; authenticated: boolean }[];
+  permissionChanges: { origin: string; granted: boolean }[];
   /** Mutable "hello_ack landed" toggle read live by configuredOriginsReady():
    * defaults to false, matching production before the daemon handshake, so
    * every existing test's behavior is unchanged unless a test opts in. */
@@ -276,6 +279,7 @@ function makeHarness(
   const reauthState: boolean[] = [];
   const freshEvidence: FreshSessionEvidence[] = [];
   const authChanges: { origin: string; authenticated: boolean }[] = [];
+  const permissionChanges: { origin: string; granted: boolean }[] = [];
   const configuredReady = { value: false };
   const originStateWrites: KeepaliveOriginSnapshot[][] = [];
   const storageValues: Record<string, unknown> = {
@@ -304,7 +308,11 @@ function makeHarness(
       },
     },
     permissions: {
-      getAll: async () => ({ origins: resolverConfig?.grantedOrigins ?? [] }),
+      getAll: async () => ({
+        origins:
+          resolverConfig?.grantedOrigins ??
+          ["https://resolver.example.edu/*"],
+      }),
     },
     scripting: { executeScript: scripting.executeScript },
     action: { setBadgeText: async ({ text }) => void badge.push(text) },
@@ -315,6 +323,9 @@ function makeHarness(
     ...(resolverConfig?.knownOrigins === undefined
       ? {}
       : { knownResolverOrigins: () => resolverConfig.knownOrigins ?? [] }),
+    ...(resolverConfig?.demandOrigins === undefined
+      ? {}
+      : { authDemandOrigins: () => resolverConfig.demandOrigins ?? [] }),
     ...(warmDemand !== undefined ? { warmDemand } : {}),
     ...(workWindowID !== undefined ? { workWindowID } : {}),
     onReauthNeeded: () => {
@@ -329,6 +340,9 @@ function makeHarness(
     },
     onOriginAuthenticationChanged: (origin, authenticated) => {
       authChanges.push({ origin, authenticated });
+    },
+    onOriginPermissionChanged: (origin, granted) => {
+      permissionChanges.push({ origin, granted });
     },
     observeMs: 10,
     reloadSettleMs: 1,
@@ -354,6 +368,7 @@ function makeHarness(
     configuredReady,
     storageValues,
     resolverMarkers,
+    permissionChanges,
     markersByTab,
     originStateWrites,
     storageGate,
@@ -773,7 +788,7 @@ test("snapshot exposes session state without leaking an IdP host", async () => {
   expect(snapshot.resolverOrigin).toBe("https://resolver.example.edu");
   expect(snapshot.resolverOrigin).not.toContain("idp.example.edu");
 });
-test("snapshot resolves a durable resolver before granted permission fallback", async () => {
+test("snapshot uses a durable resolver and never promotes a permission grant", async () => {
   const stored = makeHarness(4, undefined, {
     latestOpenURL: undefined,
     storedOrigin: "https://stored.resolver.example",
@@ -787,7 +802,7 @@ test("snapshot resolves a durable resolver before granted permission fallback", 
     grantedOrigins: ["https://granted.resolver.example/*"],
   });
   await fallback.manager.init();
-  expect(fallback.manager.getSnapshot().resolverOrigin).toBe("https://granted.resolver.example");
+  expect(fallback.manager.getSnapshot().resolverOrigin).toBeNull();
 });
 
 test("a permission grant probes a configured origin that was never dirty", async () => {
@@ -806,6 +821,7 @@ test("a permission grant probes a configured origin that was never dirty", async
     latestOpenURL: RESOLVER_OPENURL,
     knownOrigins: ["https://resolver.example.edu"],
     grantedOrigins: granted,
+    demandOrigins: ["https://resolver.example.edu"],
   });
   h.configuredReady.value = true;
   await h.manager.init();
@@ -822,6 +838,7 @@ test("a permission grant probes a configured origin that was never dirty", async
   h.clock.advanceBy(MIN_PROBE_START_SPACING_MS + 1);
   granted.push("https://resolver.example.edu/*");
   await h.manager.onPermissionsChanged();
+  await flushMicrotasks();
 
   expect(h.scripting.injectionCounts.get(1) ?? 0).toBeGreaterThan(injectedBefore);
 });
@@ -848,6 +865,265 @@ test("a permission grant for a non-configured origin probes nothing", async () =
 
   expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(injectedBefore);
   expect(h.manager.getOriginSnapshots().map((s) => s.origin)).toEqual(originsBefore);
+});
+
+test("permission coverage matches exact, wildcard, and all-host grants", () => {
+  const origin = "https://une.primo.exlibrisgroup.com";
+  expect(
+    permissionPatternCoversOrigin(
+      "https://une.primo.exlibrisgroup.com/*",
+      origin,
+    ),
+  ).toBe(true);
+  expect(
+    permissionPatternCoversOrigin(
+      "https://*.primo.exlibrisgroup.com/*",
+      origin,
+    ),
+  ).toBe(true);
+  expect(permissionPatternCoversOrigin("https://*/*", origin)).toBe(true);
+  expect(permissionPatternCoversOrigin("<all_urls>", origin)).toBe(true);
+  const customPort = "https://une.primo.exlibrisgroup.com:8443";
+  expect(
+    permissionPatternCoversOrigin(
+      "https://une.primo.exlibrisgroup.com/*",
+      customPort,
+    ),
+  ).toBe(true);
+  expect(
+    permissionPatternCoversOrigin(
+      "https://*.primo.exlibrisgroup.com/",
+      customPort,
+    ),
+  ).toBe(true);
+  expect(
+    permissionPatternCoversOrigin(
+      "*://une.primo.exlibrisgroup.com/account",
+      customPort,
+    ),
+  ).toBe(true);
+  expect(
+    permissionPatternCoversOrigin(
+      "https://*.alma.exlibrisgroup.com/*",
+      origin,
+    ),
+  ).toBe(false);
+  expect(
+    permissionPatternCoversOrigin(
+      "http://une.primo.exlibrisgroup.com/*",
+      origin,
+    ),
+  ).toBe(false);
+});
+
+test("a resolver grant with no auth-pending demand performs no page read", async () => {
+  const granted: string[] = [];
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: ["https://resolver.example.edu"],
+    grantedOrigins: granted,
+    demandOrigins: [],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  const injectedBefore = h.scripting.injectionCounts.get(1) ?? 0;
+
+  granted.push("https://resolver.example.edu/*");
+  await h.manager.onPermissionsChanged();
+  await flushMicrotasks();
+
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(injectedBefore);
+  expect(h.manager.getOriginSnapshots()[0]?.hostPermission).toBe("granted");
+  expect(
+    h.manager.getOriginSnapshots()[0]?.institutionalRecheckCause,
+  ).toBeUndefined();
+});
+
+test("a wildcard grant covers an exact configured resolver", async () => {
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: "https://une.primo.exlibrisgroup.com/openurl",
+    knownOrigins: ["https://une.primo.exlibrisgroup.com"],
+    grantedOrigins: ["https://*.primo.exlibrisgroup.com/*"],
+    demandOrigins: ["https://une.primo.exlibrisgroup.com"],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+
+  expect(h.manager.getOriginSnapshots()[0]?.hostPermission).toBe("granted");
+});
+
+test("revoking resolver access retracts authority without changing the verdict", async () => {
+  const granted = ["https://resolver.example.edu/*"];
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: ["https://resolver.example.edu"],
+    grantedOrigins: granted,
+    demandOrigins: ["https://resolver.example.edu"],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  await h.manager.probeForeground();
+  expect(h.manager.getSnapshot().verdict).toBe("in");
+
+  granted.splice(0);
+  await h.manager.onPermissionsChanged();
+
+  expect(h.permissionChanges).toContainEqual({
+    origin: "https://resolver.example.edu",
+    granted: false,
+  });
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "in",
+    authenticated: true,
+    hostPermission: "required",
+  });
+});
+
+test("a malformed permission snapshot remains unknown", async () => {
+  const h = makeHarness(4, undefined, {
+    knownOrigins: ["https://resolver.example.edu"],
+  });
+  h.configuredReady.value = true;
+  if (h.api.permissions === undefined) throw new Error("permissions unavailable");
+  h.api.permissions.getAll = async () => ({});
+  await h.manager.init();
+
+  expect(h.manager.getOriginSnapshots()[0]?.hostPermission).toBe("unknown");
+  expect(h.permissionChanges).toEqual([]);
+});
+
+test("unknown to required retracts release authority", async () => {
+  const h = makeHarness(4, undefined, {
+    knownOrigins: ["https://resolver.example.edu"],
+  });
+  h.configuredReady.value = true;
+  if (h.api.permissions === undefined) throw new Error("permissions unavailable");
+  h.api.permissions.getAll = async () => {
+    throw new Error("permission API unavailable");
+  };
+  await h.manager.init();
+  h.api.permissions.getAll = async () => ({ origins: [] });
+
+  await h.manager.onPermissionsChanged();
+
+  expect(h.permissionChanges).toContainEqual({
+    origin: "https://resolver.example.edu",
+    granted: false,
+  });
+});
+
+test("a probe finishing after permission revocation emits no fresh evidence", async () => {
+  const origin = "https://resolver.example.edu";
+  const granted = [`${origin}/*`];
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: granted,
+    demandOrigins: [origin],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  const tab = { id: 70, url: `${origin}/account` };
+  h.tabs.seed(tab);
+  h.tabs.focusedTab = tab;
+  const held = h.scripting.hold(tab.id);
+  const probing = h.manager.probeForeground(origin);
+  await flushMicrotasks();
+
+  granted.splice(0);
+  await h.manager.onPermissionsChanged();
+  held.release([{ text: "Sign out", label: "" }]);
+  await probing;
+
+  expect(h.manager.getSnapshot()).toMatchObject({
+    verdict: "in",
+    hostPermission: "required",
+  });
+  expect(h.freshEvidence).toEqual([]);
+});
+
+test("a tracked auth return rechecks after its demand state has advanced", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    demandOrigins: [],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+
+  await h.manager.noteInstitutionalLanding(origin, "tracked_auth_return");
+  await flushMicrotasks();
+
+  expect(
+    h.manager.getOriginSnapshots()[0]?.institutionalRecheckCause,
+  ).toBeUndefined();
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBeGreaterThan(0);
+});
+
+test("one wake runs one probe when ordinary and institutional recovery overlap", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    demandOrigins: [origin],
+    storageValues: {
+      "keepalive.originStates": [
+        {
+          origin,
+          authenticated: false,
+          verdict: "unknown",
+          probeSource: "none",
+          lastVerdictAt: null,
+          lastProbeAt: null,
+          checking: false,
+          likelyAuthenticated: false,
+          pausedForReauth: false,
+          dirtySince: Date.now() - 1_000,
+          institutionalRecheckCause: "parked_demand",
+        },
+      ],
+    },
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  const injectedBefore = h.scripting.injectionCounts.get(1) ?? 0;
+
+  await h.manager.onWake();
+
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(
+    injectedBefore + 1,
+  );
+});
+
+test("a deferred institutional recheck is cancelled when demand ends", async () => {
+  const demand = ["https://resolver.example.edu"];
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: ["https://resolver.example.edu"],
+    grantedOrigins: ["https://resolver.example.edu/*"],
+    demandOrigins: demand,
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  await h.manager.probeForeground();
+  const injectedBefore = h.scripting.injectionCounts.get(1) ?? 0;
+
+  await h.manager.noteInstitutionalLanding("https://resolver.example.edu");
+  expect(
+    h.manager.getOriginSnapshots()[0]?.institutionalRecheckCause,
+  ).toBe("parked_demand");
+  demand.splice(0);
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS + 1);
+  await h.timers.runDue();
+  await flushMicrotasks();
+
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(injectedBefore);
+  expect(
+    h.manager.getOriginSnapshots()[0]?.institutionalRecheckCause,
+  ).toBeUndefined();
 });
 
 test("probeForeground always runs a real scan, even moments after the previous one completed", async () => {
@@ -2037,7 +2313,11 @@ test("a fresh release-grade probe after a warm-restored verdict still emits onFr
       },
     ],
   };
-  const h = makeHarness(4, undefined, { knownOrigins: [origin], storageValues: stored });
+  const h = makeHarness(4, undefined, {
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    storageValues: stored,
+  });
   h.configuredReady.value = true;
   await h.manager.init();
   // Restoring a warm verdict is not an observation — it must never itself
@@ -2359,7 +2639,11 @@ test("notifyConfiguredOriginsChanged() picks up a newly configured origin immedi
       },
     ],
   };
-  const resolverConfig: HarnessResolver = { knownOrigins: [], storageValues: stored };
+  const resolverConfig: HarnessResolver = {
+    knownOrigins: [],
+    grantedOrigins: [`${origin}/*`],
+    storageValues: stored,
+  };
   const h = makeHarness(4, undefined, resolverConfig);
   await h.manager.init(); // pre-hello_ack: not ready, empty configured set
 
@@ -2996,11 +3280,10 @@ test("companion: the same truncated shape with only decisive out observations st
 });
 
 // --- papio-efda0ab62e90faac: loadPreferences serialization --------------------
-// loadPreferences called from sync/probeForeground/probeOriginAutomatically/
-// onObserve/onReload/onReauthTick/onWake each awaits storage.get then
-// permissions.getAll before applying restoreOriginStates. Two concurrent
-// loads must not let the earlier one's stale snapshot clobber a fresher
-// in-memory dirty/paused mark whose only former protection was
+// loadPreferences runs from sync/foreground/session triggers and lifecycle
+// wakes. Each call awaits storage.get then permissions.getAll before applying
+// restoreOriginStates. Two concurrent loads must not let an earlier stale
+// snapshot clobber a fresher in-memory dirty or paused mark whose only former
 // `if (existing?.lastProbeAt !== null) skip` — that guard was null for a
 // freshly seeded origin.
 

@@ -1068,6 +1068,30 @@ test("demanded warmth requires one exact fresh authenticated non-checking snapsh
     sessionWarmForJob(
       {
         ...session,
+        origins: [{ ...warmSnapshot, hostPermission: "required" as const }],
+      },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  expect(
+    sessionWarmForJob(
+      {
+        ...session,
+        origins: [
+          {
+            ...warmSnapshot,
+            lastProbeOutcome: "no_tab" as const,
+            lastProbeAt: now + 1,
+          },
+        ],
+      },
+      "demanded-job",
+    ),
+  ).toBe(false);
+  expect(
+    sessionWarmForJob(
+      {
+        ...session,
         authDemand: [
           { job_id: "demanded-job", origin },
           { job_id: "demanded-job", origin },
@@ -2007,8 +2031,8 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
     lastProbeOutcome: "scan_failed",
     lastVerdictAt: now,
   });
-  expect(failed.label).toBe("papio couldn't read the library page — check site access in Options");
-  expect(failed.detail).toContain("via your library tab");
+  expect(failed.label).toBe("papio couldn't read the library page — open it to retry");
+  expect(failed.detail).toBe("");
 
   const partialScan = deriveSessionCardState({
     ...base,
@@ -2097,13 +2121,7 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
   expect(warmDespiteStaleOutcome.label).toContain("Signed in");
 });
 
-test("an inconclusive recheck never reports signed out", () => {
-  // Decision boundary, enumerated one outcome per case on purpose. keepalive.ts
-  // states the rule — "an attempt that learned nothing must not overwrite what
-  // an earlier attempt learned" — and commitOriginProbe advances only
-  // lastProbeAt/lastProbeOutcome for an inconclusive attempt, leaving the
-  // verdict intact. This pins the consequence at the popup boundary: papio
-  // looked, could not tell, and must not therefore claim the session expired.
+test("a newer inconclusive recheck replaces stale verdict copy without changing the verdict", () => {
   const now = Date.now();
   const base = {
     enabled: true,
@@ -2118,37 +2136,42 @@ test("an inconclusive recheck never reports signed out", () => {
     stalledAuthJobs: [],
     releasedAuthJobs: 0,
   };
+  const expected: Record<string, string> = {
+    no_tab: "No library page open — open your library to verify",
+    no_markers: "Signed-in state unclear on this page",
+    scan_failed: "papio couldn't read the library page — open it to retry",
+    partial_scan: "Too many library tabs to check reliably",
+    conflict: "Your library tabs disagree — open your library page",
+  };
 
-  for (const outcome of ["no_markers", "scan_failed", "no_tab", "partial_scan", "conflict"] as const) {
+  for (const [outcome, label] of Object.entries(expected)) {
     const card = deriveSessionCardState({
       ...base,
       authenticated: true,
       verdict: "in",
       probeSource: "live_tab",
-      lastProbeOutcome: outcome,
-      lastVerdictAt: now,
+      lastProbeOutcome: outcome as "no_tab",
+      lastVerdictAt: now - 1,
     });
+    expect(card.label).toBe(label);
     expect(card.label).not.toContain("Signed out");
-    // Not vacuous: a card that rendered nothing would also "not contain"
-    // the forbidden string, so the surviving verdict is asserted too.
-    expect(card.label).toContain("Signed in");
+    if (outcome !== "no_markers") expect(card.detail).toBe("");
   }
 
-  // The blocker. A declined Firefox host grant is a permanent researcher
-  // choice, and its shipped representation is an origin that has never landed
-  // a decisive verdict because papio was never allowed to read the page. It
-  // must name the remedy, and must never read as an expired session.
   const blocker = deriveSessionCardState({
     ...base,
-    authenticated: false,
-    verdict: "unknown",
-    probeSource: "none",
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
     lastProbeOutcome: "scan_failed",
-    lastVerdictAt: null,
+    lastVerdictAt: now - 1,
+    hostPermission: "required",
   });
-  expect(blocker.label).not.toContain("Signed out");
-  expect(blocker.label).toBe("papio couldn't read the library page — check site access in Options");
-  expect(blocker.action).toBe("signin");
+  expect(blocker).toEqual({
+    label: "Library page access required",
+    detail: "Allow papio to check example.primo.exlibrisgroup.com",
+    action: "grant",
+  });
 });
 
 test("an inconclusive recheck still names its outcome", () => {
@@ -2172,7 +2195,7 @@ test("an inconclusive recheck still names its outcome", () => {
   const expected: Record<string, string> = {
     no_tab: "No library page open — open your library to verify",
     no_markers: "Signed-in state unclear on this page",
-    scan_failed: "papio couldn't read the library page — check site access in Options",
+    scan_failed: "papio couldn't read the library page — open it to retry",
     partial_scan: "Too many library tabs to check reliably",
     conflict: "Your library tabs disagree — open your library page",
   };
@@ -2402,7 +2425,145 @@ test("renders independent multi-origin session rows and targets each sign-in ori
   expect(buttons[1]?.getAttribute("aria-describedby")).toBe("institution-session-status-1");
   buttons[1]?.click();
   await Promise.resolve();
+  expect(buttons[0]?.id).toBe(
+    "institution-session-action-example-primo-exlibrisgroup-com",
+  );
   expect(targets).toEqual([uwaOrigin]);
+});
+
+test("the session blocker requests only its own resolver grant", async () => {
+  const origin = "https://une.primo.exlibrisgroup.com";
+  const doc = popupDocument();
+  const grants: string[] = [];
+  renderInstitutionSession(
+    doc,
+    {
+      enabled: true,
+      intervalMinutes: 4,
+      authenticated: true,
+      verdict: "in",
+      probeSource: "live_tab",
+      lastProbeOutcome: "markers",
+      lastVerdictAt: Date.now(),
+      checking: false,
+      likelyAuthenticated: false,
+      pausedForReauth: false,
+      lastProbeAt: Date.now(),
+      resolverOrigin: origin,
+      hostPermission: "required",
+      lastAuthReturnedAt: null,
+      queuedAuthJobs: 0,
+      stalledAuthJobs: [],
+      releasedAuthJobs: 0,
+    },
+    async () => {},
+    [],
+    async (target) => {
+      grants.push(target);
+    },
+  );
+
+  const button = doc.getElementById(
+    "institution-session-signin",
+  ) as HTMLButtonElement;
+  const status = doc.getElementById("institution-session-status");
+  expect(button.textContent).toBe("Allow");
+  expect(button.getAttribute("aria-label")).toBe(
+    "Allow papio to check une.primo.exlibrisgroup.com",
+  );
+  expect(status?.getAttribute("role")).toBe("status");
+  expect(status?.getAttribute("aria-live")).toBe("polite");
+  button.click();
+  await Promise.resolve();
+  expect(grants).toEqual([origin]);
+});
+
+test("the default session grant action calls the browser permission API in the click", async () => {
+  const origin = "https://une.primo.exlibrisgroup.com";
+  const originalChrome = globalThis.chrome;
+  const requested: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      permissions: {
+        request: async (value: unknown) => {
+          requested.push(value);
+          return false;
+        },
+      },
+    },
+  });
+  try {
+    const doc = popupDocument();
+    renderInstitutionSession(doc, {
+      enabled: true,
+      intervalMinutes: 4,
+      authenticated: false,
+      verdict: "unknown",
+      probeSource: "none",
+      lastVerdictAt: null,
+      checking: false,
+      likelyAuthenticated: false,
+      pausedForReauth: false,
+      lastProbeAt: null,
+      resolverOrigin: origin,
+      hostPermission: "required",
+      lastAuthReturnedAt: null,
+      queuedAuthJobs: 0,
+      stalledAuthJobs: [],
+      releasedAuthJobs: 0,
+    });
+    (
+      doc.getElementById(
+        "institution-session-signin",
+      ) as HTMLButtonElement
+    ).click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requested).toEqual([{ origins: [`${origin}/*`] }]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("a session action stays pending across a repaint", async () => {
+  const origin = "https://pending.primo.exlibrisgroup.com";
+  const doc = popupDocument();
+  const gate = Promise.withResolvers<void>();
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    verdict: "unknown" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: null,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastProbeAt: null,
+    resolverOrigin: origin,
+    hostPermission: "required" as const,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+  };
+  const grant = async (): Promise<void> => gate.promise;
+  renderInstitutionSession(doc, state, async () => {}, [], grant);
+  const button = doc.getElementById(
+    "institution-session-signin",
+  ) as HTMLButtonElement;
+  button.click();
+  expect(button.disabled).toBe(true);
+  expect(button.textContent).toBe("Requesting…");
+
+  renderInstitutionSession(doc, state, async () => {}, [], grant);
+  expect(button.disabled).toBe(true);
+  expect(button.textContent).toBe("Requesting…");
+
+  gate.resolve();
+  await flushMicrotasks();
+  expect(button.disabled).toBe(false);
+  expect(button.textContent).toBe("Allow");
 });
 test("binds waiting demand to its warm origin instead of a stale secondary row", () => {
   const now = Date.now();

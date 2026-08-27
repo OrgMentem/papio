@@ -162,9 +162,33 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 
 **Context:** Operators needed three surfaces around an acquisition already in flight: a bounded view of what *papio* has done, a way to hand a manually obtained PDF back to *papio* without a second manual-download detour, and browser-local visibility into whether an institution session is actually signed in.
 
-**Decision:** ADR-0013 exposes the daemon's append-only event history as a bounded, solicited activity read, also reachable from the CLI — no daemon push, reaffirming ADR-0005's rejection of that mechanism. A "send PDF to *papio*" browser action steers a download into a job-scoped folder and adopts it through the existing legal job-state transitions, never a new acquisition state. An institution-session card in the popup reports sign-in state from ranked, evidence-based browser-local observations — an explicit sign-out control found in the page, or a named-user session token — rather than guessing from URL shape, and that evidence never crosses the wire to the daemon.
+**Decision:** ADR-0013 exposes the daemon's append-only event history as a bounded, solicited activity read, also reachable from the CLI — no daemon push, reaffirming ADR-0005's rejection of that mechanism. A "send PDF to *papio*" browser action steers a download into a job-scoped folder and adopts it through the existing legal job-state transitions, never a new acquisition state. An institution-session card in the popup reports sign-in state from ranked, evidence-based browser-local observations — an explicit sign-out control found in the page, or a named-user session token — rather than guessing from URL shape. A committed session-evidence frame carries only its evidence kind, configured bare resolver origin, and timestamp; no cookie, token, credential, or page content crosses that boundary.
 
 **Why:** Every new surface routes through boundaries already established elsewhere: the CLI stays authoritative for capabilities, the browser stays the only place browser-local facts are known, and authentication is never inferred from a timing signal alone. Field validation after the initial design tightened the session verdict to ranked evidence and scoped institution sessions strictly to the resolver origin they were actually observed on, after early heuristics produced false verdicts.
+
+## Publisher landings schedule a resolver check
+
+**Context:** A researcher can complete institutional sign-in from a publisher's
+own access path while the extension still holds an older resolver verdict.
+Treating an untracked publisher page as that verdict would create false
+signed-in states, but ignoring the landing leaves visible authentication work
+parked.
+
+**Decision:** ADR-0026 lets a completed HTTPS navigation on a declared provider
+host schedule a check of the configured library resolver. The untracked path
+must match an `auth_pending` job and exactly one persisted configured
+institution binding. It sets no verdict or release evidence. A tracked papio
+job return retains its existing same-origin release evidence, subject to
+current resolver access, but it also cannot set the popup verdict. Queued-only
+work, other hosts, missing bindings, and ambiguous institutions fail closed.
+Resolver permission state remains separate from the verdict, and its card
+requests only the affected resolver grant.
+
+**Why:** The resolver's ranked DOM and storage observations remain the only
+source of the popup verdict. Provider correlation makes the trigger useful
+without reading publisher page content, while a restart-safe bare origin keeps
+the institution binding without storing the landing URL or identity-provider
+data.
 
 ## Consumer attribution and durable validation evidence
 

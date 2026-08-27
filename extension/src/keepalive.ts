@@ -92,6 +92,8 @@ export interface KeepaliveAPI {
   action?: KeepaliveAction;
 }
 
+export type ResolverHostPermission = "granted" | "required" | "unknown";
+
 export interface KeepaliveOriginSnapshot {
   /** The resolver origin this state belongs to; never an IdP URL. */
   origin: string;
@@ -112,6 +114,14 @@ export interface KeepaliveOriginSnapshot {
    * obsolete, cleared when a probe commits. Durable so a worker that dies
    * before probing still knows to look on the next wake. */
   dirtySince: number | null;
+  /** Why a correlated publisher landing requested a resolver recheck.
+   * Durable and contains no landing or provider data. A parked-demand check
+   * expires with its demand; a tracked auth return remains pending until it
+   * can update the browser-local verdict. */
+  institutionalRecheckCause?: "parked_demand" | "tracked_auth_return" | undefined;
+  /** Effective resolver host access. Derived from the current permission
+   * snapshot and never persisted with this origin state. */
+  hostPermission?: ResolverHostPermission;
 }
 
 export interface KeepaliveSnapshot {
@@ -138,6 +148,8 @@ export interface KeepaliveSnapshot {
   resolverOrigin: string | null;
   lastAuthReturnedAt: number | null;
   queuedAuthJobs: number;
+  /** Effective access for `resolverOrigin`. Older callers may omit it. */
+  hostPermission?: ResolverHostPermission;
   stalledAuthJobs: string[];
 }
 
@@ -163,6 +175,9 @@ export interface KeepaliveOptions {
    * that the configured set is UNKNOWN, not empty — see
    * KeepaliveManager.configuredOriginsReady(). */
   configuredOriginsReady?(): boolean;
+  /** Configured resolver origins for jobs currently parked at a visible
+   * authentication step. Queued requires-auth work is deliberately absent. */
+  authDemandOrigins?(): readonly string[];
   /** Number of queued institutional handoffs waiting for auth evidence. */
   queuedAuthJobs?(): number;
   /** Job ids parked after the bounded authentication-drive budget. */
@@ -178,6 +193,9 @@ export interface KeepaliveOptions {
   /** Committed authentication state changed for one configured origin.
    * Badge and UI state only — never a release trigger. */
   onOriginAuthenticationChanged?(origin: string, authenticated: boolean): void;
+  /** Effective resolver host access changed. A revocation retracts local
+   * release authority but never writes a signed-out verdict. */
+  onOriginPermissionChanged?(origin: string, granted: boolean): void;
   /** Called once per detected login redirect, after the tab is made visible. */
   onReauthNeeded?(): void;
   /** Keeps the central bridge badge in sync with the paused state. */
@@ -604,26 +622,42 @@ function resolverURLMatches(raw: string, resolver: URL): boolean {
 }
 
 
-/** Extract one exact or host-wildcard HTTPS origin from a Chrome permission
- * pattern. Broad HTTPS all-host access is intentionally not a resolver. */
-export function resolverOriginFromPermissionPattern(raw: unknown): string | undefined {
-  if (typeof raw !== "string" || !/^https:\/\//i.test(raw)) return undefined;
-  const withoutScheme = raw.slice("https://".length);
-  const host = withoutScheme.split(/[/?#]/, 1)[0];
-  if (host === undefined || host === "" || host === "*" || !/^[*a-z0-9.-]+(?::\d+)?$/i.test(host)) {
-    return undefined;
+
+/** Whether one granted Chrome match pattern covers one exact configured HTTPS
+ * resolver origin. Match-pattern paths do not restrict host permission, and
+ * an omitted port covers every port. */
+export function permissionPatternCoversOrigin(
+  rawPattern: unknown,
+  rawOrigin: unknown,
+): boolean {
+  const origin = normalizeHttpsOrigin(rawOrigin);
+  if (origin === undefined || typeof rawPattern !== "string") return false;
+  const pattern = rawPattern.trim().toLowerCase();
+  if (pattern === "<all_urls>") return true;
+  if (/^(?:https|\*):\/\/\*\/(?:\*|.*)$/.test(pattern)) return true;
+  const match = /^(https|\*):\/\/(\*\.)?([^/?#*]+)(?:\/[^?#]*)?$/.exec(
+    pattern,
+  );
+  if (match === null) return false;
+  const wildcard = match[2] !== undefined;
+  const authority = match[3];
+  if (authority === undefined) return false;
+  try {
+    const candidate = new URL(origin);
+    const granted = new URL(`https://${authority}`);
+    const hostMatches =
+      wildcard
+        ? candidate.hostname === granted.hostname ||
+          candidate.hostname.endsWith(`.${granted.hostname}`)
+        : candidate.hostname === granted.hostname;
+    const portMatches =
+      granted.port === "" || candidate.port === granted.port;
+    return hostMatches && portMatches;
+  } catch {
+    return false;
   }
-  return normalizeHttpsOrigin(`https://${host}`, true);
 }
 
-/** Normalize granted resolver permission patterns, preserving declaration
- * order while removing duplicates and broad all-host grants. */
-export function resolverOriginsFromPermissionPatterns(
-  patterns: readonly string[] | undefined,
-): string[] {
-  if (!Array.isArray(patterns)) return [];
-  return [...new Set(patterns.map(resolverOriginFromPermissionPattern).filter((origin): origin is string => origin !== undefined))];
-}
 
 /** Result of one pure inspection of one tab. Never written anywhere:
  * probeOrigin() reduces a batch of these into exactly one committed
@@ -641,23 +675,24 @@ interface TabObservation {
   verdict?: "in" | "out";
 }
 
-/** Every place a probe can originate. Commit C gates release authority on
- * this; here it only picks the log-worthy label and travels unchanged
- * through requestProbe() -> probeOrigin(). */
-type ProbeReason = "foreground" | "cycle" | "reauth" | "navigation" | "activation" | "wake";
+/** Every place a probe can originate. `institutional_landing` is distinct
+ * because its authority must be rechecked when a deferred probe starts. */
+type ProbeReason =
+  | "foreground"
+  | "cycle"
+  | "reauth"
+  | "navigation"
+  | "institutional_landing"
+  | "activation"
+  | "wake";
 
 /** Keys purely off the ProbeReason VALUE, never off who actually called
  * requestProbe() — the type carries no "came from an operator action" fact
  * for this to check. Today only probeForeground() constructs "foreground",
- * and every automatic trigger — including background.ts's own
- * institutional-landing detection, which uses probeOriginAutomatically()'s
- * "navigation" reason instead of calling probeForeground() directly — uses
- * one of the other five reasons, so "foreground" does mean operator-
- * initiated in practice. That correspondence is a calling convention every
- * caller of probeForeground() must uphold, not something this function or
- * the ProbeReason type enforces: a future caller of probeForeground() from
- * an automatic path would silently inherit the shorter, operator-only
- * floor. */
+ * and every automatic trigger uses one of the other reasons. Thus
+ * `foreground` remains operator-initiated, while `institutional_landing`
+ * uses the automatic floor and repeats its current-demand check before
+ * every deferred start. */
 function spacingFloorFor(reason: ProbeReason): number {
   return reason === "foreground" ? MIN_FOREGROUND_PROBE_SPACING_MS : MIN_PROBE_START_SPACING_MS;
 }
@@ -732,9 +767,13 @@ export class KeepaliveManager {
   private tabID: number | undefined;
   private resolver: URL | undefined;
   private persistedResolverOrigin: string | undefined;
-  private grantedResolverOrigin: string | undefined;
-  private grantedResolverOrigins: string[] = [];
   private readonly originStates = new Map<string, KeepaliveOriginSnapshot>();
+  /** Raw browser permission patterns from the latest successful read.
+   * Undefined means the permission API failed, not that access is absent. */
+  private grantedPermissionPatterns: string[] | undefined;
+  /** Effective access for configured exact origins. This is derived runtime
+   * state and is never persisted with the session verdict. */
+  private readonly hostPermissions = new Map<string, ResolverHostPermission>();
   /** Per-tab "which document is this" counter. Bumped on every navigation
    * noteResolverNavigation() is told about, dropped on tab removal. An
    * observeTab() scan spans an awaited executeScript(); without this, an
@@ -917,54 +956,113 @@ export class KeepaliveManager {
   /** Return one independently tracked verdict for every configured resolver. */
   getOriginSnapshots(): KeepaliveOriginSnapshot[] {
     this.syncOriginStates();
-    return [...this.originStates.values()].map((snapshot) => ({ ...snapshot }));
+    return [...this.originStates.values()].map((snapshot) => ({
+      ...snapshot,
+      hostPermission: this.hostPermissions.get(snapshot.origin) ?? "unknown",
+    }));
   }
 
-  /** Called by the bridge the instant a hello_ack lands on the current
-   * port, so origin membership updates apply immediately instead of
-   * waiting for the next minute's alarm/cycle to call syncOriginStates()
-   * incidentally. Re-syncs the row universe against the now-authoritative
-   * knownResolverOrigins() and, mirroring onWake()'s dirty-driven recovery
-   * probing, requests a probe for every origin still dirty. */
+  /** Configured origins for work that is parked at a visible sign-in step.
+   * A malformed or pre-hello value is refused, never used to widen membership. */
+  private authDemandOrigins(): Set<string> {
+    const demanded = new Set<string>();
+    let candidates: readonly string[] = [];
+    try {
+      candidates = this.options.authDemandOrigins?.() ?? [];
+    } catch {
+      return demanded;
+    }
+    for (const candidate of candidates) {
+      const origin = normalizeHttpsOrigin(candidate);
+      if (origin !== undefined && this.isConfiguredMember(origin)) {
+        demanded.add(origin);
+      }
+    }
+    return demanded;
+  }
+
+  /** Called when hello_ack makes configured membership authoritative. */
   notifyConfiguredOriginsChanged(): void {
+    void this.reconcileConfiguredOrigins();
+  }
+
+  private async reconcileConfiguredOrigins(): Promise<void> {
+    await this.loadPreferences();
     this.syncOriginStates();
+    const demanded = this.authDemandOrigins();
     for (const [origin, snapshot] of this.originStates) {
-      if (snapshot.dirtySince !== null) void this.requestProbe(origin, "wake");
+      const permission = this.hostPermissions.get(origin) ?? "unknown";
+      if (permission === "required") {
+        this.options.onOriginPermissionChanged?.(origin, false);
+      }
+      const ordinaryDue = snapshot.dirtySince !== null;
+      if (ordinaryDue) void this.requestProbe(origin, "wake");
+      const cause = snapshot.institutionalRecheckCause;
+      if (cause !== undefined) {
+        if (cause === "parked_demand" && !demanded.has(origin)) {
+          await this.updateOriginSnapshot(origin, {
+            institutionalRecheckCause: undefined,
+          });
+        } else if (permission === "granted" && !ordinaryDue) {
+          void this.requestProbe(origin, "institutional_landing");
+        }
+      } else if (
+        demanded.has(origin) &&
+        permission === "granted" &&
+        !ordinaryDue
+      ) {
+        // Covers a grant that landed before hello_ack and a restarted worker
+        // whose daemon re-offer restored auth-pending demand.
+        await this.noteInstitutionalLanding(origin);
+      }
     }
   }
 
-  /** A host grant changed. Options and the popup can grant a resolver origin
-   * at any moment, and until that grant lands papio cannot read that library
-   * page at all — every probe there fails (`scan_failed`, or `no_tab` when no
-   * candidate tab survives the query), so parked institutional work waits on
-   * evidence that could never arrive. `chrome.permissions.onAdded` already
-   * observed the grant; this is what acts on it.
-   *
-   * NARROW on purpose, and deliberately NOT notifyConfiguredOriginsChanged()
-   * above: that sibling probes only origins whose `dirtySince` is already set,
-   * and a newly granted origin is typically CLEAN — nothing invalidated its
-   * evidence, papio simply was not allowed to read the page. Routing a grant
-   * through it would skip exactly the case this method exists for.
-   *
-   * The granted set is DIFFED rather than read from the event argument, so one
-   * path covers a grant from any surface (per-source, bulk, popup) and a
-   * revocation, without parsing a raw match pattern a second time.
-   *
-   * isConfiguredMember() gates the write, not just the probe: ADR-0013's rule
-   * is that a grant may SELECT among configured origins but never create an
-   * institution, and updateOriginSnapshot() would otherwise mint a phantom row
-   * for every provider host handed over by "Grant all sources".
-   *
-   * Reason "wake" reuses the existing automatic trigger — the same one the
-   * sibling above uses for the analogous membership change — so this inherits
-   * MIN_PROBE_START_SPACING_MS and adds no new reason to the union. */
+  /** A browser permission event changed effective resolver access. */
   async onPermissionsChanged(): Promise<void> {
-    const grantedBefore = new Set(this.grantedResolverOrigins);
+    const before = new Map(this.hostPermissions);
     await this.loadPreferences();
-    for (const origin of this.grantedResolverOrigins) {
-      if (grantedBefore.has(origin) || !this.isConfiguredMember(origin)) continue;
-      await this.markDirty(origin);
-      await this.requestProbe(origin, "wake");
+    for (const origin of this.originCandidates()) {
+      const prior = before.get(origin) ?? "unknown";
+      const current = this.hostPermissions.get(origin) ?? "unknown";
+      if (prior === current) continue;
+      if (current === "required") {
+        this.options.onOriginPermissionChanged?.(origin, false);
+      } else if (current === "granted") {
+        this.options.onOriginPermissionChanged?.(origin, true);
+        if (
+          this.originStates.get(origin)?.institutionalRecheckCause !==
+          undefined
+        ) {
+          void this.requestProbe(origin, "institutional_landing");
+        } else {
+          await this.noteInstitutionalLanding(origin);
+        }
+      }
+    }
+  }
+
+  /** Schedule a resolver probe for one already-correlated publisher landing.
+   * A tracked auth return remains actionable after its job leaves
+   * auth_pending; an untracked landing remains demand-bound. */
+  async noteInstitutionalLanding(
+    origin: string,
+    cause: "parked_demand" | "tracked_auth_return" = "parked_demand",
+  ): Promise<void> {
+    await this.loadPreferences();
+    const target = normalizeHttpsOrigin(origin);
+    if (
+      target === undefined ||
+      !this.isConfiguredMember(target) ||
+      (cause === "parked_demand" && !this.authDemandOrigins().has(target))
+    ) {
+      return;
+    }
+    await this.updateOriginSnapshot(target, {
+      institutionalRecheckCause: cause,
+    });
+    if (this.hostPermissions.get(target) === "granted") {
+      void this.requestProbe(target, "institutional_landing");
     }
   }
   private updateOriginSnapshot(
@@ -1016,21 +1114,37 @@ export class KeepaliveManager {
       // the popup decide how much to trust it, never a worker restart.
       const restoredDirtySince = typeof snapshot.dirtySince === "number" ? snapshot.dirtySince : null;
       const restoredPausedForReauth = !!snapshot.pausedForReauth;
+      const restoredInstitutionalRecheckCause =
+        snapshot.institutionalRecheckCause === "parked_demand" ||
+        snapshot.institutionalRecheckCause === "tracked_auth_return"
+          ? snapshot.institutionalRecheckCause
+          : undefined;
       // Preserve any field a fresher in-memory write may have set while this
-      // load was in flight. Mutable origin-state fields:
-      //   authenticated, verdict, probeSource, lastVerdictAt, lastProbeAt,
-      //   lastProbeOutcome, checking, likelyAuthenticated, pausedForReauth, dirtySince
-      // Of those, only dirtySince (via markDirty) and pausedForReauth (via
-      // pauseForReauth) can be set synchronously while lastProbeAt is still
-      // null. Probe-owned fields are already protected by the lastProbeAt
-      // guard above; checking is always reset to false on restore.
+      // load was in flight. Permission state is deliberately absent: it is
+      // re-derived from the browser on every successful preference load.
       let dirtySince = restoredDirtySince;
       let pausedForReauth = restoredPausedForReauth;
+      let institutionalRecheckCause = restoredInstitutionalRecheckCause;
       if (existing !== undefined) {
         if (existing.dirtySince !== null) dirtySince = existing.dirtySince;
         if (existing.pausedForReauth) pausedForReauth = true;
+        if (existing.institutionalRecheckCause !== undefined) {
+          institutionalRecheckCause = existing.institutionalRecheckCause;
+        }
       }
-      this.originStates.set(origin, { ...snapshot, origin, checking: false, dirtySince, pausedForReauth });
+      const durable = { ...snapshot };
+      delete durable.hostPermission;
+      delete durable.institutionalRecheckCause;
+      this.originStates.set(origin, {
+        ...durable,
+        origin,
+        checking: false,
+        dirtySince,
+        pausedForReauth,
+        ...(institutionalRecheckCause === undefined
+          ? {}
+          : { institutionalRecheckCause }),
+      });
     }
   }
 
@@ -1038,11 +1152,17 @@ export class KeepaliveManager {
   /** Browser-local session state for privileged extension surfaces. */
   getSnapshot(): KeepaliveSnapshot {
     this.syncOriginStates();
-    const resolverOrigin =
-      this.resolver?.protocol === "https:"
-        ? this.resolver.origin
-        : this.persistedResolverOrigin ?? this.grantedResolverOrigin;
     const lastAuthReturnedAt = this.options.lastAuthReturnedAt?.();
+    const candidates = this.originCandidates();
+    const currentOrigin =
+      this.resolver?.protocol === "https:" ? this.resolver.origin : undefined;
+    const resolverOrigin =
+      currentOrigin !== undefined && candidates.includes(currentOrigin)
+        ? currentOrigin
+        : this.persistedResolverOrigin !== undefined &&
+            candidates.includes(this.persistedResolverOrigin)
+          ? this.persistedResolverOrigin
+          : candidates[0];
     return {
       enabled: this.enabled,
       intervalMinutes: this.intervalMinutes,
@@ -1056,6 +1176,10 @@ export class KeepaliveManager {
       pausedForReauth: this.reauthPaused,
       lastProbeAt: this.lastProbeAt ?? null,
       resolverOrigin: resolverOrigin ?? null,
+      hostPermission:
+        resolverOrigin === undefined
+          ? "unknown"
+          : this.hostPermissions.get(resolverOrigin) ?? "unknown",
       lastAuthReturnedAt:
         typeof lastAuthReturnedAt === "number" && Number.isFinite(lastAuthReturnedAt)
           ? lastAuthReturnedAt
@@ -1147,21 +1271,6 @@ export class KeepaliveManager {
     }
   }
 
-  /** Automatic-path probe for callers outside the tab-tracking pipeline
-   * (background.ts's own institutional-landing detection, on tab
-   * navigation) that need an immediate re-probe of one origin without
-   * claiming probeForeground()'s "foreground" reason — that reason carries
-   * the shorter, operator-only MIN_FOREGROUND_PROBE_SPACING_MS floor (see
-   * spacingFloorFor()), and this call site is not an operator action.
-   * Routes through requestProbe() with "navigation", an already-automatic
-   * reason, so it gets the full MIN_PROBE_START_SPACING_MS floor like every
-   * other automatic trigger. */
-  async probeOriginAutomatically(origin: string): Promise<void> {
-    await this.loadPreferences();
-    const target = normalizeHttpsOrigin(origin);
-    if (target === undefined) return;
-    await this.requestProbe(target, "navigation");
-  }
 
   /** `checking` is owned entirely here: requestProbe()/probeOrigin() never
    * touch it, so a "cycle"/"reauth"/"navigation"/etc. request never flips it
@@ -1180,28 +1289,27 @@ export class KeepaliveManager {
     }
   }
 
-  /** Single funnel for every probe trigger — foreground, navigation,
-   * activation, cycle, reauth, wake. An in-flight probe for the origin
-   * queues this request (newest reason/preferredTabID wins) and resolves
-   * once the eventual trailing probe settles; otherwise, if the last probe
-   * for this origin STARTED less than its reason's spacing floor ago (the
-   * shorter MIN_FOREGROUND_PROBE_SPACING_MS for an operator-initiated
-   * "foreground" request, MIN_PROBE_START_SPACING_MS for every automatic
-   * one) the origin is marked dirty and the request is deferred to the
-   * earliest permitted start; otherwise it starts immediately. A deferred
-   * request never touches verdict/lastVerdictAt/lastProbeAt/
-   * lastProbeOutcome — deferral is not an observation.
-   *
-   * Caller settlement differs by how the request was admitted: joining an
-   * in-flight probe, or starting one outright, resolves when that actual
-   * probe attempt settles. A THROTTLE-deferred "foreground" request is
-   * different — the caller only wants to know its request landed, not to
-   * sit through however long another trigger's spacing floor takes; it
-   * resolves the instant the defer is recorded, and the eventual trailing
-   * probe becomes purely the manager's own business from there. A
-   * throttle-deferred automatic request keeps the old behavior: it
-   * resolves only once the trailing probe it piggybacks on has run. */
+  /** Single funnel for every probe trigger. An institutional-landing request
+   * repeats its demand and permission gates here, including when it re-enters
+   * after a spacing delay. This prevents an auth block that ended during the
+   * delay from causing a later background page read. */
   private requestProbe(origin: string, reason: ProbeReason, preferredTabID?: number): Promise<void> {
+    if (reason === "institutional_landing") {
+      const cause =
+        this.originStates.get(origin)?.institutionalRecheckCause;
+      if (
+        cause === undefined ||
+        (cause === "parked_demand" && !this.authDemandOrigins().has(origin))
+      ) {
+        void this.updateOriginSnapshot(origin, {
+          institutionalRecheckCause: undefined,
+        });
+        return Promise.resolve();
+      }
+      if (this.hostPermissions.get(origin) !== "granted") {
+        return Promise.resolve();
+      }
+    }
     if (this.probeInFlight.has(origin)) {
       return this.deferProbe(origin, reason, preferredTabID);
     }
@@ -1209,7 +1317,7 @@ export class KeepaliveManager {
     const lastStart = this.lastProbeStartedAt.get(origin);
     const floor = spacingFloorFor(reason);
     if (lastStart !== undefined && now - lastStart < floor) {
-      void this.markDirty(origin);
+      if (reason !== "institutional_landing") void this.markDirty(origin);
       const trailing = this.deferProbe(origin, reason, preferredTabID);
       this.armSpacingTimer(origin, lastStart + floor);
       return reason === "foreground" ? Promise.resolve() : trailing;
@@ -1613,6 +1721,8 @@ export class KeepaliveManager {
     // "Signed out" for a session that is fine and firing nothing to say so.
     if (generation !== this.probeGenerations.get(origin)) return;
     const isCurrent = origin === this.resolver?.origin;
+    const keepInstitutionalRecheck =
+      this.pendingProbes.get(origin)?.reason === "institutional_landing";
     if (reduction.verdict !== undefined) {
       const authenticated = reduction.verdict === "in";
       const source = reduction.source ?? "none";
@@ -1633,12 +1743,16 @@ export class KeepaliveManager {
         lastProbeAt: now,
         lastProbeOutcome: reduction.outcome,
         dirtySince: null,
+        institutionalRecheckCause: keepInstitutionalRecheck
+          ? this.originStates.get(origin)?.institutionalRecheckCause
+          : undefined,
       });
       if (
         reduction.outcome === "markers" &&
         authenticated &&
         (source === "live_tab" || source === "keepalive_tab") &&
-        this.isConfiguredMember(origin)
+        this.isConfiguredMember(origin) &&
+        this.hostPermissions.get(origin) === "granted"
       ) {
         this.options.onFreshSessionEvidence?.({ origin, observedAt: now, generation, source });
       }
@@ -1655,6 +1769,9 @@ export class KeepaliveManager {
         lastProbeAt: now,
         lastProbeOutcome: reduction.outcome,
         dirtySince: null,
+        institutionalRecheckCause: keepInstitutionalRecheck
+          ? this.originStates.get(origin)?.institutionalRecheckCause
+          : undefined,
       });
     }
 
@@ -1742,27 +1859,46 @@ export class KeepaliveManager {
       this.restoreOriginStates(values[KEEPALIVE_ORIGIN_STATES_KEY]);
     }
     this.originStatesRestored = true;
-    this.grantedResolverOrigins = [];
-    this.grantedResolverOrigin = undefined;
+    this.grantedPermissionPatterns = undefined;
     if (this.api.permissions !== undefined) {
-      let grantedOrigins: string[] | undefined;
       try {
         const granted = await this.api.permissions.getAll();
         if (generation !== this.loadPreferencesGeneration) return;
-        grantedOrigins = granted.origins;
+        this.grantedPermissionPatterns = Array.isArray(granted.origins)
+          ? granted.origins.filter(
+              (pattern): pattern is string => typeof pattern === "string",
+            )
+          : undefined;
       } catch {
         if (generation !== this.loadPreferencesGeneration) return;
-        grantedOrigins = undefined;
+        this.grantedPermissionPatterns = undefined;
       }
-      this.grantedResolverOrigins = resolverOriginsFromPermissionPatterns(grantedOrigins);
-      this.grantedResolverOrigin = this.grantedResolverOrigins[0];
     }
     if (generation !== this.loadPreferencesGeneration) return;
     this.syncOriginStates();
+    this.hostPermissions.clear();
+    for (const origin of this.originCandidates()) {
+      const patterns = this.grantedPermissionPatterns;
+      this.hostPermissions.set(
+        origin,
+        patterns === undefined
+          ? "unknown"
+          : patterns.some((pattern) =>
+              permissionPatternCoversOrigin(pattern, origin)
+            )
+            ? "granted"
+            : "required",
+      );
+    }
   }
 
   private configuredResolver(): URL | undefined {
-    const origin = this.persistedResolverOrigin ?? this.grantedResolverOrigin ?? this.originCandidates()[0];
+    const candidates = this.originCandidates();
+    const origin =
+      this.persistedResolverOrigin !== undefined &&
+      candidates.includes(this.persistedResolverOrigin)
+        ? this.persistedResolverOrigin
+        : candidates[0];
     if (origin === undefined) return undefined;
     try {
       return new URL(origin);
@@ -1920,6 +2056,12 @@ export class KeepaliveManager {
     try {
       const url = new URL(openurl);
       if (url.protocol !== "https:") return undefined;
+      if (
+        this.configuredOriginsReady() &&
+        !this.isConfiguredMember(url.origin)
+      ) {
+        return undefined;
+      }
       this.rememberResolverOrigin(url);
       return url;
     } catch {
@@ -2408,20 +2550,44 @@ export class KeepaliveManager {
     this.resetVerdict(ownedOrigin);
   }
 
-  /** Periodic wake, and the durable recovery path for events lost to a
-   * suspended worker: setTimeout-based timers (cycleTimer/reauthTimer/
-   * settleTimers/spacingTimers) never survive a service-worker restart, but
-   * dirtySince does. Probes only origins that are dirty or paused for
-   * reauth, and runs the owned-tab cycle work when its absolute deadline
-   * has passed — pure local state, no daemon-port/message involvement. */
+  /** Periodic wake and durable recovery. Resolver-navigation dirtiness keeps
+   * its existing behavior. A publisher-landing recheck is narrower: it
+   * survives worker sleep but is resumed only while matching auth-pending
+   * demand and effective resolver access still exist. */
   async onWake(): Promise<void> {
     await this.loadPreferences();
     const now = Date.now();
-    const due: string[] = [];
+    const ordinaryDue: string[] = [];
+    const institutionalDue: string[] = [];
+    const demanded = this.authDemandOrigins();
     for (const [origin, snapshot] of this.originStates) {
-      if (snapshot.dirtySince !== null || snapshot.pausedForReauth) due.push(origin);
+      const cause = snapshot.institutionalRecheckCause;
+      if (
+        cause === "parked_demand" &&
+        !demanded.has(origin)
+      ) {
+        await this.updateOriginSnapshot(origin, {
+          institutionalRecheckCause: undefined,
+        });
+      }
+      const ordinary =
+        snapshot.dirtySince !== null || snapshot.pausedForReauth;
+      if (ordinary) {
+        ordinaryDue.push(origin);
+      } else if (
+        cause !== undefined &&
+        (cause === "tracked_auth_return" || demanded.has(origin)) &&
+        this.hostPermissions.get(origin) === "granted"
+      ) {
+        institutionalDue.push(origin);
+      }
     }
-    await Promise.all(due.map((origin) => this.requestProbe(origin, "wake")));
+    await Promise.all([
+      ...ordinaryDue.map((origin) => this.requestProbe(origin, "wake")),
+      ...institutionalDue.map((origin) =>
+        this.requestProbe(origin, "institutional_landing")
+      ),
+    ]);
 
     if (this.nextCycleDueAt !== undefined && this.nextCycleDueAt <= now) {
       await this.reconcile();

@@ -176,6 +176,26 @@ test("version 3 upgrades and old manual_delivery_target is dropped", () => {
   expect(asRecord["manual_delivery_target"]).toBeUndefined();
 });
 
+test("version 7 upgrades a configured institution binding and rejects URL-shaped residue", () => {
+  const migrated = migrateManagedState({
+    version: 7,
+    activeJobs: [
+      migrationJob({
+        institution_origin: "https://resolver.example.edu",
+      }),
+      migrationJob({
+        job_id: "job_migrate_0002",
+        institution_origin: "https://resolver.example.edu/openurl?secret=1",
+      }),
+    ],
+  });
+
+  expect(migrated.activeJobs[0]?.institution_origin).toBe(
+    "https://resolver.example.edu",
+  );
+  expect(migrated.activeJobs[1]?.institution_origin).toBeUndefined();
+});
+
 test("materialization migration preserves only validated institutional effect identity", () => {
   const valid = {
     job_id: "job_migrate_0001",

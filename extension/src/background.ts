@@ -3117,30 +3117,55 @@ export class Bridge {
     }
   }
 
-  /** The institution origin for one job. The offer URL's own origin answers
-   * when the daemon's config knows it; otherwise the first provider host the
-   * config-derived resolver origins recognize does. A LibKey-routed offer
-   * opens on libkey.io and forwards through the institution's resolver, so
-   * the offer origin stops identifying the institution the moment LibKey
-   * link mode is configured — the daemon deliberately keeps the resolver
-   * host on provider_hosts for exactly this derivation (ADR-0016). Fails
-   * closed to undefined: an origin outside the configured set never
-   * becomes institutional bookkeeping. */
+  /** Derive one configured institution from durable offer metadata. The
+   * daemon-supplied resolver set is authoritative; an offer/provider can
+   * select from it but can never create a new institution. */
+  private configuredInstitutionOrigin(
+    offerURL: string | undefined,
+    providerHosts: string[],
+  ): string | undefined {
+    const known = this.knownResolverOrigins();
+    if (offerURL !== undefined) {
+      try {
+        const offered = new URL(offerURL);
+        if (
+          offered.protocol === "https:" &&
+          known.includes(offered.origin)
+        ) {
+          return offered.origin;
+        }
+      } catch {
+        // Provider-host fallback below remains fail-closed.
+      }
+    }
+    const matches = new Set<string>();
+    for (const origin of known) {
+      try {
+        if (hostMatches(new URL(origin).hostname, providerHosts)) {
+          matches.add(origin);
+        }
+      } catch {
+        // knownResolverOrigins already validates; refuse malformed residue.
+      }
+    }
+    return matches.size === 1 ? matches.values().next().value : undefined;
+  }
+
+  /** The configured institution origin for one job. The persisted binding
+   * survives worker sleep; old-daemon rows fall back to a current re-offer's
+   * exact resolver origin. */
   private jobInstitutionOrigin(job: ActiveJob): string | undefined {
     const known = this.knownResolverOrigins();
-    const hinted = this.resolverOriginHint(this.offerURLs.get(job.job_id));
-    if (hinted !== undefined && known.includes(hinted)) return hinted;
-    for (const host of job.provider_hosts ?? []) {
-      const match = known.find((origin) => {
-        try {
-          return new URL(origin).hostname === host;
-        } catch {
-          return false;
-        }
-      });
-      if (match !== undefined) return match;
-    }
-    return undefined;
+    const stored = job.institution_origin;
+    if (stored !== undefined && known.includes(stored)) return stored;
+    const offered = this.offerURLs.get(job.job_id);
+    // Older daemons advertise no configured-origin set. Preserve their prior
+    // exact-offer fallback; a current non-empty set remains authoritative.
+    if (known.length === 0) return this.resolverOriginHint(offered);
+    return this.configuredInstitutionOrigin(
+      offered,
+      job.provider_hosts ?? [],
+    );
   }
 
   knownResolverOrigins(): readonly string[] {
@@ -3159,17 +3184,12 @@ export class Bridge {
     }
     return [...origins];
   }
-  /** Resolve only browser-local authentication demand to its configured
-   * institution. Unknown origins are omitted rather than guessed, so popup
-   * rows can never be coupled to a different resolver's job. */
+  /** Browser-local authentication demand that is already parked at a visible
+   * human sign-in step. A queued requires_auth offer is papio's future work,
+   * not permission to inspect a library page now. */
   sessionAuthDemand(): SessionAuthDemand[] {
     return this.store.activeJobs
-      .filter(
-        (job) =>
-          job.requires_auth === true ||
-          job.status === "auth_pending" ||
-          job.waiting_for_session === true,
-      )
+      .filter((job) => job.status === "auth_pending")
       .map((job) => {
         const origin = this.jobInstitutionOrigin(job);
         return origin === undefined
@@ -3177,6 +3197,38 @@ export class Bridge {
           : { job_id: job.job_id, origin };
       })
       .filter((demand): demand is SessionAuthDemand => demand !== undefined);
+  }
+
+  authDemandOrigins(): string[] {
+    return [
+      ...new Set(this.sessionAuthDemand().map((demand) => demand.origin)),
+    ];
+  }
+
+  /** Correlate a settled untracked publisher page with visible parked demand.
+   * Demand is checked before URL parsing, so unrelated browsing is not read
+   * when papio has no sign-in block. Multiple institutions fail closed. */
+  private institutionalLandingOrigin(rawURL: string | undefined): string | undefined {
+    const parked = this.store.activeJobs.filter(
+      (job) => job.status === "auth_pending",
+    );
+    if (parked.length === 0 || rawURL === undefined) return undefined;
+    let hostname: string;
+    try {
+      const parsed = new URL(rawURL);
+      if (parsed.protocol !== "https:") return undefined;
+      hostname = parsed.hostname.toLowerCase();
+    } catch {
+      return undefined;
+    }
+    const origins = new Set<string>();
+    for (const job of parked) {
+      if (!hostMatches(hostname, job.provider_hosts)) continue;
+      const origin = this.jobInstitutionOrigin(job);
+      if (origin === undefined) return undefined;
+      origins.add(origin);
+    }
+    return origins.size === 1 ? origins.values().next().value : undefined;
   }
 
   sessionOriginStates(): KeepaliveOriginSnapshot[] {
@@ -13384,7 +13436,20 @@ export class Bridge {
     job: ActiveJob,
     offerURL: string,
   ): Promise<void> {
-    await this.update((s) => upsertJob(s, job));
+    const derived = this.configuredInstitutionOrigin(
+      offerURL,
+      job.provider_hosts,
+    );
+    const retained =
+      job.institution_origin !== undefined &&
+      this.knownResolverOrigins().includes(job.institution_origin)
+        ? job.institution_origin
+        : undefined;
+    const institutionOrigin = derived ?? retained;
+    const persisted = { ...job };
+    if (institutionOrigin === undefined) delete persisted.institution_origin;
+    else persisted.institution_origin = institutionOrigin;
+    await this.update((s) => upsertJob(s, persisted));
     this.offerURLs.set(job.job_id, offerURL);
     if (job.requires_auth === true)
       this.keepaliveManager?.learnResolver(offerURL);
@@ -13603,6 +13668,21 @@ export class Bridge {
     });
   }
 
+  private async resolverAccessGranted(origin: string): Promise<boolean> {
+    const known = this.knownResolverOrigins();
+    // An older daemon sends no configured-origin set. Preserve its prior
+    // behavior; current daemons supply the closed set this feature requires.
+    if (known.length === 0) return true;
+    if (!known.includes(origin)) return false;
+    try {
+      return await this.deps.permissions.contains({
+        origins: [`${origin}/*`],
+      });
+    } catch {
+      return false;
+    }
+  }
+
   /** Keeps an OA landing from opening an institutional queue while preserving
    * the existing one-visible-tab flow for ordinary offers. `origin` may be
    * undefined for a job whose offer URL never resolved to a bare HTTPS
@@ -13611,8 +13691,12 @@ export class Bridge {
     origin: string | undefined,
     requiresAuth: boolean | undefined,
   ): boolean {
+    const known = this.knownResolverOrigins();
+    const originAllowed =
+      origin !== undefined &&
+      (known.length === 0 || known.includes(origin));
     return (
-      (origin !== undefined && this.hasAuthEvidence(origin)) ||
+      (originAllowed && this.hasAuthEvidence(origin)) ||
       (requiresAuth !== true && this.openAccessLandingObserved)
     );
   }
@@ -14263,13 +14347,19 @@ export class Bridge {
     rawURL: string,
   ): boolean {
     if (job.requires_auth !== true || isAuthenticationURL(rawURL)) return false;
-    const offered = this.offerURLs.get(job.job_id);
-    if (offered === undefined) return false;
     try {
       const landing = new URL(rawURL);
-      const offer = new URL(offered);
+      const offered = this.offerURLs.get(job.job_id);
+      let offeredOrigin: string | undefined;
+      if (offered !== undefined) {
+        try {
+          offeredOrigin = new URL(offered).origin;
+        } catch {
+          offeredOrigin = undefined;
+        }
+      }
       return (
-        landing.origin === offer.origin ||
+        landing.origin === offeredOrigin ||
         hostMatches(landing.hostname, job.provider_hosts) ||
         this.deps.adapterSpecs.some((adapter) =>
           hostMatches(landing.hostname, adapter.hosts),
@@ -14314,14 +14404,9 @@ export class Bridge {
    * fails closed (do nothing): this remains a best-effort, narrowly-scoped
    * release, never a source of truth beyond its own origin.
    *
-   * Also resumes this origin's waiting_for_session siblings, UNCONDITIONALLY
-   * — not gated behind firstAuthEvidence/warm-evidence like the keepalive
-   * probe nudge above. THIS job finishing its own sign-in is the clearest
-   * possible proof the shared session is real, regardless of whether some
-   * other evidence for this origin already existed; gating it the same way
-   * would silently drop exactly the case that motivated this whole feature —
-   * a still-warm-looking origin whose real IdP session had actually expired,
-   * so evidence never re-lands and only THIS landing ever proves it. */
+   * The resolver probe is requested on every accepted institutional landing.
+   * Recent release evidence may still release work immediately, but it must
+   * never suppress the fresh check that updates the popup's session verdict. */
   private async recordInstitutionalSession(
     job: ActiveJob,
     rawURL: string,
@@ -14334,22 +14419,21 @@ export class Bridge {
     // exactly the same first-hand evidence this function already exists to
     // record; latched so only the first landing per grant reports it.
     void this.emitClaimObservation(job.job_id, job.tab_id, "auth_returned", true);
-    const firstAuthEvidence = !this.hasAuthEvidence(origin);
+    await this.keepaliveManager?.noteInstitutionalLanding(
+      origin,
+      "tracked_auth_return",
+    );
+    if (
+      !this.holderRole() ||
+      !(await this.resolverAccessGranted(origin))
+    ) {
+      return true;
+    }
     await this.update((s) => ({
       ...s,
       lastAuthReturnedAt: now,
       authEvidenceByOrigin: this.withAuthEvidence(s, origin, now),
     }));
-    if (firstAuthEvidence) {
-      void this.keepaliveManager?.markDirty(origin);
-      // Not probeForeground: this fires from a tab NAVIGATION, an automatic
-      // path, not an operator action, so it must not take the 2s operator
-      // floor (MIN_FOREGROUND_PROBE_SPACING_MS in keepalive.ts) — the
-      // bounded rate this landing path relies on assumes the 10s automatic
-      // floor instead. markDirty stays regardless as the wake-sweep fallback
-      // if this probe never lands.
-      void this.keepaliveManager?.probeOriginAutomatically(origin);
-    }
     await this.drainQueuedHandoffs(origin, undefined, false);
     await this.reloadAuthenticationHandoffs(origin);
     return true;
@@ -14616,6 +14700,12 @@ export class Bridge {
   ): Promise<void> {
     const { origin } = evidence;
     await this.ready;
+    if (
+      !this.holderRole() ||
+      !(await this.resolverAccessGranted(origin))
+    ) {
+      return;
+    }
     const now = this.deps.now();
     await this.update((s) => ({
       ...s,
@@ -14664,7 +14754,7 @@ export class Bridge {
         await this.clearProviderDrainPark(this.providerKeyForJob(forced));
     }
     const jobOrigin = (job: ActiveJob): string | undefined =>
-      this.resolverOriginHint(this.offerURLs.get(job.job_id));
+      this.jobInstitutionOrigin(job);
     const matchesOrigin =
       originScope === undefined
         ? (_job: ActiveJob) => true
@@ -14873,7 +14963,7 @@ export class Bridge {
         job.status === "queued" ||
         (!includeInstitutional && job.requires_auth === true) ||
         (origin !== undefined &&
-          this.resolverOriginHint(this.offerURLs.get(job.job_id)) !== origin) ||
+          this.jobInstitutionOrigin(job) !== origin) ||
         this.authStalledReported.has(job.job_id)
       ) {
         continue;
@@ -15875,14 +15965,30 @@ export class Bridge {
           typeof __PAPIO_DAEMON_VERSION__ === "string"
             ? __PAPIO_DAEMON_VERSION__
             : "";
-        await this.update((s) => ({
-          ...s,
+        const negotiated: Pick<
+          StoreShape,
+          | "connectionStatus"
+          | "daemonVersion"
+          | "daemonUpdateHint"
+          | "daemonFeatures"
+          | "resolverOrigins"
+        > = {
           connectionStatus,
           daemonVersion: version,
           daemonUpdateHint: hasDaemonUpdateHint(version, stampedVersion),
           daemonFeatures: features,
           resolverOrigins,
-        }));
+        };
+        const reapplyAfterHydration = !this.hydrated;
+        if (this.hydrated) {
+          await this.update((s) => ({ ...s, ...negotiated }));
+        } else {
+          // hello can arrive while backend.load is still in flight. Publish
+          // negotiation in memory now so the inbound chain can continue, then
+          // reapply it after hydration instead of deadlocking hello against
+          // startup work that itself waits for negotiated features.
+          this.store = { ...this.store, ...negotiated };
+        }
         await this.syncConnectionBadge(connectionStatus);
         // Set before anything below can consult it. An absent `role` is a
         // daemon that predates session roles, and it only ever acknowledged
@@ -15900,6 +16006,20 @@ export class Bridge {
           this.lastKnownBrowserHolderGeneration = ackHolderGeneration;
         }
         this.keepaliveManager?.notifyConfiguredOriginsChanged();
+        if (reapplyAfterHydration) {
+          const acknowledgedGeneration = this.portGeneration;
+          void this.ready.then(async () => {
+            if (
+              this.helloAckGeneration !== acknowledgedGeneration ||
+              this.portGeneration !== acknowledgedGeneration
+            ) {
+              return;
+            }
+            await this.update((s) => ({ ...s, ...negotiated }));
+            this.keepaliveManager?.notifyConfiguredOriginsChanged();
+            await this.syncConnectionBadge(connectionStatus);
+          });
+        }
         if (features.includes(AUTHENTICATION_CLAIM_FEATURE)) {
           // Same off-chain rule as reconciliation below: schedule only,
           // never await — scheduleObservationOutboxDrain is itself
@@ -16069,6 +16189,10 @@ export class Bridge {
     const providerHosts = hostsRaw.filter(
       (h): h is string => typeof h === "string",
     );
+    const institutionOrigin = this.configuredInstitutionOrigin(
+      openurl,
+      providerHosts,
+    );
     const providerKey = this.providerKeyForHosts(providerHosts);
     const providerParked =
       this.currentProviderDrainLease(providerKey)?.parkedReason === "challenge";
@@ -16192,6 +16316,16 @@ export class Bridge {
     ) {
       await this.update((s) =>
         patchJob(s, jobID, { access_mode: offeredAccessMode }),
+      );
+      existing = findByJob(this.store, jobID);
+    }
+    if (
+      existing !== undefined &&
+      institutionOrigin !== undefined &&
+      existing.institution_origin !== institutionOrigin
+    ) {
+      await this.update((s) =>
+        patchJob(s, jobID, { institution_origin: institutionOrigin }),
       );
       existing = findByJob(this.store, jobID);
     }
@@ -16334,6 +16468,9 @@ export class Bridge {
         tab_id: -1,
         status: "queued",
         provider_hosts: providerHosts,
+        ...(institutionOrigin === undefined
+          ? {}
+          : { institution_origin: institutionOrigin }),
         offered_at: now,
         expires_at: Number.isNaN(expiresMs) ? now : expiresMs,
         engagement_required: true,
@@ -17008,6 +17145,12 @@ export class Bridge {
     await this.ready;
     const job = findByTab(this.store, tabID);
     if (!job) {
+      if (change.status === "complete") {
+        const origin = this.institutionalLandingOrigin(change.url ?? tab.url);
+        if (origin !== undefined) {
+          await this.keepaliveManager?.noteInstitutionalLanding(origin);
+        }
+      }
       // A provider "download" that opens the PDF in a NEW viewer tab (e.g. JSTOR
       // navigates to /stable/pdf/<id>.pdf) is untracked here. Adopt it for the
       // tracked handoff tab that spawned it so the PDF still flows to the daemon.
@@ -22376,6 +22519,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     warmDemand: () => bridge.warmDemand(),
     latestOpenURL: () => bridge.latestOpenURL(),
     knownResolverOrigins: () => bridge.knownResolverOrigins(),
+    authDemandOrigins: () => bridge.authDemandOrigins(),
     queuedAuthJobs: () => bridge.queuedAuthJobs(),
     stalledAuthJobs: () => bridge.stalledAuthJobIDs(),
     lastAuthReturnedAt: () => bridge.lastAuthReturnedAt(),
@@ -22391,6 +22535,10 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
       // Signing out is exactly when papio must stop opening queued handoffs
       // into a session that will bounce them to a login wall.
       if (!authenticated) void bridge.revokeAuthEvidence(origin);
+      void bridge.syncConnectionBadge();
+    },
+    onOriginPermissionChanged: (origin: string, granted: boolean) => {
+      if (!granted) void bridge.revokeAuthEvidence(origin);
       void bridge.syncConnectionBadge();
     },
     onReauthStateChanged: (paused) => bridge.setKeepaliveReauthNeeded(paused),

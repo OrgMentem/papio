@@ -120,6 +120,23 @@ makes no network request; detected identifiers and the structural count go only
 to the local *papio* application when the selection workspace opens, and
 selected canonical keys go there when submitted.
 
+## Amendment 2026-08-28: the explicit-scan rule is citation-scoped
+
+Decision 1 governs page-content citation detection. It does not prohibit the
+separate institution-session probes ratified by ADR-0013 and narrowed by
+ADR-0026.
+
+The distinction is structural. The scanner reads citation-shaped page content
+only after an explicit click on the current tab. A session trigger reads no
+publisher page content. It accepts only a completed landing that matches an
+`auth_pending` job's declared provider, then asks papio's configured library
+resolver to run its existing bounded session classifier. The publisher landing
+is never evidence.
+
+This amendment does not weaken Decision 1. There is still no persistent
+citation scanner, dynamic content-script registration, `MutationObserver`,
+ambient identifier collection, or scanner badge.
+
 ## Decision 3: Detection is local-only, top-frame, container-scoped
 
 Detection runs entirely in the content script against the top frame only —
