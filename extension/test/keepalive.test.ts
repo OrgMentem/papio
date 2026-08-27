@@ -790,6 +790,66 @@ test("snapshot resolves a durable resolver before granted permission fallback", 
   expect(fallback.manager.getSnapshot().resolverOrigin).toBe("https://granted.resolver.example");
 });
 
+test("a permission grant probes a configured origin that was never dirty", async () => {
+  // The live defect this closes: Options and the popup can grant a resolver
+  // host at any time, chrome.permissions.onAdded fires, and background's
+  // onPermissionsChanged runs — but it never reached this manager, so parked
+  // work kept waiting on evidence papio was not allowed to read.
+  //
+  // Discriminating on purpose. notifyConfiguredOriginsChanged() looks like the
+  // right tool and is NOT: it probes only origins whose dirtySince is already
+  // set, and a newly granted origin is typically CLEAN — nothing invalidated
+  // its evidence, papio simply could not read the page. This test fails
+  // against that shortcut.
+  const granted: string[] = [];
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: ["https://resolver.example.edu"],
+    grantedOrigins: granted,
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+
+  // A decisive commit clears dirtySince. That clean state is what makes this
+  // test discriminating rather than incidental.
+  await h.manager.probeForeground();
+  expect(
+    h.manager.getOriginSnapshots().find((s) => s.origin === "https://resolver.example.edu")?.dirtySince,
+  ).toBe(null);
+  const injectedBefore = h.scripting.injectionCounts.get(1) ?? 0;
+
+  // Past the automatic start floor, so admission is not what is under test.
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS + 1);
+  granted.push("https://resolver.example.edu/*");
+  await h.manager.onPermissionsChanged();
+
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBeGreaterThan(injectedBefore);
+});
+
+test("a permission grant for a non-configured origin probes nothing", async () => {
+  // ADR-0013: the row universe is exactly the daemon's configured origins, and
+  // a permission grant never creates an institution. "Grant all sources" hands
+  // papio dozens of provider patterns; none may become a probe target or a row.
+  const granted: string[] = [];
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: ["https://resolver.example.edu"],
+    grantedOrigins: granted,
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  await h.manager.probeForeground();
+  const injectedBefore = h.scripting.injectionCounts.get(1) ?? 0;
+  const originsBefore = h.manager.getOriginSnapshots().map((s) => s.origin);
+
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS + 1);
+  granted.push("https://unrelated.provider.example/*");
+  await h.manager.onPermissionsChanged();
+
+  expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(injectedBefore);
+  expect(h.manager.getOriginSnapshots().map((s) => s.origin)).toEqual(originsBefore);
+});
+
 test("probeForeground always runs a real scan, even moments after the previous one completed", async () => {
   // probeForeground() replaces checkNow(): SESSION_STALE_MS is a
   // display-trust budget for the popup only, never a gate on whether a

@@ -3719,6 +3719,13 @@ export class Bridge {
       }
     }
     await this.syncConnectionBadge();
+    // A RESOLVER grant is not provider work: the loop above only clears
+    // provider-host markers, so before this call the grant was observed and
+    // then never acted on for institutions — parked work kept waiting on a
+    // library page papio had just been allowed to read. Placed after the badge
+    // so an ungranted-resolver count repaints promptly instead of behind a
+    // probe, and awaited so the ordering is deterministic for callers.
+    await this.keepaliveManager?.onPermissionsChanged();
   }
 
   /** Resolve where handoffs open. `tab-group` degrades to `work-window` when

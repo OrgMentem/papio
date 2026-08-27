@@ -2097,6 +2097,104 @@ test("session card matrix propagates probe outcomes without hijacking a decided 
   expect(warmDespiteStaleOutcome.label).toContain("Signed in");
 });
 
+test("an inconclusive recheck never reports signed out", () => {
+  // Decision boundary, enumerated one outcome per case on purpose. keepalive.ts
+  // states the rule — "an attempt that learned nothing must not overwrite what
+  // an earlier attempt learned" — and commitOriginProbe advances only
+  // lastProbeAt/lastProbeOutcome for an inconclusive attempt, leaving the
+  // verdict intact. This pins the consequence at the popup boundary: papio
+  // looked, could not tell, and must not therefore claim the session expired.
+  const now = Date.now();
+  const base = {
+    enabled: true,
+    intervalMinutes: 4,
+    pausedForReauth: false,
+    checking: false,
+    likelyAuthenticated: false,
+    lastProbeAt: now,
+    resolverOrigin: "https://example.primo.exlibrisgroup.com",
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+  };
+
+  for (const outcome of ["no_markers", "scan_failed", "no_tab", "partial_scan", "conflict"] as const) {
+    const card = deriveSessionCardState({
+      ...base,
+      authenticated: true,
+      verdict: "in",
+      probeSource: "live_tab",
+      lastProbeOutcome: outcome,
+      lastVerdictAt: now,
+    });
+    expect(card.label).not.toContain("Signed out");
+    // Not vacuous: a card that rendered nothing would also "not contain"
+    // the forbidden string, so the surviving verdict is asserted too.
+    expect(card.label).toContain("Signed in");
+  }
+
+  // The blocker. A declined Firefox host grant is a permanent researcher
+  // choice, and its shipped representation is an origin that has never landed
+  // a decisive verdict because papio was never allowed to read the page. It
+  // must name the remedy, and must never read as an expired session.
+  const blocker = deriveSessionCardState({
+    ...base,
+    authenticated: false,
+    verdict: "unknown",
+    probeSource: "none",
+    lastProbeOutcome: "scan_failed",
+    lastVerdictAt: null,
+  });
+  expect(blocker.label).not.toContain("Signed out");
+  expect(blocker.label).toBe("papio couldn't read the library page — check site access in Options");
+  expect(blocker.action).toBe("signin");
+});
+
+test("an inconclusive recheck still names its outcome", () => {
+  // Inverse guard for the test above. A suite that only FORBIDS a string
+  // passes trivially against an empty card, so every inconclusive outcome is
+  // asserted to carry its own distinct, actionable copy.
+  const now = Date.now();
+  const base = {
+    enabled: true,
+    intervalMinutes: 4,
+    pausedForReauth: false,
+    checking: false,
+    likelyAuthenticated: false,
+    lastProbeAt: now,
+    resolverOrigin: "https://example.primo.exlibrisgroup.com",
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+  };
+  const expected: Record<string, string> = {
+    no_tab: "No library page open — open your library to verify",
+    no_markers: "Signed-in state unclear on this page",
+    scan_failed: "papio couldn't read the library page — check site access in Options",
+    partial_scan: "Too many library tabs to check reliably",
+    conflict: "Your library tabs disagree — open your library page",
+  };
+  const seen = new Set<string>();
+  for (const [outcome, label] of Object.entries(expected)) {
+    const card = deriveSessionCardState({
+      ...base,
+      authenticated: false,
+      verdict: "unknown",
+      probeSource: "none",
+      lastProbeOutcome: outcome as "no_tab",
+      lastVerdictAt: null,
+    });
+    expect(card.label).toBe(label);
+    expect(card.action).toBe("signin");
+    seen.add(card.label);
+  }
+  // Distinct copy per outcome: collapsing two onto one string would still
+  // satisfy every assertion above.
+  expect(seen.size).toBe(Object.keys(expected).length);
+});
+
 test("an origin that never landed a decisive verdict resolves to its honest probe outcome, not an eternal spinner", () => {
   // Regression for the "Checking session…" that never resolves: commitOriginProbe()
   // (keepalive.ts) only ever sets lastVerdictAt on a DECISIVE commit, so an origin

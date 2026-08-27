@@ -3199,6 +3199,35 @@ test("Slice 0: an online wake paces exactly one release even with four queued re
   expect(tabsSeenAtWake).toEqual([0, 0]);
 });
 
+test("a permission grant reaches the keepalive manager", async () => {
+  // The one broken link. chrome.permissions.onAdded already fires and
+  // onPermissionsChanged already runs, clearing provider-host markers and
+  // reclassifying provider jobs — but it never told the keepalive manager, so
+  // a resolver grant left parked institutional work waiting on evidence papio
+  // had just been allowed to read.
+  const h = makeHarness(emptyStore());
+  const calls: string[] = [];
+  h.bridge.attachKeepalive({
+    getSnapshot: () => ({ pausedForReauth: false }),
+    noteResolverActivated: () => {},
+    markDirty: async () => {},
+    probeForeground: async () => {},
+    probeOriginAutomatically: async () => {},
+    notifyConfiguredOriginsChanged: () => {},
+    noteResolverNavigation: () => {},
+    noteTabRemoved: () => {},
+    onWake: async () => {},
+    onPermissionsChanged: async () => {
+      calls.push("keepalive");
+    },
+  } as unknown as KeepaliveManager);
+
+  await h.bridge.start();
+  await h.bridge.onPermissionsChanged();
+
+  expect(calls).toEqual(["keepalive"]);
+});
+
 test("Slice 0: a legacy engagement park's offer URL is worker-local only — a genuine restart drops it, and the operator's explicit open needs the daemon's natural re-offer to recover it", async () => {
   const first = makeHarness({
     ...emptyStore(),

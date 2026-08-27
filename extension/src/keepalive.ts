@@ -932,6 +932,41 @@ export class KeepaliveManager {
       if (snapshot.dirtySince !== null) void this.requestProbe(origin, "wake");
     }
   }
+
+  /** A host grant changed. Options and the popup can grant a resolver origin
+   * at any moment, and until that grant lands papio cannot read that library
+   * page at all — every probe there fails (`scan_failed`, or `no_tab` when no
+   * candidate tab survives the query), so parked institutional work waits on
+   * evidence that could never arrive. `chrome.permissions.onAdded` already
+   * observed the grant; this is what acts on it.
+   *
+   * NARROW on purpose, and deliberately NOT notifyConfiguredOriginsChanged()
+   * above: that sibling probes only origins whose `dirtySince` is already set,
+   * and a newly granted origin is typically CLEAN — nothing invalidated its
+   * evidence, papio simply was not allowed to read the page. Routing a grant
+   * through it would skip exactly the case this method exists for.
+   *
+   * The granted set is DIFFED rather than read from the event argument, so one
+   * path covers a grant from any surface (per-source, bulk, popup) and a
+   * revocation, without parsing a raw match pattern a second time.
+   *
+   * isConfiguredMember() gates the write, not just the probe: ADR-0013's rule
+   * is that a grant may SELECT among configured origins but never create an
+   * institution, and updateOriginSnapshot() would otherwise mint a phantom row
+   * for every provider host handed over by "Grant all sources".
+   *
+   * Reason "wake" reuses the existing automatic trigger — the same one the
+   * sibling above uses for the analogous membership change — so this inherits
+   * MIN_PROBE_START_SPACING_MS and adds no new reason to the union. */
+  async onPermissionsChanged(): Promise<void> {
+    const grantedBefore = new Set(this.grantedResolverOrigins);
+    await this.loadPreferences();
+    for (const origin of this.grantedResolverOrigins) {
+      if (grantedBefore.has(origin) || !this.isConfiguredMember(origin)) continue;
+      await this.markDirty(origin);
+      await this.requestProbe(origin, "wake");
+    }
+  }
   private updateOriginSnapshot(
     origin: string | undefined,
     patch: Partial<KeepaliveOriginSnapshot>,
