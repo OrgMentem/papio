@@ -2,7 +2,7 @@
 template: home.html
 ---
 
-Search for works, queue them for acquisition, check every PDF is the paper you asked for, and offer it toward your library — from the terminal or from a coding agent.
+Search for works, queue them for acquisition, check each PDF against the requested work, and offer it toward your library — from the terminal or from a coding agent.
 
 Zotero users get preview-first import through [zotio](https://github.com/OrgMentem/zotio). Users of papis, Calibre, plain folders, or custom scripts get a best-effort handoff through a one-line [`on_ready` hook](guide/hooks.md); hook failures never fail or retry the acquisition job.
 
@@ -37,8 +37,9 @@ Every request becomes a job. `papio` ranks the possible sources and tries them i
 papio init                                                   # guided setup: config, data folder, database, browser connector, health check
 papio doctor                                                 # verify readiness: sources, PDF tools, zotio
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
-papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
-papio acquire --batch refs.bib                               # or RIS, CSL-JSON, NBIB — start from the library you already have
+papio acquire 10.1371/journal.pone.0262026 --auto-import --wait  # requires zotio
+papio acquire --from-zotio                                    # queue up to 25 missing Zotero attachments
+papio acquire --batch refs.bib                                 # or RIS, CSL-JSON, NBIB — start from the library you already have
 papio status --follow                                        # working / awaiting-human / needs-review / ready / failed
 papio actions list                                           # open browser handoffs and identity reviews
 ```

@@ -76,17 +76,20 @@
 
 <p align="center">
   <strong>Your browser, your credentials — <em>papio</em> never sees them.</strong><br>
-  <strong>The wrong PDF never gets filed: identity is verified first.</strong><br>
-  <strong>Runs entirely on your machine; every PDF carries a
-  <a href="https://orgmentem.github.io/papio/privacy/">receipt</a>.</strong>
+  <strong>Identity is checked before automatic filing; ambiguous cases wait for review.</strong><br>
+  <strong>Runs on your machine; required lookups use
+  <a href="https://orgmentem.github.io/papio/privacy/">documented destinations</a>.</strong><br>
+  <strong>Every accepted PDF has a
+  <a href="docs/concepts/validation-and-provenance.md">provenance receipt</a>
+  in its acquisition bundle.</strong>
 </p>
 
 ```bash
-brew install orgmentem/tap/papio                          # or grab a signed binary from Releases
+brew install orgmentem/tap/papio                          # or download a release archive from Releases
 papio init                                                # guided setup: config, data folder, database, browser connector, health check
 papio doctor                                              # checks the whole chain, including the browser extension and zotio
-papio acquire 10.1371/journal.pone.0262026 --auto-import --wait
-papio acquire --from-zotio                                # backfill: queue Zotero items that lack an attached PDF
+papio acquire 10.1371/journal.pone.0262026 --auto-import --wait  # requires zotio
+papio acquire --from-zotio                                # queue up to 25 Zotero items missing an attached PDF
 papio acquire --batch refs.bib                            # or RIS, CSL-JSON, NBIB — start from the library you already have
 papio status --follow                                     # working / awaiting-human / needs-review / ready / failed
 papio actions list                                        # open browser handoffs and identity reviews
@@ -105,7 +108,7 @@ Finding metadata is not enough. A usable workflow also needs to locate a PDF,
 verify that it matches the requested work, and file it in the user's library
 without handling institutional credentials.
 
-`papio` provides that workflow with explicit boundaries:
+*papio* provides that workflow with explicit boundaries:
 
 - **Access boundaries.** Open-access and explicitly licensed APIs run before
   institutional access. Institutional fetches happen as an OpenURL handoff
