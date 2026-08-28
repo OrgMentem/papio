@@ -54,6 +54,7 @@ Docs: https://orgmentem.github.io/papio/
   detected identifiers and the page's bare origin go only to the local *papio*
   application, and the display-only citation labels never leave the browser.
 - **Institution-session check:** While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host can schedule a check of the matching configured library resolver. The trigger reads no publisher page content, and the publisher page cannot set the popup's signed-in or signed-out verdict. A tracked papio tab returning from authentication can still provide existing, same-origin release evidence for queued work. The trigger adds no landing URL, page-derived publisher data, title, path, query, fragment, cookie, credential, or session token to storage or native messages. Ranked DOM and browser-storage observations on the configured library page remain the only source of the popup verdict.
+- **Loss toast:** When papio loses a tab it opened for a paper, it can open a small papio window offering to reopen that route. It is an extension page, so it reads no page content and needs no host access. One fixed sentence, one button, no identifier or URL, eight seconds, and nothing performed on close.
 - **Host-page acknowledgement:** After a successful popup action, and only when
   transient acknowledgements are set to all requests, a three-second
   noninteractive chip is drawn in the acted-on page. It carries one of four fixed

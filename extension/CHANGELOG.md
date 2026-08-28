@@ -17,6 +17,16 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+
+- **Losing a tab *papio* opened now offers to bring it back.** A small *papio*
+  window appears for eight seconds with one button: `Reopen now` for a route
+  *papio* can resume, or `Open a new sign-in tab` when the close ended your
+  library's sign-in claim and there is nothing left to undo. Letting it expire
+  does nothing, and the same recovery stays in the inbox. It is one of *papio*'s
+  own windows, so it reads no page and needs no site access; it never appears
+  while a *papio* window already has your focus, and it stays silent when the
+  close cost you nothing — a download still in flight, a file the daemon is about
+  to adopt, or a tab *papio* closed itself.
 - **A publisher sign-in can now refresh the matching library-session check.** While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host asks *papio* to check the configured library resolver again. The new publisher trigger reads no page content and never sets the popup verdict; a tracked *papio* tab can still use its existing, job-scoped return evidence to release same-institution work. Other hosts, queued-only work, and ambiguous institutions do not authorize the trigger. A paper stored before this release carries no institution binding; it is bound only when its declared publishers match exactly one configured library, and stays unbound otherwise. An inconclusive resolver check now says what could not be verified instead of repeating an older claim. The binding survives a sleeping extension without storing the landing URL. When a resolver grant is missing in either browser, the card offers **Allow** for that institution only; granting it rechecks only while matching work or a tracked return is pending.
 - **Cochrane reviews now download by themselves.** Every PDF button on a
   Cochrane review page, and the page's own PDF metadata, points at a viewer

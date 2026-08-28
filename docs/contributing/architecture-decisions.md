@@ -305,13 +305,22 @@ click, so a deliberate action could lose its only visible receipt before the
 researcher read it. The browser and daemon must continue to evolve through
 strict, feature-negotiated, additive contracts.
 
-**Decision:** ADR-0023 keeps the six surfaces distinct: inline feedback
+**Decision:** ADR-0023 keeps seven surfaces distinct: inline feedback
 acknowledges a local action, the popup is a current-page lens with a compact
 pulse, a three-second host-page acknowledgement confirms that a popup action
 entered *papio* on the exact page the researcher is still looking at, the badge
 is ambient blocker/turn state, desktop notification policy is daemon-owned and
 best effort, and the inbox plus Activity are the durable
-bounded read model. The host-page acknowledgement is noninteractive and
+bounded read model. A seventh surface, the loss toast, is the one interruption
+that carries an action: when *papio* loses a tab it opened for a paper, a small
+unfocused *papio* window offers to reopen that route for eight seconds, then
+closes and commits nothing. It is an extension page, so it needs no host access
+and reads no page; it shows one fixed sentence and one button, and it is
+suppressed while a *papio* surface already holds focus. Its offer is truthful per
+branch: a resumable route offers a reopen, an abandoned institutional claim
+offers a new sign-in tab because no reversal exists, and a loss that cost nothing
+raises no toast.
+The host-page acknowledgement is noninteractive and
 success-only: it carries one closed short label, no identifier, title, URL,
 provider, job ID, progress, or error, obeys the existing transient-feedback
 preference, and never replaces inline feedback or durable job state. It is a

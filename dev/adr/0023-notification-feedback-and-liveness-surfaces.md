@@ -36,6 +36,9 @@ The product uses six surfaces, each with one job:
 | Desktop notification | Did something worth interrupting me for happen while I was elsewhere? | OS-controlled, not reliable storage | Coalesced action, milestone, integrity, or degradation event |
 | Inbox and Activity | What needs a decision, what is continuing, and what happened? | Durable | Complete bounded or paginated read model |
 
+Amended 2026-08-28: a seventh surface was added, the loss toast. See Decision 12
+below; this table and every rule under it are otherwise unchanged.
+
 No surface substitutes for another. A feedback strip is not a work queue, the
 popup is not a miniature inbox, the badge is not a progress bar, and a desktop
 notification is never the sole record of a decision or outcome.
@@ -469,6 +472,79 @@ one field; a future change that unifies them will break one of the two surfaces.
 **The pulse card hides only when it has nothing else to say.** It also produces a
 `next` line and a capacity line, so hiding it whenever a count exists would lose
 guidance the count does not carry.
+
+## Decision 12 (2026-08-28): a seventh surface — the interruption that carries an action
+
+Decision 1's table has six surfaces and none of them can offer a researcher a
+choice about something that just happened without being asked. The inline strip
+and the popup require the researcher to already be looking. The badge carries no
+action. Activity and the inbox are durable, correct, and silent. And the desktop
+notification is the daemon's, deliberately, with Decision 3 and Decision 5
+keeping working progress out of it.
+
+So a request that arrived three times — a toast in the browser offering to undo a
+tab close — was answered three times with a surface that could not do it, and
+the third answer was an OS notification the operator had not asked for. The gap
+was never conservatism about permissions. It was that no surface in the table had
+the shape.
+
+**The seventh surface is an in-browser toast for a loss *papio* observed on a tab
+it opened itself, carrying exactly one take-back-control action.**
+
+| Surface | Question it answers | Persistence | Scope |
+| --- | --- | --- | --- |
+| Loss toast | Something *papio* was driving just went away — do you want it back? | Eight seconds, dismissable | One observed loss, one action |
+
+Delivery is an unfocused extension window (`chrome.windows.create` with
+`type: "popup"`, `focused: false`). That needs no new manifest permission and no
+host permission, so it reaches the researcher on any page — which an injected
+in-page toast cannot, because provider hosts are `optional_host_permissions` and
+*papio* only ever requests the exact configured resolver origin. An in-page
+variant remains possible for a tab already granted, and is deliberately NOT
+decided here: it would relax Decision 1's rule that the page-local surface is
+scoped to a page the researcher just acted on, and that relaxation needs its own
+answer.
+
+Bounds, all enforced by tests rather than convention:
+
+1. One toast at a time. A second loss replaces the first; the producer holds the
+   single pending offer, so the surface cannot become a stack of windows.
+2. Eight seconds, and expiry commits **nothing**. The recovery stays in the
+   inbox, so the window is a shortcut and not a timed decision — which is what
+   keeps it clear of WCAG 2.2.1. The inbox undo bar's six seconds is the
+   comparison; this is the longer of the two.
+3. One action plus a dismissal. No progress, no error text, and no identifier,
+   title, URL, provider name, or job id in anything rendered. The job id travels
+   in the extension's own message only, exactly as Decision 1 already requires of
+   the host-page acknowledgement.
+4. It is raised only for a loss *papio* itself observed on a tab it opened, and
+   only after the deliberate-close and classify-retry returns in
+   `onTabRemoved`: *papio* closing its own tab is housekeeping, not a loss, and
+   must never interrupt.
+5. Suppressed while a *papio* surface holds focus, from Decision 9's presence
+   hint. The suppression is age-bounded and resolves to *not focused* when stale,
+   because a popup that closed while the worker slept never reports
+   `focused: false` — an unbounded record would silence this surface for ever.
+6. The offered action is truthful per branch. A resumable route offers `Reopen
+   now`. An abandoned institutional claim offers `Open a new sign-in tab`,
+   because `owner_closed` retires the authentication-entry lease and consumes the
+   one-use close authorization: there is no reversal to undo, and a button
+   claiming otherwise would lie. A loss that cost nothing — a download still
+   correlated, an `awaiting_download` park the daemon adopts — raises no toast at
+   all.
+
+This does not change Decision 3 or Decision 5. No desktop notification is
+created, no second notification sender exists, and the daemon remains the sole
+owner of OS-level interruption policy. It also does not change the 2026-08-28
+addendum above: the durable record of a lost access surface is still the Activity
+row, and this surface is an offer layered on top of it, never its replacement. If
+the window fails to open, the Activity row and the inbox are unchanged.
+
+The action reuses `handoff_link_request`, the route `papio actions open` already
+mints, so there is no new wire message and no protocol change. That boundary is
+deliberate: the extension cannot mint a route itself, because an offer that
+opened a tab by itself is what *papio* must never do for a paper it asked a human
+to fetch.
 
 ## Consequences
 

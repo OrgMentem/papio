@@ -61,6 +61,8 @@ While a paper is waiting for institutional sign-in, the extension can use a comp
 
 Page scanning is an explicitly invoked feature. It runs only when the user clicks it, reads only the top frame of the current tab, and holds no standing access: there is no persistent scanner, no dynamically registered content script, and no all-sites grant. Detection is local page JavaScript. The identifiers it finds and the page's bare origin go only to the local papio daemon so it can mark which papers are already owned; the short display-only citation labels shown in the selection view never leave the browser. No page text, path, query, fragment, page title, or credential is transmitted.
 
+When papio loses a tab it opened for a paper, it can open a small papio window offering to reopen that route. It is an extension page, not a page overlay: it reads no web page content, injects nothing, and needs no host access. It shows one fixed sentence and one button, contains no identifier, title, URL, or job reference, closes after eight seconds, and performs nothing on closing.
+
 After a popup action succeeds, and only when the user has left transient acknowledgements set to show for all requests, the extension draws a small noninteractive confirmation in the page it acted on. It shows one of four fixed short phrases, contains no identifier, title, URL, or job reference, reads no page content, stores nothing, transmits nothing, and removes itself after three seconds.
 
 Extension settings and short-lived job/tab correlation state are stored locally in Firefox storage.
