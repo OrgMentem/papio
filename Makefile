@@ -1,4 +1,4 @@
-.PHONY: build test vet identity-corpus openalex-yield docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets
+.PHONY: build test vet identity-corpus openalex-yield docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets launch-demo-env
 
 build:
 	go build ./...
@@ -150,3 +150,10 @@ dev-deploy:
 # (git-ignored). Requires system Chrome and ImageMagick. Run after UI changes.
 store-assets:
 	cd extension && bun run capture:store
+
+# Provision the isolated launch-demo rehearsal environment (separate Zotero
+# profile on connector port 23119, credential-clearing zotio wrapper, pristine
+# library snapshot). The plan and gates live in dev/active/launch-demo.md.
+# Pass a subcommand: make launch-demo-env ARGS=status
+launch-demo-env:
+	scripts/launch-demo-env.sh $(or $(ARGS),init)
