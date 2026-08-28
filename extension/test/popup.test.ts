@@ -2565,6 +2565,88 @@ test("a session action stays pending across a repaint", async () => {
   expect(button.disabled).toBe(false);
   expect(button.textContent).toBe("Allow");
 });
+
+test("a settled session action repaints the row the researcher can see", async () => {
+  const now = Date.now();
+  const defaultOrigin = "https://example.primo.exlibrisgroup.com";
+  const uwaOrigin = "https://onesearch.library.example-college.edu";
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    verdict: "unknown" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    resolverOrigin: defaultOrigin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    origins: [
+      {
+        origin: defaultOrigin,
+        authenticated: false,
+        verdict: "unknown" as const,
+        probeSource: "none" as const,
+        lastProbeOutcome: "no_markers" as const,
+        lastVerdictAt: null,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+      {
+        origin: uwaOrigin,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "live_tab" as const,
+        lastProbeOutcome: "markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+    ],
+  };
+  const doc = popupDocument();
+  const gate = Promise.withResolvers<void>();
+  const signIn = async (): Promise<void> => gate.promise;
+  renderInstitutionSession(doc, state, signIn);
+  const before = Array.from(
+    doc.querySelectorAll<HTMLButtonElement>(
+      ".institution-session-origin-row button",
+    ),
+  );
+  before[1]?.click();
+  expect(before[1]?.disabled).toBe(true);
+  expect(before[1]?.textContent).toBe("Opening…");
+
+  // A refresh lands while the sign-in is still in flight. renderSessionRows
+  // replaces every row, so the element the click captured is now detached.
+  renderInstitutionSession(doc, state, signIn);
+  const after = Array.from(
+    doc.querySelectorAll<HTMLButtonElement>(
+      ".institution-session-origin-row button",
+    ),
+  );
+  expect(after[1]).not.toBe(before[1]);
+  expect(after[1]?.disabled).toBe(true);
+  expect(after[1]?.textContent).toBe("Opening…");
+
+  gate.resolve();
+  await flushMicrotasks();
+  // Repainting the detached button left this one disabled on "Opening…"
+  // until the next refresh, so the researcher could not retry.
+  expect(after[1]?.disabled).toBe(false);
+  expect(after[1]?.textContent).toBe("Sign in");
+});
 test("binds waiting demand to its warm origin instead of a stale secondary row", () => {
   const now = Date.now();
   const originA = "https://resolver.example.edu";
@@ -2696,6 +2778,73 @@ test("hides unrelated session rows when a waiting job has no safe origin binding
 
   expect(deriveSessionRows(state, [waitingJob])).toEqual([]);
   expect(deriveSessionRows(state)).toHaveLength(2);
+});
+// A tracked return advances its job to awaiting_download while requires_auth
+// stays true, and sessionAuthDemand reports only auth_pending work - so the
+// suppression gate fired and hid the card at exactly the moment the researcher
+// had just signed in and the fresh recheck result mattered. Suppression is for
+// work still WAITING with no bindable institution, not for work that already
+// used its binding.
+test("keeps the session card after a tracked return advances its job", () => {
+  const now = Date.now();
+  const originA = "https://resolver-a.example.edu";
+  const originB = "https://resolver-b.example.edu";
+  const state = {
+    enabled: true,
+    intervalMinutes: 4,
+    authenticated: false,
+    verdict: "out" as const,
+    probeSource: "none" as const,
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    resolverOrigin: originA,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authDemand: [],
+    origins: [
+      {
+        origin: originA,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "none" as const,
+        lastProbeOutcome: "no_markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+      {
+        origin: originB,
+        authenticated: false,
+        verdict: "out" as const,
+        probeSource: "none" as const,
+        lastProbeOutcome: "no_markers" as const,
+        lastVerdictAt: now,
+        checking: false,
+        likelyAuthenticated: false,
+        pausedForReauth: false,
+        lastProbeAt: now,
+        dirtySince: null,
+      },
+    ],
+  };
+  const returned = job({
+    job_id: "tracked-returned",
+    status: "awaiting_download",
+    requires_auth: true,
+  });
+  expect(deriveSessionRows(state, [returned])).toHaveLength(2);
+
+  // Still waiting, still unbindable: suppression stands.
+  const waiting = job({ job_id: "unmapped-waiting", status: "auth_pending" });
+  expect(deriveSessionRows(state, [waiting])).toEqual([]);
 });
 test("waiting demand for origin B cannot display origin A as its blocker", () => {
   const now = Date.now();

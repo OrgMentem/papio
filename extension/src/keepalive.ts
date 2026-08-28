@@ -634,7 +634,21 @@ export function permissionPatternCoversOrigin(
   if (origin === undefined || typeof rawPattern !== "string") return false;
   const pattern = rawPattern.trim().toLowerCase();
   if (pattern === "<all_urls>") return true;
-  if (/^(?:https|\*):\/\/\*\/(?:\*|.*)$/.test(pattern)) return true;
+  // An all-host authority, with or without Chrome's explicit port. Matching the
+  // portless form only reported `required` for a researcher whose grant really
+  // did cover their custom-port resolver, so the card kept asking for access
+  // they had already given.
+  const allHost = /^(?:https|\*):\/\/\*(?::(\d+))?\/(?:\*|.*)$/.exec(pattern);
+  if (allHost !== null) {
+    const port = allHost[1];
+    if (port === undefined) return true;
+    try {
+      const candidate = new URL(origin);
+      return (candidate.port === "" ? "443" : candidate.port) === port;
+    } catch {
+      return false;
+    }
+  }
   const match = /^(https|\*):\/\/(\*\.)?([^/?#*]+)(?:\/[^?#]*)?$/.exec(
     pattern,
   );
@@ -642,6 +656,14 @@ export function permissionPatternCoversOrigin(
   const wildcard = match[2] !== undefined;
   const authority = match[3];
   if (authority === undefined) return false;
+  // Chrome permits an explicit port in a match pattern and treats it as exact,
+  // while an omitted port covers every port (Firefox rejects ports outright).
+  // `new URL` erases an explicit `:443` because it is HTTPS's default, so
+  // reading the port back off the parsed URL made a `https://host:443/*` grant
+  // look portless and therefore cover `https://host:8443` - reporting GRANTED
+  // for an origin the researcher never granted. Take the port from the raw
+  // authority, and read a portless HTTPS origin as its default 443.
+  const explicitPort = /:(\d+)$/.exec(authority);
   try {
     const candidate = new URL(origin);
     const granted = new URL(`https://${authority}`);
@@ -651,7 +673,8 @@ export function permissionPatternCoversOrigin(
           candidate.hostname.endsWith(`.${granted.hostname}`)
         : candidate.hostname === granted.hostname;
     const portMatches =
-      granted.port === "" || candidate.port === granted.port;
+      explicitPort === null ||
+      (candidate.port === "" ? "443" : candidate.port) === explicitPort[1];
     return hostMatches && portMatches;
   } catch {
     return false;
@@ -1030,9 +1053,19 @@ export class KeepaliveManager {
         this.options.onOriginPermissionChanged?.(origin, false);
       } else if (current === "granted") {
         this.options.onOriginPermissionChanged?.(origin, true);
+        // A restored cause names an origin this worker persisted, which is not
+        // proof the CURRENT daemon still configures it: onPermissionsChanged
+        // iterates originCandidates(), a display-only union pre-hello, and
+        // syncOriginStates() prunes non-members only once membership is
+        // authoritative. Probing on the strength of the stored cause alone
+        // would read a page whose origin the live config no longer names.
+        // isConfiguredMember is false until hello_ack, so this defers rather
+        // than drops: reconcileConfiguredOrigins re-queues it on the ack, by
+        // which point its own syncOriginStates() has pruned strangers.
         if (
+          this.isConfiguredMember(origin) &&
           this.originStates.get(origin)?.institutionalRecheckCause !==
-          undefined
+            undefined
         ) {
           void this.requestProbe(origin, "institutional_landing");
         } else {
@@ -1655,8 +1688,14 @@ export class KeepaliveManager {
     const decisiveOut = observations.filter(
       (observation) => observation.kind === "verdict" && observation.verdict === "out",
     );
+    // ADR-0026 Decision 6: `conflict` and `no_markers` are inconclusive, and an
+    // inconclusive probe PRESERVES the stored verdict - omitting `verdict` is
+    // how this reducer says "preserved" (see commitOriginProbe below). Both
+    // used to answer `unknown`, which overwrote a good `in` with no evidence
+    // that anything had changed; the card's outcome precedence is what stops a
+    // preserved verdict from hiding the failed recheck.
     if (decisiveIn.length > 0 && decisiveOut.length > 0) {
-      return { outcome: "conflict", verdict: "unknown", source: "none" };
+      return { outcome: "conflict" };
     }
     if (decisiveIn.length > 0) {
       return {
@@ -1677,7 +1716,7 @@ export class KeepaliveManager {
       return { outcome: "scan_failed" };
     }
     if (observations.some((observation) => observation.kind === "no_markers")) {
-      return { outcome: "no_markers", verdict: "unknown", source: "none" };
+      return { outcome: "no_markers" };
     }
     return { outcome: "no_tab" };
   }
@@ -2577,7 +2616,11 @@ export class KeepaliveManager {
       } else if (
         cause !== undefined &&
         (cause === "tracked_auth_return" || demanded.has(origin)) &&
-        this.hostPermissions.get(origin) === "granted"
+        this.hostPermissions.get(origin) === "granted" &&
+        // onWake reads restored originStates WITHOUT syncOriginStates(), so a
+        // stale persisted origin survives here even after hello_ack. Membership
+        // is the same gate noteInstitutionalLanding applies.
+        this.isConfiguredMember(origin)
       ) {
         institutionalDue.push(origin);
       }

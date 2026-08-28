@@ -176,11 +176,13 @@ parked.
 
 **Decision:** ADR-0026 lets a completed HTTPS navigation on a declared provider
 host schedule a check of the configured library resolver. The untracked path
-must match an `auth_pending` job and exactly one persisted configured
-institution binding. It sets no verdict or release evidence. A tracked papio
+must match an `auth_pending` job and exactly one configured institution. That
+institution comes from the job's persisted binding, or - for a row that predates
+the binding - from its declared provider hosts when those match exactly one
+configured resolver. It sets no verdict or release evidence. A tracked papio
 job return retains its existing same-origin release evidence, subject to
 current resolver access, but it also cannot set the popup verdict. Queued-only
-work, other hosts, missing bindings, and ambiguous institutions fail closed.
+work, other hosts, and ambiguous institutions fail closed.
 Resolver permission state remains separate from the verdict, and its card
 requests only the affected resolver grant.
 

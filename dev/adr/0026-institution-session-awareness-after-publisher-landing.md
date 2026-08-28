@@ -89,6 +89,9 @@ its institution binding after worker-local offer maps disappear.
 The managed browser state version advances for this field. Old rows without it
 remain valid and fail closed until a daemon re-offer supplies the binding.
 
+Amended 2026-08-28: a persisted `provider_hosts` list matching exactly one
+configured origin is a third source for the binding. See the amendment below.
+
 No origin from tab traffic, permission traffic, or stored legacy data can widen
 the configured institution set. This preserves ADR-0013's closed-origin rule.
 
@@ -159,6 +162,9 @@ A new grant requests a resolver probe only when matching `auth_pending` demand
 exists. A grant with no parked demand updates permission state and performs no
 page read. A grant before `hello_ack` is reconsidered when configured membership
 becomes authoritative.
+
+Amended 2026-08-28: a pending `tracked_auth_return` reason is a second cause for
+that probe, as Decision 3 implies. See the amendment below.
 
 No new browser permission, native message, daemon field, or daemon store row is
 required.
@@ -373,3 +379,47 @@ needs a researcher at a Firefox profile, not more automation.
   verdicts.
 - The feature adds no browser permission, daemon wire field, or daemon schema
   change.
+
+## Amendment 2026-08-28: three decisions reviewed against the code
+
+Four reviewers read this ADR against the shipped extension. Three decisions did
+not describe it. Two are corrected here; one was a real defect and the code was
+corrected instead.
+
+**Decision 2 is narrower than the code.** It says an old row without
+`institution_origin` fails closed until a daemon re-offer supplies the binding.
+`jobInstitutionOrigin` has a third path: with no offer in worker memory it
+derives the binding from the job's own persisted `provider_hosts`, and only when
+**exactly one** configured resolver origin matches. Two matches, or none, still
+fail closed. That derivation is a SELECTION among the daemon's configured
+origins, so ADR-0013's closed-origin rule holds and Decision 2's last paragraph
+remains true; what was wrong was "until a daemon re-offer", which described a
+strictly narrower behaviour than shipped. The derivation is deliberate: after a
+worker restart, a paper waiting at a publisher wall would otherwise forget which
+library it needs until the next offer, which is the case this ADR exists to fix.
+Decision 2 is amended to state the exactly-one-match rule as the binding's third
+source.
+
+**Decision 4's last paragraph is self-contradictory.** It says a new grant
+probes only when matching `auth_pending` demand exists, while Decision 3 keeps a
+`tracked_auth_return` recheck pending after the job that earned it has advanced
+past `auth_pending`. Both are intended. The rule is: a grant probes when the
+origin has matching `auth_pending` demand OR a pending `tracked_auth_return`
+reason recorded for it, and a grant with neither performs no page read. Decision
+4 is amended to name that second case, which Decision 3 always implied.
+
+**Decision 6 was right and the code was wrong.** `reduceObservations` answered
+`verdict: "unknown"` for `no_markers` and `conflict`, and the commit path treats
+any returned verdict as newly decided, so an inconclusive probe overwrote a
+stored `in`. Decision 6 lists both outcomes as inconclusive and requires the
+stored verdict to survive. The reducer now omits the verdict for both, which is
+how it says "preserved", and a test pins a stored `in` surviving a marker-free
+probe while `lastProbeAt` advances. No decision changed.
+
+One guard was added without a demonstrated defect, and is recorded as such.
+`KeepaliveManager.onWake` reads restored origin state without pruning it, so it
+now checks configured membership before resuming a stored recheck, matching the
+gate `noteInstitutionalLanding` already applies. No reachable case was found:
+`loadPreferences` records a permission only for a current candidate, so a retired
+origin has no granted entry to satisfy. The guard is belt-and-braces for a
+function whose input is restored state.

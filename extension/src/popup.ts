@@ -1453,15 +1453,21 @@ export function deriveSessionRows(
   );
   const demandOrigins = new Set(validDemands.map((demand) => demand.origin));
   const demandJobIDs = new Set(validDemands.map((demand) => demand.job_id));
+  // Suppression is for work still WAITING on a sign-in that papio cannot bind
+  // to one configured institution: showing an unrelated row then invites the
+  // researcher to act on the wrong library. A job whose tracked return already
+  // completed is not that case - it used its binding and advanced - but
+  // `requires_auth` stays true afterwards while sessionAuthDemand drops the
+  // job, so it suppressed the card at exactly the moment the fresh recheck
+  // result mattered most.
+  const awaitingSignIn = (job: ActiveJob): boolean =>
+    job.status !== "awaiting_download" &&
+    (job.requires_auth === true ||
+      job.status === "auth_pending" ||
+      job.waiting_for_session === true ||
+      job.engagement_required === true);
   if (
-    jobs.some(
-      (job) =>
-        (job.requires_auth === true ||
-          job.status === "auth_pending" ||
-          job.waiting_for_session === true ||
-          job.engagement_required === true) &&
-        !demandJobIDs.has(job.job_id),
-    ) &&
+    jobs.some((job) => awaitingSignIn(job) && !demandJobIDs.has(job.job_id)) &&
     demandOrigins.size === 0
   ) {
     return [];
@@ -1536,6 +1542,17 @@ interface SessionActionState {
 
 const sessionActionStates = new Map<string, SessionActionState>();
 
+/** The button and status element currently rendered for one owner key.
+ * `renderSessionRows` replaces its rows wholesale, so the element a click
+ * handler captured can be detached by the time that action settles. Keyed by
+ * owner rather than by element, a settled action always repaints the row the
+ * researcher is actually looking at — repainting the detached one left the
+ * LIVE button disabled on its pending label until the next refresh. */
+const sessionActionRows = new Map<
+  string,
+  { button: HTMLButtonElement; status: HTMLElement }
+>();
+
 function bindSessionButton(
   button: HTMLButtonElement,
   status: HTMLElement,
@@ -1548,6 +1565,7 @@ function bindSessionButton(
     return;
   }
   sessionActionHandlers.set(button, binding);
+  sessionActionRows.set(binding.ownerKey, { button, status });
   const actionState = sessionActionStates.get(binding.ownerKey);
   button.disabled = actionState?.pending === true;
   button.textContent =
@@ -1578,10 +1596,12 @@ function bindSessionButton(
     void current.run().then(
       () => {
         sessionActionStates.delete(current.ownerKey);
-        const latest = sessionActionHandlers.get(button);
+        const live = sessionActionRows.get(current.ownerKey);
+        if (live === undefined) return;
+        const latest = sessionActionHandlers.get(live.button);
         if (latest?.ownerKey !== current.ownerKey) return;
-        button.disabled = false;
-        button.textContent = latest.idleLabel;
+        live.button.disabled = false;
+        live.button.textContent = latest.idleLabel;
       },
       (error: unknown) => {
         const message =
@@ -1593,11 +1613,13 @@ function bindSessionButton(
           pendingLabel: current.pendingLabel,
           error: message,
         });
-        const latest = sessionActionHandlers.get(button);
+        const live = sessionActionRows.get(current.ownerKey);
+        if (live === undefined) return;
+        const latest = sessionActionHandlers.get(live.button);
         if (latest?.ownerKey !== current.ownerKey) return;
-        button.disabled = false;
-        button.textContent = latest.idleLabel;
-        status.textContent = message;
+        live.button.disabled = false;
+        live.button.textContent = latest.idleLabel;
+        live.status.textContent = message;
       },
     );
   });

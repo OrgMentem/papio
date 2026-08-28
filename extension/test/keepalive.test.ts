@@ -902,6 +902,47 @@ test("permission coverage matches exact, wildcard, and all-host grants", () => {
       customPort,
     ),
   ).toBe(true);
+  // Chrome treats an explicit port as exact. `new URL` erases `:443` as the
+  // HTTPS default, and reading the port back off it once made a `:443` grant
+  // cover every custom port - GRANTED for an origin nobody granted.
+  expect(
+    permissionPatternCoversOrigin(
+      "https://une.primo.exlibrisgroup.com:443/*",
+      customPort,
+    ),
+  ).toBe(false);
+  expect(
+    permissionPatternCoversOrigin(
+      "https://une.primo.exlibrisgroup.com:8080/*",
+      customPort,
+    ),
+  ).toBe(false);
+  expect(
+    permissionPatternCoversOrigin(
+      "https://une.primo.exlibrisgroup.com:8443/*",
+      customPort,
+    ),
+  ).toBe(true);
+  // A portless HTTPS origin IS port 443, so an exact `:443` grant covers it.
+  expect(
+    permissionPatternCoversOrigin(
+      "https://une.primo.exlibrisgroup.com:443/*",
+      origin,
+    ),
+  ).toBe(true);
+  expect(
+    permissionPatternCoversOrigin(
+      "https://*.primo.exlibrisgroup.com:8443/*",
+      origin,
+    ),
+  ).toBe(false);
+  // An all-host grant carrying Chrome's explicit port really does cover a
+  // custom-port resolver; reading it as portless-only reported `required` for
+  // access the researcher had already given.
+  expect(permissionPatternCoversOrigin("https://*:8443/*", customPort)).toBe(true);
+  expect(permissionPatternCoversOrigin("*://*:8443/*", customPort)).toBe(true);
+  expect(permissionPatternCoversOrigin("https://*:8443/*", origin)).toBe(false);
+  expect(permissionPatternCoversOrigin("https://*:443/*", origin)).toBe(true);
   expect(
     permissionPatternCoversOrigin(
       "https://*.alma.exlibrisgroup.com/*",
@@ -1096,6 +1137,60 @@ test("one wake runs one probe when ordinary and institutional recovery overlap",
   expect(h.scripting.injectionCounts.get(1) ?? 0).toBe(
     injectedBefore + 1,
   );
+});
+
+// A wake must never read a page whose origin the live config does not name,
+// however the stored state got there. Two things enforce that and this pins the
+// property rather than either mechanism: loadPreferences records a permission
+// only for a CURRENT candidate, so a retired origin has no "granted" entry to
+// satisfy; and onWake additionally requires isConfiguredMember, the same gate
+// noteInstitutionalLanding applies. The second is deliberate belt-and-braces -
+// onWake reads restored originStates without syncOriginStates(), so it cannot
+// assume the map has been pruned. ADR-0013's universe is config-derived, and a
+// persisted grant does not widen it.
+test("a wake refuses a restored recheck before membership is authoritative", async () => {
+  const stale = "https://retired.example.edu";
+  const configured = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [configured],
+    grantedOrigins: [`${stale}/*`, `${configured}/*`],
+    demandOrigins: [stale],
+    storageValues: {
+      // The origin this worker last persisted, which the current daemon no
+      // longer configures. Pre-hello it is still a candidate, so it carries a
+      // permission entry and can be probed.
+      "keepalive.resolverOrigin": stale,
+      "keepalive.originStates": [
+        {
+          origin: stale,
+          authenticated: false,
+          verdict: "unknown",
+          probeSource: "none",
+          lastVerdictAt: null,
+          lastProbeAt: null,
+          checking: false,
+          likelyAuthenticated: false,
+          pausedForReauth: false,
+          dirtySince: null,
+          institutionalRecheckCause: "tracked_auth_return",
+        },
+      ],
+    },
+  });
+  // Pre-hello: membership is not yet authoritative, so nothing has pruned the
+  // restored row for an origin this daemon no longer configures.
+  h.configuredReady.value = false;
+  await h.manager.init();
+  // A live tab on the stale origin, so a probe would really inject into it.
+  const staleTab = { id: 93, url: `${stale}/discovery` };
+  h.tabs.seed(staleTab);
+  h.tabs.resolverTabs.push(staleTab);
+  const before = h.scripting.injectionCounts.get(93) ?? 0;
+
+  await h.manager.onWake();
+
+  expect(h.scripting.injectionCounts.get(93) ?? 0).toBe(before);
 });
 
 test("a deferred institutional recheck is cancelled when demand ends", async () => {
@@ -1619,6 +1714,54 @@ test("auth-shaped URL evidence stays unknown when marker inspection is empty", a
     authenticated: false,
     lastProbeOutcome: "no_markers",
   });
+});
+
+// ADR-0026 Decision 6: an inconclusive probe preserves the stored verdict, and
+// `no_markers` is on its inconclusive list. Answering `unknown` discarded a
+// good `in` on no evidence that anything had changed, so a researcher who was
+// signed in a minute ago saw the card fall back to not knowing. The card's
+// outcome precedence is what keeps the preserved verdict from hiding the failed
+// recheck; the verdict itself must survive.
+test("an inconclusive recheck preserves a stored signed-in verdict", async () => {
+  const origin = "https://resolver.example.edu";
+  const then = Date.now() - 60_000;
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    storageValues: {
+      "keepalive.originStates": [
+        {
+          origin,
+          authenticated: true,
+          verdict: "in",
+          probeSource: "live_tab",
+          lastProbeOutcome: "markers",
+          lastVerdictAt: then,
+          lastProbeAt: then,
+          checking: false,
+          likelyAuthenticated: false,
+          pausedForReauth: false,
+          dirtySince: null,
+        },
+      ],
+    },
+  });
+  h.resolverMarkers.splice(0, h.resolverMarkers.length);
+  await h.manager.init();
+  const liveTab = { id: 92, url: origin };
+  h.tabs.seed(liveTab);
+  h.tabs.resolverTabs.push(liveTab);
+
+  await h.manager.probeForeground();
+
+  const snapshot = h.manager.getOriginSnapshots()[0];
+  expect(snapshot).toMatchObject({
+    verdict: "in",
+    lastProbeOutcome: "no_markers",
+  });
+  expect(snapshot?.lastVerdictAt).toBe(then);
+  expect(snapshot?.lastProbeAt).not.toBe(then);
 });
 
 test("an IdP URL surfaces reauthentication without asserting signed out", async () => {
