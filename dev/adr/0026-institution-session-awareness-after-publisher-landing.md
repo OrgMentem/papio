@@ -333,6 +333,34 @@ Resolver-permission path:
 Ground truth comes from extension state, daemon job state, and a new browser
 session ID. Popup copy alone is not sufficient proof.
 
+### Run 2026-08-28
+
+The positive path passed earlier against the operator's own Chrome and library.
+
+The negative path passed in a throwaway environment built for it: a second
+daemon on its own data directory with an empty library, and a dedicated Chrome
+profile with the HEAD bundle installed as the deterministic dev-unpacked id.
+With zero jobs, a real completed navigation to a declared provider host
+(`www.cambridge.org`) left `keepalive.originStates` and
+`keepalive.resolverOrigin` absent in extension storage, and left the daemon with
+zero `profile_evidence` rows, zero claims, and no probe or recheck line in its
+log, while the ordinary keep-warm cycle kept polling. One deviation from the
+script, stated rather than glossed: the run did not perform an institutional
+sign-in, because that needs the researcher's credentials. The discriminating
+condition is the absence of parked demand — admission requires a correlated
+job, so with zero jobs nothing can correlate — not the sign-in itself.
+
+The resolver-permission path did NOT run, and the reason is structural rather
+than incidental. Step 1 cannot be performed on Chrome at all: the resolver hosts
+are declared `host_permissions`, Chrome grants them at install, and
+`chrome.permissions.remove` refuses with "You cannot remove required
+permissions". The path is therefore a Firefox scenario by construction, since
+Firefox treats MV3 host permissions as runtime opt-in. Step 3 then needs a real
+human click: `permissions.request` requires a user gesture, and extension
+gesture tracking does not accept synthesized activation — the same limit already
+recorded for the popup's Open button and for CDP's `userGesture`. Running it
+needs a researcher at a Firefox profile, not more automation.
+
 ## Consequences
 
 - papio becomes more proactive only while the researcher has a visible sign-in
