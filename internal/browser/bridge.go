@@ -10281,6 +10281,18 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		if _, err := b.jobs.ExpireUnboundAuthenticationEntryLeases(ctx, b.now()); err != nil {
 			log.Printf("papio: expiring unbound authentication entry leases: %v", err)
 		}
+		// The third route into the same stranded slot, and the only one no
+		// sweep covered: a claim retired by the holder-generation fence.
+		// AbandonStaleMaterializations deliberately keeps the entry so a
+		// reconnecting worker can renew it, but a bound human entry has no
+		// deadline and a parked owner never goes terminal, so nothing else can
+		// reach it. Observed live 2026-08-28: the fence left one entry bound to
+		// a claim it had just abandoned while 42 candidates sat eligible and two
+		// operator opens produced no tab. Bounded, not released: a renewal
+		// restarts the window, and an in-flight institutional permit outranks it.
+		if _, err := b.jobs.ExpireStrandedBoundAuthenticationEntryLeases(ctx, b.now()); err != nil {
+			log.Printf("papio: expiring stranded bound authentication entry leases: %v", err)
+		}
 	}
 	if b.materializationRecoveryPending {
 		if err := b.recoverMaterializationFocus(ctx); err != nil {

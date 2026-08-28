@@ -245,6 +245,17 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A vanished sign-in tab no longer strands your library's one sign-in slot.**
+  *papio* gives that slot to the paper that is signing in, and deliberately
+  keeps giving it when your browser restarts its background worker, so a sign-in
+  you are part-way through survives the restart. Nothing bounded that: if the
+  tab had already gone by then, the slot stayed held, and every other paper
+  waiting on that institution parked with no tab and no message. *papio* now
+  releases a slot whose surface has been gone for half an hour, and any sign-in
+  still reporting progress keeps resetting that half hour, so a slow login or a
+  wait on a code is never cut short. A download or navigation still in flight
+  keeps the slot regardless of the clock. `papio doctor` now says this in its
+  own remedy, instead of only telling you to close a tab that is already closed.
 - **`papio actions open` on a paper you download yourself now goes through your
   browser.** These papers reach your library through the institution's route,
   and *papio* had already taught the daemon to surface them in the tab you are

@@ -1082,3 +1082,166 @@ func TestProfileEvidenceRejectsSupersededRevisionAndTombstone(t *testing.T) {
 		t.Fatalf("tombstoned profile evidence = %v, want stale", err)
 	}
 }
+
+// A generation fence abandons a claim without proving the sign-in died, so
+// AbandonStaleMaterializations deliberately keeps the entry lease: §4.5 keys a
+// reserved entry on the owner JOB precisely so a human sign-in survives a
+// service-worker restart. Nothing bounded that kindness. A bound human lease
+// carries a NULL deadline by design, the three binding-keyed release paths all
+// need an event the fence does not produce, and RetireTerminalAuthentication-
+// EntryLeases needs the owner job terminal — so a parked paper's slot is held
+// forever. Observed live 2026-08-28 on the operator's own machine: the fence
+// abandoned three claims and left lease `8924301f…` `human` with a NULL
+// deadline naming binding `a3264ff7…` whose claim had just died, while 42
+// candidates sat eligible and two `papio actions open` calls produced no tab
+// and no claim. That instance cleared five minutes later because its owner job
+// reached `cancelled`; the parked-owner case is an inference from the release
+// paths, which is why this test drives the exact shape rather than a timer.
+func TestExpireStrandedBoundAuthenticationEntryLeasesFreesAFencedSlot(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "stranded-slot")
+	authorizeEffectPermitJob(t, js, jobID)
+	now := time.Now().UTC()
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 7, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-stranded-slot", LeaseID: "lease-stranded", OwnerID: jobID,
+		BrowserHolderGeneration: 7, LeaseUntil: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+		"claim-stranded-slot", jobID, 7, claim.BindingID, 1); err != nil {
+		t.Fatal(err)
+	}
+	// The live shape: bound, human-paced, no deadline at all.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET state='human', human_owner_id=?, lease_until=NULL
+		  WHERE authentication_claim_id='claim-stranded-slot'`, jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A live claim keeps its institution, however late the sweep runs.
+	late := now.Add(StrandedBoundEntryGrace + time.Hour)
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, late); err != nil || freed != 0 {
+		t.Fatalf("swept a live surface's slot: freed=%d err=%v", freed, err)
+	}
+
+	// The fence abandons the claim and, by design, leaves the lease bound.
+	if _, err := js.AbandonStaleMaterializations(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	stranded, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-stranded-slot")
+	if err != nil || !ok || stranded.State != AuthenticationEntryLeaseHuman ||
+		stranded.OwnerBindingID != claim.BindingID || stranded.LeaseUntil != "" {
+		t.Fatalf("post-fence lease = %+v ok=%v err=%v; want the stranded shape this test exists for",
+			stranded, ok, err)
+	}
+
+	// Inside the grace the slot is still held: this is the reconnect window the
+	// fence's asymmetry exists to protect, and a returning worker renews here.
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, now.Add(time.Minute)); err != nil || freed != 0 {
+		t.Fatalf("swept inside the reconnect grace: freed=%d err=%v", freed, err)
+	}
+
+	// §4.5 outranks the timer: an in-flight institutional effect keeps the slot.
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO effect_permits
+		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+		   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+		VALUES ('permit-stranded-slot', ?, 1, 7, 'domain-stranded-slot', 'institutional',
+		        ?, ?, 1, 'institutional-request-stranded-slot', 'held', ?, ?, ?)`,
+		jobID, claim.ID, claim.BindingID, now.Add(time.Minute).Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, late); err != nil || freed != 0 {
+		t.Fatalf("swept a slot whose institutional effect is in flight: freed=%d err=%v", freed, err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE effect_permits SET status='settled' WHERE id='permit-stranded-slot'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Past the grace, with nothing in flight and no surface alive: released.
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, late); err != nil || freed != 1 {
+		t.Fatalf("stranded slot past its grace: freed=%d err=%v, want 1", freed, err)
+	}
+	// Freed for real, and the sweep is idempotent.
+	next, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-stranded-slot", LeaseID: "lease-stranded-next", OwnerID: "job-next",
+		BrowserHolderGeneration: 8, LeaseUntil: late.Add(time.Minute),
+	})
+	if err != nil || next.OwnerID != "job-next" {
+		t.Fatalf("reserve after release = %+v, %v", next, err)
+	}
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, late); err != nil || freed != 0 {
+		t.Fatalf("sweep is not idempotent: freed=%d err=%v", freed, err)
+	}
+}
+
+// The property that makes the grace safe. A human sitting on an MFA prompt
+// after a worker reconnect has an abandoned claim and a live sign-in, and the
+// only difference from a dead surface is that something keeps touching the
+// lease row — §4.5's human-paced renewal, driven by every wall/login/mfa/
+// challenge observation. A renewal must therefore restart the window, or this
+// sweep cuts off the exact case AbandonStaleMaterializations protects.
+func TestStrandedBoundLeaseGraceRestartsOnRenewal(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "stranded-renew")
+	now := time.Now().UTC()
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 3, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-stranded-renew", LeaseID: "lease-renew", OwnerID: jobID,
+		BrowserHolderGeneration: 3, LeaseUntil: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+		"claim-stranded-renew", jobID, 3, claim.BindingID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET state='human', human_owner_id=?, lease_until=NULL
+		  WHERE authentication_claim_id='claim-stranded-renew'`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.AbandonStaleMaterializations(ctx, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	// The worker comes back and the sign-in renews under the new generation.
+	renewedAt := now.Add(StrandedBoundEntryGrace - time.Minute)
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET browser_holder_generation=4, updated_at=?
+		  WHERE authentication_claim_id='claim-stranded-renew'`,
+		renewedAt.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	// One grace after the abandon, but less than one after the renewal: held.
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx,
+		now.Add(StrandedBoundEntryGrace+30*time.Second)); err != nil || freed != 0 {
+		t.Fatalf("a renewed sign-in was swept: freed=%d err=%v", freed, err)
+	}
+	// A grace after the renewal, with nothing further: released.
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx,
+		renewedAt.Add(StrandedBoundEntryGrace+time.Second)); err != nil || freed != 1 {
+		t.Fatalf("silent since the renewal: freed=%d err=%v, want 1", freed, err)
+	}
+}
