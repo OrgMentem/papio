@@ -1,0 +1,89 @@
+<!doctype html>
+<!-- Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>papio</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font: 14px/1.45 system-ui, sans-serif;
+        --toast-fg: #16181d;
+        --toast-bg: #ffffff;
+        --toast-border: #d3d7de;
+        --toast-accent: #1c5fd6;
+        --toast-accent-fg: #ffffff;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --toast-fg: #e9ecf1;
+          --toast-bg: #1c1f26;
+          --toast-border: #3a4049;
+          --toast-accent: #6f9cf0;
+          --toast-accent-fg: #10131a;
+        }
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+
+      body {
+        display: flex;
+        align-items: center;
+        box-sizing: border-box;
+        padding: 12px 14px;
+        color: var(--toast-fg);
+        background: var(--toast-bg);
+      }
+
+      #toast {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+      }
+
+      .toast-message {
+        margin: 0;
+        flex: 1 1 auto;
+      }
+
+      .toast-actions {
+        display: flex;
+        gap: 6px;
+        flex: 0 0 auto;
+      }
+
+      button {
+        font: inherit;
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--toast-border);
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+      }
+
+      .toast-action {
+        border-color: var(--toast-accent);
+        background: var(--toast-accent);
+        color: var(--toast-accent-fg);
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--toast-accent);
+        outline-offset: 2px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="toast" role="alertdialog" aria-describedby="toast-message"></div>
+    <script src="./toast.js" type="module"></script>
+  </body>
+</html>

@@ -136,7 +136,17 @@ const KEEPALIVE_ALLOWLIST = new Map<string, { count: number; why: string }>([
   ],
   [
     "background.ts:realDeps",
-    { count: 1, why: "The adapter is the API boundary that wires the capability; the primitive is the only place that decides to use it." },
+    {
+      count: 2,
+      why: "The adapter is the API boundary that wires the capability; the primitives are the only places that decide to use it. Two: tabs.remove for the handoff surface, windows.remove for the toast window.",
+    },
+  ],
+  [
+    "background.ts:closeToastWindow",
+    {
+      count: 1,
+      why: "ADR-0023's seventh surface is papio's OWN transient window, not a work surface, so closeOwnedTab's lifecycle gate does not apply to it. Its own gate is ownership: the window must still hold exactly one tab showing the toast page, because a researcher who closes the toast manually reports nothing and leaves this id naming a window the browser may have recycled.",
+    },
   ],
   [
     "keepalive.ts:removeStaleTab",

@@ -15,6 +15,12 @@
 // The class is constructed with an injected BridgeDeps seam so the whole flow is
 // unit-testable without a real chrome runtime.
 
+import { type ToastKind, type ToastPayload, toastKindForLoss } from "./toast-view";
+import {
+  TOAST_ACTION_MESSAGE,
+  TOAST_DISMISS_MESSAGE,
+  TOAST_PENDING_MESSAGE,
+} from "./toast";
 import {
   BROWSER_PROTOCOL_VERSION,
   EFFECT_PERMIT_FEATURE,
@@ -471,6 +477,17 @@ const MATERIALIZE_PAGE_PATH = POPUP_PAGE_PATH.replace(
   /[^/]*$/,
   "materialize.html",
 );
+/** Same derivation rule, same reason: a bare "toast.html" resolves in no
+ * deployment, and this surface's whole job is to appear when something already
+ * went wrong — a broken page URL here would be silent. */
+const TOAST_PAGE_PATH = POPUP_PAGE_PATH.replace(/[^/]*$/, "toast.html");
+/** A toast, not a browser window: small, chrome-less, and deliberately
+ * unfocused. The height fits one line of copy plus the two controls at the
+ * default page font; the width is the popup's, so the two surfaces read as one
+ * product. */
+const TOAST_WINDOW_SIZE = { width: 420, height: 108 } as const;
+/** How long a papio surface's focus report suppresses the toast. */
+const TOAST_PRESENCE_TTL_MS = 30_000;
 /** The handoff group's title. Constant: it is an ownership marker, not a
  * status line. It briefly carried the surfaced paper's own title, which read
  * as information and was not — with more than one tab in the group the label
@@ -990,6 +1007,9 @@ export interface WindowInfo {
   state?: string | undefined;
   /** Populated by windows.create when the window is created with a URL. */
   tabs?: TabInfo[] | undefined;
+  /** Reported by windows.create. Read only by the toast, which must know when
+   * the browser ignored `focused: false` (macOS Firefox, bugzilla 1271047). */
+  focused?: boolean | undefined;
 }
 
 export interface TabGroupInfo {
@@ -1216,7 +1236,15 @@ export interface BridgeDeps {
     create(props: {
       url: string;
       focused: boolean;
-      state: "minimized" | "normal";
+      state?: "minimized" | "normal";
+      /** ADR-0023's seventh surface needs a small chrome-less window rather
+       * than a browser window. Optional so the work-window caller, which wants
+       * a real window, is unchanged. */
+      type?: "popup";
+      width?: number;
+      height?: number;
+      top?: number;
+      left?: number;
     }): Promise<WindowInfo>;
     get(windowID: number): Promise<WindowInfo>;
     update(
@@ -1227,6 +1255,9 @@ export interface BridgeDeps {
         drawAttention?: boolean;
       },
     ): Promise<unknown>;
+    /** Closes a window papio itself opened. Only the toast uses it: the work
+     * window is the researcher's to close. */
+    remove(windowID: number): Promise<unknown>;
   };
   tabGroups?: {
     get(groupID: number): Promise<TabGroupInfo>;
@@ -10742,6 +10773,145 @@ export class Bridge {
     );
   }
 
+  /** The one pending toast. Bound 1 of the plan lives here rather than in the
+   * page: a second loss replaces the first, so the surface can never become a
+   * stack of windows. Worker memory is the right home despite MV3 suspension —
+   * a toast that did not survive the worker sleeping was an offer nobody was
+   * looking at, and the durable record of the loss is the Activity row the
+   * daemon already writes. */
+  private pendingToast: ToastPayload | undefined;
+  private toastWindowID: number | undefined;
+
+  /** Raise the seventh surface for a loss papio observed itself. Returns
+   * whether a window was opened, so the caller can fall back to silence
+   * rather than assume. */
+  private async raiseToast(payload: ToastPayload): Promise<boolean> {
+    const windows = this.deps.windows;
+    if (windows === undefined) return false;
+    // A papio surface already in front reports the same event, and Decision 9's
+    // presence hint is exactly the signal for that. Interrupting a researcher
+    // who is looking at the popup would be a duplicate, not an aid.
+    if (this.papioSurfaceLikelyFocused()) return false;
+    this.pendingToast = payload;
+    // Replace rather than stack: close the previous window first so the
+    // researcher is never asked about two losses at once.
+    await this.closeToastWindow();
+    const url = this.deps.runtimeGetURL?.(TOAST_PAGE_PATH);
+    if (url === undefined) {
+      this.pendingToast = undefined;
+      return false;
+    }
+    try {
+      const created = await windows.create({
+        url,
+        focused: false,
+        type: "popup",
+        width: TOAST_WINDOW_SIZE.width,
+        height: TOAST_WINDOW_SIZE.height,
+      });
+      this.toastWindowID = created.id;
+      // macOS Firefox ignores `focused` at creation (bugzilla 1271047), the
+      // same defect the work window already documents. Unfixed here it is
+      // worse than there: a minimized work window arriving front is a nuisance,
+      // but a toast that steals focus is the opposite of a toast.
+      if (created.id !== undefined && created.focused === true) {
+        try {
+          await windows.update(created.id, { focused: false });
+        } catch {
+          // Best effort. A toast that took focus is still a delivered toast.
+        }
+      }
+      return true;
+    } catch {
+      this.pendingToast = undefined;
+      this.toastWindowID = undefined;
+      return false;
+    }
+  }
+
+  /** Decide whether this tab close deserves the seventh surface, and raise it
+   * if so. Separate from `raiseToast` so the decision (what was lost) and the
+   * delivery (how it is shown) stay testable apart. */
+  private async reportLostSurface(
+    job: ActiveJob,
+    institutionalClaimAbandoned: boolean,
+  ): Promise<void> {
+    const kind: ToastKind | undefined = toastKindForLoss({
+      institutionalClaimAbandoned,
+      deliveryInFlight:
+        this.deliveryJobs.has(job.job_id) ||
+        this.store.pendingDelivery?.job_id === job.job_id,
+      awaitingDownload: job.status === "awaiting_download",
+    });
+    if (kind === undefined) return;
+    await this.raiseToast({ kind, job_id: job.job_id });
+  }
+
+  /** Close the toast window papio opened, and ONLY that window.
+   *
+   * The ownership re-check is not defensive padding. A researcher who closes
+   * the toast themselves reports nothing — the page's own handlers never run —
+   * so this id outlives the window it named. A browser is free to reuse a
+   * window id after that, and removing a recycled id would close one of the
+   * researcher's own windows. So the id alone never authorizes a removal: the
+   * window must still be serving the toast page. */
+  private async closeToastWindow(): Promise<void> {
+    const windowID = this.toastWindowID;
+    this.toastWindowID = undefined;
+    const windows = this.deps.windows;
+    if (windowID === undefined || windows === undefined) return;
+    const toastURL = this.deps.runtimeGetURL?.(TOAST_PAGE_PATH);
+    if (toastURL === undefined) return;
+    try {
+      const existing = await windows.get(windowID);
+      const tabs = existing.tabs ?? [];
+      // Exactly one tab, and it must be the toast page. A window the
+      // researcher has navigated or added a tab to is theirs, not papio's.
+      if (tabs.length !== 1 || tabs[0]?.url !== toastURL) return;
+      await windows.remove(windowID);
+    } catch {
+      // Already gone, or unreadable: either way papio does not remove it.
+    }
+  }
+
+  /** The page asks for its payload on load. Answering consumes nothing: the
+   * page may reload, and a reload that rendered an empty toast would look like
+   * a papio failure. The payload is dropped when the page reports an outcome. */
+  toastPending(): ToastPayload | undefined {
+    return this.pendingToast;
+  }
+
+  /** The researcher took the offer. `route_lost` and
+   * `institution_claim_lost` both resolve to the same daemon call — the fresh
+   * route `papio actions open` mints — because the extension cannot mint one
+   * itself: `WithOpenRouteJob` is the daemon's authorization boundary, and an
+   * offer that opened a tab by itself is exactly what papio must never do for
+   * a paper it asked a human to fetch. */
+  async toastAction(jobID: string): Promise<boolean> {
+    const payload = this.pendingToast;
+    this.pendingToast = undefined;
+    this.toastWindowID = undefined;
+    // Ignore an id that is not the offer papio made. A stale window reloaded
+    // after a replacement would otherwise reopen the wrong paper.
+    if (payload === undefined || payload.job_id !== jobID) return false;
+    const minted = await this.requestFreshHandoffLink(jobID);
+    if (minted.ok !== true) return false;
+    try {
+      await this.deps.tabs.create({ url: minted.url, active: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Dismissed or expired. Both drop the offer and neither performs the
+   * action; the recovery stays in the inbox, which is what keeps the eight
+   * seconds from being a deadline. */
+  toastDismiss(jobID: string): void {
+    if (this.pendingToast?.job_id === jobID) this.pendingToast = undefined;
+    this.toastWindowID = undefined;
+  }
+
   async requestTriageSnapshot(request: {
     schema_versions: [1] | [2] | [3] | [4] | [5] | [4, 3] | [5, 4];
     limit?: number;
@@ -10922,9 +11092,37 @@ export class Bridge {
     };
   }
 
+  /** The last focus report a papio surface sent, and when. Retained locally
+   * because `sendSurfacePresence` is otherwise a pass-through to the daemon and
+   * the toast needs the same fact browser-side.
+   *
+   * Deliberately short-lived. This is the MV3 worker-memory trap the popup's
+   * `claimGrants` already fell into: a popup that closed while the worker slept
+   * never sends `focused: false`, so a long-lived record would read "focused"
+   * for ever and silence this surface permanently. Staleness therefore resolves
+   * to NOT focused — the benign direction, where a toast appears beside an open
+   * popup, rather than the silent one. */
+  private lastSurfaceFocus: { focused: boolean; at: number } | undefined;
+
+  /** True only on a fresh, positive focus report. `TOAST_PRESENCE_TTL_MS`
+   * bounds it: two poll intervals of the popup's own presence cadence, long
+   * enough that an open popup keeps reporting and short enough that a dead one
+   * stops counting. */
+  private papioSurfaceLikelyFocused(): boolean {
+    const last = this.lastSurfaceFocus;
+    if (last === undefined || !last.focused) return false;
+    return this.deps.now() - last.at < TOAST_PRESENCE_TTL_MS;
+  }
+
   async sendSurfacePresence(
     payload: Omit<SurfacePresencePayload, "request_id">,
   ): Promise<BrokerReply<{ accepted: boolean }>> {
+    // Recorded before the feature gate: the fact is browser-local and true
+    // whether or not the daemon negotiated the presence hint.
+    this.lastSurfaceFocus = {
+      focused: payload.focused === true,
+      at: this.deps.now(),
+    };
     if (!(this.store.daemonFeatures ?? []).includes(SURFACE_PRESENCE_FEATURE)) {
       return { ok: true, accepted: false };
     }
@@ -20011,6 +20209,14 @@ export class Bridge {
       this.tabLedgerCache?.[String(tabID)];
     const pendingClose = ledgerRecord?.pending_close;
     const authorizedClose = pendingClose !== undefined;
+    // Whether this close abandoned an institutional materialization claim. Set
+    // by BOTH owner_closed reporters below — the live-grant path and the
+    // restart-recovered path, which reports from the durable birth record after
+    // its worker died. Read by the toast, which must offer a NEW sign-in rather
+    // than a reopen for exactly this case: `owner_closed` retires the
+    // authentication-entry lease and consumes the one-use close authorization,
+    // so there is no reversal left to offer.
+    let institutionalClaimAbandoned = false;
     // Consumed exactly once, whatever happens below: this worker removed the
     // tab itself as housekeeping, so the removal is not the operator giving up.
     const deliberate = this.deliberateRemovals.delete(tabID);
@@ -20039,6 +20245,7 @@ export class Bridge {
         ownerBindingID !== undefined &&
         durableClaim !== undefined
       ) {
+        institutionalClaimAbandoned = true;
         this.enqueueRestartRecoveredObservation(
           {
             job_id: ledgerJobID,
@@ -20071,6 +20278,7 @@ export class Bridge {
     ) {
       const grant = this.claimGrants.get(job.job_id);
       if (grant !== undefined) {
+        institutionalClaimAbandoned = true;
         this.enqueueClaimObservation(job.job_id, ownerBindingID, "owner_closed");
         // §2.2.1's owner_closed reducer counterpart: authorize the now-gone
         // surface's abandonment. The tab is already gone, so there is nothing
@@ -20087,6 +20295,7 @@ export class Bridge {
         // the institution's one login slot until the daemon's lease expires,
         // and every sibling parks tablessly in the meantime — the stranded
         // sign-in this whole effort exists to prevent.
+        institutionalClaimAbandoned = true;
         this.enqueueRestartRecoveredObservation(
           {
             job_id: job.job_id,
@@ -20124,6 +20333,15 @@ export class Bridge {
 
       return;
     }
+
+    // ADR-0023's seventh surface, raised here and nowhere else. Placement is
+    // load-bearing: it sits AFTER the deliberate/authorized-close return above,
+    // because papio closing its own tab is not a loss to report, and after the
+    // classify-retry return, whose lifecycle the close already settled. The
+    // branches below decide what papio DOES about the loss; they do not change
+    // what was lost, so one call serves all of them and `toastKindForLoss`
+    // answers `undefined` for the two that lost nothing.
+    void this.reportLostSurface(job, institutionalClaimAbandoned);
 
     // (waiting_for_session) never had a chance to sign in on its own — its
     // tab closing is not the operator abandoning the job, just losing the
@@ -20975,6 +21193,9 @@ interface InboxRuntimeURLs {
   /** ADR-0019 Decision 4: addressed `?scan=<id>`, so exact-sender checks
    * compare origin+pathname only — never the full URL — for this one page. */
   pageBulkURL: string;
+  /** ADR-0023's seventh surface. Its own page, so its own authorized sender:
+   * the toast may consume one pending offer and act on it, and nothing else. */
+  toastURL: string;
 }
 
 type InboxRuntimeReply =
@@ -20995,6 +21216,8 @@ type InboxRuntimeReply =
       worker_epoch: string;
     }>
   | BrokerReply<{ accepted: boolean }>
+  | BrokerReply<{ toast?: ToastPayload }>
+  | BrokerReply<{ opened: boolean }>
   | BrokerReply<{ feature: boolean; entries: ActivityEntryPayload[] }>
   | BrokerReply<{
       state: BridgeSessionState;
@@ -21099,6 +21322,16 @@ function isInboxOrPopupSender(
 
 /** ADR-0019 Decision 4: the workspace is addressed `?scan=<id>`, so the
  * exact-page check compares origin+pathname only, ignoring that query. */
+/** The toast window is its own sender. Exact URL: unlike the page-bulk page it
+ * carries no query, because its payload comes from the producer rather than
+ * from its address. */
+function isToastSender(
+  sender: InboxRuntimeSender,
+  urls: InboxRuntimeURLs,
+): boolean {
+  return sender.id === urls.runtimeID && sender.url === urls.toastURL;
+}
+
 function isPageBulkSender(
   sender: InboxRuntimeSender,
   urls: InboxRuntimeURLs,
@@ -21849,6 +22082,37 @@ export async function handleInboxRuntimeMessage(
     }
     return bridge.getPageBulkSnapshot(request.scan_id);
   }
+  if (type === TOAST_PENDING_MESSAGE) {
+    if (!isToastSender(sender, urls))
+      return failure("unauthorized", "This sender cannot read a papio toast");
+    if (!hasOnlyKeys(message, ["type"]))
+      return failure("invalid_request", "Invalid toast request");
+    // Answered as the payload itself, not an envelope: the page's parser
+    // accepts only the closed shape and closes the window on anything else.
+    return { ok: true, toast: bridge.toastPending() };
+  }
+  if (type === TOAST_ACTION_MESSAGE) {
+    if (!isToastSender(sender, urls))
+      return failure("unauthorized", "This sender cannot act on a papio toast");
+    const jobID = message["job_id"];
+    if (!hasOnlyKeys(message, ["type", "job_id"]) || typeof jobID !== "string" || jobID === "")
+      return failure("invalid_request", "Invalid toast action");
+    return { ok: true, opened: await bridge.toastAction(jobID) };
+  }
+  if (type === TOAST_DISMISS_MESSAGE) {
+    if (!isToastSender(sender, urls))
+      return failure("unauthorized", "This sender cannot dismiss a papio toast");
+    const jobID = message["job_id"];
+    if (
+      !hasOnlyKeys(message, ["type", "job_id", "reason"]) ||
+      typeof jobID !== "string" ||
+      jobID === ""
+    ) {
+      return failure("invalid_request", "Invalid toast dismissal");
+    }
+    bridge.toastDismiss(jobID);
+    return { ok: true };
+  }
   if (type === "papio.pageBulk.scan") {
     if (!isPopupSender(sender, urls))
       return failure("unauthorized", "This sender cannot start a page scan");
@@ -22122,7 +22386,12 @@ function realDeps(): BridgeDeps {
             create: (props: {
               url: string;
               focused: boolean;
-              state: "minimized" | "normal";
+              state?: "minimized" | "normal";
+              type?: "popup";
+              width?: number;
+              height?: number;
+              top?: number;
+              left?: number;
             }) => chrome.windows.create(props) as Promise<WindowInfo>,
             // populate:true so browser-side work-window state stays observable.
             get: (windowID: number) =>
@@ -22137,6 +22406,7 @@ function realDeps(): BridgeDeps {
                 drawAttention?: boolean;
               },
             ) => chrome.windows.update(windowID, props),
+            remove: (windowID: number) => chrome.windows.remove(windowID),
           },
         }
       : {}),
@@ -22437,6 +22707,9 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
     ),
     optionsURL: chrome.runtime.getURL(
       declaredPopup.replace(/[^/]*$/, "options.html"),
+    ),
+    toastURL: chrome.runtime.getURL(
+      declaredPopup.replace(/[^/]*$/, "toast.html"),
     ),
     pageBulkURL: chrome.runtime.getURL(
       declaredPopup.replace(/[^/]*$/, "page-bulk.html"),

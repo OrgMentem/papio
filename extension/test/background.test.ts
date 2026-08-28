@@ -229,7 +229,18 @@ class FakeAction {
 }
 
 class FakeWindows {
-  readonly created: { url: string; focused: boolean; state: string }[] = [];
+  readonly created: {
+    url: string;
+    focused: boolean;
+    state?: string;
+    type?: "popup";
+    width?: number;
+    height?: number;
+  }[] = [];
+  /** When true, `create` reports the window as focused however it was asked —
+   * the macOS Firefox defect (bugzilla 1271047) the work window already
+   * documents, and which the toast must correct after creation. */
+  ignoresFocusedOnCreate = false;
   readonly updated: {
     windowID: number;
     props: {
@@ -245,17 +256,31 @@ class FakeWindows {
   async create(props: {
     url: string;
     focused: boolean;
-    state: "minimized" | "normal";
-  }): Promise<{ id: number; state: string; tabs: TabInfo[] }> {
+    state?: "minimized" | "normal";
+    type?: "popup";
+    width?: number;
+    height?: number;
+  }): Promise<{
+    id: number;
+    state: string;
+    focused: boolean;
+    tabs: TabInfo[];
+  }> {
     this.created.push(props);
     const id = this.nextId++;
-    this.live.set(id, { id, state: props.state });
+    const state = props.state ?? "normal";
+    this.live.set(id, { id, state });
     const tab = await this.tabs.create({
       url: props.url,
       active: false,
       windowId: id,
     });
-    return { id, state: props.state, tabs: [tab] };
+    return {
+      id,
+      state,
+      focused: this.ignoresFocusedOnCreate ? true : props.focused,
+      tabs: [tab],
+    };
   }
   async get(
     windowID: number,
@@ -9913,6 +9938,7 @@ test("popup capture relay emits page_capture only after the daemon advertises it
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const sanitized = sanitizeFixture(
     `<main class="article">Known structure</main>`,
@@ -9987,6 +10013,7 @@ test("popup capture relay withholds a terms capture until the daemon advertises 
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const sanitized = sanitizeFixture(`<main class="terms">Consent wall</main>`, {
     provider: "jstor",
@@ -10256,6 +10283,7 @@ test("inbox runtime messages validate the exact extension sender", async () => {
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const message = { type: "papio.triage.counts", request: {} };
 
@@ -10310,6 +10338,7 @@ test("papio.activity and counts accept popup senders while snapshot and mutation
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const reply = {
     ok: true as const,
@@ -10385,6 +10414,7 @@ test("papio.stats from any papio page routes to the bridge stats request", async
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const statsReply: Awaited<ReturnType<Bridge["requestStats"]>> = {
     ok: true,
@@ -10426,6 +10456,7 @@ test("papio.stats rejects foreign senders and malformed requests without touchin
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   let statsCalls = 0;
   h.bridge.requestStats = async (): ReturnType<Bridge["requestStats"]> => {
@@ -10487,6 +10518,7 @@ const pageBulkTestURLs = {
   historyURL: "chrome-extension://papio-test-id/history.html",
   optionsURL: "chrome-extension://papio-test-id/options.html",
   pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+  toastURL: "chrome-extension://papio-test-id/toast.html",
 };
 
 const pageBulkRequestFixtures: {
@@ -11415,6 +11447,7 @@ test("open inbox runtime request focuses the singleton or creates it from the po
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   h.tabs.seed({ id: 88, url: urls.inboxURL, windowId: 600 });
   h.windows?.live.set(600, { id: 600, state: "minimized" });
@@ -11467,6 +11500,7 @@ test("inbox handoff runtime opening focuses the live offered tab without returni
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   await h.bridge.start();
   await h.port.inbound(jobOffer("job_0001a_inbox_open"));
@@ -11603,6 +11637,7 @@ test("session probe inspects a live resolver tab before claiming signed out, and
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   await h.bridge.start();
   const keepaliveAPI: KeepaliveAPI = {
@@ -11699,6 +11734,7 @@ test("session state reports each known resolver and sign-in targets its origin",
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const collegeOrigin = "https://onesearch.library.example-college.edu";
   await h.bridge.start();
@@ -11827,6 +11863,7 @@ test("session state binds active authentication demand to the exact resolver ori
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const originA = "https://resolver.example.edu";
   await h.bridge.start();
@@ -11862,6 +11899,7 @@ test("provider and OA offer URLs never mint institution session rows", async () 
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   await h.bridge.start();
   await h.port.inbound(
@@ -11904,6 +11942,7 @@ test("session sign-in reports why it cannot open without a resolver", async () =
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   await h.bridge.start();
   await expect(
@@ -11931,6 +11970,7 @@ test("session sign-in opens the resolver origin in a foreground tab as fallback"
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const offer = jobOffer("job_session_signin") as {
     payload: Record<string, unknown>;
@@ -12036,6 +12076,7 @@ test("an inbox dismiss relays verdict dismiss through the native resolve", async
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   await h.bridge.start();
   await h.port.inbound(
@@ -12097,6 +12138,7 @@ test("an inbox delivery reconciliation relays confirm_request_exists/absent thro
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   await h.bridge.start();
   await h.port.inbound(
@@ -13714,6 +13756,7 @@ test("inbox Open mints the institution route daemon-side and still binds nothing
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const routeURL = "https://resolver.example.edu/openurl?rft_id=10.1007/BF03392100";
   const jobID = "job_open_plain_new_0001";
@@ -13760,6 +13803,7 @@ test("inbox Open surfaces a refusal when the daemon cannot mint a route", async 
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   const jobID = "job_open_no_route_0001";
   const opening = handleInboxRuntimeMessage(
@@ -13792,6 +13836,7 @@ test("inbox Open remains inbox-only and takes a job id alone", async () => {
     historyURL: "chrome-extension://papio-test-id/history.html",
     optionsURL: "chrome-extension://papio-test-id/options.html",
     pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
   };
   await expect(
     handleInboxRuntimeMessage(h.bridge, { type: "papio.manual.open", request: { job_id: "job_manual_popup_forbidden" } }, { id: urls.runtimeID, url: urls.popupURL }, urls),
@@ -22297,4 +22342,179 @@ test("dev_reload when installType rejects is handled without throwing and withou
   });
   expect(reloaded).toBe(0);
   expect(h.port.disconnected).toBe(false);
+});
+
+// ADR-0023's seventh surface, producer side. These drive the real onTabRemoved
+// branch cascade, because the decision that matters is WHICH losses interrupt
+// the researcher — and the branch that must never interrupt is the one where
+// papio closed its own tab.
+test("losing a papio-driven tab raises the toast", async () => {
+  const jobID = "job_toast_route";
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+
+  const created = h.windows?.created.filter((props) => props.url.endsWith("toast.html")) ?? [];
+  expect(created).toHaveLength(1);
+  // Unfocused and small: a toast, not a browser window. A focused window here
+  // would take the researcher out of whatever they were reading.
+  expect(created[0]?.focused).toBe(false);
+  expect(created[0]?.type).toBe("popup");
+  const internals = h.bridge as unknown as { toastPending(): { kind: string; job_id: string } | undefined };
+  expect(internals.toastPending()).toEqual({ kind: "route_lost", job_id: jobID });
+});
+
+test("papio closing its own tab never raises a toast", async () => {
+  // The discriminating case. `authorizedClose`/`deliberate` returns BEFORE the
+  // branch cascade, and a toast raised above that return would fire on every
+  // reconcile removal and every daemon-authorized close — papio interrupting
+  // the researcher to report its own routine housekeeping.
+  const jobID = "job_toast_deliberate";
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", "surface_close_v1"] }));
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  const internals = h.bridge as unknown as {
+    deliberateRemovals: Set<number>;
+    toastPending(): unknown;
+  };
+  // The exact state the branch reads. `removeMaterializationTab` is the only
+  // writer, but its own gate (closeOwnedTab's four predicates) can refuse the
+  // tab and then correctly drop the marker — that gate has its own tests, and
+  // the subject here is the toast, so the marker is set directly.
+  internals.deliberateRemovals.add(tabID);
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+
+  expect(h.windows?.created.filter((props) => props.url.endsWith("toast.html")) ?? []).toHaveLength(0);
+  expect(internals.toastPending()).toBeUndefined();
+});
+
+test("a toast is suppressed while a papio surface has focus", async () => {
+  // Decision 9's presence hint: the popup already reports the same event, so a
+  // window on top of it is a duplicate. The suppression is age-bounded, which
+  // the next test pins.
+  const jobID = "job_toast_focused";
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", "surface_presence_v1"] }));
+  // Not awaited: the record is written before the correlated round trip, and
+  // the fake port never acks presence.
+  void h.bridge.sendSurfacePresence({
+    surface: "popup",
+    focused: true,
+    instance_id: "instance-1",
+    at: new Date(h.clock.now).toISOString(),
+  });
+  await Promise.resolve();
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  expect(h.windows?.created.filter((props) => props.url.endsWith("toast.html")) ?? []).toHaveLength(0);
+});
+
+test("a stale focus report stops suppressing the toast", async () => {
+  // The MV3 worker-memory trap, deliberately failing toward showing the toast.
+  // A popup that closed while the worker slept never sends `focused: false`, so
+  // a suppression with no age bound would silence this surface for ever.
+  const jobID = "job_toast_stale_focus";
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", "surface_presence_v1"] }));
+  // Not awaited: the record is written before the correlated round trip, and
+  // the fake port never acks presence.
+  void h.bridge.sendSurfacePresence({
+    surface: "popup",
+    focused: true,
+    instance_id: "instance-1",
+    at: new Date(h.clock.now).toISOString(),
+  });
+  await Promise.resolve();
+  h.clock.now += 31_000;
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  expect(h.windows?.created.filter((props) => props.url.endsWith("toast.html")) ?? []).toHaveLength(1);
+});
+
+test("taking the offer mints a fresh route and opens it", async () => {
+  const jobID = "job_toast_action";
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+
+  const internals = h.bridge as unknown as { toastAction(jobID: string): Promise<boolean> };
+  const acting = internals.toastAction(jobID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  expect(request.payload["job_id"]).toBe(jobID);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: "https://une.primo.exlibrisgroup.com/openurl?x=1",
+    }),
+  );
+  expect(await acting).toBe(true);
+  expect(h.tabs.created.some((props) => props.url?.startsWith("https://une.primo.exlibrisgroup.com/openurl"))).toBe(true);
+});
+
+test("an offer for a job papio did not name is refused", async () => {
+  // A toast window reloaded after a replacement would otherwise ask papio to
+  // reopen the previous paper.
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  const internals = h.bridge as unknown as { toastAction(jobID: string): Promise<boolean> };
+  expect(await internals.toastAction("job_never_offered")).toBe(false);
+});
+
+test("a manually closed toast window is never removed by id alone", async () => {
+  // The recycled-id hazard. The researcher closes the toast themselves, so no
+  // dismissal is reported and the id survives. If a later raise removed that id
+  // without re-checking ownership, papio would close whatever window the
+  // browser had since given the id to.
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  const internals = h.bridge as unknown as {
+    raiseToast(payload: { kind: string; job_id: string }): Promise<boolean>;
+  };
+  await internals.raiseToast({ kind: "route_lost", job_id: "job-a" });
+  const toastWindowID = h.windows?.live.keys().next().value as number;
+
+  // The researcher closes it, and the browser hands the id to one of their own
+  // windows — modelled by dropping papio's window and creating an unrelated one
+  // that reuses the id.
+  h.windows?.close(toastWindowID);
+  h.windows?.live.set(toastWindowID, { id: toastWindowID, state: "normal" });
+  await h.tabs.create({ url: "https://example.edu/their-own-paper", active: true, windowId: toastWindowID });
+
+  await internals.raiseToast({ kind: "route_lost", job_id: "job-b" });
+  expect(h.windows?.removed ?? []).not.toContain(toastWindowID);
+});
+
+test("macOS Firefox ignoring focused:false is corrected after creation", async () => {
+  // bugzilla 1271047, the same defect the work window documents. Unfixed, the
+  // toast steals focus, which is the opposite of a toast.
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  if (h.windows !== undefined) h.windows.ignoresFocusedOnCreate = true;
+  const internals = h.bridge as unknown as {
+    raiseToast(payload: { kind: string; job_id: string }): Promise<boolean>;
+  };
+  await internals.raiseToast({ kind: "route_lost", job_id: "job-ff" });
+
+  expect(h.windows?.updated.some((entry) => entry.props.focused === false)).toBe(true);
 });

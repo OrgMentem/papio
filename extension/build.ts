@@ -2,8 +2,8 @@
 // Bundles the Chrome MV3 extension into dist/ and produces a Firefox MV3
 // extension root in firefox/. Bun is a build tool here only — both shipped
 // artifacts are plain browser JavaScript with zero runtime dependencies.
-//   dist/{history,inbox,options,popup}.{js,html} Chrome extension pages
-//   firefox/dist/{history,inbox,options,popup}.{js,html} Firefox extension pages
+//   dist/{history,inbox,materialize,options,page-bulk,popup,toast}.{js,html} Chrome pages
+//   firefox/dist/{...same...}.{js,html} Firefox extension pages
 //
 // Pass --watch to rebuild on changes to src/, icons/, or manifest.json — the
 // dev loop (see `bun run dev`) pairs this with `web-ext run`, which reloads the
@@ -24,7 +24,7 @@ const captureToolsInDevBuild =
 const capturePanel = /\n      <details class="capture" hidden>[\s\S]*?\n      <\/details>/;
 
 
-const extensionPageNames = ["history", "inbox", "materialize", "options", "page-bulk", "popup"] as const;
+const extensionPageNames = ["history", "inbox", "materialize", "options", "page-bulk", "popup", "toast"] as const;
 
 async function assertExtensionPages(outdir: string): Promise<void> {
   await Promise.all(
@@ -54,6 +54,7 @@ async function copyExtensionPages(outdir: string): Promise<void> {
     cp("src/materialize.html", `${outdir}/materialize.html`),
     cp("src/options.html", `${outdir}/options.html`),
     cp("src/page-bulk.html", `${outdir}/page-bulk.html`),
+    cp("src/toast.html", `${outdir}/toast.html`),
     writeFile(`${outdir}/popup.html`, builtPopup),
   ]);
 }
@@ -80,18 +81,18 @@ async function build(entrypoints: string[], outdir: string, format: "esm" | "iif
 
 async function buildAll(): Promise<void> {
   const chromeBundles = await build(
-    ["src/background.ts", "src/history.ts", "src/inbox.ts", "src/materialize.ts", "src/options.ts", "src/page-bulk.ts", "src/popup.ts"],
+    ["src/background.ts", "src/history.ts", "src/inbox.ts", "src/materialize.ts", "src/options.ts", "src/page-bulk.ts", "src/popup.ts", "src/toast.ts"],
     "dist",
     "esm",
   );
   await copyExtensionPages("dist");
   await assertExtensionPages("dist");
-  console.log(`built Chrome: ${chromeBundles} bundles + 6 html shells into dist/`);
+  console.log(`built Chrome: ${chromeBundles} bundles + ${extensionPageNames.length} html shells into dist/`);
 
   await mkdir(firefoxDist, { recursive: true });
   const firefoxBackgroundBundles = await build(["src/background.ts"], firefoxDist, "iife");
   const firefoxPageBundles = await build(
-    ["src/history.ts", "src/inbox.ts", "src/materialize.ts", "src/options.ts", "src/page-bulk.ts", "src/popup.ts"],
+    ["src/history.ts", "src/inbox.ts", "src/materialize.ts", "src/options.ts", "src/page-bulk.ts", "src/popup.ts", "src/toast.ts"],
     firefoxDist,
     "esm",
   );
@@ -129,7 +130,7 @@ async function buildAll(): Promise<void> {
     throw new Error("Firefox background, inbox, and history bundles must not contain top-level exports");
   }
   console.log(
-    `built Firefox: ${firefoxBackgroundBundles + firefoxPageBundles} bundles + 6 html shells + icons into firefox/`,
+    `built Firefox: ${firefoxBackgroundBundles + firefoxPageBundles} bundles + ${extensionPageNames.length} html shells + icons into firefox/`,
   );
 }
 
