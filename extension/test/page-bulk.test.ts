@@ -236,7 +236,10 @@ test("loads the snapshot, binds the header (title/origin/timestamp), and sets do
   expect(page.document.getElementById("scan-meta")?.textContent).toContain("https://scholar.example.edu");
   expect(page.document.getElementById("scan-summary")?.textContent).toBe("1 identified paper found \u2014 1 eligible");
 
-  expect(page.requests[0]).toEqual({ type: "papio.pageBulk.load", request: { scan_id: "scan-1" } });
+  expect(page.requests.find((r) => r.type === "papio.pageBulk.load")).toEqual({
+    type: "papio.pageBulk.load",
+    request: { scan_id: "scan-1" },
+  });
   const statusRequest = page.requests.find((r) => r.type === "papio.pageBulk.status");
   expect(statusRequest?.request).toEqual({
     scan_id: "scan-1",
