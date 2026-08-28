@@ -176,6 +176,17 @@ window and removes it only while it still holds exactly one tab showing the toas
 page. Naming the new removal site in `extension/test/tab-window-close-ast.test.ts`
 is what surfaced this: that allowlist exists to force exactly this review.
 
+**The window size was a guess, and the guess clipped the button.** 420px — the
+popup's width — was chosen for visual consistency. Measured in a real browser
+against the built bundle: at 420 the institutional message wraps to FOUR lines
+and needs 106px of inner height, and `windows.create`'s height includes the
+platform frame, so 108 outer left roughly 80 inner and hid the action entirely.
+At 520 both messages wrap to two lines and need 65 inner. The window is now
+520x116, `toast.html` scrolls rather than clips as a safety net, and a test pins
+the copy bound the measurement rests on so a longer sentence fails there rather
+than in a researcher's browser. Unit tests could not have caught this: they
+render into a detached document with no viewport.
+
 **The suppression needed the injected clock.** `papioSurfaceLikelyFocused` first
 used `Date.now()` rather than the bridge's `deps.now()` seam, so the stale-focus
 test could not advance time and failed. Every time-dependent path in this file

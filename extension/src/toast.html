@@ -39,6 +39,10 @@
         padding: 12px 14px;
         color: var(--toast-fg);
         background: var(--toast-bg);
+        /* The window is sized from a measurement, not a guarantee: a platform
+           with a taller frame, a larger default font, or longer copy must
+           scroll rather than hide the button silently. */
+        overflow: auto;
       }
 
       #toast {

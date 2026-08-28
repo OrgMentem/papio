@@ -118,3 +118,24 @@ test("the toast window outlasts the inbox undo window", () => {
   // it must not be the tighter of the two.
   expect(TOAST_WINDOW_MS).toBeGreaterThan(6000);
 });
+
+test("the window is wide enough for the longest copy to wrap to two lines", () => {
+  // A measurement, kept as an assertion because the first size was a guess and
+  // clipped. At 420px — the popup's width — the institutional message wraps to
+  // four lines and needs 106px of inner height, while windows.create's height
+  // includes the platform frame, so 108 outer left ~80 inner and hid the
+  // button. Measured in a real browser at 520px: both messages wrap to two
+  // lines and need 65px inner.
+  //
+  // This pins the INPUT to that measurement, which is what a future copy change
+  // would break: a longer sentence re-wraps and the window no longer fits it.
+  // The per-message bound below is what the 520px measurement allows at this
+  // font, leaving the two controls their room.
+  for (const [kind, copy] of Object.entries(TOAST_COPY)) {
+    const longestWord = Math.max(...copy.message.split(" ").map((word) => word.length));
+    expect(longestWord, `${kind} has an unwrappable word`).toBeLessThanOrEqual(14);
+    // Message plus action label share one 520px row. Both together past this
+    // and the two-line measurement no longer holds.
+    expect(copy.message.length + copy.action.length, kind).toBeLessThanOrEqual(100);
+  }
+});

@@ -482,10 +482,16 @@ const MATERIALIZE_PAGE_PATH = POPUP_PAGE_PATH.replace(
  * went wrong — a broken page URL here would be silent. */
 const TOAST_PAGE_PATH = POPUP_PAGE_PATH.replace(/[^/]*$/, "toast.html");
 /** A toast, not a browser window: small, chrome-less, and deliberately
- * unfocused. The height fits one line of copy plus the two controls at the
- * default page font; the width is the popup's, so the two surfaces read as one
- * product. */
-const TOAST_WINDOW_SIZE = { width: 420, height: 108 } as const;
+ * unfocused.
+ *
+ * Measured, not guessed. At 420px — the popup's width, which this first used —
+ * the longer of the two messages wraps to FOUR lines and needs 106px of inner
+ * height, while `windows.create` height includes the window frame, so a 108
+ * outer left roughly 80 inner and clipped the copy. At 520 both messages wrap
+ * to two lines and need 65 inner; 116 outer leaves room for the largest frame
+ * across macOS, Windows, Linux and Firefox. `toast.html` also scrolls rather
+ * than clips, so copy that outgrows this degrades visibly instead of silently. */
+const TOAST_WINDOW_SIZE = { width: 520, height: 116 } as const;
 /** How long a papio surface's focus report suppresses the toast. */
 const TOAST_PRESENCE_TTL_MS = 30_000;
 /** The handoff group's title. Constant: it is an ownership marker, not a
