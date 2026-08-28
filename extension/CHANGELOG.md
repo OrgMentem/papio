@@ -48,9 +48,10 @@ for the full pre-split extension history.
   resolver can land directly on Wiley's `/doi/pdfdirect/` file route. Chrome
   renders that route through its built-in PDF viewer, whose page body is empty.
   *papio* previously treated that empty viewer as a changed Wiley page and
-  returned the download to you. The declared Wiley route now identifies the
-  settled file before page classification, so the tracked job downloads,
-  validates, and imports it without another human action.
+  returned the download to you. The declared route now identifies the settled
+  file before page classification, so a delegated tracked job downloads it
+  without another human action. Validation then proceeds normally; auto-import
+  still follows the job policy and configured zotio integration.
 - **A fresh empty library no longer disconnects its browser session.** The
   daemon can omit zero-length task-family and required-turn arrays from an
   otherwise complete inbox-count response. The extension and daemon now agree

@@ -79,9 +79,9 @@
   <strong>Identity is checked before automatic filing; ambiguous cases wait for review.</strong><br>
   <strong>Runs on your machine; required lookups use
   <a href="https://orgmentem.github.io/papio/privacy/">documented destinations</a>.</strong><br>
-  <strong>Every accepted PDF has a
-  <a href="docs/concepts/validation-and-provenance.md">provenance receipt</a>
-  in its acquisition bundle.</strong>
+  <strong>Each exportable
+  <a href="docs/concepts/validation-and-provenance.md">acquisition bundle</a>
+  includes a permanent provenance receipt.</strong>
 </p>
 
 ```bash
