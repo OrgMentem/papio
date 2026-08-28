@@ -2933,6 +2933,29 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 		log.Printf("papio: claim observation %s for %s not applied: %s (%s)",
 			p.EventKind, jobID, applied.Outcome, applied.Detail)
 	}
+	// A lost access surface was silent on every operator surface: the badge
+	// counts auth walls and required turns, the pulse skips gate members,
+	// and owner_closed's own effects touch claim, lease, and journal — none
+	// of which any popup card reads. So papio recovered a paper the
+	// researcher had just watched disappear, and said nothing.
+	//
+	// This is legibility, not an interruption: it appends one durable
+	// Activity row, which the popup's existing catch-up card already counts
+	// and `papio activity` already prints. ADR-0023 Decision 5 forbids a
+	// desktop notification for working progress, and this is working
+	// progress.
+	//
+	// Gated on SurfaceLost so it states only what happened. An owner_closed
+	// whose claim some earlier terminal transition already retired — the
+	// ordinary tail of a SUCCESSFUL provider outcome — abandons nothing and
+	// must stay quiet; announcing a loss there would contradict the delivery
+	// the researcher is about to receive. Best-effort: a feed write must
+	// never fail the reducer's ack, whose effects are already committed.
+	if applied.Outcome == "applied" && applied.SurfaceLost {
+		if err := b.jobs.RecordEvent(ctx, jobID, "browser.surface_closed", nil); err != nil {
+			log.Printf("papio: recording browser.surface_closed for %s: %v", jobID, err)
+		}
+	}
 	return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
 		RequestID: p.RequestID, Outcome: applied.Outcome, Detail: applied.Detail,
 		GateOccurrenceID: applied.GateOccurrenceID, BrowserHolderGeneration: generation,

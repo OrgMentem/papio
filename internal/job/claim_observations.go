@@ -223,7 +223,7 @@ func (js *Store) AbandonMaterializationClaimByBinding(ctx context.Context, bindi
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := abandonMaterializationClaimByBindingTx(ctx, tx, bindingID, store.Now()); err != nil {
+	if _, err := abandonMaterializationClaimByBindingTx(ctx, tx, bindingID, store.Now()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -248,7 +248,7 @@ func (js *Store) RetireMaterializationBindingAfterOutcome(ctx context.Context, b
 	}
 	defer func() { _ = tx.Rollback() }()
 	now := store.Now()
-	if err := abandonMaterializationClaimByBindingTx(ctx, tx, bindingID, now); err != nil {
+	if _, err := abandonMaterializationClaimByBindingTx(ctx, tx, bindingID, now); err != nil {
 		return err
 	}
 	if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, []string{bindingID}, now); err != nil {
@@ -257,16 +257,31 @@ func (js *Store) RetireMaterializationBindingAfterOutcome(ctx context.Context, b
 	return tx.Commit()
 }
 
-func abandonMaterializationClaimByBindingTx(ctx context.Context, q dbtx, bindingID, now string) error {
+// abandonMaterializationClaimByBindingTx marks the binding's live claim
+// abandoned and reports whether it actually found one. That boolean is the
+// only honest discriminator between the two ways owner_closed arrives: a
+// surface lost while it still owned a live claim, and a surface whose claim
+// some earlier terminal transition (a provider outcome via
+// RetireMaterializationBindingAfterOutcome, a lease timeout, a reconcile)
+// already retired. Both apply cleanly and both are correct; only the first
+// one is a loss the researcher has any reason to hear about.
+func abandonMaterializationClaimByBindingTx(ctx context.Context, q dbtx, bindingID, now string) (bool, error) {
 	if strings.TrimSpace(bindingID) == "" {
-		return errors.New("binding is required")
+		return false, errors.New("binding is required")
 	}
-	_, err := q.ExecContext(ctx, `
+	res, err := q.ExecContext(ctx, `
 		UPDATE materialization_claims
 		   SET phase='abandoned', lease_until=?, updated_at=?
 		 WHERE binding_id=? AND phase IN ('claimed','bound','route_issued','navigated')`,
 		now, now, bindingID)
-	return err
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 // ConsumeCloseAuthorizationForBinding marks any live ('issued') close

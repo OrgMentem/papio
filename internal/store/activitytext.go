@@ -77,6 +77,8 @@ func ActivityText(kind string, detail map[string]any) string {
 		return "No entitlement here — requeued for other routes"
 	case "browser.handoff_reoffered":
 		return "Handoff re-offered (institution session live)"
+	case "browser.surface_closed":
+		return "Access tab closed — this paper waits for another attempt"
 	case "job.transition":
 		to := strings.ReplaceAll(activityDetailString(detail, "to"), "_", " ")
 		if to == "" {

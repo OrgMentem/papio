@@ -11,6 +11,17 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Closing the tab *papio* opened for you is no longer silent.** When you
+  close the tab *papio* used to reach a paper through your institution, it
+  releases that route and the paper waits for another attempt. Nothing told
+  you: the toolbar count reports sign-in walls and decisions, and the popup
+  reads neither the access claim nor the journal row that recorded the loss —
+  so a paper you watched disappear left no visible trace. That release now
+  writes one durable Activity entry, which the popup's "While you were away"
+  card counts and `papio activity` prints. It is deliberately not a desktop
+  notification: *papio* getting on with the work does not interrupt you. A tab
+  you close after the paper is already delivered stays silent, because that
+  route finished rather than being lost.
 - **A paper bundled with a supplementary file is now delivered instead of
   parked.** Publishers routinely attach one extra file to a PDF, and *papio*
   will not file a document that carries anything runnable, so those papers

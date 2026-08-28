@@ -26,6 +26,7 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 		{"browser.provider_outcome", map[string]any{"outcome": "no_entitlement"}, "Provider outcome: no entitlement"},
 		{"browser.no_entitlement_requeue", nil, "No entitlement here — requeued for other routes"},
 		{"browser.handoff_reoffered", nil, "Handoff re-offered (institution session live)"},
+		{"browser.surface_closed", nil, "Access tab closed — this paper waits for another attempt"},
 		{"acquisition.component_added", map[string]any{"role": "supplement"}, "Added supplement component"},
 		{"zotio.auto_import", map[string]any{"status": "applied"}, "Imported into Zotero"},
 		{"zotio.collection_filing", nil, "Filed into Zotero collection"},

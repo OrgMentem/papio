@@ -49,6 +49,14 @@ type ApplyClaimObservationResult struct {
 	// own store transactions and would deadlock the single-writer
 	// connection if run while this one is still open.
 	EntitledLanding bool
+	// SurfaceLost is true only when an owner_closed observation abandoned a
+	// claim that was still live. It is the reducer's report that a sign-in
+	// surface disappeared while it still owned the route, which is the one
+	// case worth telling the researcher about; every other owner_closed
+	// (a replay, or a claim an earlier terminal transition already retired)
+	// leaves it false. The caller writes the durable Activity event outside
+	// this transaction, for the same single-writer reason as EntitledLanding.
+	SurfaceLost bool
 }
 
 // ApplyClaimObservation is claim_observation's §2.2.1 reducer, run as ONE
@@ -238,9 +246,11 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		}
 		result.EntitledLanding = true
 	case "owner_closed":
-		if err := abandonMaterializationClaimByBindingTx(ctx, tx, in.BindingID, nowText); err != nil {
+		abandoned, err := abandonMaterializationClaimByBindingTx(ctx, tx, in.BindingID, nowText)
+		if err != nil {
 			return fail("error", "materialization claim could not be abandoned")
 		}
+		result.SurfaceLost = abandoned
 		if err := retireAuthenticationEntryLeaseAfterOwnerCloseTx(ctx, tx, in.AuthenticationClaimID, in.BindingID, in.Now); err != nil {
 			return fail("error", "authentication entry lease owner binding could not be cleared")
 		}
@@ -255,7 +265,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		// can retire the dead network-error surface. The candidate stays owned
 		// - no automatic retry into a network which may still be offline. A
 		// later explicit Open records the next-attempt decision.
-		if err := abandonMaterializationClaimByBindingTx(ctx, tx, in.BindingID, nowText); err != nil {
+		if _, err := abandonMaterializationClaimByBindingTx(ctx, tx, in.BindingID, nowText); err != nil {
 			return fail("error", "materialization claim could not be abandoned")
 		}
 

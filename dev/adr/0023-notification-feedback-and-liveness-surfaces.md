@@ -374,6 +374,41 @@ do not jump, because each is keyed on its earliest member. The 128-run wire
 bound stays enforced against the run count even though grouping makes it
 unreachable from the closed variant vocabulary.
 
+## Addendum (2026-08-28): a lost access surface is Activity, never a notification
+
+A researcher who closes the tab *papio* opened to reach a paper asked to be
+told about it, and asked for the telling to be proactive. Decision 5 answers
+the second half: *papio* releasing a route and waiting for another attempt is
+working progress, and working progress never creates a desktop notification.
+That is the whole answer, and this addendum records it so the same request does
+not re-open Decision 5 a third time.
+
+Three mechanical facts confirm the notifier cannot carry this event even if
+Decision 5 permitted it. The category vocabulary is closed and
+`notify.validateIntent` rejects an unknown or mismatched value, and the only
+near fit, `system_degraded`, means a named condition stops progress — this
+reducer abandons one claim and waits for fresh arbitration, so claiming
+degradation would be false. The obvious copy overpromises: the reducer schedules
+no retry, so "*papio* is retrying" would be untrue in exactly the case that
+motivates it. And the notification ledger coalesces on
+`(category, event_kind, aggregate_key, phase, window_start)` while the claim
+observation journal stores no episode and no affected count, so "3 papers" has
+nothing to coalesce on.
+
+The event therefore travels as one durable Activity row, `browser.surface_closed`,
+which Decision 8's pageable, watermark-aware Activity contract already carries
+and the popup catch-up card already counts. Decision 1's surface split is
+unchanged: no new channel, no new sender, no badge tier.
+
+One rule about honesty rather than routing. The row is written only when the
+observation abandoned a claim that was still live. A successful provider
+outcome retires the binding before the tab physically closes, so the trailing
+`owner_closed` abandons nothing; announcing a loss there would contradict the
+delivery the researcher is about to receive. The reducer reports that
+distinction (`ApplyClaimObservationResult.SurfaceLost`) rather than letting the
+caller infer it from the event kind, because the kind alone cannot tell the two
+apart.
+
 ## Consequences
 
 Positive:
