@@ -256,6 +256,13 @@ execution records kept during the initial build.
   wait on a code is never cut short. A download or navigation still in flight
   keeps the slot regardless of the clock. `papio doctor` now says this in its
   own remedy, instead of only telling you to close a tab that is already closed.
+- **A fresh empty library no longer disconnects the browser every minute.**
+  The exact inbox-count response correctly says that both the task-family list
+  and required-turn list are complete and empty. JSON omits those empty arrays,
+  but the daemon mistook omission for missing data, rejected its own response,
+  and tore down the native-messaging session. Both protocol readers and the
+  schema now treat omitted complete lists as empty only when their exact count
+  is zero. Non-empty responses still fail closed when either list is missing.
 - **`papio actions open` on a paper you download yourself now goes through your
   browser.** These papers reach your library through the institution's route,
   and *papio* had already taught the daemon to surface them in the tab you are

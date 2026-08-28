@@ -2608,6 +2608,22 @@ test("counts v3 fields, family runs, and required-turn item kinds are strict", (
       }),
     );
   expect(valid(countsV3()).payload).toBeDefined();
+  const emptyComplete: Record<string, unknown> = {
+    ...countsV3(),
+    pending_total: 0,
+    actions: 0,
+    turns_required: 0,
+    turns_working: 0,
+  };
+  delete emptyComplete.family_runs;
+  delete emptyComplete.required_turns;
+  expect(valid(emptyComplete).payload).toBeDefined();
+  const missingFamilyRuns = { ...countsV3() };
+  delete missingFamilyRuns.family_runs;
+  expect(() => valid(missingFamilyRuns)).toThrow(ProtocolError);
+  const missingRequiredTurns = { ...countsV3() };
+  delete missingRequiredTurns.required_turns;
+  expect(() => valid(missingRequiredTurns)).toThrow(ProtocolError);
   expect(() => valid({ ...countsV3(), turns_required: 1_000_001 })).toThrow(
     ProtocolError,
   );

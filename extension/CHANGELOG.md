@@ -44,6 +44,18 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+- **A Wiley PDF-viewer landing now completes without another click.** A library
+  resolver can land directly on Wiley's `/doi/pdfdirect/` file route. Chrome
+  renders that route through its built-in PDF viewer, whose page body is empty.
+  *papio* previously treated that empty viewer as a changed Wiley page and
+  returned the download to you. The declared Wiley route now identifies the
+  settled file before page classification, so the tracked job downloads,
+  validates, and imports it without another human action.
+- **A fresh empty library no longer disconnects its browser session.** The
+  daemon can omit zero-length task-family and required-turn arrays from an
+  otherwise complete inbox-count response. The extension and daemon now agree
+  that this exact zero means an empty list. Any non-zero complete count still
+  requires its list, so a truncated response remains an error.
 - **An open-access Elsevier paper is no longer left for you to fetch.** On a
   free-to-read ScienceDirect article the **View PDF** button points somewhere
   slightly different from the one on a subscription article, and *papio* only

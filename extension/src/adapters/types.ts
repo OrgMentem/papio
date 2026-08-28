@@ -763,12 +763,14 @@ export const adapters: AdapterSpec[] = [
     // points at /doi/pdf/<doi>, but that path returns an HTML viewer wrapper —
     // the actual file is Wiley's /doi/pdfdirect/<doi>?download=true endpoint
     // (what the viewer's download button builds; confirmed live to return the
-    // PDF while /doi/pdf/ returns HTML). So classify on the citation metas but
-    // build the direct endpoint from the DOI in the page URL and fetch it
-    // through the privileged downloads API with the session cookies. No
-    // publisher terms modal, so no consent gate.
+    // PDF while /doi/pdf/ returns HTML). The resolver can also land directly
+    // on that endpoint; declaring it as a viewer route lets the tracked-tab
+    // download path adopt the file before blank PDF-viewer DOM is reported as
+    // adapter drift. So classify on the citation metas but build the direct
+    // endpoint from the DOI in the page URL and fetch it through the privileged
+    // downloads API with the session cookies. No publisher terms modal.
     id: "wiley",
-    version: "0.2.0",
+    version: "0.3.0",
     hosts: ["onlinelibrary.wiley.com"],
     workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -783,7 +785,10 @@ export const adapters: AdapterSpec[] = [
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "url",
-      viewerRoutes: [{ pathPrefix: "/doi/epdf/" }],
+      viewerRoutes: [
+        { pathPrefix: "/doi/epdf/" },
+        { pathPrefix: "/doi/pdfdirect/" },
+      ],
       // Wiley article/abstract/viewer paths all carry the DOI after /doi/[seg/].
       idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
       urlTemplate: "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
@@ -1464,7 +1469,7 @@ export function providerViewerPDFURL(
 
   let match: RegExpMatchArray | null;
   try {
-    match = value.match(new RegExp(idPattern));
+    match = `${page.origin}${page.pathname}`.match(new RegExp(idPattern));
   } catch {
     return undefined;
   }

@@ -6047,8 +6047,8 @@ func (counts TriageCounts) validateV3() error {
 		if counts.TurnsRequired == nil || counts.TurnsWorking == nil {
 			return fmt.Errorf("complete family breakdown requires turns counts")
 		}
-		if counts.FamilyRuns == nil {
-			return fmt.Errorf("complete family breakdown requires family_runs")
+		if counts.FamilyRuns == nil && (*counts.TurnsRequired != 0 || *counts.TurnsWorking != 0) {
+			return fmt.Errorf("non-empty complete family breakdown requires family_runs")
 		}
 		if familyTotal != *counts.TurnsRequired+*counts.TurnsWorking {
 			return fmt.Errorf("family run totals mismatch")
@@ -6088,7 +6088,9 @@ func (counts TriageCounts) validateV3() error {
 		}
 	}
 	if counts.RequiredTurnsComplete != nil && *counts.RequiredTurnsComplete {
-		if counts.TurnsRequired == nil || counts.RequiredTurns == nil || int64(len(counts.RequiredTurns)) != *counts.TurnsRequired {
+		if counts.TurnsRequired == nil ||
+			(counts.RequiredTurns == nil && *counts.TurnsRequired != 0) ||
+			int64(len(counts.RequiredTurns)) != *counts.TurnsRequired {
 			return fmt.Errorf("complete required turns must equal turns_required")
 		}
 	}

@@ -687,6 +687,19 @@ test("packaged journal viewers resolve only their declared direct PDF endpoints"
   expect(
     providerViewerPDFURL("https://onlinelibrary.wiley.com/doi/epdf/10.1111/jcpp.13440"),
   ).toBe("https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/jcpp.13440?download=true");
+  expect(
+    providerViewerPDFURL("https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/rego.12568"),
+  ).toBe("https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/rego.12568?download=true");
+  expect(
+    providerViewerPDFURL(
+      "https://onlinelibrary.wiley.com/doi/pdfdirect/?next=/doi/10.1111/other",
+    ),
+  ).toBeUndefined();
+  expect(
+    providerViewerPDFURL(
+      "https://onlinelibrary.wiley.com/doi/pdfdirect/#/doi/10.1111/other",
+    ),
+  ).toBeUndefined();
   // Cochrane's viewer prefix cannot name the route on its own, because the DOI
   // sits between it and /pdf/full — so the route pattern carries the boundary,
   // and the article page under the same prefix must not resolve as a viewer.

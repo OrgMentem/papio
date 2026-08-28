@@ -303,6 +303,58 @@
             { "required": ["required_turns_complete"] },
             { "required": ["required_turns"] }
           ]
+        },
+        {
+          "if": {
+            "properties": { "family_breakdown_complete": { "const": true } },
+            "required": ["family_breakdown_complete"]
+          },
+          "then": { "required": ["turns_required", "turns_working"] }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": { "family_breakdown_complete": { "const": true } },
+                "required": ["family_breakdown_complete"]
+              },
+              {
+                "anyOf": [
+                  {
+                    "properties": { "turns_required": { "minimum": 1 } },
+                    "required": ["turns_required"]
+                  },
+                  {
+                    "properties": { "turns_working": { "minimum": 1 } },
+                    "required": ["turns_working"]
+                  }
+                ]
+              }
+            ]
+          },
+          "then": { "required": ["family_runs"] }
+        },
+        {
+          "if": {
+            "properties": { "required_turns_complete": { "const": true } },
+            "required": ["required_turns_complete"]
+          },
+          "then": { "required": ["turns_required"] }
+        },
+        {
+          "if": {
+            "allOf": [
+              {
+                "properties": { "required_turns_complete": { "const": true } },
+                "required": ["required_turns_complete"]
+              },
+              {
+                "properties": { "turns_required": { "minimum": 1 } },
+                "required": ["turns_required"]
+              }
+            ]
+          },
+          "then": { "required": ["required_turns"] }
         }
       ]
     },

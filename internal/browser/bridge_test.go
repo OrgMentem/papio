@@ -1267,6 +1267,31 @@ func TestTriageCountsResponseEchoesRequestID(t *testing.T) {
 	}
 }
 
+// Empty schema-3 projections encode their zero-length arrays through
+// `omitempty`. They remain complete: absence is the JSON representation of an
+// empty list here, not an unknown projection. Rejecting that frame disconnects
+// every extension from a fresh store on its first counts poll.
+func TestTriageCountsSchema3AcceptsEmptyCompleteProjection(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	msgs, _ := runSync(t, b, hello(), inFrame(t, protocol.MsgTriageCountsRequest, "",
+		protocol.TriageCountsRequestPayload{RequestID: "request-count-empty-v3", SchemaVersions: []int64{3}}))
+	result := firstOfType(msgs, protocol.MsgTriageCountsResponse)
+	if result == nil {
+		t.Fatalf("triage counts response missing: %v", msgs)
+	}
+	counts := result.Payload.(*protocol.TriageCountsResponsePayload).Counts
+	if counts.PendingTotal != 0 ||
+		counts.TurnsRequired == nil || *counts.TurnsRequired != 0 ||
+		counts.TurnsWorking == nil || *counts.TurnsWorking != 0 {
+		t.Fatalf("empty counts = %+v", counts)
+	}
+	if counts.FamilyBreakdownComplete == nil || !*counts.FamilyBreakdownComplete ||
+		counts.RequiredTurnsComplete == nil || !*counts.RequiredTurnsComplete ||
+		len(counts.FamilyRuns) != 0 || len(counts.RequiredTurns) != 0 {
+		t.Fatalf("empty projections = %+v", counts)
+	}
+}
+
 func TestTriageCountsNegotiatesAuthField(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	parkInstitutional(t, jobs, "wr_counts_auth", handoffWork(), "")

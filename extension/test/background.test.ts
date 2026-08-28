@@ -8278,6 +8278,48 @@ test("Wiley epdf viewer route downloads the declared direct endpoint", async () 
   ]);
 });
 
+test("Wiley pdfdirect viewer route downloads the settled PDF", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push({
+    id: "wiley",
+    version: "0.3.0",
+    hosts: ["onlinelibrary.wiley.com"],
+    classify: [],
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "url",
+      viewerRoutes: [
+        { pathPrefix: "/doi/epdf/" },
+        { pathPrefix: "/doi/pdfdirect/" },
+      ],
+      idPattern: "/doi/(?:[a-z]+/)?(10\\.[^?#]+)",
+      urlTemplate:
+        "https://onlinelibrary.wiley.com/doi/pdfdirect/{1}?download=true",
+    },
+  });
+  const viewerURL =
+    "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/rego.12568";
+  await h.bridge.start();
+  await h.port.inbound(
+    jobOfferForHosts(
+      "job_wiley_pdfdirect_viewer",
+      ["onlinelibrary.wiley.com"],
+      viewerURL,
+    ),
+  );
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, viewerURL);
+  expect(h.downloads.started).toEqual([
+    {
+      url: "https://onlinelibrary.wiley.com/doi/pdfdirect/10.1111/rego.12568?download=true",
+      filename: "papio/job_wiley_pdfdirect_viewer/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+});
+
 test("a pre-existing content-disposition download prevents PDF-viewer duplication", async () => {
   const h = makeHarness();
   await h.bridge.start();

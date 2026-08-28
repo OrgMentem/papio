@@ -181,6 +181,44 @@ func TestPublishedBrowserSchemaPinsStrictTermsEffectScope(t *testing.T) {
 	}
 }
 
+func TestPublishedBrowserSchemaPinsCompleteTriageLists(t *testing.T) {
+	schema := compileSchema(t, "browser-v1.schema.json")
+	frame := func() map[string]any {
+		return map[string]any{
+			"protocol": "papio-browser/1", "type": "triage_counts_response",
+			"msg_id": "message-counts-001", "seq": 1,
+			"payload": map[string]any{
+				"request_id": "request-counts-001",
+				"counts": map[string]any{
+					"pending_total": 0, "watch_hits": 0, "actions": 0,
+					"retractions": 0, "jobs_working": 0, "jobs_needs_review": 0,
+					"failure_groups_7d": 0,
+					"turns_required":    0, "turns_working": 0,
+					"family_breakdown_complete": true,
+					"required_turns_complete":   true,
+				},
+			},
+		}
+	}
+	if err := schema.Validate(frame()); err != nil {
+		t.Fatalf("complete zero counts rejected: %v", err)
+	}
+	missingFamily := frame()
+	familyCounts := missingFamily["payload"].(map[string]any)["counts"].(map[string]any)
+	familyCounts["turns_required"] = 1
+	familyCounts["required_turns"] = []any{}
+	if err := schema.Validate(missingFamily); err == nil {
+		t.Fatal("published schema accepted non-zero complete counts without family_runs")
+	}
+	missingTurns := frame()
+	turnCounts := missingTurns["payload"].(map[string]any)["counts"].(map[string]any)
+	turnCounts["turns_required"] = 1
+	turnCounts["family_runs"] = []any{}
+	if err := schema.Validate(missingTurns); err == nil {
+		t.Fatal("published schema accepted non-zero complete counts without required_turns")
+	}
+}
+
 func TestValidCorpusMatchesPublishedSchemas(t *testing.T) {
 	schemas := publishedSchemas(t)
 	for _, name := range corpusFixtures(t, "valid") {

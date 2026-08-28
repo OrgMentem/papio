@@ -1979,6 +1979,17 @@ function triageCounts(
   ) {
     fail(`${what}.required_turns_complete must be boolean`);
   }
+  if (counts["family_breakdown_complete"] === true) {
+    if (!("turns_required" in counts) || !("turns_working" in counts))
+      fail(`${what}.complete family breakdown requires turns counts`);
+    const total =
+      (counts["turns_required"] as number) +
+      (counts["turns_working"] as number);
+    // Empty arrays are omitted by Go's `omitempty`, so zero complete
+    // projections legitimately carry no family_runs field.
+    if (total > 0 && !("family_runs" in counts))
+      fail(`${what}.non-empty complete family breakdown requires family_runs`);
+  }
   if ("family_runs" in counts) {
     const runs = counts["family_runs"];
     if (!Array.isArray(runs) || runs.length > 128)
@@ -2050,6 +2061,15 @@ function triageCounts(
     ) {
       fail(`${what}.family_runs totals mismatch`);
     }
+  }
+  if (counts["required_turns_complete"] === true) {
+    if (!("turns_required" in counts))
+      fail(`${what}.complete required turns require turns_required`);
+    if (
+      (counts["turns_required"] as number) > 0 &&
+      !("required_turns" in counts)
+    )
+      fail(`${what}.non-empty complete required turns require required_turns`);
   }
   if ("required_turns" in counts) {
     const turns = counts["required_turns"];
@@ -2128,6 +2148,12 @@ function triageCounts(
       )
         fail(`${what}.required_turns gate_claim_id invalid`);
     }
+    if (
+      counts["required_turns_complete"] === true &&
+      "turns_required" in counts &&
+      turns.length !== (counts["turns_required"] as number)
+    )
+      fail(`${what}.complete required turns must equal turns_required`);
   }
 }
 const ROUTE_CLASSES = [

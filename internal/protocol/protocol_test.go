@@ -3047,6 +3047,16 @@ func TestTriageSchemaNegotiationAndV3Bounds(t *testing.T) {
 	// requesting peer gates v1/v2/v3 fields by the schema it requested; the
 	// bridge population tests pin that negotiation. Here we pin strict
 	// validation of every v3 field when present.
+	t.Run("complete list omission", func(t *testing.T) {
+		m := protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+		delete(m["counts"].(map[string]any), "family_runs")
+		expectProtocolReject(t, MsgTriageCountsResponse, m)
+
+		m = protocolPayloadMap(t, &TriageCountsResponsePayload{RequestID: "request-0001", Counts: *fullCountsV3()})
+		delete(m["counts"].(map[string]any), "required_turns")
+		expectProtocolReject(t, MsgTriageCountsResponse, m)
+	})
+
 	t.Run("required turn field gating", func(t *testing.T) {
 		for name, mutate := range map[string]func(map[string]any){
 			"human missing action": func(m map[string]any) { delete(m, "action_id") },
