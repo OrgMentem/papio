@@ -57,6 +57,14 @@ type ApplyClaimObservationResult struct {
 	// leaves it false. The caller writes the durable Activity event outside
 	// this transaction, for the same single-writer reason as EntitledLanding.
 	SurfaceLost bool
+	// OwnerJobID is the job that OWNS the observed binding, which is not the
+	// job that sent the observation. A dependent paper's missing-tab repair
+	// reports a dead surface for a binding owned by the paper actually
+	// signing in, so a caller that attributes durable state to its own
+	// request would file it against the wrong paper. Empty only when no
+	// claim or candidate resolved, where the sender is the best available
+	// answer.
+	OwnerJobID string
 }
 
 // ApplyClaimObservation is claim_observation's §2.2.1 reducer, run as ONE
@@ -143,6 +151,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 			ownerJobID = candidate.JobID
 		}
 	}
+	result.OwnerJobID = ownerJobID
 
 	// §3: the dedup/ordering check runs before any state read that can
 	// mutate — see this function's doc comment.

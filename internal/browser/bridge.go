@@ -2949,11 +2949,27 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 	// whose claim some earlier terminal transition already retired — the
 	// ordinary tail of a SUCCESSFUL provider outcome — abandons nothing and
 	// must stay quiet; announcing a loss there would contradict the delivery
-	// the researcher is about to receive. Best-effort: a feed write must
-	// never fail the reducer's ack, whose effects are already committed.
+	// the researcher is about to receive. That silence rests on the outcome
+	// path having retired the claim first, which is best-effort: when it is
+	// skipped or fails it only logs, so a trailing owner_closed can still
+	// find a live claim and report the loss it genuinely observed.
+	//
+	// Recorded against the reducer's resolved OWNER, never the sender: a
+	// dependent paper's missing-tab repair reports a dead surface for the
+	// binding owned by the paper actually signing in, and attributing it to
+	// the requester files the row against the wrong paper.
+	//
+	// Best-effort: a feed write must never fail the reducer's ack, whose
+	// effects are already committed. The loss is a missing row, not a wrong
+	// one — the journal has recorded the observation by then, so a replay is
+	// answered `duplicate` and cannot re-append.
 	if applied.Outcome == "applied" && applied.SurfaceLost {
-		if err := b.jobs.RecordEvent(ctx, jobID, "browser.surface_closed", nil); err != nil {
-			log.Printf("papio: recording browser.surface_closed for %s: %v", jobID, err)
+		owner := applied.OwnerJobID
+		if owner == "" {
+			owner = jobID
+		}
+		if err := b.jobs.RecordEvent(ctx, owner, "browser.surface_closed", nil); err != nil {
+			log.Printf("papio: recording browser.surface_closed for %s: %v", owner, err)
 		}
 	}
 	return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{

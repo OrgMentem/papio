@@ -8,6 +8,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/work"
 )
 
 // countJobEvents counts the durable Activity rows of one kind for one job.
@@ -56,6 +57,49 @@ func TestClaimObservationOwnerClosedRecordsLostSurfaceActivity(t *testing.T) {
 
 	if got := countJobEvents(t, jobs, jobID, "browser.surface_closed"); got != 1 {
 		t.Fatalf("browser.surface_closed events = %d, want 1: a lost access surface must be legible", got)
+	}
+}
+
+// The row must name the paper whose access tab closed, not whichever paper
+// happened to report it. A dependent paper's missing-tab repair consults the
+// OWNER's binding and reports the dead surface under its OWN job id
+// (reportDeadClaimSurface in extension/src/background.ts), while the reducer
+// separately resolves the binding's real owner - ApplyClaimObservationInput's
+// own comment says the envelope's job id and the binding owner differ. Reading
+// the sender filed a stranger's loss against a paper that never had a surface,
+// and left the paper that did lose one silent.
+func TestClaimObservationOwnerClosedRecordsLossAgainstTheBindingOwner(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ownerID := parkInstitutional(t, jobs, "wr_surface_closed_owner", handoffWork(), "")
+	dependentID := parkInstitutional(t, jobs, "wr_surface_closed_dependent", work.Work{
+		DOI: "10.1002/example.43", Title: "A Sibling Paper",
+		Authors: []string{"Babbage, Charles"}, Year: 2024,
+	}, "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "auth-surface-closed-owner")
+	candidateID := explicitMaterializationCandidate(t, jobs, ownerID, "domain-surface-closed-owner")
+
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, ownerID,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "auth-surface-closed-owner-req", CandidateID: candidateID,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	bindingID := bindCandidate(t, b, ownerID, candidateID, "auth-surface-closed-owner", 12)
+
+	// The dependent paper reports the loss: its own job id, the owner's binding.
+	msgs, _ := runSync(t, b, claimObservationFrame(t, dependentID, "obs-surface-closed-owner",
+		"auth-surface-closed-owner", bindingID, grant.GateOccurrenceID,
+		"observation-surface-closed-owner", b.epoch, 0, "owner_closed"))
+	if ack := claimObservationAckPayload(t, msgs); ack.Outcome != "applied" {
+		t.Fatalf("owner_closed outcome = %+v, want applied", ack)
+	}
+
+	if got := countJobEvents(t, jobs, ownerID, "browser.surface_closed"); got != 1 {
+		t.Fatalf("the owner's browser.surface_closed = %d, want 1: it lost the surface", got)
+	}
+	if got := countJobEvents(t, jobs, dependentID, "browser.surface_closed"); got != 0 {
+		t.Fatalf("the reporter's browser.surface_closed = %d, want 0: it never had a surface", got)
 	}
 }
 

@@ -2125,7 +2125,7 @@ func checkInstitutionSignInSlot(ctx context.Context, db *store.Store, add func(s
 		add("institution_sign_in_slot", Warn,
 			fmt.Sprintf("%s holds the institution's only sign-in slot with no deadline, and %d other paper%s also waiting for an institutional sign-in",
 				owner, waiting, plural(waiting, " is", "s are")),
-			fmt.Sprintf("run papio actions open --job %s and finish the sign-in in that tab, which releases the slot and shares the session with the papers waiting on it. If that tab is stranded, close it: papio releases the slot when its tab closes, and releases it on its own within half an hour when the tab is already gone",
+			fmt.Sprintf("run papio actions open --job %s and finish the sign-in in that tab, which releases the slot and shares the session with the papers waiting on it. If that tab is stranded, close it: papio releases the slot when its tab closes. A slot whose tab is already gone is released on the first browser poll after half an hour of silence, so keep the browser extension connected",
 				owner))
 	}
 	if err := rows.Err(); err != nil {

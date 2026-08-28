@@ -517,6 +517,35 @@ before a surface that will never report `owner_closed` may be declared gone.
 Do NOT ship Slice 1 alone: unfreezing sends more papers into the bound-`human`
 shapes that have no exit. It ships with a guard or a monitor and a rollback.
 
+### Shipped ahead of the distribution: `StrandedBoundEntryGrace` (2026-08-28)
+
+`e770d0d` shipped a 30-minute release for a BOUND `human` entry whose claim is no
+longer live, `ExpireStrandedBoundAuthenticationEntryLeases`. That interval is not
+measured, so it does not satisfy this plan's cost above ("the interval must come
+from measurement") and does not close Slice 2. Recorded here rather than left
+implicit, because a later reader will otherwise take the constant as the answer
+this section asked for.
+
+What the shipped change does claim, and it is narrower than Slice 2's shape 2/3/4
+work: it releases only a slot whose claim is ALREADY abandoned, which is the
+state the holder-generation fence leaves behind after a service-worker restart.
+A claim in any live phase, recent claim activity, or a `held`/`unknown_completion`
+institutional permit each veto it. It was driven by a live reproduction on the
+operator's machine, where one such row held the institution while 42 eligible
+candidates parked with no tab and no message, and no existing release path could
+reach it: `owner_closed` never came, no provider outcome arrived, and
+`RetireTerminalAuthenticationEntryLeases` needs the owner job terminal, which a
+parked paper never is.
+
+The known cost, also unmeasured: after the fence, nothing renews the entry —
+`ApplyClaimObservation` accepts wall/login/mfa/challenge renewals only while the
+lease is `reserved`, and the extension's wall latches fire once per occurrence.
+So a researcher entering a code on a quiet prompt for longer than the grace can
+lose the slot to a sibling paper. Their sign-in still lands in their own browser,
+and the paper that lost the slot had already been re-parked by the fence. The
+post-auth dead-tab TTL is still the right instrument for choosing this number;
+30 minutes is a floor picked to exceed a reconnect, not a measurement.
+
 ## Invariants — with one correction
 
 - An institutional effect permit that is `held` or `unknown_completion` vetoes

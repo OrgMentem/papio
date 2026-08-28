@@ -11,17 +11,19 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
-- **Closing the tab *papio* opened for you is no longer silent.** When you
-  close the tab *papio* used to reach a paper through your institution, it
-  releases that route and the paper waits for another attempt. Nothing told
-  you: the toolbar count reports sign-in walls and decisions, and the popup
-  reads neither the access claim nor the journal row that recorded the loss —
-  so a paper you watched disappear left no visible trace. That release now
-  writes one durable Activity entry, which the popup's "While you were away"
-  card counts and `papio activity` prints. It is deliberately not a desktop
-  notification: *papio* getting on with the work does not interrupt you. A tab
-  you close after the paper is already delivered stays silent, because that
-  route finished rather than being lost.
+- **Losing the tab *papio* opened for you is no longer silent.** When you close
+  the tab *papio* used to reach a paper through your institution while it is
+  still driving that tab, it releases the route and the paper waits for another
+  attempt. Nothing told you: the toolbar count reports sign-in walls and
+  decisions, and the popup reads neither the access claim nor the journal row
+  that recorded the loss — so a paper you watched disappear left no visible
+  trace. That release now writes a durable Activity entry, which the popup's
+  "While you were away" card counts and `papio activity` prints. The entry names
+  the paper whose tab closed, which is not always the paper that noticed. It is
+  deliberately not a desktop notification: *papio* getting on with the work does
+  not interrupt you. A tab you close after the paper is already delivered stays
+  silent, because that route finished rather than being lost — as does a tab
+  *papio* had already stopped driving, which it had already re-queued.
 - **A paper bundled with a supplementary file is now delivered instead of
   parked.** Publishers routinely attach one extra file to a PDF, and *papio*
   will not file a document that carries anything runnable, so those papers
@@ -251,11 +253,16 @@ execution records kept during the initial build.
   you are part-way through survives the restart. Nothing bounded that: if the
   tab had already gone by then, the slot stayed held, and every other paper
   waiting on that institution parked with no tab and no message. *papio* now
-  releases a slot whose surface has been gone for half an hour, and any sign-in
-  still reporting progress keeps resetting that half hour, so a slow login or a
-  wait on a code is never cut short. A download or navigation still in flight
-  keeps the slot regardless of the clock. `papio doctor` now says this in its
-  own remedy, instead of only telling you to close a tab that is already closed.
+  releases a slot that has reported nothing for half an hour once it is no
+  longer driving that tab, and a download or navigation still in flight keeps
+  the slot regardless of the clock. A sign-in *papio* is still driving is never
+  cut short. One honest limit: after a background-worker restart *papio* is no
+  longer driving the tab it opened, so if you then sit on a code prompt for half
+  an hour without the page changing, another paper may take the slot. Your
+  sign-in still completes in your own browser. Releasing needs the browser
+  extension connected, because that is what drives the check.
+  `papio doctor` now says this in its own remedy, instead of only telling you to
+  close a tab that is already closed.
 - **A fresh empty library no longer disconnects the browser every minute.**
   The exact inbox-count response correctly says that both the task-family list
   and required-turn list are complete and empty. JSON omits those empty arrays,

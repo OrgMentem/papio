@@ -383,31 +383,92 @@ working progress, and working progress never creates a desktop notification.
 That is the whole answer, and this addendum records it so the same request does
 not re-open Decision 5 a third time.
 
-Three mechanical facts confirm the notifier cannot carry this event even if
+Two mechanical facts confirm the notifier cannot carry this event even if
 Decision 5 permitted it. The category vocabulary is closed and
 `notify.validateIntent` rejects an unknown or mismatched value, and the only
 near fit, `system_degraded`, means a named condition stops progress — this
 reducer abandons one claim and waits for fresh arbitration, so claiming
-degradation would be false. The obvious copy overpromises: the reducer schedules
-no retry, so "*papio* is retrying" would be untrue in exactly the case that
-motivates it. And the notification ledger coalesces on
-`(category, event_kind, aggregate_key, phase, window_start)` while the claim
-observation journal stores no episode and no affected count, so "3 papers" has
-nothing to coalesce on.
+degradation would be false. And the obvious copy overpromises: the reducer
+schedules no retry, so "*papio* is retrying" would be untrue in exactly the case
+that motivates it.
+
+A third reason given here on 2026-08-28 was withdrawn on review the same day. It
+said the ledger's `(category, event_kind, aggregate_key, phase, window_start)`
+coalescing had nothing to group on because the observation journal stores no
+episode and no count. The journal does store `gate_occurrence_id` and
+`authentication_claim_id`, and `NotificationLedger.Upsert` increments a count on
+its own identity, so a producer could group by claim or occurrence and derive
+one. Grouping was therefore possible and the two reasons above are what decide
+it. The correction is recorded rather than deleted because a false mechanical
+claim is worse than a weaker true one: the next reader would have trusted it.
 
 The event therefore travels as one durable Activity row, `browser.surface_closed`,
 which Decision 8's pageable, watermark-aware Activity contract already carries
 and the popup catch-up card already counts. Decision 1's surface split is
 unchanged: no new channel, no new sender, no badge tier.
 
-One rule about honesty rather than routing. The row is written only when the
-observation abandoned a claim that was still live. A successful provider
-outcome retires the binding before the tab physically closes, so the trailing
-`owner_closed` abandons nothing; announcing a loss there would contradict the
-delivery the researcher is about to receive. The reducer reports that
-distinction (`ApplyClaimObservationResult.SurfaceLost`) rather than letting the
-caller infer it from the event kind, because the kind alone cannot tell the two
-apart.
+Two rules about honesty rather than routing, and the limits of each.
+
+The row is written only when the observation abandoned a claim that was still
+live. A successful provider outcome retires the binding before the tab
+physically closes, so the trailing `owner_closed` abandons nothing; announcing a
+loss there would contradict the delivery the researcher is about to receive. The
+reducer reports that distinction (`ApplyClaimObservationResult.SurfaceLost`)
+rather than letting the caller infer it from the event kind, because the kind
+alone cannot tell the two apart. That silence depends on the outcome path having
+retired the binding first, and that path is best-effort: it skips retirement when
+the browser generation is unavailable and logs its own errors while continuing.
+When it is skipped, a trailing `owner_closed` finds a live claim and reports the
+loss it genuinely observed. The gate is therefore exact about what the reducer
+saw, not about what the provider eventually delivered.
+
+The row names the job that OWNS the observed binding, not the job that sent the
+observation. A dependent paper's missing-tab repair reports a dead surface for
+the binding owned by the paper actually signing in, so attributing the row to the
+sender filed a stranger's loss against a paper that never had a surface — and
+left the paper that did lose one silent, since Activity reads join on that job
+id. `ApplyClaimObservationResult.OwnerJobID` carries the reducer's own
+resolution to the caller.
+
+The write is best-effort and stays outside the reducer's transaction, for the
+single-writer reason Decision 11's ordering already forces. So a committed
+observation whose append fails leaves no row and cannot be recovered: the journal
+has recorded the observation, so a replay is answered `duplicate`. The failure
+mode is a missing row, never a duplicated or wrong one. Any copy promising that
+every lost surface is legible must therefore be read as best-effort, and this
+ADR does not claim more.
+
+## Addendum (2026-08-28): popup density rulings, salvaged from a retired plan
+
+These were reviewer rulings in `popup-ux-consolidated-2026-08-24`, a plan file
+deleted when its last section shipped. They constrain future popup work, so they
+belong here rather than in commit archaeology. Recorded on review after the
+deletion, which is the failure this addendum also documents: git history is the
+archive for *narrative*, never for a rule someone must not re-litigate.
+
+**The count badge is not droppable.** Removing the header count in favour of a
+card was rejected. The count rides the inbox control, and Decision 7's
+`ToolbarCountMode` — `required`, `all`, `off` — remains the researcher's control
+over it. A researcher who chose **No number** must not get a number back by a
+different route.
+
+**`#popup-pulse-review` is rejected on density.** A labelled 32px button beside a
+glyph that already carries the same count and the same route is duplication in a
+380px lens. The header control keeps the route; the button does not return.
+
+**The header count and the toolbar badge gate differently, deliberately.** The
+badge gates on `required_turns_complete`, because an incomplete projection must
+not invent a precise number for a surface with no other content
+(`extension/src/background.ts`'s `computeBadge`). The header count does not gate
+on it, because that flag describes the per-ITEM projection list: past its cap the
+daemon drops the list and keeps the count exact, so gating hid a number it had
+(`extension/src/popup.ts`'s `deriveInboxCount`). The cap renders `999+` and keeps
+the exact figure in the accessible name. These are two different questions about
+one field; a future change that unifies them will break one of the two surfaces.
+
+**The pulse card hides only when it has nothing else to say.** It also produces a
+`next` line and a capacity line, so hiding it whenever a count exists would lose
+guidance the count does not carry.
 
 ## Consequences
 
