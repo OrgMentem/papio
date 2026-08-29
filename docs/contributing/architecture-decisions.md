@@ -313,7 +313,9 @@ is ambient blocker/turn state, desktop notification policy is daemon-owned and
 best effort, and the inbox plus Activity are the durable
 bounded read model. A seventh surface, the loss toast, is the one interruption
 that carries an action: when *papio* loses a tab it opened for a paper, a small
-unfocused *papio* window offers to reopen that route for eight seconds, then
+unfocused *papio* window offers to reopen that route for eight seconds — restarted
+once if you bring the window forward, because a first click on an unfocused window
+is spent activating it — then
 closes and commits nothing. It is an extension page, so it needs no host access
 and reads no page; it shows one fixed sentence and one button, and it is
 suppressed while a *papio* surface already holds focus. Its offer is truthful per

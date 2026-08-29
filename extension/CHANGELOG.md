@@ -21,8 +21,10 @@ for the full pre-split extension history.
 - **Losing a tab *papio* opened now offers to bring it back.** A small *papio*
   window appears for eight seconds with one button: `Reopen now` for a route
   *papio* can resume, or `Open a new sign-in tab` when the close ended your
-  library's sign-in claim and there is nothing left to undo. Letting it expire
-  does nothing, and the same recovery stays in the inbox. It is one of *papio*'s
+  library's sign-in claim and there is nothing left to undo. Bringing the window
+  forward restarts those eight seconds once, because on macOS the first click on
+  an unfocused window is spent activating it. Letting it expire does nothing,
+  and the same recovery stays in the inbox. It is one of *papio*'s
   own windows, so it reads no page and needs no site access; it never appears
   while a *papio* window already has your focus, and it stays silent when the
   close cost you nothing — a download still in flight, a file the daemon is about

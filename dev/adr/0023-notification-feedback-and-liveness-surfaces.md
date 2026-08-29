@@ -493,7 +493,7 @@ it opened itself, carrying exactly one take-back-control action.**
 
 | Surface | Question it answers | Persistence | Scope |
 | --- | --- | --- | --- |
-| Loss toast | Something *papio* was driving just went away — do you want it back? | Eight seconds, dismissable | One observed loss, one action |
+| Loss toast | Something *papio* was driving just went away — do you want it back? | Eight seconds, re-armed once on focus, dismissable | One observed loss, one action |
 
 Delivery is an unfocused extension window (`chrome.windows.create` with
 `type: "popup"`, `focused: false`). That needs no new manifest permission and no
@@ -513,6 +513,16 @@ Bounds, all enforced by tests rather than convention:
    inbox, so the window is a shortcut and not a timed decision — which is what
    keeps it clear of WCAG 2.2.1. The inbox undo bar's six seconds is the
    comparison; this is the longer of the two.
+
+   Amended 2026-08-29, from a live measurement: the clock restarts when the
+   window is brought forward, **once**. On macOS the first click on an
+   unfocused window is spent activating it and never reaches the button
+   underneath, so a researcher who noticed the toast at seven seconds would
+   have lost the offer between their two clicks. The bound is therefore eight
+   seconds from arrival, or eight from being brought forward, whichever is
+   later — and the re-arm is deliberately once, because a window cycled in and
+   out of the foreground must not be able to live forever. An offer that never
+   lapses is a decision *papio* is still holding.
 3. One action plus a dismissal. No progress, no error text, and no identifier,
    title, URL, provider name, or job id in anything rendered. The job id travels
    in the extension's own message only, exactly as Decision 1 already requires of

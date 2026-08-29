@@ -31,6 +31,9 @@ interface ToastPageDeps {
   readonly closeWindow: () => void;
   readonly setTimer: (run: () => void, ms: number) => ToastTimer;
   readonly clearTimer: (handle: ToastTimer) => void;
+  /** Registers interest in this window being brought forward. Injected rather
+   * than read off `window`, so the re-arm below is driven by the test. */
+  readonly onFocus: (run: () => void) => void;
 }
 /** Accepts only the closed payload shape, inside the router's own envelope. A
  * malformed, absent, or refused reply closes the window rather than rendering
@@ -80,10 +83,27 @@ export async function runToastPage(deps: ToastPageDeps): Promise<void> {
   // Expiry closes the window and tells the producer the offer lapsed. It
   // commits NOTHING: the recovery is still in the inbox, which is what keeps
   // this window clear of a timed decision.
-  const timer = deps.setTimer(() => {
+  const expire = (): void => {
     void deps.sendMessage({ type: TOAST_DISMISS_MESSAGE, job_id: payload.job_id, reason: "expired" });
     deps.closeWindow();
-  }, TOAST_WINDOW_MS);
+  };
+  let timer = deps.setTimer(expire, TOAST_WINDOW_MS);
+  // Measured on macOS: the first click on an unfocused window is spent
+  // activating it, and does not reach the button under the pointer. A
+  // researcher who notices the toast late would then lose the offer to expiry
+  // between their two clicks — so being brought forward restarts the clock,
+  // and the full window is available for the click that lands.
+  //
+  // Once only. Re-arming on every focus would let a window cycled in and out
+  // of the foreground live indefinitely, and this surface is bounded by
+  // design: an offer that never lapses is a decision papio is still holding.
+  let rearmed = false;
+  deps.onFocus(() => {
+    if (rearmed) return;
+    rearmed = true;
+    deps.clearTimer(timer);
+    timer = deps.setTimer(expire, TOAST_WINDOW_MS);
+  });
   // Both buttons stop the timer first. Without that, a researcher who clicks
   // the action at 7.9s gets the expiry message racing their own request, and
   // the producer cannot tell which one told the truth.
@@ -112,5 +132,6 @@ if (typeof document !== "undefined" && document.getElementById("toast") !== null
     closeWindow: () => window.close(),
     setTimer: (run, ms) => window.setTimeout(run, ms),
     clearTimer: (handle) => window.clearTimeout(handle),
+    onFocus: (run) => window.addEventListener("focus", run),
   });
 }

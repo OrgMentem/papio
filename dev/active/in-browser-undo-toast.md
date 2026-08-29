@@ -187,6 +187,30 @@ the copy bound the measurement rests on so a longer sentence fails there rather
 than in a researcher's browser. Unit tests could not have caught this: they
 render into a detached document with no viewport.
 
+**Driving a real unfocused window found two more things, one of them a defect.**
+Measured in headed Chrome 152, scratch profile, via the identical
+`windows.create` call:
+
+| Question | Answer |
+| --- | --- |
+| Outer size honoured? | Yes — `520x116` exactly, `type: "popup"` |
+| Inner size on macOS | `520x84`; the frame is 32px, and the copy does not scroll |
+| Is `type: "popup"` load-bearing? | Yes. `type: "normal"` clamps to `520x375` |
+| Does `focused: false` hold? | Yes. The reading window reported `focused: true` before, immediately after, and 1.5s later |
+
+The defect: **on macOS the first click on an unfocused window is spent
+activating it** and never reaches the button underneath, so a researcher who
+noticed the toast at seven seconds lost the offer between their two clicks.
+Being brought forward now restarts the clock, once — proven live: the window
+was still open at 9.2s past load and gone by 12.2s. Bounded at once on purpose,
+or a window cycled in and out of the foreground lives forever.
+
+One measurement trap worth keeping: `--window-size`/`--window-position` on the
+Chrome command line override `windows.create`'s width and height silently. The
+first run reported `1100x760` for the toast and looked like a shipped defect;
+it was the harness. Relaunching without those flags is what produced the real
+numbers above.
+
 **The suppression needed the injected clock.** `papioSurfaceLikelyFocused` first
 used `Date.now()` rather than the bridge's `deps.now()` seam, so the stale-focus
 test could not advance time and failed. Every time-dependent path in this file

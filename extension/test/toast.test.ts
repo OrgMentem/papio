@@ -24,6 +24,8 @@ interface Harness {
   readonly closes: { count: number };
   readonly timers: { ms: number; run: () => void; cleared: boolean }[];
   fire: (index?: number) => void;
+  /** Brings the window forward, the way the researcher's first click does. */
+  focus: () => void;
   deps: Parameters<typeof runToastPage>[0];
 }
 
@@ -36,6 +38,7 @@ function harness(reply: unknown | Error): Harness {
   const sent: SentMessage[] = [];
   const closes = { count: 0 };
   const timers: { ms: number; run: () => void; cleared: boolean }[] = [];
+  const focusListeners: (() => void)[] = [];
   const h: Harness = {
     doc,
     sent,
@@ -44,6 +47,9 @@ function harness(reply: unknown | Error): Harness {
     fire: (index = 0) => {
       const timer = timers[index];
       if (timer !== undefined && !timer.cleared) timer.run();
+    },
+    focus: () => {
+      for (const listener of focusListeners) listener();
     },
     deps: {
       doc,
@@ -63,6 +69,9 @@ function harness(reply: unknown | Error): Harness {
       clearTimer: (handle) => {
         const timer = timers[handle];
         if (timer !== undefined) timer.cleared = true;
+      },
+      onFocus: (run) => {
+        focusListeners.push(run);
       },
     },
   };
@@ -187,4 +196,58 @@ test("parseToastPayload keeps the kind vocabulary closed", () => {
   });
   // A kind the renderer has no copy for would render an empty toast.
   expect(parseToastPayload({ ok: true, toast: { kind: "surface_lost", job_id: "j" } })).toBeUndefined();
+});
+
+test("being brought forward restarts the clock, because macOS spends the first click activating the window", async () => {
+  // Measured against a real unfocused Chrome popup: on macOS the first click on
+  // an unfocused window activates it and does not reach the button underneath.
+  // A researcher who notices the toast at 7s would otherwise lose the offer to
+  // expiry before their second click lands.
+  const h = harness({ ok: true, toast: { kind: "route_lost", job_id: "job-focus" } });
+  await runToastPage(h.deps);
+
+  h.focus();
+
+  // The original timer is cancelled and a fresh full window replaces it.
+  expect(h.timers[0]?.cleared).toBe(true);
+  expect(h.timers[1]?.ms).toBe(TOAST_WINDOW_MS);
+  // The original firing must now do nothing: the offer is still live.
+  h.fire(0);
+  expect(h.sent.some((m) => m.reason === "expired")).toBe(false);
+  expect(h.closes.count).toBe(0);
+
+  // And the replacement still expires, so the surface stays bounded.
+  h.fire(1);
+  expect(h.sent.at(-1)).toMatchObject({ reason: "expired", job_id: "job-focus" });
+  expect(h.closes.count).toBe(1);
+});
+
+test("the window is re-armed once, so a window cycled in and out of the foreground cannot live forever", async () => {
+  const h = harness({ ok: true, toast: { kind: "route_lost", job_id: "job-once" } });
+  await runToastPage(h.deps);
+
+  h.focus();
+  h.focus();
+  h.focus();
+
+  // One replacement, not three: an offer that never lapses is a decision papio
+  // is still holding.
+  expect(h.timers.length).toBe(2);
+  h.fire(1);
+  expect(h.sent.at(-1)).toMatchObject({ reason: "expired" });
+});
+
+test("a click after the re-arm clears the replacement timer, not the dead one", async () => {
+  const h = harness({ ok: true, toast: { kind: "route_lost", job_id: "job-clear" } });
+  await runToastPage(h.deps);
+  h.focus();
+
+  (h.doc.getElementById("toast-action") as HTMLButtonElement).click();
+
+  // The live timer is the one the click must silence; leaving it armed would
+  // send `expired` after the action, and the producer could not tell which one
+  // told the truth.
+  expect(h.timers[1]?.cleared).toBe(true);
+  h.fire(1);
+  expect(h.sent.filter((m) => m.reason === "expired")).toHaveLength(0);
 });
