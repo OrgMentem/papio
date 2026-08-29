@@ -63,6 +63,37 @@ export type SuccessAckMode = "all" | "errors" | "off";
 export const TOOLBAR_COUNT_MODE_KEY = "papio_toolbar_count_mode_v1";
 export const CATCH_UP_ENABLED_KEY = "papio_catch_up_enabled_v1";
 export const SUCCESS_ACK_MODE_KEY = "papio_success_ack_mode_v1";
+/** The all-sites host pattern, declared in `optional_host_permissions` and
+ * offered as its own control on the options page. It lives here, not in
+ * `options.ts`, because the background now reads the same grant: importing the
+ * options module into the service worker would pull the whole settings UI into
+ * that bundle. */
+export const ALL_SITES_ORIGIN = "https://*/*";
+
+/** Opt-in: deliver the loss toast by injecting it into the page the researcher
+ * is actually looking at, instead of opening a small *papio* window.
+ *
+ * Two gates, not one, and they answer different questions. The all-sites host
+ * grant answers "may papio reach this page at all"; a researcher grants it so
+ * papio can complete downloads on unlisted providers (`options.html`'s
+ * all-sites lede), which is not consent to draw in their pages. This key
+ * answers "do you want papio's own interruption to appear there". Absent means
+ * off: the window route is always available and needs no host access, so the
+ * quieter surface is the one that does not require a choice. */
+export const IN_PAGE_TOAST_KEY = "papio_in_page_toast_v1";
+
+/** Read the in-page-toast preference, treating anything but an explicit `true`
+ * as off. Malformed storage must not enable an injected surface. */
+export async function getInPageToastEnabled(
+  storage: Pick<chrome.storage.StorageArea, "get"> = chrome.storage.local,
+): Promise<boolean> {
+  try {
+    const values = await storage.get(IN_PAGE_TOAST_KEY);
+    return values[IN_PAGE_TOAST_KEY] === true;
+  } catch {
+    return false;
+  }
+}
 
 /** Read the success-acknowledgement preference without ever treating malformed
  * storage as an enabled mode. The options UI and inbox both use `all` as the

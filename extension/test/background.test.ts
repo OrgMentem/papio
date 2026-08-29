@@ -17,6 +17,7 @@ import {
   type PdfGrabRefusalReason,
 } from "../src/protocol";
 import { isSurfaceBirthRecord, type SurfaceBirthRecord } from "../src/ledger";
+import { TOAST_COPY } from "../src/toast-view";
 import {
   emptyStore,
   findByJob,
@@ -432,6 +433,7 @@ function makeHarness(
     captureConsent?: boolean;
     tabGroups?: boolean;
     handoffSurface?: "in-window" | "work-window" | "tab-group";
+    inPageToast?: boolean;
   },
 ): Harness {
   const port = new FakePort();
@@ -604,6 +606,7 @@ function makeHarness(
       getHandoffSurface: async () =>
         opts?.handoffSurface ??
         (opts?.workWindowEnabled === false ? "in-window" : "work-window"),
+      getInPageToast: async () => opts?.inPageToast === true,
     },
     ...(opts?.firefox === true
       ? {
@@ -9295,6 +9298,7 @@ test("overlapping state writes persist serially so no stale snapshot wins", asyn
       getTermsConsent: async () => undefined,
       setTermsConsent: async () => {},
       getHandoffSurface: async () => "work-window",
+      getInPageToast: async () => false,
     },
     action: {
       setBadgeText: async () => {},
@@ -22517,4 +22521,311 @@ test("macOS Firefox ignoring focused:false is corrected after creation", async (
   await internals.raiseToast({ kind: "route_lost", job_id: "job-ff" });
 
   expect(h.windows?.updated.some((entry) => entry.props.focused === false)).toBe(true);
+});
+
+// ADR-0023's seventh surface, in-page route. The subject of every test below is
+// WHICH route delivers, and whether a refused route stays silent or falls back.
+// A test asserting only "an injected toast appeared" passes with every gate
+// removed, which is the failure these are shaped against.
+
+/** Grant, preference, reader tab, and a scripting fake that reports success —
+ * the four things the in-page route needs. Returns the recorded injections so a
+ * test can assert what papio put in the page, and the reader tab's id so it can
+ * assert which tab papio chose. */
+async function inPageHarness(
+  opts?: { granted?: boolean; enabled?: boolean; injects?: boolean },
+): Promise<{
+  h: Harness;
+  readerTabID: number;
+  injections: { tabId: number; args: unknown[] }[];
+}> {
+  const h = makeHarness(undefined, {
+    windows: true,
+    inPageToast: opts?.enabled !== false,
+  });
+  const injections: { tabId: number; args: unknown[] }[] = [];
+  const deps = (h.bridge as unknown as {
+    deps: {
+      permissions: { contains(perm: { origins: string[] }): Promise<boolean> };
+      scripting: {
+        executeScript(injection: {
+          target: { tabId: number };
+          args?: unknown[];
+        }): Promise<{ result?: unknown }[]>;
+      };
+    };
+  }).deps;
+  deps.permissions.contains = async ({ origins }) =>
+    opts?.granted !== false && origins.length === 1 && origins[0] === "https://*/*";
+  deps.scripting.executeScript = async ({ target, args }) => {
+    injections.push({ tabId: target.tabId, args: args ?? [] });
+    return [{ result: opts?.injects !== false }];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  return { h, readerTabID: -1, injections };
+}
+
+/** The page the researcher is actually reading: active, https, and not papio's.
+ * Created after the job offer so papio's own tab is no longer the active one. */
+async function readerTab(h: Harness): Promise<number> {
+  const tab = await h.tabs.create({
+    url: "https://journals.example.edu/article/1",
+    active: true,
+  });
+  return tab.id ?? -1;
+}
+
+test("the in-page route is off until the researcher turns it on", async () => {
+  // The discriminating case for the preference gate. All-sites access is granted
+  // — a researcher grants it so papio can finish downloads on unlisted
+  // providers — and that must not by itself put papio's own interruption into
+  // their reading. Without this gate every all-sites install is opted in.
+  const jobID = "job_inpage_off";
+  const { h, injections } = await inPageHarness({ enabled: false });
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await readerTab(h);
+
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+
+  expect(injections).toHaveLength(0);
+  expect(h.windows?.created.filter((p) => p.url.endsWith("toast.html")) ?? []).toHaveLength(1);
+});
+
+test("the in-page route needs all-sites access, not a provider grant", async () => {
+  // The preference alone must not inject. A provider grant was given so papio
+  // could complete a download on that host; it is not consent to draw there.
+  const jobID = "job_inpage_ungranted";
+  const { h, injections } = await inPageHarness({ granted: false });
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await readerTab(h);
+
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+
+  expect(injections).toHaveLength(0);
+  expect(h.windows?.created.filter((p) => p.url.endsWith("toast.html")) ?? []).toHaveLength(1);
+});
+
+test("both gates open: the toast lands in the page and no window opens", async () => {
+  // Two assertions, and the second is the one that matters. Delivering both
+  // surfaces would ask the researcher about one loss twice.
+  const jobID = "job_inpage_on";
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const readerID = await readerTab(h);
+
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+
+  expect(injections).toHaveLength(1);
+  expect(injections[0]?.tabId).toBe(readerID);
+  expect(h.windows?.created.filter((p) => p.url.endsWith("toast.html")) ?? []).toHaveLength(0);
+  // The copy travels as data from the single TOAST_COPY table, so the two
+  // routes cannot drift in what they say or offer.
+  const injected = injections[0]?.args[0] as { message: string; action: string; job_id: string };
+  expect(injected.job_id).toBe(jobID);
+  expect(injected.message).toBe(TOAST_COPY.route_lost.message);
+  expect(injected.action).toBe(TOAST_COPY.route_lost.action);
+});
+
+test("papio never injects the toast into a tab it still tracks", async () => {
+  // The active tab is a page papio holds a live job for. Injecting there would
+  // put a take-back-control offer on the surface papio is driving — and on a
+  // provider page papio is about to classify, whose body text it reads.
+  const jobID = "job_inpage_tracked";
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const readerID = await readerTab(h);
+  // The researcher's tab turns out to be a tab papio is driving for another job.
+  h.backend.store.activeJobs.push({
+    job_id: "job_inpage_other",
+    tab_id: readerID,
+    offered_at: 0,
+    expires_at: Number.MAX_SAFE_INTEGER,
+    status: "queued",
+    provider_hosts: ["journals.example.edu"],
+  });
+
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+
+  expect(injections).toHaveLength(0);
+  expect(h.windows?.created.filter((p) => p.url.endsWith("toast.html")) ?? []).toHaveLength(1);
+});
+
+test("papio never injects the toast into a tab in its own durable ledger", async () => {
+  // The second ownership signal, and the one that covers a tab whose job row is
+  // already gone — including the tab whose loss raised this very toast, whose
+  // ledger entry outlives its job.
+  const jobID = "job_inpage_ledger";
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const readerID = await readerTab(h);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, { binding_id?: string; purpose?: string }> | undefined;
+  };
+  internals.tabLedgerCache = {
+    ...(internals.tabLedgerCache ?? {}),
+    [String(readerID)]: { binding_id: "binding-ledger" },
+  };
+
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+
+  expect(injections).toHaveLength(0);
+  expect(h.windows?.created.filter((p) => p.url.endsWith("toast.html")) ?? []).toHaveLength(1);
+});
+
+test("a page that refuses injection falls back to the window, never to silence", async () => {
+  // A PDF viewer, a privileged page, or a grant withdrawn between the check and
+  // the call. The loss still has to reach the researcher.
+  const jobID = "job_inpage_refused";
+  const { h, injections } = await inPageHarness({ injects: false });
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await readerTab(h);
+
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+
+  expect(injections).toHaveLength(1);
+  expect(h.windows?.created.filter((p) => p.url.endsWith("toast.html")) ?? []).toHaveLength(1);
+});
+
+test("a non-HTTPS page takes the window route", async () => {
+  const jobID = "job_inpage_scheme";
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.create({ url: "http://intranet.example.edu/notes", active: true });
+
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+
+  expect(injections).toHaveLength(0);
+  expect(h.windows?.created.filter((p) => p.url.endsWith("toast.html")) ?? []).toHaveLength(1);
+});
+
+/** Reach the token papio actually put into the page, so the tests authorize the
+ * way the injected toast does rather than the way the bridge happens to store
+ * it. A test that read `pendingPageToast` instead would still pass if the two
+ * ever diverged. */
+function injectedToken(injections: { args: unknown[] }[]): string {
+  const injected = injections[0]?.args[0] as { token?: unknown } | undefined;
+  const token = injected?.token;
+  if (typeof token !== "string" || token === "") throw new Error("no token injected");
+  return token;
+}
+
+test("the injected toast's action needs the token papio minted", async () => {
+  // The gate that replaces `isToastSender`. The injected toast's sender is the
+  // researcher's own page, so `sender.url` proves nothing; the token is what
+  // makes the reply papio's own. A refused report must ALSO leave the live offer
+  // intact, or a wrong token becomes a way to silence a real one.
+  const jobID = "job_inpage_token";
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const readerID = await readerTab(h);
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+  const token = injectedToken(injections);
+  const internals = h.bridge as unknown as {
+    pageToastAction(jobID: string, token: string, tabID: number): Promise<boolean>;
+    toastPending(): unknown;
+  };
+
+  expect(await internals.pageToastAction(jobID, "not-the-token", readerID)).toBe(false);
+  // No daemon call was made, and the real offer is still live.
+  expect(h.port.posted.some((frame) => (frame as { type?: string }).type === "handoff_link_request")).toBe(false);
+  expect(internals.toastPending()).toEqual({ kind: "route_lost", job_id: jobID });
+
+  // The genuine token still works afterwards.
+  const acting = internals.pageToastAction(jobID, token, readerID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: "https://une.primo.exlibrisgroup.com/openurl?x=1",
+    }),
+  );
+  expect(await acting).toBe(true);
+});
+
+test("a toast left on another tab cannot act with a real token", async () => {
+  // The token is real but the tab is not the one papio injected into. This is
+  // the shape a superseded toast has: still rendered on a tab the researcher
+  // left, still holding the token it was given.
+  const jobID = "job_inpage_wrongtab";
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const readerID = await readerTab(h);
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+  const token = injectedToken(injections);
+  const internals = h.bridge as unknown as {
+    pageToastAction(jobID: string, token: string, tabID: number): Promise<boolean>;
+  };
+
+  expect(await internals.pageToastAction(jobID, token, readerID + 1)).toBe(false);
+  expect(h.port.posted.some((frame) => (frame as { type?: string }).type === "handoff_link_request")).toBe(false);
+});
+
+test("the injected toast settles exactly once", async () => {
+  // The page guards this too, but the authorization is one-use on this side as
+  // well: a click that raced its own expiry must not reopen a paper twice.
+  const jobID = "job_inpage_once";
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer(jobID));
+  const jobTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const readerID = await readerTab(h);
+  await h.tabs.onRemoved.emit(jobTabID, { isWindowClosing: false });
+  const token = injectedToken(injections);
+  const internals = h.bridge as unknown as {
+    pageToastAction(jobID: string, token: string, tabID: number): Promise<boolean>;
+    pageToastDismiss(jobID: string, token: string, tabID: number): void;
+  };
+
+  const acting = internals.pageToastAction(jobID, token, readerID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: request.payload["request_id"],
+      outcome: "opened",
+      url: "https://une.primo.exlibrisgroup.com/openurl?x=1",
+    }),
+  );
+  expect(await acting).toBe(true);
+  const opened = h.tabs.created.filter((props) => props.url?.includes("openurl")).length;
+
+  // A second report with the same token, and a late dismissal, both refused.
+  expect(await internals.pageToastAction(jobID, token, readerID)).toBe(false);
+  internals.pageToastDismiss(jobID, token, readerID);
+  expect(h.tabs.created.filter((props) => props.url?.includes("openurl")).length).toBe(opened);
+});
+
+test("a replacing loss makes the earlier injected toast inert", async () => {
+  // Bound 1 on the in-page route. The earlier toast is still on the page for a
+  // few seconds — papio cannot reach into a tab to remove it without injecting
+  // again — so its token MUST stop working the moment a second loss arrives.
+  const { h, injections } = await inPageHarness();
+  await h.port.inbound(jobOffer("job_inpage_first"));
+  const firstTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const readerID = await readerTab(h);
+  await h.tabs.onRemoved.emit(firstTabID, { isWindowClosing: false });
+  const firstToken = injectedToken(injections);
+
+  await h.port.inbound(jobOffer("job_inpage_second"));
+  const secondTabID = h.backend.store.activeJobs.find(
+    (job) => job.job_id === "job_inpage_second",
+  )?.tab_id ?? -1;
+  expect(secondTabID).toBeGreaterThanOrEqual(0);
+  await h.tabs.onRemoved.emit(secondTabID, { isWindowClosing: false });
+  expect(injections).toHaveLength(2);
+
+  const internals = h.bridge as unknown as {
+    pageToastAction(jobID: string, token: string, tabID: number): Promise<boolean>;
+  };
+  expect(await internals.pageToastAction("job_inpage_first", firstToken, readerID)).toBe(false);
+  expect(h.port.posted.some((frame) => (frame as { type?: string }).type === "handoff_link_request")).toBe(false);
 });

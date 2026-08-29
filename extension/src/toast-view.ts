@@ -58,6 +58,38 @@ export const TOAST_COPY: Readonly<Record<ToastKind, ToastCopy>> = {
  * longer of papio's two windows, not a new kind of pressure. */
 export const TOAST_WINDOW_MS = 8000;
 
+/** The injected route's own message types, deliberately NOT the extension
+ * page's `TOAST_ACTION_MESSAGE`.
+ *
+ * That type is authorized by `isToastSender`, which requires the sender to BE
+ * the toast page (`sender.url === urls.toastURL`). An injected toast's sender
+ * is the researcher's own web page, so serving it through the same type would
+ * mean relaxing that check to admit page senders — and every page papio can
+ * inject into could then speak as the toast surface. Separate types keep the
+ * two gates separate, and this one additionally requires the one-use token
+ * papio minted when it injected. */
+export const TOAST_PAGE_ACTION_MESSAGE = "papio.toast.pageAction";
+export const TOAST_PAGE_DISMISS_MESSAGE = "papio.toast.pageDismiss";
+
+/** Everything the injected function needs, as one serializable argument.
+ *
+ * `chrome.scripting` drops every outer-scope reference, so the injected body
+ * cannot import `TOAST_COPY` or call `renderToast`. Passing the copy as data
+ * keeps the single source: both routes still read the same `TOAST_COPY` table,
+ * so the sentence and the offer can never diverge even though the two routes
+ * build their DOM separately. */
+export interface ToastInjection {
+  readonly kind: ToastKind;
+  readonly job_id: string;
+  /** One-use, minted per injection. The action message is refused without it. */
+  readonly token: string;
+  readonly message: string;
+  readonly action: string;
+  readonly window_ms: number;
+  readonly action_message: string;
+  readonly dismiss_message: string;
+}
+
 export interface ToastElements {
   readonly root: HTMLElement;
   readonly message: HTMLElement;

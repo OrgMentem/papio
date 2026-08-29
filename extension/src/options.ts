@@ -6,7 +6,9 @@
 
 import {
   chromeBackend,
+  ALL_SITES_ORIGIN,
   CATCH_UP_ENABLED_KEY,
+  IN_PAGE_TOAST_KEY,
   PAGE_CAPTURE_CONSENT_KEY,
   SUCCESS_ACK_MODE_KEY,
   TOOLBAR_COUNT_MODE_KEY,
@@ -17,7 +19,9 @@ import {
 import { renderPapio } from "./dom";
 import { adapters, type AdapterSpec } from "./adapters/types";
 export {
+  ALL_SITES_ORIGIN,
   CATCH_UP_ENABLED_KEY,
+  IN_PAGE_TOAST_KEY,
   SUCCESS_ACK_MODE_KEY,
   TOOLBAR_COUNT_MODE_KEY,
 } from "./state";
@@ -29,7 +33,6 @@ export interface Source {
   origin: string;
 }
 
-export const ALL_SITES_ORIGIN = "https://*/*";
 const ALL_SITES_SOURCE: Source = {
   label: "All sites (covers every site)",
   origin: ALL_SITES_ORIGIN,
@@ -255,22 +258,60 @@ export function wirePageCaptureConsent(): void {
   });
 }
 
+/** Apply the all-sites grant to the in-page-toast row, using the snapshot the
+ * caller already read. No `permissions.contains` probe of its own: the grant
+ * lists render from one `getAll()` snapshot, and adding a second read here
+ * would reintroduce the per-origin probing those rows exist to avoid.
+ *
+ * The row is hidden, not merely unchecked, until the grant exists: the
+ * preference does nothing without it, so offering it first would be a control
+ * that silently fails. Revocation also CLEARS the stored value, because hiding
+ * the row alone would leave `true` behind and re-granting all-sites months
+ * later would restore an injected surface the researcher never re-chose. */
+async function applyInPageToastGrant(granted: boolean): Promise<void> {
+  const row = document.getElementById("in-page-toast-row");
+  const input = document.getElementById("in-page-toast");
+  if (!(row instanceof HTMLElement) || !(input instanceof HTMLInputElement))
+    return;
+  row.hidden = !granted;
+  if (granted) return;
+  input.checked = false;
+  input.dataset.lastPersisted = "false";
+  await chrome.storage.local
+    .set({ [IN_PAGE_TOAST_KEY]: false })
+    .catch(() => undefined);
+}
+
 async function renderFeedbackSettings(): Promise<void> {
   const toolbar = document.getElementById("toolbar-count-mode");
   const catchUp = document.getElementById("catch-up-enabled");
   const success = document.getElementById("success-ack-mode");
+  // Read in the SAME batch as its siblings. Its row's visibility is owned by
+  // applyInPageToastGrant, which the permission render drives; this only
+  // reflects the stored value.
+  const inPageToast = document.getElementById("in-page-toast");
   if (!(toolbar instanceof HTMLSelectElement) || !(catchUp instanceof HTMLInputElement) || !(success instanceof HTMLSelectElement)) return;
   try {
-    const values = await chrome.storage.local.get([TOOLBAR_COUNT_MODE_KEY, CATCH_UP_ENABLED_KEY, SUCCESS_ACK_MODE_KEY]);
+    const values = await chrome.storage.local.get([TOOLBAR_COUNT_MODE_KEY, CATCH_UP_ENABLED_KEY, SUCCESS_ACK_MODE_KEY, IN_PAGE_TOAST_KEY]);
     const mode = values[TOOLBAR_COUNT_MODE_KEY];
     toolbar.value = mode === "all" || mode === "off" ? mode : "required";
     catchUp.checked = values[CATCH_UP_ENABLED_KEY] !== false;
     const ack = values[SUCCESS_ACK_MODE_KEY];
     success.value = ack === "errors" || ack === "off" ? ack : "all";
+    if (inPageToast instanceof HTMLInputElement) {
+      inPageToast.checked = values[IN_PAGE_TOAST_KEY] === true;
+      inPageToast.dataset.lastPersisted = String(inPageToast.checked);
+    }
   } catch {
     toolbar.value = "required";
     catchUp.checked = true;
     success.value = "all";
+    if (inPageToast instanceof HTMLInputElement) {
+      // Fail closed: an unreadable preference must not enable an injected
+      // surface.
+      inPageToast.checked = false;
+      inPageToast.dataset.lastPersisted = "false";
+    }
   }
   toolbar.dataset.lastPersisted = toolbar.value;
   catchUp.dataset.lastPersisted = String(catchUp.checked);
@@ -283,6 +324,33 @@ function wireFeedbackSettings(): void {
   const catchUp = document.getElementById("catch-up-enabled");
   const success = document.getElementById("success-ack-mode");
   const feedbackError = "papio could not save this preference";
+  const inPageToast = document.getElementById("in-page-toast");
+  inPageToast?.addEventListener("change", () => {
+    if (!(inPageToast instanceof HTMLInputElement) || inPageToast.disabled)
+      return;
+    const pendingChecked = inPageToast.checked;
+    const previous = inPageToast.dataset.lastPersisted === "true";
+    inPageToast.disabled = true;
+    setFeedbackSettingsNotice(null);
+    void chrome.storage.local
+      .set({ [IN_PAGE_TOAST_KEY]: pendingChecked })
+      .then(
+        () => {
+          void renderFeedbackSettings()
+            .catch(() => {
+              setFeedbackSettingsNotice("papio could not refresh preferences");
+            })
+            .finally(() => {
+              inPageToast.disabled = false;
+            });
+        },
+        () => {
+          inPageToast.checked = previous;
+          inPageToast.disabled = false;
+          setFeedbackSettingsNotice(feedbackError);
+        },
+      );
+  });
   toolbar?.addEventListener("change", () => {
     if (!(toolbar instanceof HTMLSelectElement) || toolbar.disabled) return;
     const pendingValue = toolbar.value === "all" || toolbar.value === "off" ? toolbar.value : "required";
@@ -683,6 +751,9 @@ async function renderPermissionLists(reportAllSitesStillActive = false): Promise
     render(libraryResolverList, LIBRARY_RESOLVERS, permissionSnapshot);
   }
   void renderConfiguredResolvers(permissionSnapshot);
+  // Gated on the all-sites grant this function just read, so every grant and
+  // revoke path applies it here rather than each call site remembering to.
+  void applyInPageToastGrant(permissionSnapshot.allSitesGranted);
   setProviderPermissionNotice(
     reportAllSitesStillActive && permissionSnapshot.allSitesGranted
       ? "All-sites access is still active. Turn it off with the All-sites access control above to manage providers separately."

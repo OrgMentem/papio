@@ -15,7 +15,16 @@
 // The class is constructed with an injected BridgeDeps seam so the whole flow is
 // unit-testable without a real chrome runtime.
 
-import { type ToastKind, type ToastPayload, toastKindForLoss } from "./toast-view";
+import {
+  TOAST_COPY,
+  TOAST_PAGE_ACTION_MESSAGE,
+  TOAST_PAGE_DISMISS_MESSAGE,
+  TOAST_WINDOW_MS,
+  type ToastInjection,
+  type ToastKind,
+  type ToastPayload,
+  toastKindForLoss,
+} from "./toast-view";
 import {
   TOAST_ACTION_MESSAGE,
   TOAST_DISMISS_MESSAGE,
@@ -115,6 +124,8 @@ import {
   TOOLBAR_COUNT_MODE_KEY,
   type ToolbarCountMode,
   isURLLike,
+  ALL_SITES_ORIGIN,
+  getInPageToastEnabled,
 } from "./state";
 import {
   doiFromURL,
@@ -494,6 +505,138 @@ const TOAST_PAGE_PATH = POPUP_PAGE_PATH.replace(/[^/]*$/, "toast.html");
 const TOAST_WINDOW_SIZE = { width: 520, height: 116 } as const;
 /** How long a papio surface's focus report suppresses the toast. */
 const TOAST_PRESENCE_TTL_MS = 30_000;
+
+/**
+ * ADR-0023's seventh surface, delivered into the page the researcher is reading
+ * instead of into a small papio window. Runs INSIDE that page via
+ * scripting.executeScript, so — like `isBotChallenge` above — it must stay
+ * fully self-contained: no outer-scope reference, module import, or shared
+ * constant survives serialization, which is why every value it needs arrives in
+ * the one `ToastInjection` argument.
+ *
+ * Three differences from the sixth surface's chip (`popup.ts`
+ * renderInPageAcknowledgement), all of them deliberate:
+ *
+ * - It is INTERACTIVE. The chip is `pointer-events: none` because it is a
+ *   receipt; this one carries the single take-back-control action, so it takes
+ *   pointer and keyboard input and is an `alertdialog` like the toast page.
+ * - It reads NOTHING from the page. It appends one host element and removes it.
+ *   No selector runs, no text is collected, and nothing is returned except
+ *   whether the host was appended.
+ * - It removes itself from the DOM before it reports, so a capture taken after
+ *   an action can never contain it. The host id is also what the capture path
+ *   strips, so a toast that is still live is excluded from fixture bytes.
+ */
+export function renderPageToast(injection: ToastInjection): boolean {
+  const HOST_ID = "papio-extension-loss-toast-v1";
+  const prior = document.getElementById(HOST_ID);
+  if (prior !== null) prior.remove();
+  const host = document.createElement("div");
+  host.id = HOST_ID;
+  host.style.cssText = [
+    "position:fixed",
+    "right:16px",
+    "bottom:16px",
+    "z-index:2147483647",
+    "margin:0",
+    "padding:0",
+    "border:0",
+  ].join(";");
+  // Open, not closed: same reason as the chip — isolation is what the shadow
+  // root is for, and an open root stays inspectable without weakening it. It
+  // also keeps the copy out of `document.documentElement.outerHTML`, which
+  // omits shadow roots, so a capture that races the strip still carries an
+  // empty host rather than papio's sentence.
+  const root = host.attachShadow({ mode: "open" });
+  const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const [ink, border, surface, accentInk, accent] = dark
+    ? ["#e9ecf1", "#3a4049", "#1c1f26", "#0f1115", "#8fb4e0"]
+    : ["#16181d", "#d3d7de", "#ffffff", "#ffffff", "#1c5fd6"];
+  const card = document.createElement("div");
+  card.setAttribute("role", "alertdialog");
+  card.setAttribute("aria-describedby", "papio-toast-message");
+  card.style.cssText = [
+    "align-items:center",
+    `background:${surface}`,
+    `border:1px solid ${border}`,
+    "border-radius:10px",
+    "box-shadow:0 10px 30px rgb(16 22 33 / 22%)",
+    `color:${ink}`,
+    "display:flex",
+    "font:14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+    "gap:12px",
+    "max-width:min(520px, calc(100vw - 32px))",
+    "padding:12px 14px",
+  ].join(";");
+  const message = document.createElement("p");
+  message.id = "papio-toast-message";
+  message.textContent = injection.message;
+  message.style.cssText = "margin:0;flex:1 1 auto";
+  const action = document.createElement("button");
+  action.type = "button";
+  action.textContent = injection.action;
+  action.style.cssText = [
+    "flex:none",
+    `background:${accent}`,
+    `color:${accentInk}`,
+    "border:1px solid transparent",
+    "border-radius:7px",
+    "cursor:pointer",
+    "font:inherit",
+    "padding:6px 12px",
+  ].join(";");
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.textContent = "Dismiss";
+  dismiss.setAttribute("aria-label", "Dismiss this message");
+  dismiss.style.cssText = [
+    "flex:none",
+    "background:transparent",
+    `color:${ink}`,
+    `border:1px solid ${border}`,
+    "border-radius:7px",
+    "cursor:pointer",
+    "font:inherit",
+    "padding:6px 10px",
+  ].join(";");
+  // One settlement only. Both buttons and the expiry race each other, and a
+  // second report would either reopen a paper twice or dismiss an offer the
+  // researcher just accepted. `timer` is declared before `settle` reads it:
+  // the handlers only fire after the assignment below, but a const declared
+  // after its closure is a compile error, not a runtime one.
+  let settled = false;
+  let timer: number | undefined;
+  const settle = (type: string, reason?: string): void => {
+    if (settled) return;
+    settled = true;
+    window.clearTimeout(timer);
+    // Remove BEFORE reporting: the action opens a tab, and this page may be
+    // captured or classified at any moment after that.
+    host.remove();
+    const payload: Record<string, unknown> = {
+      type,
+      job_id: injection.job_id,
+      token: injection.token,
+    };
+    if (reason !== undefined) payload["reason"] = reason;
+    void chrome.runtime.sendMessage(payload).catch(() => undefined);
+  };
+  action.addEventListener("click", () => settle(injection.action_message));
+  dismiss.addEventListener("click", () =>
+    settle(injection.dismiss_message, "dismissed"),
+  );
+  // Expiry commits nothing, exactly as the window route's does: the recovery
+  // stays in the inbox, so the eight seconds are a shortcut, not a deadline.
+  timer = window.setTimeout(
+    () => settle(injection.dismiss_message, "expired"),
+    injection.window_ms,
+  );
+  card.append(message, action, dismiss);
+  root.append(card);
+  document.documentElement.append(host);
+  return true;
+}
+
 /** The handoff group's title. Constant: it is an ownership marker, not a
  * status line. It briefly carried the surfaced paper's own title, which read
  * as information and was not — with more than one tab in the group the label
@@ -1191,7 +1334,14 @@ export interface BridgeDeps {
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
     /** Used only for the singleton inbox tab. */
     sendMessage?(tabID: number, message: object): Promise<unknown>;
-    query?(query: { url?: string; groupId?: number }): Promise<TabInfo[]>;
+    /** `active`+`lastFocusedWindow` finds the page the researcher is actually
+     * looking at, which is the only tab the injected toast route may target. */
+    query?(query: {
+      url?: string;
+      groupId?: number;
+      active?: boolean;
+      lastFocusedWindow?: boolean;
+    }): Promise<TabInfo[]>;
     onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
     /** ADR-0013 privileges the focused tab: an activation with no matching
      * navigation event is still evidence the operator is looking at that
@@ -1345,6 +1495,9 @@ export interface BridgeDeps {
     /** Tri-state surface choice. `tab-group` degrades to `work-window` if
      * tabGroups is absent. */
     getHandoffSurface(): Promise<HandoffSurface>;
+    /** Opt-in delivery of the loss toast into the researcher's own page.
+     * Absent/false = the extension-window route, which needs no host access. */
+    getInPageToast(): Promise<boolean>;
   };
   /** Durable managed-tab ledger (chrome.storage.local): URL-free birth
    * certificates (Slice 2b, `./ledger.ts`). `load()` returns raw storage
@@ -10787,23 +10940,112 @@ export class Bridge {
    * daemon already writes. */
   private pendingToast: ToastPayload | undefined;
   private toastWindowID: number | undefined;
+  /** The in-page route's one-use authorization. Present only while an injected
+   * toast is live, and cleared by the first action, dismissal, or replacement.
+   *
+   * It exists because the injected toast's sender is the researcher's own page,
+   * so `sender.url` cannot authorize it the way it authorizes the toast page.
+   * The token is what makes the reply papio's own: a page cannot read it (the
+   * isolated world is not reachable from page script), and a stale injected
+   * toast left on a background tab cannot act after a replacement. */
+  private pendingPageToast:
+    | { readonly token: string; readonly job_id: string; readonly tab_id: number }
+    | undefined;
+
+  /** Try the in-page route. Returns whether an injected toast is now live, so
+   * the caller falls back to the window rather than assuming either way.
+   *
+   * Every gate here is a refusal to interrupt, and they are ordered cheapest
+   * first. Two of them are the researcher's own choices and neither implies the
+   * other: the preference says they want papio's interruption in their page,
+   * and the all-sites grant says papio may reach that page at all. A provider
+   * grant is deliberately NOT sufficient — it was given so papio could finish a
+   * download on that host, not so papio could draw on it. */
+  private async raiseInPageToast(payload: ToastPayload): Promise<boolean> {
+    const tabs = this.deps.tabs;
+    if (tabs.query === undefined) return false;
+    if (!(await this.deps.settings.getInPageToast().catch(() => false)))
+      return false;
+    const granted = await this.deps.permissions
+      .contains({ origins: [ALL_SITES_ORIGIN] })
+      .catch(() => false);
+    if (granted !== true) return false;
+    // Called through its owner, never as an extracted reference: the Chrome
+    // adapter is a bound arrow but a class-backed seam is not, and an unbound
+    // call throws inside the seam and reads here as "no active tab".
+    const [tab] = await tabs
+      .query({ active: true, lastFocusedWindow: true })
+      .catch(() => []);
+    const tabID = tab?.id;
+    if (tabID === undefined || typeof tab?.url !== "string") return false;
+    // Never into a papio surface. A tab papio tracks or owns is the work
+    // surface, not the researcher's reading, and the tab whose loss started
+    // this may still be in the ledger cache.
+    if (findByTab(this.store, tabID) !== undefined) return false;
+    if (this.tabLedgerCache?.[String(tabID)] !== undefined) return false;
+    // Only an ordinary HTTPS page. The grant covers exactly that scheme, and a
+    // PDF viewer or privileged page refuses injection anyway — reaching it
+    // through the catch below would work, but failing here keeps the window
+    // fallback fast instead of paying a rejected round trip.
+    let httpsPage = false;
+    try {
+      httpsPage = new URL(tab.url).protocol === "https:";
+    } catch {
+      return false;
+    }
+    if (!httpsPage || isPDFPage(tab.url)) return false;
+    const copy = TOAST_COPY[payload.kind];
+    const token = this.deps.randomUUID();
+    try {
+      const [injected] = await this.deps.scripting.executeScript({
+        target: { tabId: tabID },
+        func: renderPageToast,
+        args: [
+          {
+            kind: payload.kind,
+            job_id: payload.job_id,
+            token,
+            message: copy.message,
+            action: copy.action,
+            window_ms: TOAST_WINDOW_MS,
+            action_message: TOAST_PAGE_ACTION_MESSAGE,
+            dismiss_message: TOAST_PAGE_DISMISS_MESSAGE,
+          } satisfies ToastInjection,
+        ],
+      });
+      if (injected?.result !== true) return false;
+    } catch {
+      // Withdrawn grant, a page type that refuses scripting, or a tab that
+      // navigated mid-call. The window route still covers this loss.
+      return false;
+    }
+    this.pendingPageToast = { token, job_id: payload.job_id, tab_id: tabID };
+    return true;
+  }
 
   /** Raise the seventh surface for a loss papio observed itself. Returns
-   * whether a window was opened, so the caller can fall back to silence
+   * whether a surface was delivered, so the caller can fall back to silence
    * rather than assume. */
   private async raiseToast(payload: ToastPayload): Promise<boolean> {
-    const windows = this.deps.windows;
-    if (windows === undefined) return false;
     // A papio surface already in front reports the same event, and Decision 9's
     // presence hint is exactly the signal for that. Interrupting a researcher
     // who is looking at the popup would be a duplicate, not an aid.
     if (this.papioSurfaceLikelyFocused()) return false;
     this.pendingToast = payload;
-    // Replace rather than stack: close the previous window first so the
-    // researcher is never asked about two losses at once.
+    // Replace rather than stack: retire the previous surface on BOTH routes
+    // before raising either, so the researcher is never asked about two losses
+    // at once and a superseded injected toast can no longer act.
+    //
+    // An injected toast in a tab the researcher has since left is not removed
+    // from that page here — papio would have to inject again to do it. It is
+    // bounded instead: it disappears on its own within TOAST_WINDOW_MS, and
+    // dropping the token below means the stale offer is refused if clicked.
     await this.closeToastWindow();
+    this.pendingPageToast = undefined;
+    if (await this.raiseInPageToast(payload)) return true;
+    const windows = this.deps.windows;
     const url = this.deps.runtimeGetURL?.(TOAST_PAGE_PATH);
-    if (url === undefined) {
+    if (windows === undefined || url === undefined) {
       this.pendingToast = undefined;
       return false;
     }
@@ -10916,6 +11158,56 @@ export class Bridge {
   toastDismiss(jobID: string): void {
     if (this.pendingToast?.job_id === jobID) this.pendingToast = undefined;
     this.toastWindowID = undefined;
+  }
+
+  /** Consume the injected route's one-use authorization, or refuse.
+   *
+   * All three facts must agree: the token papio minted, the job it minted it
+   * for, and the tab it injected into. The token alone would be enough against
+   * a page (it cannot read the isolated world), but the tab check is what makes
+   * a replaced offer inert — a superseded toast still sitting on another tab
+   * carries a real token for a job that is no longer the pending one.
+   *
+   * Consuming here rather than in the caller means a refused report cannot
+   * silently clear a live offer — pinned by the wrong-token test, which asserts
+   * the real offer survives a bad one.
+   *
+   * The clear on success is defence at this layer only, and deliberately not
+   * claimed as more: `toastAction` drops `pendingToast` itself, so a second act
+   * is already refused one level down. Keeping it here means this
+   * authorization's one-use property does not depend on reading that method.
+   */
+  private consumePageToast(jobID: string, token: string, tabID: number): boolean {
+    const pending = this.pendingPageToast;
+    if (
+      pending === undefined ||
+      pending.token !== token ||
+      pending.job_id !== jobID ||
+      pending.tab_id !== tabID
+    ) {
+      return false;
+    }
+    this.pendingPageToast = undefined;
+    return true;
+  }
+
+  /** The researcher took the offer in their own page. Same daemon call as the
+   * window route, and deliberately the same method afterwards: the recovery is
+   * one behaviour with two delivery routes, not two behaviours. */
+  async pageToastAction(
+    jobID: string,
+    token: string,
+    tabID: number,
+  ): Promise<boolean> {
+    if (!this.consumePageToast(jobID, token, tabID)) return false;
+    return this.toastAction(jobID);
+  }
+
+  /** Dismissed or expired in the page. The injected surface has already removed
+   * itself, so this only drops the offer. */
+  pageToastDismiss(jobID: string, token: string, tabID: number): void {
+    if (!this.consumePageToast(jobID, token, tabID)) return;
+    this.toastDismiss(jobID);
   }
 
   async requestTriageSnapshot(request: {
@@ -22119,6 +22411,54 @@ export async function handleInboxRuntimeMessage(
     bridge.toastDismiss(jobID);
     return { ok: true };
   }
+  // The injected route's own two types. Their gate is NOT `isToastSender`:
+  // the sender is the researcher's own page, so `sender.url` proves nothing
+  // here. Authorization is the one-use token papio minted at injection plus
+  // the tab it injected into, both checked inside the bridge. `sender.id`
+  // still has to be papio's own runtime, and the tab id comes from the
+  // browser's sender record rather than from the message body — a page that
+  // could somehow speak cannot name a tab that is not its own.
+  if (type === TOAST_PAGE_ACTION_MESSAGE) {
+    const jobID = message["job_id"];
+    const token = message["token"];
+    const tabID = sender.tab?.id;
+    if (sender.id !== urls.runtimeID)
+      return failure("unauthorized", "This sender cannot act on a papio toast");
+    if (
+      !hasOnlyKeys(message, ["type", "job_id", "token"]) ||
+      typeof jobID !== "string" ||
+      jobID === "" ||
+      typeof token !== "string" ||
+      token === "" ||
+      tabID === undefined
+    ) {
+      return failure("invalid_request", "Invalid toast action");
+    }
+    return { ok: true, opened: await bridge.pageToastAction(jobID, token, tabID) };
+  }
+  if (type === TOAST_PAGE_DISMISS_MESSAGE) {
+    const jobID = message["job_id"];
+    const token = message["token"];
+    const tabID = sender.tab?.id;
+    if (sender.id !== urls.runtimeID) {
+      return failure(
+        "unauthorized",
+        "This sender cannot dismiss a papio toast",
+      );
+    }
+    if (
+      !hasOnlyKeys(message, ["type", "job_id", "token", "reason"]) ||
+      typeof jobID !== "string" ||
+      jobID === "" ||
+      typeof token !== "string" ||
+      token === "" ||
+      tabID === undefined
+    ) {
+      return failure("invalid_request", "Invalid toast dismissal");
+    }
+    bridge.pageToastDismiss(jobID, token, tabID);
+    return { ok: true };
+  }
   if (type === "papio.pageBulk.scan") {
     if (!isPopupSender(sender, urls))
       return failure("unauthorized", "This sender cannot start a page scan");
@@ -22576,6 +22916,7 @@ function realDeps(): BridgeDeps {
           return "work-window";
         }
       },
+      getInPageToast: () => getInPageToastEnabled(chrome.storage.local),
     },
     toolbarCount: {
       async get(): Promise<ToolbarCountMode> {

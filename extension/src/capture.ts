@@ -497,10 +497,28 @@ export interface PageCapture {
 /** Injected into the active tab via chrome.scripting.executeScript. Must be
  * fully self-contained — it is serialized, so it may not close over any popup
  * state. It reads only structure and location; nothing sensitive is computed
- * here (sanitization happens back in the popup). */
+ * here (sanitization happens back in the popup).
+ *
+ * papio's own injected surfaces are removed from the serialized copy. Both are
+ * transient — the acknowledgement chip lasts three seconds, the loss toast
+ * eight — but a capture is a fixture candidate, and a fixture is evidence about
+ * a PROVIDER's page. A stray `<div id="papio-…">` in committed bytes is papio
+ * describing itself. Their copy is already out of reach because both render
+ * into a shadow root and `outerHTML` omits shadow trees; this removes the host
+ * elements too, so the capture contains no trace of papio at all.
+ *
+ * The live DOM is not touched: the hosts are removed from a clone. Removing
+ * them for real would make a capture cancel an offer the researcher is reading.
+ */
 export function capturePage(): PageCapture {
+  const root = document.documentElement.cloneNode(true) as HTMLElement;
+  for (const host of root.querySelectorAll(
+    "#papio-extension-action-ack-v1, #papio-extension-loss-toast-v1",
+  )) {
+    host.remove();
+  }
   return {
-    html: document.documentElement.outerHTML,
+    html: root.outerHTML,
     origin: location.origin,
     path: location.pathname,
   };

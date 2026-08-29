@@ -32,6 +32,8 @@ interface OptionsPageOptions {
   storageSetFails?: Set<string>;
   storageGetFails?: Set<string>;
   resolverOrigins?: string[];
+  /** Pre-existing chrome.storage.local contents. */
+  storageSeed?: Record<string, unknown>;
 }
 
 async function settle(): Promise<void> {
@@ -61,6 +63,7 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
   const storageValues: Record<string, unknown> = {
     ...(options.pageCaptureConsent === undefined ? {} : { [PAGE_CAPTURE_CONSENT_KEY]: options.pageCaptureConsent }),
     ...(options.resolverOrigins === undefined ? {} : { papio_state_v1: { resolverOrigins: options.resolverOrigins, version: 5 } }),
+    ...(options.storageSeed ?? {}),
   };
   const containsCalls: string[][] = [];
   const grantedOrigins = new Set(options.origins ?? []);
@@ -444,4 +447,41 @@ test("configured resolvers renders unavailable state when storage load rejects",
   expect(msg.hidden).toBe(false);
   expect(msg.textContent).toContain("could not load");
   process.off("unhandledRejection", onRejection);
+});
+
+test("the in-page toast row stays hidden until all-sites access exists", async () => {
+  // The preference does nothing without the grant, so offering it first would
+  // be a control that silently fails.
+  const page = await optionsDocument({ origins: [adapters[0]!.hosts[0]!].map((h) => `https://${h}/*`) });
+  const row = page.document.getElementById("in-page-toast-row");
+  expect(row).not.toBeNull();
+  expect(row?.hasAttribute("hidden")).toBe(true);
+});
+
+test("all-sites access reveals the in-page toast row, still unchecked", async () => {
+  // Revealed, not enabled. The grant is about reach; this preference is about
+  // whether papio may draw in the researcher's page.
+  const page = await optionsDocument({ origins: [ALL_SITES_ORIGIN] });
+  const row = page.document.getElementById("in-page-toast-row");
+  const input = page.document.getElementById("in-page-toast");
+  expect(row?.hasAttribute("hidden")).toBe(false);
+  expect((input as HTMLInputElement | null)?.checked).toBe(false);
+});
+
+test("a stored opt-in shows as checked once the grant is present", async () => {
+  const page = await optionsDocument({
+    origins: [ALL_SITES_ORIGIN],
+    storageSeed: { papio_in_page_toast_v1: true },
+  });
+  expect((page.document.getElementById("in-page-toast") as HTMLInputElement | null)?.checked).toBe(true);
+});
+
+test("revoking all-sites access clears the stored opt-in", async () => {
+  // The discriminating case. Hiding the row alone would leave `true` in
+  // storage, so re-granting all-sites months later would silently restore an
+  // injected surface the researcher never re-chose.
+  const page = await optionsDocument({ storageSeed: { papio_in_page_toast_v1: true } });
+  await settle();
+  expect(page.document.getElementById("in-page-toast-row")?.hasAttribute("hidden")).toBe(true);
+  expect(page.storageValues["papio_in_page_toast_v1"]).toBe(false);
 });
