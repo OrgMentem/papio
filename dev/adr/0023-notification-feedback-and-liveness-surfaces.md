@@ -499,11 +499,60 @@ Delivery is an unfocused extension window (`chrome.windows.create` with
 `type: "popup"`, `focused: false`). That needs no new manifest permission and no
 host permission, so it reaches the researcher on any page — which an injected
 in-page toast cannot, because provider hosts are `optional_host_permissions` and
-*papio* only ever requests the exact configured resolver origin. An in-page
-variant remains possible for a tab already granted, and is deliberately NOT
-decided here: it would relax Decision 1's rule that the page-local surface is
-scoped to a page the researcher just acted on, and that relaxation needs its own
-answer.
+*papio* only ever requests the exact configured resolver origin.
+
+### Addendum (2026-08-30): the in-page route, decided
+
+The in-page variant reserved above is now **allowed, as a second delivery route
+for the same surface**, and the reservation is discharged. It is not an eighth
+surface: the copy, the single action, the eight seconds, and the one-at-a-time
+bound are the same, and `extension/src/toast-view.ts` remains the one place the
+copy lives so the two routes cannot say different things.
+
+The relaxation of Decision 1 that this needed is narrow and is stated here
+rather than left implied. Decision 1 scopes the page-local surface to a page the
+researcher just acted on, because that surface is a receipt for their own
+action. This route is not a receipt, so the scoping rule it must satisfy instead
+is **the researcher's own standing choice**, expressed as two separate consents
+that are deliberately not collapsed into one:
+
+- The **all-sites host grant** (`https://*/*`, already declared in
+  `optional_host_permissions` and already offered as its own options control)
+  answers whether *papio* may reach an arbitrary page. A per-provider grant is
+  explicitly **not** sufficient: it was given so *papio* could complete a
+  download on that host, not so *papio* could draw on it.
+- The **`papio_in_page_toast_v1` preference**, off by default, answers whether
+  *papio*'s own interruption may appear there. Revoking the grant clears the
+  preference, so re-granting all-sites access later cannot silently restore an
+  injected surface.
+
+Five further bounds, all test-enforced:
+
+- **Never into a surface *papio* owns.** A tab with a live job row, or an entry
+  in the durable tab ledger, is refused — the second check is what covers the
+  tab whose loss raised this very toast, whose ledger entry outlives its job.
+  Drawing on a provider page *papio* is about to classify would also put
+  *papio*'s own words into the `body.innerText` its adapters read.
+- **HTTPS pages only, never a PDF.** The grant covers exactly that scheme.
+- **Refusal falls back to the window, never to silence.** A withdrawn grant, a
+  privileged page, or a tab that navigated mid-call still reports the loss.
+- **Authorization is a one-use token bound to the job and the tab.** The
+  injected toast's sender is the researcher's own page, so `sender.url` cannot
+  authorize it the way it authorizes the toast page; a separate message type
+  keeps `isToastSender` unrelaxed. The tab binding is what makes a superseded
+  toast inert, since *papio* cannot reach into a tab it no longer targets to
+  remove one — that toast expires on its own within the eight seconds.
+- **Invisible to a page capture.** The toast renders in a shadow root, which
+  `outerHTML` omits, and `capturePage` additionally strips both papio host ids
+  from its own copy of the document. A fixture is evidence about a provider's
+  page; a stray `papio-…` element in committed bytes is *papio* describing
+  itself. Working from a copy is what keeps a capture from cancelling an offer
+  the researcher is reading.
+
+What is still **not** decided here: a persistent banner on *papio*-owned tabs.
+That needs `scripting.registerContentScripts`, which no part of the tree uses
+and which ADR-0019 Decision 1 names in its own scope; it would also be present
+in every capture and in every `innerText` read rather than for eight seconds.
 
 Bounds, all enforced by tests rather than convention:
 

@@ -90,6 +90,57 @@ func TestExtensionPermissionsAreDocumented(t *testing.T) {
 	}
 }
 
+// TestInjectedSurfacesAreDisclosed guards the three published privacy documents
+// against a specific, already-observed failure: prose written when a surface was
+// an extension page, left in place after that surface gained a route that draws
+// inside a web page.
+//
+// It fires only while the in-page loss-toast route exists in the source, so
+// removing the feature is not made harder than removing the sentences. The
+// forbidden strings are the exact absolute claims those documents used to make;
+// each is false the moment the route can run, and none of them is pinned by any
+// other test — the permissions guard above reads two concept pages and never
+// looks at these three files.
+func TestInjectedSurfacesAreDisclosed(t *testing.T) {
+	const route = "renderPageToast"
+	if !strings.Contains(mustRead(t, "extension/src/background.ts"), route) {
+		t.Skipf("no %s in background.ts: the in-page route is gone, so these "+
+			"disclosures are free to say the surface never injects", route)
+	}
+
+	// The wording the options control itself uses. Requiring the documents to
+	// name the researcher-visible label is what stops a reword from describing
+	// the route in terms no reader could match to the checkbox they are looking
+	// at.
+	const label = "Show the lost-tab message in the page you are reading"
+	forbidden := []string{
+		"injects nothing into any page",
+		"not a page overlay: it reads no web page content, injects nothing, and needs no host access",
+		"It is an extension page, so it reads no page content and needs no host access.",
+	}
+	for _, page := range []string{
+		"docs/privacy.md",
+		"extension/docs/amo-listing.md",
+		"extension/docs/chrome-web-store-listing.md",
+	} {
+		prose := mustRead(t, page)
+		if !strings.Contains(prose, label) {
+			t.Errorf("%s does not contain the in-page toast's own control label %q. "+
+				"The extension can draw a message inside a web page; a privacy "+
+				"document that does not name the control a researcher toggles cannot "+
+				"be checked against what the extension does.", page, label)
+		}
+		for _, claim := range forbidden {
+			if strings.Contains(prose, claim) {
+				t.Errorf("%s still claims %q. That sentence was written when the loss "+
+					"toast was only an extension page; %s makes it false whenever the "+
+					"researcher has granted all-sites access and opted in.",
+					page, claim, route)
+			}
+		}
+	}
+}
+
 // TestRegisteredAdaptersAreDocumented keeps the provider matrix honest. It had
 // fallen to 4 of 27 registered adapters.
 func TestRegisteredAdaptersAreDocumented(t *testing.T) {

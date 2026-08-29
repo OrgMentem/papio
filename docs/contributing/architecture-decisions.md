@@ -316,8 +316,12 @@ that carries an action: when *papio* loses a tab it opened for a paper, a small
 unfocused *papio* window offers to reopen that route for eight seconds — restarted
 once if you bring the window forward, because a first click on an unfocused window
 is spent activating it — then
-closes and commits nothing. It is an extension page, so it needs no host access
-and reads no page; it shows one fixed sentence and one button, and it is
+closes and commits nothing. By default it is an extension page, so it needs no
+host access and reads no page; a researcher who has granted all-sites access can
+opt in to having that same message drawn into the page they are reading instead,
+which is off by default, cleared when the grant is revoked, refused on a tab
+*papio* is itself driving, and invisible to a page capture. Either way it shows
+one fixed sentence and one button, and it is
 suppressed while a *papio* surface already holds focus. Its offer is truthful per
 branch: a resumable route offers a reopen, an abandoned institutional claim
 offers a new sign-in tab because no reversal exists, and a loss that cost nothing

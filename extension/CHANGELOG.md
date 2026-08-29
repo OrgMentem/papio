@@ -29,6 +29,25 @@ for the full pre-split extension history.
   while a *papio* window already has your focus, and it stays silent when the
   close cost you nothing — a download still in flight, a file the daemon is about
   to adopt, or a tab *papio* closed itself.
+- **That lost-tab message can now appear in the page you are reading, if you ask
+  for it.** A new option, `Show the lost-tab message in the page you are
+  reading`, delivers the same one sentence and one button into the page in front
+  of you instead of opening a separate window. It is off until you turn it on,
+  and the option only appears once you have granted all-sites access — the grant
+  is what lets *papio* reach a page at all, and the option is what allows it to
+  draw there. Revoking all-sites access turns the option off again, so
+  re-granting it later never silently restores the drawn message. When it does
+  draw, *papio* adds one element and reads nothing from the page: no page text
+  is collected, and the message renders in its own shadow root, so the page's
+  scripts and styles do not reach it. It is never drawn into a tab *papio* is
+  itself driving, into a page that is not HTTPS, or into a PDF, and any page
+  *papio* cannot draw into falls back to the window rather than to silence.
+- **A diagnostic page capture no longer records *papio*'s own on-page
+  messages.** A capture is evidence about a publisher's page, and both the
+  action acknowledgement and the lost-tab message could be on screen when one is
+  taken. Neither now appears in the captured copy. The message you are looking
+  at is left alone: the capture works from its own copy of the page, so it can
+  never cancel an offer you are reading.
 - **A publisher sign-in can now refresh the matching library-session check.** While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host asks *papio* to check the configured library resolver again. The new publisher trigger reads no page content and never sets the popup verdict; a tracked *papio* tab can still use its existing, job-scoped return evidence to release same-institution work. Other hosts, queued-only work, and ambiguous institutions do not authorize the trigger. A paper stored before this release carries no institution binding; it is bound only when its declared publishers match exactly one configured library, and stays unbound otherwise. An inconclusive resolver check now says what could not be verified instead of repeating an older claim. The binding survives a sleeping extension without storing the landing URL. When a resolver grant is missing in either browser, the card offers **Allow** for that institution only; granting it rechecks only while matching work or a tracked return is pending.
 - **Cochrane reviews now download by themselves.** Every PDF button on a
   Cochrane review page, and the page's own PDF metadata, points at a viewer
