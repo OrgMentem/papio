@@ -649,6 +649,22 @@ There is also a link check, because `zensical build` prints a broken link as an
   with `papio adapter captures` (it prints each capture's path; there is no retrieve
   subcommand — copy the file yourself), and commit it before adding the spec and the
   `adapters.test.ts` cases. Do **not** hand-guess selectors.
+- **The page classifier is implemented TWICE, and the browser runs the copy you
+  are less likely to edit.** `interpret` (`extension/src/adapters/types.ts`) is
+  what `adapter-try` and fixture tests exercise. `planExecution`
+  (`extension/src/plan.ts`) carries its own classify and readiness loops, and
+  `background.ts` injects it at three call sites. `deferUntilDeadline` first
+  landed in `interpret` alone while 1,442 tests passed, so a comment that the
+  files mirror each other is not enforcement. Any classifier change needs both
+  copies plus **asynchronous** tests where they can diverge: another rule wakes
+  early, an article marker appears then disappears, and an article marker
+  remains through the deadline. Both now hold article readiness through the
+  full budget, give non-article readiness the same 50 ms settle window, and
+  exclude deferred rules from every early classification.
+  `test/plan.test.ts` adds another trap: its serialization guard is a raw text
+  scan from `planExecution` to end of file and forbids `adapters`, `interpret`,
+  `chrome`, `globalThis`, `window`, and `resolveDownloadURL` **by word, comments
+  included**. A comment naming the twin fails the build.
 - **`sanitizeFixture` strips URL query strings** (privacy). So classify selectors must key on
   **stable id/path/data-attrs, not `?...` params** (e.g. SAGE keys on `section.format--pdf_epub`,
   not `[href*='download=true']`). `method: "href"` reads the **live** anchor href (with query)

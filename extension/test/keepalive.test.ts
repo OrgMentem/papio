@@ -868,10 +868,10 @@ test("a permission grant for a non-configured origin probes nothing", async () =
 });
 
 test("permission coverage matches exact, wildcard, and all-host grants", () => {
-  const origin = "https://une.primo.exlibrisgroup.com";
+  const origin = "https://example.primo.exlibrisgroup.com";
   expect(
     permissionPatternCoversOrigin(
-      "https://une.primo.exlibrisgroup.com/*",
+      "https://example.primo.exlibrisgroup.com/*",
       origin,
     ),
   ).toBe(true);
@@ -883,10 +883,10 @@ test("permission coverage matches exact, wildcard, and all-host grants", () => {
   ).toBe(true);
   expect(permissionPatternCoversOrigin("https://*/*", origin)).toBe(true);
   expect(permissionPatternCoversOrigin("<all_urls>", origin)).toBe(true);
-  const customPort = "https://une.primo.exlibrisgroup.com:8443";
+  const customPort = "https://example.primo.exlibrisgroup.com:8443";
   expect(
     permissionPatternCoversOrigin(
-      "https://une.primo.exlibrisgroup.com/*",
+      "https://example.primo.exlibrisgroup.com/*",
       customPort,
     ),
   ).toBe(true);
@@ -898,7 +898,7 @@ test("permission coverage matches exact, wildcard, and all-host grants", () => {
   ).toBe(true);
   expect(
     permissionPatternCoversOrigin(
-      "*://une.primo.exlibrisgroup.com/account",
+      "*://example.primo.exlibrisgroup.com/account",
       customPort,
     ),
   ).toBe(true);
@@ -907,26 +907,26 @@ test("permission coverage matches exact, wildcard, and all-host grants", () => {
   // cover every custom port - GRANTED for an origin nobody granted.
   expect(
     permissionPatternCoversOrigin(
-      "https://une.primo.exlibrisgroup.com:443/*",
+      "https://example.primo.exlibrisgroup.com:443/*",
       customPort,
     ),
   ).toBe(false);
   expect(
     permissionPatternCoversOrigin(
-      "https://une.primo.exlibrisgroup.com:8080/*",
+      "https://example.primo.exlibrisgroup.com:8080/*",
       customPort,
     ),
   ).toBe(false);
   expect(
     permissionPatternCoversOrigin(
-      "https://une.primo.exlibrisgroup.com:8443/*",
+      "https://example.primo.exlibrisgroup.com:8443/*",
       customPort,
     ),
   ).toBe(true);
   // A portless HTTPS origin IS port 443, so an exact `:443` grant covers it.
   expect(
     permissionPatternCoversOrigin(
-      "https://une.primo.exlibrisgroup.com:443/*",
+      "https://example.primo.exlibrisgroup.com:443/*",
       origin,
     ),
   ).toBe(true);
@@ -951,7 +951,7 @@ test("permission coverage matches exact, wildcard, and all-host grants", () => {
   ).toBe(false);
   expect(
     permissionPatternCoversOrigin(
-      "http://une.primo.exlibrisgroup.com/*",
+      "http://example.primo.exlibrisgroup.com/*",
       origin,
     ),
   ).toBe(false);
@@ -982,10 +982,10 @@ test("a resolver grant with no auth-pending demand performs no page read", async
 
 test("a wildcard grant covers an exact configured resolver", async () => {
   const h = makeHarness(4, undefined, {
-    latestOpenURL: "https://une.primo.exlibrisgroup.com/openurl",
-    knownOrigins: ["https://une.primo.exlibrisgroup.com"],
+    latestOpenURL: "https://example.primo.exlibrisgroup.com/openurl",
+    knownOrigins: ["https://example.primo.exlibrisgroup.com"],
     grantedOrigins: ["https://*.primo.exlibrisgroup.com/*"],
-    demandOrigins: ["https://une.primo.exlibrisgroup.com"],
+    demandOrigins: ["https://example.primo.exlibrisgroup.com"],
   });
   h.configuredReady.value = true;
   await h.manager.init();

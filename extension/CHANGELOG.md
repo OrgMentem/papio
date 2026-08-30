@@ -84,6 +84,84 @@ for the full pre-split extension history.
   signing in changes.
 
 ### Fixed
+
+- **Signing in now counts, even when it took you a few minutes.** *papio* gave
+  itself twenty seconds to read the page after a sign-in returned, then stopped
+  without a verdict. A real sign-in takes minutes, and the browser usually stops
+  the extension worker before the researcher finishes. One measured sign-in took
+  four minutes 28 seconds and produced no entitlement evidence. *papio* now
+  writes a marker only when it routes the exact federated login, then re-reads
+  waiting pages on the one-minute wake that survives a worker restart. It checks
+  at most three least-recently-checked pages per wake, stops after ten attempts,
+  and never rechecks a paper whose download started. A full browser restart
+  clears the session counters, so daemon re-offer remains the recovery. Before
+  a re-offered job starts a download, *papio* checks the browser's durable
+  download list for an in-progress item with that job's filename. This blocks a
+  browser download from starting twice.
+
+- **A dead sign-in page no longer holds your whole library queue.** When a
+  sign-in tab reaches a page that cannot be completed — your identity
+  provider's "Stale Request" dead end is the common one — the tab is still
+  open, so *papio* treated it as a sign-in still in progress. It pointed every
+  waiting paper at that page, reported "waiting for your sign-in", and renewed
+  your library's one sign-in claim every few minutes. Renewing the claim is
+  what stopped the timers that would otherwise have released it, so the wait
+  had no end: at the measured snapshot, 87 papers required authentication and
+  the oldest open request was 24 days old. *papio* now reads what the tab is
+  showing before claiming a sign-in is under way. A page that cannot finish a
+  sign-in releases the claim and asks you to open the paper again. Your next
+  open builds a **new** sign-in request, which is the only thing a stale one
+  accepts. Reloading the dead page could never have worked. *papio* already
+  knew how to recognise these pages and had never once done so here. It only
+  looked when a page loaded; reusing a tab that was already dead loads nothing.
+
+- **A paper your library does not hold is now named as that, not as a broken
+  publisher page.** Your library's search page offers *Get it for me from other
+  libraries* when it cannot give you the full text. *papio* read that page, found
+  no download link, and reported that the publisher had changed its layout — so
+  the paper was filed as a fault someone needs to repair, and you were never told
+  the plain answer. *papio* now says the library does not hold it. Nothing on the
+  page states this: the same availability wording appears on records the library
+  *does* hold, so the only difference is the missing link, and *papio* waits for
+  the whole page before drawing that conclusion. *papio* also waits three times
+  as long as before for that page to finish drawing. Eight of ten pages measured
+  had not drawn at all when *papio* read them, and an undrawn page is now
+  reported as *papio* not being able to tell, rather than as the publisher's
+  fault.
+
+- **Provider error pages no longer look like adapter breakage.** A ScienceDirect
+  500 page and two Cochrane 404 pages were recorded as changed provider layouts.
+  *papio* now requires the provider's exact error title and matching failure
+  sentence, reloads up to three times, then leaves the existing action parked.
+  It never files the transport page as adapter drift. An article merely titled
+  “Internal Server Error” does not match.
+
+- **Sign-in pages no longer enter diagnostic page captures.** The unknown-page
+  path used to add the current redirect host to its own capture allowlist. A
+  login, identity-provider, SSO, authentication, Shibboleth, or OpenAthens URL is
+  now refused before that self-authorization. Unregistered provider pages remain
+  capturable for adapter work.
+
+- **ScienceDirect articles are recognised again, in both of its page layouts.**
+  *papio* matched the page's **View PDF** control by requiring the link to *end*
+  in `/pdf`. The real link ends in a download key, not a path, so the match
+  failed on the measured pages and *papio* reported them as changed while they
+  had rendered correctly. The saved copies *papio* tests against have those keys
+  removed for privacy, so the old tests passed. *papio* now matches the path
+  within the link. It also recognises a second layout: an entitled subscription
+  article puts the control in the article's own actions area with no access bar
+  at all, and *papio* used to read those fully-rendered pages as broken. Each
+  layout is matched inside its own container, so a recommended article beside it
+  can never be downloaded in its place, and a control that has not finished
+  rendering still refuses to classify.
+- **Pages that need to be on screen are now shown in every handoff layout.**
+  Some publishers, ScienceDirect among them, build their download control only
+  when the page is actually on screen. *papio* knows which providers need this
+  and brings the page forward without taking your focus. That only worked when
+  *papio* used its own separate work window. If you had chosen to group handoff
+  tabs in your current window instead, *papio* did nothing, read the page before
+  it had drawn, and reported the provider as changed. It now brings the tab
+  forward in every layout, and still never takes your foreground.
 - **A Wiley PDF-viewer landing now completes without another click.** A library
   resolver can land directly on Wiley's `/doi/pdfdirect/` file route. Chrome
   renders that route through its built-in PDF viewer, whose page body is empty.

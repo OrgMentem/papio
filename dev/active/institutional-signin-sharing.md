@@ -228,3 +228,353 @@ expired is currently a meaningful distinction the admission path honours in one
 direction only. Answer that before touching the switch, and expect it to
 interact with residual 1 above (a `human` lease that never became entitled has
 no expiry path at all).
+
+## Slice 0 answered from existing events, 2026-08-30 — no instrumentation needed
+
+Slice 0 asked for a per-attempt cause encoding. It did not need one: the
+`browser.provider_outcome` event already carries `outcome`, `adapter_id`,
+`adapter_version` and (since the host-attribution change) `host`, so the four
+causes are separable from the store as it stands. Measured on the operator's
+own store, all time, 212 outcomes:
+
+| outcome | count |
+| --- | --- |
+| `ui_changed` | 172 (81%) |
+| `no_entitlement` | 15 |
+| `cancelled` | 14 |
+| `wrong_work` | 10 |
+| `rate_limited` | 1 |
+| **`article`** | **0** |
+
+Zero `article` verdicts, ever. That is the whole entitlement gap in one row:
+`entitled_landing` is emitted only from `applyVerdict`'s `case "article"`, so a
+corpus with no `article` verdict can never produce entitlement evidence, and
+sibling sharing has nothing to fire on.
+
+`ui_changed` by adapter — 124 rows predate host/adapter attribution, so 48 are
+attributable:
+
+| adapter | `ui_changed` | cause |
+| --- | --- | --- |
+| `sciencedirect` | 20 | **unpainted page** (new, see below) |
+| `primo` | 19 | 1, resolver-terminal |
+| `proquest` | 4 | 1, resolver-terminal |
+| `wiley` | 3 | unpainted or 2, unconfirmed |
+| `jamanetwork` | 1 | unconfirmed |
+| `ebsco` | 1 | 1, resolver-terminal |
+
+So the mix is roughly even between cause 1 (24: the landing stops at the
+resolver or a database and never reaches an article) and a cause the plan's
+taxonomy does not contain.
+
+### The fifth cause: classify ran against a document that never painted
+
+This is NOT cause 2. The selectors are correct; the page was not rendered.
+Proven three ways on the 0.6.0 drift capture
+(`captures/www.sciencedirect.com/2026-08-27T03:49:34.017086Z-observed.html`):
+
+- 28,349 bytes, against 262 KB for the same article in a visible tab — the
+  ScienceDirect adapter comment records the measured 32 KB unpainted signature
+  (`extension/src/adapters/types.ts:777-780`).
+- Its only `a.accessbar-utility-link` carries **no `href` attribute at all** and
+  `aria-disabled="true"`.
+- `bun run tools/adapter-try.ts <capture> --id sciencedirect --expect article`
+  reports `no rule matched`, with `meta[name='citation_title']` HIT and both
+  `any` href selectors MISS.
+
+`requiresVisible` + `revealForHydration`
+(`extension/src/background.ts:revealForHydration`) exist for exactly this and did not
+prevent it. Three candidate causes were considered; the first is now fixed, the
+second is ruled out, the third is still open.
+
+**Fixed — the reveal was inert outside work-window mode.**
+`revealForHydration` returned early whenever `this.store.workWindowID` was
+undefined, but `requiresVisible` is a property of the ADAPTER, not of the
+surface. `in-window` and `tab-group` mode have no work window, so the reveal
+did nothing at all in either, and tab-group is the worse case: the handoff tab
+is created inactive inside a COLLAPSED papio group
+(`test/background.test.ts` pins `{ url: OPENURL, active: false }` plus
+`collapsed: true`), so the document is even less likely to render than in a
+minimized window. The window half is now conditional and the tab half — the
+half that actually makes a page paint — always runs. Pinned by
+`"a visible-required adapter is revealed in tab-group mode too"`; restoring the
+early bail fails exactly that one test and nothing else, so the work-window
+path is provably unchanged.
+
+**Ruled out — the reused-window tab being created inactive.** It is created
+`active: false` (`extension/src/background.ts:6105`), but the reveal cycle
+recovers it in one extra load. The test `"a resolver-routed landing on a
+visible-required adapter reloads instead of drifting"` pins that recovery,
+including the background-tab return. Not the cause.
+
+**Still open — whether a `normal` but unfocused window paints at all.** Every
+measurement in the spec comment that produced 262 KB was a genuinely visible
+tab. If an unfocused work window does not hydrate this SPA, no reveal cycle can
+fix it and `requiresVisible` needs a different contract. This needs the
+operator's own authenticated browser: a scratch profile is not a valid
+instrument — measured 2026-08-30, a fresh unauthenticated profile never
+rendered the access bar in any of the three window states inside 30s, so it
+cannot discriminate. `papio browser sessions` reported "no browser has
+connected since daemon start", so the measurement was not available.
+
+Ruled out for the 2026-08-27 landing: `job.tab_id` was valid (the claim for
+`binding_9f5f8b514d8418e1d88fcfb477013234` records `tab_id=1421129698`), and
+`access_mode = 'delegated'` in the deployed config, so neither reveal gate
+precondition failed.
+
+**To settle the open item:** with the extension connected, drive one
+ScienceDirect paper in each handoff surface and compare the drift capture's
+byte size against the 28 KB unpainted signature.
+
+### Why a completed sign-in recorded no reusable entitlement, found 2026-08-30
+
+Measured during a live operator sign-in. `browser.auth_returned` was recorded at
+11:05:18Z with `elapsed_ms: 267951`, and `recordAuth` converted the lease from
+`reserved` to `human` (`internal/browser/bridge.go:recordAuth`). Entitlement
+still depends on an applied `entitled_landing`, and
+`admitAutomaticMaterializationCandidates` admits dependents only when the human
+lease also has `entitled_at`
+(`internal/browser/bridge.go:admitAutomaticMaterializationCandidates`,
+`internal/job/claim_observation_apply.go:ApplyClaimObservation`).
+
+The browser never produced that article verdict. Its in-memory classification
+net lasted `8 × 2500 ms = 20 s`, then stopped silently. The only recovery path
+was also gated on the worker-memory `federatedLoginRouted` Set. The measured
+sign-in took 268 s, long enough for MV3 to stop the worker.
+
+The trace after `auth_returned` contains `handoff.opened` at 11:10:24 and
+`browser.job_accept` at 11:10:42. What it does **not** contain is any later
+classification or entitlement evidence before `auth_pending` at 11:13:42.
+
+#### Recovery fix, corrected after review
+
+`recheckUnclassifiedLandings`
+(`extension/src/background.ts:recheckUnclassifiedLandings`) runs from the
+one-minute keepalive wake. Its counters survive a worker restart through
+`storage.session`; a full browser restart clears them
+(`extension/src/state.ts:chromeBackend`). Before any packaged download takes a
+new local latch, `claimDownloadInitiated` queries the browser's durable download
+list for an in-progress item carrying that job's filename, so a browser-resumed
+fetch still blocks a duplicate
+(`extension/src/background.ts:claimDownloadInitiated`).
+
+The review found three defects in the first version, all fixed:
+
+1. `auth_started_ms` was not proof of federated login. Generic non-provider
+   navigation and a drive timeout can set it. `maybeRouteFederatedLogin` now
+   writes `federated_login_routed_ms` before papio navigates the exact federated
+   route, clears it on navigation failure, and `retryFederatedEvidence` accepts
+   only that marker or the live Set
+   (`extension/src/background.ts:maybeRouteFederatedLogin`,
+   `extension/src/background.ts:retryFederatedEvidence`).
+2. The two status arms each took three rows, so one wake could run six probes,
+   the first stuck rows could starve the rest, and no attempt ceiling existed.
+   The sweep now takes three rows total, orders by the persisted last-check
+   time, and stops after ten attempts per job.
+3. The auth-pending arm omitted `download_initiated`. Both selection and
+   `retryFederatedEvidence` now reject an in-flight download.
+
+The same ScienceDirect paper provides the measured reason for a durable wake:
+an unpainted 27,491-byte capture at 11:35 and painted 261,738/261,674-byte
+captures at 12:33, fifty-eight minutes apart. A one-minute recovery closes that
+gap without waiting for another tab event.
+
+### The `ui_changed` bucket conflated distinct failures, found 2026-08-30
+
+Historical snapshots must name their unit. At the commit cutoff, the fortnight
+contained **37 `ui_changed` events across 31 unique jobs**:
+
+| adapter class | unique jobs | events where different |
+| --- | ---: | ---: |
+| `primo` | 14 | 14 |
+| `sciencedirect` | 7 | 11 |
+| `proquest` | 2 | 2 |
+| `wiley` | 3 | 3 |
+| `ebsco` | 1 | 1 |
+| Figshare, no adapter id | 1 | 1 |
+| no host or adapter id | 3 | 5 |
+
+The all-time snapshot was 174 `ui_changed` events. Of those, 117 carried
+adapter version `0.1.0`, had no host field, and came from the earliest
+development build. That historical population must not set current repair
+priority without a version or time filter.
+
+Capture inspection separated four causes:
+
+| class | examples | adapter drift? |
+| --- | --- | --- |
+| provider error page | `Internal Server Error` (ScienceDirect, 22 KB), `Error 404 \| Cochrane Library` ×2 | no |
+| page never rendered | MDPI 439 B ×3, Wiley 305–314 B ×3, Elsevier auth shell 878 B ×2, ScienceDirect 27–31 KB ×4 | no |
+| authentication infrastructure | identity-provider pages | no |
+| genuine coverage gap | IEEE, MDPI, Cochrane, JSTOR, Frontiers, JAMA, Springer, JMIR, Gale, Informit, ClinicalKey, ProQuest, ChemRxiv | yes |
+
+#### Resolver result fixed
+
+Ten retained Primo captures split into three app shells (1.1–5.8 KB), five
+records whose title had not rendered (22.8–29.9 KB), and two painted not-held
+records (53.7/53.8 KB). The source selector appears in none of those ten.
+
+No positive phrase names the not-held state. Against
+`extension/fixtures/primo/success.html`, the availability control and source
+link start at bytes 35,130 and 52,954. They are 17,824 bytes and 26 closing
+containers apart, so they paint independently.
+
+`ClassifyRule.deferUntilDeadline`
+(`extension/src/adapters/types.ts:ClassifyRule`) keeps the not-held rule out of
+every early classification. At the deadline, the earlier article rule wins if
+the source link exists; otherwise the scoped
+`nde-record-availability .available-at-button` marker names
+`no_entitlement`. `primo` is version `0.3.0` with a 15-second settle budget.
+Across the same captures: eight stay `unknown`, two become `no_entitlement`,
+and the held fixture remains `article`.
+
+The serial cost is explicit. At `HANDOFF_DRIVE_LIMIT = 1`, 110 not-held Primo
+records would consume `110 × 15 s = 27m30s` before navigation and cleanup; the
+measured fortnight had 14 such jobs, or 3m30s of settle budget. The 15-second
+value remains because eight of ten captures from the former five-second era
+were still shells. Raising drive concurrency is a separate stabilization gate,
+not something an adapter may do to hide its own render cost.
+
+Both async classifier copies now use the same temporal policy. Article
+readiness remains provisional through the budget; a non-article marker gets the
+existing 50 ms settle window; a deferred rule can classify only at the
+deadline. Tests cover another ready rule, a transient source link, and a source
+link that remains (`extension/src/adapters/types.ts:interpret`,
+`extension/src/plan.ts:planExecution`).
+
+#### Error pages and IdP captures fixed
+
+`assessDrivenPage` recognizes only two measured, two-signal load failures:
+ScienceDirect's exact internal-error title plus its provider failure sentence,
+and Cochrane's 404 title plus its missing-page sentence
+(`extension/src/background.ts:assessDrivenPage`). An article with the title
+“Internal Server Error” and ordinary article text stays normal.
+
+The wire has no compatible provider-load-failure outcome, and the 32 advertised
+feature slots are full. Therefore the extension reloads a detected failure at
+most three times inside the ten-attempt landing budget, then leaves the existing
+action parked. It never records the transport page as `ui_changed`.
+
+`recordUnknown` now reads the live tab before the current host can authorize its
+own first capture. `isAuthenticationURL` rejects login, IdP, SSO, auth,
+Shibboleth and OpenAthens routes, so authentication pages cannot enter
+diagnostic HTML or a `page_capture` frame
+(`extension/src/background.ts:recordUnknown`,
+`extension/src/keepalive.ts:isAuthenticationURL`). Unregistered provider pages
+remain capturable for adapter work.
+
+### The starvation has a named cause, found 2026-08-30
+
+The operator's screen showed a papio-group tab on
+`idp.example.edu/idp/profile/SAML2/Redirect/SSO`, titled
+"Example University Login Service - Stale Request". That page is a
+terminal Shibboleth dead end: the SAML conversation is spent, so no wait and no
+click completes it. Only a fresh request from the resolver entry point can.
+
+Measured on the live store at 10:43 that day, job_74e8e6f245e8048481991e5d25:
+
+| observation | value |
+| --- | --- |
+| `browser.auth_pending` | 10:20:20, then again 10:30:12 |
+| claim phase / tab | `navigated`, tab 1421129965 |
+| claim `lease_until` | renewed to 11:00:12 |
+| auth lease rows in store | exactly 1, state `human`, created 2026-08-13, `entitled_at` empty |
+| open human actions | 118, of which 87 `requires_auth` |
+| oldest open `paywall` action | 2026-08-06 (24 days) |
+| `stale_sso` reports, all time | **0** |
+| `browser.handoff_failed` rows | 34, all `auth_error`, all `login.openathens.net`, all 2026-08-03 |
+
+**Cause.** `openHandoff` -> `openFreshHandoff` ->
+`consultAuthenticationClaim` answers `navigate_existing`.
+`focusClaimOwnerTab` fetched the owner tab twice and treated existence as
+usability (`extension/src/background.ts:focusClaimOwnerTab`). A tab on a
+terminal page therefore passed. `registerHandoffDrive` then asserted
+`auth_pending`, opened the login gate, and reserved the institution's one
+sign-in slot (`extension/src/background.ts:registerHandoffDrive`). Each cycle
+renewed the claim. A renewed claim is neither unbound nor stranded, so the
+normal expiry paths cannot fire
+(`internal/job/institutional_evidence.go:ExpireUnboundAuthenticationEntryLeases`,
+`internal/job/institutional_evidence.go:ExpireStrandedBoundAuthenticationEntryLeases`).
+
+This is the same false claim already measured for an open-access preprint: the
+tab reported `auth_pending` every three minutes for two days and held the slot
+while 22 papers queued.
+
+**Why the existing detector never fired.** `detectAuthFailure` already
+classifies this page `stale_sso`: the path matches `/idp/profile/` and the page
+title contains `stale` (`extension/src/authfail.ts:detectAuthFailure`). Its only
+normal caller needed a `tabs.onUpdated` event
+(`extension/src/background.ts:onTabUpdated`). Reusing a tab that is already
+dead navigates nothing, so no event arrives.
+
+**Fix.** `claimOwnerTabFailedSignIn` classifies the proven-live owner tab from
+the `url` and `title` that `tabs.get` already returned
+(`extension/src/background.ts:claimOwnerTabFailedSignIn`). A recognized failure
+reports the existing `handoff_outcome` frame and parks for engagement instead
+of asserting a sign-in. It reads no page, needs no host permission, and adds no
+wire message.
+
+Recovery is deliberately not attempted in that branch. It is reachable only
+when the job has no retained offer URL; a retained-URL job follows the legacy
+path instead (`extension/src/background.ts:openHandoff`). `engagement_required`
+is the recovery: the operator's next open mints a fresh route.
+
+**Known sibling case:** `focus_owner` parks one job behind another job's claim.
+Reporting the owner's dead page under the waiting job would attribute the
+failure to the wrong paper. The owner's own next consult clears it.
+
+### A second ScienceDirect layout, found 2026-08-30
+
+Classifying every capture on disk against the repaired rule exposed a shape no
+fixture covered. `2026-08-24T12:33:45Z-success` (261 KB, entitled subscription
+article pii/S0747563216303168, control `aria-disabled="false"`,
+href=`<pii>/pdfft`) contains **no `.accessbar` container and no `.ViewPDF` at
+all** — the enabled control lives in
+`div.content-details-actions > div.content-actions`. Both committed fixtures were
+the access-bar layout, so an access-bar-only rule read a fully-rendered entitled
+page as a changed provider, and that is the layout an entitled institutional
+route lands on.
+
+Now committed as `extension/fixtures/sciencedirect/subscription.html` with a
+second scoped selector. Whether the layout is current or superseded is NOT
+established: it is one observed sample and the three later captures are all
+access-bar. Both rules are kept because each admits exactly one anchor and each
+fails closed on every other fixture.
+
+Verified classification across every sample on disk, adapter 0.8.0:
+
+| sample | verdict |
+| --- | --- |
+| `fixtures/.../success.html` (access bar) | `article` |
+| `fixtures/.../open-access.html` (access bar) | `article` |
+| `fixtures/.../subscription.html` (no access bar) | `article` |
+| `fixtures/.../no-entitlement.html` | `no_entitlement` |
+| `captures/...2026-08-27T03:49:34Z-observed` (28 KB, unpainted) | `unknown` |
+
+### Live cost of this one cause
+
+`job_272d01737a12bbb6a68958eab1` (`doi:10.1016/j.sbspro.2011.10.099`): created
+2026-08-23, five `challenge_blocked` errors, quiesced once on
+`fruitless_drive_limit`, re-driven across adapter 0.4.0 → 0.5.0 → 0.6.0,
+drifted four times, and received 29 `action.reminder` events. It was still
+`awaiting_human` on 2026-08-30: one paper, six days, three adapter releases, no
+artifact.
+
+### Correction to "Live after the review fixes, 2026-08-21" above
+
+That section's defect — the admission switch having no `expired` case — **is
+fixed and shipped.** `internal/browser/bridge.go:11435` now carries
+`case lease.State == job.AuthenticationEntryLeaseExpired &&
+b.retiredSlotIsCold(lease)`, and `retiredSlotIsCold`
+(`internal/browser/bridge.go:11506-11531`) answers the design question that section posed: a
+retired row is free once it is older than `AuthenticationEntryBindDeadline`
+(2 minutes, `internal/job/institutional_evidence.go:1017`), age being the only
+honest discriminator. Residual 1's bound-lease immortality is also addressed,
+by `StrandedBoundEntryGrace`
+(`internal/job/institutional_evidence.go:1773`, used at
+`internal/job/institutional_evidence.go:1800`).
+
+Live confirmation, 2026-08-30: `authentication_entry_leases` holds exactly one
+row, `expired`, last updated 2026-08-28 — two days old, therefore cold and
+admissible. **No lease is blocking anything.** Leave those paragraphs in place
+as history, but do not treat them as the live defect.

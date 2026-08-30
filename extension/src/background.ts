@@ -215,6 +215,16 @@ const CHALLENGE_COOLDOWN_MS = 10 * 60_000;
  * arrive, and each probe is a scripting call into a live tab — so the sweep is
  * bounded rather than proportional to the backlog. */
 const CHALLENGE_RECHECK_LIMIT = 3;
+/** Landing rechecks per keepalive wake, across every eligible state. Each pass
+ * costs one tabs.get plus one scripting probe. Least-recently-checked jobs run
+ * first, so a stuck row cannot starve the rest of the queue. */
+const LANDING_RECHECK_LIMIT = 3;
+/** Ten one-minute wake attempts cover twice the measured 4.5-minute sign-in
+ * while preventing a finished page from being scripted forever. */
+const MAX_LANDING_RECHECK_ATTEMPTS = 10;
+/** A provider-authored 500/404 often clears on reload. Three immediate retries
+ * fit inside the ten-attempt landing budget without looping a failing host. */
+const PROVIDER_LOAD_FAILURE_RELOAD_LIMIT = 3;
 /** How long a Cloudflare-style check must PERSIST before papio turns it into a
  * human ask. Cloudflare's managed challenge resolves itself in a few seconds
  * with no human action, and it publishes "Just a moment..." as a title-only
@@ -874,7 +884,11 @@ export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
   return spec?.requiresVisible === true;
 }
 
-export type DrivenPageAssessmentKind = "normal" | "challenge" | "redirect_loop";
+export type DrivenPageAssessmentKind =
+  | "normal"
+  | "challenge"
+  | "redirect_loop"
+  | "load_failure";
 export interface DrivenPageAssessment {
   kind: DrivenPageAssessmentKind;
 }
@@ -994,6 +1008,21 @@ export function assessDrivenPage(
     );
   if ((!openAthensHost && genericLoop) || openAthensLoop)
     return { kind: "redirect_loop" };
+  // Two independent page-authored signals are required. An article can have a
+  // title about server errors; a transport error also carries the provider's
+  // own failure sentence. These pairs come from retained live captures:
+  // ScienceDirect 2026-08-30 and Cochrane 2026-08-24.
+  const serverFailure =
+    /^(?:500\s+)?internal server error$/i.test(title) &&
+    /hit a problem processing your request|server encountered an internal error|error code:\s*[a-z0-9-]+/i.test(
+      text,
+    );
+  const notFound =
+    /\b(?:error\s*)?404\b/i.test(title) &&
+    /\b(?:the page you requested does not appear to be here|page not found)\b/i.test(
+      text,
+    );
+  if (serverFailure || notFound) return { kind: "load_failure" };
   return { kind: "normal" };
 }
 
@@ -6111,10 +6140,15 @@ export class Bridge {
     return tabID;
   }
 
-  /** Reveal the work window for an adapter whose SPA cannot paint while hidden,
-   * then reload so the page loads in a visible context. Answers whether the
-   * reload was issued; the reload's own completion re-enters classification, so
-   * this deliberately does not wait for the load.
+  /** Make a `requiresVisible` adapter's tab paint: restore the work window if
+   * there is one, activate the tab, then reload so the page loads in a visible
+   * context. Answers whether the reload was issued; the reload's own completion
+   * re-enters classification, so this deliberately does not wait for the load.
+   *
+   * The window half is conditional and the tab half is not — see the comment on
+   * the guard below. `in-window` and `tab-group` mode have no work window, and
+   * this used to return early in both, which made `requiresVisible` inert
+   * wherever the operator had not kept the default surface.
    *
    * Restoring the window is necessary but not sufficient once another paper
    * becomes its active tab. Measured 2026-08-26 after the first ScienceDirect
@@ -6141,19 +6175,29 @@ export class Bridge {
     tabID: number,
   ): Promise<boolean> {
     if (!needsVisibleWindow(spec)) return false;
+    let changed = false;
     const windowID = this.store.workWindowID;
     const windows = this.deps.windows;
-    if (windowID === undefined || windows === undefined) return false;
-    let changed = false;
-    try {
-      const win = await windows.get(windowID);
-      if (win.state === "minimized") {
-        await windows.update(windowID, { focused: false, state: "normal" });
-        changed = true;
+    // The work window is one surface mode of three. `requiresVisible` is a
+    // property of the ADAPTER, so the tab half below — the half that actually
+    // makes a document paint — must run in `in-window` and `tab-group` mode
+    // too, where there is no work window to restore. Bailing here made
+    // `requiresVisible` silently inert in both, and tab-group mode is the
+    // worse of the two: the handoff tab is created inactive inside a
+    // COLLAPSED papio group, so the page is even less likely to render than
+    // in a minimized window, and the drift it reports is indistinguishable
+    // from a real adapter break.
+    if (windowID !== undefined && windows !== undefined) {
+      try {
+        const win = await windows.get(windowID);
+        if (win.state === "minimized") {
+          await windows.update(windowID, { focused: false, state: "normal" });
+          changed = true;
+        }
+      } catch {
+        // The handoff continues assisted if the dedicated window disappeared.
+        return false;
       }
-    } catch {
-      // The handoff continues assisted if the dedicated window disappeared.
-      return false;
     }
     try {
       const tab = await this.deps.tabs.get(tabID);
@@ -8276,6 +8320,17 @@ export class Bridge {
               "The claimed sign-in surface is no longer live",
             );
           }
+          // Existence is not usability. A tab on a terminal identity-provider
+          // page is live and focusable, and `auth_pending` below would reserve
+          // the institution's one sign-in slot against it — so ask what the tab
+          // shows before making that claim, not after.
+          if (await this.claimOwnerTabFailedSignIn(jobID, ownerTabHint)) {
+            await this.parkForEngagement(jobID);
+            return failure(
+              "handoff_unavailable",
+              "The claimed sign-in surface is on a failed sign-in page",
+            );
+          }
           await this.update((s) =>
             patchJob(s, jobID, {
               tab_id: ownerTabHint,
@@ -9156,6 +9211,78 @@ export class Bridge {
       } catch {
         // A closed work window is handled by the normal tab-removal path.
       }
+    }
+    return true;
+  }
+
+  /**
+   * Ask what a proven-live claim-owner tab is actually SHOWING before a job
+   * asserts a sign-in is in progress behind it.
+   *
+   * `focusClaimOwnerTab` proves the tab exists and focuses it. Existence was
+   * the whole test, so a tab parked on a terminal identity-provider dead end
+   * passed it, and `auth_pending` followed. That assertion is not cosmetic:
+   * per `registerHandoffDrive`, it records auth-return profile evidence, opens
+   * a HumanGateLogin, and RESERVES the institution's one sign-in slot — so
+   * claiming it against a dead page is the same false claim already fixed for
+   * a spent drive, one branch over.
+   *
+   * Measured on the operator's own store 2026-08-30, job_74e8e6f2:
+   * `auth_pending` at 10:20:20 and again at 10:30:12, the claim lease renewed
+   * to 11:00, the tab on `idp.example.edu/idp/profile/SAML2/Redirect/SSO`
+   * titled "… Login Service - Stale Request" throughout. Because each cycle
+   * renews the claim, the unbound (2m) and stranded (30m) sweeps never fire:
+   * the starvation has no horizon. 87 auth-blocked actions behind it, the
+   * oldest 24 days.
+   *
+   * `detectAuthFailure` already recognizes that page, and `onTabUpdated`
+   * already reports it — but only from a `tabs.onUpdated` event. Focusing an
+   * already-dead tab navigates nothing, so no event fires, and the one path
+   * that meets the dead page on every cycle was the one that never consulted
+   * the detector. That is why `stale_sso` had never been reported once in 27
+   * days while the page sat on screen.
+   *
+   * The observation is free: `tabs.get` already returns `url` and `title`, and
+   * both were being discarded. No page read, no host permission, no new wire
+   * message.
+   *
+   * Recovery is deliberately NOT attempted here. This branch is reachable only
+   * from `openFreshHandoff`, which is reached only when the job has no
+   * retained offer URL (`openHandoff` sends a retained-URL job down the legacy
+   * path instead), and `redriveStaleHandoff` requires exactly that URL — so a
+   * redrive from here could never fire. Parking for engagement is the honest
+   * outcome and is also the recovery: an engagement-required job with no
+   * retained URL mints a FRESH route on the operator's next open, which is
+   * what a stale SAML conversation needs. Reloading the dead URL stays dead.
+   */
+  private async claimOwnerTabFailedSignIn(
+    jobID: string,
+    ownerTabHint: number,
+  ): Promise<boolean> {
+    let tab: TabInfo;
+    try {
+      tab = await this.deps.tabs.get(ownerTabHint);
+    } catch {
+      return false;
+    }
+    if (tab.url === undefined) return false;
+    const outcome = detectAuthFailure(tab.url, tab.title);
+    if (outcome === undefined) return false;
+    let host: string;
+    try {
+      host = new URL(tab.url).hostname;
+    } catch {
+      return false;
+    }
+    // Report both recognized outcomes. A stale request and an `auth_error` are
+    // equally unable to complete a sign-in, so both must stop the assertion;
+    // they differ only in whether papio could ever navigate away from them,
+    // and this path navigates nothing either way.
+    if (
+      !this.handoffOutcomeSent.has(`${jobID}:${outcome}`) &&
+      this.send("handoff_outcome", { outcome, final_host: host }, jobID)
+    ) {
+      this.handoffOutcomeSent.add(`${jobID}:${outcome}`);
     }
     return true;
   }
@@ -13617,6 +13744,83 @@ export class Bridge {
     }
   }
 
+  /** Re-read a landed tab that papio stopped classifying without a verdict.
+   *
+   * `maybeClassify`'s in-memory retry net lasts twenty seconds. Real sign-ins
+   * take minutes, so the one-minute keepalive alarm provides the wake that
+   * survives an MV3 worker restart. The active job store uses storage.session:
+   * this recovery survives worker restarts, not a full browser restart.
+   *
+   * The sweep is bounded in three dimensions. It claims at most three jobs per
+   * wake across both statuses, chooses the least recently checked jobs first,
+   * and gives each job ten attempts. The durable download latch excludes every
+   * path whose fetch already started.
+   *
+   * The auth-pending arm accepts only a persisted marker written when papio
+   * itself routed this job through a federated-login entry. auth_started_ms is
+   * broader: ordinary non-provider navigation and a drive timeout can set it,
+   * so it is not proof that a federated login occurred.
+   */
+  private async recheckUnclassifiedLandings(): Promise<void> {
+    const candidates = this.store.activeJobs
+      .filter(
+        (job) =>
+          job.download_initiated !== true &&
+          job.challenge_blocked !== true &&
+          job.tab_id >= 0 &&
+          (job.landing_recheck_count ?? 0) <
+            MAX_LANDING_RECHECK_ATTEMPTS &&
+          (job.status === "awaiting_download" ||
+            (job.status === "auth_pending" &&
+              job.federated_login_routed_ms !== undefined)),
+      )
+      .sort((left, right) => {
+        const checked =
+          (left.landing_rechecked_ms ?? 0) -
+          (right.landing_rechecked_ms ?? 0);
+        if (checked !== 0) return checked;
+        if (left.job_id < right.job_id) return -1;
+        return left.job_id === right.job_id ? 0 : 1;
+      })
+      .slice(0, LANDING_RECHECK_LIMIT);
+
+    for (const candidate of candidates) {
+      let claimedStatus: ActiveJob["status"] | undefined;
+      const checkedAt = this.deps.now();
+      await this.update((store) => {
+        const current = findByJob(store, candidate.job_id);
+        if (
+          current === undefined ||
+          current.download_initiated === true ||
+          current.challenge_blocked === true ||
+          current.tab_id < 0 ||
+          (current.landing_recheck_count ?? 0) >=
+            MAX_LANDING_RECHECK_ATTEMPTS ||
+          !(
+            current.status === "awaiting_download" ||
+            (current.status === "auth_pending" &&
+              current.federated_login_routed_ms !== undefined)
+          )
+        )
+          return store;
+        claimedStatus = current.status;
+        return patchJob(store, current.job_id, {
+          landing_recheck_count:
+            (current.landing_recheck_count ?? 0) + 1,
+          landing_rechecked_ms: checkedAt,
+        });
+      });
+      if (claimedStatus === "awaiting_download") {
+        await this.reclassifyCurrentProviderPage(candidate.job_id);
+      } else if (claimedStatus === "auth_pending") {
+        await this.retryFederatedEvidence(candidate.job_id, {
+          kind: "federated_evidence",
+          attempts: 0,
+        });
+      }
+    }
+  }
+
   private async runKeepaliveAlarm(): Promise<void> {
     await this.ready;
     // Recovery runs FIRST and unconditionally on this wake, independent of
@@ -13673,6 +13877,12 @@ export class Bridge {
     // a tabs.get per record, and nothing here depends on its result.
     void this.reconcileOwnedTabsIfDue().catch((e: unknown) => {
       console.error("papio: owned-tab reconcile failed", e);
+    });
+    // A landing whose twenty-second classify net expired has no other trigger
+    // left; see recheckUnclassifiedLandings. Same wake, same not-awaited
+    // reason as the two passes above.
+    void this.recheckUnclassifiedLandings().catch((e: unknown) => {
+      console.error("papio: landing recheck failed", e);
     });
     if (
       this.hasCurrentHello() &&
@@ -13849,10 +14059,23 @@ export class Bridge {
     if (signInBlockersChanged) await this.syncConnectionBadge();
   }
   /** Reserve a job's download initiation at the state reducer boundary.
-   * Classification may have crossed several awaits before reaching this
-   * point; the synchronous transform is the per-job CAS that makes the
-   * already-authorized decision single-use without serializing other jobs. */
+   * First consult the browser's durable download list: storage.session is
+   * cleared by a full browser restart, but an in-progress Chrome download can
+   * resume. Its job-scoped filename must block a second fetch before the local
+   * CAS runs. */
   private async claimDownloadInitiated(jobID: string): Promise<boolean> {
+    let browserItems: DownloadItemLike[];
+    try {
+      browserItems = await this.deps.downloads.search({
+        filename: jobDownloadFilename(jobID),
+        limit: 10,
+      });
+    } catch {
+      // A failed duplicate check cannot authorize another download.
+      return false;
+    }
+    if (browserItems.some((item) => item.state === "in_progress"))
+      return false;
     let claimed = false;
     await this.update((store) => {
       const current = findByJob(store, jobID);
@@ -17558,6 +17781,38 @@ export class Bridge {
     await this.retainContentSurface(tabID, undefined);
   }
 
+  /** A provider-authored 500/404 page is a failed load, not adapter drift.
+   * There is no compatible wire outcome for this state, so retry locally within
+   * the durable landing budget and leave the existing action parked after the
+   * third failure. Never turn a transport page into provider drift. */
+  private async retryProviderLoadFailure(job: ActiveJob): Promise<void> {
+    let claimed = false;
+    await this.update((store) => {
+      const current = findByJob(store, job.job_id);
+      if (
+        current === undefined ||
+        current.download_initiated === true ||
+        current.tab_id < 0 ||
+        (current.landing_recheck_count ?? 0) >=
+          PROVIDER_LOAD_FAILURE_RELOAD_LIMIT
+      )
+        return store;
+      claimed = true;
+      return patchJob(store, current.job_id, {
+        landing_recheck_count:
+          (current.landing_recheck_count ?? 0) + 1,
+        landing_rechecked_ms: this.deps.now(),
+      });
+    });
+    if (!claimed) return;
+    try {
+      await this.deps.tabs.reload(job.tab_id);
+    } catch {
+      // The tab closed between assessment and reload. Its normal removal path
+      // owns recovery; do not replace it with a false provider outcome.
+    }
+  }
+
   /** Run the bounded DOM probe for a tracked page and preserve the existing
    * challenge-blocked contract. The boolean argument is origin evidence for
    * OpenAthens-only body markers; page text never leaves the injected function. */
@@ -17573,6 +17828,10 @@ export class Bridge {
         args: [null, host === OPENATHENS_LOGIN_HOST],
       });
       const assessment = results[0]?.result as DrivenPageAssessment | undefined;
+      if (assessment?.kind === "load_failure") {
+        await this.retryProviderLoadFailure(job);
+        return true;
+      }
       if (
         assessment?.kind === "challenge" ||
         assessment?.kind === "redirect_loop"
@@ -18798,6 +19057,7 @@ export class Bridge {
       if (
         result?.kind === "challenge" ||
         result?.kind === "redirect_loop" ||
+        result?.kind === "load_failure" ||
         result?.kind === "normal"
       ) {
         assessmentKind = result.kind;
@@ -18807,6 +19067,10 @@ export class Bridge {
         "papio: driven-page assessment failed; classifying normally",
         e,
       );
+    }
+    if (assessmentKind === "load_failure") {
+      await this.retryProviderLoadFailure(currentJob);
+      return undefined;
     }
     if (assessmentKind === "challenge" || assessmentKind === "redirect_loop") {
       await this.confirmThenBlockChallenge(
@@ -19038,7 +19302,11 @@ export class Bridge {
     const template = spec.federatedLogin;
     const entityID = this.loginEntityIDs.get(jobID);
     if (template === undefined || entityID === undefined) return;
-    if (this.federatedLoginRouted.has(jobID)) return;
+    if (
+      this.federatedLoginRouted.has(jobID) ||
+      job.federated_login_routed_ms !== undefined
+    )
+      return;
     if (this.deps.tabs.update === undefined) return;
     const url = template.replace("{entityID}", encodeURIComponent(entityID));
     if (!url.startsWith("https://")) return;
@@ -19051,11 +19319,22 @@ export class Bridge {
     this.federatedLoginOperatorNavigated.delete(jobID);
     this.federatedLoginRouteSettled.delete(jobID);
     this.federatedLoginRouteEvents.set(jobID, { url, loadingSeen: false });
+    const routedAt = this.deps.now();
+    await this.update((store) =>
+      patchJob(store, jobID, {
+        federated_login_routed_ms: routedAt,
+      }),
+    );
     try {
       await this.deps.tabs.update(job.tab_id, { url });
     } catch (e) {
       // Let a later classify retry route again if this navigation failed.
       this.federatedLoginRouted.delete(jobID);
+      await this.update((store) =>
+        patchJob(store, jobID, {
+          federated_login_routed_ms: undefined,
+        }),
+      );
     }
   }
 
@@ -19135,10 +19414,19 @@ export class Bridge {
     expected: ClassifyRetry,
   ): Promise<void> {
     const job = findByJob(this.store, jobID);
+    // `federatedLoginRouted` is worker memory. A real institutional sign-in
+    // outlives the worker, so maybeRouteFederatedLogin also writes the exact,
+    // session-persisted federated_login_routed_ms marker. auth_started_ms is
+    // deliberately insufficient: generic non-provider navigation and a drive
+    // timeout can set it for a job papio never routed through federated login.
     if (
       !job ||
       job.status !== "auth_pending" ||
-      !this.federatedLoginRouted.has(jobID) ||
+      !(
+        this.federatedLoginRouted.has(jobID) ||
+        job.federated_login_routed_ms !== undefined
+      ) ||
+      job.download_initiated === true ||
       job.tab_id < 0
     ) {
       this.classifyRetries.delete(jobID);
@@ -19222,6 +19510,21 @@ export class Bridge {
     adapter?: AdapterSpec,
     deferTerminal = false,
   ): Promise<boolean> {
+    // An unregistered provider may authorize its own first diagnostic below,
+    // but an authentication redirect may not. IdP pages can contain names,
+    // institution ids and one-use SAML state, and none of that helps an adapter.
+    // Check the live URL before the current-host self-authorization is built.
+    let currentTab: TabInfo;
+    try {
+      currentTab = await this.deps.tabs.get(job.tab_id);
+    } catch {
+      return false;
+    }
+    if (
+      currentTab.url === undefined ||
+      isAuthenticationURL(currentTab.url)
+    )
+      return false;
     let captured = false;
     const captureStorage = this.deps.captureStorage;
     if (captureStorage !== undefined && this.pageCaptureAvailable()) {

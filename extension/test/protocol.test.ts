@@ -625,9 +625,9 @@ test("provider_outcome.host is optional, sanitized, and rejects the dot shapes",
   }
   expect(
     parseBrowserMessage(
-      frame({ outcome: "ui_changed", host: "une.primo.exlibrisgroup.com" }),
+      frame({ outcome: "ui_changed", host: "example.primo.exlibrisgroup.com" }),
     ).payload["host"],
-  ).toBe("une.primo.exlibrisgroup.com");
+  ).toBe("example.primo.exlibrisgroup.com");
   // Optional: an older extension omits it and the frame still parses.
   expect(
     parseBrowserMessage(frame({ outcome: "ui_changed" })).payload["host"],

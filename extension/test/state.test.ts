@@ -361,6 +361,9 @@ test("migration preserves safe identity, download, lease, daemon, origin, and UI
         status: "awaiting_download",
         tab_id: 999,
         needs_terms_consent: true,
+        federated_login_routed_ms: 1_700_000_000_000,
+        landing_recheck_count: 4,
+        landing_rechecked_ms: 1_700_000_060_000,
         drive_epoch: {
           drive_attempt_id: "attempt-1",
           ordinal: 2,
@@ -402,6 +405,11 @@ test("migration preserves safe identity, download, lease, daemon, origin, and UI
     status: "awaiting_download",
   });
   expect(migrated.activeJobs[0]?.needs_terms_consent).toBe(true);
+  expect(migrated.activeJobs[0]).toMatchObject({
+    federated_login_routed_ms: 1_700_000_000_000,
+    landing_recheck_count: 4,
+    landing_rechecked_ms: 1_700_000_060_000,
+  });
   expect(migrated.pendingDelivery).toMatchObject({
     job_id: "job_migrate_0001",
     initiated_at: 9,

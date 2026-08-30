@@ -2432,7 +2432,7 @@ test("renders independent multi-origin session rows and targets each sign-in ori
 });
 
 test("the session blocker requests only its own resolver grant", async () => {
-  const origin = "https://une.primo.exlibrisgroup.com";
+  const origin = "https://example.primo.exlibrisgroup.com";
   const doc = popupDocument();
   const grants: string[] = [];
   renderInstitutionSession(
@@ -2469,7 +2469,7 @@ test("the session blocker requests only its own resolver grant", async () => {
   const status = doc.getElementById("institution-session-status");
   expect(button.textContent).toBe("Allow");
   expect(button.getAttribute("aria-label")).toBe(
-    "Allow papio to check une.primo.exlibrisgroup.com",
+    "Allow papio to check example.primo.exlibrisgroup.com",
   );
   expect(status?.getAttribute("role")).toBe("status");
   expect(status?.getAttribute("aria-live")).toBe("polite");
@@ -2479,7 +2479,7 @@ test("the session blocker requests only its own resolver grant", async () => {
 });
 
 test("the default session grant action calls the browser permission API in the click", async () => {
-  const origin = "https://une.primo.exlibrisgroup.com";
+  const origin = "https://example.primo.exlibrisgroup.com";
   const originalChrome = globalThis.chrome;
   const requested: unknown[] = [];
   Object.assign(globalThis, {

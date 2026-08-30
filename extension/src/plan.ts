@@ -372,7 +372,9 @@ export function planExecution(
   const boundedMs = doc === null ? Math.max(0, Math.min(spec.settleTimeoutMs ?? 0, 15000)) : 0;
   const pageHref = root.location?.href ?? "https://fixture.local/";
 
-  const classify = (): { verdict: PageVerdict; decisiveRule: string | null } => {
+  const classify = (
+    allowDeferred: boolean,
+  ): { verdict: PageVerdict; decisiveRule: string | null } => {
     const evidence: string[] = [];
     const adapter_id = spec.id;
     const adapter_version = spec.version;
@@ -382,6 +384,7 @@ export function planExecution(
       const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
       const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
       if (!hasAll && !hasAny && !hasText) continue;
+      if (rule.deferUntilDeadline === true && !allowDeferred) continue;
 
       if (hasAll) {
         let ok = true;
@@ -646,8 +649,8 @@ export function planExecution(
       return null;
     }
   };
-    const buildPlan = (): PlanResult => {
-    const classified = classify();
+  const buildPlan = (allowDeferred: boolean): PlanResult => {
+    const classified = classify(allowDeferred);
     const page = (() => {
       try {
         return new URL(pageHref);
@@ -979,6 +982,7 @@ export function planExecution(
       const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
       const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
       if (!hasAll && !hasAny && !hasText) continue;
+      if (rule.deferUntilDeadline === true) continue;
       let allReady = true;
       if (hasAll) {
         for (const selector of rule.all as string[]) {
@@ -1036,52 +1040,57 @@ export function planExecution(
     }
     return null;
   };
-  if (boundedMs === 0 || root.documentElement === null) return buildPlan();
+  if (boundedMs === 0 || root.documentElement === null) return buildPlan(true);
 
-  return new Promise<PlanResult>((resolve) => {
-    let settled = false;
-    let observer: MutationObserver | null = null;
-    let timer: number | undefined;
-    let readyTimer: number | undefined;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      observer?.disconnect();
-      if (timer !== undefined) clearTimeout(timer);
-      if (readyTimer !== undefined) clearTimeout(readyTimer);
-      resolve(buildPlan());
-    };
-    const settleWindowMs = Math.min(50, boundedMs);
-    const scheduleWhenReady = (): void => {
-      const readyKind = selectorsReady();
-      if (readyKind === null) {
-        if (readyTimer !== undefined) {
-          clearTimeout(readyTimer);
-          readyTimer = undefined;
-        }
-        return;
+  const deferred = Promise.withResolvers<PlanResult>();
+  let settled = false;
+  let observer: MutationObserver | null = null;
+  let timer: number | undefined;
+  let readyTimer: number | undefined;
+  const finish = (allowDeferred: boolean): void => {
+    if (settled) return;
+    settled = true;
+    observer?.disconnect();
+    clearTimeout(timer);
+    clearTimeout(readyTimer);
+    deferred.resolve(buildPlan(allowDeferred));
+  };
+  const settleWindowMs = Math.min(50, boundedMs);
+  const scheduleWhenReady = (): void => {
+    const readyKind = selectorsReady();
+    // Article readiness is provisional for the full bounded settle period:
+    // earlier login/terms rules may hydrate after the article controls.
+    if (readyKind === null || readyKind === "article") {
+      if (readyTimer !== undefined) {
+        clearTimeout(readyTimer);
+        readyTimer = undefined;
       }
-      // Article readiness is provisional for the full bounded settle period:
-      // earlier login/terms rules may hydrate after the article controls.
-      if (readyKind === "article") {
-        if (readyTimer !== undefined) {
-          clearTimeout(readyTimer);
-          readyTimer = undefined;
-        }
-        return;
-      }
-      if (readyTimer === undefined) {
-        readyTimer = setTimeout(finish, settleWindowMs) as unknown as number;
-      }
-    };
-    const Observer =
-      root.defaultView?.MutationObserver ??
-      (typeof MutationObserver === "undefined" ? undefined : MutationObserver);
-    if (Observer !== undefined) {
-      observer = new Observer(scheduleWhenReady);
-      observer.observe(root.documentElement as Element, { childList: true, subtree: true, attributes: true });
+      return;
     }
-    timer = setTimeout(finish, boundedMs) as unknown as number;
-    scheduleWhenReady();
-  });
+    if (readyTimer === undefined) {
+      readyTimer = setTimeout(
+        () => finish(false),
+        settleWindowMs,
+      ) as unknown as number;
+    }
+  };
+  const Observer =
+    root.defaultView?.MutationObserver ??
+    (typeof MutationObserver === "undefined"
+      ? undefined
+      : MutationObserver);
+  if (Observer !== undefined) {
+    observer = new Observer(scheduleWhenReady);
+    observer.observe(root.documentElement as Element, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+    });
+  }
+  timer = setTimeout(
+    () => finish(true),
+    boundedMs,
+  ) as unknown as number;
+  scheduleWhenReady();
+  return deferred.promise;
 }

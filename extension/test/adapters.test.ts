@@ -165,7 +165,13 @@ test("interpret waits for late-upgraded custom elements when settleTimeoutMs is 
     clearTimeout: win.clearTimeout.bind(win),
   });
   try {
-    const verdict = interpret(null, jstor as AdapterSpec, ctx());
+    // Article readiness stays provisional through the full budget, matching
+    // the injected planner. Shorten only this test's clock.
+    const liveJSTOR: AdapterSpec = {
+      ...(jstor as AdapterSpec),
+      settleTimeoutMs: 200,
+    };
+    const verdict = interpret(null, liveJSTOR, ctx());
     win.document.body.insertAdjacentHTML(
       "beforeend",
       "<mfe-download-pharos-button data-qa=\"download-pdf\" data-doi=\"10.2307/259290\" data-sc=\"but click:pdf download\" variant=\"primary\"></mfe-download-pharos-button>",
@@ -954,11 +960,14 @@ test.skipIf(sciencedirectPaywall === null)(
     // exact page that reproduced this: ScienceDirect removed `.PurchasePDF`
     // and replaced it with a labelled `/getaccess/pii/.../purchase` anchor.
     expect(page.querySelector("meta[name='citation_pdf_url']")).toBeNull();
-    expect(
-      page.querySelector(
-        ".access-options a.accessbar-utility-link[aria-label='Purchase PDF'][href^='/getaccess/pii/'][href$='/purchase']",
-      ),
-    ).not.toBeNull();
+    // Read the rule's own selector rather than a copy: a hardcoded duplicate
+    // here kept asserting `[href$='/purchase']` after the spec moved to `*=`,
+    // so the test would have gone on passing against a selector the adapter no
+    // longer used.
+    const wall = spec.classify.find((rule) => rule.kind === "no_entitlement");
+    const purchase = (wall?.all ?? []).find((s) => s.includes("/purchase"));
+    expect(purchase).toBeDefined();
+    expect(page.querySelector(purchase as string)).not.toBeNull();
     expect(interpret(page, spec, ctx()).kind).toBe("no_entitlement");
   },
 );
@@ -1029,6 +1038,150 @@ test.skipIf(sciencedirectOpenAccess === null)(
     }
   },
 );
+
+const sciencedirectSubscription = loadFixture("sciencedirect", "subscription");
+test.skipIf(sciencedirectSubscription === null)(
+  "an entitled ScienceDirect page with no access bar still classifies",
+  () => {
+    const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+    const page = sciencedirectSubscription as Document;
+    // Captured 2026-08-24 from an entitled subscription article
+    // (pii/S0747563216303168). This layout has NO `.accessbar` container and no
+    // `.ViewPDF` anywhere: the enabled control sits in the article's own
+    // content-actions region. Every other ScienceDirect fixture is the
+    // access-bar layout, so an access-bar-only rule read this page — 261 KB,
+    // fully rendered, control enabled — as a changed provider.
+    expect(page.querySelectorAll(".accessbar .ViewPDF")).toHaveLength(0);
+    const control = page.querySelector(spec.download?.selector as string);
+    expect(control?.getAttribute("aria-disabled")).toBe("false");
+    expect(control?.getAttribute("href")).toContain("S0747563216303168");
+    expect(interpret(page, spec, ctx()).kind).toBe("article");
+  },
+);
+
+test.skipIf(sciencedirectSubscription === null)(
+  "no-access-bar layout still refuses every recommended sibling",
+  () => {
+    const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+    const page = sciencedirectSubscription as Document;
+    // This page carries many sibling `/pdfft` hrefs. The content-actions scope
+    // is what keeps them unreachable, exactly as `.accessbar .ViewPDF >` does
+    // for the other layout; widening either would file the wrong paper.
+    const siblings = [...page.querySelectorAll("a[href*='/pdf']")].filter(
+      (a) => !(a.getAttribute("href") ?? "").includes("S0747563216303168"),
+    );
+    expect(siblings.length).toBeGreaterThan(0);
+    for (const sibling of siblings) {
+      expect(sibling.matches(spec.download?.selector as string)).toBe(false);
+    }
+  },
+);
+
+test("each ScienceDirect article scope admits at most one control per page", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  const rule = spec.classify.find((r) => r.kind === "article");
+  // Two layouts means two selectors, and the guarantee that makes `*='/pdf'`
+  // safe is per-scope singularity. Assert it on every fixture rather than
+  // trusting that a future third layout keeps the property.
+  for (const name of ["success", "open-access", "subscription", "no-entitlement"]) {
+    const page = loadFixture("sciencedirect", name);
+    if (page === null) continue;
+    for (const selector of rule?.any ?? []) {
+      expect(page.querySelectorAll(selector).length).toBeLessThanOrEqual(1);
+    }
+  }
+});
+
+test("a sibling sharing the control's own class is still out of scope", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  // Today's recommended-article anchors are `anchor anchor-primary`, so the
+  // class alone happens to be sufficient and dropping the container scope
+  // breaks no fixture. That makes the scope defensive but unpinned, which is
+  // how a later widening would pass review: if ScienceDirect ever reuses
+  // `accessbar-utility-link` on a related item, an unscoped rule downloads a
+  // different paper under this citation. Pin the container, not the class.
+  const own = "S0747563216303168";
+  const other = "S0000000000000001";
+  const page = parseHTML(
+    "<html><head><meta name='citation_title' content='A paper'>" +
+      "<meta name='citation_doi' content='10.1016/example'></head><body>" +
+      "<div class='content-details-actions'><div class='content-actions'>" +
+      `<a class='accessbar-utility-link' aria-disabled='false' href='/science/article/pii/${own}/pdfft'>View PDF</a>` +
+      "</div></div>" +
+      "<div class='RelatedContentPanelItem'><div class='buttons'>" +
+      `<a class='accessbar-utility-link' aria-disabled='false' href='/science/article/pii/${other}/pdfft'>View PDF</a>` +
+      "</div></div></body></html>",
+  );
+  const hits = [...page.querySelectorAll(spec.download?.selector as string)];
+  expect(hits).toHaveLength(1);
+  expect(hits[0]?.getAttribute("href")).toContain(own);
+  expect(interpret(page, spec, ctx()).kind).toBe("article");
+});
+
+// Measured live 2026-08-30 in a scratch Chrome against the SAME open-access
+// article the fixture above was captured from (S1877042814012683), fully
+// painted, no institutional session. The access-bar control's real href is
+//   /science/article/pii/S1877042814012683/pdf?md5=<32 hex>&pid=<pii>-main.pdf
+// `sanitizeFixture` strips that query, so the fixture's href ends in `/pdf`
+// and every fixture-backed test above passes while the live page misses:
+// `[href$='/pdf']` cannot survive a query string, and this article's own route
+// is `/pdf`, never `/pdfft`. That divergence is why 20 of the operator's
+// `ui_changed` outcomes came from a page that had rendered perfectly.
+const sdLiveOwnHref =
+  "/science/article/pii/S1877042814012683/pdf" +
+  "?md5=796ece6edaffa7ef8192ecc309b50f9d&pid=1-s2.0-S1877042814012683-main.pdf";
+const sdLiveSiblingHref =
+  "/science/article/pii/S1877042814011513/pdfft" +
+  "?md5=6e6fef30257b3cab8e07b1c9ee1f431b&pid=1-s2.0-S1877042814011513-main.pdf";
+const sciencedirectLivePage = (): Document =>
+  parseHTML(
+    "<html><head><meta name='citation_title' content='A paper'>" +
+      "<meta name='citation_doi' content='10.1016/j.sbspro.2014.01.1251'></head>" +
+      "<body><div class='accessbar-sticky'><div><div class='accessbar'><ul>" +
+      `<li class='ViewPDF'><a class='link-button accessbar-utility-component accessbar-utility-link' target='_blank' aria-label='View PDF. Opens in a new window.' aria-disabled='false' href='${sdLiveOwnHref}'>View PDF</a></li>` +
+      "</ul></div></div></div>" +
+      "<div class='RelatedContentPanelItem u-display-block'><div class='buttons'>" +
+      `<a class='anchor anchor-primary' href='${sdLiveSiblingHref}'>View PDF</a>` +
+      "</div></div></body></html>",
+  );
+
+test("a live ScienceDirect access-bar href carrying its query still classifies", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  expect(interpret(sciencedirectLivePage(), spec, ctx()).kind).toBe("article");
+});
+
+test("the ScienceDirect download control resolves through the query string", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  const control = sciencedirectLivePage().querySelector(
+    spec.download?.selector as string,
+  );
+  // The control, not a recommended sibling: an href-shape fix that widened the
+  // scope would file a different paper under this citation.
+  expect(control?.getAttribute("href")).toBe(sdLiveOwnHref);
+});
+
+test("a recommended sibling's queried /pdfft href is still never the target", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  const page = sciencedirectLivePage();
+  const sibling = page.querySelector(`a[href='${sdLiveSiblingHref}']`);
+  expect(sibling).not.toBeNull();
+  expect(sibling?.matches(spec.download?.selector as string)).toBe(false);
+});
+
+test("an unpainted ScienceDirect access bar refuses to classify as article", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  // The hidden-window signature: the control exists but carries no href and is
+  // disabled. This must stay `unknown` however tolerant the href match becomes,
+  // or `requiresVisible` would stop meaning anything.
+  const page = parseHTML(
+    "<html><head><meta name='citation_title' content='A paper'>" +
+      "<meta name='citation_doi' content='10.1016/example'></head>" +
+      "<body><div class='accessbar'><ul><li class='ViewPDF'>" +
+      "<a class='accessbar-utility-link' aria-label='View PDF. Opens in a new window.' aria-disabled='true'>View PDF</a>" +
+      "</li></ul></div></body></html>",
+  );
+  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+});
 
 test("Taylor and Francis book metadata is outside the journal adapter host scope", () => {
   const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
@@ -2992,3 +3145,229 @@ test.skipIf(hogrefeArticle === null)(
     expect(interpret(article, spec, ctx()).kind).toBe("unknown");
   },
 );
+// The Primo discovery record page is the resolver papio drives to itself. A
+// record the library does not hold carries no marker naming that fact: the
+// availability control and its "Get it for me from other libraries" label also
+// appear on a held record. The source link is the only difference, and it can
+// paint later, so the negative rule participates only at the settle deadline.
+const primoSpec = (): AdapterSpec =>
+  adapters.find((a) => a.id === "primo") as AdapterSpec;
+
+test.skipIf(!fixtureExists("primo", "no-entitlement"))(
+  "a captured Primo record with no source link is named unentitled, not drift",
+  () => {
+    const page = loadFixture("primo", "no-entitlement") as Document;
+    expect(
+      page.querySelectorAll(
+        "nde-record-availability .available-at-button",
+      ),
+    ).toHaveLength(1);
+    const verdict = interpret(page, primoSpec(), ctx());
+    expect(verdict.kind).toBe("no_entitlement");
+    expect(verdict.adapter_id).toBe("primo");
+  },
+);
+
+test.skipIf(!fixtureExists("primo", "success"))(
+  "a held Primo record still classifies as an article",
+  () => {
+    const page = loadFixture("primo", "success") as Document;
+    expect(
+      page.querySelectorAll(
+        "nde-record-availability .available-at-button",
+      ),
+    ).toHaveLength(1);
+    expect(interpret(page, primoSpec(), ctx()).kind).toBe("article");
+  },
+);
+
+test("a Primo shell that never rendered its record availability stays unknown", () => {
+  const shell = parseHTML(
+    "<html><body><div id='searchBar'></div></body></html>",
+  );
+  expect(interpret(shell, primoSpec(), ctx()).kind).toBe("unknown");
+});
+
+test("the Primo budget is the resolver-hop ceiling, not the default", () => {
+  expect(primoSpec().settleTimeoutMs).toBe(15000);
+});
+
+async function withLiveAdapterPage<T>(
+  html: string,
+  run: (
+    win: Window,
+    pageSetTimeout: typeof globalThis.setTimeout,
+  ) => Promise<T>,
+): Promise<T> {
+  const win = new Window({
+    url: "https://primo.exlibrisgroup.com/nde/fulldisplay",
+  });
+  win.document.write(html);
+  win.document.close();
+  const prev = {
+    document: globalThis.document,
+    MutationObserver: globalThis.MutationObserver,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+  };
+  Object.assign(globalThis, {
+    document: win.document,
+    MutationObserver: win.MutationObserver,
+    setTimeout: win.setTimeout.bind(win),
+    clearTimeout: win.clearTimeout.bind(win),
+  });
+  try {
+    return await run(
+      win,
+      win.setTimeout.bind(win) as typeof globalThis.setTimeout,
+    );
+  } finally {
+    Object.assign(globalThis, prev);
+    win.close();
+  }
+}
+
+const liveClassifierKind = async (
+  mode: "fixture" | "injected",
+  spec: AdapterSpec,
+  html: string,
+  mutate?: (
+    win: Window,
+    pageSetTimeout: typeof globalThis.setTimeout,
+  ) => Promise<void>,
+): Promise<string> =>
+  withLiveAdapterPage(html, async (win, pageSetTimeout) => {
+    const pending =
+      mode === "fixture"
+        ? interpret(null, spec, ctx())
+        : planExecution(
+            null,
+            spec,
+            {},
+            { access_mode: "delegated" },
+          );
+    await mutate?.(win, pageSetTimeout);
+    const settled = await pending;
+    if (mode === "fixture") return (settled as PageVerdict).kind;
+    if ("assisted" in (settled as PlanResult))
+      throw new Error("live classifier unexpectedly returned an assisted plan");
+    return (settled as Plan).verdict.kind;
+  });
+
+test("another ready rule cannot wake a deadline-only rule early", async () => {
+  const spec: AdapterSpec = {
+    id: "proquest",
+    version: "0.0.0",
+    hosts: ["www.proquest.com"],
+    settleTimeoutMs: 300,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [".availability"],
+        deferUntilDeadline: true,
+      },
+      { kind: "login", all: [".login"] },
+    ],
+  };
+  const html =
+    "<html><body><i class='availability'></i><i class='login'></i></body></html>";
+  expect(await liveClassifierKind("fixture", spec, html)).toBe("login");
+  expect(await liveClassifierKind("injected", spec, html)).toBe("login");
+});
+
+test("both live classifiers use the source link's state at the deadline", async () => {
+  const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 300 };
+  const html =
+    "<html><body><nde-record-availability>" +
+    "<button class='available-at-button'>Get it for me</button>" +
+    "</nde-record-availability></body></html>";
+  const transientSource = async (
+    win: Window,
+    pageSetTimeout: typeof globalThis.setTimeout,
+  ): Promise<void> => {
+    const inserted = Promise.withResolvers<void>();
+    pageSetTimeout(inserted.resolve, 60);
+    await inserted.promise;
+    win.document.body.insertAdjacentHTML(
+      "beforeend",
+      "<a class='anchor-tag-style' href='/discovery/sourceRecord/alma991'></a>",
+    );
+    const removed = Promise.withResolvers<void>();
+    pageSetTimeout(removed.resolve, 40);
+    await removed.promise;
+    win.document.querySelector(".anchor-tag-style")?.remove();
+  };
+  expect(
+    await liveClassifierKind("fixture", spec, html, transientSource),
+  ).toBe("no_entitlement");
+  expect(
+    await liveClassifierKind("injected", spec, html, transientSource),
+  ).toBe("no_entitlement");
+});
+
+test("both live classifiers accept a source link that remains through the deadline", async () => {
+  const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 300 };
+  const html =
+    "<html><body><nde-record-availability>" +
+    "<button class='available-at-button'>Get it for me</button>" +
+    "</nde-record-availability></body></html>";
+  const stableSource = async (
+    win: Window,
+    pageSetTimeout: typeof globalThis.setTimeout,
+  ): Promise<void> => {
+    const inserted = Promise.withResolvers<void>();
+    pageSetTimeout(inserted.resolve, 60);
+    await inserted.promise;
+    win.document.body.insertAdjacentHTML(
+      "beforeend",
+      "<a class='anchor-tag-style' href='/discovery/sourceRecord/alma991'></a>",
+    );
+    expect(
+      win.document.querySelector(
+        "a.anchor-tag-style[href*='/discovery/sourceRecord']",
+      ),
+    ).not.toBeNull();
+    const held = Promise.withResolvers<void>();
+    pageSetTimeout(held.resolve, 180);
+    await held.promise;
+    expect(
+      win.document.querySelector(
+        "a.anchor-tag-style[href*='/discovery/sourceRecord']",
+      ),
+    ).not.toBeNull();
+  };
+  expect(
+    await liveClassifierKind("fixture", spec, html, stableSource),
+  ).toBe("article");
+  expect(
+    await liveClassifierKind("injected", spec, html, stableSource),
+  ).toBe("article");
+});
+
+test("the injected and fixture classifiers agree on every settled Primo state", () => {
+  const spec = primoSpec();
+  const cases = [
+    "<html><body><div id='searchBar'></div></body></html>",
+    "<html><body><nde-record-availability>" +
+      "<button class='available-at-button'>x</button>" +
+      "</nde-record-availability></body></html>",
+    "<html><body><nde-record-availability>" +
+      "<button class='available-at-button'>x</button>" +
+      "</nde-record-availability>" +
+      "<a class='anchor-tag-style' href='/discovery/sourceRecord/a1'></a>" +
+      "</body></html>",
+  ];
+  for (const html of cases) {
+    const page = parseHTML(html);
+    const fixtureKind = interpret(page, spec, ctx()).kind;
+    const injected = planExecution(
+      page,
+      spec,
+      {},
+      { access_mode: "delegated" },
+    ) as PlanResult;
+    if ("assisted" in injected)
+      throw new Error("settled Primo fixture unexpectedly returned an assisted plan");
+    expect((injected as Plan).verdict.kind).toBe(fixtureKind);
+  }
+});

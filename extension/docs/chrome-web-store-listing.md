@@ -46,14 +46,21 @@ Docs: https://orgmentem.github.io/papio/
 
 - **Single purpose:** Perform the browser-side institutional PDF download for a
   locally running *papio* acquisition daemon.
-- **Data collection:** None. Declare that the extension does **not** collect or
-  transmit user data. It communicates only with a local native-messaging host.
+- **Data collection:** None. No data leaves the user's computer. The extension
+  communicates only with a local native-messaging host.
 - **Page scanning:** Invoked only by an explicit click, top frame only, with no
   standing access — no persistent scanner and no dynamically registered content
   script. It uses only the one-shot activeTab grant the click implies, never the
   optional all-sites grant. Detection is local page JavaScript; the
   detected identifiers and the page's bare origin go only to the local *papio*
   application, and the display-only citation labels never leave the browser.
+- **Diagnostic captures:** An explicit capture request, or a provider page for
+  which *papio* has no working adapter, can send sanitized HTML to the local
+  *papio* daemon for adapter repair. It is stored only in the application's
+  local data directory, never uploaded, and may still contain article text,
+  account labels, or other page content. Authentication and identity-provider
+  pages are excluded. Default retention is 14 days and 10 captures per host;
+  the user can purge all captures or one host.
 - **Institution-session check:** While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host can schedule a check of the matching configured library resolver. The trigger reads no publisher page content, and the publisher page cannot set the popup's signed-in or signed-out verdict. A tracked papio tab returning from authentication can still provide existing, same-origin release evidence for queued work. The trigger adds no landing URL, page-derived publisher data, title, path, query, fragment, cookie, credential, or session token to storage or native messages. Ranked DOM and browser-storage observations on the configured library page remain the only source of the popup verdict.
 - **Loss toast:** When papio loses a tab it opened for a paper, it can offer to reopen that route. By default it is an extension page: it reads no page content, adds nothing to one, and needs no host access. With all-sites access granted, the user may opt in to "Show the lost-tab message in the page you are reading", which draws the same message into the page in front of them: off by default, cleared when all-sites access is revoked, reads nothing from the page, renders inside a shadow root, and removes itself before reporting the choice. Either route: one fixed sentence, one button, papio's own mark, no identifier or URL, eight seconds (restarted once if you bring it forward), and nothing performed on close.
 - **Host-page acknowledgement:** After a successful popup action, and only when

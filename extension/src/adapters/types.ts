@@ -27,6 +27,18 @@ export interface ClassifyRule {
   /** At least one lowercase substring must appear in document.body.innerText
    * (compared lowercased). Static labels only — never page-derived text. */
   textAny?: string[];
+  /** On live pages, this rule may classify only after the full settle budget.
+   *
+   * A positive marker can paint before the marker that would select an earlier
+   * rule. So a deferred rule neither declares readiness nor participates in an
+   * early classification triggered by some other rule. Fixture Documents are
+   * already complete and evaluate it immediately.
+   *
+   * Primo is the measured case. Its availability control and source link live
+   * 17 KB and 26 containers apart, so a held record can paint the control first.
+   * At the deadline the earlier article rule wins if the source link exists;
+   * otherwise the availability control names the not-held state. */
+  deferUntilDeadline?: boolean;
 }
 
 export interface WorkEvidenceContract {
@@ -195,7 +207,7 @@ export function interpret(
   ctx: AdapterContext,
 ): PageVerdict | Promise<PageVerdict> {
   const root: Document = doc ?? document;
-  const classify = (): PageVerdict => {
+  const classify = (allowDeferred: boolean): PageVerdict => {
     const evidence: string[] = [];
     const adapter_id = spec.id;
     const adapter_version = spec.version;
@@ -206,6 +218,7 @@ export function interpret(
       const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
       // A rule with no conditions never matches: refuse a blanket fallback.
       if (!hasAll && !hasAny && !hasText) continue;
+      if (rule.deferUntilDeadline === true && !allowDeferred) continue;
 
       if (hasAll) {
         let ok = true;
@@ -278,25 +291,27 @@ export function interpret(
   };
   // Fixture interpretation is deterministic and synchronous. Only the
   // serialized live invocation waits for React/custom-element hydration.
-  if (doc !== null) return classify();
+  if (doc !== null) return classify(true);
   // The ceiling has to exceed every value a spec may declare, or the field is
   // a lie: it was 5000 while `clinicalkey` declared 8000, so that adapter's
   // extra budget was silently discarded and the provider's Angular content
   // player — which really is slower than five seconds when reached through an
   // institutional resolver hop — kept classifying `unknown`. This is a worst
   // case, not a delay: the MutationObserver below resolves the instant a
-  // declared selector appears, so a fast page never spends it. Two concurrent
-  // handoff drives (HANDOFF_DRIVE_LIMIT) bound how long a stalled provider can
-  // hold the queue.
+  // declared selector appears, so a fast page never spends it. The separate
+  // HANDOFF_DRIVE_LIMIT bounds how many stalled provider pages can hold the
+  // drive queue at once.
   const boundedMs = Math.max(0, Math.min(spec.settleTimeoutMs ?? 0, 15000));
-  if (boundedMs === 0 || root.documentElement === null) return Promise.resolve(classify());
+  if (boundedMs === 0 || root.documentElement === null)
+    return Promise.resolve(classify(true));
 
-  const selectorsReady = (): boolean => {
+  const selectorsReady = (): PageKind | null => {
     for (const rule of spec.classify) {
       const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
       const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
       const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
       if (!hasAll && !hasAny && !hasText) continue;
+      if (rule.deferUntilDeadline === true) continue;
       let allReady = true;
       if (hasAll) {
         for (const selector of rule.all as string[]) {
@@ -336,29 +351,49 @@ export function interpret(
           }
         }
       }
-      if (allReady && anyReady && textReady) return true;
+      if (allReady && anyReady && textReady) return rule.kind;
     }
-    return false;
+    return null;
   };
-  if (selectorsReady()) return Promise.resolve(classify());
-
-  return new Promise<void>((resolve) => {
-    let settled = false;
-    let observer: MutationObserver | null = null;
-    let timer: number | Timer | undefined;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      observer?.disconnect();
-      clearTimeout(timer);
-      resolve();
-    };
-    observer = new MutationObserver(() => {
-      if (selectorsReady()) finish();
-    });
-    observer.observe(root.documentElement, { childList: true, subtree: true, attributes: true });
-    timer = setTimeout(finish, boundedMs);
-  }).then(() => classify());
+  const deferred = Promise.withResolvers<PageVerdict>();
+  let settled = false;
+  let observer: MutationObserver | null = null;
+  let timer: number | Timer | undefined;
+  let readyTimer: number | Timer | undefined;
+  const finish = (allowDeferred: boolean): void => {
+    if (settled) return;
+    settled = true;
+    observer?.disconnect();
+    clearTimeout(timer);
+    clearTimeout(readyTimer);
+    deferred.resolve(classify(allowDeferred));
+  };
+  const settleWindowMs = Math.min(50, boundedMs);
+  const scheduleWhenReady = (): void => {
+    const readyKind = selectorsReady();
+    if (readyKind === null || readyKind === "article") {
+      if (readyTimer !== undefined) {
+        clearTimeout(readyTimer);
+        readyTimer = undefined;
+      }
+      return;
+    }
+    if (readyTimer === undefined) {
+      readyTimer = setTimeout(
+        () => finish(false),
+        settleWindowMs,
+      );
+    }
+  };
+  observer = new MutationObserver(scheduleWhenReady);
+  observer.observe(root.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+  });
+  timer = setTimeout(() => finish(true), boundedMs);
+  scheduleWhenReady();
+  return deferred.promise;
 }
 
 /**
@@ -527,14 +562,41 @@ export const adapters: AdapterSpec[] = [
     // carries the full delivery parameters. Hosts cover hosted Primo
     // instances (<inst>.primo.exlibrisgroup.com); custom-domain fronts like
     // custom-domain discovery fronts need their own captured evidence before joining.
+    // A record page the library does not hold, measured 2026-08-30 across ten
+    // live resolver captures (fixtures/primo/no-entitlement.html is one of
+    // them, redacted). Only the source link separates it from a held record:
+    // the availability control, its "Get it for me from other libraries"
+    // label, and the not-linkable record title are present in BOTH cases, so
+    // no positive marker names the negative one.
+    //
+    // Ordering a positive rule first cannot decide a page that is still
+    // painting. In fixtures/primo/success.html the availability control and
+    // source path start at bytes 35130 and 52954 - 17824 bytes and 26 closing
+    // containers apart. `deferUntilDeadline` keeps the negative rule out of
+    // every early classification. At the deadline, the article rule
+    // wins when the source link exists; otherwise the availability control
+    // names the not-held state.
+    //
+    // A shell that never paints its availability control matches neither rule
+    // and stays `unknown`, which is the truth about it.
+    //
+    // The budget is the ClinicalKey value and the same reason applies with more
+    // force: that entry records a resolver hop eating the render budget, and
+    // this adapter IS the resolver. Eight of the ten captures were shells
+    // between 1.1 KB and 29.9 KB with no availability control rendered.
     id: "primo",
-    version: "0.1.0",
+    version: "0.3.0",
     hosts: ["primo.exlibrisgroup.com"],
-    settleTimeoutMs: 5000,
+    settleTimeoutMs: 15000,
     classify: [
       {
         kind: "article",
         all: ["a.anchor-tag-style[href*='/discovery/sourceRecord']"],
+      },
+      {
+        kind: "no_entitlement",
+        all: ["nde-record-availability .available-at-button"],
+        deferUntilDeadline: true,
       },
     ],
     download: {
@@ -704,7 +766,7 @@ export const adapters: AdapterSpec[] = [
     // sign-in slot occupied. `article` stays first so a transitional page that
     // briefly carries both still trusts the positive entitlement signal.
     id: "sciencedirect",
-    version: "0.6.0",
+    version: "0.8.0",
     hosts: ["sciencedirect.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -732,26 +794,68 @@ export const adapters: AdapterSpec[] = [
     // would download a different paper. Both shapes are therefore accepted,
     // and both stay scoped to `.accessbar .ViewPDF >` — that scoping, not the
     // path, is what keeps the sibling anchors unreachable.
+    //
+    // Re-measured live 2026-08-30, same article, scratch profile, no
+    // institutional session, page fully painted. The href match had to become
+    // `*=` because BOTH earlier predicates miss the real page:
+    //   live  href=/science/article/pii/<pii>/pdf?md5=<32 hex>&pid=<pii>-main.pdf
+    //   fixture href=/science/article/pii/<pii>/pdfft
+    // `sanitizeFixture` strips query strings, so `[href$='/pdf']` matched the
+    // sanitized fixture and could never match the live anchor, and the
+    // `/pdfft` alternative does not apply to this paper's own route at all.
+    // Every fixture-backed test passed while the field classified `unknown`:
+    // 20 of the operator's 172 `ui_changed` outcomes were this, on pages that
+    // had rendered correctly. A `$=` or `*=` predicate on an href is only ever
+    // safe against a value the fixture pipeline preserves; path membership is,
+    // a trailing anchor is not.
+    //
+    // `[href*='/pdf']` is not a widening: each scope below admits exactly one
+    // anchor (verified against every fixture and capture on disk), and an
+    // anchor with NO href — the unpainted signature above — still cannot
+    // match, so `requiresVisible` keeps its meaning.
+    //
+    // TWO layouts, and only one of them has an access bar. Compared across
+    // three sanitized captures from the operator's own session:
+    //   fixtures/sciencedirect/open-access.html  div.accessbar > ul > li.ViewPDF > a
+    //   fixtures/sciencedirect/success.html      same access-bar shape
+    //   fixtures/sciencedirect/subscription.html div.content-details-actions >
+    //                                            div.content-actions > a
+    // The subscription capture (2026-08-24, pii/S0747563216303168, entitled,
+    // `aria-disabled="false"`, href=<pii>/pdfft) contains NO `.accessbar`
+    // container and no `.ViewPDF` at all — the enabled control lives in the
+    // article's own content-actions region instead. An access-bar-only rule
+    // therefore misses every article served that layout, which is the layout
+    // an entitled institutional route lands on.
+    //
+    // Whether that layout is current or superseded is NOT established: it is
+    // one observed sample, and the three later captures are all access-bar.
+    // Both rules are kept because each is scoped to a single anchor and each
+    // fails closed on every other fixture, so carrying a possibly-retired
+    // layout costs one selector while dropping it would silently re-park a
+    // whole class of paper.
     classify: [
       {
         kind: "article",
         all: ["meta[name='citation_title']"],
         any: [
-          ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft']",
-          ".accessbar .ViewPDF > a.accessbar-utility-link[href$='/pdf']",
+          ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdf']",
+          ".content-details-actions > .content-actions > a.accessbar-utility-link[href*='/pdf']",
         ],
       },
       {
         kind: "no_entitlement",
         all: [
           "meta[name='citation_doi']",
-          ".access-options a.accessbar-utility-link[aria-label='Purchase PDF'][href^='/getaccess/pii/'][href$='/purchase']",
+          // `*='/purchase'` for the same reason as above: this href is a live
+          // value, so a trailing anchor breaks the moment ScienceDirect adds a
+          // query. `[href^='/getaccess/pii/']` is what keeps it tight.
+          ".access-options a.accessbar-utility-link[aria-label='Purchase PDF'][href^='/getaccess/pii/'][href*='/purchase']",
         ],
       },
     ],
     download: {
       selector:
-        ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdfft'], .accessbar .ViewPDF > a.accessbar-utility-link[href$='/pdf']",
+        ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdf'], .content-details-actions > .content-actions > a.accessbar-utility-link[href*='/pdf']",
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "click",

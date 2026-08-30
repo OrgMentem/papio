@@ -202,6 +202,15 @@ export interface ActiveJob {
   access_mode?: "assisted" | "delegated";
   /** Epoch ms when the tab first left every provider host (auth started). */
   auth_started_ms?: number;
+  /** Epoch ms when papio itself routed this job through the adapter's
+   * federated-login entry. Unlike auth_started_ms, generic navigation cannot
+   * set this marker. Session storage preserves it across worker restarts.
+   * Explicit undefined clears a failed route before serialization. */
+  federated_login_routed_ms?: number | undefined;
+  /** Durable bound and fair-order timestamp for the keepalive landing-recheck
+   * recovery net. Session storage preserves both across worker restarts. */
+  landing_recheck_count?: number;
+  landing_rechecked_ms?: number;
   /** Expected work identity from the job offer, used to build the adapter
    * AdapterContext for declarative classification. Resolver-declared hints
    * only — never an IdP value. */
@@ -1238,6 +1247,17 @@ function migratedJob(value: ActiveJob): ActiveJob {
   }
   if (isFiniteNumber(value.auth_started_ms))
     migrated.auth_started_ms = value.auth_started_ms;
+  if (isFiniteNumber(value.federated_login_routed_ms))
+    migrated.federated_login_routed_ms = value.federated_login_routed_ms;
+  const landingRecheckCount = value.landing_recheck_count;
+  if (
+    isFiniteNumber(landingRecheckCount) &&
+    Number.isInteger(landingRecheckCount) &&
+    landingRecheckCount >= 0
+  )
+    migrated.landing_recheck_count = landingRecheckCount;
+  if (isFiniteNumber(value.landing_rechecked_ms))
+    migrated.landing_rechecked_ms = value.landing_rechecked_ms;
   const expectedRaw = value.expected;
   if (isRecord(expectedRaw)) {
     const expected: NonNullable<ActiveJob["expected"]> = {};

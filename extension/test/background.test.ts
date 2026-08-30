@@ -5957,6 +5957,51 @@ test("an unregistered provider captures evidence and exits with a missing-adapte
   expect(h.backend.store.activeJobs[0]?.access_mode).toBeUndefined();
 });
 
+test("an authentication redirect never self-authorizes a diagnostic capture", async () => {
+  const h = makeHarness();
+  const stored: Record<string, unknown> = {};
+  h.deps.captureStorage = {
+    local: {
+      get: async (key) => ({ [key]: stored[key] }),
+      set: async (items) => {
+        Object.assign(stored, items);
+      },
+    },
+  };
+  let captureAttempts = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === capturePage) captureAttempts += 1;
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+  await h.port.inbound(
+    jobOfferForHosts("job_idp_capture_refused", ["resolver.example.edu"]),
+  );
+  const job = h.backend.store.activeJobs[0];
+  expect(job).toBeDefined();
+  if (job === undefined) throw new Error("job offer was not retained");
+  h.tabs.seed({
+    id: job.tab_id,
+    url: "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO",
+  });
+  const internals = h.bridge as unknown as {
+    recordUnknown(
+      activeJob: ActiveJob,
+      host: string,
+    ): Promise<boolean>;
+  };
+
+  expect(
+    await internals.recordUnknown(job, "idp.example.edu"),
+  ).toBe(false);
+  expect(captureAttempts).toBe(0);
+  expect(stored).toEqual({});
+  expect(
+    h.frames().some((frame) => frame.type === "page_capture"),
+  ).toBe(false);
+});
+
 test("a registry-only adapter host classifies and emits an observed capture", async () => {
   // The offer list is capped while the source-controlled adapter registry is not;
   // capture must use the same verified-host decision as classification.
@@ -6367,7 +6412,7 @@ test("challenge resume queues without a governor slot before classifying", async
   // for a governor slot; no second classification or download is allowed.
   expect(h.tabs.list().length).toBe(2);
 });
-test("driven-page assessment classifies challenge, redirect-loop, and normal fixtures", () => {
+test("driven-page assessment separates challenge, load failure, redirect loop, and normal pages", () => {
   const fixture = (html: string): Document => {
     const window = new Window({ url: "https://www.jstor.org/stable/paper" });
     window.document.write(html);
@@ -6390,6 +6435,24 @@ test("driven-page assessment classifies challenge, redirect-loop, and normal fix
   );
   expect(assessDrivenPage(loop).kind).toBe("redirect_loop");
   expect(isRedirectLoopPage(loop)).toBe(true);
+  const serverFailure = fixture(
+    "<html><head><title>Internal Server Error</title></head>" +
+      "<body>Sorry, we seem to have hit a problem processing your request. " +
+      "Error code: ATN-9</body></html>",
+  );
+  expect(assessDrivenPage(serverFailure)).toEqual({
+    kind: "load_failure",
+  });
+  const notFound = fixture(
+    "<html><head><title>Error 404 | Cochrane Library</title></head>" +
+      "<body>404 The page you requested does not appear to be here.</body></html>",
+  );
+  expect(assessDrivenPage(notFound)).toEqual({ kind: "load_failure" });
+  const errorArticle = fixture(
+    "<html><head><title>Internal Server Error</title></head>" +
+      "<body><article>An analysis of server errors.</article></body></html>",
+  );
+  expect(assessDrivenPage(errorArticle)).toEqual({ kind: "normal" });
   const normal = fixture(
     "<html><head><title>Article</title></head><body><main>Abstract</main></body></html>",
   );
@@ -6402,6 +6465,58 @@ test("driven-page assessment classifies challenge, redirect-loop, and normal fix
   expect(registrableProviderHost("journals.example.co.uk")).toBe(
     "example.co.uk",
   );
+});
+
+test("a provider-authored load failure reloads three times and never records drift", async () => {
+  const jobID = "job_provider_load_failure";
+  const tabID = 424500;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: tabID,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "accepted",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+  });
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  let planned = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "load_failure" } }];
+    if (injection.func === planExecution) planned += 1;
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({}));
+  h.tabs.seed({
+    id: tabID,
+    url: `https://${PROVIDER_HOST}/server-error`,
+  });
+  const internals = h.bridge as unknown as {
+    maybeClassify(jobID: string, host: string): Promise<void>;
+  };
+
+  for (let attempt = 0; attempt < 4; attempt += 1)
+    await internals.maybeClassify(jobID, PROVIDER_HOST);
+
+  expect(planned).toBe(0);
+  expect(h.tabs.reloaded).toEqual([tabID, tabID, tabID]);
+  expect(
+    h.backend.store.activeJobs[0]?.landing_recheck_count,
+  ).toBe(3);
+  expect(
+    h.frames().some(
+      (frame) =>
+        frame.type === "handoff_outcome" ||
+        frame.type === "provider_outcome",
+    ),
+  ).toBe(false);
 });
 
 test("unknown retries report ui_changed once per drive and again for a re-offered tab", async () => {
@@ -9456,6 +9571,44 @@ test("a resolver-routed landing on a visible-required adapter reloads instead of
   // keeps its paper. A cede here erases the job binding, which is exactly how
   // every revealed ScienceDirect surface lost its identity live on 2026-08-26
   // (`ceded_reason: operator_activated`).
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const revealed = closeInternals(h).tabLedgerCache[String(tabID)];
+  expect(revealed?.ceded).toBeUndefined();
+  expect(revealed?.ceded_reason).toBeUndefined();
+});
+
+test("a visible-required adapter is revealed in tab-group mode too", async () => {
+  // `requiresVisible` is a fact about the ADAPTER, but the reveal used to bail
+  // the moment there was no work window, so it did nothing at all in the two
+  // surface modes that have none. Tab-group mode is the sharper case: the tab
+  // is created `active: false` inside a COLLAPSED papio group, so the document
+  // is even less likely to paint than in a minimized window - and the drift it
+  // produces is indistinguishable from a real adapter break.
+  const h = makeHarness(undefined, {
+    tabGroups: true,
+    handoffSurface: "tab-group",
+  });
+  installManagedTabLedger(h, {});
+  h.deps.adapterSpecs = [{ ...PROVIDER_ADAPTER, requiresVisible: true }];
+  h.deps.permissions.contains = async () => true;
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_tg_reveal"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+  expect(h.backend.store.workWindowID).toBeUndefined();
+
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/123`);
+
+  // The tab half of the reveal is the half that makes a page paint, and it
+  // needs no work window: activate, then fetch again so the SPA runs.
+  expect(h.tabs.snapshot(tabID)?.active).toBe(true);
+  expect(h.tabs.reloaded).toContain(tabID);
+  // No verdict for the unpainted document; the reload's completion classifies.
+  expect(h.frames().filter((f) => f.type === "provider_outcome")).toEqual([]);
+  // No work window exists, so nothing may be created or updated to reveal one.
+  expect(h.windows?.created ?? []).toEqual([]);
+  expect(h.windows?.updated ?? []).toEqual([]);
+  // And papio's own activation must not read as the operator taking over.
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
   const revealed = closeInternals(h).tabLedgerCache[String(tabID)];
   expect(revealed?.ceded).toBeUndefined();
@@ -21805,6 +21958,88 @@ test("a consult pointed at a dead surface reports the claim's loss", async () =>
   expect(h.tabs.created).toEqual([]);
 });
 
+// A tab showing a terminal identity-provider dead end is still a live tab, and
+// `focusClaimOwnerTab` tested existence only. So each arriving sibling was
+// pointed at the dead page, marked `auth_pending`, and renewed the
+// institution's one sign-in claim — which is exactly why the unbound (2m) and
+// stranded (30m) sweeps never fire: the starvation renews its own lease and has
+// no horizon. Measured on the operator's store 2026-08-30, job_74e8e6f2:
+// `auth_pending` at 10:20:20 and again at 10:30:12, claim lease renewed to
+// 11:00, the tab on the Shibboleth stale-request page throughout, 87
+// auth-blocked actions queued behind it and the oldest 24 days old.
+//
+// Deliberately NO tabs.onUpdated event — `h.tabs.seed` installs the page
+// without one. That is the live condition and the reason `stale_sso` had never
+// been reported once in 27 days: focusing an already-dead tab navigates
+// nothing, so the one path that meets the page repeatedly never asked the
+// detector that recognizes it.
+test("a consult pointed at a dead sign-in page never reserves the slot", async () => {
+  const jobID = "job_stale_consult_001";
+  const candidateID = "cand_stale_consult1";
+  const ownerTab = 987654322;
+  const h = makeHarness({
+    ...emptyStore(),
+    // The live job re-consulted while already claiming `auth_pending` — that is
+    // the state whose falseness reserves the institution's slot, so it is where
+    // this starts. No offer URL is seeded: this branch is reachable only when
+    // the job has none (`openHandoff` sends a retained-URL job down the legacy
+    // path and never consults the claim), which is also why a redrive from here
+    // is impossible and parking is the recovery.
+    activeJobs: [{ ...coldClaimJob(jobID), status: "auth_pending" }],
+  });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM],
+      browser_holder_generation: 7,
+    }),
+  );
+  await seedClaimCandidate(h, jobID, candidateID);
+  // The owner tab exists and is sitting on the dead Shibboleth page.
+  h.tabs.seed({
+    id: ownerTab,
+    url: STALE_IDP_URL,
+    title: STALE_IDP_TITLE,
+    windowId: 500,
+  });
+
+  const opened = h.bridge.openHandoff(jobID);
+  const consult = await h.port.waitForFrame("authentication_claim_request");
+  await h.port.inbound(
+    claimResponse(jobID, consult.payload["request_id"], {
+      outcome: "navigate_existing",
+      authentication_claim_id: "claim-stale-consult",
+      gate_occurrence_id: "gate-stale-consult",
+      browser_holder_generation: 7,
+      lease_until: new Date(Date.now() + 60_000).toISOString(),
+      owner_binding_id: "binding-stale-consult",
+      owner_tab_hint: ownerTab,
+    }),
+  );
+  const reply = await opened;
+  // Refused, not "waiting on your sign-in".
+  expect(reply.ok).toBe(false);
+
+  // The report names the failure, so the daemon learns the surface is dead.
+  const outcome = await h.port.waitForFrame("handoff_outcome");
+  expect(outcome.payload["outcome"]).toBe("stale_sso");
+  expect(outcome.payload["final_host"]).toBe("idp.example.edu");
+
+  // The load-bearing half: papio never claims a sign-in is in progress, so it
+  // never reserves the institution's slot behind a page that cannot complete
+  // one. engagement_required is the recovery - the operator's next open mints
+  // a FRESH route, which is the only thing a stale SAML conversation accepts.
+  const job = h.backend.store.activeJobs.find((j) => j.job_id === jobID);
+  expect(job?.status).not.toBe("auth_pending");
+  expect(job?.status).toBe("queued");
+  expect(job?.engagement_required).toBe(true);
+  expect(job?.tab_id).toBe(-1);
+  // No replacement sign-in tab: the dead one is still the operator's to see.
+  expect(h.tabs.created).toEqual([]);
+  expect(h.tabs.snapshot(ownerTab)?.url).toBe(STALE_IDP_URL);
+});
+
 // The clear above depends on a tabs.onUpdated event for that exact tab. MV3
 // sleeps the service worker after ~30s idle and solving a CAPTCHA takes longer
 // than that, so the one trigger can simply never arrive - and then the popup's
@@ -22466,11 +22701,11 @@ test("taking the offer mints a fresh route and opens it", async () => {
     nativeResult("handoff_link_result", {
       request_id: request.payload["request_id"],
       outcome: "opened",
-      url: "https://une.primo.exlibrisgroup.com/openurl?x=1",
+      url: "https://example.primo.exlibrisgroup.com/openurl?x=1",
     }),
   );
   expect(await acting).toBe(true);
-  expect(h.tabs.created.some((props) => props.url?.startsWith("https://une.primo.exlibrisgroup.com/openurl"))).toBe(true);
+  expect(h.tabs.created.some((props) => props.url?.startsWith("https://example.primo.exlibrisgroup.com/openurl"))).toBe(true);
 });
 
 test("an offer for a job papio did not name is refused", async () => {
@@ -22746,7 +22981,7 @@ test("the injected toast's action needs the token papio minted", async () => {
     nativeResult("handoff_link_result", {
       request_id: request.payload["request_id"],
       outcome: "opened",
-      url: "https://une.primo.exlibrisgroup.com/openurl?x=1",
+      url: "https://example.primo.exlibrisgroup.com/openurl?x=1",
     }),
   );
   expect(await acting).toBe(true);
@@ -22792,7 +23027,7 @@ test("the injected toast settles exactly once", async () => {
     nativeResult("handoff_link_result", {
       request_id: request.payload["request_id"],
       outcome: "opened",
-      url: "https://une.primo.exlibrisgroup.com/openurl?x=1",
+      url: "https://example.primo.exlibrisgroup.com/openurl?x=1",
     }),
   );
   expect(await acting).toBe(true);
@@ -22828,4 +23063,395 @@ test("a replacing loss makes the earlier injected toast inert", async () => {
   };
   expect(await internals.pageToastAction("job_inpage_first", firstToken, readerID)).toBe(false);
   expect(h.port.posted.some((frame) => (frame as { type?: string }).type === "handoff_link_request")).toBe(false);
+});
+
+// `maybeClassify`'s retry net is bounded at MAX_CLASSIFY_RETRIES x
+// CLASSIFY_RETRY_MS - twenty seconds - and then `scheduleClassifyRetry` deletes
+// the entry and returns with no verdict, no capture, and nothing on the wire.
+// After that the only remaining trigger is a fresh tabs.onUpdated for that tab,
+// and a tab standing on a finished page produces none.
+//
+// 2026-08-30, job_74e8e6f2: `browser.auth_returned` with `elapsed_ms: 267951` -
+// four and a half minutes of real sign-in - then no classification or
+// entitlement evidence before the three-minute drive timeout pushed it back to
+// `auth_pending`. Without `entitled_landing`, the lease stays `human` with
+// `entitled_at` empty, and dependents are admitted only on
+// `Human && EntitledAt != ""`.
+//
+// Deliberately NO tab event here. That is the condition.
+test("a landing whose classify net expired is re-read on the durable wake", async () => {
+  const jobID = "job_landing_recheck_01";
+  const tabID = 424242;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: tabID,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "awaiting_download",
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+  });
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  let planned = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution) {
+      planned += 1;
+      return plannerResult(injection, { kind: "article" });
+    }
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === isBotChallenge) return [{ result: false }];
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({}));
+  const url = `https://${PROVIDER_HOST}/stable/article`;
+  h.tabs.seed({ id: tabID, url });
+  // The net has already expired; nothing has classified this page.
+  expect(planned).toBe(0);
+
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 80; step += 1) await Promise.resolve();
+
+  expect(planned).toBeGreaterThan(0);
+});
+
+test("a paper whose download is already in flight is never re-read", async () => {
+  // The sweep's whole risk is fetching one paper twice. `download_initiated` is
+  // the persisted marker that a fetch is already under way, so this is the
+  // guard that makes a one-minute re-read safe rather than merely useful.
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: "job_landing_inflight_1",
+        tab_id: 424243,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "awaiting_download",
+        download_initiated: true,
+        provider_hosts: [PROVIDER_HOST],
+      },
+    ],
+  });
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  let planned = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution) {
+      planned += 1;
+      return plannerResult(injection, { kind: "article" });
+    }
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === isBotChallenge) return [{ result: false }];
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({}));
+  const url = `https://${PROVIDER_HOST}/stable/article`;
+  h.tabs.seed({ id: 424243, url });
+
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 80; step += 1) await Promise.resolve();
+
+  expect(planned).toBe(0);
+});
+
+// The other half, one status earlier. `retryFederatedEvidence` turns "this
+// auth_pending tab is now on a readable provider page" into
+// `finalizeAuthReturn`. Its old gate was the worker-memory
+// `federatedLoginRouted` Set. The route now writes a session-persisted
+// federated_login_routed_ms marker before navigation, so a worker restart does
+// not erase proof that papio routed this exact job through federated login.
+test("a sign-in finished after the worker slept is still recognised", async () => {
+  const jobID = "job_auth_slept_recover1";
+  const tabID = 424244;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: tabID,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "auth_pending",
+        auth_started_ms: 1_700_000_000_000,
+        federated_login_routed_ms: 1_700_000_000_000,
+        provider_hosts: [PROVIDER_HOST],
+        requires_auth: true,
+      },
+    ],
+  });
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "article" });
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === isBotChallenge) return [{ result: false }];
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({}));
+  // The tab has left the sign-in and is standing on the article. No tab event:
+  // a finished page produces none, and the worker that would have heard one is
+  // long gone.
+  h.tabs.seed({ id: tabID, url: `https://${PROVIDER_HOST}/stable/article` });
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 120; step += 1) await Promise.resolve();
+
+  // The return is recognised, which is what promotes the institution's lease
+  // out of `reserved` and lets a later entitled landing be recorded at all.
+  expect(h.backend.store.activeJobs[0]?.status).not.toBe("auth_pending");
+  expect(
+    h.port.posted.some(
+      (frame) => (frame as { type?: string }).type === "auth_returned",
+    ),
+  ).toBe(true);
+});
+
+test("auth_started without a papio-routed federated login cannot report a return", async () => {
+  const jobID = "job_auth_generic_navigation";
+  const tabID = 424245;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: tabID,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "auth_pending",
+        // Generic non-provider navigation and drive timeout can set this.
+        auth_started_ms: 1_700_000_000_000,
+        provider_hosts: [PROVIDER_HOST],
+        requires_auth: true,
+      },
+    ],
+  });
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  let planned = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution) {
+      planned += 1;
+      return plannerResult(injection, { kind: "article" });
+    }
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === isBotChallenge) return [{ result: false }];
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({}));
+  h.tabs.seed({
+    id: tabID,
+    url: `https://${PROVIDER_HOST}/stable/article`,
+  });
+
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  for (let step = 0; step < 120; step += 1) await Promise.resolve();
+
+  expect(planned).toBe(0);
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  expect(
+    h.port.posted.some(
+      (frame) => (frame as { type?: string }).type === "auth_returned",
+    ),
+  ).toBe(false);
+});
+
+test("landing rechecks share one fair bounded budget across the queue", async () => {
+  const jobs: ActiveJob[] = Array.from({ length: 6 }, (_, index) => ({
+    job_id: `job_landing_fair_${index + 1}`,
+    tab_id: 424300 + index,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_800_000_000_000,
+    status: "awaiting_download",
+    provider_hosts: [PROVIDER_HOST],
+    ...(index === 5 ? { landing_recheck_count: 10 } : {}),
+  }));
+  const h = makeHarness({ ...emptyStore(), activeJobs: jobs });
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "unknown" });
+    if (injection.func === assessDrivenPage)
+      return [{ result: { kind: "normal" } }];
+    if (injection.func === isBotChallenge) return [{ result: false }];
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({}));
+  for (const job of jobs)
+    h.tabs.seed({
+      id: job.tab_id,
+      url: `https://${PROVIDER_HOST}/stable/${job.job_id}`,
+    });
+
+  const internals = h.bridge as unknown as {
+    recheckUnclassifiedLandings(): Promise<void>;
+  };
+  await internals.recheckUnclassifiedLandings();
+  const first = h.backend.store.activeJobs.map(
+    (job) => job.landing_recheck_count ?? 0,
+  );
+  expect(first).toEqual([1, 1, 1, 0, 0, 10]);
+
+  await internals.recheckUnclassifiedLandings();
+  const second = h.backend.store.activeJobs.map(
+    (job) => job.landing_recheck_count ?? 0,
+  );
+  expect(second[3]).toBe(1);
+  expect(second[4]).toBe(1);
+  expect(second.reduce((sum, count) => sum + count, 0)).toBe(16);
+  expect(second[5]).toBe(10);
+});
+
+test("a federated route writes its worker-restart marker before navigation", async () => {
+  const jobID = "job_federated_route_marker";
+  const tabID = 424600;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: tabID,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_800_000_000_000,
+        status: "awaiting_download",
+        provider_hosts: [PROVIDER_HOST],
+        access_mode: "delegated",
+      },
+    ],
+  });
+  h.tabs.seed({
+    id: tabID,
+    url: `https://${PROVIDER_HOST}/login`,
+  });
+  await h.bridge.start();
+  const spec: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    federatedLogin:
+      "https://idp.example.edu/sso?entityID={entityID}",
+  };
+  const internals = h.bridge as unknown as {
+    loginEntityIDs: Map<string, string>;
+    federatedLoginRouted: Set<string>;
+    maybeRouteFederatedLogin(
+      id: string,
+      activeJob: ActiveJob,
+      adapter: AdapterSpec,
+    ): Promise<void>;
+  };
+  internals.loginEntityIDs.set(
+    jobID,
+    "https://idp.example.edu/entity",
+  );
+  const first = h.backend.store.activeJobs[0];
+  expect(first).toBeDefined();
+  if (first === undefined) throw new Error("seeded job disappeared");
+
+  await internals.maybeRouteFederatedLogin(jobID, first, spec);
+
+  const routed = h.backend.store.activeJobs[0];
+  expect(routed?.federated_login_routed_ms).toBe(h.clock.now);
+  expect(h.tabs.updates).toHaveLength(1);
+  expect(h.tabs.updates[0]?.properties.url).toContain(
+    encodeURIComponent("https://idp.example.edu/entity"),
+  );
+
+  // A worker restart clears the Set but retains the session-backed marker.
+  internals.federatedLoginRouted.clear();
+  if (routed === undefined) throw new Error("routed job disappeared");
+  await internals.maybeRouteFederatedLogin(jobID, routed, spec);
+  expect(h.tabs.updates).toHaveLength(1);
+});
+
+test("a failed federated navigation clears its persisted route marker", async () => {
+  const jobID = "job_federated_route_failure";
+  const h = makeHarness();
+  await h.bridge.start();
+  h.backend.store.activeJobs.push({
+    job_id: jobID,
+    tab_id: 424601,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_800_000_000_000,
+    status: "awaiting_download",
+    provider_hosts: [PROVIDER_HOST],
+    access_mode: "delegated",
+  });
+  const spec: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    federatedLogin:
+      "https://idp.example.edu/sso?entityID={entityID}",
+  };
+  const internals = h.bridge as unknown as {
+    loginEntityIDs: Map<string, string>;
+    maybeRouteFederatedLogin(
+      id: string,
+      activeJob: ActiveJob,
+      adapter: AdapterSpec,
+    ): Promise<void>;
+  };
+  internals.loginEntityIDs.set(
+    jobID,
+    "https://idp.example.edu/entity",
+  );
+  const job = h.backend.store.activeJobs[0];
+  expect(job).toBeDefined();
+  if (job === undefined) throw new Error("seeded job disappeared");
+
+  await internals.maybeRouteFederatedLogin(jobID, job, spec);
+
+  expect(
+    h.backend.store.activeJobs[0]?.federated_login_routed_ms,
+  ).toBeUndefined();
+});
+
+test("a browser-resumed job download blocks a new local download claim", async () => {
+  const jobID = "job_browser_restart_download";
+  const h = makeHarness();
+  await h.bridge.start();
+  const internals = h.bridge as unknown as {
+    store: StoreShape;
+    claimDownloadInitiated(id: string): Promise<boolean>;
+  };
+  internals.store.activeJobs.push({
+    job_id: jobID,
+    tab_id: -1,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_800_000_000_000,
+    status: "awaiting_download",
+    provider_hosts: [PROVIDER_HOST],
+    access_mode: "delegated",
+  });
+  h.downloads.items.set(77, {
+    id: 77,
+    state: "in_progress",
+    filename: `/Users/researcher/Downloads/${jobDownloadFilename(jobID)}`,
+  });
+
+  expect(await internals.claimDownloadInitiated(jobID)).toBe(false);
+  expect(
+    internals.store.activeJobs[0]?.download_initiated,
+  ).toBeUndefined();
+
+  h.downloads.items.set(77, {
+    id: 77,
+    state: "complete",
+    filename: `/Users/researcher/Downloads/${jobDownloadFilename(jobID)}`,
+  });
+  expect(await internals.claimDownloadInitiated(jobID)).toBe(true);
+  expect(internals.store.activeJobs[0]?.download_initiated).toBe(true);
 });
