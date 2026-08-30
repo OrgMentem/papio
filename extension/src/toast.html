@@ -14,6 +14,13 @@
         --toast-border: #d3d7de;
         --toast-accent: #1c5fd6;
         --toast-accent-fg: #ffffff;
+        /* papio's mark, same values as every other papio surface. Its accent is
+           deliberately not `--toast-accent`: the brand mark is red-orange and
+           the primary control is blue on every papio page, so matching them
+           here would make this the one surface where the mark is a different
+           colour. */
+        --color-brand-ink: #2b2d42;
+        --color-brand-accent: #d94f3d;
       }
 
       @media (prefers-color-scheme: dark) {
@@ -23,6 +30,8 @@
           --toast-border: #3a4049;
           --toast-accent: #6f9cf0;
           --toast-accent-fg: #10131a;
+          --color-brand-ink: #f0edf3;
+          --color-brand-accent: #ef6a57;
         }
       }
 

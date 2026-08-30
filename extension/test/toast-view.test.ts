@@ -2,7 +2,17 @@
 import { test, expect } from "bun:test";
 import { Window } from "happy-dom";
 
-import { TOAST_COPY, TOAST_WINDOW_MS, renderToast, toastKindForLoss } from "../src/toast-view";
+import {
+  PAPIO_MARK,
+  PAPIO_MARK_SIZE_PX,
+  PAPIO_MARK_VIEWBOX,
+  TOAST_COPY,
+  TOAST_WINDOW_MS,
+  TOAST_WINDOW_SIZE,
+  renderPapioMark,
+  renderToast,
+  toastKindForLoss,
+} from "../src/toast-view";
 
 function toastDocument(): { doc: Document; container: HTMLElement } {
   const window = new Window();
@@ -49,6 +59,55 @@ test("no rendered text carries the job id", () => {
   // because a helpful `data-job-id` on the button would leak it just as far.
   expect(container.textContent ?? "").not.toContain(jobID);
   expect(container.outerHTML).not.toContain(jobID);
+});
+
+test("papio's mark leads the toast, and says nothing to a screen reader", () => {
+  const { doc, container } = toastDocument();
+  const { mark } = renderToast(doc, container, { kind: "route_lost", job_id: "job-1" });
+
+  // First child, not last: this is the one papio surface that can appear inside
+  // a publisher's page, so the sender must read before the claim.
+  expect(container.firstElementChild).toBe(mark as unknown as Element);
+  expect(mark.getAttribute("viewBox")).toBe(PAPIO_MARK_VIEWBOX);
+  // Decorative. The sentence beside it already names papio, so a title or label
+  // here would announce the sender twice.
+  expect(mark.getAttribute("aria-hidden")).toBe("true");
+  expect(mark.querySelector("title")).toBeNull();
+  expect(mark.getAttribute("aria-label")).toBeNull();
+  // The window route is a papio document, so it names its colours rather than
+  // baking literals a theme change would strand. Asserted in order, not as a
+  // set: the ring is the ink shape and the other three are accent, so an
+  // ink/accent swap must fail here rather than pass on "both colours appear".
+  const strokes = [...mark.children].map((el) => el.getAttribute("stroke"));
+  expect(strokes).toEqual(
+    PAPIO_MARK.map((shape) =>
+      shape.role === "ink" ? "var(--color-brand-ink)" : "var(--color-brand-accent)",
+    ),
+  );
+  expect(strokes[0]).toBe("var(--color-brand-ink)");
+});
+
+test("the mark's outlines are not filled", () => {
+  // The ring and the stem are stroked paths; an inherited `fill` turns each into
+  // a black blob, which is what happens when the fill attribute is simply
+  // omitted. Only the descender's arrowhead is a filled shape.
+  const { doc } = toastDocument();
+  const mark = renderPapioMark(doc, "#111111", "#222222");
+  const fills = [...mark.children].map((el) => el.getAttribute("fill"));
+  expect(fills).toEqual(["none", "none", "none", "#222222"]);
+  expect(PAPIO_MARK.filter((shape) => shape.filled === true)).toHaveLength(1);
+});
+
+test("the mark carries no colour of its own", () => {
+  // The geometry is shared with the injected route, which cannot resolve custom
+  // properties. A colour attribute baked into `PAPIO_MARK` would therefore paint
+  // one route correctly and the other wrongly, with nothing to catch it.
+  for (const shape of PAPIO_MARK) {
+    for (const name of Object.keys(shape.attrs)) {
+      expect(name, `${shape.role} shape carries ${name}`).not.toBe("fill");
+      expect(name, `${shape.role} shape carries ${name}`).not.toBe("stroke");
+    }
+  }
 });
 
 test("no copy entry names an identifier, provider, or URL", () => {
@@ -124,18 +183,50 @@ test("the window is wide enough for the longest copy to wrap to two lines", () =
   // clipped. At 420px — the popup's width — the institutional message wraps to
   // four lines and needs 106px of inner height, while windows.create's height
   // includes the platform frame, so 108 outer left ~80 inner and hid the
-  // button. Measured in a real browser at 520px: both messages wrap to two
-  // lines and need 65px inner.
+  // button. At 520 both messages wrapped to two lines and needed 65px inner.
   //
-  // This pins the INPUT to that measurement, which is what a future copy change
-  // would break: a longer sentence re-wraps and the window no longer fits it.
-  // The per-message bound below is what the 520px measurement allows at this
-  // font, leaving the two controls their room.
+  // Adding the mark took 40px off that row (28px plus the 12px gap) and pushed
+  // the institutional message back to three lines and 85px — one past the 84
+  // that a 116 outer leaves on macOS. Re-measured in a real browser at
+  // PAPIO_MARK_SIZE_PX, the two-line boundary is exactly 552px.
+  //
+  // Two assertions, because the surface has two independent inputs. This one
+  // pins the WIDTH against that boundary, with slack for platforms whose
+  // system-ui metrics run wider than macOS's.
+  const measuredBoundaryAt28 = 552;
+  expect(TOAST_WINDOW_SIZE.width).toBeGreaterThanOrEqual(measuredBoundaryAt28 + 20);
+  // And this one pins the COPY, which is what a future wording change would
+  // break: a longer sentence re-wraps and the window no longer fits it.
   for (const [kind, copy] of Object.entries(TOAST_COPY)) {
     const longestWord = Math.max(...copy.message.split(" ").map((word) => word.length));
     expect(longestWord, `${kind} has an unwrappable word`).toBeLessThanOrEqual(14);
-    // Message plus action label share one 520px row. Both together past this
-    // and the two-line measurement no longer holds.
+    // Mark, message, and action label share one row. Both together past this and
+    // the two-line measurement no longer holds.
     expect(copy.message.length + copy.action.length, kind).toBeLessThanOrEqual(100);
   }
+});
+
+test("the mark fits the two-line text block without setting the card's height", () => {
+  // Both bounds are measured, and the width boundary above was measured at this
+  // size — so this is the assertion that catches a size change made for looks
+  // and invalidating that measurement silently.
+  //
+  // Lower bound: the 20px line box, which was the first rule tried and rendered
+  // visibly undersized against two lines of copy. Upper bound: the 41px two-line
+  // block, past which the mark, not the sentence, decides how tall the card is.
+  expect(PAPIO_MARK_SIZE_PX).toBeGreaterThan(Math.round(14 * 1.45));
+  expect(PAPIO_MARK_SIZE_PX).toBeLessThan(41);
+});
+
+test("one constant sizes the mark on both routes", () => {
+  // `toast.html` used to carry a `.toast-mark` rule with its own pixel value,
+  // which the injected route could not read — two numbers that had to agree with
+  // nothing making them. The shared builder now sizes the element itself.
+  const { doc, container } = toastDocument();
+  const { mark } = renderToast(doc, container, { kind: "route_lost", job_id: "job-1" });
+  expect(mark.style.width).toBe(`${PAPIO_MARK_SIZE_PX}px`);
+  expect(mark.style.height).toBe(`${PAPIO_MARK_SIZE_PX}px`);
+  // A mark that can shrink squashes exactly when the copy is longest, which is
+  // the case the width measurement is about.
+  expect(mark.style.flexShrink).toBe("0");
 });

@@ -4,10 +4,15 @@ import { Window } from "happy-dom";
 import { renderPageToast } from "../src/background";
 import { capturePage } from "../src/capture";
 import {
+  PAPIO_MARK,
+  PAPIO_MARK_SIZE_PX,
+  PAPIO_MARK_VIEWBOX,
   TOAST_COPY,
   TOAST_PAGE_ACTION_MESSAGE,
   TOAST_PAGE_DISMISS_MESSAGE,
   TOAST_WINDOW_MS,
+  TOAST_WINDOW_SIZE,
+  renderToast,
   type ToastInjection,
 } from "../src/toast-view";
 
@@ -75,6 +80,10 @@ function harness(injection?: Partial<ToastInjection>): Harness {
     window_ms: TOAST_WINDOW_MS,
     action_message: TOAST_PAGE_ACTION_MESSAGE,
     dismiss_message: TOAST_PAGE_DISMISS_MESSAGE,
+    mark: PAPIO_MARK,
+    mark_viewbox: PAPIO_MARK_VIEWBOX,
+    mark_size_px: PAPIO_MARK_SIZE_PX,
+    max_width_px: TOAST_WINDOW_SIZE.width,
     ...injection,
   };
   expect(renderPageToast(payload)).toBe(true);
@@ -119,6 +128,84 @@ test("the toast carries the copy and exactly one action", () => {
   // into a page. The copy table forbids it; this pins it at the DOM.
   expect(root?.textContent ?? "").not.toContain("job-1");
   expect(root?.textContent ?? "").not.toContain("tok-1");
+});
+
+test("the injected mark resolves real colours, never a custom property", () => {
+  // The failure this exists for: copying the window route's colour arguments,
+  // which name `--color-brand-*`. Those properties are papio's, and this DOM is
+  // the publisher's, so `var(...)` resolves to nothing and the mark renders
+  // invisible — a defect no snapshot of papio's own pages can show.
+  const root = harness().host()?.shadowRoot;
+  const mark = root?.querySelector("svg");
+  expect(mark).not.toBeNull();
+  const painted = [...(mark?.children ?? [])].flatMap((el) => [
+    el.getAttribute("stroke") ?? "",
+    el.getAttribute("fill") ?? "",
+  ]);
+  expect(painted.length).toBeGreaterThan(0);
+  for (const value of painted) {
+    expect(value, "colour must be a literal in a page papio does not own").not.toContain("var(");
+    expect(value === "none" || /^#[0-9a-f]{6}$/.test(value), `unpaintable: ${value}`).toBe(true);
+  }
+});
+
+test("the injected mark leads the card and is hidden from assistive tech", () => {
+  const root = harness().host()?.shadowRoot;
+  const card = root?.firstElementChild;
+  const mark = card?.firstElementChild;
+  expect(mark?.tagName.toLowerCase()).toBe("svg");
+  expect(mark?.getAttribute("aria-hidden")).toBe("true");
+  // The card is the `alertdialog`, described by the message. A mark that landed
+  // inside the live region would be announced as part of the sentence.
+  expect(card?.getAttribute("role")).toBe("alertdialog");
+  expect(mark?.getAttribute("id")).toBeNull();
+});
+
+test("both routes draw the same mark, in the same order", () => {
+  // The drift guard. The geometry has one definition and travels to the injected
+  // route as data, but the two routes run their own build loops, so this asserts
+  // the drawing that actually lands in each. A shape dropped, reordered, or
+  // recoloured on one side fails here.
+  const windowDoc = new Window();
+  const container = windowDoc.document.createElement("div");
+  windowDoc.document.body.append(container);
+  const { mark: windowMark } = renderToast(
+    windowDoc.document as unknown as Document,
+    container as unknown as HTMLElement,
+    { kind: "route_lost", job_id: "job-1" },
+  );
+  const injectedMark = harness().host()?.shadowRoot?.querySelector("svg");
+
+  const geometry = (element: Element | null | undefined): unknown[] =>
+    [...(element?.children ?? [])].map((shape) => ({
+      tag: shape.tagName.toLowerCase(),
+      // Colours are excluded on purpose: they are the one thing the two routes
+      // MUST resolve differently.
+      d: shape.getAttribute("d"),
+      r: shape.getAttribute("r"),
+      transform: shape.getAttribute("transform"),
+      width: shape.getAttribute("stroke-width"),
+      cap: shape.getAttribute("stroke-linecap"),
+      join: shape.getAttribute("stroke-linejoin"),
+      filled: shape.getAttribute("fill") !== "none",
+    }));
+
+  expect(geometry(injectedMark)).toEqual(geometry(windowMark as unknown as Element));
+  expect(geometry(injectedMark)).toHaveLength(PAPIO_MARK.length);
+  expect(injectedMark?.getAttribute("viewBox")).toBe(windowMark.getAttribute("viewBox"));
+});
+
+test("a capture taken while the mark is up carries no papio path data", () => {
+  // The mark is four path strings that appear in no publisher's page. If it ever
+  // rendered outside the stripped host, those strings would be committed into
+  // every fixture captured while a toast was up, and would read as the
+  // provider's own markup.
+  const h = harness();
+  const serialized = h.doc.documentElement.outerHTML;
+  for (const shape of PAPIO_MARK) {
+    const d = shape.attrs["d"];
+    if (d !== undefined) expect(serialized).not.toContain(d);
+  }
 });
 
 test("the toast removes itself BEFORE it reports the action", () => {
@@ -194,6 +281,10 @@ test("a second loss replaces the first toast rather than stacking", () => {
     window_ms: TOAST_WINDOW_MS,
     action_message: TOAST_PAGE_ACTION_MESSAGE,
     dismiss_message: TOAST_PAGE_DISMISS_MESSAGE,
+    mark: PAPIO_MARK,
+    mark_viewbox: PAPIO_MARK_VIEWBOX,
+    mark_size_px: PAPIO_MARK_SIZE_PX,
+    max_width_px: TOAST_WINDOW_SIZE.width,
   });
   expect(h.doc.querySelectorAll(`#${HOST_ID}`)).toHaveLength(1);
   expect(h.host()?.shadowRoot?.textContent).toContain(
@@ -256,4 +347,17 @@ test("a capture taken while a toast is up contains no trace of papio", () => {
   expect(h.host()).not.toBeNull();
   expect(h.button(TOAST_COPY.route_lost.action)).toBeDefined();
   expect(view).toBeDefined();
+});
+
+test("the injected card is sized like the window, not 30px wider", () => {
+  // Both routes read `TOAST_WINDOW_SIZE.width`, but a shared constant only means
+  // a shared size if the box model agrees. `toast.html`'s body is border-box, so
+  // that number includes padding and border; a content-box card renders the same
+  // constant 30px wider — measured live at 606 against 576, which is the two
+  // routes drifting while looking like they share one measurement.
+  const root = harness().host()?.shadowRoot;
+  const card = root?.firstElementChild as HTMLElement | null;
+  const style = card?.getAttribute("style") ?? "";
+  expect(style).toContain("box-sizing: border-box");
+  expect(style).toContain(`${TOAST_WINDOW_SIZE.width}px`);
 });

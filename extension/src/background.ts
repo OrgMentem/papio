@@ -16,10 +16,14 @@
 // unit-testable without a real chrome runtime.
 
 import {
+  PAPIO_MARK,
+  PAPIO_MARK_SIZE_PX,
+  PAPIO_MARK_VIEWBOX,
   TOAST_COPY,
   TOAST_PAGE_ACTION_MESSAGE,
   TOAST_PAGE_DISMISS_MESSAGE,
   TOAST_WINDOW_MS,
+  TOAST_WINDOW_SIZE,
   type ToastInjection,
   type ToastKind,
   type ToastPayload,
@@ -492,17 +496,6 @@ const MATERIALIZE_PAGE_PATH = POPUP_PAGE_PATH.replace(
  * deployment, and this surface's whole job is to appear when something already
  * went wrong — a broken page URL here would be silent. */
 const TOAST_PAGE_PATH = POPUP_PAGE_PATH.replace(/[^/]*$/, "toast.html");
-/** A toast, not a browser window: small, chrome-less, and deliberately
- * unfocused.
- *
- * Measured, not guessed. At 420px — the popup's width, which this first used —
- * the longer of the two messages wraps to FOUR lines and needs 106px of inner
- * height, while `windows.create` height includes the window frame, so a 108
- * outer left roughly 80 inner and clipped the copy. At 520 both messages wrap
- * to two lines and need 65 inner; 116 outer leaves room for the largest frame
- * across macOS, Windows, Linux and Firefox. `toast.html` also scrolls rather
- * than clips, so copy that outgrows this degrades visibly instead of silently. */
-const TOAST_WINDOW_SIZE = { width: 520, height: 116 } as const;
 /** How long a papio surface's focus report suppresses the toast. */
 const TOAST_PRESENCE_TTL_MS = 30_000;
 
@@ -549,9 +542,13 @@ export function renderPageToast(injection: ToastInjection): boolean {
   // empty host rather than papio's sentence.
   const root = host.attachShadow({ mode: "open" });
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-  const [ink, border, surface, accentInk, accent] = dark
-    ? ["#e9ecf1", "#3a4049", "#1c1f26", "#0f1115", "#8fb4e0"]
-    : ["#16181d", "#d3d7de", "#ffffff", "#ffffff", "#1c5fd6"];
+  // The card's own palette, plus papio's brand pair for the mark. The brand
+  // colours are the same literals every papio page sets as `--color-brand-*`;
+  // they cannot be read as custom properties here, because the document these
+  // styles land in is the publisher's, not papio's.
+  const [ink, border, surface, accentInk, accent, brandInk, brandAccent] = dark
+    ? ["#e9ecf1", "#3a4049", "#1c1f26", "#10131a", "#6f9cf0", "#f0edf3", "#ef6a57"]
+    : ["#16181d", "#d3d7de", "#ffffff", "#ffffff", "#1c5fd6", "#2b2d42", "#d94f3d"];
   const card = document.createElement("div");
   card.setAttribute("role", "alertdialog");
   card.setAttribute("aria-describedby", "papio-toast-message");
@@ -560,14 +557,35 @@ export function renderPageToast(injection: ToastInjection): boolean {
     `background:${surface}`,
     `border:1px solid ${border}`,
     "border-radius:10px",
+    // `toast.html`'s body is border-box, so the shared width means the box
+    // INCLUDING padding and border there. Without this the same constant sizes
+    // the content box here, and the injected card renders 30px wider than the
+    // window it is supposed to match — measured at 606 against 576.
+    "box-sizing:border-box",
     "box-shadow:0 10px 30px rgb(16 22 33 / 22%)",
     `color:${ink}`,
     "display:flex",
     "font:14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
     "gap:12px",
-    "max-width:min(520px, calc(100vw - 32px))",
+    `max-width:min(${injection.max_width_px}px, calc(100vw - 32px))`,
     "padding:12px 14px",
   ].join(";");
+  // The same loop `renderPapioMark` runs, over the same geometry, inline because
+  // a function reference cannot cross this serialization boundary. Decorative:
+  // `aria-hidden`, no title, no label — the sentence beside it names papio.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const mark = document.createElementNS(SVG_NS, "svg");
+  mark.setAttribute("viewBox", injection.mark_viewbox);
+  mark.setAttribute("aria-hidden", "true");
+  mark.style.cssText = `flex:none;width:${injection.mark_size_px}px;height:${injection.mark_size_px}px`;
+  for (const shape of injection.mark) {
+    const el = document.createElementNS(SVG_NS, shape.tag);
+    for (const [name, value] of Object.entries(shape.attrs)) el.setAttribute(name, value);
+    const colour = shape.role === "ink" ? brandInk : brandAccent;
+    el.setAttribute("stroke", colour);
+    el.setAttribute("fill", shape.filled === true ? colour : "none");
+    mark.append(el);
+  }
   const message = document.createElement("p");
   message.id = "papio-toast-message";
   message.textContent = injection.message;
@@ -631,7 +649,7 @@ export function renderPageToast(injection: ToastInjection): boolean {
     () => settle(injection.dismiss_message, "expired"),
     injection.window_ms,
   );
-  card.append(message, action, dismiss);
+  card.append(mark, message, action, dismiss);
   root.append(card);
   document.documentElement.append(host);
   return true;
@@ -11010,6 +11028,10 @@ export class Bridge {
             window_ms: TOAST_WINDOW_MS,
             action_message: TOAST_PAGE_ACTION_MESSAGE,
             dismiss_message: TOAST_PAGE_DISMISS_MESSAGE,
+            mark: PAPIO_MARK,
+            mark_viewbox: PAPIO_MARK_VIEWBOX,
+            mark_size_px: PAPIO_MARK_SIZE_PX,
+            max_width_px: TOAST_WINDOW_SIZE.width,
           } satisfies ToastInjection,
         ],
       });
