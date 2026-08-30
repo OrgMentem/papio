@@ -2137,7 +2137,7 @@ test("a newer inconclusive recheck replaces stale verdict copy without changing 
     releasedAuthJobs: 0,
   };
   const expected: Record<string, string> = {
-    no_tab: "No library page open — open your library to verify",
+    no_tab: "Signed in recently — no library page open to recheck",
     no_markers: "Signed-in state unclear on this page",
     scan_failed: "papio couldn't read the library page — open it to retry",
     partial_scan: "Too many library tabs to check reliably",
@@ -2155,7 +2155,12 @@ test("a newer inconclusive recheck replaces stale verdict copy without changing 
     });
     expect(card.label).toBe(label);
     expect(card.label).not.toContain("Signed out");
-    if (outcome !== "no_markers") expect(card.detail).toBe("");
+    if (outcome === "no_tab") {
+      expect(card.detail).toBe("via your library tab");
+      expect(card.action).toBe("none");
+    } else if (outcome !== "no_markers") {
+      expect(card.detail).toBe("");
+    }
   }
 
   const blocker = deriveSessionCardState({

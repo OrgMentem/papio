@@ -109,9 +109,17 @@ The entry point:
 4. persists that reason before returning; and
 5. requests a probe with the dedicated `institutional_landing` reason.
 
-The probe still uses the existing per-origin 10-second start floor, generation
-fence, bounded tab scan, and single commit path. It never creates or surfaces a
-tab.
+The probe keeps the existing per-origin 10-second start floor, generation
+fence, bounded tab scan, and single commit path. It never treats the publisher
+page as evidence and never surfaces a new tab merely because that page landed.
+
+Amended 2026-08-31: the first implementation could not complete the check when
+*papio*'s owned resolver tab remained parked on an identity-provider page. A
+correlated landing may now retire ownership of that paused tab and create a
+fresh, muted background tab at the configured resolver origin. The old visible
+sign-in tab remains open. If the replacement fails, *papio* restores the old
+ownership and recheck watch. Only the configured resolver page can commit the
+session verdict.
 
 The pending reason contains only `parked_demand` or `tracked_auth_return`
 beside the configured origin already present in the snapshot. It survives
@@ -202,6 +210,12 @@ This distinction prevents two false statements:
 - a failed recheck cannot report **Signed out or expired**; and
 - a prior signed-in verdict cannot hide that papio failed to confirm the
   session now.
+
+Amended 2026-08-31: `no_tab` now uses compound copy when it follows a fresh,
+preserved `in` verdict. The card reports both facts: the session was confirmed
+recently, and no library page remains open for another check. It does not offer
+a misleading **Sign in** action. Every other newer inconclusive outcome keeps
+the precedence above.
 
 The existing outcome vocabulary remains unchanged: `no_tab`, `no_markers`,
 `scan_failed`, `partial_scan`, and `conflict` all remain inconclusive.

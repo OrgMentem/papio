@@ -1077,7 +1077,12 @@ export class KeepaliveManager {
 
   /** Schedule a resolver probe for one already-correlated publisher landing.
    * A tracked auth return remains actionable after its job leaves
-   * auth_pending; an untracked landing remains demand-bound. */
+   * auth_pending; an untracked landing remains demand-bound.
+   *
+   * A provider landing can complete a sign-in outside papio's reauth tab. If
+   * the owned tab is still parked on an IdP, retire only its ownership and
+   * create a fresh resolver tab. The old visible tab remains open, so this
+   * recovery never destroys a sign-in surface the operator might still use. */
   async noteInstitutionalLanding(
     origin: string,
     cause: "parked_demand" | "tracked_auth_return" = "parked_demand",
@@ -1095,8 +1100,74 @@ export class KeepaliveManager {
       institutionalRecheckCause: cause,
     });
     if (this.hostPermissions.get(target) === "granted") {
-      void this.requestProbe(target, "institutional_landing");
+      const preferredTabID = await this.refreshPausedResolverTab(target);
+      void this.requestProbe(target, "institutional_landing", preferredTabID);
     }
+  }
+
+  /** Replace a current paused IdP tab with a background resolver probe.
+   *
+   * The IdP tab becomes user-owned and remains open. A creation failure
+   * restores the old ownership and reauth watch, so the existing recovery
+   * surface never disappears without a replacement. */
+  private async refreshPausedResolverTab(origin: string): Promise<number | undefined> {
+    const oldTabID = this.tabID;
+    if (
+      !this.reauthPaused ||
+      oldTabID === undefined ||
+      this.resolver?.origin !== origin
+    ) {
+      return undefined;
+    }
+
+    let oldTabExists = false;
+    try {
+      const oldTab = await this.api.tabs.get(oldTabID);
+      oldTabExists = true;
+      const resolver = new URL(origin);
+      if (
+        typeof oldTab.url === "string" &&
+        resolverURLMatches(oldTab.url, resolver)
+      ) {
+        return oldTabID;
+      }
+    } catch {
+      // A missing paused tab needs the same fresh resolver replacement.
+    }
+
+    // An origin or ownership change while tabs.get() was pending supersedes
+    // this landing. Its newer owner is responsible for the next probe.
+    if (
+      !this.reauthPaused ||
+      this.tabID !== oldTabID ||
+      this.resolver?.origin !== origin
+    ) {
+      return undefined;
+    }
+
+    this.tabID = undefined;
+    this.reauthPaused = false;
+    this.clearReauthTimer();
+    void this.updateOriginSnapshot(origin, { pausedForReauth: false });
+    this.options.onReauthStateChanged?.(false);
+    await this.createTab();
+
+    if (
+      this.tabID === undefined &&
+      oldTabExists &&
+      this.resolver?.origin === origin
+    ) {
+      // Browser policy rejected the replacement. Preserve the old visible
+      // sign-in surface and its short recheck loop.
+      this.tabID = oldTabID;
+      this.reauthPaused = true;
+      void this.updateOriginSnapshot(origin, { pausedForReauth: true });
+      this.options.onReauthStateChanged?.(true);
+      this.armReauthTimer();
+      return oldTabID;
+    }
+
+    return this.resolver?.origin === origin ? this.tabID : undefined;
   }
   private updateOriginSnapshot(
     origin: string | undefined,

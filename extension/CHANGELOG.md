@@ -82,6 +82,15 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **A publisher sign-in now refreshes a resolver tab stranded on the identity
+  provider.** The publisher landing already requested a library-session check,
+  but that check found no library page while *papio*'s own tab remained on the
+  old sign-in route. *papio* now leaves that visible route open, creates a muted
+  background resolver tab, and reads the verdict there. If the browser refuses
+  the replacement, the old sign-in tab and its recheck loop remain active. A
+  recently verified session followed by an empty recheck now says both facts
+  instead of replacing **Signed in** with **No library page open**, and it no
+  longer offers a misleading **Sign in** button.
 - **Signing in now counts, even when it took you a few minutes.** *papio* gave
   itself twenty seconds to read the page after a sign-in returned, then stopped
   without a verdict. A real sign-in takes minutes, and the browser usually stops

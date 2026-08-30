@@ -409,20 +409,26 @@ it does not automate your credentials.
 
 The popup's **Institution session** card reports the browser-local resolver
 state: **Signed in**, **Signed in <age> - due a recheck**, **Signed out or
-expired**, **Sign-in needed - papio paused**, or **Keep-warm off**. An
-inconclusive new check says what papio could not verify instead of repeating an
-older signed-in or signed-out verdict. When every configured institution is
-signed in and freshly verified, the card says **All institutions signed in**.
+expired**, **Sign-in needed - papio paused**, or **Keep-warm off**. A newer
+inconclusive check says what *papio* could not verify instead of repeating an
+older verdict. One exception keeps both facts visible: a fresh signed-in
+verdict followed by an empty check says **Signed in recently - no library page
+open to recheck**. When every configured institution is signed in and freshly
+verified, the card says **All institutions signed in**.
 
 If a paper is waiting for sign-in, a completed HTTPS navigation on that
 paper's declared publisher host schedules a fresh check of the matching
 library resolver. The extension reads no publisher page content for this
 trigger. The publisher page cannot set the popup's signed-in or signed-out
-verdict. A tracked *papio* tab returning from authentication can still release
-same-institution queued work through its existing job-scoped evidence path.
-Other hosts, queued-only papers, unknown bindings, and ambiguous institutions
-do not authorize this publisher-triggered check. A same-document sign-in with
-no completed navigation falls back to the normal keep-warm refresh cycle.
+verdict. If *papio*'s own resolver tab is still paused on an identity-provider
+page, *papio* leaves that page open and creates a muted background resolver tab
+for the check. The replacement surfaces only when the resolver itself says
+that sign-in is still required. A tracked *papio* tab returning from
+authentication can still release same-institution queued work through its
+existing job-scoped evidence path. Other hosts, queued-only papers, unknown
+bindings, and ambiguous institutions do not authorize this publisher-triggered
+check. A same-document sign-in with no completed navigation falls back to the
+normal keep-warm refresh cycle.
 
 If the browser still needs access to the configured resolver, the card says
 **Library page access required** and offers **Allow** for that institution

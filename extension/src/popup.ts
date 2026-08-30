@@ -1254,6 +1254,13 @@ function latestInconclusiveCard(
   if (verdict !== "unknown" && !hasNewerInconclusiveAttempt(state)) {
     return undefined;
   }
+  if (outcome === "no_tab" && verdict === "in" && state.authenticated) {
+    return {
+      label: "Signed in recently — no library page open to recheck",
+      detail: sessionEvidenceDetail(state),
+      action: "none",
+    };
+  }
   switch (outcome) {
     case "no_tab":
       return {

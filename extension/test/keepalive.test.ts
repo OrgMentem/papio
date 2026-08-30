@@ -1103,6 +1103,77 @@ test("a tracked auth return rechecks after its demand state has advanced", async
   expect(h.scripting.injectionCounts.get(1) ?? 0).toBeGreaterThan(0);
 });
 
+test("a provider landing replaces a paused IdP owner with a fresh resolver probe", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    demandOrigins: [origin],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  const idpURL =
+    "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  h.tabs.patch(1, { url: idpURL });
+  await h.manager.probeForeground(origin);
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(true);
+
+  await h.manager.noteInstitutionalLanding(origin);
+  await flushMicrotasks();
+
+  const replacement = h.tabs
+    .list()
+    .find((tab) => tab.id !== 1 && tab.url === origin);
+  expect(replacement).toMatchObject({
+    active: false,
+    pinned: true,
+    muted: true,
+  });
+  // The stale sign-in surface becomes user-owned instead of being closed.
+  expect(h.tabs.snapshot(1)?.url).toBe(idpURL);
+  expect(h.tabs.removed).not.toContain(1);
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(false);
+  expect(h.reauthState).toEqual([true, false]);
+
+  h.clock.advanceBy(MIN_PROBE_START_SPACING_MS);
+  await h.timers.runDue();
+  await flushMicrotasks();
+
+  expect(h.freshEvidence).toContainEqual(
+    expect.objectContaining({ origin }),
+  );
+  expect(
+    h.manager.getOriginSnapshots()[0]?.institutionalRecheckCause,
+  ).toBeUndefined();
+});
+
+test("a blocked replacement preserves the paused IdP owner and its recheck watch", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    demandOrigins: [origin],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  const idpURL =
+    "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  h.tabs.patch(1, { url: idpURL });
+  await h.manager.probeForeground(origin);
+  h.tabs.failCreate = true;
+
+  await h.manager.noteInstitutionalLanding(origin);
+  await flushMicrotasks();
+
+  expect(h.tabs.snapshot(1)?.url).toBe(idpURL);
+  expect(h.tabs.removed).not.toContain(1);
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(true);
+  expect(h.reauthState).toEqual([true, false, true]);
+  expect(h.timers.pendingDelays()).toContain(10);
+});
+
 test("one wake runs one probe when ordinary and institutional recovery overlap", async () => {
   const origin = "https://resolver.example.edu";
   const h = makeHarness(4, undefined, {
