@@ -600,24 +600,20 @@
     <section>
       <h2>Keep your institution session warm</h2>
       <p class="lede">
-        <em>papio</em> keeps your library session fresh by refreshing a pinned background tab.
-        Turn this off if you prefer to sign in manually for each handoff.
+        Choose whether <em>papio</em> refreshes your current library resolver while it has work,
+        continuously between batches, or never. It never reads passwords or cookies.
       </p>
       <div class="card">
-        <div class="row" id="keepalive-enabled-row">
+        <div class="row" id="keepalive-mode-row">
           <div>
-            <div class="source-label">Keep-warm session</div>
-            <div class="hint">Refresh a pinned resolver tab while institutional downloads are active.</div>
+            <div class="source-label">Keep-warm mode</div>
+            <div class="hint">Always mode keeps the most recently used library active between papio batches.</div>
           </div>
-          <button
-            id="keepalive-enabled"
-            class="switch"
-            type="button"
-            role="switch"
-            aria-checked="true"
-            aria-label="Keep-warm institution session"
-            disabled
-          ></button>
+          <select id="keepalive-mode" aria-label="Institution session keep-warm mode" disabled>
+            <option value="demand">While papio has work</option>
+            <option value="always">Always for current library</option>
+            <option value="off">Off</option>
+          </select>
         </div>
         <div class="row" id="keepalive-interval-row">
           <div>

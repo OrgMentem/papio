@@ -11,6 +11,7 @@ import {
   clampKeepaliveInterval,
   collectResolverMarkers,
   isAuthenticationURL,
+  keepaliveModeFromStorage,
   KeepaliveManager,
   MAX_AFFORDANCE_LENGTH,
   MAX_CONTROL_TEXT_DEPTH,
@@ -284,7 +285,7 @@ function makeHarness(
   const originStateWrites: KeepaliveOriginSnapshot[][] = [];
   const storageValues: Record<string, unknown> = {
     "keepalive.interval": interval,
-    "keepalive.enabled": true,
+    "keepalive.mode": "demand",
     "keepalive.resolverOrigin": resolverConfig?.storedOrigin,
     ...(resolverConfig?.storageValues ?? {}),
   };
@@ -395,6 +396,39 @@ test("creates one pinned resolver tab, reloads it, and closes it when jobs finis
   await h.manager.sync();
 
   expect(h.tabs.removed).toEqual([1]);
+});
+
+test("explicit keepalive modes preserve the previous opt-out", () => {
+  expect(keepaliveModeFromStorage({ "keepalive.mode": "always", "keepalive.enabled": false })).toBe("always");
+  expect(keepaliveModeFromStorage({ "keepalive.mode": "off", "keepalive.enabled": true })).toBe("off");
+  expect(keepaliveModeFromStorage({ "keepalive.enabled": false })).toBe("off");
+  expect(keepaliveModeFromStorage({ "keepalive.enabled": true })).toBe("demand");
+  expect(keepaliveModeFromStorage({})).toBe("demand");
+});
+
+test("always mode keeps one resolver tab without institutional work", async () => {
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    storageValues: { "keepalive.mode": "always" },
+  });
+  h.jobs.count = 0;
+
+  await h.manager.init();
+  expect(h.tabs.created).toEqual([
+    { url: "https://resolver.example.edu", active: false, pinned: true, muted: true },
+  ]);
+
+  await h.manager.sync();
+  expect(h.tabs.removed).toEqual([]);
+});
+
+test("off mode opens no resolver tab while institutional work exists", async () => {
+  const h = makeHarness(4, undefined, {
+    storageValues: { "keepalive.mode": "off" },
+  });
+
+  await h.manager.init();
+  expect(h.tabs.created).toEqual([]);
 });
 
 /** Drains the microtask queue without a real timer or macrotask: nothing

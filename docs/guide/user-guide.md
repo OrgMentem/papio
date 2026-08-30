@@ -438,11 +438,18 @@ when a library route is configured. Sign in, complete any MFA or other
 institution step yourself, and return to the provider page; *papio* never
 fills credentials or copies cookies.
 
-The **Options** page controls this browser-local behavior. **Keep-warm
-session** enables or pauses refreshes of the pinned resolver tab, and
-**Refresh interval** chooses how often it is refreshed (2–30 minutes). The
-card and options controls describe this browser's session only; they do not
-change daemon access policy or send login details anywhere.
+The **Options** page controls this browser-local behavior. **Keep-warm mode**
+has three settings:
+
+- **While papio has work** refreshes the resolver while institutional papers
+  are active.
+- **Always for current library** keeps the configured resolver warm even when
+  no paper currently needs it.
+- **Off** stops automatic resolver checks.
+
+**Refresh interval** chooses how often either active mode refreshes the resolver
+(2–30 minutes). The card and options controls describe this browser's session
+only. They do not change daemon access policy or send login details anywhere.
 
 ### Send a PDF already open in the browser
 

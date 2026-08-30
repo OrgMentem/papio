@@ -23,6 +23,7 @@ interface OptionsPage {
   runtimeMessages: Array<{ type: string; request: Record<string, unknown> }>;
   storageGetKeys: string[];
   storageSetKeys: string[];
+  storageRemovedKeys: string[];
 }
 
 interface OptionsPageOptions {
@@ -71,6 +72,7 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
   const runtimeMessages: Array<{ type: string; request: Record<string, unknown> }> = [];
   const storageGetKeys: string[] = [];
   const storageSetKeys: string[] = [];
+  const storageRemovedKeys: string[] = [];
 
   Object.assign(globalThis, {
     window,
@@ -134,6 +136,13 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
             if (options.storageSetFails && Object.keys(items).some((k) => options.storageSetFails!.has(k))) throw new Error("quota exceeded");
             Object.assign(storageValues, items);
           },
+          remove: async (key: string | string[]) => {
+            const keys = Array.isArray(key) ? key : [key];
+            for (const entry of keys) {
+              storageRemovedKeys.push(entry);
+              delete storageValues[entry];
+            }
+          },
         },
       },
     },
@@ -156,6 +165,7 @@ async function optionsDocument(options: OptionsPageOptions = {}): Promise<Option
     runtimeMessages,
     storageGetKeys,
     storageSetKeys,
+    storageRemovedKeys,
   };
 }
 
@@ -308,6 +318,50 @@ test("keeps version diagnostics collapsed in settings", async () => {
   expect(diagnostics).not.toBeNull();
   expect(diagnostics?.hasAttribute("open")).toBe(false);
   expect(diagnostics?.contains(page.document.getElementById("daemon-footer"))).toBe(true);
+});
+
+test("keep-warm defaults to work demand and preserves the previous opt-out", async () => {
+  const defaultPage = await optionsDocument();
+  const defaultMode = defaultPage.document.getElementById("keepalive-mode") as HTMLSelectElement;
+  const defaultInterval = defaultPage.document.getElementById("keepalive-interval") as HTMLInputElement;
+  expect(defaultMode.value).toBe("demand");
+  expect(defaultInterval.disabled).toBe(false);
+
+  const optedOut = await optionsDocument({ storageSeed: { "keepalive.enabled": false } });
+  const optedOutMode = optedOut.document.getElementById("keepalive-mode") as HTMLSelectElement;
+  const optedOutInterval = optedOut.document.getElementById("keepalive-interval") as HTMLInputElement;
+  expect(optedOutMode.value).toBe("off");
+  expect(optedOutInterval.disabled).toBe(true);
+});
+
+test("selecting always mode replaces the previous boolean preference", async () => {
+  const page = await optionsDocument({ storageSeed: { "keepalive.enabled": true } });
+  const mode = page.document.getElementById("keepalive-mode") as HTMLSelectElement;
+  const interval = page.document.getElementById("keepalive-interval") as HTMLInputElement;
+
+  mode.value = "always";
+  mode.dispatchEvent(new Event("change"));
+  await settle();
+
+  expect(page.storageValues["keepalive.mode"]).toBe("always");
+  expect(page.storageValues["keepalive.enabled"]).toBeUndefined();
+  expect(page.storageRemovedKeys).toContain("keepalive.enabled");
+  expect(mode.value).toBe("always");
+  expect(mode.disabled).toBe(false);
+  expect(interval.disabled).toBe(false);
+});
+
+test("off mode disables the unused refresh interval", async () => {
+  const page = await optionsDocument();
+  const mode = page.document.getElementById("keepalive-mode") as HTMLSelectElement;
+  const interval = page.document.getElementById("keepalive-interval") as HTMLInputElement;
+
+  mode.value = "off";
+  mode.dispatchEvent(new Event("change"));
+  await settle();
+
+  expect(page.storageValues["keepalive.mode"]).toBe("off");
+  expect(interval.disabled).toBe(true);
 });
 test("persists the Firefox page-capture consent checkbox", async () => {
   const page = await optionsDocument();

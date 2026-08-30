@@ -80,6 +80,12 @@ for the full pre-split extension history.
   a reload genuinely re-reads the files. Nothing about browsing, acquiring, or
   signing in changes.
 
+- **Institution keep-warm now has an explicit always-on mode.** The Options
+  page now separates **While papio has work**, **Always for current library**,
+  and **Off**. The existing behavior remains the default. The always-on mode
+  keeps the configured resolver warm between acquisition batches, while Off
+  stops automatic resolver checks.
+
 ### Fixed
 
 - **A publisher sign-in now refreshes a resolver tab stranded on the identity

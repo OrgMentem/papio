@@ -26,7 +26,13 @@ export {
   TOOLBAR_COUNT_MODE_KEY,
 } from "./state";
 export type { SuccessAckMode, ToolbarCountMode } from "./state";
-import { clampKeepaliveInterval } from "./keepalive";
+import {
+  clampKeepaliveInterval,
+  keepaliveModeFromStorage,
+  KEEPALIVE_MODE_KEY,
+  LEGACY_KEEPALIVE_ENABLED_KEY,
+  type KeepaliveMode,
+} from "./keepalive";
 
 export interface Source {
   label: string;
@@ -421,45 +427,63 @@ function wireFeedbackSettings(): void {
   });
 }
 
-export const KEEPALIVE_ENABLED_KEY = "keepalive.enabled";
 export const KEEPALIVE_INTERVAL_KEY = "keepalive.interval";
 
 /** Reflect keep-warm preferences from the same storage keys the background
  * manager reads. The input is deliberately clamped before it is displayed. */
 export async function renderKeepalive(): Promise<void> {
-  const toggle = document.getElementById("keepalive-enabled");
+  const mode = document.getElementById("keepalive-mode");
   const inputElement = document.getElementById("keepalive-interval");
-  if (!(toggle instanceof HTMLButtonElement) || !(inputElement instanceof HTMLElement) || inputElement.tagName !== "INPUT") {
+  if (!(mode instanceof HTMLSelectElement) || !(inputElement instanceof HTMLElement) || inputElement.tagName !== "INPUT") {
     return;
   }
   const input = inputElement as HTMLInputElement;
   let values: Record<string, unknown> = {};
   try {
-    values = await chrome.storage.local.get([KEEPALIVE_ENABLED_KEY, KEEPALIVE_INTERVAL_KEY]);
+    values = await chrome.storage.local.get([
+      KEEPALIVE_MODE_KEY,
+      LEGACY_KEEPALIVE_ENABLED_KEY,
+      KEEPALIVE_INTERVAL_KEY,
+    ]);
   } catch {
     // Use the manager's defaults when storage is temporarily unavailable.
   }
-  toggle.setAttribute("aria-checked", values[KEEPALIVE_ENABLED_KEY] === false ? "false" : "true");
-  toggle.disabled = false;
+  const storedMode = keepaliveModeFromStorage(values);
+  mode.value = storedMode;
+  mode.dataset.lastPersisted = storedMode;
+  mode.disabled = false;
   input.value = String(clampKeepaliveInterval(values[KEEPALIVE_INTERVAL_KEY]));
-  input.disabled = false;
+  input.disabled = storedMode === "off";
 }
 
 export function wireKeepalive(): void {
-  const toggle = document.getElementById("keepalive-enabled");
+  const mode = document.getElementById("keepalive-mode");
   const inputElement = document.getElementById("keepalive-interval");
-  if (!(toggle instanceof HTMLButtonElement) || !(inputElement instanceof HTMLElement) || inputElement.tagName !== "INPUT") {
+  if (!(mode instanceof HTMLSelectElement) || !(inputElement instanceof HTMLElement) || inputElement.tagName !== "INPUT") {
     return;
   }
   const input = inputElement as HTMLInputElement;
-  toggle.addEventListener("click", () => {
-    const enabled = toggle.getAttribute("aria-checked") !== "true";
-    toggle.disabled = true;
-    void chrome.storage.local
-      .set({ [KEEPALIVE_ENABLED_KEY]: enabled })
-      .then(renderKeepalive, () => {
-        toggle.disabled = false;
-      });
+  mode.addEventListener("change", () => {
+    const pendingMode: KeepaliveMode =
+      mode.value === "off" || mode.value === "always" ? mode.value : "demand";
+    const previous = keepaliveModeFromStorage({ [KEEPALIVE_MODE_KEY]: mode.dataset.lastPersisted });
+    mode.disabled = true;
+    input.disabled = true;
+    void chrome.storage.local.set({ [KEEPALIVE_MODE_KEY]: pendingMode }).then(
+      async () => {
+        try {
+          await chrome.storage.local.remove(LEGACY_KEEPALIVE_ENABLED_KEY);
+        } catch {
+          // The new mode wins even if obsolete local state cannot be removed.
+        }
+        await renderKeepalive();
+      },
+      () => {
+        mode.value = previous;
+        mode.disabled = false;
+        input.disabled = previous === "off";
+      },
+    );
   });
   input.addEventListener("change", () => {
     const interval = clampKeepaliveInterval(Number.parseInt(input.value, 10));
@@ -468,7 +492,7 @@ export function wireKeepalive(): void {
     void chrome.storage.local
       .set({ [KEEPALIVE_INTERVAL_KEY]: interval })
       .then(renderKeepalive, () => {
-        input.disabled = false;
+        input.disabled = mode.value === "off";
       });
   });
 }

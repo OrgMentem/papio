@@ -161,17 +161,23 @@ overlay:
 
 The popup's institution-session card is an extension report of that overlay. It
 can say whether keep-warm is off, the local resolver session is warm, sign-in is
-needed, or a sign-in has unblocked queued work. The options page stores the
-keep-warm enabled flag and refresh interval in extension-local settings. Neither
-those settings nor the card's login state crosses the wire, and *papio* never
-receives credentials, page content, or identity-provider hosts. The existing
-authentication frames are the narrow exception: `auth_pending` and
+needed, or a sign-in has unblocked queued work. The options page stores an
+explicit keep-warm mode and refresh interval in extension-local settings. The
+three modes are:
+
+- `demand` refreshes the resolver while institutional work is active;
+- `always` keeps the configured resolver warm without current work; and
+- `off` stops automatic resolver checks.
+
+Neither those settings nor the card's login state crosses the wire, and *papio*
+never receives credentials, page content, or identity-provider hosts. The
+existing authentication frames are the narrow exception: `auth_pending` and
 `auth_returned` carry timing-only facts, never a URL, host, title, query, or
 fragment.
 
-Keep-warm remains an ordinary browser session: the extension refreshes one
-pinned resolver tab while institutional work is open, pauses when the tab is on
-a sign-in page, and brings that tab forward for the operator. It never fills a
+Keep-warm remains an ordinary browser session. The extension refreshes one
+pinned resolver tab in `demand` or `always` mode, pauses when the tab is on a
+sign-in page, and brings that tab forward for the operator. It never fills a
 login form, copies cookies, or treats a successful timing frame as an identity
 assertion.
 

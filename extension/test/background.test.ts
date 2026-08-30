@@ -11828,7 +11828,7 @@ test("session probe inspects a live resolver tab before claiming signed out, and
     storage: {
       get: async () => ({
         "keepalive.interval": 4,
-        "keepalive.enabled": true,
+        "keepalive.mode": "demand",
         "keepalive.resolverOrigin": "https://resolver.example.edu",
       }),
     },

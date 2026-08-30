@@ -9,6 +9,7 @@ export interface KeepaliveTab {
 
 export type SessionVerdict = "in" | "out" | "unknown";
 export type KeepaliveProbeSource = "live_tab" | "keepalive_tab" | "none";
+export type KeepaliveMode = "off" | "demand" | "always";
 /** Outcome of one completed probe ATTEMPT. Distinct from the verdict: an
  * attempt that learned nothing must not overwrite what an earlier attempt
  * learned. */
@@ -550,6 +551,17 @@ export function clampKeepaliveInterval(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_INTERVAL_MINUTES;
   return Math.min(MAX_INTERVAL_MINUTES, Math.max(MIN_INTERVAL_MINUTES, Math.trunc(value)));
 }
+export const KEEPALIVE_MODE_KEY = "keepalive.mode";
+export const LEGACY_KEEPALIVE_ENABLED_KEY = "keepalive.enabled";
+
+/** Read the current mode while preserving the previous boolean preference.
+ * A stored mode always wins. The legacy key can be removed after the next
+ * explicit options-page save. */
+export function keepaliveModeFromStorage(values: Record<string, unknown>): KeepaliveMode {
+  const mode = values[KEEPALIVE_MODE_KEY];
+  if (mode === "off" || mode === "demand" || mode === "always") return mode;
+  return values[LEGACY_KEEPALIVE_ENABLED_KEY] === false ? "off" : "demand";
+}
 /** Durable browser-local resolver origin. This is an origin only, never an
  * OpenURL path, query, fragment, or identity-provider URL. */
 export const KEEPALIVE_RESOLVER_ORIGIN_KEY = "keepalive.resolverOrigin";
@@ -810,7 +822,7 @@ export class KeepaliveManager {
    * without ever recording the IdP's own origin anywhere. */
   private readonly tabResolverOrigins = new Map<number, string>();
   private intervalMinutes = DEFAULT_INTERVAL_MINUTES;
-  private enabled = true;
+  private mode: KeepaliveMode = "demand";
   private reauthPaused = false;
   private authenticated = false;
   private verdict: SessionVerdict = "unknown";
@@ -1268,7 +1280,7 @@ export class KeepaliveManager {
           ? this.persistedResolverOrigin
           : candidates[0];
     return {
-      enabled: this.enabled,
+      enabled: this.mode !== "off",
       intervalMinutes: this.intervalMinutes,
       authenticated: this.authenticated,
       verdict: this.verdict,
@@ -1952,7 +1964,8 @@ export class KeepaliveManager {
     try {
       values = await this.api.storage.get([
         "keepalive.interval",
-        "keepalive.enabled",
+        KEEPALIVE_MODE_KEY,
+        LEGACY_KEEPALIVE_ENABLED_KEY,
         KEEPALIVE_RESOLVER_ORIGIN_KEY,
         KEEPALIVE_ORIGIN_STATES_KEY,
       ]);
@@ -1962,7 +1975,7 @@ export class KeepaliveManager {
     }
     if (generation !== this.loadPreferencesGeneration) return;
     this.intervalMinutes = clampKeepaliveInterval(values["keepalive.interval"]);
-    this.enabled = values["keepalive.enabled"] !== false;
+    this.mode = keepaliveModeFromStorage(values);
 
     if (storageReadSucceeded) {
       this.persistedResolverOrigin = normalizeHttpsOrigin(values[KEEPALIVE_RESOLVER_ORIGIN_KEY]);
@@ -2021,6 +2034,10 @@ export class KeepaliveManager {
     return this.options.trackedJobCount() > 0 || this.options.warmDemand?.() === true;
   }
 
+  private shouldMaintainSession(): boolean {
+    return this.mode === "always" || (this.mode === "demand" && this.hasWarmDemand());
+  }
+
   private async selectResolver(resolver: URL): Promise<void> {
     if (this.resolver?.origin !== resolver.origin && this.tabID !== undefined) {
       await this.closeTab();
@@ -2039,9 +2056,9 @@ export class KeepaliveManager {
   }
 
   private async reconcile(): Promise<void> {
-    const warmDemand = this.hasWarmDemand();
+    const shouldMaintainSession = this.shouldMaintainSession();
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
-    if (!this.enabled || !warmDemand || resolver === undefined) {
+    if (!shouldMaintainSession || resolver === undefined) {
       await this.closeTab();
       this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
@@ -2359,9 +2376,9 @@ export class KeepaliveManager {
 
   private async onObserve(): Promise<void> {
     await this.loadPreferences();
-    const warmDemand = this.hasWarmDemand();
+    const shouldMaintainSession = this.shouldMaintainSession();
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
-    if (!this.enabled || !warmDemand || resolver === undefined) {
+    if (!shouldMaintainSession || resolver === undefined) {
       await this.closeTab();
       this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
@@ -2381,7 +2398,7 @@ export class KeepaliveManager {
 
   private async onReload(): Promise<void> {
     await this.loadPreferences();
-    if (!this.enabled || !this.hasWarmDemand()) {
+    if (!this.shouldMaintainSession()) {
       await this.closeTab();
       this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
