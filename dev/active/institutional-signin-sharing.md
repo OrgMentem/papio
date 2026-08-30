@@ -450,10 +450,79 @@ and Cochrane's 404 title plus its missing-page sentence
 (`extension/src/background.ts:assessDrivenPage`). An article with the title
 “Internal Server Error” and ordinary article text stays normal.
 
-The wire has no compatible provider-load-failure outcome, and the 32 advertised
-feature slots are full. Therefore the extension reloads a detected failure at
-most three times inside the ten-attempt landing budget, then leaves the existing
-action parked. It never records the transport page as `ui_changed`.
+The current implementation reloads a detected failure at most three times
+inside the ten-attempt landing budget, then leaves the existing action parked.
+It never records the transport page as `ui_changed`.
+
+#### Provider load-failure interface selected, not yet implemented
+
+Four interface shapes were compared:
+
+1. A dedicated `provider_load_failure` message was precise, but added another
+   message family, a feature flag, and a sixth triage schema for one observation.
+2. Widening `handoff_outcome` reused its open-action guard, but required a new
+   enum, a conditional payload field, a feature retirement, and a staged
+   strict-parser migration.
+3. Consolidating seven read-model flags would free five slots, but mixes a
+   broad capability cleanup with this one user-visible failure.
+4. The existing job-scoped `error` frame already accepts a bounded normalized
+   code, preserves the action, and is valid across old and new peers. This is
+   the selected interface.
+
+The wire shape stays unchanged
+(`internal/protocol/protocol.go:ErrorPayload`):
+
+```json
+{
+  "code": "provider_load_failure",
+  "message": "Provider page failed to load after three automatic reloads."
+}
+```
+
+The sentence is fixed extension copy. It carries no host, URL, title, page
+text, path, query, fragment, credential, session value, or browser error. The
+daemon persists only `code`; the generic `MsgError` branch already appends a
+non-terminal `browser.error` event and leaves the job and action untouched
+(`internal/browser/bridge.go:handle`).
+
+The extension reports only after the page still shows the same measured
+500/404 state following the third reload. `retryProviderLoadFailure` returns
+`reloaded`, `exhausted`, or `ignored`; both classifier callers consume that one
+atomic result. A session-persisted `provider_load_failure_parked` marker keeps a
+closed failed tab from taking the normal cancellation path. A separate sent
+marker is written only after `send` succeeds
+(`extension/src/background.ts:retryProviderLoadFailure`,
+`extension/src/state.ts:ActiveJob`).
+
+For `provider_load_failure`, the daemon transaction selects the current open
+handoff action, writes its daemon-owned action id into the event, and sets the
+existing `human_actions.diagnosis` to `provider_load_failure`. A duplicate for
+the same still-open action is a no-op. The transaction never changes the action
+kind, detail, access binding, status, or job state. This keeps the route
+discriminator intact and gives the Inbox durable state instead of inferring
+from its bounded Activity page.
+
+No new Inbox field or enum is needed. `humanActionItems` maps that diagnosis to
+the existing `open_page` guidance and substitutes fixed display detail:
+“Provider page did not load after three retries. Open the link to try again.”
+The Inbox labels that existing open operation “Open link”
+(`internal/triage/triage.go:humanActionItems`,
+`extension/src/inbox.ts:operationOpenLabel`). `ActivityText` renders “Provider
+page failed to load after three automatic retries”
+(`internal/store/activitytext.go:ActivityText`). Job diagnosis gets a matching
+closed reason and retains `can_open_action`.
+
+An explicit Open is a new operator attempt, not a fourth automatic retry.
+`openHandoffUnlocked` first re-probes a tracked tab. It reloads only while that
+tab still classifies as `load_failure`, then resets the local report marker and
+three-reload budget after Chrome accepts the reload. A missing tab follows the
+existing fresh-route path (`extension/src/background.ts:openHandoffUnlocked`).
+
+Release the daemon presentation and idempotent action annotation first, then
+the extension sender. A new extension with an old daemon still sends a valid
+frame; the old daemon records the safe generic Activity text and preserves the
+action. An old extension with the new daemon never sends the code. No feature
+slot, version floor, parser alias, or protocol compatibility shim is required.
 
 `recordUnknown` now reads the live tab before the current host can authorize its
 own first capture. `isAuthenticationURL` rejects login, IdP, SSO, auth,
