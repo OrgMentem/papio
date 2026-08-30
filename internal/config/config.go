@@ -1121,10 +1121,7 @@ var documentDeliveryHostRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z
 // canonicalizeDocumentDeliveryHost returns the shared key used for both
 // allowed_hosts entries and destination URLs.
 func canonicalizeDocumentDeliveryHost(raw string) (string, error) {
-	host := strings.ToLower(raw)
-	if strings.HasSuffix(host, ".") {
-		host = strings.TrimSuffix(host, ".")
-	}
+	host := strings.TrimSuffix(strings.ToLower(raw), ".")
 	if host == "" {
 		return "", errors.New("empty host")
 	}

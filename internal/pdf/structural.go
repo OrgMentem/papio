@@ -189,7 +189,7 @@ func RunStructuralWorker(in io.Reader, out io.Writer) error {
 
 	// A sanitize request re-inspects its own rewrite, so inspecting the source
 	// as well would parse an untrusted file twice for one answer.
-	report := StructuralReport{}
+	var report StructuralReport
 	if req.SanitizeTo == "" {
 		report = inspectWithPDFCPU(req)
 	} else {

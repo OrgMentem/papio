@@ -5609,21 +5609,6 @@ func pageAcquireRequest(payload *protocol.PageAcquirePayload) (protocol.WorkRequ
 	return request, nil
 }
 
-func (b *Bridge) liveJobForRequest(ctx context.Context, requestID string) (string, error) {
-	var jobID string
-	err := b.jobs.S.DB().QueryRowContext(ctx,
-		`SELECT id FROM jobs WHERE work_request_id = ? AND state NOT IN ('failed','cancelled','unavailable') ORDER BY created_at DESC LIMIT 1`,
-		requestID,
-	).Scan(&jobID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return jobID, nil
-}
-
 func (b *Bridge) pageAcquireError(err error) ([]json.RawMessage, error) {
 	ack, frameErr := b.frame(protocol.MsgPageAcquireAck, "", protocol.PageAcquireAckPayload{
 		Error: truncate(err.Error(), 1000),
