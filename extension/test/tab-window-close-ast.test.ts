@@ -153,6 +153,13 @@ const KEEPALIVE_ALLOWLIST = new Map<string, { count: number; why: string }>([
     { count: 1, why: "Pinned tabs are deliberately skipped by the tab governor, so this retires the manager's superseded session tab." },
   ],
   [
+    "keepalive.ts:createTabOnce",
+    {
+      count: 1,
+      why: "A background resolver tab can finish creation after Off invalidates it; it was never published as owned, so closeTab cannot reach it.",
+    },
+  ],
+  [
     "keepalive.ts:closeTab",
     { count: 1, why: "Pinned tabs are deliberately skipped by the tab governor, so this releases the manager's no-longer-demanded session tab." },
   ],

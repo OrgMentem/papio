@@ -60,8 +60,11 @@ export interface KeepaliveTabs {
 export interface KeepaliveStorage {
   get(keys: string[]): Promise<Record<string, unknown>>;
   set?(values: Record<string, unknown>): Promise<void>;
-  /** Subscribe to mode changes from another extension page. */
-  onModeChanged?(listener: () => void | Promise<void>): () => void;
+  /** Subscribe to mode changes from another extension page. A valid current
+   * mode is supplied directly; undefined asks the manager to refresh storage. */
+  onModeChanged?(
+    listener: (mode: KeepaliveMode | undefined) => void | Promise<void>,
+  ): () => void;
 }
 
 export interface KeepalivePermissions {
@@ -723,6 +726,8 @@ type ProbeReason =
   | "activation"
   | "wake";
 
+type TabCreationIntent = "automatic" | "foreground";
+
 /** Keys purely off the ProbeReason VALUE, never off who actually called
  * requestProbe() — the type carries no "came from an operator action" fact
  * for this to check. Today only probeForeground() constructs "foreground",
@@ -734,10 +739,9 @@ function spacingFloorFor(reason: ProbeReason): number {
   return reason === "foreground" ? MIN_FOREGROUND_PROBE_SPACING_MS : MIN_PROBE_START_SPACING_MS;
 }
 
-/** One coalesced, not-yet-started probe request for an origin: the newest
- * reason/preferredTabID always overwrites the previous ones, and every
- * caller that piled on while waiting resolves off the SAME promise once the
- * eventual trailing probe (whichever one actually runs) settles. */
+/** One coalesced, not-yet-started probe request for an origin. Foreground
+ * authority is sticky; otherwise, the newest reason and preferred tab win.
+ * Every waiting caller resolves from the same eventual trailing probe. */
 interface PendingProbeState {
   reason: ProbeReason;
   preferredTabID: number | undefined;
@@ -1165,7 +1169,7 @@ export class KeepaliveManager {
     this.clearReauthTimer();
     void this.updateOriginSnapshot(origin, { pausedForReauth: false });
     this.options.onReauthStateChanged?.(false);
-    await this.createTab();
+    await this.createTab("automatic");
 
     if (
       this.tabID === undefined &&
@@ -1325,11 +1329,29 @@ export class KeepaliveManager {
     this.observeMs = Math.max(0, options.observeMs ?? DEFAULT_OBSERVE_MS);
     this.reloadSettleMs = Math.max(0, options.reloadSettleMs ?? DEFAULT_RELOAD_SETTLE_MS);
   }
+  private applyMode(mode: KeepaliveMode): void {
+    this.mode = mode;
+    if (mode === "off") this.cancelAutomaticProbeRequests();
+  }
+
+  private async onStoredModeChanged(mode: KeepaliveMode | undefined): Promise<void> {
+    if (mode === undefined) {
+      await this.sync();
+      return;
+    }
+    // The event is newer than every preference read already in flight.
+    this.loadPreferencesGeneration += 1;
+    this.applyMode(mode);
+    await this.reconcile();
+  }
+
   /** Load preferences, observe later mode changes, and reconcile immediately. */
   async init(): Promise<void> {
     if (this.started) return;
     this.started = true;
-    this.stopModeObserver = this.api.storage.onModeChanged?.(() => this.sync());
+    this.stopModeObserver = this.api.storage.onModeChanged?.((mode) =>
+      this.onStoredModeChanged(mode)
+    );
     await this.sync();
   }
 
@@ -1488,8 +1510,12 @@ export class KeepaliveManager {
   private deferProbe(origin: string, reason: ProbeReason, preferredTabID: number | undefined): Promise<void> {
     const existing = this.pendingProbes.get(origin);
     if (existing !== undefined) {
-      existing.reason = reason;
-      existing.preferredTabID = preferredTabID;
+      // A later automatic trigger can refine another automatic trigger, but
+      // it must never demote an explicit check that is already waiting.
+      if (existing.reason !== "foreground" || reason === "foreground") {
+        existing.reason = reason;
+        existing.preferredTabID = preferredTabID;
+      }
       return existing.promise;
     }
     const { promise, resolve } = Promise.withResolvers<void>();
@@ -2000,14 +2026,12 @@ export class KeepaliveManager {
       ]);
       storageReadSucceeded = true;
     } catch {
-      // Storage is advisory. A temporary failure must not stop an active batch.
+      // Retain the last known mode and interval when storage is unavailable.
     }
     if (generation !== this.loadPreferencesGeneration) return;
-    this.intervalMinutes = clampKeepaliveInterval(values["keepalive.interval"]);
-    this.mode = keepaliveModeFromStorage(values);
-    if (this.mode === "off") this.cancelAutomaticProbeRequests();
-
     if (storageReadSucceeded) {
+      this.intervalMinutes = clampKeepaliveInterval(values["keepalive.interval"]);
+      this.applyMode(keepaliveModeFromStorage(values));
       this.persistedResolverOrigin = normalizeHttpsOrigin(values[KEEPALIVE_RESOLVER_ORIGIN_KEY]);
       this.restoreOriginStates(values[KEEPALIVE_ORIGIN_STATES_KEY]);
     }
@@ -2096,7 +2120,7 @@ export class KeepaliveManager {
 
     await this.selectResolver(resolver);
     if (this.tabID === undefined) {
-      await this.createTab();
+      await this.createTab("automatic");
       this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
       return;
     }
@@ -2181,7 +2205,7 @@ export class KeepaliveManager {
     }
     this.resolver = target;
     this.syncOriginStates();
-    if (this.tabID === undefined) await this.createTab();
+    if (this.tabID === undefined) await this.createTab("foreground");
     const tabID = this.tabID;
     if (tabID === undefined) return false;
     const targetState = this.originStates.get(target.origin);
@@ -2303,13 +2327,13 @@ export class KeepaliveManager {
     }
   }
 
-  private async createTab(): Promise<void> {
+  private async createTab(intent: TabCreationIntent): Promise<void> {
     for (;;) {
       const resolver = this.resolver;
       const wantedOrigin = resolver?.protocol === "https:" ? resolver.origin : undefined;
       if (this.tabCreationInFlight === undefined) {
         this.tabCreationOrigin = wantedOrigin;
-        const attempt = this.createTabOnce();
+        const attempt = this.createTabOnce(intent);
         this.tabCreationInFlight = attempt.finally(() => {
           this.tabCreationInFlight = undefined;
           this.tabCreationOrigin = undefined;
@@ -2319,6 +2343,7 @@ export class KeepaliveManager {
       }
       if (wantedOrigin === this.tabCreationOrigin) {
         await this.tabCreationInFlight;
+        if (intent === "foreground" && this.tabID === undefined) continue;
         return;
       }
       // Wanted a different origin than the creation already in flight
@@ -2335,10 +2360,9 @@ export class KeepaliveManager {
     }
   }
 
-  private async createTabOnce(): Promise<void> {
-    // Snapshot once: all four callers (reconcile, onObserve, onReload,
-    // openReauth) can mutate this.resolver synchronously before calling
-    // createTab, and this method itself awaits across tabs.query()/
+  private async createTabOnce(intent: TabCreationIntent): Promise<void> {
+    // Snapshot once: callers can mutate this.resolver synchronously before
+    // calling createTab, and this method itself awaits across tabs.query()/
     // tabs.create(). Reading this.resolver again after either await let a
     // racing caller's origin switch leak into an in-progress creation —
     // querying for one origin's existing tab but creating (or claiming) a
@@ -2355,6 +2379,7 @@ export class KeepaliveManager {
         url: [`${resolver.protocol}//${resolver.host}/*`],
       });
       const tabID = existing.find((tab) => tab.id !== undefined)?.id;
+      if (intent === "automatic" && !this.shouldMaintainSession()) return;
       if (tabID !== undefined) {
         this.tabID = tabID;
         this.clearReauthPause(resolver.origin);
@@ -2370,6 +2395,7 @@ export class KeepaliveManager {
     } catch {
       // Querying is a best-effort restart recovery; creation below remains safe.
     }
+    if (intent === "automatic" && !this.shouldMaintainSession()) return;
     const base = {
       url: resolver.origin,
       active: false,
@@ -2387,9 +2413,18 @@ export class KeepaliveManager {
         // The work window may have been closed between lookup and create;
         // fall back to the user's current window rather than skip a cycle.
         if (windowID === undefined) throw e;
+        if (intent === "automatic" && !this.shouldMaintainSession()) return;
         tab = await this.api.tabs.create(base);
       }
       if (tab.id === undefined) return;
+      if (intent === "automatic" && !this.shouldMaintainSession()) {
+        try {
+          await this.api.tabs.remove(tab.id);
+        } catch {
+          // The late-created tab is already gone.
+        }
+        return;
+      }
       this.tabID = tab.id;
       this.clearReauthPause(resolver.origin);
       this.lastCycleRunAt = Date.now();
@@ -2416,7 +2451,7 @@ export class KeepaliveManager {
 
     await this.selectResolver(resolver);
     if (this.tabID === undefined) {
-      await this.createTab();
+      await this.createTab("automatic");
       this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
       return;
     }
@@ -2442,7 +2477,7 @@ export class KeepaliveManager {
     }
     await this.selectResolver(resolver);
     if (this.tabID === undefined) {
-      await this.createTab();
+      await this.createTab("automatic");
       this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
       return;
     }
@@ -2805,14 +2840,18 @@ export function chromeKeepaliveAPI(
           changes,
           areaName,
         ) => {
-          if (
-            areaName !== "local" ||
-            (changes[KEEPALIVE_MODE_KEY] === undefined &&
-              changes[LEGACY_KEEPALIVE_ENABLED_KEY] === undefined)
-          ) {
+          if (areaName !== "local") return;
+          const value = changes[KEEPALIVE_MODE_KEY]?.newValue;
+          if (value === "off" || value === "demand" || value === "always") {
+            void listener(value);
             return;
           }
-          void listener();
+          if (
+            changes[KEEPALIVE_MODE_KEY] !== undefined ||
+            changes[LEGACY_KEEPALIVE_ENABLED_KEY] !== undefined
+          ) {
+            void listener(undefined);
+          }
         };
         chromeAPI.storage.onChanged.addListener(onChanged);
         return () => chromeAPI.storage.onChanged.removeListener(onChanged);

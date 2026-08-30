@@ -25,6 +25,7 @@ import {
   SESSION_STALE_MS,
   type FreshSessionEvidence,
   type KeepaliveAPI,
+  type KeepaliveMode,
   type KeepaliveOriginSnapshot,
   type KeepaliveTab,
   type KeepaliveTimers,
@@ -256,7 +257,7 @@ function makeHarness(
    * every existing test's behavior is unchanged unless a test opts in. */
   configuredReady: { value: boolean };
   storageValues: Record<string, unknown>;
-  notifyModeChanged(): Promise<void>;
+  notifyModeChanged(mode?: KeepaliveMode): Promise<void>;
   resolverMarkers: ResolverMarker[];
   markersByTab: Map<number, ResolverMarker[]>;
   /** Every "keepalive.originStates" payload ever persisted, in write order —
@@ -285,7 +286,9 @@ function makeHarness(
   const permissionChanges: { origin: string; granted: boolean }[] = [];
   const configuredReady = { value: false };
   const originStateWrites: KeepaliveOriginSnapshot[][] = [];
-  let modeChangedListener: (() => void | Promise<void>) | undefined;
+  let modeChangedListener:
+    | ((mode: KeepaliveMode | undefined) => void | Promise<void>)
+    | undefined;
   const storageValues: Record<string, unknown> = {
     "keepalive.interval": interval,
     "keepalive.mode": "demand",
@@ -377,8 +380,8 @@ function makeHarness(
     authChanges,
     configuredReady,
     storageValues,
-    notifyModeChanged: async () => {
-      await modeChangedListener?.();
+    notifyModeChanged: async (mode) => {
+      await modeChangedListener?.(mode);
     },
     resolverMarkers,
     permissionChanges,
@@ -436,18 +439,18 @@ test("the Chrome API forwards only local keepalive mode changes", async () => {
       },
     },
   } as unknown as Parameters<typeof chromeKeepaliveAPI>[0]);
-  let notifications = 0;
-  const stop = api.storage.onModeChanged?.(() => {
-    notifications += 1;
+  const notifications: (KeepaliveMode | undefined)[] = [];
+  const stop = api.storage.onModeChanged?.((mode) => {
+    notifications.push(mode);
   });
 
   storageListener?.({ unrelated: { newValue: true } }, "local");
   storageListener?.({ "keepalive.mode": { newValue: "off" } }, "sync");
-  expect(notifications).toBe(0);
+  expect(notifications).toEqual([]);
 
   storageListener?.({ "keepalive.mode": { newValue: "off" } }, "local");
   storageListener?.({ "keepalive.enabled": { oldValue: false } }, "local");
-  expect(notifications).toBe(2);
+  expect(notifications).toEqual(["off", undefined]);
 
   stop?.();
   expect(removedListener).toBe(storageListener);
@@ -536,12 +539,72 @@ test("changing the stored mode to off closes the owned tab and cancels deferred 
   expect(h.timers.pendingDelays()).toContain(MIN_PROBE_START_SPACING_MS);
 
   h.storageValues["keepalive.mode"] = "off";
-  await h.notifyModeChanged();
+  await h.notifyModeChanged("off");
   await flushMicrotasks();
 
   expect(h.tabs.removed).toContain(1);
   expect(h.timers.pendingDelays()).not.toContain(MIN_PROBE_START_SPACING_MS);
   expect(h.scripting.injectionCounts.get(liveTab.id) ?? 0).toBe(0);
+});
+
+test("an off event remains authoritative when a later preference read fails", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  h.api.storage.get = async () => {
+    throw new Error("storage unavailable");
+  };
+
+  await h.notifyModeChanged("off");
+  await h.manager.sync();
+
+  expect(h.manager.getSnapshot().enabled).toBe(false);
+  expect(h.tabs.removed).toContain(1);
+});
+
+test("a later automatic trigger cannot demote a queued foreground probe", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness();
+  await h.manager.init();
+  await h.manager.probeForeground(origin);
+
+  const liveTab = { id: 900, url: `${origin}/account` };
+  h.tabs.seed(liveTab);
+  h.tabs.resolverTabs.push(liveTab);
+  void h.manager.probeForeground(origin);
+  await flushMicrotasks();
+  h.manager.noteResolverActivated(liveTab.id, liveTab.url);
+  await flushMicrotasks();
+
+  h.storageValues["keepalive.mode"] = "off";
+  await h.notifyModeChanged("off");
+  h.clock.advanceBy(MIN_FOREGROUND_PROBE_SPACING_MS);
+  await h.timers.runDue();
+  await flushMicrotasks();
+
+  expect(h.scripting.injectionCounts.get(liveTab.id)).toBe(1);
+});
+
+test("off removes an automatic resolver tab whose creation finishes late", async () => {
+  const h = makeHarness();
+  const creation = Promise.withResolvers<KeepaliveTab>();
+  h.tabs.create = async (properties) => {
+    h.tabs.created.push({ ...properties });
+    const tab = await creation.promise;
+    h.tabs.seed({ ...properties, ...tab });
+    return tab;
+  };
+
+  const initializing = h.manager.init();
+  await flushMicrotasks();
+  expect(h.tabs.created).toHaveLength(1);
+
+  h.storageValues["keepalive.mode"] = "off";
+  await h.notifyModeChanged("off");
+  creation.resolve({ id: 99, url: RESOLVER_OPENURL });
+  await initializing;
+
+  expect(h.tabs.removed).toContain(99);
+  expect(h.tabs.snapshot(99)).toBeUndefined();
 });
 
 /** Drains the microtask queue without a real timer or macrotask: nothing
