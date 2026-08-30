@@ -733,10 +733,11 @@ func TestLosingArtifactWinnerProducerFailuresRollBack(t *testing.T) {
 			name: "missing",
 			setup: func(_ context.Context, _ *Store, jobID string) (ArtifactProducerIdentity, func(*testing.T)) {
 				ordinal := int64(0)
-				return ArtifactProducerIdentity{
+				producer := ArtifactProducerIdentity{
 					Kind: GenericDrive, DriveAttemptID: "missing-producer",
 					Ordinal: &ordinal, Strategy: "generic", Revision: "r1",
-				}, func(*testing.T) {}
+				}
+				return producer, func(*testing.T) {}
 			},
 		},
 		{
@@ -745,16 +746,18 @@ func TestLosingArtifactWinnerProducerFailuresRollBack(t *testing.T) {
 				otherJob := permitJob(t, js, "wrong-job-producer")
 				identity := driveIdentity(otherJob, "wrong-job-attempt", 0, "generic")
 				permit := acquireDrive(t, js, identity, "wrong-job-domain", time.Now().Add(time.Minute))
-				ordinal := int64(0)
-				return ArtifactProducerIdentity{
-					Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
-					Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
-				}, func(t *testing.T) {
+				checkPermit := func(t *testing.T) {
 					got, err := js.GetEffectPermit(ctx, permit.ID)
 					if err != nil || got == nil || got.Status != Held {
 						t.Fatalf("wrong-job occupancy changed permit=%+v err=%v", got, err)
 					}
 				}
+				ordinal := int64(0)
+				producer := ArtifactProducerIdentity{
+					Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+					Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+				}
+				return producer, checkPermit
 			},
 		},
 		{
@@ -772,11 +775,7 @@ func TestLosingArtifactWinnerProducerFailuresRollBack(t *testing.T) {
 					identity.DriveAttemptID, identity.Strategy, identity.Revision, now, now); err != nil {
 					t.Fatal(err)
 				}
-				ordinal := int64(0)
-				return ArtifactProducerIdentity{
-					Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
-					Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
-				}, func(t *testing.T) {
+				checkPermit := func(t *testing.T) {
 					got, err := js.GetEffectPermit(ctx, permit.ID)
 					if err != nil || got == nil || got.Status != Held {
 						t.Fatalf("ambiguous permit changed=%+v err=%v", got, err)
@@ -791,6 +790,12 @@ func TestLosingArtifactWinnerProducerFailuresRollBack(t *testing.T) {
 						t.Fatalf("ambiguous blocker status=%q", status)
 					}
 				}
+				ordinal := int64(0)
+				producer := ArtifactProducerIdentity{
+					Kind: GenericDrive, DriveAttemptID: identity.DriveAttemptID,
+					Ordinal: &ordinal, Strategy: identity.Strategy, Revision: identity.Revision,
+				}
+				return producer, checkPermit
 			},
 		},
 	}
