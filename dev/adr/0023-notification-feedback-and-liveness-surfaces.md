@@ -549,6 +549,47 @@ Five further bounds, all test-enforced:
   itself. Working from a copy is what keeps a capture from cancelling an offer
   the researcher is reading.
 
+#### The mark, and why an interruption in someone else's page needs one
+
+Both routes draw *papio*'s mark as the card's first child. It is the same four
+shapes every other *papio* surface inlines (`popup.html`, `inbox.html`,
+`options.html`, `history.html`, `page-bulk.html`, `docs/assets/logo.svg`), with
+one definition in `extension/src/toast-view.ts` (`PAPIO_MARK`) that reaches the
+injected route as data on `ToastInjection`, for the same reason the copy does.
+
+This is a provenance requirement, not decoration. A bare sentence in a
+publisher's page has no sender: the reader cannot tell an interruption from
+*papio* apart from one from the site they are reading, and a site's own modal
+asking them to click something is the shape of the thing they should distrust.
+The mark answers "who is speaking" while adding **nothing** Decision 1's list
+forbids — no identifier, title, URL, provider name, or job reference. It is
+`aria-hidden` with no title or label, because the sentence beside it already
+names *papio* and a second name would announce the sender twice.
+
+The two routes resolve its colours differently, and must: the window route is a
+*papio* document and names `--color-brand-*`, while the injected route runs in a
+document whose custom properties are not *papio*'s, so it carries literals. The
+shared geometry therefore holds a role per shape and no colour at all — a colour
+baked into it would paint one route correctly and the other invisibly.
+
+It also cost a measurement, recorded because the previous one is now wrong. The
+mark takes 40px off the copy's row (28px plus the 12px gap), which re-wrapped
+the institutional message from two lines to three and from 65px of inner height
+to 85 — one past the 84 a 116 outer leaves on macOS. Re-measured in a real
+browser, the two-line boundary at that mark size is 552px, so
+`TOAST_WINDOW_SIZE` widens from 520 to 576, leaving 24px for platforms whose
+`system-ui` metrics run wider than macOS's.
+
+Two details of that sizing are worth keeping. The mark is sized to the two-line
+text block (41px) rather than to one line: 20px, the line box and the first rule
+tried, renders visibly undersized against two lines, while the 32px
+`--brand-mark-size` the other *papio* surfaces use is sized for a page header
+beside a wordmark at title size. And the injected card is sized from the same
+constant *and the same box model* — it declares `box-sizing: border-box`,
+because `toast.html`'s body does, and without it the shared number sized the
+content box and rendered the injected card 30px wider than the window it is
+supposed to match (measured at 606 against 576).
+
 What is still **not** decided here: a persistent banner on *papio*-owned tabs.
 That needs `scripting.registerContentScripts`, which no part of the tree uses
 and which ADR-0019 Decision 1 names in its own scope; it would also be present

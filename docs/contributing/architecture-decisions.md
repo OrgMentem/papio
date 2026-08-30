@@ -321,7 +321,8 @@ host access and reads no page; a researcher who has granted all-sites access can
 opt in to having that same message drawn into the page they are reading instead,
 which is off by default, cleared when the grant is revoked, refused on a tab
 *papio* is itself driving, and invisible to a page capture. Either way it shows
-one fixed sentence and one button, and it is
+one fixed sentence, one button, and *papio*'s own mark — the sender, because this
+is the one surface that can appear inside a publisher's page — and it is
 suppressed while a *papio* surface already holds focus. Its offer is truthful per
 branch: a resumable route offers a reopen, an abandoned institutional claim
 offers a new sign-in tab because no reversal exists, and a loss that cost nothing

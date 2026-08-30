@@ -31,8 +31,9 @@ for the full pre-split extension history.
   to adopt, or a tab *papio* closed itself.
 - **That lost-tab message can now appear in the page you are reading, if you ask
   for it.** A new option, `Show the lost-tab message in the page you are
-  reading`, delivers the same one sentence and one button into the page in front
-  of you instead of opening a separate window. It is off until you turn it on,
+  reading`, delivers the same one sentence, one button, and *papio* mark into
+  the page in front of you instead of opening a separate window. It is off until
+  you turn it on,
   and the option only appears once you have granted all-sites access — the grant
   is what lets *papio* reach a page at all, and the option is what allows it to
   draw there. Revoking all-sites access turns the option off again, so
@@ -42,6 +43,14 @@ for the full pre-split extension history.
   scripts and styles do not reach it. It is never drawn into a tab *papio* is
   itself driving, into a page that is not HTTPS, or into a PDF, and any page
   *papio* cannot draw into falls back to the window rather than to silence.
+- **The lost-tab message now carries the *papio* mark.** Both the small window
+  and the drawn-in-page version show it, at the start of the line. In a
+  publisher's page a bare sentence has no sender, and a site's own pop-up asking
+  you to click something is exactly the thing worth distrusting; the mark says
+  which of the two you are looking at. It adds no identifier, title, URL,
+  publisher name, or job reference, and screen readers skip it, because the
+  sentence beside it already says *papio*. The window is slightly wider than
+  before, so the longer of the two messages still fits on two lines.
 - **A diagnostic page capture no longer records *papio*'s own on-page
   messages.** A capture is evidence about a publisher's page, and both the
   action acknowledgement and the lost-tab message could be on screen when one is

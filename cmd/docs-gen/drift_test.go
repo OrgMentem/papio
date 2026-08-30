@@ -141,6 +141,53 @@ func TestInjectedSurfacesAreDisclosed(t *testing.T) {
 	}
 }
 
+// TestToastMarkIsDisclosed guards the same three documents against the same
+// class of staleness, one layer in: a published INVENTORY of what a surface
+// shows, which grows without the prose growing with it.
+//
+// Each document used to say the loss toast shows "one fixed sentence and one
+// button", which read as exhaustive and was. papio's mark is now drawn beside
+// them — including inside a publisher's page, which is the whole reason it
+// exists — so the inventory is short by one item. The forbidden strings are the
+// exact sentences that asserted the old inventory, so a revert to any of them
+// fails here rather than quietly under-describing a surface that appears in
+// pages papio does not own.
+func TestToastMarkIsDisclosed(t *testing.T) {
+	const mark = "PAPIO_MARK"
+	if !strings.Contains(mustRead(t, "extension/src/toast-view.ts"), mark) {
+		t.Skipf("no %s in toast-view.ts: the toast draws no mark, so these "+
+			"documents are free to describe a sentence and a button alone", mark)
+	}
+
+	// The one phrase all three share. privacy.md italicises the product name, so
+	// a longer required string would match two files and not the third.
+	const disclosed = "own mark"
+	staleInventory := []string{
+		"Both routes show the same one fixed sentence and one button,",
+		"Both routes show one fixed sentence and one button,",
+		"Either route: one fixed sentence, one button, no identifier",
+	}
+	for _, page := range []string{
+		"docs/privacy.md",
+		"extension/docs/amo-listing.md",
+		"extension/docs/chrome-web-store-listing.md",
+	} {
+		prose := mustRead(t, page)
+		if !strings.Contains(prose, disclosed) {
+			t.Errorf("%s does not disclose that the loss toast draws papio's mark "+
+				"(looked for %q). The mark is drawn inside pages papio does not own, "+
+				"so a document that lists what the surface shows has to list it.",
+				page, disclosed)
+		}
+		for _, claim := range staleInventory {
+			if strings.Contains(prose, claim) {
+				t.Errorf("%s still says %q. That inventory was written before the "+
+					"toast drew %s, and is now short by one item.", page, claim, mark)
+			}
+		}
+	}
+}
+
 // TestRegisteredAdaptersAreDocumented keeps the provider matrix honest. It had
 // fallen to 4 of 27 registered adapters.
 func TestRegisteredAdaptersAreDocumented(t *testing.T) {
