@@ -29,20 +29,17 @@ for the full pre-split extension history.
   while a *papio* window already has your focus, and it stays silent when the
   close cost you nothing — a download still in flight, a file the daemon is about
   to adopt, or a tab *papio* closed itself.
-- **That lost-tab message can now appear in the page you are reading, if you ask
-  for it.** A new option, `Show the lost-tab message in the page you are
-  reading`, delivers the same one sentence, one button, and *papio* mark into
-  the page in front of you instead of opening a separate window. It is off until
-  you turn it on,
-  and the option only appears once you have granted all-sites access — the grant
-  is what lets *papio* reach a page at all, and the option is what allows it to
-  draw there. Revoking all-sites access turns the option off again, so
-  re-granting it later never silently restores the drawn message. When it does
-  draw, *papio* adds one element and reads nothing from the page: no page text
-  is collected, and the message renders in its own shadow root, so the page's
-  scripts and styles do not reach it. It is never drawn into a tab *papio* is
-  itself driving, into a page that is not HTTPS, or into a PDF, and any page
-  *papio* cannot draw into falls back to the window rather than to silence.
+- **The lost-tab message now prefers the page you are reading when all-sites
+  access is active.** The `Show the lost-tab message in the page you are
+  reading` option is on by default with that grant. It delivers the same one
+  sentence, one button, and *papio* mark into the page in front of you instead
+  of opening a separate window. Turn it off to keep the window route. Revoking
+  all-sites access turns it off, so re-granting access later never restores a
+  choice you removed. The message adds one element and reads nothing from the
+  page. It collects no page text and renders in its own shadow root, where the
+  page's scripts and styles cannot reach it. It is never drawn into a tab
+  *papio* is driving, a non-HTTPS page, or a PDF. Any page *papio* cannot draw
+  into falls back to the window rather than to silence.
 - **The lost-tab message now carries the *papio* mark.** Both the small window
   and the drawn-in-page version show it, at the start of the line. In a
   publisher's page a bare sentence has no sender, and a site's own pop-up asking

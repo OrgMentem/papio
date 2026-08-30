@@ -316,11 +316,12 @@ that carries an action: when *papio* loses a tab it opened for a paper, a small
 unfocused *papio* window offers to reopen that route for eight seconds — restarted
 once if you bring the window forward, because a first click on an unfocused window
 is spent activating it — then
-closes and commits nothing. By default it is an extension page, so it needs no
-host access and reads no page; a researcher who has granted all-sites access can
-opt in to having that same message drawn into the page they are reading instead,
-which is off by default, cleared when the grant is revoked, refused on a tab
-*papio* is itself driving, and invisible to a page capture. Either way it shows
+closes and commits nothing. With all-sites access granted, the message prefers
+the page the researcher is reading; the researcher can turn that route off and
+use the extension window instead. Revoking the grant turns page injection off,
+and re-granting access does not restore an explicit opt-out. The in-page route
+is refused on a tab *papio* is driving and remains invisible to page captures.
+Either route shows
 one fixed sentence, one button, and *papio*'s own mark — the sender, because this
 is the one surface that can appear inside a publisher's page — and it is
 suppressed while a *papio* surface already holds focus. Its offer is truthful per

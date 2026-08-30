@@ -263,11 +263,10 @@ export function wirePageCaptureConsent(): void {
  * lists render from one `getAll()` snapshot, and adding a second read here
  * would reintroduce the per-origin probing those rows exist to avoid.
  *
- * The row is hidden, not merely unchecked, until the grant exists: the
- * preference does nothing without it, so offering it first would be a control
- * that silently fails. Revocation also CLEARS the stored value, because hiding
- * the row alone would leave `true` behind and re-granting all-sites months
- * later would restore an injected surface the researcher never re-chose. */
+ * The row is hidden until the grant exists because the preference has no
+ * effect without it. Once granted, a missing preference selects the in-page
+ * route. Revocation still clears the stored value: a later re-grant must not
+ * restore page injection after the researcher crossed that boundary. */
 async function applyInPageToastGrant(granted: boolean): Promise<void> {
   const row = document.getElementById("in-page-toast-row");
   const input = document.getElementById("in-page-toast");
@@ -299,7 +298,7 @@ async function renderFeedbackSettings(): Promise<void> {
     const ack = values[SUCCESS_ACK_MODE_KEY];
     success.value = ack === "errors" || ack === "off" ? ack : "all";
     if (inPageToast instanceof HTMLInputElement) {
-      inPageToast.checked = values[IN_PAGE_TOAST_KEY] === true;
+      inPageToast.checked = values[IN_PAGE_TOAST_KEY] !== false;
       inPageToast.dataset.lastPersisted = String(inPageToast.checked);
     }
   } catch {

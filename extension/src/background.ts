@@ -1542,8 +1542,8 @@ export interface BridgeDeps {
     /** Tri-state surface choice. `tab-group` degrades to `work-window` if
      * tabGroups is absent. */
     getHandoffSurface(): Promise<HandoffSurface>;
-    /** Opt-in delivery of the loss toast into the researcher's own page.
-     * Absent/false = the extension-window route, which needs no host access. */
+    /** Preferred delivery of the loss toast into the researcher's current
+     * page. Explicit false selects the extension-window route. */
     getInPageToast(): Promise<boolean>;
   };
   /** Durable managed-tab ledger (chrome.storage.local): URL-free birth
@@ -11101,11 +11101,10 @@ export class Bridge {
    * the caller falls back to the window rather than assuming either way.
    *
    * Every gate here is a refusal to interrupt, and they are ordered cheapest
-   * first. Two of them are the researcher's own choices and neither implies the
-   * other: the preference says they want papio's interruption in their page,
-   * and the all-sites grant says papio may reach that page at all. A provider
-   * grant is deliberately NOT sufficient — it was given so papio could finish a
-   * download on that host, not so papio could draw on it. */
+   * first. The preference selects the integrated route; the all-sites grant
+   * says papio may reach that page. A provider grant remains insufficient: it
+   * was given so papio could finish a download on that host, not so papio could
+   * draw there. */
   private async raiseInPageToast(payload: ToastPayload): Promise<boolean> {
     const tabs = this.deps.tabs;
     if (tabs.query === undefined) return false;

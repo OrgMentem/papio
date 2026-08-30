@@ -512,19 +512,19 @@ copy lives so the two routes cannot say different things.
 The relaxation of Decision 1 that this needed is narrow and is stated here
 rather than left implied. Decision 1 scopes the page-local surface to a page the
 researcher just acted on, because that surface is a receipt for their own
-action. This route is not a receipt, so the scoping rule it must satisfy instead
-is **the researcher's own standing choice**, expressed as two separate consents
-that are deliberately not collapsed into one:
+action. This route is not a receipt. The operator chose the integrated route as
+the default on 2026-08-31, after both routes shipped behind a preference:
 
 - The **all-sites host grant** (`https://*/*`, already declared in
-  `optional_host_permissions` and already offered as its own options control)
-  answers whether *papio* may reach an arbitrary page. A per-provider grant is
-  explicitly **not** sufficient: it was given so *papio* could complete a
-  download on that host, not so *papio* could draw on it.
-- The **`papio_in_page_toast_v1` preference**, off by default, answers whether
-  *papio*'s own interruption may appear there. Revoking the grant clears the
-  preference, so re-granting all-sites access later cannot silently restore an
-  injected surface.
+  `optional_host_permissions` and offered as its own options control) authorizes
+  *papio* to reach arbitrary HTTPS pages. It now also selects this bounded,
+  page-local status message by default. A per-provider grant remains
+  insufficient because it authorizes a download on that host, not a general
+  page surface.
+- The **`papio_in_page_toast_v1` preference** is an opt-out. Missing means the
+  in-page route; explicit `false` selects the extension window. Revoking the
+  all-sites grant writes `false`, so re-granting access later cannot silently
+  reverse an explicit boundary.
 
 Five further bounds, all test-enforced:
 

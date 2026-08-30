@@ -7,6 +7,7 @@ import {
   MANAGED_STATE_VERSION,
   chromeBackend,
   clearPendingDelivery,
+  getInPageToastEnabled,
   emptyStore,
   findByJob,
   findByTab,
@@ -649,4 +650,24 @@ test("materialization migration preserves only opaque correlation fields", () =>
   });
   expect(JSON.stringify(migrated)).not.toContain("fresh_route_url");
   expect(JSON.stringify(migrated)).not.toContain("https://secret.example");
+});
+
+test("the in-page toast defaults on but respects opt-out and storage failure", async () => {
+  expect(
+    await getInPageToastEnabled({
+      get: async () => ({}),
+    }),
+  ).toBe(true);
+  expect(
+    await getInPageToastEnabled({
+      get: async () => ({ papio_in_page_toast_v1: false }),
+    }),
+  ).toBe(false);
+  expect(
+    await getInPageToastEnabled({
+      get: async () => {
+        throw new Error("storage unavailable");
+      },
+    }),
+  ).toBe(false);
 });

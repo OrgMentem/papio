@@ -70,26 +70,24 @@ export const SUCCESS_ACK_MODE_KEY = "papio_success_ack_mode_v1";
  * that bundle. */
 export const ALL_SITES_ORIGIN = "https://*/*";
 
-/** Opt-in: deliver the loss toast by injecting it into the page the researcher
- * is actually looking at, instead of opening a small *papio* window.
+/** Prefer the in-page loss toast when the researcher has already granted
+ * all-sites access. An explicit false selects the extension-window route.
  *
- * Two gates, not one, and they answer different questions. The all-sites host
- * grant answers "may papio reach this page at all"; a researcher grants it so
- * papio can complete downloads on unlisted providers (`options.html`'s
- * all-sites lede), which is not consent to draw in their pages. This key
- * answers "do you want papio's own interruption to appear there". Absent means
- * off: the window route is always available and needs no host access, so the
- * quieter surface is the one that does not require a choice. */
+ * The host grant still answers whether papio may reach the page. This setting
+ * lets the researcher choose the less integrated window route instead. A
+ * missing value means in-page because the toast is bounded, reads no page
+ * content, and always falls back to papio's own window when injection is not
+ * safe. Revoking all-sites access writes false, so a later re-grant never
+ * restores page injection after that explicit boundary. */
 export const IN_PAGE_TOAST_KEY = "papio_in_page_toast_v1";
 
-/** Read the in-page-toast preference, treating anything but an explicit `true`
- * as off. Malformed storage must not enable an injected surface. */
+/** Read the in-page-toast preference. Storage failure remains fail-closed. */
 export async function getInPageToastEnabled(
   storage: Pick<chrome.storage.StorageArea, "get"> = chrome.storage.local,
 ): Promise<boolean> {
   try {
     const values = await storage.get(IN_PAGE_TOAST_KEY);
-    return values[IN_PAGE_TOAST_KEY] === true;
+    return values[IN_PAGE_TOAST_KEY] !== false;
   } catch {
     return false;
   }

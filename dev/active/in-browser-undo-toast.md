@@ -1,7 +1,7 @@
 # An interactive in-browser toast, with take-back-control
 
-Status: Slices 1, 2, 4 and 5 shipped (2026-08-28). Slice 3 is deliberately open —
-see the operator question at the end.
+Status: All five slices shipped. Route A became the default when all-sites
+access is active on 2026-08-31; Route B remains the automatic fallback.
 
 ## What was asked for
 
@@ -139,11 +139,11 @@ Unit tests only. No delivery yet.
 `focused: false`, an extension page, the two labels, the eight-second timer, the
 single-instance rule. This is the slice that makes the feature real.
 
-**Slice 3 — NOT SHIPPED, pending the operator question below. Route A, the
-in-page toast where permission exists.** Reuses Slice 1's
-renderer, injected with the existing `scripting` permission, with a
-`chrome.runtime.sendMessage` reply from the isolated world. Falls back to Route B
-when the tab is not granted.
+**Slice 3 — SHIPPED. Route A, the in-page toast where permission exists.**
+Reuses Slice 1's renderer, injected with the existing `scripting` permission,
+with a `chrome.runtime.sendMessage` reply from the isolated world. Falls back
+to Route B when the page cannot receive it. With all-sites access active, this
+route is the default unless the researcher turns it off.
 
 **Slice 4 — SHIPPED. Wire it to the tab-close branches**, per the truthfulness table above,
 and to the institutional case with the second label.
@@ -216,11 +216,9 @@ used `Date.now()` rather than the bridge's `deps.now()` seam, so the stale-focus
 test could not advance time and failed. Every time-dependent path in this file
 uses the seam.
 
-## Open question for the operator
+## Operator decision
 
-Route A renders inside a publisher page papio already has permission for. That is
-a page the researcher did not ask papio to draw on for a *background* event —
-Decision 1 restricted the existing chip to the page bound to an action the
-researcher had just taken, and this relaxes exactly that. Route B never touches a
-page. If the in-page fidelity is not worth that relaxation, Slice 3 is droppable
-and Slices 1, 2, 4, 5 still deliver the feature.
+Route A is worth the narrow relaxation. When all-sites access is active, the
+in-page message is the default. The researcher can turn it off, and Route B
+remains the automatic fallback. The bounds above still prohibit injection into
+pages *papio* is driving, non-HTTPS pages, and PDFs.

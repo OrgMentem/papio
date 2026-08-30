@@ -458,22 +458,20 @@ test("the in-page toast row stays hidden until all-sites access exists", async (
   expect(row?.hasAttribute("hidden")).toBe(true);
 });
 
-test("all-sites access reveals the in-page toast row, still unchecked", async () => {
-  // Revealed, not enabled. The grant is about reach; this preference is about
-  // whether papio may draw in the researcher's page.
+test("all-sites access reveals the in-page toast enabled by default", async () => {
   const page = await optionsDocument({ origins: [ALL_SITES_ORIGIN] });
   const row = page.document.getElementById("in-page-toast-row");
   const input = page.document.getElementById("in-page-toast");
   expect(row?.hasAttribute("hidden")).toBe(false);
-  expect((input as HTMLInputElement | null)?.checked).toBe(false);
+  expect((input as HTMLInputElement | null)?.checked).toBe(true);
 });
 
-test("a stored opt-in shows as checked once the grant is present", async () => {
+test("a stored opt-out selects the extension-window route", async () => {
   const page = await optionsDocument({
     origins: [ALL_SITES_ORIGIN],
-    storageSeed: { papio_in_page_toast_v1: true },
+    storageSeed: { papio_in_page_toast_v1: false },
   });
-  expect((page.document.getElementById("in-page-toast") as HTMLInputElement | null)?.checked).toBe(true);
+  expect((page.document.getElementById("in-page-toast") as HTMLInputElement | null)?.checked).toBe(false);
 });
 
 test("revoking all-sites access clears the stored opt-in", async () => {
