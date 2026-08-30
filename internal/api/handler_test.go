@@ -485,6 +485,7 @@ func TestRouterPingReturnsCachedUpdateBeforeRefresh(t *testing.T) {
 	system := testSystem(t)
 	refreshStarted := make(chan struct{}, 1)
 	releaseRefresh := make(chan struct{})
+	released := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		select {
 		case refreshStarted <- struct{}{}:
@@ -497,7 +498,11 @@ func TestRouterPingReturnsCachedUpdateBeforeRefresh(t *testing.T) {
 		_, _ = w.Write([]byte(`{"tag_name":"v99.0.0","html_url":"https://example.test/releases/v99.0.0"}`))
 	}))
 	defer server.Close()
-	defer close(releaseRefresh)
+	defer func() {
+		if !released {
+			close(releaseRefresh)
+		}
+	}()
 	system.Updates = update.NewWithOptions(update.Options{
 		DataDir:     system.Config.DataDir,
 		ReleasesURL: server.URL,
@@ -515,6 +520,13 @@ func TestRouterPingReturnsCachedUpdateBeforeRefresh(t *testing.T) {
 	case <-refreshStarted:
 	case <-time.After(time.Second):
 		t.Fatal("ping did not trigger an update refresh")
+	}
+	close(releaseRefresh)
+	released = true
+	// Join the background refresh through the checker's own serialization
+	// before TempDir cleanup removes its cache directory.
+	if info := system.Updates.Check(context.Background()); info == nil || info.LatestVersion != "99.0.0" {
+		t.Fatalf("background update refresh did not settle: %+v", info)
 	}
 }
 
