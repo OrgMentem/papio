@@ -9,6 +9,7 @@ import {
   classifyResolverJWTIdentity,
   classifyResolverMarkers,
   clampKeepaliveInterval,
+  chromeKeepaliveAPI,
   collectResolverMarkers,
   isAuthenticationURL,
   keepaliveModeFromStorage,
@@ -255,6 +256,7 @@ function makeHarness(
    * every existing test's behavior is unchanged unless a test opts in. */
   configuredReady: { value: boolean };
   storageValues: Record<string, unknown>;
+  notifyModeChanged(): Promise<void>;
   resolverMarkers: ResolverMarker[];
   markersByTab: Map<number, ResolverMarker[]>;
   /** Every "keepalive.originStates" payload ever persisted, in write order —
@@ -283,6 +285,7 @@ function makeHarness(
   const permissionChanges: { origin: string; granted: boolean }[] = [];
   const configuredReady = { value: false };
   const originStateWrites: KeepaliveOriginSnapshot[][] = [];
+  let modeChangedListener: (() => void | Promise<void>) | undefined;
   const storageValues: Record<string, unknown> = {
     "keepalive.interval": interval,
     "keepalive.mode": "demand",
@@ -306,6 +309,12 @@ function makeHarness(
         if (Array.isArray(states)) {
           originStateWrites.push(states.map((entry) => ({ ...(entry as KeepaliveOriginSnapshot) })));
         }
+      },
+      onModeChanged: (listener) => {
+        modeChangedListener = listener;
+        return () => {
+          if (modeChangedListener === listener) modeChangedListener = undefined;
+        };
       },
     },
     permissions: {
@@ -368,6 +377,9 @@ function makeHarness(
     authChanges,
     configuredReady,
     storageValues,
+    notifyModeChanged: async () => {
+      await modeChangedListener?.();
+    },
     resolverMarkers,
     permissionChanges,
     markersByTab,
@@ -396,6 +408,49 @@ test("creates one pinned resolver tab, reloads it, and closes it when jobs finis
   await h.manager.sync();
 
   expect(h.tabs.removed).toEqual([1]);
+});
+
+test("the Chrome API forwards only local keepalive mode changes", async () => {
+  type StorageListener = (
+    changes: Record<string, { oldValue?: unknown; newValue?: unknown }>,
+    areaName: string,
+  ) => void;
+  let storageListener: StorageListener | undefined;
+  let removedListener: StorageListener | undefined;
+  const api = chromeKeepaliveAPI({
+    action: {},
+    permissions: {},
+    tabs: {},
+    storage: {
+      local: {
+        get: async () => ({}),
+        set: async () => {},
+      },
+      onChanged: {
+        addListener: (listener: StorageListener) => {
+          storageListener = listener;
+        },
+        removeListener: (listener: StorageListener) => {
+          removedListener = listener;
+        },
+      },
+    },
+  } as unknown as Parameters<typeof chromeKeepaliveAPI>[0]);
+  let notifications = 0;
+  const stop = api.storage.onModeChanged?.(() => {
+    notifications += 1;
+  });
+
+  storageListener?.({ unrelated: { newValue: true } }, "local");
+  storageListener?.({ "keepalive.mode": { newValue: "off" } }, "sync");
+  expect(notifications).toBe(0);
+
+  storageListener?.({ "keepalive.mode": { newValue: "off" } }, "local");
+  storageListener?.({ "keepalive.enabled": { oldValue: false } }, "local");
+  expect(notifications).toBe(2);
+
+  stop?.();
+  expect(removedListener).toBe(storageListener);
 });
 
 test("explicit keepalive modes preserve the previous opt-out", () => {
@@ -429,6 +484,64 @@ test("off mode opens no resolver tab while institutional work exists", async () 
 
   await h.manager.init();
   expect(h.tabs.created).toEqual([]);
+});
+
+test("off mode blocks every automatic probe but keeps explicit checks available", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    demandOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    storageValues: { "keepalive.mode": "off" },
+  });
+  h.configuredReady.value = true;
+  h.jobs.count = 0;
+  await h.manager.init();
+
+  const tab = { id: 501, url: `${origin}/account` };
+  h.tabs.seed(tab);
+  h.tabs.resolverTabs.push(tab);
+
+  h.manager.noteResolverNavigation(tab.id, tab.url);
+  h.manager.noteResolverActivated(tab.id, tab.url);
+  await flushMicrotasks();
+  await h.manager.onWake();
+  await h.manager.noteInstitutionalLanding(origin, "tracked_auth_return");
+  await flushMicrotasks();
+
+  expect(h.timers.pendingDelays()).not.toContain(1);
+  expect(h.scripting.injectionCounts.get(tab.id) ?? 0).toBe(0);
+  expect(
+    h.manager.getOriginSnapshots().find((snapshot) => snapshot.origin === origin)
+      ?.institutionalRecheckCause,
+  ).toBeUndefined();
+
+  await h.manager.probeForeground(origin);
+  expect(h.scripting.injectionCounts.get(tab.id)).toBe(1);
+});
+
+test("changing the stored mode to off closes the owned tab and cancels deferred automatic probes", async () => {
+  const h = makeHarness();
+  await h.manager.init();
+  await h.manager.probeForeground();
+
+  const liveTab = { id: 900, url: RESOLVER_OPENURL };
+  h.tabs.seed(liveTab);
+  h.manager.noteResolverNavigation(liveTab.id, liveTab.url);
+  await h.timers.runByDelay(1);
+  await flushMicrotasks();
+
+  expect(h.scripting.injectionCounts.get(liveTab.id) ?? 0).toBe(0);
+  expect(h.timers.pendingDelays()).toContain(MIN_PROBE_START_SPACING_MS);
+
+  h.storageValues["keepalive.mode"] = "off";
+  await h.notifyModeChanged();
+  await flushMicrotasks();
+
+  expect(h.tabs.removed).toContain(1);
+  expect(h.timers.pendingDelays()).not.toContain(MIN_PROBE_START_SPACING_MS);
+  expect(h.scripting.injectionCounts.get(liveTab.id) ?? 0).toBe(0);
 });
 
 /** Drains the microtask queue without a real timer or macrotask: nothing

@@ -60,6 +60,8 @@ export interface KeepaliveTabs {
 export interface KeepaliveStorage {
   get(keys: string[]): Promise<Record<string, unknown>>;
   set?(values: Record<string, unknown>): Promise<void>;
+  /** Subscribe to mode changes from another extension page. */
+  onModeChanged?(listener: () => void | Promise<void>): () => void;
 }
 
 export interface KeepalivePermissions {
@@ -1100,6 +1102,7 @@ export class KeepaliveManager {
     cause: "parked_demand" | "tracked_auth_return" = "parked_demand",
   ): Promise<void> {
     await this.loadPreferences();
+    if (this.mode === "off") return;
     const target = normalizeHttpsOrigin(origin);
     if (
       target === undefined ||
@@ -1311,6 +1314,7 @@ export class KeepaliveManager {
     };
   }
   private started = false;
+  private stopModeObserver: (() => void) | undefined;
   private readonly observeMs: number;
   private readonly reloadSettleMs: number;
 
@@ -1321,10 +1325,11 @@ export class KeepaliveManager {
     this.observeMs = Math.max(0, options.observeMs ?? DEFAULT_OBSERVE_MS);
     this.reloadSettleMs = Math.max(0, options.reloadSettleMs ?? DEFAULT_RELOAD_SETTLE_MS);
   }
-  /** Load preferences and reconcile immediately. Safe to call more than once. */
+  /** Load preferences, observe later mode changes, and reconcile immediately. */
   async init(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    this.stopModeObserver = this.api.storage.onModeChanged?.(() => this.sync());
     await this.sync();
   }
 
@@ -1405,11 +1410,33 @@ export class KeepaliveManager {
     }
   }
 
+  /** Resolve and remove automatic work that has not started yet. Explicit
+   * foreground checks remain queued because the operator requested them. */
+  private cancelAutomaticProbeRequests(): void {
+    for (const timer of this.settleTimers.values()) {
+      this.api.timers.clearTimeout(timer);
+    }
+    this.settleTimers.clear();
+    for (const [origin, pending] of this.pendingProbes) {
+      if (pending.reason === "foreground") continue;
+      this.pendingProbes.delete(origin);
+      pending.resolve();
+      const spacing = this.spacingTimers.get(origin);
+      if (spacing !== undefined) {
+        this.api.timers.clearTimeout(spacing.timer);
+        this.spacingTimers.delete(origin);
+      }
+    }
+  }
+
   /** Single funnel for every probe trigger. An institutional-landing request
    * repeats its demand and permission gates here, including when it re-enters
    * after a spacing delay. This prevents an auth block that ended during the
    * delay from causing a later background page read. */
   private requestProbe(origin: string, reason: ProbeReason, preferredTabID?: number): Promise<void> {
+    if (reason !== "foreground" && this.mode === "off") {
+      return Promise.resolve();
+    }
     if (reason === "institutional_landing") {
       const cause =
         this.originStates.get(origin)?.institutionalRecheckCause;
@@ -1948,6 +1975,8 @@ export class KeepaliveManager {
 
   /** Stop scheduling and remove the manager-owned tab. */
   async dispose(): Promise<void> {
+    this.stopModeObserver?.();
+    this.stopModeObserver = undefined;
     this.clearCycleTimer();
     this.clearReauthTimer();
     for (const timer of this.settleTimers.values()) this.api.timers.clearTimeout(timer);
@@ -1976,6 +2005,7 @@ export class KeepaliveManager {
     if (generation !== this.loadPreferencesGeneration) return;
     this.intervalMinutes = clampKeepaliveInterval(values["keepalive.interval"]);
     this.mode = keepaliveModeFromStorage(values);
+    if (this.mode === "off") this.cancelAutomaticProbeRequests();
 
     if (storageReadSucceeded) {
       this.persistedResolverOrigin = normalizeHttpsOrigin(values[KEEPALIVE_RESOLVER_ORIGIN_KEY]);
@@ -2583,6 +2613,7 @@ export class KeepaliveManager {
    * event in a burst (url-change, then complete) actually triggers a
    * probe. */
   private armSettleTimer(origin: string, tabID: number): void {
+    if (this.mode === "off") return;
     const existing = this.settleTimers.get(origin);
     if (existing !== undefined) this.api.timers.clearTimeout(existing);
     const timer = this.api.timers.setTimeout(() => {
@@ -2769,6 +2800,23 @@ export function chromeKeepaliveAPI(
     storage: {
       get: (keys) => chromeAPI.storage.local.get(keys),
       set: (values) => chromeAPI.storage.local.set(values),
+      onModeChanged: (listener) => {
+        const onChanged: Parameters<typeof chromeAPI.storage.onChanged.addListener>[0] = (
+          changes,
+          areaName,
+        ) => {
+          if (
+            areaName !== "local" ||
+            (changes[KEEPALIVE_MODE_KEY] === undefined &&
+              changes[LEGACY_KEEPALIVE_ENABLED_KEY] === undefined)
+          ) {
+            return;
+          }
+          void listener();
+        };
+        chromeAPI.storage.onChanged.addListener(onChanged);
+        return () => chromeAPI.storage.onChanged.removeListener(onChanged);
+      },
     },
     permissions: {
       getAll: () => chromeAPI.permissions.getAll(),
