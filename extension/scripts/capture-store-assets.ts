@@ -125,6 +125,31 @@ const makePopupMock = (state: Record<string, unknown>) => `(() => {
   const store = ${JSON.stringify(state)};
   const page = ${JSON.stringify(popupPage)};
   const tab = { id: 1, url: page.url, title: page.title };
+  const counts = {
+    pending_total: 9,
+    watch_hits: 1,
+    actions: 5,
+    retractions: 0,
+    jobs_working: 3,
+    jobs_needs_review: 0,
+    failure_groups_7d: 0,
+    turns_required: 5,
+    turns_working: 3,
+    required_turns_complete: true,
+  };
+  const pulse = {
+    request_id: "store-pulse",
+    schema: 1,
+    generated_at: new Date().toISOString(),
+    nonterminal_total: 12,
+    projection_complete: true,
+    in_flight: 3,
+    scheduled: 4,
+    waiting_required: 5,
+    continuing: 0,
+    stalled: 0,
+    effect_capacity: { busy: 0, limit: 1 },
+  };
   globalThis.chrome = {
     runtime: {
       getManifest: () => ({ version: ${JSON.stringify(VERSION)}, update_url: "https://clients2.google.com/service/update2/crx" }),
@@ -133,6 +158,18 @@ const makePopupMock = (state: Record<string, unknown>) => `(() => {
         // resting shape, never open a selection workspace mid-screenshot.
         if (message && message.type === "papio.pageBulk.scan") {
           return { ok: true, scan_id: "scan-capture" };
+        }
+        if (message && message.type === "papio.work.pulse") {
+          return {
+            ok: true,
+            available: true,
+            pulse,
+            received_at: Date.now(),
+            worker_epoch: "store-capture",
+          };
+        }
+        if (message && message.type === "papio.triage.counts") {
+          return { ok: true, counts };
         }
         return {};
       },
@@ -257,11 +294,28 @@ const inboxCounts = {
   jobs_working: 1,
   jobs_needs_review: 1,
   failure_groups_7d: 0,
+  turns_required: 3,
+  turns_working: 0,
+  family_breakdown_complete: true,
+  required_turns_complete: true,
 };
 
 const inboxMock = `(() => {
   const items = ${JSON.stringify(inboxItems)};
   const counts = ${JSON.stringify(inboxCounts)};
+  const pulse = {
+    request_id: "store-inbox-pulse",
+    schema: 1,
+    generated_at: new Date().toISOString(),
+    nonterminal_total: 7,
+    projection_complete: true,
+    in_flight: 2,
+    scheduled: 2,
+    waiting_required: 3,
+    continuing: 0,
+    stalled: 0,
+    effect_capacity: { busy: 0, limit: 1 },
+  };
   const snapshot = { schema: 1, generated_at: new Date().toISOString(), counts, items, has_more: false, unsupported_items_count: 0 };
   globalThis.chrome = {
     runtime: {
@@ -269,6 +323,15 @@ const inboxMock = `(() => {
       sendMessage: async (m) => {
         if (m && m.type === "papio.triage.snapshot") return { ok: true, snapshot };
         if (m && m.type === "papio.triage.counts") return { ok: true, counts };
+        if (m && m.type === "papio.work.pulse") {
+          return {
+            ok: true,
+            available: true,
+            pulse,
+            received_at: Date.now(),
+            worker_epoch: "store-capture",
+          };
+        }
         return { ok: true };
       },
       openOptionsPage: () => {},
@@ -308,19 +371,23 @@ async function newPage(browser: Browser, width: number, height: number, mock?: s
 async function capturePopup(browser: Browser, base: string, name: string, mock: string) {
   const page = await newPage(browser, 1280, 800, mock);
   await page.goto(`${base}/popup.html`, { waitUntil: "load" });
-  // Wait until the async refresh() has painted its state: the current-page rail
-  // has revealed at least one enabled action, or the daemon-status warning card
-  // is up (the attention variant, where the rail may legitimately stay empty).
+  // Wait until refresh() has painted either acquisition surface. A specific
+  // paper now hoists its action into the header and deliberately hides the
+  // body rail; bulk-only pages still use the rail. The disconnected variant
+  // can legitimately show neither and settles on the warning card.
   await page.waitForFunction(() => {
+    const header = document.getElementById("header-acquire-btn");
+    const headerReady =
+      header instanceof HTMLButtonElement && !header.hidden && !header.disabled;
     const rail = document.getElementById("current-page-actions");
-    const ready =
+    const railReady =
       rail !== null &&
       !rail.hidden &&
       Array.from(rail.querySelectorAll("button")).some(
         (button) => !(button as HTMLButtonElement).hidden && !(button as HTMLButtonElement).disabled,
       );
     const card = document.getElementById("daemon-status");
-    return ready || (card !== null && !card.hidden);
+    return headerReady || railReady || (card !== null && !card.hidden);
   }, { timeout: 10000 });
   await page.addStyleTag({
     content:
