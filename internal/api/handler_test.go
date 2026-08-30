@@ -479,6 +479,9 @@ func TestRouterPingIncludesUpdatesOnlyWhenEnabled(t *testing.T) {
 	if enabled.ZotioUpdateAvailable == nil || !*enabled.ZotioUpdateAvailable || enabled.ZotioLatestVersion != "1.1.0" {
 		t.Fatalf("enabled Zotio update status = %+v", enabled)
 	}
+	if info := system.Updates.Check(context.Background()); info == nil || info.LatestVersion != "99.0.0" {
+		t.Fatalf("background update refresh did not settle: %+v", info)
+	}
 }
 
 func TestRouterPingReturnsCachedUpdateBeforeRefresh(t *testing.T) {
@@ -603,6 +606,8 @@ func TestRouterPingStartsOnlyOneBackgroundUpdateRefresh(t *testing.T) {
 		t.Fatal("rapid pings started an additional queued refresh")
 	case <-time.After(250 * time.Millisecond):
 	}
+	// Join the one background refresh before TempDir cleanup removes its cache.
+	_ = system.Updates.Check(context.Background())
 }
 
 func TestZotioPreflightCachesInstalledVersion(t *testing.T) {
