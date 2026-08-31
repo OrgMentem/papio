@@ -1384,6 +1384,119 @@ test("a blocked replacement preserves the paused IdP owner and its recheck watch
   expect(h.timers.pendingDelays()).toContain(10);
 });
 
+test("off during a blocked replacement leaves the paused IdP tab unowned", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    demandOrigins: [origin],
+  });
+  h.configuredReady.value = true;
+  await h.manager.init();
+  const idpURL =
+    "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?service=resolver";
+  h.tabs.patch(1, { url: idpURL });
+  await h.manager.probeForeground(origin);
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(true);
+
+  // Hold the replacement creation open so the mode can change inside it.
+  const blocked = Promise.withResolvers<void>();
+  h.tabs.create = async () => {
+    await blocked.promise;
+    throw new Error("tab creation blocked");
+  };
+
+  const landing = h.manager.noteInstitutionalLanding(origin);
+  await flushMicrotasks();
+  h.storageValues["keepalive.mode"] = "off";
+  await h.notifyModeChanged("off");
+  blocked.resolve();
+  await landing;
+  await flushMicrotasks();
+
+  // The sign-in surface stays open for the operator, but papio does not take
+  // it back over: no restored ownership, and no third reauth notice - the
+  // sibling test above records [true, false, true] when the mode is still on.
+  expect(h.tabs.snapshot(1)?.url).toBe(idpURL);
+  expect(h.tabs.removed).not.toContain(1);
+  expect(h.manager.getSnapshot().pausedForReauth).toBe(false);
+  expect(h.reauthState).toEqual([true, false]);
+});
+
+test("a mode event during the first load still hydrates persisted state", async () => {
+  const origin = "https://resolver.example.edu";
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    knownOrigins: [origin],
+    grantedOrigins: [`${origin}/*`],
+    demandOrigins: [origin],
+    storageValues: {
+      "keepalive.mode": "always",
+      "keepalive.originStates": [
+        {
+          origin,
+          verdict: "in",
+          authenticated: true,
+          likelyAuthenticated: true,
+          pausedForReauth: false,
+          lastProbeAt: null,
+          dirtySince: null,
+        },
+      ],
+    },
+  });
+  const firstRead = Promise.withResolvers<Record<string, unknown>>();
+  const storage = h.api.storage;
+  const realGet = storage.get.bind(storage);
+  let reads = 0;
+  storage.get = async (keys) => {
+    reads += 1;
+    return reads === 1 ? firstRead.promise : realGet(keys);
+  };
+
+  const starting = h.manager.init();
+  await flushMicrotasks();
+  await h.notifyModeChanged("always");
+  firstRead.resolve({ ...h.storageValues });
+  await starting;
+  await flushMicrotasks();
+
+  // The event supersedes the read it interrupted, so it owes a replacement:
+  // without one the persisted snapshot is never restored and every later
+  // origin-state write is silently dropped.
+  expect(
+    h.manager.getOriginSnapshots().find((s) => s.origin === origin)?.verdict,
+  ).toBe("in");
+  expect(h.manager.getSnapshot().enabled).toBe(true);
+});
+
+test("a joined creation that produced no tab is re-driven exactly once", async () => {
+  const h = makeHarness(4, undefined, {
+    latestOpenURL: RESOLVER_OPENURL,
+    storageValues: { "keepalive.mode": "always" },
+  });
+  const blocked = Promise.withResolvers<void>();
+  const attempts: unknown[] = [];
+  h.tabs.create = async (properties) => {
+    attempts.push(properties);
+    await blocked.promise;
+    throw new Error("tab creation blocked");
+  };
+
+  const first = h.manager.sync();
+  const second = h.manager.sync();
+  await flushMicrotasks();
+  blocked.resolve();
+  await Promise.all([first, second]);
+  await flushMicrotasks();
+
+  // One attempt per driver: the joiner re-drives after finding no tab, and a
+  // genuine creation failure is never retried in a loop.
+  expect(attempts).toHaveLength(2);
+  expect(h.tabs.list()).toEqual([]);
+});
+
 test("one wake runs one probe when ordinary and institutional recovery overlap", async () => {
   const origin = "https://resolver.example.edu";
   const h = makeHarness(4, undefined, {

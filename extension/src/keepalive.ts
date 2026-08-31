@@ -1174,6 +1174,11 @@ export class KeepaliveManager {
     if (
       this.tabID === undefined &&
       oldTabExists &&
+      // Off can land inside createTab's awaits. Re-adopting the tab and
+      // arming the recheck loop would restore automatic ownership the
+      // operator just switched off, and leave a paused IdP tab that no
+      // later reconcile can replace. The tab stays open either way.
+      this.mode !== "off" &&
       this.resolver?.origin === origin
     ) {
       // Browser policy rejected the replacement. Preserve the old visible
@@ -1335,14 +1340,14 @@ export class KeepaliveManager {
   }
 
   private async onStoredModeChanged(mode: KeepaliveMode | undefined): Promise<void> {
-    if (mode === undefined) {
-      await this.sync();
-      return;
-    }
-    // The event is newer than every preference read already in flight.
-    this.loadPreferencesGeneration += 1;
-    this.applyMode(mode);
-    await this.reconcile();
+    // Apply the event's own mode first, so a storage read that fails on the
+    // way through cannot revive automatic work the operator just stopped.
+    // Then still complete a full load: sync() supersedes every read already
+    // in flight, and the superseded one may be init()'s, which is what
+    // restores the persisted resolver origin, the origin snapshots, and the
+    // host-permission map. Applying the mode alone stranded that hydration.
+    if (mode !== undefined) this.applyMode(mode);
+    await this.sync();
   }
 
   /** Load preferences, observe later mode changes, and reconcile immediately. */
@@ -2328,6 +2333,7 @@ export class KeepaliveManager {
   }
 
   private async createTab(intent: TabCreationIntent): Promise<void> {
+    let rejoined = false;
     for (;;) {
       const resolver = this.resolver;
       const wantedOrigin = resolver?.protocol === "https:" ? resolver.origin : undefined;
@@ -2343,8 +2349,15 @@ export class KeepaliveManager {
       }
       if (wantedOrigin === this.tabCreationOrigin) {
         await this.tabCreationInFlight;
-        if (intent === "foreground" && this.tabID === undefined) continue;
-        return;
+        // The attempt we joined can be invalidated after we joined it: a
+        // mode change to off makes an automatic creation return without a
+        // tab. Re-drive exactly once, so a caller that still wants a tab is
+        // not left waiting for the next cycle, and a genuine creation
+        // failure is not retried in a loop. Under off the re-drive is free:
+        // createTabOnce's own gate returns before it touches the browser.
+        if (this.tabID !== undefined || rejoined) return;
+        rejoined = true;
+        continue;
       }
       // Wanted a different origin than the creation already in flight
       // (e.g. openReauth switching institutions mid-race). Wait for the
