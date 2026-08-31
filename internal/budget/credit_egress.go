@@ -381,6 +381,13 @@ func (m *Manager) CommitEgress(ctx context.Context, req EgressRequest) error {
 	day := utcDay(now)
 	policy := m.creditPolicyFor(req.Source)
 
+	// The production probe reads through the same single-connection database.
+	// Read it before BeginTx so the transaction cannot block its own callback.
+	otherWaiting := false
+	if egressTestHooks.enforceJobShare && req.JobID != "" && policy.DailyCreditFraction != 0 {
+		otherWaiting = m.otherWorkWaiting(ctx, req.JobID)
+	}
+
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -419,7 +426,7 @@ func (m *Manager) CommitEgress(ctx context.Context, req EgressRequest) error {
 			return err
 		}
 		share := jobShareLimit(limit)
-		if taken+req.Credits > share && m.otherWorkWaiting(ctx, req.JobID) {
+		if taken+req.Credits > share && otherWaiting {
 			return jobShareExceeded(req, taken, req.Credits, share, now)
 		}
 	}

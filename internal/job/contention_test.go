@@ -4,9 +4,13 @@ package job
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"papio/internal/budget"
+	"papio/internal/config"
 	"papio/internal/work"
+	"time"
 )
 
 // contendingJob creates a job and drives it to state, returning its id.
@@ -29,6 +33,33 @@ func contendingJob(t *testing.T, js *Store, ctx context.Context, requestID, doi,
 		}
 	}
 	return id
+}
+
+func contentionBudget(t *testing.T, js *Store) *budget.Manager {
+	t.Helper()
+	fixed := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	m := budget.New(js.S,
+		budget.WithNow(func() time.Time { return fixed }),
+		budget.WithCreditPolicy(func(string) budget.CreditPolicy {
+			return budget.CreditPolicy{DailyCreditFraction: 1, DailyCreditLimit: 100}
+		}),
+		budget.WithContentionProbe(js.OtherWorkWaiting),
+	)
+	if err := m.ObserveLimit(context.Background(), config.SourceOpenAlex, "key-a", 100, true); err != nil {
+		t.Fatalf("observe source limit: %v", err)
+	}
+	return m
+}
+
+func spendJobShare(t *testing.T, m *budget.Manager, jobID string) {
+	t.Helper()
+	for range 25 {
+		if err := m.CommitEgress(context.Background(), budget.EgressRequest{
+			Source: config.SourceOpenAlex, Identity: "key-a", Credits: 1, JobID: jobID,
+		}); err != nil {
+			t.Fatalf("commit credit before share boundary: %v", err)
+		}
+	}
 }
 
 func TestOtherWorkWaitingSeesJobsThatWillMakeRequests(t *testing.T) {
@@ -108,4 +139,60 @@ func TestOtherWorkWaitingExcludesTheAskingJob(t *testing.T) {
 	if !waiting {
 		t.Fatal("waiting = false for an empty job id with a resolving job present")
 	}
+}
+
+func TestCommitEgressChecksProductionContentionOutsideTransaction(t *testing.T) {
+	js := testStore(t)
+	mine := contendingJob(t, js, context.Background(), "wr_c_0030", "10.1002/mine", StateResolving)
+	contendingJob(t, js, context.Background(), "wr_c_0031", "10.1002/other", StateQueued)
+	m := contentionBudget(t, js)
+	spendJobShare(t, m, mine)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := time.Now()
+	err := m.CommitEgress(ctx, budget.EgressRequest{
+		Source: config.SourceOpenAlex, Identity: "key-a", Credits: 1, JobID: mine,
+	})
+	elapsed := time.Since(started)
+
+	var exceeded *budget.ErrExceeded
+	if !errors.As(err, &exceeded) || exceeded.Kind != budget.KindJobShare {
+		t.Fatalf("CommitEgress = %v after %v, want a prompt job-share refusal", err, elapsed)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("CommitEgress took %v, want the contention probe to return promptly", elapsed)
+	}
+}
+
+func TestCommitEgressCommitsAboveShareWithoutProductionContention(t *testing.T) {
+	js := testStore(t)
+	mine := contendingJob(t, js, context.Background(), "wr_c_0040", "10.1002/mine", StateResolving)
+	m := contentionBudget(t, js)
+	spendJobShare(t, m, mine)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := m.CommitEgress(ctx, budget.EgressRequest{
+		Source: config.SourceOpenAlex, Identity: "key-a", Credits: 1, JobID: mine,
+	}); err != nil {
+		t.Fatalf("CommitEgress without other waiting work: %v", err)
+	}
+
+	assertCommitted := func(table, query string, args ...any) {
+		t.Helper()
+		var committed int
+		if err := js.S.DB().QueryRow(query, args...).Scan(&committed); err != nil {
+			t.Fatalf("read %s debit: %v", table, err)
+		}
+		if committed != 26 {
+			t.Errorf("%s credits_committed = %d, want 26", table, committed)
+		}
+	}
+	assertCommitted("source_credit_fuse",
+		`SELECT credits_committed FROM source_credit_fuse WHERE source = ? AND utc_day = ?`,
+		config.SourceOpenAlex, "2026-08-17")
+	assertCommitted("job_credit_share",
+		`SELECT credits_committed FROM job_credit_share WHERE job_id = ? AND source = ? AND utc_day = ?`,
+		mine, config.SourceOpenAlex, "2026-08-17")
 }
