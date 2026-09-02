@@ -524,3 +524,68 @@ func TestLookupWorksLocalOnlySkipsSync(t *testing.T) {
 		t.Fatalf("classification = %+v, want owned_with_pdf/PDF00001", result.Works[0])
 	}
 }
+
+// missingPDFErrCLI fails only the missing-PDF read, so a MissingPDFCount test
+// can pin error propagation without disturbing the shared fakeCLI.
+type missingPDFErrCLI struct {
+	*fakeCLI
+	err error
+}
+
+func (f *missingPDFErrCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, error) {
+	return nil, f.err
+}
+
+// MissingPDFCount is the read-only counter behind the workspace badge. An
+// unconfigured integration must say so instead of answering a zero that reads
+// as "nothing missing".
+func TestMissingPDFCountRejectsUnconfiguredIntegration(t *testing.T) {
+	ctx := context.Background()
+	var absent *Service
+	if count, err := absent.MissingPDFCount(ctx, "Reading List"); err == nil {
+		t.Fatalf("nil service: count=%d err=nil, want an unconfigured error", count)
+	}
+	if count, err := (&Service{}).MissingPDFCount(ctx, ""); err == nil {
+		t.Fatalf("service without a CLI: count=%d err=nil, want an unconfigured error", count)
+	}
+}
+
+// The count is the row count of Zotio's synced missing-PDF queue, read with
+// the trimmed collection as the collection argument and 0 as the limit (the
+// whole queue). The argument assertion is the regression this test catches:
+// swapping the two — passing the collection as the limit and 0 as the
+// collection — still returns a plausible number for the wrong scope.
+func TestMissingPDFCountCountsWholeQueueForTrimmedCollection(t *testing.T) {
+	cli := &fakeCLI{items: []MissingPDFItem{
+		{Key: "AAAA1111", Title: "One"},
+		{Key: "BBBB2222", Title: "Two"},
+		{Key: "CCCC3333", Title: "Three"},
+	}}
+	count, err := (&Service{CLI: cli}).MissingPDFCount(context.Background(), "  Reading List  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("count = %d, want 3", count)
+	}
+	if cli.collection != "Reading List" {
+		t.Fatalf("collection argument = %q, want %q", cli.collection, "Reading List")
+	}
+	if cli.limit != 0 {
+		t.Fatalf("limit argument = %d, want 0 (count the whole queue)", cli.limit)
+	}
+}
+
+// A failed queue read must surface, never degrade to 0: the badge would claim
+// a healthy library while Zotio is unreachable or unsynced.
+func TestMissingPDFCountPropagatesCLIError(t *testing.T) {
+	failure := errors.New("zotio: local mirror is not synced")
+	cli := &missingPDFErrCLI{fakeCLI: &fakeCLI{}, err: failure}
+	count, err := (&Service{CLI: cli}).MissingPDFCount(context.Background(), "Reading List")
+	if !errors.Is(err, failure) {
+		t.Fatalf("err = %v, want %v", err, failure)
+	}
+	if count != 0 {
+		t.Fatalf("count = %d on a failed read, want 0", count)
+	}
+}

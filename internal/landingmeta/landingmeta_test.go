@@ -118,3 +118,48 @@ func TestPDFURL_HeadBoundStopsBeforeBody(t *testing.T) {
 		t.Errorf("PDFURL() = %q, want empty: head bound did not stop the scan before body", got)
 	}
 }
+
+// TestPDFURL_CandidateCapBoundary pins both sides of the maxCandidates
+// bound, which is otherwise unobservable: candidate number maxCandidates is
+// still resolved, and the one after it is never looked at. Each unusable tag
+// below carries an empty content attribute, so it consumes a candidate slot
+// without contributing a resolved URL — which is what lets the single valid
+// tag sit exactly on the boundary.
+func TestPDFURL_CandidateCapBoundary(t *testing.T) {
+	const (
+		unusable = `<meta name="citation_pdf_url" content="">`
+		valid    = `<meta name="citation_pdf_url" content="https://publisher.example/paper.pdf">`
+		wantURL  = "https://publisher.example/paper.pdf"
+	)
+
+	base, err := url.Parse("https://publisher.example/article")
+	if err != nil {
+		t.Fatalf("parsing base: %v", err)
+	}
+
+	// head is deliberately left open in both documents: the only thing that
+	// can stop these scans is the candidate cap, not the </head> bound.
+	document := func(unusableTags int) []byte {
+		return []byte("<!DOCTYPE html><html><head>" + strings.Repeat(unusable, unusableTags) + valid)
+	}
+
+	t.Run("last_candidate_inside_cap_is_accepted", func(t *testing.T) {
+		got, err := PDFURL(document(maxCandidates-1), base)
+		if err != nil {
+			t.Fatalf("PDFURL() unexpected error: %v", err)
+		}
+		if got != wantURL {
+			t.Errorf("PDFURL() = %q, want %q: candidate %d is inside the cap and must still be resolved", got, wantURL, maxCandidates)
+		}
+	})
+
+	t.Run("first_candidate_past_cap_is_ignored", func(t *testing.T) {
+		got, err := PDFURL(document(maxCandidates), base)
+		if err != nil {
+			t.Fatalf("PDFURL() unexpected error: %v", err)
+		}
+		if got != "" {
+			t.Errorf("PDFURL() = %q, want empty: candidate %d is past the cap and must never be scanned", got, maxCandidates+1)
+		}
+	})
+}

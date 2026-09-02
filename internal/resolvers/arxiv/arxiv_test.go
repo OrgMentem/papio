@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/redact"
 	"papio/internal/resolver"
@@ -268,60 +269,43 @@ func TestMalformedAndOversizedPayload(t *testing.T) {
 }
 
 func TestRetryClasses(t *testing.T) {
-	t.Run("429 with Retry-After seconds", func(t *testing.T) {
-		srv := serveAtom(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "12"}, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
-		d, temp := resolver.Temporary(err)
-		if !temp {
-			t.Fatalf("429 must be temporary; err=%v", err)
-		}
-		if d.Seconds() != 12 {
-			t.Errorf("RetryAfter = %v, want 12s", d)
-		}
-	})
-	t.Run("503 temporary", func(t *testing.T) {
-		srv := serveAtom(t, http.StatusServiceUnavailable, nil, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
-		if _, temp := resolver.Temporary(err); !temp {
-			t.Fatalf("503 must be temporary; err=%v", err)
-		}
-	})
-	t.Run("408 temporary", func(t *testing.T) {
-		srv := serveAtom(t, http.StatusRequestTimeout, map[string]string{"Retry-After": "12"}, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
-		d, temp := resolver.Temporary(err)
-		if !temp {
-			t.Fatalf("408 must be temporary; err=%v", err)
-		}
-		if d.Seconds() != 12 {
-			t.Errorf("RetryAfter = %v, want 12s", d)
-		}
-	})
-	t.Run("403 permanent", func(t *testing.T) {
-		srv := serveAtom(t, http.StatusForbidden, nil, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
-		if err == nil {
-			t.Fatal("403 must produce an error")
-		}
-		if _, temp := resolver.Temporary(err); temp {
-			t.Error("403 must not be temporary")
-		}
-	})
-	t.Run("network failure temporary", func(t *testing.T) {
-		srv := serveAtom(t, http.StatusOK, nil, "", nil)
-		client := srv.Client()
-		base := srv.URL
-		srv.Close() // force a connection error
-		r := NewWithOptions(Options{Client: client, BaseURL: base})
-		_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
-		if _, temp := resolver.Temporary(err); !temp {
-			t.Fatalf("network failure must be temporary; err=%v", err)
-		}
-	})
+	for _, test := range []struct {
+		name           string
+		status         int
+		retryHeader    string
+		dropConnection bool // close the server so the request fails to connect
+		wantTemporary  bool
+		wantWait       time.Duration
+	}{
+		{name: "429 with Retry-After seconds", status: http.StatusTooManyRequests, retryHeader: "12", wantTemporary: true, wantWait: 12 * time.Second},
+		{name: "503 temporary", status: http.StatusServiceUnavailable, wantTemporary: true},
+		{name: "408 temporary", status: http.StatusRequestTimeout, retryHeader: "12", wantTemporary: true, wantWait: 12 * time.Second},
+		{name: "403 permanent", status: http.StatusForbidden, wantTemporary: false},
+		{name: "network failure temporary", status: http.StatusOK, dropConnection: true, wantTemporary: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var headers map[string]string
+			if test.retryHeader != "" {
+				headers = map[string]string{"Retry-After": test.retryHeader}
+			}
+			srv := serveAtom(t, test.status, headers, "", nil)
+			r := newResolver(srv)
+			if test.dropConnection {
+				srv.Close()
+			}
+			_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			wait, temporary := resolver.Temporary(err)
+			if temporary != test.wantTemporary {
+				t.Fatalf("Temporary(%v) = %v, want %v", err, temporary, test.wantTemporary)
+			}
+			if test.wantWait != 0 && wait != test.wantWait {
+				t.Fatalf("retry wait = %v, want %v", wait, test.wantWait)
+			}
+		})
+	}
 }
 
 func TestRedactedURLHasNoQueryOrFragment(t *testing.T) {

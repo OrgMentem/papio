@@ -192,57 +192,16 @@ func TestConservativeModeAlsoWithholdsAnUnusableOpenURL(t *testing.T) {
 // each one on a schedule. Upgrading must heal them, not leave the user to find
 // and cancel each by hand.
 func TestRepairHealsAPreExistingHandoffForAnUnfetchableWork(t *testing.T) {
-	svc, jobs := exhaustionService(t)
-	ctx := context.Background()
-	id, err := svc.Submit(ctx, protocol.WorkRequest{
-		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_legacy_park",
-		Title: "A printed monograph", Authors: []string{"A. Author"}, Year: 1999, DesiredVersion: "any",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Reconstruct the pre-fix state: parked awaiting_human on an institutional
-	// handoff that no sign-in can complete.
-	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-		job.Access(true, "paywall")); err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
-		map[string]any{"reason": "scheduler_dispatch"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
-		map[string]any{"reason": "institutional_handoff"}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
-		t.Fatalf("repair: %v", err)
-	}
-	got, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != job.StateResolving {
-		t.Fatalf("state = %q, want %q — repair returns the job to the one gate that classifies it", got.State, job.StateResolving)
-	}
-	open, _ := jobs.ListHumanActions(ctx, true)
-	if len(open) != 0 {
-		t.Fatalf("open actions = %+v, want the dead handoff resolved", open)
-	}
-
-	// And the reclaimed job settles as unavailable, never back into a handoff.
-	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
-	if err != nil || row == nil {
-		t.Fatalf("claim: %v", err)
-	}
-	if err := svc.Process(ctx, row); err != nil {
-		t.Fatal(err)
-	}
-	settled, _ := jobs.Get(ctx, id)
-	if settled.State != job.StateUnavailable || settled.TerminalReason != "no_identifier" {
-		t.Fatalf("settled = state:%q reason:%q, want unavailable/no_identifier", settled.State, settled.TerminalReason)
-	}
+	assertUnfetchableHandoffRepaired(t, func(t *testing.T, svc *Service) string {
+		id, err := svc.Submit(context.Background(), protocol.WorkRequest{
+			SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_legacy_park",
+			Title: "A printed monograph", Authors: []string{"A. Author"}, Year: 1999, DesiredVersion: "any",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}, "no_identifier")
 }
 
 // The repair must not touch a park a sign-in can still finish.

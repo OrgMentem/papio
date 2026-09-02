@@ -4,6 +4,7 @@ package bundle
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -849,5 +850,190 @@ func TestExportRollbackPreservesExistingDestinationWhenMaterializeFails(t *testi
 	}
 	if _, err := os.Stat(filepath.Join(destination, "bundle.json")); !os.IsNotExist(err) {
 		t.Fatalf("bundle.json should not exist after materialize failure: %v", err)
+	}
+}
+
+// Locate is the artifacts.locate half of the exporter: it answers "where are the
+// verified bytes", and nothing about bundle provenance. These tests call it
+// directly, because reaching it through Export cannot distinguish a locate
+// failure from a bundle-construction failure.
+func TestLocateReturnsVerifiedArtifactForReadyAndImportedJobs(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+
+	art, err := exporter.Locate(ctx, id)
+	if err != nil {
+		t.Fatalf("locate ready job: %v", err)
+	}
+	if art == nil {
+		t.Fatal("locate returned no artifact for a ready job")
+	}
+	if art.SHA256 != sha {
+		t.Fatalf("artifact sha = %q, want %q", art.SHA256, sha)
+	}
+	want, err := exporter.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if art.Path != want {
+		t.Fatalf("artifact path = %q, want resolved store path %q", art.Path, want)
+	}
+	// The contract is that a caller can open these bytes and get the digest the
+	// row is recorded under.
+	digest, size, err := artifact.HashFile(art.Path)
+	if err != nil {
+		t.Fatalf("open located artifact: %v", err)
+	}
+	if digest != sha {
+		t.Fatalf("located bytes hash to %q, want %q", digest, sha)
+	}
+	if size != art.SizeBytes {
+		t.Fatalf("located bytes are %d, artifact row says %d", size, art.SizeBytes)
+	}
+
+	// imported is the only edge out of ready, and the bytes stay locatable
+	// across it: a consumer that already filed the artifact can still reopen it.
+	if err := exporter.Jobs.Transition(ctx, id, job.StateReady, job.StateImported, nil); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := exporter.Locate(ctx, id)
+	if err != nil {
+		t.Fatalf("locate imported job: %v", err)
+	}
+	if imported == nil || imported.Path != want {
+		t.Fatalf("imported locate = %+v, want path %q", imported, want)
+	}
+}
+
+// "Not collected yet" is the routine answer to a polling consumer, so it must
+// stay a conflict rather than becoming an internal fault.
+func TestLocateRejectsNonReadyJobsAsConflict(t *testing.T) {
+	exporter, _, _ := readyFixture(t)
+	ctx := context.Background()
+
+	queued, err := exporter.Jobs.CreateRequest(ctx, "wr_locate_queued", work.Work{
+		DOI: "10.1002/queued", Title: "Queued Paper", Authors: []string{"A"}, Year: 2021,
+	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any"}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A job can also reach ready with no artifact recorded at all; that is just
+	// as unlocatable, and for the same reason.
+	noArtifact, err := exporter.Jobs.CreateRequest(ctx, "wr_locate_noart", work.Work{
+		DOI: "10.1002/noart", Title: "Artifactless Paper", Authors: []string{"B"}, Year: 2022,
+	}, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any"}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exporter.Jobs.Transition(ctx, noArtifact, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := exporter.Jobs.Transition(ctx, noArtifact, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, id := range map[string]string{"queued": queued, "ready_without_artifact": noArtifact} {
+		t.Run(name, func(t *testing.T) {
+			art, err := exporter.Locate(ctx, id)
+			if !errors.Is(err, job.ErrConflict) {
+				t.Fatalf("locate error = %v, want job.ErrConflict", err)
+			}
+			if art != nil {
+				t.Fatalf("locate returned artifact %+v for an unready job", art)
+			}
+		})
+	}
+}
+
+// Locate verifies before handing over a path, so tampered bytes must never be
+// reported as locatable.
+func TestLocateRefusesCorruptArtifactBytes(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+
+	path, err := exporter.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("%PDF-1.4 tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	art, err := exporter.Locate(ctx, id)
+	if err == nil {
+		t.Fatal("located an artifact whose bytes no longer match its digest")
+	}
+	if art != nil {
+		t.Fatalf("locate returned artifact %+v alongside a verification failure", art)
+	}
+	if errors.Is(err, job.ErrConflict) {
+		t.Fatalf("corruption reported as a routine conflict: %v", err)
+	}
+	if !strings.Contains(err.Error(), "corrupt") {
+		t.Fatalf("locate error = %v, want a hash-verification failure", err)
+	}
+}
+
+// artifacts.path is first-writer-wins, so after a data-dir move the column names
+// bytes nobody verified. Locate must return the path its own store resolved.
+func TestLocateResolvesPathAgainstTheCurrentDataDir(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+
+	original, err := exporter.Locate(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(original.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	moved := t.TempDir()
+	movedStore, err := artifact.New(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedPath, err := movedStore.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(movedPath, body, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	relocated := &Exporter{Jobs: exporter.Jobs, Artifacts: movedStore, DataDir: moved}
+
+	art, err := relocated.Locate(ctx, id)
+	if err != nil {
+		t.Fatalf("locate after data-dir move: %v", err)
+	}
+	if art.Path != movedPath {
+		t.Fatalf("artifact path = %q, want %q (the store that verified the bytes)", art.Path, movedPath)
+	}
+	if strings.HasPrefix(art.Path, exporter.DataDir) {
+		t.Fatalf("artifact path = %q, taken from the stale artifacts.path column", art.Path)
+	}
+}
+
+// The whole reason Locate exists apart from Document: bundle construction can
+// fail for provenance reasons that say nothing about where the bytes are. A
+// review-identity acquisition is unexportable and still perfectly locatable.
+func TestLocateSucceedsWhereBundleConstructionFails(t *testing.T) {
+	exporter, id, sha := readyFixtureWithIdentity(t, "review")
+	ctx := context.Background()
+
+	if _, _, err := exporter.Document(ctx, id); err == nil {
+		t.Fatal("built a bundle for a review-identity acquisition")
+	}
+	art, err := exporter.Locate(ctx, id)
+	if err != nil {
+		t.Fatalf("locate refused a verified artifact over a bundle-only defect: %v", err)
+	}
+	if art == nil || art.SHA256 != sha {
+		t.Fatalf("locate = %+v, want artifact %s", art, sha)
 	}
 }

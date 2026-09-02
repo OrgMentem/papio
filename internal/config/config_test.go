@@ -1291,65 +1291,54 @@ func TestInstitutionForMirrorsDefaultProfileDocumentDelivery(t *testing.T) {
 	}
 }
 func TestTimeoutFieldsRejectAboveCeiling(t *testing.T) {
-	// saveWith validates via Save, reusing the same error strings Load would surface.
-	mustAccept := func(t *testing.T, cfg Config) {
+	// Save validates the config, reusing the same error strings Load would surface.
+	save := func(t *testing.T, cfg Config) error {
 		t.Helper()
-		if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
-			t.Fatalf("expected valid config, got error: %v", err)
-		}
-	}
-	mustReject := func(t *testing.T, cfg Config, wantErr string) {
-		t.Helper()
-		err := Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
-		if err == nil || !strings.Contains(err.Error(), wantErr) {
-			t.Fatalf("Save err = %v, want an error containing %q", err, wantErr)
-		}
+		return Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
 	}
 	base := func() Config {
 		cfg := Default()
 		cfg.AccessMode = ModeConservative
 		return cfg
 	}
-
-	t.Run("fetch.timeout_seconds", func(t *testing.T) {
-		cfg := base()
-		cfg.Fetch.TimeoutSeconds = 3600
-		mustAccept(t, cfg)
-
-		cfg = base()
-		cfg.Fetch.TimeoutSeconds = 3601
-		mustReject(t, cfg, "fetch.timeout_seconds must be in 5..3600")
-
-		cfg = base()
-		cfg.Fetch.TimeoutSeconds = math.MaxInt64
-		mustReject(t, cfg, "fetch.timeout_seconds must be in 5..3600")
-	})
-
-	t.Run("browser.action_expiry_seconds", func(t *testing.T) {
-		cfg := base()
-		cfg.Browser.ActionExpirySeconds = 2592000
-		mustAccept(t, cfg)
-
-		cfg = base()
-		cfg.Browser.ActionExpirySeconds = 2592001
-		mustReject(t, cfg, "browser.action_expiry_seconds must be in 0..2592000")
-
-		cfg = base()
-		cfg.Browser.ActionExpirySeconds = math.MaxInt64
-		mustReject(t, cfg, "browser.action_expiry_seconds must be in 0..2592000")
-	})
-
-	t.Run("actions.stale_after_seconds", func(t *testing.T) {
-		cfg := base()
-		cfg.Actions.StaleAfterSeconds = 31536000
-		mustAccept(t, cfg)
-
-		cfg = base()
-		cfg.Actions.StaleAfterSeconds = 31536001
-		mustReject(t, cfg, "actions.stale_after_seconds must be in 0..31536000")
-
-		cfg = base()
-		cfg.Actions.StaleAfterSeconds = math.MaxInt64
-		mustReject(t, cfg, "actions.stale_after_seconds must be in 0..31536000")
-	})
+	for _, test := range []struct {
+		name     string
+		set      func(*Config, int64)
+		maxValid int64
+		wantErr  string
+	}{
+		{
+			name:     "fetch.timeout_seconds",
+			set:      func(c *Config, v int64) { c.Fetch.TimeoutSeconds = int(v) },
+			maxValid: 3600,
+			wantErr:  "fetch.timeout_seconds must be in 5..3600",
+		},
+		{
+			name:     "browser.action_expiry_seconds",
+			set:      func(c *Config, v int64) { c.Browser.ActionExpirySeconds = int(v) },
+			maxValid: 2592000,
+			wantErr:  "browser.action_expiry_seconds must be in 0..2592000",
+		},
+		{
+			name:     "actions.stale_after_seconds",
+			set:      func(c *Config, v int64) { c.Actions.StaleAfterSeconds = int(v) },
+			maxValid: 31536000,
+			wantErr:  "actions.stale_after_seconds must be in 0..31536000",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base()
+			test.set(&cfg, test.maxValid)
+			if err := save(t, cfg); err != nil {
+				t.Fatalf("%s = %d is the accepted bound, got error: %v", test.name, test.maxValid, err)
+			}
+			for _, over := range []int64{test.maxValid + 1, math.MaxInt64} {
+				cfg = base()
+				test.set(&cfg, over)
+				if err := save(t, cfg); err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("Save with %s = %d err = %v, want an error containing %q", test.name, over, err, test.wantErr)
+				}
+			}
+		})
+	}
 }

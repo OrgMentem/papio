@@ -15,63 +15,24 @@ func TestFailureSummariesUseLatestDecisiveEventsAndSwitchGrouping(t *testing.T) 
 	}
 	defer func() { _ = db.Close() }()
 
-	insertJob := func(id, state, updatedAt, source, candidateURL string) {
-		t.Helper()
-		workID := "wr_" + id
-		if _, err := db.DB().ExecContext(ctx,
-			`INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, ?)`,
-			workID, "2026-08-01T00:00:00Z", id); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx,
-			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
-			 VALUES (?, ?, ?, '{}', '2026-08-01T00:00:00Z', ?)`,
-			id, workID, state, updatedAt); err != nil {
-			t.Fatal(err)
-		}
-		result, err := db.DB().ExecContext(ctx,
-			`INSERT INTO candidates
-			 (job_id, source, url_redacted, url_key, version, access_basis, reuse_license, created_at)
-			 VALUES (?, ?, ?, ?, 'any', 'unknown', 'unknown', '2026-08-01T00:00:00Z')`,
-			id, source, candidateURL, "key_"+id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		candidateID, err := result.LastInsertId()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx, `UPDATE jobs SET selected_candidate_id = ? WHERE id = ?`, candidateID, id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	insertEvent := func(jobID, kind, detail string) {
-		t.Helper()
-		if _, err := db.DB().ExecContext(ctx,
-			`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, '2026-08-01T00:00:01Z', ?, ?)`,
-			jobID, kind, detail); err != nil {
-			t.Fatal(err)
-		}
-	}
+	insertFailureTestJob(t, ctx, db, "job_jstor_transition", "unavailable", "2026-08-01T00:00:01Z", "jstor", "https://www.jstor.org/stable/1")
+	insertFailureTestEvent(t, ctx, db, "job_jstor_transition", "job.transition", `{"reason":"no_entitlement"}`)
+	insertFailureTestEvent(t, ctx, db, "job_jstor_transition", "diagnostic.noise", `{"reason":"must_not_win"}`)
 
-	insertJob("job_jstor_transition", "unavailable", "2026-08-01T00:00:01Z", "jstor", "https://www.jstor.org/stable/1")
-	insertEvent("job_jstor_transition", "job.transition", `{"reason":"no_entitlement"}`)
-	insertEvent("job_jstor_transition", "diagnostic.noise", `{"reason":"must_not_win"}`)
+	insertFailureTestJob(t, ctx, db, "job_jstor_outcome", "awaiting_human", "2026-08-01T00:00:04Z", "jstor", "https://www.jstor.org/stable/2")
+	insertFailureTestEvent(t, ctx, db, "job_jstor_outcome", "job.transition", `{"reason":"login_required"}`)
+	insertFailureTestEvent(t, ctx, db, "job_jstor_outcome", "browser.provider_outcome", `{"outcome":"no_entitlement"}`)
 
-	insertJob("job_jstor_outcome", "awaiting_human", "2026-08-01T00:00:04Z", "jstor", "https://www.jstor.org/stable/2")
-	insertEvent("job_jstor_outcome", "job.transition", `{"reason":"login_required"}`)
-	insertEvent("job_jstor_outcome", "browser.provider_outcome", `{"outcome":"no_entitlement"}`)
+	insertFailureTestJob(t, ctx, db, "job_informit_error", "awaiting_human", "2026-08-01T00:00:03Z", "informit", "not-a-url")
+	insertFailureTestEvent(t, ctx, db, "job_informit_error", "browser.error", `{"code":"adapter_timeout"}`)
 
-	insertJob("job_informit_error", "awaiting_human", "2026-08-01T00:00:03Z", "informit", "not-a-url")
-	insertEvent("job_informit_error", "browser.error", `{"code":"adapter_timeout"}`)
-
-	insertJob("job_ebsco_outcome", "unavailable", "2026-08-01T00:00:02Z", "ebsco", "https://search.ebscohost.com/item/3")
-	insertEvent("job_ebsco_outcome", "browser.provider_outcome", `{"outcome":"no_entitlement"}`)
+	insertFailureTestJob(t, ctx, db, "job_ebsco_outcome", "unavailable", "2026-08-01T00:00:02Z", "ebsco", "https://search.ebscohost.com/item/3")
+	insertFailureTestEvent(t, ctx, db, "job_ebsco_outcome", "browser.provider_outcome", `{"outcome":"no_entitlement"}`)
 
 	// Failed is terminal, but this read model is intentionally restricted to
 	// the requested unavailable/awaiting_human operator cohort.
-	insertJob("job_failed_excluded", "failed", "2026-08-01T00:00:05Z", "jstor", "https://www.jstor.org/stable/4")
-	insertEvent("job_failed_excluded", "browser.error", `{"code":"adapter_timeout"}`)
+	insertFailureTestJob(t, ctx, db, "job_failed_excluded", "failed", "2026-08-01T00:00:05Z", "jstor", "https://www.jstor.org/stable/4")
+	insertFailureTestEvent(t, ctx, db, "job_failed_excluded", "browser.error", `{"code":"adapter_timeout"}`)
 
 	byReason, truncated, err := db.FailureSummaries(ctx, 20, false)
 	if err != nil {
@@ -115,56 +76,17 @@ func TestFailureSummariesExampleJobIDIsChronologicalNotLexical(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	insertJob := func(id, state, updatedAt, source, candidateURL string) {
-		t.Helper()
-		workID := "wr_" + id
-		if _, err := db.DB().ExecContext(ctx,
-			`INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, ?)`,
-			workID, "2026-08-01T00:00:00Z", id); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx,
-			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
-			 VALUES (?, ?, ?, '{}', '2026-08-01T00:00:00Z', ?)`,
-			id, workID, state, updatedAt); err != nil {
-			t.Fatal(err)
-		}
-		result, err := db.DB().ExecContext(ctx,
-			`INSERT INTO candidates
-			 (job_id, source, url_redacted, url_key, version, access_basis, reuse_license, created_at)
-			 VALUES (?, ?, ?, ?, 'any', 'unknown', 'unknown', '2026-08-01T00:00:00Z')`,
-			id, source, candidateURL, "key_"+id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		candidateID, err := result.LastInsertId()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx, `UPDATE jobs SET selected_candidate_id = ? WHERE id = ?`, candidateID, id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	insertEvent := func(jobID, kind, detail string) {
-		t.Helper()
-		if _, err := db.DB().ExecContext(ctx,
-			`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, '2026-08-01T00:00:01Z', ?, ?)`,
-			jobID, kind, detail); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	// job_a_early's updated_at has no fractional seconds; job_b_late's does
 	// and is genuinely the later update (01.5s beats 01s). store.Now() formats
 	// with time.RFC3339Nano, which omits the fraction entirely when it is
 	// zero, so a byte-wise comparison sorts 'Z' (0x5A) above '.' (0x2E) and
 	// would pick job_a_early's fraction-less timestamp as "more recent" even
 	// though it is chronologically earlier than job_b_late's.
-	insertJob("job_a_early", "unavailable", "2026-08-01T00:00:01Z", "jstor", "https://www.jstor.org/stable/1")
-	insertEvent("job_a_early", "job.transition", `{"reason":"no_entitlement"}`)
+	insertFailureTestJob(t, ctx, db, "job_a_early", "unavailable", "2026-08-01T00:00:01Z", "jstor", "https://www.jstor.org/stable/1")
+	insertFailureTestEvent(t, ctx, db, "job_a_early", "job.transition", `{"reason":"no_entitlement"}`)
 
-	insertJob("job_b_late", "unavailable", "2026-08-01T00:00:01.5Z", "jstor", "https://www.jstor.org/stable/2")
-	insertEvent("job_b_late", "job.transition", `{"reason":"no_entitlement"}`)
+	insertFailureTestJob(t, ctx, db, "job_b_late", "unavailable", "2026-08-01T00:00:01.5Z", "jstor", "https://www.jstor.org/stable/2")
+	insertFailureTestEvent(t, ctx, db, "job_b_late", "job.transition", `{"reason":"no_entitlement"}`)
 
 	byReason, _, err := db.FailureSummaries(ctx, 20, false)
 	if err != nil {
@@ -175,5 +97,51 @@ func TestFailureSummariesExampleJobIDIsChronologicalNotLexical(t *testing.T) {
 	}
 	if got := byReason[0].ExampleJobID; got != "job_b_late" {
 		t.Fatalf("example job id = %q, want job_b_late (chronologically latest, not lexically greatest)", got)
+	}
+}
+
+// insertFailureTestJob seeds one job in the operator failure cohort: a work
+// request, the job itself, and the selected candidate that supplies the
+// provider host the read model groups by.
+func insertFailureTestJob(t *testing.T, ctx context.Context, db *Store, id, state, updatedAt, source, candidateURL string) {
+	t.Helper()
+	workID := "wr_" + id
+	if _, err := db.DB().ExecContext(ctx,
+		`INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, ?)`,
+		workID, "2026-08-01T00:00:00Z", id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx,
+		`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+		 VALUES (?, ?, ?, '{}', '2026-08-01T00:00:00Z', ?)`,
+		id, workID, state, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.DB().ExecContext(ctx,
+		`INSERT INTO candidates
+		 (job_id, source, url_redacted, url_key, version, access_basis, reuse_license, created_at)
+		 VALUES (?, ?, ?, ?, 'any', 'unknown', 'unknown', '2026-08-01T00:00:00Z')`,
+		id, source, candidateURL, "key_"+id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `UPDATE jobs SET selected_candidate_id = ? WHERE id = ?`, candidateID, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// insertFailureTestEvent appends one event to a seeded job. Every event shares
+// the same timestamp so that only insertion order can decide which event the
+// read model treats as the latest decisive one.
+func insertFailureTestEvent(t *testing.T, ctx context.Context, db *Store, jobID, kind, detail string) {
+	t.Helper()
+	if _, err := db.DB().ExecContext(ctx,
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, '2026-08-01T00:00:01Z', ?, ?)`,
+		jobID, kind, detail); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -3,22 +3,30 @@
 package pdf
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
+// The file gate must reach byte-for-byte the same verdict as the in-memory
+// gate, and both must reach the verdict named per case: a container that only
+// claims to be a PDF (HTML, an ID3 audio stream) never acquires a header, and
+// a short or late-EOF payload is rejected despite having one.
 func TestValidatePayloadFileMatchesByteGate(t *testing.T) {
 	cases := []struct {
-		name string
-		body []byte
+		name       string
+		body       []byte
+		wantOK     bool
+		wantHeader bool
 	}{
-		{"valid-with-eof", append(append([]byte("%PDF-1.7\n"), make([]byte, MinimumPayloadBytes)...), []byte("%%EOF")...)},
-		{"valid-without-eof", append([]byte("%PDF-1.7\n"), make([]byte, MinimumPayloadBytes)...)},
-		{"short", []byte("%PDF-1.7\nshort")},
-		{"html", append([]byte("<html>"), make([]byte, MinimumPayloadBytes)...)},
-		{"early-eof", append(append([]byte("%PDF-1.7\n%%EOF"), make([]byte, eofSearchBytes+100)...), []byte("trailer")...)},
+		{"valid-with-eof", append(append([]byte("%PDF-1.7\n"), make([]byte, MinimumPayloadBytes)...), []byte("%%EOF")...), true, true},
+		{"valid-without-eof", append([]byte("%PDF-1.7\n"), make([]byte, MinimumPayloadBytes)...), true, true},
+		{"short", []byte("%PDF-1.7\nshort"), false, true},
+		{"html", append([]byte("<html>"), make([]byte, MinimumPayloadBytes)...), false, false},
+		{"early-eof", append(append([]byte("%PDF-1.7\n%%EOF"), make([]byte, eofSearchBytes+100)...), []byte("trailer")...), false, true},
+		{"audio-stream", append([]byte("ID3\x04\x00\x00\x00\x00\x00\x00"), bytes.Repeat([]byte{0}, MinimumPayloadBytes)...), false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -34,6 +42,9 @@ func TestValidatePayloadFileMatchesByteGate(t *testing.T) {
 			if fileReport.OK != byteReport.OK || fileReport.HasHeader != byteReport.HasHeader ||
 				fileReport.HasEOF != byteReport.HasEOF || fileReport.SizeBytes != byteReport.SizeBytes || fileReport.Reason != byteReport.Reason {
 				t.Fatalf("file report %+v != byte report %+v", fileReport, byteReport)
+			}
+			if byteReport.OK != tc.wantOK || byteReport.HasHeader != tc.wantHeader {
+				t.Fatalf("report = %+v, want OK=%v HasHeader=%v", byteReport, tc.wantOK, tc.wantHeader)
 			}
 		})
 	}

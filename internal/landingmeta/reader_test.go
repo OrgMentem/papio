@@ -4,6 +4,7 @@ package landingmeta
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,35 +77,80 @@ func TestPDFURLForSkipsNonHTMLContentTypeWithoutReadingBody(t *testing.T) {
 	}
 }
 
+// cappedBody is a response body that both reports how many of its bytes were
+// ever handed out and fails the test the instant a read pushes that total
+// past the cap. It stands in for a decompression bomb: an unknown-length
+// body (ContentLength -1, exactly what Go's transport reports for a response
+// it transparently gunzipped) whose real size dwarfs maxBytes.
+type cappedBody struct {
+	t     *testing.T
+	src   io.Reader
+	limit int64
+	read  int64
+	over  bool
+}
+
+func (b *cappedBody) Read(p []byte) (int, error) {
+	n, err := b.src.Read(p)
+	b.read += int64(n)
+	if b.read > b.limit && !b.over {
+		b.over = true
+		b.t.Errorf("body handed out %d bytes with a %d-byte cap: the io.LimitReader bound in PDFURLFor is gone", b.read, b.limit)
+		return n, errors.New("cappedBody: read past the cap")
+	}
+	return n, err
+}
+
+func (b *cappedBody) Close() error { return nil }
+
 // TestPDFURLForTruncatesLargeBodyButStillFindsHeadTag defends the
 // io.LimitReader cap: a body far larger than maxBytes must not be read in
 // full, yet citation_pdf_url — which lives in <head>, ahead of the huge
-// filler below — must still be found in the truncated prefix.
+// filler below — must still be found in the truncated prefix. The body is
+// injected rather than served so the test can observe the bytes actually
+// read, which is the half a URL-only assertion left undefended.
 func TestPDFURLForTruncatesLargeBodyButStillFindsHeadTag(t *testing.T) {
-	const want = "https://cap.example.test/head/paper.pdf"
-	mux := http.NewServeMux()
-	mux.HandleFunc("/landing", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `<html><head><meta name="citation_pdf_url" content="`+want+`"></head><body>`)
-		if f, ok := w.(http.Flusher); ok {
-			// Force chunked transfer (no Content-Length) so the fast-path
-			// declared-size check below never fires — this test is about
-			// the io.LimitReader cap on the actual read, not that check.
-			f.Flush()
-		}
-		_, _ = io.WriteString(w, strings.Repeat("x", 4<<20)) // 4 MiB, far past the 512-byte cap
-	})
-	server := httptest.NewTLSServer(mux)
-	defer server.Close()
+	const (
+		maxBytes = 512
+		want     = "https://cap.example.test/head/paper.pdf"
+	)
+	head := `<html><head><meta name="citation_pdf_url" content="` + want + `"></head><body>`
+	if int64(len(head)) > maxBytes {
+		t.Fatalf("head prefix is %d bytes, it must fit inside the %d-byte cap", len(head), maxBytes)
+	}
 
-	reader := NewReader(server.Client(), 512)
-	got, err := reader.PDFURLFor(context.Background(), server.URL+"/landing")
+	body := &cappedBody{
+		t:     t,
+		limit: maxBytes,
+		src:   strings.NewReader(head + strings.Repeat("x", 4<<20)), // 4 MiB, far past the cap
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		// Unknown length, so the declared-size fast path cannot fire: this
+		// test is about the cap on the actual read, not that check.
+		ContentLength: -1,
+		Body:          body,
+	}
+	client := doFunc(func(req *http.Request) (*http.Response, error) {
+		resp.Request = req
+		return resp, nil
+	})
+
+	reader := NewReader(client, maxBytes)
+	got, err := reader.PDFURLFor(context.Background(), "https://cap.example.test/landing")
 	if err != nil {
 		t.Fatalf("PDFURLFor: %v", err)
 	}
 	if got != want {
 		t.Fatalf("PDFURLFor = %q, want %q", got, want)
+	}
+	// Equality, not an upper bound: `<=` also passes for a reader that
+	// truncates EARLY (io.LimitReader(resp.Body, maxBytes-1)), because the
+	// head tag fits well inside the cap either way. The whole legal prefix
+	// must be consumed, and not one byte more.
+	if body.read != maxBytes {
+		t.Fatalf("PDFURLFor read %d body bytes, want exactly %d: the cap must bound the read without shortening the legal prefix", body.read, maxBytes)
 	}
 }
 

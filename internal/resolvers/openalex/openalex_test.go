@@ -288,23 +288,20 @@ func TestKeylessPolitePoolSendsMailtoAndOmitsAPIKey(t *testing.T) {
 }
 
 func TestIdentifierTail(t *testing.T) {
-	tests := map[string]string{
-		"bare value":        "12345",
-		"identifier URL":    "https://pubmed.ncbi.nlm.nih.gov/0012345/",
-		"host only URL":     "https://pubmed.ncbi.nlm.nih.gov",
-		"root path URL":     "https://pubmed.ncbi.nlm.nih.gov/",
-		"unparseable value": "%",
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"bare value", "12345", "12345"},
+		{"identifier URL", "https://pubmed.ncbi.nlm.nih.gov/0012345/", "0012345"},
+		{"host only URL", "https://pubmed.ncbi.nlm.nih.gov", "https://pubmed.ncbi.nlm.nih.gov"},
+		{"root path URL", "https://pubmed.ncbi.nlm.nih.gov/", "https://pubmed.ncbi.nlm.nih.gov/"},
+		{"unparseable value", "%", "%"},
 	}
-	want := map[string]string{
-		"bare value":        "12345",
-		"identifier URL":    "0012345",
-		"host only URL":     "https://pubmed.ncbi.nlm.nih.gov",
-		"root path URL":     "https://pubmed.ncbi.nlm.nih.gov/",
-		"unparseable value": "%",
-	}
-	for name, raw := range tests {
-		if got := identifierTail(raw); got != want[name] {
-			t.Errorf("%s: identifierTail(%q) = %q, want %q", name, raw, got, want[name])
+	for _, test := range tests {
+		if got := identifierTail(test.input); got != test.want {
+			t.Errorf("%s: identifierTail(%q) = %q, want %q", test.name, test.input, got, test.want)
 		}
 	}
 }

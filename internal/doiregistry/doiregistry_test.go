@@ -5,6 +5,7 @@ package doiregistry
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -257,5 +258,151 @@ func TestRegisteredReturnsErrorOnNilBodyWithoutPanicking(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "response body is missing") {
 		t.Fatalf("error = %q, want to contain %q", err.Error(), "response body is missing")
+	}
+}
+
+// paddedHandleBody encodes a valid positive handle answer whose JSON is exactly
+// size bytes long, so the body cap can be probed from both sides of its
+// boundary rather than only from far below it.
+func paddedHandleBody(t *testing.T, size int) string {
+	t.Helper()
+	const prefix = `{"responseCode":1,"handle":"10.1234/x","pad":"`
+	const suffix = `"}`
+	padding := size - len(prefix) - len(suffix)
+	if padding < 0 {
+		t.Fatalf("size %d cannot hold a handle response", size)
+	}
+	body := prefix + strings.Repeat("a", padding) + suffix
+	if len(body) != size {
+		t.Fatalf("padded body = %d bytes, want %d", len(body), size)
+	}
+	return body
+}
+
+func jsonBody(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+	}
+}
+
+func TestRegisteredEnforcesTheBodyCapAtItsExactBoundary(t *testing.T) {
+	// maxResponseBytes is a legal size, not a rejected one: the read allows one
+	// extra byte purely so an over-long body is detectable. An off-by-one in
+	// either direction is invisible to any fixture smaller than the cap, and
+	// rejecting the largest legal answer would turn a big-but-valid response
+	// into a permanent "unknown".
+	for name, test := range map[string]struct {
+		size            int
+		wantRegistered  bool
+		wantErr         string
+		wantSecondProbe bool
+	}{
+		"exactly at the cap": {size: maxResponseBytes, wantRegistered: true},
+		"one byte over the cap": {
+			size:    maxResponseBytes + 1,
+			wantErr: "exceeds configured limit",
+			// A rejected body is not an answer, so nothing may be memoized:
+			// latching it would report "unregistered" (or replay the error)
+			// for hours after the proxy went back to a readable response.
+			wantSecondProbe: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			padded := paddedHandleBody(t, test.size)
+			var hits int
+			client := New(Options{
+				Client: doFunc(func(*http.Request) (*http.Response, error) {
+					hits++
+					if hits > 1 {
+						// The smallest legal positive answer. It can only be
+						// observed if the first outcome was not cached.
+						return jsonBody(`{"responseCode":1}`), nil
+					}
+					return jsonBody(padded), nil
+				}),
+				BaseURL: "https://doi.org",
+			})
+
+			ok, err := client.Registered(context.Background(), "10.1234/x")
+			switch {
+			case test.wantErr == "" && err != nil:
+				t.Fatalf("Registered: %v — a %d-byte body is within the cap", err, test.size)
+			case test.wantErr != "" && err == nil:
+				t.Fatalf("Registered = %v, nil; want an error containing %q", ok, test.wantErr)
+			case test.wantErr != "" && !strings.Contains(err.Error(), test.wantErr):
+				t.Fatalf("error = %q, want to contain %q", err.Error(), test.wantErr)
+			}
+			if ok != test.wantRegistered {
+				t.Fatalf("Registered = %v, want %v", ok, test.wantRegistered)
+			}
+			if hits != 1 {
+				t.Fatalf("upstream hits = %d, want 1", hits)
+			}
+
+			second, err := client.Registered(context.Background(), "10.1234/x")
+			if err != nil {
+				t.Fatalf("second Registered: %v", err)
+			}
+			if !second {
+				t.Fatal("second Registered = false; want true from the replayed answer")
+			}
+			wantHits := 1
+			if test.wantSecondProbe {
+				wantHits = 2
+			}
+			if hits != wantHits {
+				t.Fatalf("upstream hits = %d, want %d — an over-cap body must not be cached and a legal one must be", hits, wantHits)
+			}
+		})
+	}
+}
+
+// cappedBody reports how much of itself was consumed, so the bound on the read
+// itself is observable and not just the length check that follows it.
+type cappedBody struct {
+	available int
+	read      int
+}
+
+func (b *cappedBody) Read(p []byte) (int, error) {
+	if b.read >= b.available {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if remaining := b.available - b.read; n > remaining {
+		n = remaining
+	}
+	for i := range p[:n] {
+		p[i] = 'a'
+	}
+	b.read += n
+	return n, nil
+}
+
+func (b *cappedBody) Close() error { return nil }
+
+func TestRegisteredStopsReadingOneByteBeyondTheCap(t *testing.T) {
+	// Without the bound, a hostile or broken proxy decides how much memory the
+	// daemon allocates: the length check alone runs only after the whole body
+	// is already buffered.
+	body := &cappedBody{available: 8 * maxResponseBytes}
+	client := New(Options{
+		Client: doFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
+		}),
+		BaseURL: "https://doi.org",
+	})
+
+	_, err := client.Registered(context.Background(), "10.1234/x")
+	if err == nil {
+		t.Fatal("want an error for a body far beyond the cap")
+	}
+	if !strings.Contains(err.Error(), "exceeds configured limit") {
+		t.Fatalf("error = %q, want to contain %q", err.Error(), "exceeds configured limit")
+	}
+	if body.read != maxResponseBytes+1 {
+		t.Fatalf("bytes read = %d, want exactly %d — the read must stop one byte past the cap", body.read, maxResponseBytes+1)
 	}
 }

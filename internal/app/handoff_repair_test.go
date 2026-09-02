@@ -41,6 +41,68 @@ func setHandoffRepairUpdatedAt(t *testing.T, jobs *job.Store, jobID string, at t
 	}
 }
 
+// assertUnfetchableHandoffRepaired walks the pre-fix lifecycle shared by every
+// legacy park the identifier gates now reject: a work parked in awaiting_human
+// on an institutional handoff no sign-in can complete. The repair pass must
+// close the dead action, return the job to the classifying gate, and let the
+// reclaimed job settle as unavailable with wantTerminalReason — never back
+// into another handoff. submitWork supplies the scenario's own submission.
+func assertUnfetchableHandoffRepaired(
+	t *testing.T,
+	submitWork func(t *testing.T, svc *Service) (jobID string),
+	wantTerminalReason string,
+) {
+	t.Helper()
+	svc, jobs := exhaustionService(t)
+	ctx := context.Background()
+	id := submitWork(t, svc)
+
+	// Reconstruct the pre-fix state: parked awaiting_human on an institutional
+	// handoff that no sign-in can complete.
+	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
+		job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
+		map[string]any{"reason": "scheduler_dispatch"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
+		map[string]any{"reason": "institutional_handoff"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateResolving {
+		t.Fatalf("state = %q, want %q — repair returns a park nothing can complete to the one gate that classifies it",
+			got.State, job.StateResolving)
+	}
+	open, _ := jobs.ListHumanActions(ctx, true)
+	if len(open) != 0 {
+		t.Fatalf("open actions = %+v, want the dead handoff resolved", open)
+	}
+
+	// And the reclaimed job settles as unavailable, never back into a handoff.
+	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	settled, _ := jobs.Get(ctx, id)
+	if settled.State != job.StateUnavailable || settled.TerminalReason != wantTerminalReason {
+		t.Fatalf("settled = state:%q reason:%q, want unavailable/%s",
+			settled.State, settled.TerminalReason, wantTerminalReason)
+	}
+}
+
 func TestHandoffRepairerHealsStrandedParks(t *testing.T) {
 	ctx := context.Background()
 

@@ -21,6 +21,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/notify"
 	"papio/internal/resolver"
+	"papio/internal/resolvers/resolvertest"
 	"papio/internal/store"
 	"papio/internal/store/storetest"
 	"papio/internal/work"
@@ -713,6 +714,183 @@ func TestEmptyAffectedDOIDedupsByNotice(t *testing.T) {
 	if findingKey(emptyA) == findingKey(real) {
 		t.Fatal("findingKey must distinguish an empty affected DOI from a real one")
 	}
+}
+
+// TestPreferRanksSeverityAboveNoticeDOI pins which recorded notice a work
+// presents when Crossref reports several. A retraction must outrank an
+// expression of concern and a correction, and a concern must outrank a
+// correction, whatever the notice DOIs sort like. The failure this prevents is
+// a retracted work being presented to the operator as a benign correction
+// merely because the correction notice DOI sorts first.
+func TestPreferRanksSeverityAboveNoticeDOI(t *testing.T) {
+	const (
+		lowDOI  = "10.2000/aaa"
+		highDOI = "10.2000/zzz"
+	)
+	orderings := []struct {
+		name      string
+		candidate string
+		current   string
+	}{
+		{name: "candidate notice DOI sorts first", candidate: lowDOI, current: highDOI},
+		{name: "notice DOIs identical", candidate: lowDOI, current: lowDOI},
+		{name: "candidate notice DOI sorts last", candidate: highDOI, current: lowDOI},
+	}
+	// Every ordered pair of distinct natures, with the expectation written out
+	// rather than derived, so a change of ranking cannot silently agree with a
+	// mirrored model.
+	pairs := []struct {
+		candidate Nature
+		current   Nature
+		want      bool
+	}{
+		{candidate: NatureRetraction, current: NatureConcern, want: true},
+		{candidate: NatureRetraction, current: NatureCorrection, want: true},
+		{candidate: NatureConcern, current: NatureRetraction, want: false},
+		{candidate: NatureConcern, current: NatureCorrection, want: true},
+		{candidate: NatureCorrection, current: NatureRetraction, want: false},
+		{candidate: NatureCorrection, current: NatureConcern, want: false},
+	}
+	for _, pair := range pairs {
+		for _, ordering := range orderings {
+			t.Run(fmt.Sprintf("%s_vs_%s/%s", pair.candidate, pair.current, ordering.name), func(t *testing.T) {
+				candidate := Finding{DOI: "10.1234/original", Nature: pair.candidate, NoticeDOI: ordering.candidate}
+				current := Finding{DOI: "10.1234/original", Nature: pair.current, NoticeDOI: ordering.current}
+				if got := prefer(candidate, current); got != pair.want {
+					t.Fatalf("prefer(%s %s, %s %s) = %v, want %v", pair.candidate, ordering.candidate, pair.current, ordering.current, got, pair.want)
+				}
+			})
+		}
+	}
+	// Equal severity breaks the tie on the notice DOI, and an identical notice
+	// never displaces itself, so repeated sweeps cannot flap between two
+	// notices of the same nature.
+	for _, nature := range []Nature{NatureRetraction, NatureConcern, NatureCorrection} {
+		t.Run("tie_broken_by_notice_doi/"+string(nature), func(t *testing.T) {
+			low := Finding{DOI: "10.1234/original", Nature: nature, NoticeDOI: lowDOI}
+			high := Finding{DOI: "10.1234/original", Nature: nature, NoticeDOI: highDOI}
+			if !prefer(low, high) {
+				t.Fatalf("prefer(%s, %s) = false, want the lower notice DOI to win", lowDOI, highDOI)
+			}
+			if prefer(high, low) {
+				t.Fatalf("prefer(%s, %s) = true, want the lower notice DOI to keep its place", highDOI, lowDOI)
+			}
+			if prefer(low, low) {
+				t.Fatal("prefer(x, x) = true; an identical notice must not displace itself")
+			}
+		})
+	}
+}
+
+// TestPreferPresentsRetractionWhenAWorkHasSeveralNotices runs the same choice
+// through a whole sweep: Crossref reports a correction, a concern and a
+// retraction for one work, and the retraction notice DOI deliberately sorts
+// last. The operator must still be shown "retraction".
+func TestPreferPresentsRetractionWhenAWorkHasSeveralNotices(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/original", 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message":{"update-to":[
+			{"DOI":"10.2000/aaa-correction","updated":"correction"},
+			{"DOI":"10.2000/bbb-concern","updated":"expression-of-concern"},
+			{"DOI":"10.2000/zzz-retraction","updated":"retraction"}
+		]}}`))
+	}))
+	defer server.Close()
+	notifier := &recordingNotifier{}
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(), Notifier: notifier,
+		Now: func() time.Time { return now },
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil {
+		t.Fatalf("snapshot items: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %#v, want exactly one presented notice", items)
+	}
+	got := items[0].Retraction
+	if got == nil {
+		t.Fatalf("item = %+v, want a retraction payload", items[0])
+	}
+	if got.Nature != string(NatureRetraction) || got.NoticeDOI != "10.2000/zzz-retraction" {
+		t.Fatalf("presented notice = %+v, want the retraction 10.2000/zzz-retraction", got)
+	}
+	sentinel.mu.Lock()
+	cached, ok := sentinel.readCache()
+	sentinel.mu.Unlock()
+	if !ok || len(cached.Notices) != 1 {
+		t.Fatalf("cache notices = %#v (ok=%v), want only the preferred notice", cached.Notices, ok)
+	}
+	if _, exists := cached.Notices[findingKey(Finding{DOI: "10.1234/original", Nature: NatureRetraction, NoticeDOI: "10.2000/zzz-retraction"})]; !exists {
+		t.Fatalf("cache notices = %#v, want the retraction keyed entry", cached.Notices)
+	}
+	if len(notifier.events) != 1 {
+		t.Fatalf("events = %#v, want one", notifier.events)
+	}
+	details, isSlice := notifier.events[0].Detail["findings"].([]map[string]any)
+	if !isSlice || len(details) != 1 {
+		t.Fatalf("findings detail = %#v, want one row", notifier.events[0].Detail["findings"])
+	}
+	if details[0]["nature"] != NatureRetraction {
+		t.Fatalf("notified nature = %#v, want %q", details[0]["nature"], NatureRetraction)
+	}
+}
+
+// TestParseRetryAfterClampsHugeValues reuses the canonical resolver table so
+// this copy of parseRetryAfter cannot drift from the seven siblings.
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
+}
+
+// TestParseRetryAfterSecondsAndDates covers the two header shapes Crossref
+// sends. A date already past must yield zero, never a negative back-off that
+// would make the sweep retry immediately forever.
+func TestParseRetryAfterSecondsAndDates(t *testing.T) {
+	now := time.Now()
+	seconds := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "thirty seconds", value: "30", want: 30 * time.Second},
+		{name: "zero seconds", value: "0", want: 0},
+		{name: "padded seconds", value: " 30 ", want: 30 * time.Second},
+		{name: "negative seconds are ignored", value: "-5", want: 0},
+		{name: "garbage", value: "soon", want: 0},
+	}
+	for _, tc := range seconds {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseRetryAfter(tc.value, now); got != tc.want {
+				t.Fatalf("parseRetryAfter(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("future date waits until then", func(t *testing.T) {
+		const ahead = 2 * time.Hour
+		value := now.Add(ahead).UTC().Format(http.TimeFormat)
+		got := parseRetryAfter(value, now)
+		// The header carries whole seconds only, and time.Until is read after
+		// the call starts, so allow a small shortfall but no overshoot.
+		if got > ahead || got < ahead-5*time.Second {
+			t.Fatalf("parseRetryAfter(%q) = %v, want just under %v", value, got, ahead)
+		}
+	})
+
+	t.Run("past date does not wait", func(t *testing.T) {
+		value := now.Add(-time.Hour).UTC().Format(http.TimeFormat)
+		if got := parseRetryAfter(value, now); got != 0 {
+			t.Fatalf("parseRetryAfter(%q) = %v, want 0", value, got)
+		}
+	})
 }
 
 func testStore(t *testing.T) *store.Store {

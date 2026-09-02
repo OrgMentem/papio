@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -671,5 +672,113 @@ func TestMaintenanceRunnersRunAllAndReturnFirstError(t *testing.T) {
 	}
 	if len(order) != 3 || order[0] != "a" || order[1] != "b" || order[2] != "c" {
 		t.Fatalf("run order = %v, want [a b c] (every runner runs despite an earlier error)", order)
+	}
+}
+
+// releaseFailureStore hands out exactly one job and then fails every Release.
+// The hazard is a job the supervisor believes is durably complete staying
+// leased until expiry, where stale recovery reprocesses finished work.
+type releaseFailureStore struct {
+	mu            sync.Mutex
+	row           *job.Row
+	claimed       bool
+	releaseErr    error
+	releaseCalls  int
+	releaseCtxErr error
+}
+
+func (s *releaseFailureStore) ClaimNext(context.Context, string, time.Duration) (*job.Row, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimed {
+		return nil, nil
+	}
+	s.claimed = true
+	return s.row, nil
+}
+
+func (s *releaseFailureStore) Heartbeat(context.Context, string, string, time.Duration) error {
+	return nil
+}
+
+func (s *releaseFailureStore) Release(ctx context.Context, _ string, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseCalls++
+	s.releaseCtxErr = ctx.Err()
+	return s.releaseErr
+}
+
+func (s *releaseFailureStore) RecoverStale(context.Context) ([]string, error) { return nil, nil }
+func (s *releaseFailureStore) CloseStaleHumanActions(context.Context) error   { return nil }
+
+func (s *releaseFailureStore) releases() (calls int, ctxErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.releaseCalls, s.releaseCtxErr
+}
+
+func TestSchedulerSurfacesLeaseReleaseFailure(t *testing.T) {
+	releaseFailed := errors.New("lease release unavailable")
+	processFailed := errors.New("processor rejected the job")
+	tests := []struct {
+		name string
+		// processErr is what the processor returns for the single claimed job.
+		processErr error
+		wantErr    error
+		// rejectErr must not appear in the returned chain.
+		rejectErr   error
+		wantMessage string
+	}{
+		{
+			name:        "succeeded job reports the release failure",
+			wantErr:     releaseFailed,
+			wantMessage: "release job job_01",
+		},
+		{
+			name:       "processor failure survives a failing release",
+			processErr: processFailed,
+			wantErr:    processFailed,
+			rejectErr:  releaseFailed,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			leaseStore := &releaseFailureStore{row: &job.Row{ID: "job_01"}, releaseErr: releaseFailed}
+			scheduler, err := NewScheduler(leaseStore, ProcessorFunc(func(context.Context, *job.Row) error {
+				return tc.processErr
+			}), SchedulerConfig{Owner: "worker", LeaseDuration: 30 * time.Millisecond, HeartbeatInterval: time.Millisecond, PollInterval: time.Millisecond})
+			if err != nil {
+				t.Fatalf("NewScheduler: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- scheduler.Run(ctx) }()
+			var runErr error
+			select {
+			case runErr = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Run kept polling; a swallowed Release failure leaves the finished job leased until expiry")
+			}
+			if !errors.Is(runErr, tc.wantErr) {
+				t.Fatalf("Run error = %v, want %v", runErr, tc.wantErr)
+			}
+			if tc.rejectErr != nil && errors.Is(runErr, tc.rejectErr) {
+				t.Fatalf("Run error = %v, want the processor cause preserved rather than the release failure %v", runErr, tc.rejectErr)
+			}
+			if tc.wantMessage != "" && !strings.Contains(runErr.Error(), tc.wantMessage) {
+				t.Fatalf("Run error = %q, want it to name the unreleased job (%q)", runErr, tc.wantMessage)
+			}
+			calls, ctxErr := leaseStore.releases()
+			if calls != 1 {
+				t.Fatalf("Release calls = %d, want 1 release for the one claimed job", calls)
+			}
+			// Process completion cancels the job context, so Release must get a
+			// live context of its own or every completed job fails to release.
+			if ctxErr != nil {
+				t.Fatalf("Release context error = %v, want a live context after processing completed", ctxErr)
+			}
+		})
 	}
 }

@@ -515,3 +515,209 @@ func requireJSONEqual(t *testing.T, actual json.RawMessage, expected any) {
 		t.Fatalf("params = %s, want %s", actual, expectedJSON)
 	}
 }
+
+// resourceEnvelope is one decoded agentjson page: the row list under its own
+// key plus the cap flag, and nothing else.
+type resourceEnvelope struct {
+	rows      []json.RawMessage
+	truncated bool
+}
+
+// TestServerExposesResources pins the whole MCP resource surface. A client that
+// only calls ListTools/CallTool never reaches registerResources, so both the URI
+// set and the internal/agentjson envelope shape can drift silently. The URI
+// assertion is exact, like TestServerExposesExactToolSurface: a new resource has
+// to be declared here before it can ship.
+func TestServerExposesResources(t *testing.T) {
+	ctx := context.Background()
+	system := newResourceSystem(t)
+	seedResourceRows(t, system)
+	c := newTestClient(t, system, toolDependencies{now: time.Now, wait: waitForPoll}, emptyFactory)
+
+	listed, err := c.ListResources(ctx, mcplib.ListResourcesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uris := make([]string, 0, len(listed.Resources))
+	for _, resource := range listed.Resources {
+		uris = append(uris, resource.URI)
+		if resource.MIMEType != "application/json" {
+			t.Errorf("%s mime = %q, want application/json", resource.URI, resource.MIMEType)
+		}
+		if strings.TrimSpace(resource.Description) == "" {
+			t.Errorf("%s has no description", resource.URI)
+		}
+	}
+	sort.Strings(uris)
+	wantURIs := []string{"papio://artifacts", "papio://bundles", "papio://exports", "papio://jobs", "papio://zotio/plans"}
+	if strings.Join(uris, ",") != strings.Join(wantURIs, ",") {
+		t.Fatalf("resources = %v, want %v", uris, wantURIs)
+	}
+
+	// Counts follow seedResourceRows: one job and one bundle export past the
+	// row cap, two artifacts, one plan, one apply record.
+	cases := []struct {
+		uri       string
+		key       string
+		rows      int
+		truncated bool
+	}{
+		{"papio://jobs", "jobs", resourceRowCap, true},
+		{"papio://artifacts", "artifacts", 2, false},
+		{"papio://bundles", "bundles", resourceRowCap, true},
+		{"papio://zotio/plans", "plans", 1, false},
+		{"papio://exports", "exports", resourceRowCap, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			page := readResourceEnvelope(t, c, tc.uri, tc.key)
+			if len(page.rows) != tc.rows {
+				t.Errorf("%s rows = %d, want %d", tc.uri, len(page.rows), tc.rows)
+			}
+			if page.truncated != tc.truncated {
+				t.Errorf("%s truncated = %v, want %v", tc.uri, page.truncated, tc.truncated)
+			}
+		})
+	}
+
+	// artifactsResource joins each hash back through Jobs.GetArtifact, so the
+	// rows must carry the seeded digests, not just the right count.
+	artifacts := readResourceEnvelope(t, c, "papio://artifacts", "artifacts")
+	shas := make([]string, 0, len(artifacts.rows))
+	for _, row := range artifacts.rows {
+		var artifact job.Artifact
+		if err := json.Unmarshal(row, &artifact); err != nil {
+			t.Fatal(err)
+		}
+		shas = append(shas, artifact.SHA256)
+	}
+	sort.Strings(shas)
+	if want := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}; strings.Join(shas, ",") != strings.Join(want, ",") {
+		t.Fatalf("artifact hashes = %v, want %v", shas, want)
+	}
+
+	// Kind filtering is the only difference between the three export
+	// resources, so the plan resource must not leak the bundle rows.
+	plans := readResourceEnvelope(t, c, "papio://zotio/plans", "plans")
+	var plan exportRecord
+	if err := json.Unmarshal(plans.rows[0], &plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Kind != "zotio_plan" {
+		t.Fatalf("plan kind = %q, want zotio_plan", plan.Kind)
+	}
+
+	t.Run("empty", func(t *testing.T) {
+		// An empty surface still owes a list: `null` would break the obvious
+		// `for row in payload[key]` every agent consumer writes.
+		empty := newTestClient(t, newResourceSystem(t), toolDependencies{now: time.Now, wait: waitForPoll}, emptyFactory)
+		for _, tc := range cases {
+			page := readResourceEnvelope(t, empty, tc.uri, tc.key)
+			if len(page.rows) != 0 || page.truncated {
+				t.Errorf("%s on empty store = %d rows, truncated %v", tc.uri, len(page.rows), page.truncated)
+			}
+		}
+	})
+}
+
+func newResourceSystem(t *testing.T) *bootstrap.System {
+	t.Helper()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = storetest.DataDir(t)
+	system, err := bootstrap.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+	return system
+}
+
+// seedResourceRows fills every resource-backed table. jobs and bundle exports
+// get one row more than resourceRowCap so an off-by-one in the LIMIT or in
+// agentjson.Truncate shows up as a wrong count or a false truncated flag.
+func seedResourceRows(t *testing.T, system *bootstrap.System) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i <= resourceRowCap; i++ {
+		if _, err := system.App.SubmitWithOptionsAs(ctx, job.PrincipalMCP, protocol.WorkRequest{
+			SchemaVersion: protocol.WorkRequestSchemaVersion,
+			RequestID:     fmt.Sprintf("wr_resource_%03d", i),
+			Identifiers:   &protocol.Identifiers{DOI: fmt.Sprintf("10.1000/resource-%03d", i)},
+		}, app.SubmitOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sha := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
+		if err := system.Jobs.UpsertArtifact(ctx, job.Artifact{
+			SHA256: sha, SizeBytes: 1024, MIME: "application/pdf", PageCount: 3, TextChars: 900,
+			Path: "artifacts/" + sha + ".pdf",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert := func(kind, key string) {
+		if _, err := system.Store.DB().ExecContext(ctx,
+			`INSERT INTO exports (job_id, kind, idempotency_key, path, result_json, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			"job_resource", kind, key, "exports/"+key, `{"ok":true}`, "2026-07-15T12:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i <= resourceRowCap; i++ {
+		insert("bundle", fmt.Sprintf("bundle_%03d", i))
+	}
+	insert("zotio_plan", "plan_000")
+	insert("zotio_apply", "apply_000")
+}
+
+// readResourceEnvelope reads one resource and pins the agentjson contract on it:
+// a JSON object with exactly the named row key and truncated, the rows a real
+// list rather than null, and never a bare top-level array.
+func readResourceEnvelope(t *testing.T, c *client.Client, uri, key string) resourceEnvelope {
+	t.Helper()
+	req := mcplib.ReadResourceRequest{}
+	req.Params.URI = uri
+	res, err := c.ReadResource(context.Background(), req)
+	if err != nil {
+		t.Fatalf("read %s: %v", uri, err)
+	}
+	if len(res.Contents) != 1 {
+		t.Fatalf("%s returned %d contents, want 1", uri, len(res.Contents))
+	}
+	text, ok := res.Contents[0].(mcplib.TextResourceContents)
+	if !ok {
+		t.Fatalf("%s content = %T, want text", uri, res.Contents[0])
+	}
+	if text.URI != uri || text.MIMEType != "application/json" {
+		t.Fatalf("%s content header = %q %q", uri, text.URI, text.MIMEType)
+	}
+	if trimmed := strings.TrimSpace(text.Text); !strings.HasPrefix(trimmed, "{") {
+		t.Fatalf("%s payload is not an envelope object: %s", uri, trimmed)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(text.Text), &envelope); err != nil {
+		t.Fatalf("decode %s: %v", uri, err)
+	}
+	keys := make([]string, 0, len(envelope))
+	for name := range envelope {
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+	want := []string{key, "truncated"}
+	sort.Strings(want)
+	if strings.Join(keys, ",") != strings.Join(want, ",") {
+		t.Fatalf("%s envelope keys = %v, want %v", uri, keys, want)
+	}
+	if string(envelope[key]) == "null" {
+		t.Fatalf("%s rows are null, want a list", uri)
+	}
+	page := resourceEnvelope{}
+	if err := json.Unmarshal(envelope[key], &page.rows); err != nil {
+		t.Fatalf("%s rows are not a list: %v", uri, err)
+	}
+	if err := json.Unmarshal(envelope["truncated"], &page.truncated); err != nil {
+		t.Fatalf("%s truncated is not a bool: %v", uri, err)
+	}
+	return page
+}

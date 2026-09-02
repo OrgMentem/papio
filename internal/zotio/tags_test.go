@@ -2,9 +2,11 @@
 package zotio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -558,5 +560,73 @@ func TestTagReconcilerDisabledOnlyWhileCleanupRemains(t *testing.T) {
 	service.CLI = nil
 	if service.TagReconciler() != nil {
 		t.Fatal("reconciler must be nil without a zotio CLI")
+	}
+}
+
+// RunDue is the daemon's maintenance seam. A nil reconciler (the disabled,
+// nothing-to-clean case) is a no-op; a reconcile failure propagates to the
+// scheduler; and the log line is throttled so a persistently broken zotio
+// writes one line per tagErrorLogInterval instead of one per cadence, while a
+// *different* failure and a lapsed interval both still get reported.
+func TestTagReconcilerRunDuePropagatesAndThrottlesErrors(t *testing.T) {
+	ctx := context.Background()
+	var absent *TagReconciler
+	if err := absent.RunDue(ctx); err != nil {
+		t.Fatalf("nil reconciler must be a no-op, got %v", err)
+	}
+
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	lines := func() int { return strings.Count(logs.String(), "zotio tag reconcile:") }
+
+	cli := &tagCLI{version: "0.12.0"}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_RUNDUE01", "RUNDUE01", job.StateResolving, job.StateUnavailable)
+	reconciler := service.TagReconciler()
+	if reconciler == nil {
+		t.Fatal("an enabled service must expose a reconciler")
+	}
+
+	err := reconciler.RunDue(ctx)
+	if err == nil || !strings.Contains(err.Error(), tagsMinimumZotioVersion) {
+		t.Fatalf("RunDue must propagate the reconcile error, got %v", err)
+	}
+	if got := lines(); got != 1 {
+		t.Fatalf("log lines after the first failure = %d, want 1", got)
+	}
+	if reconciler.RunDue(ctx) == nil {
+		t.Fatal("the second pass must still fail")
+	}
+	if got := lines(); got != 1 {
+		t.Fatalf("the repeated identical error logged %d times, want 1 (throttle broken)", got)
+	}
+
+	cli.version = "0.11.0"
+	if reconciler.RunDue(ctx) == nil {
+		t.Fatal("the third pass must still fail")
+	}
+	if got := lines(); got != 2 {
+		t.Fatalf("log lines after a changed error message = %d, want 2", got)
+	}
+
+	reconciler.lastErrLog = time.Now().Add(-2 * tagErrorLogInterval)
+	if reconciler.RunDue(ctx) == nil {
+		t.Fatal("the fourth pass must still fail")
+	}
+	if got := lines(); got != 3 {
+		t.Fatalf("log lines once tagErrorLogInterval elapsed = %d, want 3", got)
+	}
+
+	cli.version = tagsMinimumZotioVersion
+	if err := reconciler.RunDue(ctx); err != nil {
+		t.Fatalf("recovered pass: %v", err)
+	}
+	if reconciler.lastErr != "" {
+		t.Fatalf("lastErr = %q after a successful pass, want cleared", reconciler.lastErr)
+	}
+	if got := tagStateRows(t, service)["RUNDUE01"]; got != TagUnavailable {
+		t.Fatalf("tag for RUNDUE01 = %q, want %q — the recovered pass must actually reconcile", got, TagUnavailable)
 	}
 }

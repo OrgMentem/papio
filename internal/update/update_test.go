@@ -166,23 +166,6 @@ func TestCheckSkipsNetworkForFreshCache(t *testing.T) {
 	}
 }
 
-func TestCheckMalformedResponseSoftFailsToCachedInfo(t *testing.T) {
-	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"tag_name":`))
-	}))
-	defer server.Close()
-
-	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
-	if err := checker.writeCache(cache{LatestVersion: "1.2.2", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
-		t.Fatal(err)
-	}
-	info := checker.Check(context.Background())
-	if info == nil || info.LatestVersion != "1.2.2" || !info.CheckedAt.Equal(now.Add(-checkEvery)) {
-		t.Fatalf("info = %#v", info)
-	}
-}
-
 func TestCachedReturnsWhileRefreshIsInFlight(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	entered := make(chan struct{})
@@ -330,35 +313,49 @@ func TestZotioCheckerPersistsInstalledVersionWithoutChecking(t *testing.T) {
 	}
 }
 
-func TestCheckTransportErrorSoftFailsToCachedInfo(t *testing.T) {
+// A warm cache means every failure mode must degrade to the previously cached
+// release rather than to nil, and must leave that release's CheckedAt alone:
+// the cached answer was never re-confirmed, so moving CheckedAt forward would
+// claim a confirmation that never happened. Every case reaches the same
+// assertions; only the way the release read fails differs.
+func TestCheckWarmCacheDegradesToCachedInfo(t *testing.T) {
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("connection refused")
-	})}
-	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: "https://example.test/releases", Client: client, Now: func() time.Time { return now }})
-	if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
-		t.Fatal(err)
+	cachedAt := now.Add(-checkEvery)
+	tests := []struct {
+		name      string
+		handler   http.HandlerFunc                            // served by a test server, or
+		transport func(*http.Request) (*http.Response, error) // used instead when non-nil
+	}{
+		{name: "transport error", transport: func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connection refused")
+		}},
+		{name: "non-OK status", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}},
+		{name: "malformed body", handler: func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"tag_name":`))
+		}},
 	}
-	info := checker.Check(context.Background())
-	if info == nil || info.LatestVersion != "1.2.3" || info.URL != "https://example.test/release" {
-		t.Fatalf("info = %#v, want cached release preserved after transport error", info)
-	}
-}
-
-func TestCheckNonOKStatusSoftFailsToCachedInfo(t *testing.T) {
-	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	checker := NewWithOptions(Options{DataDir: t.TempDir(), ReleasesURL: server.URL, Client: server.Client(), Now: func() time.Time { return now }})
-	if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: now.Add(-checkEvery)}); err != nil {
-		t.Fatal(err)
-	}
-	info := checker.Check(context.Background())
-	if info == nil || info.LatestVersion != "1.2.3" || info.URL != "https://example.test/release" {
-		t.Fatalf("info = %#v, want cached release preserved after 500 response", info)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := Options{DataDir: t.TempDir(), Now: func() time.Time { return now }}
+			if test.transport != nil {
+				options.ReleasesURL = "https://example.test/releases"
+				options.Client = &http.Client{Transport: roundTripFunc(test.transport)}
+			} else {
+				server := httptest.NewServer(test.handler)
+				t.Cleanup(server.Close)
+				options.ReleasesURL, options.Client = server.URL, server.Client()
+			}
+			checker := NewWithOptions(options)
+			if err := checker.writeCache(cache{LatestVersion: "1.2.3", URL: "https://example.test/release", CheckedAt: cachedAt}); err != nil {
+				t.Fatal(err)
+			}
+			info := checker.Check(context.Background())
+			if info == nil || info.LatestVersion != "1.2.3" || info.URL != "https://example.test/release" || !info.CheckedAt.Equal(cachedAt) {
+				t.Fatalf("info = %#v, want the cached release with its original CheckedAt", info)
+			}
+		})
 	}
 }
 

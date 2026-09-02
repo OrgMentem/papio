@@ -71,6 +71,31 @@ func TestParseNBIB(t *testing.T) {
 			data: "PMID- 777\nTI  - No DOI\nLID - S0022-5347(20)30000-0 [pii]\n",
 			want: []Record{{PMID: "777", Title: "No DOI"}},
 		},
+		{
+			name: "leading and trailing blank lines",
+			data: "\n\nPMID- 123\nTI  - Blank boundaries\n\n\n",
+			want: []Record{{PMID: "123", Title: "Blank boundaries"}},
+		},
+		{
+			name: "CRLF line endings normalized",
+			data: strings.ReplaceAll(nbibFixture, "\n", "\r\n"),
+			want: []Record{
+				{
+					PMID:    "40123456",
+					DOI:     "10.1000/first-study",
+					Title:   "First study title continued across a field line",
+					Authors: []string{"Doe, Jane", "Smith, John Q"},
+					Year:    2024,
+				},
+				{
+					PMID:    "40123457",
+					DOI:     "10.1000/second-study",
+					Title:   "Second study",
+					Authors: []string{"Nguyen, Mai"},
+					Year:    2023,
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -92,28 +117,5 @@ func TestParseNBIBEmptyInput(t *testing.T) {
 		if err == nil || err.Error() != "nbib: no records found" {
 			t.Errorf("parseNBIB(%q) error = %v, want nbib: no records found", data, err)
 		}
-	}
-}
-
-func TestParseNBIBAcceptsLeadingAndTrailingBlankLines(t *testing.T) {
-	data := "\n\nPMID- 123\nTI  - Blank boundaries\n\n\n"
-	got, err := parseNBIB([]byte(data))
-	if err != nil {
-		t.Fatalf("parseNBIB() error = %v", err)
-	}
-	want := []Record{{PMID: "123", Title: "Blank boundaries"}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("parseNBIB() = %#v, want %#v", got, want)
-	}
-}
-
-func TestParseNBIBNormalizesCRLF(t *testing.T) {
-	data := strings.ReplaceAll(nbibFixture, "\n", "\r\n")
-	got, err := parseNBIB([]byte(data))
-	if err != nil {
-		t.Fatalf("parseNBIB() error = %v", err)
-	}
-	if len(got) != 2 || got[0].Title != "First study title continued across a field line" {
-		t.Fatalf("parseNBIB() = %#v, want normalized multi-record input", got)
 	}
 }

@@ -375,36 +375,53 @@ func TestRetryClasses(t *testing.T) {
 // result whose identifier field is empty cannot be verified and is rejected, so
 // a wrong (or unverifiable) work is never emitted.
 func TestSelectResultRequiresPositiveIdentity(t *testing.T) {
-	t.Run("pmid empty field not selected", func(t *testing.T) {
-		requested := work.Work{PMID: "12345"}
-		results := []epmcResult{{ID: "a", PMID: ""}}
-		if got := selectResult(results, requested, matchPMID); got != nil {
-			t.Errorf("selectResult with empty PMID field = %+v, want nil", got)
-		}
-	})
-	t.Run("pmid matching field selected", func(t *testing.T) {
-		requested := work.Work{PMID: "12345"}
-		results := []epmcResult{{ID: "a", PMID: ""}, {ID: "b", PMID: "12345"}}
-		got := selectResult(results, requested, matchPMID)
-		if got == nil || got.ID != "b" {
-			t.Errorf("selectResult matching PMID = %+v, want result b", got)
-		}
-	})
-	t.Run("doi empty field not selected", func(t *testing.T) {
-		requested := work.Work{DOI: "10.1000/test"}
-		results := []epmcResult{{ID: "a", DOI: ""}}
-		if got := selectResult(results, requested, matchDOI); got != nil {
-			t.Errorf("selectResult with empty DOI field = %+v, want nil", got)
-		}
-	})
-	t.Run("doi matching field selected", func(t *testing.T) {
-		requested := work.Work{DOI: "10.1000/test"}
-		results := []epmcResult{{ID: "a", DOI: ""}, {ID: "b", DOI: "10.1000/test"}}
-		got := selectResult(results, requested, matchDOI)
-		if got == nil || got.ID != "b" {
-			t.Errorf("selectResult matching DOI = %+v, want result b", got)
-		}
-	})
+	for _, test := range []struct {
+		name      string
+		requested work.Work
+		results   []epmcResult
+		mode      matchMode
+		wantID    string // empty means no result may be selected
+	}{
+		{
+			name:      "pmid empty field not selected",
+			requested: work.Work{PMID: "12345"},
+			results:   []epmcResult{{ID: "a", PMID: ""}},
+			mode:      matchPMID,
+		},
+		{
+			name:      "pmid matching field selected",
+			requested: work.Work{PMID: "12345"},
+			results:   []epmcResult{{ID: "a", PMID: ""}, {ID: "b", PMID: "12345"}},
+			mode:      matchPMID,
+			wantID:    "b",
+		},
+		{
+			name:      "doi empty field not selected",
+			requested: work.Work{DOI: "10.1000/test"},
+			results:   []epmcResult{{ID: "a", DOI: ""}},
+			mode:      matchDOI,
+		},
+		{
+			name:      "doi matching field selected",
+			requested: work.Work{DOI: "10.1000/test"},
+			results:   []epmcResult{{ID: "a", DOI: ""}, {ID: "b", DOI: "10.1000/test"}},
+			mode:      matchDOI,
+			wantID:    "b",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := selectResult(test.results, test.requested, test.mode)
+			if test.wantID == "" {
+				if got != nil {
+					t.Errorf("selectResult = %+v, want nil: an unverifiable identifier field must never be selected", got)
+				}
+				return
+			}
+			if got == nil || got.ID != test.wantID {
+				t.Errorf("selectResult = %+v, want result %s", got, test.wantID)
+			}
+		})
+	}
 }
 
 // TestParseRetryAfterClampsHugeValues pins the overflow-safe Retry-After

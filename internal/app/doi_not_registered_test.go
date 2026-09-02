@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -139,55 +138,17 @@ func TestRepairHealsAPreExistingHandoffForAnUnregisteredDOI(t *testing.T) {
 	// it waits on browser.no_entitlement_requeue, which requires the browser
 	// to have reached the institutional resolver, and a dead DOI never gets
 	// that far.
-	svc, jobs := exhaustionService(t)
-	svc.DOIRegistry = &fakeDOIRegistry{}
-	ctx := context.Background()
-	id, err := svc.Submit(ctx, protocol.WorkRequest{
-		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_legacy_typo_park",
-		Identifiers:    &protocol.Identifiers{DOI: "10.1016/j.cedpsych.2020.101816"},
-		Title:          "Intrinsic and extrinsic motivation from a self-determination theory perspective",
-		DesiredVersion: "any",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-		job.Access(true, "paywall")); err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
-		map[string]any{"reason": "scheduler_dispatch"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
-		map[string]any{"reason": "institutional_handoff"}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
-		t.Fatalf("repair: %v", err)
-	}
-	got, err := jobs.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != job.StateResolving {
-		t.Fatalf("state = %q, want %q — a park nothing can complete must be reclaimed", got.State, job.StateResolving)
-	}
-	open, _ := jobs.ListHumanActions(ctx, true)
-	if len(open) != 0 {
-		t.Fatalf("open actions = %+v, want the dead handoff resolved", open)
-	}
-
-	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
-	if err != nil || row == nil {
-		t.Fatalf("claim: %v", err)
-	}
-	if err := svc.Process(ctx, row); err != nil {
-		t.Fatal(err)
-	}
-	settled, _ := jobs.Get(ctx, id)
-	if settled.State != job.StateUnavailable || settled.TerminalReason != string(job.TerminalReasonDOINotRegistered) {
-		t.Fatalf("settled = state:%q reason:%q, want unavailable/%s", settled.State, settled.TerminalReason, job.TerminalReasonDOINotRegistered)
-	}
+	assertUnfetchableHandoffRepaired(t, func(t *testing.T, svc *Service) string {
+		svc.DOIRegistry = &fakeDOIRegistry{}
+		id, err := svc.Submit(context.Background(), protocol.WorkRequest{
+			SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "wr_legacy_typo_park",
+			Identifiers:    &protocol.Identifiers{DOI: "10.1016/j.cedpsych.2020.101816"},
+			Title:          "Intrinsic and extrinsic motivation from a self-determination theory perspective",
+			DesiredVersion: "any",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}, string(job.TerminalReasonDOINotRegistered))
 }

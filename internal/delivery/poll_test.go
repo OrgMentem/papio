@@ -858,3 +858,252 @@ func TestBackoffJitterStaysWithinBudget(t *testing.T) {
 		}
 	}
 }
+
+// --- LivePollHealth: doctor's poll-health thresholds ---------------------
+
+// seedPollHealthRow creates one delivery_requests row under profile and
+// stamps exactly the columns LivePollHealth reads. A zero lastSuccess
+// leaves last_successful_poll_at NULL, so the freshness anchor falls back
+// to submitted_at — a request papio submitted but never polled once.
+func seedPollHealthRow(t *testing.T, svc *Service, jobID, profile string, state State, failures int, errorClass string, lastSuccess, submittedAt time.Time) int64 {
+	t.Helper()
+	ctx := context.Background()
+	testJob(t, svc, jobID)
+	created, err := svc.Create(ctx, CreateRequest{
+		JobID:              jobID,
+		InstitutionProfile: profile,
+		Provider:           "illiad",
+		RequestClass:       "digital_journal_article",
+		WorkIdentity:       "doi:10.1000/" + jobID,
+		GateProfileDigest:  "digest",
+	})
+	if err != nil {
+		t.Fatalf("create %s: %v", jobID, err)
+	}
+	if err := svc.UpdateState(ctx, created.ID, state); err != nil {
+		t.Fatalf("update state %s: %v", jobID, err)
+	}
+	var success, class any
+	if !lastSuccess.IsZero() {
+		success = lastSuccess.UTC().Format(time.RFC3339Nano)
+	}
+	if errorClass != "" {
+		class = errorClass
+	}
+	if _, err := svc.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET consecutive_poll_failures = ?, last_poll_error_class = ?,
+		    last_successful_poll_at = ?, submitted_at = ?
+		WHERE id = ?`,
+		failures, class, success, submittedAt.UTC().Format(time.RFC3339Nano), created.ID); err != nil {
+		t.Fatalf("seed poll health %s: %v", jobID, err)
+	}
+	return created.ID
+}
+
+// pollHealthByID indexes LivePollHealth's rows by request id, so a test
+// asserts per-row classification without depending on row order.
+func pollHealthByID(t *testing.T, svc *Service, profile string) map[int64]PollHealth {
+	t.Helper()
+	rows, err := svc.LivePollHealth(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("LivePollHealth: %v", err)
+	}
+	out := make(map[int64]PollHealth, len(rows))
+	for _, h := range rows {
+		if _, dup := out[h.RequestID]; dup {
+			t.Fatalf("LivePollHealth returned request %d twice", h.RequestID)
+		}
+		out[h.RequestID] = h
+	}
+	return out
+}
+
+func TestLivePollHealthFreshRowIsHealthyAndScoped(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	now := *clock
+	fresh := seedPollHealthRow(t, svc, "ph-fresh", "default", StateSubmitted, 0, "",
+		now.Add(-time.Minute), now.Add(-2*time.Hour))
+	// A settled row and another institution's row are not part of this
+	// profile's live poll loop; reporting either would put a request
+	// papio no longer polls into doctor's document_delivery section.
+	settled := seedPollHealthRow(t, svc, "ph-settled", "default", StateFulfilled, 9, "contract_drift",
+		time.Time{}, now.Add(-72*time.Hour))
+	foreign := seedPollHealthRow(t, svc, "ph-foreign", "campus", StateSubmitted, 9, "contract_drift",
+		time.Time{}, now.Add(-72*time.Hour))
+
+	byID := pollHealthByID(t, svc, "default")
+	if _, ok := byID[settled]; ok {
+		t.Fatalf("settled request %d reported as live poll health", settled)
+	}
+	if _, ok := byID[foreign]; ok {
+		t.Fatalf("request %d from another institution_profile reported", foreign)
+	}
+	if len(byID) != 1 {
+		t.Fatalf("LivePollHealth returned %d rows, want only the one live default-profile row", len(byID))
+	}
+	h, ok := byID[fresh]
+	if !ok {
+		t.Fatalf("live request %d missing from LivePollHealth", fresh)
+	}
+	if h.Degraded {
+		t.Fatalf("fresh row with 0 failures reported Degraded")
+	}
+	if h.Unobservable {
+		t.Fatalf("fresh row polled 1m ago reported Unobservable")
+	}
+	if h.Provider != "illiad" || h.State != StateSubmitted {
+		t.Fatalf("provider/state = %q/%q, want illiad/submitted", h.Provider, h.State)
+	}
+	if h.ConsecutivePollFailures != 0 || h.LastPollErrorClass != "" {
+		t.Fatalf("failures/class = %d/%q, want 0/empty", h.ConsecutivePollFailures, h.LastPollErrorClass)
+	}
+	if want := now.Add(-time.Minute).UTC().Format(time.RFC3339Nano); h.LastSuccessfulPollAt != want {
+		t.Fatalf("last_successful_poll_at = %q, want %q", h.LastSuccessfulPollAt, want)
+	}
+}
+
+// Degraded turns on at the third consecutive failure, not the second: one
+// off-by-one here either flags a poll loop that is merely retrying or
+// hides a loop that has stopped observing the provider.
+func TestLivePollHealthDegradedBoundaryAtThreeConsecutiveFailures(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	now := *clock
+	cases := []struct {
+		job      string
+		state    State
+		failures int
+		want     bool
+	}{
+		{"ph-deg-0", StateSubmitted, 0, false},
+		{"ph-deg-2", StateSubmitted, 2, false},
+		{"ph-deg-3", StatePending, 3, true},
+		{"ph-deg-4", StateSubmitted, 4, true},
+	}
+	ids := make(map[string]int64, len(cases))
+	for _, c := range cases {
+		class := ""
+		if c.failures > 0 {
+			class = "transport"
+		}
+		// Fresh last success on every row, so Degraded is the only
+		// classification under test here.
+		ids[c.job] = seedPollHealthRow(t, svc, c.job, "default", c.state, c.failures, class,
+			now.Add(-time.Minute), now.Add(-2*time.Hour))
+	}
+
+	byID := pollHealthByID(t, svc, "default")
+	if len(byID) != len(cases) {
+		t.Fatalf("LivePollHealth returned %d rows, want %d (submitted and pending are both live)", len(byID), len(cases))
+	}
+	for _, c := range cases {
+		h, ok := byID[ids[c.job]]
+		if !ok {
+			t.Fatalf("%s: request %d missing from LivePollHealth", c.job, ids[c.job])
+		}
+		if h.Degraded != c.want {
+			t.Fatalf("%s: %d consecutive failures -> Degraded = %v, want %v", c.job, c.failures, h.Degraded, c.want)
+		}
+		if h.Unobservable {
+			t.Fatalf("%s: fresh last success reported Unobservable", c.job)
+		}
+		if h.ConsecutivePollFailures != c.failures {
+			t.Fatalf("%s: failures = %d, want %d", c.job, h.ConsecutivePollFailures, c.failures)
+		}
+	}
+}
+
+// Unobservable is strictly more than 24h since the last success, so a row
+// polled exactly 24h ago is still observed.
+func TestLivePollHealthUnobservableBoundaryAtTwentyFourHours(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	now := *clock
+	cases := []struct {
+		job   string
+		since time.Duration
+		want  bool
+	}{
+		{"ph-obs-under", 24*time.Hour - time.Nanosecond, false},
+		{"ph-obs-exact", 24 * time.Hour, false},
+		{"ph-obs-over", 24*time.Hour + time.Nanosecond, true},
+		{"ph-obs-stale", 72 * time.Hour, true},
+	}
+	ids := make(map[string]int64, len(cases))
+	for _, c := range cases {
+		// submitted_at is deliberately ancient: last_successful_poll_at
+		// is the anchor whenever it is set.
+		ids[c.job] = seedPollHealthRow(t, svc, c.job, "default", StateSubmitted, 0, "",
+			now.Add(-c.since), now.Add(-30*24*time.Hour))
+	}
+
+	byID := pollHealthByID(t, svc, "default")
+	for _, c := range cases {
+		h, ok := byID[ids[c.job]]
+		if !ok {
+			t.Fatalf("%s: request %d missing from LivePollHealth", c.job, ids[c.job])
+		}
+		if h.Unobservable != c.want {
+			t.Fatalf("%s: last success %s ago -> Unobservable = %v, want %v", c.job, c.since, h.Unobservable, c.want)
+		}
+		if h.Degraded {
+			t.Fatalf("%s: 0 consecutive failures reported Degraded", c.job)
+		}
+	}
+}
+
+// Until the first successful poll there is no last_successful_poll_at, so
+// the 24h blind-spot window runs from submission instead. Without that
+// fallback a request submitted days ago and never once polled would look
+// perfectly healthy.
+func TestLivePollHealthUnobservableAnchorsOnSubmittedAtUntilFirstSuccess(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	now := *clock
+	underID := seedPollHealthRow(t, svc, "ph-sub-exact", "default", StateSubmitted, 0, "",
+		time.Time{}, now.Add(-24*time.Hour))
+	overID := seedPollHealthRow(t, svc, "ph-sub-over", "default", StateSubmitted, 0, "",
+		time.Time{}, now.Add(-24*time.Hour-time.Nanosecond))
+
+	byID := pollHealthByID(t, svc, "default")
+	under, ok := byID[underID]
+	if !ok {
+		t.Fatalf("request %d missing from LivePollHealth", underID)
+	}
+	if under.Unobservable {
+		t.Fatalf("never-polled row submitted exactly 24h ago reported Unobservable")
+	}
+	if under.LastSuccessfulPollAt != "" {
+		t.Fatalf("last_successful_poll_at = %q, want empty for a never-polled row", under.LastSuccessfulPollAt)
+	}
+	over, ok := byID[overID]
+	if !ok {
+		t.Fatalf("request %d missing from LivePollHealth", overID)
+	}
+	if !over.Unobservable {
+		t.Fatalf("never-polled row submitted more than 24h ago reported observable")
+	}
+}
+
+// A pending row that never reached submission has no anchor at all
+// (submitted_at and last_successful_poll_at are both NULL). papio has no
+// elapsed time to measure there, so it must not claim a blind spot.
+func TestLivePollHealthWithoutAnchorIsNotUnobservable(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	ctx := context.Background()
+	id := seedPollHealthRow(t, svc, "ph-no-anchor", "default", StatePending, 1, "transport",
+		time.Time{}, clock.Add(-30*24*time.Hour))
+	if _, err := svc.store.DB().ExecContext(ctx,
+		`UPDATE delivery_requests SET submitted_at = NULL WHERE id = ?`, id); err != nil {
+		t.Fatalf("clear submitted_at: %v", err)
+	}
+
+	h, ok := pollHealthByID(t, svc, "default")[id]
+	if !ok {
+		t.Fatalf("pending request %d missing from LivePollHealth", id)
+	}
+	if h.Unobservable {
+		t.Fatalf("row with no submitted_at and no successful poll reported Unobservable")
+	}
+	if h.Degraded {
+		t.Fatalf("1 consecutive failure reported Degraded")
+	}
+}

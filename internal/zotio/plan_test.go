@@ -86,77 +86,14 @@ func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage,
 	}
 }
 
+// readyPlanService is readyPlanServiceWork with this file's canonical
+// DOI-bearing fixture work, kept as one seam so the multi-step ready-job
+// setup exists once.
 func readyPlanService(t *testing.T, zotioKey string, cli CLI) (*Service, string) {
 	t.Helper()
-	ctx := context.Background()
-	dataDir := storetest.DataDir(t)
-	db, err := store.Open(ctx, dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	jobs := &job.Store{S: db}
-	artifacts, err := artifact.New(dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobID, err := jobs.CreateRequest(ctx, "request_plan_001", work.Work{
+	return readyPlanServiceWork(t, zotioKey, cli, work.Work{
 		DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
-	}, zotioKey, "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
-		JobID: jobID, Source: "unpaywall", URLRedacted: redact.URL("https://example.test/paper.pdf"), URLKey: "url-key",
-		LandingRedacted: "https://example.test/article", Version: "published", AccessBasis: "open_access",
-		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	candidate, err := jobs.NextPendingCandidate(ctx, jobID)
-	if err != nil || candidate == nil {
-		t.Fatalf("candidate = %+v, %v", candidate, err)
-	}
-	if err := jobs.MarkCandidate(ctx, candidate.ID, "accepted"); err != nil {
-		t.Fatal(err)
-	}
-	quarantine, err := artifacts.QuarantineDir(jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	temp := filepath.Join(quarantine, "paper.tmp")
-	body := []byte("%PDF-1.4\nfixture DOI 10.1002/example\n%%EOF")
-	if err := os.WriteFile(temp, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sha, _, err := artifact.HashFile(temp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	artifactPath, err := artifacts.Promote(temp, sha)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.UpsertArtifact(ctx, job.Artifact{
-		SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1,
-		TextChars: 1000, IdentityResult: "pass", Path: artifactPath,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateValidating}} {
-		if err := jobs.Transition(ctx, jobID, edge[0], edge[1], nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := jobs.Transition(ctx, jobID, job.StateValidating, job.StateReady, nil, job.WithCandidate(candidate.ID), job.WithArtifact(sha)); err != nil {
-		t.Fatal(err)
-	}
-	exporter := &bundle.Exporter{Jobs: jobs, Artifacts: artifacts, DataDir: dataDir}
-	return &Service{
-		CLI: cli, Bundle: exporter, Store: db, DataDir: dataDir,
-		Now: func() time.Time { return time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC) },
-	}, jobID
+	})
 }
 
 func TestExistingItemPlanApplyIsConfirmedAndIdempotent(t *testing.T) {

@@ -203,3 +203,249 @@ func itoa(n int64) string {
 	}
 	return s
 }
+
+// notificationColumn reads one column straight from the row so a test can
+// assert on state the ledger's own readers normalise away.
+func notificationColumn(t *testing.T, db *Store, id int64, column string) string {
+	t.Helper()
+	var value *string
+	if err := db.db.QueryRowContext(context.Background(),
+		`SELECT `+column+` FROM notification_intents WHERE id=?`, id).Scan(&value); err != nil {
+		t.Fatalf("reading %s of intent %d: %v", column, id, err)
+	}
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func notificationPhaseCount(t *testing.T, db *Store, aggregateKey, phase string) int {
+	t.Helper()
+	var count int
+	if err := db.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM notification_intents WHERE aggregate_key=? AND phase=?`,
+		aggregateKey, phase).Scan(&count); err != nil {
+		t.Fatalf("counting %s/%s rows: %v", aggregateKey, phase, err)
+	}
+	return count
+}
+
+func TestNotificationLedgerSupersedeCheckpointsRetiresOnlyLiveCheckpoints(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	seed := func(aggregateKey, phase, desktopState string, window time.Time) NotificationRecord {
+		t.Helper()
+		rec, err := ledger.Upsert(ctx, NotificationRecord{Category: "completion_batch", EventKind: "batch.progress", AggregateKey: aggregateKey, Phase: phase, WindowStart: window, FirstAt: window, LastAt: window, AvailableAt: window, Count: 1, DesktopState: desktopState, PayloadJSON: `{"count":1}`})
+		if err != nil {
+			t.Fatalf("seeding %s/%s: %v", aggregateKey, phase, err)
+		}
+		return rec
+	}
+	pending := seed("batch-1", "checkpoint", "pending", now)
+	held := seed("batch-1", "checkpoint", "held", now.Add(time.Minute))
+	reserved := seed("batch-1", "checkpoint", "reserved", now.Add(2*time.Minute))
+	final := seed("batch-1", "final", "pending", now)
+	otherBatch := seed("batch-2", "checkpoint", "pending", now)
+
+	superseded, err := ledger.SupersedeCheckpoints(ctx, "batch-1", now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if superseded != 2 {
+		t.Fatalf("superseded rows = %d, want 2 (the pending and held checkpoints)", superseded)
+	}
+	for _, want := range []struct {
+		name  string
+		id    int64
+		state string
+	}{
+		{"pending checkpoint", pending.ID, "superseded"},
+		{"held checkpoint", held.ID, "superseded"},
+		{"reserved checkpoint", reserved.ID, "reserved"},
+		{"final leg", final.ID, "pending"},
+		{"other batch checkpoint", otherBatch.ID, "pending"},
+	} {
+		if got := notificationColumn(t, db, want.id, "desktop_state"); got != want.state {
+			t.Errorf("%s desktop_state = %q, want %q", want.name, got, want.state)
+		}
+	}
+	rows, err := ledger.DueDesktop(ctx, now.Add(3*time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("due desktop rows after supersession = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if row.ID == pending.ID || row.ID == held.ID {
+			t.Errorf("superseded checkpoint %d is still due for the desktop", row.ID)
+		}
+	}
+}
+
+func TestNotificationLedgerSupersedeAndUpsertCheckpointIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	checkpoint, err := ledger.Upsert(ctx, NotificationRecord{Category: "completion_batch", EventKind: "batch.progress", AggregateKey: "batch-1", Phase: "checkpoint", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 3, PayloadJSON: `{"count":3}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalAt := now.Add(5 * time.Minute)
+	finalRec := NotificationRecord{Category: "completion_batch", EventKind: "batch.completed", AggregateKey: "batch-1", Phase: "final", WindowStart: finalAt, FirstAt: now, LastAt: finalAt, AvailableAt: finalAt, Count: 1, PayloadJSON: `{"count":7}`}
+
+	// A rejecting trigger is the only way to fail the insert leg after the
+	// supersession update has already run inside the transaction. That is
+	// exactly the window the single transaction exists to close: a batch whose
+	// checkpoint is cancelled without its replacement completion.
+	if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER notification_insert_fails BEFORE INSERT ON notification_intents
+		BEGIN SELECT RAISE(ABORT, 'insert leg rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.SupersedeAndUpsertCheckpoint(ctx, "batch-1", finalAt, finalRec); err == nil {
+		t.Fatal("SupersedeAndUpsertCheckpoint reported success while the insert leg was blocked")
+	}
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER notification_insert_fails`); err != nil {
+		t.Fatal(err)
+	}
+	if got := notificationColumn(t, db, checkpoint.ID, "desktop_state"); got != "pending" {
+		t.Fatalf("checkpoint desktop_state = %q after a failed finalisation, want %q: the batch completion is lost", got, "pending")
+	}
+	if got := notificationPhaseCount(t, db, "batch-1", "final"); got != 0 {
+		t.Fatalf("final rows after a failed finalisation = %d, want 0", got)
+	}
+
+	stored, err := ledger.SupersedeAndUpsertCheckpoint(ctx, "batch-1", finalAt, finalRec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ID == 0 || stored.Count != 1 || stored.PayloadJSON != `{"count":7}` {
+		t.Fatalf("stored final leg = %+v, want one row carrying the final payload", stored)
+	}
+	if got := notificationColumn(t, db, checkpoint.ID, "desktop_state"); got != "superseded" {
+		t.Fatalf("checkpoint desktop_state = %q after finalisation, want %q", got, "superseded")
+	}
+	rows, err := ledger.DueDesktop(ctx, finalAt, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != stored.ID {
+		t.Fatalf("due desktop rows = %+v, want only the final leg %d", rows, stored.ID)
+	}
+	latest, ok, err := ledger.LatestCheckpoint(ctx, "batch-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || latest.ID != checkpoint.ID || latest.DesktopState != "superseded" {
+		t.Fatalf("latest checkpoint = %+v (found=%v), want row %d superseded", latest, ok, checkpoint.ID)
+	}
+
+	// Re-finalising the same identity coalesces into the existing final row
+	// and replaces its payload rather than duplicating the completion.
+	replay := finalRec
+	replay.PayloadJSON = `{"count":9}`
+	again, err := ledger.SupersedeAndUpsertCheckpoint(ctx, "batch-1", now.Add(6*time.Minute), replay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != stored.ID {
+		t.Fatalf("re-finalisation created row %d, want the existing row %d", again.ID, stored.ID)
+	}
+	if again.Count != 2 || again.PayloadJSON != `{"count":9}` {
+		t.Fatalf("re-finalised leg = %+v, want count 2 and the replacement payload", again)
+	}
+	if got := notificationPhaseCount(t, db, "batch-1", "final"); got != 1 {
+		t.Fatalf("final rows after re-finalisation = %d, want 1", got)
+	}
+}
+
+func TestNotificationLedgerWebhookStateAndDesktopAvailabilityRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	row, err := ledger.Upsert(ctx, NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "batch-9", Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	due, err := ledger.DueWebhook(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != row.ID {
+		t.Fatalf("due webhook rows = %+v, want the pending leg %d", due, row.ID)
+	}
+	attemptedAt := now.Add(time.Minute)
+	if err := ledger.SetWebhookState(ctx, row.ID, "attempted", attemptedAt); err != nil {
+		t.Fatal(err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_state"); got != "attempted" {
+		t.Fatalf("webhook_state = %q, want %q", got, "attempted")
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_attempted_at"); got != formatNotificationTime(attemptedAt) {
+		t.Fatalf("webhook_attempted_at = %q, want %q", got, formatNotificationTime(attemptedAt))
+	}
+	due, err = ledger.DueWebhook(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("attempted leg is still due for webhook delivery: %+v", due)
+	}
+	if err := ledger.SetWebhookState(ctx, row.ID, "sent", now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_state"); got != "sent" {
+		t.Fatalf("webhook_state = %q, want %q", got, "sent")
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_attempted_at"); got != formatNotificationTime(attemptedAt) {
+		t.Fatalf("a non-attempt transition restamped webhook_attempted_at = %q, want %q", got, formatNotificationTime(attemptedAt))
+	}
+
+	// SetDesktopAvailable defers a held leg only; a pending leg keeps its slot.
+	deferred := now.Add(time.Hour)
+	if err := ledger.SetDesktopAvailable(ctx, row.ID, deferred); err != nil {
+		t.Fatal(err)
+	}
+	if got := notificationColumn(t, db, row.ID, "available_at"); got != formatNotificationTime(now) {
+		t.Fatalf("pending leg available_at = %q, want %q left untouched", got, formatNotificationTime(now))
+	}
+	if err := ledger.SetDesktopState(ctx, row.ID, "held", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.SetDesktopAvailable(ctx, row.ID, deferred); err != nil {
+		t.Fatal(err)
+	}
+	if got := notificationColumn(t, db, row.ID, "available_at"); got != formatNotificationTime(deferred) {
+		t.Fatalf("held leg available_at = %q, want %q", got, formatNotificationTime(deferred))
+	}
+	early, err := ledger.DueDesktop(ctx, now.Add(30*time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(early) != 0 {
+		t.Fatalf("deferred leg is due before its new availability: %+v", early)
+	}
+	released, err := ledger.DueDesktop(ctx, deferred, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(released) != 1 || released[0].ID != row.ID || released[0].DesktopState != "held" {
+		t.Fatalf("released desktop rows = %+v, want the held leg %d", released, row.ID)
+	}
+}

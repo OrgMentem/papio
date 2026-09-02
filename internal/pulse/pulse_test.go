@@ -5,10 +5,12 @@ package pulse
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"papio/internal/batch"
 	"papio/internal/job"
 	"papio/internal/store"
 	"papio/internal/store/storetest"
@@ -436,5 +438,301 @@ func TestPrimaryLabelUnknownIncompleteClaim(t *testing.T) {
 	snap := Snapshot{Schema: 1, GeneratedAt: "2026-08-12T12:00:00Z", ProjectionComplete: &incomplete, Continuing: &continuing}
 	if got := PrimaryLabel(snap); got != "Unknown" {
 		t.Fatalf("label = %q, want Unknown", got)
+	}
+}
+
+type pulseCohortMember struct{ key, jobID, outcome string }
+
+// insertPulseCohort seeds one acquisition batch exactly as the cohort tables
+// hold it. The projection reads those tables directly, and only raw rows can
+// express the two shapes under test here: a label longer than the wire bound,
+// and a settlement stamp chosen relative to a job outcome.
+func insertPulseCohort(t *testing.T, js *job.Store, id, label, membership string, created, updated time.Time, closed string, members []pulseCohortMember) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO acquisition_batches
+			(id, cohort_id, source_kind, source_label, expected_total, created_at, updated_at, closed_at, membership_state)
+		VALUES (?, ?, 'cli', ?, ?, ?, ?, NULLIF(?, ''), ?)`,
+		id, "cohort_"+id, label, len(members),
+		created.UTC().Format(time.RFC3339Nano), updated.UTC().Format(time.RFC3339Nano), closed, membership); err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range members {
+		if _, err := js.S.DB().ExecContext(ctx, `
+			INSERT INTO acquisition_batch_members
+				(batch_id, ordinal, canonical_key, job_id, submission_outcome, created_at)
+			VALUES (?, ?, ?, NULLIF(?, ''), ?, ?)`,
+			id, i, m.key, m.jobID, m.outcome, created.UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func pulseCohortJob(t *testing.T, js *job.Store, suffix string) string {
+	t.Helper()
+	id, err := js.CreateRequest(context.Background(), "wr_pulse_cohort_member_"+suffix, pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func wantBatchCount(t *testing.T, field string, got *int64, want int64) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("latest_batch.%s = nil, want %d", field, want)
+	}
+	if *got != want {
+		t.Fatalf("latest_batch.%s = %d, want %d", field, *got, want)
+	}
+}
+
+// TestReadLatestBatchCompleteProjectsCohortCounts pins the cohort denominator
+// the `papio pulse` and status surfaces print beside a batch. Every bucket
+// carries a distinct count, so a member filed under the wrong column fails
+// here even though the buckets still sum to nonterminal_total.
+func TestReadLatestBatchCompleteProjectsCohortCounts(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+	var members []pulseCohortMember
+	seed := func(bucket string, count int, prepare func(id string)) {
+		for i := range count {
+			id := pulseCohortJob(t, js, fmt.Sprintf("%s_%d", bucket, i))
+			prepare(id)
+			members = append(members, pulseCohortMember{
+				key: fmt.Sprintf("doi:10.1000/%s-%d", bucket, i), jobID: id, outcome: "submitted",
+			})
+		}
+	}
+	lease := func(id string, expires time.Time) {
+		if err := js.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.S.DB().ExecContext(ctx,
+			`UPDATE jobs SET lease_owner = 'worker-1', lease_expires_at = ? WHERE id = ?`,
+			expires.Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("inflight", 1, func(id string) { lease(id, now.Add(time.Minute)) })
+	seed("scheduled", 2, func(id string) {
+		if err := js.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.Transition(ctx, id, job.StateResolving, job.StateRetryWait, nil, job.WithRetryAt(now.Add(time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+	})
+	seed("continuing", 3, func(string) {})
+	seed("waiting", 4, func(id string) {
+		if _, err := js.S.DB().ExecContext(ctx, `UPDATE jobs SET state = 'awaiting_human' WHERE id = ?`, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.OpenHumanAction(ctx, id, "manual_download", "download", job.Access(false, "landing_page")); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// An expired lease is a wedged worker holding the job: stalled, never
+	// continuing.
+	seed("stalled", 5, func(id string) { lease(id, now.Add(-time.Minute)) })
+	// Six members were already owned, so the cohort settled them without ever
+	// creating a job and none of them is unavailable.
+	for i := range 6 {
+		members = append(members, pulseCohortMember{key: fmt.Sprintf("doi:10.1000/owned-%d", i), outcome: "already_owned"})
+	}
+
+	started := now.Add(-time.Hour)
+	insertPulseCohort(t, js, "batch_pulse_complete", "August sweep", "complete", started, now.Add(-time.Minute), "", members)
+
+	snap, err := (&Service{Jobs: js, Cohorts: batch.New(js.S), Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := snap.LatestBatch
+	if b == nil {
+		t.Fatal("latest_batch = nil, want the seeded cohort")
+	}
+	if b.BatchID != "batch_pulse_complete" || b.Label != "August sweep" || b.Membership != "complete" {
+		t.Fatalf("latest_batch identity = %+v", b)
+	}
+	if b.StartedAt != stamp(started) {
+		t.Fatalf("latest_batch.started_at = %q, want %q", b.StartedAt, stamp(started))
+	}
+	if b.ProjectionComplete == nil || !*b.ProjectionComplete {
+		t.Fatalf("latest_batch.projection_complete = %v, want true", b.ProjectionComplete)
+	}
+	if b.SettledAt != "" {
+		t.Fatalf("latest_batch.settled_at = %q, want empty while fifteen members are live", b.SettledAt)
+	}
+	wantBatchCount(t, "total", b.Total, 21)
+	wantBatchCount(t, "settled", b.Settled, 6)
+	wantBatchCount(t, "nonterminal_total", b.NonterminalTotal, 15)
+	wantBatchCount(t, "in_flight", b.InFlight, 1)
+	wantBatchCount(t, "scheduled", b.Scheduled, 2)
+	wantBatchCount(t, "continuing", b.Continuing, 3)
+	wantBatchCount(t, "waiting_required", b.WaitingRequired, 4)
+	wantBatchCount(t, "stalled", b.Stalled, 5)
+	wantBatchCount(t, "unavailable", b.Unavailable, 0)
+	if got := *b.InFlight + *b.Scheduled + *b.Continuing + *b.WaitingRequired + *b.Stalled; got != *b.NonterminalTotal {
+		t.Fatalf("cohort buckets sum to %d, want nonterminal_total %d", got, *b.NonterminalTotal)
+	}
+}
+
+// TestReadLatestBatchSettledAtAdvancesLastFinishedAt pins the precedence
+// between the two settlement authorities. A cohort that settled after the last
+// job transition moves last_finished_at forward; a cohort that settled earlier
+// must never drag it backwards.
+func TestReadLatestBatchSettledAtAdvancesLastFinishedAt(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	outside := pulseCohortJob(t, js, "outside")
+	if err := js.Transition(ctx, outside, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, outside, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	var raw string
+	if err := js.S.DB().QueryRowContext(ctx,
+		`SELECT MAX(at) FROM events WHERE kind = 'job.transition'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	finished, ok := parseTime(raw)
+	if !ok {
+		t.Fatalf("job transition stamp %q is unparseable", raw)
+	}
+
+	// Every member is already_owned, so the projection keeps the stored
+	// closed_at instead of deriving settlement from a terminal job event.
+	late := finished.Add(time.Hour)
+	insertPulseCohort(t, js, "batch_pulse_settled", "settled sweep", "complete",
+		finished.Add(-time.Hour), late, stamp(late), []pulseCohortMember{
+			{key: "doi:10.1000/owned-a", outcome: "already_owned"},
+			{key: "doi:10.1000/owned-b", outcome: "already_owned"},
+		})
+
+	now := late.Add(time.Minute)
+	svc := &Service{Jobs: js, Cohorts: batch.New(js.S), Now: func() time.Time { return now }}
+	snap, err := svc.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.LatestBatch == nil || snap.LatestBatch.SettledAt != stamp(late) {
+		t.Fatalf("latest_batch = %+v, want settled_at %q", snap.LatestBatch, stamp(late))
+	}
+	if snap.LastFinishedAt != stamp(late) {
+		t.Fatalf("last_finished_at = %q, want the later cohort settlement %q", snap.LastFinishedAt, stamp(late))
+	}
+
+	early := finished.Add(-time.Minute)
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE acquisition_batches SET closed_at = ? WHERE id = ?`, stamp(early), "batch_pulse_settled"); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = svc.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.LatestBatch == nil || snap.LatestBatch.SettledAt != stamp(early) {
+		t.Fatalf("latest_batch = %+v, want settled_at %q", snap.LatestBatch, stamp(early))
+	}
+	if snap.LastFinishedAt != stamp(finished) {
+		t.Fatalf("last_finished_at = %q, want the job authority %q", snap.LastFinishedAt, stamp(finished))
+	}
+}
+
+// TestReadLatestBatchPartialMembershipWithholdsCounts covers the cohort whose
+// membership never closed. Its members are individually projectable, so a
+// regression that counted them anyway would publish a denominator the cohort
+// cannot support.
+func TestReadLatestBatchPartialMembershipWithholdsCounts(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+
+	done := pulseCohortJob(t, js, "partial_ready")
+	if err := js.Transition(ctx, done, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.Transition(ctx, done, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	live := pulseCohortJob(t, js, "partial_queued")
+
+	// The cohort is still open, but its last chunk landed 20 minutes ago: the
+	// projection must give up on the denominator rather than wait forever.
+	insertPulseCohort(t, js, "batch_pulse_open", "interrupted sweep", "open",
+		now.Add(-time.Hour), now.Add(-20*time.Minute), "", []pulseCohortMember{
+			{key: "doi:10.1000/partial-ready", jobID: done, outcome: "submitted"},
+			{key: "doi:10.1000/partial-queued", jobID: live, outcome: "submitted"},
+		})
+
+	snap, err := (&Service{Jobs: js, Cohorts: batch.New(js.S), Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := snap.LatestBatch
+	if b == nil {
+		t.Fatal("latest_batch = nil, want the partial cohort named")
+	}
+	if b.BatchID != "batch_pulse_open" || b.Membership != "partial" {
+		t.Fatalf("latest_batch = %+v, want batch_pulse_open reported as partial", b)
+	}
+	if b.StartedAt != stamp(now.Add(-time.Hour)) {
+		t.Fatalf("latest_batch.started_at = %q, want %q", b.StartedAt, stamp(now.Add(-time.Hour)))
+	}
+	if b.ProjectionComplete == nil || *b.ProjectionComplete {
+		t.Fatalf("latest_batch.projection_complete = %v, want false", b.ProjectionComplete)
+	}
+	for field, got := range map[string]*int64{
+		"total": b.Total, "settled": b.Settled, "nonterminal_total": b.NonterminalTotal,
+		"in_flight": b.InFlight, "scheduled": b.Scheduled, "continuing": b.Continuing,
+		"waiting_required": b.WaitingRequired, "stalled": b.Stalled, "unavailable": b.Unavailable,
+	} {
+		if got != nil {
+			t.Fatalf("latest_batch.%s = %d, want omitted for partial membership", field, *got)
+		}
+	}
+	var membership string
+	if err := js.S.DB().QueryRowContext(ctx,
+		`SELECT membership_state FROM acquisition_batches WHERE id = ?`, "batch_pulse_open").Scan(&membership); err != nil {
+		t.Fatal(err)
+	}
+	if membership != "partial" {
+		t.Fatalf("stored membership_state = %q, want the durable partial verdict", membership)
+	}
+}
+
+// TestReadLatestBatchLabelTruncatesAtRuneBound holds the wire bound on a
+// caller-supplied cohort label. Byte-wise truncation would both halve the
+// visible label and risk splitting a multi-byte rune.
+func TestReadLatestBatchLabelTruncatesAtRuneBound(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	label := strings.Repeat("é", 300)
+	insertPulseCohort(t, js, "batch_pulse_label", label, "complete",
+		now.Add(-time.Hour), now.Add(-time.Minute), "", []pulseCohortMember{
+			{key: "doi:10.1000/label-owned", outcome: "already_owned"},
+		})
+	snap, err := (&Service{Jobs: js, Cohorts: batch.New(js.S), Now: func() time.Time { return now }}).Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.LatestBatch == nil {
+		t.Fatal("latest_batch = nil, want the seeded cohort")
+	}
+	got := snap.LatestBatch.Label
+	if runes := len([]rune(got)); runes != 256 {
+		t.Fatalf("label runes = %d, want 256", runes)
+	}
+	if len(got) != 512 {
+		t.Fatalf("label bytes = %d, want 512: truncation must count runes, not bytes", len(got))
+	}
+	if got != string([]rune(label)[:256]) {
+		t.Fatalf("label = %q, want the first 256 runes of the stored label", got)
 	}
 }

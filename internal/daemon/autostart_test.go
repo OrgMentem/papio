@@ -34,31 +34,48 @@ func isProcessGone(t *testing.T, cmd *exec.Cmd) bool {
 	return false
 }
 
-func TestAutostarterTerminatesOrphanOnReadinessTimeout(t *testing.T) {
+// autostarterFixture wires an Autostarter whose daemon command is a long-lived
+// child process, which is how these tests observe orphan termination. It
+// returns the starter and an accessor for the launched command; the accessor
+// reports nil until the command factory has run. The readiness predicate reads
+// that same command, so a test can make readiness depend on the child.
+//
+// The caller must never call cmd.Wait and must never read cmd.ProcessState
+// before the child is gone: the ready path (autostart.go:139) and
+// terminateOrphan each reap the child in their OWN goroutine, exec.Cmd.Wait may
+// be called exactly once, and racing the reaper is what the race detector
+// caught. Use isProcessGone, which asks the kernel instead.
+func autostarterFixture(t *testing.T, child []string, grace time.Duration, ready func(*exec.Cmd) error) (*Autostarter, func() *exec.Cmd) {
+	t.Helper()
 	dir := t.TempDir()
-	socket := filepath.Join(dir, "papio.sock")
 	var launched *exec.Cmd
 	starter := &Autostarter{
-		SocketPath:    socket,
+		SocketPath: filepath.Join(dir, "papio.sock"),
+		// Readiness never succeeds on the failure paths, so this deadline is
+		// what bounds those tests; the ready path passes on its first probe.
 		StartTimeout:  120 * time.Millisecond,
 		RetryInterval: 10 * time.Millisecond,
 		Executable:    func() (string, error) { return "/test/papio", nil },
-		Command: func(name string, args ...string) *exec.Cmd {
-			// Sleep is the long-lived helper that never creates the socket.
-			cmd := exec.Command("sleep", "30")
-			launched = cmd
-			return cmd
+		Command: func(string, ...string) *exec.Cmd {
+			launched = exec.Command(child[0], child[1:]...)
+			return launched
 		},
 		OpenNull: func() (*os.File, error) { return os.OpenFile(os.DevNull, os.O_RDWR, 0) },
-		OpenLog: func() (*os.File, error) {
-			f, err := os.CreateTemp(t.TempDir(), "daemon-*.log")
-			if err != nil {
-				return nil, err
-			}
-			return f, nil
-		},
-		Ready: func(context.Context, string) error { return errors.New("not ready") },
+		OpenLog:  func() (*os.File, error) { return os.CreateTemp(dir, "daemon-*.log") },
+		Ready:    func(context.Context, string) error { return ready(launched) },
 	}
+	// Zero keeps terminateOrphan's own 2s default.
+	starter.gracePeriod = grace
+	return starter, func() *exec.Cmd { return launched }
+}
+
+// neverReady is the readiness predicate of both orphan-termination tests: the
+// helper child never creates the socket.
+func neverReady(*exec.Cmd) error { return errors.New("not ready") }
+
+func TestAutostarterTerminatesOrphanOnReadinessTimeout(t *testing.T) {
+	// sleep is the long-lived helper that never creates the socket.
+	starter, command := autostarterFixture(t, []string{"sleep", "30"}, 0, neverReady)
 	start := time.Now()
 	result, err := starter.EnsureWithResult(context.Background())
 	elapsed := time.Since(start)
@@ -68,6 +85,7 @@ func TestAutostarterTerminatesOrphanOnReadinessTimeout(t *testing.T) {
 	if !result.Started {
 		t.Fatal("EnsureWithResult Started = false, want true (process was launched before readiness failed)")
 	}
+	launched := command()
 	if launched == nil || launched.Process == nil {
 		t.Fatal("no process was launched")
 	}
@@ -85,38 +103,17 @@ func TestAutostarterTerminatesOrphanOnReadinessTimeout(t *testing.T) {
 }
 
 func TestAutostarterEscalatesToHardKillWhenGracefulIgnored(t *testing.T) {
-	dir := t.TempDir()
-	socket := filepath.Join(dir, "papio.sock")
-	var launched *exec.Cmd
 	// sh with trap "" TERM makes the exec'd sleep inherit ignored SIGTERM,
 	// mirroring the macOS TCC hang where the daemon ignores SIGTERM mid-open.
-	starter := &Autostarter{
-		SocketPath:    socket,
-		StartTimeout:  80 * time.Millisecond,
-		RetryInterval: 10 * time.Millisecond,
-		Executable:    func() (string, error) { return "/test/papio", nil },
-		Command: func(name string, args ...string) *exec.Cmd {
-			cmd := exec.Command("sh", "-c", `trap "" TERM; exec sleep 30`)
-			launched = cmd
-			return cmd
-		},
-		OpenNull: func() (*os.File, error) { return os.OpenFile(os.DevNull, os.O_RDWR, 0) },
-		OpenLog: func() (*os.File, error) {
-			f, err := os.CreateTemp(t.TempDir(), "daemon-*.log")
-			if err != nil {
-				return nil, err
-			}
-			return f, nil
-		},
-		Ready: func(context.Context, string) error { return errors.New("not ready") },
-	}
-	starter.gracePeriod = 15 * time.Millisecond
+	child := []string{"sh", "-c", `trap "" TERM; exec sleep 30`}
+	starter, command := autostarterFixture(t, child, 15*time.Millisecond, neverReady)
 	start := time.Now()
 	_, err := starter.EnsureWithResult(context.Background())
 	elapsed := time.Since(start)
 	if err == nil || !strings.Contains(err.Error(), "wait for daemon socket") {
 		t.Fatalf("EnsureWithResult err = %v, want wait for daemon socket", err)
 	}
+	launched := command()
 	if launched == nil || launched.Process == nil {
 		t.Fatal("no process was launched")
 	}
@@ -133,34 +130,13 @@ func TestAutostarterEscalatesToHardKillWhenGracefulIgnored(t *testing.T) {
 }
 
 func TestAutostarterLeavesReadyDaemonRunning(t *testing.T) {
-	dir := t.TempDir()
-	socket := filepath.Join(dir, "papio.sock")
-	var launched *exec.Cmd
-	starter := &Autostarter{
-		SocketPath:    socket,
-		StartTimeout:  2 * time.Second,
-		RetryInterval: 5 * time.Millisecond,
-		Executable:    func() (string, error) { return "/test/papio", nil },
-		Command: func(name string, args ...string) *exec.Cmd {
-			cmd := exec.Command("sleep", "30")
-			launched = cmd
-			return cmd
-		},
-		OpenNull: func() (*os.File, error) { return os.OpenFile(os.DevNull, os.O_RDWR, 0) },
-		OpenLog: func() (*os.File, error) {
-			f, err := os.CreateTemp(t.TempDir(), "daemon-*.log")
-			if err != nil {
-				return nil, err
-			}
-			return f, nil
-		},
-		Ready: func(context.Context, string) error {
-			if launched == nil || launched.Process == nil {
-				return errors.New("not ready")
-			}
-			return nil
-		},
+	ready := func(cmd *exec.Cmd) error {
+		if cmd == nil || cmd.Process == nil {
+			return errors.New("not ready")
+		}
+		return nil
 	}
+	starter, command := autostarterFixture(t, []string{"sleep", "30"}, 0, ready)
 	result, err := starter.EnsureWithResult(context.Background())
 	if err != nil {
 		t.Fatalf("EnsureWithResult: %v", err)
@@ -168,6 +144,7 @@ func TestAutostarterLeavesReadyDaemonRunning(t *testing.T) {
 	if !result.Started {
 		t.Fatal("Started = false, want true")
 	}
+	launched := command()
 	if launched == nil || launched.Process == nil {
 		t.Fatal("no process was launched")
 	}
