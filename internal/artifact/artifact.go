@@ -45,10 +45,24 @@ func New(dataDir string) (*Store, error) {
 	return &Store{dataDir: dataDir}, nil
 }
 
+// validJobDir rejects every job id that would not name a fresh child directory
+// under quarantine/. Separators are the obvious case; the dot segments are the
+// dangerous one, because filepath.Join(dataDir, "quarantine", "..") collapses
+// to dataDir itself, and CleanQuarantine would then remove the entire data
+// directory — every published artifact and the database beside them. No
+// caller can reach that today (both pass ids minted by job.NewID), so this is
+// a guard against a future caller, not a live bug.
+func validJobDir(jobID string) error {
+	if jobID == "" || jobID == "." || jobID == ".." || strings.ContainsAny(jobID, "/\\") {
+		return fmt.Errorf("invalid job id %q", jobID)
+	}
+	return nil
+}
+
 // QuarantineDir returns (and creates) the per-job quarantine directory.
 func (s *Store) QuarantineDir(jobID string) (string, error) {
-	if strings.ContainsAny(jobID, "/\\") || jobID == "" {
-		return "", fmt.Errorf("invalid job id %q", jobID)
+	if err := validJobDir(jobID); err != nil {
+		return "", err
 	}
 	d := filepath.Join(s.dataDir, quarantineDir, jobID)
 	if err := os.MkdirAll(d, 0o700); err != nil {
@@ -59,8 +73,8 @@ func (s *Store) QuarantineDir(jobID string) (string, error) {
 
 // CleanQuarantine removes a job's quarantine directory.
 func (s *Store) CleanQuarantine(jobID string) error {
-	if strings.ContainsAny(jobID, "/\\") || jobID == "" {
-		return fmt.Errorf("invalid job id %q", jobID)
+	if err := validJobDir(jobID); err != nil {
+		return err
 	}
 	return os.RemoveAll(filepath.Join(s.dataDir, quarantineDir, jobID))
 }

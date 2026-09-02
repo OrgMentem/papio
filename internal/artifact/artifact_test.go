@@ -281,3 +281,87 @@ func TestConfineRegularFile(t *testing.T) {
 		t.Fatal("directory accepted")
 	}
 }
+
+// CleanQuarantine runs unattended on every terminal job transition
+// (internal/app/app.go, internal/job/job.go), so it is a destructive call that
+// nobody reviews per invocation. Its job-id guard is path-traversal protection
+// on that call, which is why the invalid cases assert what SURVIVED, not just
+// that an error came back.
+func TestCleanQuarantineRemovesOnlyTheNamedJobDirectory(t *testing.T) {
+	data := t.TempDir()
+	s, err := New(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := s.QuarantineDir("job_target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "download.tmp"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sibling, err := s.QuarantineDir("job_sibling")
+	if err != nil {
+		t.Fatal(err)
+	}
+	siblingFile := filepath.Join(sibling, "download.tmp")
+	if err := os.WriteFile(siblingFile, []byte("in flight"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A published artifact: the traversal target one directory up from any
+	// per-job quarantine directory, and immutable by contract.
+	body := []byte("%PDF-1.4 published")
+	temp := filepath.Join(sibling, "publish.tmp")
+	if err := os.WriteFile(temp, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := s.Promote(temp, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.CleanQuarantine("job_target"); err != nil {
+		t.Fatalf("clean quarantine: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("quarantine directory survived cleanup: stat err = %v", err)
+	}
+	if _, err := os.Stat(siblingFile); err != nil {
+		t.Fatalf("cleaning one job removed another job's quarantine file: %v", err)
+	}
+
+	// Idempotent: the terminal transition re-runs after crash recovery, and an
+	// absent directory is the expected steady state, not an error.
+	if err := s.CleanQuarantine("job_target"); err != nil {
+		t.Fatalf("second cleanup of the same job: %v", err)
+	}
+	if err := s.CleanQuarantine("job_never_existed"); err != nil {
+		t.Fatalf("cleanup of an absent job: %v", err)
+	}
+
+	// Invalid ids are refused before any removal happens. ".." is the one that
+	// matters most: filepath.Join collapses it to the data directory itself, so
+	// accepting it would turn one cleanup into os.RemoveAll(dataDir).
+	for _, bad := range []string{"", ".", "..", "..\\artifacts", "../artifacts", "job/../..", "job\\..\\..", "/", "\\"} {
+		if err := s.CleanQuarantine(bad); err == nil {
+			t.Fatalf("accepted invalid job id %q", bad)
+		}
+	}
+	for _, keep := range []string{
+		published,
+		filepath.Join(data, artifactsDir),
+		filepath.Join(data, quarantineDir),
+		sibling,
+		siblingFile,
+	} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Fatalf("an invalid job id removed %s: %v", keep, err)
+		}
+	}
+}
