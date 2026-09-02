@@ -21,15 +21,6 @@ func (f adapterRepairRunnerFunc) Run(ctx context.Context, root, path, provider s
 	return f(ctx, root, path, provider)
 }
 
-func TestRewrapAdapterFixtureHeader(t *testing.T) {
-	captured := time.Date(2026, 8, 10, 1, 2, 3, 4000000, time.UTC)
-	got := rewrapAdapterFixture("<!-- papio-fixture provider=\"old\" scenario=\"success\" origin=\"https://old.example/a?secret=1\" captured=\"2020-01-01T00:00:00Z\" -->\n<html><body>safe</body></html>", "jstor", "drift", "https://www.jstor.org/stable/abc?token=discard", captured)
-	wantHeader := "<!-- papio-fixture provider=\"jstor\" scenario=\"drift\" origin=\"https://www.jstor.org/stable/abc\" captured=\"2026-08-10T01:02:03.004Z\" -->"
-	if !strings.HasPrefix(got, wantHeader+"\n<html>") {
-		t.Fatalf("fixture = %q, want header %q and original body", got, wantHeader)
-	}
-}
-
 func TestParseAdapterVersionFromEmbeddedTypesSample(t *testing.T) {
 	source := `export const adapters = [
   { id: "other", version: "9.9.9", hosts: [] },

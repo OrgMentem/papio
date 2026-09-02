@@ -84,17 +84,13 @@ func normalizeText(value string) string {
 	return strings.TrimRight(b.String(), " ")
 }
 
-// score judges how well a title answers a query, returning a 0..1 score and the
-// kind explaining it. The kind is the useful half: it tells a reader *why* a row
-// ranked where it did, which a bare number cannot.
-func score(query, title string) (float64, string) {
-	normalizedQuery := normalizeText(query)
-	return scoreNormalized(normalizedQuery, strings.Fields(normalizedQuery), title)
-}
-
-// scoreNormalized is score with the query's normalization and tokenization
-// already done. rank judges every row against the same query, so it computes
-// those once and calls this directly instead of paying for them per row.
+// scoreNormalized judges how well a title answers a query, returning a 0..1
+// score and the kind explaining it. The kind is the useful half: it tells a
+// reader *why* a row ranked where it did, which a bare number cannot.
+//
+// The query arrives with its normalization and tokenization already done: rank
+// judges every row against the same query, so it computes those once and calls
+// this per row instead of repeating them.
 func scoreNormalized(normalizedQuery string, queryTokens []string, title string) (float64, string) {
 	normalizedTitle := normalizeText(title)
 	if normalizedQuery == "" || normalizedTitle == "" {

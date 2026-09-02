@@ -42,8 +42,11 @@ func TestParseBatchAcceptsBareAndDiscoveredWork(t *testing.T) {
 	if requests[1].Identifiers == nil || requests[1].Identifiers.ArXiv != "2601.12345v2" || requests[1].DesiredVersion != "any" {
 		t.Fatalf("enveloped request = %+v", requests[1])
 	}
-	if !strings.HasPrefix(requests[0].RequestID, "batch-") || requests[0].RequestID != batch.InitialRequestID(requests[0].Identifiers, requests[0].Title, requests[0].Authors, requests[0].Year) {
-		t.Fatalf("bare request ID = %q", requests[0].RequestID)
+	if requests[0].RequestID != "batch-96f16ac2250ffe5e559407598d50052f" {
+		t.Fatalf("bare request ID = %q, want the deterministic doi:10.1000/bare identity", requests[0].RequestID)
+	}
+	if requests[1].RequestID != "batch-9ba68b77e35f8b358b61ddd9642d7169" {
+		t.Fatalf("enveloped request ID = %q, want the deterministic arxiv:2601.12345v2 identity", requests[1].RequestID)
 	}
 }
 
@@ -81,12 +84,15 @@ func TestParseBatchInputRIS(t *testing.T) {
 	if len(requests) != 2 {
 		t.Fatalf("parsed %d requests, want 2", len(requests))
 	}
-	for i, wantDOI := range []string{"10.1000/first", "10.1000/second"} {
-		if requests[i].Identifiers == nil || requests[i].Identifiers.DOI != wantDOI {
-			t.Fatalf("request %d = %+v, want DOI %q", i, requests[i], wantDOI)
+	for i, want := range []struct{ doi, requestID string }{
+		{"10.1000/first", "batch-a6f248218485053db2e9c2c6772925f6"},
+		{"10.1000/second", "batch-3e2875a1e37f9b7ae3541436e0bae4b4"},
+	} {
+		if requests[i].Identifiers == nil || requests[i].Identifiers.DOI != want.doi {
+			t.Fatalf("request %d = %+v, want DOI %q", i, requests[i], want.doi)
 		}
-		if wantID := batch.InitialRequestID(requests[i].Identifiers, requests[i].Title, requests[i].Authors, requests[i].Year); requests[i].RequestID != wantID {
-			t.Fatalf("request %d ID = %q, want %q", i, requests[i].RequestID, wantID)
+		if requests[i].RequestID != want.requestID {
+			t.Fatalf("request %d ID = %q, want %q", i, requests[i].RequestID, want.requestID)
 		}
 	}
 }

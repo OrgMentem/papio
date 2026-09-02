@@ -197,12 +197,6 @@ func batchRequestID(ids *protocol.Identifiers, title string, authors []string, y
 	return fmt.Sprintf("batch-%x", sum[:batchIdentityHashBytes])
 }
 
-// InitialRequestID returns the pre-manifest deterministic request identity
-// used when parsing CLI or MCP batch input.
-func InitialRequestID(ids *protocol.Identifiers, title string, authors []string, year int) string {
-	return batchRequestID(ids, title, authors, year)
-}
-
 // ApplyOwnership assigns the batch collection, skips complete owned works by
 // default, and routes missing attachments through their existing Zotero parent.
 func ApplyOwnership(requests []protocol.WorkRequest, ownership zotio.LookupWorksResult, collection string, includeOwned bool) ([]protocol.WorkRequest, int, error) {

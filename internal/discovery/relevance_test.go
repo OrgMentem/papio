@@ -80,9 +80,10 @@ func TestScoreClassifiesTitleMatches(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, kind := score(tc.query, tc.title)
+			normalized := normalizeText(tc.query)
+			got, kind := scoreNormalized(normalized, strings.Fields(normalized), tc.title)
 			if kind != tc.wantKind {
-				t.Fatalf("score(%q, %q) kind = %q, want %q (score %.3f)", tc.query, tc.title, kind, tc.wantKind, got)
+				t.Fatalf("scoreNormalized(%q, %q) kind = %q, want %q (score %.3f)", tc.query, tc.title, kind, tc.wantKind, got)
 			}
 			if Confident(kind) != tc.confident {
 				t.Fatalf("Confident(%q) = %t, want %t", kind, Confident(kind), tc.confident)
@@ -101,9 +102,12 @@ func TestScoreClassifiesTitleMatches(t *testing.T) {
 // matches, so the closest answer to the query leads.
 func TestScoreOrdersMatchKindsByStrength(t *testing.T) {
 	const title = "My Advisor, Her AI, and Me: Doctoral Student Experiences"
-	exact, _ := score("my advisor her ai and me doctoral student experiences", title)
-	phrase, _ := score("My Advisor, Her AI, and Me", title)
-	tokens, _ := score("doctoral student experiences with my advisor and her ai", title)
+	exactQuery := normalizeText("my advisor her ai and me doctoral student experiences")
+	exact, _ := scoreNormalized(exactQuery, strings.Fields(exactQuery), title)
+	phraseQuery := normalizeText("My Advisor, Her AI, and Me")
+	phrase, _ := scoreNormalized(phraseQuery, strings.Fields(phraseQuery), title)
+	tokensQuery := normalizeText("doctoral student experiences with my advisor and her ai")
+	tokens, _ := scoreNormalized(tokensQuery, strings.Fields(tokensQuery), title)
 	if !(exact > phrase && phrase > tokens) {
 		t.Fatalf("expected exact > phrase > tokens, got %.3f, %.3f, %.3f", exact, phrase, tokens)
 	}
@@ -112,8 +116,10 @@ func TestScoreOrdersMatchKindsByStrength(t *testing.T) {
 // A longer query covering more of the title is the better match of the two.
 func TestPhraseScoreRewardsCoverage(t *testing.T) {
 	const title = "My Advisor, Her AI, and Me: Doctoral Student Experiences"
-	broad, _ := score("My Advisor, Her AI, and Me: Doctoral Student", title)
-	narrow, _ := score("My Advisor, Her AI", title)
+	broadQuery := normalizeText("My Advisor, Her AI, and Me: Doctoral Student")
+	broad, _ := scoreNormalized(broadQuery, strings.Fields(broadQuery), title)
+	narrowQuery := normalizeText("My Advisor, Her AI")
+	narrow, _ := scoreNormalized(narrowQuery, strings.Fields(narrowQuery), title)
 	if broad <= narrow {
 		t.Fatalf("broader phrase scored %.3f, want more than the narrower %.3f", broad, narrow)
 	}
@@ -124,12 +130,14 @@ func TestPhraseScoreRewardsCoverage(t *testing.T) {
 // sharing every word (overlap 1.0) against the weakest possible phrase match.
 func TestTokenScoresStayBelowEveryPhraseMatch(t *testing.T) {
 	// Same token set, different order, so containment cannot fire.
-	maxTokens, kind := score("collaboration ai human in asymmetries trust", "Trust asymmetries in human AI collaboration")
+	rewordedQuery := normalizeText("collaboration ai human in asymmetries trust")
+	maxTokens, kind := scoreNormalized(rewordedQuery, strings.Fields(rewordedQuery), "Trust asymmetries in human AI collaboration")
 	if kind != MatchTitleTokens {
 		t.Fatalf("kind = %q, want %q for a full-overlap rewording", kind, MatchTitleTokens)
 	}
 	// A phrase match covering almost none of a very long title.
-	weakestPhrase, phraseKind := score("trust asymmetries in", "Trust asymmetries in "+strings.Repeat("very long tail ", 40))
+	shortQuery := normalizeText("trust asymmetries in")
+	weakestPhrase, phraseKind := scoreNormalized(shortQuery, strings.Fields(shortQuery), "Trust asymmetries in "+strings.Repeat("very long tail ", 40))
 	if phraseKind != MatchTitlePhrase {
 		t.Fatalf("kind = %q, want %q", phraseKind, MatchTitlePhrase)
 	}
@@ -181,21 +189,22 @@ func TestScorePhraseContainmentRequiresWholeWords(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, kind := score(tc.query, tc.title)
+			normalized := normalizeText(tc.query)
+			got, kind := scoreNormalized(normalized, strings.Fields(normalized), tc.title)
 			if tc.wantPhrase {
 				if kind != MatchTitlePhrase {
-					t.Fatalf("score(%q, %q) kind = %q, want %q (score %.3f)", tc.query, tc.title, kind, MatchTitlePhrase, got)
+					t.Fatalf("scoreNormalized(%q, %q) kind = %q, want %q (score %.3f)", tc.query, tc.title, kind, MatchTitlePhrase, got)
 				}
 				if !Confident(kind) {
-					t.Fatalf("score(%q, %q) kind %q, want Confident", tc.query, tc.title, kind)
+					t.Fatalf("scoreNormalized(%q, %q) kind %q, want Confident", tc.query, tc.title, kind)
 				}
 				return
 			}
 			if kind == MatchTitlePhrase {
-				t.Fatalf("score(%q, %q) = %.3f, %q — matched as a phrase with no whole-word containment", tc.query, tc.title, got, kind)
+				t.Fatalf("scoreNormalized(%q, %q) = %.3f, %q — matched as a phrase with no whole-word containment", tc.query, tc.title, got, kind)
 			}
 			if Confident(kind) {
-				t.Fatalf("score(%q, %q) kind %q reported Confident, want false", tc.query, tc.title, kind)
+				t.Fatalf("scoreNormalized(%q, %q) kind %q reported Confident, want false", tc.query, tc.title, kind)
 			}
 		})
 	}
@@ -233,9 +242,10 @@ func TestScoreConfidentOverlapBoundary(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, kind := score(query, tc.title)
+			normalized := normalizeText(query)
+			got, kind := scoreNormalized(normalized, strings.Fields(normalized), tc.title)
 			if kind != tc.wantKind {
-				t.Fatalf("score(%q, %q) kind = %q, want %q", query, tc.title, kind, tc.wantKind)
+				t.Fatalf("scoreNormalized(%q, %q) kind = %q, want %q", query, tc.title, kind, tc.wantKind)
 			}
 			wantConfident := tc.wantKind == MatchTitleTokens
 			if Confident(kind) != wantConfident {

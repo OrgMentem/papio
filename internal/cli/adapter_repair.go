@@ -409,17 +409,6 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	}
 	return adapterRepairResult{Workspace: workspace, Fixture: fixturePath, Report: reportPath, NextRevision: nextRevision, IndependentEvidence: capture.IndependentEvidence}, nil
 }
-func rewrapAdapterFixture(raw, provider, scenario, origin string, captured time.Time) string {
-	body := raw
-	if first, rest, ok := strings.Cut(raw, "\n"); ok && adapterFixtureHeaderRE.MatchString(strings.TrimSuffix(first, "\r")) {
-		body = rest
-	}
-	if captured.IsZero() {
-		captured = time.Now().UTC()
-	}
-	header := fmt.Sprintf("<!-- papio-fixture provider=\"%s\" scenario=\"%s\" origin=\"%s\" captured=\"%s\" -->", provider, scenario, normalizeRepairOrigin(origin, "provider.example"), captured.UTC().Format(time.RFC3339Nano))
-	return header + "\n" + body
-}
 
 func parseAdapterVersion(source, provider string) (string, error) {
 	pattern := regexp.MustCompile(`(?ms)\bid:\s*"` + regexp.QuoteMeta(provider) + `"\s*,.*?\bversion:\s*"([^"]+)"`)
