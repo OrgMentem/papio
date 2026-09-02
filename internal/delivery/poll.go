@@ -337,8 +337,7 @@ func (s *Service) handleNotFound(ctx context.Context, req *Request, now time.Tim
 			return s.recordPollFailure(ctx, req, now, deps, PollErrorClassTransient)
 		}
 		if matched != nil {
-			req.ProviderReference = strconv.Itoa(matched.TransactionNumber)
-			applied, err := s.persistProviderReference(ctx, req)
+			applied, err := s.persistProviderReference(ctx, req, strconv.Itoa(matched.TransactionNumber))
 			if err != nil {
 				return PollResult{}, err
 			}
@@ -443,16 +442,24 @@ func defaultJitter(interval time.Duration) time.Duration {
 }
 
 // persistPollSuccess compare-and-swaps the row: the UPDATE only applies
-// WHERE state/next_check_at still match what this call originally read
-// (req.State/req.NextCheckAt, captured before any write). Two workers
-// joined on the same live request each read their own snapshot before
-// either wrote — the first commit wins, the second's WHERE clause no
-// longer matches and RowsAffected is 0, reported back as applied=false.
+// WHERE state/next_check_at/provider_reference still match what this call
+// originally read (captured before any write). Two workers joined on the
+// same live request each read their own snapshot before either wrote — the
+// first commit wins, the second's WHERE clause no longer matches and
+// RowsAffected is 0, reported back as applied=false.
 // events append inside the same transaction as the CAS'd UPDATE, so a
 // lost race can never leave a duplicate (or orphaned) event behind.
+//
+// provider_reference is part of that snapshot because it names the very
+// transaction this poll asked about. The 404 reconciliation path rekeys it
+// WITHOUT touching state or next_check_at, so a predicate over those two
+// fields alone still matches after a rekey: a stale worker would then write
+// transaction 555's status, terminal state, and settlement event onto a row
+// that now names transaction 999.
 func (s *Service) persistPollSuccess(ctx context.Context, req *Request, now time.Time, raw, display string, nextCheckAt time.Time, newState State, events []pendingEvent) (bool, error) {
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
+	origRef := req.ProviderReference
 	nowStr := now.UTC().Format(time.RFC3339Nano)
 	var nextCheckVal any
 	if !nextCheckAt.IsZero() {
@@ -474,9 +481,9 @@ func (s *Service) persistPollSuccess(ctx context.Context, req *Request, now time
 		SET state = ?, provider_status_raw = ?, provider_display_status = ?,
 		    last_poll_at = ?, last_successful_poll_at = ?, consecutive_poll_failures = 0,
 		    last_poll_error_class = NULL, next_check_at = ?, updated_at = ?
-		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ? AND provider_reference = ?`,
 		string(state), raw, display, nowStr, nowStr, nextCheckVal, nowStr,
-		req.ID, string(origState), origNextCheckAt)
+		req.ID, string(origState), origNextCheckAt, origRef)
 	if err != nil {
 		return false, err
 	}
@@ -517,13 +524,14 @@ func (s *Service) persistPollSuccess(ctx context.Context, req *Request, now time
 func (s *Service) persistPollFailure(ctx context.Context, req *Request, now time.Time, class string, failures int, nextCheck time.Time) (bool, error) {
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
+	origRef := req.ProviderReference
 	nowStr := now.UTC().Format(time.RFC3339Nano)
 	nextStr := nextCheck.UTC().Format(time.RFC3339Nano)
 	res, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET last_poll_at = ?, consecutive_poll_failures = ?, last_poll_error_class = ?, next_check_at = ?, updated_at = ?
-		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
-		nowStr, failures, class, nextStr, nowStr, req.ID, string(origState), origNextCheckAt)
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ? AND provider_reference = ?`,
+		nowStr, failures, class, nextStr, nowStr, req.ID, string(origState), origNextCheckAt, origRef)
 	if err != nil {
 		return false, err
 	}
@@ -549,6 +557,7 @@ func (s *Service) persistPollFailure(ctx context.Context, req *Request, now time
 func (s *Service) persistUnknownOutcome(ctx context.Context, req *Request, now time.Time) (PollResult, error) {
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
+	origRef := req.ProviderReference
 	nowStr := now.UTC().Format(time.RFC3339Nano)
 
 	tx, err := s.store.DB().BeginTx(ctx, nil)
@@ -560,8 +569,8 @@ func (s *Service) persistUnknownOutcome(ctx context.Context, req *Request, now t
 	res, err := tx.ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET state = ?, last_poll_at = ?, consecutive_poll_failures = 0, last_poll_error_class = NULL, next_check_at = NULL, updated_at = ?
-		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
-		string(StateUnknownOutcome), nowStr, nowStr, req.ID, string(origState), origNextCheckAt)
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ? AND provider_reference = ?`,
+		string(StateUnknownOutcome), nowStr, nowStr, req.ID, string(origState), origNextCheckAt, origRef)
 	if err != nil {
 		return PollResult{}, err
 	}
@@ -598,14 +607,20 @@ func (s *Service) persistUnknownOutcome(ctx context.Context, req *Request, now t
 // snapshot this call read, so the caller must not proceed to
 // recordPollSuccess against a reference that no longer belongs to this
 // row's current, already-changed state.
-func (s *Service) persistProviderReference(ctx context.Context, req *Request) (bool, error) {
+//
+// The CAS is over the OLD reference, and req is mutated only after the
+// write applies. Two reconciling workers that each found a different
+// replacement transaction therefore cannot both believe they rekeyed the
+// row, and a caller never carries a reference the durable row rejected.
+func (s *Service) persistProviderReference(ctx context.Context, req *Request, newRef string) (bool, error) {
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
+	origRef := req.ProviderReference
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	res, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests SET provider_reference = ?, updated_at = ?
-		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ?`,
-		req.ProviderReference, now, req.ID, string(origState), origNextCheckAt)
+		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ? AND provider_reference = ?`,
+		newRef, now, req.ID, string(origState), origNextCheckAt, origRef)
 	if err != nil {
 		return false, err
 	}
@@ -613,7 +628,11 @@ func (s *Service) persistProviderReference(ctx context.Context, req *Request) (b
 	if err != nil {
 		return false, err
 	}
-	return n > 0, nil
+	if n == 0 {
+		return false, nil
+	}
+	req.ProviderReference = newRef
+	return true, nil
 }
 
 // appendEventTx is store.AppendEvent's insert, scoped to an in-flight

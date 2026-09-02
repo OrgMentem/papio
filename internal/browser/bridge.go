@@ -5107,7 +5107,18 @@ func (b *Bridge) acknowledgeRetraction(ctx context.Context, request *protocol.Tr
 	}
 }
 
+// triageDismissScope resolves the extension's watch_scope into the exact set of
+// watch digests a dismissal may consume. It mirrors the API/CLI half in
+// internal/api/triage.go: an absent scope, a bare string other than "all", an
+// empty list, more than 100 IDs, a non-positive ID, an ID the hit does not own,
+// a duplicate ID, and trailing JSON after the list are all refused, and a
+// refusal consumes nothing. The wire shape differs - the IPC half answers
+// invalid_argument, this half answers a structured "error" outcome - but the
+// decision must not, or a scope the CLI rejects silently clears digests here.
 func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]bool, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("watch_scope is required for dismiss")
+	}
 	var all string
 	if err := json.Unmarshal(raw, &all); err == nil {
 		if all != "all" {
@@ -5119,19 +5130,20 @@ func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]
 		}
 		return selected, nil
 	}
+	// Unmarshal, not Decoder.Decode: it refuses trailing bytes after the list
+	// instead of silently accepting a truncated-then-garbage payload.
 	var ids []int64
-	if err := json.Unmarshal(raw, &ids); err != nil {
-		return nil, errors.New("watch_scope must be all or watch IDs")
+	if err := json.Unmarshal(raw, &ids); err != nil || len(ids) == 0 || len(ids) > 100 {
+		return nil, errors.New("watch_scope must be all or 1 to 100 watch IDs")
 	}
 	available, selected := make(map[int64]bool, len(watches)), make(map[int64]bool, len(ids))
 	for _, watched := range watches {
 		available[watched.ID] = true
 	}
 	for _, id := range ids {
-		if !available[id] || selected[id] {
+		if id <= 0 || !available[id] || selected[id] {
 			return nil, errors.New("watch_scope contains an invalid watch ID")
 		}
-
 		selected[id] = true
 	}
 	return selected, nil
@@ -5315,20 +5327,11 @@ func (b *Bridge) deliveryConfirmRequestExists(ctx context.Context, request *prot
 	// Human action closed LAST via RepairAwaitingHumanTx.
 	db := b.svc.Delivery.DB()
 	if db == nil {
-		// Fallback to ordered apply if DB accessor unavailable.
-		if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StatePending); err != nil {
-			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-		}
-		if err := b.svc.Delivery.RecordPoll(ctx, row.ID, request.ProviderReference, next); err != nil {
-			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-		}
-		if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID}, map[string]any{"reason": "document_delivery_confirmed_exists"}); err != nil {
-			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-		}
-		if err := b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateRetryWait, map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": request.ProviderReference}, job.WithRetryAt(next)); err != nil {
-			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-		}
-		return b.deliveryReconcileResult(request.RequestID, "applied", "")
+		// This used to fall back to an ordered, non-atomic apply. Refuse
+		// instead: a reconciliation verdict that is only partly durable is
+		// worse than one that did not run, and the fallback was a second
+		// copy of this operation that no test exercised.
+		return b.deliveryReconcileResult(request.RequestID, "error", "delivery store is unavailable")
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -5371,11 +5374,17 @@ func (b *Bridge) deliveryConfirmRequestExists(ctx context.Context, request *prot
 // order. If Submit fails after Repair, re-open a reconciliation action so the
 // operator never loses the affordance — a cancelled row is a documented
 // recoverable state.
+//
+// Cancel and Repair share ONE tx, mirroring internal/api and this file's own
+// exists sibling. Committing the cancellation separately made a losing
+// verdict destructive: a confirm-exists arriving from the CLI between this
+// handler's read and its write closes the action, this Repair then fails, and
+// nothing rolled the cancellation back — the winner's confirmed live provider
+// request was left locally cancelled. Repair doubles as the staleness guard,
+// because it refuses an already-closed action and takes the cancellation down
+// with it.
 func (b *Bridge) deliveryConfirmRequestAbsent(ctx context.Context, request *protocol.DeliveryReconcilePayload, action *job.HumanAction, row *delivery.Request) ([]json.RawMessage, error) {
-	if err := b.svc.Delivery.UpdateState(ctx, row.ID, delivery.StateCancelled); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	if err := b.jobs.RepairAwaitingHuman(ctx, request.JobID, []int64{action.ID}, map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
+	if err := b.cancelAndCloseReconciliation(ctx, request.JobID, action.ID, row.ID); err != nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
 	if _, err := b.svc.SubmitDelivery(ctx, request.JobID); err != nil {
@@ -5402,6 +5411,38 @@ func (b *Bridge) deliveryConfirmRequestAbsent(ctx context.Context, request *prot
 		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
 	return b.deliveryReconcileResult(request.RequestID, "applied", "")
+}
+
+// cancelAndCloseReconciliation commits the confirm-absent verdict's two
+// durable effects together: the stale delivery row becomes cancelled and the
+// open document_delivery action closes as an awaiting_human->resolving
+// repair. Either both land or neither does, so a concurrent confirm-exists
+// that already closed the action cannot be left with its confirmed live
+// request cancelled underneath it.
+func (b *Bridge) cancelAndCloseReconciliation(ctx context.Context, jobID string, actionID, rowID int64) error {
+	repairJSON, err := marshalJobDetail(map[string]any{"reason": "document_delivery_confirmed_absent"})
+	if err != nil {
+		return err
+	}
+	db := b.svc.Delivery.DB()
+	if db == nil {
+		// Same refusal as the exists sibling: without a transaction this
+		// verdict cannot be applied atomically, and half of it is worse than
+		// none of it.
+		return errors.New("delivery store is unavailable")
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := b.svc.Delivery.UpdateStateTx(ctx, tx, rowID, delivery.StateCancelled); err != nil {
+		return err
+	}
+	if err := b.jobs.RepairAwaitingHumanTx(ctx, tx, jobID, []int64{actionID}, repairJSON, bridgeNow()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func marshalJobDetail(detail map[string]any) (string, error) {

@@ -241,6 +241,31 @@ func deliveryCancel(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	if _, err := system.Jobs.Get(ctx, jobID); err != nil {
 		return failure(err)
 	}
+	// Two passes at most. Cancellation is a decision made from a read, and
+	// the row can move under it: submitToProvider sends the irreversible
+	// provider request while the row is still offered and only then records
+	// submitted, so an unconditional write here could report a cancellation
+	// the institution never received. The CAS makes the loser re-read and
+	// answer for the state the row actually reached.
+	for range 2 {
+		row, err := svc.GetByJobID(ctx, jobID)
+		if err != nil {
+			return failure(err)
+		}
+		if row == nil {
+			return nil, &ipc.RPCError{Code: "not_found", Message: "no delivery request for this job"}
+		}
+		if row.State != delivery.StateOffered && row.State != delivery.StateDeclined {
+			return marshal(deliveryNotCancellable(jobID, row))
+		}
+		applied, err := svc.UpdateStateFrom(ctx, row.ID, row.State, delivery.StateCancelled)
+		if err != nil {
+			return failure(err)
+		}
+		if applied {
+			return marshal(DeliveryCancelResult{JobID: jobID, Supported: true, Cancelled: true, State: string(delivery.StateCancelled)})
+		}
+	}
 	row, err := svc.GetByJobID(ctx, jobID)
 	if err != nil {
 		return failure(err)
@@ -248,26 +273,31 @@ func deliveryCancel(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	if row == nil {
 		return nil, &ipc.RPCError{Code: "not_found", Message: "no delivery request for this job"}
 	}
+	return marshal(DeliveryCancelResult{
+		JobID: jobID, Supported: true, Cancelled: false, State: string(row.State),
+		Reason: "this request changed state while the cancellation was being applied; re-read it and try again",
+	})
+}
+
+// deliveryNotCancellable names why a row in a non-offered state cannot be
+// cancelled locally. Split out so the CAS loop can answer for a state it
+// discovered on its second read, not only for the state it first saw.
+func deliveryNotCancellable(jobID string, row *delivery.Request) DeliveryCancelResult {
 	switch row.State {
-	case delivery.StateOffered, delivery.StateDeclined:
-		if err := svc.UpdateState(ctx, row.ID, delivery.StateCancelled); err != nil {
-			return failure(err)
-		}
-		return marshal(DeliveryCancelResult{JobID: jobID, Supported: true, Cancelled: true, State: string(delivery.StateCancelled)})
 	case delivery.StateCancelled:
-		return marshal(DeliveryCancelResult{JobID: jobID, Supported: true, Cancelled: true, State: string(row.State), Reason: "already cancelled"})
+		return DeliveryCancelResult{JobID: jobID, Supported: true, Cancelled: true, State: string(row.State), Reason: "already cancelled"}
 	case delivery.StateFulfilled:
-		return marshal(DeliveryCancelResult{JobID: jobID, Supported: false, Cancelled: false, State: string(row.State), Reason: "already fulfilled; nothing to cancel"})
+		return DeliveryCancelResult{JobID: jobID, Supported: false, Cancelled: false, State: string(row.State), Reason: "already fulfilled; nothing to cancel"}
 	case delivery.StateUnknownOutcome:
-		return marshal(DeliveryCancelResult{
+		return DeliveryCancelResult{
 			JobID: jobID, Supported: false, Cancelled: false, State: string(row.State),
 			Reason: "reconciliation is open on this request; use 'papio delivery confirm-absent' once you have checked with the provider",
-		})
+		}
 	default: // StateSubmitted, StatePending: a live provider transaction exists.
-		return marshal(DeliveryCancelResult{
+		return DeliveryCancelResult{
 			JobID: jobID, Supported: false, Cancelled: false, State: string(row.State),
 			Reason: fmt.Sprintf("no configured provider (%s) supports API cancellation of a live request in this version; cancel directly with the institution", row.Provider),
-		})
+		}
 	}
 }
 
@@ -466,11 +496,32 @@ func deliveryConfirmRequestAbsent(ctx context.Context, system *bootstrap.System,
 	//   fails after Repair, we compensate by re-opening a reconciliation
 	//   action so the operator never loses the affordance (row cancelled is a
 	//   documented recoverable state).
-	if err := svc.UpdateState(ctx, row.ID, delivery.StateCancelled); err != nil {
+	//
+	// Cancel and Repair share ONE tx, like the exists sibling. Committing the
+	// cancellation on its own made a losing verdict destructive: a
+	// confirm-exists that had already closed the action and moved the job to
+	// retry_wait would make this Repair fail, but the row was cancelled by
+	// then and nothing rolled it back — the winner's confirmed live provider
+	// request ended up locally cancelled. Repair is also the staleness guard:
+	// it refuses a closed action, which rolls the cancellation back with it.
+	// SubmitDelivery stays outside, after the commit; it is the seam that
+	// would need a Tx-variant to move inside.
+	tx, err := system.Store.DB().BeginTx(ctx, nil)
+	if err != nil {
 		return failure(err)
 	}
-	if err := system.Jobs.RepairAwaitingHuman(ctx, jobID, []int64{action.ID},
-		map[string]any{"reason": "document_delivery_confirmed_absent"}); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	if err := svc.UpdateStateTx(ctx, tx, row.ID, delivery.StateCancelled); err != nil {
+		return failure(err)
+	}
+	repairJSON, err := json.Marshal(map[string]any{"reason": "document_delivery_confirmed_absent"})
+	if err != nil {
+		return failure(err)
+	}
+	if err := system.Jobs.RepairAwaitingHumanTx(ctx, tx, jobID, []int64{action.ID}, string(repairJSON), store.Now()); err != nil {
+		return failure(err)
+	}
+	if err := tx.Commit(); err != nil {
 		return failure(err)
 	}
 	_, submitErr := system.App.SubmitDelivery(ctx, jobID)

@@ -339,9 +339,18 @@ func (s *Service) ListRecoverableAfter(ctx context.Context, afterID int64, limit
 	return out, nil
 }
 
-// UpdateState transitions a row's state. Entering StateSubmitted stamps
-// submitted_at the first time only (COALESCE), so a later re-observation of
-// the same live request never resets the cap-counting anchor.
+// UpdateState transitions a row's state unconditionally. Entering
+// StateSubmitted stamps submitted_at the first time only (COALESCE), so a
+// later re-observation of the same live request never resets the
+// cap-counting anchor.
+//
+// It is UNCONDITIONAL: the UPDATE is keyed by id alone. That makes it wrong
+// for any transition decided from a prior read, because the row can move
+// between the read and this write — a `papio delivery cancel` that read
+// `offered` could overwrite the `submitted` state a concurrent
+// submitToProvider had just committed for a live provider transaction. Use
+// UpdateStateFrom for those. TestProductionUsesExpectedStateTransitions
+// keeps production callers off this method.
 func (s *Service) UpdateState(ctx context.Context, id int64, state State) error {
 	if !validState(state) {
 		return fmt.Errorf("delivery: invalid state %q", state)
@@ -356,6 +365,45 @@ func (s *Service) UpdateState(ctx context.Context, id int64, state State) error 
 	}
 	_, err := s.store.DB().ExecContext(ctx, `UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ?`, string(state), now, id)
 	return err
+}
+
+// UpdateStateFrom is UpdateState's compare-and-swap form: the UPDATE applies
+// only while the row still holds `from`. applied=false means the row moved
+// after the caller read it, and the caller MUST re-read and re-decide rather
+// than assume its transition happened.
+//
+// This is the only safe transition for a decision made from an earlier read.
+// The provider submission path is the reason: submitToProvider sends the
+// irreversible provider request while the row is still `offered`, and only
+// then CAS-records `submitted`. An unconditional cancel landing in that
+// window reports success to the operator while the institution continues
+// fulfilling a request papio has locally marked cancelled.
+func (s *Service) UpdateStateFrom(ctx context.Context, id int64, from, to State) (bool, error) {
+	if !validState(to) {
+		return false, fmt.Errorf("delivery: invalid state %q", to)
+	}
+	if !validState(from) {
+		return false, fmt.Errorf("delivery: invalid expected state %q", from)
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	query := `UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ? AND state = ?`
+	args := []any{string(to), now, id, string(from)}
+	if to == StateSubmitted {
+		query = `
+			UPDATE delivery_requests
+			SET state = ?, updated_at = ?, submitted_at = COALESCE(submitted_at, ?)
+			WHERE id = ? AND state = ?`
+		args = []any{string(to), now, now, id, string(from)}
+	}
+	res, err := s.store.DB().ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // UpdateStateTx and RecordPollTx are transaction-threaded variants that let
