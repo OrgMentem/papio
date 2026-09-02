@@ -1,0 +1,13 @@
+# Accepted findings for `betterleaks git .` (see .github/workflows/ci.yml `secrets`).
+# betterleaks 1.8.0 split generic credential detection into `generic-password`
+# and `generic-credential-uri`, which match three placeholder values in test
+# fixtures. Each fixture exists to prove papio redacts credentials, so the
+# literal placeholder is the point of the test and must stay in history.
+# Do not quote those placeholders here — this file is scanned too.
+#
+# Institutional-gate detail redaction test.
+9ef3b4fce70c7523f7a66311842d8a330248759e:internal/job/institutional_gates_test.go:generic-password:249
+# Popup URL redaction test.
+197924d76b97a2c846470bba1b3c84f812376ca0:extension/test/popup.test.ts:generic-credential-uri:2202
+# Protocol fixture: a route carrying credentials must be rejected.
+21e58b29620504396eafea21373eb5c6b6daa34e:testdata/protocol/invalid/acquisition-bundle-v2-route-with-credentials.json:generic-credential-uri:17
