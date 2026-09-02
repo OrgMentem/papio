@@ -25,7 +25,7 @@ bun run build          # emits Chrome dist/ AND Firefox firefox/ (both targets)
 bun run dev            # web-ext hot-reload loop into Firefox Developer Edition
 
 # Docs (Python — neither brew nor bun can install the SSG)
-uv tool install zensical==0.0.51   # once; version is pinned in docs/requirements.txt
+uv tool install "zensical==$(sed -n 's/^zensical==//p' docs/requirements.txt)"   # once; that file is the pin, and Renovate bumps it
 zensical build                     # what CI runs; "No issues found" = clean
 zensical serve -a localhost:8042   # local preview; :8000 is often already taken
 go run ./cmd/docs-gen              # regenerates docs/reference/* — never hand-edit those
