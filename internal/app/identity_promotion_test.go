@@ -125,7 +125,7 @@ func TestCrossCandidateIdentifierConflictRejected(t *testing.T) {
 }
 
 func TestUnattestedAnchorSkipsDOICache(t *testing.T) {
-	svc, jobs := newTestService(t)
+	_, jobs := newTestService(t)
 	ctx := context.Background()
 	const doi = "10.1000/cache-test"
 	first, err := jobs.CreateRequest(ctx, "wr_cache_first", work.Work{DOI: doi, Title: "Cached"}, "", "", testPolicy(), nil, job.PrincipalCLI)
@@ -176,9 +176,9 @@ func TestUnattestedAnchorSkipsDOICache(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cached == nil {
+		// The cache row must exist, otherwise the refusal above is vacuous:
+		// AnchorAllowsDOICache would be the only thing standing between
+		// Process and a fast path that had nothing to reuse anyway.
 		t.Fatal("fixture cache row missing")
-	}
-	if cached != nil && svc.Artifacts.Verify(cached.SHA256) == nil && anchor.AnchorAllowsDOICache(doi) {
-		t.Fatal("Process would have taken the DOI cache fast path")
 	}
 }

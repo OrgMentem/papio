@@ -202,8 +202,12 @@ func TestZoteroFileStorageRefusedDatesTheQuotaReading(t *testing.T) {
 		"ok": false, "error": map[string]any{"http_status": 413, "message": "File would exceed quota (300.4 > 300)"},
 	})
 	// A newer refusal that is NOT a quota failure: the operator is still being
-	// refused, for a different reason.
-	seedFailedZotioApply(t, ctx, db, "job_other_new", time.Now().UTC().Add(-1*time.Hour).Format(time.RFC3339Nano), map[string]any{
+	// refused, for a different reason. Bind the instant once: deriving the seed
+	// and the expected date from two separate time.Now() calls fails for the
+	// first hour of every UTC day, when the seeded event lands on the previous
+	// date.
+	recent := time.Now().UTC().Add(-1 * time.Hour)
+	seedFailedZotioApply(t, ctx, db, "job_other_new", recent.Format(time.RFC3339Nano), map[string]any{
 		"ok": false, "error": map[string]any{"http_status": 413},
 	})
 
@@ -217,7 +221,7 @@ func TestZoteroFileStorageRefusedDatesTheQuotaReading(t *testing.T) {
 	if !strings.Contains(got.Detail, "1 of them was refused for another reason") {
 		t.Fatalf("detail = %q, want the non-quota refusals distinguished", got.Detail)
 	}
-	if !strings.Contains(got.Detail, "last "+time.Now().UTC().Format("2006-01-02")) {
+	if !strings.Contains(got.Detail, "last "+recent.Format("2006-01-02")) {
 		t.Fatalf("detail = %q, want the newest refusal dated", got.Detail)
 	}
 }

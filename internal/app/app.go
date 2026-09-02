@@ -613,6 +613,7 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 		cands, err := entry.Adapter.Resolve(anonymousIfFallback(ctx, entry.Policy, chosen), row.Work)
 		if err != nil {
 			if ctx.Err() != nil {
+				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 				return nil, plan, ctx.Err()
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
@@ -1203,9 +1204,9 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 			if err != nil {
 				if ctx.Err() != nil {
 					if valid > 0 {
-						_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("typed_sibling_candidates=%d", valid))
+						s.settleCancelledAttempt(ctx, attempt, "success", fmt.Sprintf("typed_sibling_candidates=%d", valid))
 					} else {
-						_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(ctx.Err()))
+						s.settleCancelledAttempt(ctx, attempt, "failed", safeType(ctx.Err()))
 					}
 					return all, plan
 				}
@@ -1374,6 +1375,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 		plan.SourcesCalled++
 		if err != nil {
 			if ctx.Err() != nil {
+				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 				return plan, ctx.Err()
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
@@ -1467,6 +1469,24 @@ func (s *Service) recoverOABrowserHint(ctx context.Context, jobID string, live m
 		}
 	}
 	return ""
+}
+
+// settleCancelledAttempt closes a durable attempt row whose work was
+// interrupted by context cancellation. FinishAttempt performs its UPDATE
+// through ExecContext, which database/sql refuses outright for a cancelled
+// context, so the write MUST run on a context derived with
+// context.WithoutCancel. Passing the cancelled context instead is silently
+// lossy: the attempt keeps ended_at/outcome NULL forever, an orderly daemon
+// shutdown therefore looks like unfinished work, and openalexyield's
+// FreeReport counts every such row as LostToFinishAttempt
+// (internal/openalexyield/measure.go:216-225).
+func (s *Service) settleCancelledAttempt(ctx context.Context, attempt int64, outcome, detail string) {
+	if attempt == 0 {
+		return
+	}
+	if err := s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, outcome, 0, detail); err != nil {
+		log.Printf("papio: settling cancelled attempt %d: %v", attempt, err)
+	}
 }
 
 func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) error {
@@ -1657,7 +1677,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		result, err := s.Fetch(ctx, candidate, temp)
 		if err != nil {
 			if ctx.Err() != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "cancelled", 0, "context_cancelled")
+				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 				return ctx.Err()
 			}
 			_ = os.Remove(temp)
@@ -3121,7 +3141,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	report, validateErr := s.Validate(ctx, result.TempPath, result.ContentType, validationTarget(anchor, row))
 	if validateErr != nil {
 		if ctx.Err() != nil {
-			_ = s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "cancelled", 0, "context_cancelled")
+			s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 			_ = os.Remove(result.TempPath)
 			return false, false, ctx.Err()
 		}

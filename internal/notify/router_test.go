@@ -290,13 +290,17 @@ func TestQuietReleaseHandlesDSTGapAndOverlap(t *testing.T) {
 		t.Fatal(err)
 	}
 	router.policy.QuietHours = fallQuiet
+	// Both fall-back 01:30 instants share a wall clock, so an hour/minute
+	// assertion cannot tell them apart. Compare absolute instants.
 	firstOccurrence := time.Date(2026, 11, 1, 1, 15, 0, 0, loc)
-	if got := router.nextQuietRelease(firstOccurrence).In(loc); got.Hour() != 1 || got.Minute() != 30 {
-		t.Fatalf("fall first release = %s, want first 01:30", got)
+	wantFirst := time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)
+	if got := router.nextQuietRelease(firstOccurrence); !got.Equal(wantFirst) {
+		t.Fatalf("fall first release = %s, want first 01:30 EDT (%s)", got.UTC(), wantFirst)
 	}
 	secondOccurrence := time.Unix(time.Date(2026, 11, 1, 6, 15, 0, 0, time.UTC).Unix(), 0).In(loc)
-	if got := router.nextQuietRelease(secondOccurrence).In(loc); got.Day() != 2 {
-		t.Fatalf("fall repeated release = %s, want next local day", got)
+	wantSecond := time.Date(2026, 11, 2, 6, 30, 0, 0, time.UTC)
+	if got := router.nextQuietRelease(secondOccurrence); !got.Equal(wantSecond) {
+		t.Fatalf("fall repeated release = %s, want next local day 01:30 EST (%s)", got.UTC(), wantSecond)
 	}
 }
 
