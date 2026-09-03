@@ -1,17 +1,16 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Declarative adapter tests: the pure `interpret` classifier (rule precedence,
-// every PageKind, the ≥60% wrong-work title-token check, static-only evidence),
-// the skip-when-missing fixture harness, and the background verdict mapping
-// (permission gate, unknown debounce, single-download latch, hello versions).
+// Declarative adapter tests: the production planner `planExecution` (rule
+// precedence, every PageKind, the ≥60% wrong-work title-token check,
+// static-only evidence), the skip-when-missing fixture harness, and the
+// background verdict mapping (permission gate, unknown debounce,
+// single-download latch, hello versions).
 
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import {
   adapters,
-  interpret,
   providerViewerPDFURL,
-  type AdapterContext,
   type AdapterSpec,
   type DownloadRule,
   type PageVerdict,
@@ -29,7 +28,14 @@ import {
   type DownloadItemLike,
   type NativePort,
 } from "../src/background";
-import { fixtureExists, fixturePath, loadFixture, parseHTML } from "./harness";
+import {
+  classifyFixture,
+  fixtureExists,
+  fixturePath,
+  loadFixture,
+  parseHTML,
+  verdictOf,
+} from "./harness";
 import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { Window } from "happy-dom";
 
@@ -55,10 +61,6 @@ const SPEC: AdapterSpec = {
 };
 
 const EXPECTED_TITLE = "Trust in Automation: Designing for Appropriate Reliance";
-
-function ctx(title?: string): AdapterContext {
-  return { expected: title === undefined ? {} : { title } };
-}
 
 function fixtureScenarioForRule(kind: AdapterSpec["classify"][number]["kind"]): string {
   switch (kind) {
@@ -87,7 +89,7 @@ function expectFixtureBackedRules(
   }
 }
 
-// --- Contract 1/2: interpret --------------------------------------------------
+// --- Contract 1/2: planExecution ---------------------------------------------
 
 test("every registered adapter is fixture-backed, versioned, and host-scoped", () => {
   for (const spec of adapters) {
@@ -143,7 +145,7 @@ test("only ScienceDirect opts out of the minimized work window", () => {
   }
 });
 
-test("interpret waits for late-upgraded custom elements when settleTimeoutMs is set", async () => {
+test("planExecution waits for late-upgraded custom elements when settleTimeoutMs is set", async () => {
   // JSTOR's tracked tab fires `complete` post-SSO before its `mfe-*` custom
   // elements upgrade. The live (doc === null) path must observe the DOM until
   // the download button appears, not classify once and give up.
@@ -171,12 +173,12 @@ test("interpret waits for late-upgraded custom elements when settleTimeoutMs is 
       ...(jstor as AdapterSpec),
       settleTimeoutMs: 200,
     };
-    const verdict = interpret(null, liveJSTOR, ctx());
+    const pending = planExecution(null, liveJSTOR, {}, {});
     win.document.body.insertAdjacentHTML(
       "beforeend",
       "<mfe-download-pharos-button data-qa=\"download-pdf\" data-doi=\"10.2307/259290\" data-sc=\"but click:pdf download\" variant=\"primary\"></mfe-download-pharos-button>",
     );
-    expect((await verdict).kind).toBe("article");
+    expect(verdictOf(await pending).kind).toBe("article");
   } finally {
     Object.assign(globalThis, prev);
   }
@@ -190,7 +192,7 @@ test("a rule with no conditions never matches (no blanket fallback)", () => {
     classify: [{ kind: "article" }], // empty conditions
   };
   const doc = parseHTML("<html><body><a class='download-pdf'>x</a></body></html>");
-  expect(interpret(doc, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(doc, spec).kind).toBe("unknown");
 });
 
 test("first matching rule wins: login precedes article on an ambiguous page", () => {
@@ -198,7 +200,7 @@ test("first matching rule wins: login precedes article on an ambiguous page", ()
     `<html><body><form id="login-form"><input name="password"></form>` +
       `<a class="download-pdf">PDF</a></body></html>`,
   );
-  const v = interpret(doc, SPEC, ctx(EXPECTED_TITLE));
+  const v = classifyFixture(doc, SPEC, { title: EXPECTED_TITLE });
   expect(v.kind).toBe("login");
   expect(v.evidence).toEqual(["rule:login matched"]);
 });
@@ -214,7 +216,7 @@ test("each PageKind is reachable from its own fixture", () => {
   ];
   for (const c of cases) {
     const doc = parseHTML(`<html><body>${c.html}</body></html>`);
-    expect(interpret(doc, SPEC, ctx(EXPECTED_TITLE)).kind).toBe(c.kind);
+    expect(classifyFixture(doc, SPEC, { title: EXPECTED_TITLE }).kind).toBe(c.kind);
   }
 });
 
@@ -225,8 +227,8 @@ test("any[] matches on at least one selector; all[] needs every selector", () =>
     hosts: ["h"],
     classify: [{ kind: "login", any: ["#a", "#b"] }],
   };
-  expect(interpret(parseHTML(`<html><body><i id="b"></i></body></html>`), anySpec, ctx()).kind).toBe("login");
-  expect(interpret(parseHTML(`<html><body><i id="c"></i></body></html>`), anySpec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(parseHTML(`<html><body><i id="b"></i></body></html>`), anySpec).kind).toBe("login");
+  expect(classifyFixture(parseHTML(`<html><body><i id="c"></i></body></html>`), anySpec).kind).toBe("unknown");
 
   const allSpec: AdapterSpec = {
     id: "a",
@@ -234,9 +236,9 @@ test("any[] matches on at least one selector; all[] needs every selector", () =>
     hosts: ["h"],
     classify: [{ kind: "login", all: ["#a", "#b"] }],
   };
-  expect(interpret(parseHTML(`<html><body><i id="a"></i></body></html>`), allSpec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(parseHTML(`<html><body><i id="a"></i></body></html>`), allSpec).kind).toBe("unknown");
   expect(
-    interpret(parseHTML(`<html><body><i id="a"></i><i id="b"></i></body></html>`), allSpec, ctx()).kind,
+    classifyFixture(parseHTML(`<html><body><i id="a"></i><i id="b"></i></body></html>`), allSpec).kind,
   ).toBe("login");
 });
 
@@ -246,7 +248,7 @@ test("wrong-work: matching title tokens keep article; mismatch downgrades to wro
     `<html><head><title>Trust in Automation: Designing for Appropriate Reliance</title></head>` +
       `<body><h1>Trust in Automation</h1><a class="download-pdf">PDF</a></body></html>`,
   );
-  const gv = interpret(good, SPEC, ctx(EXPECTED_TITLE));
+  const gv = classifyFixture(good, SPEC, { title: EXPECTED_TITLE });
   expect(gv.kind).toBe("article");
   expect(gv.evidence).toContain("title-token-check passed");
 
@@ -256,7 +258,7 @@ test("wrong-work: matching title tokens keep article; mismatch downgrades to wro
       `<body><h1>Collective Rationalization in Small Groups</h1>` +
       `<a class="download-pdf">PDF</a></body></html>`,
   );
-  const bv = interpret(bad, SPEC, ctx(EXPECTED_TITLE));
+  const bv = classifyFixture(bad, SPEC, { title: EXPECTED_TITLE });
   expect(bv.kind).toBe("wrong_work");
   expect(bv.evidence).toContain("title-token-check failed");
 });
@@ -266,12 +268,12 @@ test("wrong-work check uses citation_title meta as a title source", () => {
     `<html><head><meta name="citation_title" content="Trust in Automation: Designing for Appropriate Reliance"></head>` +
       `<body><h1>Untitled viewer</h1><a class="download-pdf">PDF</a></body></html>`,
   );
-  expect(interpret(doc, SPEC, ctx(EXPECTED_TITLE)).kind).toBe("article");
+  expect(classifyFixture(doc, SPEC, { title: EXPECTED_TITLE }).kind).toBe("article");
 });
 
 test("no expected title present: article is accepted without a token check", () => {
   const doc = parseHTML(`<html><body><h1>Anything</h1><a class="download-pdf">PDF</a></body></html>`);
-  const v = interpret(doc, SPEC, ctx());
+  const v = classifyFixture(doc, SPEC);
   expect(v.kind).toBe("article");
   expect(v.evidence).toEqual(["rule:article matched"]);
 });
@@ -282,7 +284,7 @@ test("evidence carries only static rule labels — never page text", () => {
     `<html><head><title>${secret}</title></head><body><h1>${secret}</h1>` +
       `<p>${secret} more prose ${secret}</p><a class="download-pdf">${secret}</a></body></html>`,
   );
-  const v = interpret(doc, SPEC, ctx("something entirely different"));
+  const v = classifyFixture(doc, SPEC, { title: "something entirely different" });
   const allowed = /^(rule:[a-z_]+ matched|title-token-check (passed|failed)|no rule matched)$/;
   for (const e of v.evidence) expect(e).toMatch(allowed);
   expect(JSON.stringify(v.evidence).includes(secret)).toBe(false);
@@ -299,7 +301,7 @@ test("harness reports a missing fixture as absent and loads it as null", () => {
 // Real capture lands later; this must SKIP (not fail) while absent.
 const liveArticle = loadFixture("proquest", "article");
 test.skipIf(liveArticle === null)("captured proquest article fixture classifies as article", () => {
-  expect(interpret(liveArticle as Document, SPEC, ctx(EXPECTED_TITLE)).kind).toBe("article");
+  expect(classifyFixture(liveArticle as Document, SPEC, { title: EXPECTED_TITLE }).kind).toBe("article");
 });
 
 // JSTOR renders the same primary Download control on the stable/ viewer AND
@@ -323,7 +325,7 @@ test.skipIf(jstorArticle === null)(
   () => {
     const article = jstorArticle as Document;
     const spec = adapters.find((a) => a.id === "jstor") as AdapterSpec;
-    const verdict = interpret(article, spec, ctx());
+    const verdict = classifyFixture(article, spec);
     expect(verdict.kind).toBe("article");
     expect(article.querySelector("#pdf-viewer .page[data-page-number]")).not.toBeNull();
 
@@ -342,7 +344,7 @@ test.skipIf(jstorRecord === null)(
   () => {
     const record = jstorRecord as Document;
     const spec = adapters.find((a) => a.id === "jstor") as AdapterSpec;
-    const verdict = interpret(record, spec, ctx());
+    const verdict = classifyFixture(record, spec);
     expect(verdict.kind).toBe("article");
     const rule = spec.download as DownloadRule;
     // The record page's own control is the entitlement evidence the url
@@ -369,7 +371,7 @@ test.skipIf(informitArticle === null)(
     expect(fixtureExists("informit", "success")).toBe(true);
     const article = informitArticle as Document;
     const spec = adapters.find((a) => a.id === "informit") as AdapterSpec;
-    const verdict = interpret(article, spec, ctx());
+    const verdict = classifyFixture(article, spec);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("informit");
     expect(article.querySelector("[data-doi='10.3316/informit.TOKEN']")).not.toBeNull();
@@ -395,7 +397,7 @@ test.skipIf(informitTerms === null)(
     expect(fixtureExists("informit", "terms")).toBe(true);
     const terms = informitTerms as Document;
     const spec = adapters.find((a) => a.id === "informit") as AdapterSpec;
-    const verdict = interpret(terms, spec, ctx());
+    const verdict = classifyFixture(terms, spec);
     expect(verdict.kind).toBe("terms");
     expect(verdict.adapter_id).toBe("informit");
     expect(terms.querySelector("form.saml__consent__form")).not.toBeNull();
@@ -414,7 +416,7 @@ test.skipIf(informitArticle === null)(
   "captured Informit article does not classify as terms",
   () => {
     const spec = adapters.find((a) => a.id === "informit") as AdapterSpec;
-    expect(interpret(informitArticle as Document, spec, ctx()).kind).not.toBe("terms");
+    expect(classifyFixture(informitArticle as Document, spec).kind).not.toBe("terms");
   },
 );
 
@@ -426,7 +428,7 @@ test.skipIf(wileyArticle === null)(
   "captured wiley article fixture classifies as article via the citation metas",
   () => {
     const spec = adapters.find((a) => a.id === "wiley") as AdapterSpec;
-    const verdict = interpret(wileyArticle as Document, spec, ctx());
+    const verdict = classifyFixture(wileyArticle as Document, spec);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("wiley");
   },
@@ -435,7 +437,7 @@ test.skipIf(wileyArticle === null)(
 test("wiley stays unknown on a page lacking the citation_pdf_url/title metas", () => {
   const spec = adapters.find((a) => a.id === "wiley") as AdapterSpec;
   const page = parseHTML("<!doctype html><html><head><title>Journal home</title></head><body><h1>Psychology &amp; Marketing</h1></body></html>");
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 test("wiley download builds the /doi/pdfdirect endpoint from the DOI in the page URL", () => {
@@ -470,7 +472,7 @@ test.skipIf(cochraneArticle === null)(
   "captured Cochrane review classifies through its full-review PDF affordance",
   () => {
     const spec = adapters.find((a) => a.id === "cochrane") as AdapterSpec;
-    const verdict = interpret(cochraneArticle as Document, spec, ctx());
+    const verdict = classifyFixture(cochraneArticle as Document, spec);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("cochrane");
   },
@@ -484,7 +486,7 @@ test.skipIf(cochraneViewer === null)(
   "captured Cochrane PDF viewer wrapper stays assisted",
   () => {
     const spec = adapters.find((a) => a.id === "cochrane") as AdapterSpec;
-    expect(interpret(cochraneViewer as Document, spec, ctx()).kind).toBe(
+    expect(classifyFixture(cochraneViewer as Document, spec).kind).toBe(
       "unknown",
     );
   },
@@ -498,7 +500,7 @@ test("cochrane stays unknown when only the abstract PDF link is offered", () => 
       "<meta name='citation_pdf_url' content='https://www.cochranelibrary.com/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/full'>" +
       "</head><body><a class='download media pdf-link-abstract pdf-link' href='/cdsr/doi/10.1002/14651858.CD013850.pub2/pdf/abstract/en'>PDF</a></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 test("cochrane download builds the nested review file from the page URL", () => {
@@ -547,7 +549,7 @@ test.skipIf(sageArticle === null)(
   "captured sage article classifies via PDF/EPUB marker and derives its direct PDF URL",
   async () => {
     const spec = adapters.find((a) => a.id === "sage") as AdapterSpec;
-    const verdict = interpret(sageArticle as Document, spec, ctx());
+    const verdict = classifyFixture(sageArticle as Document, spec);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("sage");
 
@@ -733,7 +735,7 @@ test("sage stays unknown when its PDF/EPUB marker is absent", () => {
   const page = parseHTML(
     "<!doctype html><html><head><meta name='publication_doi' content='10.1177/0018720814547570'></head><body><a class='btn btn--pdf' href='/doi/reader/10.1177/0018720814547570'>View PDF/EPUB</a></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const halArticle = loadFixture("hal", "success");
@@ -741,7 +743,7 @@ test.skipIf(halArticle === null)(
   "captured HAL record classifies as article through citation_pdf_url",
   () => {
     const spec = adapters.find((a) => a.id === "hal") as AdapterSpec;
-    const verdict = interpret(halArticle as Document, spec, ctx("Deep learning"));
+    const verdict = classifyFixture(halArticle as Document, spec, { title: "Deep learning" });
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("hal");
     expect(spec.download?.method).toBe("meta");
@@ -754,7 +756,7 @@ test("HAL records without a deposited document stay unknown", () => {
     "<html><head><meta name='citation_title' content='Metadata-only record'>" +
       "<meta name='citation_doi' content='10.1000/no-file'></head></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const exLibrisPrimoNoEntitlement = loadFixture("exlibris-primo", "no-entitlement");
@@ -762,7 +764,7 @@ test.skipIf(exLibrisPrimoNoEntitlement === null)(
   "captured Ex Libris Alma resolver with no full text classifies as no entitlement",
   () => {
     const spec = adapters.find((a) => a.id === "exlibris-primo") as AdapterSpec;
-    const verdict = interpret(exLibrisPrimoNoEntitlement as Document, spec, ctx());
+    const verdict = classifyFixture(exLibrisPrimoNoEntitlement as Document, spec);
     expect(verdict.kind).toBe("no_entitlement");
     expect(verdict.adapter_id).toBe("exlibris-primo");
   },
@@ -775,7 +777,7 @@ test("Alma resolver boilerplate terms footer without the no-full-text marker sta
       "<c id='showAllLine'>0 - 0 of 0</c><h1>Additional services</h1>" +
       "<a>By continuing, you agree to our access Terms and Policies</a></form></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const natureArticle = loadFixture("nature", "success");
@@ -783,7 +785,7 @@ test.skipIf(natureArticle === null)(
   "captured Nature OA article classifies on access metadata and its PDF control",
   () => {
     const spec = adapters.find((a) => a.id === "nature") as AdapterSpec;
-    const verdict = interpret(natureArticle as Document, spec, ctx());
+    const verdict = classifyFixture(natureArticle as Document, spec);
     expect(verdict.kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
@@ -794,7 +796,7 @@ test.skipIf(naturePaywall === null)(
   "captured Nature subscription preview is not mistaken for an article",
   () => {
     const spec = adapters.find((a) => a.id === "nature") as AdapterSpec;
-    const verdict = interpret(naturePaywall as Document, spec, ctx());
+    const verdict = classifyFixture(naturePaywall as Document, spec);
     expect(verdict.kind).toBe("no_entitlement");
   },
 );
@@ -804,7 +806,7 @@ test.skipIf(thiemeArticle === null)(
   "captured Thieme full-text page classifies through rendered body and PDF anchor",
   () => {
     const spec = adapters.find((a) => a.id === "thieme") as AdapterSpec;
-    const verdict = interpret(thiemeArticle as Document, spec, ctx());
+    const verdict = classifyFixture(thiemeArticle as Document, spec);
     expect(verdict.kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
@@ -815,7 +817,7 @@ test.skipIf(thiemeAbstract === null)(
   "captured Thieme abstract route stays assisted despite universal PDF metadata",
   () => {
     const spec = adapters.find((a) => a.id === "thieme") as AdapterSpec;
-    expect(interpret(thiemeAbstract as Document, spec, ctx()).kind).toBe("unknown");
+    expect(classifyFixture(thiemeAbstract as Document, spec).kind).toBe("unknown");
   },
 );
 
@@ -824,7 +826,7 @@ test.skipIf(cambridgeArticle === null)(
   "captured Cambridge journal article classifies through its action-bar PDF controls",
   () => {
     const spec = adapters.find((a) => a.id === "cambridge") as AdapterSpec;
-    expect(interpret(cambridgeArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(cambridgeArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -834,7 +836,7 @@ test.skipIf(cambridgePaywall === null)(
   "captured Cambridge purchase wall wins despite citation_pdf_url metadata",
   () => {
     const spec = adapters.find((a) => a.id === "cambridge") as AdapterSpec;
-    expect(interpret(cambridgePaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(cambridgePaywall as Document, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -845,7 +847,7 @@ test("Cambridge book-shaped pages stay outside the journal adapter", () => {
       "</head><body><button data-test-id='buttonSavePDFOptions'></button>" +
       "<a href='/core/services/aop-cambridge-core/content/view/ID/book.pdf'>PDF</a></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const emeraldArticle = loadFixture("emerald", "success");
@@ -853,7 +855,7 @@ test.skipIf(emeraldArticle === null)(
   "captured Emerald OA page classifies through its real PDF anchor",
   () => {
     const spec = adapters.find((a) => a.id === "emerald") as AdapterSpec;
-    expect(interpret(emeraldArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(emeraldArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -863,7 +865,7 @@ test.skipIf(emeraldPaywall === null)(
   "captured Emerald No License turnaway classifies as no entitlement",
   () => {
     const spec = adapters.find((a) => a.id === "emerald") as AdapterSpec;
-    expect(interpret(emeraldPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(emeraldPaywall as Document, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -876,7 +878,7 @@ test.skipIf(emeraldCurrent === null)(
     // The legacy Insight anchor is absent here: this page is only reachable
     // through the rule added for the migrated platform.
     expect(page.querySelector("a.intent_pdf_link")).toBeNull();
-    expect(interpret(page, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(page, spec).kind).toBe("article");
     // One download rule serves both platforms, so its union selector has to
     // resolve on each captured shape.
     expect(page.querySelector(spec.download?.selector as string)).not.toBeNull();
@@ -891,7 +893,7 @@ test.skipIf(tandfArticle === null)(
   "captured Taylor and Francis OA journal page classifies through its direct PDF control",
   () => {
     const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
-    expect(interpret(tandfArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(tandfArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -901,7 +903,7 @@ test.skipIf(tandfPaywall === null)(
   "captured Taylor and Francis Access Denial page classifies as no entitlement",
   () => {
     const spec = adapters.find((a) => a.id === "tandfonline") as AdapterSpec;
-    expect(interpret(tandfPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(tandfPaywall as Document, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -916,7 +918,7 @@ test.skipIf(tandfInstitutional === null)(
     // a working PDF control are both rendered.
     expect(page.querySelector(".accessLogo .access-icon.oa")).toBeNull();
     expect(page.querySelector(".accessLogo .access-icon.full")).not.toBeNull();
-    expect(interpret(page, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(page, spec).kind).toBe("article");
   },
 );
 
@@ -927,7 +929,7 @@ test("Taylor and Francis still needs a rendered access badge, not just a PDF lin
       "<a class='show-pdf' href='https://www.tandfonline.com/doi/pdf/10.1080/x'>Download PDF</a>" +
       "</div></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const sciencedirectArticle = loadFixture("sciencedirect", "success");
@@ -943,7 +945,7 @@ test.skipIf(sciencedirectArticle === null)(
     expect(page.querySelector("meta[name='citation_pdf_url']")).toBeNull();
     expect(page.querySelector("#onetrust-banner-sdk")).not.toBeNull();
     expect(page.querySelector(spec.download?.selector as string)).not.toBeNull();
-    expect(interpret(page, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(page, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("click");
   },
 );
@@ -968,7 +970,7 @@ test.skipIf(sciencedirectPaywall === null)(
     const purchase = (wall?.all ?? []).find((s) => s.includes("/purchase"));
     expect(purchase).toBeDefined();
     expect(page.querySelector(purchase as string)).not.toBeNull();
-    expect(interpret(page, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(page, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -982,7 +984,7 @@ test("an entitled ScienceDirect page still wins over the purchase-wall rule", ()
       "</ul></div>" +
       "<div class='access-options'><a class='accessbar-utility-link' aria-label='Purchase PDF' href='/getaccess/pii/S1/purchase'>Purchase PDF</a></div></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("article");
+  expect(classifyFixture(page, spec).kind).toBe("article");
 });
 
 test("ScienceDirect purchase-like links outside an identified article fail closed", () => {
@@ -998,7 +1000,7 @@ test("ScienceDirect purchase-like links outside an identified article fail close
         "</div></body></html>",
     ),
   ]) {
-    expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+    expect(classifyFixture(page, spec).kind).toBe("unknown");
   }
 });
 
@@ -1017,7 +1019,7 @@ test.skipIf(sciencedirectOpenAccess === null)(
     const control = page.querySelector(spec.download?.selector as string);
     expect(control?.getAttribute("href")).toBe(`/science/article/pii/${own}/pdf`);
     expect(control?.getAttribute("aria-disabled")).toBe("false");
-    expect(interpret(page, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(page, spec).kind).toBe("article");
   },
 );
 
@@ -1055,7 +1057,7 @@ test.skipIf(sciencedirectSubscription === null)(
     const control = page.querySelector(spec.download?.selector as string);
     expect(control?.getAttribute("aria-disabled")).toBe("false");
     expect(control?.getAttribute("href")).toContain("S0747563216303168");
-    expect(interpret(page, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(page, spec).kind).toBe("article");
   },
 );
 
@@ -1115,7 +1117,7 @@ test("a sibling sharing the control's own class is still out of scope", () => {
   const hits = [...page.querySelectorAll(spec.download?.selector as string)];
   expect(hits).toHaveLength(1);
   expect(hits[0]?.getAttribute("href")).toContain(own);
-  expect(interpret(page, spec, ctx()).kind).toBe("article");
+  expect(classifyFixture(page, spec).kind).toBe("article");
 });
 
 // Measured live 2026-08-30 in a scratch Chrome against the SAME open-access
@@ -1147,7 +1149,7 @@ const sciencedirectLivePage = (): Document =>
 
 test("a live ScienceDirect access-bar href carrying its query still classifies", () => {
   const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
-  expect(interpret(sciencedirectLivePage(), spec, ctx()).kind).toBe("article");
+  expect(classifyFixture(sciencedirectLivePage(), spec).kind).toBe("article");
 });
 
 test("the ScienceDirect download control resolves through the query string", () => {
@@ -1180,7 +1182,7 @@ test("an unpainted ScienceDirect access bar refuses to classify as article", () 
       "<a class='accessbar-utility-link' aria-label='View PDF. Opens in a new window.' aria-disabled='true'>View PDF</a>" +
       "</li></ul></div></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 test("Taylor and Francis book metadata is outside the journal adapter host scope", () => {
@@ -1193,7 +1195,7 @@ test.skipIf(psycnetArticle === null)(
   "captured PsycNet full-text page classifies through its rendered PDF control",
   () => {
     const spec = adapters.find((a) => a.id === "psycnet") as AdapterSpec;
-    expect(interpret(psycnetArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(psycnetArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -1203,7 +1205,7 @@ test.skipIf(psycnetPaywall === null)(
   "captured PsycNet record with Get Access classifies as no entitlement",
   () => {
     const spec = adapters.find((a) => a.id === "psycnet") as AdapterSpec;
-    expect(interpret(psycnetPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(psycnetPaywall as Document, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -1212,7 +1214,7 @@ test.skipIf(annualReviewsArticle === null)(
   "captured Annual Reviews OA page classifies through its PDF POST control",
   () => {
     const spec = adapters.find((a) => a.id === "annualreviews") as AdapterSpec;
-    expect(interpret(annualReviewsArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(annualReviewsArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("click");
   },
 );
@@ -1224,7 +1226,7 @@ test("Annual Reviews PDF controls without the OA marker stay assisted", () => {
       "<body><div id='html_fulltext'></div>" +
       "<form class='ft-download-content__form--pdf'><a aria-label='Download PDF'></a></form></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const oupArticle = loadFixture("oup", "success");
@@ -1232,7 +1234,7 @@ test.skipIf(oupArticle === null)(
   "captured Oxford Academic OA article classifies through its PDF action",
   () => {
     const spec = adapters.find((a) => a.id === "oup") as AdapterSpec;
-    expect(interpret(oupArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(oupArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -1242,7 +1244,7 @@ test.skipIf(oupPaywall === null)(
   "captured Oxford Academic abstract paywall classifies as no entitlement",
   () => {
     const spec = adapters.find((a) => a.id === "oup") as AdapterSpec;
-    expect(interpret(oupPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(oupPaywall as Document, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -1251,7 +1253,7 @@ test.skipIf(mitPressArticle === null)(
   "captured MIT Press OA article classifies through its PDF action",
   () => {
     const spec = adapters.find((a) => a.id === "mitpress") as AdapterSpec;
-    expect(interpret(mitPressArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(mitPressArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -1261,7 +1263,7 @@ test.skipIf(mitPressPaywall === null)(
   "captured MIT Press purchase wall classifies as no entitlement",
   () => {
     const spec = adapters.find((a) => a.id === "mitpress") as AdapterSpec;
-    expect(interpret(mitPressPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(mitPressPaywall as Document, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -1270,7 +1272,7 @@ test.skipIf(bmjArticle === null)(
   "captured BMJ Open article classifies through its explicit OA PDF action",
   () => {
     const spec = adapters.find((a) => a.id === "bmj") as AdapterSpec;
-    expect(interpret(bmjArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(bmjArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -1282,7 +1284,7 @@ test("BMJ PDF metadata without explicit open access stays assisted", () => {
       "<meta name='citation_pdf_url' content='https://bmj.com/content/closed.full.pdf'></head>" +
       "<body><a class='article-pdf-download' href='/content/closed.full.pdf'>PDF</a></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const psychiatryArticle = loadFixture("psychiatryonline", "success");
@@ -1290,7 +1292,7 @@ test.skipIf(psychiatryArticle === null)(
   "captured PsychiatryOnline full-access article classifies through its PDF action",
   () => {
     const spec = adapters.find((a) => a.id === "psychiatryonline") as AdapterSpec;
-    expect(interpret(psychiatryArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(psychiatryArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("href");
   },
 );
@@ -1300,7 +1302,7 @@ test.skipIf(psychiatryPaywall === null)(
   "captured PsychiatryOnline no-access article overrides its PDF-shaped link",
   () => {
     const spec = adapters.find((a) => a.id === "psychiatryonline") as AdapterSpec;
-    expect(interpret(psychiatryPaywall as Document, spec, ctx()).kind).toBe("no_entitlement");
+    expect(classifyFixture(psychiatryPaywall as Document, spec).kind).toBe("no_entitlement");
   },
 );
 
@@ -1309,7 +1311,7 @@ test.skipIf(jamaArticle === null)(
   "captured free JAMA article classifies through its access-checked PDF control",
   () => {
     const spec = adapters.find((a) => a.id === "jamanetwork") as AdapterSpec;
-    expect(interpret(jamaArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(jamaArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("click");
   },
 );
@@ -1322,7 +1324,7 @@ test("JAMA PDF controls without a Free or Open Access marker stay assisted", () 
       "<a id='pdf-link' class='pdfaccess' data-article-url='/article.pdf' " +
       "data-ajax-url='/Content/CheckPdfAccess'>PDF</a></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 const lwwArticle = loadFixture("lww", "success");
@@ -1330,7 +1332,7 @@ test.skipIf(lwwArticle === null)(
   "captured LWW full-text article classifies through its wkhealth PDF metadata",
   () => {
     const spec = adapters.find((a) => a.id === "lww") as AdapterSpec;
-    expect(interpret(lwwArticle as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(lwwArticle as Document, spec).kind).toBe("article");
     expect(spec.download?.method).toBe("meta");
   },
 );
@@ -1342,7 +1344,7 @@ test("LWW PDF metadata without a rendered full-text body stays assisted", () => 
       "<meta name='wkhealth_pdf_url' content='https://journals.lww.com/downloadpdf.aspx'></head>" +
       "<body><article id='ej-article-view'><section>Abstract only</section></article></body></html>",
   );
-  expect(interpret(page, spec, ctx()).kind).toBe("unknown");
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
 // ProQuest "Find your institution" wall (fixtures/proquest/login-return.html,
@@ -1355,7 +1357,7 @@ test.skipIf(pqLogin === null)(
   "proquest institution wall classifies as login, not unknown/article",
   () => {
     const spec = adapters.find((a) => a.id === "proquest") as AdapterSpec;
-    expect(interpret(pqLogin as Document, spec, ctx()).kind).toBe("login");
+    expect(classifyFixture(pqLogin as Document, spec).kind).toBe("login");
   },
 );
 
@@ -1364,7 +1366,7 @@ test.skipIf(pqSuccess === null)(
   "proquest entitled docview still classifies as article after the login rule",
   () => {
     const spec = adapters.find((a) => a.id === "proquest") as AdapterSpec;
-    expect(interpret(pqSuccess as Document, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(pqSuccess as Document, spec).kind).toBe("article");
   },
 );
 
@@ -1501,7 +1503,7 @@ class FakeScripting {
   }[] = [];
   readonly rawClickArgs: unknown[][] = [];
   readonly termsAccepts: { tabId: number; modalSelector: string; textAny: unknown; control: unknown }[] = [];
-  readonly interpretTabs: number[] = [];
+  readonly plannedTabs: number[] = [];
   constructedURL: string | null = "https://provider.example.edu/pdf/default.pdf";
   readonly constructedArgs: { tabId: number; selector: string; idPattern: unknown; urlTemplate: unknown; jsonField: unknown }[] = [];
   private syntheticPageURL(spec: AdapterSpec): string {
@@ -1709,7 +1711,7 @@ class FakeScripting {
       ) {
         this.extracted.push({ tabId: inj.target.tabId, selector: planned.target_ref.selector });
       }
-      this.interpretTabs.push(inj.target.tabId);
+      this.plannedTabs.push(inj.target.tabId);
       return [{ result: planned }];
     }
     const args = inj.args ?? [];
@@ -1998,7 +2000,7 @@ test("auth return classifies the provider landing even without a complete event"
   await h.tabs.userNavigate(tabID, provURL);
 
   expect(h.frames().some((f) => f.type === "auth_returned")).toBe(true);
-  expect(h.scripting.interpretTabs).toContain(tabID);
+  expect(h.scripting.plannedTabs).toContain(tabID);
   expect(h.downloads.started.length).toBe(1);
 });
 
@@ -2024,7 +2026,7 @@ test("a transiently unknown provider page is reclassified until it renders", asy
   const retryTimers = h.timers.filter((timer) => timer.ms === 2_500);
   h.timers.splice(0, h.timers.length, ...h.timers.filter((timer) => timer.ms !== 2_500));
   for (const timer of retryTimers) await timer.fn();
-  expect(h.scripting.interpretTabs.length).toBeGreaterThanOrEqual(2);
+  expect(h.scripting.plannedTabs.length).toBeGreaterThanOrEqual(2);
   expect(h.downloads.started.length).toBe(1);
   expect(h.tabs.snapshot(tabID)?.url).toContain(PROVIDER);
 });
@@ -2448,7 +2450,7 @@ test("declared shadow click reclassifies an in-page terms gate", async () => {
   const outcome = h.frames().find((f) => f.type === "provider_outcome");
   expect(outcome?.payload["outcome"]).toBe("terms_acceptance_required");
   expect(outcome?.payload["adapter_version"]).toBe("0.1.0");
-  expect(h.scripting.interpretTabs.length).toBe(3);
+  expect(h.scripting.plannedTabs.length).toBe(3);
   expect(h.downloads.started).toHaveLength(0);
 });
 test("declared provider modal follow-up stays inside the one click helper", async () => {
@@ -2605,7 +2607,7 @@ test("classification is gated on an optional-host-permission grant", async () =>
   await h.bridge.start();
   await h.port.inbound(offer("job_nogrant_0001", { title: EXPECTED_TITLE }));
   await landOnProvider(h, "job_nogrant_0001");
-  expect(h.scripting.interpretTabs.length).toBe(0);
+  expect(h.scripting.plannedTabs.length).toBe(0);
   expect(h.downloads.started.length).toBe(0);
   expect(h.permissions.checks).toContainEqual([`https://${PROVIDER}/*`]);
 });
@@ -2616,7 +2618,7 @@ test("no registered adapter for the host stays assisted (no injection)", async (
   await h.bridge.start();
   await h.port.inbound(offer("job_noadapter_0001"));
   await landOnProvider(h, "job_noadapter_0001");
-  expect(h.scripting.interpretTabs.length).toBe(0);
+  expect(h.scripting.plannedTabs.length).toBe(0);
 });
 
 test("terms/no_entitlement/wrong_work map to their provider outcomes", async () => {
@@ -3040,7 +3042,7 @@ test.skipIf(primoRecord === null)(
   () => {
     const record = primoRecord as Document;
     const spec = adapters.find((a) => a.id === "primo") as AdapterSpec;
-    const verdict = interpret(record, spec, ctx());
+    const verdict = classifyFixture(record, spec);
     expect(verdict.kind).toBe("article");
     const rule = spec.download as DownloadRule;
     expect(rule.method).toBe("href");
@@ -3058,7 +3060,7 @@ test.skipIf(primoRecord === null)(
     for (const el of Array.from(stripped.querySelectorAll("a.anchor-tag-style[href*='/discovery/sourceRecord']"))) {
       el.remove();
     }
-    expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
+    expect(classifyFixture(stripped, spec).kind).not.toBe("article");
   },
 );
 
@@ -3071,7 +3073,7 @@ test.skipIf(clinicalKeyArticle === null)(
   () => {
     const article = clinicalKeyArticle as Document;
     const spec = adapters.find((a) => a.id === "clinicalkey") as AdapterSpec;
-    expect(interpret(article, spec, ctx()).kind).toBe("article");
+    expect(classifyFixture(article, spec).kind).toBe("article");
     const rule = spec.download as DownloadRule;
     expect(rule.method).toBe("href");
     const anchor = article.querySelector(rule.selector);
@@ -3087,7 +3089,7 @@ test.skipIf(clinicalKeyArticle === null)(
     const spec = adapters.find((a) => a.id === "clinicalkey") as AdapterSpec;
     const stripped = article.cloneNode(true) as Document;
     for (const el of Array.from(stripped.querySelectorAll("a[data-testid='pdf-download-link']"))) el.remove();
-    expect(interpret(stripped, spec, ctx()).kind).not.toBe("article");
+    expect(classifyFixture(stripped, spec).kind).not.toBe("article");
   },
 );
 
@@ -3098,7 +3100,7 @@ test.skipIf(mdpiArticle === null)(
   () => {
     const article = mdpiArticle as Document;
     const spec = adapters.find((a) => a.id === "mdpi") as AdapterSpec;
-    const verdict = interpret(article, spec, ctx());
+    const verdict = classifyFixture(article, spec);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("mdpi");
     const rule = spec.download as DownloadRule;
@@ -3115,7 +3117,7 @@ test.skipIf(mdpiArticle === null)(
     const article = (mdpiArticle as Document).cloneNode(true) as Document;
     const spec = adapters.find((a) => a.id === "mdpi") as AdapterSpec;
     for (const anchor of Array.from(article.querySelectorAll("a.UD_ArticlePDF"))) anchor.remove();
-    expect(interpret(article, spec, ctx()).kind).toBe("unknown");
+    expect(classifyFixture(article, spec).kind).toBe("unknown");
   },
 );
 
@@ -3125,7 +3127,7 @@ test.skipIf(hogrefeArticle === null)(
   () => {
     const article = hogrefeArticle as Document;
     const spec = adapters.find((a) => a.id === "hogrefe") as AdapterSpec;
-    const verdict = interpret(article, spec, ctx());
+    const verdict = classifyFixture(article, spec);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("hogrefe");
     const rule = spec.download as DownloadRule;
@@ -3142,7 +3144,7 @@ test.skipIf(hogrefeArticle === null)(
     const article = (hogrefeArticle as Document).cloneNode(true) as Document;
     const spec = adapters.find((a) => a.id === "hogrefe") as AdapterSpec;
     for (const anchor of Array.from(article.querySelectorAll("a[href^='/doi/pdf/']"))) anchor.remove();
-    expect(interpret(article, spec, ctx()).kind).toBe("unknown");
+    expect(classifyFixture(article, spec).kind).toBe("unknown");
   },
 );
 // The Primo discovery record page is the resolver papio drives to itself. A
@@ -3162,7 +3164,7 @@ test.skipIf(!fixtureExists("primo", "no-entitlement"))(
         "nde-record-availability .available-at-button",
       ),
     ).toHaveLength(1);
-    const verdict = interpret(page, primoSpec(), ctx());
+    const verdict = classifyFixture(page, primoSpec());
     expect(verdict.kind).toBe("no_entitlement");
     expect(verdict.adapter_id).toBe("primo");
   },
@@ -3177,7 +3179,7 @@ test.skipIf(!fixtureExists("primo", "success"))(
         "nde-record-availability .available-at-button",
       ),
     ).toHaveLength(1);
-    expect(interpret(page, primoSpec(), ctx()).kind).toBe("article");
+    expect(classifyFixture(page, primoSpec()).kind).toBe("article");
   },
 );
 
@@ -3185,7 +3187,7 @@ test("a Primo shell that never rendered its record availability stays unknown", 
   const shell = parseHTML(
     "<html><body><div id='searchBar'></div></body></html>",
   );
-  expect(interpret(shell, primoSpec(), ctx()).kind).toBe("unknown");
+  expect(classifyFixture(shell, primoSpec()).kind).toBe("unknown");
 });
 
 test("the Primo budget is the resolver-hop ceiling, not the default", () => {
@@ -3228,7 +3230,6 @@ async function withLiveAdapterPage<T>(
 }
 
 const liveClassifierKind = async (
-  mode: "fixture" | "injected",
   spec: AdapterSpec,
   html: string,
   mutate?: (
@@ -3237,21 +3238,12 @@ const liveClassifierKind = async (
   ) => Promise<void>,
 ): Promise<string> =>
   withLiveAdapterPage(html, async (win, pageSetTimeout) => {
-    const pending =
-      mode === "fixture"
-        ? interpret(null, spec, ctx())
-        : planExecution(
-            null,
-            spec,
-            {},
-            { access_mode: "delegated" },
-          );
+    const pending = planExecution(null, spec, {}, { access_mode: "delegated" });
     await mutate?.(win, pageSetTimeout);
     const settled = await pending;
-    if (mode === "fixture") return (settled as PageVerdict).kind;
-    if ("assisted" in (settled as PlanResult))
+    if ("assisted" in settled)
       throw new Error("live classifier unexpectedly returned an assisted plan");
-    return (settled as Plan).verdict.kind;
+    return settled.verdict.kind;
   });
 
 test("another ready rule cannot wake a deadline-only rule early", async () => {
@@ -3271,11 +3263,45 @@ test("another ready rule cannot wake a deadline-only rule early", async () => {
   };
   const html =
     "<html><body><i class='availability'></i><i class='login'></i></body></html>";
-  expect(await liveClassifierKind("fixture", spec, html)).toBe("login");
-  expect(await liveClassifierKind("injected", spec, html)).toBe("login");
+  expect(await liveClassifierKind(spec, html)).toBe("login");
 });
 
-test("both live classifiers use the source link's state at the deadline", async () => {
+test("a late-hydrating non-article rule settles inside the 50 ms window", async () => {
+  // The settle window is what stops a ready non-article rule from waiting out
+  // the whole budget. A deferred rule is already matchable on this page, so a
+  // planner that resolved at the deadline would report no_entitlement instead,
+  // and would spend the full declared budget doing it.
+  const spec: AdapterSpec = {
+    id: "proquest",
+    version: "0.0.0",
+    hosts: ["www.proquest.com"],
+    settleTimeoutMs: 2000,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [".availability"],
+        deferUntilDeadline: true,
+      },
+      { kind: "login", all: [".login"] },
+    ],
+  };
+  const html = "<html><body><i class='availability'></i></body></html>";
+  const startedAt = Date.now();
+  const kind = await liveClassifierKind(
+    spec,
+    html,
+    async (win, pageSetTimeout) => {
+      const hydrated = Promise.withResolvers<void>();
+      pageSetTimeout(hydrated.resolve, 40);
+      await hydrated.promise;
+      win.document.body.insertAdjacentHTML("beforeend", "<i class='login'></i>");
+    },
+  );
+  expect(kind).toBe("login");
+  expect(Date.now() - startedAt).toBeLessThan(1000);
+});
+
+test("the live planner uses the source link's state at the deadline", async () => {
   const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 300 };
   const html =
     "<html><body><nde-record-availability>" +
@@ -3297,15 +3323,12 @@ test("both live classifiers use the source link's state at the deadline", async 
     await removed.promise;
     win.document.querySelector(".anchor-tag-style")?.remove();
   };
-  expect(
-    await liveClassifierKind("fixture", spec, html, transientSource),
-  ).toBe("no_entitlement");
-  expect(
-    await liveClassifierKind("injected", spec, html, transientSource),
-  ).toBe("no_entitlement");
+  expect(await liveClassifierKind(spec, html, transientSource)).toBe(
+    "no_entitlement",
+  );
 });
 
-test("both live classifiers accept a source link that remains through the deadline", async () => {
+test("the live planner accepts a source link that remains through the deadline", async () => {
   const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 300 };
   const html =
     "<html><body><nde-record-availability>" +
@@ -3336,30 +3359,32 @@ test("both live classifiers accept a source link that remains through the deadli
       ),
     ).not.toBeNull();
   };
-  expect(
-    await liveClassifierKind("fixture", spec, html, stableSource),
-  ).toBe("article");
-  expect(
-    await liveClassifierKind("injected", spec, html, stableSource),
-  ).toBe("article");
+  expect(await liveClassifierKind(spec, html, stableSource)).toBe("article");
 });
 
-test("the injected and fixture classifiers agree on every settled Primo state", () => {
+test("the planner classifies every settled Primo state on the synchronous path", () => {
   const spec = primoSpec();
-  const cases = [
-    "<html><body><div id='searchBar'></div></body></html>",
-    "<html><body><nde-record-availability>" +
-      "<button class='available-at-button'>x</button>" +
-      "</nde-record-availability></body></html>",
-    "<html><body><nde-record-availability>" +
-      "<button class='available-at-button'>x</button>" +
-      "</nde-record-availability>" +
-      "<a class='anchor-tag-style' href='/discovery/sourceRecord/a1'></a>" +
-      "</body></html>",
+  const cases: { html: string; kind: PageVerdict["kind"] }[] = [
+    { html: "<html><body><div id='searchBar'></div></body></html>", kind: "unknown" },
+    {
+      html:
+        "<html><body><nde-record-availability>" +
+        "<button class='available-at-button'>x</button>" +
+        "</nde-record-availability></body></html>",
+      kind: "no_entitlement",
+    },
+    {
+      html:
+        "<html><body><nde-record-availability>" +
+        "<button class='available-at-button'>x</button>" +
+        "</nde-record-availability>" +
+        "<a class='anchor-tag-style' href='/discovery/sourceRecord/a1'></a>" +
+        "</body></html>",
+      kind: "article",
+    },
   ];
-  for (const html of cases) {
-    const page = parseHTML(html);
-    const fixtureKind = interpret(page, spec, ctx()).kind;
+  for (const c of cases) {
+    const page = parseHTML(c.html);
     const injected = planExecution(
       page,
       spec,
@@ -3368,6 +3393,6 @@ test("the injected and fixture classifiers agree on every settled Primo state", 
     ) as PlanResult;
     if ("assisted" in injected)
       throw new Error("settled Primo fixture unexpectedly returned an assisted plan");
-    expect((injected as Plan).verdict.kind).toBe(fixtureKind);
+    expect((injected as Plan).verdict.kind).toBe(c.kind);
   }
 });

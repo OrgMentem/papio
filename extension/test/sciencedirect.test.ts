@@ -5,16 +5,14 @@
 
 import { expect, test } from "bun:test";
 
-import { adapters, interpret } from "../src/adapters/types";
-import { fixtureExists, loadFixture } from "./harness";
+import { adapters } from "../src/adapters/types";
+import { classifyFixture, fixtureExists, loadFixture } from "./harness";
 
 const spec = adapters.find((adapter) => adapter.id === "sciencedirect");
 if (!spec) throw new Error("sciencedirect spec missing from registry");
 
 const EXPECTED = {
-  expected: {
-    title: "Student motivation and need satisfaction in GenAI-supported classrooms: A self-determination theory perspective",
-  },
+  title: "Student motivation and need satisfaction in GenAI-supported classrooms: A self-determination theory perspective",
 };
 
 function fixture(scenario: string): Document {
@@ -27,7 +25,7 @@ test.skipIf(!fixtureExists("sciencedirect", "success"))(
   "entitled ScienceDirect article exposes its primary PDF viewer control",
   () => {
     const doc = fixture("success");
-    const verdict = interpret(doc, spec, EXPECTED);
+    const verdict = classifyFixture(doc, spec, EXPECTED);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("sciencedirect");
     expect(verdict.evidence).toEqual(["rule:article matched", "title-token-check passed"]);
@@ -45,6 +43,6 @@ test.skipIf(!fixtureExists("sciencedirect", "success"))(
 test.skipIf(!fixtureExists("sciencedirect", "drift"))(
   "renamed ScienceDirect primary PDF control fails closed to unknown",
   () => {
-    expect(interpret(fixture("drift"), spec, EXPECTED).kind).toBe("unknown");
+    expect(classifyFixture(fixture("drift"), spec, EXPECTED).kind).toBe("unknown");
   },
 );

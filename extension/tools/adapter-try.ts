@@ -5,8 +5,9 @@
 // it, and re-drive a live institutional handoff. Measured on the live
 // install, 99 of 103 adapter failures were adapters that matched the host and
 // then could not classify the page — a purely selector-level problem that
-// `interpret` (pure, DOM-only, exported from ../src/adapters/types) can
-// diagnose against a stored capture with no browser, daemon, or network — by
+// `planExecution` (the production planner the extension injects; DOM-only on
+// its Document path, exported from ../src/plan) can diagnose against a stored
+// capture with no browser, daemon, or network — by
 // default. A spec whose download method is "url" or "api" is the exception:
 // resolving it calls the real resolveDownloadURL, which performs a live,
 // credentialed `fetch` whenever the rule declares `jsonField`. That branch is
@@ -17,14 +18,14 @@
 //   bun run adapter:try -- capture.html --spec draft-adapter.json --expect article
 //
 // The per-rule table independently re-checks every classify rule's selectors,
-// not just the ones `interpret` itself reaches before its first-match-wins
-// return — a losing rule still shows exactly which selector cost it the
-// match, which is the actual repair signal.
+// not just the ones `planExecution` itself reaches before its
+// first-match-wins return — a losing rule still shows exactly which selector
+// cost it the match, which is the actual repair signal.
 
 import { readFileSync } from "node:fs";
 
-import { captureOrigin, parseHTML } from "../test/harness";
-import { adapters, type AdapterSpec, type ClassifyRule, type DownloadRule, type PageVerdict } from "../src/adapters/types";
+import { captureOrigin, parseHTML, verdictOf } from "../test/harness";
+import { adapters, type AdapterSpec, type ClassifyRule, type DownloadRule } from "../src/adapters/types";
 import { planExecution, type Plan } from "../src/plan";
 
 function usage(): never {
@@ -183,10 +184,10 @@ function loadSpec(args: Args): AdapterSpec {
 }
 
 // ---- per-rule diagnostic ----------------------------------------------------
-// Mirrors interpret()'s own rule-matching (types.ts lines ~148-186) exactly,
-// but evaluates every rule instead of stopping at the first match, and never
-// throws on a malformed selector — a draft spec under active repair is
-// expected to have exactly those problems.
+// Mirrors the rule matching planExecution performs (its `classify` loop in
+// ../src/plan.ts) exactly, but evaluates every rule instead of stopping at
+// the first match, and never throws on a malformed selector — a draft spec
+// under active repair is expected to have exactly those problems.
 
 interface SelectorCheck {
   selector: string;
@@ -214,7 +215,7 @@ function evaluateRule(doc: Document, bodyText: string, rule: ClassifyRule): Rule
   const any = (rule.any ?? []).map((selector) => checkSelector(doc, selector));
   const textAny = (rule.textAny ?? []).map((needle) => ({
     needle,
-    // interpret() never lowercases the needle — textAny is documented as
+    // planExecution never lowercases the needle — textAny is documented as
     // already-lowercase static labels matched against lowercased body text.
     hit: bodyText.indexOf(needle) !== -1,
   }));
@@ -245,23 +246,23 @@ function printClassifyRules(doc: Document, spec: AdapterSpec): void {
     }
   }
 
-  console.log("\nClassify rules (declared order; interpret() stops at the first full match)");
+  console.log("\nClassify rules (declared order; planExecution stops at the first full match)");
   for (const [i, rule] of spec.classify.entries()) {
     const report = reports[i];
     if (report === undefined) continue;
     const isWinner = winner === i;
     const skipped = winner !== null && winner < i;
     const tag = isWinner
-      ? "  <-- WINNER (first match wins; interpret() returns here)"
+      ? "  <-- WINNER (first match wins; planExecution classifies here)"
       : skipped && winner !== null
-        ? `  (never evaluated by interpret(): rule [${winner + 1}] already won)`
+        ? `  (never evaluated by planExecution: rule [${winner + 1}] already won)`
         : "";
     console.log(`  [${i + 1}] kind=${rule.kind}  ${report.matched ? "MATCHED" : "not matched"}${tag}`);
     printSelectorChecks("all", report.all);
     printSelectorChecks("any", report.any);
     for (const t of report.textAny) console.log(`        textAny  ${t.hit ? "HIT " : "MISS"}  "${t.needle}"`);
     if (report.all.length === 0 && report.any.length === 0 && report.textAny.length === 0) {
-      console.log("        (rule declares no all/any/textAny — interpret() always skips it)");
+      console.log("        (rule declares no all/any/textAny — planExecution always skips it)");
     }
   }
 }
@@ -414,15 +415,15 @@ async function main(): Promise<void> {
   };
 
   const planned = planExecution(doc, spec, expected, {});
+  // `assisted` is the only authority discriminator, so an assisted result is
+  // never executed here: `plan` stays undefined and nothing resolves an
+  // action from it. Its verdict is still the classification this same
+  // planning pass reached, so report that verdict verbatim — "classified
+  // article, but not executable because X" is the repair signal a synthetic
+  // `unknown` used to hide.
   const plan = "assisted" in planned ? undefined : planned;
-  const verdict =
-    plan?.verdict ??
-    ({
-      kind: "unknown",
-      adapter_id: spec.id,
-      adapter_version: spec.version,
-      evidence: [`planner assisted: ${"assisted" in planned ? planned.assisted : "planner returned no plan"}`],
-    } satisfies PageVerdict);
+  const assisted = "assisted" in planned ? planned.assisted : null;
+  const verdict = verdictOf(planned);
 
   console.log(`=== adapter-try: ${spec.id}@${spec.version} vs ${args.htmlPath} ===\n`);
   console.log("Verdict");
@@ -431,6 +432,11 @@ async function main(): Promise<void> {
   console.log(`  adapter_version: ${verdict.adapter_version}`);
   console.log("  evidence:");
   for (const line of verdict.evidence) console.log(`    - ${line}`);
+  console.log(
+    assisted === null
+      ? "  executable:      yes (the planner returned an executable plan)"
+      : `  executable:      NO — classified ${verdict.kind}, but not executable because ${assisted}`,
+  );
 
   printClassifyRules(doc, spec);
 
@@ -440,17 +446,28 @@ async function main(): Promise<void> {
 
   console.log("");
   if (args.expect !== undefined) {
-    if (verdict.kind === args.expect) {
-      console.log(`Result: PASS (--expect ${args.expect} matched)`);
-      process.exit(0);
-    } else {
+    if (verdict.kind !== args.expect) {
       console.log(`Result: FAIL (--expect ${args.expect}, got ${verdict.kind})`);
       process.exit(1);
     }
-  } else {
-    console.log("Result: interpreted successfully (no --expect given)");
+    if (assisted !== null) {
+      // The classification matched but the planner produced no executable
+      // action. An assisted result exited non-zero before, because it was
+      // reported as `unknown`; keep that non-zero exit now that the real
+      // verdict is printed, so a classified-but-unexecutable adapter cannot
+      // start passing.
+      console.log(`Result: FAIL (--expect ${args.expect} matched the classification, but the plan stayed assisted: ${assisted})`);
+      process.exit(1);
+    }
+    console.log(`Result: PASS (--expect ${args.expect} matched)`);
     process.exit(0);
   }
+  console.log(
+    assisted === null
+      ? "Result: planned successfully (no --expect given)"
+      : "Result: planned, but assisted — no executable action (no --expect given)",
+  );
+  process.exit(0);
 }
 
 await main();

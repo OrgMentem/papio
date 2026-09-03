@@ -4,8 +4,8 @@
 
 import { expect, test } from "bun:test";
 
-import { adapters, interpret } from "../src/adapters/types";
-import { fixtureExists, loadFixture } from "./harness";
+import { adapters } from "../src/adapters/types";
+import { classifyFixture, fixtureExists, loadFixture } from "./harness";
 
 const spec = adapters.find((a) => a.id === "jstor");
 if (!spec) throw new Error("jstor spec missing from registry");
@@ -14,17 +14,13 @@ if (!spec) throw new Error("jstor spec missing from registry");
 // https://www.jstor.org/stable/20183234 (spec version 0.2.0: click-invoked
 // custom download control; the page exposes no PDF URL to synthesize).
 const STRENGTH_MODEL = {
-  expected: {
-    title: "The Strength Model of Self-Control",
-    year: 2007,
-  },
+  title: "The Strength Model of Self-Control",
+  year: 2007,
 };
 
 const IRON_CAGE = {
-  expected: {
-    title: "The Iron Cage Revisited: Institutional Isomorphism and Collective Rationality in Organizational Fields",
-    year: 1983,
-  },
+  title: "The Iron Cage Revisited: Institutional Isomorphism and Collective Rationality in Organizational Fields",
+  year: 1983,
 };
 
 function fixture(scenario: string): Document {
@@ -37,7 +33,7 @@ test.skipIf(!fixtureExists("jstor", "success"))(
   "authenticated matching article classifies article and exposes the declared custom control",
   () => {
     const doc = fixture("success");
-    const verdict = interpret(doc, spec, STRENGTH_MODEL);
+    const verdict = classifyFixture(doc, spec, STRENGTH_MODEL);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("jstor");
     expect(doc.querySelector(spec.download?.selector ?? "")).not.toBeNull();
@@ -54,34 +50,34 @@ test.skipIf(!fixtureExists("jstor", "success"))(
 test.skipIf(!fixtureExists("jstor", "success"))(
   "a different expected work on the entitled page fails the identity check",
   () => {
-    expect(interpret(fixture("success"), spec, IRON_CAGE).kind).toBe("wrong_work");
+    expect(classifyFixture(fixture("success"), spec, IRON_CAGE).kind).toBe("wrong_work");
   },
 );
 
 test.skipIf(!fixtureExists("jstor", "wrong-work"))(
   "different JSTOR article fails the title identity check",
   () => {
-    expect(interpret(fixture("wrong-work"), spec, IRON_CAGE).kind).toBe("wrong_work");
+    expect(classifyFixture(fixture("wrong-work"), spec, IRON_CAGE).kind).toBe("wrong_work");
   },
 );
 
 test.skipIf(!fixtureExists("jstor", "login-return"))(
   "isolated logged-out article classifies as login before article",
   () => {
-    expect(interpret(fixture("login-return"), spec, IRON_CAGE).kind).toBe("login");
+    expect(classifyFixture(fixture("login-return"), spec, IRON_CAGE).kind).toBe("login");
   },
 );
 
 test.skipIf(!fixtureExists("jstor", "terms"))(
   "open terms overlay takes precedence over the still article-shaped page",
   () => {
-    expect(interpret(fixture("terms"), spec, IRON_CAGE).kind).toBe("terms");
+    expect(classifyFixture(fixture("terms"), spec, IRON_CAGE).kind).toBe("terms");
   },
 );
 
 test.skipIf(!fixtureExists("jstor", "drift"))(
   "renamed download marker fails closed to unknown",
   () => {
-    expect(interpret(fixture("drift"), spec, IRON_CAGE).kind).toBe("unknown");
+    expect(classifyFixture(fixture("drift"), spec, IRON_CAGE).kind).toBe("unknown");
   },
 );

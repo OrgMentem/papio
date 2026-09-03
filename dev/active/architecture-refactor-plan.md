@@ -119,10 +119,16 @@ This plan does not:
 ## Execution order
 
 The slices below form one clean cutover. Finish each slice before the next slice
-starts. Slice 3 overlaps the classifier work in
-`dev/active/institutional-signin-sharing.md`. Either land Slice 3 first and
-change that plan's remaining classifier work to target `planExecution` only, or
-wait until that work stops. Never edit the two classifier bodies concurrently.
+starts. Slice 3 overlapped the classifier work in
+`dev/active/institutional-signin-sharing.md`. **Resolved 2026-09-03 by taking
+the first option: Slice 3 landed first, and that plan now carries a classifier
+consolidation amendment retargeting its remaining provider-rule classifier work
+at `planExecution` only.** Verification found the overlap was narrower than this
+paragraph assumed: that plan's one unimplemented section reaches
+`assessDrivenPage`, a different classifier with a different input contract, so
+its pending provider load-failure work must stay there and must NOT move into
+`planExecution`. There is now one classifier body, so the concurrent-edit
+prohibition is moot.
 
 Slices 4 and 5 touch active browser lifecycle work. Start them only when
 `dev/active/surface-lifecycle-plan.md`,

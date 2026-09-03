@@ -5,22 +5,20 @@
 
 import { expect, test } from "bun:test";
 
-import { adapters, interpret } from "../src/adapters/types";
-import { fixtureExists, loadFixture } from "./harness";
+import { adapters } from "../src/adapters/types";
+import { classifyFixture, fixtureExists, loadFixture } from "./harness";
 
 const spec = adapters.find((a) => a.id === "proquest");
 if (!spec) throw new Error("proquest spec missing from registry");
 
-const LEE_SEE = {
-  expected: { title: "Trust in Automation: Designing for Appropriate Reliance", year: 2004 },
-};
+const LEE_SEE = { title: "Trust in Automation: Designing for Appropriate Reliance", year: 2004 };
 
 test.skipIf(!fixtureExists("proquest", "success"))(
   "entitled article page with matching work classifies article and exposes the download selector",
   () => {
     const doc = loadFixture("proquest", "success");
     if (!doc) throw new Error("unreachable");
-    const v = interpret(doc, spec, LEE_SEE);
+    const v = classifyFixture(doc, spec, LEE_SEE);
     expect(v.kind).toBe("article");
     expect(v.adapter_id).toBe("proquest");
     expect(doc.querySelector(spec.download?.selector ?? "")).not.toBeNull();
@@ -34,8 +32,8 @@ test.skipIf(!fixtureExists("proquest", "success"))(
   () => {
     const doc = loadFixture("proquest", "success");
     if (!doc) throw new Error("unreachable");
-    const v = interpret(doc, spec, {
-      expected: { title: "Calibrating Reliance on Automated Advice in Simulated Submarine Control" },
+    const v = classifyFixture(doc, spec, {
+      title: "Calibrating Reliance on Automated Advice in Simulated Submarine Control",
     });
     expect(v.kind).toBe("wrong_work");
   },
@@ -46,7 +44,7 @@ test.skipIf(!fixtureExists("proquest", "wrong-work"))(
   () => {
     const doc = loadFixture("proquest", "wrong-work");
     if (!doc) throw new Error("unreachable");
-    const v = interpret(doc, spec, LEE_SEE);
+    const v = classifyFixture(doc, spec, LEE_SEE);
     expect(v.kind).toBe("unknown");
   },
 );
@@ -56,7 +54,7 @@ test.skipIf(!fixtureExists("proquest", "drift"))(
   () => {
     const doc = loadFixture("proquest", "drift");
     if (!doc) throw new Error("unreachable");
-    const v = interpret(doc, spec, LEE_SEE);
+    const v = classifyFixture(doc, spec, LEE_SEE);
     expect(v.kind).toBe("unknown");
   },
 );

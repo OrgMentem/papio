@@ -1,8 +1,12 @@
 # Provider adapter fixtures
 
 Captured HTML snapshots of real provider pages, used to fixture-test the
-declarative adapters (`src/adapters/types.ts` → `interpret`) via the happy-dom
-harness (`test/harness.ts`).
+declarative adapters (`src/adapters/types.ts`) through the production planner
+`planExecution` (`src/plan.ts`) — the same function the browser injects — via
+the happy-dom harness (`test/harness.ts`). A fixture test reads the verdict
+through that harness's `classifyFixture` helper, which projects the verdict
+`planExecution` already computed and carries no classification policy of its
+own.
 
 ## Layout
 
@@ -33,7 +37,7 @@ newline, then the full **sanitized** document HTML.
 
 The header carries only scheme + host + path in `origin` (never query or
 fragment). The harness parses the whole file with happy-dom; the header comment
-becomes an inert comment node and `interpret` ignores it.
+becomes an inert comment node and `planExecution` ignores it.
 
 ## Capture → repo workflow
 
@@ -71,9 +75,9 @@ Editing the adapter registry, rebuilding the extension, reloading it, and
 re-driving a live institutional handoff is far too slow a loop to repair an
 adapter that matches a host and then fails to classify the page — that
 failure mode alone accounted for 99 of 103 adapter failures measured on a
-live install. Because `interpret` (`src/adapters/types.ts`) is pure and
-DOM-only, a spec can instead be checked against a stored capture entirely
-offline, with `tools/adapter-try.ts`:
+live install. Because `planExecution` (`src/plan.ts`) is pure and DOM-only on
+its Document path, a spec can instead be checked against a stored capture
+entirely offline, with `tools/adapter-try.ts`:
 
 ```
 bun run adapter:try -- fixtures/tandfonline/success.html --id tandfonline
@@ -100,12 +104,12 @@ or adding an adapter — can be tried the same way with `--spec` instead of
 bun run adapter:try -- fixtures/newprovider/success.html --spec draft-newprovider.json --expect article
 ```
 
-`--title`/`--doi`/`--year` populate `AdapterContext.expected`, the same
-wrong-work title-token check `interpret` runs live. `--allow-network` opts
-into the one live network path described above; every other resolution stays
-fully offline. Both a committed fixture under `fixtures/<id>/<scenario>.html`
-and a raw capture retrieved with `papio adapter captures` work as the
-positional `<captured.html>` argument.
+`--title`/`--doi`/`--year` populate the `ExpectedWork` argument that
+`planExecution` takes, the same wrong-work title-token check it runs live.
+`--allow-network` opts into the one live network path described above; every
+other resolution stays fully offline. Both a committed fixture under
+`fixtures/<id>/<scenario>.html` and a raw capture retrieved with
+`papio adapter captures` work as the positional `<captured.html>` argument.
 
 ## Privacy
 

@@ -5,18 +5,16 @@
 
 import { expect, test } from "bun:test";
 
-import { adapters, interpret } from "../src/adapters/types";
-import { fixtureExists, loadFixture } from "./harness";
+import { adapters } from "../src/adapters/types";
+import { classifyFixture, fixtureExists, loadFixture } from "./harness";
 import { Window } from "happy-dom";
 
 const spec = adapters.find((adapter) => adapter.id === "ebsco");
 if (!spec) throw new Error("ebsco spec missing from registry");
 
 const DIRKS_FERRIN = {
-  expected: {
-    title: "Trust in leadership: Meta-analytic findings and implications for research and practice",
-    year: 2002,
-  },
+  title: "Trust in leadership: Meta-analytic findings and implications for research and practice",
+  year: 2002,
 };
 
 function fixture(scenario: string): Document {
@@ -29,7 +27,7 @@ test.skipIf(!fixtureExists("ebsco", "success"))(
   "matching EBSCO article exposes the declared two-click PDF controls",
   () => {
     const doc = fixture("success");
-    const verdict = interpret(doc, spec, DIRKS_FERRIN);
+    const verdict = classifyFixture(doc, spec, DIRKS_FERRIN);
     expect(verdict.kind).toBe("article");
     expect(verdict.adapter_id).toBe("ebsco");
     expect(doc.querySelector(spec.download?.selector ?? "")).not.toBeNull();
@@ -43,17 +41,15 @@ test.skipIf(!fixtureExists("ebsco", "success"))(
 test.skipIf(!fixtureExists("ebsco", "login-return"))(
   "authenticated EBSCO return page is immediately article-shaped",
   () => {
-    expect(interpret(fixture("login-return"), spec, DIRKS_FERRIN).kind).toBe("article");
+    expect(classifyFixture(fixture("login-return"), spec, DIRKS_FERRIN).kind).toBe("article");
   },
 );
 
 test.skipIf(!fixtureExists("ebsco", "wrong-work"))(
   "different requested work fails the EBSCO title identity check",
   () => {
-    const requestedOtherWork = {
-      expected: { title: "Deep Learning for Image Recognition in Autonomous Vehicles" },
-    };
-    expect(interpret(fixture("wrong-work"), spec, requestedOtherWork).kind).toBe("wrong_work");
+    const requestedOtherWork = { title: "Deep Learning for Image Recognition in Autonomous Vehicles" };
+    expect(classifyFixture(fixture("wrong-work"), spec, requestedOtherWork).kind).toBe("wrong_work");
   },
 );
 
@@ -61,7 +57,7 @@ test.skipIf(!fixtureExists("ebsco", "no-entitlement"))(
   "metadata record with only the institutional link resolver reports no entitlement",
   () => {
     const doc = fixture("no-entitlement");
-    expect(interpret(doc, spec, { expected: {} }).kind).toBe("no_entitlement");
+    expect(classifyFixture(doc, spec).kind).toBe("no_entitlement");
     expect(doc.querySelector("button[data-auto='card-call-to-action']")).not.toBeNull();
   },
 );
@@ -69,7 +65,7 @@ test.skipIf(!fixtureExists("ebsco", "no-entitlement"))(
 test.skipIf(!fixtureExists("ebsco", "drift"))(
   "renamed EBSCO download marker fails closed to unknown",
   () => {
-    expect(interpret(fixture("drift"), spec, DIRKS_FERRIN).kind).toBe("unknown");
+    expect(classifyFixture(fixture("drift"), spec, DIRKS_FERRIN).kind).toBe("unknown");
   },
 );
 
@@ -80,7 +76,7 @@ test("EBSCO PDF viewer classifies as article (canvas-rendered) for the api downl
   const win = new Window({ url: "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details" });
   win.document.head.insertAdjacentHTML("beforeend", "<meta name='citation_title' content='Long short-term memory'>");
   win.document.body.insertAdjacentHTML("beforeend", "<canvas></canvas>");
-  const verdict = interpret(win.document as unknown as Document, spec, { expected: { title: "Long short-term memory" } });
+  const verdict = classifyFixture(win.document as unknown as Document, spec, { title: "Long short-term memory" });
   expect(verdict.kind).toBe("article");
   expect(spec.download?.method).toBe("api");
   expect(spec.download?.idPattern).toContain("viewer/pdf");

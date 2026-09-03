@@ -100,7 +100,20 @@ export interface Plan {
 
 export interface AssistedPlan {
   assisted: string;
+  /** The verdict this same evaluation pass classified, retained for reporting.
+   * `assisted` stays the only authority discriminator, so a verdict carried on
+   * an assisted result never authorizes an effect. Extension-local: it reaches
+   * production only as a chrome.scripting.executeScript result and must never
+   * enter an IPC result or a browser protocol frame. */
+  verdict: PageVerdict;
 }
+
+/** An assisted reason before the verdict is attached. Every nested planner
+ * helper returns this shape, because none of them can see the classification;
+ * the verdict is attached once, at the plan boundary. Type-only on purpose:
+ * types are erased, so this adds no module value the injected planner could
+ * reference. */
+type AssistedReason = { assisted: string };
 
 export type PlanResult = Plan | AssistedPlan;
 
@@ -478,7 +491,7 @@ export function planExecution(
   ): {
     evidence: { normalized: string; fingerprint: string; selector: string; attribute: string; pattern: string | null } | null;
     title: { fingerprint: string; selector: string; attribute: string; pattern: string | null } | null;
-  } | AssistedPlan => {
+  } | AssistedReason => {
     if (requestedDOI === null && requestedTitle === null) return { evidence: null, title: null };
     if (
       contract === undefined ||
@@ -544,7 +557,7 @@ export function planExecution(
     }
     return values.join("|");
   };
-  const targetFor = (rule: DownloadRule): PlanTargetReference | AssistedPlan => {
+  const targetFor = (rule: DownloadRule): PlanTargetReference | AssistedReason => {
     if (rule.selector.length === 0 || rule.selector.length > 512) {
       return { assisted: "declared action selector exceeds the revalidation limit" };
     }
@@ -649,8 +662,11 @@ export function planExecution(
       return null;
     }
   };
-  const buildPlan = (allowDeferred: boolean): PlanResult => {
-    const classified = classify(allowDeferred);
+  // Every assisted return below is a bare reason. buildPlan attaches the
+  // verdict once, at the single boundary where a result leaves this planner.
+  const composePlan = (
+    classified: { verdict: PageVerdict; decisiveRule: string | null },
+  ): Plan | AssistedReason => {
     const page = (() => {
       try {
         return new URL(pageHref);
@@ -807,7 +823,7 @@ export function planExecution(
     const workBindingFor = (
       rule: DownloadRule,
       element: Element,
-    ): PlanTargetWorkBinding | AssistedPlan => {
+    ): PlanTargetWorkBinding | AssistedReason => {
       const contract = rule.workTarget;
       if (contract === undefined) {
         if (requestedDOI !== null || requestedTitle !== null) {
@@ -975,6 +991,13 @@ export function planExecution(
       url,
       required_consequence: "download",
     };
+  };
+  const buildPlan = (allowDeferred: boolean): PlanResult => {
+    const classified = classify(allowDeferred);
+    const composed = composePlan(classified);
+    return "assisted" in composed
+      ? { assisted: composed.assisted, verdict: classified.verdict }
+      : composed;
   };
   const selectorsReady = (): PageKind | null => {
     for (const rule of spec.classify) {

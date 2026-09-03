@@ -209,9 +209,9 @@ export interface ActiveJob {
    * recovery net. Session storage preserves both across worker restarts. */
   landing_recheck_count?: number;
   landing_rechecked_ms?: number;
-  /** Expected work identity from the job offer, used to build the adapter
-   * AdapterContext for declarative classification. Resolver-declared hints
-   * only — never an IdP value. */
+  /** Expected work identity from the job offer, supplied as the expected work
+   * passed to `planExecution`. Resolver-declared hints only — never an IdP
+   * value. */
   expected?: { title?: string; doi?: string };
   /** True when the resolver says this offer needs a warm institutional session.
    * Queued handoffs retain it so a fallback never mints a sign-in request early. */

@@ -1,14 +1,17 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // papio provider adapters are DECLARATIVE selector/pattern specs (source-
-// controlled, versioned) interpreted by exactly one generic function,
-// `interpret`. There is NO free-form injected code and NO "click the likely
-// download button" fallback: a page that matches no rule classifies as
-// `unknown`, and the extension stays in assisted behaviour.
+// controlled, versioned) plus the types that describe them. This file DECLARES
+// them only: the single generic function that interprets a spec is
+// `planExecution` in extension/src/plan.ts, and the injection constraint lives
+// there with it — `planExecution` is intentionally self-contained (it
+// references no module import, helper, or closure at runtime), so the
+// background service worker can hand it verbatim to
+// chrome.scripting.executeScript with the matched spec + args as JSON. That
+// same function is unit-tested against happy-dom fixtures.
 //
-// `interpret` is intentionally self-contained: it references no module import,
-// helper, or closure at runtime, so the background service worker can hand it
-// verbatim to chrome.scripting.executeScript with the matched spec + ctx as
-// JSON args. The same function is unit-tested against happy-dom fixtures.
+// There is NO free-form injected code and NO "click the likely download
+// button" fallback: a page that matches no rule classifies as `unknown`, and
+// the extension stays in assisted behaviour.
 
 export type PageKind =
   | "article"
@@ -174,226 +177,12 @@ export interface TermsAcceptRule {
   textAny: string[];
 }
 
-export interface AdapterContext {
-  expected: { title?: string; doi?: string; year?: number };
-}
-
 export interface PageVerdict {
   kind: PageKind | "wrong_work";
   adapter_id: string;
   adapter_version: string;
   /** Static rule labels only (e.g. `rule:article matched`). NEVER page text. */
   evidence: string[];
-}
-
-/**
- * Classify a provider page against a declarative adapter spec. Pure and
- * DOM-only: no chrome.* usage, no network, no mutation. A live SPA invocation
- * may await declared rule selectors via MutationObserver before classification;
- * fixture Documents classify synchronously.
- *
- * SERIALIZATION CONTRACT: this function must remain self-contained (no imports,
- * helpers, or closures referenced at runtime) so it survives
- * `Function.prototype.toString()` inside chrome.scripting.executeScript. When
- * injected it is called as `interpret(null, spec, ctx)` — the `doc` argument
- * arrives as `null` and we fall back to the page's global `document`; `spec`
- * and `ctx` are the JSON args. Tests pass a real happy-dom Document as `doc`.
- */
-export function interpret(doc: Document, spec: AdapterSpec, ctx: AdapterContext): PageVerdict;
-export function interpret(doc: null, spec: AdapterSpec, ctx: AdapterContext): Promise<PageVerdict>;
-export function interpret(
-  doc: Document | null,
-  spec: AdapterSpec,
-  ctx: AdapterContext,
-): PageVerdict | Promise<PageVerdict> {
-  const root: Document = doc ?? document;
-  const classify = (allowDeferred: boolean): PageVerdict => {
-    const evidence: string[] = [];
-    const adapter_id = spec.id;
-    const adapter_version = spec.version;
-
-    for (const rule of spec.classify) {
-      const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
-      const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
-      const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
-      // A rule with no conditions never matches: refuse a blanket fallback.
-      if (!hasAll && !hasAny && !hasText) continue;
-      if (rule.deferUntilDeadline === true && !allowDeferred) continue;
-
-      if (hasAll) {
-        let ok = true;
-        for (const sel of rule.all as string[]) {
-          if (root.querySelector(sel) === null) {
-            ok = false;
-            break;
-          }
-        }
-        if (!ok) continue;
-      }
-      if (hasAny) {
-        let ok = false;
-        for (const sel of rule.any as string[]) {
-          if (root.querySelector(sel) !== null) {
-            ok = true;
-            break;
-          }
-        }
-        if (!ok) continue;
-      }
-      if (hasText) {
-        const body = root.body;
-        const bodyText = (body && body.innerText ? body.innerText : "").toLowerCase();
-        let ok = false;
-        for (const needle of rule.textAny as string[]) {
-          if (bodyText.indexOf(needle) !== -1) {
-            ok = true;
-            break;
-          }
-        }
-        if (!ok) continue;
-      }
-
-      evidence.push("rule:" + rule.kind + " matched");
-      if (rule.kind === "article") {
-        const expectedTitle = ctx.expected.title;
-        if (expectedTitle !== undefined && expectedTitle.length > 0) {
-          const parts: string[] = [];
-          const h1 = root.querySelector("h1");
-          if (h1 && h1.textContent) parts.push(h1.textContent);
-          const meta = root.querySelector('meta[name="citation_title"]');
-          const metaContent = meta ? meta.getAttribute("content") : null;
-          if (metaContent) parts.push(metaContent);
-          if (root.title) parts.push(root.title);
-          const haystack = parts.join(" ").toLowerCase();
-
-          const tokens = expectedTitle
-            .toLowerCase()
-            .split(/[^a-z0-9]+/)
-            .filter((t) => t.length > 3);
-          let present = 0;
-          for (const tok of tokens) {
-            if (haystack.indexOf(tok) !== -1) present++;
-          }
-          const ratio = tokens.length === 0 ? 1 : present / tokens.length;
-          if (ratio < 0.6) {
-            evidence.push("title-token-check failed");
-            return { kind: "wrong_work", adapter_id, adapter_version, evidence };
-          }
-          evidence.push("title-token-check passed");
-        }
-      }
-
-      return { kind: rule.kind, adapter_id, adapter_version, evidence };
-    }
-
-    evidence.push("no rule matched");
-    return { kind: "unknown", adapter_id, adapter_version, evidence };
-  };
-  // Fixture interpretation is deterministic and synchronous. Only the
-  // serialized live invocation waits for React/custom-element hydration.
-  if (doc !== null) return classify(true);
-  // The ceiling has to exceed every value a spec may declare, or the field is
-  // a lie: it was 5000 while `clinicalkey` declared 8000, so that adapter's
-  // extra budget was silently discarded and the provider's Angular content
-  // player — which really is slower than five seconds when reached through an
-  // institutional resolver hop — kept classifying `unknown`. This is a worst
-  // case, not a delay: the MutationObserver below resolves the instant a
-  // declared selector appears, so a fast page never spends it. The separate
-  // HANDOFF_DRIVE_LIMIT bounds how many stalled provider pages can hold the
-  // drive queue at once.
-  const boundedMs = Math.max(0, Math.min(spec.settleTimeoutMs ?? 0, 15000));
-  if (boundedMs === 0 || root.documentElement === null)
-    return Promise.resolve(classify(true));
-
-  const selectorsReady = (): PageKind | null => {
-    for (const rule of spec.classify) {
-      const hasAll = Array.isArray(rule.all) && rule.all.length > 0;
-      const hasAny = Array.isArray(rule.any) && rule.any.length > 0;
-      const hasText = Array.isArray(rule.textAny) && rule.textAny.length > 0;
-      if (!hasAll && !hasAny && !hasText) continue;
-      if (rule.deferUntilDeadline === true) continue;
-      let allReady = true;
-      if (hasAll) {
-        for (const selector of rule.all as string[]) {
-          try {
-            if (root.querySelector(selector) === null) {
-              allReady = false;
-              break;
-            }
-          } catch {
-            allReady = false;
-            break;
-          }
-        }
-      }
-      let anyReady = true;
-      if (hasAny) {
-        anyReady = false;
-        for (const selector of rule.any as string[]) {
-          try {
-            if (root.querySelector(selector) !== null) {
-              anyReady = true;
-              break;
-            }
-          } catch {
-            // Invalid alternatives cannot authorize a ready rule.
-          }
-        }
-      }
-      let textReady = true;
-      if (hasText) {
-        textReady = false;
-        const bodyText = (root.body?.innerText ?? "").toLowerCase();
-        for (const needle of rule.textAny as string[]) {
-          if (bodyText.includes(needle.toLowerCase())) {
-            textReady = true;
-            break;
-          }
-        }
-      }
-      if (allReady && anyReady && textReady) return rule.kind;
-    }
-    return null;
-  };
-  const deferred = Promise.withResolvers<PageVerdict>();
-  let settled = false;
-  let observer: MutationObserver | null = null;
-  let timer: number | Timer | undefined;
-  let readyTimer: number | Timer | undefined;
-  const finish = (allowDeferred: boolean): void => {
-    if (settled) return;
-    settled = true;
-    observer?.disconnect();
-    clearTimeout(timer);
-    clearTimeout(readyTimer);
-    deferred.resolve(classify(allowDeferred));
-  };
-  const settleWindowMs = Math.min(50, boundedMs);
-  const scheduleWhenReady = (): void => {
-    const readyKind = selectorsReady();
-    if (readyKind === null || readyKind === "article") {
-      if (readyTimer !== undefined) {
-        clearTimeout(readyTimer);
-        readyTimer = undefined;
-      }
-      return;
-    }
-    if (readyTimer === undefined) {
-      readyTimer = setTimeout(
-        () => finish(false),
-        settleWindowMs,
-      );
-    }
-  };
-  observer = new MutationObserver(scheduleWhenReady);
-  observer.observe(root.documentElement, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-  });
-  timer = setTimeout(() => finish(true), boundedMs);
-  scheduleWhenReady();
-  return deferred.promise;
 }
 
 /**
@@ -622,8 +411,9 @@ export const adapters: AdapterSpec[] = [
     // titled "Page loading" with `.c-cksc-content-player.loading` ten seconds
     // after load, while the direct content URL rendered the full 164 KB
     // article with its download anchor inside the same ten seconds. The
-    // declared value was 8000 and silently clamped to 5000 by `interpret`
-    // until that ceiling was raised.
+    // declared value was 8000 and silently clamped to 5000 by the interpreter
+    // (`planExecution` in extension/src/plan.ts) until that ceiling was raised
+    // to 15000.
     id: "clinicalkey",
     version: "0.2.0",
     hosts: ["clinicalkey.com.au"],

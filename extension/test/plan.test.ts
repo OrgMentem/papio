@@ -3,16 +3,29 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Window } from "happy-dom";
 
-import { adapters, interpret, type AdapterSpec } from "../src/adapters/types";
+import { adapters, type AdapterSpec, type PageVerdict } from "../src/adapters/types";
 import { planExecution, planGeneric } from "../src/plan";
-import { captureOrigin, parseHTML } from "./harness";
+import { captureOrigin, parseHTML, verdictOf } from "./harness";
 
 function fixtureHTML(provider: string, scenario: string): string {
   return readFileSync(join(import.meta.dir, "..", "fixtures", provider, `${scenario}.html`), "utf8");
 }
 
+/** Every verdict kind `planExecution` may project. Exhaustive by type: adding a
+ * `PageKind` fails typecheck here until this table names it. */
+const PLANNED_VERDICT_KINDS: Record<PageVerdict["kind"], true> = {
+  article: true,
+  login: true,
+  terms: true,
+  no_entitlement: true,
+  wrong_work_check: true,
+  unknown: true,
+  wrong_work: true,
+};
+
 test("planExecution preserves passive verdicts and fails closed on unbound effects for every fixture", () => {
   const root = join(import.meta.dir, "..", "fixtures");
+  let swept = 0;
   for (const providerEntry of readdirSync(root, { withFileTypes: true })) {
     if (!providerEntry.isDirectory()) continue;
     const spec = adapters.find((candidate) => candidate.id === providerEntry.name);
@@ -22,18 +35,24 @@ test("planExecution preserves passive verdicts and fails closed on unbound effec
       const scenario = fixtureEntry.slice(0, -5);
       const html = fixtureHTML(providerEntry.name, scenario);
       const doc = parseHTML(html, captureOrigin(html) ?? "https://fixture.local/");
-      const expected = { expected: {} };
-      const verdict = interpret(doc, spec, expected);
-      const planned = planExecution(doc, { ...spec, settleTimeoutMs: 0 }, expected.expected, {});
+      const planned = planExecution(doc, { ...spec, settleTimeoutMs: 0 }, {}, {});
+      const verdict = verdictOf(planned);
+      swept++;
+      // One classifier, so there is no second verdict to agree with. The
+      // projected verdict must still name a declared kind and stay bound to the
+      // adapter that produced it — `rule.kind` reaches here from spec data, so
+      // the vocabulary check is a runtime check, not just a type-level one.
+      expect(Object.keys(PLANNED_VERDICT_KINDS)).toContain(verdict.kind);
+      expect(verdict.adapter_id).toBe(spec.id);
+      expect(verdict.adapter_version).toBe(spec.version);
       if ("assisted" in planned) {
         // A fixture without requested-work evidence may classify as an article
         // or terms page, but its unbound effect must stay assisted rather than
-        // being repaired by the harness.
+        // being repaired into a plan.
         expect(["article", "terms"]).toContain(verdict.kind);
         expect(planned.assisted.length).toBeGreaterThan(0);
         continue;
       }
-      expect(planned.verdict).toEqual(verdict);
       if (verdict.kind === "article" && spec.download !== undefined) {
         expect(planned.method).toBe(spec.download.method);
         expect(planned.target_ref).not.toBeNull();
@@ -41,6 +60,8 @@ test("planExecution preserves passive verdicts and fails closed on unbound effec
       }
     }
   }
+  // An empty fixture tree would satisfy every assertion above vacuously.
+  expect(swept).toBeGreaterThan(0);
 });
 
 test("planExecution refuses an ambiguous action target instead of choosing the first match", () => {
@@ -56,7 +77,10 @@ test("planExecution refuses an ambiguous action target instead of choosing the f
       '<a class="pdf" href="https://example.test/two.pdf">two</a></body></html>',
     "https://example.test/article",
   );
-  expect(planExecution(doc, spec, {}, {})).toEqual({ assisted: "declared action target is not unique" });
+  expect(planExecution(doc, spec, {}, {})).toEqual({
+    assisted: "declared action target is not unique",
+    verdict: expect.objectContaining({ kind: "article" }),
+  });
 });
 
 test("planExecution keeps href and meta URL extraction equivalent to live download semantics", () => {
@@ -100,6 +124,7 @@ test("planExecution keeps href and meta URL extraction equivalent to live downlo
   );
   expect(planExecution(selfPage, hrefSpec, {}, {})).toEqual({
     assisted: "declared action URL is not a distinct HTTPS URL",
+    verdict: expect.objectContaining({ kind: "article" }),
   });
 });
 
@@ -139,6 +164,7 @@ test("planExecution rejects a selected target whose explicit DOI is another work
   );
   expect(planExecution(wrong, spec, { doi: "10.1000/right" }, { access_mode: "delegated" })).toEqual({
     assisted: "declared action target does not match the requested work",
+    verdict: expect.objectContaining({ kind: "article" }),
   });
   const valid = parseHTML(
     '<head><meta name="citation_doi" content="10.1000/right"></head>' +
@@ -452,6 +478,7 @@ test("page-derived foreign destinations require a declared origin and path", () 
   const doc = parseHTML('<a class="pdf" href="https://cdn.publisher.test/files/paper.pdf">PDF</a>', "https://publisher.test/article");
   expect(planExecution(doc, base, {}, { access_mode: "delegated" })).toEqual({
     assisted: "declared action URL is not a distinct HTTPS URL",
+    verdict: expect.objectContaining({ kind: "article" }),
   });
   const declared = {
     ...base,
@@ -504,6 +531,7 @@ test("planExecution binds terms text resolution to the packaged modal and unique
   expect("assisted" in planned ? null : planned.effect_graph.terms_target?.control_fingerprint).toEqual(expect.any(String));
   expect(planExecution(doc, spec, {}, { access_mode: "delegated" })).toEqual({
     assisted: "terms effect has no requested work binding",
+    verdict: expect.objectContaining({ kind: "terms" }),
   });
 
   const ambiguous = parseHTML(
