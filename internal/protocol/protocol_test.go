@@ -2988,6 +2988,30 @@ func TestWorkPulseMaximumLegalSize(t *testing.T) {
 	}
 }
 
+// TestWorkPulseLabelCapCountsBytesNotRunes pins the unit of the
+// latest_batch.label bound. TestWorkPulseMaximumLegalSize already accepts 256
+// ASCII bytes, which a rune-counting validator would also accept, so it cannot
+// tell the two rules apart. A producer that truncated to 256 RUNES shipped a
+// label of up to 1024 bytes; the daemon self-validates its outbound frames, so
+// that failure dropped the whole browser session instead of one field.
+func TestWorkPulseLabelCapCountsBytesNotRunes(t *testing.T) {
+	// 200 two-byte runes: under any rune-based cap, over the byte cap at 400.
+	p := fullWorkPulsePayload()
+	p.LatestBatch.Label = strings.Repeat("é", 200)
+	expectProtocolReject(t, MsgWorkPulseResponse, p)
+
+	// The byte cap is reachable exactly with multibyte runes, and a label that
+	// fills it must still be accepted: the rule is a byte bound, not a ban.
+	full := fullWorkPulsePayload()
+	full.LatestBatch.Label = strings.Repeat("é", 128)
+	if len(full.LatestBatch.Label) != 256 {
+		t.Fatalf("fixture = %d bytes, want exactly the 256-byte cap", len(full.LatestBatch.Label))
+	}
+	if _, err := DecodeBrowserMessage(protocolTestFrame(t, MsgWorkPulseResponse, full)); err != nil {
+		t.Fatalf("a label filling the byte cap exactly was rejected: %v", err)
+	}
+}
+
 func TestActivityAndBulkV2Bounds(t *testing.T) {
 	t.Run("activity page 51 entries", func(t *testing.T) {
 		p := fullActivityPageResponse()

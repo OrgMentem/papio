@@ -384,7 +384,7 @@ func TestValidatePipelineMetadataContextErrorPropagates(t *testing.T) {
 // production has no other reason to carry. What this pins is that the reported
 // verdict is the text stage's review, and that it is NOT what the matcher says
 // about the same excerpt.
-func TestValidatePipelineReviewSkipsTheIdentityMatcher(t *testing.T) {
+func TestValidatePipelineReviewVerdictComesFromTextNotTheMatcher(t *testing.T) {
 	// Sparse text (below MinChars) with no OCR tools is the review path, and
 	// unlike a failed converter it still leaves a non-empty excerpt for the
 	// matcher, which is what makes the two verdicts distinguishable.

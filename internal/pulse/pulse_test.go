@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"papio/internal/batch"
 	"papio/internal/job"
@@ -706,13 +707,19 @@ func TestReadLatestBatchPartialMembershipWithholdsCounts(t *testing.T) {
 	}
 }
 
-// TestReadLatestBatchLabelTruncatesAtRuneBound holds the wire bound on a
-// caller-supplied cohort label. Byte-wise truncation would both halve the
-// visible label and risk splitting a multi-byte rune.
-func TestReadLatestBatchLabelTruncatesAtRuneBound(t *testing.T) {
+// TestReadLatestBatchLabelTruncatesToWireByteBound holds the wire bound on a
+// caller-supplied cohort label. protocol.WorkPulseLatestBatch.validate bounds
+// latest_batch.label at 256 UTF-8 BYTES, and the daemon self-validates its own
+// outbound frames, so a label that only satisfies a 256-RUNE bound builds a
+// frame the daemon then rejects — a fatal transport condition that drops the
+// whole browser session. The truncation must also land on a rune boundary,
+// because invalid UTF-8 would survive the control-character check.
+func TestReadLatestBatchLabelTruncatesToWireByteBound(t *testing.T) {
 	ctx := context.Background()
 	js := pulseJobs(t)
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	// 300 two-byte runes: 600 bytes, well over the cap, and no cut at the
+	// 256-byte mark falls on a rune boundary, so a naive slice would split one.
 	label := strings.Repeat("é", 300)
 	insertPulseCohort(t, js, "batch_pulse_label", label, "complete",
 		now.Add(-time.Hour), now.Add(-time.Minute), "", []pulseCohortMember{
@@ -726,13 +733,17 @@ func TestReadLatestBatchLabelTruncatesAtRuneBound(t *testing.T) {
 		t.Fatal("latest_batch = nil, want the seeded cohort")
 	}
 	got := snap.LatestBatch.Label
-	if runes := len([]rune(got)); runes != 256 {
-		t.Fatalf("label runes = %d, want 256", runes)
+	if len(got) > 256 {
+		t.Fatalf("label = %d bytes, want at most 256: the wire validator counts bytes, not runes", len(got))
 	}
-	if len(got) != 512 {
-		t.Fatalf("label bytes = %d, want 512: truncation must count runes, not bytes", len(got))
+	if !utf8.ValidString(got) {
+		t.Fatalf("label %q is not valid UTF-8: truncation split a rune", got)
 	}
-	if got != string([]rune(label)[:256]) {
-		t.Fatalf("label = %q, want the first 256 runes of the stored label", got)
+	// Two-byte runes divide 256 exactly, so the cap is reachable: 128 whole
+	// runes are 256 bytes and all of them must survive. An implementation that
+	// truncated one rune further would pass the cap check above while
+	// needlessly shortening the operator's label.
+	if want := strings.Repeat("é", 128); got != want {
+		t.Fatalf("label = %d bytes, want the 128 whole runes that fill the cap exactly (%d bytes)", len(got), len(want))
 	}
 }

@@ -3,6 +3,7 @@
 package browser
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -193,7 +194,12 @@ func TestRecoverDeferredAutoBind(t *testing.T) {
 		id := parkManualDownload(t, jobs, "wr_recover_noevent",
 			deferredWork("10.1234/recover.noevent.1", "Recovery Without Deferred Event"))
 		g := bindGrab(t, b, id, "Recover No Event", "")
-		writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+		staged := filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf")
+		writeFixturePDF(t, staged)
+		before, err := os.ReadFile(staged)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if err := b.recoverDeferredAutoBind(ctx, g.ID, id); err != nil {
 			t.Fatalf("recoverDeferredAutoBind: %v", err)
@@ -204,6 +210,17 @@ func TestRecoverDeferredAutoBind(t *testing.T) {
 		// leave its own browser.adoption_deferred event behind.
 		if got := countDeferredAdoptions(t, jobs, id); got != 0 {
 			t.Fatalf("browser.adoption_deferred events = %d, want 0 (recovery guessed a filename)", got)
+		}
+		// The file must still be there, byte-identical. Adopting nothing is
+		// only half the contract: recovery that deleted or moved an
+		// unreferenced staged file would destroy an operator's download while
+		// every state and event assertion above still passed.
+		after, err := os.ReadFile(staged)
+		if err != nil {
+			t.Fatalf("staged file did not survive recovery: %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatalf("staged file changed during recovery: %d bytes before, %d after", len(before), len(after))
 		}
 	})
 

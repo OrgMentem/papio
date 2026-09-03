@@ -5,6 +5,7 @@ package sourcegate
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 
 	"papio/internal/config"
@@ -24,6 +25,20 @@ func (p *pacingReserver) Acquire(_ context.Context, source string, policy config
 	p.policies = append(p.policies, policy)
 	p.costs = append(p.costs, cost)
 	return p.err
+}
+
+// recordingHTTP keeps the request it was handed. countingHTTP (egress_test.go)
+// counts calls and discards the request, which cannot witness what reached the
+// wire; the api_key stripping contract is exactly about that.
+type recordingHTTP struct {
+	calls int
+	last  *http.Request
+}
+
+func (r *recordingHTTP) Do(req *http.Request) (*http.Response, error) {
+	r.calls++
+	r.last = req
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody}, nil
 }
 
 // A pacing client without a reserver or without an inner client is unpaced or
@@ -50,7 +65,8 @@ func TestPacingOnlyRefusesIncompleteWiring(t *testing.T) {
 func TestPacingOnlyStripsPolicyAPIKey(t *testing.T) {
 	reserve := &pacingReserver{}
 	policy := config.Source{Enabled: true, APIKey: "private-key", RatePerSec: 4, Burst: 7}
-	client, err := NewPacingOnly(reserve, config.SourceOpenAlex, policy, 2.5, &countingHTTP{})
+	inner := &recordingHTTP{}
+	client, err := NewPacingOnly(reserve, config.SourceOpenAlex, policy, 2.5, inner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,10 +94,15 @@ func TestPacingOnlyStripsPolicyAPIKey(t *testing.T) {
 		t.Fatalf("reserved cost = %v, want 2.5", reserve.costs[0])
 	}
 
-	// The caller's own request must keep its key: stripping is scoped to the
-	// admission policy, never to the wire.
-	if policy.APIKey != "private-key" {
-		t.Fatalf("caller policy mutated to %+v", policy)
+	// The forwarded request must keep its credential: stripping is scoped to
+	// the admission policy, never to the wire. Asserting on `policy` instead
+	// would prove nothing, since NewPacingOnly takes it BY VALUE and cannot
+	// mutate the caller's copy whatever it does to the request.
+	if inner.calls != 1 || inner.last == nil {
+		t.Fatalf("inner calls = %d, last = %v, want exactly one forwarded request", inner.calls, inner.last)
+	}
+	if got := inner.last.URL.Query().Get("api_key"); got != "private-key" {
+		t.Fatalf("forwarded api_key = %q, want the caller's key intact on the wire", got)
 	}
 }
 

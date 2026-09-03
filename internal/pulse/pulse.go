@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"papio/internal/batch"
 	"papio/internal/job"
@@ -732,14 +733,33 @@ func readJobTimes(ctx context.Context, db *sql.DB) (*time.Time, *time.Time, erro
 	return forward, finished, rows.Err()
 }
 
+// maxLabelBytes mirrors protocol.WorkPulseLatestBatch.validate, which bounds
+// latest_batch.label at 256 UTF-8 BYTES. This used to truncate at 256 runes,
+// which is the same number only for ASCII: a 256-rune accented label is up to
+// 1024 bytes, so the daemon built a frame its own outbound validation rejects,
+// and an outbound self-validation failure is a fatal transport condition that
+// tears down the browser session rather than dropping one field.
+const maxLabelBytes = 256
+
+// truncateLabel bounds a label to the wire limit without splitting a rune.
+// Cutting mid-rune would emit invalid UTF-8, which JSON encoding silently
+// turns into U+FFFD and which the control-character check would not catch.
+func truncateLabel(label string) string {
+	if len(label) <= maxLabelBytes {
+		return label
+	}
+	cut := maxLabelBytes
+	for cut > 0 && !utf8.RuneStart(label[cut]) {
+		cut--
+	}
+	return label[:cut]
+}
+
 func latestBatch(p *batch.Projection) *protocol.WorkPulseLatestBatch {
 	if p == nil {
 		return nil
 	}
-	label := p.Label
-	if len([]rune(label)) > 256 {
-		label = string([]rune(label)[:256])
-	}
+	label := truncateLabel(p.Label)
 	out := &protocol.WorkPulseLatestBatch{BatchID: p.BatchID, Label: label, StartedAt: stamp(p.StartedAt), Membership: p.Membership}
 	if p.SettledAt != nil {
 		out.SettledAt = stamp(*p.SettledAt)
