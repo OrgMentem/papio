@@ -36,47 +36,131 @@ const (
 	ModeDelegated    = "delegated"
 )
 
-// Source names used across config, budgets, and resolver registry.
+// Source names used across config, budgets, and resolver registry. The order
+// here is sourceCatalog's order, which is normative: filtered to the
+// acquisition role it is the resolver chain's priority order, and
+// internal/bootstrap's entry list and internal/bench's fixture-backed overlay
+// both derive their order from it.
 const (
 	SourceArXiv            = "arxiv"
 	SourceEuropePMC        = "europepmc"
 	SourceUnpaywall        = "unpaywall"
 	SourceOpenAlex         = "openalex"
+	SourceSemanticScholar  = "semanticscholar"
 	SourceCORE             = "core"
 	SourceCrossrefTDM      = "crossref_tdm"
 	SourceCrossrefMetadata = "crossref_metadata"
 	SourceRetractionWatch  = "retraction_watch"
-	SourceSemanticScholar  = "semanticscholar"
 	SourceOpenAIRE         = "openaire"
 )
 
-// validSourceNames is the exhaustive set of [sources.*] keys papio
-// understands, kept adjacent to the constants above so it cannot drift from
-// them. validate() uses it to fail closed on a misspelled or reserved-but-
-// unimplemented source name instead of silently ignoring it (see the
-// discovery.sources and validateLibrary rationale below).
-var validSourceNames = map[string]bool{
-	SourceArXiv:            true,
-	SourceEuropePMC:        true,
-	SourceUnpaywall:        true,
-	SourceOpenAlex:         true,
-	SourceCORE:             true,
-	SourceCrossrefTDM:      true,
-	SourceCrossrefMetadata: true,
-	SourceRetractionWatch:  true,
-	SourceSemanticScholar:  true,
-	SourceOpenAIRE:         true,
+// SourceRole is one job papio wires a source into, carried as a bit set in a
+// catalog row. A source declares every role it plays, and every role has
+// exactly one production constructor site. Tests in the package that owns the
+// wiring compare the declared roles against that wiring in both directions, so
+// a declared role with no constructor and a constructor with no declared role
+// both fail — which is what keeps one catalog row plus one constructor per role
+// the whole edit surface for adding a source.
+//
+// Roles are deliberately declarative data only: papio never constructs a
+// provider by reflection, dynamic loading, or a name read from config.
+type SourceRole uint8
+
+const (
+	// RoleAcquisitionResolver joins the acquisition resolver chain, in catalog
+	// order (internal/bootstrap/bootstrap.go:resolverEntries). Enablement for
+	// this role is sources.<name>.enabled.
+	RoleAcquisitionResolver SourceRole = 1 << iota
+	// RoleDiscoveryBackend can serve search and watches
+	// (internal/bootstrap/bootstrap.go:discoverySources). Enablement for this
+	// role is selection in discovery.sources, which is independent of
+	// sources.<name>.enabled — see discoveryPolicy's rationale.
+	RoleDiscoveryBackend
+	// RoleMetadataEnricher supplies metadata enrichment
+	// (internal/bootstrap/bootstrap.go's Service.MetadataEnrichers wiring).
+	RoleMetadataEnricher
+	// RoleRetractionSource feeds the retraction sentinel
+	// (internal/bootstrap/bootstrap.go's retraction.New wiring).
+	RoleRetractionSource
+)
+
+// has reports whether r declares role.
+func (r SourceRole) has(role SourceRole) bool { return r&role != 0 }
+
+// sourceCatalogEntry is one implemented source: its [sources.*] key, the roles
+// papio wires it into, and the values Default() ships for it. Holding all three
+// in one row is the point — the name set validate() fails closed against, the
+// shipped defaults, and the wiring roles cannot drift apart when they are the
+// same row.
+type sourceCatalogEntry struct {
+	Name    string
+	Roles   SourceRole
+	Default Source
 }
+
+// sourceCatalog is the exhaustive catalog of implemented sources, in wiring
+// order. It is the single authority for four things that used to be four
+// parallel lists: the [sources.*] keys papio understands, the error text that
+// names them, the shipped [sources.*] baseline, and each source's roles.
+//
+// validate() fails closed against it, so a misspelled or reserved-but-
+// unimplemented source name is a startup error instead of a silently ignored
+// no-op (see the discovery.sources and validateLibrary rationale below).
+var sourceCatalog = []sourceCatalogEntry{
+	{Name: SourceArXiv, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
+	{Name: SourceEuropePMC, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: 2, Burst: 2}},
+	{Name: SourceUnpaywall, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
+	// OpenAlex is the one provider papio uses in three roles against one
+	// keyed daily allowance, which is why its credit fuse ships armed:
+	// DailyCreditFraction is non-zero in the baseline so the fuse is not
+	// inert on first install (papio init and Load's Default() overlay both
+	// depend on that).
+	{Name: SourceOpenAlex, Roles: RoleAcquisitionResolver | RoleDiscoveryBackend | RoleMetadataEnricher, Default: Source{Enabled: false, RatePerSec: 2, Burst: 2, DailyCreditFraction: DefaultDailyCreditFraction}},
+	{Name: SourceSemanticScholar, Roles: RoleAcquisitionResolver | RoleDiscoveryBackend, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
+	{Name: SourceCORE, Roles: RoleAcquisitionResolver, Default: Source{Enabled: false, RatePerSec: 0.4, Burst: 1}},
+	{Name: SourceCrossrefTDM, Roles: RoleAcquisitionResolver, Default: Source{Enabled: false, RatePerSec: 1, Burst: 1}},
+	{Name: SourceCrossrefMetadata, Roles: RoleMetadataEnricher, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
+	{Name: SourceRetractionWatch, Roles: RoleRetractionSource, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
+	// OpenAIRE publishes two ceilings, and papio paces to whichever tier the
+	// request is actually made in (see ADR-0024: never to a response header,
+	// which reports the authenticated ceiling even to keyless callers).
+	// Keyless is 60 requests/hour, so the shipped rate spends 57.6 of them;
+	// effectiveSourceTier raises this row only when client credentials move
+	// the source to the authenticated tier.
+	{Name: SourceOpenAIRE, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: OpenAIREKeylessRatePerSec, Burst: 1}},
+}
+
+// validSourceNames indexes sourceCatalog by name for validate(), which runs
+// once per configured [sources.*] key.
+var validSourceNames = func() map[string]SourceRole {
+	names := make(map[string]SourceRole, len(sourceCatalog))
+	for _, entry := range sourceCatalog {
+		names[entry.Name] = entry.Roles
+	}
+	return names
+}()
 
 // SourceNames enumerates every implemented source, sorted, so a caller that
 // must visit all of them reads the same authority validate() rejects against
 // rather than keeping its own list to fall out of date.
 func SourceNames() []string {
-	names := make([]string, 0, len(validSourceNames))
-	for name := range validSourceNames {
-		names = append(names, name)
-	}
+	names := catalogNames()
 	sort.Strings(names)
+	return names
+}
+
+// SourcesInRole names every catalog source that declares role, in catalog
+// order. The order is the contract for RoleAcquisitionResolver: it is the
+// resolver chain's priority order, so a caller that builds part of that chain
+// (the benchmark's fixture-backed overlay) reproduces production precedence
+// instead of restating it.
+func SourcesInRole(role SourceRole) []string {
+	names := make([]string, 0, len(sourceCatalog))
+	for _, entry := range sourceCatalog {
+		if entry.Roles.has(role) {
+			names = append(names, entry.Name)
+		}
+	}
 	return names
 }
 
@@ -94,9 +178,18 @@ var removedSourceNames = map[string]bool{
 	"openalex_content": true,
 }
 
-// validSourceNamesList renders validSourceNames for error messages, in the
-// same order as the const block above.
-const validSourceNamesList = "arxiv, europepmc, unpaywall, openalex, core, crossref_tdm, crossref_metadata, retraction_watch, semanticscholar, openaire"
+// validSourceNamesList renders the catalog for error messages, in catalog
+// order, so the names papio accepts and the names it advertises are one list.
+var validSourceNamesList = strings.Join(catalogNames(), ", ")
+
+// catalogNames lists every catalog name in catalog order.
+func catalogNames() []string {
+	names := make([]string, 0, len(sourceCatalog))
+	for _, entry := range sourceCatalog {
+		names = append(names, entry.Name)
+	}
+	return names
+}
 
 var validNotifyCategoryNames = map[string]bool{
 	"request_outcome":  true,
@@ -619,27 +712,16 @@ func Default() Config {
 	}
 }
 
-// defaultSources is the shipped [sources.*] baseline. papio init and Load's
-// Default() overlay both depend on non-zero daily_credit_fraction for OpenAlex
-// so a credit fuse is not inert on first install.
+// defaultSources is the shipped [sources.*] baseline, one row per catalog
+// entry: the catalog carries the values, so `papio init` and Load's Default()
+// overlay cannot ship a source the validator rejects, or omit one it accepts.
+// A fresh map each call keeps a caller's mutation out of the catalog.
 func defaultSources() map[string]Source {
-	return map[string]Source{
-		SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
-		SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
-		SourceUnpaywall:        {Enabled: true, RatePerSec: 1, Burst: 1},
-		SourceOpenAlex:         {Enabled: false, RatePerSec: 2, Burst: 2, DailyCreditFraction: DefaultDailyCreditFraction},
-		SourceCORE:             {Enabled: false, RatePerSec: 0.4, Burst: 1},
-		SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},
-		SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
-		SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
-		SourceSemanticScholar:  {Enabled: true, RatePerSec: 1, Burst: 1},
-		// OpenAIRE publishes two ceilings, and papio paces to whichever
-		// tier the request is actually made in (see ADR-0024: never to a
-		// response header, which reports the authenticated ceiling even
-		// to keyless callers). Keyless is 60 requests/hour, so the
-		// shipped rate spends 57.6 of them.
-		SourceOpenAIRE: {Enabled: true, RatePerSec: OpenAIREKeylessRatePerSec, Burst: 1},
+	sources := make(map[string]Source, len(sourceCatalog))
+	for _, entry := range sourceCatalog {
+		sources[entry.Name] = entry.Default
 	}
+	return sources
 }
 
 // OpenAIRE's two documented rate ceilings, and the pacing papio uses inside
@@ -884,7 +966,7 @@ func (c *Config) validate() error {
 		// otherwise accepted and silently does nothing, suppressing an
 		// acquisition route the user asked for — the same failure mode
 		// validateLibrary's doc comment argues must be a startup error.
-		if !validSourceNames[name] && !removedSourceNames[name] {
+		if _, known := validSourceNames[name]; !known && !removedSourceNames[name] {
 			return fmt.Errorf("sources.%s is not a recognized source name (valid names: %s)", name, validSourceNamesList)
 		}
 		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {
@@ -933,8 +1015,11 @@ func (c *Config) validate() error {
 	}
 	seenDiscovery := map[string]bool{}
 	for _, name := range c.Discovery.Sources {
-		if name != SourceOpenAlex && name != SourceSemanticScholar {
-			return fmt.Errorf("discovery.sources entry %q must be %s or %s", name, SourceOpenAlex, SourceSemanticScholar)
+		// Selection here is discovery's own enablement, so a name papio has no
+		// discovery backend for must fail closed rather than silently drop out
+		// of the merge order — the same rule the [sources.*] keys above follow.
+		if !validSourceNames[name].has(RoleDiscoveryBackend) {
+			return fmt.Errorf("discovery.sources entry %q must be one of: %s", name, strings.Join(SourcesInRole(RoleDiscoveryBackend), ", "))
 		}
 		if seenDiscovery[name] {
 			return fmt.Errorf("discovery.sources lists %q twice", name)

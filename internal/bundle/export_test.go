@@ -76,7 +76,7 @@ func readyFixtureWithIdentity(t *testing.T, identity string) (*Exporter, string,
 		t.Fatal(err)
 	}
 	sha, _, _ := artifact.HashFile(temp)
-	path, err := arts.Promote(temp, sha)
+	path, _, err := arts.Promote(temp, sha)
 	if err != nil {
 		t.Fatal(err)
 	}

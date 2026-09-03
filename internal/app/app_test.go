@@ -406,9 +406,9 @@ func TestResolveContinuesAfterTemporaryEnrichmentFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.TemporaryResolvers != 1 || plan.Kind() != retryKindTemporary {
-		t.Fatalf("plan = %+v, kind = %q; want one temporary observation charged as %q",
-			plan, plan.Kind(), retryKindTemporary)
+	if plan.temporary().IsZero() || plan.kind() != retryKindTemporary {
+		t.Fatalf("plan = %+v, kind = %q; want a temporary observation charged as %q",
+			plan, plan.kind(), retryKindTemporary)
 	}
 	if enricher.calls != 1 || adapter.calls != 1 {
 		t.Fatalf("enricher/resolver calls = %d/%d, want 1/1", enricher.calls, adapter.calls)
@@ -1169,7 +1169,7 @@ func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
 	}
 }
 
-func TestValidationRemovesMetadataWhenPromotionFails(t *testing.T) {
+func TestValidationRetainsPreparedPublicationWhenPromotionFails(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
 	row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs, "wr_promotion_rollback", "promotion-rollback", "promotion-rollback")
@@ -1192,9 +1192,90 @@ func TestValidationRemovesMetadataWhenPromotionFails(t *testing.T) {
 	if _, err := os.Stat(dest); !os.IsNotExist(err) {
 		t.Fatalf("artifact file remains after promotion failure: %v", err)
 	}
+	prepared, err := jobs.PreparedPublications(ctx, row.ID)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared publications = %+v, %v; want one durable owner", prepared, err)
+	}
+	if err := svc.reconcilePreparedPublications(ctx, row.ID); err != nil {
+		t.Fatalf("recover missing publication: %v", err)
+	}
+	prepared, err = jobs.PreparedPublications(ctx, row.ID)
+	if err != nil || len(prepared) != 0 {
+		t.Fatalf("prepared publications after recovery = %+v, %v; want none", prepared, err)
+	}
 	art, err := jobs.GetArtifact(ctx, sha)
 	if err != nil || art != nil {
-		t.Fatalf("artifact metadata remains after promotion failure = %+v, %v", art, err)
+		t.Fatalf("artifact metadata after discarded publication = %+v, %v", art, err)
+	}
+}
+
+func TestRecoverPreparedPublicationsDefersActiveBrowserLease(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	row, candidate, _, tempPath, sha := seedValidatingCandidate(t, svc, jobs, "wr_active_publication_lease", "active-publication", "active-publication")
+	owner := "active-browser-owner"
+	if claimed, err := jobs.Claim(ctx, row.ID, owner, time.Minute); err != nil || claimed == nil {
+		t.Fatalf("claim validating job = %+v, %v", claimed, err)
+	}
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateID := candidate.ID
+	publication := job.PublicationInput{
+		ID:             job.NewID("publication"),
+		JobID:          row.ID,
+		CandidateID:    &candidateID,
+		Role:           job.PublicationRoleMain,
+		SHA256:         sha,
+		QuarantinePath: tempPath,
+		LeaseOwner:     &owner,
+		Artifact: job.Artifact{
+			SHA256: sha, SizeBytes: 1, MIME: "application/pdf", Path: dest,
+		},
+		FromState: job.StateValidating, ToState: job.StateReady,
+		TransitionDetail: map[string]any{"candidate_id": candidate.ID, "sha256": sha},
+	}
+	if err := jobs.PreparePublication(ctx, publication); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatalf("active lease recovery must defer rather than abort startup: %v", err)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, row.ID)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("active lease publication = %+v, %v; want intact journal", prepared, err)
+	}
+	if err := jobs.Release(ctx, row.ID, owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatalf("recover after lease release: %v", err)
+	}
+	recovered, err := jobs.Get(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != job.StateReady {
+		t.Fatalf("recovered state = %s, want ready", recovered.State)
+	}
+}
+
+func TestRecoverPreparedPublicationsSweepsAbandonedComponentStage(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newTestService(t)
+	stage, err := svc.Artifacts.QuarantineDir(job.NewID("component-stage"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "abandoned.tmp"), []byte("abandoned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatalf("recover prepared publications: %v", err)
+	}
+	if _, err := os.Stat(stage); !os.IsNotExist(err) {
+		t.Fatalf("abandoned component stage remains at %s: %v", stage, err)
 	}
 }
 
@@ -2765,19 +2846,16 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 
 	t.Run("wake_time_is_earliest_of_all_three_observations", func(t *testing.T) {
 		base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-		plan := retryPlan{
-			CandidateTemporary: base.Add(3 * time.Minute),
-			ResolverTemporary:  base.Add(1 * time.Minute), // earliest
-			Gate:               base.Add(2 * time.Minute),
-		}
+		plan := retryPlan{}
+		plan.observeCandidateTemporary(base, 3*time.Minute, time.Second)
+		plan.observeResolverTemporary(base, time.Minute, time.Second) // earliest
+		plan.observeBudgetRefusal(&budget.ErrDeferred{Until: base.Add(2 * time.Minute)})
 		want := base.Add(1 * time.Minute)
-		if got := plan.At(); !got.Equal(want) {
-			t.Fatalf("At() = %v, want earliest observation %v", got, want)
+		if got := plan.at(); !got.Equal(want) {
+			t.Fatalf("retry wake = %v, want earliest observation %v", got, want)
 		}
-		// Splitting Temporary into two fields must not change what a caller
-		// that only cares "when" sees.
-		if got := plan.Temporary(); !got.Equal(want) {
-			t.Fatalf("Temporary() = %v, want %v", got, want)
+		if got := plan.temporary(); !got.Equal(want) {
+			t.Fatalf("temporary retry = %v, want %v", got, want)
 		}
 	})
 
@@ -2791,24 +2869,20 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 	t.Run("advisory_throttle_never_outranks_a_durable_gate", func(t *testing.T) {
 		base := time.Date(2026, 8, 12, 1, 37, 0, 0, time.UTC)
 		plan := retryPlan{}
-		plan.recordDeferral(&budget.ErrDeferred{
+		plan.observeBudgetRefusal(&budget.ErrDeferred{
 			Source: "openalex", Until: base.Add(23 * time.Hour),
 		})
-		plan.recordDeferral(&budget.ErrDeferred{
+		plan.observeBudgetRefusal(&budget.ErrDeferred{
 			Source: "openaire", Until: base.Add(5 * time.Second), Advisory: true,
 		})
-		if got, want := plan.At(), base.Add(23*time.Hour); !got.Equal(want) {
-			t.Fatalf("At() = %v, want the durable gate %v", got, want)
+		if got, want := plan.at(), base.Add(23*time.Hour); !got.Equal(want) {
+			t.Fatalf("retry wake = %v, want the durable gate %v", got, want)
 		}
-		if plan.ClosedSourceGates != 1 || plan.AdvisoryBackoffs != 1 {
-			t.Fatalf("counters = %d gates / %d advisory, want 1/1",
-				plan.ClosedSourceGates, plan.AdvisoryBackoffs)
+		if !plan.hasClosedSourceGate() || plan.advisoryOnly() {
+			t.Fatal("a pass holding a durable gate must stay distinct from advisory-only")
 		}
-		if plan.AdvisoryOnly() {
-			t.Fatal("a pass holding a durable gate is not advisory-only")
-		}
-		if plan.Kind() != retryKindSourceGate {
-			t.Fatalf("Kind() = %q, want %q", plan.Kind(), retryKindSourceGate)
+		if plan.kind() != retryKindSourceGate {
+			t.Fatalf("kind = %q, want %q", plan.kind(), retryKindSourceGate)
 		}
 	})
 
@@ -2824,17 +2898,19 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 	// answered-but-empty pass into an uncharged 30-second re-park forever.
 	t.Run("a_pass_that_reached_sources_is_still_charged", func(t *testing.T) {
 		now := time.Date(2026, 8, 12, 1, 37, 0, 0, time.UTC)
-		plan := retryPlan{SourcesCalled: 2}
-		plan.recordDeferral(&budget.ErrDeferred{
+		plan := retryPlan{}
+		plan.observeSourceCalled()
+		plan.observeSourceCalled()
+		plan.observeBudgetRefusal(&budget.ErrDeferred{
 			Source: "openaire", Until: now.Add(3 * time.Second), Advisory: true,
 		})
-		if plan.AdvisoryOnly() {
+		if plan.advisoryOnly() {
 			t.Fatal("a pass that called sources is not advisory-only")
 		}
-		if plan.Kind() != retryKindTemporary {
-			t.Fatalf("Kind() = %q, want %q so the retry budget bounds it", plan.Kind(), retryKindTemporary)
+		if plan.kind() != retryKindTemporary {
+			t.Fatalf("kind = %q, want %q so the retry budget bounds it", plan.kind(), retryKindTemporary)
 		}
-		if plan.IsZero() {
+		if plan.empty() {
 			t.Fatal("a throttled source papio never asked must not settle the job")
 		}
 	})
@@ -2858,14 +2934,14 @@ func TestRetryPlanReportsWhatItObserved(t *testing.T) {
 			t.Fatal(err)
 		}
 		plan := retryPlan{}
-		plan.recordDeferral(&budget.ErrDeferred{
+		plan.observeBudgetRefusal(&budget.ErrDeferred{
 			Source: "openaire", Until: now.Add(3 * time.Second), Advisory: true,
 		})
-		if !plan.AdvisoryOnly() || plan.IsZero() {
-			t.Fatalf("advisory-only plan = %+v, want advisory-only and non-zero", plan)
+		if !plan.advisoryOnly() || plan.empty() {
+			t.Fatalf("advisory-only plan = %+v, want advisory-only and non-empty", plan)
 		}
-		if plan.Kind() != retryKindAdvisory {
-			t.Fatalf("Kind() = %q, want %q", plan.Kind(), retryKindAdvisory)
+		if plan.kind() != retryKindAdvisory {
+			t.Fatalf("kind = %q, want %q", plan.kind(), retryKindAdvisory)
 		}
 		if err := svc.parkForRetry(ctx, row, job.StateResolving, plan,
 			map[string]any{"reason": "resolver_temporarily_unavailable"},

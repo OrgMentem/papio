@@ -1151,6 +1151,89 @@ func TestSubmitDeliveryMatchesAutomaticRoute(t *testing.T) {
 		t.Fatalf("posted DOI = %v", postedBody["DOI"])
 	}
 }
+func TestSubmitDeliveryUsesPinnedRequestAfterIdentityPromotion(t *testing.T) {
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://illiad.example.test")
+	ctx := context.Background()
+
+	id, err := svc.Submit(ctx, protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion,
+		RequestID:     "wr_pinned_delivery_identity",
+		Identifiers:   &protocol.Identifiers{PMID: "12345678"},
+		Title:         "Pinned delivery identity",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimNext(ctx, "pinned-identity", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: before.Work.Describe(), State: delivery.StateUnknownOutcome,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.FillWorkMetadata(ctx, id, work.Work{DOI: "10.1234/promoted-delivery-identity"}); err != nil {
+		t.Fatal(err)
+	}
+	afterPromotion, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterPromotion.Work.Describe() == request.WorkIdentity {
+		t.Fatal("test is void: resolver promotion did not change the work identity")
+	}
+
+	result, err := svc.SubmitDelivery(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Branch != delivery.BranchReconcile || result.Request == nil || result.Request.ID != request.ID {
+		t.Fatalf("SubmitDelivery result = %+v, want pinned reconciliation row %d", result, request.ID)
+	}
+	var count int
+	if err := deliverySvc.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM delivery_requests WHERE job_id = ?`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("delivery rows = %d, want one pinned row", count)
+	}
+	var pointer int64
+	if err := deliverySvc.DB().QueryRowContext(ctx, `SELECT delivery_request_id FROM jobs WHERE id = ?`, id).Scan(&pointer); err != nil {
+		t.Fatal(err)
+	}
+	if pointer != request.ID {
+		t.Fatalf("jobs.delivery_request_id = %d, want %d", pointer, request.ID)
+	}
+	actions, err := jobs.ListHumanActionsForJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var open, resolved int
+	for _, action := range actions {
+		if action.Action.Kind != job.ActionKindDocumentDelivery {
+			continue
+		}
+		if action.Action.Status == "open" {
+			open++
+		} else {
+			resolved++
+		}
+	}
+	if open != 1 || resolved != 0 {
+		t.Fatalf("document_delivery actions: open=%d resolved=%d, want one open and no resolved", open, resolved)
+	}
+}
 
 // TestExhaustedCandidatesConservativeModeRecordsDeliveryAdvisoryEvent proves
 // ADR-0017 Decision 3B condition 1's conservative carve-out: a configured
@@ -2202,5 +2285,90 @@ func TestReassignOfferedRequestCAS(t *testing.T) {
 	}
 	if again.JobID != jobB {
 		t.Fatalf("row job_id after submitted reassign = %s want %s", again.JobID, jobB)
+	}
+}
+
+// The reconciliation park is one store transaction, plus the notice park used
+// to route after its own transition. Refusing the transition with a trigger
+// proves both halves are tied together: no prompt is left behind for a job
+// that stayed resolving, and no human notice goes out for a park that never
+// happened.
+func TestOpenDeliveryReconciliationActionParksAtomicallyAndNotifies(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	notifier := &fakeNotificationSink{}
+	svc.Notifier = notifier
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_reconcile_atomic_001", "10.1000/reconcile-atomic-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
+		map[string]any{"reason": "test_setup"}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := &delivery.Request{
+		ID: 4242, JobID: id, Provider: "illiad",
+		ProviderReference: "TN-9", State: delivery.StateUnknownOutcome,
+	}
+
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_reconciliation_park
+		BEFORE UPDATE OF state ON jobs
+		WHEN NEW.state = 'awaiting_human'
+		BEGIN SELECT RAISE(ABORT, 'injected park failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.openDeliveryReconciliationAction(ctx, row, job.StateResolving, existing); err == nil {
+		t.Fatal("reconciliation park succeeded despite the injected transition failure")
+	}
+	unparked, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unparked.State != job.StateResolving {
+		t.Fatalf("state = %q, want resolving", unparked.State)
+	}
+	open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("failed park left a stale prompt: %+v", open)
+	}
+	if notifier.human != 0 {
+		t.Fatalf("human notifications = %d, want 0 for a park that did not happen", notifier.human)
+	}
+
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER reject_reconciliation_park`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.openDeliveryReconciliationAction(ctx, row, job.StateResolving, existing); err != nil {
+		t.Fatalf("reconciliation park after dropping the trigger: %v", err)
+	}
+	parked, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.State != job.StateAwaitingHuman {
+		t.Fatalf("state = %q, want awaiting_human", parked.State)
+	}
+	open, err = jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("open actions = %+v, want exactly one", open)
+	}
+	if open[0].Kind != job.ActionKindDocumentDelivery || open[0].Detail != DeliveryReconciliationActionDetail(existing) {
+		t.Fatalf("action = %+v", open[0])
+	}
+	if notifier.human != 1 {
+		t.Fatalf("human notifications = %d, want 1", notifier.human)
 	}
 }

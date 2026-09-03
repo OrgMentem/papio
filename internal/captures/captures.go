@@ -259,18 +259,31 @@ func (s *Store) writePendingIndexLocked(index map[string]string) error {
 	return writeAtomically(s.root, pendingIndexPath(s.root), data)
 }
 
-func (s *Store) addPendingIndexLocked(jobID string) error {
+// addPendingIndexLocked records the job's provisional lease association. It
+// reports whether this call introduced the entry, so a rollback undoes only its
+// own side effect and never deletes an association that an earlier successful
+// capture committed.
+func (s *Store) addPendingIndexLocked(jobID string) (bool, error) {
 	data, err := os.ReadFile(pendingIndexPath(s.root))
 	index := map[string]string{}
 	if err == nil {
 		if err := json.Unmarshal(data, &index); err != nil {
-			return fmt.Errorf("decoding capture pending index: %w", err)
+			return false, fmt.Errorf("decoding capture pending index: %w", err)
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
+		return false, err
 	}
-	index[pendingFingerprint(jobID)] = strings.TrimSpace(jobID)
-	return s.writePendingIndexLocked(index)
+	fingerprint := pendingFingerprint(jobID)
+	trimmed := strings.TrimSpace(jobID)
+	previous, existed := index[fingerprint]
+	if existed && previous == trimmed {
+		return false, nil
+	}
+	index[fingerprint] = trimmed
+	if err := s.writePendingIndexLocked(index); err != nil {
+		return false, err
+	}
+	return !existed, nil
 }
 
 func (s *Store) removePendingIndexLocked(jobID string) error {
@@ -288,6 +301,49 @@ func (s *Store) removePendingIndexLocked(jobID string) error {
 	delete(index, pendingFingerprint(jobID))
 	return s.writePendingIndexLocked(index)
 }
+
+// pendingRoleLocked reports whether a capture becomes the incident's first
+// decisive evidence or its new latest. The scan reads pins only; it publishes
+// nothing, so a failure here leaves no side effect to undo.
+func (s *Store) pendingRoleLocked(ctx context.Context, fingerprint string) (PinRole, error) {
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return PinFirstDecisive, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return "", err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if err != nil {
+			return "", err
+		}
+		for _, candidate := range files {
+			pin, ok := readPin(candidate.Path)
+			if ok && pin.Fingerprint == fingerprint && pin.Role == PinFirstDecisive {
+				return PinLatest, nil
+			}
+		}
+	}
+	return PinFirstDecisive, nil
+}
+
+// pinPendingLocked pins a capture the caller has just written and records the
+// durable lease association for its job. It is all-or-nothing: a failure undoes
+// the pin sidecar and the index entry this call published, and it displaces a
+// prior latest marker only after both are durable. A caller that sees an error
+// therefore never observes a demoted earlier capture, an unenumerable lease, or
+// a pin that exempts the capture from retention forever.
 func (s *Store) pinPendingLocked(ctx context.Context, path, jobID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -297,49 +353,39 @@ func (s *Store) pinPendingLocked(ctx context.Context, path, jobID string) error 
 		return err
 	}
 	fingerprint := pendingFingerprint(jobID)
-	role := PinFirstDecisive
-	entries, err := os.ReadDir(s.root)
-	if errors.Is(err, fs.ErrNotExist) {
-		if err := s.writePinLocked(file, fingerprint, role); err != nil {
-			return err
-		}
-		return s.addPendingIndexLocked(jobID)
-	}
+	role, err := s.pendingRoleLocked(ctx, fingerprint)
 	if err != nil {
 		return err
-	}
-	for _, entry := range entries {
-		info, infoErr := entry.Info()
-		if infoErr != nil {
-			return infoErr
-		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			continue
-		}
-		files, scanErr := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
-		if scanErr != nil {
-			return scanErr
-		}
-		for _, candidate := range files {
-			pin, ok := readPin(candidate.Path)
-			if ok && pin.Fingerprint == fingerprint && pin.Role == PinFirstDecisive {
-				role = PinLatest
-				break
-			}
-		}
-		if role == PinLatest {
-			break
-		}
-	}
-	if role == PinLatest {
-		if err := s.removeIncidentRoleLocked(ctx, fingerprint, PinLatest, file.Path); err != nil {
-			return err
-		}
 	}
 	if err := s.writePinLocked(file, fingerprint, role); err != nil {
 		return err
 	}
-	return s.addPendingIndexLocked(jobID)
+	indexed, err := s.addPendingIndexLocked(jobID)
+	if err != nil {
+		s.discardPinLocked(file.Path)
+		return err
+	}
+	if role != PinLatest {
+		return nil
+	}
+	// The previous latest marker is displaced last. Demoting it before the two
+	// writes above would leave the incident with no latest evidence whenever
+	// either of them failed.
+	if err := s.removeIncidentRoleLocked(ctx, fingerprint, PinLatest, file.Path); err != nil {
+		s.discardPinLocked(file.Path)
+		if indexed {
+			_ = s.removePendingIndexLocked(jobID)
+		}
+		return err
+	}
+	return nil
+}
+
+// discardPinLocked drops a pin sidecar this call published. The caller derived
+// the path from capture bytes it created in the same call, so no marker from an
+// earlier successful capture can be removed here.
+func (s *Store) discardPinLocked(path string) {
+	_ = os.Remove(pinPath(path))
 }
 
 func (s *Store) store(ctx context.Context, host, scenario, adapterID, adapterVersion, sanitizerProvenance, sanitizerVersion, jobID string, html []byte) (string, error) {
@@ -388,7 +434,15 @@ func (s *Store) store(ctx context.Context, host, scenario, adapterID, adapterVer
 	}
 	if strings.TrimSpace(jobID) != "" && scenario != "observed" {
 		if err := s.pinPendingLocked(ctx, path, jobID); err != nil {
-			return path, err
+			// Without its pin and lease entry the capture would be
+			// unreleasable: pruneHost keeps any pinned file regardless of age
+			// or count, and PendingJobs enumerates the index alone. Undo the
+			// bytes and metadata this call wrote and report no path, so the
+			// caller cannot mistake the discarded capture for stored evidence.
+			s.discardPinLocked(path)
+			_ = os.Remove(path)
+			_ = os.Remove(metadataPath)
+			return "", err
 		}
 	}
 	if err := s.pruneHost(ctx, hostDir, verbatimHost); err != nil {
@@ -576,28 +630,38 @@ func (s *Store) writePinLocked(file captureFile, fingerprint string, role PinRol
 	return writeAtomically(filepath.Dir(file.Path), pinPath(file.Path), data)
 }
 
-func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string, role PinRole, keepPath string) error {
+// displacedPin remembers a role marker verbatim so a failed displacement can
+// republish it instead of leaving the incident without that role.
+type displacedPin struct {
+	file captureFile
+	pin  capturePin
+}
+
+// findIncidentRoleLocked collects every marker for one incident role except the
+// capture at keepPath. It only reads.
+func (s *Store) findIncidentRoleLocked(ctx context.Context, fingerprint string, role PinRole, keepPath string) ([]displacedPin, error) {
 	entries, err := os.ReadDir(s.root)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var found []displacedPin
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
 		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, file := range files {
 			if filepath.Clean(file.Path) == filepath.Clean(keepPath) {
@@ -605,13 +669,35 @@ func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string
 			}
 			pin, ok := readPin(file.Path)
 			if ok && pin.Fingerprint == fingerprint && pin.Role == role {
-				if err := os.Remove(pinPath(file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return err
-				}
+				found = append(found, displacedPin{file: file, pin: pin})
 			}
 		}
 	}
+	return found, nil
+}
+
+// removeIncidentRoleLocked drops every marker for one incident role except the
+// capture at keepPath. It is all-or-nothing: a failure part way through
+// republishes the markers already removed, so no caller can lose a prior
+// latest capture to a partially applied displacement.
+func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string, role PinRole, keepPath string) error {
+	displaced, err := s.findIncidentRoleLocked(ctx, fingerprint, role, keepPath)
+	if err != nil {
+		return err
+	}
+	for i, marker := range displaced {
+		if err := os.Remove(pinPath(marker.file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			s.restorePinsLocked(displaced[:i])
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Store) restorePinsLocked(displaced []displacedPin) {
+	for _, marker := range displaced {
+		_ = s.writePinLocked(marker.file, marker.pin.Fingerprint, marker.pin.Role)
+	}
 }
 
 // ReleaseIncident removes all retention markers for an incident. The next

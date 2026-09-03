@@ -64,7 +64,7 @@ func TestWeakTitleMatchDoesNotPromoteDOI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !plan.IsZero() {
+	if !plan.empty() {
 		t.Fatalf("plan = %+v, want zero after settlement", plan)
 	}
 	got, err := jobs.Get(ctx, created.JobID)

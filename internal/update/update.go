@@ -6,6 +6,7 @@ package update
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -25,6 +26,11 @@ const (
 	// maxReleaseBody bounds the release payload the same way every resolver
 	// bounds an upstream response body.
 	maxReleaseBody = 1 << 20
+	// cacheLockRetry and cacheLockWait bound the wait for the cross-process
+	// cache lock. Every critical section is one small file read plus one
+	// atomic rename, so a healthy holder releases the lock almost immediately.
+	cacheLockRetry = 5 * time.Millisecond
+	cacheLockWait  = 2 * time.Second
 )
 
 // Info describes the latest release known to a checker.
@@ -51,7 +57,9 @@ type Checker struct {
 	releasesURL string
 	client      *http.Client
 	now         func() time.Time
-	// mu guards cache file access. It is never held while a refresh is in flight.
+	// mu guards cache file access inside this process. It is never held while
+	// a refresh is in flight. Cross-process coordination needs the advisory
+	// file lock in the data directory as well; see updateCache.
 	mu sync.Mutex
 	// refreshMu serializes stale-cache refreshes, including the HTTP request.
 	// Check takes refreshMu only after releasing mu.
@@ -168,14 +176,16 @@ func (c *Checker) Check(ctx context.Context) *Info {
 	defer response.Body.Close()
 
 	if response.StatusCode == http.StatusNotModified {
-		c.mu.Lock()
-		cached = c.readCache()
-		cached.CheckedAt = now
-		cached.LastAttemptAt = now
-		_ = c.writeCache(cached)
-		info := cached.info()
-		c.mu.Unlock()
-		return info
+		merged, err := c.updateCache(func(cached *cache) bool {
+			cached.CheckedAt = now
+			cached.LastAttemptAt = now
+			return true
+		})
+		if err != nil {
+			cached.CheckedAt = now
+			return cached.info()
+		}
+		return merged.info()
 	}
 	if response.StatusCode != http.StatusOK {
 		c.recordAttempt(now)
@@ -192,47 +202,53 @@ func (c *Checker) Check(ctx context.Context) *Info {
 		c.recordAttempt(now)
 		return cached.info()
 	}
-	c.mu.Lock()
-	cached = c.readCache()
-	cached.ETag = response.Header.Get("ETag")
-	cached.LatestVersion = latest.TagName
-	cached.URL = latest.HTMLURL
-	cached.CheckedAt = now
-	cached.LastAttemptAt = now
-	_ = c.writeCache(cached)
-	info := cached.info()
-	c.mu.Unlock()
-	return info
+	etag := response.Header.Get("ETag")
+	merged, err := c.updateCache(func(cached *cache) bool {
+		cached.ETag = etag
+		cached.LatestVersion = latest.TagName
+		cached.URL = latest.HTMLURL
+		cached.CheckedAt = now
+		cached.LastAttemptAt = now
+		return true
+	})
+	if err != nil {
+		// Persistence is soft: the caller still receives the release this
+		// request just fetched.
+		return &Info{LatestVersion: latest.TagName, URL: latest.HTMLURL, CheckedAt: now}
+	}
+	return merged.info()
 }
 
 // recordAttempt persists the attempt clock after a check that reached a
 // conclusion but produced no usable release, leaving any previously cached
 // release metadata untouched.
 func (c *Checker) recordAttempt(now time.Time) {
-	c.mu.Lock()
-	cached := c.readCache()
-	cached.LastAttemptAt = now
-	_ = c.writeCache(cached)
-	c.mu.Unlock()
+	_, _ = c.updateCache(func(cached *cache) bool {
+		cached.LastAttemptAt = now
+		return true
+	})
 }
 
-// TryMarkNagged atomically records a displayed update prompt when none has
-// been displayed in the past day. A persistence failure suppresses the prompt
-// so the caller never turns a missing cache into repeated stderr noise.
+// TryMarkNagged records a displayed update prompt when none has been displayed
+// in the past day. The decision is one cross-process compare-and-set on the
+// cache file, so two papio processes that both see an available update yield
+// exactly one prompt. A persistence failure suppresses the prompt so the
+// caller never turns a missing cache into repeated stderr noise.
 func (c *Checker) TryMarkNagged(now time.Time) bool {
 	if c == nil {
 		return false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	cached := c.readCache()
 	now = now.UTC()
-	if checkedRecently(cached.LastNaggedAt, now) {
-		return false
-	}
-	cached.LastNaggedAt = now
-	return c.writeCache(cached) == nil
+	marked := false
+	_, err := c.updateCache(func(cached *cache) bool {
+		if checkedRecently(cached.LastNaggedAt, now) {
+			return false
+		}
+		cached.LastNaggedAt = now
+		marked = true
+		return true
+	})
+	return marked && err == nil
 }
 
 // IsNewer compares the numeric major.minor.patch cores used by papio version
@@ -334,13 +350,76 @@ func (c *Checker) RememberInstalledVersion(version string) {
 	if c == nil || strings.TrimSpace(version) == "" {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cached := c.readCache()
-	cached.InstalledVersion = strings.TrimSpace(version)
-	_ = c.writeCache(cached)
+	trimmed := strings.TrimSpace(version)
+	_, _ = c.updateCache(func(cached *cache) bool {
+		cached.InstalledVersion = trimmed
+		return true
+	})
 }
 
+// updateCache performs one read-modify-write cycle on the cache file while
+// holding both the instance mutex and the advisory file lock in the data
+// directory. It re-reads the cache from disk inside the lock, so mutate sees
+// the newest state and every field it leaves alone survives, including fields
+// another papio process wrote after this one read the cache. mutate reports
+// whether the cache has to be written back, which makes the whole cycle a
+// cross-process compare-and-set.
+func (c *Checker) updateCache(mutate func(cached *cache) bool) (cache, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	release, err := c.acquireCacheLock()
+	if err != nil {
+		return cache{}, err
+	}
+	defer release()
+	cached := c.readCache()
+	if !mutate(&cached) {
+		return cached, nil
+	}
+	return cached, c.writeCache(cached)
+}
+
+// cacheLockPath keeps the lock beside its own cache file so the papio and
+// zotio checkers never contend with each other.
+func (c *Checker) cacheLockPath() string {
+	return c.cachePath() + ".lock"
+}
+
+// acquireCacheLock takes the cross-process advisory lock that guards the cache
+// file. The wait uses the real clock, never the injected one, because a test
+// clock does not advance. The lock is never held across an HTTP request.
+func (c *Checker) acquireCacheLock() (func(), error) {
+	if err := os.MkdirAll(c.dataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create update cache directory: %w", err)
+	}
+	file, err := os.OpenFile(c.cacheLockPath(), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open update cache lock: %w", err)
+	}
+	deadline := time.Now().Add(cacheLockWait)
+	for {
+		locked, err := tryLockFile(file)
+		if err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("lock update cache: %w", err)
+		}
+		if locked {
+			return func() {
+				_ = unlockFile(file)
+				_ = file.Close()
+			}, nil
+		}
+		if !time.Now().Before(deadline) {
+			_ = file.Close()
+			return nil, fmt.Errorf("lock update cache: another papio process held it for %s", cacheLockWait)
+		}
+		time.Sleep(cacheLockRetry)
+	}
+}
+
+// writeCache atomically replaces the cache file. Callers mutate the cache
+// through updateCache, which supplies both the instance mutex and the
+// cross-process lock; writeCache itself performs no locking.
 func (c *Checker) writeCache(cached cache) error {
 	data, err := json.Marshal(cached)
 	if err != nil {

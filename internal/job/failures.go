@@ -162,8 +162,12 @@ func (js *Store) IncidentFailures(ctx context.Context, since time.Time, limit in
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	observations := make([]incident.JobObservation, 0)
+	type jobRow struct {
+		id        string
+		state     string
+		updatedAt time.Time
+	}
+	var jobs []jobRow
 	for rows.Next() {
 		var id, state, updatedRaw string
 		if err := rows.Scan(&id, &state, &updatedRaw); err != nil {
@@ -176,14 +180,21 @@ func (js *Store) IncidentFailures(ctx context.Context, since time.Time, limit in
 		if !since.IsZero() && updated.Before(since) {
 			continue
 		}
-		events, err := js.Events(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		observations = append(observations, incident.JobObservation{JobID: id, State: state, UpdatedAt: updated, Events: events})
+		jobs = append(jobs, jobRow{id: id, state: state, updatedAt: updated})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	observations := make([]incident.JobObservation, 0, len(jobs))
+	for _, job := range jobs {
+		events, err := js.Events(ctx, job.id)
+		if err != nil {
+			return nil, err
+		}
+		observations = append(observations, incident.JobObservation{JobID: job.id, State: job.state, UpdatedAt: job.updatedAt, Events: events})
 	}
 	groups := incident.Aggregate(key, observations)
 	if len(groups) > limit {

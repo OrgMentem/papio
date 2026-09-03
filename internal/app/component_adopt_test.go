@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,6 +107,160 @@ func TestAdoptComponentRecordsASupplementBesideTheMainArtifact(t *testing.T) {
 	// the article and would fail a title/DOI match.
 	if components[1].IdentityResult != "" {
 		t.Fatalf("supplement asserted identity %q; a supplement is not the work", components[1].IdentityResult)
+	}
+	edge, err := jobs.HasPublicationEdge(ctx, id, components[1].SHA256, job.PublicationRoleSupplement)
+	if err != nil || !edge {
+		t.Fatalf("supplement publication edge = %v, %v; want true, nil", edge, err)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 0 {
+		t.Fatalf("prepared publications after component adoption = %+v, %v; want none", prepared, err)
+	}
+}
+
+func TestAdoptComponentDoesNotTreatPriorSameDigestEdgeAsFinalized(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	svc.Fetch = fakeDownload(new(int))
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: readyCandidate()}, Policy: config.Source{Enabled: true}}}
+	id := readyJobWithArtifact(t, svc, jobs, "wr_component_ambiguous_edge")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "supplement.pdf")
+	if err := os.WriteFile(path, pdfBytes("same component bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement); err != nil {
+		t.Fatalf("initial component adoption: %v", err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_component_publication_consumption
+		BEFORE DELETE ON artifact_publications
+		BEGIN SELECT RAISE(FAIL, 'forced component journal retention'); END`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_component_publication_consumption`) }()
+	if err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement); err == nil {
+		t.Fatal("second component adoption succeeded despite retained publication journal")
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared component publication = %+v, %v; want one current journal", prepared, err)
+	}
+	if prepared[0].Role != job.PublicationRoleSupplement {
+		t.Fatalf("prepared role = %q, want supplement", prepared[0].Role)
+	}
+}
+
+func TestAdoptComponentStagesOutsideTerminalQuarantineBeforePreparation(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	svc.Fetch = fakeDownload(new(int))
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: readyCandidate()}, Policy: config.Source{Enabled: true}}}
+	id := readyJobWithArtifact(t, svc, jobs, "wr_component_prepare_sweep")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "supplement.pdf")
+	if err := os.WriteFile(path, pdfBytes("preparation sweep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := componentBeforePrepareForTest
+	var stagePath string
+	componentBeforePrepareForTest = func(temp string) error {
+		stagePath = filepath.Dir(temp)
+		if err := jobs.SweepTerminalQuarantine(ctx); err != nil {
+			return err
+		}
+		if _, err := os.Stat(temp); err != nil {
+			return fmt.Errorf("component staging vanished during terminal sweep: %w", err)
+		}
+		return nil
+	}
+	t.Cleanup(func() { componentBeforePrepareForTest = previous })
+	if err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement); err != nil {
+		t.Fatalf("component adoption after pre-prepare sweep: %v", err)
+	}
+	if _, err := os.Stat(stagePath); !os.IsNotExist(err) {
+		t.Fatalf("successful component stage remains at %s: %v", stagePath, err)
+	}
+	components, err := jobs.Components(ctx, id)
+	if err != nil || len(components) != 2 {
+		t.Fatalf("components after pre-prepare sweep = %+v, %v; want main plus supplement", components, err)
+	}
+}
+
+func TestAdoptComponentCleansStageAfterValidationRejection(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	svc.Fetch = fakeDownload(new(int))
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: readyCandidate()}, Policy: config.Source{Enabled: true}}}
+	id := readyJobWithArtifact(t, svc, jobs, "wr_component_stage_rejected")
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{Payload: pdf.PayloadReport{OK: false}}, nil
+	}
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "supplement.pdf")
+	if err := os.WriteFile(path, pdfBytes("rejected component"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement); !errors.Is(err, ErrComponentRejected) {
+		t.Fatalf("reject component = %v, want ErrComponentRejected", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(svc.Config.DataDir, "quarantine"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "component-stage_") {
+			t.Fatalf("rejected component stage remains at %s", entry.Name())
+		}
+	}
+}
+
+func TestAdoptComponentCleansStageAfterPrepareFailure(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	svc.Fetch = fakeDownload(new(int))
+	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: readyCandidate()}, Policy: config.Source{Enabled: true}}}
+	id := readyJobWithArtifact(t, svc, jobs, "wr_component_stage_prepare_failure")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "supplement.pdf")
+	if err := os.WriteFile(path, pdfBytes("prepare failure"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := componentBeforePrepareForTest
+	var stagePath string
+	componentBeforePrepareForTest = func(temp string) error {
+		stagePath = filepath.Dir(temp)
+		_, err := jobs.S.DB().ExecContext(ctx, `
+			CREATE TRIGGER fail_component_publication_prepare
+			BEFORE INSERT ON artifact_publications
+			BEGIN SELECT RAISE(FAIL, 'forced component preparation failure'); END`)
+		return err
+	}
+	t.Cleanup(func() {
+		componentBeforePrepareForTest = previous
+		_, _ = jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_component_publication_prepare`)
+	})
+	if err := svc.AdoptComponent(ctx, id, path, job.ComponentSupplement); err == nil {
+		t.Fatal("component adoption succeeded despite forced preparation failure")
+	}
+	if _, err := os.Stat(stagePath); !os.IsNotExist(err) {
+		t.Fatalf("failed preparation stage remains at %s: %v", stagePath, err)
 	}
 }
 

@@ -2,6 +2,9 @@ package hook
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -108,6 +111,48 @@ func TestTimeoutKillsWholeProcessTree(t *testing.T) {
 	}
 	if result.Err == nil || result.ExitCode != -1 {
 		t.Fatalf("result = %+v, want deadline error with exit -1", result)
+	}
+}
+
+func TestTimeoutKillsWindowsJobTree(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows Job Object test: no job object to confine the tree on this platform")
+	}
+	// The hook shell detaches a grandchild and then blocks past the deadline.
+	// Killing cmd.exe alone leaves that grandchild running - Windows has no
+	// implicit tree kill - so it announces itself immediately and writes the
+	// escape marker only after the hook has been killed. A marker means the
+	// job did not take the tree with it.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "child.cmd")
+	body := "@echo off\r\n" +
+		"echo started> \"%~dp0started.txt\"\r\n" +
+		"ping -n 8 127.0.0.1 >NUL\r\n" +
+		"echo escaped> \"%~dp0escaped.txt\"\r\n"
+	if err := os.WriteFile(script, []byte(body), 0o644); err != nil {
+		t.Fatalf("write child script: %v", err)
+	}
+	r := &Runner{
+		Command: `start "" /b cmd /c "` + script + `" & ping -n 60 127.0.0.1 >NUL`,
+		Timeout: 2 * time.Second,
+	}
+	start := time.Now()
+	result := r.Run(context.Background(), nil)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Run blocked %v; the descendant held the pipes past WaitDelay", elapsed)
+	}
+	if !errors.Is(result.Err, context.DeadlineExceeded) || result.ExitCode != -1 {
+		t.Fatalf("result = %+v, want deadline-exceeded with exit -1", result)
+	}
+	// Without this the test could pass vacuously: a deadline that fired before
+	// the shell reached `start` proves nothing about the job.
+	if _, err := os.Stat(filepath.Join(dir, "started.txt")); err != nil {
+		t.Fatalf("descendant never started (%v); the test proves nothing", err)
+	}
+	// Outlast the grandchild's own delay, then require its marker absent.
+	time.Sleep(12 * time.Second)
+	if _, err := os.Stat(filepath.Join(dir, "escaped.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("escape marker stat = %v; the descendant survived the job kill", err)
 	}
 }
 

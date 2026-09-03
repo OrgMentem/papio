@@ -21,7 +21,7 @@ import (
 	"papio/internal/zotio"
 )
 
-func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
+func TestNewWiresCoreServices(t *testing.T) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = t.TempDir()
@@ -36,25 +36,11 @@ func TestNewWiresResolverOrderAndCoreServices(t *testing.T) {
 			t.Errorf("close system: %v", err)
 		}
 	})
-	var names []string
-	for _, entry := range system.App.Resolvers {
-		if entry.Adapter == nil {
-			t.Fatal("nil resolver adapter")
-		}
-		names = append(names, entry.Adapter.Name())
-	}
-	want := []string{
-		config.SourceArXiv,
-		config.SourceEuropePMC,
-		config.SourceUnpaywall,
-		config.SourceOpenAlex,
-		config.SourceSemanticScholar,
-		config.SourceCORE,
-		config.SourceCrossrefTDM,
-		config.SourceOpenAIRE,
-	}
-	if !reflect.DeepEqual(names, want) {
-		t.Fatalf("resolver order = %v, want %v", names, want)
+	// Resolver chain membership and order are pinned against the config
+	// catalog by TestResolverChainMatchesCatalogAcquisitionRole; a second
+	// hand-written order list here is exactly the drift this slice removed.
+	if len(system.App.Resolvers) == 0 {
+		t.Fatal("bootstrap left the resolver chain empty")
 	}
 	if system.Pulse == nil {
 		t.Fatal("bootstrap left pulse service unwired")

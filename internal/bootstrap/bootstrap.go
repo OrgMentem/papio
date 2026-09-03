@@ -588,11 +588,19 @@ func mustOpenAlexClient(budgets *budget.Manager, cfg config.Config, _ *fetch.Sec
 	return client
 }
 
-// resolverEntries builds the acquisition resolver chain. The OpenAlex adapter
-// is the one client that reads its own daily-budget headers: budgets is needed
-// for the OpenAlex egress stack (GuardedClient → Observer). The entry is
-// deliberately NOT wrapped in sourcegate.Client — admission already happens at
-// the app.go AcquireAny sites, and a second wrapper would reserve twice.
+// resolverEntries builds the acquisition resolver chain. Every constructor is
+// explicit here — the one place that knows how to build one — and the chain's
+// order is config's catalog order for RoleAcquisitionResolver, which
+// TestResolverChainMatchesCatalogAcquisitionRole pins in both directions: a
+// catalog source with no entry here fails, and an entry here with no catalog
+// acquisition role fails. Adding a source is therefore one catalog row and one
+// constructor, with no name list to keep in step.
+//
+// The OpenAlex adapter is the one client that reads its own daily-budget
+// headers: budgets is needed for the OpenAlex egress stack (GuardedClient →
+// Observer). The entry is deliberately NOT wrapped in sourcegate.Client —
+// admission already happens at the app.go AcquireAny sites, and a second
+// wrapper would reserve twice.
 func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.SecureHTTPClient) []app.ResolverEntry {
 	return []app.ResolverEntry{
 		{Adapter: arxiv.NewWithOptions(arxiv.Options{Client: client, BaseURL: cfg.Sources[config.SourceArXiv].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceArXiv)},
@@ -643,11 +651,18 @@ func discoveryPolicy(cfg config.Config, name string) config.Source {
 	return policy
 }
 
-// discoverySources builds the discovery backends. Each is given the shared
-// secure HTTP client wrapped in its source's budget gate, so discovery is
-// accounted for, paced and paused exactly like the acquisition resolvers that
-// hit the same providers. Left ungated it drew on the same provider quota
-// invisibly and ignored a durable gate that had already paused acquisition.
+// discoverySources builds the discovery backends. The switch below stays
+// explicit — one constructor per backend — and config's catalog declares which
+// sources may appear here: config.validate() refuses a discovery.sources entry
+// without RoleDiscoveryBackend, and
+// TestDiscoveryBackendsMatchCatalogDiscoveryRole pins the switch against that
+// role in both directions.
+//
+// Each backend is given the shared secure HTTP client wrapped in its source's
+// budget gate, so discovery is accounted for, paced and paused exactly like the
+// acquisition resolvers that hit the same providers. Left ungated it drew on
+// the same provider quota invisibly and ignored a durable gate that had already
+// paused acquisition.
 func discoverySources(cfg config.Config, budgets *budget.Manager, client sourcegate.HTTPClient) ([]discovery.Source, error) {
 	names := cfg.Discovery.Sources
 	if len(names) == 0 {

@@ -61,39 +61,26 @@ protects for holdings claims and ADR-0014 Decision 1 protects for job
 attribution — one durable row per (scope, identity) pair, not one per
 attempt.
 
-**Amendment 2026-08-23: the key alone does not enforce this, because work
-identity is mutable.** "Canonical work identity" was written as though it were
-fixed for the life of a job. It is not. `work.Work` is filled in as resolvers
-answer, `fillMissingFromCandidate` promotes a missing DOI out of a candidate,
-and `Work.Describe()` prefers a DOI over a PMID — so a PMID-only job that
-gains a DOI **changes key mid-flight**. Its earlier row keeps the old key, a
-lookup on the new key finds nothing, and the branch reports `evaluate_gate`:
-the gate may then send a second request to the library while the first row's
-outcome is still unknown. The `UNIQUE` constraint on `idempotency_key` cannot
-see this, because the two keys genuinely differ. Decision 4's confirm-absent
-route makes it reachable in ordinary operation, since it releases the job's
-lease before re-entering the gate and nothing holds a lock across that window.
+**Amendment 2026-09-03: pin the request identity at creation.** Work identity
+is mutable. `work.Work` is filled as resolvers answer, and
+`Work.Describe()` can prefer a newly promoted DOI over an earlier PMID. A
+delivery request therefore retains its creation-time work identity and
+idempotency key for its whole life. Routing first resolves a job's
+`delivery_request_id` pointer. It uses the request's persisted key and
+identity before it considers any mutable current work identity. A new job
+still uses the computed global key to deduplicate against an existing request.
 
-So the invariant this decision states — *one work produces at most one live
-subscription-provider request* — is now enforced **per job as well as per
-key**: when the computed key names no row, the branch falls back to the row
-the job already owns (`delivery.Service.BranchForJob`). That fallback is
-strictly more conservative than recomputing, because every branch it can
-reach is one the unchanged key would have reached anyway.
+The durable pointer replaces the former `BranchForJob` containment fallback.
+It is populated for creation, global-key reuse, and offered-request ownership
+transfer. This preserves the invariant that one work produces at most one live
+subscription-provider request when resolver promotion changes a job's current
+identity.
 
-This is containment, not a cure. The key is still derived from mutable state
-on every route. The durable repair is to **pin** it: persist the key on the
-row at creation and resolve by the stored value, which is also what the
-never-wired `jobs.delivery_request_id` column below was for. Anyone changing
-key derivation, or adding a caller that branches on a bare key, must keep the
-per-job fallback or replace it with pinning — not remove it.
-
-`internal/delivery` owns this table, the provider-specific status-poll budget
-(separate from `internal/budget`'s resolver/HTTP retry accounting — a delivery
-poll is not a resolver attempt), and the reconciliation routes in Decision 4.
-`jobs` gains a foreign reference to its live delivery request; `internal/job`
-keeps owning job state and the human-action table, exactly as it already keeps
-owning both while `internal/browser` only observes and reports.
+`internal/delivery` owns `delivery_requests` persistence and provider
+reconciliation. `internal/job` owns job state and the human-action table.
+`internal/app` owns the cross-store Decision 4 operator reconciliation
+operation. Transport adapters call that one app operation and only encode its
+domain outcomes for their own surfaces.
 
 New CLI surface: `papio delivery get <job-id>`, `papio delivery submit
 <job-id>`, `papio delivery cancel <job-id>` where the provider supports

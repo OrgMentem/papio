@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -64,6 +65,7 @@ func TestNotificationLedgerTerminalReplayIsImmutable(t *testing.T) {
 		Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:1",
 		Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now,
 		AvailableAt: now, Count: 1, PayloadJSON: `{"count":1,"message":"first"}`,
+		WebhookState: "skipped",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -71,8 +73,8 @@ func TestNotificationLedgerTerminalReplayIsImmutable(t *testing.T) {
 	if reserved, err := ledger.ReserveDesktop(ctx, first.ID, now, 0); err != nil || !reserved {
 		t.Fatalf("reserve = %v, %v", reserved, err)
 	}
-	if err := ledger.SetDesktopState(ctx, first.ID, "attempted", now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
+	if applied, err := ledger.SetDesktopState(ctx, first.ID, "attempted", now.Add(time.Minute)); err != nil || !applied {
+		t.Fatalf("attempted transition = %v, %v", applied, err)
 	}
 	replayed, err := ledger.Upsert(ctx, NotificationRecord{
 		Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:1",
@@ -84,6 +86,153 @@ func TestNotificationLedgerTerminalReplayIsImmutable(t *testing.T) {
 	}
 	if replayed.Count != 1 || !replayed.LastAt.Equal(now) || replayed.PayloadJSON != `{"count":1,"message":"first"}` {
 		t.Fatalf("terminal replay mutated audit row: %+v", replayed)
+	}
+	if replayed.DesktopSentCount != 1 || replayed.DesktopSentPayloadJSON != `{"count":1,"message":"first"}` {
+		t.Fatalf("desktop snapshot = %d/%q, want the delivered count and payload", replayed.DesktopSentCount, replayed.DesktopSentPayloadJSON)
+	}
+}
+
+// A finished desktop leg must not freeze a webhook digest that has not been
+// sent: the shared row keeps coalescing for the pending webhook leg, while the
+// desktop snapshot preserves exactly what the desktop already delivered.
+func TestNotificationLedgerCoalescesForPendingWebhookAfterDesktopDelivery(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	first, err := ledger.Upsert(ctx, NotificationRecord{
+		Category: "discovery_new", EventKind: "watch.alert", AggregateKey: "watch:1",
+		Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now,
+		Count: 1, PayloadJSON: `{"count":1,"message":"first"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserved, err := ledger.ReserveDesktop(ctx, first.ID, now, 0); err != nil || !reserved {
+		t.Fatalf("reserve = %v, %v", reserved, err)
+	}
+	if applied, err := ledger.SetDesktopState(ctx, first.ID, "attempted", now.Add(time.Minute)); err != nil || !applied {
+		t.Fatalf("attempted transition = %v, %v", applied, err)
+	}
+	merged, err := ledger.Upsert(ctx, NotificationRecord{
+		Category: "discovery_new", EventKind: "watch.alert", AggregateKey: "watch:1",
+		Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now.Add(2 * time.Minute),
+		AvailableAt: now.Add(2 * time.Minute), Count: 1, PayloadJSON: `{"count":1,"message":"second"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Count != 2 {
+		t.Fatalf("count after a second event = %d, want 2: the webhook digest lost an event", merged.Count)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(merged.PayloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["message"] != "second" || payload["count"] != float64(2) {
+		t.Fatalf("merged payload = %v, want the second message and count 2", payload)
+	}
+	if merged.DesktopSentCount != 1 || merged.DesktopSentPayloadJSON != `{"count":1,"message":"first"}` {
+		t.Fatalf("coalescing rewrote the desktop audit: snapshot = %d/%q", merged.DesktopSentCount, merged.DesktopSentPayloadJSON)
+	}
+	// Once the webhook leg is sent too, neither leg can still deliver and the
+	// row becomes an immutable audit record.
+	if err := ledger.SetWebhookState(ctx, first.ID, "attempted", now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := ledger.Upsert(ctx, NotificationRecord{
+		Category: "discovery_new", EventKind: "watch.alert", AggregateKey: "watch:1",
+		Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now.Add(4 * time.Minute),
+		AvailableAt: now.Add(4 * time.Minute), Count: 1, PayloadJSON: `{"count":1,"message":"third"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozen.Count != 2 || frozen.PayloadJSON != merged.PayloadJSON {
+		t.Fatalf("both legs terminal but the row still mutated: %+v", frozen)
+	}
+}
+
+// A desktop leg that never delivered leaves the snapshot empty, so audit reads
+// fall back to the live count and payload.
+func TestNotificationLedgerUndeliveredDesktopLegKeepsNoSnapshot(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	off, err := ledger.Upsert(ctx, NotificationRecord{
+		Category: "discovery_new", EventKind: "watch.alert", AggregateKey: "watch:2",
+		Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now,
+		Count: 1, PayloadJSON: `{"count":1,"message":"first"}`, DesktopState: "platform_unavailable",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{"desktop_sent_count", "desktop_sent_payload_json"} {
+		if got := notificationColumn(t, db, off.ID, column); got != "" {
+			t.Errorf("%s = %q for a desktop leg that never sent, want NULL", column, got)
+		}
+	}
+	held, err := ledger.Upsert(ctx, NotificationRecord{
+		Category: "discovery_new", EventKind: "watch.alert", AggregateKey: "watch:3",
+		Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now,
+		Count: 1, PayloadJSON: `{"count":1,"message":"first"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := ledger.SetDesktopState(ctx, held.ID, "suppressed_presence", now); err != nil || !applied {
+		t.Fatalf("suppression transition = %v, %v", applied, err)
+	}
+	if got := notificationColumn(t, db, held.ID, "desktop_sent_payload_json"); got != "" {
+		t.Errorf("suppressed leg recorded a delivery snapshot %q", got)
+	}
+}
+
+// Every nonterminal desktop transition is a compare-and-swap: a stale caller
+// cannot pull a superseded row back into the drain.
+func TestNotificationLedgerSetDesktopStateRefusesTerminalRows(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	row, err := ledger.Upsert(ctx, NotificationRecord{
+		Category: "completion_batch", EventKind: "batch.progress", AggregateKey: "batch-7",
+		Phase: "checkpoint", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now,
+		Count: 1, PayloadJSON: `{"count":1}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if superseded, err := ledger.SupersedeCheckpoints(ctx, "batch-7", now); err != nil || superseded != 1 {
+		t.Fatalf("supersede = %d, %v", superseded, err)
+	}
+	for _, state := range []string{"held", "dropped_quiet", "platform_unavailable", "suppressed_presence", "reserved"} {
+		applied, err := ledger.SetDesktopState(ctx, row.ID, state, now.Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if applied {
+			t.Fatalf("transition to %q applied to a superseded row", state)
+		}
+		if got := notificationColumn(t, db, row.ID, "desktop_state"); got != "superseded" {
+			t.Fatalf("desktop_state = %q after a lost swap to %q, want superseded", got, state)
+		}
+	}
+	if applied, err := ledger.SetDesktopState(ctx, row.ID, "attempted", now.Add(time.Minute)); err != nil || applied {
+		t.Fatalf("attempted transition from superseded = %v, %v, want false", applied, err)
 	}
 }
 
@@ -425,8 +574,8 @@ func TestNotificationLedgerWebhookStateAndDesktopAvailabilityRoundTrip(t *testin
 	if got := notificationColumn(t, db, row.ID, "available_at"); got != formatNotificationTime(now) {
 		t.Fatalf("pending leg available_at = %q, want %q left untouched", got, formatNotificationTime(now))
 	}
-	if err := ledger.SetDesktopState(ctx, row.ID, "held", now); err != nil {
-		t.Fatal(err)
+	if applied, err := ledger.SetDesktopState(ctx, row.ID, "held", now); err != nil || !applied {
+		t.Fatalf("hold transition = %v, %v", applied, err)
 	}
 	if err := ledger.SetDesktopAvailable(ctx, row.ID, deferred); err != nil {
 		t.Fatal(err)

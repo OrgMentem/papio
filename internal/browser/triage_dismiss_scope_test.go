@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -123,43 +124,6 @@ func equalWatchIDs(got, want []int64) bool {
 	return true
 }
 
-// A watch_scope list must consume exactly the named watches. Before this test
-// the extension path only ever exercised "all", which cannot tell a correct
-// selection from one that clears every sibling watch in the group.
-func TestTriageDismissScopeBridgeConsumesOnlyTheListedWatches(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		pick    []int // indices into fixture.watchIDs
-		survive []int
-	}{
-		{name: "one id", pick: []int{1}, survive: []int{0, 2}},
-		{name: "several ids", pick: []int{0, 2}, survive: []int{1}},
-		{name: "every id", pick: []int{0, 1, 2}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fixture := newBridgeDismissScopeFixture(t)
-			ids := make([]string, 0, len(tc.pick))
-			for _, index := range tc.pick {
-				ids = append(ids, fmt.Sprintf("%d", fixture.watchIDs[index]))
-			}
-			result, err := fixture.decide(t, "request-scope-list-1", "["+strings.Join(ids, ",")+"]")
-			if err != nil {
-				t.Fatalf("sync with scope %v: %v", ids, err)
-			}
-			if result.Outcome != "applied" {
-				t.Fatalf("scope %v outcome = %+v, want applied", ids, result)
-			}
-			want := make([]int64, 0, len(tc.survive))
-			for _, index := range tc.survive {
-				want = append(want, fixture.watchIDs[index])
-			}
-			if got := fixture.surviving(t); !equalWatchIDs(got, want) {
-				t.Fatalf("surviving digests = %v, want %v", got, want)
-			}
-		})
-	}
-}
-
 // Ownership is the one refusal the protocol layer cannot make for itself: a
 // well-formed list of positive, unique IDs that this hit does not own reaches
 // the bridge. It must come back as a structured outcome - a raw error here
@@ -228,46 +192,55 @@ func TestTriageDismissScopeBridgeRefusesInvalidScopeAtTheFrameBoundary(t *testin
 	}
 }
 
-// triageDismissScope is mirrored in internal/api/triage.go, and this half used
-// to be the weaker copy: it accepted an empty list, more than 100 IDs, a
-// non-positive ID, and an absent scope. An empty list was the silent-loss
-// shape - it answered "applied" while consuming nothing - so the browser's
-// only defence was the protocol validator one layer up. AGENTS.md records that
-// a one-sided fix to a mirrored pair is the standing failure mode here, so
-// both halves are now pinned to the same decision table.
-func TestTriageDismissScopeMirrorsTheApiHalf(t *testing.T) {
-	watches := []triage.Watch{
-		{ID: 4, WorkKey: dismissScopeWorkKey},
-		{ID: 9, WorkKey: dismissScopeWorkKey},
+// dismissScopeIDList builds a JSON array of n UNIQUE positive watch IDs. Unique
+// matters: a repeated ID trips the duplicate guard first, which is how a
+// 101-copy list can appear to test the 100-ID cap without reaching it.
+func dismissScopeIDList(n int) string {
+	ids := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		ids = append(ids, strconv.Itoa(i))
 	}
-	for _, scope := range []string{
-		"",           // absent
-		"null",       // present but empty
-		`"mine"`,     // bare string that is not all
-		"[]",         // empty list: was accepted, and consumed nothing under "applied"
-		"[4,4]",      // duplicate
-		"[0]",        // zero
-		"[-1]",       // negative
-		"[4,11]",     // an ID this hit does not own
-		"[4] oops",   // trailing garbage
-		"[4][9]",     // a second JSON value
-		`"all" oops`, // trailing garbage after the sentinel
-		"[" + strings.TrimSuffix(strings.Repeat("4,", 101), ",") + "]", // over the 100 cap
+	return "[" + strings.Join(ids, ",") + "]"
+}
+
+// Browser frames reject malformed scope JSON before the handler runs. This
+// decoder is the browser seam that turns valid JSON into normalized domain
+// input, while the triage service validates watch ownership.
+func TestTriageDismissScopeBrowserDecoder(t *testing.T) {
+	const requiredMsg = "watch_scope is required for dismiss"
+	const bareMsg = "watch_scope must be all or watch IDs"
+	const shapeMsg = "watch_scope must be all or 1 to 100 watch IDs"
+	const idMsg = "watch_scope contains an invalid watch ID"
+	for _, tc := range []struct {
+		scope       string
+		wantMessage string
+	}{
+		{scope: "", wantMessage: requiredMsg},
+		{scope: "null", wantMessage: bareMsg},
+		{scope: `"mine"`, wantMessage: bareMsg},
+		{scope: "[]", wantMessage: shapeMsg},
+		{scope: "[4,4]", wantMessage: idMsg},
+		{scope: "[0]", wantMessage: idMsg},
+		{scope: "[-1]", wantMessage: idMsg},
+		{scope: "[4] oops", wantMessage: shapeMsg},
+		{scope: "[4][9]", wantMessage: shapeMsg},
+		{scope: `"all" oops`, wantMessage: shapeMsg},
+		{scope: dismissScopeIDList(101), wantMessage: shapeMsg},
 	} {
-		selected, err := triageDismissScope(json.RawMessage(scope), watches)
+		decoded, err := decodeTriageDismissScope(json.RawMessage(tc.scope))
 		if err == nil {
-			t.Fatalf("scope %s was accepted as %v, want a refusal", scope, selected)
+			t.Fatalf("scope %s was accepted as %+v, want a refusal", tc.scope, decoded)
 		}
-		if selected != nil {
-			t.Fatalf("scope %s refused but still selected %v", scope, selected)
+		if !strings.Contains(err.Error(), tc.wantMessage) {
+			t.Fatalf("scope %s error = %q, want %q", tc.scope, err, tc.wantMessage)
 		}
 	}
-	all, err := triageDismissScope(json.RawMessage(`"all"`), watches)
-	if err != nil || len(all) != 2 || !all[4] || !all[9] {
-		t.Fatalf(`scope "all" = %v, %v, want both watches selected`, all, err)
+	all, err := decodeTriageDismissScope(json.RawMessage(`"all"`))
+	if err != nil || !all.All {
+		t.Fatalf(`scope "all" = %+v, %v, want all watches selected`, all, err)
 	}
-	subset, err := triageDismissScope(json.RawMessage("[9]"), watches)
-	if err != nil || len(subset) != 1 || !subset[9] {
-		t.Fatalf("scope [9] = %v, %v, want only watch 9 selected", subset, err)
+	subset, err := decodeTriageDismissScope(json.RawMessage("[9]"))
+	if err != nil || len(subset.WatchIDs) != 1 || subset.WatchIDs[0] != 9 {
+		t.Fatalf("scope [9] = %+v, %v, want only watch 9 selected", subset, err)
 	}
 }

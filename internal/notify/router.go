@@ -29,7 +29,7 @@ type Ledger interface {
 	Upsert(context.Context, Record) (Record, error)
 	DueDesktop(context.Context, time.Time, int) ([]Record, error)
 	ReserveDesktop(context.Context, int64, time.Time, int) (bool, error)
-	SetDesktopState(context.Context, int64, string, time.Time) error
+	SetDesktopState(context.Context, int64, string, time.Time) (bool, error)
 	SetWebhookState(context.Context, int64, string, time.Time) error
 	SupersedeCheckpoints(context.Context, string, time.Time) (int, error)
 	LatestCheckpoint(context.Context, string) (Record, bool, error)
@@ -97,7 +97,10 @@ func (r *Router) Route(ctx context.Context, intent Intent) error {
 			return err
 		}
 		if found && previous.DesktopState == "attempted" {
-			ok, err := samePublicOutcome(previous.Intent.Detail, intent.Detail)
+			// Compare against what the desktop leg actually delivered, not the
+			// live row: a still-pending webhook digest keeps merging into it.
+			sent, _ := previous.DesktopSent()
+			ok, err := samePublicOutcome(sent, intent.Detail)
 			if err != nil {
 				return err
 			}
@@ -243,38 +246,49 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 				return err
 			}
 			if !valid {
-				if err := r.ledger.SetDesktopState(ctx, row.ID, "superseded", now); err != nil {
+				applied, err := r.ledger.SetDesktopState(ctx, row.ID, "superseded", now)
+				if err != nil {
 					return err
 				}
-				r.audit(ctx, "notify.held", row, "superseded")
+				if applied {
+					r.audit(ctx, "notify.held", row, "superseded")
+				}
 				continue
 			}
 		}
 		categoryPolicy := r.policy.For(row.Intent.Category)
 		if categoryPolicy.Desktop == "off" || r.desktop == nil {
-			if err := r.ledger.SetDesktopState(ctx, row.ID, "platform_unavailable", now); err != nil {
+			if _, err := r.ledger.SetDesktopState(ctx, row.ID, "platform_unavailable", now); err != nil {
 				return err
 			}
 			continue
 		}
 		if r.policy.QuietHours.Contains(now) {
 			if r.policy.QuietMode == "drop" {
-				if err := r.ledger.SetDesktopState(ctx, row.ID, "dropped_quiet", now); err != nil {
+				if _, err := r.ledger.SetDesktopState(ctx, row.ID, "dropped_quiet", now); err != nil {
 					return err
 				}
-			} else {
-				if err := r.ledger.SetDesktopState(ctx, row.ID, "held", now); err != nil {
-					return err
-				}
-				if err := r.deferDesktop(ctx, row.ID, r.nextQuietRelease(now)); err != nil {
-					return err
-				}
-				r.audit(ctx, "notify.held", row, "quiet_hours")
+				continue
 			}
+			held, err := r.ledger.SetDesktopState(ctx, row.ID, "held", now)
+			if err != nil {
+				return err
+			}
+			if !held {
+				// A terminal transition won this row between the due read and
+				// now. Holding it would resurrect a superseded checkpoint,
+				// which a later drain would then deliver after its final
+				// notification.
+				continue
+			}
+			if err := r.deferDesktop(ctx, row.ID, r.nextQuietRelease(now)); err != nil {
+				return err
+			}
+			r.audit(ctx, "notify.held", row, "quiet_hours")
 			continue
 		}
 		if r.focusedSurface(now) {
-			if err := r.ledger.SetDesktopState(ctx, row.ID, "suppressed_presence", now); err != nil {
+			if _, err := r.ledger.SetDesktopState(ctx, row.ID, "suppressed_presence", now); err != nil {
 				return err
 			}
 			continue
@@ -304,8 +318,12 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 					continue
 				}
 			}
-			if err := r.ledger.SetDesktopState(ctx, row.ID, "held", now); err != nil {
+			held, err := r.ledger.SetDesktopState(ctx, row.ID, "held", now)
+			if err != nil {
 				return err
+			}
+			if !held {
+				continue
 			}
 			if err := r.deferDesktop(ctx, row.ID, now.Add(time.Minute)); err != nil {
 				return err
@@ -318,7 +336,7 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 		row.Intent.Detail.Message = ComposeMessage(row.Intent.Category, row.Count, row.Intent.Detail, row.Intent.Message)
 		row.Intent.Detail.Count = row.Count
 		r.sendDesktop(ctx, row.Intent.Detail, row.Intent.Message)
-		if err := r.ledger.SetDesktopState(ctx, row.ID, "attempted", now); err != nil {
+		if _, err := r.ledger.SetDesktopState(ctx, row.ID, "attempted", now); err != nil {
 			return err
 		}
 		r.audit(ctx, "notify.attempted", row, "attempted")

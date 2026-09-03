@@ -994,6 +994,109 @@ func TestMaterializePrivateFileConcurrentSameTargetConverges(t *testing.T) {
 	}
 }
 
+func materializeLockCount() int {
+	materializeLocks.Lock()
+	defer materializeLocks.Unlock()
+	return len(materializeLocks.locks)
+}
+
+func materializeLockEntry(path string) (*materializeLock, int) {
+	materializeLocks.Lock()
+	defer materializeLocks.Unlock()
+	lock := materializeLocks.locks[path]
+	if lock == nil {
+		return nil, 0
+	}
+	return lock, lock.refs
+}
+
+func TestMaterializePrivateFileReleasesLockRegistryForUniqueTargets(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.pdf")
+	contents := []byte("%PDF unique staging targets")
+	if err := os.WriteFile(source, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := fmt.Sprintf("%x", sha256.Sum256(contents))
+	const targets = 64
+	var wg sync.WaitGroup
+	errs := make([]error, targets)
+	start := make(chan struct{})
+	for i := range targets {
+		// Staging targets are lifetime-unique: one job ID plus one digest each.
+		target := filepath.Join(dir, fmt.Sprintf("job%d", i), strings.Repeat("a", 64), "paper.pdf")
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func(idx int, target string) {
+			defer wg.Done()
+			<-start
+			errs[idx] = materializePrivateFile(source, target, expected)
+		}(i, target)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("materialize[%d] err = %v", i, err)
+		}
+	}
+	if n := materializeLockCount(); n != 0 {
+		t.Fatalf("lock registry retained %d entries after %d unique targets, want 0", n, targets)
+	}
+}
+
+func TestMaterializeLockWaiterAcquiresTheReleasedMutex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "job", strings.Repeat("b", 64), "paper.pdf")
+	releaseHolder := lockMaterializeTarget(path)
+	holder, refs := materializeLockEntry(path)
+	if holder == nil || refs != 1 {
+		t.Fatalf("holder entry present=%t refs=%d, want one live entry", holder != nil, refs)
+	}
+	acquired := make(chan func(), 1)
+	go func() { acquired <- lockMaterializeTarget(path) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		entry, refs := materializeLockEntry(path)
+		if entry != holder {
+			t.Fatalf("waiter registered against a second mutex for the same target")
+		}
+		if refs == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiter never registered: refs=%d", refs)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-acquired:
+		t.Fatal("waiter acquired the target while the holder still held it")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	releaseHolder()
+	var releaseWaiter func()
+	select {
+	case releaseWaiter = <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter never acquired the released lock")
+	}
+	entry, refs := materializeLockEntry(path)
+	if entry != holder {
+		t.Fatal("waiter holds a different mutex than the holder released")
+	}
+	if refs != 1 {
+		t.Fatalf("refs after holder release = %d, want 1", refs)
+	}
+	releaseWaiter()
+	if n := materializeLockCount(); n != 0 {
+		t.Fatalf("lock registry retained %d entries after the last release, want 0", n)
+	}
+}
+
 func TestPlanAndApplySkipsWhenLibraryAlreadyHasPDF(t *testing.T) {
 	cli := &fakeCLI{
 		find: map[string]json.RawMessage{
@@ -1083,7 +1186,7 @@ func readyPlanServiceWork(t *testing.T, zotioKey string, cli CLI, w work.Work) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifactPath, err := artifacts.Promote(temp, sha)
+	artifactPath, _, err := artifacts.Promote(temp, sha)
 	if err != nil {
 		t.Fatal(err)
 	}

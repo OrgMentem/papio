@@ -29,20 +29,43 @@ const (
 
 var planIDRE = regexp.MustCompile(`^zplan_[a-f0-9]{26}$`)
 
-var (
-	materializeLocksMu sync.Mutex
-	materializeLocks   = make(map[string]*sync.Mutex)
-)
+var materializeLocks = struct {
+	sync.Mutex
+	locks map[string]*materializeLock
+}{locks: make(map[string]*materializeLock)}
 
-func pathLock(path string) *sync.Mutex {
-	materializeLocksMu.Lock()
-	defer materializeLocksMu.Unlock()
-	if mu, ok := materializeLocks[path]; ok {
-		return mu
+type materializeLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockMaterializeTarget serializes callers staging the same target path and
+// returns the release. Staging targets embed a job ID and an artifact digest,
+// so they are lifetime-unique and the registry entry must not outlive its
+// holders. The reference count is what makes deletion safe: deleting right
+// after Unlock would leave a waiter parked on the removed mutex while a later
+// caller for the same path created a second one, so both would materialize the
+// same target concurrently.
+func lockMaterializeTarget(path string) func() {
+	materializeLocks.Lock()
+	lock := materializeLocks.locks[path]
+	if lock == nil {
+		lock = &materializeLock{}
+		materializeLocks.locks[path] = lock
 	}
-	mu := &sync.Mutex{}
-	materializeLocks[path] = mu
-	return mu
+	lock.refs++
+	materializeLocks.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		materializeLocks.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(materializeLocks.locks, path)
+		}
+		materializeLocks.Unlock()
+	}
 }
 
 // Plan is papio's immutable confirmation object around one exact Zotio preview.
@@ -1145,9 +1168,8 @@ func atomicPrivateWrite(path string, data []byte) error {
 }
 
 func materializePrivateFile(source, target, expectedSHA string) error {
-	mu := pathLock(target)
-	mu.Lock()
-	defer mu.Unlock()
+	unlock := lockMaterializeTarget(target)
+	defer unlock()
 	if err := verifyFileSHA256(target, expectedSHA); err == nil {
 		return nil
 	}

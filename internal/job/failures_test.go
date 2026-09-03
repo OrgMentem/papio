@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"papio/internal/incident"
 )
 
 func TestFailures(t *testing.T) {
@@ -189,6 +191,76 @@ func TestFailures(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("negative limit groups = %d, want 1", len(got))
 	}
+}
+
+func TestIncidentFailures(t *testing.T) {
+	t.Run("returns event-derived group before deadline", func(t *testing.T) {
+		js := testStore(t)
+		id := createFailure(t, js, "incident-failure", StateFailed, "", nil, false)
+		if err := js.RecordEvent(context.Background(), id, "browser.provider_outcome", map[string]any{
+			"outcome":       "access_denied",
+			"host":          "https://papers.example.org/article/42",
+			"safety_domain": "publisher",
+		}); err != nil {
+			t.Fatalf("record provider outcome: %v", err)
+		}
+		events, err := js.Events(context.Background(), id)
+		if err != nil {
+			t.Fatalf("read events: %v", err)
+		}
+		if len(events) == 0 {
+			t.Fatal("events are empty")
+		}
+		event := events[len(events)-1]
+		if event["kind"] != "browser.provider_outcome" {
+			t.Fatalf("last event kind = %q, want browser.provider_outcome", event["kind"])
+		}
+		eventAt, err := time.Parse(time.RFC3339Nano, event["at"].(string))
+		if err != nil {
+			t.Fatalf("parse provider outcome time: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		type result struct {
+			groups []incident.Group
+			err    error
+		}
+		resultCh := make(chan result, 1)
+		go func() {
+			groups, err := js.IncidentFailures(ctx, time.Time{}, 1)
+			resultCh <- result{groups: groups, err: err}
+		}()
+
+		select {
+		case result := <-resultCh:
+			if result.err != nil {
+				t.Fatalf("incident failures: %v", result.err)
+			}
+			if len(result.groups) != 1 {
+				t.Fatalf("group count = %d, want 1: %+v", len(result.groups), result.groups)
+			}
+			group := result.groups[0]
+			if group.SafetyDomain != "publisher" || group.HostFamily != "example.org" || group.Outcome != "access_denied" || group.Jobs != 1 {
+				t.Fatalf("group = %+v, want publisher/example.org/access_denied for one job", group)
+			}
+			if !group.FirstSeen.Equal(eventAt) || !group.LastSeen.Equal(eventAt) {
+				t.Fatalf("group time range = %s to %s, want %s", group.FirstSeen, group.LastSeen, eventAt)
+			}
+		case <-ctx.Done():
+			t.Fatalf("IncidentFailures did not return before the deadline: %v", ctx.Err())
+		}
+	})
+
+	t.Run("returns no groups for no matching jobs", func(t *testing.T) {
+		groups, err := testStore(t).IncidentFailures(context.Background(), time.Time{}, 1)
+		if err != nil {
+			t.Fatalf("incident failures: %v", err)
+		}
+		if len(groups) != 0 {
+			t.Fatalf("group count = %d, want 0: %+v", len(groups), groups)
+		}
+	})
 }
 
 func createFailure(t *testing.T, js *Store, requestID, state, reason string, urls []string, selectFirst bool) string {

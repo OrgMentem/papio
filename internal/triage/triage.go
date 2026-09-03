@@ -100,6 +100,52 @@ type WatchHit struct {
 	openAlex string
 }
 
+// DecisionOperation names one normalized triage mutation.
+type DecisionOperation string
+
+const (
+	DecisionAcquire DecisionOperation = "acquire"
+	DecisionDismiss DecisionOperation = "dismiss"
+)
+
+// WatchScope selects the watch digests a dismissal may consume. Transport
+// adapters parse their own wire values before they construct this value.
+type WatchScope struct {
+	All      bool
+	WatchIDs []int64
+}
+
+// DecisionInput is the normalized input for one triage mutation.
+type DecisionInput struct {
+	ItemID    string
+	Operation DecisionOperation
+	Scope     WatchScope
+}
+
+// DecisionOutcome reports the durable result of one triage mutation.
+type DecisionOutcome string
+
+const (
+	DecisionApplied        DecisionOutcome = "applied"
+	DecisionAlreadyApplied DecisionOutcome = "already_applied"
+	DecisionConflict       DecisionOutcome = "conflict"
+	DecisionInvalid        DecisionOutcome = "invalid"
+)
+
+// DecisionResult is the typed outcome of one triage mutation.
+type DecisionResult struct {
+	Outcome DecisionOutcome
+	Detail  string
+}
+
+// WatchMutationError identifies an unexpected failure from the watch runner.
+// Transport adapters retain their own watch-specific error mapping.
+type WatchMutationError struct{ err error }
+
+func (e *WatchMutationError) Error() string { return e.err.Error() }
+
+func (e *WatchMutationError) Unwrap() error { return e.err }
+
 // HumanAction carries fields needed to display and safely resolve a human
 // action. Quarantine paths and candidate IDs never leave the daemon.
 type HumanAction struct {
@@ -362,14 +408,103 @@ func (s *Service) RegisterSource(source ItemSource) {
 	s.sources = append(s.sources, source)
 }
 
-// AcknowledgeRetraction clears the retraction notice named by itemID from the
-// inbox, reporting whether this call recorded the acknowledgement. No
-// registered source owning the item yields sql.ErrNoRows, which callers render
-// as the same conflict a vanished watch hit produces.
-func (s *Service) AcknowledgeRetraction(ctx context.Context, itemID string) (bool, error) {
+// Decide applies one normalized watch-hit or retraction mutation. It owns the
+// current-hit lookup, scope selection, digest mutation, and retraction policy.
+// Transport adapters own wire decoding and result or error encoding.
+func (s *Service) Decide(ctx context.Context, input DecisionInput, runner *watch.Runner) (DecisionResult, error) {
 	if s == nil {
-		return false, errors.New("triage service is not configured")
+		return DecisionResult{}, errors.New("triage service is not configured")
 	}
+	if input.ItemID == "" {
+		return DecisionResult{Outcome: DecisionInvalid, Detail: "item_id is required"}, nil
+	}
+	switch input.Operation {
+	case DecisionAcquire, DecisionDismiss:
+	default:
+		return DecisionResult{Outcome: DecisionInvalid, Detail: "operation must be acquire or dismiss"}, nil
+	}
+	if strings.HasPrefix(input.ItemID, RetractionIDPrefix) {
+		if input.Operation != DecisionDismiss {
+			return DecisionResult{Outcome: DecisionInvalid, Detail: "retraction notices support only the dismiss operation"}, nil
+		}
+		applied, err := s.acknowledgeRetraction(ctx, input.ItemID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return DecisionResult{Outcome: DecisionConflict}, nil
+		case err != nil:
+			return DecisionResult{}, err
+		case applied:
+			return DecisionResult{Outcome: DecisionApplied}, nil
+		default:
+			return DecisionResult{Outcome: DecisionAlreadyApplied}, nil
+		}
+	}
+
+	hit, err := s.FindWatchHit(ctx, input.ItemID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return DecisionResult{Outcome: DecisionConflict}, nil
+	case err != nil:
+		return DecisionResult{}, err
+	}
+	targets, result := decisionTargets(input, hit.Watches)
+	if result.Outcome != "" {
+		return result, nil
+	}
+	if runner == nil {
+		return DecisionResult{}, errors.New("watch runner is not configured")
+	}
+	if input.Operation == DecisionAcquire {
+		err = runner.AcquireDigests(ctx, targets)
+	} else {
+		err = runner.ConsumeDigests(ctx, targets)
+	}
+	if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
+		return DecisionResult{Outcome: DecisionConflict}, nil
+	}
+	if err != nil {
+		return DecisionResult{}, &WatchMutationError{err: err}
+	}
+	return DecisionResult{Outcome: DecisionApplied}, nil
+}
+
+func decisionTargets(input DecisionInput, watches []Watch) ([]watch.DigestTarget, DecisionResult) {
+	selected := make(map[int64]bool, len(watches))
+	if input.Operation == DecisionDismiss {
+		if input.Scope.All {
+			for _, watched := range watches {
+				selected[watched.ID] = true
+			}
+		} else {
+			available := make(map[int64]bool, len(watches))
+			for _, watched := range watches {
+				available[watched.ID] = true
+			}
+			for _, id := range input.Scope.WatchIDs {
+				if id <= 0 || !available[id] || selected[id] {
+					return nil, DecisionResult{Outcome: DecisionInvalid, Detail: "watch_scope contains an invalid watch ID"}
+				}
+				selected[id] = true
+			}
+			if len(selected) == 0 || len(selected) > 100 {
+				return nil, DecisionResult{Outcome: DecisionInvalid, Detail: "watch_scope must be all or 1 to 100 watch IDs"}
+			}
+		}
+	}
+	targets := make([]watch.DigestTarget, 0, len(watches))
+	for _, watched := range watches {
+		if input.Operation == DecisionDismiss && !selected[watched.ID] {
+			continue
+		}
+		targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
+	}
+	return targets, DecisionResult{}
+}
+
+// acknowledgeRetraction clears the retraction notice named by itemID from the
+// inbox, reporting whether this call recorded the acknowledgement. No
+// registered source owning the item yields sql.ErrNoRows.
+func (s *Service) acknowledgeRetraction(ctx context.Context, itemID string) (bool, error) {
 	s.mu.RLock()
 	sources := append([]ItemSource(nil), s.sources...)
 	s.mu.RUnlock()

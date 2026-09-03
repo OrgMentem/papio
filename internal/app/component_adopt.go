@@ -35,6 +35,10 @@ var (
 	ErrComponentRejected = errors.New("component rejected")
 )
 
+// componentBeforePrepareForTest pauses the only window before a component
+// receives durable journal ownership. Production leaves it nil.
+var componentBeforePrepareForTest func(string) error
+
 // AdoptComponent files a supplement or appendix alongside a job's main artifact:
 // the parts of a source that a quotation may legitimately live in, which a main
 // PDF alone would report as absent (ADR-0007).
@@ -106,10 +110,17 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 		return fmt.Errorf("%w: %w", ErrComponentPath, err)
 	}
 
-	qdir, err := s.Artifacts.QuarantineDir(jobID)
+	stageID := job.NewID("component-stage")
+	qdir, err := s.Artifacts.QuarantineDir(stageID)
 	if err != nil {
 		return err
 	}
+	cleanupStage := true
+	defer func() {
+		if cleanupStage {
+			_ = os.RemoveAll(qdir)
+		}
+	}()
 	temp := filepath.Join(qdir, job.NewID("component")+".tmp")
 	sha, size, err := copyHashed(resolved, temp)
 	if err != nil {
@@ -136,33 +147,45 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 		_ = os.Remove(temp)
 		return err
 	}
-	existing, err := s.Jobs.GetArtifact(ctx, sha)
-	if err != nil {
-		_ = os.Remove(temp)
-		return err
-	}
 	// The component's own identity is not asserted, so its artifact row carries
 	// no identity claim; the acquisition edge records the same absence.
-	if err := s.Jobs.UpsertArtifact(ctx, job.Artifact{
-		SHA256: sha, SizeBytes: size, MIME: "application/pdf",
-		PageCount: report.Structural.Pages, TextChars: report.Text.Chars, OCRUsed: report.Text.OCRUsed,
-		Encrypted: false, HasActiveContent: false, Path: dest,
-	}); err != nil {
+	publication := job.PublicationInput{
+		ID:             job.NewID("publication"),
+		JobID:          jobID,
+		Role:           job.PublicationRole(role),
+		SHA256:         sha,
+		QuarantinePath: temp,
+		Artifact: job.Artifact{
+			SHA256: sha, SizeBytes: size, MIME: "application/pdf",
+			PageCount: report.Structural.Pages, TextChars: report.Text.Chars, OCRUsed: report.Text.OCRUsed,
+			Encrypted: false, HasActiveContent: false, Path: dest,
+		},
+	}
+	if componentBeforePrepareForTest != nil {
+		if err := componentBeforePrepareForTest(temp); err != nil {
+			_ = os.Remove(temp)
+			return err
+		}
+	}
+	if err := s.Jobs.PreparePublication(ctx, publication); err != nil {
 		_ = os.Remove(temp)
 		return err
 	}
-	if _, err := s.Artifacts.Promote(temp, sha); err != nil {
-		if existing == nil {
-			if _, cleanupErr := s.Jobs.S.DB().ExecContext(context.WithoutCancel(ctx),
-				`DELETE FROM artifacts WHERE sha256 = ?`, sha); cleanupErr != nil {
-				return errors.Join(err, fmt.Errorf("removing unpromoted component metadata: %w", cleanupErr))
-			}
+	cleanupStage = false
+	_, err = s.Jobs.FinalizePublication(ctx, publication.ID, func() (job.PromotionResult, error) {
+		path, created, promoteErr := s.Artifacts.Promote(temp, sha)
+		return job.PromotionResult{Path: path, Created: created}, promoteErr
+	})
+	if err != nil {
+		edge, edgeErr := s.hasPublicationEdgeFresh(ctx, publication)
+		if edgeErr != nil {
+			return errors.Join(err, fmt.Errorf("checking ambiguous component publication finalization: %w", edgeErr))
 		}
-		return err
+		if !edge {
+			return err
+		}
 	}
-	if err := s.Jobs.AddComponent(ctx, jobID, sha, role, 0, ""); err != nil {
-		return err
-	}
+	_ = os.Remove(qdir)
 	return s.Jobs.RecordEvent(ctx, jobID, "acquisition.component_added", map[string]any{
 		"role": role, "sha256": sha, "size_bytes": size, "page_count": report.Structural.Pages,
 	})

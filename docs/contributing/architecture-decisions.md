@@ -451,3 +451,38 @@ neither. Naming the anchor explicitly is what stops "compare against what was
 requested" from silently degrading into "compare against whatever the job now
 believes", and the insufficient-authority disposition is what keeps a sparse
 submission from being resolved by evidence that only confirms itself.
+
+## A prepared journal owns every visible artifact file
+
+**Context:** Artifact metadata, filesystem bytes, candidate acceptance, the
+acquisition edge, and the job transition could each commit on their own, and
+SQLite cannot roll back a hard link or a rename. A crash after promotion
+therefore left visible bytes with no durable owner. Every publication crosses
+two resources: the artifact store owns quarantine files, hashing, and promotion,
+while the job store owns artifact metadata, candidates, acquisition edges,
+leases, and job state.
+
+**Decision:** ADR-0027 splits a publication into preparation and finalization.
+Preparation commits one journal row — the job, the candidate or the component
+role, the publication role, the digest and quarantine path, the artifact
+metadata, the optional adoption-lease owner, and the intended main transition —
+before promotion makes the digest path visible, so every visible artifact file
+has either a prepared journal row or a committed acquisition edge. Finalization
+holds a SQLite writer fence across exactly one precomputed, idempotent promotion
+callback, then records candidate acceptance, the acquisition edge, any legal main
+transition, and the removal of the journal row in that same transaction; a lease
+check before promotion is never a substitute for the fence. A commit error after
+promotion is ambiguous, so the finalizer opens a fresh job-store connection and
+reads the durable acquisition edge and journal row instead of assuming a
+rollback, and recovery finalizes that same intent rather than creating a
+replacement one. Reused content is never deleted, because a shared digest path
+can hold bytes another job reached. `validateCandidate` remains the single
+main-artifact validation seam, and component adoption still performs no main-job
+transition.
+
+**Why:** Filesystem publication is not compensable: deleting a destination can
+destroy content another acquisition reused, and it still cannot repair an
+uncertain database commit. A durable intent written before the bytes appear is
+the only thing that lets recovery tell a half-finished publication from a
+finished one, and the writer fence is what stops a bounded link or rename from
+racing a lease replacement.

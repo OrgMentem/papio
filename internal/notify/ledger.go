@@ -79,7 +79,7 @@ func (l *StoreLedger) DueWebhook(ctx context.Context, now time.Time, limit int) 
 func (l *StoreLedger) ReserveDesktop(ctx context.Context, id int64, now time.Time, maxPerHour int) (bool, error) {
 	return l.ledger.ReserveDesktop(ctx, id, now, maxPerHour)
 }
-func (l *StoreLedger) SetDesktopState(ctx context.Context, id int64, state string, now time.Time) error {
+func (l *StoreLedger) SetDesktopState(ctx context.Context, id int64, state string, now time.Time) (bool, error) {
 	return l.ledger.SetDesktopState(ctx, id, state, now)
 }
 func (l *StoreLedger) SetWebhookState(ctx context.Context, id int64, state string, now time.Time) error {
@@ -127,7 +127,15 @@ func fromStoreRecord(row store.NotificationRecord) (Record, error) {
 	if err := json.Unmarshal([]byte(row.PayloadJSON), &detail); err != nil {
 		return Record{}, fmt.Errorf("notification %d: payload_json: %w", row.ID, err)
 	}
-	return Record{ID: row.ID, Intent: Intent{EventKind: row.EventKind, Category: Category(row.Category), AggregateKey: row.AggregateKey, Phase: Phase(row.Phase), WindowStart: row.WindowStart, JobID: row.JobID, BatchID: row.BatchID, ScanID: row.ScanID, HappenedAt: row.LastAt, Message: detail.Message, Detail: detail}, FirstAt: row.FirstAt, LastAt: row.LastAt, AvailableAt: row.AvailableAt, Count: row.Count, DesktopState: row.DesktopState, WebhookState: row.WebhookState, DesktopReservedAt: row.DesktopReservedAt, DesktopAttemptedAt: row.DesktopAttemptedAt, WebhookAttemptedAt: row.WebhookAttemptedAt}, nil
+	rec := Record{ID: row.ID, Intent: Intent{EventKind: row.EventKind, Category: Category(row.Category), AggregateKey: row.AggregateKey, Phase: Phase(row.Phase), WindowStart: row.WindowStart, JobID: row.JobID, BatchID: row.BatchID, ScanID: row.ScanID, HappenedAt: row.LastAt, Message: detail.Message, Detail: detail}, FirstAt: row.FirstAt, LastAt: row.LastAt, AvailableAt: row.AvailableAt, Count: row.Count, DesktopState: row.DesktopState, WebhookState: row.WebhookState, DesktopReservedAt: row.DesktopReservedAt, DesktopAttemptedAt: row.DesktopAttemptedAt, WebhookAttemptedAt: row.WebhookAttemptedAt}
+	if row.DesktopSentPayloadJSON != "" {
+		var sent Event
+		if err := json.Unmarshal([]byte(row.DesktopSentPayloadJSON), &sent); err != nil {
+			return Record{}, fmt.Errorf("notification %d: desktop_sent_payload_json: %w", row.ID, err)
+		}
+		rec.DesktopSentDetail, rec.DesktopSentCount = sent, row.DesktopSentCount
+	}
+	return rec, nil
 }
 
 func (l *StoreLedger) SetDesktopAvailable(ctx context.Context, id int64, available time.Time) error {

@@ -514,7 +514,7 @@ func readyBundleSystem(t *testing.T, provenance ...func(*job.Candidate)) (*boots
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, err := system.Artifacts.Promote(temp, sha)
+	path, _, err := system.Artifacts.Promote(temp, sha)
 	if err != nil {
 		t.Fatal(err)
 	}

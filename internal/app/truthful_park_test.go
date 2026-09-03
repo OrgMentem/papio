@@ -25,65 +25,61 @@ func stubProcessDeps(svc *Service) {
 }
 
 func TestRecordExceededUTCDaySetsGate(t *testing.T) {
-	midnight := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	midnight := now.Add(24 * time.Hour)
 	plan := retryPlan{}
-	plan.recordExceeded(&budget.ErrExceeded{
+	if !plan.observeBudgetRefusal(&budget.ErrExceeded{
 		Source: config.SourceOpenAlex,
 		Kind:   budget.KindCredits,
 		Window: budget.WindowUTCDay,
 		Until:  midnight,
-	})
-	if plan.Gate != midnight {
-		t.Fatalf("Gate = %v, want %v", plan.Gate, midnight)
+	}) {
+		t.Fatal("typed budget refusal was not observed")
 	}
-	if plan.LatestGate != midnight {
-		t.Fatalf("LatestGate = %v, want %v", plan.LatestGate, midnight)
-	}
-	if plan.StickyBudgetGate {
-		t.Fatal("UTC-day refusal must not mark sticky")
+	if got := plan.schedule(now, time.Minute, false, false).at; !got.Equal(midnight) {
+		t.Fatalf("retry wake = %v, want %v", got, midnight)
 	}
 }
 
-func TestRecordExceededStickyLeavesGateZero(t *testing.T) {
+func TestRecordExceededStickyUsesRetryCadence(t *testing.T) {
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
 	plan := retryPlan{}
-	plan.recordExceeded(&budget.ErrExceeded{
+	plan.observeBudgetRefusal(&budget.ErrExceeded{
 		Source: config.SourceOpenAlex,
 		Kind:   budget.KindCredits,
 		Window: budget.WindowSticky,
 	})
-	if !plan.StickyBudgetGate {
-		t.Fatal("sticky refusal must set StickyBudgetGate")
+	if plan.empty() {
+		t.Fatal("sticky gate must keep the plan non-empty so the job parks")
 	}
-	if !plan.Gate.IsZero() || !plan.LatestGate.IsZero() {
-		t.Fatalf("sticky refusal must leave Gate/LatestGate zero: gate=%v latest=%v", plan.Gate, plan.LatestGate)
-	}
-	if plan.IsZero() {
-		t.Fatal("sticky gate must keep plan non-zero so the job parks instead of settling")
+	if got, want := plan.schedule(now, time.Minute, false, false).at, now.Add(time.Minute); !got.Equal(want) {
+		t.Fatalf("retry wake = %v, want cadence floor %v", got, want)
 	}
 }
 
 func TestRecordExceededDistinctWindowsDoNotCollapse(t *testing.T) {
-	day := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+	day := now.Add(24 * time.Hour)
 	month := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	plan := retryPlan{}
-	plan.recordExceeded(&budget.ErrExceeded{Window: budget.WindowUTCDay, Until: day})
-	plan.recordExceeded(&budget.ErrExceeded{Kind: budget.KindUSD, Window: budget.WindowMonth, Until: month})
-	if plan.Gate != day {
-		t.Fatalf("Gate = %v, want earliest reset %v", plan.Gate, day)
+	plan.observeBudgetRefusal(&budget.ErrExceeded{Window: budget.WindowUTCDay, Until: day})
+	plan.observeBudgetRefusal(&budget.ErrExceeded{Kind: budget.KindUSD, Window: budget.WindowMonth, Until: month})
+	if got := plan.schedule(now, time.Minute, false, false).at; !got.Equal(day) {
+		t.Fatalf("ordinary retry wake = %v, want earliest reset %v", got, day)
 	}
-	if plan.LatestGate != month {
-		t.Fatalf("LatestGate = %v, want latest reset %v", plan.LatestGate, month)
+	if got := plan.schedule(now, time.Minute, true, false).at; !got.Equal(month) {
+		t.Fatalf("post-exhaustion wake = %v, want latest reset %v", got, month)
 	}
 }
 
-func TestAbsorbBudgetRefusal_guardRequired(t *testing.T) {
+func TestObserveBudgetRefusalRequiresTypedError(t *testing.T) {
 	plan := retryPlan{}
 	until := time.Date(2026, 8, 16, 0, 0, 0, 0, time.UTC)
-	if !absorbBudgetRefusal(&plan, &budget.ErrExceeded{Window: budget.WindowUTCDay, Until: until}) {
-		t.Fatal("absorbBudgetRefusal must recognise ErrExceeded")
+	if !plan.observeBudgetRefusal(&budget.ErrExceeded{Window: budget.WindowUTCDay, Until: until}) {
+		t.Fatal("observeBudgetRefusal must recognise ErrExceeded")
 	}
-	if plan.Gate.IsZero() {
-		t.Fatal("guard: recordExceeded must set Gate — disabling it leaves an empty plan")
+	if got := plan.at(); !got.Equal(until) {
+		t.Fatalf("retry wake = %v, want %v", got, until)
 	}
 }
 

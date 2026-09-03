@@ -1256,6 +1256,47 @@ func (js *Store) RepairAwaitingHuman(ctx context.Context, jobID string, actionID
 	return tx.Commit()
 }
 
+// ParkWithHumanAction is RepairAwaitingHuman's inverse: it opens (or
+// refreshes) the prompt a human must answer and performs the parking
+// transition in ONE transaction, so the two halves of a park cannot disagree.
+// Split across two commits, a failed transition leaves a stale open prompt on
+// a job nobody is waiting on, and a failed open leaves a parked job with
+// nothing for a human to act on; only the scheduler re-driving the unleased
+// job papered over the first outcome.
+//
+// The transition uses ordinary Transition semantics — the caller holds the
+// lease it is parking — rather than RepairAwaitingHuman's unleased predicate,
+// which exists for maintenance acting on a job it does not own.
+func (js *Store) ParkWithHumanAction(ctx context.Context, jobID, from, to, actionKind, actionDetail string,
+	detail map[string]any, access AccessClassification, opts ...OpenHumanActionOption,
+) error {
+	if !allowed[from][to] {
+		return fmt.Errorf("%w: %s -> %s not allowed", ErrConflict, from, to)
+	}
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	detail["from"], detail["to"] = from, to
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		return err
+	}
+	now := store.Now()
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := js.OpenHumanActionTx(ctx, tx, jobID, actionKind, actionDetail, now, access, opts...); err != nil {
+		return err
+	}
+	if err := js.TransitionTx(ctx, tx, jobID, from, to, string(detailJSON), TransitionTxConfig{}, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // RepairParkWithAction atomically moves an unleased human park only when its
 // open actions still match the maintenance snapshot, then opens the replacement
 // human action. The lease and action predicates share one transaction so a
@@ -1742,11 +1783,43 @@ func (js *Store) SweepTerminalQuarantine(ctx context.Context) error {
 	}
 	var cleanupErr error
 	for _, id := range ids {
-		if err := artifacts.CleanQuarantine(id); err != nil {
+		if err := js.cleanTerminalQuarantine(ctx, artifacts, id); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("clean terminal quarantine for %s: %w", id, err))
 		}
 	}
 	return cleanupErr
+}
+
+// cleanTerminalQuarantine takes the writer fence across the filesystem cleanup.
+// A prepared publication owns quarantine bytes, even when its job is terminal.
+func (js *Store) cleanTerminalQuarantine(ctx context.Context, artifacts *artifact.Store, jobID string) error {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET updated_at = updated_at
+		 WHERE id = ? AND state IN ('ready', 'imported', 'unavailable', 'failed', 'cancelled')`, jobID)
+	if err != nil {
+		return err
+	}
+	if changed, _ := res.RowsAffected(); changed != 1 {
+		return nil
+	}
+	var one int
+	err = tx.QueryRowContext(ctx,
+		`SELECT 1 FROM artifact_publications WHERE job_id = ? LIMIT 1`, jobID).Scan(&one)
+	if err == nil {
+		return tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := artifacts.CleanQuarantine(jobID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Get loads one job row with its work-request identity.
@@ -2651,6 +2724,29 @@ func validSHA256(value string) bool {
 // same job and action kind refreshes the existing action rather than creating
 // another open prompt.
 func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string, access AccessClassification, opts ...OpenHumanActionOption) (int64, error) {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	actionID, err := js.OpenHumanActionTx(ctx, tx, jobID, kind, detail, store.Now(), access, opts...)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return actionID, nil
+}
+
+// OpenHumanActionTx is OpenHumanAction's transaction-taking form. It exists so
+// a caller can open the prompt and move the job in the same commit: an action
+// opened by its own write is durable before the transition that justifies it,
+// and a failed transition then strands an open prompt on a job nobody is
+// waiting on. now is supplied by the caller so the action row and that
+// caller's other writes carry one timestamp.
+func (js *Store) OpenHumanActionTx(ctx context.Context, tx *sql.Tx, jobID, kind, detail, now string, access AccessClassification, opts ...OpenHumanActionOption) (int64, error) {
 	var options openHumanActionOptions
 	if err := access.apply(&options); err != nil {
 		return 0, err
@@ -2667,14 +2763,8 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 		return 0, errors.New("human action binding is only valid for verify_identity or unsafe_pdf")
 	}
 
-	tx, err := js.S.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	var actionID int64
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT id FROM human_actions
 		 WHERE job_id = ? AND kind = ? AND status = 'open'
 		 ORDER BY id ASC LIMIT 1`, jobID, kind).Scan(&actionID)
@@ -2710,7 +2800,7 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 			INSERT INTO human_actions
 				(job_id, kind, status, detail, requires_auth, blocked_by, diagnosis, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
 			VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-			jobID, kind, nullable(detail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), candidateID, path, sha, store.Now())
+			jobID, kind, nullable(detail), options.requiresAuth, options.blockedBy, nullable(options.diagnosis), candidateID, path, sha, now)
 		if err != nil {
 			return 0, err
 		}
@@ -2719,9 +2809,6 @@ func (js *Store) OpenHumanAction(ctx context.Context, jobID, kind, detail string
 			return 0, err
 		}
 	default:
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return actionID, nil

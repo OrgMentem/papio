@@ -8,13 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
+	"papio/internal/app"
 	"papio/internal/bootstrap"
 	"papio/internal/delivery"
 	"papio/internal/ipc"
-	"papio/internal/job"
-	"papio/internal/store"
 )
 
 // DeliveryRequest is the wire projection of one delivery_requests row
@@ -363,194 +361,41 @@ func deliveryAction(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	}
 }
 
-// openDocumentDeliveryAction finds the one open document_delivery human
-// action Decision 4 says a job in this reconciliation state must have.
-func openDocumentDeliveryAction(ctx context.Context, system *bootstrap.System, jobID string) (*job.HumanAction, *ipc.RPCError) {
-	actions, err := system.Jobs.ListHumanActionsForJob(ctx, jobID)
-	if err != nil {
-		return nil, failureErr(err)
-	}
-	for _, a := range actions {
-		if a.Action.Kind == job.ActionKindDocumentDelivery && a.Action.Status == "open" {
-			action := a.Action
-			return &action, nil
-		}
-	}
-	return nil, &ipc.RPCError{Code: "not_found", Message: "no open document_delivery action for this job"}
-}
-
-// deliveryConfirmRequestExists implements Decision 4's "the operator checked
-// with the institution and a request really is on file": the row moves to
-// pending with the human-supplied provider reference, the document_delivery
-// action closes, and the job resumes as an ordinary pending delivery poll
-// (StateRetryWait, RetryReasonDocumentDeliveryPending) — never
-// retry_submission.
+// deliveryConfirmRequestExists delegates the atomic Decision 4 mutation to
+// app.Service. This adapter only renders the CLI/MCP response.
 func deliveryConfirmRequestExists(ctx context.Context, system *bootstrap.System, jobID, providerReference string) ([]byte, *ipc.RPCError) {
-	svc, rpcErr := deliveryService(system)
-	if rpcErr != nil {
-		return nil, rpcErr
-	}
-	row, err := svc.GetByJobID(ctx, jobID)
-	if err != nil {
-		return failure(err)
-	}
-	if row == nil {
-		return nil, &ipc.RPCError{Code: "not_found", Message: "no delivery request for this job"}
-	}
-	action, rpcErr := openDocumentDeliveryAction(ctx, system, jobID)
-	if rpcErr != nil {
-		return nil, rpcErr
-	}
-	profile, err := svc.ResolveGateProfileFor(ctx, row.InstitutionProfile)
-	if err != nil {
-		return failure(err)
-	}
-	next := delivery.NextCheck(time.Now(), 0, profile.StatusPollMinutes)
-	// One threaded tx over the single pooled *sql.DB (SetMaxOpenConns(1)).
-	// Validate prerequisites before mutating; then apply delivery row mutations
-	// and job transitions atomically. Human action is closed LAST via
-	// RepairAwaitingHuman so a mid-sequence failure leaves the action OPEN and
-	// the operator retains the reconciliation affordance.
-	//
-	// Full atomicity is via one sql.Tx threaded through Tx-variants on the
-	// delivery and job stores (both share the same *store.Store / *sql.DB).
-	// If future absent-path logic must call app.Service.SubmitDelivery inside
-	// the same tx, that seam must gain a Tx-variant.
-	db := system.Store.DB()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return failure(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := svc.UpdateStateTx(ctx, tx, row.ID, delivery.StatePending); err != nil {
-		return failure(err)
-	}
-	if err := svc.RecordPollTx(ctx, tx, row.ID, providerReference, next); err != nil {
-		return failure(err)
-	}
-	repairDetail := map[string]any{"reason": "document_delivery_confirmed_exists"}
-	repairDetail["from"], repairDetail["to"] = job.StateAwaitingHuman, job.StateResolving
-	repairJSON, err := json.Marshal(repairDetail)
-	if err != nil {
-		return failure(err)
-	}
-	now := store.Now()
-	if err := system.Jobs.RepairAwaitingHumanTx(ctx, tx, jobID, []int64{action.ID}, string(repairJSON), now); err != nil {
-		return failure(err)
-	}
-	retryDetail := map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": providerReference}
-	retryDetail["from"], retryDetail["to"] = job.StateResolving, job.StateRetryWait
-	retryJSON, err := json.Marshal(retryDetail)
-	if err != nil {
-		return failure(err)
-	}
-	if err := system.Jobs.TransitionTx(ctx, tx, jobID, job.StateResolving, job.StateRetryWait, string(retryJSON), job.TransitionTxConfig{RetryAt: next.UTC().Format(time.RFC3339Nano)}, now); err != nil {
-		return failure(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return failure(err)
-	}
-	detail, rpcErr := deliveryRequestDetail(ctx, system, jobID)
-	if rpcErr != nil {
-		return nil, rpcErr
-	}
-	return marshal(DeliveryActionResult{JobID: jobID, Operation: deliveryOpConfirmRequestExists, JobState: job.StateRetryWait, Detail: detail})
+	return deliveryReconcile(ctx, system, jobID, deliveryOpConfirmRequestExists, providerReference)
 }
 
-// deliveryConfirmRequestAbsent implements Decision 4's "the operator checked
-// and no request exists": the stale row is cancelled, the document_delivery
-// action closes, and the job re-enters the exact Branch/gate seam
-// exhaustedCandidates uses (app.Service.SubmitDelivery) — never a duplicated
-// policy implementation. In v1 that seam always resolves a cancelled row to
-// BranchResubmissionPolicy, which deliveryRoute routes straight back to
-// reconciliation (a fresh document_delivery action, job awaiting_human)
-// rather than re-entering the gate: this operation never auto-resubmits.
-// It exists to close the stale reconciliation action on a deliberate
-// operator decision — "no request was ever lodged" — and open a new one,
-// not to give the job another shot at ActionSubmit.
+// deliveryConfirmRequestAbsent delegates the ordered cancel -> repair ->
+// submit Decision 4 mutation to app.Service. This adapter only renders the
+// CLI/MCP response.
 func deliveryConfirmRequestAbsent(ctx context.Context, system *bootstrap.System, jobID string) ([]byte, *ipc.RPCError) {
-	svc, rpcErr := deliveryService(system)
-	if rpcErr != nil {
-		return nil, rpcErr
-	}
+	return deliveryReconcile(ctx, system, jobID, deliveryOpConfirmRequestAbsent, "")
+}
+
+func deliveryReconcile(ctx context.Context, system *bootstrap.System, jobID, operation, providerReference string) ([]byte, *ipc.RPCError) {
 	if system.App == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "document delivery is not configured"}
 	}
-	row, err := svc.GetByJobID(ctx, jobID)
+	result, err := system.App.ReconcileDelivery(ctx, app.DeliveryReconciliationInput{
+		JobID: jobID, Operation: app.DeliveryReconciliationOperation(operation), ProviderReference: providerReference,
+	})
 	if err != nil {
-		return failure(err)
-	}
-	if row == nil {
-		return nil, &ipc.RPCError{Code: "not_found", Message: "no delivery request for this job"}
-	}
-	action, rpcErr := openDocumentDeliveryAction(ctx, system, jobID)
-	if rpcErr != nil {
-		return nil, rpcErr
-	}
-	// Ordering that satisfies both atomicity and the legal state graph:
-	//   allowed[A->R] via RepairAwaitingHuman, allowed[R->A] via SubmitDelivery's
-	//   reconciliation park. The prior Cancel->Submit->Repair order kept the
-	//   action open on Submit failure (good) but Submit saw job still A and
-	//   attempted A->A (illegal). Repair->Submit is the only legal order:
-	//   Cancel row, Repair A->R (close old), Submit R->A (open new). If Submit
-	//   fails after Repair, we compensate by re-opening a reconciliation
-	//   action so the operator never loses the affordance (row cancelled is a
-	//   documented recoverable state).
-	//
-	// Cancel and Repair share ONE tx, like the exists sibling. Committing the
-	// cancellation on its own made a losing verdict destructive: a
-	// confirm-exists that had already closed the action and moved the job to
-	// retry_wait would make this Repair fail, but the row was cancelled by
-	// then and nothing rolled it back — the winner's confirmed live provider
-	// request ended up locally cancelled. Repair is also the staleness guard:
-	// it refuses a closed action, which rolls the cancellation back with it.
-	// SubmitDelivery stays outside, after the commit; it is the seam that
-	// would need a Tx-variant to move inside.
-	tx, err := system.Store.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return failure(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := svc.UpdateStateTx(ctx, tx, row.ID, delivery.StateCancelled); err != nil {
-		return failure(err)
-	}
-	repairJSON, err := json.Marshal(map[string]any{"reason": "document_delivery_confirmed_absent"})
-	if err != nil {
-		return failure(err)
-	}
-	if err := system.Jobs.RepairAwaitingHumanTx(ctx, tx, jobID, []int64{action.ID}, string(repairJSON), store.Now()); err != nil {
-		return failure(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return failure(err)
-	}
-	_, submitErr := system.App.SubmitDelivery(ctx, jobID)
-	if submitErr != nil {
-		ref := row.ProviderReference
-		if ref == "" {
-			ref = "(no provider reference recorded)"
+		switch {
+		case errors.Is(err, app.ErrDeliveryNotConfigured):
+			return nil, &ipc.RPCError{Code: "precondition_failed", Message: "document delivery is not configured"}
+		case errors.Is(err, app.ErrDeliveryRequestNotFound), errors.Is(err, app.ErrDeliveryReconciliationNotFound):
+			return nil, &ipc.RPCError{Code: "not_found", Message: err.Error()}
+		default:
+			return failure(err)
 		}
-		detail := fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
-			row.Provider, ref, string(delivery.StateCancelled), jobID)
-		// Park first, then open the prompt — see the bridge sibling in
-		// internal/browser for the full reasoning. Opening first could commit
-		// the action and then fail the transition, leaving a document_delivery
-		// prompt visible on a job still in resolving that RepairAwaitingHuman
-		// refuses to act on.
-		if parkErr := system.Jobs.Transition(ctx, jobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"}); parkErr == nil {
-			_, _ = system.Jobs.OpenHumanAction(ctx, jobID, job.ActionKindDocumentDelivery, detail, job.Access(false, ""))
-		}
-		return failure(submitErr)
-	}
-	after, err := system.Jobs.Get(ctx, jobID)
-	if err != nil {
-		return failure(err)
 	}
 	detail, rpcErr := deliveryRequestDetail(ctx, system, jobID)
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	return marshal(DeliveryActionResult{JobID: jobID, Operation: deliveryOpConfirmRequestAbsent, JobState: after.State, Detail: detail})
+	return marshal(DeliveryActionResult{JobID: jobID, Operation: operation, JobState: result.JobState, Detail: detail})
 }
 
 // DeliveryResumeResult reports delivery.resume's outcome: Resumed is false

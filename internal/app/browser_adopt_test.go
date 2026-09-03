@@ -20,6 +20,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/resolver"
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -369,6 +370,14 @@ func TestAdoptDownloadValidatesAndPromotes(t *testing.T) {
 	if err := svc.Artifacts.Verify(row.ArtifactSHA256); err != nil {
 		t.Fatalf("artifact verify: %v", err)
 	}
+	edge, err := jobs.HasPublicationEdge(context.Background(), id, row.ArtifactSHA256, job.PublicationRoleMain)
+	if err != nil || !edge {
+		t.Fatalf("main publication edge = %v, %v; want true, nil", edge, err)
+	}
+	prepared, err := jobs.PreparedPublications(context.Background(), id)
+	if err != nil || len(prepared) != 0 {
+		t.Fatalf("prepared publications after adoption = %+v, %v; want none", prepared, err)
+	}
 }
 
 func TestAdoptDownloadResolvesSatisfiedHandoffActions(t *testing.T) {
@@ -562,7 +571,7 @@ func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
 	}
 }
 
-func TestAdoptDownloadRepArksToAwaitingHumanOnValidationInfraError(t *testing.T) {
+func TestAdoptDownloadRetainsPreparedPublicationOnPromotionError(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Validate = passValidation()
 	id := parkAwaitingHuman(t, jobs, "wr_adopt_infra")
@@ -575,9 +584,8 @@ func TestAdoptDownloadRepArksToAwaitingHumanOnValidationInfraError(t *testing.T)
 		t.Fatal(err)
 	}
 	// Make the immutable artifact store read-only so Promote (an atomic rename
-	// into it) fails after validation passes: a post-validation infra error
-	// that leaves validateCandidate returning (false, false, err). The
-	// quarantine and database dirs stay writable, so only Promote fails.
+	// into it) fails after preparation. The journal retains its owner row and
+	// the job stays validating, so recovery can retry without a stale-state CAS.
 	artRoot := filepath.Join(svc.Config.DataDir, "artifacts")
 	if err := os.Chmod(artRoot, 0o500); err != nil {
 		t.Fatal(err)
@@ -591,12 +599,273 @@ func TestAdoptDownloadRepArksToAwaitingHumanOnValidationInfraError(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.State != job.StateAwaitingHuman {
-		t.Fatalf("adoption infra error left job in %s, want awaiting_human (a validating strand lets RecoverStale rewind it to resolving and discard the file)", row.State)
+	if row.State != job.StateValidating {
+		t.Fatalf("prepared publication changed job state to %s, want validating", row.State)
 	}
-	// The adopted file must be preserved so the directory sweep can retry it.
+	prepared, err := jobs.PreparedPublications(context.Background(), id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared publications after promotion error = %+v, %v; want one", prepared, err)
+	}
+	// The adopted source remains in the landing directory. A later browser
+	// sweep or restart can recover the durable journal once storage recovers.
 	if _, statErr := os.Stat(pdfPath); statErr != nil {
-		t.Fatalf("adopted file was not preserved for retry: %v", statErr)
+		t.Fatalf("adopted file was not preserved for recovery: %v", statErr)
+	}
+}
+
+func TestAdoptDownloadRecoversPreparedPublicationAfterFinalizationFailure(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_finalize_recovery")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("finalization recovery"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_browser_publication_ready
+		BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'ready'
+		BEGIN SELECT RAISE(FAIL, 'forced publication finalization failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err == nil {
+		t.Fatal("browser adoption succeeded despite forced post-promotion finalization failure")
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateValidating {
+		t.Fatalf("prepared browser publication re-parked job in %s, want validating", row.State)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared publications = %+v, %v; want one", prepared, err)
+	}
+	if err := svc.Artifacts.Verify(prepared[0].SHA256); err != nil {
+		t.Fatalf("promoted artifact before failed commit was not retained: %v", err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_browser_publication_ready`); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Dir(jobs.S.Path())
+	if err := jobs.S.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	svc.Jobs = &job.Store{S: reopened}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatalf("recover prepared browser publication after restart: %v", err)
+	}
+	row, err = svc.Jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateReady {
+		t.Fatalf("recovered browser job state = %s, want ready", row.State)
+	}
+	edge, err := svc.Jobs.HasPublicationEdge(ctx, id, row.ArtifactSHA256, job.PublicationRoleMain)
+	if err != nil || !edge {
+		t.Fatalf("recovered main publication edge = %v, %v; want true, nil", edge, err)
+	}
+	prepared, err = svc.Jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 0 {
+		t.Fatalf("prepared publications after restart recovery = %+v, %v; want none", prepared, err)
+	}
+}
+
+func TestAdoptDownloadKeepsSanitizedPreparedPublicationValidatingAfterFinalizationFailure(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_sanitized_finalize_recovery")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("embedded source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validations := 0
+	svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		validations++
+		report, err := passValidation()(context.Background(), "", "", work.Work{})
+		if err != nil {
+			return pdf.ValidationReport{}, err
+		}
+		if validations == 1 {
+			report.Structural.HasEmbeddedFiles = true
+		}
+		return report, nil
+	}
+	svc.Sanitize = func(_ context.Context, src, dst string) (pdf.StructuralReport, error) {
+		bytes, err := os.ReadFile(src)
+		if err != nil {
+			return pdf.StructuralReport{}, err
+		}
+		if err := os.WriteFile(dst, append(bytes, []byte(" sanitized")...), 0o600); err != nil {
+			return pdf.StructuralReport{}, err
+		}
+		return pdf.StructuralReport{Valid: true, Pages: 2}, nil
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_sanitized_browser_publication_ready
+		BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'ready'
+		BEGIN SELECT RAISE(FAIL, 'forced sanitized finalization failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_sanitized_browser_publication_ready`) }()
+	if err := svc.AdoptDownload(ctx, id, path); err == nil {
+		t.Fatal("sanitized browser adoption succeeded despite forced finalization failure")
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateValidating {
+		t.Fatalf("sanitized prepared publication re-parked job in %s, want validating", row.State)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("sanitized prepared publications = %+v, %v; want one", prepared, err)
+	}
+	if prepared[0].CandidateID == nil {
+		t.Fatal("sanitized publication lost its candidate binding")
+	}
+}
+
+func TestProcessClaimDoesNotRewindPreparedBrowserPublication(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_claimed_publication_recovery")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("claimed publication"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_claimed_browser_publication_ready
+		BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'ready'
+		BEGIN SELECT RAISE(FAIL, 'forced claimed finalization failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err == nil {
+		t.Fatal("browser adoption succeeded despite forced finalization failure")
+	}
+	claimed, err := jobs.ClaimNext(ctx, "scheduler-owner", time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim prepared browser job = %+v, %v", claimed, err)
+	}
+	if err := svc.Process(ctx, claimed); err == nil {
+		t.Fatal("process succeeded despite forced finalization failure")
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateValidating {
+		t.Fatalf("claimed prepared job rewound to %s, want validating", row.State)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared publication after scheduler claim = %+v, %v; want one", prepared, err)
+	}
+	if err := svc.Artifacts.Verify(prepared[0].SHA256); err != nil {
+		t.Fatalf("published bytes were lost before journal recovery: %v", err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_claimed_browser_publication_ready`); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Release(ctx, id, "scheduler-owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatalf("recover publication after scheduler claim: %v", err)
+	}
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateReady {
+		t.Fatalf("recovered claimed job state = %s, want ready", row.State)
+	}
+}
+
+func TestRecoverPreparedPublicationAfterCancellationConsumesJournal(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_cancelled_publication_recovery")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("cancelled publication"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER fail_cancelled_browser_publication_ready
+		BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'ready'
+		BEGIN SELECT RAISE(FAIL, 'forced cancelled finalization failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err == nil {
+		t.Fatal("browser adoption succeeded despite forced finalization failure")
+	}
+	prepared, err := jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 1 {
+		t.Fatalf("prepared cancelled publication = %+v, %v; want one", prepared, err)
+	}
+	publicationSHA := prepared[0].SHA256
+	if err := jobs.Cancel(ctx, id, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_cancelled_browser_publication_ready`); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Dir(jobs.S.Path())
+	if err := jobs.S.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	svc.Jobs = &job.Store{S: reopened}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatalf("recover cancelled prepared publication after restart: %v", err)
+	}
+	row, err := svc.Jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateCancelled {
+		t.Fatalf("cancelled recovery changed job state to %s", row.State)
+	}
+	prepared, err = svc.Jobs.PreparedPublications(ctx, id)
+	if err != nil || len(prepared) != 0 {
+		t.Fatalf("cancelled recovery journal = %+v, %v; want none", prepared, err)
+	}
+	edge, err := svc.Jobs.HasPublicationEdge(ctx, id, publicationSHA, job.PublicationRoleMain)
+	if err != nil || !edge {
+		t.Fatalf("cancelled recovery edge = %v, %v; want retained ownership", edge, err)
+	}
+	if err := svc.Artifacts.Verify(publicationSHA); err != nil {
+		t.Fatalf("cancelled recovery artifact: %v", err)
 	}
 }
 

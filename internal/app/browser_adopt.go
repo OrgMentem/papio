@@ -140,6 +140,9 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	if s.Validate == nil {
 		return fmt.Errorf("acquisition service is missing its validation dependency")
 	}
+	if err := s.reconcilePreparedPublications(ctx, jobID); err != nil {
+		return err
+	}
 	row, err := s.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return err
@@ -176,7 +179,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	path = resolved
 
 	owner := job.NewID("adopt")
-	held, err := s.leaseAwaitingHuman(ctx, jobID, owner, 5*time.Minute)
+	held, err := s.Jobs.LeaseAwaitingHuman(ctx, jobID, owner, 5*time.Minute)
 	if err != nil {
 		return err
 	}
@@ -223,7 +226,7 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		_ = os.Remove(temp)
 		return err
 	}
-	id, err := s.candidateIDByKey(ctx, jobID, key)
+	id, err := s.Jobs.CandidateIDByKey(ctx, jobID, key)
 	if err != nil {
 		_ = os.Remove(temp)
 		return err
@@ -256,10 +259,23 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	replacementAccess := s.adoptionReplacementAccess(ctx, jobID)
 	s.resolveAdoptedHandoffActions(ctx, jobID)
 
-	accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
+	accepted, parked, err := s.validateCandidate(ctx, row, stored, result, &owner)
 	if err != nil {
+		// A prepared publication owns the quarantine bytes and records a
+		// validating -> ready transition. Re-parking this job would make that
+		// transition impossible to finalize after a crash or an ambiguous SQL
+		// reply. Leave it validating for the journal recovery path instead.
+		prepared, preparedErr := s.Jobs.PreparedPublications(context.WithoutCancel(ctx), jobID)
+		if preparedErr != nil {
+			return errors.Join(err, fmt.Errorf("checking prepared browser publication: %w", preparedErr))
+		}
+		for _, publication := range prepared {
+			if publication.Role == job.PublicationRoleMain && publication.CandidateID != nil && *publication.CandidateID == stored.ID {
+				return err
+			}
+		}
 		// validateCandidate returns before completing a transition on an
-		// infrastructure error (start-attempt / promote / store failure),
+		// infrastructure error (start-attempt / preparation failure),
 		// leaving the job in validating. Left there, the scheduler's
 		// RecoverStale rewinds it to resolving and re-fetches, discarding the
 		// user's supplied download for whatever OA resolution finds. Re-park in
@@ -325,7 +341,7 @@ func (s *Service) AdoptDownloadCandidate(ctx context.Context, jobID, path string
 	adoptErr := s.AdoptDownload(context.WithValue(ctx, adoptionCandidateResultKey{}, result), jobID, path)
 	if adoptErr != nil {
 		if result.ID == 0 && result.Key != "" {
-			result.ID, _ = s.candidateIDByKey(ctx, jobID, result.Key)
+			result.ID, _ = s.Jobs.CandidateIDByKey(ctx, jobID, result.Key)
 		}
 		return result.ID, adoptErr
 	}
@@ -416,30 +432,10 @@ func (s *Service) adoptionReplacementAccess(ctx context.Context, jobID string) j
 	return job.AccessInheritedFromResolvedHandoff("")
 }
 
-// leaseAwaitingHuman CAS-acquires a lease on a job that is parked in
-// awaiting_human. It mirrors ClaimNext's ownership guard but targets a specific
-// parked job (which ClaimNext never selects), so adoption can hold the job
-// across the validating window.
+// leaseAwaitingHuman keeps the package-local test seam while the job store
+// owns the lease predicate and durable update.
 func (s *Service) leaseAwaitingHuman(ctx context.Context, jobID, owner string, lease time.Duration) (bool, error) {
-	now := time.Now().UTC()
-	expires := now.Add(lease).Format(time.RFC3339Nano)
-	res, err := s.Jobs.S.DB().ExecContext(ctx,
-		`UPDATE jobs SET lease_owner = ?, lease_expires_at = ?
-		 WHERE id = ? AND state = ? AND (lease_owner IS NULL OR lease_expires_at < ?)`,
-		owner, expires, jobID, job.StateAwaitingHuman, now.Format(time.RFC3339Nano))
-	if err != nil {
-		return false, err
-	}
-	n, _ := res.RowsAffected()
-	return n == 1, nil
-}
-
-// candidateIDByKey resolves the durable id of a job candidate by its url_key.
-func (s *Service) candidateIDByKey(ctx context.Context, jobID, key string) (int64, error) {
-	var id int64
-	err := s.Jobs.S.DB().QueryRowContext(ctx,
-		`SELECT id FROM candidates WHERE job_id = ? AND url_key = ?`, jobID, key).Scan(&id)
-	return id, err
+	return s.Jobs.LeaseAwaitingHuman(ctx, jobID, owner, lease)
 }
 
 // copyHashed streams src into dst (created 0600) while computing its SHA-256 and

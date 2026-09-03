@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,16 +33,11 @@ import (
 	"papio/internal/work"
 )
 
-// overlaySources are the resolver source names bench wires for every run,
-// plus config.SourceCrossrefMetadata for the typed-relations/enrichment
-// HTTP seam (Service.Enricher, not a resolver entry). openalex/core/
-// crossref_tdm stay unwired in both overlays: config.Default() already
-// ships them disabled, and bench's "current" overlay means "today's shipped
-// default," not "every resolver that exists."
-var overlaySources = []string{
-	config.SourceArXiv, config.SourceEuropePMC, config.SourceUnpaywall,
-	config.SourceSemanticScholar, config.SourceOpenAIRE, config.SourceCrossrefMetadata,
-}
+// overlaySources are every source bench serves a fixture host for: the
+// acquisition resolvers it wires, plus config.SourceCrossrefMetadata for the
+// typed-relations/enrichment HTTP seam (Service.Enricher, not a resolver
+// entry).
+var overlaySources = append(slices.Clone(benchAcquisitionSources), config.SourceCrossrefMetadata)
 
 // baselineDisabledSources are turned off for the baseline overlay:
 // Semantic Scholar and OpenAIRE are ordinary resolver sources, per
@@ -98,23 +94,70 @@ func overlayConfig(dataDir string, current bool) config.Config {
 	return cfg
 }
 
+// benchAcquisitionSources are the acquisition resolvers bench points at fixture
+// servers. It is a membership set only — never an order — because precedence
+// comes from config's catalog, the same authority production reads. openalex/
+// core/crossref_tdm stay unwired in both overlays: config.Default() already
+// ships them disabled, and bench's "current" overlay means "today's shipped
+// default," not "every resolver that exists."
+var benchAcquisitionSources = []string{
+	config.SourceArXiv, config.SourceEuropePMC, config.SourceUnpaywall,
+	config.SourceSemanticScholar, config.SourceOpenAIRE,
+}
+
 // resolverEntries builds the real resolver adapters, each pointed at the
-// rig's per-source fixture server instead of the provider's real API. This
-// mirrors internal/bootstrap/bootstrap.go's resolverEntries wiring, but with
-// a plain http.DefaultClient instead of a *fetch.SecureHTTPClient: the
-// fixture servers are loopback-only httptest.Servers with nothing to
-// SSRF-guard against, and every resolver's Options.Client is a small
-// Do(*http.Request) interface any *http.Client already satisfies (see
-// internal/resolvers/*/*_test.go).
-func resolverEntries(cfg config.Config, rig *sourceRig) []app.ResolverEntry {
+// rig's per-source fixture server instead of the provider's real API, in the
+// production acquisition order: it walks config's catalog for
+// RoleAcquisitionResolver and keeps the sources bench fixtures. A benchmark
+// with its own order would measure a resolver precedence papio does not ship,
+// and would drift silently the first time production's order changed.
+//
+// The adapters are the production ones, but with a plain http.DefaultClient
+// instead of a *fetch.SecureHTTPClient: the fixture servers are loopback-only
+// httptest.Servers with nothing to SSRF-guard against, and every resolver's
+// Options.Client is a small Do(*http.Request) interface any *http.Client
+// already satisfies (see internal/resolvers/*/*_test.go).
+//
+// A name bench wires that the catalog does not call an acquisition resolver,
+// or one this switch cannot build, is an error rather than a quietly shorter
+// chain — a bench run that silently drops a resolver reports a regression that
+// did not happen.
+func resolverEntries(cfg config.Config, rig *sourceRig) ([]app.ResolverEntry, error) {
 	client := http.DefaultClient
-	return []app.ResolverEntry{
-		{Adapter: arxiv.NewWithOptions(arxiv.Options{Client: client, BaseURL: rig.baseURL(config.SourceArXiv)}), Policy: cfg.SourcePolicy(config.SourceArXiv)},
-		{Adapter: europepmc.NewWithOptions(europepmc.Options{Client: client, BaseURL: rig.baseURL(config.SourceEuropePMC)}), Policy: cfg.SourcePolicy(config.SourceEuropePMC)},
-		{Adapter: unpaywall.NewWithOptions(unpaywall.Options{Client: client, ContactEmail: cfg.Email, BaseURL: rig.baseURL(config.SourceUnpaywall)}), Policy: cfg.SourcePolicy(config.SourceUnpaywall)},
-		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, BaseURL: rig.baseURL(config.SourceSemanticScholar)}), Policy: cfg.SourcePolicy(config.SourceSemanticScholar)},
-		{Adapter: openaire.NewWithOptions(openaire.Options{Client: client, BaseURL: rig.baseURL(config.SourceOpenAIRE)}), Policy: cfg.SourcePolicy(config.SourceOpenAIRE)},
+	wired := make(map[string]bool, len(benchAcquisitionSources))
+	for _, name := range benchAcquisitionSources {
+		wired[name] = true
 	}
+	entries := make([]app.ResolverEntry, 0, len(benchAcquisitionSources))
+	built := make(map[string]bool, len(benchAcquisitionSources))
+	for _, name := range config.SourcesInRole(config.RoleAcquisitionResolver) {
+		if !wired[name] {
+			continue
+		}
+		var adapter resolver.Resolver
+		switch name {
+		case config.SourceArXiv:
+			adapter = arxiv.NewWithOptions(arxiv.Options{Client: client, BaseURL: rig.baseURL(name)})
+		case config.SourceEuropePMC:
+			adapter = europepmc.NewWithOptions(europepmc.Options{Client: client, BaseURL: rig.baseURL(name)})
+		case config.SourceUnpaywall:
+			adapter = unpaywall.NewWithOptions(unpaywall.Options{Client: client, ContactEmail: cfg.Email, BaseURL: rig.baseURL(name)})
+		case config.SourceSemanticScholar:
+			adapter = semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, BaseURL: rig.baseURL(name)})
+		case config.SourceOpenAIRE:
+			adapter = openaire.NewWithOptions(openaire.Options{Client: client, BaseURL: rig.baseURL(name)})
+		default:
+			return nil, fmt.Errorf("bench: acquisition source %q is wired for bench but has no fixture-backed adapter", name)
+		}
+		entries = append(entries, app.ResolverEntry{Adapter: adapter, Policy: cfg.SourcePolicy(name)})
+		built[name] = true
+	}
+	for _, name := range benchAcquisitionSources {
+		if !built[name] {
+			return nil, fmt.Errorf("bench: %q is not an acquisition resolver in config's source catalog", name)
+		}
+	}
+	return entries, nil
 }
 
 // buildEnricher wires the crossref_metadata-backed enricher exactly when
@@ -191,7 +234,13 @@ func newOverlayService(ctx context.Context, current bool, rig *sourceRig) (*over
 	cfg := overlayConfig(dir, current)
 	jobs := &job.Store{S: db}
 	svc := app.New(cfg, jobs, artifacts, nil)
-	svc.Resolvers = resolverEntries(cfg, rig)
+	entries, err := resolverEntries(cfg, rig)
+	if err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, nil, err
+	}
+	svc.Resolvers = entries
 	svc.Enricher = buildEnricher(cfg, rig)
 	svc.Fetch = fixtureFetch()
 	svc.Validate = fixtureValidate()

@@ -86,51 +86,68 @@ func (f *lookupFunc) LookupWork(_ context.Context, doi string) (discovery.Discov
 
 func TestRetryPlanKindChargesCalledPasses(t *testing.T) {
 	t1 := time.Date(2026, 8, 15, 1, 0, 0, 0, time.UTC)
-	if got := (retryPlan{SourcesCalled: 1, ClosedSourceGates: 1, Gate: t1}).Kind(); got != retryKindTemporary {
-		t.Fatalf("mixed pass Kind() = %q, want %q so the retry budget bounds it", got, retryKindTemporary)
+	var mixed retryPlan
+	mixed.observeSourceCalled()
+	mixed.observeBudgetRefusal(&budget.ErrDeferred{Until: t1})
+	if got := mixed.kind(); got != retryKindTemporary {
+		t.Fatalf("mixed pass kind = %q, want %q so the retry budget bounds it", got, retryKindTemporary)
 	}
-	if got := (retryPlan{ClosedSourceGates: 1, Gate: t1}).Kind(); got != retryKindSourceGate {
-		t.Fatalf("pure gate Kind() = %q, want %q", got, retryKindSourceGate)
+	var gateOnly retryPlan
+	gateOnly.observeBudgetRefusal(&budget.ErrDeferred{Until: t1})
+	if got := gateOnly.kind(); got != retryKindSourceGate {
+		t.Fatalf("pure gate kind = %q, want %q", got, retryKindSourceGate)
 	}
-	if got := (retryPlan{AdvisoryBackoffs: 1}).Kind(); got != retryKindAdvisory {
-		t.Fatalf("advisory-only Kind() = %q, want %q", got, retryKindAdvisory)
+	var advisoryOnly retryPlan
+	advisoryOnly.observeBudgetRefusal(&budget.ErrDeferred{Until: t1, Advisory: true})
+	if got := advisoryOnly.kind(); got != retryKindAdvisory {
+		t.Fatalf("advisory-only kind = %q, want %q", got, retryKindAdvisory)
 	}
 }
 
 func TestRetryCutoverDecisionChargesCalledPasses(t *testing.T) {
 	t1 := time.Date(2026, 8, 15, 1, 0, 0, 0, time.UTC)
-	decision := retryCutoverDecision(retryPlan{SourcesCalled: 1, ClosedSourceGates: 1, Gate: t1})
+	var plan retryPlan
+	plan.observeSourceCalled()
+	plan.observeBudgetRefusal(&budget.ErrDeferred{Until: t1})
+	decision := plan.cutoverDecision()
 	if decision.Blocker != job.InstitutionCutoverBlockerTransientRetryRemaining {
 		t.Fatalf("blocker = %q, want transient_retry_remaining: the pass reached a source", decision.Blocker)
 	}
 }
 
-func TestRetryPlanMergeSumsSourcesCalled(t *testing.T) {
-	plan := retryPlan{SourcesCalled: 1}
-	plan.merge(retryPlan{SourcesCalled: 2})
-	if plan.SourcesCalled != 3 {
-		t.Fatalf("SourcesCalled = %d, want 3", plan.SourcesCalled)
+func TestRetryPlanMergeKeepsCalledPassChargeable(t *testing.T) {
+	var plan, other retryPlan
+	plan.observeSourceCalled()
+	other.observeSourceCalled()
+	other.observeSourceCalled()
+	plan.merge(other)
+	if got := plan.kind(); got != retryKindTemporary {
+		t.Fatalf("merged plan kind = %q, want %q", got, retryKindTemporary)
 	}
 }
 
 func TestRetryPlanMergeCarriesLatestGate(t *testing.T) {
 	t1 := time.Date(2026, 8, 15, 1, 0, 0, 0, time.UTC)
 	t2 := t1.Add(24 * time.Hour)
-	plan := retryPlan{Gate: t1, LatestGate: t1}
-	plan.merge(retryPlan{Gate: t2, LatestGate: t2})
-	if !plan.Gate.Equal(t1) {
-		t.Fatalf("Gate = %v, want the earliest %v for scheduling", plan.Gate, t1)
+	var plan, other retryPlan
+	plan.observeBudgetRefusal(&budget.ErrDeferred{Until: t1})
+	other.observeBudgetRefusal(&budget.ErrDeferred{Until: t2})
+	plan.merge(other)
+	if got := plan.at(); !got.Equal(t1) {
+		t.Fatalf("retry wake = %v, want earliest gate %v", got, t1)
 	}
-	if !plan.LatestGate.Equal(t2) {
-		t.Fatalf("LatestGate = %v, want the latest %v for the one post-exhaustion wait", plan.LatestGate, t2)
+	if !plan.gatePending(t1.Add(time.Second)) {
+		t.Fatal("latest gate must remain pending after the earliest gate opens")
 	}
 }
 
 func TestGatePendingUsesTheLatestGate(t *testing.T) {
 	now := time.Date(2026, 8, 15, 1, 0, 0, 0, time.UTC)
-	plan := retryPlan{Gate: now.Add(-1 * time.Second), LatestGate: now.Add(24 * time.Hour)}
-	if !plan.GatePending(now) {
-		t.Fatal("GatePending = false while a day-long gate is still closed")
+	var plan retryPlan
+	plan.observeBudgetRefusal(&budget.ErrDeferred{Until: now.Add(-time.Second)})
+	plan.observeBudgetRefusal(&budget.ErrDeferred{Until: now.Add(24 * time.Hour)})
+	if !plan.gatePending(now) {
+		t.Fatal("gatePending = false while a day-long gate is still closed")
 	}
 }
 
@@ -183,9 +200,9 @@ func TestParkForRetryWaitsOutTheLongestPendingGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := retryPlan{
-		Gate: now.Add(5 * time.Minute), LatestGate: now.Add(24 * time.Hour), ClosedSourceGates: 2,
-	}
+	plan := retryPlan{}
+	plan.observeBudgetRefusal(&budget.ErrDeferred{Until: now.Add(5 * time.Minute)})
+	plan.observeBudgetRefusal(&budget.ErrDeferred{Until: now.Add(24 * time.Hour)})
 	if err := svc.parkForRetry(ctx, row, job.StateResolving, plan,
 		map[string]any{"reason": "resolver_temporarily_unavailable"},
 		job.TerminalReasonTemporarySourceFailuresDidNotClear, ""); err != nil {
@@ -293,18 +310,15 @@ func TestEnrichmentAloneChargesThePass(t *testing.T) {
 			if enricher.calls != 1 {
 				t.Fatalf("enricher calls = %d, want 1", enricher.calls)
 			}
-			if plan.SourcesCalled != test.charged {
-				t.Fatalf("SourcesCalled = %d, want %d", plan.SourcesCalled, test.charged)
-			}
-			if plan.ClosedSourceGates != 1 {
-				t.Fatalf("ClosedSourceGates = %d, want the gated acquisition source recorded", plan.ClosedSourceGates)
+			if !plan.hasClosedSourceGate() {
+				t.Fatal("the gated acquisition source was not recorded")
 			}
 			wantKind := retryKindTemporary
 			if test.charged == 0 {
 				wantKind = retryKindSourceGate
 			}
-			if got := plan.Kind(); got != wantKind {
-				t.Fatalf("Kind() = %q, want %q", got, wantKind)
+			if got := plan.kind(); got != wantKind {
+				t.Fatalf("kind = %q, want %q", got, wantKind)
 			}
 		})
 	}
@@ -337,8 +351,8 @@ func TestEnrichmentSkippedEntirelyChargesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.SourcesCalled != 0 {
-		t.Fatalf("SourcesCalled = %d, want 0", plan.SourcesCalled)
+	if !plan.empty() {
+		t.Fatalf("plan = %+v, want no observation", plan)
 	}
 }
 
@@ -415,11 +429,14 @@ func TestDOIEnrichmentAloneChargesThePass(t *testing.T) {
 			if lookup.calls != test.wantCalls {
 				t.Fatalf("LookupWork calls = %d, want %d", lookup.calls, test.wantCalls)
 			}
-			if plan.SourcesCalled != test.charged {
-				t.Fatalf("SourcesCalled = %d, want %d", plan.SourcesCalled, test.charged)
+			if got := plan.hasClosedSourceGate(); got != (test.gates > 0) {
+				t.Fatalf("hasClosedSourceGate = %t, want %t", got, test.gates > 0)
 			}
-			if plan.ClosedSourceGates != test.gates {
-				t.Fatalf("ClosedSourceGates = %d, want %d", plan.ClosedSourceGates, test.gates)
+			if test.charged > 0 && plan.kind() != retryKindTemporary {
+				t.Fatalf("kind = %q, want a chargeable temporary observation", plan.kind())
+			}
+			if test.charged == 0 && test.gates == 0 && !plan.empty() {
+				t.Fatalf("plan = %+v, want no observation", plan)
 			}
 		})
 	}
@@ -535,12 +552,9 @@ func TestGatedOpenAccessRouteWaitsAfterRetryBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := svc.Now().UTC()
-	plan := retryPlan{
-		Gate:                 now.Add(-time.Minute),
-		LatestGate:           now.Add(-time.Minute),
-		ClosedSourceGates:    1,
-		OpenAccessCandidates: 1,
-	}
+	plan := retryPlan{}
+	plan.observeBudgetRefusal(&budget.ErrDeferred{Until: now.Add(-time.Minute)})
+	plan.observeOpenAccessCandidate()
 	if err := svc.parkForRetry(ctx, row, job.StateResolving, plan,
 		map[string]any{"reason": "acquisition_inputs_temporarily_unavailable"},
 		job.TerminalReasonTemporarySourceFailuresDidNotClear, ""); err != nil {
@@ -683,8 +697,8 @@ func TestOrdinaryGateNeverAnonymous(t *testing.T) {
 	if adapter.calls != 0 {
 		t.Fatalf("adapter calls = %d, want none: the keyed identity is gated and no fallback is authorized", adapter.calls)
 	}
-	if plan.ClosedSourceGates != 1 {
-		t.Fatalf("ClosedSourceGates = %d, want the ordinary gate recorded", plan.ClosedSourceGates)
+	if !plan.hasClosedSourceGate() {
+		t.Fatal("the ordinary gate was not recorded")
 	}
 }
 
@@ -712,8 +726,8 @@ func TestAdvisoryThrottleSkipsAdapter(t *testing.T) {
 	if adapter.calls != 0 {
 		t.Fatalf("adapter calls = %d, want none while the local throttle is spent", adapter.calls)
 	}
-	if plan.AdvisoryBackoffs != 1 || plan.SourcesCalled != 0 {
-		t.Fatalf("plan = %+v, want one advisory backoff and no charged call", plan)
+	if !plan.advisoryOnly() {
+		t.Fatalf("plan = %+v, want advisory-only with no charged call", plan)
 	}
 }
 
@@ -799,8 +813,8 @@ func TestSiblingNoSearchBasisUncharged(t *testing.T) {
 	if sibling.siblings != 1 {
 		t.Fatalf("sibling calls = %d, want one", sibling.siblings)
 	}
-	if plan.SourcesCalled != 0 {
-		t.Fatalf("SourcesCalled = %d, want 0: the hop made no request", plan.SourcesCalled)
+	if !plan.empty() {
+		t.Fatalf("plan = %+v, want no charged observation: the hop made no request", plan)
 	}
 	var outcome, detail string
 	if err := jobs.S.DB().QueryRowContext(ctx,
@@ -897,14 +911,14 @@ func TestFuzzySiblingSearchWaitsForTheBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, plan := svc.resolveSiblings(ctx, row, false); plan.SourcesCalled != 0 {
-		t.Fatalf("SourcesCalled = %d, want 0 away from the boundary", plan.SourcesCalled)
+	if _, plan := svc.resolveSiblings(ctx, row, false); !plan.empty() {
+		t.Fatalf("plan = %+v, want no observation away from the boundary", plan)
 	}
 	if sibling.siblings != 0 {
 		t.Fatalf("sibling calls = %d, want none while an ordinary retry remains", sibling.siblings)
 	}
-	if _, plan := svc.resolveSiblings(ctx, row, true); plan.SourcesCalled != 1 {
-		t.Fatalf("SourcesCalled = %d, want 1 at the boundary", plan.SourcesCalled)
+	if _, plan := svc.resolveSiblings(ctx, row, true); plan.kind() != retryKindTemporary {
+		t.Fatalf("plan kind = %q, want chargeable temporary at the boundary", plan.kind())
 	}
 	if sibling.siblings != 1 {
 		t.Fatalf("sibling calls = %d, want exactly one at the boundary", sibling.siblings)
@@ -928,8 +942,8 @@ func TestFuzzySiblingSearchRunsOncePerBasis(t *testing.T) {
 		t.Fatal(err)
 	}
 	for pass := range 3 {
-		if _, plan := svc.resolveSiblings(ctx, row, true); pass > 0 && plan.SourcesCalled != 0 {
-			t.Fatalf("pass %d charged %d sources, want 0 for a basis already searched", pass, plan.SourcesCalled)
+		if _, plan := svc.resolveSiblings(ctx, row, true); pass > 0 && !plan.empty() {
+			t.Fatalf("pass %d plan = %+v, want no observation for a basis already searched", pass, plan)
 		}
 	}
 	if sibling.siblings != 1 {
@@ -938,8 +952,8 @@ func TestFuzzySiblingSearchRunsOncePerBasis(t *testing.T) {
 
 	enriched := *row
 	enriched.Work.Title = "a materially different title"
-	if _, plan := svc.resolveSiblings(ctx, &enriched, true); plan.SourcesCalled != 1 {
-		t.Fatalf("SourcesCalled = %d, want 1: a new basis is a new question", plan.SourcesCalled)
+	if _, plan := svc.resolveSiblings(ctx, &enriched, true); plan.kind() != retryKindTemporary {
+		t.Fatalf("plan kind = %q, want a chargeable observation for a new basis", plan.kind())
 	}
 	if sibling.siblings != 2 {
 		t.Fatalf("sibling calls = %d, want a second search after the basis changed", sibling.siblings)
@@ -1034,8 +1048,8 @@ func TestUnreadableSiblingMarkerFailsClosed(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, plan := svc.resolveSiblings(ctx, row, true); plan.SourcesCalled != 0 {
-		t.Fatalf("SourcesCalled = %d, want 0: an illegible marker must not buy another search", plan.SourcesCalled)
+	if _, plan := svc.resolveSiblings(ctx, row, true); !plan.empty() {
+		t.Fatalf("plan = %+v, want no observation: an illegible marker must not buy another search", plan)
 	}
 	if sibling.siblings != 0 {
 		t.Fatalf("sibling calls = %d, want none against an unreadable marker", sibling.siblings)

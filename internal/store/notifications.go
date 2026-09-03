@@ -32,6 +32,12 @@ type NotificationRecord struct {
 	DesktopState                                              string
 	WebhookState                                              string
 	DesktopReservedAt, DesktopAttemptedAt, WebhookAttemptedAt time.Time
+	// DesktopSentCount and DesktopSentPayloadJSON record what the desktop leg
+	// actually delivered, captured when it left the reserved state. They are
+	// zero for a leg that never sent anything, so a reader falls back to the
+	// live count and payload.
+	DesktopSentCount       int
+	DesktopSentPayloadJSON string
 }
 
 // NotificationLedger owns the durable notification outbox and its desktop
@@ -58,9 +64,23 @@ func parseNotificationTime(rowID int64, column string, text sql.NullString) (tim
 	return t, nil
 }
 
+// notificationColumns is the shared read projection. Every reader scans it in
+// this order through scanNotificationRow.
+const notificationColumns = `id,category,event_kind,aggregate_key,phase,window_start,
+	job_id,batch_id,scan_id,payload_json,first_at,last_at,available_at,count,desktop_state,
+	webhook_state,desktop_reserved_at,desktop_attempted_at,webhook_attempted_at,
+	desktop_sent_count,desktop_sent_payload_json`
+
+// notificationCoalescable gates every ON CONFLICT merge. One row carries one
+// shared count and payload for both legs, so it stays mutable while either leg
+// can still deliver it: the desktop leg is nonterminal, or the webhook leg has
+// not been sent yet. A desktop leg that already delivered keeps its own
+// snapshot of what it sent, so later merging cannot rewrite that audit.
+const notificationCoalescable = `(notification_intents.desktop_state IN ('pending','held') OR notification_intents.webhook_state='pending')`
+
 // Upsert merges an intent by its five-part desktop identity. Coalesced rows
-// remain mutable only while their desktop leg is nonterminal; an attempted
-// or otherwise terminal leg is an immutable audit record.
+// remain mutable only while a leg can still deliver them; a row both legs have
+// finished with is an immutable audit record.
 func (l *NotificationLedger) Upsert(ctx context.Context, rec NotificationRecord) (NotificationRecord, error) {
 	if l == nil || l.s == nil || l.s.db == nil {
 		return NotificationRecord{}, fmt.Errorf("notification ledger is unavailable")
@@ -93,15 +113,15 @@ func (l *NotificationLedger) Upsert(ctx context.Context, rec NotificationRecord)
 		 payload_json,first_at,last_at,count,available_at,desktop_state,webhook_state)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(category,event_kind,aggregate_key,phase,window_start) DO UPDATE SET
-			last_at=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN excluded.last_at ELSE notification_intents.last_at END,
-			count=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN notification_intents.count+excluded.count ELSE notification_intents.count END,
-			payload_json=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN
+			last_at=CASE WHEN `+notificationCoalescable+` THEN excluded.last_at ELSE notification_intents.last_at END,
+			count=CASE WHEN `+notificationCoalescable+` THEN notification_intents.count+excluded.count ELSE notification_intents.count END,
+			payload_json=CASE WHEN `+notificationCoalescable+` THEN
 				CASE WHEN json_type(json_extract(excluded.payload_json,'$.count')) IN ('integer','real')
 					THEN json_set(json_patch(notification_intents.payload_json, excluded.payload_json),'$.count',
 						notification_intents.count+excluded.count)
 					ELSE json_patch(notification_intents.payload_json, excluded.payload_json) END
 				ELSE notification_intents.payload_json END,
-			available_at=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN excluded.available_at ELSE notification_intents.available_at END`,
+			available_at=CASE WHEN `+notificationCoalescable+` THEN excluded.available_at ELSE notification_intents.available_at END`,
 		rec.Category, rec.EventKind, rec.AggregateKey, rec.Phase, formatNotificationTime(rec.WindowStart),
 		nullIfEmpty(rec.JobID), nullIfEmpty(rec.BatchID), nullIfEmpty(rec.ScanID), rec.PayloadJSON,
 		formatNotificationTime(rec.FirstAt), formatNotificationTime(rec.LastAt), maxInt(rec.Count, 1),
@@ -140,56 +160,10 @@ func defaultWebhookState(value string) string {
 }
 
 func (l *NotificationLedger) getByIdentity(ctx context.Context, category, eventKind, aggregate, phase string, window time.Time) (NotificationRecord, error) {
-	row := l.s.db.QueryRowContext(ctx, `SELECT id,category,event_kind,aggregate_key,phase,window_start,
-		job_id,batch_id,scan_id,payload_json,first_at,last_at,available_at,count,desktop_state,
-		webhook_state,desktop_reserved_at,desktop_attempted_at,webhook_attempted_at
+	row := l.s.db.QueryRowContext(ctx, `SELECT `+notificationColumns+`
 		FROM notification_intents WHERE category=? AND event_kind=? AND aggregate_key=? AND phase=? AND window_start=?`,
 		category, eventKind, aggregate, phase, formatNotificationTime(window))
-	return scanNotification(row)
-}
-
-func scanNotification(row *sql.Row) (NotificationRecord, error) {
-	var r NotificationRecord
-	var window, first, last, available sql.NullString
-	var jobID, batchID, scanID sql.NullString
-	var reserved, attempted, webhook sql.NullString
-	err := row.Scan(&r.ID, &r.Category, &r.EventKind, &r.AggregateKey, &r.Phase, &window,
-		&jobID, &batchID, &scanID, &r.PayloadJSON, &first, &last, &available, &r.Count,
-		&r.DesktopState, &r.WebhookState, &reserved, &attempted, &webhook)
-	if err != nil {
-		return NotificationRecord{}, err
-	}
-	if r.WindowStart, err = parseNotificationTime(r.ID, "window_start", window); err != nil {
-		return NotificationRecord{}, err
-	}
-	if r.FirstAt, err = parseNotificationTime(r.ID, "first_at", first); err != nil {
-		return NotificationRecord{}, err
-	}
-	if r.LastAt, err = parseNotificationTime(r.ID, "last_at", last); err != nil {
-		return NotificationRecord{}, err
-	}
-	if r.AvailableAt, err = parseNotificationTime(r.ID, "available_at", available); err != nil {
-		return NotificationRecord{}, err
-	}
-	if r.DesktopReservedAt, err = parseNotificationTime(r.ID, "desktop_reserved_at", reserved); err != nil {
-		return NotificationRecord{}, err
-	}
-	if r.DesktopAttemptedAt, err = parseNotificationTime(r.ID, "desktop_attempted_at", attempted); err != nil {
-		return NotificationRecord{}, err
-	}
-	if r.WebhookAttemptedAt, err = parseNotificationTime(r.ID, "webhook_attempted_at", webhook); err != nil {
-		return NotificationRecord{}, err
-	}
-	if jobID.Valid {
-		r.JobID = jobID.String
-	}
-	if batchID.Valid {
-		r.BatchID = batchID.String
-	}
-	if scanID.Valid {
-		r.ScanID = scanID.String
-	}
-	return r, nil
+	return scanNotificationRow(row)
 }
 
 type notificationScanner interface{ Scan(...any) error }
@@ -199,9 +173,11 @@ func scanNotificationRow(row notificationScanner) (NotificationRecord, error) {
 	var window, first, last, available sql.NullString
 	var jobID, batchID, scanID sql.NullString
 	var reserved, attempted, webhook sql.NullString
+	var sentCount sql.NullInt64
+	var sentPayload sql.NullString
 	err := row.Scan(&r.ID, &r.Category, &r.EventKind, &r.AggregateKey, &r.Phase, &window,
 		&jobID, &batchID, &scanID, &r.PayloadJSON, &first, &last, &available, &r.Count,
-		&r.DesktopState, &r.WebhookState, &reserved, &attempted, &webhook)
+		&r.DesktopState, &r.WebhookState, &reserved, &attempted, &webhook, &sentCount, &sentPayload)
 	if err != nil {
 		return NotificationRecord{}, err
 	}
@@ -236,6 +212,12 @@ func scanNotificationRow(row notificationScanner) (NotificationRecord, error) {
 	if scanID.Valid {
 		r.ScanID = scanID.String
 	}
+	if sentCount.Valid {
+		r.DesktopSentCount = int(sentCount.Int64)
+	}
+	if sentPayload.Valid {
+		r.DesktopSentPayloadJSON = sentPayload.String
+	}
 	return r, nil
 }
 
@@ -244,9 +226,7 @@ func (l *NotificationLedger) DueDesktop(ctx context.Context, now time.Time, limi
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := l.s.db.QueryContext(ctx, `SELECT id,category,event_kind,aggregate_key,phase,window_start,
-		job_id,batch_id,scan_id,payload_json,first_at,last_at,available_at,count,desktop_state,
-		webhook_state,desktop_reserved_at,desktop_attempted_at,webhook_attempted_at
+	rows, err := l.s.db.QueryContext(ctx, `SELECT `+notificationColumns+`
 		FROM notification_intents WHERE desktop_state IN ('pending','held') AND available_at <= ?
 		ORDER BY available_at,id LIMIT ?`, formatNotificationTime(now), limit)
 	if err != nil {
@@ -311,24 +291,42 @@ func (l *NotificationLedger) ReserveDesktop(ctx context.Context, id int64, now t
 	return true, nil
 }
 
-func (l *NotificationLedger) SetDesktopState(ctx context.Context, id int64, state string, now time.Time) error {
+// SetDesktopState moves the desktop leg with a compare-and-swap from the state
+// the caller observed, and reports whether the swap applied. A lost swap means
+// a concurrent terminal transition — a supersession, typically — already
+// claimed the row; the caller must abandon its stale copy rather than
+// resurrect it.
+//
+// The reserved -> attempted transition also snapshots the count and payload
+// the desktop leg delivered. A leg that never delivered leaves the snapshot
+// NULL, because it has nothing to preserve.
+func (l *NotificationLedger) SetDesktopState(ctx context.Context, id int64, state string, now time.Time) (bool, error) {
 	var query string
+	var args []any
 	switch state {
 	case "attempted":
-		query = `UPDATE notification_intents SET desktop_state=?, desktop_attempted_at=? WHERE id=? AND desktop_state='reserved'`
-	case "reserved":
-		query = `UPDATE notification_intents SET desktop_state=?, desktop_reserved_at=? WHERE id=?`
-	default:
-		query = `UPDATE notification_intents SET desktop_state=? WHERE id=?`
-	}
-	var args []any
-	if state == "attempted" || state == "reserved" {
+		query = `UPDATE notification_intents SET desktop_state=?, desktop_attempted_at=?,
+			desktop_sent_count=notification_intents.count,
+			desktop_sent_payload_json=notification_intents.payload_json
+			WHERE id=? AND desktop_state='reserved'`
 		args = []any{state, formatNotificationTime(now), id}
-	} else {
+	case "reserved":
+		query = `UPDATE notification_intents SET desktop_state=?, desktop_reserved_at=?
+			WHERE id=? AND desktop_state IN ('pending','held')`
+		args = []any{state, formatNotificationTime(now), id}
+	default:
+		query = `UPDATE notification_intents SET desktop_state=? WHERE id=? AND desktop_state IN ('pending','held')`
 		args = []any{state, id}
 	}
-	_, err := l.s.db.ExecContext(ctx, query, args...)
-	return err
+	result, err := l.s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
 }
 
 func (l *NotificationLedger) SetWebhookState(ctx context.Context, id int64, state string, now time.Time) error {
@@ -400,10 +398,10 @@ func (l *NotificationLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, a
 		 payload_json,first_at,last_at,count,available_at,desktop_state,webhook_state)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(category,event_kind,aggregate_key,phase,window_start) DO UPDATE SET
-			last_at=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN excluded.last_at ELSE notification_intents.last_at END,
-			count=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN notification_intents.count+excluded.count ELSE notification_intents.count END,
-			payload_json=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN excluded.payload_json ELSE notification_intents.payload_json END,
-			available_at=CASE WHEN notification_intents.desktop_state IN ('pending','held') THEN excluded.available_at ELSE notification_intents.available_at END`,
+			last_at=CASE WHEN `+notificationCoalescable+` THEN excluded.last_at ELSE notification_intents.last_at END,
+			count=CASE WHEN `+notificationCoalescable+` THEN notification_intents.count+excluded.count ELSE notification_intents.count END,
+			payload_json=CASE WHEN `+notificationCoalescable+` THEN excluded.payload_json ELSE notification_intents.payload_json END,
+			available_at=CASE WHEN `+notificationCoalescable+` THEN excluded.available_at ELSE notification_intents.available_at END`,
 		rec.Category, rec.EventKind, rec.AggregateKey, rec.Phase, formatNotificationTime(rec.WindowStart),
 		nullIfEmpty(rec.JobID), nullIfEmpty(rec.BatchID), nullIfEmpty(rec.ScanID), rec.PayloadJSON,
 		formatNotificationTime(rec.FirstAt), formatNotificationTime(rec.LastAt), maxInt(rec.Count, 1),
@@ -422,9 +420,7 @@ func (l *NotificationLedger) DueWebhook(ctx context.Context, now time.Time, limi
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := l.s.db.QueryContext(ctx, `SELECT id,category,event_kind,aggregate_key,phase,window_start,
-		job_id,batch_id,scan_id,payload_json,first_at,last_at,available_at,count,desktop_state,
-		webhook_state,desktop_reserved_at,desktop_attempted_at,webhook_attempted_at
+	rows, err := l.s.db.QueryContext(ctx, `SELECT `+notificationColumns+`
 		FROM notification_intents WHERE webhook_state='pending' AND available_at <= ?
 		ORDER BY available_at,id LIMIT ?`, formatNotificationTime(now), limit)
 	if err != nil {
@@ -443,12 +439,10 @@ func (l *NotificationLedger) DueWebhook(ctx context.Context, now time.Time, limi
 }
 
 func (l *NotificationLedger) LatestCheckpoint(ctx context.Context, aggregateKey string) (NotificationRecord, bool, error) {
-	row := l.s.db.QueryRowContext(ctx, `SELECT id,category,event_kind,aggregate_key,phase,window_start,
-		job_id,batch_id,scan_id,payload_json,first_at,last_at,available_at,count,desktop_state,
-		webhook_state,desktop_reserved_at,desktop_attempted_at,webhook_attempted_at
+	row := l.s.db.QueryRowContext(ctx, `SELECT `+notificationColumns+`
 		FROM notification_intents WHERE aggregate_key=? AND category='completion_batch' AND phase='checkpoint'
 		ORDER BY id DESC LIMIT 1`, aggregateKey)
-	r, err := scanNotification(row)
+	r, err := scanNotificationRow(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NotificationRecord{}, false, nil
 	}

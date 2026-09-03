@@ -179,7 +179,8 @@ type CreateRequest struct {
 
 // Create inserts a new delivery_requests row, keyed by IdempotencyKey. If a
 // row already occupies that key, Create returns the existing row and
-// ErrDuplicateRequest — never a second row.
+// ErrDuplicateRequest — never a second row. In either case it pins the
+// calling job to the resolved request.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (*Request, error) {
 	state := req.State
 	if state == "" {
@@ -190,7 +191,12 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Request, erro
 	}
 	key := IdempotencyKey(req.InstitutionProfile, req.WorkIdentity, req.Provider, req.RequestClass)
 	now := store.Now()
-	res, err := s.store.DB().ExecContext(ctx, `
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO delivery_requests
 			(job_id, institution_profile, provider, request_class, work_identity, idempotency_key,
 			 state, provider_reference, gate_profile_digest, created_at, updated_at)
@@ -204,21 +210,32 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Request, erro
 	if err != nil {
 		return nil, err
 	}
+	var request *Request
 	if affected == 0 {
-		existing, err := s.Lookup(ctx, key)
+		request, err = scanRequest(tx.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM delivery_requests WHERE idempotency_key = ?`, key))
+		if err != nil {
+			return nil, fmt.Errorf("delivery: idempotency key %s reported a conflict but no row was found: %w", key, err)
+		}
+	} else {
+		id, err := res.LastInsertId()
 		if err != nil {
 			return nil, err
 		}
-		if existing == nil {
-			return nil, fmt.Errorf("delivery: idempotency key %s reported a conflict but no row was found", key)
+		request, err = scanRequest(tx.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM delivery_requests WHERE id = ?`, id))
+		if err != nil {
+			return nil, err
 		}
-		return existing, ErrDuplicateRequest
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
+	if err := s.bindJobToRequestTx(ctx, tx, req.JobID, request.ID); err != nil {
 		return nil, err
 	}
-	return s.Get(ctx, id)
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return request, ErrDuplicateRequest
+	}
+	return request, nil
 }
 
 // scanner is satisfied by both *sql.Row and *sql.Rows, letting Lookup, Get,
@@ -230,6 +247,14 @@ type scanner interface {
 var requestColumns = `id, job_id, institution_profile, provider, request_class, work_identity, idempotency_key,
 	state, provider_reference, gate_profile_digest, submitted_at, last_checked_at, next_check_at, created_at, updated_at,
 	provider_status_raw, provider_display_status, last_poll_at, last_successful_poll_at, consecutive_poll_failures, last_poll_error_class`
+
+var joinedRequestColumns = `delivery_requests.id, delivery_requests.job_id, delivery_requests.institution_profile,
+	delivery_requests.provider, delivery_requests.request_class, delivery_requests.work_identity, delivery_requests.idempotency_key,
+	delivery_requests.state, delivery_requests.provider_reference, delivery_requests.gate_profile_digest,
+	delivery_requests.submitted_at, delivery_requests.last_checked_at, delivery_requests.next_check_at,
+	delivery_requests.created_at, delivery_requests.updated_at, delivery_requests.provider_status_raw,
+	delivery_requests.provider_display_status, delivery_requests.last_poll_at, delivery_requests.last_successful_poll_at,
+	delivery_requests.consecutive_poll_failures, delivery_requests.last_poll_error_class`
 
 func scanRequest(row scanner) (*Request, error) {
 	var r Request
@@ -283,16 +308,15 @@ func (s *Service) Get(ctx context.Context, id int64) (*Request, error) {
 	return r, nil
 }
 
-// GetByJobID returns the delivery_requests row for a job, or (nil, nil) when
-// the job was never routed through document delivery. A job's idempotency
-// key is scoped to institution+work+provider+request_class (Decision 1), not
-// to the job itself, so in principle more than one row could reference the
-// same job_id across resubmission policy changes; ORDER BY id DESC picks the
-// most recently created one, which is always the row a caller asking "what
-// is this job's delivery state" means.
+// GetByJobID resolves the request pinned by jobs.delivery_request_id. It does
+// not search delivery_requests.job_id: that historical containment lookup
+// would reintroduce mutable-identity fallback semantics.
 func (s *Service) GetByJobID(ctx context.Context, jobID string) (*Request, error) {
-	row := s.store.DB().QueryRowContext(ctx,
-		`SELECT `+requestColumns+` FROM delivery_requests WHERE job_id = ? ORDER BY id DESC LIMIT 1`, jobID)
+	row := s.store.DB().QueryRowContext(ctx, `
+		SELECT `+joinedRequestColumns+`
+		FROM jobs
+		JOIN delivery_requests ON delivery_requests.id = jobs.delivery_request_id
+		WHERE jobs.id = ?`, jobID)
 	r, err := scanRequest(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -301,6 +325,36 @@ func (s *Service) GetByJobID(ctx context.Context, jobID string) (*Request, error
 		return nil, err
 	}
 	return r, nil
+}
+
+// BindJobToRequest pins a job to a resolved delivery request. It changes no
+// job state and exists so the app route can retain global-key deduplication
+// for a newly routed job.
+func (s *Service) BindJobToRequest(ctx context.Context, jobID string, requestID int64) error {
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.bindJobToRequestTx(ctx, tx, jobID, requestID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Service) bindJobToRequestTx(ctx context.Context, tx *sql.Tx, jobID string, requestID int64) error {
+	res, err := tx.ExecContext(ctx, `UPDATE jobs SET delivery_request_id = ? WHERE id = ?`, requestID, jobID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("delivery: job %q not found while pinning request %d", jobID, requestID)
+	}
+	return nil
 }
 
 // ListRecoverable returns the first page of durably-offered rows that have
@@ -530,20 +584,13 @@ func (s *Service) RecordSubmission(ctx context.Context, id int64, providerRefere
 // ReassignOfferedRequest atomically transfers ownership of an offered delivery
 // request from its original job to the submitting job. It succeeds only when
 // the row is still offered with an empty provider reference and still owned
-// by oldJobID. Design choice: ownership transfer (this method) is preferred
-// over changing RecordSubmission's CAS to check the submitting job's state,
-// because leaving delivery_requests.job_id pointing at a cancelled job would
-// keep GetByJobID and future Branch lookups stale and violate the FK's
-// intent that job_id names the driving job. Transfer keeps the row truthful
-// and lets RecordSubmission's existing guard (which checks the row's owner
-// job state) work unchanged.
+// by oldJobID. The old job releases its pointer and the new job pins this row
+// in the same transaction.
 func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID, oldJobID string) (bool, error) {
 	if newJobID == "" || oldJobID == "" {
 		return false, errors.New("delivery: job ids required for reassignment")
 	}
 	if newJobID == oldJobID {
-		// Verify the row is still offered and actually owned by this job,
-		// otherwise report "no transfer" instead of a hollow success.
 		row, err := s.Get(ctx, id)
 		if err != nil {
 			return false, err
@@ -551,10 +598,15 @@ func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID
 		if row == nil || row.State != StateOffered || row.ProviderReference != "" || row.JobID != oldJobID {
 			return false, nil
 		}
-		return true, nil
+		return true, s.BindJobToRequest(ctx, newJobID, id)
 	}
+	tx, err := s.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	res, err := s.store.DB().ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET job_id = ?, updated_at = ?
 		WHERE id = ? AND state = ? AND provider_reference = '' AND job_id = ?`,
@@ -566,7 +618,19 @@ func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID
 	if err != nil {
 		return false, err
 	}
-	return n == 1, nil
+	if n == 0 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET delivery_request_id = NULL WHERE id = ? AND delivery_request_id = ?`, oldJobID, id); err != nil {
+		return false, err
+	}
+	if err := s.bindJobToRequestTx(ctx, tx, newJobID, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Resume clears a live (submitted/pending) request's poll-failure
@@ -644,31 +708,14 @@ func (s *Service) Branch(ctx context.Context, key string) (BranchDecision, *Requ
 	return branchForRow(row), row, nil
 }
 
-// BranchForJob resolves Decision 3B's branch for a job whose key was just
-// recomputed, falling back to the row the job owns when the key names none.
-//
-// The key digests the job's CURRENT work identity (Decision 1), and that
-// identity is mutable: promotion can fill a missing DOI mid-flight, after
-// which Describe() prefers the DOI and the key changes. A key-only Branch
-// then finds nothing and reports evaluate_gate, so the gate can open and
-// send a SECOND provider request while this job's earlier row — perhaps a
-// live one whose outcome is unknown — still sits under the old key. The
-// UNIQUE constraint on idempotency_key cannot catch it, because the two keys
-// differ. One paper reaching a real library as two interlibrary-loan
-// requests is precisely what Decision 1 exists to prevent, so a job that
-// already owns a row is routed by that row.
-//
-// Falling back is strictly more conservative than recomputing: every branch
-// it can reach is one the unchanged key would have reached anyway.
-func (s *Service) BranchForJob(ctx context.Context, jobID, key string) (BranchDecision, *Request, error) {
-	row, err := s.Lookup(ctx, key)
+// BranchForJob resolves the branch from the request pinned on the job. It
+// never accepts a recomputed key and never falls back through
+// delivery_requests.job_id. That makes resolver promotion unable to change
+// which request governs an already-routed job.
+func (s *Service) BranchForJob(ctx context.Context, jobID string) (BranchDecision, *Request, error) {
+	row, err := s.GetByJobID(ctx, jobID)
 	if err != nil {
 		return "", nil, err
-	}
-	if row == nil {
-		if row, err = s.GetByJobID(ctx, jobID); err != nil {
-			return "", nil, err
-		}
 	}
 	if row == nil {
 		return BranchEvaluateGate, nil, nil

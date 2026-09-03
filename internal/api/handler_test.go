@@ -153,6 +153,111 @@ func TestTriageSnapshotCountsAndDismiss(t *testing.T) {
 	}
 }
 
+// TestTriageDecideTransportSeamsShareOneMutation proves that the API and
+// browser adapters leave the same durable state for one normalized decision.
+func TestTriageDecideTransportSeamsShareOneMutation(t *testing.T) {
+	seed := func(t *testing.T, system *bootstrap.System) (string, []int64) {
+		t.Helper()
+		ctx := context.Background()
+		ids := make([]int64, 0, 2)
+		for i := range 2 {
+			watched, err := system.Watches.Create(ctx, watch.CreateInput{
+				Query: fmt.Sprintf("shared mutation %d", i), Filters: watch.Filters{YearFrom: 2020},
+				Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := system.Watches.RecordDigest(ctx, watched.ID, time.Now(), []watch.DigestEntry{{
+				WorkKey: "10.1000/shared-transport-mutation", DOI: "10.1000/shared-transport-mutation", Title: "Shared mutation",
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, watched.ID)
+		}
+		snapshot, err := system.Triage.Snapshot(ctx, triage.SnapshotRequest{Limit: 10})
+		if err != nil || len(snapshot.Items) != 1 {
+			t.Fatalf("snapshot = %+v, %v, want one grouped hit", snapshot, err)
+		}
+		return snapshot.Items[0].ID, ids
+	}
+	surviving := func(t *testing.T, system *bootstrap.System, ids []int64) []int64 {
+		t.Helper()
+		alive := make([]int64, 0, len(ids))
+		for _, id := range ids {
+			entries, err := system.Watches.Digest(context.Background(), id, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				alive = append(alive, id)
+			}
+		}
+		return alive
+	}
+
+	apiSystem := testSystem(t)
+	apiItemID, apiWatchIDs := seed(t, apiSystem)
+	var apiResult triageDecideResult
+	if rpcErr := callMethod(t, Router(apiSystem), "triage.decide", map[string]any{
+		"item_id": apiItemID, "op": "dismiss", "watch_scope": []int64{apiWatchIDs[1]},
+	}, &apiResult); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if apiResult.Outcome != "applied" {
+		t.Fatalf("API result = %+v, want applied", apiResult)
+	}
+
+	browserSystem := testSystem(t)
+	browserItemID, browserWatchIDs := seed(t, browserSystem)
+	ctx := context.Background()
+	const sessionID = "sess-shared-000000000000000000000000"
+	if _, err := browserSystem.Browser.Sync(ctx, sessionID, false, []json.RawMessage{
+		json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"shared-hello-1","seq":0,"payload":{"extension_version":"1.2.3"}}`),
+	}); err != nil {
+		t.Fatalf("browser hello: %v", err)
+	}
+	frame, err := json.Marshal(map[string]any{
+		"protocol": protocol.BrowserProtocolVersion, "type": protocol.MsgTriageDecide,
+		"msg_id": "shared-decide-1", "seq": 1,
+		"payload": protocol.TriageDecidePayload{
+			RequestID: "shared-decision-001", ItemID: browserItemID, Op: "dismiss",
+			WatchScope: json.RawMessage(fmt.Sprintf("[%d]", browserWatchIDs[1])),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := browserSystem.Browser.Sync(ctx, sessionID, false, []json.RawMessage{frame})
+	if err != nil {
+		t.Fatalf("browser decision: %v", err)
+	}
+	var browserResult *protocol.TriageDecideResultPayload
+	for _, raw := range frames {
+		message, err := protocol.DecodeBrowserMessage(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if message.Type == protocol.MsgTriageDecideResult {
+			browserResult = message.Payload.(*protocol.TriageDecideResultPayload)
+		}
+	}
+	if browserResult == nil || browserResult.Outcome != "applied" {
+		t.Fatalf("browser result = %+v, want applied", browserResult)
+	}
+	apiState := surviving(t, apiSystem, apiWatchIDs)
+	browserState := surviving(t, browserSystem, browserWatchIDs)
+	if want := []int64{apiWatchIDs[0]}; !slices.Equal(apiState, want) {
+		t.Fatalf("API durable state = %v, want %v", apiState, want)
+	}
+	if want := []int64{browserWatchIDs[0]}; !slices.Equal(browserState, want) {
+		t.Fatalf("browser durable state = %v, want %v", browserState, want)
+	}
+	if len(apiState) != len(browserState) {
+		t.Fatalf("transport durable state lengths differ: API %v, browser %v", apiState, browserState)
+	}
+}
+
 // stats.get is the CLI's and MCP's only route to the acquisition value read
 // model the extension already reads over stats_request, so it must decode into
 // the same snake_case shape the rest of the JSON surface uses.

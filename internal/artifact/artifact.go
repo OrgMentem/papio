@@ -90,32 +90,33 @@ func (s *Store) ArtifactPath(sha string) (string, error) {
 // Promote moves a validated quarantine file into the immutable store,
 // verifying its hash on the way. Idempotent: if the artifact already exists
 // with matching content, the temp file is discarded and the existing path is
-// returned. The temp file must live on the same filesystem (it does; both are
-// under dataDir), allowing link to atomically claim the destination. On
-// filesystems without hard-link support, Promote checks that the destination is
-// absent before renaming instead; that fallback is weaker against cross-process
-// publication races.
-func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
+// returned with created false. The call that atomically makes the artifact
+// visible returns created true. The temp file must live on the same filesystem
+// (it does; both are under dataDir), allowing link to atomically claim the
+// destination. On filesystems without hard-link support, Promote checks that
+// the destination is absent before renaming instead; that fallback is weaker
+// against cross-process publication races.
+func (s *Store) Promote(tempPath, expectedSHA string) (path string, created bool, err error) {
 	dest, err := s.ArtifactPath(expectedSHA)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	sha, size, err := HashFile(tempPath)
 	if err != nil {
-		return "", fmt.Errorf("hashing quarantine file: %w", err)
+		return "", false, fmt.Errorf("hashing quarantine file: %w", err)
 	}
 	if size == 0 {
-		return "", fmt.Errorf("refusing to promote empty file")
+		return "", false, fmt.Errorf("refusing to promote empty file")
 	}
 	if sha != expectedSHA {
-		return "", fmt.Errorf("quarantine file hash %s does not match expected %s", sha, expectedSHA)
+		return "", false, fmt.Errorf("quarantine file hash %s does not match expected %s", sha, expectedSHA)
 	}
 
 	// Apply read-only mode before the artifact becomes visible so no
 	// post-publication chmod is needed. This is the last fallible step
 	// before the atomic publication (link or rename).
 	if err := chmodFile(tempPath, 0o400); err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	renamed := false
@@ -123,28 +124,31 @@ func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 		switch {
 		case errors.Is(err, fs.ErrExist):
 			if err := validateExisting(dest, expectedSHA); err != nil {
-				return "", err
+				return "", false, err
 			}
 		case linkUnsupported(err):
 			if _, statErr := os.Lstat(dest); statErr == nil {
 				if err := validateExisting(dest, expectedSHA); err != nil {
-					return "", err
+					return "", false, err
 				}
 			} else if !os.IsNotExist(statErr) {
-				return "", fmt.Errorf("checking existing artifact: %w", statErr)
+				return "", false, fmt.Errorf("checking existing artifact: %w", statErr)
 			} else if err := os.Rename(tempPath, dest); err != nil {
 				if !errors.Is(err, fs.ErrExist) {
-					return "", fmt.Errorf("promoting artifact without hard links: %w", err)
+					return "", false, fmt.Errorf("promoting artifact without hard links: %w", err)
 				}
 				if err := validateExisting(dest, expectedSHA); err != nil {
-					return "", err
+					return "", false, err
 				}
 			} else {
 				renamed = true
+				created = true
 			}
 		default:
-			return "", fmt.Errorf("promoting artifact: %w", err)
+			return "", false, fmt.Errorf("promoting artifact: %w", err)
 		}
+	} else {
+		created = true
 	}
 	// Publication is complete. Temp cleanup is best-effort: a failure to
 	// remove the (now hard-linked or duplicate) quarantine file must not be
@@ -154,7 +158,7 @@ func (s *Store) Promote(tempPath, expectedSHA string) (string, error) {
 	if !renamed {
 		_ = removeFile(tempPath)
 	}
-	return dest, nil
+	return dest, created, nil
 }
 
 func validateExisting(dest, expectedSHA string) error {

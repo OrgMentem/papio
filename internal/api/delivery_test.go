@@ -662,12 +662,41 @@ func TestDeliveryResumeWireContract(t *testing.T) {
 	if err := system.App.Delivery.UpdateState(ctx, pendingRow.ID, delivery.StatePending); err != nil {
 		t.Fatal(err)
 	}
+	// Seed the same parked bookkeeping the submitted arm uses. Without it the
+	// row starts with zero failures, no error class and an empty next check,
+	// so "resumed=true" is satisfied by an implementation that clears nothing
+	// — and the comment above claims pending resumes exactly like submitted.
+	pendingFuture := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := system.Store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET consecutive_poll_failures = 4, last_poll_error_class = 'contract_drift', next_check_at = ?
+		WHERE id = ?`, pendingFuture, pendingRow.ID); err != nil {
+		t.Fatal(err)
+	}
 	var resumedPending DeliveryResumeResult
 	if rpcErr := callMethod(t, router, "delivery.resume", map[string]any{"request_id": pendingRow.ID}, &resumedPending); rpcErr != nil {
 		t.Fatalf("delivery.resume on a live pending row: %v", rpcErr)
 	}
-	if !resumedPending.Resumed || resumedPending.State != string(delivery.StatePending) || resumedPending.Reason != "" {
+	if !resumedPending.Resumed || resumedPending.RequestID != pendingRow.ID || resumedPending.State != string(delivery.StatePending) || resumedPending.Reason != "" {
 		t.Fatalf("resume of a live pending row = %#v, want resumed=true, state=pending, no reason", resumedPending)
+	}
+	afterPending, err := system.App.Delivery.Get(ctx, pendingRow.ID)
+	if err != nil || afterPending == nil {
+		t.Fatalf("Get after pending resume: row=%#v err=%v", afterPending, err)
+	}
+	if afterPending.ConsecutivePollFailures != 0 || afterPending.LastPollErrorClass != "" {
+		t.Fatalf("after pending resume: consecutive_poll_failures=%d last_poll_error_class=%q, want 0 and cleared",
+			afterPending.ConsecutivePollFailures, afterPending.LastPollErrorClass)
+	}
+	pendingDueBy, err := time.Parse(time.RFC3339Nano, afterPending.NextCheckAt)
+	if err != nil {
+		t.Fatalf("next_check_at %q is unparseable: %v", afterPending.NextCheckAt, err)
+	}
+	if pendingDueBy.After(time.Now().UTC()) {
+		t.Fatalf("next_check_at = %s, want a due schedule: a still-future check leaves the pending row parked", afterPending.NextCheckAt)
+	}
+	if afterPending.State != delivery.StatePending {
+		t.Fatalf("resume changed the pending row state to %s; it must only clear poll bookkeeping", afterPending.State)
 	}
 
 	if rpcErr := callMethod(t, router, "delivery.resume", map[string]any{"request_id": live.ID + 1_000_000}, nil); rpcErr == nil || rpcErr.Code != "not_found" {
@@ -832,8 +861,13 @@ func TestDeliveryConfirmRequestAbsentCompensatesWhenSubmitFailsAfterRepair(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	repairSeen, compensated := false, false
-	for _, e := range events {
+	// The ORDER is load-bearing, so record indices rather than booleans. The
+	// repair's own event carries only its reason (RepairAwaitingHumanTx takes
+	// pre-marshalled detail and, unlike the non-Tx variant at job.go:1179,
+	// adds no from/to), so the evidence that the job really passed through
+	// `resolving` is the compensation park's own from-state.
+	repairAt, compensatedAt := -1, -1
+	for i, e := range events {
 		if e["kind"] != "job.transition" {
 			continue
 		}
@@ -842,29 +876,32 @@ func TestDeliveryConfirmRequestAbsentCompensatesWhenSubmitFailsAfterRepair(t *te
 			continue
 		}
 		if detail["reason"] == "document_delivery_confirmed_absent" {
-			repairSeen = true
+			repairAt = i
 			continue
 		}
-		if repairSeen && detail["to"] == job.StateAwaitingHuman && detail["reason"] == "document_delivery_reconciliation" {
-			compensated = true
+		if repairAt >= 0 && detail["to"] == job.StateAwaitingHuman && detail["reason"] == "document_delivery_reconciliation" {
+			if detail["from"] != string(job.StateResolving) {
+				t.Fatalf("the compensation parked from %v, want resolving: the repair must have moved the job into the resolving window that SubmitDelivery runs inside", detail["from"])
+			}
+			compensatedAt = i
+			break
 		}
 	}
-	if !repairSeen {
+	if repairAt < 0 {
 		t.Fatalf("no confirmed-absent repair transition; the failure was injected before the repair, not after it: events = %v", events)
 	}
-	if !compensated {
+	if compensatedAt < 0 {
 		t.Fatalf("no post-repair park to awaiting_human with reason document_delivery_reconciliation; events = %v", events)
 	}
-
+	if repairAt >= compensatedAt {
+		t.Fatalf("repair at index %d, compensation park at %d: the park must follow the repair, not precede it", repairAt, compensatedAt)
+	}
 	actions, err := system.Jobs.ListHumanActionsForJob(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	open, resolved := 0, 0
 	for _, a := range actions {
-		if a.Action.Kind != job.ActionKindDocumentDelivery {
-			continue
-		}
 		switch a.Action.Status {
 		case "open":
 			open++

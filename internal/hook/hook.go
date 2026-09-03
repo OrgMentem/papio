@@ -88,14 +88,16 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 	cmd.Stderr = stderr
 	// Kill the whole process tree at deadline, not just the shell: a hook
 	// like `worker & wait` must not outlive the timeout or hold the stderr
-	// pipe open. WaitDelay bounds the pipe wait even if a grandchild escaped
-	// the group.
-	setProcessGroup(cmd)
-	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	// pipe open. The tree is confined the moment it starts - a process group
+	// on Unix, a kill-on-close Job Object on Windows. WaitDelay only bounds
+	// papio's wait on the pipes if a descendant escaped; it never ends one.
+	guard := newProcGuard(cmd)
+	defer guard.close()
+	cmd.Cancel = func() error { return guard.kill(cmd) }
 	cmd.WaitDelay = 3 * time.Second
 
 	start := time.Now()
-	err := cmd.Run()
+	err := runConfined(cmd, guard)
 	result := Result{
 		Ran:        true,
 		Duration:   time.Since(start),
@@ -116,6 +118,21 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 		}
 	}
 	return result
+}
+
+// runConfined starts the shell, confines it before it can spawn a descendant,
+// then waits for it. Splitting exec.Cmd.Run's start and wait is what makes
+// room for the Windows job assignment, which needs a process to assign.
+func runConfined(cmd *exec.Cmd, guard *procGuard) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if err := guard.confine(cmd); err != nil {
+		_ = guard.kill(cmd)
+		_ = cmd.Wait()
+		return err
+	}
+	return cmd.Wait()
 }
 
 // tailBuffer keeps only the final limit bytes written to it.

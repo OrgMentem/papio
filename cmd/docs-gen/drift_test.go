@@ -381,7 +381,8 @@ func TestInitFlagsAreDocumented(t *testing.T) {
 
 // TestInternalDocLinksResolve exists because `zensical build` reports a broken
 // link as an "issue" and still exits 0, so the docs workflow stays green with
-// broken links. Verified against zensical 0.0.51.
+// broken links. Verified against the zensical version pinned in
+// docs/requirements.txt.
 func TestInternalDocLinksResolve(t *testing.T) {
 	docsDir := filepath.Join(repoRoot, "docs")
 	pages, err := filepath.Glob(filepath.Join(docsDir, "*", "*.md"))

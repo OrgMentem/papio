@@ -652,3 +652,62 @@ func assertHeader(t *testing.T, response *http.Response, name, want string) {
 		t.Fatalf("%s = %q, want %q", name, value, want)
 	}
 }
+
+// TestUnexpectedServeExitDoesNotStrandAClosedListener covers the state, not a
+// reachable production trigger: the listener is TCP loopback and only Shutdown
+// closes it, so net/http retries every temporary accept error. The defect was
+// that Start treated a non-nil listener as proof of health while the Serve
+// goroutine discarded its terminal error, so one unrecoverable Serve exit would
+// have made every later Issue mint a URL against a dead socket for the rest of
+// the process. Closing the private listener is the only way to model that.
+func TestUnexpectedServeExitDoesNotStrandAClosedListener(t *testing.T) {
+	server := New(&recordingResolver{})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	server.mu.Lock()
+	listener := server.listener
+	server.mu.Unlock()
+	if listener == nil {
+		t.Fatal("Start left no listener")
+	}
+	dead := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Serve returns on its own once the listener is gone; wait for the
+	// goroutine to publish that rather than sleeping.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.mu.Lock()
+		cleared := server.listener == nil
+		server.mu.Unlock()
+		if cleared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Serve exited without clearing listener state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	pdf := []byte("%PDF-1.7\nrelisten\n%%EOF\n")
+	path, digest := writePDF(t, pdf)
+	capabilityURL := issuePreview(t, server, path, digest, len(pdf), Citation{
+		Title: "Relistened", Authors: []string{"Ada Lovelace"}, Year: 2026,
+	})
+	if strings.Contains(capabilityURL, dead) {
+		t.Fatalf("Issue handed out a URL on the closed listener %s: %s", dead, capabilityURL)
+	}
+	response, body := getResponse(t, capabilityURL)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("relistened shell status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if !strings.Contains(body, "Relistened") {
+		t.Fatalf("relistened shell missing the citation it was issued for:\n%s", body)
+	}
+}

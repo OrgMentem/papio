@@ -86,6 +86,63 @@ func (m *fakeMaintenance) RunDue(context.Context) error {
 	return nil
 }
 
+type publicationRecoveryProcessor struct{ order chan<- string }
+
+func (p publicationRecoveryProcessor) Process(ctx context.Context, _ *job.Row) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (p publicationRecoveryProcessor) RecoverPreparedPublications(context.Context) error {
+	p.order <- "publications"
+	return nil
+}
+
+type publicationRecoveryStore struct{ order chan<- string }
+
+func (s publicationRecoveryStore) ClaimNext(context.Context, string, time.Duration) (*job.Row, error) {
+	return nil, nil
+}
+
+func (s publicationRecoveryStore) Heartbeat(context.Context, string, string, time.Duration) error {
+	return nil
+}
+
+func (s publicationRecoveryStore) Release(context.Context, string, string) error { return nil }
+
+func (s publicationRecoveryStore) RecoverStale(context.Context) ([]string, error) {
+	s.order <- "stale"
+	return nil, nil
+}
+
+func (s publicationRecoveryStore) CloseStaleHumanActions(context.Context) error { return nil }
+
+func (s publicationRecoveryStore) SweepTerminalQuarantine(context.Context) error {
+	s.order <- "sweep"
+	return nil
+}
+
+func TestSchedulerRecoversPreparedPublicationsBeforeStaleRecoveryAndSweep(t *testing.T) {
+	order := make(chan string, 3)
+	scheduler, err := NewScheduler(publicationRecoveryStore{order: order}, publicationRecoveryProcessor{order: order}, SchedulerConfig{
+		Owner: "test", Workers: 1, LeaseDuration: time.Minute, HeartbeatInterval: time.Second, PollInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	got := []string{<-order, <-order, <-order}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("scheduler run: %v", err)
+	}
+	if strings.Join(got, ",") != "publications,stale,sweep" {
+		t.Fatalf("startup recovery order = %v, want publications before stale recovery and sweep", got)
+	}
+}
+
 func TestAutostarterUsesExecutableCommandSeamOnce(t *testing.T) {
 	var starts int
 	var calls [][]string

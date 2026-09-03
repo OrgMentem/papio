@@ -93,14 +93,25 @@ func (l *routerLedger) ReserveDesktop(_ context.Context, id int64, _ time.Time, 
 	l.rows[id] = r
 	return true, nil
 }
-func (l *routerLedger) SetDesktopState(_ context.Context, id int64, state string, _ time.Time) error {
+func (l *routerLedger) SetDesktopState(_ context.Context, id int64, state string, _ time.Time) (bool, error) {
 	if l.failSetDesktopState != nil {
-		return l.failSetDesktopState
+		return false, l.failSetDesktopState
 	}
-	r := l.rows[id]
+	r, ok := l.rows[id]
+	if !ok {
+		return false, nil
+	}
+	if state == "attempted" {
+		if r.DesktopState != "reserved" {
+			return false, nil
+		}
+		r.DesktopSentDetail, r.DesktopSentCount = r.Intent.Detail, r.Count
+	} else if r.DesktopState != "pending" && r.DesktopState != "held" {
+		return false, nil
+	}
 	r.DesktopState = state
 	l.rows[id] = r
-	return nil
+	return true, nil
 }
 func (l *routerLedger) SetWebhookState(_ context.Context, id int64, state string, _ time.Time) error {
 	r := l.rows[id]
@@ -292,7 +303,11 @@ func TestQuietReleaseHandlesDSTGapAndOverlap(t *testing.T) {
 	router.policy.QuietHours = fallQuiet
 	// Both fall-back 01:30 instants share a wall clock, so an hour/minute
 	// assertion cannot tell them apart. Compare absolute instants.
-	firstOccurrence := time.Date(2026, 11, 1, 1, 15, 0, 0, loc)
+	// 01:15 is inside the repeated hour, so time.Date's zone choice for it is
+	// documented as not guaranteed. Naming the instant in UTC picks the FIRST
+	// 01:15 (EDT, -04:00) with no ambiguity; a local construction could hand
+	// this line the second one and fail against wantFirst on a correct runtime.
+	firstOccurrence := time.Date(2026, 11, 1, 5, 15, 0, 0, time.UTC).In(loc)
 	wantFirst := time.Date(2026, 11, 1, 5, 30, 0, 0, time.UTC)
 	if got := router.nextQuietRelease(firstOccurrence); !got.Equal(wantFirst) {
 		t.Fatalf("fall first release = %s, want first 01:30 EDT (%s)", got.UTC(), wantFirst)
@@ -645,4 +660,265 @@ func itoaNotify(n int64) string {
 		s = "-" + s
 	}
 	return s
+}
+
+type recordingEventSender struct{ events []Event }
+
+func (s *recordingEventSender) Send(_ context.Context, message string) {
+	s.events = append(s.events, Event{Message: message})
+}
+func (s *recordingEventSender) SendEvent(_ context.Context, event Event) {
+	s.events = append(s.events, event)
+}
+
+func desktopSentColumns(t *testing.T, db *store.Store, id int64) (string, int64) {
+	t.Helper()
+	var payload *string
+	var count *int64
+	if err := db.DB().QueryRowContext(context.Background(),
+		`SELECT desktop_sent_payload_json, desktop_sent_count FROM notification_intents WHERE id=?`, id).
+		Scan(&payload, &count); err != nil {
+		t.Fatalf("reading desktop snapshot of intent %d: %v", id, err)
+	}
+	if payload == nil || count == nil {
+		return "", 0
+	}
+	return *payload, *count
+}
+
+func desktopStateColumn(t *testing.T, db *store.Store, id int64) string {
+	t.Helper()
+	var state string
+	if err := db.DB().QueryRowContext(context.Background(),
+		`SELECT desktop_state FROM notification_intents WHERE id=?`, id).Scan(&state); err != nil {
+		t.Fatalf("reading desktop_state of intent %d: %v", id, err)
+	}
+	return state
+}
+
+// A desktop leg that is switched off must not freeze the webhook digest that
+// shares its row: every later event still joins the digest.
+func TestDesktopOffKeepsWebhookDigestCoalescing(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &recordingEventSender{}
+	desktop := &routerSender{}
+	policy := Policy{MaxPerHour: 10, DigestEvery: 30 * time.Minute, Categories: map[Category]CategoryPolicy{
+		CategoryDiscoveryNew: {Desktop: "off", Webhook: "digest", Window: time.Hour},
+	}}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Desktop: desktop, Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }})
+	route := func(at time.Time, message, detailKey string) {
+		t.Helper()
+		clock = at
+		intent := Intent{EventKind: "watch.alert", Category: CategoryDiscoveryNew, AggregateKey: "watch:1",
+			Phase: PhaseDigest, WindowStart: now, HappenedAt: at, Message: message,
+			Detail: Event{Kind: "watch.alert", Message: message, Count: 1, Detail: map[string]any{detailKey: true}}}
+		if err := router.Route(ctx, intent); err != nil {
+			t.Fatalf("route %q: %v", message, err)
+		}
+	}
+	route(now, "first paper", "first")
+	route(now.Add(5*time.Minute), "second paper", "second")
+
+	clock = now.Add(2 * time.Hour)
+	if err := router.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %#v, want exactly one digest", webhook.events)
+	}
+	digest := webhook.events[0]
+	if digest.Count != 2 {
+		t.Fatalf("digest count = %d, want 2: the second event never joined the digest", digest.Count)
+	}
+	if digest.Detail["first"] != true || digest.Detail["second"] != true {
+		t.Fatalf("digest detail = %v, want both events merged", digest.Detail)
+	}
+	if want := ComposeMessage(CategoryDiscoveryNew, 2, digest, digest.Message); digest.Message != want {
+		t.Fatalf("digest message = %q, want %q", digest.Message, want)
+	}
+	if len(desktop.messages) != 0 {
+		t.Fatalf("desktop sent %#v with the desktop leg switched off", desktop.messages)
+	}
+}
+
+// After the desktop leg delivers, the row keeps coalescing for the pending
+// webhook digest, and the delivery snapshot still names exactly what the
+// desktop said.
+func TestDesktopDeliveryKeepsItsAuditWhileDigestCoalesces(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := NewStoreLedger(db)
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &recordingEventSender{}
+	desktop := &routerSender{}
+	policy := Policy{MaxPerHour: 10, DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryDiscoveryNew: {Desktop: "immediate", Webhook: "digest", Window: time.Hour},
+	}}
+	now2 := func() time.Time { return clock }
+	router := NewRouter(RouterOptions{Ledger: ledger, Desktop: desktop, Webhook: webhook, Policy: policy, Now: now2})
+	// Both legs share one availability, so a drain that reaches the desktop leg
+	// would also flush the digest. A deployment without a webhook sender drains
+	// the desktop leg alone, which is the state this test needs: desktop sent,
+	// digest still pending.
+	desktopOnly := NewRouter(RouterOptions{Ledger: ledger, Desktop: desktop, Policy: policy, Now: now2})
+	route := func(at time.Time, message, detailKey string) {
+		t.Helper()
+		clock = at
+		intent := Intent{EventKind: "watch.alert", Category: CategoryDiscoveryNew, AggregateKey: "watch:1",
+			Phase: PhaseDigest, WindowStart: now, HappenedAt: at, Message: message,
+			Detail: Event{Kind: "watch.alert", Message: message, Count: 1, Detail: map[string]any{detailKey: true}}}
+		if err := router.Route(ctx, intent); err != nil {
+			t.Fatalf("route %q: %v", message, err)
+		}
+	}
+	route(now, "first paper", "first")
+	clock = now.Add(90 * time.Minute)
+	if err := desktopOnly.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(desktop.messages) != 1 {
+		t.Fatalf("desktop messages = %#v, want the one delivered notification", desktop.messages)
+	}
+	sentCopy := desktop.messages[0]
+
+	route(now.Add(100*time.Minute), "second paper", "second")
+	clock = now.Add(5 * time.Hour)
+	pending, err := ledger.DueWebhook(ctx, clock, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending webhook rows = %d, want 1", len(pending))
+	}
+	row := pending[0]
+	if row.Count != 2 {
+		t.Fatalf("row count = %d, want 2: the desktop delivery froze the digest", row.Count)
+	}
+	sentDetail, sentCount := row.DesktopSent()
+	if sentCount != 1 || sentDetail.Detail["second"] == true {
+		t.Fatalf("desktop audit = %d/%v, want the single event the desktop actually sent", sentCount, sentDetail.Detail)
+	}
+	if sentDetail.Message != sentCopy {
+		t.Fatalf("desktop audit copy = %q, want the delivered copy %q", sentDetail.Message, sentCopy)
+	}
+
+	if err := router.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %#v, want exactly one digest", webhook.events)
+	}
+	digest := webhook.events[0]
+	if digest.Count != 2 || digest.Detail["first"] != true || digest.Detail["second"] != true {
+		t.Fatalf("digest = %+v, want both events", digest)
+	}
+	payload, count := desktopSentColumns(t, db, row.ID)
+	if count != 1 || !strings.Contains(payload, "first paper") || strings.Contains(payload, "second paper") {
+		t.Fatalf("desktop snapshot = %d/%q, want only the delivered event", count, payload)
+	}
+}
+
+// staleDesktopLedger replays a due-row snapshot taken before a concurrent
+// supersession, which is exactly what a drain holds when the final
+// notification commits between the due read and the drain's own write.
+type staleDesktopLedger struct {
+	*StoreLedger
+	rows []Record
+}
+
+func (l *staleDesktopLedger) DueDesktop(context.Context, time.Time, int) ([]Record, error) {
+	return l.rows, nil
+}
+
+func TestRunDueAtDoesNotResurrectSupersededCheckpoint(t *testing.T) {
+	quiet, err := ParseQuietHours("22:00-23:30", time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both cases route the checkpoint under a live desktop policy, so the row
+	// is pending and genuinely due. Only the drain differs: quiet hours start,
+	// or the operator switches the desktop channel off.
+	for _, tc := range []struct {
+		name         string
+		drainDesktop string
+		drainQuiet   QuietHours
+	}{
+		{name: "quiet hours hold", drainDesktop: "immediate", drainQuiet: quiet},
+		{name: "platform unavailable", drainDesktop: "off"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := openTestStore(ctx, t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			ledger := NewStoreLedger(db)
+			// 22:15 UTC is inside the quiet window above.
+			now := time.Date(2026, 7, 15, 22, 15, 0, 0, time.UTC)
+			clock := now
+			desktop := &routerSender{}
+			routePolicy := Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+				CategoryCompletionBatch: {Desktop: "immediate", Webhook: "off", Window: time.Minute},
+			}}
+			drainPolicy := Policy{MaxPerHour: 10, QuietHours: tc.drainQuiet, QuietMode: "hold", Categories: map[Category]CategoryPolicy{
+				CategoryCompletionBatch: {Desktop: tc.drainDesktop, Webhook: "off", Window: time.Minute},
+			}}
+			router := NewRouter(RouterOptions{Ledger: ledger, Desktop: desktop, Policy: routePolicy, Now: func() time.Time { return clock }})
+			checkpoint := Intent{EventKind: "batch.checkpoint", Category: CategoryCompletionBatch, AggregateKey: "cohort:1",
+				Phase: PhaseCheckpoint, WindowStart: now, HappenedAt: now, Message: "checkpoint", Detail: Event{Kind: "batch.checkpoint", Message: "checkpoint"}}
+			if err := router.Route(ctx, checkpoint); err != nil {
+				t.Fatal(err)
+			}
+			// The drain reads its due rows, then the final notification commits
+			// its supersession before the drain writes.
+			due, err := ledger.DueDesktop(ctx, now, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(due) != 1 {
+				t.Fatalf("due rows = %d, want the checkpoint", len(due))
+			}
+			checkpointID := due[0].ID
+			clock = now.Add(time.Minute)
+			final := Intent{EventKind: "batch.completed", Category: CategoryCompletionBatch, AggregateKey: "cohort:1",
+				Phase: PhaseFinal, WindowStart: clock, HappenedAt: clock, Message: "batch done", Detail: Event{Kind: "batch.completed", Message: "batch done"}}
+			if err := router.Route(ctx, final); err != nil {
+				t.Fatal(err)
+			}
+			if got := desktopStateColumn(t, db, checkpointID); got != "superseded" {
+				t.Fatalf("checkpoint desktop_state = %q after finalisation, want superseded", got)
+			}
+
+			stale := NewRouter(RouterOptions{Ledger: &staleDesktopLedger{StoreLedger: ledger, rows: due}, Desktop: desktop, Policy: drainPolicy, Now: func() time.Time { return clock }})
+			if err := stale.RunDueAt(ctx, clock); err != nil {
+				t.Fatal(err)
+			}
+			if got := desktopStateColumn(t, db, checkpointID); got != "superseded" {
+				t.Fatalf("stale drain rewrote desktop_state to %q, want superseded", got)
+			}
+			// A later real drain must never deliver the retired checkpoint.
+			clock = now.Add(12 * time.Hour)
+			if err := router.RunDueAt(ctx, clock); err != nil {
+				t.Fatal(err)
+			}
+			for _, message := range desktop.messages {
+				if strings.Contains(message, "checkpoint") {
+					t.Fatalf("superseded checkpoint delivered after its final notification: %#v", desktop.messages)
+				}
+			}
+		})
+	}
 }

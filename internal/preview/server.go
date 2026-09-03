@@ -88,6 +88,7 @@ type Server struct {
 	mu       sync.Mutex
 	listener net.Listener
 	http     *http.Server
+	serveErr error
 	closed   bool
 	resolver ReviewResolver
 	byToken  map[string]*capability
@@ -126,9 +127,26 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	s.listener = listener
+	s.serveErr = nil
 	s.http = &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second}
 	go func(server *http.Server, l net.Listener) {
-		_ = server.Serve(l)
+		err := server.Serve(l)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// An explicit Shutdown owns its own teardown, and ErrServerClosed
+		// there is expected. Any other Serve exit has already closed the
+		// listener underneath us, so these pointers must stop advertising a
+		// reachable address: the listener != nil guard above would keep
+		// reporting health and Issue would keep minting capability URLs
+		// against a closed socket for the rest of the process. Clearing them
+		// lets the next Start relisten, and serveErr names the failure for a
+		// caller that arrives before it does.
+		if s.closed || s.http != server {
+			return
+		}
+		s.listener = nil
+		s.http = nil
+		s.serveErr = err
 	}(s.http, listener)
 	return nil
 }
@@ -159,7 +177,13 @@ func (s *Server) Issue(input IssueInput) (string, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.listener == nil {
+	if s.closed {
+		return "", errClosed
+	}
+	if s.listener == nil {
+		if s.serveErr != nil {
+			return "", s.serveErr
+		}
 		return "", errClosed
 	}
 	if s.byToken == nil {

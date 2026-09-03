@@ -99,6 +99,21 @@ type Record struct {
 	Count                                                     int
 	DesktopState, WebhookState                                string
 	DesktopReservedAt, DesktopAttemptedAt, WebhookAttemptedAt time.Time
+	// DesktopSentCount and DesktopSentDetail are the snapshot the ledger took
+	// when the desktop leg delivered. They are zero when nothing was sent.
+	DesktopSentCount  int
+	DesktopSentDetail Event
+}
+
+// DesktopSent reports what the desktop leg told the operator: the delivery
+// snapshot when one exists, otherwise the live coalesced values. Later events
+// keep merging into Count and Intent.Detail for a still-pending webhook
+// digest, so only the snapshot answers "what did the desktop actually say".
+func (r Record) DesktopSent() (Event, int) {
+	if r.DesktopSentCount > 0 {
+		return r.DesktopSentDetail, r.DesktopSentCount
+	}
+	return r.Intent.Detail, r.Count
 }
 
 type RouteRow struct {

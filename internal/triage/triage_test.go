@@ -1509,3 +1509,48 @@ func TestSnapshotCursorSurvivesMutationAndRejectsSchemaSwitchAndStaleAnchor(t *t
 
 	_ = jobs
 }
+
+func TestDecideOwnsWatchScopeSelection(t *testing.T) {
+	service, watches, _ := triageTestService(t)
+	ctx := context.Background()
+	first := createTriageWatch(t, watches, "decision first")
+	second := createTriageWatch(t, watches, "decision second")
+	for _, watched := range []*watch.Watch{first, second} {
+		if _, err := watches.RecordDigest(ctx, watched.ID, time.Now(), []watch.DigestEntry{{
+			WorkKey: "10.1000/decision", DOI: "10.1000/decision", Title: "Decision",
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := service.Snapshot(ctx, SnapshotRequest{Limit: 10})
+	if err != nil || len(snapshot.Items) != 1 {
+		t.Fatalf("snapshot = %+v, %v, want one grouped hit", snapshot, err)
+	}
+	input := DecisionInput{
+		ItemID: snapshot.Items[0].ID, Operation: DecisionDismiss,
+		Scope: WatchScope{WatchIDs: []int64{first.ID + second.ID + 1}},
+	}
+	result, err := service.Decide(ctx, input, &watch.Runner{Store: watches})
+	if err != nil || result.Outcome != DecisionInvalid {
+		t.Fatalf("foreign scope result = %+v, %v, want invalid", result, err)
+	}
+	for _, watched := range []*watch.Watch{first, second} {
+		entries, err := watches.Digest(ctx, watched.ID, 10)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("watch %d after refusal = %+v, %v, want one digest", watched.ID, entries, err)
+		}
+	}
+	input.Scope = WatchScope{WatchIDs: []int64{second.ID}}
+	result, err = service.Decide(ctx, input, &watch.Runner{Store: watches})
+	if err != nil || result.Outcome != DecisionApplied {
+		t.Fatalf("subset dismissal result = %+v, %v, want applied", result, err)
+	}
+	firstEntries, err := watches.Digest(ctx, first.ID, 10)
+	if err != nil || len(firstEntries) != 1 {
+		t.Fatalf("first watch after subset dismissal = %+v, %v, want one digest", firstEntries, err)
+	}
+	secondEntries, err := watches.Digest(ctx, second.ID, 10)
+	if err != nil || len(secondEntries) != 0 {
+		t.Fatalf("second watch after subset dismissal = %+v, %v, want no digest", secondEntries, err)
+	}
+}

@@ -17,29 +17,68 @@ import (
 	"papio/internal/zotio"
 )
 
+// baseBatchCaller answers the daemon RPCs every batch mock needs alike: an
+// ownership lookup reports every work not owned, and jobs.get reports a queued
+// job. Mocks embed it and handle only the methods their test is about,
+// delegating the rest so an unexpected method still fails loudly.
+type baseBatchCaller struct{}
+
+func (baseBatchCaller) Call(_ context.Context, method string, params, result any) error {
+	switch method {
+	case "zotio.lookup_works":
+		request := params.(zotio.LookupWorksRequest)
+		out := result.(*zotio.LookupWorksResult)
+		out.Works = make([]zotio.WorkOwnership, len(request.Works))
+		for i := range out.Works {
+			out.Works[i].Status = zotio.OwnershipNotOwned
+		}
+	case "jobs.get":
+		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-x","state":"queued"}`)
+	default:
+		return fmt.Errorf("unexpected method %q", method)
+	}
+	return nil
+}
+
+// methodRecorder records which RPCs a mock caller was asked for.
+type methodRecorder struct {
+	mu      sync.Mutex
+	methods []string
+}
+
+func (r *methodRecorder) record(method string) {
+	r.mu.Lock()
+	r.methods = append(r.methods, method)
+	r.mu.Unlock()
+}
+
+func (r *methodRecorder) called(method string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, seen := range r.methods {
+		if seen == method {
+			return true
+		}
+	}
+	return false
+}
+
 type resolverBatchCaller struct {
+	baseBatchCaller
 	t        *testing.T
 	resolver string
 }
 
-func (c resolverBatchCaller) Call(_ context.Context, method string, params, result any) error {
+func (c resolverBatchCaller) Call(ctx context.Context, method string, params, result any) error {
 	switch method {
-	case "zotio.lookup_works":
-		request := params.(zotio.LookupWorksRequest)
-		result.(*zotio.LookupWorksResult).Works = make([]zotio.WorkOwnership, len(request.Works))
-		for i := range request.Works {
-			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
-		}
 	case "acquire.submit_v2":
 		request := params.(submitParams).Request
 		if request.Resolver != c.resolver {
 			c.t.Errorf("resolver = %q, want %q", request.Resolver, c.resolver)
 		}
 		result.(*submitResult).JobID = "job-resolver-profile"
-	case "jobs.get":
-		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-x","state":"queued"}`)
 	default:
-		return fmt.Errorf("unexpected method %q", method)
+		return c.baseBatchCaller.Call(ctx, method, params, result)
 	}
 	return nil
 }
@@ -61,43 +100,34 @@ func TestSubmitAppliesResolverProfileToEveryBatchRequest(t *testing.T) {
 }
 
 type collectionBatchCaller struct {
+	baseBatchCaller
 	mu          sync.Mutex
 	collections []string
 }
 
-func (c *collectionBatchCaller) Call(_ context.Context, method string, params, result any) error {
+func (c *collectionBatchCaller) Call(ctx context.Context, method string, params, result any) error {
 	switch method {
-	case "zotio.lookup_works":
-		request := params.(zotio.LookupWorksRequest)
-		result.(*zotio.LookupWorksResult).Works = make([]zotio.WorkOwnership, len(request.Works))
-		for i := range request.Works {
-			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
-		}
 	case "acquire.submit_v2":
 		request := params.(submitParams).Request
 		c.mu.Lock()
 		c.collections = append(c.collections, request.Collection)
 		c.mu.Unlock()
 		result.(*submitResult).JobID = "job-collection-default"
-	case "jobs.get":
-		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-x","state":"queued"}`)
 	default:
-		return fmt.Errorf("unexpected method %q", method)
+		return c.baseBatchCaller.Call(ctx, method, params, result)
 	}
 	return nil
 }
 
 type fingerprintBatchCaller struct {
-	mu                  sync.Mutex
+	baseBatchCaller
+	methodRecorder
 	expectedFingerprint string
 	lookupErr           error
-	methods             []string
 }
 
-func (c *fingerprintBatchCaller) Call(_ context.Context, method string, params, result any) error {
-	c.mu.Lock()
-	c.methods = append(c.methods, method)
-	c.mu.Unlock()
+func (c *fingerprintBatchCaller) Call(ctx context.Context, method string, params, result any) error {
+	c.record(method)
 
 	switch method {
 	case "library.lookup_works":
@@ -109,31 +139,12 @@ func (c *fingerprintBatchCaller) Call(_ context.Context, method string, params, 
 			return c.lookupErr
 		}
 		result.(*ownership.Result).Works = make([]ownership.WorkResult, len(request.Works))
-	case "zotio.lookup_works":
-		request := params.(zotio.LookupWorksRequest)
-		result.(*zotio.LookupWorksResult).Works = make([]zotio.WorkOwnership, len(request.Works))
-		for i := range request.Works {
-			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
-		}
 	case "acquire.submit_v2":
 		result.(*submitResult).JobID = "job-fingerprint"
-	case "jobs.get":
-		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-fingerprint","state":"queued"}`)
 	default:
-		return fmt.Errorf("unexpected method %q", method)
+		return c.baseBatchCaller.Call(ctx, method, params, result)
 	}
 	return nil
-}
-
-func (c *fingerprintBatchCaller) called(method string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, called := range c.methods {
-		if called == method {
-			return true
-		}
-	}
-	return false
 }
 
 func TestSubmitBindsHoldingsLookupToFingerprint(t *testing.T) {
@@ -255,19 +266,14 @@ func TestBatchRequestIDSeparatesLegacyPrefixCollision(t *testing.T) {
 // legacyDaemonCaller answers acquire.submit_v2 the way a pre-0.13.0 daemon
 // does, so the batch path has to reach the retained v1 method.
 type legacyDaemonCaller struct {
+	baseBatchCaller
 	t          *testing.T
 	mu         sync.Mutex
 	sawBareReq bool
 }
 
-func (c *legacyDaemonCaller) Call(_ context.Context, method string, params, result any) error {
+func (c *legacyDaemonCaller) Call(ctx context.Context, method string, params, result any) error {
 	switch method {
-	case "zotio.lookup_works":
-		request := params.(zotio.LookupWorksRequest)
-		result.(*zotio.LookupWorksResult).Works = make([]zotio.WorkOwnership, len(request.Works))
-		for i := range request.Works {
-			result.(*zotio.LookupWorksResult).Works[i].Status = zotio.OwnershipNotOwned
-		}
 	case "acquire.submit_v2":
 		return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
 	case "acquire.submit":
@@ -281,10 +287,8 @@ func (c *legacyDaemonCaller) Call(_ context.Context, method string, params, resu
 			c.t.Errorf("legacy params = %#v, want a bare protocol.WorkRequest", params)
 		}
 		result.(*submitResult).JobID = "job-legacy"
-	case "jobs.get":
-		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-legacy","state":"queued"}`)
 	default:
-		return fmt.Errorf("unexpected method %q", method)
+		return c.baseBatchCaller.Call(ctx, method, params, result)
 	}
 	return nil
 }

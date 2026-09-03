@@ -3,19 +3,14 @@
 package api
 
 import (
-	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
-	"io"
-	"strings"
 
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/triage"
-	"papio/internal/watch"
 )
 
 type triageDecideResult struct {
@@ -87,105 +82,55 @@ func triageDecide(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if system == nil || system.Triage == nil || system.WatchRunner == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "triage inbox is not configured"}
 	}
-	if strings.HasPrefix(params.ItemID, triage.RetractionIDPrefix) {
-		return acknowledgeRetraction(ctx, params.ItemID, params.Op, system)
-	}
-	hit, err := system.Triage.FindWatchHit(ctx, params.ItemID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return marshal(triageDecideResult{Outcome: "conflict"})
-	}
-	if err != nil {
-		return failure(err)
-	}
-	if params.Op == "acquire" {
-		targets := make([]watch.DigestTarget, 0, len(hit.Watches))
-		for _, watched := range hit.Watches {
-			targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
+	scope := triage.WatchScope{}
+	if params.Op == string(triage.DecisionDismiss) {
+		var err error
+		scope, err = decodeTriageDismissScope(params.WatchScope)
+		if err != nil {
+			return badParams(err)
 		}
-		if err := system.WatchRunner.AcquireDigests(ctx, targets); err != nil {
-			if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-				return marshal(triageDecideResult{Outcome: "conflict"})
-			}
+	}
+	result, err := system.Triage.Decide(ctx, triage.DecisionInput{
+		ItemID: params.ItemID, Operation: triage.DecisionOperation(params.Op), Scope: scope,
+	}, system.WatchRunner)
+	if err != nil {
+		var watchErr *triage.WatchMutationError
+		if errors.As(err, &watchErr) {
 			return watchFailure(err)
 		}
-		return marshal(triageDecideResult{Outcome: "applied"})
-	}
-
-	watchIDs, err := triageDismissScope(params.WatchScope, hit.Watches)
-	if err != nil {
-		return badParams(err)
-	}
-	targets := make([]watch.DigestTarget, 0, len(hit.Watches))
-	for _, watched := range hit.Watches {
-		if !watchIDs[watched.ID] {
-			continue
-		}
-		targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
-	}
-	if err := system.WatchRunner.ConsumeDigests(ctx, targets); err != nil {
-		if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-			return marshal(triageDecideResult{Outcome: "conflict"})
-		}
-		return watchFailure(err)
-	}
-	return marshal(triageDecideResult{Outcome: "applied"})
-}
-
-// acknowledgeRetraction clears one Crossref update notice. A retraction notice
-// carries no watch digest to consume, so watch_scope is not consulted: the
-// notice itself is the unit of dismissal.
-func acknowledgeRetraction(ctx context.Context, itemID, op string, system *bootstrap.System) ([]byte, *ipc.RPCError) {
-	if op != "dismiss" {
-		return badParams(errors.New("retraction notices support only the dismiss operation"))
-	}
-	applied, err := system.Triage.AcknowledgeRetraction(ctx, itemID)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return marshal(triageDecideResult{Outcome: "conflict"})
-	case err != nil:
 		return failure(err)
-	case applied:
-		return marshal(triageDecideResult{Outcome: "applied"})
-	default:
-		return marshal(triageDecideResult{Outcome: "already_applied"})
 	}
+	if result.Outcome == triage.DecisionInvalid {
+		return badParams(errors.New(result.Detail))
+	}
+	return marshal(triageDecideResult{Outcome: string(result.Outcome), Detail: result.Detail})
 }
 
-func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]bool, error) {
+// decodeTriageDismissScope owns IPC JSON decoding. The triage service receives
+// the normalized scope and validates it against the current hit.
+func decodeTriageDismissScope(raw json.RawMessage) (triage.WatchScope, error) {
 	if len(raw) == 0 {
-		return nil, errors.New("watch_scope is required for dismiss")
+		return triage.WatchScope{}, errors.New("watch_scope is required for dismiss")
 	}
 	var all string
 	if err := json.Unmarshal(raw, &all); err == nil {
 		if all != "all" {
-			return nil, errors.New("watch_scope must be all or watch IDs")
+			return triage.WatchScope{}, errors.New("watch_scope must be all or watch IDs")
 		}
-		selected := make(map[int64]bool, len(watches))
-		for _, watched := range watches {
-			selected[watched.ID] = true
-		}
-		return selected, nil
+		return triage.WatchScope{All: true}, nil
 	}
 	var ids []int64
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := decoder.Decode(&ids); err != nil || len(ids) == 0 || len(ids) > 100 {
-		return nil, errors.New("watch_scope must be all or 1 to 100 watch IDs")
+	if err := json.Unmarshal(raw, &ids); err != nil || len(ids) == 0 || len(ids) > 100 {
+		return triage.WatchScope{}, errors.New("watch_scope must be all or 1 to 100 watch IDs")
 	}
-	available := make(map[int64]bool, len(watches))
-	for _, watched := range watches {
-		available[watched.ID] = true
-	}
-	selected := make(map[int64]bool, len(ids))
+	seen := make(map[int64]bool, len(ids))
 	for _, id := range ids {
-		if id <= 0 || !available[id] || selected[id] {
-			return nil, errors.New("watch_scope contains an invalid watch ID")
+		if id <= 0 || seen[id] {
+			return triage.WatchScope{}, errors.New("watch_scope contains an invalid watch ID")
 		}
-		selected[id] = true
+		seen[id] = true
 	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, errors.New("watch_scope must be all or 1 to 100 watch IDs")
-	}
-	return selected, nil
+	return triage.WatchScope{WatchIDs: ids}, nil
 }
 
 func resolveActionCAS(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

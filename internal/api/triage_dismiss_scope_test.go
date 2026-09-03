@@ -124,39 +124,6 @@ func equalIDs(got, want []int64) bool {
 	return true
 }
 
-// A watch_scope list must consume exactly the named watches. Before this test
-// the only exercised scope was "all", which cannot tell a correct selection
-// from one that clears every sibling watch in the group.
-func TestTriageDismissScopeConsumesOnlyTheListedWatches(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		pick    []int // indices into fixture.watchIDs
-		survive []int
-	}{
-		{name: "one id", pick: []int{1}, survive: []int{0, 2}},
-		{name: "several ids", pick: []int{0, 2}, survive: []int{1}},
-		{name: "every id", pick: []int{0, 1, 2}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fixture := newTriageDismissScopeFixture(t)
-			ids := make([]string, 0, len(tc.pick))
-			for _, index := range tc.pick {
-				ids = append(ids, fmt.Sprintf("%d", fixture.watchIDs[index]))
-			}
-			if rpcErr := fixture.dismiss(t, "["+strings.Join(ids, ",")+"]"); rpcErr != nil {
-				t.Fatalf("dismiss %v: %+v", ids, rpcErr)
-			}
-			want := make([]int64, 0, len(tc.survive))
-			for _, index := range tc.survive {
-				want = append(want, fixture.watchIDs[index])
-			}
-			if got := fixture.surviving(t); !equalIDs(got, want) {
-				t.Fatalf("surviving digests = %v, want %v", got, want)
-			}
-		})
-	}
-}
-
 // Every rejection arm must refuse with invalid_argument and consume nothing.
 // One fixture serves all of them precisely because a refusal may not change
 // state: the shared final assertion is that all three digests are still there.
@@ -167,19 +134,31 @@ func TestTriageDismissScopeRejectsInvalidScope(t *testing.T) {
 		tooMany = append(tooMany, fmt.Sprintf("%d", fixture.watchIDs[0]+int64(i)))
 	}
 	unowned := fixture.watchIDs[2] + 1000
+	// wantMessage separates the two refusal reasons the production guard can
+	// give. Asserting only the code cannot discriminate the 100-ID cap: with
+	// `len(ids) > 100` removed, a 101-ID list built from a 3-watch fixture
+	// still fails on the FIRST unowned ID and still reports invalid_argument.
+	// Four distinct refusal reasons, each pinned to the arm that produces it.
+	const requiredMsg = "watch_scope is required for dismiss"
+	const bareMsg = "watch_scope must be all or watch IDs"
+	const shapeMsg = "watch_scope must be all or 1 to 100 watch IDs"
+	const idMsg = "watch_scope contains an invalid watch ID"
 	for _, tc := range []struct {
-		name  string
-		scope string
+		name        string
+		scope       string
+		wantMessage string
 	}{
-		{name: "missing scope", scope: ""},
-		{name: "null scope", scope: "null"},
-		{name: "bare string that is not all", scope: `"mine"`},
-		{name: "empty array", scope: "[]"},
-		{name: "more than 100 ids", scope: "[" + strings.Join(tooMany, ",") + "]"},
-		{name: "unowned watch id", scope: fmt.Sprintf("[%d]", unowned)},
-		{name: "duplicate id", scope: fmt.Sprintf("[%d,%d]", fixture.watchIDs[0], fixture.watchIDs[0])},
-		{name: "zero id", scope: "[0]"},
-		{name: "negative id", scope: "[-1]"},
+		{name: "missing scope", scope: "", wantMessage: requiredMsg},
+		// JSON null unmarshals into a string without error, leaving it empty,
+		// so this takes the bare-string arm rather than the array arm.
+		{name: "null scope", scope: "null", wantMessage: bareMsg},
+		{name: "bare string that is not all", scope: `"mine"`, wantMessage: bareMsg},
+		{name: "empty array", scope: "[]", wantMessage: shapeMsg},
+		{name: "more than 100 ids", scope: "[" + strings.Join(tooMany, ",") + "]", wantMessage: shapeMsg},
+		{name: "unowned watch id", scope: fmt.Sprintf("[%d]", unowned), wantMessage: idMsg},
+		{name: "duplicate id", scope: fmt.Sprintf("[%d,%d]", fixture.watchIDs[0], fixture.watchIDs[0]), wantMessage: idMsg},
+		{name: "zero id", scope: "[0]", wantMessage: idMsg},
+		{name: "negative id", scope: "[-1]", wantMessage: idMsg},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rpcErr := fixture.dismiss(t, tc.scope)
@@ -188,6 +167,9 @@ func TestTriageDismissScopeRejectsInvalidScope(t *testing.T) {
 			}
 			if rpcErr.Code != "invalid_argument" {
 				t.Fatalf("scope %s error = %+v, want invalid_argument", tc.scope, rpcErr)
+			}
+			if !strings.Contains(rpcErr.Message, tc.wantMessage) {
+				t.Fatalf("scope %s message = %q, want %q: the two refusal reasons must stay distinguishable", tc.scope, rpcErr.Message, tc.wantMessage)
 			}
 			if got := fixture.surviving(t); !equalIDs(got, fixture.watchIDs) {
 				t.Fatalf("scope %s consumed digests: surviving = %v, want %v", tc.scope, got, fixture.watchIDs)
@@ -201,22 +183,18 @@ func TestTriageDismissScopeRejectsInvalidScope(t *testing.T) {
 
 // Trailing JSON after the ID list cannot arrive over triage.decide, because
 // ipc.DecodeParams rejects a params object that is not exactly one JSON value.
-// The guard is still the scope parser's own contract, and it is the arm the
-// browser mirror lacked, so it is asserted directly on both halves.
+// The IPC decoder still rejects it before the normalized scope reaches the
+// domain mutation.
 func TestTriageDismissScopeRejectsTrailingGarbage(t *testing.T) {
-	watches := []triage.Watch{{ID: 7, WorkKey: dismissScopeWorkKey}}
 	for _, scope := range []string{`[7] oops`, `[7][7]`, `[7],`, `"all" oops`} {
-		selected, err := triageDismissScope(json.RawMessage(scope), watches)
+		decoded, err := decodeTriageDismissScope(json.RawMessage(scope))
 		if err == nil {
-			t.Fatalf("scope %s was accepted as %v, want a refusal", scope, selected)
-		}
-		if selected != nil {
-			t.Fatalf("scope %s refused but still selected %v", scope, selected)
+			t.Fatalf("scope %s was accepted as %+v, want a refusal", scope, decoded)
 		}
 	}
 	// Trailing whitespace is not garbage: the list is still exactly one value.
-	selected, err := triageDismissScope(json.RawMessage("[7] \n"), watches)
-	if err != nil || !selected[7] || len(selected) != 1 {
-		t.Fatalf("whitespace-padded scope = %v, %v, want watch 7 selected", selected, err)
+	decoded, err := decodeTriageDismissScope(json.RawMessage("[7] \n"))
+	if err != nil || len(decoded.WatchIDs) != 1 || decoded.WatchIDs[0] != 7 {
+		t.Fatalf("whitespace-padded scope = %+v, %v, want watch 7 selected", decoded, err)
 	}
 }

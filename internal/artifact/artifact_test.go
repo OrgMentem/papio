@@ -30,9 +30,12 @@ func TestPromoteIsAtomicIdempotentAndVerifiable(t *testing.T) {
 		t.Fatalf("hash: %v size=%d", err, size)
 	}
 
-	dest, err := s.Promote(temp, sha)
+	dest, created, err := s.Promote(temp, sha)
 	if err != nil {
 		t.Fatalf("promote: %v", err)
+	}
+	if !created {
+		t.Fatal("first promotion reported reused artifact")
 	}
 	if _, err := os.Stat(temp); !os.IsNotExist(err) {
 		t.Fatal("temp file survived promotion")
@@ -50,16 +53,24 @@ func TestPromoteIsAtomicIdempotentAndVerifiable(t *testing.T) {
 	if err := os.WriteFile(temp2, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	dest2, err := s.Promote(temp2, sha)
+	dest2, created, err := s.Promote(temp2, sha)
 	if err != nil || dest2 != dest {
 		t.Fatalf("re-promote = %q, %v; want same path, no error", dest2, err)
+	}
+	if created {
+		t.Fatal("re-promotion reported created artifact")
 	}
 
 	// Wrong-hash promotion is refused.
 	temp3 := filepath.Join(q, "download3.tmp")
 	_ = os.WriteFile(temp3, []byte("different"), 0o600)
-	if _, err := s.Promote(temp3, sha); err == nil {
+	if _, created, err := s.Promote(temp3, sha); err == nil {
 		t.Fatal("promoted mismatched content")
+	} else if created {
+		t.Fatal("mismatched promotion reported created artifact")
+	}
+	if err := s.Verify(sha); err != nil {
+		t.Fatalf("failed second promotion damaged shared artifact: %v", err)
 	}
 }
 
@@ -88,7 +99,11 @@ func TestPromoteConcurrentlyConvergesForSameHash(t *testing.T) {
 	}
 
 	start := make(chan struct{})
-	results := make(chan string, len(tempPaths))
+	type promotionResult struct {
+		path    string
+		created bool
+	}
+	results := make(chan promotionResult, len(tempPaths))
 	errs := make(chan error, len(tempPaths))
 	var wg sync.WaitGroup
 	for _, tempPath := range tempPaths {
@@ -96,12 +111,12 @@ func TestPromoteConcurrentlyConvergesForSameHash(t *testing.T) {
 		go func(path string) {
 			defer wg.Done()
 			<-start
-			dest, err := s.Promote(path, sha)
+			dest, created, err := s.Promote(path, sha)
 			if err != nil {
 				errs <- err
 				return
 			}
-			results <- dest
+			results <- promotionResult{path: dest, created: created}
 		}(tempPath)
 	}
 	close(start)
@@ -112,12 +127,19 @@ func TestPromoteConcurrentlyConvergesForSameHash(t *testing.T) {
 		t.Fatalf("concurrent promote: %v", err)
 	}
 	var dest string
+	createdCount := 0
 	for result := range results {
-		if dest == "" {
-			dest = result
-		} else if result != dest {
-			t.Fatalf("promotion destinations = %q and %q, want one path", dest, result)
+		if result.created {
+			createdCount++
 		}
+		if dest == "" {
+			dest = result.path
+		} else if result.path != dest {
+			t.Fatalf("promotion destinations = %q and %q, want one path", dest, result.path)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created promotions = %d, want 1", createdCount)
 	}
 	if err := s.Verify(sha); err != nil {
 		t.Fatalf("verify converged artifact: %v", err)
@@ -149,9 +171,12 @@ func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
 	}
 	t.Cleanup(func() { linkFile = originalLink })
 
-	dest, err := s.Promote(temp, sha)
+	dest, created, err := s.Promote(temp, sha)
 	if err != nil {
 		t.Fatalf("promote without hard links: %v", err)
+	}
+	if !created {
+		t.Fatal("fallback first promotion reported reused artifact")
 	}
 	if err := s.Verify(sha); err != nil {
 		t.Fatalf("verify fallback artifact: %v", err)
@@ -164,9 +189,12 @@ func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
 	if err := os.WriteFile(duplicate, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	duplicateDest, err := s.Promote(duplicate, sha)
+	duplicateDest, created, err := s.Promote(duplicate, sha)
 	if err != nil {
 		t.Fatalf("fallback duplicate promote: %v", err)
+	}
+	if created {
+		t.Fatal("fallback duplicate promotion reported created artifact")
 	}
 	if duplicateDest != dest {
 		t.Fatalf("fallback duplicate destination = %q, want %q", duplicateDest, dest)
@@ -201,9 +229,12 @@ func TestPromoteSucceedsWhenTempCleanupFails(t *testing.T) {
 	}
 	t.Cleanup(func() { removeFile = origRemove })
 
-	dest, err := s.Promote(temp, sha)
+	dest, created, err := s.Promote(temp, sha)
 	if err != nil {
 		t.Fatalf("promote with cleanup failure: %v", err)
+	}
+	if !created {
+		t.Fatal("promotion with cleanup failure reported reused artifact")
 	}
 	// Artifact must be published despite cleanup failure.
 	if err := s.Verify(sha); err != nil {
@@ -254,13 +285,54 @@ func TestPromotePrePublicationFailureLeavesNoDestination(t *testing.T) {
 	}
 	t.Cleanup(func() { chmodFile = origChmod })
 
-	if _, err := s.Promote(temp, sha); err == nil {
+	if _, created, err := s.Promote(temp, sha); err == nil {
 		t.Fatal("expected pre-publication chmod failure")
+	} else if created {
+		t.Fatal("pre-publication chmod failure reported created artifact")
 	}
 	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
 		t.Fatalf("destination exists after pre-publication failure: %v", err)
 	}
 }
+
+func TestPromoteLinkFailureDoesNotClaimCreation(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.QuarantineDir("job_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(q, "download.tmp")
+	if err := os.WriteFile(temp, []byte("%PDF-1.4 fixture body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest, err := s.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalLink := linkFile
+	linkFile = func(oldname, newname string) error {
+		return errors.New("injected link failure")
+	}
+	t.Cleanup(func() { linkFile = originalLink })
+
+	if _, created, err := s.Promote(temp, sha); err == nil {
+		t.Fatal("expected link failure")
+	} else if created {
+		t.Fatal("link failure reported created artifact")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("destination exists after link failure: %v", err)
+	}
+}
+
 func TestConfineRegularFile(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "a.pdf")
@@ -321,7 +393,7 @@ func TestCleanQuarantineRemovesOnlyTheNamedJobDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	published, err := s.Promote(temp, sha)
+	published, _, err := s.Promote(temp, sha)
 	if err != nil {
 		t.Fatal(err)
 	}

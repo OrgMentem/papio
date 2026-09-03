@@ -820,6 +820,329 @@ func TestJobScopedPageCaptureRecordsEvent(t *testing.T) {
 	}
 }
 
+// blockingCaptureStore parks every capture write until it is released. The
+// real store's write duration is a property of the disk, so this is the only
+// way to hold the window open and observe what the daemon can still do while
+// a capture is being written.
+type blockingCaptureStore struct {
+	entered chan string // one send per write, carrying the pinned job id
+	release chan struct{}
+	path    string
+
+	mu       sync.Mutex
+	released []string
+}
+
+func (s *blockingCaptureStore) StoreSanitizedPinned(_ context.Context, jobID, _, _, _, _ string, _ []byte) (string, error) {
+	s.entered <- jobID
+	<-s.release
+	return s.path, nil
+}
+
+func (s *blockingCaptureStore) ReleaseJob(_ context.Context, jobID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.released = append(s.released, jobID)
+	return nil
+}
+
+func (s *blockingCaptureStore) releasedJobs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.released)
+}
+
+func newBlockingCaptureStore(t *testing.T) *blockingCaptureStore {
+	t.Helper()
+	return &blockingCaptureStore{
+		entered: make(chan string, 1),
+		release: make(chan struct{}),
+		path:    filepath.Join(t.TempDir(), "blocked-capture.html"),
+	}
+}
+
+// awaitCaptureWrite blocks until pageCapture has entered the store write.
+func awaitCaptureWrite(t *testing.T, store *blockingCaptureStore) {
+	t.Helper()
+	select {
+	case <-store.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("page capture never reached the capture store")
+	}
+}
+
+// awaitPendingCapture waits for Capture to queue its directive and returns the
+// pending entry so a test can inspect the path it correlates.
+func awaitPendingCapture(t *testing.T, b *Bridge, sessionID string) *pendingPageCapture {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b.mu.Lock()
+		pending := b.pendingCaptures[sessionID]
+		b.mu.Unlock()
+		if pending != nil {
+			return pending
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("capture request was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// pageCaptureReceipt returns the browser.page_capture event detail for a job,
+// or nil when the daemon recorded none.
+func pageCaptureReceipt(t *testing.T, jobs *job.Store, jobID string) map[string]any {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "browser.page_capture" {
+			detail, _ := event["detail"].(map[string]any)
+			return detail
+		}
+	}
+	return nil
+}
+
+// capturePath reads the correlated path under b.mu, the only lock that guards
+// a pending entry's fields.
+func capturePath(b *Bridge, pending *pendingPageCapture) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return pending.path
+}
+
+// holderEpoch reads the holder generation under b.mu.
+func holderEpoch(b *Bridge) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.epoch
+}
+
+// TestPageCaptureStoreDoesNotHoldSessionLock is the point of moving the
+// capture write out of the session critical section: the store does MkdirAll,
+// a path scan, two fsynced writes, pin/index writes and a per-host prune, and
+// b.mu is the same mutex session arbitration runs under. Held across the
+// write, a slow disk presents to the user as session loss — the failure class
+// AGENTS.md records for adoption scans wedging every daemon RPC.
+func TestPageCaptureStoreDoesNotHoldSessionLock(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := park(t, jobs, "wr_capture_store_lock", handoffWork())
+	store := newBlockingCaptureStore(t)
+	b.pageCaptures = store
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageCapture, jobID, pageCapturePayload(t, []byte("<html>slow store</html>")))
+	syncErr := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
+		syncErr <- err
+	}()
+	awaitCaptureWrite(t, store)
+
+	sessions := make(chan int, 1)
+	go func() {
+		listed, _, _ := b.Sessions()
+		sessions <- len(listed)
+	}()
+	select {
+	case count := <-sessions:
+		if count != 1 {
+			t.Errorf("sessions = %d during a blocked capture write, want 1", count)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Sessions blocked behind the capture store write: b.mu is still held across it")
+	}
+
+	claimed := make(chan error, 1)
+	go func() {
+		_, err := b.Claim(testSessionID)
+		claimed <- err
+	}()
+	select {
+	case err := <-claimed:
+		if err != nil {
+			t.Errorf("claim during a blocked capture write: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Claim blocked behind the capture store write: b.mu is still held across it")
+	}
+
+	close(store.release)
+	if err := <-syncErr; err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	receipt := pageCaptureReceipt(t, jobs, jobID)
+	if receipt == nil || receipt["path"] != store.path {
+		t.Fatalf("page capture receipt = %#v, want one naming %s", receipt, store.path)
+	}
+	if released := store.releasedJobs(); len(released) != 0 {
+		t.Fatalf("released jobs = %v, want none for a capture that stayed current", released)
+	}
+}
+
+// TestPageCaptureHolderDepartureDuringStoreDiscardsResult covers the window the
+// unlock opens: release() drops the pending capture and increments b.epoch, so
+// a write that completes after the departure must not attach its path to the
+// request, must not record a receipt against the replacement holder's bridge,
+// and must not leave a pinned file no request can claim.
+func TestPageCaptureHolderDepartureDuringStoreDiscardsResult(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := park(t, jobs, "wr_capture_holder_departs", handoffWork())
+	store := newBlockingCaptureStore(t)
+	b.pageCaptures = store
+	runSync(t, b, hello())
+
+	captureResult := make(chan CaptureResult, 1)
+	go func() {
+		captureResult <- b.Capture(context.Background(), CaptureRequest{
+			URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
+		})
+	}()
+	pending := awaitPendingCapture(t, b, testSessionID)
+
+	content := pageCapturePayload(t, []byte("<html>captured while departing</html>"))
+	content.Scenario = "success"
+	content.RequestID = pending.payload.RequestID
+	frame := inFrame(t, protocol.MsgPageCapture, jobID, content)
+	syncErr := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
+		syncErr <- err
+	}()
+	awaitCaptureWrite(t, store)
+
+	// The holder says goodbye and a replacement browser claims the bridge,
+	// both while the write is parked. Neither call can proceed unless b.mu is
+	// free, so reaching the assertions at all also re-proves the unlock.
+	if _, err := b.Sync(context.Background(), testSessionID, true, nil); err != nil {
+		t.Fatalf("goodbye sync: %v", err)
+	}
+	const replacement = "sess-replacement-00000000000000000000"
+	runSyncAs(t, b, replacement, hello())
+
+	close(store.release)
+	if err := <-syncErr; err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if path := capturePath(b, pending); path != "" {
+		t.Fatalf("pending.path = %q after the holder departed, want no correlated path", path)
+	}
+	if receipt := pageCaptureReceipt(t, jobs, jobID); receipt != nil {
+		t.Fatalf("page capture receipt = %#v, want none against the replacement holder", receipt)
+	}
+	if released := store.releasedJobs(); !slices.Contains(released, jobID) {
+		t.Fatalf("released jobs = %v, want the discarded capture's job %s released", released, jobID)
+	}
+	select {
+	case result := <-captureResult:
+		if result.Outcome != "nav_failed" || result.Path != "" {
+			t.Fatalf("capture result = %#v, want nav_failed with no path", result)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the departing session's capture caller was never answered")
+	}
+}
+
+// TestPageCaptureTimeoutDuringStoreDiscardsResult is the same discard reached
+// by the other route: Capture's timeout arm clears the pending entry without
+// touching b.epoch, so entry identity — not the generation — is what must
+// catch this one.
+func TestPageCaptureTimeoutDuringStoreDiscardsResult(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := park(t, jobs, "wr_capture_request_timeout", handoffWork())
+	store := newBlockingCaptureStore(t)
+	b.pageCaptures = store
+	runSync(t, b, hello())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	captureResult := make(chan CaptureResult, 1)
+	go func() {
+		captureResult <- b.Capture(ctx, CaptureRequest{
+			URL: "https://sagepub.com/article/42", Provider: "sage", Scenario: "success",
+		})
+	}()
+	pending := awaitPendingCapture(t, b, testSessionID)
+	epochBefore := holderEpoch(b)
+
+	content := pageCapturePayload(t, []byte("<html>captured after the deadline</html>"))
+	content.Scenario = "success"
+	content.RequestID = pending.payload.RequestID
+	frame := inFrame(t, protocol.MsgPageCapture, jobID, content)
+	syncErr := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
+		syncErr <- err
+	}()
+	awaitCaptureWrite(t, store)
+
+	cancel()
+	select {
+	case result := <-captureResult:
+		if result.Outcome != "timeout" {
+			t.Fatalf("capture result = %#v, want timeout", result)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the timed-out capture caller was never answered")
+	}
+
+	close(store.release)
+	if err := <-syncErr; err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if epochAfter := holderEpoch(b); epochAfter != epochBefore {
+		t.Fatalf("epoch = %d, want %d: a timeout must not change the holder generation, or this test proves the wrong gate", epochAfter, epochBefore)
+	}
+	if path := capturePath(b, pending); path != "" {
+		t.Fatalf("pending.path = %q after the request timed out, want no correlated path", path)
+	}
+	if receipt := pageCaptureReceipt(t, jobs, jobID); receipt != nil {
+		t.Fatalf("page capture receipt = %#v, want none for a timed-out request", receipt)
+	}
+	if released := store.releasedJobs(); !slices.Contains(released, jobID) {
+		t.Fatalf("released jobs = %v, want the discarded capture's job %s released", released, jobID)
+	}
+}
+
+// TestUnsolicitedPageCaptureNotAttributedAcrossHolderChange isolates the epoch
+// gate. An unsolicited capture (the developer panel's captureFixture) has no
+// pending entry to invalidate, so nothing but the holder generation stands
+// between a write that outlives its holder and a receipt written onto the
+// replacement holder's job.
+func TestUnsolicitedPageCaptureNotAttributedAcrossHolderChange(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	jobID := park(t, jobs, "wr_capture_unsolicited_epoch", handoffWork())
+	store := newBlockingCaptureStore(t)
+	b.pageCaptures = store
+	runSync(t, b, hello())
+
+	frame := inFrame(t, protocol.MsgPageCapture, jobID, pageCapturePayload(t, []byte("<html>panel capture</html>")))
+	syncErr := make(chan error, 1)
+	go func() {
+		_, err := b.Sync(context.Background(), testSessionID, false, []json.RawMessage{frame})
+		syncErr <- err
+	}()
+	awaitCaptureWrite(t, store)
+
+	if _, err := b.Sync(context.Background(), testSessionID, true, nil); err != nil {
+		t.Fatalf("goodbye sync: %v", err)
+	}
+	close(store.release)
+	if err := <-syncErr; err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if receipt := pageCaptureReceipt(t, jobs, jobID); receipt != nil {
+		t.Fatalf("page capture receipt = %#v, want none once the capturing holder departed", receipt)
+	}
+	if released := store.releasedJobs(); !slices.Contains(released, jobID) {
+		t.Fatalf("released jobs = %v, want the discarded capture's job %s released", released, jobID)
+	}
+}
+
 func TestHelloIsAcknowledged(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	msgs, _ := runSync(t, b, hello())
@@ -1170,6 +1493,9 @@ func TestTriageSnapshotV3DeliveryLookupFailureDegradesGracefully(t *testing.T) {
 	// the triage query itself reads) are untouched, so a real, isolated
 	// storage failure surfaces exactly where triageDeliveryFor's error path
 	// is exercised, not as an incidental snapshot-wide failure.
+	if _, err := jobs.S.DB().ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TABLE delivery_requests`); err != nil {
 		t.Fatal(err)
 	}
@@ -15931,9 +16257,9 @@ func TestDeliveryReconcileConfirmExistsConvergesDriftAndReplaysAsNoOp(t *testing
 		DOI: "10.1234/bridge-delivery-exists", Title: "Bridge delivery exists", Year: 2026,
 	}, "openurl", "unknown_outcome", "old-reference")
 
-	action, err := b.openDocumentDeliveryAction(ctx, jobID)
-	if err != nil || action == nil {
-		t.Fatalf("openDocumentDeliveryAction = %#v, %v; want an open action", action, err)
+	action := openDocumentDeliveryActionForTest(t, jobs, jobID)
+	if action == nil {
+		t.Fatal("openDocumentDeliveryActionForTest() = nil, want an open action")
 	}
 	request := protocol.DeliveryReconcilePayload{
 		RequestID: "request-bridge-delivery-exists",

@@ -172,13 +172,9 @@ func TestBranchTable(t *testing.T) {
 	}
 }
 
-// A job's work identity is mutable: promotion can fill a missing DOI, after
-// which Describe() prefers it and the idempotency key changes. The key alone
-// then names no row, and reporting evaluate_gate would let the gate send a
-// second provider request while this job's earlier row still holds the old
-// key — one paper reaching a library twice, which the UNIQUE constraint
-// cannot catch because the keys differ.
-func TestBranchForJobPrefersTheJobsRowWhenTheKeyWasRecomputed(t *testing.T) {
+// A job's work identity is mutable. Its pinned request must govern routing
+// even after promotion changes the key a fresh work description would produce.
+func TestBranchForJobUsesPinnedRequestAfterIdentityMutation(t *testing.T) {
 	svc := testService(t, time.Now())
 	ctx := context.Background()
 	const jobID = "job_rekeyed"
@@ -207,19 +203,19 @@ func TestBranchForJobPrefersTheJobsRowWhenTheKeyWasRecomputed(t *testing.T) {
 		t.Fatalf("Lookup(rekeyed) = %+v, %v, want no row: the key must name nothing", orphan, err)
 	}
 
-	branch, row, err := svc.BranchForJob(ctx, jobID, rekeyed)
+	branch, row, err := svc.BranchForJob(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if branch != BranchReconcile {
-		t.Fatalf("BranchForJob(rekeyed) = %q, want reconcile: the job's unknown-outcome row governs, not the new key", branch)
+		t.Fatalf("BranchForJob() = %q, want reconcile: the job's pinned unknown-outcome row governs", branch)
 	}
 	if row == nil || row.ID != created.ID {
-		t.Fatalf("BranchForJob(rekeyed) row = %+v, want the job's existing row %d", row, created.ID)
+		t.Fatalf("BranchForJob() row = %+v, want the job's pinned row %d", row, created.ID)
 	}
 
-	// The key-only entry point keeps its documented contract: it cannot see
-	// across keys, which is why the delivery route no longer uses it.
+	// A bare key still cannot see across identities. The app route only uses
+	// this global lookup for a genuinely new job that has no pinned request.
 	keyOnly, keyRow, err := svc.Branch(ctx, rekeyed)
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +227,7 @@ func TestBranchForJobPrefersTheJobsRowWhenTheKeyWasRecomputed(t *testing.T) {
 	// A job with no row at all still reaches the gate, or nothing could ever
 	// take the delivery route in the first place.
 	testJob(t, svc, "job_never_routed")
-	fresh, freshRow, err := svc.BranchForJob(ctx, "job_never_routed", rekeyed)
+	fresh, freshRow, err := svc.BranchForJob(ctx, "job_never_routed")
 	if err != nil {
 		t.Fatal(err)
 	}

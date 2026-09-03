@@ -304,7 +304,7 @@ func addReadyPlanJob(t *testing.T, service *Service, requestID string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifactPath, err := service.Bundle.Artifacts.Promote(temp, sha)
+	artifactPath, _, err := service.Bundle.Artifacts.Promote(temp, sha)
 	if err != nil {
 		t.Fatal(err)
 	}

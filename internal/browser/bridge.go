@@ -41,7 +41,6 @@ import (
 	"papio/internal/batch"
 	"papio/internal/captures"
 	"papio/internal/config"
-	"papio/internal/delivery"
 	"papio/internal/grab"
 	"papio/internal/job"
 	"papio/internal/notify"
@@ -462,6 +461,10 @@ type Bridge struct {
 	// session keeps the unchanged page_capture content frame unambiguous.
 	pendingCaptures map[string]*pendingPageCapture
 	now             func() time.Time
+	// pageCaptures is the page-capture store seam; nil in production, where
+	// pageCaptureStore falls back to captureStore. Tests substitute a store
+	// whose write blocks to prove the write runs off b.mu.
+	pageCaptures pageCaptureStorer
 	// readDir is the adoption-directory ReadDir seam; nil in production,
 	// where readAdoptionDir falls back to os.ReadDir. Tests substitute a
 	// blocking or error-returning func to exercise adoptionScanSuspended
@@ -4094,11 +4097,47 @@ func isValidPageCaptureHost(host string) bool {
 	return pageCapHostRE.MatchString(host)
 }
 
+// pageCaptureStorer is the subset of *captures.Store that page-capture
+// ingress uses. It is an interface so a test can substitute a store whose
+// write blocks: proving that the write no longer runs under b.mu is
+// otherwise only reachable with a genuinely slow disk.
+type pageCaptureStorer interface {
+	StoreSanitizedPinned(ctx context.Context, jobID, host, scenario, adapterID, adapterVersion string, html []byte) (string, error)
+	ReleaseJob(ctx context.Context, jobID string) error
+}
+
+// pageCaptureStore resolves the page-capture write target. The seam field is
+// nil in production, and the fallback goes through the concrete typed field
+// on purpose: assigning a nil *captures.Store into an interface field would
+// yield a non-nil interface wrapping a nil pointer, defeating the
+// captures-disabled check below.
+func (b *Bridge) pageCaptureStore() pageCaptureStorer {
+	if b.pageCaptures != nil {
+		return b.pageCaptures
+	}
+	if b.captureStore == nil {
+		return nil
+	}
+	return b.captureStore
+}
+
 // pageCapture treats diagnostic content failures as local losses: disconnecting
 // the native session over a bad fixture would discard the handoff it was meant
 // to help diagnose.
+//
+// The caller holds b.mu (dispatch runs inside one Sync batch), and this
+// function releases it around every durable write. The capture payload is
+// bounded (2 MiB decompressed) but the write DURATION is not: the store does
+// MkdirAll, a path scan, two fsynced atomic writes, pin/index writes and a
+// per-host prune that stats every file for the host. Holding the session lock
+// across that makes a slow disk present to the user as session loss, because
+// Sessions/Claim/Capture/AnyFocused and every other Sync queue behind the
+// same mutex — the same failure class AGENTS.md records for adoption scans
+// wedging every daemon RPC. b.mu is held again on return, so Sync's own
+// invariants are unchanged; its scheduler window (see Sync) is the precedent.
 func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, payload *protocol.PageCapturePayload) {
-	if !b.cfg.Captures.Enabled || b.captureStore == nil {
+	store := b.pageCaptureStore()
+	if !b.cfg.Captures.Enabled || store == nil {
 		return
 	}
 	if !isValidPageCaptureHost(payload.Host) {
@@ -4116,11 +4155,6 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 	html, err := decodePageCapture(payload)
 	if err != nil {
 		log.Printf("papio: ignoring page capture from %s: %v", payload.Host, err)
-		return
-	}
-	path, err := b.captureStore.StoreSanitizedPinned(ctx, jobID, payload.Host, payload.Scenario, payload.AdapterID, payload.AdapterVersion, html)
-	if err != nil {
-		log.Printf("papio: storing page capture from %s: %v", payload.Host, err)
 		return
 	}
 	// Correlate strictly on the echoed request id. A requested capture carries
@@ -4142,23 +4176,72 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 	// ordinary cross-host redirect (www canonicalization, a CDN host swap, an
 	// SSO round-trip) makes the two differ and turns a real "captured" into a
 	// reported "nav_failed" with no path.
-	if pending := b.pendingCaptures[sessionID]; pending != nil &&
+	//
+	// The correlation is resolved HERE, under the lock, and revalidated after
+	// the write: identity is only meaningful as of a single critical section.
+	var pending *pendingPageCapture
+	if candidate := b.pendingCaptures[sessionID]; candidate != nil &&
 		payload.RequestID != "" &&
-		pending.payload.RequestID == payload.RequestID {
+		candidate.payload.RequestID == payload.RequestID {
+		pending = candidate
+	}
+	epochAtStore := b.epoch
+
+	b.mu.Unlock()
+	path, storeErr := store.StoreSanitizedPinned(ctx, jobID, payload.Host, payload.Scenario, payload.AdapterID, payload.AdapterVersion, html)
+	b.mu.Lock()
+	if storeErr != nil {
+		log.Printf("papio: storing page capture from %s: %v", payload.Host, storeErr)
+		return
+	}
+	// Revalidate the identity the write was started for. release() drops the
+	// pending capture and increments b.epoch when a holder departs, promote()
+	// takes a fresh holder generation, and Capture's timeout arm deletes the
+	// pending entry — any of which can happen inside the window above. Entry
+	// identity keeps pending.path off a NEW request; the epoch additionally
+	// keeps this capture's receipt off a REPLACEMENT holder's job.
+	staleCorrelation := pending != nil &&
+		(b.pendingCaptures[sessionID] != pending || pending.payload.RequestID != payload.RequestID)
+	if b.epoch != epochAtStore || staleCorrelation {
+		log.Printf("papio: discarding page capture from %s: the request it answers is no longer current", payload.Host)
+		b.releaseStoredCaptureUnlocked(ctx, store, jobID)
+		return
+	}
+	if pending != nil {
 		pending.path = path
 	}
 	if jobID == "" || b.jobs == nil {
 		return
 	}
-	if err := b.jobs.RecordEvent(ctx, jobID, "browser.page_capture", map[string]any{
+	detail := map[string]any{
 		"host":            payload.Host,
 		"scenario":        payload.Scenario,
 		"adapter_id":      payload.AdapterID,
 		"adapter_version": payload.AdapterVersion,
 		"path":            path,
 		"size_bytes":      len(html),
-	}); err != nil {
-		log.Printf("papio: recording page capture for job %s: %v", jobID, err)
+	}
+	b.mu.Unlock()
+	recordErr := b.jobs.RecordEvent(ctx, jobID, "browser.page_capture", detail)
+	b.mu.Lock()
+	if recordErr != nil {
+		log.Printf("papio: recording page capture for job %s: %v", jobID, recordErr)
+	}
+}
+
+// releaseStoredCaptureUnlocked drops the provisional lease on a capture whose
+// correlation expired while it was being written. Without it the pinned file
+// would survive every prune with no request and no receipt to claim it. The
+// caller holds b.mu; it is released around the write and held again on return.
+func (b *Bridge) releaseStoredCaptureUnlocked(ctx context.Context, store pageCaptureStorer, jobID string) {
+	if jobID == "" {
+		return // an unpinned capture is ordinary prunable diagnostic content
+	}
+	b.mu.Unlock()
+	err := store.ReleaseJob(ctx, jobID)
+	b.mu.Lock()
+	if err != nil {
+		log.Printf("papio: releasing discarded page capture for job %s: %v", jobID, err)
 	}
 }
 
@@ -5044,110 +5127,54 @@ func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecid
 	if b.triage == nil || b.watchRunner == nil {
 		return b.triageDecisionResult(request.RequestID, "error", "triage mutations are not configured")
 	}
-	if strings.HasPrefix(request.ItemID, triage.RetractionIDPrefix) {
-		return b.acknowledgeRetraction(ctx, request)
-	}
-	hit, err := b.triage.FindWatchHit(ctx, request.ItemID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return b.triageDecisionResult(request.RequestID, "conflict", "")
-	}
-	if err != nil {
-		return b.triageDecisionResult(request.RequestID, "error", err.Error())
-	}
-	if request.Op == "acquire" {
-		targets := make([]watch.DigestTarget, 0, len(hit.Watches))
-		for _, watched := range hit.Watches {
-			targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
-		}
-		if err := b.watchRunner.AcquireDigests(ctx, targets); err != nil {
-			if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-				return b.triageDecisionResult(request.RequestID, "conflict", "")
-			}
+	scope := triage.WatchScope{}
+	if request.Op == string(triage.DecisionDismiss) {
+		var err error
+		scope, err = decodeTriageDismissScope(request.WatchScope)
+		if err != nil {
 			return b.triageDecisionResult(request.RequestID, "error", err.Error())
 		}
-		return b.triageDecisionResult(request.RequestID, "applied", "")
 	}
-	selected, err := triageDismissScope(request.WatchScope, hit.Watches)
+	result, err := b.triage.Decide(ctx, triage.DecisionInput{
+		ItemID: request.ItemID, Operation: triage.DecisionOperation(request.Op), Scope: scope,
+	}, b.watchRunner)
 	if err != nil {
 		return b.triageDecisionResult(request.RequestID, "error", err.Error())
 	}
-	targets := make([]watch.DigestTarget, 0, len(hit.Watches))
-	for _, watched := range hit.Watches {
-		if !selected[watched.ID] {
-			continue
-		}
-		targets = append(targets, watch.DigestTarget{WatchID: watched.ID, WorkKey: watched.WorkKey})
+	outcome := string(result.Outcome)
+	if result.Outcome == triage.DecisionInvalid {
+		outcome = "error"
 	}
-	if err := b.watchRunner.ConsumeDigests(ctx, targets); err != nil {
-		if errors.Is(err, watch.ErrDigestEntryNotFound) || errors.Is(err, sql.ErrNoRows) {
-			return b.triageDecisionResult(request.RequestID, "conflict", "")
-		}
-		return b.triageDecisionResult(request.RequestID, "error", err.Error())
-	}
-	return b.triageDecisionResult(request.RequestID, "applied", "")
+	return b.triageDecisionResult(request.RequestID, outcome, result.Detail)
 }
 
-// acknowledgeRetraction clears one Crossref update notice. A retraction notice
-// carries no watch digest to consume, so watch_scope is not consulted: the
-// notice itself is the unit of dismissal.
-func (b *Bridge) acknowledgeRetraction(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
-	if request.Op != "dismiss" {
-		return b.triageDecisionResult(request.RequestID, "error", "retraction notices support only the dismiss operation")
-	}
-	applied, err := b.triage.AcknowledgeRetraction(ctx, request.ItemID)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return b.triageDecisionResult(request.RequestID, "conflict", "")
-	case err != nil:
-		return b.triageDecisionResult(request.RequestID, "error", err.Error())
-	case applied:
-		return b.triageDecisionResult(request.RequestID, "applied", "")
-	default:
-		return b.triageDecisionResult(request.RequestID, "already_applied", "")
-	}
-}
-
-// triageDismissScope resolves the extension's watch_scope into the exact set of
-// watch digests a dismissal may consume. It mirrors the API/CLI half in
-// internal/api/triage.go: an absent scope, a bare string other than "all", an
-// empty list, more than 100 IDs, a non-positive ID, an ID the hit does not own,
-// a duplicate ID, and trailing JSON after the list are all refused, and a
-// refusal consumes nothing. The wire shape differs - the IPC half answers
-// invalid_argument, this half answers a structured "error" outcome - but the
-// decision must not, or a scope the CLI rejects silently clears digests here.
-func triageDismissScope(raw json.RawMessage, watches []triage.Watch) (map[int64]bool, error) {
+// decodeTriageDismissScope owns browser JSON decoding. The triage service
+// receives the normalized scope and validates it against the current hit.
+func decodeTriageDismissScope(raw json.RawMessage) (triage.WatchScope, error) {
 	if len(raw) == 0 {
-		return nil, errors.New("watch_scope is required for dismiss")
+		return triage.WatchScope{}, errors.New("watch_scope is required for dismiss")
 	}
 	var all string
 	if err := json.Unmarshal(raw, &all); err == nil {
 		if all != "all" {
-			return nil, errors.New("watch_scope must be all or watch IDs")
+			return triage.WatchScope{}, errors.New("watch_scope must be all or watch IDs")
 		}
-		selected := make(map[int64]bool, len(watches))
-		for _, watched := range watches {
-			selected[watched.ID] = true
-		}
-		return selected, nil
+		return triage.WatchScope{All: true}, nil
 	}
-	// Unmarshal, not Decoder.Decode: it refuses trailing bytes after the list
-	// instead of silently accepting a truncated-then-garbage payload.
 	var ids []int64
 	if err := json.Unmarshal(raw, &ids); err != nil || len(ids) == 0 || len(ids) > 100 {
-		return nil, errors.New("watch_scope must be all or 1 to 100 watch IDs")
+		return triage.WatchScope{}, errors.New("watch_scope must be all or 1 to 100 watch IDs")
 	}
-	available, selected := make(map[int64]bool, len(watches)), make(map[int64]bool, len(ids))
-	for _, watched := range watches {
-		available[watched.ID] = true
-	}
+	seen := make(map[int64]bool, len(ids))
 	for _, id := range ids {
-		if id <= 0 || !available[id] || selected[id] {
-			return nil, errors.New("watch_scope contains an invalid watch ID")
+		if id <= 0 || id > protocol.MaxBrowserInteger || seen[id] {
+			return triage.WatchScope{}, errors.New("watch_scope contains an invalid watch ID")
 		}
-		selected[id] = true
+		seen[id] = true
 	}
-	return selected, nil
+	return triage.WatchScope{WatchIDs: ids}, nil
 }
+
 func (b *Bridge) dismissPdfGrab(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
 	if request.Op != "dismiss" {
 		return b.triageDecisionResult(request.RequestID, "error", "pdf grabs support only the dismiss operation")
@@ -5245,218 +5272,27 @@ func (b *Bridge) humanActionResolveResult(requestID, outcome, detail string) ([]
 	return []json.RawMessage{frame}, nil
 }
 
-// deliveryReconcile executes one of Decision 4's two document_delivery
-// reconciliation mutations (confirm_request_exists/confirm_request_absent)
-// against a job's open document_delivery human action. It is a new message
-// rather than a widened human_action_resolve — see
-// protocol.DeliveryReconcilePayload's doc comment — and mirrors
-// internal/api/delivery.go's deliveryAction so the two surfaces (CLI/MCP and
-// browser) leave a job in the exact same state for the same operator
-// decision. Every failure encodes into the result frame's outcome/detail
-// (never a raw Go error), matching every other bridge handler.
+// deliveryReconcile delegates both Decision 4 mutations to app.Service. The
+// bridge owns only result-frame encoding. Every ordinary domain failure stays
+// inside a structured result frame so it cannot terminate the browser session.
 func (b *Bridge) deliveryReconcile(ctx context.Context, request *protocol.DeliveryReconcilePayload) ([]json.RawMessage, error) {
-	if b.jobs == nil || b.svc == nil || b.svc.Delivery == nil {
+	if b.svc == nil {
 		return b.deliveryReconcileResult(request.RequestID, "error", "document delivery is not configured")
 	}
-	action, err := b.openDocumentDeliveryAction(ctx, request.JobID)
+	_, err := b.svc.ReconcileDelivery(ctx, app.DeliveryReconciliationInput{
+		JobID: request.JobID, Operation: app.DeliveryReconciliationOperation(request.Operation), ProviderReference: request.ProviderReference,
+	})
 	if err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	if action == nil {
-		return b.deliveryReconcileResult(request.RequestID, "already_applied", "no open document_delivery action for this job")
-	}
-	row, err := b.svc.Delivery.GetByJobID(ctx, request.JobID)
-	if err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	if row == nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", "no delivery request for this job")
-	}
-	switch request.Operation {
-	case "confirm_request_exists":
-		return b.deliveryConfirmRequestExists(ctx, request, action, row)
-	case "confirm_request_absent":
-		return b.deliveryConfirmRequestAbsent(ctx, request, action, row)
-	default:
-		return b.deliveryReconcileResult(request.RequestID, "error", "unknown operation "+request.Operation)
-	}
-}
-
-// openDocumentDeliveryAction finds the one open document_delivery human
-// action Decision 4 says a job in this reconciliation state must have.
-// (nil, nil) means none is open — a routine race with a concurrent
-// resolution, not an error.
-func (b *Bridge) openDocumentDeliveryAction(ctx context.Context, jobID string) (*job.HumanAction, error) {
-	actions, err := b.jobs.ListHumanActionsForJob(ctx, jobID)
-	if err != nil {
-		return nil, err
-	}
-	for _, a := range actions {
-		if a.Action.Kind == job.ActionKindDocumentDelivery && a.Action.Status == "open" {
-			action := a.Action
-			return &action, nil
+		switch {
+		case errors.Is(err, app.ErrDeliveryNotConfigured):
+			return b.deliveryReconcileResult(request.RequestID, "error", "document delivery is not configured")
+		case errors.Is(err, app.ErrDeliveryRequestNotFound), errors.Is(err, app.ErrDeliveryReconciliationNotFound):
+			return b.deliveryReconcileResult(request.RequestID, "already_applied", err.Error())
+		default:
+			return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 		}
-	}
-	return nil, nil
-}
-
-// deliveryConfirmRequestExists mirrors internal/api's deliveryConfirmRequestExists:
-// the row moves to pending with the human-supplied provider reference, the
-// document_delivery action closes, and the job resumes as an ordinary
-// pending delivery poll (StateRetryWait, RetryReasonDocumentDeliveryPending)
-// — never retry_submission.
-func (b *Bridge) deliveryConfirmRequestExists(ctx context.Context, request *protocol.DeliveryReconcilePayload, action *job.HumanAction, row *delivery.Request) ([]json.RawMessage, error) {
-	profile, err := b.svc.Delivery.ResolveGateProfileFor(ctx, row.InstitutionProfile)
-	if err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	next := delivery.NextCheck(b.now(), 0, profile.StatusPollMinutes)
-	repairDetail := map[string]any{"reason": "document_delivery_confirmed_exists"}
-	repairDetail["from"], repairDetail["to"] = job.StateAwaitingHuman, job.StateResolving
-	repairJSON, err := marshalJobDetail(repairDetail)
-	if err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	retryDetail := map[string]any{"reason": job.RetryReasonDocumentDeliveryPending, "provider_reference": request.ProviderReference}
-	retryDetail["from"], retryDetail["to"] = job.StateResolving, job.StateRetryWait
-	retryJSON, err := marshalJobDetail(retryDetail)
-	if err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	// One threaded tx: delivery row mutations + job transitions atomically.
-	// Human action closed LAST via RepairAwaitingHumanTx.
-	db := b.svc.Delivery.DB()
-	if db == nil {
-		// This used to fall back to an ordered, non-atomic apply. Refuse
-		// instead: a reconciliation verdict that is only partly durable is
-		// worse than one that did not run, and the fallback was a second
-		// copy of this operation that no test exercised.
-		return b.deliveryReconcileResult(request.RequestID, "error", "delivery store is unavailable")
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := b.svc.Delivery.UpdateStateTx(ctx, tx, row.ID, delivery.StatePending); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	if err := b.svc.Delivery.RecordPollTx(ctx, tx, row.ID, request.ProviderReference, next); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	now := bridgeNow()
-	if err := b.jobs.RepairAwaitingHumanTx(ctx, tx, request.JobID, []int64{action.ID}, string(repairJSON), now); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	if err := b.jobs.TransitionTx(ctx, tx, request.JobID, job.StateResolving, job.StateRetryWait, string(retryJSON), job.TransitionTxConfig{RetryAt: next.UTC().Format(time.RFC3339Nano)}, now); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	if err := tx.Commit(); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
 	}
 	return b.deliveryReconcileResult(request.RequestID, "applied", "")
-}
-
-// deliveryConfirmRequestAbsent mirrors internal/api's
-// deliveryConfirmRequestAbsent: the stale row is cancelled, the
-// document_delivery action closes, and the job re-enters the shared
-// Branch/gate seam (app.Service.SubmitDelivery) — never a duplicated policy
-// implementation, and never a second live request for this idempotency key.
-//
-// The order is load-bearing, and it must stay identical to internal/api's:
-// RepairAwaitingHuman is the allowed awaiting_human->resolving edge, and
-// SubmitDelivery's reconciliation park is the allowed resolving->awaiting_human
-// one. Cancel->Submit->Repair looks safer, because a Submit failure leaves the
-// action open, but Submit then sees the job still in awaiting_human and
-// attempts awaiting_human->awaiting_human, which the state graph rejects: on a
-// normally parked job every confirm-absent failed with a job state conflict
-// after already cancelling the row. Cancel, Repair, Submit is the only legal
-// order. If Submit fails after Repair, re-open a reconciliation action so the
-// operator never loses the affordance — a cancelled row is a documented
-// recoverable state.
-//
-// Cancel and Repair share ONE tx, mirroring internal/api and this file's own
-// exists sibling. Committing the cancellation separately made a losing
-// verdict destructive: a confirm-exists arriving from the CLI between this
-// handler's read and its write closes the action, this Repair then fails, and
-// nothing rolled the cancellation back — the winner's confirmed live provider
-// request was left locally cancelled. Repair doubles as the staleness guard,
-// because it refuses an already-closed action and takes the cancellation down
-// with it.
-func (b *Bridge) deliveryConfirmRequestAbsent(ctx context.Context, request *protocol.DeliveryReconcilePayload, action *job.HumanAction, row *delivery.Request) ([]json.RawMessage, error) {
-	if err := b.cancelAndCloseReconciliation(ctx, request.JobID, action.ID, row.ID); err != nil {
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	if _, err := b.svc.SubmitDelivery(ctx, request.JobID); err != nil {
-		ref := row.ProviderReference
-		if ref == "" {
-			ref = "(no provider reference recorded)"
-		}
-		detail := fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
-			row.Provider, ref, string(delivery.StateCancelled), request.JobID)
-		// Park first, then open the prompt. The reverse order — which this
-		// and internal/api both used — could commit the action and then fail
-		// the transition, leaving an open document_delivery prompt on a job
-		// still in resolving. Triage lists open actions without filtering on
-		// job state, so the inbox offered that prompt while acting on it
-		// failed: RepairAwaitingHuman only accepts awaiting_human. Parking
-		// first cannot produce that state. If the park fails no prompt is
-		// opened and the unleased resolving job is re-driven by the
-		// scheduler; if the park lands and the open fails, the job is parked
-		// with no action, which is the orphan state jobs.repair already
-		// names and recovers.
-		if parkErr := b.jobs.Transition(ctx, request.JobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"}); parkErr == nil {
-			_, _ = b.jobs.OpenHumanAction(ctx, request.JobID, job.ActionKindDocumentDelivery, detail, job.Access(false, ""))
-		}
-		return b.deliveryReconcileResult(request.RequestID, "error", err.Error())
-	}
-	return b.deliveryReconcileResult(request.RequestID, "applied", "")
-}
-
-// cancelAndCloseReconciliation commits the confirm-absent verdict's two
-// durable effects together: the stale delivery row becomes cancelled and the
-// open document_delivery action closes as an awaiting_human->resolving
-// repair. Either both land or neither does, so a concurrent confirm-exists
-// that already closed the action cannot be left with its confirmed live
-// request cancelled underneath it.
-func (b *Bridge) cancelAndCloseReconciliation(ctx context.Context, jobID string, actionID, rowID int64) error {
-	repairJSON, err := marshalJobDetail(map[string]any{"reason": "document_delivery_confirmed_absent"})
-	if err != nil {
-		return err
-	}
-	db := b.svc.Delivery.DB()
-	if db == nil {
-		// Same refusal as the exists sibling: without a transaction this
-		// verdict cannot be applied atomically, and half of it is worse than
-		// none of it.
-		return errors.New("delivery store is unavailable")
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := b.svc.Delivery.UpdateStateTx(ctx, tx, rowID, delivery.StateCancelled); err != nil {
-		return err
-	}
-	if err := b.jobs.RepairAwaitingHumanTx(ctx, tx, jobID, []int64{actionID}, repairJSON, bridgeNow()); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func marshalJobDetail(detail map[string]any) (string, error) {
-	data, err := json.Marshal(detail)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func bridgeNow() string {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	// Use store.Now() format; time.Now is fine for bridge context.
-	return now
 }
 
 func (b *Bridge) deliveryReconcileResult(requestID, outcome, detail string) ([]json.RawMessage, error) {

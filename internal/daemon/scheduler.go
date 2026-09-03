@@ -33,6 +33,13 @@ type Processor interface {
 	Process(context.Context, *job.Row) error
 }
 
+// publicationRecoverer restores durable publication work before stale-job
+// recovery can rewind its transition state or quarantine cleanup can remove
+// journal-owned bytes.
+type publicationRecoverer interface {
+	RecoverPreparedPublications(context.Context) error
+}
+
 // ProcessorFunc adapts a function into a Processor.
 type ProcessorFunc func(context.Context, *job.Row) error
 
@@ -130,6 +137,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 	if ctx.Err() != nil {
 		return nil
+	}
+	if recovery, ok := s.Processor.(publicationRecoverer); ok {
+		if err := recovery.RecoverPreparedPublications(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("recover prepared publications: %w", err)
+		}
 	}
 	if _, err := s.Store.RecoverStale(ctx); err != nil {
 		if ctx.Err() != nil {

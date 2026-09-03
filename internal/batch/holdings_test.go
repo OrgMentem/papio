@@ -4,32 +4,26 @@ package batch
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
 	"papio/internal/ipc"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
-	"papio/internal/zotio"
 )
 
 // holdingsCaller answers library.lookup_works with a canned result and records
 // which methods the batch path reached.
 type holdingsCaller struct {
-	mu       sync.Mutex
+	baseBatchCaller
+	methodRecorder
 	result   ownership.Result
-	methods  []string
 	unknown  bool
 	submitID string
 }
 
-func (c *holdingsCaller) Call(_ context.Context, method string, params, result any) error {
-	c.mu.Lock()
-	c.methods = append(c.methods, method)
-	c.mu.Unlock()
+func (c *holdingsCaller) Call(ctx context.Context, method string, params, result any) error {
+	c.record(method)
 	switch method {
 	case "library.lookup_works":
 		if c.unknown {
@@ -41,36 +35,16 @@ func (c *holdingsCaller) Call(_ context.Context, method string, params, result a
 		if len(out.Works) == 0 {
 			out.Works = make([]ownership.WorkResult, len(request.Works))
 		}
-	case "zotio.lookup_works":
-		request := params.(zotio.LookupWorksRequest)
-		out := result.(*zotio.LookupWorksResult)
-		out.Works = make([]zotio.WorkOwnership, len(request.Works))
-		for i := range request.Works {
-			out.Works[i].Status = zotio.OwnershipNotOwned
-		}
 	case "acquire.submit_v2":
 		id := c.submitID
 		if id == "" {
 			id = "job-holdings"
 		}
 		result.(*submitResult).JobID = id
-	case "jobs.get":
-		result.(*jobDetail).Job = json.RawMessage(`{"id":"job-x","state":"queued"}`)
 	default:
-		return fmt.Errorf("unexpected method %q", method)
+		return c.baseBatchCaller.Call(ctx, method, params, result)
 	}
 	return nil
-}
-
-func (c *holdingsCaller) called(method string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, seen := range c.methods {
-		if seen == method {
-			return true
-		}
-	}
-	return false
 }
 
 func holdingsRequest(doi string) protocol.WorkRequest {

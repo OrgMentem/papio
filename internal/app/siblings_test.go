@@ -384,7 +384,7 @@ func TestTypedRelationsRateLimitParksInsteadOfSettling(t *testing.T) {
 	if len(cands) != 0 {
 		t.Fatalf("typed candidates = %#v, want none on a rate limit", cands)
 	}
-	if plan.TemporaryResolvers != 1 || plan.ResolverTemporary.IsZero() {
+	if plan.temporary().IsZero() || plan.kind() != retryKindTemporary {
 		t.Fatalf("plan = %+v, want the 429 recorded as retryable: at the exhaustion boundary a missing retry time is the difference between parking and giving up", plan)
 	}
 }
