@@ -400,7 +400,8 @@ the generator, locator AST, or generated fixtures ship in Phase 0. The current
 authority is the packaged adapter plus the complete `Plan`.
 
 The current CSS-based adapter schema is source-controlled, store-reviewed, and
-already exercises the production `interpret` function. A custom locator AST is
+already exercises the production planner `planExecution`
+(`extension/src/plan.ts`). A custom locator AST is
 not a prerequisite for the adapter patch generator and does not by itself make
 a selected action safe.
 

@@ -171,3 +171,46 @@ If someone returns to this, the bar is: a mechanism whose safety comes from what
 it structurally cannot express, evaluated by an oracle that models the *action*
 and not just the DOM, or a suppression-only design that cannot increase what papio
 does with the operator's session.
+
+## Addendum, 2026-09-03: one provider-rule classifier, and a verdict is not authority
+
+This addendum is normative and self-contained. It narrows one sentence above and
+records two rules that were previously only in code comments.
+
+**One evaluator.** `extension/src/plan.ts:planExecution` is the sole
+provider-rule classifier. The second copy this ADR's Context describes — a pure
+DOM-only function in `extension/src/adapters/types.ts` — is deleted. Production
+injects `planExecution` verbatim through `chrome.scripting.executeScript`, so its
+body must reference no module import, helper, or closure; a module-level *type*
+is erased and therefore permitted, a module-level value is not. Any future
+proposal that adds a second body which turns a spec into a verdict is refused for
+the same reason a runtime amendment is: it makes the fixture-backed contract
+describe something other than what runs.
+
+**A verdict is an observation, not authority.** The section "Classification
+selectors are authorization" above says a decisive verdict has operational
+consequences. That is now too broad, and the distinction matters. The planner
+returns `PlanResult`, either a `Plan` or an `AssistedPlan`, and BOTH carry the
+verdict the same evaluation pass computed — `buildPlan` classifies once, calls
+`composePlan`, and attaches that one verdict to either shape. So a decisive
+verdict can exist on a result the planner explicitly refused.
+
+The rules that follow from that:
+
+1. The presence of `assisted` is the ONLY discriminator for effect authority. A
+   verdict never grants it, and the absence of a verdict never withholds it.
+2. Only a `PlanResult` with no `assisted` key may reach an effect path. Every
+   production consumer MUST narrow on `assisted` BEFORE reading any other field,
+   because both shapes now share fields and a common-field read type-checks
+   against an unnarrowed result.
+3. Classification is a necessary guard, not a sufficient one. An effect path must
+   still check the plan's own `method` and `target_ref`; a `Plan` for a passive
+   verdict carries neither and authorizes nothing.
+4. A retained verdict may be reported — to a diagnostic tool, a test, or a log —
+   and MUST NOT widen what crosses the wire. `PageVerdict` appears in no IPC
+   result and no browser protocol frame, and its `evidence` entries stay static
+   rule labels so no page-derived text escapes this boundary.
+
+Rule 2 is the one that decays quietly. It is a convention the type system stopped
+enforcing when the shapes converged, so it wants a test that fails when a
+consumer reads a verdict off an unnarrowed result, not a comment.

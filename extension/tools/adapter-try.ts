@@ -267,6 +267,79 @@ function printClassifyRules(doc: Document, spec: AdapterSpec): void {
   }
 }
 
+// ---- planner outcome --------------------------------------------------------
+// Which outcome planExecution produced is the first thing an adapter author
+// needs, and there are three of them, not two. Read them off the result's own
+// fields — never off a list of verdict kinds — so a verdict kind added later
+// is described by the plan it actually produces instead of by a list this
+// tool would have to remember to update:
+//
+//   refused  an AssistedReason and no Plan, so nothing is executable and the
+//            planner's own reason says why;
+//   passive  composePlan's `base` Plan: no method, no target_ref,
+//            required_consequence "none". Every non-article verdict plans
+//            exactly this, and for those verdicts it is the correct result,
+//            not a failure;
+//   action   a Plan with a download method on a resolved target_ref.
+//
+// A terms verdict also plans `base`, but with a terms-accept target in its
+// effect graph — background.ts drives that target when primary_target is
+// null — so it is reported on its own rather than as "nothing to execute".
+type PlanState =
+  | { kind: "refused"; reason: string }
+  | { kind: "action"; method: NonNullable<Plan["method"]>; url: string | null }
+  | { kind: "terms" }
+  | { kind: "passive" }
+  | { kind: "incomplete"; detail: string };
+
+function planStateOf(plan: Plan | undefined, assisted: string | null): PlanState {
+  if (assisted !== null) return { kind: "refused", reason: assisted };
+  if (plan === undefined) return { kind: "refused", reason: "the planner returned no plan" };
+  const { method, target_ref: target, url, required_consequence: consequence } = plan;
+  if (method !== null && target !== null) return { kind: "action", method, url };
+  if (method === null && target === null) {
+    if (plan.effect_graph.terms_target !== null) return { kind: "terms" };
+    if (consequence === "none") return { kind: "passive" };
+  }
+  // composePlan sets method, target_ref and required_consequence together, so
+  // this shape is not reachable from it today. Report the fields as they are
+  // rather than guess which half is missing.
+  return {
+    kind: "incomplete",
+    detail: `method ${method ?? "none"}, target ${target === null ? "none" : "resolved"}, required consequence ${consequence}`,
+  };
+}
+
+/** The `executable:` line. Short on purpose: it is the line read first.
+ * `actionDeclared` says whether the spec itself declares a download action
+ * for this verdict, so "this is correct, not a failure" is a statement about
+ * the spec rather than an assertion this tool makes on its own. */
+function executableLine(state: PlanState, verdictKind: string, actionDeclared: boolean): string {
+  switch (state.kind) {
+    case "refused":
+      return `NO — classified ${verdictKind}, but not executable because ${state.reason}`;
+    case "action":
+      return `yes — the plan carries a "${state.method}" action on a resolved target`;
+    case "terms":
+      return "no download action — the plan carries only a terms-accept target";
+    case "passive":
+      return actionDeclared
+        ? `no action — the plan carries no method and no target, yet the spec declares a download action for ${verdictKind}`
+        : `no action — the plan carries no method and no target (the spec declares no download action for ${verdictKind}, so this is correct, not a failure)`;
+    case "incomplete":
+      return `no action — the plan is incomplete (${state.detail})`;
+  }
+}
+
+/** Why no download URL was resolved, for the states where the planner
+ * produced no action. Never a list of hypothetical causes: in every one of
+ * these states the real cause is already known and printed above. */
+function unresolvedBecause(state: PlanState): string {
+  return state.kind === "refused"
+    ? "not attempted — the planner stayed assisted (reason above)"
+    : "not attempted — the planner planned no download action for this verdict";
+}
+
 
 // resolveDownloadURL is the live API-only resolver. The declarative href/meta
 // planning and URL construction above come from planExecution; this helper is
@@ -325,7 +398,7 @@ async function tryResolveViaBackground(
 async function printDownloadResolution(
   doc: Document,
   rule: DownloadRule,
-  plan: Plan | undefined,
+  state: PlanState,
   allowNetwork: boolean,
 ): Promise<void> {
   console.log("\nDownload resolution (verdict is article; spec declares a download rule)");
@@ -338,7 +411,18 @@ async function printDownloadResolution(
     case "href":
     case "meta":
       if (rule.method === "meta") console.log(`  metaName: ${rule.metaName ?? "citation_pdf_url"}`);
-      console.log(`  url:      ${plan?.url ?? "(none — selector missing, target is not unique, or URL not https)"}`);
+      if (state.kind !== "action") {
+        // No speculative cause list here. In every non-action state the
+        // planner's real reason is already printed above, and naming a
+        // missing selector, a non-unique target and a non-https URL would
+        // name three causes that are all false: an assisted href/meta plan
+        // got as far as a resolved, unique target and never evaluated a URL.
+        console.log(`  url:      ${unresolvedBecause(state)}`);
+        break;
+      }
+      // planExecution refuses an href/meta article plan whose URL is not a
+      // distinct HTTPS URL, so an action plan for this rule always carries one.
+      console.log(`  url:      ${state.url ?? "(none — planExecution planned this action with no URL)"}`);
       break;
     case "url":
     case "api": {
@@ -348,8 +432,11 @@ async function printDownloadResolution(
         );
         break;
       }
-      if (plan === undefined) {
-        console.log("  url:      not resolvable offline (planner stayed assisted)");
+      if (state.kind !== "action") {
+        // Also the gate on the live fetch below: resolving a rule the planner
+        // planned no action for would hit a credentialed endpoint for an
+        // effect nothing authorized.
+        console.log(`  url:      ${unresolvedBecause(state)}`);
         break;
       }
       if (rule.method === "api") {
@@ -369,7 +456,13 @@ async function printDownloadResolution(
       break;
     }
     case "click":
-      console.log('  url:      not resolvable offline (method "click" requires a real user gesture against a live page)');
+      // Even here the planner's own refusal outranks the method-intrinsic
+      // reason: with no action planned, no gesture was ever the blocker.
+      console.log(
+        state.kind === "action"
+          ? '  url:      not resolvable offline (method "click" requires a real user gesture against a live page)'
+          : `  url:      ${unresolvedBecause(state)}`,
+      );
       break;
   }
 }
@@ -424,6 +517,10 @@ async function main(): Promise<void> {
   const plan = "assisted" in planned ? undefined : planned;
   const assisted = "assisted" in planned ? planned.assisted : null;
   const verdict = verdictOf(planned);
+  // One classification of what the planner produced, shared by the
+  // `executable:` line and the download-resolution block, so the two can
+  // never describe the same result differently.
+  const state = planStateOf(plan, assisted);
 
   console.log(`=== adapter-try: ${spec.id}@${spec.version} vs ${args.htmlPath} ===\n`);
   console.log("Verdict");
@@ -432,16 +529,15 @@ async function main(): Promise<void> {
   console.log(`  adapter_version: ${verdict.adapter_version}`);
   console.log("  evidence:");
   for (const line of verdict.evidence) console.log(`    - ${line}`);
-  console.log(
-    assisted === null
-      ? "  executable:      yes (the planner returned an executable plan)"
-      : `  executable:      NO — classified ${verdict.kind}, but not executable because ${assisted}`,
-  );
+  // Read off the spec, not off a verdict-kind list: the spec is what decides
+  // whether an action was ever meant to be planned for this classification.
+  const actionDeclared = spec.download !== undefined && spec.download.requireKind === verdict.kind;
+  console.log(`  executable:      ${executableLine(state, verdict.kind, actionDeclared)}`);
 
   printClassifyRules(doc, spec);
 
   if (verdict.kind === "article" && spec.download !== undefined) {
-    await printDownloadResolution(doc, spec.download, plan, args.allowNetwork);
+    await printDownloadResolution(doc, spec.download, state, args.allowNetwork);
   }
 
   console.log("");
@@ -462,10 +558,15 @@ async function main(): Promise<void> {
     console.log(`Result: PASS (--expect ${args.expect} matched)`);
     process.exit(0);
   }
+  // Same three states as the `executable:` line, so the last line a reader
+  // sees cannot call a plan with no action "planned successfully". `--expect`
+  // still owns the exit code; every branch here exits 0 as before.
   console.log(
-    assisted === null
-      ? "Result: planned successfully (no --expect given)"
-      : "Result: planned, but assisted — no executable action (no --expect given)",
+    state.kind === "action"
+      ? "Result: planned an executable action (no --expect given)"
+      : state.kind === "refused"
+        ? "Result: planned, but assisted — no executable action (no --expect given)"
+        : "Result: planned, no executable action (no --expect given)",
   );
   process.exit(0);
 }

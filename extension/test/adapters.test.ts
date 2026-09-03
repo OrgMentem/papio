@@ -3268,9 +3268,33 @@ test("another ready rule cannot wake a deadline-only rule early", async () => {
 
 test("a late-hydrating non-article rule settles inside the 50 ms window", async () => {
   // The settle window is what stops a ready non-article rule from waiting out
-  // the whole budget. A deferred rule is already matchable on this page, so a
-  // planner that resolved at the deadline would report no_entitlement instead,
-  // and would spend the full declared budget doing it.
+  // the whole budget, and what lets a rule that hydrates just afterwards still
+  // take the page. Three planners must be told apart here, and every one of
+  // them is told apart by its VERDICT, never by a wall-clock margin. The page
+  // starts with a `wrong_work_check` marker, which is non-deferred and so opens
+  // the window on the planner's very first look; the higher-priority `login`
+  // marker lands 15 ms later, inside the window; and a deferred
+  // `no_entitlement` rule is matchable from the start but may only be consulted
+  // at the deadline.
+  //   - The planner this test pins classifies at the END of the window and
+  //     answers "login": the login marker is there by then, and deferred rules
+  //     are still excluded.
+  //   - A planner with no window (`settleWindowMs = 0`) classifies before the
+  //     login marker exists and answers "wrong_work_check".
+  //   - A planner that only ever settles at the deadline classifies with
+  //     deferred rules allowed and answers "no_entitlement".
+  // The 15 ms interval needs no margin argument: these are timers in one event
+  // loop, and an event loop runs due timers in due order however late it is
+  // running, so the zero-width settle (due at +0 ms), the login insertion (due
+  // at +15 ms) and the real settle (due at +50 ms) cannot be reordered by load.
+  //
+  // Nothing here waits on a MutationObserver callback: the window is opened by
+  // markup that is already in the page. That is deliberate. When this case
+  // hydrated its FIRST marker on a timer and relied on the observer to notice,
+  // it failed about one run in six - happy-dom under `bun test` drops a
+  // mutation callback outright every few dozen runs, and with no callback the
+  // planner cannot settle early, answers "no_entitlement" at the 2000 ms
+  // deadline, and fails an assertion that production code satisfies.
   const spec: AdapterSpec = {
     id: "proquest",
     version: "0.0.0",
@@ -3283,43 +3307,67 @@ test("a late-hydrating non-article rule settles inside the 50 ms window", async 
         deferUntilDeadline: true,
       },
       { kind: "login", all: [".login"] },
+      { kind: "wrong_work_check", all: ["[data-mismatch]"] },
     ],
   };
-  const html = "<html><body><i class='availability'></i></body></html>";
+  const html =
+    "<html><body><i class='availability'></i><i data-mismatch></i></body></html>";
   const startedAt = Date.now();
   const kind = await liveClassifierKind(
     spec,
     html,
     async (win, pageSetTimeout) => {
       const hydrated = Promise.withResolvers<void>();
-      pageSetTimeout(hydrated.resolve, 40);
+      pageSetTimeout(hydrated.resolve, 15);
       await hydrated.promise;
       win.document.body.insertAdjacentHTML("beforeend", "<i class='login'></i>");
     },
   );
   expect(kind).toBe("login");
+  // The opposite regression, caught twice over: a planner that waited out the
+  // whole 2000 ms budget would already have answered "no_entitlement" above.
   expect(Date.now() - startedAt).toBeLessThan(1000);
 });
 
 test("the live planner uses the source link's state at the deadline", async () => {
-  const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 300 };
+  // These intervals carry the assertion. `scheduleWhenReady` in
+  // extension/src/plan.ts settles a ready non-article rule one settle window
+  // (`Math.min(50, boundedMs)`, so 50 ms here) after it appears, but treats a
+  // ready article rule as provisional and re-reads the DOM at the deadline,
+  // because a provider page can show a source link and then take it away.
+  // Only these offsets separate the two policies, so re-check each property
+  // against plan.ts before retiming them:
+  //   1. The marker is in the page before the earliest instant any planner
+  //      could settle on it. It is there from the first byte, and the earliest
+  //      settle is 50 ms - one settle window - after the planner starts.
+  //   2. The marker is still in the page at that instant, because its removal
+  //      is due at 150 ms, three settle windows later. Both are timers in one
+  //      event loop, and an event loop runs due timers in due order however
+  //      late it is running, so the removal can never overtake the settle: a
+  //      planner that treated the article marker as final always reads the
+  //      marker as present and answers "article".
+  //   3. The marker is gone long before the 1000 ms deadline - at 150 ms,
+  //      leaving 850 ms of slack - so the planner this test pins reads its
+  //      absence and answers "no_entitlement".
+  // The marker starts in the page, and is removed on a timer rather than in
+  // response to one, so neither verdict depends on a mutation record being
+  // delivered. That matters: happy-dom under `bun test` drops a
+  // MutationObserver callback outright every few dozen runs, and a case built
+  // on observed hydration silently degrades to a deadline-only answer when it
+  // does.
+  const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 1000 };
   const html =
     "<html><body><nde-record-availability>" +
     "<button class='available-at-button'>Get it for me</button>" +
-    "</nde-record-availability></body></html>";
+    "</nde-record-availability>" +
+    "<a class='anchor-tag-style' href='/discovery/sourceRecord/alma991'></a>" +
+    "</body></html>";
   const transientSource = async (
     win: Window,
     pageSetTimeout: typeof globalThis.setTimeout,
   ): Promise<void> => {
-    const inserted = Promise.withResolvers<void>();
-    pageSetTimeout(inserted.resolve, 60);
-    await inserted.promise;
-    win.document.body.insertAdjacentHTML(
-      "beforeend",
-      "<a class='anchor-tag-style' href='/discovery/sourceRecord/alma991'></a>",
-    );
     const removed = Promise.withResolvers<void>();
-    pageSetTimeout(removed.resolve, 40);
+    pageSetTimeout(removed.resolve, 150);
     await removed.promise;
     win.document.querySelector(".anchor-tag-style")?.remove();
   };
@@ -3329,37 +3377,107 @@ test("the live planner uses the source link's state at the deadline", async () =
 });
 
 test("the live planner accepts a source link that remains through the deadline", async () => {
-  const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 300 };
+  // The companion of the transient-marker case above: a marker that persists
+  // must be answered "article". The verdict alone cannot show that the planner
+  // waited, because a marker that never disappears reads the same one settle
+  // window after it appears as it does at the deadline. So this case also
+  // measures WHEN the answer arrived, at the plan promise itself rather than
+  // around the mutation script, which would confuse the planner's own timing
+  // with the script's.
+  //
+  // A planner that treated article readiness as final would answer one 50 ms
+  // settle window after the 60 ms insertion, at about 110 ms. The 800 ms floor
+  // sits 200 ms under the 1000 ms deadline to absorb timer coarseness, and it
+  // is a lower bound, so load can only make it hold more firmly. Load can also
+  // delay an early-settling planner's answer past the floor, so this floor
+  // documents the hold rather than guaranteeing the kill; the transient-marker
+  // case above is what kills that mutant by verdict, in due-timer order.
+  //
+  // Unlike that case, this one does paint the marker late, so it also covers a
+  // provider that hydrates its source link after load. That costs nothing in
+  // reliability: if the mutation record is never delivered - happy-dom under
+  // `bun test` drops one every few dozen runs - the planner simply answers at
+  // the deadline, with the marker in the page, which is the same verdict and
+  // still past the floor.
+  const spec: AdapterSpec = { ...primoSpec(), settleTimeoutMs: 1000 };
   const html =
     "<html><body><nde-record-availability>" +
     "<button class='available-at-button'>Get it for me</button>" +
     "</nde-record-availability></body></html>";
-  const stableSource = async (
-    win: Window,
-    pageSetTimeout: typeof globalThis.setTimeout,
-  ): Promise<void> => {
-    const inserted = Promise.withResolvers<void>();
-    pageSetTimeout(inserted.resolve, 60);
-    await inserted.promise;
-    win.document.body.insertAdjacentHTML(
-      "beforeend",
-      "<a class='anchor-tag-style' href='/discovery/sourceRecord/alma991'></a>",
-    );
-    expect(
-      win.document.querySelector(
-        "a.anchor-tag-style[href*='/discovery/sourceRecord']",
-      ),
-    ).not.toBeNull();
-    const held = Promise.withResolvers<void>();
-    pageSetTimeout(held.resolve, 180);
-    await held.promise;
-    expect(
-      win.document.querySelector(
-        "a.anchor-tag-style[href*='/discovery/sourceRecord']",
-      ),
-    ).not.toBeNull();
+  const sourceSelector = "a.anchor-tag-style[href*='/discovery/sourceRecord']";
+  const held = await withLiveAdapterPage(
+    html,
+    async (win, pageSetTimeout) => {
+      const startedAt = Date.now();
+      let resolvedAfterMs = -1;
+      const pending = planExecution(
+        null,
+        spec,
+        {},
+        { access_mode: "delegated" },
+      ).then((plan) => {
+        resolvedAfterMs = Date.now() - startedAt;
+        return plan;
+      });
+      const inserted = Promise.withResolvers<void>();
+      pageSetTimeout(inserted.resolve, 60);
+      await inserted.promise;
+      win.document.body.insertAdjacentHTML(
+        "beforeend",
+        "<a class='anchor-tag-style' href='/discovery/sourceRecord/alma991'></a>",
+      );
+      expect(win.document.querySelector(sourceSelector)).not.toBeNull();
+      const settled = await pending;
+      if ("assisted" in settled)
+        throw new Error("live classifier unexpectedly returned an assisted plan");
+      // Nothing removes the marker, so it is still in the page at the deadline
+      // the planner read: that is the state the verdict below must reflect.
+      expect(win.document.querySelector(sourceSelector)).not.toBeNull();
+      return { kind: settled.verdict.kind, resolvedAfterMs };
+    },
+  );
+  expect(held.kind).toBe("article");
+  expect(held.resolvedAfterMs).toBeGreaterThanOrEqual(800);
+});
+
+test("a page whose only matching rule is deadline-only is answered at the deadline", async () => {
+  // The scheduler half of the deferred-rule gate. "another ready rule cannot
+  // wake a deadline-only rule early" above pins the CLASSIFIER half: a
+  // deferred rule must not decide an early settle. This case pins the
+  // SCHEDULER half - `selectorsReady` in extension/src/plan.ts must not count
+  // a deferred rule as readiness at all - and it is the only page shape where
+  // that is observable, because here the deferred rule is the only rule that
+  // matches anything.
+  //
+  // A planner that let the deferred rule signal readiness settles one 50 ms
+  // settle window after the page is seen and classifies with deferred rules
+  // still excluded, so it answers "unknown" at ~50 ms. The planner this test
+  // pins cannot settle at all before the 300 ms deadline, and at the deadline
+  // the deferred rule is finally allowed to match, so it answers
+  // "no_entitlement". Both the verdict and the elapsed floor are asserted:
+  // the verdict is the discriminator that holds under any machine load, and
+  // the 250 ms floor - 50 ms under the deadline for timer coarseness, and a
+  // lower bound, so load only reinforces it - records that the answer is the
+  // deadline's, not an early settle's.
+  const spec: AdapterSpec = {
+    id: "proquest",
+    version: "0.0.0",
+    hosts: ["www.proquest.com"],
+    settleTimeoutMs: 300,
+    classify: [
+      {
+        kind: "no_entitlement",
+        all: [".availability"],
+        deferUntilDeadline: true,
+      },
+      { kind: "login", all: [".login"] },
+    ],
   };
-  expect(await liveClassifierKind(spec, html, stableSource)).toBe("article");
+  const html = "<html><body><i class='availability'></i></body></html>";
+  const startedAt = Date.now();
+  const kind = await liveClassifierKind(spec, html);
+  expect(kind).toBe("no_entitlement");
+  expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
 });
 
 test("the planner classifies every settled Primo state on the synchronous path", () => {

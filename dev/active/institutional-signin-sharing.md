@@ -8,9 +8,10 @@ ways, and effectively never fires in the field. This plan is about closing the
 gap between the two, and its first slice is measurement because the cause is not
 yet known.
 
-Successor to nothing. `dev/active/surface-lifecycle-plan.md` covers the *surface*
-lifecycle (churn, adoption, closure) and its work has shipped; it is due for ADR
-extraction. This file must not become that plan's ninth round by accretion.
+Successor to nothing. The *surface* lifecycle (churn, adoption, closure) shipped
+and is now `dev/adr/0028-surface-lifecycle-ownership.md`, with its short open
+list in `dev/active/surface-lifecycle-remainder.md`. This file must not become
+that work's ninth round by accretion.
 
 ## Measured, 2026-08-21, on the operator's own store
 
@@ -439,8 +440,8 @@ Both async classifier copies now use the same temporal policy. Article
 readiness remains provisional through the budget; a non-article marker gets the
 existing 50 ms settle window; a deferred rule can classify only at the
 deadline. Tests cover another ready rule, a transient source link, and a source
-link that remains (`extension/src/adapters/types.ts:interpret`,
-`extension/src/plan.ts:planExecution`).
+link that remains (`extension/src/plan.ts:planExecution`; the second copy those
+tests originally also covered is deleted, see the amendment below).
 
 **Classifier consolidation amendment, 2026-09-03.** The temporal-policy work
 above shipped in both classifier copies that existed then. Slice 3 of
@@ -497,8 +498,9 @@ non-terminal `browser.error` event and leaves the job and action untouched
 
 The extension reports only after the page still shows the same measured
 500/404 state following the third reload. `retryProviderLoadFailure` returns
-`reloaded`, `exhausted`, or `ignored`; both `assessDrivenPage` call sites
-consume that one atomic result. A session-persisted
+`reloaded`, `exhausted`, or `ignored`; the two load-failure branches consume
+that one atomic result. Note `assessDrivenPage` is injected from three sites,
+of which two reach this path. A session-persisted
 `provider_load_failure_parked` marker keeps a closed failed tab from taking the
 normal cancellation path. A separate sent
 marker is written only after `send` succeeds

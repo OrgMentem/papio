@@ -56,9 +56,9 @@ Four concrete locality failures now carry maintenance risk.
 2. The same adapters repeat document-delivery reconciliation. See
    `internal/api/delivery.go:deliveryConfirmRequestAbsent` and
    `internal/browser/bridge.go:deliveryConfirmRequestAbsent`.
-3. The extension has two copies of provider-page classification. See
-   `extension/src/adapters/types.ts:interpret` and
-   `extension/src/plan.ts:planExecution`.
+3. The extension had two copies of provider-page classification. **Shipped
+   2026-09-03 in Slice 3**: `extension/src/plan.ts:planExecution` is now the
+   only classifier, and the second copy is deleted.
 4. Browser request correlation and daemon session arbitration expose their
    implementation across many callers. See
    `extension/src/background.ts:requestNative` and
@@ -127,14 +127,57 @@ at `planExecution` only.** Verification found the overlap was narrower than this
 paragraph assumed: that plan's one unimplemented section reaches
 `assessDrivenPage`, a different classifier with a different input contract, so
 its pending provider load-failure work must stay there and must NOT move into
-`planExecution`. There is now one classifier body, so the concurrent-edit
-prohibition is moot.
+`planExecution`. There is now one **provider-rule** classifier body, so the
+concurrent-edit prohibition is moot. `assessDrivenPage` remains a separate
+classifier and is deliberately untouched by this plan.
 
-Slices 4 and 5 touch active browser lifecycle work. Start them only when
-`dev/active/surface-lifecycle-plan.md`,
-`dev/active/entry-lease-lifecycle.md`, and
-`dev/active/institutional-signin-sharing.md` no longer change the same
-invariants.
+### Verified slice status (2026-09-03, read against the tree)
+
+Six of the eight slices have already landed, so this plan is two slices from
+done. Verified, not read off this document:
+
+| Slice | State | Evidence |
+| --- | --- | --- |
+| 1 triage mutation module | shipped | both callers run `triage.Service.Decide` (`internal/api/triage.go:93`, `internal/browser/bridge.go:5138`) |
+| 2 delivery reconciliation | shipped | both delegate to `app.Service` (`internal/api/delivery.go:377`, `internal/browser/bridge.go:5278`) |
+| 3 one extension classifier | shipped | `bce6777`; `interpret` is gone, `extension/src/plan.ts:planExecution` is the only provider-rule classifier |
+| 4 native request correlation | open | no correlation module exists under `extension/src` |
+| 5 browser session arbitration | open | no arbitration module exists under `internal/browser` |
+| 6 retry policy | shipped | `internal/app/retry_policy.go` |
+| 7 adoption persistence | shipped | `internal/job/publication.go`, `internal/store/migrations/0052_artifact_publications.sql`, ADR-0027 |
+| 8 source registration catalog | shipped | `internal/config/config.go:109` (`sourceCatalog`) |
+
+Correction to Slice 7 below: it still asks for migration 0052. That number is
+taken by Slice 7's own migration. Highest migration in the tree is
+`0052_artifact_publications.sql`, so a later slice needs 0053.
+
+### The gate on Slices 4 and 5
+
+This paragraph previously blocked both slices on three whole plans. That was
+read against those documents, not against the tree, which is the exact trap
+ADR-0028's working discipline records. Verified on 2026-09-03: the surface
+lifecycle work has shipped and is now ADR-0028, with a short remainder in
+`dev/active/surface-lifecycle-remainder.md`; the entry-lease and sign-in-sharing
+plans each hold one genuine open unit, and neither one rewrites the symbols
+these two slices move.
+
+Two narrow overlaps remain, and they are the whole gate:
+
+1. **Slice 5 and the entry lease.** Slice 5 moves `Sync` out of
+   `internal/browser/bridge.go`. The entry-lease work has an open ordering
+   question inside `Sync`, between an explicit focus request and an automatic
+   one. Slice 5 changes no behaviour, so move the code first and decide the
+   order inside the new module afterwards.
+2. **Slice 4 and provider load-failure reporting.** Slice 4 replaces how the
+   extension sends a correlated request. The sign-in-sharing plan's one open
+   feature adds a new send site. Land Slice 4 first, so that feature is written
+   once against the new shape.
+
+Nothing else collides. The remaining work in those two plans lives in
+`internal/job/institutional_evidence.go`,
+`internal/job/claim_observation_apply.go`, and the tab-lifecycle and
+`assessDrivenPage` regions of `extension/src/background.ts` — none of which
+Slice 4 or Slice 5 moves.
 
 ### Slice 1: one triage mutation module
 
@@ -241,15 +284,23 @@ The tests must keep the discriminating end state. They must check the job state,
 one resolved action, one open action after re-park, and reuse of the existing
 request row.
 
-### Slice 3: one extension classifier
+### Slice 3: one extension classifier — SHIPPED 2026-09-03 (`bce6777`)
 
-**Problem.** `extension/src/adapters/types.ts:interpret` and
-`extension/src/plan.ts:planExecution` repeat rule order, `all`, `any`,
-`textAny`, `deferUntilDeadline`, title-token checks, evidence labels, and the
-unknown fallback.
+**Problem, as it stood.** A now-deleted `interpret` in
+`extension/src/adapters/types.ts` and `extension/src/plan.ts:planExecution`
+repeated rule order, `all`, `any`, `textAny`, `deferUntilDeadline`,
+title-token checks, evidence labels, and the unknown fallback.
 
-Production injects `planExecution`. Most provider fixture tests call
-`interpret`. A one-sided change can test one implementation and run the other.
+Production injected `planExecution`. Most provider fixture tests called the
+other copy. A one-sided change could test one implementation and run the other.
+
+**Amendment recorded on landing.** Step 3 below says to keep a test helper only
+when it projects a `Plan` verdict. `AssistedPlan` gained a required `verdict`,
+because 9 of the 27 provider fixture assertions read a verdict that
+`planExecution` returns as an `AssistedPlan` after its work-evidence and URL
+contract checks. The helper therefore projects a verdict from both result
+shapes and still contains no classification policy. `assisted` remains the only
+authority discriminator.
 
 **Change.**
 

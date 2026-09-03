@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Window } from "happy-dom";
 
 import { adapters, type AdapterSpec, type PageVerdict } from "../src/adapters/types";
-import { planExecution, planGeneric } from "../src/plan";
+import { planExecution, planGeneric, type ExpectedWork } from "../src/plan";
 import { captureOrigin, parseHTML, verdictOf } from "./harness";
 
 function fixtureHTML(provider: string, scenario: string): string {
@@ -23,9 +23,33 @@ const PLANNED_VERDICT_KINDS: Record<PageVerdict["kind"], true> = {
   wrong_work: true,
 };
 
+/** Every evidence label `planExecution`'s classifier can emit for this spec and
+ * this requested work. The decisive label is built as `"rule:" + rule.kind +
+ * " matched"` (plan.ts:435-436), so its parameterized form is derived from the
+ * rule kinds the spec under test declares rather than matched loosely; the
+ * remaining labels are literal (plan.ts:456, 462, 471), and the two
+ * title-token labels become reachable only once a requested title is present
+ * (plan.ts:437-439). `PageVerdict.evidence` reaches the daemon and the
+ * operator's screen, so it holds static labels only and never page text: exact
+ * membership in this closed set is that rule. An entry carrying a title, DOI,
+ * or body string cannot equal a label — not even in the `rule:… matched`
+ * shape, whose middle must be a rule kind this adapter declares. */
+function plannedEvidenceVocabulary(spec: AdapterSpec, expected: ExpectedWork): string[] {
+  const labels = ["no rule matched"];
+  for (const rule of spec.classify) labels.push("rule:" + rule.kind + " matched");
+  if (expected.title !== undefined && expected.title.length > 0) {
+    labels.push("title-token-check passed", "title-token-check failed");
+  }
+  return labels;
+}
+
 test("planExecution preserves passive verdicts and fails closed on unbound effects for every fixture", () => {
   const root = join(import.meta.dir, "..", "fixtures");
   let swept = 0;
+  let checkedEvidenceEntries = 0;
+  // The sweep requests no particular work, so the title-token labels stay
+  // unreachable and out of every fixture's expected vocabulary.
+  const expected: ExpectedWork = {};
   for (const providerEntry of readdirSync(root, { withFileTypes: true })) {
     if (!providerEntry.isDirectory()) continue;
     const spec = adapters.find((candidate) => candidate.id === providerEntry.name);
@@ -35,7 +59,7 @@ test("planExecution preserves passive verdicts and fails closed on unbound effec
       const scenario = fixtureEntry.slice(0, -5);
       const html = fixtureHTML(providerEntry.name, scenario);
       const doc = parseHTML(html, captureOrigin(html) ?? "https://fixture.local/");
-      const planned = planExecution(doc, { ...spec, settleTimeoutMs: 0 }, {}, {});
+      const planned = planExecution(doc, { ...spec, settleTimeoutMs: 0 }, expected, {});
       const verdict = verdictOf(planned);
       swept++;
       // One classifier, so there is no second verdict to agree with. The
@@ -45,6 +69,16 @@ test("planExecution preserves passive verdicts and fails closed on unbound effec
       expect(Object.keys(PLANNED_VERDICT_KINDS)).toContain(verdict.kind);
       expect(verdict.adapter_id).toBe(spec.id);
       expect(verdict.adapter_version).toBe(spec.version);
+      // Evidence is a closed vocabulary: the only parameterized label names a
+      // rule kind this spec declares, and every other label is a fixed string.
+      // Arbitrary text and page-derived text alike therefore fail exact
+      // membership, which is what keeps page content out of the verdict.
+      const evidenceVocabulary = plannedEvidenceVocabulary(spec, expected);
+      expect(verdict.evidence.length).toBeGreaterThan(0);
+      for (const entry of verdict.evidence) {
+        expect(evidenceVocabulary).toContain(entry);
+        checkedEvidenceEntries++;
+      }
       if ("assisted" in planned) {
         // A fixture without requested-work evidence may classify as an article
         // or terms page, but its unbound effect must stay assisted rather than
@@ -62,7 +96,15 @@ test("planExecution preserves passive verdicts and fails closed on unbound effec
   }
   // An empty fixture tree would satisfy every assertion above vacuously.
   expect(swept).toBeGreaterThan(0);
-});
+  // Every projected verdict emits at least one label, so checking fewer entries
+  // than fixtures would mean the evidence loop ran vacuously somewhere.
+  expect(checkedEvidenceEntries).toBeGreaterThanOrEqual(swept);
+  // Explicit timeout: the sweep walks all 66 committed fixtures through the
+  // real planner and checks every evidence entry, measured at ~5.3s. That is
+  // just over bun's 5s default, so the default made this fail intermittently
+  // on nothing but corpus growth. Raise this bound as the corpus grows; never
+  // thin the sweep to fit a timeout.
+}, 30_000);
 
 test("planExecution refuses an ambiguous action target instead of choosing the first match", () => {
   const spec: AdapterSpec = {
