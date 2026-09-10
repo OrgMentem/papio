@@ -1544,17 +1544,36 @@ func TestSnapshotCursorSurvivesMutationAndRejectsSchemaSwitchAndStaleAnchor(t *t
 func TestDecideDismissesPdfGrabThroughItsSource(t *testing.T) {
 	service, watches, _ := triageTestService(t)
 	ctx := context.Background()
+	runner := &watch.Runner{Store: watches}
+
+	// No registered source owns grabs: that is a fact about this daemon, not
+	// about the item, so it must not read as "already gone".
+	unowned, watchesBare, _ := triageTestService(t)
+	if result, err := unowned.Decide(ctx, DecisionInput{
+		ItemID: PdfGrabIDPrefix + "grab_decide_1", Operation: DecisionDismiss,
+	}, &watch.Runner{Store: watchesBare}); err != nil || result.Outcome != DecisionInvalid ||
+		result.Detail != "pdf grabs are not configured" {
+		t.Fatalf("unconfigured grabs = %+v, %v; want invalid with a not-configured detail", result, err)
+	}
+
 	source := &dismissingGrabSource{grabID: "grab_decide_1"}
 	service.RegisterSource(source)
+	before, err := service.Snapshot(ctx, SnapshotRequest{Limit: 10})
+	if err != nil || len(before.Items) != 1 || before.Items[0].ID != PdfGrabIDPrefix+"grab_decide_1" {
+		t.Fatalf("seeded snapshot = %+v, %v; want the parked grab", before.Items, err)
+	}
 
 	result, err := service.Decide(ctx, DecisionInput{
 		ItemID: PdfGrabIDPrefix + "grab_decide_1", Operation: DecisionDismiss,
-	}, &watch.Runner{Store: watches})
+	}, runner)
 	if err != nil || result.Outcome != DecisionApplied {
 		t.Fatalf("dismiss result = %+v, %v; want applied", result, err)
 	}
-	if source.dismissed != "grab_decide_1" {
-		t.Fatalf("dismissed grab = %q; want the bare grab id without the item prefix", source.dismissed)
+	// The inbox must actually lose the item: a source that answered applied
+	// without discarding the grab would leave the operator dismissing forever.
+	after, err := service.Snapshot(ctx, SnapshotRequest{Limit: 10})
+	if err != nil || len(after.Items) != 0 {
+		t.Fatalf("snapshot after dismissal = %+v, %v; want the grab gone", after.Items, err)
 	}
 
 	gone, err := service.Decide(ctx, DecisionInput{
@@ -1572,23 +1591,33 @@ func TestDecideDismissesPdfGrabThroughItsSource(t *testing.T) {
 	}
 }
 
+// dismissingGrabSource owns one grab and refuses any other id, so the
+// interface's argument contract (the BARE grab id, without the item prefix) is
+// enforced by the applied/conflict outcome rather than by inspecting the fake.
 type dismissingGrabSource struct {
 	grabID    string
-	dismissed string
+	discarded bool
 }
 
 func (s *dismissingGrabSource) SnapshotItems(context.Context, *sql.Tx) ([]Item, error) {
+	if s.discarded {
+		return nil, nil
+	}
 	return []Item{{
 		Kind: KindPdfGrab, ID: PdfGrabIDPrefix + s.grabID, Title: "Reading copy",
 		Ops: []string{"provide_identifier", "dismiss"}, PdfGrab: &PdfGrab{GrabID: s.grabID, State: "parked_no_identifier"},
 	}}, nil
 }
 
+// DismissPdfGrab discards the grab it owns, exactly as the real source does, so
+// the decision's effect is observable through a fresh Snapshot rather than
+// through a field only the test can see. Any other id answers sql.ErrNoRows,
+// which is what enforces the bare-id argument contract.
 func (s *dismissingGrabSource) DismissPdfGrab(_ context.Context, grabID string) (bool, error) {
 	if grabID != s.grabID {
 		return false, sql.ErrNoRows
 	}
-	s.dismissed = grabID
+	s.discarded = true
 	return true, nil
 }
 func TestDecideOwnsWatchScopeSelection(t *testing.T) {
@@ -1638,11 +1667,13 @@ func TestDecideOwnsWatchScopeSelection(t *testing.T) {
 
 // acknowledgingRetractionSource is a retraction item source whose
 // acknowledgement outcome each test sets explicitly.
+// acknowledgingRetractionSource owns one notice; a foreign item ID answers
+// sql.ErrNoRows, which is what makes triage's cross-source skipping observable
+// through the decision outcome alone.
 type acknowledgingRetractionSource struct {
 	doi      string
 	applied  bool
 	err      error
-	seen     string
 	nowStamp time.Time
 }
 
@@ -1655,7 +1686,6 @@ func (s *acknowledgingRetractionSource) SnapshotItems(context.Context, *sql.Tx) 
 }
 
 func (s *acknowledgingRetractionSource) AcknowledgeRetraction(_ context.Context, itemID string) (bool, error) {
-	s.seen = itemID
 	if s.err != nil {
 		return false, s.err
 	}
@@ -1686,16 +1716,18 @@ func TestDecideAcknowledgesRetractionThroughItsSource(t *testing.T) {
 	}
 
 	service, watches2, _ := triageTestService(t)
+	// A first acknowledger that does not own this notice must be SKIPPED, not
+	// treated as the answer: sources are independent, and the owning one is
+	// registered second here on purpose.
+	foreign := &acknowledgingRetractionSource{doi: "10.1000/someone-elses", applied: true, nowStamp: now}
 	source := &acknowledgingRetractionSource{doi: "10.1000/retracted", applied: true, nowStamp: now}
+	service.RegisterSource(foreign)
 	service.RegisterSource(source)
 	runner := &watch.Runner{Store: watches2}
 	item := RetractionIDPrefix + "10.1000/retracted"
 
 	if result, err := service.Decide(ctx, DecisionInput{ItemID: item, Operation: DecisionDismiss}, runner); err != nil || result.Outcome != DecisionApplied {
 		t.Fatalf("first dismiss = %+v, %v; want applied", result, err)
-	}
-	if source.seen != item {
-		t.Fatalf("source saw %q, want the full item ID", source.seen)
 	}
 
 	// A notice already acknowledged reports already_applied, not applied: the

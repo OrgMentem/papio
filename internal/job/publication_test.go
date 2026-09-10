@@ -133,6 +133,15 @@ func TestConsumePublishedPublicationClearsRedundantJournalRow(t *testing.T) {
 	if err != nil || !edge {
 		t.Fatalf("edge = %t, %v; want the committed acquisition retained", edge, err)
 	}
+	// Unlike DiscardPublication, consumption must leave the artifact row the
+	// committed edge still points at.
+	var artifacts int
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM artifacts WHERE sha256 = ?`, sha).Scan(&artifacts); err != nil {
+		t.Fatal(err)
+	}
+	if artifacts != 1 {
+		t.Fatalf("artifact rows for %s = %d, want 1 retained", sha, artifacts)
+	}
 
 	// Without an edge the row is still owed real recovery, so consumption
 	// must refuse rather than discard evidence.

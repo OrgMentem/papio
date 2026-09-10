@@ -391,6 +391,10 @@ type PdfGrabDismisser interface {
 	DismissPdfGrab(ctx context.Context, grabID string) (bool, error)
 }
 
+// errNoPdfGrabDismisser separates "this daemon owns no grabs at all" from
+// "that grab is gone", which sql.ErrNoRows alone cannot express.
+var errNoPdfGrabDismisser = errors.New("no registered source owns pdf grabs")
+
 // Service composes the transactionally consistent inbox read model.
 type Service struct {
 	Store   *store.Store
@@ -455,6 +459,13 @@ func (s *Service) Decide(ctx context.Context, input DecisionInput, runner *watch
 		}
 		applied, err := s.dismissPdfGrab(ctx, input.ItemID)
 		switch {
+		case errors.Is(err, errNoPdfGrabDismisser):
+			// No registered source owns grabs at all, which is a configuration
+			// fact about this daemon, not a statement about the item. Reporting
+			// it as a conflict would tell the operator the grab is already
+			// gone; the deleted bridge-side copy said "not configured", and
+			// this preserves that distinction for every transport.
+			return DecisionResult{Outcome: DecisionInvalid, Detail: "pdf grabs are not configured"}, nil
 		case errors.Is(err, sql.ErrNoRows):
 			return DecisionResult{Outcome: DecisionConflict}, nil
 		case err != nil:
@@ -562,16 +573,21 @@ func (s *Service) dismissPdfGrab(ctx context.Context, itemID string) (bool, erro
 	s.mu.RLock()
 	sources := append([]ItemSource(nil), s.sources...)
 	s.mu.RUnlock()
+	owned := false
 	for _, source := range sources {
 		dismisser, ok := source.(PdfGrabDismisser)
 		if !ok {
 			continue
 		}
+		owned = true
 		applied, err := dismisser.DismissPdfGrab(ctx, id)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		return applied, err
+	}
+	if !owned {
+		return false, errNoPdfGrabDismisser
 	}
 	return false, sql.ErrNoRows
 }

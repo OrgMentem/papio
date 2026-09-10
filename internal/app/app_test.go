@@ -3704,3 +3704,131 @@ func TestReconciliationAttemptCountSemantics(t *testing.T) {
 		}
 	})
 }
+
+// TestReconcileConsumesRedundantPublicationAndItsQuarantineBytes covers the
+// state that wedged a job: a journal row whose acquisition edge is already
+// committed. processNext reads ANY prepared publication as unfinished work, so
+// skipping the row (which recovery used to do) meant the job was passed over on
+// every scheduler tick forever. Consuming it must also discard the quarantined
+// copy, whose bytes the promoted artifact already holds — the component-stage
+// sweep runs before this reconciliation, so an orphan left here would wait for
+// the next daemon start, and a main-role file is never swept.
+func TestReconcileConsumesRedundantPublicationAndItsQuarantineBytes(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs, "wr_redundant_pub", "redundant-pub", "redundant-pub")
+	if _, _, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+		TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)), SniffedMIME: "application/pdf",
+	}); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if edge, err := jobs.HasPublicationEdge(ctx, row.ID, sha, job.PublicationRoleMain); err != nil || !edge {
+		t.Fatalf("edge = %v, %v; want the acquisition committed", edge, err)
+	}
+
+	// A second journal row for the same job, digest and role, naming a
+	// quarantine file that still exists: the shape a duplicate adoption leaves
+	// behind once the edge is committed.
+	qdir, err := svc.Artifacts.QuarantineDir(row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined := filepath.Join(qdir, "redundant.pdf")
+	if err := os.WriteFile(quarantined, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := jobs.GetArtifact(ctx, sha)
+	if err != nil || stored == nil {
+		t.Fatalf("artifact metadata = %+v, %v", stored, err)
+	}
+	if err := jobs.PreparePublication(ctx, job.PublicationInput{
+		ID: "publication_redundant", JobID: row.ID, Role: job.PublicationRoleMain, SHA256: sha,
+		QuarantinePath: quarantined, Artifact: *stored,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.reconcilePreparedPublications(ctx, row.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	prepared, err := jobs.PreparedPublications(ctx, row.ID)
+	if err != nil || len(prepared) != 0 {
+		t.Fatalf("prepared = %+v, %v; want none, so the scheduler can process the job", prepared, err)
+	}
+	if _, err := os.Stat(quarantined); !os.IsNotExist(err) {
+		t.Fatalf("quarantine bytes remain after consumption: %v", err)
+	}
+	// The published copy and its metadata are what the edge owns; neither may
+	// be collateral of the cleanup.
+	dest, err := svc.Artifacts.ArtifactPath(sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dest); err != nil {
+		t.Fatalf("promoted artifact = %v; want it retained", err)
+	}
+	if art, err := jobs.GetArtifact(ctx, sha); err != nil || art == nil {
+		t.Fatalf("artifact metadata after consumption = %+v, %v; want retained", art, err)
+	}
+
+	// A component publication stages its bytes in a whole component-stage_
+	// directory, and SweepOrphanComponentStages only collects one that no
+	// journal row claims — at the next daemon start. Consumption must take the
+	// directory with it.
+	supplement := []byte("%PDF-1.4\nsupplement\n%%EOF")
+	supplementSHA := hex.EncodeToString(func() []byte { d := sha256.Sum256(supplement); return d[:] }())
+	stageDir, err := svc.Artifacts.QuarantineDir("component-stage_redundant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	supplementDest, err := svc.Artifacts.ArtifactPath(supplementSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(stageDir, "supplement.pdf")
+	if err := os.WriteFile(staged, supplement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	component := job.PublicationInput{
+		ID: "publication_component_first", JobID: row.ID, Role: job.PublicationRoleSupplement,
+		SHA256: supplementSHA, QuarantinePath: staged,
+		Artifact: job.Artifact{
+			SHA256: supplementSHA, SizeBytes: int64(len(supplement)), MIME: "application/pdf",
+			PageCount: 1, Path: supplementDest, IdentityResult: "pass",
+		},
+	}
+	if err := jobs.PreparePublication(ctx, component); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.FinalizePublication(ctx, component.ID, func() (job.PromotionResult, error) {
+		path, created, promoteErr := svc.Artifacts.Promote(staged, supplementSHA)
+		return job.PromotionResult{Path: path, Created: created}, promoteErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Re-stage the same bytes under the same role: the redundant component row.
+	if err := os.MkdirAll(stageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, supplement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	redundant := component
+	redundant.ID = "publication_component_redundant"
+	if err := jobs.PreparePublication(ctx, redundant); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.reconcilePreparedPublications(ctx, row.ID); err != nil {
+		t.Fatalf("reconcile component: %v", err)
+	}
+	if prepared, err := jobs.PreparedPublications(ctx, row.ID); err != nil || len(prepared) != 0 {
+		t.Fatalf("prepared after component consumption = %+v, %v; want none", prepared, err)
+	}
+	if _, err := os.Stat(stageDir); !os.IsNotExist(err) {
+		t.Fatalf("component stage directory remains after consumption: %v", err)
+	}
+	if edge, err := jobs.HasPublicationEdge(ctx, row.ID, supplementSHA, job.PublicationRoleSupplement); err != nil || !edge {
+		t.Fatalf("supplement edge = %v, %v; want retained", edge, err)
+	}
+}

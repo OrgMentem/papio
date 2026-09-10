@@ -936,14 +936,14 @@ func TestRunnerClearDigestAndMultiWatchConsumeCommit(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("ConsumeDigests: %v", err)
 	}
-	for _, check := range []struct {
-		watchID int64
-		want    int
-	}{{w1.ID, 1}, {w2.ID, 0}} {
-		entries, err := watches.Digest(ctx, check.watchID, 100)
-		if err != nil || len(entries) != check.want {
-			t.Fatalf("watch %d digest = %+v, %v; want %d pending", check.watchID, entries, err, check.want)
-		}
+	// Which entry survives matters, not how many: consuming the wrong target
+	// leaves the same count behind and the later clear hides the difference.
+	remaining, err := watches.Digest(ctx, w1.ID, 100)
+	if err != nil || len(remaining) != 1 || remaining[0].WorkKey != "10.1000/two" {
+		t.Fatalf("w1 digest = %+v, %v; want only the untargeted 10.1000/two", remaining, err)
+	}
+	if entries, err := watches.Digest(ctx, w2.ID, 100); err != nil || len(entries) != 0 {
+		t.Fatalf("w2 digest = %+v, %v; want its only entry consumed", entries, err)
 	}
 
 	// ClearDigest consumes what is left, and reports zero on a second pass

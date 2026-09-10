@@ -124,17 +124,36 @@ func TestObserverCreditsUsedSeedsCounter(t *testing.T) {
 	if len(rec.usedCalls) != 1 || rec.usedCalls[0] != 240 {
 		t.Fatalf("usedCalls = %v, want [240]", rec.usedCalls)
 	}
-	// A nil credit observer must not report the same header: this is the only
-	// witness for observeCreditSignals' nil-observer early return on the
-	// credits-used path, and it lives here so the seed input is stated once.
-	observerNil, _, _ := testObserverWithCredit(t, nil, map[string]string{
-		"X-RateLimit-Credits-Used": "240",
-	})
-	if err := doAndClose(observerNil, bearerRequest(t)); err != nil {
+}
+
+// TestObserverSkipsCreditsUsedWithoutObserver is the durable witness for
+// observeCreditSignals' nil-observer early return on the credits-used path.
+// Asserting it through a recorder cannot work: with no observer wired there is
+// nothing to record, so a recorder-based check is a tautology. The observable
+// consequence is the absent commit, mirroring
+// TestObserverSkipsCreditObservationWithoutObserver on the denominator path.
+func TestObserverSkipsCreditsUsedWithoutObserver(t *testing.T) {
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rec.usedCalls) != 1 {
-		t.Fatalf("usedCalls = %v; a nil credit observer must not call ObserveCreditsUsed", rec.usedCalls)
+	t.Cleanup(func() { _ = s.Close() })
+	observer, _, _ := testObserverWithCredit(t, nil, map[string]string{
+		"X-RateLimit-Credits-Used": "240",
+	})
+	if err := doAndClose(observer, bearerRequest(t)); err != nil {
+		t.Fatal(err)
+	}
+	day := observerNow.UTC().Format("2006-01-02")
+	var committed sql.NullInt64
+	err = s.DB().QueryRowContext(context.Background(),
+		`SELECT credits_committed FROM source_credit_fuse WHERE source = ? AND utc_day = ?`,
+		config.SourceOpenAlex, day).Scan(&committed)
+	if err == nil && committed.Valid && committed.Int64 != 0 {
+		t.Fatalf("credits_committed = %d, want unset when no credit observer is wired", committed.Int64)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal(err)
 	}
 }
 

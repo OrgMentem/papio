@@ -1650,9 +1650,18 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 			if err != nil || row.State != job.StateAwaitingHuman {
 				t.Fatalf("job = %+v, %v; want awaiting_human", row, err)
 			}
-			kinds := openActionKinds(t, jobs, id)
-			if !kinds[job.CandidateEligibleKind] {
-				t.Fatalf("open actions = %v; want a %s action for the adoption fence", kinds, job.CandidateEligibleKind)
+			seeded, err := jobs.ListHumanActionsForJob(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var firstAction int64
+			for _, action := range seeded {
+				if action.Action.Status == "open" && action.Action.Kind == job.CandidateEligibleKind {
+					firstAction = action.Action.ID
+				}
+			}
+			if firstAction == 0 {
+				t.Fatalf("open actions = %+v; want a %s action for the adoption fence", seeded, job.CandidateEligibleKind)
 			}
 			// Idempotent: a second report of the same download must not open a
 			// second action or move the job again.
@@ -1663,14 +1672,20 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			open := 0
+			open := make([]int64, 0, 1)
 			for _, action := range actions {
-				if action.Action.Status == "open" {
-					open++
+				if action.Action.Status != "open" {
+					continue
 				}
+				if action.Action.Kind != job.CandidateEligibleKind {
+					t.Fatalf("open action %d has kind %q; want %s", action.Action.ID, action.Action.Kind, job.CandidateEligibleKind)
+				}
+				open = append(open, action.Action.ID)
 			}
-			if open != 1 {
-				t.Fatalf("open actions after second park = %d, want 1", open)
+			// The SAME action, not a replacement: re-opening one would reset the
+			// revision the browser holds and make its next resolve conflict.
+			if len(open) != 1 || open[0] != firstAction {
+				t.Fatalf("open actions after second park = %v, want exactly the original %d", open, firstAction)
 			}
 		})
 	}

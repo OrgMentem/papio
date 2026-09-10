@@ -3472,6 +3472,37 @@ func (s *Service) RecoverPreparedPublications(ctx context.Context) error {
 	return s.reconcilePreparedPublications(ctx, "")
 }
 
+// removeQuarantineBytes discards one quarantined file whose bytes are already
+// published, best-effort. It is confined to the store's own quarantine root:
+// a quarantine_path is durable state that predates several validations (see
+// AGENTS.md on long-lived dev stores), so an unexpected path is logged and
+// left alone rather than removed. A component stage keeps its whole staging
+// directory, which is what SweepOrphanComponentStages would otherwise collect
+// a full daemon start later.
+func (s *Service) removeQuarantineBytes(quarantinePath string) {
+	if quarantinePath == "" {
+		return
+	}
+	root, err := filepath.Abs(filepath.Join(filepath.Dir(s.Jobs.S.Path()), "quarantine"))
+	if err != nil {
+		return
+	}
+	target, err := filepath.Abs(quarantinePath)
+	if err != nil {
+		return
+	}
+	if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+		log.Printf("papio: leaving published quarantine path outside %s in place: %s", root, target)
+		return
+	}
+	if base := filepath.Dir(target); strings.HasPrefix(filepath.Base(base), "component-stage_") {
+		target = base
+	}
+	if err := os.RemoveAll(target); err != nil {
+		log.Printf("papio: removing published quarantine bytes %s: %v", target, err)
+	}
+}
+
 func (s *Service) reconcilePreparedPublications(ctx context.Context, jobID string) error {
 	return s.reconcilePreparedPublicationsForOwner(ctx, jobID, "")
 }
@@ -3495,8 +3526,18 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 			// of skipping it. Finalizing it is not an option: its recorded
 			// from_state no longer holds once the edge committed, so
 			// transitionPublicationMainTx would refuse the transition.
-			if _, err := s.Jobs.ConsumePublishedPublication(ctx, publication.ID); err != nil {
+			consumed, err := s.Jobs.ConsumePublishedPublication(ctx, publication.ID)
+			if err != nil {
 				return err
+			}
+			if consumed {
+				// The promoted artifact is the copy that matters, so the
+				// quarantine bytes this row still names are now unreferenced.
+				// Deleting the row alone would strand them: the component-stage
+				// sweep runs once at startup, BEFORE this reconciliation, so a
+				// file orphaned here waits for the next daemon start, and a
+				// main-role quarantine file is not swept at all.
+				s.removeQuarantineBytes(publication.QuarantinePath)
 			}
 			continue
 		}

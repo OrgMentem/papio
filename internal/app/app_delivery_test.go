@@ -2601,14 +2601,51 @@ func TestReconcileDeliveryConfirmAbsentReparksAndReusesTheRow(t *testing.T) {
 		if action.Action.Kind != job.ActionKindDocumentDelivery {
 			continue
 		}
-		if action.Action.Status == "open" {
+		switch action.Action.Status {
+		case "open":
 			open++
-			continue
+		case "resolved":
+			resolved++
+		default:
+			t.Fatalf("document_delivery action %d has status %q; want open or resolved", action.Action.ID, action.Action.Status)
 		}
-		resolved++
 	}
 	if open != 1 || resolved != 1 {
 		t.Fatalf("document_delivery actions = %d open, %d resolved; want 1 and 1: %+v", open, resolved, actions)
+	}
+	// The ordering itself, which the assertions above cannot see: the repair
+	// transition MUST be recorded before the reconciliation park. Repair is the
+	// only legal awaiting_human -> resolving edge and the park supplies the edge
+	// back, so a submit attempted before the repair is asked for
+	// awaiting_human -> awaiting_human and refused. Assert the reason order and
+	// the park's own edge; the repair's detail carries no from/to today and
+	// pinning that would be brittle.
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reasons []string
+	parkFrom := ""
+	for _, event := range events {
+		if event["kind"] != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		reason, _ := detail["reason"].(string)
+		reasons = append(reasons, reason)
+		if reason == "document_delivery_reconciliation" {
+			parkFrom, _ = detail["from"].(string)
+		}
+	}
+	if len(reasons) < 2 {
+		t.Fatalf("job transitions = %v; want a repair followed by a park", reasons)
+	}
+	tail := reasons[len(reasons)-2:]
+	if tail[0] != "document_delivery_confirmed_absent" || tail[1] != "document_delivery_reconciliation" {
+		t.Fatalf("final transition reasons = %v (all: %v); want the confirmed-absent repair, then the park", tail, reasons)
+	}
+	if parkFrom != job.StateResolving {
+		t.Fatalf("reconciliation park came from %q, want %s: the repair must run first", parkFrom, job.StateResolving)
 	}
 	// One row, reused: a duplicate would make the operator reconcile twice.
 	var rows int
