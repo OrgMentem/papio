@@ -24,9 +24,10 @@ export interface ExpectedWorkEvidence {
   requested_doi: string | null;
   requested_title: string | null;
   /** Exact normalized identifier and packaged source that supplied it. */
-  doi: { normalized: string; fingerprint: string; selector?: string; attribute?: string; pattern?: string | null } | null;
-  /** Positive title evidence is retained as a local revalidation binding. */
-  title: { fingerprint: string; selector?: string; attribute?: string; pattern?: string | null } | null;
+  doi: { normalized: string; fingerprint: string; selector?: string; attribute?: string | null; pattern?: string | null } | null;
+  /** Positive title evidence is retained as a local revalidation binding.
+   * `attribute` is null when the identity came from the element's own text. */
+  title: { fingerprint: string; selector?: string; attribute?: string | null; pattern?: string | null } | null;
 }
 
 export interface PlanTargetWorkBinding {
@@ -489,15 +490,15 @@ export function planExecution(
     requestedDOI: string | null,
     requestedTitle: string | null,
   ): {
-    evidence: { normalized: string; fingerprint: string; selector: string; attribute: string; pattern: string | null } | null;
-    title: { fingerprint: string; selector: string; attribute: string; pattern: string | null } | null;
+    evidence: { normalized: string; fingerprint: string; selector: string; attribute: string | null; pattern: string | null } | null;
+    title: { fingerprint: string; selector: string; attribute: string | null; pattern: string | null } | null;
   } | AssistedReason => {
     if (requestedDOI === null && requestedTitle === null) return { evidence: null, title: null };
     if (
       contract === undefined ||
       contract.selector.length === 0 ||
       contract.selector.length > 512 ||
-      contract.attribute.length === 0
+      contract.attribute?.length === 0
     ) return { assisted: "declared work evidence is missing" };
     if (contract.kind !== "doi" && contract.kind !== "title") return { assisted: "declared work evidence kind is invalid" };
     if (
@@ -514,7 +515,11 @@ export function planExecution(
       return { assisted: matches.length === 0 ? "declared work evidence is missing" : "declared work evidence is ambiguous" };
     }
     const element = matches[0];
-    const raw = element.getAttribute(contract.attribute)?.trim() ?? "";
+    // No declared attribute means the identity is the element's own text.
+    const raw = (contract.attribute === undefined
+      ? element.textContent
+      : element.getAttribute(contract.attribute)
+    )?.replace(/\s+/g, " ").trim() ?? "";
     if (raw === "") return { assisted: "declared work evidence is empty" };
     let extracted = raw;
     if (contract.pattern !== undefined) {
@@ -531,13 +536,13 @@ export function planExecution(
     if (contract.kind === "doi") {
       const normalized = normalizeDOI(extracted);
       if (normalized === "" || normalized !== requestedDOI) return { assisted: "declared work evidence does not match the requested work" };
-      const source = { selector: contract.selector, attribute: contract.attribute, pattern: contract.pattern ?? null };
+      const source = { selector: contract.selector, attribute: contract.attribute ?? null, pattern: contract.pattern ?? null };
       return { evidence: { normalized, fingerprint: fingerprint(element), ...source }, title: null };
     }
     if (normalizeTitle(extracted) !== requestedTitle) {
       return { assisted: "declared work evidence does not match the requested work" };
     }
-    const source = { selector: contract.selector, attribute: contract.attribute, pattern: contract.pattern ?? null };
+    const source = { selector: contract.selector, attribute: contract.attribute ?? null, pattern: contract.pattern ?? null };
     return { evidence: null, title: { fingerprint: fingerprint(element), ...source } };
   };
 

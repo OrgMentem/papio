@@ -696,3 +696,44 @@ test("planExecution live settling lets an ordered blocking rule win", async () =
     vi.useRealTimers();
   }
 });
+
+// Every real job supplies a requested identity, so an adapter that declares an
+// article rule without workEvidence can never execute in production, however
+// green its fixture classification test is. ProQuest shipped in exactly that
+// state — the resolver's highest-volume destination, silently degraded to a
+// human click. This test states which shipped adapters bind an identity and
+// which are assisted by design, so neither condition can change unnoticed.
+test("adapters declaring an article rule bind the requested identity, or are pinned as assisted", () => {
+  const requested: Record<string, ExpectedWork> = {
+    proquest: { title: "Trust in Automation: Designing for Appropriate Reliance" },
+    primo: { title: "Intrinsic motivation and self-determination in human behavior" },
+    clinicalkey: {
+      title:
+        "Autonomy is equally important across East and West: Testing the cross-cultural universality of self-determination theory",
+    },
+  };
+  // Assisted by design: no stable identity node in the committed capture. See
+  // each spec's comment; binding these needs a fresh capture.
+  const assistedByDesign = new Set(["primo", "clinicalkey"]);
+
+  for (const [id, expected] of Object.entries(requested)) {
+    const spec = adapters.find((candidate) => candidate.id === id);
+    if (spec === undefined) throw new Error(`${id} spec missing from registry`);
+    const html = fixtureHTML(id, "success");
+    const doc = parseHTML(html, captureOrigin(html) ?? "https://fixture.local/");
+    const planned = planExecution(doc, { ...spec, settleTimeoutMs: 0 }, expected, {});
+    if (assistedByDesign.has(id)) {
+      expect(spec.workEvidence).toBeUndefined();
+      expect(planned).toHaveProperty("assisted");
+      expect("assisted" in planned ? planned.assisted : "").toBe("declared work evidence is missing");
+      continue;
+    }
+    expect(spec.workEvidence).toBeDefined();
+    expect("assisted" in planned ? planned.assisted : null).toBeNull();
+    if ("assisted" in planned) throw new Error("unreachable");
+    expect(planned.verdict.kind).toBe("article");
+    expect(planned.method).not.toBeNull();
+    expect(planned.url).not.toBeNull();
+    expect(planned.expected_work.title).not.toBeNull();
+  }
+});

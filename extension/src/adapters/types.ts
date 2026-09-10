@@ -48,7 +48,12 @@ export interface WorkEvidenceContract {
   /** Exact packaged page-side identity evidence for the requested work. */
   kind: "doi" | "title";
   selector: string;
-  attribute: string;
+  /** Attribute holding the identity. Omit it to read the element's own text,
+   * which is the only evidence some providers expose: ProQuest's docview
+   * prints the title in `h1#documentTitle` and carries no citation meta tag
+   * at all, so an attribute-only contract left that provider permanently
+   * assisted. */
+  attribute?: string;
   /** Optional extraction pattern; group 1 is the identity value. */
   pattern?: string;
 }
@@ -205,8 +210,15 @@ export const adapters: AdapterSpec[] = [
     // unentitled) stays `unknown`: distinguishing those needs fixtures
     // we do not have yet.
     id: "proquest",
-    version: "0.2.0",
+    version: "0.3.0",
+    // The docview carries no citation meta tag at all, so the printed title in
+    // the stable `documentTitle` id is the only identity evidence on the page.
+    // Without a declared contract the planner refused every real job — a job
+    // always supplies a requested identity — so ProQuest, this resolver's
+    // highest-volume destination, was permanently human-assisted while its
+    // fixture test still reported the `article` verdict.
     hosts: ["proquest.com"],
+    workEvidence: { kind: "title", selector: "h1#documentTitle" },
     classify: [
       // ProQuest's "Find your institution" wall (fixtures/proquest/login-return.html):
       // when the resolver routes here without a ProQuest institutional session,
@@ -373,6 +385,18 @@ export const adapters: AdapterSpec[] = [
     // force: that entry records a resolver hop eating the render budget, and
     // this adapter IS the resolver. Eight of the ten captures were shells
     // between 1.1 KB and 29.9 KB with no availability control rendered.
+    //
+    // Human-assisted by design, for now: this adapter declares no
+    // workEvidence, so the planner refuses to execute its article effect
+    // whenever a job supplies a requested identity — which every real job
+    // does. That refusal is correct, not an oversight: the committed capture
+    // exposes the title only in Angular-generated class names and in a
+    // localized `aria-label` ("Get PDF for <title>, opens in a new window"),
+    // and the sanitizer rewrites unstable tokens, so neither is a
+    // trustworthy live selector. A stable identity node has to come from a
+    // fresh capture before this can bind. TestPrimoStaysAssistedWithoutWorkEvidence
+    // pins the refusal so the green fixture test cannot read as a working
+    // automated path.
     id: "primo",
     version: "0.3.0",
     hosts: ["primo.exlibrisgroup.com"],
@@ -414,6 +438,15 @@ export const adapters: AdapterSpec[] = [
     // declared value was 8000 and silently clamped to 5000 by the interpreter
     // (`planExecution` in extension/src/plan.ts) until that ceiling was raised
     // to 15000.
+    //
+    // Human-assisted by design, for now: no workEvidence is declared, so the
+    // planner refuses the article effect for any job carrying a requested
+    // identity. The capture's only title node is
+    // `h1.TOKEN-cksc-content-header__title`, and that `TOKEN-` prefix is the
+    // sanitizer's redaction of an unstable class, so it cannot be used as a
+    // live selector. Binding this provider needs a fresh capture showing a
+    // stable identity node. TestClinicalKeyStaysAssistedWithoutWorkEvidence
+    // pins the refusal.
     id: "clinicalkey",
     version: "0.2.0",
     hosts: ["clinicalkey.com.au"],

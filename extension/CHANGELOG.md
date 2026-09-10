@@ -88,6 +88,17 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **ProQuest papers are fetched again instead of asking you to click.**
+  ProQuest is where this library's link resolver sends most requests, and the
+  adapter (now `proquest` v0.3.0) declared no way to prove the page shows the
+  paper you asked for. *papio* refuses to download without that proof, so every
+  ProQuest paper quietly became a manual click. The docview prints its title in
+  a stable place, and the adapter now binds to it, so the download runs on its
+  own. A page whose title does not match your request is still refused. Two
+  other adapters (`primo`, `clinicalkey`) stay assisted on purpose: their
+  captured pages expose no stable identity to bind, and a test now pins that
+  refusal so it cannot be mistaken for a working automatic path.
+
 - **A publisher sign-in now refreshes a resolver tab stranded on the identity
   provider.** The publisher landing already requested a library-session check,
   but that check found no library page while *papio*'s own tab remained on the

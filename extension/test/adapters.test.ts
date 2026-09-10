@@ -1572,14 +1572,27 @@ class FakeScripting {
       win.document.body.appendChild(modal);
     }
     if (spec.workEvidence !== undefined) {
-      const evidence = win.document.createElement("meta");
-      const name = /meta\[name=['"]([^'"]+)['"]\]/u.exec(spec.workEvidence.selector)?.[1];
-      if (name !== undefined) evidence.setAttribute("name", name);
       const value = spec.workEvidence.kind === "doi"
         ? expected.doi ?? ""
         : expected.title ?? "";
-      evidence.setAttribute(spec.workEvidence.attribute, value);
-      win.document.head.appendChild(evidence);
+      const name = /meta\[name=['"]([^'"]+)['"]\]/u.exec(spec.workEvidence.selector)?.[1];
+      if (spec.workEvidence.attribute !== undefined) {
+        const evidence = win.document.createElement("meta");
+        if (name !== undefined) evidence.setAttribute("name", name);
+        evidence.setAttribute(spec.workEvidence.attribute, value);
+        win.document.head.appendChild(evidence);
+      } else {
+        // Text-mode contract: the identity is the element's own text, so the
+        // synthetic page must build the declared element rather than a meta tag.
+        const tag = /^[a-z][a-z0-9-]*/i.exec(spec.workEvidence.selector)?.[0] ?? "div";
+        const evidence = win.document.createElement(tag);
+        const id = /#([A-Za-z0-9_-]+)/.exec(spec.workEvidence.selector)?.[1];
+        const className = /\.([A-Za-z0-9_-]+)/.exec(spec.workEvidence.selector)?.[1];
+        if (id !== undefined) evidence.id = id;
+        if (className !== undefined) evidence.className = className;
+        evidence.textContent = value;
+        win.document.body.appendChild(evidence);
+      }
     }
     const selector = spec.download?.selector;
     if (selector !== undefined && terms === undefined) {

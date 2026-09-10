@@ -2662,6 +2662,12 @@ function autoRefreshAllowed(): boolean {
 }
 
 async function pollCounts(): Promise<void> {
+  // Ownership first. A module instance whose document has been replaced (every
+  // test fixture re-import, and any orphaned page) still holds a live timer,
+  // and presence used to be sent before this check — so a stray
+  // papio.surface.presence landed in whichever chrome stub owned the global at
+  // that moment, breaking unrelated exact-message-count assertions.
+  if (boundDocument !== undefined && globalThis.document !== boundDocument) return;
   if (typeof document === "undefined" || document.visibilityState === "visible") sendInboxPresence(true);
   if (!autoRefreshAllowed()) return;
   const before = countsSignature(state.counts);
