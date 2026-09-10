@@ -617,6 +617,50 @@ test.skipIf(!fixtureExists("sage", "success"))(
   },
 );
 
+// A text-mode work-evidence contract must survive the round trip into the
+// effect executor. `workEvidenceFor` (plan.ts) emits `attribute: null` when the
+// adapter reads the element's own text, and `executePlannedPageEffect`'s
+// re-validation demanded a non-empty attribute string — so ProQuest, whose
+// docview carries no citation meta tag and prints its title in
+// `h1#documentTitle`, produced a bound plan that then refused itself with "the
+// page's title evidence does not re-validate". Bound in the page, refused in
+// the worker: the same class of defect as the SAGE case above, one layer later.
+test.skipIf(!fixtureExists("proquest", "success"))(
+  "a text-mode evidence contract re-validates in the effect executor",
+  async () => {
+    const href = "https://www.proquest.com/docview/1234567890";
+    const doc = parseHTML(readFileSync(fixturePath("proquest", "success"), "utf8"), href);
+    const spec = adapters.find((a) => a.id === "proquest") as AdapterSpec;
+    const plan = planExecution(
+      doc,
+      spec,
+      { title: "Trust in Automation: Designing for Appropriate Reliance" },
+      { access_mode: "delegated" },
+    ) as Plan;
+    expect("assisted" in plan).toBe(false);
+    expect(plan.verdict.kind).toBe("article");
+    // Text mode: bound title, and no attribute recorded for it.
+    expect(plan.expected_work.title).not.toBeNull();
+    expect(plan.expected_work.title?.attribute ?? null).toBeNull();
+    expect(plan.expected_work.doi).toBeNull();
+
+    const prev = { document: globalThis.document, location: globalThis.location };
+    Object.assign(globalThis, {
+      document: doc,
+      location: { href, origin: "https://www.proquest.com" },
+    });
+    try {
+      const outcome = await executePlannedPageEffect(plan, spec.download as DownloadRule);
+      expect(outcome).toEqual({
+        ok: true,
+        url: "https://media.proquest.com/media/hms/OBJ/wbSmS",
+      });
+    } finally {
+      Object.assign(globalThis, prev);
+    }
+  },
+);
+
 // THE defect behind "papio sees the article and never downloads it".
 //
 // `planExecution` runs in the page, its result is serialized back to the

@@ -2452,8 +2452,8 @@ export async function executePlannedPageEffect(
       entry.fingerprint === "" ||
       typeof entry.selector !== "string" ||
       entry.selector.length === 0 ||
-      typeof entry.attribute !== "string" ||
-      entry.attribute.length === 0 ||
+      (orNull(entry.attribute) !== null && typeof entry.attribute !== "string") ||
+      entry.attribute === "" ||
       (orNull(entry.pattern) !== null &&
         typeof orNull(entry.pattern) !== "string")
     )
@@ -2461,7 +2461,16 @@ export async function executePlannedPageEffect(
     const source = findExactlyOne(entry.selector);
     if (source === null || fingerprint(source) !== entry.fingerprint)
       return false;
-    const raw = source.getAttribute(entry.attribute)?.trim() ?? "";
+    // A null attribute means the adapter's contract binds the element's own
+    // text (WorkEvidenceContract.attribute is optional): ProQuest's docview
+    // prints its title in h1#documentTitle and carries no citation meta tag,
+    // so an attribute-only re-validation refused every plan plan.ts had
+    // already bound. Collapse whitespace exactly as plan.ts does, or the
+    // same element re-reads as a different value here.
+    const raw = (orNull(entry.attribute) === null
+      ? source.textContent
+      : source.getAttribute(String(entry.attribute))
+    )?.replace(/\s+/g, " ").trim() ?? "";
     if (raw === "") return false;
     let extracted = raw;
     const entryPattern = orNull(entry.pattern);
