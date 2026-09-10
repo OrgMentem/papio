@@ -2372,3 +2372,251 @@ func TestOpenDeliveryReconciliationActionParksAtomicallyAndNotifies(t *testing.T
 		t.Fatalf("human notifications = %d, want 1", notifier.human)
 	}
 }
+
+// seedDeliveryReconciliation parks a job in awaiting_human with one open
+// document_delivery reconciliation action and a live delivery_requests row —
+// the exact state an operator verdict arrives into. It reuses
+// submitDeliveryRequest's duplicate-live-row path, which is how that state is
+// produced in production.
+func seedDeliveryReconciliation(t *testing.T, svc *Service, jobs *job.Store, deliverySvc *delivery.Service, suffix string) (string, *delivery.Request) {
+	t.Helper()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_reconcile_"+suffix, "10.1000/reconcile-"+suffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimNext: %v, %v", claimed, err)
+	}
+	if err := jobs.Transition(ctx, claimed.ID, job.StateQueued, job.StateResolving, map[string]any{"reason": "test_setup"}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileName := deliveryProfileName(row.Policy.Resolver)
+	requestClass := deliveryRequestClass(row.Work)
+	workIdentity := row.Work.Describe()
+	key := delivery.IdempotencyKey(profileName, workIdentity, "illiad", requestClass)
+	request, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: profileName, Provider: "illiad",
+		RequestClass: requestClass, WorkIdentity: workIdentity,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deliverySvc.UpdateState(ctx, request.ID, delivery.StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+	inst, dd, ok := svc.deliveryConfigured(row)
+	if !ok {
+		t.Fatal("delivery must be configured")
+	}
+	profile, err := deliverySvc.ResolveGateProfile(ctx, profileName, inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.submitDeliveryRequest(ctx, row, job.StateResolving, profileName, dd, requestClass, workIdentity, key, profile); err != nil {
+		t.Fatal(err)
+	}
+	parked, err := jobs.Get(ctx, id)
+	if err != nil || parked.State != job.StateAwaitingHuman {
+		t.Fatalf("seeded job = %+v, %v; want awaiting_human", parked, err)
+	}
+	return id, request
+}
+
+// TestReconcileDeliveryConfirmExistsAndRefusals covers app.Service's own
+// reconciliation entry point. Only the API and browser packages exercised it,
+// and their test binaries cannot cover this implementation, so its terminal
+// refusals and the confirm-exists transaction were unprotected here.
+func TestReconcileDeliveryConfirmExistsAndRefusals(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("illiad must never be called during reconciliation of an existing request")
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	// Unconfigured delivery is refused before any store read.
+	if _, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: "wr_absent", Operation: DeliveryConfirmRequestExists, ProviderReference: "T-1",
+	}); !errors.Is(err, ErrDeliveryNotConfigured) {
+		t.Fatalf("nil Delivery err = %v, want ErrDeliveryNotConfigured", err)
+	}
+	svc.Delivery = deliverySvc
+
+	id, request := seedDeliveryReconciliation(t, svc, jobs, deliverySvc, "exists")
+
+	// A job with no delivery row, and an unknown operation, are both refused.
+	other, err := svc.Submit(ctx, deliveryWorkRequest("wr_reconcile_norow", "10.1000/reconcile-norow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: other, Operation: DeliveryConfirmRequestExists, ProviderReference: "T-1",
+	}); !errors.Is(err, ErrDeliveryRequestNotFound) {
+		t.Fatalf("missing request err = %v, want ErrDeliveryRequestNotFound", err)
+	}
+	if _, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: id, Operation: DeliveryReconciliationOperation("shrug"),
+	}); err == nil {
+		t.Fatal("unknown operation was accepted")
+	}
+	if _, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: id, Operation: DeliveryConfirmRequestExists,
+	}); err == nil {
+		t.Fatal("confirm-exists without a provider reference was accepted")
+	}
+	// Every refusal above must leave the parked job and its open action alone.
+	if parked, err := jobs.Get(ctx, id); err != nil || parked.State != job.StateAwaitingHuman {
+		t.Fatalf("job after refusals = %+v, %v; want still awaiting_human", parked, err)
+	}
+
+	result, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: id, Operation: DeliveryConfirmRequestExists, ProviderReference: "T-4242",
+	})
+	if err != nil {
+		t.Fatalf("confirm-exists: %v", err)
+	}
+	if result.JobState != job.StateRetryWait || result.Request == nil ||
+		result.Request.State != delivery.StatePending || result.Request.ProviderReference != "T-4242" {
+		t.Fatalf("confirm-exists result = %+v", result)
+	}
+	after, err := jobs.Get(ctx, id)
+	if err != nil || after.State != job.StateRetryWait {
+		t.Fatalf("job after confirm-exists = %+v, %v; want retry_wait", after, err)
+	}
+	open, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range open {
+		if action.JobID == id {
+			t.Fatalf("action %d stayed open after confirm-exists", action.ID)
+		}
+	}
+	stored, err := deliverySvc.Get(ctx, request.ID)
+	if err != nil || stored.State != delivery.StatePending {
+		t.Fatalf("delivery row = %+v, %v; want pending and polled", stored, err)
+	}
+}
+
+// TestReconcileDeliveryRejectsMissingOpenAction pins the second terminal
+// refusal: a verdict with no open document_delivery action to close must not
+// mutate the request or the job.
+func TestReconcileDeliveryRejectsMissingOpenAction(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("illiad must never be called")
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	id, request := seedDeliveryReconciliation(t, svc, jobs, deliverySvc, "noaction")
+	actions, err := jobs.ListHumanActionsForJob(ctx, id)
+	if err != nil || len(actions) == 0 {
+		t.Fatalf("seeded actions = %+v, %v", actions, err)
+	}
+	for _, action := range actions {
+		if _, err := jobs.DismissHumanAction(ctx, action.Action.ID, action.Action.Revision); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: id, Operation: DeliveryConfirmRequestAbsent,
+	}); !errors.Is(err, ErrDeliveryReconciliationNotFound) {
+		t.Fatalf("no open action err = %v, want ErrDeliveryReconciliationNotFound", err)
+	}
+	stored, err := deliverySvc.Get(ctx, request.ID)
+	if err != nil || stored.State != delivery.StateSubmitted {
+		t.Fatalf("delivery row = %+v, %v; want untouched submitted", stored, err)
+	}
+}
+
+// TestReconcileDeliveryConfirmAbsentReparksAndReusesTheRow covers the
+// confirm-absent branch. Its cancel -> repair -> submit order is load-bearing:
+// RepairAwaitingHuman is the only legal awaiting_human -> resolving edge, so
+// the action must close before SubmitDelivery, whose own reconciliation park
+// supplies the edge back. The discriminating end state is a job parked again
+// with exactly one open action, and the SAME delivery row reused rather than a
+// duplicate created - a test asserting only "one open action" passes under the
+// broken Cancel -> Submit -> Repair order too.
+func TestReconcileDeliveryConfirmAbsentReparksAndReusesTheRow(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"Message":"provider down"}`))
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+
+	id, request := seedDeliveryReconciliation(t, svc, jobs, deliverySvc, "absent")
+	result, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: id, Operation: DeliveryConfirmRequestAbsent,
+	})
+	if err != nil {
+		t.Fatalf("confirm-absent: %v", err)
+	}
+	if result.JobState != job.StateAwaitingHuman {
+		t.Fatalf("job state = %q, want awaiting_human", result.JobState)
+	}
+	// papio never resubmits automatically: the cancelled row stays cancelled and
+	// the provider is not called again.
+	if calls.Load() != 0 {
+		t.Fatalf("provider calls = %d, want 0", calls.Load())
+	}
+	stored, err := deliverySvc.Get(ctx, request.ID)
+	if err != nil || stored.State != delivery.StateCancelled {
+		t.Fatalf("delivery row = %+v, %v; want cancelled", stored, err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateAwaitingHuman {
+		t.Fatalf("job = %+v, %v; want parked awaiting_human again", row, err)
+	}
+	actions, err := jobs.ListHumanActionsForJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, resolved := 0, 0
+	for _, action := range actions {
+		if action.Action.Kind != job.ActionKindDocumentDelivery {
+			continue
+		}
+		if action.Action.Status == "open" {
+			open++
+			continue
+		}
+		resolved++
+	}
+	if open != 1 || resolved != 1 {
+		t.Fatalf("document_delivery actions = %d open, %d resolved; want 1 and 1: %+v", open, resolved, actions)
+	}
+	// One row, reused: a duplicate would make the operator reconcile twice.
+	var rows int
+	if err := deliverySvc.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM delivery_requests WHERE job_id = ?`, id).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("delivery rows for %s = %d, want 1 reused", id, rows)
+	}
+}

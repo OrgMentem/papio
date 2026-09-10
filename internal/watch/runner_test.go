@@ -906,3 +906,63 @@ func TestAcquireDigestFailsClosedWhenZotioReturnsFewerWorksThanRequestsViaAcquir
 		t.Fatalf("digest after AcquireDigests mismatch = %+v, want 1 pending entry", entries)
 	}
 }
+
+// TestRunnerClearDigestAndMultiWatchConsumeCommit covers the two paths the
+// package suite left unexercised: `papio watch digest clear` (the API handler's
+// only entry point), and ConsumeDigests' successful multi-watch commit — the
+// existing tests reach only its conflict preflight.
+func TestRunnerClearDigestAndMultiWatchConsumeCommit(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	w1 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "clear-1", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	w2 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "clear-2", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	for _, seed := range []struct {
+		watchID int64
+		key     string
+	}{{w1.ID, "10.1000/one"}, {w1.ID, "10.1000/two"}, {w2.ID, "10.1000/three"}} {
+		if _, err := watches.RecordDigest(ctx, seed.watchID, now, []DigestEntry{
+			{WorkKey: seed.key, Title: seed.key, DOI: seed.key},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &Runner{Store: watches, Lookup: &fakeLookup{}, Submitter: &fakeSubmitter{}}
+
+	// Multi-watch consume commits every target, not just the first.
+	if err := runner.ConsumeDigests(ctx, []DigestTarget{
+		{WatchID: w1.ID, WorkKey: "10.1000/one"},
+		{WatchID: w2.ID, WorkKey: "10.1000/three"},
+	}); err != nil {
+		t.Fatalf("ConsumeDigests: %v", err)
+	}
+	for _, check := range []struct {
+		watchID int64
+		want    int
+	}{{w1.ID, 1}, {w2.ID, 0}} {
+		entries, err := watches.Digest(ctx, check.watchID, 100)
+		if err != nil || len(entries) != check.want {
+			t.Fatalf("watch %d digest = %+v, %v; want %d pending", check.watchID, entries, err, check.want)
+		}
+	}
+
+	// ClearDigest consumes what is left, and reports zero on a second pass
+	// rather than failing.
+	cleared, err := runner.ClearDigest(ctx, w1.ID)
+	if err != nil || cleared != 1 {
+		t.Fatalf("ClearDigest = %d, %v; want 1, nil", cleared, err)
+	}
+	if entries, err := watches.Digest(ctx, w1.ID, 100); err != nil || len(entries) != 0 {
+		t.Fatalf("w1 digest after clear = %+v, %v; want empty", entries, err)
+	}
+	if again, err := runner.ClearDigest(ctx, w1.ID); err != nil || again != 0 {
+		t.Fatalf("second ClearDigest = %d, %v; want 0, nil", again, err)
+	}
+	if _, err := runner.ClearDigest(ctx, w2.ID+1000); err == nil {
+		t.Fatal("ClearDigest on an unknown watch was accepted")
+	}
+	var unconfigured *Runner
+	if _, err := unconfigured.ClearDigest(ctx, w1.ID); err == nil {
+		t.Fatal("ClearDigest on an unconfigured runner was accepted")
+	}
+}

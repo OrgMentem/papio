@@ -500,6 +500,11 @@ func TestValidatePipelineThresholdReachesTheMatcher(t *testing.T) {
 		{"strict floor", 0.99, strict},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Each subtest builds its own temp files and fake tool processes and
+			// mutates no shared state, so the four subprocess launches per case
+			// need not run serially: four seconds of the package's race runtime
+			// was this pair waiting on each other.
+			t.Parallel()
 			worker, workerRan := structuralTool(t, `{"Valid":true,"Pages":1}`)
 			text, textRan := textTool(t, document)
 			info, crossRan, metaRan := pipelineInfoTool(t, 1, pipelinePacket, "")

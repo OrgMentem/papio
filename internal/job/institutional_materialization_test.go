@@ -3,9 +3,12 @@ package job
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"papio/internal/store"
 )
 
 func institutionalProfile(t *testing.T, js *Store, name, digest, claim string) InstitutionProfile {
@@ -1165,5 +1168,56 @@ func TestSupersededMaterializationClaimSpansJobAttempts(t *testing.T) {
 	}
 	if got {
 		t.Fatal("an earlier attempt must never supersede the current one")
+	}
+}
+
+// TestNextMaterializationHolderGenerationIsDurableAndMonotonic covers the
+// fence itself: a reused holder generation would let a restarted daemon accept
+// observations minted for a claim it no longer owns. Only internal/browser
+// called this, so a regression here could not fail any test in this package.
+func TestNextMaterializationHolderGenerationIsDurableAndMonotonic(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	first, err := js.NextMaterializationHolderGeneration(ctx)
+	if err != nil || first != 1 {
+		t.Fatalf("first generation = %d, %v; want 1, nil", first, err)
+	}
+	second, err := js.NextMaterializationHolderGeneration(ctx)
+	if err != nil || second != first+1 {
+		t.Fatalf("second generation = %d, %v; want %d, nil", second, err, first+1)
+	}
+
+	// Survives a restart: the counter is durable, not process state.
+	dataDir := filepath.Dir(js.S.Path())
+	if err := js.S.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	restarted := &Store{S: reopened}
+	third, err := restarted.NextMaterializationHolderGeneration(ctx)
+	if err != nil || third != second+1 {
+		t.Fatalf("generation after restart = %d, %v; want %d, nil", third, err, second+1)
+	}
+
+	// Exhaustion is refused rather than wrapping onto a live generation.
+	const maxGeneration int64 = 1<<53 - 1
+	if _, err := reopened.DB().ExecContext(ctx,
+		`UPDATE daemon_authority_key SET holder_generation = ? WHERE singleton=1`, maxGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.NextMaterializationHolderGeneration(ctx); err == nil {
+		t.Fatal("exhausted generation counter was allocated; want a refusal")
+	}
+	var held int64
+	if err := reopened.DB().QueryRowContext(ctx,
+		`SELECT holder_generation FROM daemon_authority_key WHERE singleton=1`).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != maxGeneration {
+		t.Fatalf("counter after refusal = %d, want %d retained", held, maxGeneration)
 	}
 }

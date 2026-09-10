@@ -629,3 +629,43 @@ func TestPlanAndApplySkipsKeyedItemHoldingPDF(t *testing.T) {
 		t.Fatalf("state = %q, want %q", row.State, job.StateImported)
 	}
 }
+
+// TestValidateImportBackfillCursorRejections covers the user-facing
+// `papio zotio import-backfill --cursor` guard directly. The selection test
+// reaches only the happy continuation, so the two distinct rejections and the
+// empty-cursor pass were unexercised.
+func TestValidateImportBackfillCursorRejections(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	seedImportBackfillJob(t, ctx, db, "job_cursor_anchor", time.Now().UTC().Format(time.RFC3339Nano), true, "pass", "")
+	service := importBackfillService(t, dataDir, db, nil)
+
+	// An empty or whitespace-only cursor means "start from the head".
+	for _, blank := range []string{"", "   ", "\t\n"} {
+		if err := service.ValidateImportBackfillCursor(ctx, blank); err != nil {
+			t.Fatalf("blank cursor %q = %v, want accepted as start-from-head", blank, err)
+		}
+	}
+	// An existing anchor is accepted.
+	if err := service.ValidateImportBackfillCursor(ctx, " job_cursor_anchor "); err != nil {
+		t.Fatalf("existing anchor = %v, want accepted", err)
+	}
+	// A cursor that is not a job id is refused by shape, before any query.
+	for _, malformed := range []string{"12345", "wr_cursor_anchor", "job", "JOB_cursor_anchor"} {
+		err := service.ValidateImportBackfillCursor(ctx, malformed)
+		if err == nil || !strings.Contains(err.Error(), "invalid import-backfill cursor") {
+			t.Fatalf("malformed cursor %q = %v, want an invalid-cursor error", malformed, err)
+		}
+	}
+	// A plausible but absent anchor is refused distinctly, so the operator can
+	// tell "wrong shape" from "that row is gone".
+	err = service.ValidateImportBackfillCursor(ctx, "job_cursor_missing")
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("absent anchor = %v, want a not-found error", err)
+	}
+}

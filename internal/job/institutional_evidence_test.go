@@ -1309,3 +1309,108 @@ func TestStrandedBoundLeaseGraceRestartsOnObservedProgress(t *testing.T) {
 		t.Fatalf("silent since the renewal: freed=%d err=%v, want 1", freed, err)
 	}
 }
+
+// TestRetireAuthenticationEntryLeaseAfterOwnerCloseFencesOnBinding covers
+// owner_closed's lease-side effect in its owning package. Only
+// internal/browser exercised it, so a regression could strand a dead sign-in
+// slot — blocking every sibling at that institution — or clear another
+// binding's occupancy, while this package stayed green.
+func TestRetireAuthenticationEntryLeaseAfterOwnerCloseFencesOnBinding(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	seedInstitutionProfile(t, js, "profile-retire")
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE institution_profiles SET authentication_claim_id='claim-retire' WHERE id='profile-retire'`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	evidence := ProfileEvidenceObservation{
+		ObservationID: "retire-evidence", BrowserHolderGeneration: 7,
+		InstitutionProfileID: "profile-retire", InstitutionProfileRevision: 1,
+		Verdict: ProfileEvidenceAuthReturned, Source: ProfileEvidenceAuthReturn,
+		ProducerObservedAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+		DaemonReceivedAt:   now.Format(time.RFC3339Nano),
+	}
+	if err := js.RecordProfileEvidence(ctx, evidence); err != nil {
+		t.Fatal(err)
+	}
+
+	reserve := func(t *testing.T, leaseID, ownerID, bindingID string) {
+		t.Helper()
+		if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+			AuthenticationClaimID: "claim-retire", LeaseID: leaseID, OwnerID: ownerID,
+			BrowserHolderGeneration: 7, LeaseUntil: now.Add(time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx, "claim-retire", ownerID, 7, bindingID, 41); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// An empty fence is a caller error, never a wildcard update.
+	if err := js.RetireAuthenticationEntryLeaseAfterOwnerClose(ctx, "claim-retire", "", now); err == nil {
+		t.Fatal("empty binding fence was accepted; want a refusal")
+	}
+
+	// A reserved occupancy: every durable field of the occupancy is cleared and
+	// the lease drops to expired so a later request opens a fresh cycle.
+	reserve(t, "lease-reserved", "job-reserved", "binding-reserved")
+	if err := js.RetireAuthenticationEntryLeaseAfterOwnerClose(ctx, "claim-retire", "binding-reserved", now); err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-retire")
+	if err != nil || !ok {
+		t.Fatalf("lease after reserved retirement = ok %v, %v", ok, err)
+	}
+	if lease.State != AuthenticationEntryLeaseExpired || lease.LeaseUntil != "" ||
+		lease.OwnerBindingID != "" || lease.OwnerTabHint != nil || lease.EntitledAt != "" {
+		t.Fatalf("retired reserved lease = %+v; want expired with no occupancy", lease)
+	}
+
+	// A human occupancy carrying entitlement: same retirement, and entitled_at
+	// must not survive, or a sibling would resume on a dead sign-in.
+	reserve(t, "lease-human", "job-human", "binding-human")
+	if err := js.ConvertAuthenticationEntryLeaseToHuman(ctx, "claim-retire", "lease-human", "job-human", 7, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.MarkAuthenticationEntryLeaseEntitled(ctx, "claim-retire", "lease-human", "job-human", 7,
+		now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if entitled, _, err := js.GetAuthenticationEntryLease(ctx, "claim-retire"); err != nil || entitled.EntitledAt == "" {
+		t.Fatalf("entitled human lease = %+v, %v; want entitled_at set before retirement", entitled, err)
+	}
+
+	// A stale binding must not mutate the live occupancy at all.
+	before, _, err := js.GetAuthenticationEntryLease(ctx, "claim-retire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.RetireAuthenticationEntryLeaseAfterOwnerClose(ctx, "claim-retire", "binding-reserved", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := js.GetAuthenticationEntryLease(ctx, "claim-retire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// OwnerTabHint is a fresh pointer per read, so compare the values.
+	if before.OwnerTabHint != nil && after.OwnerTabHint != nil && *before.OwnerTabHint == *after.OwnerTabHint {
+		before.OwnerTabHint, after.OwnerTabHint = nil, nil
+	}
+	if *after != *before {
+		t.Fatalf("stale binding mutated the live lease: before %+v after %+v", before, after)
+	}
+
+	if err := js.RetireAuthenticationEntryLeaseAfterOwnerClose(ctx, "claim-retire", "binding-human", now); err != nil {
+		t.Fatal(err)
+	}
+	lease, ok, err = js.GetAuthenticationEntryLease(ctx, "claim-retire")
+	if err != nil || !ok {
+		t.Fatalf("lease after human retirement = ok %v, %v", ok, err)
+	}
+	if lease.State != AuthenticationEntryLeaseExpired || lease.LeaseUntil != "" ||
+		lease.OwnerBindingID != "" || lease.OwnerTabHint != nil || lease.EntitledAt != "" {
+		t.Fatalf("retired human lease = %+v; want expired with no occupancy or entitlement", lease)
+	}
+}

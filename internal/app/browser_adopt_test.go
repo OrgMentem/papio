@@ -1605,3 +1605,91 @@ func TestAdoptDownloadNormalPickedDeliveryStillSucceeds(t *testing.T) {
 		t.Fatalf("normal pick not promoted: %+v", row)
 	}
 }
+
+// createLiveJob makes one job and leaves it in the requested live state, so
+// parkForBrowserAdoption's own entry paths can be exercised. Existing adoption
+// tests all start from awaiting_human, where AdoptDownload returns before ever
+// calling it.
+func createLiveJob(t *testing.T, jobs *job.Store, reqID string, states ...[2]string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, reqID, work.Work{DOI: "10.1002/example"}, "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range states {
+		if err := jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return id
+}
+
+// TestParkForBrowserAdoptionEntryPaths covers the browser's advertised ability
+// to adopt a download for a job that is still live. Each entry state must end
+// awaiting_human with an open action, so the adoption fence sees a genuine
+// human-awaiting action; a state with no adoption edge must be refused.
+func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		steps [][2]string
+	}{
+		{"queued", nil},
+		{"resolving", [][2]string{{job.StateQueued, job.StateResolving}}},
+		{"fetching", [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			id := createLiveJob(t, jobs, "wr_park_"+tc.name, tc.steps...)
+			if err := svc.parkForBrowserAdoption(ctx, id); err != nil {
+				t.Fatalf("park from %s: %v", tc.name, err)
+			}
+			row, err := jobs.Get(ctx, id)
+			if err != nil || row.State != job.StateAwaitingHuman {
+				t.Fatalf("job = %+v, %v; want awaiting_human", row, err)
+			}
+			kinds := openActionKinds(t, jobs, id)
+			if !kinds[job.CandidateEligibleKind] {
+				t.Fatalf("open actions = %v; want a %s action for the adoption fence", kinds, job.CandidateEligibleKind)
+			}
+			// Idempotent: a second report of the same download must not open a
+			// second action or move the job again.
+			if err := svc.parkForBrowserAdoption(ctx, id); err != nil {
+				t.Fatalf("second park: %v", err)
+			}
+			actions, err := jobs.ListHumanActionsForJob(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			open := 0
+			for _, action := range actions {
+				if action.Action.Status == "open" {
+					open++
+				}
+			}
+			if open != 1 {
+				t.Fatalf("open actions after second park = %d, want 1", open)
+			}
+		})
+	}
+
+	t.Run("terminal", func(t *testing.T) {
+		svc, jobs := newTestService(t)
+		id := createLiveJob(t, jobs, "wr_park_terminal", [2]string{job.StateQueued, job.StateResolving})
+		if err := jobs.Cancel(ctx, id, job.TerminalReasonBrowserCancelled); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.parkForBrowserAdoption(ctx, id); err == nil {
+			t.Fatal("a terminal job was accepted for browser adoption")
+		}
+		row, err := jobs.Get(ctx, id)
+		if err != nil || row.State != job.StateCancelled {
+			t.Fatalf("job = %+v, %v; want cancelled and untouched", row, err)
+		}
+		if len(openActionKinds(t, jobs, id)) != 0 {
+			t.Fatal("a refused adoption must open no action")
+		}
+	})
+}

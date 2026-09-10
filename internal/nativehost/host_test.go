@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -543,4 +544,118 @@ func frameLength(data []byte) int {
 		return len(data)
 	}
 	return 4 + int(binary.LittleEndian.Uint32(data[:4]))
+}
+
+// serveSyncRPC runs a real ipc.Server answering browser.sync with handle, and
+// returns an ipcSyncer wired to it. This exercises the production
+// classification in ipcSyncer.Sync, which every other test in this file
+// bypasses with fakeSyncer.
+func serveSyncRPC(t *testing.T, handle func(json.RawMessage) ([]byte, *ipc.RPCError)) *ipcSyncer {
+	t.Helper()
+	// A unix socket path is capped near 104 bytes, and t.TempDir() embeds the
+	// full subtest name, so use a short directory of our own.
+	dir, err := os.MkdirTemp("", "papio-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "s")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &ipc.Server{Handler: ipc.HandlerFunc(func(_ context.Context, request ipc.Request) ([]byte, *ipc.RPCError) {
+		if request.Method != syncMethod {
+			return nil, &ipc.RPCError{Code: "unknown_method", Message: "unexpected method"}
+		}
+		return handle(request.Params)
+	})}
+	done := make(chan error, 1)
+	go func() { done <- server.ServeListener(ctx, listener) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = listener.Close()
+		if err := <-done; err != nil {
+			t.Errorf("serve sync socket: %v", err)
+		}
+	})
+	return &ipcSyncer{client: ipc.NewSocketClient(socket), sessionID: "session-under-test"}
+}
+
+// TestIpcSyncerClassifiesDaemonFailures pins the disposition boundary the host
+// depends on: only an explicit application_failure keeps the browser session
+// alive. Every other RPC failure — including result_too_large, an ordinary
+// internal error, and a malformed response — is fatal, because past it the
+// host can no longer trust the request/response stream.
+func TestIpcSyncerClassifiesDaemonFailures(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("success returns outbound frames and carries the session", func(t *testing.T) {
+		var seen syncRequest
+		syncer := serveSyncRPC(t, func(params json.RawMessage) ([]byte, *ipc.RPCError) {
+			if err := json.Unmarshal(params, &seen); err != nil {
+				return nil, &ipc.RPCError{Code: "invalid_argument", Message: err.Error()}
+			}
+			return []byte(`{"outbound":[{"type":"ack"}]}`), nil
+		})
+		outbound, err := syncer.Sync(ctx, []json.RawMessage{json.RawMessage(`{"type":"hello"}`)})
+		if err != nil {
+			t.Fatalf("sync: %v", err)
+		}
+		if len(outbound) != 1 || string(outbound[0]) != `{"type":"ack"}` {
+			t.Fatalf("outbound = %v", outbound)
+		}
+		if seen.SessionID != "session-under-test" || seen.Goodbye || len(seen.Messages) != 1 {
+			t.Fatalf("request = %+v", seen)
+		}
+	})
+
+	t.Run("application_failure keeps the session alive", func(t *testing.T) {
+		syncer := serveSyncRPC(t, func(json.RawMessage) ([]byte, *ipc.RPCError) {
+			return nil, &ipc.RPCError{Code: "application_failure", Message: "stale review action"}
+		})
+		_, err := syncer.Sync(ctx, nil)
+		if err == nil || !isApplicationSyncFailure(err) {
+			t.Fatalf("err = %v; want an application-level sync failure", err)
+		}
+	})
+
+	for _, code := range []string{"result_too_large", "internal", "invalid_argument", "unknown_method"} {
+		t.Run("fatal on "+code, func(t *testing.T) {
+			syncer := serveSyncRPC(t, func(json.RawMessage) ([]byte, *ipc.RPCError) {
+				return nil, &ipc.RPCError{Code: code, Message: code}
+			})
+			_, err := syncer.Sync(ctx, nil)
+			if err == nil || isApplicationSyncFailure(err) {
+				t.Fatalf("err = %v; want a fatal transport failure for %s", err, code)
+			}
+		})
+	}
+
+	t.Run("fatal on a malformed result", func(t *testing.T) {
+		syncer := serveSyncRPC(t, func(json.RawMessage) ([]byte, *ipc.RPCError) {
+			return []byte(`{"outbound":"not-a-list"}`), nil
+		})
+		_, err := syncer.Sync(ctx, nil)
+		if err == nil || isApplicationSyncFailure(err) {
+			t.Fatalf("err = %v; want a fatal transport failure", err)
+		}
+	})
+
+	t.Run("goodbye reports the departure on the same method", func(t *testing.T) {
+		var seen syncRequest
+		syncer := serveSyncRPC(t, func(params json.RawMessage) ([]byte, *ipc.RPCError) {
+			if err := json.Unmarshal(params, &seen); err != nil {
+				return nil, &ipc.RPCError{Code: "invalid_argument", Message: err.Error()}
+			}
+			return []byte(`{"outbound":[]}`), nil
+		})
+		if err := syncer.goodbye(ctx); err != nil {
+			t.Fatalf("goodbye: %v", err)
+		}
+		if !seen.Goodbye || seen.SessionID != "session-under-test" || len(seen.Messages) != 0 {
+			t.Fatalf("goodbye request = %+v", seen)
+		}
+	})
 }

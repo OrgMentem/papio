@@ -124,6 +124,18 @@ func TestObserverCreditsUsedSeedsCounter(t *testing.T) {
 	if len(rec.usedCalls) != 1 || rec.usedCalls[0] != 240 {
 		t.Fatalf("usedCalls = %v, want [240]", rec.usedCalls)
 	}
+	// A nil credit observer must not report the same header: this is the only
+	// witness for observeCreditSignals' nil-observer early return on the
+	// credits-used path, and it lives here so the seed input is stated once.
+	observerNil, _, _ := testObserverWithCredit(t, nil, map[string]string{
+		"X-RateLimit-Credits-Used": "240",
+	})
+	if err := doAndClose(observerNil, bearerRequest(t)); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.usedCalls) != 1 {
+		t.Fatalf("usedCalls = %v; a nil credit observer must not call ObserveCreditsUsed", rec.usedCalls)
+	}
 }
 
 func TestObserverCreditsUsedSeedsDatabase(t *testing.T) {
@@ -260,41 +272,6 @@ func TestObserverSkipsCreditObservationWithoutObserver(t *testing.T) {
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		t.Fatal(err)
-	}
-}
-
-func TestObserverPrimaryRecordsDenominator_guardRequired(t *testing.T) {
-	rec := &recordingCredit{}
-	observer, _, _ := testObserverWithCredit(t, rec, map[string]string{
-		"X-RateLimit-Limit": "10000",
-	})
-	if err := doAndClose(observer, bearerRequest(t)); err != nil {
-		t.Fatal(err)
-	}
-	if len(rec.limitCalls) != 1 {
-		t.Fatalf("ObserveLimit calls = %d, want 1 with credit observer wired", len(rec.limitCalls))
-	}
-}
-
-func TestObserverCreditsUsed_guardRequired(t *testing.T) {
-	rec := &recordingCredit{}
-	observer, _, _ := testObserverWithCredit(t, rec, map[string]string{
-		"X-RateLimit-Credits-Used": "240",
-	})
-	if err := doAndClose(observer, bearerRequest(t)); err != nil {
-		t.Fatal(err)
-	}
-	if len(rec.usedCalls) != 1 {
-		t.Fatalf("usedCalls = %v, want one ObserveCreditsUsed with credit observer wired", rec.usedCalls)
-	}
-	observerNil, _, _ := testObserverWithCredit(t, nil, map[string]string{
-		"X-RateLimit-Credits-Used": "240",
-	})
-	if err := doAndClose(observerNil, bearerRequest(t)); err != nil {
-		t.Fatal(err)
-	}
-	if len(rec.usedCalls) != 1 {
-		t.Fatal("nil credit observer must not call ObserveCreditsUsed")
 	}
 }
 
