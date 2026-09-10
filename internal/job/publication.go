@@ -425,6 +425,47 @@ func (js *Store) HasPublicationEdge(ctx context.Context, jobID, sha256 string, r
 	return err == nil, err
 }
 
+// ConsumePublishedPublication deletes one journal row whose acquisition edge is
+// already committed for the same job, digest and role. It exists because a
+// redundant journal row is not harmless: the scheduler reads any prepared
+// publication as unfinished work and refuses to process the job. Artifact
+// metadata is left untouched, because the committed edge still owns the digest
+// (unlike DiscardPublication, which requires no edge at all). It reports
+// whether a row was removed and refuses when no edge owns the digest.
+func (js *Store) ConsumePublishedPublication(ctx context.Context, publicationID string) (bool, error) {
+	if strings.TrimSpace(publicationID) == "" {
+		return false, errors.New("publication ID is required")
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	prepared, err := publicationByIDTx(ctx, tx, publicationID)
+	if err != nil {
+		return false, err
+	}
+	var one int
+	err = tx.QueryRowContext(ctx,
+		`SELECT 1 FROM job_artifacts WHERE job_id = ? AND artifact_sha256 = ? AND role = ? LIMIT 1`,
+		prepared.JobID, prepared.SHA256, string(prepared.Role)).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: publication %s has no committed acquisition edge", ErrConflict, publicationID)
+	}
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM artifact_publications WHERE id = ?`, publicationID)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	deleted, err := res.RowsAffected()
+	return deleted == 1, err
+}
+
 // DiscardPublication removes an unfinalized publication after recovery proves
 // both the destination and quarantine are absent. It deletes artifact metadata
 // only when no edge and no remaining journal row owns the digest.

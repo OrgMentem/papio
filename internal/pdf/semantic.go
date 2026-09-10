@@ -89,6 +89,15 @@ func ExtractText(ctx context.Context, path string, cap Capability, opt SemanticO
 	}
 	text, err := runTextTool(ctx, opt.Timeout, opt.MaxOutputBytes, cap.PDFToText, path, "-")
 	if err != nil {
+		// Cancellation is not a semantic verdict. runTextTool returns ctx.Err()
+		// when the parent context is done, and the caller
+		// (Service.validateCandidate) settles a cancelled attempt only when
+		// Validate reports an error — so swallowing this leaves an open
+		// attempt row and drives database writes on a dead context. Same rule
+		// as metadata.go's extraction path.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return TextReport{}, ctxErr
+		}
 		return TextReport{NeedsReview: true, Evidence: []string{"pdftotext failed: " + err.Error()}}, nil
 	}
 	report := textReport(text, false, opt)
@@ -114,6 +123,9 @@ func ExtractText(ctx context.Context, path string, cap Capability, opt SemanticO
 	}
 	ocr, err := extractOCR(ctx, path, cap, opt)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return TextReport{}, ctxErr
+		}
 		report.NeedsReview = true
 		report.Evidence = append(report.Evidence, "OCR unavailable: "+err.Error())
 		return report, nil

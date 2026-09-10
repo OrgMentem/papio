@@ -381,6 +381,16 @@ type RetractionAcknowledger interface {
 	AcknowledgeRetraction(ctx context.Context, itemID string) (bool, error)
 }
 
+// PdfGrabDismisser is an ItemSource that can discard one of the parked PDF
+// grabs it contributes. The grab row and its quarantined bytes outlive the
+// browser session that created them, so a dismissal has to be a durable
+// mutation owned by the source, not a browser-side gesture.
+// DismissPdfGrab takes the bare grab id, without the item-ID prefix, and
+// reports sql.ErrNoRows when it owns no such grab.
+type PdfGrabDismisser interface {
+	DismissPdfGrab(ctx context.Context, grabID string) (bool, error)
+}
+
 // Service composes the transactionally consistent inbox read model.
 type Service struct {
 	Store   *store.Store
@@ -437,6 +447,22 @@ func (s *Service) Decide(ctx context.Context, input DecisionInput, runner *watch
 			return DecisionResult{Outcome: DecisionApplied}, nil
 		default:
 			return DecisionResult{Outcome: DecisionAlreadyApplied}, nil
+		}
+	}
+	if strings.HasPrefix(input.ItemID, PdfGrabIDPrefix) {
+		if input.Operation != DecisionDismiss {
+			return DecisionResult{Outcome: DecisionInvalid, Detail: "pdf grabs support only the dismiss operation"}, nil
+		}
+		applied, err := s.dismissPdfGrab(ctx, input.ItemID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return DecisionResult{Outcome: DecisionConflict}, nil
+		case err != nil:
+			return DecisionResult{}, err
+		case applied:
+			return DecisionResult{Outcome: DecisionApplied}, nil
+		default:
+			return DecisionResult{Outcome: DecisionConflict}, nil
 		}
 	}
 
@@ -514,6 +540,34 @@ func (s *Service) acknowledgeRetraction(ctx context.Context, itemID string) (boo
 			continue
 		}
 		applied, err := acknowledger.AcknowledgeRetraction(ctx, itemID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		return applied, err
+	}
+	return false, sql.ErrNoRows
+}
+
+// dismissPdfGrab discards the parked grab named by itemID, reporting whether
+// this call removed it. It mirrors acknowledgeRetraction: the owning source
+// implements the mutation, so every transport — the browser bridge, the CLI
+// and MCP over RPC — reaches one implementation instead of the bridge owning
+// a private copy the RPC path could not reach. No registered source owning
+// the item yields sql.ErrNoRows.
+func (s *Service) dismissPdfGrab(ctx context.Context, itemID string) (bool, error) {
+	id, ok := strings.CutPrefix(itemID, PdfGrabIDPrefix)
+	if !ok || id == "" {
+		return false, sql.ErrNoRows
+	}
+	s.mu.RLock()
+	sources := append([]ItemSource(nil), s.sources...)
+	s.mu.RUnlock()
+	for _, source := range sources {
+		dismisser, ok := source.(PdfGrabDismisser)
+		if !ok {
+			continue
+		}
+		applied, err := dismisser.DismissPdfGrab(ctx, id)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}

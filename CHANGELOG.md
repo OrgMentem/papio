@@ -247,6 +247,28 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Dismissing a held PDF from the command line now works.** The inbox offers
+  "dismiss" on a PDF *papio* is holding without an identity, and the browser
+  window honoured it, but the same request over the command line or an agent
+  connection answered "conflict" and left the file in place. One dismissal path
+  now serves every surface, so the file and its record go away whichever
+  surface you use.
+- **A cancelled paper no longer leaves a document-delivery request looking
+  live.** Cancelling a paper, or dismissing its request, from the browser window
+  skipped the reconciliation the command line already did, so a delivery request
+  *papio* had stopped watching stayed recorded as submitted forever.
+- **An interrupted text check is no longer reported as a failed one.** Shutting
+  *papio* down while it was reading a PDF's text recorded the interruption as a
+  document that needs your review, and left the attempt open. The same applies
+  to an interrupted sibling-version lookup. Both now record the interruption for
+  what it is.
+- **A paper whose file was already filed can no longer stall.** A leftover
+  publication record for a file *papio* had already filed made the scheduler
+  treat the paper as unfinished and skip it on every pass. Recovery now clears
+  the redundant record and keeps the filed copy.
+- **`papio jobs failures` no longer leaks a database connection** when a row
+  fails to read, and two advisories in an indirect dependency
+  (`golang.org/x/crypto`) are closed by moving to v0.57.0.
 - **A vanished sign-in tab no longer strands your library's one sign-in slot.**
   *papio* gives that slot to the paper that is signing in, and deliberately
   keeps giving it when your browser restarts its background worker, so a sign-in

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -155,6 +156,48 @@ func TestExtractTextAndOCRCapabilityEvidence(t *testing.T) {
 	report, err = ExtractText(context.Background(), path, Capability{PDFToText: pdftotext, PDFToPPM: pdftoppm, Tesseract: tesseract}, DefaultSemanticOptions())
 	if err != nil || !report.OCRUsed || report.NeedsReview || report.Chars < 1000 {
 		t.Fatalf("OCR report=%+v err=%v", report, err)
+	}
+}
+
+// TestExtractTextPropagatesCancellation pins the rule metadata.go states and
+// semantic.go used to break: a cancelled context is not a semantic verdict.
+// Reporting NeedsReview with a nil error hid the cancellation from
+// Service.validateCandidate, which settles a cancelled attempt only when
+// Validate returns an error — so the attempt row stayed open and every
+// follow-up write ran on a dead context.
+func TestExtractTextPropagatesCancellation(t *testing.T) {
+	path := writeTempPDF(t)
+	hung := fakeTool(t, `sleep 10`)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+	report, err := ExtractText(ctx, path, Capability{PDFToText: hung}, SemanticOptions{Timeout: 10 * time.Second})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled; report = %+v", err, report)
+	}
+	if report.NeedsReview {
+		t.Fatalf("cancelled extraction must not report a review verdict: %+v", report)
+	}
+
+	// OCR leg: pdftotext succeeds with sparse text, then the raster stage is
+	// interrupted.
+	sparse := fakeTool(t, `printf 'short text'`)
+	slowRaster := fakeTool(t, `sleep 10`)
+	ocrCtx, ocrCancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		ocrCancel()
+	}()
+	defer ocrCancel()
+	report, err = ExtractText(ocrCtx, path, Capability{PDFToText: sparse, PDFToPPM: slowRaster, Tesseract: sparse}, SemanticOptions{Timeout: 10 * time.Second})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("OCR err = %v, want context.Canceled; report = %+v", err, report)
+	}
+	if report.NeedsReview {
+		t.Fatalf("cancelled OCR must not report a review verdict: %+v", report)
 	}
 }
 

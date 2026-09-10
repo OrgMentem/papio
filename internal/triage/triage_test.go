@@ -9,9 +9,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1431,8 +1434,15 @@ func TestSnapshotCursorSurvivesMutationAndRejectsSchemaSwitchAndStaleAnchor(t *t
 		t.Fatalf("cursor anchored on removed %q was accepted; expected invalid triage cursor", firstID)
 	}
 
-	// Insertion-only walk must still yield every item exactly once: never
-	// skip or duplicate, regardless of a mid-page insert ahead of the cursor.
+	// Insertion-only walk must still yield every seeded item exactly once, and
+	// must yield exactly those items: a walk that swapped one seeded item for
+	// an unrelated later insertion has the same cardinality.
+	//
+	// Items are ordered by item ID (assignRanks), NOT by first_seen_at, so the
+	// two insertion positions are constructed by work key, not by timestamp.
+	// A new watch always takes a higher watch id and therefore lands BEHIND the
+	// anchor whatever timestamp it carries; only a new work key on the anchor's
+	// own watch can land AHEAD of it.
 	service2, watches2, _ := triageTestService(t)
 	seeded2 := make([]*watch.Watch, 0, 4)
 	for i := range 4 {
@@ -1456,11 +1466,26 @@ func TestSnapshotCursorSurvivesMutationAndRejectsSchemaSwitchAndStaleAnchor(t *t
 	seen := map[string]int{}
 	seen[first2.Items[0].ID]++
 	cursor := first2.Cursor
+	anchorID := first2.Items[0].ID
+	// Behind the anchor: a new watch, so a higher watch id and a later item ID.
 	injected := createTriageWatch(t, watches2, "cursor-walk-injected")
 	if _, err := watches2.RecordDigest(context.Background(), injected.ID, now.Add(-time.Hour), []watch.DigestEntry{
 		{WorkKey: "10.1000/injected", Title: "Injected", DOI: "10.1000/injected"},
 	}); err != nil {
 		t.Fatal(err)
+	}
+	// Ahead of the anchor: the anchor's own watch with a work key that sorts
+	// before it. Keyset pagination must leave this out of the current walk;
+	// the caller sees it only by restarting from the head.
+	if _, err := watches2.RecordDigest(context.Background(), seeded2[0].ID, now.Add(time.Hour), []watch.DigestEntry{
+		{WorkKey: "10.1000/aaa", Title: "Ahead of anchor", DOI: "10.1000/aaa"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aheadID := "hit:" + strconv.FormatInt(seeded2[0].ID, 10) + ":10.1000/aaa"
+	head, err := service2.Snapshot(context.Background(), SnapshotRequest{Limit: 10, Schema: 5})
+	if err != nil || len(head.Items) == 0 || head.Items[0].ID != aheadID {
+		t.Fatalf("ahead-of-anchor insert must head a fresh walk; got %+v, %v", head.Items, err)
 	}
 	for {
 		page, err := service2.Snapshot(context.Background(), SnapshotRequest{Limit: 1, Cursor: cursor, Schema: 5})
@@ -1475,13 +1500,15 @@ func TestSnapshotCursorSurvivesMutationAndRejectsSchemaSwitchAndStaleAnchor(t *t
 		}
 		cursor = page.Cursor
 	}
-	for id, count := range seen {
-		if count != 1 {
-			t.Fatalf("walk produced duplicate/skip for %q: count %d, seen %v", id, count, seen)
-		}
+	want := map[string]int{
+		anchorID: 1,
+		"hit:" + strconv.FormatInt(seeded2[1].ID, 10) + ":10.1000/w2":     1,
+		"hit:" + strconv.FormatInt(seeded2[2].ID, 10) + ":10.1000/w3":     1,
+		"hit:" + strconv.FormatInt(seeded2[3].ID, 10) + ":10.1000/w4":     1,
+		"hit:" + strconv.FormatInt(injected.ID, 10) + ":10.1000/injected": 1,
 	}
-	if want := 5; len(seen) != want {
-		t.Fatalf("walk covered %d items, want %d: %v", len(seen), want, seen)
+	if !maps.Equal(seen, want) {
+		t.Fatalf("walk visited %v, want exactly %v (ahead-of-anchor %s must be skipped)", seen, want, aheadID)
 	}
 
 	// Schema-boundary regression: a client that enumerates under schema 3
@@ -1510,6 +1537,60 @@ func TestSnapshotCursorSurvivesMutationAndRejectsSchemaSwitchAndStaleAnchor(t *t
 	_ = jobs
 }
 
+// TestDecideDismissesPdfGrabThroughItsSource pins the transport-independent
+// dismissal: the browser bridge used to own a private copy, so triage.decide
+// over RPC answered "conflict" for the dismiss operation pdf_grab items
+// themselves advertise.
+func TestDecideDismissesPdfGrabThroughItsSource(t *testing.T) {
+	service, watches, _ := triageTestService(t)
+	ctx := context.Background()
+	source := &dismissingGrabSource{grabID: "grab_decide_1"}
+	service.RegisterSource(source)
+
+	result, err := service.Decide(ctx, DecisionInput{
+		ItemID: PdfGrabIDPrefix + "grab_decide_1", Operation: DecisionDismiss,
+	}, &watch.Runner{Store: watches})
+	if err != nil || result.Outcome != DecisionApplied {
+		t.Fatalf("dismiss result = %+v, %v; want applied", result, err)
+	}
+	if source.dismissed != "grab_decide_1" {
+		t.Fatalf("dismissed grab = %q; want the bare grab id without the item prefix", source.dismissed)
+	}
+
+	gone, err := service.Decide(ctx, DecisionInput{
+		ItemID: PdfGrabIDPrefix + "grab_missing", Operation: DecisionDismiss,
+	}, &watch.Runner{Store: watches})
+	if err != nil || gone.Outcome != DecisionConflict {
+		t.Fatalf("unknown grab result = %+v, %v; want conflict", gone, err)
+	}
+
+	acquire, err := service.Decide(ctx, DecisionInput{
+		ItemID: PdfGrabIDPrefix + "grab_decide_1", Operation: DecisionAcquire,
+	}, &watch.Runner{Store: watches})
+	if err != nil || acquire.Outcome != DecisionInvalid {
+		t.Fatalf("acquire on a grab = %+v, %v; want invalid", acquire, err)
+	}
+}
+
+type dismissingGrabSource struct {
+	grabID    string
+	dismissed string
+}
+
+func (s *dismissingGrabSource) SnapshotItems(context.Context, *sql.Tx) ([]Item, error) {
+	return []Item{{
+		Kind: KindPdfGrab, ID: PdfGrabIDPrefix + s.grabID, Title: "Reading copy",
+		Ops: []string{"provide_identifier", "dismiss"}, PdfGrab: &PdfGrab{GrabID: s.grabID, State: "parked_no_identifier"},
+	}}, nil
+}
+
+func (s *dismissingGrabSource) DismissPdfGrab(_ context.Context, grabID string) (bool, error) {
+	if grabID != s.grabID {
+		return false, sql.ErrNoRows
+	}
+	s.dismissed = grabID
+	return true, nil
+}
 func TestDecideOwnsWatchScopeSelection(t *testing.T) {
 	service, watches, _ := triageTestService(t)
 	ctx := context.Background()
@@ -1552,5 +1633,88 @@ func TestDecideOwnsWatchScopeSelection(t *testing.T) {
 	secondEntries, err := watches.Digest(ctx, second.ID, 10)
 	if err != nil || len(secondEntries) != 0 {
 		t.Fatalf("second watch after subset dismissal = %+v, %v, want no digest", secondEntries, err)
+	}
+}
+
+// acknowledgingRetractionSource is a retraction item source whose
+// acknowledgement outcome each test sets explicitly.
+type acknowledgingRetractionSource struct {
+	doi      string
+	applied  bool
+	err      error
+	seen     string
+	nowStamp time.Time
+}
+
+func (s *acknowledgingRetractionSource) SnapshotItems(context.Context, *sql.Tx) ([]Item, error) {
+	return []Item{{
+		Kind: KindRetraction, ID: RetractionIDPrefix + s.doi, Title: "Retracted work",
+		Ops:        []string{"dismiss", "open"},
+		Retraction: &Retraction{DOI: s.doi, Nature: "retraction", NoticedAt: s.nowStamp},
+	}}, nil
+}
+
+func (s *acknowledgingRetractionSource) AcknowledgeRetraction(_ context.Context, itemID string) (bool, error) {
+	s.seen = itemID
+	if s.err != nil {
+		return false, s.err
+	}
+	if itemID != RetractionIDPrefix+s.doi {
+		return false, sql.ErrNoRows
+	}
+	return s.applied, nil
+}
+
+// TestDecideAcknowledgesRetractionThroughItsSource covers the retraction arm of
+// the inbox decision layer at service level. internal/retraction tests the
+// sentinel directly, which cannot see triage's source discovery, its
+// sql.ErrNoRows skipping, the already-applied mapping, or error propagation.
+func TestDecideAcknowledgesRetractionThroughItsSource(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// No source implements the acknowledger: the notice cannot be owned.
+	bare, watches, _ := triageTestService(t)
+	bare.RegisterSource(staticSource{items: []Item{{
+		Kind: KindRetraction, ID: RetractionIDPrefix + "10.1000/orphan", Title: "Retracted work",
+		Ops: []string{"dismiss"}, Retraction: &Retraction{DOI: "10.1000/orphan", Nature: "retraction", NoticedAt: now},
+	}}})
+	if result, err := bare.Decide(ctx, DecisionInput{
+		ItemID: RetractionIDPrefix + "10.1000/orphan", Operation: DecisionDismiss,
+	}, &watch.Runner{Store: watches}); err != nil || result.Outcome != DecisionConflict {
+		t.Fatalf("unowned notice = %+v, %v; want conflict", result, err)
+	}
+
+	service, watches2, _ := triageTestService(t)
+	source := &acknowledgingRetractionSource{doi: "10.1000/retracted", applied: true, nowStamp: now}
+	service.RegisterSource(source)
+	runner := &watch.Runner{Store: watches2}
+	item := RetractionIDPrefix + "10.1000/retracted"
+
+	if result, err := service.Decide(ctx, DecisionInput{ItemID: item, Operation: DecisionDismiss}, runner); err != nil || result.Outcome != DecisionApplied {
+		t.Fatalf("first dismiss = %+v, %v; want applied", result, err)
+	}
+	if source.seen != item {
+		t.Fatalf("source saw %q, want the full item ID", source.seen)
+	}
+
+	// A notice already acknowledged reports already_applied, not applied: the
+	// caller must not be told it changed something.
+	source.applied = false
+	if result, err := service.Decide(ctx, DecisionInput{ItemID: item, Operation: DecisionDismiss}, runner); err != nil || result.Outcome != DecisionAlreadyApplied {
+		t.Fatalf("repeat dismiss = %+v, %v; want already_applied", result, err)
+	}
+
+	// A retraction supports dismiss only.
+	if result, err := service.Decide(ctx, DecisionInput{ItemID: item, Operation: DecisionAcquire}, runner); err != nil || result.Outcome != DecisionInvalid {
+		t.Fatalf("acquire on a notice = %+v, %v; want invalid", result, err)
+	}
+
+	// An unexpected source error propagates rather than becoming a conflict,
+	// so the caller does not read a broken source as "notice is gone".
+	boom := errors.New("retraction store unavailable")
+	source.err = boom
+	if _, err := service.Decide(ctx, DecisionInput{ItemID: item, Operation: DecisionDismiss}, runner); !errors.Is(err, boom) {
+		t.Fatalf("source error = %v, want it propagated", err)
 	}
 }

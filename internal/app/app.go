@@ -1016,6 +1016,14 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 		}
 		plan.observeSourceCalled()
 		if err != nil {
+			// A cancelled lookup must settle its attempt on a live context:
+			// FinishAttempt's UPDATE is refused outright for a dead one, which
+			// would leave this row open forever and misreport shutdown as
+			// unfinished work. Abort the hop rather than trying the next source.
+			if ctx.Err() != nil {
+				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
+				return nil, plan
+			}
 			// A rate-limited sibling lookup is not a verdict. Recording it as
 			// a plain failure let a 429 here settle the whole job unavailable,
 			// because the hop runs at the exhaustion boundary where a missing
@@ -1162,6 +1170,12 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 	plan.observeSourceCalled()
 	sibs, err := relations.VersionSiblings(ctx, row.Work.DOI)
 	if err != nil {
+		// See resolveSecondary: a dead context makes FinishAttempt a no-op, so
+		// the attempt row must be settled through settleCancelledAttempt.
+		if ctx.Err() != nil {
+			s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
+			return nil, plan
+		}
 		if delay, temporary := resolver.Temporary(err); temporary {
 			sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
 			if s.Budgets != nil {
@@ -3473,6 +3487,17 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 			return err
 		}
 		if edge {
+			// The acquisition edge already owns this job, digest and role, so
+			// this journal row can never publish anything new — but leaving it
+			// in place is not inert: processNext treats ANY prepared
+			// publication as unfinished work and returns before processing the
+			// job, wedging it on every tick. Consume the redundant row instead
+			// of skipping it. Finalizing it is not an option: its recorded
+			// from_state no longer holds once the edge committed, so
+			// transitionPublicationMainTx would refuse the transition.
+			if _, err := s.Jobs.ConsumePublishedPublication(ctx, publication.ID); err != nil {
+				return err
+			}
 			continue
 		}
 		recoveryOwner := ""
@@ -3499,12 +3524,16 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 		destExists := s.Artifacts.Verify(publication.SHA256) == nil
 		quarantineInfo, quarantineErr := os.Stat(publication.QuarantinePath)
 		quarantineExists := quarantineErr == nil && quarantineInfo.Mode().IsRegular()
+		dest := ""
+		if destExists {
+			resolved, pathErr := s.Artifacts.ArtifactPath(publication.SHA256)
+			if pathErr != nil {
+				return pathErr
+			}
+			dest = resolved
+		}
 		switch {
 		case destExists:
-			dest, err := s.Artifacts.ArtifactPath(publication.SHA256)
-			if err != nil {
-				return err
-			}
 			_, err = s.Jobs.FinalizePublication(ctx, publication.ID, func() (job.PromotionResult, error) {
 				return job.PromotionResult{Path: dest}, nil
 			})

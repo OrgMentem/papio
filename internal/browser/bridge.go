@@ -628,6 +628,35 @@ const pendingExpireAfter = 5 * time.Minute
 
 type parkedGrabItemSource struct {
 	store *store.Store
+	grabs *grab.Service
+}
+
+// DismissPdfGrab discards one parked grab and its quarantine directory. It
+// lives on the item source so triage.Service.Decide serves the browser, the
+// CLI and MCP from one implementation: an earlier private copy on Bridge left
+// triage.decide over RPC answering "conflict" for the dismiss operation the
+// items themselves advertise.
+func (source parkedGrabItemSource) DismissPdfGrab(ctx context.Context, grabID string) (bool, error) {
+	if source.grabs == nil || grabID == "" {
+		return false, sql.ErrNoRows
+	}
+	g, err := source.grabs.Get(ctx, grabID)
+	if err != nil {
+		return false, err
+	}
+	if g == nil {
+		return false, sql.ErrNoRows
+	}
+	quarantinePath := g.QuarantinePath
+	if err := source.grabs.Delete(ctx, grabID); err != nil {
+		return false, err
+	}
+	if quarantinePath != "" {
+		if err := os.RemoveAll(filepath.Dir(quarantinePath)); err != nil {
+			log.Printf("papio: removing dismissed grab quarantine %s: %v", filepath.Dir(quarantinePath), err)
+		}
+	}
+	return true, nil
 }
 
 func (source parkedGrabItemSource) SnapshotItems(ctx context.Context, tx *sql.Tx) ([]triage.Item, error) {
@@ -675,7 +704,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 			cohorts = batch.New(jobs.S)
 		}
 		if triageService != nil {
-			triageService.RegisterSource(parkedGrabItemSource{store: jobs.S})
+			triageService.RegisterSource(parkedGrabItemSource{store: jobs.S, grabs: grabs})
 		}
 	}
 	return &Bridge{
@@ -3442,7 +3471,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		b.cancelSent[msg.JobID] = true
 		b.cancelAnnounced[msg.JobID] = true
 		b.clearMaterializationTracking(msg.JobID)
-		if err := b.jobs.Cancel(ctx, msg.JobID, job.TerminalReasonBrowserCancelled); err != nil {
+		if err := b.cancelJob(ctx, msg.JobID, job.TerminalReasonBrowserCancelled); err != nil {
 			log.Printf("papio: cancelling browser job: %v", err)
 		}
 		return nil, nil
@@ -5121,14 +5150,13 @@ func activityTitle(value string) string {
 }
 
 func (b *Bridge) triageDecide(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
-	if strings.HasPrefix(request.ItemID, triage.PdfGrabIDPrefix) {
-		return b.dismissPdfGrab(ctx, request)
-	}
 	if b.triage == nil || b.watchRunner == nil {
 		return b.triageDecisionResult(request.RequestID, "error", "triage mutations are not configured")
 	}
 	scope := triage.WatchScope{}
-	if request.Op == string(triage.DecisionDismiss) {
+	// A pdf_grab dismissal names one durable grab row, not a set of watches,
+	// so it carries no watch scope to decode.
+	if request.Op == string(triage.DecisionDismiss) && !strings.HasPrefix(request.ItemID, triage.PdfGrabIDPrefix) {
 		var err error
 		scope, err = decodeTriageDismissScope(request.WatchScope)
 		if err != nil {
@@ -5175,36 +5203,6 @@ func decodeTriageDismissScope(raw json.RawMessage) (triage.WatchScope, error) {
 	return triage.WatchScope{WatchIDs: ids}, nil
 }
 
-func (b *Bridge) dismissPdfGrab(ctx context.Context, request *protocol.TriageDecidePayload) ([]json.RawMessage, error) {
-	if request.Op != "dismiss" {
-		return b.triageDecisionResult(request.RequestID, "error", "pdf grabs support only the dismiss operation")
-	}
-	if b.grabs == nil {
-		return b.triageDecisionResult(request.RequestID, "error", "pdf grabs are not configured")
-	}
-	id := strings.TrimPrefix(request.ItemID, triage.PdfGrabIDPrefix)
-	if id == "" {
-		return b.triageDecisionResult(request.RequestID, "conflict", "")
-	}
-	g, err := b.grabs.Get(ctx, id)
-	if err != nil {
-		return b.triageDecisionResult(request.RequestID, "error", "pdf grab is temporarily unavailable")
-	}
-	if g == nil {
-		return b.triageDecisionResult(request.RequestID, "conflict", "")
-	}
-	quarantinePath := g.QuarantinePath
-	if err := b.grabs.Delete(ctx, id); err != nil {
-		return b.triageDecisionResult(request.RequestID, "error", "pdf grab could not be dismissed")
-	}
-	if quarantinePath != "" {
-		if err := os.RemoveAll(filepath.Dir(quarantinePath)); err != nil {
-			log.Printf("papio: removing dismissed grab quarantine %s: %v", filepath.Dir(quarantinePath), err)
-		}
-	}
-	return b.triageDecisionResult(request.RequestID, "applied", "")
-}
-
 func (b *Bridge) triageDecisionResult(requestID, outcome, detail string) ([]json.RawMessage, error) {
 	frame, err := b.frame(protocol.MsgTriageDecideResult, "", protocol.TriageDecideResultPayload{
 		RequestID: requestID, Outcome: outcome, Detail: truncate(detail, 1000),
@@ -5213,6 +5211,26 @@ func (b *Bridge) triageDecisionResult(requestID, outcome, detail string) ([]json
 		return nil, err
 	}
 	return []json.RawMessage{frame}, nil
+}
+
+// cancelJob and dismissAction route the browser's own terminal gestures through
+// app.Service, which additionally orphans any live document-delivery request
+// the job was driving (ADR-0017 Decision 4). Calling job.Store directly — as
+// this file used to — left such a row looking submitted/pending forever, while
+// the CLI and RPC paths reconciled it. The store fallback keeps tests and any
+// service-less bridge working.
+func (b *Bridge) cancelJob(ctx context.Context, jobID string, reason job.TerminalReason) error {
+	if b.svc != nil {
+		return b.svc.CancelJob(ctx, jobID, reason)
+	}
+	return b.jobs.Cancel(ctx, jobID, reason)
+}
+
+func (b *Bridge) dismissAction(ctx context.Context, actionID, expectedRevision int64) (string, error) {
+	if b.svc != nil {
+		return b.svc.DismissAction(ctx, actionID, expectedRevision)
+	}
+	return b.jobs.DismissHumanAction(ctx, actionID, expectedRevision)
 }
 
 func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.HumanActionResolvePayload) ([]json.RawMessage, error) {
@@ -5234,7 +5252,7 @@ func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.Human
 		if dismissedKind == "" {
 			return b.humanActionResolveResult(request.RequestID, "error", "human action not found")
 		}
-		_, err := b.jobs.DismissHumanAction(ctx, request.ActionID, request.ExpectedRevision)
+		_, err := b.dismissAction(ctx, request.ActionID, request.ExpectedRevision)
 		if err != nil {
 			if errors.Is(err, job.ErrConflict) {
 				return b.humanActionResolveResult(request.RequestID, "conflict", "")
@@ -5540,15 +5558,26 @@ func (b *Bridge) pageBulkStatus(ctx context.Context, request *protocol.PageBulkS
 			return []json.RawMessage{frame}, nil
 		}
 		// Detect an item that cannot fit even by itself before dropping valid
-		// neighbors to satisfy the aggregate frame cap. "invalid" is the
-		// existing renderable refusal state; clearing the canonical identity
+		// neighbors to satisfy the aggregate frame cap. "frame_too_large" is
+		// the renderable refusal state; clearing the canonical identity
 		// prevents the workspace from offering it for submission.
+		//
+		// Every loop path below MUST shrink either the payload or the item
+		// count, or this loop never terminates. Marking an item refused shrinks
+		// it only once, so an already-refused item that still does not fit is
+		// dropped instead of re-marked: with all protocol fields bounded (a
+		// refused item is a <=128-char local_id and a status) that is
+		// unreachable today, and it stays unreachable by construction rather
+		// than by arithmetic on the caps.
 		refused := false
 		for i, item := range items {
 			if b.frameFits(protocol.MsgPageBulkStatusResult, protocol.PageBulkStatusResultPayload{
 				RequestID: request.RequestID, ScanID: request.ScanID,
 				Items: []protocol.PageBulkStatusItem{item}, Truncated: true,
 			}) {
+				continue
+			}
+			if item.Status == "frame_too_large" {
 				continue
 			}
 			log.Printf("papio: refusing oversized page-bulk status item %s", item.LocalID)
@@ -5559,19 +5588,14 @@ func (b *Bridge) pageBulkStatus(ctx context.Context, request *protocol.PageBulkS
 			truncated = true
 			continue
 		}
-		if len(items) <= 1 {
-			// This is defensive: all current protocol fields are bounded, so
-			// a single valid item should fit. Return a structured refusal if
-			// a future field violates that invariant.
-			if len(items) == 1 {
-				log.Printf("papio: refusing page-bulk status item %s after frame-cap exhaustion", items[0].LocalID)
-				items[0] = protocol.PageBulkStatusItem{LocalID: items[0].LocalID, Status: "invalid"}
-				truncated = true
-				continue
-			}
+		if len(items) == 0 {
 			return b.unavailable(request.RequestID, "page_bulk_status_unavailable",
 				"page status is temporarily unavailable", "page bulk status", nil)
 		}
+		// Drop the last item, including the final one: a request_id and scan_id
+		// alone always fit, so an empty item list is a reachable base case and
+		// the refusal above is reachable code.
+		log.Printf("papio: dropping page-bulk status item %s after frame-cap exhaustion", items[len(items)-1].LocalID)
 		items = items[:len(items)-1]
 		truncated = true
 	}
@@ -7942,7 +7966,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 			return err
 		}
 		b.cancelSent[jobID] = true
-		return b.jobs.Cancel(ctx, jobID, job.TerminalReasonBrowserCancelled)
+		return b.cancelJob(ctx, jobID, job.TerminalReasonBrowserCancelled)
 
 	case "no_entitlement", "document_delivery_available":
 		// The provider has ended this browser drive. Release its exact

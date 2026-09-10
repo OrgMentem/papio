@@ -162,6 +162,7 @@ func (js *Store) IncidentFailures(ctx context.Context, since time.Time, limit in
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 	type jobRow struct {
 		id        string
 		state     string

@@ -93,6 +93,63 @@ func TestFinalizePublicationMainCommitsOneAcceptance(t *testing.T) {
 	}
 }
 
+// TestConsumePublishedPublicationClearsRedundantJournalRow pins the recovery
+// escape from a wedged job: a journal row whose acquisition edge is already
+// committed cannot publish anything, but the scheduler reads ANY prepared
+// publication as unfinished work and refuses to process the job, so recovery
+// has to consume the row instead of skipping it. Artifact metadata must
+// survive, because the committed edge still owns the digest.
+func TestConsumePublishedPublicationClearsRedundantJournalRow(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	jobID, candidateID := validatingPublicationJob(t, js, "wr_publication_consume")
+	sha := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	input := publicationInput("publication_consume", jobID, &candidateID, PublicationRoleMain, sha)
+	input.FromState, input.ToState = StateValidating, StateReady
+	if err := js.PreparePublication(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.FinalizePublication(ctx, input.ID, func() (PromotionResult, error) {
+		return PromotionResult{Path: input.Artifact.Path, Created: true}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second journal row for the same job, digest and role: the shape a
+	// duplicate adoption leaves behind once the edge exists.
+	redundant := publicationInput("publication_consume_again", jobID, nil, PublicationRoleMain, sha)
+	if err := js.PreparePublication(ctx, redundant); err != nil {
+		t.Fatal(err)
+	}
+	consumed, err := js.ConsumePublishedPublication(ctx, redundant.ID)
+	if err != nil || !consumed {
+		t.Fatalf("consume = %t, %v; want true, nil", consumed, err)
+	}
+	prepared, err := js.PreparedPublications(ctx, jobID)
+	if err != nil || len(prepared) != 0 {
+		t.Fatalf("prepared = %+v, %v; want none, so the scheduler can process the job", prepared, err)
+	}
+	edge, err := js.HasPublicationEdge(ctx, jobID, sha, PublicationRoleMain)
+	if err != nil || !edge {
+		t.Fatalf("edge = %t, %v; want the committed acquisition retained", edge, err)
+	}
+
+	// Without an edge the row is still owed real recovery, so consumption
+	// must refuse rather than discard evidence.
+	other, otherCandidate := validatingPublicationJob(t, js, "wr_publication_consume_noedge")
+	unpublished := publicationInput("publication_consume_noedge", other, &otherCandidate, PublicationRoleMain,
+		"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	if err := js.PreparePublication(ctx, unpublished); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ConsumePublishedPublication(ctx, unpublished.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("consume without edge = %v, want ErrConflict", err)
+	}
+	if prepared, err := js.PreparedPublications(ctx, other); err != nil || len(prepared) != 1 {
+		t.Fatalf("unpublished journal = %+v, %v; want retained", prepared, err)
+	}
+}
+
 func TestFinalizePublicationComponentDoesNotTransitionJob(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
@@ -83,7 +84,10 @@ func triageDecide(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "triage inbox is not configured"}
 	}
 	scope := triage.WatchScope{}
-	if params.Op == string(triage.DecisionDismiss) {
+	// A pdf_grab dismissal names one durable grab row rather than a set of
+	// watches, so it carries no watch scope. triage.Service.Decide owns the
+	// dismissal itself; this path must not demand a scope it cannot have.
+	if params.Op == string(triage.DecisionDismiss) && !strings.HasPrefix(params.ItemID, triage.PdfGrabIDPrefix) {
 		var err error
 		scope, err = decodeTriageDismissScope(params.WatchScope)
 		if err != nil {
