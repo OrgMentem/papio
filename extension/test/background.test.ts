@@ -84,6 +84,7 @@ import {
   type TabChangeInfo,
   type TabInfo,
 } from "../src/background";
+import type { NativeRequestResult } from "../src/correlation";
 import { routeResolverService } from "../src/resolver";
 import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { FakeDownloads } from "./fake-downloads";
@@ -421,6 +422,13 @@ interface Harness {
   pageBulkScans: { current: PageBulkScanStore };
   sessionStorage: { clear(): void };
   detachBridgeListeners(): void;
+}
+
+function stubCorrelatedRequests(
+  bridge: Bridge,
+  handler: (...args: unknown[]) => Promise<NativeRequestResult>,
+): void {
+  bridge.requestCorrelated = (...args) => handler(...args);
 }
 
 function makeHarness(
@@ -3019,7 +3027,7 @@ test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async
   ).toEqual([]);
 });
 
-// --- Slice 0 containment (dev/active/surface-lifecycle-plan.md) ---
+// --- Slice 0 containment (dev/adr/0028-surface-lifecycle-ownership.md) ---
 // Without the daemon-side authentication-claim feature, NO autonomous path
 // may create a requires_auth surface; the work parks tabless for explicit
 // engagement. These pin the gate closed; the machinery itself stays covered
@@ -16681,12 +16689,12 @@ describe("generic settled-unknown acquisition", () => {
       if (injection.func === planGeneric) return [{ result: planned }];
       return [];
     };
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => ({
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => ({
       kind: "response",
       payload: {
         ...((args[1] ?? {}) as Record<string, unknown>),
         outcome:
-          args[2] === "provider_drive_epoch_start_result"
+          args[0] === "provider_drive_epoch_start_request"
             ? "started"
             : "applied",
       },
@@ -16700,7 +16708,7 @@ describe("generic settled-unknown acquisition", () => {
         features: ["provider_drive_epoch_v1", "effect_permit_v1"],
       }),
     );
-    // requestNative above models the feature-negotiated daemon ACK.
+    // The stub above models the feature-negotiated daemon acknowledgement.
     offer.payload["expected"] = { doi: expectedDOI };
     if (driveEpoch) {
       offer.payload["drive_attempt_id"] = "generic-test-epoch-1";
@@ -16751,14 +16759,14 @@ describe("generic settled-unknown acquisition", () => {
       }
       return [];
     };
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       requests.push(args);
       return {
         kind: "response",
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
           outcome:
-            args[2] === "provider_drive_epoch_start_result"
+            args[0] === "provider_drive_epoch_start_request"
               ? (outcomes.shift() ?? "stale")
               : "applied",
         },
@@ -17026,7 +17034,7 @@ describe("generic settled-unknown acquisition", () => {
     offer.payload["drive_strategy"] = "generic";
     offer.payload["drive_revision"] = "1";
     await h.port.inbound(offer);
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       if (args[0] === "provider_drive_epoch_start_request") {
         entered();
         await epochStartGate;
@@ -17036,7 +17044,7 @@ describe("generic settled-unknown acquisition", () => {
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
           outcome:
-            args[2] === "provider_drive_epoch_start_result"
+            args[0] === "provider_drive_epoch_start_request"
               ? "started"
               : "applied",
         },
@@ -17138,14 +17146,14 @@ describe("generic settled-unknown acquisition", () => {
       }
       return [];
     };
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       requests.push(args);
       return {
         kind: "response",
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
           outcome:
-            args[2] === "provider_drive_epoch_start_result"
+            args[0] === "provider_drive_epoch_start_request"
               ? "started"
               : "applied",
         },
@@ -17155,7 +17163,7 @@ describe("generic settled-unknown acquisition", () => {
     await h.port.inbound(
       helloAck({ features: ["provider_drive_epoch_v1", "effect_permit_v1"] }),
     );
-    // requestNative above models the feature-negotiated daemon ACK.
+    // The stub above models the feature-negotiated daemon acknowledgement.
     const offer = jobOffer("job_generic_identity", OPENURL, "delegated") as {
       payload: Record<string, unknown>;
     };
@@ -17182,7 +17190,11 @@ describe("generic settled-unknown acquisition", () => {
     expect(
       requests
         .filter((args) => args[0] === "provider_drive_epoch_result_request")
-        .every((args) => args[5] === "job_generic_identity"),
+        .every(
+          (args) =>
+            (args[2] as { jobID?: string } | undefined)?.jobID ===
+            "job_generic_identity",
+        ),
     ).toBe(true);
     expect(
       h
@@ -17219,12 +17231,12 @@ describe("generic settled-unknown acquisition", () => {
       state: "in_progress",
     });
     const reloaded = new Bridge(h.deps);
-    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => ({
+    stubCorrelatedRequests(reloaded, async (...args: unknown[]) => ({
       kind: "response",
       payload: {
         ...((args[1] ?? {}) as Record<string, unknown>),
         outcome:
-          args[2] === "provider_drive_epoch_start_result"
+          args[0] === "provider_drive_epoch_start_request"
             ? "started"
             : "applied",
       },
@@ -17286,14 +17298,14 @@ describe("generic settled-unknown acquisition", () => {
     });
     const reloaded = new Bridge(h.deps);
     const requests: unknown[][] = [];
-    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(reloaded, async (...args: unknown[]) => {
       requests.push(args);
       return {
         kind: "response",
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
           outcome:
-            args[2] === "provider_drive_epoch_start_result"
+            args[0] === "provider_drive_epoch_start_request"
               ? "started"
               : "applied",
         },
@@ -17335,7 +17347,7 @@ describe("generic settled-unknown acquisition", () => {
     expect(JSON.stringify(persisted)).not.toContain("restart.pdf");
     const reloaded = new Bridge(h.deps);
     let restartedStartRequests = 0;
-    Reflect.set(reloaded, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(reloaded, async (...args: unknown[]) => {
       if (args[0] === "provider_drive_epoch_start_request")
         restartedStartRequests += 1;
       return {
@@ -17343,7 +17355,7 @@ describe("generic settled-unknown acquisition", () => {
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
           outcome:
-            args[2] === "provider_drive_epoch_start_result"
+            args[0] === "provider_drive_epoch_start_request"
               ? "started"
               : "applied",
         },
@@ -17359,12 +17371,12 @@ describe("generic settled-unknown acquisition", () => {
   });
   test("generic browser-document MIME parks the current candidate without advancing", async () => {
     const h = makeHarness();
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => ({
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => ({
       kind: "response",
       payload: {
         ...((args[1] ?? {}) as Record<string, unknown>),
         outcome:
-          args[2] === "provider_drive_epoch_start_result"
+          args[0] === "provider_drive_epoch_start_request"
             ? "started"
             : "applied",
       },
@@ -17410,20 +17422,22 @@ describe("generic settled-unknown acquisition", () => {
   test("generic clean non-browser MIME retains exact tuple and awaits daemon successor", async () => {
     const h = makeHarness();
     const requests: unknown[][] = [];
-    const makeResponse = async (...args: unknown[]) => {
+    const makeResponse = async (
+      ...args: unknown[]
+    ): Promise<NativeRequestResult> => {
       requests.push(args);
       return {
         kind: "response",
         payload: {
           ...((args[1] ?? {}) as Record<string, unknown>),
           outcome:
-            args[2] === "provider_drive_epoch_start_result"
+            args[0] === "provider_drive_epoch_start_request"
               ? "started"
               : "applied",
         },
       };
     };
-    Reflect.set(h.bridge, "requestNative", makeResponse);
+    stubCorrelatedRequests(h.bridge, makeResponse);
     await reachUnknown(
       h,
       "job_generic_clean",
@@ -17446,8 +17460,8 @@ describe("generic settled-unknown acquisition", () => {
       "10.1000/generic",
       true,
     );
-    // reachUnknown overwrites requestNative; reinstall our tracker for the completion phase
-    Reflect.set(h.bridge, "requestNative", makeResponse);
+    // reachUnknown replaces the stub. Install our tracker for completion.
+    stubCorrelatedRequests(h.bridge, makeResponse);
     expect(h.downloads.started.map((entry) => entry.url)).toEqual([
       "https://www.jstor.org/download/image.pdf",
     ]);
@@ -18121,7 +18135,7 @@ test("generic exact-ID interruption settles once and missing exact ID remains un
     ],
   };
   const h = makeHarness(seed);
-  Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+  stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
     requests.push(args);
     return {
       kind: "response",
@@ -18146,7 +18160,7 @@ test("generic exact-ID interruption settles once and missing exact ID remains un
   expect(h.backend.store.activeJobs[0]?.generic_terminal).toBe(true);
   expect(h.backend.store.activeJobs[0]?.download_initiated).toBe(false);
   const second = new Bridge(h.deps);
-  Reflect.set(second, "requestNative", async (...args: unknown[]) => {
+  stubCorrelatedRequests(second, async (...args: unknown[]) => {
     requests.push(args);
     return {
       kind: "response",
@@ -18162,11 +18176,13 @@ test("generic exact-ID interruption settles once and missing exact ID remains un
       (args) => args[0] === "provider_drive_epoch_result_request",
     ),
   ).toHaveLength(1);
-  expect(requests[0]?.[5]).toBe(jobID);
+  expect(
+    (requests[0]?.[2] as { jobID?: string } | undefined)?.jobID,
+  ).toBe(jobID);
 
   const missing = makeHarness(seed);
   const missingRequests: unknown[][] = [];
-  Reflect.set(missing.bridge, "requestNative", async (...args: unknown[]) => {
+  stubCorrelatedRequests(missing.bridge, async (...args: unknown[]) => {
     missingRequests.push(args);
     return {
       kind: "response",
@@ -19096,7 +19112,7 @@ test("an explicit focus never mints a legacy handoff beside an in-flight materia
 // surface the job still pointed at fell through onTabRemoved to the operator-
 // cancel branch: `provider_outcome {outcome:"cancelled"}` + removeJobWithOffer,
 // and the daemon cancelled the paper (traces in the open-defect table in
-// dev/active/surface-lifecycle-plan.md). Every existing materialization test
+// dev/adr/0028-surface-lifecycle-ownership.md). Every existing materialization test
 // missed it because `materializationActiveJob` sets `tab_id: -1`, so
 // `findByTab` never matched and the branch was unreachable. These two pin the
 // distinction the marker draws: papio's own removal is silent, the operator's
@@ -19645,7 +19661,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     await h.bridge.start();
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: { outcome: "started" } };
     });
@@ -19659,7 +19675,7 @@ describe("effect_permit reconcile inbound", () => {
       revision: "rev-1",
     };
     await h.port.inbound(reconcileRequest(jobID, payload));
-    // second inbound proves the serialized queue was not deadlocked by awaiting requestNative
+    // The second inbound proves the queue never awaits a correlated request.
     await h.port.inbound(
       reconcileRequest(jobID, {
         ...payload,
@@ -19691,14 +19707,10 @@ describe("effect_permit reconcile inbound", () => {
     });
     await restarted.bridge.start();
     const spy2: unknown[][] = [];
-    Reflect.set(
-      restarted.bridge,
-      "requestNative",
-      async (...args: unknown[]) => {
-        spy2.push(args);
-        return { kind: "response", payload: {} };
-      },
-    );
+    stubCorrelatedRequests(restarted.bridge, async (...args: unknown[]) => {
+      spy2.push(args);
+      return { kind: "response", payload: {} };
+    });
     await restarted.port.inbound(reconcileRequest(jobID, payload));
     const restartedFrames = restarted
       .frames()
@@ -19709,7 +19721,7 @@ describe("effect_permit reconcile inbound", () => {
     expect(spy2).toHaveLength(0);
   });
 
-  test("generic exact in-flight download reports dispatched and download_present true without deadlocking and without requestNative", async () => {
+  test("generic exact in-flight download reports dispatched and download_present true without deadlocking and without a correlated request", async () => {
     const jobID = "job_generic_reconcile_download";
     const driveAttemptID = "drive-attempt-generic-download";
     const downloadID = 901;
@@ -19750,7 +19762,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     await h.bridge.start();
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: {} };
     });
@@ -19824,7 +19836,7 @@ describe("effect_permit reconcile inbound", () => {
     h.downloads.items.set(901, { id: 901, state: "in_progress" });
     await h.bridge.start();
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: {} };
     });
@@ -19888,7 +19900,7 @@ describe("effect_permit reconcile inbound", () => {
     h.downloads.items.set(downloadID, { id: downloadID, state: "in_progress" });
     await h.bridge.start();
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: {} };
     });
@@ -19965,7 +19977,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     h.downloads.items.set(903, { id: 903, state: "in_progress" });
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: {} };
     });
@@ -20042,7 +20054,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     await h.bridge.start();
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: {} };
     });
@@ -20185,7 +20197,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     await h.bridge.start();
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: {} };
     });
@@ -20249,7 +20261,7 @@ describe("effect_permit reconcile inbound", () => {
     });
     await h.bridge.start();
     const spy: unknown[][] = [];
-    Reflect.set(h.bridge, "requestNative", async (...args: unknown[]) => {
+    stubCorrelatedRequests(h.bridge, async (...args: unknown[]) => {
       spy.push(args);
       return { kind: "response", payload: {} };
     });
@@ -20277,7 +20289,7 @@ describe("effect_permit reconcile inbound", () => {
   });
 });
 
-// Slice 1 (surface-lifecycle-plan.md): navigation-error ordering ahead of
+// Slice 1 (dev/adr/0028-surface-lifecycle-ownership.md): navigation-error ordering ahead of
 // generic auth-wall detection, and the lifecycle.ts harness seams
 // (restartWorker/simulateExtensionUpdate/expectLedgerRetains).
 test("Slice 1: a navigation error on a managed handoff tab never charges an auth attempt", async () => {
@@ -20504,7 +20516,7 @@ test("Slice 1: restartWorker keeps the durable tab ledger across a worker restar
 });
 
 // Slice 2b: durable identity, adoption, and the close transaction
-// (surface-lifecycle-plan.md lines 271-303; claim-observation-protocol.md
+// (dev/adr/0028-surface-lifecycle-ownership.md; claim-observation-protocol.md
 // §2.3/§4.3). Helpers build a scaffold tab already recorded as an owned
 // SurfaceBirthRecord under the bridge's own browser_epoch, with a known
 // daemon holder generation, so closeOwnedSurface's local eligibility check

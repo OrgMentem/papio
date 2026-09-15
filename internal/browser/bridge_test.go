@@ -255,12 +255,11 @@ func helloWithAdapterVersions(t *testing.T, extensionVersion string, adapterVers
 }
 func effectPermitHolder(t *testing.T, b *Bridge) {
 	t.Helper()
-	b.holder = &browserSession{
+	b.arbitration.setHolderForTest(&browserSession{
 		ID: "permit-test-holder", ExtensionVersion: "0.14.0",
 		Features:   []string{providerDriveEpochV1Feature, effectPermitFeature},
 		LastSyncAt: b.now(),
-	}
-	b.epoch = 0
+	}, 0)
 }
 
 func effectPermitOffer(t *testing.T, jobs *job.Store, id, attempt, domain string) {
@@ -716,7 +715,7 @@ func TestUnsolicitedPageCaptureCannotSatisfyPendingRequest(t *testing.T) {
 	runSync(t, b, inFrame(t, protocol.MsgPageCapture, "", unsolicited))
 
 	b.mu.Lock()
-	bound := b.pendingCaptures[b.holder.ID].path
+	bound := b.pendingCaptures[b.arbitration.holderSession().ID].path
 	b.mu.Unlock()
 	if bound != "" {
 		t.Fatalf("unsolicited capture bound to the pending request: path = %q", bound)
@@ -775,7 +774,7 @@ func TestCaptureRefusesAnExtensionThatCannotEchoRequestID(t *testing.T) {
 
 	b.mu.Lock()
 	pendingCount := len(b.pendingCaptures)
-	seated := b.holder != nil && !b.holder.Outdated
+	seated := b.arbitration.holderSession() != nil && !b.arbitration.holderSession().Outdated
 	b.mu.Unlock()
 	if pendingCount != 0 {
 		t.Fatalf("pendingCaptures = %d after a refused capture, want 0", pendingCount)
@@ -919,7 +918,7 @@ func capturePath(b *Bridge, pending *pendingPageCapture) string {
 func holderEpoch(b *Bridge) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.epoch
+	return b.arbitration.generation()
 }
 
 // TestPageCaptureStoreDoesNotHoldSessionLock is the point of moving the
@@ -985,7 +984,7 @@ func TestPageCaptureStoreDoesNotHoldSessionLock(t *testing.T) {
 }
 
 // TestPageCaptureHolderDepartureDuringStoreDiscardsResult covers the window the
-// unlock opens: release() drops the pending capture and increments b.epoch, so
+// unlock opens: release() drops the pending capture and increments b.arbitration.generation(), so
 // a write that completes after the departure must not attach its path to the
 // request, must not record a receipt against the replacement holder's bridge,
 // and must not leave a pinned file no request can claim.
@@ -1049,7 +1048,7 @@ func TestPageCaptureHolderDepartureDuringStoreDiscardsResult(t *testing.T) {
 
 // TestPageCaptureTimeoutDuringStoreDiscardsResult is the same discard reached
 // by the other route: Capture's timeout arm clears the pending entry without
-// touching b.epoch, so entry identity — not the generation — is what must
+// touching b.arbitration.generation(), so entry identity — not the generation — is what must
 // catch this one.
 func TestPageCaptureTimeoutDuringStoreDiscardsResult(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
@@ -3018,7 +3017,7 @@ func TestInstitutionalCandidateOfferRecoversAfterHolderRestart(t *testing.T) {
 
 	const replacementSession = "sess-replacement-000000000000000000000"
 	b.mu.Lock()
-	b.promote(&browserSession{
+	promoteForTest(b, &browserSession{
 		ID:               replacementSession,
 		ExtensionVersion: "0.14.0",
 		Features:         []string{institutionalMaterializationFeature, effectPermitFeature},
@@ -3973,7 +3972,7 @@ func TestAuthReturnedDoesNotReofferWithoutLiveHolder(t *testing.T) {
 	runSync(t, b, hello())
 
 	b.mu.Lock()
-	b.holder.LastSyncAt = b.now().Add(-sessionStaleAfter - time.Second)
+	b.arbitration.setHolderLastSyncForTest(b.now().Add(-sessionStaleAfter - time.Second))
 	err := b.recordAuth(ctx, &protocol.BrowserMessage{
 		Type:    protocol.MsgAuthReturned,
 		JobID:   source,
@@ -4085,6 +4084,112 @@ func TestDeliveryContextAnnotatesTheMatchingDownloadCandidate(t *testing.T) {
 	}
 	if newer.BrowserRoute != "resolver" || newer.SessionEvidence != "warm" || newer.AccessBasis != resolver.AccessInstitutional {
 		t.Fatalf("new candidate provenance = %+v", newer)
+	}
+}
+
+func TestDeliveryContextWaitsForInFlightDownloadAdoption(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := park(t, jobs, "wr_delivery_in_flight", handoffWork())
+	runSync(t, b, hello())
+	writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+
+	validationStarted := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseValidation) })
+	}
+	t.Cleanup(release)
+	validate := b.svc.Validate
+	b.svc.Validate = func(ctx context.Context, path, mime string, expected work.Work) (pdf.ValidationReport, error) {
+		close(validationStarted)
+		<-releaseValidation
+		return validate(ctx, path, mime, expected)
+	}
+
+	type syncResult struct {
+		frames []json.RawMessage
+		err    error
+	}
+	downloadResult := make(chan syncResult, 1)
+	downloadFrame := inFrame(t, protocol.MsgDownloadComplete, id,
+		map[string]any{"download_id": 12, "filename": "paper.pdf", "size_bytes": 533})
+	go func() {
+		frames, err := b.Sync(ctx, testSessionID, false, []json.RawMessage{downloadFrame})
+		downloadResult <- syncResult{frames: frames, err: err}
+	}()
+
+	select {
+	case <-validationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("download adoption did not reach validation")
+	}
+
+	contextFrame := inFrame(t, protocol.MsgDeliveryContext, id,
+		map[string]any{"download_id": 12, "route": "resolver", "session_evidence": "warm", "page_host": "provider.example.edu"})
+	if _, err := b.Sync(ctx, testSessionID, false, []json.RawMessage{contextFrame}); err != nil {
+		t.Fatalf("delivery context sync: %v", err)
+	}
+	release()
+
+	select {
+	case result := <-downloadResult:
+		if result.err != nil {
+			t.Fatalf("download complete sync: %v", result.err)
+		}
+		hasAck := false
+		for _, frame := range result.frames {
+			msg, err := protocol.DecodeBrowserMessage(frame)
+			if err != nil {
+				t.Fatalf("decode download_complete response: %v", err)
+			}
+			hasAck = hasAck || msg.Type == protocol.MsgAck
+		}
+		if !hasAck {
+			t.Fatalf("no ack for download_complete: %v", result.frames)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download adoption did not finish")
+	}
+
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.GetCandidate(ctx, row.SelectedCandidateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.BrowserRoute != "resolver" ||
+		candidate.SessionEvidence != "warm" ||
+		candidate.AccessBasis != resolver.AccessInstitutional ||
+		candidate.LandingRedacted != "https://provider.example.edu" {
+		t.Fatalf("candidate delivery context = %+v", candidate)
+	}
+
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] != "browser.adoption_deferred" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		reason, _ := detail["reason"].(string)
+		if strings.Contains(reason, "not adoptable") {
+			t.Fatalf("competing adoption was deferred: %q", reason)
+		}
+	}
+
+	key := browserDownloadKey{JobID: id, DownloadID: 12}
+	b.mu.Lock()
+	_, downloadPending := b.pendingDownloads[key]
+	_, contextPending := b.deliveryContexts[key]
+	b.mu.Unlock()
+	if downloadPending || contextPending {
+		t.Fatalf("delivery metadata was not pruned: download=%t context=%t", downloadPending, contextPending)
 	}
 }
 
@@ -5088,7 +5193,7 @@ func TestProviderDriftLatchAllowsNewerAdapterRevision(t *testing.T) {
 	if got := countJobOffersFor(msgs, id); got != 0 {
 		t.Fatalf("same-revision drifted job offers = %d, want 0", got)
 	}
-	b.holder.AdapterVersions["sage"] = "1.1.0"
+	b.arbitration.setHolderAdapterVersionForTest("sage", "1.1.0")
 	delete(b.offered, id)
 	msgs, _ = runSync(t, b)
 	if got := countJobOffersFor(msgs, id); got != 1 {
@@ -5634,13 +5739,13 @@ func TestInstitutionalNoEntitlementRetiresItsSignInOccupancy(t *testing.T) {
 	const authClaimID = "auth-" + prefix
 	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 		AuthenticationClaimID: authClaimID, LeaseID: "lease-" + prefix,
-		OwnerID: candidate.JobID, BrowserHolderGeneration: b.epoch,
+		OwnerID: candidate.JobID, BrowserHolderGeneration: b.arbitration.generation(),
 		LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.SetAuthenticationEntryLeaseOwnerBinding(
-		ctx, authClaimID, candidate.JobID, b.epoch, claim.BindingID, 99,
+		ctx, authClaimID, candidate.JobID, b.arbitration.generation(), claim.BindingID, 99,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -6158,7 +6263,7 @@ func TestSweepAdoptionRequiresWinningTheAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimSweep, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-sweep", BrowserHolderGeneration: b.epoch,
+		CandidateID: "candidate-sweep", BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -6215,7 +6320,7 @@ func TestWinnerIsNotCommittedBeforeValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-order", BrowserHolderGeneration: b.epoch,
+		CandidateID: "candidate-order", BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -6268,7 +6373,7 @@ func TestFailedAdoptionLeavesTheAttemptWinnable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-failed", BrowserHolderGeneration: b.epoch,
+		CandidateID: "candidate-failed", BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -6333,7 +6438,7 @@ func TestBufferedFrameDoesNotPromoteIntoTheNewRevision(t *testing.T) {
 	if accepted {
 		t.Fatal("a frame produced under the superseded revision was accepted")
 	}
-	if _, ok, err := jobs.CurrentProfileEvidence(ctx, profile.ID, bumped[0].Revision, b.epoch); err != nil || ok {
+	if _, ok, err := jobs.CurrentProfileEvidence(ctx, profile.ID, bumped[0].Revision, b.arbitration.generation()); err != nil || ok {
 		t.Fatalf("stale observation became current evidence for the new revision: ok=%v err=%v", ok, err)
 	}
 }
@@ -6483,7 +6588,7 @@ func TestReconcileRefusesATabThatIsNotTheClaimsOwn(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-tab", BrowserHolderGeneration: b.epoch,
+		CandidateID: "candidate-tab", BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -6492,7 +6597,7 @@ func TestReconcileRefusesATabThatIsNotTheClaimsOwn(t *testing.T) {
 		t.Fatal(err)
 	}
 	const boundTab = 41
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profiles[0].Revision, boundTab); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), profiles[0].Revision, boundTab); err != nil {
 		t.Fatal(err)
 	}
 	reconcile := func(tab int64) *protocol.InstitutionalReconcileResponsePayload {
@@ -6546,7 +6651,7 @@ func TestReconcileConfirmsAClaimedButUnboundClaim(t *testing.T) {
 	}
 	// Claimed, never bound: tab_id is still 0.
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-unbound", BrowserHolderGeneration: b.epoch,
+		CandidateID: "candidate-unbound", BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -6668,21 +6773,21 @@ func TestMisfencedOpenAccessCandidateIsRefencedInPlace(t *testing.T) {
 			name: "holding a live claim",
 			claim: func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate) {
 				t.Helper()
-				mustClaim(t, b, jobs, cand, b.epoch, b.now().UTC().Add(10*time.Minute))
+				mustClaim(t, b, jobs, cand, b.arbitration.generation(), b.now().UTC().Add(10*time.Minute))
 			},
 		},
 		{
 			name: "claimed by a superseded browser generation",
 			claim: func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate) {
 				t.Helper()
-				mustClaim(t, b, jobs, cand, b.epoch-1, b.now().UTC().Add(10*time.Minute))
+				mustClaim(t, b, jobs, cand, b.arbitration.generation()-1, b.now().UTC().Add(10*time.Minute))
 			},
 		},
 		{
 			name: "claim lapsed in the live generation",
 			claim: func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate) {
 				t.Helper()
-				mustClaim(t, b, jobs, cand, b.epoch, b.now().UTC().Add(time.Minute))
+				mustClaim(t, b, jobs, cand, b.arbitration.generation(), b.now().UTC().Add(time.Minute))
 				// The store refuses to record a lease already in the past, so
 				// the fixture ages a real one - which is how a live claim
 				// lapses.
@@ -6804,7 +6909,7 @@ func seedSurfaceCloseClaim(t *testing.T, b *Bridge, jobs *job.Store, prefix, pha
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-" + prefix, BrowserHolderGeneration: b.epoch,
+		CandidateID: "candidate-" + prefix, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -6848,7 +6953,7 @@ func TestSurfaceCloseAuthorizedHappyPath(t *testing.T) {
 
 	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-happy", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "materialization_settled",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -6860,8 +6965,8 @@ func TestSurfaceCloseAuthorizedHappyPath(t *testing.T) {
 	if got.CloseAuthorizationID == "" || got.Nonce == "" {
 		t.Fatalf("authorized response missing id/nonce: %+v", got)
 	}
-	if got.BrowserHolderGeneration == nil || *got.BrowserHolderGeneration != b.epoch {
-		t.Fatalf("browser_holder_generation = %v, want %d", got.BrowserHolderGeneration, b.epoch)
+	if got.BrowserHolderGeneration == nil || *got.BrowserHolderGeneration != b.arbitration.generation() {
+		t.Fatalf("browser_holder_generation = %v, want %d", got.BrowserHolderGeneration, b.arbitration.generation())
 	}
 
 	var status string
@@ -6893,7 +6998,7 @@ func TestSurfaceCloseJobInactiveAuthorizesTerminalNavigatedBinding(t *testing.T)
 
 	frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-job-inactive", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "job_inactive",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7018,7 +7123,7 @@ func TestTerminalCancelBatchStaysWithinResultCapAndLeavesRemainder(t *testing.T)
 			t.Fatalf("create candidate %d: %v", i, err)
 		}
 		claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-			CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+			CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 			JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 			RouteRevision: 1, MaterializationKind: "browser_tab",
 			LeaseUntil: time.Now().UTC().Add(time.Hour),
@@ -7069,7 +7174,7 @@ func TestSurfaceCloseJobInactiveRefusesLiveHandoff(t *testing.T) {
 
 	frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-job-live", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "job_inactive",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7095,7 +7200,7 @@ func TestSurfaceCloseJobInactiveRefusesUnsettledEffect(t *testing.T) {
 	if err != nil || candidate == nil {
 		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch,
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(),
 		candidate.InstitutionProfileRevision, 9); err != nil {
 		t.Fatal(err)
 	}
@@ -7103,7 +7208,7 @@ func TestSurfaceCloseJobInactiveRefusesUnsettledEffect(t *testing.T) {
 		job.InstitutionalEffectPermitAcquireInput{
 			JobID: candidate.JobID, ClaimID: claim.ID, BindingID: claim.BindingID,
 			SafetyDomainID: candidate.SafetyDomainID, InstitutionalRequestID: "close-effect-request",
-			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.arbitration.generation(),
 			ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
 			Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
 		}); err != nil || outcome != job.EffectPermitAcquired {
@@ -7115,7 +7220,7 @@ func TestSurfaceCloseJobInactiveRefusesUnsettledEffect(t *testing.T) {
 
 	frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-job-effect", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "job_inactive",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7135,7 +7240,7 @@ func TestSurfaceCloseAuthorizedRepeatIsIdempotent(t *testing.T) {
 
 	req := &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-idempotent", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "claim_abandoned",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "claim_abandoned",
 	}
 	first, err := b.surfaceClose(context.Background(), req)
 	if err != nil {
@@ -7172,7 +7277,7 @@ func TestSurfaceCloseUnknownBindingIsUnclaimed(t *testing.T) {
 
 	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-unknown", BindingID: "binding-never-claimed-00001",
-		BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "scaffold_idle",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7198,7 +7303,7 @@ func TestSurfaceCloseStaleGenerationIsRejected(t *testing.T) {
 
 	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-stale", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch - 1, Disposition: "materialization_settled",
+		BrowserHolderGeneration: b.arbitration.generation() - 1, Disposition: "materialization_settled",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7219,7 +7324,7 @@ func TestSurfaceClosePhaseMismatchIsNotEligible(t *testing.T) {
 
 	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-mismatch", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "materialization_settled",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7246,7 +7351,7 @@ func TestSurfaceCloseRequestDispatchedThroughSyncAuthorizes(t *testing.T) {
 
 	frame := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-dispatch", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "materialization_settled",
 	})
 	msgs, _ := runSync(t, b, frame)
 	resp := firstOfType(msgs, protocol.MsgSurfaceCloseResponse)
@@ -7278,7 +7383,7 @@ func TestSurfaceCloseOfUnclaimedBindingIsNotARefusal(t *testing.T) {
 
 	frame := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-unclaimed", BindingID: "binding-with-no-claim",
-		BrowserHolderGeneration: b.epoch, Disposition: "job_inactive",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "job_inactive",
 	})
 	msgs, _ := runSync(t, b, frame)
 	resp := firstOfType(msgs, protocol.MsgSurfaceCloseResponse)
@@ -7300,7 +7405,7 @@ func TestSurfaceCloseOfUnclaimedBindingIsNotARefusal(t *testing.T) {
 	held := seedSurfaceCloseClaim(t, b, jobs, "close-unclaimed-sibling", "claimed")
 	refused := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-refused", BindingID: held.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "materialization_settled",
 	})
 	refusedMsgs, _ := runSync(t, b, refused)
 	refusedResp := firstOfType(refusedMsgs, protocol.MsgSurfaceCloseResponse)
@@ -7330,7 +7435,7 @@ func TestSurfaceCloseHandoffParkedAuthorizesAnUntouchedAsk(t *testing.T) {
 
 	frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-parked", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "handoff_parked",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "handoff_parked",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7347,7 +7452,7 @@ func TestSurfaceCloseHandoffParkedAuthorizesAnUntouchedAsk(t *testing.T) {
 	seedLiveEffectPermitForClaim(t, jobs, held, "permit-parked-inflight")
 	inflight, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-parked-inflight", BindingID: held.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "handoff_parked",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "handoff_parked",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -7373,7 +7478,7 @@ func TestSurfaceCloseRequestFromNonHolderSessionIsRefused(t *testing.T) {
 
 	frame := inFrame(t, protocol.MsgSurfaceCloseRequest, "", protocol.SurfaceCloseRequestPayload{
 		RequestID: "req-close-dispatch-nonholder", BindingID: claim.BindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "materialization_settled",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "materialization_settled",
 	})
 	msgs, _ := runSyncAs(t, b, nonHolder, frame)
 	errFrame := firstOfType(msgs, protocol.MsgError)
@@ -7415,7 +7520,7 @@ func TestSurfaceCloseEligibilityMatrixAcrossPhases(t *testing.T) {
 				claim := seedSurfaceCloseClaim(t, b, jobs, "matrix-"+disposition+"-"+phase, phase)
 				frames, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 					RequestID: "req-matrix-" + disposition + "-" + phase, BindingID: claim.BindingID,
-					BrowserHolderGeneration: b.epoch, Disposition: disposition,
+					BrowserHolderGeneration: b.arbitration.generation(), Disposition: disposition,
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -7475,7 +7580,7 @@ func TestSurfaceCloseScaffoldIdleRespectsLiveEffectPermitOwnership(t *testing.T)
 
 		frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
 			RequestID: "req-matrix-permit-same", BindingID: claim.BindingID,
-			BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+			BrowserHolderGeneration: b.arbitration.generation(), Disposition: "scaffold_idle",
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -7494,7 +7599,7 @@ func TestSurfaceCloseScaffoldIdleRespectsLiveEffectPermitOwnership(t *testing.T)
 
 		frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
 			RequestID: "req-matrix-permit-diff", BindingID: claim.BindingID,
-			BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+			BrowserHolderGeneration: b.arbitration.generation(), Disposition: "scaffold_idle",
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -7750,7 +7855,7 @@ func TestAuthTrafficRenewsTheMaterializationLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: "candidate-renew", BrowserHolderGeneration: b.epoch,
+		CandidateID: "candidate-renew", BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(30 * time.Second),
@@ -9414,7 +9519,7 @@ func TestPdfGrabAllocatesSteeringPath(t *testing.T) {
 		Scan(&jobID, &attempt, &holder, &domain, &kind, &status, &grabID); err != nil {
 		t.Fatalf("pdf grab permit lookup: %v", err)
 	}
-	if jobID.Valid || attempt != 0 || holder != b.epoch ||
+	if jobID.Valid || attempt != 0 || holder != b.arbitration.generation() ||
 		domain != "pdf_grab:pdf.example.org" || kind != "pdf_grab" ||
 		status != "held" || grabID != p.GrabID {
 		t.Fatalf("pdf grab permit = job_id=%v attempt=%d holder=%d domain=%q kind=%q status=%q grab_id=%q",
@@ -9634,8 +9739,8 @@ func TestPdfGrabIsServedFromANonHolderSession(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", p.GrabID)); err != nil {
 		t.Fatalf("landing directory not created for the non-holder grab: %v", err)
 	}
-	if b.holder == nil || b.holder.ID != holder {
-		t.Fatalf("holder = %+v, want the grab to leave the session slot with %s", b.holder, holder)
+	if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != holder {
+		t.Fatalf("holder = %+v, want the grab to leave the session slot with %s", b.arbitration.holderSession(), holder)
 	}
 	var n int
 	if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pdf_grabs`).Scan(&n); err != nil {
@@ -10626,8 +10731,8 @@ func TestDirectRouteUsesTupleProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if permit.JobAttemptRevision != attempt || permit.BrowserHolderGeneration != b.epoch {
-		t.Fatalf("direct permit fences = attempt %d/holder %d, want %d/%d", permit.JobAttemptRevision, permit.BrowserHolderGeneration, attempt, b.epoch)
+	if permit.JobAttemptRevision != attempt || permit.BrowserHolderGeneration != b.arbitration.generation() {
+		t.Fatalf("direct permit fences = attempt %d/holder %d, want %d/%d", permit.JobAttemptRevision, permit.BrowserHolderGeneration, attempt, b.arbitration.generation())
 	}
 	result := inFrame(t, protocol.MsgProviderDirectGetResult, id, protocol.ProviderDirectGetResultPayload{
 		DriveAttemptID: p.DriveAttemptID, Ordinal: p.Ordinal, RouteRevision: p.RouteRevision,
@@ -10828,7 +10933,7 @@ func TestDirectRouteHistoricalResultSettlesCleanupOnly(t *testing.T) {
 	if err := jobs.RecordEvent(context.Background(), id, "job.retry_requested", map[string]any{"reason": "historical direct result"}); err != nil {
 		t.Fatal(err)
 	}
-	b.epoch++
+	b.arbitration.advanceGenerationForTest()
 	result := inFrame(t, protocol.MsgProviderDirectGetResult, id, protocol.ProviderDirectGetResultPayload{
 		DriveAttemptID: p.DriveAttemptID, Ordinal: p.Ordinal, RouteRevision: p.RouteRevision,
 		Outcome: "not_pdf", LandingClass: "html",
@@ -11377,7 +11482,7 @@ func TestInstitutionalRouteProfileFencePrecedesURLDerivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision:         candidate.JobAttemptRevision,
 		InstitutionProfileRevision: candidate.InstitutionProfileRevision,
 		RouteRevision:              candidate.RouteRevision, MaterializationKind: "browser_tab",
@@ -11386,7 +11491,7 @@ func TestInstitutionalRouteProfileFencePrecedesURLDerivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 0); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), profile.Revision, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jobs.ReconcileInstitutionProfiles(ctx, []job.InstitutionProfileSpec{{
@@ -11450,7 +11555,7 @@ func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -11458,14 +11563,14 @@ func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 3); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), profile.Revision, 3); err != nil {
 		t.Fatal(err)
 	}
-	ordinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.epoch, 0)
+	ordinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, b.epoch, ordinal, 3); err != nil {
+	if err := jobs.AcknowledgeMaterializationNavigation(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), ordinal, 3); err != nil {
 		t.Fatal(err)
 	}
 
@@ -11478,7 +11583,7 @@ func TestDeliveredArtifactIsFencedToTheWinningMaterialization(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("artifact winner after adoption ok=%v err=%v", ok, err)
 	}
-	if winner.CandidateID != candidate.ID || winner.BrowserHolderGeneration != b.epoch {
+	if winner.CandidateID != candidate.ID || winner.BrowserHolderGeneration != b.arbitration.generation() {
 		t.Fatalf("winner = %+v, want the navigated candidate and holder", winner)
 	}
 	settled, err := jobs.GetMaterializationClaim(ctx, claim.ID)
@@ -11558,7 +11663,7 @@ func TestLateArtifactStaleClaimRecordsWinnerAndSettlesExactProducer(t *testing.T
 					if err != nil {
 						t.Fatal(err)
 					}
-					holder := b.epoch
+					holder := b.arbitration.generation()
 					claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
 						CandidateID: candidate.ID, BrowserHolderGeneration: holder,
 						JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
@@ -11714,7 +11819,7 @@ func TestLateArtifactMissingProducerLeavesExactPermitHeld(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	holder := b.epoch
+	holder := b.arbitration.generation()
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
 		CandidateID: candidate.ID, BrowserHolderGeneration: holder,
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
@@ -11802,7 +11907,7 @@ func TestInstitutionalReconcileAcceptsTabZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -11810,7 +11915,7 @@ func TestInstitutionalReconcileAcceptsTabZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 0); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), profile.Revision, 0); err != nil {
 		t.Fatal(err)
 	}
 	frames, err := b.institutionalReconcile(ctx, &protocol.InstitutionalReconcileRequestPayload{
@@ -11869,8 +11974,8 @@ func TestMaterializationGenerationRetryOnSameSessionHello(t *testing.T) {
 		t.Fatal(err)
 	}
 	runSync(t, b, materializationHello(t))
-	if b.materializationGenerationUnavailable || b.materializationAuthorityUncertain || b.epoch == 0 {
-		t.Fatalf("same-session generation retry did not recover: epoch=%d unavailable=%v uncertain=%v", b.epoch, b.materializationGenerationUnavailable, b.materializationAuthorityUncertain)
+	if b.materializationGenerationUnavailable || b.materializationAuthorityUncertain || b.arbitration.generation() == 0 {
+		t.Fatalf("same-session generation retry did not recover: epoch=%d unavailable=%v uncertain=%v", b.arbitration.generation(), b.materializationGenerationUnavailable, b.materializationAuthorityUncertain)
 	}
 }
 
@@ -11921,7 +12026,7 @@ func TestInstitutionalRouteClosedActionDoesNotIssueOrdinal(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -11929,7 +12034,7 @@ func TestInstitutionalRouteClosedActionDoesNotIssueOrdinal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 0); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), profile.Revision, 0); err != nil {
 		t.Fatal(err)
 	}
 	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
@@ -12153,7 +12258,7 @@ func TestFocusHandoffStartsTheNextAttemptForASpentCandidate(t *testing.T) {
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
 		CandidateID: candidateID, JobAttemptRevision: before,
 		InstitutionProfileRevision: 1, RouteRevision: 1,
-		MaterializationKind: "browser_tab", BrowserHolderGeneration: b.epoch,
+		MaterializationKind: "browser_tab", BrowserHolderGeneration: b.arbitration.generation(),
 		LeaseUntil: b.now().Add(time.Minute),
 	})
 	if err != nil {
@@ -12218,13 +12323,13 @@ func TestSpentCandidateStopsBeingOffered(t *testing.T) {
 		CandidateID: current.ID, JobAttemptRevision: current.JobAttemptRevision,
 		InstitutionProfileRevision: current.InstitutionProfileRevision,
 		RouteRevision:              current.RouteRevision,
-		MaterializationKind:        "browser_tab", BrowserHolderGeneration: b.epoch,
+		MaterializationKind:        "browser_tab", BrowserHolderGeneration: b.arbitration.generation(),
 		LeaseUntil: b.now().Add(time.Minute),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, current.InstitutionProfileRevision, 9); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), current.InstitutionProfileRevision, 9); err != nil {
 		t.Fatal(err)
 	}
 	// The settled institutional effect is what keeps the candidate owned past
@@ -12233,7 +12338,7 @@ func TestSpentCandidateStopsBeingOffered(t *testing.T) {
 	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
 		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
 		SafetyDomainID: current.SafetyDomainID, InstitutionalRequestID: "spent-offer-request",
-		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.arbitration.generation(),
 		ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
 		Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
 	}); err != nil || outcome != job.EffectPermitAcquired {
@@ -12287,19 +12392,19 @@ func TestSpentCandidateClaimAnswersStaleNotBusy(t *testing.T) {
 		CandidateID: current.ID, JobAttemptRevision: current.JobAttemptRevision,
 		InstitutionProfileRevision: current.InstitutionProfileRevision,
 		RouteRevision:              current.RouteRevision,
-		MaterializationKind:        "browser_tab", BrowserHolderGeneration: b.epoch,
+		MaterializationKind:        "browser_tab", BrowserHolderGeneration: b.arbitration.generation(),
 		LeaseUntil: b.now().Add(time.Minute),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, current.InstitutionProfileRevision, 9); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), current.InstitutionProfileRevision, 9); err != nil {
 		t.Fatal(err)
 	}
 	if _, outcome, err := jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
 		JobID: jobID, ClaimID: claim.ID, BindingID: claim.BindingID,
 		SafetyDomainID: current.SafetyDomainID, InstitutionalRequestID: "spent-claim-request",
-		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+		JobAttemptRevision: current.JobAttemptRevision, BrowserHolderGeneration: b.arbitration.generation(),
 		ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
 		Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
 	}); err != nil || outcome != job.EffectPermitAcquired {
@@ -12391,9 +12496,7 @@ func TestMaterializationSchedulerStallDoesNotBlockHolderTakeover(t *testing.T) {
 	}()
 	<-started
 	b.mu.Lock()
-	if b.holder != nil {
-		b.holder.LastSyncAt = b.now().Add(-sessionStaleAfter - time.Second)
-	}
+	b.arbitration.setHolderLastSyncForTest(b.now().Add(-sessionStaleAfter - time.Second))
 	b.mu.Unlock()
 	const replacement = "sess-scheduler-replacement-000000000000000000"
 	replacementMsgs, _ := runSyncAs(t, b, replacement, hello())
@@ -12401,7 +12504,7 @@ func TestMaterializationSchedulerStallDoesNotBlockHolderTakeover(t *testing.T) {
 		t.Fatalf("replacement did not become holder while scheduler stalled: %v", replacementMsgs)
 	}
 	b.mu.Lock()
-	holder := b.holder
+	holder := b.arbitration.holderSession()
 	b.mu.Unlock()
 	if holder == nil || holder.ID != replacement {
 		t.Fatalf("holder = %#v, want replacement while first scheduler call is blocked", holder)
@@ -12492,7 +12595,7 @@ func TestMaterializationTakeoverResetsScheduleCursorForRecovery(t *testing.T) {
 		t.Fatalf("initial candidate offer missing: %v", initial)
 	}
 	b.mu.Lock()
-	b.holder.LastSyncAt = b.now().Add(-sessionStaleAfter - time.Second)
+	b.arbitration.setHolderLastSyncForTest(b.now().Add(-sessionStaleAfter - time.Second))
 	b.mu.Unlock()
 	const replacement = "sess-takeover-cursor-000000000000000000000000"
 	recovered, _ := runSyncAs(t, b, replacement, materializationHello(t))
@@ -12575,7 +12678,7 @@ func TestMaterializationRestartRecoversLiveClaimWithoutSecondTab(t *testing.T) {
 	}
 	const replacement = "sess-live-claim-replacement-00000000000000000"
 	b.mu.Lock()
-	b.promote(&browserSession{ID: replacement, ExtensionVersion: "0.14.0", Features: []string{institutionalMaterializationFeature, effectPermitFeature}, LastSyncAt: b.now()}, "live claim restart")
+	promoteForTest(b, &browserSession{ID: replacement, ExtensionVersion: "0.14.0", Features: []string{institutionalMaterializationFeature, effectPermitFeature}, LastSyncAt: b.now()}, "live claim restart")
 	b.mu.Unlock()
 	recovered, _ := runSyncAs(t, b, replacement)
 	reoffer := firstOfType(recovered, protocol.MsgInstitutionalCandidateOffer)
@@ -12851,7 +12954,7 @@ func TestFocusPreparationTakeoverReplacementOffersWithoutRetry(t *testing.T) {
 	<-started
 	const replacement = "sess-focus-takeover-replacement-000000000000000"
 	b.mu.Lock()
-	b.promote(&browserSession{
+	promoteForTest(b, &browserSession{
 		ID: replacement, ExtensionVersion: "0.14.0",
 		Features: []string{institutionalMaterializationFeature, effectPermitFeature}, LastSyncAt: b.now(),
 	}, "focus preparation takeover")
@@ -13034,10 +13137,10 @@ func TestBridgeEvidenceIsFencedToHolderGenerationAcrossTakeover(t *testing.T) {
 	}
 	now = now.Add(sessionStaleAfter + time.Second)
 	runSyncAs(t, b, "holder-b", hello())
-	if b.epoch == firstGeneration {
+	if b.arbitration.generation() == firstGeneration {
 		t.Fatalf("holder takeover did not advance generation: %d", firstGeneration)
 	}
-	current, found, err := jobs.CurrentProfileEvidence(context.Background(), mustProfileID(t, jobs, "alpha"), 1, b.epoch)
+	current, found, err := jobs.CurrentProfileEvidence(context.Background(), mustProfileID(t, jobs, "alpha"), 1, b.arbitration.generation())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -13116,10 +13219,10 @@ func TestBridgeWarmEvidenceIsExactProfileDespiteSharedAuthClaim(t *testing.T) {
 	if alpha.AuthenticationClaimID != beta.AuthenticationClaimID {
 		t.Fatalf("test setup claims differ: %q vs %q", alpha.AuthenticationClaimID, beta.AuthenticationClaimID)
 	}
-	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), alpha.ID, alpha.Revision, b.epoch); err != nil || !ok {
+	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), alpha.ID, alpha.Revision, b.arbitration.generation()); err != nil || !ok {
 		t.Fatalf("alpha warm evidence missing: ok=%v err=%v", ok, err)
 	}
-	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), beta.ID, beta.Revision, b.epoch); err != nil || ok {
+	if _, ok, err := jobs.CurrentProfileEvidence(context.Background(), beta.ID, beta.Revision, b.arbitration.generation()); err != nil || ok {
 		t.Fatalf("beta inherited alpha warm evidence: ok=%v err=%v", ok, err)
 	}
 }
@@ -13833,7 +13936,7 @@ func TestProviderDriveEffectPermitFeaturelessPeerIsUnsupported(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "permit-featureless", handoffWork())
 	effectPermitOffer(t, jobs, id, "permit-featureless-attempt", "domain-featureless")
-	b.holder = &browserSession{ID: "featureless", ExtensionVersion: "0.14.0", LastSyncAt: b.now()}
+	b.arbitration.setHolderOnlyForTest(&browserSession{ID: "featureless", ExtensionVersion: "0.14.0", LastSyncAt: b.now()})
 	frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{
 		DriveAttemptID: "permit-featureless-attempt", Ordinal: 0, Strategy: "generic", Revision: "1",
 	})
@@ -14297,7 +14400,7 @@ func TestEffectPermitReconcileOutboundExactIdentity(t *testing.T) {
 	if err != nil || permit == nil {
 		t.Fatal(err)
 	}
-	msgs, _ := runSyncAs(t, b, b.holder.ID)
+	msgs, _ := runSyncAs(t, b, b.arbitration.holderSession().ID)
 	req := firstOfType(msgs, protocol.MsgEffectPermitReconcileRequest)
 	if req == nil {
 		t.Fatalf("no reconcile request outbound: %v", msgs)
@@ -14322,7 +14425,7 @@ func TestEffectPermitReconcileOutboundExactIdentity(t *testing.T) {
 
 func nextEffectPermitReconcileRequest(t *testing.T, b *Bridge) *protocol.EffectPermitReconcileRequestPayload {
 	t.Helper()
-	msgs, _ := runSyncAs(t, b, b.holder.ID)
+	msgs, _ := runSyncAs(t, b, b.arbitration.holderSession().ID)
 	req := firstOfType(msgs, protocol.MsgEffectPermitReconcileRequest)
 	if req == nil {
 		t.Fatalf("no reconcile request outbound: %v", msgs)
@@ -14351,7 +14454,7 @@ func TestEffectPermitReconcileNoDispatchBecomesUnknown(t *testing.T) {
 		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
 		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
 	})
-	runSyncAs(t, b, b.holder.ID, resp)
+	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if got.Status != job.EffectPermitUnknownCompletion {
 		t.Fatalf("status=%q want unknown_completion", got.Status)
@@ -14379,12 +14482,12 @@ func TestEffectPermitReconcileReplacementHolderClassifiesHistoricalPermit(t *tes
 	// A replacement holder answers the request after its generation changes.
 	// The bridge correlates the current request, while the store classifies
 	// the historical permit using its stored generation.
-	b.epoch = 77
+	b.arbitration.setGenerationForTest(77)
 	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
 		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
 		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
 	})
-	runSyncAs(t, b, b.holder.ID, resp)
+	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 	got, err := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if err != nil || got == nil || got.Status != job.EffectPermitUnknownCompletion {
 		t.Fatalf("replacement reconcile permit=%+v err=%v, want unknown_completion", got, err)
@@ -14413,7 +14516,7 @@ func TestEffectPermitReconcileDispatchedRemainsHeld(t *testing.T) {
 		obs["request_id"] = request.RequestID
 		obs["permit_id"] = permit.ID
 		resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, obs)
-		runSyncAs(t, b, b.holder.ID, resp)
+		runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 		got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 		if got.Status != job.EffectPermitHeld {
 			t.Fatalf("held observation %v got status %q want held", obs, got.Status)
@@ -14436,7 +14539,7 @@ func TestEffectPermitReconcileNonTermsSettledProofDoesNotRelease(t *testing.T) {
 		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "settled",
 		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
 	})
-	runSyncAs(t, b, b.holder.ID, resp)
+	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if got.Status != job.EffectPermitHeld {
 		t.Fatalf("status=%q want held", got.Status)
@@ -14460,7 +14563,7 @@ func TestEffectPermitReconcileStaleOrWrongIDNoMutation(t *testing.T) {
 		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "stale",
 		"dispatched": true, "download_present": true, "acknowledged": true, "tab_present": true,
 	})
-	runSyncAs(t, b, b.holder.ID, stale)
+	runSyncAs(t, b, b.arbitration.holderSession().ID, stale)
 	after, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if after.Status != before.Status {
 		t.Fatalf("stale mutated %q -> %q", before.Status, after.Status)
@@ -14471,7 +14574,7 @@ func TestEffectPermitReconcileStaleOrWrongIDNoMutation(t *testing.T) {
 		"request_id": request.RequestID, "permit_id": "permit-does-not-exist", "outcome": "settled",
 		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
 	})
-	runSyncAs(t, b, b.holder.ID, wrong)
+	runSyncAs(t, b, b.arbitration.holderSession().ID, wrong)
 	after2, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if after2.Status != before.Status {
 		t.Fatalf("wrong id mutated %q -> %q", before.Status, after2.Status)
@@ -14482,7 +14585,7 @@ func TestEffectPermitReconcileStaleOrWrongIDNoMutation(t *testing.T) {
 		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
 		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
 	})
-	runSyncAs(t, b, b.holder.ID, wrongJob)
+	runSyncAs(t, b, b.arbitration.holderSession().ID, wrongJob)
 	afterWrongJob, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if afterWrongJob.Status != before.Status {
 		t.Fatalf("wrong job mutated %q -> %q", before.Status, afterWrongJob.Status)
@@ -14490,12 +14593,12 @@ func TestEffectPermitReconcileStaleOrWrongIDNoMutation(t *testing.T) {
 	// wrong holder generation must not mutate: request under the current
 	// generation, then fence it before the response arrives.
 	request = nextEffectPermitReconcileRequest(t, b)
-	b.epoch = 99
+	b.arbitration.setGenerationForTest(99)
 	mismatchGen := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
 		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "settled",
 		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
 	})
-	runSyncAs(t, b, b.holder.ID, mismatchGen)
+	runSyncAs(t, b, b.arbitration.holderSession().ID, mismatchGen)
 	after3, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if after3.Status != before.Status {
 		t.Fatalf("wrong generation mutated %q -> %q", before.Status, after3.Status)
@@ -14574,12 +14677,12 @@ func TestTermsEffectPermitAuthorizesAndSettlesExactOccurrence(t *testing.T) {
 	if replayed.PermitID != authorized.PermitID || replayed.TermsOccurrenceID != authorized.TermsOccurrenceID {
 		t.Fatalf("lost-response replay authorization=%+v, want exact original tuple", replayed)
 	}
-	b.epoch++
+	b.arbitration.advanceGenerationForTest()
 	fencedReplay, err := b.termsEffectStart(ctx, jobID, request)
 	if err != nil || permitOutcome(t, fencedReplay) != "stale" {
 		t.Fatalf("replacement-holder replay err=%v frames=%v", err, fencedReplay)
 	}
-	b.epoch--
+	b.arbitration.retreatGenerationForTest()
 	identity := job.EffectPermitIdentity{
 		JobID: jobID, Kind: job.EffectKindTerms,
 		TermsOccurrenceID: authorized.TermsOccurrenceID,
@@ -14840,7 +14943,7 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -14848,10 +14951,10 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profile.Revision, 7); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), profile.Revision, 7); err != nil {
 		t.Fatal(err)
 	}
-	effectOrdinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.epoch, 0)
+	effectOrdinal, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -14929,7 +15032,7 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 		t.Fatal(err)
 	}
 	freshClaim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: freshCandidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: freshCandidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision,
 		RouteRevision: 2, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -14937,7 +15040,7 @@ func TestLegacyInstitutionalNavigatedSettlesExactBlockerOnlyAndReopensAdmission(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, freshClaim.ID, freshClaim.BindingID, b.epoch, profile.Revision, 8); err != nil {
+	if err := jobs.BindMaterialization(ctx, freshClaim.ID, freshClaim.BindingID, b.arbitration.generation(), profile.Revision, 8); err != nil {
 		t.Fatal(err)
 	}
 	freshFrames, err := b.institutionalRoute(ctx, jobID, &protocol.InstitutionalRouteRequestPayload{
@@ -14978,7 +15081,7 @@ func TestLegacyInstitutionalNavigatedWireUsesPrePermitNegotiation(t *testing.T) 
 		t.Fatal(err)
 	}
 	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
 		RouteRevision: 1, MaterializationKind: "browser_tab",
 		LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -14986,10 +15089,10 @@ func TestLegacyInstitutionalNavigatedWireUsesPrePermitNegotiation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch, profiles[0].Revision, 7); err != nil {
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), profiles[0].Revision, 7); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.epoch, 0); err != nil {
+	if _, err := jobs.IssueMaterializationRoute(ctx, claim.ID, claim.BindingID, b.arbitration.generation(), 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := jobs.ImportLegacyStartedEpochs(ctx); err != nil {
@@ -15339,7 +15442,7 @@ func TestTerminalClaimRetiresOnlyAfterItsCancelIsDelivered(t *testing.T) {
 	}
 	// A SETTLED permit is what made the row immortal: the effect is over, so it
 	// protects nothing, yet the permit's mere existence vetoed both sweeps.
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch,
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(),
 		candidate.InstitutionProfileRevision, 9); err != nil {
 		t.Fatal(err)
 	}
@@ -15347,7 +15450,7 @@ func TestTerminalClaimRetiresOnlyAfterItsCancelIsDelivered(t *testing.T) {
 		job.InstitutionalEffectPermitAcquireInput{
 			JobID: candidate.JobID, ClaimID: claim.ID, BindingID: claim.BindingID,
 			SafetyDomainID: candidate.SafetyDomainID, InstitutionalRequestID: "immortal-request",
-			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.arbitration.generation(),
 			ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
 			Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
 		}); err != nil || outcome != job.EffectPermitAcquired {
@@ -15412,7 +15515,7 @@ func TestTerminalClaimSurvivesThePollThatAnnouncesIt(t *testing.T) {
 	if err != nil || candidate == nil {
 		t.Fatalf("binding candidate = %+v, err=%v", candidate, err)
 	}
-	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.epoch,
+	if err := jobs.BindMaterialization(ctx, claim.ID, claim.BindingID, b.arbitration.generation(),
 		candidate.InstitutionProfileRevision, 11); err != nil {
 		t.Fatal(err)
 	}
@@ -15420,7 +15523,7 @@ func TestTerminalClaimSurvivesThePollThatAnnouncesIt(t *testing.T) {
 		job.InstitutionalEffectPermitAcquireInput{
 			JobID: candidate.JobID, ClaimID: claim.ID, BindingID: claim.BindingID,
 			SafetyDomainID: candidate.SafetyDomainID, InstitutionalRequestID: "announce-request",
-			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.epoch,
+			JobAttemptRevision: candidate.JobAttemptRevision, BrowserHolderGeneration: b.arbitration.generation(),
 			ExpectedEffectOrdinal: 0, LeaseUntil: b.now().Add(time.Minute),
 			Authorization: job.EffectPermitEvent{Kind: "institutional.authorized"},
 		}); err != nil || outcome != job.EffectPermitAcquired {
@@ -15536,7 +15639,7 @@ func TestSurfaceCloseSupersededAuthorizesOnlyANonDrivingTab(t *testing.T) {
 
 			req := &protocol.SurfaceCloseRequestPayload{
 				RequestID: "req-close-superseded", BindingID: claim.BindingID,
-				BrowserHolderGeneration: b.epoch, Disposition: "surface_superseded",
+				BrowserHolderGeneration: b.arbitration.generation(), Disposition: "surface_superseded",
 			}
 			if !tc.omitTab {
 				tab := claim.TabID + tc.tabOffset
@@ -15594,7 +15697,7 @@ func TestSurfaceCloseSupersededRetiresAReDrivenClaimsOwnTab(t *testing.T) {
 			t.Fatal(err)
 		}
 		second, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-			CandidateID: "candidate-" + suffix, BrowserHolderGeneration: b.epoch,
+			CandidateID: "candidate-" + suffix, BrowserHolderGeneration: b.arbitration.generation(),
 			JobAttemptRevision: candidate.JobAttemptRevision, InstitutionProfileRevision: candidate.InstitutionProfileRevision,
 			RouteRevision: candidate.RouteRevision + 1, MaterializationKind: "browser_tab",
 			LeaseUntil: time.Now().UTC().Add(time.Minute),
@@ -15608,7 +15711,7 @@ func TestSurfaceCloseSupersededRetiresAReDrivenClaimsOwnTab(t *testing.T) {
 		t.Helper()
 		frames, err := b.surfaceClose(ctx, &protocol.SurfaceCloseRequestPayload{
 			RequestID: "req-close-redrive", BindingID: claim.BindingID,
-			BrowserHolderGeneration: b.epoch, Disposition: "surface_superseded",
+			BrowserHolderGeneration: b.arbitration.generation(), Disposition: "surface_superseded",
 			SurfaceTabID: &tabID,
 		})
 		if err != nil {
@@ -15675,7 +15778,7 @@ func TestRequestDevReloadRejectsOldExtensionVersionAndDoesNotLatch(t *testing.T)
 		t.Fatalf("rejected dev_reload was still latched: %v", msgs)
 	}
 	b.mu.Lock()
-	latched := b.holder != nil && b.holder.pendingDevReload != ""
+	latched := b.arbitration.holderSession() != nil && b.arbitration.pendingDevReload(b.arbitration.holderSession().ID) != ""
 	b.mu.Unlock()
 	if latched {
 		t.Fatal("pendingDevReload is latched after a version-gated refusal")
@@ -15788,9 +15891,9 @@ func TestDevReloadReservationHoldsSlotAgainstPendingSibling(t *testing.T) {
 	}
 	msgs, _ = runSyncAs(t, b, sessB)
 	b.mu.Lock()
-	holder := b.holder
-	_, stillPending := b.pending[sessB]
-	reserved := b.devReloadReserved(b.now())
+	holder := b.arbitration.holderSession()
+	stillPending := b.arbitration.known(sessB)
+	reserved := b.arbitration.reloadReserved(b.now())
 	b.mu.Unlock()
 	if holder != nil {
 		t.Fatalf("pending sibling stole the slot during reservation: holder=%+v", holder)
@@ -15826,9 +15929,9 @@ func TestDevReloadFreshHelloReclaimsReservedSlot(t *testing.T) {
 		t.Fatalf("B Sync: %v", err)
 	}
 	b.mu.Lock()
-	if b.holder != nil {
+	if b.arbitration.holderSession() != nil {
 		b.mu.Unlock()
-		t.Fatalf("holder must be nil before reloader returns, got %+v", b.holder)
+		t.Fatalf("holder must be nil before reloader returns, got %+v", b.arbitration.holderSession())
 	}
 	b.mu.Unlock()
 	const sessC = "cccc3333cccc3333cccc3333cccc3333"
@@ -15839,10 +15942,10 @@ func TestDevReloadFreshHelloReclaimsReservedSlot(t *testing.T) {
 	}
 	b.mu.Lock()
 	holderID := ""
-	if b.holder != nil {
-		holderID = b.holder.ID
+	if b.arbitration.holderSession() != nil {
+		holderID = b.arbitration.holderSession().ID
 	}
-	reserved := b.devReloadReserved(b.now())
+	reserved := b.arbitration.reloadReserved(b.now())
 	b.mu.Unlock()
 	if holderID != sessC {
 		t.Fatalf("holder = %q, want %q", holderID, sessC)
@@ -15871,8 +15974,8 @@ func TestDevReloadReservationExpiryPromotesWaitingSibling(t *testing.T) {
 	msgs, _ = runSyncAs(t, b, sessB)
 	b.mu.Lock()
 	holderID := ""
-	if b.holder != nil {
-		holderID = b.holder.ID
+	if b.arbitration.holderSession() != nil {
+		holderID = b.arbitration.holderSession().ID
 	}
 	b.mu.Unlock()
 	if holderID != sessB {
@@ -15899,8 +16002,8 @@ func TestDevReloadOrdinaryGoodbyePromotesImmediatelyWithoutReservation(t *testin
 	msgs, _ = runSyncAs(t, b, sessB)
 	b.mu.Lock()
 	holderID := ""
-	if b.holder != nil {
-		holderID = b.holder.ID
+	if b.arbitration.holderSession() != nil {
+		holderID = b.arbitration.holderSession().ID
 	}
 	b.mu.Unlock()
 	if holderID != sessB {
@@ -15928,11 +16031,11 @@ func TestDevReloadExplicitClaimOverridesReservation(t *testing.T) {
 		t.Fatalf("goodbye Sync: %v", err)
 	}
 	b.mu.Lock()
-	if b.holder != nil {
+	if b.arbitration.holderSession() != nil {
 		b.mu.Unlock()
-		t.Fatalf("holder must be nil before explicit claim, got %+v", b.holder)
+		t.Fatalf("holder must be nil before explicit claim, got %+v", b.arbitration.holderSession())
 	}
-	if !b.devReloadReserved(b.now()) {
+	if !b.arbitration.reloadReserved(b.now()) {
 		b.mu.Unlock()
 		t.Fatalf("reservation must be live before Claim override")
 	}
@@ -15946,10 +16049,10 @@ func TestDevReloadExplicitClaimOverridesReservation(t *testing.T) {
 	}
 	b.mu.Lock()
 	holderID := ""
-	if b.holder != nil {
-		holderID = b.holder.ID
+	if b.arbitration.holderSession() != nil {
+		holderID = b.arbitration.holderSession().ID
 	}
-	reserved := b.devReloadReserved(b.now())
+	reserved := b.arbitration.reloadReserved(b.now())
 	b.mu.Unlock()
 	if holderID != sessB {
 		t.Fatalf("explicit Claim must make B the holder, got %q", holderID)

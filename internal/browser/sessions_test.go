@@ -228,8 +228,8 @@ func TestNonHolderHumanInitiatedFramesAreAdmitted(t *testing.T) {
 				t.Fatalf("%s from a non-holder produced no %s: %v", tc.name, tc.want, msgs)
 			}
 			// Serving a non-holder must not hand it the session slot either.
-			if b.holder == nil || b.holder.ID != sessA {
-				t.Fatalf("holder = %+v, want the session slot left with %s", b.holder, sessA)
+			if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessA {
+				t.Fatalf("holder = %+v, want the session slot left with %s", b.arbitration.holderSession(), sessA)
 			}
 		})
 	}

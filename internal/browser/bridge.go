@@ -264,8 +264,10 @@ type browserDownloadKey struct {
 type pendingBrowserDownload struct {
 	Filename    string
 	CandidateID int64
-	Producer    *job.ArtifactProducerIdentity
-	ReceivedAt  time.Time
+	// Adopting is true while CandidateID is not yet known and ingestion runs without b.mu.
+	Adopting   bool
+	Producer   *job.ArtifactProducerIdentity
+	ReceivedAt time.Time
 }
 type pendingDeliveryContext struct {
 	Payload    protocol.DeliveryContextPayload
@@ -353,16 +355,10 @@ type Bridge struct {
 	mu                   sync.Mutex
 	providerDriveEpochMu sync.Mutex
 	seq                  int64
-	holder               *browserSession
-	pending              map[string]*browserSession
-	deniedHellos         int
-	takeovers            int
-	// epoch increments whenever holder identity changes. Code that releases
-	// b.mu mid-flight (adoption windows inside poll) re-checks it afterwards:
-	// a concurrent claim/takeover must not let a resumed poll send offers to a
-	// demoted session or pollute the new holder's bookkeeping.
-	epoch   int64
-	offered map[string]bool // handoff jobs offered to the current holder
+	// arbitration owns holder identity, pending sessions, generation fences,
+	// demotion notices, counters, and development reload reservations.
+	arbitration sessionArbitration
+	offered     map[string]bool // handoff jobs offered to the current holder
 	// queuedOffers are jobs whose most recent browser.job_accept carried
 	// disposition "queued" — the extension saying it took the offer into its
 	// own queue and is NOT driving it. They are still offered; they are just
@@ -395,13 +391,6 @@ type Bridge struct {
 	// per configured resolver profile across ordinary sync ticks, even after
 	// its source settles.
 	reofferSourceJobID map[string]string
-	// devReloadReservedFor is the session id whose dev_reload frame has been
-	// delivered and which is therefore expected back as a NEW session, and
-	// devReloadReservedUntil bounds that expectation. While the reservation
-	// is live the bridge slot is left vacant rather than handed to a pending
-	// sibling: see devReloadReservation.
-	devReloadReservedFor   string
-	devReloadReservedUntil time.Time
 	// Session evidence is timing-only and throttled per exact configured
 	// resolver profile.
 	lastSessionEvidenceAt map[string]time.Time
@@ -560,38 +549,6 @@ func (b *Bridge) compactPresenceOrderLocked() {
 	b.presenceOrder = compact
 }
 
-// browserSession is one native-host connection that said hello.
-type browserSession struct {
-	ID               string
-	ExtensionVersion string
-	AdapterVersions  map[string]string
-	Features         []string
-	HelloAt          time.Time
-	LastSyncAt       time.Time
-	Outdated         bool
-	// adapterUpgradeRepairPending lets a newly live holder repair parks once
-	// without turning each two-second browser poll into a maintenance sweep.
-	adapterUpgradeRepairPending bool
-	// needsAck makes the next Sync from this session deliver a hello_ack:
-	// a session promoted by claim or stale-takeover was only acked as
-	// sessionRolePending at hello time and must hear it now holds the
-	// bridge before offers mean anything.
-	needsAck bool
-	// demotedNotice makes the next Sync from a claim-demoted holder deliver
-	// one session_busy frame. `papio browser use` moves the bridge without
-	// the old holder's extension ever hearing about it, so that browser kept
-	// reporting a live connection while receiving no offers. A hello-time
-	// takeover needs no flag: it drops the previous holder outright, whose
-	// next poll is answered with expected_hello.
-	demotedNotice bool
-	// pendingDevReload holds one un-delivered dev_reload's reload_id ("" when
-	// none). It is cleared the moment the frame is emitted, and dropped with
-	// the session: a reload tears the native port down, so the reloaded
-	// extension arrives as a NEW session and must never inherit the command
-	// that killed its predecessor. That is what stops a reload loop.
-	pendingDevReload string
-}
-
 // legacySessionID stands in for native hosts older than the session_id field.
 // It cannot collide with real ids (32 hex chars). Legacy hosts cannot be
 // arbitrated, so a legacy hello always takes the session (and loses it to any
@@ -707,15 +664,21 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 			triageService.RegisterSource(parkedGrabItemSource{store: jobs.S, grabs: grabs})
 		}
 	}
+	var nextEpoch func() (int64, error)
+	if jobs != nil {
+		nextEpoch = func() (int64, error) {
+			return jobs.NextMaterializationHolderGeneration(context.Background())
+		}
+	}
 	return &Bridge{
 		jobs: jobs, svc: svc, triage: triageService, watchRunner: watchRunner, preview: previewServer, captureStore: captureStore, holdings: holdings, zotio: zotioService, cfg: cfg, cohorts: cohorts,
 		grabs:                  grabs,
 		Version:                version,
 		Features:               required,
+		arbitration:            newSessionArbitration(nextEpoch),
 		offered:                map[string]bool{},
 		cancelSent:             map[string]bool{},
 		cancelAnnounced:        map[string]bool{},
-		pending:                map[string]*browserSession{},
 		authReleased:           map[int64]bool{},
 		reofferPending:         map[string]bool{},
 		directRouteAttempts:    map[string]string{},
@@ -740,10 +703,10 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 func (b *Bridge) SessionInfo() (extensionVersion string, adapterCount int, helloSeen bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.holder == nil {
+	if b.arbitration.holderSession() == nil {
 		return "", 0, false
 	}
-	return b.holder.ExtensionVersion, len(b.holder.AdapterVersions), true
+	return b.arbitration.holderSession().ExtensionVersion, len(b.arbitration.holderSession().AdapterVersions), true
 }
 
 // FocusHandoffs queues compatible holder sessions to surface tracked handoffs.
@@ -754,13 +717,13 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.holder == nil ||
-		b.holder.ID == legacySessionID ||
-		b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter ||
-		compareVersion(b.holder.ExtensionVersion, HandoffFocusMinExtensionVersion) < 0 {
+	if b.arbitration.holderSession() == nil ||
+		b.arbitration.holderSession().ID == legacySessionID ||
+		b.now().Sub(b.arbitration.holderSession().LastSyncAt) > sessionStaleAfter ||
+		compareVersion(b.arbitration.holderSession().ExtensionVersion, HandoffFocusMinExtensionVersion) < 0 {
 		return 0, false, nil
 	}
-	holderID := b.holder.ID
+	holderID := b.arbitration.holderSession().ID
 	actions, err := b.jobs.ListHumanActions(ctx, true)
 	if err != nil {
 		return 0, true, err
@@ -814,7 +777,7 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		// download is the opposite instruction — the human fetches the file —
 		// so it takes the plain offer path below and never pins a candidate.
 		if kind == handoffActionKind && b.institutionalMaterializationAvailable() {
-			epoch := b.epoch
+			epoch := b.arbitration.generation()
 			b.mu.Unlock()
 			// An operator asking again for a paper whose attempt already
 			// navigated and never delivered is the retry decision the
@@ -829,8 +792,8 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 			}
 			candidate, candidateErr := b.prepareMaterializationCandidate(ctx, *row)
 			b.mu.Lock()
-			if b.epoch != epoch || b.holder == nil || b.holder.ID != holderID {
-				if b.holder != nil && b.holder.ID != legacySessionID && b.institutionalMaterializationAvailable() {
+			if b.arbitration.generation() != epoch || b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != holderID {
+				if b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID != legacySessionID && b.institutionalMaterializationAvailable() {
 					b.focusPending[row.ID] = true
 					b.materializationTracked[row.ID] = false
 					queued++
@@ -865,18 +828,7 @@ type SessionSummary struct {
 func (b *Bridge) Sessions() (sessions []SessionSummary, deniedHellos, takeovers int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.holder != nil {
-		sessions = append(sessions, summarize(b.holder, true))
-	}
-	rest := make([]*browserSession, 0, len(b.pending))
-	for _, session := range b.pending {
-		rest = append(rest, session)
-	}
-	sort.Slice(rest, func(i, j int) bool { return rest[i].LastSyncAt.After(rest[j].LastSyncAt) })
-	for _, session := range rest {
-		sessions = append(sessions, summarize(session, false))
-	}
-	return sessions, b.deniedHellos, b.takeovers
+	return b.arbitration.summaries()
 }
 
 func summarize(session *browserSession, holder bool) SessionSummary {
@@ -895,32 +847,13 @@ func summarize(session *browserSession, holder bool) SessionSummary {
 func (b *Bridge) Claim(sessionID string) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	prefix := strings.TrimSpace(sessionID)
-	if prefix == "" {
-		return "", errors.New("browser session id is required")
+	resolved, transition, err := b.arbitration.claim(sessionID)
+	if err != nil || !transition.changed {
+		return resolved, err
 	}
-	var matches []*browserSession
-	if b.holder != nil && strings.HasPrefix(b.holder.ID, prefix) {
-		matches = append(matches, b.holder)
-	}
-	for id, session := range b.pending {
-		if strings.HasPrefix(id, prefix) {
-			matches = append(matches, session)
-		}
-	}
-	switch {
-	case len(matches) == 0:
-		return "", fmt.Errorf("unknown browser session %q (run 'papio browser sessions')", prefix)
-	case len(matches) > 1:
-		// Ambiguity includes the holder: a prefix matching both the holder
-		// and a pending session must not report a silent no-op success.
-		return "", fmt.Errorf("browser session prefix %q is ambiguous (run 'papio browser sessions')", prefix)
-	case matches[0] == b.holder:
-		return b.holder.ID, nil // already the holder
-	}
-	b.promote(matches[0], "claimed via papio browser use")
+	b.applyPromotion(transition, "claimed via papio browser use")
 	b.reconcileMaterializationGeneration(context.Background())
-	return b.holder.ID, nil
+	return resolved, nil
 }
 
 // RequestDevReload latches a one-shot dev_reload for the current holder.
@@ -932,35 +865,31 @@ func (b *Bridge) Claim(sessionID string) (string, error) {
 func (b *Bridge) RequestDevReload() (sessionID string, reloadID string, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.holder == nil {
+	holder := b.arbitration.holderSession()
+	if holder == nil {
 		return "", "", errors.New("no browser session holds the bridge")
 	}
-	if compareVersion(b.holder.ExtensionVersion, DevReloadMinExtensionVersion) < 0 {
-		return "", "", fmt.Errorf("browser extension v%s does not support dev_reload (needs v%s)", b.holder.ExtensionVersion, DevReloadMinExtensionVersion)
+	if compareVersion(holder.ExtensionVersion, DevReloadMinExtensionVersion) < 0 {
+		return "", "", fmt.Errorf("browser extension v%s does not support dev_reload (needs v%s)", holder.ExtensionVersion, DevReloadMinExtensionVersion)
 	}
-	if b.holder.pendingDevReload != "" {
-		return b.holder.ID, b.holder.pendingDevReload, nil
+	if pending := b.arbitration.pendingDevReload(holder.ID); pending != "" {
+		return holder.ID, pending, nil
 	}
 	reloadID = job.NewID("reload")
-	b.holder.pendingDevReload = reloadID
-	log.Printf("papio: dev_reload %s latched for browser session %s", reloadID, shortSession(b.holder.ID))
-	return b.holder.ID, reloadID, nil
+	sessionID, reloadID, err = b.arbitration.requestDevReload(reloadID)
+	if err == nil {
+		log.Printf("papio: dev_reload %s latched for browser session %s", reloadID, shortSession(sessionID))
+	}
+	return sessionID, reloadID, err
 }
 
-// promote makes session the holder. The caller holds b.mu. The previous
-// holder, when still present, is demoted to pending rather than dropped so an
-// explicit claim can be reversed with another claim.
-func (b *Bridge) promote(session *browserSession, reason string) {
-	if b.holder != nil && b.holder.ID != session.ID {
-		b.holder.demotedNotice = true
-		// A latch is only meaningful while its session holds the bridge. Left
-		// in place it would fire whenever that session was promoted again,
-		// reloading a browser long after the command that asked for it was
-		// reported as failed.
-		b.holder.pendingDevReload = ""
-		b.pending[b.holder.ID] = b.holder
-		if capture := b.pendingCaptures[b.holder.ID]; capture != nil {
-			delete(b.pendingCaptures, b.holder.ID)
+// applyPromotion resets Bridge-owned routing state after arbitration changes
+// the holder. The arbitration module has already completed its transition.
+// The caller holds b.mu.
+func (b *Bridge) applyPromotion(transition arbitrationTransition, reason string) {
+	if previous := transition.previous; previous != nil {
+		if capture := b.pendingCaptures[previous.ID]; capture != nil {
+			delete(b.pendingCaptures, previous.ID)
 			capture.result <- CaptureResult{
 				RequestID: capture.payload.RequestID,
 				Outcome:   "nav_failed",
@@ -968,25 +897,14 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 			}
 		}
 	}
-	if b.jobs != nil {
-		generation, err := b.jobs.NextMaterializationHolderGeneration(context.Background())
-		if err != nil {
-			b.materializationAuthorityUncertain = true
-			b.materializationGenerationUnavailable = true
-			log.Printf("papio: materialization holder generation unavailable: %v", err)
-		} else {
-			b.epoch = generation
-			b.materializationAuthorityUncertain = false
-			b.materializationGenerationUnavailable = false
-		}
+	if transition.generationErr != nil {
+		b.materializationAuthorityUncertain = true
+		b.materializationGenerationUnavailable = true
+		log.Printf("papio: materialization holder generation unavailable: %v", transition.generationErr)
+	} else if b.jobs != nil {
+		b.materializationAuthorityUncertain = false
+		b.materializationGenerationUnavailable = false
 	}
-	delete(b.pending, session.ID)
-	session.needsAck = true
-	// An explicit `papio browser use` claim overrides a reload reservation.
-	b.clearDevReloadReservation()
-	// A pending browser has not been allowed to offer work, so it must check
-	// upgrade repairs when it becomes the live holder.
-	b.holder = session
 	b.offered = map[string]bool{}
 	b.queuedOffers = map[string]bool{}
 	b.cancelSent = map[string]bool{}
@@ -997,7 +915,6 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.materializationTracked = map[string]bool{}
 	b.reofferRanThisSync = map[string]bool{}
 	b.effectPermitReconciles = map[string]pendingEffectPermitReconcile{}
-
 	b.materializationScheduleCursor = job.CandidateScheduleCursor{}
 	b.scheduleCursorPending = job.CandidateScheduleCursor{}
 	b.scheduleHasMorePending = false
@@ -1006,8 +923,8 @@ func (b *Bridge) promote(session *browserSession, reason string) {
 	b.materializationScheduleInFlight = false
 	b.materializationScheduleVersion++
 	b.materializationRecoveryPending = true
-	b.takeovers++
-	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(session.ID), session.ExtensionVersion, reason)
+	holder := b.arbitration.holderSession()
+	log.Printf("papio: browser session %s (v%s) now holds the bridge: %s", shortSession(holder.ID), holder.ExtensionVersion, reason)
 }
 
 // reconcileMaterializationGeneration abandons claims fenced to older holder
@@ -1018,7 +935,7 @@ func (b *Bridge) reconcileMaterializationGeneration(ctx context.Context) {
 	if b.jobs == nil || b.materializationGenerationUnavailable || b.materializationProfileAuthorityUnavailable {
 		return
 	}
-	count, err := b.jobs.AbandonStaleMaterializations(ctx, b.epoch)
+	count, err := b.jobs.AbandonStaleMaterializations(ctx, b.arbitration.generation())
 	if err != nil {
 		b.materializationAuthorityUncertain = true
 		log.Printf("papio: abandoning stale materialization claims failed: %v", err)
@@ -1026,7 +943,7 @@ func (b *Bridge) reconcileMaterializationGeneration(ctx context.Context) {
 	}
 	b.materializationAuthorityUncertain = false
 	if count > 0 {
-		log.Printf("papio: abandoned %d stale materialization claims for holder generation %d", count, b.epoch)
+		log.Printf("papio: abandoned %d stale materialization claims for holder generation %d", count, b.arbitration.generation())
 	}
 }
 
@@ -1090,7 +1007,7 @@ var ErrOutboundFrame = errors.New("outbound frame self-validation failed")
 func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frames []json.RawMessage) ([]json.RawMessage, error) {
 	b.mu.Lock()
 	b.reofferRanThisSync = map[string]bool{}
-	generationAtStart := b.epoch
+	generationAtStart := b.arbitration.generation()
 	defer b.mu.Unlock()
 	if sessionID == "" {
 		sessionID = legacySessionID
@@ -1100,31 +1017,18 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		return nil, nil
 	}
 	now := b.now()
-	b.prunePending(now)
-	if b.holder != nil && b.holder.ID == sessionID {
-		b.holder.LastSyncAt = now
-	} else if session, ok := b.pending[sessionID]; ok {
-		session.LastSyncAt = now
-		// Succession: a silent or departed holder yields to the session that
-		// is demonstrably alive right now.
-		if b.holder == nil {
-			// A reload is not a departure: hold the slot for the browser that
-			// is restarting instead of handing it to an idle sibling.
-			if !b.devReloadReserved(now) {
-				b.promote(session, "previous holder disconnected")
-			}
-		} else if now.Sub(b.holder.LastSyncAt) > sessionStaleAfter {
-			stale := b.holder
-			delete(b.pending, stale.ID) // do not resurrect a silent holder
-			b.promote(session, "holder "+shortSession(stale.ID)+" went silent")
-			delete(b.pending, stale.ID)
+	pollDecision := b.arbitration.poll(sessionID, now)
+	if pollDecision.transition.changed {
+		reason := "previous holder disconnected"
+		if pollDecision.transition.previous != nil {
+			reason = "holder " + shortSession(pollDecision.transition.previous.ID) + " went silent"
 		}
+		b.applyPromotion(pollDecision.transition, reason)
 	}
 
 	var out []json.RawMessage
-	if b.holder != nil && b.holder.ID == sessionID && b.holder.needsAck {
-		b.holder.needsAck = false
-		if b.holder.Outdated {
+	if promoted := b.arbitration.consumeHolderAck(sessionID); promoted != nil {
+		if promoted.Outdated {
 			// A promoted session skipped the hello path where the outdated
 			// gate normally answers; staying silent would leave an
 			// incompatible extension holding the bridge unaware.
@@ -1144,8 +1048,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 	// A claim moved the bridge out from under this session. Tell it once, with
 	// the same frame a denied hello gets, so its UI can stop claiming a live
 	// papio connection and name the browser that now holds one.
-	if demoted, ok := b.pending[sessionID]; ok && demoted.demotedNotice {
-		demoted.demotedNotice = false
+	if b.arbitration.consumeDemotedNotice(sessionID) {
 		busy, err := b.sessionBusy("")
 		if err != nil {
 			return nil, err
@@ -1155,17 +1058,14 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 	// A latched dev_reload leaves on the very next poll, ahead of any other
 	// work: the extension is about to restart, so nothing queued behind it
 	// would survive to be handled.
-	if b.holder != nil && b.holder.ID == sessionID && b.holder.pendingDevReload != "" {
-		reloadID := b.holder.pendingDevReload
-		b.holder.pendingDevReload = ""
+	if reloadID := b.arbitration.pendingDevReload(sessionID); reloadID != "" {
 		frame, err := b.frame(protocol.MsgDevReload, "", protocol.DevReloadPayload{ReloadID: reloadID})
 		if err != nil {
 			return nil, err
 		}
-		// Reserve the slot from the moment the command is on the wire, not
-		// from the latch: this is when the extension actually restarts.
-		b.devReloadReservedFor = sessionID
-		b.devReloadReservedUntil = now.Add(devReloadReservation)
+		// Reserve from successful construction of the frame that will go on
+		// the wire, not from the earlier latch.
+		b.arbitration.emitDevReload(sessionID, reloadID, now)
 		out = append(out, frame)
 	}
 	for _, raw := range frames {
@@ -1187,8 +1087,8 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			return nil, err
 		}
 		out = append(out, replies...)
-		if b.holder != nil && b.holder.ID == sessionID && b.holder.Outdated {
-			if b.epoch != generationAtStart || b.materializationAuthorityUncertain {
+		if b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID == sessionID && b.arbitration.holderSession().Outdated {
+			if b.arbitration.generation() != generationAtStart || b.materializationAuthorityUncertain {
 				b.reconcileMaterializationGeneration(ctx)
 			}
 			return out, nil
@@ -1201,11 +1101,11 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		}
 		return append(out, required...), nil
 	}
-	if b.holder == nil || b.holder.ID != sessionID || b.holder.Outdated {
+	if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID || b.arbitration.holderSession().Outdated {
 		// Pending sessions poll but never receive offer/cancel traffic.
 		return out, nil
 	}
-	if b.epoch != generationAtStart || b.materializationAuthorityUncertain {
+	if b.arbitration.generation() != generationAtStart || b.materializationAuthorityUncertain {
 		b.reconcileMaterializationGeneration(ctx)
 	}
 	b.repairAdapterUpgradeParks(ctx)
@@ -1216,7 +1116,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 	var scheduled []job.BrowserCandidateDescriptor
 	schedulingUnavailable := false
 	scheduleRan := false
-	scheduleEpoch := b.epoch
+	scheduleEpoch := b.arbitration.generation()
 	scheduleVersion := b.materializationScheduleVersion
 	if b.jobs != nil && b.institutionalMaterializationAvailable() && !b.materializationScheduleInFlight {
 		cursor := b.materializationScheduleCursor
@@ -1237,7 +1137,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			return out, nil
 		}
 		b.materializationScheduleInFlight = false
-		if b.epoch != scheduleEpoch || b.holder == nil || b.holder.ID != sessionID {
+		if !b.arbitration.holderMatches(sessionID, scheduleEpoch) {
 			return out, nil
 		}
 		if scheduleErr != nil {
@@ -1278,7 +1178,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 	}
 	if scheduleRan && !schedulingUnavailable && !b.materializationScheduleBlocked &&
 		b.materializationScheduleProcessed && b.materializationScheduleVersion == scheduleVersion &&
-		b.epoch == scheduleEpoch && b.holder != nil && b.holder.ID == sessionID {
+		b.arbitration.holderMatches(sessionID, scheduleEpoch) {
 		b.materializationScheduleCursor = b.scheduleCursorPending
 		if !b.scheduleHasMorePending {
 			b.materializationScheduleCursor = job.CandidateScheduleCursor{}
@@ -1291,21 +1191,17 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 // a repair read or write must not disconnect the user's native browser session.
 // The caller holds b.mu.
 func (b *Bridge) repairAdapterUpgradeParks(ctx context.Context) {
-	if b.holder == nil ||
-		b.holder.Outdated ||
-		!b.holder.adapterUpgradeRepairPending ||
-		len(b.holder.AdapterVersions) == 0 ||
-		b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+	holder := b.arbitration.consumeAdapterUpgradeRepair(b.now())
+	if holder == nil {
 		return
 	}
-	b.holder.adapterUpgradeRepairPending = false
 	if b.svc == nil {
 		return
 	}
 	if err := b.svc.HandoffRepairer().RepairAdapterUpgrade(
 		ctx,
-		b.holder.ExtensionVersion,
-		b.holder.AdapterVersions,
+		holder.ExtensionVersion,
+		holder.AdapterVersions,
 		extensionVersionNewer,
 	); err != nil {
 		log.Printf("papio: repairing provider parks after adapter upgrade: %v", err)
@@ -1315,11 +1211,7 @@ func (b *Bridge) repairAdapterUpgradeParks(ctx context.Context) {
 // knownSession reports whether the session already completed a hello this
 // daemon run. The caller holds b.mu.
 func (b *Bridge) knownSession(sessionID string) bool {
-	if b.holder != nil && b.holder.ID == sessionID {
-		return true
-	}
-	_, ok := b.pending[sessionID]
-	return ok
+	return b.arbitration.known(sessionID)
 }
 
 // Capture queues one directive for the current holder and waits for its
@@ -1327,12 +1219,12 @@ func (b *Bridge) knownSession(sessionID string) bool {
 func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureResult {
 	b.mu.Lock()
 	now := b.now()
-	if b.holder == nil || b.holder.Outdated || now.Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+	if b.arbitration.holderSession() == nil || b.arbitration.holderSession().Outdated || now.Sub(b.arbitration.holderSession().LastSyncAt) > sessionStaleAfter {
 		b.mu.Unlock()
 		return CaptureResult{Outcome: "not_permitted", Detail: "no compatible browser session is connected"}
 	}
-	if compareVersion(b.holder.ExtensionVersion, CaptureRequestIDMinExtensionVersion) < 0 {
-		version := b.holder.ExtensionVersion
+	if compareVersion(b.arbitration.holderSession().ExtensionVersion, CaptureRequestIDMinExtensionVersion) < 0 {
+		version := b.arbitration.holderSession().ExtensionVersion
 		b.mu.Unlock()
 		return CaptureResult{
 			Outcome: "not_permitted",
@@ -1340,7 +1232,7 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 				version, CaptureRequestIDMinExtensionVersion),
 		}
 	}
-	sessionID := b.holder.ID
+	sessionID := b.arbitration.holderSession().ID
 	if _, exists := b.pendingCaptures[sessionID]; exists {
 		b.mu.Unlock()
 		return CaptureResult{Outcome: "busy", Detail: "a page capture is already outstanding for this browser session"}
@@ -1392,26 +1284,11 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 	}
 }
 
-// devReloadReserved reports whether the bridge slot is currently being held
-// vacant for a browser restarting under dev_reload. The caller holds b.mu.
-func (b *Bridge) devReloadReserved(now time.Time) bool {
-	return b.devReloadReservedFor != "" && now.Before(b.devReloadReservedUntil)
-}
-
-// clearDevReloadReservation drops the reservation once it has been honoured
-// or is no longer wanted. The caller holds b.mu.
-func (b *Bridge) clearDevReloadReservation() {
-	b.devReloadReservedFor = ""
-	b.devReloadReservedUntil = time.Time{}
-}
-
 // release forgets a departing session. The caller holds b.mu.
 func (b *Bridge) release(sessionID string) {
-	delete(b.pending, sessionID)
-	if b.holder != nil && b.holder.ID == sessionID {
-		log.Printf("papio: browser session %s (v%s) disconnected", shortSession(sessionID), b.holder.ExtensionVersion)
-		b.holder = nil
-		b.epoch++
+	departed, holderReleased := b.arbitration.release(sessionID)
+	if holderReleased {
+		log.Printf("papio: browser session %s (v%s) disconnected", shortSession(sessionID), departed.ExtensionVersion)
 		b.reofferSourceJobID = map[string]string{}
 	}
 	if pending := b.pendingCaptures[sessionID]; pending != nil {
@@ -1420,16 +1297,6 @@ func (b *Bridge) release(sessionID string) {
 			RequestID: pending.payload.RequestID,
 			Outcome:   "nav_failed",
 			Detail:    "browser session disconnected during page capture",
-		}
-	}
-}
-
-// prunePending drops pending sessions whose native host stopped syncing
-// without a goodbye. The caller holds b.mu.
-func (b *Bridge) prunePending(now time.Time) {
-	for id, session := range b.pending {
-		if now.Sub(session.LastSyncAt) > pendingExpireAfter {
-			delete(b.pending, id)
 		}
 	}
 }
@@ -1448,7 +1315,7 @@ func (b *Bridge) helloAck(role string) (json.RawMessage, error) {
 		Role:            role,
 	}
 	if role == sessionRoleHolder {
-		generation := b.epoch
+		generation := b.arbitration.generation()
 		payload.BrowserHolderGeneration = &generation
 	}
 	return b.frame(protocol.MsgHelloAck, "", payload)
@@ -1483,24 +1350,19 @@ func institutionalAuthenticationClaimMessage(msgType string) bool {
 }
 
 func (b *Bridge) institutionalMaterializationAvailable() bool {
-	return b != nil && b.holder != nil && b.holder.ID != legacySessionID &&
+	return b != nil && b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID != legacySessionID &&
 		!b.materializationAuthorityUncertain &&
 		!b.materializationProfileAuthorityUnavailable &&
 		!b.materializationGenerationUnavailable &&
 		!b.materializationClaimReconcileUnavailable &&
-		slices.Contains(b.holder.Features, institutionalMaterializationFeature) &&
-		slices.Contains(b.holder.Features, effectPermitFeature)
+		slices.Contains(b.arbitration.holderSession().Features, institutionalMaterializationFeature) &&
+		slices.Contains(b.arbitration.holderSession().Features, effectPermitFeature)
 }
 func (b *Bridge) legacyInstitutionalNavigationAllowed(sessionID string) bool {
 	if b == nil {
 		return false
 	}
-	var session *browserSession
-	if b.holder != nil && b.holder.ID == sessionID {
-		session = b.holder
-	} else {
-		session = b.pending[sessionID]
-	}
+	session := b.arbitration.session(sessionID)
 	return session != nil &&
 		slices.Contains(session.Features, institutionalMaterializationFeature) &&
 		!slices.Contains(session.Features, effectPermitFeature)
@@ -1905,7 +1767,7 @@ func (b *Bridge) institutionalClaim(ctx context.Context, jobID string, p *protoc
 	}
 	leaseUntil := b.now().Add(b.actionExpiry())
 	claim, err := b.jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
-		CandidateID: candidate.ID, BrowserHolderGeneration: b.epoch,
+		CandidateID: candidate.ID, BrowserHolderGeneration: b.arbitration.generation(),
 		JobAttemptRevision:         candidate.JobAttemptRevision,
 		InstitutionProfileRevision: candidate.InstitutionProfileRevision,
 		RouteRevision:              candidate.RouteRevision, MaterializationKind: p.MaterializationKind,
@@ -1965,7 +1827,7 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 	}
 	if candidate == nil || candidate.JobID != jobID || p.TabID < 0 ||
 		!liveMaterializationClaim(claim, b.now()) ||
-		claim.BrowserHolderGeneration != b.epoch || claim.MaterializationKind != "browser_tab" {
+		claim.BrowserHolderGeneration != b.arbitration.generation() || claim.MaterializationKind != "browser_tab" {
 		result.Outcome, result.Detail = "stale", "claim is fenced to another holder"
 		return b.frameInstitutionalBind(jobID, result)
 	}
@@ -2050,10 +1912,10 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 		shared := found && lease.State == job.AuthenticationEntryLeaseHuman && lease.EntitledAt != ""
 		ownsEntry := found && (lease.OwnerID == jobID || lease.HumanOwnerID == jobID)
 		if !shared {
-			leaseID := evidenceObservationID("authentication_claim_lease", authenticationClaimID, jobID, strconv.FormatInt(b.epoch, 10))
+			leaseID := evidenceObservationID("authentication_claim_lease", authenticationClaimID, jobID, strconv.FormatInt(b.arbitration.generation(), 10))
 			if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 				AuthenticationClaimID: authenticationClaimID, LeaseID: leaseID, OwnerID: jobID,
-				BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+				BrowserHolderGeneration: b.arbitration.generation(), LeaseUntil: b.now().Add(b.actionExpiry()),
 			}); reserveErr != nil {
 				if !errors.Is(reserveErr, job.ErrAuthenticationEntryLeaseBusy) {
 					result.Outcome, result.Detail = "error", "authentication entry lease is unavailable"
@@ -2087,7 +1949,7 @@ func (b *Bridge) institutionalBind(ctx context.Context, jobID string, p *protoco
 			return b.frameInstitutionalBind(jobID, result)
 		}
 	}
-	err = b.jobs.BindMaterializationWithLeaseOwner(ctx, claim.ID, p.BindingID, b.epoch,
+	err = b.jobs.BindMaterializationWithLeaseOwner(ctx, claim.ID, p.BindingID, b.arbitration.generation(),
 		candidate.InstitutionProfileRevision, p.TabID, leaseOwnerClaimID, jobID)
 	if err != nil {
 		// Every other refusal here names itself; this one answered a bare
@@ -2142,7 +2004,7 @@ func (b *Bridge) institutionalRoute(ctx context.Context, jobID string, p *protoc
 		}
 		return b.frameInstitutionalRoute(jobID, result)
 	}
-	if claim.BindingID != p.BindingID || claim.BrowserHolderGeneration != b.epoch ||
+	if claim.BindingID != p.BindingID || claim.BrowserHolderGeneration != b.arbitration.generation() ||
 		claim.MaterializationKind != "browser_tab" ||
 		(claim.Phase != "bound" && claim.Phase != "route_issued" && claim.Phase != "navigated") {
 		result.Outcome, result.Detail = "stale", "claim is fenced to another holder"
@@ -2200,7 +2062,7 @@ func (b *Bridge) institutionalRoute(ctx context.Context, jobID string, p *protoc
 		SafetyDomainID:          candidate.SafetyDomainID,
 		InstitutionalRequestID:  p.InstitutionalRequestID,
 		JobAttemptRevision:      candidate.JobAttemptRevision,
-		BrowserHolderGeneration: b.epoch,
+		BrowserHolderGeneration: b.arbitration.generation(),
 		ExpectedEffectOrdinal:   p.ExpectedEffectOrdinal,
 		LeaseUntil:              leaseUntil,
 		Authorization: job.EffectPermitEvent{Kind: "browser.institutional_effect_authorized", Detail: map[string]any{
@@ -2321,7 +2183,7 @@ func (b *Bridge) institutionalNavigatedForSession(ctx context.Context, jobID str
 		}
 		return b.frameInstitutionalNavigated(jobID, result)
 	}
-	currentHolderGeneration := b.epoch
+	currentHolderGeneration := b.arbitration.generation()
 	if !currentHolder {
 		// A negotiated non-holder may settle its exact historical navigation,
 		// but it can never pass the current-holder projection fence.
@@ -2399,7 +2261,7 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 				continue
 			}
 			if !liveMaterializationClaim(claim, b.now()) ||
-				claim.BrowserHolderGeneration != b.epoch || claim.MaterializationKind != "browser_tab" {
+				claim.BrowserHolderGeneration != b.arbitration.generation() || claim.MaterializationKind != "browser_tab" {
 				continue
 			}
 			candidate, err := b.jobs.GetBrowserCandidate(ctx, claim.CandidateID)
@@ -2521,7 +2383,7 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 		return frame()
 	}
 	phase = claim.Phase
-	if p.BrowserHolderGeneration != b.epoch {
+	if p.BrowserHolderGeneration != b.arbitration.generation() {
 		result.Outcome, result.Detail = "stale", "browser holder generation is not current"
 		return frame()
 	}
@@ -2704,7 +2566,7 @@ func (b *Bridge) institutionalAuthenticationClaimDisabled(msg *protocol.BrowserM
 		p := msg.Payload.(*protocol.ClaimObservationPayload)
 		frame, err := b.frame(protocol.MsgClaimObservationAck, msg.JobID, protocol.ClaimObservationAckPayload{
 			RequestID: p.RequestID, Outcome: "rejected", Detail: detail,
-			GateOccurrenceID: p.GateOccurrenceID, BrowserHolderGeneration: b.epoch,
+			GateOccurrenceID: p.GateOccurrenceID, BrowserHolderGeneration: b.arbitration.generation(),
 		})
 		if err != nil {
 			return nil, err
@@ -2810,12 +2672,12 @@ func (b *Bridge) authenticationClaim(ctx context.Context, jobID string, p *proto
 		return response("not_eligible", "institution profile authority was lost")
 	}
 	claimID := profile.AuthenticationClaimID
-	leaseID := evidenceObservationID("authentication_claim_lease", claimID, jobID, strconv.FormatInt(b.epoch, 10))
+	leaseID := evidenceObservationID("authentication_claim_lease", claimID, jobID, strconv.FormatInt(b.arbitration.generation(), 10))
 	lease, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 		AuthenticationClaimID: claimID, LeaseID: leaseID, OwnerID: jobID,
-		BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+		BrowserHolderGeneration: b.arbitration.generation(), LeaseUntil: b.now().Add(b.actionExpiry()),
 	})
-	generation := b.epoch
+	generation := b.arbitration.generation()
 	if reserveErr != nil {
 		if !errors.Is(reserveErr, job.ErrAuthenticationEntryLeaseBusy) {
 			return response("error", "authentication entry lease is unavailable")
@@ -2902,7 +2764,7 @@ func (b *Bridge) claimObservationAck(jobID string, p protocol.ClaimObservationAc
 // browser_holder_generation are populated on every path, including the
 // earliest possible returns, because the ack requires both unconditionally.
 func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol.ClaimObservationPayload) ([]json.RawMessage, error) {
-	generation := b.epoch
+	generation := b.arbitration.generation()
 	if p == nil {
 		return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
 			Outcome: "error", Detail: "claim observation is missing",
@@ -2931,7 +2793,7 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 		// reoffer path (reofferInstitutionalSiblings) — both already
 		// poll/reopen on exactly this signal. A dependent that already
 		// carries a durable browser_candidates row (Slice 4,
-		// dev/active/surface-lifecycle-plan.md) is picked up by
+		// dev/adr/0028-surface-lifecycle-ownership.md) is picked up by
 		// admitAutomaticMaterializationCandidates on the next poll purely
 		// from the now-entitled lease state — no legacy reoffer needed for
 		// it, and reofferInstitutionalSiblings is a harmless no-op for a
@@ -3028,7 +2890,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		session != nil &&
 		slices.Contains(session.Features, institutionalMaterializationFeature) &&
 		!slices.Contains(session.Features, effectPermitFeature)
-	if historicalEffectResult && (b.holder == nil || b.holder.ID != sessionID) &&
+	if historicalEffectResult && (b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID) &&
 		!slices.Contains(session.Features, effectPermitFeature) && !legacyInstitutionalNavigation {
 		// A non-holder may settle only the negotiated durable effect tuple;
 		// featureless peers cannot establish that historical authority.
@@ -3038,7 +2900,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		if session == nil {
 			return b.helloRequired()
 		}
-		if b.holder == nil || b.holder.ID != sessionID {
+		if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID {
 			return b.sessionBusy(msg.JobID)
 		}
 		if session.Outdated {
@@ -3049,7 +2911,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		if session == nil {
 			return b.helloRequired()
 		}
-		if b.holder == nil || b.holder.ID != sessionID {
+		if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID {
 			return b.sessionBusy(msg.JobID)
 		}
 		if session.Outdated {
@@ -3062,7 +2924,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		}
 		historicalResult := msg.Type == protocol.MsgInstitutionalNavigatedRequest
 		if !historicalResult {
-			if b.holder == nil || b.holder.ID != sessionID {
+			if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID {
 				return b.sessionBusy(msg.JobID)
 			}
 			if session.Outdated {
@@ -3086,7 +2948,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		case protocol.MsgInstitutionalRouteRequest:
 			return b.institutionalRoute(ctx, msg.JobID, msg.Payload.(*protocol.InstitutionalRouteRequestPayload))
 		case protocol.MsgInstitutionalNavigatedRequest:
-			return b.institutionalNavigatedForSession(ctx, msg.JobID, msg.Payload.(*protocol.InstitutionalNavigatedRequestPayload), b.holder != nil && b.holder.ID == sessionID)
+			return b.institutionalNavigatedForSession(ctx, msg.JobID, msg.Payload.(*protocol.InstitutionalNavigatedRequestPayload), b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID == sessionID)
 		case protocol.MsgInstitutionalReconcileRequest:
 			// Omitting this case did not make reconcile unsupported: the frame
 			// is protocol-defined, validated, gated as an institutional
@@ -3104,7 +2966,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		}
 		historicalResult := msg.Type == protocol.MsgClaimObservation
 		if !historicalResult {
-			if b.holder == nil || b.holder.ID != sessionID {
+			if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID {
 				return b.sessionBusy(msg.JobID)
 			}
 			if session.Outdated {
@@ -3134,7 +2996,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			return b.claimObservation(ctx, msg.JobID, msg.Payload.(*protocol.ClaimObservationPayload))
 		}
 	}
-	if b.holder == nil || b.holder.ID != sessionID {
+	if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID {
 		switch msg.Type {
 		case protocol.MsgPageAcquire, protocol.MsgTriageSnapshotRequest, protocol.MsgTriageCountsRequest,
 			protocol.MsgPageBulkStatusRequest, protocol.MsgPageBulkSubmitRequest, protocol.MsgPageBulkSubmitV2Request,
@@ -3207,7 +3069,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	case protocol.MsgProviderDriveEpochStartRequest:
 		return b.providerDriveEpochStart(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDriveEpochStartRequestPayload))
 	case protocol.MsgProviderDriveEpochResultRequest:
-		return b.providerDriveEpochResultForSession(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDriveEpochResultRequestPayload), b.holder != nil && b.holder.ID == sessionID)
+		return b.providerDriveEpochResultForSession(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDriveEpochResultRequestPayload), b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID == sessionID)
 	case protocol.MsgTermsEffectStartRequest:
 		return b.termsEffectStart(ctx, msg.JobID, msg.Payload.(*protocol.TermsEffectStartRequestPayload))
 	case protocol.MsgTermsEffectResultRequest:
@@ -3397,7 +3259,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		}
 		b.pruneDeliveryMetadata(b.now())
 		pendingDownload := pendingBrowserDownload{
-			Filename: p.Filename, Producer: producer, ReceivedAt: b.now(),
+			Filename: p.Filename, Adopting: true, Producer: producer, ReceivedAt: b.now(),
 		}
 		b.pendingDownloads[key] = pendingDownload
 		var context *app.BrowserDeliveryContext
@@ -3405,6 +3267,11 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			context = browserDeliveryContext(&pending.Payload)
 		}
 		candidateID, err := b.adoptOutsideSessionLock(ctx, msg.JobID, p.Filename, context, producer)
+		pendingDownload.Adopting = false
+		if current, ok := b.pendingDownloads[key]; ok {
+			current.Adopting = false
+			b.pendingDownloads[key] = current
+		}
 		switch {
 		case errors.Is(err, errArtifactSuperseded):
 			// Another materialization already won this attempt. Retrying would
@@ -3436,9 +3303,18 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			if err := b.recordAdoptionConclusiveLatch(ctx, msg.JobID); err != nil {
 				log.Printf("papio: recording adoption safety latch: %v", err)
 			}
-			if context != nil {
-				delete(b.deliveryContexts, key)
-				delete(b.pendingDownloads, key)
+			if pending, ok := b.deliveryContexts[key]; ok {
+				applied, applyErr := b.jobs.ApplyBrowserDeliveryContextToCandidate(
+					ctx, msg.JobID, candidateID,
+					pending.Payload.Route, pending.Payload.SessionEvidence, pageHostURL(pending.Payload.PageHost),
+				)
+				switch {
+				case applyErr != nil:
+					log.Printf("papio: applying browser delivery context after adoption: %v", applyErr)
+				case applied:
+					delete(b.deliveryContexts, key)
+					delete(b.pendingDownloads, key)
+				}
 			}
 		}
 		ack, err := b.frame(protocol.MsgAck, msg.JobID, protocol.EmptyPayload{})
@@ -3448,7 +3324,7 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return []json.RawMessage{ack}, nil
 
 	case protocol.MsgProviderDirectGetResult:
-		if err := b.providerDirectGetResultForSession(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDirectGetResultPayload), b.holder != nil && b.holder.ID == sessionID); err != nil {
+		if err := b.providerDirectGetResultForSession(ctx, msg.JobID, msg.Payload.(*protocol.ProviderDirectGetResultPayload), b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID == sessionID); err != nil {
 			log.Printf("papio: recording provider direct result: %v", err)
 		}
 		return nil, nil
@@ -3628,7 +3504,7 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 									DriveAttemptID: driveAttemptID, Ordinal: ordinal,
 									Strategy: strategy, Revision: revision,
 								},
-								JobAttemptRevision: attempt, BrowserHolderGeneration: b.epoch,
+								JobAttemptRevision: attempt, BrowserHolderGeneration: b.arbitration.generation(),
 								SafetyDomainID: domain, LeaseUntil: b.now().UTC().Add(b.actionExpiry()),
 								Authorization: job.EffectPermitEvent{Kind: "browser.provider_drive_epoch_started", Detail: map[string]any{
 									"drive_attempt_id": driveAttemptID, "ordinal": ordinal,
@@ -3637,7 +3513,7 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 							})
 							exactReplay := permit != nil && permit.Status == job.EffectPermitHeld &&
 								permit.JobAttemptRevision == attempt &&
-								permit.BrowserHolderGeneration == b.epoch &&
+								permit.BrowserHolderGeneration == b.arbitration.generation() &&
 								permit.SafetyDomainID == domain
 							switch {
 							case acquireErr != nil && errors.Is(acquireErr, job.ErrEffectPermitBusy):
@@ -3741,7 +3617,7 @@ func (b *Bridge) providerDriveEpochResultForSession(ctx context.Context, jobID s
 					if currentHolder {
 						currentAttempt, attemptErr = b.jobs.MaterializationAttemptRevision(ctx, jobID)
 					}
-					current := currentHolder && attemptErr == nil && permit.JobAttemptRevision == currentAttempt && permit.BrowserHolderGeneration == b.epoch
+					current := currentHolder && attemptErr == nil && permit.JobAttemptRevision == currentAttempt && permit.BrowserHolderGeneration == b.arbitration.generation()
 					if attemptErr != nil {
 						outcome, detail = "error", "provider drive attempt state is unavailable"
 					} else {
@@ -3757,7 +3633,7 @@ func (b *Bridge) providerDriveEpochResultForSession(ctx context.Context, jobID s
 								"strategy": strategy, "revision": revision, "safety_domain": permit.SafetyDomainID,
 							}})
 						}
-						settleGeneration := b.epoch
+						settleGeneration := b.arbitration.generation()
 						if !currentHolder {
 							settleGeneration = -1
 						}
@@ -3913,7 +3789,7 @@ func (b *Bridge) termsEffectStart(ctx context.Context, jobID string, p *protocol
 					}
 					permit, acquireOutcome, acquireErr := b.jobs.AcquireEffectPermit(ctx, job.EffectPermitAcquireInput{
 						Identity: identity, JobAttemptRevision: attempt,
-						BrowserHolderGeneration: b.epoch, SafetyDomainID: domain,
+						BrowserHolderGeneration: b.arbitration.generation(), SafetyDomainID: domain,
 						LeaseUntil: b.now().UTC().Add(b.actionExpiry()),
 						Authorization: job.EffectPermitEvent{Kind: "browser.terms_effect_authorized", Detail: map[string]any{
 							"terms_occurrence_id": occurrenceID,
@@ -3933,7 +3809,7 @@ func (b *Bridge) termsEffectStart(ctx context.Context, jobID string, p *protocol
 					case acquireOutcome == job.EffectPermitDuplicate &&
 						permit.Status == job.EffectPermitHeld &&
 						permit.JobAttemptRevision == attempt &&
-						permit.BrowserHolderGeneration == b.epoch &&
+						permit.BrowserHolderGeneration == b.arbitration.generation() &&
 						permit.SafetyDomainID == domain:
 						// The start response may have been lost before the
 						// extension persisted the tuple. Re-issue the same
@@ -4214,7 +4090,7 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 		candidate.payload.RequestID == payload.RequestID {
 		pending = candidate
 	}
-	epochAtStore := b.epoch
+	epochAtStore := b.arbitration.generation()
 
 	b.mu.Unlock()
 	path, storeErr := store.StoreSanitizedPinned(ctx, jobID, payload.Host, payload.Scenario, payload.AdapterID, payload.AdapterVersion, html)
@@ -4224,14 +4100,14 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 		return
 	}
 	// Revalidate the identity the write was started for. release() drops the
-	// pending capture and increments b.epoch when a holder departs, promote()
+	// pending capture and increments b.arbitration.generation() when a holder departs, promote()
 	// takes a fresh holder generation, and Capture's timeout arm deletes the
 	// pending entry — any of which can happen inside the window above. Entry
 	// identity keeps pending.path off a NEW request; the epoch additionally
 	// keeps this capture's receipt off a REPLACEMENT holder's job.
 	staleCorrelation := pending != nil &&
 		(b.pendingCaptures[sessionID] != pending || pending.payload.RequestID != payload.RequestID)
-	if b.epoch != epochAtStore || staleCorrelation {
+	if b.arbitration.generation() != epochAtStore || staleCorrelation {
 		log.Printf("papio: discarding page capture from %s: the request it answers is no longer current", payload.Host)
 		b.releaseStoredCaptureUnlocked(ctx, store, jobID)
 		return
@@ -4317,20 +4193,13 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 		Outdated:                    compareVersion(p.ExtensionVersion, MinExtensionVersion) < 0,
 		adapterUpgradeRepairPending: len(p.AdapterVersions) != 0,
 	}
-	holderAlive := b.holder != nil && now.Sub(b.holder.LastSyncAt) <= sessionStaleAfter
-	sameSession := b.holder != nil && b.holder.ID == sessionID
-	legacyInvolved := sessionID == legacySessionID || (b.holder != nil && b.holder.ID == legacySessionID)
-	if b.holder != nil && holderAlive && !sameSession && !legacyInvolved {
-		b.pending[sessionID] = session
-		b.deniedHellos++
+	decision := b.arbitration.hello(session, now, b.materializationGenerationUnavailable)
+	if decision.role == sessionRolePending {
+		holder := b.arbitration.holderSession()
 		log.Printf("papio: browser session %s (v%s) denied: session held by %s (v%s)",
-			shortSession(sessionID), session.ExtensionVersion, shortSession(b.holder.ID), b.holder.ExtensionVersion)
-		// Ack first, then refuse holdership. The denial is about who receives
-		// daemon-initiated offers and handoffs — it is not a rejection of the
-		// session. A pending browser still serves user-initiated,
-		// holder-independent requests (the dispatcher's non-holder whitelist),
-		// and without an ack it never learns which of them this daemon
-		// supports, so its own UI fails closed on every one of them.
+			shortSession(sessionID), session.ExtensionVersion, shortSession(holder.ID), holder.ExtensionVersion)
+		// Ack first, then refuse holdership. A pending browser still serves
+		// user-initiated, holder-independent requests.
 		ack, err := b.helloAck(sessionRolePending)
 		if err != nil {
 			return nil, err
@@ -4341,25 +4210,20 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 		}
 		return append([]json.RawMessage{ack}, busy...), nil
 	}
-	if b.holder != nil && !sameSession {
-		b.takeovers++
+
+	transition := decision.transition
+	if transition.previous != nil && transition.previous.ID != sessionID {
 		log.Printf("papio: browser session %s (v%s) took over from previous holder",
 			shortSession(sessionID), session.ExtensionVersion)
 	}
-	delete(b.pending, sessionID)
-	holderChanged := b.holder == nil || b.holder.ID != session.ID
-	if b.jobs != nil && (holderChanged || b.materializationGenerationUnavailable) {
-		generation, genErr := b.jobs.NextMaterializationHolderGeneration(context.Background())
-		if genErr != nil {
-			b.materializationAuthorityUncertain = true
-			b.materializationGenerationUnavailable = true
-			log.Printf("papio: materialization holder generation unavailable: %v", genErr)
-		} else {
-			b.epoch = generation
-			b.materializationGenerationUnavailable = false
-		}
+	if transition.generationErr != nil {
+		b.materializationAuthorityUncertain = true
+		b.materializationGenerationUnavailable = true
+		log.Printf("papio: materialization holder generation unavailable: %v", transition.generationErr)
+	} else if transition.generationAttempted {
+		b.materializationGenerationUnavailable = false
 	}
-	if holderChanged {
+	if transition.changed {
 		b.lastSessionEvidenceAt = map[string]time.Time{}
 		b.materializationScheduleCursor = job.CandidateScheduleCursor{}
 		b.scheduleCursorPending = job.CandidateScheduleCursor{}
@@ -4370,10 +4234,6 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 		b.materializationScheduleVersion++
 	}
 	b.materializationRecoveryPending = true
-	// A fresh hello is the reloaded extension arriving (or any browser
-	// claiming a vacant slot): the reservation has served its purpose.
-	b.clearDevReloadReservation()
-	b.holder = session
 	b.offered = map[string]bool{}
 	b.queuedOffers = map[string]bool{}
 	b.cancelSent = map[string]bool{}
@@ -4410,20 +4270,14 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 
 // sessionByID resolves holder or pending. The caller holds b.mu.
 func (b *Bridge) sessionByID(sessionID string) *browserSession {
-	if b.holder != nil && b.holder.ID == sessionID {
-		return b.holder
-	}
-	return b.pending[sessionID]
+	return b.arbitration.session(sessionID)
 }
 
 // sessionBusy tells a non-holder browser who owns the bridge and how to
 // switch. Delivered as an ordinary error frame so old extensions log it
 // instead of breaking.
 func (b *Bridge) sessionBusy(jobID string) ([]json.RawMessage, error) {
-	holderVersion := ""
-	if b.holder != nil {
-		holderVersion = b.holder.ExtensionVersion
-	}
+	holderVersion := b.arbitration.holderVersion()
 	frame, err := b.frame(protocol.MsgError, jobID, protocol.ErrorPayload{
 		Code:    "session_busy",
 		Message: "another browser holds the papio session (v" + holderVersion + "); run 'papio browser sessions' then 'papio browser use' to switch",
@@ -6134,7 +5988,7 @@ func (b *Bridge) recordPageBulkRun(ctx context.Context, source protocol.PageBulk
 // when it may. It is the whole admission test for the grab path.
 //
 // It deliberately does NOT compare sessionID against the holder, and the
-// conjunct that used to (`b.holder.ID != sessionID`) was wrong three times
+// conjunct that used to (`b.arbitration.holderSession().ID != sessionID`) was wrong three times
 // over:
 //
 //   - handle's non-holder whitelist already admits MsgPdfGrabRequest (the
@@ -6221,7 +6075,7 @@ func (b *Bridge) pdfGrab(ctx context.Context, sessionID string, request *protoco
 		preparedDir = dir
 		return nil
 	}
-	g, err := b.grabs.AllocateEffect(ctx, normalizedHost, title, b.epoch, safetyDomain, b.now().Add(b.actionExpiry()), prepare, request.RequestID)
+	g, err := b.grabs.AllocateEffect(ctx, normalizedHost, title, b.arbitration.generation(), safetyDomain, b.now().Add(b.actionExpiry()), prepare, request.RequestID)
 	if err != nil {
 		if preparedDir != "" {
 			_ = os.RemoveAll(preparedDir)
@@ -6328,7 +6182,7 @@ func (b *Bridge) pdfGrabAbandonSession(ctx context.Context, sessionID string, re
 		return []json.RawMessage{frame}, nil
 	}
 	return b.pdfGrabAbandonWith(ctx, request, request.RequestID, func() error {
-		err := b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, b.epoch, "The PDF grab download was interrupted")
+		err := b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, b.arbitration.generation(), "The PDF grab download was interrupted")
 		if err == nil {
 			return nil
 		}
@@ -6516,6 +6370,9 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 	if !ok {
 		return nil
 	}
+	if pending.Adopting {
+		return nil
+	}
 	provenance := browserDeliveryContext(payload)
 	if pending.CandidateID != 0 {
 		applied, err := b.jobs.ApplyBrowserDeliveryContextToCandidate(ctx, jobID, pending.CandidateID, payload.Route, payload.SessionEvidence, pageHostURL(payload.PageHost))
@@ -6532,7 +6389,14 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 		delete(b.pendingDownloads, key)
 		return nil
 	}
-	if _, err := b.adoptOutsideSessionLock(ctx, jobID, pending.Filename, provenance, pending.Producer); err != nil {
+	pending.Adopting = true
+	b.pendingDownloads[key] = pending
+	candidateID, err := b.adoptOutsideSessionLock(ctx, jobID, pending.Filename, provenance, pending.Producer)
+	if current, ok := b.pendingDownloads[key]; ok {
+		current.Adopting = false
+		b.pendingDownloads[key] = current
+	}
+	if err != nil {
 		_ = b.recordAdoptionDeferred(ctx, jobID, pending.Filename, err)
 		if errors.Is(err, job.ErrAdoptNotAwaiting) || errors.Is(err, job.ErrCandidateNotEligible) {
 			// Permanent, not environmental — see the same case in the
@@ -6540,6 +6404,21 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 			delete(b.deliveryContexts, key)
 			delete(b.pendingDownloads, key)
 		}
+		return nil
+	}
+	latest, ok := b.deliveryContexts[key]
+	if !ok {
+		delete(b.pendingDownloads, key)
+		return nil
+	}
+	applied, err := b.jobs.ApplyBrowserDeliveryContextToCandidate(
+		ctx, jobID, candidateID,
+		latest.Payload.Route, latest.Payload.SessionEvidence, pageHostURL(latest.Payload.PageHost),
+	)
+	if err != nil {
+		return err
+	}
+	if !applied {
 		return nil
 	}
 	delete(b.deliveryContexts, key)
@@ -6645,7 +6524,7 @@ func (b *Bridge) weighArtifact(ctx context.Context, jobID, filename string) (*ar
 	if err != nil {
 		return nil, err
 	}
-	claim, candidate, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.epoch)
+	claim, candidate, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.arbitration.generation())
 	if err != nil {
 		return nil, err
 	}
@@ -6785,7 +6664,7 @@ func (b *Bridge) commitArtifact(
 	if fence.candidate != nil {
 		_, won, settled, err := b.jobs.CommitArtifactWinnerAndProducer(ctx, job.ArtifactWinner{
 			JobID: jobID, JobAttemptRevision: fence.attempt, CandidateID: fence.candidate.ID,
-			BrowserHolderGeneration: b.epoch, SHA256: fence.digest,
+			BrowserHolderGeneration: b.arbitration.generation(), SHA256: fence.digest,
 		}, producer)
 		switch {
 		case errors.Is(err, job.ErrMaterializationStale):
@@ -6830,7 +6709,7 @@ func (b *Bridge) commitArtifact(
 		return nil
 	}
 	if err := b.jobs.SettleMaterialization(ctx, fence.claim.ID, fence.claim.BindingID,
-		int64(b.epoch), fence.candidate.InstitutionProfileRevision); err != nil &&
+		int64(b.arbitration.generation()), fence.candidate.InstitutionProfileRevision); err != nil &&
 		!errors.Is(err, job.ErrMaterializationStale) &&
 		!errors.Is(err, job.ErrMaterializationConflict) {
 		log.Printf("papio: settling materialization after adoption: %v", err)
@@ -7035,7 +6914,7 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	}
 	idParts := []string{
 		profile.ID, strconv.FormatInt(observedRevision, 10),
-		strconv.FormatInt(b.epoch, 10), string(verdict), string(source),
+		strconv.FormatInt(b.arbitration.generation(), 10), string(verdict), string(source),
 	}
 	if strings.TrimSpace(observationID) == "" {
 		idParts = append(idParts, producerObservedAt)
@@ -7045,7 +6924,7 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	sum := sha256.Sum256([]byte(strings.Join(idParts, "\x00")))
 	observationID = hex.EncodeToString(sum[:])
 	recordErr := b.jobs.RecordProfileEvidence(ctx, job.ProfileEvidenceObservation{
-		ObservationID: observationID, BrowserHolderGeneration: b.epoch,
+		ObservationID: observationID, BrowserHolderGeneration: b.arbitration.generation(),
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: observedRevision,
 		Verdict: verdict, Source: source, ProducerObservedAt: producerObservedAt,
 		DaemonReceivedAt: received.Format(time.RFC3339Nano),
@@ -7085,12 +6964,12 @@ func (b *Bridge) reserveAuthenticationEntry(ctx context.Context, resolverName, j
 		return err
 	}
 	leaseID := evidenceObservationID("authentication_entry", profile.AuthenticationClaimID,
-		jobID, strconv.FormatInt(b.epoch, 10))
+		jobID, strconv.FormatInt(b.arbitration.generation(), 10))
 	_, err = b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 		AuthenticationClaimID:   profile.AuthenticationClaimID,
 		LeaseID:                 leaseID,
 		OwnerID:                 jobID,
-		BrowserHolderGeneration: b.epoch,
+		BrowserHolderGeneration: b.arbitration.generation(),
 		LeaseUntil:              b.now().UTC().Add(profileEvidenceTTL),
 	})
 	if errors.Is(err, job.ErrAuthenticationEntryLeaseBusy) {
@@ -7143,8 +7022,8 @@ func (b *Bridge) profilesSharingOneClaim(ctx context.Context, names []string) ([
 //
 // An origin hint attributes to every profile that origin serves, but ONLY
 // while those profiles share one authentication claim - the daemon's identity
-// for one human sign-in entry (surface-lifecycle-plan.md's corrected
-// cardinality rule: "a claim may group profiles sharing one human entry",
+// for one human sign-in entry; see dev/adr/0028-surface-lifecycle-ownership.md "Decision 2":
+// corrected cardinality rule: "a claim may group profiles sharing one human entry",
 // and resolving one claim never asserts evidence for another). Two distinct
 // claims behind one origin are two human entries, so that frame stays
 // unattributable and fails closed exactly as before.
@@ -7378,11 +7257,11 @@ func (b *Bridge) renewMaterializationLease(ctx context.Context, jobID string) {
 	if err != nil {
 		return
 	}
-	claim, _, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, int64(b.epoch))
+	claim, _, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, int64(b.arbitration.generation()))
 	if err != nil || claim == nil {
 		return
 	}
-	renewErr := b.jobs.RenewMaterializationClaim(ctx, claim.ID, int64(b.epoch), b.now().Add(b.actionExpiry()))
+	renewErr := b.jobs.RenewMaterializationClaim(ctx, claim.ID, int64(b.arbitration.generation()), b.now().Add(b.actionExpiry()))
 	if renewErr != nil && !errors.Is(renewErr, job.ErrMaterializationStale) {
 		log.Printf("papio: renewing materialization lease for %s: %v", jobID, renewErr)
 	}
@@ -7441,9 +7320,9 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 		if profile, profileErr := b.jobs.InstitutionProfileByConfiguredName(ctx, resolverName); profileErr == nil && profile != nil && profile.AuthenticationClaimID != "" {
 			if lease, found, leaseErr := b.jobs.GetAuthenticationEntryLease(ctx, profile.AuthenticationClaimID); leaseErr == nil && found &&
 				lease.State == job.AuthenticationEntryLeaseReserved && lease.OwnerID == msg.JobID &&
-				lease.BrowserHolderGeneration == int64(b.epoch) {
-				if evidence, evidenceFound, evidenceErr := b.jobs.CurrentProfileEvidence(ctx, profile.ID, profile.Revision, int64(b.epoch)); evidenceErr == nil && evidenceFound {
-					if convertErr := b.jobs.ConvertAuthenticationEntryLeaseToHuman(ctx, profile.AuthenticationClaimID, lease.LeaseID, msg.JobID, int64(b.epoch), evidence); convertErr != nil &&
+				lease.BrowserHolderGeneration == int64(b.arbitration.generation()) {
+				if evidence, evidenceFound, evidenceErr := b.jobs.CurrentProfileEvidence(ctx, profile.ID, profile.Revision, int64(b.arbitration.generation())); evidenceErr == nil && evidenceFound {
+					if convertErr := b.jobs.ConvertAuthenticationEntryLeaseToHuman(ctx, profile.AuthenticationClaimID, lease.LeaseID, msg.JobID, int64(b.arbitration.generation()), evidence); convertErr != nil &&
 						!errors.Is(convertErr, job.ErrAuthenticationEntryLeaseDenied) && !errors.Is(convertErr, job.ErrAuthenticationEntryLeaseStale) {
 						return convertErr
 					}
@@ -7541,7 +7420,7 @@ func (b *Bridge) handoffQuiescedByEvidence(
 // reofferInstitutionalSiblings lets poll reopen only the handoffs that a
 // returned institutional session can actually unlock. The caller holds b.mu.
 func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID string) error {
-	if b.holder == nil || b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+	if b.arbitration.holderSession() == nil || b.now().Sub(b.arbitration.holderSession().LastSyncAt) > sessionStaleAfter {
 		return nil
 	}
 	if b.reofferSourceJobID == nil {
@@ -7668,8 +7547,8 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 	released := 0
 	for _, candidate := range candidates {
 		if released >= maxInstitutionalReoffers ||
-			b.holder == nil ||
-			b.now().Sub(b.holder.LastSyncAt) > sessionStaleAfter {
+			b.arbitration.holderSession() == nil ||
+			b.now().Sub(b.arbitration.holderSession().LastSyncAt) > sessionStaleAfter {
 			break
 		}
 		if !b.offered[candidate.row.ID] && available <= 0 {
@@ -7852,8 +7731,8 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		}
 	}()
 	sourceExtensionVersion := ""
-	if b.holder != nil {
-		sourceExtensionVersion = b.holder.ExtensionVersion
+	if b.arbitration.holderSession() != nil {
+		sourceExtensionVersion = b.arbitration.holderSession().ExtensionVersion
 	}
 	detail := map[string]any{
 		"outcome":           p.Outcome,
@@ -7983,7 +7862,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 			if attemptErr != nil {
 				log.Printf("papio: reading materialization attempt after %s for %s: %v", p.Outcome, jobID, attemptErr)
 			} else {
-				claim, _, claimErr := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.epoch)
+				claim, _, claimErr := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.arbitration.generation())
 				switch {
 				case claimErr != nil:
 					log.Printf("papio: reading materialization claim after %s for %s: %v", p.Outcome, jobID, claimErr)
@@ -10271,7 +10150,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	// adoptOutsideSessionLock releases b.mu; a concurrent claim/takeover in
 	// that window must abort this poll — its offers would go to a demoted
 	// session and its bookkeeping would pollute the new holder's maps.
-	epoch := b.epoch
+	epoch := b.arbitration.generation()
 	// commit reads err, so neither may be shadowed here.
 	for i := range awaiting {
 		row := awaiting[i]
@@ -10282,7 +10161,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		// ambiguity stays with the user, per the fail-closed rule.
 		if name, ok := b.scanAdoptionDir(ctx, row.ID); ok {
 			_, err := b.adoptOutsideSessionLock(ctx, row.ID, name, nil, nil)
-			if b.epoch != epoch {
+			if b.arbitration.generation() != epoch {
 				return out, nil
 			}
 			if err != nil {
@@ -10356,7 +10235,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	if slots < 0 {
 		slots = 0
 	}
-	// Slice 4 (dev/active/surface-lifecycle-plan.md): claim-paced automatic
+	// Slice 4 (dev/adr/0028-surface-lifecycle-ownership.md): claim-paced automatic
 	// candidate offers ride the same maxOutstandingOffers transport budget
 	// as legacy/direct-route offers, so their admission is computed and
 	// reserved before the legacy loop below spends the remainder. Their
@@ -10523,7 +10402,7 @@ jobLoop:
 						permit, permitOutcome, permitErr := b.jobs.AcquireEffectPermit(ctx, job.EffectPermitAcquireInput{
 							Identity:                identity,
 							JobAttemptRevision:      attemptRevision,
-							BrowserHolderGeneration: int64(b.epoch),
+							BrowserHolderGeneration: int64(b.arbitration.generation()),
 							SafetyDomainID:          candidateDomain,
 							LeaseUntil:              b.now().UTC().Add(b.actionExpiry()),
 							Authorization: job.EffectPermitEvent{Kind: "browser.direct_route", Detail: map[string]any{
@@ -10536,7 +10415,7 @@ jobLoop:
 						})
 						exactReplay := permit != nil && permit.Status == job.EffectPermitHeld &&
 							permit.JobAttemptRevision == attemptRevision &&
-							permit.BrowserHolderGeneration == int64(b.epoch) &&
+							permit.BrowserHolderGeneration == int64(b.arbitration.generation()) &&
 							permit.SafetyDomainID == candidateDomain
 						if permitErr != nil || (permitOutcome != job.EffectPermitAcquired &&
 							(permitOutcome != job.EffectPermitDuplicate || !exactReplay)) {
@@ -10684,7 +10563,7 @@ jobLoop:
 			log.Printf("papio: abandoning terminal materialization claims: %v", err)
 		}
 	}
-	if b.epoch != epoch {
+	if b.arbitration.generation() != epoch {
 		return out, nil
 	}
 	scheduledByJob := make(map[string]job.BrowserCandidateDescriptor, len(scheduled))
@@ -10706,7 +10585,7 @@ jobLoop:
 			}
 		}
 	}
-	if b.holder != nil && b.holder.ID != legacySessionID && compareVersion(b.holder.ExtensionVersion, HandoffFocusMinExtensionVersion) >= 0 {
+	if b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID != legacySessionID && compareVersion(b.arbitration.holderSession().ExtensionVersion, HandoffFocusMinExtensionVersion) >= 0 {
 		ids := make([]string, 0, len(b.focusPending))
 		ordered := make(map[string]bool, len(b.focusPending))
 		for _, descriptor := range scheduled {
@@ -10879,8 +10758,8 @@ jobLoop:
 			b.lastPacedHeld = held
 		}
 	}
-	if b.holder != nil {
-		if pending := b.pendingCaptures[b.holder.ID]; pending != nil && !pending.delivered {
+	if b.arbitration.holderSession() != nil {
+		if pending := b.pendingCaptures[b.arbitration.holderSession().ID]; pending != nil && !pending.delivered {
 			frame, err := b.frame(protocol.MsgPageCaptureRequest, "", pending.payload)
 			if err != nil {
 				return nil, err
@@ -10970,7 +10849,7 @@ jobLoop:
 // serviceMaterializationCandidate resolves, refreshes, or clears one
 // MsgInstitutionalCandidateOffer for id against the current scheduler
 // snapshot. It is shared by poll's explicit-focus loop and Slice 4's
-// automatic admission loop (dev/active/surface-lifecycle-plan.md Slice 4):
+// automatic admission loop (dev/adr/0028-surface-lifecycle-ownership.md Slice 4):
 // both loops fully own materialization for the ids they hand it, so a nil
 // frame with a nil error means id is still pending (or its tracking was
 // just cleared) and the caller must never fall back to a legacy URL offer
@@ -11171,7 +11050,7 @@ func (b *Bridge) serviceMaterializationCandidate(
 }
 
 // claimBoundAutomaticMaterializationEnabled is Slice 4's enablement gate
-// (dev/active/surface-lifecycle-plan.md Slice 4, "Rollout order"): a session
+// (dev/adr/0028-surface-lifecycle-ownership.md Slice 4, "Rollout order"): a session
 // that negotiated institutional_materialization_v1 (and effect_permit_v1,
 // via institutionalMaterializationAvailable) gets automatic (non-focus)
 // materialization candidate offers by default — no operator toggle. A
@@ -11310,10 +11189,10 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			if claimSlotUsed[claimID] || !canAdmit {
 				continue
 			}
-			leaseID := evidenceObservationID("authentication_claim_lease", claimID, descriptor.JobID, strconv.FormatInt(b.epoch, 10))
+			leaseID := evidenceObservationID("authentication_claim_lease", claimID, descriptor.JobID, strconv.FormatInt(b.arbitration.generation(), 10))
 			if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 				AuthenticationClaimID: claimID, LeaseID: leaseID, OwnerID: descriptor.JobID,
-				BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+				BrowserHolderGeneration: b.arbitration.generation(), LeaseUntil: b.now().Add(b.actionExpiry()),
 			}); reserveErr != nil {
 				continue
 			}
@@ -11335,10 +11214,10 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			if claimSlotUsed[claimID] || !canAdmit {
 				continue
 			}
-			leaseID := evidenceObservationID("authentication_claim_lease", claimID, descriptor.JobID, strconv.FormatInt(b.epoch, 10))
+			leaseID := evidenceObservationID("authentication_claim_lease", claimID, descriptor.JobID, strconv.FormatInt(b.arbitration.generation(), 10))
 			if _, reserveErr := b.jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
 				AuthenticationClaimID: claimID, LeaseID: leaseID, OwnerID: descriptor.JobID,
-				BrowserHolderGeneration: b.epoch, LeaseUntil: b.now().Add(b.actionExpiry()),
+				BrowserHolderGeneration: b.arbitration.generation(), LeaseUntil: b.now().Add(b.actionExpiry()),
 			}); reserveErr != nil {
 				continue
 			}
@@ -11525,22 +11404,22 @@ func (b *Bridge) leaseHolderCanConvert(ctx context.Context, ownerJobID string) b
 	return candidate != nil
 }
 func (b *Bridge) providerDirectGetAvailable() bool {
-	if b == nil || b.holder == nil || !slices.Contains(b.Features, providerDirectGetV1Feature) {
+	if b == nil || b.arbitration.holderSession() == nil || !slices.Contains(b.Features, providerDirectGetV1Feature) {
 		return false
 	}
-	return compareVersion(b.holder.ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
+	return compareVersion(b.arbitration.holderSession().ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
 }
 func (b *Bridge) effectPermitAvailable() bool {
-	if b == nil || b.holder == nil || !slices.Contains(b.Features, effectPermitFeature) {
+	if b == nil || b.arbitration.holderSession() == nil || !slices.Contains(b.Features, effectPermitFeature) {
 		return false
 	}
-	return slices.Contains(b.holder.Features, effectPermitFeature)
+	return slices.Contains(b.arbitration.holderSession().Features, effectPermitFeature)
 }
 func (b *Bridge) providerDriveEpochAvailable() bool {
-	if b == nil || b.holder == nil || !slices.Contains(b.Features, providerDriveEpochV1Feature) || !b.effectPermitAvailable() {
+	if b == nil || b.arbitration.holderSession() == nil || !slices.Contains(b.Features, providerDriveEpochV1Feature) || !b.effectPermitAvailable() {
 		return false
 	}
-	return compareVersion(b.holder.ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
+	return compareVersion(b.arbitration.holderSession().ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
 }
 
 // offerableAccessMode resolves the access mode to advertise for one handoff.
@@ -11775,9 +11654,9 @@ func validateDirectRouteEnvelope(candidate routes.Candidate) bool {
 func (b *Bridge) directRouteEligible(row job.Row, accessMode string) bool {
 	return accessMode == config.ModeDelegated &&
 		b.cfg.Browser.DirectRoutesEnabled &&
-		b.holder != nil &&
-		b.holder.ID != legacySessionID &&
-		compareVersion(b.holder.ExtensionVersion, DirectRouteMinExtensionVersion) >= 0
+		b.arbitration.holderSession() != nil &&
+		b.arbitration.holderSession().ID != legacySessionID &&
+		compareVersion(b.arbitration.holderSession().ExtensionVersion, DirectRouteMinExtensionVersion) >= 0
 }
 
 // browserOfferLatched projects durable job.latch events into the browser-only
@@ -11834,8 +11713,8 @@ func (b *Bridge) browserOfferLatched(
 				continue
 			}
 			liveVersion := ""
-			if b.holder != nil {
-				liveVersion = b.holder.AdapterVersions[adapterID]
+			if b.arbitration.holderSession() != nil {
+				liveVersion = b.arbitration.holderSession().AdapterVersions[adapterID]
 			}
 			if extensionVersionNewer(adapterVersion, liveVersion) {
 				continue
@@ -12178,7 +12057,7 @@ func (b *Bridge) providerDirectGetResultForSession(ctx context.Context, jobID st
 			if rowErr == nil {
 				attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 				if attemptErr == nil && currentHolder && permit.JobAttemptRevision == attempt &&
-					permit.BrowserHolderGeneration == int64(b.epoch) {
+					permit.BrowserHolderGeneration == int64(b.arbitration.generation()) {
 					ordinal, inFlight, _ := directRouteProgress(events, candidates, b.now())
 					current = inFlight && int64(ordinal) == p.Ordinal &&
 						candidate.RouteRevision == p.RouteRevision
@@ -12279,7 +12158,7 @@ func (b *Bridge) providerDirectGetResultForSession(ctx context.Context, jobID st
 		}
 		required = append(required, job.EffectPermitEvent{Kind: "browser.direct_route", Detail: cleanup})
 	}
-	settleGeneration := int64(b.epoch)
+	settleGeneration := int64(b.arbitration.generation())
 	if !currentHolder {
 		settleGeneration = -1
 	}

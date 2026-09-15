@@ -72,6 +72,12 @@ import {
   type ClaimObservationAckPayload,
 } from "./protocol";
 import {
+  NativeRequestCorrelation,
+  type CorrelatedRequestKind,
+  type CorrelatedRequestOptions,
+  type NativeRequestResult,
+} from "./correlation";
+import {
   isSurfaceBirthRecord,
   migrateTabLedger,
   originDigestOf,
@@ -140,7 +146,6 @@ import {
   carriesSignedCredential,
   sanitizePageHost,
   PDF_GRAB_FEATURE,
-  PDF_GRAB_SUGGEST_FEATURE,
 } from "./deliver";
 import {
   adapters,
@@ -327,7 +332,6 @@ const TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE = "triage_snapshot_schema_v4";
 const TRIAGE_SNAPSHOT_SCHEMA_5_FEATURE = "triage_snapshot_schema_v5";
 const TRIAGE_COUNTS_SCHEMA_2_FEATURE = "triage_counts_schema_v2";
 const TRIAGE_COUNTS_SCHEMA_3_FEATURE = "triage_counts_schema_v3";
-const TRIAGE_MUTATIONS_FEATURE = "triage_mutations_v1";
 const SURFACE_PRESENCE_FEATURE = "surface_presence_v1";
 const WORK_PULSE_FEATURE = "work_pulse_v1";
 const SESSION_EVIDENCE_FEATURE = "session_evidence_v1";
@@ -344,15 +348,11 @@ const HANDOFF_LINK_FEATURE = "handoff_link_v1";
  * behavior against an older daemon. */
 const AUTHENTICATION_CLAIM_FEATURE = INSTITUTIONAL_AUTHENTICATION_CLAIM_FEATURE;
 const PROVIDER_DRIVE_EPOCH_FEATURE = "provider_drive_epoch_v1";
-const REVIEW_PREVIEW_FEATURE = "review_preview_v1";
-const STATS_FEATURE = "browser_stats_v1";
 const ACTIVITY_FEED_FEATURE = "activity_feed_v1";
 const ACTIVITY_PAGE_FEATURE = "activity_page_v1";
 const PAGE_CAPTURE_FEATURE = "page_capture_v1";
 const PAGE_CAPTURE_REQUEST_FEATURE = "page_capture_request_v1";
 const PAGE_CAPTURE_TERMS_FEATURE = "page_capture_terms_v1";
-/** ADR-0019 Decision 7: page_bulk_status_request/page_bulk_submit_request. */
-const PAGE_BULK_ACQUIRE_FEATURE = "page_bulk_acquire_v1";
 const PAGE_BULK_COHORT_V2_FEATURE = "page_bulk_cohort_v2";
 const INSTITUTIONAL_MATERIALIZATION_FEATURE =
   "institutional_materialization_v1";
@@ -454,42 +454,6 @@ const PARKED_SURFACE_COLD_MS = 30 * 60_000;
  * stranded surface within one cold window instead of never, at one ledger walk
  * per five wakes. */
 const OWNED_TAB_RECONCILE_INTERVAL_MS = 5 * 60_000;
-/** Daemon replies that settle a correlated `requestNative` call. `requestNative`
- * rejects any type outside this set before registering a wait, so wrappers and
- * variables cannot create a request that only fails later by timing out. */
-const CORRELATED_RESULT_TYPES: ReadonlySet<BrowserMessageType> = new Set([
-  "triage_snapshot_response",
-  "triage_counts_response",
-  "triage_decide_result",
-  "human_action_resolve_result",
-  "review_preview_result",
-  "stats_response",
-  "activity_response",
-  "activity_page_response",
-  "pdf_grab_status_result",
-  "pdf_grab_abandon_result",
-  "delivery_reconcile_result",
-  "pdf_grab_result",
-  "surface_presence_ack",
-  "work_pulse_response",
-  "surface_close_response",
-  // Registered 2026-08-12: the page-bulk bridge (ADR-0019 phase B) landed after
-  // this guard and never added its own reply types, so every availability check
-  // and v1 submit threw before sending a frame. page_bulk_runs recorded six
-  // opens and zero submissions as a result.
-  "page_bulk_status_result",
-  "page_bulk_submit_result",
-  "page_bulk_submit_v2_result",
-  "handoff_link_result",
-  "provider_drive_epoch_start_result",
-  "provider_drive_epoch_result",
-  "terms_effect_start_result",
-  "terms_effect_result",
-  "pdf_grab_suggest_response",
-  "pdf_grab_confirm_response",
-  "authentication_claim_response",
-  "claim_observation_ack",
-]);
 // the pages under dist/ (see build.ts) and the manifest is the source of truth.
 const POPUP_PAGE_PATH = "dist/popup.html";
 /** Derived, never hardcoded: extension pages ship beside the declared popup
@@ -1299,8 +1263,8 @@ export interface PdfGrabCorrelation {
 }
 /** One durably-queued `claim_observation` frame (Slice 3), keyed by
  * `observation_id` in both the worker-memory map and the persisted outbox.
- * Mirrors `ClaimObservationPayload` minus `request_id` — `requestNative`
- * mints a fresh correlation id per send attempt, but `observation_id` is the
+ * Mirrors `ClaimObservationPayload` minus `request_id` — the correlation
+ * module mints a fresh id per send attempt, but `observation_id` is the
  * daemon's own idempotency key and must survive every retry unchanged.
  * `job_id` is carried separately from the wire payload (claim_observation is
  * JOB_SCOPED: the daemon protocol puts it on the message envelope, not
@@ -1424,7 +1388,8 @@ export interface BridgeDeps {
     /** chrome.webNavigation.onErrorOccurred — a top-frame navigation that
      * failed to commit (net error, aborted, blocked). No URL is read from
      * this event: it exists only to order navigation-error evidence before
-     * generic auth-wall detection (surface-lifecycle-plan.md Slice 1). */
+     * generic auth-wall detection (dev/adr/0028-surface-lifecycle-ownership.md
+     * Slice 1). */
     onErrorOccurred?: Listenable<
       [{ tabId: number; frameId: number; error?: string }]
     >;
@@ -1729,19 +1694,6 @@ interface PendingMaterializationRequest {
   resolve(message: BrowserMessage | undefined): void;
 }
 
-type NativeRequestKind = "response" | "transport" | "timeout";
-
-interface NativeRequestResult {
-  kind: NativeRequestKind;
-  payload?: Record<string, unknown>;
-  code?: string;
-  message?: string;
-}
-
-interface PendingNativeRequest {
-  expectedType: BrowserMessageType;
-  resolve(result: NativeRequestResult): void;
-}
 
 type ClassifyRetryKind = "unknown" | "effect" | "federated_evidence";
 interface ClassifyRetry {
@@ -2877,8 +2829,8 @@ export class Bridge {
    * intervening await, so a touch that happens (and even reverts) during a
    * close attempt is never invisible to a single before/after tabs.get. */
   private readonly tabTouchEpoch = new Map<number, number>();
-  /** papio-issued focus action tokens (surface-lifecycle-plan.md Slice 2,
-   * "Causal operator cession"): one pending token per tab that papio itself
+  /** papio-issued focus action tokens (dev/adr/0028-surface-lifecycle-ownership.md):
+   * Slice 2, "Causal operator cession": one pending token per tab that papio itself
    * is about to activate. The matching onActivated event consumes the token
    * and is therefore NOT operator takeover; an activation with no token is.
    *
@@ -3182,7 +3134,7 @@ export class Bridge {
    * no daemon-side cancellation, no `owner_closed`. Without it papio reads its
    * own tidy-up as the operator giving up and cancels the paper — measured
    * twice on a real library (see the open-defect table in
-   * dev/active/surface-lifecycle-plan.md), which is why reviewers asked for
+   * dev/adr/0028-surface-lifecycle-ownership.md), which is why reviewers asked for
    * this marker rather than a rewrite of onTabRemoved.
    *
    * Worker-memory is the RIGHT tier here, unlike the durable claim identity
@@ -3198,7 +3150,30 @@ export class Bridge {
     string,
     Promise<BrokerReply<{ opened: true }>>
   >();
+  private readonly correlation: NativeRequestCorrelation;
   constructor(private readonly deps: BridgeDeps) {
+    this.correlation = new NativeRequestCorrelation({
+      randomUUID: deps.randomUUID,
+      setTimeout: deps.setTimeout,
+      ensureConnected: () => this.ensureConnected(),
+      connectionFailure: () =>
+        this.helloDeniedGeneration === this.portGeneration
+          ? {
+              kind: "transport",
+              code: "session_busy",
+              message:
+                "Another browser holds the papio session; run 'papio browser use --latest' to move it here",
+            }
+          : {
+              kind: "transport",
+              code: "connection_timeout",
+              message: "Could not establish a current daemon session",
+            },
+      supportsFeature: (feature) =>
+        (this.store.daemonFeatures ?? []).includes(feature),
+      send: (type, payload, jobID) => this.send(type, payload, jobID),
+      reconnect: () => this.reconnectForHello(),
+    });
     this.workerEpoch = deps.randomUUID().replace(/-/g, "");
     this.pageBulkRecovery =
       deps.pageBulkRecovery ?? new PageBulkCohortRecovery();
@@ -3235,12 +3210,6 @@ export class Bridge {
    * map only remembers the last rung while the worker remains alive; it never
    * decides whether a retry is allowed. */
   private readonly institutionalRetryAttempts = new Map<string, number>();
-  /** One resolver per correlated native triage request. It is intentionally
-   * worker-memory only; daemon state remains the authority after a restart. */
-  private readonly pendingNativeRequests = new Map<
-    string,
-    PendingNativeRequest
-  >();
   /** One detached response-loss retry timer per materialization job. */
   private readonly materializationRetryTimers = new Map<string, object>();
   /** One offline-revival timer per materialization job, deliberately SEPARATE
@@ -3289,7 +3258,6 @@ export class Bridge {
   private helloDeniedGeneration = -1;
   private helloRequestID: string | undefined;
   private readonly helloWaiters = new Set<(acknowledged: boolean) => void>();
-  private requestIDSequence = 0;
   /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
   /** Durable institutional demand from the most recent negotiated counts poll. */
   private triageActionsRequiresAuth: number | undefined;
@@ -5479,23 +5447,17 @@ export class Bridge {
     if (generation === undefined) return { authorized: false };
     if (disposition === "surface_superseded" && surfaceTabID === undefined)
       return { authorized: false };
-    const result = await this.requestNative(
-      "surface_close_request",
-      {
-        binding_id: bindingID,
-        browser_holder_generation: generation,
-        disposition,
-        ...(disposition === "claim_abandoned" && gateOccurrenceID !== undefined
-          ? { gate_occurrence_id: gateOccurrenceID }
-          : {}),
-        ...(disposition === "surface_superseded" && surfaceTabID !== undefined
-          ? { surface_tab_id: surfaceTabID }
-          : {}),
-      },
-      "surface_close_response",
-      SURFACE_CLOSE_FEATURE,
-      true,
-    );
+    const result = await this.requestCorrelated("surface_close_request", {
+      binding_id: bindingID,
+      browser_holder_generation: generation,
+      disposition,
+      ...(disposition === "claim_abandoned" && gateOccurrenceID !== undefined
+        ? { gate_occurrence_id: gateOccurrenceID }
+        : {}),
+      ...(disposition === "surface_superseded" && surfaceTabID !== undefined
+        ? { surface_tab_id: surfaceTabID }
+        : {}),
+    });
     if (result.kind !== "response" || result.payload === undefined)
       return { authorized: false };
     // The daemon distinguishing "I have no stake in this surface" from "I am
@@ -7642,7 +7604,7 @@ export class Bridge {
       // A failed top-frame navigation is a dead end, not a human sign-in
       // wall; the marker it leaves is read (and consumed) by the generic
       // auth-wall detector in onTabUpdated before that detector charges an
-      // auth attempt (surface-lifecycle-plan.md Slice 1).
+      // auth attempt (dev/adr/0028-surface-lifecycle-ownership.md Slice 1).
       n.onErrorOccurred?.addListener((d) => {
         void this.onNavigationError(d);
       });
@@ -8843,147 +8805,21 @@ export class Bridge {
     return this.waitForCurrentHello();
   }
 
-  private nextRequestID(): string {
-    // UUID text is already a valid msg-id once hyphens are removed. A local
-    // sequence makes a deterministic test seam and a late echo unable to
-    // collide with a later request in this worker lifetime.
-    const random = this.deps.randomUUID().replace(/-/g, "");
-    const suffix = `_${this.requestIDSequence++}`;
-    return random.length + suffix.length <= 64 ? `${random}${suffix}` : random;
+  requestCorrelated(
+    kind: CorrelatedRequestKind,
+    payload: Record<string, unknown>,
+    options?: CorrelatedRequestOptions,
+  ): Promise<NativeRequestResult> {
+    return this.correlation.request(kind, payload, options);
   }
 
-  private failPendingNativeRequests(code: string, message: string): void {
-    for (const pending of this.pendingNativeRequests.values()) {
-      pending.resolve({ kind: "transport", code, message });
-    }
-    this.pendingNativeRequests.clear();
-  }
 
-  private sendCorrelated(
-    type: BrowserMessageType,
-    payload: Record<string, unknown>,
-    expectedType: BrowserMessageType,
-    jobID?: string,
-    suppliedRequestID?: string,
-  ): Promise<NativeRequestResult> {
-    const requestID = suppliedRequestID ?? this.nextRequestID();
-    if (
-      typeof requestID !== "string" ||
-      requestID.length === 0 ||
-      requestID.length > 64 ||
-      /[\u0000-\u001f\u007f]/u.test(requestID)
-    ) {
-      return Promise.resolve({
-        kind: "transport",
-        code: "invalid_request_id",
-        message: "The supplied request id is invalid",
-      });
-    }
-    if (
-      typeof payload["request_id"] === "string" &&
-      payload["request_id"] !== requestID
-    ) {
-      return Promise.resolve({
-        kind: "transport",
-        code: "request_id_mismatch",
-        message: "The supplied request id does not match the payload",
-      });
-    }
-    if (this.pendingNativeRequests.has(requestID)) {
-      return Promise.resolve({
-        kind: "transport",
-        code: "duplicate_request_id",
-        message: "A request with this id is already pending",
-      });
-    }
-    return new Promise<NativeRequestResult>((resolve) => {
-      const pending: PendingNativeRequest = { expectedType, resolve };
-      this.pendingNativeRequests.set(requestID, pending);
-      this.deps.setTimeout(() => {
-        if (this.pendingNativeRequests.get(requestID) !== pending) return;
-        this.pendingNativeRequests.delete(requestID);
-        resolve({ kind: "timeout" });
-      }, TRIAGE_REQUEST_TIMEOUT_MS);
-      if (!this.send(type, { ...payload, request_id: requestID }, jobID)) {
-        this.pendingNativeRequests.delete(requestID);
-        resolve({
-          kind: "transport",
-          code: "connection_lost",
-          message: "The daemon connection was lost before the request was sent",
-        });
-        this.reconnectForHello();
-      }
-    });
-  }
-  private async requestNative(
-    type: BrowserMessageType,
-    payload: Record<string, unknown>,
-    expectedType: BrowserMessageType,
-    feature: string,
-    mutation: boolean,
-    jobID?: string,
-    suppliedRequestID?: string,
-    retryTransport = !mutation,
-  ): Promise<NativeRequestResult> {
-    if (!CORRELATED_RESULT_TYPES.has(expectedType)) {
-      throw new Error(
-        `papio: correlated request expects unrouted reply type ${expectedType}`,
-      );
-    }
-    const attempts = retryTransport ? (mutation ? 1 : 2) : 1;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      if (!(await this.ensureConnected())) {
-        // Two different failures reached the researcher as one sentence about
-        // an unavailable daemon. A refused session has a remedy the generic
-        // copy hides, and the inbox prints this text verbatim.
-        return this.helloDeniedGeneration === this.portGeneration
-          ? {
-              kind: "transport",
-              code: "session_busy",
-              message:
-                "Another browser holds the papio session; run 'papio browser use --latest' to move it here",
-            }
-          : {
-              kind: "transport",
-              code: "connection_timeout",
-              message: "Could not establish a current daemon session",
-            };
-      }
-      if (!(this.store.daemonFeatures ?? []).includes(feature)) {
-        return {
-          kind: "response",
-          code: "feature_unavailable",
-          message: "This daemon does not support the requested inbox feature",
-        };
-      }
-      const result = await this.sendCorrelated(
-        type,
-        payload,
-        expectedType,
-        jobID,
-        suppliedRequestID,
-      );
-      if (
-        result.kind !== "transport" ||
-        !retryTransport ||
-        attempt + 1 === attempts
-      )
-        return result;
-      // Reads are safe to retry once after a confirmed transport failure;
-      // mutations deliberately return their ambiguous status to the page.
-    }
-    return {
-      kind: "transport",
-      code: "connection_lost",
-      message: "The daemon is unavailable",
-    };
-  }
 
   private supportsFreshHandoffLinks(): boolean {
     return (this.store.daemonFeatures ?? []).includes(HANDOFF_LINK_FEATURE);
   }
 
-  /** Slice 0 containment gate (dev/active/surface-lifecycle-plan.md): an
+  /** Slice 0 containment gate (dev/adr/0028-surface-lifecycle-ownership.md): an
    * autonomous `requires_auth` surface needs a live daemon session that is
    * the holder AND advertises the authentication-claim feature (ADR-0022
    * Phase 4) AND a live network. hasCurrentHello() ties the negotiated
@@ -9044,14 +8880,7 @@ export class Bridge {
     // explicit non-native message), so awaiting it here cannot deadlock
     // the FIFO it itself depends on.
     await this.outboxReplayed;
-    const result = await this.requestNative(
-      "authentication_claim_request",
-      { candidate_id: candidateID, materialization_kind: "browser_tab", trigger },
-      "authentication_claim_response",
-      AUTHENTICATION_CLAIM_FEATURE,
-      true,
-      jobID,
-    );
+    const result = await this.requestCorrelated("authentication_claim_request", { candidate_id: candidateID, materialization_kind: "browser_tab", trigger }, { jobID: jobID });
     if (result.kind !== "response" || result.payload === undefined)
       return { kind: "refuse" };
     const p = result.payload as Partial<AuthenticationClaimResponsePayload>;
@@ -9493,8 +9322,8 @@ export class Bridge {
       )
       .slice(0, 32);
     if (entries.length === 0) return;
-    // Negotiate BEFORE reading a generation off any entry. `requestNative`
-    // establishes the port and waits for `hello_ack` itself, so reading
+    // Negotiate BEFORE reading a generation off any entry. A correlated
+    // request establishes the port and waits for `hello_ack` itself, so reading
     // `lastKnownBrowserHolderGeneration` above that call captured whatever a
     // fresh worker happened to have — a rehydrated stale value, or nothing at
     // all, falling back to the entry's own historical generation. The daemon
@@ -9525,14 +9354,7 @@ export class Bridge {
       // daemon fences a stale value as harmlessly as it always has.
       const generation =
         this.lastKnownBrowserHolderGeneration ?? payload.browser_holder_generation;
-      const result = await this.requestNative(
-        "claim_observation",
-        { ...payload, browser_holder_generation: generation },
-        "claim_observation_ack",
-        AUTHENTICATION_CLAIM_FEATURE,
-        true,
-        jobID,
-      );
+      const result = await this.requestCorrelated("claim_observation", { ...payload, browser_holder_generation: generation }, { jobID: jobID });
       if (result.kind !== "response" || result.payload === undefined) continue;
       const ack = result.payload as Partial<ClaimObservationAckPayload>;
       if (typeof ack.browser_holder_generation === "number")
@@ -11048,13 +10870,7 @@ export class Bridge {
   private async requestFreshHandoffLink(
     jobID: string,
   ): Promise<{ ok: true; url: string } | BrokerFailure> {
-    const result = await this.requestNative(
-      "handoff_link_request",
-      { job_id: jobID },
-      "handoff_link_result",
-      HANDOFF_LINK_FEATURE,
-      true,
-    );
+    const result = await this.requestCorrelated("handoff_link_request", { job_id: jobID });
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     const outcome = result.payload["outcome"];
@@ -11383,13 +11199,7 @@ export class Bridge {
             : features.includes(TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE)
               ? [2]
               : request.schema_versions;
-    const result = await this.requestNative(
-      "triage_snapshot_request",
-      { ...request, schema_versions: schemaVersions },
-      "triage_snapshot_response",
-      TRIAGE_SNAPSHOT_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("triage_snapshot_request", { ...request, schema_versions: schemaVersions });
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -11447,13 +11257,7 @@ export class Bridge {
       : features.includes(TRIAGE_COUNTS_SCHEMA_2_FEATURE)
         ? { schema_versions: [2] }
         : {};
-    const result = await this.requestNative(
-      "triage_counts_request",
-      payload,
-      "triage_counts_response",
-      TRIAGE_SNAPSHOT_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("triage_counts_request", payload);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -11488,13 +11292,7 @@ export class Bridge {
   async requestStats(): Promise<
     BrokerReply<{ stats: Record<string, unknown> }>
   > {
-    const result = await this.requestNative(
-      "stats_request",
-      {},
-      "stats_response",
-      STATS_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("stats_request", {});
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -11516,13 +11314,7 @@ export class Bridge {
     if (!(this.store.daemonFeatures ?? []).includes(WORK_PULSE_FEATURE)) {
       return { ok: true, available: false, worker_epoch: this.workerEpoch };
     }
-    const result = await this.requestNative(
-      "work_pulse_request",
-      { schema_versions: [1] },
-      "work_pulse_response",
-      WORK_PULSE_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("work_pulse_request", { schema_versions: [1] });
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code === "feature_unavailable")
@@ -11581,16 +11373,7 @@ export class Bridge {
     if (!(this.store.daemonFeatures ?? []).includes(SURFACE_PRESENCE_FEATURE)) {
       return { ok: true, accepted: false };
     }
-    const result = await this.requestNative(
-      "surface_presence",
-      payload,
-      "surface_presence_ack",
-      SURFACE_PRESENCE_FEATURE,
-      false,
-      undefined,
-      undefined,
-      false,
-    );
+    const result = await this.requestCorrelated("surface_presence", payload);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -11609,13 +11392,7 @@ export class Bridge {
   ): Promise<BrokerReply<ActivityPageBrokerPayload>> {
     const features = this.store.daemonFeatures ?? [];
     if (features.includes(ACTIVITY_PAGE_FEATURE)) {
-      const result = await this.requestNative(
-        "activity_page_request",
-        request,
-        "activity_page_response",
-        ACTIVITY_PAGE_FEATURE,
-        false,
-      );
+      const result = await this.requestCorrelated("activity_page_request", request);
       if (result.kind !== "response") return this.nativeFailure(result);
       if (result.code === "feature_unavailable")
         return { ok: true, feature: false, entries: [] };
@@ -11635,13 +11412,7 @@ export class Bridge {
     }
     if (!features.includes(ACTIVITY_FEED_FEATURE))
       return { ok: true, feature: false, entries: [] };
-    const result = await this.requestNative(
-      "activity_request",
-      request.limit === undefined ? {} : { limit: request.limit },
-      "activity_response",
-      ACTIVITY_FEED_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("activity_request", request.limit === undefined ? {} : { limit: request.limit });
     if (result.kind !== "response") return this.nativeFailure(result);
     if (result.code === "feature_unavailable")
       return { ok: true, feature: false, entries: [] };
@@ -12181,22 +11952,14 @@ export class Bridge {
     // id has to be minted here and retained, or no abandon this extension sends
     // can ever match — every interruption report was answered `conflict` and
     // the grab stayed occupying.
-    const effectRequestID = this.deps.randomUUID().replace(/-/g, "");
+    const effectRequestID = this.correlation.createRequestID();
     try {
-      const result = await this.requestNative(
-        "pdf_grab_request",
-        {
-          host,
-          // Same rule as page_acquire: a URL-derived tab title must not smuggle
-          // the address past a frame that was reduced to host and title.
-          ...(request.title !== undefined && !isURLLike(request.title) ? { title: request.title } : {}),
-        },
-        "pdf_grab_result",
-        PDF_GRAB_FEATURE,
-        true,
-        undefined,
-        effectRequestID,
-      );
+      const result = await this.requestCorrelated("pdf_grab_request", {
+        host,
+        // Same rule as page_acquire: a URL-derived tab title must not smuggle
+        // the address past a frame that was reduced to host and title.
+        ...(request.title !== undefined && !isURLLike(request.title) ? { title: request.title } : {}),
+      }, { requestID: effectRequestID });
       if (result.kind !== "response" || result.payload === undefined)
         return this.nativeFailure(result);
       if (result.code !== undefined)
@@ -12427,13 +12190,7 @@ export class Bridge {
       job_id?: string;
     }>
   > {
-    const result = await this.requestNative(
-      "pdf_grab_status_request",
-      { grab_id: grabID },
-      "pdf_grab_status_result",
-      PDF_GRAB_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("pdf_grab_status_request", { grab_id: grabID });
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -12475,18 +12232,15 @@ export class Bridge {
       detail?: string;
     }>
   > {
-    const request = this.requestNative(
+    const request = this.requestCorrelated(
       "pdf_grab_abandon_request",
       { grab_id: grabID },
-      "pdf_grab_abandon_result",
-      PDF_GRAB_FEATURE,
-      true,
-      undefined,
-      // The daemon fences cancellation on the grab's originating request id, so
-      // reusing it here is what makes this call effective rather than a
-      // `conflict` the caller then has to interpret. Absent for a grab this
-      // worker generation did not arm; the daemon answers on its own evidence.
-      effectRequestID,
+      {
+        // The daemon fences cancellation on the grab's originating request id.
+        // Reusing it makes this call effective instead of returning `conflict`.
+        // It is absent for a grab this worker generation did not arm.
+        requestID: effectRequestID,
+      },
     );
     const result = await Promise.race([
       request,
@@ -12533,13 +12287,7 @@ export class Bridge {
   }): Promise<
     BrokerReply<{ items: PageBulkStatusItem[]; truncated: boolean }>
   > {
-    const result = await this.requestNative(
-      "page_bulk_status_request",
-      request,
-      "page_bulk_status_result",
-      PAGE_BULK_ACQUIRE_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("page_bulk_status_request", request);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -12580,13 +12328,7 @@ export class Bridge {
       (this.store.daemonFeatures ?? []).includes(PAGE_BULK_COHORT_V2_FEATURE);
     if (!v2Available) {
       const keys = request.canonical_keys.slice(0, 50);
-      const result = await this.requestNative(
-        "page_bulk_submit_request",
-        { ...request, canonical_keys: keys },
-        "page_bulk_submit_result",
-        PAGE_BULK_ACQUIRE_FEATURE,
-        true,
-      );
+      const result = await this.requestCorrelated("page_bulk_submit_request", { ...request, canonical_keys: keys });
       if (result.kind !== "response" || result.payload === undefined)
         return this.nativeFailure(result);
       if (result.code !== undefined)
@@ -12628,13 +12370,13 @@ export class Bridge {
       origin: request.source.origin,
       detector: request.source.detector,
     };
-    const cohortID = this.nextRequestID();
+    const cohortID = this.correlation.createRequestID();
     const total = request.canonical_keys.length;
     const totalChunks = Math.ceil(total / 50);
     const firstIndex = 0;
     const firstKeys = request.canonical_keys.slice(0, 50);
     const firstFinal = totalChunks === 1;
-    const firstRequestID = this.nextRequestID();
+    const firstRequestID = this.correlation.createRequestID();
     const firstDigest = await pageBulkPayloadDigest({
       scan_id: request.scan_id,
       cohort_id: cohortID,
@@ -12690,7 +12432,7 @@ export class Bridge {
         );
       }
       if (unresolved === undefined || unresolved.chunk_index !== index) {
-        const requestID = this.nextRequestID();
+        const requestID = this.correlation.createRequestID();
         const digest = await pageBulkPayloadDigest({
           scan_id: cohort.scan_id,
           cohort_id: cohort.cohort_id,
@@ -12718,23 +12460,15 @@ export class Bridge {
           );
         }
       }
-      const result = await this.requestNative(
-        "page_bulk_submit_v2_request",
-        {
-          scan_id: cohort.scan_id,
-          cohort_id: cohort.cohort_id,
-          source: cohort.source,
-          cohort_total: cohort.cohort_total,
-          chunk_index: index,
-          final_chunk: finalChunk,
-          canonical_keys: keys,
-        },
-        "page_bulk_submit_v2_result",
-        PAGE_BULK_COHORT_V2_FEATURE,
-        true,
-        undefined,
-        unresolved.request_id,
-      );
+      const result = await this.requestCorrelated("page_bulk_submit_v2_request", {
+        scan_id: cohort.scan_id,
+        cohort_id: cohort.cohort_id,
+        source: cohort.source,
+        cohort_total: cohort.cohort_total,
+        chunk_index: index,
+        final_chunk: finalChunk,
+        canonical_keys: keys,
+      }, { requestID: unresolved.request_id });
       if (result.kind !== "response" || result.payload === undefined)
         return this.nativeFailure(result);
       if (result.code !== undefined)
@@ -12823,23 +12557,15 @@ export class Bridge {
       const index = cohort.unresolved.chunk_index;
       const keys = chunkKeysFor(cohort, index);
       const finalChunk = index === Math.ceil(cohort.cohort_total / 50) - 1;
-      const result = await this.requestNative(
-        "page_bulk_submit_v2_request",
-        {
-          scan_id: cohort.scan_id,
-          cohort_id: cohort.cohort_id,
-          source: cohort.source,
-          cohort_total: cohort.cohort_total,
-          chunk_index: index,
-          final_chunk: finalChunk,
-          canonical_keys: keys,
-        },
-        "page_bulk_submit_v2_result",
-        PAGE_BULK_COHORT_V2_FEATURE,
-        true,
-        undefined,
-        cohort.unresolved.request_id,
-      );
+      const result = await this.requestCorrelated("page_bulk_submit_v2_request", {
+        scan_id: cohort.scan_id,
+        cohort_id: cohort.cohort_id,
+        source: cohort.source,
+        cohort_total: cohort.cohort_total,
+        chunk_index: index,
+        final_chunk: finalChunk,
+        canonical_keys: keys,
+      }, { requestID: cohort.unresolved.request_id });
       if (
         result.kind !== "response" ||
         result.payload === undefined ||
@@ -12895,13 +12621,7 @@ export class Bridge {
     op: "acquire" | "dismiss";
     watch_scope?: "all" | number[];
   }): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
-    const result = await this.requestNative(
-      "triage_decide",
-      request,
-      "triage_decide_result",
-      TRIAGE_MUTATIONS_FEATURE,
-      true,
-    );
+    const result = await this.requestCorrelated("triage_decide", request);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -12924,13 +12644,7 @@ export class Bridge {
     expected_revision: number;
     expected_sha256?: string;
   }): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
-    const result = await this.requestNative(
-      "human_action_resolve",
-      request,
-      "human_action_resolve_result",
-      TRIAGE_MUTATIONS_FEATURE,
-      true,
-    );
+    const result = await this.requestCorrelated("human_action_resolve", request);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -12958,13 +12672,7 @@ export class Bridge {
     operation: "confirm_request_exists" | "confirm_request_absent";
     provider_reference?: string;
   }): Promise<BrokerReply<{ outcome: string; detail?: string }>> {
-    const result = await this.requestNative(
-      "delivery_reconcile_request",
-      request,
-      "delivery_reconcile_result",
-      TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE,
-      true,
-    );
+    const result = await this.requestCorrelated("delivery_reconcile_request", request);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -12988,13 +12696,7 @@ export class Bridge {
       preview?: Record<string, unknown>;
     }>
   > {
-    const result = await this.requestNative(
-      "review_preview_request",
-      request,
-      "review_preview_result",
-      REVIEW_PREVIEW_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("review_preview_request", request);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -13027,8 +12729,8 @@ export class Bridge {
   // would name a job the pool has since filed or abandoned), and confirm
   // binds through the same fenced operator_confirm path autonomous binding
   // uses. Both are gated on PDF_GRAB_SUGGEST_FEATURE so an older daemon that
-  // never advertised the picker is never sent either frame: requestNative's
-  // own feature check answers `feature_unavailable` before anything is sent,
+  // never advertised the picker is never sent either frame: the correlation
+  // policy's feature check answers `feature_unavailable` before any send,
   // and the inbox's own daemonFeatures gate (read from the persisted store)
   // keeps the button from offering the picker at all in that case — this is
   // the second, server-side backstop.
@@ -13050,13 +12752,7 @@ export class Bridge {
       truncated: boolean;
     }>
   > {
-    const result = await this.requestNative(
-      "pdf_grab_suggest_request",
-      request,
-      "pdf_grab_suggest_response",
-      PDF_GRAB_SUGGEST_FEATURE,
-      false,
-    );
+    const result = await this.requestCorrelated("pdf_grab_suggest_request", request);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -13093,13 +12789,7 @@ export class Bridge {
   async requestGrabConfirm(request: { grab_id: string; job_id: string }): Promise<
     BrokerReply<{ grab_id: string; job_id?: string; outcome: string; detail?: string }>
   > {
-    const result = await this.requestNative(
-      "pdf_grab_confirm_request",
-      request,
-      "pdf_grab_confirm_response",
-      PDF_GRAB_SUGGEST_FEATURE,
-      true,
-    );
+    const result = await this.requestCorrelated("pdf_grab_confirm_request", request);
     if (result.kind !== "response" || result.payload === undefined)
       return this.nativeFailure(result);
     if (result.code !== undefined)
@@ -13188,18 +12878,11 @@ export class Bridge {
     correlation: TermsEffectCorrelation,
   ): Promise<boolean> {
     if (correlation.result_outcome === undefined) return false;
-    const result = await this.requestNative(
-      "terms_effect_result_request",
-      {
-        permit_id: correlation.permit_id,
-        terms_occurrence_id: correlation.terms_occurrence_id,
-        outcome: correlation.result_outcome,
-      },
-      "terms_effect_result",
-      EFFECT_PERMIT_FEATURE,
-      true,
-      correlation.job_id,
-    );
+    const result = await this.requestCorrelated("terms_effect_result_request", {
+      permit_id: correlation.permit_id,
+      terms_occurrence_id: correlation.terms_occurrence_id,
+      outcome: correlation.result_outcome,
+    }, { jobID: correlation.job_id });
     const outcome = result.payload?.["outcome"];
     if (
       result.kind !== "response" ||
@@ -13296,18 +12979,11 @@ export class Bridge {
     if (!this.hasDelegatedAuthority(latest)) return "not_dispatched";
     const authorityDigest = await termsAuthorityDigest(spec);
     if (authorityDigest === undefined) return "not_dispatched";
-    const start = await this.requestNative(
-      "terms_effect_start_request",
-      {
-        adapter_id: spec.id,
-        adapter_version: spec.version,
-        authority_digest: authorityDigest,
-      },
-      "terms_effect_start_result",
-      EFFECT_PERMIT_FEATURE,
-      true,
-      jobID,
-    );
+    const start = await this.requestCorrelated("terms_effect_start_request", {
+      adapter_id: spec.id,
+      adapter_version: spec.version,
+      authority_digest: authorityDigest,
+    }, { jobID: jobID });
     if (start.kind !== "response")
       return start.code === "feature_unavailable"
         ? "not_dispatched"
@@ -13984,7 +13660,7 @@ export class Bridge {
       "The daemon disconnected before acknowledging this page",
     );
     this.settleHelloWaiters(false);
-    this.failPendingNativeRequests(
+    this.correlation.failAll(
       "connection_lost",
       "The daemon disconnected before acknowledging the request",
     );
@@ -14012,7 +13688,7 @@ export class Bridge {
       "The daemon disconnected before acknowledging this page",
     );
     this.settleHelloWaiters(false);
-    this.failPendingNativeRequests(
+    this.correlation.failAll(
       "connection_lost",
       "The daemon disconnected before acknowledging the request",
     );
@@ -14036,7 +13712,7 @@ export class Bridge {
       "The daemon restarted before acknowledging this page",
     );
     this.settleHelloWaiters(false);
-    this.failPendingNativeRequests(
+    this.correlation.failAll(
       "connection_lost",
       "The daemon restarted before acknowledging the request",
     );
@@ -16069,55 +15745,6 @@ export class Bridge {
     return dispatched;
   }
 
-  private resolveNativeResponse(msg: BrowserMessage): void {
-    const requestID = msg.payload["request_id"];
-    if (typeof requestID !== "string") return;
-    const pending = this.pendingNativeRequests.get(requestID);
-    if (pending === undefined || pending.expectedType !== msg.type) {
-      console.debug(
-        "papio: dropping unknown or late correlated response",
-        msg.type,
-        requestID,
-      );
-      return;
-    }
-    this.pendingNativeRequests.delete(requestID);
-    pending.resolve({ kind: "response", payload: msg.payload });
-  }
-  private resolveNativeError(msg: BrowserMessage): void {
-    const requestID = msg.payload["request_id"];
-    const code =
-      typeof msg.payload["code"] === "string"
-        ? msg.payload["code"]
-        : "daemon_error";
-    const message =
-      typeof msg.payload["message"] === "string"
-        ? msg.payload["message"]
-        : "The daemon rejected the request";
-    if (typeof requestID !== "string") {
-      console.warn("papio: dropping uncorrelated daemon error", msg.payload);
-      return;
-    }
-    const pending = this.pendingNativeRequests.get(requestID);
-    if (pending !== undefined) {
-      this.pendingNativeRequests.delete(requestID);
-      pending.resolve({ kind: "transport", code, message });
-      return;
-    }
-    const pageAcquire = this.pageAcquireWaiters.get(requestID);
-    if (pageAcquire !== undefined) {
-      this.pageAcquireWaiters.delete(requestID);
-      pageAcquire({ error: message });
-      return;
-    }
-    if (requestID === this.helloRequestID) {
-      this.helloSentGeneration = -1;
-      this.helloRequestID = undefined;
-      this.settleHelloWaiters(false);
-      return;
-    }
-    console.debug("papio: dropping unknown or late daemon error", requestID);
-  }
   private onUnsolicitedPdfGrab(msg: BrowserMessage): void {
     const grabID = msg.payload["grab_id"];
     const outcome = msg.payload["outcome"];
@@ -16449,8 +16076,8 @@ export class Bridge {
   }
 
   /** Answer an effect-permit reconcile request from browser-local, URL-free
-   * state only. This is a direct notification: awaiting requestNative here
-   * would deadlock the inbound FIFO delivering this request. */
+   * state only. This is a direct notification: awaiting a correlated request
+   * here would deadlock the inbound FIFO delivering this request. */
   private async onEffectPermitReconcileRequest(
     msg: BrowserMessage,
   ): Promise<void> {
@@ -16639,13 +16266,10 @@ export class Bridge {
       await this.onEffectPermitReconcileRequest(msg);
       return;
     }
-    // Every correlated daemon result is routed from ONE list. When the switch
-    // below enumerated these case-by-case, review_preview_result was simply
-    // absent: the daemon issued the preview capability, the frame fell through
-    // to the ignore-echo default, and every "View PDF" click sat until its
-    // request timed out reporting that the daemon had not responded. A reply
-    // type can no longer be named as a requestNative expectation and go
-    // unrouted here.
+    // The correlation module owns the closed response-type set. It consumes
+    // matched replies and errors, and it drops late or mismatched replies
+    // without changing pending state. Unmatched errors continue to the hello
+    // and page-acquire handlers below.
     const grabRequestID = msg.payload["request_id"];
     if (
       msg.type === "pdf_grab_result" &&
@@ -16664,10 +16288,7 @@ export class Bridge {
       void this.onInstitutionalCandidateOffer(msg);
       return;
     }
-    if (CORRELATED_RESULT_TYPES.has(msg.type)) {
-      this.resolveNativeResponse(msg);
-      return;
-    }
+    if (this.correlation.handleInbound(msg) === "handled") return;
     switch (msg.type) {
       case "page_capture_request":
         await this.onPageCaptureRequest(msg);
@@ -16877,7 +16498,28 @@ export class Bridge {
       case "error":
         console.warn("papio: daemon reported error", msg.payload);
         if (msg.payload["request_id"] !== undefined) {
-          this.resolveNativeError(msg);
+          const requestID = msg.payload["request_id"];
+          const message =
+            typeof msg.payload["message"] === "string"
+              ? msg.payload["message"]
+              : "The daemon rejected the request";
+          if (typeof requestID !== "string") {
+            console.warn("papio: dropping uncorrelated daemon error", msg.payload);
+            return;
+          }
+          const pageAcquire = this.pageAcquireWaiters.get(requestID);
+          if (pageAcquire !== undefined) {
+            this.pageAcquireWaiters.delete(requestID);
+            pageAcquire({ error: message });
+            return;
+          }
+          if (requestID === this.helloRequestID) {
+            this.helloSentGeneration = -1;
+            this.helloRequestID = undefined;
+            this.settleHelloWaiters(false);
+            return;
+          }
+          console.debug("papio: dropping unknown or late daemon error", requestID);
           return;
         }
         if (msg.payload.code === "expected_hello") this.reconnectForHello();
@@ -17551,7 +17193,7 @@ export class Bridge {
     });
 
     if (requiresAuth === true && !this.institutionalAuthGateOpen()) {
-      // Slice 0 containment (dev/active/surface-lifecycle-plan.md): no
+      // Slice 0 containment (dev/adr/0028-surface-lifecycle-ownership.md): no
       // autonomous sign-in surface without the daemon-side authentication
       // claim feature and a live network. Only legacy (non-fresh-link)
       // offers reach this tail with requires_auth — the fresh-link variants
@@ -18028,7 +17670,8 @@ export class Bridge {
     }
     const successfulLanding =
       change.status === "complete" && !isAuthenticationURL(url);
-    // Navigation-error precedence (surface-lifecycle-plan.md Slice 1): a
+    // Navigation-error precedence (dev/adr/0028-surface-lifecycle-ownership.md
+    // Slice 1): a
     // failed top-frame load lands here as an unsuccessful document, same as
     // a genuine auth wall. Consult the marker before challenge assessment or
     // auth-wall detection ever runs for it — a dead end must not charge an
@@ -19607,21 +19250,14 @@ export class Bridge {
     const key = this.genericEpochKey(jobID, epoch);
     if (this.genericEpochResultsSent.has(key)) return undefined;
     this.genericEpochResultsSent.add(key);
-    const result = await this.requestNative(
-      "provider_drive_epoch_result_request",
-      {
-        drive_attempt_id: epoch.drive_attempt_id,
-        ordinal: epoch.ordinal,
-        strategy: "generic",
-        revision: epoch.revision ?? "",
-        outcome,
-        detail,
-      },
-      "provider_drive_epoch_result",
-      PROVIDER_DRIVE_EPOCH_FEATURE,
-      true,
-      jobID,
-    );
+    const result = await this.requestCorrelated("provider_drive_epoch_result_request", {
+      drive_attempt_id: epoch.drive_attempt_id,
+      ordinal: epoch.ordinal,
+      strategy: "generic",
+      revision: epoch.revision ?? "",
+      outcome,
+      detail,
+    }, { jobID: jobID });
     if (result.kind !== "response") this.genericEpochResultsSent.delete(key);
     return result;
   }
@@ -19880,19 +19516,12 @@ export class Bridge {
       return;
     }
     try {
-      const start = await this.requestNative(
-        "provider_drive_epoch_start_request",
-        {
-          drive_attempt_id: epoch.drive_attempt_id,
-          ordinal: epoch.ordinal,
-          strategy: "generic",
-          revision: epoch.revision,
-        },
-        "provider_drive_epoch_start_result",
-        PROVIDER_DRIVE_EPOCH_FEATURE,
-        true,
-        jobID,
-      );
+      const start = await this.requestCorrelated("provider_drive_epoch_start_request", {
+        drive_attempt_id: epoch.drive_attempt_id,
+        ordinal: epoch.ordinal,
+        strategy: "generic",
+        revision: epoch.revision,
+      }, { jobID: jobID });
       const startOutcome =
         start.kind === "response" &&
         typeof start.payload?.["outcome"] === "string"

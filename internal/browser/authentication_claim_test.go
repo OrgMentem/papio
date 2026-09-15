@@ -472,7 +472,7 @@ func TestClaimObservationIdempotencyTrio(t *testing.T) {
 		}))
 	grant := authClaimResponse(t, granted)
 	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-trio", 3)
-	generation := b.epoch
+	generation := b.arbitration.generation()
 
 	applied, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-trio-req-1", "auth-observation-trio",
 		bindingID, grant.GateOccurrenceID, "observation-trio-1", generation, 0, "wall_observed"))
@@ -523,7 +523,7 @@ func TestClaimObservationStaleGenerationMutatesNothing(t *testing.T) {
 		}))
 	grant := authClaimResponse(t, granted)
 	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-stale-gen", 4)
-	staleGeneration := b.epoch
+	staleGeneration := b.arbitration.generation()
 
 	before, beforeFound, err := jobs.GetAuthenticationEntryLease(context.Background(), "auth-observation-stale-gen")
 	if err != nil || !beforeFound {
@@ -532,7 +532,7 @@ func TestClaimObservationStaleGenerationMutatesNothing(t *testing.T) {
 
 	// Bump the holder generation so staleGeneration is now behind current.
 	b.mu.Lock()
-	b.epoch++
+	b.arbitration.advanceGenerationForTest()
 	b.mu.Unlock()
 
 	stale, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-stale-gen-req", "auth-observation-stale-gen",
@@ -541,8 +541,8 @@ func TestClaimObservationStaleGenerationMutatesNothing(t *testing.T) {
 	if staleAck.Outcome != "stale" {
 		t.Fatalf("outcome = %+v, want stale", staleAck)
 	}
-	if staleAck.BrowserHolderGeneration != b.epoch {
-		t.Fatalf("stale ack browser_holder_generation = %d, want current %d", staleAck.BrowserHolderGeneration, b.epoch)
+	if staleAck.BrowserHolderGeneration != b.arbitration.generation() {
+		t.Fatalf("stale ack browser_holder_generation = %d, want current %d", staleAck.BrowserHolderGeneration, b.arbitration.generation())
 	}
 
 	after, afterFound, err := jobs.GetAuthenticationEntryLease(context.Background(), "auth-observation-stale-gen")
@@ -578,7 +578,7 @@ func TestClaimObservationAuthReturnedPromotesLeaseToHuman(t *testing.T) {
 	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-returned", 5)
 
 	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-returned-req", "auth-observation-returned",
-		bindingID, grant.GateOccurrenceID, "observation-returned", b.epoch, 0, "auth_returned"))
+		bindingID, grant.GateOccurrenceID, "observation-returned", b.arbitration.generation(), 0, "auth_returned"))
 	ack := claimObservationAckPayload(t, msgs)
 	if ack.Outcome != "applied" {
 		t.Fatalf("auth_returned outcome = %+v, want applied", ack)
@@ -617,7 +617,7 @@ func TestClaimObservationSurvivesAReconnectSinceArbitration(t *testing.T) {
 		}))
 	grant := authClaimResponse(t, granted)
 	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-reconnect", 5)
-	reservedUnder := b.epoch
+	reservedUnder := b.arbitration.generation()
 
 	// The service worker dies mid-login and reconnects as a new session: the
 	// port closes (goodbye), then the fresh worker says hello and is promoted,
@@ -626,13 +626,13 @@ func TestClaimObservationSurvivesAReconnectSinceArbitration(t *testing.T) {
 		t.Fatalf("goodbye for the dying worker: %v", err)
 	}
 	runSyncAs(t, b, "session-after-reconnect", authClaimHello(t))
-	if b.epoch == reservedUnder {
-		t.Fatalf("reconnect did not advance the holder generation (still %d)", b.epoch)
+	if b.arbitration.generation() == reservedUnder {
+		t.Fatalf("reconnect did not advance the holder generation (still %d)", b.arbitration.generation())
 	}
 
 	msgs, _ := runSyncAs(t, b, "session-after-reconnect",
 		claimObservationFrame(t, jobID, "obs-reconnect-req", "auth-observation-reconnect",
-			bindingID, grant.GateOccurrenceID, "observation-reconnect", b.epoch, 0, "wall_observed"))
+			bindingID, grant.GateOccurrenceID, "observation-reconnect", b.arbitration.generation(), 0, "wall_observed"))
 	ack := claimObservationAckPayload(t, msgs)
 	if ack.Outcome != "applied" {
 		t.Fatalf("wall_observed after a reconnect = %+v, want applied", ack)
@@ -641,9 +641,9 @@ func TestClaimObservationSurvivesAReconnectSinceArbitration(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("lease read after renewal: found=%v err=%v", found, err)
 	}
-	if lease.BrowserHolderGeneration != b.epoch {
+	if lease.BrowserHolderGeneration != b.arbitration.generation() {
 		t.Fatalf("renewal left generation %d, want it carried forward to %d",
-			lease.BrowserHolderGeneration, b.epoch)
+			lease.BrowserHolderGeneration, b.arbitration.generation())
 	}
 	if lease.State != job.AuthenticationEntryLeaseReserved || lease.OwnerID != jobID {
 		t.Fatalf("lease after renewal = %+v, want reserved and owned by %s", lease, jobID)
@@ -676,7 +676,7 @@ func TestClaimObservationDuplicateStaleRejectedNeverTouchLeaseOrEvidence(t *test
 		}))
 	grant := authClaimResponse(t, granted)
 	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-dup-evidence", 6)
-	generation := b.epoch
+	generation := b.arbitration.generation()
 
 	applied, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-dup-evidence-req-1", "auth-observation-dup-evidence",
 		bindingID, grant.GateOccurrenceID, "observation-dup-evidence-1", generation, 0, "auth_returned"))
@@ -764,10 +764,10 @@ func TestClaimObservationEntitledLandingReoffersParkedSibling(t *testing.T) {
 	bindingID := bindCandidate(t, b, source, candidateID, "auth-observation-entitled", 6)
 
 	runSync(t, b, claimObservationFrame(t, source, "obs-entitled-returned", "auth-observation-entitled",
-		bindingID, grant.GateOccurrenceID, "observation-entitled-returned", b.epoch, 0, "auth_returned"))
+		bindingID, grant.GateOccurrenceID, "observation-entitled-returned", b.arbitration.generation(), 0, "auth_returned"))
 
 	msgs, _ := runSync(t, b, claimObservationFrame(t, source, "obs-entitled-landing", "auth-observation-entitled",
-		bindingID, grant.GateOccurrenceID, "observation-entitled-landing", b.epoch, 1, "entitled_landing"))
+		bindingID, grant.GateOccurrenceID, "observation-entitled-landing", b.arbitration.generation(), 1, "entitled_landing"))
 	ack := claimObservationAckPayload(t, msgs)
 	if ack.Outcome != "applied" {
 		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
@@ -813,13 +813,13 @@ func TestClaimObservationOwnerClosedAbandonsClaimConsumesTokenAndLeavesDependent
 	if err != nil || claim == nil {
 		t.Fatalf("materialization claim for binding: %v %v", claim, err)
 	}
-	closeID, _, err := jobs.IssueCloseAuthorization(ctx, bindingID, b.epoch, "scaffold_idle", b.now())
+	closeID, _, err := jobs.IssueCloseAuthorization(ctx, bindingID, b.arbitration.generation(), "scaffold_idle", b.now())
 	if err != nil {
 		t.Fatalf("issue close authorization: %v", err)
 	}
 
 	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-closed-req", "auth-observation-closed",
-		bindingID, grant.GateOccurrenceID, "observation-closed", b.epoch, 0, "owner_closed"))
+		bindingID, grant.GateOccurrenceID, "observation-closed", b.arbitration.generation(), 0, "owner_closed"))
 	ack := claimObservationAckPayload(t, msgs)
 	if ack.Outcome != "applied" {
 		t.Fatalf("owner_closed outcome = %+v, want applied", ack)
@@ -878,7 +878,7 @@ func TestClaimObservationOwnerClosedAppliesAcrossAGateRollover(t *testing.T) {
 	if err != nil || claim == nil {
 		t.Fatalf("materialization claim for binding: %v %v", claim, err)
 	}
-	closeID, _, err := jobs.IssueCloseAuthorization(ctx, bindingID, b.epoch, "handoff_parked", b.now())
+	closeID, _, err := jobs.IssueCloseAuthorization(ctx, bindingID, b.arbitration.generation(), "handoff_parked", b.now())
 	if err != nil {
 		t.Fatalf("issue close authorization: %v", err)
 	}
@@ -886,7 +886,7 @@ func TestClaimObservationOwnerClosedAppliesAcrossAGateRollover(t *testing.T) {
 	// One ordered event under the live occurrence, so ordinal 0 is taken.
 	if ack := claimObservationAckPayload(t, mustSync(t, b, claimObservationFrame(t, jobID,
 		"obs-rollover-wall", "auth-observation-rollover", bindingID, grant.GateOccurrenceID,
-		"observation-rollover-wall", b.epoch, 0, "wall_observed"))); ack.Outcome != "applied" {
+		"observation-rollover-wall", b.arbitration.generation(), 0, "wall_observed"))); ack.Outcome != "applied" {
 		t.Fatalf("wall_observed outcome = %+v, want applied", ack)
 	}
 
@@ -894,7 +894,7 @@ func TestClaimObservationOwnerClosedAppliesAcrossAGateRollover(t *testing.T) {
 	// heard about — which is no longer the current one.
 	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-rollover-closed",
 		"auth-observation-rollover", bindingID, "gate-occurrence-that-has-rolled-over",
-		"observation-rollover-closed", b.epoch, 0, "owner_closed"))
+		"observation-rollover-closed", b.arbitration.generation(), 0, "owner_closed"))
 	ack := claimObservationAckPayload(t, msgs)
 	if ack.Outcome != "applied" {
 		t.Fatalf("owner_closed across a rollover = %+v, want applied: a closed tab cannot un-close because the human signed in again", ack)
@@ -916,7 +916,7 @@ func TestClaimObservationOwnerClosedAppliesAcrossAGateRollover(t *testing.T) {
 	// duplicate, not a second apply and not a spurious ordinal conflict.
 	replay, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-rollover-closed-replay",
 		"auth-observation-rollover", bindingID, "gate-occurrence-that-has-rolled-over",
-		"observation-rollover-closed", b.epoch, 0, "owner_closed"))
+		"observation-rollover-closed", b.arbitration.generation(), 0, "owner_closed"))
 	if got := claimObservationAckPayload(t, replay); got.Outcome != "duplicate" {
 		t.Fatalf("replayed owner_closed = %+v, want duplicate", got)
 	}
@@ -940,7 +940,7 @@ func TestClaimObservationRolledOverAuthReturnedIsStillStale(t *testing.T) {
 
 	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-rollover-auth",
 		"auth-observation-rollover-auth", bindingID, "gate-occurrence-that-has-rolled-over",
-		"observation-rollover-auth", b.epoch, 0, "auth_returned"))
+		"observation-rollover-auth", b.arbitration.generation(), 0, "auth_returned"))
 	if got := claimObservationAckPayload(t, msgs); got.Outcome != "stale" {
 		t.Fatalf("rolled-over auth_returned = %+v, want stale", got)
 	}
@@ -966,7 +966,7 @@ func TestClaimObservationNavigationErrorParksWithoutMutatingLease(t *testing.T) 
 	}
 
 	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-naverror-req", "auth-observation-naverror",
-		bindingID, grant.GateOccurrenceID, "observation-naverror", b.epoch, 0, "navigation_error"))
+		bindingID, grant.GateOccurrenceID, "observation-naverror", b.arbitration.generation(), 0, "navigation_error"))
 	ack := claimObservationAckPayload(t, msgs)
 	if ack.Outcome != "applied" {
 		t.Fatalf("navigation_error outcome = %+v, want applied", ack)
@@ -981,7 +981,7 @@ func TestClaimObservationNavigationErrorParksWithoutMutatingLease(t *testing.T) 
 	}
 	closed, err := b.surfaceClose(context.Background(), &protocol.SurfaceCloseRequestPayload{
 		RequestID: "close-naverror-request", BindingID: bindingID,
-		BrowserHolderGeneration: b.epoch, Disposition: "claim_abandoned",
+		BrowserHolderGeneration: b.arbitration.generation(), Disposition: "claim_abandoned",
 		GateOccurrenceID: grant.GateOccurrenceID,
 	})
 	if err != nil {
@@ -1000,7 +1000,7 @@ func TestClaimObservationNavigationErrorParksWithoutMutatingLease(t *testing.T) 
 	}
 }
 
-// The following tests pin Slice 4 (dev/active/surface-lifecycle-plan.md):
+// The following tests pin Slice 4 (dev/adr/0028-surface-lifecycle-ownership.md):
 // automatic (non-focus) materialization candidate offers, claim-paced by
 // the authentication-entry lease this file already exercises. None of them
 // ever call FocusHandoffs — the offers below are the daemon's own
@@ -1089,9 +1089,9 @@ func TestAutomaticCandidateOfferParksDependentUntilEntitledLanding(t *testing.T)
 
 	bindingID := bindCandidate(t, b, owner, ownerCandidate, "auto-claim-dep", 4)
 	runSync(t, b, claimObservationFrame(t, owner, "auto-claim-dep-obs-returned", "auto-claim-dep-shared",
-		bindingID, grant.GateOccurrenceID, "auto-claim-dep-observation-returned", b.epoch, 0, "auth_returned"))
+		bindingID, grant.GateOccurrenceID, "auto-claim-dep-observation-returned", b.arbitration.generation(), 0, "auth_returned"))
 	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-dep-obs-landing", "auto-claim-dep-shared",
-		bindingID, grant.GateOccurrenceID, "auto-claim-dep-observation-landing", b.epoch, 1, "entitled_landing"))
+		bindingID, grant.GateOccurrenceID, "auto-claim-dep-observation-landing", b.arbitration.generation(), 1, "entitled_landing"))
 	ack := claimObservationAckPayload(t, landed)
 	if ack.Outcome != "applied" {
 		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
@@ -1139,9 +1139,9 @@ func TestEntitledDependentBindsWithoutTakingTheSignInSlot(t *testing.T) {
 	}
 	ownerBinding := bindCandidate(t, b, owner, ownerCandidate, "share-bind", 4)
 	runSync(t, b, claimObservationFrame(t, owner, "share-bind-obs-returned", "share-bind-shared",
-		ownerBinding, grant.GateOccurrenceID, "share-bind-observation-returned", b.epoch, 0, "auth_returned"))
+		ownerBinding, grant.GateOccurrenceID, "share-bind-observation-returned", b.arbitration.generation(), 0, "auth_returned"))
 	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "share-bind-obs-landing", "share-bind-shared",
-		ownerBinding, grant.GateOccurrenceID, "share-bind-observation-landing", b.epoch, 1, "entitled_landing"))
+		ownerBinding, grant.GateOccurrenceID, "share-bind-observation-landing", b.arbitration.generation(), 1, "entitled_landing"))
 	if ack := claimObservationAckPayload(t, landed); ack.Outcome != "applied" {
 		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
 	}
@@ -1228,9 +1228,9 @@ func TestChallengeAfterEntitledLandingIsRejectedAndInert(t *testing.T) {
 	grant := authClaimResponse(t, granted)
 	bindingID := bindCandidate(t, b, owner, ownerCandidate, "challenge-after-landing", 4)
 	runSync(t, b, claimObservationFrame(t, owner, "challenge-after-landing-returned", "challenge-after-landing",
-		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-returned", b.epoch, 0, "auth_returned"))
+		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-returned", b.arbitration.generation(), 0, "auth_returned"))
 	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "challenge-after-landing-landing", "challenge-after-landing",
-		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-landing", b.epoch, 1, "entitled_landing"))
+		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-landing", b.arbitration.generation(), 1, "entitled_landing"))
 	if ack := claimObservationAckPayload(t, landed); ack.Outcome != "applied" {
 		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
 	}
@@ -1241,7 +1241,7 @@ func TestChallengeAfterEntitledLandingIsRejectedAndInert(t *testing.T) {
 	}
 
 	challenged, _ := runSync(t, b, claimObservationFrame(t, owner, "challenge-after-landing-challenge", "challenge-after-landing",
-		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-challenge", b.epoch, 2, "challenge"))
+		bindingID, grant.GateOccurrenceID, "challenge-after-landing-ev-challenge", b.arbitration.generation(), 2, "challenge"))
 	ack := claimObservationAckPayload(t, challenged)
 	if ack.Outcome != "rejected" {
 		t.Fatalf("challenge after entitled_landing outcome = %+v, want rejected", ack)
@@ -1709,7 +1709,7 @@ func TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim(
 	// observed entitled_landing. The dependent must stay parked.
 	authReturned, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-gate-obs-returned",
 		"auto-claim-gate-shared", bindingID, grant.GateOccurrenceID,
-		"auto-claim-gate-observation-returned", b.epoch, 0, "auth_returned"))
+		"auto-claim-gate-observation-returned", b.arbitration.generation(), 0, "auth_returned"))
 	if ack := claimObservationAckPayload(t, authReturned); ack.Outcome != "applied" {
 		t.Fatalf("auth_returned outcome = %+v, want applied", ack)
 	}
@@ -1724,7 +1724,7 @@ func TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim(
 	// dependent is admitted on the next poll.
 	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-gate-obs-landing",
 		"auto-claim-gate-shared", bindingID, grant.GateOccurrenceID,
-		"auto-claim-gate-observation-landing", b.epoch, 1, "entitled_landing"))
+		"auto-claim-gate-observation-landing", b.arbitration.generation(), 1, "entitled_landing"))
 	if ack := claimObservationAckPayload(t, landed); ack.Outcome != "applied" {
 		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
 	}
@@ -1743,7 +1743,7 @@ func TestAutomaticCandidateOfferGatesOnEntitledLandingAndOwnerCloseRetiresClaim(
 	// rather than resuming on the now-stale entitlement.
 	closed, _ := runSync(t, b, claimObservationFrame(t, owner, "auto-claim-gate-obs-closed",
 		"auto-claim-gate-shared", bindingID, grant.GateOccurrenceID,
-		"auto-claim-gate-observation-closed", b.epoch, 2, "owner_closed"))
+		"auto-claim-gate-observation-closed", b.arbitration.generation(), 2, "owner_closed"))
 	if ack := claimObservationAckPayload(t, closed); ack.Outcome != "applied" {
 		t.Fatalf("owner_closed outcome = %+v, want applied", ack)
 	}
@@ -1791,7 +1791,7 @@ func rawOfType(msgs []*protocol.BrowserMessage, raw []json.RawMessage, typ strin
 // claim_observation_ack, or surface_close_response frame.
 //
 // institutional_candidate_offer is checked too, but as a POSITIVE
-// control: dev/active/surface-lifecycle-plan.md's storage-tier scope note
+// control: dev/adr/0028-surface-lifecycle-ownership.md's "Decision 3" storage-tier scope note
 // and dev/active/claim-observation-protocol.md's §2 scope note document
 // that this frame (part of the pre-existing institutional_materialization_v1
 // route/offer family, shipped in 0b716b3 before this effort) legitimately
@@ -1883,7 +1883,7 @@ func TestClaimObservationCloseFramesCarryNoRawMaterial(t *testing.T) {
 
 	obsMsgs, obsRaw := runSync(t, b, claimObservationFrame(t, jobID, "denylist-obs-req",
 		"auth-claim-denylist", bindingID, authResp.GateOccurrenceID,
-		"obs-denylist-0001", b.epoch, 0, "wall_observed"))
+		"obs-denylist-0001", b.arbitration.generation(), 0, "wall_observed"))
 	record(obsMsgs, obsRaw)
 	if ack := claimObservationAckPayload(t, obsMsgs); ack.Outcome != "applied" {
 		t.Fatalf("claim_observation_ack outcome = %s, want applied: %+v", ack.Outcome, ack)
@@ -1892,7 +1892,7 @@ func TestClaimObservationCloseFramesCarryNoRawMaterial(t *testing.T) {
 	closeMsgs, closeRaw := runSync(t, b, inFrame(t, protocol.MsgSurfaceCloseRequest, "",
 		protocol.SurfaceCloseRequestPayload{
 			RequestID: "denylist-close-req", BindingID: bindingID,
-			BrowserHolderGeneration: b.epoch, Disposition: "scaffold_idle",
+			BrowserHolderGeneration: b.arbitration.generation(), Disposition: "scaffold_idle",
 		}))
 	record(closeMsgs, closeRaw)
 	if closeResp := decodeSurfaceCloseResponse(t, closeRaw); closeResp.Outcome != "authorized" {

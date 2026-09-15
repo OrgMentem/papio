@@ -444,14 +444,14 @@ link that remains (`extension/src/plan.ts:planExecution`; the second copy those
 tests originally also covered is deleted, see the amendment below).
 
 **Classifier consolidation amendment, 2026-09-03.** The temporal-policy work
-above shipped in both classifier copies that existed then. Slice 3 of
-`dev/active/architecture-refactor-plan.md` removes `interpret` and keeps those
-semantics and their tests in `planExecution`, the sole provider-rule
-classifier. Any later provider-rule classifier work in this plan targets only
-`planExecution`. The pending provider load-failure work below stays separate
-and must NOT move into `planExecution`: `assessDrivenPage` produces
-`load_failure` before `planExecution` runs, and it is a different classifier
-with a different input contract.
+above shipped in both classifier copies that existed then. The architecture
+refactor's Slice 3 (`bce6777`, now retired from `dev/active/`) deleted
+`interpret` and kept those semantics and their tests in `planExecution`, the
+sole provider-rule classifier. Any later provider-rule classifier work in this
+plan targets only `planExecution`. The pending provider load-failure work below
+stays separate and must NOT move into `planExecution`: `assessDrivenPage`
+produces `load_failure` before `planExecution` runs, and it is a different
+classifier with a different input contract.
 
 #### Error pages and IdP captures fixed
 

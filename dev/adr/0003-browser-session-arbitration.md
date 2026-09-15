@@ -30,19 +30,23 @@ The native host mints a per-process `session_id` and carries it — plus a
 clean-shutdown `goodbye` — on the `browser.sync` request body. The extension
 protocol is untouched; extensions of every version participate immediately.
 
-Arbitration policy: **first hello holds**. A hello from a different session is
-denied with a `session_busy` error frame and parked as *pending* (old
-extensions log the error frame and idle — fail-visible, not fail-broken). A
-holder silent past 10 s (5× the 2 s host poll) yields to a live pending
-session, which receives its withheld `hello_ack` on promotion. `goodbye`
-releases immediately. An empty `session_id` marks a legacy host and keeps
-last-hello-wins in both directions (a legacy host cannot be arbitrated).
+Arbitration policy: **first hello holds**. A hello from a different identified
+session is parked as *pending*. The daemon first sends a role-bearing
+`hello_ack` (`role: "pending"`), then a `session_busy` error frame. The
+acknowledgement negotiates daemon features without granting the pending
+session holder work. A holder silent past 10 s (5× the 2 s host poll) yields
+to a live pending session, which receives a new `hello_ack` with
+`role: "holder"`. `goodbye` releases immediately. An empty `session_id` marks
+a legacy host and keeps last-hello-wins in both directions (a legacy host
+cannot be arbitrated).
 
 Switching is explicit: `papio browser sessions` / `papio browser use
-<id>|--latest` (RPCs `browser.sessions` / `browser.claim`). Stateless
-request/response frames (`page_acquire`, triage, review preview) pass from
-ANY session — "Acquire this page" in the non-holder browser must keep
-working; only the offer/handoff flow is holder-exclusive.
+<id>|--latest` (RPCs `browser.sessions` / `browser.claim`). Admission is
+independent of holdership for frames whose effects route back to the sending
+browser or mutate only daemon-owned state. Holder status gates
+daemon-initiated offer and handoff work, plus frames that act on that routed
+authority. The exact admitted frame set stays in bridge code and tests because
+it changes with the protocol surface.
 
 ### B. Rejected: prefer highest extension version
 

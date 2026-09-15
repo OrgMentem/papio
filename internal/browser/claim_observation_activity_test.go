@@ -50,7 +50,7 @@ func TestClaimObservationOwnerClosedRecordsLostSurfaceActivity(t *testing.T) {
 
 	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-surface-closed-activity",
 		"auth-surface-closed-activity", bindingID, grant.GateOccurrenceID,
-		"observation-surface-closed-activity", b.epoch, 0, "owner_closed"))
+		"observation-surface-closed-activity", b.arbitration.generation(), 0, "owner_closed"))
 	if ack := claimObservationAckPayload(t, msgs); ack.Outcome != "applied" {
 		t.Fatalf("owner_closed outcome = %+v, want applied", ack)
 	}
@@ -90,7 +90,7 @@ func TestClaimObservationOwnerClosedRecordsLossAgainstTheBindingOwner(t *testing
 	// The dependent paper reports the loss: its own job id, the owner's binding.
 	msgs, _ := runSync(t, b, claimObservationFrame(t, dependentID, "obs-surface-closed-owner",
 		"auth-surface-closed-owner", bindingID, grant.GateOccurrenceID,
-		"observation-surface-closed-owner", b.epoch, 0, "owner_closed"))
+		"observation-surface-closed-owner", b.arbitration.generation(), 0, "owner_closed"))
 	if ack := claimObservationAckPayload(t, msgs); ack.Outcome != "applied" {
 		t.Fatalf("owner_closed outcome = %+v, want applied", ack)
 	}
@@ -134,7 +134,7 @@ func TestClaimObservationOwnerClosedAfterOutcomeRecordsNoLostSurface(t *testing.
 
 	msgs, _ := runSync(t, b, claimObservationFrame(t, jobID, "obs-surface-settled-activity",
 		"auth-surface-settled-activity", bindingID, grant.GateOccurrenceID,
-		"observation-surface-settled-activity", b.epoch, 0, "owner_closed"))
+		"observation-surface-settled-activity", b.arbitration.generation(), 0, "owner_closed"))
 	if ack := claimObservationAckPayload(t, msgs); ack.Outcome != "applied" {
 		t.Fatalf("owner_closed after an outcome = %+v, want applied: it stays idempotent", ack)
 	}
@@ -163,13 +163,13 @@ func TestClaimObservationOwnerClosedReplayRecordsOneLostSurface(t *testing.T) {
 
 	frame := claimObservationFrame(t, jobID, "obs-surface-replay-activity",
 		"auth-surface-replay-activity", bindingID, grant.GateOccurrenceID,
-		"observation-surface-replay-activity", b.epoch, 0, "owner_closed")
+		"observation-surface-replay-activity", b.arbitration.generation(), 0, "owner_closed")
 	if ack := claimObservationAckPayload(t, mustSync(t, b, frame)); ack.Outcome != "applied" {
 		t.Fatalf("first owner_closed = %+v, want applied", ack)
 	}
 	replay := claimObservationFrame(t, jobID, "obs-surface-replay-activity",
 		"auth-surface-replay-activity", bindingID, grant.GateOccurrenceID,
-		"observation-surface-replay-activity", b.epoch, 0, "owner_closed")
+		"observation-surface-replay-activity", b.arbitration.generation(), 0, "owner_closed")
 	if ack := claimObservationAckPayload(t, mustSync(t, b, replay)); ack.Outcome != "duplicate" {
 		t.Fatalf("replayed owner_closed = %+v, want duplicate", ack)
 	}

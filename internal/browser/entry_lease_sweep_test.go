@@ -41,7 +41,7 @@ func TestSyncFreesAStrandedBoundEntryLease(t *testing.T) {
 		  WHERE authentication_claim_id='auth-stranded-sweep'`, jobID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.AbandonStaleMaterializations(ctx, b.epoch+1); err != nil {
+	if _, err := jobs.AbandonStaleMaterializations(ctx, b.arbitration.generation()+1); err != nil {
 		t.Fatal(err)
 	}
 	stranded, ok, err := jobs.GetAuthenticationEntryLease(ctx, "auth-stranded-sweep")
