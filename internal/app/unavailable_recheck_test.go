@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,16 +132,29 @@ func TestUnavailableRecheck(t *testing.T) {
 	})
 
 	t.Run("exempt reason is skipped", func(t *testing.T) {
-		svc, jobs := newService(t)
-		wr := request("wr_recheck_exempt_001", "10.1000/recheck-exempt-001")
-		wr.Identifiers = nil
-		oldID := seedUnavailable(t, svc, jobs, wr, job.TerminalReasonNoIdentifier, now.AddDate(0, 0, -windowDays-1))
-		if err := svc.UnavailableRechecker().RunDue(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		rows, _ := jobs.List(context.Background(), "", 10)
-		if len(rows) != 1 || len(recheckEvents(t, jobs, oldID)) != 0 {
-			t.Fatalf("exempt pass produced jobs=%d events=%d, want 1 and 0", len(rows), len(recheckEvents(t, jobs, oldID)))
+		for _, tc := range []struct {
+			name       string
+			reason     job.TerminalReason
+			identifier bool
+		}{
+			{name: "no identifier", reason: job.TerminalReasonNoIdentifier},
+			{name: "browser rejected", reason: job.TerminalReasonBrowserRejected, identifier: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				svc, jobs := newService(t)
+				wr := request("wr_recheck_exempt_"+strings.ReplaceAll(tc.name, " ", "_"), "10.1000/recheck-exempt-"+strings.ReplaceAll(tc.name, " ", "-"))
+				if !tc.identifier {
+					wr.Identifiers = nil
+				}
+				oldID := seedUnavailable(t, svc, jobs, wr, tc.reason, now.AddDate(0, 0, -windowDays-1))
+				if err := svc.UnavailableRechecker().RunDue(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				rows, _ := jobs.List(context.Background(), "", 10)
+				if len(rows) != 1 || len(recheckEvents(t, jobs, oldID)) != 0 {
+					t.Fatalf("exempt pass produced jobs=%d events=%d, want 1 and 0", len(rows), len(recheckEvents(t, jobs, oldID)))
+				}
+			})
 		}
 	})
 
@@ -271,6 +285,103 @@ func TestUnavailableRecheck(t *testing.T) {
 		if len(rows) != 2 {
 			t.Fatalf("second pass after replacement failed created %d jobs, want 2", len(rows))
 		}
+	})
+
+	t.Run("recheck outcome notifications", func(t *testing.T) {
+		t.Run("unavailable replacement stays quiet", func(t *testing.T) {
+			svc, jobs := newService(t)
+			wr := request("wr_recheck_notify_unavailable", "10.1000/recheck-notify-unavailable")
+			oldID := seedUnavailable(t, svc, jobs, wr, job.TerminalReasonNoEntitlement, now.AddDate(0, 0, -windowDays-1))
+			if err := svc.UnavailableRechecker().RunDue(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			rows, _ := jobs.List(context.Background(), "", 10)
+			var freshID string
+			for _, row := range rows {
+				if row.ID != oldID {
+					freshID = row.ID
+				}
+			}
+			if err := jobs.Transition(context.Background(), freshID, job.StateQueued, job.StateResolving, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(context.Background(), freshID, job.StateResolving, job.StateUnavailable, nil, job.WithTerminalReason(job.TerminalReasonNoEntitlement)); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := jobs.Get(context.Background(), freshID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			notifier := &fakeNotificationSink{}
+			svc.Notifier = notifier
+			svc.recordStandaloneOutcome(context.Background(), fresh)
+			if len(notifier.intents) != 0 {
+				t.Fatalf("unavailable recheck routed %d intents, want none", len(notifier.intents))
+			}
+		})
+
+		t.Run("ready replacement announces new availability", func(t *testing.T) {
+			svc, jobs := newService(t)
+			wr := request("wr_recheck_notify_ready", "10.1000/recheck-notify-ready")
+			oldID := seedUnavailable(t, svc, jobs, wr, job.TerminalReasonNoEntitlement, now.AddDate(0, 0, -windowDays-1))
+			if err := svc.UnavailableRechecker().RunDue(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			rows, _ := jobs.List(context.Background(), "", 10)
+			var freshID string
+			for _, row := range rows {
+				if row.ID != oldID {
+					freshID = row.ID
+				}
+			}
+			if err := jobs.Transition(context.Background(), freshID, job.StateQueued, job.StateResolving, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(context.Background(), freshID, job.StateResolving, job.StateReady, nil); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := jobs.Get(context.Background(), freshID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			notifier := &fakeNotificationSink{}
+			svc.Notifier = notifier
+			svc.recordStandaloneOutcome(context.Background(), fresh)
+			if len(notifier.intents) != 1 {
+				t.Fatalf("ready recheck routed %d intents, want one", len(notifier.intents))
+			}
+			const want = "A paper that was unavailable is now ready — open the papio inbox"
+			if notifier.intents[0].Message != want {
+				t.Fatalf("ready recheck message = %q, want %q", notifier.intents[0].Message, want)
+			}
+		})
+
+		t.Run("ordinary failure still announces outcome", func(t *testing.T) {
+			svc, jobs := newService(t)
+			id, err := svc.Submit(context.Background(), request("wr_recheck_notify_ordinary", "10.1000/recheck-notify-ordinary"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(context.Background(), id, job.StateQueued, job.StateResolving, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(context.Background(), id, job.StateResolving, job.StateFailed, nil, job.WithTerminalReason(job.TerminalReasonUnknown)); err != nil {
+				t.Fatal(err)
+			}
+			row, err := jobs.Get(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			notifier := &fakeNotificationSink{}
+			svc.Notifier = notifier
+			svc.recordStandaloneOutcome(context.Background(), row)
+			if len(notifier.intents) != 1 {
+				t.Fatalf("ordinary failure routed %d intents, want one", len(notifier.intents))
+			}
+			if notifier.intents[0].Message != "Request failed — open the papio inbox" {
+				t.Fatalf("ordinary failure message = %q", notifier.intents[0].Message)
+			}
+		})
 	})
 
 	t.Run("batch is bounded and oldest first", func(t *testing.T) {

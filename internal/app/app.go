@@ -3828,12 +3828,23 @@ func (s *Service) recordStandaloneOutcome(ctx context.Context, row *job.Row) {
 	if err != nil || !standalone {
 		return
 	}
+	recheckOf, err := s.Jobs.RecheckOrigin(ctx, row.ID)
+	if err != nil {
+		return
+	}
 	happened := s.Now().UTC()
 	event := notify.Event{Kind: "request.outcome", Count: 1}
 	switch row.State {
 	case job.StateReady:
-		event.Message = "Request ready — open the papio inbox"
+		if recheckOf != "" {
+			event.Message = "A paper that was unavailable is now ready — open the papio inbox"
+		} else {
+			event.Message = "Request ready — open the papio inbox"
+		}
 	case job.StateFailed, job.StateUnavailable, job.StateCancelled:
+		if recheckOf != "" {
+			return
+		}
 		event.Message = "Request failed — open the papio inbox"
 	default:
 		return

@@ -12,11 +12,11 @@ import (
 	"papio/internal/protocol"
 )
 
-// unavailableRecheckScanLimit bounds one maintenance pass. It matches the
-// import-retry scan because both runners share the daemon's maintenance
-// goroutine. The oldest-first cursor advances past exempt rows, so a permanent
-// identity gap cannot starve newer unavailable outcomes.
-const unavailableRecheckScanLimit = readyImportScanLimit
+// unavailableRecheckScanLimit bounds one maintenance pass to two submissions.
+// At the one-minute cadence, 2/minute is a 120/hour ceiling. The oldest-first
+// cursor drains 2,000 jobs in about 17 hours while keeping re-checks in the same
+// order as the slowest paced source, instead of sending 200 times that pace.
+const unavailableRecheckScanLimit = 2
 
 type unavailableRecheckCursor struct {
 	updatedAt string

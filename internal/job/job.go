@@ -152,6 +152,8 @@ func RecheckExempt(reason string) bool {
 		TerminalReasonInsufficientIdentityEvidence,
 		TerminalReasonCancelledByUser,
 		TerminalReasonBrowserCancelled,
+		// internal/browser/bridge.go's JobReject path records this explicit human decision.
+		TerminalReasonBrowserRejected,
 		TerminalReasonUserDismissed,
 		TerminalReasonReviewRejected:
 		return true
@@ -589,9 +591,13 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		jobID, requestID, string(polJSON), nullable(who.Consumer), now, now); err != nil {
 		return CreateResult{}, fmt.Errorf("inserting job: %w", err)
 	}
+	createdDetail := fmt.Sprintf(`{"request_id":%q,"work":%q}`, requestID, w.Describe())
+	if recheckOf != "" {
+		createdDetail = fmt.Sprintf(`{"request_id":%q,"work":%q,"recheck_of":%q}`, requestID, w.Describe(), recheckOf)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.created', ?)`,
-		jobID, now, fmt.Sprintf(`{"request_id":%q,"work":%q}`, requestID, w.Describe())); err != nil {
+		jobID, now, createdDetail); err != nil {
 		return CreateResult{}, err
 	}
 	if recheckOf != "" {
@@ -3853,6 +3859,28 @@ func (js *Store) RecordEvent(ctx context.Context, jobID, kind string, detail map
 		return fmt.Errorf("recording job event: %w", err)
 	}
 	return nil
+}
+
+// RecheckOrigin returns the unavailable job that caused this replacement.
+// An empty result identifies an ordinary submission.
+func (js *Store) RecheckOrigin(ctx context.Context, jobID string) (string, error) {
+	var detailJSON string
+	err := js.S.DB().QueryRowContext(ctx,
+		`SELECT detail_json FROM events WHERE job_id = ? AND kind = 'job.created' ORDER BY seq ASC LIMIT 1`,
+		jobID).Scan(&detailJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var detail struct {
+		RecheckOf string `json:"recheck_of"`
+	}
+	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil {
+		return "", err
+	}
+	return detail.RecheckOf, nil
 }
 
 // Events returns a job's event stream in order.
