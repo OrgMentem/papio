@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,10 +16,10 @@ import (
 	"papio/internal/captures"
 )
 
-type adapterRepairRunnerFunc func(context.Context, string, string, string) (string, error)
+type adapterRepairRunnerFunc func(context.Context, string, string, ...string) (string, error)
 
-func (f adapterRepairRunnerFunc) Run(ctx context.Context, root, path, provider string) (string, error) {
-	return f(ctx, root, path, provider)
+func (f adapterRepairRunnerFunc) Run(ctx context.Context, root, tool string, args ...string) (string, error) {
+	return f(ctx, root, tool, args...)
 }
 
 func TestParseAdapterVersionFromEmbeddedTypesSample(t *testing.T) {
@@ -72,50 +73,26 @@ func TestScaffoldAdapterRepairRejectsUnprovenancedPrivateHTML(t *testing.T) {
 	}
 }
 
-func TestScaffoldAdapterRepairCertifiesExactEmittedBytes(t *testing.T) {
+func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "extension", "tools"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "extension", "tools", "adapter-try.ts"), []byte("// test seam\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(root, "extension", "src", "adapters"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "extension", "src", "adapters", "types.ts"), []byte(`{ id: "jstor", version: "0.3.0" }`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store := captures.New(root, captures.Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
-	fixture := []byte("<!-- papio-fixture provider=\"jstor\" scenario=\"success\" origin=\"https://www.jstor.org/stable/abc\" captured=\"2026-08-10T00:00:00Z\" -->\n<html><body>safe</body></html>")
-	path, err := store.StoreSanitized(context.Background(), "www.jstor.org", "success", "jstor", "0.3.0", fixture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows, err := store.List(context.Background())
-	if err != nil || len(rows) != 1 {
-		t.Fatalf("capture rows = %#v, %v", rows, err)
-	}
-	if err := store.UpdateJob(context.Background(), "job-independent", path, path); err != nil {
-		t.Fatal(err)
-	}
-	rows, err = store.List(context.Background())
-	if err != nil || !rows[0].IndependentEvidence {
-		t.Fatalf("independent evidence = %#v, %v", rows, err)
-	}
+	writeAdapterRepairTestRepo(t, root)
+	row, fixture := storeAdapterRepairTestCapture(t, root, true)
 
 	var runnerPath string
 	result, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
-		Path: path, Provider: rows[0].AdapterID, Scenario: rows[0].Scenario,
-		Host: rows[0].Host, Captured: rows[0].Timestamp, AdapterVersion: rows[0].AdapterVersion,
-		SHA256: rows[0].SHA256, SanitizerProvenance: rows[0].SanitizerProvenance,
-		SanitizerVersion: rows[0].SanitizerVersion, IndependentEvidence: rows[0].IndependentEvidence,
+		Path: row.Path, Provider: row.AdapterID, Scenario: row.Scenario,
+		Host: row.Host, Captured: row.Timestamp, AdapterVersion: row.AdapterVersion,
+		SHA256: row.SHA256, SanitizerProvenance: row.SanitizerProvenance,
+		SanitizerVersion: row.SanitizerVersion, IndependentEvidence: row.IndependentEvidence,
 	}, adapterRepairDeps{
 		RepoRoot: root,
 		Now:      func() time.Time { return time.Date(2026, 8, 10, 2, 3, 4, 0, time.UTC) },
-		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, p, _ string) (string, error) {
-			runnerPath = p
-			data, readErr := os.ReadFile(p)
+		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, args ...string) (string, error) {
+			if tool == "tools/adapter-repair.ts" {
+				return `{"provider":"jstor","scenario":"success","rule_kind":"article","rule_index":2,"candidates":[{"score":100,"selector":"a#pdf-download","outer_html":"<a id=\"pdf-download\">PDF</a>","verified":true,"replace_selector":"mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']"}]}`, nil
+			}
+			runnerPath = args[0]
+			data, readErr := os.ReadFile(runnerPath)
 			if readErr != nil {
 				return "", readErr
 			}
@@ -126,6 +103,7 @@ func TestScaffoldAdapterRepairCertifiesExactEmittedBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	emitted, err := os.ReadFile(result.Fixture)
 	if err != nil {
 		t.Fatal(err)
@@ -140,16 +118,137 @@ func TestScaffoldAdapterRepairCertifiesExactEmittedBytes(t *testing.T) {
 	if string(runnerBytes) != string(emitted) {
 		t.Fatalf("adapter-try received bytes different from emitted fixture")
 	}
+	finalFixture, err := os.ReadFile(filepath.Join(result.Workspace, "extension", "fixtures", "jstor", "success.html"))
+	if err != nil || string(finalFixture) != string(fixture) {
+		t.Fatalf("final fixture = %q, %v; want canonical bytes", finalFixture, err)
+	}
+
 	report, err := os.ReadFile(result.Report)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(emitted)
 	if !strings.Contains(string(report), "Fixture SHA-256: `"+hex.EncodeToString(sum[:])+"`") ||
-		!strings.Contains(string(report), "plan fixture sha256="+hex.EncodeToString(sum[:])) {
-		t.Fatalf("report does not certify exact adapter-try bytes: %s", report)
+		!strings.Contains(string(report), "plan fixture sha256="+hex.EncodeToString(sum[:])) ||
+		!strings.Contains(string(report), "Top verified candidate: `a#pdf-download`") {
+		t.Fatalf("report does not certify the fixture and selector: %s", report)
 	}
 	if result.NextRevision != "0.3.1" {
 		t.Fatalf("next revision = %q, want 0.3.1", result.NextRevision)
 	}
+	apply, err := os.ReadFile(filepath.Join(result.Workspace, "apply.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedApply := "# Apply this reviewed repair\n\nRun from the repository root after reviewing `report.md` and both generated diffs.\n\n```sh\n" +
+		"git apply dev/scratch/repair/jstor-20260810T020304Z/adapters.test.ts.patch dev/scratch/repair/jstor-20260810T020304Z/types.ts.patch\n" +
+		"mkdir -p extension/fixtures/jstor\n" +
+		"cp dev/scratch/repair/jstor-20260810T020304Z/extension/fixtures/jstor/success.html extension/fixtures/jstor/success.html\n" +
+		"(cd extension && bun test test/adapters.test.ts)\n```\n"
+	if string(apply) != expectedApply {
+		t.Fatalf("apply.md = %q; want %q", apply, expectedApply)
+	}
+
+	typesPatch := filepath.Join(result.Workspace, "types.ts.patch")
+	command := exec.Command("git", "apply", "--check", typesPatch)
+	command.Dir = root
+	if output, applyErr := command.CombinedOutput(); applyErr != nil {
+		t.Fatalf("git apply --check types.ts.patch: %v\n%s", applyErr, output)
+	}
+	testPatch := filepath.Join(result.Workspace, "adapters.test.ts.patch")
+	command = exec.Command("git", "apply", "--check", testPatch)
+	command.Dir = root
+	if output, applyErr := command.CombinedOutput(); applyErr != nil {
+		t.Fatalf("git apply --check adapters.test.ts.patch: %v\n%s", applyErr, output)
+	}
+}
+
+func TestScaffoldAdapterRepairOmitsTypesPatchWithoutVerifiedCandidate(t *testing.T) {
+	root := t.TempDir()
+	writeAdapterRepairTestRepo(t, root)
+	row, _ := storeAdapterRepairTestCapture(t, root, true)
+
+	result, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
+		Path: row.Path, Provider: row.AdapterID, Scenario: row.Scenario,
+		Host: row.Host, Captured: row.Timestamp, AdapterVersion: row.AdapterVersion,
+		SHA256: row.SHA256, SanitizerProvenance: row.SanitizerProvenance,
+		SanitizerVersion: row.SanitizerVersion, IndependentEvidence: row.IndependentEvidence,
+	}, adapterRepairDeps{
+		RepoRoot: root,
+		Now:      func() time.Time { return time.Date(2026, 8, 10, 3, 4, 5, 0, time.UTC) },
+		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, _ ...string) (string, error) {
+			if tool == "tools/adapter-repair.ts" {
+				return `{"provider":"jstor","scenario":"success","rule_kind":"article","rule_index":0,"candidates":[]}`, nil
+			}
+			return "adapter-try found no matching selector", nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(filepath.Join(result.Workspace, "types.ts.patch")); !os.IsNotExist(statErr) {
+		t.Fatalf("types.ts.patch exists without a verified candidate: %v", statErr)
+	}
+	report, err := os.ReadFile(result.Report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "No selector candidate verified through planExecution") ||
+		!strings.Contains(string(report), "No types.ts.patch was emitted") {
+		t.Fatalf("report omits the no-candidate reason: %s", report)
+	}
+}
+
+func writeAdapterRepairTestRepo(t *testing.T, root string) {
+	t.Helper()
+	for _, directory := range []string{
+		filepath.Join(root, "extension", "tools"),
+		filepath.Join(root, "extension", "src", "adapters"),
+		filepath.Join(root, "extension", "test"),
+	} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tool := range []string{"adapter-try.ts", "adapter-repair.ts"} {
+		if err := os.WriteFile(filepath.Join(root, "extension", "tools", tool), []byte("// test seam\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repoRoot, err := findAdapterRepairRepoRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{
+		filepath.Join("extension", "src", "adapters", "types.ts"),
+		filepath.Join("extension", "test", "adapters.test.ts"),
+	} {
+		source, readErr := os.ReadFile(filepath.Join(repoRoot, relative))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(root, relative), source, 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+}
+
+func storeAdapterRepairTestCapture(t *testing.T, root string, independent bool) (captures.Capture, []byte) {
+	t.Helper()
+	store := captures.New(root, captures.Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
+	fixture := []byte("<!-- papio-fixture provider=\"jstor\" scenario=\"success\" origin=\"https://www.jstor.org/stable/abc\" captured=\"2026-08-10T00:00:00Z\" -->\n<html><body><a id=\"pdf-download\">PDF</a></body></html>")
+	path, err := store.StoreSanitized(context.Background(), "www.jstor.org", "success", "jstor", "0.3.0", fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if independent {
+		if err := store.UpdateJob(context.Background(), "job-independent", path, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := store.List(context.Background())
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("capture rows = %#v, %v", rows, err)
+	}
+	return rows[0], fixture
 }

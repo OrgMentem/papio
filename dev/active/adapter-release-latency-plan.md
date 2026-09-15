@@ -18,8 +18,9 @@ later phase sections remain targets and must not be read as shipped behaviour.
 - **SHIPPED** — provider-drive epoch authority and access-mode enforcement — `internal/browser/bridge.go`; contracts in `internal/protocol/protocol.go`
 - **SHIPPED** — captures and local incident lifecycle with safety latching — `internal/captures/captures.go` (storage, pin/release, retention), `internal/incident/incident.go` (grouping, bounded failure-shape evidence)
 - **SHIPPED** — adapter-try offline diagnostic — `extension/tools/adapter-try.ts`, which invokes the production planner
-- **SHIPPED** — proposal-only repair scaffold — `internal/cli/adapter_repair.go` (daemon-listed/sanitized capture validation; proposals only)
-- **OPEN** — Firefox transmission consent; redacted observation reporting; URL-template expansion; generator/release automation; signed remote control plane; contribution intake; staged rollout; broadened Zotero/generator phases — none present in the tree: no signed control plane, no hosted reporting pipeline, no automatic patch/release generator
+- **SHIPPED** — reviewed selector-candidate patch generation — `extension/tools/adapter-repair.ts` enumerates and scores fixture DOM candidates, then verifies them through `planExecution`; `internal/cli/adapter_repair.go` emits the final-path fixture plus applicable adapter-test and guarded `types.ts` diffs without applying them
+- **MEASURED 2026-09-15** — three selector fixes had captures made before their source fix; replay produced 0/3 exact shipped selectors: ACM (`#downloadPdfUrl` versus `a.btn--eReader[href*='/doi/epdf/']`), SAGE (`input[data-id='article-cite-download']` versus `section.format--pdf_epub`), and ScienceDirect open access (`#download-full-issue` versus `.accessbar .ViewPDF > a.accessbar-utility-link[href$='/pdf']`)
+- **OPEN** — Firefox transmission consent; redacted observation reporting; URL-template expansion; release automation; signed remote control plane; contribution intake; staged rollout; broadened Zotero phases — none present in the tree: no signed control plane, no hosted reporting pipeline, and no automatic patch application, changelog, tag, or store release
 
 Trim candidate: Phase-0 material shipped; later phases still live.
 
@@ -81,11 +82,14 @@ Build, in this order of leverage:
    daemon route repairs deploy outside browser stores in **hours**. Generic
    page candidates remain page-side, but their positive attempts are admitted
    only by the daemon-minted provider-drive epoch.
-2. **An automated adapter patch generator** (capture → candidate source change,
-   fixtures, tests, revision bump, changelog, tag) feeding the existing
-   dual-store release flow. Store review is "most extensions within a few
-   days" and clients auto-update within hours, so mechanically generated
-   DOM-level repairs land in **days**, not weeks.
+2. **A reviewed adapter patch generator** now ships the capture-to-candidate
+   part of this decision. It emits the final-path fixture, a fixture-backed
+   test diff, and a selector plus revision diff only when the production
+   classifier verifies a candidate and independent evidence permits the
+   revision bump. It never applies the proposal. Changelog, tag, and
+   dual-store release automation remain open. Store review is "most
+   extensions within a few days", so reviewed DOM repairs can still land in
+   **days**, not weeks.
 3. **A small signed restrictive control plane** — suspend exact packaged
    revisions immediately; positive activation machinery is deferred until the
    registry work it needs is justified by measured rollout risk.

@@ -38,6 +38,12 @@ execution records kept during the initial build.
   in one cached request per day instead of one request per paper, so cost no
   longer grows with your library. The default stays `"acquired"`, so an upgrade
   does not widen anything on its own.
+- **`papio adapter repair` now proposes a patch instead of instructions.** It
+  scores candidate selectors from the captured page by stability, verifies each
+  one against the production classifier, and writes the fixture at its final
+  path plus two review-only patches: the adapter test case and the adapter
+  source change with its revision bump. When no candidate verifies it says so
+  and writes no source patch — never a guessed selector.
 - **arXiv is a discovery backend.** `papio search --source arxiv` and standing
   watches now query arXiv directly with no key and no credit spend, so weekly
   "what is new" watches in CS, ML, physics, and math are not gated on aggregator
