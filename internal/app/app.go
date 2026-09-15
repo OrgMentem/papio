@@ -147,13 +147,16 @@ type Service struct {
 	// ReadyHook, when non-nil with a command, runs the user's on_ready hook
 	// once per ready transition. Nil disables it.
 	ReadyHook *hook.Runner
-	// hookWG tracks launched on_ready hook goroutines so shutdown can drain
+	// hookWG tracks automatic and manual on_ready runs so shutdown can drain
 	// them before the store closes (DrainHooks).
 	hookWG sync.WaitGroup
 	// hookMu protects hookInFlight, which admits at most one automatic or
 	// manual filing run per job.
 	hookMu       sync.Mutex
 	hookInFlight map[string]struct{}
+	hookCtx      context.Context
+	hookCancel   context.CancelFunc
+	hooksClosing bool
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -223,10 +226,12 @@ type UnfiledJob struct {
 
 // New constructs a service and applies safe timing defaults.
 func New(cfg config.Config, jobs *job.Store, artifacts *artifact.Store, budgets *budget.Manager) *Service {
+	hookCtx, hookCancel := context.WithCancel(context.Background())
 	return &Service{
 		Config: cfg, Jobs: jobs, Artifacts: artifacts, Budgets: budgets,
 		RetryDelay: 30 * time.Second, Now: time.Now,
 		IlliadHTTPClient: http.DefaultClient,
+		hookCtx:          hookCtx, hookCancel: hookCancel,
 	}
 }
 
@@ -3909,12 +3914,12 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 	if !s.beginReadyHook(row.ID) {
 		return
 	}
-	eventCtx := context.WithoutCancel(ctx)
+	execCtx := s.readyHookContext()
 	s.hookWG.Add(1)
 	go func() {
 		defer s.hookWG.Done()
 		defer s.endReadyHook(row.ID)
-		_, _ = s.executeReadyHook(eventCtx, row, sha, "ready")
+		_, _ = s.executeReadyHook(execCtx, row, sha, "ready")
 	}()
 }
 
@@ -3934,6 +3939,8 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 	if !s.beginReadyHook(row.ID) {
 		return RefileResult{}, job.ErrConflict
 	}
+	s.hookWG.Add(1)
+	defer s.hookWG.Done()
 	defer s.endReadyHook(row.ID)
 	var latestStatus string
 	err = s.Jobs.S.DB().QueryRowContext(ctx, `
@@ -3948,12 +3955,21 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 	if latestStatus == "ok" {
 		return RefileResult{}, fmt.Errorf("paper is already filed; run `papio jobs unfiled` to list jobs that need filing: %w", job.ErrConflict)
 	}
-	return s.executeReadyHook(ctx, row, row.ArtifactSHA256, "manual")
+	execCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.readyHookContext(), cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+	return s.executeReadyHook(execCtx, row, row.ArtifactSHA256, "manual")
 }
 
 func (s *Service) beginReadyHook(jobID string) bool {
 	s.hookMu.Lock()
 	defer s.hookMu.Unlock()
+	if s.hooksClosing {
+		return false
+	}
 	if s.hookInFlight == nil {
 		s.hookInFlight = make(map[string]struct{})
 	}
@@ -3970,7 +3986,29 @@ func (s *Service) endReadyHook(jobID string) {
 	s.hookMu.Unlock()
 }
 
+func (s *Service) readyHookContext() context.Context {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	if s.hookCtx == nil {
+		s.hookCtx, s.hookCancel = context.WithCancel(context.Background())
+	}
+	return s.hookCtx
+}
+
+// CancelHooks stops active hook commands and prevents new hook runs. Their
+// outcome records remain active through context.WithoutCancel in the executor.
+func (s *Service) CancelHooks() {
+	s.hookMu.Lock()
+	s.hooksClosing = true
+	cancel := s.hookCancel
+	s.hookMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigger string) (RefileResult, error) {
+	eventCtx := context.WithoutCancel(ctx)
 	out := RefileResult{JobID: row.ID, ExitCode: -1}
 	detail := map[string]any{"trigger": trigger}
 	pdfPath, err := s.Artifacts.ArtifactPath(sha)
@@ -3985,7 +4023,7 @@ func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigg
 		detail["exit_code"] = out.ExitCode
 		detail["duration_ms"] = out.DurationMS
 		detail["reason"] = "artifact_path"
-		if recordErr := s.Jobs.RecordEvent(ctx, row.ID, "hook.on_ready", detail); recordErr != nil {
+		if recordErr := s.Jobs.RecordEvent(eventCtx, row.ID, "hook.on_ready", detail); recordErr != nil {
 			return RefileResult{}, recordErr
 		}
 		return out, nil
@@ -4009,13 +4047,15 @@ func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigg
 		out.Status = "ok"
 	case errors.Is(result.Err, context.DeadlineExceeded):
 		out.Status = "timeout"
+	case errors.Is(result.Err, context.Canceled):
+		out.Status = "cancelled"
 	default:
 		out.Status = "failed"
 	}
 	detail["status"] = out.Status
 	detail["exit_code"] = out.ExitCode
 	detail["duration_ms"] = out.DurationMS
-	if err := s.Jobs.RecordEvent(ctx, row.ID, "hook.on_ready", detail); err != nil {
+	if err := s.Jobs.RecordEvent(eventCtx, row.ID, "hook.on_ready", detail); err != nil {
 		return RefileResult{}, err
 	}
 	return out, nil

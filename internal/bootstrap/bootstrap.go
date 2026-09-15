@@ -539,6 +539,14 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	return system, nil
 }
 
+// hookShutdownGraceCap keeps daemon shutdown inside ordinary service-manager
+// deadlines. After this grace period, cancellation leaves five seconds for the
+// hook process tree to stop and its small outcome event to reach SQLite.
+const (
+	hookShutdownGraceCap   = 5 * time.Second
+	hookShutdownCancelWait = 5 * time.Second
+)
+
 // Close releases the process-wide services and database connection.
 func (s *System) Close() error {
 	if s == nil {
@@ -550,11 +558,20 @@ func (s *System) Close() error {
 		previewErr = s.Preview.Shutdown(ctx)
 		cancel()
 	}
+	var hookErr error
 	if s.App != nil {
-		// Launched on_ready hooks record their durable outcome event after the
-		// command exits; give them a bounded window before SQLite goes away so
-		// a normal daemon stop does not lose the audit record.
-		s.App.DrainHooks(5 * time.Second)
+		grace := time.Duration(s.Config.Hooks.TimeoutSeconds) * time.Second
+		if grace <= 0 || grace > hookShutdownGraceCap {
+			grace = hookShutdownGraceCap
+		}
+		drained := s.App.DrainHooks(grace)
+		s.App.CancelHooks()
+		if !drained && !s.App.DrainHooks(hookShutdownCancelWait) {
+			hookErr = errors.New("on_ready hooks did not stop after cancellation; database left open so their outcome records are not lost")
+		}
+	}
+	if hookErr != nil {
+		return errors.Join(previewErr, hookErr)
 	}
 	if s.Store == nil {
 		return previewErr

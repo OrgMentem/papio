@@ -4,7 +4,13 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -15,8 +21,14 @@ import (
 	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/daemon"
+	"papio/internal/fetch"
+	"papio/internal/hook"
 	"papio/internal/job"
+	"papio/internal/pdf"
+	"papio/internal/protocol"
+	"papio/internal/resolver"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
@@ -481,5 +493,113 @@ func TestSerialAutoImporterPacingHonorsCancellation(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("cancelled pace waited %v", elapsed)
+	}
+}
+
+type shutdownHookResolver struct{}
+
+func (shutdownHookResolver) Name() string { return "shutdown-hook" }
+
+func (shutdownHookResolver) Resolve(context.Context, work.Work) ([]resolver.Candidate, error) {
+	return []resolver.Candidate{{
+		Source: "shutdown-hook", URL: "https://example.test/shutdown-hook.pdf",
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen,
+		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true,
+		IdentityConfidence: 1,
+	}}, nil
+}
+
+func TestSystemCloseCancelsHookAndPersistsOutcome(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = storetest.DataDir(t)
+	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
+	cfg.PDF.OCREnabled = false
+	cfg.Zotio.Executable = ""
+	cfg.Zotio.AutoEnrich = false
+	cfg.Hooks.OnReady = "configured"
+	cfg.Hooks.TimeoutSeconds = 5
+	system, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	system.App.Config.Sources["shutdown-hook"] = config.Source{Enabled: true}
+	system.App.Resolvers = []app.ResolverEntry{{
+		Adapter: shutdownHookResolver{},
+		Policy:  config.Source{Enabled: true},
+	}}
+	system.App.Fetch = func(_ context.Context, _ resolver.Candidate, path string) (fetch.Result, error) {
+		body := append([]byte("%PDF-1.4\nshutdown\n"), make([]byte, pdf.MinimumPayloadBytes+100)...)
+		body = append(body, []byte("\n%%EOF")...)
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			return fetch.Result{}, err
+		}
+		sum := sha256.Sum256(body)
+		return fetch.Result{
+			TempPath: path, SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(body)),
+			SniffedMIME: "application/pdf", ContentType: "application/pdf", HTTPStatus: 200,
+			FinalHost: "example.test",
+		}, nil
+	}
+	system.App.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Chars: 1000},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
+		}, nil
+	}
+	started := make(chan struct{})
+	system.App.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(ctx context.Context, _ string, _ []string) hook.Result {
+			close(started)
+			<-ctx.Done()
+			return hook.Result{Ran: true, ExitCode: -1, Err: ctx.Err()}
+		},
+	}
+	jobID, err := system.App.Submit(ctx, protocol.WorkRequest{
+		SchemaVersion:  protocol.WorkRequestSchemaVersion,
+		RequestID:      "wr_system_close_hook",
+		Identifiers:    &protocol.Identifiers{DOI: "10.1000/system-close-hook"},
+		DesiredVersion: "any",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := system.Jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := system.App.Process(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := system.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Store.DB().PingContext(ctx); err == nil {
+		t.Fatal("system store remained open after Close")
+	}
+
+	reopened, err := sql.Open("sqlite", "file:"+filepath.Join(cfg.DataDir, "papio.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	var raw string
+	if err := reopened.QueryRowContext(ctx, `
+		SELECT detail_json FROM events
+		WHERE job_id = ? AND kind = 'hook.on_ready'
+		ORDER BY seq DESC LIMIT 1`, jobID).Scan(&raw); err != nil {
+		t.Fatalf("read persisted hook outcome after Close: %v", err)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(raw), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["status"] != "cancelled" || detail["trigger"] != "ready" {
+		t.Fatalf("persisted hook outcome = %#v", detail)
 	}
 }

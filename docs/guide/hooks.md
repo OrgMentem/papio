@@ -106,8 +106,9 @@ papio jobs refile <job-id>
 ```
 
 The command runs the same hook with the same `PAPIO_*` environment. It waits
-for that bounded run and records a manual event. *papio* never retries it
-automatically.
+for that bounded run and records a manual event. It refuses a job whose newest
+filing succeeded, and it refuses a second run while one is active. *papio*
+never retries a filing automatically.
 
 ## De-duplicating against a non-Zotero library
 

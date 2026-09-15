@@ -3037,6 +3037,104 @@ func TestRefileJobRejectsConcurrentRun(t *testing.T) {
 	}
 }
 
+func TestDrainHooksCancellationRecordsOutcome(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id := createFilingStateJob(t, jobs, "wr_hook_shutdown", job.StateReady)
+	const sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET artifact_sha256 = ? WHERE id = ?`, sha, id); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(ctx context.Context, _ string, _ []string) hook.Result {
+			close(started)
+			<-ctx.Done()
+			return hook.Result{Ran: true, ExitCode: -1, Err: ctx.Err()}
+		},
+	}
+	svc.runReadyHook(ctx, row, sha)
+	<-started
+	if svc.DrainHooks(10 * time.Millisecond) {
+		t.Fatal("blocked hook drained before cancellation")
+	}
+	svc.CancelHooks()
+	if !svc.DrainHooks(time.Second) {
+		t.Fatal("cancelled hook did not record its outcome and drain")
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filings := 0
+	for _, event := range events {
+		if event["kind"] != "hook.on_ready" {
+			continue
+		}
+		filings++
+		detail := event["detail"].(map[string]any)
+		if detail["status"] != "cancelled" || detail["trigger"] != "ready" {
+			t.Fatalf("cancelled filing event = %#v", detail)
+		}
+	}
+	if filings != 1 {
+		t.Fatalf("filing events = %d, want 1", filings)
+	}
+}
+
+func TestDrainHooksCancelsManualRefileAndRecordsOutcome(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id := createFilingStateJob(t, jobs, "wr_manual_hook_shutdown", job.StateReady)
+	const sha = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET artifact_sha256 = ? WHERE id = ?`, sha, id); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(ctx context.Context, _ string, _ []string) hook.Result {
+			close(started)
+			<-ctx.Done()
+			return hook.Result{Ran: true, ExitCode: -1, Err: ctx.Err()}
+		},
+	}
+	type outcome struct {
+		result RefileResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := svc.RefileJob(ctx, id)
+		done <- outcome{result: result, err: err}
+	}()
+	<-started
+	if svc.DrainHooks(10 * time.Millisecond) {
+		t.Fatal("manual hook drained before cancellation")
+	}
+	svc.CancelHooks()
+	if !svc.DrainHooks(time.Second) {
+		t.Fatal("cancelled manual hook did not record its outcome and drain")
+	}
+	got := <-done
+	if got.err != nil || got.result.Status != "cancelled" {
+		t.Fatalf("cancelled refile result = %+v, %v", got.result, got.err)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail := events[len(events)-1]["detail"].(map[string]any)
+	if detail["status"] != "cancelled" || detail["trigger"] != "manual" {
+		t.Fatalf("cancelled manual filing event = %#v", detail)
+	}
+}
+
 // retryWaitDetail returns the detail of the job's most recent transition
 // into retry_wait, so tests can inspect what a park actually reported.
 func retryWaitDetail(t *testing.T, jobs *job.Store, id string) map[string]any {
