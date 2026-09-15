@@ -299,9 +299,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	}
 	var desktop notify.Sender
 	if cfg.Notify.Enabled {
-		if available, _ := notify.PlatformCapability(); available {
-			desktop = notify.NewMacOS()
-		}
+		desktop, _ = notify.NewPlatformSender()
 	}
 	var webhook notify.Sender
 	if cfg.Notify.WebhookURL != "" {

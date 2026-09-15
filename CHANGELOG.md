@@ -11,6 +11,12 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Desktop notifications on Linux and Windows.** *papio* pinged only through
+  macOS `osascript`; Linux and Windows builds had no desktop leg at all, so a
+  paper waiting on a sign-in pass went unnoticed until you looked. Linux now
+  uses `notify-send` (or `gdbus` when that is absent) and Windows a built-in
+  PowerShell toast, chosen by probe at startup so `papio doctor` and the
+  notification ledger report the real mechanism.
 - **Losing the tab *papio* opened for you is no longer silent.** When you close
   the tab *papio* used to reach a paper through your institution while it is
   still driving that tab, it releases the route and the paper waits for another

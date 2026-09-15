@@ -646,6 +646,21 @@ deliberate: the extension cannot mint a route itself, because an offer that
 opened a tab by itself is what *papio* must never do for a paper it asked a human
 to fetch.
 
+## Addendum (2026-09-15): Linux and Windows desktop senders
+
+The desktop transport now has per-platform implementations behind the same
+`Sender` seam. macOS uses `osascript`, Linux prefers `notify-send` and falls
+back to `gdbus`, and Windows uses the built-in WinRT API through PowerShell.
+
+Selection probes the required executable before it installs a sender. A missing
+mechanism therefore remains `platform_unavailable`, and the ledger never
+records a send attempt that the host could not make.
+
+Each sender keeps untrusted text inside its platform's data boundary.
+AppleScript escapes backslashes, quotes, and line endings; Linux passes the
+message as its own guarded argument; PowerShell removes control characters and
+doubles single quotes inside one single-quoted literal.
+
 ## Consequences
 
 Positive:
