@@ -208,8 +208,12 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	if err != nil {
 		// A local client that sends a malformed or partial frame is otherwise
 		// invisible: the connection just closes. Log it so a broken CLI, a
-		// stale native host, or a half-open probe can be diagnosed.
-		if !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) {
+		// stale native host, or a half-open probe can be diagnosed. A peer that
+		// closed without sending anything is not one of those: it is the
+		// autostart liveness probe (daemon.probeSocket) or a client that gave
+		// up before writing, and every CLI invocation produces one. Logging it
+		// buried real decode failures under thousands of identical lines.
+		if !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrEmptyMessage) {
 			log.Printf("ipc: decode request: %v", err)
 		}
 		return

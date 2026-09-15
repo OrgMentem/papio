@@ -46,6 +46,12 @@ var (
 	ErrTrailingJSON = errors.New("ipc message has trailing JSON")
 	// ErrInvalidRequest indicates a malformed, unsupported, or unsafe request.
 	ErrInvalidRequest = errors.New("invalid ipc request")
+	// ErrEmptyMessage indicates a peer that closed the connection without
+	// sending a single byte. On the server side that is a liveness probe
+	// (daemon.probeSocket dials and closes), not a broken client, so it wraps
+	// ErrInvalidRequest for callers that only care about "no request came" and
+	// is distinguishable for the one caller that decides whether to log.
+	ErrEmptyMessage = fmt.Errorf("%w: peer closed without sending a message", ErrInvalidRequest)
 )
 
 // Request is one local RPC invocation. Params must be a JSON object (or null);
@@ -194,6 +200,9 @@ func decodeStrict(r io.Reader, max int, dst any) error {
 	}
 	if len(raw) > max {
 		return ErrTooLarge
+	}
+	if len(raw) == 0 {
+		return ErrEmptyMessage
 	}
 	if err := rejectDuplicateKeys(raw); err != nil {
 		if errors.Is(err, ErrTrailingJSON) {

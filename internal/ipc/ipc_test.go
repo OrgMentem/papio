@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -615,4 +616,77 @@ func TestServeConnReadDeadlineReapsStalledClient(t *testing.T) {
 	if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
 		t.Fatalf("read error = %v, want server-side close (EOF or reset)", err)
 	}
+}
+
+// TestServerLogsPartialFramesButNotEmptyProbes pins the one distinction the
+// decode-failure log makes. A peer that dials and closes without a byte is the
+// autostart liveness probe (daemon.probeSocket), issued by every CLI invocation;
+// logging it buried real decode failures under thousands of identical lines. A
+// peer that sends a partial frame is a broken client and must still be logged.
+func TestServerLogsPartialFramesButNotEmptyProbes(t *testing.T) {
+	logs := &syncBuffer{}
+	prev := log.Writer()
+	log.SetOutput(logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	socket, _ := startTestServer(t, HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
+		return json.RawMessage(`{}`), nil
+	}))
+	dial := func() net.Conn {
+		t.Helper()
+		conn, err := net.DialTimeout("unix", socket, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return conn
+	}
+	// Wait until the server has observed the close: it answers a real request
+	// on a later connection, and serveConn goroutines run in accept order.
+	settle := func() {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := NewSocketClient(socket).CallRaw(ctx, "probe_01", "jobs.get", json.RawMessage(`{}`)); err != nil {
+			t.Fatalf("settling call: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := dial().Close(); err != nil {
+		t.Fatal(err)
+	}
+	settle()
+	if got := logs.String(); strings.Contains(got, "decode request") {
+		t.Fatalf("an empty dial-and-close was logged as a decode failure:\n%s", got)
+	}
+
+	partial := dial()
+	if _, err := partial.Write([]byte(`{"protocol":`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := partial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	settle()
+	if got := logs.String(); !strings.Contains(got, "ipc: decode request: invalid ipc request") {
+		t.Fatalf("a partial frame was not logged as a decode failure:\n%s", got)
+	}
+}
+
+// syncBuffer is a log sink the server goroutines write while the test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
