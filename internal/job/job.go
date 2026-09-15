@@ -457,7 +457,7 @@ type CreateResult struct {
 // one transaction. Resubmitting the same requestID returns its existing live
 // job; terminal attempts permit a new job.
 func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal) (string, error) {
-	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, Attribution{Principal: principal}, false, false)
+	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, Attribution{Principal: principal}, false, false, "", 0)
 	if err != nil {
 		return "", err
 	}
@@ -475,10 +475,17 @@ func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Wor
 // this acquisition, and rewriting the row would hand one consumer another's
 // work.
 func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force bool) (CreateResult, error) {
-	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, force, true)
+	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, force, true, "", 0)
 }
 
-func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force, deduplicateWork bool) (CreateResult, error) {
+// CreateRecheckRequestForWork creates a replacement job and records the old
+// unavailable job's re-check event in the same transaction. The event is the
+// durable idempotency key, so neither write can survive without the other.
+func (js *Store) CreateRecheckRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, recheckOf string, windowDays int) (CreateResult, error) {
+	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, false, true, recheckOf, windowDays)
+}
+
+func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force, deduplicateWork bool, recheckOf string, recheckWindowDays int) (CreateResult, error) {
 	if who.Principal == "" {
 		who.Principal = PrincipalUnknown
 	}
@@ -492,6 +499,26 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		return CreateResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	if recheckOf != "" {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, recheckOf).Scan(&state); err != nil {
+			return CreateResult{}, err
+		}
+		if state != StateUnavailable {
+			return CreateResult{}, ErrConflict
+		}
+		var already bool
+		if err := tx.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM events WHERE job_id = ? AND kind = 'unavailable.recheck'
+			)`, recheckOf).Scan(&already); err != nil {
+			return CreateResult{}, err
+		}
+		if already {
+			return CreateResult{Existing: true}, nil
+		}
+	}
 
 	if !force {
 		existing, err := liveJobForRequest(ctx, tx, requestID)
@@ -566,6 +593,13 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'job.created', ?)`,
 		jobID, now, fmt.Sprintf(`{"request_id":%q,"work":%q}`, requestID, w.Describe())); err != nil {
 		return CreateResult{}, err
+	}
+	if recheckOf != "" {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, 'unavailable.recheck', ?)`,
+			recheckOf, now, fmt.Sprintf(`{"new_job_id":%q,"window_days":%d}`, jobID, recheckWindowDays)); err != nil {
+			return CreateResult{}, err
+		}
 	}
 	if force && deduplicateWork {
 		// A force submission is the operator withdrawing a verdict this work

@@ -160,6 +160,10 @@ type Service struct {
 type SubmitOptions struct {
 	AutoImport *bool
 	Force      bool
+	// RecheckOf marks daemon maintenance that replaces one unavailable job.
+	// The job store records its event atomically with the new queued job.
+	RecheckOf         string
+	RecheckWindowDays int
 	// Consumer names the caller for its own accounting. Empty records no
 	// attribution rather than a placeholder one, and a submission that matches
 	// an in-flight job does not overwrite the attribution that job was queued
@@ -305,8 +309,17 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	created, err := s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
-		job.Attribution{Principal: principal, Consumer: consumer}, options.Force)
+	var created job.CreateResult
+	if options.RecheckOf != "" {
+		if options.RecheckWindowDays <= 0 {
+			return SubmitResult{}, errors.New("unavailable recheck window must be positive")
+		}
+		created, err = s.Jobs.CreateRecheckRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
+			job.Attribution{Principal: principal, Consumer: consumer}, options.RecheckOf, options.RecheckWindowDays)
+	} else {
+		created, err = s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
+			job.Attribution{Principal: principal, Consumer: consumer}, options.Force)
+	}
 	if err != nil {
 		return SubmitResult{}, err
 	}

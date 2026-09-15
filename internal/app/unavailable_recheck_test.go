@@ -212,6 +212,67 @@ func TestUnavailableRecheck(t *testing.T) {
 		}
 	})
 
+	t.Run("marker and replacement commit together", func(t *testing.T) {
+		svc, jobs := newService(t)
+		wr := request("wr_recheck_atomic_001", "10.1000/recheck-atomic-001")
+		oldID := seedUnavailable(t, svc, jobs, wr, job.TerminalReasonNoEntitlement, now.AddDate(0, 0, -windowDays-1))
+		if _, err := jobs.S.DB().ExecContext(context.Background(), `
+			CREATE TRIGGER fail_unavailable_recheck_event
+			BEFORE INSERT ON events
+			WHEN NEW.kind = 'unavailable.recheck'
+			BEGIN
+				SELECT RAISE(FAIL, 'injected recheck event failure');
+			END`); err != nil {
+			t.Fatal(err)
+		}
+		runner := svc.UnavailableRechecker()
+		if err := runner.RunDue(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := jobs.List(context.Background(), "", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || len(recheckEvents(t, jobs, oldID)) != 0 {
+			t.Fatalf("failed atomic write left jobs=%d events=%d, want 1 and 0", len(rows), len(recheckEvents(t, jobs, oldID)))
+		}
+		if _, err := jobs.S.DB().ExecContext(context.Background(), `DROP TRIGGER fail_unavailable_recheck_event`); err != nil {
+			t.Fatal(err)
+		}
+		if err := runner.RunDue(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		rows, err = jobs.List(context.Background(), "", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 || len(recheckEvents(t, jobs, oldID)) != 1 {
+			t.Fatalf("successful atomic write left jobs=%d events=%d, want 2 and 1", len(rows), len(recheckEvents(t, jobs, oldID)))
+		}
+		var freshID string
+		for _, row := range rows {
+			if row.ID != oldID {
+				freshID = row.ID
+			}
+		}
+		if err := jobs.Transition(context.Background(), freshID, job.StateQueued, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Transition(context.Background(), freshID, job.StateResolving, job.StateFailed, nil, job.WithTerminalReason(job.TerminalReasonUnknown)); err != nil {
+			t.Fatal(err)
+		}
+		if err := runner.RunDue(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		rows, err = jobs.List(context.Background(), "", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("second pass after replacement failed created %d jobs, want 2", len(rows))
+		}
+	})
+
 	t.Run("batch is bounded and oldest first", func(t *testing.T) {
 		svc, jobs := newService(t)
 		oldest := make([]string, 0, unavailableRecheckScanLimit)

@@ -4,7 +4,6 @@ package app
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -99,19 +98,11 @@ func (r *UnavailableRecheck) runDue(ctx context.Context) error {
 
 		request := unavailableWorkRequest(row)
 		autoImport := row.Policy.AutoImport
-		result, err := r.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, request, SubmitOptions{
-			AutoImport: &autoImport,
+		_, _ = r.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, request, SubmitOptions{
+			AutoImport:        &autoImport,
+			RecheckOf:         row.ID,
+			RecheckWindowDays: days,
 		})
-		if err != nil || result.Existing || result.JobID == row.ID {
-			continue
-		}
-		newID := result.JobID
-		if err := r.svc.Jobs.RecordEvent(ctx, row.ID, "unavailable.recheck", map[string]any{
-			"new_job_id":  newID,
-			"window_days": days,
-		}); err != nil {
-			return fmt.Errorf("record unavailable recheck for %s: %w", row.ID, err)
-		}
 	}
 	return nil
 }
