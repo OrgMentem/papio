@@ -180,6 +180,39 @@ type SubmitResult struct {
 	Existing bool
 }
 
+// ErrReadyHookNotConfigured means manual filing has no configured command.
+var ErrReadyHookNotConfigured = errors.New("[hooks] on_ready is not configured")
+
+// UnfiledFilter selects which incomplete filing outcomes to return.
+type UnfiledFilter string
+
+const (
+	UnfiledFailed  UnfiledFilter = "failed"
+	UnfiledMissing UnfiledFilter = "missing"
+	UnfiledAll     UnfiledFilter = "all"
+)
+
+// RefileResult is one synchronous manual on_ready hook outcome.
+type RefileResult struct {
+	JobID      string `json:"job_id"`
+	Status     string `json:"status"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+// UnfiledJob projects the newest on_ready event for one ready or imported job.
+type UnfiledJob struct {
+	JobID         string `json:"job_id"`
+	State         string `json:"state"`
+	Title         string `json:"title"`
+	DOI           string `json:"doi,omitempty"`
+	Filing        string `json:"filing"`
+	LastStatus    string `json:"last_status,omitempty"`
+	LastExitCode  int    `json:"last_exit_code"`
+	LastAttemptAt string `json:"last_attempt_at,omitempty"`
+	Attempts      int    `json:"attempts"`
+}
+
 // New constructs a service and applies safe timing defaults.
 func New(cfg config.Config, jobs *job.Store, artifacts *artifact.Store, budgets *budget.Manager) *Service {
 	return &Service{
@@ -3850,12 +3883,39 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 // or fails acquisition. Import retries never re-fire it. Raw hook stderr is
 // deliberately NEVER persisted: the hook inherits the daemon environment, so
 // its output can carry credentials, and durable events must stay
-// secret-free. The durable audit trail is status, exit code, and duration.
+// secret-free. The durable audit trail is status, exit code, duration, and
+// whether the ready transition or an operator triggered the run.
 func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return
 	}
 	eventCtx := context.WithoutCancel(ctx)
+	s.hookWG.Add(1)
+	go func() {
+		defer s.hookWG.Done()
+		_, _ = s.executeReadyHook(eventCtx, row, sha, "ready")
+	}()
+}
+
+// RefileJob synchronously reruns the configured on_ready hook for a settled
+// acquisition. It changes no job state and records the manual attempt.
+func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, error) {
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return RefileResult{}, err
+	}
+	if row.State != job.StateReady && row.State != job.StateImported {
+		return RefileResult{}, job.ErrConflict
+	}
+	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
+		return RefileResult{}, ErrReadyHookNotConfigured
+	}
+	return s.executeReadyHook(ctx, row, row.ArtifactSHA256, "manual")
+}
+
+func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigger string) (RefileResult, error) {
+	out := RefileResult{JobID: row.ID, ExitCode: -1}
+	detail := map[string]any{"trigger": trigger}
 	pdfPath, err := s.Artifacts.ArtifactPath(sha)
 	if err == nil && !filepath.IsAbs(pdfPath) {
 		// The env contract promises an absolute path; a relative data_dir
@@ -3863,9 +3923,15 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 		pdfPath, err = filepath.Abs(pdfPath)
 	}
 	if err != nil {
-		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "hook.on_ready",
-			map[string]any{"status": "error", "reason": "artifact_path"})
-		return
+		out.Status = "failed"
+		detail["status"] = out.Status
+		detail["exit_code"] = out.ExitCode
+		detail["duration_ms"] = out.DurationMS
+		detail["reason"] = "artifact_path"
+		if recordErr := s.Jobs.RecordEvent(ctx, row.ID, "hook.on_ready", detail); recordErr != nil {
+			return RefileResult{}, recordErr
+		}
+		return out, nil
 	}
 	env := map[string]string{
 		"PAPIO_JOB_ID":     row.ID,
@@ -3878,22 +3944,93 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 		"PAPIO_PDF":        pdfPath,
 		"PAPIO_STATE":      "ready",
 	}
-	jobID := row.ID
-	s.hookWG.Add(1)
-	go func() {
-		defer s.hookWG.Done()
-		result := s.ReadyHook.Run(eventCtx, env)
-		detail := map[string]any{
-			"exit_code":   result.ExitCode,
-			"duration_ms": result.Duration.Milliseconds(),
+	result := s.ReadyHook.Run(ctx, env)
+	out.ExitCode = result.ExitCode
+	out.DurationMS = result.Duration.Milliseconds()
+	switch {
+	case result.Err == nil && result.ExitCode == 0:
+		out.Status = "ok"
+	case errors.Is(result.Err, context.DeadlineExceeded):
+		out.Status = "timeout"
+	default:
+		out.Status = "failed"
+	}
+	detail["status"] = out.Status
+	detail["exit_code"] = out.ExitCode
+	detail["duration_ms"] = out.DurationMS
+	if err := s.Jobs.RecordEvent(ctx, row.ID, "hook.on_ready", detail); err != nil {
+		return RefileResult{}, err
+	}
+	return out, nil
+}
+
+// UnfiledJobs returns ready and imported jobs whose newest on_ready attempt is
+// absent or unsuccessful. The window query derives the newest event and attempt
+// count in SQLite, so the read stays bounded by limit plus its truncation probe.
+func (s *Service) UnfiledJobs(ctx context.Context, filter UnfiledFilter, limit int) ([]UnfiledJob, bool, error) {
+	if filter == "" {
+		filter = UnfiledAll
+	}
+	switch filter {
+	case UnfiledFailed, UnfiledMissing, UnfiledAll:
+	default:
+		return nil, false, fmt.Errorf("filter must be failed, missing, or all")
+	}
+	effective := job.EffectiveListLimit(limit)
+	rows, err := s.Jobs.S.DB().QueryContext(ctx, `
+		WITH hook_events AS (
+			SELECT job_id, at, detail_json,
+			       ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY seq DESC) AS newest,
+			       COUNT(*) OVER (PARTITION BY job_id) AS attempts
+			FROM events
+			WHERE kind = 'hook.on_ready'
+		)
+		SELECT j.id, j.state, COALESCE(w.title, ''), COALESCE(doi.value, ''),
+		       CASE WHEN h.job_id IS NULL THEN 'missing' ELSE 'failed' END,
+		       COALESCE(json_extract(h.detail_json, '$.status'), ''),
+		       COALESCE(CAST(json_extract(h.detail_json, '$.exit_code') AS INTEGER), 0),
+		       COALESCE(h.at, ''), COALESCE(h.attempts, 0)
+		FROM jobs j
+		JOIN work_requests w ON w.id = j.work_request_id
+		LEFT JOIN identifiers doi
+		  ON doi.work_request_id = j.work_request_id AND doi.kind = 'doi'
+		LEFT JOIN hook_events h ON h.job_id = j.id AND h.newest = 1
+		WHERE j.state IN ('ready', 'imported')
+		  AND (h.job_id IS NULL OR COALESCE(json_extract(h.detail_json, '$.status'), '') <> 'ok')
+		  AND (? = 'all'
+		       OR (? = 'missing' AND h.job_id IS NULL)
+		       OR (? = 'failed' AND h.job_id IS NOT NULL))
+		ORDER BY j.created_at DESC, j.id DESC
+		LIMIT ?`, filter, filter, filter, effective+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]UnfiledJob, 0, effective)
+	for rows.Next() {
+		var item UnfiledJob
+		if err := rows.Scan(&item.JobID, &item.State, &item.Title, &item.DOI,
+			&item.Filing, &item.LastStatus, &item.LastExitCode, &item.LastAttemptAt,
+			&item.Attempts); err != nil {
+			return nil, false, err
 		}
-		if result.Err == nil && result.ExitCode == 0 {
-			detail["status"] = "ok"
-		} else {
-			detail["status"] = "error"
+		if item.LastAttemptAt != "" {
+			at, err := time.Parse(time.RFC3339Nano, item.LastAttemptAt)
+			if err != nil {
+				return nil, false, fmt.Errorf("parsing filing attempt time for job %s: %w", item.JobID, err)
+			}
+			item.LastAttemptAt = at.UTC().Format(time.RFC3339)
 		}
-		_ = s.Jobs.RecordEvent(eventCtx, jobID, "hook.on_ready", detail)
-	}()
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	truncated := len(out) > effective
+	if truncated {
+		out = out[:effective]
+	}
+	return out, truncated, nil
 }
 
 // DrainHooks waits up to timeout for launched on_ready hooks to finish and

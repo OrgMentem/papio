@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2584,6 +2585,97 @@ func waitForHookEvent(t *testing.T, jobs *job.Store, id string) map[string]any {
 	}
 }
 
+func createFilingStateJob(t *testing.T, jobs *job.Store, requestID, state string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := jobs.CreateRequest(ctx, requestID, work.Work{
+		Title: "Filing " + requestID,
+		DOI:   "10.1000/" + requestID,
+	}, "", "", job.Policy{
+		AccessMode:     config.ModeConservative,
+		DesiredVersion: "any",
+		FetchMaxBytes:  1 << 20,
+	}, nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == job.StateQueued {
+		return id
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if state == job.StateResolving {
+		return id
+	}
+	if err := jobs.Transition(ctx, id, job.StateResolving, job.StateReady, nil); err != nil {
+		t.Fatal(err)
+	}
+	if state == job.StateImported {
+		if err := jobs.Transition(ctx, id, job.StateReady, job.StateImported, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return id
+}
+
+func TestUnfiledJobs(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	failedID := createFilingStateJob(t, jobs, "wr_unfiled_failed", job.StateReady)
+	missingID := createFilingStateJob(t, jobs, "wr_unfiled_missing", job.StateImported)
+	recoveredID := createFilingStateJob(t, jobs, "wr_unfiled_recovered", job.StateReady)
+	if err := jobs.RecordEvent(ctx, failedID, "hook.on_ready", map[string]any{
+		"status": "failed", "exit_code": 1, "duration_ms": 9, "trigger": "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, recoveredID, "hook.on_ready", map[string]any{
+		"status": "failed", "exit_code": 1, "duration_ms": 4, "trigger": "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, recoveredID, "hook.on_ready", map[string]any{
+		"status": "ok", "exit_code": 0, "duration_ms": 5, "trigger": "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, truncated, err := svc.UnfiledJobs(ctx, UnfiledAll, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated || len(rows) != 2 {
+		t.Fatalf("unfiled page = %+v, truncated=%v, want failed and missing only", rows, truncated)
+	}
+	byID := make(map[string]UnfiledJob, len(rows))
+	for _, row := range rows {
+		byID[row.JobID] = row
+	}
+	failed := byID[failedID]
+	if failed.Filing != "failed" || failed.LastStatus != "failed" || failed.LastExitCode != 1 ||
+		failed.Attempts != 1 || failed.LastAttemptAt == "" || failed.DOI != "10.1000/wr_unfiled_failed" {
+		t.Fatalf("failed filing = %+v", failed)
+	}
+	missing := byID[missingID]
+	if missing.Filing != "missing" || missing.LastStatus != "" || missing.Attempts != 0 ||
+		missing.LastAttemptAt != "" || missing.State != job.StateImported {
+		t.Fatalf("missing filing = %+v", missing)
+	}
+	if _, listed := byID[recoveredID]; listed {
+		t.Fatalf("job with newest successful filing was listed: %+v", byID[recoveredID])
+	}
+
+	failedOnly, _, err := svc.UnfiledJobs(ctx, UnfiledFailed, 10)
+	if err != nil || len(failedOnly) != 1 || failedOnly[0].JobID != failedID {
+		t.Fatalf("failed filter = %+v, %v", failedOnly, err)
+	}
+	missingOnly, _, err := svc.UnfiledJobs(ctx, UnfiledMissing, 10)
+	if err != nil || len(missingOnly) != 1 || missingOnly[0].JobID != missingID {
+		t.Fatalf("missing filter = %+v, %v", missingOnly, err)
+	}
+}
+
 func TestProcessReadyFiresOnReadyHookOnce(t *testing.T) {
 	svc, jobs := newTestService(t)
 	readyPipeline(svc)
@@ -2700,8 +2792,8 @@ func TestOnReadyHookFailureLeavesJobReady(t *testing.T) {
 		t.Fatalf("hook failure must be non-fatal: %v", err)
 	}
 	detail := waitForHookEvent(t, jobs, id)
-	if detail["status"] != "error" {
-		t.Fatalf("hook failure detail = %#v", detail)
+	if detail["status"] != "failed" || detail["trigger"] != "ready" {
+		t.Fatalf("hook failure detail = %#v, want failed automatic filing", detail)
 	}
 	if _, leaked := detail["stderr_tail"]; leaked {
 		t.Fatalf("raw hook stderr persisted to a durable event: %#v", detail)
@@ -2712,6 +2804,91 @@ func TestOnReadyHookFailureLeavesJobReady(t *testing.T) {
 	}
 	if ready.State != job.StateReady {
 		t.Fatalf("job state = %s, want ready despite hook failure", ready.State)
+	}
+}
+
+func TestRefileJob(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	readyPipeline(svc)
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, _ []string) hook.Result {
+			return hook.Result{Ran: true, ExitCode: 1, Duration: 7 * time.Millisecond}
+		},
+	}
+	id, err := svc.Submit(ctx, doiRequest("wr_refile_job"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	first := waitForHookEvent(t, jobs, id)
+	if first["status"] != "failed" || first["trigger"] != "ready" {
+		t.Fatalf("automatic filing event = %#v", first)
+	}
+
+	svc.ReadyHook.Exec = func(_ context.Context, _ string, env []string) hook.Result {
+		foundState := false
+		for _, pair := range env {
+			if pair == "PAPIO_STATE=ready" {
+				foundState = true
+			}
+		}
+		if !foundState {
+			t.Fatalf("manual hook did not receive the ready environment: %v", env)
+		}
+		return hook.Result{Ran: true, ExitCode: 0, Duration: 12 * time.Millisecond}
+	}
+	result, err := svc.RefileJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.JobID != id || result.Status != "ok" || result.ExitCode != 0 || result.DurationMS != 12 {
+		t.Fatalf("refile result = %+v", result)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filings []map[string]any
+	for _, event := range events {
+		if event["kind"] == "hook.on_ready" {
+			filings = append(filings, event["detail"].(map[string]any))
+		}
+	}
+	if len(filings) != 2 || filings[1]["trigger"] != "manual" || filings[1]["status"] != "ok" {
+		t.Fatalf("filing events = %#v", filings)
+	}
+	importedID := createFilingStateJob(t, jobs, "wr_refile_imported", job.StateImported)
+	readyRow, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET artifact_sha256 = ? WHERE id = ?`, readyRow.ArtifactSHA256, importedID); err != nil {
+		t.Fatal(err)
+	}
+	importedResult, err := svc.RefileJob(ctx, importedID)
+	if err != nil || importedResult.Status != "ok" {
+		t.Fatalf("imported refile result = %+v, %v", importedResult, err)
+	}
+
+	unconfigured, unconfiguredJobs := newTestService(t)
+	readyID := createFilingStateJob(t, unconfiguredJobs, "wr_refile_unconfigured", job.StateReady)
+	if _, err := unconfigured.RefileJob(ctx, readyID); !errors.Is(err, ErrReadyHookNotConfigured) {
+		t.Fatalf("unconfigured refile error = %v", err)
+	}
+	if _, err := unconfigured.RefileJob(ctx, "job_missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing refile error = %v", err)
+	}
+	resolvingID := createFilingStateJob(t, jobs, "wr_refile_resolving", job.StateResolving)
+	if _, err := svc.RefileJob(ctx, resolvingID); !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("resolving refile error = %v", err)
 	}
 }
 

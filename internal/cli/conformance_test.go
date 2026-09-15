@@ -118,6 +118,8 @@ var commandClassification = map[string]commandClass{
 	"papio activity":                   {kind: kindEnvelope, rowKey: "entries", rpcMethods: []string{"activity.list"}},
 	"papio failures":                   {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"failures.list_v1"}},
 	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v3", "jobs.list_v2", "jobs.list"}},
+	"papio jobs unfiled":               {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.unfiled"}},
+	"papio jobs refile":                {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"jobs.refile"}},
 	"papio jobs get":                   {kind: kindStructured, rpcMethods: []string{"jobs.get_v3", "jobs.get_v2", "jobs.get"}},
 	"papio jobs show":                  {kind: kindStructured, rpcMethods: []string{"jobs.get_v3", "jobs.get_v2", "jobs.get"}},
 	"papio jobs diagnose":              {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"jobs.diagnose_v2", "jobs.diagnose_v1"}},

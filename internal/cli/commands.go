@@ -518,6 +518,68 @@ func newJobsCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "Retrying %s", args[0])
 		},
 	}
+	var filingFilter string
+	var filingLimit int
+	unfiled := &cobra.Command{
+		Use:         "unfiled",
+		Short:       "List ready jobs whose on-ready filing is missing or failed",
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		Args:        cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			effective := effectiveLimit(filingLimit, job.ListLimitMax, job.ListLimitDefault)
+			var page api.UnfiledPage
+			if err := opt.call(cmd.Context(), "jobs.unfiled", map[string]any{
+				"filter": filingFilter,
+				"limit":  effective,
+			}, &page); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("jobs.unfiled")
+				}
+				return err
+			}
+			if opt.jsonOutput {
+				return printPage(opt, "jobs", page.Jobs, page.Truncated)
+			}
+			if _, err := fmt.Fprintln(opt.out, "job\tstate\tfiling\tlast status\tattempts\ttitle"); err != nil {
+				return err
+			}
+			for _, row := range page.Jobs {
+				lastStatus := row.LastStatus
+				if lastStatus == "" {
+					lastStatus = "-"
+				}
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\t%s\t%d\t%s\n",
+					row.JobID, row.State, row.Filing, lastStatus, row.Attempts,
+					store.StripTerminalControls(row.Title)); err != nil {
+					return err
+				}
+			}
+			return truncationNotice(opt, page.Truncated, len(page.Jobs), "job(s)")
+		},
+	}
+	unfiled.Flags().StringVar(&filingFilter, "filter", "all", "filing filter: failed, missing, or all")
+	unfiled.Flags().IntVar(&filingLimit, "limit", job.ListLimitDefault, "maximum rows (1-500)")
+
+	refile := &cobra.Command{
+		Use:   "refile <job-id>",
+		Short: "Run the configured on-ready filing hook again",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var result app.RefileResult
+			if err := opt.call(cmd.Context(), "jobs.refile", map[string]string{"job_id": args[0]}, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("jobs.refile")
+				}
+				return fmt.Errorf("refile failed: %w", err)
+			}
+			if result.Status != "ok" {
+				return opt.printResult(result, "refile failed: %s: %s (exit %d, %dms)",
+					result.JobID, result.Status, result.ExitCode, result.DurationMS)
+			}
+			return opt.printResult(result, "filed %s: ok (exit %d, %dms)",
+				result.JobID, result.ExitCode, result.DurationMS)
+		},
+	}
 	var failuresSince string
 	var failuresLimit int
 	failures := &cobra.Command{
@@ -617,7 +679,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 
 	diagnose := newJobsDiagnoseCommand(opt)
 
-	command.AddCommand(list, get, show, diagnose, cancel, retry, failures, incidents, receiptCommand, repairAwaitingHuman, addComponent)
+	command.AddCommand(list, get, show, diagnose, cancel, retry, unfiled, refile, failures, incidents, receiptCommand, repairAwaitingHuman, addComponent)
 	return command
 }
 

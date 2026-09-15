@@ -24,7 +24,7 @@ Contract:
 - **Fire-and-forget, best effort.** A slow or failing hook never blocks or
   fails the job, but filing is not guaranteed. *papio* does not retry hooks.
 - **Audited.** Each run records a durable `hook.on_ready` job event with
-  `status`, `exit_code`, and `duration_ms`. Hook stdout/stderr is **not**
+  `status`, `exit_code`, `duration_ms`, and `trigger` (`ready` or `manual`). Hook stdout/stderr is **not**
   recorded (it could carry secrets from your environment) — have your
   command do its own logging if you need output.
 - **Shell semantics.** The command runs via `/bin/sh -c` (`cmd /C` on
@@ -86,6 +86,28 @@ on_ready = 'cp "$PAPIO_PDF" "$HOME/Papers/"'
 new unless you configure a library source (below), and `papio doctor` reports
 zotio as `not configured (optional)` instead of failing. Hooks are then the only
 automatic hand-off — *papio* acquires and validates; your hook files.
+
+### Finding and repairing failed filings
+
+`papio doctor` includes a `filing` check when `on_ready` is your library
+hand-off. It warns when a ready or imported job has no successful filing.
+
+List those jobs:
+
+```sh
+papio jobs unfiled
+```
+
+Use `--filter failed` or `--filter missing` to show one class. After you fix
+the hook or its destination, file one job again:
+
+```sh
+papio jobs refile <job-id>
+```
+
+The command runs the same hook with the same `PAPIO_*` environment. It waits
+for that bounded run and records a manual event. *papio* never retries it
+automatically.
 
 ## De-duplicating against a non-Zotero library
 

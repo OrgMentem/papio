@@ -310,6 +310,12 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.list_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listJobsV3(ctx, raw, system)
 		},
+		"jobs.unfiled": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return unfiledJobs(ctx, raw, system)
+		},
+		"jobs.refile": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return refileJob(ctx, raw, system)
+		},
 		"jobs.receipt": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return jobReceipt(ctx, raw, system)
 		},

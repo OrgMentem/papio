@@ -839,6 +839,14 @@ Show the outcome and component index for one job
 papio jobs receipt <job-id>
 ```
 
+### `papio jobs refile`
+
+Run the configured on-ready filing hook again
+
+```
+papio jobs refile <job-id>
+```
+
 ### `papio jobs repair-awaiting-human`
 
 Return an orphaned awaiting-human job with no open actions to resolving
@@ -866,6 +874,19 @@ papio jobs show <job-id> [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--wait` | `bool` | `false` | wait for completion or human action |
+
+### `papio jobs unfiled`
+
+List ready jobs whose on-ready filing is missing or failed
+
+```
+papio jobs unfiled [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--filter` | `string` | `all` | filing filter: failed, missing, or all |
+| `--limit` | `int` | `100` | maximum rows (1-500) |
 
 ## `papio mcp`
 

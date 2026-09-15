@@ -269,10 +269,13 @@ func TestJobStatesAreDocumented(t *testing.T) {
 // reading empty strings. The drift is not hypothetical: PAPIO_PMID reached both
 // code and the docs table while ADR-0004's frozen list still named eight.
 func TestReadyHookEnvContractIsPinned(t *testing.T) {
+	// The env map lives in executeReadyHook, the body both the automatic
+	// on-ready path and `papio jobs refile` run; runReadyHook is now the
+	// detached wrapper and carries no PAPIO_* keys of its own.
 	src := mustRead(t, "internal/app/app.go")
-	hook := regexp.MustCompile(`(?s)func \(s \*Service\) runReadyHook\(.*?\n}`).FindString(src)
+	hook := regexp.MustCompile(`(?s)func \(s \*Service\) executeReadyHook\(.*?\n}`).FindString(src)
 	if hook == "" {
-		t.Fatal("could not locate runReadyHook in internal/app/app.go")
+		t.Fatal("could not locate executeReadyHook in internal/app/app.go")
 	}
 	emitted := map[string]bool{}
 	for _, m := range regexp.MustCompile(`"(PAPIO_[A-Z0-9_]+)":`).FindAllStringSubmatch(hook, -1) {

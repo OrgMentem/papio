@@ -80,6 +80,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		add("fetch_policy", Pass, "HTTPS-only production policy", "")
 	}
 	checkNotifications(ctx, cfg, db, add)
+	checkFiling(ctx, cfg, db, add)
 
 	if err := checkDataDir(cfg.DataDir); err != nil {
 		msg := err.Error()
@@ -445,6 +446,44 @@ func checkNotifications(ctx context.Context, cfg config.Config, db *store.Store,
 	add("notifications", status,
 		fmt.Sprintf("%s; effective preset %s; held digests %s; webhook %s", capability, policy.Preset, held, webhook),
 		remediation)
+}
+
+// checkFiling reports failed or absent on_ready outcomes only when the hook is
+// the configured library hand-off. Zotio keeps its separate delivery lifecycle.
+func checkFiling(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+	if strings.TrimSpace(cfg.Hooks.OnReady) == "" {
+		add("filing", Skip, "no on_ready hook configured", "")
+		return
+	}
+	if strings.TrimSpace(cfg.Zotio.Executable) != "" {
+		add("filing", Skip, "zotio is configured; hook filing is not the active destination lifecycle", "")
+		return
+	}
+	if db == nil {
+		add("filing", Skip, "filing is checked by the daemon", "")
+		return
+	}
+	var count int
+	err := db.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM jobs j
+		LEFT JOIN events e ON e.seq = (
+			SELECT MAX(newest.seq)
+			FROM events newest
+			WHERE newest.job_id = j.id AND newest.kind = 'hook.on_ready'
+		)
+		WHERE j.state IN ('ready', 'imported')
+		  AND (e.seq IS NULL OR COALESCE(json_extract(e.detail_json, '$.status'), '') <> 'ok')`).Scan(&count)
+	switch {
+	case err != nil:
+		add("filing", Warn, "unfiled jobs could not be counted", "inspect database permissions")
+	case count == 0:
+		add("filing", Pass, "every ready acquisition has a successful on_ready filing", "")
+	default:
+		add("filing", Warn,
+			fmt.Sprintf("%d ready or imported %s %s a failed or missing filing", count, plural(count, "job", "jobs"), plural(count, "has", "have")),
+			"run `papio jobs unfiled`, then run `papio jobs refile <id>` after fixing the hook")
+	}
 }
 
 // uncollectedGracePeriod is how long an acquired full text may sit before it

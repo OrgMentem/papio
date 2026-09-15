@@ -11,6 +11,13 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **A paper that failed to file into a non-Zotero library can now be found and
+  filed again.** When `[hooks] on_ready` fails once (papis mid-upgrade, target
+  volume unmounted, a timeout), the PDF was acquired but never filed, and no
+  command showed it. `papio jobs unfiled` lists ready papers whose newest hook
+  run is missing or failed, `papio jobs refile <id>` runs the hook again for one
+  paper and records the result, and `papio doctor` warns with the count. Hooks
+  are still never retried on their own.
 - **Desktop notifications on Linux and Windows.** *papio* pinged only through
   macOS `osascript`; Linux and Windows builds had no desktop leg at all, so a
   paper waiting on a sign-in pass went unnoticed until you looked. Linux now
