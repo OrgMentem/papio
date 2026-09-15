@@ -4776,6 +4776,21 @@ func (p *HelloAckPayload) validate() error {
 			return fmt.Errorf("hello_ack.resolver_origins entries must be bounded https origins")
 		}
 	}
+	// The generation is holder-only and bounded. extension/src/protocol.ts and
+	// protocol/browser-v1.schema.json ALREADY enforce both rules on this field,
+	// so their absence here made the daemon's own outbound self-validation
+	// weaker than the receiver it emits to — the exact asymmetry the
+	// dual-validation contract exists to prevent, on the same field whose null
+	// handling was already one-sided. This adds no wire field and refuses only
+	// frames the extension would refuse anyway.
+	if p.BrowserHolderGeneration != nil {
+		if *p.BrowserHolderGeneration < 0 || *p.BrowserHolderGeneration > MaxBrowserInteger {
+			return fmt.Errorf("hello_ack.browser_holder_generation out of range")
+		}
+		if p.Role == "pending" {
+			return fmt.Errorf("hello_ack.browser_holder_generation must not accompany a pending role")
+		}
+	}
 	// An absent role means holder: an older daemon acknowledged only the session
 	// it had just slotted, so silence is unambiguous rather than unknown.
 	return enumOK("hello_ack.role", p.Role, "holder", "pending")

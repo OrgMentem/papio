@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "hello_ack",
+  "msg_id": "daemon-ack-pending-generation-001",
+  "seq": 1,
+  "payload": {
+    "role": "pending",
+    "browser_holder_generation": 7
+  }
+}

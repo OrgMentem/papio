@@ -5111,7 +5111,18 @@ func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.Human
 			if errors.Is(err, job.ErrConflict) {
 				return b.humanActionResolveResult(request.RequestID, "conflict", "")
 			}
-			return b.humanActionResolveResult(request.RequestID, "error", err.Error())
+			if !errors.Is(err, app.ErrCompensationIncomplete) {
+				return b.humanActionResolveResult(request.RequestID, "error", err.Error())
+			}
+			// The dismissal COMMITTED and only releasing the job's
+			// document-delivery request failed. Reporting "error" here would be
+			// a lie the inbox acts on: it prints the detail as a failure, the
+			// operator dismisses again, and the second attempt conflicts
+			// against the action its own first attempt resolved. Report what
+			// the store says. The stranded delivery request is an operator
+			// concern with an operator surface — the daemon log names it and
+			// `papio delivery` resolves it — not a property of this item.
+			log.Printf("papio: %v", err)
 		}
 		if b.preview != nil {
 			b.preview.Revoke(request.ActionID)

@@ -2261,6 +2261,16 @@ var (
 	ErrDeliveryNotConfigured          = errors.New("delivery: document delivery is not configured")
 	ErrDeliveryRequestNotFound        = errors.New("delivery: no request for this job")
 	ErrDeliveryReconciliationNotFound = errors.New("delivery: no open document_delivery action for this job")
+
+	// ErrCompensationIncomplete marks the one failure shape where the operator's
+	// verb COMMITTED and only its follow-up write failed. Every seam must tell
+	// the operator that much, because the obvious response to a bare failure —
+	// retry the verb — is wrong here: the cancel or dismissal already happened,
+	// and the work left undone is releasing a document-delivery request. Without
+	// this classification internal/api's failure() flattens the error to
+	// "operation failed", which is indistinguishable from the verb itself
+	// failing.
+	ErrCompensationIncomplete = errors.New("app: the operation committed but its compensation did not")
 )
 
 // DeliveryReconciliationInput supplies one operator verdict.
@@ -2385,7 +2395,13 @@ func (s *Service) ReconcileDelivery(ctx context.Context, input DeliveryReconcili
 		if submitErr != nil {
 			restoreErr := s.restoreDeliveryReconciliationAction(ctx, input.JobID, request)
 			if restoreErr != nil {
-				return DeliveryReconciliationResult{}, errors.Join(submitErr, restoreErr)
+				// The repair committed, so the operator's prompt is gone and the
+				// restore that should have brought it back also failed: classify
+				// it, or every seam reports this as a plain submit failure and an
+				// operator retries a confirmation whose affordance no longer
+				// exists.
+				return DeliveryReconciliationResult{}, fmt.Errorf("%w: %w",
+					ErrCompensationIncomplete, errors.Join(submitErr, restoreErr))
 			}
 			return DeliveryReconciliationResult{}, submitErr
 		}
@@ -2467,7 +2483,7 @@ func (s *Service) CancelJob(ctx context.Context, jobID string, reason job.Termin
 	orphanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCompensationTimeout)
 	defer cancel()
 	if err := s.Delivery.OrphanIfLive(orphanCtx, jobID, "job_cancelled"); err != nil {
-		return fmt.Errorf("job %s is cancelled, but its live delivery request was not orphaned; re-run the cancel or resolve the request by hand: %w", jobID, err)
+		return fmt.Errorf("%w: job %s is cancelled, but its live delivery request was not orphaned; re-run the cancel or resolve the request by hand: %w", ErrCompensationIncomplete, jobID, err)
 	}
 	return nil
 }
@@ -2488,7 +2504,7 @@ func (s *Service) DismissAction(ctx context.Context, actionID, expectedRevision 
 	orphanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCompensationTimeout)
 	defer cancel()
 	if err := s.Delivery.OrphanIfLive(orphanCtx, jobID, "action_dismissed"); err != nil {
-		return jobID, fmt.Errorf("action %d is dismissed, but the live delivery request it was driving was not orphaned; resolve the request by hand: %w", actionID, err)
+		return jobID, fmt.Errorf("%w: action %d is dismissed, but the live delivery request it was driving was not orphaned; resolve the request by hand: %w", ErrCompensationIncomplete, actionID, err)
 	}
 	return jobID, nil
 }
@@ -3543,7 +3559,15 @@ func (s *Service) removeQuarantineBytes(ctx context.Context, tx *sql.Tx, quarant
 	if err != nil {
 		return nil
 	}
-	if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+	// Strict containment: the quarantine ROOT itself is never a deletable
+	// target. `target != root` let equality through, so a quarantine_path that
+	// normalized to the root reached os.RemoveAll(root) and took every other
+	// job's quarantined bytes with it. No writer can produce that value today —
+	// every stored path is QuarantineDir(jobID) plus a file name, and
+	// artifact.validJobDir already rejects "", ".", ".." and separators — but
+	// this is the primitive that file guards one layer away for exactly the
+	// caller that does not exist yet.
+	if target == root || !strings.HasPrefix(target, root+string(filepath.Separator)) {
 		log.Printf("papio: leaving published quarantine path outside %s in place: %s", root, target)
 		return nil
 	}

@@ -35,8 +35,10 @@ session is parked as *pending*. The daemon first sends a role-bearing
 `hello_ack` (`role: "pending"`), then a `session_busy` error frame. The
 acknowledgement negotiates daemon features without granting the pending
 session holder work. A holder silent past 10 s (5× the 2 s host poll) yields
-to a live pending session, which receives a new `hello_ack` with
-`role: "holder"`. `goodbye` releases immediately. An empty `session_id` marks
+to a live pending session, which receives a role-holder `hello_ack` — unless it
+fails the extension-version gate, in which case `Sync` returns
+`extension_outdated` rather than seating it in a role it cannot serve.
+`goodbye` releases immediately. An empty `session_id` marks
 a legacy host and keeps last-hello-wins in both directions (a legacy host
 cannot be arbitrated).
 

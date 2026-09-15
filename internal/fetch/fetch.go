@@ -252,11 +252,13 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 	var sample []byte
 	var written int64
 	buf := make([]byte, 32*1024)
+	reader := newBodyReader(resp.Body)
+	defer reader.stop()
 	for {
 		if err := bodyCtx.Err(); err != nil {
 			return Result{}, classifyContextError(err)
 		}
-		n, readErr := readBodyWithContext(bodyCtx, resp.Body, buf)
+		n, readErr := reader.read(bodyCtx, buf)
 		if n > 0 {
 			if int64(n) > d.policy.MaxBytes-written {
 				return Result{}, invalid("response body exceeds configured size limit")
@@ -309,17 +311,82 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 	}, nil
 }
 
-// readBodyWithContext relies on the request context and the response-body close
-// callback in saveResponse to interrupt a blocked transport read.
-func readBodyWithContext(ctx context.Context, body io.ReadCloser, buffer []byte) (int, error) {
+// pathologicalBodyGrace bounds the wait for a body whose Close does not unblock
+// a Read already in flight. Stock net/http bodies do unblock — HTTP/1's
+// bodyEOFSignal.Close signals the read loop, HTTP/2's transportResponseBody.Close
+// aborts the stream — but Downloader accepts an injected http.RoundTripper, so
+// the guarantee cannot rest on the transport being stock.
+const pathologicalBodyGrace = 100 * time.Millisecond
+
+// bodyReader serves every chunk of ONE response body from a single goroutine.
+// Reading a 32 KiB chunk directly on the caller's goroutine is simpler, but it
+// has no escape: a body whose Read never returns hangs the download forever,
+// and a daemon goroutine parked in a syscall is this repository's most
+// expensive failure shape to diagnose. Spawning a goroutine per chunk has the
+// escape and costs one goroutine per 32 KiB — 32 added goroutines were measured
+// against an 18 limit. One goroutine for the whole body keeps the escape at
+// constant cost.
+type bodyReader struct {
+	body     io.ReadCloser
+	requests chan []byte
+	results  chan bodyReadResult
+}
+
+type bodyReadResult struct {
+	n   int
+	err error
+}
+
+func newBodyReader(body io.ReadCloser) *bodyReader {
+	r := &bodyReader{
+		body:     body,
+		requests: make(chan []byte),
+		// Buffered, so the reader can deposit the result of a read the caller
+		// has already abandoned and then exit, rather than blocking forever on
+		// a send nobody will receive.
+		results: make(chan bodyReadResult, 1),
+	}
+	go func() {
+		for buffer := range r.requests {
+			n, err := r.body.Read(buffer)
+			r.results <- bodyReadResult{n: n, err: err}
+		}
+	}()
+	return r
+}
+
+// stop releases the reader goroutine. A goroutine blocked in Read exits once
+// that read returns, because its result lands in the buffered channel and the
+// closed request channel then ends the loop.
+func (r *bodyReader) stop() { close(r.requests) }
+
+// read fills buffer with the next chunk, returning the context's error instead
+// if the context is done first. Only one read is ever outstanding, which is why
+// a single-slot result buffer is sufficient.
+func (r *bodyReader) read(ctx context.Context, buffer []byte) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	n, err := body.Read(buffer)
-	if contextErr := ctx.Err(); contextErr != nil {
-		return 0, contextErr
+	select {
+	case r.requests <- buffer:
+	case <-ctx.Done():
+		return 0, ctx.Err()
 	}
-	return n, err
+	select {
+	case res := <-r.results:
+		return res.n, res.err
+	case <-ctx.Done():
+		// saveResponse's own context.AfterFunc closes the body here too; this
+		// close keeps the escape self-contained rather than depending on a
+		// caller that a later edit could drop. Close is idempotent for every
+		// body this package reads.
+		_ = r.body.Close()
+		select {
+		case <-r.results:
+		case <-time.After(pathologicalBodyGrace):
+		}
+		return 0, ctx.Err()
+	}
 }
 
 func (d *Downloader) validateURL(ctx context.Context, u *url.URL) error {

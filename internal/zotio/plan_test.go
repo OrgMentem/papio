@@ -16,7 +16,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"papio/internal/artifact"
 	"papio/internal/bundle"
@@ -1562,26 +1561,27 @@ func TestAttachStagingBasename(t *testing.T) {
 		t.Fatalf("multibyte test title is %d bytes, want 300", len(multibyteTitle))
 	}
 
+	// Each want encodes the rule it pins: the cap is a BYTE cap, so the ASCII
+	// row's want is exactly attachTitleMaxBytes of payload, and the multibyte
+	// row's want stops at the last whole rune that fits rather than splitting
+	// one. Comparing the whole basename to want therefore already proves both
+	// the cap and UTF-8 validity — a separate len() or utf8.ValidString() check
+	// cannot fail unless this comparison already has.
 	for _, tc := range []struct {
-		name          string
-		work          work.Work
-		want          string
-		wantErr       string
-		assertByteCap bool
-		assertUTF8    bool
+		name    string
+		work    work.Work
+		want    string
+		wantErr string
 	}{
 		{
-			name:          "300-byte ASCII title stays within the component byte cap",
-			work:          work.Work{Title: strings.Repeat("a", 300)},
-			want:          strings.Repeat("a", attachTitleMaxBytes) + suffix,
-			assertByteCap: true,
+			name: "300-byte ASCII title stays within the component byte cap",
+			work: work.Work{Title: strings.Repeat("a", 300)},
+			want: strings.Repeat("a", attachTitleMaxBytes) + suffix,
 		},
 		{
-			name:          "300-byte multibyte title stays valid UTF-8 within the component byte cap",
-			work:          work.Work{Title: multibyteTitle},
-			want:          "a" + strings.Repeat("界", 59) + suffix,
-			assertByteCap: true,
-			assertUTF8:    true,
+			name: "300-byte multibyte title stays valid UTF-8 within the component byte cap",
+			work: work.Work{Title: multibyteTitle},
+			want: "a" + strings.Repeat("界", 59) + suffix,
 		},
 		{
 			name: "title exactly at the byte cap is unchanged",
@@ -1613,12 +1613,6 @@ func TestAttachStagingBasename(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("attachStagingBasename() = %q, want %q", got, tc.want)
-			}
-			if tc.assertByteCap && len(got) > attachTitleMaxBytes+len(suffix) {
-				t.Fatalf("attachStagingBasename() is %d bytes, want at most %d", len(got), attachTitleMaxBytes+len(suffix))
-			}
-			if tc.assertUTF8 && !utf8.ValidString(got) {
-				t.Fatalf("attachStagingBasename() returned invalid UTF-8: %q", got)
 			}
 		})
 	}

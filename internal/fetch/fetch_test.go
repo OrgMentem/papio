@@ -471,84 +471,74 @@ func TestRedirectCredentialsFollowEffectivePort(t *testing.T) {
 	}
 }
 
-func TestReadBodyWithContextDoesNotSpawnOrLeakReadGoroutines(t *testing.T) {
-	const readers = 16
+// TestBodyReaderCostsOneGoroutinePerBodyNotPerChunk pins the reason bodyReader
+// exists. Reading each 32 KiB chunk in its own goroutine has the cancellation
+// escape but cost one goroutine per chunk; reading directly on the caller's
+// goroutine is free but has no escape at all. This proves both properties at
+// once: many chunks from one body add one goroutine, and the read still returns
+// on cancellation even though this body's Close never unblocks its Read.
+func TestBodyReaderCostsOneGoroutinePerBodyNotPerChunk(t *testing.T) {
+	const chunks = 16
 
+	body := newCloseIgnoringBody()
 	runtime.GC()
 	baseline := runtime.NumGoroutine()
-	ctx, cancel := context.WithCancel(context.Background())
-	bodies := make([]*closeIgnoringBody, readers)
-	results := make(chan struct {
-		n   int
-		err error
-	}, readers)
-	defer cancel()
+
+	reader := newBodyReader(body)
+	defer reader.stop()
 	defer func() {
-		for _, body := range bodies {
-			select {
-			case <-body.release:
-			default:
-				close(body.release)
-			}
+		select {
+		case <-body.release:
+		default:
+			close(body.release)
 		}
 	}()
-	for i := range bodies {
-		bodies[i] = newCloseIgnoringBody()
-	}
-	stopClose := context.AfterFunc(ctx, func() {
-		for _, body := range bodies {
-			_ = body.Close()
-		}
-	})
-	defer stopClose()
-	for _, body := range bodies {
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Ask for many chunks. Each request blocks in Read until the body is
+	// released, so all of them are served by the one reader goroutine.
+	results := make(chan error, chunks)
+	for range chunks {
 		go func() {
-			n, err := readBodyWithContext(ctx, body, make([]byte, 1))
-			results <- struct {
-				n   int
-				err error
-			}{n: n, err: err}
+			_, err := reader.read(ctx, make([]byte, 1))
+			results <- err
 		}()
 	}
-	for _, body := range bodies {
-		select {
-		case <-body.started:
-		case <-time.After(time.Second):
-			t.Fatal("reader did not start")
-		}
+	select {
+	case <-body.started:
+	case <-time.After(time.Second):
+		t.Fatal("reader goroutine did not start its first read")
 	}
 
-	if got, limit := runtime.NumGoroutine(), baseline+readers+2; got > limit {
-		t.Fatalf("blocked reads added %d goroutines, want at most %d", got-baseline, readers+2)
+	// baseline + the chunks callers + the single reader goroutine. A
+	// goroutine-per-chunk implementation adds `chunks` more than this.
+	if got, limit := runtime.NumGoroutine(), baseline+chunks+1; got > limit {
+		t.Fatalf("%d blocked chunk reads added %d goroutines, want at most %d",
+			chunks, got-baseline, chunks+1)
 	}
 
+	// The body is NEVER released: this is the pathological case where Close
+	// returns without unblocking the in-flight Read. Cancellation must still
+	// return, bounded by pathologicalBodyGrace.
 	cancel()
-	for _, body := range bodies {
-		select {
-		case <-body.closed:
-		case <-time.After(time.Second):
-			t.Fatal("cancellation did not close response body")
-		}
-		close(body.release)
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not close the response body")
 	}
-	for range bodies {
+	deadline := time.After(2 * time.Second)
+	for range chunks {
 		select {
-		case result := <-results:
-			if result.n != 0 || result.err != context.Canceled {
-				t.Fatalf("read result = (%d, %v), want (0, context canceled)", result.n, result.err)
+		case err := <-results:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("read error = %v, want context.Canceled", err)
 			}
-		case <-time.After(time.Second):
-			t.Fatal("read did not return after the blocked reader was released")
+		case <-deadline:
+			t.Fatal("a read did not return after cancellation: the escape is gone, " +
+				"so a body whose Close does not unblock Read hangs the download forever")
 		}
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for runtime.NumGoroutine() > baseline && time.Now().Before(deadline) {
-		runtime.Gosched()
-		time.Sleep(time.Millisecond)
-	}
-	if got := runtime.NumGoroutine(); got > baseline {
-		t.Fatalf("goroutines after cancellation = %d, want pre-call baseline %d", got, baseline)
 	}
 }
 

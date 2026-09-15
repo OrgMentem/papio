@@ -1808,6 +1808,15 @@ func failure(err error) ([]byte, *ipc.RPCError) {
 		return nil, &ipc.RPCError{Code: "not_found", Message: "record not found"}
 	case errors.Is(err, job.ErrConflict):
 		return nil, &ipc.RPCError{Code: "conflict", Message: safeMessage(err, "state conflict")}
+	case errors.Is(err, app.ErrCompensationIncomplete):
+		// The verb committed and only its follow-up write failed, so the
+		// operator MUST NOT be told "operation failed": the obvious response to
+		// that is to retry the verb, which is already done. The message is a
+		// fixed template rather than the error text, because the wrapped cause
+		// is database detail this seam does not disclose; the full chain goes to
+		// the daemon log.
+		log.Printf("rpc compensation incomplete: %v", err)
+		return nil, &ipc.RPCError{Code: "internal", Message: "the request was recorded, but releasing its document-delivery request failed; the recorded change stands, so resolve the delivery request by hand rather than repeating this command"}
 	case errors.As(err, &actionKind):
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "unsupported human action")}
 	default:

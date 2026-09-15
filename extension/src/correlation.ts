@@ -11,8 +11,21 @@ import { PDF_GRAB_FEATURE, PDF_GRAB_SUGGEST_FEATURE } from "./deliver";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
+/**
+ * The reply types a correlated request may name. `BrowserMessageType` is too
+ * wide: `responseType: "hello_ack"` would compile, and `handleInbound` would
+ * then consume the handshake frame before `background.ts` could run its own
+ * hello branch, leaving features and hello waiters permanently unset. Reply
+ * frames all carry a `_response`, `_result`, or `_ack` suffix, and `hello_ack`
+ * is the one such frame that is never a correlated reply.
+ */
+type CorrelatedReplyType = Exclude<
+  Extract<BrowserMessageType, `${string}_response` | `${string}_result` | `${string}_ack`>,
+  "hello_ack"
+>;
+
 type RequestPolicy = {
-  responseType: BrowserMessageType;
+  responseType: CorrelatedReplyType;
   feature: string;
 } &
   (

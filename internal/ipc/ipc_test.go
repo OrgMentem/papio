@@ -121,7 +121,11 @@ func TestServerRejectsInvalidHandlerResult(t *testing.T) {
 	}
 }
 
-func TestServerReportsResultTooLarge(t *testing.T) {
+// TestServerEnforcesResultCapAtTheExactBoundary pins both sides of the cap. A
+// single over-cap case cannot distinguish `>` from `>=`: an implementation that
+// rejected an exactly-at-cap response would still pass it. The two cases differ
+// by ONE byte of result payload, so they straddle the comparison.
+func TestServerEnforcesResultCapAtTheExactBoundary(t *testing.T) {
 	const requestID = "request_01"
 	emptyStringResult := json.RawMessage(`""`)
 	minimalEnvelope, err := json.Marshal(Response{
@@ -133,29 +137,49 @@ func TestServerReportsResultTooLarge(t *testing.T) {
 		t.Fatalf("marshal response envelope: %v", err)
 	}
 	envelopeOverhead := len(minimalEnvelope) - len(emptyStringResult)
-	resultSize := MaxResultBytes - envelopeOverhead + 1
-	result := make([]byte, resultSize)
-	result[0] = '"'
-	copy(result[1:], bytes.Repeat([]byte("x"), resultSize-2))
-	result[len(result)-1] = '"'
 
-	if len(result) > MaxResultBytes {
-		t.Fatalf("test result size = %d, exceeds MaxResultBytes = %d", len(result), MaxResultBytes)
-	}
-	if envelopeSize := len(result) + envelopeOverhead; envelopeSize <= MaxResultBytes {
-		t.Fatalf("test envelope size = %d, want greater than MaxResultBytes = %d", envelopeSize, MaxResultBytes)
+	// jsonStringOfEnvelopeSize builds a JSON string result whose whole response
+	// envelope is exactly `total` bytes.
+	jsonStringOfEnvelopeSize := func(total int) json.RawMessage {
+		size := total - envelopeOverhead
+		result := make([]byte, size)
+		result[0] = '"'
+		copy(result[1:], bytes.Repeat([]byte("x"), size-2))
+		result[len(result)-1] = '"'
+		return result
 	}
 
-	socket, _ := startTestServer(t, HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
-		return result, nil
-	}))
-	_, err = NewSocketClient(socket).CallRaw(context.Background(), requestID, "jobs.get", json.RawMessage(`{}`))
-	var remote *RemoteError
-	if !errors.As(err, &remote) {
-		t.Fatalf("CallRaw error = %v, want decodable RemoteError with code result_too_large", err)
-	}
-	if remote.Code != "result_too_large" {
-		t.Fatalf("CallRaw RemoteError code = %q, want result_too_large", remote.Code)
+	for _, test := range []struct {
+		name         string
+		envelopeSize int
+		wantCode     string
+	}{
+		{name: "exactly_at_cap_is_served", envelopeSize: MaxResultBytes, wantCode: ""},
+		{name: "one_byte_over_cap_is_refused", envelopeSize: MaxResultBytes + 1, wantCode: "result_too_large"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := jsonStringOfEnvelopeSize(test.envelopeSize)
+			socket, _ := startTestServer(t, HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
+				return result, nil
+			}))
+			raw, err := NewSocketClient(socket).CallRaw(context.Background(), requestID, "jobs.get", json.RawMessage(`{}`))
+			if test.wantCode == "" {
+				if err != nil {
+					t.Fatalf("CallRaw at exactly MaxResultBytes = %v, want the response served", err)
+				}
+				if len(raw) != len(result) {
+					t.Fatalf("served result = %d bytes, want %d", len(raw), len(result))
+				}
+				return
+			}
+			var remote *RemoteError
+			if !errors.As(err, &remote) {
+				t.Fatalf("CallRaw error = %v, want decodable RemoteError with code %s", err, test.wantCode)
+			}
+			if remote.Code != test.wantCode {
+				t.Fatalf("CallRaw RemoteError code = %q, want %s", remote.Code, test.wantCode)
+			}
+		})
 	}
 }
 
