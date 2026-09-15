@@ -982,7 +982,7 @@ papio search [query] [flags]
 | `--new-only` | `bool` | `false` | omit works already in your library; filters after --limit and may return fewer results |
 | `--oa-only` | `bool` | `false` | return only open-access works |
 | `--related-to` | `string` |  | DOI to find OpenAlex-related papers (related_to: filter) |
-| `--source` | `string` |  | discovery backend: openalex or semanticscholar (default: all configured) |
+| `--source` | `string` |  | discovery backend: arxiv, openalex, or semanticscholar (default: all configured) |
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
 

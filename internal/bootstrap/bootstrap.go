@@ -688,6 +688,11 @@ func discoverySources(cfg config.Config, budgets *budget.Manager, client sourceg
 			return nil, err
 		}
 		switch name {
+		case config.SourceArXiv:
+			sources = append(sources, discovery.NewArxivWithOptions(discovery.ArxivOptions{
+				Client:  gated,
+				BaseURL: cfg.Sources[config.SourceArXiv].BaseURLForDev,
+			}))
 		case config.SourceOpenAlex:
 			sources = append(sources, discovery.NewWithOptions(discovery.Options{
 				Client:       gated,

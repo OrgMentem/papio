@@ -17,6 +17,11 @@ execution records kept during the initial build.
   uses `notify-send` (or `gdbus` when that is absent) and Windows a built-in
   PowerShell toast, chosen by probe at startup so `papio doctor` and the
   notification ledger report the real mechanism.
+- **arXiv is a discovery backend.** `papio search --source arxiv` and standing
+  watches now query arXiv directly with no key and no credit spend, so weekly
+  "what is new" watches in CS, ML, physics, and math are not gated on aggregator
+  indexing lag. Citation-snowball searches decline on this backend rather than
+  answering partially.
 - **Losing the tab *papio* opened for you is no longer silent.** When you close
   the tab *papio* used to reach a paper through your institution while it is
   still driving that tab, it releases the route and the paper waits for another

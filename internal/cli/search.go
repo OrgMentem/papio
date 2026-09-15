@@ -114,7 +114,7 @@ func newSearchCommand(opt *options) *cobra.Command {
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")
 	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year")
 	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
-	flags.StringVar(&source, "source", "", "discovery backend: openalex or semanticscholar (default: all configured)")
+	flags.StringVar(&source, "source", "", "discovery backend: arxiv, openalex, or semanticscholar (default: all configured)")
 	flags.BoolVar(&newOnly, "new-only", false, "omit works already in your library; filters after --limit and may return fewer results")
 	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
 	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")

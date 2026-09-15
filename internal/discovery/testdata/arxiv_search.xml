@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>https://arxiv.org/abs/2401.12345v2</id>
+    <published>2024-01-23T12:34:56Z</published>
+    <title>
+      A resilient   arXiv discovery paper
+    </title>
+    <author><name>Ada   Lovelace</name></author>
+    <author><name> Grace Hopper </name></author>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/not-an-arxiv-id</id>
+    <published>not-a-date</published>
+    <title>Malformed entry</title>
+    <author><name>Unknown</name></author>
+  </entry>
+</feed>

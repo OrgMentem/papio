@@ -32,7 +32,7 @@ column lists anything else sent.
 | `api.crossref.org` | your `email`, if set | Adding metadata to a title-only request; checking a DOI's registered version relations when other candidates are exhausted | **On** |
 | `api.crossref.org` | — | Daily retraction checks for papers already in your library | **On** |
 | `www.ebi.ac.uk` (Europe PMC) | — | Resolving a DOI, PMID, or title | **On** |
-| `export.arxiv.org` | — | Resolving an arXiv ID or DOI | **On** |
+| `export.arxiv.org` | — | Resolving an arXiv ID or DOI, and `papio search` when configured | **On** |
 | `doi.org` | your `email`, in the User-Agent | Confirming that a DOI exists before an institutional handoff | **On** |
 | Your institution's configured delivery API (`document_delivery.base_url` — ILLiad in v1) | your `api_key`, `patron_ref`, and the request's bibliographic identifiers | Submitting or polling one of your document-delivery requests | Off — requires configuration |
 | `api.openalex.org` | your `email`, your API key | Resolving and `papio search` | Off |

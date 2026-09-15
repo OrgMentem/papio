@@ -315,7 +315,7 @@ unknown `[notify]` fields.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `sources` | string array | empty (= `["openalex"]`) | Discovery backends for `papio search` and watches, in merge-preference order. Valid entries: `openalex`, `semanticscholar` (each at most once). Results merge with DOI-then-title deduplication; earlier backends win ties. Per-backend API keys live under `[sources.<name>]` (e.g. `sources.semanticscholar.api_key`, optional — Semantic Scholar works keyless at public rate limits). |
+| `sources` | string array | empty (= `["openalex"]`) | Discovery backends for `papio search` and watches, in merge-preference order. Valid entries: `arxiv`, `openalex`, `semanticscholar` (each at most once). Results merge with DOI-then-title deduplication; earlier backends win ties. arXiv supports text and submitted-year searches but not citation snowballs. Per-backend API keys live under `[sources.<name>]` (e.g. `sources.semanticscholar.api_key`, optional — Semantic Scholar works keyless at public rate limits); arXiv needs no credential. |
 
 ## `[actions]`
 
@@ -340,10 +340,10 @@ with the list below. The valid names are `arxiv`, `europepmc`, `unpaywall`,
 a removed key: an earlier *papio* release wrote it into `Default()` and no
 adapter for it ever shipped, so a config carrying it loads normally and
 drops the key silently rather than breaking on upgrade — it is not a valid
-key to add yourself. For `semanticscholar`, `enabled` governs
-the acquisition resolver (open-access PDF lookup by exact DOI, arXiv id, or
-PMID); selection as a *search* backend is separate and lives in `[discovery]`
-(which reads this section's `api_key`). For `openaire`, candidates come from
+key to add yourself. For `arxiv` and `semanticscholar`, `enabled` governs the
+acquisition resolver. Selection as a search backend is separate and lives in
+`[discovery]`; Semantic Scholar search also reads this section's optional
+`api_key`. For `openaire`, candidates come from
 the OpenAIRE Graph (metadata licensed CC-BY, acknowledged here and in
 candidate provenance); the keyless public limit is 60 requests/hour — the
 default `rate_per_sec` honors it, and a personal-token `api_key` raises the

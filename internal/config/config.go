@@ -107,7 +107,7 @@ type sourceCatalogEntry struct {
 // unimplemented source name is a startup error instead of a silently ignored
 // no-op (see the discovery.sources and validateLibrary rationale below).
 var sourceCatalog = []sourceCatalogEntry{
-	{Name: SourceArXiv, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
+	{Name: SourceArXiv, Roles: RoleAcquisitionResolver | RoleDiscoveryBackend, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
 	{Name: SourceEuropePMC, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: 2, Burst: 2}},
 	{Name: SourceUnpaywall, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
 	// OpenAlex is the one provider papio uses in three roles against one

@@ -215,6 +215,51 @@ type atomAuthor struct {
 	Name string `xml:"name"`
 }
 
+// AtomEntry is one valid bibliographic entry decoded from an arXiv Atom feed.
+// ArXivID preserves the feed's version, while BaseID names the versionless
+// landing and PDF resources.
+type AtomEntry struct {
+	ArXivID string
+	BaseID  string
+	Title   string
+	Authors []string
+	Year    int
+}
+
+// DecodeBoundedAtomEntries decodes an arXiv Atom feed through the resolver's
+// response-size bound. Entries without a valid arXiv identity or title are
+// skipped so one malformed result does not discard the rest of the page.
+func DecodeBoundedAtomEntries(body io.Reader, max int64) ([]AtomEntry, error) {
+	var feed atomFeed
+	if err := decodeBoundedXML(body, max, &feed); err != nil {
+		return nil, err
+	}
+	entries := make([]AtomEntry, 0, len(feed.Entries))
+	for _, raw := range feed.Entries {
+		id := normalizedEntryArXivID(raw.ID)
+		title := strings.TrimSpace(raw.Title)
+		if id == "" || title == "" {
+			continue
+		}
+		base, _ := splitVersion(id)
+		entry := AtomEntry{
+			ArXivID: id,
+			BaseID:  base,
+			Title:   safeEvidenceValue(title),
+		}
+		for _, author := range raw.Authors {
+			if name := strings.TrimSpace(author.Name); name != "" {
+				entry.Authors = append(entry.Authors, safeEvidenceValue(name))
+			}
+		}
+		if len(raw.Published) >= 4 {
+			entry.Year, _ = strconv.Atoi(raw.Published[:4])
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
 // firstResult returns the entry that corresponds to base, or nil. arXiv reports
 // a lookup miss as an entry whose id points at /api/errors; such entries and
 // entries for a different id are treated as "not found".
@@ -232,6 +277,12 @@ func (f *atomFeed) firstResult(base string) *atomEntry {
 }
 
 func entryArXivID(raw string) string {
+	id := normalizedEntryArXivID(raw)
+	base, _ := splitVersion(id)
+	return base
+}
+
+func normalizedEntryArXivID(raw string) string {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return ""
@@ -244,8 +295,7 @@ func entryArXivID(raw string) string {
 	if err != nil {
 		return ""
 	}
-	base, _ := splitVersion(id)
-	return base
+	return id
 }
 
 // resolvedWork carries the source-discovered bibliographic identity for the app

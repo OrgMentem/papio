@@ -35,7 +35,7 @@ var shippedSourceDefaults = map[string]Source{
 // discovers AND resolves against one keyed allowance), and gaining one claims
 // wiring that does not exist.
 var shippedSourceRoles = map[string]SourceRole{
-	SourceArXiv:            RoleAcquisitionResolver,
+	SourceArXiv:            RoleAcquisitionResolver | RoleDiscoveryBackend,
 	SourceEuropePMC:        RoleAcquisitionResolver,
 	SourceUnpaywall:        RoleAcquisitionResolver,
 	SourceOpenAlex:         RoleAcquisitionResolver | RoleDiscoveryBackend | RoleMetadataEnricher,
@@ -109,8 +109,8 @@ func TestAcquisitionRoleOrderIsResolverPrecedence(t *testing.T) {
 	if got := SourcesInRole(RoleAcquisitionResolver); !reflect.DeepEqual(got, want) {
 		t.Fatalf("acquisition order = %v, want %v", got, want)
 	}
-	if got := SourcesInRole(RoleDiscoveryBackend); !reflect.DeepEqual(got, []string{SourceOpenAlex, SourceSemanticScholar}) {
-		t.Fatalf("discovery order = %v, want openalex then semanticscholar (merge preference)", got)
+	if got := SourcesInRole(RoleDiscoveryBackend); !reflect.DeepEqual(got, []string{SourceArXiv, SourceOpenAlex, SourceSemanticScholar}) {
+		t.Fatalf("discovery order = %v, want arxiv, openalex, then semanticscholar (merge preference)", got)
 	}
 }
 

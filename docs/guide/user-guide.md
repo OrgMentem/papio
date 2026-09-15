@@ -37,9 +37,9 @@ after any manual configuration change.
 
 ## 2. Discover a research set
 
-Start with a discovery search (OpenAlex by default; add Semantic Scholar via
-`discovery.sources` in config, or pick one backend for a single query with
-`--source openalex|semanticscholar`):
+Start with a discovery search (OpenAlex by default; add arXiv or Semantic
+Scholar via `discovery.sources` in config, or pick one backend for a single
+query with `--source arxiv|openalex|semanticscholar`):
 
 ```sh
 papio search "appropriate reliance on AI" --limit 20 --year-from 2023
