@@ -226,6 +226,42 @@ func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 	}
 }
 
+func TestHelloAckBrowserHolderGenerationRejectsNullButAllowsOmission(t *testing.T) {
+	frame := func(payload map[string]any) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgHelloAck,
+			"msg_id":   "daemon-ack-generation-001",
+			"seq":      1,
+			"payload":  payload,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	if _, err := DecodeBrowserMessage(frame(map[string]any{
+		"role":                      "holder",
+		"browser_holder_generation": nil,
+	})); err == nil {
+		t.Fatal("hello_ack accepted null browser_holder_generation")
+	}
+
+	msg, err := DecodeBrowserMessage(frame(map[string]any{"role": "holder"}))
+	if err != nil {
+		t.Fatalf("hello_ack rejected omitted browser_holder_generation: %v", err)
+	}
+	payload := msg.Payload.(*HelloAckPayload)
+	if payload.BrowserHolderGeneration != nil {
+		t.Fatalf("omitted browser_holder_generation decoded as %v", *payload.BrowserHolderGeneration)
+	}
+	if err := payload.validate(); err != nil {
+		t.Fatalf("hello_ack with omitted browser_holder_generation failed validation: %v", err)
+	}
+}
+
 // TestPdfGrabResultReasonVocabulary pins the machine-readable refusal
 // classifier. The popup switches on reason to pick its own copy, so an
 // unclassified value must never reach it, and reason must stay confined to the

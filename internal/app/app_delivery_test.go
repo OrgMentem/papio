@@ -1089,6 +1089,135 @@ func TestDismissDocumentDeliveryActionOrphansLiveDeliveryRequest(t *testing.T) {
 	}
 }
 
+// TestCancellationCompensationSurvivesCallerCancellation proves that the
+// durable orphan write does not inherit cancellation from the request that
+// already committed the job or action cancellation.
+func TestCancellationCompensationSurvivesCallerCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		dismiss bool
+	}{
+		{name: "cancel_job"},
+		{name: "dismiss_action", dismiss: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs, deliverySvc := newDeliveryTestService(t)
+			svc.Delivery = deliverySvc
+			ctx := context.Background()
+			id, err := svc.Submit(ctx, deliveryWorkRequest("wr_cancel_ctx_"+tc.name, "10.1000/cancel-ctx-"+tc.name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+				JobID: id, InstitutionProfile: "default", Provider: "illiad",
+				RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/cancel-ctx-" + tc.name,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := deliverySvc.UpdateState(ctx, request.ID, delivery.StateSubmitted); err != nil {
+				t.Fatal(err)
+			}
+
+			var action *job.HumanAction
+			if tc.dismiss {
+				actionID, err := jobs.OpenHumanAction(ctx, id, job.ActionKindDocumentDelivery,
+					"a document-delivery request needs reconciliation", job.Access(false, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
+					map[string]any{"reason": "test_setup"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
+					map[string]any{"reason": "document_delivery_reconciliation"}); err != nil {
+					t.Fatal(err)
+				}
+				actions, err := jobs.ListHumanActions(ctx, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := range actions {
+					if actions[i].ID == actionID {
+						action = &actions[i]
+						break
+					}
+				}
+				if action == nil {
+					t.Fatal("document_delivery action not found")
+				}
+			}
+
+			callerCtx, cancel := context.WithCancel(context.Background())
+			deliverySvc.SetBeforeOrphanCASForTest(func() error {
+				cancel()
+				return nil
+			})
+			t.Cleanup(func() {
+				cancel()
+				deliverySvc.SetBeforeOrphanCASForTest(nil)
+			})
+			if tc.dismiss {
+				if _, err := svc.DismissAction(callerCtx, action.ID, action.Revision); err != nil {
+					t.Fatalf("DismissAction: %v", err)
+				}
+			} else if err := svc.CancelJob(callerCtx, id, job.TerminalReasonUserDismissed); err != nil {
+				t.Fatalf("CancelJob: %v", err)
+			}
+			if !errors.Is(callerCtx.Err(), context.Canceled) {
+				t.Fatalf("caller context = %v, want cancelled after the durable job mutation", callerCtx.Err())
+			}
+
+			stored, err := deliverySvc.Get(context.Background(), request.ID)
+			if err != nil || stored == nil {
+				t.Fatalf("delivery request after cancellation = %+v, %v", stored, err)
+			}
+			if stored.State != delivery.StateUnknownOutcome {
+				t.Fatalf("delivery request state = %q, want unknown_outcome", stored.State)
+			}
+			events, err := jobs.Events(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			orphaned := 0
+			for _, event := range events {
+				if event["kind"] == "delivery.orphaned" {
+					orphaned++
+				}
+			}
+			if orphaned != 1 {
+				t.Fatalf("delivery.orphaned events = %d, want 1", orphaned)
+			}
+		})
+	}
+	t.Run("orphan failure is returned", func(t *testing.T) {
+		svc, _, deliverySvc := newDeliveryTestService(t)
+		svc.Delivery = deliverySvc
+		ctx := context.Background()
+		id, err := svc.Submit(ctx, deliveryWorkRequest("wr_cancel_orphan_failure", "10.1000/cancel-orphan-failure"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+			JobID: id, InstitutionProfile: "default", Provider: "illiad",
+			RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/cancel-orphan-failure",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := deliverySvc.UpdateState(ctx, request.ID, delivery.StateSubmitted); err != nil {
+			t.Fatal(err)
+		}
+		orphanErr := errors.New("injected orphan compensation failure")
+		deliverySvc.SetBeforeOrphanCASForTest(func() error { return orphanErr })
+		t.Cleanup(func() { deliverySvc.SetBeforeOrphanCASForTest(nil) })
+		if err := svc.CancelJob(ctx, id, job.TerminalReasonUserDismissed); !errors.Is(err, orphanErr) {
+			t.Fatalf("CancelJob error = %v, want orphan compensation failure", err)
+		}
+	})
+}
+
 // TestSubmitDeliveryMatchesAutomaticRoute proves the explicit
 // operator/RPC-triggered SubmitDelivery entrypoint runs the same
 // Branch-then-gate path and job transition exhaustedCandidates' automatic
@@ -2656,4 +2785,142 @@ func TestReconcileDeliveryConfirmAbsentReparksAndReusesTheRow(t *testing.T) {
 	if rows != 1 {
 		t.Fatalf("delivery rows for %s = %d, want 1 reused", id, rows)
 	}
+}
+
+// TestReconcileDeliveryReportsRestoreFailures proves the confirm-absent
+// compensation survives caller cancellation and reports either restore write
+// when it cannot restore the human affordance.
+func TestReconcileDeliveryReportsRestoreFailures(t *testing.T) {
+	t.Run("detached restore succeeds", func(t *testing.T) {
+		svc, jobs, deliverySvc := newDeliveryTestService(t)
+		svc.Delivery = deliverySvc
+		svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://illiad.example.edu")
+		svc.Resolvers = deliveryTestResolvers()
+		id, _ := seedDeliveryReconciliation(t, svc, jobs, deliverySvc, "restore_detached")
+
+		submitErr := errors.New("injected post-repair submit failure")
+		callerCtx, cancel := context.WithCancel(context.Background())
+		calls := 0
+		job.SetBeforeTransitionTxForTest(func() error {
+			calls++
+			if calls == 1 {
+				cancel()
+				return submitErr
+			}
+			return nil
+		})
+		t.Cleanup(func() {
+			cancel()
+			job.SetBeforeTransitionTxForTest(nil)
+		})
+
+		if _, err := svc.ReconcileDelivery(callerCtx, DeliveryReconciliationInput{
+			JobID: id, Operation: DeliveryConfirmRequestAbsent,
+		}); !errors.Is(err, submitErr) {
+			t.Fatalf("ReconcileDelivery error = %v, want submit failure", err)
+		}
+		if !errors.Is(callerCtx.Err(), context.Canceled) {
+			t.Fatalf("caller context = %v, want cancelled during SubmitDelivery", callerCtx.Err())
+		}
+		row, err := jobs.Get(context.Background(), id)
+		if err != nil || row.State != job.StateAwaitingHuman {
+			t.Fatalf("job after detached restore = %+v, %v; want awaiting_human", row, err)
+		}
+		actions, err := jobs.ListHumanActionsForJob(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		open, resolved := 0, 0
+		for _, action := range actions {
+			if action.Action.Kind != job.ActionKindDocumentDelivery {
+				continue
+			}
+			switch action.Action.Status {
+			case "open":
+				open++
+			case "resolved":
+				resolved++
+			}
+		}
+		if open != 1 || resolved != 1 {
+			t.Fatalf("document_delivery actions = %d open, %d resolved; want 1 and 1", open, resolved)
+		}
+	})
+
+	t.Run("transition failure is joined", func(t *testing.T) {
+		svc, jobs, deliverySvc := newDeliveryTestService(t)
+		svc.Delivery = deliverySvc
+		svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery("https://illiad.example.edu")
+		svc.Resolvers = deliveryTestResolvers()
+		id, _ := seedDeliveryReconciliation(t, svc, jobs, deliverySvc, "restore_transition_failure")
+
+		submitErr := errors.New("injected post-repair submit failure")
+		transitionCalls := 0
+		job.SetBeforeTransitionTxForTest(func() error {
+			transitionCalls++
+			if transitionCalls == 1 {
+				return submitErr
+			}
+			return nil
+		})
+		if _, err := jobs.S.DB().ExecContext(context.Background(), `
+			CREATE TRIGGER injected_restore_transition_failure
+			BEFORE UPDATE OF state ON jobs
+			WHEN OLD.id = '`+id+`' AND NEW.state = 'awaiting_human'
+			BEGIN SELECT RAISE(ABORT, 'injected restore transition failure'); END`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			job.SetBeforeTransitionTxForTest(nil)
+			_, _ = jobs.S.DB().Exec(`DROP TRIGGER IF EXISTS injected_restore_transition_failure`)
+		})
+
+		_, err := svc.ReconcileDelivery(context.Background(), DeliveryReconciliationInput{
+			JobID: id, Operation: DeliveryConfirmRequestAbsent,
+		})
+		if !errors.Is(err, submitErr) || !strings.Contains(err.Error(), "injected restore transition failure") {
+			t.Fatalf("ReconcileDelivery error = %v, want joined submit and restore transition failures", err)
+		}
+	})
+
+	t.Run("action failure is returned", func(t *testing.T) {
+		svc, jobs, _ := newDeliveryTestService(t)
+		ctx := context.Background()
+		id, err := svc.Submit(ctx, deliveryWorkRequest("wr_restore_action_failure", "10.1000/restore-action-failure"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving,
+			map[string]any{"reason": "test_setup"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := jobs.S.DB().ExecContext(ctx, `
+			CREATE TRIGGER injected_restore_action_failure
+			BEFORE INSERT ON human_actions
+			WHEN NEW.job_id = '`+id+`' AND NEW.kind = 'document_delivery'
+			BEGIN SELECT RAISE(ABORT, 'injected restore action failure'); END`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = jobs.S.DB().Exec(`DROP TRIGGER IF EXISTS injected_restore_action_failure`)
+		})
+
+		err = svc.restoreDeliveryReconciliationAction(ctx, id, &delivery.Request{
+			JobID: id, Provider: "illiad", State: delivery.StateCancelled,
+		})
+		if err == nil || !strings.Contains(err.Error(), "injected restore action failure") {
+			t.Fatalf("restore error = %v, want explicit action write failure", err)
+		}
+		row, err := jobs.Get(ctx, id)
+		if err != nil || row.State != job.StateResolving {
+			t.Fatalf("job after failed atomic restore = %+v, %v; want resolving with an explicit error", row, err)
+		}
+		open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(open) != 0 {
+			t.Fatalf("failed atomic restore left actions = %+v, want none and an explicit error", open)
+		}
+	})
 }

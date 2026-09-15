@@ -1231,15 +1231,18 @@ func getJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 	if err != nil {
 		return failure(err)
 	}
-	actions, err := system.Jobs.ListHumanActions(ctx, false)
+	attributedActions, err := system.Jobs.ListHumanActionsForJob(ctx, params.JobID)
 	if err != nil {
 		return failure(err)
 	}
-	jobActions := actions[:0]
-	for _, action := range actions {
-		if action.JobID == params.JobID {
-			jobActions = append(jobActions, action)
-		}
+	// One job-scoped read: the legacy global read was O(total actions) per
+	// single-job request, and `papio status` calls this once per row. The
+	// empty result is always [] rather than the old null, which came from
+	// reslicing the global read; every consumer decodes into a slice, where
+	// Go treats null and [] identically.
+	jobActions := make([]job.HumanAction, 0, len(attributedActions))
+	for _, action := range attributedActions {
+		jobActions = append(jobActions, action.Action)
 	}
 	return marshal(JobDetail{Job: row, Events: events, Actions: jobActions})
 }

@@ -2707,7 +2707,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		msg.Payload = p
 	case MsgHelloAck:
 		p := &HelloAckPayload{}
-		err = browserRejectNullFields(payloadFields, "daemon_version", "features", "resolver_origins", "role")
+		err = browserRejectNullFields(payloadFields, "daemon_version", "features", "resolver_origins", "role", "browser_holder_generation")
 		var features []json.RawMessage
 		if raw, ok := payloadFields["features"]; ok && err == nil {
 			err = strictDecode(raw, &features)

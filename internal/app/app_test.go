@@ -3832,3 +3832,131 @@ func TestReconcileConsumesRedundantPublicationAndItsQuarantineBytes(t *testing.T
 		t.Fatalf("supplement edge = %v, %v; want retained", edge, err)
 	}
 }
+
+// TestReconcileRedundantPublicationPreservesSharedQuarantineOwnership proves
+// that consuming one redundant journal row cannot remove bytes which another
+// prepared publication still owns.
+func TestReconcileRedundantPublicationPreservesSharedQuarantineOwnership(t *testing.T) {
+	t.Run("exact path", func(t *testing.T) {
+		ctx := context.Background()
+		svc, jobs := newTestService(t)
+		svc.Validate = passValidation()
+		row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs,
+			"wr_shared_path_edge", "shared-path-edge", "shared-path-edge")
+		if _, _, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+			TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)), SniffedMIME: "application/pdf",
+		}); err != nil {
+			t.Fatalf("validate edge owner: %v", err)
+		}
+		stored, err := jobs.GetArtifact(ctx, sha)
+		if err != nil || stored == nil {
+			t.Fatalf("artifact metadata = %+v, %v", stored, err)
+		}
+		otherJob, err := svc.Submit(ctx, doiRequestFor("wr_shared_path_live"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		qdir, err := svc.Artifacts.QuarantineDir("shared-publication-path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sharedPath := filepath.Join(qdir, "shared.pdf")
+		if err := os.WriteFile(sharedPath, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.PreparePublication(ctx, job.PublicationInput{
+			ID: "publication_shared_path_live", JobID: otherJob, Role: job.PublicationRoleMain,
+			SHA256: sha, QuarantinePath: sharedPath, Artifact: *stored,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.PreparePublication(ctx, job.PublicationInput{
+			ID: "publication_shared_path_redundant", JobID: row.ID, Role: job.PublicationRoleMain,
+			SHA256: sha, QuarantinePath: sharedPath, Artifact: *stored,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := svc.reconcilePreparedPublications(ctx, row.ID); err != nil {
+			t.Fatalf("reconcile redundant publication: %v", err)
+		}
+		if got, err := os.ReadFile(sharedPath); err != nil || string(got) != string(body) {
+			t.Fatalf("shared quarantine bytes = %q, %v; want intact", got, err)
+		}
+		if prepared, err := jobs.PreparedPublications(ctx, row.ID); err != nil || len(prepared) != 0 {
+			t.Fatalf("redundant publication = %+v, %v; want consumed", prepared, err)
+		}
+		if prepared, err := jobs.PreparedPublications(ctx, otherJob); err != nil || len(prepared) != 1 {
+			t.Fatalf("remaining publication = %+v, %v; want one durable owner", prepared, err)
+		}
+	})
+
+	t.Run("component stage directory", func(t *testing.T) {
+		ctx := context.Background()
+		svc, jobs := newTestService(t)
+		svc.Validate = passValidation()
+		row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs,
+			"wr_shared_stage_edge", "shared-stage-edge", "shared-stage-edge")
+		if _, _, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+			TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)), SniffedMIME: "application/pdf",
+		}); err != nil {
+			t.Fatalf("validate edge owner: %v", err)
+		}
+		stored, err := jobs.GetArtifact(ctx, sha)
+		if err != nil || stored == nil {
+			t.Fatalf("artifact metadata = %+v, %v", stored, err)
+		}
+		otherJob, err := svc.Submit(ctx, doiRequestFor("wr_shared_stage_live"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stageDir, err := svc.Artifacts.QuarantineDir("component-stage_shared")
+		if err != nil {
+			t.Fatal(err)
+		}
+		redundantPath := filepath.Join(stageDir, "main.pdf")
+		if err := os.WriteFile(redundantPath, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		componentBody := []byte("%PDF-1.4\nshared component\n%%EOF")
+		componentSum := sha256.Sum256(componentBody)
+		componentSHA := hex.EncodeToString(componentSum[:])
+		componentPath := filepath.Join(stageDir, "supplement.pdf")
+		if err := os.WriteFile(componentPath, componentBody, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		componentDest, err := svc.Artifacts.ArtifactPath(componentSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.PreparePublication(ctx, job.PublicationInput{
+			ID: "publication_shared_stage_live", JobID: otherJob, Role: job.PublicationRoleSupplement,
+			SHA256: componentSHA, QuarantinePath: componentPath,
+			Artifact: job.Artifact{
+				SHA256: componentSHA, SizeBytes: int64(len(componentBody)), MIME: "application/pdf",
+				PageCount: 1, Path: componentDest, IdentityResult: "pass",
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.PreparePublication(ctx, job.PublicationInput{
+			ID: "publication_shared_stage_redundant", JobID: row.ID, Role: job.PublicationRoleMain,
+			SHA256: sha, QuarantinePath: redundantPath, Artifact: *stored,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := svc.reconcilePreparedPublications(ctx, row.ID); err != nil {
+			t.Fatalf("reconcile redundant stage publication: %v", err)
+		}
+		if got, err := os.ReadFile(componentPath); err != nil || string(got) != string(componentBody) {
+			t.Fatalf("shared component bytes = %q, %v; want intact", got, err)
+		}
+		if prepared, err := jobs.PreparedPublications(ctx, row.ID); err != nil || len(prepared) != 0 {
+			t.Fatalf("redundant publication = %+v, %v; want consumed", prepared, err)
+		}
+		if prepared, err := jobs.PreparedPublications(ctx, otherJob); err != nil || len(prepared) != 1 {
+			t.Fatalf("remaining publication = %+v, %v; want one durable owner", prepared, err)
+		}
+	})
+}

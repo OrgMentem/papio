@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -470,70 +471,130 @@ func TestRedirectCredentialsFollowEffectivePort(t *testing.T) {
 	}
 }
 
-func TestReadBodyWithContextReturnsWhenCloseDoesNotUnblockRead(t *testing.T) {
-	body := newCloseIgnoringBody()
+func TestReadBodyWithContextDoesNotSpawnOrLeakReadGoroutines(t *testing.T) {
+	const readers = 16
+
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
 	ctx, cancel := context.WithCancel(context.Background())
+	bodies := make([]*closeIgnoringBody, readers)
+	results := make(chan struct {
+		n   int
+		err error
+	}, readers)
 	defer cancel()
-	defer close(body.release)
-	readDone := make(chan error, 1)
-	go func() {
-		_, err := readBodyWithContext(ctx, body, make([]byte, 1))
-		readDone <- err
+	defer func() {
+		for _, body := range bodies {
+			select {
+			case <-body.release:
+			default:
+				close(body.release)
+			}
+		}
 	}()
-	select {
-	case <-body.started:
-	case <-time.After(time.Second):
-		t.Fatal("reader did not start")
+	for i := range bodies {
+		bodies[i] = newCloseIgnoringBody()
+	}
+	stopClose := context.AfterFunc(ctx, func() {
+		for _, body := range bodies {
+			_ = body.Close()
+		}
+	})
+	defer stopClose()
+	for _, body := range bodies {
+		go func() {
+			n, err := readBodyWithContext(ctx, body, make([]byte, 1))
+			results <- struct {
+				n   int
+				err error
+			}{n: n, err: err}
+		}()
+	}
+	for _, body := range bodies {
+		select {
+		case <-body.started:
+		case <-time.After(time.Second):
+			t.Fatal("reader did not start")
+		}
 	}
 
-	start := time.Now()
-	cancel()
-	select {
-	case err := <-readDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("read error = %v, want context canceled", err)
-		}
-		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-			t.Fatalf("cancellation returned after %s", elapsed)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("read did not return after cancellation")
+	if got, limit := runtime.NumGoroutine(), baseline+readers+2; got > limit {
+		t.Fatalf("blocked reads added %d goroutines, want at most %d", got-baseline, readers+2)
 	}
-	select {
-	case <-body.closed:
-	default:
-		t.Fatal("cancellation did not close response body")
+
+	cancel()
+	for _, body := range bodies {
+		select {
+		case <-body.closed:
+		case <-time.After(time.Second):
+			t.Fatal("cancellation did not close response body")
+		}
+		close(body.release)
+	}
+	for range bodies {
+		select {
+		case result := <-results:
+			if result.n != 0 || result.err != context.Canceled {
+				t.Fatalf("read result = (%d, %v), want (0, context canceled)", result.n, result.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("read did not return after the blocked reader was released")
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baseline && time.Now().Before(deadline) {
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > baseline {
+		t.Fatalf("goroutines after cancellation = %d, want pre-call baseline %d", got, baseline)
 	}
 }
 
-func TestReadBodyWithContextClosesAndDrainsBlockedReader(t *testing.T) {
+func TestDownloadPreservesCancellationError(t *testing.T) {
 	body := newCloseBlockingBody()
+	d := testDownloader(t, publicResolver(nil), roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body}, nil
+	}))
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	readDone := make(chan error, 1)
+	path := filepath.Join(t.TempDir(), "partial")
+	done := make(chan error, 1)
 	go func() {
-		_, err := readBodyWithContext(ctx, body, make([]byte, 1))
-		readDone <- err
+		_, err := d.Download(ctx, "https://papers.example/file", path)
+		done <- err
 	}()
 	select {
 	case <-body.started:
 	case <-time.After(time.Second):
 		t.Fatal("reader did not start")
 	}
-
 	cancel()
 	select {
-	case err := <-readDone:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("read error = %v, want context canceled", err)
+	case err := <-done:
+		got := fetchError(t, err)
+		if got.Class != ClassRetryable || got.Msg != "request cancelled" || err.Error() != "fetch retryable: request cancelled" {
+			t.Fatalf("cancellation error = %#v (%q)", got, err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("read did not finish after cancellation")
+		t.Fatal("download did not return after cancellation")
 	}
-	select {
-	case <-body.closed:
-	default:
-		t.Fatal("cancellation did not close response body")
+}
+
+func TestDownloadPreservesBodySizeLimitError(t *testing.T) {
+	p := DefaultPolicy()
+	p.MaxBytes = 7
+	d, err := New(p, publicResolver(nil), roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return response(http.StatusOK, "%PDF-1.7", nil), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.Download(context.Background(), "https://papers.example/file", filepath.Join(t.TempDir(), "partial"))
+	got := fetchError(t, err)
+	if got.Class != ClassInvalid || got.Msg != "response body exceeds configured size limit" ||
+		err.Error() != "fetch invalid: response body exceeds configured size limit" {
+		t.Fatalf("size-limit error = %#v (%q)", got, err)
 	}
 }
 
@@ -610,9 +671,10 @@ func (b *closeBlockingBody) Close() error {
 }
 
 type closeIgnoringBody struct {
-	closed  chan struct{}
-	release chan struct{}
-	started chan struct{}
+	closeOnce sync.Once
+	closed    chan struct{}
+	release   chan struct{}
+	started   chan struct{}
 }
 
 func newCloseIgnoringBody() *closeIgnoringBody {
@@ -630,7 +692,7 @@ func (b *closeIgnoringBody) Read(_ []byte) (int, error) {
 }
 
 func (b *closeIgnoringBody) Close() error {
-	close(b.closed)
+	b.closeOnce.Do(func() { close(b.closed) })
 	return nil
 }
 

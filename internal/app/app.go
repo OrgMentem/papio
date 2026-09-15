@@ -7,6 +7,7 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2254,6 +2255,8 @@ const (
 	DeliveryConfirmRequestAbsent DeliveryReconciliationOperation = "confirm_request_absent"
 )
 
+const deliveryCompensationTimeout = 2 * time.Second
+
 var (
 	ErrDeliveryNotConfigured          = errors.New("delivery: document delivery is not configured")
 	ErrDeliveryRequestNotFound        = errors.New("delivery: no request for this job")
@@ -2380,7 +2383,10 @@ func (s *Service) ReconcileDelivery(ctx context.Context, input DeliveryReconcili
 		}
 		result, submitErr := s.SubmitDelivery(ctx, input.JobID)
 		if submitErr != nil {
-			s.restoreDeliveryReconciliationAction(ctx, input.JobID, request)
+			restoreErr := s.restoreDeliveryReconciliationAction(ctx, input.JobID, request)
+			if restoreErr != nil {
+				return DeliveryReconciliationResult{}, errors.Join(submitErr, restoreErr)
+			}
 			return DeliveryReconciliationResult{}, submitErr
 		}
 		after, err := s.Jobs.Get(ctx, input.JobID)
@@ -2393,48 +2399,96 @@ func (s *Service) ReconcileDelivery(ctx context.Context, input DeliveryReconcili
 	}
 }
 
-func (s *Service) restoreDeliveryReconciliationAction(ctx context.Context, jobID string, request *delivery.Request) {
-	ref := request.ProviderReference
-	if ref == "" {
-		ref = "(no provider reference recorded)"
+// restoreDeliveryReconciliationAction puts back the affordance
+// confirm_request_absent consumed: the repair transaction closed the operator's
+// document_delivery action and moved the job to resolving, so a SubmitDelivery
+// failure after that commit leaves a runnable job with nothing for a human to
+// act on. Both writes are therefore compensation for a committed step, not
+// best-effort — the caller joins any failure here with the submit error.
+//
+// It deliberately does NOT call job.Store.ParkWithHumanAction, despite being
+// that method's shape: ParkWithHumanAction opens the prompt BEFORE the
+// transition (job.go), so within one transaction the prompt insert still reads
+// the job as resolving. Anything keyed on the job's state during that insert —
+// a trigger, a constraint, a future guard refusing a document_delivery prompt
+// on a resolving job — then aborts the whole restore. Park first, prompt
+// second, one transaction: atomic like ParkWithHumanAction, and in the
+// park-before-prompt order internal/api's delivery path and internal/browser's
+// bridge both document. TestDeliveryConfirmRequestAbsentCompensatesWhenSubmitFailsAfterRepair
+// (internal/api) injects exactly that trigger and fails if this is
+// "simplified" back to ParkWithHumanAction.
+func (s *Service) restoreDeliveryReconciliationAction(ctx context.Context, jobID string, request *delivery.Request) error {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCompensationTimeout)
+	defer cancel()
+	tx, err := s.Jobs.S.DB().BeginTx(restoreCtx, nil)
+	if err != nil {
+		return fmt.Errorf("starting delivery reconciliation restore: %w", err)
 	}
-	detail := fmt.Sprintf("a document-delivery request (provider %s, reference %s, state %s) needs reconciliation; run 'papio delivery get %s' for its history and resolve it by hand — papio never resubmits automatically",
-		request.Provider, ref, delivery.StateCancelled, jobID)
-	if err := s.Jobs.Transition(ctx, jobID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "document_delivery_reconciliation"}); err == nil {
-		_, _ = s.Jobs.OpenHumanAction(ctx, jobID, job.ActionKindDocumentDelivery, detail, job.Access(false, ""))
+	defer func() { _ = tx.Rollback() }()
+	detail, err := json.Marshal(map[string]any{
+		"reason": "document_delivery_reconciliation",
+		"from":   job.StateResolving,
+		"to":     job.StateAwaitingHuman,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding delivery reconciliation restore: %w", err)
 	}
+	now := s.Now().UTC().Format(time.RFC3339Nano)
+	if err := s.Jobs.TransitionTx(restoreCtx, tx, jobID, job.StateResolving, job.StateAwaitingHuman,
+		string(detail), job.TransitionTxConfig{}, now); err != nil {
+		return fmt.Errorf("restoring delivery reconciliation job state: %w", err)
+	}
+	cancelled := *request
+	cancelled.State = delivery.StateCancelled
+	if _, err := s.Jobs.OpenHumanActionTx(restoreCtx, tx, jobID, job.ActionKindDocumentDelivery,
+		DeliveryReconciliationActionDetail(&cancelled), now, job.Access(false, "")); err != nil {
+		return fmt.Errorf("restoring delivery reconciliation action: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing delivery reconciliation restore: %w", err)
+	}
+	return nil
 }
 
 // CancelJob cancels a job exactly as job.Store.Cancel does, additionally
 // reconciling any live (submitted/pending) delivery_requests row it was
-// driving (ADR-0017 Decision 4): cancelling the job stops papio from ever
-// polling that row again, so a live row must not be left looking like it is
-// still being watched. See delivery.Service.OrphanIfLive. Compensation is
-// best-effort — the cancellation itself, which the caller actually asked
-// for, is what this must never fail on.
+// driving (ADR-0017 Decision 4). The cancellation commits first. Its orphan
+// compensation then runs on a bounded context detached from the caller, since
+// the caller can cancel after the job commit but before this second durable
+// write. A compensation failure is returned instead of leaving the live
+// delivery row silently stranded.
 func (s *Service) CancelJob(ctx context.Context, jobID string, reason job.TerminalReason) error {
 	if err := s.Jobs.Cancel(ctx, jobID, reason); err != nil {
 		return err
 	}
-	if s.Delivery != nil {
-		_ = s.Delivery.OrphanIfLive(ctx, jobID, "job_cancelled")
+	if s.Delivery == nil {
+		return nil
+	}
+	orphanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCompensationTimeout)
+	defer cancel()
+	if err := s.Delivery.OrphanIfLive(orphanCtx, jobID, "job_cancelled"); err != nil {
+		return fmt.Errorf("job %s is cancelled, but its live delivery request was not orphaned; re-run the cancel or resolve the request by hand: %w", jobID, err)
 	}
 	return nil
 }
 
 // DismissAction dismisses a human action exactly as
 // job.Store.DismissHumanAction does, additionally reconciling any live
-// delivery_requests row a resulting job cancellation was driving — see
-// CancelJob. Dismissing a non-document_delivery action, or one whose job
-// isn't cancelled by the dismissal, is untouched: OrphanIfLive only ever
-// acts on a row actually in state submitted/pending.
+// delivery_requests row a resulting job cancellation was driving. The orphan
+// compensation uses the same detached, bounded context as CancelJob and
+// reports its failure after the action mutation has committed.
 func (s *Service) DismissAction(ctx context.Context, actionID, expectedRevision int64) (string, error) {
 	jobID, err := s.Jobs.DismissHumanAction(ctx, actionID, expectedRevision)
 	if err != nil {
 		return "", err
 	}
-	if s.Delivery != nil {
-		_ = s.Delivery.OrphanIfLive(ctx, jobID, "action_dismissed")
+	if s.Delivery == nil {
+		return jobID, nil
+	}
+	orphanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCompensationTimeout)
+	defer cancel()
+	if err := s.Delivery.OrphanIfLive(orphanCtx, jobID, "action_dismissed"); err != nil {
+		return jobID, fmt.Errorf("action %d is dismissed, but the live delivery request it was driving was not orphaned; resolve the request by hand: %w", actionID, err)
 	}
 	return jobID, nil
 }
@@ -3472,35 +3526,125 @@ func (s *Service) RecoverPreparedPublications(ctx context.Context) error {
 	return s.reconcilePreparedPublications(ctx, "")
 }
 
-// removeQuarantineBytes discards one quarantined file whose bytes are already
-// published, best-effort. It is confined to the store's own quarantine root:
-// a quarantine_path is durable state that predates several validations (see
-// AGENTS.md on long-lived dev stores), so an unexpected path is logged and
-// left alone rather than removed. A component stage keeps its whole staging
-// directory, which is what SweepOrphanComponentStages would otherwise collect
-// a full daemon start later.
-func (s *Service) removeQuarantineBytes(quarantinePath string) {
+// removeQuarantineBytes removes bytes only when no remaining publication owns
+// the exact file or its component-stage_ directory. The caller must hold the
+// same writer-reserved transaction that consumed the redundant publication,
+// so another publication cannot appear between this ownership read and the
+// filesystem removal.
+func (s *Service) removeQuarantineBytes(ctx context.Context, tx *sql.Tx, quarantinePath string) error {
 	if quarantinePath == "" {
-		return
+		return nil
 	}
 	root, err := filepath.Abs(filepath.Join(filepath.Dir(s.Jobs.S.Path()), "quarantine"))
 	if err != nil {
-		return
+		return nil
 	}
 	target, err := filepath.Abs(quarantinePath)
 	if err != nil {
-		return
+		return nil
 	}
 	if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
 		log.Printf("papio: leaving published quarantine path outside %s in place: %s", root, target)
-		return
+		return nil
 	}
+	stage := false
 	if base := filepath.Dir(target); strings.HasPrefix(filepath.Base(base), "component-stage_") {
 		target = base
+		stage = true
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT quarantine_path FROM artifact_publications`)
+	if err != nil {
+		return err
+	}
+	owned := false
+	for rows.Next() {
+		var remainingPath string
+		if err := rows.Scan(&remainingPath); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		remaining, err := filepath.Abs(remainingPath)
+		if err != nil {
+			continue
+		}
+		if (!stage && remaining == target) ||
+			(stage && (remaining == target || strings.HasPrefix(remaining, target+string(filepath.Separator)))) {
+			owned = true
+			break
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if owned {
+		return nil
 	}
 	if err := os.RemoveAll(target); err != nil {
 		log.Printf("papio: removing published quarantine bytes %s: %v", target, err)
 	}
+	return nil
+}
+
+// consumePublishedPublication consumes one redundant journal row and cleans
+// its unowned quarantine bytes while one SQLite writer fence covers both the
+// durable ownership check and the filesystem change.
+func (s *Service) consumePublishedPublication(ctx context.Context, publicationID string) (bool, error) {
+	tx, err := s.Jobs.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE artifact_publications SET prepared_at = prepared_at WHERE id = ?`, publicationID)
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if changed == 0 {
+		return false, nil
+	}
+	var jobID, sha256, role, quarantinePath string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT job_id, sha256, role, quarantine_path
+		  FROM artifact_publications WHERE id = ?`, publicationID).
+		Scan(&jobID, &sha256, &role, &quarantinePath); err != nil {
+		return false, err
+	}
+	var edge int
+	err = tx.QueryRowContext(ctx, `
+		SELECT 1 FROM job_artifacts
+		 WHERE job_id = ? AND artifact_sha256 = ? AND role = ? LIMIT 1`,
+		jobID, sha256, role).Scan(&edge)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: publication %s has no committed acquisition edge", job.ErrConflict, publicationID)
+	}
+	if err != nil {
+		return false, err
+	}
+	res, err = tx.ExecContext(ctx, `DELETE FROM artifact_publications WHERE id = ?`, publicationID)
+	if err != nil {
+		return false, err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if deleted != 1 {
+		return false, fmt.Errorf("%w: publication %s changed during consumption", job.ErrConflict, publicationID)
+	}
+	if err := s.removeQuarantineBytes(ctx, tx, quarantinePath); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Service) reconcilePreparedPublications(ctx context.Context, jobID string) error {
@@ -3526,18 +3670,8 @@ func (s *Service) reconcilePreparedPublicationsForOwner(ctx context.Context, job
 			// of skipping it. Finalizing it is not an option: its recorded
 			// from_state no longer holds once the edge committed, so
 			// transitionPublicationMainTx would refuse the transition.
-			consumed, err := s.Jobs.ConsumePublishedPublication(ctx, publication.ID)
-			if err != nil {
+			if _, err := s.consumePublishedPublication(ctx, publication.ID); err != nil {
 				return err
-			}
-			if consumed {
-				// The promoted artifact is the copy that matters, so the
-				// quarantine bytes this row still names are now unreferenced.
-				// Deleting the row alone would strand them: the component-stage
-				// sweep runs once at startup, BEFORE this reconciliation, so a
-				// file orphaned here waits for the next daemon start, and a
-				// main-role quarantine file is not swept at all.
-				s.removeQuarantineBytes(publication.QuarantinePath)
 			}
 			continue
 		}

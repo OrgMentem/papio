@@ -240,12 +240,13 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 	}()
 
 	bodyCtx, cancelBody := context.WithCancel(overall)
-	bodyTimer := time.AfterFunc(d.policy.BodyTimeout, func() {
-		cancelBody()
+	defer cancelBody()
+	bodyTimer := time.AfterFunc(d.policy.BodyTimeout, cancelBody)
+	defer bodyTimer.Stop()
+	stopBodyClose := context.AfterFunc(bodyCtx, func() {
 		_ = resp.Body.Close()
 	})
-	defer bodyTimer.Stop()
-	defer cancelBody()
+	defer stopBodyClose()
 
 	hash := sha256.New()
 	var sample []byte
@@ -308,34 +309,17 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 	}, nil
 }
 
-// readBodyWithContext closes a blocked response body on cancellation. A
-// well-behaved ReadCloser unblocks Read when closed; broken implementations
-// cannot be allowed to hold the download indefinitely.
+// readBodyWithContext relies on the request context and the response-body close
+// callback in saveResponse to interrupt a blocked transport read.
 func readBodyWithContext(ctx context.Context, body io.ReadCloser, buffer []byte) (int, error) {
-	type readResult struct {
-		n   int
-		err error
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	result := make(chan readResult, 1)
-	go func() {
-		n, err := body.Read(buffer)
-		result <- readResult{n: n, err: err}
-	}()
-	select {
-	case done := <-result:
-		return done.n, done.err
-	case <-ctx.Done():
-		_ = body.Close()
-		// Do not wait indefinitely for a pathological body whose Close does
-		// not unblock Read. The buffered result lets that sole goroutine exit
-		// once it eventually returns, while the bounded wait preserves the
-		// caller's cancellation guarantee.
-		select {
-		case <-result:
-		case <-time.After(100 * time.Millisecond):
-		}
-		return 0, ctx.Err()
+	n, err := body.Read(buffer)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return 0, contextErr
 	}
+	return n, err
 }
 
 func (d *Downloader) validateURL(ctx context.Context, u *url.URL) error {
