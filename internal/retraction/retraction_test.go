@@ -148,6 +148,25 @@ func TestBulkLookupUsesOneRequestForTwoThousandDOIs(t *testing.T) {
 		t.Fatalf("requests/budget = %d/%d, want 1/1 for 2,000 DOIs", client.requests, budget.acquires)
 	}
 }
+func TestBulkLookupRejectsOversizedQuotedField(t *testing.T) {
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/oversized", 1)
+	body := "Record ID,Title,RetractionDOI,OriginalPaperDOI,RetractionNature\n" +
+		"1,\"" + strings.Repeat("a", maxDatasetFieldBytes+1) +
+		"\",10.2000/notice,10.1234/oversized,Retraction\n"
+	client := &recordingHTTPClient{body: body}
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: client, BaseURL: "https://example.test/retractionwatch", DataDir: t.TempDir(),
+	})
+	err := sentinel.RunDue(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "CSV field exceeds 65536-byte limit") {
+		t.Fatalf("oversized field error = %v", err)
+	}
+	if client.requests != 1 {
+		t.Fatalf("requests = %d, want 1", client.requests)
+	}
+}
 
 func TestLibraryScopeProducesFindingAndTriageItemWithoutJob(t *testing.T) {
 	ctx := context.Background()
@@ -244,6 +263,74 @@ func TestBulkLookupServesLastKnownGoodDatasetAfterFetchFailure(t *testing.T) {
 		t.Fatalf("fallback items = %#v, err = %v", items, err)
 	}
 }
+func TestZeroRowDatasetPreservesLastKnownGoodCaches(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	dataDir := t.TempDir()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/cached", 1)
+	previous := Finding{
+		DOI: "10.1234/cached", Nature: NatureRetraction,
+		NoticeDOI: "10.2000/notice", Title: "Affected paper",
+		NoticedAt: now.Add(-48 * time.Hour),
+	}
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		DataDir: dataDir, Now: func() time.Time { return now },
+	})
+	sentinel.mu.Lock()
+	err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now.Add(-sweepEvery),
+		Notices: map[string]Finding{findingKey(previous): previous},
+	})
+	sentinel.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := httptest.NewRecorder()
+	writeRetractionDataset(t, valid, csvNotice{
+		title: "Affected paper", noticeDOI: "10.2000/notice",
+		workDOI: "10.1234/cached", nature: "Retraction",
+	})
+	if err := sentinel.writeDataset(valid.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	noticeBefore, err := os.ReadFile(sentinel.cachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	datasetBefore, err := os.ReadFile(sentinel.datasetPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRetractionDataset(t, w)
+	}))
+	defer server.Close()
+	sentinel.client = server.Client()
+	sentinel.baseURL = server.URL
+	if err := sentinel.RunDue(ctx); err == nil || !strings.Contains(err.Error(), "no data rows") {
+		t.Fatalf("zero-row sweep error = %v", err)
+	}
+	noticeAfter, err := os.ReadFile(sentinel.cachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	datasetAfter, err := os.ReadFile(sentinel.datasetPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(noticeAfter) != string(noticeBefore) {
+		t.Fatal("zero-row dataset rewrote the current notice cache")
+	}
+	if string(datasetAfter) != string(datasetBefore) {
+		t.Fatal("zero-row dataset rewrote the last known-good dataset")
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 || items[0].Retraction.DOI != previous.DOI {
+		t.Fatalf("items after zero-row response = %#v, err = %v", items, err)
+	}
+}
 
 func TestRunDueBudgetDenialStopsBeforeRequest(t *testing.T) {
 	jobs := testStore(t)
@@ -332,7 +419,10 @@ func TestSweepExposesRecognizedNotices(t *testing.T) {
 			addReadyDOI(t, jobs, "10.1234/original", 1)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				if tc.update == "" {
-					writeRetractionDataset(t, w)
+					writeRetractionDataset(t, w, csvNotice{
+						title: "Unrelated paper", noticeDOI: "10.2000/unrelated-notice",
+						workDOI: "10.1234/unrelated", nature: "retraction",
+					})
 					return
 				}
 				writeRetractionDataset(t, w, csvNotice{
@@ -684,7 +774,10 @@ func TestSnapshotItemsDoesNotWaitForSweepLookup(t *testing.T) {
 		}
 		select {
 		case <-release:
-			writeRetractionDataset(t, w)
+			writeRetractionDataset(t, w, csvNotice{
+				title: "Unrelated paper", noticeDOI: "10.2000/unrelated-notice",
+				workDOI: "10.1234/unrelated", nature: "retraction",
+			})
 		case <-r.Context().Done():
 		}
 	}))

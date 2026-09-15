@@ -63,6 +63,9 @@ const (
 	sweepEvery                    = 24 * time.Hour
 	maxNotices                    = 1000
 	cacheVersion                  = 1
+	maxDatasetFieldBytes          = 64 << 10
+	maxDatasetRecordBytes         = 1 << 20
+	maxDatasetColumns             = 64
 )
 
 // Nature classifies an update notice recognized by the sentinel.
@@ -548,16 +551,16 @@ func (s *Sentinel) lookup(ctx context.Context, corpus map[string]readyWork) (map
 		if cacheErr != nil || int64(len(cached)) > s.maxBody {
 			return nil, err
 		}
-		updates, parseErr := parseDataset(bytes.NewReader(cached), corpus)
-		if parseErr != nil {
-			return nil, fmt.Errorf("%w; cached Retraction Watch dataset is invalid: %v", err, parseErr)
+		updates, rowCount, parseErr := parseDataset(cached, corpus)
+		if parseErr != nil || rowCount == 0 {
+			return nil, fmt.Errorf("%w; cached Retraction Watch dataset is invalid: %v", err, datasetValidationError(parseErr, rowCount))
 		}
 		log.Printf("papio: Retraction Watch fetch failed; using last known-good dataset: %v", err)
 		return updates, nil
 	}
-	updates, err := parseDataset(bytes.NewReader(data), corpus)
-	if err != nil {
-		return nil, fmt.Errorf("retraction: invalid Retraction Watch dataset: %w", err)
+	updates, rowCount, err := parseDataset(data, corpus)
+	if err != nil || rowCount == 0 {
+		return nil, fmt.Errorf("retraction: invalid Retraction Watch dataset: %w", datasetValidationError(err, rowCount))
 	}
 	if err := s.writeDataset(data); err != nil {
 		return nil, fmt.Errorf("retraction: cache Retraction Watch dataset: %w", err)
@@ -607,12 +610,15 @@ func (s *Sentinel) fetchDataset(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
-func parseDataset(body io.Reader, corpus map[string]readyWork) (map[string][]update, error) {
-	reader := csv.NewReader(body)
+func parseDataset(data []byte, corpus map[string]readyWork) (map[string][]update, int, error) {
+	if err := validateDatasetShape(data); err != nil {
+		return nil, 0, err
+	}
+	reader := csv.NewReader(bytes.NewReader(data))
 	reader.FieldsPerRecord = -1
 	header, err := reader.Read()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	columns := make(map[string]int, len(header))
 	for i, name := range header {
@@ -621,7 +627,7 @@ func parseDataset(body io.Reader, corpus map[string]readyWork) (map[string][]upd
 	required := []string{"Title", "RetractionDOI", "OriginalPaperDOI", "RetractionNature"}
 	for _, name := range required {
 		if _, ok := columns[name]; !ok {
-			return nil, fmt.Errorf("missing %q column", name)
+			return nil, 0, fmt.Errorf("missing %q column", name)
 		}
 	}
 	value := func(row []string, name string) string {
@@ -633,14 +639,26 @@ func parseDataset(body io.Reader, corpus map[string]readyWork) (map[string][]upd
 	}
 	updates := make(map[string][]update)
 	seen := make(map[string]bool)
+	rowCount := 0
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, rowCount, err
 		}
+		nonempty := false
+		for _, field := range row {
+			if strings.TrimSpace(field) != "" {
+				nonempty = true
+				break
+			}
+		}
+		if !nonempty {
+			continue
+		}
+		rowCount++
 		doi, err := work.NormalizeDOI(value(row, "OriginalPaperDOI"))
 		if err != nil {
 			continue
@@ -665,7 +683,96 @@ func parseDataset(body io.Reader, corpus map[string]readyWork) (map[string][]upd
 			Nature: nature, NoticeDOI: noticeDOI, Title: value(row, "Title"),
 		})
 	}
-	return updates, nil
+	return updates, rowCount, nil
+}
+func validateDatasetShape(data []byte) error {
+	fieldBytes := 0
+	recordBytes := 0
+	columns := 1
+	inQuotes := false
+	atFieldStart := true
+	addFieldByte := func() error {
+		fieldBytes++
+		if fieldBytes > maxDatasetFieldBytes {
+			return fmt.Errorf("CSV field exceeds %d-byte limit", maxDatasetFieldBytes)
+		}
+		return nil
+	}
+	for i := 0; i < len(data); i++ {
+		char := data[i]
+		recordBytes++
+		if recordBytes > maxDatasetRecordBytes {
+			return fmt.Errorf("CSV record exceeds %d-byte limit", maxDatasetRecordBytes)
+		}
+		if inQuotes {
+			if char == '"' {
+				if i+1 < len(data) && data[i+1] == '"' {
+					i++
+					recordBytes++
+					if recordBytes > maxDatasetRecordBytes {
+						return fmt.Errorf("CSV record exceeds %d-byte limit", maxDatasetRecordBytes)
+					}
+					if err := addFieldByte(); err != nil {
+						return err
+					}
+				} else {
+					inQuotes = false
+				}
+				continue
+			}
+			if err := addFieldByte(); err != nil {
+				return err
+			}
+			continue
+		}
+		switch char {
+		case '"':
+			if atFieldStart {
+				inQuotes = true
+			} else if err := addFieldByte(); err != nil {
+				return err
+			}
+			atFieldStart = false
+		case ',':
+			columns++
+			if columns > maxDatasetColumns {
+				return fmt.Errorf("CSV record exceeds %d-column limit", maxDatasetColumns)
+			}
+			fieldBytes = 0
+			atFieldStart = true
+		case '\n':
+			fieldBytes = 0
+			recordBytes = 0
+			columns = 1
+			atFieldStart = true
+		case '\r':
+			if i+1 >= len(data) || data[i+1] != '\n' {
+				if err := addFieldByte(); err != nil {
+					return err
+				}
+				atFieldStart = false
+			}
+		default:
+			if err := addFieldByte(); err != nil {
+				return err
+			}
+			atFieldStart = false
+		}
+	}
+	if inQuotes {
+		return errors.New("CSV record has an unterminated quoted field")
+	}
+	return nil
+}
+
+func datasetValidationError(parseErr error, rowCount int) error {
+	if parseErr != nil {
+		return parseErr
+	}
+	if rowCount == 0 {
+		return errors.New("dataset contains no data rows")
+	}
+	return nil
 }
 
 func readBounded(body io.Reader, maximum int64) ([]byte, error) {
