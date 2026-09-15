@@ -88,6 +88,13 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **A paper brought back after a restart that lands on a terms page no longer
+  stalls every other message for fifteen seconds.** The extension waited for
+  the daemon's reply to its terms request from inside the very queue that
+  reply had to travel through, so the queue parked against itself until the
+  request timed out. The terms step now runs beside the queue instead of
+  inside it; nothing about the terms flow itself changed.
+
 - **ProQuest papers are fetched again instead of asking you to click.**
   ProQuest is where this library's link resolver sends most requests, and the
   adapter (now `proquest` v0.3.0) declared no way to prove the page shows the

@@ -17016,15 +17016,16 @@ export class Bridge {
             loginEntityRestored &&
             liveTab !== undefined
           ) {
-            // A restarted worker may have missed this tab's completed landing
-            // and lost the worker-local entity ID. The first re-offer restores
-            // that metadata; assess the authoritative current Chrome snapshot
-            // once instead of waiting for a navigation event that already ran.
-            await this.onTabUpdated(
+            // A restored terms gate can request a daemon permit. Its reply
+            // must traverse the inbound frame chain handling this job_offer,
+            // so classify after this handler yields instead of awaiting it.
+            void this.onTabUpdated(
               existing.tab_id,
               { status: "complete" },
               liveTab,
-            );
+            ).catch((e: unknown) => {
+              console.error("papio: restored job classification failed", e);
+            });
           }
           return;
         }
@@ -18829,6 +18830,24 @@ export class Bridge {
       this.scheduleClassifyRetry(jobID, "effect");
       return;
     }
+    await this.finishClassificationVerdict(
+      jobID,
+      spec,
+      plan,
+      host,
+      providerKey,
+      providerLeaseOwner,
+    );
+  }
+
+  private async finishClassificationVerdict(
+    jobID: string,
+    spec: AdapterSpec,
+    plan: Plan,
+    host: string,
+    providerKey: string,
+    providerLeaseOwner: string | undefined,
+  ): Promise<void> {
     let releasedProviderLease = false;
     try {
       await this.applyVerdict(jobID, spec, plan, host);
@@ -18860,8 +18879,8 @@ export class Bridge {
       after?.download_initiated === true &&
       this.downloads.get(jobID)?.generic !== undefined;
     if (
-      (!genericInFlight && verdict.kind === "unknown") ||
-      (verdict.kind !== "terms" && awaitingTermsGate)
+      (!genericInFlight && plan.verdict.kind === "unknown") ||
+      (plan.verdict.kind !== "terms" && awaitingTermsGate)
     ) {
       this.scheduleClassifyRetry(jobID);
     } else {
