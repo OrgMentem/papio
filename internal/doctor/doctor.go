@@ -514,12 +514,12 @@ func checkRetraction(cfg config.Config, add func(string, string, string, string)
 	age := time.Since(status.CheckedAt)
 	if age > retractionStaleAfter {
 		add("retraction", Warn,
-			fmt.Sprintf("last successful retraction sweep was %s ago with %d current notice(s)", quiesceDays(age), noticeCount),
+			fmt.Sprintf("last successful retraction sweep was %s ago with %d current notice(s)", sweepAge(age), noticeCount),
 			"check that the daemon stays running and that sources.retraction_watch remains enabled")
 		return
 	}
 	add("retraction", Pass,
-		fmt.Sprintf("last successful retraction sweep was %s ago with %d current notice(s)", quiesceDays(age), noticeCount), "")
+		fmt.Sprintf("last successful retraction sweep was %s ago with %d current notice(s)", sweepAge(age), noticeCount), "")
 }
 
 // checkFiling reports failed or absent on_ready outcomes only when the hook is
@@ -952,6 +952,16 @@ func quiescedActions(ctx context.Context, db *store.Store) (int, time.Duration, 
 // quiesceDays renders a multi-day duration the way a person reads it. Go's
 // Duration has no day unit, so the raw value prints as "168h0m0s" — accurate,
 // and useless in a line whose whole job is to be scanned.
+// sweepAge renders a retraction sweep age at the granularity a reader can act
+// on: minutes inside the first hour (quiesceDays would round 30 minutes to
+// "0s"), hours inside the 48-hour freshness window, days beyond it.
+func sweepAge(d time.Duration) string {
+	if d < time.Hour {
+		return d.Round(time.Minute).String()
+	}
+	return quiesceDays(d)
+}
+
 func quiesceDays(d time.Duration) string {
 	if d < 48*time.Hour {
 		return d.Round(time.Hour).String()
