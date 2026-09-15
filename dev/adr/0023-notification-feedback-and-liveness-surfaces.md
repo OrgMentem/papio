@@ -657,9 +657,9 @@ mechanism therefore remains `platform_unavailable`, and the ledger never
 records a send attempt that the host could not make.
 
 Each sender keeps untrusted text inside its platform's data boundary.
-AppleScript escapes backslashes, quotes, and line endings; Linux passes the
-message as its own guarded argument; PowerShell removes control characters and
-doubles single quotes inside one single-quoted literal.
+AppleScript escapes backslashes, quotes, and line endings; Linux entity-escapes
+markup characters and passes the body as a guarded argument; PowerShell removes
+control characters and doubles single quotes inside one single-quoted literal.
 
 ## Consequences
 

@@ -42,6 +42,12 @@ func (m MacOS) Send(ctx context.Context, message string) {
 	runBounded(ctx, m.Exec, "osascript", "-e", appleScript(message))
 }
 
+var linuxMarkupEscaper = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+)
+
 // Linux sends notifications through notify-send or the freedesktop D-Bus
 // notification service.
 type Linux struct {
@@ -55,6 +61,7 @@ func (l Linux) Send(ctx context.Context, message string) {
 	if l.Exec == nil {
 		return
 	}
+	message = linuxMarkupEscaper.Replace(message)
 	switch l.mechanism {
 	case linuxNotifySend:
 		runBounded(ctx, l.Exec, "notify-send", "--app-name", "papio", "--", "papio", message)
@@ -63,7 +70,7 @@ func (l Linux) Send(ctx context.Context, message string) {
 			"gdbus", "call", "--session",
 			"--dest", "org.freedesktop.Notifications",
 			"--object-path", "/org/freedesktop/Notifications",
-			"--method", "org.freedesktop.Notifications.Notify",
+			"--method", "org.freedesktop.Notifications.Notify", "--",
 			"papio", "0", "", "papio", message, "[]", "{}", "5000",
 		)
 	}

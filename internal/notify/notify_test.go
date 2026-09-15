@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os/exec"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 )
@@ -117,7 +116,7 @@ func TestLinuxSenderUsesSelectedArgv(t *testing.T) {
 				"gdbus", "call", "--session",
 				"--dest", "org.freedesktop.Notifications",
 				"--object-path", "/org/freedesktop/Notifications",
-				"--method", "org.freedesktop.Notifications.Notify",
+				"--method", "org.freedesktop.Notifications.Notify", "--",
 				"papio", "0", "", "papio", message, "[]", "{}", "5000",
 			},
 		},
@@ -149,6 +148,49 @@ func TestLinuxSenderUsesSelectedArgv(t *testing.T) {
 	}
 }
 
+func TestLinuxSenderEscapesMarkupInBody(t *testing.T) {
+	const message = `Paper & <a href="https://evil.example/">Open PDF</a> > queue`
+	const escaped = `Paper &amp; &lt;a href="https://evil.example/"&gt;Open PDF&lt;/a&gt; &gt; queue`
+	tests := []struct {
+		name      string
+		mechanism linuxMechanism
+		want      []string
+	}{
+		{
+			name:      "notify-send",
+			mechanism: linuxNotifySend,
+			want:      []string{"notify-send", "--app-name", "papio", "--", "papio", escaped},
+		},
+		{
+			name:      "gdbus",
+			mechanism: linuxGDBus,
+			want: []string{
+				"gdbus", "call", "--session",
+				"--dest", "org.freedesktop.Notifications",
+				"--object-path", "/org/freedesktop/Notifications",
+				"--method", "org.freedesktop.Notifications.Notify", "--",
+				"papio", "0", "", "papio", escaped, "[]", "{}", "5000",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var argv []string
+			sender := Linux{
+				mechanism: tt.mechanism,
+				Exec: func(_ context.Context, name string, args ...string) error {
+					argv = append([]string{name}, args...)
+					return nil
+				},
+			}
+			sender.Send(context.Background(), message)
+			if !reflect.DeepEqual(argv, tt.want) {
+				t.Fatalf("argv = %#v, want %#v", argv, tt.want)
+			}
+		})
+	}
+}
+
 func TestLinuxUnavailableDoesNotExecute(t *testing.T) {
 	execCalls := 0
 	sender, ok := newPlatformSender(
@@ -168,38 +210,59 @@ func TestLinuxUnavailableDoesNotExecute(t *testing.T) {
 }
 
 func TestWindowsSenderUsesEscapedLiteral(t *testing.T) {
-	const message = "Paper '; Remove-Item\nnext\r\tline\x00"
-	var argv []string
-	sender, ok := newPlatformSender(
-		"windows",
-		func(name string) (string, error) {
-			if name == "powershell" {
-				return `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, nil
+	const scriptPrefix = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; ` +
+		`[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; ` +
+		`$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); ` +
+		`$text = $xml.GetElementsByTagName('text'); ` +
+		`$text[0].AppendChild($xml.CreateTextNode('papio')) > $null; ` +
+		`$text[1].AppendChild($xml.CreateTextNode('`
+	const scriptSuffix = `')) > $null; ` +
+		`$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); ` +
+		`[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('papio').Show($toast)`
+	tests := []struct {
+		name        string
+		message     string
+		wantEscaped string
+	}{
+		{
+			name:        "Remove-Item remains inside the literal",
+			message:     "Paper '; Remove-Item\nnext\r\tline\x00",
+			wantEscaped: "Paper ''; Remove-Itemnextline",
+		},
+		{
+			name:        "Get-Process remains inside the literal",
+			message:     "Status'; Get-Process\nnow",
+			wantEscaped: "Status''; Get-Processnow",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var argv []string
+			sender, ok := newPlatformSender(
+				"windows",
+				func(name string) (string, error) {
+					if name == "powershell" {
+						return `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, nil
+					}
+					return "", exec.ErrNotFound
+				},
+				func(_ context.Context, name string, args ...string) error {
+					argv = append([]string{name}, args...)
+					return nil
+				},
+			)
+			if !ok {
+				t.Fatal("newPlatformSender() unavailable")
 			}
-			return "", exec.ErrNotFound
-		},
-		func(_ context.Context, name string, args ...string) error {
-			argv = append([]string{name}, args...)
-			return nil
-		},
-	)
-	if !ok {
-		t.Fatal("newPlatformSender() unavailable")
-	}
-	sender.Send(context.Background(), message)
-	if len(argv) != 5 {
-		t.Fatalf("argv = %#v, want powershell plus four arguments", argv)
-	}
-	if want := []string{"powershell", "-NoProfile", "-NonInteractive", "-Command"}; !reflect.DeepEqual(argv[:4], want) {
-		t.Fatalf("argv prefix = %#v, want %#v", argv[:4], want)
-	}
-	const literalCall = `$xml.CreateTextNode('Paper ''; Remove-Itemnextline')`
-	if !strings.Contains(argv[4], literalCall) {
-		t.Fatalf("script = %q, want literal call %q", argv[4], literalCall)
-	}
-	withoutLiteral := strings.Replace(argv[4], literalCall, "", 1)
-	if strings.Contains(withoutLiteral, "Remove-Item") {
-		t.Fatalf("script contains injected command outside the quoted literal: %q", argv[4])
+			sender.Send(context.Background(), tt.message)
+			want := []string{
+				"powershell", "-NoProfile", "-NonInteractive", "-Command",
+				scriptPrefix + tt.wantEscaped + scriptSuffix,
+			}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %#v, want %#v", argv, want)
+			}
+		})
 	}
 }
 
