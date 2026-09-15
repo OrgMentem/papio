@@ -292,6 +292,13 @@ execution records kept during the initial build.
   and resumed as current. The gap now carries a generation no holder can be
   issued; the grab itself still succeeds, because you start and route that
   download in your own browser.
+- **Stopping *papio* while a filing hook is still running no longer loses the
+  hook's result.** Shutdown waited five seconds for hooks, then closed the
+  database whether or not they had finished, while a hook may be allowed ten
+  minutes; a slow papis or folder hook then recorded its outcome against a
+  closed database, or not at all. *papio* now cancels a hook that outlives the
+  wait, records it as cancelled so `papio jobs unfiled` lists the paper for a
+  refile, and only then closes the database.
 - **Dismissing a held PDF from the command line now works.** The inbox offers
   "dismiss" on a PDF *papio* is holding without an identity, and the browser
   window honoured it, but the same request over the command line or an agent
