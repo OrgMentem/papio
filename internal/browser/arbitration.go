@@ -211,7 +211,7 @@ func (a *sessionArbitration) release(sessionID string) (*browserSession, bool) {
 	}
 	departed := a.holder
 	a.holder = nil
-	a.epoch++
+	a.epoch = 0
 	return departed, true
 }
 

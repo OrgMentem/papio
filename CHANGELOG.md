@@ -247,6 +247,13 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A download you started while no browser held the bridge can no longer be
+  mistaken for the next holder's work.** Releasing the bridge advanced the
+  in-memory generation to exactly the value the next holder would be issued, so
+  a PDF grab permit stamped during that gap passed the incoming holder's fence
+  and resumed as current. The gap now carries a generation no holder can be
+  issued; the grab itself still succeeds, because you start and route that
+  download in your own browser.
 - **Dismissing a held PDF from the command line now works.** The inbox offers
   "dismiss" on a PDF *papio* is holding without an identity, and the browser
   window honoured it, but the same request over the command line or an agent

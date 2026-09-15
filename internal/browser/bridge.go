@@ -2765,6 +2765,12 @@ func (b *Bridge) claimObservationAck(jobID string, p protocol.ClaimObservationAc
 // earliest possible returns, because the ack requires both unconditionally.
 func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol.ClaimObservationPayload) ([]json.RawMessage, error) {
 	generation := b.arbitration.generation()
+	applyGeneration := generation
+	if generation < 1 || b.arbitration.holderSession() == nil {
+		// The ack must carry a non-negative protocol value, but no frame can
+		// match the vacancy sentinel and gain current-holder authority.
+		applyGeneration = -1
+	}
 	if p == nil {
 		return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
 			Outcome: "error", Detail: "claim observation is missing",
@@ -2775,7 +2781,7 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 		JobID: jobID, AuthenticationClaimID: p.AuthenticationClaimID, BindingID: p.BindingID,
 		ObservationID: p.ObservationID, GateOccurrenceID: p.GateOccurrenceID,
 		EventKind: p.EventKind, EventOrdinal: p.EventOrdinal,
-		FrameGeneration: p.BrowserHolderGeneration, Generation: generation,
+		FrameGeneration: p.BrowserHolderGeneration, Generation: applyGeneration,
 		AuthReturnedEvidenceObservationID: evidenceObservationID("claim_observation_auth_returned", p.ObservationID),
 		LeaseUntil:                        b.now().Add(b.actionExpiry()),
 		Now:                               b.now(),
@@ -4100,8 +4106,8 @@ func (b *Bridge) pageCapture(ctx context.Context, sessionID, jobID string, paylo
 		return
 	}
 	// Revalidate the identity the write was started for. release() drops the
-	// pending capture and increments b.arbitration.generation() when a holder departs, promote()
-	// takes a fresh holder generation, and Capture's timeout arm deletes the
+	// pending capture and sets the generation to the vacancy sentinel, promote()
+	// takes a fresh durable generation, and Capture's timeout arm deletes the
 	// pending entry — any of which can happen inside the window above. Entry
 	// identity keeps pending.path off a NEW request; the epoch additionally
 	// keeps this capture's receipt off a REPLACEMENT holder's job.
@@ -6039,6 +6045,14 @@ func (b *Bridge) pdfGrabRefusalReason(sessionID string) string {
 	return ""
 }
 
+func (b *Bridge) pdfGrabGeneration() int64 {
+	generation := b.arbitration.generation()
+	if generation < 1 || b.arbitration.holderSession() == nil {
+		return 0
+	}
+	return generation
+}
+
 // pdfGrab allocates a PDF grab (ADR-0020 Decision 3): a grab id and a
 // steering directory under the reserved grabs/ namespace. It never touches
 // the requested URL itself — only chrome.downloads.download, steered by the
@@ -6086,7 +6100,8 @@ func (b *Bridge) pdfGrab(ctx context.Context, sessionID string, request *protoco
 		preparedDir = dir
 		return nil
 	}
-	g, err := b.grabs.AllocateEffect(ctx, normalizedHost, title, b.arbitration.generation(), safetyDomain, b.now().Add(b.actionExpiry()), prepare, request.RequestID)
+	holderGeneration := b.pdfGrabGeneration()
+	g, err := b.grabs.AllocateEffect(ctx, normalizedHost, title, holderGeneration, safetyDomain, b.now().Add(b.actionExpiry()), prepare, request.RequestID)
 	if err != nil {
 		if preparedDir != "" {
 			_ = os.RemoveAll(preparedDir)
@@ -6193,7 +6208,7 @@ func (b *Bridge) pdfGrabAbandonSession(ctx context.Context, sessionID string, re
 		return []json.RawMessage{frame}, nil
 	}
 	return b.pdfGrabAbandonWith(ctx, request, request.RequestID, func() error {
-		err := b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, b.arbitration.generation(), "The PDF grab download was interrupted")
+		err := b.grabs.MarkAbandonedForRequest(ctx, request.GrabID, request.RequestID, b.pdfGrabGeneration(), "The PDF grab download was interrupted")
 		if err == nil {
 			return nil
 		}

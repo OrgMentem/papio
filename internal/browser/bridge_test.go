@@ -984,7 +984,7 @@ func TestPageCaptureStoreDoesNotHoldSessionLock(t *testing.T) {
 }
 
 // TestPageCaptureHolderDepartureDuringStoreDiscardsResult covers the window the
-// unlock opens: release() drops the pending capture and increments b.arbitration.generation(), so
+// unlock opens: release() drops the pending capture and sets b.arbitration.generation() to the vacancy sentinel, so
 // a write that completes after the departure must not attach its path to the
 // request, must not record a receipt against the replacement holder's bridge,
 // and must not leave a pinned file no request can claim.
