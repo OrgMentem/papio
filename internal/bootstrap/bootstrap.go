@@ -479,7 +479,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if retractions != nil {
 		triageService.RegisterSource(retractions)
 	}
-	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), retractions, router}
+	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.UnavailableRechecker(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), retractions, router}
 	if reconciler := zotioService.TagReconciler(); reconciler != nil {
 		maintenance = append(maintenance, reconciler)
 	}

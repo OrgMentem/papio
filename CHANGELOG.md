@@ -24,6 +24,13 @@ execution records kept during the initial build.
   uses `notify-send` (or `gdbus` when that is absent) and Windows a built-in
   PowerShell toast, chosen by probe at startup so `papio doctor` and the
   notification ledger report the real mechanism.
+- **Papers that were unavailable are checked again for everyone.** A paywalled
+  paper often becomes free later: embargoes lift, authors post copies, holdings
+  change. Only Zotero users with a backfill watch got that re-check. The daemon
+  now re-submits stale `unavailable` jobs through the ordinary path after
+  `[zotio] unavailable_recheck_days`, one bounded batch per pass, skipping
+  reasons a wait cannot change and work that is already live or delivered. The
+  old job records the re-check so `papio jobs get` shows what happened.
 - **arXiv is a discovery backend.** `papio search --source arxiv` and standing
   watches now query arXiv directly with no key and no credit spend, so weekly
   "what is new" watches in CS, ML, physics, and math are not gated on aggregator

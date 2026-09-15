@@ -140,6 +140,26 @@ func NormalizeTerminalReason(reason string) TerminalReason {
 	}
 }
 
+// RecheckExempt reports whether replaying the unchanged work request cannot
+// change its terminal outcome. Metadata correction or a new explicit request
+// is required for identity gaps and cancellations remain deliberate terminal
+// choices. Acquisition, access, and candidate outcomes are not exempt because
+// sources, holdings, and provider routes can change after the original attempt.
+func RecheckExempt(reason string) bool {
+	switch TerminalReason(reason) {
+	case TerminalReasonNoIdentifier,
+		TerminalReasonDOINotRegistered,
+		TerminalReasonInsufficientIdentityEvidence,
+		TerminalReasonCancelledByUser,
+		TerminalReasonBrowserCancelled,
+		TerminalReasonUserDismissed,
+		TerminalReasonReviewRejected:
+		return true
+	default:
+		return false
+	}
+}
+
 // Provenance records how an identifier entered durable storage.
 type Provenance string
 

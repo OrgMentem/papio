@@ -514,12 +514,11 @@ func (s *Service) liveJobForRequest(ctx context.Context, requestID string) (stri
 
 // unavailableCooldown returns how long an item's unavailable outcome still
 // parks it. Unavailability decays — green-OA copies appear months after
-// publication, holdings change, adapters gain providers — so backfill
-// re-checks after the configured window instead of retrying every cadence or
-// older verdict. no_identifier, doi_not_registered, and
-// insufficient_identity_evidence are intentionally exempt because editing the
-// item's metadata — supplying a DOI, correcting a mistyped one, or confirming
-// identity — can make it fetchable immediately without waiting out the window.
+// publication, holdings change, adapters gain providers — so backfill and the
+// daemon-wide unavailable re-check wait for the configured window instead of
+// retrying every cadence. job.RecheckExempt is the shared list of outcomes an
+// unchanged work request cannot alter; metadata correction or an explicit new
+// request can proceed immediately.
 func (s *Service) unavailableCooldown(ctx context.Context, requestID string) (time.Duration, error) {
 	if s.UnavailableRecheck <= 0 {
 		return 0, nil
@@ -535,7 +534,7 @@ func (s *Service) unavailableCooldown(ctx context.Context, requestID string) (ti
 	if err != nil {
 		return 0, err
 	}
-	if state != job.StateUnavailable || terminalReason == "no_identifier" || terminalReason == "doi_not_registered" || terminalReason == string(job.TerminalReasonInsufficientIdentityEvidence) {
+	if state != job.StateUnavailable || job.RecheckExempt(terminalReason) {
 		return 0, nil
 	}
 	decided, err := time.Parse(time.RFC3339, updatedAt)
