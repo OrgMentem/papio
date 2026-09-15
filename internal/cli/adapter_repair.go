@@ -86,11 +86,12 @@ type adapterRepairResult struct {
 }
 
 type adapterRepairCandidate struct {
-	Score           int    `json:"score"`
-	Selector        string `json:"selector"`
-	OuterHTML       string `json:"outer_html"`
-	Verified        bool   `json:"verified"`
-	ReplaceSelector string `json:"replace_selector"`
+	Score              int    `json:"score"`
+	Selector           string `json:"selector"`
+	OuterHTML          string `json:"outer_html"`
+	ClassifierVerified bool   `json:"classifier_verified"`
+	PlanComplete       bool   `json:"plan_complete"`
+	ReplaceSelector    string `json:"replace_selector"`
 }
 
 type adapterRepairCandidates struct {
@@ -419,11 +420,12 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 
 	ruleKind, kindErr := adapterRepairRuleKind(capture.Scenario)
 	candidateStatus := ""
+	generationSupported := false
 	var candidates adapterRepairCandidates
 	if kindErr != nil {
-		candidateStatus = kindErr.Error()
+		candidateStatus = "Patch generation stopped: " + kindErr.Error()
 	} else if _, statErr := os.Stat(filepath.Join(deps.RepoRoot, "extension", "tools", "adapter-repair.ts")); statErr != nil {
-		candidateStatus = "selector synthesis skipped: extension/tools/adapter-repair.ts is unavailable"
+		candidateStatus = "Patch generation stopped: extension/tools/adapter-repair.ts is unavailable."
 	} else {
 		output, runErr := deps.Run.Run(
 			ctx,
@@ -435,37 +437,54 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 			"--rule-kind", ruleKind,
 		)
 		if runErr != nil {
-			candidateStatus = fmt.Sprintf("selector synthesis failed: %v\n%s", runErr, output)
+			candidateStatus = fmt.Sprintf("Patch generation stopped because selector synthesis failed: %v\n%s", runErr, output)
 		} else if decodeErr := json.Unmarshal([]byte(output), &candidates); decodeErr != nil {
-			candidateStatus = fmt.Sprintf("selector synthesis returned invalid JSON: %v", decodeErr)
+			candidateStatus = fmt.Sprintf("Patch generation stopped because selector synthesis returned invalid JSON: %v", decodeErr)
+		} else if candidates.Provider != capture.Provider || candidates.Scenario != capture.Scenario || candidates.RuleKind != ruleKind {
+			candidateStatus = "Patch generation stopped because selector synthesis returned mismatched provider, scenario, or rule-kind metadata."
+		} else {
+			generationSupported = true
 		}
 	}
 
-	var top *adapterRepairCandidate
-	for i := range candidates.Candidates {
-		if candidates.Candidates[i].Verified {
-			top = &candidates.Candidates[i]
-			break
+	var topClassifier, top *adapterRepairCandidate
+	if generationSupported {
+		for i := range candidates.Candidates {
+			candidate := &candidates.Candidates[i]
+			if candidate.ClassifierVerified && topClassifier == nil {
+				topClassifier = candidate
+			}
+			if candidate.ClassifierVerified && candidate.PlanComplete && candidate.ReplaceSelector != "" {
+				top = candidate
+				break
+			}
+		}
+		candidateStatus = "Classifier verification only proves selector matching. Treat every candidate as a starting point. A maintainer must confirm the article file against live `%PDF` bytes before applying it."
+		if top != nil {
+			candidateStatus += fmt.Sprintf("\n\nTop candidate with a complete plan: `%s` (score %d).\n\nProven missing selector: `%s`.\n\nMatched node: `%s`", top.Selector, top.Score, top.ReplaceSelector, top.OuterHTML)
+		} else if topClassifier != nil && topClassifier.ReplaceSelector == "" {
+			candidateStatus += "\n\nThe capture proves no declared selector is missing. No types.ts.patch was emitted."
+		} else if topClassifier != nil {
+			candidateStatus += "\n\nAt least one candidate passed classifier matching, but none produced a complete non-assisted plan. No types.ts.patch was emitted."
+		} else {
+			candidateStatus += fmt.Sprintf("\n\nNo selector candidate passed classifier matching for the `%s` rule. No types.ts.patch was emitted.", ruleKind)
 		}
 	}
-	if top == nil && candidateStatus == "" {
-		candidateStatus = fmt.Sprintf("No selector candidate verified through planExecution for the `%s` rule. No types.ts.patch was emitted.", ruleKind)
-	}
-	if top != nil {
-		candidateStatus = fmt.Sprintf("Top verified candidate: `%s` (score %d).\n\nMatched node: `%s`", top.Selector, top.Score, top.OuterHTML)
-	}
 
-	adaptersTestPath := filepath.Join(deps.RepoRoot, "extension", "test", "adapters.test.ts")
-	adaptersTestSource, readErr := os.ReadFile(adaptersTestPath)
-	if readErr != nil {
-		return adapterRepairResult{}, fmt.Errorf("read extension/test/adapters.test.ts: %w", readErr)
-	}
-	expectedVerdict := ruleKind
-	testCase := adapterRepairTestCase(capture.Provider, capture.Scenario, expectedVerdict)
-	testPatch := appendUnifiedPatch("extension/test/adapters.test.ts", string(adaptersTestSource), testCase)
-	testPatchPath := filepath.Join(workspace, "adapters.test.ts.patch")
-	if err := os.WriteFile(testPatchPath, []byte(testPatch), 0o600); err != nil {
-		return adapterRepairResult{}, fmt.Errorf("write adapters test patch: %w", err)
+	testPatchWritten := false
+	if generationSupported {
+		adaptersTestPath := filepath.Join(deps.RepoRoot, "extension", "test", "adapters.test.ts")
+		adaptersTestSource, readErr := os.ReadFile(adaptersTestPath)
+		if readErr != nil {
+			return adapterRepairResult{}, fmt.Errorf("read extension/test/adapters.test.ts: %w", readErr)
+		}
+		testCase := adapterRepairTestCase(capture.Provider, capture.Scenario, ruleKind)
+		testPatch := appendUnifiedPatch("extension/test/adapters.test.ts", string(adaptersTestSource), testCase)
+		testPatchPath := filepath.Join(workspace, "adapters.test.ts.patch")
+		if err := os.WriteFile(testPatchPath, []byte(testPatch), 0o600); err != nil {
+			return adapterRepairResult{}, fmt.Errorf("write adapters test patch: %w", err)
+		}
+		testPatchWritten = true
 	}
 
 	typesPatchWritten := false
@@ -488,7 +507,7 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		}
 		typesPatchWritten = true
 	} else if top != nil && !capture.IndependentEvidence {
-		candidateStatus += "\n\nThe verified selector remains proposal-only. Independent evidence is absent, so the revision bump and types.ts.patch stay locked."
+		candidateStatus += "\n\nThe complete candidate remains proposal-only. Independent evidence is absent, so the revision bump and types.ts.patch stay locked."
 	} else if top != nil && nextRevision == "unknown" {
 		candidateStatus += "\n\nThe adapter revision could not be advanced, so types.ts.patch was not emitted."
 	}
@@ -516,23 +535,26 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	}
 	workspaceRelative = filepath.ToSlash(workspaceRelative)
 	fixtureSource := workspaceRelative + "/" + filepath.ToSlash(finalFixtureRelative)
-	patches := workspaceRelative + "/adapters.test.ts.patch"
-	if typesPatchWritten {
-		patches += " " + workspaceRelative + "/types.ts.patch"
+	apply := "# No applicable repair patch\n\nPatch generation stopped. Review `report.md` for the exact reason.\n"
+	if testPatchWritten {
+		patches := workspaceRelative + "/adapters.test.ts.patch"
+		if typesPatchWritten {
+			patches += " " + workspaceRelative + "/types.ts.patch"
+		}
+		reviewTarget := "the generated test diff"
+		if typesPatchWritten {
+			reviewTarget = "both generated diffs"
+		}
+		apply = fmt.Sprintf(
+			"# Apply this reviewed repair\n\nClassifier verification does not prove that an article candidate returns PDF bytes. Confirm the candidate against live `%%PDF` bytes first.\n\nRun from the repository root after reviewing `report.md` and %s.\n\n```sh\ngit apply %s\nmkdir -p extension/fixtures/%s\ncp %s extension/fixtures/%s/%s.html\n(cd extension && bun test test/adapters.test.ts)\n```\n",
+			reviewTarget,
+			patches,
+			capture.Provider,
+			fixtureSource,
+			capture.Provider,
+			capture.Scenario,
+		)
 	}
-	reviewTarget := "the generated test diff"
-	if typesPatchWritten {
-		reviewTarget = "both generated diffs"
-	}
-	apply := fmt.Sprintf(
-		"# Apply this reviewed repair\n\nRun from the repository root after reviewing `report.md` and %s.\n\n```sh\ngit apply %s\nmkdir -p extension/fixtures/%s\ncp %s extension/fixtures/%s/%s.html\n(cd extension && bun test test/adapters.test.ts)\n```\n",
-		reviewTarget,
-		patches,
-		capture.Provider,
-		fixtureSource,
-		capture.Provider,
-		capture.Scenario,
-	)
 	if err := os.WriteFile(applyPath, []byte(apply), 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write apply instructions: %w", err)
 	}
@@ -558,15 +580,26 @@ func adapterRepairRuleKind(scenario string) (string, error) {
 
 func adapterRepairTestCase(provider, scenario, expected string) string {
 	identifier := strings.NewReplacer("-", "_", ".", "_").Replace(provider + "_" + scenario)
+	var planLines string
+	if expected == "article" {
+		planLines = fmt.Sprintf(
+			"    const evidence = spec.workEvidence;\n    if (evidence === undefined) throw new Error(%q);\n    const evidenceNode = page.querySelector(evidence.selector);\n    if (evidenceNode === null) throw new Error(%q);\n    let identity = evidence.attribute === undefined ? evidenceNode.textContent?.trim() ?? \"\" : evidenceNode.getAttribute(evidence.attribute)?.trim() ?? \"\";\n    if (evidence.pattern !== undefined) identity = new RegExp(evidence.pattern).exec(identity)?.[1]?.trim() ?? \"\";\n    expect(identity).not.toBe(\"\");\n    const expectedWork = evidence.kind === \"doi\" ? { doi: identity } : { title: identity };\n    const planned = planExecution(page, spec, expectedWork, {});\n",
+			"generated article repair requires packaged work evidence",
+			"generated article repair fixture lacks packaged identity evidence",
+		)
+	} else {
+		planLines = "    const planned = planExecution(page, spec, {}, {});\n"
+	}
 	return fmt.Sprintf(
-		"\nconst repair_%s = loadFixture(%q, %q);\ntest.skipIf(repair_%s === null)(\n  %q,\n  () => {\n    const spec = adapters.find((candidate) => candidate.id === %q) as AdapterSpec;\n    expect(classifyFixture(repair_%s as Document, spec).kind).toBe(%q);\n  },\n);\n",
+		"\nconst repair_%s = loadFixture(%q, %q);\ntest.skipIf(repair_%s === null)(\n  %q,\n  () => {\n    const page = repair_%s as Document;\n    const spec = adapters.find((candidate) => candidate.id === %q) as AdapterSpec;\n%s    expect(\"assisted\" in planned).toBe(false);\n    expect(planned.verdict.kind).toBe(%q);\n  },\n);\n",
 		identifier,
 		provider,
 		scenario,
 		identifier,
-		fmt.Sprintf("generated %s %s fixture classifies as %s", provider, scenario, expected),
-		provider,
+		fmt.Sprintf("generated %s %s fixture produces a complete %s plan", provider, scenario, expected),
 		identifier,
+		provider,
+		planLines,
 		expected,
 	)
 }
@@ -634,20 +667,24 @@ func adapterTypesUnifiedPatch(source, provider, ruleKind, oldSelector, newSelect
 	}
 
 	oldQuoted, newQuoted := strconv.Quote(oldSelector), strconv.Quote(newSelector)
-	selectorIndex := -1
+	foundInRule := false
 	for i := ruleStart; i < ruleEnd; i++ {
 		if strings.Contains(lines[i], oldQuoted) {
-			selectorIndex = i
+			foundInRule = true
 			break
 		}
 	}
-	if selectorIndex < 0 {
+	if !foundInRule {
 		return "", fmt.Errorf("the %s rule does not contain selector %q", ruleKind, oldSelector)
 	}
 
 	changes := map[int]string{
-		versionIndex:  strings.Replace(lines[versionIndex], strconv.Quote(currentVersion), strconv.Quote(nextRevision), 1),
-		selectorIndex: strings.Replace(lines[selectorIndex], oldQuoted, newQuoted, 1),
+		versionIndex: strings.Replace(lines[versionIndex], strconv.Quote(currentVersion), strconv.Quote(nextRevision), 1),
+	}
+	for i := adapterStart; i < adapterEnd; i++ {
+		if strings.Contains(lines[i], oldQuoted) {
+			changes[i] = strings.ReplaceAll(lines[i], oldQuoted, newQuoted)
+		}
 	}
 	return replacementUnifiedPatch("extension/src/adapters/types.ts", lines, changes), nil
 }

@@ -1,10 +1,11 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
 import { readFileSync } from "node:fs";
+import { Window } from "happy-dom";
 
 import { adapters, type AdapterSpec, type ClassifyRule, type PageKind } from "../src/adapters/types";
-import { planExecution } from "../src/plan";
-import { captureOrigin, parseHTML, verdictOf } from "../test/harness";
+import { planExecution, type ExpectedWork } from "../src/plan";
+import { captureOrigin, verdictOf } from "../test/harness";
 
 export type RepairRuleKind = Exclude<PageKind, "unknown">;
 
@@ -12,7 +13,8 @@ export interface SelectorCandidate {
   score: number;
   selector: string;
   outer_html: string;
-  verified: boolean;
+  classifier_verified: boolean;
+  plan_complete: boolean;
   replace_selector: string | null;
 }
 
@@ -72,7 +74,14 @@ function semanticNodes(doc: Document, kind: RepairRuleKind): Element[] {
           }
           return ARTICLE_WORDS.test(`${pathname} ${elementWords(node)}`);
         }
-        return (tag === "button" || node.getAttribute("role") === "button" || tag === "input") && ARTICLE_WORDS.test(elementWords(node));
+        const words = elementWords(node);
+        const hasActionAttribute = ["href", "data-href", "onclick", "formaction"].some((name) => node.hasAttribute(name));
+        const customControl = tag.includes("-") || tag.includes("button");
+        const ownValues = [tag, node.getAttribute("id") ?? "", node.getAttribute("class") ?? "", node.getAttribute("name") ?? "", node.getAttribute("title") ?? "", node.getAttribute("aria-label") ?? ""];
+        for (const attr of Array.from(node.attributes)) {
+          if (attr.name.startsWith("data-")) ownValues.push(attr.name, attr.value);
+        }
+        return ARTICLE_WORDS.test(words) && (hasActionAttribute || customControl || ARTICLE_WORDS.test(ownValues.join(" ")));
       });
     case "login":
       return all.filter((node) => {
@@ -189,26 +198,72 @@ function replacementTarget(doc: Document, rule: ClassifyRule): string | null {
     }
     if (!anyMatches) return rule.any?.[0] ?? null;
   }
-  return rule.all?.[0] ?? rule.any?.[0] ?? null;
+  return null;
 }
 
 function candidateSpec(spec: AdapterSpec, ruleIndex: number, replaceSelector: string | null, candidate: string): AdapterSpec {
   const sourceRule = spec.classify[ruleIndex];
   if (sourceRule === undefined) throw new Error(`rule index ${ruleIndex} is unavailable`);
+  if (replaceSelector === null) return structuredClone(spec);
   const replace = (values: string[]): string[] =>
-    values.map((value) => (replaceSelector !== null && value === replaceSelector ? candidate : value));
+    values.map((value) => (value === replaceSelector ? candidate : value));
   const rule: ClassifyRule = { kind: sourceRule.kind };
   if (sourceRule.all !== undefined) rule.all = replace(sourceRule.all);
   if (sourceRule.any !== undefined) rule.any = replace(sourceRule.any);
   if (sourceRule.textAny !== undefined) rule.textAny = [...sourceRule.textAny];
   if (sourceRule.deferUntilDeadline !== undefined) rule.deferUntilDeadline = sourceRule.deferUntilDeadline;
-  if (replaceSelector === null) rule.all = [...(rule.all ?? []), candidate];
-  return { ...spec, classify: [rule] };
+
+  const trial = structuredClone(spec);
+  trial.classify[ruleIndex] = rule;
+  if (trial.download?.selector === replaceSelector) trial.download.selector = candidate;
+  if (trial.download?.shadowSelector === replaceSelector) trial.download.shadowSelector = candidate;
+  if (trial.download?.postClickWaitFor === replaceSelector) trial.download.postClickWaitFor = candidate;
+  if (trial.download?.followupSelector === replaceSelector) trial.download.followupSelector = candidate;
+  if (trial.download?.workTarget?.selector === replaceSelector) trial.download.workTarget.selector = candidate;
+  if (trial.workEvidence?.selector === replaceSelector) trial.workEvidence.selector = candidate;
+  if (trial.termsAccept?.modalSelector === replaceSelector) trial.termsAccept.modalSelector = candidate;
+  if (trial.termsAccept?.control === replaceSelector) trial.termsAccept.control = candidate;
+  return trial;
+}
+
+function expectedWorkFor(doc: Document, spec: AdapterSpec): ExpectedWork {
+  const contract = spec.workEvidence;
+  if (contract === undefined) return {};
+  const node = doc.querySelector(contract.selector);
+  if (node === null) return {};
+  let value = contract.attribute === undefined ? node.textContent?.trim() ?? "" : node.getAttribute(contract.attribute)?.trim() ?? "";
+  if (value === "") return {};
+  if (contract.pattern !== undefined) {
+    const match = new RegExp(contract.pattern).exec(value);
+    value = match?.[1]?.trim() ?? "";
+  }
+  if (value === "") return {};
+  return contract.kind === "doi" ? { doi: value } : { title: value };
 }
 
 function truncateOuterHTML(node: Element): string {
   const compact = node.outerHTML.replace(/\s+/g, " ").trim();
   return compact.length <= 320 ? compact : `${compact.slice(0, 317)}...`;
+}
+
+function parseOfflineCapture(html: string, baseURL: string, onFetchAttempt?: (url: string) => void): Document {
+  const window = new Window({
+    url: baseURL,
+    settings: {
+      disableJavaScriptFileLoading: true,
+      disableJavaScriptEvaluation: true,
+      disableCSSFileLoading: true,
+      disableIframePageLoading: true,
+      disableComputedStyleRendering: true,
+    },
+  });
+  window.fetch = ((input: unknown) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : String(input);
+    onFetchAttempt?.(url);
+    return Promise.reject(new Error(`network access is disabled while parsing adapter captures: ${url}`));
+  }) as typeof window.fetch;
+  window.document.write(html);
+  return window.document as unknown as Document;
 }
 
 export function synthesizeAdapterRepair(
@@ -217,6 +272,7 @@ export function synthesizeAdapterRepair(
   scenario: string,
   ruleKind: RepairRuleKind,
   limit = 10,
+  onFetchAttempt?: (url: string) => void,
 ): AdapterRepairOutput {
   const origin = captureOrigin(html);
   let base = "https://fixture.local/";
@@ -228,7 +284,7 @@ export function synthesizeAdapterRepair(
       // The diagnostic stays offline and uses the fixture-local base.
     }
   }
-  const doc = parseHTML(html, base);
+  const doc = parseOfflineCapture(html, base, onFetchAttempt);
   const ruleIndex = spec.classify.findIndex((rule) => rule.kind === ruleKind);
   if (ruleIndex < 0) throw new Error(`adapter ${spec.id} has no ${ruleKind} rule`);
   const rule = spec.classify[ruleIndex] as ClassifyRule;
@@ -246,12 +302,16 @@ export function synthesizeAdapterRepair(
     .slice(0, Math.max(0, limit))
     .map((item): SelectorCandidate => {
       const trial = candidateSpec(spec, ruleIndex, replaceSelector, item.selector);
-      const verdict = verdictOf(planExecution(doc, trial, {}, {}));
+      const expected = expectedWorkFor(doc, spec);
+      const planned = planExecution(doc, trial, expected, {});
+      const classifierVerified = verdictOf(planned).kind === ruleKind;
+      const hasFixtureIdentity = ruleKind !== "article" || expected.doi !== undefined || expected.title !== undefined;
       return {
         score: item.score,
         selector: item.selector,
         outer_html: truncateOuterHTML(item.node),
-        verified: verdict.kind === ruleKind,
+        classifier_verified: classifierVerified,
+        plan_complete: classifierVerified && hasFixtureIdentity && !("assisted" in planned),
         replace_selector: replaceSelector,
       };
     });
