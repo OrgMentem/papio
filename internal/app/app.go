@@ -150,6 +150,10 @@ type Service struct {
 	// hookWG tracks launched on_ready hook goroutines so shutdown can drain
 	// them before the store closes (DrainHooks).
 	hookWG sync.WaitGroup
+	// hookMu protects hookInFlight, which admits at most one automatic or
+	// manual filing run per job.
+	hookMu       sync.Mutex
+	hookInFlight map[string]struct{}
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -3902,10 +3906,14 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return
 	}
+	if !s.beginReadyHook(row.ID) {
+		return
+	}
 	eventCtx := context.WithoutCancel(ctx)
 	s.hookWG.Add(1)
 	go func() {
 		defer s.hookWG.Done()
+		defer s.endReadyHook(row.ID)
 		_, _ = s.executeReadyHook(eventCtx, row, sha, "ready")
 	}()
 }
@@ -3923,7 +3931,43 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return RefileResult{}, ErrReadyHookNotConfigured
 	}
+	if !s.beginReadyHook(row.ID) {
+		return RefileResult{}, job.ErrConflict
+	}
+	defer s.endReadyHook(row.ID)
+	var latestStatus string
+	err = s.Jobs.S.DB().QueryRowContext(ctx, `
+		SELECT COALESCE(json_extract(detail_json, '$.status'), '')
+		FROM events
+		WHERE job_id = ? AND kind = 'hook.on_ready'
+		ORDER BY seq DESC
+		LIMIT 1`, row.ID).Scan(&latestStatus)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return RefileResult{}, err
+	}
+	if latestStatus == "ok" {
+		return RefileResult{}, fmt.Errorf("paper is already filed; run `papio jobs unfiled` to list jobs that need filing: %w", job.ErrConflict)
+	}
 	return s.executeReadyHook(ctx, row, row.ArtifactSHA256, "manual")
+}
+
+func (s *Service) beginReadyHook(jobID string) bool {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	if s.hookInFlight == nil {
+		s.hookInFlight = make(map[string]struct{})
+	}
+	if _, running := s.hookInFlight[jobID]; running {
+		return false
+	}
+	s.hookInFlight[jobID] = struct{}{}
+	return true
+}
+
+func (s *Service) endReadyHook(jobID string) {
+	s.hookMu.Lock()
+	delete(s.hookInFlight, jobID)
+	s.hookMu.Unlock()
 }
 
 func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigger string) (RefileResult, error) {

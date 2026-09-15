@@ -2865,6 +2865,11 @@ func TestRefileJob(t *testing.T) {
 	if len(filings) != 2 || filings[1]["trigger"] != "manual" || filings[1]["status"] != "ok" {
 		t.Fatalf("filing events = %#v", filings)
 	}
+	if _, err := svc.RefileJob(ctx, id); !errors.Is(err, job.ErrConflict) ||
+		!strings.Contains(err.Error(), "paper is already filed") ||
+		!strings.Contains(err.Error(), "papio jobs unfiled") {
+		t.Fatalf("successful filing replay error = %v", err)
+	}
 	importedID := createFilingStateJob(t, jobs, "wr_refile_imported", job.StateImported)
 	readyRow, err := jobs.Get(ctx, id)
 	if err != nil {
@@ -2889,6 +2894,146 @@ func TestRefileJob(t *testing.T) {
 	resolvingID := createFilingStateJob(t, jobs, "wr_refile_resolving", job.StateResolving)
 	if _, err := svc.RefileJob(ctx, resolvingID); !errors.Is(err, job.ErrConflict) {
 		t.Fatalf("resolving refile error = %v", err)
+	}
+}
+
+func TestOnReadyHookRejectsRefileWhileAutomaticRunIsInFlight(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	readyPipeline(svc)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var callsMu sync.Mutex
+	calls := 0
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, _ []string) hook.Result {
+			callsMu.Lock()
+			calls++
+			callsMu.Unlock()
+			startOnce.Do(func() { close(started) })
+			<-release
+			return hook.Result{Ran: true, ExitCode: 0}
+		},
+	}
+	id, err := svc.Submit(ctx, doiRequest("wr_refile_automatic_inflight"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Process(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	refileErr := make(chan error, 1)
+	go func() {
+		_, err := svc.RefileJob(ctx, id)
+		refileErr <- err
+	}()
+	select {
+	case err := <-refileErr:
+		if !errors.Is(err, job.ErrConflict) {
+			t.Fatalf("refile during automatic run error = %v", err)
+		}
+	case <-time.After(time.Second):
+		unblock()
+		err := <-refileErr
+		_ = svc.DrainHooks(time.Second)
+		t.Fatalf("refile waited for the automatic run instead of returning conflict: %v", err)
+	}
+	unblock()
+	if !svc.DrainHooks(time.Second) {
+		t.Fatal("automatic hook did not drain")
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filings := 0
+	for _, event := range events {
+		if event["kind"] == "hook.on_ready" {
+			filings++
+		}
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 || filings != 1 {
+		t.Fatalf("hook calls = %d, filing events = %d, want one of each", calls, filings)
+	}
+}
+
+func TestRefileJobRejectsConcurrentRun(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id := createFilingStateJob(t, jobs, "wr_refile_concurrent", job.StateReady)
+	const sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET artifact_sha256 = ? WHERE id = ?`, sha, id); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var callsMu sync.Mutex
+	calls := 0
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, _ []string) hook.Result {
+			callsMu.Lock()
+			calls++
+			callsMu.Unlock()
+			startOnce.Do(func() { close(started) })
+			<-release
+			return hook.Result{Ran: true, ExitCode: 0}
+		},
+	}
+	first := make(chan error, 1)
+	go func() {
+		_, err := svc.RefileJob(ctx, id)
+		first <- err
+	}()
+	<-started
+	second := make(chan error, 1)
+	go func() {
+		_, err := svc.RefileJob(ctx, id)
+		second <- err
+	}()
+	select {
+	case err := <-second:
+		if !errors.Is(err, job.ErrConflict) {
+			t.Fatalf("second concurrent refile error = %v", err)
+		}
+	case <-time.After(time.Second):
+		unblock()
+		err := <-second
+		_ = <-first
+		t.Fatalf("second refile waited instead of returning conflict: %v", err)
+	}
+	unblock()
+	if err := <-first; err != nil {
+		t.Fatalf("first refile error = %v", err)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filings := 0
+	for _, event := range events {
+		if event["kind"] == "hook.on_ready" {
+			filings++
+		}
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 || filings != 1 {
+		t.Fatalf("hook calls = %d, filing events = %d, want one of each", calls, filings)
 	}
 }
 
