@@ -31,6 +31,13 @@ execution records kept during the initial build.
   `[zotio] unavailable_recheck_days`, one bounded batch per pass, skipping
   reasons a wait cannot change and work that is already live or delivered. The
   old job records the re-check so `papio jobs get` shows what happened.
+- **Retraction warnings for your whole library, not only the papers *papio*
+  fetched.** Set `[retraction] scope = "library"` and the daily sweep also
+  covers every DOI in your configured bibliographic exports and your Zotero
+  library. The sweep now reads the Retraction Watch dataset Crossref publishes
+  in one cached request per day instead of one request per paper, so cost no
+  longer grows with your library. The default stays `"acquired"`, so an upgrade
+  does not widen anything on its own.
 - **arXiv is a discovery backend.** `papio search --source arxiv` and standing
   watches now query arXiv directly with no key and no credit spend, so weekly
   "what is new" watches in CS, ML, physics, and math are not gated on aggregator

@@ -107,6 +107,33 @@ func TestSaveValidatesExceptionTagsAndRecheckWindow(t *testing.T) {
 		t.Fatalf("valid exception-tag config rejected: %v", err)
 	}
 }
+func TestRetractionScopeValidation(t *testing.T) {
+	for _, scope := range []string{RetractionScopeAcquired, RetractionScopeLibrary} {
+		t.Run("accepts "+scope, func(t *testing.T) {
+			cfg := Default()
+			cfg.AccessMode = ModeConservative
+			cfg.Retraction.Scope = scope
+			if err := Save(cfg, filepath.Join(t.TempDir(), "config.toml")); err != nil {
+				t.Fatalf("valid retraction.scope %q rejected: %v", scope, err)
+			}
+		})
+	}
+	for _, scope := range []string{"", "all", "ready"} {
+		t.Run("rejects "+scope, func(t *testing.T) {
+			cfg := Default()
+			cfg.AccessMode = ModeConservative
+			cfg.Retraction.Scope = scope
+			err := Save(cfg, filepath.Join(t.TempDir(), "config.toml"))
+			if err == nil || !strings.Contains(err.Error(), "retraction.scope must be acquired or library") {
+				t.Fatalf("invalid retraction.scope %q error = %v", scope, err)
+			}
+		})
+	}
+	if got := Default().Retraction.Scope; got != RetractionScopeAcquired {
+		t.Fatalf("default retraction.scope = %q, want %q", got, RetractionScopeAcquired)
+	}
+}
+
 func TestCapturesDefaultsAndValidation(t *testing.T) {
 	cfg := Default()
 	cfg.AccessMode = ModeConservative

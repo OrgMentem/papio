@@ -516,6 +516,17 @@ type Hooks struct {
 	TimeoutSeconds int `toml:"timeout_seconds"`
 }
 
+// Retraction controls which local DOI corpus the daily retraction sentinel
+// checks. The default keeps the historical papio-acquired scope.
+type Retraction struct {
+	Scope string `toml:"scope"`
+}
+
+const (
+	RetractionScopeAcquired = "acquired"
+	RetractionScopeLibrary  = "library"
+)
+
 // Library declares the libraries papio may consult to answer "do I already hold
 // this paper?" for users who do not run Zotero. See ADR-0008: a source emits
 // only positive holdings claims, and a source papio cannot read makes the answer
@@ -621,6 +632,7 @@ type Config struct {
 	Notify     Notify            `toml:"notify"`
 	Hooks      Hooks             `toml:"hooks"`
 	Library    Library           `toml:"library"`
+	Retraction Retraction        `toml:"retraction"`
 	Updates    Updates           `toml:"updates"`
 	Discovery  Discovery         `toml:"discovery"`
 	Actions    Actions           `toml:"actions"`
@@ -694,13 +706,14 @@ func defaultDataDir() string {
 // callers that acquire must see ErrAccessModeUnset until the user chooses.
 func Default() Config {
 	return Config{
-		DataDir:  defaultDataDir(),
-		Fetch:    Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
-		PDF:      PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
-		Browser:  Browser{DirectRoutesEnabled: true, ActionExpirySeconds: 1800},
-		Captures: Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
-		Actions:  Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
-		Zotio:    Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
+		DataDir:    defaultDataDir(),
+		Fetch:      Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
+		PDF:        PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
+		Browser:    Browser{DirectRoutesEnabled: true, ActionExpirySeconds: 1800},
+		Captures:   Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
+		Actions:    Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
+		Zotio:      Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
+		Retraction: Retraction{Scope: RetractionScopeAcquired},
 		Notify: Notify{
 			Enabled: true, Preset: "milestones", MaxPerHour: 6,
 			QuietMode: "hold", DigestEveryMinutes: 240,
@@ -945,6 +958,11 @@ func (c *Config) validate() error {
 	}
 	if c.Captures.MaxAgeDays < 1 || c.Captures.MaxAgeDays > 365 {
 		return fmt.Errorf("captures.max_age_days must be in 1..365")
+	}
+	switch c.Retraction.Scope {
+	case RetractionScopeAcquired, RetractionScopeLibrary:
+	default:
+		return fmt.Errorf("retraction.scope must be acquired or library")
 	}
 	if strings.TrimSpace(c.Zotio.Executable) == "" && c.Zotio.AutoImport {
 		return fmt.Errorf("zotio.auto_import requires zotio.executable")

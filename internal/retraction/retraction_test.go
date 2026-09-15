@@ -5,14 +5,18 @@ package retraction
 import (
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +29,7 @@ import (
 	"papio/internal/store"
 	"papio/internal/store/storetest"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 type recordingBudget struct {
@@ -46,6 +51,24 @@ func (b *recordingBudget) Acquire(_ context.Context, source string, policy confi
 	return b.err
 }
 
+type recordingHTTPClient struct {
+	requests int
+	status   int
+	body     string
+}
+
+func (c *recordingHTTPClient) Do(*http.Request) (*http.Response, error) {
+	c.requests++
+	status := c.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return &http.Response{
+		StatusCode: status, Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(c.body)),
+	}, nil
+}
+
 type recordingNotifier struct {
 	events []notify.Event
 }
@@ -59,6 +82,235 @@ func (n *recordingNotifier) Send(_ context.Context, _ string) {}
 
 func (n *recordingNotifier) SendEvent(_ context.Context, event notify.Event) {
 	n.events = append(n.events, event)
+}
+
+type fakeLibraryDOIs struct {
+	dois   []string
+	titles map[string]string
+	calls  int
+}
+
+func (f *fakeLibraryDOIs) LibraryDOIs(context.Context) ([]string, error) {
+	f.calls++
+	return append([]string(nil), f.dois...), nil
+}
+
+func (f *fakeLibraryDOIs) LibraryDOITitle(doi string) string {
+	return f.titles[doi]
+}
+
+type csvNotice struct {
+	title     string
+	noticeDOI string
+	workDOI   string
+	nature    string
+}
+
+func writeRetractionDataset(t *testing.T, w http.ResponseWriter, notices ...csvNotice) {
+	t.Helper()
+	writer := csv.NewWriter(w)
+	if err := writer.Write([]string{"Record ID", "Title", "RetractionDOI", "OriginalPaperDOI", "RetractionNature"}); err != nil {
+		t.Fatal(err)
+	}
+	for i, notice := range notices {
+		if err := writer.Write([]string{fmt.Sprint(i + 1), notice.title, notice.noticeDOI, notice.workDOI, notice.nature}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBulkLookupUsesOneRequestForTwoThousandDOIs(t *testing.T) {
+	ctx := context.Background()
+	library := &fakeLibraryDOIs{}
+	for i := range 2000 {
+		library.dois = append(library.dois, fmt.Sprintf("10.1234/work-%04d", i))
+	}
+	recorder := httptest.NewRecorder()
+	writeRetractionDataset(t, recorder, csvNotice{
+		title: "Affected paper", noticeDOI: "10.2000/notice",
+		workDOI: "10.1234/work-1999", nature: "Retraction",
+	})
+	client := &recordingHTTPClient{body: recorder.Body.String()}
+	budget := &recordingBudget{}
+	sentinel := New(Options{
+		Store: testStore(t), Budgets: budget, Policy: config.Source{Enabled: true},
+		Client: client, BaseURL: "https://example.test/retractionwatch", DataDir: t.TempDir(),
+		Scope: config.RetractionScopeLibrary, LibraryDOIs: library,
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if client.requests != 1 || budget.acquires != 1 {
+		t.Fatalf("requests/budget = %d/%d, want 1/1 for 2,000 DOIs", client.requests, budget.acquires)
+	}
+}
+
+func TestLibraryScopeProducesFindingAndTriageItemWithoutJob(t *testing.T) {
+	ctx := context.Background()
+	library := &fakeLibraryDOIs{
+		dois:   []string{"https://doi.org/10.1234/library-only"},
+		titles: map[string]string{"10.1234/library-only": "Title from library"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Dataset title", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/library-only", nature: "Expression of concern",
+		})
+	}))
+	defer server.Close()
+	sentinel := New(Options{
+		Store: testStore(t), Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+		Scope: config.RetractionScopeLibrary, LibraryDOIs: library,
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sentinel.mu.Lock()
+	cached, ok := sentinel.readCache()
+	sentinel.mu.Unlock()
+	if !ok || len(cached.Notices) != 1 {
+		t.Fatalf("cache = %#v, ok = %v", cached, ok)
+	}
+	var finding Finding
+	for _, finding = range cached.Notices {
+	}
+	if finding.DOI != "10.1234/library-only" || finding.Title != "Title from library" || finding.Nature != NatureConcern {
+		t.Fatalf("finding = %#v", finding)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 || items[0].Title != "Title from library" || items[0].ID != "retraction:10.1234/library-only" {
+		t.Fatalf("triage items = %#v, err = %v", items, err)
+	}
+	applied, err := sentinel.AcknowledgeRetraction(ctx, items[0].ID)
+	if err != nil || !applied {
+		t.Fatalf("acknowledge library-only notice = %v, %v", applied, err)
+	}
+	if remaining, err := sentinel.SnapshotItems(ctx, nil); err != nil || len(remaining) != 0 {
+		t.Fatalf("items after acknowledge = %#v, err = %v", remaining, err)
+	}
+}
+
+func TestLibraryScopeAcquiredNeverEnumeratesLibrary(t *testing.T) {
+	library := &fakeLibraryDOIs{dois: []string{"10.1234/not-called"}}
+	sentinel := New(Options{
+		Store: testStore(t), Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		DataDir: t.TempDir(), Scope: config.RetractionScopeAcquired, LibraryDOIs: library,
+	})
+	if err := sentinel.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if library.calls != 0 {
+		t.Fatalf("LibraryDOIs calls = %d, want 0", library.calls)
+	}
+}
+
+func TestBulkLookupServesLastKnownGoodDatasetAfterFetchFailure(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	fail := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail {
+			http.Error(w, "offline", http.StatusServiceUnavailable)
+			return
+		}
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Affected paper", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/cached", nature: "Retraction",
+		})
+	}))
+	defer server.Close()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/cached", 1)
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+		Now: func() time.Time { return now },
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fail = true
+	now = now.Add(25 * time.Hour)
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatalf("fallback sweep: %v", err)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 || items[0].Retraction.DOI != "10.1234/cached" {
+		t.Fatalf("fallback items = %#v, err = %v", items, err)
+	}
+}
+
+func TestRunDueBudgetDenialStopsBeforeRequest(t *testing.T) {
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/budget", 1)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	budget := &recordingBudget{err: errors.New("budget exhausted")}
+	sentinel := New(Options{
+		Store: jobs, Budgets: budget, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+	})
+	if err := sentinel.RunDue(context.Background()); err == nil {
+		t.Fatal("budget denial succeeded")
+	}
+	if requests != 0 || budget.acquires != 1 {
+		t.Fatalf("requests/budget = %d/%d, want 0/1", requests, budget.acquires)
+	}
+}
+func TestLibraryCatalogEnumeratesFileAndPagedZotero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "library.bib")
+	if err := os.WriteFile(path, []byte(`@article{file,
+  title = {File title},
+  doi = {https://doi.org/10.1234/from-file}
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	client := &zotio.Client{Exec: func(_ context.Context, args ...string) ([]byte, error) {
+		calls++
+		start, err := strconv.Atoi(args[len(args)-1])
+		if err != nil {
+			return nil, err
+		}
+		count := zotioPageSize
+		if start == zotioPageSize {
+			count = 1
+		}
+		rows := make([]map[string]any, 0, count)
+		for i := range count {
+			rows = append(rows, map[string]any{"data": map[string]any{
+				"DOI":   fmt.Sprintf("10.1234/zotero-%03d", start+i),
+				"title": fmt.Sprintf("Zotero title %d", start+i),
+			}})
+		}
+		return json.Marshal(map[string]any{"results": rows})
+	}}
+	catalog := NewLibraryCatalog([]config.LibrarySource{{
+		Name: "export", Kind: config.LibraryKindFile, Path: path,
+		Format: "bibtex", Claim: config.LibraryClaimRecordPresent,
+	}}, client)
+	dois, err := catalog.LibraryDOIs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(dois) != 102 {
+		t.Fatalf("calls/DOIs = %d/%d, want 2/102", calls, len(dois))
+	}
+	if !slices.Contains(dois, "10.1234/from-file") || !slices.Contains(dois, "10.1234/zotero-100") {
+		t.Fatalf("enumerated DOIs omit file or second Zotero page")
+	}
+	if got := catalog.LibraryDOITitle("10.1234/from-file"); got != "File title" {
+		t.Fatalf("file title = %q", got)
+	}
+	if got := catalog.LibraryDOITitle("10.1234/zotero-100"); got != "Zotero title 100" {
+		t.Fatalf("Zotero title = %q", got)
+	}
 }
 
 func TestSweepExposesRecognizedNotices(t *testing.T) {
@@ -79,12 +331,14 @@ func TestSweepExposesRecognizedNotices(t *testing.T) {
 			jobs := testStore(t)
 			addReadyDOI(t, jobs, "10.1234/original", 1)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
 				if tc.update == "" {
-					_, _ = w.Write([]byte(`{"message":{"update-to":[]}}`))
+					writeRetractionDataset(t, w)
 					return
 				}
-				_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/notice","updated":"` + tc.update + `"}]}}`))
+				writeRetractionDataset(t, w, csvNotice{
+					title: "Dataset title", noticeDOI: "10.2000/notice",
+					workDOI: "10.1234/original", nature: tc.update,
+				})
 			}))
 			defer server.Close()
 			budget := &recordingBudget{}
@@ -140,7 +394,10 @@ func TestSweepUsesCrossrefTitleWhenLibraryTitleUnknown(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests++
-		_, _ = w.Write([]byte(`{"message":{"title":["Crossref paper title"],"update-to":[{"DOI":"10.2000/notice","updated":"retraction"}]}}`))
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Crossref paper title", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/untitled", nature: "retraction",
+		})
 	}))
 	defer server.Close()
 	sentinel := New(Options{
@@ -187,7 +444,10 @@ func TestSweepDeduplicatesReadyDOIAndPersistsNotice(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests++
-		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/notice","updated":"retraction"}]}}`))
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Dataset title", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/duplicate", nature: "retraction",
+		})
 	}))
 	defer server.Close()
 	budget := &recordingBudget{}
@@ -231,7 +491,10 @@ func TestAcknowledgeHidesNoticeUntilTheNoticeChanges(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	nature := "expression-of-concern"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/notice","updated":"` + nature + `"}]}}`))
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Dataset title", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/original", nature: nature,
+		})
 	}))
 	defer server.Close()
 	sentinel := New(Options{
@@ -302,7 +565,7 @@ func TestSweepTemporaryAndMalformedResponsesFailClosed(t *testing.T) {
 		temporary bool
 	}{
 		{name: "rate limited", status: http.StatusTooManyRequests, temporary: true},
-		{name: "malformed json", status: http.StatusOK, body: `{`, temporary: false},
+		{name: "malformed csv", status: http.StatusOK, body: `{`, temporary: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			jobs := testStore(t)
@@ -326,63 +589,6 @@ func TestSweepTemporaryAndMalformedResponsesFailClosed(t *testing.T) {
 				t.Fatalf("items after failed sweep = %#v, %v", items, snapshotErr)
 			}
 		})
-	}
-}
-
-func TestSweepCommitsPartialResultsAndRetainsFailedDOI(t *testing.T) {
-	ctx := context.Background()
-	jobs := testStore(t)
-	addReadyDOI(t, jobs, "10.1234/failing", 1)
-	addReadyDOI(t, jobs, "10.1234/fresh", 2)
-	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
-	previous := Finding{
-		DOI: "10.1234/failing", Nature: NatureRetraction, NoticeDOI: "10.2000/previous",
-		Title: "Previously known paper", NoticedAt: now.Add(-48 * time.Hour),
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/10.1234/failing" {
-			http.Error(w, "unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/fresh","updated":"correction"}]}}`))
-	}))
-	defer server.Close()
-	notifier := &recordingNotifier{}
-	sentinel := New(Options{
-		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
-		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(), Notifier: notifier,
-		Now: func() time.Time { return now },
-	})
-	sentinel.mu.Lock()
-	err := sentinel.writeCache(cache{
-		Version: cacheVersion, CheckedAt: now.Add(-sweepEvery), Notices: map[string]Finding{
-			findingKey(previous): previous,
-		},
-	})
-	sentinel.mu.Unlock()
-	if err != nil {
-		t.Fatalf("seed cache: %v", err)
-	}
-
-	if err := sentinel.RunDue(ctx); err != nil {
-		t.Fatalf("partial sweep: %v", err)
-	}
-
-	sentinel.mu.Lock()
-	persisted, ok := sentinel.readCache()
-	sentinel.mu.Unlock()
-	if !ok || len(persisted.Notices) != 2 {
-		t.Fatalf("cache = %#v, valid = %v", persisted, ok)
-	}
-	if got := persisted.Notices[findingKey(previous)]; got != previous {
-		t.Fatalf("carried finding = %#v, want %#v", got, previous)
-	}
-	fresh := Finding{DOI: "10.1234/fresh", Nature: NatureCorrection, NoticeDOI: "10.2000/fresh", Title: "Library work", NoticedAt: now}
-	if got := persisted.Notices[findingKey(fresh)]; got != fresh {
-		t.Fatalf("fresh finding = %#v, want %#v", got, fresh)
-	}
-	if len(notifier.events) != 1 || notifier.events[0].Message != noticeMessage(fresh) {
-		t.Fatalf("events = %#v", notifier.events)
 	}
 }
 
@@ -478,7 +684,7 @@ func TestSnapshotItemsDoesNotWaitForSweepLookup(t *testing.T) {
 		}
 		select {
 		case <-release:
-			_, _ = w.Write([]byte(`{"message":{"update-to":[]}}`))
+			writeRetractionDataset(t, w)
 		case <-r.Context().Done():
 		}
 	}))
@@ -561,8 +767,11 @@ func TestSharedNoticeDOIStillSurfacesEachAffectedWork(t *testing.T) {
 		jobs := testStore(t)
 		addReadyDOI(t, jobs, "10.1234/alpha", 1)
 		addReadyDOI(t, jobs, "10.1234/beta", 2)
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"` + shared + `","updated":"retraction"}]}}`))
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRetractionDataset(t, w,
+				csvNotice{title: "Alpha", noticeDOI: shared, workDOI: "10.1234/alpha", nature: "retraction"},
+				csvNotice{title: "Beta", noticeDOI: shared, workDOI: "10.1234/beta", nature: "retraction"},
+			)
 		}))
 		defer server.Close()
 		notifier := &recordingNotifier{}
@@ -674,7 +883,10 @@ func TestGenuineDuplicateCollapsesToOne(t *testing.T) {
 	jobs := testStore(t)
 	addReadyDOI(t, jobs, "10.1234/alpha", 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/shared","updated":"retraction"}]}}`))
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Alpha", noticeDOI: "10.2000/shared",
+			workDOI: "10.1234/alpha", nature: "retraction",
+		})
 	}))
 	defer server.Close()
 	notifier := &recordingNotifier{}
@@ -792,12 +1004,11 @@ func TestPreferPresentsRetractionWhenAWorkHasSeveralNotices(t *testing.T) {
 	jobs := testStore(t)
 	addReadyDOI(t, jobs, "10.1234/original", 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"message":{"update-to":[
-			{"DOI":"10.2000/aaa-correction","updated":"correction"},
-			{"DOI":"10.2000/bbb-concern","updated":"expression-of-concern"},
-			{"DOI":"10.2000/zzz-retraction","updated":"retraction"}
-		]}}`))
+		writeRetractionDataset(t, w,
+			csvNotice{title: "Original", noticeDOI: "10.2000/aaa-correction", workDOI: "10.1234/original", nature: "correction"},
+			csvNotice{title: "Original", noticeDOI: "10.2000/bbb-concern", workDOI: "10.1234/original", nature: "expression-of-concern"},
+			csvNotice{title: "Original", noticeDOI: "10.2000/zzz-retraction", workDOI: "10.1234/original", nature: "retraction"},
+		)
 	}))
 	defer server.Close()
 	notifier := &recordingNotifier{}

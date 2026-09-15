@@ -470,9 +470,22 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	}
 	var retractions *retraction.Sentinel
 	if policy := cfg.SourcePolicy(config.SourceRetractionWatch); policy.Enabled {
+		retractionHTTPPolicy := metadataPolicy
+		retractionHTTPPolicy.MaxBytes = retraction.DefaultMaxResponseBytes
+		retractionClient, err := fetch.NewSecureHTTPClientNoRedirect(
+			retractionHTTPPolicy, nil, fetch.MetadataTransport(policy.DisableKeepAlives()))
+		if err != nil {
+			return nil, err
+		}
+		var retractionZotio *zotio.Client
+		if strings.TrimSpace(cfg.Zotio.Executable) != "" {
+			retractionZotio = zotio.New(cfg.Zotio)
+		}
+		libraryDOIs := retraction.NewLibraryCatalog(cfg.Library.Sources, retractionZotio)
 		retractions = retraction.New(retraction.Options{
-			Store: db, Budgets: budgets, Policy: policy, Client: metadataClient,
-			DataDir: cfg.DataDir, BaseURL: policy.BaseURLForDev, Notifier: router,
+			Store: db, Budgets: budgets, Policy: policy, Client: retractionClient,
+			DataDir: cfg.DataDir, BaseURL: policy.BaseURLForDev, ContactEmail: cfg.Email,
+			Notifier: router, Scope: cfg.Retraction.Scope, LibraryDOIs: libraryDOIs,
 		})
 	}
 	triageService := triage.New(db, watches, jobs)

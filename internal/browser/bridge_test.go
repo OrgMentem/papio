@@ -1952,8 +1952,11 @@ func TestTriageDismissAcknowledgesRetractionNotice(t *testing.T) {
 	if err := jobs.Transition(ctx, id, job.StateValidating, job.StateReady, nil, job.WithArtifact(sha)); err != nil {
 		t.Fatal(err)
 	}
+	// The sentinel reads the Retraction Watch dataset Crossref publishes (one
+	// CSV per sweep), not a per-DOI works record.
 	crossref := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"message":{"update-to":[{"DOI":"10.2000/notice","updated":"retraction"}]}}`))
+		_, _ = w.Write([]byte("Record ID,Title,RetractionDOI,OriginalPaperDOI,RetractionNature\n" +
+			"1,Retracted work,10.2000/notice,10.1000/retracted,Retraction\n"))
 	}))
 	defer crossref.Close()
 	sentinel := retraction.New(retraction.Options{

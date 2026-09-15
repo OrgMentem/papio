@@ -1,12 +1,34 @@
 // Copyright 2026 OrgMentem. Licensed under MIT.
 
-// Package retraction monitors Crossref update notices for ready library works.
+// Package retraction monitors the Crossref Retraction Watch dataset for ready
+// works and, when configured, every DOI in the user's library.
+//
+// The source choice follows two bounded live probes made on 2026-09-15.
+// The proposed Crossref works sweep returned these fragments verbatim:
+//
+//	HTTP/2 400
+//	"type":"select-not-available","value":"updated"
+//	Select 'updated' specified but there is no such select for this route.
+//
+// Thus the proposed select shape did not provide a verified incremental
+// watermark. The Retraction Watch dataset probe used
+// `curl --max-time 20 -r 0-65535` and returned these fragments verbatim:
+//
+//	HTTP/2 200
+//	content-disposition: attachment; filename=retractions.csv
+//	Record ID,Title,Subject,Institution,Journal,Publisher,Country,Author,URLS,ArticleType,RetractionDate,RetractionDOI,RetractionPubMedID,OriginalPaperDate,OriginalPaperDOI,OriginalPaperPubMedID,RetractionNature,Reason,Paywalled,Notes,
+//
+// The server ignored the byte range and sent 49.5 MB. The 64 MiB response
+// limit admits that measured dataset with headroom. One daily request replaces
+// a request for every corpus DOI, and the last valid CSV remains available when
+// a later fetch fails.
 package retraction
 
 import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,12 +53,16 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.crossref.org/works"
-	defaultMaxBody = 1 << 20
-	cacheFileName  = "retraction-cache.json"
-	sweepEvery     = 24 * time.Hour
-	maxNotices     = 1000
-	cacheVersion   = 1
+	defaultBaseURL = "https://api.labs.crossref.org/data/retractionwatch"
+	// DefaultMaxResponseBytes admits the 49.5 MB dataset measured by the live
+	// probe while retaining a fixed response ceiling.
+	DefaultMaxResponseBytes int64 = 64 << 20
+	maxCacheBody            int64 = 1 << 20
+	cacheFileName                 = "retraction-cache.json"
+	datasetFileName               = "retraction-watch.csv"
+	sweepEvery                    = 24 * time.Hour
+	maxNotices                    = 1000
+	cacheVersion                  = 1
 )
 
 // Nature classifies an update notice recognized by the sentinel.
@@ -67,6 +93,19 @@ type BudgetAcquirer interface {
 	Acquire(context.Context, string, config.Source, float64) error
 }
 
+// LibraryDOILister supplies every configured library DOI when library scope is
+// enabled. Implementations can also implement LibraryDOITitleProvider.
+type LibraryDOILister interface {
+	LibraryDOIs(context.Context) ([]string, error)
+}
+
+// LibraryDOITitleProvider supplies the title discovered while LibraryDOIs
+// enumerated the library. It is separate so simple test fakes only need the
+// required DOI method.
+type LibraryDOITitleProvider interface {
+	LibraryDOITitle(string) string
+}
+
 type Options struct {
 	Store            *store.Store
 	Budgets          BudgetAcquirer
@@ -74,23 +113,29 @@ type Options struct {
 	Client           HTTPClient
 	DataDir          string
 	BaseURL          string
+	ContactEmail     string
 	MaxResponseBytes int64
 	Notifier         notify.Sink
+	Scope            string
+	LibraryDOIs      LibraryDOILister
 	Now              func() time.Time
 }
 
 // Sentinel performs at most one Crossref sweep each day and provides the
 // cached current notices to the triage read model.
 type Sentinel struct {
-	store    *store.Store
-	budgets  BudgetAcquirer
-	policy   config.Source
-	client   HTTPClient
-	dataDir  string
-	baseURL  string
-	maxBody  int64
-	notifier notify.Sink
-	now      func() time.Time
+	store       *store.Store
+	budgets     BudgetAcquirer
+	policy      config.Source
+	client      HTTPClient
+	dataDir     string
+	baseURL     string
+	email       string
+	maxBody     int64
+	notifier    notify.Sink
+	scope       string
+	libraryDOIs LibraryDOILister
+	now         func() time.Time
 
 	mu      sync.Mutex
 	sweepMu sync.Mutex
@@ -108,7 +153,7 @@ func New(options Options) *Sentinel {
 	}
 	maxBody := options.MaxResponseBytes
 	if maxBody <= 0 {
-		maxBody = defaultMaxBody
+		maxBody = DefaultMaxResponseBytes
 	}
 	now := options.Now
 	if now == nil {
@@ -116,14 +161,17 @@ func New(options Options) *Sentinel {
 	}
 	return &Sentinel{
 		store: options.Store, budgets: options.Budgets, policy: options.Policy,
-		client: client, dataDir: options.DataDir, baseURL: baseURL, maxBody: maxBody,
-		notifier: options.Notifier, now: now,
+		client: client, dataDir: options.DataDir, baseURL: baseURL,
+		email: strings.TrimSpace(options.ContactEmail), maxBody: maxBody,
+		notifier: options.Notifier, scope: options.Scope,
+		libraryDOIs: options.LibraryDOIs, now: now,
 	}
 }
 
-// RunDue performs a daily metadata sweep when the configured source policy is
-// enabled. Partial sweep results are committed; a failed DOI keeps its last
-// known notices. A total sweep failure leaves the last known-good cache intact.
+// RunDue performs one daily Retraction Watch dataset request when the source
+// policy is enabled. The corpus is matched locally, so request count does not
+// grow with library size. A failed fetch uses the last valid dataset; without
+// one, the current notice cache remains intact.
 func (s *Sentinel) RunDue(ctx context.Context) error {
 	if s == nil || !s.policy.Enabled {
 		return nil
@@ -147,7 +195,7 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		return nil
 	}
 
-	readyWorks, err := s.readyWorks(ctx)
+	corpus, err := s.corpusWorks(ctx)
 	if err != nil {
 		return err
 	}
@@ -158,49 +206,35 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 			current[finding.DOI] = finding
 		}
 	}
-	var firstLookupErr error
-	failedLookups := 0
-	for _, ready := range readyWorks {
-		doi := ready.DOI
+	if len(corpus) != 0 {
 		if err := s.budgets.Acquire(ctx, config.SourceRetractionWatch, s.policy, 0); err != nil {
-			return fmt.Errorf("retraction: acquire Crossref budget: %w", err)
+			return fmt.Errorf("retraction: acquire Retraction Watch budget: %w", err)
 		}
-		updates, err := s.lookup(ctx, doi)
-		if err != nil {
-			failedLookups++
-			if firstLookupErr == nil {
-				firstLookupErr = err
-			}
-			for _, finding := range previous {
-				if finding.DOI == doi {
-					addCurrent(finding)
-				}
-			}
-			continue
+		updates, fetchErr := s.lookup(ctx, corpus)
+		if fetchErr != nil {
+			return fetchErr
 		}
-		for _, update := range updates {
-			title := ready.Title
-			if title == "" {
-				title = update.Title
-			}
-			finding := Finding{DOI: doi, Nature: update.Nature, NoticeDOI: update.NoticeDOI, Title: title}
-			key := findingKey(finding)
-			if old, exists := previous[key]; exists {
-				finding.NoticedAt = old.NoticedAt
-				if finding.Title == "" {
-					finding.Title = old.Title
+		for doi, records := range updates {
+			local := corpus[doi]
+			for _, update := range records {
+				title := local.Title
+				if title == "" {
+					title = update.Title
 				}
-			} else {
-				finding.NoticedAt = now
+				finding := Finding{DOI: doi, Nature: update.Nature, NoticeDOI: update.NoticeDOI, Title: title}
+				key := findingKey(finding)
+				if old, exists := previous[key]; exists {
+					finding.NoticedAt = old.NoticedAt
+					if finding.Title == "" {
+						finding.Title = old.Title
+					}
+				} else {
+					finding.NoticedAt = now
+				}
+				addCurrent(finding)
 			}
-			addCurrent(finding)
 		}
 	}
-	if len(readyWorks) > 0 && failedLookups == len(readyWorks) {
-		return firstLookupErr
-	}
-	// The rest of the sweep commits the current notices and preserves their
-	// first-seen timestamps exactly as before.
 
 	findings := make([]Finding, 0, len(current))
 	for _, finding := range current {
@@ -259,7 +293,6 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 			ScanID: scanID, HappenedAt: now, Message: message, Detail: event,
 		}
 		if err := s.notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
-			// Notification failures must not alter the committed scan/cache.
 			log.Printf("papio: routing retraction notification: %v", err)
 		}
 	}
@@ -469,6 +502,38 @@ func (s *Sentinel) readyWorks(ctx context.Context) ([]readyWork, error) {
 	sort.Slice(works, func(i, j int) bool { return works[i].DOI < works[j].DOI })
 	return works, nil
 }
+func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, error) {
+	ready, err := s.readyWorks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	corpus := make(map[string]readyWork, len(ready))
+	for _, item := range ready {
+		corpus[item.DOI] = item
+	}
+	if s.scope != config.RetractionScopeLibrary || s.libraryDOIs == nil {
+		return corpus, nil
+	}
+	dois, err := s.libraryDOIs.LibraryDOIs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("retraction: enumerate library DOIs: %w", err)
+	}
+	titles, _ := s.libraryDOIs.(LibraryDOITitleProvider)
+	for _, raw := range dois {
+		doi, err := work.NormalizeDOI(raw)
+		if err != nil {
+			continue
+		}
+		title := ""
+		if titles != nil {
+			title = strings.TrimSpace(titles.LibraryDOITitle(doi))
+		}
+		if current, exists := corpus[doi]; !exists || (current.Title == "" && title != "") {
+			corpus[doi] = readyWork{DOI: doi, Title: title}
+		}
+	}
+	return corpus, nil
+}
 
 type update struct {
 	Nature    Nature
@@ -476,86 +541,176 @@ type update struct {
 	Title     string
 }
 
-type response struct {
-	Message struct {
-		Title    []string `json:"title"`
-		UpdateTo []struct {
-			DOI     string `json:"DOI"`
-			Updated string `json:"updated"`
-			Label   string `json:"label"`
-		} `json:"update-to"`
-	} `json:"message"`
+func (s *Sentinel) lookup(ctx context.Context, corpus map[string]readyWork) (map[string][]update, error) {
+	data, err := s.fetchDataset(ctx)
+	if err != nil {
+		cached, cacheErr := os.ReadFile(s.datasetPath())
+		if cacheErr != nil || int64(len(cached)) > s.maxBody {
+			return nil, err
+		}
+		updates, parseErr := parseDataset(bytes.NewReader(cached), corpus)
+		if parseErr != nil {
+			return nil, fmt.Errorf("%w; cached Retraction Watch dataset is invalid: %v", err, parseErr)
+		}
+		log.Printf("papio: Retraction Watch fetch failed; using last known-good dataset: %v", err)
+		return updates, nil
+	}
+	updates, err := parseDataset(bytes.NewReader(data), corpus)
+	if err != nil {
+		return nil, fmt.Errorf("retraction: invalid Retraction Watch dataset: %w", err)
+	}
+	if err := s.writeDataset(data); err != nil {
+		return nil, fmt.Errorf("retraction: cache Retraction Watch dataset: %w", err)
+	}
+	return updates, nil
 }
 
-func (s *Sentinel) lookup(ctx context.Context, doi string) ([]update, error) {
+func (s *Sentinel) fetchDataset(ctx context.Context) ([]byte, error) {
 	endpoint, err := url.Parse(s.baseURL)
 	if err != nil {
-		return nil, errors.New("retraction: invalid configured Crossref endpoint")
+		return nil, errors.New("retraction: invalid configured Retraction Watch endpoint")
 	}
-	escapedPrefix := strings.TrimRight(endpoint.EscapedPath(), "/")
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/" + doi
-	endpoint.RawPath = escapedPrefix + "/" + url.PathEscape(doi)
+	if s.email != "" {
+		query := endpoint.Query()
+		query.Set("mailto", s.email)
+		endpoint.RawQuery = query.Encode()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("retraction: build Crossref request: %w", err)
+		return nil, fmt.Errorf("retraction: build Retraction Watch request: %w", err)
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "text/csv")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, &resolver.TemporaryError{Err: errors.New("retraction: Crossref request failed")}
+		return nil, &resolver.TemporaryError{Err: errors.New("retraction: Retraction Watch request failed")}
 	}
 	if resp == nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("retraction: empty Crossref response")}
+		return nil, &resolver.TemporaryError{Err: errors.New("retraction: empty Retraction Watch response")}
 	}
 	if resp.Body == nil {
-		return nil, errors.New("retraction: Crossref response body is missing")
+		return nil, errors.New("retraction: Retraction Watch response body is missing")
 	}
 	defer func() { _ = resp.Body.Close() }()
-
 	switch {
-	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
-		return nil, nil
 	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		return nil, temporaryStatus(resp)
 	case resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices:
-		return nil, fmt.Errorf("retraction: Crossref returned HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("retraction: Retraction Watch returned HTTP %d", resp.StatusCode)
 	}
-	var payload response
-	if err := decodeBoundedJSON(resp.Body, s.maxBody, &payload); err != nil {
-		return nil, fmt.Errorf("retraction: invalid Crossref response: %w", err)
+	data, err := readBounded(resp.Body, s.maxBody)
+	if err != nil {
+		return nil, fmt.Errorf("retraction: invalid Retraction Watch response: %w", err)
 	}
-	title := ""
-	for _, candidate := range payload.Message.Title {
-		if candidate = strings.TrimSpace(candidate); candidate != "" {
-			title = candidate
+	return data, nil
+}
+
+func parseDataset(body io.Reader, corpus map[string]readyWork) (map[string][]update, error) {
+	reader := csv.NewReader(body)
+	reader.FieldsPerRecord = -1
+	header, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+	columns := make(map[string]int, len(header))
+	for i, name := range header {
+		columns[strings.TrimSpace(name)] = i
+	}
+	required := []string{"Title", "RetractionDOI", "OriginalPaperDOI", "RetractionNature"}
+	for _, name := range required {
+		if _, ok := columns[name]; !ok {
+			return nil, fmt.Errorf("missing %q column", name)
+		}
+	}
+	value := func(row []string, name string) string {
+		index := columns[name]
+		if index >= len(row) {
+			return ""
+		}
+		return strings.TrimSpace(row[index])
+	}
+	updates := make(map[string][]update)
+	seen := make(map[string]bool)
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
 			break
 		}
-	}
-	updates := make([]update, 0, len(payload.Message.UpdateTo))
-	seen := make(map[string]bool)
-	for _, record := range payload.Message.UpdateTo {
-		nature, ok := parseNature(record.Updated)
-		if !ok {
-			nature, ok = parseNature(record.Label)
+		if err != nil {
+			return nil, err
 		}
+		doi, err := work.NormalizeDOI(value(row, "OriginalPaperDOI"))
+		if err != nil {
+			continue
+		}
+		if _, wanted := corpus[doi]; !wanted {
+			continue
+		}
+		nature, ok := parseNature(value(row, "RetractionNature"))
 		if !ok {
 			continue
 		}
-		noticeDOI, err := work.NormalizeDOI(record.DOI)
+		noticeDOI, err := work.NormalizeDOI(value(row, "RetractionDOI"))
 		if err != nil {
 			noticeDOI = ""
 		}
-		key := string(nature) + "\x00" + noticeDOI
+		key := doi + "\x00" + string(nature) + "\x00" + noticeDOI
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		updates = append(updates, update{Nature: nature, NoticeDOI: noticeDOI, Title: title})
+		updates[doi] = append(updates[doi], update{
+			Nature: nature, NoticeDOI: noticeDOI, Title: value(row, "Title"),
+		})
 	}
 	return updates, nil
+}
+
+func readBounded(body io.Reader, maximum int64) ([]byte, error) {
+	if maximum <= 0 {
+		return nil, errors.New("invalid response limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(body, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maximum {
+		return nil, fmt.Errorf("response exceeds %d-byte limit", maximum)
+	}
+	return data, nil
+}
+
+func (s *Sentinel) datasetPath() string {
+	return filepath.Join(s.dataDir, datasetFileName)
+}
+
+func (s *Sentinel) writeDataset(data []byte) error {
+	if err := os.MkdirAll(s.dataDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(s.dataDir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(s.dataDir, ".retraction-watch-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, s.datasetPath())
 }
 
 func parseNature(value string) (Nature, bool) {
@@ -653,11 +808,11 @@ func (s *Sentinel) cachePath() string {
 // replacement in progress.
 func (s *Sentinel) readCache() (cache, bool) {
 	data, err := os.ReadFile(s.cachePath())
-	if err != nil || int64(len(data)) > defaultMaxBody {
+	if err != nil || int64(len(data)) > maxCacheBody {
 		return cache{}, false
 	}
 	var cached cache
-	if err := decodeBoundedJSON(bytes.NewReader(data), defaultMaxBody, &cached); err != nil ||
+	if err := decodeBoundedJSON(bytes.NewReader(data), maxCacheBody, &cached); err != nil ||
 		cached.Version != cacheVersion || cached.CheckedAt.IsZero() || len(cached.Notices) > maxNotices {
 		return cache{}, false
 	}
