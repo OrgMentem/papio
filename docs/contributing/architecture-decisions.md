@@ -486,3 +486,38 @@ uncertain database commit. A durable intent written before the bytes appear is
 the only thing that lets recovery tell a half-finished publication from a
 finished one, and the writer fence is what stops a bounded link or rename from
 racing a lease replacement.
+
+## papio owns every surface it creates
+
+**Context:** One papio tab group reached about seventeen tabs in the operator's
+own browser: six or more identity-provider sign-in tabs, several unrendered
+discovery pages, and a provider error page, with duplicate groups after
+extension reloads, drives fired into a dead network after wake, and siblings
+still stranded at sign-in walls after the operator had authenticated in one tab.
+Five earlier attempts patched the legacy drive path instead of finishing the
+daemon-owned machinery ADR-0022 had already shipped but left disabled.
+
+**Decision:** ADR-0028 fixes the authority split, the cardinality rule, and the
+storage tiers for every surface papio creates. The daemon owns jobs, candidate
+ordering, the opaque authentication claim and its entry lease, holder
+generation, claims and bindings, human-gate occurrences, durable park and retry
+state, effect permits, and terminal dispositions. The extension owns
+browser-local facts: tabs, groups and windows, binding acknowledgements,
+observations, operator engagement and cession, connectivity, and the guarded
+close primitive. Exactly one unresolved human sign-in surface exists per
+daemon-issued authentication claim, never per institution. Session storage holds
+re-derivable mirrors only, and its loss means retain and do not drive; local
+storage holds a URL-free birth certificate per owned surface. A claim precedes
+every surface, positive evidence closes while absence retains, operator cession
+is proven causally through papio-issued action tokens, every dead end has a
+daemon-side disposition, one readiness barrier gates every effect-producing
+entry point, and lifecycle work never rides the global effect permit. An
+in-flight provider effect is never read as a free sign-in slot.
+
+**Why:** The surface pileup was an ownership question, not a tidiness question:
+a stale sign-in form invites credentials into a flow that can no longer succeed,
+and a second sign-in offered at the same institution can duplicate an
+irreversible provider action. Locating each fact on the side that can actually
+observe it — the daemon for claims and leases, the browser for tabs and
+engagement — is what lets papio retire a surface on evidence instead of on a
+timer, which is the guess every earlier attempt made and paid for.

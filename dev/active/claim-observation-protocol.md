@@ -4,8 +4,8 @@ Status: **implemented, shipped**. The design below shipped in two parts: the
 protocol design (this document) landed in `e2c7c45` (2026-08-18); the full
 four-site implementation landed in `7662f6a` (2026-08-18), with Slice 4's
 consumption of the claim-bound path in `5b866d2` (2026-08-19). This document
-was the deliverable `dev/active/surface-lifecycle-plan.md` line 330 required
-before Slice 3 implementation started ("Gated on a written protocol design
+was the written-design deliverable the surface-lifecycle work required before
+Slice 3 implementation started ("Gated on a written protocol design
 (four-site parity) before implementation"). It specifies wire messages,
 storage, ordering, lease, and rollout precisely enough for three implementing
 agents — Go daemon (`internal/protocol`, `internal/browser/bridge.go`,
@@ -14,8 +14,8 @@ agents — Go daemon (`internal/protocol`, `internal/browser/bridge.go`,
 (`protocol/browser-v1.schema.json`) — to build without negotiating shape
 between themselves. It supersedes no ADR; it fills in the mechanism ADR-0022
 Phase 4 reserved (Decisions 2, 3, 5, 6) and the August-reviewed arbitration
-design referenced by the plan (`navigate_existing` / `open_new` /
-`focus_owner` / `park`).
+design now recorded in `dev/adr/0028-surface-lifecycle-ownership.md`
+(`navigate_existing` / `open_new` / `focus_owner` / `park`).
 
 Having shipped, this document now also serves as **the reference for the
 shipped wire contract** — the exact message shapes in §2, the
@@ -76,10 +76,11 @@ Two features, not one, and the split is deliberate:
 - **`surface_close_v1`** — gates the generic one-use close-authorization
   request/response pair (§2.3). It authorizes closing *any* daemon-bound
   scaffold (institutional or not), so Slice 2b can implement and ship the
-  close transaction (`dev/active/surface-lifecycle-plan.md` lines 288-299)
+  close transaction (`dev/adr/0028-surface-lifecycle-ownership.md`, Decision 6,
+  "Positive evidence closes; absence retains")
   **before** Slice 3 lands, with no dependency on authentication-claim
   arbitration existing yet. Recommended because Slice 2b is sequenced strictly
-  before Slice 3 (`Sequencing: 0 → 1 → 2a → 2b → 3 → 4`, plan line 357) and
+  before Slice 3 (sequencing `0 → 1 → 2a → 2b → 3 → 4`) and
   gating its own close mechanism behind a feature name that also implies
   full claim arbitration would falsely tell an extension "the close
   transaction works" only once the much larger Slice 3 daemon surface ships,
@@ -92,7 +93,8 @@ Two features, not one, and the split is deliberate:
   pinned by `extension/test/background.test.ts:100`'s `AUTH_CLAIM` constant
   and the Slice-0-shipped containment gate). Slice 3 is the first daemon that
   advertises it; the extension-side gate that already exists
-  (`dev/active/surface-lifecycle-plan.md` lines 218-236, Slice 0 "SHIPPED")
+  (`dev/adr/0028-surface-lifecycle-ownership.md`, Decision 6, "A claim precedes
+  a surface"; shipped in Slice 0)
   starts passing the moment this feature and a passing connectivity probe are
   both true — no extension change required to consume it.
 
@@ -183,8 +185,8 @@ Precedes any `requires_auth` tab. Job-scoped (carries the envelope's
 `job_id`, matching every other job-scoped institutional pair —
 `protocol.go:1092-1105` `jobScoped` map gets both new types added). Resolves
 the human-surface disposition for one candidate's authentication claim in
-one daemon transaction, per the August-reviewed design
-(`dev/active/surface-lifecycle-plan.md` lines 322-323).
+one daemon transaction, per the August-reviewed design now recorded in
+`dev/adr/0028-surface-lifecycle-ownership.md` (Decision 2).
 
 **`authentication_claim_request`** (extension → daemon):
 
@@ -701,7 +703,8 @@ carries the matching `"forbidden-unless-empty"` disposition so an explicit
 empty string on the wire parses identically on both sides.
 
 Rollout order, mirroring Slice 4's already-decided pattern
-(`dev/active/surface-lifecycle-plan.md` lines 350-352) rather than inventing
+(`dev/adr/0028-surface-lifecycle-ownership.md`, "Consequences") rather than
+inventing
 a new one:
 
 1. **Daemon/host first, dark.** `surface_close_v1` and
@@ -777,7 +780,8 @@ a new one:
 Every citation above was read from the current tree in this session; the
 file:line anchors were current as of that read and may drift with unrelated
 edits, but the symbols and shapes they describe are real, not inferred:
-`dev/active/surface-lifecycle-plan.md` (whole plan, lines cited inline),
+`dev/adr/0028-surface-lifecycle-ownership.md` (Decisions 1-7; it supersedes the
+plan document these citations originally named),
 `dev/adr/0022-institutional-processing-authority-and-enablement.md`
 (Decisions 1-10, Phase 1/3 implementation notes, both amendments),
 `dev/adr/0003-browser-session-arbitration.md`, `AGENTS.md` (Protocol section,

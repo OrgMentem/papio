@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // The `storage.local` birth-certificate ledger: a URL-free successor to the
-// raw-URL managed-tab ledger (Slice 2a of dev/active/surface-lifecycle-plan.md).
+// raw-URL managed-tab ledger (Slice 2a of dev/adr/0028-surface-lifecycle-ownership.md).
 // No route URLs, titles, DOIs, hosts, or entity material are ever recorded
 // here (ADR-0022 Decision 1) — only an opaque binding identity and enough
 // bookkeeping to authorize adoption and closure in later slices. This module

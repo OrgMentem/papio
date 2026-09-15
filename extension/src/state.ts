@@ -950,7 +950,7 @@ export function clearPendingDelivery(
  * adds the URL-free operator-selected manual-delivery target; version 5 adds
  * the URL-free terms effect correlation ledger; version 6 drops that pin and
  * binds the one restart-surviving `waiting_manual` continuation to its exact
- * page identity; version 7 (Slice 3 of surface-lifecycle-plan.md) drops the
+ * page identity; version 7 (Slice 3 of dev/adr/0028-surface-lifecycle-ownership.md) drops the
  * `federatedLoginOwners` cross-job claim map and its per-job
  * `waiting_for_session`/`waiting_for_session_key`/`waiting_deadline`
  * markers; version 8 adds a configured bare institution origin to active
