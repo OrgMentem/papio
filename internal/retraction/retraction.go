@@ -18,13 +18,14 @@
 //	content-disposition: attachment; filename=retractions.csv
 //	Record ID,Title,Subject,Institution,Journal,Publisher,Country,Author,URLS,ArticleType,RetractionDate,RetractionDOI,RetractionPubMedID,OriginalPaperDate,OriginalPaperDOI,OriginalPaperPubMedID,RetractionNature,Reason,Paywalled,Notes,
 //
-// The server ignored the byte range and sent 49.5 MB. The 64 MiB response
+// The server ignored the byte range and sent 66.7 MB. The 256 MiB response
 // limit admits that measured dataset with headroom. One daily request replaces
 // a request for every corpus DOI, and the last valid CSV remains available when
 // a later fetch fails.
 package retraction
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -34,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,9 +56,9 @@ import (
 
 const (
 	defaultBaseURL = "https://api.labs.crossref.org/data/retractionwatch"
-	// DefaultMaxResponseBytes admits the 49.5 MB dataset measured by the live
-	// probe while retaining a fixed response ceiling.
-	DefaultMaxResponseBytes int64 = 64 << 20
+	// DefaultMaxResponseBytes admits the 66.7 MB, 72,526-row dataset measured
+	// on 2026-09-15 with enough headroom for sustained growth.
+	DefaultMaxResponseBytes int64 = 256 << 20
 	maxCacheBody            int64 = 1 << 20
 	cacheFileName                 = "retraction-cache.json"
 	datasetFileName               = "retraction-watch.csv"
@@ -77,7 +79,7 @@ const (
 	NatureConcern    Nature = "concern"
 )
 
-// Finding is one current Crossref update notice for a ready library work.
+// Finding is one current Crossref update notice for a monitored library work.
 type Finding struct {
 	DOI       string    `json:"doi"`
 	Nature    Nature    `json:"nature"`
@@ -97,16 +99,13 @@ type BudgetAcquirer interface {
 }
 
 // LibraryDOILister supplies every configured library DOI when library scope is
-// enabled. Implementations can also implement LibraryDOITitleProvider.
+// enabled.
 type LibraryDOILister interface {
 	LibraryDOIs(context.Context) ([]string, error)
 }
 
-// LibraryDOITitleProvider supplies the title discovered while LibraryDOIs
-// enumerated the library. It is separate so simple test fakes only need the
-// required DOI method.
-type LibraryDOITitleProvider interface {
-	LibraryDOITitle(string) string
+type libraryDOITitleProvider interface {
+	libraryDOITitle(string) string
 }
 
 type Options struct {
@@ -192,7 +191,11 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	now := s.now().UTC()
 	s.mu.Lock()
 	cached, ok := s.readCache()
-	fresh := ok && !cached.CheckedAt.IsZero() && now.Sub(cached.CheckedAt) < sweepEvery
+	latestAttempt := cached.CheckedAt
+	if cached.LastFetchErrorAt.After(latestAttempt) {
+		latestAttempt = cached.LastFetchErrorAt
+	}
+	fresh := ok && !latestAttempt.IsZero() && now.Sub(latestAttempt) < sweepEvery
 	s.mu.Unlock()
 	if fresh {
 		return nil
@@ -209,14 +212,17 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 			current[finding.DOI] = finding
 		}
 	}
+	var lastFetchErr error
 	if len(corpus) != 0 {
 		if err := s.budgets.Acquire(ctx, config.SourceRetractionWatch, s.policy, 0); err != nil {
 			return fmt.Errorf("retraction: acquire Retraction Watch budget: %w", err)
 		}
-		updates, fetchErr := s.lookup(ctx, corpus)
-		if fetchErr != nil {
-			return fetchErr
+		updates, sourceErr, lookupErr := s.lookup(ctx, corpus)
+		if lookupErr != nil {
+			s.recordFetchFailure(cached, ok, now, lookupErr)
+			return lookupErr
 		}
+		lastFetchErr = sourceErr
 		for doi, records := range updates {
 			local := corpus[doi]
 			for _, update := range records {
@@ -270,7 +276,12 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	if scanID == "" || !ok || !fresh {
 		scanID = fmt.Sprintf("scan:%d", now.UnixNano())
 	}
-	if err := s.writeCache(cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices}); err != nil {
+	nextCache := cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices}
+	if lastFetchErr != nil {
+		nextCache.LastFetchError = boundedFetchError(lastFetchErr)
+		nextCache.LastFetchErrorAt = now
+	}
+	if err := s.writeCache(nextCache); err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("retraction: write cache: %w", err)
 	}
@@ -521,7 +532,7 @@ func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, error
 	if err != nil {
 		return nil, fmt.Errorf("retraction: enumerate library DOIs: %w", err)
 	}
-	titles, _ := s.libraryDOIs.(LibraryDOITitleProvider)
+	titles, _ := s.libraryDOIs.(libraryDOITitleProvider)
 	for _, raw := range dois {
 		doi, err := work.NormalizeDOI(raw)
 		if err != nil {
@@ -529,7 +540,7 @@ func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, error
 		}
 		title := ""
 		if titles != nil {
-			title = strings.TrimSpace(titles.LibraryDOITitle(doi))
+			title = strings.TrimSpace(titles.libraryDOITitle(doi))
 		}
 		if current, exists := corpus[doi]; !exists || (current.Title == "" && title != "") {
 			corpus[doi] = readyWork{DOI: doi, Title: title}
@@ -544,34 +555,39 @@ type update struct {
 	Title     string
 }
 
-func (s *Sentinel) lookup(ctx context.Context, corpus map[string]readyWork) (map[string][]update, error) {
-	data, err := s.fetchDataset(ctx)
-	if err != nil {
-		cached, cacheErr := os.ReadFile(s.datasetPath())
-		if cacheErr != nil || int64(len(cached)) > s.maxBody {
-			return nil, err
-		}
-		updates, rowCount, parseErr := parseDataset(cached, corpus)
+func (s *Sentinel) lookup(ctx context.Context, corpus map[string]readyWork) (map[string][]update, error, error) {
+	downloaded, sourceErr := s.downloadDataset(ctx)
+	if sourceErr == nil {
+		updates, rowCount, parseErr := parseDatasetFile(downloaded, corpus)
 		if parseErr != nil || rowCount == 0 {
-			return nil, fmt.Errorf("%w; cached Retraction Watch dataset is invalid: %v", err, datasetValidationError(parseErr, rowCount))
+			sourceErr = fmt.Errorf("retraction: invalid Retraction Watch dataset: %w", datasetValidationError(parseErr, rowCount))
+		} else if err := os.Rename(downloaded, s.datasetPath()); err != nil {
+			sourceErr = fmt.Errorf("retraction: cache Retraction Watch dataset: %w", err)
+		} else {
+			return updates, nil, nil
 		}
-		log.Printf("papio: Retraction Watch fetch failed; using last known-good dataset: %v", err)
-		return updates, nil
+		_ = os.Remove(downloaded)
 	}
-	updates, rowCount, err := parseDataset(data, corpus)
-	if err != nil || rowCount == 0 {
-		return nil, fmt.Errorf("retraction: invalid Retraction Watch dataset: %w", datasetValidationError(err, rowCount))
+	var updates map[string][]update
+	var rowCount int
+	info, cacheErr := os.Stat(s.datasetPath())
+	if cacheErr == nil && info.Size() > s.maxBody {
+		cacheErr = fmt.Errorf("dataset exceeds %d-byte limit", s.maxBody)
 	}
-	if err := s.writeDataset(data); err != nil {
-		return nil, fmt.Errorf("retraction: cache Retraction Watch dataset: %w", err)
+	if cacheErr == nil {
+		updates, rowCount, cacheErr = parseDatasetFile(s.datasetPath(), corpus)
 	}
-	return updates, nil
+	if cacheErr != nil || rowCount == 0 {
+		return nil, sourceErr, fmt.Errorf("%w; cached Retraction Watch dataset is invalid: %v", sourceErr, datasetValidationError(cacheErr, rowCount))
+	}
+	log.Printf("papio: Retraction Watch fetch failed; using last known-good dataset: %v", sourceErr)
+	return updates, sourceErr, nil
 }
 
-func (s *Sentinel) fetchDataset(ctx context.Context) ([]byte, error) {
+func (s *Sentinel) downloadDataset(ctx context.Context) (string, error) {
 	endpoint, err := url.Parse(s.baseURL)
 	if err != nil {
-		return nil, errors.New("retraction: invalid configured Retraction Watch endpoint")
+		return "", errors.New("retraction: invalid configured Retraction Watch endpoint")
 	}
 	if s.email != "" {
 		query := endpoint.Query()
@@ -580,42 +596,88 @@ func (s *Sentinel) fetchDataset(ctx context.Context) ([]byte, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("retraction: build Retraction Watch request: %w", err)
+		return "", fmt.Errorf("retraction: build Retraction Watch request: %w", err)
 	}
 	req.Header.Set("Accept", "text/csv")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return "", ctx.Err()
 		}
-		return nil, &resolver.TemporaryError{Err: errors.New("retraction: Retraction Watch request failed")}
+		return "", &resolver.TemporaryError{Err: errors.New("retraction: Retraction Watch request failed")}
 	}
 	if resp == nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("retraction: empty Retraction Watch response")}
+		return "", &resolver.TemporaryError{Err: errors.New("retraction: empty Retraction Watch response")}
 	}
 	if resp.Body == nil {
-		return nil, errors.New("retraction: Retraction Watch response body is missing")
+		return "", errors.New("retraction: Retraction Watch response body is missing")
 	}
 	defer func() { _ = resp.Body.Close() }()
 	switch {
 	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-		return nil, temporaryStatus(resp)
+		return "", temporaryStatus(resp)
 	case resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices:
-		return nil, fmt.Errorf("retraction: Retraction Watch returned HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("retraction: Retraction Watch returned HTTP %d", resp.StatusCode)
 	}
-	data, err := readBounded(resp.Body, s.maxBody)
+	if resp.ContentLength > s.maxBody {
+		return "", fmt.Errorf("retraction: Retraction Watch response exceeds %d-byte limit", s.maxBody)
+	}
+	if contentType := strings.TrimSpace(resp.Header.Get("Content-Type")); contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err != nil || (mediaType != "text/csv" && mediaType != "application/csv" && mediaType != "application/octet-stream") {
+			return "", fmt.Errorf("retraction: unexpected Retraction Watch content type %q", contentType)
+		}
+	}
+	if err := os.MkdirAll(s.dataDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(s.dataDir, 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(s.dataDir, ".retraction-watch-*")
 	if err != nil {
-		return nil, fmt.Errorf("retraction: invalid Retraction Watch response: %w", err)
+		return "", err
 	}
-	return data, nil
+	name := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(name)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return "", err
+	}
+	written, err := io.Copy(tmp, io.LimitReader(resp.Body, s.maxBody+1))
+	if err != nil {
+		return "", fmt.Errorf("retraction: read Retraction Watch response: %w", err)
+	}
+	if written > s.maxBody {
+		return "", fmt.Errorf("retraction: Retraction Watch response exceeds %d-byte limit", s.maxBody)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	keep = true
+	return name, nil
 }
 
-func parseDataset(data []byte, corpus map[string]readyWork) (map[string][]update, int, error) {
-	if err := validateDatasetShape(data); err != nil {
+func parseDatasetFile(path string, corpus map[string]readyWork) (map[string][]update, int, error) {
+	file, err := os.Open(path)
+	if err != nil {
 		return nil, 0, err
 	}
-	reader := csv.NewReader(bytes.NewReader(data))
+	defer func() { _ = file.Close() }()
+	if err := validateDatasetShape(file); err != nil {
+		return nil, 0, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, 0, err
+	}
+	reader := csv.NewReader(file)
 	reader.FieldsPerRecord = -1
+	reader.ReuseRecord = true
 	header, err := reader.Read()
 	if err != nil {
 		return nil, 0, err
@@ -685,7 +747,9 @@ func parseDataset(data []byte, corpus map[string]readyWork) (map[string][]update
 	}
 	return updates, rowCount, nil
 }
-func validateDatasetShape(data []byte) error {
+
+func validateDatasetShape(body io.Reader) error {
+	reader := bufio.NewReaderSize(body, 64<<10)
 	fieldBytes := 0
 	recordBytes := 0
 	columns := 1
@@ -698,16 +762,25 @@ func validateDatasetShape(data []byte) error {
 		}
 		return nil
 	}
-	for i := 0; i < len(data); i++ {
-		char := data[i]
+	for {
+		char, err := reader.ReadByte()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
 		recordBytes++
 		if recordBytes > maxDatasetRecordBytes {
 			return fmt.Errorf("CSV record exceeds %d-byte limit", maxDatasetRecordBytes)
 		}
 		if inQuotes {
 			if char == '"' {
-				if i+1 < len(data) && data[i+1] == '"' {
-					i++
+				next, peekErr := reader.Peek(1)
+				if peekErr == nil && next[0] == '"' {
+					if _, err := reader.ReadByte(); err != nil {
+						return err
+					}
 					recordBytes++
 					if recordBytes > maxDatasetRecordBytes {
 						return fmt.Errorf("CSV record exceeds %d-byte limit", maxDatasetRecordBytes)
@@ -716,6 +789,9 @@ func validateDatasetShape(data []byte) error {
 						return err
 					}
 				} else {
+					if peekErr != nil && peekErr != io.EOF {
+						return peekErr
+					}
 					inQuotes = false
 				}
 				continue
@@ -746,7 +822,11 @@ func validateDatasetShape(data []byte) error {
 			columns = 1
 			atFieldStart = true
 		case '\r':
-			if i+1 >= len(data) || data[i+1] != '\n' {
+			next, peekErr := reader.Peek(1)
+			if peekErr != nil && peekErr != io.EOF {
+				return peekErr
+			}
+			if len(next) == 0 || next[0] != '\n' {
 				if err := addFieldByte(); err != nil {
 					return err
 				}
@@ -775,49 +855,8 @@ func datasetValidationError(parseErr error, rowCount int) error {
 	return nil
 }
 
-func readBounded(body io.Reader, maximum int64) ([]byte, error) {
-	if maximum <= 0 {
-		return nil, errors.New("invalid response limit")
-	}
-	data, err := io.ReadAll(io.LimitReader(body, maximum+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maximum {
-		return nil, fmt.Errorf("response exceeds %d-byte limit", maximum)
-	}
-	return data, nil
-}
-
 func (s *Sentinel) datasetPath() string {
 	return filepath.Join(s.dataDir, datasetFileName)
-}
-
-func (s *Sentinel) writeDataset(data []byte) error {
-	if err := os.MkdirAll(s.dataDir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(s.dataDir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(s.dataDir, ".retraction-watch-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, s.datasetPath())
 }
 
 func parseNature(value string) (Nature, bool) {
@@ -901,14 +940,40 @@ func noticeMessage(f Finding) string {
 }
 
 type cache struct {
-	Version   int                `json:"version"`
-	CheckedAt time.Time          `json:"checked_at"`
-	ScanID    string             `json:"scan_id,omitempty"`
-	Notices   map[string]Finding `json:"notices"`
+	Version          int                `json:"version"`
+	CheckedAt        time.Time          `json:"checked_at"`
+	ScanID           string             `json:"scan_id,omitempty"`
+	Notices          map[string]Finding `json:"notices"`
+	LastFetchError   string             `json:"last_fetch_error,omitempty"`
+	LastFetchErrorAt time.Time          `json:"last_fetch_error_at,omitempty"`
 }
 
 func (s *Sentinel) cachePath() string {
 	return filepath.Join(s.dataDir, cacheFileName)
+}
+func (s *Sentinel) recordFetchFailure(cached cache, valid bool, at time.Time, fetchErr error) {
+	if !valid {
+		cached = cache{Version: cacheVersion, Notices: map[string]Finding{}}
+	}
+	cached.LastFetchError = boundedFetchError(fetchErr)
+	cached.LastFetchErrorAt = at
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.writeCache(cached); err != nil {
+		log.Printf("papio: recording Retraction Watch fetch failure: %v", err)
+	}
+}
+
+func boundedFetchError(err error) string {
+	if err == nil {
+		return ""
+	}
+	const maximumRunes = 512
+	message := []rune(err.Error())
+	if len(message) > maximumRunes {
+		message = message[:maximumRunes]
+	}
+	return string(message)
 }
 
 // readCache requires the caller to hold s.mu so readers cannot observe a cache
@@ -920,7 +985,9 @@ func (s *Sentinel) readCache() (cache, bool) {
 	}
 	var cached cache
 	if err := decodeBoundedJSON(bytes.NewReader(data), maxCacheBody, &cached); err != nil ||
-		cached.Version != cacheVersion || cached.CheckedAt.IsZero() || len(cached.Notices) > maxNotices {
+		cached.Version != cacheVersion ||
+		(cached.CheckedAt.IsZero() && cached.LastFetchErrorAt.IsZero()) ||
+		len(cached.Notices) > maxNotices {
 		return cache{}, false
 	}
 	cached.Notices = validNotices(cached.Notices)

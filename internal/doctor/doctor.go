@@ -81,6 +81,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 	checkNotifications(ctx, cfg, db, add)
 	checkFiling(ctx, cfg, db, add)
+	checkRetraction(cfg, add)
 
 	if err := checkDataDir(cfg.DataDir); err != nil {
 		msg := err.Error()
@@ -446,6 +447,79 @@ func checkNotifications(ctx context.Context, cfg config.Config, db *store.Store,
 	add("notifications", status,
 		fmt.Sprintf("%s; effective preset %s; held digests %s; webhook %s", capability, policy.Preset, held, webhook),
 		remediation)
+}
+
+const (
+	retractionCacheFileName = "retraction-cache.json"
+	retractionCacheMaxBytes = 1 << 20
+	retractionCacheVersion  = 1
+	retractionStaleAfter    = 48 * time.Hour
+)
+
+type retractionCacheStatus struct {
+	Version          int                        `json:"version"`
+	CheckedAt        time.Time                  `json:"checked_at"`
+	Notices          map[string]json.RawMessage `json:"notices"`
+	LastFetchError   string                     `json:"last_fetch_error"`
+	LastFetchErrorAt time.Time                  `json:"last_fetch_error_at"`
+}
+
+func checkRetraction(cfg config.Config, add func(string, string, string, string)) {
+	if !cfg.SourcePolicy(config.SourceRetractionWatch).Enabled {
+		add("retraction", Skip, "retraction_watch is disabled", "enable sources.retraction_watch to monitor library integrity notices")
+		return
+	}
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		add("retraction", Skip, "no data directory is configured", "set data_dir, then let the daemon complete a retraction sweep")
+		return
+	}
+	path := filepath.Join(cfg.DataDir, retractionCacheFileName)
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		add("retraction", Skip, "no retraction sweep has completed yet", "keep the daemon running through its next daily maintenance sweep")
+		return
+	}
+	if err != nil {
+		add("retraction", Warn, "retraction sweep status cannot be read", "check data directory ownership and permissions")
+		return
+	}
+	if len(data) > retractionCacheMaxBytes {
+		add("retraction", Warn, "retraction sweep status exceeds its size limit", "remove the damaged retraction-cache.json file, then restart the daemon")
+		return
+	}
+	var status retractionCacheStatus
+	if err := json.Unmarshal(data, &status); err != nil || status.Version != retractionCacheVersion {
+		add("retraction", Warn, "retraction sweep status is invalid", "remove the damaged retraction-cache.json file, then restart the daemon")
+		return
+	}
+	noticeCount := len(status.Notices)
+	if status.LastFetchError != "" {
+		detail := "latest Retraction Watch fetch failed"
+		if !status.LastFetchErrorAt.IsZero() {
+			detail += fmt.Sprintf(" %s ago", quiesceDays(time.Since(status.LastFetchErrorAt)))
+		}
+		detail += ": " + status.LastFetchError
+		if !status.CheckedAt.IsZero() {
+			detail += fmt.Sprintf("; last successful sweep %s ago with %d current notice(s)", quiesceDays(time.Since(status.CheckedAt)), noticeCount)
+		} else {
+			detail += "; no successful sweep is recorded"
+		}
+		add("retraction", Warn, detail, "check access to api.labs.crossref.org and keep the daemon running through its next daily maintenance sweep")
+		return
+	}
+	if status.CheckedAt.IsZero() {
+		add("retraction", Skip, "no retraction sweep has completed yet", "keep the daemon running through its next daily maintenance sweep")
+		return
+	}
+	age := time.Since(status.CheckedAt)
+	if age > retractionStaleAfter {
+		add("retraction", Warn,
+			fmt.Sprintf("last successful retraction sweep was %s ago with %d current notice(s)", quiesceDays(age), noticeCount),
+			"check that the daemon stays running and that sources.retraction_watch remains enabled")
+		return
+	}
+	add("retraction", Pass,
+		fmt.Sprintf("last successful retraction sweep was %s ago with %d current notice(s)", quiesceDays(age), noticeCount), "")
 }
 
 // checkFiling reports failed or absent on_ready outcomes only when the hook is

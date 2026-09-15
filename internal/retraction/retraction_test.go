@@ -95,7 +95,7 @@ func (f *fakeLibraryDOIs) LibraryDOIs(context.Context) ([]string, error) {
 	return append([]string(nil), f.dois...), nil
 }
 
-func (f *fakeLibraryDOIs) LibraryDOITitle(doi string) string {
+func (f *fakeLibraryDOIs) libraryDOITitle(doi string) string {
 	return f.titles[doi]
 }
 
@@ -108,6 +108,9 @@ type csvNotice struct {
 
 func writeRetractionDataset(t *testing.T, w http.ResponseWriter, notices ...csvNotice) {
 	t.Helper()
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "text/csv")
+	}
 	writer := csv.NewWriter(w)
 	if err := writer.Write([]string{"Record ID", "Title", "RetractionDOI", "OriginalPaperDOI", "RetractionNature"}); err != nil {
 		t.Fatal(err)
@@ -262,6 +265,64 @@ func TestBulkLookupServesLastKnownGoodDatasetAfterFetchFailure(t *testing.T) {
 	if err != nil || len(items) != 1 || items[0].Retraction.DOI != "10.1234/cached" {
 		t.Fatalf("fallback items = %#v, err = %v", items, err)
 	}
+	data, err := os.ReadFile(sentinel.cachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status cache
+	if err := json.Unmarshal(data, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.LastFetchError == "" || !status.LastFetchErrorAt.Equal(now) {
+		t.Fatalf("fallback fetch status = %#v", status)
+	}
+}
+
+func TestBulkLookupRejectsUnexpectedContentType(t *testing.T) {
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/content-type", 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Affected paper", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/content-type", nature: "Retraction",
+		})
+	}))
+	defer server.Close()
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+	})
+	err := sentinel.RunDue(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unexpected Retraction Watch content type") {
+		t.Fatalf("content-type error = %v", err)
+	}
+}
+
+func TestBulkLookupAttemptsFailedFetchOnlyOnceDaily(t *testing.T) {
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/daily-attempt", 1)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		http.Error(w, "offline", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+		Now: func() time.Time { return now },
+	})
+	if err := sentinel.RunDue(context.Background()); err == nil {
+		t.Fatal("first failed fetch succeeded")
+	}
+	if err := sentinel.RunDue(context.Background()); err != nil {
+		t.Fatalf("daily attempt gate: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("failed fetch requests = %d, want 1 per day", requests)
+	}
 }
 func TestZeroRowDatasetPreservesLastKnownGoodCaches(t *testing.T) {
 	ctx := context.Background()
@@ -292,11 +353,7 @@ func TestZeroRowDatasetPreservesLastKnownGoodCaches(t *testing.T) {
 		title: "Affected paper", noticeDOI: "10.2000/notice",
 		workDOI: "10.1234/cached", nature: "Retraction",
 	})
-	if err := sentinel.writeDataset(valid.Body.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	noticeBefore, err := os.ReadFile(sentinel.cachePath())
-	if err != nil {
+	if err := os.WriteFile(sentinel.datasetPath(), valid.Body.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	datasetBefore, err := os.ReadFile(sentinel.datasetPath())
@@ -309,8 +366,8 @@ func TestZeroRowDatasetPreservesLastKnownGoodCaches(t *testing.T) {
 	defer server.Close()
 	sentinel.client = server.Client()
 	sentinel.baseURL = server.URL
-	if err := sentinel.RunDue(ctx); err == nil || !strings.Contains(err.Error(), "no data rows") {
-		t.Fatalf("zero-row sweep error = %v", err)
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatalf("zero-row sweep did not use the last known-good dataset: %v", err)
 	}
 	noticeAfter, err := os.ReadFile(sentinel.cachePath())
 	if err != nil {
@@ -320,8 +377,13 @@ func TestZeroRowDatasetPreservesLastKnownGoodCaches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(noticeAfter) != string(noticeBefore) {
-		t.Fatal("zero-row dataset rewrote the current notice cache")
+	var noticeCache cache
+	if err := json.Unmarshal(noticeAfter, &noticeCache); err != nil {
+		t.Fatal(err)
+	}
+	if len(noticeCache.Notices) != 1 || noticeCache.LastFetchError == "" ||
+		!strings.Contains(noticeCache.LastFetchError, "no data rows") {
+		t.Fatalf("notice cache after zero-row dataset = %#v", noticeCache)
 	}
 	if string(datasetAfter) != string(datasetBefore) {
 		t.Fatal("zero-row dataset rewrote the last known-good dataset")
@@ -392,10 +454,10 @@ func TestLibraryCatalogEnumeratesFileAndPagedZotero(t *testing.T) {
 	if !slices.Contains(dois, "10.1234/from-file") || !slices.Contains(dois, "10.1234/zotero-100") {
 		t.Fatalf("enumerated DOIs omit file or second Zotero page")
 	}
-	if got := catalog.LibraryDOITitle("10.1234/from-file"); got != "File title" {
+	if got := catalog.libraryDOITitle("10.1234/from-file"); got != "File title" {
 		t.Fatalf("file title = %q", got)
 	}
-	if got := catalog.LibraryDOITitle("10.1234/zotero-100"); got != "Zotero title 100" {
+	if got := catalog.libraryDOITitle("10.1234/zotero-100"); got != "Zotero title 100" {
 		t.Fatalf("Zotero title = %q", got)
 	}
 }
@@ -708,7 +770,7 @@ func TestIntegrityNoticeCopyNamesARecoverableSurface(t *testing.T) {
 	}
 }
 
-func TestSweepAllLookupFailuresLeaveCacheUntouched(t *testing.T) {
+func TestBulkLookupFailurePreservesNoticesAndRecordsHealth(t *testing.T) {
 	ctx := context.Background()
 	jobs := testStore(t)
 	addReadyDOI(t, jobs, "10.1234/first", 1)
@@ -737,9 +799,8 @@ func TestSweepAllLookupFailuresLeaveCacheUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed cache: %v", err)
 	}
-	before, err := os.ReadFile(filepath.Join(dataDir, cacheFileName))
-	if err != nil {
-		t.Fatalf("read initial cache: %v", err)
+	if err := os.WriteFile(sentinel.datasetPath(), []byte("{"), 0o600); err != nil {
+		t.Fatalf("seed corrupt dataset cache: %v", err)
 	}
 
 	if err := sentinel.RunDue(ctx); err == nil {
@@ -750,8 +811,16 @@ func TestSweepAllLookupFailuresLeaveCacheUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read final cache: %v", err)
 	}
-	if string(after) != string(before) {
-		t.Fatalf("cache changed after total failure:\n before = %s\n after = %s", before, after)
+	var status cache
+	if err := json.Unmarshal(after, &status); err != nil {
+		t.Fatalf("decode final cache: %v", err)
+	}
+	got, ok := status.Notices[findingKey(previous)]
+	if !ok || got.DOI != previous.DOI || got.NoticeDOI != previous.NoticeDOI {
+		t.Fatalf("notices changed after total failure: %#v", status.Notices)
+	}
+	if status.LastFetchError == "" || !status.LastFetchErrorAt.Equal(now) {
+		t.Fatalf("fetch failure was not recorded: %#v", status)
 	}
 }
 

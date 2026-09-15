@@ -203,6 +203,7 @@ report not OK. The checks below explain every check the command can emit.
 | `access_mode` | An explicit allowed access mode is configured. | Set `access_mode` to `conservative`, `assisted`, or `delegated`; `papio init` creates a conservative profile. |
 | `fetch_policy` | HTTPS-only fetch policy is active. | A warning means `fetch.allow_http_loopback` is on; disable it outside loopback fixture work. |
 | `data_dir` | The data directory is private and writable. | Correct ownership or permissions so *papio* can create and write the configured directory. |
+| `retraction` | The latest Retraction Watch fetch succeeded, and the last successful sweep is less than 48 hours old. | `SKIP` means the source is disabled or no sweep has completed. `WARN` means the latest fetch failed, the last success is older than 48 hours, or the local status is invalid. Check access to `api.labs.crossref.org`, keep the daemon running through its next daily maintenance sweep, or follow the row's cache repair instruction. |
 | `config_permissions` | The config is user-only. | A missing config is a warning; create it with `papio init`. A group/world-readable config is a failure; set it to mode `0600`. |
 | `database` | The local database passed its integrity and version checks. | If unavailable in this run, run doctor through the background service. For an integrity failure, restore a verified backup before acquiring more work. |
 | `pdf_worker` | The current *papio* can run its isolated PDF worker. | Reinstall or rebuild `papio` and retry doctor. |

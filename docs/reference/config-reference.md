@@ -175,7 +175,7 @@ patron_ref = "configured-non-secret-reference"
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `scope` | string | `acquired` | Selects the DOI corpus for the daily Retraction Watch check. `acquired` checks works that *papio* has filed. `library` also checks DOI records from every `[[library.sources]]` export and, when configured, the personal Zotero library through paged `zotio --agent items list` reads. Allowed values are `acquired` and `library`. The check downloads the Crossref Retraction Watch CSV at most once daily, caches its last valid copy in `data_dir`, and matches locally. Thus its request count does not grow with the library size. The CSV response limit is 64 MiB. |
+| `scope` | string | `acquired` | Selects the DOI corpus for the daily Retraction Watch check. `acquired` checks works that *papio* has acquired. `library` also checks DOI records from every `[[library.sources]]` export and, when configured, the personal Zotero library through paged `zotio --agent items list` reads. Allowed values are `acquired` and `library`. The check downloads the Crossref Retraction Watch CSV at most once daily, caches its last valid copy in `data_dir`, and matches locally. Thus its request count does not grow with the library size. The CSV response limit is 256 MiB; the live dataset was 66.7 MB with 72,526 rows on 2026-09-15. |
 
 The default preserves the earlier job-scoped behavior. An upgrade does not
 silently disclose a wider DOI corpus. This strict-mode section requires a

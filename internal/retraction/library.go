@@ -8,22 +8,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
-	"papio/internal/bibparse"
 	"papio/internal/config"
+	"papio/internal/ownershipsnapshot"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
 const (
-	maxLibrarySourceBytes int64 = 32 << 20
-	zotioPageSize               = 100
-	maxZotioPages               = 1000
+	zotioPageSize = 100
+	maxZotioPages = 1000
 )
 
 // LibraryCatalog enumerates DOI-bearing records from configured bibliographic
@@ -68,33 +66,16 @@ func (c *LibraryCatalog) LibraryDOIs(ctx context.Context) ([]string, error) {
 	return dois, nil
 }
 
-// LibraryDOITitle returns the title recorded by the latest enumeration.
-func (c *LibraryCatalog) LibraryDOITitle(doi string) string {
+func (c *LibraryCatalog) libraryDOITitle(doi string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.titles[doi]
 }
 
 func enumerateFileSource(ctx context.Context, source config.LibrarySource, byDOI map[string]string) error {
-	if err := ctx.Err(); err != nil {
+	records, err := ownershipsnapshot.EnumerateLibraryRecords(ctx, source)
+	if err != nil {
 		return err
-	}
-	file, err := os.Open(source.Path)
-	if err != nil {
-		return fmt.Errorf("library source %q: %w", source.Name, err)
-	}
-	defer file.Close()
-	data, err := readBounded(file, maxLibrarySourceBytes)
-	if err != nil {
-		return fmt.Errorf("library source %q: %w", source.Name, err)
-	}
-	format := bibparse.Format(source.Format)
-	if format == "" {
-		format = bibparse.Detect(source.Path, data)
-	}
-	records, err := bibparse.ParseRecords(format, data)
-	if err != nil {
-		return fmt.Errorf("library source %q: %w", source.Name, err)
 	}
 	for _, record := range records {
 		addLibraryRecord(byDOI, record.DOI, record.Title)

@@ -1955,6 +1955,7 @@ func TestTriageDismissAcknowledgesRetractionNotice(t *testing.T) {
 	// The sentinel reads the Retraction Watch dataset Crossref publishes (one
 	// CSV per sweep), not a per-DOI works record.
 	crossref := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/csv")
 		_, _ = w.Write([]byte("Record ID,Title,RetractionDOI,OriginalPaperDOI,RetractionNature\n" +
 			"1,Retracted work,10.2000/notice,10.1000/retracted,Retraction\n"))
 	}))
