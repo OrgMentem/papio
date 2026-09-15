@@ -308,22 +308,32 @@ There is also a link check, because `zensical build` prints a broken link as an
   the cheap one) or behind a new method name; do not widen an existing result.
 
 ### Protocol (dual Go/TS)
-- **Every document-delivery reconciliation operation is implemented TWICE on the daemon
-  side, and a fix to one does not reach the other.** `internal/api/delivery.go` serves the
-  CLI and RPC path; `internal/browser/bridge.go` serves the extension. They are separate
-  functions with the same names and "mirrors internal/api's …" comments, and the comment
-  is not enforcement: `confirm_request_absent` was fixed in the API (`9d95757`) and the
-  bridge sibling kept the broken order for eight days while still claiming to mirror it,
-  so the extension's "Confirm absent" failed on every normally parked job. The ordering is
-  the load-bearing part — `RepairAwaitingHuman` is the legal `awaiting_human -> resolving`
-  edge, so the action MUST close **before** `SubmitDelivery`, whose reconciliation park
-  supplies the `resolving -> awaiting_human` edge back. `Cancel -> Submit -> Repair` reads
-  as safer, because a submit failure leaves the action open, but Submit then attempts
-  `awaiting_human -> awaiting_human` and the state graph refuses it. Both sides' tests now
-  pin the same discriminating end state (job parked again, one open and one resolved
-  action, row reused not duplicated), which is what makes a one-sided change fail; keep it
-  that way, because a test asserting only "one open and one resolved" passes under **both**
-  orders and is how this shipped.
+- **Document-delivery reconciliation now has ONE implementation, and the ordering inside
+  it is still the load-bearing part.** `internal/api/delivery.go:deliveryConfirmRequestAbsent`
+  and `internal/browser/bridge.go` both delegate to `internal/app`'s
+  `Service.ReconcileDelivery`; the duplicated pair of functions with "mirrors internal/api's
+  …" comments is gone. That duplication is why the single implementation exists:
+  `confirm_request_absent` was fixed in the API (`9d95757`) and the bridge sibling kept the
+  broken order for eight days while still claiming to mirror it, so the extension's "Confirm
+  absent" failed on every normally parked job. Do not reintroduce a seam-local copy of a
+  reconciliation operation; both seams keep only their own error mapping and transport
+  decoding.
+  The order is `Cancel -> Repair -> Submit`. `RepairAwaitingHuman` is the legal
+  `awaiting_human -> resolving` edge, so the action MUST close **before** `SubmitDelivery`,
+  whose reconciliation park supplies the `resolving -> awaiting_human` edge back.
+  `Cancel -> Submit -> Repair` reads as safer, because a submit failure leaves the action
+  open, but Submit then attempts `awaiting_human -> awaiting_human` and the state graph
+  refuses it.
+  Because the repair COMMITS before the submit runs, a submit failure has already consumed
+  the operator's only affordance, so `Service.restoreDeliveryReconciliationAction`
+  compensates: one transaction that transitions back to `awaiting_human` and reopens a
+  `document_delivery` action. It deliberately does not call `job.Store.ParkWithHumanAction`
+  despite matching its shape — that method opens the prompt BEFORE the transition, so
+  anything keyed on the job's state during the insert aborts the whole restore. Park first,
+  prompt second; its doc comment carries the detail.
+  Tests pin the discriminating end state (job parked again, one open and one resolved
+  action, row reused not duplicated). Keep them that way: a test asserting only "one open
+  and one resolved" passes under **both** orders and is how the original defect shipped.
 - The protocol is validated **twice** — `internal/protocol/protocol.go` (emit + decode +
   `validate()`) and `extension/src/protocol.ts` (`parseBrowserMessage`). A new offer field
   must be added to **both**, plus `protocol/browser-v1.schema.json`. New fields should be
@@ -649,22 +659,26 @@ There is also a link check, because `zensical build` prints a broken link as an
   with `papio adapter captures` (it prints each capture's path; there is no retrieve
   subcommand — copy the file yourself), and commit it before adding the spec and the
   `adapters.test.ts` cases. Do **not** hand-guess selectors.
-- **The page classifier is implemented TWICE, and the browser runs the copy you
-  are less likely to edit.** `interpret` (`extension/src/adapters/types.ts`) is
-  what `adapter-try` and fixture tests exercise. `planExecution`
-  (`extension/src/plan.ts`) carries its own classify and readiness loops, and
-  `background.ts` injects it at three call sites. `deferUntilDeadline` first
-  landed in `interpret` alone while 1,442 tests passed, so a comment that the
-  files mirror each other is not enforcement. Any classifier change needs both
-  copies plus **asynchronous** tests where they can diverge: another rule wakes
-  early, an article marker appears then disappears, and an article marker
-  remains through the deadline. Both now hold article readiness through the
-  full budget, give non-article readiness the same 50 ms settle window, and
-  exclude deferred rules from every early classification.
-  `test/plan.test.ts` adds another trap: its serialization guard is a raw text
-  scan from `planExecution` to end of file and forbids `adapters`, `interpret`,
-  `chrome`, `globalThis`, `window`, and `resolveDownloadURL` **by word, comments
-  included**. A comment naming the twin fails the build.
+- **There is ONE provider-rule classifier, and the guard that keeps it that way bans
+  its predecessor's name.** `extension/src/plan.ts:planExecution` owns provider-rule
+  classification and its readiness loops; `background.ts` injects it. The second copy,
+  `interpret` in `extension/src/adapters/types.ts`, is deleted (`bce6777`) — it was what
+  `adapter-try` and the fixture tests used to exercise, so a classifier change once meant
+  editing two files and `deferUntilDeadline` landed in `interpret` alone while 1,442 tests
+  passed. A comment claiming two files mirror each other was never enforcement, which is
+  why the copy is gone rather than re-synchronised.
+  The readiness semantics that survived the consolidation: article readiness holds through
+  the full budget, non-article readiness gets a 50 ms settle window, and deferred rules are
+  excluded from every early classification. A change here still needs **asynchronous**
+  tests where those cases diverge — another rule wakes early, an article marker appears
+  then disappears, and an article marker remains through the deadline.
+  `test/plan.test.ts:355` is the trap: a raw text scan from `planExecution` to end of file
+  forbidding `adapters`, `interpret`, `chrome`, `globalThis`, `window`, and
+  `resolveDownloadURL` **by word, comments included**. So naming the deleted twin in a
+  comment there fails the build, and reintroducing a second classifier fails it too.
+  `assessDrivenPage` (`extension/src/background.ts:932`) is a **different** classifier with
+  a different input contract — it produces `load_failure` before `planExecution` runs — and
+  is deliberately untouched by any of this. Do not merge it in.
 - **`sanitizeFixture` strips URL query strings** (privacy). So classify selectors must key on
   **stable id/path/data-attrs, not `?...` params** (e.g. SAGE keys on `section.format--pdf_epub`,
   not `[href*='download=true']`). `method: "href"` reads the **live** anchor href (with query)
