@@ -2123,7 +2123,7 @@
             },
             "allOf": [
               {
-                "comment": "browser_holder_generation is holder-only: a pending session is acknowledged to negotiate features, not to hold the bridge, so it never carries a generation. protocol.go's HelloAckPayload.validate and protocol.ts enforce the same rule at runtime.",
+                "description": "browser_holder_generation is holder-only: a pending session is acknowledged to negotiate features, not to hold the bridge, so it never carries a generation. protocol.go's HelloAckPayload.validate and protocol.ts enforce the same rule at runtime.",
                 "if": { "properties": { "role": { "const": "pending" } }, "required": ["role"] },
                 "then": { "not": { "required": ["browser_holder_generation"] } }
               }
