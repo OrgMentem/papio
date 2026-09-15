@@ -257,6 +257,29 @@ execution records kept during the initial build.
   live.** Cancelling a paper, or dismissing its request, from the browser window
   skipped the reconciliation the command line already did, so a delivery request
   *papio* had stopped watching stayed recorded as submitted forever.
+- **A cancel *papio* could not finish is no longer silent.** Cancelling a paper,
+  or dismissing its request, records the cancellation first and then releases the
+  institutional request it was waiting on. If whatever asked for the cancel went
+  away in between, the release was skipped and nothing reported it, so the
+  request stayed recorded as live while nothing was watching it. The release now
+  runs to completion regardless of who walked away, and if it still fails, the
+  message tells you the cancel itself did go through — so you retry the release
+  rather than the cancel.
+- **Confirming that a request never arrived can no longer leave the paper with
+  nothing to answer.** Telling *papio* a document-delivery request is absent
+  closes the question it asked you, and only then records the fresh request. If
+  recording the fresh request failed, the question was already gone: the paper
+  sat waiting with no prompt on any surface, and nothing short of reading the
+  database explained why. The question now comes back when that happens.
+- **Filing a second copy of a paper can no longer delete the copy you keep.**
+  When *papio* had prepared two copies of one file and finished with one of them,
+  it removed the file's bytes without checking whether the other copy still
+  pointed at them, so tidying up could take the delivered file with it. It now
+  removes the bytes only when nothing else owns them.
+- **Opening one paper no longer reads every paper's decisions.** `papio jobs
+  show` and the status card gathered the whole decision table in order to display
+  a single paper's, so both got slower as your library grew. They now read only
+  the paper you asked for.
 - **An interrupted text check is no longer reported as a failed one.** Shutting
   *papio* down while it was reading a PDF's text recorded the interruption as a
   document that needs your review, and left the attempt open. The same applies
