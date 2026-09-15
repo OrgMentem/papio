@@ -68,6 +68,16 @@ explicit one-command switch for the dev workflow, bounded automatic recovery
 (goodbye, then the 10 s stale window) for crashes, and full visibility
 (`browser sessions`, `ping` pending/denied counts, doctor remediation line).
 
+`dev_reload` also reserves against a holder whose native-host `goodbye` never
+arrives. Chrome can kill the host at the same 2 s deadline used by the
+best-effort goodbye, while daemon restart reconciliation holds the bridge
+lock. A different identified, non-legacy hello inside the live reservation
+therefore releases the reserved current holder and takes the holder role
+immediately. This rule shares the accepted risk of the time-keyed reservation:
+a sibling's fresh hello inside the window is indistinguishable from the
+reloaded browser. The CLI already detects that risk by observing which known
+session ids disappear instead of treating every holder change as success.
+
 ## Constraints on future work
 
 - **Session identity never enters `papio-browser/1` implicitly.** The planned

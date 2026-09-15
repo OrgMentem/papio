@@ -47,9 +47,10 @@ type arbitrationTransition struct {
 }
 
 type helloDecision struct {
-	role       string
-	session    *browserSession
-	transition arbitrationTransition
+	role              string
+	session           *browserSession
+	transition        arbitrationTransition
+	releasedForReload bool
 }
 
 type pollDecision struct {
@@ -96,15 +97,23 @@ func (a *sessionArbitration) hello(session *browserSession, now time.Time, refre
 	holderAlive := a.holder != nil && now.Sub(a.holder.LastSyncAt) <= sessionStaleAfter
 	sameSession := a.isHolder(session.ID)
 	legacyInvolved := session.ID == legacySessionID || (a.holder != nil && a.holder.ID == legacySessionID)
-	if a.holder != nil && holderAlive && !sameSession && !legacyInvolved {
+	reloadDeparture := a.holder != nil &&
+		a.reservedFor == a.holder.ID &&
+		now.Before(a.reservedUntil) &&
+		!sameSession &&
+		!legacyInvolved
+	if a.holder != nil && holderAlive && !sameSession && !legacyInvolved && !reloadDeparture {
 		a.pending[session.ID] = session
 		a.deniedHellos++
 		return helloDecision{role: sessionRolePending, session: session}
 	}
 
 	previous := a.holder
+	if reloadDeparture {
+		_, _ = a.release(previous.ID)
+	}
 	changed := previous == nil || previous.ID != session.ID
-	if previous != nil && !sameSession {
+	if previous != nil && !sameSession && !reloadDeparture {
 		a.takeovers++
 	}
 	delete(a.pending, session.ID)
@@ -120,7 +129,12 @@ func (a *sessionArbitration) hello(session *browserSession, now time.Time, refre
 	}
 	a.clearReloadReservation()
 	a.holder = session
-	return helloDecision{role: sessionRoleHolder, session: session, transition: transition}
+	return helloDecision{
+		role:              sessionRoleHolder,
+		session:           session,
+		transition:        transition,
+		releasedForReload: reloadDeparture,
+	}
 }
 
 func (a *sessionArbitration) poll(sessionID string, now time.Time) pollDecision {

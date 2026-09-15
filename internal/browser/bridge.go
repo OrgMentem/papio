@@ -1301,6 +1301,19 @@ func (b *Bridge) release(sessionID string) {
 	}
 }
 
+func (b *Bridge) finishReloadRelease(departed *browserSession) {
+	log.Printf("papio: browser session %s (v%s) disconnected: reload latched", shortSession(departed.ID), departed.ExtensionVersion)
+	b.reofferSourceJobID = map[string]string{}
+	if pending := b.pendingCaptures[departed.ID]; pending != nil {
+		delete(b.pendingCaptures, departed.ID)
+		pending.result <- CaptureResult{
+			RequestID: pending.payload.RequestID,
+			Outcome:   "nav_failed",
+			Detail:    "browser session disconnected during page capture",
+		}
+	}
+}
+
 // helloAck builds the capability acknowledgement frame for the role this
 // session was granted: sessionRoleHolder, or sessionRolePending for a hello
 // that lost arbitration. A pending session is acked too — it still drives
@@ -4218,7 +4231,10 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	}
 
 	transition := decision.transition
-	if transition.previous != nil && transition.previous.ID != sessionID {
+	if decision.releasedForReload {
+		b.finishReloadRelease(transition.previous)
+	}
+	if transition.previous != nil && transition.previous.ID != sessionID && !decision.releasedForReload {
 		log.Printf("papio: browser session %s (v%s) took over from previous holder",
 			shortSession(sessionID), session.ExtensionVersion)
 	}
