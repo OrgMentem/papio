@@ -40,6 +40,9 @@ func unfiledJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "application service is not configured"}
 	}
 	jobs, truncated, err := system.App.UnfiledJobs(ctx, filter, params.Limit)
+	if errors.Is(err, app.ErrReadyHookNotConfigured) {
+		return badParams(app.ErrReadyHookNotConfigured)
+	}
 	if err != nil {
 		return failure(err)
 	}

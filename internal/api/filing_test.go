@@ -22,6 +22,7 @@ import (
 func TestJobsUnfiledReturnsEnvelope(t *testing.T) {
 	system := testSystem(t)
 	ctx := context.Background()
+	system.App.ReadyHook = &hook.Runner{Command: "configured"}
 	id, err := system.Jobs.CreateRequest(ctx, "wr_jobs_unfiled_api", work.Work{
 		Title: "Filing API", DOI: "10.1000/filing-api",
 	}, "", "", job.Policy{
@@ -54,6 +55,14 @@ func TestJobsUnfiledReturnsEnvelope(t *testing.T) {
 	}
 	if truncated || len(rows) != 1 || rows[0].JobID != id || rows[0].Filing != "missing" {
 		t.Fatalf("jobs.unfiled envelope = %+v", envelope)
+	}
+}
+
+func TestJobsUnfiledWithoutHookIsInvalidArgument(t *testing.T) {
+	rpcErr := callMethod(t, Router(testSystem(t)), "jobs.unfiled", map[string]any{}, nil)
+	if rpcErr == nil || rpcErr.Code != "invalid_argument" ||
+		!strings.Contains(rpcErr.Message, "[hooks] on_ready") {
+		t.Fatalf("jobs.unfiled error = %#v, want invalid_argument naming [hooks] on_ready", rpcErr)
 	}
 }
 

@@ -532,6 +532,11 @@ func newJobsCommand(opt *options) *cobra.Command {
 				"filter": filingFilter,
 				"limit":  effective,
 			}, &page); err != nil {
+				var remoteErr *ipc.RemoteError
+				if errors.As(err, &remoteErr) && remoteErr.Code == "invalid_argument" &&
+					remoteErr.Message == app.ErrReadyHookNotConfigured.Error() {
+					return errors.New("papio jobs unfiled: [hooks] on_ready is not configured — this command lists papers a configured hook failed to file")
+				}
 				if isUnknownMethod(err) {
 					return daemonUpgradeRequired("jobs.unfiled")
 				}

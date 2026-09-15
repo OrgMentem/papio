@@ -10,12 +10,14 @@ import (
 	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/config"
+	"papio/internal/ipc"
 	"papio/internal/job"
 )
 
 func TestJobsUnfiledJSONUsesEnvelope(t *testing.T) {
 	var out, errOut bytes.Buffer
-	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+	cfg := config.Config{Hooks: config.Hooks{OnReady: "configured"}}
+	root := NewInProcessRoot(&out, &errOut, cfg, func(_ context.Context, method string, params any, result any) error {
 		if method != "jobs.unfiled" {
 			t.Fatalf("method = %q, want jobs.unfiled", method)
 		}
@@ -39,6 +41,25 @@ func TestJobsUnfiledJSONUsesEnvelope(t *testing.T) {
 	const want = `{"jobs":[{"job_id":"job_filing_01","state":"ready","title":"Unfiled paper","doi":"10.1000/unfiled","filing":"failed","last_status":"failed","last_exit_code":1,"last_attempt_at":"2026-09-15T12:00:00Z","attempts":1}],"truncated":false}` + "\n"
 	if out.String() != want {
 		t.Fatalf("output = %q, want %q", out.String(), want)
+	}
+}
+
+func TestJobsUnfiledWithoutHookReturnsActionableError(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, _ any) error {
+		if method != "jobs.unfiled" {
+			t.Fatalf("method = %q, want jobs.unfiled", method)
+		}
+		return &ipc.RemoteError{Code: "invalid_argument", Message: app.ErrReadyHookNotConfigured.Error()}
+	})
+	root.SetArgs([]string{"jobs", "unfiled"})
+	err := root.ExecuteContext(context.Background())
+	const want = "papio jobs unfiled: [hooks] on_ready is not configured — this command lists papers a configured hook failed to file"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", out.String())
 	}
 }
 

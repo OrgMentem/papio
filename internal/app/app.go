@@ -4076,6 +4076,9 @@ func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigg
 // absent or unsuccessful. The window query derives the newest event and attempt
 // count in SQLite, so the read stays bounded by limit plus its truncation probe.
 func (s *Service) UnfiledJobs(ctx context.Context, filter UnfiledFilter, limit int) ([]UnfiledJob, bool, error) {
+	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
+		return nil, false, ErrReadyHookNotConfigured
+	}
 	if filter == "" {
 		filter = UnfiledAll
 	}

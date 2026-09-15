@@ -2622,6 +2622,10 @@ func createFilingStateJob(t *testing.T, jobs *job.Store, requestID, state string
 func TestUnfiledJobs(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
+	if _, _, err := svc.UnfiledJobs(ctx, UnfiledAll, 10); !errors.Is(err, ErrReadyHookNotConfigured) {
+		t.Fatalf("unconfigured unfiled error = %v", err)
+	}
+	svc.ReadyHook = &hook.Runner{Command: "configured"}
 	failedID := createFilingStateJob(t, jobs, "wr_unfiled_failed", job.StateReady)
 	missingID := createFilingStateJob(t, jobs, "wr_unfiled_missing", job.StateImported)
 	recoveredID := createFilingStateJob(t, jobs, "wr_unfiled_recovered", job.StateReady)

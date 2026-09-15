@@ -91,6 +91,7 @@ automatic hand-off — *papio* acquires and validates; your hook files.
 
 `papio doctor` includes a `filing` check when `on_ready` is your library
 hand-off. It warns when a ready or imported job has no successful filing.
+Both commands in this section require a configured `[hooks] on_ready` command.
 
 List those jobs:
 
