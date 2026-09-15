@@ -432,12 +432,6 @@ func (s *Service) adoptionReplacementAccess(ctx context.Context, jobID string) j
 	return job.AccessInheritedFromResolvedHandoff("")
 }
 
-// leaseAwaitingHuman keeps the package-local test seam while the job store
-// owns the lease predicate and durable update.
-func (s *Service) leaseAwaitingHuman(ctx context.Context, jobID, owner string, lease time.Duration) (bool, error) {
-	return s.Jobs.LeaseAwaitingHuman(ctx, jobID, owner, lease)
-}
-
 // copyHashed streams src into dst (created 0600) while computing its SHA-256 and
 // size. The download's own bytes never enter events or the database.
 func copyHashed(src, dst string) (sha string, size int64, err error) {

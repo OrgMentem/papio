@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -84,6 +85,77 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if result.Job != "job_01" || result.State != "queued" {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestServerRejectsInvalidHandlerResult(t *testing.T) {
+	oversizedJSON := make([]byte, MaxResultBytes+1)
+	oversizedJSON[0] = '"'
+	copy(oversizedJSON[1:], bytes.Repeat([]byte("x"), MaxResultBytes-1))
+	oversizedJSON[len(oversizedJSON)-1] = '"'
+
+	tests := []struct {
+		name   string
+		result []byte
+	}{
+		{name: "empty", result: []byte("")},
+		{name: "duplicate object member", result: []byte(`{"a":1,"a":2}`)},
+		// validJSON enforces the result cap before encodeResponse sees the
+		// envelope, so an oversized result reports internal, not result_too_large.
+		{name: "oversized valid JSON", result: oversizedJSON},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			socket, _ := startTestServer(t, HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
+				return test.result, nil
+			}))
+			_, err := NewSocketClient(socket).CallRaw(context.Background(), "request_01", "jobs.get", json.RawMessage(`{}`))
+			var remote *RemoteError
+			if !errors.As(err, &remote) {
+				t.Fatalf("CallRaw error = %v, want decodable RemoteError with code internal", err)
+			}
+			if remote.Code != "internal" {
+				t.Fatalf("CallRaw RemoteError code = %q, want internal", remote.Code)
+			}
+		})
+	}
+}
+
+func TestServerReportsResultTooLarge(t *testing.T) {
+	const requestID = "request_01"
+	emptyStringResult := json.RawMessage(`""`)
+	minimalEnvelope, err := json.Marshal(Response{
+		Protocol: ProtocolVersion,
+		ID:       requestID,
+		Result:   emptyStringResult,
+	})
+	if err != nil {
+		t.Fatalf("marshal response envelope: %v", err)
+	}
+	envelopeOverhead := len(minimalEnvelope) - len(emptyStringResult)
+	resultSize := MaxResultBytes - envelopeOverhead + 1
+	result := make([]byte, resultSize)
+	result[0] = '"'
+	copy(result[1:], bytes.Repeat([]byte("x"), resultSize-2))
+	result[len(result)-1] = '"'
+
+	if len(result) > MaxResultBytes {
+		t.Fatalf("test result size = %d, exceeds MaxResultBytes = %d", len(result), MaxResultBytes)
+	}
+	if envelopeSize := len(result) + envelopeOverhead; envelopeSize <= MaxResultBytes {
+		t.Fatalf("test envelope size = %d, want greater than MaxResultBytes = %d", envelopeSize, MaxResultBytes)
+	}
+
+	socket, _ := startTestServer(t, HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
+		return result, nil
+	}))
+	_, err = NewSocketClient(socket).CallRaw(context.Background(), requestID, "jobs.get", json.RawMessage(`{}`))
+	var remote *RemoteError
+	if !errors.As(err, &remote) {
+		t.Fatalf("CallRaw error = %v, want decodable RemoteError with code result_too_large", err)
+	}
+	if remote.Code != "result_too_large" {
+		t.Fatalf("CallRaw RemoteError code = %q, want result_too_large", remote.Code)
 	}
 }
 

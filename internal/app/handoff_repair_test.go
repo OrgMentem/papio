@@ -13,6 +13,12 @@ import (
 	"papio/internal/job"
 )
 
+// leaseAwaitingHuman keeps the package-local test seam while the job store
+// owns the lease predicate and durable update.
+func (s *Service) leaseAwaitingHuman(ctx context.Context, jobID, owner string, lease time.Duration) (bool, error) {
+	return s.Jobs.LeaseAwaitingHuman(ctx, jobID, owner, lease)
+}
+
 func parkedHandoffJob(t *testing.T, svc *Service, jobs *job.Store, requestID string) *job.Row {
 	t.Helper()
 	row := resolvingExhaustionJob(t, svc, jobs, requestID)

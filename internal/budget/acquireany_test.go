@@ -404,27 +404,6 @@ func TestAcquireAnyFallsBackOnProcessLocalLatchOnly(t *testing.T) {
 	}
 }
 
-func TestAcquireAnyFallsBackOnProcessLocalLatchOnly_guardRequired(t *testing.T) {
-	m := testManager(t)
-	ctx := context.Background()
-	keyed, anon := keyedAndAnon()
-	m.LatchQuota("openalex", identityFor(keyed), m.now().UTC().Add(6*time.Hour))
-	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if chosen.APIKey != "" {
-		t.Fatal("guard: without the latch pre-check AcquireAny would not fall back")
-	}
-	keyedSnap, err := m.Snapshot(ctx, "openalex", keyed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if keyedSnap.RequestsInWindow != 0 {
-		t.Fatalf("guard: keyed reservations = %d, want 0 when the latch binds admission", keyedSnap.RequestsInWindow)
-	}
-}
-
 func TestAcquireAnyParksWhenOnlyIdentityLatched(t *testing.T) {
 	m := testManager(t)
 	ctx := context.Background()

@@ -306,23 +306,33 @@ func TestRunReportsAcquisitionsNobodyEverCollected(t *testing.T) {
 	seed("job_collected", old, true)
 	seed("job_recent", fresh, false)
 
-	detail := uncollectedDetail(t, ctx, db, Warn)
+	detail := checkDoctorDetail(t, ctx, db, "uncollected_acquisitions", Warn)
 	if !strings.Contains(detail, "1 acquired full texts") {
 		t.Fatalf("detail = %q; want exactly the one stranded job — an exported job and one inside the grace period are not orphans", detail)
 	}
 }
-
-func TestRunPassesWhenEveryAcquisitionWasCollected(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
+func TestRunPassesWhenEveryAcquisitionOrActionIsHealthy(t *testing.T) {
+	tests := []struct {
+		name      string
+		checkName string
+	}{
+		{name: "uncollected_acquisitions", checkName: "uncollected_acquisitions"},
+		{name: "quiesced_actions", checkName: "quiesced_actions"},
 	}
-	t.Cleanup(func() { _ = db.Close() })
-	uncollectedDetail(t, ctx, db, Pass)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(ctx, storetest.DataDir(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			checkDoctorDetail(t, ctx, db, tt.checkName, Pass)
+		})
+	}
 }
 
-func uncollectedDetail(t *testing.T, ctx context.Context, db *store.Store, want string) string {
+func checkDoctorDetail(t *testing.T, ctx context.Context, db *store.Store, checkName string, want string) string {
 	t.Helper()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
@@ -332,14 +342,14 @@ func uncollectedDetail(t *testing.T, ctx context.Context, db *store.Store, want 
 		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
 	}, tool, nil)
 	for _, c := range report.Checks {
-		if c.Name == "uncollected_acquisitions" {
+		if c.Name == checkName {
 			if c.Status != want {
-				t.Fatalf("status = %q, want %q (detail %q)", c.Status, want, c.Detail)
+				t.Fatalf("%s status = %q, want %q (detail %q)", checkName, c.Status, want, c.Detail)
 			}
 			return c.Detail
 		}
 	}
-	t.Fatalf("uncollected_acquisitions check missing: %+v", report.Checks)
+	t.Fatalf("%s check missing: %+v", checkName, report.Checks)
 	return ""
 }
 
@@ -379,41 +389,10 @@ func TestRunReportsActionsThatHaveGoneQuiet(t *testing.T) {
 	seed("live", "job_live", stamp(time.Hour), "open")
 	seed("done", "job_done", stamp(job.QuiesceAfter+24*time.Hour), "resolved")
 
-	detail := quiescedDetail(t, ctx, db, Warn)
+	detail := checkDoctorDetail(t, ctx, db, "quiesced_actions", Warn)
 	if !strings.Contains(detail, "1 human action(s)") {
 		t.Fatalf("detail = %q; want exactly the one quiet action — a live one and a resolved one are not waiting", detail)
 	}
-}
-
-func TestRunPassesWhenNoActionHasGoneQuiet(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	quiescedDetail(t, ctx, db, Pass)
-}
-
-func quiescedDetail(t *testing.T, ctx context.Context, db *store.Store, want string) string {
-	t.Helper()
-	cfg := config.Default()
-	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
-	tool := executable(t)
-	report := Run(ctx, cfg, db, pdf.Capability{
-		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
-	}, tool, nil)
-	for _, c := range report.Checks {
-		if c.Name == "quiesced_actions" {
-			if c.Status != want {
-				t.Fatalf("status = %q, want %q (detail %q)", c.Status, want, c.Detail)
-			}
-			return c.Detail
-		}
-	}
-	t.Fatalf("quiesced_actions check missing: %+v", report.Checks)
-	return ""
 }
 
 func TestRunReportsMissingModeCredentialsToolsAndUnsafeConfig(t *testing.T) {

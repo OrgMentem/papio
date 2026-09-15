@@ -136,18 +136,51 @@ func TestReconcileReturnsNotFoundYetForCompleteEmptyList(t *testing.T) {
 	}
 }
 
-func TestReconcileRejectsTokenWithContradictoryDOI(t *testing.T) {
-	svc := testService(t, time.Now())
-	req := newReconcileRequest(t, svc, "job_reconcile_doi_mismatch")
-	client := &reconcileFakeClient{transactions: []illiad.Transaction{{
-		TransactionNumber: 7, TransactionStatus: "Awaiting Request Processing", DOI: "10.1000/other", ItemInfo4: req.IdempotencyKey,
-	}}}
-	result, err := svc.Reconcile(context.Background(), req, reconcileDeps(client))
-	if err != nil {
-		t.Fatal(err)
+func TestReconcileRejectsContradictoryMetadata(t *testing.T) {
+	tests := []struct {
+		name          string
+		contradiction func(*illiad.Transaction)
+	}{
+		{
+			name: "DOI",
+			contradiction: func(tx *illiad.Transaction) {
+				tx.DOI = "10.1000/other"
+			},
+		},
+		{
+			name: "title and author",
+			contradiction: func(tx *illiad.Transaction) {
+				tx.PhotoArticleTitle, tx.PhotoArticleAuthor = "Different title", "Different author"
+			},
+		},
+		{
+			name: "request type",
+			contradiction: func(tx *illiad.Transaction) {
+				tx.RequestType = "Loan"
+			},
+		},
 	}
-	if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonIdentityMismatch {
-		t.Fatalf("result = %+v, want NEEDS_HUMAN/strong_identity_mismatch", result)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := testService(t, time.Now())
+			req := newReconcileRequest(t, svc, "job_reconcile_contradictory_metadata")
+			transaction := illiad.Transaction{
+				TransactionNumber: 7, TransactionStatus: "Awaiting Request Processing",
+				ItemInfo4: req.IdempotencyKey,
+			}
+			tc.contradiction(&transaction)
+			client := &reconcileFakeClient{transactions: []illiad.Transaction{transaction}}
+			deps := reconcileDeps(client)
+			deps.Identity.Title, deps.Identity.Author = "Expected title", "Expected author"
+			result, err := svc.Reconcile(context.Background(), req, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonIdentityMismatch {
+				t.Fatalf("result = %+v, want NEEDS_HUMAN/strong_identity_mismatch", result)
+			}
+		})
 	}
 }
 
@@ -180,41 +213,6 @@ func TestReconcileRejectsUnconfiguredReferenceField(t *testing.T) {
 	}
 	if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonReferenceField {
 		t.Fatalf("result = %+v, want NEEDS_HUMAN/reference_field_unconfigured_or_changed", result)
-	}
-}
-
-func TestReconcileRejectsContradictoryTitleAndAuthor(t *testing.T) {
-	svc := testService(t, time.Now())
-	req := newReconcileRequest(t, svc, "job_reconcile_citation_mismatch")
-	client := &reconcileFakeClient{transactions: []illiad.Transaction{{
-		TransactionNumber: 9, TransactionStatus: "Awaiting Request Processing",
-		PhotoArticleTitle: "Different title", PhotoArticleAuthor: "Different author",
-		ItemInfo4: req.IdempotencyKey,
-	}}}
-	deps := reconcileDeps(client)
-	deps.Identity.Title, deps.Identity.Author = "Expected title", "Expected author"
-	result, err := svc.Reconcile(context.Background(), req, deps)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonIdentityMismatch {
-		t.Fatalf("result = %+v, want NEEDS_HUMAN/strong_identity_mismatch", result)
-	}
-}
-
-func TestReconcileRejectsContradictoryRequestType(t *testing.T) {
-	svc := testService(t, time.Now())
-	req := newReconcileRequest(t, svc, "job_reconcile_request_type")
-	client := &reconcileFakeClient{transactions: []illiad.Transaction{{
-		TransactionNumber: 10, TransactionStatus: "Awaiting Request Processing",
-		RequestType: "Loan", ItemInfo4: req.IdempotencyKey,
-	}}}
-	result, err := svc.Reconcile(context.Background(), req, reconcileDeps(client))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonIdentityMismatch {
-		t.Fatalf("result = %+v, want NEEDS_HUMAN/strong_identity_mismatch", result)
 	}
 }
 

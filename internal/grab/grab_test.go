@@ -232,63 +232,104 @@ func TestAllocateEffectExistingNoPrepare(t *testing.T) {
 	}
 }
 
-func TestMarkQuarantinedSettlesPermit(t *testing.T) {
-	ctx := context.Background()
-	s, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
+func TestMarkTerminalSettlesPermit(t *testing.T) {
+	type transition struct {
+		name string
+		run  func(context.Context, *Service, string) error
 	}
-	defer s.Close()
-	svc := New(s, nil)
-	g, err := svc.AllocateEffect(ctx, "pdf.example.org", "Paper", 5, "pdf_grab:pdf.example.org", time.Now().Add(time.Hour), nil)
-	if err != nil {
-		t.Fatalf("AllocateEffect: %v", err)
+	tests := []struct {
+		name             string
+		holderGeneration int64
+		transitions      []transition
+		wantState        State
+	}{
+		{
+			name:             "quarantined",
+			holderGeneration: 5,
+			transitions: []transition{{
+				name: "MarkQuarantined",
+				run: func(ctx context.Context, svc *Service, id string) error {
+					return svc.MarkQuarantined(ctx, id, "/tmp/quarantine/"+id)
+				},
+			}},
+			wantState: StateQuarantined,
+		},
+		{
+			name:             "failed_validation",
+			holderGeneration: 6,
+			transitions: []transition{{
+				name: "MarkFailedValidation",
+				run: func(ctx context.Context, svc *Service, id string) error {
+					return svc.MarkFailedValidation(ctx, id, "not a PDF")
+				},
+			}},
+			wantState: StateFailedValidation,
+		},
+		{
+			name:             "abandoned",
+			holderGeneration: 7,
+			transitions: []transition{{
+				name: "MarkAbandoned",
+				run: func(ctx context.Context, svc *Service, id string) error {
+					return svc.MarkAbandoned(ctx, id, "interrupted")
+				},
+			}},
+			wantState: StateAbandoned,
+		},
+		{
+			name:             "failed_validation_from_quarantined",
+			holderGeneration: 8,
+			transitions: []transition{
+				{
+					name: "MarkQuarantined",
+					run: func(ctx context.Context, svc *Service, id string) error {
+						return svc.MarkQuarantined(ctx, id, "/tmp/quarantine/"+id)
+					},
+				},
+				{
+					name: "MarkFailedValidation",
+					run: func(ctx context.Context, svc *Service, id string) error {
+						return svc.MarkFailedValidation(ctx, id, "not a PDF")
+					},
+				},
+			},
+			wantState: StateFailedValidation,
+		},
 	}
-	if err := svc.MarkQuarantined(ctx, g.ID, "/tmp/quarantine/"+g.ID); err != nil {
-		t.Fatalf("MarkQuarantined: %v", err)
-	}
-	got, err := svc.Get(ctx, g.ID)
-	if err != nil || got == nil {
-		t.Fatalf("Get after quarantine: %v %v", got, err)
-	}
-	if got.State != StateQuarantined {
-		t.Fatalf("state = %q, want quarantined", got.State)
-	}
-	db := s.DB()
-	var status string
-	if err := db.QueryRowContext(ctx, `SELECT status FROM effect_permits WHERE grab_id=?`, g.ID).Scan(&status); err != nil {
-		t.Fatalf("permit lookup: %v", err)
-	}
-	if status != "settled" {
-		t.Fatalf("permit status = %q, want settled", status)
-	}
-}
 
-func TestMarkFailedValidationSettlesPermit(t *testing.T) {
-	ctx := context.Background()
-	s, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	svc := New(s, nil)
-	g, err := svc.AllocateEffect(ctx, "pdf.example.org", "Paper", 6, "pdf_grab:pdf.example.org", time.Now().Add(time.Hour), nil)
-	if err != nil {
-		t.Fatalf("AllocateEffect: %v", err)
-	}
-	if err := svc.MarkFailedValidation(ctx, g.ID, "not a PDF"); err != nil {
-		t.Fatalf("MarkFailedValidation: %v", err)
-	}
-	got, err := svc.Get(ctx, g.ID)
-	if err != nil || got == nil || got.State != StateFailedValidation {
-		t.Fatalf("grab after failed validation: %+v err=%v", got, err)
-	}
-	var status string
-	if err := s.DB().QueryRowContext(ctx, `SELECT status FROM effect_permits WHERE grab_id=?`, g.ID).Scan(&status); err != nil {
-		t.Fatal(err)
-	}
-	if status != "settled" {
-		t.Fatalf("permit status = %q, want settled", status)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, err := store.Open(ctx, storetest.DataDir(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			svc := New(s, nil)
+			g, err := svc.AllocateEffect(ctx, "pdf.example.org", "Paper", tt.holderGeneration, "pdf_grab:pdf.example.org", time.Now().Add(time.Hour), nil)
+			if err != nil {
+				t.Fatalf("AllocateEffect: %v", err)
+			}
+			for _, step := range tt.transitions {
+				if err := step.run(ctx, svc, g.ID); err != nil {
+					t.Fatalf("%s: %v", step.name, err)
+				}
+			}
+			got, err := svc.Get(ctx, g.ID)
+			if err != nil || got == nil {
+				t.Fatalf("Get after terminal transition: grab=%+v err=%v", got, err)
+			}
+			if got.State != tt.wantState {
+				t.Fatalf("state = %q, want %q", got.State, tt.wantState)
+			}
+			var status string
+			if err := s.DB().QueryRowContext(ctx, `SELECT status FROM effect_permits WHERE grab_id=?`, g.ID).Scan(&status); err != nil {
+				t.Fatalf("permit lookup: %v", err)
+			}
+			if status != "settled" {
+				t.Fatalf("permit status = %q, want settled", status)
+			}
+		})
 	}
 }
 
@@ -310,34 +351,6 @@ func TestMarkQuarantinedLegacyNoPermit(t *testing.T) {
 	got, _ := svc.Get(ctx, g.ID)
 	if got.State != StateQuarantined {
 		t.Fatalf("state = %q, want quarantined", got.State)
-	}
-}
-
-func TestMarkAbandonedSettlesPermit(t *testing.T) {
-	ctx := context.Background()
-	s, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	svc := New(s, nil)
-	g, err := svc.AllocateEffect(ctx, "pdf.example.org", "Paper", 7, "pdf_grab:pdf.example.org", time.Now().Add(time.Hour), nil)
-	if err != nil {
-		t.Fatalf("AllocateEffect: %v", err)
-	}
-	if err := svc.MarkAbandoned(ctx, g.ID, "interrupted"); err != nil {
-		t.Fatalf("MarkAbandoned: %v", err)
-	}
-	got, _ := svc.Get(ctx, g.ID)
-	if got.State != StateAbandoned {
-		t.Fatalf("state = %q, want abandoned", got.State)
-	}
-	var status string
-	if err := s.DB().QueryRowContext(ctx, `SELECT status FROM effect_permits WHERE grab_id=?`, g.ID).Scan(&status); err != nil {
-		t.Fatalf("permit lookup: %v", err)
-	}
-	if status != "settled" {
-		t.Fatalf("permit status = %q, want settled", status)
 	}
 }
 

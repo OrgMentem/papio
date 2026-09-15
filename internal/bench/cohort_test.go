@@ -64,38 +64,40 @@ func TestDecodeCohortRejectsEmptyID(t *testing.T) {
 	}
 }
 
-func TestDecodeCohortRejectsNoWorks(t *testing.T) {
-	doc := `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": []}`
-	if _, err := DecodeCohort(strings.NewReader(doc)); err == nil {
-		t.Fatal("DecodeCohort with zero works succeeded, want an error")
-	}
-}
-
-func TestDecodeCohortRejectsDuplicateKeys(t *testing.T) {
-	doc := `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": [
+func TestDecodeCohortRejections(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  string
+	}{
+		{
+			name: "no works",
+			doc:  `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": []}`,
+		},
+		{
+			name: "duplicate keys",
+			doc: `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": [
 		{"key": "a", "request": {"doi": "10.1000/a"}, "expected_class": "autonomous_ready"},
 		{"key": "a", "request": {"doi": "10.1000/b"}, "expected_class": "autonomous_ready"}
-	]}`
-	if _, err := DecodeCohort(strings.NewReader(doc)); err == nil {
-		t.Fatal("DecodeCohort with a duplicate work key succeeded, want an error")
-	}
-}
-
-func TestDecodeCohortRejectsRequestWithNoIdentity(t *testing.T) {
-	doc := `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": [
+	]}`,
+		},
+		{
+			name: "request with no identity",
+			doc: `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": [
 		{"key": "a", "request": {}, "expected_class": "autonomous_ready"}
-	]}`
-	if _, err := DecodeCohort(strings.NewReader(doc)); err == nil {
-		t.Fatal("DecodeCohort with an identity-less request succeeded, want an error")
-	}
-}
-
-func TestDecodeCohortRejectsUnknownExpectedClass(t *testing.T) {
-	doc := `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": [
+	]}`,
+		},
+		{
+			name: "unknown expected class",
+			doc: `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": [
 		{"key": "a", "request": {"doi": "10.1000/a"}, "expected_class": "probably_fine"}
-	]}`
-	if _, err := DecodeCohort(strings.NewReader(doc)); err == nil {
-		t.Fatal("DecodeCohort with an unrecognized expected_class succeeded, want an error")
+	]}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeCohort(strings.NewReader(tc.doc)); err == nil {
+				t.Fatalf("DecodeCohort(%s) succeeded, want an error", tc.name)
+			}
+		})
 	}
 }
 

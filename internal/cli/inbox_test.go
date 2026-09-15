@@ -68,6 +68,34 @@ func TestInboxJSONEmitsSnapshotEnvelopeVerbatim(t *testing.T) {
 // text-mode `papio inbox` row, reopening the same escape-injection hole
 // store.StripTerminalControls closes for `papio activity` and
 // `papio watch digest`.
+func assertInboxSanitizedRow(t *testing.T, snapshot triage.Snapshot, wantRow string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "triage.snapshot" {
+			t.Fatalf("method = %q, want triage.snapshot", method)
+		}
+		*result.(*triage.Snapshot) = snapshot
+		return nil
+	})
+	root.SetArgs([]string{"inbox"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("inbox: %v (%s)", err, stderr.String())
+	}
+	got := stdout.String()
+	if got != wantRow {
+		t.Fatalf("stdout = %q, want %q", got, wantRow)
+	}
+	for _, r := range got {
+		if r == '\n' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			t.Errorf("control byte %#U survived in %q", r, got)
+		}
+	}
+}
+
 func TestInboxWatchHitRowStripsTerminalControlBytes(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -99,30 +127,7 @@ func TestInboxWatchHitRowStripsTerminalControlBytes(t *testing.T) {
 					},
 				}},
 			}
-			var stdout, stderr bytes.Buffer
-			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
-				if method != "triage.snapshot" {
-					t.Fatalf("method = %q, want triage.snapshot", method)
-				}
-				*result.(*triage.Snapshot) = snapshot
-				return nil
-			})
-			root.SetArgs([]string{"inbox"})
-			if err := root.Execute(); err != nil {
-				t.Fatalf("inbox: %v (%s)", err, stderr.String())
-			}
-			got := stdout.String()
-			if got != tc.wantRow {
-				t.Fatalf("stdout = %q, want %q", got, tc.wantRow)
-			}
-			for _, r := range got {
-				if r == '\n' || r == '\t' {
-					continue
-				}
-				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-					t.Errorf("control byte %#U survived in %q", r, got)
-				}
-			}
+			assertInboxSanitizedRow(t, snapshot, tc.wantRow)
 		})
 	}
 }
@@ -163,30 +168,7 @@ func TestInboxRetractionRowStripsTerminalControlBytes(t *testing.T) {
 					Retraction: &triage.Retraction{DOI: tc.doi, Nature: "retraction", NoticedAt: now},
 				}},
 			}
-			var stdout, stderr bytes.Buffer
-			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
-				if method != "triage.snapshot" {
-					t.Fatalf("method = %q, want triage.snapshot", method)
-				}
-				*result.(*triage.Snapshot) = snapshot
-				return nil
-			})
-			root.SetArgs([]string{"inbox"})
-			if err := root.Execute(); err != nil {
-				t.Fatalf("inbox: %v (%s)", err, stderr.String())
-			}
-			got := stdout.String()
-			if got != tc.wantRow {
-				t.Fatalf("stdout = %q, want %q", got, tc.wantRow)
-			}
-			for _, r := range got {
-				if r == '\n' || r == '\t' {
-					continue
-				}
-				if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-					t.Errorf("control byte %#U survived in %q", r, got)
-				}
-			}
+			assertInboxSanitizedRow(t, snapshot, tc.wantRow)
 		})
 	}
 }
