@@ -1531,12 +1531,23 @@ func setAuthenticationEntryLeaseOwnerBindingTx(ctx context.Context, q dbtx, auth
 		holderGeneration < 0 || strings.TrimSpace(bindingID) == "" || tabID < 0 {
 		return nil, errors.New("authentication entry lease owner binding requires exact fence")
 	}
+	// The deadline is part of the fence. AuthenticationEntryBindDeadline
+	// bounds how long a reservation may wait for its bind, and the bridge
+	// reads the lease, reserves it and binds in three separate calls
+	// (institutionalBind, internal/browser/bridge.go), so the deadline can
+	// pass in between. GetAuthenticationEntryLease expires a stale
+	// reservation lazily, but BindMaterializationWithLeaseOwner does not run
+	// that read, so without lease_until here a late bind records a surface
+	// against a reservation the deadline already rejected. The sibling
+	// materialization UPDATE in BindMaterializationWithLeaseOwner carries the
+	// same predicate.
 	return q.ExecContext(ctx, `
 		UPDATE authentication_entry_leases
 		   SET owner_binding_id=?, owner_tab_hint=?, updated_at=?
 		 WHERE authentication_claim_id=? AND owner_id=? AND browser_holder_generation=?
-		   AND state IN ('reserved','human')`,
-		bindingID, tabID, store.Now(), authenticationClaimID, ownerID, holderGeneration)
+		   AND state IN ('reserved','human')
+		   AND (lease_until IS NULL OR lease_until > ?)`,
+		bindingID, tabID, store.Now(), authenticationClaimID, ownerID, holderGeneration, store.Now())
 }
 
 // ClearAuthenticationEntryLeaseOwnerBinding clears owner_binding_id/

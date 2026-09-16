@@ -404,14 +404,25 @@ func TestAuthenticationEntryLeaseExpiryRefusedWhileEffectPermitHeld(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	past := time.Now().UTC().Add(-time.Minute)
+	// Reserve live, bind, and only then let the lease lapse. That is the
+	// production order, and it is the only order that can produce this state:
+	// a bind now carries the reservation's deadline in its fence, so binding
+	// to an already-expired reservation is refused rather than recorded. The
+	// scenario §4.5 pins is unchanged - a lease that expires while its
+	// surface still holds an unresolved effect.
 	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
 		AuthenticationClaimID: "claim-permit-hold", LeaseID: "lease-permit-hold", OwnerID: jobID,
-		BrowserHolderGeneration: 9, LeaseUntil: past,
+		BrowserHolderGeneration: 9, LeaseUntil: time.Now().UTC().Add(time.Minute),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx, "claim-permit-hold", jobID, 9, claim.BindingID, 1); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().UTC().Add(-time.Minute)
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET lease_until=? WHERE authentication_claim_id=?`,
+		past.Format(time.RFC3339Nano), "claim-permit-hold"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := js.S.DB().ExecContext(ctx, `
@@ -684,5 +695,140 @@ func TestReconcileMaterializationClaimsReleasesTheEntryItOccupied(t *testing.T) 
 	})
 	if err != nil || next.OwnerID != "job-after" {
 		t.Fatalf("reserve after release = %+v, %v", next, err)
+	}
+}
+
+// ClaimMaterialization retires an expired claim inline, on the request path,
+// before reconciliation ever sees it - and once it does, the claim is
+// 'abandoned', so ReconcileMaterializationClaims will never select it again.
+// The inline path therefore owns the same cleanup, but it only consumed the
+// close authorization and left the institution slot bound to a dead surface.
+// Every sibling paper at that library then read a sign-in already in progress
+// until the stranded-bound grace sweep ran.
+//
+// The sibling above proves the reconcile path releases. This proves the
+// inline path does, which is the one an operator actually hits first.
+func TestClaimMaterializationReleasesTheEntryAnExpiredClaimOccupied(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "inline-expiry-release")
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 6, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-inline-expiry", LeaseID: "lease-inline", OwnerID: jobID,
+		BrowserHolderGeneration: 6, LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+		"claim-inline-expiry", jobID, 6, claim.BindingID, 1); err != nil {
+		t.Fatal(err)
+	}
+	// Human-paced with no deadline: the live shape, and the one nothing else
+	// expires on its own.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET state='human', human_owner_id=?, lease_until=NULL
+		  WHERE authentication_claim_id='claim-inline-expiry'`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	// Age the claim past its lease with no reconciler involved, so the next
+	// claim request is the only thing that can retire it.
+	lapsed := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET lease_until=? WHERE id=?`, lapsed, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 6, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("re-claim after inline expiry: %v", err)
+	}
+
+	retired, err := js.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired.Phase != "abandoned" {
+		t.Fatalf("expired claim phase = %q, want abandoned - the rest of this test assumes it was retired inline", retired.Phase)
+	}
+	freed, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-inline-expiry")
+	if err != nil || !ok {
+		t.Fatalf("entry after inline expiry = %+v ok=%v err=%v", freed, ok, err)
+	}
+	if freed.State == AuthenticationEntryLeaseHuman {
+		t.Fatal("an inline-retired claim left its institution held by a paper with no surface - every sibling at this library now reads a sign-in in progress")
+	}
+	if freed.OwnerBindingID == claim.BindingID {
+		t.Fatalf("entry still names the dead binding %q", freed.OwnerBindingID)
+	}
+}
+
+// BindMaterializationWithLeaseOwner fences the materialization claim on its
+// own lease_until but used to fence the authentication entry on identity and
+// state alone. AuthenticationEntryBindDeadline bounds how long a reservation
+// may wait for its bind, and the bridge reads, reserves and binds in three
+// separate calls, so the deadline can pass in between. Lazy expiry lives in
+// GetAuthenticationEntryLease, which this path never calls - so a late bind
+// recorded a live surface against a reservation the deadline had already
+// rejected, and the slot was occupied by a tab no sweep had authorised.
+//
+// The materialization claim here stays live on purpose: it is the ONLY thing
+// left that can refuse the bind, so a passing test proves the authentication
+// predicate and not the sibling one.
+func TestBindWithLeaseOwnerRefusesAnAuthenticationLeasePastItsDeadline(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, candidateID := seedJobAndCandidate(t, js, "auth-bind-deadline")
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: 6, JobAttemptRevision: 1,
+		InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "claim-auth-bind-deadline", LeaseID: "lease-auth-bind-deadline",
+		OwnerID: jobID, BrowserHolderGeneration: 6, LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The reservation's deadline passes with no sweep and no lazy-expiry read:
+	// state stays 'reserved' and every identity fence still matches.
+	lapsed := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE authentication_entry_leases SET lease_until=? WHERE authentication_claim_id=?`,
+		lapsed, "claim-auth-bind-deadline"); err != nil {
+		t.Fatal(err)
+	}
+
+	err = js.BindMaterializationWithLeaseOwner(ctx, claim.ID, claim.BindingID, 6, 1, 42,
+		"claim-auth-bind-deadline", jobID)
+	if !errors.Is(err, ErrMaterializationStale) {
+		t.Fatalf("bind against a lapsed authentication reservation = %v, want ErrMaterializationStale", err)
+	}
+	lease, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-auth-bind-deadline")
+	if err != nil || !ok {
+		t.Fatalf("entry after the refused bind = %+v ok=%v err=%v", lease, ok, err)
+	}
+	if lease.OwnerBindingID != "" {
+		t.Fatalf("a refused bind still recorded owner binding %q on an expired reservation", lease.OwnerBindingID)
+	}
+	// The whole bind rolls back, not just the side channel.
+	bound, err := js.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.Phase == "bound" {
+		t.Fatal("the materialization bound while its authentication fence was refused - a bound scaffold no lease names as owned")
 	}
 }

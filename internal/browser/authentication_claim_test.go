@@ -1982,3 +1982,81 @@ func TestOpenAccessBindDoesNotArbitrateTheInstitution(t *testing.T) {
 			lease.OwnerID, ownerJob)
 	}
 }
+
+// A candidate whose action needs no authentication still spends a transport
+// slot: it is admitted, and the automatic frame loop turns every admission
+// into an institutional_candidate_offer on the same poll response. The
+// unauthenticated branch used to skip the budget check that the reserving
+// branch honours, so `limit` was advisory for exactly the candidates that
+// reach the wire fastest - limit 0 admitted the whole scheduled page.
+//
+// TestSlotArbitrationRunsWithNoOfferBudget covers the same gate for
+// RequiresAuth candidates and passed throughout, which is why this shipped.
+func TestAutomaticAdmissionCapsUnauthenticatedCandidates(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "noauth-cap-shared")
+
+	type entry struct {
+		jobID       string
+		candidateID string
+	}
+	entries := []entry{}
+	for _, name := range []string{"noauth-cap-a", "noauth-cap-b"} {
+		jobID := parkInstitutional(t, jobs, name, handoffWork(), "")
+		entries = append(entries, entry{
+			jobID:       jobID,
+			candidateID: explicitMaterializationCandidate(t, jobs, jobID, "domain-"+name),
+		})
+	}
+	settleInstitutionProfiles(t, b, jobs)
+
+	scheduled := []job.BrowserCandidateDescriptor{}
+	handoff := map[string]job.HumanAction{}
+	for _, e := range entries {
+		candidate, err := jobs.GetBrowserCandidate(ctx, e.candidateID)
+		if err != nil || candidate == nil {
+			t.Fatalf("candidate %s: %+v err=%v", e.candidateID, candidate, err)
+		}
+		scheduled = append(scheduled, job.BrowserCandidateDescriptor{
+			CandidateID: candidate.ID, JobID: candidate.JobID,
+			JobAttemptRevision:         candidate.JobAttemptRevision,
+			InstitutionProfileID:       candidate.InstitutionProfileID,
+			InstitutionProfileRevision: candidate.InstitutionProfileRevision,
+			RouteRevision:              candidate.RouteRevision,
+			SafetyDomainID:             candidate.SafetyDomainID,
+			Status:                     candidate.Status,
+		})
+		handoff[e.jobID] = job.HumanAction{
+			JobID: e.jobID, Kind: "openurl_handoff", Status: "open", RequiresAuth: false,
+		}
+	}
+
+	admit := func(limit int) map[string]bool {
+		t.Helper()
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		// Isolate the budget gate from the focus and live-legacy-offer skips,
+		// exactly as the RequiresAuth sibling test does.
+		for _, e := range entries {
+			delete(b.focusPending, e.jobID)
+			delete(b.offered, e.jobID)
+		}
+		admitted, _ := b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, limit)
+		return admitted
+	}
+
+	if admitted := admit(0); len(admitted) != 0 {
+		t.Fatalf("a spent offer budget admitted %d unauthenticated candidates (%v), want 0 - limit is the transport budget, not a hint",
+			len(admitted), admitted)
+	}
+	if admitted := admit(1); len(admitted) != 1 {
+		t.Fatalf("limit 1 admitted %d unauthenticated candidates (%v), want exactly 1",
+			len(admitted), admitted)
+	}
+	if admitted := admit(len(scheduled)); len(admitted) != len(scheduled) {
+		t.Fatalf("a full budget admitted %d of %d - the cap must not starve an admissible candidate",
+			len(admitted), len(scheduled))
+	}
+}

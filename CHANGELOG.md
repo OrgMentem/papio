@@ -285,6 +285,29 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A library sign-in is no longer held by a paper whose tab is already
+  gone.** When a materialization claim expired, the *next* claim request
+  retired it on the spot — but only released the close authorization, not the
+  institution slot the dead surface still occupied. Because the retired claim
+  was now `abandoned`, the reconciliation sweep that does release the slot
+  never looked at it again, so every sibling paper at that library read a
+  sign-in as already in progress until the stranded-bound grace sweep ran. The
+  request path now performs the same release the sweep does.
+- **A sign-in reservation that ran out of time can no longer have a tab bound
+  to it.** The bind fenced the authentication entry on claim, owner, holder
+  generation and state, but not on the reservation's own deadline, and this
+  path never takes the lazy-expiry read that would have caught it. A bind
+  arriving after the deadline recorded a live surface against a reservation
+  the deadline had already rejected. The deadline is now part of the fence,
+  and a late bind is refused whole rather than leaving a bound scaffold no
+  lease names as owned.
+- **Automatic institutional offers now respect the transport budget.** A
+  candidate whose action needs no sign-in was admitted without checking the
+  remaining offer budget, so a poll with nothing left to spend still admitted
+  the whole scheduled page and put more browser work in flight than the bridge
+  guarantees. Admitting spends a slot exactly like reserving one does, and now
+  obeys the same cap; retiring a dead institution slot stays deliberately
+  uncapped.
 - **A download you started while no browser held the bridge can no longer be
   mistaken for the next holder's work.** Releasing the bridge advanced the
   in-memory generation to exactly the value the next holder would be issued, so

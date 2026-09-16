@@ -886,6 +886,16 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 		if err := consumeCloseAuthorizationsTx(ctx, tx, []string{expiringBindingID.String}, now); err != nil {
 			return nil, err
 		}
+		// Release the institution slot the retired claim still occupies.
+		// ReconcileMaterializationClaims does this for every binding it
+		// retires; this inline path must too, because the claim is now
+		// 'abandoned' and reconciliation will never select it again. Without
+		// the release the authentication lease stays bound to a dead surface
+		// and every sibling job at that institution reads a sign-in already
+		// in progress until the stranded-bound grace sweep runs.
+		if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, []string{expiringBindingID.String}, now); err != nil {
+			return nil, err
+		}
 	}
 	// The same artifact_winners anti-join the two sweeps carry. Without it a
 	// winner-bearing candidate that reconciliation deliberately left parked in

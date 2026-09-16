@@ -11213,6 +11213,12 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			continue
 		}
 		if !action.RequiresAuth {
+			// Admission spends a transport slot exactly like the reserving
+			// branch below, so it obeys the same budget. Only the lease
+			// maintenance above is deliberately uncapped.
+			if !canAdmit {
+				continue
+			}
 			admitted[descriptor.JobID] = true
 			continue
 		}
