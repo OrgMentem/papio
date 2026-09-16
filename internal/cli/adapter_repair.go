@@ -376,6 +376,9 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	if err := os.WriteFile(fixturePath, raw, 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write fixture: %w", err)
 	}
+	// #nosec G703 -- same provenance as the write above: finalFixturePath is
+	// built from the repo scratch root and segments that passed
+	// adapterRepairSegmentRE.
 	if err := os.WriteFile(finalFixturePath, raw, 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write final fixture path: %w", err)
 	}
@@ -502,6 +505,8 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		if patchErr != nil {
 			return adapterRepairResult{}, fmt.Errorf("generate types patch: %w", patchErr)
 		}
+		// #nosec G703 -- workspace is the repo scratch root and its variable
+		// segments passed adapterRepairSegmentRE; the filename is a literal.
 		if err := os.WriteFile(filepath.Join(workspace, "types.ts.patch"), []byte(typesPatch), 0o600); err != nil {
 			return adapterRepairResult{}, fmt.Errorf("write types patch: %w", err)
 		}

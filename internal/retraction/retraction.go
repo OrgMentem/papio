@@ -578,7 +578,7 @@ func (s *Sentinel) lookup(ctx context.Context, corpus map[string]readyWork) (map
 		updates, rowCount, cacheErr = parseDatasetFile(s.datasetPath(), corpus)
 	}
 	if cacheErr != nil || rowCount == 0 {
-		return nil, sourceErr, fmt.Errorf("%w; cached Retraction Watch dataset is invalid: %v", sourceErr, datasetValidationError(cacheErr, rowCount))
+		return nil, sourceErr, fmt.Errorf("%w; cached Retraction Watch dataset is invalid: %w", sourceErr, datasetValidationError(cacheErr, rowCount))
 	}
 	log.Printf("papio: Retraction Watch fetch failed; using last known-good dataset: %v", sourceErr)
 	return updates, sourceErr, nil
@@ -704,7 +704,7 @@ func parseDatasetFile(path string, corpus map[string]readyWork) (map[string][]up
 	rowCount := 0
 	for {
 		row, err := reader.Read()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
