@@ -42,6 +42,9 @@ type statusJob struct {
 	Category     string `json:"category,omitempty"`
 	Guidance     string `json:"guidance,omitempty"`
 	ImportStatus string `json:"import_status,omitempty"`
+	Institution  string `json:"institution,omitempty"`
+	Command      string `json:"command,omitempty"`
+	QuietReason  string `json:"quiet_reason,omitempty"`
 }
 
 func newStatusCommand(opt *options) *cobra.Command {
@@ -134,6 +137,10 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		"failed_unavailable": nil,
 	}
 	for _, row := range rows {
+		detail := details[row.ID]
+		if detail.Job != nil {
+			row = *detail.Job
+		}
 		if !showStatusRow(row, now) {
 			continue
 		}
@@ -141,10 +148,13 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		if group == "" {
 			continue
 		}
-		detail := details[row.ID]
+		title := row.Work.Title
+		if strings.TrimSpace(title) == "" {
+			title = row.Work.Describe()
+		}
 		item := statusJob{
 			ID:       row.ID,
-			Title:    shortTitle(row.Work.Describe()),
+			Title:    shortTitle(title),
 			Provider: eventProvider(detail.Events),
 			State:    row.State,
 			Age:      formatStatusAge(row.UpdatedAt, now),
@@ -154,9 +164,38 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		}
 		if group == "awaiting_human" || group == "needs_review" || group == "failed_unavailable" {
 			item.Reason = transitionReason(detail.Events, row.State)
+			if row.TerminalReason != "" {
+				item.Reason = row.TerminalReason
+			}
 			exp := errcat.ExplainWithOpenAction(row.State, item.Reason, row.Policy.Resolver, row.Policy.AccessMode, detail.Actions, cfg)
 			item.Category = exp.Category
 			item.Guidance = exp.Guidance
+			item.Command = exp.Command
+			var current *job.HumanAction
+			for i := range detail.Actions {
+				action := &detail.Actions[i]
+				if action.Status == "open" && (current == nil || action.ID > current.ID) {
+					current = action
+				}
+			}
+			if current != nil {
+				if current.RequiresAuth || current.Kind == job.ActionKindDocumentDelivery {
+					item.Institution = row.Policy.Resolver
+					if item.Institution == "" {
+						item.Institution = "default"
+					}
+				}
+				if current.Quiesced(now) {
+					item.QuietReason = "Reminders stopped after 7 days. The action remains open."
+				}
+				if current.Kind == "openurl_handoff" || current.Kind == "manual_download" {
+					if current.Quiesced(now) {
+						item.QuietReason = "Automatic browser offers and reminders stopped after 7 days. You can still open this paper."
+					} else if job.ProjectHandoffOfferState(detail.Events, current.CreatedAt, now).Quiesced {
+						item.QuietReason = "Automatic browser offers stopped after repeated attempts without progress. You can still open this paper."
+					}
+				}
+			}
 		}
 		if group == "ready" {
 			item.ImportStatus = autoImportStatus(detail.Events)
@@ -214,6 +253,14 @@ func statusPhase(state string) string {
 
 func eventProvider(events []map[string]any) string {
 	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] == "browser.provider_outcome" {
+			if host := eventDetailString(events[i], "host"); host != "" {
+				return host
+			}
+			if adapter := eventDetailString(events[i], "adapter_id"); adapter != "" {
+				return adapter
+			}
+		}
 		if value := eventDetailString(events[i], "source"); value != "" {
 			return value
 		}
@@ -309,37 +356,72 @@ func renderStatusRefresh(out io.Writer, snapshot statusSnapshot, terminal bool) 
 		return err
 	}
 	for _, group := range snapshot.Groups {
-		if _, err := fmt.Fprintf(out, "\n%s\n", strings.ToUpper(group.Phase)); err != nil {
+		if _, err := fmt.Fprintf(out, "\n%s (%d)\n", strings.ToUpper(group.Phase), len(group.Jobs)); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintln(out, "TITLE                                               PROVIDER            STATE             AGE     DETAIL"); err != nil {
-			return err
-		}
-		for _, item := range group.Jobs {
-			detail := item.Category
-			if detail == "" {
-				detail = item.Reason
+		for _, items := range groupStatusJobs(group.Jobs) {
+			first := items[0]
+			heading := first.Category
+			if heading == "" {
+				heading = first.State
 			}
-			if item.ImportStatus != "" {
-				detail = "import=" + item.ImportStatus
+			if first.Institution != "" {
+				heading += " / institution: " + first.Institution
 			}
-			// item.Title is shortTitle(row.Work.Describe()): third-party
-			// bibliographic metadata (a discovery-registered title or DOI),
-			// truncated by shortText but never stripped of control bytes.
-			// statusJob.Title also backs `papio status --json`, which must keep
-			// exact bytes, so the strip happens here at the text-only render
-			// site rather than inside shortTitle/shortText.
-			if _, err := fmt.Fprintf(out, "%-50s  %-18s  %-16s  %-6s  %s\n", store.StripTerminalControls(item.Title), item.Provider, item.State, item.Age, detail); err != nil {
+			heading += " / provider: " + first.Provider
+			if _, err := fmt.Fprintf(out, "\n%s (%d)\n", store.StripTerminalControls(heading), len(items)); err != nil {
 				return err
 			}
-			if item.Guidance != "" {
-				if _, err := fmt.Fprintf(out, "    → %s\n", item.Guidance); err != nil {
+			for _, guidance := range []string{first.Guidance, first.QuietReason} {
+				if guidance != "" {
+					if _, err := fmt.Fprintf(out, "    → %s\n", store.StripTerminalControls(guidance)); err != nil {
+						return err
+					}
+				}
+			}
+			for _, item := range items {
+				detail := item.State + "; " + item.Age
+				if item.ImportStatus != "" && item.ImportStatus != "—" {
+					detail += "; import=" + item.ImportStatus
+				}
+				// Keep raw metadata in JSON; strip controls only at the text sink.
+				if _, err := fmt.Fprintf(out, "  %s  [%s]\n    %s\n",
+					store.StripTerminalControls(item.Title),
+					store.StripTerminalControls(detail),
+					store.StripTerminalControls(item.ID)); err != nil {
 					return err
+				}
+				if item.Command != "" {
+					if _, err := fmt.Fprintf(out, "    → %s\n", store.StripTerminalControls(item.Command)); err != nil {
+						return err
+					}
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// Group only identical explanations. Different institutions, provider hosts,
+// access requirements, and quiet reasons must never borrow each other's advice.
+// Keep first-seen order, including within each group, across refreshes.
+func groupStatusJobs(items []statusJob) [][]statusJob {
+	type key struct {
+		institution, provider, category, guidance, quiet string
+	}
+	indices := make(map[key]int)
+	var groups [][]statusJob
+	for _, item := range items {
+		k := key{item.Institution, item.Provider, item.Category, item.Guidance, item.QuietReason}
+		index, ok := indices[k]
+		if !ok {
+			index = len(groups)
+			indices[k] = index
+			groups = append(groups, nil)
+		}
+		groups[index] = append(groups[index], item)
+	}
+	return groups
 }
 
 func statusTTY(out io.Writer) bool {

@@ -8,6 +8,8 @@
 package errcat
 
 import (
+	"fmt"
+
 	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/job"
@@ -19,6 +21,9 @@ import (
 type Explanation struct {
 	Category string
 	Guidance string
+	// Command is separate from shared guidance so a queue can group the prose
+	// while retaining the exact action each paper can run.
+	Command string
 }
 
 // Explain maps a job's state and latest transition reason — and, for the
@@ -31,62 +36,50 @@ type Explanation struct {
 func Explain(state, reason, resolver, accessMode string, cfg config.Config) Explanation {
 	switch reason {
 	case "institutional_handoff":
-		return Explanation{"login_required",
-			"Sign in at your institution in the browser, then run `papio actions open` to launch the handoff tab. If the sign-in page reports a stale or expired request, run it again — every open mints a fresh link."}
+		return Explanation{Category: "login_required", Guidance: "An institutional handoff needs attention. Inspect its current action before opening the paper.", Command: "papio actions list"}
 	case "open_access_browser_handoff":
-		return Explanation{"browser_fetch_pending",
-			"An open-access copy needs a browser fetch; run `papio actions open` to complete it. No login is required."}
+		return Explanation{Category: "browser_fetch_pending", Guidance: "An open-access copy needs a browser fetch. No login is required.", Command: "papio actions list"}
 	case "landing_page_only":
-		return Explanation{"manual_download",
-			"The link resolved to a landing page, not a PDF; open the handoff and download the PDF manually."}
+		return Explanation{Category: "manual_download", Guidance: "The link resolved to a landing page, not a PDF; open the handoff and download the PDF manually."}
 	case "validation_error":
-		return Explanation{"validation_incomplete",
-			"PDF validation could not finish within its bounds; inspect the quarantined file, then re-run or override."}
+		return Explanation{Category: "validation_incomplete", Guidance: "PDF validation could not finish within its bounds; inspect the quarantined file, then re-run or override."}
 	case "encrypted_or_active_content":
-		return Explanation{"unsafe_pdf",
-			"The PDF is encrypted or carries active content papio could not strip; accept the review to re-check the same file, or reject it to try another source."}
+		return Explanation{Category: "unsafe_pdf", Guidance: "The PDF is encrypted or carries active content papio could not strip; accept the review to re-check the same file, or reject it to try another source."}
 	case "semantic_or_identity_review":
-		return Explanation{"identity_review",
-			"Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}
+		return Explanation{Category: "identity_review", Guidance: "Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}
 	case "resolver_temporarily_unavailable", "candidate_temporarily_unavailable", "acquisition_inputs_temporarily_unavailable":
-		return Explanation{"retrying",
-			"A source was temporarily unavailable; papio will retry automatically. No action needed."}
+		return Explanation{Category: "retrying", Guidance: "A source was temporarily unavailable; papio will retry automatically. No action needed."}
 	case "document_delivery_pending":
-		return Explanation{"document_delivery_pending",
-			"A document-delivery request is lodged; papio is polling the provider. No action needed."}
+		return Explanation{Category: "document_delivery_pending", Guidance: "A document-delivery request is lodged; papio is polling the provider. No action needed."}
+	case string(job.TerminalReasonBrowserRejected):
+		return Explanation{Category: "browser_rejected", Guidance: "You rejected this browser acquisition. Papio will not try it again automatically."}
 	case "no_identifier":
 		// The single most expensive wrong answer papio can give is "sign in" for
 		// a work no login can deliver. Name what is missing and the one remedy
 		// that closes the loop, and say plainly that authenticating will not help.
-		return Explanation{"no_identifier",
-			"No DOI, PMID, or arXiv id could be confirmed for this title — books, chapters, reports, and theses usually have none. An institutional sign-in cannot make an identifier-less request fetchable. Find a DOI and re-submit with `papio acquire --doi <doi>`; for a Zotero item, apply `zotio --yes items enrich --missing-doi` then re-run `papio acquire --from-zotio`."}
+		return Explanation{Category: "no_identifier", Guidance: "No DOI, PMID, or arXiv id could be confirmed for this title — books, chapters, reports, and theses usually have none. An institutional sign-in cannot make an identifier-less request fetchable. Find a DOI and re-submit with `papio acquire --doi <doi>`; for a Zotero item, apply `zotio --yes items enrich --missing-doi` then re-run `papio acquire --from-zotio`."}
 	case "doi_not_registered":
 		// Same principle as no_identifier, one step further in: the identifier
 		// is present and well-formed but names nothing. Say so plainly, because
 		// the user's instinct on a paywall message is to go sign in again.
-		return Explanation{"doi_not_registered",
-			"This DOI is not registered with the DOI system, so it resolves to a \"DOI NOT FOUND\" page and no link resolver can match it — almost always a typo or a mangled copy-paste. Signing in will not help. Check the DOI against the article's own page and re-submit with `papio acquire --doi <doi>`."}
+		return Explanation{Category: "doi_not_registered", Guidance: "This DOI is not registered with the DOI system, so it resolves to a \"DOI NOT FOUND\" page and no link resolver can match it — almost always a typo or a mangled copy-paste. Signing in will not help. Check the DOI against the article's own page and re-submit with `papio acquire --doi <doi>`."}
 	case "insufficient_identity_evidence":
-		return Explanation{"insufficient_identity_evidence",
-			"The request only supplied a title (or otherwise too little to verify identity), and no resolver echoed a submitted identifier. Papio will not file a PDF on search evidence alone. Re-submit with a DOI, PMID, or arXiv id, or confirm the match after a human review."}
+		return Explanation{Category: "insufficient_identity_evidence", Guidance: "The request only supplied a title (or otherwise too little to verify identity), and no resolver echoed a submitted identifier. Papio will not file a PDF on search evidence alone. Re-submit with a DOI, PMID, or arXiv id, or confirm the match after a human review."}
 	}
 
 	// Fall back per state so nothing renders blank when the daemon emits a
 	// reason this catalog does not yet name.
 	switch state {
 	case "awaiting_human":
-		return Explanation{"action_required",
-			"This job is waiting on a browser action; run `papio actions open`."}
+		return Explanation{Category: "action_required", Guidance: "This job needs a human action. Inspect its current actions before opening a browser tab.", Command: "papio actions list"}
 	case "needs_review":
-		return Explanation{"review_required",
-			"This job needs human review; see `papio actions` and approve or reject it."}
+		return Explanation{Category: "review_required", Guidance: "This job needs human review; see `papio actions` and approve or reject it."}
 	case "unavailable":
 		return explainNoAccess(resolver, accessMode, cfg)
 	case "failed":
-		return Explanation{"failed",
-			"This job hit an unexpected error; check its recent events with `papio jobs` and re-submit if needed."}
+		return Explanation{Category: "failed", Guidance: "This job hit an unexpected error; check its recent events with `papio jobs` and re-submit if needed."}
 	case "cancelled":
-		return Explanation{"cancelled", "This job was cancelled."}
+		return Explanation{Category: "cancelled", Guidance: "This job was cancelled."}
 	}
 	return Explanation{}
 }
@@ -117,66 +110,64 @@ func latestOpenAction(actions []job.HumanAction) (job.HumanAction, bool) {
 
 func explainOpenAction(action job.HumanAction) Explanation {
 	next := app.HumanActionNextStepFor(action)
+	command := next.Command
+	if command != "" {
+		if action.ID > 0 {
+			command += fmt.Sprintf(" --action %d", action.ID)
+		} else {
+			// Without a durable selector, never recommend opening the whole queue.
+			command = "papio actions list"
+		}
+	}
 	switch action.Kind {
 	case "openurl_handoff":
 		if next.Command == "" {
 			break
 		}
 		if next.RequiresInstitutionalLogin {
-			return Explanation{"login_required",
-				"Sign in at your institution in the browser, then run `" + next.Command + "` to launch the handoff tab. If the sign-in page reports a stale or expired request, run it again — every open mints a fresh link."}
+			return Explanation{Category: "login_required", Guidance: "Open the paper, then sign in at your institution if the page asks. Open it again if the sign-in link expires.", Command: command}
 		}
-		return Explanation{"browser_fetch_pending",
-			"An open-access copy needs a browser fetch; run `" + next.Command + "` to complete it. No login is required."}
+		return Explanation{Category: "browser_fetch_pending", Guidance: "An open-access copy needs a browser fetch. No login is required.", Command: command}
 	case "manual_download":
 		if next.Instruction == "" {
 			break
 		}
+		guidance := "Open the paper, then " + next.Instruction + ". No login is required."
 		if next.RequiresInstitutionalLogin {
-			if next.Command != "" {
-				return Explanation{"manual_download",
-					"Sign in at your institution in the browser, then run `" + next.Command + "` to " + next.Instruction + "."}
-			}
-			return Explanation{"manual_download",
-				"Sign in at your institution in the browser, then " + next.Instruction + "."}
+			guidance = "Open the paper, sign in at your institution if the page asks, then " + next.Instruction + "."
 		}
-		if next.Command != "" {
-			return Explanation{"manual_download",
-				"Run `" + next.Command + "` to " + next.Instruction + ". No login is required."}
-		}
-		return Explanation{"manual_download", "You need to " + next.Instruction + ". No login is required."}
+		return Explanation{Category: "manual_download", Guidance: guidance, Command: command}
 	case "validation_error":
-		return Explanation{"validation_incomplete",
-			"PDF validation could not finish within its bounds; inspect the quarantined file, then re-run or override."}
+		return Explanation{Category: "validation_incomplete", Guidance: "PDF validation could not finish within its bounds; inspect the quarantined file, then re-run or override."}
 	case "unsafe_pdf":
-		return Explanation{"unsafe_pdf",
-			"The PDF is encrypted or carries active content papio could not strip; accept the review to re-check the same file, or reject it to try another source."}
+		return Explanation{Category: "unsafe_pdf", Guidance: "The PDF is encrypted or carries active content papio could not strip; accept the review to re-check the same file, or reject it to try another source."}
 	case "verify_identity":
-		return Explanation{"identity_review",
-			"Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}
+		return Explanation{Category: "identity_review", Guidance: "Confirm the downloaded PDF is the requested paper; approve it to finish, or reject to try another source."}
 	case "terms_acceptance_required":
-		return Explanation{"terms_acceptance_required",
-			"Review and accept the provider's terms in the browser, then retry the acquisition."}
+		return Explanation{Category: "terms_acceptance_required", Guidance: "Review and accept the provider's terms in the browser, then retry the acquisition."}
 	case "openurl_available":
-		return Explanation{"openurl_available",
-			"An institutional OpenURL route is available; set access_mode to \"assisted\" or \"delegated\" and retry the acquisition."}
+		return Explanation{Category: "openurl_available", Guidance: "An institutional OpenURL route is available; set access_mode to \"assisted\" or \"delegated\" and retry the acquisition."}
 	case "downloads_access_required":
 		root := action.Detail
 		if root == "" {
 			root = "the adoption folder"
 		}
-		return Explanation{"downloads_access_required",
-			"papio can't read " + root + " (macOS privacy consent). Grant Files and Folders access in System Settings -> Privacy & Security, then the pending download adopts automatically."}
+		return Explanation{Category: "downloads_access_required", Guidance: "papio can't read " + root + " (macOS privacy consent). Grant Files and Folders access in System Settings -> Privacy & Security, then the pending download adopts automatically."}
 	case job.ActionKindDocumentDelivery:
-		// Reconciliation details are surfaced by the action payload; retain
-		// the generic action-required explanation here.
-		break
+		command := "papio actions list"
+		if action.JobID != "" {
+			command = "papio delivery get " + action.JobID
+		}
+		return Explanation{
+			Category: "document_delivery",
+			Guidance: "Document delivery needs attention. Inspect the request and its blockers before submitting or retrying it.",
+			Command:  command,
+		}
 	}
 	if next.RequiresInstitutionalLogin {
-		return Explanation{"login_required",
-			"Sign in at your institution in the browser, then complete the requested human action."}
+		return Explanation{Category: "login_required", Guidance: "Sign in at your institution in the browser, then complete the requested human action."}
 	}
-	return Explanation{"action_required", "This job is waiting on a human action; see `papio actions list` for details."}
+	return Explanation{Category: "action_required", Guidance: "This job is waiting on a human action; see `papio actions list` for details."}
 }
 
 // explainNoAccess distinguishes the reasons a job found no accessible copy. The
@@ -188,16 +179,13 @@ func explainNoAccess(resolver, accessMode string, cfg config.Config) Explanation
 	switch accessMode {
 	case config.ModeAssisted, config.ModeDelegated:
 		if _, ok := cfg.InstitutionFor(resolver); !ok {
-			return Explanation{"institution_not_configured",
-				"No institution is configured, so institutional access was never attempted. Run `papio init` and set your library's OpenURL resolver base (Institution step)."}
+			return Explanation{Category: "institution_not_configured", Guidance: "No institution is configured, so institutional access was never attempted. Run `papio init` and set your library's OpenURL resolver base (Institution step)."}
 		}
-		return Explanation{"no_access",
-			"No open-access copy exists and your institution's OpenURL resolver returned no entitled full text."}
+		return Explanation{Category: "no_access", Guidance: "No open-access copy exists and your institution's OpenURL resolver returned no entitled full text."}
 	case config.ModeConservative:
-		return Explanation{"no_access_conservative",
-			"Conservative mode only checks open sources. Set access_mode to \"assisted\" or \"delegated\" to route this work through your institution."}
+		return Explanation{Category: "no_access_conservative", Guidance: "Conservative mode only checks open sources. Set access_mode to \"assisted\" or \"delegated\" to route this work through your institution."}
 	}
-	return Explanation{"no_access", "No legally accessible copy was found for this work."}
+	return Explanation{Category: "no_access", Guidance: "No legally accessible copy was found for this work."}
 }
 
 // WaitGuidanceWithOpenAction is the acquire-side form for a job detail, where
@@ -240,5 +228,9 @@ func renderWaitGuidance(state string, exp Explanation) string {
 	if exp.Category == "" {
 		return ""
 	}
-	return "  [" + exp.Category + "]\n    → " + exp.Guidance
+	guidance := "  [" + exp.Category + "]\n    → " + exp.Guidance
+	if exp.Command != "" {
+		guidance += "\n    → Run `" + exp.Command + "`."
+	}
+	return guidance
 }

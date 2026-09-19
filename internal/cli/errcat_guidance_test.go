@@ -215,18 +215,16 @@ func TestCurrentErrcatGuidanceCommandsApplyToActions(t *testing.T) {
 		wantOpen bool
 	}{
 		{
-			name:     "historical institutional handoff",
-			state:    job.StateAwaitingHuman,
-			reason:   "institutional_handoff",
-			action:   job.HumanAction{Kind: "openurl_handoff", RequiresAuth: true},
-			wantOpen: true,
+			name:   "historical institutional handoff",
+			state:  job.StateAwaitingHuman,
+			reason: "institutional_handoff",
+			action: job.HumanAction{Kind: "openurl_handoff", RequiresAuth: true},
 		},
 		{
-			name:     "historical open access handoff",
-			state:    job.StateAwaitingHuman,
-			reason:   "open_access_browser_handoff",
-			action:   job.HumanAction{Kind: "openurl_handoff"},
-			wantOpen: true,
+			name:   "historical open access handoff",
+			state:  job.StateAwaitingHuman,
+			reason: "open_access_browser_handoff",
+			action: job.HumanAction{Kind: "openurl_handoff"},
 		},
 		{
 			name:   "manual replacement of login-required park",
@@ -242,9 +240,14 @@ func TestCurrentErrcatGuidanceCommandsApplyToActions(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			exp := errcat.ExplainWithOpenAction(test.state, test.reason, "", "", test.actions, config.Config{})
-			opens := strings.Contains(exp.Guidance, "`papio actions open`")
+			opens := strings.Contains(exp.Guidance, "`papio actions open`") || strings.HasPrefix(exp.Command, "papio actions open --action ")
 			if opens != test.wantOpen {
 				t.Fatalf("guidance names `papio actions open` = %t, want %t: %q", opens, test.wantOpen, exp.Guidance)
+			}
+			if exp.Command != "" {
+				if err := resolveGuidanceCommand(root, exp.Command); err != nil {
+					t.Fatal(err)
+				}
 			}
 			for _, match := range papioCommandInBackticks.FindAllStringSubmatch(exp.Guidance, -1) {
 				snippet := match[1]

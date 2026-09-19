@@ -193,6 +193,24 @@ as actionable:
 papio status --follow
 ```
 
+The text view shows paper titles when metadata supplies them, with identifiers
+as the fallback. Each paper keeps its job ID. Within a phase, papers share
+guidance only when their institution profile, recorded provider, blocker, and
+quiet reason match. Unknown providers remain unknown.
+
+Browser actions include an exact `papio actions open --action <action-id>`
+command. It opens that action, not the whole queue. Add `--dry-run` to inspect
+the route without opening it. A document-delivery action instead points to
+`papio delivery get <job-id>`, which shows the request and its blockers.
+
+Status also names actions whose automatic browser offers or reminders have
+stopped. Seven-day-old actions remain open; repeated drives without progress
+can stop automatic offers sooner. An explicit open still works. This display
+does not reset either limit or change the queue rules.
+
+The JSON view retains its phase groups and includes each paper's `command`,
+`institution`, and `quiet_reason` when available.
+
 `--follow` refreshes the dashboard every two seconds. For a single job, use
 `papio jobs get <job-id> --wait`; `papio jobs list --state <state>` filters the
 job list, and `papio jobs retry <job-id>` explicitly retries a failed,

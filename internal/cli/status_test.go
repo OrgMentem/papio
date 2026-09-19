@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -94,10 +95,8 @@ func TestBuildStatusSnapshotUsesCurrentOpenActionGuidance(t *testing.T) {
 	if item.Category != "manual_download" {
 		t.Fatalf("category = %q, want manual_download", item.Category)
 	}
-	for _, want := range []string{"Sign in at your institution", "`papio actions open`", "download the PDF yourself"} {
-		if !strings.Contains(item.Guidance, want) {
-			t.Fatalf("guidance = %q, want %q", item.Guidance, want)
-		}
+	if item.Command != "papio actions open --action 228" {
+		t.Fatalf("next command = %q; it must select the current action, not the whole queue", item.Command)
 	}
 }
 
@@ -203,11 +202,7 @@ func TestRenderStatusRefreshShowsLibraryCompleteness(t *testing.T) {
 	}
 }
 
-// statusJob.Title (shortTitle(row.Work.Describe())) backs both `papio
-// status`'s text row and `papio status --json`. buildStatusSnapshot must
-// keep the raw bytes intact here for the --json exact-byte contract; only
-// the text-mode renderStatusRefresh strips them (see the comment above that
-// call site in status.go).
+// JSON retains metadata control bytes; only the terminal renderer strips them.
 func TestBuildStatusSnapshotPreservesControlBytesForJSON(t *testing.T) {
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	rows := []job.Row{
@@ -217,7 +212,7 @@ func TestBuildStatusSnapshotPreservesControlBytesForJSON(t *testing.T) {
 	if len(snapshot.Groups) != 1 || len(snapshot.Groups[0].Jobs) != 1 {
 		t.Fatalf("groups = %#v", snapshot.Groups)
 	}
-	want := "title:Evil\x1b[31mTitle"
+	want := "Evil\x1b[31mTitle"
 	if got := snapshot.Groups[0].Jobs[0].Title; got != want {
 		t.Fatalf("statusJob.Title = %q, want raw %q (must survive verbatim for --json)", got, want)
 	}
@@ -271,5 +266,101 @@ func TestRenderStatusRefreshStripsTerminalControlBytes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStatusUsesPaperMetadataAndCurrentProvider(t *testing.T) {
+	now := time.Now()
+	row := job.Row{ID: "job_paper", State: job.StateAwaitingHuman,
+		UpdatedAt: now.Format(time.RFC3339Nano), Work: work.Work{DOI: "10.1000/paper"}}
+	current := row
+	current.Work.Title = "The title learned during acquisition"
+	detail := api.JobDetail{Job: &current, Events: []map[string]any{
+		{"kind": "fetch.completed", "detail": map[string]any{"source": "resolver"}},
+		{"kind": "browser.provider_outcome", "detail": map[string]any{"host": "journals.example.org"}},
+	}}
+	snapshot := buildStatusSnapshot([]job.Row{row}, map[string]api.JobDetail{row.ID: detail}, now, config.Config{})
+	item := snapshot.Groups[0].Jobs[0]
+	if item.Title != current.Work.Title || item.Provider != "journals.example.org" {
+		t.Fatalf("status hides the current paper or provider: %+v", item)
+	}
+	current.Work.Title = ""
+	snapshot = buildStatusSnapshot([]job.Row{row}, map[string]api.JobDetail{row.ID: detail}, now, config.Config{})
+	if got := snapshot.Groups[0].Jobs[0].Title; !strings.Contains(got, row.Work.DOI) {
+		t.Fatalf("missing title loses identifier fallback: %q", got)
+	}
+}
+
+func TestStatusGroupsAdviceButKeepsEachActionAndInstitution(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	rows := []job.Row{}
+	details := map[string]api.JobDetail{}
+	for i, institution := range []string{"campus", "campus", "institute"} {
+		id := fmt.Sprintf("job_%d", i)
+		rows = append(rows, job.Row{ID: id, State: job.StateAwaitingHuman,
+			Policy: job.Policy{Resolver: institution}, Work: work.Work{Title: "Paper " + id}})
+		details[id] = api.JobDetail{Actions: []job.HumanAction{{
+			ID: int64(100 + i), JobID: id, Kind: "openurl_handoff", Status: "open",
+			RequiresAuth: true, CreatedAt: now.Add(-job.QuiesceAfter).Format(time.RFC3339Nano),
+		}}}
+	}
+	snapshot := buildStatusSnapshot(rows, details, now, config.Config{})
+	var out bytes.Buffer
+	if err := renderStatusRefresh(&out, snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	advice := snapshot.Groups[0].Jobs[0].Guidance
+	if strings.Count(got, advice) != 2 {
+		t.Fatalf("advice must appear once per institution, not once per paper: %q", got)
+	}
+	for i, row := range rows {
+		if !strings.Contains(got, row.Work.Title) || !strings.Contains(got, fmt.Sprintf("papio actions open --action %d", 100+i)) {
+			t.Fatalf("paper lost its identity or scoped action: %q", got)
+		}
+	}
+	for _, item := range snapshot.Groups[0].Jobs {
+		if item.QuietReason == "" {
+			t.Fatalf("aged action silently loses automatic offers: %+v", item)
+		}
+	}
+}
+
+func TestStatusQuietAdviceUsesCurrentActionAndDriveEvidence(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	row := job.Row{ID: "job_quiet", State: job.StateAwaitingHuman}
+	old := job.HumanAction{ID: 1, Kind: "openurl_handoff", Status: "resolved", CreatedAt: now.Add(-2 * job.QuiesceAfter).Format(time.RFC3339Nano)}
+	current := job.HumanAction{ID: 2, Kind: "openurl_handoff", Status: "open", CreatedAt: now.Add(-24 * time.Hour).Format(time.RFC3339Nano)}
+	detail := api.JobDetail{Actions: []job.HumanAction{current, old}}
+	readItem := func() statusJob {
+		return buildStatusSnapshot([]job.Row{row}, map[string]api.JobDetail{row.ID: detail}, now, config.Config{}).Groups[0].Jobs[0]
+	}
+	if got := readItem(); got.QuietReason != "" || got.Command != "papio actions open --action 2" {
+		t.Fatalf("resolved action overrides the current action: %+v", got)
+	}
+	for i := range job.MaxAutomaticHandoffEpochs {
+		at := now.Add(-time.Duration(job.MaxAutomaticHandoffEpochs-i) * (job.HandoffAcceptedLease + time.Minute))
+		detail.Events = append(detail.Events, map[string]any{
+			"kind": "browser.job_accept", "at": at.Format(time.RFC3339Nano),
+			"detail": map[string]any{},
+		})
+	}
+	if got := readItem(); got.QuietReason == "" {
+		t.Fatalf("recent action hides its exhausted drive budget: %+v", got)
+	}
+	detail.Actions = []job.HumanAction{{ID: 3, Kind: "openurl_handoff", Status: "open", CreatedAt: now.Format(time.RFC3339Nano)}}
+	if got := readItem(); got.QuietReason != "" {
+		t.Fatalf("new action inherits old drive history: %+v", got)
+	}
+}
+
+func TestStatusPreservesBrowserRejectionReason(t *testing.T) {
+	now := time.Now()
+	row := job.Row{ID: "job_rejected", State: job.StateUnavailable,
+		UpdatedAt: now.Format(time.RFC3339Nano), TerminalReason: string(job.TerminalReasonBrowserRejected),
+		Policy: job.Policy{AccessMode: config.ModeDelegated}}
+	snapshot := buildStatusSnapshot([]job.Row{row}, nil, now, config.Config{})
+	if got := snapshot.Groups[0].Jobs[0]; got.Category != "browser_rejected" {
+		t.Fatalf("operator rejection becomes an access failure: %+v", got)
 	}
 }

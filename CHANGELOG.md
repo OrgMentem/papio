@@ -285,6 +285,14 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Status shows the paper and the next action.** It uses known titles rather
+  than preferring identifiers, groups matching advice by institution profile
+  and recorded provider, and keeps each job ID visible. Browser commands
+  select one action instead of opening the whole queue. Status names actions
+  whose automatic offers or reminders have stopped, without changing either
+  limit. Document-delivery actions point to the request and its blockers;
+  an explicit browser rejection no longer appears as missing institutional
+  access. `acquire --wait` also shows the scoped action command.
 - **A conclusive DOI mismatch no longer stops the candidate queue.** The fetch
   path tries the remaining candidates before asking for identity review. If
   none succeeds, it keeps the first mismatch and binds the review to its

@@ -30,7 +30,7 @@ func TestExplainCategoriesAndGuidance(t *testing.T) {
 		{name: "identity review", state: "needs_review", reason: "semantic_or_identity_review", wantCategory: "identity_review"},
 		{name: "unsafe pdf", state: "needs_review", reason: "encrypted_or_active_content", wantCategory: "unsafe_pdf"},
 		{name: "retrying", state: "retry_wait", reason: "resolver_temporarily_unavailable", wantCategory: "retrying"},
-		{name: "open access browser handoff", state: "awaiting_human", reason: "open_access_browser_handoff", wantCategory: "browser_fetch_pending", wantGuidance: []string{"browser fetch", "`papio actions open`", "No login is required"}},
+		{name: "open access browser handoff", state: "awaiting_human", reason: "open_access_browser_handoff", wantCategory: "browser_fetch_pending"},
 		{name: "validation error", state: "needs_review", reason: "validation_error", wantCategory: "validation_incomplete", wantGuidance: []string{"inspect the quarantined file", "re-run or override"}},
 		{name: "doi not registered", state: "unavailable", reason: "doi_not_registered", wantCategory: "doi_not_registered", wantGuidance: []string{"DOI NOT FOUND", "Signing in will not help", "Check the DOI against the article's own page", "`papio acquire --doi <doi>`"}},
 		{name: "insufficient identity evidence", state: "needs_review", reason: "insufficient_identity_evidence", wantCategory: "insufficient_identity_evidence", wantGuidance: []string{"will not file a PDF on search evidence alone", "Re-submit with a DOI, PMID, or arXiv id", "human review"}},
@@ -118,14 +118,12 @@ func TestExplainWithOpenActionUsesReplacementManualDownload(t *testing.T) {
 	if got.Category != "manual_download" {
 		t.Fatalf("category = %q, want manual_download", got.Category)
 	}
-	for _, want := range []string{"Sign in at your institution", "`papio actions open`", "download the PDF yourself"} {
-		if !strings.Contains(got.Guidance, want) {
-			t.Fatalf("guidance = %q, want %q", got.Guidance, want)
-		}
+	if got.Command != "papio actions open --action 228" {
+		t.Fatalf("current action command = %q", got.Command)
 	}
 
 	wait := WaitGuidanceWithOpenAction("awaiting_human", "login_required", "", config.ModeDelegated, actions, cfg)
-	for _, want := range []string{"[manual_download]", "`papio actions open`", "download the PDF yourself"} {
+	for _, want := range []string{"[manual_download]", "`papio actions open --action 228`"} {
 		if !strings.Contains(wait, want) {
 			t.Fatalf("wait guidance = %q, want %q", wait, want)
 		}
@@ -192,11 +190,6 @@ func TestExplainWithOpenActionGuidance(t *testing.T) {
 			wantCategory: "openurl_available",
 			wantGuidance: []string{`set access_mode to "assisted" or "delegated"`, "retry the acquisition"},
 		},
-		{
-			name: "document delivery", kind: job.ActionKindDocumentDelivery,
-			wantCategory: "action_required",
-			wantGuidance: []string{"waiting on a human action", "`papio actions list`"},
-		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := ExplainWithOpenAction("awaiting_human", "", "", config.ModeDelegated,
@@ -210,6 +203,25 @@ func TestExplainWithOpenActionGuidance(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDeliveryActionPointsAtItsRequestNotTheBrowser(t *testing.T) {
+	action := job.HumanAction{ID: 601, JobID: "job_delivery", Kind: job.ActionKindDocumentDelivery, Status: "open", RequiresAuth: true}
+	got := ExplainWithOpenAction("awaiting_human", "institutional_handoff", "", "", []job.HumanAction{action}, config.Config{})
+	if got.Category != "document_delivery" || got.Command != "papio delivery get job_delivery" {
+		t.Fatalf("delivery action borrows browser guidance: %+v", got)
+	}
+	wait := WaitGuidanceWithOpenAction("awaiting_human", "", "", "", []job.HumanAction{action}, config.Config{})
+	if !strings.Contains(wait, got.Command) || strings.Contains(wait, "papio actions open") {
+		t.Fatalf("delivery wait omits its request or opens unrelated browser work: %q", wait)
+	}
+}
+
+func TestActionWithoutSelectorCannotOpenWholeQueue(t *testing.T) {
+	got := ExplainWithOpenAction("awaiting_human", "", "", "", []job.HumanAction{{Kind: "openurl_handoff", Status: "open"}}, config.Config{})
+	if got.Command != "papio actions list" {
+		t.Fatalf("missing action id must fail safe to inspection: %+v", got)
 	}
 }
 
