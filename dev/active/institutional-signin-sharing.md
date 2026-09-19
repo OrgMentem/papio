@@ -660,3 +660,35 @@ Live confirmation, 2026-08-30: `authentication_entry_leases` holds exactly one
 row, `expired`, last updated 2026-08-28 — two days old, therefore cold and
 admissible. **No lease is blocking anything.** Leave those paragraphs in place
 as history, but do not treat them as the live defect.
+
+## Live sign-in validation, 2026-09-19
+
+One operator sign-in resumed the existing legacy sharing path. The daemon
+re-offered 10 sibling jobs; one reached `ready`. The acquired PDF contained
+the requested paper. This run does not establish a general success rate.
+No new `entitled_landing` observation appeared, so it does not validate the
+claim-based entitlement path.
+
+The original owner's binding entered `abandoned` after a `navigation_error`
+observation, before the operator completed sign-in in that same tab. The
+browser error code was not recorded, so its exact cause remains unknown.
+
+A separate regression reproduced one way this can happen:
+`net::ERR_ABORTED` followed by an authentication page created a false
+navigation-error marker. Chrome uses this code when another navigation
+cancels the first. `extension/src/background.ts` now excludes this code
+before recording the marker. Other errors retain their failure handling.
+Both regression cases fail before the fix and pass afterward: the current
+worker and a worker restart between cancellation and the next page.
+
+Verification: 1,513 extension tests passed, one skipped; type checking and
+both browser builds passed. The live extension reloaded to a new holder
+session. A subsequent institutional handoff emitted `auth_returned` and
+kept its binding in `navigated`, with no `navigation_error` observation for
+that binding. This is a live smoke check, not proof that the original
+unknown error was `net::ERR_ABORTED`.
+
+Provider classification remains a separate problem. The original
+ScienceDirect page showed institutional access but no PDF control, then
+reported `ui_changed`. ProQuest pages also reported `ui_changed`. These
+observations alone do not prove entitlement or justify new selectors.

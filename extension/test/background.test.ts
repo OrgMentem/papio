@@ -5014,6 +5014,47 @@ test("Slice 3: trigger routing — explicit open on a claim owned elsewhere focu
   expect(h2.tabs.updates).toEqual([]);
 });
 
+for (const restartBeforeLanding of [false, true]) {
+  test(`a cancelled navigation preserves the next sign-in${restartBeforeLanding ? " across worker restart" : ""}`, async () => {
+    const jobID = "job_claim_aborted";
+    const candidateID = "cand_aborted_0001";
+    const idpURL = "https://idp.example.edu/sso";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [coldClaimJob(jobID)],
+    });
+    installManagedTabLedger(h, {});
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+    await seedClaimCandidate(h, jobID, candidateID);
+    const tabID = await openClaimWithNewSurface(
+      h,
+      jobID,
+      candidateID,
+      `https://${PROVIDER_HOST}/fresh?aborted=1`,
+    );
+
+    await h.webNavigation.emitError(tabID, "net::ERR_ABORTED");
+    const active = restartBeforeLanding ? restartWorker(h) : h;
+    if (restartBeforeLanding) {
+      h.tabs.patch(tabID, { url: idpURL, status: "complete" });
+      await active.bridge.start();
+      await active.port.inbound(
+        helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }),
+      );
+    }
+    await active.tabs.completeNavigation(tabID, idpURL);
+
+    expect(active.frames().some((frame) =>
+      frame.type === "claim_observation" &&
+      frame.payload["event_kind"] === "navigation_error"
+    )).toBe(false);
+    expect(active.backend.store.activeJobs.find((job) => job.job_id === jobID)?.status)
+      .toBe("auth_pending");
+    expect(active.tabs.snapshot(tabID)).toBeDefined();
+  });
+}
+
 test("Slice 3: navigation_error on a claim-owned handoff tab emits the observation and charges no local auth attempt", async () => {
   const jobID = "job_claim_naverr";
   const candidateID = "cand_naverr_0001";

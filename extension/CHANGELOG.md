@@ -93,6 +93,12 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Chrome navigation cancellations no longer end a working sign-in claim.**
+  Chrome can report `net::ERR_ABORTED` when another navigation replaces the
+  first. The extension now leaves the next page free to request sign-in,
+  including after a worker restart. Other navigation errors still use the
+  existing failure path.
+
 - **Europe PMC direct PDFs no longer enter the HTML adapter classifier.**
   The extension recognizes the exact `/api/getPdf?pmcid=PMC…` endpoint in a
   tracked tab or its correlated child tab. Downloads keep their existing

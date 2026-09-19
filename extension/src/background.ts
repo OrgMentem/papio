@@ -7695,8 +7695,12 @@ export class Bridge {
   private async onNavigationError(d: {
     tabId: number;
     frameId: number;
+    error?: string;
   }): Promise<void> {
-    if (d.frameId !== 0) return;
+    // Chrome cancels a superseded navigation with ERR_ABORTED. The next
+    // document may be a working sign-in page, not an exhausted route.
+    // Do not let that cancellation create a durable failure marker.
+    if (d.frameId !== 0 || d.error === "net::ERR_ABORTED") return;
     await this.ready;
     const managed =
       findByTab(this.store, d.tabId) !== undefined ||
