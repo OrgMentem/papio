@@ -209,6 +209,11 @@ const HANDOFF_DRIVE_TIMEOUT_MS = 3 * 60_000;
 // schedule so a slow render still reaches a decisive verdict.
 const CLASSIFY_RETRY_MS = 2_500;
 const MAX_CLASSIFY_RETRIES = 8;
+function unknownGraceMs(spec?: AdapterSpec): number {
+  const configured = spec?.unknownGraceMs;
+  return configured !== undefined && Number.isFinite(configured)
+    ? Math.max(5_000, Math.min(configured, 60_000)) : 5_000;
+}
 // A challenge holds only its provider's queue for the same one minute the old
 // bounded challenge probe used, then a fresh drain can reclaim it.
 const PROVIDER_DRAIN_LEASE_MS = 24 * CLASSIFY_RETRY_MS;
@@ -2741,11 +2746,20 @@ export async function executePlannedPageEffect(
       const raw = (data as Record<string, unknown>)[api.result_field];
       if (typeof raw !== "string") return { ok: false };
       const resolved = new URL(raw, location.href);
+      const declaredDestination = Array.isArray(rule.allowedDestinations) &&
+        rule.allowedDestinations.some((destination) =>
+          destination.origin === resolved.origin &&
+          typeof destination.pathPrefix === "string" &&
+          destination.pathPrefix.startsWith("/") &&
+          (resolved.pathname === destination.pathPrefix ||
+            resolved.pathname.startsWith(destination.pathPrefix.endsWith("/")
+              ? destination.pathPrefix : `${destination.pathPrefix}/`)));
       if (
         resolved.protocol !== "https:" ||
-        resolved.origin !== api.result_origin
+        resolved.username !== "" || resolved.password !== "" ||
+        (resolved.origin !== api.result_origin && !declaredDestination)
       )
-        return { ok: false };
+        return no("the API result is outside the packaged download destinations");
       return { ok: true, url: resolved.href };
     } catch {
       return { ok: false };
@@ -18316,22 +18330,11 @@ export class Bridge {
     }
   }
 
-  /** Provider PDF endpoints are not required to end in `.pdf`: MDPI serves
-   * `/.../pdf`, and similar publisher routes use `/download` or
-   * `/full-text`. Keep this bounded to explicit PDF-ish path segments so a
-   * tracked handoff navigation can be adopted without treating arbitrary
-   * provider pages as files. */
+  /** Only known file/viewer routes authorize navigation adoption. A path word
+   * such as `pdf` is not file evidence: EBSCO's /viewer/pdf/<record> is HTML
+   * and needs the identity-bound adapter before its API can supply a file. */
   private isPDFNavigationURL(url: string): boolean {
-    if (isPDFPage(url)) return true;
-    try {
-      const pathname = new URL(url).pathname.toLowerCase();
-      return (
-        pathname.endsWith(".pdf") ||
-        /\/(?:pdf|download|full[-_]?text)(?:\/|$)/u.test(pathname)
-      );
-    } catch {
-      return false;
-    }
+    return isPDFPage(url);
   }
 
   /** Download a tracked PDF-viewer navigation through Chrome's download API.
@@ -19060,7 +19063,12 @@ export class Bridge {
     const retry = this.classifyRetries.get(jobID);
     if (kind === "unknown" && retry?.kind === "federated_evidence") return;
     const attempts = retry?.kind === kind ? retry.attempts : 0;
-    if (attempts >= MAX_CLASSIFY_RETRIES) {
+    const job = findByJob(this.store, jobID);
+    const spec = this.deps.adapterSpecs.find(candidate => candidate.id === job?.adapter_id);
+    const maxAttempts = kind === "unknown"
+      ? Math.max(MAX_CLASSIFY_RETRIES, Math.ceil(unknownGraceMs(spec) / CLASSIFY_RETRY_MS))
+      : MAX_CLASSIFY_RETRIES;
+    if (attempts >= maxAttempts) {
       this.classifyRetries.delete(jobID);
       return;
     }
@@ -19374,7 +19382,7 @@ export class Bridge {
     const now = this.deps.now();
     const count = job.unknown_count ?? 0;
     const last = job.last_unknown_ms ?? 0;
-    if (count >= 1 && now - last >= 5000 && !deferTerminal) {
+    if (count >= 1 && now - last >= unknownGraceMs(adapter) && !deferTerminal) {
       // Retries wait for one document to render; they are not independent
       // provider failures, so one broker drive gets one terminal observation.
       const outcomeKey = `${job.job_id}:ui_changed`;
@@ -20515,7 +20523,7 @@ export class Bridge {
         const now = this.deps.now();
         const settled =
           (job.unknown_count ?? 0) >= 1 &&
-          now - (job.last_unknown_ms ?? 0) >= 5000;
+          now - (job.last_unknown_ms ?? 0) >= unknownGraceMs(spec);
         await this.recordUnknown(job, host, spec, settled);
         if (!settled) return;
         const current = findByJob(this.store, jobID);

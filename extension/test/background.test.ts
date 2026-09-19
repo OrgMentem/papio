@@ -42,7 +42,7 @@ import {
   type FreshSessionEvidence,
   type KeepaliveAPI,
 } from "../src/keepalive";
-import { type AdapterSpec, type PageVerdict } from "../src/adapters/types";
+import { adapters, type AdapterSpec, type PageVerdict } from "../src/adapters/types";
 import {
   emptyPageBulkScanStore,
   scanDocument,
@@ -6629,6 +6629,36 @@ test("an ambiguous article can settle to a normal verdict without a false drift"
   expect(h.backend.store.activeJobs[0]!.unknown_count).toBe(0);
 });
 
+test("a slow provider can render within its bounded grace, and a stuck page reports once", async () => {
+  for (const renders of [true, false]) {
+    const h = makeHarness();
+    h.deps.adapterSpecs.push({ ...PROVIDER_ADAPTER, unknownGraceMs: 45_000 });
+    h.deps.permissions.contains = async () => true;
+    const start = h.clock.now;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+      if (injection.func === planExecution) return plannerResult(injection, {
+        kind: renders && h.clock.now - start >= 35_000 ? "login" : "unknown",
+      });
+      return [];
+    };
+    await h.bridge.start();
+    await h.port.inbound(jobOffer("job_slow_render"));
+    const tabID = h.backend.store.activeJobs[0]!.tab_id;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    for (let elapsed = 2_500; elapsed <= 45_000; elapsed += 2_500) {
+      const retry = h.timers.at(-1)!;
+      h.clock.now = start + elapsed;
+      await retry.fn();
+      if (elapsed < 45_000) expect(h.frames().filter(f => f.type === "provider_outcome")).toHaveLength(0);
+      if (renders && elapsed === 35_000) break;
+    }
+    expect(h.frames().filter(f => f.type === "provider_outcome")).toHaveLength(renders ? 0 : 1);
+    expect(h.downloads.started).toHaveLength(0);
+    if (renders) expect(h.backend.store.activeJobs[0]!.unknown_count).toBe(0);
+  }
+});
+
 test("unknown retries report ui_changed once per drive and again for a re-offered tab", async () => {
   const jobID = "job_unknown_outcome_drive";
   const h = makeHarness();
@@ -8509,6 +8539,43 @@ test("a PDF-viewer tab starts one download and leaves the adopted viewer open", 
   ).toBe(true);
   expect(h.tabs.removed).toEqual([]);
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
+});
+
+test("EBSCO's HTML PDF viewer reaches its adapter without downloading the page", async () => {
+  const h = makeHarness();
+  const spec = adapters.find((candidate) => candidate.id === "ebsco")!;
+  h.deps.adapterSpecs.push(spec);
+  h.deps.permissions.contains = async () => true;
+  let planned = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution) {
+      planned++;
+      return plannerResult(injection, { kind: "unknown" });
+    }
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOfferForHosts("job_ebsco_viewer", spec.hosts,
+    "https://research.ebsco.com/c/example/details/record"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID,
+    "https://research.ebsco.com/c/example/viewer/pdf/record?route=details");
+  expect(h.downloads.started).toEqual([]);
+  expect(planned).toBeGreaterThan(0);
+});
+
+test("PDF-like path segments alone do not authorize downloading an HTML page", async () => {
+  for (const path of ["/viewer/pdf/record", "/article/download", "/article/full-text"]) {
+    const h = makeHarness();
+    await h.bridge.start();
+    await h.port.inbound(jobOffer("job_html_route"));
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}${path}`);
+    expect(h.downloads.started).toEqual([]);
+    h.tabs.seed({ id: tabID + 1, url: "about:blank", openerTabId: tabID });
+    await h.tabs.completeNavigation(tabID + 1, `https://${PROVIDER_HOST}${path}`);
+    expect(h.downloads.started).toEqual([]);
+  }
 });
 
 test("a tracked Europe PMC direct route downloads once without entering the provider planner", async () => {

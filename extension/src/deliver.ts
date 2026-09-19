@@ -436,6 +436,12 @@ export function extractPageDOI(probe: PageDOIProbe): string | undefined {
 function isKnownDirectPDFRoute(url: URL): boolean {
   if (
     url.protocol === "https:" &&
+    (url.hostname === "mdpi.com" || url.hostname === "www.mdpi.com") &&
+    url.username === "" && url.password === "" && url.port === "" &&
+    /^\/\d{4}-\d{3}[\dX]\/\d+\/\d+\/\d+\/pdf$/.test(url.pathname)
+  ) return true;
+  if (
+    url.protocol === "https:" &&
     url.hostname.toLowerCase() === "europepmc.org" &&
     url.username === "" &&
     url.password === "" &&

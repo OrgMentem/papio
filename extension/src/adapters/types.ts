@@ -116,8 +116,8 @@ export interface DownloadRule {
    * gesture. The privileged downloads API carries the session cookies, so an
    * entitled endpoint (e.g. JSTOR /stable/pdf/<id>.pdf) is fetched
    * autonomously. */
-  /** Page-derived href/meta destinations require this packaged envelope when
-   * they leave the current page origin. */
+  /** Page-derived href/meta/API destinations require this packaged envelope
+   * when they leave the current page origin. */
   allowedDestinations?: DownloadDestinationContract[];
   /** `post` downloads an empty HTML POST form's explicit same-origin PDF
    * action. Forms with fields are refused; this never submits consent,
@@ -166,6 +166,9 @@ export interface AdapterSpec {
   /** On live SPA pages only, wait this long for a complete rule's declared
    * selectors to hydrate before classifying. Fixture Documents stay synchronous. */
   settleTimeoutMs?: number;
+  /** Extra bounded render window after the first inconclusive plan. Defaults
+   * to 5 seconds; the worker caps provider overrides at 60 seconds. */
+  unknownGraceMs?: number;
   download?: DownloadRule;
   /** Minimized work windows under-render some provider SPAs; keep this adapter's
    * handoff window visible without focusing it. */
@@ -482,10 +485,17 @@ export const adapters: AdapterSpec[] = [
     // Verified live 2026-07-14 against an institutionally authenticated EBSCOhost record
     // and its provider-owned download-format modal (fixtures/ebsco/success.html).
     id: "ebsco",
-    version: "0.2.0",
+    version: "0.3.0",
     hosts: ["research.ebsco.com"],
-    workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
-    settleTimeoutMs: 5000,
+    // EBSCO adds punctuation to citation titles. Bind execution to the exact
+    // DOI supplied by the rendered page; a missing or different DOI refuses.
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
+    // The current viewer still has no citation metadata ten seconds after
+    // load, before rendering the entitled article. Give it the full budget.
+    settleTimeoutMs: 15000,
+    // A live cold return remained on its captured loading shell for more
+    // than 30 seconds, then rendered the requested article without input.
+    unknownGraceMs: 45000,
     classify: [
       {
         kind: "article",
@@ -515,10 +525,13 @@ export const adapters: AdapterSpec[] = [
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "api",
-      idPattern: "/c/([^/]+)/viewer/pdf/([^/?#]+)",
+      idPattern: "^https://research\\.ebsco\\.com/c/([A-Za-z0-9_-]+)/viewer/pdf/([A-Za-z0-9_-]+)(?:[?#]|$)",
       urlTemplate:
         "https://research.ebsco.com/api/researcher-edge-aggregator/v1/records/{2}/fulltext/pdf?sourceRecordId={2}&opid={1}&intent=view&lang=en-US",
       jsonField: "url",
+      allowedDestinations: [
+        { origin: "https://content.ebscohost.com", pathPrefix: "/cds/retrieve" },
+      ],
     },
   },
   {

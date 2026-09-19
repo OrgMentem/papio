@@ -8,6 +8,8 @@ import { expect, test } from "bun:test";
 import { adapters } from "../src/adapters/types";
 import { classifyFixture, fixtureExists, loadFixture } from "./harness";
 import { Window } from "happy-dom";
+import { planExecution, type Plan } from "../src/plan";
+import { executePlannedPageEffect } from "../src/background";
 
 const spec = adapters.find((adapter) => adapter.id === "ebsco");
 if (!spec) throw new Error("ebsco spec missing from registry");
@@ -24,7 +26,7 @@ function fixture(scenario: string): Document {
 }
 
 test.skipIf(!fixtureExists("ebsco", "success"))(
-  "matching EBSCO article exposes the declared two-click PDF controls",
+  "matching EBSCO record retains article classification and the declared API route",
   () => {
     const doc = fixture("success");
     const verdict = classifyFixture(doc, spec, DIRKS_FERRIN);
@@ -80,4 +82,55 @@ test("EBSCO PDF viewer classifies as article (canvas-rendered) for the api downl
   expect(verdict.kind).toBe("article");
   expect(spec.download?.method).toBe("api");
   expect(spec.download?.idPattern).toContain("viewer/pdf");
+});
+
+test("EBSCO viewer API accepts only the packaged content-file destination", async () => {
+  const href = "https://research.ebsco.com/c/example/viewer/pdf/record?route=details";
+  const doc = fixture("viewer-current");
+  doc.defaultView!.location.href = href;
+  const result = planExecution(doc, spec, { title: "Example scholarly article", doi: "10.1000/example-paper" }, { access_mode: "delegated" });
+  if ("assisted" in result) throw new Error(result.assisted);
+  const planned = JSON.parse(JSON.stringify(result, (_key, value) => value === null ? undefined : value)) as Plan;
+  expect(planned.url).toBe("https://research.ebsco.com/api/researcher-edge-aggregator/v1/records/record/fulltext/pdf?sourceRecordId=record&opid=example&intent=view&lang=en-US");
+  const previous = { document: globalThis.document, location: globalThis.location, fetch: globalThis.fetch };
+  Object.assign(globalThis, { document: doc, location: new URL(href) });
+  try {
+    for (const [url, accepted] of [
+      ["https://content.ebscohost.com/cds/retrieve?test-only=1", true],
+      ["https://content.ebscohost.com/account", false],
+      ["https://content.ebscohost.com/cds/retrieve-other", false],
+      ["https://content.ebscohost.com.attacker.example/cds/retrieve", false],
+      ["http://content.ebscohost.com/cds/retrieve", false],
+      ["https://user@content.ebscohost.com/cds/retrieve", false],
+    ] as const) {
+      globalThis.fetch = Object.assign(async () => Response.json({ url }), { preconnect: previous.fetch.preconnect });
+      const effect = await executePlannedPageEffect(planned, spec.download!);
+      expect(effect.ok).toBe(accepted);
+      if (accepted) expect(effect.url).toBe(url);
+    }
+    globalThis.fetch = Object.assign(async () => Response.json({ url: "https://content.ebscohost.com/cds/retrieve" }), { preconnect: previous.fetch.preconnect });
+    expect((await executePlannedPageEffect(planned, { ...spec.download!, allowedDestinations: [] })).ok).toBe(false);
+    doc.querySelector("meta[name='citation_doi']")!.setAttribute("content", "10.1000/another-paper");
+    expect((await executePlannedPageEffect(planned, spec.download!)).ok).toBe(false);
+  } finally { Object.assign(globalThis, previous); }
+});
+
+test("EBSCO refuses missing or mismatched DOI metadata even when the title matches", () => {
+  for (const doi of [null, "10.1000/another-paper"]) {
+    const doc = fixture("viewer-current");
+    doc.defaultView!.location.href = "https://research.ebsco.com/c/example/viewer/pdf/record";
+    const meta = doc.querySelector("meta[name='citation_doi']")!;
+    if (doi === null) meta.remove(); else meta.setAttribute("content", doi);
+    const planned = planExecution(doc, spec, { title: "Example scholarly article", doi: "10.1000/example-paper" }, { access_mode: "delegated" });
+    expect(planned).toHaveProperty("assisted");
+  }
+});
+
+test("EBSCO refuses record and nested viewer routes before execution", () => {
+  for (const path of ["/c/example/details/record", "/c/example/viewer/pdf/record/extra", "/nested/c/example/viewer/pdf/record"]) {
+    const doc = fixture("viewer-current");
+    doc.defaultView!.location.href = `https://research.ebsco.com${path}`;
+    const planned = planExecution(doc, spec, { title: "Example scholarly article", doi: "10.1000/example-paper" }, { access_mode: "delegated" });
+    expect(planned).toHaveProperty("assisted");
+  }
 });

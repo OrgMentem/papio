@@ -93,6 +93,14 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **EBSCO's HTML viewer is no longer downloaded as a PDF.** PDF-like path
+  words alone no longer start a download. Known file routes still work, and
+  EBSCO's adapter waits longer for its viewer to render before requesting the
+  file. Its API may return a URL on the declared EBSCO content endpoint;
+  unrelated hosts and paths remain refused. Execution checks the page's exact
+  DOI, so EBSCO's title punctuation does not block the requested paper. Record
+  pages without an executable viewer route report the planning refusal.
+
 - Springer downloads now select the article header's PDF control explicitly.
   The same link also appears in a sticky banner; matching both made the
   planner refuse the download even though the page classified as an article.

@@ -255,6 +255,16 @@ test("Cell's exact PII route is a direct PDF surface without a .pdf suffix", () 
   expect(isPDFURL("https://attacker.example/action/showPdf?pii=S240584401730308X")).toBe(false);
 });
 
+test("MDPI direct PDF routes require its journal path on the exact host", () => {
+  expect(isPDFURL("https://mdpi.com/2227-7102/9/3/181/pdf?version=1563177761")).toBe(true);
+  expect(isPDFURL("https://www.mdpi.com/2227-7102/9/3/181/pdf")).toBe(true);
+  for (const url of [
+    "https://mdpi.com/viewer/pdf/record", "https://other.example/2227-7102/9/3/181/pdf",
+    "https://mdpi.com/2227-7102/9/3/181/pdf/extra", "http://mdpi.com/2227-7102/9/3/181/pdf",
+    "https://user@mdpi.com/2227-7102/9/3/181/pdf", "https://mdpi.com:444/2227-7102/9/3/181/pdf",
+  ]) expect(isPDFURL(url)).toBe(false);
+});
+
 test("Europe PMC direct PDF routes require the exact host, path, and PMCID query", () => {
   const file = "https://europepmc.org/api/getPdf?pmcid=PMC8053968";
   expect(isPDFURL(file)).toBe(true);

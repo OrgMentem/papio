@@ -1055,7 +1055,7 @@ export function planExecution(
     if (routeBinding !== null && "assisted" in routeBinding)
       return routeBinding;
     const url = resolveURL(download, element) ?? null;
-    if ((download.method === "href" || download.method === "meta" || download.method === "url" || download.method === "post") && url === null) {
+    if (download.method !== "click" && url === null) {
       return { assisted: "declared action URL is not a distinct HTTPS URL" };
     }
     const followupMatches =
