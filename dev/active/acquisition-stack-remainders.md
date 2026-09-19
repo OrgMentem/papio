@@ -22,8 +22,9 @@ constraint that makes the extension QA matrix manual.
   A fresh live probe retained the correct 16-page open-access article after one
   explicit Open on 2026-09-20. Subscription sign-in remains pending, and this
   article result does not establish access to a full book or entitled chapter.
-- **EBSCO re-verification.** The 2026-07-23 adoption-binding fix (`a4aeab3`)
-  landed after EBSCO's only live run, which had stopped at `needs_review`. Re-run
-  it end to end to confirm the job now reaches ready/attach, and separately
-  confirm the resolver lands on EBSCO's PDF viewer rather than the record page
-  — the `api` download method cannot use the record page's `idPattern`.
+- **EBSCO remaining routes.** The institutional resolver reached its PDF viewer
+  on 2026-09-20. Adapter 0.3.0 retained the correct validated 10-page PDF after
+  one explicit Open with a warmed sign-in session. That closes viewer acquisition
+  re-verification. Record-only pages, title-only requests, unattended queue
+  progress, and Zotero attachment remain unverified; they are not implied by
+  this operator-assisted acquisition.
