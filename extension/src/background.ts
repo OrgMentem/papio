@@ -1441,6 +1441,7 @@ export interface BridgeDeps {
     search(query: {
       id?: number;
       filename?: string;
+      filenameRegex?: string;
       limit?: number;
     }): Promise<DownloadItemLike[]>;
     /** Start a browser-managed download. The resolver-provided offer URL stays
@@ -7777,7 +7778,7 @@ export class Bridge {
     if (pending.status === "sending" && !this.deliveryJobs.has(pending.job_id)) {
       let live = false;
       try {
-        const found = await this.deps.downloads.search({ filename: jobDownloadFilename(pending.job_id) });
+        const found = await this.findJobDownloads(pending.job_id);
         live = found.length > 0;
       } catch {}
       if (!live) {
@@ -7893,7 +7894,7 @@ export class Bridge {
       if (isStuckSending) {
         let liveDownload = false;
         try {
-          const found = await this.deps.downloads.search({ filename: jobDownloadFilename(pending.job_id) });
+          const found = await this.findJobDownloads(pending.job_id);
           liveDownload = found.length > 0;
         } catch {}
         if (!liveDownload && !this.deliveryJobs.has(pending.job_id)) {
@@ -13840,6 +13841,16 @@ export class Bridge {
     await save;
     if (signInBlockersChanged) await this.syncConnectionBadge();
   }
+  /** Match the job directory, not the requested relative paper.pdf name:
+   * Chrome records an absolute path and filename steering can keep the
+   * publisher's basename (including a conflict suffix). No URL is searched. */
+  private findJobDownloads(jobID: string): Promise<DownloadItemLike[]> {
+    const escaped = jobID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return this.deps.downloads.search({
+      filenameRegex: `(?:^|[/\\\\])papio[/\\\\]${escaped}[/\\\\][^/\\\\]+$`,
+      limit: 0,
+    });
+  }
   /** Reserve a job's download initiation at the state reducer boundary.
    * First consult the browser's durable download list: storage.session is
    * cleared by a full browser restart, but an in-progress Chrome download can
@@ -13848,10 +13859,7 @@ export class Bridge {
   private async claimDownloadInitiated(jobID: string): Promise<boolean> {
     let browserItems: DownloadItemLike[];
     try {
-      browserItems = await this.deps.downloads.search({
-        filename: jobDownloadFilename(jobID),
-        limit: 10,
-      });
+      browserItems = await this.findJobDownloads(jobID);
     } catch {
       // A failed duplicate check cannot authorize another download.
       return false;
@@ -18419,9 +18427,10 @@ export class Bridge {
    * navigation to a `.pdf`), correlating it to the tracked handoff tab that
    * spawned it. The adapter's click set `download_initiated` but produced a
    * viewer, not a `chrome.downloads` item — so gate on "no download tracked
-   * yet" (this.downloads) rather than the latch. Downloads the URL through the
-   * browser cookie jar so the daemon's adoption/import path runs. The viewer
-   * remains open for the operator.
+   * yet" rather than the click latch. Completed downloads also block adoption
+   * while the daemon validates the file, including after a worker restart.
+   * Downloads the URL through the browser cookie jar so the daemon's adoption
+   * path runs. The viewer remains open for the operator.
    */
   private async maybeAdoptViewerTab(
     viewerTabId: number,
@@ -18444,7 +18453,11 @@ export class Bridge {
     const openerLedgerEntry =
       openerTabId === undefined ? undefined : ledger[String(openerTabId)];
     const candidates = this.store.activeJobs.filter((j) => {
-      if (this.downloads.has(j.job_id)) return false;
+      if (
+        this.downloads.has(j.job_id) ||
+        this.completedDownloadTabs.has(j.job_id)
+      )
+        return false;
       if (this.isFirefoxClickDownload(j)) return false;
       if (j.status !== "accepted" && j.status !== "awaiting_download")
         return false;
@@ -18473,10 +18486,28 @@ export class Bridge {
       );
       return;
     }
-    this.adoptedViewerTabs.set(job.job_id, viewerTabId);
-
-    this.pendingDownloadURLs.set(url, job.job_id);
     try {
+      const existing = await this.findJobDownloads(job.job_id);
+      if (
+        existing.some(
+          (item) => item.state === "in_progress" || item.state === "complete",
+        )
+      )
+        return;
+      // Search yields to cancellation, authority changes, and download events.
+      // Re-read before the effect rather than trusting the selected snapshot.
+      const current = findByJob(this.store, job.job_id);
+      if (
+        !this.hasDelegatedAuthority(current) ||
+        current?.tab_id !== job.tab_id ||
+        (current.status !== "accepted" &&
+          current.status !== "awaiting_download") ||
+        this.downloads.has(job.job_id) ||
+        this.completedDownloadTabs.has(job.job_id)
+      )
+        return;
+      this.adoptedViewerTabs.set(job.job_id, viewerTabId);
+      this.pendingDownloadURLs.set(url, job.job_id);
       const id = await this.deps.downloads.download({
         url,
         filename: `papio/${job.job_id}/paper.pdf`,

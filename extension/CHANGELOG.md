@@ -93,6 +93,18 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- Springer article pages that offer institutional sign-in now remain sign-in
+  pending instead of reporting no entitlement. An available PDF still takes
+  precedence. The change is verified against captured pages; live acquisition
+  after this repair remains unverified.
+
+- **ScienceDirect keeps institutional sign-in prompts open.** A Purchase PDF
+  link beside an enabled institutional-access link no longer counts as proof
+  that the library lacks access or sends the paper to document delivery.
+- **Late PDF viewer events no longer repeat a completed download.** Viewer
+  adoption checks the browser's job folder while the daemon validates the
+  file, including after an extension worker restart. Download recovery also
+  recognizes absolute paths and publisher filenames.
 - **Adapter repair prefers the PDF download over a viewer tab.** Article
   proposals require a PDF-specific affordance; HTML full-text links and
   citation exports no longer qualify on their own. Explicit PDF downloads

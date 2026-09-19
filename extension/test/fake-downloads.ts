@@ -45,10 +45,25 @@ export class FakeDownloads {
     return [query.id];
   }
 
-  async search(query: { id?: number; filename?: string; limit?: number }): Promise<DownloadItemLike[]> {
+  async search(query: {
+    id?: number;
+    filename?: string;
+    filenameRegex?: string;
+    limit?: number;
+  }): Promise<DownloadItemLike[]> {
     let result = [...this.items.values()];
-    if (query.id !== undefined) result = result.filter((item) => item.id === query.id);
-    if (query.filename !== undefined) result = result.filter((item) => item.filename?.includes(query.filename ?? "") === true);
-    return query.limit === undefined ? result : result.slice(0, query.limit);
+    if (query.id !== undefined)
+      result = result.filter((item) => item.id === query.id);
+    if (query.filename !== undefined)
+      result = result.filter((item) => item.filename === query.filename);
+    if (query.filenameRegex !== undefined) {
+      const pattern = new RegExp(query.filenameRegex);
+      result = result.filter(
+        (item) => item.filename !== undefined && pattern.test(item.filename),
+      );
+    }
+    return query.limit === undefined || query.limit === 0
+      ? result
+      : result.slice(0, query.limit);
   }
 }

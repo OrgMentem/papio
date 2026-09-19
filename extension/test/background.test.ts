@@ -8195,6 +8195,56 @@ test("a CDN PDF viewer is adopted for one uniquely driven accepted job", async (
     },
   ]);
 });
+
+for (const restart of [false, true]) {
+  test(`a late child PDF viewer cannot repeat a completed download${restart ? " after worker restart" : " while adoption is pending"}`, async () => {
+    const jobID = "job_late_child_viewer";
+    let h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 100,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_800_000_000_000,
+          status: "accepted",
+          provider_hosts: ["www.sciencedirect.com"],
+          download_initiated: true,
+          access_mode: "delegated",
+        },
+      ],
+    });
+    h.tabs.seed({ id: 100, url: OPENURL });
+    await h.bridge.start();
+    const viewerURL = "https://pdf.sciencedirectassets.com/77/paper.pdf";
+    h.tabs.seed({ id: 101, url: "about:blank", openerTabId: 100 });
+    await h.tabs.completeNavigation(101, viewerURL);
+    expect(h.downloads.started).toHaveLength(1);
+
+    // Filename steering keeps the provider's basename, not paper.pdf.
+    h.downloads.items.set(901, {
+      id: 901,
+      url: viewerURL,
+      filename: `/Users/x/Downloads/papio/${jobID}/main (1).pdf`,
+      fileSize: 128,
+      state: "complete",
+    });
+    await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+    expect(
+      h.frames().some((f) => f.type === "download_complete" && f.job_id === jobID),
+    ).toBe(true);
+    // Hold the daemon's adoption ack. Its PDF validation can take seconds.
+    if (restart) {
+      h = restartWorker(h);
+      await h.bridge.start();
+    }
+    await h.tabs.completeNavigation(101, viewerURL);
+    h.tabs.seed({ id: 102, url: "about:blank", openerTabId: 100 });
+    await h.tabs.completeNavigation(102, viewerURL);
+    expect(h.downloads.started).toHaveLength(1);
+  });
+}
+
 test("an unrelated openerless PDF viewer is rejected without provider provenance", async () => {
   const h = makeHarness({
     ...emptyStore(),
@@ -8217,6 +8267,70 @@ test("an unrelated openerless PDF viewer is rejected without provider provenance
   await h.tabs.completeNavigation(101, "https://unrelated.example/paper.pdf");
   expect(h.downloads.started).toEqual([]);
 });
+
+for (const scenario of [
+  "in_progress",
+  "complete",
+  "interrupted",
+  "other_job",
+  "search_failed",
+  "cancelled",
+] as const) {
+  test(`child PDF viewer checks durable downloads and live authority: ${scenario}`, async () => {
+    const jobID = "job_viewer_authority";
+    const h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 100,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_800_000_000_000,
+          status: "accepted",
+          provider_hosts: ["www.sciencedirect.com"],
+          download_initiated: true,
+          access_mode: "delegated",
+        },
+      ],
+    });
+    h.tabs.seed({ id: 100, url: OPENURL });
+    await h.bridge.start();
+    const storedJobID = scenario === "other_job" ? `${jobID}_sibling` : jobID;
+    h.downloads.items.set(77, {
+      id: 77,
+      state:
+        scenario === "in_progress" || scenario === "interrupted"
+          ? scenario
+          : "complete",
+      filename: `C:\\Users\\x\\Downloads\\papio\\${storedJobID}\\publisher (1).pdf`,
+    });
+    if (scenario === "search_failed") {
+      h.deps.downloads.search = async () => {
+        throw new Error("history unavailable");
+      };
+    } else if (scenario === "cancelled") {
+      h.deps.downloads.search = async () => {
+        await h.port.inbound({
+          protocol: "papio-browser/1",
+          type: "cancel",
+          msg_id: "cancel_viewer_pending_search",
+          job_id: jobID,
+          seq: 1,
+          payload: {},
+        });
+        return [];
+      };
+    }
+    h.tabs.seed({ id: 101, url: "about:blank", openerTabId: 100 });
+    await h.tabs.completeNavigation(
+      101,
+      "https://pdf.sciencedirectassets.com/77/paper.pdf",
+    );
+    expect(h.downloads.started).toHaveLength(
+      scenario === "interrupted" || scenario === "other_job" ? 1 : 0,
+    );
+  });
+}
 
 test("a CDN PDF viewer remains unadopted when two driven jobs are candidates", async () => {
   const h = makeHarness({

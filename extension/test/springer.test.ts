@@ -1,10 +1,11 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Springer Nature Link adapter against sanitized live entitled/open-access and
-// isolated no-entitlement captures. Missing states remain assisted.
+// Springer Nature Link adapter against captured article and access-prompt
+// pages. An institutional login prompt does not establish no entitlement.
 
 import { expect, test } from "bun:test";
 
 import { adapters } from "../src/adapters/types";
+import { planExecution, type Plan } from "../src/plan";
 import { classifyFixture, fixtureExists, loadFixture } from "./harness";
 
 const spec = adapters.find((adapter) => adapter.id === "springer");
@@ -54,15 +55,16 @@ test.skipIf(!fixtureExists("springer", "wrong-work"))(
 );
 
 test.skipIf(!fixtureExists("springer", "no-entitlement"))(
-  "Springer subscription preview reports no entitlement before any download",
+  "Springer subscription preview keeps institutional sign-in pending",
   () => {
     const doc = fixture("no-entitlement");
     const requested = {
       title:
         "The influence of information overload on the development of trust and purchase intention based on online product reviews in a mobile vs. web environment: an empirical investigation",
     };
-    expect(classifyFixture(doc, spec, requested).kind).toBe("no_entitlement");
+    expect(classifyFixture(doc, spec, requested).kind).toBe("login");
     expect(doc.querySelector("[data-test='access-article']")).not.toBeNull();
+    expect(doc.querySelector("[data-test='access-via-institution']")).not.toBeNull();
     expect(doc.querySelector(spec.download?.selector ?? "")).toBeNull();
   },
 );
@@ -80,3 +82,28 @@ test.skipIf(!fixtureExists("springer", "drift"))(
     expect(classifyFixture(fixture("drift"), spec, HUMAN_MACHINE_TRUST).kind).toBe("unknown");
   },
 );
+
+test("Springer institutional login prompt is not proof of no entitlement", () => {
+  for (const scenario of ["no-entitlement", "institutional-access"]) {
+    const page = fixture(scenario);
+    expect(classifyFixture(page, spec).kind).toBe("login");
+    const doi = page.querySelector("meta[name='citation_doi']")!.getAttribute("content")!;
+    const plan = planExecution(page, spec, { doi }, { access_mode: "delegated" }) as Plan;
+    expect(plan.verdict.kind).toBe("login");
+    expect(plan.method).toBeNull();
+    expect(plan.target_ref).toBeNull();
+  }
+});
+
+test("Springer requires an institutional login control and prefers an available PDF", () => {
+  const page = fixture("no-entitlement");
+  for (const control of page.querySelectorAll("[data-test='access-via-institution']")) control.remove();
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
+  const entitled = fixture("success");
+  const access = entitled.createElement("div");
+  access.setAttribute("data-test", "access-article");
+  access.innerHTML = `<a href="//wayf.springernature.com"><span data-test="access-via-institution">Log in via an institution</span></a>`;
+  entitled.body.append(access);
+  expect(classifyFixture(entitled, spec).kind).toBe("article");
+  expect(classifyFixture(fixture("login-return"), spec).kind).toBe("article");
+});

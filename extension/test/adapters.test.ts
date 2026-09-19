@@ -1080,28 +1080,48 @@ test.skipIf(sciencedirectArticle === null)(
 );
 
 const sciencedirectPaywall = loadFixture("sciencedirect", "no-entitlement");
+
 test.skipIf(sciencedirectPaywall === null)(
-  "captured ScienceDirect purchase wall reports no entitlement, not a coverage gap",
+  "the older ScienceDirect purchase wall still offers institutional sign-in",
   () => {
     const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
     const page = sciencedirectPaywall as Document;
-    // Reporting this as `unknown` told the user papio could not drive the page
-    // and sent them hunting an adapter bug, when the resolver had simply
-    // routed them somewhere they have no access. The 2026-08-26 capture is the
-    // exact page that reproduced this: ScienceDirect removed `.PurchasePDF`
-    // and replaced it with a labelled `/getaccess/pii/.../purchase` anchor.
+    // The older fixture was labelled no-entitlement, but carries the same
+    // institutional-access prompt as the 2026-09-19 landing.
+    // Purchase availability alone cannot prove the institution lacks access.
     expect(page.querySelector("meta[name='citation_pdf_url']")).toBeNull();
     // Read the rule's own selector rather than a copy: a hardcoded duplicate
     // here kept asserting `[href$='/purchase']` after the spec moved to `*=`,
     // so the test would have gone on passing against a selector the adapter no
     // longer used.
-    const wall = spec.classify.find((rule) => rule.kind === "no_entitlement");
+    const wall = spec.classify.find((rule) => rule.kind === "login");
     const purchase = (wall?.all ?? []).find((s) => s.includes("/purchase"));
     expect(purchase).toBeDefined();
     expect(page.querySelector(purchase as string)).not.toBeNull();
-    expect(classifyFixture(page, spec).kind).toBe("no_entitlement");
+    expect(classifyFixture(page, spec).kind).toBe("login");
   },
 );
+
+test("ScienceDirect institutional access stays sign-in pending without downloading", () => {
+  const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
+  const page = loadFixture("sciencedirect", "login-return") as Document;
+  const plan = planExecution(
+    page,
+    spec,
+    { doi: "10.1016/j.chb.2016.04.041" },
+    { access_mode: "delegated" },
+  ) as Plan;
+  expect("assisted" in plan).toBe(false);
+  expect(plan.verdict.kind).toBe("login");
+  expect(plan.target_ref).toBeNull();
+  expect(plan.method).toBeNull();
+
+  // A decorative sign-in link or a purchase option alone does not prove
+  // either an authentication wall or institutional non-entitlement.
+  for (const control of [...page.querySelectorAll(".RemoteAccessButton")])
+    control.remove();
+  expect(classifyFixture(page, spec).kind).toBe("unknown");
+});
 
 test("an entitled ScienceDirect page still wins over the purchase-wall rule", () => {
   const spec = adapters.find((a) => a.id === "sciencedirect") as AdapterSpec;
@@ -1111,7 +1131,8 @@ test("an entitled ScienceDirect page still wins over the purchase-wall rule", ()
       "<body><div class='accessbar'><ul>" +
       "<li class='ViewPDF'><a class='accessbar-utility-link' href='/science/article/pii/S1/pdfft'>View PDF</a></li>" +
       "</ul></div>" +
-      "<div class='access-options'><a class='accessbar-utility-link' aria-label='Purchase PDF' href='/getaccess/pii/S1/purchase'>Purchase PDF</a></div></body></html>",
+      "<div class='access-options'><a class='accessbar-utility-link' aria-label='Purchase PDF' href='/getaccess/pii/S1/purchase'>Purchase PDF</a>" +
+      "<a class='RemoteAccessButton' aria-disabled='false' href='https://auth.elsevier.com/ShibAuth/institutionLogin'>Institutional access</a></div></body></html>",
   );
   expect(classifyFixture(page, spec).kind).toBe("article");
 });

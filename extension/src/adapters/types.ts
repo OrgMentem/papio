@@ -522,10 +522,11 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // Verified live 2026-07-14 against entitled and isolated no-entitlement
-    // Springer Nature Link article states (fixtures/springer/*.html).
+    // Captured Springer Nature Link article states (fixtures/springer/*.html).
+    // The access panel offers institutional sign-in; its presence does not
+    // establish no entitlement. A rendered PDF control takes precedence.
     id: "springer",
-    version: "0.1.0",
+    version: "0.1.1",
     hosts: ["link.springer.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 3000,
@@ -538,10 +539,10 @@ export const adapters: AdapterSpec[] = [
         ],
       },
       {
-        kind: "no_entitlement",
+        kind: "login",
         all: [
           "meta[name='citation_title']",
-          "[data-test='access-article']",
+          "[data-test='access-article'] a[href]:not([aria-disabled='true']) [data-test='access-via-institution']",
         ],
       },
     ],
@@ -594,16 +595,13 @@ export const adapters: AdapterSpec[] = [
     // opens the PDF in a new browser window, which papio's viewer-adoption path
     // captures. Fetching the bare href directly redirects to Cookie Notice HTML.
     //
-    // The no_entitlement rule is separate live evidence (fixtures/
-    // sciencedirect/no-entitlement.html, captured 2026-08-26 after a fresh UNE
-    // institutional sign-in). The paywall publishes one provider-owned
-    // `/getaccess/pii/<pii>/purchase` anchor labelled "Purchase PDF" and no View
-    // PDF control. ScienceDirect removed the old `.PurchasePDF` class, so that
-    // page used to fall through as `ui_changed` and keep the institution's one
-    // sign-in slot occupied. `article` stays first so a transitional page that
-    // briefly carries both still trusts the positive entitlement signal.
+    // The 2026-09-19 login-return capture pairs Purchase PDF with an enabled
+    // institutional RemoteAccessButton. The older no-entitlement fixture has
+    // the same prompt: neither capture proves the institution lacks this
+    // work. Treat that combination as login, not terminal no_entitlement.
+    // Article stays first so an enabled PDF control still wins over a prompt.
     id: "sciencedirect",
-    version: "0.8.0",
+    version: "0.8.1",
     hosts: ["sciencedirect.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -680,13 +678,14 @@ export const adapters: AdapterSpec[] = [
         ],
       },
       {
-        kind: "no_entitlement",
+        kind: "login",
         all: [
           "meta[name='citation_doi']",
           // `*='/purchase'` for the same reason as above: this href is a live
           // value, so a trailing anchor breaks the moment ScienceDirect adds a
           // query. `[href^='/getaccess/pii/']` is what keeps it tight.
           ".access-options a.accessbar-utility-link[aria-label='Purchase PDF'][href^='/getaccess/pii/'][href*='/purchase']",
+          ".access-options a.RemoteAccessButton[aria-disabled='false'][href^='https://auth.elsevier.com/ShibAuth/institutionLogin']",
         ],
       },
     ],
