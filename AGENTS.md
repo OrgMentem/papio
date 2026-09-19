@@ -770,3 +770,13 @@ There is also a link check, because `zensical build` prints a broken link as an
 - Work-window mode (`papio_work_window_v1`, default on) puts handoff tabs in a **minimized
   background window**; provider SPAs may under-render while hidden — a per-adapter
   `requiresVisible` fallback is the intended fix if one stalls. Toggle off in options to debug.
+
+## Agent skills
+
+### Issue tracker
+
+Tickets live in the rumen findings ledger under project id `papio`; specs and wayfinder maps live as tracked markdown under `dev/plans/<feature-slug>/`. Never drive `bd` directly. GitHub Issues are not the agent ticket surface. See `dev/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: the ADRs are `dev/adr/NNNN-*.md`, not `docs/adr/`; there is no `CONTEXT.md` yet and none should be created preemptively. See `dev/agents/domain.md`.
