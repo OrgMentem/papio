@@ -217,6 +217,115 @@ test("planExecution rejects a selected target whose explicit DOI is another work
   expect("assisted" in planned ? null : planned.url).toBe("https://example.test/pdf/right.pdf");
 });
 
+test("Europe PMC plans a direct URL only when the route and citation PMCID agree", () => {
+  const html = fixtureHTML("europepmc", "success");
+  const spec = adapters.find((candidate) => candidate.id === "europepmc") as AdapterSpec;
+  const articleURL = "https://europepmc.org/article/PMC/8053968";
+  const doi = "10.1073/pnas.2019053118";
+
+  const valid = planExecution(
+    parseHTML(html, articleURL),
+    spec,
+    { doi },
+    { access_mode: "delegated" },
+  );
+  expect("assisted" in valid).toBe(false);
+  if ("assisted" in valid) throw new Error(valid.assisted);
+  expect(valid.verdict.kind).toBe("article");
+  expect(valid.method).toBe("url");
+  expect(valid.url).toBe(
+    "https://europepmc.org/api/getPdf?pmcid=PMC8053968",
+  );
+
+  expect(
+    planExecution(
+      parseHTML(html, articleURL),
+      spec,
+      { doi: "10.1093/nar/gkab1061" },
+      { access_mode: "delegated" },
+    ),
+  ).toEqual({
+    assisted: expect.any(String),
+    verdict: expect.objectContaining({ kind: "article" }),
+  });
+
+  const absent = parseHTML(html, articleURL);
+  absent.querySelector("meta[name='citation_pmcid']")?.remove();
+  const absentPlan = planExecution(
+    absent,
+    spec,
+    { doi },
+    { access_mode: "delegated" },
+  );
+  expect("assisted" in absentPlan).toBe(false);
+  if ("assisted" in absentPlan) throw new Error(absentPlan.assisted);
+  expect(absentPlan.verdict.kind).toBe("unknown");
+  expect(absentPlan.required_consequence).toBe("none");
+
+  const noAffordance = parseHTML(html, articleURL);
+  noAffordance.querySelector("#open_pdf")?.remove();
+  const noAffordancePlan = planExecution(
+    noAffordance,
+    spec,
+    { doi },
+    { access_mode: "delegated" },
+  );
+  expect("assisted" in noAffordancePlan).toBe(false);
+  if ("assisted" in noAffordancePlan)
+    throw new Error(noAffordancePlan.assisted);
+  expect(noAffordancePlan.verdict.kind).toBe("unknown");
+  expect(noAffordancePlan.required_consequence).toBe("none");
+
+  const duplicate = parseHTML(html, articleURL);
+  duplicate.head.append(
+    duplicate
+      .querySelector("meta[name='citation_pmcid']")!
+      .cloneNode(true),
+  );
+  expect(
+    planExecution(
+      duplicate,
+      spec,
+      { doi },
+      { access_mode: "delegated" },
+    ),
+  ).toEqual({
+    assisted: expect.any(String),
+    verdict: expect.objectContaining({ kind: "article" }),
+  });
+
+  const mismatched = parseHTML(html, articleURL);
+  mismatched
+    .querySelector("meta[name='citation_pmcid']")
+    ?.setAttribute("content", "PMC9999999");
+  expect(
+    planExecution(
+      mismatched,
+      spec,
+      { doi },
+      { access_mode: "delegated" },
+    ),
+  ).toEqual({
+    assisted: expect.any(String),
+    verdict: expect.objectContaining({ kind: "article" }),
+  });
+
+  for (const unrelatedRoute of [
+    "https://europepmc.org/article/PMC/9999999",
+    "https://europepmc.org/article/MED/33827920",
+    "https://europepmc.org/articles/PMC8053968?pdf=render",
+    "https://europepmc.org/article/PMC/8053968/supplementary",
+  ]) {
+    const refused = planExecution(
+      parseHTML(html, unrelatedRoute),
+      spec,
+      { doi },
+      { access_mode: "delegated" },
+    );
+    expect("assisted" in refused).toBe(true);
+  }
+});
+
 test("planGeneric records E0 evidence but emits no E1 candidate for assisted access", () => {
   const doc = parseHTML(
     '<head><meta name="citation_doi" content="doi:10.1000/ABC"></head><body></body>',

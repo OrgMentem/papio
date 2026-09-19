@@ -8295,6 +8295,98 @@ test("a PDF-viewer tab starts one download and leaves the adopted viewer open", 
   expect(h.tabs.snapshot(tabID) !== undefined).toBe(true);
 });
 
+test("a tracked Europe PMC direct route downloads once without entering the provider planner", async () => {
+  const h = makeHarness();
+  let scriptCalls = 0;
+  h.deps.scripting.executeScript = async () => {
+    scriptCalls++;
+    return [];
+  };
+  await h.bridge.start();
+  const pdfURL =
+    "https://europepmc.org/api/getPdf?pmcid=PMC8053968";
+  await h.port.inbound(
+    jobOfferForHosts(
+      "job_europepmc_tracked",
+      ["europepmc.org"],
+      "https://europepmc.org/article/PMC/8053968",
+    ),
+  );
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await h.tabs.completeNavigation(tabID, pdfURL);
+  await h.tabs.completeNavigation(tabID, pdfURL);
+
+  expect(h.downloads.started).toEqual([
+    {
+      url: pdfURL,
+      filename: "papio/job_europepmc_tracked/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+  expect(scriptCalls).toBe(0);
+});
+
+test("an off-provider Europe PMC direct route keeps the tracked job correlation", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  const pdfURL =
+    "https://europepmc.org/api/getPdf?pmcid=PMC8053968";
+  await h.port.inbound(
+    jobOfferForHosts(
+      "job_europepmc_redirect",
+      ["publisher.example"],
+      "https://publisher.example/article",
+    ),
+  );
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+
+  await h.tabs.completeNavigation(tabID, pdfURL);
+
+  expect(h.downloads.started).toEqual([
+    {
+      url: pdfURL,
+      filename: "papio/job_europepmc_redirect/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+});
+
+test("only the opener-correlated Europe PMC child route is adopted", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  const pdfURL =
+    "https://europepmc.org/api/getPdf?pmcid=PMC8053968";
+  await h.port.inbound(
+    jobOfferForHosts(
+      "job_europepmc_child",
+      ["europepmc.org"],
+      "https://europepmc.org/article/PMC/8053968",
+    ),
+  );
+  const trackedTab = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const strayTab = 997;
+  h.tabs.seed({ id: strayTab, url: pdfURL, openerTabId: 12345 });
+  await h.tabs.completeNavigation(strayTab, pdfURL);
+  expect(h.downloads.started).toEqual([]);
+
+  const childTab = 998;
+  h.tabs.seed({ id: childTab, url: pdfURL, openerTabId: trackedTab });
+  await h.tabs.completeNavigation(childTab, pdfURL);
+
+  expect(h.downloads.started).toEqual([
+    {
+      url: pdfURL,
+      filename: "papio/job_europepmc_child/paper.pdf",
+      conflictAction: "uniquify",
+      saveAs: false,
+    },
+  ]);
+  expect(h.tabs.snapshot(childTab)).toBeDefined();
+});
+
 // Measured live 2026-08-26 on doi 10.1016/j.sbspro.2014.01.1251. The
 // institutional route latched `auth_pending` mid-redirect, then the tracked
 // tab settled on the real file. Adoption was gated on status BEFORE the PDF

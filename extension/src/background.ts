@@ -2374,6 +2374,78 @@ export async function executePlannedPageEffect(
   } else if (plan.verdict.kind === "article" && workBinding !== null) {
     return no("a work binding is present but no identity was requested");
   }
+  const routeBinding = orNull(
+    (
+      primary as typeof primary & {
+        route_binding?: unknown;
+      }
+    ).route_binding,
+  );
+  if (routeBinding !== null) {
+    if (typeof routeBinding !== "object" || Array.isArray(routeBinding))
+      return no("the route identity binding is malformed");
+    const binding = routeBinding as {
+      selector?: unknown;
+      fingerprint?: unknown;
+      attribute?: unknown;
+      normalized?: unknown;
+      pattern?: unknown;
+      route_pattern?: unknown;
+    };
+    const metadataPattern = orNull(binding.pattern);
+    if (
+      typeof binding.selector !== "string" ||
+      binding.selector.length === 0 ||
+      binding.selector.length > plan.revalidation.max_selector_length ||
+      typeof binding.fingerprint !== "string" ||
+      binding.fingerprint === "" ||
+      typeof binding.attribute !== "string" ||
+      binding.attribute.length === 0 ||
+      typeof binding.normalized !== "string" ||
+      binding.normalized === "" ||
+      (metadataPattern !== null && typeof metadataPattern !== "string") ||
+      typeof binding.route_pattern !== "string" ||
+      binding.route_pattern.length === 0 ||
+      binding.route_pattern.length > plan.revalidation.max_selector_length
+    )
+      return no("the route identity binding is malformed");
+    const source = findExactlyOne(binding.selector);
+    if (source === null)
+      return no(
+        `the route identity selector ${binding.selector} did not match exactly one element`,
+      );
+    if (fingerprint(source) !== binding.fingerprint)
+      return no(
+        "the route identity element no longer matches its planned fingerprint",
+      );
+    const raw = source.getAttribute(binding.attribute)?.trim() ?? "";
+    if (raw === "") return no("the route identity attribute is empty");
+    let extracted = raw;
+    if (metadataPattern !== null) {
+      let match: RegExpMatchArray | null;
+      try {
+        match = raw.match(new RegExp(metadataPattern));
+      } catch {
+        return no("the route identity metadata pattern is invalid");
+      }
+      if (match === null || typeof match[1] !== "string")
+        return no("the route identity metadata pattern did not match");
+      extracted = match[1];
+    }
+    let routeMatch: RegExpMatchArray | null;
+    try {
+      routeMatch = location.href.match(new RegExp(binding.route_pattern));
+    } catch {
+      return no("the route identity URL pattern is invalid");
+    }
+    if (
+      routeMatch === null ||
+      typeof routeMatch[1] !== "string" ||
+      routeMatch[1] !== binding.normalized ||
+      extracted !== binding.normalized
+    )
+      return no("the route identity no longer matches the page metadata");
+  }
   const doiEvidence = orNull(
     expectedWork.doi as {
       normalized?: unknown;
@@ -17861,6 +17933,7 @@ export class Bridge {
     // only. Re-reads fresh job state; a stale local `job` here is fine.
     if (change.status === "complete") {
       await this.maybeDownloadPDFViewer(job.job_id, url);
+      if (isPDFPage(url)) return;
       await this.maybeClassify(job.job_id, host);
     }
   }
@@ -18215,6 +18288,7 @@ export class Bridge {
    * tracked handoff navigation can be adopted without treating arbitrary
    * provider pages as files. */
   private isPDFNavigationURL(url: string): boolean {
+    if (isPDFPage(url)) return true;
     try {
       const pathname = new URL(url).pathname.toLowerCase();
       return (

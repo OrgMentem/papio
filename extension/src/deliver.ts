@@ -434,6 +434,18 @@ export function extractPageDOI(probe: PageDOIProbe): string | undefined {
  * exact and host-bound; HTML viewers that need endpoint conversion belong in
  * their declarative adapter's viewerRoutes contract instead. */
 function isKnownDirectPDFRoute(url: URL): boolean {
+  if (
+    url.protocol === "https:" &&
+    url.hostname.toLowerCase() === "europepmc.org" &&
+    url.username === "" &&
+    url.password === "" &&
+    url.port === ""
+  ) {
+    if (url.pathname !== "/api/getPdf" || url.hash !== "") return false;
+    const params = [...url.searchParams];
+    const only = params.length === 1 ? params[0] : undefined;
+    return only?.[0] === "pmcid" && /^PMC[1-9][0-9]*$/.test(only[1]);
+  }
   if (isCochraneDirectPDFRoute(url)) return true;
   if (url.protocol !== "https:") return false;
   if (url.hostname.toLowerCase() !== "www.cell.com") return false;

@@ -782,6 +782,91 @@ test("sage stays unknown when its PDF/EPUB marker is absent", () => {
   expect(classifyFixture(page, spec).kind).toBe("unknown");
 });
 
+const europePMCArticle = loadFixture("europepmc", "success");
+const europePMCDrift = loadFixture("europepmc", "drift");
+test.skipIf(europePMCArticle === null || europePMCDrift === null)(
+  "captured Europe PMC article classifies and the PDF shell stays unknown",
+  () => {
+    const spec = adapters.find((candidate) => candidate.id === "europepmc") as AdapterSpec;
+    const article = europePMCArticle as Document;
+    const verdict = classifyFixture(article, spec, {
+      doi: "10.1073/pnas.2019053118",
+    });
+    expect(verdict.kind).toBe("article");
+    expect(verdict.adapter_id).toBe("europepmc");
+    expect(classifyFixture(europePMCDrift as Document, spec).kind).toBe(
+      "unknown",
+    );
+  },
+);
+
+test.skipIf(!fixtureExists("europepmc", "success"))(
+  "Europe PMC revalidates the requested DOI, route PMCID, and metadata before the URL effect",
+  async () => {
+    const href = "https://europepmc.org/article/PMC/8053968";
+    const doc = parseHTML(
+      readFileSync(fixturePath("europepmc", "success"), "utf8"),
+      href,
+    );
+    const spec = adapters.find((candidate) => candidate.id === "europepmc") as AdapterSpec;
+    const plan = planExecution(
+      doc,
+      spec,
+      { doi: "10.1073/pnas.2019053118" },
+      { access_mode: "delegated" },
+    ) as Plan;
+    expect("assisted" in plan).toBe(false);
+
+    const prev = {
+      document: globalThis.document,
+      location: globalThis.location,
+    };
+    Object.assign(globalThis, {
+      document: doc,
+      location: { href, origin: "https://europepmc.org" },
+    });
+    try {
+      expect(
+        await executePlannedPageEffect(
+          plan,
+          spec.download as DownloadRule,
+        ),
+      ).toEqual({
+        ok: true,
+        url: "https://europepmc.org/api/getPdf?pmcid=PMC8053968",
+      });
+
+      Object.assign(globalThis, {
+        location: {
+          href: "https://europepmc.org/article/PMC/9999999",
+          origin: "https://europepmc.org",
+        },
+      });
+      expect(
+        await executePlannedPageEffect(
+          plan,
+          spec.download as DownloadRule,
+        ),
+      ).toMatchObject({ ok: false });
+
+      Object.assign(globalThis, {
+        location: { href, origin: "https://europepmc.org" },
+      });
+      doc
+        .querySelector("meta[name='citation_pmcid']")
+        ?.setAttribute("content", "PMC9999999");
+      expect(
+        await executePlannedPageEffect(
+          plan,
+          spec.download as DownloadRule,
+        ),
+      ).toMatchObject({ ok: false });
+    } finally {
+      Object.assign(globalThis, prev);
+    }
+  },
+);
+
 const halArticle = loadFixture("hal", "success");
 test.skipIf(halArticle === null)(
   "captured HAL record classifies as article through citation_pdf_url",

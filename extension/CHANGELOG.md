@@ -18,6 +18,11 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Europe PMC article pages have a fixture-backed download route.** The
+  extension uses the rendered Open PDF control and constructs the file URL
+  only when the requested DOI and the page's PMCID metadata agree with the
+  article route. It checks that identity again before the download.
+
 - **Losing a tab *papio* opened now offers to bring it back.** A small *papio*
   window appears for eight seconds with one button: `Reopen now` for a route
   *papio* can resume, or `Open a new sign-in tab` when the close ended your
@@ -87,6 +92,11 @@ for the full pre-split extension history.
   stops automatic resolver checks.
 
 ### Fixed
+
+- **Europe PMC direct PDFs no longer enter the HTML adapter classifier.**
+  The extension recognizes the exact `/api/getPdf?pmcid=PMC…` endpoint in a
+  tracked tab or its correlated child tab. Downloads keep their existing
+  job ownership and authority checks.
 
 - **A paper brought back after a restart that lands on a terms page no longer
   stalls every other message for fifteen seconds.** The extension waited for

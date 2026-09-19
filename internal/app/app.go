@@ -1557,7 +1557,15 @@ func (s *Service) settleCancelledAttempt(ctx context.Context, attempt int64, out
 	}
 }
 
-func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) error {
+func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan retryPlan) (err error) {
+	var deferredReview *conclusiveIdentityReview
+	defer func() {
+		if deferredReview == nil {
+			return
+		}
+		materializeErr := s.materializeDeferredIdentityReview(context.WithoutCancel(ctx), row.ID, deferredReview)
+		err = errors.Join(err, materializeErr)
+	}()
 	// Keep this fact separate from the retry counters. A live OA candidate
 	// beside a source gate is a retryable OA route, not an exhausted work.
 	for _, candidate := range live {
@@ -1799,14 +1807,43 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			return err
 		}
 
-		accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
+		accepted, parked, candidateReview, err := s.validateFetchCandidate(ctx, row, stored, result)
+		if candidateReview != nil {
+			if deferredReview == nil {
+				// NextPendingCandidate is ordered by rank and durable ID. Keep
+				// the first conclusive mismatch as the deterministic fallback.
+				deferredReview = candidateReview
+			} else if candidateReview.binding.QuarantinePath != deferredReview.binding.QuarantinePath {
+				if err := s.discardDeferredIdentityReview(ctx, candidateReview); err != nil {
+					return err
+				}
+			}
+		}
 		if err != nil {
 			return err
 		}
 		if accepted || parked {
+			// A later candidate supplied the final outcome. The deferred wrong
+			// bytes are no longer review evidence and must not remain in the
+			// quarantine directory after a ready or parked result.
+			review := deferredReview
+			deferredReview = nil
+			if err := s.discardDeferredIdentityReview(context.WithoutCancel(ctx), review); err != nil {
+				return err
+			}
 			return nil
 		}
 		// Rejection returned the job to fetching to try the next candidate.
+	}
+
+	// A conclusive mismatch outranks manual, retry, browser-handoff and
+	// exhaustion outcomes only after every immediate queue expansion has run.
+	// Materialize it before this pass can release its lease or clean quarantine
+	// on a later Process call.
+	if deferredReview != nil {
+		review := deferredReview
+		deferredReview = nil
+		return s.materializeDeferredIdentityReview(context.WithoutCancel(ctx), row.ID, review)
 	}
 
 	// Classification, not gating. Conservative is documented to "emit
@@ -3377,7 +3414,114 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
+type conclusiveIdentityReview struct {
+	detail  string
+	binding job.HumanActionBinding
+}
+
+type conclusiveIdentityReviewHandler func(context.Context, *job.Row, *conclusiveIdentityReview) (parked bool, err error)
+
+func (s *Service) openConclusiveIdentityReview(ctx context.Context, jobID, from string, review *conclusiveIdentityReview) error {
+	if err := s.Jobs.ParkWithHumanAction(ctx, jobID, from, job.StateNeedsReview,
+		"verify_identity", review.detail, map[string]any{"reason": "conclusive_doi_mismatch"},
+		job.Access(false, ""), job.WithHumanActionBinding(review.binding)); err != nil {
+		return err
+	}
+	s.notifyParked(ctx, jobID, job.StateNeedsReview)
+	return nil
+}
+
+func (s *Service) discardDeferredIdentityReview(ctx context.Context, review *conclusiveIdentityReview) error {
+	if review == nil {
+		return nil
+	}
+	markErr := s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
+	removeErr := os.Remove(review.binding.QuarantinePath)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	} else if removeErr != nil {
+		removeErr = fmt.Errorf("removing deferred identity-review file: %w", removeErr)
+	}
+	return errors.Join(markErr, removeErr)
+}
+
+// materializeDeferredIdentityReview converts the fetch pass's retained
+// conclusive mismatch into durable review ownership before Process can return.
+// The digest check prevents missing or altered quarantine bytes from acquiring
+// a review override for content the operator never saw.
+func (s *Service) materializeDeferredIdentityReview(ctx context.Context, jobID string, review *conclusiveIdentityReview) error {
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if row.State != job.StateFetching && row.State != job.StateValidating {
+		return fmt.Errorf("cannot materialize deferred identity review for job %s in state %s", jobID, row.State)
+	}
+
+	actualSHA, hashErr := fileSHA256(review.binding.QuarantinePath)
+	if hashErr == nil && strings.EqualFold(actualSHA, review.binding.QuarantineSHA256) {
+		reviewErr := s.openConclusiveIdentityReview(ctx, row.ID, row.State, review)
+		if reviewErr != nil {
+			return reviewErr
+		}
+		return s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
+	}
+
+	var integrityErr error
+	if hashErr != nil {
+		integrityErr = fmt.Errorf("reading deferred identity-review file: %w", hashErr)
+	} else {
+		integrityErr = fmt.Errorf("deferred identity-review digest changed: got %s, want %s",
+			actualSHA, review.binding.QuarantineSHA256)
+	}
+	detail := fmt.Sprintf("%s; deferred review evidence for candidate %d is unavailable or changed at %s (expected SHA-256 %s)",
+		review.detail, review.binding.CandidateID, review.binding.QuarantinePath, review.binding.QuarantineSHA256)
+	if err := s.Jobs.ParkWithHumanAction(ctx, jobID, row.State, job.StateNeedsReview,
+		"validation_error", detail, map[string]any{"reason": "conclusive_doi_mismatch_evidence_invalid"},
+		job.Access(false, "")); err != nil {
+		return errors.Join(integrityErr, err)
+	}
+	log.Printf("papio: deferred identity review for job %s: %v", jobID, integrityErr)
+	s.notifyParked(ctx, jobID, job.StateNeedsReview)
+	return s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
+}
+
 func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, leaseOwners ...*string) (accepted, parked bool, err error) {
+	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
+		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
+			markErr := s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
+			reviewErr := s.openConclusiveIdentityReview(ctx, row.ID, job.StateValidating, review)
+			return true, errors.Join(markErr, reviewErr)
+		}, leaseOwners...)
+}
+
+// validateFetchCandidate is the only validator entry point allowed to defer a
+// conclusive mismatch. Its caller owns the remaining candidate queue and must
+// materialize the returned review before any non-success exit.
+func (s *Service) validateFetchCandidate(
+	ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result,
+) (accepted, parked bool, deferred *conclusiveIdentityReview, err error) {
+	accepted, parked, err = s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
+		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
+			// Keep the candidate in its durable fetching status until this pass
+			// either binds the review or discards it for a later outcome.
+			// Crash recovery resets fetching candidates to pending, so a lost
+			// pass re-fetches this mismatch instead of losing its only fallback.
+			deferred = review
+			return false, s.Jobs.Transition(ctx, row.ID, job.StateValidating, job.StateFetching,
+				map[string]any{"reason": "conclusive_doi_mismatch_deferred"})
+		})
+	return accepted, parked, deferred, err
+}
+
+func (s *Service) validateCandidateWithConclusiveReview(
+	ctx context.Context,
+	row *job.Row,
+	stored *job.Candidate,
+	result fetch.Result,
+	onConclusiveReview conclusiveIdentityReviewHandler,
+	leaseOwners ...*string,
+) (accepted, parked bool, err error) {
 	attempt, err := s.Jobs.StartAttempt(ctx, row.ID, stored.ID, "validate", stored.Source)
 	if err != nil {
 		return false, false, err
@@ -3402,12 +3546,16 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		// a validation that could not finish: it names the stage that stopped.
 		s.recordValidation(ctx, row.ID, stored.ID, result.SHA256, validationIncomplete, report)
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, safeType(validateErr))
-		_, _ = s.Jobs.OpenHumanAction(ctx, row.ID, "validation_error", "PDF validation could not complete within configured bounds", job.Access(false, ""))
 		if err := s.Jobs.MarkCandidate(ctx, stored.ID, "skipped"); err != nil {
 			return false, false, err
 		}
-		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
-			map[string]any{"reason": "validation_error"})
+		if err := s.Jobs.ParkWithHumanAction(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
+			"validation_error", "PDF validation could not complete within configured bounds",
+			map[string]any{"reason": "validation_error"}, job.Access(false, "")); err != nil {
+			return false, false, err
+		}
+		s.notifyParked(ctx, row.ID, job.StateNeedsReview)
+		return false, true, nil
 	}
 	// An embedded file is the only active-content marker on most quarantined
 	// papers, because publisher PDFs routinely bundle one supplementary
@@ -3437,15 +3585,17 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 	case report.Structural.Encrypted || active:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "encrypted_or_active_content")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
-		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "unsafe_pdf", "PDF is encrypted or contains active/embedded content", job.Access(false, ""),
+		if err := s.Jobs.ParkWithHumanAction(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
+			"unsafe_pdf", "PDF is encrypted or contains active/embedded content",
+			map[string]any{"reason": "encrypted_or_active_content"}, job.Access(false, ""),
 			job.WithHumanActionBinding(job.HumanActionBinding{
 				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
 			}),
 		); err != nil {
 			return false, false, err
 		}
-		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
-			map[string]any{"reason": "encrypted_or_active_content"})
+		s.notifyParked(ctx, row.ID, job.StateNeedsReview)
+		return false, true, nil
 	case !report.Payload.OK || !report.Structural.Valid:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "payload_or_structure_rejected")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
@@ -3458,35 +3608,30 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 		// escape a legitimately mismatched document (a chapter DOI against a
 		// book job) could never be accepted at all. A job selection never
 		// sets ReviewOverride, so picks stay gated.
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "conclusive_doi_mismatch")
-		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
-		detail := fmt.Sprintf("Document front matter DOI %s does not match this job; local quarantine file: %s — %s",
-			strings.Join(conclusiveVeto.DOIs, ", "), result.TempPath, strings.Join(conclusiveVeto.Evidence, "; "))
-		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
-			detail,
-			job.Access(false, ""),
-			job.WithHumanActionBinding(job.HumanActionBinding{
+		finishErr := s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "needs_review", 0, "conclusive_doi_mismatch")
+		review := &conclusiveIdentityReview{
+			detail: fmt.Sprintf("Document front matter DOI %s does not match this job; local quarantine file: %s — %s",
+				strings.Join(conclusiveVeto.DOIs, ", "), result.TempPath, strings.Join(conclusiveVeto.Evidence, "; ")),
+			binding: job.HumanActionBinding{
 				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
-			}),
-		); err != nil {
-			return false, false, err
+			},
 		}
-		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
-			map[string]any{"reason": "conclusive_doi_mismatch"})
+		parked, reviewErr := onConclusiveReview(ctx, row, review)
+		return false, parked, errors.Join(finishErr, reviewErr)
 	case needsIdentityReview && !stored.ReviewOverride:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "needs_review", 0, "semantic_or_identity_review")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
-		if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "verify_identity",
+		if err := s.Jobs.ParkWithHumanAction(ctx, row.ID, job.StateValidating, job.StateNeedsReview, "verify_identity",
 			fmt.Sprintf("PDF text or identity requires human verification; local quarantine file: %s", result.TempPath),
-			job.Access(false, ""),
+			map[string]any{"reason": "semantic_or_identity_review"}, job.Access(false, ""),
 			job.WithHumanActionBinding(job.HumanActionBinding{
 				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
 			}),
 		); err != nil {
 			return false, false, err
 		}
-		return false, true, s.park(ctx, row.ID, job.StateValidating, job.StateNeedsReview,
-			map[string]any{"reason": "semantic_or_identity_review"})
+		s.notifyParked(ctx, row.ID, job.StateNeedsReview)
+		return false, true, nil
 	case report.Identity.Result != pdf.IdentityPass && report.Identity.Result != pdf.IdentityReview:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "identity_rejected")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")

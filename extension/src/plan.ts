@@ -39,12 +39,24 @@ export interface PlanTargetWorkBinding {
   pattern: string | null;
 }
 
+export interface PlanRouteIdentityBinding {
+  selector: string;
+  fingerprint: string;
+  attribute: string;
+  normalized: string;
+  pattern: string | null;
+  route_pattern: string;
+}
+
 export interface PlanEffectTarget {
   selector: string;
   shadow_selector: string | null;
   fingerprint: string | null;
   /** Exact packaged work binding for this page-side effect. */
   work_binding?: PlanTargetWorkBinding | null;
+  /** Independent page metadata bound to the route identifier used by a
+   * constructed URL. Present only for adapters that declare routeIdentity. */
+  route_binding?: PlanRouteIdentityBinding;
   /** Static packaged labels used to resolve a terms control inside selector. */
   text_any?: string[];
   control_selector?: string | null;
@@ -912,6 +924,92 @@ export function planExecution(
         pattern: contract.pattern ?? null,
       };
     };
+    const routeBindingFor = (
+      rule: DownloadRule,
+    ): PlanRouteIdentityBinding | null | AssistedReason => {
+      const contract = rule.routeIdentity;
+      if (contract === undefined) return null;
+      if (
+        (rule.method !== "url" && rule.method !== "api") ||
+        typeof rule.idPattern !== "string" ||
+        rule.idPattern.length === 0 ||
+        rule.idPattern.length > 512
+      ) {
+        return { assisted: "declared route identity lacks a bounded URL pattern" };
+      }
+      const selector = contract.selector.trim();
+      const attribute = contract.attribute.trim();
+      if (
+        selector.length === 0 ||
+        selector.length > 512 ||
+        attribute.length === 0
+      ) {
+        return { assisted: "declared route identity source is invalid" };
+      }
+      let matches: Element[];
+      try {
+        matches = Array.from(root.querySelectorAll(selector));
+      } catch {
+        return { assisted: "declared route identity selector is invalid" };
+      }
+      if (matches.length !== 1 || matches[0] === undefined) {
+        return {
+          assisted:
+            matches.length === 0
+              ? "declared route identity evidence is missing"
+              : "declared route identity evidence is ambiguous",
+        };
+      }
+      const source = matches[0];
+      const raw = source.getAttribute(attribute)?.trim() ?? "";
+      if (raw === "")
+        return { assisted: "declared route identity evidence is empty" };
+      let extracted = raw;
+      if (contract.pattern !== undefined) {
+        if (contract.pattern.length === 0 || contract.pattern.length > 512) {
+          return { assisted: "declared route identity pattern is invalid" };
+        }
+        let metadataMatch: RegExpMatchArray | null;
+        try {
+          metadataMatch = raw.match(new RegExp(contract.pattern));
+        } catch {
+          return { assisted: "declared route identity pattern is invalid" };
+        }
+        if (
+          metadataMatch === null ||
+          typeof metadataMatch[1] !== "string"
+        ) {
+          return {
+            assisted: "declared route identity evidence does not match",
+          };
+        }
+        extracted = metadataMatch[1];
+      }
+      let routeMatch: RegExpMatchArray | null;
+      try {
+        routeMatch = pageHref.match(new RegExp(rule.idPattern));
+      } catch {
+        return { assisted: "declared route identity URL pattern is invalid" };
+      }
+      if (
+        routeMatch === null ||
+        typeof routeMatch[1] !== "string" ||
+        routeMatch[1] === "" ||
+        extracted !== routeMatch[1]
+      ) {
+        return {
+          assisted: "declared route identity does not match page metadata",
+        };
+      }
+      return {
+        selector,
+        fingerprint: fingerprint(source),
+        attribute,
+        normalized: extracted,
+        pattern: contract.pattern ?? null,
+        route_pattern: rule.idPattern,
+      };
+    };
     const download = spec.download;
     if (classified.verdict.kind !== "article" || download === undefined || download.requireKind !== "article") {
       if (classified.verdict.kind === "terms" && base.effect_graph !== undefined) {
@@ -934,6 +1032,9 @@ export function planExecution(
     if (element === null) return { assisted: "declared action target disappeared" };
     const workBinding = workBindingFor(download, element);
     if ("assisted" in workBinding) return workBinding;
+    const routeBinding = routeBindingFor(download);
+    if (routeBinding !== null && "assisted" in routeBinding)
+      return routeBinding;
     const url = resolveURL(download, element) ?? null;
     if ((download.method === "href" || download.method === "meta" || download.method === "url") && url === null) {
       return { assisted: "declared action URL is not a distinct HTTPS URL" };
@@ -957,6 +1058,7 @@ export function planExecution(
       shadow_selector: target.shadow_selector,
       fingerprint: target.fingerprint,
       work_binding: workBinding,
+      ...(routeBinding === null ? {} : { route_binding: routeBinding }),
     };
     effectGraph.followup_target =
       download.followupSelector === undefined

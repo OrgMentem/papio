@@ -85,6 +85,15 @@ export interface DownloadTargetContract {
   pattern?: string;
 }
 
+export interface RouteIdentityContract {
+  /** Exact page element carrying the identifier used to build a URL route. */
+  selector: string;
+  /** Attribute carrying that identifier. */
+  attribute: string;
+  /** Optional extraction pattern. Group 1 must equal idPattern group 1. */
+  pattern?: string;
+}
+
 export interface ProviderViewerRoute {
   /** Exact leading pathname identifying the provider's journal viewer. */
   pathPrefix: string;
@@ -124,6 +133,9 @@ export interface DownloadRule {
   /** method "url"/"api": regex matched against the page URL; capture groups fill
    * {1},{2},… (and {id} = {1}) in urlTemplate. */
   idPattern?: string;
+  /** Bind idPattern group 1 to independent page metadata before building a
+   * URL, then revalidate both the route and metadata before the effect. */
+  routeIdentity?: RouteIdentityContract;
   /** method "url": the resolved HTTPS PDF endpoint. method "api": an HTTPS
    * endpoint returning JSON whose jsonField holds the PDF URL. */
   urlTemplate?: string;
@@ -1259,6 +1271,52 @@ export const adapters: AdapterSpec[] = [
       workTarget: { kind: "opaque" },
       method: "meta",
       metaName: "wkhealth_pdf_url",
+    },
+  },
+  {
+    // Captured 2026-09-19 from the public Europe PMC full-text article
+    // PMC8053968 (fixtures/europepmc/success.html). The visible PDF affordance
+    // is a role=button span, not an anchor, and citation_pdf_url points back to
+    // the article after fixture query sanitization. Build Europe PMC's measured
+    // direct endpoint only when the requested DOI, article route PMCID, and
+    // citation_pmcid metadata all bind the same page.
+    id: "europepmc",
+    version: "0.1.0",
+    hosts: ["europepmc.org"],
+    settleTimeoutMs: 5_000,
+    workEvidence: {
+      kind: "doi",
+      selector: "meta[name='citation_doi']",
+      attribute: "content",
+    },
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='citation_title']",
+          "meta[name='citation_doi']",
+          "meta[name='citation_pmcid']",
+          "#open_pdf > span[role='button']",
+        ],
+      },
+    ],
+    download: {
+      selector: "#open_pdf > span[role='button']",
+      requireKind: "article",
+      workTarget: {
+        kind: "doi",
+        selector: "meta[name='citation_doi']",
+        attribute: "content",
+      },
+      method: "url",
+      idPattern:
+        "^https://europepmc\\.org/article/PMC/([1-9][0-9]*)(?:[?#]|$)",
+      routeIdentity: {
+        selector: "meta[name='citation_pmcid']",
+        attribute: "content",
+        pattern: "^PMC([1-9][0-9]*)$",
+      },
+      urlTemplate: "https://europepmc.org/api/getPdf?pmcid=PMC{id}",
     },
   },
   {

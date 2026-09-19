@@ -1,0 +1,115 @@
+{
+  "schema_version": "papio-bench-cohort/1",
+  "id": "live-open-access-v1",
+  "description": "The committed live-cohort baseline. Every work is a real, public paper, so this file can live in the repository — a cohort drawn from the operator's own backlog names their reading and belongs in dev/scratch instead (see dev/live-cohort.md). Judgements were verified against the Unpaywall API on 2026-09-19: each autonomous_ready work returned is_oa true from a publisher host, each ready_after_human_boundary work returned is_oa false, and the honest_unavailable DOI is unregistered. Re-verify before trusting an old run: a work can go open access, and then its expectation is wrong rather than papio being right.",
+  "works": [
+    {
+      "key": "plos-biology-arrive",
+      "request": { "doi": "10.1371/journal.pbio.3000410" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. PLOS Biology."
+    },
+    {
+      "key": "plos-medicine-prisma",
+      "request": { "doi": "10.1371/journal.pmed.1003583" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. PLOS Medicine."
+    },
+    {
+      "key": "nature-communications",
+      "request": { "doi": "10.1038/s41467-020-19393-6" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. Nature Communications."
+    },
+    {
+      "key": "scientific-reports",
+      "request": { "doi": "10.1038/s41598-021-90442-w" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. Scientific Reports."
+    },
+    {
+      "key": "elife",
+      "request": { "doi": "10.7554/eLife.63646" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher host, no direct url_for_pdf — deliberately kept, because a landing page papio must resolve past is the case that separates a working route from a lucky one."
+    },
+    {
+      "key": "frontiers-psychology",
+      "request": { "doi": "10.3389/fpsyg.2019.01686" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. Frontiers in Psychology."
+    },
+    {
+      "key": "mdpi-ijerph",
+      "request": { "doi": "10.3390/ijerph17186469" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. MDPI, the host whose 545 KB page first exceeded the IPC transport cap."
+    },
+    {
+      "key": "bmc-psychiatry",
+      "request": { "doi": "10.1186/s12888-021-03282-3" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. BMC Psychiatry."
+    },
+    {
+      "key": "peerj",
+      "request": { "doi": "10.7717/peerj.9350" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher host, no direct url_for_pdf."
+    },
+    {
+      "key": "jmir",
+      "request": { "doi": "10.2196/18848" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. JMIR."
+    },
+    {
+      "key": "oup-nar",
+      "request": { "doi": "10.1093/nar/gkab1061" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher host, no direct url_for_pdf. Oxford University Press, an adapter host."
+    },
+    {
+      "key": "pnas",
+      "request": { "doi": "10.1073/pnas.2019053118" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. PNAS."
+    },
+    {
+      "key": "elsevier-heliyon",
+      "request": { "doi": "10.1016/j.heliyon.2021.e06297" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. Elsevier, so the open-access ScienceDirect route the adapter comments describe as fragile."
+    },
+    {
+      "key": "bmj-open",
+      "request": { "doi": "10.1136/bmjopen-2020-041350" },
+      "expected_class": "autonomous_ready",
+      "source": "Unpaywall 2026-09-19: is_oa true, publisher PDF. BMJ Open, an adapter host."
+    },
+    {
+      "key": "science-closed",
+      "request": { "doi": "10.1126/science.1127647" },
+      "expected_class": "ready_after_human_boundary",
+      "source": "Unpaywall 2026-09-19: is_oa false, no OA location. Science. An unattended run must reach the institutional boundary and stop there."
+    },
+    {
+      "key": "wiley-closed",
+      "request": { "doi": "10.1002/job.2297" },
+      "expected_class": "ready_after_human_boundary",
+      "source": "Unpaywall 2026-09-19: is_oa false, no OA location. Wiley, an adapter host."
+    },
+    {
+      "key": "sage-closed",
+      "request": { "doi": "10.1177/0956797614524581" },
+      "expected_class": "ready_after_human_boundary",
+      "source": "Unpaywall 2026-09-19: is_oa false, no OA location. SAGE, an adapter host."
+    },
+    {
+      "key": "unregistered-doi",
+      "request": { "doi": "10.9999/papio.live.cohort.absent.0001" },
+      "expected_class": "honest_unavailable",
+      "source": "Unregistered prefix; the DOI resolves nowhere (Unpaywall 404, 2026-09-19). Present so the report shows whether papio fails honestly and quickly, which is a product behaviour and not only an error path."
+    }
+  ]
+}

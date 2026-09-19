@@ -255,6 +255,40 @@ test("Cell's exact PII route is a direct PDF surface without a .pdf suffix", () 
   expect(isPDFURL("https://attacker.example/action/showPdf?pii=S240584401730308X")).toBe(false);
 });
 
+test("Europe PMC direct PDF routes require the exact host, path, and PMCID query", () => {
+  const file = "https://europepmc.org/api/getPdf?pmcid=PMC8053968";
+  expect(isPDFURL(file)).toBe(true);
+  expect(isPDFPage(file)).toBe(true);
+  expect(classifyPage(file)).toEqual({ kind: "pdf" });
+
+  const credentialed = new URL(file);
+  credentialed.username = "user";
+  credentialed.password = "pass";
+  for (const refused of [
+    "http://europepmc.org/api/getPdf?pmcid=PMC8053968",
+    credentialed.href,
+    "https://europepmc.org:8443/api/getPdf?pmcid=PMC8053968",
+    "https://www.europepmc.org/api/getPdf?pmcid=PMC8053968",
+    "https://attacker.example/api/getPdf?pmcid=PMC8053968",
+    "https://europepmc.org/api/getpdf?pmcid=PMC8053968",
+    "https://europepmc.org/api/getPdf/PMC8053968",
+    "https://europepmc.org/api/getPdf",
+    "https://europepmc.org/api/getPdf?pmcid=pmc8053968",
+    "https://europepmc.org/api/getPdf?pmcid=PMC8053968&download=1",
+    "https://europepmc.org/api/getPdf?pmcid=PMC8053968&pmcid=PMC8053968",
+    "https://europepmc.org/api/getPdf?pmcid=PMC8053968#page=1",
+    "https://europepmc.org/articles/PMC8053968?pdf=render",
+    "https://europepmc.org/article/PMC/8053968?supplementary=1",
+    "https://europepmc.org/api/fulltextRepo?pmcid=PMC8053968",
+    "https://europepmc.org/articles/PMC8053968/figure/F1",
+    "https://europepmc.org/abstract/MED/33827920",
+    "https://europepmc.org/article/MED/33827920",
+    "https://doi.org/10.1073/pnas.2019053118",
+  ]) {
+    expect(isPDFURL(refused)).toBe(false);
+  }
+});
+
 test("Cochrane PDF routes keep the DOI boundary and expose the viewer", () => {
   const doi = "10.1002/14651858.CD013850.pub2";
   const article = `https://www.cochranelibrary.com/cdsr/doi/${doi}/full`;

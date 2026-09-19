@@ -1,4 +1,4 @@
-.PHONY: build test vet identity-corpus openalex-yield docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets launch-demo-env
+.PHONY: build test vet identity-corpus openalex-yield live-cohort docs-gen docs-build docs-serve ext-bump hooks dev-deploy store-assets launch-demo-env
 
 build:
 	go build ./...
@@ -46,6 +46,18 @@ composite-labels:
 # -confirm-spend). Output names your own library — never commit a run.
 openalex-yield:
 	go run ./cmd/openalexyield
+
+# Measure what papio does UNATTENDED against a cohort of real works, through
+# the running daemon: real resolvers, real providers, the real browser bridge.
+# The live counterpart to `papio bench`, which is hermetic and so can see none
+# of the failures that matter in the field. Reports WRONG ACCEPTS first — the
+# unconditional gate — then autonomous completions, then why each work
+# stopped. Submits REAL jobs with auto_import off and cancels the ones that
+# produced no artifact; see dev/live-cohort.md. A cohort built from your own
+# backlog names your own papers — keep it in dev/scratch and never commit it.
+live-cohort: COHORT ?= dev/cohorts/open-access-v1.json
+live-cohort:
+	go run ./cmd/live-cohort -cohort $(COHORT)
 
 # Regenerate the code-generated reference page (docs/reference/commands.md) from
 # the cobra command tree. Drift-gated in CI — run after any command/flag change.

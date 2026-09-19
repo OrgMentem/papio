@@ -285,6 +285,11 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A conclusive DOI mismatch no longer stops the candidate queue.** The fetch
+  path tries the remaining candidates before asking for identity review. If
+  none succeeds, it keeps the first mismatch and binds the review to its
+  checked quarantine bytes. Browser-download review and explicit review
+  acceptance keep their existing behavior.
 - **A library sign-in is no longer held by a paper whose tab is already
   gone.** When a materialization claim expired, the *next* claim request
   retired it on the spot — but only released the close authorization, not the
