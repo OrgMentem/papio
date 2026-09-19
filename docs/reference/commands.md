@@ -156,6 +156,26 @@ papio actions resolve <action-id> [flags]
 | `--accept` | `bool` | `false` | accept the identity review |
 | `--reject` | `bool` | `false` | reject the identity review |
 
+### `papio actions retry-publisher`
+
+Retry a failed browser route through the paper's DOI
+
+Retry one wrong-page or adapter failure through the paper's DOI in your browser.
+
+Use the action id and revision from 'papio actions list --json'. The failed
+action and its evidence remain in the job history. Only one publisher retry
+is allowed per job. Pending sign-ins, challenges, terms, downloads, and
+unresolved browser effects must be handled first. Publisher access may
+still require sign-in; this command does not establish entitlement.
+
+```
+papio actions retry-publisher <action-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--revision` | `int64` | `0` | revision the failed action had when you listed it |
+
 ## `papio activity`
 
 Show recent daemon activity

@@ -874,7 +874,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 	open.Flags().Int64Var(&openActionID, "action", 0, "open only this action id")
 
 	resolve.Flags().BoolVar(&reject, "reject", false, "reject the identity review")
-	command.AddCommand(list, resolve, dismiss, open)
+	command.AddCommand(list, resolve, dismiss, open, publisherRetryCommand(opt))
 	return command
 }
 

@@ -7899,22 +7899,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		// This cleanup is best-effort like route suppression below. The outcome
 		// still has to resolve the user's handoff if bookkeeping is unavailable;
 		// doctor will continue to expose any lease that could not be retired.
-		if !b.materializationGenerationUnavailable {
-			attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
-			if attemptErr != nil {
-				log.Printf("papio: reading materialization attempt after %s for %s: %v", p.Outcome, jobID, attemptErr)
-			} else {
-				claim, _, claimErr := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.arbitration.generation())
-				switch {
-				case claimErr != nil:
-					log.Printf("papio: reading materialization claim after %s for %s: %v", p.Outcome, jobID, claimErr)
-				case claim != nil:
-					if retireErr := b.jobs.RetireMaterializationBindingAfterOutcome(ctx, claim.BindingID); retireErr != nil {
-						log.Printf("papio: retiring materialization binding after %s for %s: %v", p.Outcome, jobID, retireErr)
-					}
-				}
-			}
-		}
+		b.retireFinishedProviderBinding(ctx, jobID, p.Outcome)
 		// This exact route proved it cannot serve this work. Fence it before
 		// any requeue so a rediscovery pass cannot re-select the same tuple.
 		if err := b.suppressCurrentRoute(ctx, jobID, job.RouteSuppressionNoEntitlement, storedEvidenceID); err != nil {
@@ -7953,7 +7938,15 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		return b.leaveHandoff(ctx, jobID, job.StateUnavailable, p.Outcome)
 
 	case "wrong_work", "ui_changed":
+		// A diagnosed page failure ended this drive too. Keeping its live
+		// binding would block an explicit publisher retry until lease expiry.
+		// A security challenge remains owned by the human gate instead.
+		lowerDetail := strings.ToLower(p.Detail)
+		if p.Outcome == "wrong_work" || (!strings.Contains(lowerDetail, "captcha") && !strings.Contains(lowerDetail, "security")) {
+			b.retireFinishedProviderBinding(ctx, jobID, p.Outcome)
+		}
 		requiresAuth := true
+		publisherRoute := false
 		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
 		if err != nil {
 			return err
@@ -7962,6 +7955,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		for _, action := range actions {
 			if action.Kind == handoffActionKind {
 				requiresAuth = action.RequiresAuth
+				publisherRoute = job.IsPublisherHandoff(action)
 				break
 			}
 		}
@@ -7987,6 +7981,9 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 					detail += "; a sanitized page diagnostic is saved locally; run 'papio adapter captures' to inspect it"
 				}
 			}
+		}
+		if publisherRoute {
+			detail = job.PublisherHandoffDetail + "\n" + detail
 		}
 		// The page, rather than the original paywall, now blocks papio; whether
 		// that page needs a sign-in remains the resolved handoff's classification.
@@ -8058,7 +8055,46 @@ func hostSafetyDomain(prefix, target string) string {
 	return prefix + ":" + strings.ToLower(parsed.Hostname())
 }
 
+// retireFinishedProviderBinding releases the completed route's occupancy.
+// Effect permits are untouched: an unresolved effect still prevents a retry.
+func (b *Bridge) retireFinishedProviderBinding(ctx context.Context, jobID, outcome string) {
+	if !b.materializationGenerationUnavailable {
+		attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+		if attemptErr != nil {
+			log.Printf("papio: reading materialization attempt after %s for %s: %v", outcome, jobID, attemptErr)
+		} else {
+			claim, _, claimErr := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.arbitration.generation())
+			switch {
+			case claimErr != nil:
+				log.Printf("papio: reading materialization claim after %s for %s: %v", outcome, jobID, claimErr)
+			case claim != nil:
+				if retireErr := b.jobs.RetireMaterializationBindingAfterOutcome(ctx, claim.BindingID); retireErr != nil {
+					log.Printf("papio: retiring materialization binding after %s for %s: %v", outcome, jobID, retireErr)
+				}
+			}
+		}
+	}
+}
+
+func (b *Bridge) handoffURL(row job.Row, action job.HumanAction) string {
+	if job.IsPublisherHandoff(action) {
+		target, _ := app.PublisherHandoffURL(action, row)
+		return target
+	}
+	if target, ok := app.OABrowserHandoffURL(action.Detail); ok {
+		return target
+	}
+	if target, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
+		return target
+	}
+	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
+	return RouteURL(inst, row.Work)
+}
+
 func actionSafetyDomain(cfg config.Config, row job.Row, action job.HumanAction) string {
+	if target, ok := app.PublisherHandoffURL(action, row); ok {
+		return hostSafetyDomain("publisher", target)
+	}
 	if target, ok := app.OABrowserHandoffURL(action.Detail); ok {
 		return hostSafetyDomain("oa", target)
 	}
@@ -10383,7 +10419,7 @@ jobLoop:
 			heldIDs[id] = true
 			continue
 		}
-		directAction := true
+		directAction := !job.IsPublisherHandoff(action)
 		if _, ok := app.OABrowserHandoffURL(action.Detail); ok {
 			directAction = false
 		}
@@ -11727,14 +11763,7 @@ func (b *Bridge) browserOfferLatched(
 	domain := actionSafetyDomain(b.cfg, row, action)
 	offerHosts := b.browserOfferHosts(row, action, events)
 	landingHost := ""
-	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
-	offerURL := RouteURL(inst, row.Work)
-	if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
-		offerURL = oaURL
-	}
-	if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
-		offerURL = retrievalURL
-	}
+	offerURL := b.handoffURL(row, action)
 	landingHost = strings.ToLower(strings.TrimSpace(resolverHost(offerURL)))
 	if len(override) > 0 && override[0] != "" {
 		domain = override[0]
@@ -11793,13 +11822,7 @@ func (b *Bridge) browserOfferHosts(row job.Row, action job.HumanAction, events [
 		offerURL = strings.TrimSpace(directURL[0])
 	}
 	if offerURL == "" {
-		offerURL = RouteURL(inst, row.Work)
-		if target, ok := app.OABrowserHandoffURL(action.Detail); ok {
-			offerURL = target
-		}
-		if target, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
-			offerURL = target
-		}
+		offerURL = b.handoffURL(row, action)
 	}
 	hosts := make([]string, 0, 4)
 	offerHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(resolverHost(offerURL))), ".")
@@ -11958,16 +11981,7 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
 	offerURL := directURL
 	if offerURL == "" {
-		offerURL = RouteURL(inst, row.Work)
-		if oaURL, ok := app.OABrowserHandoffURL(action.Detail); ok {
-			offerURL = oaURL
-		}
-		if retrievalURL, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
-			// ADR-0017's 2026-08-07 amendment: a fulfilled document-delivery
-			// request's form-75 "View PDF" URL, not the institution's
-			// ordinary resolver route.
-			offerURL = retrievalURL
-		}
+		offerURL = b.handoffURL(row, action)
 	}
 	var events []map[string]any
 	if b.jobs != nil && row.ID != "" {
@@ -12011,7 +12025,20 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 		b.providerDriveEpochMu.Lock()
 		attempt, ordinal, ok := b.latestProviderDriveEpoch(row.ID)
 		domain := actionSafetyDomain(b.cfg, row, action)
-		if b.jobs != nil {
+		if job.IsPublisherHandoff(action) {
+			// A publisher retry must not inherit the failed resolver's epoch
+			// or safety domain. A newly offered epoch remains reusable.
+			retryAfterEpoch := false
+			for _, event := range events {
+				if event["kind"] == "browser.publisher_retry_requested" {
+					retryAfterEpoch = true
+				}
+				if event["kind"] == "browser.provider_drive_epoch_offered" {
+					retryAfterEpoch = false
+				}
+			}
+			forceNewEpoch = forceNewEpoch || retryAfterEpoch
+		} else if b.jobs != nil {
 			if durableDomain := b.latestHandoffSafetyDomain(row.ID); durableDomain != "" {
 				domain = durableDomain
 			}
@@ -12386,6 +12413,9 @@ func (b *Bridge) candidateSafetyDomain(ctx context.Context, key []byte, profileI
 	for _, action := range actions {
 		if action.Kind != handoffActionKind {
 			continue
+		}
+		if job.IsPublisherHandoff(action) {
+			return "publisher:doi.org", nil
 		}
 		url, ok := app.OABrowserHandoffURL(action.Detail)
 		if !ok {

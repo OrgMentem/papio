@@ -364,6 +364,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"actions.open": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return openActions(ctx, raw, system)
 		},
+		"actions.retry_publisher": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return retryPublisher(ctx, raw, system)
+		},
 		"actions.resolve": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return resolveAction(ctx, raw, system)
 		},

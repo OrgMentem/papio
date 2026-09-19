@@ -169,6 +169,26 @@ records a `browser.handoff_failed` event on the job (visible in
 capped by the handoff's authentication budget; past it the tab is left on the
 failure page for you and the job stays parked.
 
+### The resolver opens the wrong paper or an unusable page
+
+Inspect `papio jobs diagnose <job-id>` and `papio actions list --json`.
+For a manual-download action diagnosed as a wrong work, a missing adapter, or
+adapter drift, you can ask *papio* to try the paper's DOI route:
+
+```sh
+papio actions retry-publisher <action-id> --revision <revision>
+```
+
+Use the action's current revision from the listing. This requires a connected
+extension and delegated mode. It keeps the failed action and its evidence,
+then starts one publisher attempt on the same job. A pending sign-in, challenge,
+terms prompt, download, or unresolved browser effect blocks the retry. The DOI
+route may still require institutional access; it does not establish entitlement.
+
+Only one publisher retry is allowed per job. If that route also fails, Open
+keeps the publisher page available for manual work without starting another
+download attempt.
+
 ## Two browsers fight over *papio*
 
 With the extension enabled in more than one browser or profile, only one
@@ -345,4 +365,3 @@ WARN  quiesced_actions  3 human action(s) have gone quiet after waiting more tha
 If a handoff becomes inactive again, the library may not hold the title, the
 provider may have changed its login, or the DOI may be wrong. Check
 `papio jobs receipt <job-id>` before reopening it.
-

@@ -206,6 +206,15 @@ func classifyAction(action HumanAction, outcome, providerDetail string) ActionDi
 		result.Next = "inspect " + command + " for the request and its blockers"
 		return result
 	}
+	// A new publisher attempt owns the next step. The resolver's earlier
+	// failure remains evidence, but must not tell the operator to fetch the
+	// PDF manually while papio has just been asked to try it.
+	if action.Kind == "openurl_handoff" && IsPublisherHandoff(action) {
+		result.Reason = DiagnosisReasonInProgress
+		result.Why = "an explicit publisher retry is pending through the paper's DOI"
+		result.Next = "let the browser finish the publisher attempt; respond if it asks for sign-in or another human step"
+		return result
+	}
 	text := strings.ToLower(action.Detail + " " + providerDetail)
 	if strings.TrimSpace(outcome) != "" {
 		result.Source = "provider_outcome"

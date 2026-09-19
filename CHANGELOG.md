@@ -11,6 +11,12 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Retry a failed resolver route through the paper's DOI.**
+  `papio actions retry-publisher <action-id> --revision <revision>` starts one
+  publisher attempt after a wrong-page or adapter failure. The original action
+  and failure evidence remain available. Pending sign-ins, challenges, terms,
+  downloads, and unresolved effects block the retry; publisher access still
+  depends on the browser session's entitlement.
 - **A paper that failed to file into a non-Zotero library can now be found and
   filed again.** When `[hooks] on_ready` fails once (papis mid-upgrade, target
   volume unmounted, a timeout), the PDF was acquired but never filed, and no

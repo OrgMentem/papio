@@ -84,10 +84,27 @@ func validActionURL(value string) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
 }
 
+// PublisherHandoffURL is derived only from a job's validated DOI. A failed
+// resolver's page or diagnostic cannot supply a replacement navigation URL.
+func PublisherHandoffURL(action job.HumanAction, row job.Row) (string, bool) {
+	if !job.IsPublisherHandoff(action) {
+		return "", false
+	}
+	doi, err := work.NormalizeDOI(row.Work.DOI)
+	if err != nil {
+		return "", false
+	}
+	u := url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}
+	return u.String(), true
+}
+
 // ResolveHumanActionURL resolves the same fresh URL used by `papio actions
 // open`. It performs no caching; each call evaluates the action detail and
 // constructs a route from the current job and institution profile.
 func ResolveHumanActionURL(action job.HumanAction, row job.Row, instFor func(string) (config.Institution, bool)) (string, bool) {
+	if job.IsPublisherHandoff(action) {
+		return PublisherHandoffURL(action, row)
+	}
 	if direct, ok := OABrowserHandoffURL(action.Detail); ok {
 		return direct, true
 	}

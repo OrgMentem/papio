@@ -159,6 +159,11 @@ One line each; run `papio <command> --help` for the full flag set.
 - **`actions open --job <id>` / `--action <id>`** — Hand ONE parked job to the user's
   ordinary browser. `--dry-run` prints targets instead. Bare `actions open` opens the
   entire queue; never issue it.
+- **`actions retry-publisher <action-id> --revision <n>`** — With the user's
+  authorization, retry one wrong-page or adapter failure through the job's DOI.
+  This starts a browser attempt and preserves the earlier failure. It is limited
+  to one publisher retry per job and refuses pending gates or browser effects.
+  It does not establish publisher entitlement or authorize sign-in.
 - **`actions resolve <action-id> --accept|--reject`** — Settle one identity review, on
   the user's word.
 - **`actions dismiss <action-id> --revision <n>`** — Close an action permanently, and
