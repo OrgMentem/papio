@@ -49,6 +49,7 @@ function elementWords(node: Element): string {
     node.getAttribute("role") ?? "",
     node.getAttribute("href") ?? "",
     node.getAttribute("action") ?? "",
+    node.getAttribute("download") ?? "",
     node.getAttribute("type") ?? "",
   ];
   for (const attr of Array.from(node.attributes)) {
@@ -119,7 +120,7 @@ function cssIdentifier(value: string): string {
 }
 
 function cssString(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/[\r\n\f]/g, " ");
+  return value.replace(/[\\'\r\n\f]/g, (char) => `\\${char.charCodeAt(0).toString(16)} `);
 }
 
 function stablePath(node: Element): string {
@@ -142,19 +143,28 @@ function stablePath(node: Element): string {
   return parts.join(" > ");
 }
 
+const DOCUMENT_SCOPED_VALUE = /(?:TOKEN|[a-f0-9]{16,}|\d{7,})/i;
+
 function selectorsFor(node: Element): RankedSelector[] {
   const result: RankedSelector[] = [];
   const id = node.getAttribute("id")?.trim() ?? "";
   if (id !== "" && !id.includes("?")) {
-    const tokenPenalty = /(?:TOKEN|[a-f0-9]{16,}|\d{7,})/i.test(id) ? 35 : 0;
-    result.push({ score: 100 - tokenPenalty, selector: `#${cssIdentifier(id)}`, node });
+    if (!DOCUMENT_SCOPED_VALUE.test(id)) {
+      result.push({ score: 100, selector: `#${cssIdentifier(id)}`, node });
+    } else {
+      // The sanitizer preserves semantic ID prefixes but masks the record suffix.
+      // An exact TOKEN selector could pass the fixture and never match a live page.
+      const prefix = /^(.+[_-])TOKEN$/.exec(id)?.[1];
+      if (prefix !== undefined && !DOCUMENT_SCOPED_VALUE.test(prefix)) {
+        result.push({ score: 85, selector: `${node.tagName.toLowerCase()}[id^='${cssString(prefix)}']`, node });
+      }
+    }
   }
 
   for (const attr of Array.from(node.attributes)) {
-    if (!attr.name.startsWith("data-") || attr.value.trim() === "" || attr.value.includes("?")) continue;
-    const valuePenalty = /(?:TOKEN|[a-f0-9]{16,})/i.test(attr.value) ? 25 : 0;
+    if (!attr.name.startsWith("data-") || attr.value.trim() === "" || attr.value.includes("?") || DOCUMENT_SCOPED_VALUE.test(attr.value)) continue;
     result.push({
-      score: 80 - valuePenalty,
+      score: 80,
       selector: `${node.tagName.toLowerCase()}[${attr.name}='${cssString(attr.value)}']`,
       node,
     });
@@ -162,13 +172,13 @@ function selectorsFor(node: Element): RankedSelector[] {
 
   const tag = node.tagName.toLowerCase();
   const name = node.getAttribute("name")?.trim() ?? "";
-  if (name !== "" && !name.includes("?") && ["meta", "input", "form"].includes(tag)) {
+  if (name !== "" && !name.includes("?") && !DOCUMENT_SCOPED_VALUE.test(name) && ["meta", "input", "form"].includes(tag)) {
     result.push({ score: 78, selector: `${tag}[name='${cssString(name)}']`, node });
   }
 
   result.push({ score: 60, selector: stablePath(node), node });
 
-  const classes = Array.from(node.classList).filter((value) => value !== "" && !value.includes("?"));
+  const classes = Array.from(node.classList).filter((value) => value !== "" && !value.includes("?") && !DOCUMENT_SCOPED_VALUE.test(value));
   for (const className of classes.slice(0, 4)) {
     result.push({
       score: Math.max(10, 42 - Math.max(0, classes.length - 1) * 6),
@@ -296,25 +306,48 @@ export function synthesizeAdapterRepair(
     const prior = bySelector.get(item.selector);
     if (prior === undefined || item.score > prior.score) bySelector.set(item.selector, item);
   }
+  const expected = expectedWorkFor(doc, spec);
+  const hasFixtureIdentity = ruleKind !== "article" || expected.doi !== undefined || expected.title !== undefined;
+  // A PDF control proves nothing about a separate missing access/identity
+  // check. Such candidates may classify, but must not unlock a source patch.
+  const repairsDeclaredTarget = ruleKind !== "article" || replaceSelector === null ||
+    replaceSelector === spec.download?.selector ||
+    replaceSelector === spec.download?.shadowSelector ||
+    replaceSelector === spec.download?.postClickWaitFor ||
+    replaceSelector === spec.download?.followupSelector ||
+    replaceSelector === spec.download?.workTarget?.selector;
 
   const candidates = Array.from(bySelector.values())
-    .sort((a, b) => b.score - a.score || a.selector.localeCompare(b.selector))
-    .slice(0, Math.max(0, limit))
     .map((item): SelectorCandidate => {
       const trial = candidateSpec(spec, ruleIndex, replaceSelector, item.selector);
-      const expected = expectedWorkFor(doc, spec);
       const planned = planExecution(doc, trial, expected, {});
       const classifierVerified = verdictOf(planned).kind === ruleKind;
-      const hasFixtureIdentity = ruleKind !== "article" || expected.doi !== undefined || expected.title !== undefined;
+      // An executable same-origin href can still be the HTML "Full text" tab
+      // or a citation export. Only PDF-specific affordances can unlock an
+      // article repair proposal; live bytes still need maintainer verification.
+      const hasPDFAffordance = ruleKind !== "article" || /pdf/i.test(elementWords(item.node));
+      // A PDF viewer tab may have a stable id while the actual download has a
+      // document-scoped one. Prefer the explicit download before id stability.
+      const explicitPDFDownload = ruleKind === "article" && (
+        /\.pdf$/i.test(item.node.getAttribute("download") ?? "") ||
+        [item.node.textContent, ...["title", "aria-label", "id", "class"].map((name) => item.node.getAttribute(name))]
+          .some((value) => /(?:download[\s_-]*pdf|pdf[\s_-]*download)/i.test(value ?? ""))
+      );
       return {
-        score: item.score,
+        score: item.score + (explicitPDFDownload ? 100 : 0),
         selector: item.selector,
         outer_html: truncateOuterHTML(item.node),
         classifier_verified: classifierVerified,
-        plan_complete: classifierVerified && hasFixtureIdentity && !("assisted" in planned),
+        plan_complete: classifierVerified && hasFixtureIdentity && repairsDeclaredTarget && hasPDFAffordance && !("assisted" in planned),
         replace_selector: replaceSelector,
       };
-    });
+    })
+    // A lexical score cannot prove that a control downloads the article. Verify
+    // before limiting output, or generic full-text controls can hide every repair.
+    .sort((a, b) => Number(b.plan_complete) - Number(a.plan_complete) ||
+      Number(b.classifier_verified) - Number(a.classifier_verified) ||
+      b.score - a.score || a.selector.localeCompare(b.selector))
+    .slice(0, Math.max(0, limit));
 
   return { provider: spec.id, scenario, rule_kind: ruleKind, rule_index: ruleIndex, candidates };
 }

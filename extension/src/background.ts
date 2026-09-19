@@ -1447,6 +1447,9 @@ export interface BridgeDeps {
      * local to the extension/browser and is never put in a native frame. */
     download(options: {
       url: string;
+      method?: "POST";
+      body?: string;
+      headers?: { name: string; value: string }[];
       filename?: string;
       conflictAction: "uniquify";
       saveAs: false;
@@ -2130,7 +2133,7 @@ export async function resolveDownloadURL(
 export async function executePlannedPageEffect(
   plan: Plan,
   rule: {
-    method: "href" | "click" | "url" | "api" | "meta";
+    method: "href" | "click" | "url" | "api" | "meta" | "post";
     metaName?: string;
     followupSelector?: string;
     postClickTimeoutMs?: number;
@@ -2635,7 +2638,7 @@ export async function executePlannedPageEffect(
       control.click();
       return { ok: true };
     }
-    const followup = graph.followup_target;
+    const followup = orNull(graph.followup_target);
     if (followup === null && rule.followupSelector !== undefined)
       return { ok: false };
     let followupSelector: string | null = null;
@@ -2756,6 +2759,25 @@ export async function executePlannedPageEffect(
         `the plan's required consequence is ${String(plan.required_consequence)}, not download`,
       );
     return { ok: true, url: downloadURL };
+  }
+  if (rule.method === "post") {
+    const form = target as HTMLFormElement;
+    const raw = target.getAttribute("action")?.trim() ?? "";
+    if (
+      plan.method !== "post" || plan.required_consequence !== "download" ||
+      target.tagName.toUpperCase() !== "FORM" ||
+      target.getAttribute("method")?.toLowerCase() !== "post" ||
+      form.elements?.length !== 0 || raw === "" ||
+      (target.getAttribute("enctype") ?? "application/x-www-form-urlencoded").toLowerCase() !== "application/x-www-form-urlencoded"
+    ) return no("PDF POST requires the planned empty URL-encoded POST form");
+    try {
+      const url = new URL(raw, location.href);
+      if (url.protocol !== "https:" || url.origin !== location.origin ||
+          url.username !== "" || url.password !== "" || !/\.pdf$/i.test(url.pathname) ||
+          url.href !== plan.url)
+        return no("the PDF POST action no longer matches its planned same-origin endpoint");
+      return { ok: true, url: url.href };
+    } catch { return no("the PDF POST action is invalid"); }
   }
   const raw =
     target.getAttribute(rule.method === "meta" ? "content" : "href") ?? "";
@@ -13862,7 +13884,7 @@ export class Bridge {
       current === undefined ||
       !this.handoffDrives.has(jobID) ||
       current.tab_id < 0 ||
-      current.status !== "accepted" ||
+      (current.status !== "accepted" && current.status !== "awaiting_download") ||
       !this.hasDelegatedAuthority(current) ||
       current.generic_terminal === true ||
       this.downloads.has(jobID)
@@ -19399,10 +19421,14 @@ export class Bridge {
   }
 
   private async runGenericOnSettledUnknown(job: ActiveJob): Promise<boolean> {
+    // Auth return advances a live handoff to awaiting_download. That is still
+    // a provider landing: requiring accepted here (and at the two execution
+    // gates) discarded valid PDF candidates after a successful sign-in.
+    // The exact daemon epoch, active drive, and download latch remain required.
     if (
       this.handoffDrives.has(job.job_id) === false ||
       job.tab_id < 0 ||
-      job.status !== "accepted" ||
+      (job.status !== "accepted" && job.status !== "awaiting_download") ||
       (job.access_mode !== "delegated" && job.access_mode !== "assisted")
     ) {
       return false;
@@ -19484,7 +19510,7 @@ export class Bridge {
       current === undefined ||
       !this.handoffDrives.has(jobID) ||
       current.tab_id < 0 ||
-      current.status !== "accepted" ||
+      (current.status !== "accepted" && current.status !== "awaiting_download") ||
       current.access_mode !== "delegated"
     ) {
       return;
@@ -20274,6 +20300,11 @@ export class Bridge {
             try {
               const id = await this.deps.downloads.download({
                 url,
+                ...(dl.method === "post" ? {
+                  method: "POST" as const,
+                  body: "",
+                  headers: [{ name: "Content-Type", value: "application/x-www-form-urlencoded" }],
+                } : {}),
                 filename: jobDownloadFilename(jobID),
                 conflictAction: "uniquify",
                 saveAs: false,

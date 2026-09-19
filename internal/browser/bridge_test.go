@@ -2639,35 +2639,52 @@ func TestFocusHandoffsEmitsOnceAtAndAboveExtensionFloor(t *testing.T) {
 // with NO drive authority: papio must not race the person it just asked to do
 // the work.
 func TestFocusHandoffsOffersAManualDownloadWithoutDriveAuthority(t *testing.T) {
-	b, jobs, _, _ := newBridge(t)
-	ctx := context.Background()
-	id := parkManualDownload(t, jobs, "wr_focus_manual", handoffWork())
-	runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{"extension_version": HandoffFocusMinExtensionVersion}))
+	for _, capable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("materialization=%t", capable), func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			ctx := context.Background()
+			id := parkManualDownload(t, jobs, "wr_focus_manual", handoffWork())
+			greeting := helloAs(HandoffFocusMinExtensionVersion)
+			if capable {
+				greeting = materializationHello(t)
+			}
+			initial, _ := runSync(t, b, greeting)
+			if countJobOffersFor(initial, id) != 0 {
+				t.Fatal("manual download offered without an explicit open")
+			}
 
-	queued, sessionLive, err := b.FocusHandoffs(ctx, []string{id})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !sessionLive || queued != 1 {
-		t.Fatalf("focus result = queued:%d live:%t, want 1,true — a manual download is focusable", queued, sessionLive)
-	}
+			queued, sessionLive, err := b.FocusHandoffs(ctx, []string{id})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sessionLive || queued != 1 {
+				t.Fatalf("focus result = queued:%d live:%t, want 1,true — a manual download is focusable", queued, sessionLive)
+			}
 
-	msgs, _ := runSync(t, b)
-	focus := firstOfType(msgs, protocol.MsgHandoffFocus)
-	if focus == nil || focus.JobID != id {
-		t.Fatalf("focus frame = %#v, want job %q", focus, id)
-	}
-	offer := firstOfType(msgs, protocol.MsgJobOffer)
-	if offer == nil || offer.JobID != id {
-		t.Fatalf("offer frame = %#v, want job %q", offer, id)
-	}
-	payload, ok := offer.Payload.(*protocol.JobOfferPayload)
-	if !ok {
-		t.Fatalf("offer payload = %T, want *protocol.JobOfferPayload", offer.Payload)
-	}
-	// The whole point of the change: a route, not the bare canonical link.
-	if payload.OpenURL == "" {
-		t.Fatal("offer carries no OpenURL, so the human is sent nowhere")
+			msgs, _ := runSync(t, b)
+			focus := firstOfType(msgs, protocol.MsgHandoffFocus)
+			if focus == nil || focus.JobID != id {
+				t.Fatalf("focus frame = %#v, want job %q", focus, id)
+			}
+			offer := firstOfType(msgs, protocol.MsgJobOffer)
+			if offer == nil || offer.JobID != id {
+				t.Fatalf("offer frame = %#v, want job %q", offer, id)
+			}
+			payload, ok := offer.Payload.(*protocol.JobOfferPayload)
+			if !ok {
+				t.Fatalf("offer payload = %T, want *protocol.JobOfferPayload", offer.Payload)
+			}
+			if payload.OpenURL == "" {
+				t.Fatal("offer carries no OpenURL, so the human is sent nowhere")
+			}
+			if payload.DriveAttemptID != "" || countType(msgs, protocol.MsgInstitutionalCandidateOffer) != 0 {
+				t.Fatal("manual download received automatic drive authority")
+			}
+			later, _ := runSync(t, b)
+			if countJobOffersFor(later, id) != 0 || countType(later, protocol.MsgHandoffFocus) != 0 {
+				t.Fatal("manual handoff repeated without another explicit open")
+			}
+		})
 	}
 }
 

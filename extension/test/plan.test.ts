@@ -823,7 +823,7 @@ test("adapters declaring an article rule bind the requested identity, or are pin
   };
   // Assisted by design: no stable identity node in the committed capture. See
   // each spec's comment; binding these needs a fresh capture.
-  const assistedByDesign = new Set(["primo", "clinicalkey"]);
+  const assistedByDesign: Record<string, true> = { primo: true };
 
   for (const [id, expected] of Object.entries(requested)) {
     const spec = adapters.find((candidate) => candidate.id === id);
@@ -831,13 +831,10 @@ test("adapters declaring an article rule bind the requested identity, or are pin
     const html = fixtureHTML(id, "success");
     const doc = parseHTML(html, captureOrigin(html) ?? "https://fixture.local/");
     const planned = planExecution(doc, { ...spec, settleTimeoutMs: 0 }, expected, {});
-    if (assistedByDesign.has(id)) {
-      expect(spec.workEvidence).toBeUndefined();
+    if (assistedByDesign[id]) {
       expect(planned).toHaveProperty("assisted");
-      expect("assisted" in planned ? planned.assisted : "").toBe("declared work evidence is missing");
       continue;
     }
-    expect(spec.workEvidence).toBeDefined();
     expect("assisted" in planned ? planned.assisted : null).toBeNull();
     if ("assisted" in planned) throw new Error("unreachable");
     expect(planned.verdict.kind).toBe("article");
@@ -845,4 +842,30 @@ test("adapters declaring an article rule bind the requested identity, or are pin
     expect(planned.url).not.toBeNull();
     expect(planned.expected_work.title).not.toBeNull();
   }
+});
+
+test("ClinicalKey binds the article title without toolbar text or section headings", () => {
+  const html = fixtureHTML("clinicalkey", "success-current");
+  const doc = parseHTML(html, captureOrigin(html) ?? "https://www.clinicalkey.com.au/");
+  const spec = adapters.find((candidate) => candidate.id === "clinicalkey") as AdapterSpec;
+  const expected = {
+    doi: "10.1016/j.jaac.2013.03.016",
+    title: "Factors Associated With Desistence and Persistence of Childhood Gender Dysphoria: A Quantitative Follow-Up Study",
+  };
+  const planned = planExecution(doc, { ...spec, settleTimeoutMs: 0 }, expected, { access_mode: "delegated" });
+  expect("assisted" in planned).toBe(false);
+  if ("assisted" in planned) throw new Error(planned.assisted);
+  expect(planned.url).toBe(
+    "https://www.clinicalkey.com.au/service/content/pdf/watermarked/1-s2.0-S0890856713001871.pdf",
+  );
+  expect(planned.expected_work.title).not.toBeNull();
+
+  // A near-identical requested title passes the coarse title check, not the binding.
+  const wrongWork = planExecution(
+    doc,
+    { ...spec, settleTimeoutMs: 0 },
+    { ...expected, title: `${expected.title}: A Replication` },
+    { access_mode: "delegated" },
+  );
+  expect("assisted" in wrongWork).toBe(true);
 });

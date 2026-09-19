@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"papio/internal/work"
@@ -149,6 +150,28 @@ func TestDiagnoseKnownAdapterDrift(t *testing.T) {
 	}
 	if diagnosis.AdapterID != "sciencedirect" || diagnosis.AdapterVersion != "0.4.0" {
 		t.Fatalf("adapter = %s@%s", diagnosis.AdapterID, diagnosis.AdapterVersion)
+	}
+}
+
+func TestDiagnoseDocumentDeliveryUsesRequestInsteadOfProviderHistory(t *testing.T) {
+	action := HumanAction{ID: 9, JobID: "job_test", Kind: ActionKindDocumentDelivery, Status: "open", RequiresAuth: true}
+	for _, outcome := range []string{"no_entitlement", "ui_changed"} {
+		t.Run(outcome, func(t *testing.T) {
+			events := []map[string]any{{
+				"kind":   "browser.provider_outcome",
+				"detail": map[string]any{"outcome": outcome, "adapter_id": "primo"},
+			}}
+			diagnosis := Diagnose(diagnosisRow(StateAwaitingHuman), []HumanAction{action}, events)
+			if diagnosis.Reason != "document_delivery" || diagnosis.Source != "action" {
+				t.Fatalf("delivery diagnosis follows stale provider history: %+v", diagnosis)
+			}
+			if diagnosis.NeedsBrowser || diagnosis.CanRetry || diagnosis.Action == nil || diagnosis.Action.CanOpenAction {
+				t.Fatalf("delivery diagnosis recommends an unrelated browser operation: %+v", diagnosis)
+			}
+			if !strings.Contains(diagnosis.Next, "papio delivery get job_test") {
+				t.Fatalf("delivery diagnosis does not identify its request: %q", diagnosis.Next)
+			}
+		})
 	}
 }
 

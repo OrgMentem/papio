@@ -16,6 +16,7 @@ const (
 	DiagnosisReasonHumanAuthRequired      = "human_auth_required"
 	DiagnosisReasonTermsRequired          = "terms_acceptance_required"
 	DiagnosisReasonIdentityReview         = "identity_review"
+	DiagnosisReasonDocumentDelivery       = "document_delivery"
 	DiagnosisReasonRetryWait              = "retry_wait"
 	DiagnosisReasonInProgress             = "in_progress"
 	DiagnosisReasonComplete               = "complete"
@@ -40,6 +41,7 @@ var diagnosisReasons = map[string]bool{
 	DiagnosisReasonHumanAuthRequired:      true,
 	DiagnosisReasonTermsRequired:          true,
 	DiagnosisReasonIdentityReview:         true,
+	DiagnosisReasonDocumentDelivery:       true,
 	DiagnosisReasonRetryWait:              true,
 	DiagnosisReasonInProgress:             true,
 	DiagnosisReasonComplete:               true,
@@ -191,6 +193,18 @@ func classifyAction(action HumanAction, outcome, providerDetail string) ActionDi
 		Source:        "action",
 		CanOpenAction: action.Status == "open" && (action.Kind == "manual_download" || action.Kind == "openurl_handoff"),
 		NeedsBrowser:  action.Kind == "manual_download" || action.Kind == "openurl_handoff" || action.Kind == "human_auth_required" || action.Kind == "terms_acceptance_required",
+	}
+	// The current delivery request owns the next step. Earlier browser failures
+	// explain how it got here, not what the operator should do now.
+	if action.Kind == ActionKindDocumentDelivery {
+		result.Reason = DiagnosisReasonDocumentDelivery
+		result.Why = "document delivery needs attention"
+		command := "papio delivery get"
+		if action.JobID != "" {
+			command += " " + action.JobID
+		}
+		result.Next = "inspect " + command + " for the request and its blockers"
+		return result
 	}
 	text := strings.ToLower(action.Detail + " " + providerDetail)
 	if strings.TrimSpace(outcome) != "" {

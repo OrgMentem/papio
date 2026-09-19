@@ -1338,15 +1338,73 @@ test.skipIf(psycnetPaywall === null)(
   },
 );
 
-const annualReviewsArticle = loadFixture("annualreviews", "success");
-test.skipIf(annualReviewsArticle === null)(
-  "captured Annual Reviews OA page classifies through its PDF POST control",
-  () => {
+for (const [scenario, title] of [
+  ["success", "Variable Importance Without Impossible Data"],
+  ["marker-only", "Motivational Interviewing"],
+] as const) {
+  test(`Annual Reviews ${scenario} capture plans its PDF control for the requested work`, () => {
     const spec = adapters.find((a) => a.id === "annualreviews") as AdapterSpec;
-    expect(classifyFixture(annualReviewsArticle as Document, spec).kind).toBe("article");
-    expect(spec.download?.method).toBe("click");
-  },
-);
+    const page = loadFixture("annualreviews", scenario)!;
+    const result = planExecution(page, spec, { title }, {});
+    expect("assisted" in result).toBe(false);
+    if ("assisted" in result) throw new Error(result.assisted);
+    expect(result.method).toBe("post");
+    expect(result.url).toContain(".pdf");
+  });
+}
+
+test("Annual Reviews clicks a serialized plan once and refuses changed work evidence", async () => {
+  const href = "https://www.annualreviews.org/content/journals/10.1146/annurev.clinpsy.1.102803.143833";
+  const page = parseHTML(readFileSync(fixturePath("annualreviews", "marker-only"), "utf8"), href);
+  // Keep the original serialization regression for click adapters even after
+  // Annual Reviews moves to its empty POST endpoint.
+  const packaged = adapters.find((a) => a.id === "annualreviews") as AdapterSpec;
+  const spec: AdapterSpec = { ...packaged, download: {
+    ...packaged.download!, method: "click",
+    selector: "form.ft-download-content__form--pdf a[aria-label='Download PDF']",
+  } };
+  const planned = planExecution(
+    page,
+    spec,
+    { doi: "10.1146/annurev.clinpsy.1.102803.143833", title: "Motivational Interviewing" },
+    { access_mode: "delegated" },
+  );
+  if ("assisted" in planned) throw new Error(planned.assisted);
+  const serialized = JSON.parse(
+    JSON.stringify(planned, (_key, value) => value === null ? undefined : value),
+  ) as Plan;
+  let clicks = 0;
+  page.querySelector(planned.target_ref!.selector)!.addEventListener("click", (event) => {
+    event.preventDefault();
+    clicks += 1;
+  });
+  const previous = {
+    document: globalThis.document,
+    location: globalThis.location,
+    HTMLElement: globalThis.HTMLElement,
+  };
+  Object.assign(globalThis, {
+    document: page,
+    location: new URL(href),
+    HTMLElement: page.defaultView!.HTMLElement,
+  });
+  try {
+    expect(await executePlannedPageEffect(serialized, spec.download as DownloadRule)).toEqual({ ok: true });
+    expect(clicks).toBe(1);
+    page.querySelector("meta[name='citation_title']")!.setAttribute("content", "A different paper");
+    expect(await executePlannedPageEffect(serialized, spec.download as DownloadRule)).toMatchObject({ ok: false });
+    expect(clicks).toBe(1);
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test("Annual Reviews refuses a different requested work despite a valid PDF control", () => {
+  const spec = adapters.find((a) => a.id === "annualreviews") as AdapterSpec;
+  const page = loadFixture("annualreviews", "marker-only")!;
+  const result = planExecution(page, spec, { title: "An unrelated review of statistical methods" }, {});
+  expect("assisted" in result || result.required_consequence === "none").toBe(true);
+});
 
 test("Annual Reviews PDF controls without the OA marker stay assisted", () => {
   const spec = adapters.find((a) => a.id === "annualreviews") as AdapterSpec;
@@ -1359,6 +1417,20 @@ test("Annual Reviews PDF controls without the OA marker stay assisted", () => {
 });
 
 const oupArticle = loadFixture("oup", "success");
+test("Oxford's captured chapter wall requires sign-in despite PDF metadata", () => {
+  const spec = adapters.find(a => a.id === "oup")!;
+  const page = loadFixture("oup", "login-return")!;
+  const result = planExecution(page, spec, { title: "ERP Components: The Ups and Downs of Brainwave Recordings" }, {});
+  expect("assisted" in result).toBe(false);
+  if ("assisted" in result) throw new Error(result.assisted);
+  expect(result.verdict.kind).toBe("login");
+  expect(result.required_consequence).toBe("none");
+  expect(result.url).toBeNull();
+  // A header sign-in link by itself must not wall an entitled journal page.
+  const article = loadFixture("oup", "success")!;
+  article.body.appendChild(page.querySelector("a")!.cloneNode(true));
+  expect(classifyFixture(article, spec).kind).toBe("article");
+});
 test.skipIf(oupArticle === null)(
   "captured Oxford Academic OA article classifies through its PDF action",
   () => {
@@ -2122,6 +2194,45 @@ async function landOnProvider(
   await h.tabs.completeNavigation(tabID, url);
   return tabID;
 }
+
+test("Annual Reviews sends one job-bound POST download through the production plan and executor", async () => {
+  const spec = adapters.find(a => a.id === "annualreviews")!;
+  const href = "https://www.annualreviews.org/content/journals/10.1146/annurev.clinpsy.1.102803.143833";
+  const doc = parseHTML(readFileSync(fixturePath("annualreviews", "marker-only"), "utf8"), href);
+  const expected = { title: "Motivational Interviewing", doi: "10.1146/annurev.clinpsy.1.102803.143833" };
+  const h = makeMapHarness([spec]);
+  const execute = h.scripting.executeScript.bind(h.scripting);
+  h.scripting.executeScript = async injection => {
+    if (injection.func === planExecution) {
+      return [{ result: planExecution(doc, spec, expected, { access_mode: "delegated" }) }];
+    }
+    if (injection.func === executePlannedPageEffect) {
+      const previous = { document: globalThis.document, location: globalThis.location, HTMLElement: globalThis.HTMLElement };
+      Object.assign(globalThis, { document: doc, location: new URL(href), HTMLElement: doc.defaultView!.HTMLElement });
+      try {
+        return [{ result: await executePlannedPageEffect(injection.args![0] as Plan, spec.download!) }];
+      } finally { Object.assign(globalThis, previous); }
+    }
+    return execute(injection);
+  };
+  h.downloads.emitOnCreated = true;
+  h.downloads.determineBeforeReturn = true;
+  await h.bridge.start();
+  await h.port.inbound(offer("job_post_0001", expected, ["annualreviews.org"]));
+  await landOnProvider(h, "job_post_0001", "www.annualreviews.org", href);
+  expect(h.downloads.started).toHaveLength(1);
+  expect(h.downloads.started[0]).toMatchObject({
+    url: "https://www.annualreviews.org/deliver/fulltext/cp/1/1/annurev.clinpsy.1.102803.143833.pdf",
+    method: "POST", body: "", saveAs: false,
+    filename: "papio/job_post_0001/paper.pdf",
+    headers: [{ name: "Content-Type", value: "application/x-www-form-urlencoded" }],
+  });
+  await landOnProvider(h, "job_post_0001", "www.annualreviews.org", href);
+  expect(h.downloads.started).toHaveLength(1);
+  expect(h.downloads.items.get(701)?.filename).toBe("/Users/test/Downloads/papio/job_post_0001/out.pdf");
+  await h.downloads.onChanged.emit({ id: 701, state: { current: "complete" } });
+  expect(h.frames().find(frame => frame.type === "download_complete")?.job_id).toBe("job_post_0001");
+});
 
 test("auth return classifies the provider landing even without a complete event", async () => {
   // JSTOR-class providers end SSO with a soft-nav landing that carries no

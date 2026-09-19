@@ -285,6 +285,36 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A cited author no longer makes a short-title paper pass identity checks.**
+  A surname followed by a citation year before the printed title does not
+  establish authorship. If that is the only author evidence, papio holds the
+  PDF for review.
+- **PDF binding uses the complete title and its own byline.** A numeric title
+  marker cannot hide a different subtitle. An earlier title prefix cannot
+  supply author evidence for a later exact title.
+- **Open-access article handoffs survive resolver retries.** The daemon
+  preserves a skipped article page as a browser route before retrying an
+  unrelated resolver. It no longer loses that route when the candidate
+  leaves the pending queue.
+- **Job diagnosis directs document-delivery actions to their requests.**
+  `papio jobs diagnose` reports `document_delivery` and the scoped
+  `papio delivery get` command instead of `unknown` or an earlier browser
+  failure. It does not recommend opening or retrying a browser handoff.
+- **Manual downloads open on current browser sessions.** The daemon no
+  longer sends an explicit manual-download open into the automatic
+  materialization path, which has no candidate for that action. It sends
+  the institution's route and the focus request without automatic download
+  authority. Existing safety latches still apply.
+- **Adapter repair handles apostrophes in captured attributes.** It emits
+  CSS hexadecimal escapes that its offline selector parser accepts.
+  A ProQuest capture previously stopped the entire repair with a selector
+  parse error. The tool still requires work evidence before it reports a
+  complete plan.
+- **Adapter repair checks complete plans before limiting its proposals.**
+  A low-ranked working selector no longer disappears behind generic controls.
+  Proposals exclude redacted document tokens that would fail on a live page.
+  A PDF control cannot replace a separate access or identity check and unlock
+  a source patch.
 - **Status shows the paper and the next action.** It uses known titles rather
   than preferring identifiers, groups matching advice by institution profile
   and recorded provider, and keeps each job ID visible. Browser commands

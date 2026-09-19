@@ -311,6 +311,16 @@ const RESOLVE_URL_SIGNATURE = "const resolveURL = (rule: DownloadRule, target: E
 // re-sync this literal (and extractMetaURLMirror above) whenever the real code
 // legitimately changes — see the comment block above for the full procedure.
 const PINNED_RESOLVE_URL_SOURCE = `const resolveURL = (rule: DownloadRule, target: Element): string | null => {
+    if (rule.method === "post") {
+      const raw = target.getAttribute("action")?.trim() ?? "";
+      if (raw === "") return null;
+      try {
+        const url = new URL(raw, pageHref);
+        return url.protocol === "https:" && url.origin === new URL(pageHref).origin &&
+          url.username === "" && url.password === "" && /\\.pdf$/i.test(url.pathname)
+          ? url.href : null;
+      } catch { return null; }
+    }
     const raw = rule.method === "meta" ? target.getAttribute("content") : target.getAttribute("href");
     if (rule.method === "href" || rule.method === "meta") {
       const trimmed = raw?.trim() ?? "";

@@ -93,6 +93,38 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Adapter repair prefers the PDF download over a viewer tab.** Article
+  proposals require a PDF-specific affordance; HTML full-text links and
+  citation exports no longer qualify on their own. Explicit PDF downloads
+  rank ahead of viewer tabs even when the viewer has a more stable selector.
+- **Page-authored PDF routes continue after sign-in.** Generic acquisition now
+  accepts the live `awaiting_download` state reached on authentication return,
+  while retaining the exact daemon authorization and single-download guards.
+- **Annual Reviews downloads its PDF without a pop-up.** Papio uses the
+  page's empty PDF POST form through the browser download API. The result is
+  bound to the requesting job even when an older viewer window exists.
+  Forms with fields, changed endpoints, and pages without the full-text and
+  Open Access markers remain assisted.
+- **Oxford chapter sign-in walls no longer look like adapter drift.** A
+  captured chapter access wall with an institutional sign-in control is
+  recognized as login required. Its PDF metadata does not authorize a download.
+- **Click downloads tolerate an omitted empty follow-up target.** The executor
+  preserves a valid plan when browser serialization drops that null field.
+  It still refuses changed work evidence or a missing required follow-up.
+- **Annual Reviews accepts an Open Access marker without its text span.**
+  The adapter still requires the explicit access class, full-text container,
+  matching work, and the page's PDF control.
+- **Psychiatry Online binds the PDF link to the requested DOI.** A link for
+  another paper remains assisted, even when the page identifies the right work.
+- **Known adapter misses now produce repairable drift captures.** The daemon
+  still requires a separate provider outcome before it promotes the evidence.
+  Unknown providers keep development-only observations.
+
+- **ClinicalKey downloads now bind to the requested article.** The adapter
+  reads the title from the article header, without its toolbar text or section
+  headings. It selects the header's PDF link rather than the repeated link in
+  the sticky toolbar. A different title still prevents the download.
+
 - **Chrome navigation cancellations no longer end a working sign-in claim.**
   Chrome can report `net::ERR_ABORTED` when another navigation replaces the
   first. The extension now leaves the next page free to request sign-in,

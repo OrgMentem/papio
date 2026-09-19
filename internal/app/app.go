@@ -1687,6 +1687,12 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			// route (or the institutional handoff exhaustedCandidates builds).
 			if oaBrowserURL == "" && candidate.AccessBasis == resolver.AccessOpen && strings.HasPrefix(candidate.URL, "https://") {
 				oaBrowserURL = candidate.URL
+				// Non-direct rows become skipped below and never re-enter the
+				// pending queue. Preserve the route across an unrelated retry,
+				// with the same fresh-URL requirement as a blocked direct PDF.
+				if err := s.Jobs.RecordEvent(ctx, row.ID, oaBrowserHintEventKind, map[string]any{"url_key": stored.URLKey}); err != nil {
+					return err
+				}
 			}
 			_ = s.Jobs.MarkCandidate(ctx, stored.ID, "skipped")
 			continue

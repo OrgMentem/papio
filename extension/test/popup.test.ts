@@ -193,6 +193,9 @@ test("uses an honest pending-items label when counts-v3 is unavailable", () => {
 
 
 test("catch-up says newer Activity without an exact number across a retention gap", async () => {
+  // A prior fixture leaves both `document` and a chrome stub global. Keep this
+  // fresh module from running the real popup bootstrap and starting its timer.
+  Object.assign(globalThis, { chrome: undefined });
   const popup = await import(`../src/popup.ts?catchup-gap=${Date.now()}`);
   const doc = popupDocument();
   const storage = {
@@ -211,6 +214,9 @@ test("catch-up says newer Activity without an exact number across a retention ga
 });
 
 test("catch-up uses daemon new_count_since rather than the page size", async () => {
+  // The preceding catch-up fixture leaves a usable chrome.storage stub behind.
+  // Withhold it while this fresh module evaluates so its bootstrap stays quiet.
+  Object.assign(globalThis, { chrome: undefined });
   const popup = await import(`../src/popup.ts?catchup-count=${Date.now()}`);
   const doc = popupDocument();
   const storage = {

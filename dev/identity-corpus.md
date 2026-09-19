@@ -172,6 +172,13 @@ seconds of CPU — the extraction, not the matching, is the cost.
    it must not fall. A document that stops matching its own metadata is a
    new false negative your change introduced.
 
+The citation boundary needs a separate regression: a requested surname
+followed by a citation year before the printed title does not establish
+authorship. When that supplies the only author evidence, `MatchIdentity`
+returns review. A short title followed by its actual byline can still pass.
+Candidate binding also scopes authors to the strict title match and rejects
+additional title words after a numeric marker.
+
 The absolute counts are **not** comparable across machines or across
 different people's runs — a Zotero library is one person's collection, so
 its size, its authors, and its title collisions are specific to it. Only
@@ -269,7 +276,7 @@ paper costs a human a moment of review; papio filing the wrong paper costs
 a library its trust.
 
 **The two wrong accepts that survive, and why they're hard.** Both print
-the requested title as a genuinely delimited line, so `titlePrintedAsLine`
+the requested title as a genuinely delimited line, so `printedTitleLine`
 has no way to tell them from an original: a technical report prints the
 requested title inside its own contents list, and a review paper prints it
 as one of its section headings. Neither is a label, a wrapped title, or a

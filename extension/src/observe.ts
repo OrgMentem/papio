@@ -1,9 +1,10 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Automatic, rate-limited capture of unknown provider pages. This is strictly
-// development material: it is only reachable from a broker-owned handoff tab
-// whose host passed the same offer-or-registry gate as classification.
+// Automatic, rate-limited capture of unknown provider pages. Known adapters
+// supply drift evidence; unknown providers supply development observations.
+// Both require a broker-owned tab and the classification host gate.
 
 import {
+  PROVIDERS,
   capturePage,
   encodePageCapture,
   residualLeak,
@@ -212,10 +213,15 @@ export function observeUnknown(
       return;
     }
     if (!hostMatches(pageHost, context.verifiedHosts) || pageHost.toLowerCase() !== host.toLowerCase()) return;
+    // A known adapter's miss belongs to its repair scenario. The daemon still
+    // requires a separate, durable provider outcome before promoting evidence.
+    const provider = PROVIDERS.find((id) => id === context.adapterID);
+    const meta = provider === undefined
+      ? { provider: hostKey, scenario: "observed" as const }
+      : { provider, scenario: "drift" as const };
 
     const sanitized = sanitizeFixture(page.html, {
-      provider: hostKey,
-      scenario: "observed",
+      ...meta,
       originNoQuery: `${page.origin}${page.path}`,
       capturedISO: capturedAt.toISOString(),
     });
@@ -237,7 +243,7 @@ export function observeUnknown(
 
     const encoded = await encodePageCapture(sanitized, {
       host: pageHost,
-      scenario: "observed",
+      scenario: meta.scenario,
       ...(context.adapterID === undefined ? {} : { adapterID: context.adapterID }),
       ...(context.adapterVersion === undefined ? {} : { adapterVersion: context.adapterVersion }),
       jobID: job.job_id,

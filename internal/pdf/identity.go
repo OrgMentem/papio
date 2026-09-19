@@ -235,25 +235,28 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	// It is a REQUIREMENT for the final pass, not a substitute for the token
 	// gate above: a scan whose title line is garbled still reaches review or a
 	// corroborated pass on its printed identifier, never a discard.
-	titlePrinted := titlePrintedAsLine(bylineSegments(bylineText), identityTitlePhrase(target.Title))
+	segments := bylineSegments(bylineText)
+	titleLine, titlePrinted := printedTitleLine(segments, identityTitlePhrase(target.Title))
 	if titlePrinted {
 		evidence = append(evidence, "requested title printed as a line in the front matter")
 	}
 
 	exact, prefixed, numbered := 0, 0, 0
+	citationOnly := false
 	for _, author := range target.Authors {
-		switch family := familyToken(author); {
-		case family == "":
-		case bylineHasExactly(byline, family):
+		family := familyToken(author)
+		if family == "" {
+			continue
+		}
+		exactMatch, markedMatch, numericMatch, cited := bylineAuthorMatch(segments, family, titleLine, titlePrinted)
+		citationOnly = citationOnly || cited
+		switch {
+		case exactMatch:
 			exact++
 			evidence = append(evidence, "author family name matched: "+family)
-		default:
-			marked, numeric := bylineMarkedSurname(byline, family)
-			if !marked {
-				continue
-			}
+		case markedMatch:
 			prefixed++
-			if numeric {
+			if numericMatch {
 				numbered++
 			}
 			evidence = append(evidence, "author family name matched with an affiliation marker: "+family)
@@ -324,6 +327,8 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 	}
 
 	switch {
+	case !authorOK && citationOnly:
+		return capReview(append(evidence, "requested author family name appears only in a surname-year citation before the printed title")...)
 	case !authorOK && prefixed > 0:
 		return capReview(append(evidence, "only a prefix of one author's family name appears in the front matter")...)
 	case !authorOK:
@@ -361,6 +366,11 @@ type titleSegment struct {
 	// for a colon.
 	breaks []bool
 	labels []bool
+}
+
+type printedTitleMatch struct {
+	segment int
+	offset  int
 }
 
 // bylineSegments returns the byline window as the runs a publisher printed on
@@ -434,7 +444,7 @@ func splitTitleSegment(run string) titleSegment {
 // label cap exists to refuse.
 const labelTerminators = ":.|\u2022\u00b7"
 
-// titlePrintedAsLine reports whether phrase is printed as a delimited unit:
+// printedTitleLine locates phrase when it is printed as a delimited unit:
 // beginning where a segment begins or a short label ended, and ending where a
 // segment ends or punctuation begins. A title that wraps spans consecutive
 // segments, so intermediate segments must be consumed whole.
@@ -447,9 +457,9 @@ const labelTerminators = ":.|\u2022\u00b7"
 // label is short where a sentence is not.
 const titleLabelWords = 3
 
-func titlePrintedAsLine(segments []titleSegment, phrase string) bool {
+func printedTitleLine(segments []titleSegment, phrase string) (printedTitleMatch, bool) {
 	if phrase == "" {
-		return false
+		return printedTitleMatch{}, false
 	}
 	for start, segment := range segments {
 		for offset := range min(len(segment.words), titleLabelWords+1) {
@@ -457,11 +467,11 @@ func titlePrintedAsLine(segments []titleSegment, phrase string) bool {
 				continue
 			}
 			if titleRunMatches(segments[start:], offset, phrase) {
-				return true
+				return printedTitleMatch{segment: start, offset: offset}, true
 			}
 		}
 	}
-	return false
+	return printedTitleMatch{}, false
 }
 
 // titleRunMatches compares the printed words against the title as one character
@@ -1086,6 +1096,40 @@ func bylineHasExactly(byline map[string]struct{}, family string) bool {
 	return ok
 }
 
+// bylineAuthorMatch distinguishes a byline name from a citation that only
+// happens to sit inside the same byte window. A title phrase can begin a
+// wrapped prose line and therefore satisfy printedTitleLine. When the only
+// requested surname before that line is immediately followed by a year, the
+// surname and title are evidence about a cited work, not this document's
+// authorship. The evidence remains sufficient for review, but not for a pass.
+func bylineAuthorMatch(segments []titleSegment, family string, title printedTitleMatch, titlePrinted bool) (exact, marked, numeric, cited bool) {
+	for segmentIndex, segment := range segments {
+		for wordIndex, word := range segment.words {
+			exactMatch := word == family
+			markedMatch, numericMatch := markedSurnameToken(word, family)
+			if !exactMatch && !markedMatch {
+				continue
+			}
+			beforeTitle := segmentIndex < title.segment || segmentIndex == title.segment && wordIndex < title.offset
+			if titlePrinted && beforeTitle && wordIndex+1 < len(segment.words) && publicationYearToken(segment.words[wordIndex+1]) {
+				cited = true
+				continue
+			}
+			if exactMatch {
+				exact = true
+				continue
+			}
+			marked = true
+			numeric = numeric || numericMatch
+		}
+	}
+	return exact, marked, numeric, cited
+}
+
+func publicationYearToken(token string) bool {
+	return len(token) == 4 && (strings.HasPrefix(token, "19") || strings.HasPrefix(token, "20")) && isASCIIDigits(token)
+}
+
 // bylineMarkedSurname tolerates the superscript markers pdftotext glues onto a
 // byline surname — "Alejandro Barredo Arrietaa", "Siham Tabikg", "Keith D.
 // Ciani1". Every author of one real 12-author paper was marked this way, so
@@ -1100,19 +1144,24 @@ func bylineHasExactly(byline map[string]struct{}, family string) bool {
 // surname ends in a digit, so a token that is the requested surname followed
 // only by digits is that surname carrying an affiliation number.
 func bylineMarkedSurname(byline map[string]struct{}, family string) (marked, numeric bool) {
-	if len([]rune(family)) < 5 {
-		return false, false
-	}
 	for token := range byline {
-		if len(token) <= len(family) || len(token) > len(family)+2 || !strings.HasPrefix(token, family) {
+		tokenMarked, tokenNumeric := markedSurnameToken(token, family)
+		if !tokenMarked {
 			continue
 		}
 		marked = true
-		if isASCIIDigits(token[len(family):]) {
+		if tokenNumeric {
 			return true, true
 		}
 	}
 	return marked, false
+}
+
+func markedSurnameToken(token, family string) (marked, numeric bool) {
+	if len([]rune(family)) < 5 || len(token) <= len(family) || len(token) > len(family)+2 || !strings.HasPrefix(token, family) {
+		return false, false
+	}
+	return true, isASCIIDigits(token[len(family):])
 }
 
 func isASCIIDigits(s string) bool {

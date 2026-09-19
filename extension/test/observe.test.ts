@@ -116,7 +116,7 @@ test("unknown tracked provider page emits one sanitized observed page_capture fr
   expect(typeof storedState.digests[shapeKey]?.[0]).toBe("string");
 });
 
-test("a registry-only adapter host now passes the observed-capture gate", async () => {
+test("a registry-only adapter miss produces a canonical drift fixture", async () => {
   const offerHost = "resolver.example.edu";
   const adapterHost = "journals.sagepub.com";
   const fake = fakeChrome(pageFor(adapterHost));
@@ -137,9 +137,14 @@ test("a registry-only adapter host now passes the observed-capture gate", async 
   expect(fake.sent).toHaveLength(1);
   expect(fake.sent[0]?.payload).toMatchObject({
     host: adapterHost,
+    scenario: "drift",
     adapter_id: "sage",
     adapter_version: "1.2.3",
   });
+  const fixture = gunzipBase64(fake.sent[0]?.payload.body ?? "");
+  expect(fixture.split("\n")[0]).toBe(
+    '<!-- papio-fixture provider="sage" scenario="drift" origin="https://journals.sagepub.com/article/123" captured="2026-07-15T10:11:12.000Z" -->',
+  );
 });
 
 test("persisted per-shape and daily observation quotas prevent later captures", async () => {

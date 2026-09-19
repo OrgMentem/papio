@@ -22,6 +22,28 @@ When *papio* reaches a provider it does not understand, the extension waits for 
 
 This is enough for a maintainer or coding agent to implement the adapter without asking you to reverse-engineer selectors.
 
+For a known adapter that stops matching, the extension records a `drift`
+capture under the adapter's canonical name. The daemon marks it as independent
+evidence only after a separate provider outcome confirms the failure.
+Unknown providers keep `observed` captures for development.
+
+To inspect a repair proposal:
+
+```console
+papio adapter repair <capture-id-or-path>
+```
+
+The tool checks each proposal through the production planner before limiting
+the results. It excludes redacted identifiers from selectors. A PDF-control
+proposal cannot replace a separate access or identity check and unlock a
+source patch. Article proposals require a PDF-specific affordance and rank
+explicit PDF downloads ahead of viewer tabs. Generic full-text links and
+citation exports cannot qualify on their own. A complete plan proves neither
+entitlement nor PDF bytes.
+Review the access checks and the live file before applying a proposal.
+A wrong resolver destination or missing PDF control can require a route
+change instead of a selector change.
+
 ## Capture a specific scenario
 
 A code contribution normally needs at least an entitled `success` page. Login, terms, and no-entitlement states need separate captures when the adapter distinguishes them.
@@ -55,7 +77,7 @@ See [Privacy](../privacy.md) for the storage and disclosure boundary.
 
 1. Copy the reviewed capture to `extension/fixtures/<adapter-id>/<scenario>.html`.
 2. Add one `AdapterSpec` to `extension/src/adapters/types.ts`. Use stable IDs, paths, and provider-owned data attributes from the fixture. Do not classify from URL query parameters: fixture sanitization removes them.
-3. Add classification and download assertions to `extension/test/adapters.test.ts`. Include every captured scenario and the provider's exact download method (`href`, `click`, `url`, `api`, or `meta`).
+3. Add classification and download assertions to `extension/test/adapters.test.ts`. Include every captured scenario and the provider's exact download method (`href`, `click`, `url`, `api`, `meta`, or `post`). The `post` method accepts only an empty URL-encoded HTML POST form with an explicit same-origin HTTPS `.pdf` action. It downloads through the browser API without opening the form's target window; forms containing fields remain assisted.
 4. Run the focused checks:
 
     ```console

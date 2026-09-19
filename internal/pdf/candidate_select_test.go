@@ -159,7 +159,7 @@ func TestQualifyCandidateTitleNotPrintedAsLineDisqualified(t *testing.T) {
 		Bound: []string{"10.1234/abcd.1"},
 	}
 	// Tokens are present but the title is not printed as a delimited line:
-	// it appears quoted inside a citing sentence, which titlePrintedAsLine
+	// it appears quoted inside a citing sentence, which printedTitleLine
 	// must refuse (no label terminator, offset would exceed the 3-word cap).
 	text := "We extend and update the earlier work that cites \"Quantum Networks Robustness Calibration Measurement\" for guidance.\n" +
 		"Ada Lovelace (2026)\n" +
@@ -525,15 +525,17 @@ func TestQualifyCandidateStrictPrefixTitleDisqualified(t *testing.T) {
 	// Document's real title is "Target Title: A Different Study" — candidate
 	// "Target Title" is a strict prefix across a subtitle boundary. For
 	// single-target verification leniency is right; for 1-of-N it must abstain.
-	text := "Target Title: A Different Study\n" +
-		"Ada Lovelace (2026)\n" +
-		"DOI: 10.1234/abcd.1\n\nAbstract\n"
-	got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
-	if got.Qualifies {
-		t.Fatalf("want Qualifies false for strict-prefix title, got %+v", got)
-	}
-	if !strings.Contains(got.Reason, "title_not_printed_as_line") {
-		t.Fatalf("want Reason title_not_printed_as_line for strict prefix, got %q", got.Reason)
+	for _, title := range []string{"Target Title: A Different Study", "Target Title1: A Different Study"} {
+		t.Run(title, func(t *testing.T) {
+			text := title + "\nAda Lovelace (2026)\nDOI: 10.1234/abcd.1\n\nAbstract\n"
+			got := QualifyCandidate(BindDocument{Excerpt: text}, candidate)
+			if got.Qualifies {
+				t.Fatalf("want Qualifies false for strict-prefix title, got %+v", got)
+			}
+			if !strings.Contains(got.Reason, "title_not_printed_as_line") {
+				t.Fatalf("want Reason title_not_printed_as_line for strict prefix, got %q", got.Reason)
+			}
+		})
 	}
 	// Exact-title document must still qualify: legitimate case still passes.
 	wExact := work.Work{
@@ -549,6 +551,17 @@ func TestQualifyCandidateStrictPrefixTitleDisqualified(t *testing.T) {
 	gotExact := QualifyCandidate(BindDocument{Excerpt: textExact}, candidateExact)
 	if !gotExact.Qualifies {
 		t.Fatalf("want Qualifies true for exact title, got %+v", gotExact)
+	}
+}
+
+func TestQualifyCandidateScopesAuthorAfterTheStrictTitle(t *testing.T) {
+	candidate := BindCandidate{Key: "job-title-scope", Work: work.Work{
+		Title: "Target Title", Authors: []string{"Ada Lovelace"}, Year: 2026, DOI: "10.1234/abcd.1",
+	}, Bound: []string{"10.1234/abcd.1"}}
+	text := "Target Title: A Different Study\nAda Lovelace (2026)\n" +
+		"Target Title\nAlan Turing (2026)\nDOI: 10.1234/abcd.1\n\nAbstract\n"
+	if got := QualifyCandidate(BindDocument{Excerpt: text}, candidate); got.Qualifies {
+		t.Fatalf("want the actual title's different author to prevent binding, got %+v", got)
 	}
 }
 

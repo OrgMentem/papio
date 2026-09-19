@@ -10693,7 +10693,10 @@ jobLoop:
 				delete(b.focusPending, id)
 				continue
 			}
-			if b.focusPending[id] && b.institutionalMaterializationAvailable() {
+			// Only institutional handoffs have materialization candidates. A manual
+			// download needs the URL-bearing offer and focus below, even when
+			// the holder supports materialization.
+			if handoff[id].Kind == handoffActionKind && b.institutionalMaterializationAvailable() {
 				frame, err := b.serviceMaterializationCandidate(ctx, id, row, handoff[id], accessMode, scheduledByJob, scheduledRawByJob)
 				if err != nil {
 					return nil, err

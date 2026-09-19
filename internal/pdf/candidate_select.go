@@ -235,7 +235,7 @@ func QualifyCandidate(doc BindDocument, candidate BindCandidate) CandidateQualif
 	// (identityByline) as a bag and treated any hit anywhere as positional
 	// evidence. documentTokens(bylineText) let a surname appearing only in the
 	// printed title or journal name satisfy "real author evidence", and
-	// titlePrintedAsLine accepted ANY matching segment, so a running head or
+	// printedTitleLine accepted ANY matching segment, so a running head or
 	// a right-column reference line glued by wide-gap recovery satisfied
 	// "exact printed title". Combined with a shared author family name, a
 	// compatible year and the target's DOI cited on page one, the wrong
@@ -306,18 +306,18 @@ func QualifyCandidate(doc BindDocument, candidate BindCandidate) CandidateQualif
 	//
 	// WHY stricter than MatchIdentity: MatchIdentity's corroboratingIdentifier
 	// early-return (identity.go:272) can pass on a whole-document DOI/PMID/arXiv
-	// match plus authorOK, before titlePrintedAsLine is ever checked. For a
+	// match plus authorOK, before printedTitleLine is ever checked. For a
 	// single target that is acceptable — the identifier is strong evidence and
 	// the title gate is still required for the non-corroborated path — but for
 	// 1-of-N selection it would let a comment or reply that cites the
 	// candidate's DOI and shares an author family name auto-bind, because the
 	// title gate would be skipped entirely. This rule requires
-	// titlePrintedAsLine unconditionally, over the byline window, with the
+	// candidateTitlePrintedAsLine unconditionally, over the byline window, with the
 	// same label and gluing recovery the identity rules use. Loose token
 	// overlap (60% threshold) is insufficient for autonomous selection; the
 	// whole title must be printed as a delimited line.
 	//
-	// WHY strict prefix: titlePrintedAsLine accepts a punctuation boundary
+	// WHY strict prefix: printedTitleLine accepts a punctuation boundary
 	// and up to four label words, so candidate "Target Title" is accepted
 	// against document "Target Title: A Different Study". For single-target
 	// verification that leniency is right (same work, subtitle dropped in
@@ -349,7 +349,7 @@ func QualifyCandidate(doc BindDocument, candidate BindCandidate) CandidateQualif
 	// WHY a new predicate: MatchIdentity defines yearConflict only when
 	// matches < len(tokens) (identity.go:260). That conjunct makes the check
 	// provably defeated by an exact printed title: when every significant
-	// token is present — which titlePrintedAsLine guarantees — matches ==
+	// token is present — which candidateTitlePrintedAsLine guarantees — matches ==
 	// len(tokens) and yearConflict is forced false. A preprint routinely
 	// dated a year before its version of record therefore passes
 	// MatchIdentity on its exact title, and that leniency is intentional for
@@ -485,9 +485,9 @@ func candidateNonArticleMarker(foldedByline string) string {
 	return ""
 }
 
-// findCandidateTitleRange returns the segment range that permissively matches
-// phrase via titleRunMatches, for positional scoping of the author gate. It
-// reuses titleRunMatches so the gluing and label recovery stay single-sourced.
+// findCandidateTitleRange returns the strictly matched title's segment range
+// for positional scoping of the author gate. It uses the same trailing-content
+// rule as candidateTitlePrintedAsLine so a prior title prefix cannot move it.
 func findCandidateTitleRange(segments []titleSegment, phrase string) (startSeg, endSeg int, ok bool) {
 	if phrase == "" {
 		return 0, 0, false
@@ -497,7 +497,7 @@ func findCandidateTitleRange(segments []titleSegment, phrase string) (startSeg, 
 			if offset != 0 && !seg.labels[offset-1] {
 				continue
 			}
-			if !titleRunMatches(segments[start:], offset, phrase) {
+			if !candidateStrictTitleRunMatches(segments[start:], offset, phrase) {
 				continue
 			}
 			// Walk to find where phrase completes to determine endSeg.
@@ -728,7 +728,7 @@ func candidateStrictTitleRunMatches(segments []titleSegment, offset int, phrase 
 			case strings.HasPrefix(phrase[matched:], word):
 				matched += len(word)
 			case strings.HasPrefix(word, phrase[matched:]) && isASCIIDigits(word[len(phrase)-matched:]):
-				return true
+				return j == len(words)-1
 			default:
 				return false
 			}

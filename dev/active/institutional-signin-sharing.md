@@ -692,3 +692,117 @@ Provider classification remains a separate problem. The original
 ScienceDirect page showed institutional access but no PDF control, then
 reported `ui_changed`. ProQuest pages also reported `ui_changed`. These
 observations alone do not prove entitlement or justify new selectors.
+
+### Follow-through on the same ten jobs
+
+Two further defects reproduced during this run:
+
+- `internal/browser/bridge.go` admitted a manual-download focus, then sent
+  it to `serviceMaterializationCandidate` on capable browser sessions.
+  Manual downloads have no such candidate, so the poll cleared the request
+  without opening a tab. The focus branch now checks the action kind.
+  The regression fails before the fix for a materialization-capable holder
+  and passes afterward; the older holder path still passes. The deployed
+  build opened the previously silent manual handoff in Chrome.
+- `extension/tools/adapter-repair.ts` escaped attribute apostrophes in a
+  form that its offline parser rejects. A committed ProQuest fixture
+  reproduced the crash. CSS hexadecimal escapes preserve the value and
+  allow the repair to finish. The focused regression fails before the fix
+  and passes afterward.
+
+The repair replay also restored the pre-fix ProQuest spec's missing
+`workEvidence`. The production planner reported an assisted article before
+the historical fix and an executable article afterward. The generator
+produced ten candidates but no complete repair or replacement target for
+the broken spec. Selector generation cannot supply a missing identity
+contract; this remains a measured limit, not automatic self-healing.
+
+The fixed cohort still contains one ready job, one identity-review job,
+and eight awaiting-human jobs. The identity-review download contains an
+archive cover with one DOI and the requested publisher DOI on the next
+page. No identity rule or quarantine approval changed. Other observations
+include an authenticated ProQuest search with zero results, a book-reader
+route under a drift latch, a Europe PMC JSON error instead of a PDF, and
+a publisher consent return that lands on the journal home page. None
+establishes a safe new adapter selector.
+Both remaining article handoffs reach the requested ClinicalKey full text
+with a PDF link and the institution's account label. Authentication
+navigation continues, and no PDF download is confirmed. A fresh capture
+attempt returns `busy`; the existing adapter still lacks `workEvidence`.
+These are not verified entitlement failures.
+
+The browser and CLI package tests passed with `-race`, as did the generated
+documentation tests. The extension suite passed 1,514 tests with one skip;
+type checking passed. The new daemon, native host, and browser session
+completed the live manual-handoff smoke check. Per-paper evidence stays
+private; these results do not establish a general acquisition success rate.
+The relay is enabled again, and papio retains the same holder session.
+
+### ClinicalKey completion and identity review, 2026-09-19
+
+The popup's fixture capture succeeds while the separate diagnostic capture
+returns `busy`. The current ClinicalKey capture and the earlier capture
+both contain a stable title span under `header#top h1`. Each also repeats
+the PDF link in a sticky toolbar. Adapter version `0.3.0` binds the requested
+title to that span and selects only the header's PDF link.
+
+One paper reaches `ready` after a manual PDF click. Its validated PDF has
+nine pages. After the extension rebuild and a confirmed new browser session,
+the second paper downloads through the adapter without a PDF click. Its
+validated PDF has twelve pages and the requested title on page one.
+The same ten jobs now contain three ready papers, one identity-review paper,
+and six awaiting-human papers. This is a cohort comparison, not a general
+success-rate estimate.
+
+The identity corpus contains 799 documents and 637,594 mismatched pairs.
+Review of its four flagged passes finds three duplicate-record pairs and one
+genuine wrong-paper match. The genuine match combines a short title with a
+cited author's surname and a cited year; it is separate from the JSTOR cover
+case. The JSTOR PDF contains an archive cover before the requested article,
+but one example does not establish a safe general cover rule. The cover
+boundary still needs positive and negative fixtures. No identity window,
+DOI equivalence, or quarantine approval changes.
+
+The ClinicalKey regression fails before the repair. Both captures now plan
+the correct file route, while a near-identical but different requested title
+stays assisted. Type checking, all 1,515 extension tests, and both browser
+builds pass; one unrelated test remains skipped. Per-paper evidence and the
+corpus adjudications stay private.
+The generated documentation and site build also pass. The relay is enabled
+again, papio remains enabled, and papio retains its post-reload holder session.
+
+### Identity guard and further downloads, 2026-09-19
+
+The same ten jobs now contain five ready papers, four awaiting-human papers,
+and one identity-review paper. Psychiatry Online reaches ready after reopening
+the requested article following sign-in and using its PDF control. The PDF
+has six pages. The Europe PMC route returns a JSON error; the corresponding
+PMC page supplies a 31-page PDF with the requested DOI on page one.
+Both completions use manual browser downloads, not unattended acquisition.
+
+The corpus still contains 799 documents and 637,594 mismatched pairs.
+Correct results remain 729 pass, 64 review, and six reject. Mismatched passes
+fall from four to three; the genuine wrong-paper match now needs review.
+The remaining three flagged pairs describe duplicate records.
+The fix excludes surname-year citations before the printed title from
+authorship evidence. Candidate binding also rejects a numbered title with
+extra subtitle words and scopes authors to the strict title match.
+Reverting either candidate fix makes its regression fail.
+
+The JSTOR cover omits the following article's subtitle. The cover-skipping
+experiment was removed because an abbreviated title does not establish the
+required full-title agreement. The original file remains in review.
+No identity window, DOI equivalence, or quarantine approval changes.
+
+A separate regression confirms that an open-access article handoff survives
+an unrelated resolver retry. Three remaining jobs use ProQuest routes;
+the fourth has a document-delivery action. Job diagnosis now points that
+action to its delivery request instead of an earlier browser failure.
+Per-paper captures, corpus reports, and mutation evidence remain private.
+
+Focused race tests pass for PDF identity, the corpus, acquisition, browser,
+CLI, job, API, triage, and generated documentation packages. Build, vet, and
+lint also pass. The final deployment rebuilds both extension bundles and
+confirms a new holder session. Live `jobs diagnose` now reports
+`document_delivery` and the correct request command. That request remains
+prefill-only; no delivery submission or review override occurred.

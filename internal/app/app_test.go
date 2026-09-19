@@ -3434,14 +3434,11 @@ func (r *onceTemporaryResolver) Resolve(context.Context, work.Work) ([]resolver.
 
 // runOABrowserHintFixture reproduces the verified incident
 // (10.3389/feduc.2018.00095: fully open access, expired Azure SAS link) over
-// two passes. Pass 1's only candidate 403s -- classified permanently, so
-// MarkCandidate leaves it "invalid" -- while an unrelated resolver gate fails
-// temporarily, so the pass parks instead of exhausting immediately, exactly
-// like the mislabelled "candidate_temporarily_unavailable" parks observed
-// live. Pass 2's gate has cleared and the OA candidate is already invalid, so
-// NextPendingCandidate returns nothing and the fetch loop -- and
-// isOABrowserBlocked with it -- never runs again.
-func runOABrowserHintFixture(t *testing.T, requestID, oaURL string) (*Service, *job.Store, string) {
+// two passes. A blocked direct candidate becomes invalid; a non-direct article
+// page becomes skipped without a fetch. An unrelated resolver gate makes pass
+// 1 retry. Pass 2 must retain the OA browser route even though neither settled
+// candidate returns to the pending queue.
+func runOABrowserHintFixture(t *testing.T, requestID, oaURL string, direct bool) (*Service, *job.Store, string) {
 	t.Helper()
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
@@ -3449,7 +3446,7 @@ func runOABrowserHintFixture(t *testing.T, requestID, oaURL string) (*Service, *
 	svc.RetryDelay = time.Millisecond
 	oa := &fakeResolver{name: "oa", cands: []resolver.Candidate{{
 		Source: "oa", URL: oaURL, Version: resolver.VersionPublished,
-		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: direct, IdentityConfidence: 1,
 	}}}
 	gate := &onceTemporaryResolver{name: "gate"}
 	svc.Resolvers = []ResolverEntry{
@@ -3497,7 +3494,7 @@ func runOABrowserHintFixture(t *testing.T, requestID, oaURL string) (*Service, *
 // OpenURL handoff for a paper that needs no institution.
 func TestOABrowserHintSurvivesEmptyPendingQueueOnLaterPass(t *testing.T) {
 	const oaURL = "https://example.test/oa-survives.pdf"
-	_, jobs, id := runOABrowserHintFixture(t, "wr_oa_hint_survives", oaURL)
+	_, jobs, id := runOABrowserHintFixture(t, "wr_oa_hint_survives", oaURL, true)
 	ctx := context.Background()
 
 	got, err := jobs.Get(ctx, id)
@@ -3524,6 +3521,31 @@ func TestOABrowserHintSurvivesEmptyPendingQueueOnLaterPass(t *testing.T) {
 	}
 }
 
+func TestNonDirectOAHandoffSurvivesRetry(t *testing.T) {
+	const landing = "https://example.test/article?token=PRIVATE_ROUTE_TOKEN"
+	_, jobs, id := runOABrowserHintFixture(t, "wr_oa_landing_survives", landing, false)
+	ctx := context.Background()
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].JobID != id || actions[0].Kind != "openurl_handoff" ||
+		actions[0].RequiresAuth || actions[0].Detail != OABrowserHandoffActionDetail(landing) {
+		t.Fatalf("want the same unauthenticated article handoff after retry, got %+v", actions)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "PRIVATE_ROUTE_TOKEN") {
+		t.Fatalf("the durable handoff hint leaked a bearer token: %s", encoded)
+	}
+}
+
 // safeType, redacted candidate rows, and now the oa_browser_hint event all
 // exist so upstream bearer URLs never reach durable storage. This asserts on
 // the actual event detail contents, not just the event kind, so a future
@@ -3531,7 +3553,7 @@ func TestOABrowserHintSurvivesEmptyPendingQueueOnLaterPass(t *testing.T) {
 // rather than in production.
 func TestOABrowserHintEventNeverStoresBearerURL(t *testing.T) {
 	const oaURL = "https://example.test/oa-secret.pdf?sig=SHOULD_NEVER_PERSIST"
-	_, jobs, id := runOABrowserHintFixture(t, "wr_oa_hint_no_leak", oaURL)
+	_, jobs, id := runOABrowserHintFixture(t, "wr_oa_hint_no_leak", oaURL, true)
 	ctx := context.Background()
 
 	events, err := jobs.Events(ctx, id)

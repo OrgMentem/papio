@@ -598,6 +598,15 @@ export function planExecution(
     if (rule.method === "href" && element.tagName.toUpperCase() !== "A") {
       return { assisted: "href action target is not an anchor" };
     }
+    if (rule.method === "post") {
+      const form = element as HTMLFormElement;
+      if (
+        element.tagName.toUpperCase() !== "FORM" ||
+        element.getAttribute("method")?.toLowerCase() !== "post" ||
+        form.elements?.length !== 0 ||
+        (element.getAttribute("enctype") ?? "application/x-www-form-urlencoded").toLowerCase() !== "application/x-www-form-urlencoded"
+      ) return { assisted: "PDF POST requires an empty URL-encoded POST form" };
+    }
     if (rule.method === "meta") {
       const declaredName = rule.metaName ?? "citation_pdf_url";
       const metaCtor = (root.defaultView as { HTMLMetaElement?: typeof HTMLMetaElement } | null)?.HTMLMetaElement;
@@ -639,6 +648,16 @@ export function planExecution(
     };
   };
   const resolveURL = (rule: DownloadRule, target: Element): string | null => {
+    if (rule.method === "post") {
+      const raw = target.getAttribute("action")?.trim() ?? "";
+      if (raw === "") return null;
+      try {
+        const url = new URL(raw, pageHref);
+        return url.protocol === "https:" && url.origin === new URL(pageHref).origin &&
+          url.username === "" && url.password === "" && /\.pdf$/i.test(url.pathname)
+          ? url.href : null;
+      } catch { return null; }
+    }
     const raw = rule.method === "meta" ? target.getAttribute("content") : target.getAttribute("href");
     if (rule.method === "href" || rule.method === "meta") {
       const trimmed = raw?.trim() ?? "";
@@ -1036,7 +1055,7 @@ export function planExecution(
     if (routeBinding !== null && "assisted" in routeBinding)
       return routeBinding;
     const url = resolveURL(download, element) ?? null;
-    if ((download.method === "href" || download.method === "meta" || download.method === "url") && url === null) {
+    if ((download.method === "href" || download.method === "meta" || download.method === "url" || download.method === "post") && url === null) {
       return { assisted: "declared action URL is not a distinct HTTPS URL" };
     }
     const followupMatches =

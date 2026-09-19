@@ -119,7 +119,10 @@ export interface DownloadRule {
   /** Page-derived href/meta destinations require this packaged envelope when
    * they leave the current page origin. */
   allowedDestinations?: DownloadDestinationContract[];
-  method: "href" | "click" | "url" | "api" | "meta";
+  /** `post` downloads an empty HTML POST form's explicit same-origin PDF
+   * action. Forms with fields are refused; this never submits consent,
+   * credentials, or other page data and never opens a named viewer window. */
+  method: "href" | "click" | "url" | "api" | "meta" | "post";
   shadowSelector?: string;
   /** Wait for this fixture-backed in-page gate before reclassification. */
   postClickWaitFor?: string;
@@ -451,17 +454,16 @@ export const adapters: AdapterSpec[] = [
     // (`planExecution` in extension/src/plan.ts) until that ceiling was raised
     // to 15000.
     //
-    // Human-assisted by design, for now: no workEvidence is declared, so the
-    // planner refuses the article effect for any job carrying a requested
-    // identity. The capture's only title node is
-    // `h1.TOKEN-cksc-content-header__title`, and that `TOKEN-` prefix is the
-    // sanitizer's redaction of an unstable class, so it cannot be used as a
-    // live selector. Binding this provider needs a fresh capture showing a
-    // stable identity node. TestClinicalKeyStaysAssistedWithoutWorkEvidence
-    // pins the refusal.
+    // Captured again 2026-09-19 (success-current.html): the main content
+    // header's direct title span is stable across both captures. Do not read
+    // the whole h1: it includes the RSS and PDF controls, and the outline
+    // carries unrelated h1 section headings. The header also owns one PDF
+    // link; the sticky toolbar repeats it, so the download selector must be
+    // scoped to the header to keep the action target unique.
     id: "clinicalkey",
-    version: "0.2.0",
+    version: "0.3.0",
     hosts: ["clinicalkey.com.au"],
+    workEvidence: { kind: "title", selector: "header#top h1 > span" },
     settleTimeoutMs: 15000,
     classify: [
       {
@@ -470,7 +472,7 @@ export const adapters: AdapterSpec[] = [
       },
     ],
     download: {
-      selector: "a[data-testid='pdf-download-link'][href*='/service/content/pdf/']",
+      selector: "header#top a[data-testid='pdf-download-link'][href*='/service/content/pdf/']",
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "href",
@@ -846,14 +848,15 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
-    // Verified 2026-07-20 against the public OA Annual Reviews article in
-    // fixtures/annualreviews/success.html. The platform's PDF action is a
-    // JavaScript-backed POST form whose anchor href is "#", so href extraction
-    // is impossible: click exactly the fixture-backed Download PDF control.
-    // Non-OA pages can render the same form, therefore require the explicit
-    // Open Access marker and full-text container as entitlement evidence.
+    // Verified against the public OA captures in fixtures/annualreviews/.
+    // The PDF action is an empty POST form with no file href. Download its
+    // action directly: its named window target can reuse an old viewer whose
+    // opener no longer belongs to this job, and pop-up blocking can stop it.
+    // The Open Access class survives when its decorative text span is absent;
+    // retain that explicit marker and the full-text container, since non-OA
+    // pages can also render the PDF form.
     id: "annualreviews",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["annualreviews.org"],
     workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     classify: [
@@ -861,17 +864,17 @@ export const adapters: AdapterSpec[] = [
         kind: "article",
         all: [
           "meta[name='citation_title']",
-          ".article-access.item-meta-data__oa .accesstext",
+          ".article-access.item-meta-data__oa",
           "#html_fulltext",
           "form.ft-download-content__form--pdf a[aria-label='Download PDF']",
         ],
       },
     ],
     download: {
-      selector: "form.ft-download-content__form--pdf a[aria-label='Download PDF']",
+      selector: "form.ft-download-content__form--pdf",
       requireKind: "article",
       workTarget: { kind: "opaque" },
-      method: "click",
+      method: "post",
     },
   },
   {
@@ -1087,11 +1090,22 @@ export const adapters: AdapterSpec[] = [
     // render the js-no-access-jumplink control. Prefer the rendered action over
     // citation_pdf_url so a metadata-only paywall cannot look entitled.
     id: "oup",
-    version: "0.1.0",
+    version: "0.1.1",
     hosts: ["academic.oup.com"],
     workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     settleTimeoutMs: 5000,
     classify: [
+      {
+        // A chapter's current-session wall offers institutional sign-in. It
+        // does not prove the institution lacks the book, and its PDF metadata
+        // must never be mistaken for an entitled file control.
+        kind: "login",
+        all: [
+          "meta[name='citation_title']",
+          "#no-access-message.chapter-user-restricted",
+          "#unauth .login-box a.js-shibboleth-action[data-action-type='login-discovery']",
+        ],
+      },
       {
         kind: "no_entitlement",
         all: [
@@ -1187,7 +1201,7 @@ export const adapters: AdapterSpec[] = [
     // denied pages may still render downloadPdfUrl, so the full-access marker
     // is load-bearing and the no-access rule must run first.
     id: "psychiatryonline",
-    version: "0.1.0",
+    version: "0.1.1",
     hosts: ["psychiatryonline.org"],
     workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -1211,7 +1225,7 @@ export const adapters: AdapterSpec[] = [
     download: {
       selector: "a#downloadPdfUrl[data-doi]",
       requireKind: "article",
-      workTarget: { kind: "opaque" },
+      workTarget: { kind: "doi", attribute: "href", pattern: "^/doi/pdf/(10\\.[^?#]+)(?:[?#]|$)" },
       method: "href",
     },
   },

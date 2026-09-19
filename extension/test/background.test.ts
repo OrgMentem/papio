@@ -16816,6 +16816,7 @@ describe("generic settled-unknown acquisition", () => {
     planned: GenericPlan,
     expectedDOI = "10.1000/generic",
     driveEpoch = true,
+    afterAuth = false,
   ): Promise<void> {
     h.deps.permissions.contains = async () => true;
     h.deps.scripting.executeScript = async (injection) => {
@@ -16857,9 +16858,34 @@ describe("generic settled-unknown acquisition", () => {
       });
     }
     const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    if (afterAuth) {
+      await h.tabs.userNavigate(tabID, "https://idp.example.edu/login");
+      expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+    }
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
     h.clock.now += 6_000;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+  }
+  test("a generic PDF candidate can download after an authentication return", async () => {
+    const h = makeHarness();
+    const url = `https://${PROVIDER_HOST}/paper.pdf`;
+    await reachUnknown(h, "job_generic_auth_return", "delegated", {
+      evidence: ["e0:citation-doi=exact"],
+      candidates: [{ strategy_id: "generic-citation-pdf/1", strategy_version: "1", url }],
+    }, "10.1000/generic", true, true);
+    expect(h.frames().some(frame => frame.type === "auth_returned")).toBe(true);
+    expect(h.backend.store.activeJobs[0]?.status).toBe("awaiting_download");
+    expect(h.downloads.started.map(item => item.url)).toEqual([url]);
+  });
+  for (const [access, epoch] of [["assisted", true], ["delegated", false]] as const) {
+    test(`auth return does not grant generic authority for ${access}, epoch=${epoch}`, async () => {
+      const h = makeHarness();
+      await reachUnknown(h, "job_generic_auth_no_authority", access, {
+        evidence: ["e0:citation-doi=exact"],
+        candidates: [{ strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: `https://${PROVIDER_HOST}/paper.pdf` }],
+      }, "10.1000/generic", epoch, true);
+      expect(h.downloads.started).toHaveLength(0);
+    });
   }
   async function genericStartOutcome(
     h: Harness,
