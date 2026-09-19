@@ -107,3 +107,30 @@ test("Springer requires an institutional login control and prefers an available 
   expect(classifyFixture(entitled, spec).kind).toBe("article");
   expect(classifyFixture(fixture("login-return"), spec).kind).toBe("article");
 });
+
+test("Springer plans one header PDF despite the duplicate sticky-banner link", () => {
+  for (const scenario of ["success", "login-return"]) {
+    const page = fixture(scenario);
+    expect(page.querySelectorAll("a[data-test='pdf-link']")).toHaveLength(2);
+    const result = planExecution(page, spec, {
+      doi: "10.1186/s41235-024-00583-5",
+      title: HUMAN_MACHINE_TRUST.title,
+    }, { access_mode: "delegated" });
+    expect("assisted" in result).toBe(false);
+    if ("assisted" in result) throw new Error(result.assisted);
+    expect(result.verdict.kind).toBe("article");
+    expect(result.method).toBe("href");
+    const targets = page.querySelectorAll(result.target_ref!.selector);
+    expect(targets).toHaveLength(1);
+    expect(targets[0]!.closest(".app-masthead__access-container")).not.toBeNull();
+    expect(result.url).toContain("/content/pdf/10.1186/s41235-024-00583-5.pdf");
+  }
+});
+
+test("Springer never substitutes the sticky banner when the header PDF is absent", () => {
+  const page = fixture("success");
+  page.querySelector(".app-masthead__access-container")!.remove();
+  expect(page.querySelectorAll("a[data-test='pdf-link']")).toHaveLength(1);
+  const result = planExecution(page, spec, { doi: "10.1186/s41235-024-00583-5" }, { access_mode: "delegated" });
+  expect("assisted" in result || result.method === null).toBe(true);
+});

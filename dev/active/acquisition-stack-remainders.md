@@ -17,11 +17,11 @@ anti-bot checks that no CDP or WebDriver session can, which is the same
 constraint that makes the extension QA matrix manual.
 
 - **ScienceDirect entitled download (Unverified).** The live primary access-bar path, viewer adoption, and provider outcome are now repaired/observed, but no retained validated artifact reached `ready`; the exact route is therefore not canary-qualified or **Verified working**. Page capture or provider outcome alone is insufficient to promote it. The purchase-wall capture also offers institutional sign-in, so it no longer qualifies as `no_entitlement` evidence. That combination now stays sign-in pending. The entitled-article rule remains fixture-backed only — `fixtures/sciencedirect/success.html` carries a fabricated DOI/PII, not a capture. Confirm the `citation_pdf_url` meta fetch reaches a real PDF through the privileged downloads API.
-- **Springer supervised acceptance.** Adapter 0.1.1 corrects a captured access
-  panel that offered institutional sign-in but was classified as no entitlement.
-  The rendered PDF control still takes precedence. This repair is fixture-backed;
-  a retained, validated PDF from a fresh live run remains necessary to prove the
-  download route end to end.
+- **Springer subscription and book acceptance.** Adapter 0.1.2 now selects the
+  article header's PDF control rather than also matching the sticky banner.
+  A fresh live probe retained the correct 16-page open-access article after one
+  explicit Open on 2026-09-20. Subscription sign-in remains pending, and this
+  article result does not establish access to a full book or entitled chapter.
 - **EBSCO re-verification.** The 2026-07-23 adoption-binding fix (`a4aeab3`)
   landed after EBSCO's only live run, which had stopped at `needs_review`. Re-run
   it end to end to confirm the job now reaches ready/attach, and separately

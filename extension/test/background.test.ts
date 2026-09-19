@@ -6568,6 +6568,67 @@ test("a provider-authored load failure reloads three times and never records dri
   ).toBe(false);
 });
 
+test("a non-executable article plan reports its refusal after the render window", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution) return [{ result: {
+      assisted: "declared action target is not unique",
+      verdict: { kind: "article", adapter_id: PROVIDER_ADAPTER.id, adapter_version: PROVIDER_ADAPTER.version, evidence: [] },
+    } }];
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_assisted_plan"));
+  const tabID = h.backend.store.activeJobs[0]!.tab_id;
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+  expect(h.frames().filter((f) => f.type === "provider_outcome")).toHaveLength(0);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const retry = h.timers.at(-1)!;
+    expect(retry.ms).toBe(2_500);
+    h.clock.now += 2_500;
+    await retry.fn();
+  }
+  const outcomes = h.frames().filter((f) => f.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]!.payload).toMatchObject({
+    outcome: "ui_changed", adapter_id: PROVIDER_ADAPTER.id,
+    detail: "Adapter plan refused: declared action target is not unique",
+  });
+  expect(h.downloads.started).toHaveLength(0);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ tab_id: -1, status: "awaiting_download" });
+  expect(h.backend.store.activeJobs[0]!.access_mode).toBeUndefined();
+});
+
+test("an ambiguous article can settle to a normal verdict without a false drift", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  let ambiguous = true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution) return ambiguous ? [{ result: {
+      assisted: "declared action target is not unique",
+      verdict: { kind: "article", adapter_id: PROVIDER_ADAPTER.id, adapter_version: PROVIDER_ADAPTER.version, evidence: [] },
+    } }] : plannerResult(injection, { kind: "login" });
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_transient_assisted_plan"));
+  const tabID = h.backend.store.activeJobs[0]!.tab_id;
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+  const retry = h.timers.at(-1)!;
+  expect(retry.ms).toBe(2_500);
+  ambiguous = false;
+  h.clock.now += 2_500;
+  await retry.fn();
+  expect(h.frames().filter((f) => f.type === "provider_outcome")).toHaveLength(0);
+  expect(h.downloads.started).toHaveLength(0);
+  expect(h.backend.store.activeJobs[0]!.unknown_count).toBe(0);
+});
+
 test("unknown retries report ui_changed once per drive and again for a re-offered tab", async () => {
   const jobID = "job_unknown_outcome_drive";
   const h = makeHarness();

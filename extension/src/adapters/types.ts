@@ -526,7 +526,7 @@ export const adapters: AdapterSpec[] = [
     // The access panel offers institutional sign-in; its presence does not
     // establish no entitlement. A rendered PDF control takes precedence.
     id: "springer",
-    version: "0.1.1",
+    version: "0.1.2",
     hosts: ["link.springer.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 3000,
@@ -547,7 +547,9 @@ export const adapters: AdapterSpec[] = [
       },
     ],
     download: {
-      selector: "a[data-test='pdf-link'][href*='/content/pdf/']",
+      // Springer repeats the same PDF link in a sticky banner. Bind the
+      // article header's control so the planner has exactly one target.
+      selector: ".app-masthead__access-container a[data-test='pdf-link'][href*='/content/pdf/']",
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "href",

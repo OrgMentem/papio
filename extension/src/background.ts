@@ -18869,6 +18869,7 @@ export class Bridge {
     }
 
     let plan: Plan | undefined;
+    let refused: Extract<PlanResult, { assisted: string }> | undefined;
     try {
       const results = await this.deps.scripting.executeScript({
         target: { tabId: currentJob.tab_id },
@@ -18892,10 +18893,28 @@ export class Bridge {
         !("assisted" in first)
       ) {
         plan = first;
+      } else if (first !== undefined && first !== null &&
+        typeof first === "object" && "assisted" in first &&
+        typeof first.assisted === "string") {
+        refused = first;
       }
     } catch (e) {
       console.error("papio: adapter planning failed; staying assisted", e);
       return;
+    }
+    if (refused !== undefined) {
+      if (disposition === "evidence_only") return refused.verdict;
+      // A classified article is not an executable plan. Keep the planner's
+      // refusal visible and give transient DOM duplication the same bounded
+      // render window as an unknown page, without attempting another route.
+      const live = findByJob(this.store, jobID);
+      if (live?.tab_id !== currentJob.tab_id ||
+        (live.status !== "accepted" && live.status !== "awaiting_download") ||
+        live.download_initiated === true || this.downloads.has(jobID)) return;
+      await this.recordUnknown(live, host, spec, false,
+        `Adapter plan refused: ${refused.assisted}`);
+      this.scheduleClassifyRetry(jobID);
+      return refused.verdict;
     }
     if (plan === undefined) return undefined;
     const verdict = plan.verdict;
@@ -19310,6 +19329,7 @@ export class Bridge {
     host: string,
     adapter?: AdapterSpec,
     deferTerminal = false,
+    detail?: string,
   ): Promise<boolean> {
     // An unregistered provider may authorize its own first diagnostic below,
     // but an authentication redirect may not. IdP pages can contain names,
@@ -19368,6 +19388,7 @@ export class Bridge {
               outcome: "ui_changed",
               adapter_id: adapter.id,
               adapter_version: adapter.version,
+              ...(detail === undefined ? {} : { detail }),
               ...(reportedHost === undefined ? {} : { host: reportedHost }),
             },
             job.job_id,

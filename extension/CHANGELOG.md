@@ -93,6 +93,15 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- Springer downloads now select the article header's PDF control explicitly.
+  The same link also appears in a sticky banner; matching both made the
+  planner refuse the download even though the page classified as an article.
+  A fresh Chrome probe downloaded and validated the correct 16-page article
+  after one explicit Open, without a manual PDF click.
+- A refused adapter plan now records its reason and, when enabled, a diagnostic
+  capture after a bounded render window. Papers no longer remain silently parked
+  when the planner cannot identify one safe download target.
+
 - Springer article pages that offer institutional sign-in now remain sign-in
   pending instead of reporting no entitlement. An available PDF still takes
   precedence. The change is verified against captured pages; live acquisition
