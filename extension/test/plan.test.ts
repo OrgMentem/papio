@@ -244,9 +244,8 @@ test("Europe PMC plans a direct URL only when the route and citation PMCID agree
       { doi: "10.1093/nar/gkab1061" },
       { access_mode: "delegated" },
     ),
-  ).toEqual({
-    assisted: expect.any(String),
-    verdict: expect.objectContaining({ kind: "article" }),
+  ).toMatchObject({
+    verdict: { kind: "wrong_work" }, required_consequence: "none",
   });
 
   const absent = parseHTML(html, articleURL);
@@ -546,6 +545,51 @@ test("planExecution requires the exact unique citation DOI meta and declared met
   }
 });
 
+test("declared page identity mismatches are passive wrong-work verdicts, not adapter drift", () => {
+  for (const kind of ["article", "terms", "no_entitlement"] as const) {
+    for (const identity of ["doi", "title"] as const) {
+      const spec: AdapterSpec = {
+        id: "identity-bound", version: "1", hosts: ["publisher.test"],
+        classify: [{ kind, all: ["a.pdf"] }],
+        workEvidence: { kind: identity, selector: "meta[name='identity']", attribute: "content" },
+        download: { selector: "a.pdf", requireKind: "article", method: "href", workTarget: { kind: "opaque" } },
+      };
+      const expected = identity === "doi" ? { doi: "10.1000/right" } : { title: "Requested paper" };
+      const value = identity === "doi" ? "https://doi.org/10.1000/other" : "Different paper";
+      const planned = planExecution(parseHTML(
+        `<meta name="identity" content="${value}"><h1>Requested paper</h1><a class="pdf" href="/paper.pdf">PDF</a>`,
+        "https://publisher.test/article",
+      ), spec, expected, { access_mode: "delegated", terms_consent: "accept" });
+      expect(planned).toMatchObject({
+        verdict: { kind: "wrong_work", evidence: [
+          `rule:${kind} matched`,
+          ...(kind === "article" && identity === "title" ? ["title-token-check passed"] : []),
+          "declared-work-check failed",
+        ] },
+        target_ref: null, method: null, url: null, required_consequence: "none",
+        effect_graph: { primary_target: null, followup_target: null, terms_target: null, api: null, consequence: "none" },
+      });
+      expect(planned.verdict.evidence).not.toContain(value);
+    }
+  }
+});
+
+test("missing, ambiguous, or malformed page identity stays assisted", () => {
+  const spec: AdapterSpec = {
+    id: "identity-bound", version: "1", hosts: ["publisher.test"],
+    classify: [{ kind: "article", all: ["a.pdf"] }],
+    workEvidence: { kind: "doi", selector: "meta[name='identity']", attribute: "content" },
+  };
+  for (const meta of ["", '<meta name="identity">', '<meta name="identity" content="doi:">',
+    '<meta name="identity" content="Not a DOI">',
+    '<meta name="identity" content="10.1000/right"><meta name="identity" content="10.1000/other">']) {
+    const planned = planExecution(parseHTML(`${meta}<a class="pdf">PDF</a>`, "https://publisher.test/article"),
+      spec, { doi: "10.1000/right" }, { access_mode: "delegated" });
+    expect(planned).toHaveProperty("assisted");
+    expect(planned.verdict.kind).toBe("article");
+  }
+});
+
 test("no-entitlement verdicts are bound to the requested work", () => {
   const spec: AdapterSpec = {
     id: "no-entitlement-bound",
@@ -581,7 +625,7 @@ test("no-entitlement verdicts are bound to the requested work", () => {
   );
   expect(
     planExecution(wrongPage, spec, { doi: "10.1000/right" }, {}),
-  ).toHaveProperty("assisted");
+  ).toMatchObject({ verdict: { kind: "wrong_work" }, required_consequence: "none" });
   // Older no-entitlement adapters such as Ex Libris Primo have no page
   // identity contract. This shared hardening must not turn their passive
   // terminal verdict into a coverage gap; only a declared contract can bind.
@@ -643,7 +687,9 @@ test("ACM work evidence uses the declared publication DOI and rejects absent, du
     ),
     "https://dl.acm.org/doi/10.1145/3544548.3581058",
   );
-  expect(planExecution(wrong, spec, expected, { access_mode: "delegated" })).toHaveProperty("assisted");
+  expect(planExecution(wrong, spec, expected, { access_mode: "delegated" })).toMatchObject({
+    verdict: { kind: "wrong_work" }, required_consequence: "none",
+  });
 });
 
 test("page-derived foreign destinations require a declared origin and path", () => {
@@ -723,7 +769,9 @@ test("planExecution binds terms text resolution to the packaged modal and unique
       '<div class="terms" open><button>Accept and download</button></div>',
     "https://example.test/article",
   );
-  expect(planExecution(wrongWork, spec, { doi: "10.1000/terms" }, { access_mode: "delegated" })).toHaveProperty("assisted");
+  expect(planExecution(wrongWork, spec, { doi: "10.1000/terms" }, { access_mode: "delegated" })).toMatchObject({
+    verdict: { kind: "wrong_work" }, required_consequence: "none",
+  });
 });
 
 test("planExecution carries a not-yet-present terms target in an article graph", () => {
@@ -895,5 +943,5 @@ test("ClinicalKey binds the article title without toolbar text or section headin
     { ...expected, title: `${expected.title}: A Replication` },
     { access_mode: "delegated" },
   );
-  expect("assisted" in wrongWork).toBe(true);
+  expect(wrongWork).toMatchObject({ verdict: { kind: "wrong_work" }, required_consequence: "none" });
 });

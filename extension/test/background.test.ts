@@ -6642,6 +6642,44 @@ test("a provider-authored load failure reloads three times and never records dri
   ).toBe(false);
 });
 
+test("a different declared page DOI reports wrong_work without downloads or drift", async () => {
+  const h = makeHarness();
+  const spec: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    classify: [{ kind: "article", all: ["a.pdf"] }],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
+    download: { selector: "a.pdf", requireKind: "article", method: "href", workTarget: { kind: "opaque" } },
+  };
+  h.deps.adapterSpecs.push(spec);
+  h.deps.permissions.contains = async () => true;
+  const page = new Window({ url: `https://${PROVIDER_HOST}/article` });
+  page.document.write('<meta name="citation_doi" content="10.1000/other"><a class="pdf" href="/paper.pdf">PDF</a>');
+  let effects = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution) return [{ result: planExecution(
+      page.document as unknown as Document, spec,
+      injection.args![2] as { doi: string }, { access_mode: "delegated" },
+    ) }];
+    if (injection.func === executePlannedPageEffect) effects++;
+    return [];
+  };
+  await h.bridge.start();
+  const offer = jobOffer("job_wrong_declared_identity") as { payload: Record<string, unknown> };
+  offer.payload["expected"] = { doi: "10.1000/right" };
+  await h.port.inbound(offer);
+  const tabID = h.backend.store.activeJobs[0]!.tab_id;
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+  const outcomes = h.frames().filter((f) => f.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]!.payload).toMatchObject({ outcome: "wrong_work", adapter_id: spec.id, host: PROVIDER_HOST });
+  expect(h.frames().some((f) => f.type === "page_capture")).toBe(false);
+  expect(h.downloads.started).toHaveLength(0);
+  expect(effects).toBe(0);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ tab_id: -1, status: "awaiting_download" });
+  expect(h.backend.store.activeJobs[0]!.access_mode).toBeUndefined();
+});
+
 test("a non-executable article plan reports its refusal after the render window", async () => {
   const h = makeHarness();
   h.deps.adapterSpecs.push(PROVIDER_ADAPTER);

@@ -26,7 +26,9 @@ test("ChemRxiv binds the preprint DOI and one rendered PDF control", () => {
 test("ChemRxiv refuses a publication DOI or another preprint version", () => {
   expect(spec()).toBeDefined();
   for (const expected of ["10.1000/example-publication", doi.replace("-v2", "-v1")]) {
-    expect("assisted" in planExecution(page(), spec(), { doi: expected }, {})).toBe(true);
+    expect(planExecution(page(), spec(), { doi: expected }, {})).toMatchObject({
+      verdict: { kind: "wrong_work" }, required_consequence: "none",
+    });
   }
 });
 

@@ -103,6 +103,12 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **A different paper is reported as the wrong work, instead of adapter drift.**
+  When a page's declared DOI or title disagrees with the request, papio stops
+  without attempting its PDF or terms controls and offers the existing
+  wrong-page recovery. Missing, ambiguous, or malformed identity metadata still
+  requires assistance; it does not prove that the page names another work.
+
 - **Manual-download tasks release their completed browser surfaces.**
   Cleanup now reports that the browser handoff is parked, instead of incorrectly
   claiming the whole job is inactive. Downloads in flight still prevent closure.

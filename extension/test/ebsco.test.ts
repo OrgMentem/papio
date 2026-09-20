@@ -122,7 +122,8 @@ test("EBSCO refuses missing or mismatched DOI metadata even when the title match
     const meta = doc.querySelector("meta[name='citation_doi']")!;
     if (doi === null) meta.remove(); else meta.setAttribute("content", doi);
     const planned = planExecution(doc, spec, { title: "Example scholarly article", doi: "10.1000/example-paper" }, { access_mode: "delegated" });
-    expect(planned).toHaveProperty("assisted");
+    if (doi === null) expect(planned).toHaveProperty("assisted");
+    else expect(planned).toMatchObject({ verdict: { kind: "wrong_work" }, required_consequence: "none" });
   }
 });
 

@@ -519,7 +519,7 @@ export function planExecution(
   ): {
     evidence: { normalized: string; fingerprint: string; selector: string; attribute: string | null; pattern: string | null } | null;
     title: { fingerprint: string; selector: string; attribute: string | null; pattern: string | null } | null;
-  } | AssistedReason => {
+  } | AssistedReason | { wrong_work: true } => {
     if (requestedDOI === null && requestedTitle === null) return { evidence: null, title: null };
     if (
       contract === undefined ||
@@ -562,13 +562,15 @@ export function planExecution(
     }
     if (contract.kind === "doi") {
       const normalized = normalizeDOI(extracted);
-      if (normalized === "" || normalized !== requestedDOI) return { assisted: "declared work evidence does not match the requested work" };
+      // Unusable metadata can be a selector failure; only a well-formed
+      // different identifier proves that this is another work.
+      if (!/^10\.[0-9]{4,9}\/\S{1,200}$/.test(normalized)) return { assisted: "declared work DOI evidence is invalid" };
+      if (normalized !== requestedDOI) return { wrong_work: true };
       const source = { selector: contract.selector, attribute: contract.attribute ?? null, pattern: contract.pattern ?? null };
       return { evidence: { normalized, fingerprint: fingerprint(element), ...source }, title: null };
     }
-    if (normalizeTitle(extracted) !== requestedTitle) {
-      return { assisted: "declared work evidence does not match the requested work" };
-    }
+    if (normalizeTitle(extracted) === "") return { assisted: "declared work title evidence is empty" };
+    if (normalizeTitle(extracted) !== requestedTitle) return { wrong_work: true };
     const source = { selector: contract.selector, attribute: contract.attribute ?? null, pattern: contract.pattern ?? null };
     return { evidence: null, title: { fingerprint: fingerprint(element), ...source } };
   };
@@ -738,20 +740,6 @@ export function planExecution(
     if (classified.verdict.kind === "terms" && requestedDOI === null && requestedTitle === null) {
       return { assisted: "terms effect has no requested work binding" };
     }
-    if (
-      (classified.verdict.kind === "article" ||
-        classified.verdict.kind === "terms" ||
-        (classified.verdict.kind === "no_entitlement" &&
-          ((spec.workEvidence?.kind === "doi" && requestedDOI !== null) ||
-            (spec.workEvidence?.kind === "title" &&
-              requestedTitle !== null)))) &&
-      (requestedDOI !== null || requestedTitle !== null)
-    ) {
-      const evidence = workEvidenceFor(spec.workEvidence, requestedDOI, requestedTitle);
-      if ("assisted" in evidence) return evidence;
-      expectedWork.doi = evidence.evidence;
-      expectedWork.title = evidence.title;
-    }
     const base: Plan = {
       adapter_id: spec.id,
       adapter_version: spec.version,
@@ -779,6 +767,32 @@ export function planExecution(
         max_wait_ms: boundedMs,
       },
     };
+    if (
+      (classified.verdict.kind === "article" ||
+        classified.verdict.kind === "terms" ||
+        (classified.verdict.kind === "no_entitlement" &&
+          ((spec.workEvidence?.kind === "doi" && requestedDOI !== null) ||
+            (spec.workEvidence?.kind === "title" &&
+              requestedTitle !== null)))) &&
+      (requestedDOI !== null || requestedTitle !== null)
+    ) {
+      const evidence = workEvidenceFor(spec.workEvidence, requestedDOI, requestedTitle);
+      if ("assisted" in evidence) return evidence;
+      if ("wrong_work" in evidence) {
+        // A different page identity is a passive terminal observation, not
+        // broken selector coverage. The base has no target or effect.
+        return {
+          ...base,
+          verdict: {
+            ...classified.verdict,
+            kind: "wrong_work",
+            evidence: [...classified.verdict.evidence, "declared-work-check failed"],
+          },
+        };
+      }
+      expectedWork.doi = evidence.evidence;
+      expectedWork.title = evidence.title;
+    }
 
     const termsTarget = (requirePresent: boolean): PlanEffectTarget | null => {
       const terms = spec.termsAccept;
