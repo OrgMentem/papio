@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,13 @@ import (
 
 func executable(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		path, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return path // TestMain implements the real worker entry point.
+	}
 	path := filepath.Join(t.TempDir(), "papio")
 	if err := os.WriteFile(path, []byte("binary"), 0o700); err != nil {
 		t.Fatal(err)
@@ -403,6 +411,7 @@ func TestRunReportsMissingModeCredentialsToolsAndUnsafeConfig(t *testing.T) {
 	if err := os.WriteFile(cfg.Path, []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	makeTestConfigPublic(t, cfg.Path)
 	report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil)
 	if report.OK {
 		t.Fatalf("unsafe profile passed: %+v", report)
@@ -1491,6 +1500,9 @@ func findDataDirCheck(checks []Check) (Check, bool) {
 }
 
 func TestCheckDataDirReportsInsecurePermissionsAndLeavesMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode contract; Windows ACLs are tested separately")
+	}
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -1523,6 +1535,9 @@ func TestCheckDataDirReportsInsecurePermissionsAndLeavesMode(t *testing.T) {
 }
 
 func TestCheckDataDirPassesWhenPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode contract; Windows ACLs are tested separately")
+	}
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -1552,6 +1567,9 @@ func TestCheckDataDirPassesWhenPrivate(t *testing.T) {
 }
 
 func TestCheckDataDirCreatesAbsentDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode contract; Windows ACLs are tested separately")
+	}
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "absent", "nested")
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {

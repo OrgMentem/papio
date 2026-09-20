@@ -304,6 +304,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Windows health checks use Windows permissions and a real worker probe.**
+  `papio doctor` checks file ownership and access-control lists instead of Unix
+  permission bits, and launches the PDF worker to verify its response. Private
+  Windows installations no longer fail these checks or receive `chmod` advice.
 - **A late browser completion no longer reports adoption as deferred after the
   same PDF is already ready.** The daemon checks the landed bytes, stored artifact
   and accepted browser candidate before acknowledging the duplicate. Mismatched

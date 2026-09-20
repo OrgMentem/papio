@@ -86,9 +86,10 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	if err := checkDataDir(cfg.DataDir); err != nil {
 		msg := err.Error()
 		var detail string
+		var privacy *privacyError
 		switch {
-		case strings.HasPrefix(msg, "chmod 0700"):
-			detail = "data directory is not private"
+		case errors.As(err, &privacy):
+			detail = privacy.detail
 		case strings.HasPrefix(msg, "make ") && strings.Contains(msg, "writable"):
 			detail = "data directory is not writable"
 		case strings.Contains(msg, "is not a directory"):
@@ -111,8 +112,8 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	checkInstitutionSignInSlot(ctx, db, add)
 	if cfg.Path != "" {
 		if info, err := os.Stat(cfg.Path); err == nil {
-			if info.Mode().Perm()&0o077 != 0 {
-				add("config_permissions", Fail, "configuration is readable by group or others", "chmod 600 "+cfg.Path)
+			if issue := checkPathPrivacy(cfg.Path, info); issue != nil {
+				add("config_permissions", Fail, issue.detail, issue.remediation)
 			} else {
 				add("config_permissions", Pass, "configuration permissions are user-only", "")
 			}
@@ -368,7 +369,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 
 	if workerBinary == "" {
 		add("pdf_worker", Fail, "papio worker executable path is missing", "run doctor from the papio binary")
-	} else if info, err := os.Stat(workerBinary); err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+	} else if err := checkWorkerExecutable(ctx, workerBinary); err != nil {
 		add("pdf_worker", Fail, "papio worker executable is not runnable", "install or rebuild papio and retry")
 	} else {
 		add("pdf_worker", Pass, "isolated pdfcpu worker is runnable", "")
@@ -981,13 +982,16 @@ func checkDataDir(path string) error {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", path, err)
 		}
-	} else {
-		if !info.IsDir() {
-			return fmt.Errorf("%s is not a directory", path)
+		info, err = os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", path, err)
 		}
-		if info.Mode().Perm()&0o077 != 0 {
-			return fmt.Errorf("chmod 0700 %s", path)
-		}
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	if issue := checkPathPrivacy(path, info); issue != nil {
+		return issue
 	}
 	probe, err := os.CreateTemp(path, ".doctor-write-*")
 	if err != nil {
