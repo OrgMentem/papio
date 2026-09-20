@@ -308,6 +308,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Windows native-host installation now works while a browser is connected.**
+  The installer preserves running host copies, publishes the replacement, and
+  restores the prior image if publication fails. Existing connections keep
+  running; new connections use the installed version.
 - **Provider diagnostics can now be saved on Windows.** Capture filenames avoid
   timestamp colons, which Windows rejects. Existing captures remain readable;
   fixture contents and JSON timestamps are unchanged.

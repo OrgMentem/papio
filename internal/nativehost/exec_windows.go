@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/sys/windows"
+
 	"papio/internal/config"
 )
 
@@ -41,37 +43,166 @@ func InstallExecutable(realExe string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	if err := copyExecutable(realExe, path); err != nil {
+	unlock, err := lockExecutableInstall(path)
+	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(targetPath(), []byte(realExe), 0o644); err != nil {
+	defer unlock()
+
+	// Prepare the target before touching the installed image, and publish it
+	// atomically so an error cannot truncate the previous daemon target.
+	target, err := os.CreateTemp(filepath.Dir(path), ".papio-native-host-target-*")
+	if err != nil {
 		return "", err
 	}
+	defer func() { _ = os.Remove(target.Name()) }()
+	if _, err := io.WriteString(target, realExe); err != nil {
+		_ = target.Close()
+		return "", err
+	}
+	if err := target.Close(); err != nil {
+		return "", err
+	}
+	backup, err := copyExecutable(realExe, path)
+	if err != nil {
+		return "", err
+	}
+	// These are separate publications: a browser can launch the new image
+	// before its daemon target is updated.
+	if err := os.Rename(target.Name(), targetPath()); err != nil {
+		return "", errors.Join(err, rollbackExecutable(path, backup))
+	}
+	cleanupExecutableBackups(filepath.Dir(path), realExe)
 	return path, nil
 }
 
-// copyExecutable copies src to dst via a same-dir temp file and rename, so a
-// browser never launches a half-written host.
-func copyExecutable(src, dst string) error {
+// The exclusive handle serializes installers across processes, including target
+// publication and backup cleanup. Closing it (also on process exit) removes the
+// lock file; a competing installer fails promptly instead of interleaving swaps.
+func lockExecutableInstall(path string) (func(), error) {
+	name, err := windows.UTF16PtrFromString(path + ".install.lock")
+	if err != nil {
+		return nil, err
+	}
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.DELETE,
+		0, nil, windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_TEMPORARY|windows.FILE_FLAG_DELETE_ON_CLOSE, 0)
+	if err != nil {
+		return nil, fmt.Errorf("locking native-host installation: %w", err)
+	}
+	return func() { _ = windows.CloseHandle(handle) }, nil
+}
+
+// copyExecutable stages a complete image, then publishes it at the fixed path.
+// The caller holds the install lock and keeps the returned backup until the
+// daemon target is also published. Running Windows images can be renamed aside
+// but cannot be overwritten or necessarily deleted until their process exits.
+func copyExecutable(src, dst string) (string, error) {
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer in.Close()
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".papio-native-host-*.exe")
 	if err != nil {
-		return err
+		return "", err
 	}
 	name := tmp.Name()
 	defer func() { _ = os.Remove(name) }()
 	if _, err := io.Copy(tmp, in); err != nil {
 		_ = tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	return publishExecutable(name, dst)
+}
+
+const executableBackupPrefix = ".papio-native-host-backup-"
+
+func moveExecutableAside(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("native-host executable %q is not a regular file", path)
+	}
+	// Reserve a unique name instead of reusing a backup that may still be a
+	// running image from an earlier upgrade.
+	backup, err := os.CreateTemp(filepath.Dir(path), executableBackupPrefix+"*.exe")
+	if err != nil {
+		return "", err
+	}
+	name := backup.Name()
+	if err := backup.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := os.Rename(path, name); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+func restoreExecutable(backup, path string) error {
+	if backup == "" {
+		return nil
+	}
+	if err := os.Rename(backup, path); err != nil {
+		return fmt.Errorf("restoring native host (previous image retained at %q): %w", backup, err)
+	}
+	return nil
+}
+
+func publishExecutable(staged, path string) (string, error) {
+	backup, err := moveExecutableAside(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(staged, path); err != nil {
+		return "", errors.Join(err, restoreExecutable(backup, path))
+	}
+	return backup, nil
+}
+
+func rollbackExecutable(path, backup string) error {
+	// A browser may already have launched the newly published image. Rename
+	// that aside too, so rollback does not depend on deleting a running image.
+	failed, err := moveExecutableAside(path)
+	if err != nil {
+		return fmt.Errorf("rolling back native host (previous image retained at %q): %w", backup, err)
+	}
+	if err := restoreExecutable(backup, path); err != nil {
 		return err
 	}
-	return os.Rename(name, dst)
+	if failed != "" {
+		_ = os.Remove(failed)
+	}
+	return nil
+}
+
+func cleanupExecutableBackups(dir, source string) {
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		return
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), executableBackupPrefix) && strings.HasSuffix(entry.Name(), ".exe") {
+			info, err := entry.Info()
+			if err != nil || os.SameFile(info, sourceInfo) {
+				continue
+			}
+			// A still-running image remains private here until a later successful
+			// install can remove it. Never terminate a host to reclaim its backup.
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
 }
 
 // RemoveExecutable deletes the host executable and its recorded target.
