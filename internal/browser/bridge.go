@@ -8026,6 +8026,13 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		// that page needs a sign-in remains the resolved handoff's classification.
 		_, err = b.jobs.OpenHumanAction(ctx, jobID, "manual_download", detail,
 			job.Access(requiresAuth, "landing_page"), job.WithHumanActionDiagnosis(diagnosis))
+		if err == nil {
+			// An Open belongs to the route that just finished, not the new
+			// manual task. Reusing it immediately re-offers the retired job
+			// while the browser is relinquishing its drive and tab binding.
+			b.clearMaterializationTracking(jobID)
+			delete(b.reofferPending, jobID)
+		}
 		return err
 
 	case "rate_limited":
@@ -12046,6 +12053,11 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 		AccessMode:    accessMode,
 		RequiresAuth:  action.RequiresAuth,
 		ExpiresAt:     b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339),
+	}
+	if action.Kind == manualDownloadActionKind {
+		// Withholding a generic epoch alone does not prevent a known
+		// adapter's delegated click path from racing the human.
+		payload.AccessMode = config.ModeAssisted
 	}
 	// A manual download is never driven. The action means the human fetches
 	// the file, so the offer exists only to put them on the institution's

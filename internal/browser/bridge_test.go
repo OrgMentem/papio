@@ -2680,6 +2680,9 @@ func TestFocusHandoffsOffersAManualDownloadWithoutDriveAuthority(t *testing.T) {
 			if payload.DriveAttemptID != "" || countType(msgs, protocol.MsgInstitutionalCandidateOffer) != 0 {
 				t.Fatal("manual download received automatic drive authority")
 			}
+			if payload.AccessMode != config.ModeAssisted {
+				t.Fatalf("manual download access mode = %q, want assisted", payload.AccessMode)
+			}
 			later, _ := runSync(t, b)
 			if countJobOffersFor(later, id) != 0 || countType(later, protocol.MsgHandoffFocus) != 0 {
 				t.Fatal("manual handoff repeated without another explicit open")
@@ -5812,6 +5815,9 @@ func TestNativeViewerOutcomeRetiresOccupancyAndCreatesManualTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The operator opened the institutional route. That request must not
+	// transfer to the different manual action created when the route ends.
+	b.focusPending[candidate.JobID] = true
 	if err := b.outcome(ctx, candidate.JobID, "native-viewer-observed", &protocol.ProviderOutcomePayload{Outcome: "native_viewer_download_required"}); err != nil {
 		t.Fatal(err)
 	}
@@ -5835,6 +5841,10 @@ func TestNativeViewerOutcomeRetiresOccupancyAndCreatesManualTask(t *testing.T) {
 	if lease.State != job.AuthenticationEntryLeaseExpired ||
 		lease.OwnerBindingID != "" || lease.OwnerTabHint != nil {
 		t.Fatalf("retired lease = %+v; want expired with no owner surface", lease)
+	}
+	msgs, _ := runSync(t, b)
+	if countJobOffersFor(msgs, candidate.JobID) != 0 || countType(msgs, protocol.MsgHandoffFocus) != 0 {
+		t.Fatal("completed route's Open was reused to drive the new manual task")
 	}
 }
 

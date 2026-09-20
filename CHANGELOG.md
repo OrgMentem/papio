@@ -292,6 +292,11 @@ execution records kept during the initial build.
 
 ### Fixed
 
+- A provider route that ends in a manual-download task no longer reuses the
+  route's earlier Open request. Explicitly opening that task also withholds
+  delegated adapter clicks, so papio does not race the manual download it
+  just requested.
+
 - Browser effect reconciliation now accepts a delayed reply after intervening polls. A busy connection no longer keeps replacing the request before the browser can answer it; uncertain effects still require independent resolution.
 
 - When a provider opens a PDF that needs the browser viewer’s Download button, papio now records a manual task and releases the institution’s sign-in slot. Other queued papers can proceed; the waiting paper remains unfinished.
