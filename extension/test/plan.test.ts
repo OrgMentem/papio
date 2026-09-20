@@ -370,6 +370,34 @@ test("planGeneric prioritizes one declared citation PDF before article links", (
   });
 });
 
+test.each(["Preview PDF", "Download sample PDF", "Abstract PDF", "Download full issue PDF", "Supplementary PDF"])(
+  "planGeneric refuses a %s even when metadata names the same URL",
+  (label) => {
+    const doc = parseHTML(
+      '<meta name="citation_doi" content="10.1000/right">' +
+        '<meta name="citation_pdf_url" content="/download/document.pdf">' +
+        `<main><a href="/download/document.pdf">${label}</a></main>`,
+      "https://publisher.example/article",
+    );
+    const planned = planGeneric(doc, { doi: "10.1000/right" }, { access_mode: "delegated" });
+    expect(planned.candidates).toEqual([]);
+    expect(planned.evidence).toContain("e0:partial-pdf-link=excluded");
+  },
+);
+
+test("planGeneric retains a full PDF beside an explicitly labelled preview", () => {
+  const doc = parseHTML(
+    '<meta name="citation_doi" content="10.1000/right">' +
+      '<main><a href="/download/document.pdf?part=preview" aria-label="Preview PDF">PDF</a>' +
+      '<a href="/download/document.pdf?part=full">Download PDF</a></main>',
+    "https://publisher.example/article",
+  );
+  const planned = planGeneric(doc, { doi: "10.1000/right" }, { access_mode: "delegated" });
+  expect(planned.candidates.map((candidate) => candidate.url)).toEqual([
+    "https://publisher.example/download/document.pdf?part=full",
+  ]);
+});
+
 test("planGeneric pairs JSON-LD PDF URLs only with the record carrying the exact DOI", () => {
   const doc = parseHTML(
     '<script type="application/ld+json">' +

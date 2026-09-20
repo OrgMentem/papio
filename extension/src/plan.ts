@@ -305,12 +305,26 @@ export function planGeneric(
   }
   evidence.push("e0:citation-doi=exact");
 
+  // A page can repeat its preview in PDF metadata. The page's DOI identifies
+  // the work, not the completeness of every linked file. Exclude exact URLs
+  // whose controls explicitly name a different document, from both routes.
+  const partialDocumentURLs = new Set<string>();
+  for (const anchor of Array.from(root.querySelectorAll("a[href]"))) {
+    const words = [anchor.textContent ?? "", ...["title", "aria-label", "id", "class"]
+      .map((name) => anchor.getAttribute(name) ?? "")]
+      .join(" ").replace(/([a-z])([A-Z])/g, "$1 $2");
+    if (!/(?:^|[^a-z])(?:preview|sample|abstract|supplement(?:ary|al)?|full[\s_-]*issue|table[\s_-]*of[\s_-]*contents)(?:[^a-z]|$)/i.test(words)) continue;
+    const parsed = safeURL(anchor.getAttribute("href") ?? "");
+    if (parsed !== null && sameAllowedOrigin(parsed)) partialDocumentURLs.add(parsed.href);
+  }
+  if (partialDocumentURLs.size > 0) evidence.push("e0:partial-pdf-link=excluded");
+
   const declaredCandidates: string[] = [];
   const declaredURLs = [...citationPDFURLs, ...jsonURLs, ...alternatePDFURLs];
   const declaredSeen = new Set<string>();
   for (const raw of declaredURLs) {
     const parsed = safeURL(raw);
-    if (parsed === null || !sameAllowedOrigin(parsed) || parsed.href === page.href) continue;
+    if (parsed === null || !sameAllowedOrigin(parsed) || parsed.href === page.href || partialDocumentURLs.has(parsed.href)) continue;
     if (declaredSeen.has(parsed.href)) continue;
     declaredSeen.add(parsed.href);
     declaredCandidates.push(parsed.href);
@@ -354,6 +368,7 @@ export function planGeneric(
   for (const anchor of articleAnchors) {
     const parsed = safeURL(anchor.getAttribute("href") ?? "");
     if (parsed === null || !routeShape(parsed.pathname) || !sameAllowedOrigin(parsed)) continue;
+    if (partialDocumentURLs.has(parsed.href)) continue;
     if (declaredSeen.has(parsed.href) || articleSeen.has(parsed.href)) continue;
     articleSeen.add(parsed.href);
     articleURLs.push(parsed.href);

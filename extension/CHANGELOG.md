@@ -98,6 +98,11 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Generic downloads exclude files labelled as previews or partial documents.**
+  A matching DOI and PDF metadata cannot override a link labelled as a preview,
+  sample, abstract, supplement, or full issue. A separate full PDF remains
+  eligible, and diagnostics record the excluded links.
+
 - **Ebook Central no longer reports a broken ProQuest article adapter.**
   The book platform now follows the missing-adapter path and preserves its own
   diagnostic evidence. ProQuest article downloads keep their existing route.
