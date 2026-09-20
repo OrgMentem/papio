@@ -21372,6 +21372,7 @@ export class Bridge {
     }
     if (!owner || !track) return;
     if (track.ambiguous || track.ids.size !== 1) return; // zero or multiple matches: stay with the user
+    const downloadDrive = this.handoffDrives.get(owner.job_id);
     const found = await this.deps.downloads.search({ id: delta.id });
     const item = found[0];
     const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
@@ -21503,11 +21504,13 @@ export class Bridge {
         return;
       }
     } else if (mime === "text/html" || mime === "application/xhtml+xml") {
-      // The provider served a web page where the PDF should be — the classic
-      // no-entitlement wrapper (SAGE "get access"). Adopting it would only
-      // bounce off the daemon's %PDF validation and burn a round trip, so
-      // refuse here, discard the file, and tell the daemon why. The job stays
-      // parked with its human actions; the tab stays for the human.
+      // HTML proves only that this download failed. It cannot distinguish a
+      // login wall, viewer wrapper, challenge or broken adapter, so retain the
+      // daemon's action and diagnostic-only error. Release the browser drive
+      // without fabricating a provider outcome or retrying this page.
+      // search/removeFile yield: a late completion must not retire a newer
+      // download or park a replacement drive for the same job.
+      if (this.downloads.get(owner.job_id) !== track) return;
       await this.discardDownload(owner.job_id, delta.id);
       this.send(
         "error",
@@ -21518,6 +21521,21 @@ export class Bridge {
         },
         owner.job_id,
       );
+      const current = findByJob(this.store, owner.job_id);
+      if (
+        downloadDrive !== undefined &&
+        this.handoffDrives.get(owner.job_id) === downloadDrive &&
+        current?.tab_id === owner.tab_id &&
+        !this.downloads.has(owner.job_id)
+      ) {
+        this.classifyRetries.delete(owner.job_id);
+        await this.update((s) => patchJob(s, owner.job_id, {
+          status: "queued",
+          engagement_required: true,
+          download_initiated: false,
+        }));
+        await this.parkHandoffForManual(owner.job_id);
+      }
       return;
     }
     if (track.generic !== undefined) {

@@ -10708,6 +10708,14 @@ test("an HTML adapter download is refused, discarded, and reported as download_n
   expect(error?.job_id).toBe("job_0020_html_trap");
   expect(error?.payload["code"]).toBe("download_not_pdf");
   expect(h.downloads.removedFiles).toContain(7);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({
+    tab_id: tabID,
+    status: "queued",
+    engagement_required: true,
+    parked_with_tab: true,
+    download_initiated: false,
+  });
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
 
   // A genuine PDF on the same job afterwards still adopts normally.
   await h.downloads.onCreated.emit({
@@ -10726,6 +10734,74 @@ test("an HTML adapter download is refused, discarded, and reported as download_n
   await h.downloads.onChanged.emit({ id: 8, state: { current: "complete" } });
   expect(h.frames().some((f) => f.type === "download_complete")).toBe(true);
 });
+
+test("an HTML adapter failure frees the next drive and stays parked across restart", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_html_park"));
+  const tabID = findByJob(h.backend.store, "job_html_park")!.tab_id;
+  await h.port.inbound(jobOffer("job_after_html"));
+  expect(findByJob(h.backend.store, "job_after_html")!.tab_id).toBe(-1);
+  await h.downloads.onCreated.emit({ id: 7, tabId: tabID, state: "in_progress" });
+  h.downloads.items.set(7, { id: 7, tabId: tabID, mime: "application/xhtml+xml", state: "complete" });
+  await h.downloads.onChanged.emit({ id: 7, state: { current: "complete" } });
+  expect(findByJob(h.backend.store, "job_after_html")!.tab_id).toBeGreaterThanOrEqual(0);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(jobOffer("job_html_park"));
+  expect(findByJob(restarted.backend.store, "job_html_park")).toMatchObject({
+    status: "queued", engagement_required: true, parked_with_tab: true,
+  });
+  const internals = restarted.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  expect(internals.handoffDrives.has("job_html_park")).toBe(false);
+  expect(restarted.downloads.started).toHaveLength(0);
+});
+
+for (const stage of ["search", "removeFile"] as const) {
+  test(`a late HTML completion during ${stage} leaves a replacement drive intact`, async () => {
+    const h = makeHarness();
+    const jobID = "job_html_replaced";
+    await h.bridge.start();
+    await h.port.inbound(jobOffer(jobID));
+    const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+    await h.downloads.onCreated.emit({ id: 7, tabId: tabID, state: "in_progress" });
+    h.downloads.items.set(7, { id: 7, tabId: tabID, mime: "text/html", state: "complete" });
+    let replacementTab = -1;
+    const replaceDrive = async () => {
+      await h.port.inbound({ protocol: "papio-browser/1", type: "cancel", msg_id: "cancel-old-html", seq: 9, job_id: jobID, payload: {} });
+      await h.port.inbound(jobOffer(jobID));
+      replacementTab = findByJob(h.backend.store, jobID)!.tab_id;
+      await h.downloads.onCreated.emit({ id: 8, tabId: replacementTab, state: "in_progress" });
+    };
+    if (stage === "search") {
+      const search = h.downloads.search.bind(h.downloads);
+      h.downloads.search = async (query) => {
+        const items = await search(query);
+        if (query.id === 7) await replaceDrive();
+        return items;
+      };
+    } else {
+      h.downloads.removeFile = async (id) => {
+        h.downloads.removedFiles.push(id);
+        if (id === 7) await replaceDrive();
+      };
+    }
+    await h.downloads.onChanged.emit({ id: 7, state: { current: "complete" } });
+    expect(replacementTab).toBeGreaterThanOrEqual(0);
+    expect(findByJob(h.backend.store, jobID)).toMatchObject({
+      tab_id: replacementTab, status: "accepted", download_initiated: true,
+    });
+    expect(findByJob(h.backend.store, jobID)!.parked_with_tab).not.toBe(true);
+    h.downloads.items.set(8, { id: 8, tabId: replacementTab, mime: "application/pdf", filename: "/Downloads/real.pdf", fileSize: 91, state: "complete" });
+    await h.downloads.onChanged.emit({ id: 8, state: { current: "complete" } });
+    expect(h.frames().filter(f => f.type === "download_complete").map(f => f.payload["download_id"])).toEqual([8]);
+  });
+}
 
 test("popup capture relay emits page_capture only after the daemon advertises it", async () => {
   const h = makeHarness();

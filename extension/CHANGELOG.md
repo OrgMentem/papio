@@ -108,6 +108,11 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- An adapter download that returns HTML now frees its browser drive slot and
+  stays parked across worker restarts. The page remains available for the
+  operator, and a later PDF can still be adopted. HTML alone does not establish
+  missing access or adapter drift; late results cannot park a newer attempt.
+
 - **PLOS ONE printable PDFs download through the browser handoff.** The
   extension recognizes the exact article-file route, which has no `.pdf`
   suffix, instead of reporting a missing HTML adapter. Supplement IDs,
