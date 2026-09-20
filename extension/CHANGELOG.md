@@ -18,6 +18,11 @@ for the full pre-split extension history.
 
 ### Added
 
+- **IOS Press ebooks open-access articles can download through their own PDF
+  form.** The adapter checks the page DOI, license marker and scoped form
+  control before clicking. A fresh Chrome probe downloaded and validated the
+  correct five-page paper without an Open action or manual PDF click.
+
 - **Figshare records can report that their files are not public.** The adapter
   recognizes the captured unavailable-file status heading and lets papio try
   another route. It does not treat that message as missing adapter support or

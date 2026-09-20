@@ -236,6 +236,30 @@ export function adapterSupportsHost(host: string, spec: AdapterSpec): boolean {
  */
 export const adapters: AdapterSpec[] = [
   {
+    // Captured 2026-09-20 on an open-access IOS Press ebooks article. The
+    // page owns a POST form and a JS-backed div control; no PDF URL is exposed.
+    // Click only that form's control, with the page DOI and license present.
+    id: "iospress",
+    version: "0.1.0",
+    hosts: ["ebooks.iospress.nl"],
+    requiresVisible: true,
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
+    classify: [{
+      kind: "article",
+      all: [
+        "meta[name='citation_title']",
+        "main#contentcolumn .content > .actions > .openaccesslicense a[rel='license'][href^='https://creativecommons.org/licenses/']",
+        "main#contentcolumn .content > .actions > form[action='/Download/Pdf'][method='post'][id^='downloadform'] > div.button.getpdf[id^='downloadlink']:not([aria-disabled='true']):not([disabled])",
+      ],
+    }],
+    download: {
+      selector: "main#contentcolumn .content > .actions > form[action='/Download/Pdf'][method='post'][id^='downloadform'] > div.button.getpdf[id^='downloadlink']:not([aria-disabled='true']):not([disabled])",
+      requireKind: "article",
+      workTarget: { kind: "opaque" },
+      method: "click",
+    },
+  },
+  {
     id: "chemrxiv",
     version: "0.1.0",
     hosts: ["chemrxiv.org"],
