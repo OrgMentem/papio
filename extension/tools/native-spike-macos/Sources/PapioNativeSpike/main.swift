@@ -19,14 +19,17 @@ final class NativeSpike {
     var delivery = "ax"
     var nativeDialog = false
     var attention = "background"
+    var monitor: PassiveMonitor?
 
-    func status() -> [String: Any] {
+    func status(timeout: Float? = nil) -> [String: Any] {
         // Query the AX server directly: NSWorkspace notifications need a run
         // loop and may otherwise leave a long-lived command helper with stale
         // foreground state.
         var focusedApplication: CFTypeRef?
         var frontPID: pid_t = 0
-        let focusError = AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &focusedApplication)
+        let system = AXUIElementCreateSystemWide()
+        if let timeout { AXUIElementSetMessagingTimeout(system, timeout) }
+        let focusError = AXUIElementCopyAttributeValue(system, kAXFocusedApplicationAttribute as CFString, &focusedApplication)
         if focusError == .success,
            let focusedApplication, CFGetTypeID(focusedApplication) == AXUIElementGetTypeID() {
             AXUIElementGetPid(focusedApplication as! AXUIElement, &frontPID)
@@ -43,10 +46,13 @@ final class NativeSpike {
         let pointer = CGEvent(source: nil)?.location
         var focusedWindow: CFTypeRef?
         if frontPID != 0 {
-            AXUIElementCopyAttributeValue(AXUIElementCreateApplication(frontPID), kAXFocusedWindowAttribute as CFString, &focusedWindow)
+            let app = AXUIElementCreateApplication(frontPID)
+            if let timeout { AXUIElementSetMessagingTimeout(app, timeout) }
+            AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focusedWindow)
         }
         var windowID: CGWindowID = 0
         if let focusedWindow, CFGetTypeID(focusedWindow) == AXUIElementGetTypeID() {
+            if let timeout { AXUIElementSetMessagingTimeout(focusedWindow as! AXUIElement, timeout) }
             windowID = AXWindowResolver().windowID(from: focusedWindow as! AXUIElement) ?? 0
         }
         return ["trusted": AXIsProcessTrusted(), "frontPID": Int(frontPID), "focusObserved": frontPID != 0 && windowID != 0,
@@ -190,6 +196,15 @@ final class NativeSpike {
 
     func request(_ input: [String: Any]) throws -> [String: Any] {
         switch input["method"] as? String {
+        case "start_monitor":
+            guard monitor == nil else { throw SpikeError.invalidRequest }
+            let observer = try PassiveMonitor()
+            monitor = observer
+            return observer.started
+        case "stop_monitor":
+            guard let monitor else { throw SpikeError.invalidRequest }
+            defer { self.monitor = nil }
+            return try monitor.stop()
         case "status": return status()
         case "configure": return try configure(input)
         case "observe": return try observe()
@@ -201,7 +216,12 @@ final class NativeSpike {
 
 @main struct Main {
     @MainActor static func main() {
+        if CommandLine.arguments.dropFirst().first == "--passive-monitor" {
+            PassiveMonitor.runObserver()
+            return
+        }
         let helper = NativeSpike()
+        defer { _ = try? helper.monitor?.stop() }
         while let line = readLine() {
             var response: [String: Any]
             do {

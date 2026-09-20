@@ -45,6 +45,7 @@ async function rpc(input: Record<string, unknown>): Promise<any> {
     return response.result;
   } finally { clearTimeout(timer); }
 }
+let monitorRunning = false;
 let current: NativeObservation | undefined;
 const driver: NativeDriver = {
   observe: async () => {
@@ -92,6 +93,7 @@ const backend: DecisionBackend = {
 try {
   const baseline = await rpc({ method: "configure", prefix: `${fixtureURL.origin}${fixture.prefix}`, delivery: values.delivery, attention: values.attention, goal: "Open the main article PDF in the browser viewer, then use Download and Save to save it to disk. Related reference PDFs are not the main article." });
   record({ kind: "baseline", ...baseline, backend: values.backend });
+  record({ kind: "monitor_start", ...await rpc({ method: "start_monitor" }) }); monitorRunning = true;
   if (values.inspect) {
     const observation = await driver.observe();
     writeFileSync(`${dir}/observation.json`, JSON.stringify(observation, null, 2) + "\n", { mode: 0o600, flag: "wx" });
@@ -100,10 +102,14 @@ try {
     let result = await runNativeLoop(driver, backend, { maxDecisions: Number(values["max-decisions"]), noProgressMs: Number(values["no-progress-seconds"]) * 1000,
       signal: deadline, wait: () => new Promise(resolve => setTimeout(resolve, 500)), record, allowOwnedFocusChanges: values.attention === "owned" });
     const final = await rpc({ method: "status" });
+    const monitor = await rpc({ method: "stop_monitor" }); monitorRunning = false;
+    writeFileSync(`${dir}/monitor.json`, JSON.stringify(monitor, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+    record({ kind: "monitor_stop", ...monitor });
     // Also check settling/last-download time, after the action-level samples.
     const pointerChanged = !baseline.pointerObserved || !final.pointerObserved || baseline.pointerX !== final.pointerX || baseline.pointerY !== final.pointerY;
     const appChanged = !baseline.focusObserved || !final.focusObserved || baseline.frontPID !== final.frontPID;
-    if (pointerChanged || appChanged || (values.attention === "background" && baseline.frontWindow !== final.frontWindow)) {
+    if (pointerChanged || appChanged || monitor.changeCounts.pointer > 0 || monitor.changeCounts.app > 0 ||
+        (values.attention === "background" && (baseline.frontWindow !== final.frontWindow || monitor.changeCounts.window > 0))) {
       record({ kind: "attention_changed_by_end", baseline, final, downloadResult: result });
       result = { status: "interference", decisions: result.decisions };
     }
@@ -113,4 +119,10 @@ try {
 } catch (error) {
   writeFileSync(`${dir}/failure.json`, JSON.stringify({ status: "failed", error: error instanceof Error ? error.message : "Native run failed" }) + "\n", { mode: 0o600, flag: "wx" });
   throw error;
-} finally { proc.stdin.end(); proc.kill(); }
+} finally {
+  if (monitorRunning && !deadline.aborted) {
+    try { writeFileSync(`${dir}/monitor.json`, JSON.stringify(await rpc({ method: "stop_monitor" }), null, 2) + "\n", { mode: 0o600, flag: "wx" }); }
+    catch { /* Failure/deadline remains primary; absence of the report is not quietness. */ }
+  }
+  proc.stdin.end(); proc.kill();
+}

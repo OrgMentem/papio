@@ -136,3 +136,55 @@ and any native attention lease need the next live evidence.
 The first publisher acceptance still requires a fresh isolated job, a downloaded
 and adopted PDF, identity validation, and first-page/page-count inspection. The
 subsequent repaired declarative route must independently produce that result.
+
+## Background page follow-up
+
+The next development runner is `extension/tools/page-spike-run.ts`. It builds a
+nonce-scoped controller page into the existing unpacked extension's ignored
+`dist/` directory. The controller creates one inactive loopback fixture tab and
+uses `chrome.scripting`, `chrome.tabs` and `chrome.downloads`; it never attaches a
+debugger. The page observer retains actual DOM elements in the isolated world,
+uses opaque choices and a per-document identity, and refuses changed links,
+replaced nodes, disabled controls and duplicate delivery. The fixture includes
+an article link, a button that reveals download options, a PDF link and unrelated
+references. This remains fixture tooling, not production acquisition authority.
+
+The first browser attempt failed: Chrome refuses `scripting.executeScript` on
+an extension's own page, including its own packaged fixture. The runner now
+serves the fixture on loopback HTTP. This requires temporary activeTab access,
+which the existing Papio toolbar action can grant on that one fixture tab.
+Permission approval is required by this session's explicit user instructions.
+No permission was granted and no background-download success is claimed yet.
+
+```sh
+bun run extension/tools/page-spike-run.ts \
+  --run-dir dev/scratch/page-spike-example \
+  --extension-id YOUR_UNPACKED_EXTENSION_ID \
+  --monitor-helper dev/scratch/native-spike-swift-build/debug/papio-native-spike \
+  --backend local-fixture
+```
+
+Open the printed controller URL. Once authorized, select the local fixture tab
+and invoke Papio's toolbar action. Return to the previous foreground app, then
+POST to the printed `startURL` from the terminal. Use a fresh run with `--backend
+jev` for model acceptance; the same Keychain authorization and private receipts
+apply. Closing the fixture tab revokes its activeTab access. The runner closes
+its owned fixture on completion, cancellation or its five-minute setup timeout;
+close the controller tab separately and remove only its printed generated bundle
+directory. Generated bundles are development artifacts and must not ship.
+
+The native helper now supports `start_monitor` / `stop_monitor`. A separate
+child samples app, window and pointer state every 25 ms while inference and UI
+operations run. Reports include missing samples, gaps over 75 ms, maximum read
+latency and bounded change history. A live one-second smoke check produced 41
+samples, no missing channels and one startup gap. These are polling observations:
+fast transitions and keyboard-focus changes inside the same window can still be
+missed. Native runs retain the report and classify observed disallowed transitions
+as interference; the page runner records the independent report alongside the
+actual download result. Missing data or a missing report never proves quietness.
+
+The helper build, standalone report-accumulation checks, 20 focused extension
+tests and TypeScript check pass. The full extension suite passes 1,714 tests
+with one skip. Both test-owned tabs were closed, leaving the original 21 tabs;
+the generated controller bundles and loopback servers were removed/stopped. The new browser action path still needs its
+permission-approved live run, followed by publisher and adoption validation.
