@@ -5,7 +5,8 @@ import { readFileSync } from "node:fs";
 
 import { adapters, type AdapterSpec } from "../src/adapters/types";
 import { planExecution } from "../src/plan";
-import { synthesizeAdapterRepair } from "../tools/adapter-repair";
+import { candidateSpec, synthesizeAdapterRepair } from "../tools/adapter-repair";
+import { patchedAdapterSource } from "../tools/adapter-repair-source";
 import { captureOrigin, fixturePath, parseHTML } from "./harness";
 
 const REPAIR_SPEC: AdapterSpec = {
@@ -16,6 +17,48 @@ const REPAIR_SPEC: AdapterSpec = {
   classify: [{ kind: "article", all: ["meta[name='citation_doi']", ".old-pdf"] }],
   download: { selector: ".old-pdf", requireKind: "article", method: "click", workTarget: { kind: "opaque" } },
 };
+
+test("repair searches later article rules without weakening an earlier access rule", () => {
+  const spec = structuredClone(REPAIR_SPEC);
+  spec.classify = [
+    { kind: "login", all: ["#login", ".old-pdf"] },
+    { kind: "article", all: ["#legacy", ".old-pdf"] },
+    { kind: "article", all: ["#current", ".old-pdf"] },
+  ];
+  const html = `<meta name="citation_doi" content="10.1000/repair"><div id="login"></div>
+    <main id="current"><a id="article-pdf" href="/paper.pdf">Download PDF</a></main>`;
+  const result = synthesizeAdapterRepair(html, spec, "drift", "article", 1);
+  const top = result.candidates[0]!;
+  expect(top).toMatchObject({ rule_index: 2, plan_complete: true, replace_selector: ".old-pdf" });
+  const trial = candidateSpec(spec, top.rule_index, top.replace_selector, top.selector);
+  expect(trial.classify.slice(0, 2)).toEqual(spec.classify.slice(0, 2));
+  expect(planExecution(parseHTML(html), trial, { doi: "10.1000/repair" }, {}).verdict.kind).toBe("article");
+});
+
+test("source patch changes exactly the verified literal fields, preserving sibling rules and comments", () => {
+  const spec = structuredClone(REPAIR_SPEC);
+  spec.classify.unshift({ kind: "login", all: [".old-pdf", "#login"] });
+  const source = `export const adapters: AdapterSpec[] = [\n// .old-pdf stays in this comment — { kind: "article" }\n${JSON.stringify(spec, null, 2)}\n];`;
+  const trial = candidateSpec(spec, 1, ".old-pdf", "a[data-action='download-pdf']");
+  trial.version = "1.0.1";
+  const patched = patchedAdapterSource(source, spec, trial);
+  expect(patched).toContain('// .old-pdf stays in this comment — { kind: "article" }');
+  const parsed = JSON.parse(patched.slice(patched.indexOf('{\n'), patched.lastIndexOf('\n]')));
+  expect(parsed).toEqual(trial);
+  expect(parsed.classify[0]).toEqual(spec.classify[0]);
+  expect(patched.split('\n')).toHaveLength(source.split('\n').length);
+  expect(() => patchedAdapterSource(source.replace('"1.0.0"', '"9.9.9"'), spec, trial)).toThrow("differs from the spec");
+});
+
+test("a working earlier rule does not fabricate drift in a later article rule", () => {
+  const spec = structuredClone(REPAIR_SPEC);
+  spec.classify.unshift({ kind: "article", all: ["#working"] });
+  spec.download!.selector = "#working";
+  const html = `<meta name="citation_doi" content="10.1000/repair"><a id="working" href="/paper.pdf">Download PDF</a>`;
+  const result = synthesizeAdapterRepair(html, spec, "drift", "article");
+  expect(result.candidates.every(candidate => candidate.replace_selector === null)).toBe(true);
+  expect(result.blockers).toContain("The current adapter already produces a complete plan; no selector repair is needed.");
+});
 
 test("ranking selects the stable article PDF id and the proven missing target", () => {
   const html =

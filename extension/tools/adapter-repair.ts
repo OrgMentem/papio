@@ -4,18 +4,21 @@ import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
 import { adapters, type AdapterSpec, type ClassifyRule, type PageKind } from "../src/adapters/types";
-import { planExecution, type ExpectedWork } from "../src/plan";
+import { planExecution, type ExpectedWork, type PlanResult } from "../src/plan";
 import { captureOrigin, verdictOf } from "../test/harness";
+import { patchedAdapterSource } from "./adapter-repair-source";
 
 export type RepairRuleKind = Exclude<PageKind, "unknown">;
 
 export interface SelectorCandidate {
+  rule_index: number;
   score: number;
   selector: string;
   outer_html: string;
   classifier_verified: boolean;
   plan_complete: boolean;
   replace_selector: string | null;
+  blocked_by: string[];
 }
 
 export interface AdapterRepairOutput {
@@ -24,6 +27,8 @@ export interface AdapterRepairOutput {
   rule_kind: RepairRuleKind;
   rule_index: number;
   candidates: SelectorCandidate[];
+  patched_source?: string;
+  blockers: string[];
 }
 
 interface RankedSelector {
@@ -232,7 +237,7 @@ function replacementTarget(doc: Document, rule: ClassifyRule): string | null {
   return null;
 }
 
-function candidateSpec(spec: AdapterSpec, ruleIndex: number, replaceSelector: string | null, candidate: string): AdapterSpec {
+export function candidateSpec(spec: AdapterSpec, ruleIndex: number, replaceSelector: string | null, candidate: string): AdapterSpec {
   const sourceRule = spec.classify[ruleIndex];
   if (sourceRule === undefined) throw new Error(`rule index ${ruleIndex} is unavailable`);
   if (replaceSelector === null) return structuredClone(spec);
@@ -317,10 +322,8 @@ export function synthesizeAdapterRepair(
     }
   }
   const doc = parseOfflineCapture(html, base, onFetchAttempt);
-  const ruleIndex = spec.classify.findIndex((rule) => rule.kind === ruleKind);
-  if (ruleIndex < 0) throw new Error(`adapter ${spec.id} has no ${ruleKind} rule`);
-  const rule = spec.classify[ruleIndex] as ClassifyRule;
-  const replaceSelector = replacementTarget(doc, rule);
+  const ruleIndexes = spec.classify.flatMap((rule, index) => rule.kind === ruleKind ? [index] : []);
+  if (ruleIndexes.length === 0) throw new Error(`adapter ${spec.id} has no ${ruleKind} rule`);
   const ranked = semanticNodes(doc, ruleKind).flatMap(selectorsFor);
   const bySelector = new Map<string, RankedSelector>();
   for (const item of ranked) {
@@ -329,18 +332,22 @@ export function synthesizeAdapterRepair(
     if (prior === undefined || item.score > prior.score) bySelector.set(item.selector, item);
   }
   const expected = expectedWorkFor(doc, spec);
+  const complete = (plan: PlanResult): boolean => verdictOf(plan).kind === ruleKind && !("assisted" in plan) &&
+    (ruleKind !== "article" || (plan.method !== null && plan.required_consequence === "download"));
+  const currentComplete = complete(planExecution(doc, spec, expected, {}));
   const hasFixtureIdentity = ruleKind !== "article" || expected.doi !== undefined || expected.title !== undefined;
   // A PDF control proves nothing about a separate missing access/identity
   // check. Such candidates may classify, but must not unlock a source patch.
-  const repairsDeclaredTarget = ruleKind !== "article" || replaceSelector === null ||
-    replaceSelector === spec.download?.selector ||
-    replaceSelector === spec.download?.shadowSelector ||
-    replaceSelector === spec.download?.postClickWaitFor ||
-    replaceSelector === spec.download?.followupSelector ||
-    replaceSelector === spec.download?.workTarget?.selector;
+  const candidates = ruleIndexes.flatMap((ruleIndex) => {
+    const replaceSelector = currentComplete ? null : replacementTarget(doc, spec.classify[ruleIndex]!);
+    const repairsDeclaredTarget = ruleKind !== "article" || replaceSelector === null ||
+      replaceSelector === spec.download?.selector ||
+      replaceSelector === spec.download?.shadowSelector ||
+      replaceSelector === spec.download?.postClickWaitFor ||
+      replaceSelector === spec.download?.followupSelector ||
+      replaceSelector === spec.download?.workTarget?.selector;
 
-  const candidates = Array.from(bySelector.values())
-    .map((item): SelectorCandidate => {
+    return Array.from(bySelector.values()).map((item): SelectorCandidate => {
       const trial = candidateSpec(spec, ruleIndex, replaceSelector, item.selector);
       const planned = planExecution(doc, trial, expected, {});
       const classifierVerified = verdictOf(planned).kind === ruleKind;
@@ -361,23 +368,36 @@ export function synthesizeAdapterRepair(
         [item.node.textContent, ...["title", "aria-label", "id", "class"].map((name) => item.node.getAttribute(name))]
           .some((value) => /(?:download[\s_-]*pdf|pdf[\s_-]*download)/i.test(value ?? ""))
       );
+      const blockedBy: string[] = [];
+      if (!classifierVerified) blockedBy.push(`Proposed selector still classifies as ${verdictOf(planned).kind}.`);
+      if (!hasFixtureIdentity) blockedBy.push("Capture lacks the adapter's required work identity evidence.");
+      if (!repairsDeclaredTarget) blockedBy.push("A PDF control cannot replace a separate access or identity check.");
+      if (!hasPDFAffordance) blockedBy.push("Candidate does not identify the requested article PDF.");
+      if ("assisted" in planned) blockedBy.push(`Planner refused: ${planned.assisted}.`);
+      else if (classifierVerified && !complete(planned)) blockedBy.push("Plan has no declared download action.");
       return {
+        rule_index: ruleIndex,
         score: item.score + (explicitPDFDownload ? 100 : 0),
         selector: item.selector,
         outer_html: truncateOuterHTML(item.node),
         classifier_verified: classifierVerified,
-        plan_complete: classifierVerified && hasFixtureIdentity && repairsDeclaredTarget && hasPDFAffordance && !("assisted" in planned),
+        plan_complete: blockedBy.length === 0,
         replace_selector: replaceSelector,
+        blocked_by: blockedBy,
       };
-    })
+    });
+  })
     // A lexical score cannot prove that a control downloads the article. Verify
     // before limiting output, or generic full-text controls can hide every repair.
     .sort((a, b) => Number(b.plan_complete) - Number(a.plan_complete) ||
       Number(b.classifier_verified) - Number(a.classifier_verified) ||
-      b.score - a.score || a.selector.localeCompare(b.selector))
+      b.score - a.score || a.rule_index - b.rule_index || a.selector.localeCompare(b.selector))
     .slice(0, Math.max(0, limit));
 
-  return { provider: spec.id, scenario, rule_kind: ruleKind, rule_index: ruleIndex, candidates };
+  const blockers = currentComplete ? ["The current adapter already produces a complete plan; no selector repair is needed."] :
+    candidates.length === 0 ? [`Capture has no candidate controls for the ${ruleKind} rule.`, ...(!hasFixtureIdentity ? ["Capture lacks the adapter's required work identity evidence."] : [])] :
+    candidates.some(candidate => candidate.plan_complete) ? [] : [...new Set(candidates.flatMap(candidate => candidate.blocked_by))];
+  return { provider: spec.id, scenario, rule_kind: ruleKind, rule_index: candidates[0]?.rule_index ?? ruleIndexes[0]!, candidates, blockers };
 }
 
 interface Args {
@@ -385,6 +405,7 @@ interface Args {
   id: string;
   scenario: string;
   ruleKind: RepairRuleKind;
+  nextRevision?: string;
 }
 
 function usage(message?: string): never {
@@ -399,12 +420,14 @@ function parseArgs(argv: string[]): Args {
   let id: string | undefined;
   let scenario: string | undefined;
   let ruleKind: RepairRuleKind | undefined;
+  let nextRevision: string | undefined;
   for (let i = 1; i < argv.length; i += 1) {
     const flag = argv[i];
     const value = argv[i + 1];
     if (value === undefined) usage(`${flag ?? "flag"} requires a value`);
     if (flag === "--id") id = value;
     else if (flag === "--scenario") scenario = value;
+    else if (flag === "--next-revision") nextRevision = value;
     else if (flag === "--rule-kind") {
       if (!["article", "login", "terms", "no_entitlement", "wrong_work_check"].includes(value)) {
         usage(`unsupported rule kind: ${value}`);
@@ -414,7 +437,7 @@ function parseArgs(argv: string[]): Args {
     i += 1;
   }
   if (id === undefined || scenario === undefined || ruleKind === undefined) usage();
-  return { htmlPath, id, scenario, ruleKind };
+  return { htmlPath, id, scenario, ruleKind, ...(nextRevision === undefined ? {} : { nextRevision }) };
 }
 
 function main(): void {
@@ -422,7 +445,14 @@ function main(): void {
   const spec = adapters.find((item) => item.id === args.id);
   if (spec === undefined) usage(`no registered adapter with id "${args.id}"`);
   const html = readFileSync(args.htmlPath, "utf8");
-  process.stdout.write(`${JSON.stringify(synthesizeAdapterRepair(html, spec, args.scenario, args.ruleKind), null, 2)}\n`);
+  const result = synthesizeAdapterRepair(html, spec, args.scenario, args.ruleKind);
+  const top = result.candidates.find(candidate => candidate.plan_complete && candidate.replace_selector !== null);
+  if (top !== undefined && args.nextRevision !== undefined && args.nextRevision !== "unknown") {
+    const trial = candidateSpec(spec, top.rule_index, top.replace_selector, top.selector);
+    trial.version = args.nextRevision;
+    result.patched_source = patchedAdapterSource(readFileSync(new URL("../src/adapters/types.ts", import.meta.url), "utf8"), spec, trial);
+  }
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 if (import.meta.main) main();

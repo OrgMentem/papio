@@ -11,6 +11,13 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Adapter repair proposals now preserve the exact verified change.** The
+  generator examines later rules as well as the first, edits parsed source
+  fields without changing sibling rules, and explains blocked proposals.
+  Separate workspaces prevent stale patches from leaking into repeat runs.
+  Generated regressions preserve existing fixtures, fail if their capture is
+  missing, and use its real origin. CI applies the generated patch and checks
+  that the regression fails before it and passes afterward.
 - **Retry a failed resolver route through the paper's DOI.**
   `papio actions retry-publisher <action-id> --revision <revision>` starts one
   publisher attempt after a wrong-page or adapter failure. The original action

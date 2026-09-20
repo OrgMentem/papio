@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,7 +94,7 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 		Now:      func() time.Time { return time.Date(2026, 8, 10, 2, 3, 4, 0, time.UTC) },
 		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, args ...string) (string, error) {
 			if tool == "tools/adapter-repair.ts" {
-				return completeAdapterRepairCandidate, nil
+				return completeAdapterRepairOutput(t, root), nil
 			}
 			runnerPath = args[0]
 			data, readErr := os.ReadFile(runnerPath)
@@ -121,7 +123,7 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 	if string(runnerBytes) != string(emitted) {
 		t.Fatalf("adapter-try received bytes different from emitted fixture")
 	}
-	finalFixture, err := os.ReadFile(filepath.Join(result.Workspace, "extension", "fixtures", "jstor", "success.html"))
+	finalFixture, err := os.ReadFile(filepath.Join(result.Workspace, "extension", "fixtures", "jstor", "repair-"+row.SHA256+".html"))
 	if err != nil || string(finalFixture) != string(fixture) {
 		t.Fatalf("final fixture = %q, %v; want canonical bytes", finalFixture, err)
 	}
@@ -134,7 +136,7 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 	if !strings.Contains(string(report), "Fixture SHA-256: `"+hex.EncodeToString(sum[:])+"`") ||
 		!strings.Contains(string(report), "plan fixture sha256="+hex.EncodeToString(sum[:])) ||
 		!strings.Contains(string(report), "Top candidate with a complete plan: `a#pdf-download`") ||
-		!strings.Contains(string(report), "confirm the article file against live `%PDF` bytes") {
+		!strings.Contains(string(report), "downloaded, adopted, identity-validated PDF") {
 		t.Fatalf("report does not certify the fixture and bound candidate: %s", report)
 	}
 	if result.NextRevision != "0.3.1" {
@@ -144,12 +146,10 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectedApply := "# Apply this reviewed repair\n\nClassifier verification does not prove that an article candidate returns PDF bytes. Confirm the candidate against live `%PDF` bytes first.\n\n" +
-		"Run from the repository root after reviewing `report.md` and both generated diffs.\n\n```sh\n" +
-		"git apply dev/scratch/repair/jstor-20260810T020304Z/adapters.test.ts.patch dev/scratch/repair/jstor-20260810T020304Z/types.ts.patch\n" +
-		"mkdir -p extension/fixtures/jstor\n" +
-		"cp dev/scratch/repair/jstor-20260810T020304Z/extension/fixtures/jstor/success.html extension/fixtures/jstor/success.html\n" +
-		"(cd extension && bun test test/adapters.test.ts)\n```\n"
+	rel, _ := filepath.Rel(root, result.Workspace)
+	fixtureName := "repair-" + row.SHA256 + ".html"
+	expectedApply := fmt.Sprintf("# Apply this reviewed repair\n\nThis is a development proposal, not a verified provider repair. Review the fixture for private data before copying it into tracked source.\n\nRun from an isolated development checkout after reviewing `report.md` and both generated diffs.\n\n```sh\ngit apply %s/adapters.test.ts.patch %s/types.ts.patch\nmkdir -p extension/fixtures/jstor\ncp %s/extension/fixtures/jstor/%s extension/fixtures/jstor/%s\n(cd extension && bun test test/adapters.test.ts)\n```\n\nThen run the full extension tests, typecheck and both builds. Reload the development extension and confirm its new browser session ID. Use a fresh isolated acquisition with imports disabled; record Open actions, sign-ins and other interventions separately. Require download, adoption and validation, then inspect the PDF first page and page count. A passing fixture is not live acceptance.\n", rel, rel, rel, fixtureName, fixtureName)
+
 	if string(apply) != expectedApply {
 		t.Fatalf("apply.md = %q; want %q", apply, expectedApply)
 	}
@@ -240,7 +240,7 @@ func TestScaffoldAdapterRepairKeepsRevisionLockedWithoutIndependentEvidence(t *t
 		Now:      func() time.Time { return time.Date(2026, 8, 10, 4, 5, 6, 0, time.UTC) },
 		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, _ ...string) (string, error) {
 			if tool == "tools/adapter-repair.ts" {
-				return completeAdapterRepairCandidate, nil
+				return completeAdapterRepairOutput(t, root), nil
 			}
 			return "adapter-try found a missing selector", nil
 		}),
@@ -356,4 +356,29 @@ func storeAdapterRepairScenarioCapture(t *testing.T, root, scenario string, inde
 		t.Fatalf("capture rows = %#v, %v", rows, err)
 	}
 	return rows[0], fixture
+}
+
+// The unit runner supplies already-edited source; the cross-language cycle
+// test exercises the real parser and emitter rather than this seam.
+func completeAdapterRepairOutput(t *testing.T, root string) string {
+	t.Helper()
+	var result map[string]any
+	if err := json.Unmarshal([]byte(completeAdapterRepairCandidate), &result); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "extension", "src", "adapters", "types.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	start := strings.Index(source, `id: "jstor"`)
+	version := strings.Index(source[start:], `version: "0.3.0"`) + start
+	source = source[:version] + strings.Replace(source[version:], `version: "0.3.0"`, `version: "0.3.1"`, 1)
+	source = strings.ReplaceAll(source, `mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']`, "a#pdf-download")
+	result["patched_source"] = source
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }

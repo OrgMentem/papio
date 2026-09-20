@@ -165,5 +165,12 @@ jobs:
         run: bun run typecheck
       - name: Test
         run: bun test
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.1'
+      - name: Exercise generated adapter repair cycle
+        run: go test -race ../internal/cli -run '^TestAdapterRepairCycle$' -count=1
+        env:
+          PAPIO_REPAIR_CYCLE_REQUIRED: '1'
       - name: Build bundles and lint Firefox
         run: bun run lint:firefox

@@ -33,8 +33,11 @@ To inspect a repair proposal:
 papio adapter repair <capture-id-or-path>
 ```
 
-The tool checks each proposal through the production planner before limiting
-the results. It excludes redacted identifiers from selectors. A PDF-control
+The tool checks every rule of the requested kind through the production planner
+before limiting the results. A working rule does not justify repairing an unused
+sibling rule. Source patches edit only the literal fields in the verified
+proposal, preserving other rules and comments. The tool excludes redacted
+identifiers from selectors. A PDF-control
 proposal cannot replace a separate access or identity check and unlock a
 source patch. Article proposals require a PDF-specific affordance and rank
 explicit PDF downloads ahead of viewer tabs. Stable control classes combined
@@ -44,9 +47,24 @@ citation exports cannot qualify on their own. Controls labelled as previews,
 samples, abstracts, supplements, or full issues cannot qualify as the requested
 article PDF, even when page metadata matches. A complete plan proves neither
 entitlement nor PDF bytes.
-Review the access checks and the live file before applying a proposal.
+Review the access checks before testing a proposal in an isolated development
+checkout. Verify the live file before promoting the repair.
 A wrong resolver destination or missing PDF control can require a route
 change instead of a selector change.
+
+The JSON result reports `outcome: "proposal"` when reviewable source and test
+patches exist, or `outcome: "blocked"` when they do not. A blocked workspace
+contains the capture and an explanation, with no apply commands or partial test
+patch. Each run gets a separate directory so an earlier proposal cannot survive
+inside a later failed analysis.
+
+Generated fixtures use a content-hash filename and leave existing scenario
+fixtures intact. Their regression tests require the file to exist, resolve links
+against its captured origin, and require a complete download plan for articles.
+CI exercises the capture-store → proposal → generated test → source patch cycle
+in a disposable checkout: the test fails before the patch and passes afterward.
+This controlled check does not replace live PDF download, adoption and identity
+validation after a real provider repair.
 
 Connecting an extension with a newer adapter revision can automatically retry
 eligible jobs parked by the older revision. During isolated testing, record the
