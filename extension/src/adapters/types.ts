@@ -1104,7 +1104,7 @@ export const adapters: AdapterSpec[] = [
     // render the js-no-access-jumplink control. Prefer the rendered action over
     // citation_pdf_url so a metadata-only paywall cannot look entitled.
     id: "oup",
-    version: "0.1.1",
+    version: "0.1.2",
     hosts: ["academic.oup.com"],
     workEvidence: { kind: "title", selector: "meta[name='citation_title']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -1132,12 +1132,14 @@ export const adapters: AdapterSpec[] = [
         kind: "article",
         all: [
           "meta[name='citation_title']",
-          "a.article-pdfLink[href*='/article-pdf/']",
+          // Entitled chapters use chapter-ag-pdf; the same rendered PDF
+          // control carries both routes. Metadata also exists behind walls.
+          "a.article-pdfLink[href*='/article-pdf/'], a.article-pdfLink[href*='/chapter/'][href*='/chapter-ag-pdf/']",
         ],
       },
     ],
     download: {
-      selector: "a.article-pdfLink[href*='/article-pdf/']",
+      selector: "a.article-pdfLink[href*='/article-pdf/'], a.article-pdfLink[href*='/chapter/'][href*='/chapter-ag-pdf/']",
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "href",

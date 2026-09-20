@@ -29,6 +29,7 @@ import {
   type NativePort,
 } from "../src/background";
 import {
+  captureOrigin,
   classifyFixture,
   fixtureExists,
   fixturePath,
@@ -1438,6 +1439,28 @@ test("Annual Reviews PDF controls without the OA marker stay assisted", () => {
 });
 
 const oupArticle = loadFixture("oup", "success");
+test("Oxford's entitled chapter plans its rendered chapter PDF after sign-in", () => {
+  const spec = adapters.find(a => a.id === "oup")!;
+  const html = readFileSync(fixturePath("oup", "chapter"), "utf8");
+  const page = parseHTML(html, captureOrigin(html)!);
+  const expected = { title: "Example chapter on brainwave recordings" };
+  const plan = planExecution(page, spec, expected, {});
+  expect("assisted" in plan).toBe(false);
+  if ("assisted" in plan) throw new Error(plan.assisted);
+  expect(plan.verdict.kind).toBe("article");
+  expect(plan.url).toBe("https://academic.oup.com/edited-volume/12345/chapter/987654321/chapter-ag-pdf/12345678/TOKEN.ag.pdf");
+
+  // Metadata alone cannot establish access, and unrelated PDF actions cannot
+  // broaden the adapter beyond the captured chapter and journal endpoints.
+  page.querySelector("a")!.setAttribute("href", "/edited-volume/12345/preview.pdf");
+  expect(classifyFixture(page, spec, expected).kind).toBe("unknown");
+  page.querySelector("a")!.remove();
+  expect(classifyFixture(page, spec, expected).kind).toBe("unknown");
+
+  const wrong = planExecution(parseHTML(html, captureOrigin(html)!), spec,
+    { title: "A different chapter about ocean currents" }, {});
+  expect(wrong.verdict.kind).toBe("wrong_work");
+});
 test("Oxford's captured chapter wall requires sign-in despite PDF metadata", () => {
   const spec = adapters.find(a => a.id === "oup")!;
   const page = loadFixture("oup", "login-return")!;
