@@ -292,6 +292,11 @@ execution records kept during the initial build.
 
 ### Fixed
 
+- **A manual-download task cannot restart an automated sign-in attempt.**
+  Late browser requests are refused once the provider handoff has become a
+  manual-download task, preventing a spent attempt from reserving the
+  institution's sign-in slot again. The operator's Open action remains available.
+
 - **A PDF preview cannot qualify as a full-work adapter repair.** Proposals
   labelled as previews, samples, abstracts, supplements, or full issues remain
   diagnostic candidates but cannot produce a source patch for the requested

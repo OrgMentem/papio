@@ -5947,6 +5947,11 @@ for (const { label, host, specs } of [
     test(`${label} captures evidence and exits with a missing-adapter outcome${afterSignIn ? " after sign-in" : " after loading"}`, async () => {
       const h = makeHarness();
       h.deps.adapterSpecs = specs;
+      let closeDisposition: SurfaceCloseDisposition | undefined;
+      closeInternals(h).closeOwnedSurface = async (_tabID, disposition) => {
+        closeDisposition = disposition;
+        return { closed: true };
+      };
       h.deps.permissions.contains = async () => true;
       const stored: Record<string, unknown> = {};
       const injectedFunctions: unknown[] = [];
@@ -6040,6 +6045,7 @@ for (const { label, host, specs } of [
         status: "awaiting_download",
       });
       expect(h.backend.store.activeJobs[0]?.access_mode).toBeUndefined();
+      expect(closeDisposition).toBe("handoff_parked");
     });
   }
 }

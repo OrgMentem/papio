@@ -103,6 +103,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Manual-download tasks release their completed browser surfaces.**
+  Cleanup now reports that the browser handoff is parked, instead of incorrectly
+  claiming the whole job is inactive. Downloads in flight still prevent closure.
+
 - **Unsupported provider pages no longer leave papers waiting for sign-in.**
   Loading an unregistered provider does not count as authentication. If sign-in
   returns to an unsupported page, papio records the missing adapter and releases

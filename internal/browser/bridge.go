@@ -1668,7 +1668,10 @@ func (b *Bridge) currentMaterializationEligibility(ctx context.Context, candidat
 	if err != nil {
 		return row, nil, false, err
 	}
-	return row, action, action != nil, nil
+	// A manual-download action keeps the operator's Open affordance, but it
+	// does not authorize another automated attempt. A late frame from the
+	// replaced handoff must not claim or bind a new sign-in surface for it.
+	return row, action, action != nil && action.Kind == handoffActionKind, nil
 }
 
 func (b *Bridge) clearMaterializationOffer(jobID string) {

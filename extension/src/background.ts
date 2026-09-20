@@ -20167,7 +20167,9 @@ export class Bridge {
     };
     const notice = explicitDelivery && this.store.pendingDelivery?.job_id === jobID && this.store.pendingDelivery.status === "failed"
       ? this.store.pendingDelivery : undefined;
-    await this.removeJobWithOffer(jobID);
+    // The job remains active for manual delivery. Close its spent browser
+    // surface with that fact; job_inactive would be refused by the daemon.
+    await this.removeJobWithOffer(jobID, "handoff_parked");
     await this.upsertJobWithoutOffer(retained);
     if (notice !== undefined) {
       await this.update(s => s.pendingDelivery === undefined ? startPendingDelivery(s, notice) : s);
