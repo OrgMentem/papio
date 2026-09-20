@@ -17,7 +17,7 @@ latency was 333 ms (Jev 1.13.0). These are fixture observations, not provider
 performance estimates. The local deterministic backend also executes through
 the same interface; it is a fixture oracle, not a local AI model.
 
-**Unobtrusive background execution remains unproved.** The background Jev run
+**Native-only background execution remains unproved.** The background Jev run
 made no progress after one decision. Native AXPress also acknowledged browser
 actions without causing navigation in both initial background and foreground
 trials. The private window-event sequence worked in the foreground reference
@@ -153,8 +153,8 @@ The first browser attempt failed: Chrome refuses `scripting.executeScript` on
 an extension's own page, including its own packaged fixture. The runner now
 serves the fixture on loopback HTTP. This requires temporary activeTab access,
 which the existing Papio toolbar action can grant on that one fixture tab.
-Permission approval is required by this session's explicit user instructions.
-No permission was granted and no background-download success is claimed yet.
+The user approved that temporary access. It was granted on each owned fixture
+tab and ended when the tab closed. No permanent host permission changed.
 
 ```sh
 bun run extension/tools/page-spike-run.ts \
@@ -186,5 +186,42 @@ actual download result. Missing data or a missing report never proves quietness.
 The helper build, standalone report-accumulation checks, 20 focused extension
 tests and TypeScript check pass. The full extension suite passes 1,714 tests
 with one skip. Both test-owned tabs were closed, leaving the original 21 tabs;
-the generated controller bundles and loopback servers were removed/stopped. The new browser action path still needs its
-permission-approved live run, followed by publisher and adoption validation.
+the generated controller bundles and loopback servers were removed/stopped. The new browser action path passed the live run below; publisher and adoption
+validation remain outstanding.
+
+
+### Approved background acceptance result
+
+A fresh Jev run completed **three decisions in 2.29 seconds**: follow the article
+link, activate the button revealing download options, and select the article PDF.
+The normal Chrome extension APIs performed the actions while Finder remained in
+the foreground. No native input, CDP, debugger or coding-agent clicks supplied any
+acquisition step after the run began. The model made three calls using Jev 1.13.0,
+with 1,969 input tokens and 150 output tokens. The downloaded file was 5,661 bytes,
+matched the expected SHA-256, had three pages, and its rendered first page matched
+the synthetic article.
+
+The independent monitor recorded 94 samples with zero app, window or pointer
+changes and no missing channels. Its one 114.5 ms startup gap ended before the
+runner started acquisition. This is evidence for an unobtrusive background
+fixture path, still subject to polling's limits. It does not measure keyboard
+focus within the same window, provider behavior, signed resident-viewer bytes,
+Papio adoption or adapter learning.
+
+An earlier run made all three model-selected actions and completed a download,
+but Chrome saved it as `paper.pdf` despite the requested unique filename. The
+verifier rejected the destination mismatch. That failure receipt is preserved.
+The fresh fixture gives the PDF resource itself a unique filename; its actual
+browser-reported download path and bytes both pass verification. This avoids a
+fixture assumption about Chrome's filename selection; it does not establish
+that production download adoption is fixed. Chrome's
+[download filename API](https://developer.chrome.com/docs/extensions/reference/api/downloads#event-onDeterminingFilename)
+allows filename listeners to influence the destination, which remains an
+independent integration check.
+
+Private calls, events, monitor report and first-page verification are retained
+in `dev/scratch/page-spike-jev-2026-09-20-d/`; the failed filename check is in the
+sibling `-c/` directory. Both owned test tabs and the temporary Finder window were
+closed; the original 21 browser tabs remain. Both loopback servers stopped and
+the generated extension bundles were removed. No daemon, native-host, original
+job or persistent extension-permission configuration changed.

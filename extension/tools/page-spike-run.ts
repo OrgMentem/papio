@@ -27,7 +27,7 @@ const server = Bun.serve<unknown>({ hostname: "127.0.0.1", port: 0,
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname.startsWith(`/${nonce}/fixture/`)) {
       const name = url.pathname.slice(`/${nonce}/fixture/`.length);
-      if (["start.html", "article.html", "wrong.html", "paper.pdf", "article.js"].includes(name)) return new Response(Bun.file(`${bundleDir}/fixture/${name}`));
+      if (["start.html", "article.html", "wrong.html", filename, "article.js"].includes(name)) return new Response(Bun.file(`${bundleDir}/fixture/${name}`));
     }
     if (url.pathname === `/${nonce}/socket` && request.headers.get("origin") === origin && !socket && server.upgrade(request, { data: {} })) return;
     if (url.pathname === `/${nonce}/start` && request.method === "POST" && !request.headers.has("origin")) { startRequested = true; return Response.json({ started: true }); }
@@ -59,9 +59,9 @@ if (!built.success) throw new Error(built.logs.join("\n"));
 writeFileSync(`${bundleDir}/run.html`, '<!doctype html><meta charset="utf-8"><title>Papio background spike</title><h1>Papio background spike</h1><p>Local synthetic fixture; one owned background tab. No provider or job changes.</p><pre>Connecting…</pre><script type="module" src="page-spike-browser.js"></script>');
 const shell = (title: string, content: string) => `<!doctype html><meta charset="utf-8"><title>${title}</title><style>body{font:20px system-ui;max-width:800px;margin:40px auto}a,button{display:block;margin:24px}</style><main><h1>${title}</h1>${content}</main><aside><h2>References</h2><a href="wrong.html">Related reference PDF</a></aside>`;
 writeFileSync(`${bundleDir}/fixture/start.html`, shell("Native acquisition experiment", '<p>Find the main article and download its PDF.</p><a href="article.html">Read the main article</a>'));
-writeFileSync(`${bundleDir}/fixture/article.html`, shell("The main article", '<p>Full text available.</p><button id="options">Show download options</button><section id="download" hidden><h2>Article access</h2><a href="paper.pdf" type="application/pdf">Download article PDF</a></section><script src="article.js"></script>'));
+writeFileSync(`${bundleDir}/fixture/article.html`, shell("The main article", `<p>Full text available.</p><button id="options">Show download options</button><section id="download" hidden><h2>Article access</h2><a href="${filename}" type="application/pdf">Download article PDF</a></section><script src="article.js"></script>`));
 writeFileSync(`${bundleDir}/fixture/wrong.html`, shell("Wrong reference", '<p>This is not the requested paper.</p>'));
-writeFileSync(`${bundleDir}/fixture/paper.pdf`, sourcePDF);
+writeFileSync(`${bundleDir}/fixture/${filename}`, sourcePDF);
 writeFileSync(`${bundleDir}/fixture/article.js`, 'document.querySelector("#options").addEventListener("click",()=>{document.querySelector("#download").hidden=false;document.querySelector("#options").hidden=true;});');
 const receipt = { url: `${origin}/dist/page-spike-${nonce}/run.html`, startURL: `http://127.0.0.1:${server.port}/${nonce}/start`, bundleDir, filename, sha256: digest, bytes: sourcePDF.length, pid: process.pid };
 writeFileSync(`${dir}/fixture.json`, JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });

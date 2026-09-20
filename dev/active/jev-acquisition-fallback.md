@@ -12,9 +12,14 @@ behavior remains unchanged until implemented and tested.
 The [native helper spike](../native-helper-spike.md) now runs independently of
 Codex: four Jev decisions acquired a three-page synthetic PDF through Chrome's
 viewer and native Save dialog. It reuses AXorcist and selected trycua native
-delivery code. Foreground operation succeeded; background-only operation did
-not. This is not publisher acceptance or daemon adoption proof. The downloaded
-file and private receipts were checked, and the owned tab/server were cleaned up.
+delivery code. Native foreground operation succeeded; native background-only
+operation did not. A subsequent extension-API run completed three Jev decisions
+and downloaded the verified fixture PDF in 2.29 seconds while another app stayed
+in front. The passive monitor recorded 94 samples with no app/window/pointer
+changes or missing channels during that run. This supports the extension/native
+split; publisher acceptance, daemon adoption and repair learning remain unproved.
+Private receipts include the failed filename check. Owned tabs/servers and
+generated bundles were cleaned up; temporary activeTab grants ended on closure.
 
 The first supervised native-browser trial downloaded three correct papers.
 Two fresh isolated jobs adopted and validated their files; one CDN-viewer
