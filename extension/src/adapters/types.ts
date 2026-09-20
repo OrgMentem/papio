@@ -27,9 +27,13 @@ export interface ClassifyRule {
   all?: string[];
   /** At least one CSS selector must match for the rule to fire. */
   any?: string[];
-  /** At least one lowercase substring must appear in document.body.innerText
-   * (compared lowercased). Static labels only — never page-derived text. */
+  /** At least one lowercase substring must appear in textSelector's innerText
+   * (or document.body.innerText when omitted), compared lowercased.
+   * Static labels only — never page-derived text. */
   textAny?: string[];
+  /** Scope textAny to exactly one matching element. Missing or ambiguous
+   * matches refuse the rule; omitted retains the document-body text scope. */
+  textSelector?: string;
   /** On live pages, this rule may classify only after the full settle budget.
    *
    * A positive marker can paint before the marker that would select an earlier
@@ -1483,6 +1487,24 @@ export const adapters: AdapterSpec[] = [
       workTarget: { kind: "opaque" },
       method: "href",
     },
+  },
+  {
+    // Captured Figshare record with an explicit unavailable-file banner. This
+    // ends this repository route only; the daemon can still try institutional
+    // access. Metadata-only records do not establish a PDF download route.
+    id: "figshare",
+    version: "0.1.0",
+    hosts: ["figshare.com"],
+    settleTimeoutMs: 5000,
+    classify: [{
+      kind: "no_entitlement",
+      all: [
+        "meta[name='citation_title']",
+        "main [data-id='layout-preview'] [data-id='layout-header'] h1",
+      ],
+      textSelector: "main .jbW3L > h2.rSf-Z",
+      textAny: ["file(s) not publicly available"],
+    }],
   },
   {
     // The seven captured Alma View It pages all expose this terminal empty-results

@@ -413,6 +413,19 @@ export function planExecution(
   const boundedMs = doc === null ? Math.max(0, Math.min(spec.settleTimeoutMs ?? 0, 15000)) : 0;
   const pageHref = root.location?.href ?? "https://fixture.local/";
 
+  // Use the same bounded text evidence for classification and render readiness.
+  // A status heading must not borrow a matching phrase from the article body.
+  const ruleText = (selector: string | undefined): string => {
+    if (selector === undefined) return (root.body?.innerText ?? "").toLowerCase();
+    try {
+      const matches = root.querySelectorAll(selector);
+      if (matches.length !== 1) return "";
+      return ((matches[0] as HTMLElement).innerText ?? "").toLowerCase();
+    } catch {
+      return "";
+    }
+  };
+
   const classify = (
     allowDeferred: boolean,
   ): { verdict: PageVerdict; decisiveRule: string | null } => {
@@ -448,8 +461,7 @@ export function planExecution(
         if (!ok) continue;
       }
       if (hasText) {
-        const body = root.body;
-        const bodyText = (body && body.innerText ? body.innerText : "").toLowerCase();
+        const bodyText = ruleText(rule.textSelector);
         let ok = false;
         for (const needle of rule.textAny as string[]) {
           if (bodyText.indexOf(needle) !== -1) {
@@ -1192,7 +1204,7 @@ export function planExecution(
       let textReady = true;
       if (hasText) {
         textReady = false;
-        const bodyText = (root.body?.innerText ?? "").toLowerCase();
+        const bodyText = ruleText(rule.textSelector);
         for (const needle of rule.textAny as string[]) {
           if (bodyText.includes(needle.toLowerCase())) {
             textReady = true;

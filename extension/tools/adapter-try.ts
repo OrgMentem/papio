@@ -213,11 +213,21 @@ interface RuleReport {
 function evaluateRule(doc: Document, bodyText: string, rule: ClassifyRule): RuleReport {
   const all = (rule.all ?? []).map((selector) => checkSelector(doc, selector));
   const any = (rule.any ?? []).map((selector) => checkSelector(doc, selector));
+  let text = bodyText;
+  if (rule.textSelector !== undefined) {
+    text = "";
+    try {
+      const matches = doc.querySelectorAll(rule.textSelector);
+      if (matches.length === 1) text = ((matches[0] as HTMLElement).innerText ?? "").toLowerCase();
+    } catch {
+      // A malformed scope supplies no evidence, matching the production planner.
+    }
+  }
   const textAny = (rule.textAny ?? []).map((needle) => ({
     needle,
     // planExecution never lowercases the needle — textAny is documented as
-    // already-lowercase static labels matched against lowercased body text.
-    hit: bodyText.indexOf(needle) !== -1,
+    // already-lowercase static labels matched against lowercased scoped text.
+    hit: text.indexOf(needle) !== -1,
   }));
   const hasCondition = all.length > 0 || any.length > 0 || textAny.length > 0;
   const allOK = all.every((r) => r.hit);
@@ -260,6 +270,7 @@ function printClassifyRules(doc: Document, spec: AdapterSpec): void {
     console.log(`  [${i + 1}] kind=${rule.kind}  ${report.matched ? "MATCHED" : "not matched"}${tag}`);
     printSelectorChecks("all", report.all);
     printSelectorChecks("any", report.any);
+    if (rule.textSelector !== undefined) console.log(`        textSelector  ${rule.textSelector} (requires exactly one match)`);
     for (const t of report.textAny) console.log(`        textAny  ${t.hit ? "HIT " : "MISS"}  "${t.needle}"`);
     if (report.all.length === 0 && report.any.length === 0 && report.textAny.length === 0) {
       console.log("        (rule declares no all/any/textAny — planExecution always skips it)");

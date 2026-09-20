@@ -104,4 +104,10 @@ provider domains. Exclusions include subdomains and apply wherever the browser
 selects an adapter; they do not change the job’s permitted hosts. Such a platform
 follows the missing-adapter path until its own captured rules exist.
 
+A classification rule can pair `textAny` with `textSelector` to read a specific
+status heading instead of the whole page. The selector must match exactly one
+element; missing, invalid, or ambiguous matches leave the rule unsatisfied.
+This prevents an abstract that quotes an access message from deciding access.
+The render wait and repair proposals preserve the same scope.
+
 An adapter is not accepted from guessed selectors, generated vendor tables, or an uncaptured page. A new hostname needs its own capture when branding, routing, or DOM structure differs, even if the provider name is the same.

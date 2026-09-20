@@ -34,6 +34,22 @@ test("ranking selects the stable article PDF id and the proven missing target", 
   expect(top?.score).toBeGreaterThan(result.candidates[1]?.score ?? 0);
 });
 
+test("repair proposals preserve the rule's scoped access text", () => {
+  const spec = structuredClone(REPAIR_SPEC);
+  spec.classify[0]!.textAny = ["access granted"];
+  spec.classify[0]!.textSelector = "#access-status";
+  const html = `<meta name="citation_doi" content="10.1000/repair">
+    <h2 id="access-status">Access unavailable</h2>
+    <p>The abstract mentions access granted.</p>
+    <a id="article-pdf" href="/article.pdf">Download PDF</a>`;
+  const denied = synthesizeAdapterRepair(html, spec, "drift", "article");
+  expect(denied.candidates.length).toBeGreaterThan(0);
+  expect(denied.candidates.some((candidate) => candidate.classifier_verified)).toBe(false);
+  expect(denied.candidates.some((candidate) => candidate.plan_complete)).toBe(false);
+  const granted = synthesizeAdapterRepair(html.replace("Access unavailable", "Access granted"), spec, "drift", "article");
+  expect(granted.candidates.some((candidate) => candidate.plan_complete)).toBe(true);
+});
+
 test("complete repairs survive the output limit and do not bind sanitized document tokens", () => {
   const spec = adapters.find((candidate) => candidate.id === "proquest") as AdapterSpec;
   const html = readFileSync(fixturePath("proquest", "drift"), "utf8");

@@ -31,6 +31,7 @@
     "https://login.openathens.net/*"
   ],
   "optional_host_permissions": [
+    "https://figshare.com/*",
     "https://chemrxiv.org/*",
     "https://www.jstor.org/*",
     "https://www.proquest.com/*",

@@ -18,6 +18,11 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Figshare records can report that their files are not public.** The adapter
+  recognizes the captured unavailable-file status heading and lets papio try
+  another route. It does not treat that message as missing adapter support or
+  proof that institutional access is unavailable. It adds no download route.
+
 - **ChemRxiv preprints have a version-specific PDF route.** The adapter uses
   the primary self-citation DOI and rendered article toolbar, even when
   `citation_doi` metadata is absent. It refuses a different preprint version,

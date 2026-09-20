@@ -242,6 +242,7 @@ function candidateSpec(spec: AdapterSpec, ruleIndex: number, replaceSelector: st
   if (sourceRule.all !== undefined) rule.all = replace(sourceRule.all);
   if (sourceRule.any !== undefined) rule.any = replace(sourceRule.any);
   if (sourceRule.textAny !== undefined) rule.textAny = [...sourceRule.textAny];
+  if (sourceRule.textSelector !== undefined) rule.textSelector = sourceRule.textSelector;
   if (sourceRule.deferUntilDeadline !== undefined) rule.deferUntilDeadline = sourceRule.deferUntilDeadline;
 
   const trial = structuredClone(spec);
