@@ -89,4 +89,9 @@ See [Privacy](../privacy.md) for the storage and disclosure boundary.
 
 5. In the pull request, state what was observed live, which fixture backs each rule, whether the PDF endpoint returned a real PDF, and which provider fronts remain intentionally assisted.
 
+An adapter can declare `excludedHosts` for a separate platform under one of its
+provider domains. Exclusions include subdomains and apply wherever the browser
+selects an adapter; they do not change the job’s permitted hosts. Such a platform
+follows the missing-adapter path until its own captured rules exist.
+
 An adapter is not accepted from guessed selectors, generated vendor tables, or an uncaptured page. A new hostname needs its own capture when branding, routing, or DOM structure differs, even if the provider name is the same.

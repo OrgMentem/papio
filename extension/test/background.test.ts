@@ -5939,87 +5939,94 @@ test("a resolver no-service route stays assisted without an outcome", async () =
   expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
-test("an unregistered provider captures evidence and exits with a missing-adapter outcome", async () => {
-  const h = makeHarness();
-  h.deps.permissions.contains = async () => true;
-  const stored: Record<string, unknown> = {};
-  h.deps.captureStorage = {
-    local: {
-      get: async (key) => ({ [key]: stored[key] }),
-      set: async (items) => {
-        Object.assign(stored, items);
-      },
-    },
-  };
-  h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === capturePage) {
-      return [
-        {
-          result: {
-            html: '<main class="article">unsupported provider shape</main>',
-            origin: `https://${PROVIDER_HOST}`,
-            path: "/stable/article",
-          },
+for (const { label, host, specs } of [
+  { label: "an unregistered provider", host: PROVIDER_HOST, specs: [] },
+  { label: "Ebook Central with the ProQuest article adapter installed", host: "ebookcentral.proquest.com", specs: adapters.filter(spec => spec.id === "proquest") },
+]) {
+  test(`${label} captures evidence and exits with a missing-adapter outcome`, async () => {
+    const h = makeHarness();
+    h.deps.adapterSpecs = specs;
+    h.deps.permissions.contains = async () => true;
+    const stored: Record<string, unknown> = {};
+    h.deps.captureStorage = {
+      local: {
+        get: async (key) => ({ [key]: stored[key] }),
+        set: async (items) => {
+          Object.assign(stored, items);
         },
-      ];
+      },
+    };
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === capturePage) {
+        return [
+          {
+            result: {
+              html: '<main class="article">unsupported provider shape</main>',
+              origin: `https://${host}`,
+              path: "/stable/article",
+            },
+          },
+        ];
+      }
+      return [];
+    };
+
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+    await h.port.inbound(
+      jobOfferForHosts("job_missing_adapter", ["resolver.example.edu"]),
+    );
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    const articleURL = `https://${host}/stable/article`;
+    h.tabs.seed({ id: tabID, url: articleURL });
+    let nextTimer = h.timers.length;
+    await h.tabs.completeNavigation(tabID, articleURL);
+
+    for (let retry = 0; retry < 2; retry += 1) {
+      const relative = h.timers
+        .slice(nextTimer)
+        .findIndex((timer) => timer.ms === 2_500);
+      expect(relative).toBeGreaterThanOrEqual(0);
+      nextTimer += relative;
+      const timer = h.timers[nextTimer]!;
+      nextTimer += 1;
+      h.clock.now += 2_500;
+      await timer.fn();
     }
-    return [];
-  };
 
-  await h.bridge.start();
-  await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
-  await h.port.inbound(
-    jobOfferForHosts("job_missing_adapter", ["resolver.example.edu"]),
-  );
-  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
-  h.tabs.seed({ id: tabID, url: articleURL });
-  let nextTimer = h.timers.length;
-  await h.tabs.completeNavigation(tabID, articleURL);
-
-  for (let retry = 0; retry < 2; retry += 1) {
-    const relative = h.timers
-      .slice(nextTimer)
-      .findIndex((timer) => timer.ms === 2_500);
-    expect(relative).toBeGreaterThanOrEqual(0);
-    nextTimer += relative;
-    const timer = h.timers[nextTimer]!;
-    nextTimer += 1;
-    h.clock.now += 2_500;
-    await timer.fn();
-  }
-
-  expect(
-    h.frames().filter((frame) => frame.type === "page_capture"),
-  ).toHaveLength(1);
-  const outcomes = h
-    .frames()
-    .filter((frame) => frame.type === "provider_outcome");
-  expect(outcomes).toHaveLength(1);
-  expect(outcomes[0]?.payload).toMatchObject({
-    outcome: "ui_changed",
-    detail:
-      "No source-controlled adapter matched this provider page. " +
-      "A sanitized diagnostic was saved locally for adapter development.",
-    // Name the page. Without this the daemon records a drift it cannot
-    // attribute: its only other source is a prior page capture, and this is
-    // the branch where no adapter matched, so the capture carries no adapter
-    // id to join on. A live park showed exactly that — adapter_id,
-    // adapter_version and host all empty on the durable latch.
-    host: PROVIDER_HOST,
+    expect(
+      h.frames().filter((frame) => frame.type === "page_capture"),
+    ).toHaveLength(1);
+    const outcomes = h
+      .frames()
+      .filter((frame) => frame.type === "provider_outcome");
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.payload).toMatchObject({
+      outcome: "ui_changed",
+      detail:
+        "No source-controlled adapter matched this provider page. " +
+        "A sanitized diagnostic was saved locally for adapter development.",
+      // Name the page. Without this the daemon records a drift it cannot
+      // attribute: its only other source is a prior page capture, and this is
+      // the branch where no adapter matched, so the capture carries no adapter
+      // id to join on. A live park showed exactly that — adapter_id,
+      // adapter_version and host all empty on the durable latch.
+      host,
+    });
+    expect(outcomes[0]?.payload.adapter_id).toBeUndefined();
+    // The daemon opens a manual_download action from exactly this outcome, so the
+    // job survives as an inert correlation window rather than being deleted: it
+    // detaches from its tab, holds no drive authority, and keeps only the hosts
+    // correlate() needs to claim the researcher's own download.
+    expect(h.backend.store.activeJobs).toHaveLength(1);
+    expect(h.backend.store.activeJobs[0]).toMatchObject({
+      job_id: "job_missing_adapter",
+      tab_id: -1,
+      status: "awaiting_download",
+    });
+    expect(h.backend.store.activeJobs[0]?.access_mode).toBeUndefined();
   });
-  // The daemon opens a manual_download action from exactly this outcome, so the
-  // job survives as an inert correlation window rather than being deleted: it
-  // detaches from its tab, holds no drive authority, and keeps only the hosts
-  // correlate() needs to claim the researcher's own download.
-  expect(h.backend.store.activeJobs).toHaveLength(1);
-  expect(h.backend.store.activeJobs[0]).toMatchObject({
-    job_id: "job_missing_adapter",
-    tab_id: -1,
-    status: "awaiting_download",
-  });
-  expect(h.backend.store.activeJobs[0]?.access_mode).toBeUndefined();
-});
+}
 
 test("an authentication redirect never self-authorizes a diagnostic capture", async () => {
   const h = makeHarness();

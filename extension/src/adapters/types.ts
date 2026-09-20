@@ -159,6 +159,9 @@ export interface AdapterSpec {
   id: string;
   version: string;
   hosts: string[];
+  /** Separate platforms within a provider domain that this adapter cannot
+   * classify. Each exclusion also covers its subdomains. */
+  excludedHosts?: string[];
   /** Ordered rules; first match wins. */
   classify: ClassifyRule[];
   /** Exact packaged page evidence used to bind expected DOI/title identity. */
@@ -208,6 +211,14 @@ export interface PageVerdict {
   evidence: string[];
 }
 
+/** Match a packaged adapter's domain scope, including platform exclusions. */
+export function adapterSupportsHost(host: string, spec: AdapterSpec): boolean {
+  const normalized = host.toLowerCase();
+  const matches = (domain: string): boolean =>
+    normalized === domain || normalized.endsWith(`.${domain}`);
+  return spec.hosts.some(matches) && !(spec.excludedHosts ?? []).some(matches);
+}
+
 /**
  * Registered provider adapters, in plan order. Every spec is fixture-backed:
  * a rule may only reference markers proven by a captured fixture under
@@ -228,7 +239,7 @@ export const adapters: AdapterSpec[] = [
     // unentitled) stays `unknown`: distinguishing those needs fixtures
     // we do not have yet.
     id: "proquest",
-    version: "0.3.0",
+    version: "0.3.1",
     // The docview carries no citation meta tag at all, so the printed title in
     // the stable `documentTitle` id is the only identity evidence on the page.
     // Without a declared contract the planner refused every real job — a job
@@ -236,6 +247,9 @@ export const adapters: AdapterSpec[] = [
     // highest-volume destination, was permanently human-assisted while its
     // fixture test still reported the `article` verdict.
     hosts: ["proquest.com"],
+    // Ebook Central offers book reading, chapter exports and loans; it does
+    // not use this article platform's docview controls or sign-in route.
+    excludedHosts: ["ebookcentral.proquest.com"],
     workEvidence: { kind: "title", selector: "h1#documentTitle" },
     classify: [
       // ProQuest's "Find your institution" wall (fixtures/proquest/login-return.html):
@@ -1472,7 +1486,7 @@ export function providerViewerPDFURL(
   }
   if (page.protocol !== "https:") return undefined;
   const spec = specs.find((candidate) =>
-    candidate.hosts.some((host) => page.hostname === host || page.hostname.endsWith(`.${host}`))
+    adapterSupportsHost(page.hostname, candidate)
   );
   const rule = spec?.download;
   const route = rule?.viewerRoutes?.find((candidate) => page.pathname.startsWith(candidate.pathPrefix));

@@ -149,6 +149,7 @@ import {
 } from "./deliver";
 import {
   adapters,
+  adapterSupportsHost,
   type AdapterSpec,
   type PageVerdict,
   providerViewerPDFURL,
@@ -4146,7 +4147,7 @@ export class Bridge {
       try {
         const host = new URL(url).hostname;
         targetAdapter = this.deps.adapterSpecs.find((candidate) =>
-          hostMatches(host, candidate.hosts),
+          adapterSupportsHost(host, candidate),
         );
       } catch {
         // The browser will reject malformed handoff URLs through the normal path.
@@ -14360,7 +14361,7 @@ export class Bridge {
     if (
       hostMatches(currentHost, job.provider_hosts) ||
       this.deps.adapterSpecs.some((spec) =>
-        hostMatches(currentHost, spec.hosts),
+        adapterSupportsHost(currentHost, spec),
       )
     ) {
       return current;
@@ -14918,7 +14919,7 @@ export class Bridge {
         landing.origin === offeredOrigin ||
         hostMatches(landing.hostname, job.provider_hosts) ||
         this.deps.adapterSpecs.some((adapter) =>
-          hostMatches(landing.hostname, adapter.hosts),
+          adapterSupportsHost(landing.hostname, adapter),
         )
       );
     } catch {
@@ -17802,7 +17803,7 @@ export class Bridge {
       this.scheduleOpenAthensErrorRecheck(job, staleRecoveryEpoch);
     }
     const adapter = this.deps.adapterSpecs.find((candidate) =>
-      hostMatches(host, candidate.hosts),
+      adapterSupportsHost(host, candidate),
     );
     // The registry is source-controlled and may cover hosts omitted from the
     // capped offer list. Persist its identity before any permission-dependent
@@ -18807,7 +18808,7 @@ export class Bridge {
     const spec = this.deps.adapterSpecs.find(
       (candidate) => candidate.id === job.adapter_id,
     );
-    return spec !== undefined && hostMatches(host, spec.hosts);
+    return spec !== undefined && adapterSupportsHost(host, spec);
   }
 
   /** Classify the tracked provider page with the single injected plan executor.
@@ -18832,7 +18833,7 @@ export class Bridge {
       return undefined;
     }
     const spec = this.deps.adapterSpecs.find((candidate) =>
-      hostMatches(host, candidate.hosts),
+      adapterSupportsHost(host, candidate),
     );
     if (!spec) {
       // Direct-PDF delivery does not need a page adapter. Otherwise verify that
@@ -19427,7 +19428,7 @@ export class Bridge {
     const onRegisteredProvider =
       hostMatches(host, job.provider_hosts) ||
       this.deps.adapterSpecs.some((candidate) =>
-        hostMatches(host, candidate.hosts),
+        adapterSupportsHost(host, candidate),
       );
     const continuingUnregisteredLanding =
       allowUnregistered || job.last_unknown_ms !== undefined;
@@ -21036,7 +21037,7 @@ export class Bridge {
       const spec = this.deps.adapterSpecs.find(
         (candidate) => candidate.id === job.adapter_id,
       );
-      return spec !== undefined && hostMatches(host, spec.hosts);
+      return spec !== undefined && adapterSupportsHost(host, spec);
     });
 
     if (initiated.length === 1) return initiated[0];

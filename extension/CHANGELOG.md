@@ -98,6 +98,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Ebook Central no longer reports a broken ProQuest article adapter.**
+  The book platform now follows the missing-adapter path and preserves its own
+  diagnostic evidence. ProQuest article downloads keep their existing route.
+
 - An authorized institutional navigation now releases a paper from its old
   queued state before the provider page loads. Reconnection also repairs that
   stale state after the daemon confirms the navigation. Loading papio's own
