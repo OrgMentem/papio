@@ -8253,7 +8253,85 @@ test("a cross-origin api download with a content-disposition rename steers into 
   expect(complete?.payload["filename"]).toBe("retrieve.pdf");
 });
 
+for (const status of ["accepted", "auth_pending"] as const) {
+  for (const child of [false, true]) {
+    test(`signed viewer navigation asks for Send PDF without re-fetching: ${status}, child=${child}`, async () => {
+      const jobID = "job_signed_viewer";
+      const h = makeHarness({
+        ...emptyStore(),
+        activeJobs: [{
+          job_id: jobID, tab_id: 100,
+          offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
+          status, provider_hosts: ["www.sciencedirect.com"],
+          access_mode: "delegated", download_initiated: true,
+        }],
+      });
+      h.tabs.seed({ id: 100, url: OPENURL });
+      await h.bridge.start();
+      const viewerID = child ? 101 : 100;
+      if (child) h.tabs.seed({ id: viewerID, url: "about:blank", openerTabId: 100 });
+      const viewerURL = "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=private-token";
+      await h.tabs.completeNavigation(viewerID, viewerURL);
+      await h.tabs.completeNavigation(viewerID, viewerURL);
+      expect(h.downloads.started).toEqual([]);
+      expect(h.bridge.deliveryState()).toMatchObject({
+        state: "failed", job_id: jobID,
+        message: expect.stringMatching(/Send this PDF.*Download/),
+      });
+      const notices = h.frames().filter(f => f.type === "error" && f.payload["code"] === "native_viewer_download_required");
+      expect(notices).toHaveLength(1);
+      expect(JSON.stringify(notices)).not.toContain("private-token");
+      expect(h.backend.store.pendingDelivery?.page_identity).toBeUndefined();
+      expect(h.backend.store.pendingDelivery?.url).toBe(viewerURL);
+      expect(migrateManagedState(h.backend.store).pendingDelivery?.url).toBeUndefined();
+      expect(h.tabs.removed).toEqual([]);
+    });
+  }
+}
+
+for (const scenario of ["unrelated", "assisted", "downloaded", "search_failed", "delivery_busy", "restart"] as const) {
+  test(`signed viewer notice preserves authority and existing work: ${scenario}`, async () => {
+    const jobID = "job_signed_guard";
+    let h = makeHarness({
+      ...emptyStore(),
+      activeJobs: [{
+        job_id: jobID, tab_id: 100,
+        offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
+        status: "accepted", provider_hosts: ["www.sciencedirect.com"],
+        access_mode: scenario === "assisted" ? "assisted" : "delegated",
+        download_initiated: true,
+      }],
+      ...(scenario === "delivery_busy" ? { pendingDelivery: {
+        job_id: "job_operator_delivery", initiated_at: 1_700_000_000_000,
+        status: "waiting_manual" as const, error: "existing operator instruction",
+      }} : {}),
+    });
+    h.tabs.seed({ id: 100, url: OPENURL });
+    await h.bridge.start();
+    if (scenario === "search_failed") h.deps.downloads.search = async () => { throw new Error("history unavailable"); };
+    if (scenario === "downloaded") h.downloads.items.set(77, {
+      id: 77, state: "complete", filename: `/Downloads/papio/${jobID}/paper.pdf`,
+    });
+    h.tabs.seed({ id: 101, url: "about:blank", openerTabId: scenario === "unrelated" ? 999 : 100 });
+    const url = "https://pdf.sciencedirectassets.com/77/main.pdf";
+    await h.tabs.completeNavigation(101, url);
+    if (scenario === "restart") {
+      h = restartWorker(h);
+      await h.bridge.start();
+      await h.tabs.completeNavigation(101, url);
+      expect(h.bridge.deliveryState()).toMatchObject({ state: "failed", job_id: jobID });
+    } else if (scenario === "delivery_busy") {
+      expect(h.bridge.deliveryState()).toMatchObject({ state: "waiting_manual", job_id: "job_operator_delivery", message: "existing operator instruction" });
+    } else {
+      expect(h.bridge.deliveryState()).toMatchObject({ state: "idle" });
+    }
+    expect(h.downloads.started).toEqual([]);
+  });
+}
+
 test("a CDN PDF viewer is adopted for one uniquely driven accepted job", async () => {
+  // Model an unsigned CDN file; the named pdf.sciencedirectassets.com viewer
+  // requires native delivery and is covered above.
   const h = makeHarness({
     ...emptyStore(),
     activeJobs: [
@@ -8274,12 +8352,12 @@ test("a CDN PDF viewer is adopted for one uniquely driven accepted job", async (
   h.tabs.seed({ id: 101, url: "about:blank" });
   await h.tabs.completeNavigation(
     101,
-    "https://pdf.sciencedirectassets.com/77/paper.pdf",
+    "https://content.sciencedirectassets.com/77/paper.pdf",
   );
 
   expect(h.downloads.started).toEqual([
     {
-      url: "https://pdf.sciencedirectassets.com/77/paper.pdf",
+      url: "https://content.sciencedirectassets.com/77/paper.pdf",
       filename: "papio/job_cdn_single/paper.pdf",
       conflictAction: "uniquify",
       saveAs: false,
@@ -8307,7 +8385,7 @@ for (const restart of [false, true]) {
     });
     h.tabs.seed({ id: 100, url: OPENURL });
     await h.bridge.start();
-    const viewerURL = "https://pdf.sciencedirectassets.com/77/paper.pdf";
+    const viewerURL = "https://content.sciencedirectassets.com/77/paper.pdf";
     h.tabs.seed({ id: 101, url: "about:blank", openerTabId: 100 });
     await h.tabs.completeNavigation(101, viewerURL);
     expect(h.downloads.started).toHaveLength(1);
@@ -8415,7 +8493,7 @@ for (const scenario of [
     h.tabs.seed({ id: 101, url: "about:blank", openerTabId: 100 });
     await h.tabs.completeNavigation(
       101,
-      "https://pdf.sciencedirectassets.com/77/paper.pdf",
+      "https://content.sciencedirectassets.com/77/paper.pdf",
     );
     expect(h.downloads.started).toHaveLength(
       scenario === "interrupted" || scenario === "other_job" ? 1 : 0,
@@ -8442,7 +8520,7 @@ test("a CDN PDF viewer remains unadopted when two driven jobs are candidates", a
   h.tabs.seed({ id: 102, url: "about:blank" });
   await h.tabs.completeNavigation(
     102,
-    "https://pdf.sciencedirectassets.com/77/paper.pdf",
+    "https://content.sciencedirectassets.com/77/paper.pdf",
   );
 
   expect(h.downloads.started).toEqual([]);
@@ -8482,7 +8560,7 @@ test("Firefox keeps the CDN viewer adoption path disabled for click adapters", a
   h.tabs.seed({ id: 101, url: "about:blank" });
   await h.tabs.completeNavigation(
     101,
-    "https://pdf.sciencedirectassets.com/77/paper.pdf",
+    "https://content.sciencedirectassets.com/77/paper.pdf",
   );
 
   expect(h.downloads.started).toEqual([]);

@@ -3279,7 +3279,7 @@ type DeliveryFeedback = PendingDelivery & {
   status: "sending" | "waiting_manual" | "downloaded" | "failed" | "adopted";
 };
 
-async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Promise<PendingDelivery | undefined> {
+export async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Promise<PendingDelivery | undefined> {
   try {
     const reply: unknown = await chrome.runtime.sendMessage({ type: "papio.delivery.state" });
     if (
@@ -3295,10 +3295,13 @@ async function readDeliveryFeedback(fallback: PendingDelivery | undefined): Prom
       const state = (reply as Record<string, unknown>)["state"] as DeliveryFeedback["status"];
       const jobID = (reply as Record<string, unknown>)["job_id"] as string;
       const message = (reply as Record<string, unknown>)["message"];
+      const runtimeURL = (reply as Record<string, unknown>)["url"];
       const sameJob = fallback?.job_id === jobID ? fallback : undefined;
       return {
         job_id: jobID,
-        url: sameJob?.url ?? "",
+        // Managed storage deliberately drops signed URLs. The worker can
+        // still associate feedback with this exact PDF during its lifetime.
+        url: typeof runtimeURL === "string" ? runtimeURL : sameJob?.url ?? "",
         initiated_at: sameJob?.initiated_at ?? 0,
         status: state,
         ...(typeof message === "string" ? { error: message } : {}),

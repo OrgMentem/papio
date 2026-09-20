@@ -16,7 +16,16 @@ These cannot be closed by automation: a warm human browser passes provider
 anti-bot checks that no CDP or WebDriver session can, which is the same
 constraint that makes the extension QA matrix manual.
 
-- **ScienceDirect entitled download (Unverified).** The live primary access-bar path, viewer adoption, and provider outcome are now repaired/observed, but no retained validated artifact reached `ready`; the exact route is therefore not canary-qualified or **Verified working**. Page capture or provider outcome alone is insufficient to promote it. The purchase-wall capture also offers institutional sign-in, so it no longer qualifies as `no_entitlement` evidence. That combination now stays sign-in pending. The entitled-article rule remains fixture-backed only — `fixtures/sciencedirect/success.html` carries a fabricated DOI/PII, not a capture. Confirm the `citation_pdf_url` meta fetch reaches a real PDF through the privileged downloads API.
+- **ScienceDirect entitled download (Unverified).** A 2026-09-20 live probe
+  reached the requested paper in Chrome's PDF viewer after explicit institutional
+  navigation, but re-fetching its signed delivery URL returned HTML. No validated
+  artifact reached `ready`. Automatic viewer adoption now follows the existing
+  Send PDF restriction on signed URLs and offers the manual Send PDF / viewer
+  Download sequence. That is an operator action, not unattended acquisition.
+  Prove a retained, validated artifact before promoting this route. The current
+  adapter activates the rendered PDF control; `citation_pdf_url` fetching is not
+  its download path. A purchase control beside institutional sign-in remains
+  login evidence, not proof of no entitlement.
 - **Springer subscription and book acceptance.** Adapter 0.1.2 now selects the
   article header's PDF control rather than also matching the sticky banner.
   A fresh live probe retained the correct 16-page open-access article after one

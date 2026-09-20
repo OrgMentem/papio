@@ -93,6 +93,15 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Signed PDF viewers stay available for manual delivery.** Automatic viewer
+  adoption now uses the same restriction as Send PDF: it does not re-fetch
+  ScienceDirect's viewer URL or a signed delivery link. The popup directs you
+  to Send this PDF and then the viewer's Download button. This notice does not
+  arm a download or claim success. A child PDF viewer is also recognized while
+  its job still carries a sign-in status. HTML download failures no longer
+  speculate that the library lacks access.
+
+
 - **EBSCO's HTML viewer is no longer downloaded as a PDF.** PDF-like path
   words alone no longer start a download. Known file routes still work, and
   EBSCO's adapter waits longer for its viewer to render before requesting the

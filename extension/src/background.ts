@@ -1890,6 +1890,9 @@ type DeliveryReply = BrokerReply<{
   duplicate?: boolean;
   message?: string;
   choice?: DeliveryChoiceOffer;
+  /** Worker-local association for the authorized extension popup only. Never
+   * sent over native messaging or persisted in managed state. */
+  url?: string;
 }>;
 function hostMatches(host: string, providerHosts: string[]): boolean {
   return providerHosts.some((h) => host === h || host.endsWith("." + h));
@@ -1899,13 +1902,11 @@ function hostMatches(host: string, providerHosts: string[]): boolean {
  * True when papio must not fetch this URL itself, and should ask for the PDF
  * viewer's own Download button instead — bytes the browser already holds.
  *
- * Two cases. `pdf.sciencedirectassets.com` is a named host whose viewer URL is
- * not a file at all. The general case is any URL carrying a signed, expiring
- * delivery credential: re-requesting one returns an error page, because the
- * grant belongs to the session that minted it. That was a single hard-coded
- * hostname while the mechanism it guards was fully built, so every other
- * signed-CDN publisher — Silverchair, which serves JAMA and Oxford University
- * Press among others — took the doomed fetch instead of this path.
+ * ScienceDirect's viewer can display the PDF while a second request to its
+ * URL returns HTML (measured again 2026-09-20). Signed delivery links from
+ * other publishers are conservatively treated the same way: possession of
+ * their URL does not establish that the delivery grant is reusable. This
+ * does not assert that every signed URL is single-use.
  */
 function requiresNativeViewerDownload(url: string): boolean {
   try {
@@ -8247,6 +8248,7 @@ export class Bridge {
         ok: true,
         state: pending.status ?? "sending",
         job_id: pending.job_id,
+        ...(pending.url ? { url: pending.url } : {}),
         ...(pending.error ? { message: pending.error } : {}),
       };
     }
@@ -18337,6 +18339,61 @@ export class Bridge {
     return isPDFPage(url);
   }
 
+  /** The viewer already holds these bytes. Re-fetching a signed delivery URL
+   * can return HTML, even while the correct PDF is visible. Keep the manual
+   * continuation explicit: Send PDF will bind the live document before the
+   * operator's Download click. This notice grants no download authority and
+   * persists neither the URL nor its credential. The worker-local URL lets the
+   * popup show the instruction on the PDF tab that actually needs it. */
+  private async reportNativeViewerDownloadRequired(jobID: string, url: string): Promise<void> {
+    // The click latch alone does not prove a file exists, but a correlated or
+    // completed download does. Check browser history too after a worker nap.
+    if (this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)) return;
+    let existing: DownloadItemLike[];
+    try {
+      existing = await this.findJobDownloads(jobID);
+    } catch {
+      return; // Unknown download state must not invite a duplicate manual copy.
+    }
+    if (
+      existing.some(item => item.state === "in_progress" || item.state === "complete") ||
+      this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)
+    ) return;
+    if (!this.hasDelegatedAuthority(findByJob(this.store, jobID))) return;
+    const code = "native_viewer_download_required";
+    const message = this.isFirefox()
+      ? "Open this PDF in Chrome, choose Send this PDF in papio, then use the PDF viewer Download button."
+      : "Choose Send this PDF in papio, then use the PDF viewer Download button.";
+    const pending = this.store.pendingDelivery;
+    // Do not overwrite an operator's delivery or an already displayed notice.
+    if (pending?.job_id === jobID && pending.error === message) {
+      // Managed-state serialization strips the URL; a fresh viewer event can
+      // restore this display-only association after a worker restart.
+      await this.update(s => updatePendingDelivery(s, jobID, { url }));
+      return;
+    }
+    if (pending === undefined || pending.status === "failed") {
+      await this.update((s) => {
+        if (s.pendingDelivery !== undefined && s.pendingDelivery.status !== "failed")
+          return s;
+        return startPendingDelivery(s, {
+          job_id: jobID,
+          url,
+          initiated_at: this.deps.now(),
+          status: "failed",
+          error: message,
+        });
+      });
+    }
+    const noticeKey = `${jobID}:${code}`;
+    if (
+      !this.handoffOutcomeSent.has(noticeKey) &&
+      this.send("error", { code, message }, jobID)
+    ) {
+      this.handoffOutcomeSent.add(noticeKey);
+    }
+  }
+
   /** Download a tracked PDF-viewer navigation through Chrome's download API.
    * The persisted latch and in-memory correlation jointly ensure that a
    * content-disposition download or repeated completion event cannot start a
@@ -18352,7 +18409,7 @@ export class Bridge {
     if (!this.hasDelegatedAuthority(job)) return;
     if (!job) return;
     if (this.isFirefoxClickDownload(job)) return;
-    if (job.download_initiated === true || this.downloads.has(jobID)) return;
+    if (this.downloads.has(jobID)) return;
 
     let downloadURL = url;
     let viewer = knownPDFViewer;
@@ -18380,6 +18437,11 @@ export class Bridge {
       job.status !== "auth_pending"
     )
       return;
+
+    if (requiresNativeViewerDownload(downloadURL)) {
+      await this.reportNativeViewerDownloadRequired(jobID, downloadURL);
+      return;
+    }
 
     // Re-read after the permission/probe awaits: a content-disposition
     // download may have been correlated while this probe was in flight.
@@ -18462,7 +18524,7 @@ export class Bridge {
       )
         return false;
       if (this.isFirefoxClickDownload(j)) return false;
-      if (j.status !== "accepted" && j.status !== "awaiting_download")
+      if (j.status !== "accepted" && j.status !== "awaiting_download" && j.status !== "auth_pending")
         return false;
       const openerMatches =
         this.hasDelegatedAuthority(j) &&
@@ -18504,11 +18566,16 @@ export class Bridge {
         !this.hasDelegatedAuthority(current) ||
         current?.tab_id !== job.tab_id ||
         (current.status !== "accepted" &&
-          current.status !== "awaiting_download") ||
+          current.status !== "awaiting_download" &&
+          current.status !== "auth_pending") ||
         this.downloads.has(job.job_id) ||
         this.completedDownloadTabs.has(job.job_id)
       )
         return;
+      if (requiresNativeViewerDownload(url)) {
+        await this.reportNativeViewerDownloadRequired(job.job_id, url);
+        return;
+      }
       this.adoptedViewerTabs.set(job.job_id, viewerTabId);
       this.pendingDownloadURLs.set(url, job.job_id);
       const id = await this.deps.downloads.download({
@@ -21369,7 +21436,7 @@ export class Bridge {
         {
           code: "download_not_pdf",
           message:
-            "provider served HTML where a PDF was expected (likely no entitlement)",
+            "provider returned HTML instead of a PDF; access could not be determined from this download",
         },
         owner.job_id,
       );
