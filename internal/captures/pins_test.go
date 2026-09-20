@@ -262,7 +262,7 @@ func TestStoreSanitizedPinnedRollsBackWhenPinWriteFails(t *testing.T) {
 	// publication rename, after the capture bytes and metadata are durable.
 	failAt := at.Add(3 * time.Minute)
 	store.now = func() time.Time { return failAt }
-	blocked := pinPath(filepath.Join(hostDir, failAt.Format(time.RFC3339Nano)+"-drift"+htmlExt))
+	blocked := pinPath(filepath.Join(hostDir, failAt.Format(captureTimestampLayout)+"-drift"+htmlExt))
 	if err := os.Mkdir(blocked, 0o700); err != nil {
 		t.Fatal(err)
 	}

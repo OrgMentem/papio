@@ -28,6 +28,10 @@ const (
 	pinExt           = ".pin.json"
 	pendingIndexName = ".pending.json"
 
+	// RFC3339's clock colons are invalid in Windows filenames. Keep UTC and
+	// nanosecond precision here; fixture and JSON timestamps stay RFC3339.
+	captureTimestampLayout = "2006-01-02T15-04-05.999999999Z"
+
 	// SanitizerProvenance and SanitizerVersion are the only provenance values
 	// accepted for adapter repair. They describe the extension sanitizer whose
 	// canonical fixture header is checked before bytes enter this store.
@@ -948,7 +952,7 @@ func (s *Store) nextPath(ctx context.Context, hostDir, scenario string, timestam
 		if err := ctx.Err(); err != nil {
 			return "", time.Time{}, err
 		}
-		base := candidate.Format(time.RFC3339Nano) + "-" + scenario
+		base := candidate.Format(captureTimestampLayout) + "-" + scenario
 		path := filepath.Join(hostDir, base+htmlExt)
 		if _, err := os.Lstat(path); err == nil {
 			continue
@@ -1015,7 +1019,12 @@ func parseCaptureName(name string) (time.Time, string, bool) {
 	if separator < 0 {
 		return time.Time{}, "", false
 	}
-	timestamp, err := time.Parse(time.RFC3339Nano, base[:separator+1])
+	timestamp, err := time.Parse(captureTimestampLayout, base[:separator+1])
+	if err != nil {
+		// Captures already stored under RFC3339 names remain readable and
+		// participate in the same retention and pinning rules.
+		timestamp, err = time.Parse(time.RFC3339Nano, base[:separator+1])
+	}
 	if err != nil {
 		return time.Time{}, "", false
 	}

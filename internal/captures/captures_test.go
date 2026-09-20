@@ -4,13 +4,137 @@ package captures
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStoreUsesPortableFilenames(t *testing.T) {
+	ctx := context.Background()
+	at := time.Date(2026, time.September, 20, 15, 43, 28, 355555200, time.UTC)
+	store := New(t.TempDir(), Retention{MaxPerHost: 10, MaxAge: 24 * time.Hour})
+	store.now = func() time.Time { return at }
+	html := []byte("<!-- papio-fixture provider=\"iospress\" scenario=\"observed\" origin=\"https://ebooks.iospress.nl/\" captured=\"2026-09-20T15:43:28.3555552Z\" -->\n<html>safe</html>")
+
+	// A repeated clock value must still yield distinct captures without losing
+	// precision or changing the sanitized fixture's RFC3339 timestamp.
+	paths := make([]string, 2)
+	for i := range paths {
+		path, err := store.StoreSanitized(ctx, "ebooks.iospress.nl", "observed", "iospress", "1", html)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.ContainsAny(filepath.Base(path), "<>:\"/\\|?*") {
+			t.Fatalf("capture filename %q contains a Windows-forbidden character", filepath.Base(path))
+		}
+		if got, err := os.ReadFile(path); err != nil || string(got) != string(html) {
+			t.Fatalf("stored HTML = %q, %v; want unchanged fixture %q", got, err, html)
+		}
+		if _, err := os.Stat(metadataPath(path)); err != nil {
+			t.Fatalf("capture metadata: %v", err)
+		}
+		paths[i] = path
+	}
+	if paths[0] == paths[1] {
+		t.Fatal("repeated timestamp overwrote the first capture")
+	}
+	rows, err := store.List(ctx)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("List() = %#v, %v; want both captures", rows, err)
+	}
+	for i, row := range rows {
+		wantTime := at.Add(time.Duration(1-i) * time.Nanosecond)
+		if !row.Timestamp.Equal(wantTime) || row.Path != paths[1-i] || row.SanitizerProvenance != SanitizerProvenance {
+			t.Fatalf("capture %d = %#v; want timestamp %s and path %q", i, row, wantTime, paths[1-i])
+		}
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire struct {
+			Timestamp string `json:"timestamp"`
+		}
+		if err := json.Unmarshal(encoded, &wire); err != nil || wire.Timestamp != wantTime.Format(time.RFC3339Nano) {
+			t.Fatalf("wire timestamp = %q, %v; want RFC3339 %s", wire.Timestamp, err, wantTime)
+		}
+	}
+}
+
+func TestParseCaptureNameFormats(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{"2026-09-20T15:43:28.3555552Z-login-return.html", "2026-09-20T15:43:28.3555552Z"},
+		{"2026-09-20T15-43-28.3555552Z-login-return.html", "2026-09-20T15:43:28.3555552Z"},
+		{"2026-09-20T15:43:28Z-login-return.html", "2026-09-20T15:43:28Z"},
+		{"2026-09-20T15-43-28Z-login-return.html", "2026-09-20T15:43:28Z"},
+		{"2026-09-20T15-43-28.123456789Z-login-return.html", "2026-09-20T15:43:28.123456789Z"},
+		{"2026-09-20T15-43:28Z-login-return.html", ""},
+		{"2026-09-20T25-43-28Z-login-return.html", ""},
+		{"2026-09-20T15-43-28Z-unknown.html", ""},
+		{"2026-09-20T15-43-28Z-login-return.json", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, scenario, ok := parseCaptureName(tc.name)
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("accepted invalid capture filename %q", tc.name)
+				}
+				return
+			}
+			if !ok || scenario != "login-return" || got.Format(time.RFC3339Nano) != tc.want {
+				t.Fatalf("parseCaptureName() = %s, %q, %v; want %s, login-return, true", got, scenario, ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestListAndPruneLegacyCaptureFilename(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot create legacy filenames containing colons; parsing is covered on every platform")
+	}
+	ctx := context.Background()
+	at := time.Date(2026, time.September, 20, 15, 43, 28, 355555200, time.UTC)
+	store := New(t.TempDir(), Retention{MaxPerHost: 1, MaxAge: 24 * time.Hour})
+	store.now = func() time.Time { return at.Add(time.Minute) }
+	hostDir := filepath.Join(store.root, "ebooks.iospress.nl")
+	if err := os.MkdirAll(hostDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(hostDir, "2026-09-20T15:43:28.3555552Z-observed.html")
+	if err := os.WriteFile(legacy, []byte("legacy capture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metadataPath(legacy), []byte(`{"adapter_id":"iospress","adapter_version":"1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.List(ctx)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("List() = %#v, %v; want legacy capture", rows, err)
+	}
+	if rows[0].Path != legacy || !rows[0].Timestamp.Equal(at) || rows[0].AdapterID != "iospress" {
+		t.Fatalf("legacy capture = %#v", rows[0])
+	}
+	current, err := store.Store(ctx, "ebooks.iospress.nl", "observed", "iospress", "2", []byte("new capture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = store.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Path != current {
+		t.Fatalf("List() after pruning = %#v, %v; want new capture only", rows, err)
+	}
+	for _, path := range []string{legacy, metadataPath(legacy)} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy artifact %s after pruning: %v", path, err)
+		}
+	}
+}
 
 func TestStoreAndListRoundTrip(t *testing.T) {
 	ctx := context.Background()

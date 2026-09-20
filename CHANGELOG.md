@@ -308,6 +308,9 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Provider diagnostics can now be saved on Windows.** Capture filenames avoid
+  timestamp colons, which Windows rejects. Existing captures remain readable;
+  fixture contents and JSON timestamps are unchanged.
 - **Open actions remain usable after conservative acquisition finds no file.**
   `papio actions open` now finds advisory actions on unavailable jobs and opens
   their canonical work links. Selecting an action also works beyond the bulk
