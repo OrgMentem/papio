@@ -321,3 +321,133 @@ test("a PDF form without a rendered download control cannot unlock a click repai
   expect(result.candidates.length).toBeGreaterThan(0);
   expect(result.candidates.some(candidate => candidate.plan_complete)).toBe(false);
 });
+
+test("controlled IOS Press fault proposes the clickable child across record and layout changes", () => {
+  const html = readFileSync(fixturePath("iospress", "success"), "utf8");
+  const original = adapters.find(candidate => candidate.id === "iospress")!;
+  // Deliberately broken selector, not evidence of natural provider drift.
+  const spec = candidateSpec(original, 0, original.download!.selector!, original.download!.selector!.replace(".getpdf", ".papioControlledFaultPdf"));
+  const top = synthesizeAdapterRepair(html, spec, "drift", "article", 1).candidates[0]!;
+  expect(top.plan_complete).toBe(true);
+  expect(top.selector).toBe(original.download!.selector);
+  expect(top.selector).not.toContain("00001");
+  expect(top.selector).not.toContain("nth-of-type");
+  const changed = html.replace(/(id="download(?:form|link))00001/g, (_match, prefix) => `${prefix}42`).replace('<div class="actions">',
+    '<div class="actions"><div class="button previewpdf" id="downloadlink99">Preview PDF</div><div>New layout sibling</div>');
+  const doc = parseHTML(changed, captureOrigin(changed)!);
+  expect(doc.querySelectorAll(top.selector)).toHaveLength(1);
+  const control = doc.querySelector(top.selector)!;
+  expect(control.matches("div.button.getpdf")).toBe(true);
+  let clicks = 0;
+  doc.querySelector("div.button.getpdf")!.addEventListener("click", () => clicks++);
+  (control as HTMLElement).click();
+  expect(clicks).toBe(1);
+  const trial = candidateSpec(spec, top.rule_index, top.replace_selector, top.selector);
+  expect(trial.classify[0]!.all!.slice(0, 2)).toEqual(original.classify[0]!.all!.slice(0, 2));
+  expect(trial.version).toBe(original.version);
+  expect(planExecution(doc, trial, { doi: "10.3233/SHTI000001" }, {})).toMatchObject({ method: "click", required_consequence: "download" });
+  doc.querySelector("a[rel='license']")!.remove();
+  expect(planExecution(doc, trial, { doi: "10.3233/SHTI000001" }, {}).verdict.kind).toBe("unknown");
+});
+
+test.each(["form-route", "form-method", "outside-article", "aria-disabled", "disabled", "form-id", "control-id", "duplicate"])(
+  "generated IOS Press repair preserves the original refusal for %s", (change) => {
+    const html = readFileSync(fixturePath("iospress", "success"), "utf8");
+    const original = adapters.find(candidate => candidate.id === "iospress")!;
+    const broken = candidateSpec(original, 0, original.download!.selector!, original.download!.selector!.replace(".getpdf", ".papioControlledFaultPdf"));
+    const top = synthesizeAdapterRepair(html, broken, "drift", "article", 1).candidates[0]!;
+    const trial = candidateSpec(broken, top.rule_index, top.replace_selector, top.selector);
+    const doc = parseHTML(html, captureOrigin(html)!);
+    const control = doc.querySelector("div.button.getpdf")!, form = control.parentElement!;
+    expect(planExecution(doc, trial, { doi: "10.3233/SHTI000001" }, {})).toMatchObject({ method: "click", required_consequence: "download" });
+    if (change === "form-route") form.setAttribute("action", "/Download/Supplement");
+    if (change === "form-method") form.setAttribute("method", "get");
+    if (change === "outside-article") doc.body.append(form);
+    if (change === "aria-disabled") control.setAttribute("aria-disabled", "true");
+    if (change === "disabled") control.setAttribute("disabled", "");
+    if (change === "form-id") form.id = "unrelated42";
+    if (change === "control-id") control.id = "unrelated42";
+    if (change === "duplicate") control.after(control.cloneNode(true));
+    const plan = planExecution(doc, trial, { doi: "10.3233/SHTI000001" }, {});
+    expect("assisted" in plan || plan.required_consequence === "none").toBe(true);
+  },
+);
+
+test("click repair does not mistake a labelled wrapper for its interactive child", () => {
+  const html = `<meta name="citation_doi" content="10.1000/repair">
+    <div id="download-pdf"><div class="button getpdf">Download PDF</div></div>`;
+  const result = synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article");
+  expect(result.candidates.find(candidate => candidate.selector === "#download-pdf")?.plan_complete).toBe(false);
+  const doc = parseHTML(html), top = result.candidates[0]!;
+  expect(top.plan_complete).toBe(true);
+  const control = doc.querySelector(top.selector)!;
+  let clicks = 0;
+  doc.querySelector(".getpdf")!.addEventListener("click", () => clicks++);
+  (control as HTMLElement).click();
+  expect(clicks).toBe(1);
+});
+
+test.each(['onclick="downloadPDF()"', 'role="button" tabindex="0"', 'class="button"'])(
+  "a form with its own click affordance remains a proposal: %s", (attributes) => {
+    const html = `<meta name="citation_doi" content="10.1000/repair">
+      <form id="download-pdf" ${attributes}>Download PDF</form>`;
+    const top = synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article", 1).candidates[0]!;
+    expect(top).toMatchObject({ selector: "#download-pdf", plan_complete: true });
+  },
+);
+
+test("a submit handler alone does not make a form a click control", () => {
+  const html = `<meta name="citation_doi" content="10.1000/repair">
+    <form id="download-pdf" onsubmit="downloadPDF()">Download PDF</form>`;
+  expect(synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article").candidates.some(candidate => candidate.plan_complete)).toBe(false);
+});
+
+test.each(['role="button"', 'class="button"', 'class="btn"'])(
+  "article discovery includes generic custom controls with their own PDF label: %s", (attributes) => {
+    const html = `<meta name="citation_doi" content="10.1000/repair"><div ${attributes}>Download PDF</div>`;
+    expect(synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article", 1).candidates[0]?.plan_complete).toBe(true);
+  },
+);
+
+test.each(["7", "42", "01234"])("numeric record suffix %s is never an exact reusable ID", (suffix) => {
+  const html = `<meta name="citation_doi" content="10.1000/repair"><button id="downloadPDF${suffix}">Download PDF</button>`;
+  const result = synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article");
+  expect(result.candidates.some(candidate => candidate.selector === `#downloadPDF${suffix}`)).toBe(false);
+  const top = result.candidates[0]!;
+  expect(top.plan_complete).toBe(true);
+  expect(top.selector).not.toContain("nth-of-type");
+  expect(parseHTML(html.replace(`downloadPDF${suffix}`, "downloadPDF999")).querySelector(top.selector)?.tagName).toBe("BUTTON");
+});
+
+test("leaf class repair retains quoted ancestor attributes and negative class guards", () => {
+  const old = "main[data-scope='article > full'] > button.button.old-format.old-control[data-route='/v1.2 > file']:not(.blocked):not([disabled])";
+  const spec = candidateSpec(REPAIR_SPEC, 0, ".old-pdf", old);
+  const html = `<meta name="citation_doi" content="10.1000/repair"><main data-scope="article > full">
+    <button class="button download-pdf" data-route="/v1.2 > file">Download PDF</button></main>`;
+  const result = synthesizeAdapterRepair(html, spec, "drift", "article"), top = result.candidates[0]!;
+  expect(top.plan_complete).toBe(true);
+  expect(top.selector).toBe(old.replace(".old-format.old-control", ".download-pdf"));
+  expect(new Set(result.candidates.map(candidate => candidate.selector)).size).toBe(result.candidates.length);
+  const trial = candidateSpec(spec, 0, top.replace_selector, top.selector);
+  for (const mutation of ["ancestor", "attribute", "negative-class"]) {
+    const doc = parseHTML(html), button = doc.querySelector("button")!;
+    expect(planExecution(doc, trial, { doi: "10.1000/repair" }, {})).toMatchObject({ method: "click" });
+    if (mutation === "ancestor") doc.querySelector("main")!.setAttribute("data-scope", "preview");
+    if (mutation === "attribute") button.setAttribute("data-route", "/preview");
+    if (mutation === "negative-class") button.classList.add("blocked");
+    const plan = planExecution(doc, trial, { doi: "10.1000/repair" }, {});
+    expect("assisted" in plan || plan.required_consequence === "none").toBe(true);
+  }
+});
+
+test.each(["main > button.old, button.alternative", "main > button.old\\:control:not([disabled])", "main form[method='post'] > button.old:not([disabled])"])(
+  "unsupported or nonmatching constraints never fall back to a loose complete repair: %s", (old) => {
+    const html = `<meta name="citation_doi" content="10.1000/repair"><main><form method="get">
+      <button class="download-pdf">Download PDF</button></form></main>`;
+    const spec = candidateSpec(REPAIR_SPEC, 0, ".old-pdf", old);
+    const result = synthesizeAdapterRepair(html, spec, "drift", "article");
+    expect(result.candidates.length).toBeGreaterThan(0);
+    expect(result.candidates.some(candidate => candidate.plan_complete)).toBe(false);
+    expect(result.blockers).toContain("Cannot repair the leaf while preserving the declared selector constraints.");
+  },
+);

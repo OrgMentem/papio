@@ -42,6 +42,12 @@ const LOGIN_WORDS = /(?:sign[\s_-]*in|log[\s_-]*in|login|institution|password)/i
 const TERMS_WORDS = /(?:accept|agree|consent|terms)/i;
 const PAYWALL_WORDS = /(?:paywall|purchase|subscribe|subscription|required|no[\s_-]*(?:access|entitlement)|not[\s_-]*available|access[\s_-]*denied|get[\s_-]*access)/i;
 
+function hasClickAffordance(node: Element): boolean {
+  // Capture-visible evidence only: listeners attached by page JS are not inspectable.
+  return node.matches('a[href],button,summary,input[type="button"],input[type="submit"],input[type="image"],[role="button"],[role="link"],.button,.btn') ||
+    (node.getAttribute("onclick")?.trim().length ?? 0) > 0 || node.tagName.toLowerCase().includes("button");
+}
+
 function elementWords(node: Element): string {
   const values = [
     node.tagName,
@@ -87,7 +93,7 @@ function semanticNodes(doc: Document, kind: RepairRuleKind): Element[] {
         for (const attr of Array.from(node.attributes)) {
           if (attr.name.startsWith("data-")) ownValues.push(attr.name, attr.value);
         }
-        return ARTICLE_WORDS.test(words) && (hasActionAttribute || customControl || ARTICLE_WORDS.test(ownValues.join(" ")));
+        return ARTICLE_WORDS.test(words) && (hasClickAffordance(node) || hasActionAttribute || customControl || ARTICLE_WORDS.test(ownValues.join(" ")));
       });
     case "login":
       return all.filter((node) => {
@@ -154,7 +160,12 @@ function selectorsFor(node: Element): RankedSelector[] {
   const result: RankedSelector[] = [];
   const id = node.getAttribute("id")?.trim() ?? "";
   if (id !== "" && !id.includes("?")) {
-    if (!DOCUMENT_SCOPED_VALUE.test(id)) {
+    // Even a one- or five-digit suffix may be an article record, not a stable ID.
+    // Prefer semantic classes; a prefix remains a lower-ranked fallback.
+    const numericPrefix = /^(.*?[^\d])\d+$/.exec(id)?.[1];
+    if (numericPrefix !== undefined && /[a-z]/i.test(numericPrefix) && !DOCUMENT_SCOPED_VALUE.test(numericPrefix)) {
+      result.push({ score: 65, selector: `${node.tagName.toLowerCase()}[id^='${cssString(numericPrefix)}']`, node });
+    } else if (!DOCUMENT_SCOPED_VALUE.test(id) && !/\d+$/.test(id)) {
       result.push({ score: 100, selector: `#${cssIdentifier(id)}`, node });
     } else {
       // The sanitizer preserves semantic ID prefixes but masks the record suffix.
@@ -184,6 +195,11 @@ function selectorsFor(node: Element): RankedSelector[] {
   result.push({ score: 60, selector: stablePath(node), node });
 
   const classes = Array.from(node.classList).filter((value) => value !== "" && !value.includes("?") && !DOCUMENT_SCOPED_VALUE.test(value));
+  // A compound class can distinguish the real control from a preview sharing
+  // its generic button class, without preserving record IDs or layout position.
+  if (classes.length > 1) {
+    result.push({ score: 70, selector: `${tag}${classes.slice(0, 4).map(value => `.${cssIdentifier(value)}`).join("")}`, node });
+  }
   // Captured PDF routes can identify a control without pinning its place in
   // the layout or its document ID. Keep slash boundaries, ignore filenames
   // and query values, and retain the rendered control's class. A bare class
@@ -213,6 +229,51 @@ function selectorsFor(node: Element): RankedSelector[] {
     });
   }
   return result;
+}
+
+function preserveSelectorConstraints(original: string, candidate: RankedSelector): string | null {
+  const selector = original.trim();
+  // A lone locator has no surrounding guards to salvage. Preserve the existing
+  // discovery path for ID/class/attribute renames; compound selectors below are
+  // repairable only by replacing positive classes on their final element.
+  if (/^(?:[a-z][\w-]*|\*)?(?:[.#][a-z_-][\w-]*|\[[^\[\]]+\])$/i.test(selector)) return candidate.selector;
+  const classes: { start: number; end: number; name: string }[] = [];
+  const stack: string[] = [];
+  let quote = "", leafStart = 0;
+  for (let index = 0; index < selector.length; index++) {
+    const char = selector[index]!;
+    // Escaped identifiers and selector lists require a fuller CSS parser. They
+    // remain diagnostics, never permission to fall back to a broader selector.
+    if (char === "\\") return null;
+    if (quote) { if (char === quote) quote = ""; continue; }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === "[" || char === "(") { stack.push(char === "[" ? "]" : ")"); continue; }
+    if (char === "]" || char === ")") { if (stack.pop() !== char) return null; continue; }
+    if (stack.length) continue;
+    if (char === ",") return null;
+    if (/\s|[>+~]/.test(char)) { leafStart = index + 1; continue; }
+    if (char === ".") {
+      const name = /^\.([a-z_-][\w-]*)/i.exec(selector.slice(index))?.[1];
+      if (name === undefined) return null;
+      classes.push({ start: index, end: index + name.length + 1, name });
+      index += name.length;
+    }
+  }
+  if (quote || stack.length) return null;
+  const leafClasses = classes.filter(token => token.start >= leafStart);
+  const obsolete = leafClasses.filter(token => !candidate.node.classList.contains(token.name));
+  const additions = Array.from(candidate.node.classList).filter(name =>
+    /^[a-z_-][\w-]*$/i.test(name) && !DOCUMENT_SCOPED_VALUE.test(name) && !leafClasses.some(token => token.name === name));
+  if (!obsolete.length || !additions.length) return null;
+  // Every byte outside the obsolete positive class tokens survives: ancestors,
+  // combinators, matching classes, attributes, and nested/negative pseudo guards.
+  let repaired = "", cursor = 0;
+  obsolete.forEach((token, index) => {
+    repaired += selector.slice(cursor, token.start) + (index === 0 ? additions.map(name => `.${cssIdentifier(name)}`).join("") : "");
+    cursor = token.end;
+  });
+  repaired += selector.slice(cursor);
+  try { return candidate.node.matches(repaired) ? repaired : null; } catch { return null; }
 }
 
 function replacementTarget(doc: Document, rule: ClassifyRule): string | null {
@@ -338,6 +399,7 @@ export function synthesizeAdapterRepair(
   const hasFixtureIdentity = ruleKind !== "article" || expected.doi !== undefined || expected.title !== undefined;
   // A PDF control proves nothing about a separate missing access/identity
   // check. Such candidates may classify, but must not unlock a source patch.
+  const emitted = new Set<string>();
   const candidates = ruleIndexes.flatMap((ruleIndex) => {
     const replaceSelector = currentComplete ? null : replacementTarget(doc, spec.classify[ruleIndex]!);
     const repairsDeclaredTarget = ruleKind !== "article" || replaceSelector === null ||
@@ -348,7 +410,9 @@ export function synthesizeAdapterRepair(
       replaceSelector === spec.download?.workTarget?.selector;
 
     return Array.from(bySelector.values()).map((item): SelectorCandidate => {
-      const trial = candidateSpec(spec, ruleIndex, replaceSelector, item.selector);
+      const constrained = ruleKind === "article" && replaceSelector !== null ? preserveSelectorConstraints(replaceSelector, item) : item.selector;
+      const selector = constrained ?? item.selector;
+      const trial = candidateSpec(spec, ruleIndex, replaceSelector, selector);
       const planned = planExecution(doc, trial, expected, {});
       const classifierVerified = verdictOf(planned).kind === ruleKind;
       // An executable same-origin href can still be the HTML "Full text" tab
@@ -369,11 +433,17 @@ export function synthesizeAdapterRepair(
           .some((value) => /(?:download[\s_-]*pdf|pdf[\s_-]*download)/i.test(value ?? ""))
       );
       const blockedBy: string[] = [];
+      if (constrained === null) blockedBy.push("Cannot repair the leaf while preserving the declared selector constraints.");
       // A form inherits its child's PDF label and may itself have a stable
       // download id/action. HTMLElement.click() on the form does not activate
       // its submit control, even though the planner accepts that element.
-      if (ruleKind === "article" && spec.download?.method === "click" && item.node.tagName.toLowerCase() === "form") {
-        blockedBy.push("A form container does not prove a clickable download control.");
+      const clickAffordance = hasClickAffordance(item.node);
+      if (ruleKind === "article" && spec.download?.method === "click" && !clickAffordance) {
+        if (item.node.tagName.toLowerCase() === "form") {
+          blockedBy.push("A form container does not prove a clickable download control.");
+        } else if (Array.from(item.node.querySelectorAll("*")).some(node => hasClickAffordance(node) && /pdf/i.test(elementWords(node)))) {
+          blockedBy.push("A container's PDF label does not activate its interactive child.");
+        }
       }
       if (!classifierVerified) blockedBy.push(`Proposed selector still classifies as ${verdictOf(planned).kind}.`);
       if (!hasFixtureIdentity) blockedBy.push("Capture lacks the adapter's required work identity evidence.");
@@ -383,8 +453,8 @@ export function synthesizeAdapterRepair(
       else if (classifierVerified && !complete(planned)) blockedBy.push("Plan has no declared download action.");
       return {
         rule_index: ruleIndex,
-        score: item.score + (explicitPDFDownload ? 100 : 0),
-        selector: item.selector,
+        score: item.score + (explicitPDFDownload ? 100 : 0) + (ruleKind === "article" && clickAffordance ? 20 : 0),
+        selector,
         outer_html: truncateOuterHTML(item.node),
         classifier_verified: classifierVerified,
         plan_complete: blockedBy.length === 0,
@@ -398,6 +468,11 @@ export function synthesizeAdapterRepair(
     .sort((a, b) => Number(b.plan_complete) - Number(a.plan_complete) ||
       Number(b.classifier_verified) - Number(a.classifier_verified) ||
       b.score - a.score || a.rule_index - b.rule_index || a.selector.localeCompare(b.selector))
+    .filter(candidate => {
+      const key = JSON.stringify([candidate.rule_index, candidate.selector]);
+      if (emitted.has(key)) return false;
+      emitted.add(key); return true;
+    })
     .slice(0, Math.max(0, limit));
 
   const blockers = currentComplete ? ["The current adapter already produces a complete plan; no selector repair is needed."] :

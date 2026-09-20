@@ -298,6 +298,16 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **A late browser completion no longer reports adoption as deferred after the
+  same PDF is already ready.** The daemon checks the landed bytes, stored artifact
+  and accepted browser candidate before acknowledging the duplicate. Mismatched
+  files and unsupported producer claims remain refused.
+
+- **Adapter repairs retain working selector constraints.** Proposals prefer the
+  interactive PDF control over its surrounding form, avoid numeric article IDs,
+  and preserve ancestor, form and disabled-control guards when repairing a leaf
+  class. Unsupported compound changes remain explained diagnostics.
+
 - **HTML downloads no longer consume a waiting paper's browser handoff during
   folder scans.** The daemon checks the file header before starting adoption,
   leaving the original action available for a later PDF. The check shares the
