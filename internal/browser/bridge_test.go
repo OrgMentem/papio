@@ -14531,6 +14531,37 @@ func TestEffectPermitReconcileNoDispatchBecomesUnknown(t *testing.T) {
 		t.Fatalf("status=%q want unknown_completion", got.Status)
 	}
 }
+func TestEffectPermitReconcileReplySurvivesInterveningPolls(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	effectPermitHolder(t, b)
+	id := park(t, jobs, "reconcile-unknown", handoffWork())
+	attempt := "reconcile-unknown-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-unknown")
+	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatal(err)
+	}
+	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	request := nextEffectPermitReconcileRequest(t, b)
+	// Ordinary polls may overtake a slow browser response. They must not
+	// invalidate the sole request the browser is already answering.
+	for range 8 {
+		nextEffectPermitReconcileRequest(t, b)
+	}
+	if len(b.effectPermitReconciles) != 1 {
+		t.Fatalf("pending requests=%d", len(b.effectPermitReconciles))
+	}
+	// no-dispatch observation -> unknown_completion
+	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
+
+		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
+	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
+	if got.Status != job.EffectPermitUnknownCompletion {
+		t.Fatalf("status=%q want unknown_completion", got.Status)
+	}
+}
 func TestEffectPermitReconcileReplacementHolderClassifiesHistoricalPermit(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	effectPermitHolder(t, b)

@@ -10944,12 +10944,18 @@ jobLoop:
 				complete = payload.ClaimID != "" && payload.BindingID != "" && payload.EffectOrdinal != nil && payload.InstitutionalRequestID != ""
 			}
 			if complete {
-				if frame, err := b.frame(protocol.MsgEffectPermitReconcileRequest, permit.JobID, payload); err == nil {
-					for requestID, pending := range b.effectPermitReconciles {
-						if pending.permitID == permit.ID {
-							delete(b.effectPermitReconciles, requestID)
-						}
+				// A poll can overtake the browser's reply. Reuse the pending
+				// request until it is answered instead of invalidating that
+				// reply on every intervening sync. There is one live permit;
+				// holder replacement clears this map before soliciting again.
+				for requestID, pending := range b.effectPermitReconciles {
+					if pending.permitID == permit.ID && pending.jobID == permit.JobID {
+						payload.RequestID = requestID
+					} else {
+						delete(b.effectPermitReconciles, requestID)
 					}
+				}
+				if frame, err := b.frame(protocol.MsgEffectPermitReconcileRequest, permit.JobID, payload); err == nil {
 					b.effectPermitReconciles[payload.RequestID] = pendingEffectPermitReconcile{
 						permitID: permit.ID,
 						jobID:    permit.JobID,
