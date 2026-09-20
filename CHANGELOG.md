@@ -298,6 +298,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **HTML downloads no longer consume a waiting paper's browser handoff during
+  folder scans.** The daemon checks the file header before starting adoption,
+  leaving the original action available for a later PDF. The check shares the
+  existing filesystem timeout and still requires full PDF and identity validation.
 
 - **A manual-download task cannot restart an automated sign-in attempt.**
   Late browser requests are refused once the provider handoff has become a

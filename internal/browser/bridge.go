@@ -8475,6 +8475,13 @@ func BoundedReadDir(dir string, readDir func(string) ([]os.DirEntry, error), aft
 // evidence a settled file is present (fail-closed adoption semantics). The
 // two log lines fire exactly once per transition.
 func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
+	return b.readAdoptionDirWith(dir, b.readDir)
+}
+
+// readAdoptionDirWith keeps inspection of job landing bytes inside the same
+// deadline and single-flight gate as the listing. A blocked open/read must not
+// strand the session or start another filesystem call on every poll.
+func (b *Bridge) readAdoptionDirWith(dir string, fn func(string) ([]os.DirEntry, error)) ([]os.DirEntry, error) {
 	b.adoptionScanMu.Lock()
 	if b.adoptionScanGate == nil {
 		b.adoptionScanGate = make(chan struct{}, 1)
@@ -8496,7 +8503,6 @@ func (b *Bridge) readAdoptionDir(dir string) ([]os.DirEntry, error) {
 		return nil, ErrAdoptionScanTimeout
 	}
 
-	fn := b.readDir
 	if fn == nil {
 		fn = os.ReadDir
 	}
@@ -8670,16 +8676,12 @@ func (b *Bridge) recoverDeferredAutoBind(ctx context.Context, grabID, jobID stri
 // placeholder target (Firefox creates the final name empty while streaming
 // into name.part), never a settled download, so it defers the scan too. More
 // than one visible file is ambiguous and adopts nothing. The returned name
-// feeds adopt(), which re-applies full confinement checks. Roots are tried in
+// must also pass a bounded PDF-header probe before it feeds adopt(), which
+// re-applies full confinement and validation checks. Roots are tried in
 // cfg.AdoptionRoots order, so the effective root wins and the drain-only
 // legacy root is only consulted when it holds the job's directory.
 func (b *Bridge) scanAdoptionDir(_ context.Context, jobID string) (string, bool) {
-	for _, root := range b.cfg.AdoptionRoots() {
-		if name, ok := b.settledFileIn(filepath.Join(root, jobID)); ok {
-			return name, true
-		}
-	}
-	return "", false
+	return b.scanAdoptionDirWithProbe(jobID, probeAdoptionPDF)
 }
 
 // settledFileIn is scanAdoptionDir's directory-scan rule, factored out so
@@ -8690,6 +8692,12 @@ func (b *Bridge) settledFileIn(dir string) (string, bool) {
 	if err != nil {
 		return "", false // no directory yet, scan suspended/timed out, or unreadable
 	}
+	return settledFileName(entries)
+}
+
+// settledFileName preserves the shared job/grab ambiguity and partial-write
+// rules. Only job-folder scans add a byte probe after this selection.
+func settledFileName(entries []os.DirEntry) (string, bool) {
 	var name string
 	for _, e := range entries {
 		n := e.Name()
