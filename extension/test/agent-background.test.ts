@@ -766,3 +766,32 @@ test("Firefox late import result cannot mark a newer generic tuple terminal", as
   expect(h.backend.store.activeJobs[0]?.generic_terminal).not.toBe(true);
   expect(h.backend.store.activeJobs[0]?.generic_drive_epoch?.ordinal).toBe(1); expectNativeUntouched(h);
 });
+
+test("Firefox explicit PDF link retains native adoption through delayed browser creation", async () => {
+  const h = await nativeHarness();
+  h.win.document.querySelector("main")!.innerHTML = '<a href="/download/paper.pdf?ticket=PRIVATE">Article PDF</a>';
+  const anchor = h.win.document.querySelector("a")!;
+  let clicks = 0;
+  anchor.addEventListener("click", event => {
+    clicks++;
+    expect(anchor.getAttribute("download")).toBe("");
+    expect(h.backend.store.activeJobs[0]?.native_download?.phase).toBe("armed");
+    event.preventDefault();
+  });
+  await nativeArm(h);
+  expect(anchor.hasAttribute("download")).toBe(false);
+  for (let i = 0; i < 5; i++) await h.tick();
+  expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+  const item = firefoxItem(h, { url: "https://unregistered.example/download/paper.pdf?ticket=PRIVATE" });
+  await h.downloads.onCreated.emit(item);
+  await h.tick();
+  const completing = completeNative(h, item);
+  const request = await h.request("native_download_import_request_v1");
+  expect(request.payload["download_id"]).toBe(item.id);
+  expect(request.payload["source_path"]).toBe(sourcePath);
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+  await h.reply(request, "native_download_import_result_v1", { reservation_id: reservationID, download_id: item.id, outcome: "ready" });
+  await completing;
+  expect(clicks).toBe(1);
+  expectNativeUntouched(h);
+});

@@ -24,8 +24,16 @@ takeover or a changed permit cannot revive an old answer. Neither side creates
 a second acquisition queue or authority ledger.
 
 The first integration handles visible controls on a DOI-identified article
-already bound to a managed tab. It supports in-page menus and JavaScript-backed
-downloads. Cross-document navigation, new contexts, publisher search and native
+already bound to a managed tab. It supports in-page menus, JavaScript-backed
+downloads and explicit same-origin PDF links. A selected original anchor with
+its own PDF label and a `.pdf` path can receive an empty `download` attribute
+for one native click. Its URL, target, referrer policy and publisher handlers
+remain intact; no URL replay, cloned link or filename is introduced. The
+temporary attribute is removed afterward unless a publisher handler replaced
+it. This requests a download rather than proving one: browser preferences,
+redirects or handlers can change the outcome. The existing bound-document and
+download-receipt checks still determine ownership. Cross-document navigation,
+new contexts, publisher search and native
 viewer saving are later implementation milestones, not reasons to require one
 adapter per publisher. Effective browser host permission remains necessary.
 Chrome uses its filename-steering API. Firefox negotiates

@@ -535,5 +535,6 @@ this feature is the cloud opt-in. PDF adoption and validation remain unchanged.
 **Why:** Requiring a separate selector adapter for every publisher makes coverage
 and repair depend on continual provider-specific maintenance. Agent acquisition
 can cover unfamiliar controls while retaining packaged execution checks. The
-first integration handles an already identified article; broader navigation and
+first integration handles an already identified article, including explicit
+same-origin PDF links through native download intent. Broader navigation and
 native viewers are later work. Browser-store acceptance remains unverified.

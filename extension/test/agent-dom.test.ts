@@ -99,11 +99,11 @@ test("standard title fallback retains the existing public text length cap", asyn
   expect(observed(await observe()).observation.title).toHaveLength(400);
 });
 
-test("own-label ranking precedes the cap without promoting region context or authorizing PDF navigation", async () => {
+test("own-label ranking precedes the cap without promoting region context or authorizing viewer navigation", async () => {
   const win = setup(`<meta name="citation_doi" content="${doi}"><main>
     <button>Download citation</button><button>Figures PDF</button><button>Supplementary PDF</button>
     <section aria-label="Download PDF">${Array.from({ length: 85 }, (_, i) => `<button>Share ${i}</button>`).join("")}</section>
-    <button>Formats</button><a href="/download/opaque/article.pdf">Article PDF</a>
+    <button>Formats</button><a href="/download/opaque/viewer">Article PDF</a>
     <button>Download PDF</button>
   </main>`);
   const first = observed(await observe());
@@ -226,7 +226,7 @@ for (const [name, content] of [
   ["dc.identifier", `https://doi.org/${doi}`], ["dc.identifier", `http://dx.doi.org/${doi}`],
   ["prism.doi", doi], ["PRISM.DOI", `doi:${doi}`],
 ] as const) test(`standard DOI metadata provides exact identity: ${name} ${content}`, async () => {
-  const win = setup(`<meta name="${name}" content="${content}"><main><button>Formats</button><a href="/articles/63646.pdf">PDF</a></main>`);
+  const win = setup(`<meta name="${name}" content="${content}"><main><button>Formats</button><a href="/articles/63646/viewer">PDF</a></main>`);
   let clicks = 0; win.document.querySelector("a")!.addEventListener("click", () => clicks++);
   const injected = new Function(`return (${agentDOM.toString()});`)() as typeof agentDOM;
   const first = observed(await injected({ method: "observe", entryURL, doi }));
@@ -351,3 +351,88 @@ for (const attributes of ['type="password" hidden', 'type="hidden" name="passwor
     expect((await act(first)).status).not.toBe("dispatched");
     expect(reads).toBe(0);
   });
+
+test("an explicit same-origin PDF anchor uses its original native click with temporary download intent", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/download/opaque/paper.PDF?ticket=PRIVATE" referrerpolicy="same-origin">Article PDF</a></main>`);
+  const anchor = win.document.querySelector("a")!;
+  const before = anchor.outerHTML;
+  let clicks = 0;
+  anchor.addEventListener("click", event => {
+    clicks++;
+    expect(event.target).toBe(anchor);
+    expect(anchor.getAttribute("download")).toBe("");
+    expect(anchor.getAttribute("href")).toBe("/download/opaque/paper.PDF?ticket=PRIVATE");
+    expect(anchor.getAttribute("referrerpolicy")).toBe("same-origin");
+    event.preventDefault(); // No network from this DOM regression.
+  });
+  const injected = new Function(`return (${agentDOM.toString()});`)() as typeof agentDOM;
+  const first = observed(await injected({ method: "observe", entryURL, doi }));
+  expect(first.observation.controls[0]?.disabled).toBe(false);
+  const request = { method: "act" as const, entryURL, doi, document: first.document, revision: first.observation.revision, choice: first.observation.controls[0]!.id };
+  expect(await injected(request)).toEqual({ status: "dispatched", downloadExpected: true });
+  expect(anchor.outerHTML).toBe(before);
+  expect(await injected(request)).toEqual({ status: "stale", reason: "observation_changed" });
+  expect(clicks).toBe(1);
+});
+
+for (const [attributes, text] of [
+  ['href="https://external.example/paper.pdf"', "Article PDF"],
+  ['href="http://ebooks.iospress.nl/paper.pdf"', "Article PDF"],
+  ['href="/paper.pdf" target="_blank"', "Article PDF"],
+  ['href="/paper.pdf" target="other"', "Article PDF"],
+  ['href="/viewer?format=pdf"', "Article PDF"],
+  ['href="/paper.pdf"', "Next"],
+  ['href="/paper.pdf"', "Accept terms and download PDF"],
+] as const) test(`PDF download intent retains restrictions: ${attributes} ${text}`, async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a ${attributes}>${text}</a></main>`);
+  let clicks = 0; win.document.querySelector("a")!.addEventListener("click", () => clicks++);
+  const first = observed(await observe());
+  expect(first.observation.controls[0]?.disabled).toBe(true);
+  expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "stale", reason: "observation_changed" });
+  expect(clicks).toBe(0);
+  expect(win.document.querySelector("a")!.hasAttribute("download")).toBe(false);
+});
+
+test("PDF download intent restores its attribute even if native dispatch throws", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/paper.pdf">Article PDF</a></main>`);
+  const anchor = win.document.querySelector("a")!;
+  const first = observed(await observe());
+  const original = win.HTMLElement.prototype.click;
+  try {
+    win.HTMLElement.prototype.click = function () { throw new Error("synthetic dispatch failure"); };
+    await expect(act(first, { choice: first.observation.controls[0]!.id })).rejects.toThrow("synthetic dispatch failure");
+    expect(anchor.hasAttribute("download")).toBe(false);
+  } finally { win.HTMLElement.prototype.click = original; }
+  expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "stale", reason: "observation_changed" });
+});
+
+test("PDF intent belongs to the selected original anchor, never a conflicting child label", async () => {
+  setup(`<meta name="citation_doi" content="${doi}"><main><a href="/paper.pdf" aria-label="Next"><span role="button">PDF</span></a></main>`);
+  expect(observed(await observe()).observation.controls.every(c => c.disabled)).toBe(true);
+});
+
+for (const existing of [false, true]) test(`PDF intent preserves publisher download values, existing=${existing}`, async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/paper.pdf" aria-haspopup="menu" ${existing ? 'download="publisher.pdf"' : ''}>PDF options</a></main>`);
+  const anchor = win.document.querySelector("a")!;
+  anchor.addEventListener("click", event => {
+    expect(anchor.getAttribute("download")).toBe(existing ? "publisher.pdf" : "");
+    if (!existing) anchor.setAttribute("download", "provider-changed.pdf");
+    event.preventDefault();
+  });
+  const first = observed(await observe());
+  expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "dispatched", downloadExpected: true });
+  expect(anchor.getAttribute("download")).toBe(existing ? "publisher.pdf" : "provider-changed.pdf");
+});
+
+for (const change of ["href", "base-target", "identity"]) test(`PDF intent rechecks ${change} before mutation or click`, async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/paper.pdf">Article PDF</a></main>`);
+  const anchor = win.document.querySelector("a")!;
+  let clicks = 0; anchor.addEventListener("click", () => clicks++);
+  const first = observed(await observe());
+  if (change === "href") anchor.href = "https://external.example/wrong.pdf";
+  if (change === "base-target") win.document.head.insertAdjacentHTML("beforeend", '<base target="_blank">');
+  if (change === "identity") win.document.querySelector("meta")!.setAttribute("content", "10.1234/wrong");
+  expect((await act(first, { choice: first.observation.controls[0]!.id })).status).not.toBe("dispatched");
+  expect(clicks).toBe(0);
+  expect(anchor.hasAttribute("download")).toBe(false);
+});

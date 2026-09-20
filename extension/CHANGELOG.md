@@ -123,6 +123,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Article-agent fallback can download explicit same-origin PDF links.** It
+  clicks the original publisher link with temporary download intent. Firefox
+  still requires an exact browser download, adoption and PDF validation before
+  reporting success.
 - **Article-agent choices use the control's own label.** Unnamed controls no
   longer inherit unrelated download headings. Standard article titles and
   relevant controls survive the observation limit, and unchanged pages are

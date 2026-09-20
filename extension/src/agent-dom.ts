@@ -24,8 +24,9 @@ export type AgentDOMResult =
 
 /** Self-contained isolated-world injection. Only the projection leaves the page;
  * URLs, selectors, form execution data and account content never leave it.
- * This first slice stays in one article document. Explicit cross-page links,
- * form navigation and new browsing contexts are refused. Wider navigation needs
+ * This executor stays in one article document. Explicit same-origin PDF links
+ * use native download intent; other cross-page links, form navigation and new
+ * browsing contexts are refused. Wider navigation needs
  * its own binding/authority design, not a more permissive model instruction. */
 export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult> {
   const normalizeDOI = (raw: string) => raw.trim().replace(/^(?:doi:\s*|https?:\/\/(?:dx\.)?doi\.org\/)/i, "").toLowerCase();
@@ -130,6 +131,8 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     const value = element.getAttribute("role");
     return value === "button" || value === "link" || value === "menuitem" || value === "tab" ? value : element.tagName === "A" ? "link" : "button";
   };
+  const explicitPDFLink = (element: Element, anchor: HTMLAnchorElement) =>
+    element === anchor && /\bpdf\b/i.test(label(anchor)) && /\.pdf$/i.test(new URL(anchor.href).pathname);
   const allowed = (element: Element) => {
     if (human.test(label(element))) return false;
     const anchor = element.closest<HTMLAnchorElement>("a[href]");
@@ -137,9 +140,11 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       const url = new URL(anchor.href);
       const target = anchor.target || document.querySelector("base")?.target || "_self";
       if (target !== "_self" || url.protocol !== "https:" || url.origin !== entry.origin || url.username || url.password) return false;
-      // A download attribute explicitly prevents article navigation. Other links
-      // can only move within this exact article (including its query binding).
-      if (!anchor.hasAttribute("download") && (url.pathname !== entry.pathname || url.search !== location.search)) return false;
+      // Explicit PDF links receive download intent at dispatch. Browser policy
+      // and publisher handlers still control the outcome; document/receipt
+      // checks, rather than the attribute, establish continued ownership.
+      if (!anchor.hasAttribute("download") && !explicitPDFLink(element, anchor) &&
+        (url.pathname !== entry.pathname || url.search !== location.search)) return false;
     }
     const form = (element as HTMLButtonElement).form || element.closest("form");
     if (form) {
@@ -200,8 +205,18 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     state.serial++;
     const menu = target.hasAttribute("aria-haspopup") || target.hasAttribute("aria-controls") ||
       target.hasAttribute("aria-expanded") || /\b(options?|formats?|menu)\b/i.test(label(target));
-    const downloadExpected = !menu && (/\b(download|pdf|save (?:article|full text))\b/i.test(label(target)) || target.closest("a[download]") !== null);
-    HTMLElement.prototype.click.call(target);
+    const anchor = target.closest<HTMLAnchorElement>("a[href]");
+    const explicitPDF = anchor !== null && explicitPDFLink(target, anchor);
+    const addDownload = explicitPDF && !anchor.hasAttribute("download");
+    const downloadExpected = explicitPDF || (!menu && (/\b(download|pdf|save (?:article|full text))\b/i.test(label(target)) || target.closest("a[download]") !== null));
+    // Click the original provider element once, preserving its URL, handlers,
+    // target and referrer policy. No cloned link, URL replay or invented path.
+    if (addDownload) anchor.setAttribute("download", "");
+    try { HTMLElement.prototype.click.call(target); }
+    finally {
+      // Leave a publisher handler's own replacement value intact.
+      if (addDownload && anchor.getAttribute("download") === "") anchor.removeAttribute("download");
+    }
     return { status: "dispatched", downloadExpected };
   }
   if (request.method !== "observe") return { status: "blocked", reason: "invalid_request" };
