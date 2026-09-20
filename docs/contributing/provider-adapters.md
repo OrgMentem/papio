@@ -48,6 +48,12 @@ Review the access checks and the live file before applying a proposal.
 A wrong resolver destination or missing PDF control can require a route
 change instead of a selector change.
 
+Connecting an extension with a newer adapter revision can automatically retry
+eligible jobs parked by the older revision. During isolated testing, record the
+normal daemon's jobs before reconnecting it: the upgraded browser can trigger
+that recovery there too. These retries remain part of the normal job history;
+they are not new isolated probes or proof that a file was acquired.
+
 ## Capture a specific scenario
 
 A code contribution normally needs at least an entitled `success` page. Login, terms, and no-entitlement states need separate captures when the adapter distinguishes them.

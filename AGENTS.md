@@ -675,6 +675,14 @@ There is also a link check, because `zensical build` prints a broken link as an
   `rule://no-underscore-file-in-extension`.
 
 ### Adapters & fixtures
+- **Reconnecting a newer adapter can retry existing jobs in the destination
+  daemon.** `internal/app/handoff_repair.go:RepairAdapterUpgrade` repairs eligible
+  provider parks when the live browser advertises a newer adapter revision. This
+  also runs when restoring the normal native host after an isolated experiment:
+  restoring the manifest does not restore the browser's old adapter versions.
+  Snapshot normal job states before reconnecting and inspect
+  `adapter_upgrade_repair` events afterward. Preserve those transitions; do not
+  rewrite jobs to make the before/after states match or call them isolated probes.
 - The procedure for building or repairing one lives in
   `.agents/skills/papio-provider-adapter/SKILL.md` — evidence order, the
   wrapper-versus-file test, route-boundary and localization rules, and the
