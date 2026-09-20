@@ -23,9 +23,13 @@ restarting disables the backend.
 Both daemon and extension must support `agent_fallback_v1`. Effective site access
 is still required, including for publishers without an adapter. The initial
 implementation handles controls on a DOI-identified article in a managed tab.
-It currently requires Chrome's filename-steering download API; Firefox remains
-human-assisted for this path. The daemon and decision contract are shared across
-operating systems.
+Chrome uses its filename-steering download API. Firefox requires both peers to
+support `native_click_adoption_v1`. It uses a fresh download with an exact article
+referrer, then asks the daemon to copy and validate that file. The file must be
+directly in the parent of the configured adoption root, normally Downloads.
+Custom browser download directories must match that configuration. Missing
+referrers, ambiguous downloads, UNC paths and save dialogs remain assisted.
+The daemon and decision contract are shared across operating systems.
 It allows up to 60 decisions in ten minutes per drive permit and 30 seconds per
 model call. Failures consume their call reservation; retries do not reset the
 budget. These limits are implementation defaults, not TOML settings.

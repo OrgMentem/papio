@@ -14,8 +14,9 @@ The daemon now owns inference over the existing generic-drive permit and job.
 The extension tries the agent after packaged/generic routes fail, including
 publishers with no adapter. It observes an already bound DOI-identified article,
 selects in-page controls and tracks the resulting browser download. Chrome's
-filename-steering API is required in this slice. The backend contract is shared
-across platforms and accepts local implementations; the first concrete backend
+filename-steering API carries Chrome downloads. Firefox now has a negotiated
+native-download reservation and daemon adoption path; live acceptance is in
+progress. The backend contract is shared across platforms and accepts local implementations; the first concrete backend
 uses TypeSafe with a daemon-only `PAPIO_TYPESAFE_API_KEY` environment variable.
 The key is removed from the process environment before other subprocesses start.
 
@@ -28,11 +29,12 @@ Local receipts omit page projections and raw model responses.
 
 One live call through the new Go backend returned Jev 1.13.0's PDF-control choice
 (750 input / 50 output tokens); it performed no browser action. The earlier
-verified IOS Press acquisition used the spike controller. Live acceptance of the
-integrated loop remains outstanding and must use a fresh isolated job, including
-one provider with no adapter. Cross-document navigation, native viewer saving,
-Firefox ownership, credential-store onboarding and automatic source-repair
-promotion remain subsequent slices.
+verified IOS Press acquisition used the spike controller. A later isolated Chrome
+run of the integrated loop acquired the correct five-page IOS Press PDF after one explicit Open and one Jev decision, with the
+packaged adapter deliberately omitted. That proves the fallback mechanism;
+Firefox and a naturally unsupported publisher still need live acceptance.
+Cross-document navigation, native viewer saving, credential-store onboarding and
+automatic source-repair promotion remain subsequent slices.
 
 ## Evidence and remaining proof
 

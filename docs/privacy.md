@@ -158,6 +158,13 @@ receipts. Existing diagnostic captures remain separate and local. No repair trac
 or analytics is sent to OrgMentem. The decision interface also accepts local
 backends without cloud credentials; a local model runtime is not yet bundled.
 
+For Firefox agent downloads, the extension sends the local daemon the exact
+browser download path, size, start time and download ID. The path stays local
+and is not retained in the job's event receipts or sent to the model. The daemon
+copies only a new file from its configured download directory and keeps the
+browser's original file. A restart before publication can leave an incomplete
+attempt; Papio does not repeat the click to recover it.
+
 ## Permissions
 
 Each browser permission is used to perform a requested download, read a page

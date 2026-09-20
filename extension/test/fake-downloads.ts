@@ -16,6 +16,7 @@ export class FakeDownloads {
   }[] = [];
   readonly removedFiles: number[] = [];
   readonly erased: number[] = [];
+  readonly searches: { id?: number; filename?: string; filenameRegex?: string; limit?: number }[] = [];
   /** Optional hook runs after Chrome has created its durable item but before
    * downloads.download resolves with the item ID. Tests use it to start a
    * second Bridge, modelling an MV3 worker death in that exact window. */
@@ -51,6 +52,7 @@ export class FakeDownloads {
     filenameRegex?: string;
     limit?: number;
   }): Promise<DownloadItemLike[]> {
+    this.searches.push({ ...query });
     let result = [...this.items.values()];
     if (query.id !== undefined)
       result = result.filter((item) => item.id === query.id);

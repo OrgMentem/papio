@@ -9,6 +9,7 @@
 // shape below; handoff URLs remain worker-local compatibility data only.
 
 import type { DeliverySessionEvidence } from "./protocol";
+import { migrateNativeDownloadRecovery, type NativeDownloadRecovery } from "./native-download";
 
 export type JobStatus =
   "offered" | "queued" | "accepted" | "auth_pending" | "awaiting_download";
@@ -229,6 +230,8 @@ export interface ActiveJob {
    * candidate URLs remain worker-local and are never persisted or sent over
    * native messaging. */
   generic_drive_epoch?: ProviderDriveEpoch;
+  /** Native observation recovery evidence only; never resumes actions or IDs. */
+  native_download?: NativeDownloadRecovery;
   /** Generic epoch bookkeeping is opaque correlation only. Candidate URLs and
    * page-derived evidence remain worker-local. */
   generic_evaluated?: boolean;
@@ -964,8 +967,9 @@ export function clearPendingDelivery(
  * `federatedLoginOwners` cross-job claim map and its per-job
  * `waiting_for_session`/`waiting_for_session_key`/`waiting_deadline`
  * markers; version 8 adds a configured bare institution origin to active
- * jobs, without retaining the worker-local offer URL. */
-export const MANAGED_STATE_VERSION = 8;
+ * jobs, without retaining the worker-local offer URL; version 9 adds a closed
+ * native-download recovery receipt that never restores dispatch authority. */
+export const MANAGED_STATE_VERSION = 9;
 const STORAGE_KEY = "papio_state_v1";
 type UnknownRecord = Record<string, unknown>;
 
@@ -1209,6 +1213,9 @@ function migratedJob(value: ActiveJob): ActiveJob {
   delete migrated.institution_claim_key;
   delete migrated.waiting_for_session_key;
   delete migrated.direct_envelope;
+  delete migrated.native_download;
+  const nativeDownload = migrateNativeDownloadRecovery(raw.native_download);
+  if (nativeDownload !== undefined) migrated.native_download = nativeDownload;
   const institutionOrigin = safeOrigin(raw.institution_origin);
   delete (migrated as unknown as UnknownRecord).institution_origin;
   if (
@@ -1659,6 +1666,7 @@ export function migrateManagedState(raw: unknown): StoreShape {
     version !== 5 &&
     version !== 6 &&
     version !== 7 &&
+    version !== 8 &&
     version !== MANAGED_STATE_VERSION
   )
     return emptyStore();

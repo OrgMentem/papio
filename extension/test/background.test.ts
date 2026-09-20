@@ -1371,6 +1371,7 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
     "surface_presence_v1",
     "work_pulse_v1",
     "agent_fallback_v1",
+    "native_click_adoption_v1",
   ]);
 });
 

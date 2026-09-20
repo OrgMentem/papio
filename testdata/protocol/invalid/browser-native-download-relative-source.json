@@ -1,0 +1,24 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "native_download_import_request_v1",
+  "msg_id": "native-frame-1",
+  "job_id": "job_native_download",
+  "seq": 1,
+  "payload": {
+    "request_id": "native-request-1",
+    "producer": {
+      "effect_kind": "generic_drive",
+      "drive_attempt_id": "native-drive-1",
+      "ordinal": 0,
+      "strategy": "generic",
+      "revision": "1"
+    },
+    "browser_epoch": "browser_epoch_1",
+    "document_id": "document_1",
+    "reservation_id": "native_reservation_1",
+    "download_id": 42,
+    "started_at_ms": 1789899900000,
+    "source_path": "Downloads/paper.pdf",
+    "size_bytes": 12345
+  }
+}

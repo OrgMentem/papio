@@ -53,6 +53,7 @@ func (b *Bridge) CloseAcquisitionBackend() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.agentClosed = true
+	b.retireNativeDownloads("")
 	for _, pending := range b.agentDecisions {
 		pending.cancel()
 	}
@@ -79,18 +80,11 @@ func (b *Bridge) agentAuthority(ctx context.Context, sessionID, jobID string, p 
 		return nil, false
 	}
 	holder := b.arbitration.holderSession()
-	if holder == nil || holder.ID != sessionID || holder.Outdated || !slices.Contains(holder.Features, agentFallbackFeature) || !b.effectPermitAvailable() || !b.providerDriveEpochAvailable() {
+	if holder == nil || !slices.Contains(holder.Features, agentFallbackFeature) {
 		return nil, false
 	}
-	if b.now().Sub(holder.LastSyncAt) > sessionStaleAfter {
-		return nil, false
-	}
-	permit, err := b.jobs.GetEffectPermitByIdentity(ctx, job.EffectPermitIdentity{JobID: jobID, Kind: job.EffectKindGenericDrive, DriveAttemptID: p.DriveAttemptID, Ordinal: p.Ordinal, Strategy: p.Strategy, Revision: p.Revision})
-	if err != nil || permit == nil || permit.Status != job.EffectPermitHeld || permit.BrowserHolderGeneration != b.arbitration.generation() || permit.LeaseUntil == nil || !permit.LeaseUntil.After(b.now()) {
-		return nil, false
-	}
-	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
-	if err != nil || attempt != permit.JobAttemptRevision {
+	permit, ok := b.currentGenericDriveAuthority(ctx, sessionID, jobID, p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision)
+	if !ok {
 		return nil, false
 	}
 	row, err := b.jobs.Get(ctx, jobID)
@@ -98,25 +92,13 @@ func (b *Bridge) agentAuthority(ctx context.Context, sessionID, jobID string, p 
 		return nil, false
 	}
 	doi, err := work.NormalizeDOI(row.Work.DOI)
-	if err != nil || doi != p.Observation.DOI {
-		return nil, false
-	}
-	events, err := b.jobs.Events(ctx, jobID)
-	if err != nil {
-		return nil, false
-	}
-	tuple := providerDriveEpochKey(p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision)
-	current, started, applied, superseded, domain := providerDriveEpochState(events, tuple)
-	if current != tuple || !started || applied || superseded || domain != permit.SafetyDomainID {
-		return nil, false
-	}
-	authorized, err := b.providerDriveEpochAuthorized(ctx, jobID, domain)
-	return permit, err == nil && authorized
+	return permit, err == nil && doi == p.Observation.DOI
 }
 
 // Session lifecycle calls this under b.mu, including for already completed
 // replies. A browser that never polls again cannot occupy a decision slot.
 func (b *Bridge) retireAgentDecisions(sessionID string) {
+	b.retireNativeDownloads(sessionID)
 	for id, pending := range b.agentDecisions {
 		if pending.sessionID == sessionID || pending.generation != b.arbitration.generation() {
 			pending.cancel()

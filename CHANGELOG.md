@@ -11,6 +11,10 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Firefox can adopt downloads made by the optional article agent.** The daemon
+  reserves the attempt before a click, copies the newly observed file from the
+  configured download directory, and applies normal PDF and identity checks.
+  It leaves the browser's original file intact and never repeats the download.
 - **Optional daemon-owned agent acquisition.** A TypeSafe key supplied through
   `PAPIO_TYPESAFE_API_KEY` enables bounded Jev decisions for delegated article
   downloads when packaged and generic routes fail, including publishers without

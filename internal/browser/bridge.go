@@ -360,6 +360,8 @@ type Bridge struct {
 	agentBackend         acquisitionagent.Backend
 	agentDecisions       map[string]*pendingAgentDecision
 	agentClosed          bool
+	nativeDownloads      map[string]*nativeDownloadReservation
+	nativeIOGate         chan struct{}
 	providerDriveEpochMu sync.Mutex
 	seq                  int64
 	// arbitration owns holder identity, pending sessions, generation fences,
@@ -1350,6 +1352,13 @@ func (b *Bridge) helloAck(role string, peerFeatures []string) (json.RawMessage, 
 	if b.agentBackend != nil && !b.agentClosed && slices.Contains(peerFeatures, agentFallbackFeature) && slices.Contains(features, triageSnapshotSchema5Feature) {
 		if i := slices.Index(features, triageSnapshotSchema3Feature); i >= 0 {
 			features[i] = agentFallbackFeature
+		}
+	}
+	// Only a peer advertising native import can receive this capability.
+	// Snapshot v5 subsumes v4; preserve old peers and the strict 32-slot cap.
+	if slices.Contains(peerFeatures, protocol.NativeClickAdoptionFeature) && slices.Contains(features, triageSnapshotSchema5Feature) {
+		if i := slices.Index(features, triageSnapshotSchema4Feature); i >= 0 {
+			features[i] = protocol.NativeClickAdoptionFeature
 		}
 	}
 	payload := protocol.HelloAckPayload{
@@ -3096,6 +3105,10 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	}
 
 	switch msg.Type {
+	case protocol.MsgNativeDownloadArmRequestV1:
+		return b.armNativeDownload(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeDownloadArmRequestV1Payload))
+	case protocol.MsgNativeDownloadImportRequestV1:
+		return b.importNativeDownload(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeDownloadImportRequestV1Payload))
 	case protocol.MsgAgentDecideRequestV1:
 		return b.agentDecide(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.AgentDecideRequestV1Payload))
 	case protocol.MsgSurfacePresence:

@@ -39,6 +39,10 @@
         "provider_drive_epoch_result",
         "agent_decide_request_v1",
         "agent_decide_result_v1",
+        "native_download_arm_request_v1",
+        "native_download_arm_result_v1",
+        "native_download_import_request_v1",
+        "native_download_import_result_v1",
         "effect_permit_reconcile_request",
         "effect_permit_reconcile_response",
         "terms_effect_start_request",
@@ -7082,6 +7086,343 @@
             }
           }
         }
+      }
+    }
+  ,
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_download_arm_request_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "producer",
+              "browser_epoch",
+              "document_id"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "producer": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "effect_kind",
+                  "drive_attempt_id",
+                  "ordinal",
+                  "strategy",
+                  "revision"
+                ],
+                "properties": {
+                  "effect_kind": {
+                    "const": "generic_drive"
+                  },
+                  "drive_attempt_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{8,64}$"
+                  },
+                  "ordinal": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "strategy": {
+                    "const": "generic"
+                  },
+                  "revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\u0000\r\n]+$"
+                  }
+                }
+              },
+              "browser_epoch": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "document_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              }
+            }
+          }
+        },
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_download_arm_result_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "outcome"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "outcome": {
+                "enum": [
+                  "armed",
+                  "refused",
+                  "stale",
+                  "unavailable"
+                ]
+              },
+              "reservation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "expires_at_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "reason": {
+                "enum": [
+                  "unavailable",
+                  "authority_lost",
+                  "already_armed",
+                  "expired",
+                  "source_rejected",
+                  "source_busy",
+                  "invalid_pdf",
+                  "validation_pending"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "const": "armed"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "reservation_id",
+                    "expires_at_ms"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "reservation_id"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "expires_at_ms"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_download_import_request_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "producer",
+              "browser_epoch",
+              "document_id",
+              "reservation_id",
+              "download_id",
+              "started_at_ms",
+              "source_path",
+              "size_bytes"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "producer": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "effect_kind",
+                  "drive_attempt_id",
+                  "ordinal",
+                  "strategy",
+                  "revision"
+                ],
+                "properties": {
+                  "effect_kind": {
+                    "const": "generic_drive"
+                  },
+                  "drive_attempt_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{8,64}$"
+                  },
+                  "ordinal": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "strategy": {
+                    "const": "generic"
+                  },
+                  "revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\u0000\r\n]+$"
+                  }
+                }
+              },
+              "browser_epoch": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "document_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "reservation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "download_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "started_at_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "source_path": {
+                "type": "string",
+                "maxLength": 4096,
+                "pattern": "^(?:/|[A-Za-z]:[\\\\/])",
+                "not": {
+                  "pattern": "[\u0000-\u001f\u007f]"
+                },
+                "description": "Executable parsers also bound UTF-8 length to 4096 bytes. Daemon enforces local pinned-root confinement."
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            }
+          }
+        },
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_download_import_result_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "reservation_id",
+              "download_id",
+              "outcome"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "reservation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "download_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "outcome": {
+                "enum": [
+                  "ready",
+                  "review",
+                  "rejected",
+                  "deferred",
+                  "stale",
+                  "refused"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "unavailable",
+                  "authority_lost",
+                  "already_armed",
+                  "expired",
+                  "source_rejected",
+                  "source_busy",
+                  "invalid_pdf",
+                  "validation_pending"
+                ]
+              }
+            }
+          }
+        },
+        "required": [
+          "job_id"
+        ]
       }
     }
   ]

@@ -51,6 +51,8 @@ import {
   isDetectorText,
   type ActivityEntryPayload,
   type ArtifactProducerPayload,
+  type NativeDownloadArmRequestV1Payload,
+  type NativeDownloadImportRequestV1Payload,
   type BrowserMessage,
   type BrowserMessageType,
   type BrowserSessionRole,
@@ -166,6 +168,11 @@ import {
   type PlanResult,
 } from "./plan";
 import { agentDOM, type AgentDOMRequest, type AgentDOMResult } from "./agent-dom";
+import {
+  NATIVE_CLICK_ADOPTION_FEATURE, nativeDownloadReceipt, sameNativeReceipt,
+  nativeCompletedFile, nativeDownloadDocumentCurrent,
+  type NativeDownloadBinding, type NativeDownloadReceipt,
+} from "./native-download";
 import { observeUnknown, type ObserveChromeApi, type ObservationCaptureDiagnostic } from "./observe";
 import {
   capturePage,
@@ -1031,6 +1038,8 @@ export interface NativePort {
 }
 
 export interface TabInfo {
+  incognito?: boolean | undefined;
+  cookieStoreId?: string | undefined;
   id?: number | undefined;
   url?: string | undefined;
   status?: string | undefined;
@@ -1212,6 +1221,11 @@ export interface TabGroupInfo {
 
 export interface DownloadItemLike {
   id: number;
+  startTime?: string | undefined;
+  exists?: boolean | undefined;
+  byExtensionId?: string | undefined;
+  incognito?: boolean | undefined;
+  cookieStoreId?: string | undefined;
   state?: string | undefined;
   filename?: string | undefined;
   fileSize?: number | undefined;
@@ -1345,6 +1359,9 @@ type ClaimConsultResult =
   | { kind: "refuse" };
 
 export interface BridgeDeps {
+  /** Firefox can expose an ignored filename event. Its runtime API identifies
+   * the browser independently of that compatibility stub. */
+  firefox?: boolean;
   connectNative(name: string): NativePort;
   manifestVersion: string;
   randomUUID(): string;
@@ -1662,6 +1679,14 @@ interface DownloadTrack {
   route?: DeliveryRoute;
   sessionEvidence?: DeliverySessionEvidence;
   generic?: GenericDownloadAttempt;
+  native?: NativeDownloadBinding & {
+    generation: number;
+    holderGeneration: number | undefined;
+    tabID: number;
+    receipt?: NativeDownloadReceipt;
+    checking?: Promise<void>;
+    completing?: boolean;
+  };
   /** Exact institutional effect identity captured only when the browser
    * download belongs to the materialization tab. Ordinary/manual downloads
    * must not inherit a job's lingering materialization correlation. */
@@ -2947,6 +2972,9 @@ export class Bridge {
   private keepaliveAlarmHandledAt = 0;
   private readonly downloads = new Map<string, DownloadTrack>();
   private readonly agentLoops = new Map<string, object>();
+  /** Fresh on every worker life. Persisted numeric download IDs never regain
+   * authority through the surface lifecycle's heuristic browser continuity. */
+  private nativeDownloadEpoch: string | undefined;
   /** Page-derived generic evidence stays worker-local and is not durable. */
   private readonly genericEvidence = new Map<string, string[]>();
   private readonly grabDownloads = new Map<string, PdfGrabTrack>();
@@ -7612,7 +7640,7 @@ export class Bridge {
   }
 
   private isFirefox(): boolean {
-    return this.deps.downloads.onDeterminingFilename === undefined;
+    return this.deps.firefox === true || this.deps.downloads.onDeterminingFilename === undefined;
   }
 
   private advisoryCandidates(): DeliveryCandidate[] {
@@ -13847,6 +13875,7 @@ export class Bridge {
             SURFACE_PRESENCE_FEATURE,
             WORK_PULSE_FEATURE,
             "agent_fallback_v1",
+            NATIVE_CLICK_ADOPTION_FEATURE,
           ],
         },
         undefined,
@@ -17518,6 +17547,9 @@ export class Bridge {
     jobID: string,
     downloadID: number,
   ): Promise<void> {
+    // Native source bytes and browser history remain the user's property.
+    if (this.downloads.get(jobID)?.native !== undefined ||
+      findByJob(this.store, jobID)?.native_download?.download_id === downloadID) return;
     this.downloads.delete(jobID);
     try {
       await this.deps.downloads.removeFile(downloadID);
@@ -19676,6 +19708,9 @@ export class Bridge {
    * daemon's tuple is the sole durable authority for a fresh epoch. */
   private async reconcileGenericDownloads(): Promise<void> {
     for (const job of this.store.activeJobs) {
+      // A native reservation without its live worker/document binding can
+      // recover only on the daemon after staging. Never look up reused IDs.
+      if (job.native_download !== undefined) continue;
       const epoch = job.generic_drive_epoch;
       if (epoch?.strategy !== "generic") continue;
       if (job.generic_terminal === true) continue;
@@ -19746,7 +19781,7 @@ export class Bridge {
       job.generic_terminal === true || job.download_initiated === true ||
       this.downloads.has(job.job_id) || !job.expected?.doi ||
       epoch?.strategy !== "generic" || !epoch.revision ||
-      this.deps.downloads.onDeterminingFilename === undefined) return false;
+      (this.isFirefox() && !(this.store.daemonFeatures ?? []).includes(NATIVE_CLICK_ADOPTION_FEATURE))) return false;
     const key = this.genericEpochKey(job.job_id, epoch);
     if ((job as ActiveJob & AgentJobState).agent_fallback_attempt === key) return false;
     const token = {};
@@ -19771,6 +19806,8 @@ export class Bridge {
     const jobID = job.job_id;
     const drive = this.handoffDrives.get(jobID);
     const generation = this.portGeneration;
+    const native = this.isFirefox();
+    const holderGeneration = this.lastKnownBrowserHolderGeneration;
     const deadline = this.deps.now() + 10 * 60_000;
     const providerKey = this.providerKeyForJob(job);
     let effectToken: string | undefined;
@@ -19797,6 +19834,7 @@ export class Bridge {
       return current !== undefined && this.agentLoops.get(jobID) === token &&
         this.handoffDrives.get(jobID) === drive && drive !== undefined &&
         this.portGeneration === generation && this.agentFallbackAvailable() &&
+        (!native || holderGeneration === this.lastKnownBrowserHolderGeneration) &&
         this.hasDelegatedAuthority(current) && current.expected?.doi === job.expected?.doi && current.generic_terminal !== true &&
         (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending") &&
         current.expires_at > this.deps.now() && this.deps.now() < deadline &&
@@ -19815,6 +19853,7 @@ export class Bridge {
       if (entryURL === undefined) entryURL = tab.url;
       const entry = new URL(entryURL);
       if (url.origin !== entry.origin || url.pathname !== entry.pathname) return false;
+      if (native && tab.url !== entryURL) return false;
       const permitted = await this.deps.permissions.contains({ origins: [`https://${url.hostname}/*`] }).catch(() => false);
       return authorized() && permitted === true;
     };
@@ -19892,30 +19931,66 @@ export class Bridge {
         // GenericCandidate or known strategy ID is needed to carry this epoch.
         if (track === undefined) {
           if (this.downloads.has(jobID) || sameEpoch()?.download_initiated === true) return;
-          const browserDownloads = await this.findJobDownloads(jobID);
-          if (!authorized() || browserDownloads.some(item => item.state === "in_progress")) return;
+          if (!native) {
+            const browserDownloads = await this.findJobDownloads(jobID);
+            if (!authorized() || browserDownloads.some(item => item.state === "in_progress")) return;
+          }
           track = { ids: new Set(), ambiguous: false, directOffer: false,
             generic: { candidates: [], index: 0, epoch } };
           this.downloads.set(jobID, track);
+          if (native) {
+            // Refuse ambiguity before spending a reservation or clicking. Query
+            // all tabs: another live copy has no distinguishing DownloadItem tab.
+            const tab = await this.uniqueNativeArticleTab(jobID, job.tab_id, entryURL!);
+            if (!authorized() || tab === undefined) return;
+            this.nativeDownloadEpoch ??= this.deps.randomUUID();
+            const payload: Omit<NativeDownloadArmRequestV1Payload, "request_id"> = {
+              producer: { effect_kind: "generic_drive", strategy: "generic",
+                drive_attempt_id: epoch.drive_attempt_id, ordinal: epoch.ordinal, revision: epoch.revision! },
+              browser_epoch: this.nativeDownloadEpoch, document_id: documentID,
+            };
+            const armed = await this.requestCorrelated("native_download_arm_request_v1", { ...payload }, { jobID });
+            if (!authorized() || this.downloads.get(jobID) !== track) return;
+            const reservation = armed.payload?.["reservation_id"];
+            const expires = armed.payload?.["expires_at_ms"];
+            if (armed.kind !== "response" || armed.payload?.["outcome"] !== "armed" ||
+              typeof reservation !== "string" || typeof expires !== "number" || expires <= this.deps.now()) {
+              exitDetail = "Native download adoption is unavailable; no article control was clicked.";
+              return;
+            }
+            track.native = { articleURL: entryURL!, tabID: job.tab_id, incognito: tab.incognito === true,
+              cookieStoreId: tab.cookieStoreId ?? "firefox-default", generation,
+              holderGeneration,
+              recovery: { ...payload, reservation_id: reservation, expires_at_ms: expires, phase: "armed" } };
+            await this.persistNativeDownload(jobID, track);
+          }
           await this.update(store => authorized() ? patchJob(store, jobID, { download_initiated: true }) : store);
           if (!authorized()) return;
         }
         if (!(await liveTab()) || !authorized()) return;
+        if (native) {
+          if (!(await this.nativeDownloadFresh(jobID, track)) || !authorized()) return;
+          if (!(await liveTab()) || !authorized() || !this.nativeDownloadAuthority(jobID, track)) return;
+        }
         usedRevisions.add(observation.revision);
+        // No storage/permission await between the dispatch timestamp and
+        // injection. A synchronous onCreated can bind before click returns.
+        if (native) track.native!.recovery.dispatched_at_ms = this.deps.now();
         const action = (await this.deps.scripting.executeScript({
           target: { tabId: job.tab_id }, func: agentDOM,
           args: [{ method: "act", entryURL: entryURL!, doi: job.expected!.doi!, document: documentID,
             revision: observation.revision, choice } satisfies AgentDOMRequest],
         }))[0]?.result as AgentDOMResult | undefined;
         // onCreated may have run before executeScript returns. It owns normal
-        // PDF validation/completion/adoption from this point, including restart.
+        // completion from here. Only Chrome's steered producer resumes on restart.
         if (downloaded()) return;
         if (!authorized()) return;
+        if (native) await this.persistNativeDownload(jobID, track);
         if (action?.status !== "dispatched") { if (action?.status === "blocked") exitDetail = humanDetail; return; }
         if (action.downloadExpected) {
           // Provider clicks often disable their button before Chrome announces
           // a download. No further model decision may turn that into failure.
-          const pendingUntil = Math.min(deadline, this.deps.now() + 45_000);
+          const pendingUntil = Math.min(deadline, track.native?.recovery.expires_at_ms ?? deadline, this.deps.now() + 45_000);
           await this.update(store => authorized() ? { ...store, activeJobs: store.activeJobs.map(current =>
             current.job_id === jobID ? { ...current, agent_fallback_pending_until: pendingUntil } as ActiveJob : current) } : store);
           if (downloaded() || !authorized()) return;
@@ -21475,7 +21550,154 @@ export class Bridge {
     };
   }
 
+  private async uniqueNativeArticleTab(jobID: string, tabID: number, articleURL: string): Promise<TabInfo | undefined> {
+    if (this.deps.tabs.query === undefined || this.store.activeJobs.some(job => job.job_id !== jobID && job.tab_id === tabID)) return undefined;
+    const tabs = await this.deps.tabs.query({}).catch(() => undefined);
+    if (tabs === undefined) return undefined;
+    const matches = tabs.filter(tab => tab.url === articleURL);
+    if (matches.length !== 1 || matches[0]?.id !== tabID || matches[0].status === "loading") return undefined;
+    return matches[0];
+  }
+
+  private nativeDownloadAuthority(jobID: string, track: DownloadTrack): boolean {
+    const n = track.native;
+    const current = findByJob(this.store, jobID);
+    return n !== undefined && this.downloads.get(jobID) === track && !track.ambiguous &&
+      n.generation === this.portGeneration && n.holderGeneration === this.lastKnownBrowserHolderGeneration &&
+      n.recovery.browser_epoch === this.nativeDownloadEpoch && this.agentFallbackAvailable() &&
+      (this.store.daemonFeatures ?? []).includes(NATIVE_CLICK_ADOPTION_FEATURE) &&
+      this.deps.now() < n.recovery.expires_at_ms && current !== undefined &&
+      current.tab_id === n.tabID && this.hasDelegatedAuthority(current) &&
+      (current.status === "accepted" || current.status === "auth_pending" || current.status === "awaiting_download") &&
+      !current.generic_terminal && !current.challenge_blocked && !current.needs_terms_consent &&
+      current.expires_at > this.deps.now() && current.generic_drive_epoch !== undefined && track.generic !== undefined &&
+      this.genericEpochKey(jobID, current.generic_drive_epoch) === this.genericEpochKey(jobID, track.generic.epoch);
+  }
+
+  private async nativeDownloadFresh(jobID: string, track: DownloadTrack): Promise<boolean> {
+    if (!this.nativeDownloadAuthority(jobID, track)) return false;
+    const n = track.native!;
+    const tab = await this.uniqueNativeArticleTab(jobID, n.tabID, n.articleURL);
+    if (tab === undefined || (tab.incognito === true) !== n.incognito ||
+      (tab.cookieStoreId ?? "firefox-default") !== n.cookieStoreId || !this.nativeDownloadAuthority(jobID, track)) return false;
+    const permitted = await this.deps.permissions.contains({ origins: [`https://${new URL(n.articleURL).hostname}/*`] }).catch(() => false);
+    if (!permitted || !this.nativeDownloadAuthority(jobID, track)) return false;
+    const result = await this.deps.scripting.executeScript({ target: { tabId: n.tabID }, func: nativeDownloadDocumentCurrent,
+      args: [n.recovery.document_id, n.articleURL] }).catch(() => []);
+    return result[0]?.result === true && this.nativeDownloadAuthority(jobID, track);
+  }
+
+  private async persistNativeDownload(jobID: string, track: DownloadTrack): Promise<void> {
+    if (track.native === undefined) return;
+    const record = { ...track.native.recovery };
+    await this.update(store => this.downloads.get(jobID) === track && findByJob(store, jobID)?.generic_drive_epoch !== undefined &&
+      this.genericEpochKey(jobID, findByJob(store, jobID)!.generic_drive_epoch!) === this.genericEpochKey(jobID, track.generic!.epoch)
+      ? patchJob(store, jobID, { native_download: record }) : store);
+  }
+
+  /** Bind synchronously before the first await. No Firefox tabId/finalUrl and
+   * no generic correlate() fallback can mint this native import authority. */
+  private async onNativeDownloadCreated(item: DownloadItemLike): Promise<boolean> {
+    const natives = [...this.downloads.entries()].filter((entry): entry is [string, DownloadTrack & { native: NonNullable<DownloadTrack["native"]> }] => entry[1].native !== undefined);
+    const already = natives.filter(([, track]) => track.ids.has(item.id));
+    if (already.length > 0) {
+      for (const [, track] of already) {
+        const receipt = nativeDownloadReceipt(item, track.native, this.deps.now());
+        if (!receipt || !track.native.receipt || !sameNativeReceipt(receipt, track.native.receipt)) track.ambiguous = true;
+      }
+      return true;
+    }
+    const eligible = natives.filter(([jobID, track]) => this.nativeDownloadAuthority(jobID, track) &&
+      nativeDownloadReceipt(item, track.native, this.deps.now()) !== undefined);
+    if (eligible.length !== 1) {
+      for (const [, track] of eligible) track.ambiguous = true;
+      return eligible.length > 0;
+    }
+    const [jobID, track] = eligible[0]!;
+    if (track.ids.size > 0 || this.trackedJobFor(item.id) !== undefined || this.trackedGrabFor(item.id) !== undefined) {
+      track.ambiguous = true;
+      return true;
+    }
+    const receipt = nativeDownloadReceipt(item, track.native, this.deps.now())!;
+    track.ids.add(item.id);
+    track.native.receipt = receipt;
+    track.native.recovery = { ...track.native.recovery, download_id: item.id, started_at_ms: receipt.startedAt, phase: "observed" };
+    // onChanged may arrive during freshness/storage awaits. It joins this
+    // exact check; the generic completion path can never overtake it.
+    track.native.checking = (async () => {
+      if (!(await this.nativeDownloadFresh(jobID, track))) track.ambiguous = true;
+      await this.persistNativeDownload(jobID, track);
+    })();
+    await track.native.checking;
+    return true;
+  }
+
+  private async onNativeDownloadChanged(jobID: string, track: DownloadTrack, delta: DownloadDeltaLike): Promise<void> {
+    const n = track.native!;
+    if (n.completing || n.recovery.phase === "deferred" || n.recovery.phase === "retired") return;
+    if (delta.state?.current !== "complete" && delta.state?.current !== "interrupted") return;
+    n.completing = true;
+    try {
+      await n.checking;
+      if (delta.state.current === "interrupted" || !(await this.nativeDownloadFresh(jobID, track))) {
+        n.recovery.phase = "retired";
+        await this.persistNativeDownload(jobID, track);
+        return;
+      }
+      const found = await this.deps.downloads.search({ id: delta.id }).catch(() => []);
+      const item = found.length === 1 && found[0]?.id === delta.id ? found[0] : undefined;
+      const receipt = item && nativeDownloadReceipt(item, n, this.deps.now());
+      const file = item && nativeCompletedFile(item);
+      if (!receipt || !n.receipt || !sameNativeReceipt(receipt, n.receipt) || !file ||
+        !(await this.nativeDownloadFresh(jobID, track))) {
+        n.recovery.phase = "retired";
+        await this.persistNativeDownload(jobID, track);
+        return;
+      }
+      n.recovery.phase = "importing";
+      await this.persistNativeDownload(jobID, track);
+      if (!this.nativeDownloadAuthority(jobID, track)) return;
+      const payload: Omit<NativeDownloadImportRequestV1Payload, "request_id"> = {
+        reservation_id: n.recovery.reservation_id, producer: n.recovery.producer,
+        browser_epoch: n.recovery.browser_epoch, document_id: n.recovery.document_id,
+        download_id: delta.id, started_at_ms: receipt.startedAt, ...file,
+      };
+      // Admission must see the held permit. Never send generic success first,
+      // and never use download_complete's basename contract for a native path.
+      const result = await this.requestCorrelated("native_download_import_request_v1", { ...payload }, { jobID });
+      if (!this.nativeDownloadAuthority(jobID, track)) return;
+      const reply = result.payload;
+      if (result.kind !== "response" || reply?.["reservation_id"] !== n.recovery.reservation_id || reply?.["download_id"] !== delta.id) {
+        n.recovery.phase = "deferred";
+        await this.persistNativeDownload(jobID, track);
+        return;
+      }
+      const outcome = reply["outcome"];
+      if (outcome === "deferred") {
+        n.recovery.phase = "deferred";
+        await this.persistNativeDownload(jobID, track);
+        return;
+      }
+      n.recovery.phase = "retired";
+      await this.persistNativeDownload(jobID, track);
+      if (!this.nativeDownloadAuthority(jobID, track)) return;
+      if (outcome === "ready" || outcome === "review" || outcome === "rejected") {
+        // The daemon's artifact settlement already emitted the terminal event.
+        this.genericEpochResultsSent.add(this.genericEpochKey(jobID, track.generic!.epoch));
+        await this.update(store => this.nativeDownloadAuthority(jobID, track)
+          ? patchJob(store, jobID, { generic_terminal: true, download_initiated: false }) : store);
+        if (this.downloads.get(jobID) !== track) return;
+        this.downloads.delete(jobID);
+        if (outcome === "ready") {
+          this.completedDownloadTabs.set(jobID, n.tabID);
+          await this.closeAfterAdoption(jobID);
+        }
+      }
+    } finally { n.completing = false; }
+  }
+
   private async onDownloadCreated(item: DownloadItemLike): Promise<void> {
+    if (this.isFirefox() && await this.onNativeDownloadCreated(item)) return;
     // A download papio itself started for a job outranks any grab, and must be
     // classified first. The grab check used to run before this one and returned
     // early, so a click-adapter download whose route matched an armed grab was
@@ -21669,6 +21891,12 @@ export class Bridge {
 
   private async onDownloadChanged(delta: DownloadDeltaLike): Promise<void> {
     await this.ready;
+    for (const [jobID, track] of this.downloads) {
+      if (track.native !== undefined && track.ids.has(delta.id)) {
+        await this.onNativeDownloadChanged(jobID, track, delta);
+        return;
+      }
+    }
     const state = delta.state?.current;
     const grabID = this.trackedGrabFor(delta.id);
     if (grabID !== undefined) {
@@ -23356,7 +23584,12 @@ function isPageBulkScanStore(value: unknown): value is PageBulkScanStore {
 }
 
 function realDeps(): BridgeDeps {
+  // Firefox exposes getBrowserInfo even where it also exposes an ignored
+  // downloads.onDeterminingFilename compatibility event. Do not wire that
+  // event as a usable steering capability in this browser.
+  const firefox = typeof (chrome.runtime as typeof chrome.runtime & { getBrowserInfo?: unknown }).getBrowserInfo === "function";
   return {
+    firefox,
     connectNative: (name) => {
       const port = chrome.runtime.connectNative(name);
       return {
@@ -23515,7 +23748,7 @@ function realDeps(): BridgeDeps {
       onChanged: {
         addListener: (cb) => chrome.downloads.onChanged.addListener(cb),
       },
-      ...(chrome.downloads.onDeterminingFilename
+      ...(!firefox && chrome.downloads.onDeterminingFilename
         ? {
             onDeterminingFilename: {
               addListener: (

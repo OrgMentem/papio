@@ -17,11 +17,15 @@ an already bound article with matching DOI metadata. It needs effective browser
 access to that site, but no publisher entry in the adapter registry. The initial
 implementation supports in-page menus and download controls; cross-document
 navigation, publisher search and native PDF viewer saving remain future work.
-This path currently needs Chrome's download filename hook; Firefox remains
-human-assisted until it has an equivalent ownership path.
+Chrome uses filename steering. Firefox uses a matching original article referrer
+and an observed file in the configured download directory, with the daemon's
+`native_click_adoption_v1` capability. Missing or ambiguous download provenance
+remains assisted.
 See [agent configuration](../reference/config-reference.md#agent-acquisition).
-The earlier live IOS Press spike does not establish live acceptance of this
-integrated daemon loop.
+An isolated Chrome run of the integrated loop acquired and validated a five-page
+IOS Press PDF after one explicit Open and one Jev decision. The test deliberately
+omitted the packaged adapter. It proves that fallback mechanism, not a success
+rate across publishers. Live Firefox acceptance is still in progress.
 
 Every adapter below ships with a captured fixture under
 `extension/fixtures/<adapter-id>/` (see

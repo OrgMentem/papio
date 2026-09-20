@@ -28,8 +28,21 @@ already bound to a managed tab. It supports in-page menus and JavaScript-backed
 downloads. Cross-document navigation, new contexts, publisher search and native
 viewer saving are later implementation milestones, not reasons to require one
 adapter per publisher. Effective browser host permission remains necessary.
-The first executor uses Chrome's filename-steering API; its Firefox counterpart
-needs an equivalent download-ownership mechanism before it can act.
+Chrome uses its filename-steering API. Firefox negotiates
+`native_click_adoption_v1` and reserves one native download under the same held
+generic-drive permit before dispatch. The browser must observe an unambiguous
+fresh download with an exact original article referrer. The daemon pins the
+configured download directory before the click, rejects pre-existing files and
+changed identities, and copies the observed file without deleting the original.
+It records the exact digest and producer transactionally before publication to
+normal adoption. A reservation is observation evidence, not a new effect permit.
+
+A restart loses the private directory baseline and cannot rearm the same permit
+or repeat a click. Published bytes can recover through existing adoption. A crash
+between durable admission and publication can strand a temporary copy; that
+attempt remains incomplete. The current implementation does not collect those
+orphan copies automatically. Neither a completed browser download nor admission
+alone establishes acquisition success.
 
 The backend-neutral contract carries a DOI, bounded article title, up to 80
 role/label/disabled control descriptions and an opaque observation revision.

@@ -1,0 +1,700 @@
+[
+  {
+    "name": "arm-request missing request_id",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request null request_id",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "arm-request missing producer",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request null producer",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "arm-request missing browser_epoch",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request null browser_epoch",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "arm-request missing document_id",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request null document_id",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "arm-request unknown",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "not_allowed"
+    ],
+    "value": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request constructor",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "constructor"
+    ],
+    "value": "unsafe",
+    "valid": false
+  },
+  {
+    "name": "arm-request producer missing effect_kind",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "effect_kind"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request producer missing drive_attempt_id",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "drive_attempt_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request producer missing ordinal",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "ordinal"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request producer missing strategy",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "strategy"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request producer missing revision",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "revision"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "arm-request mixed producer",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "claim_id"
+    ],
+    "value": "claim_fake",
+    "valid": false
+  },
+  {
+    "name": "arm-request institutional",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "effect_kind"
+    ],
+    "value": "institutional",
+    "valid": false
+  },
+  {
+    "name": "arm-request bad strategy",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "strategy"
+    ],
+    "value": "direct_get",
+    "valid": false
+  },
+  {
+    "name": "arm-request negative ordinal",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "producer",
+      "ordinal"
+    ],
+    "value": -1,
+    "valid": false
+  },
+  {
+    "name": "arm-request newline epoch",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "value": "safe\n",
+    "valid": false
+  },
+  {
+    "name": "arm-request URL document",
+    "base": "arm-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "value": "https://site.example/page",
+    "valid": false
+  },
+  {
+    "name": "import-request missing request_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null request_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing producer",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null producer",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing browser_epoch",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null browser_epoch",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing document_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null document_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing reservation_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null reservation_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing download_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "download_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null download_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "download_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing started_at_ms",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "started_at_ms"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null started_at_ms",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "started_at_ms"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing source_path",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "source_path"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null source_path",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "source_path"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request missing size_bytes",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "size_bytes"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request null size_bytes",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "size_bytes"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "import-request unknown",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "not_allowed"
+    ],
+    "value": true,
+    "valid": false
+  },
+  {
+    "name": "import-request constructor",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "constructor"
+    ],
+    "value": "unsafe",
+    "valid": false
+  },
+  {
+    "name": "import-request producer missing effect_kind",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "effect_kind"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request producer missing drive_attempt_id",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "drive_attempt_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request producer missing ordinal",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "ordinal"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request producer missing strategy",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "strategy"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request producer missing revision",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "revision"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "import-request mixed producer",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "claim_id"
+    ],
+    "value": "claim_fake",
+    "valid": false
+  },
+  {
+    "name": "import-request institutional",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "effect_kind"
+    ],
+    "value": "institutional",
+    "valid": false
+  },
+  {
+    "name": "import-request bad strategy",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "strategy"
+    ],
+    "value": "direct_get",
+    "valid": false
+  },
+  {
+    "name": "import-request negative ordinal",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "producer",
+      "ordinal"
+    ],
+    "value": -1,
+    "valid": false
+  },
+  {
+    "name": "import-request newline epoch",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "value": "safe\n",
+    "valid": false
+  },
+  {
+    "name": "import-request URL document",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "value": "https://site.example/page",
+    "valid": false
+  },
+  {
+    "name": "Windows observed path",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "source_path"
+    ],
+    "value": "C:\\Users\\Reader\\Downloads\\r\u00e9sum\u00e9 (1).pdf",
+    "valid": true
+  },
+  {
+    "name": "relative source",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "source_path"
+    ],
+    "value": "Downloads/paper.pdf",
+    "valid": false
+  },
+  {
+    "name": "control in source",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "source_path"
+    ],
+    "value": "/Downloads/paper\t.pdf",
+    "valid": false
+  },
+  {
+    "name": "UTF8 byte cap",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "source_path"
+    ],
+    "value": "/\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9",
+    "valid": false
+  },
+  {
+    "name": "missing grant id",
+    "base": "arm-armed",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "missing grant expiry",
+    "base": "arm-armed",
+    "path": [
+      "payload",
+      "expires_at_ms"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "grant on refusal",
+    "base": "arm-refused",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "value": "native_unauthorized",
+    "valid": false
+  },
+  {
+    "name": "empty grant on refusal",
+    "base": "arm-refused",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "value": "",
+    "valid": false
+  },
+  {
+    "name": "zero expiry on refusal",
+    "base": "arm-refused",
+    "path": [
+      "payload",
+      "expires_at_ms"
+    ],
+    "value": 0,
+    "valid": false
+  },
+  {
+    "name": "null optional",
+    "base": "arm-refused",
+    "path": [
+      "payload",
+      "reason"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "empty reason",
+    "base": "arm-refused",
+    "path": [
+      "payload",
+      "reason"
+    ],
+    "value": "",
+    "valid": false
+  },
+  {
+    "name": "unknown outcome",
+    "base": "import-ready",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "value": "success",
+    "valid": false
+  },
+  {
+    "name": "false ready payload",
+    "base": "import-ready",
+    "path": [
+      "payload",
+      "ready"
+    ],
+    "value": true,
+    "valid": false
+  },
+  {
+    "name": "unknown reason",
+    "base": "import-deferred",
+    "path": [
+      "payload",
+      "reason"
+    ],
+    "value": "path=/private",
+    "valid": false
+  },
+  {
+    "name": "zero download",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "download_id"
+    ],
+    "value": 0,
+    "valid": false
+  },
+  {
+    "name": "unsafe size",
+    "base": "import-request",
+    "path": [
+      "payload",
+      "size_bytes"
+    ],
+    "value": 9007199254740992,
+    "valid": false
+  }
+]

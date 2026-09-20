@@ -45,6 +45,10 @@ export type BrowserMessageType =
   | "provider_drive_epoch_result"
   | "agent_decide_request_v1"
   | "agent_decide_result_v1"
+  | "native_download_arm_request_v1"
+  | "native_download_arm_result_v1"
+  | "native_download_import_request_v1"
+  | "native_download_import_result_v1"
   | "cancel"
   | "handoff_focus"
   | "ack"
@@ -351,6 +355,28 @@ export interface ProviderDriveEpochTuple {
   strategy: string;
   revision: string;
 }
+export const NATIVE_CLICK_ADOPTION_FEATURE = "native_click_adoption_v1";
+export type NativeDownloadProducer = Required<Pick<ArtifactProducerPayload, "drive_attempt_id" | "ordinal" | "revision">> & {
+  effect_kind: "generic_drive"; strategy: "generic";
+};
+export interface NativeDownloadArmRequestV1Payload {
+  request_id: string; producer: NativeDownloadProducer;
+  browser_epoch: string; document_id: string;
+}
+export type NativeDownloadReason = "unavailable" | "authority_lost" | "already_armed" | "expired" | "source_rejected" | "source_busy" | "invalid_pdf" | "validation_pending";
+export interface NativeDownloadArmResultV1Payload {
+  request_id: string; outcome: "armed" | "refused" | "stale" | "unavailable";
+  reservation_id?: string; expires_at_ms?: number; reason?: NativeDownloadReason;
+}
+export interface NativeDownloadImportRequestV1Payload extends NativeDownloadArmRequestV1Payload {
+  reservation_id: string; download_id: number; started_at_ms: number; source_path: string; size_bytes: number;
+}
+export interface NativeDownloadImportResultV1Payload {
+  request_id: string; reservation_id: string; download_id: number;
+  outcome: "ready" | "review" | "rejected" | "deferred" | "stale" | "refused";
+  reason?: NativeDownloadReason;
+}
+
 export interface AgentDecideControl {
   id: string;
   role: "button" | "link" | "menuitem" | "tab";
@@ -1513,6 +1539,10 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   provider_drive_epoch_result: true,
   agent_decide_request_v1: true,
   agent_decide_result_v1: true,
+  native_download_arm_request_v1: true,
+  native_download_arm_result_v1: true,
+  native_download_import_request_v1: true,
+  native_download_import_result_v1: true,
   cancel: true,
   handoff_focus: true,
   ack: true,
@@ -1603,6 +1633,10 @@ const JOB_SCOPED: Record<string, true> = {
   provider_drive_epoch_result: true,
   agent_decide_request_v1: true,
   agent_decide_result_v1: true,
+  native_download_arm_request_v1: true,
+  native_download_arm_result_v1: true,
+  native_download_import_request_v1: true,
+  native_download_import_result_v1: true,
   cancel: true,
   handoff_focus: true,
   institutional_candidate_offer: true,
@@ -1840,6 +1874,25 @@ function requireAgentDecideFields<T>(
         !Object.prototype.hasOwnProperty.call(obj, key))
       fail(`${what}: missing required field ${JSON.stringify(key)}`);
   }
+}
+
+function nativeIdentifier(p: Record<string, unknown>, key: string, what: string, min = 8, max = 64): void {
+  const value = str(p, key, what, max);
+  if (value.length < min || /[^A-Za-z0-9_-]/u.test(value)) fail(`${what}.${key} is invalid`);
+}
+function nativeProducer(value: unknown, what: string): void {
+  const p = asRecord(value, what);
+  requireAgentDecideFields<NativeDownloadProducer>(p, what, {
+    effect_kind: "required", drive_attempt_id: "required", ordinal: "required", strategy: "required", revision: "required",
+  });
+  if (p["effect_kind"] !== "generic_drive" || p["strategy"] !== "generic") fail(`${what} requires a generic producer`);
+  nativeIdentifier(p, "drive_attempt_id", what);
+  int(p, "ordinal", what, 0);
+  const revision = str(p, "revision", what, 128);
+  if (!revision || /[\u0000\r\n]/u.test(revision)) fail(`${what}.revision is invalid`);
+}
+function nativeReason(p: Record<string, unknown>, what: string): void {
+  if ("reason" in p && !["unavailable", "authority_lost", "already_armed", "expired", "source_rejected", "source_busy", "invalid_pdf", "validation_pending"].includes(str(p, "reason", what, 32))) fail(`${what}.reason is invalid`);
 }
 
 function isAgentControlID(value: string): boolean {
@@ -4069,6 +4122,48 @@ function validatePayload(
       } catch {
         fail("provider_direct_get_request URL is invalid");
       }
+      break;
+    }
+    case "native_download_arm_request_v1":
+    case "native_download_import_request_v1": {
+      if (type === "native_download_arm_request_v1") {
+        requireAgentDecideFields<NativeDownloadArmRequestV1Payload>(p, type, {
+          request_id: "required", producer: "required", browser_epoch: "required", document_id: "required",
+        });
+      } else {
+        requireAgentDecideFields<NativeDownloadImportRequestV1Payload>(p, type, {
+          request_id: "required", producer: "required", browser_epoch: "required", document_id: "required",
+          reservation_id: "required", download_id: "required", started_at_ms: "required", source_path: "required", size_bytes: "required",
+        });
+        nativeIdentifier(p, "reservation_id", type);
+        int(p, "download_id", type, 1); int(p, "started_at_ms", type, 1); int(p, "size_bytes", type, 1);
+        const path = str(p, "source_path", type, 4096);
+        if (new TextEncoder().encode(path).length > 4096 || !/^(?:\/|[A-Za-z]:[\\/])/u.test(path) || /[\u0000-\u001f\u007f]/u.test(path)) fail(`${type}.source_path is invalid`);
+      }
+      nativeIdentifier(p, "request_id", type);
+      nativeIdentifier(p, "browser_epoch", type, 1, 128); nativeIdentifier(p, "document_id", type, 1, 128);
+      nativeProducer(p["producer"], `${type}.producer`);
+      break;
+    }
+    case "native_download_arm_result_v1": {
+      requireAgentDecideFields<NativeDownloadArmResultV1Payload>(p, type, {
+        request_id: "required", outcome: "required", reservation_id: "optional", expires_at_ms: "optional", reason: "optional",
+      });
+      nativeIdentifier(p, "request_id", type);
+      const outcome = str(p, "outcome", type, 16);
+      if (!["armed", "refused", "stale", "unavailable"].includes(outcome)) fail(`${type}.outcome is invalid`);
+      if (outcome === "armed") { nativeIdentifier(p, "reservation_id", type); int(p, "expires_at_ms", type, 1); }
+      else if ("reservation_id" in p || "expires_at_ms" in p) fail(`${type} refusal cannot grant a reservation`);
+      nativeReason(p, type);
+      break;
+    }
+    case "native_download_import_result_v1": {
+      requireAgentDecideFields<NativeDownloadImportResultV1Payload>(p, type, {
+        request_id: "required", reservation_id: "required", download_id: "required", outcome: "required", reason: "optional",
+      });
+      nativeIdentifier(p, "request_id", type); nativeIdentifier(p, "reservation_id", type); int(p, "download_id", type, 1);
+      if (!["ready", "review", "rejected", "deferred", "stale", "refused"].includes(str(p, "outcome", type, 16))) fail(`${type}.outcome is invalid`);
+      nativeReason(p, type);
       break;
     }
     case "agent_decide_request_v1": {

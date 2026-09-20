@@ -1,11 +1,12 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 import { afterEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { Bridge, MIN_DAEMON_VERSION, type BridgeDeps, type NativePort } from "../src/background";
+import { Bridge, MIN_DAEMON_VERSION, type BridgeDeps, type DownloadItemLike, type NativePort } from "../src/background";
 import { agentDOM, type AgentDOMRequest } from "../src/agent-dom";
+import { nativeDownloadDocumentCurrent, NATIVE_CLICK_ADOPTION_FEATURE } from "../src/native-download";
 import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { planGeneric } from "../src/plan";
-import { emptyStore, patchJob, type ActiveJob, type StoreShape } from "../src/state";
+import { emptyStore, patchJob, migrateManagedState, type ActiveJob, type StoreShape } from "../src/state";
 import { FakeDownloads } from "./fake-downloads";
 import { ChromeTabsFake, FakeEmitter } from "./fake-tabs";
 
@@ -32,7 +33,7 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 
-async function harness(options: { features?: string[]; firefox?: boolean; status?: ActiveJob["status"]; seed?: StoreShape } = {}) {
+async function harness(options: { features?: string[]; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape } = {}) {
   const win = new Window({ url, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
   win.document.write(`<meta name="citation_doi" content="${doi}"><meta name="citation_title" content="Example article"><main><h1>Example article</h1><button type="button">Formats</button></main><header><input type="search" value="PRIVATEQUERY"></header>`);
   Object.assign(win.HTMLElement.prototype, { getClientRects: () => [{ width: 10, height: 10 }] });
@@ -50,15 +51,17 @@ async function harness(options: { features?: string[]; firefox?: boolean; status
   const tabs = new ChromeTabsFake();
   tabs.seed({ id: tabID, url, status: "complete" });
   const downloads = new FakeDownloads();
-  if (options.firefox) Reflect.deleteProperty(downloads, "onDeterminingFilename");
+  if (options.firefox && !options.ignoredSteeringEvent) Reflect.deleteProperty(downloads, "onDeterminingFilename");
   const backend = { store: emptyStore(), load: async () => backend.store, save: async (store: StoreShape) => { backend.store = store; } };
   let permitted = true, observations = 0, actions = 0, genericPlans = 0;
   let onAct: (() => Promise<void>) | undefined;
   const deps: BridgeDeps = {
+    firefox: options.firefox ?? false,
     connectNative: () => port, manifestVersion: "0.1.0", randomUUID: () => crypto.randomUUID(), now: () => now,
     setTimeout: (fn, ms) => timers.push({ fn, ms }), backend, tabs, downloads, adapterSpecs: [],
     scripting: { executeScript: async injection => {
       if (injection.func === planGeneric) { genericPlans++; return [{ result: { evidence: [], candidates: [] } }]; }
+      if (injection.func === nativeDownloadDocumentCurrent) return [{ result: nativeDownloadDocumentCurrent(...injection.args as [string, string]) }];
       if (injection.func !== agentDOM) return [];
       const request = injection.args![0] as AgentDOMRequest;
       if (request.method === "observe") observations++;
@@ -74,6 +77,7 @@ async function harness(options: { features?: string[]; firefox?: boolean; status
   const inbound = async (type: BrowserMessage["type"], payload: Record<string, unknown>, scoped = true) => port.onMessage.emit({
     protocol: "papio-browser/1", type, msg_id: `agent-test-${seq}`, seq: seq++, ...(scoped ? { job_id: jobID } : {}), payload,
   });
+  backend.store = options.seed ?? emptyStore();
   await bridge.start();
   await inbound("hello_ack", { daemon_version: MIN_DAEMON_VERSION, role: "holder", browser_holder_generation: 1, features: options.features ?? features }, false);
   const update = (reducer: (store: StoreShape) => StoreShape): Promise<void> => Reflect.get(bridge, "update").call(bridge, reducer);
@@ -108,7 +112,7 @@ async function harness(options: { features?: string[]; firefox?: boolean; status
     expect(index).toBeGreaterThanOrEqual(0);
     now += 1000; timers.splice(index, 1)[0]!.fn(); await flush();
   };
-  return { bridge, deps, backend, frames, win, tabs, downloads, timers, classify, started, decide, request, reply, settle, tick, update,
+  return { bridge, deps, backend, frames, win, tabs, downloads, timers, classify, started, decide, request, reply, settle, tick, update, now: () => now,
     counts: () => ({ observations, actions, genericPlans }), setPermission: (value: boolean) => { permitted = value; }, setOnAct: (fn: () => Promise<void>) => { onAct = fn; }, advance: (ms: number) => { now += ms; }, inbound };
 }
 
@@ -403,4 +407,241 @@ test("PDF-labelled menu expands immediately and its Download PDF control uses pe
   await h.tick();
   expect(h.backend.store.activeJobs[0]?.generic_drive_epoch?.in_flight_download_id).toBe(906);
   expect(h.frames.some(f => f.type === "provider_outcome")).toBe(false);
+});
+
+const nativeFeatures = [...features, NATIVE_CLICK_ADOPTION_FEATURE];
+const reservationID = "native-reservation-1";
+const sourcePath = "C:\\Users\\Researcher\\Downloads\\Article paper (2).pdf";
+type AgentHarness = Awaited<ReturnType<typeof harness>>;
+function firefoxItem(h: AgentHarness, patch: Partial<DownloadItemLike> = {}): DownloadItemLike {
+  // Firefox DownloadItem has no tabId, finalUrl or DOM documentId.
+  return { id: 1401, url: "https://unregistered.example/one-use?token=PRIVATE", referrer: url,
+    startTime: new Date(h.now()).toISOString(), incognito: false, cookieStoreId: "firefox-default",
+    state: "in_progress", exists: true, filename: sourcePath, fileSize: -1, ...patch };
+}
+async function nativeHarness(options: { ignoredSteeringEvent?: boolean } = {}) {
+  const h = await harness({ firefox: true, features: nativeFeatures, ...options });
+  h.win.document.querySelector("button")!.textContent = "Download PDF";
+  return h;
+}
+async function nativeArm(h: AgentHarness) {
+  await h.classify(); await h.started(); await h.decide("decision", "c1");
+  const arm = await h.request("native_download_arm_request_v1");
+  expect(h.counts().observations).toBe(1); expect(h.counts().actions).toBe(0);
+  expect(arm.payload["producer"]).toEqual({ effect_kind: "generic_drive", ...epoch });
+  await h.reply(arm, "native_download_arm_result_v1", { outcome: "armed", reservation_id: reservationID, expires_at_ms: h.now() + 120_000 });
+  await until(() => h.counts().actions === 1); await flush();
+  return arm;
+}
+function completeNative(h: AgentHarness, item: DownloadItemLike, patch: Partial<DownloadItemLike> = {}) {
+  h.downloads.items.set(item.id, { ...item, state: "complete", fileSize: 12345, mime: "application/pdf", ...patch });
+  return h.downloads.onChanged.emit({ id: item.id, state: { current: "complete" } });
+}
+function expectNativeUntouched(h: AgentHarness) {
+  expect(h.downloads.started).toHaveLength(0); expect(h.downloads.removedFiles).toHaveLength(0); expect(h.downloads.erased).toHaveLength(0);
+  expect(h.frames.some(f => f.type === "download_complete" || f.type === "download_started" || f.type === "auth_returned" || f.type === "session_evidence")).toBe(false);
+}
+
+for (const outcome of ["ready", "review", "rejected"] as const) test(`Firefox synchronous native click imports exact actual file before ${outcome} settlement`, async () => {
+  const h = await nativeHarness();
+  let item: DownloadItemLike | undefined, receipt: Promise<void> | undefined, clicks = 0;
+  h.win.document.querySelector("button")!.addEventListener("click", () => {
+    clicks++; item = firefoxItem(h); receipt = h.downloads.onCreated.emit(item);
+    expect(Reflect.get(h.bridge, "downloads").get(jobID).ids.has(item.id)).toBe(true);
+  });
+  const arm = await nativeArm(h); await receipt;
+  const completing = completeNative(h, item!, outcome === "rejected" ? { mime: "text/html" } : {});
+  const request = await h.request("native_download_import_request_v1");
+  expect(request.payload).toMatchObject({ reservation_id: reservationID,
+    browser_epoch: arm.payload["browser_epoch"], document_id: arm.payload["document_id"],
+    download_id: item!.id, source_path: sourcePath, size_bytes: 12345,
+    started_at_ms: Date.parse(item!.startTime!), producer: { effect_kind: "generic_drive", ...epoch } });
+  expect(h.downloads.searches.filter(query => query.id === item!.id)).toEqual([{ id: item!.id }]);
+  expect(h.downloads.searches.some(query => query.filename !== undefined || query.filenameRegex !== undefined)).toBe(false);
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+  expect(Reflect.get(h.bridge, "downloads").has(jobID)).toBe(true);
+  await h.reply(request, "native_download_import_result_v1", { reservation_id: reservationID, download_id: item!.id, outcome }); await completing;
+  expect(Reflect.get(h.bridge, "downloads").has(jobID)).toBe(false);
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+  expect(clicks).toBe(1); expect(h.counts().actions).toBe(1); expectNativeUntouched(h);
+  const saved = JSON.stringify(h.backend.store);
+  expect(saved).not.toContain("PRIVATE"); expect(saved).not.toContain(sourcePath); expect(saved).not.toContain(url);
+});
+
+test("Firefox identity overrides an exposed ignored filename event", async () => {
+  const h = await nativeHarness({ ignoredSteeringEvent: true }); await nativeArm(h);
+  const item = firefoxItem(h); await h.downloads.onCreated.emit(item);
+  expect(h.backend.store.activeJobs[0]?.native_download?.download_id).toBe(item.id);
+  expect(h.backend.store.activeJobs[0]?.generic_drive_epoch?.in_flight_download_id).toBeUndefined(); expectNativeUntouched(h);
+});
+
+test("Firefox delayed creation holds grace and never asks for another decision", async () => {
+  const h = await nativeHarness();
+  h.win.document.querySelector("button")!.addEventListener("click", () => { h.win.document.querySelector("button")!.disabled = true; });
+  await nativeArm(h); for (let i = 0; i < 5; i++) await h.tick();
+  const item = firefoxItem(h); await h.downloads.onCreated.emit(item); await h.tick();
+  expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.native_download).toMatchObject({ download_id: item.id, phase: "observed" });
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false); expectNativeUntouched(h);
+});
+
+test("Firefox menu then download uses two fresh DOM choices and a single reservation", async () => {
+  const h = await nativeHarness(); const button = h.win.document.querySelector("button")!;
+  button.textContent = "Formats"; let clicks = 0;
+  button.addEventListener("click", () => {
+    clicks++; button.disabled = true;
+    const download = h.win.document.createElement("button"); download.type = "button"; download.textContent = "Download PDF";
+    download.addEventListener("click", () => { clicks++; void h.downloads.onCreated.emit(firefoxItem(h)); }); button.after(download);
+  });
+  await nativeArm(h); const after = h.frames.length; await h.tick(); await h.decide("decision", "c2", after);
+  await until(() => h.backend.store.activeJobs[0]?.native_download?.download_id === 1401);
+  expect(clicks).toBe(2); expect(h.counts().actions).toBe(2);
+  expect(h.frames.filter(f => f.type === "native_download_arm_request_v1")).toHaveLength(1);
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false); expectNativeUntouched(h);
+});
+
+for (const variant of ["absent", "origin", "wrong", "query", "old-start", "future-start", "other-extension", "private", "container", "blob"] as const)
+  test(`Firefox refuses ${variant} provenance without guessing or replay`, async () => {
+    const h = await nativeHarness(); await nativeArm(h);
+    const patch: Partial<DownloadItemLike> = variant === "absent" ? { referrer: undefined } :
+      variant === "origin" ? { referrer: "https://unregistered.example/" } : variant === "wrong" ? { referrer: url + "/different" } :
+      variant === "query" ? { referrer: url + "?other=1" } : variant === "old-start" ? { startTime: new Date(h.now() - 1).toISOString() } :
+      variant === "future-start" ? { startTime: new Date(h.now() + 1000).toISOString() } : variant === "other-extension" ? { byExtensionId: "someone@example.org" } :
+      variant === "private" ? { incognito: true } : variant === "container" ? { cookieStoreId: "firefox-container-2" } : { url: "blob:https://unregistered.example/opaque" };
+    const item = firefoxItem(h, patch); await h.downloads.onCreated.emit(item);
+    expect(h.backend.store.activeJobs[0]?.native_download?.download_id).toBeUndefined();
+    await completeNative(h, item);
+    expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false);
+    h.advance(45_000); await h.tick(); await h.settle(); expect(h.counts().actions).toBe(1); expectNativeUntouched(h);
+  });
+
+for (const stage of ["before-arm", "after-dispatch"] as const) test(`Firefox refuses same-article second tab ${stage}`, async () => {
+  const h = await nativeHarness();
+  if (stage === "before-arm") {
+    h.tabs.seed({ id: 78, url, status: "complete" }); await h.classify(); await h.started(); await h.decide("decision", "c1"); await h.settle();
+    expect(h.frames.some(f => f.type === "native_download_arm_request_v1")).toBe(false); expect(h.counts().actions).toBe(0);
+  } else {
+    await nativeArm(h); h.tabs.seed({ id: 78, url, status: "complete" });
+    const item = firefoxItem(h); await h.downloads.onCreated.emit(item); await completeNative(h, item);
+    expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false);
+  }
+  expectNativeUntouched(h);
+});
+
+test("Firefox refuses two jobs bound to the same article tab", async () => {
+  const h = await nativeHarness(); await h.update(s => ({ ...s, activeJobs: [...s.activeJobs, { ...s.activeJobs[0]!, job_id: "job_other_article" }] }));
+  await h.classify(); await h.started(); await h.decide("decision", "c1"); await h.settle();
+  expect(h.counts().actions).toBe(0); expect(h.frames.some(f => f.type === "native_download_arm_request_v1")).toBe(false);
+});
+
+for (const change of ["document", "epoch", "generation", "holder", "cancel", "permission", "expired"] as const)
+  test(`Firefox refuses completion after ${change} authority changes`, async () => {
+    const h = await nativeHarness(); await nativeArm(h); const item = firefoxItem(h); await h.downloads.onCreated.emit(item);
+    if (change === "document") Reflect.set(globalThis, "papioArticleAgent", undefined);
+    if (change === "epoch") await h.update(s => patchJob(s, jobID, { generic_drive_epoch: { ...localEpoch, ordinal: 1 } }));
+    if (change === "generation") { const next = Reflect.get(h.bridge, "portGeneration") + 1; Reflect.set(h.bridge, "portGeneration", next); Reflect.set(h.bridge, "helloAckGeneration", next); }
+    if (change === "holder") Reflect.set(h.bridge, "lastKnownBrowserHolderGeneration", 2);
+    if (change === "cancel") await h.inbound("cancel", {});
+    if (change === "permission") h.setPermission(false); if (change === "expired") h.advance(120_001);
+    await completeNative(h, item); expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false);
+    expect(h.counts().actions).toBe(1); expectNativeUntouched(h);
+  });
+
+for (const change of ["document", "permission", "generation", "holder", "epoch", "cancel"] as const)
+  test(`Firefox does not dispatch after ${change} during arm`, async () => {
+    const h = await nativeHarness(); await h.classify(); await h.started(); await h.decide("decision", "c1"); const arm = await h.request("native_download_arm_request_v1");
+    if (change === "document") Reflect.set(globalThis, "papioArticleAgent", undefined); if (change === "permission") h.setPermission(false);
+    if (change === "generation") { const next = Reflect.get(h.bridge, "portGeneration") + 1; Reflect.set(h.bridge, "portGeneration", next); Reflect.set(h.bridge, "helloAckGeneration", next); }
+    if (change === "epoch") await h.update(s => patchJob(s, jobID, { generic_drive_epoch: { ...localEpoch, ordinal: 1 } }));
+    if (change === "cancel") await h.update(s => ({ ...s, activeJobs: [] }));
+    if (change === "holder") Reflect.set(h.bridge, "lastKnownBrowserHolderGeneration", 2);
+    await h.reply(arm, "native_download_arm_result_v1", { outcome: "armed", reservation_id: reservationID, expires_at_ms: h.now() + 120_000 }); await h.settle();
+    expect(h.counts().actions).toBe(0); expectNativeUntouched(h);
+  });
+
+for (const duplicate of ["different-id", "same-id-changed-start", "same-id-changed-url"] as const)
+  test(`Firefox refuses ambiguous ${duplicate} creation`, async () => {
+    const h = await nativeHarness(); await nativeArm(h); const item = firefoxItem(h); await h.downloads.onCreated.emit(item); h.advance(1);
+    const patch = duplicate === "different-id" ? { id: 1402 } : duplicate === "same-id-changed-start"
+      ? { startTime: new Date(h.now()).toISOString() } : { url: "https://unregistered.example/other" };
+    await h.downloads.onCreated.emit({ ...item, ...patch }); await completeNative(h, item);
+    expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false); expectNativeUntouched(h);
+  });
+
+for (const invalid of ["missing", "size", "relative", "interrupted", "search-id", "changed-start", "changed-referrer"] as const)
+  test(`Firefox refuses ${invalid} exact completion record without deleting the source`, async () => {
+    const h = await nativeHarness(); await nativeArm(h); const item = firefoxItem(h); await h.downloads.onCreated.emit(item);
+    if (invalid === "interrupted") await h.downloads.onChanged.emit({ id: item.id, state: { current: "interrupted" } });
+    else {
+      if (invalid === "search-id") h.downloads.search = async () => [{ ...item, id: 44, state: "complete", fileSize: 12345 }];
+      const patch: Partial<DownloadItemLike> = invalid === "missing" ? { exists: false } : invalid === "size" ? { fileSize: -1, totalBytes: 12345 } :
+        invalid === "relative" ? { filename: "Article paper (2).pdf" } : invalid === "changed-start" ? { startTime: new Date(h.now() - 1000).toISOString() } :
+        invalid === "changed-referrer" ? { referrer: url + "?changed=1" } : {};
+      await completeNative(h, item, patch);
+    }
+    expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false); expectNativeUntouched(h);
+  });
+
+test("Firefox duplicate complete/deferred retains exactly one import and never replays", async () => {
+  const h = await nativeHarness(); await nativeArm(h); const item = firefoxItem(h);
+  await h.downloads.onCreated.emit(item); await h.downloads.onCreated.emit({ ...item });
+  const first = completeNative(h, item); const request = await h.request("native_download_import_request_v1"); await completeNative(h, item);
+  await h.reply(request, "native_download_import_result_v1", { reservation_id: reservationID, download_id: item.id, outcome: "deferred", reason: "validation_pending" });
+  await first; await completeNative(h, item); await h.classify();
+  expect(h.frames.filter(f => f.type === "native_download_import_request_v1")).toHaveLength(1);
+  expect(h.backend.store.activeJobs[0]?.native_download).toMatchObject({ phase: "deferred", download_id: item.id });
+  expect(h.counts().actions).toBe(1); expectNativeUntouched(h);
+});
+
+test("Firefox mismatched import reply cannot retire the exact track", async () => {
+  const h = await nativeHarness(); await nativeArm(h); const item = firefoxItem(h); await h.downloads.onCreated.emit(item);
+  const completing = completeNative(h, item); const request = await h.request("native_download_import_request_v1");
+  await h.reply(request, "native_download_import_result_v1", { reservation_id: "different-reservation", download_id: item.id, outcome: "ready" }); await completing;
+  expect(Reflect.get(h.bridge, "downloads").has(jobID)).toBe(true); expect(h.backend.store.activeJobs[0]?.generic_terminal).not.toBe(true);
+  expect(h.backend.store.activeJobs[0]?.native_download?.phase).toBe("deferred"); expectNativeUntouched(h);
+});
+
+test("Firefox worker restart preserves a URL-free receipt but never searches or binds its reused ID", async () => {
+  const first = await nativeHarness(); await nativeArm(first); const item = firefoxItem(first); await first.downloads.onCreated.emit(item);
+  const seed = migrateManagedState({ version: 8, ...JSON.parse(JSON.stringify(first.backend.store)) });
+  expect(seed.activeJobs[0]?.native_download?.download_id).toBe(item.id);
+  const second = await harness({ firefox: true, features: nativeFeatures, seed }); await second.classify();
+  await second.downloads.onCreated.emit(firefoxItem(second)); await completeNative(second, firefoxItem(second));
+  expect(second.downloads.searches.some(query => query.id === item.id)).toBe(false); expect(second.counts().actions).toBe(0);
+  expect(second.frames.some(f => f.type === "native_download_arm_request_v1" || f.type === "native_download_import_request_v1")).toBe(false); expectNativeUntouched(second);
+});
+
+for (const outcome of ["refused", "unavailable", "stale"] as const) test(`Firefox ${outcome} arm never dispatches`, async () => {
+  const h = await nativeHarness(); await h.classify(); await h.started(); await h.decide("decision", "c1");
+  const arm = await h.request("native_download_arm_request_v1");
+  await h.reply(arm, "native_download_arm_result_v1", { outcome, reason: "unavailable" }); await h.settle();
+  expect(h.counts().actions).toBe(0); expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false); expectNativeUntouched(h);
+});
+
+test("Firefox completion waits for a pending creation provenance check", async () => {
+  const h = await nativeHarness(); await nativeArm(h);
+  const original = h.deps.scripting.executeScript;
+  let release!: () => void, blocked = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  h.deps.scripting.executeScript = async injection => {
+    if (injection.func === nativeDownloadDocumentCurrent && !blocked) { blocked = true; await gate; }
+    return original(injection);
+  };
+  const item = firefoxItem(h); const creating = h.downloads.onCreated.emit(item);
+  await until(() => blocked);
+  const completing = completeNative(h, item); await flush();
+  expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false);
+  release(); await creating;
+  const request = await h.request("native_download_import_request_v1");
+  await h.reply(request, "native_download_import_result_v1", { outcome: "review", reservation_id: reservationID, download_id: item.id });
+  await completing; expectNativeUntouched(h);
+});
+
+test("Firefox late import result cannot mark a newer generic tuple terminal", async () => {
+  const h = await nativeHarness(); await nativeArm(h); const item = firefoxItem(h); await h.downloads.onCreated.emit(item);
+  const completing = completeNative(h, item); const request = await h.request("native_download_import_request_v1");
+  await h.update(s => patchJob(s, jobID, { generic_drive_epoch: { ...localEpoch, ordinal: 1 } }));
+  await h.reply(request, "native_download_import_result_v1", { outcome: "ready", reservation_id: reservationID, download_id: item.id }); await completing;
+  expect(h.backend.store.activeJobs[0]?.generic_terminal).not.toBe(true);
+  expect(h.backend.store.activeJobs[0]?.generic_drive_epoch?.ordinal).toBe(1); expectNativeUntouched(h);
 });
