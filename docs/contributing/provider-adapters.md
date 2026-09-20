@@ -40,7 +40,9 @@ source patch. Article proposals require a PDF-specific affordance and rank
 explicit PDF downloads ahead of viewer tabs. Stable control classes combined
 with bounded PDF path segments rank above positional selectors; document IDs,
 filenames, and query values do not supply those segments. Generic full-text links and
-citation exports cannot qualify on their own. A complete plan proves neither
+citation exports cannot qualify on their own. Controls labelled as previews,
+samples, abstracts, supplements, or full issues cannot qualify as the requested
+article PDF, even when page metadata matches. A complete plan proves neither
 entitlement nor PDF bytes.
 Review the access checks and the live file before applying a proposal.
 A wrong resolver destination or missing PDF control can require a route

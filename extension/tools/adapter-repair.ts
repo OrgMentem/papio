@@ -346,7 +346,13 @@ export function synthesizeAdapterRepair(
       // An executable same-origin href can still be the HTML "Full text" tab
       // or a citation export. Only PDF-specific affordances can unlock an
       // article repair proposal; live bytes still need maintainer verification.
-      const hasPDFAffordance = ruleKind !== "article" || /pdf/i.test(elementWords(item.node));
+      const controlWords = elementWords(item.node).replace(/([a-z])([A-Z])/g, "$1 $2");
+      // Matching page identity does not make a preview, abstract, supplement,
+      // or whole issue the requested work. Keep these visible as diagnostics,
+      // but never let their PDF label authorize a source patch.
+      const namesDifferentDocument = /(?:^|[^a-z])(?:preview|sample|abstract|supplement(?:ary|al)?|full[\s_-]*issue|table[\s_-]*of[\s_-]*contents)(?:[^a-z]|$)/i.test(controlWords);
+      const hasPDFAffordance = ruleKind !== "article" ||
+        (/pdf/i.test(controlWords) && !namesDifferentDocument);
       // A PDF viewer tab may have a stable id while the actual download has a
       // document-scoped one. Prefer the explicit download before id stability.
       const explicitPDFDownload = ruleKind === "article" && (

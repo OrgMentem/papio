@@ -292,6 +292,11 @@ execution records kept during the initial build.
 
 ### Fixed
 
+- **A PDF preview cannot qualify as a full-work adapter repair.** Proposals
+  labelled as previews, samples, abstracts, supplements, or full issues remain
+  diagnostic candidates but cannot produce a source patch for the requested
+  article. Matching page metadata alone does not make those files the work.
+
 - **Adapter repair proposals prefer stable PDF routes over page position.**
   A rendered control’s class and bounded PDF path segment can survive layout
   changes without embedding a document ID. Proposals still pass through the

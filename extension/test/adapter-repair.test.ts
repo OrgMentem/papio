@@ -91,6 +91,31 @@ test("generic full-text and citation downloads do not qualify as complete PDF re
   expect(result.candidates.some((candidate) => candidate.plan_complete)).toBe(false);
 });
 
+test("a captured preview control cannot repair a full-work PDF rule", () => {
+  // Reduced from the Taylor & Francis book access wall. Its only rendered
+  // PDF control offers a preview, despite matching work metadata.
+  const html = `<meta name="citation_doi" content="10.1000/repair">
+    <button data-gtm="gtm-preview-pdf" class="btn btn-outline sideDownload preview-pdf-btn">
+      <span data-gtm="gtm-preview-pdf" class="preview-pdf">Preview PDF</span>
+    </button>`;
+  const result = synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article");
+
+  expect(result.candidates.some((candidate) => candidate.classifier_verified)).toBe(true);
+  expect(result.candidates.some((candidate) => candidate.plan_complete)).toBe(false);
+});
+
+test.each(["Download sample PDF", "Abstract PDF", "Download full issue PDF", "Supplementary PDF"])(
+  "%s cannot replace the requested article PDF",
+  (label) => {
+    const html = `<meta name="citation_doi" content="10.1000/repair">
+      <a id="download" href="/download.pdf">${label}</a>`;
+    const result = synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article");
+
+    expect(result.candidates.some((candidate) => candidate.classifier_verified)).toBe(true);
+    expect(result.candidates.some((candidate) => candidate.plan_complete)).toBe(false);
+  },
+);
+
 test("repair candidates exclude redacted values from IDs, attributes, and classes", () => {
   const html =
     "<html><head><meta name='citation_doi' content='10.1000/redacted'></head><body>" +
