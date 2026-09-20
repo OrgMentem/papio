@@ -10960,7 +10960,7 @@ jobLoop:
 		}
 	}
 	if b.effectPermitAvailable() && b.jobs != nil {
-		if permit, _ := b.jobs.LiveEffectPermit(ctx); permit != nil {
+		if permit, _ := b.jobs.LiveEffectPermit(ctx); permit != nil && !b.effectPermitWorkerLive(permit) {
 			payload := protocol.EffectPermitReconcileRequestPayload{
 				RequestID:  newMsgID(),
 				PermitID:   permit.ID,
@@ -11599,6 +11599,24 @@ func (b *Bridge) effectPermitAvailable() bool {
 	}
 	return slices.Contains(b.arbitration.holderSession().Features, effectPermitFeature)
 }
+
+// Recovery observations cannot distinguish a lost effect from a live worker
+// that has not dispatched yet. Do not solicit them while the authorizing
+// holder still owns its lease. Hello after daemon/worker loss allocates a new
+// durable generation; zero or a failed allocation never proves continuity.
+// This only defers recovery: it neither grants authority nor settles a permit.
+func (b *Bridge) effectPermitWorkerLive(permit *job.EffectPermit) bool {
+	holder := b.arbitration.holderSession()
+	generation := b.arbitration.generation()
+	now := b.now()
+	return holder != nil && holder.ID != legacySessionID && !holder.Outdated &&
+		!b.materializationGenerationUnavailable && !b.materializationAuthorityUncertain &&
+		generation > 0 && permit.BrowserHolderGeneration == generation &&
+		permit.Status == job.EffectPermitHeld &&
+		permit.LeaseUntil != nil && permit.LeaseUntil.After(now) &&
+		now.Sub(holder.LastSyncAt) <= sessionStaleAfter
+}
+
 func (b *Bridge) providerDriveEpochAvailable() bool {
 	if b == nil || b.arbitration.holderSession() == nil || !slices.Contains(b.Features, providerDriveEpochV1Feature) || !b.effectPermitAvailable() {
 		return false
