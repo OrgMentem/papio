@@ -8281,7 +8281,7 @@ for (const status of ["accepted", "auth_pending"] as const) {
       const notices = h.frames().filter(f => f.type === "error" && f.payload["code"] === "native_viewer_download_required");
       expect(notices).toHaveLength(1);
       expect(JSON.stringify(notices)).not.toContain("private-token");
-      expect(h.backend.store.pendingDelivery?.page_identity).toBeUndefined();
+      expect(h.backend.store.pendingDelivery?.page_identity).toMatchObject({ tab_id: viewerID, source_url: "https://pdf.sciencedirectassets.com/77/main.pdf" });
       expect(h.backend.store.pendingDelivery?.url).toBe(viewerURL);
       expect(migrateManagedState(h.backend.store).pendingDelivery?.url).toBeUndefined();
       expect(h.tabs.removed).toEqual([]);

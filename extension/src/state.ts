@@ -41,9 +41,9 @@ export interface PendingDelivery {
   /** Session evidence available at the moment the delivery was requested,
    * frozen alongside page_host. */
   session_evidence?: DeliverySessionEvidence;
-  /** Exact page binding for the one authority-bearing continuation that must
-   * survive SW restart. Present only on `waiting_manual` records produced by
-   * the nonce picker. */
+  /** Exact page binding for a `waiting_manual` continuation, or display-only
+   * association for a `failed` notice. Only waiting_manual arms delivery;
+   * a failed notice never supplies download authority. */
   page_identity?: PageIdentity;
 }
 

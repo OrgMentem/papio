@@ -3305,6 +3305,7 @@ export async function readDeliveryFeedback(fallback: PendingDelivery | undefined
         initiated_at: sameJob?.initiated_at ?? 0,
         status: state,
         ...(typeof message === "string" ? { error: message } : {}),
+        ...(sameJob?.page_identity ? { page_identity: sameJob.page_identity } : {}),
       };
     }
   } catch {
@@ -4091,7 +4092,17 @@ export function renderPageContext(
     const deliveryMatchesJob = pendingDelivery?.job_id === knownJob?.job_id;
     const deliveryMatchesURL =
       currentPDFURL !== undefined && pendingPDFURL !== undefined && currentPDFURL === pendingPDFURL;
-    const delivery = deliveryMatchesJob || deliveryMatchesURL ? pendingDelivery : undefined;
+    // A failed notice grants no authority. Its query-free tab/page association
+    // keeps the remedy visible after MV3 sleeps and discards the signed URL.
+    let deliveryNoticeMatchesPage = false;
+    const notice = pendingDelivery?.status === "failed" ? pendingDelivery.page_identity : undefined;
+    if (notice !== undefined && notice.tab_id === page?.tab_id && currentPDFURL !== undefined) {
+      try {
+        const current = new URL(currentPDFURL);
+        deliveryNoticeMatchesPage = notice.source_url === `${current.origin}${current.pathname}`;
+      } catch { /* An unreadable page association supplies no display match. */ }
+    }
+    const delivery = deliveryMatchesJob || deliveryMatchesURL || deliveryNoticeMatchesPage ? pendingDelivery : undefined;
     button.dataset.mode = "pdf";
     button.dataset.idleLabel = "Send this PDF to papio";
     // One decision, taken from what this popup already knows, BEFORE the click.

@@ -18345,7 +18345,7 @@ export class Bridge {
    * operator's Download click. This notice grants no download authority and
    * persists neither the URL nor its credential. The worker-local URL lets the
    * popup show the instruction on the PDF tab that actually needs it. */
-  private async reportNativeViewerDownloadRequired(jobID: string, url: string): Promise<void> {
+  private async reportNativeViewerDownloadRequired(jobID: string, url: string, tabID: number): Promise<void> {
     // The click latch alone does not prove a file exists, but a correlated or
     // completed download does. Check browser history too after a worker nap.
     if (this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)) return;
@@ -18360,6 +18360,7 @@ export class Bridge {
       this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)
     ) return;
     if (!this.hasDelegatedAuthority(findByJob(this.store, jobID))) return;
+    const pageIdentity = await this.currentPageIdentity(tabID, url);
     const code = "native_viewer_download_required";
     const message = this.isFirefox()
       ? "Open this PDF in Chrome, choose Send this PDF in papio, then use the PDF viewer Download button."
@@ -18369,7 +18370,9 @@ export class Bridge {
     if (pending?.job_id === jobID && pending.error === message) {
       // Managed-state serialization strips the URL; a fresh viewer event can
       // restore this display-only association after a worker restart.
-      await this.update(s => updatePendingDelivery(s, jobID, { url }));
+      await this.update(s => updatePendingDelivery(s, jobID, {
+        url, ...(pageIdentity === undefined ? {} : { page_identity: pageIdentity }),
+      }));
       return;
     }
     if (pending === undefined || pending.status === "failed") {
@@ -18382,6 +18385,7 @@ export class Bridge {
           initiated_at: this.deps.now(),
           status: "failed",
           error: message,
+          ...(pageIdentity === undefined ? {} : { page_identity: pageIdentity }),
         });
       });
     }
@@ -18439,7 +18443,7 @@ export class Bridge {
       return;
 
     if (requiresNativeViewerDownload(downloadURL)) {
-      await this.reportNativeViewerDownloadRequired(jobID, downloadURL);
+      await this.reportNativeViewerDownloadRequired(jobID, downloadURL, job.tab_id);
       return;
     }
 
@@ -18573,7 +18577,7 @@ export class Bridge {
       )
         return;
       if (requiresNativeViewerDownload(url)) {
-        await this.reportNativeViewerDownloadRequired(job.job_id, url);
+        await this.reportNativeViewerDownloadRequired(job.job_id, url, viewerTabId);
         return;
       }
       this.adoptedViewerTabs.set(job.job_id, viewerTabId);

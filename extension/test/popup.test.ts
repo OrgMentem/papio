@@ -725,6 +725,26 @@ test("worker delivery feedback reaches the matching child PDF after storage drop
   expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
 });
 
+test("signed-viewer guidance survives worker sleep without arming a delivery", async () => {
+  const doc = popupDocument();
+  const url = "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=private-token";
+  const message = "Choose Send this PDF in papio, then use the PDF viewer Download button.";
+  Object.assign(globalThis, { chrome: { runtime: {
+    sendMessage: async () => ({ ok: true, state: "failed", job_id: "job_child_pdf", message }),
+  } } });
+  const feedback = await readDeliveryFeedback({
+    job_id: "job_child_pdf", initiated_at: 1, status: "failed", error: message,
+    page_identity: { tab_id: 77, nav_seq: 0, document_id: "pdf-77", source_url: "https://pdf.sciencedirectassets.com/77/main.pdf" },
+  });
+  renderPageAcquire(doc, async () => ({ error: "unused" }));
+  renderPageContext(doc, { url, tab_url: url, tab_id: 77, kind: "pdf" }, [], feedback);
+  expect(doc.getElementById("page-acquire")?.hidden).toBe(false);
+  expect(doc.getElementById("page-acquire-status")?.textContent).toBe(message);
+  expect(doc.body.textContent).not.toContain("private-token");
+  renderPageContext(doc, { url: "https://papers.example/other.pdf", tab_url: "https://papers.example/other.pdf", tab_id: 78, kind: "pdf" }, [], feedback);
+  expect(doc.getElementById("page-acquire")?.hidden).toBe(true);
+});
+
 test("shows the PDF acquire icon with the PDF tooltip", () => {
   const doc = popupDocument();
   renderPageAcquire(doc, async () => ({ error: "unused" }), async () => ({ state: "sending", job_id: "job_1234567890abcdef" }));
