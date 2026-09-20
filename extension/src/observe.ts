@@ -70,6 +70,16 @@ export interface ObservationCaptureContext {
   adapterVersion?: string;
 }
 
+/** Static labels only: no page content, URLs, digests, or exception text. */
+export interface ObservationCaptureDiagnostic {
+  reason: "sent" | "untracked" | "host_unverified" | "invalid_host" | "invalid_time"
+    | "storage_unavailable" | "daily_limit" | "shape_limit" | "injection_failed"
+    | "invalid_page" | "origin_changed" | "sanitizer_refused" | "duplicate"
+    | "encoding_refused" | "transport_unavailable" | "capture_failed";
+  /** Time until this quota gate clears, not a promise the next capture succeeds. */
+  retryAfterMs?: number;
+}
+
 interface ObservationRateState {
   total: number[];
   byShape: Record<string, number[]>;
@@ -171,48 +181,63 @@ export function observeUnknown(
   host: string,
   context: ObservationCaptureContext,
   now: () => Date = () => new Date(),
+  onDiagnostic?: (diagnostic: ObservationCaptureDiagnostic) => void,
 ): Promise<boolean> {
   let captured = false;
+  let diagnostic: ObservationCaptureDiagnostic = { reason: "capture_failed" };
+  const refuse = (reason: ObservationCaptureDiagnostic["reason"], retryAfterMs?: number): void => {
+    diagnostic = { reason, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
+  };
   const run = observationQueue.then(async () => {
-    if (!job || !hostMatches(host, context.verifiedHosts)) return;
+    if (!job) return refuse("untracked");
+    if (!hostMatches(host, context.verifiedHosts)) return refuse("host_unverified");
     const hostKey = observedHostKey(host);
-    if (!hostKey) return;
+    if (!hostKey) return refuse("invalid_host");
     const shapeKey = observationShapeKey(hostKey, context);
 
     const capturedAt = now();
     const timestamp = capturedAt.getTime();
-    if (!Number.isFinite(timestamp)) return;
+    if (!Number.isFinite(timestamp)) return refuse("invalid_time");
 
     let stored: Record<string, unknown>;
     try {
       stored = await api.storage.local.get(RATE_STORAGE_KEY);
     } catch (error) {
       console.warn("papio: observed capture rate storage unavailable; skipping", error);
-      return;
+      return refuse("storage_unavailable");
     }
     const rates = cleanRateState(stored[RATE_STORAGE_KEY], timestamp);
     // `rates.byShape` spans the full day (see cleanRateState); the 1-per-
     // hour gate is a trailing-hour sub-filter over that persisted history.
-    const shapeCapturesThisHour = (rates.byShape[shapeKey] ?? []).filter((t) => t > timestamp - HOUR_MS).length;
-    if (rates.total.length >= MAX_PER_DAY || shapeCapturesThisHour >= MAX_PER_SHAPE) return;
+    const shapeCapturesThisHour = (rates.byShape[shapeKey] ?? []).filter((t) => t > timestamp - HOUR_MS);
+    // Sort copies: persisted order is not part of the quota contract. For an
+    // overfull snapshot, enough reservations must expire to fall below the cap.
+    if (rates.total.length >= MAX_PER_DAY) {
+      const clearsAt = [...rates.total].sort((a, b) => a - b)[rates.total.length - MAX_PER_DAY]! + DAY_MS;
+      return refuse("daily_limit", clearsAt - timestamp);
+    }
+    if (shapeCapturesThisHour.length >= MAX_PER_SHAPE) {
+      const clearsAt = shapeCapturesThisHour.sort((a, b) => a - b)[shapeCapturesThisHour.length - MAX_PER_SHAPE]! + HOUR_MS;
+      return refuse("shape_limit", clearsAt - timestamp);
+    }
 
     let injected: { result?: PageCapture | undefined } | undefined;
     try {
       [injected] = await api.scripting.executeScript({ target: { tabId: job.tab_id }, func: capturePage });
     } catch (error) {
       console.warn("papio: observed page capture failed; skipping", error);
-      return;
+      return refuse("injection_failed");
     }
     const page = injected?.result;
-    if (!page || typeof page.html !== "string" || typeof page.origin !== "string" || typeof page.path !== "string") return;
+    if (!page || typeof page.html !== "string" || typeof page.origin !== "string" || typeof page.path !== "string") return refuse("invalid_page");
 
     let pageHost: string;
     try {
       pageHost = new URL(page.origin).hostname;
     } catch {
-      return;
+      return refuse("invalid_page");
     }
-    if (!hostMatches(pageHost, context.verifiedHosts) || pageHost.toLowerCase() !== host.toLowerCase()) return;
+    if (!hostMatches(pageHost, context.verifiedHosts) || pageHost.toLowerCase() !== host.toLowerCase()) return refuse("origin_changed");
     // A known adapter's miss belongs to its repair scenario. The daemon still
     // requires a separate, durable provider outcome before promoting evidence.
     const provider = PROVIDERS.find((id) => id === context.adapterID);
@@ -228,7 +253,7 @@ export function observeUnknown(
     const leak = residualLeak(sanitized);
     if (leak) {
       console.warn(`papio: refusing observed capture with residual secret: ${leak}`);
-      return;
+      return refuse("sanitizer_refused");
     }
 
     // The digest only exists once the page is captured and sanitized, so a
@@ -239,7 +264,7 @@ export function observeUnknown(
     // construction, so including it would make every capture look unique
     // and the dedupe would never fire.
     const digest = fnv1a(sanitized.slice(sanitized.indexOf("\n") + 1));
-    if (rates.digests[shapeKey]?.includes(digest)) return;
+    if (rates.digests[shapeKey]?.includes(digest)) return refuse("duplicate");
 
     const encoded = await encodePageCapture(sanitized, {
       host: pageHost,
@@ -250,7 +275,7 @@ export function observeUnknown(
     });
     if (!encoded.ok) {
       console.warn("papio: observed page capture could not be encoded; skipping", encoded.error);
-      return;
+      return refuse("encoding_refused");
     }
 
     // Reserve quota before bridge emission so a worker restart during native
@@ -265,19 +290,26 @@ export function observeUnknown(
       await api.storage.local.set({ [RATE_STORAGE_KEY]: rates });
     } catch (error) {
       console.warn("papio: observed capture rate storage unavailable; skipping", error);
-      return;
+      return refuse("storage_unavailable");
     }
 
     try {
       if (await api.sendPageCapture(encoded.payload, job.job_id)) {
         captured = true;
+        diagnostic = { reason: "sent" };
       } else {
         console.warn("papio: observed page capture was not sent; skipping");
+        refuse("transport_unavailable");
       }
     } catch (error) {
       console.warn("papio: observed page capture was not sent; skipping", error);
+      refuse("transport_unavailable");
     }
   });
-  observationQueue = run.catch(() => undefined);
-  return run.then(() => captured);
+  const completed = run.catch(() => { refuse("capture_failed"); });
+  observationQueue = completed;
+  return completed.then(() => {
+    onDiagnostic?.(diagnostic);
+    return captured;
+  });
 }

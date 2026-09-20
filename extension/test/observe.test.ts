@@ -9,6 +9,7 @@ import { gunzipSync } from "node:zlib";
 import {
   observeUnknown,
   type ObservationCaptureContext,
+  type ObservationCaptureDiagnostic,
   type ObserveChromeApi,
 } from "../src/observe";
 import type { PageCapture } from "../src/capture";
@@ -371,3 +372,72 @@ test("legacy byHost persisted state loads as empty instead of throwing", async (
   expect(captured).toBe(true);
   expect(fake.sent).toHaveLength(1);
 });
+
+test("capture diagnostics distinguish sent, hourly quota and duplicate without changing reservations", async () => {
+  const host = "ebooks.iospress.nl";
+  const fake = fakeChrome(pageFor(host));
+  const context = { verifiedHosts: [host], adapterID: "iospress", adapterVersion: "0.1.0" };
+  const diagnostics: ObservationCaptureDiagnostic[] = [];
+  for (const time of ["10:00", "10:05", "11:30"]) {
+    await observeUnknown(fake.api, jobFor(host), host, context,
+      fixedNow(`2026-09-20T${time}:00.000Z`), (diagnostic) => diagnostics.push(diagnostic));
+  }
+  expect(diagnostics).toEqual([
+    { reason: "sent" },
+    { reason: "shape_limit", retryAfterMs: 55 * 60 * 1000 },
+    { reason: "duplicate" },
+  ]);
+  expect(fake.sent).toHaveLength(1);
+  expect((fake.stored[RATE_KEY] as { total: number[] }).total).toHaveLength(1);
+});
+
+test("daily diagnostic waits until enough unsorted reservations expire", async () => {
+  const host = "example.org";
+  const fake = fakeChrome(pageFor(host));
+  const now = Date.parse("2026-09-20T10:00:00Z");
+  // Twenty-one reservations: expiring just the oldest would still leave 20.
+  fake.stored[RATE_KEY] = {
+    total: Array.from({ length: 21 }, (_, index) => now - (index + 1) * 60_000),
+    byShape: {}, digests: {},
+  };
+  const diagnostics: ObservationCaptureDiagnostic[] = [];
+  expect(await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
+    () => new Date(now), (diagnostic) => diagnostics.push(diagnostic))).toBe(false);
+  expect(diagnostics).toEqual([{ reason: "daily_limit", retryAfterMs: 24 * 60 * 60_000 - 20 * 60_000 }]);
+  expect(fake.injections).toHaveLength(0);
+});
+
+test("unexpected capture failure remains diagnosable and does not block the next observation", async () => {
+  const host = "example.org";
+  const fake = fakeChrome(pageFor(host));
+  const diagnostics: ObservationCaptureDiagnostic[] = [];
+  expect(await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
+    () => { throw new Error("private-clock-error"); }, (diagnostic) => diagnostics.push(diagnostic))).toBe(false);
+  expect(diagnostics).toEqual([{ reason: "capture_failed" }]);
+  expect(await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
+    fixedNow("2026-09-20T10:00:00Z"))).toBe(true);
+});
+
+for (const reason of ["storage_unavailable", "injection_failed", "origin_changed", "invalid_page", "sanitizer_refused", "encoding_refused", "transport_unavailable"] as const) {
+  test(`capture diagnostic reports ${reason} without leaking page or exception content`, async () => {
+    const host = reason === "sanitizer_refused" ? "abcdefghijklmnopqrstuvwxyzabcdef.com" : "example.org";
+    const fake = fakeChrome(pageFor(host));
+    if (reason === "storage_unavailable") fake.api.storage.local.get = async () => { throw new Error("private-storage-error"); };
+    if (reason === "injection_failed") fake.api.scripting.executeScript = async () => { throw new Error("private-page-error"); };
+    if (reason === "origin_changed") fake.setPage(pageFor("private-other.example"));
+    if (reason === "invalid_page") fake.api.scripting.executeScript = async () => [];
+    if (reason === "encoding_refused") fake.setPage({ ...pageFor(host), html: `<main>${"ordinary text ".repeat(180_000)}</main>` });
+    if (reason === "transport_unavailable") fake.api.sendPageCapture = async () => false;
+    const diagnostics: ObservationCaptureDiagnostic[] = [];
+    expect(await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
+      fixedNow("2026-09-20T10:00:00Z"), (diagnostic) => diagnostics.push(diagnostic))).toBe(false);
+    expect(diagnostics).toEqual([{ reason }]);
+    expect(fake.sent).toHaveLength(0);
+    if (reason === "transport_unavailable") {
+      // Sending failed after reservation; a second attempt must still meet the quota.
+      await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
+        fixedNow("2026-09-20T10:01:00Z"), (diagnostic) => diagnostics.push(diagnostic));
+      expect(diagnostics[1]).toEqual({ reason: "shape_limit", retryAfterMs: 59 * 60_000 });
+    }
+  });
+}

@@ -162,7 +162,7 @@ import {
   type Plan,
   type PlanResult,
 } from "./plan";
-import { observeUnknown, type ObserveChromeApi } from "./observe";
+import { observeUnknown, type ObserveChromeApi, type ObservationCaptureDiagnostic } from "./observe";
 import {
   capturePage,
   encodePageCapture,
@@ -214,6 +214,24 @@ function unknownGraceMs(spec?: AdapterSpec): number {
   const configured = spec?.unknownGraceMs;
   return configured !== undefined && Number.isFinite(configured)
     ? Math.max(5_000, Math.min(configured, 60_000)) : 5_000;
+}
+
+function captureOutcomeDetail(detail: string | undefined, diagnostic: ObservationCaptureDiagnostic | undefined): string {
+  if (diagnostic === undefined) return detail ?? "";
+  // Latest attempt only: a previous retry may already have sent a capture.
+  const suffix = `Automatic capture latest attempt: ${diagnostic.reason}` +
+    (diagnostic.retryAfterMs === undefined ? "." :
+      `; quota retry-after=${Math.ceil(diagnostic.retryAfterMs / 1000)}s.`);
+  // The wire allows 500 characters, but redactProviderDetail persists only
+  // 200 bytes. Reserve space for the diagnostic after the evidence prefix.
+  const encoder = new TextEncoder();
+  const budget = 200 - encoder.encode(suffix).length - 1;
+  let prefix = "";
+  for (const character of detail ?? "") {
+    if (encoder.encode(prefix + character).length > budget) break;
+    prefix += character;
+  }
+  return prefix === "" ? suffix : `${prefix} ${suffix}`;
 }
 // A challenge holds only its provider's queue for the same one minute the old
 // bounded challenge probe used, then a fresh drain can reclaim it.
@@ -19469,6 +19487,7 @@ export class Bridge {
     adapter?: AdapterSpec,
     deferTerminal = false,
     detail?: string,
+    onCaptureDiagnostic?: (diagnostic: ObservationCaptureDiagnostic) => void,
   ): Promise<boolean> {
     // An unregistered provider may authorize its own first diagnostic below,
     // but an authentication redirect may not. IdP pages can contain names,
@@ -19487,6 +19506,9 @@ export class Bridge {
       return false;
     let captured = false;
     const captureStorage = this.deps.captureStorage;
+    let captureDiagnostic: ObservationCaptureDiagnostic = {
+      reason: captureStorage === undefined ? "storage_unavailable" : "transport_unavailable",
+    };
     if (captureStorage !== undefined && this.pageCaptureAvailable()) {
       captured = await observeUnknown(
         {
@@ -19507,9 +19529,12 @@ export class Bridge {
             : { adapterID: adapter.id, adapterVersion: adapter.version }),
         },
         () => new Date(this.deps.now()),
+        (diagnostic) => { captureDiagnostic = diagnostic; },
       );
     }
+    onCaptureDiagnostic?.(captureDiagnostic);
     if (adapter === undefined) return captured;
+    const outcomeDetail = captureOutcomeDetail(detail, captureDiagnostic);
     const now = this.deps.now();
     const count = job.unknown_count ?? 0;
     const last = job.last_unknown_ms ?? 0;
@@ -19527,7 +19552,7 @@ export class Bridge {
               outcome: "ui_changed",
               adapter_id: adapter.id,
               adapter_version: adapter.version,
-              ...(detail === undefined ? {} : { detail }),
+              detail: outcomeDetail,
               ...(reportedHost === undefined ? {} : { host: reportedHost }),
             },
             job.job_id,
@@ -20668,7 +20693,9 @@ export class Bridge {
         const settled =
           (job.unknown_count ?? 0) >= 1 &&
           now - (job.last_unknown_ms ?? 0) >= unknownGraceMs(spec);
-        await this.recordUnknown(job, host, spec, settled);
+        let captureDiagnostic: ObservationCaptureDiagnostic | undefined;
+        await this.recordUnknown(job, host, spec, settled, undefined,
+          (diagnostic) => { captureDiagnostic = diagnostic; });
         if (!settled) return;
         const current = findByJob(this.store, jobID);
         if (
@@ -20677,10 +20704,10 @@ export class Bridge {
         )
           return;
         const evidence = this.genericEvidence.get(jobID) ?? [];
-        const detail =
+        const detail = captureOutcomeDetail(
           evidence.length === 0
             ? undefined
-            : `Generic evidence: ${evidence.join(", ")}.`;
+            : `Generic evidence: ${evidence.join(", ")}.`, captureDiagnostic);
         const outcomeKey = `${jobID}:ui_changed`;
         if (!this.handoffOutcomeSent.has(outcomeKey)) {
           this.handoffOutcomeSent.add(outcomeKey);

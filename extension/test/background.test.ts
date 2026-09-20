@@ -6707,7 +6707,7 @@ test("a non-executable article plan reports its refusal after the render window"
   expect(outcomes).toHaveLength(1);
   expect(outcomes[0]!.payload).toMatchObject({
     outcome: "ui_changed", adapter_id: PROVIDER_ADAPTER.id,
-    detail: "Adapter plan refused: declared action target is not unique",
+    detail: "Adapter plan refused: declared action target is not unique Automatic capture latest attempt: storage_unavailable.",
   });
   expect(h.downloads.started).toHaveLength(0);
   expect(h.backend.store.activeJobs[0]).toMatchObject({ tab_id: -1, status: "awaiting_download" });
@@ -6770,6 +6770,94 @@ test("a slow provider can render within its bounded grace, and a stuck page repo
     if (renders) expect(h.backend.store.activeJobs[0]!.unknown_count).toBe(0);
   }
 });
+
+for (const scenario of ["sent_then_quota", "daily_limit", "transport_unavailable", "storage_unavailable", "long_detail"] as const) {
+  test(`ui_changed retains evidence and reports automatic capture ${scenario}`, async () => {
+    const h = makeHarness();
+    const stored: Record<string, unknown> = {};
+    if (scenario !== "storage_unavailable") h.deps.captureStorage = {
+      local: {
+        get: async (key) => ({ [key]: stored[key] }),
+        set: async (items) => { Object.assign(stored, items); },
+      },
+    };
+    h.deps.scripting.executeScript = async (injection) => injection.func === capturePage ? [{ result: {
+      html: "<main>Unknown article layout</main>", origin: `https://${PROVIDER_HOST}`, path: "/article",
+    } }] : [];
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ features: scenario === "transport_unavailable" ? [] : ["page_capture_v1"] }));
+    await h.port.inbound(jobOffer("job_capture_diagnostic"));
+    const job = h.backend.store.activeJobs[0]!;
+    h.tabs.seed({ id: job.tab_id, url: `https://${PROVIDER_HOST}/article` });
+    if (scenario === "daily_limit") stored["papio_observed_capture_rate_v1"] = {
+      total: Array(20).fill(h.clock.now), byShape: {}, digests: {},
+    };
+    const internals = h.bridge as unknown as {
+      recordUnknown(job: ActiveJob, host: string, adapter: AdapterSpec, deferTerminal: boolean, detail: string): Promise<boolean>;
+    };
+    const evidence = scenario === "long_detail" ? "é".repeat(250) : "Generic evidence: e0:citation-doi=missing.";
+    const firstCaptured = await internals.recordUnknown(job, PROVIDER_HOST, PROVIDER_ADAPTER, false, evidence);
+    expect(firstCaptured).toBe(scenario === "sent_then_quota" || scenario === "long_detail");
+    h.clock.now += 5_000;
+    expect(await internals.recordUnknown(h.backend.store.activeJobs[0]!, PROVIDER_HOST, PROVIDER_ADAPTER, false, evidence)).toBe(false);
+    const outcomes = h.frames().filter(frame => frame.type === "provider_outcome");
+    expect(outcomes).toHaveLength(1);
+    const detail = outcomes[0]!.payload.detail as string;
+    expect(new TextEncoder().encode(detail).length).toBeLessThanOrEqual(200);
+    expect(detail).toStartWith(scenario === "long_detail" ? "ééé" : evidence);
+    const reason = scenario === "sent_then_quota" || scenario === "long_detail" ? "shape_limit" : scenario;
+    expect(detail).toContain(`Automatic capture latest attempt: ${reason}`);
+    if (reason === "shape_limit") expect(detail).toContain("quota retry-after=3595s.");
+    if (reason === "daily_limit") expect(detail).toContain("quota retry-after=86395s.");
+    expect(h.frames().filter(frame => frame.type === "page_capture")).toHaveLength(firstCaptured ? 1 : 0);
+  });
+}
+
+for (const firstSent of [false, true]) {
+  test(`settled unknown verdict reports capture quota with generic evidence; earlier sent=${firstSent}`, async () => {
+    const h = makeHarness();
+    useUnknownProviderClassifier(h, () => false);
+    const stored: Record<string, unknown> = {};
+    if (!firstSent) stored["papio_observed_capture_rate_v1"] = {
+      total: Array(20).fill(h.clock.now), byShape: {}, digests: {},
+    };
+    h.deps.captureStorage = {
+      local: {
+        get: async (key) => ({ [key]: stored[key] }),
+        set: async (items) => { Object.assign(stored, items); },
+      },
+    };
+    const classify = h.deps.scripting.executeScript;
+    h.deps.scripting.executeScript = async (injection) => {
+      if (injection.func === capturePage) return [{ result: {
+        html: "<main>Unknown article layout</main>", origin: `https://${PROVIDER_HOST}`, path: "/article",
+      } }];
+      if (injection.func === planGeneric) return [{ result: {
+        evidence: ["e0:citation-title=present", "e0:citation-year=missing", "e0:jsonld-content-url=missing", "e0:alternate-pdf=missing", "e0:citation-doi=present", "e0:citation-doi=exact", "e0:citation-pdf=missing"],
+        candidates: [],
+      } }];
+      return classify(injection);
+    };
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+    await h.port.inbound(jobOffer("job_unknown_capture_diagnostic"));
+    const tabID = h.backend.store.activeJobs[0]!.tab_id;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);
+    for (let retry = 0; retry < 2; retry++) {
+      const timer = h.timers.at(-1)!;
+      h.clock.now += 2_500;
+      await timer.fn();
+    }
+    const outcomes = h.frames().filter(frame => frame.type === "provider_outcome");
+    expect(outcomes).toHaveLength(1);
+    const detail = outcomes[0]!.payload.detail as string;
+    expect(detail).toStartWith("Generic evidence: e0:citation-title=present");
+    expect(detail).toContain(`Automatic capture latest attempt: ${firstSent ? "shape_limit" : "daily_limit"}`);
+    expect(detail).toEndWith(`quota retry-after=${firstSent ? 3595 : 86395}s.`);
+    expect(new TextEncoder().encode(detail).length).toBeLessThanOrEqual(200);
+    expect(h.frames().filter(frame => frame.type === "page_capture")).toHaveLength(firstSent ? 1 : 0);
+  });
+}
 
 test("unknown retries report ui_changed once per drive and again for a re-offered tab", async () => {
   const jobID = "job_unknown_outcome_drive";

@@ -297,3 +297,27 @@ test("capture parsing never attempts subresource requests", () => {
 
   expect(attempts).toEqual([]);
 });
+
+
+test("click repair refuses a PDF form container and selects its download control", () => {
+  const html = `<meta name="citation_doi" content="10.1000/repair">
+    <form id="download-form" action="/Download/Pdf" method="post">
+      <input type="hidden" name="id" value="">
+      <div id="download-pdf" class="button getpdf">Download PDF</div>
+    </form>`;
+  const result = synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article");
+  const form = result.candidates.find(candidate => candidate.selector === "#download-form");
+  expect(form?.plan_complete).toBe(false);
+  expect(form?.blocked_by).toContain("A form container does not prove a clickable download control.");
+  expect(result.candidates[0]).toMatchObject({ selector: "#download-pdf", plan_complete: true });
+});
+
+test("a PDF form without a rendered download control cannot unlock a click repair", () => {
+  const html = `<meta name="citation_doi" content="10.1000/repair">
+    <form id="download-pdf-form" action="/Download/Pdf" method="post">
+      <input type="hidden" name="id" value="">
+    </form>`;
+  const result = synthesizeAdapterRepair(html, REPAIR_SPEC, "drift", "article");
+  expect(result.candidates.length).toBeGreaterThan(0);
+  expect(result.candidates.some(candidate => candidate.plan_complete)).toBe(false);
+});

@@ -369,6 +369,12 @@ export function synthesizeAdapterRepair(
           .some((value) => /(?:download[\s_-]*pdf|pdf[\s_-]*download)/i.test(value ?? ""))
       );
       const blockedBy: string[] = [];
+      // A form inherits its child's PDF label and may itself have a stable
+      // download id/action. HTMLElement.click() on the form does not activate
+      // its submit control, even though the planner accepts that element.
+      if (ruleKind === "article" && spec.download?.method === "click" && item.node.tagName.toLowerCase() === "form") {
+        blockedBy.push("A form container does not prove a clickable download control.");
+      }
       if (!classifierVerified) blockedBy.push(`Proposed selector still classifies as ${verdictOf(planned).kind}.`);
       if (!hasFixtureIdentity) blockedBy.push("Capture lacks the adapter's required work identity evidence.");
       if (!repairsDeclaredTarget) blockedBy.push("A PDF control cannot replace a separate access or identity check.");
