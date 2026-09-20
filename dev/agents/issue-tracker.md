@@ -5,11 +5,10 @@ Two surfaces, split by shape.
 | Artifact                                | Home                                             |
 | --------------------------------------- | ------------------------------------------------ |
 | A ticket: bug, task, chore, decision    | The rumen findings ledger, project id `papio`    |
-| A spec, a wayfinder map, a child ticket | `dev/plans/<feature-slug>/` in this repo         |
+| A spec or a wayfinder map              | `dev/plans/<feature-slug>/` in this repo         |
 
-The split exists because the ledger stores findings, not documents, and because
-rumen exposes no dependency-link and no claim command, so a wayfinder frontier
-cannot be computed from it.
+Documents hold the design and decision index. Findings hold tickets, native
+relationships, and labels. Host-local claims live in rumen's state store.
 
 ## Hard rules
 
@@ -51,7 +50,7 @@ audited as a local CLI mutation.
 
 ```bash
 rumen findings show <id> --json
-rumen findings context <id>        # anchors, verification commands, prior fix attempts, related findings
+rumen findings context <id>        # explicit edges, similar findings, anchors, verification, fix history
 rumen findings show <id> --prompt  # the finding plus the exact commands that disposition it
 ```
 
@@ -65,8 +64,9 @@ rumen findings query --project papio --recurring --json   # zombies that keep re
 ```
 
 Filters: `--category`, `--priority`, `--status`, `--resolution`, `--path`,
-`--text`, `--since`, `--sort`, `--group-by`, `--view`. Default `--limit` is 50,
-so a count of exactly 50 is a truncation, not a total.
+`--text`, `--since`, `--sort`, `--group-by`, `--view`, `--label`, `--blocks`,
+`--blocked-by`, `--parent`. Default `--limit` is 50; inspect `truncated` before
+treating a result count as a total.
 
 `--json` returns an envelope, `{"findings": [...]}`, so narrow it with
 `--select findings` before piping to `jq '.[]'`. Finding ids carry the project
@@ -98,8 +98,8 @@ Other dispositions: `rumen findings defer --until <YYYY-MM-DD>`,
 
 ## Documents under `dev/plans/`
 
-`dev/plans/` is tracked, so specs, maps, and claims survive commits and are
-visible to agents working in other worktrees.
+`dev/plans/` is tracked, so specs and maps survive commits and remain visible
+to agents in other worktrees. Claims are leases, not document fields.
 
 - One feature per directory: `dev/plans/<feature-slug>/`
 - The spec is `dev/plans/<feature-slug>/spec.md`
@@ -111,25 +111,36 @@ multi-ticket effort gets a `dev/plans/<slug>/` directory instead.
 
 ### Wayfinding operations
 
-Used by `/wayfinder`. The ledger cannot host these: rumen surfaces no
-dependency link, no assignee, and no label on a finding, so blocking, claim,
-and the `wayfinder:map` marker have nowhere to live. Beads has the underlying
-capability; rumen deliberately does not expose it, and reaching past rumen to
-`bd` is forbidden.
+Used by `/wayfinder`. Documents describe decisions; Findings hold tickets and coordination state.
 
-- **Map**: `dev/plans/<effort>/map.md` (the Notes / Decisions-so-far / Fog body).
-- **Child ticket**: `dev/plans/<effort>/issues/NN-<slug>.md`, numbered from `01`,
-  with the question in the body. A `Type:` line records the ticket type
-  (`research`/`prototype`/`grilling`/`task`); a `Status:` line records
-  `claimed`/`resolved`.
-- **Blocking**: a `Blocked by: NN, NN` line near the top. A ticket is unblocked
-  when every file it lists is `resolved`.
-- **Frontier**: scan `dev/plans/<effort>/issues/` for files that are open,
-  unblocked, and unclaimed; first by number wins.
-- **Claim**: set `Status: claimed` and save before any work.
-- **Resolve**: append the answer under an `## Answer` heading, set
-  `Status: resolved`, then append a context pointer (gist + link) to the map's
-  Decisions-so-far in `map.md`.
+- **Map**: keep Destination, Notes, Decisions so far, and unresolved questions in `dev/plans/<effort>/map.md`.
+- **Effort root**: lodge a `task` Finding with `--source operator --dedupe-hint wayfinder:<effort>:root`.
+  Add `wayfinder:map` and `wayfinder:<effort>` with `findings label`. Record its id in the map.
+- **Child ticket**: lodge a `task` or `decision` Finding with a stable `--dedupe-hint wayfinder:<effort>:<ticket>`.
+  Use `--input` for a JSON body. Include the question and links to retained evidence.
+  Set its parent with `findings link <child> --parent <root>`.
+  Add `wayfinder:<effort>` and one type label: `wayfinder:research`, `wayfinder:prototype`, `wayfinder:grilling`, or `wayfinder:task`.
+- **Blocking**: `rumen findings link <dependent> --blocked-by <blocker>`.
+  Use `findings unlink` with the same endpoints to remove that edge.
+  Parent membership and blocking are separate relationships; create all Findings before wiring their edges.
+  Keep the effort root open while a child is open; the vendor refuses to close it.
+- **Frontier**: `rumen findings frontier --project papio --parent <root> --explain --json`.
+  Use the first returned Finding. Do not sort by ticket number or reconstruct readiness from files.
+  The CLI considers current blockers, deferrals, priority, and host-local claims.
+  Missing evidence excludes affected work; `--explain` names the reason.
+- **Claim**: `rumen findings claim <id> --project papio --holder <session> --pid <long-lived-pid> --ttl 10m --json`.
+  Start only when `claimed` is true. A refusal can return exit 0 with `claimed:false`.
+  Use the agent or shell PID, never the short-lived command PID.
+  Renew with the same holder/PID and `--refresh`; release with `findings release <id> --holder <session>`.
+  `findings claims --project papio --json` shows liveness and expiry.
+  Claims coordinate only processes sharing one rumen state directory on one host.
+  A close/reopen cycle invalidates a claim. Durable assignment and cross-host exclusion are not supported.
+- **Resolve**: retain the answer in a document when it needs one, then close the Finding with the proper resolution class.
+  Put the answer or its path in `--reason`. Add a named Finding reference to the map's Decisions so far.
+  Use `rumen findings show <id>` to retrieve that reference; do not invent a web URL.
+
+Do not create child-ticket files or store blocking and claim state in Markdown.
+Do not use labels to emulate status, ownership, or priority. Only `user:*` and `wayfinder:*` labels accept operator writes.
 
 ## GitHub Issues and PRs
 
