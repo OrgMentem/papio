@@ -19,7 +19,7 @@ import (
 )
 
 func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "config.toml")
+	path := filepath.Join(configPermissionRoot(t), "nested", "config.toml")
 	cfg := Default()
 	if !cfg.Browser.DirectRoutesEnabled {
 		t.Fatal("direct routes disabled by default")
@@ -35,17 +35,7 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	if err := Save(cfg, path); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("config mode = %v, want 0600", info.Mode().Perm())
-	}
-	parent, _ := os.Stat(filepath.Dir(path))
-	if parent.Mode().Perm() != 0o700 {
-		t.Fatalf("config dir mode = %v, want 0700", parent.Mode().Perm())
-	}
+	assertSavedConfigPermissions(t, path)
 	got, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -828,13 +818,14 @@ func TestSaveAcceptsMultipleExtensionIDs(t *testing.T) {
 }
 
 func TestLibrarySourceValidation(t *testing.T) {
+	absolute := filepath.Join(t.TempDir(), "owned.bib")
 	valid := func() Config {
 		cfg := Default()
 		cfg.AccessMode = ModeConservative
 		cfg.Library.Sources = []LibrarySource{{
 			Name:   "owned-pdfs",
 			Kind:   LibraryKindFile,
-			Path:   "/tmp/owned.bib",
+			Path:   absolute,
 			Format: "bibtex",
 			Claim:  LibraryClaimPDFPresent,
 		}}
@@ -846,7 +837,7 @@ func TestLibrarySourceValidation(t *testing.T) {
 		tooMany[i] = LibrarySource{
 			Name:  "source-" + strconv.Itoa(i),
 			Kind:  LibraryKindFile,
-			Path:  "/tmp/owned.bib",
+			Path:  absolute,
 			Claim: LibraryClaimPDFPresent,
 		}
 	}

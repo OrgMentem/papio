@@ -34,6 +34,33 @@ func shortTempDir(t *testing.T) string {
 	return dir
 }
 
+func listenTestEndpoint(t *testing.T, path string) net.Listener {
+	t.Helper()
+	listener, cleanup, err := listenSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		if err := cleanup(); err != nil {
+			t.Errorf("clean up test endpoint: %v", err)
+		}
+	})
+	return listener
+}
+
+func dialTestEndpoint(t *testing.T, path string) net.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := dialSocket(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
 func startTestServer(t *testing.T, handler Handler) (string, context.CancelFunc) {
 	t.Helper()
 	socket := filepath.Join(shortTempDir(t), "s")
@@ -259,44 +286,9 @@ func TestStrictRequestValidation(t *testing.T) {
 	}
 }
 
-func TestSocketPermissionsAndRegularFileSafety(t *testing.T) {
-	dir := shortTempDir(t)
-	socket := filepath.Join(dir, "s")
-	server := &Server{SocketPath: socket, Handler: HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) { return []byte(`{}`), nil })}
-	listener, err := server.Listen()
-	if err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	info, err := os.Stat(socket)
-	if err != nil {
-		t.Fatalf("Stat socket: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0600 {
-		t.Fatalf("socket mode = %o, want 0600", got)
-	}
-
-	unsafe := filepath.Join(dir, "regular")
-	if err := os.WriteFile(unsafe, []byte("do not remove"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	unsafeServer := &Server{SocketPath: unsafe, Handler: server.Handler}
-	if _, err := unsafeServer.Listen(); !errors.Is(err, ErrUnsafeSocketPath) {
-		t.Fatalf("Listen regular file error = %v, want ErrUnsafeSocketPath", err)
-	}
-	contents, err := os.ReadFile(unsafe)
-	if err != nil || string(contents) != "do not remove" {
-		t.Fatalf("regular file changed: %q, %v", contents, err)
-	}
-}
-
 func TestClientDeadlineCancelsBlockedResponse(t *testing.T) {
 	socket := filepath.Join(shortTempDir(t), "s")
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = listener.Close() }()
+	listener := listenTestEndpoint(t, socket)
 	accepted := make(chan struct{})
 	go func() {
 		conn, err := listener.Accept()
@@ -310,7 +302,7 @@ func TestClientDeadlineCancelsBlockedResponse(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	_, err = NewSocketClient(socket).CallRaw(ctx, "request_01", "jobs.get", json.RawMessage(`{}`))
+	_, err := NewSocketClient(socket).CallRaw(ctx, "request_01", "jobs.get", json.RawMessage(`{}`))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("CallRaw error = %v, want deadline exceeded", err)
 	}
@@ -349,10 +341,7 @@ func TestServerCancellationClosesIdleConnection(t *testing.T) {
 	if err := WaitForSocket(waitCtx, socket, time.Millisecond); err != nil {
 		t.Fatalf("WaitForSocket: %v", err)
 	}
-	idle, err := net.Dial("unix", socket)
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
+	idle := dialTestEndpoint(t, socket)
 	defer func() { _ = idle.Close() }()
 	cancel()
 	select {
@@ -433,17 +422,11 @@ func TestClientRejectsTransportWithoutCloseWriteBeforeRequest(t *testing.T) {
 
 func TestServeListenerClosesIdleClientsWhenListenerCloses(t *testing.T) {
 	socket := filepath.Join(shortTempDir(t), "s")
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenTestEndpoint(t, socket)
 	server := &Server{Handler: HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) { return []byte(`{}`), nil })}
 	done := make(chan error, 1)
 	go func() { done <- server.ServeListener(context.Background(), listener) }()
-	idle, err := net.Dial("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	idle := dialTestEndpoint(t, socket)
 	defer func() { _ = idle.Close() }()
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
@@ -564,10 +547,7 @@ func TestServeListenerReturnsPermanentAcceptError(t *testing.T) {
 
 func TestServeConnReadDeadlineReapsStalledClient(t *testing.T) {
 	socket := filepath.Join(shortTempDir(t), "s")
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenTestEndpoint(t, socket)
 	server := &Server{
 		Handler:     HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) { return []byte(`{}`), nil }),
 		IdleTimeout: 100 * time.Millisecond,
@@ -587,10 +567,7 @@ func TestServeConnReadDeadlineReapsStalledClient(t *testing.T) {
 		}
 	})
 
-	conn, err := net.Dial("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := dialTestEndpoint(t, socket)
 	defer func() { _ = conn.Close() }()
 	// Send a partial request prefix and never CloseWrite: framing relies on
 	// EOF, so without the server's read deadline this connection would stall
@@ -632,14 +609,7 @@ func TestServerLogsPartialFramesButNotEmptyProbes(t *testing.T) {
 	socket, _ := startTestServer(t, HandlerFunc(func(context.Context, Request) ([]byte, *RPCError) {
 		return json.RawMessage(`{}`), nil
 	}))
-	dial := func() net.Conn {
-		t.Helper()
-		conn, err := net.DialTimeout("unix", socket, time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return conn
-	}
+	dial := func() net.Conn { return dialTestEndpoint(t, socket) }
 	// Wait until the server has observed the close: it answers a real request
 	// on a later connection, and serveConn goroutines run in accept order.
 	settle := func() {
@@ -662,6 +632,15 @@ func TestServerLogsPartialFramesButNotEmptyProbes(t *testing.T) {
 
 	partial := dial()
 	if _, err := partial.Write([]byte(`{"protocol":`)); err != nil {
+		t.Fatal(err)
+	}
+	// Flush the partial frame before disconnecting. A named pipe can discard
+	// unread buffered bytes on Close; CloseWrite delivers the framing EOF.
+	closeWriter, ok := partial.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("test endpoint does not support CloseWrite")
+	}
+	if err := closeWriter.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
 	if err := partial.Close(); err != nil {

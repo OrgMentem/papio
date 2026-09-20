@@ -16,6 +16,7 @@ func isolatedHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir uses this on Windows.
 	t.Setenv("XDG_DOWNLOAD_DIR", "")
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	return home
@@ -184,14 +185,18 @@ func TestXDGDownloadDirIgnoresARelativeEnvironmentOverride(t *testing.T) {
 }
 
 func TestXDGDownloadDirFrom(t *testing.T) {
-	const home = "/home/reader"
+	home := t.TempDir()
+	absolute := filepath.Join(t.TempDir(), "bulk", "dl")
+	// XDG uses slash-separated strings; the fixture must still name an
+	// absolute path on the host whose filepath implementation parses it.
+	absoluteValue := filepath.ToSlash(absolute)
 	for _, test := range []struct {
 		name, body, want string
 	}{
 		{"home relative", `XDG_DOWNLOAD_DIR="$HOME/Downloads"`, filepath.Join(home, "Downloads")},
 		{"localized", `XDG_DOWNLOAD_DIR="$HOME/Téléchargements"`, filepath.Join(home, "Téléchargements")},
-		{"absolute", `XDG_DOWNLOAD_DIR="/mnt/bulk/dl"`, filepath.FromSlash("/mnt/bulk/dl")},
-		{"unquoted absolute", `XDG_DOWNLOAD_DIR=/mnt/bulk/dl`, filepath.FromSlash("/mnt/bulk/dl")},
+		{"absolute", `XDG_DOWNLOAD_DIR="` + absoluteValue + `"`, absolute},
+		{"unquoted absolute", "XDG_DOWNLOAD_DIR=" + absoluteValue, absolute},
 		{"exported", `export XDG_DOWNLOAD_DIR="$HOME/dl"`, filepath.Join(home, "dl")},
 		{"commented out", `#XDG_DOWNLOAD_DIR="$HOME/Downloads"`, ""},
 		{"other keys only", "XDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_MUSIC_DIR=\"$HOME/Music\"", ""},

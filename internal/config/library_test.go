@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -37,10 +39,9 @@ claim = "record_present"
 `
 
 func TestLoadNormalizesLibrarySourcePaths(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := isolatedHome(t)
 	absolute := filepath.Join(t.TempDir(), "reading.ris")
-	body := strings.Replace(validLibraryConfig, "/tmp/reading.ris", absolute, 1)
+	body := strings.Replace(validLibraryConfig, `path = "/tmp/reading.ris"`, libraryPathTOML(t, absolute), 1)
 
 	cfg, err := Load(writeConfig(t, body))
 	if err != nil {
@@ -61,6 +62,8 @@ func TestLoadNormalizesLibrarySourcePaths(t *testing.T) {
 }
 
 func TestLibrarySourceValidationIsFailClosed(t *testing.T) {
+	absolute := filepath.Join(t.TempDir(), "a.bib")
+	reading := filepath.Join(t.TempDir(), "reading.ris")
 	cases := []struct {
 		name string
 		body string
@@ -121,7 +124,9 @@ func TestLibrarySourceValidationIsFailClosed(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(writeConfig(t, tc.body))
+			body := strings.ReplaceAll(tc.body, `path = "/tmp/a.bib"`, libraryPathTOML(t, absolute))
+			body = strings.ReplaceAll(body, `path = "/tmp/reading.ris"`, libraryPathTOML(t, reading))
+			_, err := Load(writeConfig(t, body))
 			if err == nil {
 				t.Fatal("expected validation to reject this configuration")
 			}
@@ -130,6 +135,18 @@ func TestLibrarySourceValidationIsFailClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// libraryPathTOML preserves native backslashes as data, not TOML escapes.
+func libraryPathTOML(t *testing.T, path string) string {
+	t.Helper()
+	data, err := toml.Marshal(struct {
+		Path string `toml:"path"`
+	}{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func TestLibrarySourceCountIsBounded(t *testing.T) {
