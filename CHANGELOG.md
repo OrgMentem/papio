@@ -292,6 +292,11 @@ execution records kept during the initial build.
 
 ### Fixed
 
+- **Adapter repair proposals prefer stable PDF routes over page position.**
+  A rendered control’s class and bounded PDF path segment can survive layout
+  changes without embedding a document ID. Proposals still pass through the
+  production planner and cannot replace independent access or identity checks.
+
 - **Identity review distinguishes ambiguous DOI evidence from a definite
   mismatch.** A PDF with multiple front-matter DOIs, such as a book DOI and a
   chapter DOI, now asks the operator to check which identifies the requested

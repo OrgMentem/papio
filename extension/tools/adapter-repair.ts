@@ -179,7 +179,28 @@ function selectorsFor(node: Element): RankedSelector[] {
   result.push({ score: 60, selector: stablePath(node), node });
 
   const classes = Array.from(node.classList).filter((value) => value !== "" && !value.includes("?") && !DOCUMENT_SCOPED_VALUE.test(value));
+  // Captured PDF routes can identify a control without pinning its place in
+  // the layout or its document ID. Keep slash boundaries, ignore filenames
+  // and query values, and retain the rendered control's class. A bare class
+  // can also name a preview or a sibling format on the same page.
+  let pdfRouteSegments: string[] = [];
+  if (tag === "a") {
+    try {
+      const path = new URL(node.getAttribute("href") ?? "", "https://fixture.local").pathname;
+      pdfRouteSegments = [...new Set(path.split("/").slice(1, -1).filter(segment =>
+        segment.length <= 40 && /^[a-z_-]*pdf[a-z_-]*$/i.test(segment) && !DOCUMENT_SCOPED_VALUE.test(segment)))];
+    } catch {
+      // An invalid href cannot supply a route candidate.
+    }
+  }
   for (const className of classes.slice(0, 4)) {
+    for (const segment of pdfRouteSegments) {
+      result.push({
+        score: 74,
+        selector: `${tag}.${cssIdentifier(className)}[href*='/${cssString(segment)}/']`,
+        node,
+      });
+    }
     result.push({
       score: Math.max(10, 42 - Math.max(0, classes.length - 1) * 6),
       selector: `${tag}.${cssIdentifier(className)}`,

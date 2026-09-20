@@ -37,7 +37,9 @@ The tool checks each proposal through the production planner before limiting
 the results. It excludes redacted identifiers from selectors. A PDF-control
 proposal cannot replace a separate access or identity check and unlock a
 source patch. Article proposals require a PDF-specific affordance and rank
-explicit PDF downloads ahead of viewer tabs. Generic full-text links and
+explicit PDF downloads ahead of viewer tabs. Stable control classes combined
+with bounded PDF path segments rank above positional selectors; document IDs,
+filenames, and query values do not supply those segments. Generic full-text links and
 citation exports cannot qualify on their own. A complete plan proves neither
 entitlement nor PDF bytes.
 Review the access checks and the live file before applying a proposal.

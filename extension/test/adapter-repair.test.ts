@@ -149,6 +149,24 @@ test("an article capture without a PDF affordance has no candidates", () => {
   expect(result.candidates).toEqual([]);
 });
 
+test("PDF route selectors survive layout changes and exclude sibling previews", () => {
+  // Reduced from the Oxford chapter capture that ranked a six-level
+  // positional selector above the rendered PDF control.
+  const html = `<meta name="citation_doi" content="10.1000/repair">
+    <div><ul><li><a class="al-link pdf article-pdfLink" href="/chapter/123456789/chapter-ag-pdf/987654321/TOKEN.ag.pdf">PDF</a></li></ul></div>`;
+  const spec: AdapterSpec = { ...REPAIR_SPEC, download: { ...REPAIR_SPEC.download!, method: "href" } };
+  const top = synthesizeAdapterRepair(html, spec, "drift", "article", 1).candidates[0]!;
+  expect(top.plan_complete).toBe(true);
+  expect(top.selector).not.toContain("nth-of-type");
+  expect(top.selector).toContain("/chapter-ag-pdf/");
+  expect(top.selector).not.toContain("TOKEN");
+  expect(top.selector).not.toContain("123456789");
+
+  const changed = parseHTML(html.replace("<li>", `<li><a class="al-link pdf article-pdfLink" href="/preview.pdf">PDF preview</a></li><li>`));
+  expect(changed.querySelectorAll(top.selector)).toHaveLength(1);
+  expect(changed.querySelector(top.selector)?.getAttribute("href")).toContain("/chapter-ag-pdf/");
+});
+
 test("query-string values never become selector candidates", () => {
   const html =
     "<html><head><meta name='citation_doi' content='10.1000/query'></head><body>" +
