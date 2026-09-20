@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"papio/internal/app"
+	"papio/internal/artifact"
 	"papio/internal/batch"
 	"papio/internal/captures"
 	"papio/internal/config"
@@ -6571,6 +6572,11 @@ func (b *Bridge) weighArtifact(ctx context.Context, jobID, filename string) (*ar
 	if err != nil {
 		return nil, err
 	}
+	// Completed adoption can bypass the app's validation path, so enforce
+	// its regular-file confinement before weighing replayed bytes too.
+	if err := artifact.ConfineRegularFile(filepath.Dir(full), full); err != nil {
+		return nil, err
+	}
 	digest, err := fileDigest(full)
 	if err != nil {
 		return nil, err
@@ -6794,6 +6800,9 @@ func (b *Bridge) ingestAdoptedFile(
 	if err != nil {
 		return 0, err
 	}
+	if candidateID, err := b.completedAdoption(ctx, jobID, filename, fence, provenance, producer); err != nil || candidateID != 0 {
+		return candidateID, err
+	}
 	if err := b.persistArtifactCorrelation(ctx, jobID, filename, fence.digest, producer); err != nil {
 		return 0, err
 	}
@@ -6804,6 +6813,12 @@ func (b *Bridge) ingestAdoptedFile(
 		candidateID, err = b.adopt(ctx, jobID, filename)
 	}
 	if err != nil {
+		// The sweep can finish between the first ready check and the app's
+		// state/lease check. Re-read durable evidence instead of deferring a
+		// completion whose exact bytes have now been accepted.
+		if recoveredID, recoveryErr := b.completedAdoption(ctx, jobID, filename, fence, provenance, producer); recoveryErr != nil || recoveredID != 0 {
+			return recoveredID, recoveryErr
+		}
 		return candidateID, err
 	}
 	if commitErr := b.commitArtifact(ctx, jobID, filename, fence, producer); commitErr != nil {
