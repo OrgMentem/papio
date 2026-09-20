@@ -112,6 +112,13 @@ for the full pre-split extension history.
   stops automatic resolver checks.
 
 ### Fixed
+- **ScienceDirect recognizes its captured access-bar sign-in layout.** Paired
+  purchase and institutional-access controls now offer sign-in guidance instead
+  of an adapter-drift failure. PDF controls marked disabled are refused, including
+  when they become disabled after planning. The signed-viewer download boundary
+  is unchanged; this does not establish unattended ScienceDirect acquisition.
+- **IOS Press downloads retain the normal background-tab behavior.** The adapter
+  does not require bringing its page to the foreground.
 - **Known adapter failures retain repair evidence under their real provider
   names.** The capture registry now covers every packaged adapter, including
   ScienceDirect, while preserving historical aliases. A regression checks the

@@ -8179,6 +8179,45 @@ test("Firefox keeps click adapters assisted and ignores their manual job-tab dow
   expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
 });
 
+// The ScienceDirect click executor must recheck enabled state after planning.
+// Run the real final effect on the retained DOM; do not fake its result.
+for (const capture of ["success", "subscription", "open-access"]) {
+  for (const disabled of ["aria-disabled", "disabled"] as const) {
+    test(`ScienceDirect disabled-after-plan click refusal: ${capture}, ${disabled}`, async () => {
+      const spec = adapters.find((adapter) => adapter.id === "sciencedirect")!;
+      const html = readFileSync(new URL(`../fixtures/sciencedirect/${capture}.html`, import.meta.url), "utf8");
+      const origin = /^<!--\s*papio-fixture\b[^>]*?\borigin="([^"]+)"/.exec(html)?.[1];
+      if (origin === undefined) throw new Error("ScienceDirect capture has no origin");
+      const page = new Window({ url: origin });
+      page.document.write(html);
+      const doc = page.document as unknown as Document;
+      const control = doc.querySelector(spec.download!.selector)!;
+      const doi = doc.querySelector("meta[name='citation_doi']")!.getAttribute("content")!;
+      const plan = planExecution(doc, spec, { doi }, { access_mode: "delegated" });
+      expect("assisted" in plan).toBe(false);
+      if ("assisted" in plan) throw new Error(plan.assisted);
+      expect(plan.method).toBe("click");
+      control.setAttribute(disabled, disabled === "disabled" ? "" : "true");
+      let clicks = 0;
+      doc.addEventListener("click", (event) => { clicks++; event.preventDefault(); }, true);
+      const values = { document: doc, location: page.location, HTMLElement: page.HTMLElement };
+      const prior = new Map(Object.keys(values).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+      try {
+        for (const [key, value] of Object.entries(values)) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+        const result = await executePlannedPageEffect(plan, spec.download!);
+        expect(result).toEqual({ ok: false, why: expect.stringContaining("did not match exactly one element") });
+        expect(clicks).toBe(0);
+      } finally {
+        for (const [key, descriptor] of prior) {
+          if (descriptor === undefined) Reflect.deleteProperty(globalThis, key);
+          else Object.defineProperty(globalThis, key, descriptor);
+        }
+        await page.happyDOM.close();
+      }
+    });
+  }
+}
+
 test("Firefox ignores manual downloads from non-click adapters without exact ownership", async () => {
   const h = makeHarness(undefined, { firefox: true });
   const hrefAdapter: AdapterSpec = {

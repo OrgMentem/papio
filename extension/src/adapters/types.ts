@@ -242,7 +242,6 @@ export const adapters: AdapterSpec[] = [
     id: "iospress",
     version: "0.1.0",
     hosts: ["ebooks.iospress.nl"],
-    requiresVisible: true,
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     classify: [{
       kind: "article",
@@ -682,9 +681,9 @@ export const adapters: AdapterSpec[] = [
     // citation_pdf_url there; it renders the current article's View PDF anchor
     // under the access bar instead. The page also carries a visible OneTrust
     // cookie banner, which does not hide that structural control from the DOM.
-    // Activate that exact provider-owned control: Elsevier's documented flow
-    // opens the PDF in a new browser window, which papio's viewer-adoption path
-    // captures. Fetching the bare href directly redirects to Cookie Notice HTML.
+    // Activate that exact provider-owned control. The signed viewer can require
+    // manual Send PDF; a fresh full live href also returned non-PDF content
+    // through Chrome downloads on 2026-09-20. Do not re-fetch its signed URL.
     //
     // The 2026-09-19 login-return capture pairs Purchase PDF with an enabled
     // institutional RemoteAccessButton. The older no-entitlement fixture has
@@ -692,7 +691,7 @@ export const adapters: AdapterSpec[] = [
     // work. Treat that combination as login, not terminal no_entitlement.
     // Article stays first so an enabled PDF control still wins over a prompt.
     id: "sciencedirect",
-    version: "0.8.1",
+    version: "0.8.2",
     hosts: ["sciencedirect.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
@@ -764,8 +763,8 @@ export const adapters: AdapterSpec[] = [
         kind: "article",
         all: ["meta[name='citation_title']"],
         any: [
-          ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdf']",
-          ".content-details-actions > .content-actions > a.accessbar-utility-link[href*='/pdf']",
+          ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdf']:not([aria-disabled='true']):not([disabled])",
+          ".content-details-actions > .content-actions > a.accessbar-utility-link[href*='/pdf']:not([aria-disabled='true']):not([disabled])",
         ],
       },
       {
@@ -779,10 +778,20 @@ export const adapters: AdapterSpec[] = [
           ".access-options a.RemoteAccessButton[aria-disabled='false'][href^='https://auth.elsevier.com/ShibAuth/institutionLogin']",
         ],
       },
+      {
+        // The reduced observed capture keeps the paired access-bar layout.
+        // A body sign-in link must not complete this scoped login signal.
+        kind: "login",
+        all: [
+          "meta[name='citation_doi']",
+          ".accessbar > ul > li.PurchasePDF > a.accessbar-utility-link[aria-label='Purchase PDF'][href^='/getaccess/pii/'][href*='/purchase']:not([aria-disabled='true']):not([disabled])",
+          ".accessbar > ul > li.RemoteAccess > a.RemoteAccessButton[aria-disabled='false'][href^='https://auth.elsevier.com/ShibAuth/institutionLogin']:not([disabled])",
+        ],
+      },
     ],
     download: {
       selector:
-        ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdf'], .content-details-actions > .content-actions > a.accessbar-utility-link[href*='/pdf']",
+        ".accessbar .ViewPDF > a.accessbar-utility-link[href*='/pdf']:not([aria-disabled='true']):not([disabled]), .content-details-actions > .content-actions > a.accessbar-utility-link[href*='/pdf']:not([aria-disabled='true']):not([disabled])",
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "click",

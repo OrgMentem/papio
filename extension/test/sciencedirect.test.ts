@@ -4,9 +4,12 @@
 // a OneTrust cookie overlay remains rendered.
 
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+
+import { planExecution } from "../src/plan";
 
 import { adapters } from "../src/adapters/types";
-import { classifyFixture, fixtureExists, loadFixture } from "./harness";
+import { captureOrigin, classifyFixture, fixtureExists, fixturePath, loadFixture, parseHTML } from "./harness";
 
 const spec = adapters.find((adapter) => adapter.id === "sciencedirect");
 if (!spec) throw new Error("sciencedirect spec missing from registry");
@@ -46,3 +49,39 @@ test.skipIf(!fixtureExists("sciencedirect", "drift"))(
     expect(classifyFixture(fixture("drift"), spec, EXPECTED).kind).toBe("unknown");
   },
 );
+
+for (const capture of ["success", "subscription", "open-access"]) {
+  for (const state of ["enabled", "omitted-aria", "aria-disabled", "disabled-attribute", "missing", "duplicate", "wrong-work"] as const) {
+    test(`ScienceDirect click guard: ${capture}, ${state}`, () => {
+      const html = readFileSync(fixturePath("sciencedirect", capture), "utf8");
+      const origin = captureOrigin(html);
+      if (origin === null) throw new Error("ScienceDirect capture has no origin");
+      const doc = parseHTML(html, origin);
+      const control = doc.querySelector(spec.download!.selector)!;
+      expect(control.getAttribute("aria-disabled")).toBe("false");
+      expect(control.hasAttribute("disabled")).toBe(false);
+      const doi = doc.querySelector("meta[name='citation_doi']")!.getAttribute("content")!;
+      if (state === "omitted-aria") control.removeAttribute("aria-disabled");
+      if (state === "aria-disabled") control.setAttribute("aria-disabled", "true");
+      if (state === "disabled-attribute") control.setAttribute("disabled", "");
+      if (state === "missing") control.remove();
+      if (state === "duplicate") control.after(control.cloneNode(true));
+      const plan = planExecution(doc, spec, {
+        doi: state === "wrong-work" ? "10.1016/example-wrong-work" : doi,
+      }, { access_mode: "delegated" });
+      if (state === "enabled" || state === "omitted-aria") {
+        expect("assisted" in plan).toBe(false);
+        if ("assisted" in plan) throw new Error(plan.assisted);
+        expect(plan.verdict.kind).toBe("article");
+        expect(plan.method).toBe("click");
+        expect(plan.expected_work.doi?.normalized).toBe(doi);
+      } else {
+        if (state === "wrong-work") expect(plan.verdict.kind).toBe("wrong_work");
+        else if (state === "duplicate") expect("assisted" in plan).toBe(true);
+        else expect(plan.verdict.kind).toBe("unknown");
+        expect("assisted" in plan || plan.method === null).toBe(true);
+      }
+      expect(spec.requiresVisible).toBe(true);
+    });
+  }
+}

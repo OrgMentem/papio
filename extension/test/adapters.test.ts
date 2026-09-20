@@ -7,6 +7,7 @@
 
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { residualLeak } from "../src/capture";
 
 import {
   adapters,
@@ -1079,6 +1080,61 @@ test.skipIf(sciencedirectArticle === null)(
     expect(spec.download?.method).toBe("click");
   },
 );
+
+// Mandatory reduced capture: retain its observed provenance and neutralized
+// identity. It demonstrates a login layout, not entitlement or PDF acquisition.
+for (const state of ["paired", "missing-purchase", "body-link-decoy", "purchase-disabled", "purchase-disabled-attribute", "remote-disabled", "remote-disabled-attribute", "missing-doi", "mixed-layout", "query", "article-wins"] as const) {
+  test(`ScienceDirect captured accessbar login: ${state}`, () => {
+    const spec = adapters.find((adapter) => adapter.id === "sciencedirect")!;
+    const html = readFileSync(fixturePath("sciencedirect", "login-accessbar"), "utf8");
+    if (state === "paired") expect(residualLeak(html)).toBeNull();
+    const origin = captureOrigin(html);
+    if (origin === null) throw new Error("ScienceDirect capture has no origin");
+    const doc = parseHTML(html, origin);
+    const purchase = doc.querySelector(".accessbar > ul > li.PurchasePDF > a")!;
+    const remote = doc.querySelector(".accessbar > ul > li.RemoteAccess > a")!;
+    expect(doc.querySelectorAll("a.RemoteAccessButton")).toHaveLength(2);
+    expect(doc.querySelector(".access-options")).toBeNull();
+    if (state === "missing-purchase") purchase.remove();
+    if (state === "body-link-decoy") {
+      remote.remove();
+      expect(doc.querySelectorAll("a.RemoteAccessButton")).toHaveLength(1);
+    }
+    if (state === "purchase-disabled") purchase.setAttribute("aria-disabled", "true");
+    if (state === "purchase-disabled-attribute") purchase.setAttribute("disabled", "");
+    if (state === "remote-disabled") remote.setAttribute("aria-disabled", "true");
+    if (state === "remote-disabled-attribute") remote.setAttribute("disabled", "");
+    if (state === "missing-doi") doc.querySelector("meta[name='citation_doi']")!.remove();
+    if (state === "mixed-layout") {
+      const otherLayout = doc.createElement("div");
+      otherLayout.className = "access-options";
+      otherLayout.appendChild(remote);
+      doc.body.appendChild(otherLayout);
+    }
+    if (state === "query") purchase.setAttribute("href", purchase.getAttribute("href")! + "?test=1");
+    if (state === "article-wins") {
+      // Regression mutation from the already captured entitled layout. This
+      // coexistence case is synthetic and does not alter the observed fixture.
+      const entitled = loadFixture("sciencedirect", "open-access");
+      if (entitled === null) throw new Error("missing entitled ScienceDirect fixture");
+      const ownPDF = entitled.querySelector(".accessbar .ViewPDF")!.cloneNode(true) as Element;
+      ownPDF.querySelector("a")!.setAttribute("href", "/science/article/pii/S0000000000000000/pdf");
+      doc.querySelector(".accessbar > ul")!.appendChild(ownPDF);
+    }
+    const plan = planExecution(doc, spec, { doi: "10.1016/example" }, { access_mode: "delegated" });
+    expect("assisted" in plan).toBe(false);
+    if ("assisted" in plan) throw new Error(plan.assisted);
+    expect(plan.verdict.kind).toBe(state === "article-wins" ? "article" : state === "paired" || state === "query" ? "login" : "unknown");
+    expect(plan.method).toBe(state === "article-wins" ? "click" : null);
+    if (state !== "article-wins") {
+      expect(plan.target_ref).toBeNull();
+      expect(plan.effect_graph.primary_target).toBeNull();
+      expect(plan.required_consequence).toBe("none");
+    }
+    expect(spec.federatedLogin).toBeUndefined();
+    expect(spec.accountIdParam).toBeUndefined();
+  });
+}
 
 const sciencedirectPaywall = loadFixture("sciencedirect", "no-entitlement");
 
