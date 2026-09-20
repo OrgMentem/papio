@@ -265,6 +265,33 @@ test("MDPI direct PDF routes require its journal path on the exact host", () => 
   ]) expect(isPDFURL(url)).toBe(false);
 });
 
+test("PLOS ONE printable article files are PDFs, but supplements and ambiguous queries are not", () => {
+  const file = "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0000308&type=printable";
+  for (const url of [file, file.replace("id=10.1371/journal.pone.0000308&type=printable", "type=printable&id=10.1371%2Fjournal.pone.0000308")]) {
+    expect(isPDFURL(url)).toBe(true);
+    expect(classifyPage(url)).toEqual({ kind: "pdf" });
+  }
+  for (const refused of [
+    file.replace("https:", "http:"),
+    file.replace("journals.plos.org", "journals.plos.org.attacker.example"),
+    file.replace("journals.plos.org", "www.plos.org"),
+    file.replace("journals.plos.org", "user:pass@journals.plos.org"),
+    file.replace("journals.plos.org", "journals.plos.org:8443"),
+    file.replace("/article/file", "/article"),
+    file.replace("/article/file", "/article/file/extra"),
+    file.replace("/plosone/", "/plosbiology/"),
+    file.replace("type=printable", "type=manuscript"),
+    file.replace("&type=printable", ""),
+    file.replace("0000308", "0000308.s001"),
+    file.replace("0000308", "0000308.t001"),
+    file.replace("10.1371/journal.pone", "10.1234/journal.pone"),
+    `${file}&id=10.1371/journal.pone.0000309`,
+    `${file}&type=printable`,
+    `${file}&download=1`,
+    `${file}#page=1`,
+  ]) expect(isPDFURL(refused)).toBe(false);
+});
+
 test("Europe PMC direct PDF routes require the exact host, path, and PMCID query", () => {
   const file = "https://europepmc.org/api/getPdf?pmcid=PMC8053968";
   expect(isPDFURL(file)).toBe(true);

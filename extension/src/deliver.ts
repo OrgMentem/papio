@@ -434,6 +434,18 @@ export function extractPageDOI(probe: PageDOIProbe): string | undefined {
  * exact and host-bound; HTML viewers that need endpoint conversion belong in
  * their declarative adapter's viewerRoutes contract instead. */
 function isKnownDirectPDFRoute(url: URL): boolean {
+  // Verified in Chrome: PLOS ONE serves the article PDF at this endpoint,
+  // without a .pdf suffix. Component IDs name figures/tables/supplements;
+  // only the full article's printable route belongs in navigation adoption.
+  if (url.hostname === "journals.plos.org") {
+    const params = [...url.searchParams];
+    return url.protocol === "https:" &&
+      url.username === "" && url.password === "" && url.port === "" &&
+      url.pathname === "/plosone/article/file" && url.hash === "" &&
+      params.length === 2 &&
+      url.searchParams.get("type") === "printable" &&
+      /^10\.1371\/journal\.pone\.[0-9]{7}$/.test(url.searchParams.get("id") ?? "");
+  }
   if (
     url.protocol === "https:" &&
     (url.hostname === "mdpi.com" || url.hostname === "www.mdpi.com") &&

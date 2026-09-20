@@ -103,6 +103,13 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **PLOS ONE printable PDFs download through the browser handoff.** The
+  extension recognizes the exact article-file route, which has no `.pdf`
+  suffix, instead of reporting a missing HTML adapter. Supplement IDs,
+  other hosts, and ambiguous queries remain excluded. A fresh Chrome probe
+  downloaded, adopted, and validated the correct five-page article without
+  an Open action or PDF click during the probe.
+
 - **A different paper is reported as the wrong work, instead of adapter drift.**
   When a page's declared DOI or title disagrees with the request, papio stops
   without attempting its PDF or terms controls and offers the existing

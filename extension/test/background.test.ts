@@ -8847,6 +8847,28 @@ test("a tracked Europe PMC direct route downloads once without entering the prov
   expect(scriptCalls).toBe(0);
 });
 
+test("a tracked PLOS ONE printable file downloads once without entering the HTML planner", async () => {
+  const h = makeHarness();
+  let scriptCalls = 0;
+  h.deps.scripting.executeScript = async () => {
+    scriptCalls++;
+    return [];
+  };
+  await h.bridge.start();
+  const pdfURL = "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0000308&type=printable";
+  await h.port.inbound(jobOfferForHosts("job_plos_printable", ["journals.plos.org"], pdfURL));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  await h.tabs.completeNavigation(tabID, pdfURL);
+  await h.tabs.completeNavigation(tabID, pdfURL);
+  expect(h.downloads.started).toEqual([{
+    url: pdfURL,
+    filename: "papio/job_plos_printable/paper.pdf",
+    conflictAction: "uniquify",
+    saveAs: false,
+  }]);
+  expect(scriptCalls).toBe(0);
+});
+
 test("an off-provider Europe PMC direct route keeps the tracked job correlation", async () => {
   const h = makeHarness();
   await h.bridge.start();
