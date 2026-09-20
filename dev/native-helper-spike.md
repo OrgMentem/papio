@@ -133,9 +133,8 @@ requirement: no unannounced focus/input fallback, and no hidden keyboard-focus
 transfer presented as background operation. The precise browser/helper split
 and any native attention lease need the next live evidence.
 
-The first publisher acceptance still requires a fresh isolated job, a downloaded
-and adopted PDF, identity validation, and first-page/page-count inspection. The
-subsequent repaired declarative route must independently produce that result.
+The IOS Press acceptance below now proves one publisher download and adoption.
+The subsequent repaired declarative route must independently produce that result.
 
 ## Background page follow-up
 
@@ -281,3 +280,99 @@ cleaned up. Private evidence is in
 This is a successful fixture-to-Papio adoption test. Real publisher fallback,
 signed viewer delivery, cross-platform native coverage and the independent
 declarative repair canary remain separate acceptance work.
+
+### Real provider and recovery results
+
+`extension/tools/provider-spike-run.ts` now runs the shared decision loop against
+one explicit HTTPS article and DOI. The extension supplies observed controls and
+executes the selected existing element through `chrome.scripting`. It uses no
+CDP, debugger, WebDriver, global input or browser-generated PDF URL. The native
+helper only monitors foreground app/window and pointer changes during these runs.
+The provider observer sends the article citation and visible control labels to
+Jev; real URLs, form values, account/navigation areas and execution fingerprints
+stay local. Local fingerprints bind the decision to the current document,
+element identity, surrounding form and hidden values.
+
+The first successful provider trial used an assisted job to prevent the packaged
+adapter from downloading first. Jev selected IOS Press's JavaScript-backed PDF
+control. Chrome download 411 landed in the job directory; Papio adopted the file,
+passed identity validation and reached `ready`. The stored PDF was 363,923 bytes,
+had five pages and matched the independently checked title, DOI and first page.
+Two Jev 1.13.0 calls used 1,705 input and 109 output tokens; elapsed time through
+download was 2.85 seconds. A separate controlled-fault recovery repeated the
+result in 2.81 seconds after the daemon recorded the broken adapter's drift.
+Both monitors had 113 samples, no missing channels and no app/window/pointer
+changes. Startup gaps preceded acquisition; polling does not establish continuous
+keyboard focus or provider invisibility.
+
+The first provider attempt exposed a harness error: after a correct click, Jev
+classified the temporarily disabled button as blocked while Chrome was starting
+the download. Closing the managed tab cancelled the job. That failed job remains
+preserved. The shared loop now checks correlated transfer progress before another
+decision and before accepting a blocked result. The controller retains a managed
+tab until the daemon retires its binding. No model opinion overrides real download
+completion; adoption remains a separate daemon check.
+
+For an already-recorded drift, Papio has deliberately closed the failed tab and
+retained an inert manual-download correlation window. The runner can open its own
+background article tab against that existing record and validate the live DOI.
+It never creates or edits an ActiveJob, offer, permit or daemon binding. This is
+an explicitly authorized developer experiment, not a shipped fallback scheduler
+or a reinterpretation of an assisted job as delegated authority.
+
+Run with a fresh private directory, isolated job/configuration, existing provider
+host access and the passive monitor helper:
+
+```sh
+bun run extension/tools/provider-spike-run.ts \
+  --run-dir dev/scratch/provider-run-example \
+  --extension-id YOUR_UNPACKED_EXTENSION_ID \
+  --job-id YOUR_ISOLATED_JOB_ID \
+  --entry-url HTTPS_ARTICLE_URL --doi ARTICLE_DOI \
+  --adoption-root YOUR_BROWSER_DOWNLOADS_PAPIO_DIRECTORY \
+  --monitor-helper dev/scratch/native-spike-swift-build/debug/papio-native-spike
+```
+
+Open the printed controller URL, return to the idle foreground app, and POST to
+its nonce-scoped `startURL`. For controlled recovery, `--drift-evidence` accepts a
+private `jobs show --json` receipt naming that parked job and its daemon-recorded
+`ui_changed` outcome. Verify `ready`, the stored PDF and interventions separately.
+A fresh job in an existing store may reuse an artifact cache: the declarative
+canary needs a new empty store, with earlier stores preserved. Close owned
+controller tabs and remove their generated bundle directories after each run.
+
+Private source captures, model receipts, browser events, failed attempts and
+artifact checks are in `dev/scratch/provider-spike-2026-09-20/`. These results
+cover one provider's POST-form mechanism. Signed resident-viewer delivery and
+Windows/Linux acceptance remain separate work.
+
+### Controlled repair canary
+
+A separate checkout deliberately replaced the IOS Press control's class with an
+absent one. The live adapter failed, and the daemon retained a sanitized drift
+capture correlated with its own `ui_changed` outcome. Jev then recovered that
+same parked job through the retained manual-download window, producing Chrome
+download 412 and a validated `ready` artifact. No stored state was erased.
+
+The repair generator initially proposed the passive form container. Ranking now
+uses interactive affordances and avoids numeric article IDs. Its next candidate
+selected the actual control but dropped surrounding constraints; applying it in
+the isolated checkout failed five existing IOS Press adverse-case tests. That
+candidate was reverted. The corrected generator replaces an obsolete positive
+leaf class while preserving ancestor scope, form route/method, ID prefixes and
+negative/disabled guards. It leaves unsupported compound transformations blocked
+with an explanation rather than emitting a broader executable repair.
+
+`papio adapter repair` regenerated an independently evidenced `0.1.1` proposal.
+The applied patch passed the isolated full suite (1,757 tests, one skip), typecheck
+and both builds. After a verified browser reload, an empty canary store acquired
+the article through the ordinary declarative adapter: Chrome download 413,
+363,923 bytes, five pages, matching SHA-256 and first page, identity validation,
+and `ready` 5.19 seconds after explicit Open. There were no model calls or manual
+PDF clicks. An earlier cache-only result was excluded from browser acceptance.
+
+This establishes the controlled failure → recovery → proposal → rejection and
+correction → fresh declarative success cycle. A developer orchestrated the stages;
+automatic fallback enrollment, trace ingestion and repair promotion are not yet
+production features. The injected fault and experimental adapter revision stay
+in the isolated checkout; the normal IOS Press adapter did not need changing.

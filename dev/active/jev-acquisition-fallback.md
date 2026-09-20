@@ -21,7 +21,20 @@ public 15-page paper through the loopback fixture, steered it to its job directo
 and reached `ready` with PDF identity validation passing. Three Jev decisions took
 3.20 seconds through download; 130 monitor samples showed no app/window/pointer
 changes or missing channels. This proves fixture adoption through the normal
-pipeline. Publisher acceptance and repair learning remain unproved.
+pipeline. A subsequent IOS Press trial acquired a real five-page article in
+2.85 seconds through download, with two Jev decisions and no manual PDF click.
+Chrome steered the 363,923-byte file into its fresh isolated job directory;
+Papio adopted it, validated identity and reached `ready`. The first page and
+page count were checked. Its 113 monitor samples recorded no app/window/pointer
+changes or missing channels. This is one provider mechanism, not a cohort result.
+A controlled selector fault then completed the full development repair cycle:
+daemon-correlated drift capture → Jev recovery → validated PDF → generated source
+repair → tests/build/reload → a fresh declarative canary. That canary downloaded
+the same correct PDF and reached `ready` 5.19 seconds after explicit Open, with no
+model calls and no artifact cache. The first generated candidate failed five
+adverse-case tests and was reverted; the corrected generator preserves the
+working ancestor, form and disabled-control guards. This proves the controlled
+workflow, not autonomous production learning or recovery from natural site drift.
 Private receipts include the failed filename check. Owned tabs/servers and
 generated bundles were cleaned up; temporary activeTab grants ended on closure.
 
@@ -31,9 +44,11 @@ extension now recovers inert choices from the daemon's current actions. It can d
 so when Send PDF is requested, without requiring an inbox visit. The live test
 opened the inbox during setup; regression tests cover the direct cold Send PDF
 path. Recovered choices carry no provider-driving authority and require a fresh
-PDF document binding. A late completion notification still emits a misleading
-`adoption_deferred` event after the job reaches `ready`; correct that duplicate
-completion diagnostic before expanding the next acceptance cohort.
+PDF document binding. Late completion notifications now recover an already-ready
+job only when confined landing bytes, the verified stored artifact and accepted
+browser candidate agree. Supplied producer claims require prior durable evidence.
+The live IOS Press run completed without the earlier misleading
+`adoption_deferred` event.
 
 The first supervised native-browser trial downloaded three correct papers.
 Two fresh isolated jobs adopted and validated their files; one CDN-viewer

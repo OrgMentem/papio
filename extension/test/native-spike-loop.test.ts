@@ -73,3 +73,19 @@ test("foreground-owned mode permits its own Save dialog, but never unrelated foc
     expect(await runNativeLoop(h.driver, h.local, { ...h.options, allowOwnedFocusChanges: true })).toMatchObject({ status: owned ? "downloaded" : "interference" });
   }
 });
+
+test("download beginning during blocked inference completes without another model decision or effect", async () => {
+  const h = harness(); let started = false, polls = 0;
+  h.driver.artifact = async () => started && polls >= 3 ? { path: "/landed.pdf", sha256: "verified", bytes: 100 } : null;
+  h.driver.pendingArtifact = async () => started && ++polls <= 3;
+  h.local.decide = async observation => { started = true; return { choice: "BLOCKED", observationHash: observationHash(observation) }; };
+  expect(await runNativeLoop(h.driver, h.local, h.options)).toMatchObject({ status: "downloaded", decisions: 1 });
+  expect(h.effects()).toBe(0);
+});
+
+test("a stalled correlated download remains cancellable without spending model calls", async () => {
+  const h = harness(); let polls = 0;
+  h.driver.pendingArtifact = async () => { if (++polls === 3) h.controller.abort(); return true; };
+  await expect(runNativeLoop(h.driver, h.local, h.options)).rejects.toThrow();
+  expect(h.calls()).toBe(0);
+});

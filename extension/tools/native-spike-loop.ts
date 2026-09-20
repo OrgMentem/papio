@@ -18,6 +18,9 @@ export interface NativeDriver {
   // invocation. A matching hash alone cannot fence a changing native UI.
   act(choice: string, observationHash: string): Promise<{ status: "dispatched" | "stale" | "needs_foreground"; focusChanged: boolean; pointerMoved: boolean; focusWithinOwnedSurface?: boolean }>;
   artifact(): Promise<{ path: string; sha256: string; bytes: number } | null>;
+  // A correlated browser transfer owns progress until completion/interruption.
+  // A temporarily disabled page control is not evidence of acquisition failure.
+  pendingArtifact?(): Promise<boolean>;
 }
 export type NativeRunResult = { status: "downloaded"; artifact: NonNullable<Awaited<ReturnType<NativeDriver["artifact"]>>>; decisions: number }
   | { status: "blocked" | "needs_foreground" | "interference" | "no_progress" | "budget_exhausted"; decisions: number };
@@ -41,6 +44,7 @@ export async function runNativeLoop(driver: NativeDriver, backend: DecisionBacke
     options.signal.throwIfAborted();
     const artifact = await driver.artifact();
     if (artifact) return { status: "downloaded", artifact, decisions }; // Adoption is independently checked by the caller.
+    if (await driver.pendingArtifact?.()) { await options.wait(); continue; }
     const observed = await driver.observe(), hash = observationHash(observed);
     // Ephemeral handles/revisions must not masquerade as progress.
     const state = sha256(JSON.stringify({ page: observed.page, controls: observed.controls.map(({ role, label, disabled }) => ({ role, label, disabled: disabled === true })) }));
@@ -54,7 +58,14 @@ export async function runNativeLoop(driver: NativeDriver, backend: DecisionBacke
     options.signal.throwIfAborted();
     if (decision.observationHash !== hash) throw new Error("Decision belongs to another observation");
     options.record({ kind: "decision", observationHash: hash, choice: decision.choice, decisions });
-    if (decision.choice === "BLOCKED") return { status: "blocked", decisions };
+    if (decision.choice === "BLOCKED") {
+      // Downloads can begin during inference. Transport evidence outranks a
+      // model's interpretation of the now-disabled download button.
+      const completed = await driver.artifact();
+      if (completed) return { status: "downloaded", artifact: completed, decisions };
+      if (await driver.pendingArtifact?.()) continue;
+      return { status: "blocked", decisions };
+    }
     if (decision.choice === "WAIT") { waitingForChange = state; await options.wait(); continue; }
     const target = observed.controls.find(c => c.id === decision.choice && !c.disabled);
     if (!target) throw new Error("Decision selected an absent or disabled control");
