@@ -1365,7 +1365,7 @@ func manualDownloadGuidance(diagnosisReason string) string {
 		return "manual_download_rejected_file"
 	case job.DiagnosisReasonWrongWork:
 		return "manual_download_wrong_work"
-	case "", job.DiagnosisReasonLandingPageOnly, job.DiagnosisReasonInstitutionalHandoff:
+	case "", job.DiagnosisReasonLandingPageOnly, job.DiagnosisReasonInstitutionalHandoff, job.DiagnosisReasonNativeViewerDownload:
 		return "manual_download"
 	default:
 		return ""

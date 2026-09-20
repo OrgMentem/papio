@@ -7,6 +7,7 @@ import "strings"
 // Diagnosis reasons are stable, agent-facing classifications. They describe
 // the next human or operator step; they do not authorize that step.
 const (
+	DiagnosisReasonNativeViewerDownload   = "native_viewer_download_required"
 	DiagnosisReasonProviderAdapterMissing = "provider_adapter_missing"
 	DiagnosisReasonProviderAdapterDrift   = "provider_adapter_drift"
 	DiagnosisReasonAdoptedPDFInvalid      = "adopted_pdf_failed_validation"
@@ -32,6 +33,7 @@ const (
 // fails when a declared reason is missing here — do not hand-maintain it into
 // a list that silently covers less.
 var diagnosisReasons = map[string]bool{
+	DiagnosisReasonNativeViewerDownload:   true,
 	DiagnosisReasonProviderAdapterMissing: true,
 	DiagnosisReasonProviderAdapterDrift:   true,
 	DiagnosisReasonAdoptedPDFInvalid:      true,
@@ -221,6 +223,10 @@ func classifyAction(action HumanAction, outcome, providerDetail string) ActionDi
 	}
 	reason := ""
 	switch {
+	case outcome == "native_viewer_download_required":
+		reason = DiagnosisReasonNativeViewerDownload
+		result.Why = "the provider opened a PDF viewer whose download needs an explicit browser action"
+		result.Next = "in the PDF viewer, choose Send this PDF in papio, then use the viewer Download button; on Firefox, open the PDF in Chrome first"
 	case strings.Contains(text, "no adapter") || strings.Contains(text, "no source-controlled adapter"):
 		reason = DiagnosisReasonProviderAdapterMissing
 		result.Why = "no compiled provider adapter matched the page papio reached"

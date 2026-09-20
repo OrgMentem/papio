@@ -2799,6 +2799,7 @@
                 "enum": [
                   "no_entitlement",
                   "document_delivery_available",
+                  "native_viewer_download_required",
                   "wrong_work",
                   "ui_changed",
                   "rate_limited",

@@ -1366,6 +1366,7 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   expect(first?.payload["features"]).toEqual([
     "effect_permit_v1",
     "pdf_grab_v1",
+    "native_viewer_download_v1",
     "institutional_materialization_v1",
     "surface_presence_v1",
     "work_pulse_v1",
@@ -8252,6 +8253,52 @@ test("a cross-origin api download with a content-disposition rename steers into 
     );
   expect(complete?.payload["filename"]).toBe("retrieve.pdf");
 });
+
+for (const child of [false, true]) {
+  test(`native viewer manual task releases its drive without granting download authority: child=${child}`, async () => {
+    const jobID = "job_native_viewer_queue";
+    const h = makeHarness({ ...emptyStore(), activeJobs: [{
+      job_id: jobID, tab_id: 100, offered_at: 1_700_000_000_000,
+      expires_at: 1_800_000_000_000, status: "auth_pending",
+      provider_hosts: ["www.sciencedirect.com"], access_mode: "delegated",
+      download_initiated: true, adapter_id: "sciencedirect", expected: { doi: "10.1234/example" },
+    }] });
+    h.tabs.seed({ id: 100, url: OPENURL });
+    await h.bridge.start();
+    await h.port.onMessage.emit(helloAck({ daemon_version: CURRENT_DAEMON,
+      features: ["native_viewer_download_v1"] }));
+    const internals = h.bridge as unknown as { handoffDrives: Map<string, unknown> };
+    expect(internals.handoffDrives.has(jobID)).toBe(true);
+    h.tabs.nextId = 102;
+    await h.port.inbound(jobOffer("job_next_after_viewer", "https://next.example.edu/article"));
+    expect(h.backend.store.activeJobs.find(j => j.job_id === "job_next_after_viewer")?.tab_id).toBe(-1);
+    const viewerID = child ? 101 : 100;
+    if (child) h.tabs.seed({ id: viewerID, url: "about:blank", openerTabId: 100 });
+    await h.tabs.completeNavigation(viewerID, "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=secret");
+    for (let i = 0; i < 200; i++) await Promise.resolve();
+    expect(internals.handoffDrives.has(jobID)).toBe(false);
+    expect(h.frames().filter(f => f.type === "provider_outcome" && f.payload["outcome"] === "native_viewer_download_required")).toHaveLength(1);
+    expect(h.backend.store.activeJobs.find(j => j.job_id === jobID)).toMatchObject({ tab_id: -1, provider_hosts: [] });
+    expect(h.backend.store.activeJobs.find(j => j.job_id === jobID)?.access_mode).toBeUndefined();
+    expect(h.bridge.deliveryState()).toMatchObject({ state: "failed", job_id: jobID });
+    expect(h.tabs.removed).not.toContain(viewerID);
+    expect(h.downloads.started).toEqual([]);
+    expect(h.backend.store.activeJobs.find(j => j.job_id === "job_next_after_viewer")?.tab_id).toBeGreaterThanOrEqual(0);
+    // A browser download before Send PDF is not authorized by the notice.
+    const suggestions: unknown[] = [];
+    await h.downloads.onDeterminingFilename.emit({ id: 930, tabId: viewerID,
+      url: "https://www.sciencedirect.com/doi/pdf/10.1234/example", filename: "main.pdf", state: "in_progress" },
+      suggestion => suggestions.push(suggestion));
+    expect(suggestions).toEqual([]);
+    expect(migrateManagedState(h.backend.store).activeJobs.find(j => j.job_id === jobID)?.manual_delivery_required).toBe(true);
+    expect(JSON.stringify(h.frames())).not.toContain("secret");
+    const delivery = await h.bridge.startPDFDelivery({ tab_id: viewerID,
+      url: "https://pdf.sciencedirectassets.com/77/main.pdf", doi: "10.1234/example" });
+    expect(delivery).toMatchObject({ ok: true, state: "waiting_manual", job_id: jobID });
+    expect(h.backend.store.pendingDelivery?.page_identity?.tab_id).toBe(viewerID);
+    expect(h.downloads.started).toEqual([]);
+  });
+}
 
 for (const status of ["accepted", "auth_pending"] as const) {
   for (const child of [false, true]) {

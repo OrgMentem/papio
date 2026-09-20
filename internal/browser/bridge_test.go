@@ -5788,6 +5788,56 @@ func TestInstitutionalNoEntitlementRetiresItsSignInOccupancy(t *testing.T) {
 	}
 }
 
+func TestNativeViewerOutcomeRetiresOccupancyAndCreatesManualTask(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, materializationHello(t))
+	const prefix = "native-viewer-retire"
+	claim := seedSurfaceCloseClaim(t, b, jobs, prefix, "navigated")
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate = %+v, %v", candidate, err)
+	}
+	const authClaimID = "auth-" + prefix
+	if _, err := jobs.ReserveAuthenticationEntryLease(ctx, job.AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: authClaimID, LeaseID: "lease-" + prefix,
+		OwnerID: candidate.JobID, BrowserHolderGeneration: b.arbitration.generation(),
+		LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.SetAuthenticationEntryLeaseOwnerBinding(
+		ctx, authClaimID, candidate.JobID, b.arbitration.generation(), claim.BindingID, 99,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.outcome(ctx, candidate.JobID, "native-viewer-observed", &protocol.ProviderOutcomePayload{Outcome: "native_viewer_download_required"}); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{candidate.JobID})
+	if err != nil || len(actions) != 1 || actions[0].Kind != "manual_download" || !strings.Contains(actions[0].Detail, "Send this PDF") {
+		t.Fatalf("manual task = %+v, %v", actions, err)
+	}
+	row, err := jobs.Get(ctx, candidate.JobID)
+	if err != nil || row.State != job.StateAwaitingHuman || row.ArtifactSHA256 != "" {
+		t.Fatalf("manual task claimed success or left waiting state: %+v, %v", row, err)
+	}
+
+	retired, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil || retired == nil || retired.Phase != "abandoned" {
+		t.Fatalf("retired claim = %+v, %v; want abandoned", retired, err)
+	}
+	lease, found, err := jobs.GetAuthenticationEntryLease(ctx, authClaimID)
+	if err != nil || !found || lease == nil {
+		t.Fatalf("retired lease = %+v, found=%v, err=%v", lease, found, err)
+	}
+	if lease.State != job.AuthenticationEntryLeaseExpired ||
+		lease.OwnerBindingID != "" || lease.OwnerTabHint != nil {
+		t.Fatalf("retired lease = %+v; want expired with no owner surface", lease)
+	}
+}
+
 func TestRequeuedRouteNeverConvertsOAHandoffBackToInstitution(t *testing.T) {
 	const oaURL = "https://oa.example.org/articles/alternate-version.pdf"
 	b, jobs, _, _ := newBridge(t)
@@ -16586,4 +16636,59 @@ func TestDeliveryReconcileRoutineFailuresReturnStructuredResults(t *testing.T) {
 			t.Fatalf("unconfigured result = %+v, want structured configuration error", result)
 		}
 	})
+}
+
+func TestNativeViewerCapabilityKeepsOldPeersAndFeatureCap(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSync(t, b, hello())
+	original := slices.Clone(b.Features)
+	for _, role := range []string{sessionRoleHolder, sessionRolePending} {
+		for _, capable := range []bool{false, true} {
+			var peer []string
+			if capable {
+				peer = []string{nativeViewerDownloadFeature}
+			}
+			raw, err := b.helloAck(role, peer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := protocol.DecodeBrowserMessage(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			features := msg.Payload.(*protocol.HelloAckPayload).Features
+			if len(features) != 32 || slices.Contains(features, nativeViewerDownloadFeature) != capable || slices.Contains(features, triageSnapshotSchema2Feature) == capable || !slices.Contains(features, triageSnapshotSchema3Feature) {
+				t.Fatalf("role=%s capable=%t features=%v", role, capable, features)
+			}
+		}
+	}
+	if !slices.Equal(original, b.Features) {
+		t.Fatal("peer negotiation changed capabilities for other browsers")
+	}
+}
+
+func TestNativeViewerOutcomeRequiresNegotiation(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		t.Run(fmt.Sprint(capable), func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			id := park(t, jobs, "wr_native_negotiation", handoffWork())
+			runSync(t, b, hello())
+			if capable {
+				b.arbitration.holderSession().Features = append(b.arbitration.holderSession().Features, nativeViewerDownloadFeature)
+			}
+			frame := inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": "native_viewer_download_required"})
+			runSync(t, b, frame)
+			actions, err := jobs.ListOpenHumanActionsForJobs(t.Context(), []string{id})
+			if err != nil || len(actions) != 1 {
+				t.Fatalf("actions=%+v err=%v", actions, err)
+			}
+			want := handoffActionKind
+			if capable {
+				want = manualDownloadActionKind
+			}
+			if actions[0].Kind != want {
+				t.Fatalf("action=%+v want=%s", actions[0], want)
+			}
+		})
+	}
 }

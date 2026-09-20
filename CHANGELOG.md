@@ -291,6 +291,8 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+
+- When a provider opens a PDF that needs the browser viewer’s Download button, papio now records a manual task and releases the institution’s sign-in slot. Other queued papers can proceed; the waiting paper remains unfinished.
 - **A cited author no longer makes a short-title paper pass identity checks.**
   A surname followed by a citation year before the printed title does not
   establish authorship. If that is the only author evidence, papio holds the

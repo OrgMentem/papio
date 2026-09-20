@@ -58,7 +58,8 @@ import (
 )
 
 const (
-	handoffActionKind = "openurl_handoff"
+	handoffActionKind           = "openurl_handoff"
+	nativeViewerDownloadFeature = "native_viewer_download_v1"
 	// manualDownloadActionKind is focusable and offerable, but never driven:
 	// the offer hands the institution's route to the human, who fetches the
 	// file themselves and lets papio adopt it.
@@ -119,7 +120,8 @@ const (
 	// advertised feature before the fail-closed 32-feature cap
 	// (protocol.go's hello.features/hello_ack.features bound, pinned by
 	// protocol_test.go) — no further protocol feature may be added without
-	// retiring or consolidating an existing one first
+	// retiring or consolidating an existing one first (helloAck now replaces
+	// the redundant snapshot-v2 hint only for native-viewer-capable peers)
 	// (dev/active/claim-observation-protocol.md §1).
 	institutionalAuthenticationClaimFeature = protocol.InstitutionalAuthenticationClaimFeature
 	// pdfGrabSuggestV1Feature gates the inbox's operator candidate picker:
@@ -1038,7 +1040,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			}
 			out = append(out, outdated...)
 		} else {
-			ack, err := b.helloAck(sessionRoleHolder)
+			ack, err := b.helloAck(sessionRoleHolder, promoted.Features)
 			if err != nil {
 				return nil, err
 			}
@@ -1320,10 +1322,19 @@ func (b *Bridge) finishReloadRelease(departed *browserSession) {
 // the holder-independent surfaces the dispatcher admits from a non-holder,
 // and it can only know they exist from the feature list carried here.
 // The caller holds b.mu.
-func (b *Bridge) helloAck(role string) (json.RawMessage, error) {
+func (b *Bridge) helloAck(role string, peerFeatures []string) (json.RawMessage, error) {
+	features := slices.Clone(b.Features)
+	// A peer requesting native-viewer outcomes also supports snapshot v3+.
+	// Replace its redundant v2 hint rather than exceed the strict 32-feature
+	// wire cap. Older peers receive the unchanged capability list.
+	if slices.Contains(peerFeatures, nativeViewerDownloadFeature) && slices.Contains(features, triageSnapshotSchema3Feature) {
+		if i := slices.Index(features, triageSnapshotSchema2Feature); i >= 0 {
+			features[i] = nativeViewerDownloadFeature
+		}
+	}
 	payload := protocol.HelloAckPayload{
 		DaemonVersion:   b.Version,
-		Features:        b.Features,
+		Features:        features,
 		ResolverOrigins: b.cfg.ResolverOrigins(),
 		Role:            role,
 	}
@@ -3349,6 +3360,12 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, nil
 
 	case protocol.MsgProviderOutcome:
+		if msg.Payload.(*protocol.ProviderOutcomePayload).Outcome == "native_viewer_download_required" {
+			session := b.arbitration.holderSession()
+			if session == nil || !slices.Contains(session.Features, nativeViewerDownloadFeature) {
+				return nil, nil
+			}
+		}
 		if err := b.outcome(ctx, msg.JobID, msg.MsgID, msg.Payload.(*protocol.ProviderOutcomePayload)); err != nil {
 			log.Printf("papio: recording browser provider outcome: %v", err)
 		}
@@ -4219,7 +4236,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 			shortSession(sessionID), session.ExtensionVersion, shortSession(holder.ID), holder.ExtensionVersion)
 		// Ack first, then refuse holdership. A pending browser still serves
 		// user-initiated, holder-independent requests.
-		ack, err := b.helloAck(sessionRolePending)
+		ack, err := b.helloAck(sessionRolePending, session.Features)
 		if err != nil {
 			return nil, err
 		}
@@ -4283,7 +4300,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	if session.Outdated {
 		return b.extensionOutdatedError()
 	}
-	ack, err := b.helloAck(sessionRoleHolder)
+	ack, err := b.helloAck(sessionRoleHolder, session.Features)
 	if err != nil {
 		return nil, err
 	}
@@ -7760,6 +7777,22 @@ func (b *Bridge) suppressCurrentRoute(ctx context.Context, jobID string, reason 
 
 // outcome maps a terminal provider observation onto a policy-legal transition.
 func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.ProviderOutcomePayload) (err error) {
+	if p.Outcome == "native_viewer_download_required" {
+		row, readErr := b.jobs.Get(ctx, jobID)
+		if readErr != nil {
+			return readErr
+		}
+		if row.State != job.StateAwaitingHuman {
+			return nil
+		}
+		actions, readErr := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+		if readErr != nil {
+			return readErr
+		}
+		if !slices.ContainsFunc(actions, func(a job.HumanAction) bool { return a.Kind == handoffActionKind }) {
+			return nil // duplicate or superseded handoff; do not replace another task
+		}
+	}
 	defer func() {
 		if b.captureStore == nil {
 			return
@@ -7937,12 +7970,12 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		}
 		return b.leaveHandoff(ctx, jobID, job.StateUnavailable, p.Outcome)
 
-	case "wrong_work", "ui_changed":
+	case "wrong_work", "ui_changed", "native_viewer_download_required":
 		// A diagnosed page failure ended this drive too. Keeping its live
 		// binding would block an explicit publisher retry until lease expiry.
 		// A security challenge remains owned by the human gate instead.
 		lowerDetail := strings.ToLower(p.Detail)
-		if p.Outcome == "wrong_work" || (!strings.Contains(lowerDetail, "captcha") && !strings.Contains(lowerDetail, "security")) {
+		if p.Outcome == "wrong_work" || p.Outcome == "native_viewer_download_required" || (!strings.Contains(lowerDetail, "captcha") && !strings.Contains(lowerDetail, "security")) {
 			b.retireFinishedProviderBinding(ctx, jobID, p.Outcome)
 		}
 		requiresAuth := true
@@ -7981,6 +8014,10 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 					detail += "; a sanitized page diagnostic is saved locally; run 'papio adapter captures' to inspect it"
 				}
 			}
+		}
+		if p.Outcome == "native_viewer_download_required" {
+			detail = "In the PDF viewer, choose Send this PDF in papio, then use the viewer Download button; on Firefox, open the PDF in Chrome first"
+			diagnosis = job.DiagnosisReasonNativeViewerDownload
 		}
 		if publisherRoute {
 			detail = job.PublisherHandoffDetail + "\n" + detail

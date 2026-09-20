@@ -287,3 +287,10 @@ func TestDiagnoseV2LatestValidTransactionalDecisionWins(t *testing.T) {
 		t.Fatalf("cutover = %+v, want identifier_gate/true", diagnosis.InstitutionCutover)
 	}
 }
+
+func TestNativeViewerDiagnosisExplainsTheManualBinding(t *testing.T) {
+	got := classifyAction(HumanAction{Kind: "manual_download", Status: "open"}, "native_viewer_download_required", "")
+	if got.Reason != DiagnosisReasonNativeViewerDownload || !strings.Contains(got.Next, "Send this PDF") || !strings.Contains(got.Next, "Download button") {
+		t.Fatalf("native viewer diagnosis = %+v", got)
+	}
+}

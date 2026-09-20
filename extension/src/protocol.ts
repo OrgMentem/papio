@@ -284,6 +284,7 @@ export interface DeliveryContextPayload {
 export type ProviderOutcome =
   | "no_entitlement"
   | "document_delivery_available"
+  | "native_viewer_download_required"
   | "wrong_work"
   | "ui_changed"
   | "rate_limited"
@@ -1595,6 +1596,7 @@ const JOB_SCOPED: Record<string, true> = {
 const OUTCOMES: Record<string, true> = {
   no_entitlement: true,
   document_delivery_available: true,
+  native_viewer_download_required: true,
   wrong_work: true,
   ui_changed: true,
   rate_limited: true,

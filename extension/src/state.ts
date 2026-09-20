@@ -264,6 +264,8 @@ export interface ActiveJob {
    * source-controlled adapter id allows concurrent provider downloads to be
    * correlated without persisting a page URL, referrer, or live host. */
   download_initiated?: boolean;
+  /** Native-viewer notice: only a fresh explicit Send PDF may bind a download. */
+  manual_delivery_required?: boolean;
   adapter_id?: string;
   /** Consecutive `unknown` classification streak, and the epoch-ms of the
    * streak's first observation, for the 2×(≥5s apart) ui_changed debounce. */
@@ -1312,6 +1314,7 @@ function migratedJob(value: ActiveJob): ActiveJob {
     migrated.engagement_required = value.engagement_required;
   if (typeof value.fresh_handoff === "boolean")
     migrated.fresh_handoff = value.fresh_handoff;
+  if (value.manual_delivery_required === true) migrated.manual_delivery_required = true;
   if (typeof value.download_initiated === "boolean")
     migrated.download_initiated = value.download_initiated;
   const unknownCount = value.unknown_count;

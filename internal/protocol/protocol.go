@@ -4810,7 +4810,7 @@ func validResolverOrigin(s string) bool {
 func (p *ProviderOutcomePayload) validate() error {
 	if err := enumRequired("outcome", p.Outcome,
 		"no_entitlement", "document_delivery_available", "wrong_work", "ui_changed",
-		"rate_limited", "terms_acceptance_required", "human_auth_required", "cancelled"); err != nil {
+		"rate_limited", "terms_acceptance_required", "human_auth_required", "cancelled", "native_viewer_download_required"); err != nil {
 		return err
 	}
 	if p.AdapterID != "" && !adapterIDRE.MatchString(p.AdapterID) {

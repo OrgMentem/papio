@@ -331,6 +331,7 @@ const KEEPALIVE_ALARM_DEDUPE_MS = KEEPALIVE_ALARM_MINUTES * 60_000 - 5_000;
 const TRIAGE_REQUEST_TIMEOUT_MS = 15_000;
 const HELLO_WAIT_TIMEOUT_MS = 5_000;
 const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
+const NATIVE_VIEWER_DOWNLOAD_FEATURE = "native_viewer_download_v1";
 const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE = "triage_snapshot_schema_v3";
 const TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE = "triage_snapshot_schema_v4";
@@ -13752,6 +13753,7 @@ export class Bridge {
           features: [
             EFFECT_PERMIT_FEATURE,
             PDF_GRAB_FEATURE,
+            NATIVE_VIEWER_DOWNLOAD_FEATURE,
             INSTITUTIONAL_MATERIALIZATION_FEATURE,
             SURFACE_PRESENCE_FEATURE,
             WORK_PULSE_FEATURE,
@@ -18361,6 +18363,8 @@ export class Bridge {
     ) return;
     if (!this.hasDelegatedAuthority(findByJob(this.store, jobID))) return;
     const pageIdentity = await this.currentPageIdentity(tabID, url);
+    if (!this.hasDelegatedAuthority(findByJob(this.store, jobID)) ||
+      this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)) return;
     const code = "native_viewer_download_required";
     const message = this.isFirefox()
       ? "Open this PDF in Chrome, choose Send this PDF in papio, then use the PDF viewer Download button."
@@ -18373,9 +18377,7 @@ export class Bridge {
       await this.update(s => updatePendingDelivery(s, jobID, {
         url, ...(pageIdentity === undefined ? {} : { page_identity: pageIdentity }),
       }));
-      return;
-    }
-    if (pending === undefined || pending.status === "failed") {
+    } else if (pending === undefined || pending.status === "failed") {
       await this.update((s) => {
         if (s.pendingDelivery !== undefined && s.pendingDelivery.status !== "failed")
           return s;
@@ -18390,10 +18392,17 @@ export class Bridge {
       });
     }
     const noticeKey = `${jobID}:${code}`;
-    if (
-      !this.handoffOutcomeSent.has(noticeKey) &&
-      this.send("error", { code, message }, jobID)
-    ) {
+    if (this.handoffOutcomeSent.has(noticeKey)) return;
+    if ((this.store.daemonFeatures ?? []).includes(NATIVE_VIEWER_DOWNLOAD_FEATURE)) {
+      if (this.send("provider_outcome", { outcome: code }, jobID)) {
+        this.handoffOutcomeSent.add(noticeKey);
+        // Tear down the drive, not the visible file. The close path retains
+        // PDF content; a child viewer is not the parent's managed surface.
+        await this.retainForManualDownload(jobID, true);
+      }
+    } else if (this.send("error", { code, message }, jobID)) {
+      // An older strict parser cannot accept the new outcome. Keep its
+      // existing diagnostic path and do not pretend it created a task.
       this.handoffOutcomeSent.add(noticeKey);
     }
   }
@@ -18767,7 +18776,13 @@ export class Bridge {
 
   /** A manual browser download may originate from an offer host or from a
    * source-controlled adapter host that was recorded on the tracked landing. */
+  private canCorrelateDownload(job: ActiveJob): boolean {
+    return job.manual_delivery_required !== true ||
+      (this.store.pendingDelivery?.job_id === job.job_id && this.store.pendingDelivery.status === "waiting_manual");
+  }
+
   private matchesManualDownloadHost(job: ActiveJob, host: string): boolean {
+    if (!this.canCorrelateDownload(job)) return false;
     if (hostMatches(host, job.provider_hosts)) return true;
     if (job.adapter_id === undefined) return false;
     const spec = this.deps.adapterSpecs.find(
@@ -20077,6 +20092,10 @@ export class Bridge {
    * refusal, which must keep working or Firefox would acknowledge a file it
    * cannot relocate.
    *
+   * Native viewers retain a delivery-choice candidate and the failed notice,
+   * but require explicit delivery instead of DOI/host correlation. Send PDF
+   * binds a fresh page identity before any file can be steered.
+   *
    * `awaiting_download` is the honest status for it — papio is waiting for a
    * PDF for this job and nothing else — and it is already the status the
    * download-completion path writes, so a claimed download needs no second
@@ -20086,7 +20105,7 @@ export class Bridge {
    * through the ordinary `ack` -> `closeAfterAdoption` path, and
    * `reconcileManualDownloadWindows` drops it as soon as a complete triage
    * snapshot stops reporting the action open. */
-  private async retainForManualDownload(jobID: string): Promise<void> {
+  private async retainForManualDownload(jobID: string, explicitDelivery = false): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
     const retained: ActiveJob = {
@@ -20095,12 +20114,19 @@ export class Bridge {
       offered_at: job.offered_at,
       expires_at: job.expires_at,
       status: "awaiting_download",
-      provider_hosts: [...job.provider_hosts],
+      // Native viewers need a fresh Send PDF binding, never host-only adoption.
+      provider_hosts: explicitDelivery ? [] : [...job.provider_hosts],
+      ...(explicitDelivery ? { manual_delivery_required: true } : {}),
       ...(job.adapter_id === undefined ? {} : { adapter_id: job.adapter_id }),
       ...(job.expected === undefined ? {} : { expected: { ...job.expected } }),
     };
+    const notice = explicitDelivery && this.store.pendingDelivery?.job_id === jobID && this.store.pendingDelivery.status === "failed"
+      ? this.store.pendingDelivery : undefined;
     await this.removeJobWithOffer(jobID);
     await this.upsertJobWithoutOffer(retained);
+    if (notice !== undefined) {
+      await this.update(s => s.pendingDelivery === undefined ? startPendingDelivery(s, notice) : s);
+    }
   }
 
   /** A record left behind by `retainForManualDownload`, recognised by shape
@@ -20120,7 +20146,7 @@ export class Bridge {
       this.offerURLs.get(job.job_id) === undefined &&
       !this.downloads.has(job.job_id) &&
       !this.deliveryJobs.has(job.job_id) &&
-      this.store.pendingDelivery?.job_id !== job.job_id
+      (this.store.pendingDelivery?.job_id !== job.job_id || this.store.pendingDelivery.status === "failed")
     );
   }
 
@@ -20920,7 +20946,7 @@ export class Bridge {
     item: DownloadItemLike,
   ): ActiveJob | null | undefined {
     const windows = this.store.activeJobs.filter((job) =>
-      this.isManualDownloadWindow(job),
+      this.isManualDownloadWindow(job) && this.canCorrelateDownload(job),
     );
     if (windows.length === 0) return undefined;
     const observed = new Set<string>();
@@ -20965,7 +20991,7 @@ export class Bridge {
     ) {
       const byTab = findByTab(this.store, item.tabId);
       if (byTab) {
-        if (this.isFirefoxClickDownload(byTab)) return undefined;
+        if (!this.canCorrelateDownload(byTab) || this.isFirefoxClickDownload(byTab)) return undefined;
         return byTab;
       }
     }
@@ -20982,6 +21008,7 @@ export class Bridge {
     if (host === undefined) return undefined;
     const initiated = this.store.activeJobs.filter((job: ActiveJob) => {
       if (
+        !this.canCorrelateDownload(job) ||
         this.isFirefoxClickDownload(job) ||
         job.download_initiated !== true ||
         job.adapter_id === undefined

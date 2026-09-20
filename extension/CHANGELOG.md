@@ -93,6 +93,8 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- PDF viewers that require an explicit download now release their browser drive slot after reporting a manual task to a compatible daemon. The PDF stays open. Choose **Send this PDF** before using the viewer’s **Download** button; the notice alone grants no adoption authority. Older daemons retain the diagnostic-only behavior.
+
 - **Signed PDF viewers stay available for manual delivery.** Automatic viewer
   adoption now uses the same restriction as Send PDF: it does not re-fetch
   ScienceDirect's viewer URL or a signed delivery link. The popup directs you

@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "provider_outcome",
+  "msg_id": "native_viewer_outcome",
+  "job_id": "job_0003_leventhal",
+  "seq": 5,
+  "payload": {
+    "outcome": "native_viewer_download_required"
+  }
+}

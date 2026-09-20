@@ -42,6 +42,19 @@ tab *papio* has no record of opening is never closed at all. The extension
 can restart at any time; it keeps only a minimal tab-to-job mapping and asks
 *papio* for the authoritative state.
 
+## PDF viewers that need a manual download
+
+Some providers display a PDF but return HTML when its signed URL is fetched again.
+For these viewers, papio keeps the PDF open and asks you to choose **Send this PDF**,
+then use the viewer’s **Download** button. On Firefox, open the PDF in Chrome first.
+The notice itself does not authorize adoption; Send this PDF binds the current
+browser document. The daemon still validates the downloaded file before marking
+its job ready.
+
+With compatible daemon and extension versions, this becomes a manual task and
+releases browser capacity for queued papers. Older daemons receive a diagnostic
+only, so they cannot provide this queue recovery.
+
 ## Handoff surfaces
 
 *papio* opens its own tabs on one of three surfaces, chosen automatically
