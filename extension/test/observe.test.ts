@@ -2,6 +2,7 @@
 // Automatic observed captures exercise the narrow browser seams. They never
 // write to Downloads: the only observable output is a compressed native frame.
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 
 
@@ -13,6 +14,9 @@ import {
 import type { PageCapture } from "../src/capture";
 import type { PageCapturePayload } from "../src/protocol";
 import type { ActiveJob } from "../src/state";
+import { adapters } from "../src/adapters/types";
+import { planExecution } from "../src/plan";
+import { fixturePath, parseHTML } from "./harness";
 
 const RATE_KEY = "papio_observed_capture_rate_v1";
 const CLEAN_HTML = `<html><body><main class="article">Known structure</main><script>secret</script></body></html>`;
@@ -114,6 +118,45 @@ test("unknown tracked provider page emits one sanitized observed page_capture fr
   // that a single sanitized-page fingerprint was recorded for the shape.
   expect(storedState.digests[shapeKey]).toHaveLength(1);
   expect(typeof storedState.digests[shapeKey]?.[0]).toBe("string");
+});
+
+test("ScienceDirect unknown emits a sanitized drift frame with its actual adapter identity", async () => {
+  const spec = adapters.find((adapter) => adapter.id === "sciencedirect");
+  if (!spec) throw new Error("sciencedirect adapter missing");
+  const host = "www.sciencedirect.com";
+  const path = "/science/article/pii/S2666557326000194";
+  // This committed synthetic refusal fixture is a regression input, not live
+  // independent evidence. Use the production planner before capturing it.
+  const html = readFileSync(fixturePath("sciencedirect", "drift"), "utf8")
+    .replace("</body>", "<script>capture-secret</script></body>");
+  const planned = planExecution(parseHTML(html, `https://${host}${path}`), spec, {}, {});
+  expect(planned.verdict.kind).toBe("unknown");
+
+  const fake = fakeChrome({ html, origin: `https://${host}`, path });
+  const captured = await observeUnknown(
+    fake.api,
+    jobFor("resolver.example.edu"),
+    host,
+    { verifiedHosts: spec.hosts, adapterID: spec.id, adapterVersion: spec.version },
+    fixedNow("2026-07-15T10:11:12.000Z"),
+  );
+
+  expect(captured).toBe(true);
+  expect(fake.sent).toHaveLength(1);
+  expect(fake.sent[0]?.jobID).toBe("job_capture_17");
+  expect(fake.sent[0]?.payload).toMatchObject({
+    host,
+    scenario: "drift",
+    adapter_id: spec.id,
+    adapter_version: spec.version,
+  });
+  const sanitized = gunzipBase64(fake.sent[0]!.payload.body);
+  expect(sanitized.split("\n")[0]).toBe(
+    `<!-- papio-fixture provider="sciencedirect" scenario="drift" origin="https://${host}${path}" captured="2026-07-15T10:11:12.000Z" -->`,
+  );
+  expect(sanitized).toContain('class="PDFViewer"');
+  expect(sanitized).toContain("<script></script>");
+  expect(sanitized).not.toContain("capture-secret");
 });
 
 test("a registry-only adapter miss produces a canonical drift fixture", async () => {

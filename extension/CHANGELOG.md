@@ -107,6 +107,10 @@ for the full pre-split extension history.
   stops automatic resolver checks.
 
 ### Fixed
+- **Known adapter failures retain repair evidence under their real provider
+  names.** The capture registry now covers every packaged adapter, including
+  ScienceDirect, while preserving historical aliases. A regression checks the
+  registry and sanitized drift frames; unknown providers remain observations.
 
 - An adapter download that returns HTML now frees its browser drive slot and
   stays parked across worker restarts. The page remains available for the

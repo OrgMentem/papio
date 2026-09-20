@@ -23,42 +23,13 @@ import {
   type PageCapturePayload,
 } from "./protocol";
 
-/** Providers the capture tool can record fixtures for. Superset of the enabled
- * adapter set: a provider appears here as soon as fixture capture is wanted,
- * and in `adapters/types.ts` only once its fixtures and tests exist. */
-export type Provider =
-  | "chemrxiv"
-  | "proquest"
-  | "jstor"
-  | "ebsco"
-  | "springer"
-  | "elsevier"
-  | "acm"
-  | "wiley"
-  | "tandfonline"
-  | "sage"
-  | "psycnet"
-  | "hal"
-  | "nature"
-  | "thieme"
-  | "cambridge"
-  | "emerald"
-  | "annualreviews"
-  | "oup"
-  | "mitpress"
-  | "bmj"
-  | "psychiatryonline"
-  | "jamanetwork"
-  | "lww"
-  | "informit"
-  | "primo"
-  | "mdpi"
-  | "clinicalkey";
-
 /** Scenarios that the daemon can retain as page-capture fixtures. */
 export type Scenario = "success" | "login-return" | "no-entitlement" | "drift" | "terms";
 
-export const PROVIDERS: readonly Provider[] = [
+/** Capture vocabulary includes every actual adapter id plus historical names
+ * such as elsevier. capture-registry.test.ts pins coverage against the real
+ * adapter registry without pulling that runtime registry into the sanitizer. */
+export const PROVIDERS = [
   "chemrxiv",
   "proquest",
   "jstor",
@@ -86,7 +57,15 @@ export const PROVIDERS: readonly Provider[] = [
   "primo",
   "mdpi",
   "clinicalkey",
-];
+  "sciencedirect",
+  "cochrane",
+  "europepmc",
+  "hogrefe",
+  "figshare",
+  "exlibris-primo",
+  "iospress",
+] as const;
+export type Provider = (typeof PROVIDERS)[number];
 export const SCENARIOS: readonly Scenario[] = ["success", "login-return", "no-entitlement", "drift", "terms"];
 
 export interface FixtureMeta {
