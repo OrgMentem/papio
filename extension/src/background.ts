@@ -167,7 +167,7 @@ import {
   type Plan,
   type PlanResult,
 } from "./plan";
-import { agentDOM, type AgentDOMRequest, type AgentDOMResult } from "./agent-dom";
+import { agentDOM, type AgentDOMRequest, type AgentDOMResult, type AgentDOMRefusalReason } from "./agent-dom";
 import {
   NATIVE_CLICK_ADOPTION_FEATURE, nativeDownloadReceipt, sameNativeReceipt,
   nativeCompletedFile, nativeDownloadDocumentCurrent,
@@ -19816,7 +19816,24 @@ export class Bridge {
     let exitDetail = "Article agent fallback stopped because its page or authority became stale.";
     const unavailableDetail = "Article agent fallback is unavailable; the decision backend did not return a usable response.";
     const budgetDetail = "Article agent fallback exhausted its decision or time budget.";
-    const humanDetail = "Article agent fallback stopped at a human gate; operator action is required.";
+    const blockedDetail = "Article agent fallback stopped because the decision backend reported BLOCKED; operator review is required.";
+    const domDetails: Record<AgentDOMRefusalReason, string> = {
+      identity_invalid: "the expected DOI is invalid; article identity could not be verified.",
+      identity_missing: "the page has no public DOI citation; article identity could not be verified.",
+      identity_conflicting: "the page's public DOI citations conflict with the expected article identity.",
+      page_binding_failed: "the page no longer matches the bound HTTPS article; navigation or page loading requires a fresh attempt.",
+      document_changed: "the bound article document changed or reloaded; its previous controls cannot be used.",
+      observation_changed: "the article controls or observation changed; the selected control cannot be used.",
+      credentials_required: "a sign-in or credential gate requires operator action.",
+      challenge_required: "a verification or CAPTCHA challenge requires operator action.",
+      consent_required: "a consent or permission dialog requires operator action.",
+      payment_required: "a payment or subscription gate requires operator action.",
+      human_action_required: "a human-action dialog requires operator action.",
+      invalid_request: "the internal article request was invalid.",
+    };
+    const domDetail = (reason: AgentDOMRefusalReason): string => Object.hasOwn(domDetails, reason)
+      ? `Article agent fallback stopped [${reason}]: ${domDetails[reason]}`
+      : "Article agent fallback stopped because the page check returned no recognized refusal reason.";
     const noControlDetail = "Article agent fallback found no usable article control.";
     let track: DownloadTrack | undefined;
     let entryURL: string | undefined;
@@ -19847,13 +19864,15 @@ export class Bridge {
     const liveTab = async (): Promise<boolean> => {
       if (!authorized()) return false;
       const tab = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
-      if (!authorized() || tab?.url === undefined || tab.status === "loading" || isAuthenticationURL(tab.url)) return false;
+      if (!authorized()) return false;
+      if (tab?.url === undefined || tab.status === "loading") { exitDetail = domDetail("page_binding_failed"); return false; }
+      if (isAuthenticationURL(tab.url)) { exitDetail = domDetail("credentials_required"); return false; }
       const url = new URL(tab.url);
-      if (url.protocol !== "https:" || url.username || url.password) return false;
+      if (url.protocol !== "https:" || url.username || url.password) { exitDetail = domDetail("page_binding_failed"); return false; }
       if (entryURL === undefined) entryURL = tab.url;
       const entry = new URL(entryURL);
-      if (url.origin !== entry.origin || url.pathname !== entry.pathname) return false;
-      if (native && tab.url !== entryURL) return false;
+      if (url.origin !== entry.origin || url.pathname !== entry.pathname) { exitDetail = domDetail("page_binding_failed"); return false; }
+      if (native && tab.url !== entryURL) { exitDetail = domDetail("page_binding_failed"); return false; }
       const permitted = await this.deps.permissions.contains({ origins: [`https://${url.hostname}/*`] }).catch(() => false);
       return authorized() && permitted === true;
     };
@@ -19895,7 +19914,7 @@ export class Bridge {
         }))[0]?.result as AgentDOMResult | undefined;
         if (!authorized()) return;
         if (observed?.status !== "observed") {
-          if (observed?.status === "blocked") exitDetail = humanDetail;
+          if (observed?.status === "blocked" || observed?.status === "stale") exitDetail = domDetail(observed.reason);
           return;
         }
         documentID = observed.document;
@@ -19918,7 +19937,7 @@ export class Bridge {
         if (result.payload["outcome"] === "exhausted") { exitDetail = budgetDetail; return; }
         if (result.payload["observation_revision"] !== observation.revision || result.payload["outcome"] !== "decision") return;
         const choice = result.payload["choice"];
-        if (choice === "BLOCKED") { exitDetail = humanDetail; return; }
+        if (choice === "BLOCKED") { exitDetail = blockedDetail; return; }
         if (choice === "WAIT") {
           await pause();
           if (!authorized()) return;
@@ -19986,7 +20005,10 @@ export class Bridge {
         if (downloaded()) return;
         if (!authorized()) return;
         if (native) await this.persistNativeDownload(jobID, track);
-        if (action?.status !== "dispatched") { if (action?.status === "blocked") exitDetail = humanDetail; return; }
+        if (action?.status !== "dispatched") {
+          if (action?.status === "blocked" || action?.status === "stale") exitDetail = domDetail(action.reason);
+          return;
+        }
         if (action.downloadExpected) {
           // Provider clicks often disable their button before Chrome announces
           // a download. No further model decision may turn that into failure.

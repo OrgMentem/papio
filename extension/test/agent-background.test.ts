@@ -271,6 +271,70 @@ for (const outcome of ["unavailable", "exhausted", "stale"] as const) test(`${ou
   expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
 });
 
+for (const firefox of [false, true]) for (const reason of ["identity_missing", "identity_conflicting", "identity_invalid"] as const)
+  test(`${firefox ? "Firefox" : "Chrome"} ${reason} stops before any decision or action without asserting a human gate`, async () => {
+    const h = await harness({ firefox, features: [...features, NATIVE_CLICK_ADOPTION_FEATURE], status: "auth_pending" });
+    if (reason === "identity_missing") h.win.document.querySelector('meta[name="citation_doi"]')!.remove();
+    if (reason === "identity_conflicting") h.win.document.head.insertAdjacentHTML("beforeend", '<meta name="dc.identifier" content="doi:10.9999/PRIVATEOTHER">');
+    if (reason === "identity_invalid") await h.update(s => patchJob(s, jobID, { expected: { doi: "PRIVATEINVALID" } }));
+    await h.classify(); await h.started(); await h.settle();
+    const settlement = h.frames.find(f => f.type === "provider_drive_epoch_result_request")!;
+    const outcome = h.frames.find(f => f.type === "provider_outcome")!;
+    expect(settlement.payload["outcome"]).toBe("unknown");
+    expect(outcome.payload["outcome"]).toBe("ui_changed");
+    expect(outcome.payload["detail"]).toBe(settlement.payload["detail"]);
+    expect(outcome.payload["detail"]).toContain(`[${reason}]`);
+    expect(outcome.payload["detail"]).toContain("identity");
+    expect(outcome.payload["detail"]).not.toContain("human gate");
+    expect(JSON.stringify(h.frames)).not.toContain("PRIVATE");
+    expect(h.frames.some(f => ["agent_decide_request_v1", "native_download_arm_request_v1", "auth_returned", "session_evidence", "claim_observation"].includes(f.type))).toBe(false);
+    expect(h.counts().observations).toBe(1); expect(h.counts().actions).toBe(0);
+    expect(h.downloads.started).toHaveLength(0);
+    const retained = h.backend.store.activeJobs[0]!;
+    expect(retained.challenge_blocked).not.toBe(true); expect(retained.needs_terms_consent).not.toBe(true);
+    expect(retained.requires_auth).not.toBe(true); expect(retained.engagement_required).not.toBe(true);
+    expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
+  });
+
+for (const [html, reason, message] of [
+  ['<input type="password" value="PRIVATESECRET">', "credentials_required", "credential gate"],
+  ['<iframe title="CAPTCHA PRIVATESECRET"></iframe>', "challenge_required", "CAPTCHA challenge"],
+  ['<dialog open>Accept PRIVATESECRET terms</dialog>', "consent_required", "consent or permission dialog"],
+] as const) test(`standard DC identity exposes the actual ${reason} gate, without page content`, async () => {
+  const h = await harness();
+  h.win.document.querySelector('meta[name="citation_doi"]')!.setAttribute("name", "dc.identifier");
+  h.win.document.querySelector('meta[name="dc.identifier"]')!.setAttribute("content", `doi:${doi}`);
+  h.win.document.body.insertAdjacentHTML("beforeend", html);
+  await h.classify(); await h.started(); await h.settle();
+  const detail = h.frames.find(f => f.type === "provider_outcome")!.payload["detail"];
+  expect(detail).toContain(`[${reason}]`); expect(detail).toContain(message);
+  expect(JSON.stringify(h.frames)).not.toContain("PRIVATESECRET");
+  expect(h.frames.some(f => f.type === "agent_decide_request_v1")).toBe(false);
+  expect(h.counts().actions).toBe(0);
+});
+
+for (const reason of ["identity_missing", "identity_conflicting", "consent_required", "page_binding_failed"] as const)
+  test(`pre-click refusal reports ${reason} after a model decision`, async () => {
+    const h = await harness(); await h.classify(); await h.started(); await h.request("agent_decide_request_v1");
+    let clicks = 0; h.win.document.querySelector("button")!.addEventListener("click", () => clicks++);
+    if (reason === "identity_missing") h.win.document.querySelector('meta[name="citation_doi"]')!.remove();
+    if (reason === "identity_conflicting") h.win.document.head.insertAdjacentHTML("beforeend", '<meta name="prism.doi" content="10.9999/PRIVATEOTHER">');
+    if (reason === "consent_required") h.win.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept PRIVATECONSENT</dialog>');
+    if (reason === "page_binding_failed") h.tabs.seed({ id: tabID, url: "https://unregistered.example/PRIVATEOTHER", status: "complete" });
+    await h.decide("decision", "c1"); await h.settle();
+    expect(h.frames.find(f => f.type === "provider_outcome")?.payload["detail"]).toContain(`[${reason}]`);
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(clicks).toBe(0); expect(h.downloads.started).toHaveLength(0);
+    expect(JSON.stringify(h.frames)).not.toContain("PRIVATE");
+  });
+
+test("backend BLOCKED is reported as a decision, not proof of a DOM human gate", async () => {
+  const h = await harness(); await h.classify(); await h.started(); await h.decide("decision", "BLOCKED"); await h.settle();
+  const detail = h.frames.find(f => f.type === "provider_outcome")?.payload["detail"];
+  expect(detail).toContain("decision backend reported BLOCKED");
+  expect(detail).not.toContain("human gate"); expect(h.counts().actions).toBe(0);
+});
+
 for (const change of ["downgrade", "epoch", "tab", "cancel", "permission", "human gate"] as const) test(`authority rechecked before click after ${change}`, async () => {
   const h = await harness(); await h.classify(); await h.started();
   await h.request("agent_decide_request_v1");

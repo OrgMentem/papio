@@ -122,6 +122,11 @@ for the full pre-split extension history.
   stops automatic resolver checks.
 
 ### Fixed
+
+- **Article-agent fallback recognizes standard DOI metadata and explains refusals.**
+  Dublin Core and PRISM identifiers can establish an exact article match;
+  conflicting DOI claims still stop the attempt. Missing identity, changed pages,
+  sign-ins, challenges and consent gates now have distinct explanations.
 - **ScienceDirect recognizes its captured access-bar sign-in layout.** Paired
   purchase and institutional-access controls now offer sign-in guidance instead
   of an adapter-drift failure. PDF controls marked disabled are refused, including

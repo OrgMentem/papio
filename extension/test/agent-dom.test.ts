@@ -60,18 +60,26 @@ test("sanitized projection omits account/form/URL/body data while hidden executi
   expect(after.observation.controls).toEqual(before.observation.controls);
 });
 
-for (const gate of [
-  '<input type="password">', '<input autocomplete="one-time-code">',
-  '<iframe title="CAPTCHA challenge"></iframe>', '<div class="cf-turnstile" data-sitekey="secret"></div>',
-  '<dialog open>Accept terms and conditions<button>Continue</button></dialog>',
-  '<div role="dialog">Purchase access<button>Continue</button></div>',
-  '<div role="dialog">Document delivery<button>Continue</button></div>',
-  '<div role="dialog">Grant permissions<button>Continue</button></div>',
-]) test(`human gate blocks before observation and before click: ${gate}`, async () => {
+for (const [gate, reason] of [
+  ['<input type="password">', "credentials_required"],
+  ['<input autocomplete="one-time-code">', "credentials_required"],
+  ['<input autocomplete="cc-number">', "payment_required"],
+  ['<iframe title="CAPTCHA challenge"></iframe>', "challenge_required"],
+  ['<div class="cf-turnstile" data-sitekey="secret"></div>', "challenge_required"],
+  ['<dialog open>Accept terms and conditions<button>Continue</button></dialog>', "consent_required"],
+  ['<div role="dialog">Purchase access<button>Continue</button></div>', "payment_required"],
+  ['<div role="dialog">Document delivery<button>Continue</button></div>', "human_action_required"],
+  ['<div role="dialog">Grant permissions<button>Continue</button></div>', "consent_required"],
+  ['<div role="dialog">Sign in PRIVATEACCOUNT<button>Continue</button></div>', "credentials_required"],
+  ['<div role="dialog">Verification PRIVATEACCOUNT<button>Continue</button></div>', "challenge_required"],
+] as const) test(`human gate blocks with a fixed reason before observation and click: ${gate}`, async () => {
   const win = setup(), first = observed(await observe());
+  let clicks = 0;
+  win.document.querySelector(".getpdf")!.addEventListener("click", () => clicks++);
   win.document.body.insertAdjacentHTML("beforeend", gate);
-  expect(await observe()).toEqual({ status: "blocked" });
-  expect(await act(first)).toEqual({ status: "blocked" });
+  expect(await observe()).toEqual({ status: "blocked", reason });
+  expect(await act(first)).toEqual({ status: "blocked", reason });
+  expect(clicks).toBe(0);
 });
 
 for (const label of ["Accept license", "Buy article", "Request a copy", "Document delivery", "Grant permission", "Subscribe", "Verify credentials"])
@@ -81,7 +89,7 @@ for (const label of ["Accept license", "Buy article", "Request a copy", "Documen
     const first = observed(await observe());
     const control = first.observation.controls.find(c => c.label.startsWith(label))!;
     expect(control.disabled).toBe(true);
-    expect(await act(first, { choice: control.id })).toEqual({ status: "stale" });
+    expect(await act(first, { choice: control.id })).toEqual({ status: "stale", reason: "observation_changed" });
   });
 
 for (const mutation of ["form", "field", "label", "ancestor", "disabled", "hidden", "replace", "query", "base", "document", "doi"]) test(`live fingerprint or gate rejects ${mutation} change`, async () => {
@@ -112,7 +120,7 @@ test("concurrent observations cannot overwrite newer state; repeated or re-obser
   expect((await Promise.all([act(first), act(first)])).map(r => r.status).sort()).toEqual(["dispatched", "stale"]);
   const again = observed(await observe());
   expect(again.observation.revision).toBe(first.observation.revision);
-  expect(await act(again)).toEqual({ status: "stale" });
+  expect(await act(again)).toEqual({ status: "stale", reason: "observation_changed" });
   expect(clicks).toBe(1);
 });
 
@@ -140,11 +148,114 @@ test("scope and live citation are required without an adapter registry", async (
   const win = setup('<meta name="citation_doi" content="10.3233/SHTI000001"><article><button>Formats</button></article>');
   expect((await observe()).status).toBe("observed");
   win.location.pathname = "/different";
-  expect(await observe()).toEqual({ status: "blocked" });
+  expect(await observe()).toEqual({ status: "blocked", reason: "page_binding_failed" });
   win.location.href = entryURL;
   win.document.querySelector("meta")!.remove();
-  expect(await observe()).toEqual({ status: "blocked" });
+  expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
 });
+
+for (const [name, content] of [
+  ["citation_doi", doi], ["dc.identifier", doi], ["DC.Identifier", `doi:${doi}`],
+  ["dc.identifier", `https://doi.org/${doi}`], ["dc.identifier", `http://dx.doi.org/${doi}`],
+  ["prism.doi", doi], ["PRISM.DOI", `doi:${doi}`],
+] as const) test(`standard DOI metadata provides exact identity: ${name} ${content}`, async () => {
+  const win = setup(`<meta name="${name}" content="${content}"><main><button>Formats</button><a href="/articles/63646.pdf">PDF</a></main>`);
+  let clicks = 0; win.document.querySelector("a")!.addEventListener("click", () => clicks++);
+  const injected = new Function(`return (${agentDOM.toString()});`)() as typeof agentDOM;
+  const first = observed(await injected({ method: "observe", entryURL, doi }));
+  expect(first.observation.doi).toBe(doi.toLowerCase());
+  expect(first.observation.controls.find(c => c.label === "Formats")?.disabled).toBe(false);
+  const pdf = first.observation.controls.find(c => c.label === "PDF")!;
+  expect(pdf.disabled).toBe(true); // Metadata support does not authorize cross-path navigation.
+  expect(await act(first, { choice: pdf.id })).toEqual({ status: "stale", reason: "observation_changed" });
+  expect(clicks).toBe(0);
+});
+
+for (const content of ["urn:isbn:9781234567890", "local-record-63646", "https://publisher.example/63646"])
+  test(`non-DOI DC identifier is not identity evidence: ${content}`, async () => {
+    const win = setup(`<meta name="dc.identifier" content="${content}"><main><button>PDF</button></main>`);
+    expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
+    win.document.head.insertAdjacentHTML("beforeend", `<meta name="prism.doi" content="${doi}">`);
+    expect((await observe()).status).toBe("observed");
+  });
+
+for (const name of ["citation_doi", "dc.identifier", "prism.doi"]) {
+  test(`wrong DOI in ${name} refuses`, async () => {
+    setup(`<meta name="${name}" content="doi:10.9999/PRIVATEOTHER"><main><button>PDF</button></main>`);
+    expect(await observe()).toEqual({ status: "blocked", reason: "identity_conflicting" });
+  });
+  for (const other of ["citation_doi", "dc.identifier", "prism.doi"].filter(other => other !== name))
+    test(`conflicting DOI claims across ${name} and ${other} refuse before click`, async () => {
+      const win = setup(`<meta name="${name}" content="${doi}"><main><button>PDF</button></main>`);
+      const first = observed(await observe());
+      win.document.head.insertAdjacentHTML("beforeend", `<meta name="${other}" content="https://doi.org/10.9999/PRIVATEOTHER">`);
+      expect(await observe()).toEqual({ status: "blocked", reason: "identity_conflicting" });
+      expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "blocked", reason: "identity_conflicting" });
+    });
+}
+
+test("matching standard claims agree but malformed declared DC DOI still refuses", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><meta name="dc.identifier" content="doi:${doi}"><meta name="prism.doi" content="https://doi.org/${doi}"><main><button>Formats</button></main>`);
+  expect((await observe()).status).toBe("observed");
+  win.document.head.insertAdjacentHTML("beforeend", '<meta name="dc.identifier" content="doi:PRIVATEINVALID">');
+  expect(await observe()).toEqual({ status: "blocked", reason: "identity_conflicting" });
+});
+
+for (const [change, reason] of [
+  ["missing", "identity_missing"], ["empty", "identity_missing"],
+  ["conflicting", "identity_conflicting"], ["extra", "identity_conflicting"],
+  ["invalid expected", "identity_invalid"],
+] as const) test(`identity refusal is distinct from a human gate: ${change}`, async () => {
+  const win = setup(), first = observed(await observe());
+  let clicks = 0;
+  win.document.querySelector(".getpdf")!.addEventListener("click", () => clicks++);
+  const citation = win.document.querySelector('meta[name="citation_doi"]')!;
+  if (change === "missing") citation.remove();
+  if (change === "empty") citation.setAttribute("content", "");
+  if (change === "conflicting") citation.setAttribute("content", "10.9999/PRIVATEIDENTITY");
+  if (change === "extra") win.document.head.insertAdjacentHTML("beforeend", '<meta name="citation_doi" content="10.9999/PRIVATEIDENTITY">');
+  const expected = change === "invalid expected" ? "PRIVATEINVALID" : doi;
+  expect(await agentDOM({ method: "observe", entryURL, doi: expected })).toEqual({ status: "blocked", reason });
+  expect(await act(first, { doi: expected })).toEqual({ status: "blocked", reason });
+  expect(clicks).toBe(0);
+});
+
+test("identity failure does not assert a human gate even when one is also present", async () => {
+  const win = setup();
+  win.document.querySelector('meta[name="citation_doi"]')!.remove();
+  win.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept PRIVATECONSENT</dialog>');
+  expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
+});
+
+test("reload and stale controls have separate bounded reasons", async () => {
+  const win = setup(), first = observed(await observe());
+  win.document.querySelector(".getpdf")!.setAttribute("disabled", "");
+  expect(await act(first)).toEqual({ status: "stale", reason: "observation_changed" });
+  setup();
+  expect(await act(first)).toEqual({ status: "stale", reason: "document_changed" });
+});
+
+test("a validation failure during the observation digest retains its exact reason", async () => {
+  const win = setup();
+  const digest = crypto.subtle.digest.bind(crypto.subtle);
+  const original = crypto.subtle.digest;
+  try {
+    crypto.subtle.digest = async (...args) => {
+      win.document.querySelector('meta[name="citation_doi"]')!.remove();
+      return digest(...args);
+    };
+    expect(await observe()).toEqual({ status: "stale", reason: "identity_missing" });
+  } finally { crypto.subtle.digest = original; }
+});
+
+const credentialBinding = new URL("https://ebooks.iospress.nl/article");
+credentialBinding.username = "test-user";
+credentialBinding.password = "test-password"; // betterleaks:allow -- synthetic negative-test input, never sent
+for (const target of ["https://other.example/article", "http://ebooks.iospress.nl/article", credentialBinding.href, "invalid PRIVATEURL"])
+  test(`invalid or different article binding refuses without exposing its value: ${target}`, async () => {
+    setup();
+    expect(await agentDOM({ method: "observe", entryURL: target, doi })).toEqual({ status: "blocked", reason: "page_binding_failed" });
+  });
 
 
 test("ordinary header search and unrelated newsletter do not disable an entitled PDF", async () => {
