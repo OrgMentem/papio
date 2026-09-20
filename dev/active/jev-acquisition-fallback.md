@@ -9,6 +9,13 @@ behavior remains unchanged until implemented and tested.
 
 ## Evidence and remaining proof
 
+The [native helper spike](../native-helper-spike.md) now runs independently of
+Codex: four Jev decisions acquired a three-page synthetic PDF through Chrome's
+viewer and native Save dialog. It reuses AXorcist and selected trycua native
+delivery code. Foreground operation succeeded; background-only operation did
+not. This is not publisher acceptance or daemon adoption proof. The downloaded
+file and private receipts were checked, and the owned tab/server were cleaned up.
+
 The first supervised native-browser trial downloaded three correct papers.
 Two fresh isolated jobs adopted and validated their files; one CDN-viewer
 download remained outside papio. A follow-up explicitly used the extension's
@@ -148,6 +155,14 @@ resolution can run concurrently, but foreground input needs a single owner.
 Desktop lock, missing permission or unsupported browser combinations need clear
 operator actions. Probe background accessibility support rather than assuming
 every action must steal focus. Close only surfaces owned by the attempt.
+
+Unobtrusiveness includes setup, native dialogs and cleanup. Measure foreground
+app/window and keyboard-focus changes, pointer movement and interference during
+settling, not merely whether a window was raised. Prefer extension operations
+for background page interactions they can perform without CDP; native control
+covers the remaining viewer/dialog surfaces. A library's quiet-looking focus
+mutation must not silently become the default. The current spike uses endpoint
+measurements only and cannot yet establish uninterrupted user input.
 
 **Artifact path.** Establish ownership before saving resident viewer bytes.
 Diagnose the existing filename-steering path alongside the native spike. If Save
