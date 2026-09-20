@@ -17931,9 +17931,9 @@ export class Bridge {
         await this.maybeClassify(job.job_id, host);
         return;
       }
-      if (job.status !== "auth_pending" && !successfulLanding) {
-        // Leaving every provider host for an IdP starts human authentication.
-        // A completed non-IdP page is instead a usable resolver landing.
+      if (job.status !== "auth_pending" && isAuthenticationURL(url)) {
+        // Only an authentication route starts a sign-in wait. Loading an
+        // unregistered provider is ordinary navigation, not an IdP visit.
         await this.update((s) =>
           patchJob(s, job.job_id, {
             status: "auth_pending",
@@ -18824,7 +18824,15 @@ export class Bridge {
   ): Promise<PageVerdict | undefined> {
     const job = findByJob(this.store, jobID);
     if (!job) return undefined;
-    const allowAuthPending = disposition === "evidence_only";
+    const spec = this.deps.adapterSpecs.find((candidate) =>
+      adapterSupportsHost(host, candidate),
+    );
+    // An unsupported landing after sign-in still needs a coverage diagnosis.
+    // It proves neither authentication nor permission to execute an effect.
+    const missingAdapterAfterAuth =
+      spec === undefined && job.status === "auth_pending";
+    const allowAuthPending =
+      disposition === "evidence_only" || missingAdapterAfterAuth;
     if (
       job.status !== "accepted" &&
       job.status !== "awaiting_download" &&
@@ -18832,9 +18840,6 @@ export class Bridge {
     ) {
       return undefined;
     }
-    const spec = this.deps.adapterSpecs.find((candidate) =>
-      adapterSupportsHost(host, candidate),
-    );
     if (!spec) {
       // Direct-PDF delivery does not need a page adapter. Otherwise verify that
       // the extension can inspect this host, then give the page one bounded
@@ -18844,6 +18849,18 @@ export class Bridge {
       if (disposition === "evidence_only") return undefined;
       if (job.download_initiated === true || this.downloads.has(job.job_id))
         return;
+      const live = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
+      if (
+        live?.url === undefined ||
+        live.status === "loading" ||
+        isAuthenticationURL(live.url)
+      )
+        return;
+      try {
+        if (new URL(live.url).hostname !== host) return;
+      } catch {
+        return;
+      }
       const access = await this.hasEffectiveProviderAccess(host);
       if (access !== true) {
         if (access === false) await this.reportBlockedProviderHost(jobID, host);
@@ -18868,7 +18885,10 @@ export class Bridge {
       const currentJob = findByJob(this.store, job.job_id);
       if (currentJob === undefined) return;
       const captured = await this.recordUnknown(currentJob, host);
-      if (await this.runGenericOnSettledUnknown(currentJob)) return;
+      if (
+        !missingAdapterAfterAuth &&
+        await this.runGenericOnSettledUnknown(currentJob)
+      ) return;
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
@@ -19330,7 +19350,12 @@ export class Bridge {
       this.classifyRetries.delete(jobID);
       return;
     }
-    if (job.status !== "accepted" && job.status !== "awaiting_download") {
+    if (
+      job.status !== "accepted" &&
+      job.status !== "awaiting_download" &&
+      !(expected?.kind === "unknown" && job.status === "auth_pending" &&
+        job.last_unknown_ms !== undefined)
+    ) {
       this.classifyRetries.delete(jobID);
       return;
     }

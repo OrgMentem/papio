@@ -103,6 +103,12 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Unsupported provider pages no longer leave papers waiting for sign-in.**
+  Loading an unregistered provider does not count as authentication. If sign-in
+  returns to an unsupported page, papio records the missing adapter and releases
+  the drive after a bounded render wait, without claiming successful sign-in or
+  attempting a PDF download.
+
 - **Generic downloads exclude files labelled as previews or partial documents.**
   A matching DOI and PDF metadata cannot override a link labelled as a preview,
   sample, abstract, supplement, or full issue. A separate full PDF remains

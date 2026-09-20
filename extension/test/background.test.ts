@@ -5943,90 +5943,136 @@ for (const { label, host, specs } of [
   { label: "an unregistered provider", host: PROVIDER_HOST, specs: [] },
   { label: "Ebook Central with the ProQuest article adapter installed", host: "ebookcentral.proquest.com", specs: adapters.filter(spec => spec.id === "proquest") },
 ]) {
-  test(`${label} captures evidence and exits with a missing-adapter outcome`, async () => {
-    const h = makeHarness();
-    h.deps.adapterSpecs = specs;
-    h.deps.permissions.contains = async () => true;
-    const stored: Record<string, unknown> = {};
-    h.deps.captureStorage = {
-      local: {
-        get: async (key) => ({ [key]: stored[key] }),
-        set: async (items) => {
-          Object.assign(stored, items);
-        },
-      },
-    };
-    h.deps.scripting.executeScript = async (injection) => {
-      if (injection.func === capturePage) {
-        return [
-          {
-            result: {
-              html: '<main class="article">unsupported provider shape</main>',
-              origin: `https://${host}`,
-              path: "/stable/article",
-            },
+  for (const afterSignIn of [false, true]) {
+    test(`${label} captures evidence and exits with a missing-adapter outcome${afterSignIn ? " after sign-in" : " after loading"}`, async () => {
+      const h = makeHarness();
+      h.deps.adapterSpecs = specs;
+      h.deps.permissions.contains = async () => true;
+      const stored: Record<string, unknown> = {};
+      const injectedFunctions: unknown[] = [];
+      h.deps.captureStorage = {
+        local: {
+          get: async (key) => ({ [key]: stored[key] }),
+          set: async (items) => {
+            Object.assign(stored, items);
           },
-        ];
+        },
+      };
+      h.deps.scripting.executeScript = async (injection) => {
+        injectedFunctions.push(injection.func);
+        if (injection.func === capturePage) {
+          return [
+            {
+              result: {
+                html: '<main class="article">unsupported provider shape</main>',
+                origin: `https://${host}`,
+                path: "/stable/article",
+              },
+            },
+          ];
+        }
+        return [];
+      };
+
+      await h.bridge.start();
+      await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
+      await h.port.inbound(
+        jobOfferForHosts("job_missing_adapter", ["resolver.example.edu"]),
+      );
+      const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+      const articleURL = `https://${host}/stable/article`;
+      if (afterSignIn) {
+        const loginURL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO";
+        await h.tabs.userNavigate(tabID, loginURL);
+        await h.tabs.completeNavigation(tabID, loginURL);
+        expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
       }
-      return [];
-    };
+      const authPendingBefore = h.frames().filter(frame => frame.type === "auth_pending").length;
+      await h.tabs.userNavigate(tabID, articleURL);
+      expect(h.frames().filter(frame => frame.type === "auth_pending")).toHaveLength(authPendingBefore);
+      let nextTimer = h.timers.length;
+      await h.tabs.completeNavigation(tabID, articleURL);
 
-    await h.bridge.start();
-    await h.port.inbound(helloAck({ features: ["page_capture_v1"] }));
-    await h.port.inbound(
-      jobOfferForHosts("job_missing_adapter", ["resolver.example.edu"]),
-    );
-    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
-    const articleURL = `https://${host}/stable/article`;
-    h.tabs.seed({ id: tabID, url: articleURL });
-    let nextTimer = h.timers.length;
-    await h.tabs.completeNavigation(tabID, articleURL);
+      for (let retry = 0; retry < 2; retry += 1) {
+        const relative = h.timers
+          .slice(nextTimer)
+          .findIndex((timer) => timer.ms === 2_500);
+        expect(relative).toBeGreaterThanOrEqual(0);
+        nextTimer += relative;
+        const timer = h.timers[nextTimer]!;
+        nextTimer += 1;
+        h.clock.now += 2_500;
+        await timer.fn();
+      }
 
-    for (let retry = 0; retry < 2; retry += 1) {
-      const relative = h.timers
-        .slice(nextTimer)
-        .findIndex((timer) => timer.ms === 2_500);
-      expect(relative).toBeGreaterThanOrEqual(0);
-      nextTimer += relative;
-      const timer = h.timers[nextTimer]!;
-      nextTimer += 1;
-      h.clock.now += 2_500;
-      await timer.fn();
-    }
-
-    expect(
-      h.frames().filter((frame) => frame.type === "page_capture"),
-    ).toHaveLength(1);
-    const outcomes = h
-      .frames()
-      .filter((frame) => frame.type === "provider_outcome");
-    expect(outcomes).toHaveLength(1);
-    expect(outcomes[0]?.payload).toMatchObject({
-      outcome: "ui_changed",
-      detail:
-        "No source-controlled adapter matched this provider page. " +
-        "A sanitized diagnostic was saved locally for adapter development.",
-      // Name the page. Without this the daemon records a drift it cannot
-      // attribute: its only other source is a prior page capture, and this is
-      // the branch where no adapter matched, so the capture carries no adapter
-      // id to join on. A live park showed exactly that — adapter_id,
-      // adapter_version and host all empty on the durable latch.
-      host,
+      expect(
+        h.frames().filter((frame) => frame.type === "page_capture"),
+      ).toHaveLength(1);
+      const outcomes = h
+        .frames()
+        .filter((frame) => frame.type === "provider_outcome");
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0]?.payload).toMatchObject({
+        outcome: "ui_changed",
+        detail:
+          "No source-controlled adapter matched this provider page. " +
+          "A sanitized diagnostic was saved locally for adapter development.",
+        // Name the page. Without this the daemon records a drift it cannot
+        // attribute: its only other source is a prior page capture, and this is
+        // the branch where no adapter matched, so the capture carries no adapter
+        // id to join on. A live park showed exactly that — adapter_id,
+        // adapter_version and host all empty on the durable latch.
+        host,
+      });
+      expect(outcomes[0]?.payload.adapter_id).toBeUndefined();
+      // A coverage gap neither proves authentication nor authorizes a PDF effect.
+      expect(h.frames().some(frame => frame.type === "auth_returned")).toBe(false);
+      expect(h.downloads.started).toHaveLength(0);
+      if (afterSignIn) expect(injectedFunctions).not.toContain(planGeneric);
+      // The daemon opens a manual_download action from exactly this outcome, so the
+      // job survives as an inert correlation window rather than being deleted: it
+      // detaches from its tab, holds no drive authority, and keeps only the hosts
+      // correlate() needs to claim the researcher's own download.
+      expect(h.backend.store.activeJobs).toHaveLength(1);
+      expect(h.backend.store.activeJobs[0]).toMatchObject({
+        job_id: "job_missing_adapter",
+        tab_id: -1,
+        status: "awaiting_download",
+      });
+      expect(h.backend.store.activeJobs[0]?.access_mode).toBeUndefined();
     });
-    expect(outcomes[0]?.payload.adapter_id).toBeUndefined();
-    // The daemon opens a manual_download action from exactly this outcome, so the
-    // job survives as an inert correlation window rather than being deleted: it
-    // detaches from its tab, holds no drive authority, and keeps only the hosts
-    // correlate() needs to claim the researcher's own download.
-    expect(h.backend.store.activeJobs).toHaveLength(1);
-    expect(h.backend.store.activeJobs[0]).toMatchObject({
-      job_id: "job_missing_adapter",
-      tab_id: -1,
-      status: "awaiting_download",
-    });
-    expect(h.backend.store.activeJobs[0]?.access_mode).toBeUndefined();
-  });
+  }
 }
+
+test("an unsupported post-login landing that returns to the IdP is not captured or parked as drift", async () => {
+  const h = makeHarness();
+  h.deps.adapterSpecs = [];
+  h.deps.permissions.contains = async () => true;
+  const injections: unknown[] = [];
+  h.deps.scripting.executeScript = async (injection) => {
+    injections.push(injection.func);
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(jobOfferForHosts("job_missing_adapter_auth_redirect", ["resolver.example.edu"]));
+  const tabID = h.backend.store.activeJobs[0]!.tab_id;
+  const loginURL = "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO";
+  await h.tabs.userNavigate(tabID, loginURL);
+  await h.tabs.completeNavigation(tabID, loginURL);
+  const firstTimer = h.timers.length;
+  await h.tabs.completeNavigation(tabID, "https://unsupported.example/article");
+  const retry = h.timers.slice(firstTimer).find(timer => timer.ms === 2_500);
+  expect(retry).toBeDefined();
+  await h.tabs.userNavigate(tabID, loginURL);
+  await h.tabs.completeNavigation(tabID, loginURL);
+  h.clock.now += 5_000;
+  await retry!.fn();
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  expect(injections).not.toContain(capturePage);
+  expect(injections).not.toContain(planGeneric);
+  expect(h.frames().some(frame => frame.type === "provider_outcome" || frame.type === "auth_returned")).toBe(false);
+  expect(h.downloads.started).toHaveLength(0);
+});
 
 test("an authentication redirect never self-authorizes a diagnostic capture", async () => {
   const h = makeHarness();
