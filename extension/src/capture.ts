@@ -27,6 +27,7 @@ import {
  * adapter set: a provider appears here as soon as fixture capture is wanted,
  * and in `adapters/types.ts` only once its fixtures and tests exist. */
 export type Provider =
+  | "chemrxiv"
   | "proquest"
   | "jstor"
   | "ebsco"
@@ -58,6 +59,7 @@ export type Provider =
 export type Scenario = "success" | "login-return" | "no-entitlement" | "drift" | "terms";
 
 export const PROVIDERS: readonly Provider[] = [
+  "chemrxiv",
   "proquest",
   "jstor",
   "ebsco",

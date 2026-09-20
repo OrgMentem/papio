@@ -18,6 +18,11 @@ for the full pre-split extension history.
 
 ### Added
 
+- **ChemRxiv preprints have a version-specific PDF route.** The adapter uses
+  the primary self-citation DOI and rendered article toolbar, even when
+  `citation_doi` metadata is absent. It refuses a different preprint version,
+  the published article’s DOI, and supplementary files.
+
 - **Oxford Academic chapters have a rendered PDF route.** After institutional
   sign-in, the adapter recognizes the chapter PDF control as well as journal
   PDF controls. PDF metadata alone does not establish access; login walls and

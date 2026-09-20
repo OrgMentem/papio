@@ -232,6 +232,40 @@ export function adapterSupportsHost(host: string, spec: AdapterSpec): boolean {
  */
 export const adapters: AdapterSpec[] = [
   {
+    id: "chemrxiv",
+    version: "0.1.0",
+    hosts: ["chemrxiv.org"],
+    // This platform omits citation_doi. Its primary self-citation names the
+    // exact preprint version; the separate version-of-record link does not.
+    workEvidence: {
+      kind: "doi",
+      selector: ".core-self-citation .doi a[property='sameAs']",
+      attribute: "href",
+      pattern: "^https://doi\\.org/(10\\.26434/chemrxiv-[^?#]+)(?:[?#].*)?$",
+    },
+    classify: [{
+      kind: "article",
+      all: [
+        "meta[name='citation_fulltext_world_readable']",
+        "meta[name='citation_article_type'][content='preprint']",
+        ".core-self-citation .doi a[property='sameAs']",
+        ".info-panel__formats a.btn--pdf[href*='/doi/pdf/']",
+      ],
+    }],
+    // The page repeats the PDF link in view options and in a hidden credits
+    // section. Only the rendered article toolbar proves this route is usable.
+    download: {
+      method: "href",
+      selector: ".info-panel__formats a.btn--pdf[href*='/doi/pdf/']",
+      requireKind: "article",
+      workTarget: {
+        kind: "doi",
+        attribute: "href",
+        pattern: "^(?:https://chemrxiv\\.org)?/doi/pdf/(10\\.26434/chemrxiv-[^?#]+)(?:[?#].*)?$",
+      },
+    },
+  },
+  {
     // Verified live 2026-07-14 against Example University-authenticated ProQuest
     // (fixtures/proquest/*.html). The PDF link id is document-scoped
     // (`downloadPDFLink_MSTAR_<docid>`), hence the prefix selector.
