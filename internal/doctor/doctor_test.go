@@ -881,16 +881,30 @@ func TestRunIntegrationUpdates(t *testing.T) {
 	})
 
 	t.Run("zotio behind", func(t *testing.T) {
-		cfg := baseConfig()
-		cfg.Updates.Check = true
-		cfg.Zotio.Executable = "/opt/homebrew/bin/zotio"
-		deps := depsFor(cfg)
-		deps.CheckZotioUpdates = func(context.Context, config.Config) *update.Info {
-			return &update.Info{LatestVersion: "1.2.4", URL: "https://example.test/zotio"}
+		packaged, packageHint := "/opt/homebrew/bin/zotio", "brew upgrade zotio"
+		if runtime.GOOS == "windows" {
+			packaged = filepath.Join(t.TempDir(), "scoop", "shims", "zotio.exe")
+			packageHint = "scoop update zotio"
 		}
-		got := find(RunIntegration(context.Background(), deps), "updates (zotio)")
-		if got.Status != Warn || got.Detail != "zotio 1.2.4 available (you have 1.2.3)" || got.Remediation != "brew upgrade zotio" {
-			t.Fatalf("zotio update check = %#v", got)
+		for _, tc := range []struct {
+			name, executable, hint string
+		}{
+			{"package manager", packaged, packageHint},
+			{"standalone binary", filepath.Join(t.TempDir(), "zotio"), "https://example.test/zotio"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := baseConfig()
+				cfg.Updates.Check = true
+				cfg.Zotio.Executable = tc.executable
+				deps := depsFor(cfg)
+				deps.CheckZotioUpdates = func(context.Context, config.Config) *update.Info {
+					return &update.Info{LatestVersion: "1.2.4", URL: "https://example.test/zotio"}
+				}
+				got := find(RunIntegration(context.Background(), deps), "updates (zotio)")
+				if got.Status != Warn || got.Detail != "zotio 1.2.4 available (you have 1.2.3)" || got.Remediation != tc.hint {
+					t.Fatalf("zotio update check = %#v, want remediation %q", got, tc.hint)
+				}
+			})
 		}
 	})
 

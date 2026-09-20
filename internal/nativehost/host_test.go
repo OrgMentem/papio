@@ -10,11 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -560,26 +560,38 @@ func serveSyncRPC(t *testing.T, handle func(json.RawMessage) ([]byte, *ipc.RPCEr
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	socket := filepath.Join(dir, "s")
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &ipc.Server{Handler: ipc.HandlerFunc(func(_ context.Context, request ipc.Request) ([]byte, *ipc.RPCError) {
+	var handled atomic.Bool
+	server := &ipc.Server{SocketPath: socket, Handler: ipc.HandlerFunc(func(_ context.Context, request ipc.Request) ([]byte, *ipc.RPCError) {
 		if request.Method != syncMethod {
 			return nil, &ipc.RPCError{Code: "unknown_method", Message: "unexpected method"}
 		}
+		handled.Store(true)
 		return handle(request.Params)
 	})}
 	done := make(chan error, 1)
-	go func() { done <- server.ServeListener(ctx, listener) }()
+	go func() { done <- server.Serve(ctx) }()
 	t.Cleanup(func() {
 		cancel()
-		_ = listener.Close()
-		if err := <-done; err != nil {
-			t.Errorf("serve sync socket: %v", err)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve sync endpoint: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("sync endpoint did not stop after cancellation")
+		}
+		// A missing pipe is also a fatal transport error. Require the fixture
+		// response to have run so fatal-result cases cannot pass for that reason.
+		if !handled.Load() {
+			t.Error("browser.sync never reached the test daemon")
 		}
 	})
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := ipc.WaitForSocket(waitCtx, socket, time.Millisecond); err != nil {
+		t.Fatalf("sync endpoint did not become ready: %v", err)
+	}
 	return &ipcSyncer{client: ipc.NewSocketClient(socket), sessionID: "session-under-test"}
 }
 

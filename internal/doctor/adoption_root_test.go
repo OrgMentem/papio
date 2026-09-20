@@ -4,9 +4,11 @@ package doctor
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"papio/internal/config"
@@ -20,9 +22,33 @@ func adoptionHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_DOWNLOAD_DIR", "")
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	return home
+}
+
+// adoptionListingFixture leaves the platform's default-path derivation real,
+// but serves a controlled listing. Windows may have an absolute Downloads
+// registry value that no HOME/USERPROFILE override can isolate; tests must
+// never create or enumerate that real directory.
+func adoptionListingFixture(t *testing.T, expectedRoot, fixture string) {
+	t.Helper()
+	previous := adoptionRootReadDir
+	var probed atomic.Bool
+	adoptionRootReadDir = func(path string) ([]os.DirEntry, error) {
+		probed.Store(true)
+		if path != expectedRoot {
+			return nil, fmt.Errorf("listing path = %q, want %q", path, expectedRoot)
+		}
+		return os.ReadDir(fixture)
+	}
+	t.Cleanup(func() {
+		adoptionRootReadDir = previous
+		if !probed.Load() {
+			t.Error("adoption root was never probed")
+		}
+	})
 }
 
 func collectChecks(t *testing.T, run func(func(string, string, string, string))) []Check {
@@ -71,10 +97,8 @@ func TestCheckAdoptionRootFailsWhenBrowserSteeringCannotReachIt(t *testing.T) {
 // steering can actually reach.
 func TestCheckAdoptionRootPassesForTheReachableDefault(t *testing.T) {
 	home := adoptionHome(t)
-	root := filepath.Join(home, "Downloads", config.AdoptionDirName)
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	root := filepath.Join(config.UserDownloadsDir(), config.AdoptionDirName)
+	adoptionListingFixture(t, root, t.TempDir())
 	cfg := config.Config{DataDir: filepath.Join(home, ".local", "share", "papio")}
 
 	checks := collectChecks(t, func(add func(string, string, string, string)) { checkAdoptionRoot(cfg, add) })
@@ -98,17 +122,19 @@ func TestCheckAdoptionRootPassesForTheReachableDefault(t *testing.T) {
 // the developer's real ~/Downloads/papio instead of a missing directory.
 func TestCheckAdoptionRootMissingDirIsHealthy(t *testing.T) {
 	home := adoptionHome(t)
-	root := filepath.Join(home, "Downloads", config.AdoptionDirName)
-	if _, err := os.Stat(root); !os.IsNotExist(err) {
-		t.Fatalf("stat %q = %v, want the directory to be absent", root, err)
+	root := filepath.Join(config.UserDownloadsDir(), config.AdoptionDirName)
+	missing := filepath.Join(t.TempDir(), "absent")
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("stat %q = %v, want the directory to be absent", missing, err)
 	}
+	adoptionListingFixture(t, root, missing)
 	cfg := config.Config{DataDir: filepath.Join(home, ".local", "share", "papio")}
 
 	checks := collectChecks(t, func(add func(string, string, string, string)) { checkAdoptionRoot(cfg, add) })
 	if len(checks) != 1 {
 		t.Fatalf("checks = %#v, want exactly one", checks)
 	}
-	if c := checks[0]; c.Name != "adoption_root" || c.Status != Pass {
+	if c := checks[0]; c.Name != "adoption_root" || c.Status != Pass || !strings.Contains(c.Detail, root) {
 		t.Fatalf("check = %#v, want a Pass adoption_root check for the absent %q", c, root)
 	}
 }
