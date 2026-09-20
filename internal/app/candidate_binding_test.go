@@ -164,6 +164,36 @@ func conclusiveQueueCandidate(url string, confidence float64) resolver.Candidate
 	}
 }
 
+func TestMultipleFrontMatterDOIsExplainAmbiguityWithoutPromoting(t *testing.T) {
+	svc, jobs := newTestService(t)
+	row, candidate, _, tempPath, sha := seedTitleOnlyValidatingCandidate(t, svc, jobs, "wr_veto_multiple", "veto-multiple", "veto-multiple")
+	excerpt := "Book DOI: 10.9999/book\nChapter DOI: 10.9999/chapter\n" + row.Work.Title
+	svc.Validate = func(_ context.Context, _, _ string, _ work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Pages: 36},
+			Text:     pdf.TextReport{Chars: int64(len(excerpt)), Excerpt: excerpt},
+			Identity: pdf.IdentityDecision{Result: pdf.IdentityPass},
+		}, nil
+	}
+	accepted, parked, err := svc.validateCandidate(context.Background(), row, candidate, fetch.Result{
+		TempPath: tempPath, SHA256: sha, SizeBytes: 2048, SniffedMIME: "application/pdf", ContentType: "application/pdf",
+	})
+	if err != nil || accepted || !parked {
+		t.Fatalf("accepted=%v parked=%v err=%v, want identity review", accepted, parked, err)
+	}
+	actions, err := jobs.ListHumanActions(context.Background(), true)
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("actions=%+v err=%v, want one identity review", actions, err)
+	}
+	action := actions[0]
+	if action.Kind != "verify_identity" || action.QuarantineSHA256 != sha || action.QuarantinePath != tempPath {
+		t.Fatalf("review lost its exact quarantined file binding: %+v", action)
+	}
+	if !strings.Contains(action.Detail, "ambiguous") || strings.Contains(action.Detail, "does not match") {
+		t.Fatalf("ambiguous evidence reported as a definite mismatch: %s", action.Detail)
+	}
+}
+
 func TestProcessTriesCorrectCandidateAfterConclusiveMismatch(t *testing.T) {
 	const (
 		wrongURL   = "https://example.test/conclusive-wrong.pdf"

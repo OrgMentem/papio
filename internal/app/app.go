@@ -3615,9 +3615,13 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		// book job) could never be accepted at all. A job selection never
 		// sets ReviewOverride, so picks stay gated.
 		finishErr := s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "needs_review", 0, "conclusive_doi_mismatch")
+		identityDetail := fmt.Sprintf("Document front matter DOI %s does not match this job", strings.Join(conclusiveVeto.DOIs, ", "))
+		if conclusiveVeto.Verdict == pdf.VetoAmbiguous {
+			identityDetail = fmt.Sprintf("Document front matter DOI evidence is ambiguous (%s); check which DOI identifies the requested work", strings.Join(conclusiveVeto.DOIs, ", "))
+		}
 		review := &conclusiveIdentityReview{
-			detail: fmt.Sprintf("Document front matter DOI %s does not match this job; local quarantine file: %s — %s",
-				strings.Join(conclusiveVeto.DOIs, ", "), result.TempPath, strings.Join(conclusiveVeto.Evidence, "; ")),
+			detail: fmt.Sprintf("%s; local quarantine file: %s — %s",
+				identityDetail, result.TempPath, strings.Join(conclusiveVeto.Evidence, "; ")),
 			binding: job.HumanActionBinding{
 				CandidateID: stored.ID, QuarantinePath: result.TempPath, QuarantineSHA256: result.SHA256,
 			},

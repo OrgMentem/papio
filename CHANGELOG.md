@@ -292,6 +292,11 @@ execution records kept during the initial build.
 
 ### Fixed
 
+- **Identity review distinguishes ambiguous DOI evidence from a definite
+  mismatch.** A PDF with multiple front-matter DOIs, such as a book DOI and a
+  chapter DOI, now asks the operator to check which identifies the requested
+  work. The quarantined file and review requirement remain in place.
+
 - A provider route that ends in a manual-download task no longer reuses the
   route's earlier Open request. Explicitly opening that task also withholds
   delegated adapter clicks, so papio does not race the manual download it
