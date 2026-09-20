@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/store"
+	"papio/internal/work"
 )
 
 // jobsFailuresResult decodes the daemon reply. internal/api/failures.go sends
@@ -825,8 +827,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			rows, rowsTruncated, err := listJobsPage(cmd.Context(), opt,
-				map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}, job.ListLimitMax)
+			rows, err := actionJobs(cmd.Context(), opt, actions, selector.active())
 			if err != nil {
 				return err
 			}
@@ -843,7 +844,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				}
 			}
 			urls, urlsTruncated := agentjson.Capped(urls, limit)
-			truncated := urlsTruncated || droppedForMissingJob > 0 || rowsTruncated
+			truncated := urlsTruncated || droppedForMissingJob > 0
 			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
 				if _, err := fmt.Fprintf(opt.out, "%s, none openable from here — run 'papio actions list' for details\n", selector.describe(len(actions))); err != nil {
 					return err
@@ -921,14 +922,43 @@ const openURLTimeout = 5 * time.Second
 
 type commandRunner func(context.Context, string, ...string) error
 
-// actionHandoffTargets resolves the openable handoffs and retains their job IDs
-// newest actions first, up to limit (0 = unbounded). droppedForMissingJob
-// counts open actions whose job id was not present in rows: either the job
-// has moved past awaiting_human since the action was recorded (a routine,
-// self-resolving race the caller cannot act on) or rows itself was bounded
-// and omitted a still-awaiting_human job. Both mean the caller cannot see
-// the complete open-action picture, so a nonzero count should fold into the
-// caller's own `truncated` signal.
+// actionJobs uses the bulk parked-job page for the queue, then fills missing
+// action IDs exactly (terminal advisories and overflow). A selector skips the
+// bulk read. jobs.get includes history, so avoid it for rows already joined.
+func actionJobs(ctx context.Context, opt *options, actions []job.HumanAction, selected bool) ([]job.Row, error) {
+	var rows []job.Row
+	if !selected && len(actions) > 0 {
+		var err error
+		rows, _, err = listJobsPage(ctx, opt,
+			map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}, job.ListLimitMax)
+		if err != nil {
+			return nil, err
+		}
+	}
+	seen := make(map[string]bool, len(actions))
+	for _, row := range rows {
+		seen[row.ID] = true
+	}
+	for _, action := range actions {
+		if action.Status != "open" || seen[action.JobID] {
+			continue
+		}
+		seen[action.JobID] = true
+		var detail api.JobDetail
+		if err := opt.call(ctx, "jobs.get", map[string]string{"job_id": action.JobID}, &detail); err != nil {
+			var remote *ipc.RemoteError
+			if errors.As(err, &remote) && remote.Code == "not_found" {
+				continue
+			}
+			return nil, err
+		}
+		if detail.Job != nil && detail.Job.ID == action.JobID {
+			rows = append(rows, *detail.Job)
+		}
+	}
+	return rows, nil
+}
+
 type actionHandoffTarget struct {
 	JobID   string
 	URL     string
@@ -949,6 +979,8 @@ func browserFocusableActionKind(kind string) bool {
 	return kind == "openurl_handoff" || kind == "manual_download"
 }
 
+// actionHandoffTargets retains newest-first action order. Missing job rows
+// still mark an incomplete view; a known but no longer openable row does not.
 func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor func(string) (config.Institution, bool), limit int) (targets []actionHandoffTarget, droppedForMissingJob int) {
 	jobs := make(map[string]job.Row, len(rows))
 	for _, row := range rows {
@@ -964,7 +996,7 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 			droppedForMissingJob++
 			continue
 		}
-		if row.State != job.StateAwaitingHuman {
+		if row.State != job.StateAwaitingHuman && !(row.State == job.StateUnavailable && action.Kind == "openurl_available") {
 			continue
 		}
 		target, ok := actionURL(action, row, instFor)
@@ -980,6 +1012,20 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 }
 
 func actionURL(action job.HumanAction, row job.Row, instFor func(string) (config.Institution, bool)) (string, bool) {
+	if action.Kind == "openurl_available" {
+		// Match the inbox's untracked manual Open: a canonical work link,
+		// without reviving the terminal job or minting an institutional offer.
+		if doi, err := work.NormalizeDOI(row.Work.DOI); err == nil {
+			return (&url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}).String(), true
+		}
+		if arxiv, err := work.NormalizeArXiv(row.Work.ArXiv); err == nil {
+			return "https://arxiv.org/abs/" + arxiv, true
+		}
+		if openalex, err := work.NormalizeOpenAlex(row.Work.OpenAlex); err == nil {
+			return "https://openalex.org/" + openalex, true
+		}
+		return "", false
+	}
 	return app.ResolveHumanActionURL(action, row, instFor)
 }
 

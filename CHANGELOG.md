@@ -308,6 +308,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Open actions remain usable after conservative acquisition finds no file.**
+  `papio actions open` now finds advisory actions on unavailable jobs and opens
+  their canonical work links. Selecting an action also works beyond the bulk
+  job-list limit. Opening an advisory leaves the terminal job unchanged.
 - **Windows health checks use Windows permissions and a real worker probe.**
   `papio doctor` checks file ownership and access-control lists instead of Unix
   permission bits, and launches the PDF worker to verify its response. Private

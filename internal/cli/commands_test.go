@@ -776,43 +776,30 @@ func TestJobsListStripsTerminalControlBytes(t *testing.T) {
 	}
 }
 
-// TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated pins two
-// parts of the "actions open" completeness fix: the jobs.list join request
-// is filtered to state=awaiting_human (strictly narrower than the old
-// unfiltered newest-500, so an old awaiting_human job stops falling out of
-// the cap), and an open action whose job id is missing from that page — the
-// join's own omission — folds into `truncated`, rather than silently
-// vanishing behind `truncated:false`.
-func TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated(t *testing.T) {
-	action := job.HumanAction{
-		ID: 1, JobID: "old_job", Kind: "openurl_handoff", Status: "open",
-		Detail: app.OABrowserHandoffActionDetail("https://oa.example.test/old.pdf"),
-	}
+// A missing exact job lookup remains visible as an incomplete view instead of
+// making an orphaned open action disappear behind truncated:false.
+func TestActionsOpenFoldsMissingJobIntoTruncated(t *testing.T) {
+	action := job.HumanAction{ID: 1, JobID: "old_job", Kind: "openurl_handoff", Status: "open"}
 	var out, errOut bytes.Buffer
-	var gotJobsListParams map[string]any
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
 		switch method {
 		case "actions.list":
 			*result.(*[]job.HumanAction) = []job.HumanAction{action}
-			return nil
 		case "jobs.list_v2":
-			gotJobsListParams = params.(map[string]any)
-			// old_job's action is still "open", but its job row is absent
-			// from this state-filtered page — exactly the omission
-			// actionHandoffTargets must now surface via droppedForMissingJob.
 			*result.(*api.JobsPage) = api.JobsPage{}
-			return nil
+		case "jobs.get":
+			if !reflect.DeepEqual(params, map[string]string{"job_id": action.JobID}) {
+				t.Fatalf("jobs.get params = %#v", params)
+			}
+			return &ipc.RemoteError{Code: "not_found", Message: "job not found"}
 		default:
 			t.Fatalf("unexpected method %q", method)
-			return nil
 		}
+		return nil
 	})
 	root.SetArgs([]string{"--json", "actions", "open", "--dry-run"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("actions open --dry-run: %v (%s)", err, errOut.String())
-	}
-	if !reflect.DeepEqual(gotJobsListParams, map[string]any{"state": job.StateAwaitingHuman, "limit": job.ListLimitMax}) {
-		t.Fatalf("jobs.list_v2 params = %#v, want state=%q limit=%d", gotJobsListParams, job.StateAwaitingHuman, job.ListLimitMax)
+		t.Fatal(err)
 	}
 	var page struct {
 		URLs      []string `json:"urls"`
@@ -821,11 +808,8 @@ func TestActionsOpenFiltersJobsByStateAndFoldsDroppedRowsIntoTruncated(t *testin
 	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
 		t.Fatal(err)
 	}
-	if len(page.URLs) != 0 {
-		t.Fatalf("urls = %v, want none — the action's job row was omitted from the state-filtered page", page.URLs)
-	}
-	if !page.Truncated {
-		t.Fatal("truncated = false despite an open action whose job row was omitted from the state-filtered jobs.list page — want true")
+	if len(page.URLs) != 0 || !page.Truncated {
+		t.Fatalf("missing job page = %s, want empty URLs and truncated:true", out.String())
 	}
 }
 

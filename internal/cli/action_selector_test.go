@@ -48,6 +48,15 @@ func handoffRoot(t *testing.T, out, errOut *bytes.Buffer, opened *[]string) *cob
 			*result.(*[]job.HumanAction) = actions
 		case "jobs.list_v2":
 			*result.(*api.JobsPage) = api.JobsPage{Jobs: rows}
+		case "jobs.get":
+			id := params.(map[string]string)["job_id"]
+			for _, row := range rows {
+				if row.ID == id {
+					*result.(*api.JobDetail) = api.JobDetail{Job: &row}
+					return nil
+				}
+			}
+			t.Fatalf("unexpected job lookup %q", id)
 		case "actions.open":
 			if opened != nil {
 				*opened = append(*opened, params.(map[string]any)["job_ids"].([]string)...)
