@@ -62,6 +62,11 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     return child.matches(`${fields},${privateSelector}`) || !visible(child) ? "" : publicText(child);
   }).join(" ");
   const label = (element: Element) => safe(element.getAttribute("aria-label") || publicText(element).trim() || element.getAttribute("title") || element.getAttribute("alt"));
+  const hasPublicLabel = (text: string) => text.replace(/\[redacted\]/g, "").trim() !== "";
+  // Rank only the control's own public name, never a neighbouring heading.
+  // This orders evidence within the cap; it grants no execution permission.
+  const priority = (text: string) => /\b(citations?|cite|bibtex|ris|figures?|tables?|supplement(?:ary|al)?|appendi(?:x|ces)|references?)\b/i.test(text) ? 2
+    : /\b(pdf|download|full[ -]?text|formats?|options?|menu|(?:read|save|view) article)\b/i.test(text) ? 0 : 1;
   const human = /\b(password|passcode|credentials?|sign[ -]?(?:in|out)|log[ -]?(?:in|out)|authentication|verification|captcha|challenge|accept|agree|consent|acknowledge|purchase|buy|pay|checkout|subscribe|document delivery|interlibrary|request (?:a |the )?(?:copy|document)|permissions?|authorize|allow access)\b/i;
   const sensitiveField = (node: Element) => node.matches('input[type="password" i]') ||
     /password|passcode|credential|one-time-code|cc-number|cc-csc|cc-exp|credit.?card|card.?number|cvv|cvc/i.test(
@@ -153,10 +158,12 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     const candidates = Array.from(document.querySelectorAll(selector)).filter(element =>
       element.namespaceURI === "http://www.w3.org/1999/xhtml" && !sensitiveForm(element) && element.closest(scope) && !element.closest(privateSelector) && visible(element) &&
       (!element.matches(fields) || element.matches(native)) && (element.matches(native) || !element.querySelector(selector)) &&
-      !/\b(my account|sign[ -]?(?:in|out)|log[ -]?(?:in|out)|profile)\b/i.test(label(element)));
+      !/\b(my account|sign[ -]?(?:in|out)|log[ -]?(?:in|out)|profile)\b/i.test(label(element)))
+      .map(element => ({ element, ownLabel: label(element) }))
+      .filter(({ ownLabel }) => hasPublicLabel(ownLabel));
     const targets = new Map<string, Element>();
     const fingerprints: unknown[] = [];
-    const controls = candidates.map(element => {
+    const controls = candidates.map(({ element, ownLabel }) => {
       let id = state.ids.get(element);
       if (!id) { id = `c${++state.next}`; state.ids.set(element, id); }
       targets.set(id, element);
@@ -166,11 +173,16 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       fingerprints.push([id, element.outerHTML, element.closest<HTMLAnchorElement>("a[href]")?.href, ancestors, form?.outerHTML,
         form ? Array.from(form.elements).map(node => { const field = node as HTMLInputElement & HTMLSelectElement; return [field.outerHTML, field.value, field.checked, field.selectedIndex]; }) : []]);
       const section = element.closest(`section,aside,[role="region"],${scope}`);
-      const heading = section && Array.from(section.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading']")).find(node => visible(node) && !node.closest(privateSelector));
+      // A nested menu's heading does not label every control in its article.
+      const heading = section && Array.from(section.children).find(node => node.matches("h1,h2,h3,h4,h5,h6,[role='heading']") && visible(node) && !node.closest(privateSelector));
       const context = safe(section?.getAttribute("aria-label") || (heading ? publicText(heading) : ""), 100);
-      return { id, role: role(element), label: safe(`${label(element)}${context ? ` [${context}]` : ""}`), disabled: disabled(element) || !allowed(element) };
-    });
-    const projection = { doi, title: safe(document.querySelector('meta[name="citation_title" i]')?.getAttribute("content"), 400), controls: controls.slice(0, 80) };
+      return { priority: priority(ownLabel), control: { id, role: role(element), label: safe(`${ownLabel}${context ? ` [${context}]` : ""}`), disabled: disabled(element) || !allowed(element) } };
+    }).sort((a, b) => a.priority - b.priority).map(({ control }) => control);
+    const metadata = Array.from(document.querySelectorAll("meta[name]"));
+    const title = ["citation_title", "dc.title", "prism.title"].flatMap(name => metadata
+      .filter(node => node.getAttribute("name")?.trim().toLowerCase() === name)
+      .map(node => safe(node.getAttribute("content"), 400))).find(hasPublicLabel) ?? "";
+    const projection = { doi, title, controls: controls.slice(0, 80) };
     const source = JSON.stringify([state.document, binding, location.href, document.baseURI, projection, fingerprints]);
     return { status: "snapshot" as const, projection, source, targets };
   };

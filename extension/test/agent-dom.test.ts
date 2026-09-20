@@ -41,7 +41,7 @@ test("production injection serializes independently and clicks a JS-backed artic
   const result = observed(await injected({ method: "observe", entryURL, doi }));
   expect(result.observation.doi).toBe(doi.toLowerCase());
   expect(result.observation.revision).toMatch(/^[a-f0-9]{64}$/);
-  expect(result.observation.controls[0]).toEqual({ id: "c1", role: "button", label: "Download PDF [An example open-access research article]", disabled: false });
+  expect(result.observation.controls[0]).toEqual({ id: "c1", role: "button", label: "Download PDF", disabled: false });
   expect(await injected({ method: "act", entryURL, doi, document: result.document, revision: result.observation.revision, choice: "c1" })).toMatchObject({ status: "dispatched" });
   expect(clicks).toBe(1);
 });
@@ -58,6 +58,73 @@ test("sanitized projection omits account/form/URL/body data while hidden executi
   const after = observed(await observe());
   expect(after.observation.revision).not.toBe(before.observation.revision);
   expect(after.observation.controls).toEqual(before.observation.controls);
+});
+
+test("a nested download heading cannot name unrelated article controls or unnamed candidates", async () => {
+  setup(`<meta name="citation_doi" content="${doi}"><main>
+    <div><h3>Downloads</h3><a href="#"></a><button><span hidden>Hidden PDF</span></button>
+      <button aria-label="https://private.test/SECRET user@example.test"></button></div>
+    <button>Share</button><button>Cite</button><a href="#formats">Download</a>
+    <section><h2>Figures</h2><button>Save PNG</button></section>
+    <section aria-label="Local formats"><div><h3>Unowned heading</h3></div><button>Options</button></section>
+  </main>`);
+  const controls = observed(await observe()).observation.controls;
+  expect(controls.map(c => c.label)).toEqual(["Download", "Options [Local formats]", "Share", "Save PNG [Figures]", "Cite"]);
+  expect(controls.every(c => !c.disabled)).toBe(true);
+  expect(JSON.stringify(controls)).not.toContain("SECRET");
+});
+
+test("only visible public direct headings supply implicit region context", async () => {
+  setup(`<meta name="citation_doi" content="${doi}"><main><h1 hidden>Hidden heading</h1>
+    <h2 data-private>PRIVATEHEADING</h2><div><h3>Nested download</h3></div><button>Share</button>
+    <section><h2>Article formats</h2><button>PDF options</button></section>
+  </main>`);
+  expect(observed(await observe()).observation.controls.map(c => c.label)).toEqual(["PDF options [Article formats]", "Share"]);
+});
+
+for (const [metadata, title] of [
+  ['<meta name="dc.title" content="DC article">', "DC article"],
+  ['<meta name="PRISM.TITLE" content="Prism article">', "Prism article"],
+  ['<meta name="prism.title" content="Prism article"><meta name=" DC.Title " content="DC article">', "DC article"],
+  ['<meta name="dc.title" content="DC article"><meta name="citation_title" content="Citation article">', "Citation article"],
+  ['<meta name="citation_title" content=" "><meta name="dc.title" content="https://private.test/SECRET"><meta name="prism.title" content="Public article user@example.test">', "Public article [redacted]"],
+  ["", ""],
+] as const) test(`title uses only the first public standard metadata value: ${metadata || "absent"}`, async () => {
+  setup(`<title>PRIVATEBROWSERTITLE</title><meta name="citation_doi" content="${doi}">${metadata}<main><h1>PRIVATEBODYTITLE</h1><button>Formats</button></main>`);
+  expect(observed(await observe()).observation.title).toBe(title);
+});
+
+test("standard title fallback retains the existing public text length cap", async () => {
+  setup(`<meta name="citation_doi" content="${doi}"><meta name="dc.title" content="${"Public article ".repeat(40)}"><main><button>Formats</button></main>`);
+  expect(observed(await observe()).observation.title).toHaveLength(400);
+});
+
+test("own-label ranking precedes the cap without promoting region context or authorizing PDF navigation", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main>
+    <button>Download citation</button><button>Figures PDF</button><button>Supplementary PDF</button>
+    <section aria-label="Download PDF">${Array.from({ length: 85 }, (_, i) => `<button>Share ${i}</button>`).join("")}</section>
+    <button>Formats</button><a href="/download/opaque/article.pdf">Article PDF</a>
+    <button>Download PDF</button>
+  </main>`);
+  const first = observed(await observe());
+  expect(first.observation.controls).toHaveLength(80);
+  expect(first.observation.controls.slice(0, 4).map(c => [c.label, c.disabled])).toEqual([
+    ["Formats", false], ["Article PDF", true], ["Download PDF", false], ["Share 0 [Download PDF]", false],
+  ]);
+  expect(first.observation.controls.some(c => /citation|Figures|Supplementary/.test(c.label))).toBe(false);
+  expect(first.observation.controls[0]!.id).not.toBe("c1"); // IDs belong to elements, not rank positions.
+  const pdf = first.observation.controls[1]!;
+  let clicks = 0; win.document.querySelector("a")!.addEventListener("click", () => clicks++);
+  expect(await act(first, { choice: pdf.id })).toEqual({ status: "stale", reason: "observation_changed" });
+  expect(clicks).toBe(0);
+  expect(observed(await observe()).observation).toEqual(first.observation);
+  win.document.querySelector("main")!.insertAdjacentHTML("afterbegin", '<button>PDF options</button>');
+  const next = observed(await observe());
+  expect(next.observation.controls[0]!.label).toBe("PDF options");
+  expect(next.observation.controls.find(c => c.label === "Formats")!.id).toBe(first.observation.controls[0]!.id);
+  // A control outside the transmitted cap still participates in freshness.
+  win.document.querySelector("section button:last-child")!.setAttribute("onclick", "changed()");
+  expect(await act(next)).toEqual({ status: "stale", reason: "observation_changed" });
 });
 
 for (const [gate, reason] of [

@@ -350,17 +350,74 @@ for (const change of ["downgrade", "epoch", "tab", "cancel", "permission", "huma
   expect(h.downloads.started).toHaveLength(0);
 });
 
-test("concurrent classification and replay cannot start a second loop or duplicate an unchanged effect", async () => {
+test("concurrent classification and an unchanged effect get bounded rechecks without a second paid decision", async () => {
   const h = await harness();
   await Promise.all([h.classify(), h.classify()]); await h.started();
   await h.decide("decision", "c1"); await until(() => h.counts().actions === 1); await flush();
-  const after = h.frames.length;
-  await h.classify(); await h.tick();
-  await h.decide("decision", "c1", after); await h.settle();
+  await h.classify();
+  for (let i = 0; i < 2; i++) {
+    await h.tick(); await until(() => h.timers.some(timer => timer.ms === 1000));
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+  }
+  await h.tick(); await h.settle();
   expect(h.counts().actions).toBe(1);
+  expect(h.counts().observations).toBe(4);
+  expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
   expect(h.frames.filter(f => f.type === "provider_drive_epoch_start_request")).toHaveLength(1);
   expect(h.frames.filter(f => f.type === "provider_outcome")).toHaveLength(1);
+  expect(h.frames.find(f => f.type === "provider_outcome")?.payload["detail"]).toContain("no observable article change");
+  expect(h.frames.find(f => f.type === "provider_drive_epoch_result_request")?.payload["detail"]).toContain("no observable article change");
+  expect(Reflect.get(h.bridge, "downloads").has(jobID)).toBe(false);
 });
+
+test("a menu that renders during the bounded rechecks gets a fresh decision and exact download tracking", async () => {
+  const h = await harness(); await h.classify(); await h.started();
+  const first = await h.decide("decision", "c1");
+  await until(() => h.counts().actions === 1); await flush();
+  for (let i = 0; i < 2; i++) {
+    await h.tick(); await until(() => h.timers.some(timer => timer.ms === 1000));
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+  }
+  h.win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button type="button">Download PDF</button>');
+  await h.tick();
+  const second = await h.request("agent_decide_request_v1", h.frames.indexOf(first) + 1);
+  const observation = second.payload["observation"] as { revision: string; controls: { id: string; label: string }[] };
+  expect(observation.revision).not.toBe((first.payload["observation"] as { revision: string }).revision);
+  const download = observation.controls.find(c => c.label.startsWith("Download PDF"))!;
+  h.setOnAct(async () => { await h.downloads.onCreated.emit({ id: 908, tabId: tabID, url: "https://unregistered.example/generated", state: "in_progress" }); });
+  await h.reply(second, "agent_decide_result_v1", { observation_revision: observation.revision, outcome: "decision", choice: download.id });
+  await until(() => h.backend.store.activeJobs[0]?.generic_drive_epoch?.in_flight_download_id === 908);
+  expect(h.counts().actions).toBe(2);
+  expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(2);
+  expect(h.frames.some(f => f.type === "provider_outcome" || f.type === "provider_drive_epoch_result_request")).toBe(false);
+});
+
+for (const change of ["permission", "navigation", "document", "gate", "generation", "cancel"] as const)
+  test(`bounded no-progress rechecks retain the ${change} guard`, async () => {
+    const h = await harness(); await h.classify(); await h.started(); await h.decide("decision", "c1");
+    await until(() => h.counts().actions === 1); await flush();
+    await h.tick(); await until(() => h.timers.some(timer => timer.ms === 1000));
+    if (change === "permission") h.setPermission(false);
+    if (change === "navigation") h.tabs.seed({ id: tabID, url: url + "/other", status: "complete" });
+    if (change === "document") Reflect.deleteProperty(globalThis, "papioArticleAgent");
+    if (change === "gate") h.win.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept PRIVATECONSENT</dialog>');
+    if (change === "generation") {
+      const generation = Reflect.get(h.bridge, "portGeneration") + 1;
+      Reflect.set(h.bridge, "portGeneration", generation); Reflect.set(h.bridge, "helloAckGeneration", generation);
+    }
+    if (change === "cancel") await h.update(store => ({ ...store, activeJobs: [] }));
+    await h.tick(); await h.settle();
+    expect(h.counts().actions).toBe(1);
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(h.frames.some(f => f.type === "download_complete")).toBe(false);
+    if (change === "generation" || change === "cancel") expect(h.frames.some(f => f.type === "provider_outcome")).toBe(false);
+    const detail = h.frames.find(f => f.type === "provider_drive_epoch_result_request")?.payload["detail"];
+    expect(detail).not.toContain("PRIVATECONSENT");
+    if (change === "gate") expect(detail).toContain("consent_required");
+    if (change === "document") expect(detail).toContain("document_changed");
+    if (change === "navigation") expect(detail).toContain("page_binding_failed");
+  });
 
 test("an old loop cannot park or rewrite the job after a connection generation changes", async () => {
   const h = await harness(); await h.classify(); await h.started();

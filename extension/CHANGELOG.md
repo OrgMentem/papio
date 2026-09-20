@@ -123,6 +123,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Article-agent choices use the control's own label.** Unnamed controls no
+  longer inherit unrelated download headings. Standard article titles and
+  relevant controls survive the observation limit, and unchanged pages are
+  rechecked without another paid decision or repeated click.
 - **Article-agent fallback recognizes standard DOI metadata and explains refusals.**
   Dublin Core and PRISM identifiers can establish an exact article match;
   conflicting DOI claims still stop the attempt. Missing identity, changed pages,

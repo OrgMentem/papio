@@ -19835,10 +19835,12 @@ export class Bridge {
       ? `Article agent fallback stopped [${reason}]: ${domDetails[reason]}`
       : "Article agent fallback stopped because the page check returned no recognized refusal reason.";
     const noControlDetail = "Article agent fallback found no usable article control.";
+    const noProgressDetail = "Article agent fallback stopped because the clicked control produced no observable article change after a brief wait; operator review is required.";
     let track: DownloadTrack | undefined;
     let entryURL: string | undefined;
     let documentID: string | undefined;
     const usedRevisions = new Set<string>();
+    let unchangedRechecks = 0;
     const sameEpoch = (): ActiveJob | undefined => {
       const current = findByJob(this.store, jobID);
       return this.portGeneration === generation && current?.tab_id === job.tab_id && current.generic_drive_epoch !== undefined &&
@@ -19906,7 +19908,7 @@ export class Bridge {
         start.payload?.["revision"] === epoch.revision;
       if (!authorized()) return;
       if (!started) { if (start.kind !== "response") exitDetail = unavailableDetail; return; }
-      for (let decisions = 0; decisions < 60 && authorized(); decisions++) {
+      for (let decisions = 0; decisions < 60 && authorized();) {
         if (!(await liveTab()) || !authorized()) return;
         const observed = (await this.deps.scripting.executeScript({
           target: { tabId: job.tab_id }, func: agentDOM,
@@ -19919,6 +19921,17 @@ export class Bridge {
         }
         documentID = observed.document;
         const observation = observed.observation;
+        // A consumed observation cannot authorize another effect. Give a local
+        // menu two one-second rechecks to render before stopping, without
+        // paying for another decision on the same evidence. WAIT is unconsumed.
+        if (usedRevisions.has(observation.revision)) {
+          if (unchangedRechecks >= 2) { exitDetail = noProgressDetail; return; }
+          unchangedRechecks++;
+          await pause();
+          if (downloaded() || !authorized()) return;
+          continue;
+        }
+        unchangedRechecks = 0;
         if (!observation.controls.some(control => !control.disabled)) { exitDetail = noControlDetail; return; }
         if (sameEpoch()?.status === "auth_pending") {
           // A matching public article identifies the work, not a successful
@@ -19928,6 +19941,7 @@ export class Bridge {
             ? patchJob(store, jobID, { status: "awaiting_download" }) : store);
           if (!authorized()) return;
         }
+        decisions++;
         const result = await this.requestCorrelated("agent_decide_request_v1", {
           drive_attempt_id: epoch.drive_attempt_id, ordinal: epoch.ordinal,
           strategy: "generic", revision: epoch.revision, observation,
@@ -19943,7 +19957,6 @@ export class Bridge {
           if (!authorized()) return;
           continue;
         }
-        if (usedRevisions.has(observation.revision)) return;
         if (typeof choice !== "string" || !observation.controls.some(control => control.id === choice && !control.disabled)) { exitDetail = noControlDetail; return; }
         if (!(await liveTab()) || !authorized()) return;
         // Arm the existing generic producer BEFORE click dispatch. No invented
