@@ -15,6 +15,9 @@
 // The class is constructed with an injected BridgeDeps seam so the whole flow is
 // unit-testable without a real chrome runtime.
 
+import { createPageSpikeDeliveryHandler, PAGE_SPIKE_DELIVERY, type PageSpikeDeliveryFence } from "../tools/page-spike-delivery";
+declare const __PAPIO_PAGE_SPIKE__: unknown;
+
 import {
   PAPIO_MARK,
   PAPIO_MARK_SIZE_PX,
@@ -7883,8 +7886,21 @@ export class Bridge {
 
   async startPDFDelivery(
     payload: DeliveryStartPayload,
+    fixture?: PageSpikeDeliveryFence,
   ): Promise<DeliveryReply> {
     await this.ready;
+    // Only the compiled developer seam supplies this fence. A preflight outside
+    // this method could race tab lookup and silently resolve a different job.
+    if (fixture && (payload.url !== fixture.pdfURL || payload.doi !== undefined ||
+        (payload.choice !== undefined && payload.choice.job_id !== fixture.jobID))) {
+      return failure("job_mismatch", "Invalid fixture delivery binding");
+    }
+    if (fixture && this.store.pendingDelivery?.job_id === fixture.jobID) {
+      return failure("duplicate_dispatch", "This fixture already has a PDF delivery");
+    }
+    if (fixture && findByJob(this.store, fixture.jobID)?.download_initiated) {
+      return failure("duplicate_dispatch", "This fixture already started a download");
+    }
     // Choice accept path — handle before normal resolution, but after tab lookup
     if (payload.choice !== undefined) {
       const entry = this.consumeDeliveryChoice(payload.choice);
@@ -7909,6 +7925,8 @@ export class Bridge {
         return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
       }
       const liveTabURL = tabCheck.url;
+      if (fixture && liveTabURL !== fixture.pdfURL)
+        return failure("fixture_changed", "The fixture PDF tab changed");
       const liveEpoch = await this.liveDocumentEpoch(payload.tab_id);
       if (liveEpoch === undefined) {
         return { ok: false, state: "failed", code: "choice_expired", message: "That choice expired — click Send this PDF again." } as unknown as DeliveryReply;
@@ -8024,6 +8042,8 @@ export class Bridge {
       );
     }
     const tabURL = tab.url;
+    if (fixture && tabURL !== fixture.pdfURL)
+      return failure("fixture_changed", "The fixture PDF tab changed");
     const viewerPDFURL = providerViewerPDFURL(tabURL, this.deps.adapterSpecs);
     const url = viewerPDFURL ?? this.comparableDeliverySourceURL(tabURL);
     if (viewerPDFURL === undefined && !isPDFPage(tabURL) && !isPDFPage(url)) {
@@ -8034,6 +8054,34 @@ export class Bridge {
       findByTab(this.store, payload.tab_id) ??
       this.deliveryJobForOpener(tab) ??
       this.deliveryJobForDOI(doi);
+    // Extension reloads clear session storage. Recover the daemon's existing
+    // manual actions on an explicit Send PDF request, without requiring an
+    // inbox visit or turning startup into provider work. Choosing a recovered
+    // entry still uses the ordinary one-use, live-document-bound picker.
+    if (job === undefined && (doi === undefined || doi.trim() === "") &&
+        this.advisoryCandidates().length === 0 &&
+        (this.store.daemonFeatures ?? []).includes(TRIAGE_SNAPSHOT_FEATURE)) {
+      const refreshed = await this.requestTriageSnapshot({ schema_versions: [1], limit: 100 });
+      if (!refreshed.ok) return refreshed;
+      // The snapshot wait must not let an old tab URL mint a choice for a
+      // different PDF. The picker below then reads the live document epoch,
+      // and consumption rechecks both that epoch and the source URL.
+      try {
+        if ((await this.deps.tabs.get(payload.tab_id)).url !== tabURL)
+          return failure("page_changed", "The PDF tab changed — click Send this PDF again");
+      } catch {
+        return failure("tab_unavailable", "The current PDF tab is no longer available");
+      }
+    }
+    if (fixture) {
+      if ((job !== undefined && job.job_id !== fixture.jobID) ||
+          !this.advisoryCandidates().some((candidate) => candidate.job_id === fixture.jobID)) {
+        return failure("job_mismatch", "The fixture job is not eligible for PDF delivery");
+      }
+      // Always use the existing choice path, including its document epoch check;
+      // never let a no-candidate fixture fall through to an unbound PDF grab.
+      job = undefined;
+    }
     let duplicate = false;
     if (job === undefined) {
       if (doi === undefined || doi.trim() === "") {
@@ -20222,32 +20270,25 @@ export class Bridge {
     );
   }
 
-  /** Re-derive which manual-download correlation windows are still live from
-   * the daemon's own view of what is still open.
+  /** Reconcile manual PDF choices with the daemon's open actions. An extension
+   * reload clears session storage, so a missing record must be recoverable from
+   * the snapshot alone. Its title is a picker label, not identifier or provider
+   * authority: recovery requires an explicit PDF choice and never opens a tab.
+   * Existing records retain their own, independently established bindings.
    *
-   * This is also the restart path. The window record itself is persisted, so
-   * an MV3 teardown does not lose it and the startup drive scan leaves it
-   * alone; what a restart does lose is any right to believe it. The first
-   * complete snapshot after the worker comes back either reconfirms the
-   * action — the window keeps steering — or reports it closed, in which case
-   * the record is dropped rather than left to claim an unrelated download
-   * from the same provider months later.
-   *
-   * Only a complete first page is authority. A cursored page, a page with
-   * `has_more`, one the daemon could not fully render at the negotiated
-   * schema, or one carrying an item this cannot read describes a subset of
-   * the open actions, and retiring against a subset would drop live windows.
+   * Every validated page supplies positive evidence for its listed actions.
+   * Only a complete first page with no unsupported items supplies absence:
+   * retiring against a subset would drop live windows on other pages.
    * Identification is structural — schema-3+ `route_class` first, the older
    * `action_kind` field otherwise — never the action's prose detail. */
   private async reconcileManualDownloadWindows(
     snapshot: Record<string, unknown>,
     paged: boolean,
   ): Promise<void> {
-    if (paged || snapshot["has_more"] !== false) return;
-    if (snapshot["unsupported_items_count"] !== 0) return;
+    await this.ready;
     const items = snapshot["items"];
     if (!Array.isArray(items)) return;
-    const open = new Set<string>();
+    const open = new Map<string, string | undefined>();
     for (const entry of items) {
       if (typeof entry !== "object" || entry === null) return;
       const item = entry as Record<string, unknown>;
@@ -20257,8 +20298,25 @@ export class Bridge {
       const routeClass = item["route_class"];
       const kind =
         typeof routeClass === "string" ? routeClass : item["action_kind"];
-      if (kind === "manual_download") open.add(jobID);
+      if (kind === "manual_download") {
+        open.set(jobID, typeof item["title"] === "string" ? item["title"] : undefined);
+      }
     }
+    for (const [jobID, title] of open) {
+      if (findByJob(this.store, jobID) !== undefined) continue;
+      const now = this.deps.now();
+      await this.upsertJobWithoutOffer({
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: now,
+        expires_at: now, // No offer/lease was minted; the open action governs retirement.
+        status: "awaiting_download",
+        provider_hosts: [],
+        manual_delivery_required: true,
+        ...(title === undefined ? {} : { expected: { title } }),
+      });
+    }
+    if (paged || snapshot["has_more"] !== false || snapshot["unsupported_items_count"] !== 0) return;
     const stale = this.store.activeJobs
       .filter(
         (job) => this.isManualDownloadWindow(job) && !open.has(job.job_id),
@@ -23378,6 +23436,14 @@ function realDeps(): BridgeDeps {
 // Wiring runs only inside a real extension service worker, never under bun test.
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   const bridge = new Bridge(realDeps());
+  const pageSpikeDelivery = createPageSpikeDeliveryHandler(
+    typeof __PAPIO_PAGE_SPIKE__ === "undefined" ? null : __PAPIO_PAGE_SPIKE__, {
+      runtimeID: chrome.runtime.id,
+      getSelf: () => chrome.management.getSelf(),
+      getTab: (tabID) => chrome.tabs.get(tabID),
+      startPDFDelivery: (request, fence) => bridge.startPDFDelivery(request, fence),
+    },
+  );
   // The broker authorizes senders by exact page URL. Derive the popup path
   // from the manifest and the inbox as its sibling so the authorized URLs
   // can never drift from the shipped page layout again.
@@ -23416,6 +23482,10 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   });
   chrome.runtime.onInstalled.addListener(() => {});
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (pageSpikeDelivery && isObjectRecord(message) && message["type"] === PAGE_SPIKE_DELIVERY) {
+      respondToRuntimePromise(pageSpikeDelivery(message, _sender), sendResponse);
+      return true;
+    }
     if (isObjectRecord(message) && isInboxRuntimeMessageType(message["type"])) {
       respondToRuntimePromise(
         handleInboxRuntimeMessage(bridge, message, _sender, inboxRuntimeURLs),

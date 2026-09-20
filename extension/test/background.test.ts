@@ -1315,13 +1315,13 @@ function manualDownloadItem(
 async function settleSnapshot(
   h: Harness,
   items: Record<string, unknown>[],
-  opts?: { hasMore?: boolean; unsupported?: number; cursor?: string },
+  opts?: { hasMore?: boolean; unsupported?: number; cursor?: string; schema?: 1 | 3 },
 ): Promise<void> {
   const before = h
     .frames()
     .filter((frame) => frame.type === "triage_snapshot_request").length;
   const pending = h.bridge.requestTriageSnapshot({
-    schema_versions: [1],
+    schema_versions: opts?.schema === 3 ? [3] : [1],
     ...(opts?.cursor === undefined ? {} : { cursor: opts.cursor }),
   });
   await Promise.resolve();
@@ -1334,7 +1334,7 @@ async function settleSnapshot(
   await h.port.inbound(
     nativeResult("triage_snapshot_response", {
       request_id: request!.payload["request_id"],
-      schema: 1,
+      schema: opts?.schema ?? 1,
       generated_at: "2027-01-01T00:00:00Z",
       counts: {
         ...triageCounts(0),
@@ -7270,6 +7270,192 @@ test("a worker restart rehydrates the retained window from the daemon's snapshot
   expect(await suggestFilenameFor(restarted, clickDownload(952))).toEqual([
     `papio/${jobID}/1234567.pdf`,
   ]);
+});
+
+test("an empty backend recovers an inert manual PDF choice from the daemon snapshot", async () => {
+  const jobID = "job_manual_window_empty_backend";
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["triage_snapshot_v1"] }));
+  expect(h.backend.store.activeJobs).toEqual([]);
+  await settleSnapshot(h, [{ ...manualDownloadItem(jobID), title: "Recovered paper",
+    links: [
+      { rel: "doi", url: "https://doi.org/10.1234/recovered" },
+      { rel: "landing", url: `https://${PROVIDER_HOST}/paper` },
+    ],
+  }]);
+
+  // The action supplies a picker entry, never a reconstructed provider route.
+  expect(h.backend.store.activeJobs).toEqual([{
+    job_id: jobID, tab_id: -1, offered_at: h.clock.now, expires_at: h.clock.now,
+    status: "awaiting_download", provider_hosts: [], manual_delivery_required: true,
+    expected: { title: "Recovered paper" },
+  }]);
+  expect(h.tabs.created).toEqual([]);
+  expect(h.downloads.started).toEqual([]);
+  expect(h.bridge.latestOpenURL()).toBeUndefined();
+  expect(await suggestFilenameFor(h, clickDownload(949))).toEqual([]);
+  expect(await suggestFilenameFor(h, { ...clickDownload(950),
+    url: `https://${PROVIDER_HOST}/doi/pdf/10.1234/recovered`,
+  })).toEqual([]);
+
+  const pdfURL = `https://${PROVIDER_HOST}/recovered.pdf`;
+  h.tabs.seed({ id: 50, url: pdfURL });
+  const offered = await h.bridge.startPDFDelivery({ tab_id: 50, url: pdfURL });
+  expect(offered).toMatchObject({ ok: true, state: "needs_choice", choice: {
+    candidates: [{ job_id: jobID, title: "Recovered paper" }],
+  } });
+  if (!offered.ok || !offered.choice) throw new Error("expected a manual PDF choice");
+  expect(h.downloads.started).toEqual([]);
+  expect(await h.bridge.startPDFDelivery({ tab_id: 50, url: pdfURL,
+    choice: { interaction: offered.choice.interaction, job_id: jobID },
+  })).toMatchObject({ ok: true, state: "sending", job_id: jobID });
+  expect(h.downloads.started).toEqual([{
+    url: pdfURL, filename: `papio/${jobID}/paper.pdf`, conflictAction: "uniquify", saveAs: false,
+  }]);
+  const item: DownloadItemLike = { id: 901, url: pdfURL, filename: "recovered.pdf", state: "in_progress" };
+  expect(await suggestFilenameFor(h, item)).toEqual([`papio/${jobID}/recovered.pdf`]);
+  await h.downloads.onCreated.emit(item);
+  h.downloads.items.set(901, { ...item,
+    filename: `/Users/x/Downloads/papio/${jobID}/recovered.pdf`,
+    fileSize: 123_456, mime: "application/pdf", state: "complete",
+  });
+  await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  expect(h.frames().filter(frame => frame.type === "download_complete")).toMatchObject([{
+    job_id: jobID, payload: { download_id: 901, filename: "recovered.pdf", size_bytes: 123_456 },
+  }]);
+});
+
+test("cold Send PDF recovers manual choices without first opening the inbox", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["triage_snapshot_v1"] }));
+  const jobID = "job_manual_recover_send_pdf";
+  const pdfURL = "https://unrelated.example/recovered.pdf";
+  h.tabs.seed({ id: 50, url: pdfURL });
+  const urls = {
+    runtimeID: "papio-test-id", inboxURL: "chrome-extension://papio-test-id/inbox.html",
+    popupURL: "chrome-extension://papio-test-id/popup.html", historyURL: "chrome-extension://papio-test-id/history.html",
+    optionsURL: "chrome-extension://papio-test-id/options.html", pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+    toastURL: "chrome-extension://papio-test-id/toast.html",
+  };
+  const sendPDF = (request: Parameters<Bridge["startPDFDelivery"]>[0]) =>
+    handleInboxRuntimeMessage(h.bridge, { type: "papio.delivery.start", request },
+      { id: urls.runtimeID, url: urls.popupURL }, urls) as ReturnType<Bridge["startPDFDelivery"]>;
+  const pending = sendPDF({ tab_id: 50, url: pdfURL });
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  const requests = h.frames().filter(frame => frame.type === "triage_snapshot_request");
+  expect(requests).toHaveLength(1);
+  await h.port.inbound(nativeResult("triage_snapshot_response", {
+    request_id: requests[0]!.payload["request_id"], schema: 1,
+    generated_at: "2027-01-01T00:00:00Z", counts: { ...triageCounts(0), pending_total: 1, actions: 1 },
+    items: [manualDownloadItem(jobID)], has_more: false, unsupported_items_count: 0,
+  }));
+  const offered = await pending;
+  expect(offered).toMatchObject({ ok: true, state: "needs_choice", choice: {
+    candidates: [{ job_id: jobID, title: "Example work" }],
+  } });
+  if (!offered.ok || !offered.choice) throw new Error("expected recovered choice");
+  expect(await sendPDF({ tab_id: 50, url: pdfURL,
+    choice: { interaction: offered.choice.interaction, job_id: jobID },
+  })).toMatchObject({ ok: true, state: "sending", job_id: jobID });
+  expect(h.frames().filter(frame => frame.type === "triage_snapshot_request")).toHaveLength(1);
+  expect(h.downloads.started).toHaveLength(1);
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("cold Send PDF refuses a tab that navigates during snapshot recovery", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["triage_snapshot_v1"] }));
+  const pdfURL = "https://unrelated.example/original.pdf";
+  h.tabs.seed({ id: 50, url: pdfURL });
+  const pending = h.bridge.startPDFDelivery({ tab_id: 50, url: pdfURL });
+  const request = await h.port.waitForFrame("triage_snapshot_request");
+  h.tabs.patch(50, { url: "https://unrelated.example/other.pdf" });
+  await h.port.inbound(nativeResult("triage_snapshot_response", {
+    request_id: request.payload["request_id"], schema: 1,
+    generated_at: "2027-01-01T00:00:00Z", counts: { ...triageCounts(0), pending_total: 1, actions: 1 },
+    items: [manualDownloadItem("job_manual_recover_navigated")], has_more: false, unsupported_items_count: 0,
+  }));
+  expect(await pending).toMatchObject({ ok: false, error: { code: "page_changed" } });
+  expect(h.downloads.started).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("manual PDF recovery uses positive pages but retires only against complete absence", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["triage_snapshot_v1"] }));
+  const first = "job_manual_recover_page_one", second = "job_manual_recover_page_two";
+  const third = "job_manual_recover_partial_schema";
+  await settleSnapshot(h, [manualDownloadItem(first)], { hasMore: true });
+  expect(h.backend.store.activeJobs.map(job => job.job_id)).toEqual([first]);
+  await settleSnapshot(h, [manualDownloadItem(second)], { cursor: "next-page" });
+  expect(h.backend.store.activeJobs.map(job => job.job_id)).toEqual([first, second]);
+  await settleSnapshot(h, [manualDownloadItem(third)], { unsupported: 1 });
+  expect(h.backend.store.activeJobs.map(job => job.job_id)).toEqual([first, second, third]);
+  const firstRecord = structuredClone(h.backend.store.activeJobs[0]);
+  h.clock.now += 5_000;
+  await settleSnapshot(h, [manualDownloadItem(first)], { hasMore: true });
+  expect(h.backend.store.activeJobs).toHaveLength(3);
+  expect(h.backend.store.activeJobs[0]).toEqual(firstRecord);
+
+  const pdfURL = "https://unrelated.example/recovered.pdf";
+  h.tabs.seed({ id: 50, url: pdfURL });
+  const offered = await h.bridge.startPDFDelivery({ tab_id: 50, url: pdfURL });
+  if (!offered.ok || !offered.choice) throw new Error("expected a manual PDF choice");
+  await settleSnapshot(h, []);
+  expect(h.backend.store.activeJobs).toEqual([]);
+  expect(await h.bridge.startPDFDelivery({ tab_id: 50, url: pdfURL,
+    choice: { interaction: offered.choice.interaction, job_id: first },
+  })).toMatchObject({ ok: false });
+  expect(h.downloads.started).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+  expect(h.tabs.removed).toEqual([]);
+});
+
+test("manual PDF recovery preserves existing records and never invents authority from links", async () => {
+  const existing: ActiveJob = {
+    job_id: "job_manual_recover_existing", tab_id: -1,
+    offered_at: 1_600_000_000_000, expires_at: 1_900_000_000_000,
+    status: "awaiting_download", provider_hosts: [PROVIDER_HOST], adapter_id: "provider",
+    expected: { title: "Original title", doi: "10.1234/original" },
+  };
+  const active: ActiveJob = { ...existing, job_id: "job_manual_recover_active", tab_id: 90, status: "accepted", access_mode: "assisted" };
+  const h = makeHarness({ ...emptyStore(), activeJobs: [existing, active] });
+  h.tabs.seed({ id: 90, url: `https://${PROVIDER_HOST}/original` });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["triage_snapshot_v1"] }));
+  const before = structuredClone(h.backend.store.activeJobs);
+  const newJob = "job_manual_recover_fresh";
+  await settleSnapshot(h, [
+    { ...manualDownloadItem(existing.job_id, 1), title: "A different picker title" },
+    manualDownloadItem(newJob, 2),
+    { ...manualDownloadItem("job_not_a_download", 3), action_kind: "openurl_handoff" },
+  ]);
+  expect(h.backend.store.activeJobs.slice(0, 2)).toEqual(before);
+  expect(h.backend.store.activeJobs.map(job => job.job_id)).toEqual([existing.job_id, active.job_id, newJob]);
+  expect(h.tabs.created).toEqual([]);
+  expect(h.downloads.started).toEqual([]);
+  await settleSnapshot(h, []);
+  expect(h.backend.store.activeJobs).toEqual([before[1]!]);
+  expect(h.tabs.removed).toEqual([]);
+});
+
+test("manual PDF recovery identifies schema-3 actions by route_class rather than action prose", async () => {
+  const h = makeHarness();
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["triage_snapshot_v1", "triage_snapshot_schema_v3"] }));
+  const jobID = "job_manual_recover_route_class";
+  await settleSnapshot(h, [
+    { ...manualDownloadItem(jobID), action_kind: "legacy_download", route_class: "manual_download", attention: "required", auth_requirement: "unknown" },
+    { ...manualDownloadItem("job_not_manual_route", 2), route_class: "openurl_handoff", attention: "required", auth_requirement: "unknown" },
+  ], { schema: 3 });
+  expect(h.backend.store.activeJobs.map(job => job.job_id)).toEqual([jobID]);
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ manual_delivery_required: true, provider_hosts: [], tab_id: -1 });
+  expect(h.downloads.started).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
 });
 
 test("a complete snapshot without the action retires the retained window", async () => {

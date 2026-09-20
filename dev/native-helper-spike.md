@@ -169,7 +169,7 @@ and invoke Papio's toolbar action. Return to the previous foreground app, then
 POST to the printed `startURL` from the terminal. Use a fresh run with `--backend
 jev` for model acceptance; the same Keychain authorization and private receipts
 apply. Closing the fixture tab revokes its activeTab access. The runner closes
-its owned fixture on completion, cancellation or its five-minute setup timeout;
+its owned fixture on completion, cancellation or its fifteen-minute setup timeout;
 close the controller tab separately and remove only its printed generated bundle
 directory. Generated bundles are development artifacts and must not ship.
 
@@ -225,3 +225,59 @@ sibling `-c/` directory. Both owned test tabs and the temporary Finder window we
 closed; the original 21 browser tabs remain. Both loopback servers stopped and
 the generated extension bundles were removed. No daemon, native-host, original
 job or persistent extension-permission configuration changed.
+
+### Job adoption result
+
+The next isolated run used the public
+[*Attention Is All You Need* PDF](https://arxiv.org/abs/1706.03762) as fixture input.
+Preparation saved the source in private scratch storage. During acceptance, Chrome
+downloaded a fresh copy from the loopback fixture into `Downloads/papio/<job>/`.
+No file was manually placed in an adoption directory.
+
+Jev 1.13.0 made three decisions using 1,969 input and 150 output tokens. The
+download completed in 3.20 seconds. The stored artifact matched the source hash,
+contained 15 pages and 2,215,244 bytes, passed Papio's identity validation, and
+reached `ready`. Its rendered first page confirmed the title, authors and arXiv
+identifier. Chrome download ID 409 and the matching daemon completion event
+were captured. Adoption finished before the completion handler's retry, which
+logged a misleading `adoption_deferred` event against the already-ready job.
+This result establishes adoption and receipt of the completion frame; it does
+not establish that the frame handler won the race with directory discovery.
+
+Finder stayed in front. The passive monitor recorded 130 samples, no app/window/
+pointer changes and no missing channels. Its 157.9 ms startup gap ended before
+acquisition began. Setup included one explicit Open for this isolated job,
+extension reload, one inbox visit and the approved temporary fixture grant.
+After the start signal, no operator or coding-agent action supplied a PDF step.
+
+An earlier run stopped before download because its delivery choice disappeared
+on reload. Chrome documents that
+[session storage clears on extension reload, update and browser restart](https://developer.chrome.com/docs/extensions/reference/api/storage#property-session).
+The daemon still held the manual-download action. The extension now reconstructs
+inert PDF choices from those actions and refreshes them on an otherwise-unbound
+Send PDF request. Recovery never reconstructs a provider route or delegated
+authority. Regression tests cover empty storage, direct Send PDF without an inbox
+visit, changed pages, partial snapshots, retirement and exact download ownership.
+
+The optional adoption runner takes `--job-id`, `--adoption-root` and `--pdf-source`.
+It writes `delivery-config.json`; build with `PAPIO_PAGE_SPIKE_CONFIG` pointing to
+that file, then reload the extension. This explicit development build enables
+one exact controller, loopback PDF and job. Its broker consumes the existing
+one-use delivery choice and document checks. It cannot seed job state or accept
+an arbitrary URL or job from the controller. Normal builds disable the entry;
+release builds reject an experiment configuration. Rebuild normally and reload
+before restoring the native host. This is developer plumbing, not a production
+agent-acquisition API or evidence that a model action was a human gesture.
+
+The full extension suite passes 1,732 tests with one skip; typecheck and both
+browser bundles pass. Normal manifest and isolated-config bytes were restored,
+the normal daemon reconnected and doctor passed. All 1,001 original job rows
+remained unchanged. The original 21 tabs remain; one original page temporarily
+used for the controller was restored from its navigation history. Owned fixture
+tabs, two Finder windows, three generated bundles and all test servers were
+cleaned up. Private evidence is in
+`dev/scratch/page-spike-adoption-2026-09-20/`.
+
+This is a successful fixture-to-Papio adoption test. Real publisher fallback,
+signed viewer delivery, cross-platform native coverage and the independent
+declarative repair canary remain separate acceptance work.

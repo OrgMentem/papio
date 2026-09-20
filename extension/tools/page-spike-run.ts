@@ -1,22 +1,23 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Explicit development runner. One owned inactive fixture tab, existing extension
-// APIs only. No daemon, provider, debugger, runtime permissions or global input.
+// APIs only. Optional isolated-job adoption; no provider, debugger or global input.
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { runTrial } from "./jev-trial";
 import { runNativeLoop, observationHash, type NativeObservation, type NativeDriver } from "./native-spike-loop";
-const { values } = parseArgs({ args: Bun.argv.slice(2), options: { "run-dir": { type: "string" }, "extension-id": { type: "string" }, "monitor-helper": { type: "string" }, backend: { type: "string", default: "local-fixture" } }, strict: true });
+const { values } = parseArgs({ args: Bun.argv.slice(2), options: { "run-dir": { type: "string" }, "extension-id": { type: "string" }, "monitor-helper": { type: "string" }, "pdf-source": { type: "string" }, "job-id": { type: "string" }, "adoption-root": { type: "string" }, backend: { type: "string", default: "local-fixture" } }, strict: true });
 if (!values["run-dir"] || !/^[a-p]{32}$/.test(values["extension-id"] ?? "") || !["local-fixture", "jev"].includes(values.backend!)) throw new Error("Required --run-dir NEW_DIR --extension-id ID [--backend local-fixture|jev]");
+if ((values["job-id"] === undefined) !== (values["adoption-root"] === undefined) || (values["job-id"] && !/^job_[a-f0-9]+$/.test(values["job-id"]))) throw new Error("Adoption needs both --job-id job_HEX and --adoption-root PATH");
 const dir = resolve(values["run-dir"]), nonce = randomUUID(), origin = `chrome-extension://${values["extension-id"]}`;
 mkdirSync(dir, { mode: 0o700 });
 const record = (value: unknown) => appendFileSync(`${dir}/events.jsonl`, JSON.stringify({ at: new Date().toISOString(), ...value as object }) + "\n", { mode: 0o600 });
 const bundleDir = resolve(import.meta.dir, `../dist/page-spike-${nonce}`), filename = `papio-page-spike-${nonce}.pdf`;
 mkdirSync(`${bundleDir}/fixture`, { recursive: true });
-const sourcePDF = readFileSync(new URL("../../internal/pdf/testdata/candidatecorpus/sentinels/title_wrap.pdf", import.meta.url));
+const sourcePDF = readFileSync(values["pdf-source"] ? resolve(values["pdf-source"]) : new URL("../../internal/pdf/testdata/candidatecorpus/sentinels/title_wrap.pdf", import.meta.url));
 const digest = createHash("sha256").update(sourcePDF).digest("hex");
 let socket: Bun.ServerWebSocket<unknown> | undefined, sequence = 0, startRequested = false;
 const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
@@ -54,9 +55,10 @@ async function rpc(method: string, input: object = {}): Promise<any> {
     socket!.send(JSON.stringify({ id, method, input }));
   }); } finally { clearTimeout(timer!); }
 }
-const built = await Bun.build({ entrypoints: [new URL("./page-spike-browser.ts", import.meta.url).pathname], outdir: bundleDir, target: "browser", format: "esm", define: { SPIKE_SOCKET: JSON.stringify(`ws://127.0.0.1:${server.port}/${nonce}/socket`), SPIKE_PREFIX: JSON.stringify(`http://127.0.0.1:${server.port}/${nonce}/fixture`) } });
+const prefix = `http://127.0.0.1:${server.port}/${nonce}/fixture`, pdfURL = `${prefix}/${filename}`;
+const built = await Bun.build({ entrypoints: [new URL("./page-spike-browser.ts", import.meta.url).pathname], outdir: bundleDir, target: "browser", format: "esm", define: { SPIKE_SOCKET: JSON.stringify(`ws://127.0.0.1:${server.port}/${nonce}/socket`), SPIKE_PREFIX: JSON.stringify(prefix), SPIKE_JOB_ID: JSON.stringify(values["job-id"] ?? null), SPIKE_PDF_URL: JSON.stringify(pdfURL) } });
 if (!built.success) throw new Error(built.logs.join("\n"));
-writeFileSync(`${bundleDir}/run.html`, '<!doctype html><meta charset="utf-8"><title>Papio background spike</title><h1>Papio background spike</h1><p>Local synthetic fixture; one owned background tab. No provider or job changes.</p><pre>Connecting…</pre><script type="module" src="page-spike-browser.js"></script>');
+writeFileSync(`${bundleDir}/run.html`, `<!doctype html><meta charset="utf-8"><title>Papio background spike</title><h1>Papio background spike</h1><p>Local synthetic fixture; one owned background tab. ${values["job-id"] ? "Fresh isolated job adoption experiment." : "No provider or job changes."}</p><pre>Connecting…</pre><script type="module" src="page-spike-browser.js"></script>`);
 const shell = (title: string, content: string) => `<!doctype html><meta charset="utf-8"><title>${title}</title><style>body{font:20px system-ui;max-width:800px;margin:40px auto}a,button{display:block;margin:24px}</style><main><h1>${title}</h1>${content}</main><aside><h2>References</h2><a href="wrong.html">Related reference PDF</a></aside>`;
 writeFileSync(`${bundleDir}/fixture/start.html`, shell("Native acquisition experiment", '<p>Find the main article and download its PDF.</p><a href="article.html">Read the main article</a>'));
 writeFileSync(`${bundleDir}/fixture/article.html`, shell("The main article", `<p>Full text available.</p><button id="options">Show download options</button><section id="download" hidden><h2>Article access</h2><a href="${filename}" type="application/pdf">Download article PDF</a></section><script src="article.js"></script>`));
@@ -64,10 +66,11 @@ writeFileSync(`${bundleDir}/fixture/wrong.html`, shell("Wrong reference", '<p>Th
 writeFileSync(`${bundleDir}/fixture/${filename}`, sourcePDF);
 writeFileSync(`${bundleDir}/fixture/article.js`, 'document.querySelector("#options").addEventListener("click",()=>{document.querySelector("#download").hidden=false;document.querySelector("#options").hidden=true;});');
 const receipt = { url: `${origin}/dist/page-spike-${nonce}/run.html`, startURL: `http://127.0.0.1:${server.port}/${nonce}/start`, bundleDir, filename, sha256: digest, bytes: sourcePDF.length, pid: process.pid };
+if (values["job-id"]) writeFileSync(`${dir}/delivery-config.json`, JSON.stringify({ controllerPath: `dist/page-spike-${nonce}/run.html`, pdfURL, jobID: values["job-id"] }, null, 2) + "\n", { mode: 0o600 });
 writeFileSync(`${dir}/fixture.json`, JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
 console.log(JSON.stringify(receipt));
 const abort = new AbortController();
-const timeout = setTimeout(() => abort.abort(new Error("Fixture connection/start deadline elapsed")), 300000);
+const timeout = setTimeout(() => abort.abort(new Error("Fixture connection/start deadline elapsed")), 900000);
 for (const name of ["SIGINT", "SIGTERM"] as const) process.on(name, () => abort.abort(new Error("Fixture cancelled")));
 const aborted = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(abort.signal.reason), { once: true }));
 let created = false;
@@ -86,6 +89,10 @@ try {
   console.log(JSON.stringify({ status: "ready", tabID: setup.tabID }));
   while (!startRequested) { abort.signal.throwIfAborted(); await Bun.sleep(100); }
   clearTimeout(timeout);
+  if (values["job-id"]) {
+    const binding = await rpc("binding"); record({ kind: "binding_preflight", ...binding });
+    if (binding?.job?.job_id !== values["job-id"] || binding.job.status !== "awaiting_download") throw new Error("Isolated job has no eligible PDF delivery binding; no model call or download attempted");
+  }
   if (values["monitor-helper"]) {
     monitor = Bun.spawn([resolve(values["monitor-helper"]), "--passive-monitor"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
     monitorLines = createInterface({ input: Readable.fromWeb(monitor.stdout as ReadableStream<Uint8Array> as never), crlfDelay: Infinity })[Symbol.asyncIterator]();
@@ -107,7 +114,8 @@ try {
       const item = await rpc("artifact");
       if (!item || item.state !== "complete") return null;
       record({ kind: "download_event", ...item });
-      if (basename(item.filename) !== filename || !existsSync(item.filename)) throw new Error("Download destination mismatch");
+      const expectedDirectory = values["job-id"] ? resolve(values["adoption-root"]!, values["job-id"]) : undefined;
+      if ((expectedDirectory ? dirname(item.filename) !== expectedDirectory : basename(item.filename) !== filename) || !existsSync(item.filename)) throw new Error("Download destination mismatch");
       const bytes = readFileSync(item.filename), actual = createHash("sha256").update(bytes).digest("hex");
       if (actual !== digest || bytes.length !== sourcePDF.length) throw new Error("Downloaded artifact differs from fixture");
       return { path: item.filename, sha256: actual, bytes: bytes.length };

@@ -12,10 +12,16 @@
 
 import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { watch as fsWatch } from "node:fs";
+import { pageSpikeBuildConfig } from "./tools/page-spike-delivery";
 
 const firefoxRoot = "firefox";
 const firefoxDist = `${firefoxRoot}/dist`;
 const buildDaemonVersion = process.env.PAPIO_DAEMON_VERSION ?? "0.0.0-dev";
+const pageSpikeConfig = pageSpikeBuildConfig(
+  process.env.PAPIO_PAGE_SPIKE_CONFIG === undefined ? null :
+    JSON.parse(await readFile(process.env.PAPIO_PAGE_SPIKE_CONFIG, "utf8")),
+  buildDaemonVersion,
+);
 // AMO manifests cannot distinguish an unpacked extension from a shipped one,
 // so the developer-panel boundary is fixed before either browser bundle exists.
 const captureToolsInDevBuild =
@@ -70,6 +76,7 @@ async function build(entrypoints: string[], outdir: string, format: "esm" | "iif
     define: {
       __PAPIO_DAEMON_VERSION__: JSON.stringify(buildDaemonVersion),
       __PAPIO_DEV_CAPTURE__: JSON.stringify(captureToolsInDevBuild),
+      __PAPIO_PAGE_SPIKE__: JSON.stringify(outdir === "dist" ? pageSpikeConfig : null),
     },
   });
   if (!result.success) {

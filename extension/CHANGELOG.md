@@ -1071,6 +1071,11 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Manual PDF delivery recovers after extension reloads and browser restarts.**
+  Papio rebuilds PDF choices from the daemon's open manual-download actions when
+  session storage is empty. Each recovered choice still requires a fresh PDF
+  document binding; recovery does not open tabs or start downloads.
+
 - **Popup refreshes no longer starve on a slow daemon read.** The periodic tick
   now waits for an in-flight refresh instead of repeatedly superseding it, so
   disconnected and slow-start states eventually render. Action labels wrap

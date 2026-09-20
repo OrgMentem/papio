@@ -16,10 +16,24 @@ delivery code. Native foreground operation succeeded; native background-only
 operation did not. A subsequent extension-API run completed three Jev decisions
 and downloaded the verified fixture PDF in 2.29 seconds while another app stayed
 in front. The passive monitor recorded 94 samples with no app/window/pointer
-changes or missing channels during that run. This supports the extension/native
-split; publisher acceptance, daemon adoption and repair learning remain unproved.
+changes or missing channels during that run. A further isolated run downloaded a
+public 15-page paper through the loopback fixture, steered it to its job directory,
+and reached `ready` with PDF identity validation passing. Three Jev decisions took
+3.20 seconds through download; 130 monitor samples showed no app/window/pointer
+changes or missing channels. This proves fixture adoption through the normal
+pipeline. Publisher acceptance and repair learning remain unproved.
 Private receipts include the failed filename check. Owned tabs/servers and
 generated bundles were cleaned up; temporary activeTab grants ended on closure.
+
+That adoption test found and fixed a real recovery defect: extension reloads clear
+session storage, leaving open manual-download actions without PDF choices. The
+extension now recovers inert choices from the daemon's current actions. It can do
+so when Send PDF is requested, without requiring an inbox visit. The live test
+opened the inbox during setup; regression tests cover the direct cold Send PDF
+path. Recovered choices carry no provider-driving authority and require a fresh
+PDF document binding. A late completion notification still emits a misleading
+`adoption_deferred` event after the job reaches `ready`; correct that duplicate
+completion diagnostic before expanding the next acceptance cohort.
 
 The first supervised native-browser trial downloaded three correct papers.
 Two fresh isolated jobs adopted and validated their files; one CDN-viewer
