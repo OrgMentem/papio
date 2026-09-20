@@ -159,6 +159,98 @@ for (const status of ["accepted", "auth_pending"] as const) test(`no-adapter ${s
   expect(JSON.stringify(h.backend.store)).not.toContain(url);
 });
 
+test("a delayed candidate refresh cannot re-park an authorized no-adapter materialization", async () => {
+  const h = await harness({ features: [...features, "institutional_materialization_v1", "authentication_claim_v1", "handoff_link_v1"] });
+  const candidateID = "candidate_agent_refresh";
+  const claimID = "claim_agent_refresh";
+  const bindingID = "binding_agent_refresh";
+  const expiresAt = "2030-01-01T00:00:00Z";
+  // Start at a bound scaffold, still waiting for a daemon-issued route. No
+  // injected handoff drive: the real materialization path must establish it.
+  Reflect.get(h.bridge, "handoffDrives").clear();
+  await h.update(store => ({ ...store,
+    activeJobs: store.activeJobs.map(job => ({ ...job, status: "queued", requires_auth: true,
+      engagement_required: true, fresh_handoff: true })),
+    materializations: { [jobID]: { job_id: jobID, candidate_id: candidateID, claim_id: claimID,
+      binding_id: bindingID, materialization_kind: "browser_tab", candidate_expires_at: expiresAt,
+      lease_until: expiresAt, browser_holder_generation: 1, phase: "bound", tab_id: tabID } },
+  }));
+  await h.classify();
+  expect(h.frames.some(frame => frame.type === "provider_drive_epoch_start_request")).toBe(false);
+
+  Reflect.get(h.bridge, "scheduleMaterialization").call(h.bridge, jobID);
+  const route = await h.request("institutional_route_request");
+  let releaseAlarm!: () => void;
+  const alarmRead = new Promise<void>(resolve => { releaseAlarm = resolve; });
+  let alarmStarted = false;
+  h.deps.alarms.get = async () => { alarmStarted = true; await alarmRead; return undefined; };
+  // Candidate notifications run off the inbound FIFO. Hold this one across
+  // navigation and its acknowledgement, just as a slow chrome.alarms read can.
+  await h.inbound("institutional_candidate_offer", {
+    candidate_id: candidateID, materialization_kind: "browser_tab", expires_at: expiresAt,
+    provider_hosts: ["unregistered.example"], expected: { doi }, access_mode: "delegated",
+    requires_auth: true, drive_attempt_id: epoch.drive_attempt_id, drive_ordinal: epoch.ordinal,
+    drive_strategy: "generic", drive_revision: epoch.revision,
+  });
+  await until(() => alarmStarted);
+  await h.reply(route, "institutional_route_response", {
+    outcome: "issued", claim_id: claimID, binding_id: bindingID, route_issuance_ordinal: 1,
+    effect_ordinal: 1, institutional_request_id: route.payload["institutional_request_id"], url,
+  });
+  const navigated = await h.request("institutional_navigated_request");
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ status: "accepted", engagement_required: false });
+  await h.reply(navigated, "institutional_navigated_response", {
+    outcome: "acknowledged", claim_id: claimID, binding_id: bindingID,
+  });
+  await until(() => h.backend.store.materializations?.[jobID]?.phase === "navigated" &&
+    Reflect.get(h.bridge, "materializationRuns").size === 0);
+  releaseAlarm();
+  await flush();
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ status: "accepted", engagement_required: false,
+    requires_auth: true, fresh_handoff: true, tab_id: tabID });
+  expect(Reflect.get(h.bridge, "handoffDrives").has(jobID)).toBe(true);
+
+  await h.tabs.completeNavigation(tabID);
+  await h.started();
+  await h.decide("decision", "BLOCKED");
+  await h.settle();
+  expect(h.frames.filter(frame => frame.type === "agent_decide_request_v1")).toHaveLength(1);
+  expect(h.frames.some(frame => frame.type === "auth_returned" || frame.type === "session_evidence" || frame.type === "claim_observation")).toBe(false);
+  expect(h.counts().actions).toBe(0);
+  expect(h.tabs.created).toHaveLength(0);
+});
+
+test("a candidate refresh preserves an authentication gate observed during its alarm lookup", async () => {
+  const h = await harness({ features: [...features, "institutional_materialization_v1"] });
+  const candidateID = "candidate_agent_auth_refresh";
+  const expiresAt = "2030-01-01T00:00:00Z";
+  await h.update(store => ({ ...store,
+    materializations: { [jobID]: { job_id: jobID, candidate_id: candidateID,
+      binding_id: "binding_agent_auth_refresh", materialization_kind: "browser_tab",
+      candidate_expires_at: expiresAt, phase: "navigated", tab_id: tabID } },
+  }));
+  let releaseAlarm!: () => void;
+  const alarmRead = new Promise<void>(resolve => { releaseAlarm = resolve; });
+  let alarmStarted = false;
+  h.deps.alarms.get = async () => { alarmStarted = true; await alarmRead; return undefined; };
+  await h.inbound("institutional_candidate_offer", {
+    candidate_id: candidateID, materialization_kind: "browser_tab", expires_at: expiresAt,
+    provider_hosts: ["unregistered.example"], expected: { doi }, access_mode: "delegated",
+    requires_auth: true, drive_attempt_id: epoch.drive_attempt_id, drive_ordinal: epoch.ordinal,
+    drive_strategy: "generic", drive_revision: epoch.revision,
+  });
+  await until(() => alarmStarted);
+  // A real gate wins over the earlier accepted snapshot just as an issued
+  // route wins over an earlier queued snapshot. A refresh grants no authority.
+  await h.update(store => patchJob(store, jobID, { status: "auth_pending", auth_started_ms: 1_700_000_000_000,
+    engagement_required: true, needs_terms_consent: true, challenge_blocked: true }));
+  releaseAlarm();
+  await flush();
+  expect(h.backend.store.activeJobs[0]).toMatchObject({ status: "auth_pending", auth_started_ms: 1_700_000_000_000,
+    engagement_required: true, needs_terms_consent: true, challenge_blocked: true, requires_auth: true });
+  expect(h.frames.some(frame => frame.type === "provider_drive_epoch_start_request" || frame.type === "agent_decide_request_v1")).toBe(false);
+});
+
 for (const mode of ["old", "firefox", "permission"] as const) test(`fallback does not start with ${mode} capability gap`, async () => {
   const h = await harness({ ...(mode === "old" ? { features: ["provider_drive_epoch_v1", "effect_permit_v1"] } : {}), firefox: mode === "firefox" });
   if (mode === "permission") h.setPermission(false);

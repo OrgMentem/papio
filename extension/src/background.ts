@@ -10966,13 +10966,16 @@ export class Bridge {
             attempt_count: 0,
           }
         : undefined;
-    const existingJob = findByJob(this.store, jobID);
-    const existing = this.materializationCorrelation(jobID);
     // Candidate offers are the daemon's existing wake signal after an
     // institution becomes free. While a durable retry alarm is pending, the
     // daemon's ordinary 2s poll is only a refresh; it must not rebuild a tab.
     const institutionalRetryPending =
       await this.institutionalRetryAlarmPending(jobID);
+    // Candidate notifications run outside the inbound FIFO. Navigation (or
+    // an observed auth gate) can advance this job while alarms.get awaits;
+    // read the live state only now so a refresh cannot restore a stale park.
+    const existingJob = findByJob(this.store, jobID);
+    const existing = this.materializationCorrelation(jobID);
     const now = this.deps.now();
     const expiresMs = Date.parse(expiresAt);
     // A re-offer of the SAME candidate refreshes the daemon's lease; it does
