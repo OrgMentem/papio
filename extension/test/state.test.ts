@@ -559,6 +559,35 @@ test("materialization reducer keeps URL-free closed transitions and rejects stal
       ?.tab_id,
   ).toBe(-1);
 });
+test("reconciled navigation repairs a stale queue park without clearing a live authentication gate", () => {
+  const jobID = "job_mat_queue_recovery";
+  const correlation: MaterializationCorrelation = {
+    job_id: jobID,
+    candidate_id: "cand_queue_recovery",
+    binding_id: "bind_queue_recovery",
+    materialization_kind: "browser_tab",
+    candidate_expires_at: "2030-01-01T00:00:00Z",
+    phase: "navigated",
+    tab_id: 501,
+    route_issuance_ordinal: 1,
+    effect_ordinal: 1,
+    institutional_request_id: "inst_queue_recovery",
+  };
+  for (const status of ["queued", "auth_pending"] as const) {
+    const store = {
+      ...emptyStore(),
+      activeJobs: [job({ job_id: jobID, tab_id: 501, status, engagement_required: true })],
+      materializations: { [jobID]: correlation },
+    };
+    const recovered = reduceMaterialization(store, jobID, { type: "navigated" });
+    expect(recovered.activeJobs[0]).toMatchObject({
+      status: status === "queued" ? "accepted" : "auth_pending",
+      engagement_required: status !== "queued",
+      tab_id: 501,
+    });
+  }
+});
+
 test("materialization reducer supersedes candidates and marks a lost scaffold without dropping binding", () => {
   const first: MaterializationCorrelation = {
     job_id: "job_mat_0002",

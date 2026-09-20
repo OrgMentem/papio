@@ -5415,7 +5415,14 @@ test("Scenario 7 continued: institutional materialization survives a worker rest
     const bindingID = `bind_scenario7b_${restartAt}`;
     const claimID = `claim_scenario7b_${restartAt}`;
     let h = makeHarness(
-      { ...emptyStore(), activeJobs: [materializationActiveJob(jobID)] },
+      {
+        ...emptyStore(),
+        activeJobs: [{
+          ...materializationActiveJob(jobID),
+          status: "queued",
+          engagement_required: true,
+        }],
+      },
       { windows: true },
     );
     installManagedTabLedger(h, {});
@@ -5489,6 +5496,9 @@ test("Scenario 7 continued: institutional materialization survives a worker rest
       await drainReconcileRequests(h);
       routeReq = await h.port.waitForFrame("institutional_route_request");
     }
+    // Neither a candidate nor its bound scaffold authorizes page effects.
+    expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID))
+      .toMatchObject({ status: "queued", engagement_required: true });
     await h.port.inbound({
       protocol: "papio-browser/1",
       type: "institutional_route_response",
@@ -5511,6 +5521,10 @@ test("Scenario 7 continued: institutional materialization survives a worker rest
     let navigatedReq = await h.port.waitForFrame(
       "institutional_navigated_request",
     );
+    // A fast provider landing must be classifiable before the navigation
+    // acknowledgement arrives, including a legacy job parked for engagement.
+    expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID))
+      .toMatchObject({ status: "accepted", engagement_required: false });
     if (restartAt === "navigate") {
       h = restartWorker(h);
       await h.bridge.start();
@@ -18990,6 +19004,44 @@ test("persisted materialization waits for capability negotiation and clears on d
   await h.port.inbound(helloAck());
   expect(h.tabs.removed).toContain(902);
   expect(h.backend.store.materializations).toBeUndefined();
+});
+
+test("materialization scaffold loading never reports an authentication wall", async () => {
+  const jobID = "job_mat_scaffold_loading";
+  const tabID = 777;
+  const url = "chrome-extension://test/dist/materialize.html#bind_scaffold";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{ ...materializationActiveJob(jobID), tab_id: tabID }],
+    materializations: {
+      [jobID]: {
+        job_id: jobID,
+        candidate_id: "cand_scaffold",
+        materialization_kind: "browser_tab",
+        candidate_expires_at: "2030-01-01T00:00:00Z",
+        binding_id: "bind_scaffold",
+        phase: "bound",
+        tab_id: tabID,
+      },
+    },
+  });
+  h.tabs.seed({ id: tabID, url, active: false });
+  await h.bridge.start();
+  const internals = h.bridge as unknown as {
+    onTabUpdated: (id: number, change: { status: string }, tab: TabInfo) => Promise<void>;
+  };
+  for (const status of ["loading", "complete"]) {
+    await internals.onTabUpdated(tabID, { status }, { id: tabID, url });
+  }
+  expect(h.backend.store.activeJobs[0]?.status).toBe("accepted");
+  expect(h.frames().filter((frame) => frame.type === "auth_pending")).toEqual([]);
+
+  // The exemption names only this job's local scaffold. A real IdP hop
+  // still parks the same job for the operator.
+  await internals.onTabUpdated(tabID, { status: "loading" }, {
+    id: tabID, url: "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO",
+  });
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
 });
 
 test("candidate-only materialization binds ActiveJob tab before provider navigation", async () => {

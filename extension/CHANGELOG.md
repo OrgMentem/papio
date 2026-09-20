@@ -93,6 +93,11 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- An authorized institutional navigation now releases a paper from its old
+  queued state before the provider page loads. Reconnection also repairs that
+  stale state after the daemon confirms the navigation. Loading papio's own
+  access tab no longer reports a sign-in attempt.
+
 - PDF viewers that require an explicit download now release their browser drive slot after reporting a manual task to a compatible daemon. The PDF stays open. Choose **Send this PDF** before using the viewer’s **Download** button; the notice alone grants no adoption authority. Older daemons retain the diagnostic-only behavior.
 
 - **Signed PDF viewers stay available for manual delivery.** Automatic viewer

@@ -10775,9 +10775,16 @@ export class Bridge {
       }
       entry = currentFor(snapshot);
       if (entry === undefined) continue;
-      if (claim["phase"] === "navigated" && entry.phase === "navigating") {
+      if (
+        claim["phase"] === "navigated" &&
+        (entry.phase === "navigating" || entry.phase === "navigated")
+      ) {
         if (currentFor(snapshot) === undefined) continue;
+        const wasQueued = findByJob(this.store, snapshot.job_id)?.status === "queued";
         await this.applyMaterialization(snapshot.job_id, { type: "navigated" });
+        if (wasQueued && findByJob(this.store, snapshot.job_id)?.status === "accepted") {
+          this.scheduleClassifyRetry(snapshot.job_id);
+        }
       }
       entry = currentFor(snapshot);
       if (entry === undefined) continue;
@@ -17730,6 +17737,18 @@ export class Bridge {
     if (staleRecoveryNavigationInFlight) return;
     const url = change.url ?? tab.url;
     if (url === undefined) return;
+    const materialization = this.materializationCorrelation(job.job_id);
+    const scaffoldBase = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
+    if (
+      scaffoldBase !== undefined &&
+      materialization?.binding_id !== undefined &&
+      materialization.tab_id === tabID &&
+      url === `${scaffoldBase}#${materialization.binding_id}`
+    ) {
+      // Chrome emits loading/complete for our local scaffold too. It is
+      // neither a provider landing nor a human authentication attempt.
+      return;
+    }
     if (change.status === "loading") this.advanceStaleRecoveryEpoch(job.job_id);
     const staleRecoveryEpoch = this.staleRecoveryEpochs.get(job.job_id) ?? 0;
     let host: string;

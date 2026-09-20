@@ -529,7 +529,7 @@ const MATERIALIZATION_TRANSITIONS: Readonly<
   route_prepared: ["bound"],
   route_issued: ["bound"],
   navigating: ["route_issued"],
-  navigated: ["navigating"],
+  navigated: ["navigating", "navigated"],
   retry_route: ["route_issued", "navigating", "failed"],
   retry_claim: ["offered", "claiming", "failed"],
   retry_bind: ["claimed", "bound"],
@@ -784,18 +784,26 @@ export function reduceMaterialization(
     event.type === "scaffold_lost" ||
     event.type === "retry_route" ||
     event.type === "retry_claim";
-  if (!tabSync)
-    return {
-      ...store,
-      materializations: { ...(store.materializations ?? {}), [jobID]: next },
-    };
+  // The issued route, not the offer or scaffold, clears a legacy queue
+  // park. Do this before tabs.update: completion can beat its acknowledgement.
+  // Reconciled navigation can repair the same stale queue flag after sleep.
+  const navigationAuthorized =
+    (event.type === "navigating" || event.type === "navigated") &&
+    next.tab_id >= 0 &&
+    next.route_issuance_ordinal !== undefined &&
+    next.effect_ordinal !== undefined &&
+    next.institutional_request_id !== undefined;
   const tabID = next.tab_id;
   return {
     ...store,
     materializations: { ...(store.materializations ?? {}), [jobID]: next },
-    activeJobs: store.activeJobs.map((job) =>
-      job.job_id === jobID ? { ...job, tab_id: tabID } : job,
-    ),
+    activeJobs: store.activeJobs.map((job) => {
+      if (job.job_id !== jobID) return job;
+      const boundJob = tabSync ? { ...job, tab_id: tabID } : job;
+      return navigationAuthorized && job.status === "queued"
+        ? { ...boundJob, status: "accepted", engagement_required: false }
+        : boundJob;
+    }),
   };
 }
 
