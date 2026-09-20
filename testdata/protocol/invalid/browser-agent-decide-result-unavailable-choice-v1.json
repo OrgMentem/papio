@@ -1,0 +1,13 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "agent_decide_result_v1",
+  "msg_id": "message-agent-002",
+  "job_id": "job-agent-001",
+  "seq": 1,
+  "payload": {
+    "request_id": "request-agent-001",
+    "observation_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "outcome": "unavailable",
+    "choice": "control-1"
+  }
+}

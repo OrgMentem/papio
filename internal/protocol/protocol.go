@@ -20,6 +20,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"papio/internal/acquisitionagent"
 )
 
 // Contract versions locked after live browser, acquisition, bundle-export, and
@@ -865,6 +867,8 @@ const (
 	MsgProviderDriveEpochStartResult   = "provider_drive_epoch_start_result"
 	MsgProviderDriveEpochResultRequest = "provider_drive_epoch_result_request"
 	MsgProviderDriveEpochResult        = "provider_drive_epoch_result"
+	MsgAgentDecideRequestV1            = "agent_decide_request_v1"
+	MsgAgentDecideResultV1             = "agent_decide_result_v1"
 	// institutional_materialization_v1 is the dark, strict Phase 1
 	// materialization protocol. Its handlers are feature-disabled until a
 	// later phase enables durable claims and browser effects.
@@ -1247,6 +1251,7 @@ var jobScoped = map[string]bool{
 	MsgProviderOutcome: true, MsgProviderDirectGetRequest: true, MsgProviderDirectGetResult: true,
 	MsgProviderDriveEpochStartRequest: true, MsgProviderDriveEpochStartResult: true,
 	MsgProviderDriveEpochResultRequest: true, MsgProviderDriveEpochResult: true,
+	MsgAgentDecideRequestV1: true, MsgAgentDecideResultV1: true,
 	MsgCancel: true, MsgHandoffFocus: true,
 	MsgInstitutionalCandidateOffer: true,
 	MsgInstitutionalClaimRequest:   true, MsgInstitutionalClaimResponse: true,
@@ -1714,6 +1719,31 @@ type ProviderDirectGetResultPayload struct {
 	LandingClass   string `json:"landing_class"`
 	Detail         string `json:"detail,omitempty"`
 }
+
+// AgentDecideRequestV1Payload asks the daemon to choose from a bounded
+// observation within an existing drive epoch. Peers must negotiate support
+// before sending this family; browser URLs and page/form bodies are not fields.
+type AgentDecideRequestV1Payload struct {
+	RequestID      string                       `json:"request_id"`
+	DriveAttemptID string                       `json:"drive_attempt_id"`
+	Ordinal        int64                        `json:"ordinal"`
+	Strategy       string                       `json:"strategy"`
+	Revision       string                       `json:"revision"`
+	Observation    acquisitionagent.Observation `json:"observation"`
+}
+
+// AgentDecideResultV1Payload correlates a decision with the observation it
+// describes. Choice is WAIT, BLOCKED, or an opaque control ID; callers must
+// still bind it to the requested observation before acting. Detail must be
+// constant application text, never model/provider output or a URL.
+type AgentDecideResultV1Payload struct {
+	RequestID           string `json:"request_id"`
+	ObservationRevision string `json:"observation_revision"`
+	Outcome             string `json:"outcome"`
+	Choice              string `json:"choice,omitempty"`
+	Detail              string `json:"detail,omitempty"`
+}
+
 type ProviderDriveEpochStartRequestPayload struct {
 	RequestID      string `json:"request_id,omitempty"`
 	DriveAttemptID string `json:"drive_attempt_id"`
@@ -2552,6 +2582,12 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 	if err != nil {
 		return nil, err
 	}
+	if env.Type == MsgAgentDecideRequestV1 || env.Type == MsgAgentDecideResultV1 {
+		if _, err := agentDecideObjectFields(data, "browser message",
+			[]string{"protocol", "type", "msg_id", "job_id", "seq", "payload"}); err != nil {
+			return nil, err
+		}
+	}
 	if _, ok := envelopeFields["job_id"]; ok {
 		if browserFieldIsNull(envelopeFields, "job_id") || !requestIDRE.MatchString(env.JobID) {
 			return nil, fmt.Errorf("browser message: invalid job_id %q", env.JobID)
@@ -2963,6 +2999,29 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		}
 		if err == nil {
 			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgAgentDecideRequestV1:
+		p := &AgentDecideRequestV1Payload{}
+		err = decodeAgentDecideRequestV1(env.Payload, p)
+		if err == nil {
+			err = p.Validate()
+		}
+		msg.Payload = p
+	case MsgAgentDecideResultV1:
+		p := &AgentDecideResultV1Payload{}
+		_, err = agentDecideObjectFields(env.Payload, env.Type,
+			[]string{"request_id", "observation_revision", "outcome"}, "choice", "detail")
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil && p.Outcome != "decision" {
+			if _, present := payloadFields["choice"]; present {
+				err = fmt.Errorf("agent_decide_result_v1.choice is forbidden unless outcome is decision")
+			}
+		}
+		if err == nil {
+			err = p.Validate()
 		}
 		msg.Payload = p
 	case MsgProviderDriveEpochStartRequest:
@@ -4891,6 +4950,93 @@ func (p *ProviderDirectGetResultPayload) validate() error {
 	}
 	return nil
 }
+
+// agentDecideObjectFields enforces wire shape only. Observation semantics live
+// in acquisitionagent.Observation.Validate, shared with daemon callers.
+func agentDecideObjectFields(data []byte, what string, required []string, optional ...string) (map[string]json.RawMessage, error) {
+	fields, err := browserObjectFields(data, what)
+	if err != nil {
+		return nil, err
+	}
+	if err := browserRequireFields(fields, required...); err != nil {
+		return nil, err
+	}
+	for key := range fields {
+		if !slices.Contains(required, key) && !slices.Contains(optional, key) {
+			return nil, fmt.Errorf("%s: unknown field %q", what, key)
+		}
+		if browserFieldIsNull(fields, key) {
+			return nil, fmt.Errorf("%s.%s cannot be null", what, key)
+		}
+	}
+	return fields, nil
+}
+
+func decodeAgentDecideRequestV1(data []byte, p *AgentDecideRequestV1Payload) error {
+	fields, err := agentDecideObjectFields(data, MsgAgentDecideRequestV1,
+		[]string{"request_id", "drive_attempt_id", "ordinal", "strategy", "revision", "observation"})
+	if err != nil {
+		return err
+	}
+	observation, err := agentDecideObjectFields(fields["observation"], "agent_decide_request_v1.observation",
+		[]string{"revision", "doi", "title", "controls"})
+	if err != nil {
+		return err
+	}
+	var controls []json.RawMessage
+	if err := strictDecode(observation["controls"], &controls); err != nil {
+		return err
+	}
+	for _, control := range controls {
+		if _, err := agentDecideObjectFields(control, "agent_decide_request_v1.observation.controls",
+			[]string{"id", "role", "label", "disabled"}); err != nil {
+			return err
+		}
+	}
+	return strictDecode(data, p)
+}
+
+// Validate checks the request correlation, drive tuple, and shared observation.
+func (p *AgentDecideRequestV1Payload) Validate() error {
+	if err := validateCorrelationID("agent_decide_request_v1.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateDriveEpochTuple(p.DriveAttemptID, p.Ordinal, p.Strategy, p.Revision, MsgAgentDecideRequestV1); err != nil {
+		return err
+	}
+	if p.Observation.Controls == nil {
+		return fmt.Errorf("agent_decide_request_v1.observation.controls must be an array")
+	}
+	return p.Observation.Validate()
+}
+
+var agentDecideDetailURLRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*:|//|[Ww][Ww][Ww]\.`)
+
+// Validate checks result syntax. Membership of an opaque choice in the original
+// observation is a request/result binding check owned by the caller.
+func (p *AgentDecideResultV1Payload) Validate() error {
+	if err := validateCorrelationID("agent_decide_result_v1.request_id", p.RequestID); err != nil {
+		return err
+	}
+	if !sha256RE.MatchString(p.ObservationRevision) {
+		return fmt.Errorf("agent_decide_result_v1.observation_revision must be 64 lowercase hex characters")
+	}
+	if err := enumRequired("agent_decide_result_v1.outcome", p.Outcome, "decision", "unavailable", "stale", "exhausted"); err != nil {
+		return err
+	}
+	if p.Outcome == "decision" {
+		if !wireIDRE.MatchString(p.Choice) || slices.Contains([]string{"__proto__", "constructor", "prototype"}, p.Choice) {
+			return fmt.Errorf("agent_decide_result_v1.choice must be WAIT, BLOCKED, or an opaque control ID")
+		}
+	} else if p.Choice != "" {
+		return fmt.Errorf("agent_decide_result_v1.choice is forbidden unless outcome is decision")
+	}
+	if browserTextLen(p.Detail) > 500 || agentDecideDetailURLRE.MatchString(p.Detail) {
+		return fmt.Errorf("agent_decide_result_v1.detail must be application text of at most 500 characters without URLs")
+	}
+	return nil
+}
+
 func validateDriveEpochTuple(attempt string, ordinal int64, strategy, revision, what string) error {
 	if err := validateCorrelationID(what+".drive_attempt_id", attempt); err != nil {
 		return err

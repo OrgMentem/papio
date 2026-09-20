@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"papio/internal/acquisitionagent"
 	"papio/internal/app"
 	"papio/internal/artifact"
 	"papio/internal/batch"
@@ -216,6 +217,10 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 }
 
 func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*System, error) {
+	agentBackend, err := takeAcquisitionBackend()
+	if err != nil {
+		return nil, err
+	}
 	db, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
 		return nil, err
@@ -515,6 +520,11 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	previewServer := preview.New(jobs)
 	bridge := browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, holdings, browserZotio, cfg, version)
+	// This explicitly named daemon environment variable is the initial
+	// cross-platform opt-in. The key never enters config, browser IPC, or logs.
+	// Platform credential-store onboarding can supply it without coupling the
+	// shared decision contract to a particular OS or cloud provider.
+	bridge.SetAcquisitionBackend(agentBackend)
 	router.SetPresence(bridge.PresenceProvider())
 
 	pulseService := &pulse.Service{
@@ -539,6 +549,23 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	return system, nil
 }
 
+// Read once before bootstrap can launch PDF workers, hooks or integrations.
+// Those children have no reason to inherit the acquisition inference key.
+func takeAcquisitionBackend() (acquisitionagent.Backend, error) {
+	key := strings.TrimSpace(os.Getenv("PAPIO_TYPESAFE_API_KEY"))
+	if err := os.Unsetenv("PAPIO_TYPESAFE_API_KEY"); err != nil {
+		return nil, errors.New("could not isolate the acquisition backend credential")
+	}
+	if key == "" {
+		return nil, nil
+	}
+	backend, err := acquisitionagent.NewTypeSafe(key, nil)
+	if err != nil {
+		return nil, errors.New("invalid PAPIO_TYPESAFE_API_KEY for acquisition decisions")
+	}
+	return backend, nil
+}
+
 // hookShutdownGraceCap keeps daemon shutdown inside ordinary service-manager
 // deadlines. After this grace period, cancellation leaves five seconds for the
 // hook process tree to stop and its small outcome event to reach SQLite.
@@ -551,6 +578,9 @@ const (
 func (s *System) Close() error {
 	if s == nil {
 		return nil
+	}
+	if s.Browser != nil {
+		s.Browser.CloseAcquisitionBackend()
 	}
 	var previewErr error
 	if s.Preview != nil {

@@ -37,6 +37,7 @@ import (
 	"syscall"
 	"time"
 
+	"papio/internal/acquisitionagent"
 	"papio/internal/app"
 	"papio/internal/artifact"
 	"papio/internal/batch"
@@ -356,6 +357,9 @@ type Bridge struct {
 	Features []string
 
 	mu                   sync.Mutex
+	agentBackend         acquisitionagent.Backend
+	agentDecisions       map[string]*pendingAgentDecision
+	agentClosed          bool
 	providerDriveEpochMu sync.Mutex
 	seq                  int64
 	// arbitration owns holder identity, pending sessions, generation fences,
@@ -890,6 +894,7 @@ func (b *Bridge) RequestDevReload() (sessionID string, reloadID string, err erro
 // the holder. The arbitration module has already completed its transition.
 // The caller holds b.mu.
 func (b *Bridge) applyPromotion(transition arbitrationTransition, reason string) {
+	b.retireAgentDecisions("")
 	if previous := transition.previous; previous != nil {
 		if capture := b.pendingCaptures[previous.ID]; capture != nil {
 			delete(b.pendingCaptures, previous.ID)
@@ -1104,6 +1109,11 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		}
 		return append(out, required...), nil
 	}
+	agentReplies, err := b.drainAgentDecisions(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, agentReplies...)
 	if b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != sessionID || b.arbitration.holderSession().Outdated {
 		// Pending sessions poll but never receive offer/cancel traffic.
 		return out, nil
@@ -1289,6 +1299,7 @@ func (b *Bridge) Capture(ctx context.Context, request CaptureRequest) CaptureRes
 
 // release forgets a departing session. The caller holds b.mu.
 func (b *Bridge) release(sessionID string) {
+	b.retireAgentDecisions(sessionID)
 	departed, holderReleased := b.arbitration.release(sessionID)
 	if holderReleased {
 		log.Printf("papio: browser session %s (v%s) disconnected", shortSession(sessionID), departed.ExtensionVersion)
@@ -1305,6 +1316,7 @@ func (b *Bridge) release(sessionID string) {
 }
 
 func (b *Bridge) finishReloadRelease(departed *browserSession) {
+	b.retireAgentDecisions(departed.ID)
 	log.Printf("papio: browser session %s (v%s) disconnected: reload latched", shortSession(departed.ID), departed.ExtensionVersion)
 	b.reofferSourceJobID = map[string]string{}
 	if pending := b.pendingCaptures[departed.ID]; pending != nil {
@@ -1331,6 +1343,13 @@ func (b *Bridge) helloAck(role string, peerFeatures []string) (json.RawMessage, 
 	if slices.Contains(peerFeatures, nativeViewerDownloadFeature) && slices.Contains(features, triageSnapshotSchema3Feature) {
 		if i := slices.Index(features, triageSnapshotSchema2Feature); i >= 0 {
 			features[i] = nativeViewerDownloadFeature
+		}
+	}
+	// Agent peers implement snapshot v5. Reuse its superseded v3 hint;
+	// older peers keep their exact list and the emitted cap stays at 32.
+	if b.agentBackend != nil && !b.agentClosed && slices.Contains(peerFeatures, agentFallbackFeature) && slices.Contains(features, triageSnapshotSchema5Feature) {
+		if i := slices.Index(features, triageSnapshotSchema3Feature); i >= 0 {
+			features[i] = agentFallbackFeature
 		}
 	}
 	payload := protocol.HelloAckPayload{
@@ -3077,6 +3096,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	}
 
 	switch msg.Type {
+	case protocol.MsgAgentDecideRequestV1:
+		return b.agentDecide(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.AgentDecideRequestV1Payload))
 	case protocol.MsgSurfacePresence:
 		return b.surfacePresence(ctx, msg.Payload.(*protocol.SurfacePresencePayload))
 	case protocol.MsgWorkPulseRequest:

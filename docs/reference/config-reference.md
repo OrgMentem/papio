@@ -9,6 +9,32 @@ validated user-only config file and `papio doctor` reports readiness.
 The tables below list every decoded key in `internal/config`. Paths beginning
 with `~/` are expanded when *papio* loads them.
 
+## Agent acquisition
+
+Set `PAPIO_TYPESAFE_API_KEY` in the **daemon's environment** to enable TypeSafe/Jev
+for delegated browser acquisition when packaged and generic routes fail. This is
+an environment variable, not a TOML key. Supplying it opts into sending the
+article DOI, bounded title and sanitized control descriptions to TypeSafe; see
+[Privacy](../privacy.md#agent-acquisition). The credential never enters the
+extension or job history. An already running daemon must be stopped and started
+from the configured environment to pick up a change. Removing the variable and
+restarting disables the backend.
+
+Both daemon and extension must support `agent_fallback_v1`. Effective site access
+is still required, including for publishers without an adapter. The initial
+implementation handles controls on a DOI-identified article in a managed tab.
+It currently requires Chrome's filename-steering download API; Firefox remains
+human-assisted for this path. The daemon and decision contract are shared across
+operating systems.
+It allows up to 60 decisions in ten minutes per drive permit and 30 seconds per
+model call. Failures consume their call reservation; retries do not reset the
+budget. These limits are implementation defaults, not TOML settings.
+
+The daemon removes the key from its process environment after reading it, before
+starting PDF workers, hooks or other integrations. The backend interface supports
+local implementations without a key or network;
+no local model runtime or credential-store setup UI ships yet.
+
 ## Top-level keys
 
 | Key | Type | Default | Effect and constraints |

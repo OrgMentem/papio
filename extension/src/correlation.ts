@@ -16,17 +16,21 @@ const REQUEST_TIMEOUT_MS = 15_000;
  * wide: `responseType: "hello_ack"` would compile, and `handleInbound` would
  * then consume the handshake frame before `background.ts` could run its own
  * hello branch, leaving features and hello waiters permanently unset. Reply
- * frames all carry a `_response`, `_result`, or `_ack` suffix, and `hello_ack`
- * is the one such frame that is never a correlated reply.
+ * frames carry a `_response`, `_result`, `_result_v1`, or `_ack` suffix.
+ * `hello_ack` is the one such frame that is never a correlated reply.
  */
 type CorrelatedReplyType = Exclude<
-  Extract<BrowserMessageType, `${string}_response` | `${string}_result` | `${string}_ack`>,
+  Extract<
+    BrowserMessageType,
+    `${string}_response` | `${string}_result` | `${string}_result_v1` | `${string}_ack`
+  >,
   "hello_ack"
 >;
 
 type RequestPolicy = {
   responseType: CorrelatedReplyType;
   feature: string;
+  timeoutMs?: number;
 } &
   (
     | { operation: "read"; transport: "retry_once" | "single_attempt" }
@@ -57,6 +61,13 @@ type RequestPolicy = {
  * class on the daemon's inbound dispatch.
  */
 const REQUEST_POLICIES = {
+  agent_decide_request_v1: {
+    responseType: "agent_decide_result_v1",
+    feature: "agent_fallback_v1",
+    operation: "mutation",
+    transport: "single_attempt",
+    timeoutMs: 45_000,
+  },
   surface_close_request: {
     responseType: "surface_close_response",
     feature: SURFACE_CLOSE_FEATURE,
@@ -381,7 +392,7 @@ export class NativeRequestCorrelation {
         if (this.pending.get(requestID) !== pending) return;
         this.pending.delete(requestID);
         resolve({ kind: "timeout" });
-      }, REQUEST_TIMEOUT_MS);
+      }, policy.timeoutMs ?? REQUEST_TIMEOUT_MS);
       if (!this.deps.send(kind, { ...payload, request_id: requestID }, options.jobID)) {
         this.pending.delete(requestID);
         resolve({

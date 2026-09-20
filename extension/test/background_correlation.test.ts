@@ -14,17 +14,22 @@ interface CorrelationHarness {
   }>;
   sendResults: boolean[];
   timers: Array<() => void>;
+  timerDelays: number[];
 }
 
-function makeHarness(sendResults: boolean[] = []): CorrelationHarness {
+function makeHarness(sendResults: boolean[] = [], featureAvailable = true): CorrelationHarness {
   const preparedFeatures: string[] = [];
   const reconnects = { count: 0 };
   const sent: CorrelationHarness["sent"] = [];
   const timers: Array<() => void> = [];
+  const timerDelays: number[] = [];
   let uuid = 0;
   const correlation = new NativeRequestCorrelation({
     randomUUID: () => `request${uuid++}`,
-    setTimeout: (fn) => timers.push(fn),
+    setTimeout: (fn, ms) => {
+      timers.push(fn);
+      timerDelays.push(ms);
+    },
     ensureConnected: async () => true,
     connectionFailure: () => ({
       kind: "transport",
@@ -33,7 +38,7 @@ function makeHarness(sendResults: boolean[] = []): CorrelationHarness {
     }),
     supportsFeature: (feature) => {
       preparedFeatures.push(feature);
-      return true;
+      return featureAvailable;
     },
     send: (type, payload, jobID) => {
       sent.push({ type, payload, jobID });
@@ -50,6 +55,7 @@ function makeHarness(sendResults: boolean[] = []): CorrelationHarness {
     sent,
     sendResults,
     timers,
+    timerDelays,
   };
 }
 
@@ -70,6 +76,59 @@ async function afterPrepare(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+test("agent decisions require the negotiated feature before sending", async () => {
+  const h = makeHarness([], false);
+  await expect(h.correlation.request("agent_decide_request_v1", {})).resolves.toMatchObject({
+    kind: "response", code: "feature_unavailable",
+  });
+  expect(h.preparedFeatures).toEqual(["agent_fallback_v1"]);
+  expect(h.sent).toHaveLength(0);
+  expect(h.timers).toHaveLength(0);
+});
+
+test("agent decisions correlate versioned replies and keep job scope", async () => {
+  const h = makeHarness();
+  const pending = h.correlation.request("agent_decide_request_v1", { ordinal: 0 }, {
+    requestID: "request-agent-001", jobID: "job-agent-001",
+  });
+  await afterPrepare();
+  expect(h.preparedFeatures).toEqual(["agent_fallback_v1"]);
+  expect(h.sent).toEqual([{
+    type: "agent_decide_request_v1",
+    payload: { request_id: "request-agent-001", ordinal: 0 },
+    jobID: "job-agent-001",
+  }]);
+  expect(h.timerDelays).toEqual([45_000]);
+  expect(h.correlation.handleInbound(inbound("agent_decide_result_v1", {
+    request_id: "request-agent-001", outcome: "decision", choice: "WAIT",
+  }))).toBe("handled");
+  await expect(pending).resolves.toMatchObject({ kind: "response", payload: { choice: "WAIT" } });
+  h.timers[0]!(); // A completed request cannot later time out.
+});
+
+test("agent decisions use one attempt on transport failure and time out after 45 seconds", async () => {
+  const failed = makeHarness([false, true]);
+  await expect(failed.correlation.request("agent_decide_request_v1", {})).resolves.toMatchObject({
+    kind: "transport", code: "connection_lost",
+  });
+  expect(failed.sent).toHaveLength(1);
+  expect(failed.preparedFeatures).toEqual(["agent_fallback_v1"]);
+
+  const h = makeHarness();
+  const pending = h.correlation.request("agent_decide_request_v1", {});
+  await afterPrepare();
+  expect(h.timerDelays).toEqual([45_000]);
+  h.timers[0]!();
+  await expect(pending).resolves.toEqual({ kind: "timeout" });
+  expect(h.sent).toHaveLength(1);
+
+  const regular = h.correlation.request("stats_request", {});
+  await afterPrepare();
+  expect(h.timerDelays).toEqual([45_000, 15_000]);
+  h.timers[1]!();
+  await expect(regular).resolves.toEqual({ kind: "timeout" });
+});
 
 test("a duplicate supplied request ID fails before a second send", async () => {
   const h = makeHarness();

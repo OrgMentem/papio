@@ -7,8 +7,8 @@ This repo is **single-context**: one ADR directory, one shared vocabulary.
 
 ## Before exploring, read these
 
-- **`dev/adr/`**: 28 ADRs, `NNNN-<slug>.md`, from `0001-triage-inbox-surface.md`
-  to `0028-surface-lifecycle-ownership.md`. Read the ones that touch the area
+- **`dev/adr/`**: 29 ADRs, `NNNN-<slug>.md`, from `0001-triage-inbox-surface.md`
+  to `0029-agent-acquisition-decisions.md`. Read the ones that touch the area
   you are about to work in. Several carry a `ratified-` prefix in the slug;
   treat those as settled contracts. This repo does **not** use `docs/adr/`; do
   not create it.
@@ -29,7 +29,7 @@ the ADR titles, and `docs/concepts/`.
 ```
 /
 ├── AGENTS.md
-├── dev/adr/            ← 28 ADRs, 0001 … 0028
+├── dev/adr/            ← 29 ADRs, 0001 … 0029
 ├── dev/active/         ← in-flight working notes
 ├── dev/plans/          ← plans, specs, wayfinder maps
 ├── docs/concepts/      ← worked explanations

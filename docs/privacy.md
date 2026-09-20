@@ -1,6 +1,6 @@
 # Privacy policy
 
-_Last updated: 2026-08-28_
+_Last updated: 2026-09-20_
 
 *papio* runs on your computer. It has no hosted service, user account, telemetry, or
 analytics. This policy covers the *papio* application (daemon and CLI) and the
@@ -20,6 +20,9 @@ These requests include the identifier you ask *papio* to resolve, such as a DOI,
 PMID, arXiv ID, or title. Some services also receive your configured email address
 or API credentials. The table below lists every destination and the data it receives.
 
+If you configure the optional agent acquisition backend, the daemon also sends
+a limited article observation to TypeSafe as described below.
+
 ## Requests to third-party services
 
 Every destination below is contacted directly by the daemon on your computer. Each
@@ -28,6 +31,7 @@ column lists anything else sent.
 
 | Service | Data sent besides the lookup | Used for | Default |
 | --- | --- | --- | --- |
+| `api.typesafe.ai` | your TypeSafe key; bounded article title, sanitized visible control labels/roles/disabled states, opaque IDs and observation revision | Optional agent acquisition decisions | Off — requires `PAPIO_TYPESAFE_API_KEY` in the daemon environment |
 | `api.unpaywall.org` | your `email` (required by their terms) | Resolving a DOI | **On** |
 | `api.crossref.org` | your `email`, if set | Adding metadata to a title-only request; checking a DOI's registered version relations when other candidates are exhausted | **On** |
 | `api.crossref.org` | — | Daily retraction checks for papers already in your library | **On** |
@@ -136,6 +140,23 @@ can still contain article text, account labels, or other page content.
 acquired, success rate, weekly acquisition trend, access-route breakdown, and
 human-handoff rate — are calculated locally from job records. They are displayed
 only to you and are never transmitted anywhere.
+
+## Agent acquisition
+
+Supplying `PAPIO_TYPESAFE_API_KEY` to the daemon enables cloud decisions for
+eligible delegated acquisitions. The extension sends the local daemon a matching
+article DOI, a title of at most 400 characters, and at most 80 visible article
+controls with labels of at most 240 characters. TypeSafe receives that projection
+and your TypeSafe credential. The projection excludes page URLs, document bodies,
+form values, browser credentials, account areas and unrelated tabs. URL-like and
+credential-like strings in labels are redacted. Labels are page-derived text;
+this minimization is not a guarantee that all possible personal text is detected.
+
+The daemon retains request/permit IDs, observation revisions, outcomes and usage
+counts locally. It does not retain the model projection or raw response in those
+receipts. Existing diagnostic captures remain separate and local. No repair trace
+or analytics is sent to OrgMentem. The decision interface also accepts local
+backends without cloud credentials; a local model runtime is not yet bundled.
 
 ## Permissions
 

@@ -1,0 +1,20 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "agent_decide_request_v1",
+  "msg_id": "message-agent-001",
+  "job_id": "job-agent-001",
+  "seq": 0,
+  "payload": {
+    "request_id": "request-agent-001",
+    "drive_attempt_id": "attempt-agent-001",
+    "ordinal": 0,
+    "strategy": "generic_drive",
+    "revision": "rev-1",
+    "observation": {
+      "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "doi": "10.1000/example",
+      "title": "",
+      "controls": []
+    }
+  }
+}

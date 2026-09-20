@@ -9,6 +9,11 @@ for the repair pipeline around it. Implementation order, evidence tables, and
 acceptance tests live in `dev/active/adapter-release-latency-plan.md`; when
 that plan ships, this ADR is the durable record.
 
+Amended by [ADR-0029](0029-agent-acquisition-decisions.md): optional agent
+acquisition may select observed controls without a provider adapter. The
+executor remains packaged; source-repair distribution and restrictive control
+keep the rules below. Store acceptance of the agent path remains unverified.
+
 ## Context
 
 The shipped repair loop — capture, hand-written adapter edit, extension

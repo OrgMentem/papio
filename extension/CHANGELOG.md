@@ -18,6 +18,14 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Optional article-agent fallback in Chrome.** With a compatible configured
+  daemon, delegated acquisition can select visible controls on DOI-identified
+  articles even when the publisher has no adapter. In-page menus and downloads
+  use fresh document checks and normal download ownership. Human gates remain
+  explicit, and a pending download is given time to appear before parking.
+  Cross-document navigation and native PDF viewer saving are not included yet;
+  Firefox needs a separate download-ownership path.
+
 - **IOS Press ebooks open-access articles can download through their own PDF
   form.** The adapter checks the page DOI, license marker and scoped form
   control before clicking. A fresh Chrome probe downloaded and validated the

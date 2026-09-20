@@ -11,6 +11,12 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Optional daemon-owned agent acquisition.** A TypeSafe key supplied through
+  `PAPIO_TYPESAFE_API_KEY` enables bounded Jev decisions for delegated article
+  downloads when packaged and generic routes fail, including publishers without
+  adapters. Decisions share the existing job and effect permit; cancellation,
+  stale sessions and consumed requests cannot authorize a new action. The
+  backend interface also accepts local implementations without cloud access.
 - **Adapter repair proposals now preserve the exact verified change.** The
   generator examines later rules as well as the first, edits parsed source
   fields without changing sibling rules, and explains blocked proposals.

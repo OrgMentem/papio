@@ -35,7 +35,7 @@ func TestEveryInboundRequestTypeHasADispatchCase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsing protocol.go: %v", err)
 	}
-	requestConst := regexp.MustCompile(`^Msg\w*Request$`)
+	requestConst := regexp.MustCompile(`^Msg\w*Request(?:V\d+)?$`)
 	requests := map[string]bool{}
 	for _, decl := range protoFile.Decls {
 		gen, ok := decl.(*ast.GenDecl)

@@ -521,3 +521,19 @@ irreversible provider action. Locating each fact on the side that can actually
 observe it — the daemon for claims and leases, the browser for tabs and
 engagement — is what lets papio retire a surface on evidence instead of on a
 timer, which is the guess every earlier attempt made and paid for.
+
+## Agent decisions share acquisition authority
+
+**Decision:** ADR-0029 permits an optional agent fallback for missing or broken
+adapters. The daemon owns inference, credentials, cancellation and durable budget
+reservations. The extension observes the bound article and executes only a fresh
+observed control under the existing job and effect permit. Decisions carry no
+code, selectors or URLs. TypeSafe is the first backend; the shared interface also
+accepts local implementations without cloud credentials. Supplying a key for
+this feature is the cloud opt-in. PDF adoption and validation remain unchanged.
+
+**Why:** Requiring a separate selector adapter for every publisher makes coverage
+and repair depend on continual provider-specific maintenance. Agent acquisition
+can cover unfamiliar controls while retaining packaged execution checks. The
+first integration handles an already identified article; broader navigation and
+native viewers are later work. Browser-store acceptance remains unverified.

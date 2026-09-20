@@ -43,6 +43,8 @@ export type BrowserMessageType =
   | "provider_drive_epoch_start_result"
   | "provider_drive_epoch_result_request"
   | "provider_drive_epoch_result"
+  | "agent_decide_request_v1"
+  | "agent_decide_result_v1"
   | "cancel"
   | "handoff_focus"
   | "ack"
@@ -348,6 +350,30 @@ export interface ProviderDriveEpochTuple {
   ordinal: number;
   strategy: string;
   revision: string;
+}
+export interface AgentDecideControl {
+  id: string;
+  role: "button" | "link" | "menuitem" | "tab";
+  label: string;
+  disabled: boolean;
+}
+export interface AgentDecideObservation {
+  revision: string;
+  doi: string;
+  title: string;
+  controls: AgentDecideControl[];
+}
+export interface AgentDecideRequestV1Payload extends ProviderDriveEpochTuple {
+  request_id: string;
+  observation: AgentDecideObservation;
+}
+export interface AgentDecideResultV1Payload {
+  request_id: string;
+  observation_revision: string;
+  outcome: "decision" | "unavailable" | "stale" | "exhausted";
+  choice?: string;
+  /** Constant application text, never model/provider output or a URL. */
+  detail?: string;
 }
 export interface ProviderDriveEpochStartRequestPayload extends ProviderDriveEpochTuple {}
 export interface ProviderDriveEpochStartResultPayload extends ProviderDriveEpochTuple {
@@ -1485,6 +1511,8 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   provider_drive_epoch_start_result: true,
   provider_drive_epoch_result_request: true,
   provider_drive_epoch_result: true,
+  agent_decide_request_v1: true,
+  agent_decide_result_v1: true,
   cancel: true,
   handoff_focus: true,
   ack: true,
@@ -1573,6 +1601,8 @@ const JOB_SCOPED: Record<string, true> = {
   provider_drive_epoch_start_result: true,
   provider_drive_epoch_result_request: true,
   provider_drive_epoch_result: true,
+  agent_decide_request_v1: true,
+  agent_decide_result_v1: true,
   cancel: true,
   handoff_focus: true,
   institutional_candidate_offer: true,
@@ -1791,6 +1821,78 @@ function requireFields<T>(
     if (disposition === "forbidden-unless-empty") {
       forbiddenUnlessEmpty(obj, key, what);
     }
+  }
+}
+
+// This family also rejects Object.prototype names as unknown wire fields.
+function requireAgentDecideFields<T>(
+  obj: Record<string, unknown>,
+  what: string,
+  spec: FieldSpec<T>,
+): void {
+  requireFields<T>(obj, what, spec);
+  for (const key of Object.keys(obj)) {
+    if (!Object.prototype.hasOwnProperty.call(spec, key))
+      fail(`${what}: unknown field ${JSON.stringify(key)} (fail closed)`);
+  }
+  for (const key of Object.keys(spec)) {
+    if (spec[key as keyof FieldSpec<T>] === "required" &&
+        !Object.prototype.hasOwnProperty.call(obj, key))
+      fail(`${what}: missing required field ${JSON.stringify(key)}`);
+  }
+}
+
+function isAgentControlID(value: string): boolean {
+  return value.length >= 1 && value.length <= 64 && !/[^A-Za-z0-9_-]/u.test(value);
+}
+function agentDecideCorrelationID(obj: Record<string, unknown>, key: string, what: string): void {
+  correlationID(obj, key, what);
+  if (!isAgentControlID(obj[key] as string)) fail(`${what}.${key} is invalid`);
+}
+const AGENT_REVISION_RE = /^[a-f0-9]{64}$/;
+const AGENT_RESERVED_IDS = new Set([
+  "WAIT", "BLOCKED", "__proto__", "constructor", "prototype",
+]);
+const AGENT_DETAIL_URL_RE = /[A-Za-z][A-Za-z0-9+.-]*:|\/\/|[Ww][Ww][Ww]\./;
+
+function validateAgentDecideObservation(raw: unknown, what: string): void {
+  const observation = asRecord(raw, what);
+  requireAgentDecideFields<AgentDecideObservation>(observation, what, {
+    revision: "required",
+    doi: "required",
+    title: "required",
+    controls: "required",
+  });
+  if (!AGENT_REVISION_RE.test(str(observation, "revision", what, 64)))
+    fail(`${what}.revision must be 64 lowercase hex characters`);
+  const doi = str(observation, "doi", what, 512);
+  // Match work.NormalizeDOI without silently normalizing evidence on ingress.
+  if (!/^10\.[0-9]{4,9}\/[^\t\n\f\r ]{1,200}$/u.test(doi) ||
+      new TextEncoder().encode(doi).byteLength > 512 || doi !== doi.toLowerCase() ||
+      /%2f/i.test(doi) || /[\u0009-\u000d \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000.,;:)\]}"'>]$/u.test(doi))
+    fail(`${what}.doi must be a normalized DOI`);
+  str(observation, "title", what, 400);
+  const controls = observation["controls"];
+  if (!Array.isArray(controls) || controls.length > 80)
+    fail(`${what}.controls must be an array of at most 80 controls`);
+  const ids = new Set<string>();
+  for (const rawControl of controls) {
+    const control = asRecord(rawControl, `${what}.controls`);
+    requireAgentDecideFields<AgentDecideControl>(control, `${what}.controls`, {
+      id: "required",
+      role: "required",
+      label: "required",
+      disabled: "required",
+    });
+    const id = str(control, "id", what, 64);
+    if (!isAgentControlID(id) || AGENT_RESERVED_IDS.has(id) || ids.has(id))
+      fail(`${what}.controls must have unique, non-reserved opaque IDs`);
+    ids.add(id);
+    if (!["button", "link", "menuitem", "tab"].includes(str(control, "role", what, 8)))
+      fail(`${what}.controls.role is invalid`);
+    str(control, "label", what, 240);
+    if (typeof control["disabled"] !== "boolean")
+      fail(`${what}.controls.disabled must be a boolean`);
   }
 }
 
@@ -2642,6 +2744,11 @@ export function parseBrowserMessageWithLegacyInstitutionalNavigation(
   if ("job_id" in env) {
     jobID = str(env, "job_id", "message", 128);
     if (!JOB_ID_RE.test(jobID)) fail(`invalid job_id ${JSON.stringify(jobID)}`);
+  }
+  if (type === "agent_decide_request_v1" || type === "agent_decide_result_v1") {
+    if (!isAgentControlID(msgID) ||
+        (jobID !== undefined && /[^A-Za-z0-9_-]/u.test(jobID)))
+      fail(`${type} envelope identifiers must contain only ASCII identifier characters`);
   }
   const payload = asRecord(env["payload"], "payload");
   if (
@@ -3962,6 +4069,51 @@ function validatePayload(
       } catch {
         fail("provider_direct_get_request URL is invalid");
       }
+      break;
+    }
+    case "agent_decide_request_v1": {
+      requireAgentDecideFields<AgentDecideRequestV1Payload>(p, type, {
+        request_id: "required",
+        drive_attempt_id: "required",
+        ordinal: "required",
+        strategy: "required",
+        revision: "required",
+        observation: "required",
+      });
+      agentDecideCorrelationID(p, "request_id", type);
+      agentDecideCorrelationID(p, "drive_attempt_id", type);
+      int(p, "ordinal", type, 0);
+      const strategy = str(p, "strategy", type, 128);
+      const revision = str(p, "revision", type, 128);
+      if (!strategy || !revision || /[\u0000\r\n]/u.test(strategy + revision))
+        fail(`${type} tuple text is invalid`);
+      validateAgentDecideObservation(p["observation"], `${type}.observation`);
+      break;
+    }
+    case "agent_decide_result_v1": {
+      requireAgentDecideFields<AgentDecideResultV1Payload>(p, type, {
+        request_id: "required",
+        observation_revision: "required",
+        outcome: "required",
+        choice: "optional",
+        detail: "optional",
+      });
+      agentDecideCorrelationID(p, "request_id", type);
+      if (!AGENT_REVISION_RE.test(str(p, "observation_revision", type, 64)))
+        fail(`${type}.observation_revision must be 64 lowercase hex characters`);
+      const outcome = str(p, "outcome", type, 11);
+      if (!["decision", "unavailable", "stale", "exhausted"].includes(outcome))
+        fail(`${type}.outcome is invalid`);
+      if (outcome === "decision") {
+        const choice = str(p, "choice", type, 64);
+        if (!isAgentControlID(choice) ||
+            (AGENT_RESERVED_IDS.has(choice) && choice !== "WAIT" && choice !== "BLOCKED"))
+          fail(`${type}.choice must be WAIT, BLOCKED, or an opaque control ID`);
+      } else if ("choice" in p) {
+        fail(`${type}.choice is forbidden unless outcome is decision`);
+      }
+      if ("detail" in p && AGENT_DETAIL_URL_RE.test(str(p, "detail", type, 500)))
+        fail(`${type}.detail must not contain URLs`);
       break;
     }
     case "provider_drive_epoch_start_request": {

@@ -37,6 +37,8 @@
         "provider_drive_epoch_start_result",
         "provider_drive_epoch_result_request",
         "provider_drive_epoch_result",
+        "agent_decide_request_v1",
+        "agent_decide_result_v1",
         "effect_permit_reconcile_request",
         "effect_permit_reconcile_response",
         "terms_effect_start_request",
@@ -111,6 +113,202 @@
     "payload": { "type": "object" }
   },
   "$defs": {
+    "agentDecideControl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "role",
+        "label",
+        "disabled"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "not": {
+            "enum": [
+              "WAIT",
+              "BLOCKED",
+              "__proto__",
+              "constructor",
+              "prototype"
+            ]
+          }
+        },
+        "role": {
+          "enum": [
+            "button",
+            "link",
+            "menuitem",
+            "tab"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "disabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "agentDecideObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "doi",
+        "title",
+        "controls"
+      ],
+      "properties": {
+        "revision": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "doi": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Already normalized by work.NormalizeDOI. Executable validators also enforce at most 512 UTF-8 bytes.",
+          "pattern": "^10\\.[0-9]{4,9}/[^\\t\\n\\f\\r ]{1,200}$",
+          "not": {
+            "anyOf": [
+              {
+                "pattern": "[\\p{Lu}\\p{Lt}]|%2[fF]"
+              },
+              {
+                "pattern": "[\u0009-\u000d \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000.,;:)\\]}\"'>]$"
+              }
+            ]
+          }
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "controls": {
+          "type": "array",
+          "maxItems": 80,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/agentDecideControl"
+          },
+          "description": "Control IDs must be unique even when other properties differ; executable Go and TypeScript validators enforce this cross-item constraint."
+        }
+      }
+    },
+    "agentDecideRequestV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "drive_attempt_id",
+        "ordinal",
+        "strategy",
+        "revision",
+        "observation"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{8,64}$"
+        },
+        "drive_attempt_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{8,64}$"
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "strategy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\u0000\r\n]+$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\u0000\r\n]+$"
+        },
+        "observation": {
+          "$ref": "#/$defs/agentDecideObservation"
+        }
+      }
+    },
+    "agentDecideResultV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "observation_revision",
+        "outcome"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{8,64}$"
+        },
+        "observation_revision": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "outcome": {
+          "enum": [
+            "decision",
+            "unavailable",
+            "stale",
+            "exhausted"
+          ]
+        },
+        "choice": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "not": {
+            "enum": [
+              "__proto__",
+              "constructor",
+              "prototype"
+            ]
+          }
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 500,
+          "not": {
+            "pattern": "[A-Za-z][A-Za-z0-9+.-]*:|//|[Ww][Ww][Ww]\\."
+          },
+          "description": "Constant application detail only; never echo model or provider text or include URLs."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "decision"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "choice"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "choice"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "counts": {
       "type": "object",
       "additionalProperties": false,
@@ -1958,6 +2156,8 @@
               "provider_drive_epoch_start_result",
               "provider_drive_epoch_result_request",
               "provider_drive_epoch_result",
+              "agent_decide_request_v1",
+              "agent_decide_result_v1",
               "terms_effect_start_request",
               "terms_effect_start_result",
               "terms_effect_result_request",
@@ -2972,6 +3172,38 @@
                 }
               }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "agent_decide_request_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/agentDecideRequestV1"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "agent_decide_result_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/agentDecideResultV1"
           }
         }
       }

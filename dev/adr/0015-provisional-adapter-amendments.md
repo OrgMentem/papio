@@ -10,6 +10,10 @@ Governs `extension/src/adapters/`. Constrains any future proposal to let a
 non-maintainer change adapter behaviour at runtime. Supersedes nothing; the
 adapter registry's compiled-in, fixture-backed contract stands unchanged.
 
+Amended by [ADR-0029](0029-agent-acquisition-decisions.md): an optional agent may
+select observed controls through a packaged executor under existing acquisition
+authority. It does not amend adapter selectors or accept remote executable code.
+
 ## Context
 
 An adapter is a declarative spec in `extension/src/adapters/types.ts`, interpreted

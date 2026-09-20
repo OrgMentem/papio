@@ -5,11 +5,23 @@ every title, institution, entitlement, or browser session will work. A row marke
 **Verified working** records an individually live-verified observation; it is not
 a success rate. We do not invent aggregate rates or denominators: where there is
 no measured population, none is implied. Unknown or changed provider UI remains
-assisted behavior.
+assisted behavior unless the optional agent fallback is configured.
 
 The registered adapter list is intentionally narrower than the web. A provider
 appears here only when there is a useful observed route to report; the extension
 runs an adapter only after the user has granted its provider host permission.
+
+The agent fallback also handles publishers with **no adapter**. In delegated
+mode, after packaged and generic routes fail, it can select visible controls on
+an already bound article with matching DOI metadata. It needs effective browser
+access to that site, but no publisher entry in the adapter registry. The initial
+implementation supports in-page menus and download controls; cross-document
+navigation, publisher search and native PDF viewer saving remain future work.
+This path currently needs Chrome's download filename hook; Firefox remains
+human-assisted until it has an equivalent ownership path.
+See [agent configuration](../reference/config-reference.md#agent-acquisition).
+The earlier live IOS Press spike does not establish live acceptance of this
+integrated daemon loop.
 
 Every adapter below ships with a captured fixture under
 `extension/fixtures/<adapter-id>/` (see

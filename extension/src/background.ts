@@ -165,6 +165,7 @@ import {
   type Plan,
   type PlanResult,
 } from "./plan";
+import { agentDOM, type AgentDOMRequest, type AgentDOMResult } from "./agent-dom";
 import { observeUnknown, type ObserveChromeApi, type ObservationCaptureDiagnostic } from "./observe";
 import {
   capturePage,
@@ -1666,6 +1667,15 @@ interface DownloadTrack {
    * must not inherit a job's lingering materialization correlation. */
   institutional?: InstitutionalDownloadAttempt;
 }
+/** Local loop bookkeeping on the existing persisted job, never authority. */
+interface AgentJobState {
+  /** URL-free attempt latch, persisted on the existing job. Never resume it. */
+  agent_fallback_attempt?: string;
+  agent_fallback_detail?: string;
+  /** Wait for a page-triggered download across a worker restart, never click. */
+  agent_fallback_pending_until?: number;
+}
+
 /** Generic state is intentionally carried on the persisted job object so the
  * attempt bound survives an MV3 worker restart without widening the wire. */
 interface GenericJobState {
@@ -2936,6 +2946,7 @@ export class Bridge {
   private keepaliveAlarmInFlight = false;
   private keepaliveAlarmHandledAt = 0;
   private readonly downloads = new Map<string, DownloadTrack>();
+  private readonly agentLoops = new Map<string, object>();
   /** Page-derived generic evidence stays worker-local and is not durable. */
   private readonly genericEvidence = new Map<string, string[]>();
   private readonly grabDownloads = new Map<string, PdfGrabTrack>();
@@ -6518,6 +6529,7 @@ export class Bridge {
     this.handoffDriveTimeouts.set(jobID, token);
     this.deps.setTimeout(async () => {
       if (this.handoffDriveTimeouts.get(jobID) !== token) return;
+      if (this.agentLoops.has(jobID)) return; // The bounded article loop owns this drive until it settles.
       this.handoffDriveTimeouts.delete(jobID);
       const current = findByJob(this.store, jobID);
       if (current !== undefined && current.tab_id === tabID) {
@@ -13831,6 +13843,7 @@ export class Bridge {
             INSTITUTIONAL_MATERIALIZATION_FEATURE,
             SURFACE_PRESENCE_FEATURE,
             WORK_PULSE_FEATURE,
+            "agent_fallback_v1",
           ],
         },
         undefined,
@@ -18890,6 +18903,18 @@ export class Bridge {
   ): Promise<PageVerdict | undefined> {
     const job = findByJob(this.store, jobID);
     if (!job) return undefined;
+    if (disposition === "apply") {
+      if (this.agentLoops.has(jobID)) return undefined;
+      const latch = (job as ActiveJob & AgentJobState).agent_fallback_attempt;
+      if (latch !== undefined && job.generic_drive_epoch !== undefined &&
+        latch === this.genericEpochKey(jobID, job.generic_drive_epoch)) {
+        // A dead worker cannot recover its DOM observations. Existing exact-ID
+        // downloads reconcile normally; otherwise leave this attempt human.
+        if (!this.downloads.has(jobID)) void this.emitGenericUnknown(jobID,
+          (job as ActiveJob & AgentJobState).agent_fallback_detail ?? "Article agent fallback stopped after a worker restart; operator action is required.", job.generic_drive_epoch);
+        return undefined;
+      }
+    }
     const spec = this.deps.adapterSpecs.find((candidate) =>
       adapterSupportsHost(host, candidate),
     );
@@ -18951,10 +18976,8 @@ export class Bridge {
       const currentJob = findByJob(this.store, job.job_id);
       if (currentJob === undefined) return;
       const captured = await this.recordUnknown(currentJob, host);
-      if (
-        !missingAdapterAfterAuth &&
-        await this.runGenericOnSettledUnknown(currentJob)
-      ) return;
+      if (((!missingAdapterAfterAuth || this.agentFallbackAvailable()) && await this.runGenericOnSettledUnknown(currentJob)) ||
+        this.startAgentFallback(findByJob(this.store, job.job_id) ?? currentJob)) return;
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
@@ -19654,6 +19677,31 @@ export class Bridge {
       if (epoch?.strategy !== "generic") continue;
       if (job.generic_terminal === true) continue;
       if (epoch.in_flight_download_id === undefined) {
+        const state = job as ActiveJob & AgentJobState;
+        const pendingUntil = state.agent_fallback_pending_until;
+        if (state.agent_fallback_attempt === this.genericEpochKey(job.job_id, epoch) &&
+          job.download_initiated === true && typeof pendingUntil === "number" &&
+          Number.isFinite(pendingUntil) && pendingUntil > this.deps.now() &&
+          pendingUntil <= this.deps.now() + 45_000 && this.deps.downloads.onDeterminingFilename !== undefined) {
+          // Recover only the armed producer, never observations or actions. A
+          // late onCreated still belongs to this same job/epoch after reload.
+          const track: DownloadTrack = { ids: new Set(), ambiguous: false, directOffer: false,
+            generic: { candidates: [], index: 0, epoch } };
+          this.downloads.set(job.job_id, track);
+          this.deps.setTimeout(() => {
+            void (async () => {
+              if (this.downloads.get(job.job_id) !== track || track.ids.size > 0) return;
+              const current = findByJob(this.store, job.job_id);
+              if (current?.generic_drive_epoch === undefined ||
+                this.genericEpochKey(job.job_id, current.generic_drive_epoch) !== state.agent_fallback_attempt) return;
+              const detail = "Article agent fallback timed out waiting for the browser to start the requested download.";
+              await this.sendGenericEpochResult(job.job_id, epoch, "unknown", detail);
+              if (track.ids.size > 0 || this.downloads.get(job.job_id) !== track) return;
+              this.downloads.delete(job.job_id);
+              await this.emitGenericUnknown(job.job_id, detail, epoch);
+            })().catch(() => console.error("papio: pending article download recovery failed"));
+          }, pendingUntil - this.deps.now());
+        }
         // No exact id survived the worker boundary. Keep the occupying permit
         // unresolved; a filename miss or match cannot prove this effect's
         // outcome.
@@ -19684,6 +19732,231 @@ export class Bridge {
     }
   }
 
+  /** Reserve locally before returning to the inbound FIFO. The daemon reply
+   * must be able to run on that FIFO while this loop waits for it. */
+  private startAgentFallback(job: ActiveJob): boolean {
+    if (this.agentLoops.has(job.job_id)) return true;
+    const epoch = job.generic_drive_epoch;
+    if (!this.agentFallbackAvailable() || !this.hasDelegatedAuthority(job) ||
+      !this.handoffDrives.has(job.job_id) || job.tab_id < 0 ||
+      (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") ||
+      job.generic_terminal === true || job.download_initiated === true ||
+      this.downloads.has(job.job_id) || !job.expected?.doi ||
+      epoch?.strategy !== "generic" || !epoch.revision ||
+      this.deps.downloads.onDeterminingFilename === undefined) return false;
+    const key = this.genericEpochKey(job.job_id, epoch);
+    if ((job as ActiveJob & AgentJobState).agent_fallback_attempt === key) return false;
+    const token = {};
+    this.agentLoops.set(job.job_id, token);
+    void this.runAgentFallback(job, epoch, key, token).catch(() => {
+      // No page error text is safe diagnostic material for the daemon.
+      console.error("papio: agent fallback stopped; operator action retained");
+    }).finally(() => {
+      if (this.agentLoops.get(job.job_id) === token) this.agentLoops.delete(job.job_id);
+    });
+    return true;
+  }
+
+  private agentFallbackAvailable(): boolean {
+    const features = this.store.daemonFeatures ?? [];
+    return this.hasCurrentHello() && this.holderRole() &&
+      features.includes("agent_fallback_v1") &&
+      features.includes(PROVIDER_DRIVE_EPOCH_FEATURE) && features.includes(EFFECT_PERMIT_FEATURE);
+  }
+
+  private async runAgentFallback(job: ActiveJob, epoch: ProviderDriveEpoch, key: string, token: object): Promise<void> {
+    const jobID = job.job_id;
+    const drive = this.handoffDrives.get(jobID);
+    const generation = this.portGeneration;
+    const deadline = this.deps.now() + 10 * 60_000;
+    const providerKey = this.providerKeyForJob(job);
+    let effectToken: string | undefined;
+    let leaseOwner: string | undefined;
+    let started = false;
+    let exitDetail = "Article agent fallback stopped because its page or authority became stale.";
+    const unavailableDetail = "Article agent fallback is unavailable; the decision backend did not return a usable response.";
+    const budgetDetail = "Article agent fallback exhausted its decision or time budget.";
+    const humanDetail = "Article agent fallback stopped at a human gate; operator action is required.";
+    const noControlDetail = "Article agent fallback found no usable article control.";
+    let track: DownloadTrack | undefined;
+    let entryURL: string | undefined;
+    let documentID: string | undefined;
+    const usedRevisions = new Set<string>();
+    const sameEpoch = (): ActiveJob | undefined => {
+      const current = findByJob(this.store, jobID);
+      return this.portGeneration === generation && current?.tab_id === job.tab_id && current.generic_drive_epoch !== undefined &&
+        this.genericEpochKey(jobID, current.generic_drive_epoch) === key ? current : undefined;
+    };
+    const downloaded = () => (track?.ids.size ?? 0) > 0;
+    const authorized = (): boolean => {
+      const current = sameEpoch();
+      if (this.deps.now() >= deadline) exitDetail = budgetDetail;
+      return current !== undefined && this.agentLoops.get(jobID) === token &&
+        this.handoffDrives.get(jobID) === drive && drive !== undefined &&
+        this.portGeneration === generation && this.agentFallbackAvailable() &&
+        this.hasDelegatedAuthority(current) && current.expected?.doi === job.expected?.doi && current.generic_terminal !== true &&
+        (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending") &&
+        current.expires_at > this.deps.now() && this.deps.now() < deadline &&
+        !current.challenge_blocked && !current.needs_terms_consent &&
+        !downloaded() &&
+        (effectToken === undefined || this.effectGovernorOwner?.token === effectToken) &&
+        (leaseOwner === undefined || (this.providerDrainLeaseOwners.get(providerKey) === leaseOwner &&
+          this.providerDrainLeaseJobs.get(providerKey) === jobID && this.currentProviderDrainLease(providerKey) !== undefined));
+    };
+    const liveTab = async (): Promise<boolean> => {
+      if (!authorized()) return false;
+      const tab = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
+      if (!authorized() || tab?.url === undefined || tab.status === "loading" || isAuthenticationURL(tab.url)) return false;
+      const url = new URL(tab.url);
+      if (url.protocol !== "https:" || url.username || url.password) return false;
+      if (entryURL === undefined) entryURL = tab.url;
+      const entry = new URL(entryURL);
+      if (url.origin !== entry.origin || url.pathname !== entry.pathname) return false;
+      const permitted = await this.deps.permissions.contains({ origins: [`https://${url.hostname}/*`] }).catch(() => false);
+      return authorized() && permitted === true;
+    };
+    const pause = () => new Promise<void>(resolve => this.deps.setTimeout(resolve, 1000));
+    try {
+      // The persisted latch contains only the daemon tuple. It is deliberately
+      // never cleared on reload or ordinary classification callbacks.
+      await this.update(store => ({ ...store, activeJobs: store.activeJobs.map(current =>
+        current.job_id === jobID && authorized()
+          ? { ...current, agent_fallback_attempt: key } as ActiveJob : current) }));
+      if (!authorized() || !(await liveTab()) || !authorized()) return;
+      effectToken = this.claimEffectGovernor(jobID);
+      if (effectToken === undefined) return;
+      const leaseJob = this.providerDrainLeaseJobs.get(providerKey);
+      if (leaseJob !== undefined && leaseJob !== jobID) return;
+      leaseOwner = this.providerDrainLeaseOwners.get(providerKey);
+      if (leaseOwner === undefined) leaseOwner = await this.claimProviderDrainLease(job);
+      if (!authorized() || leaseOwner === undefined) return;
+      await this.update(store => authorized() ? { ...store, providerDrainLeases: {
+        ...store.providerDrainLeases, [providerKey]: { ...store.providerDrainLeases![providerKey]!, expiresAt: deadline },
+      } } : store);
+      if (!authorized()) return;
+      this.scheduleProviderDrainLeaseExpiry(providerKey, deadline);
+      const start = await this.requestCorrelated("provider_drive_epoch_start_request", {
+        drive_attempt_id: epoch.drive_attempt_id, ordinal: epoch.ordinal,
+        strategy: "generic", revision: epoch.revision,
+      }, { jobID });
+      started = start.kind === "response" && start.payload?.["outcome"] === "started" &&
+        start.payload?.["drive_attempt_id"] === epoch.drive_attempt_id &&
+        start.payload?.["ordinal"] === epoch.ordinal && start.payload?.["strategy"] === "generic" &&
+        start.payload?.["revision"] === epoch.revision;
+      if (!authorized()) return;
+      if (!started) { if (start.kind !== "response") exitDetail = unavailableDetail; return; }
+      for (let decisions = 0; decisions < 60 && authorized(); decisions++) {
+        if (!(await liveTab()) || !authorized()) return;
+        const observed = (await this.deps.scripting.executeScript({
+          target: { tabId: job.tab_id }, func: agentDOM,
+          args: [{ method: "observe", entryURL: entryURL!, doi: job.expected!.doi!, ...(documentID ? { document: documentID } : {}) } satisfies AgentDOMRequest],
+        }))[0]?.result as AgentDOMResult | undefined;
+        if (!authorized()) return;
+        if (observed?.status !== "observed") {
+          if (observed?.status === "blocked") exitDetail = humanDetail;
+          return;
+        }
+        documentID = observed.document;
+        const observation = observed.observation;
+        if (!observation.controls.some(control => !control.disabled)) { exitDetail = noControlDetail; return; }
+        if (sameEpoch()?.status === "auth_pending") {
+          // A matching public article identifies the work, not a successful
+          // login or entitlement. Advance this local download wait only; the
+          // existing delegated epoch/permit remains the authority for effects.
+          await this.update(store => authorized() && sameEpoch()?.status === "auth_pending"
+            ? patchJob(store, jobID, { status: "awaiting_download" }) : store);
+          if (!authorized()) return;
+        }
+        const result = await this.requestCorrelated("agent_decide_request_v1", {
+          drive_attempt_id: epoch.drive_attempt_id, ordinal: epoch.ordinal,
+          strategy: "generic", revision: epoch.revision, observation,
+        }, { jobID });
+        if (!authorized()) return;
+        if (result.kind !== "response" || result.payload?.["outcome"] === "unavailable" || result.payload === undefined) { exitDetail = unavailableDetail; return; }
+        if (result.payload["outcome"] === "exhausted") { exitDetail = budgetDetail; return; }
+        if (result.payload["observation_revision"] !== observation.revision || result.payload["outcome"] !== "decision") return;
+        const choice = result.payload["choice"];
+        if (choice === "BLOCKED") { exitDetail = humanDetail; return; }
+        if (choice === "WAIT") {
+          await pause();
+          if (!authorized()) return;
+          continue;
+        }
+        if (usedRevisions.has(observation.revision)) return;
+        if (typeof choice !== "string" || !observation.controls.some(control => control.id === choice && !control.disabled)) { exitDetail = noControlDetail; return; }
+        if (!(await liveTab()) || !authorized()) return;
+        // Arm the existing generic producer BEFORE click dispatch. No invented
+        // GenericCandidate or known strategy ID is needed to carry this epoch.
+        if (track === undefined) {
+          if (this.downloads.has(jobID) || sameEpoch()?.download_initiated === true) return;
+          const browserDownloads = await this.findJobDownloads(jobID);
+          if (!authorized() || browserDownloads.some(item => item.state === "in_progress")) return;
+          track = { ids: new Set(), ambiguous: false, directOffer: false,
+            generic: { candidates: [], index: 0, epoch } };
+          this.downloads.set(jobID, track);
+          await this.update(store => authorized() ? patchJob(store, jobID, { download_initiated: true }) : store);
+          if (!authorized()) return;
+        }
+        if (!(await liveTab()) || !authorized()) return;
+        usedRevisions.add(observation.revision);
+        const action = (await this.deps.scripting.executeScript({
+          target: { tabId: job.tab_id }, func: agentDOM,
+          args: [{ method: "act", entryURL: entryURL!, doi: job.expected!.doi!, document: documentID,
+            revision: observation.revision, choice } satisfies AgentDOMRequest],
+        }))[0]?.result as AgentDOMResult | undefined;
+        // onCreated may have run before executeScript returns. It owns normal
+        // PDF validation/completion/adoption from this point, including restart.
+        if (downloaded()) return;
+        if (!authorized()) return;
+        if (action?.status !== "dispatched") { if (action?.status === "blocked") exitDetail = humanDetail; return; }
+        if (action.downloadExpected) {
+          // Provider clicks often disable their button before Chrome announces
+          // a download. No further model decision may turn that into failure.
+          const pendingUntil = Math.min(deadline, this.deps.now() + 45_000);
+          await this.update(store => authorized() ? { ...store, activeJobs: store.activeJobs.map(current =>
+            current.job_id === jobID ? { ...current, agent_fallback_pending_until: pendingUntil } as ActiveJob : current) } : store);
+          if (downloaded() || !authorized()) return;
+          while (this.deps.now() < pendingUntil && authorized()) {
+            await pause();
+            if (downloaded() || !authorized()) return;
+          }
+          exitDetail = "Article agent fallback timed out waiting for the browser to start the requested download.";
+          return;
+        }
+        await pause();
+        if (downloaded() || !authorized()) return;
+      }
+      if (authorized()) exitDetail = budgetDetail;
+    } finally {
+      // Exact browser IDs are the only success signal. Never mark a job ready,
+      // infer completion from a click, or settle a still-pending download.
+      try {
+        if (!downloaded()) {
+          if (track !== undefined && this.downloads.get(jobID) === track) this.downloads.delete(jobID);
+          if (started) await this.sendGenericEpochResult(jobID, epoch, "unknown", exitDetail);
+          if (sameEpoch() !== undefined) {
+            await this.update(store => sameEpoch() === undefined ? store : ({ ...store,
+              activeJobs: store.activeJobs.map(current => current.job_id === jobID ? {
+                ...current, agent_fallback_detail: exitDetail, agent_fallback_pending_until: undefined,
+                ...(track === undefined ? {} : { download_initiated: false }),
+                ...(started ? { generic_terminal: true } : {}),
+              } as ActiveJob : current),
+            }));
+          }
+        }
+      } finally {
+        try {
+          if (leaseOwner !== undefined) await this.releaseProviderDrainLease(providerKey, leaseOwner);
+        } finally {
+          if (effectToken !== undefined) this.releaseEffectGovernor(jobID, effectToken);
+        }
+      }
+      const current = sameEpoch();
+      if (!downloaded() && current !== undefined && this.handoffDrives.get(jobID) === drive &&
+        (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending")) await this.emitGenericUnknown(jobID, exitDetail, epoch);
+    }
+  }
+
   private async runGenericOnSettledUnknown(job: ActiveJob): Promise<boolean> {
     // Auth return advances a live handoff to awaiting_download. That is still
     // a provider landing: requiring accepted here (and at the two execution
@@ -19692,7 +19965,7 @@ export class Bridge {
     if (
       this.handoffDrives.has(job.job_id) === false ||
       job.tab_id < 0 ||
-      (job.status !== "accepted" && job.status !== "awaiting_download") ||
+      (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") ||
       (job.access_mode !== "delegated" && job.access_mode !== "assisted")
     ) {
       return false;
@@ -19759,7 +20032,11 @@ export class Bridge {
               candidate.url.startsWith("https://"),
           )
         : [];
-    if (candidates.length === 0) return false;
+    // A missing-adapter auth return can supply discovery evidence without
+    // manufacturing authentication success. The DOI-bound agent probe below
+    // handles its controls; ordinary generic URL execution still requires the
+    // established accepted/awaiting_download gate.
+    if (candidates.length === 0 || job.status === "auth_pending") return false;
     await this.startGenericCandidate(job.job_id, candidates, 0);
     return true;
   }
@@ -20083,19 +20360,24 @@ export class Bridge {
     return current;
   }
 
-  private async emitGenericUnknown(jobID: string): Promise<void> {
+  private async emitGenericUnknown(jobID: string, fallbackDetail?: string, expectedEpoch?: ProviderDriveEpoch): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
     const evidence = this.genericEvidence.get(jobID) ?? [];
-    const detail =
+    const detail = fallbackDetail ?? (
       "No source-controlled adapter matched this provider page." +
       (evidence.length === 0
         ? ""
-        : ` Generic evidence: ${evidence.join(", ")}.`);
+        : ` Generic evidence: ${evidence.join(", ")}.`));
     // Best effort, and deliberately fail-empty. See reportableHost: a wrong
     // host is worse than none, because adapter work would be aimed at the
     // wrong provider.
     const host = await this.reportableHost(job.tab_id);
+    if (expectedEpoch !== undefined) {
+      const current = findByJob(this.store, jobID);
+      if (current?.tab_id !== job.tab_id || current.generic_drive_epoch === undefined ||
+        this.genericEpochKey(jobID, current.generic_drive_epoch) !== this.genericEpochKey(jobID, expectedEpoch)) return;
+    }
     const outcomeKey = `${jobID}:ui_changed`;
     if (
       !this.handoffOutcomeSent.has(outcomeKey) &&
@@ -20333,6 +20615,7 @@ export class Bridge {
   ): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (!job) return;
+    if (this.agentLoops.has(jobID)) return;
     const verdict = plan.verdict;
     const av = spec.version;
     if (verdict.kind !== "unknown" && (job.unknown_count ?? 0) !== 0) {
@@ -20758,7 +21041,7 @@ export class Bridge {
         const current = findByJob(this.store, jobID);
         if (
           current !== undefined &&
-          (await this.runGenericOnSettledUnknown(current))
+          (await this.runGenericOnSettledUnknown(current) || this.startAgentFallback(findByJob(this.store, jobID) ?? current))
         )
           return;
         const evidence = this.genericEvidence.get(jobID) ?? [];
@@ -21319,6 +21602,17 @@ export class Bridge {
     track.ids.add(item.id);
     if (track.ids.size > 1) track.ambiguous = true;
     this.downloads.set(job.job_id, track);
+    if (track.generic !== undefined) {
+      const epoch = track.generic.epoch;
+      await this.update(store => {
+        const current = findByJob(store, job.job_id);
+        if (current?.generic_drive_epoch === undefined ||
+          this.genericEpochKey(job.job_id, current.generic_drive_epoch) !== this.genericEpochKey(job.job_id, epoch)) return store;
+        return patchJob(store, job.job_id, {
+          generic_drive_epoch: { ...current.generic_drive_epoch, in_flight_download_id: item.id },
+        });
+      });
+    }
   }
 
   /** Return the complete URL-free identity of the effect that produced this
