@@ -162,8 +162,14 @@ func WithContentionProbe(probe ContentionProbe) Option {
 // may this identity spend today", and the two disagree the moment one is
 // edited.
 func CreditPolicyFromConfig(cfg config.Config) func(string) CreditPolicy {
+	return CreditPolicyFromSource(cfg.SourcePolicy)
+}
+
+// CreditPolicyFromSource lets runtime credentials and diagnostics share the
+// same effective source policies without putting secrets into Config.
+func CreditPolicyFromSource(sourcePolicy func(string) config.Source) func(string) CreditPolicy {
 	return func(source string) CreditPolicy {
-		p := cfg.SourcePolicy(source)
+		p := sourcePolicy(source)
 		return CreditPolicy{
 			DailyCreditFraction: p.DailyCreditFraction,
 			DailyCreditLimit:    p.DailyCreditLimit,

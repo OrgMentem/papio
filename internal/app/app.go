@@ -115,7 +115,12 @@ type ResolverEntry struct {
 
 // Service is the command-independent acquisition service.
 type Service struct {
-	Config            config.Config
+	Config config.Config
+	// Credentials supplies resolved runtime policy without modifying Config.
+	Credentials interface {
+		SourcePolicy(string) config.Source
+		InstitutionFor(string) (config.Institution, bool)
+	}
 	Jobs              *job.Store
 	Artifacts         *artifact.Store
 	Budgets           *budget.Manager
@@ -160,6 +165,20 @@ type Service struct {
 
 	RetryDelay time.Duration
 	Now        func() time.Time
+}
+
+func (s *Service) sourcePolicy(name string) config.Source {
+	if s.Credentials != nil {
+		return s.Credentials.SourcePolicy(name)
+	}
+	return s.Config.SourcePolicy(name)
+}
+
+func (s *Service) institutionFor(name string) (config.Institution, bool) {
+	if s.Credentials != nil {
+		return s.Credentials.InstitutionFor(name)
+	}
+	return s.Config.InstitutionFor(name)
 }
 
 // SubmitOptions keeps explicit retry intent at the application boundary so
@@ -1205,7 +1224,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 		return nil, plan
 	}
 	name := config.SourceCrossrefMetadata
-	policy := s.Config.SourcePolicy(name)
+	policy := s.sourcePolicy(name)
 	if !policy.Enabled || !row.Policy.SourceAllowed(name) {
 		return nil, plan
 	}
@@ -1413,7 +1432,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 		if name == "" {
 			name = config.SourceCrossrefMetadata
 		}
-		policy := s.Config.SourcePolicy(name)
+		policy := s.sourcePolicy(name)
 		if !policy.Enabled || !row.Policy.SourceAllowed(name) {
 			continue
 		}
@@ -1708,7 +1727,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		// One policy binding for the whole iteration: the Defer on a retryable
 		// fetch failure below must name the same quota identity the Acquire
 		// here reserved against, or the gate lands on a different row.
-		policy := s.Config.SourcePolicy(stored.Source)
+		policy := s.sourcePolicy(stored.Source)
 		if s.Budgets != nil {
 			if err := s.Budgets.Acquire(ctx, stored.Source, policy, stored.CostUSD); err != nil {
 				if releaseErr := s.Jobs.ReleaseReservedCost(context.WithoutCancel(ctx), row.ID, stored.Source, stored.CostUSD); releaseErr != nil {
@@ -2623,7 +2642,7 @@ func (s *Service) deliveryConfigured(row *job.Row) (config.Institution, *config.
 	if s.Delivery == nil {
 		return config.Institution{}, nil, false
 	}
-	inst, _ := s.Config.InstitutionFor(row.Policy.Resolver)
+	inst, _ := s.institutionFor(row.Policy.Resolver)
 	if inst.DocumentDelivery == nil {
 		return config.Institution{}, nil, false
 	}

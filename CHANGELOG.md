@@ -11,6 +11,16 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **One credential service for integration secrets.** `papio config credentials`
+  sets, binds, inspects, detaches, deletes and migrates typed records in the OS
+  credential store. Config contains stable references; explicit environment
+  references support headless use. OpenAIRE pairs and complete webhook endpoints
+  are atomic records, and each institution keeps its own ILLiad binding.
+  Migration verifies stored records and rejects observed concurrent config edits.
+  Acquisition, discovery, delivery and doctor share resolved runtime credentials
+  without putting secrets back into config. OpenAIRE client pairs now have their
+  own quota identity, so a keyless deferral cannot block a newly authenticated
+  account. Legacy credentials remain readable.
 - **Article-agent downloads can continue after a same-origin page change.** A
   compatible extension can transfer an unused Firefox download reservation to
   a freshly verified document. The daemon retains the original download-directory
@@ -18,7 +28,7 @@ execution records kept during the initial build.
 - **Persistent article-agent setup.** `papio config agent set` saves a TypeSafe
   key in the OS credential store and enables Jev for that profile. A hidden prompt
   and `--key-stdin` keep it out of command arguments. `status` reports setup
-  without exposing the key; `remove` disables enrollment and removes it.
+  without exposing the key; `remove` disables enrollment without deleting a shared record.
   Restart the daemon after changes. The environment override remains supported,
   and a locked credential store leaves ordinary acquisition available.
 - **Firefox can adopt downloads made by the optional article agent.** The daemon

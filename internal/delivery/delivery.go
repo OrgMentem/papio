@@ -82,7 +82,11 @@ type Request struct {
 type Service struct {
 	store *store.Store
 	cfg   *config.Config
-	now   func() time.Time
+	// Credentials resolves institution-specific API keys without hydrating cfg.
+	Credentials interface {
+		InstitutionFor(string) (config.Institution, bool)
+	}
+	now func() time.Time
 	// jitter overrides Poll's default backoff jitter (poll.go); nil uses
 	// defaultJitter. Test-only seam, never set by New.
 	jitter func(time.Duration) time.Duration
@@ -793,6 +797,9 @@ func (s *Service) ResolveGateProfile(ctx context.Context, profileName string, in
 // (the CLI, the poller) never need to thread an Institution through by hand.
 func (s *Service) ResolveGateProfileFor(ctx context.Context, profileName string) (GateProfile, error) {
 	inst, ok := s.cfg.InstitutionFor(profileName)
+	if s.Credentials != nil {
+		inst, ok = s.Credentials.InstitutionFor(profileName)
+	}
 	// InstitutionFor's ok-flag keys on the OpenURL base, but a document-
 	// delivery route needs no OpenURL base to exist (the app reaches the
 	// delivery path without one). A profile whose only institutional fact

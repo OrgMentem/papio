@@ -9,6 +9,86 @@ validated user-only config file and `papio doctor` reports readiness.
 The tables below list every decoded key in `internal/config`. Paths beginning
 with `~/` are expanded when *papio* loads them.
 
+## Integration credentials
+
+`papio config credentials` manages TypeSafe, OpenAlex, Semantic Scholar, CORE,
+Crossref TDM, OpenAIRE, ILLiad and notification-webhook credentials through one
+service. The default store is macOS Keychain, Windows Credential Manager or
+Linux Secret Service. Linux needs an unlocked Secret Service; Papio never falls
+back to a plaintext file when a store is unavailable.
+
+```sh
+papio config credentials set sources.openalex
+papio config credentials status
+papio config credentials migrate
+```
+
+`set TARGET` reads a key at a hidden prompt and creates a fresh record. A secret
+manager can pipe input with `--key-stdin`. Never put a real secret in a command
+argument. Use the global `--config <path>` to select a profile.
+
+The targets are `sources.openalex`, `sources.semanticscholar`, `sources.core`,
+`sources.crossref_tdm`, `sources.openaire`, `agent.typesafe`, `notify.webhook`,
+`browser.document_delivery`, and
+`browser.resolvers.<name>.document_delivery`. Delivery targets exist when that
+institution has an ILLiad route configured.
+
+OpenAIRE and webhooks take a typed JSON record through stdin. These examples
+show the input shape; replace the placeholders through your secret manager,
+without putting credentials in shell history:
+
+```json
+{"version":1,"kind":"openaire_client","client_id":"CLIENT_ID","client_secret":"CLIENT_SECRET"}
+```
+
+```json
+{"version":1,"kind":"openaire_token","api_key":"PERSONAL_ACCESS_TOKEN"}
+```
+
+```json
+{"version":1,"kind":"webhook","url":"https://hooks.example.org/PRIVATE_ENDPOINT","bearer":"OPTIONAL_BEARER"}
+```
+
+The complete webhook URL is secret storage material: paths and query strings
+can contain tokens. Omit `bearer` when the endpoint needs none. Records are
+limited to 2,048 encoded UTF-8 bytes to fit every supported OS store.
+
+Configuration stores an explicit `credential_ref`, such as
+`keyring:0123456789abcdef0123456789abcdef`, at the consuming integration.
+Notifications use `notify.webhook_credential_ref`. Moving the config or data
+directory preserves this binding. Copying config to another machine does not
+copy its secrets. To share a record deliberately, use
+`papio config credentials bind TARGET REFERENCE`. The record's kind must match
+the target. Binding TypeSafe also enables cloud decisions for that profile;
+a key stored for another profile does not enable them.
+
+For headless use, bind `env:YOUR_SECRET_VARIABLE`. Single-key integrations read
+the variable as a key; OpenAIRE and webhooks read the JSON shapes above. The
+variable must be available when binding and when starting the daemon. Papio
+snapshots selected variables and removes them before launching vault helpers,
+PDF workers or hooks. References are authoritative: a missing or invalid value
+never falls back to another credential.
+
+`status [TARGET]` reports the selected source and whether it resolves locally;
+it does not test provider authentication. `detach TARGET` removes the binding
+without deleting a shared record. `delete REFERENCE` explicitly deletes an OS
+record and can affect other configs that refer to it. Restart the daemon after
+changes with `papio daemon stop`; the next ordinary command starts it again.
+
+`migrate` converts this profile's legacy TOML secrets and old TypeSafe record.
+It validates the inventory, creates and verifies fresh records, rejects observed
+concurrent config edits, then publishes one atomic config update. A failed save
+leaves the original config in place and reports any staged references for cleanup.
+It leaves the old TypeSafe record intact and creates no plaintext backup. An
+active legacy TypeSafe environment override must be removed before migration.
+Install a compatible daemon and native host first: older strict config parsers
+cannot read the new reference fields.
+
+Resolved secrets stay in runtime memory, separate from serializable config.
+Missing keys disable required-key integrations; services with a supported
+keyless mode continue at that mode's quota. `papio doctor` explains the selected
+credential's state. Unrelated acquisition remains available.
+
 ## Agent acquisition
 
 Run `papio config agent set` to enable TypeSafe/Jev for delegated browser
@@ -16,9 +96,9 @@ acquisition when packaged and generic routes fail. It reads your key at a hidden
 prompt and saves it in macOS Keychain, Windows Credential Manager or Linux
 Secret Service. A secret manager can pipe the key into
 `papio config agent set --key-stdin`; avoid literal keys in shell commands.
-Use `--config <path>` for a particular profile. Keys are scoped to both the config
-path and data directory, so moving either requires setup again. Linux needs a
-running, unlocked Secret Service; no plaintext fallback is used.
+These commands are compatibility entry points to the shared credential service
+above. New setup writes an explicit reference, so moving the profile preserves
+its key binding. Existing path-derived records remain readable until migration.
 On Windows, run setup and start the daemon from your signed-in desktop session.
 SSH network logons cannot read Windows Credential Manager's user credential set;
 a daemon started there cannot use the saved key. This is a
@@ -28,8 +108,8 @@ the daemon.
 
 Supplying the key opts into sending the article DOI, bounded title and sanitized
 control descriptions to TypeSafe; see [Privacy](../privacy.md#agent-acquisition).
-The credential never enters TOML, the extension or job history. Setup stores only
-`backend = "typesafe"` in the `[agent]` section. Empty or absent `backend` disables
+The credential never enters TOML, the extension or job history. Setup stores
+`backend = "typesafe"` and a non-secret `credential_ref` in the `[agent]` section. Empty or absent `backend` disables
 stored-key lookup; other backend values are currently rejected. This new section
 requires a compatible daemon and native host before it is added to an older
 installation's config.
@@ -38,13 +118,16 @@ Run `papio daemon stop` after setup; the next ordinary command starts the daemon
 with the new setting. `papio config agent status` reports saved configuration,
 credential availability and the current command's environment override, without
 printing a key or claiming the running daemon reloaded. `papio config agent remove`
-disables enrollment and removes its saved key; restart afterward. If the OS store
+detaches the key and disables enrollment without deleting the stored record;
+restart afterward. Use `papio config credentials delete REFERENCE` for explicit
+record deletion. If the OS store
 is unavailable, agent inference is disabled with a daemon diagnostic, while
 ordinary acquisition remains available.
 
-`PAPIO_TYPESAFE_API_KEY` in the **daemon's environment** remains an override and
-does not require `[agent]`. An explicitly empty value disables Jev even when a
-saved key exists. Removing the variable restores the profile's configured behavior
+`PAPIO_TYPESAFE_API_KEY` in the **daemon's environment** remains a legacy override
+when no `agent.credential_ref` is configured, and does not require `[agent]`.
+An explicitly empty legacy value disables Jev even when an old saved key exists.
+A new explicit reference takes precedence over this legacy variable. Removing the variable restores the profile's configured behavior
 after restart. To disable Jev completely, remove both enrollment and any launch
 environment override. Changing your shell's environment does not change an
 already running daemon.
@@ -206,7 +289,8 @@ profile, alongside that profile's own `openurl_base_url`,
 | `patron_fee_policy` | string | `unknown` | `zero_standard` \| `per_request` \| `unknown`. Only `zero_standard` can ever compile `auto_capable` — v1 auto-submission covers zero-patron-fee digital journal articles only; books, chapters, theses, physical loans, rush service, and any nonzero or provider-quoted fee stay `prefill_only`. |
 | `monthly_request_cap` | integer | `0` (no cap) | Bounds auto-submitted requests per calendar month; `0` means no declared cap. Values below zero are tolerated and behave as `0` (no cap). |
 | `status_poll_minutes` | integer minutes | `0` (adapter default) | Delivery status poll cadence; `0` uses the delivery service's own default. Values below zero are tolerated and behave as `0` (the default). Delivery polling draws on its own budget, never on ordinary resolver/HTTP retry counts, so a slow ILL turnaround cannot exhaust the acquisition waterfall's retry budget. |
-| `api_key` | string | empty | Institution-issued application credential, permitted only for `kind = "illiad"` — a key on a form-kind profile is rejected as dead config. Read only by the daemon's delivery service; never sent to, stored in, or observable from the extension or the browser wire. 0600 config only. |
+| `credential_ref` | string | empty | OS-store or environment reference for this institution's ILLiad key. Set it with `papio config credentials set browser.document_delivery` (or the named resolver target). Cannot coexist with `api_key`. |
+| `api_key` | string | empty | Legacy ILLiad application key, supported for compatibility. Migrate it into the credential service. Never sent to the extension or browser wire; rejected for other delivery kinds. |
 | `patron_ref` | string | empty | Configured, non-secret patron reference used to map requests to the institution's system. Personal identity data, not a secret: 0600 config only, redacted from events, diagnostics, and delivery provenance. |
 
 A compiled `auto_capable` verdict additionally requires one recorded live
@@ -231,7 +315,7 @@ patron_attestation = "standing_completed"    # or "not_required" / "per_request"
 patron_fee_policy = "zero_standard"
 monthly_request_cap = 25
 status_poll_minutes = 60
-api_key = "..."
+credential_ref = "keyring:0123456789abcdef0123456789abcdef"
 patron_ref = "configured-non-secret-reference"
 ```
 
@@ -335,7 +419,8 @@ suppression, or the desktop rate ceiling.
 | `stall_after_minutes` | integer minutes | `30` | Minimum named episode age before a system-degraded/stall notice. Must be in `0..10080`. A scheduled retry or delivery poll is not a stall. |
 | `categories` | table of tables | empty | Per-category overrides. Keys must be one of the seven names listed below; an unknown category is rejected. |
 | `webhook_url` | string URL | empty | When set, notification intents are delivered as JSON POSTs to this automation endpoint. It is independent of `enabled` and desktop policy; must be an absolute `http(s)` URL. |
-| `webhook_secret` | string | empty | Sent as `Authorization: Bearer <secret>` on webhook posts. Requires `webhook_url`. |
+| `webhook_credential_ref` | string | empty | Reference to a webhook record containing the complete endpoint URL and optional bearer. Set with `papio config credentials set notify.webhook --key-stdin`. Cannot coexist with `webhook_url` or `webhook_secret`. |
+| `webhook_secret` | string | empty | Legacy bearer token for `webhook_url`. Use `papio config credentials migrate` to move both into one record. |
 
 The `milestones` preset is the default: it sends immediate coalesced
 standalone outcomes and newly opened decisions, a four-hour pending-decision
@@ -389,7 +474,7 @@ unknown `[notify]` fields.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `sources` | string array | empty (= `["openalex"]`) | Discovery backends for `papio search` and watches, in merge-preference order. Valid entries: `arxiv`, `openalex`, `semanticscholar` (each at most once). Results merge with DOI-then-title deduplication; earlier backends win ties. arXiv supports text and submitted-year searches but not citation snowballs. Per-backend API keys live under `[sources.<name>]` (e.g. `sources.semanticscholar.api_key`, optional — Semantic Scholar works keyless at public rate limits); arXiv needs no credential. |
+| `sources` | string array | empty (= `["openalex"]`) | Discovery backends for `papio search` and watches, in merge-preference order. Valid entries: `arxiv`, `openalex`, `semanticscholar` (each at most once). Results merge with DOI-then-title deduplication; earlier backends win ties. arXiv supports text and submitted-year searches but not citation snowballs. Per-backend credentials bind through `sources.<name>.credential_ref` (optional for Semantic Scholar, which works keyless at public rate limits); arXiv needs no credential. |
 
 ## `[actions]`
 
@@ -416,19 +501,20 @@ adapter for it ever shipped, so a config carrying it loads normally and
 drops the key silently rather than breaking on upgrade — it is not a valid
 key to add yourself. For `arxiv` and `semanticscholar`, `enabled` governs the
 acquisition resolver. Selection as a search backend is separate and lives in
-`[discovery]`; Semantic Scholar search also reads this section's optional
-`api_key`. For `openaire`, candidates come from
+`[discovery]`; Semantic Scholar search also uses this section's resolved
+credential. For `openaire`, candidates come from
 the OpenAIRE Graph (metadata licensed CC-BY, acknowledged here and in
 candidate provenance); the keyless public limit is 60 requests/hour — the
-default `rate_per_sec` honors it, and a personal-token `api_key` raises the
-ceiling. Each named section accepts these keys:
+default `rate_per_sec` honors it. A resolved registered-service client pair
+raises the effective pacing; a short-lived personal token does not. Each named section accepts these keys:
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | source-specific; see below | Enables the resolver policy. |
-| `api_key` | string | empty | Credential or token for a source that requires one. Doctor requires it for enabled `openalex`, `core`, and `crossref_tdm`; enabled OpenAlex also needs `email`. For `openaire` this holds a *personal access token*, which OpenAIRE expires one hour after issuing it — usable for a manual check, not for unattended operation; use `client_id`/`client_secret` instead. |
-| `client_id` | string | empty | OpenAIRE registered-service client id. Read only by `openaire` today. Unlike a personal access token these credentials do not expire, so this is the only OpenAIRE credential that survives unattended operation. Must be set together with `client_secret`; half a pair is ignored. |
-| `client_secret` | string | empty | Secret paired with `client_id`. *papio* exchanges the pair for a short-lived access token at OpenAIRE's AAI endpoint and re-exchanges it before expiry; the secret is never logged or echoed in an error. |
+| `credential_ref` | string | empty | OS-store or environment reference for OpenAlex, Semantic Scholar, CORE, Crossref TDM or OpenAIRE. Cannot coexist with literal credential fields. Resolved before source pacing and quota identity are chosen. |
+| `api_key` | string | empty | Legacy credential or token; use `papio config credentials migrate` to move it into the shared store. CORE and Crossref TDM require a key; OpenAlex supports a smaller keyless allowance and also needs `email`. For `openaire` this holds a *personal access token*, which OpenAIRE expires one hour after issuing it — usable for a manual check, not for unattended operation; use `client_id`/`client_secret` instead. |
+| `client_id` | string | empty | Legacy OpenAIRE registered-service client id. Migrate it together with `client_secret` into one atomic record. Unlike a personal access token these credentials do not expire, so this is the only OpenAIRE credential that survives unattended operation. Must be set together with `client_secret`; half a pair is ignored. |
+| `client_secret` | string | empty | Legacy secret paired with `client_id`. *papio* exchanges the pair for a short-lived access token at OpenAIRE's AAI endpoint and re-exchanges it before expiry; the secret is never logged or echoed in an error. |
 | `rate_per_sec` | number | source-specific; see below | Per-source request-rate budget. |
 | `burst` | integer | source-specific; see below | Per-source burst budget. |
 | `max_cost_usd` | number | `0` | Monthly budget for paid sources. `0` means unmetered. |
@@ -466,19 +552,20 @@ of them can run a daemon:
 2. Go to [Registered Services](https://develop.openaire.eu/apis), click **+ New Service**,
    pick the **Basic** security level, and create it. Copy the *Client ID* and
    *Client Secret* it shows you.
-3. Put them in `[sources.openaire]` as `client_id` and `client_secret`.
+3. Save them as one `openaire_client` record with
+   `papio config credentials set sources.openaire --key-stdin`, using the JSON
+   shape in [Integration credentials](#integration-credentials).
 
 *papio* exchanges that pair for an access token as needed and refreshes it before it
 expires. The alternative credential — a [personal access
-token](https://develop.openaire.eu/personal-token) — is a single string you can paste
-into `api_key`, but OpenAIRE expires it **one hour** after issuing it, so it is only
+token](https://develop.openaire.eu/personal-token) — can be stored as an `openaire_token` record, but OpenAIRE expires it **one hour** after issuing it, so it is only
 useful for a manual check. `papio doctor` warns when `api_key` is carrying one.
 
 Note that OpenAIRE reports `x-ratelimit-limit: 7199` in its responses **even to
 unauthenticated requests**, so that header is not a safe basis for choosing
 `rate_per_sec`. Use the documented ceiling for the tier you are actually in.
 
-Setting `client_id`/`client_secret` also raises `rate_per_sec` to `1.9` and `burst`
+Resolving a complete client credential pair also raises `rate_per_sec` to `1.9` and `burst`
 to `5` (6,845 requests/hour against the documented 7,200), because a credential that
 authenticated but changed nothing observable would be two knobs for one intent. An
 explicit `rate_per_sec` or `burst` in your config always wins. A personal access

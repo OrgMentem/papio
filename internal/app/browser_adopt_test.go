@@ -583,14 +583,17 @@ func TestAdoptDownloadRetainsPreparedPublicationOnPromotionError(t *testing.T) {
 	if err := os.WriteFile(pdfPath, pdfBytes("adopted"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Make the immutable artifact store read-only so Promote (an atomic rename
-	// into it) fails after preparation. The journal retains its owner row and
-	// the job stays validating, so recovery can retry without a stale-state CAS.
+	// Replace the empty temporary artifact directory with a regular file so
+	// Promote's publication fails on every OS, including Windows where chmod
+	// does not remove directory write access. Preparation must already have
+	// committed: its owner row stays validating for recovery to retry.
 	artRoot := filepath.Join(svc.Config.DataDir, "artifacts")
-	if err := os.Chmod(artRoot, 0o500); err != nil {
+	if err := os.Remove(artRoot); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(artRoot, 0o700) })
+	if err := os.WriteFile(artRoot, []byte("temporary publication obstruction"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := svc.AdoptDownload(context.Background(), id, pdfPath); err == nil {
 		t.Fatal("expected the promote failure to surface")

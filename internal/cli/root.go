@@ -454,6 +454,6 @@ func newConfigCommand(opt *options) *cobra.Command {
 	initCommand.Flags().StringVar(&dataDir, "data-dir", "", "artifact and database directory")
 	initCommand.Flags().BoolVar(&force, "force", false, "replace an existing config")
 	_ = initCommand.MarkFlagRequired("access-mode")
-	command.AddCommand(initCommand, newAgentConfigCommand(opt))
+	command.AddCommand(initCommand, newAgentConfigCommand(opt), newCredentialConfigCommand(opt))
 	return command
 }

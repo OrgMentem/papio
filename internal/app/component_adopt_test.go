@@ -529,10 +529,6 @@ func TestAdoptComponentRejectsInvalidAndUnsafePDFs(t *testing.T) {
 }
 
 func TestAdoptComponentLeavesOperationalRootFailureUnclassified(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root bypasses directory permissions")
-	}
-
 	svc, jobs, id := readyComponentService(t, "wr_component_unreadable_root")
 	root := svc.Config.EffectiveAdoptionRoot()
 	dir := componentAdoptionDir(t, svc, id)
@@ -540,24 +536,23 @@ func TestAdoptComponentLeavesOperationalRootFailureUnclassified(t *testing.T) {
 	if err := os.WriteFile(path, pdfBytes("unreadable root"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(root, 0o000); err != nil {
-		t.Fatal(err)
+	want, restore := failAdoptionRootResolution(t, svc, root)
+	// Prove the real filesystem lookup fails with the intended operational
+	// error. The supplied component remains an existing file in the test root.
+	if _, err := filepath.EvalSymlinks(filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)); !errors.Is(err, want) {
+		t.Fatalf("fixture did not fail adoption root resolution: %v; want %v", err, want)
 	}
-	t.Cleanup(func() {
-		if err := os.Chmod(root, 0o700); err != nil {
-			t.Errorf("restore adoption root mode: %v", err)
-		}
-	})
 
 	err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
-	if err == nil {
-		t.Fatal("adopt component unexpectedly succeeded with unreadable adoption root")
+	if !errors.Is(err, want) || !strings.Contains(err.Error(), "adoption root unavailable:") {
+		t.Fatalf("adopt component did not preserve the operational root error: %v", err)
 	}
 	for _, sentinel := range []error{ErrComponentRole, ErrComponentPrecondition, ErrComponentPath, ErrComponentRejected} {
 		if errors.Is(err, sentinel) {
-			t.Fatalf("unreadable adoption root = %v, must not match %v", err, sentinel)
+			t.Fatalf("operational adoption root failure = %v, must not match %v", err, sentinel)
 		}
 	}
+	restore()
 	assertComponentCount(t, jobs, id, 1)
 	assertNoComponentTemp(t, svc, id)
 }

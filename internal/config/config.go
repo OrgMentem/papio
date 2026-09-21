@@ -125,7 +125,7 @@ var sourceCatalog = []sourceCatalogEntry{
 	// request is actually made in (see ADR-0024: never to a response header,
 	// which reports the authenticated ceiling even to keyless callers).
 	// Keyless is 60 requests/hour, so the shipped rate spends 57.6 of them;
-	// effectiveSourceTier raises this row only when client credentials move
+	// EffectiveSourcePolicy raises this row only when client credentials move
 	// the source to the authenticated tier.
 	{Name: SourceOpenAIRE, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: OpenAIREKeylessRatePerSec, Burst: 1}},
 }
@@ -209,6 +209,7 @@ const DefaultDailyCreditFraction = 0.5
 type Source struct {
 	Enabled             bool    `toml:"enabled"`
 	APIKey              string  `toml:"api_key,omitempty"`
+	CredentialRef       string  `toml:"credential_ref,omitempty"`
 	ClientID            string  `toml:"client_id,omitempty"`     // OpenAIRE registered service; non-expiring, unlike a personal token
 	ClientSecret        string  `toml:"client_secret,omitempty"` // pairs with client_id
 	RatePerSec          float64 `toml:"rate_per_sec,omitempty"`
@@ -425,7 +426,8 @@ type DocumentDelivery struct {
 	// only for kind = illiad — a key on a form-kind profile is dead config.
 	// Read only by internal/delivery in the daemon (ADR-0017 Decision 2).
 	// 0600 config only.
-	APIKey string `toml:"api_key,omitempty"`
+	APIKey        string `toml:"api_key,omitempty"`
+	CredentialRef string `toml:"credential_ref,omitempty"`
 	// PatronRef is a configured, non-secret patron reference used to map
 	// papio's requests to the institution's system. Not a secret, but
 	// personal identity data: 0600 config only, redacted from events,
@@ -502,7 +504,8 @@ type Notify struct {
 	// addition to (not instead of) the local desktop channel.
 	WebhookURL string `toml:"webhook_url"`
 	// WebhookSecret, when set, is sent as "Authorization: Bearer <secret>".
-	WebhookSecret string `toml:"webhook_secret"`
+	WebhookSecret        string `toml:"webhook_secret"`
+	WebhookCredentialRef string `toml:"webhook_credential_ref,omitempty"`
 }
 
 // Hooks configures best-effort local commands the daemon runs at job
@@ -622,7 +625,8 @@ func (a Actions) EffectiveActionStaleAfter() time.Duration {
 // Agent enrolls this profile in optional acquisition decisions. Credentials
 // remain in the OS credential store, never in this configuration.
 type Agent struct {
-	Backend string `toml:"backend,omitempty"`
+	Backend       string `toml:"backend,omitempty"`
+	CredentialRef string `toml:"credential_ref,omitempty"`
 }
 
 // Config is the loaded, validated configuration.
@@ -760,7 +764,7 @@ const (
 	OpenAIREAuthenticatedBurst = 5
 )
 
-// effectiveSourceTier raises pacing that is still at a tier's shipped default
+// EffectiveSourcePolicy raises pacing that is still at a tier's shipped default
 // when the configured credentials move the source to a higher tier. Without it a
 // registered-service credential would authenticate correctly and change nothing
 // observable, because rate_per_sec would still be metering out the keyless
@@ -772,7 +776,9 @@ const (
 // tier: a personal access token also raises OpenAIRE's ceiling, but expires an
 // hour after issue, and pacing to the authenticated ceiling on a credential that
 // can vanish mid-hour leaves papio at 120x what a keyless caller may do.
-func effectiveSourceTier(name string, s Source) Source {
+// Credential references alone do not promote a tier; runtime callers supply
+// the resolved policy. This function does not access the credential store.
+func EffectiveSourcePolicy(name string, s Source) Source {
 	if name != SourceOpenAIRE || !s.HasClientCredentials() {
 		return s
 	}
@@ -856,6 +862,9 @@ func normalizeLibrarySourcePath(path string) string {
 }
 
 func (c *Config) validate() error {
+	if err := c.validateCredentialReferences(); err != nil {
+		return err
+	}
 	if c.Agent != nil && c.Agent.Backend != "" && c.Agent.Backend != "typesafe" {
 		return errors.New("agent.backend must be empty or typesafe")
 	}
@@ -1609,7 +1618,7 @@ func (c *Config) FetchTimeout() time.Duration {
 // the credential would then leave papio pacing an unauthenticated tier at 120x
 // its allowance.
 func (c *Config) SourcePolicy(name string) Source {
-	return effectiveSourceTier(name, c.Sources[name])
+	return EffectiveSourcePolicy(name, c.Sources[name])
 }
 
 // InstitutionFor returns the institutional-access identity for a resolver
@@ -1767,56 +1776,4 @@ func resolverProfileName(name string) string {
 		return "default"
 	}
 	return name
-}
-
-// Save validates and atomically writes cfg as a user-only TOML file. An empty
-// path uses the default config location. API keys may be present, so neither
-// temporary nor final files are group/world-readable.
-func Save(cfg Config, path string) error {
-	if path == "" {
-		path = filepath.Join(Dir(), "config.toml")
-	}
-	if _, err := cfg.RequireAccessMode(); err != nil {
-		return err
-	}
-	if err := cfg.validate(); err != nil {
-		return err
-	}
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("encoding config: %w", err)
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer func() { _ = os.Remove(name) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
-		return err
-	}
-	cfg.Path = path
-	return nil
 }

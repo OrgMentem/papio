@@ -1,15 +1,14 @@
 # ADR-0030: One credential service for configured integrations
 
-Status: Accepted design (2026-09-21); migration and runtime integration are not
-implemented yet. The operator asked for consistent handling of all Papio-owned
-API keys. This supersedes ADR-0029's path-derived credential identity once its
-compatibility migration ships; it preserves explicit cloud enrollment.
+Status: Implemented (2026-09-21). The operator asked for consistent handling of
+all Papio-owned API keys. This supersedes ADR-0029's path-derived identity for
+new and migrated credentials; it preserves explicit cloud enrollment.
 
-Today, only TypeSafe uses an OS credential store. Resolver API keys, OpenAIRE
-client credentials, document-delivery API keys and notification bearer tokens
-remain in TOML. TypeSafe additionally hashes the config path and data directory
-to locate its secret, so moving either loses the association. One credential
-service will own storage, resolution, validation, diagnostics and migration for
+Before this change, only TypeSafe used an OS credential store. Resolver API keys,
+OpenAIRE client credentials, document-delivery API keys and notification bearer
+tokens remained in TOML. The legacy TypeSafe store hashes the config path and
+data directory to locate its secret, so moving either loses the association. One credential
+service now owns storage, resolution, validation, diagnostics and migration for
 all these integrations.
 
 ## Storage and binding
@@ -56,8 +55,12 @@ before constructing providers, quota identities or effective source rates.
 Resolved values must never be put back into serializable `config.Config`.
 OpenAIRE's higher tier requires an actually resolved client pair; a reference or
 an unavailable secret does not establish authenticated capacity.
-Budget identities continue to derive from the actual credential, not its reference,
-so renaming or rebinding a reference does not reset an account's quota. Daemon,
+Budget identities derive from the actual credential, not its reference, so
+renaming or rebinding a reference does not reset an account's quota. Client
+credential pairs receive a fingerprint of both fields, matching client
+normalization. Previously OpenAIRE pairs shared the anonymous identity, so an
+anonymous deferral incorrectly blocked a newly authenticated account. Existing
+anonymous rows are left intact because their past ownership cannot be inferred. Daemon,
 MCP, doctor, discovery and delivery must use the same resolution/status rules.
 
 One configuration command family will set, bind, inspect, detach and migrate
@@ -118,3 +121,20 @@ The alternatives rejected are keeping a TypeSafe-only store, moving all secrets
 back into TOML, or automatically sharing a provider's default key across every
 profile. They respectively preserve the inconsistency, weaken stored-secret
 handling, or change account/feature choices without an explicit binding.
+
+## Implementation
+
+`internal/credential` owns the typed, versioned store, bounded OS calls, explicit
+reference resolution and safe diagnostics. `internal/runtimecredential` supplies
+resolved source policies, institution credentials and optional integrations to
+bootstrap without changing `config.Config`. Legacy TypeSafe records remain in
+`internal/agentcredential` solely for compatibility and migration.
+
+The operator surface is `papio config credentials` with `set`, `bind`, `status`,
+`detach`, `delete` and `migrate`. The old agent setup verbs delegate to it. New
+references use `keyring:` plus a generated record identifier, or `env:` plus an
+explicit variable name. A typed record is at most 2,048 encoded UTF-8 bytes.
+All Papio config saves acquire a platform lock; credential mutations additionally
+compare a content snapshot before atomic publication. Non-cooperating editors
+cannot be locked out, but observed changes are refused. Old vault entries and
+user backups are not automatically deleted.

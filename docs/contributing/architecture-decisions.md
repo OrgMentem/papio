@@ -549,16 +549,16 @@ acceptance remains unverified.
 
 **Decision:** ADR-0030 selects a common credential service for API keys,
 OpenAIRE client credentials, document-delivery keys and webhook endpoints/tokens. Config
-will hold explicit references to typed records in the user's OS credential
+holds explicit references to typed records in the user's OS credential
 store, with environment-backed references for headless deployments. References
 survive config and data-directory moves; sharing between profiles is explicit.
 Cloud inference still requires enrollment in the profile that uses it.
 
-**Why:** TypeSafe currently uses the OS store while other integrations keep
+**Why:** TypeSafe previously used the OS store while other integrations kept
 secrets in TOML. Common setup, resolution and diagnostics remove that mismatch
-and prevent config saves from serializing resolved secrets. Migration will
-verify stored records before atomically replacing legacy values, preserve
-working settings on failure, and retain compatibility readers. This is an
-accepted design; implementation is pending. Browser authentication and Zotero
+and prevent config saves from serializing resolved secrets. Explicit migration
+verifies stored records before atomically replacing legacy values, preserves
+working settings on failed publication, and retains compatibility readers.
+`papio config credentials` provides the common operator commands. Browser authentication and Zotero
 credentials retain their existing owners, and dataset-bound incident keys
 retain their existing lifecycle.

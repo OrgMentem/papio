@@ -63,7 +63,9 @@ type Report struct {
 // discovery backend health, and PDF helper capabilities. A nil store means
 // database integrity is checked by the daemon-backed doctor command instead;
 // a nil discoverySource means discovery backend health is checked there too.
-func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf.Capability, workerBinary string, discoverySource discovery.Source) Report {
+// The optional credential view supplies the daemon's resolved snapshot. Without
+// it, references remain unchecked and no OS credential store is accessed.
+func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf.Capability, workerBinary string, discoverySource discovery.Source, credentials ...CredentialView) Report {
 	var checks []Check
 	add := func(name, status, detail, remediation string) {
 		checks = append(checks, Check{Name: name, Status: status, Detail: detail, Remediation: remediation})
@@ -79,7 +81,8 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	} else {
 		add("fetch_policy", Pass, "HTTPS-only production policy", "")
 	}
-	checkNotifications(ctx, cfg, db, add)
+	checkNotifications(ctx, cfg, db, add, credentials...)
+	checkCredentials(cfg, add, credentials...)
 	checkFiling(ctx, cfg, db, add)
 	checkRetraction(cfg, add)
 
@@ -107,7 +110,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 	checkAdoptionRoot(cfg, add)
 	checkLegacyAdoptionRoot(ctx, cfg, db, add)
-	checkCreditSpend(ctx, cfg, db, add)
+	checkCreditSpend(ctx, cfg, db, add, credentials...)
 	checkLegacyCandidateBind(ctx, db, add)
 	checkInstitutionSignInSlot(ctx, db, add)
 	if cfg.Path != "" {
@@ -399,9 +402,9 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 		add("ocr", Warn, "OCR fallback is explicitly disabled", "image-only papers will require review")
 	}
 
-	checkSourceCredentials(cfg, add)
+	checkSourceCredentials(cfg, add, credentials...)
 	checkResolverBases(cfg, add)
-	checkDocumentDelivery(ctx, cfg, db, add)
+	checkDocumentDelivery(ctx, cfg, db, add, credentials...)
 	checkDiscoveryHealth(cfg, discoverySource, add)
 	sort.SliceStable(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
 	out := Report{OK: true, Checks: checks}
@@ -415,7 +418,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 
 // checkNotifications reports the local notification capability and effective
 // routing state without exposing webhook credentials.
-func checkNotifications(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+func checkNotifications(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string), credentials ...CredentialView) {
 	available, capability := notify.PlatformCapability()
 	policy, policyErr := notify.ResolvePolicy(cfg.Notify)
 	held := "unavailable"
@@ -426,8 +429,13 @@ func checkNotifications(ctx context.Context, cfg config.Config, db *store.Store,
 		}
 	}
 	webhook := "not configured"
-	if strings.TrimSpace(cfg.Notify.WebhookURL) != "" {
+	if doctorCredentials(cfg, credentials).WebhookConfigured() {
 		webhook = "configured"
+	} else if cfg.Notify.WebhookCredentialRef != "" {
+		webhook = "unavailable (see credential:notify.webhook)"
+		if _, offline := doctorCredentials(cfg, credentials).(offlineCredentials); offline {
+			webhook = "not checked (see credential:notify.webhook)"
+		}
 	}
 	if policyErr != nil {
 		add("notifications", Fail,
@@ -1285,18 +1293,21 @@ func isRawAlmaResolver(base string) bool {
 		strings.Contains(strings.ToLower(u.Path), "/view/uresolver/")
 }
 
-func checkSourceCredentials(cfg config.Config, add func(string, string, string, string)) {
-	if cfg.SourcePolicy(config.SourceUnpaywall).Enabled {
+func checkSourceCredentials(cfg config.Config, add func(string, string, string, string), credentials ...CredentialView) {
+	view := doctorCredentials(cfg, credentials)
+	if view.SourcePolicy(config.SourceUnpaywall).Enabled {
 		if strings.TrimSpace(cfg.Email) == "" {
 			add("source_unpaywall", Fail, "Unpaywall is enabled without a contact email", "set email in config.toml")
 		} else {
 			add("source_unpaywall", Pass, "Unpaywall contact identity configured", "")
 		}
 	}
-	if cfg.SourcePolicy(config.SourceOpenAlex).Enabled {
+	if view.SourcePolicy(config.SourceOpenAlex).Enabled {
 		if strings.TrimSpace(cfg.Email) == "" {
-			add("source_openalex", Fail, "OpenAlex is enabled without a contact email", "set email (polite pool); sources.openalex.api_key is optional premium capacity")
-		} else if strings.TrimSpace(cfg.SourcePolicy(config.SourceOpenAlex).APIKey) == "" {
+			add("source_openalex", Fail, "OpenAlex is enabled without a contact email", "set email (polite pool); use papio config credentials set sources.openalex for optional account capacity")
+		} else if uncheckedSourceReference(cfg, config.SourceOpenAlex, credentials) {
+			add("source_openalex", Skip, "OpenAlex credential reference has not been checked; offline policy is keyless", "run papio config credentials status or daemon-backed papio doctor")
+		} else if strings.TrimSpace(view.SourcePolicy(config.SourceOpenAlex).APIKey) == "" {
 			// Passing cleanly here reads as fully configured, and that is how a
 			// real operator missed it: they measured the anonymous tier's 1000
 			// credits a day against an unkeyed client and recorded multi-day
@@ -1304,13 +1315,15 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 			// free and roughly ten times the allowance, so the gap is worth a
 			// word even though nothing is broken.
 			add("source_openalex", Warn, "OpenAlex is on the anonymous allowance, roughly a tenth of an account's",
-				"set sources.openalex.api_key from a free openalex.org account; the anonymous quota is shared per-IP with every other tool on this machine")
+				"use papio config credentials set sources.openalex with a free openalex.org account key; the anonymous quota is shared per-IP with every other tool on this machine")
 		} else {
 			add("source_openalex", Pass, "OpenAlex credentials configured", "")
 		}
 	}
-	if p := cfg.SourcePolicy(config.SourceOpenAIRE); p.Enabled {
+	if p := view.SourcePolicy(config.SourceOpenAIRE); p.Enabled {
 		switch {
+		case uncheckedSourceReference(cfg, config.SourceOpenAIRE, credentials):
+			add("source_openaire", Skip, "OpenAIRE credential reference has not been checked; offline policy is keyless (60 requests/hour)", "run papio config credentials status or daemon-backed papio doctor")
 		case p.HasClientCredentials():
 			add("source_openaire", Pass, "OpenAIRE registered-service credentials configured (7,200 requests/hour)", "")
 		case strings.TrimSpace(p.APIKey) != "":
@@ -1320,7 +1333,7 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 			// then fails every request afterwards, looking like a provider
 			// outage rather than an expiry.
 			add("source_openaire", Warn, "OpenAIRE api_key is a personal access token, which expires one hour after OpenAIRE issued it",
-				"register a service at https://develop.openaire.eu/apis (Basic) and set sources.openaire.client_id and client_secret instead; those do not expire")
+				"register a service at https://develop.openaire.eu/apis (Basic), then store its client pair with papio config credentials set sources.openaire")
 		default:
 			// Keyless is the shipped default and papio paces it correctly,
 			// so this states the tier rather than nagging about it.
@@ -1328,13 +1341,15 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 		}
 	}
 	for _, source := range []string{config.SourceCORE, config.SourceCrossrefTDM} {
-		p := cfg.SourcePolicy(source)
+		p := view.SourcePolicy(source)
 		if !p.Enabled {
 			continue
 		}
 		name := "source_" + strings.ReplaceAll(source, "_", "-")
-		if strings.TrimSpace(p.APIKey) == "" {
-			add(name, Fail, source+" is enabled without its API credential", "configure the API key/token, or disable the source")
+		if uncheckedSourceReference(cfg, source, credentials) {
+			add(name, Skip, source+" credential reference has not been checked", "run papio config credentials status or daemon-backed papio doctor")
+		} else if strings.TrimSpace(p.APIKey) == "" {
+			add(name, Fail, source+" is enabled without its API credential", "use papio config credentials set sources."+source+", or disable the source")
 		} else {
 			add(name, Pass, source+" credential configured", "")
 		}
@@ -1348,19 +1363,20 @@ func checkSourceCredentials(cfg config.Config, add func(string, string, string, 
 // credential it belonged to. Reported for every source whose fuse is armed,
 // whether or not it is close to the limit — a number you only see once it is
 // too late is not visibility.
-func checkCreditSpend(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+func checkCreditSpend(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string), credentials ...CredentialView) {
 	if db == nil {
 		return
 	}
-	budgets := budget.New(db, budget.WithCreditPolicy(budget.CreditPolicyFromConfig(cfg)))
+	view := doctorCredentials(cfg, credentials)
+	budgets := budget.New(db, budget.WithCreditPolicy(budget.CreditPolicyFromSource(view.SourcePolicy)))
 	for _, source := range config.SourceNames() {
-		policy := cfg.SourcePolicy(source)
+		policy := view.SourcePolicy(source)
 		if !policy.Enabled || policy.DailyCreditFraction == 0 {
 			continue
 		}
 		status, err := budgets.CreditStatus(ctx, source)
 		if err != nil {
-			add("credits_"+source, Warn, source+" credit accounting could not be read", err.Error())
+			add("credits_"+source, Warn, source+" credit accounting could not be read", "inspect database permissions and run papio doctor again")
 			continue
 		}
 		name := "credits_" + source
@@ -1436,11 +1452,16 @@ func configuredDocumentDeliveryProfiles(cfg config.Config) []string {
 // version, and it never creates a test request: Decision 3C forbids a probe
 // request outright, and a safe, budget-respecting auth-only check is future
 // work, not this pass.
-func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string), credentials ...CredentialView) {
+	view := doctorCredentials(cfg, credentials)
 	for _, name := range configuredDocumentDeliveryProfiles(cfg) {
-		inst, _ := cfg.InstitutionFor(name)
+		inst, _ := view.InstitutionFor(name)
 		dd := inst.DocumentDelivery
 		prefix := "document_delivery:" + name
+		if dd == nil {
+			add(prefix+":credentials", Fail, "resolved document-delivery profile is unavailable", "run papio config credentials status and restart the daemon")
+			continue
+		}
 
 		profile := delivery.CompileGateProfile(inst, name)
 		switch db {
@@ -1449,7 +1470,7 @@ func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Sto
 		default:
 			resolved, err := delivery.New(db, &cfg, nil).ResolveGateProfile(ctx, name, inst)
 			if err != nil {
-				add(prefix+":live_acceptance", Fail, "live-acceptance record could not be read: "+err.Error(), "inspect database permissions")
+				add(prefix+":live_acceptance", Fail, "live-acceptance record could not be read", "inspect database permissions")
 				break
 			}
 			profile = resolved
@@ -1467,13 +1488,16 @@ func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Sto
 		add(prefix+":kind", Pass, "kind "+documentDeliveryOrUnset(dd.Kind)+" delivery adapter is shipped", "")
 
 		if dd.Kind == "illiad" {
+			_, offline := view.(offlineCredentials)
 			switch {
+			case offline && dd.CredentialRef != "":
+				add(prefix+":credentials", Skip, "ILLiad credential reference has not been checked; automatic delivery requires resolution", "run papio config credentials status or daemon-backed papio doctor")
 			case dd.APIKey == "" && dd.PatronRef == "":
-				add(prefix+":credentials", Warn, "api_key and patron_ref are not configured", "configure document_delivery.api_key and .patron_ref (0600 config only)")
+				add(prefix+":credentials", Warn, "api_key and patron_ref are not configured", "use papio config credentials set "+deliveryCredentialTarget(name)+" and configure document_delivery.patron_ref")
 			case dd.APIKey == "":
-				add(prefix+":credentials", Warn, "api_key is not configured", "configure document_delivery.api_key (0600 config only)")
+				add(prefix+":credentials", Warn, "api_key is not configured", "use papio config credentials set "+deliveryCredentialTarget(name))
 			case dd.PatronRef == "":
-				add(prefix+":credentials", Warn, "patron_ref is not configured", "configure document_delivery.patron_ref (0600 config only)")
+				add(prefix+":credentials", Warn, "patron_ref is not configured", "configure document_delivery.patron_ref")
 			default:
 				add(prefix+":credentials", Pass, "api_key and patron_ref are configured", "")
 			}
@@ -1493,7 +1517,7 @@ func checkDocumentDelivery(ctx context.Context, cfg config.Config, db *store.Sto
 			default:
 				health, err := delivery.New(db, &cfg, nil).LivePollHealth(ctx, name)
 				if err != nil {
-					add(prefix+":poll_health", Fail, "poll health could not be read: "+err.Error(), "inspect database permissions")
+					add(prefix+":poll_health", Fail, "poll health could not be read", "inspect database permissions")
 					break
 				}
 				add(prefix+":poll_health", documentDeliveryPollHealthStatus(health), documentDeliveryPollHealthDetail(health), documentDeliveryPollHealthRemedy(health))

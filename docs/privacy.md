@@ -153,13 +153,28 @@ form values, browser credentials, account areas and unrelated tabs. URL-like and
 credential-like strings in labels are redacted. Labels are page-derived text;
 this minimization is not a guarantee that all possible personal text is detected.
 
-Saved keys use the operating system's credential store and are scoped to a Papio
-configuration path and data directory. Setup writes only enrollment to TOML;
-the secret is never supplied as a process argument or sent to the extension.
-Unenrolled profiles do not search for existing credentials. An explicitly empty
-environment override disables the backend. Use `papio config agent remove` and
-remove any environment override to disable it, then restart the daemon. Removing
-configuration alone does not erase a previously saved OS credential.
+Saved integration credentials use macOS Keychain, Windows Credential Manager
+or Linux Secret Service. Config stores typed references; it does not receive
+resolved secrets. References survive config moves but do not sync secrets to
+another machine. Each profile explicitly chooses its records, and TypeSafe
+setup enrolls only that profile. Webhook records include the complete endpoint
+URL because its path or query can contain a token.
+
+An explicit environment reference supports headless use. Selected variables are
+removed before child processes start. The older `PAPIO_TYPESAFE_API_KEY` override
+still works until the profile has an explicit agent reference; an empty legacy
+value disables the backend. `papio config agent remove` detaches enrollment;
+remove any legacy environment override and restart the daemon to disable it.
+Detaching does not delete a shared OS record. Deletion is a separate explicit
+credential command.
+
+Legacy TOML secrets remain supported until you run
+`papio config credentials migrate`. Migration verifies new records before
+replacing config, refuses observed concurrent edits, leaves old TypeSafe records
+intact and creates no plaintext backup. Existing user backups are not rewritten.
+Credential status reports local availability without printing values; it does not
+claim the provider has authenticated them. Browser passwords, cookies and SSO
+remain browser-owned; Zotero credentials remain zotio-owned.
 
 The daemon retains request/permit IDs, observation revisions, outcomes and usage
 counts locally. It does not retain the model projection or raw response in those

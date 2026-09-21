@@ -104,5 +104,6 @@ shared analytics are separate work.
 
 Credential storage follow-up (2026-09-21): ADR-0030 selects one integration
 credential service with explicit references independent of filesystem paths.
-Its migration is not implemented yet; the path-scoped behavior described above
-remains current until that migration ships. Cloud enrollment stays explicit.
+The shared service and explicit migration are now implemented. New setup uses
+references; the path-scoped behavior above remains a compatibility reader until
+each existing profile is migrated. Cloud enrollment stays explicit.

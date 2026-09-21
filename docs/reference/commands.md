@@ -444,7 +444,7 @@ papio config agent
 
 #### `papio config agent remove`
 
-Disable the configured agent and remove its saved key
+Disable the configured agent while preserving stored credentials
 
 ```
 papio config agent remove
@@ -454,7 +454,7 @@ papio config agent remove
 
 Enable TypeSafe/Jev with a key saved in the OS credential store
 
-Enable cloud article decisions for this configuration profile. This sends article DOIs, bounded titles and sanitized control descriptions to TypeSafe. The API key stays in the OS credential store. Input is hidden; use --key-stdin for a secret-manager pipe. Restart the daemon after changing this setting.
+Enable cloud article decisions for this configuration profile. This sends article DOIs, bounded titles and sanitized control descriptions to TypeSafe. The key is stored as a shared-service typed credential with an explicit reference. Input is hidden; use --key-stdin for a secret-manager pipe. Restart the daemon after changing this setting.
 
 ```
 papio config agent set [flags]
@@ -470,6 +470,70 @@ Show agent configuration without revealing credentials
 
 ```
 papio config agent status
+```
+
+### `papio config credentials`
+
+Manage integration credentials in the OS store or environment
+
+```
+papio config credentials
+```
+
+#### `papio config credentials bind`
+
+Reuse an existing typed credential for this configuration
+
+```
+papio config credentials bind TARGET REFERENCE
+```
+
+#### `papio config credentials delete`
+
+Delete a stored record without changing configurations that reference it
+
+```
+papio config credentials delete REFERENCE
+```
+
+#### `papio config credentials detach`
+
+Remove a configuration binding while preserving the stored record
+
+```
+papio config credentials detach TARGET
+```
+
+#### `papio config credentials migrate`
+
+Move this configuration's legacy secrets into verified OS records
+
+Migrate supported literal credentials and this profile's legacy TypeSafe key. New records are verified before one guarded config update. Existing vault entries are retained. Interrupted operations report staged references for inspection or explicit deletion. No plaintext backup is created. An active legacy TypeSafe environment override must be removed before migration.
+
+```
+papio config credentials migrate
+```
+
+#### `papio config credentials set`
+
+Save a new credential and bind this configuration to it
+
+Create a fresh OS credential record for one integration. Supply a single API key at the hidden prompt or with --key-stdin. For sources.openaire and notify.webhook, use --key-stdin with a version-1 typed JSON credential record. TypeSafe setup enrolls this profile in cloud article decisions. Restart the daemon after changes.
+
+```
+papio config credentials set TARGET [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--key-stdin` | `bool` | `false` | read a key or typed JSON record from standard input |
+
+#### `papio config credentials status`
+
+Show selected credential sources without revealing values
+
+```
+papio config credentials status [TARGET]
 ```
 
 ### `papio config init`

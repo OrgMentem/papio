@@ -22,6 +22,7 @@ import (
 	"papio/internal/bundle"
 	"papio/internal/captures"
 	"papio/internal/config"
+	"papio/internal/credential"
 	"papio/internal/daemon"
 	"papio/internal/delivery"
 	"papio/internal/discovery"
@@ -48,6 +49,7 @@ import (
 	"papio/internal/resolvers/semanticscholar"
 	"papio/internal/resolvers/unpaywall"
 	"papio/internal/retraction"
+	"papio/internal/runtimecredential"
 	"papio/internal/sourcegate"
 	"papio/internal/store"
 	"papio/internal/triage"
@@ -64,6 +66,7 @@ import (
 // handlers. Closing it closes the single SQLite connection.
 type System struct {
 	Config        config.Config
+	Credentials   *runtimecredential.Runtime
 	Store         *store.Store
 	Jobs          *job.Store
 	Artifacts     *artifact.Store
@@ -218,14 +221,22 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 }
 
 func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*System, error) {
-	agentBackend, err := takeAcquisitionBackend(ctx, cfg)
+	env, err := runtimecredential.TakeEnvironment(cfg)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		return nil, err
+	}
+	credentials := runtimecredential.Resolve(ctx, cfg, credential.NewStore(), agentcredential.NewStore().Load, env)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var agentBackend acquisitionagent.Backend
+	if key := credentials.AgentKey(); key != "" {
+		agentBackend, _ = acquisitionagent.NewTypeSafe(key, nil)
+	}
+	for _, status := range credentials.Statuses() {
+		if status.State == "missing" || status.State == "unavailable" || status.State == "invalid" {
+			_, _ = fmt.Fprintf(os.Stderr, "papio: credential for %s is %s; check papio config credentials status and restart after fixing setup\n", status.Target, status.State)
 		}
-		// Optional inference must not disable deterministic acquisition when
-		// the credential store is locked or unavailable (e.g. a headless login).
-		_, _ = fmt.Fprintf(os.Stderr, "papio: article agent unavailable: %v; check papio config agent status and restart after fixing setup\n", err)
 	}
 	db, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
@@ -250,7 +261,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		MaxAge:     time.Duration(cfg.Captures.MaxAgeDays) * 24 * time.Hour,
 	})
 	budgets := budget.New(db,
-		budget.WithCreditPolicy(budget.CreditPolicyFromConfig(cfg)),
+		budget.WithCreditPolicy(budget.CreditPolicyFromSource(credentials.SourcePolicy)),
 		// Without this the per-job credit share never binds: an unspent
 		// allowance cannot be carried forward, so deferring a job when
 		// nothing else is waiting would cost throughput and buy nothing.
@@ -269,13 +280,14 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	metadataPolicy := artifactPolicy
 	metadataPolicy.MaxBytes = 8 << 20
 	metadataPolicy.MaxRedirects = 3
-	metadataClient, err := fetch.NewSecureHTTPClient(metadataPolicy, nil, fetch.MetadataTransport(metadataDisableKeepAlives(cfg)))
+	metadataClient, err := fetch.NewSecureHTTPClient(metadataPolicy, nil, fetch.MetadataTransport(metadataDisableKeepAlives(cfg, credentials)))
 	if err != nil {
 		return nil, err
 	}
 
-	entries := resolverEntries(cfg, budgets, metadataClient)
+	entries := resolverEntries(cfg, budgets, metadataClient, credentials)
 	service := app.New(cfg, jobs, artifacts, budgets)
+	service.Credentials = credentials
 	// ILLiad is the only POST caller. It uses the same policy as metadata:
 	// submission responses need no distinct timeout or byte bound today, while
 	// the separate constructor keeps metadata and discovery GET-only.
@@ -284,8 +296,9 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		return nil, err
 	}
 	service.Delivery = delivery.New(db, &cfg, nil)
+	service.Delivery.Credentials = credentials
 	service.IlliadHTTPClient = illiadClient
-	discoveryBackends, err := discoverySources(cfg, budgets, metadataClient)
+	discoveryBackends, err := discoverySources(cfg, budgets, metadataClient, credentials)
 	if err != nil {
 		return nil, err
 	}
@@ -313,8 +326,8 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		desktop, _ = notify.NewPlatformSender()
 	}
 	var webhook notify.Sender
-	if cfg.Notify.WebhookURL != "" {
-		webhook = notify.NewWebhook(cfg.Notify.WebhookURL, cfg.Notify.WebhookSecret)
+	if endpoint, bearer := credentials.Webhook(); endpoint != "" {
+		webhook = notify.NewWebhook(endpoint, bearer)
 	}
 	revalidate := func(ctx context.Context, row notify.Record) (bool, error) {
 		dbh := db.DB()
@@ -369,7 +382,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	})
 	service.Notifier = router
 	service.Resolvers = entries
-	if cfg.SourcePolicy(config.SourceCrossrefMetadata).Enabled {
+	if credentials.SourcePolicy(config.SourceCrossrefMetadata).Enabled {
 		crossrefEnricher := enrich.NewWithOptions(enrich.Options{
 			Client: metadataClient, ContactEmail: cfg.Email,
 			BaseURL: cfg.Sources[config.SourceCrossrefMetadata].BaseURLForDev,
@@ -379,13 +392,13 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 			Name: config.SourceCrossrefMetadata, Enricher: crossrefEnricher,
 		})
 	}
-	if cfg.SourcePolicy(config.SourceOpenAlex).Enabled {
+	if credentials.SourcePolicy(config.SourceOpenAlex).Enabled {
 		openAlexEnricher := enrich.NewOpenAlexWithOptions(enrich.OpenAlexOptions{
 			// Same daily budget as the resolver and discovery paths, so the
 			// enricher's own responses must feed the header-derived floor too.
-			Client:       mustOpenAlexClient(budgets, cfg, metadataClient),
+			Client:       mustOpenAlexClient(budgets, cfg, metadataClient, credentials),
 			ContactEmail: cfg.Email,
-			APIKey:       cfg.Sources[config.SourceOpenAlex].APIKey,
+			APIKey:       credentials.SourcePolicy(config.SourceOpenAlex).APIKey,
 			BaseURL:      cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
 		})
 		service.MetadataEnrichers = append(service.MetadataEnrichers, app.MetadataEnricherEntry{
@@ -480,7 +493,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Holdings: holdings,
 	}
 	var retractions *retraction.Sentinel
-	if policy := cfg.SourcePolicy(config.SourceRetractionWatch); policy.Enabled {
+	if policy := credentials.SourcePolicy(config.SourceRetractionWatch); policy.Enabled {
 		retractionHTTPPolicy := metadataPolicy
 		retractionHTTPPolicy.MaxBytes = retraction.DefaultMaxResponseBytes
 		retractionClient, err := fetch.NewSecureHTTPClientNoRedirect(
@@ -526,10 +539,8 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 	previewServer := preview.New(jobs)
 	bridge := browser.NewBridge(jobs, service, triageService, watchRunner, previewServer, captureStore, holdings, browserZotio, cfg, version)
-	// This explicitly named daemon environment variable is the initial
-	// cross-platform opt-in. The key never enters config, browser IPC, or logs.
-	// Platform credential-store onboarding can supply it without coupling the
-	// shared decision contract to a particular OS or cloud provider.
+	// Only a resolved, explicitly configured backend reaches the browser.
+	// Credential values remain in the daemon; they never enter browser IPC.
 	bridge.SetAcquisitionBackend(agentBackend)
 	router.SetPresence(bridge.PresenceProvider())
 
@@ -538,7 +549,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	}
 	bridge.SetPulseService(pulseService)
 	system := &System{
-		Config: cfg, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,
+		Config: cfg, Credentials: credentials, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,
 		App: service, Notify: router, Pulse: pulseService, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
 		Browser:       bridge,
@@ -562,35 +573,24 @@ func takeAcquisitionBackend(ctx context.Context, cfg config.Config) (acquisition
 }
 
 func takeAcquisitionBackendWithStore(ctx context.Context, cfg config.Config, load func(context.Context, string) (string, error)) (acquisitionagent.Backend, error) {
-	raw, overridden := os.LookupEnv("PAPIO_TYPESAFE_API_KEY")
-	key := strings.TrimSpace(raw)
-	if err := os.Unsetenv("PAPIO_TYPESAFE_API_KEY"); err != nil {
-		return nil, errors.New("could not isolate the acquisition backend credential")
-	}
-	if !overridden {
-		if cfg.Agent == nil || cfg.Agent.Backend != "typesafe" {
-			return nil, nil
-		}
-		profile, err := agentcredential.Profile(cfg.Path, cfg.DataDir)
-		if err != nil {
-			return nil, errors.New("could not identify the agent credential profile")
-		}
-		key, err = load(ctx, profile)
-		if err != nil {
-			return nil, errors.New("saved TypeSafe key could not be read from the OS credential store")
-		}
-	}
-	if overridden && key == "" {
-		return nil, nil
-	}
-	if err := agentcredential.ValidateKey(key); err != nil {
-		return nil, errors.New("invalid TypeSafe key for acquisition decisions")
-	}
-	backend, err := acquisitionagent.NewTypeSafe(key, nil)
+	env, err := runtimecredential.TakeEnvironment(cfg)
 	if err != nil {
-		return nil, errors.New("invalid TypeSafe key for acquisition decisions")
+		return nil, err
 	}
-	return backend, nil
+	resolved := runtimecredential.Resolve(ctx, cfg, credential.NewStore(), load, env)
+	if key := resolved.AgentKey(); key != "" {
+		backend, err := acquisitionagent.NewTypeSafe(key, nil)
+		if err != nil {
+			return nil, errors.New("invalid TypeSafe key for acquisition decisions")
+		}
+		return backend, nil
+	}
+	for _, status := range resolved.Statuses() {
+		if status.Target == "agent.typesafe" && status.State != "not_configured" {
+			return nil, errors.New("TypeSafe credential is " + status.State + "; check papio config credentials status")
+		}
+	}
+	return nil, nil
 }
 
 // hookShutdownGraceCap keeps daemon shutdown inside ordinary service-manager
@@ -639,15 +639,19 @@ func (s *System) Close() error {
 // DoctorReport runs readiness checks against this live system without exposing
 // credentials or opening a second database connection.
 func (s *System) DoctorReport(ctx context.Context) doctor.Report {
-	return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery)
+	if s.Credentials == nil {
+		return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery)
+	}
+	return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery, s.Credentials)
 }
 
 // metadataDisableKeepAlives aggregates every configured source's keep-alive
 // policy for the one shared metadata HTTP client. Any source that opts into
 // reuse disables keep-alive suppression for the shared transport.
-func metadataDisableKeepAlives(cfg config.Config) bool {
+func metadataDisableKeepAlives(cfg config.Config, views ...sourcePolicies) bool {
+	source := selectSourcePolicies(cfg, views)
 	for name := range cfg.Sources {
-		if !cfg.SourcePolicy(name).DisableKeepAlives() {
+		if !source.SourcePolicy(name).DisableKeepAlives() {
 			return false
 		}
 	}
@@ -657,8 +661,9 @@ func metadataDisableKeepAlives(cfg config.Config) bool {
 // mustOpenAlexClient is the OpenAlex metadata HTTP stack: replay-bounded
 // transport, no in-client redirect following, and quota-header observation.
 // Admission still happens at app.go AcquireAny sites — not in sourcegate.Client.
-func mustOpenAlexClient(budgets *budget.Manager, cfg config.Config, _ *fetch.SecureHTTPClient) sourcegate.HTTPClient {
-	policy := cfg.SourcePolicy(config.SourceOpenAlex)
+func mustOpenAlexClient(budgets *budget.Manager, cfg config.Config, _ *fetch.SecureHTTPClient, views ...sourcePolicies) sourcegate.HTTPClient {
+	source := selectSourcePolicies(cfg, views)
+	policy := source.SourcePolicy(config.SourceOpenAlex)
 	transport := fetch.MetadataTransport(policy.DisableKeepAlives())
 	metaPolicy := fetch.DefaultPolicy()
 	metaPolicy.MaxBytes = 8 << 20
@@ -686,16 +691,17 @@ func mustOpenAlexClient(budgets *budget.Manager, cfg config.Config, _ *fetch.Sec
 // Observer). The entry is deliberately NOT wrapped in sourcegate.Client —
 // admission already happens at the app.go AcquireAny sites, and a second
 // wrapper would reserve twice.
-func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.SecureHTTPClient) []app.ResolverEntry {
+func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.SecureHTTPClient, views ...sourcePolicies) []app.ResolverEntry {
+	source := selectSourcePolicies(cfg, views)
 	return []app.ResolverEntry{
-		{Adapter: arxiv.NewWithOptions(arxiv.Options{Client: client, BaseURL: cfg.Sources[config.SourceArXiv].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceArXiv)},
-		{Adapter: europepmc.NewWithOptions(europepmc.Options{Client: client, BaseURL: cfg.Sources[config.SourceEuropePMC].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceEuropePMC)},
-		{Adapter: unpaywall.NewWithOptions(unpaywall.Options{Client: client, ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceUnpaywall].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceUnpaywall)},
-		{Adapter: openalex.NewWithOptions(openalex.Options{Client: mustOpenAlexClient(budgets, cfg, client), ContactEmail: cfg.Email, APIKey: cfg.Sources[config.SourceOpenAlex].APIKey, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev, SiblingTitleSearch: cfg.Sources[config.SourceOpenAlex].SiblingTitleSearch}), Policy: cfg.SourcePolicy(config.SourceOpenAlex)},
-		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, APIKey: cfg.Sources[config.SourceSemanticScholar].APIKey, BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceSemanticScholar)},
-		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: cfg.Sources[config.SourceCORE].APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCORE)},
-		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: cfg.Sources[config.SourceCrossrefTDM].APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceCrossrefTDM)},
-		{Adapter: openaire.NewWithOptions(openaire.Options{Client: client, Tokens: openAIRETokens(cfg, client), APIKey: cfg.Sources[config.SourceOpenAIRE].APIKey, BaseURL: cfg.Sources[config.SourceOpenAIRE].BaseURLForDev}), Policy: cfg.SourcePolicy(config.SourceOpenAIRE)},
+		{Adapter: arxiv.NewWithOptions(arxiv.Options{Client: client, BaseURL: cfg.Sources[config.SourceArXiv].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceArXiv)},
+		{Adapter: europepmc.NewWithOptions(europepmc.Options{Client: client, BaseURL: cfg.Sources[config.SourceEuropePMC].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceEuropePMC)},
+		{Adapter: unpaywall.NewWithOptions(unpaywall.Options{Client: client, ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceUnpaywall].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceUnpaywall)},
+		{Adapter: openalex.NewWithOptions(openalex.Options{Client: mustOpenAlexClient(budgets, cfg, client, source), ContactEmail: cfg.Email, APIKey: source.SourcePolicy(config.SourceOpenAlex).APIKey, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev, SiblingTitleSearch: cfg.Sources[config.SourceOpenAlex].SiblingTitleSearch}), Policy: source.SourcePolicy(config.SourceOpenAlex)},
+		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, APIKey: source.SourcePolicy(config.SourceSemanticScholar).APIKey, BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceSemanticScholar)},
+		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: source.SourcePolicy(config.SourceCORE).APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceCORE)},
+		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: source.SourcePolicy(config.SourceCrossrefTDM).APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceCrossrefTDM)},
+		{Adapter: openaire.NewWithOptions(openaire.Options{Client: client, Tokens: openAIRETokens(cfg, client, source), APIKey: source.SourcePolicy(config.SourceOpenAIRE).APIKey, BaseURL: cfg.Sources[config.SourceOpenAIRE].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceOpenAIRE)},
 	}
 }
 
@@ -708,8 +714,8 @@ func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.S
 // it is neither metered by the Graph rate ceiling papio paces itself to nor
 // admitted through the source's budget gate — one request per token lifetime
 // against a different service.
-func openAIRETokens(cfg config.Config, client *fetch.SecureHTTPClient) openaire.TokenSource {
-	source := cfg.Sources[config.SourceOpenAIRE]
+func openAIRETokens(cfg config.Config, client *fetch.SecureHTTPClient, views ...sourcePolicies) openaire.TokenSource {
+	source := selectSourcePolicies(cfg, views).SourcePolicy(config.SourceOpenAIRE)
 	if !source.HasClientCredentials() {
 		return nil
 	}
@@ -730,8 +736,9 @@ func openAIRETokens(cfg config.Config, client *fetch.SecureHTTPClient) openaire.
 // discovery request on a default config, which is a backend built and then
 // silently refused. Pacing and cost still come from the source because they
 // describe the provider, which both callers share.
-func discoveryPolicy(cfg config.Config, name string) config.Source {
-	policy := cfg.SourcePolicy(name)
+func discoveryPolicy(cfg config.Config, name string, views ...sourcePolicies) config.Source {
+	source := selectSourcePolicies(cfg, views)
+	policy := source.SourcePolicy(name)
 	policy.Enabled = true
 	return policy
 }
@@ -748,7 +755,8 @@ func discoveryPolicy(cfg config.Config, name string) config.Source {
 // acquisition resolvers that hit the same providers. Left ungated it drew on
 // the same provider quota invisibly and ignored a durable gate that had already
 // paused acquisition.
-func discoverySources(cfg config.Config, budgets *budget.Manager, client sourcegate.HTTPClient) ([]discovery.Source, error) {
+func discoverySources(cfg config.Config, budgets *budget.Manager, client sourcegate.HTTPClient, views ...sourcePolicies) ([]discovery.Source, error) {
+	source := selectSourcePolicies(cfg, views)
 	names := cfg.Discovery.Sources
 	if len(names) == 0 {
 		names = []string{config.SourceOpenAlex}
@@ -766,10 +774,10 @@ func discoverySources(cfg config.Config, budgets *budget.Manager, client sourceg
 			// sourcegate.Client's construction-time policy is removed so it cannot
 			// pre-empt the keyed identity CommitEgress derives from the request.
 			// Identity-agnostic pacing sits outside the guarded stack.
-			stack := mustOpenAlexClient(budgets, cfg, nil)
-			gated, err = sourcegate.NewPacingOnly(budgets, name, discoveryPolicy(cfg, name), 0, stack)
+			stack := mustOpenAlexClient(budgets, cfg, nil, source)
+			gated, err = sourcegate.NewPacingOnly(budgets, name, discoveryPolicy(cfg, name, source), 0, stack)
 		} else {
-			gated, err = sourcegate.New(budgets, name, discoveryPolicy(cfg, name), 0, client)
+			gated, err = sourcegate.New(budgets, name, discoveryPolicy(cfg, name, source), 0, client)
 		}
 		if err != nil {
 			return nil, err
@@ -784,16 +792,26 @@ func discoverySources(cfg config.Config, budgets *budget.Manager, client sourceg
 			sources = append(sources, discovery.NewWithOptions(discovery.Options{
 				Client:       gated,
 				ContactEmail: cfg.Email,
-				APIKey:       cfg.Sources[config.SourceOpenAlex].APIKey,
+				APIKey:       source.SourcePolicy(config.SourceOpenAlex).APIKey,
 				BaseURL:      cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
 			}))
 		case config.SourceSemanticScholar:
 			sources = append(sources, discovery.NewSemanticScholarWithOptions(discovery.SemanticScholarOptions{
 				Client:  gated,
-				APIKey:  cfg.Sources[config.SourceSemanticScholar].APIKey,
+				APIKey:  source.SourcePolicy(config.SourceSemanticScholar).APIKey,
 				BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev,
 			}))
 		}
 	}
 	return sources, nil
+}
+
+// sourcePolicies is shared by raw legacy config and the resolved runtime view.
+type sourcePolicies interface{ SourcePolicy(string) config.Source }
+
+func selectSourcePolicies(cfg config.Config, views []sourcePolicies) sourcePolicies {
+	if len(views) != 0 && views[0] != nil {
+		return views[0]
+	}
+	return &cfg
 }

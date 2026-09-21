@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -226,6 +227,15 @@ func New(s *store.Store, opts ...Option) *Manager {
 // send the credential, so trimming here is what keeps a whitespace-only key
 // metered as the anonymous traffic it actually is.
 func identityFor(policy config.Source) string {
+	if policy.HasClientCredentials() {
+		// OpenAIRE exchanges this pair before considering its legacy token.
+		// Keep its authenticated account separate from anonymous deferrals and
+		// other pairs, independent of where the credential was stored. JSON
+		// preserves field boundaries; both fields follow the client's trimming.
+		pair, _ := json.Marshal([2]string{strings.TrimSpace(policy.ClientID), strings.TrimSpace(policy.ClientSecret)})
+		sum := sha256.Sum256(append([]byte("openaire-client\x00"), pair...))
+		return "client-" + hex.EncodeToString(sum[:8])
+	}
 	key := strings.TrimSpace(policy.APIKey)
 	if key == "" {
 		return "anonymous"
