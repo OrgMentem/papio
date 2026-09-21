@@ -126,16 +126,17 @@ func readPublishedKey(path string) ([]byte, bool, error) {
 	} else if !errors.Is(err, io.EOF) {
 		return nil, true, fmt.Errorf("checking incident key length: %w", err)
 	}
-	if err := file.Chmod(0o600); err != nil {
+	if err := restrictIncidentKey(file); err != nil {
 		return nil, true, fmt.Errorf("restricting incident key: %w", err)
 	}
 	return key, true, nil
 }
 
 // LoadOrCreateKey loads the per-installation incident key, creating it once
-// with restrictive permissions when needed. A key is never published until a
-// same-directory temporary file has been completely written, synced, closed,
-// and then linked into place with exclusive semantics.
+// with Unix mode 0600, or inherited Windows data-directory ACLs. A key is never
+// published until a same-directory temporary file has been written, synced, closed,
+// and then linked into place with exclusive semantics. Unix additionally syncs
+// the directory entry; Windows does not promise that metadata flush guarantee.
 func LoadOrCreateKey(dataDir string) ([]byte, error) {
 	if strings.TrimSpace(dataDir) == "" {
 		return nil, errors.New("incident data directory is required")
@@ -190,7 +191,7 @@ func LoadOrCreateKey(dataDir string) ([]byte, error) {
 		if err := keyPublicationPoint("written"); err != nil {
 			return fail("incident key publication interrupted", err)
 		}
-		if err := temp.Chmod(0o600); err != nil {
+		if err := restrictIncidentKey(temp); err != nil {
 			return fail("restricting incident key", err)
 		}
 		if err := keyPublicationPoint("chmod"); err != nil {
@@ -216,17 +217,8 @@ func LoadOrCreateKey(dataDir string) ([]byte, error) {
 			if err := keyPublicationPoint("published"); err != nil {
 				return nil, fmt.Errorf("incident key publication interrupted: %w", err)
 			}
-			dir, openErr := os.Open(dataDir)
-			if openErr != nil {
-				return nil, fmt.Errorf("opening incident key directory: %w", openErr)
-			}
-			syncErr := dir.Sync()
-			closeErr := dir.Close()
-			if syncErr != nil {
-				return nil, fmt.Errorf("syncing incident key directory: %w", syncErr)
-			}
-			if closeErr != nil {
-				return nil, fmt.Errorf("closing incident key directory: %w", closeErr)
+			if err := syncIncidentKeyDirectory(dataDir); err != nil {
+				return nil, err
 			}
 			return newKey, nil
 		}

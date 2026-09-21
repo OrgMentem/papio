@@ -38,7 +38,7 @@ func TestFingerprintStableKeyedAndRedacted(t *testing.T) {
 	}
 }
 
-func TestLoadOrCreateKeyCreatesOnceWith0600(t *testing.T) {
+func TestLoadOrCreateKeyCreatesOnce(t *testing.T) {
 	dir := t.TempDir()
 	first, err := LoadOrCreateKey(dir)
 	if err != nil {
@@ -55,8 +55,8 @@ func TestLoadOrCreateKeyCreatesOnceWith0600(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("incident key mode = %o, want 600", info.Mode().Perm())
+	if !info.Mode().IsRegular() || info.Size() != KeySize {
+		t.Fatalf("incident key = %v, size %d; want complete regular key", info.Mode(), info.Size())
 	}
 }
 
@@ -231,26 +231,63 @@ func TestLoadOrCreateKeyConcurrentCreatorsAndInvalidArtifactRecovery(t *testing.
 }
 
 func TestLoadOrCreateKeyRecoversInterruptedPublication(t *testing.T) {
+	for _, stoppedAt := range []string{"temp_created", "written", "chmod", "synced", "closed", "published"} {
+		t.Run(stoppedAt, func(t *testing.T) {
+			dir := t.TempDir()
+			incidentKeyPublicationHook = func(point string) error {
+				if point == stoppedAt {
+					return errors.New("injected interruption")
+				}
+				return nil
+			}
+			t.Cleanup(func() { incidentKeyPublicationHook = nil })
+			_, err := LoadOrCreateKey(dir)
+			incidentKeyPublicationHook = nil
+			if err == nil {
+				t.Fatal("interrupted first publication unexpectedly succeeded")
+			}
+			published, err := os.ReadFile(filepath.Join(dir, KeyName))
+			if stoppedAt == "published" {
+				if err != nil || len(published) != KeySize {
+					t.Fatalf("published key is not complete: length=%d err=%v", len(published), err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("interrupted publication left final artifact: %v", err)
+			}
+			entries, err := filepath.Glob(filepath.Join(dir, "."+KeyName+".tmp-*"))
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("temporary publication artifacts retained: %d %v", len(entries), err)
+			}
+			key, err := LoadOrCreateKey(dir)
+			if err != nil || len(key) != KeySize {
+				t.Fatalf("recovered key length=%d err=%v", len(key), err)
+			}
+			if published != nil && string(key) != string(published) {
+				t.Fatal("recovery replaced complete published key")
+			}
+		})
+	}
+}
+
+func TestLoadOrCreateKeyCompetingPublicationNeverReplacesWinner(t *testing.T) {
 	dir := t.TempDir()
+	path := filepath.Join(dir, KeyName)
+	winner := []byte(strings.Repeat("w", KeySize))
 	incidentKeyPublicationHook = func(point string) error {
-		if point == "synced" {
-			return errors.New("injected interruption")
+		if point != "closed" {
+			return nil
 		}
-		return nil
+		// A different publisher wins between our absent-path check and Link.
+		return os.WriteFile(path, winner, 0o600)
 	}
-	_, err := LoadOrCreateKey(dir)
-	incidentKeyPublicationHook = nil
-	if err == nil {
-		t.Fatal("interrupted first publication unexpectedly succeeded")
-	}
-	if _, err := os.Stat(filepath.Join(dir, KeyName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("interrupted publication left final artifact: %v", err)
-	}
+	t.Cleanup(func() { incidentKeyPublicationHook = nil })
 	key, err := LoadOrCreateKey(dir)
-	if err != nil {
-		t.Fatal(err)
+	incidentKeyPublicationHook = nil
+	if err != nil || string(key) != string(winner) {
+		t.Fatalf("lost exclusive publication did not load winner: %v", err)
 	}
-	if len(key) != KeySize {
-		t.Fatalf("recovered key length = %d, want %d", len(key), KeySize)
+	stored, err := os.ReadFile(path)
+	if err != nil || string(stored) != string(winner) {
+		t.Fatalf("winner replaced: %v", err)
 	}
 }

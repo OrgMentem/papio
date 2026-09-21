@@ -318,6 +318,9 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Windows can create its incident key on first use.** Publication still flushes
+  complete key bytes and never overwrites a competing key. It preserves Windows
+  ACLs and read-only attributes without requiring an unsupported directory flush.
 - **Windows native-host installation now works while a browser is connected.**
   The installer preserves running host copies, publishes the replacement, and
   restores the prior image if publication fails. Existing connections keep
