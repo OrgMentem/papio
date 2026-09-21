@@ -3,13 +3,20 @@
 import type { AgentDecideObservation } from "./protocol";
 export type AgentObservation = AgentDecideObservation;
 export interface AgentDOMRequest {
-  method: "observe" | "act" | "check_menu";
+  method: "observe" | "prepare" | "act" | "check_menu";
   entryURL: string;
   doi: string;
   /** Worker-local document identity: a navigation/reload cannot resume a loop. */
   document?: string;
   choice?: string;
   revision?: string;
+  /** Negotiated worker capability; URLs remain internal, never model input. */
+  allowNavigation?: boolean;
+  destination?: string;
+  /** Absolute browser clock deadline; queued injections cannot outlive it. */
+  actionDeadline?: number;
+  /** Only the worker's unchanged-source navigation wait can resume this menu. */
+  resumeNavigation?: boolean;
 }
 /** Fixed public diagnostics only; never include page text or identity values. */
 export type AgentDOMRefusalReason =
@@ -19,16 +26,15 @@ export type AgentDOMRefusalReason =
   | "payment_required" | "human_action_required" | "invalid_request";
 export type AgentDOMResult =
   | { status: "observed"; document: string; observation: AgentObservation }
+  | { status: "prepared"; effect: "local" | "navigate"; destination?: string }
   | { status: "dispatched"; downloadExpected: boolean; menuPending?: true }
   | { status: "menu_checked"; ready: boolean }
   | { status: "stale" | "blocked"; reason: AgentDOMRefusalReason };
 
 /** Self-contained isolated-world injection. Only the projection leaves the page;
- * URLs, selectors, form execution data and account content never leave it.
- * This executor stays in one article document. Explicit same-origin PDF links
- * use native download intent; other cross-page links, form navigation and new
- * browsing contexts are refused. Wider navigation needs
- * its own binding/authority design, not a more permissive model instruction. */
+ * Selectors, form execution data and account content never leave it. Navigation
+ * preparation returns the selected URL only to the worker, which owns the
+ * document transition. Form navigation and new browsing contexts stay refused. */
 export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult> {
   const normalizeDOI = (raw: string) => raw.trim().replace(/^(?:doi:\s*|https?:\/\/(?:dx\.)?doi\.org\/)/i, "").toLowerCase();
   const doi = normalizeDOI(request.doi);
@@ -39,7 +45,9 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   const host = globalThis as typeof globalThis & { papioArticleAgent?: {
     node: Document; document: string; binding: string; ids: WeakMap<Element, string>; next: number; serial: number;
     consumed: Set<string>;
-    menuWait?: { revision: string; url: string; enabled: Set<string> };
+    retired?: boolean;
+    prepared?: { revision: string; choice: string; destination: string };
+    menuWait?: { revision: string; url: string; enabled: Set<string>; navigation?: true };
     observed?: { revision: string; source: string; targets: Map<string, Element> };
   } };
   const safe = (raw: string | null | undefined, limit = 240) => (raw ?? "")
@@ -115,6 +123,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   const validate = (): AgentDOMRefusalReason | undefined => {
     const current = new URL(location.href);
     if (entry.protocol !== "https:" || current.protocol !== "https:" || entry.username || entry.password || current.username || current.password || current.origin !== entry.origin || current.pathname !== entry.pathname) return "page_binding_failed";
+    if (request.allowNavigation && current.href !== entry.href) return "page_binding_failed";
     // DC identifiers can name ISBNs, local records or URLs unrelated to a DOI.
     // Only explicit DOI forms count there; every DOI claim across all three
     // standard fields must agree. No body/URL sniffing or first-hit fallback.
@@ -146,7 +155,8 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     host.papioArticleAgent = { node: document, document: crypto.randomUUID(), binding, ids: new WeakMap(), next: 0, serial: 0, consumed: new Set() };
   }
   const state = host.papioArticleAgent;
-  if (state.binding !== binding || (request.document !== undefined && state.document !== request.document)) return { status: "stale", reason: "document_changed" };
+  const checkingNavigationMenu = request.method === "check_menu" && request.resumeNavigation === true && state.menuWait?.navigation === true;
+  if ((state.retired && !checkingNavigationMenu) || state.binding !== binding || (request.document !== undefined && state.document !== request.document)) return { status: "stale", reason: "document_changed" };
   const scope = 'main,article,[role="main"]';
   const native = 'a[href],button,summary,input[type="button"],input[type="submit"],input[type="image"]';
   const selector = `${native},[role="button"],[role="link"],[role="menuitem"],[role="tab"],[aria-controls],[aria-haspopup],[tabindex],[onclick],.button,.btn`;
@@ -157,6 +167,12 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   };
   const explicitPDFLink = (element: Element, anchor: HTMLAnchorElement) =>
     element === anchor && /\bpdf\b/i.test(label(anchor)) && /\.pdf$/i.test(new URL(anchor.href).pathname);
+  const navigationTarget = (element: Element): string | undefined => {
+    const anchor = element.closest<HTMLAnchorElement>("a[href]");
+    if (!request.allowNavigation || element !== anchor || anchor.hasAttribute("download") || explicitPDFLink(element, anchor)) return undefined;
+    const url = new URL(anchor.href);
+    return url.pathname !== entry.pathname || url.search !== location.search ? url.href : undefined;
+  };
   const allowed = (element: Element) => {
     if (human.test(label(element)) || unrelated(label(element))) return false;
     const anchor = element.closest<HTMLAnchorElement>("a[href]");
@@ -168,7 +184,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       // and publisher handlers still control the outcome; document/receipt
       // checks, rather than the attribute, establish continued ownership.
       if (!anchor.hasAttribute("download") && !explicitPDFLink(element, anchor) &&
-        (url.pathname !== entry.pathname || url.search !== location.search)) return false;
+        (url.pathname !== entry.pathname || url.search !== location.search) && navigationTarget(element) === undefined) return false;
     }
     const form = (element as HTMLButtonElement).form || element.closest("form");
     if (form) {
@@ -212,7 +228,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       .filter(node => node.getAttribute("name")?.trim().toLowerCase() === name)
       .map(node => safe(node.getAttribute("content"), 400))).find(hasPublicLabel) ?? "";
     const projection = { doi, title, controls: controls.slice(0, 80) };
-    const source = JSON.stringify([state.document, binding, location.href, document.baseURI, projection, fingerprints]);
+    const source = JSON.stringify([state.document, binding, location.href, document.baseURI, request.allowNavigation === true, projection, fingerprints]);
     return { status: "snapshot" as const, projection, source, targets, controls };
   };
   const menuProgress = (view: Extract<ReturnType<typeof snapshot>, { status: "snapshot" }>, enabled: Set<string>) =>
@@ -223,18 +239,47 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     const pending = state.menuWait;
     if (!pending || request.document !== state.document || request.revision !== pending.revision || !state.consumed.has(pending.revision)) return { status: "stale", reason: "observation_changed" };
     if (location.href !== pending.url) return { status: "stale", reason: "page_binding_failed" };
-    return { status: "menu_checked", ready: menuProgress(current, pending.enabled) };
+    const ready = menuProgress(current, pending.enabled);
+    if (ready && checkingNavigationMenu) {
+      // The consumed answer stays consumed. Only a fresh observation may use
+      // newly exposed controls in this same, still-bound source document.
+      state.retired = false;
+      delete state.menuWait;
+    }
+    return { status: "menu_checked", ready };
   }
-  if (request.method === "act") {
+  if (request.method === "act" || request.method === "prepare") {
     const previous = state.observed;
     const choice = request.choice ?? "";
     const target = current.targets.get(choice);
     if (!previous || previous.revision !== request.revision || state.consumed.has(previous.revision) || previous.source !== current.source || !target || previous.targets.get(choice) !== target || !target.isConnected || !current.projection.controls.some(c => c.id === choice && !c.disabled)) return { status: "stale", reason: "observation_changed" };
+    const destination = navigationTarget(target);
+    if (request.method === "prepare") {
+      delete state.prepared;
+      if (destination === undefined) return { status: "prepared", effect: "local" };
+      state.prepared = { revision: previous.revision, choice, destination };
+      return { status: "prepared", effect: "navigate", destination };
+    }
+    if (destination !== undefined && (request.document !== state.document || request.destination !== destination ||
+      state.prepared?.revision !== previous.revision || state.prepared.choice !== choice || state.prepared.destination !== destination)) return { status: "stale", reason: "observation_changed" };
+    if (destination === undefined && request.destination !== undefined) return { status: "stale", reason: "observation_changed" };
+    if (request.actionDeadline !== undefined && (!Number.isSafeInteger(request.actionDeadline) || request.actionDeadline < 0)) return { status: "blocked", reason: "invalid_request" };
+    if (request.actionDeadline !== undefined && Date.now() >= request.actionDeadline) return { status: "stale", reason: "observation_changed" };
     // No await between the complete freshness/gate check and dispatch. Consume
     // before the click even when dispatch throws or synchronously re-enters.
     delete state.observed;
     state.consumed.add(previous.revision);
     state.serial++;
+    delete state.prepared;
+    if (destination !== undefined) {
+      // Retire before the native click: unload can destroy the injection's
+      // response. Keep only the identity token for a source download receipt.
+      state.retired = true;
+      state.menuWait = { revision: previous.revision, url: location.href, navigation: true,
+        enabled: new Set(current.controls.filter(control => !control.disabled).map(control => control.id)) };
+      HTMLElement.prototype.click.call(target);
+      return { status: "dispatched", downloadExpected: true };
+    }
     const menu = target.hasAttribute("aria-haspopup") || target.hasAttribute("aria-controls") ||
       target.hasAttribute("aria-expanded") || /\b(options?|formats?|menu)\b/i.test(label(target));
     const anchor = target.closest<HTMLAnchorElement>("a[href]");
@@ -270,6 +315,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   if (request.method !== "observe") return { status: "blocked", reason: "invalid_request" };
   const serial = ++state.serial;
   delete state.observed;
+  delete state.prepared;
   const revision = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(current.source)))).map(n => n.toString(16).padStart(2, "0")).join("");
   const fresh = snapshot();
   if (fresh.status === "blocked") return { status: "stale", reason: fresh.reason };

@@ -14,9 +14,12 @@ runs an adapter only after the user has granted its provider host permission.
 The agent fallback also handles publishers with **no adapter**. In delegated
 mode, after packaged and generic routes fail, it can select visible controls on
 an already bound article with matching DOI metadata. It needs effective browser
-access to that site, but no publisher entry in the adapter registry. The initial
-implementation supports in-page menus and download controls; cross-document
-navigation, publisher search and native PDF viewer saving remain future work.
+access to that site, but no publisher entry in the adapter registry. The
+implementation supports in-page menus and download controls. With a compatible
+daemon, it can also follow an observed same-origin link in the same tab and
+continue after verifying the destination's DOI. It stops on an unexpected
+redirect or human gate. New tabs, cross-origin navigation, publisher search and
+native PDF viewer saving remain future work.
 Chrome uses filename steering. Firefox uses a matching original article referrer
 and an observed file in the configured download directory, with the daemon's
 `native_click_adoption_v1` capability. Missing or ambiguous download provenance
@@ -25,7 +28,10 @@ See [agent configuration](../reference/config-reference.md#agent-acquisition).
 An isolated Chrome run of the integrated loop acquired and validated a five-page
 IOS Press PDF after one explicit Open and one Jev decision. The test deliberately
 omitted the packaged adapter. It proves that fallback mechanism, not a success
-rate across publishers. Live Firefox acceptance is still in progress.
+rate across publishers. A separate Windows Firefox run acquired and validated a
+17-page eLife paper with no adapter, after one explicit Open and one Jev decision.
+These are assisted starts followed by automatic acquisition. The new menu and
+article-navigation changes still need live provider validation.
 
 Every adapter below ships with a captured fixture under
 `extension/fixtures/<adapter-id>/` (see

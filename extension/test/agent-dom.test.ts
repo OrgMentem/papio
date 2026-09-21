@@ -33,6 +33,51 @@ const act = (result: ReturnType<typeof observed>, extra: Partial<AgentDOMRequest
   document: result.document, revision: result.observation.revision,
   choice: result.observation.controls.find(c => c.label.startsWith("Download PDF"))?.id ?? "", ...extra });
 
+test("navigation prepares the exact original anchor without a PDF label and retires source handles", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/article/full?edition=2">Read this work</a></main>`);
+  const anchor = win.document.querySelector("a")!;
+  let clicks = 0;
+  anchor.addEventListener("click", event => { event.preventDefault(); clicks++; });
+  const first = observed(await agentDOM({ method: "observe", entryURL, doi, allowNavigation: true }));
+  expect(first.observation.controls[0]?.disabled).toBe(false);
+  expect(JSON.stringify(first.observation)).not.toContain("edition=2");
+  const request = { entryURL, doi, allowNavigation: true, document: first.document, revision: first.observation.revision, choice: "c1" };
+  expect(await agentDOM({ ...request, method: "act" })).toMatchObject({ status: "stale" });
+  const prepared = await agentDOM({ ...request, method: "prepare" });
+  expect(prepared).toEqual({ status: "prepared", effect: "navigate", destination: anchor.href });
+  expect(clicks).toBe(0);
+  expect(await agentDOM({ ...request, method: "act", destination: anchor.href })).toEqual({ status: "dispatched", downloadExpected: true });
+  expect(clicks).toBe(1);
+  expect(anchor.hasAttribute("download")).toBe(false);
+  expect(await agentDOM({ method: "observe", entryURL, doi, allowNavigation: true })).toEqual({ status: "stale", reason: "document_changed" });
+  expect(await agentDOM({ ...request, method: "act", destination: anchor.href })).toMatchObject({ status: "stale" });
+  expect(clicks).toBe(1);
+});
+
+for (const mutation of ["href", "base", "identity", "document", "destination"] as const)
+  test(`prepared navigation refuses ${mutation} drift without clicking`, async () => {
+    const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/article/full">Read article</a></main>`);
+    const anchor = win.document.querySelector("a")!;
+    let clicks = 0; anchor.addEventListener("click", event => { event.preventDefault(); clicks++; });
+    const first = observed(await agentDOM({ method: "observe", entryURL, doi, allowNavigation: true }));
+    const request = { entryURL, doi, allowNavigation: true, document: first.document, revision: first.observation.revision, choice: "c1" };
+    expect((await agentDOM({ ...request, method: "prepare" })).status).toBe("prepared");
+    const destination = anchor.href;
+    if (mutation === "href") anchor.href = "/article/other";
+    if (mutation === "base") win.document.head.insertAdjacentHTML("beforeend", '<base target="_blank">');
+    if (mutation === "identity") win.document.querySelector("meta")!.setAttribute("content", "10.9999/wrong");
+    if (mutation === "document") setup();
+    expect((await agentDOM({ ...request, method: "act", destination: mutation === "destination" ? destination + "?different" : destination })).status).not.toBe("dispatched");
+    expect(clicks).toBe(0);
+  });
+
+test("navigation capability preserves new-context, cross-origin and form refusals", async () => {
+  setup(`<meta name="citation_doi" content="${doi}"><main><a href="/next" target="_blank">Read work</a><a href="https://other.example/next">Read work</a><a href="http://ebooks.iospress.nl/next">Read work</a><a href="https://user@ebooks.iospress.nl/next">Read work</a><form action="/next"><button>Read work</button></form></main>`);
+  const first = observed(await agentDOM({ method: "observe", entryURL, doi, allowNavigation: true }));
+  expect(first.observation.controls).toHaveLength(5);
+  expect(first.observation.controls.every(control => control.disabled)).toBe(true);
+});
+
 test("production injection serializes independently and clicks a JS-backed article control", async () => {
   const win = setup();
   const injected = new Function(`return (${agentDOM.toString()});`)() as typeof agentDOM;
@@ -631,4 +676,40 @@ test("local menu readiness requires the new PDF control to fit the next projecti
   expect(await agentDOM(check)).toEqual({ status: "menu_checked", ready: false });
   win.document.querySelectorAll("button").forEach(node => { if (node.textContent === "Formats") node.remove(); });
   expect(await agentDOM(check)).toEqual({ status: "menu_checked", ready: true });
+});
+
+for (const deadline of ["expired", "fraction", "infinite", "negative"] as const)
+  test(`dispatch rejects ${deadline} absolute action deadline without consuming or clicking`, async () => {
+    const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Formats</button></main>`);
+    let clicks = 0; win.document.querySelector("button")!.addEventListener("click", () => clicks++);
+    const first = observed(await observe());
+    const actionDeadline = deadline === "expired" ? Date.now() - 1 : deadline === "fraction" ? 1.5 : deadline === "negative" ? -1 : Infinity;
+    const rejected = await act(first, { choice: "c1", actionDeadline });
+    expect(rejected.status).toBe(deadline === "expired" ? "stale" : "blocked");
+    expect(clicks).toBe(0);
+    expect(await act(first, { choice: "c1", actionDeadline: Date.now() + 10_000 })).toMatchObject({ status: "dispatched" });
+    expect(clicks).toBe(1);
+  });
+
+for (const reveal of ["synchronous", "asynchronous"] as const) test(`prepared navigation can become a ${reveal} same-document menu without replay`, async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/article/download">Download</a></main>`);
+  const insert = () => win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button type="button">Download PDF</button>');
+  let clicks = 0;
+  win.document.querySelector("a")!.addEventListener("click", event => { event.preventDefault(); clicks++; if (reveal === "synchronous") insert(); });
+  const first = observed(await agentDOM({ method: "observe", entryURL, doi, allowNavigation: true }));
+  const request = { entryURL, doi, allowNavigation: true, document: first.document, revision: first.observation.revision, choice: "c1" };
+  const prepared = await agentDOM({ ...request, method: "prepare" });
+  if (prepared.status !== "prepared") throw new Error(prepared.status);
+  await agentDOM({ ...request, method: "act", destination: prepared.destination! });
+  if (reveal === "asynchronous") {
+    expect(await agentDOM({ ...request, method: "check_menu", resumeNavigation: true })).toEqual({ status: "menu_checked", ready: false });
+    insert();
+  }
+  expect(await agentDOM({ ...request, method: "check_menu", resumeNavigation: true })).toEqual({ status: "menu_checked", ready: true });
+  const next = observed(await agentDOM({ method: "observe", entryURL, doi, allowNavigation: true, document: first.document }));
+  expect(next.document).toBe(first.document);
+  expect(next.observation.revision).not.toBe(first.observation.revision);
+  expect(next.observation.controls.some(control => control.label === "Download PDF" && !control.disabled)).toBe(true);
+  expect((await agentDOM({ ...request, method: "act", destination: prepared.destination! })).status).toBe("stale");
+  expect(clicks).toBe(1);
 });

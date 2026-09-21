@@ -39,6 +39,8 @@
         "provider_drive_epoch_result",
         "agent_decide_request_v1",
         "agent_decide_result_v1",
+        "native_download_rebind_request_v1",
+        "native_download_rebind_result_v1",
         "native_download_arm_request_v1",
         "native_download_arm_result_v1",
         "native_download_import_request_v1",
@@ -7418,6 +7420,164 @@
                 ]
               }
             }
+          }
+        },
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_download_rebind_request_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "producer",
+              "browser_epoch",
+              "document_id",
+              "reservation_id",
+              "next_document_id"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "producer": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "effect_kind",
+                  "drive_attempt_id",
+                  "ordinal",
+                  "strategy",
+                  "revision"
+                ],
+                "properties": {
+                  "effect_kind": {
+                    "const": "generic_drive"
+                  },
+                  "drive_attempt_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{8,64}$"
+                  },
+                  "ordinal": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "strategy": {
+                    "const": "generic"
+                  },
+                  "revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\u0000\r\n]+$"
+                  }
+                }
+              },
+              "browser_epoch": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "document_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "reservation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "next_document_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              }
+            },
+            "$comment": "Runtime validators additionally require next_document_id to differ from document_id; standard JSON Schema cannot compare these field values."
+          }
+        },
+        "required": [
+          "job_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_download_rebind_result_v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "reservation_id",
+              "outcome"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "reservation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "outcome": {
+                "enum": [
+                  "rebound",
+                  "refused",
+                  "stale",
+                  "unavailable"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "unavailable",
+                  "authority_lost",
+                  "already_armed",
+                  "expired",
+                  "source_rejected",
+                  "source_busy",
+                  "invalid_pdf",
+                  "validation_pending"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "const": "rebound"
+                    }
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "reason"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         },
         "required": [

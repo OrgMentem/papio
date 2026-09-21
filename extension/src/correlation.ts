@@ -2,6 +2,7 @@
 
 import {
   EFFECT_PERMIT_FEATURE,
+  AGENT_NAVIGATION_FEATURE,
   NATIVE_CLICK_ADOPTION_FEATURE,
   INSTITUTIONAL_AUTHENTICATION_CLAIM_FEATURE,
   SURFACE_CLOSE_FEATURE,
@@ -62,6 +63,10 @@ type RequestPolicy = {
  * class on the daemon's inbound dispatch.
  */
 const REQUEST_POLICIES = {
+  native_download_rebind_request_v1: {
+    responseType: "native_download_rebind_result_v1", feature: AGENT_NAVIGATION_FEATURE,
+    operation: "mutation", transport: "single_attempt", timeoutMs: 45_000,
+  },
   native_download_arm_request_v1: {
     responseType: "native_download_arm_result_v1", feature: NATIVE_CLICK_ADOPTION_FEATURE,
     operation: "mutation", transport: "single_attempt", timeoutMs: 15_000,

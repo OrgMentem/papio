@@ -3,9 +3,10 @@ import { expect, test } from "bun:test";
 import { NativeRequestCorrelation } from "../src/correlation";
 import type { BrowserMessage, BrowserMessageType } from "../src/protocol";
 
-for (const [request, response, timeout] of [
-  ["native_download_arm_request_v1", "native_download_arm_result_v1", 15_000],
-  ["native_download_import_request_v1", "native_download_import_result_v1", 60_000],
+for (const [request, response, timeout, feature] of [
+  ["native_download_arm_request_v1", "native_download_arm_result_v1", 15_000, "native_click_adoption_v1"],
+  ["native_download_import_request_v1", "native_download_import_result_v1", 60_000, "native_click_adoption_v1"],
+  ["native_download_rebind_request_v1", "native_download_rebind_result_v1", 45_000, "agent_navigation_v1"],
 ] as const) {
   test(`${request} requires negotiation and sends once`, async () => {
     for (const available of [false, true]) {
@@ -20,7 +21,7 @@ for (const [request, response, timeout] of [
         send: type => { sends.push(type); return false; }, reconnect: () => { reconnects++; },
       });
       const result = await c.request(request, {}, { jobID: "job_native" });
-      expect(features).toEqual(["native_click_adoption_v1"]);
+      expect(features).toEqual([feature]);
       expect(result).toMatchObject({ code: available ? "connection_lost" : "feature_unavailable" });
       expect(sends).toEqual(available ? [request] : []);
       expect(reconnects).toBe(available ? 1 : 0);

@@ -696,5 +696,680 @@
     ],
     "value": 9007199254740992,
     "valid": false
+  },
+  {
+    "name": "rebind-request missing request_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request null request_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "rebind-request missing producer",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request null producer",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "rebind-request missing browser_epoch",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request null browser_epoch",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "rebind-request missing document_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request null document_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "value": null,
+    "valid": false
+  },
+  {
+    "name": "rebind-request unknown",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "not_allowed"
+    ],
+    "value": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request constructor",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "constructor"
+    ],
+    "value": "unsafe",
+    "valid": false
+  },
+  {
+    "name": "rebind-request producer missing effect_kind",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "effect_kind"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request producer missing drive_attempt_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "drive_attempt_id"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request producer missing ordinal",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "ordinal"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request producer missing strategy",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "strategy"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request producer missing revision",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "revision"
+    ],
+    "remove": true,
+    "valid": false
+  },
+  {
+    "name": "rebind-request mixed producer",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "claim_id"
+    ],
+    "value": "claim_fake",
+    "valid": false
+  },
+  {
+    "name": "rebind-request institutional",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "effect_kind"
+    ],
+    "value": "institutional",
+    "valid": false
+  },
+  {
+    "name": "rebind-request bad strategy",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "strategy"
+    ],
+    "value": "direct_get",
+    "valid": false
+  },
+  {
+    "name": "rebind-request negative ordinal",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "producer",
+      "ordinal"
+    ],
+    "value": -1,
+    "valid": false
+  },
+  {
+    "name": "rebind-request newline epoch",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "browser_epoch"
+    ],
+    "value": "safe\n",
+    "valid": false
+  },
+  {
+    "name": "rebind-request URL document",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "document_id"
+    ],
+    "value": "https://site.example/page",
+    "valid": false
+  },
+  {
+    "name": "rebind-request missing reservation_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "remove": true
+  },
+  {
+    "name": "rebind-request null reservation_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "value": null
+  },
+  {
+    "name": "rebind-request missing next_document_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": false,
+    "remove": true
+  },
+  {
+    "name": "rebind-request null next_document_id",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": false,
+    "value": null
+  },
+  {
+    "name": "rebind-request unknown unknown",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "unknown"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-request unknown __proto__",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "__proto__"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-request unknown constructor",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "constructor"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-request unknown prototype",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "prototype"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-request no job",
+    "base": "rebind-request",
+    "path": [
+      "job_id"
+    ],
+    "valid": false,
+    "remove": true
+  },
+  {
+    "name": "rebind-result missing request_id",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "valid": false,
+    "remove": true
+  },
+  {
+    "name": "rebind-result null request_id",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "request_id"
+    ],
+    "valid": false,
+    "value": null
+  },
+  {
+    "name": "rebind-result missing reservation_id",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "remove": true
+  },
+  {
+    "name": "rebind-result null reservation_id",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "value": null
+  },
+  {
+    "name": "rebind-result missing outcome",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": false,
+    "remove": true
+  },
+  {
+    "name": "rebind-result null outcome",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": false,
+    "value": null
+  },
+  {
+    "name": "rebind-result unknown unknown",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "unknown"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-result unknown __proto__",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "__proto__"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-result unknown constructor",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "constructor"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-result unknown prototype",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "prototype"
+    ],
+    "valid": false,
+    "value": {}
+  },
+  {
+    "name": "rebind-result no job",
+    "base": "rebind-result",
+    "path": [
+      "job_id"
+    ],
+    "valid": false,
+    "remove": true
+  },
+  {
+    "name": "rebind reservation_id minimum",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": true,
+    "value": "xxxxxxxx"
+  },
+  {
+    "name": "rebind reservation_id maximum",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": true,
+    "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  {
+    "name": "rebind reservation_id short",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "value": "xxxxxxx"
+  },
+  {
+    "name": "rebind reservation_id long",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  {
+    "name": "rebind reservation_id invalid",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "value": "https://example.org"
+  },
+  {
+    "name": "rebind reservation_id number",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "reservation_id"
+    ],
+    "valid": false,
+    "value": 12
+  },
+  {
+    "name": "rebind next_document_id minimum",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": true,
+    "value": "x"
+  },
+  {
+    "name": "rebind next_document_id maximum",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": true,
+    "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  {
+    "name": "rebind next_document_id short",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": false,
+    "value": ""
+  },
+  {
+    "name": "rebind next_document_id long",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": false,
+    "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  {
+    "name": "rebind next_document_id invalid",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": false,
+    "value": "https://example.org"
+  },
+  {
+    "name": "rebind next_document_id number",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": false,
+    "value": 12
+  },
+  {
+    "name": "rebind unchanged document",
+    "base": "rebind-request",
+    "path": [
+      "payload",
+      "next_document_id"
+    ],
+    "valid": false,
+    "value": "document_1"
+  },
+  {
+    "name": "rebind result refused",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": true,
+    "value": "refused"
+  },
+  {
+    "name": "rebind result stale",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": true,
+    "value": "stale"
+  },
+  {
+    "name": "rebind result unavailable",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": true,
+    "value": "unavailable"
+  },
+  {
+    "name": "rebind result invalid armed",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": false,
+    "value": "armed"
+  },
+  {
+    "name": "rebind result invalid ready",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": false,
+    "value": "ready"
+  },
+  {
+    "name": "rebind result invalid ",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": false,
+    "value": ""
+  },
+  {
+    "name": "rebind result invalid 42",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "outcome"
+    ],
+    "valid": false,
+    "value": 42
+  },
+  {
+    "name": "rebound forbids reason source_busy",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "reason"
+    ],
+    "valid": false,
+    "value": "source_busy"
+  },
+  {
+    "name": "rebound forbids reason ",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "reason"
+    ],
+    "valid": false,
+    "value": ""
+  },
+  {
+    "name": "rebound forbids reason None",
+    "base": "rebind-result",
+    "path": [
+      "payload",
+      "reason"
+    ],
+    "valid": false,
+    "value": null
+  },
+  {
+    "name": "rebind refusal with reason",
+    "base": "rebind-result",
+    "path": [
+      "payload"
+    ],
+    "valid": true,
+    "value": {
+      "request_id": "native-request-1",
+      "reservation_id": "reservation_123",
+      "outcome": "refused",
+      "reason": "source_busy"
+    }
+  },
+  {
+    "name": "rebind refusal unknown reason",
+    "base": "rebind-result",
+    "path": [
+      "payload"
+    ],
+    "valid": false,
+    "value": {
+      "request_id": "native-request-1",
+      "reservation_id": "reservation_123",
+      "outcome": "refused",
+      "reason": "surprise"
+    }
   }
 ]

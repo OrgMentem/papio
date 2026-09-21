@@ -1,0 +1,13 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "native_download_rebind_result_v1",
+  "msg_id": "native-frame-1",
+  "job_id": "job_native_download",
+  "seq": 1,
+  "payload": {
+    "request_id": "native-request-1",
+    "reservation_id": "reservation_123",
+    "outcome": "rebound",
+    "reason": "source_busy"
+  }
+}

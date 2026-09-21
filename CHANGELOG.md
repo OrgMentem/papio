@@ -11,6 +11,10 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Article-agent downloads can continue after a same-origin page change.** A
+  compatible extension can transfer an unused Firefox download reservation to
+  a freshly verified document. The daemon retains the original download-directory
+  baseline, expiry and permit, and rejects imports from the previous document.
 - **Persistent article-agent setup.** `papio config agent set` saves a TypeSafe
   key in the OS credential store and enables Jev for that profile. A hidden prompt
   and `--key-stdin` keep it out of command arguments. `status` reports setup

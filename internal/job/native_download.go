@@ -150,6 +150,84 @@ func (js *Store) ReserveNativeDownload(ctx context.Context, r NativeDownloadRese
 	return tx.Commit()
 }
 
+type nativeDownloadBinding struct {
+	NativeDownloadReservation
+	PreviousBindingSHA256 string `json:"previous_binding_sha256,omitempty"`
+	RequestID             string `json:"request_id,omitempty"`
+}
+
+func latestNativeDownloadBindingTx(ctx context.Context, tx *sql.Tx, jobID, reservationID string) (nativeDownloadBinding, error) {
+	var stored nativeDownloadBinding
+	var raw string
+	if err := tx.QueryRowContext(ctx, `SELECT detail_json FROM events WHERE job_id=?
+		AND kind IN ('browser.native_download_reserved','browser.native_download_rebound')
+		AND json_extract(detail_json,'$.reservation_id')=? ORDER BY seq DESC LIMIT 1`, jobID, reservationID).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return stored, ErrEffectPermitStale
+		}
+		return stored, err
+	}
+	if json.Unmarshal([]byte(raw), &stored) != nil {
+		return stored, ErrEffectPermitStale
+	}
+	stored.JobID = jobID
+	return stored, nil
+}
+
+func sameNativeDownloadReservation(a, b NativeDownloadReservation) bool {
+	want, _ := json.Marshal(a)
+	got, _ := json.Marshal(b)
+	return a.JobID == b.JobID && string(want) == string(got)
+}
+
+// RebindNativeDownload transfers only the opaque document binding of an
+// unconsumed reservation. The bridge must still own the original private root
+// baseline and exclude an observed or in-flight import under its session lock.
+// Existing permit, generation, attempt, and expiry checks remain transactional.
+func (js *Store) RebindNativeDownload(ctx context.Context, r NativeDownloadReservation, nextBinding, requestID string, now time.Time) error {
+	if !nativeSHA(nextBinding) || nextBinding == r.BindingSHA256 || requestID == "" || len(requestID) > 64 {
+		return ErrEffectPermitStale
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := nativeDownloadCurrentTx(ctx, tx, r, now); err != nil {
+		return err
+	}
+	var admitted int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id=? AND kind='browser.native_download_admitted' AND json_extract(detail_json,'$.reservation_id')=?`, r.JobID, r.ReservationID).Scan(&admitted); err != nil {
+		return err
+	}
+	if admitted != 0 {
+		return ErrNativeDownloadReserved
+	}
+	stored, err := latestNativeDownloadBindingTx(ctx, tx, r.JobID, r.ReservationID)
+	if err != nil {
+		return err
+	}
+	next := r
+	next.BindingSHA256 = nextBinding
+	if stored.RequestID == requestID && stored.PreviousBindingSHA256 == r.BindingSHA256 && sameNativeDownloadReservation(stored.NativeDownloadReservation, next) {
+		return nil // exact retry of the still-current transfer
+	}
+	if !sameNativeDownloadReservation(stored.NativeDownloadReservation, r) {
+		return ErrEffectPermitStale
+	}
+	var reused int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id=? AND kind='browser.native_download_rebound' AND json_extract(detail_json,'$.reservation_id')=? AND json_extract(detail_json,'$.request_id')=?`, r.JobID, r.ReservationID, requestID).Scan(&reused); err != nil {
+		return err
+	}
+	if reused != 0 {
+		return ErrEffectPermitStale
+	}
+	if err := nativeEventTx(ctx, tx, r.JobID, "browser.native_download_rebound", nativeDownloadBinding{next, r.BindingSHA256, requestID}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // AdmitNativeDownload consumes a reservation and records the exact artifact
 // producer BEFORE the staging file can enter the job's swept directory.
 // No external source path, response body or page data enters these events.
@@ -165,17 +243,11 @@ func (js *Store) AdmitNativeDownload(ctx context.Context, a NativeDownloadAdmiss
 	if err := nativeDownloadCurrentTx(ctx, tx, a.NativeDownloadReservation, now); err != nil {
 		return err
 	}
-	var raw string
-	if err := tx.QueryRowContext(ctx, `SELECT detail_json FROM events WHERE job_id=? AND kind='browser.native_download_reserved' AND json_extract(detail_json,'$.reservation_id')=?`, a.JobID, a.ReservationID).Scan(&raw); err != nil {
-		return ErrEffectPermitStale
+	stored, err := latestNativeDownloadBindingTx(ctx, tx, a.JobID, a.ReservationID)
+	if err != nil {
+		return err
 	}
-	var stored NativeDownloadReservation
-	if json.Unmarshal([]byte(raw), &stored) != nil {
-		return ErrEffectPermitStale
-	}
-	want, _ := json.Marshal(a.NativeDownloadReservation)
-	got, _ := json.Marshal(stored)
-	if string(want) != string(got) {
+	if !sameNativeDownloadReservation(a.NativeDownloadReservation, stored.NativeDownloadReservation) {
 		return ErrEffectPermitStale
 	}
 	var count int

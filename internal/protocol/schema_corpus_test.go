@@ -42,6 +42,7 @@ import (
 // below fails both when an unlisted fixture is accepted and when a listed one
 // is rejected, so the map cannot silently over-cover as the schemas tighten.
 var schemaRuntimeOnly = map[string]string{
+	"browser-native-download-rebind-same-document.json":          "document_id and next_document_id must differ; standard JSON Schema cannot compare sibling values",
 	"acquisition-bundle-path-mismatch.json":                      "artifact path must equal the SHA-256 digest; a cross-field identity JSON Schema has no vocabulary for",
 	"browser-job-offer-invalid-date.json":                        "expected-completion timestamp is validated as a real RFC 3339 instant; JSON Schema format is annotation-only by default",
 	"browser-triage-snapshot-counts-pending-mismatch-v3.json":    "counts must agree with the item array they summarise; a cross-field arithmetic invariant",

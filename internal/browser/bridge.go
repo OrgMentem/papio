@@ -1361,6 +1361,13 @@ func (b *Bridge) helloAck(role string, peerFeatures []string) (json.RawMessage, 
 			features[i] = protocol.NativeClickAdoptionFeature
 		}
 	}
+	// Navigation depends on both the decision loop and native reservation transfer.
+	// Counts v3 subsumes v2; old peers retain their original 32-slot list.
+	if slices.Contains(peerFeatures, protocol.AgentNavigationFeature) && slices.Contains(features, agentFallbackFeature) && slices.Contains(features, protocol.NativeClickAdoptionFeature) && slices.Contains(features, triageCountsSchema3Feature) {
+		if i := slices.Index(features, triageCountsSchema2Feature); i >= 0 {
+			features[i] = protocol.AgentNavigationFeature
+		}
+	}
 	payload := protocol.HelloAckPayload{
 		DaemonVersion:   b.Version,
 		Features:        features,
@@ -3105,6 +3112,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	}
 
 	switch msg.Type {
+	case protocol.MsgNativeDownloadRebindRequestV1:
+		return b.rebindNativeDownload(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeDownloadRebindRequestV1Payload))
 	case protocol.MsgNativeDownloadArmRequestV1:
 		return b.armNativeDownload(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeDownloadArmRequestV1Payload))
 	case protocol.MsgNativeDownloadImportRequestV1:

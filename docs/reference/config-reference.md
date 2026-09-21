@@ -19,6 +19,12 @@ Secret Service. A secret manager can pipe the key into
 Use `--config <path>` for a particular profile. Keys are scoped to both the config
 path and data directory, so moving either requires setup again. Linux needs a
 running, unlocked Secret Service; no plaintext fallback is used.
+On Windows, run setup and start the daemon from your signed-in desktop session.
+SSH network logons cannot read Windows Credential Manager's user credential set;
+a daemon started there cannot use the saved key. This is a
+[Windows logon-session constraint](https://learn.microsoft.com/en-us/windows/win32/api/wincred/nf-wincred-credreada),
+not a missing key. Use a local terminal or let the browser's native host start
+the daemon.
 
 Supplying the key opts into sending the article DOI, bounded title and sanitized
 control descriptions to TypeSafe; see [Privacy](../privacy.md#agent-acquisition).
@@ -52,6 +58,11 @@ referrer, then asks the daemon to copy and validate that file. The file must be
 directly in the parent of the configured adoption root, normally Downloads.
 Custom browser download directories must match that configuration. Missing
 referrers, ambiguous downloads, UNC paths and save dialogs remain assisted.
+With `agent_navigation_v1`, both browsers can follow a selected same-origin link
+in the same tab, verify the destination DOI and continue under the original
+attempt. Firefox transfers its unused reservation without resetting its expiry
+or download-directory baseline. Unexpected redirects, new tabs and native PDF
+viewer saving still require assistance.
 The daemon and decision contract are shared across operating systems.
 It allows up to 60 decisions in ten minutes per drive permit and 30 seconds per
 model call. Failures consume their call reservation; retries do not reset the

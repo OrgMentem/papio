@@ -18,6 +18,12 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Article-agent fallback can follow a same-origin article link.** With a
+  compatible daemon, a selected link can open another document in the same tab.
+  Papio verifies its DOI and transfers the existing download reservation before
+  continuing. The original time and inference budgets remain in force. Unexpected
+  redirects, new tabs and native PDF viewer saving remain unsupported.
+
 - **Article-agent download menus can render asynchronously.** A plain Download
   control can reveal a PDF choice without triggering the full download timeout.
   Local checks wait for that choice without paid model polling, while an actual
@@ -31,8 +37,7 @@ for the full pre-split extension history.
   explicit, and a pending download is given time to appear before parking.
   Firefox requires a compatible daemon with `native_click_adoption_v1` and an
   unambiguous download whose original referrer matches the article. The daemon
-  validates the newly downloaded file and preserves the original. Cross-document
-  navigation and native PDF viewer saving are not included yet.
+  validates the newly downloaded file and preserves the original.
 
 - **IOS Press ebooks open-access articles can download through their own PDF
   form.** The adapter checks the page DOI, license marker and scoped form

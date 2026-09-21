@@ -9,6 +9,7 @@ import (
 )
 
 const NativeClickAdoptionFeature = "native_click_adoption_v1"
+const AgentNavigationFeature = "agent_navigation_v1"
 
 // Native download paths are transient browser observations, never authority.
 // The daemon confines and opens them only under its own pinned source root.
@@ -42,6 +43,51 @@ type NativeDownloadImportResultV1Payload struct {
 	DownloadID    int64  `json:"download_id"`
 	Outcome       string `json:"outcome"`
 	Reason        string `json:"reason,omitempty"`
+}
+
+// Rebinding carries a verified document transition under the original reservation.
+// It does not refresh the reservation expiry, producer, or browser epoch.
+type NativeDownloadRebindRequestV1Payload struct {
+	RequestID      string                  `json:"request_id"`
+	ReservationID  string                  `json:"reservation_id"`
+	Producer       ArtifactProducerPayload `json:"producer"`
+	BrowserEpoch   string                  `json:"browser_epoch"`
+	DocumentID     string                  `json:"document_id"`
+	NextDocumentID string                  `json:"next_document_id"`
+}
+type NativeDownloadRebindResultV1Payload struct {
+	RequestID     string `json:"request_id"`
+	ReservationID string `json:"reservation_id"`
+	Outcome       string `json:"outcome"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+func (p *NativeDownloadRebindRequestV1Payload) Validate() error {
+	if err := validateNativeBinding(p.RequestID, p.BrowserEpoch, p.DocumentID, p.Producer); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("native download reservation_id", p.ReservationID); err != nil {
+		return err
+	}
+	if !nativeBindingRE.MatchString(p.NextDocumentID) || p.NextDocumentID == p.DocumentID {
+		return fmt.Errorf("native download rebind requires a different valid document")
+	}
+	return nil
+}
+func (p *NativeDownloadRebindResultV1Payload) Validate() error {
+	if err := validateCorrelationID("native download request_id", p.RequestID); err != nil {
+		return err
+	}
+	if err := validateCorrelationID("native download reservation_id", p.ReservationID); err != nil {
+		return err
+	}
+	if err := enumRequired("native download rebind outcome", p.Outcome, "rebound", "refused", "stale", "unavailable"); err != nil {
+		return err
+	}
+	if p.Outcome == "rebound" && p.Reason != "" {
+		return fmt.Errorf("successful native rebind cannot carry a reason")
+	}
+	return nativeDownloadReason(p.Reason)
 }
 
 var nativeBindingRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -134,6 +180,13 @@ func decodeNativeDownload(data []byte, kind string) (any, error) {
 	case MsgNativeDownloadArmRequestV1:
 		target = &NativeDownloadArmRequestV1Payload{}
 		required = []string{"request_id", "producer", "browser_epoch", "document_id"}
+	case MsgNativeDownloadRebindRequestV1:
+		target = &NativeDownloadRebindRequestV1Payload{}
+		required = []string{"request_id", "reservation_id", "producer", "browser_epoch", "document_id", "next_document_id"}
+	case MsgNativeDownloadRebindResultV1:
+		target = &NativeDownloadRebindResultV1Payload{}
+		required = []string{"request_id", "reservation_id", "outcome"}
+		optional = []string{"reason"}
 	case MsgNativeDownloadImportRequestV1:
 		target = &NativeDownloadImportRequestV1Payload{}
 		required = []string{"request_id", "reservation_id", "producer", "browser_epoch", "document_id", "download_id", "started_at_ms", "source_path", "size_bytes"}

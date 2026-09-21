@@ -40,6 +40,7 @@ import {
 import {
   BROWSER_PROTOCOL_VERSION,
   EFFECT_PERMIT_FEATURE,
+  AGENT_NAVIGATION_FEATURE,
   durablePdfGrabState,
   MAX_BROWSER_MESSAGE_BYTES,
   MsgPageCapture,
@@ -52,6 +53,7 @@ import {
   type ActivityEntryPayload,
   type ArtifactProducerPayload,
   type NativeDownloadArmRequestV1Payload,
+  type NativeDownloadRebindRequestV1Payload,
   type NativeDownloadImportRequestV1Payload,
   type BrowserMessage,
   type BrowserMessageType,
@@ -1661,6 +1663,20 @@ interface InstitutionalDownloadAttempt {
   effect_ordinal: number;
   institutional_request_id: string;
 }
+/** One live, prepared native-click transition. Never persisted or replayed. */
+interface AgentNavigation {
+  tabID: number;
+  sourceURL: string;
+  destination: string;
+  revision: string;
+  departed: boolean;
+  invalid: boolean;
+  verifying: boolean;
+  settled: Promise<void>;
+  settle: () => void;
+  stopped: Promise<void>;
+  stop: () => void;
+}
 interface DownloadTrack {
   ids: Set<number>;
   ambiguous: boolean;
@@ -1686,6 +1702,12 @@ interface DownloadTrack {
     receipt?: NativeDownloadReceipt;
     checking?: Promise<void>;
     completing?: boolean;
+  };
+  /** Chrome keeps filename steering; navigation adds a local document fence
+   * only after a cross-document agent action, never a new producer/permit. */
+  agentDocument?: {
+    url: string; document: string; tabID: number; generation: number; holderGeneration: number | undefined;
+    dispatchedAt?: number; checking?: Promise<void>;
   };
   /** Exact institutional effect identity captured only when the browser
    * download belongs to the materialization tab. Ordinary/manual downloads
@@ -2972,6 +2994,7 @@ export class Bridge {
   private keepaliveAlarmHandledAt = 0;
   private readonly downloads = new Map<string, DownloadTrack>();
   private readonly agentLoops = new Map<string, object>();
+  private readonly agentNavigations = new Map<string, AgentNavigation>();
   /** Fresh on every worker life. Persisted numeric download IDs never regain
    * authority through the surface lifecycle's heuristic browser continuity. */
   private nativeDownloadEpoch: string | undefined;
@@ -7712,7 +7735,7 @@ export class Bridge {
     try {
       type NavListener = {
         addListener: (
-          cb: (d: { tabId: number; frameId: number; documentId?: string }) => void,
+          cb: (d: { tabId: number; frameId: number; documentId?: string; url?: string }) => void,
         ) => void;
       };
       type NavAPI = {
@@ -7751,6 +7774,11 @@ export class Bridge {
       };
       n.onCommitted?.addListener((d) => {
         if (d.frameId !== 0) return;
+        for (const pending of this.agentNavigations.values()) {
+          if (pending.tabID !== d.tabId) continue;
+          pending.departed = true;
+          if (pending.verifying || (d.url !== undefined && d.url !== pending.sourceURL && d.url !== pending.destination)) pending.stop();
+        }
         observeNavigation(d);
         // A committed top-frame navigation replaces the document the manual
         // continuation was granted against, so the continuation dies with it.
@@ -7765,6 +7793,9 @@ export class Bridge {
       // that took over; `replacedTabId` is the one that went away. Neither id
       // keeps any authority: the page the researcher was looking at is gone.
       n.onTabReplaced?.addListener((d) => {
+        for (const pending of this.agentNavigations.values()) {
+          if (pending.tabID === d.replacedTabId || pending.tabID === d.tabId) pending.stop();
+        }
         this.pageNavSeq.delete(d.replacedTabId);
         this.pageNavSeq.delete(d.tabId);
         this.destroyDeliveryChoiceForTab(d.replacedTabId);
@@ -7802,6 +7833,9 @@ export class Bridge {
     // document may be a working sign-in page, not an exhausted route.
     // Do not let that cancellation create a durable failure marker.
     if (d.frameId !== 0 || d.error === "net::ERR_ABORTED") return;
+    for (const pending of this.agentNavigations.values()) {
+      if (pending.tabID === d.tabId) pending.stop();
+    }
     await this.ready;
     const managed =
       findByTab(this.store, d.tabId) !== undefined ||
@@ -13421,6 +13455,10 @@ export class Bridge {
     }
     const job = exactJob ?? this.correlate(item);
     if (!job || base.length === 0) return undefined;
+    const agentTrack = this.downloads.get(job.job_id);
+    if (agentTrack?.agentDocument && (!this.agentNavigationReceiptCurrent(agentTrack, item) || agentTrack.ambiguous ||
+      this.agentNavigations.get(job.job_id)?.departed || this.agentNavigations.get(job.job_id)?.verifying ||
+      this.agentNavigations.get(job.job_id)?.invalid)) return undefined;
     return {
       filename: `papio/${job.job_id}/${base}`,
       conflictAction: "uniquify",
@@ -13876,6 +13914,7 @@ export class Bridge {
             WORK_PULSE_FEATURE,
             "agent_fallback_v1",
             NATIVE_CLICK_ADOPTION_FEATURE,
+            AGENT_NAVIGATION_FEATURE,
           ],
         },
         undefined,
@@ -13890,6 +13929,7 @@ export class Bridge {
   private async onPortDisconnect(port: NativePort): Promise<void> {
     // A stale port may report its close after recovery opened a replacement.
     if (this.port !== port) return;
+    for (const pending of this.agentNavigations.values()) pending.stop();
     this.port = null;
     this.failPendingMaterializationRequests();
     this.failPageAcquireWaiters(
@@ -17586,6 +17626,7 @@ export class Bridge {
   private async onCancel(msg: BrowserMessage): Promise<void> {
     const jobID = msg.job_id;
     if (jobID === undefined) return;
+    this.agentNavigations.get(jobID)?.stop();
     this.downloads.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
     const job = findByJob(this.store, jobID);
@@ -17819,6 +17860,7 @@ export class Bridge {
     await this.ready;
     const job = findByTab(this.store, tabID);
     if (!job) {
+      if (tab.openerTabId !== undefined && this.store.activeJobs.some(owner => owner.tab_id === tab.openerTabId && this.agentLoops.has(owner.job_id))) return;
       if (change.status === "complete") {
         const origin = this.institutionalLandingOrigin(change.url ?? tab.url);
         if (origin !== undefined) {
@@ -17844,6 +17886,16 @@ export class Bridge {
       ) {
         await this.syncConnectionBadge();
       }
+      return;
+    }
+    // The agent owns this tab until it settles its current effect. Resolver,
+    // auth-return and native-viewer routing must not act on the same update.
+    if (this.agentLoops.has(job.job_id)) {
+      const pending = this.agentNavigations.get(job.job_id);
+      const observedURL = change.url ?? tab.url;
+      if (pending && observedURL !== undefined && observedURL !== pending.sourceURL) pending.departed = true;
+      if (pending && ((observedURL !== undefined && observedURL !== pending.sourceURL && observedURL !== pending.destination) ||
+        (pending.verifying && change.status === "loading"))) pending.stop();
       return;
     }
     const staleRecoveryNavigationInFlight =
@@ -18650,6 +18702,7 @@ export class Bridge {
     openerTabId: number | undefined,
   ): Promise<void> {
     if (url === undefined) return;
+    if (openerTabId !== undefined && this.store.activeJobs.some(job => job.tab_id === openerTabId && this.agentLoops.has(job.job_id))) return;
     const isPDF = this.isPDFNavigationURL(url);
     let host: string;
     try {
@@ -18666,7 +18719,7 @@ export class Bridge {
       openerTabId === undefined ? undefined : ledger[String(openerTabId)];
     const candidates = this.store.activeJobs.filter((j) => {
       if (
-        this.downloads.has(j.job_id) ||
+        this.agentLoops.has(j.job_id) || this.downloads.has(j.job_id) ||
         this.completedDownloadTabs.has(j.job_id)
       )
         return false;
@@ -19839,6 +19892,10 @@ export class Bridge {
     let track: DownloadTrack | undefined;
     let entryURL: string | undefined;
     let documentID: string | undefined;
+    const visitedDocuments = new Set<string>();
+    const visitedURLs = new Set<string>();
+    const navigationAvailable = () => (this.store.daemonFeatures ?? []).includes(AGENT_NAVIGATION_FEATURE) &&
+      (this.store.daemonFeatures ?? []).includes(NATIVE_CLICK_ADOPTION_FEATURE);
     const usedRevisions = new Set<string>();
     let unchangedRechecks = 0;
     const sameEpoch = (): ActiveJob | undefined => {
@@ -19847,18 +19904,18 @@ export class Bridge {
         this.genericEpochKey(jobID, current.generic_drive_epoch) === key ? current : undefined;
     };
     const downloaded = () => (track?.ids.size ?? 0) > 0;
-    const authorized = (): boolean => {
+    const authorized = (allowReceipt = false): boolean => {
       const current = sameEpoch();
       if (this.deps.now() >= deadline) exitDetail = budgetDetail;
       return current !== undefined && this.agentLoops.get(jobID) === token &&
         this.handoffDrives.get(jobID) === drive && drive !== undefined &&
         this.portGeneration === generation && this.agentFallbackAvailable() &&
-        (!native || holderGeneration === this.lastKnownBrowserHolderGeneration) &&
+        holderGeneration === this.lastKnownBrowserHolderGeneration &&
         this.hasDelegatedAuthority(current) && current.expected?.doi === job.expected?.doi && current.generic_terminal !== true &&
         (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending") &&
         current.expires_at > this.deps.now() && this.deps.now() < deadline &&
         !current.challenge_blocked && !current.needs_terms_consent &&
-        !downloaded() &&
+        (allowReceipt || !downloaded()) && !track?.ambiguous &&
         (effectToken === undefined || this.effectGovernorOwner?.token === effectToken) &&
         (leaseOwner === undefined || (this.providerDrainLeaseOwners.get(providerKey) === leaseOwner &&
           this.providerDrainLeaseJobs.get(providerKey) === jobID && this.currentProviderDrainLease(providerKey) !== undefined));
@@ -19879,6 +19936,101 @@ export class Bridge {
       return authorized() && permitted === true;
     };
     const pause = () => new Promise<void>(resolve => this.deps.setTimeout(resolve, 1000));
+    const settleNavigation = async (pending: AgentNavigation, until: number): Promise<boolean> => {
+      exitDetail = "Article agent navigation stopped: the selected exact target did not produce a fresh matching article; redirects and unrelated navigation require a new attempt.";
+      const currentDocument = async (id: string, url: string): Promise<boolean> => {
+        const result = await this.deps.scripting.executeScript({ target: { tabId: job.tab_id },
+          func: nativeDownloadDocumentCurrent, args: [id, url] }).catch(() => []);
+        return result[0]?.result === true;
+      };
+      try {
+        while (this.deps.now() < until && authorized(true) && navigationAvailable() && !pending.invalid) {
+          const tab = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
+          if (!authorized(true) || pending.invalid || tab?.id !== job.tab_id || !tab.url ||
+            (tab.url !== pending.sourceURL && tab.url !== pending.destination) || isAuthenticationURL(tab.url)) return false;
+          const permitted = await this.deps.permissions.contains({ origins: [`https://${new URL(tab.url).hostname}/*`] }).catch(() => false);
+          if (!permitted || !authorized(true) || pending.invalid) return false;
+          if (tab.status === "loading") { await pause(); continue; }
+          if (downloaded()) {
+            // A Content-Disposition response can leave the old document in
+            // place. A file plus a replacement document is ambiguous, never
+            // a reason to transfer a receipt to the destination.
+            if (tab.url !== pending.sourceURL || !(await currentDocument(documentID!, pending.sourceURL))) track!.ambiguous = true;
+            return false;
+          }
+          if (tab.url === pending.sourceURL) {
+            if (!(await currentDocument(documentID!, pending.sourceURL))) return false;
+            if (!pending.departed) {
+              const menu = (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
+                args: [{ method: "check_menu", entryURL: pending.sourceURL, doi: job.expected!.doi!, document: documentID!,
+                  revision: pending.revision, allowNavigation: true, resumeNavigation: true } satisfies AgentDOMRequest],
+              }).catch(() => []))[0]?.result as AgentDOMResult | undefined;
+              if (!authorized() || pending.invalid || pending.departed) return false;
+              if (menu?.status !== "menu_checked") {
+                if (menu?.status === "blocked" || menu?.status === "stale") exitDetail = domDetail(menu.reason);
+                return false;
+              }
+              if (menu.ready) return true;
+            }
+            await pause(); continue;
+          }
+          pending.verifying = true;
+          const observed = (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
+            args: [{ method: "observe", entryURL: pending.destination, doi: job.expected!.doi!, allowNavigation: true } satisfies AgentDOMRequest],
+          }).catch(() => []))[0]?.result as AgentDOMResult | undefined;
+          if (!authorized() || pending.invalid || observed?.status !== "observed") {
+            if (observed?.status === "blocked" || observed?.status === "stale") exitDetail = domDetail(observed.reason);
+            return false;
+          }
+          if (visitedDocuments.has(observed.document) || visitedURLs.has(pending.destination)) return false;
+          const destinationFresh = async () => {
+            if (!authorized() || pending.invalid || !navigationAvailable() || this.deps.now() >= until) return false;
+            const live = await this.uniqueNativeArticleTab(jobID, job.tab_id, pending.destination);
+            const n = track?.native;
+            if (!live || (n && ((live.incognito === true) !== n.incognito || (live.cookieStoreId ?? "firefox-default") !== n.cookieStoreId))) return false;
+            const permitted = await this.deps.permissions.contains({ origins: [`https://${new URL(pending.destination).hostname}/*`] }).catch(() => false);
+            return permitted && await currentDocument(observed.document, pending.destination) && authorized() && !pending.invalid && this.deps.now() < until;
+          };
+          if (!(await destinationFresh())) return false;
+          if (native) {
+            const n = track!.native!;
+            if (!this.nativeDownloadAuthority(jobID, track!) || n.recovery.phase !== "armed" || n.checking || n.completing || n.receipt) return false;
+            const payload: Omit<NativeDownloadRebindRequestV1Payload, "request_id"> = {
+              reservation_id: n.recovery.reservation_id, producer: n.recovery.producer,
+              browser_epoch: n.recovery.browser_epoch, document_id: n.recovery.document_id, next_document_id: observed.document,
+            };
+            // Correlation is single-attempt. A late acknowledgement cannot
+            // extend the transition's original 45-second deadline.
+            const result = await Promise.race([
+              this.requestCorrelated("native_download_rebind_request_v1", { ...payload }, { jobID }),
+              new Promise<undefined>(resolve => this.deps.setTimeout(() => resolve(undefined), Math.max(0, until - this.deps.now()))),
+            ]);
+            if (result?.kind !== "response" || result.payload?.["outcome"] !== "rebound" ||
+              result.payload["reservation_id"] !== n.recovery.reservation_id || result.payload["reason"] !== undefined ||
+              !(await destinationFresh()) || n.recovery.phase !== "armed" || n.checking || n.completing || n.receipt) return false;
+            n.articleURL = pending.destination;
+            n.recovery = { ...n.recovery, document_id: observed.document };
+            delete n.recovery.dispatched_at_ms;
+            await this.persistNativeDownload(jobID, track!);
+            if (!(await destinationFresh())) return false;
+          }
+          entryURL = pending.destination;
+          documentID = observed.document;
+          if (track!.agentDocument) track!.agentDocument = { ...track!.agentDocument, url: entryURL, document: documentID };
+          if (track!.agentDocument) delete track!.agentDocument.dispatchedAt;
+          visitedDocuments.add(documentID);
+          visitedURLs.add(entryURL);
+          return true;
+        }
+        return false;
+      } finally {
+        // Resolve before any receipt checking is joined. Exact native IDs stay
+        // bound even when cancellation/navigation makes their import unsafe.
+        if (downloaded() && !authorized(true)) track!.ambiguous = true;
+        if (this.agentNavigations.get(jobID) === pending) this.agentNavigations.delete(jobID);
+        pending.settle();
+      }
+    };
     try {
       // The persisted latch contains only the daemon tuple. It is deliberately
       // never cleared on reload or ordinary classification callbacks.
@@ -19912,7 +20064,7 @@ export class Bridge {
         if (!(await liveTab()) || !authorized()) return;
         const observed = (await this.deps.scripting.executeScript({
           target: { tabId: job.tab_id }, func: agentDOM,
-          args: [{ method: "observe", entryURL: entryURL!, doi: job.expected!.doi!, ...(documentID ? { document: documentID } : {}) } satisfies AgentDOMRequest],
+          args: [{ method: "observe", entryURL: entryURL!, doi: job.expected!.doi!, allowNavigation: navigationAvailable(), ...(documentID ? { document: documentID } : {}) } satisfies AgentDOMRequest],
         }))[0]?.result as AgentDOMResult | undefined;
         if (!authorized()) return;
         if (observed?.status !== "observed") {
@@ -19920,6 +20072,8 @@ export class Bridge {
           return;
         }
         documentID = observed.document;
+        visitedDocuments.add(documentID);
+        visitedURLs.add(entryURL!);
         const observation = observed.observation;
         // A consumed observation cannot authorize another effect. Give a local
         // menu two one-second rechecks to render before stopping, without
@@ -19959,6 +20113,20 @@ export class Bridge {
         }
         if (typeof choice !== "string" || !observation.controls.some(control => control.id === choice && !control.disabled)) { exitDetail = noControlDetail; return; }
         if (!(await liveTab()) || !authorized()) return;
+        let destination: string | undefined;
+        if (navigationAvailable()) {
+          const prepared = (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
+            args: [{ method: "prepare", entryURL: entryURL!, doi: job.expected!.doi!, document: documentID,
+              revision: observation.revision, choice, allowNavigation: true } satisfies AgentDOMRequest],
+          }))[0]?.result as AgentDOMResult | undefined;
+          if (!authorized() || prepared?.status !== "prepared") return;
+          if (prepared.effect === "navigate") {
+            const target = prepared.destination && new URL(prepared.destination);
+            if (!target || target.protocol !== "https:" || target.username || target.password || target.origin !== new URL(entryURL!).origin ||
+              isAuthenticationURL(target.href) || visitedURLs.has(target.href)) return;
+            destination = target.href;
+          }
+        }
         // Arm the existing generic producer BEFORE click dispatch. No invented
         // GenericCandidate or known strategy ID is needed to carry this epoch.
         if (track === undefined) {
@@ -20005,14 +20173,48 @@ export class Bridge {
           if (!(await liveTab()) || !authorized() || !this.nativeDownloadAuthority(jobID, track)) return;
         }
         usedRevisions.add(observation.revision);
+        let navigation: AgentNavigation | undefined;
+        const navigationUntil = Math.min(deadline, track.native?.recovery.expires_at_ms ?? deadline, this.deps.now() + 45_000);
+        const actionDeadline = Date.now() + Math.max(0, (destination === undefined ? deadline : navigationUntil) - this.deps.now());
+        if (destination !== undefined) {
+          if (!native && !track.agentDocument) track.agentDocument = { url: entryURL!, document: documentID,
+            tabID: job.tab_id, generation, holderGeneration };
+          let settle!: () => void;
+          let stop!: () => void;
+          const settled = new Promise<void>(resolve => { settle = resolve; });
+          const stopped = new Promise<void>(resolve => { stop = resolve; });
+          navigation = { tabID: job.tab_id, sourceURL: entryURL!, destination, revision: observation.revision, departed: false,
+            invalid: false, verifying: false, settled, settle,
+            stopped, stop: () => { navigation!.invalid = true; settle(); stop(); } };
+          this.agentNavigations.set(jobID, navigation);
+          // Covers a never-returning injection, not just the later load poll.
+          this.deps.setTimeout(() => {
+            if (this.agentNavigations.get(jobID) === navigation) navigation!.stop();
+          }, Math.max(0, navigationUntil - this.deps.now()));
+        }
         // No storage/permission await between the dispatch timestamp and
         // injection. A synchronous onCreated can bind before click returns.
         if (native) track.native!.recovery.dispatched_at_ms = this.deps.now();
-        const action = (await this.deps.scripting.executeScript({
+        if (track.agentDocument) track.agentDocument.dispatchedAt = this.deps.now();
+        const dispatch = this.deps.scripting.executeScript({
           target: { tabId: job.tab_id }, func: agentDOM,
           args: [{ method: "act", entryURL: entryURL!, doi: job.expected!.doi!, document: documentID,
-            revision: observation.revision, choice } satisfies AgentDOMRequest],
-        }))[0]?.result as AgentDOMResult | undefined;
+            revision: observation.revision, choice, allowNavigation: navigationAvailable(), actionDeadline, ...(destination === undefined ? {} : { destination }) } satisfies AgentDOMRequest],
+        }).catch(error => { if (!navigation) throw error; return []; });
+        const action = (await (navigation ? Promise.race([dispatch, navigation.stopped.then(() => [])]) : dispatch))[0]?.result as AgentDOMResult | undefined;
+        if (navigation) {
+          // An unloading document may destroy the injection reply after click.
+          // Never replay it: only the prepared transition/receipt can continue.
+          if (action?.status === "stale" || action?.status === "blocked") {
+            navigation.stop();
+            exitDetail = domDetail(action.reason);
+            this.agentNavigations.delete(jobID);
+            navigation.settle();
+            return;
+          }
+          if (!(await Promise.race([settleNavigation(navigation, navigationUntil), navigation.stopped.then(() => false)]))) return;
+          continue;
+        }
         // onCreated may have run before executeScript returns. It owns normal
         // completion from here. Only Chrome's steered producer resumes on restart.
         if (downloaded()) return;
@@ -20040,7 +20242,7 @@ export class Bridge {
               const checked = (await this.deps.scripting.executeScript({
                 target: { tabId: job.tab_id }, func: agentDOM,
                 args: [{ method: "check_menu", entryURL: entryURL!, doi: job.expected!.doi!,
-                  document: documentID, revision: observation.revision } satisfies AgentDOMRequest],
+                  document: documentID, revision: observation.revision, allowNavigation: navigationAvailable() } satisfies AgentDOMRequest],
               }))[0]?.result as AgentDOMResult | undefined;
               if (downloaded() || !authorized()) return;
               if (checked?.status !== "menu_checked") {
@@ -20064,6 +20266,11 @@ export class Bridge {
       }
       if (authorized()) exitDetail = budgetDetail;
     } finally {
+      const pending = this.agentNavigations.get(jobID);
+      if (pending) {
+        pending.stop();
+        this.agentNavigations.delete(jobID);
+      }
       // Exact browser IDs are the only success signal. Never mark a job ready,
       // infer completion from a click, or settle a still-pending download.
       try {
@@ -21275,6 +21482,9 @@ export class Bridge {
   }
 
   private async onTabRemoved(tabID: number): Promise<void> {
+    for (const pending of this.agentNavigations.values()) {
+      if (pending.tabID === tabID) pending.stop();
+    }
     await this.ready;
     this.destroyDeliveryChoiceForTab(tabID);
     this.pageNavSeq.delete(tabID);
@@ -21634,6 +21844,14 @@ export class Bridge {
 
   private async nativeDownloadFresh(jobID: string, track: DownloadTrack): Promise<boolean> {
     if (!this.nativeDownloadAuthority(jobID, track)) return false;
+    const transition = this.agentNavigations.get(jobID);
+    if (transition) {
+      // Creation binds its ID synchronously; validation waits for the native
+      // navigation response to settle. The loop resolves this independently
+      // of receipt checking, so onChanged cannot deadlock it.
+      await transition.settled;
+      if (transition.invalid || !this.nativeDownloadAuthority(jobID, track)) return false;
+    }
     const n = track.native!;
     const tab = await this.uniqueNativeArticleTab(jobID, n.tabID, n.articleURL);
     if (tab === undefined || (tab.incognito === true) !== n.incognito ||
@@ -21754,8 +21972,50 @@ export class Bridge {
     } finally { n.completing = false; }
   }
 
+  private agentNavigationReceiptCurrent(track: DownloadTrack, item: DownloadItemLike): boolean {
+    const binding = track.agentDocument!;
+    const started = Date.parse(item.startTime ?? "");
+    return item.referrer === binding.url && binding.dispatchedAt !== undefined &&
+      Number.isSafeInteger(started) && started >= binding.dispatchedAt && started <= this.deps.now() &&
+      started <= binding.dispatchedAt + 45_000 && (item.tabId === undefined || item.tabId === binding.tabID);
+  }
+
+  private async agentNavigationDownloadFresh(jobID: string, track: DownloadTrack): Promise<boolean> {
+    const binding = track.agentDocument!;
+    const valid = () => {
+      const job = findByJob(this.store, jobID);
+      return this.downloads.get(jobID) === track && !track.ambiguous && binding.generation === this.portGeneration &&
+        binding.holderGeneration === this.lastKnownBrowserHolderGeneration &&
+        this.agentFallbackAvailable() && !!job && this.hasDelegatedAuthority(job) && job.tab_id === binding.tabID &&
+        (job.status === "accepted" || job.status === "awaiting_download" || job.status === "auth_pending") &&
+        !job.generic_terminal && !job.challenge_blocked && !job.needs_terms_consent && job.expires_at > this.deps.now() &&
+        !!job.generic_drive_epoch && !!track.generic && this.genericEpochKey(jobID, job.generic_drive_epoch) === this.genericEpochKey(jobID, track.generic.epoch);
+    };
+    if (!valid()) return false;
+    const tab = await this.uniqueNativeArticleTab(jobID, binding.tabID, binding.url);
+    if (!tab || !valid()) return false;
+    const permitted = await this.deps.permissions.contains({ origins: [`https://${new URL(binding.url).hostname}/*`] }).catch(() => false);
+    if (!permitted || !valid()) return false;
+    const result = await this.deps.scripting.executeScript({ target: { tabId: binding.tabID },
+      func: nativeDownloadDocumentCurrent, args: [binding.document, binding.url] }).catch(() => []);
+    return result[0]?.result === true && valid();
+  }
+
   private async onDownloadCreated(item: DownloadItemLike): Promise<void> {
     if (this.isFirefox() && await this.onNativeDownloadCreated(item)) return;
+    const agentJob = !this.isFirefox() ? this.correlate(item) : undefined;
+    const agentTrack = agentJob && this.downloads.get(agentJob.job_id);
+    if (agentJob && agentTrack?.agentDocument) {
+      agentTrack.ids.add(item.id);
+      if (agentTrack.ids.size !== 1 || !this.agentNavigationReceiptCurrent(agentTrack, item)) agentTrack.ambiguous = true;
+      const pending = this.agentNavigations.get(agentJob.job_id);
+      agentTrack.agentDocument.checking = (async () => {
+        await pending?.settled;
+        if (pending?.invalid || !(await this.agentNavigationDownloadFresh(agentJob.job_id, agentTrack))) agentTrack.ambiguous = true;
+      })();
+      await agentTrack.agentDocument.checking;
+      if (agentTrack.ambiguous) return;
+    }
     // A download papio itself started for a job outranks any grab, and must be
     // classified first. The grab check used to run before this one and returned
     // early, so a click-adapter download whose route matched an armed grab was
@@ -22039,10 +22299,16 @@ export class Bridge {
       }
     }
     if (!owner || !track) return;
+    if (track.agentDocument) {
+      await track.agentDocument.checking;
+      if (!(await this.agentNavigationDownloadFresh(owner.job_id, track))) return;
+    }
     if (track.ambiguous || track.ids.size !== 1) return; // zero or multiple matches: stay with the user
     const downloadDrive = this.handoffDrives.get(owner.job_id);
     const found = await this.deps.downloads.search({ id: delta.id });
     const item = found[0];
+    if (track.agentDocument && (!item || !this.agentNavigationReceiptCurrent(track, item) ||
+      !(await this.agentNavigationDownloadFresh(owner.job_id, track)))) return;
     const mime = item?.mime?.split(";", 1)[0]?.trim().toLowerCase();
     if (track.generic !== undefined && mime !== "application/pdf") {
       await this.discardDownload(owner.job_id, delta.id);

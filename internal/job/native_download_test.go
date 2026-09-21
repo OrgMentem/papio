@@ -3,6 +3,7 @@ package job
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -44,6 +45,156 @@ func nativeLedgerCount(t *testing.T, js *Store, id, kind string) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+func TestNativeDownloadAdmissionUsesLatestDurableBinding(t *testing.T) {
+	js, original, now := nativeReservationFixture(t)
+	ctx := context.Background()
+	if err := js.ReserveNativeDownload(ctx, original, now); err != nil {
+		t.Fatal(err)
+	}
+	next := original
+	next.BindingSHA256 = strings.Repeat("d", 64)
+	// Model the committed transfer, including a freshly constructed Store that
+	// has none of the bridge's private document or filesystem observations.
+	raw, _ := json.Marshal(next)
+	var detail map[string]any
+	if err := json.Unmarshal(raw, &detail); err != nil {
+		t.Fatal(err)
+	}
+	detail["previous_binding_sha256"] = original.BindingSHA256
+	detail["request_id"] = "rebind-1"
+	if err := js.RecordEvent(ctx, original.JobID, "browser.native_download_rebound", detail); err != nil {
+		t.Fatal(err)
+	}
+	reopened := &Store{S: js.S}
+	if err := reopened.AdmitNativeDownload(ctx, nativeAdmission(original), now); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("old document admitted after committed rebind: %v", err)
+	}
+	if err := reopened.AdmitNativeDownload(ctx, nativeAdmission(next), now); err != nil {
+		t.Fatalf("current document rejected after committed rebind: %v", err)
+	}
+	if nativeLedgerCount(t, js, original.JobID, "browser.native_download_admitted") != 1 {
+		t.Fatal("expected exactly one admission")
+	}
+}
+
+func TestNativeDownloadRebindPreservesReservationAndIsIdempotent(t *testing.T) {
+	js, original, now := nativeReservationFixture(t)
+	ctx := context.Background()
+	if err := js.ReserveNativeDownload(ctx, original, now); err != nil {
+		t.Fatal(err)
+	}
+	next := original
+	next.BindingSHA256 = strings.Repeat("d", 64)
+	for range 2 {
+		if err := js.RebindNativeDownload(ctx, original, next.BindingSHA256, "rebind-1", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if nativeLedgerCount(t, js, original.JobID, "browser.native_download_rebound") != 1 || nativeLedgerCount(t, js, original.JobID, "browser.native_download_reserved") != 1 {
+		t.Fatal("retry added reservation or transfer")
+	}
+	if err := js.RebindNativeDownload(ctx, next, strings.Repeat("e", 64), "rebind-1", now); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("reused request changed binding: %v", err)
+	}
+	if err := js.RebindNativeDownload(ctx, original, strings.Repeat("e", 64), "rebind-2", now); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("stale source changed binding: %v", err)
+	}
+	reopened := &Store{S: js.S}
+	if err := reopened.AdmitNativeDownload(ctx, nativeAdmission(original), now); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("old binding survived reload: %v", err)
+	}
+	if err := reopened.AdmitNativeDownload(ctx, nativeAdmission(next), now); err != nil {
+		t.Fatalf("new binding did not survive reload: %v", err)
+	}
+	if err := reopened.RebindNativeDownload(ctx, original, next.BindingSHA256, "rebind-1", now); !errors.Is(err, ErrNativeDownloadReserved) {
+		t.Fatalf("consumed transfer replayed: %v", err)
+	}
+	if err := reopened.ReserveNativeDownload(ctx, next, now); !errors.Is(err, ErrNativeDownloadReserved) {
+		t.Fatalf("rebind reset arm latch: %v", err)
+	}
+}
+
+func TestNativeDownloadRebindFencesDurableAuthority(t *testing.T) {
+	for _, condition := range []string{"missing", "old binding", "expiry changed", "armed time changed", "same binding", "invalid binding", "admitted", "new generation", "new attempt", "cancelled", "closed action", "expired", "settled", "new offer", "finished"} {
+		t.Run(condition, func(t *testing.T) {
+			js, original, now := nativeReservationFixture(t)
+			ctx := context.Background()
+			if condition != "missing" {
+				if err := js.ReserveNativeDownload(ctx, original, now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := original
+			next := strings.Repeat("d", 64)
+			var err error
+			switch condition {
+			case "old binding":
+				r.BindingSHA256 = strings.Repeat("f", 64)
+			case "expiry changed":
+				r.ExpiresAtMS++
+			case "armed time changed":
+				r.ArmedAtMS--
+			case "same binding":
+				next = r.BindingSHA256
+			case "invalid binding":
+				next = "invalid"
+			case "admitted":
+				err = js.AdmitNativeDownload(ctx, nativeAdmission(r), now)
+			case "new generation":
+				_, err = js.NextMaterializationHolderGeneration(ctx)
+			case "new attempt":
+				err = js.RecordEvent(ctx, r.JobID, "job.retry_requested", nil)
+			case "cancelled":
+				_, err = js.S.DB().Exec(`UPDATE jobs SET state='cancelled' WHERE id=?`, r.JobID)
+			case "closed action":
+				_, err = js.S.DB().Exec(`UPDATE human_actions SET status='resolved' WHERE job_id=?`, r.JobID)
+			case "expired":
+				now = time.UnixMilli(r.ExpiresAtMS)
+			case "settled":
+				_, _, err = js.SettleEffectPermit(ctx, EffectPermitSettleInput{Identity: driveIdentity(r.JobID, "native-drive", 0, "generic")})
+			case "new offer":
+				err = js.RecordEvent(ctx, r.JobID, "browser.provider_drive_epoch_offered", map[string]any{"drive_attempt_id": "new-drive"})
+			case "finished":
+				err = js.RecordEvent(ctx, r.JobID, "browser.provider_drive_epoch_result", map[string]any{"drive_attempt_id": "native-drive", "ordinal": 0, "strategy": "generic", "revision": "r1"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := js.RebindNativeDownload(ctx, r, next, "rebind-1", now); !errors.Is(err, ErrEffectPermitStale) && !errors.Is(err, ErrNativeDownloadReserved) {
+				t.Fatalf("unsafe transfer accepted: %v", err)
+			}
+			if nativeLedgerCount(t, js, r.JobID, "browser.native_download_rebound") != 0 {
+				t.Fatal("rejected transfer recorded")
+			}
+		})
+	}
+}
+
+func TestNativeDownloadRebindAndAdmissionHaveOneWinner(t *testing.T) {
+	js, r, now := nativeReservationFixture(t)
+	ctx := context.Background()
+	if err := js.ReserveNativeDownload(ctx, r, now); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	wg.Go(func() { results <- js.RebindNativeDownload(ctx, r, strings.Repeat("d", 64), "rebind-1", now) })
+	wg.Go(func() { results <- js.AdmitNativeDownload(ctx, nativeAdmission(r), now) })
+	wg.Wait()
+	close(results)
+	wins := 0
+	for err := range results {
+		if err == nil {
+			wins++
+		} else if !errors.Is(err, ErrEffectPermitStale) && !errors.Is(err, ErrNativeDownloadReserved) {
+			t.Fatal(err)
+		}
+	}
+	if wins != 1 || nativeLedgerCount(t, js, r.JobID, "browser.native_download_rebound")+nativeLedgerCount(t, js, r.JobID, "browser.native_download_admitted") != 1 {
+		t.Fatalf("race committed %d winners", wins)
+	}
 }
 func TestNativeDownloadAtomicAdmissionAndOneShot(t *testing.T) {
 	js, r, now := nativeReservationFixture(t)

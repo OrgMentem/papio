@@ -538,5 +538,9 @@ can cover unfamiliar controls while retaining packaged execution checks. The
 first integration handles an already identified article, including explicit
 same-origin PDF links through native download intent. Profile-scoped OS credentials
 can be configured with `papio config agent set`; the daemon environment remains
-an explicit override. Broader navigation and
-native viewers are later work. Browser-store acceptance remains unverified.
+an explicit override. A negotiated navigation capability now follows an observed
+same-origin link in the same tab, verifies the destination DOI and transfers the
+existing download reservation. It preserves the original baseline, expiry,
+permit and inference budget. Unexpected redirects stop the continuation. New
+tabs, cross-origin navigation and native viewers are later work. Browser-store
+acceptance remains unverified.

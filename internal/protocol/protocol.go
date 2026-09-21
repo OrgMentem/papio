@@ -869,6 +869,8 @@ const (
 	MsgProviderDriveEpochResult        = "provider_drive_epoch_result"
 	MsgAgentDecideRequestV1            = "agent_decide_request_v1"
 	MsgAgentDecideResultV1             = "agent_decide_result_v1"
+	MsgNativeDownloadRebindRequestV1   = "native_download_rebind_request_v1"
+	MsgNativeDownloadRebindResultV1    = "native_download_rebind_result_v1"
 	MsgNativeDownloadArmRequestV1      = "native_download_arm_request_v1"
 	MsgNativeDownloadArmResultV1       = "native_download_arm_result_v1"
 	MsgNativeDownloadImportRequestV1   = "native_download_import_request_v1"
@@ -1256,6 +1258,7 @@ var jobScoped = map[string]bool{
 	MsgProviderDriveEpochStartRequest: true, MsgProviderDriveEpochStartResult: true,
 	MsgProviderDriveEpochResultRequest: true, MsgProviderDriveEpochResult: true,
 	MsgAgentDecideRequestV1: true, MsgAgentDecideResultV1: true,
+	MsgNativeDownloadRebindRequestV1: true, MsgNativeDownloadRebindResultV1: true,
 	MsgNativeDownloadArmRequestV1: true, MsgNativeDownloadArmResultV1: true,
 	MsgNativeDownloadImportRequestV1: true, MsgNativeDownloadImportResultV1: true,
 	MsgCancel: true, MsgHandoffFocus: true,
@@ -3007,7 +3010,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			err = p.validate()
 		}
 		msg.Payload = p
-	case MsgNativeDownloadArmRequestV1, MsgNativeDownloadArmResultV1, MsgNativeDownloadImportRequestV1, MsgNativeDownloadImportResultV1:
+	case MsgNativeDownloadRebindRequestV1, MsgNativeDownloadRebindResultV1, MsgNativeDownloadArmRequestV1, MsgNativeDownloadArmResultV1, MsgNativeDownloadImportRequestV1, MsgNativeDownloadImportResultV1:
 		msg.Payload, err = decodeNativeDownload(env.Payload, env.Type)
 	case MsgAgentDecideRequestV1:
 		p := &AgentDecideRequestV1Payload{}

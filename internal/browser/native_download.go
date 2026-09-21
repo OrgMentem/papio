@@ -26,6 +26,7 @@ type nativeDownloadReservation struct {
 	digest          string
 	outcome, reason string
 	busy            bool
+	rebindRequest   string // fingerprint of the still-current successful transfer
 }
 
 func (b *Bridge) currentGenericDriveAuthority(ctx context.Context, sessionID, jobID, attemptID string, ordinal int64, strategy, revision string) (*job.EffectPermit, bool) {
@@ -149,7 +150,7 @@ func (b *Bridge) armNativeDownload(ctx context.Context, sessionID, jobID string,
 	}
 	binding := nativeBinding(sessionID, jobID, p)
 	if prior := b.nativeDownloads[jobID]; prior != nil {
-		if prior.arm.RequestID == p.RequestID && prior.record.BindingSHA256 == binding && prior.root != nil && prior.observation == "" && !prior.busy {
+		if prior.arm.RequestID == p.RequestID && nativeBinding(sessionID, jobID, &prior.arm) == binding && prior.record.BindingSHA256 == binding && prior.root != nil && prior.observation == "" && !prior.busy {
 			result.Outcome = "armed"
 			result.Reason = ""
 			result.ReservationID = prior.record.ReservationID
@@ -233,6 +234,67 @@ func (b *Bridge) armNativeDownload(ctx context.Context, sessionID, jobID string,
 	result.Reason = ""
 	result.ReservationID = record.ReservationID
 	result.ExpiresAtMS = record.ExpiresAtMS
+	return reply()
+}
+
+// Called under b.mu, like arm/import. No filesystem work or unlock occurs: an
+// import either consumes its observation first, or sees the transferred binding.
+func (b *Bridge) rebindNativeDownload(ctx context.Context, sessionID, jobID string, p *protocol.NativeDownloadRebindRequestV1Payload) ([]json.RawMessage, error) {
+	result := protocol.NativeDownloadRebindResultV1Payload{RequestID: p.RequestID, ReservationID: p.ReservationID, Outcome: "stale", Reason: "authority_lost"}
+	reply := func() ([]json.RawMessage, error) {
+		f, err := b.frame(protocol.MsgNativeDownloadRebindResultV1, jobID, result)
+		if err != nil {
+			return nil, err
+		}
+		return []json.RawMessage{f}, nil
+	}
+	if !b.nativeAvailable(sessionID) {
+		return reply()
+	}
+	peerFeatures := b.arbitration.holderSession().Features
+	if b.agentBackend == nil || !slices.Contains(peerFeatures, agentFallbackFeature) || !slices.Contains(peerFeatures, protocol.AgentNavigationFeature) {
+		result.Outcome, result.Reason = "unavailable", "unavailable"
+		return reply()
+	}
+	permit, ok := b.nativeAuthority(ctx, sessionID, jobID, p.Producer)
+	r := b.nativeDownloads[jobID]
+	if !ok || r == nil || r.sessionID != sessionID || r.record.ReservationID != p.ReservationID || r.record.PermitID != permit.ID || r.record.HolderGeneration != b.arbitration.generation() {
+		return reply()
+	}
+	if r.record.ExpiresAtMS <= b.now().UnixMilli() {
+		result.Reason = "expired"
+		return reply()
+	}
+	if r.busy || r.observation != "" || r.root == nil {
+		result.Outcome, result.Reason = "refused", "already_armed"
+		if r.busy {
+			result.Reason = "source_busy"
+		}
+		return reply()
+	}
+	old := protocol.NativeDownloadArmRequestV1Payload{Producer: p.Producer, BrowserEpoch: p.BrowserEpoch, DocumentID: p.DocumentID}
+	next := old
+	next.DocumentID = p.NextDocumentID
+	oldBinding, nextBinding := nativeBinding(sessionID, jobID, &old), nativeBinding(sessionID, jobID, &next)
+	fingerprint := nativeDigest(p)
+	if oldBinding == nextBinding || (r.record.BindingSHA256 != oldBinding && (r.record.BindingSHA256 != nextBinding || r.rebindRequest != fingerprint)) {
+		return reply()
+	}
+	previous := r.record
+	previous.BindingSHA256 = oldBinding
+	if err := b.jobs.RebindNativeDownload(ctx, previous, nextBinding, p.RequestID, b.now()); err != nil {
+		switch {
+		case errors.Is(err, job.ErrNativeDownloadReserved):
+			result.Outcome, result.Reason = "refused", "already_armed"
+		case errors.Is(err, job.ErrEffectPermitStale):
+		default:
+			result.Outcome, result.Reason = "unavailable", "unavailable"
+		}
+		return reply()
+	}
+	r.record.BindingSHA256 = nextBinding
+	r.rebindRequest = fingerprint
+	result.Outcome, result.Reason = "rebound", ""
 	return reply()
 }
 

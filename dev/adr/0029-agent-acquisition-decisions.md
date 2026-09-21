@@ -21,7 +21,10 @@ lock. Calls and answers require the current holder, job, delegated handoff, work
 identity and held generic-drive effect permit. The extension rechecks the bound
 document and selected element before dispatch. Reload, navigation, operator
 takeover or a changed permit cannot revive an old answer. Neither side creates
-a second acquisition queue or authority ledger.
+a second acquisition queue or authority ledger. Cancellation stops further
+submissions and invalidates adoption authority. An already submitted browser
+injection may finish; local action deadlines reject dispatch after expiry but
+cannot revoke a click the browser has already begun.
 
 The first integration handles visible controls on a DOI-identified article
 already bound to a managed tab. It supports in-page menus, JavaScript-backed
@@ -32,10 +35,15 @@ remain intact; no URL replay, cloned link or filename is introduced. The
 temporary attribute is removed afterward unless a publisher handler replaced
 it. This requests a download rather than proving one: browser preferences,
 redirects or handlers can change the outcome. The existing bound-document and
-download-receipt checks still determine ownership. Cross-document navigation,
-new contexts, publisher search and native
-viewer saving are later implementation milestones, not reasons to require one
-adapter per publisher. Effective browser host permission remains necessary.
+download-receipt checks still determine ownership. With `agent_navigation_v1`,
+an observed same-origin article link may lead to another document in the same
+tab. The browser records the exact selected destination before clicking, retires
+old control handles, and requires fresh matching DOI metadata, permissions and
+no human gate on the destination. It stops on an unexpected redirect, reload or
+operator navigation. Navigation uses the original loop deadline and inference
+budget. URLs stay browser-local and the model still selects only an opaque ID.
+New contexts, cross-origin navigation, publisher search and native viewer saving
+remain later milestones. Effective browser host permission remains necessary.
 Chrome uses its filename-steering API. Firefox negotiates
 `native_click_adoption_v1` and reserves one native download under the same held
 generic-drive permit before dispatch. The browser must observe an unambiguous
@@ -44,6 +52,16 @@ configured download directory before the click, rejects pre-existing files and
 changed identities, and copies the observed file without deleting the original.
 It records the exact digest and producer transactionally before publication to
 normal adoption. A reservation is observation evidence, not a new effect permit.
+
+An idle reservation can transfer to that freshly verified document through a
+correlated rebind request. The daemon records the new binding in the existing
+job events. It preserves the original directory baseline, arm time, expiry,
+producer and held permit. Admission checks the latest accepted binding; a late
+request with the previous document cannot import. An exact retry of the current
+transfer returns the existing result. A busy, observed, expired or lost
+reservation cannot transfer. A selected link that starts a download while the
+source document stays in place can still use its original reservation. A
+replaced document with a competing source download stops the continuation.
 
 A restart loses the private directory baseline and cannot rearm the same permit
 or repeat a click. Published bytes can recover through existing adoption. A crash

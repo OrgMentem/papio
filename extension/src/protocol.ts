@@ -45,6 +45,8 @@ export type BrowserMessageType =
   | "provider_drive_epoch_result"
   | "agent_decide_request_v1"
   | "agent_decide_result_v1"
+  | "native_download_rebind_request_v1"
+  | "native_download_rebind_result_v1"
   | "native_download_arm_request_v1"
   | "native_download_arm_result_v1"
   | "native_download_import_request_v1"
@@ -355,6 +357,7 @@ export interface ProviderDriveEpochTuple {
   strategy: string;
   revision: string;
 }
+export const AGENT_NAVIGATION_FEATURE = "agent_navigation_v1";
 export const NATIVE_CLICK_ADOPTION_FEATURE = "native_click_adoption_v1";
 export type NativeDownloadProducer = Required<Pick<ArtifactProducerPayload, "drive_attempt_id" | "ordinal" | "revision">> & {
   effect_kind: "generic_drive"; strategy: "generic";
@@ -374,6 +377,15 @@ export interface NativeDownloadImportRequestV1Payload extends NativeDownloadArmR
 export interface NativeDownloadImportResultV1Payload {
   request_id: string; reservation_id: string; download_id: number;
   outcome: "ready" | "review" | "rejected" | "deferred" | "stale" | "refused";
+  reason?: NativeDownloadReason;
+}
+
+export interface NativeDownloadRebindRequestV1Payload extends NativeDownloadArmRequestV1Payload {
+  reservation_id: string; next_document_id: string;
+}
+export interface NativeDownloadRebindResultV1Payload {
+  request_id: string; reservation_id: string;
+  outcome: "rebound" | "refused" | "stale" | "unavailable";
   reason?: NativeDownloadReason;
 }
 
@@ -1539,6 +1551,8 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   provider_drive_epoch_result: true,
   agent_decide_request_v1: true,
   agent_decide_result_v1: true,
+  native_download_rebind_request_v1: true,
+  native_download_rebind_result_v1: true,
   native_download_arm_request_v1: true,
   native_download_arm_result_v1: true,
   native_download_import_request_v1: true,
@@ -1633,6 +1647,8 @@ const JOB_SCOPED: Record<string, true> = {
   provider_drive_epoch_result: true,
   agent_decide_request_v1: true,
   agent_decide_result_v1: true,
+  native_download_rebind_request_v1: true,
+  native_download_rebind_result_v1: true,
   native_download_arm_request_v1: true,
   native_download_arm_result_v1: true,
   native_download_import_request_v1: true,
@@ -4122,6 +4138,29 @@ function validatePayload(
       } catch {
         fail("provider_direct_get_request URL is invalid");
       }
+      break;
+    }
+    case "native_download_rebind_request_v1": {
+      requireAgentDecideFields<NativeDownloadRebindRequestV1Payload>(p, type, {
+        request_id: "required", reservation_id: "required", producer: "required",
+        browser_epoch: "required", document_id: "required", next_document_id: "required",
+      });
+      nativeIdentifier(p, "request_id", type); nativeIdentifier(p, "reservation_id", type);
+      nativeIdentifier(p, "browser_epoch", type, 1, 128); nativeIdentifier(p, "document_id", type, 1, 128);
+      nativeIdentifier(p, "next_document_id", type, 1, 128);
+      if (p["document_id"] === p["next_document_id"]) fail(`${type} requires a different document`);
+      nativeProducer(p["producer"], `${type}.producer`);
+      break;
+    }
+    case "native_download_rebind_result_v1": {
+      requireAgentDecideFields<NativeDownloadRebindResultV1Payload>(p, type, {
+        request_id: "required", reservation_id: "required", outcome: "required", reason: "optional",
+      });
+      nativeIdentifier(p, "request_id", type); nativeIdentifier(p, "reservation_id", type);
+      const outcome = str(p, "outcome", type, 16);
+      if (!["rebound", "refused", "stale", "unavailable"].includes(outcome)) fail(`${type}.outcome is invalid`);
+      if (outcome === "rebound" && "reason" in p) fail(`${type} success cannot carry a reason`);
+      nativeReason(p, type);
       break;
     }
     case "native_download_arm_request_v1":
