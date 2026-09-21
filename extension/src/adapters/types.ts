@@ -361,13 +361,15 @@ export const adapters: AdapterSpec[] = [
     // is consent-gated: without recorded auto-accept consent the page stays
     // assisted and the human clicks through the terms modal themselves.
     id: "jstor",
-    version: "0.3.0",
+    version: "0.3.1",
     hosts: ["jstor.org"],
+    // data-doi is a JSTOR stable ID, not a DOI. The packaged title identifies
+    // the work; the primary control independently binds the URL's stable ID.
     workEvidence: {
-      kind: "doi",
-      selector:
-        "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
-      attribute: "data-doi",
+      kind: "title",
+      selector: "meta[property='og:title']",
+      attribute: "content",
+      pattern: "^(.+) \\| JSTOR$",
     },
     settleTimeoutMs: 5000,
     classify: [
@@ -395,7 +397,12 @@ export const adapters: AdapterSpec[] = [
       workTarget: { kind: "opaque" },
       allowedDestinations: [{ origin: "https://www.jstor.org", pathPrefix: "/stable/pdf/" }],
       method: "url",
-      idPattern: "^https://www\\.jstor\\.org/stable/(?:pdf/)?(\\d+)",
+      idPattern: "^https://www\\.jstor\\.org/stable/(?:pdf/)?(\\d+)(?:\\.pdf)?(?:[?#]|$)",
+      routeIdentity: {
+        selector:
+          "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
+        attribute: "data-doi",
+      },
       urlTemplate: "https://www.jstor.org/stable/pdf/{id}.pdf?acceptTC=1",
       requiresTermsConsent: true,
     },

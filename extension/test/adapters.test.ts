@@ -312,56 +312,191 @@ test.skipIf(liveArticle === null)("captured proquest article fixture classifies 
 // popup blocker eats for a gesture-less adapter click (field report
 // 2026-08-03). The adapter therefore derives the direct endpoint from the tab
 // URL, consent-gated because acceptTC=1 accepts JSTOR's terms.
-const jstorArticle = loadFixture("jstor", "success");
-const jstorRecord = loadFixture("jstor", "record");
-const jstorURLFor = (rule: DownloadRule, href: string): string | null => {
-  const m = href.match(new RegExp(rule.idPattern as string));
-  if (!m) return null;
-  return (rule.urlTemplate as string).replace(
-    /\{(\d+|id)\}/g,
-    (_, k: string) => m[k === "id" ? 1 : Number(k)] ?? "",
-  );
-};
-test.skipIf(jstorArticle === null)(
-  "captured JSTOR viewer page classifies and derives its consent-gated endpoint",
-  () => {
-    const article = jstorArticle as Document;
-    const spec = adapters.find((a) => a.id === "jstor") as AdapterSpec;
-    const verdict = classifyFixture(article, spec);
-    expect(verdict.kind).toBe("article");
-    expect(article.querySelector("#pdf-viewer .page[data-page-number]")).not.toBeNull();
+const jstorSpec = adapters.find((a) => a.id === "jstor")!;
+const jstorCases = [
+  { scenario: "success", id: "20183234", title: "The Strength Model of Self-Control" },
+  {
+    scenario: "record", id: "45277272",
+    title: "Development of Motivational Variables and Self-Esteem During the School Career: A Meta-Analysis of Longitudinal Studies",
+  },
+] as const;
 
-    const rule = spec.download as DownloadRule;
-    expect(rule.method).toBe("url");
-    // The consent gate is load-bearing: acceptTC=1 accepts publisher terms.
-    expect(rule.requiresTermsConsent).toBe(true);
-    expect(article.querySelector(rule.selector)?.getAttribute("data-doi")).toBe("20183234");
-    expect(jstorURLFor(rule, "https://www.jstor.org/stable/pdf/20183234")).toBe(
-      "https://www.jstor.org/stable/pdf/20183234.pdf?acceptTC=1",
-    );
-  },
-);
-test.skipIf(jstorRecord === null)(
-  "captured JSTOR record page classifies and derives the endpoint from its stable id",
-  () => {
-    const record = jstorRecord as Document;
-    const spec = adapters.find((a) => a.id === "jstor") as AdapterSpec;
-    const verdict = classifyFixture(record, spec);
-    expect(verdict.kind).toBe("article");
-    const rule = spec.download as DownloadRule;
-    // The record page's own control is the entitlement evidence the url
-    // method requires; its data-doi matches the id derived from the tab URL.
-    expect(record.querySelector(rule.selector)?.getAttribute("data-doi")).toBe("45277272");
-    // No anchor href exists on this page - the control window.open()s.
-    expect(record.querySelector("a[href*='/stable/pdf/']")).toBeNull();
-    expect(jstorURLFor(rule, "https://www.jstor.org/stable/45277272?seq=1")).toBe(
-      "https://www.jstor.org/stable/pdf/45277272.pdf?acceptTC=1",
-    );
-    // Related-work download controls (secondary variant) never satisfy the
-    // primary-control selector.
-    expect(record.querySelectorAll(rule.selector)).toHaveLength(1);
-  },
-);
+function jstorPage(scenario: string, href?: string): Document {
+  const html = readFileSync(fixturePath("jstor", scenario), "utf8");
+  const doc = parseHTML("", captureOrigin(html)!);
+  const win = doc.defaultView as unknown as Window;
+  // Set the harness window offline BEFORE writing the captured document.
+  Object.assign(win.happyDOM.settings, {
+    enableJavaScriptEvaluation: false,
+    disableJavaScriptFileLoading: true,
+    disableCSSFileLoading: true,
+    disableIframePageLoading: true,
+  });
+  // preload as=fetch bypasses those flags in Happy DOM; intercept it too.
+  win.happyDOM.settings.fetch.interceptor = {
+    beforeAsyncRequest: async ({ window }) => new window.Response("", { status: 200 }),
+    beforeSyncRequest: () => { throw new Error("JSTOR fixtures must stay offline"); },
+  };
+  doc.write(html);
+  if (href !== undefined) win.happyDOM.setURL(href);
+  return doc;
+}
+
+async function executeJstorPlan(doc: Document, plan: Plan) {
+  const previous = { document: globalThis.document, location: globalThis.location };
+  Object.assign(globalThis, { document: doc, location: new URL(doc.URL) });
+  try {
+    // Exercise the same null-dropping serialization as page injection.
+    const serialized = JSON.parse(JSON.stringify(plan, (_key, value) => value === null ? undefined : value));
+    return await executePlannedPageEffect(serialized, jstorSpec.download!);
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+}
+
+for (const { scenario, id, title } of jstorCases) {
+  test(`JSTOR ${scenario} capture produces an executable plan for its expected title`, async () => {
+    const doc = jstorPage(scenario);
+    const plan = planExecution(doc, jstorSpec, { title }, { access_mode: "delegated", terms_consent: "accept" });
+    if ("assisted" in plan) throw new Error(plan.assisted);
+    expect(plan.verdict.kind).toBe("article");
+    expect(plan.method).toBe("url");
+    expect(plan.required_consequence).toBe("download");
+    expect(plan.expected_work.doi).toBeNull();
+    expect(plan.expected_work.title).toMatchObject({ selector: "meta[property='og:title']", attribute: "content" });
+    expect(plan.effect_graph?.primary_target?.work_binding?.kind).toBe("opaque");
+    expect(plan.effect_graph?.primary_target?.route_binding).toMatchObject({
+      selector: jstorSpec.download!.selector, attribute: "data-doi", normalized: id,
+    });
+    expect(plan.url).toBe(`https://www.jstor.org/stable/pdf/${id}.pdf?acceptTC=1`);
+    expect(await executeJstorPlan(doc, plan)).toEqual({ ok: true, url: `https://www.jstor.org/stable/pdf/${id}.pdf?acceptTC=1` });
+  });
+
+  test(`JSTOR ${scenario} refuses an exact-title mismatch even when the token check passes`, () => {
+    const doc = jstorPage(scenario);
+    doc.querySelector("meta[property='og:title']")!.setAttribute("content", `${title}: A Different Article | JSTOR`);
+    const result = planExecution(doc, jstorSpec, { title }, { access_mode: "delegated" });
+    if ("assisted" in result) throw new Error(result.assisted);
+    expect(result.verdict.evidence).toContain("title-token-check passed");
+    expect(result.verdict.kind).toBe("wrong_work");
+    expect(result.required_consequence).toBe("none");
+    expect(result.url).toBeNull();
+  });
+
+  test(`JSTOR ${scenario} refuses missing, ambiguous, or unpackaged title evidence`, () => {
+    for (const change of ["missing", "empty", "duplicate", "no-suffix", "nonterminal-suffix"] as const) {
+      const doc = jstorPage(scenario);
+      const meta = doc.querySelector("meta[property='og:title']")!;
+      if (change === "missing") meta.remove();
+      if (change === "empty") meta.setAttribute("content", "");
+      if (change === "duplicate") meta.after(meta.cloneNode(true));
+      if (change === "no-suffix") meta.setAttribute("content", title);
+      if (change === "nonterminal-suffix") meta.setAttribute("content", `${title} | JSTOR extra`);
+      const result = planExecution(doc, jstorSpec, { title }, { access_mode: "delegated" });
+      expect("assisted" in result).toBe(true);
+      expect(result).not.toHaveProperty("url");
+    }
+    // A DOI-only request cannot borrow an unrequested page title.
+    expect(planExecution(jstorPage(scenario), jstorSpec, { doi: "10.1234/example" }, {}))
+      .toMatchObject({ assisted: "declared work evidence does not bind the requested identity" });
+  });
+
+  test(`JSTOR ${scenario} refuses ambiguous primary controls and mismatched stable IDs`, () => {
+    for (const change of ["duplicate", "different-id", "empty-id", "invalid-id"] as const) {
+      const doc = jstorPage(scenario);
+      const primary = doc.querySelector(jstorSpec.download!.selector)!;
+      if (change === "duplicate") primary.after(primary.cloneNode(true));
+      if (change === "different-id") primary.setAttribute("data-doi", "99999999");
+      if (change === "empty-id") primary.setAttribute("data-doi", "");
+      if (change === "invalid-id") primary.setAttribute("data-doi", `${id}extra`);
+      const result = planExecution(doc, jstorSpec, { title }, { access_mode: "delegated" });
+      expect("assisted" in result).toBe(true);
+      expect(result).not.toHaveProperty("url");
+    }
+  });
+
+  test(`JSTOR ${scenario} accepts bounded stable and PDF routes and refuses unsafe routes`, () => {
+    for (const path of [`/stable/${id}`, `/stable/pdf/${id}`, `/stable/pdf/${id}.pdf`]) {
+      for (const suffix of ["", "?seq=1", "#page_scan_tab_contents"]) {
+        const doc = jstorPage(scenario, `https://www.jstor.org${path}${suffix}`);
+        const result = planExecution(doc, jstorSpec, { title }, { access_mode: "delegated" });
+        if ("assisted" in result) throw new Error(result.assisted);
+        expect(result.url).toBe(`https://www.jstor.org/stable/pdf/${id}.pdf?acceptTC=1`);
+      }
+    }
+    for (const href of [
+      `https://www.jstor.org/stable/${id}extra`,
+      `https://www.jstor.org/stable/${id}/related`,
+      `https://www.jstor.org/stable/pdf/${id}.pdf/related`,
+      `https://www.jstor.org/stable/pdf/${id}.pdfextra`,
+      `https://www.jstor.org/stable/pdf/${id}.html`,
+      `https://www.jstor.org/stable/99999999`,
+      `https://www.jstor.org/stable/10.1234/${id}`,
+      `http://www.jstor.org/stable/${id}`,
+      `https://www.jstor.org.evil.example/stable/${id}`,
+      `https://user@www.jstor.org/stable/${id}`,
+      `https://www.jstor.org/search?q=/stable/${id}`,
+    ]) {
+      const result = planExecution(jstorPage(scenario, href), jstorSpec, { title }, { access_mode: "delegated" });
+      expect("assisted" in result).toBe(true);
+      expect(result).not.toHaveProperty("url");
+    }
+  });
+
+  test(`JSTOR ${scenario} revalidates title, control identity, and page route before execution`, async () => {
+    for (const change of ["title", "data-id", "route"] as const) {
+      const doc = jstorPage(scenario);
+      const result = planExecution(doc, jstorSpec, { title }, { access_mode: "delegated", terms_consent: "accept" });
+      if ("assisted" in result) throw new Error(result.assisted);
+      if (change === "title") doc.querySelector("meta[property='og:title']")!.setAttribute("content", "Different Work | JSTOR");
+      if (change === "data-id") doc.querySelector(jstorSpec.download!.selector)!.setAttribute("data-doi", "99999999");
+      if (change === "route") (doc.defaultView as unknown as Window).happyDOM.setURL("https://www.jstor.org/stable/99999999");
+      expect(await executeJstorPlan(doc, result)).toMatchObject({ ok: false });
+    }
+  });
+
+  for (const consent of ["accept", undefined, "manual"] as const) {
+    test(`JSTOR ${scenario} production plan ${consent === "accept" ? "downloads with consent" : `stays assisted with ${consent ?? "no"} consent`}`, async () => {
+      const doc = jstorPage(scenario);
+      const h = makeMapHarness([jstorSpec]);
+      const fallback = h.scripting.executeScript.bind(h.scripting);
+      let effectCalls = 0;
+      let clicks = 0;
+      doc.addEventListener("click", () => { clicks++; });
+      h.scripting.executeScript = async injection => {
+        if (injection.func === planExecution) {
+          const args = injection.args! as Parameters<typeof planExecution>;
+          return [{ result: planExecution(doc, args[1], args[2], args[3]) }];
+        }
+        if (injection.func === executePlannedPageEffect) {
+          effectCalls++;
+          return [{ result: await executeJstorPlan(doc, injection.args![0] as Plan) }];
+        }
+        return fallback(injection);
+      };
+      h.settings.consent = consent;
+      await h.bridge.start();
+      const jobID = `job_jstor_${scenario}_${consent ?? "unset"}`;
+      await h.port.inbound(offer(jobID, { title }, ["www.jstor.org"]));
+      await landOnProvider(h, jobID, "www.jstor.org", doc.URL);
+      const job = h.backend.store.activeJobs.find(j => j.job_id === jobID)!;
+      expect(jstorSpec.download!.requiresTermsConsent).toBe(true);
+      expect(clicks).toBe(0);
+      if (consent === "accept") {
+        expect(effectCalls).toBe(1);
+        expect(h.downloads.started).toHaveLength(1);
+        expect(h.downloads.started[0]?.url).toBe(`https://www.jstor.org/stable/pdf/${id}.pdf?acceptTC=1`);
+        expect(job.download_initiated).toBe(true);
+      } else {
+        expect(effectCalls).toBe(0);
+        expect(h.downloads.started).toHaveLength(0);
+        expect(job.download_initiated).not.toBe(true);
+        expect(job.needs_terms_consent).toBe(consent === undefined ? true : undefined);
+        expect(h.frames().some(f => f.type === "provider_outcome" && f.payload["outcome"] === "terms_acceptance_required")).toBe(true);
+      }
+    });
+  }
+}
 
 // Informit is an Atypon platform. Its entitled record exposes reader and PDF
 // anchors but no citation PDF meta; the adapter clicks the captured PDF control

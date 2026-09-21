@@ -18,6 +18,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **JSTOR recognizes its article identity correctly.** Its download control's
+  `data-doi` is a numeric record ID, not a DOI. Papio now matches the article's
+  title and separately checks that the primary control identifies the same
+  record as the download route. Publisher terms still require consent.
 - **Chrome keepalive survives its initial blank page loading.** Papio records
   its newly created tab while `about:blank` is pending, then opens the institution
   and schedules refreshes. A tab navigating elsewhere is still refused.
