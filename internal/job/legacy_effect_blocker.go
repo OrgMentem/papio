@@ -200,7 +200,10 @@ func importLegacyDriveEffects(ctx context.Context, tx *sql.Tx) error {
 			e = &legacyDriveEpoch{kind: GenericDrive, jobID: job, attempt: attempt, ordinal: ordinal, strategy: strategy, revision: revision}
 			epochs[key] = e
 		}
-		if nonempty(domain) {
+		// Supersession is lineage, not start/completion authority. Older
+		// publisher retries stamped the successor's domain onto this event;
+		// it must not reassign or conflict with the original started effect.
+		if eventKind.String != "browser.provider_drive_epoch_superseded" && nonempty(domain) {
 			if nonempty(e.domain) && e.domain != domain {
 				return fmt.Errorf("unclassifiable legacy provider drive effect for job %q: conflicting safety domains", job)
 			}

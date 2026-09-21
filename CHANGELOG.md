@@ -332,6 +332,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Publisher retries no longer prevent the daemon from restarting.**
+  Retiring an open-access attempt now records that attempt's original safety
+  domain. Startup also reads older retry histories correctly while retaining
+  any unresolved effect under its original domain.
 - **Late browser receipts no longer report a failed adoption for an acquired PDF.**
   If a directory sweep validates the file before its producer receipt arrives,
   Papio records the missing delivery provenance separately. It keeps the accepted

@@ -106,6 +106,9 @@ func TestPublisherRetryConsumedOAEpochCandidateWire(t *testing.T) {
 			offered++
 		case "browser.provider_drive_epoch_superseded":
 			superseded++
+			if detail["safety_domain"] != "oa:doi.org" {
+				t.Fatalf("superseded original epoch acquired successor domain: %+v", detail)
+			}
 		case "browser.provider_drive_epoch_result":
 			if detail["drive_attempt_id"] == "consumed-oa" {
 				oldResults++
@@ -118,6 +121,14 @@ func TestPublisherRetryConsumedOAEpochCandidateWire(t *testing.T) {
 	}
 	if offered != 2 || superseded != 1 || oldResults != 1 || oldLatches != 1 {
 		t.Fatalf("history: offered=%d superseded=%d oldResults=%d oldLatches=%d", offered, superseded, oldResults, oldLatches)
+	}
+	// Startup imports this exact history. A legitimate retry must not make
+	// the daemon refuse its next restart or gain a legacy unresolved effect.
+	if err := jobs.ImportLegacyStartedEpochs(ctx); err != nil {
+		t.Fatalf("restart after publisher retry: %v", err)
+	}
+	if blockers, err := jobs.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || blockers != 0 {
+		t.Fatalf("legacy blockers after completed retry=%d err=%v", blockers, err)
 	}
 }
 

@@ -127,6 +127,46 @@ func TestImportLegacyStartedEpochsSkipsCurrentPermitRows(t *testing.T) {
 		t.Fatalf("current held permit was also imported as %d legacy blocker(s)", count)
 	}
 }
+
+func TestImportLegacySupersessionDoesNotReassignStartedDomain(t *testing.T) {
+	for _, completed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unresolved", true: "completed"}[completed], func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			id := legacyBlockerJob(t, js, "retry-domain")
+			legacyStarted(t, js, id, "original", 0, "generic", "1", "oa:doi.org")
+			if completed {
+				if err := js.RecordEvent(ctx, id, "browser.provider_drive_epoch_result", map[string]any{
+					"drive_attempt_id": "original", "ordinal": 0, "strategy": "generic", "revision": "1", "safety_domain": "oa:doi.org",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Older publisher retry writers recorded the successor's domain on
+			// this lineage event. It neither starts nor completes an effect.
+			if err := js.RecordEvent(ctx, id, "browser.provider_drive_epoch_superseded", map[string]any{
+				"drive_attempt_id": "original", "ordinal": 0, "strategy": "generic", "revision": "1", "safety_domain": "publisher:doi.org",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := js.ImportLegacyStartedEpochs(ctx); err != nil {
+				t.Fatal(err)
+			}
+			blockers, err := js.UnresolvedLegacyEffectBlockers(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if completed {
+				if len(blockers) != 0 {
+					t.Fatalf("completed effect gained legacy blockers: %+v", blockers)
+				}
+			} else if len(blockers) != 1 || blockers[0].SafetyDomainID != "oa:doi.org" || blockers[0].DriveAttemptID != "original" {
+				t.Fatalf("supersession lost or reassigned unresolved effect: %+v", blockers)
+			}
+		})
+	}
+}
+
 func TestImportLegacyStartedEpochsMatchesResultsAndSupersedesExactly(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

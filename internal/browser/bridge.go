@@ -12234,8 +12234,9 @@ func (b *Bridge) providerDriveEpochForOffer(row job.Row, action job.HumanAction,
 		}
 	}
 	if forceNewEpoch && ok && b.jobs != nil {
+		_, _, _, _, previousDomain := providerDriveEpochState(events, providerDriveEpochKey(attempt, ordinal, "generic", "1"))
 		if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_superseded", map[string]any{
-			"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": domain,
+			"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": previousDomain,
 		}); err != nil {
 			return "", nil, fmt.Errorf("record provider drive epoch supersession: %w", err)
 		}
