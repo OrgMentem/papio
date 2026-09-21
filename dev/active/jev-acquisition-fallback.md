@@ -67,7 +67,7 @@ debugger is introduced by removing the extension.
 | Persistent key setup | Implemented across platforms; Windows interactive-session storage and fresh live acquisition verified. SSH network logons cannot read Credential Manager; launch the enrolled daemon in the signed-in desktop session. Native Linux Secret Service acceptance remains pending. No plaintext key in config, browser storage, logs or argv. |
 | Menu and observation progression | Implemented with delayed-menu and intercepted-anchor regressions. An intercepted link can expose a new local PDF control without replaying the consumed click. Preserve actual-download grace and exact receipt ownership. |
 | Article navigation and new contexts | Same-tab exact same-origin destination implemented; one live Chrome HTML-wrapper route acquired a validated PDF. Next: redirects and an owned child tab. Retire old control handles; carry the existing job/permit through a defined handoff, recheck permissions/identity, close only owned tabs, and reconcile any download already started. Test redirects, cancellation, concurrent jobs and operator takeover. |
-| CDN and resident-viewer acquisition | Follow the browser's actual navigation and save resident bytes through the native helper when needed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation on Chrome and Firefox. |
+| CDN and resident-viewer acquisition | Mac Firefox passed the revoked-URL native-save fixture; Chrome's observed Save path refetched and failed. Connect the proven save operation to job authority and adoption. Follow the browser's actual navigation and save resident bytes through the native helper when needed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation on Chrome and Firefox. |
 | Local repair learning | Connect failed declarative capture, successful fallback and validated artifact to the existing repair workspace. Generate/test in isolation, run a fresh model-free declarative canary, promote or revert from the artifact outcome. Keep local operation independent of analytics. |
 | Extension-free native executor | Reuse and assess maintained OSS accessibility/input components on macOS, Windows and named Linux desktops. The helper starts on demand, yields to user input and cleans up its own tabs/dialogs. Prove article observation, navigation, saving, ownership, cancellation and recovery with the extension disabled and Codex absent. Measure focus, pointer and input interference. |
 
@@ -85,8 +85,12 @@ viewer and native Save dialog. It reuses AXorcist and selected trycua native
 delivery code. The initial native background article flow failed. A later
 Chrome viewer-only AX save succeeded in the background, but fetched the URL
 again. With the original URL revoked, the same save sequence failed despite
-the visible PDF. Native resident-byte saving remains unproved. A subsequent
-extension-API run completed three Jev decisions
+the visible PDF. A fresh Firefox 156 native run subsequently saved the exact
+three-page fixture after URL revocation, with no later browser request. Its
+three native actions included choosing Downloads. The 479-sample monitor saw
+no app/window/pointer changes; daemon adoption was not part of this check.
+Production native saving still needs job/file association and platform coverage.
+A subsequent extension-API run completed three Jev decisions
 and downloaded the verified fixture PDF in 2.29 seconds while another app stayed
 in front. The passive monitor recorded 94 samples with no app/window/pointer
 changes or missing channels during that run. A further isolated run downloaded a

@@ -7,7 +7,10 @@ import AXorcist
 import CryptoKit
 import Foundation
 
-enum SpikeError: Error { case invalidRequest, permissionMissing, missingSurface, ambiguousSurface, stale, unsupported }
+enum SpikeError: Error, Equatable {
+    case invalidRequest, permissionMissing, missingSurface, ambiguousSurface, stale, unsupported
+    case saveBinding(String), nativeAction(Int32)
+}
 
 @MainActor
 final class NativeSpike {
@@ -66,12 +69,14 @@ final class NativeSpike {
     }
 
     // Bounded traversal is observation coverage, never an entitlement verdict.
-    func walk(_ root: Element, limit: Int = 5000) -> [Element] {
+    func walk(_ root: Element, limit: Int = 5000, omitFileListings: Bool = false) -> [Element] {
         var queue = [root], result: [Element] = [], seen = Set<Element>(), offset = 0
         while offset < queue.count && result.count < limit {
             let element = queue[offset]; offset += 1
             guard seen.insert(element).inserted else { continue }
             result.append(element)
+            if omitFileListings, ["AXOutline", "AXTable", "AXBrowser"].contains(element.role() ?? ""),
+               element.descriptionText() != "sidebar" { continue }
             queue.append(contentsOf: element.children() ?? [])
         }
         return result
@@ -111,7 +116,7 @@ final class NativeSpike {
             if matches.count > 1 { throw SpikeError.ambiguousSurface }
             throw SpikeError.missingSurface
         }
-        if let window, window != boundWindow { throw SpikeError.stale }
+        if let window, window != boundWindow { throw SpikeError.saveBinding("document_window_changed") }
         window = boundWindow
         var sheets = walk(boundWindow, limit: 500).filter { $0.role() == "AXSheet" }
         // Firefox exposes its attached NSSavePanel through AXFocusedWindow,
@@ -122,13 +127,14 @@ final class NativeSpike {
         }
         guard sheets.count <= 1 else { throw SpikeError.ambiguousSurface }
         if let sheet = sheets.first {
-            guard saveRequested, sheet.identifier() == "save-panel", sheet.parent() == boundWindow else { throw SpikeError.stale }
-            if let savePanel, savePanel != sheet { throw SpikeError.stale }
+            guard saveRequested else { throw SpikeError.saveBinding("save_not_requested") }
+            guard sheet.identifier() == "save-panel", sheet.parent() == boundWindow else { throw SpikeError.saveBinding("panel_not_attached") }
+            if let savePanel, savePanel != sheet { throw SpikeError.saveBinding("panel_replaced") }
             savePanel = sheet
-        } else if savePanel != nil { throw SpikeError.stale }
+        } else if savePanel != nil { throw SpikeError.saveBinding("panel_disappeared") }
         let root = sheets.first ?? area
         nativeDialog = !sheets.isEmpty
-        let nodes = walk(root)
+        let nodes = walk(root, omitFileListings: nativeDialog)
         var controls: [[String: Any]] = [], context: [String] = [], nextTargets: [String: Element] = [:]
         var nextActions: [String: String] = [:]
         var destinationReady = true
@@ -137,24 +143,28 @@ final class NativeSpike {
             let names = nodes.filter { $0.identifier() == "saveAsNameTextField" }
             let locations = nodes.filter { $0.identifier() == "where popup" }
             let expectedName = (URL(string: prefix)?.lastPathComponent ?? "") + ".pdf"
-            guard names.count == 1, names[0].value() as? String == expectedName,
-                  locations.count == 1, let location = locations[0].value() as? String else { throw SpikeError.stale }
+            guard names.count == 1 else { throw SpikeError.saveBinding("filename_field_count") }
+            // Avoid AXorcist's generic Any-valued accessor here: on the observed
+            // NSSavePanel it lost a string that the raw AX attribute preserved.
+            guard names[0].rawAttributeValue(named: "AXValue") as? String == expectedName else { throw SpikeError.saveBinding("filename_changed") }
+            guard locations.count == 1, let location = locations[0].rawAttributeValue(named: "AXValue") as? String else { throw SpikeError.saveBinding("folder_field_unavailable") }
             context.append("Fixture filename: \(expectedName)\nSave folder: \(location)")
             destinationReady = location == "Downloads"
             if !destinationReady {
                 // This is a fixture-only directory choice. Final proof still
                 // requires the exact file under the runner's Downloads path.
                 let cells = nodes.filter { element in
-                    guard element.role() == "AXCell", element.isActionSupported("AXOpen"),
+                    guard element.role() == "AXCell",
                           let row = element.parent(), row.role() == "AXRow",
+                          row.isAttributeSettable(named: "AXSelected"),
                           let outline = row.parent(), outline.role() == "AXOutline",
                           outline.descriptionText() == "sidebar" else { return false }
-                    return walk(element, limit: 20).contains { $0.role() == "AXStaticText" && $0.value() as? String == "Downloads" }
+                    return walk(element, limit: 20).contains { $0.role() == "AXStaticText" && $0.rawAttributeValue(named: "AXValue") as? String == "Downloads" }
                 }
                 guard cells.count == 1 else { throw SpikeError.ambiguousSurface }
                 controls.append(["id": "c1", "role": "AXButton", "label": "Choose Downloads", "disabled": false])
-                nextTargets["c1"] = cells[0]
-                nextActions["c1"] = "AXOpen"
+                nextTargets["c1"] = cells[0].parent()
+                nextActions["c1"] = "set-selected"
             }
         }
         for element in nodes {
@@ -199,7 +209,8 @@ final class NativeSpike {
         guard before["focusObserved"] as? Bool == true, before["pointerObserved"] as? Bool == true else { throw SpikeError.unsupported }
         _ = try observe()
         guard revision == expected, let current = targets[id], current == old,
-              let action = targetActions[id], current.isEnabled() != false, current.isActionSupported(action) else { throw SpikeError.stale }
+              let action = targetActions[id], current.isEnabled() != false,
+              action == "set-selected" ? current.isAttributeSettable(named: "AXSelected") : current.isActionSupported(action) else { throw SpikeError.stale }
         let dispatchedLabel = [current.title(), current.descriptionText()].compactMap { $0 }.first { !$0.isEmpty } ?? ""
         let beforeOwnedIDs = Set(((window.map { walk($0, limit: 500).filter { ["AXWindow", "AXSheet"].contains($0.role() ?? "") } } ?? []) + (savePanel.map { [$0] } ?? []))
             .compactMap { AXWindowResolver().windowID(from: $0).map(Int.init) })
@@ -209,7 +220,12 @@ final class NativeSpike {
         let actualDelivery = nativeDialog ? "ax-native-dialog" : delivery
         if delivery == "ax" || nativeDialog {
             // Perform only the retained accessibility action. No input fallback.
-            try current.performAction(action)
+            if action == "set-selected" {
+                let result = AXUIElementSetAttributeValue(current.underlyingElement, kAXSelectedAttribute as CFString, kCFBooleanTrue)
+                guard result == .success else { throw SpikeError.nativeAction(result.rawValue) }
+            } else {
+                try current.performAction(action)
+            }
         } else {
             guard let frame = current.frame(), let window, let windowFrame = window.frame(),
                   frame.width > 4, frame.height > 4, windowFrame.contains(CGPoint(x: frame.midX, y: frame.midY)),
@@ -247,7 +263,7 @@ final class NativeSpike {
         let staysOwned = before["frontPID"] as? Int == ownedPID && after["frontPID"] as? Int == ownedPID
             && beforeOwnedIDs.contains(before["frontWindow"] as? Int ?? -1) && ownedIDs.contains(after["frontWindow"] as? Int ?? -1)
         return ["status": "dispatched",
-                "delivery": actualDelivery, "focusWithinOwnedSurface": staysOwned,
+                "delivery": actualDelivery, "nativeAction": action, "focusWithinOwnedSurface": staysOwned,
                 "focusChanged": before["frontPID"] as? Int != after["frontPID"] as? Int || before["frontWindow"] as? Int != after["frontWindow"] as? Int,
                 "pointerMoved": before["pointerX"] as? Double != after["pointerX"] as? Double || before["pointerY"] as? Double != after["pointerY"] as? Double,
                 "before": before, "after": after]

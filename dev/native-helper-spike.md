@@ -70,15 +70,37 @@ and `AXWindow` both identified the retained fixture window. The dialog also
 remembered a different save folder. No file was saved. The monitor recorded
 384 samples with no app, window or pointer changes or missing channels.
 
-The helper now binds that attached sheet by element identity, checks the exact
-fixture filename, and exposes a deterministic Downloads sidebar action before
-Save when needed. It retains the sheet identity and rejects replacement or
-loss. Filename and folder changes affect the revision. This is a development
-fixture mechanism: the folder label alone does not establish a production
-save-path binding. The runner still requires the exact file in its expected
-Downloads path. The corrected live test is pending a desktop unlock. After final dialog Save, the runner
-checks only the expected file until its deadline; it does not replay the save
-or treat the dismissed dialog as an immediate failure.
+The helper binds that attached sheet by element identity, checks the exact
+fixture filename, and selects the Downloads sidebar row before Save when needed.
+It retains the sheet identity and rejects replacement or loss. Filename and
+folder changes affect the revision. This is a development fixture mechanism:
+the folder label alone does not establish a production save-path binding. The
+runner requires the exact file in its expected Downloads path. After final
+Save it checks only that file until its deadline, without replaying the save.
+
+Further live attempts found three helper defects. The library's generic value
+accessor did not return the filename as a string, although the raw native
+attribute matched exactly. The sidebar's advertised Open action changed folders
+but returned an error; the helper now uses its settable selection attribute.
+Finally, observing the populated file list timed out. The helper now omits that
+unrelated listing and reads only the controls needed for the save operation.
+Failed attempts remain failures; none was resumed or counted as a saved PDF.
+
+A fresh Firefox 156 run then passed the full revoked-URL check. The helper used
+three native actions: document Save, choose Downloads, and dialog Save. The
+saved PDF matched the original SHA-256 and all 5,661 bytes. It had three pages;
+the rendered first page matched the fixture's title and DOI. Firefox made no
+request after revocation. The only later requests were the three deliberate
+replay checks, all rejected with HTML/410.
+
+The passive monitor recorded 479 samples over 12.28 seconds, with no app,
+window or pointer changes and no missing channels. One startup gap lasted
+102 ms; polling cannot exclude changes between samples. The run used no model
+call, extension API, CDP, debugger or manual PDF/Save action. Setup opened the
+fixture beforehand. All owned tabs and servers were cleaned up and the test
+PDF was moved from Downloads into private evidence. This proves resident saving
+for this Mac/Firefox fixture. Production job binding, daemon adoption, publisher
+acceptance and other native platforms remain unproved.
 
 Checks after this slice: 2,753 extension tests passed, one existing test skipped,
 TypeScript checking passed, and all eight Swift tests passed. The helper builds.
