@@ -82,8 +82,11 @@ Keep cloud and future local classifiers interchangeable in both execution modes.
 The [native helper spike](../native-helper-spike.md) now runs independently of
 Codex: four Jev decisions acquired a three-page synthetic PDF through Chrome's
 viewer and native Save dialog. It reuses AXorcist and selected trycua native
-delivery code. Native foreground operation succeeded; native background-only
-operation did not. A subsequent extension-API run completed three Jev decisions
+delivery code. The initial native background article flow failed. A later
+Chrome viewer-only AX save succeeded in the background, but fetched the URL
+again. With the original URL revoked, the same save sequence failed despite
+the visible PDF. Native resident-byte saving remains unproved. A subsequent
+extension-API run completed three Jev decisions
 and downloaded the verified fixture PDF in 2.29 seconds while another app stayed
 in front. The passive monitor recorded 94 samples with no app/window/pointer
 changes or missing channels during that run. A further isolated run downloaded a

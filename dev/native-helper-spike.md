@@ -1,6 +1,6 @@
 # Native helper reuse and first executable spike
 
-Evidence date: 2026-09-20. Development tooling only; no production daemon,
+Evidence date: 2026-09-21. Development tooling only; no production daemon,
 extension, job-policy or native-host changes.
 
 ## Result
@@ -17,7 +17,7 @@ latency was 333 ms (Jev 1.13.0). These are fixture observations, not provider
 performance estimates. The local deterministic backend also executes through
 the same interface; it is a fixture oracle, not a local AI model.
 
-**Native-only background execution remains unproved.** The background Jev run
+**The initial article-to-viewer background run failed.** The background Jev run
 made no progress after one decision. Native AXPress also acknowledged browser
 actions without causing navigation in both initial background and foreground
 trials. The private window-event sequence worked in the foreground reference
@@ -37,6 +37,77 @@ publisher acquisition, daemon adoption, identity validation through Papio,
 repair learning, Windows/Linux operation or fully unattended background use.
 Private receipts, failed trials and the supervised positive control remain in
 `dev/scratch/`; failed attempts were not reset or counted as successes.
+
+## Resident PDF save check — 2026-09-21
+
+A later test started with a fully loaded synthetic PDF in Chrome 153.0.8010.52.
+Pure AXPress on Download and the native Save dialog saved the correct 5,661-byte,
+three-page file while another app stayed in front. The passive monitor recorded
+267 samples with no app, window or pointer changes and no missing channels.
+This proves background saving for that viewer state; it does not prove background
+article navigation or uninterrupted keyboard focus. The request log showed a
+second PDF GET during saving.
+
+The next test revoked the fixture URL after the viewer loaded. Every subsequent
+request, including Range and query variants, returned HTML with status 410.
+Three independent replay checks confirmed this before native actions began.
+Chrome dispatched Download and Save, made another GET, and saved no PDF. The
+viewer still displayed the loaded paper. The run ended `no_progress`; 630 monitor
+samples showed no app, window or pointer changes or missing channels.
+
+The fixture now has an irreversible revocation control and a request journal.
+The runner's `--resident-pdf` mode checks the loaded viewer, revokes the URL,
+checks the replay failures, and permits only the native save sequence. Success
+requires the exact source SHA-256 and byte count, with no PDF response after
+revocation. It uses the local deterministic backend and makes no model calls.
+It neither adopts the file nor creates a Papio job.
+
+Firefox 156 opened a native Save As dialog after one background AX Save action.
+It made no new PDF request after revocation. The helper nevertheless ended
+`no_progress`: Firefox exposed the attached sheet through `AXFocusedWindow`,
+while omitting it from the document window's children. The sheet's `AXParent`
+and `AXWindow` both identified the retained fixture window. The dialog also
+remembered a different save folder. No file was saved. The monitor recorded
+384 samples with no app, window or pointer changes or missing channels.
+
+The helper now binds that attached sheet by element identity, checks the exact
+fixture filename, and exposes a deterministic Downloads sidebar action before
+Save when needed. It retains the sheet identity and rejects replacement or
+loss. Filename and folder changes affect the revision. This is a development
+fixture mechanism: the folder label alone does not establish a production
+save-path binding. The runner still requires the exact file in its expected
+Downloads path. The corrected live test is pending a desktop unlock. After final dialog Save, the runner
+checks only the expected file until its deadline; it does not replay the save
+or treat the dismissed dialog as an immediate failure.
+
+Checks after this slice: 2,753 extension tests passed, one existing test skipped,
+TypeScript checking passed, and all eight Swift tests passed. The helper builds.
+These checks do not replace the pending live Firefox test.
+
+Run this check with a new fixture directory and its exact `pdfURL` already open
+in one owned browser tab. Use a new result directory and retain the server until
+the final request audit finishes:
+
+```sh
+bun run extension/tools/native-spike-run.ts \
+  --helper dev/scratch/native-spike-swift-build/debug/papio-native-spike \
+  --fixture dev/scratch/NEW_FIXTURE/fixture.json \
+  --run-dir dev/scratch/NEW_RESULT \
+  --browser chrome --resident-pdf \
+  --backend local-fixture --delivery ax --attention background
+```
+
+`--browser firefox` selects the installed release Firefox. The helper emits an
+explicit document/dialog surface and includes it in the observation revision.
+The Firefox check requires the known fixture's title, DOI and page-count marker;
+it does not treat that check as general PDF readiness. Read `result.json` and
+`resident-proof.json`: a zero process exit status alone does not mean success.
+The monitor report records sampled attention changes and gaps separately.
+
+This test rules out the observed Chrome Download/Save path as a resident-byte
+solution. A visible PDF and a successful baseline save are insufficient. Keep
+the signed-URL guard in production; a second fetch can fail after the original
+transfer succeeds. The fixture results do not establish publisher support.
 
 ## Reuse decision
 

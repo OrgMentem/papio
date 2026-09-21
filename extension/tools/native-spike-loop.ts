@@ -7,6 +7,7 @@ export interface NativeObservation {
   page: { url: string; title: string; text: string };
   controls: { id: string; role: string; label: string; disabled?: boolean }[];
   provenance: { kind: string; revision: string };
+  native_surface?: "document" | "save-dialog";
 }
 export interface NativeDecision { choice: string; observationHash: string }
 export interface DecisionBackend {
@@ -47,7 +48,7 @@ export async function runNativeLoop(driver: NativeDriver, backend: DecisionBacke
     if (await driver.pendingArtifact?.()) { await options.wait(); continue; }
     const observed = await driver.observe(), hash = observationHash(observed);
     // Ephemeral handles/revisions must not masquerade as progress.
-    const state = sha256(JSON.stringify({ page: observed.page, controls: observed.controls.map(({ role, label, disabled }) => ({ role, label, disabled: disabled === true })) }));
+    const state = sha256(JSON.stringify({ page: observed.page, controls: observed.controls.map(({ role, label, disabled }) => ({ role, label, disabled: disabled === true })), native_surface: observed.native_surface }));
     if (state !== previous) { changedAt = now(); previous = state; }
     if (now() - changedAt >= options.noProgressMs) return { status: "no_progress", decisions };
     if (waitingForChange === state) { await options.wait(); continue; }

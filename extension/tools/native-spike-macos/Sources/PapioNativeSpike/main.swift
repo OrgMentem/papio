@@ -11,6 +11,7 @@ enum SpikeError: Error { case invalidRequest, permissionMissing, missingSurface,
 
 @MainActor
 final class NativeSpike {
+    private(set) var browser = NativeBrowser.chrome
     var window: Element?
     var targets: [String: Element] = [:]
     var revision = ""
@@ -18,6 +19,9 @@ final class NativeSpike {
     var goal = ""
     var delivery = "ax"
     var nativeDialog = false
+    var saveRequested = false
+    var savePanel: Element?
+    var targetActions: [String: String] = [:]
     var attention = "background"
     var monitor: PassiveMonitor?
 
@@ -73,27 +77,28 @@ final class NativeSpike {
         return result
     }
 
-    func configure(_ input: [String: Any]) throws -> [String: Any] {
+    func configure(_ input: [String: Any]) throws {
+        let browser = try NativeBrowser.configured(input["browser"], surfaceBound: window != nil || !targets.isEmpty)
         guard let raw = input["prefix"] as? String, let url = URL(string: raw),
               url.scheme == "http", url.host == "127.0.0.1", url.path.hasPrefix("/papio-native-"),
               let goal = input["goal"] as? String, goal.count <= 1000 else { throw SpikeError.invalidRequest }
-        self.prefix = raw
-        self.goal = goal
         let delivery = input["delivery"] as? String ?? "ax"
         guard ["ax", "pid-click", "cua-window"].contains(delivery) else { throw SpikeError.invalidRequest }
-        self.delivery = delivery
         let attention = input["attention"] as? String ?? "background"
         guard ["background", "owned"].contains(attention) else { throw SpikeError.invalidRequest }
+        self.browser = browser
+        self.prefix = raw
+        self.goal = goal
+        self.delivery = delivery
         self.attention = attention
-        return status()
     }
 
     func observe() throws -> [String: Any] {
         guard AXIsProcessTrusted() else { throw SpikeError.permissionMissing }
         guard !prefix.isEmpty,
-              let chrome = NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").first
+              let application = NSRunningApplication.runningApplications(withBundleIdentifier: browser.bundleIdentifier).first
         else { throw SpikeError.missingSurface }
-        let app = Element(AXUIElementCreateApplication(chrome.processIdentifier))
+        let app = Element(AXUIElementCreateApplication(application.processIdentifier))
         AXUIElementSetMessagingTimeout(app.underlyingElement, 1)
         let windows = app.windows() ?? []
         var matches: [(Element, Element)] = []
@@ -108,33 +113,83 @@ final class NativeSpike {
         }
         if let window, window != boundWindow { throw SpikeError.stale }
         window = boundWindow
-        let sheets = walk(boundWindow, limit: 500).filter { $0.role() == "AXSheet" }
+        var sheets = walk(boundWindow, limit: 500).filter { $0.role() == "AXSheet" }
+        // Firefox exposes its attached NSSavePanel through AXFocusedWindow,
+        // while omitting it from the document window's AXChildren.
+        if let focused = app.focusedWindow(), focused.role() == "AXSheet",
+           focused.parent() == boundWindow, !sheets.contains(focused) {
+            sheets.append(focused)
+        }
         guard sheets.count <= 1 else { throw SpikeError.ambiguousSurface }
+        if let sheet = sheets.first {
+            guard saveRequested, sheet.identifier() == "save-panel", sheet.parent() == boundWindow else { throw SpikeError.stale }
+            if let savePanel, savePanel != sheet { throw SpikeError.stale }
+            savePanel = sheet
+        } else if savePanel != nil { throw SpikeError.stale }
         let root = sheets.first ?? area
         nativeDialog = !sheets.isEmpty
         let nodes = walk(root)
         var controls: [[String: Any]] = [], context: [String] = [], nextTargets: [String: Element] = [:]
+        var nextActions: [String: String] = [:]
+        var destinationReady = true
+        if nativeDialog {
+            // Only inspect the two fixture-save fields, never account inputs.
+            let names = nodes.filter { $0.identifier() == "saveAsNameTextField" }
+            let locations = nodes.filter { $0.identifier() == "where popup" }
+            let expectedName = (URL(string: prefix)?.lastPathComponent ?? "") + ".pdf"
+            guard names.count == 1, names[0].value() as? String == expectedName,
+                  locations.count == 1, let location = locations[0].value() as? String else { throw SpikeError.stale }
+            context.append("Fixture filename: \(expectedName)\nSave folder: \(location)")
+            destinationReady = location == "Downloads"
+            if !destinationReady {
+                // This is a fixture-only directory choice. Final proof still
+                // requires the exact file under the runner's Downloads path.
+                let cells = nodes.filter { element in
+                    guard element.role() == "AXCell", element.isActionSupported("AXOpen"),
+                          let row = element.parent(), row.role() == "AXRow",
+                          let outline = row.parent(), outline.role() == "AXOutline",
+                          outline.descriptionText() == "sidebar" else { return false }
+                    return walk(element, limit: 20).contains { $0.role() == "AXStaticText" && $0.value() as? String == "Downloads" }
+                }
+                guard cells.count == 1 else { throw SpikeError.ambiguousSurface }
+                controls.append(["id": "c1", "role": "AXButton", "label": "Choose Downloads", "disabled": false])
+                nextTargets["c1"] = cells[0]
+                nextActions["c1"] = "AXOpen"
+            }
+        }
         for element in nodes {
             let role = element.role() ?? ""
-            // Never read editable values. This fixture has no account fields.
+            // Editable reads above are limited to the owned fixture save name.
             let label = [element.title(), element.descriptionText()].compactMap { $0 }.first { !$0.isEmpty } ?? ""
-            if ["AXStaticText", "AXHeading"].contains(role) {
+            if !nativeDialog && ["AXStaticText", "AXHeading"].contains(role) {
                 let text = label.isEmpty ? (element.rawAttributeValue(named: "AXValue") as? String ?? "") : label
                 if !text.isEmpty { context.append(String(text.prefix(300))) }
             }
+            // Do not project unrelated filenames or other save-panel controls.
+            if nativeDialog && !["Save", "Cancel"].contains(label) { continue }
             if ["AXLink", "AXButton"].contains(role), !label.isEmpty, element.isActionSupported("AXPress"), controls.count < 80 {
                 let id = "c\(controls.count + 1)"
-                controls.append(["id": id, "role": role, "label": String(label.prefix(240)), "disabled": element.isEnabled() == false])
+                controls.append(["id": id, "role": role, "label": String(label.prefix(240)), "disabled": element.isEnabled() == false || (nativeDialog && label == "Save" && !destinationReady)])
                 nextTargets[id] = element
+                if !nativeDialog || label != "Save" || destinationReady { nextActions[id] = "AXPress" }
             }
         }
         let page: [String: Any] = ["url": area.url()?.absoluteString ?? prefix,
             "title": area.title() ?? "Papio native fixture", "text": String(context.joined(separator: "\n").prefix(12000))]
-        let state: [String: Any] = ["page": page, "controls": controls]
+        let observation = try projectObservation(page: page, controls: controls)
+        targets = nextTargets
+        targetActions = nextActions
+        return observation
+    }
+
+    // Pure projection of the already-chosen AX root; labels never select a surface.
+    func projectObservation(page: [String: Any], controls: [[String: Any]]) throws -> [String: Any] {
+        let surface = nativeDialog ? "save-dialog" : "document"
+        let state: [String: Any] = ["page": page, "controls": controls, "native_surface": surface]
         let encoded = try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
         revision = SHA256.hash(data: encoded).map { String(format: "%02x", $0) }.joined()
-        targets = nextTargets
-        return ["goal": goal, "page": page, "controls": controls, "provenance": ["kind": "native-axorcist", "revision": revision]]
+        return ["goal": goal, "page": page, "controls": controls, "native_surface": surface,
+                "provenance": ["kind": "native-axorcist", "revision": revision]]
     }
 
     func act(_ input: [String: Any]) throws -> [String: Any] {
@@ -144,16 +199,17 @@ final class NativeSpike {
         guard before["focusObserved"] as? Bool == true, before["pointerObserved"] as? Bool == true else { throw SpikeError.unsupported }
         _ = try observe()
         guard revision == expected, let current = targets[id], current == old,
-              current.isEnabled() != false, current.isActionSupported("AXPress") else { throw SpikeError.stale }
-        let beforeOwnedIDs = Set((window.map { walk($0, limit: 500).filter { ["AXWindow", "AXSheet"].contains($0.role() ?? "") } } ?? [])
+              let action = targetActions[id], current.isEnabled() != false, current.isActionSupported(action) else { throw SpikeError.stale }
+        let dispatchedLabel = [current.title(), current.descriptionText()].compactMap { $0 }.first { !$0.isEmpty } ?? ""
+        let beforeOwnedIDs = Set(((window.map { walk($0, limit: 500).filter { ["AXWindow", "AXSheet"].contains($0.role() ?? "") } } ?? []) + (savePanel.map { [$0] } ?? []))
             .compactMap { AXWindowResolver().windowID(from: $0).map(Int.init) })
         if attention == "owned" && (before["frontPID"] as? Int != window?.pid().map(Int.init) || !beforeOwnedIDs.contains(before["frontWindow"] as? Int ?? -1)) {
             return ["status": "needs_foreground", "focusChanged": false, "pointerMoved": false]
         }
         let actualDelivery = nativeDialog ? "ax-native-dialog" : delivery
         if delivery == "ax" || nativeDialog {
-            // AXorcist performs exactly AXPress. No implicit delivery fallback.
-            try current.performAction(.press)
+            // Perform only the retained accessibility action. No input fallback.
+            try current.performAction(action)
         } else {
             guard let frame = current.frame(), let window, let windowFrame = window.frame(),
                   frame.width > 4, frame.height > 4, windowFrame.contains(CGPoint(x: frame.midX, y: frame.midY)),
@@ -179,10 +235,13 @@ final class NativeSpike {
                 }
             }
         }
+        if !nativeDialog, ["Save", "Download"].contains(dispatchedLabel) {
+            saveRequested = true
+        }
         Thread.sleep(forTimeInterval: 0.2)
         let after = status()
         guard after["focusObserved"] as? Bool == true, after["pointerObserved"] as? Bool == true else { throw SpikeError.unsupported }
-        let owned = window.map { walk($0, limit: 500).filter { ["AXWindow", "AXSheet"].contains($0.role() ?? "") } } ?? []
+        let owned = (window.map { walk($0, limit: 500).filter { ["AXWindow", "AXSheet"].contains($0.role() ?? "") } } ?? []) + (savePanel.map { [$0] } ?? [])
         let ownedIDs = Set(owned.compactMap { AXWindowResolver().windowID(from: $0).map(Int.init) })
         let ownedPID = window?.pid().map(Int.init)
         let staysOwned = before["frontPID"] as? Int == ownedPID && after["frontPID"] as? Int == ownedPID
@@ -206,7 +265,9 @@ final class NativeSpike {
             defer { self.monitor = nil }
             return try monitor.stop()
         case "status": return status()
-        case "configure": return try configure(input)
+        case "configure":
+            try configure(input)
+            return status()
         case "observe": return try observe()
         case "act": return try act(input)
         default: throw SpikeError.invalidRequest
