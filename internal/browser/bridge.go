@@ -11234,9 +11234,13 @@ func (b *Bridge) serviceMaterializationCandidate(
 		LoginEntityID: inst.ShibbolethEntityID, ProquestAccountID: inst.ProquestAccountID,
 		RequiresAuth: action.RequiresAuth,
 	}
-	if attemptID, ordinal, ok := b.latestProviderDriveEpoch(id); ok {
+	attemptID, ordinal, epochErr := b.providerDriveEpochForOffer(*row, action, events, false)
+	if epochErr != nil {
+		return nil, epochErr
+	}
+	if ordinal != nil {
 		offerPayload.DriveAttemptID = attemptID
-		offerPayload.DriveOrdinal = &ordinal
+		offerPayload.DriveOrdinal = ordinal
 		offerPayload.DriveStrategy = "generic"
 		offerPayload.DriveRevision = "1"
 	}
@@ -12146,69 +12150,15 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 		// adapter's delegated click path from racing the human.
 		payload.AccessMode = config.ModeAssisted
 	}
-	// A manual download is never driven. The action means the human fetches
-	// the file, so the offer exists only to put them on the institution's
-	// route; granting a drive epoch here would have papio racing the person
-	// it just asked to do the work.
-	driveAllowed := action.Kind != manualDownloadActionKind && b.providerDriveEpochAvailable()
-	if driveAllowed && b.jobs != nil {
-		if live, err := b.jobs.LiveEffectPermit(context.Background()); err != nil {
-			return nil, fmt.Errorf("read effect permit occupancy: %w", err)
-		} else if live != nil {
-			driveAllowed = false
-		}
-		if blockers, err := b.jobs.UnresolvedLegacyEffectBlockerCount(context.Background()); err != nil {
-			return nil, fmt.Errorf("read legacy effect blockers: %w", err)
-		} else if blockers > 0 {
-			driveAllowed = false
-		}
+	attempt, ordinal, err := b.providerDriveEpochForOffer(row, action, events, forceNewEpoch)
+	if err != nil {
+		return nil, err
 	}
-	if driveAllowed {
-		b.providerDriveEpochMu.Lock()
-		attempt, ordinal, ok := b.latestProviderDriveEpoch(row.ID)
-		domain := actionSafetyDomain(b.cfg, row, action)
-		if job.IsPublisherHandoff(action) {
-			// A publisher retry must not inherit the failed resolver's epoch
-			// or safety domain. A newly offered epoch remains reusable.
-			retryAfterEpoch := false
-			for _, event := range events {
-				if event["kind"] == "browser.publisher_retry_requested" {
-					retryAfterEpoch = true
-				}
-				if event["kind"] == "browser.provider_drive_epoch_offered" {
-					retryAfterEpoch = false
-				}
-			}
-			forceNewEpoch = forceNewEpoch || retryAfterEpoch
-		} else if b.jobs != nil {
-			if durableDomain := b.latestHandoffSafetyDomain(row.ID); durableDomain != "" {
-				domain = durableDomain
-			}
-		}
-		if forceNewEpoch && ok && b.jobs != nil {
-			if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_superseded", map[string]any{
-				"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": domain,
-			}); err != nil {
-				b.providerDriveEpochMu.Unlock()
-				return nil, fmt.Errorf("record provider drive epoch supersession: %w", err)
-			}
-		}
-		if forceNewEpoch || !ok {
-			attempt, ordinal = newMsgID(), 0
-			if b.jobs != nil {
-				if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_offered", map[string]any{
-					"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": domain,
-				}); err != nil {
-					b.providerDriveEpochMu.Unlock()
-					return nil, fmt.Errorf("record provider drive epoch offer: %w", err)
-				}
-			}
-		}
+	if ordinal != nil {
 		payload.DriveAttemptID = attempt
-		payload.DriveOrdinal = &ordinal
+		payload.DriveOrdinal = ordinal
 		payload.DriveStrategy = "generic"
 		payload.DriveRevision = "1"
-		b.providerDriveEpochMu.Unlock()
 	}
 
 	// Federated login-routing: hand this job's institution Shibboleth entityID
@@ -12217,6 +12167,73 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 	payload.LoginEntityID = inst.ShibbolethEntityID
 	payload.ProquestAccountID = inst.ProquestAccountID
 	return b.frame(protocol.MsgJobOffer, row.ID, payload)
+}
+
+// providerDriveEpochForOffer gives both candidate and legacy offers the same
+// authority. A publisher retry may supersede a consumed tuple; ordinary
+// refreshes retain it. A nil ordinal means this offer grants no generic drive.
+func (b *Bridge) providerDriveEpochForOffer(row job.Row, action job.HumanAction, events []map[string]any, forceNewEpoch bool) (string, *int64, error) {
+	// Manual downloads belong to the operator, and occupancy is global across
+	// effect kinds, including permits whose completion is still unknown.
+	if action.Kind == manualDownloadActionKind || !b.providerDriveEpochAvailable() {
+		return "", nil, nil
+	}
+	driveAllowed := true
+	if b.jobs != nil {
+		if live, err := b.jobs.LiveEffectPermit(context.Background()); err != nil {
+			return "", nil, fmt.Errorf("read effect permit occupancy: %w", err)
+		} else if live != nil {
+			driveAllowed = false
+		}
+		if blockers, err := b.jobs.UnresolvedLegacyEffectBlockerCount(context.Background()); err != nil {
+			return "", nil, fmt.Errorf("read legacy effect blockers: %w", err)
+		} else if blockers > 0 {
+			driveAllowed = false
+		}
+	}
+	if !driveAllowed {
+		return "", nil, nil
+	}
+	b.providerDriveEpochMu.Lock()
+	defer b.providerDriveEpochMu.Unlock()
+	attempt, ordinal, ok := b.latestProviderDriveEpoch(row.ID)
+	domain := actionSafetyDomain(b.cfg, row, action)
+	if job.IsPublisherHandoff(action) {
+		// A publisher retry must not inherit the failed resolver's epoch
+		// or safety domain. A newly offered epoch remains reusable.
+		retryAfterEpoch := false
+		for _, event := range events {
+			if event["kind"] == "browser.publisher_retry_requested" {
+				retryAfterEpoch = true
+			}
+			if event["kind"] == "browser.provider_drive_epoch_offered" {
+				retryAfterEpoch = false
+			}
+		}
+		forceNewEpoch = forceNewEpoch || retryAfterEpoch
+	} else if b.jobs != nil {
+		if durableDomain := b.latestHandoffSafetyDomain(row.ID); durableDomain != "" {
+			domain = durableDomain
+		}
+	}
+	if forceNewEpoch && ok && b.jobs != nil {
+		if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_superseded", map[string]any{
+			"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": domain,
+		}); err != nil {
+			return "", nil, fmt.Errorf("record provider drive epoch supersession: %w", err)
+		}
+	}
+	if forceNewEpoch || !ok {
+		attempt, ordinal = newMsgID(), 0
+		if b.jobs != nil {
+			if err := b.jobs.S.AppendEvent(context.Background(), row.ID, "browser.provider_drive_epoch_offered", map[string]any{
+				"drive_attempt_id": attempt, "ordinal": ordinal, "strategy": "generic", "revision": "1", "safety_domain": domain,
+			}); err != nil {
+				return "", nil, fmt.Errorf("record provider drive epoch offer: %w", err)
+			}
+		}
+	}
+	return attempt, &ordinal, nil
 }
 
 // providerDirectGetResult applies one strict direct observation only when its

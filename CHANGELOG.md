@@ -332,6 +332,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Publisher retries now receive fresh browser drive authority.** Retrying a
+  consumed route through a materialized candidate no longer reuses its old
+  attempt, which stopped the article agent before it could inspect the page.
+  Repeated offers reuse the new attempt and retain the original route history.
 - **Windows can create its incident key on first use.** Publication still flushes
   complete key bytes and never overwrites a competing key. It preserves Windows
   ACLs and read-only attributes without requiring an unsupported directory flush.
