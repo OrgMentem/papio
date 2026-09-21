@@ -23,6 +23,13 @@ const (
 	nativeHostDescription  = "papio native-messaging host for institutional paper-acquisition handoff"
 )
 
+// Keep OS registration separate from manifest publication so fixture installs
+// can exercise the complete file path without changing the user's registry.
+var (
+	registerNativeManifest   = registerManifest
+	deregisterNativeManifest = deregisterManifest
+)
+
 // browserFamily determines a browser's native-messaging manifest format and how
 // the daemon's origin check identifies it.
 type browserFamily int
@@ -178,7 +185,7 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 				} else {
 					removed = append(removed, path)
 				}
-				if err := deregisterManifest(t); err != nil {
+				if err := deregisterNativeManifest(t); err != nil {
 					return err
 				}
 			}
@@ -336,7 +343,7 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 		if err := writeManifestAtomic(path, manifest); err != nil {
 			return nativeHostInstallResult{}, err
 		}
-		if err := registerManifest(t, path); err != nil {
+		if err := registerNativeManifest(t, path); err != nil {
 			return nativeHostInstallResult{}, err
 		}
 		if err := verifyNativeHost(path); err != nil {

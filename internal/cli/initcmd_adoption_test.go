@@ -5,20 +5,34 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"papio/internal/config"
 )
 
-// initHome isolates the home-derived download directory so these tests never
-// touch a developer's real ~/Downloads.
+// isolateCLIProfile isolates both Unix and Windows config/data defaults.
+// It does not isolate Windows' registry-derived Downloads: tests must also
+// supply an explicit adoption root before any directory access on Windows.
+func isolateCLIProfile(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	t.Setenv("PAPIO_CONFIG_DIR", filepath.Join(home, ".config", "papio"))
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
+	t.Setenv("XDG_DOWNLOAD_DIR", "")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+}
+
+// initHome isolates the profile. Windows adoption isolation is supplied by
+// the setup fixture separately because a relocated Downloads path is absolute.
 func initHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_DOWNLOAD_DIR", "")
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	isolateCLIProfile(t, home)
 	return home
 }
 
@@ -32,7 +46,7 @@ func TestInitCreatesTheBrowserAdoptionRoot(t *testing.T) {
 	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 
-	out, err := runInitForTest(t, path, initTestDependencies(t),
+	out, err := runInitForTest(t, path, initTestDependencies(t, home),
 		"--non-interactive", "--email", "reader@example.test", "--skip-browser")
 	if err != nil {
 		t.Fatalf("init: %v\n%s", err, out)
@@ -50,14 +64,21 @@ func TestInitCreatesTheBrowserAdoptionRoot(t *testing.T) {
 		t.Fatalf("init output does not report the created adoption root %q:\n%s", root, out)
 	}
 
-	// The default stays derived: freezing an absolute path into config.toml
-	// would strand a user who later moves their download folder.
+	// On Unix the default stays derived. Windows uses an explicit fixture
+	// override because its real Downloads folder can be an absolute registry
+	// path that environment isolation cannot redirect.
 	body, readErr := os.ReadFile(path)
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if strings.Contains(string(body), "download_adoption_root") {
+	if runtime.GOOS != "windows" && strings.Contains(string(body), "download_adoption_root") {
 		t.Fatalf("init wrote download_adoption_root into the config; the default must stay derived:\n%s", body)
+	}
+	if runtime.GOOS == "windows" {
+		cfg, err := config.Load(path)
+		if err != nil || cfg.Browser.AdoptionRoot != root {
+			t.Fatalf("Windows fixture root = %q, %v; want %q", cfg.Browser.AdoptionRoot, err, root)
+		}
 	}
 }
 
@@ -74,7 +95,7 @@ func TestInitReportsAnAdoptionRootItCannotCreate(t *testing.T) {
 	}
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 
-	out, err := runInitForTest(t, path, initTestDependencies(t),
+	out, err := runInitForTest(t, path, initTestDependencies(t, home),
 		"--non-interactive", "--email", "reader@example.test", "--skip-browser")
 	if err != nil {
 		t.Fatalf("a failed adoption root must not abort setup: %v\n%s", err, out)

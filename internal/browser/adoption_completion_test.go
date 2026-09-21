@@ -133,7 +133,7 @@ func TestDownloadCompleteAfterSweepRefusesUnprovenArtifact(t *testing.T) {
 				err = os.Remove(path)
 			case "symlink":
 				if err = os.Remove(path); err == nil {
-					err = os.Symlink(artifactPath, path)
+					adoptionTestSymlink(t, artifactPath, path)
 				}
 			case "missing_artifact":
 				err = os.Remove(artifactPath)

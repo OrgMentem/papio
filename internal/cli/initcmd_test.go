@@ -24,9 +24,36 @@ type initTestCloser struct{}
 
 func (initTestCloser) Close() error { return nil }
 
-func initTestDependencies(t *testing.T) initDependencies {
+func isolatedInitConfigLoader(t *testing.T, home string) func(string) (config.Config, bool, error) {
+	t.Helper()
+	inside := func(label, path string) {
+		t.Helper()
+		rel, err := filepath.Rel(home, path)
+		if err != nil || !filepath.IsLocal(rel) {
+			t.Fatalf("%s fixture escaped temporary profile: %q (%v)", label, path, err)
+		}
+	}
+	return func(path string) (config.Config, bool, error) {
+		inside("config", path)
+		cfg, exists, err := initConfig(path)
+		if err != nil {
+			return cfg, exists, err
+		}
+		// A moved Windows Downloads folder may be absolute in the registry.
+		// Never consult that default for a fixture's directory operations.
+		if runtime.GOOS == "windows" && cfg.Browser.AdoptionRoot == "" {
+			cfg.Browser.AdoptionRoot = filepath.Join(home, "Downloads", config.AdoptionDirName)
+		}
+		inside("data", cfg.DataDir)
+		inside("adoption", cfg.EffectiveAdoptionRoot())
+		return cfg, exists, nil
+	}
+}
+
+func initTestDependencies(t *testing.T, home string) initDependencies {
 	t.Helper()
 	return initDependencies{
+		LoadConfig: isolatedInitConfigLoader(t, home),
 		Bootstrap: func(ctx context.Context, cfg config.Config) (io.Closer, error) {
 			return bootstrap.New(ctx, cfg)
 		},
@@ -56,10 +83,9 @@ func runInitForTest(t *testing.T, path string, deps initDependencies, args ...st
 }
 
 func TestInitFreshWritesConfigAndAppliesMigrations(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 
 	out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser")
 	if err != nil {
@@ -90,10 +116,9 @@ func TestInitFreshWritesConfigAndAppliesMigrations(t *testing.T) {
 }
 
 func TestInitRerunPreservesValuesAndFlagOverridesOneField(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "first@example.test", "--skip-browser"); err != nil {
 		t.Fatalf("first init: %v\n%s", err, out)
 	}
@@ -127,9 +152,8 @@ func TestInitRerunPreservesValuesAndFlagOverridesOneField(t *testing.T) {
 }
 
 func TestInitZotioWarningAndRequiredFailureExitContract(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	deps := initTestDependencies(t)
+	home := initHome(t)
+	deps := initTestDependencies(t, home)
 	deps.CheckZotio = func(context.Context, string) error { return errors.New("zotio not found") }
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 
@@ -146,7 +170,7 @@ func TestInitZotioWarningAndRequiredFailureExitContract(t *testing.T) {
 		t.Fatal("invalid required email succeeded")
 	}
 
-	migrationDeps := initTestDependencies(t)
+	migrationDeps := initTestDependencies(t, home)
 	migrationDeps.Bootstrap = func(context.Context, config.Config) (io.Closer, error) {
 		return initTestCloser{}, errors.New("database unavailable")
 	}
@@ -195,10 +219,9 @@ func TestProquestAccountIDFromInput(t *testing.T) {
 }
 
 func TestInitInstitutionFlagsExtractAccountIDFromPastedURL(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 
 	out, err := runInitForTest(t, path, deps,
 		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
@@ -224,13 +247,12 @@ func TestInitInstitutionFlagsExtractAccountIDFromPastedURL(t *testing.T) {
 }
 
 func TestInitInstitutionURLDerivesPrimoVEBase(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 	const discoveryURL = "https://university.primo.exlibrisgroup.com/discovery/search?vid=UNIV:Main&rft.title=An+Article&rft.au=Author&accountid=24680"
 	const wantBase = "https://university.primo.exlibrisgroup.com/discovery/openurl?institution=UNIV&vid=UNIV%3AMain"
 
-	out, err := runInitForTest(t, path, initTestDependencies(t),
+	out, err := runInitForTest(t, path, initTestDependencies(t, home),
 		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
 		"--institution-url", discoveryURL)
 	if err != nil {
@@ -249,11 +271,10 @@ func TestInitInstitutionURLDerivesPrimoVEBase(t *testing.T) {
 }
 
 func TestInitInstitutionURLConflictsWithOpenURLBase(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 
-	_, err := runInitForTest(t, path, initTestDependencies(t),
+	_, err := runInitForTest(t, path, initTestDependencies(t, home),
 		"--non-interactive", "--institution-url", "https://university.primo.exlibrisgroup.com/discovery/search?vid=UNIV:Main",
 		"--openurl-base", "https://resolver.example.edu/openurl")
 	if err == nil || !strings.Contains(err.Error(), "--institution-url and --openurl-base cannot be used together") {
@@ -262,8 +283,7 @@ func TestInitInstitutionURLConflictsWithOpenURLBase(t *testing.T) {
 }
 
 func TestInitInstitutionURLRejectsUnderivableDiscoveryURL(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 	const discoveryURL = "https://catalog.example.edu/search?query=climate"
 	discovery, err := institution.Discover(discoveryURL)
@@ -274,7 +294,7 @@ func TestInitInstitutionURLRejectsUnderivableDiscoveryURL(t *testing.T) {
 		t.Fatalf("test URL derived unexpected base %q", discovery.OpenURLBase)
 	}
 
-	_, err = runInitForTest(t, path, initTestDependencies(t),
+	_, err = runInitForTest(t, path, initTestDependencies(t, home),
 		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
 		"--institution-url", discoveryURL)
 	if err == nil || !strings.Contains(err.Error(), discovery.Note) {
@@ -298,10 +318,9 @@ func runInitStdin(t *testing.T, path string, deps initDependencies, stdin string
 }
 
 func TestInitExtensionIDFlags(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	if _, err := runInitForTest(t, path, deps,
 		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
 		"--extension-id", "abcdefghijklmnopabcdefghijklmnop",
@@ -350,11 +369,10 @@ func TestBrowserInstructionsPointAtEachStoreListing(t *testing.T) {
 }
 
 func TestInitInteractiveCapturesExtensionIDsAndInstalls(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 	var installedID string
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	deps.InstallNative = func(cfg config.Config) error {
 		installedID = cfg.Browser.ExtensionID
 		return nil
@@ -391,10 +409,9 @@ func TestInitInteractiveCapturesExtensionIDsAndInstalls(t *testing.T) {
 }
 
 func TestInitInteractiveZotioNoneClearsExecutableAndSkipsAttachment(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	deps.InstallNative = func(config.Config) error { return nil }
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
@@ -442,10 +459,9 @@ func TestInitInteractiveZotioNoneClearsExecutableAndSkipsAttachment(t *testing.T
 }
 
 func TestInitInteractiveInstitutionURLDerivesPrimoVEBase(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	deps.InstallNative = func(config.Config) error { return nil }
 	const discoveryURL = "https://university.primo.exlibrisgroup.com/discovery/search?vid=UNIV:Main"
 	const wantBase = "https://university.primo.exlibrisgroup.com/discovery/openurl?institution=UNIV&vid=UNIV%3AMain"
@@ -477,8 +493,7 @@ func TestInitInteractiveInstitutionURLDerivesPrimoVEBase(t *testing.T) {
 }
 
 func TestInitInteractiveInstitutionPromptUsesExistingBaseDefault(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
 	const existingBase = "https://resolver.example.edu/openurl"
 	cfg := config.Default()
@@ -488,7 +503,7 @@ func TestInitInteractiveInstitutionPromptUsesExistingBaseDefault(t *testing.T) {
 	if err := config.Save(cfg, path); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	deps.InstallNative = func(config.Config) error { return nil }
 
 	answers := strings.Join([]string{
@@ -533,8 +548,7 @@ func TestInitUpdateCheckPromptWritesBothAnswers(t *testing.T) {
 		{name: "no", answer: "n", want: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			home := t.TempDir()
-			t.Setenv("HOME", home)
+			home := initHome(t)
 			path := filepath.Join(home, ".config", "papio", "config.toml")
 			answers := strings.Join([]string{
 				"reader@example.test",
@@ -543,7 +557,7 @@ func TestInitUpdateCheckPromptWritesBothAnswers(t *testing.T) {
 				"no",
 				test.answer,
 			}, "\n") + "\n"
-			out, err := runInitStdin(t, path, initTestDependencies(t), answers)
+			out, err := runInitStdin(t, path, initTestDependencies(t, home), answers)
 			if err != nil {
 				t.Fatalf("init: %v\n%s", err, out)
 			}
@@ -669,10 +683,9 @@ func TestLibKeyLibraryIDFromInput(t *testing.T) {
 }
 
 func TestInitConfiguresAndClearsLibKeyLinkRouting(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 
 	out, err := runInitForTest(t, path, deps,
 		"--non-interactive", "--email", "reader@example.test", "--skip-browser",
@@ -705,10 +718,9 @@ func TestInitConfiguresAndClearsLibKeyLinkRouting(t *testing.T) {
 }
 
 func TestInitPrintsAutoCapableShapedVerdictForCleanIlliadProfile(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser"); err != nil {
 		t.Fatalf("first init: %v\n%s", err, out)
 	}
@@ -747,10 +759,9 @@ func TestInitPrintsAutoCapableShapedVerdictForCleanIlliadProfile(t *testing.T) {
 }
 
 func TestInitPrintsPrefillOnlyVerdictForCopyrightActS49Profile(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser"); err != nil {
 		t.Fatalf("first init: %v\n%s", err, out)
 	}
@@ -786,10 +797,9 @@ func TestInitPrintsPrefillOnlyVerdictForCopyrightActS49Profile(t *testing.T) {
 }
 
 func TestInitPrintsNoDeliveryVerdictWithoutConfig(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t)
+	deps := initTestDependencies(t, home)
 
 	out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser")
 	if err != nil {

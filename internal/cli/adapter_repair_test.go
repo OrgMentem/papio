@@ -147,6 +147,8 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	rel, _ := filepath.Rel(root, result.Workspace)
+	// The generated instructions are shell commands and Git paths on every OS.
+	rel = filepath.ToSlash(rel)
 	fixtureName := "repair-" + row.SHA256 + ".html"
 	expectedApply := fmt.Sprintf("# Apply this reviewed repair\n\nThis is a development proposal, not a verified provider repair. Review the fixture for private data before copying it into tracked source.\n\nRun from an isolated development checkout after reviewing `report.md` and both generated diffs.\n\n```sh\ngit apply %s/adapters.test.ts.patch %s/types.ts.patch\nmkdir -p extension/fixtures/jstor\ncp %s/extension/fixtures/jstor/%s extension/fixtures/jstor/%s\n(cd extension && bun test test/adapters.test.ts)\n```\n\nThen run the full extension tests, typecheck and both builds. Reload the development extension and confirm its new browser session ID. Use a fresh isolated acquisition with imports disabled; record Open actions, sign-ins and other interventions separately. Require download, adoption and validation, then inspect the PDF first page and page count. A passing fixture is not live acceptance.\n", rel, rel, rel, fixtureName, fixtureName)
 

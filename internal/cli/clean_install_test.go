@@ -5,6 +5,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,6 +26,39 @@ import (
 
 type cleanInstallResolver struct{ calls int }
 
+func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == pdf.WorkerArgument {
+		if err := pdf.WorkerMain(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	// A fixture that forgets to inject registration must fail before any OS
+	// registry operation. Individual native-host tests record the calls instead.
+	registerNativeManifest = func(browserTarget, string) error {
+		return errors.New("test must inject native-host registration")
+	}
+	deregisterNativeManifest = func(browserTarget) error {
+		return errors.New("test must inject native-host deregistration")
+	}
+	os.Exit(m.Run())
+}
+
+// The clean-install doctor uses this test image as its worker. Prove that the
+// image speaks the actual worker protocol, rather than merely being executable.
+func TestCLIWorkerEntryPoint(t *testing.T) {
+	worker, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := pdf.ValidateStructural(context.Background(), worker,
+		filepath.Join(t.TempDir(), "absent.pdf"), pdf.StructuralOptions{Timeout: 5 * time.Second, MaxPages: 1})
+	if err != nil || report != (pdf.StructuralReport{Reason: "open PDF failed"}) {
+		t.Fatalf("worker probe = %+v, %v; want exact missing-PDF rejection", report, err)
+	}
+}
+
 func (r *cleanInstallResolver) Name() string { return "clean-install-stub" }
 
 func (r *cleanInstallResolver) Resolve(context.Context, work.Work) ([]resolver.Candidate, error) {
@@ -37,9 +72,8 @@ func (r *cleanInstallResolver) Resolve(context.Context, work.Work) ([]resolver.C
 // bootstrap is open, with a resolver that deliberately returns no candidates.
 func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 	ctx := context.Background()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg-config"))
+	home := cliPrivateTestDir(t)
+	isolateCLIProfile(t, home)
 	configPath := filepath.Join(home, ".config", "papio", "config.toml")
 	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
 		t.Fatalf("fresh profile config stat = %v, want not exist", err)
@@ -47,6 +81,7 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 
 	var doctorReport doctor.Report
 	deps := initDependencies{
+		LoadConfig: isolatedInitConfigLoader(t, home),
 		Bootstrap: func(ctx context.Context, cfg config.Config) (io.Closer, error) {
 			return bootstrap.New(ctx, cfg)
 		},
@@ -82,7 +117,7 @@ func TestCleanInstallBootstrapsAndAcceptsWork(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	opt := &options{out: &out, errOut: &errOut}
+	opt := &options{configPath: configPath, out: &out, errOut: &errOut}
 	command := newInitCommandWithDependencies(opt, deps)
 	command.SetOut(&out)
 	command.SetErr(&errOut)

@@ -14,8 +14,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,6 +34,34 @@ func writeAdoptionProbeFile(t *testing.T, path string, body []byte) {
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func adoptionTestSymlink(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := os.Symlink(oldname, newname); err != nil {
+		// ERROR_PRIVILEGE_NOT_HELD: ordinary Windows accounts need Developer
+		// Mode or a granted symlink privilege. Other failures remain failures.
+		if runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(1314)) {
+			t.Skipf("Windows symlink privilege is unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+}
+
+func adoptionTestFileInfo(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// File.Stat captures Windows file identity from the open handle. os.Stat
+	// can instead defer that lookup until SameFile, after a name was replaced.
+	info, statErr := f.Stat()
+	closeErr := f.Close()
+	if statErr != nil || closeErr != nil {
+		t.Fatalf("capture file identity: stat=%v close=%v", statErr, closeErr)
+	}
+	return info
 }
 
 // A real, one-page PDF with an uncompressed text stream, large enough for the
@@ -269,27 +299,28 @@ func TestAdoptionProbeHeaderAndConfinement(t *testing.T) {
 		})
 	}
 	writeAdoptionProbeFile(t, filepath.Join(dir, "actual"), []byte("%PDF-1.4\n"))
-	if err := os.Symlink("actual", filepath.Join(dir, "link.pdf")); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"link.pdf", "../actual", "missing.pdf", ".", filepath.Join(dir, "actual")} {
+	for _, name := range []string{"../actual", "missing.pdf", ".", filepath.Join(dir, "actual")} {
 		if probeAdoptionPDF(dir, name) {
 			t.Fatalf("accepted non-confined/nonregular file %q", name)
 		}
 	}
+	t.Run("symlink", func(t *testing.T) {
+		adoptionTestSymlink(t, "actual", filepath.Join(dir, "link.pdf"))
+		if probeAdoptionPDF(dir, "link.pdf") {
+			t.Fatal("accepted symlink")
+		}
+	})
 }
 
 func TestAdoptionProbeDefersFilesChangingDuringRead(t *testing.T) {
-	for _, mode := range []string{"grow", "rewrite", "replace", "symlink", "remove", "read error", "short read"} {
+	for _, mode := range []string{"grow", "rewrite", "replace", "replace after unlink", "symlink", "remove", "read error", "short read"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "paper.pdf")
 			body := []byte("%PDF-1.4\nfixture")
 			writeAdoptionProbeFile(t, path, body)
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			info := adoptionTestFileInfo(t, path)
+			var replacementBlocked bool
 			read := func(r io.Reader, p []byte) (int, error) {
 				n, err := io.ReadFull(r, p)
 				switch mode {
@@ -303,7 +334,7 @@ func TestAdoptionProbeDefersFilesChangingDuringRead(t *testing.T) {
 					if err := os.Chtimes(path, info.ModTime().Add(time.Second), info.ModTime().Add(time.Second)); err != nil {
 						t.Fatal(err)
 					}
-				case "replace", "symlink":
+				case "replace", "replace after unlink", "symlink":
 					replacement := filepath.Join(dir, "replacement")
 					writeAdoptionProbeFile(t, replacement, body)
 					if err := os.Chtimes(replacement, info.ModTime(), info.ModTime()); err != nil {
@@ -311,14 +342,46 @@ func TestAdoptionProbeDefersFilesChangingDuringRead(t *testing.T) {
 					}
 					if mode == "replace" {
 						if err := os.Rename(replacement, path); err != nil {
-							t.Fatal(err)
+							// Windows may refuse replacing an open destination.
+							// Prove OS refusal left the source intact; this is not
+							// evidence of the software detecting replacement.
+							if runtime.GOOS != "windows" ||
+								(!errors.Is(err, syscall.Errno(5)) && !errors.Is(err, syscall.Errno(32))) {
+								t.Fatal(err)
+							}
+							replacementBlocked = true
+							current := adoptionTestFileInfo(t, path)
+							got, readErr := os.ReadFile(path)
+							if readErr != nil || !os.SameFile(info, current) || !bytes.Equal(got, body) {
+								t.Fatalf("blocked replacement altered original: %v", readErr)
+							}
+							t.Logf("Windows refused replacement of the open file: %v", err)
 						}
 					} else {
-						if err := os.Remove(path); err != nil {
+						// Root.Remove uses Windows' POSIX unlink semantics where
+						// available, freeing the name while the old descriptor
+						// stays open. DeleteFile alone can leave it delete-pending.
+						root, err := os.OpenRoot(dir)
+						if err != nil {
 							t.Fatal(err)
 						}
-						if err := os.Symlink("replacement", path); err != nil {
+						removeErr := root.Remove(filepath.Base(path))
+						_ = root.Close()
+						if removeErr != nil {
+							t.Fatal(removeErr)
+						}
+						if _, err := os.Lstat(path); !os.IsNotExist(err) {
+							t.Fatalf("replacement fixture did not free source name: %v", err)
+						}
+						if mode == "symlink" {
+							adoptionTestSymlink(t, "replacement", path)
+						} else if err := os.Rename(replacement, path); err != nil {
 							t.Fatal(err)
+						}
+					}
+					if mode != "symlink" && !replacementBlocked {
+						if os.SameFile(info, adoptionTestFileInfo(t, path)) {
+							t.Fatal("replacement fixture did not change file identity")
 						}
 					}
 				case "remove":
@@ -332,8 +395,18 @@ func TestAdoptionProbeDefersFilesChangingDuringRead(t *testing.T) {
 				}
 				return n, err
 			}
-			if probeAdoptionPDFWithRead(dir, "paper.pdf", read) {
-				t.Fatal("changing/unreadable file passed probe")
+			if got := probeAdoptionPDFWithRead(dir, "paper.pdf", read); got != replacementBlocked {
+				t.Fatalf("probe=%v, Windows blocked replacement=%v", got, replacementBlocked)
+			}
+			if replacementBlocked {
+				// The same replacement must succeed after the probe closes its
+				// descriptor; otherwise this could be an unrelated ACL failure.
+				if err := os.Rename(filepath.Join(dir, "replacement"), path); err != nil {
+					t.Fatalf("replacement still failed after the probe closed: %v", err)
+				}
+				if os.SameFile(info, adoptionTestFileInfo(t, path)) {
+					t.Fatal("closed-file replacement did not change identity")
+				}
 			}
 			if mode == "symlink" {
 				if err := os.Remove(path); err != nil {

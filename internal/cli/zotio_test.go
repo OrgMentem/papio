@@ -4,11 +4,12 @@ package cli
 import (
 	"bytes"
 	"context"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"papio/internal/api"
 	"papio/internal/config"
@@ -29,16 +30,15 @@ func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	listener, err := net.Listen("unix", filepath.Join(dataDir, "papio.sock"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	socket := filepath.Join(dataDir, "papio.sock")
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &ipc.Server{Handler: ipc.HandlerFunc(func(_ context.Context, request ipc.Request) ([]byte, *ipc.RPCError) {
+	var handled atomic.Bool
+	server := &ipc.Server{SocketPath: socket, Handler: ipc.HandlerFunc(func(_ context.Context, request ipc.Request) ([]byte, *ipc.RPCError) {
 		switch request.Method {
 		case "ping":
 			return []byte(`{"status":"ok","version":"` + api.Version + `","extension_connected":false,"extension_version":""}`), nil
 		case "zotio.apply":
+			handled.Store(true)
 			return nil, &ipc.RPCError{
 				Code:    "internal",
 				Message: "operation failed",
@@ -52,19 +52,31 @@ func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
 		}
 	})}
 	done := make(chan error, 1)
-	go func() { done <- server.ServeListener(ctx, listener) }()
+	go func() { done <- server.Serve(ctx) }()
 	t.Cleanup(func() {
 		cancel()
-		_ = listener.Close()
-		if err := <-done; err != nil {
-			t.Errorf("serve test socket: %v", err)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve test socket: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("test socket did not stop after cancellation")
 		}
 	})
+	waitCtx, waitCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer waitCancel()
+	if err := ipc.WaitForSocket(waitCtx, socket, time.Millisecond); err != nil {
+		t.Fatalf("test socket did not become ready: %v", err)
+	}
 
 	var stdout, stderr bytes.Buffer
 	root := NewRoot(&stdout, &stderr)
 	root.SetArgs([]string{"--config", configPath, "zotio", "apply", "zplan_deadbeef", "--confirm-sha256", "sha256:test"})
 	err = root.Execute()
+	if !handled.Load() {
+		t.Fatalf("zotio.apply did not reach the test daemon: %v", err)
+	}
 	if err == nil {
 		t.Fatal("zotio apply unexpectedly succeeded")
 	}

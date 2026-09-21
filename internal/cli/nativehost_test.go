@@ -4,10 +4,13 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -25,12 +28,46 @@ func runCLI(t *testing.T, args ...string) (string, string, error) {
 	return stdout.String(), stderr.String(), err
 }
 
-// writeTestConfig writes a config.toml under a temp PAPIO_CONFIG_DIR and returns
-// the config dir and the resolved current-executable path (post EvalSymlinks).
-func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (string, string) {
+type nativeRegistrationCall struct{ browser, path string }
+
+type nativeRegistrationFixture struct {
+	installed []nativeRegistrationCall
+	removed   []string
+}
+
+// writeTestConfig isolates the profile and records registration calls instead
+// of writing Windows HKCU. Manifest and host publication still run normally.
+func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (string, string, *nativeRegistrationFixture) {
 	t.Helper()
-	configDir := t.TempDir()
-	t.Setenv("PAPIO_CONFIG_DIR", configDir)
+	home := t.TempDir()
+	isolateCLIProfile(t, home)
+	registration := &nativeRegistrationFixture{}
+	previousRegister, previousDeregister := registerNativeManifest, deregisterNativeManifest
+	t.Cleanup(func() {
+		registerNativeManifest, deregisterNativeManifest = previousRegister, previousDeregister
+	})
+	registerNativeManifest = func(target browserTarget, path string) error {
+		// Registration must receive the just-published manifest for this host,
+		// never a guessed/default path or a partially written file.
+		if path != filepath.Join(target.dir, nativeHostManifestName+".json") {
+			t.Fatalf("registration path = %q, target directory = %q", path, target.dir)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest nativeHostManifest
+		if err := json.Unmarshal(body, &manifest); err != nil || manifest.Path != nativehost.ExecPath() {
+			t.Fatalf("registration received incomplete/wrong manifest: %+v, %v", manifest, err)
+		}
+		registration.installed = append(registration.installed, nativeRegistrationCall{target.id, path})
+		return nil
+	}
+	deregisterNativeManifest = func(target browserTarget) error {
+		registration.removed = append(registration.removed, target.id)
+		return nil
+	}
+	configDir := config.Dir()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
 	cfg.Browser.ExtensionID = extensionID
@@ -44,13 +81,13 @@ func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (stri
 	if err != nil {
 		t.Fatalf("executable: %v", err)
 	}
-	return configDir, exe
+	return configDir, exe, registration
 }
 
 func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 	extID := strings.Repeat("a", 32) // valid 32-char a-p extension ID
 	const firefoxID = "papio@orgmentem.com"
-	_, exe := writeTestConfig(t, extID, firefoxID)
+	_, exe, registration := writeTestConfig(t, extID, firefoxID)
 	manifestDir := t.TempDir()
 	firefoxManifestDir := t.TempDir()
 
@@ -61,6 +98,10 @@ func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 
 	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
 	firefoxManifestPath := filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")
+	wantRegistration := []nativeRegistrationCall{{"chrome", manifestPath}, {"firefox", firefoxManifestPath}}
+	if !slices.Equal(registration.installed, wantRegistration) {
+		t.Fatalf("registration calls = %v, want %v", registration.installed, wantRegistration)
+	}
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		t.Fatalf("read Chrome manifest: %v", err)
@@ -113,24 +154,46 @@ func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 		t.Fatalf("Firefox allowed_extensions = %v, want [%s]", firefoxManifest.AllowedExtensions, firefoxID)
 	}
 
-	// Manifest files are 0644.
+	// Manifest files are regular, public metadata. Windows permissions are
+	// inherited ACLs; 0644 is the Unix-specific publication contract.
 	for _, path := range []string{manifestPath, firefoxManifestPath} {
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Mode().Perm() != 0o644 {
+		if !info.Mode().IsRegular() {
+			t.Fatalf("manifest is not regular: %v", info.Mode())
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o644 {
 			t.Fatalf("manifest mode = %v, want 0644", info.Mode().Perm())
 		}
 	}
 
-	// Symlink points at the resolved test binary.
-	target, err := os.Readlink(symlinkPath)
-	if err != nil {
-		t.Fatalf("readlink: %v", err)
+	// Unix installs a symlink. Windows installs a complete executable copy
+	// and records its original path so daemon autostart resolves separately.
+	target, exists := nativehost.ExecTarget()
+	if !exists || target != exe {
+		t.Fatalf("host target = %q, exists=%v; want %q", target, exists, exe)
 	}
-	if target != exe {
-		t.Fatalf("symlink target = %q, want %q", target, exe)
+	if runtime.GOOS == "windows" {
+		digest := func(path string) [32]byte {
+			t.Helper()
+			f, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			h := sha256.New()
+			if _, err := io.Copy(h, f); err != nil {
+				t.Fatal(err)
+			}
+			return [32]byte(h.Sum(nil))
+		}
+		if digest(symlinkPath) != digest(exe) {
+			t.Fatal("installed host differs from the original executable")
+		}
+	} else if linked, err := os.Readlink(symlinkPath); err != nil || linked != exe {
+		t.Fatalf("host symlink = %q, %v; want %q", linked, err, exe)
 	}
 
 	// A second install is idempotent: no error, same manifests.
@@ -148,12 +211,15 @@ func TestNativeHostInstallWritesBrowserManifestsAndSymlink(t *testing.T) {
 	if !bytes.Equal(data, data2) || !bytes.Equal(firefoxData, firefoxData2) {
 		t.Fatal("manifest changed on re-install")
 	}
+	if !slices.Equal(registration.installed, append(wantRegistration, wantRegistration...)) {
+		t.Fatalf("reinstallation registration calls = %v", registration.installed)
+	}
 }
 
 func TestNativeHostStatusAndUninstall(t *testing.T) {
 	extID := strings.Repeat("b", 32)
 	const firefoxID = "papio@orgmentem.com"
-	writeTestConfig(t, extID, firefoxID)
+	_, _, registration := writeTestConfig(t, extID, firefoxID)
 	manifestDir := t.TempDir()
 	firefoxManifestDir := t.TempDir()
 	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
@@ -214,11 +280,15 @@ func TestNativeHostStatusAndUninstall(t *testing.T) {
 	if gone["target_exists"] != false {
 		t.Fatalf("post-uninstall target_exists = %v", gone["target_exists"])
 	}
+	if !slices.Equal(registration.installed, []nativeRegistrationCall{{"chrome", manifestPath}, {"firefox", firefoxManifestPath}}) ||
+		!slices.Equal(registration.removed, []string{"chrome", "firefox", "chrome", "firefox"}) {
+		t.Fatalf("registration lifecycle = %+v", registration)
+	}
 }
 
 func TestNativeHostInstallWithoutFirefoxWritesChromeOnly(t *testing.T) {
 	extID := strings.Repeat("c", 32)
-	writeTestConfig(t, extID, "")
+	_, _, registration := writeTestConfig(t, extID, "")
 	manifestDir := t.TempDir()
 	firefoxManifestDir := t.TempDir()
 
@@ -239,10 +309,13 @@ func TestNativeHostInstallWithoutFirefoxWritesChromeOnly(t *testing.T) {
 	if result["firefox_manifest_path"] != "" {
 		t.Fatalf("firefox_manifest_path = %v, want empty", result["firefox_manifest_path"])
 	}
+	if !slices.Equal(registration.installed, []nativeRegistrationCall{{"chrome", filepath.Join(manifestDir, nativeHostManifestName+".json")}}) {
+		t.Fatalf("Chrome-only registration = %+v", registration)
+	}
 }
 
 func TestNativeHostInstallRequiresExtensionID(t *testing.T) {
-	writeTestConfig(t, "", "papio@orgmentem.com") // no Chrome extension_id
+	_, _, registration := writeTestConfig(t, "", "papio@orgmentem.com") // no Chrome extension_id
 	manifestDir := t.TempDir()
 	firefoxManifestDir := t.TempDir()
 
@@ -259,6 +332,9 @@ func TestNativeHostInstallRequiresExtensionID(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")); !os.IsNotExist(statErr) {
 		t.Fatalf("Firefox manifest written despite missing Chrome extension_id: %v", statErr)
+	}
+	if len(registration.installed) != 0 || len(registration.removed) != 0 {
+		t.Fatalf("invalid setup changed registration: %+v", registration)
 	}
 }
 
@@ -278,11 +354,11 @@ func statusJSON(t *testing.T, manifestDir, firefoxManifestDir string) map[string
 func TestNativeHostInstallMultipleChromiumIDs(t *testing.T) {
 	const primary = "abcdefghijklmnopabcdefghijklmnop"
 	const secondary = "ponmlkjihgfedcbaponmlkjihgfedcba"
-	configDir := t.TempDir()
-	t.Setenv("PAPIO_CONFIG_DIR", configDir)
-	cfg := config.Default()
-	cfg.AccessMode = config.ModeDelegated
-	cfg.Browser.ExtensionID = primary
+	writeTestConfig(t, primary, "")
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg.Browser.ExtensionIDs = []string{secondary}
 	if err := config.Save(cfg, ""); err != nil {
 		t.Fatalf("save config: %v", err)

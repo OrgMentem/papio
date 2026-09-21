@@ -38,6 +38,7 @@ type initNativeInstaller func(config.Config) error
 type initDoctorRunner func(context.Context, *options) (doctor.Report, error)
 
 type initDependencies struct {
+	LoadConfig    func(string) (config.Config, bool, error)
 	Bootstrap     initBootstrapper
 	CheckZotio    initZotioChecker
 	InstallNative initNativeInstaller
@@ -168,7 +169,11 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	if path == "" {
 		path = filepath.Join(config.Dir(), "config.toml")
 	}
-	cfg, exists, err := initConfig(path)
+	loadConfig := deps.LoadConfig
+	if loadConfig == nil {
+		loadConfig = initConfig
+	}
+	cfg, exists, err := loadConfig(path)
 	if err != nil {
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}

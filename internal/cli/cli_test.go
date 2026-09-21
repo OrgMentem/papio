@@ -430,8 +430,25 @@ func TestNewWorksOnlyFiltersOwnedResultsWithoutRefetching(t *testing.T) {
 	}
 }
 
+// Windows test initialization replaces these with private-parent ACL setup
+// and inherited ACL assertions. Unix keeps its actual mode-bit contract.
+var cliPrivateTestDir = func(t *testing.T) string { return t.TempDir() }
+
+var assertCLIConfigPermissions = func(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config mode = %v", info.Mode().Perm())
+	}
+}
+
 func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
+	home := cliPrivateTestDir(t)
+	isolateCLIProfile(t, home)
+	path := filepath.Join(home, "config", "config.toml")
 	var stdout, stderr bytes.Buffer
 	root := NewRoot(&stdout, &stderr)
 	root.SetArgs([]string{"--config", path, "--json", "config", "init", "--access-mode", "delegated", "--email", "reader@example.test"})
@@ -445,13 +462,7 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 	if output["access_mode"] != "delegated" || output["config_path"] != path {
 		t.Fatalf("output = %v", output)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("config mode = %v", info.Mode().Perm())
-	}
+	assertCLIConfigPermissions(t, path)
 	cfg, err := config.Load(path)
 	if err != nil || cfg.AccessMode != config.ModeDelegated || cfg.Email != "reader@example.test" {
 		t.Fatalf("loaded config = %+v, %v", cfg, err)
