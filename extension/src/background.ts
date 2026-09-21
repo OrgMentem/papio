@@ -1723,6 +1723,28 @@ interface AgentJobState {
   agent_fallback_pending_until?: number;
 }
 
+/** Fixed local gate names only; never include page data in a skip diagnostic. */
+type AgentFallbackSkipReason =
+  | "backend_feature_missing" | "drive_features_missing" | "authority_unavailable"
+  | "drive_unavailable" | "tab_unavailable" | "job_state_ineligible"
+  | "attempt_terminal" | "download_pending" | "expected_doi_missing"
+  | "generic_epoch_missing" | "native_adoption_unavailable" | "attempt_consumed";
+
+const AGENT_FALLBACK_SKIP_DETAIL: Record<AgentFallbackSkipReason, string> = {
+  backend_feature_missing: "Article agent unavailable: reconnect to a daemon with Jev enabled.",
+  drive_features_missing: "Article agent unavailable: reconnect to a daemon with browser-drive support.",
+  authority_unavailable: "Article agent skipped: this browser lacks authority for the attempt.",
+  drive_unavailable: "Article agent skipped: no active browser drive owns this attempt.",
+  tab_unavailable: "Article agent skipped: this attempt has no bound browser tab.",
+  job_state_ineligible: "Article agent skipped: this job is not awaiting article acquisition.",
+  attempt_terminal: "Article agent skipped: this browser attempt is already terminal.",
+  download_pending: "Article agent skipped: a download is already pending for this job.",
+  expected_doi_missing: "Article agent skipped: this attempt has no DOI.",
+  generic_epoch_missing: "Article agent skipped: the daemon has not authorized a fresh browser attempt.",
+  native_adoption_unavailable: "Article agent unavailable: this Firefox connection cannot adopt native downloads.",
+  attempt_consumed: "Article agent skipped: this attempt already used its fallback; operator review is required.",
+};
+
 /** Generic state is intentionally carried on the persisted job object so the
  * attempt bound survives an MV3 worker restart without widening the wire. */
 interface GenericJobState {
@@ -19064,14 +19086,16 @@ export class Bridge {
       const currentJob = findByJob(this.store, job.job_id);
       if (currentJob === undefined) return;
       const captured = await this.recordUnknown(currentJob, host);
-      if (((!missingAdapterAfterAuth || this.agentFallbackAvailable()) && await this.runGenericOnSettledUnknown(currentJob)) ||
-        this.startAgentFallback(findByJob(this.store, job.job_id) ?? currentJob)) return;
+      if ((!missingAdapterAfterAuth || this.agentFallbackAvailable()) && await this.runGenericOnSettledUnknown(currentJob)) return;
+      const agentStart = this.startAgentFallback(findByJob(this.store, job.job_id) ?? currentJob);
+      if (agentStart === true) return;
       const outcomeKey = `${job.job_id}:ui_changed`;
       if (!this.handoffOutcomeSent.has(outcomeKey)) {
         this.handoffOutcomeSent.add(outcomeKey);
         const evidence = this.genericEvidence.get(job.job_id) ?? [];
         const detail =
           "No source-controlled adapter matched this provider page." +
+          ` ${AGENT_FALLBACK_SKIP_DETAIL[agentStart]}` +
           (captured
             ? " A sanitized diagnostic was saved locally for adapter development."
             : "") +
@@ -19823,20 +19847,25 @@ export class Bridge {
     }
   }
 
-  /** Reserve locally before returning to the inbound FIFO. The daemon reply
-   * must be able to run on that FIFO while this loop waits for it. */
-  private startAgentFallback(job: ActiveJob): boolean {
+  /** True means started or already running; otherwise return a fixed skip reason.
+   * Reserve locally before returning to the inbound FIFO, which must remain
+   * available for the daemon reply while this loop waits for it. */
+  private startAgentFallback(job: ActiveJob): true | AgentFallbackSkipReason {
     if (this.agentLoops.has(job.job_id)) return true;
+    const availability = this.agentFallbackAvailability();
+    if (availability !== true) return availability;
     const epoch = job.generic_drive_epoch;
-    if (!this.agentFallbackAvailable() || !this.hasDelegatedAuthority(job) ||
-      !this.handoffDrives.has(job.job_id) || job.tab_id < 0 ||
-      (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") ||
-      job.generic_terminal === true || job.download_initiated === true ||
-      this.downloads.has(job.job_id) || !job.expected?.doi ||
-      epoch?.strategy !== "generic" || !epoch.revision ||
-      (this.isFirefox() && !(this.store.daemonFeatures ?? []).includes(NATIVE_CLICK_ADOPTION_FEATURE))) return false;
+    if (!this.hasDelegatedAuthority(job)) return "authority_unavailable";
+    if (!this.handoffDrives.has(job.job_id)) return "drive_unavailable";
+    if (job.tab_id < 0) return "tab_unavailable";
+    if (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") return "job_state_ineligible";
+    if (job.generic_terminal === true) return "attempt_terminal";
+    if (job.download_initiated === true || this.downloads.has(job.job_id)) return "download_pending";
+    if (!job.expected?.doi) return "expected_doi_missing";
+    if (epoch?.strategy !== "generic" || !epoch.revision) return "generic_epoch_missing";
+    if (this.isFirefox() && !(this.store.daemonFeatures ?? []).includes(NATIVE_CLICK_ADOPTION_FEATURE)) return "native_adoption_unavailable";
     const key = this.genericEpochKey(job.job_id, epoch);
-    if ((job as ActiveJob & AgentJobState).agent_fallback_attempt === key) return false;
+    if ((job as ActiveJob & AgentJobState).agent_fallback_attempt === key) return "attempt_consumed";
     const token = {};
     this.agentLoops.set(job.job_id, token);
     void this.runAgentFallback(job, epoch, key, token).catch(() => {
@@ -19849,10 +19878,15 @@ export class Bridge {
   }
 
   private agentFallbackAvailable(): boolean {
+    return this.agentFallbackAvailability() === true;
+  }
+
+  private agentFallbackAvailability(): true | AgentFallbackSkipReason {
     const features = this.store.daemonFeatures ?? [];
-    return this.hasCurrentHello() && this.holderRole() &&
-      features.includes("agent_fallback_v1") &&
-      features.includes(PROVIDER_DRIVE_EPOCH_FEATURE) && features.includes(EFFECT_PERMIT_FEATURE);
+    if (!this.hasCurrentHello() || !this.holderRole()) return "authority_unavailable";
+    if (!features.includes("agent_fallback_v1")) return "backend_feature_missing";
+    if (!features.includes(PROVIDER_DRIVE_EPOCH_FEATURE) || !features.includes(EFFECT_PERMIT_FEATURE)) return "drive_features_missing";
+    return true;
   }
 
   private async runAgentFallback(job: ActiveJob, epoch: ProviderDriveEpoch, key: string, token: object): Promise<void> {
@@ -21382,16 +21416,17 @@ export class Bridge {
           (diagnostic) => { captureDiagnostic = diagnostic; });
         if (!settled) return;
         const current = findByJob(this.store, jobID);
-        if (
-          current !== undefined &&
-          (await this.runGenericOnSettledUnknown(current) || this.startAgentFallback(findByJob(this.store, jobID) ?? current))
-        )
-          return;
+        let agentSkipDetail = "";
+        if (current !== undefined) {
+          if (await this.runGenericOnSettledUnknown(current)) return;
+          const agentStart = this.startAgentFallback(findByJob(this.store, jobID) ?? current);
+          if (agentStart === true) return;
+          agentSkipDetail = AGENT_FALLBACK_SKIP_DETAIL[agentStart];
+        }
         const evidence = this.genericEvidence.get(jobID) ?? [];
         const detail = captureOutcomeDetail(
-          evidence.length === 0
-            ? undefined
-            : `Generic evidence: ${evidence.join(", ")}.`, captureDiagnostic);
+          [agentSkipDetail, ...(evidence.length === 0 ? [] : [`Generic evidence: ${evidence.join(", ")}.`])]
+            .filter(Boolean).join(" "), captureDiagnostic);
         const outcomeKey = `${jobID}:ui_changed`;
         if (!this.handoffOutcomeSent.has(outcomeKey)) {
           this.handoffOutcomeSent.add(outcomeKey);

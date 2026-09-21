@@ -6024,6 +6024,7 @@ for (const { label, host, specs } of [
         outcome: "ui_changed",
         detail:
           "No source-controlled adapter matched this provider page. " +
+          "Article agent unavailable: reconnect to a daemon with Jev enabled. " +
           "A sanitized diagnostic was saved locally for adapter development.",
         // Name the page. Without this the daemon records a drift it cannot
         // attribute: its only other source is a prior page capture, and this is
@@ -6032,6 +6033,8 @@ for (const { label, host, specs } of [
         // adapter_version and host all empty on the durable latch.
         host,
       });
+      // The daemon retains 200 bytes: preserve both the agent skip and capture evidence.
+      expect(new TextEncoder().encode(outcomes[0]!.payload.detail as string).length).toBeLessThanOrEqual(200);
       expect(outcomes[0]?.payload.adapter_id).toBeUndefined();
       // A coverage gap neither proves authentication nor authorizes a PDF effect.
       expect(h.frames().some(frame => frame.type === "auth_returned")).toBe(false);
@@ -6854,7 +6857,10 @@ for (const firstSent of [false, true]) {
     const outcomes = h.frames().filter(frame => frame.type === "provider_outcome");
     expect(outcomes).toHaveLength(1);
     const detail = outcomes[0]!.payload.detail as string;
-    expect(detail).toStartWith("Generic evidence: e0:citation-title=present");
+    expect(detail).toStartWith(
+      "Article agent unavailable: reconnect to a daemon with Jev enabled. " +
+      "Generic evidence: e0:citation-title=present",
+    );
     expect(detail).toContain(`Automatic capture latest attempt: ${firstSent ? "shape_limit" : "daily_limit"}`);
     expect(detail).toEndWith(`quota retry-after=${firstSent ? 3595 : 86395}s.`);
     expect(new TextEncoder().encode(detail).length).toBeLessThanOrEqual(200);

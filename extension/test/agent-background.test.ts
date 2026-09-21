@@ -5,7 +5,7 @@ import { Bridge, MIN_DAEMON_VERSION, type BridgeDeps, type DownloadItemLike, typ
 import { agentDOM, type AgentDOMRequest } from "../src/agent-dom";
 import { nativeDownloadDocumentCurrent, NATIVE_CLICK_ADOPTION_FEATURE } from "../src/native-download";
 import { AGENT_NAVIGATION_FEATURE, parseBrowserMessage, type BrowserMessage } from "../src/protocol";
-import { planGeneric } from "../src/plan";
+import { planExecution, planGeneric } from "../src/plan";
 import { emptyStore, patchJob, migrateManagedState, type ActiveJob, type StoreShape } from "../src/state";
 import { FakeDownloads } from "./fake-downloads";
 import { ChromeTabsFake, FakeEmitter, FakeWebNavigation } from "./fake-tabs";
@@ -33,7 +33,7 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 
-async function harness(options: { features?: string[]; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape } = {}) {
+async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape } = {}) {
   const win = new Window({ url, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
   win.document.write(`<meta name="citation_doi" content="${doi}"><meta name="citation_title" content="Example article"><main><h1>Example article</h1><button type="button">Formats</button></main><header><input type="search" value="PRIVATEQUERY"></header>`);
   Object.assign(win.HTMLElement.prototype, { getClientRects: () => [{ width: 10, height: 10 }] });
@@ -61,9 +61,14 @@ async function harness(options: { features?: string[]; firefox?: boolean; ignore
     webNavigation: new FakeWebNavigation(),
     firefox: options.firefox ?? false,
     connectNative: () => port, manifestVersion: "0.1.0", randomUUID: () => crypto.randomUUID(), now: () => now,
-    setTimeout: (fn, ms) => timers.push({ fn, ms }), backend, tabs, downloads, adapterSpecs: [],
+    setTimeout: (fn, ms) => timers.push({ fn, ms }), backend, tabs, downloads,
+    adapterSpecs: options.knownAdapter ? [{ id: "test-unknown", version: "1", hosts: ["unregistered.example"], classify: [] }] : [],
     scripting: { executeScript: async injection => {
       if (injection.func === planGeneric) { genericPlans++; return [{ result: { evidence: [], candidates: [] } }]; }
+      if (injection.func === planExecution) {
+        const [, spec, expected, policy] = injection.args as Parameters<typeof planExecution>;
+        return [{ result: planExecution(win.document as unknown as Document, spec, expected, policy) }];
+      }
       if (injection.func === nativeDownloadDocumentCurrent) return [{ result: nativeDownloadDocumentCurrent(...injection.args as [string, string]) }];
       if (injection.func !== agentDOM) return [];
       const request = injection.args![0] as AgentDOMRequest;
@@ -268,6 +273,48 @@ for (const mode of ["old", "firefox", "permission"] as const) test(`fallback doe
   await h.classify(); await flush();
   expect(h.frames.some(frame => frame.type === "agent_decide_request_v1" || frame.type === "provider_drive_epoch_start_request")).toBe(false);
   expect(h.counts().actions).toBe(0);
+});
+
+for (const knownAdapter of [false, true]) for (const [reason, message] of [
+  ["backend_feature_missing", "Article agent unavailable: reconnect to a daemon with Jev enabled."],
+  ["generic_epoch_missing", "Article agent skipped: the daemon has not authorized a fresh browser attempt."],
+  ["expected_doi_missing", "Article agent skipped: this attempt has no DOI."],
+  ["authority_unavailable", "Article agent skipped: this browser lacks authority for the attempt."],
+] as const) test(`${knownAdapter ? "known unknown" : "no-adapter"} reports safe fallback skip: ${reason}`, async () => {
+  const h = await harness({ knownAdapter,
+    ...(reason === "backend_feature_missing" ? { features: features.filter(feature => feature !== "agent_fallback_v1") } : {}),
+  });
+  if (reason === "generic_epoch_missing") await h.update(s => ({ ...s, activeJobs: s.activeJobs.map(job => {
+    const current = { ...job }; delete current.generic_drive_epoch; return current;
+  }) }));
+  if (reason === "expected_doi_missing") await h.update(s => patchJob(s, jobID, { expected: { title: "PRIVATEEXPECTED" } }));
+  if (reason === "authority_unavailable") await h.update(s => patchJob(s, jobID, { access_mode: "assisted" }));
+  await h.classify(); await flush();
+  const outcomes = h.frames.filter(frame => frame.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]!.payload["outcome"]).toBe("ui_changed");
+  const detail = String(outcomes[0]!.payload["detail"]);
+  expect(detail).toContain(message);
+  // The daemon retains only 200 bytes of provider detail.
+  expect(new TextDecoder().decode(new TextEncoder().encode(detail).slice(0, 200))).toContain(message);
+  expect(detail).not.toContain("PRIVATE"); expect(detail).not.toContain(url); expect(detail).not.toContain(doi);
+  expect(h.counts().genericPlans).toBe(1);
+  expect(h.frames.some(frame => frame.type === "provider_drive_epoch_start_request" || frame.type === "agent_decide_request_v1")).toBe(false);
+  expect(h.counts().observations).toBe(0); expect(h.counts().actions).toBe(0);
+  expect(h.downloads.started).toHaveLength(0);
+});
+
+for (const knownAdapter of [false, true]) test(`${knownAdapter ? "known unknown" : "no-adapter"} keeps an already-running agent instead of parking`, async () => {
+  const h = await harness({ knownAdapter });
+  await h.classify(); await h.started();
+  await h.request("agent_decide_request_v1");
+  // A repeated classification while the daemon decision is pending must not
+  // turn the active loop into a refused start or emit an unknown outcome.
+  await h.classify(); await flush();
+  expect(h.frames.filter(frame => frame.type === "provider_drive_epoch_start_request")).toHaveLength(1);
+  expect(h.frames.filter(frame => frame.type === "agent_decide_request_v1")).toHaveLength(1);
+  expect(h.frames.some(frame => frame.type === "provider_outcome")).toBe(false);
+  await h.decide("decision", "BLOCKED"); await h.settle();
 });
 
 for (const outcome of ["unavailable", "exhausted", "stale"] as const) test(`${outcome} returns a specific operator detail and settles the epoch`, async () => {

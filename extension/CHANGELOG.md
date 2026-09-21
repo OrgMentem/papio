@@ -18,6 +18,10 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Skipped article-agent fallback now explains why.** Unknown provider pages
+  report missing backend support, article identity or browser authority, and
+  distinguish attempts that already ran or have a download pending.
+
 - **Article-agent fallback can follow a same-origin article link.** With a
   compatible daemon, a selected link can open another document in the same tab.
   Papio verifies its DOI and transfers the existing download reservation before
