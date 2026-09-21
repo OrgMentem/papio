@@ -112,7 +112,7 @@ func TestDownloadCompleteAfterSweepIsIdempotent(t *testing.T) {
 // observation exists. Accepting the artifact is not authority to attach the
 // late frame's producer or delivery metadata.
 func TestDownloadCompleteAfterUncorrelatedSweepDoesNotDeferAdoption(t *testing.T) {
-	for _, mode := range []string{"context_after", "long_filename", "context_before", "diagnostic_retry", "restart"} {
+	for _, mode := range []string{"context_after", "long_filename", "context_before", "diagnostic_retry", "restart", "sanitized"} {
 		t.Run(mode, func(t *testing.T) {
 			filename := "paper.pdf"
 			if mode == "long_filename" {
@@ -146,21 +146,30 @@ func TestDownloadCompleteAfterUncorrelatedSweepDoesNotDeferAdoption(t *testing.T
 			path := filepath.Join(cfg.EffectiveAdoptionRoot(), id, filename)
 			body := adoptionProbePDF(handoffWork().DOI)
 			writeAdoptionProbeFile(t, path, body)
+			sourceSHA, err := fileDigest(path)
+			if err != nil {
+				t.Fatal(err)
+			}
 			validationCalls := 0
 			b.svc.Validate = func(ctx context.Context, path, mime string, expected work.Work) (pdf.ValidationReport, error) {
 				validationCalls++
 				return adoptionProbeValidate(ctx, path, mime, expected)
 			}
+			wantValidations := 1
+			if mode == "sanitized" {
+				enableAdoptionSanitization(t, b)
+				wantValidations = 2
+			}
 			if err := b.SweepAdoptions(ctx); err != nil {
 				t.Fatal(err)
 			}
 			before, err := jobs.Get(ctx, id)
-			if err != nil || before.State != job.StateReady || validationCalls != 1 {
+			if err != nil || before.State != job.StateReady || validationCalls != wantValidations {
 				t.Fatalf("sweep: row=%+v validations=%d err=%v", before, validationCalls, err)
 			}
 			assertUncorrelated := func() {
 				t.Helper()
-				producer, err := jobs.ArtifactProducerForArtifact(ctx, id, filename, before.ArtifactSHA256)
+				producer, err := jobs.ArtifactProducerForArtifact(ctx, id, filename, sourceSHA)
 				if err != nil || producer != nil {
 					t.Fatalf("sweep/late frame invented producer correlation: %+v %v", producer, err)
 				}
@@ -237,7 +246,7 @@ func TestDownloadCompleteAfterUncorrelatedSweepDoesNotDeferAdoption(t *testing.T
 			}
 			assertUncorrelated()
 			after, err := jobs.Get(ctx, id)
-			if err != nil || !reflect.DeepEqual(before, after) || validationCalls != 1 {
+			if err != nil || !reflect.DeepEqual(before, after) || validationCalls != wantValidations {
 				t.Fatalf("late frames changed ready job: %+v validations=%d err=%v", after, validationCalls, err)
 			}
 			candidate, err := jobs.GetCandidate(ctx, before.SelectedCandidateID)
@@ -355,8 +364,13 @@ func TestDownloadCompleteAfterSweepRefusesUnprovenArtifact(t *testing.T) {
 }
 
 func TestDownloadCompleteReadyProducerRequiresPriorExactEvidence(t *testing.T) {
-	for _, mode := range []string{"exact", "recovered", "uncorrelated", "mismatch", "ambiguous", "forged_filename", "forged_digest"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, name := range []string{
+		"exact", "recovered", "uncorrelated", "mismatch", "ambiguous", "forged_filename", "forged_digest",
+		"sanitized_exact", "sanitized_recovered", "sanitized_uncorrelated", "sanitized_mismatch",
+		"sanitized_ambiguous", "sanitized_forged_filename", "sanitized_forged_digest",
+	} {
+		t.Run(name, func(t *testing.T) {
+			mode := strings.TrimPrefix(name, "sanitized_")
 			b, jobs, cfg, _ := newBridge(t)
 			ctx := context.Background()
 			effectPermitHolder(t, b)
@@ -403,6 +417,9 @@ func TestDownloadCompleteReadyProducerRequiresPriorExactEvidence(t *testing.T) {
 			}
 			// Publish without bridge settlement: the crash/interleaving window
 			// after validation commits but before the exact permit is released.
+			if strings.HasPrefix(name, "sanitized_") {
+				enableAdoptionSanitization(t, b)
+			}
 			candidateID, err := b.svc.AdoptDownloadCandidate(ctx, id, path)
 			if err != nil {
 				t.Fatal(err)

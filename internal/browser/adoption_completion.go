@@ -30,7 +30,7 @@ func (b *Bridge) completedAdoption(ctx context.Context, jobID, filename string, 
 	if row.State != job.StateReady {
 		return 0, nil
 	}
-	if fence.digest == "" || row.ArtifactSHA256 != fence.digest {
+	if fence.digest == "" {
 		return 0, fmt.Errorf("completed browser download does not match ready artifact for job %s", jobID)
 	}
 	candidate, err := b.jobs.GetCandidate(ctx, row.SelectedCandidateID)
@@ -41,7 +41,26 @@ func (b *Bridge) completedAdoption(ctx context.Context, jobID, filename string, 
 		candidate.Status != job.CandidateAccepted || candidate.URLKey != "browser-adopt:sha256:"+fence.digest {
 		return 0, fmt.Errorf("ready artifact has no matching accepted browser candidate for job %s", jobID)
 	}
-	if err := b.svc.Artifacts.Verify(fence.digest); err != nil {
+	if row.ArtifactSHA256 != fence.digest {
+		// Sanitization keeps the candidate keyed to the confined source bytes,
+		// but publishes a different artifact. Only this accepted candidate's
+		// recorded rewrite can connect the two; a late frame supplies no such
+		// authority. Producer recovery below must still use the source digest.
+		var sanitized bool
+		err := b.jobs.S.DB().QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM events WHERE job_id = ? AND kind = 'job.pdf_sanitized'
+			AND json_extract(detail_json, '$.candidate_id') = ?
+			AND json_extract(detail_json, '$.source_sha256') = ?
+			AND json_extract(detail_json, '$.adopted_sha256') = ?
+		)`, jobID, candidate.ID, fence.digest, row.ArtifactSHA256).Scan(&sanitized)
+		if err != nil {
+			return 0, err
+		}
+		if !sanitized {
+			return 0, fmt.Errorf("completed browser download does not match ready artifact for job %s", jobID)
+		}
+	}
+	if err := b.svc.Artifacts.Verify(row.ArtifactSHA256); err != nil {
 		return 0, err
 	}
 	// A late frame cannot mint its own filename+SHA authority. Recover before

@@ -332,6 +332,12 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Late browser receipts recognize PDFs that Papio sanitized before storing.**
+  The daemon verifies the downloaded source, accepted candidate, recorded
+  sanitization and stored artifact before pairing delivery details. Removing
+  embedded content no longer causes a successfully acquired paper to be reported
+  as an unmatched download. Unrelated files and missing producer evidence remain
+  refused.
 - **Publisher retries no longer prevent the daemon from restarting.**
   Retiring an open-access attempt now records that attempt's original safety
   domain. Startup also reads older retry histories correctly while retaining
