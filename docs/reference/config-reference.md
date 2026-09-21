@@ -146,6 +146,9 @@ in the same tab, verify the destination DOI and continue under the original
 attempt. Firefox transfers its unused reservation without resetting its expiry
 or download-directory baseline. Unexpected redirects, new tabs and native PDF
 viewer saving still require assistance.
+An HTML PDF wrapper can be followed when it exposes one matching file. This is
+distinct from saving a document already loaded in the native PDF viewer; signed
+viewer URLs are not replayed to simulate that capability.
 The daemon and decision contract are shared across operating systems.
 It allows up to 60 decisions in ten minutes per drive permit and 30 seconds per
 model call. Failures consume their call reservation; retries do not reset the

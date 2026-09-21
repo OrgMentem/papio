@@ -20,6 +20,8 @@ daemon, it can also follow an observed same-origin link in the same tab and
 continue after verifying the destination's DOI. It stops on an unexpected
 redirect or human gate. New tabs, cross-origin navigation, publisher search and
 native PDF viewer saving remain future work.
+An HTML wrapper that exposes one matching PDF is supported; this does not save
+bytes already held inside the browser's native PDF viewer.
 Chrome uses filename steering. Firefox uses a matching original article referrer
 and an observed file in the configured download directory, with the daemon's
 `native_click_adoption_v1` capability. Missing or ambiguous download provenance
@@ -30,8 +32,12 @@ IOS Press PDF after one explicit Open and one Jev decision. The test deliberatel
 omitted the packaged adapter. It proves that fallback mechanism, not a success
 rate across publishers. A separate Windows Firefox run acquired and validated a
 17-page eLife paper with no adapter, after one explicit Open and one Jev decision.
-These are assisted starts followed by automatic acquisition. The new menu and
-article-navigation changes still need live provider validation.
+These are assisted starts followed by automatic acquisition. A normal-profile
+Chrome run also acquired and validated a ten-page IEEE PDF through one Jev
+decision and an HTML wrapper, 49.2 seconds after fresh submission. That attempt
+needed no Open, publisher retry or manual PDF control; institutional sign-in
+had been completed earlier. These individual results do not establish general
+navigation or menu reliability.
 
 Every adapter below ships with a captured fixture under
 `extension/fixtures/<adapter-id>/` (see
@@ -58,7 +64,7 @@ invoke.
 | Provider | Route observed | Adapter | Status | Last verified | Notes |
 | --- | --- | --- | --- | --- | --- |
 | ACM Digital Library | PDF/eReader toolbar control (`a.btn--eReader`) gates a derived `/doi/pdf/<doi>?download=true` endpoint | `acm` | Verified working | 2026-07-23 | The bottom-of-page `a#downloadPdfUrl` anchor is not an entitlement signal — ACM renders it even on paywalled "Get Access" pages — so the adapter keys on the eReader control instead; the downloads API was confirmed returning `%PDF` bytes through the session cookie jar. |
-| Annual Reviews | Empty PDF POST form, downloaded through the browser API after checking the Open Access marker and full-text container | `annualreviews` | Verified working | 2026-09-20 | A fresh isolated Chrome job stayed queued during 81 seconds unattended. One explicit Open reached a ProQuest no-results page; `actions retry-publisher` then recovered the same job through its DOI and reached `ready` with the correct 21-page PDF. The original failure and latch remain in its history. No PDF control was clicked, no sign-in was performed, and pop-ups stayed blocked. This proves operator-requested publisher recovery; the institutional route still fails. |
+| Annual Reviews | Empty PDF POST form, downloaded through the browser API after checking the Open Access marker and full-text container | `annualreviews` | Verified working | 2026-09-21 | A fresh normal-profile Chrome job again reached a ProQuest no-results page through the institutional route. Explicit publisher retry reached `ready` in 13.1 seconds with the correct 21-page PDF; first page and page count were checked. No Jev call or manual PDF control was needed. Earlier sign-in and the retry are separate interventions. This confirms publisher recovery after the earlier isolated proof; the institutional route still fails. |
 | APA PsycNet | Stable `#pdf` anchor renders once the full article has loaded; denied records show a "Get Access" control instead | `psycnet` | Verified route | 2026-07-20 | Verified live in a fresh browser against a public full-text article and a denied record; `doi.apa.org` DOI landings route into the same application. |
 | BMJ Journals | `citation_access=all` plus a rendered `article-pdf-download` anchor gates the file | `bmj` | Verified route | 2026-07-20 | Restricted to explicit `citation_access=all` pages — closed articles stay assisted even when they publish PDF-shaped citation metadata. |
 | Cambridge Core | Action-bar `buttonSavePDFOptions` control plus a rendered `aop-cambridge-core/content/view` anchor | `cambridge` | Verified route | 2026-07-20 | Denied pages still publish `citation_pdf_url`, so the adapter requires the rendered PDF action instead; scoped to journals, not Cambridge's separate books PDF service. |
