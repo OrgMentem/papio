@@ -18,6 +18,9 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Chrome keepalive survives its initial blank page loading.** Papio records
+  its newly created tab while `about:blank` is pending, then opens the institution
+  and schedules refreshes. A tab navigating elsewhere is still refused.
 - **The popup no longer mistakes a hidden institution row for successful sign-in.**
   If a waiting paper cannot be mapped to an institution, Papio reports that
   sign-in is unconfirmed and keeps the paper's Open action available. The

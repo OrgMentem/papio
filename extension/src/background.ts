@@ -1045,6 +1045,7 @@ export interface TabInfo {
   cookieStoreId?: string | undefined;
   id?: number | undefined;
   url?: string | undefined;
+  pendingUrl?: string | undefined;
   status?: string | undefined;
   /** Page title when available; used only for local IdP failure-page
    * heuristics and never sent over the bridge. */
@@ -6353,7 +6354,14 @@ export class Bridge {
     // The caller just created this blank tab. Persist birth BEFORE any
     // resolver/IdP navigation, so a crash cannot orphan a sign-in surface.
     const tab = await this.deps.tabs.get(tabID);
-    if (tab.id !== tabID || tab.url !== "about:blank") return false;
+    // Chrome can return an empty committed URL while its newly created blank
+    // is still loading. Only that exact pending blank counts; a navigation
+    // away, even from a committed blank, must not acquire ownership.
+    const pendingBlank = tab.pendingUrl === "about:blank";
+    const committedBlank = tab.url === "about:blank";
+    if (tab.id !== tabID ||
+        (tab.pendingUrl !== undefined && !pendingBlank) ||
+        (!committedBlank && !(tab.url === "" && pendingBlank))) return false;
     const documentID = await this.liveDocumentEpoch(tabID);
     try {
       return await this.runTabLedgerTransaction((ledger) => {

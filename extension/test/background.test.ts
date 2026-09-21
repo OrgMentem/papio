@@ -306,6 +306,55 @@ test("owned keepalive off and resolver changes retire only ledgered owners, incl
   expect(ledger.current()).toEqual({});
 });
 
+test("owned keepalive records a fresh pending blank before navigation and refreshes that owner", async () => {
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const create = h.tabs.create.bind(h.tabs);
+  h.tabs.create = async (properties) => {
+    const tab = await create(properties);
+    h.tabs.patch(tab.id!, { url: "", pendingUrl: "about:blank", status: "loading" });
+    h.webNavigation.clearFrame(tab.id!);
+    return h.tabs.get(tab.id!);
+  };
+  const update = h.tabs.update.bind(h.tabs);
+  h.tabs.update = async (id, properties) => {
+    if (properties.url !== undefined) {
+      expect(ledger.current()[String(id)]).toMatchObject({ purpose: "keepalive" });
+      h.tabs.patch(id, { pendingUrl: undefined });
+    }
+    return update(id, properties);
+  };
+  const owner = ownedKeepalive(h, { "keepalive.mode": "always" });
+  await owner.manager.init();
+  const id = h.tabs.list()[0]!.id!;
+  expect(h.tabs.navigations).toEqual([{ tabID: id, url: "https://resolver.example.edu" }]);
+  expect(h.tabs.removed).toEqual([]);
+  expect(Object.keys(ledger.current())).toEqual([String(id)]);
+  const reload = [...owner.timers.values()].find((timer) => timer.ms > 60_000);
+  expect(reload).toBeDefined();
+  await reload!.fn();
+  expect(h.tabs.reloaded).toEqual([id]);
+  expect(h.tabs.created).toHaveLength(1);
+});
+
+for (const tab of [
+  { url: "", pendingUrl: "https://elsewhere.example/" },
+  { url: "https://elsewhere.example/", pendingUrl: "about:blank" },
+  { url: "about:blank", pendingUrl: "https://elsewhere.example/" },
+  { url: "", pendingUrl: undefined },
+]) {
+  test(`owned keepalive refuses a changed or unproven initial blank ${JSON.stringify(tab)}`, async () => {
+    const h = makeHarness();
+    const ledger = installManagedTabLedger(h, {});
+    await h.bridge.start();
+    h.tabs.seed({ id: 777, ...tab });
+    expect(await h.bridge.keepaliveOwnership().record(777, "https://resolver.example.edu", Date.now())).toBe(false);
+    expect(ledger.current()).toEqual({});
+    expect(h.tabs.navigations).toEqual([]);
+  });
+}
+
 test("owned keepalive writes birth before navigation and fails closed when its durable write fails", async () => {
   const h = makeHarness();
   installManagedTabLedger(h, {});
