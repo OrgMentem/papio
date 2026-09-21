@@ -332,6 +332,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Late browser receipts no longer report a failed adoption for an acquired PDF.**
+  If a directory sweep validates the file before its producer receipt arrives,
+  Papio records the missing delivery provenance separately. It keeps the accepted
+  PDF and refuses to invent the missing producer binding from a late receipt.
 - **Publisher retries now receive fresh browser drive authority.** Retrying a
   consumed route through a materialized candidate no longer reuses its old
   attempt, which stopped the article agent before it could inspect the page.

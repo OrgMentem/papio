@@ -3350,6 +3350,10 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			b.pendingDownloads[key] = current
 		}
 		switch {
+		case errors.Is(err, errDeliveryProvenanceUnconfirmed):
+			if evErr := b.finishUnconfirmedDelivery(ctx, key, p.Filename); evErr != nil {
+				log.Printf("papio: recording unconfirmed browser delivery provenance: %v", evErr)
+			}
 		case errors.Is(err, errArtifactSuperseded):
 			// Another materialization already won this attempt. Retrying would
 			// re-deliver bytes that must never be attached, so the pending
@@ -6471,8 +6475,18 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 	if err := b.jobs.S.AppendEvent(ctx, jobID, "browser.delivery_context", detail); err != nil {
 		return err
 	}
-	b.deliveryContexts[key] = pendingDeliveryContext{Payload: *payload, ReceivedAt: b.now()}
 	pending, ok := b.pendingDownloads[key]
+	if !ok {
+		unconfirmed, err := b.deliveryProvenanceUnconfirmed(ctx, key)
+		if err != nil {
+			return err
+		}
+		if unconfirmed {
+			delete(b.deliveryContexts, key)
+			return nil
+		}
+	}
+	b.deliveryContexts[key] = pendingDeliveryContext{Payload: *payload, ReceivedAt: b.now()}
 	if !ok {
 		return nil
 	}
@@ -6501,6 +6515,9 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 	if current, ok := b.pendingDownloads[key]; ok {
 		current.Adopting = false
 		b.pendingDownloads[key] = current
+	}
+	if errors.Is(err, errDeliveryProvenanceUnconfirmed) {
+		return b.finishUnconfirmedDelivery(ctx, key, pending.Filename)
 	}
 	if err != nil {
 		_ = b.recordAdoptionDeferred(ctx, jobID, pending.Filename, err)

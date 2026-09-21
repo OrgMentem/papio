@@ -4,11 +4,18 @@ package browser
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 
 	"papio/internal/app"
 	"papio/internal/job"
+	"papio/internal/store"
 )
+
+var errDeliveryProvenanceUnconfirmed = errors.New("artifact already stored; browser delivery provenance is unconfirmed")
+
+const deliveryProvenanceUnconfirmedEvent = "browser.delivery_provenance_unconfirmed"
 
 // completedAdoption recovers only a ready job's accepted browser candidate for
 // the exact confined bytes weighed by ingestAdoptedFile. A sweep may have
@@ -44,6 +51,13 @@ func (b *Bridge) completedAdoption(ctx context.Context, jobID, filename string, 
 	if err != nil {
 		return 0, err
 	}
+	if supplied != nil && producer == nil {
+		// A sweep can publish before any filename+SHA producer observation
+		// exists. The artifact is complete, but this frame cannot authorize
+		// provenance or producer settlement. Report that distinction without
+		// minting correlation from the late frame.
+		return 0, errDeliveryProvenanceUnconfirmed
+	}
 	if supplied != nil && !artifactProducersMatch(supplied, producer) {
 		return 0, fmt.Errorf("completed browser download has no matching durable producer for job %s", jobID)
 	}
@@ -63,4 +77,43 @@ func (b *Bridge) completedAdoption(ctx context.Context, jobID, filename string, 
 		}
 	}
 	return candidate.ID, nil
+}
+
+// deliveryProvenanceUnconfirmed recognizes an observed completion disposition,
+// not artifact/producer authority. Its durable key prevents a late context from
+// rebuilding pending metadata after the completion was consumed or a restart.
+func (b *Bridge) deliveryProvenanceUnconfirmed(ctx context.Context, key browserDownloadKey) (bool, error) {
+	var found bool
+	err := b.jobs.S.DB().QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM events WHERE job_id = ? AND kind = ?
+		AND json_extract(detail_json, '$.download_id') = ?
+	)`, key.JobID, deliveryProvenanceUnconfirmedEvent, key.DownloadID).Scan(&found)
+	return found, err
+}
+
+// finishUnconfirmedDelivery records the diagnostic once before dropping pending
+// metadata. Call with b.mu held. A storage failure leaves the metadata retryable;
+// neither this diagnostic nor a replay can settle a producer or bind a candidate.
+func (b *Bridge) finishUnconfirmedDelivery(ctx context.Context, key browserDownloadKey, filename string) error {
+	detail, err := json.Marshal(map[string]any{
+		"download_id": key.DownloadID,
+		"filename":    filename,
+		"reason":      errDeliveryProvenanceUnconfirmed.Error(),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = b.jobs.S.DB().ExecContext(ctx, `
+		INSERT INTO events (job_id, at, kind, detail_json)
+		SELECT ?, ?, ?, ? WHERE NOT EXISTS (
+			SELECT 1 FROM events WHERE job_id = ? AND kind = ?
+			AND json_extract(detail_json, '$.download_id') = ?
+		)`, key.JobID, store.Now(), deliveryProvenanceUnconfirmedEvent, string(detail),
+		key.JobID, deliveryProvenanceUnconfirmedEvent, key.DownloadID)
+	if err != nil {
+		return err
+	}
+	delete(b.pendingDownloads, key)
+	delete(b.deliveryContexts, key)
+	return nil
 }
