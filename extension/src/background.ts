@@ -193,6 +193,7 @@ import {
 import type {
   FreshSessionEvidence,
   KeepaliveManager,
+  KeepaliveOwnership,
   KeepaliveOriginSnapshot,
   KeepaliveSnapshot,
 } from "./keepalive";
@@ -4663,11 +4664,13 @@ export class Bridge {
   }
   private async saveTabLedger(
     ledger: Record<string, SurfaceBirthRecord>,
+    required = false,
   ): Promise<void> {
     const snapshot = { ...ledger };
     try {
       await this.deps.tabLedger?.save(snapshot);
     } catch {
+      if (required) throw new Error("keepalive birth ledger unavailable");
       // Best-effort durability: a failed write only degrades future cleanup.
     }
   }
@@ -4684,6 +4687,7 @@ export class Bridge {
       ledger: Record<string, SurfaceBirthRecord>,
     ) =>
       Promise<{ value: T; changed: boolean }> | { value: T; changed: boolean },
+    required = false,
   ): Promise<T> {
     const operation = this.tabLedgerChain.then(async () => {
       let cached = this.tabLedgerCache;
@@ -4692,6 +4696,7 @@ export class Bridge {
         try {
           raw = (await this.deps.tabLedger?.load()) ?? {};
         } catch {
+          if (required) throw new Error("keepalive birth ledger unavailable");
           raw = {};
         }
         const migrated = await migrateTabLedger(
@@ -4702,13 +4707,13 @@ export class Bridge {
         cached = migrated.ledger;
         this.legacyLedgerReview = migrated.review;
         this.tabLedgerCache = { ...cached };
-        await this.saveTabLedger(this.tabLedgerCache);
+        await this.saveTabLedger(this.tabLedgerCache, required);
       }
 
       const ledger = { ...cached };
       const result = await transaction(ledger);
+      if (result.changed) await this.saveTabLedger(ledger, required);
       this.tabLedgerCache = { ...ledger };
-      if (result.changed) await this.saveTabLedger(this.tabLedgerCache);
       return result.value;
     });
     this.tabLedgerChain = operation.then(
@@ -4717,14 +4722,14 @@ export class Bridge {
     );
     return operation;
   }
-  private async snapshotTabLedger(): Promise<
+  private async snapshotTabLedger(required = false): Promise<
     Record<string, SurfaceBirthRecord>
   > {
     if (this.deps.tabLedger === undefined) return {};
     return this.runTabLedgerTransaction((ledger) => ({
       value: { ...ledger },
       changed: false,
-    }));
+    }), required);
   }
 
   /** Record a broker tab papio CREATED as a URL-free birth certificate
@@ -4914,6 +4919,7 @@ export class Bridge {
         }
         if (tracked.has(tabID)) continue;
         const entry = ledger[key];
+        if (entry?.purpose === "keepalive") continue; // Its manager owns pause/reload/teardown.
         if (entry === undefined) {
           delete ledger[key];
           changed = true;
@@ -5354,6 +5360,9 @@ export class Bridge {
       .slice(0, RESTART_LIVENESS_SCAN_LIMIT);
     for (const record of candidates) {
       try {
+        if (record.purpose === "keepalive" &&
+            (record.keepalive?.document_id === undefined ||
+             record.keepalive.document_id !== await this.liveDocumentEpoch(record.tab_hint))) continue;
         const tab = await this.deps.tabs.get(record.tab_hint);
         if (tab.id === record.tab_hint) return true;
       } catch {
@@ -5374,6 +5383,9 @@ export class Bridge {
     const record = ledger[String(tabID)];
     if (record === undefined || record.browser_epoch !== this.browserEpoch)
       return undefined;
+    if (record.purpose === "keepalive" && this.restartClass !== "worker" &&
+        (record.keepalive?.document_id === undefined ||
+         record.keepalive.document_id !== await this.liveDocumentEpoch(tabID))) return undefined;
     try {
       const tab = await this.deps.tabs.get(tabID);
       return tab.id === tabID ? tab : undefined;
@@ -6274,6 +6286,111 @@ export class Bridge {
     await this.ready;
     if ((await this.handoffSurface()) !== "tab-group") return;
     await this.foldIntoHandoffGroup(tabID);
+  }
+
+  /** Keepalive uses the same birth ledger as every other owned surface.
+   * Elapsed time never revokes ownership of a still-live same-epoch tab. */
+  keepaliveOwnership(): KeepaliveOwnership {
+    return {
+      recover: (origin) => this.recoverKeepalive(origin),
+      record: (tabID, origin, reloadAt) => this.recordKeepalive(tabID, origin, reloadAt),
+      update: (tabID, paused, reloadAt, leftOrigin) => this.updateKeepalive(tabID, paused, reloadAt, leftOrigin),
+      forget: (tabID) => this.forgetKeepalive(tabID),
+    };
+  }
+
+  private async recoverKeepalive(origin?: string): ReturnType<KeepaliveOwnership["recover"]> {
+    await this.ready;
+    await this.surfaceReady;
+    if (this.deps.epoch === undefined || this.browserEpoch === undefined ||
+        await this.deps.epoch.getSession().catch(() => undefined) !== this.browserEpoch) {
+      throw new Error("browser epoch unavailable");
+    }
+    const digest = origin === undefined ? undefined : await originDigestOf(origin);
+    if (origin !== undefined && digest === undefined) throw new Error("resolver digest unavailable");
+    const ledger = await this.snapshotTabLedger(true);
+    let recovered: Awaited<ReturnType<KeepaliveOwnership["recover"]>>;
+    for (const [key, record] of Object.entries(ledger)) {
+      if (record.purpose !== "keepalive") continue;
+      const id = record.tab_hint;
+      let owned = this.deps.epoch !== undefined && this.browserEpoch !== undefined &&
+        record.browser_epoch === this.browserEpoch && String(id) === key &&
+        Number.isInteger(id) && id >= 0 &&
+        !record.ceded && !record.legacy && !record.content && !record.pending_close;
+      if (owned && this.restartClass !== "worker") {
+        // A reload can erase session storage. Recycled IDs cannot prove a
+        // browser epoch; this record's own document must still be alive.
+        owned = record.keepalive?.document_id !== undefined &&
+          record.keepalive.document_id === await this.liveDocumentEpoch(id);
+      }
+      if (owned) {
+        try { owned = (await this.deps.tabs.get(id)).id === id; }
+        catch (error) {
+          if (!isTabAbsenceRejection(error)) throw error;
+          owned = false;
+        }
+      }
+      if (owned && digest !== undefined && record.origin_digest === digest && recovered === undefined) {
+        recovered = { tabID: id, paused: record.keepalive!.paused, leftOrigin: record.keepalive!.left_origin, reloadAt: record.keepalive!.reload_at };
+        await this.updateKeepalive(id, recovered.paused);
+        continue;
+      }
+      // Off/origin change closes only proven owners. Stale/reused
+      // hints lose their record without touching whatever now has that ID.
+      if (owned) await this.deps.tabs.remove(id);
+      await this.forgetKeepalive(id);
+    }
+    return recovered;
+  }
+
+  private async recordKeepalive(tabID: number, origin: string, reloadAt: number): Promise<boolean> {
+    await this.ready;
+    await this.surfaceReady;
+    if (this.deps.tabLedger === undefined || this.deps.epoch === undefined || this.browserEpoch === undefined) return false;
+    if (await this.deps.epoch.getSession().catch(() => undefined) !== this.browserEpoch) return false;
+    const digest = await originDigestOf(origin);
+    if (digest === undefined) return false;
+    // The caller just created this blank tab. Persist birth BEFORE any
+    // resolver/IdP navigation, so a crash cannot orphan a sign-in surface.
+    const tab = await this.deps.tabs.get(tabID);
+    if (tab.id !== tabID || tab.url !== "about:blank") return false;
+    const documentID = await this.liveDocumentEpoch(tabID);
+    try {
+      return await this.runTabLedgerTransaction((ledger) => {
+        if (ledger[String(tabID)] !== undefined) return { value: false, changed: false };
+        ledger[String(tabID)] = {
+          binding_id: this.deps.randomUUID(), tab_hint: tabID, purpose: "keepalive",
+          browser_epoch: this.browserEpoch!, extension_generation: this.deps.manifestVersion,
+          created_at: this.deps.now(), origin_digest: digest,
+          keepalive: { paused: false, left_origin: false, reload_at: reloadAt,
+            ...(documentID === undefined ? {} : { document_id: documentID }) },
+        };
+        return { value: true, changed: true };
+      }, true);
+    } catch { return false; }
+  }
+
+  private async updateKeepalive(tabID: number, paused: boolean, reloadAt?: number, leftOrigin?: boolean): Promise<void> {
+    const documentID = await this.liveDocumentEpoch(tabID);
+    await this.runTabLedgerTransaction((ledger) => {
+      const record = ledger[String(tabID)];
+      if (record?.purpose !== "keepalive" || record.keepalive === undefined ||
+          record.browser_epoch !== this.browserEpoch || record.ceded) return { value: undefined, changed: false };
+      ledger[String(tabID)] = { ...record, keepalive: {
+        paused, left_origin: leftOrigin ?? record.keepalive.left_origin,
+        reload_at: reloadAt ?? record.keepalive.reload_at,
+        ...(documentID === undefined ? {} : { document_id: documentID }),
+      } };
+      return { value: undefined, changed: true };
+    });
+  }
+
+  private async forgetKeepalive(tabID: number): Promise<void> {
+    await this.runTabLedgerTransaction((ledger) => {
+      if (ledger[String(tabID)]?.purpose !== "keepalive") return { value: undefined, changed: false };
+      delete ledger[String(tabID)];
+      return { value: undefined, changed: true };
+    });
   }
 
   /** Create the tab inside the dedicated work window, keeping a directly
@@ -21587,6 +21704,7 @@ export class Bridge {
     const record = ledger[String(tabID)];
     if (
       record === undefined ||
+      record.purpose === "keepalive" || // Focusing its sign-in surface does not cede it.
       record.ceded === true ||
       record.browser_epoch !== this.browserEpoch
     )
@@ -24544,6 +24662,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id) {
   // manager.init() without awaiting it, so hydration continues concurrently
   // with the bridge's own async startup below — neither blocks the other.
   const keepaliveManager = initKeepalive(chromeKeepaliveAPI(chrome), {
+    ownership: bridge.keepaliveOwnership(),
     trackedJobCount: () => bridge.trackedJobCount(),
     warmDemand: () => bridge.warmDemand(),
     latestOpenURL: () => bridge.latestOpenURL(),

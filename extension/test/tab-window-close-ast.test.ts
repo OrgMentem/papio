@@ -135,6 +135,13 @@ const KEEPALIVE_ALLOWLIST = new Map<string, { count: number; why: string }>([
     { count: 1, why: "The sole lifecycle close primitive; its synchronous four-predicate gate is the invariant boundary." },
   ],
   [
+    "background.ts:recoverKeepalive",
+    {
+      count: 1,
+      why: "The keepalive manager retires only a live, current-epoch keepalive birth record when disabled, superseded, or duplicated. Reload recovery also requires that record's exact document ID; stale hints are forgotten without closing their tabs.",
+    },
+  ],
+  [
     "background.ts:realDeps",
     {
       count: 2,
@@ -155,8 +162,8 @@ const KEEPALIVE_ALLOWLIST = new Map<string, { count: number; why: string }>([
   [
     "keepalive.ts:createTabOnce",
     {
-      count: 1,
-      why: "A background resolver tab can finish creation after Off invalidates it; it was never published as owned, so closeTab cannot reach it.",
+      count: 3,
+      why: "Only the just-created tab is removed: if Off lands during creation, if its birth record cannot be saved, or if Off lands during that save. All three checks precede the first resolver navigation.",
     },
   ],
   [

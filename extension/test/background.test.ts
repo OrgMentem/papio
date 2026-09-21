@@ -130,6 +130,242 @@ test("managed tab dedupe ignores URL fragments and prioritizes a tracked tab", (
 
 const EXPIRES = "2027-01-01T00:00:00Z";
 
+/** A real manager and bridge sharing the browser and birth ledger across
+ * worker deaths. No synthetic ownership, URL-match adoption, or auth claims. */
+function ownedKeepalive(h: Harness, storage: Record<string, unknown>, origins = ["https://resolver.example.edu"]) {
+  const timers = new Map<number, { fn: () => void | Promise<void>; ms: number }>();
+  let nextTimer = 0;
+  const evidence: FreshSessionEvidence[] = [];
+  const manager = new KeepaliveManager({
+    tabs: h.tabs,
+    storage: {
+      get: async () => ({ ...storage }),
+      set: async (values) => { Object.assign(storage, values); },
+    },
+    permissions: { getAll: async () => ({ origins: ["https://resolver.example.edu/*"] }) },
+    scripting: { executeScript: async () => [{ result: [] }] },
+    timers: {
+      setTimeout: (fn, ms) => { timers.set(++nextTimer, { fn, ms }); return nextTimer; },
+      clearTimeout: (id) => { timers.delete(id as number); },
+    },
+  }, {
+    trackedJobCount: () => 1,
+    latestOpenURL: () => undefined,
+    knownResolverOrigins: () => origins,
+    configuredOriginsReady: () => true,
+    ownership: h.bridge.keepaliveOwnership(),
+    onFreshSessionEvidence: (value) => { evidence.push(value); },
+    observeMs: 10,
+    reloadSettleMs: 1,
+  });
+  h.bridge.attachKeepalive(manager);
+  return { manager, timers, evidence };
+}
+
+for (const restart of [restartWorker, simulateExtensionUpdate]) {
+  test(`owned keepalive survives ${restart.name} during Duo and reloads its exact returned tab`, async () => {
+    const h = makeHarness();
+    const ledger = installManagedTabLedger(h, {});
+    const settings = { "keepalive.mode": "always" };
+    await h.bridge.start();
+    const first = ownedKeepalive(h, settings);
+    const update = h.tabs.update.bind(h.tabs);
+    h.tabs.update = async (id, props) => {
+      if (props.url !== undefined) {
+        expect(ledger.current()[String(id)]).toMatchObject({ purpose: "keepalive" });
+      }
+      return update(id, props);
+    };
+    await first.manager.init();
+    const id = h.tabs.list()[0]!.id!;
+    expect(h.tabs.created[0]?.url).toBe("about:blank");
+    await first.manager.openReauth("https://resolver.example.edu");
+    h.webNavigation.setFrame(id, "keepalive-duo-document");
+    await h.tabs.completeNavigation(id, "https://api-example.duosecurity.com/frame/v4/auth");
+    expect(h.tabs.snapshot(id)).toMatchObject({ pinned: false, muted: false });
+    const birth = ledger.current()[String(id)] as SurfaceBirthRecord;
+    expect(JSON.stringify(birth)).not.toContain("resolver.example.edu");
+    expect(JSON.stringify(birth)).not.toContain("duosecurity");
+    const next = restart(h);
+    first.timers.clear(); // The worker died; dispose() would close its tab.
+    await next.bridge.start();
+    const second = ownedKeepalive(next, settings);
+    await second.manager.init();
+    expect(h.tabs.created).toHaveLength(1);
+    expect(second.manager.getSnapshot().pausedForReauth).toBe(true);
+    expect(second.timers.size).toBeGreaterThan(0);
+    expect((ledger.current()[String(id)] as SurfaceBirthRecord).binding_id).toBe(birth.binding_id);
+
+    h.webNavigation.setFrame(id, "keepalive-resolver-document");
+    await h.tabs.completeNavigation(id, "https://resolver.example.edu/account");
+    const recheck = [...second.timers.values()].find((timer) => timer.ms === 10);
+    expect(recheck).toBeDefined();
+    await recheck!.fn();
+    expect(second.manager.getSnapshot().pausedForReauth).toBe(false);
+    expect(second.manager.getSnapshot().authenticated).toBe(false);
+    expect(second.evidence).toEqual([]);
+    expect(h.tabs.snapshot(id)).toMatchObject({ pinned: true, muted: true });
+    // Resumption itself must arm a real reload, without a later sync call.
+    const reload = [...second.timers.values()].find((timer) => timer.ms > 60_000);
+    expect(reload).toBeDefined();
+    await reload!.fn();
+    expect(h.tabs.reloaded).toEqual([id]);
+    expect(h.tabs.created).toHaveLength(1);
+  });
+}
+
+test("owned keepalive cold startup recovers an unpinned unmuted owner after a week without an await cycle", async () => {
+  const h = makeHarness();
+  const originalNow = Date.now;
+  Date.now = () => h.clock.now;
+  try {
+  const ledger = installManagedTabLedger(h, {});
+  const settings = { "keepalive.mode": "always" };
+  const first = ownedKeepalive(h, settings);
+  await Promise.all([first.manager.init(), h.bridge.start()]);
+  const id = h.tabs.list()[0]!.id!;
+  h.tabs.patch(id, { pinned: false, muted: false, groupId: 7 });
+  const birth = ledger.current()[String(id)] as SurfaceBirthRecord;
+  h.clock.now += 7 * 24 * 60 * 60_000;
+  const next = restartWorker(h);
+  first.timers.clear();
+  const second = ownedKeepalive(next, settings);
+  await Promise.all([second.manager.init(), next.bridge.start()]);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(ledger.current()[String(id)]).toMatchObject({
+    binding_id: birth.binding_id, keepalive: { reload_at: birth.keepalive!.reload_at },
+  });
+  const reload = [...second.timers.values()].find((timer) => timer.ms === 0);
+  expect(reload).toBeDefined();
+  await reload!.fn();
+  expect(h.tabs.reloaded).toEqual([id]);
+  } finally { Date.now = originalNow; }
+});
+
+for (const scenario of ["stale epoch", "missing epochs", "reused ID", "missing document", "closed"] as const) {
+  test(`owned keepalive declines ${scenario} without touching a stale hint`, async () => {
+    const h = makeHarness();
+    const ledger = installManagedTabLedger(h, {});
+    const settings = { "keepalive.mode": "always" };
+    await h.bridge.start();
+    const first = ownedKeepalive(h, settings);
+    await first.manager.init();
+    const id = h.tabs.list()[0]!.id!;
+    if (scenario === "stale epoch") await h.deps.epoch!.setSession("different-browser");
+    if (scenario === "missing epochs") {
+      await h.deps.epoch!.setSession("");
+      await h.deps.epoch!.setLocal("");
+    }
+    if (scenario === "reused ID" || scenario === "missing document") {
+      h.sessionStorage!.clear();
+      if (scenario === "reused ID") h.webNavigation.setFrame(id, "unrelated-new-document");
+      else h.webNavigation.clearFrame(id);
+    }
+    if (scenario === "closed") h.tabs.forget(id);
+    // A matching pin/mute/group/URL still grants no ownership.
+    if (scenario !== "closed") h.tabs.patch(id, { pinned: true, muted: true, groupId: 7 });
+    const before = h.tabs.updates.length;
+    const next = restartWorker(h);
+    first.timers.clear();
+    await next.bridge.start();
+    const second = ownedKeepalive(next, settings);
+    await second.manager.init();
+    expect(h.tabs.created).toHaveLength(2);
+    expect(ledger.current()[String(id)]).toBeUndefined();
+    expect(h.tabs.removed).not.toContain(id);
+    expect(h.tabs.updates.slice(before).some((update) => update.id === id)).toBe(false);
+    expect(h.tabs.reloaded).not.toContain(id);
+  });
+}
+
+test("owned keepalive off and resolver changes retire only ledgered owners, including across restart", async () => {
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  const settings: Record<string, unknown> = { "keepalive.mode": "always" };
+  const origins = ["https://resolver.example.edu"];
+  await h.bridge.start();
+  const first = ownedKeepalive(h, settings, origins);
+  await first.manager.init();
+  const id = h.tabs.list()[0]!.id!;
+  h.tabs.seed({ id: 999, url: origins[0], pinned: true, muted: true, groupId: 7 });
+  origins[0] = "https://other-resolver.example.edu";
+  const next = restartWorker(h);
+  first.timers.clear();
+  await next.bridge.start();
+  const second = ownedKeepalive(next, settings, origins);
+  await second.manager.init();
+  expect(h.tabs.removed).toContain(id);
+  const replacement = h.tabs.list().find((tab) => tab.id !== 999)!.id!;
+  settings["keepalive.mode"] = "off";
+  const final = restartWorker(next);
+  second.timers.clear();
+  await final.bridge.start();
+  await ownedKeepalive(final, settings, origins).manager.init();
+  expect(h.tabs.removed).toContain(replacement);
+  expect(h.tabs.snapshot(999)).toBeDefined();
+  expect(ledger.current()).toEqual({});
+});
+
+test("owned keepalive writes birth before navigation and fails closed when its durable write fails", async () => {
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  h.deps.tabLedger!.save = async () => { throw new Error("storage unavailable"); };
+  const manager = ownedKeepalive(h, { "keepalive.mode": "always" });
+  await manager.manager.init();
+  expect(h.tabs.navigations).toEqual([]);
+  expect(h.tabs.list()).toEqual([]);
+});
+
+test("owned keepalive retires a failed first navigation and retries without an abandoned blank", async () => {
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  h.tabs.seed({ id: 777, url: "https://resolver.example.edu", pinned: true, muted: true });
+  const update = h.tabs.update.bind(h.tabs);
+  let rejectNavigation = true;
+  h.tabs.update = async (id, properties) => {
+    if (rejectNavigation && properties.url !== undefined) throw new Error("navigation rejected");
+    return update(id, properties);
+  };
+  const owner = ownedKeepalive(h, { "keepalive.mode": "always" });
+  await owner.manager.init();
+  expect(h.tabs.list().map((tab) => tab.id)).toEqual([777]);
+  expect(ledger.current()).toEqual({});
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.removed).toHaveLength(1);
+  rejectNavigation = false;
+  await owner.manager.sync();
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.list()).toHaveLength(2);
+  expect(h.tabs.list().some((tab) => tab.url === "about:blank")).toBe(false);
+  expect(h.tabs.snapshot(777)).toBeDefined();
+  expect(Object.keys(ledger.current())).toHaveLength(1);
+});
+
+test("owned keepalive observes return after restart while preserving qualified publisher-return rechecks", async () => {
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const first = ownedKeepalive(h, { "keepalive.mode": "always" });
+  await first.manager.init();
+  const id = h.tabs.list()[0]!.id!;
+  await h.tabs.completeNavigation(id, "https://idp.example.edu/login");
+  await first.manager.openReauth("https://resolver.example.edu");
+  expect(first.manager.getSnapshot().pausedForReauth).toBe(true);
+  await first.manager.noteInstitutionalLanding("https://resolver.example.edu", "tracked_auth_return");
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.snapshot(id)).toBeDefined();
+  expect(ledger.current()[String(id)]).toBeUndefined();
+  expect(first.evidence).toEqual([]);
+  const next = restartWorker(h);
+  first.timers.clear();
+  await next.bridge.start();
+  await ownedKeepalive(next, { "keepalive.mode": "always" }).manager.init();
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.snapshot(id)).toBeDefined();
+});
+
 // Listeners are registered as promise-returning callbacks; emit awaits them all,
 // which makes handler completion observable without any timer.
 class FakeEmitter<A extends unknown[]> {

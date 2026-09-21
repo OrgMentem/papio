@@ -18,6 +18,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Institution keepalive recovers its own sign-in tab after a worker restart.**
+  Papio records tab ownership before navigation, so unpinning or redirecting
+  through an identity provider no longer loses the tab. Returning from sign-in
+  resumes refreshes. Tabs without an ownership record remain untouched.
 - **Duo push prompts remain part of sign-in.** A prompt without a login path
   no longer becomes an unsupported-publisher failure or consumes an article-agent
   attempt. Papio waits for the authentication flow to return.

@@ -172,3 +172,25 @@ test("isSurfaceBirthRecord rejects a url-carrying record and accepts a minimal v
     isSurfaceBirthRecord({ ...minimal, pending_close: { authorization_id: "auth" } }),
   ).toBe(false);
 });
+
+test("keepalive births require complete URL-free scheduling state and a configured-origin digest", async () => {
+  const record: SurfaceBirthRecord = {
+    binding_id: "owned", tab_hint: 7, purpose: "keepalive", browser_epoch: "browser",
+    extension_generation: "test", created_at: 1, origin_digest: "a".repeat(64),
+    keepalive: { paused: true, left_origin: true, reload_at: 1, document_id: "opaque-document" },
+  };
+  expect(isSurfaceBirthRecord(record)).toBe(true);
+  for (const invalid of [
+    { ...record, keepalive: undefined },
+    { ...record, origin_digest: undefined },
+    { ...record, origin_digest: "https://resolver.example.edu" },
+    { ...record, keepalive: { ...record.keepalive, paused: "yes" } },
+    { ...record, keepalive: { ...record.keepalive, left_origin: undefined } },
+    { ...record, keepalive: { ...record.keepalive, reload_at: NaN } },
+    { ...record, keepalive: { ...record.keepalive, document_id: "" } },
+    { ...record, keepalive: { ...record.keepalive, resolver: "https://resolver.example.edu" } },
+  ]) {
+    expect(isSurfaceBirthRecord(invalid)).toBe(false);
+    expect((await migrateTabLedger({ "7": invalid }, () => "new", () => 1)).ledger).toEqual({});
+  }
+});

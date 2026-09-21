@@ -40,6 +40,16 @@ export interface SurfaceBirthRecord {
    * lowercased — never the raw URL itself. Absent when no origin was known
    * or digestible (fail closed to no-digest, never a raw fallback). */
   origin_digest?: string;
+  /** Keepalive scheduling only, never session/authentication evidence. The
+   * origin digest above identifies the configured resolver even at an IdP.
+   * An opaque live document ID can re-prove this exact tab after an extension
+   * reload clears storage.session; a numeric tab ID alone cannot. */
+  keepalive?: {
+    paused: boolean;
+    left_origin: boolean;
+    reload_at: number;
+    document_id?: string;
+  };
   /** Daemon job this surface currently serves, when known. */
   job_id?: string;
   /** Daemon-issued authentication-claim identity this surface owns, when it
@@ -132,6 +142,18 @@ export function isSurfaceBirthRecord(value: unknown): value is SurfaceBirthRecor
     return false;
   if (typeof value.created_at !== "number" || !Number.isFinite(value.created_at)) return false;
   if (value.origin_digest !== undefined && typeof value.origin_digest !== "string") return false;
+  if (value.purpose === "keepalive" &&
+      (value.keepalive === undefined || typeof value.origin_digest !== "string" ||
+       !/^[a-f0-9]{64}$/.test(value.origin_digest))) return false;
+  if (value.keepalive !== undefined) {
+    if (!isPlainRecord(value.keepalive) || value.purpose !== "keepalive") return false;
+    const state = value.keepalive;
+    if (typeof state.left_origin !== "boolean" || typeof state.paused !== "boolean") return false;
+    if (typeof state.reload_at !== "number" || !Number.isFinite(state.reload_at)) return false;
+    if (state.document_id !== undefined &&
+        (typeof state.document_id !== "string" || state.document_id.length === 0)) return false;
+    if (Object.keys(state).some((key) => !["paused", "left_origin", "reload_at", "document_id"].includes(key))) return false;
+  }
   if (value.job_id !== undefined && typeof value.job_id !== "string") return false;
   if (value.ceded !== undefined && typeof value.ceded !== "boolean") return false;
   if (value.content !== undefined && value.content !== true) return false;

@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Institutional resolver session keepalive. This is deliberately independent of
-// the bridge: callers supply only current job count and the latest OpenURL.
+// the bridge: callers supply demand, resolver identity, and tab ownership.
 
 export interface KeepaliveTab {
   id?: number | undefined;
@@ -53,7 +53,7 @@ export interface KeepaliveTabs {
   remove(tabID: number): Promise<void>;
   update(
     tabID: number,
-    properties: { active?: boolean; pinned?: boolean; muted?: boolean },
+    properties: { active?: boolean; pinned?: boolean; muted?: boolean; url?: string },
   ): Promise<KeepaliveTab>;
 }
 
@@ -168,7 +168,18 @@ export interface FreshSessionEvidence {
   source: "live_tab" | "keepalive_tab";
 }
 
+/** The bridge's existing birth ledger is the sole durable tab authority.
+ * No URL/pin/group match may mint ownership of an existing tab. */
+export interface KeepaliveOwnership {
+  /** Retire other owned keepalives; undefined retires all (mode off). */
+  recover(origin?: string): Promise<{ tabID: number; paused: boolean; leftOrigin: boolean; reloadAt: number } | undefined>;
+  record(tabID: number, origin: string, reloadAt: number): Promise<boolean>;
+  update(tabID: number, paused: boolean, reloadAt?: number, leftOrigin?: boolean): Promise<void>;
+  forget(tabID: number): Promise<void>;
+}
+
 export interface KeepaliveOptions {
+  ownership?: KeepaliveOwnership;
   /** Number of currently non-terminal handoff jobs. */
   trackedJobCount(): number;
   /** Durable daemon-side institutional work demand. */
@@ -809,6 +820,7 @@ export class KeepaliveManager {
    * intending the other. */
   private readonly spacingTimers = new Map<string, { timer: unknown; dueAt: number }>();
   private tabID: number | undefined;
+  private reauthLeftOrigin = false;
   private resolver: URL | undefined;
   private persistedResolverOrigin: string | undefined;
   private readonly originStates = new Map<string, KeepaliveOriginSnapshot>();
@@ -1033,6 +1045,7 @@ export class KeepaliveManager {
   private async reconcileConfiguredOrigins(): Promise<void> {
     await this.loadPreferences();
     this.syncOriginStates();
+    if (this.options.ownership !== undefined) await this.reconcile();
     const demanded = this.authDemandOrigins();
     for (const [origin, snapshot] of this.originStates) {
       const permission = this.hostPermissions.get(origin) ?? "unknown";
@@ -1100,10 +1113,9 @@ export class KeepaliveManager {
    * A tracked auth return remains actionable after its job leaves
    * auth_pending; an untracked landing remains demand-bound.
    *
-   * A provider landing can complete a sign-in outside papio's reauth tab. If
-   * the owned tab is still parked on an IdP, retire only its ownership and
-   * create a fresh resolver tab. The old visible tab remains open, so this
-   * recovery never destroys a sign-in surface the operator might still use. */
+   * A provider landing can complete a sign-in outside papio's reauth tab.
+   * A qualified landing can replace a paused owner with a resolver probe;
+   * replacement is deliberate, not restart recovery. */
   async noteInstitutionalLanding(
     origin: string,
     cause: "parked_demand" | "tracked_auth_return" = "parked_demand",
@@ -1172,7 +1184,7 @@ export class KeepaliveManager {
     this.clearReauthTimer();
     void this.updateOriginSnapshot(origin, { pausedForReauth: false });
     this.options.onReauthStateChanged?.(false);
-    await this.createTab("automatic");
+    await this.createTab("automatic", false);
 
     if (
       this.tabID === undefined &&
@@ -1194,6 +1206,7 @@ export class KeepaliveManager {
       return oldTabID;
     }
 
+    await this.options.ownership?.forget(oldTabID);
     return this.resolver?.origin === origin ? this.tabID : undefined;
   }
   private updateOriginSnapshot(
@@ -1380,7 +1393,7 @@ export class KeepaliveManager {
     try {
       const resolver = new URL(openURL);
       if (resolver.protocol !== "https:") return;
-      this.resolver = resolver;
+      if (this.tabID === undefined || this.resolver?.origin === resolver.origin) this.resolver = resolver;
       this.rememberResolverOrigin(resolver);
       this.syncOriginStates();
     } catch {
@@ -1973,6 +1986,9 @@ export class KeepaliveManager {
   ): "pause" | "resume" | "unchanged" {
     if (observation === undefined || !observation.owned) return "unchanged";
     if (observation.kind === "verdict" && observation.verdict === "in") return "resume";
+    // A returned resolver page with no auth evidence can be reloaded. This
+    // resumes scheduling only; the verdict/release callbacks stay unchanged.
+    if (this.reauthPaused && this.reauthLeftOrigin && observation.kind === "no_markers") return "resume";
     if (observation.kind === "auth_url" || (observation.kind === "verdict" && observation.verdict === "out")) {
       return "pause";
     }
@@ -2122,6 +2138,7 @@ export class KeepaliveManager {
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (!shouldMaintainSession || resolver === undefined) {
       await this.closeTab();
+      if (this.mode === "off" || this.configuredOriginsReady()) await this.options.ownership?.recover().catch(() => undefined);
       this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
     }
@@ -2330,19 +2347,20 @@ export class KeepaliveManager {
     if (wasPaused) this.options.onReauthStateChanged?.(false);
     try {
       await this.api.tabs.remove(tabID);
+      await this.options.ownership?.forget(tabID);
     } catch {
       // A manually closed tab is already in the desired state.
     }
   }
 
-  private async createTab(intent: TabCreationIntent): Promise<void> {
+  private async createTab(intent: TabCreationIntent, recover = true): Promise<void> {
     let rejoined = false;
     for (;;) {
       const resolver = this.resolver;
       const wantedOrigin = resolver?.protocol === "https:" ? resolver.origin : undefined;
       if (this.tabCreationInFlight === undefined) {
         this.tabCreationOrigin = wantedOrigin;
-        const attempt = this.createTabOnce(intent);
+        const attempt = this.createTabOnce(intent, recover);
         this.tabCreationInFlight = attempt.finally(() => {
           this.tabCreationInFlight = undefined;
           this.tabCreationOrigin = undefined;
@@ -2376,9 +2394,9 @@ export class KeepaliveManager {
     }
   }
 
-  private async createTabOnce(intent: TabCreationIntent): Promise<void> {
+  private async createTabOnce(intent: TabCreationIntent, recover: boolean): Promise<void> {
     // Snapshot once: callers can mutate this.resolver synchronously before
-    // calling createTab, and this method itself awaits across tabs.query()/
+    // calling createTab, and this method itself awaits across recovery and
     // tabs.create(). Reading this.resolver again after either await let a
     // racing caller's origin switch leak into an in-progress creation —
     // querying for one origin's existing tab but creating (or claiming) a
@@ -2388,32 +2406,39 @@ export class KeepaliveManager {
     // of starting its own.
     const resolver = this.resolver;
     if (resolver === undefined) return;
+    if (this.options.ownership !== undefined && !this.isConfiguredMember(resolver.origin)) return;
     try {
-      const existing = await this.api.tabs.query({
-        pinned: true,
-        muted: true,
-        url: [`${resolver.protocol}//${resolver.host}/*`],
-      });
-      const tabID = existing.find((tab) => tab.id !== undefined)?.id;
-      if (intent === "automatic" && !this.shouldMaintainSession()) return;
-      if (tabID !== undefined) {
-        this.tabID = tabID;
-        this.clearReauthPause(resolver.origin);
-        // The owned-tab cycle "just ran" the moment we take ownership of a
-        // tab, whether adopted here or freshly created below — otherwise
-        // the very first scheduleCycle(lastCycleRunAt + intervalMs()) call
-        // would compute a due time still stuck at epoch 0 and fire almost
-        // immediately instead of a full interval from now.
-        this.lastCycleRunAt = Date.now();
-        this.resetVerdict(resolver.origin);
+      const recovered = recover ? await this.options.ownership?.recover(resolver.origin) : undefined;
+      if (intent === "automatic" && !this.shouldMaintainSession()) {
+        await this.options.ownership?.recover();
+        return;
+      }
+      if (recovered !== undefined) {
+        this.tabID = recovered.tabID;
+        this.lastCycleRunAt = recovered.reloadAt;
+        this.reauthPaused = recovered.paused;
+        this.reauthLeftOrigin = recovered.leftOrigin;
+        // A redirect may have landed while this worker was absent, before
+        // pause was recorded. Inspect only this proven owner's URL.
+        const tab = await this.api.tabs.get(recovered.tabID);
+        if (tab.url === "about:blank") {
+          if (!await this.navigateNewOwner(recovered.tabID, resolver.origin)) return;
+        } else if (typeof tab.url === "string" && !resolverURLMatches(tab.url, resolver)) {
+          this.reauthPaused = true;
+          this.reauthLeftOrigin = true;
+        }
+        void this.updateOriginSnapshot(resolver.origin, { pausedForReauth: this.reauthPaused });
+        this.options.onReauthStateChanged?.(this.reauthPaused);
+        if (this.reauthPaused) this.armReauthTimer();
         return;
       }
     } catch {
-      // Querying is a best-effort restart recovery; creation below remains safe.
+      // Unknown ledger/tab liveness is not permission to create a duplicate.
+      return;
     }
     if (intent === "automatic" && !this.shouldMaintainSession()) return;
     const base = {
-      url: resolver.origin,
+      url: this.options.ownership === undefined ? resolver.origin : "about:blank",
       active: false,
       pinned: true,
       muted: true,
@@ -2441,9 +2466,22 @@ export class KeepaliveManager {
         }
         return;
       }
+      if (this.options.ownership !== undefined &&
+          !await this.options.ownership.record(tab.id, resolver.origin, Date.now())) {
+        await this.api.tabs.remove(tab.id).catch(() => {});
+        return;
+      }
+      if (intent === "automatic" && !this.shouldMaintainSession()) {
+        await this.options.ownership?.forget(tab.id);
+        await this.api.tabs.remove(tab.id).catch(() => {});
+        return;
+      }
       this.tabID = tab.id;
       this.clearReauthPause(resolver.origin);
       this.lastCycleRunAt = Date.now();
+      if (this.options.ownership !== undefined) {
+        if (!await this.navigateNewOwner(tab.id, resolver.origin)) return;
+      }
       // Opening the probe tab is not evidence of anything: the reset that
       // lived here erased restored or previously earned session state before
       // the first inspection could run. A genuinely new origin already sits
@@ -2455,12 +2493,25 @@ export class KeepaliveManager {
     }
   }
 
+  /** Birth is durable before this first navigation. A rejected navigation
+   * must not leave an owned blank that subsequent cycles only reload. */
+  private async navigateNewOwner(tabID: number, origin: string): Promise<boolean> {
+    try {
+      await this.api.tabs.update(tabID, { url: origin });
+      return true;
+    } catch {
+      if (this.tabID === tabID) await this.removeStaleTab(tabID, origin);
+      return false;
+    }
+  }
+
   private async onObserve(): Promise<void> {
     await this.loadPreferences();
     const shouldMaintainSession = this.shouldMaintainSession();
     const resolver = this.resolverFromLatestOffer() ?? this.configuredResolver();
     if (!shouldMaintainSession || resolver === undefined) {
       await this.closeTab();
+      if (this.mode === "off" || this.configuredOriginsReady()) await this.options.ownership?.recover().catch(() => undefined);
       this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
       return;
     }
@@ -2501,6 +2552,7 @@ export class KeepaliveManager {
 
     try {
       await this.api.tabs.reload(this.tabID);
+      await this.options.ownership?.update(this.tabID, false, Date.now());
     } catch {
       this.tabID = undefined;
       this.scheduleCycle(this.lastCycleRunAt + this.observeMs, () => this.onObserve());
@@ -2522,6 +2574,12 @@ export class KeepaliveManager {
     this.reauthPaused = true;
     void this.updateOriginSnapshot(origin, { pausedForReauth: true });
     const pausedTabID = this.tabID;
+    try {
+      const tab = await this.api.tabs.get(pausedTabID);
+      this.reauthLeftOrigin = typeof tab.url === "string" &&
+        !resolverURLMatches(tab.url, new URL(origin));
+    } catch { /* Closure is handled by the tab removal observer. */ }
+    await this.options.ownership?.update(pausedTabID, true, undefined, this.reauthLeftOrigin);
     try {
       await this.api.tabs.update(pausedTabID, { active: true, pinned: false, muted: false });
       // In work-window mode the tab lives in a minimized window; bring it up.
@@ -2546,27 +2604,19 @@ export class KeepaliveManager {
     this.armReauthTimer();
   }
 
-  /** Drop a reauthentication pause, in memory AND in the persisted snapshot.
-   *
-   * Taking ownership of a fresh or adopted tab must clear both. pauseForReauth
-   * unpins and unmutes the tab it parks, so a service worker suspended
-   * mid-pause comes back with `tabID`/`reauthPaused` at their in-memory
-   * defaults while the origin snapshot still says pausedForReauth — and the
-   * adoption query, which looks for a pinned+muted tab, cannot find the very
-   * tab the operator may be signing in on. Without this the popup kept
-   * reporting "Waiting on your sign-in" for a session nothing was waiting on,
-   * with no reauth timer armed to ever re-check it. */
+  /** Clear the local display pause for a new owner or after teardown. */
   private clearReauthPause(origin: string | undefined): void {
     this.reauthPaused = false;
+    this.reauthLeftOrigin = false;
     this.clearReauthTimer();
     if (origin !== undefined) void this.updateOriginSnapshot(origin, { pausedForReauth: false });
   }
 
   private armReauthTimer(): void {
     this.clearReauthTimer();
-    this.reauthTimer = this.api.timers.setTimeout(() => {
+    this.reauthTimer = this.api.timers.setTimeout(async () => {
       this.reauthTimer = undefined;
-      void this.onReauthTick();
+      await this.onReauthTick();
     }, this.observeMs);
   }
 
@@ -2578,6 +2628,8 @@ export class KeepaliveManager {
   private async onReauthTick(): Promise<void> {
     await this.loadPreferences();
     if (!this.reauthPaused || this.tabID === undefined) return;
+    if (this.mode === "off") { await this.closeTab(); return; }
+    await this.options.ownership?.update(this.tabID, true);
     await this.probeOwnedTab("reauth");
     if (this.reauthPaused) this.armReauthTimer();
   }
@@ -2608,10 +2660,13 @@ export class KeepaliveManager {
     } catch {
       // The tab is still usable; retry normal keepalive on the next cycle.
     }
-    if (this.resolver?.origin !== origin) return;
+    if (this.resolver?.origin !== origin || this.tabID !== tabID) return;
     this.reauthPaused = false;
+    this.reauthLeftOrigin = false;
     this.clearReauthTimer();
+    await this.options.ownership?.update(tabID, false);
     this.options.onReauthStateChanged?.(false);
+    this.scheduleCycle(this.lastCycleRunAt + this.intervalMs(), () => this.onReload());
   }
 
 
@@ -2679,6 +2734,11 @@ export class KeepaliveManager {
    * bookkeeping all happen before any await, so a wake event can never be
    * reordered or lost while this manager is still hydrating. */
   noteResolverNavigation(tabID: number, rawURL: string | undefined): void {
+    if (this.tabID === tabID) {
+      if (this.reauthPaused && this.resolver !== undefined && typeof rawURL === "string" &&
+          !resolverURLMatches(rawURL, this.resolver)) this.reauthLeftOrigin = true;
+      void this.options.ownership?.update(tabID, this.reauthPaused, undefined, this.reauthLeftOrigin);
+    }
     this.tabDocumentEpochs.set(tabID, (this.tabDocumentEpochs.get(tabID) ?? 0) + 1);
     this.syncOriginStates();
     const origin = this.originFromURL(rawURL);
@@ -2749,10 +2809,12 @@ export class KeepaliveManager {
       }
     }
     if (this.tabID !== tabID) return;
+    void this.options.ownership?.forget(tabID);
     const ownedOrigin = this.resolver?.origin;
     const wasPaused = this.reauthPaused;
     this.tabID = undefined;
     this.reauthPaused = false;
+    this.reauthLeftOrigin = false;
     this.clearReauthTimer();
     void this.updateOriginSnapshot(ownedOrigin, { pausedForReauth: false });
     if (wasPaused) this.options.onReauthStateChanged?.(false);
@@ -2813,6 +2875,7 @@ export class KeepaliveManager {
     const wasAwaitingReauth = this.reauthPaused;
     this.tabID = undefined;
     this.reauthPaused = false;
+    this.reauthLeftOrigin = false;
     this.clearReauthTimer();
     void this.updateOriginSnapshot(origin, { pausedForReauth: false });
     if (wasAwaitingReauth) this.options.onReauthStateChanged?.(false);
@@ -2820,6 +2883,7 @@ export class KeepaliveManager {
     if (tabID === undefined) return;
     try {
       await this.api.tabs.remove(tabID);
+      await this.options.ownership?.forget(tabID);
     } catch {
       // A manually closed tab is already in the desired state.
     }
@@ -2849,8 +2913,8 @@ export function chromeKeepaliveAPI(
         try {
           await chromeAPI.tabs.update(tab.id, { muted });
         } catch (error) {
-          // An unmuted tab cannot be recovered by the pinned+muted query
-          // after worker restart. Retire only this failed creation.
+          // Creation did not satisfy the requested quiet-tab contract.
+          // Retire only this failed creation, before it can navigate.
           try {
             await chromeAPI.tabs.remove(tab.id);
           } catch {
