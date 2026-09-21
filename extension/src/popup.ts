@@ -1431,6 +1431,27 @@ function isFreshSessionTimestamp(value: number | null | undefined, now = Date.no
   return age >= 0 && age <= SESSION_ROW_FRESH_MS;
 }
 
+/** Row suppression is not authentication evidence: an unmapped waiting job
+ * also hides rows. Check every configured session before claiming success. */
+function allSessionsFreshAndSignedIn(state: PopupSessionState): boolean {
+  if (!state.enabled) return false;
+  const snapshots = state.origins?.length
+    ? state.origins
+    : [{ ...state, origin: state.resolverOrigin }];
+  const now = Date.now();
+  return snapshots.every((snapshot) =>
+    isOriginSnapshot(snapshot) &&
+    snapshot.verdict === "in" &&
+    snapshot.authenticated &&
+    snapshot.probeSource !== "none" &&
+    !snapshot.checking &&
+    !snapshot.pausedForReauth &&
+    snapshot.hostPermission !== "required" &&
+    !hasNewerInconclusiveAttempt(snapshot) &&
+    isFreshSessionTimestamp(snapshot.lastVerdictAt, now),
+  );
+}
+
 
 export function deriveSessionRows(
   state: PopupSessionState | undefined,
@@ -1801,9 +1822,10 @@ export function renderInstitutionSession(
       : deriveSessionRows(state, jobs);
   const waitingVisible = waiting instanceof HTMLElement && waiting.hidden === false;
   const noticeVisible = Math.max(0, Math.trunc(state.releasedAuthJobs)) > 0;
+  const allSignedIn = allSessionsFreshAndSignedIn(state);
   // Calm steady state — every session warm and fresh, nothing waiting, no
   // notice — renders NO card at all: quiet means live.
-  if (rows.length === 0 && !waitingVisible && !noticeVisible) {
+  if (rows.length === 0 && allSignedIn && !waitingVisible && !noticeVisible) {
     if (legacyRow instanceof HTMLElement) legacyRow.hidden = true;
     if (rowsContainer instanceof HTMLElement) {
       rowsContainer.hidden = true;
@@ -1821,14 +1843,14 @@ export function renderInstitutionSession(
     rowsContainer.hidden = false;
     renderSessionRows(doc, rowsContainer, rows, onSignIn, onGrant);
   } else if (rows.length === 0) {
-    // Only the waiting list or a release notice justifies the card — and a
-    // card with a bare heading reads as broken, so say WHY it is quiet:
-    // rows only filter out when every session is signed in and freshly
-    // verified. Same words as the row labels above — "warm" is the internal
-    // evidence tier (ADR-0018), never the reader's word for it.
+    // Empty rows can mean quiet verified sessions, invalid evidence, or
+    // suppressed demand with no safe institution binding. Keep the latter
+    // unassigned; the waiting paper's own Open action remains its route.
     if (legacyRow instanceof HTMLElement) legacyRow.hidden = false;
     origin.textContent = "";
-    status.textContent = "All institutions signed in";
+    status.textContent = allSignedIn
+      ? "All institutions signed in"
+      : "Institution sign-in not confirmed";
     signIn.hidden = true;
     signIn.disabled = true;
     if (rowsContainer instanceof HTMLElement) {

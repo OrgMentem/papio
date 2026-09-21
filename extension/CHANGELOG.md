@@ -18,6 +18,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **The popup no longer mistakes a hidden institution row for successful sign-in.**
+  If a waiting paper cannot be mapped to an institution, Papio reports that
+  sign-in is unconfirmed and keeps the paper's Open action available. The
+  signed-in summary requires fresh evidence for every configured institution.
 - **Institution keepalive recovers its own sign-in tab after a worker restart.**
   Papio records tab ownership before navigation, so unpinning or redirecting
   through an identity provider no longer loses the tab. Returning from sign-in

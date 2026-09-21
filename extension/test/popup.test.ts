@@ -17,6 +17,7 @@ import {
   openInstitutionSignIn,
   deriveSessionCardState,
   deriveSessionRows,
+  type PopupSessionState,
   requestSessionState,
   readCurrentPageMetadata,
   refreshImpactSummary,
@@ -73,7 +74,7 @@ import {
   pdfGrabRefusalText,
   sendPdfState,
 } from "../src/deliver";
-import { SESSION_STALE_MS } from "../src/keepalive";
+import { SESSION_STALE_MS, type KeepaliveOriginSnapshot } from "../src/keepalive";
 import { PROVIDERS, SCENARIOS } from "../src/capture";
 
 function popupDocument(): Document {
@@ -2775,7 +2776,7 @@ test("binds waiting demand to its warm origin instead of a stale secondary row",
   expect(doc.querySelector(".institution-session-origin-row")).toBeNull();
   expect(doc.getElementById("institution-session-waiting")?.textContent).toContain("resolver.example.edu");
 });
-test("hides unrelated session rows when a waiting job has no safe origin binding", () => {
+test("hides unrelated session rows when a waiting job has no safe origin binding", async () => {
   const now = Date.now();
   const originA = "https://resolver-a.example.edu";
   const originB = "https://resolver-b.example.edu";
@@ -2796,17 +2797,18 @@ test("hides unrelated session rows when a waiting job has no safe origin binding
     stalledAuthJobs: [],
     releasedAuthJobs: 0,
     authDemand: [],
+    authDemandComplete: true as const,
     origins: [
       {
         origin: originA,
         authenticated: false,
         verdict: "out" as const,
-        probeSource: "none" as const,
-        lastProbeOutcome: "no_markers" as const,
+        probeSource: "live_tab" as const,
+        lastProbeOutcome: "markers" as const,
         lastVerdictAt: now,
         checking: false,
         likelyAuthenticated: false,
-        pausedForReauth: false,
+        pausedForReauth: true,
         lastProbeAt: now,
         dirtySince: null,
       },
@@ -2825,10 +2827,116 @@ test("hides unrelated session rows when a waiting job has no safe origin binding
       },
     ],
   };
-  const waitingJob = job({ job_id: "unmapped-waiting", status: "auth_pending" });
+  const waitingJob = job({
+    job_id: "unmapped-waiting",
+    status: "auth_pending",
+    engagement_required: true,
+    tab_id: -1,
+  });
 
   expect(deriveSessionRows(state, [waitingJob])).toEqual([]);
   expect(deriveSessionRows(state)).toHaveLength(2);
+
+  const doc = popupDocument();
+  const opened: string[] = [];
+  const signedIn: (string | undefined)[] = [];
+  const signIn = async (origin?: string): Promise<void> => { signedIn.push(origin); };
+  // Match refresh(): session copy first, then waiting work. The next poll
+  // used to turn the suppressed rows into "All institutions signed in".
+  renderInstitutionSession(doc, state, signIn, [waitingJob]);
+  renderNeedsAttention(doc, [waitingJob], [], async (jobID) => { opened.push(jobID); });
+  for (let poll = 0; poll < 2; poll++) {
+    expect(doc.getElementById("institution-session")?.hidden).toBe(false);
+    expect(doc.getElementById("institution-session-status")?.textContent).toBe(
+      "Institution sign-in not confirmed",
+    );
+    expect(doc.getElementById("institution-session-origin")?.textContent).toBe("");
+    expect(doc.querySelector(".institution-session-origin-row")).toBeNull();
+    expect((doc.getElementById("institution-session-signin") as HTMLButtonElement).hidden).toBe(true);
+    renderInstitutionSession(doc, state, signIn, [waitingJob]);
+  }
+  const open = doc.querySelector<HTMLButtonElement>(".institution-session-waiting-row button");
+  expect(open?.textContent).toBe("Open");
+  open?.click();
+  await flushMicrotasks();
+  expect(opened).toEqual([waitingJob.job_id]);
+  expect(signedIn).toEqual([]);
+});
+
+function freshInstitutionSessions(now: number): PopupSessionState {
+  const origins: KeepaliveOriginSnapshot[] = [
+    "https://resolver-a.example.edu",
+    "https://resolver-b.example.edu",
+  ].map((origin) => ({
+    origin,
+    authenticated: true,
+    verdict: "in",
+    probeSource: "live_tab",
+    lastProbeOutcome: "markers",
+    lastVerdictAt: now,
+    checking: false,
+    likelyAuthenticated: false,
+    pausedForReauth: false,
+    lastProbeAt: now,
+    dirtySince: null,
+  }));
+  return {
+    ...origins[0]!,
+    enabled: true,
+    intervalMinutes: 4,
+    resolverOrigin: origins[0]!.origin,
+    lastAuthReturnedAt: null,
+    queuedAuthJobs: 0,
+    stalledAuthJobs: [],
+    releasedAuthJobs: 0,
+    authDemand: [],
+    authDemandComplete: true,
+    origins,
+  };
+}
+
+const unverifiedSessionCases: [string, Partial<KeepaliveOriginSnapshot>][] = [
+  ["stale", { lastVerdictAt: Date.now() - 11 * 60_000 }],
+  ["unknown", { verdict: "unknown", authenticated: false }],
+  ["signed out", { verdict: "out", authenticated: false, pausedForReauth: true }],
+  ["inconsistent", { authenticated: false }],
+  ["missing timestamp", { lastVerdictAt: null }],
+  ["invalid timestamp", { lastVerdictAt: Number.NaN }],
+  ["future timestamp", { lastVerdictAt: Date.now() + 60_000 }],
+  ["invalid origin", { origin: "not-an-origin" }],
+  ["checking", { checking: true }],
+  ["paused", { pausedForReauth: true }],
+  ["permission required", { hostPermission: "required" }],
+  ["inconclusive recheck", { lastProbeOutcome: "no_tab", lastProbeAt: Date.now() + 60_000 }],
+];
+for (const [name, patch] of unverifiedSessionCases) {
+  test(`suppressed ${name} session evidence cannot claim all institutions signed in`, () => {
+    const state = freshInstitutionSessions(Date.now());
+    // A fresh primary summary cannot stand in for a different institution.
+    state.origins![1] = { ...state.origins![1]!, ...patch };
+    const waitingJob = job({ status: "auth_pending", engagement_required: true, tab_id: -1 });
+    const doc = popupDocument();
+    renderNeedsAttention(doc, [waitingJob]);
+    expect(deriveSessionRows(state, [waitingJob])).toEqual([]);
+    renderInstitutionSession(doc, state, async () => {}, [waitingJob]);
+    expect(doc.getElementById("institution-session")?.hidden).toBe(false);
+    expect(doc.getElementById("institution-session-status")?.textContent).toBe(
+      "Institution sign-in not confirmed",
+    );
+    expect((doc.getElementById("institution-session-signin") as HTMLButtonElement).hidden).toBe(true);
+  });
+}
+
+test("all fresh signed-in institutions stay quiet and can support a release summary", () => {
+  const now = Date.now();
+  const state = freshInstitutionSessions(now);
+  const doc = popupDocument();
+  renderInstitutionSession(doc, state);
+  expect(doc.getElementById("institution-session")?.hidden).toBe(true);
+  renderInstitutionSession(doc, { ...state, releasedAuthJobs: 2, releasedAuthJobsAt: now });
+  expect(doc.getElementById("institution-session")?.hidden).toBe(false);
+  expect(doc.getElementById("institution-session-status")?.textContent).toBe("All institutions signed in");
+  expect(doc.getElementById("institution-session-unblocked")?.textContent).toContain("Sign-in unblocked 2 items");
 });
 // A tracked return advances its job to awaiting_download while requires_auth
 // stays true, and sessionAuthDemand reports only auth_pending work - so the
