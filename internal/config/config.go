@@ -619,6 +619,12 @@ func (a Actions) EffectiveActionStaleAfter() time.Duration {
 	return time.Duration(a.StaleAfterSeconds) * time.Second
 }
 
+// Agent enrolls this profile in optional acquisition decisions. Credentials
+// remain in the OS credential store, never in this configuration.
+type Agent struct {
+	Backend string `toml:"backend,omitempty"`
+}
+
 // Config is the loaded, validated configuration.
 type Config struct {
 	AccessMode string            `toml:"access_mode"`
@@ -636,6 +642,7 @@ type Config struct {
 	Updates    Updates           `toml:"updates"`
 	Discovery  Discovery         `toml:"discovery"`
 	Actions    Actions           `toml:"actions"`
+	Agent      *Agent            `toml:"agent,omitempty"`
 	Sources    map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
@@ -849,6 +856,9 @@ func normalizeLibrarySourcePath(path string) string {
 }
 
 func (c *Config) validate() error {
+	if c.Agent != nil && c.Agent.Backend != "" && c.Agent.Backend != "typesafe" {
+		return errors.New("agent.backend must be empty or typesafe")
+	}
 	switch c.AccessMode {
 	case "", ModeConservative, ModeAssisted, ModeDelegated:
 	default:

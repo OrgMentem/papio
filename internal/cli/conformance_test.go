@@ -87,16 +87,20 @@ type commandClass struct {
 // `acquire --from-zotio`, both real commands whose non-envelope JSON no
 // prior test classified at all.
 var commandClassification = map[string]commandClass{
-	"papio init":         {kind: kindNone},
-	"papio config":       {kind: kindNone},
-	"papio config init":  {kind: kindStructured},
-	"papio acquire":      {kind: kindStructured, rpcMethods: []string{"watch.digest_acquire", "zotio.queue", "acquire.submit_v3", "acquire.submit_v2", "acquire.submit", "jobs.get_v2", "jobs.get", "zotio.lookup_works", "library.lookup_works"}},
-	"papio batch":        {kind: kindNone},
-	"papio batch report": {kind: kindStructured, rpcMethods: []string{"acquire.report"}},
-	"papio search":       {kind: kindEnvelope, rowKey: "works", args: []string{"conformance probe"}, rpcMethods: []string{"discovery.search"}},
-	"papio watch":        {kind: kindNone},
-	"papio watch add":    {kind: kindStructured, rpcMethods: []string{"watch.add"}},
-	"papio watch list":   {kind: kindEnvelope, rowKey: "watches", rpcMethods: []string{"watch.list"}},
+	"papio init":                {kind: kindNone},
+	"papio config":              {kind: kindNone},
+	"papio config init":         {kind: kindStructured},
+	"papio config agent":        {kind: kindNone},
+	"papio config agent set":    {kind: kindStructured},
+	"papio config agent status": {kind: kindStructured},
+	"papio config agent remove": {kind: kindStructured},
+	"papio acquire":             {kind: kindStructured, rpcMethods: []string{"watch.digest_acquire", "zotio.queue", "acquire.submit_v3", "acquire.submit_v2", "acquire.submit", "jobs.get_v2", "jobs.get", "zotio.lookup_works", "library.lookup_works"}},
+	"papio batch":               {kind: kindNone},
+	"papio batch report":        {kind: kindStructured, rpcMethods: []string{"acquire.report"}},
+	"papio search":              {kind: kindEnvelope, rowKey: "works", args: []string{"conformance probe"}, rpcMethods: []string{"discovery.search"}},
+	"papio watch":               {kind: kindNone},
+	"papio watch add":           {kind: kindStructured, rpcMethods: []string{"watch.add"}},
+	"papio watch list":          {kind: kindEnvelope, rowKey: "watches", rpcMethods: []string{"watch.list"}},
 	// watch digest also owns a "digest clear" subcommand; ExactArgs(1) on
 	// "digest" itself accepts a bare watch id, so no daemon state is needed
 	// to reach its --json path.

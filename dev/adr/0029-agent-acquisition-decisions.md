@@ -57,10 +57,18 @@ role/label/disabled control descriptions and an opaque observation revision.
 URLs, document bodies, account areas and form values stay out of the projection.
 The browser keeps execution handles and fingerprints locally. TypeSafe is one
 implementation; a local backend needs no cloud key or network. The initial
-cross-platform credential input is the daemon environment variable
-`PAPIO_TYPESAFE_API_KEY`. Credential-store onboarding and a local model runtime
-are later work. No unrelated credential is discovered automatically, and no
-cloud substitution occurs silently.
+cross-platform credential input was the daemon environment variable
+`PAPIO_TYPESAFE_API_KEY`. Profile enrollment now also supports OS credential
+storage through `papio config agent set`: Keychain on macOS, Credential Manager
+on Windows and Secret Service on Linux. Only `agent.backend = "typesafe"` is
+stored in TOML; the secret is scoped to the configuration path and data directory.
+No keyring lookup occurs for an unenrolled profile. A supplied environment value
+overrides stored credentials, including an empty value to disable this backend.
+Setup accepts a hidden prompt or stdin and requires a daemon restart. Removing
+the saved key disables profile enrollment before deleting it. Credential-store
+failure disables optional inference while ordinary acquisition remains available.
+A local model runtime is later work. No unrelated credential is discovered
+automatically, and no cloud substitution occurs silently.
 
 An initial attempt permits up to 60 decisions in ten minutes, with a 30-second
 backend deadline. These are resource ceilings, not evidence of denied access or

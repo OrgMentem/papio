@@ -31,7 +31,7 @@ column lists anything else sent.
 
 | Service | Data sent besides the lookup | Used for | Default |
 | --- | --- | --- | --- |
-| `api.typesafe.ai` | your TypeSafe key; bounded article title, sanitized visible control labels/roles/disabled states, opaque IDs and observation revision | Optional agent acquisition decisions | Off — requires `PAPIO_TYPESAFE_API_KEY` in the daemon environment |
+| `api.typesafe.ai` | your TypeSafe key; article DOI, bounded article title, sanitized visible control labels/roles/disabled states, opaque IDs and observation revision | Optional agent acquisition decisions | Off — requires explicit `papio config agent set` enrollment or `PAPIO_TYPESAFE_API_KEY` in the daemon environment |
 | `api.unpaywall.org` | your `email` (required by their terms) | Resolving a DOI | **On** |
 | `api.crossref.org` | your `email`, if set | Adding metadata to a title-only request; checking a DOI's registered version relations when other candidates are exhausted | **On** |
 | `api.crossref.org` | — | Daily retraction checks for papers already in your library | **On** |
@@ -143,7 +143,8 @@ only to you and are never transmitted anywhere.
 
 ## Agent acquisition
 
-Supplying `PAPIO_TYPESAFE_API_KEY` to the daemon enables cloud decisions for
+Saving a key with `papio config agent set`, or supplying
+`PAPIO_TYPESAFE_API_KEY` to the daemon, enables cloud decisions for
 eligible delegated acquisitions. The extension sends the local daemon a matching
 article DOI, a title of at most 400 characters, and at most 80 visible article
 controls with labels of at most 240 characters. TypeSafe receives that projection
@@ -151,6 +152,14 @@ and your TypeSafe credential. The projection excludes page URLs, document bodies
 form values, browser credentials, account areas and unrelated tabs. URL-like and
 credential-like strings in labels are redacted. Labels are page-derived text;
 this minimization is not a guarantee that all possible personal text is detected.
+
+Saved keys use the operating system's credential store and are scoped to a Papio
+configuration path and data directory. Setup writes only enrollment to TOML;
+the secret is never supplied as a process argument or sent to the extension.
+Unenrolled profiles do not search for existing credentials. An explicitly empty
+environment override disables the backend. Use `papio config agent remove` and
+remove any environment override to disable it, then restart the daemon. Removing
+configuration alone does not erase a previously saved OS credential.
 
 The daemon retains request/permit IDs, observation revisions, outcomes and usage
 counts locally. It does not retain the model projection or raw response in those

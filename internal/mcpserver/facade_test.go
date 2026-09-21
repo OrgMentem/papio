@@ -106,7 +106,7 @@ func TestFacadeSearchHidesLifecycleAndMarksReadOnly(t *testing.T) {
 		}
 	}
 	// Lifecycle/setup/system commands are hidden, along with their subtrees.
-	for _, hidden := range []string{"daemon", "daemon stop", "mcp", "config", "config init", "init", "native-host", "native-host install", "browser reload"} {
+	for _, hidden := range []string{"daemon", "daemon stop", "mcp", "config", "config init", "config agent", "config agent set", "config agent status", "config agent remove", "init", "native-host", "native-host install", "browser reload"} {
 		if present[hidden] {
 			t.Errorf("facade should hide %q", hidden)
 		}

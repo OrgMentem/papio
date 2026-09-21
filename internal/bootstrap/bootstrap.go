@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"papio/internal/acquisitionagent"
+	"papio/internal/agentcredential"
 	"papio/internal/app"
 	"papio/internal/artifact"
 	"papio/internal/batch"
@@ -217,9 +218,14 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 }
 
 func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*System, error) {
-	agentBackend, err := takeAcquisitionBackend()
+	agentBackend, err := takeAcquisitionBackend(ctx, cfg)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// Optional inference must not disable deterministic acquisition when
+		// the credential store is locked or unavailable (e.g. a headless login).
+		_, _ = fmt.Fprintf(os.Stderr, "papio: article agent unavailable: %v; check papio config agent status and restart after fixing setup\n", err)
 	}
 	db, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {
@@ -551,17 +557,38 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 
 // Read once before bootstrap can launch PDF workers, hooks or integrations.
 // Those children have no reason to inherit the acquisition inference key.
-func takeAcquisitionBackend() (acquisitionagent.Backend, error) {
-	key := strings.TrimSpace(os.Getenv("PAPIO_TYPESAFE_API_KEY"))
+func takeAcquisitionBackend(ctx context.Context, cfg config.Config) (acquisitionagent.Backend, error) {
+	return takeAcquisitionBackendWithStore(ctx, cfg, agentcredential.NewStore().Load)
+}
+
+func takeAcquisitionBackendWithStore(ctx context.Context, cfg config.Config, load func(context.Context, string) (string, error)) (acquisitionagent.Backend, error) {
+	raw, overridden := os.LookupEnv("PAPIO_TYPESAFE_API_KEY")
+	key := strings.TrimSpace(raw)
 	if err := os.Unsetenv("PAPIO_TYPESAFE_API_KEY"); err != nil {
 		return nil, errors.New("could not isolate the acquisition backend credential")
 	}
-	if key == "" {
+	if !overridden {
+		if cfg.Agent == nil || cfg.Agent.Backend != "typesafe" {
+			return nil, nil
+		}
+		profile, err := agentcredential.Profile(cfg.Path, cfg.DataDir)
+		if err != nil {
+			return nil, errors.New("could not identify the agent credential profile")
+		}
+		key, err = load(ctx, profile)
+		if err != nil {
+			return nil, errors.New("saved TypeSafe key could not be read from the OS credential store")
+		}
+	}
+	if overridden && key == "" {
 		return nil, nil
+	}
+	if err := agentcredential.ValidateKey(key); err != nil {
+		return nil, errors.New("invalid TypeSafe key for acquisition decisions")
 	}
 	backend, err := acquisitionagent.NewTypeSafe(key, nil)
 	if err != nil {
-		return nil, errors.New("invalid PAPIO_TYPESAFE_API_KEY for acquisition decisions")
+		return nil, errors.New("invalid TypeSafe key for acquisition decisions")
 	}
 	return backend, nil
 }

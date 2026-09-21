@@ -536,5 +536,7 @@ this feature is the cloud opt-in. PDF adoption and validation remain unchanged.
 and repair depend on continual provider-specific maintenance. Agent acquisition
 can cover unfamiliar controls while retaining packaged execution checks. The
 first integration handles an already identified article, including explicit
-same-origin PDF links through native download intent. Broader navigation and
+same-origin PDF links through native download intent. Profile-scoped OS credentials
+can be configured with `papio config agent set`; the daemon environment remains
+an explicit override. Broader navigation and
 native viewers are later work. Browser-store acceptance remains unverified.

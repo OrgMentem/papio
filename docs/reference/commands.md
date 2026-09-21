@@ -434,6 +434,44 @@ Manage papio configuration
 papio config
 ```
 
+### `papio config agent`
+
+Configure optional article-agent decisions
+
+```
+papio config agent
+```
+
+#### `papio config agent remove`
+
+Disable the configured agent and remove its saved key
+
+```
+papio config agent remove
+```
+
+#### `papio config agent set`
+
+Enable TypeSafe/Jev with a key saved in the OS credential store
+
+Enable cloud article decisions for this configuration profile. This sends article DOIs, bounded titles and sanitized control descriptions to TypeSafe. The API key stays in the OS credential store. Input is hidden; use --key-stdin for a secret-manager pipe. Restart the daemon after changing this setting.
+
+```
+papio config agent set [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--key-stdin` | `bool` | `false` | read the API key from standard input instead of a hidden terminal prompt |
+
+#### `papio config agent status`
+
+Show agent configuration without revealing credentials
+
+```
+papio config agent status
+```
+
 ### `papio config init`
 
 Write explicit first-run configuration

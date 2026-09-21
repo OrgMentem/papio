@@ -11,14 +11,37 @@ with `~/` are expanded when *papio* loads them.
 
 ## Agent acquisition
 
-Set `PAPIO_TYPESAFE_API_KEY` in the **daemon's environment** to enable TypeSafe/Jev
-for delegated browser acquisition when packaged and generic routes fail. This is
-an environment variable, not a TOML key. Supplying it opts into sending the
-article DOI, bounded title and sanitized control descriptions to TypeSafe; see
-[Privacy](../privacy.md#agent-acquisition). The credential never enters the
-extension or job history. An already running daemon must be stopped and started
-from the configured environment to pick up a change. Removing the variable and
-restarting disables the backend.
+Run `papio config agent set` to enable TypeSafe/Jev for delegated browser
+acquisition when packaged and generic routes fail. It reads your key at a hidden
+prompt and saves it in macOS Keychain, Windows Credential Manager or Linux
+Secret Service. A secret manager can pipe the key into
+`papio config agent set --key-stdin`; avoid literal keys in shell commands.
+Use `--config <path>` for a particular profile. Keys are scoped to both the config
+path and data directory, so moving either requires setup again. Linux needs a
+running, unlocked Secret Service; no plaintext fallback is used.
+
+Supplying the key opts into sending the article DOI, bounded title and sanitized
+control descriptions to TypeSafe; see [Privacy](../privacy.md#agent-acquisition).
+The credential never enters TOML, the extension or job history. Setup stores only
+`backend = "typesafe"` in the `[agent]` section. Empty or absent `backend` disables
+stored-key lookup; other backend values are currently rejected. This new section
+requires a compatible daemon and native host before it is added to an older
+installation's config.
+
+Run `papio daemon stop` after setup; the next ordinary command starts the daemon
+with the new setting. `papio config agent status` reports saved configuration,
+credential availability and the current command's environment override, without
+printing a key or claiming the running daemon reloaded. `papio config agent remove`
+disables enrollment and removes its saved key; restart afterward. If the OS store
+is unavailable, agent inference is disabled with a daemon diagnostic, while
+ordinary acquisition remains available.
+
+`PAPIO_TYPESAFE_API_KEY` in the **daemon's environment** remains an override and
+does not require `[agent]`. An explicitly empty value disables Jev even when a
+saved key exists. Removing the variable restores the profile's configured behavior
+after restart. To disable Jev completely, remove both enrollment and any launch
+environment override. Changing your shell's environment does not change an
+already running daemon.
 
 Both daemon and extension must support `agent_fallback_v1`. Effective site access
 is still required, including for publishers without an adapter. The initial
@@ -37,7 +60,7 @@ budget. These limits are implementation defaults, not TOML settings.
 The daemon removes the key from its process environment after reading it, before
 starting PDF workers, hooks or other integrations. The backend interface supports
 local implementations without a key or network;
-no local model runtime or credential-store setup UI ships yet.
+no local model runtime ships yet. Credential setup is currently a CLI command.
 
 ## Top-level keys
 

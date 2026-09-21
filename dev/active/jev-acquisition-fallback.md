@@ -1,6 +1,6 @@
 # Native agent acquisition and adapter learning
 
-Status: first daemon/extension integration implemented, 2026-09-20. The product direction is cross-platform
+Status: integrated Chrome and Windows Firefox acquisition proven, 2026-09-21. The product direction is cross-platform
 native acquisition, interchangeable cloud/local decision backends, and learning
 from successful recoveries. Development validation is authorized. This document
 does not grant new OS permissions. ADR-0029 records the acquisition decision
@@ -15,9 +15,13 @@ The extension tries the agent after packaged/generic routes fail, including
 publishers with no adapter. It observes an already bound DOI-identified article,
 selects in-page controls and tracks the resulting browser download. Chrome's
 filename-steering API carries Chrome downloads. Firefox now has a negotiated
-native-download reservation and daemon adoption path; live acceptance is in
-progress. The backend contract is shared across platforms and accepts local implementations; the first concrete backend
-uses TypeSafe with a daemon-only `PAPIO_TYPESAFE_API_KEY` environment variable.
+native-download reservation and daemon adoption path. A naturally unsupported
+eLife article reached `ready` through Firefox on Windows after one explicit Open
+and one Jev decision; the correct 17-page PDF was retained and visually checked.
+This proves assisted startup followed by automatic acquisition, not an unattended
+cohort. The backend contract is shared across platforms and accepts local implementations; the first concrete backend
+uses TypeSafe with a profile-scoped OS credential or a daemon-only
+`PAPIO_TYPESAFE_API_KEY` environment variable.
 The key is removed from the process environment before other subprocesses start.
 
 Calls reserve a durable budget before network I/O. Inference runs outside the
@@ -32,9 +36,33 @@ One live call through the new Go backend returned Jev 1.13.0's PDF-control choic
 verified IOS Press acquisition used the spike controller. A later isolated Chrome
 run of the integrated loop acquired the correct five-page IOS Press PDF after one explicit Open and one Jev decision, with the
 packaged adapter deliberately omitted. That proves the fallback mechanism;
-Firefox and a naturally unsupported publisher still need live acceptance.
-Cross-document navigation, native viewer saving, credential-store onboarding and
+the eLife Firefox run adds natural no-adapter acceptance. Neither result establishes
+cross-provider reliability. Cross-document navigation, native viewer saving and
 automatic source-repair promotion remain subsequent slices.
+
+## Delivery backlog after the first live proof
+
+The operator requested an extension-free route on 2026-09-21. It is a planned
+product capability, not merely a developer tool. Keep the extension-backed route
+as the background executor where available; let users choose native execution
+without installing an extension. Both executors share the decision contract,
+job authority, cancellation and artifact validation. No CDP, WebDriver or browser
+debugger is introduced by removing the extension.
+
+| Work | Result required |
+| --- | --- |
+| Persistent key setup | Hidden prompt or secret-manager stdin → OS credential store → explicitly enrolled profile → restarted daemon, on macOS, Windows and Linux. No plaintext key in config, browser storage, logs or argv. |
+| Menu and observation progression | Hidden/clipped menu controls do not appear prematurely; an opened PDF menu advances without spending a 45-second download wait. Preserve actual-download grace and exact receipt ownership. |
+| Article navigation and new contexts | An observed acquisition link may lead to a freshly identified document or an owned child tab. Retire old control handles; carry the existing job/permit through a defined handoff, recheck permissions/identity, close only owned tabs, and reconcile any download already started. Test redirects, cancellation, concurrent jobs and operator takeover. |
+| CDN and resident-viewer acquisition | Follow the browser's actual navigation and save resident bytes through the native helper when needed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation on Chrome and Firefox. |
+| Local repair learning | Connect failed declarative capture, successful fallback and validated artifact to the existing repair workspace. Generate/test in isolation, run a fresh model-free declarative canary, promote or revert from the artifact outcome. Keep local operation independent of analytics. |
+| Extension-free native executor | Reuse and assess maintained OSS accessibility/input components on macOS, Windows and named Linux desktops. The helper starts on demand, yields to user input and cleans up its own tabs/dialogs. Prove article observation, navigation, saving, ownership, cancellation and recovery with the extension disabled and Codex absent. Measure focus, pointer and input interference. |
+
+Removing the extension also removes its tab IDs, host grants and download events.
+The native implementation therefore needs its own demonstrated surface/file
+association; elapsed time or the newest file is insufficient. Use a daemon-issued
+per-attempt save destination or another equally discriminating ownership proof.
+Keep cloud and future local classifiers interchangeable in both execution modes.
 
 ## Evidence and remaining proof
 

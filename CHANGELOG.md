@@ -11,6 +11,12 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Persistent article-agent setup.** `papio config agent set` saves a TypeSafe
+  key in the OS credential store and enables Jev for that profile. A hidden prompt
+  and `--key-stdin` keep it out of command arguments. `status` reports setup
+  without exposing the key; `remove` disables enrollment and removes it.
+  Restart the daemon after changes. The environment override remains supported,
+  and a locked credential store leaves ordinary acquisition available.
 - **Firefox can adopt downloads made by the optional article agent.** The daemon
   reserves the attempt before a click, copies the newly observed file from the
   configured download directory, and applies normal PDF and identity checks.
