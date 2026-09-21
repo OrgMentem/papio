@@ -71,7 +71,13 @@ test.skipIf(!fixtureExists("jstor", "login-return"))(
 test.skipIf(!fixtureExists("jstor", "terms"))(
   "open terms overlay takes precedence over the still article-shaped page",
   () => {
-    expect(classifyFixture(fixture("terms"), spec, IRON_CAGE).kind).toBe("terms");
+    // This capture is a different article from IRON_CAGE. Terms do not
+    // override the requested-work identity check.
+    const expected = {
+      title: "Institutionalized Organizations: Formal Structure as Myth and Ceremony",
+    };
+    expect(classifyFixture(fixture("terms"), spec, expected).kind).toBe("terms");
+    expect(classifyFixture(fixture("terms"), spec, IRON_CAGE).kind).toBe("wrong_work");
   },
 );
 
