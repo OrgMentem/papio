@@ -2838,7 +2838,25 @@ export function chromeKeepaliveAPI(
 ): KeepaliveAPI {
   return {
     tabs: {
-      create: (properties) => chromeAPI.tabs.create(properties),
+      create: async ({ muted, ...properties }) => {
+        // Chrome accepts muted only on update (Firefox also accepts it on
+        // create). Keep the manager's create-and-mute contract portable.
+        const tab = await chromeAPI.tabs.create(properties);
+        if (tab.id === undefined) return tab;
+        try {
+          await chromeAPI.tabs.update(tab.id, { muted });
+        } catch (error) {
+          // An unmuted tab cannot be recovered by the pinned+muted query
+          // after worker restart. Retire only this failed creation.
+          try {
+            await chromeAPI.tabs.remove(tab.id);
+          } catch {
+            // Preserve the creation failure even if cleanup also failed.
+          }
+          throw error;
+        }
+        return tab;
+      },
       reload: (tabID) => chromeAPI.tabs.reload(tabID),
       get: (tabID) => chromeAPI.tabs.get(tabID),
       query: (query) => chromeAPI.tabs.query(query),

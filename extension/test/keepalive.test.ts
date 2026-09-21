@@ -413,6 +413,93 @@ test("creates one pinned resolver tab, reloads it, and closes it when jobs finis
   expect(h.tabs.removed).toEqual([1]);
 });
 
+/** Exercise the production adapter against Chrome's creation boundary, not
+ * the permissive shared tabs fake (which also accepts update properties). */
+function useStrictChromeTabs(h: ReturnType<typeof makeHarness>): KeepaliveAPI["tabs"] {
+  const api = chromeKeepaliveAPI({
+    tabs: {
+      create: (properties: chrome.tabs.CreateProperties) => {
+        const allowed = new Set<keyof chrome.tabs.CreateProperties>([
+          "active", "index", "openerTabId", "pinned", "selected", "url", "windowId",
+        ]);
+        for (const key of Object.keys(properties)) {
+          if (!allowed.has(key as keyof chrome.tabs.CreateProperties))
+            throw new Error(`Unexpected property: '${key}'`);
+        }
+        return h.tabs.create(properties as Parameters<typeof h.tabs.create>[0]);
+      },
+      update: (id: number, properties: Parameters<typeof h.tabs.update>[1]) => h.tabs.update(id, properties),
+      query: (query: Parameters<typeof h.tabs.query>[0]) => h.tabs.query(query),
+      reload: (id: number) => h.tabs.reload(id),
+      get: (id: number) => h.tabs.get(id),
+      remove: (id: number) => h.tabs.remove(id),
+    },
+  } as unknown as Parameters<typeof chromeKeepaliveAPI>[0]);
+  h.api.tabs = api.tabs;
+  return api.tabs;
+}
+
+for (const missingWindow of [false, true]) test(`Chrome keepalive creates valid properties then mutes (${missingWindow ? "missing work window" : "work window"})`, async () => {
+  const h = makeHarness(4, () => 500);
+  h.tabs.failWindowCreate = missingWindow;
+  useStrictChromeTabs(h);
+  await h.manager.init();
+
+  const base = { url: "https://resolver.example.edu", active: false, pinned: true };
+  expect(h.tabs.created).toEqual([
+    { ...base, windowId: 500 },
+    ...(missingWindow ? [base] : []),
+  ]);
+  expect(h.tabs.updates).toEqual([{ id: 1, properties: { muted: true } }]);
+  expect(h.tabs.snapshot(1)).toMatchObject({ active: false, pinned: true, muted: true });
+  await h.timers.runNext();
+  expect(h.tabs.reloaded).toEqual([1]);
+  h.jobs.count = 0;
+  await h.manager.sync();
+  expect(h.tabs.removed).toEqual([1]);
+  expect(h.tabs.live.size).toBe(0);
+});
+
+test("Chrome keepalive removes only its new tab when muting fails", async () => {
+  const h = makeHarness();
+  h.tabs.seed({ id: 99, url: RESOLVER_OPENURL, active: true, pinned: false });
+  let muteAttempts = 0;
+  const failure = new Error("Tabs cannot be edited right now");
+  h.tabs.update = async () => {
+    muteAttempts++;
+    throw failure;
+  };
+  const tabs = useStrictChromeTabs(h);
+  await expect(tabs.create({ url: RESOLVER_OPENURL, active: false, pinned: true, muted: true })).rejects.toBe(failure);
+  expect(muteAttempts).toBe(1);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.tabs.removed).toEqual([100]);
+  expect(h.tabs.live.size).toBe(1);
+  expect(h.tabs.snapshot(99)).toMatchObject({ active: true, pinned: false });
+
+  // The manager can retry a genuine failure without leaving a second,
+  // unmuted tab behind when its creation catch absorbs the error.
+  await h.manager.init();
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.removed).toEqual([100, 101]);
+  expect(h.tabs.live.size).toBe(1);
+});
+
+test("Chrome keepalive never reports creation success when mute and cleanup fail", async () => {
+  const h = makeHarness();
+  const failure = new Error("mute refused");
+  h.tabs.update = async () => { throw failure; };
+  const removed: number[] = [];
+  h.tabs.remove = async id => {
+    removed.push(id);
+    throw new Error("remove refused");
+  };
+  const tabs = useStrictChromeTabs(h);
+  await expect(tabs.create({ url: RESOLVER_OPENURL, active: false, pinned: true, muted: true })).rejects.toBe(failure);
+  expect(removed).toEqual([1]);
+  expect(h.tabs.created).toHaveLength(1);
+});
+
 test("the Chrome API forwards only local keepalive mode changes", async () => {
   type StorageListener = (
     changes: Record<string, { oldValue?: unknown; newValue?: unknown }>,

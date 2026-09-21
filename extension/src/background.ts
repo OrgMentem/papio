@@ -1808,6 +1808,9 @@ interface PendingMaterializationRequest {
 
 type ClassifyRetryKind = "unknown" | "effect" | "federated_evidence";
 interface ClassifyRetry {
+  /** The drive queue just acquired this retained tab, whose final host may
+   * have no adapter and no earlier unknown observation. */
+  allowUnregistered?: boolean;
   kind: ClassifyRetryKind;
   attempts: number;
 }
@@ -6686,15 +6689,29 @@ export class Bridge {
 
   private async drainHandoffDriveQueueUnlocked(): Promise<void> {
     await this.surfaceReady;
+    const port = this.port;
+    if (port === null) return;
     while (
+      this.port === port &&
       this.handoffDrives.size < HANDOFF_DRIVE_LIMIT &&
       this.handoffDriveQueue.length > 0
     ) {
-      const request = this.handoffDriveQueue.shift();
+      // Keep the entry queued across awaits: its already-navigated page may
+      // classify before this drain can register the drive. Cancellation can
+      // remove it meanwhile and must not be undone by the continuation.
+      const request = this.handoffDriveQueue[0];
       if (request === undefined) return;
-      this.queuedDriveJobIDs.delete(request.jobID);
+      const dequeue = (): boolean => {
+        if (this.handoffDriveQueue[0] !== request) return false;
+        this.handoffDriveQueue.shift();
+        this.queuedDriveJobIDs.delete(request.jobID);
+        return true;
+      };
       const job = findByJob(this.store, request.jobID);
-      if (job === undefined) continue;
+      if (job === undefined) {
+        dequeue();
+        continue;
+      }
       let tabID = job.tab_id >= 0 ? job.tab_id : undefined;
       if (tabID !== undefined) {
         try {
@@ -6704,6 +6721,8 @@ export class Bridge {
           tabID = undefined;
         }
       }
+      if (this.handoffDriveQueue[0] !== request) continue;
+      if (this.port !== port || this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) return;
       if (
         tabID === undefined &&
         job.requires_auth === true &&
@@ -6711,6 +6730,7 @@ export class Bridge {
         request.purpose !== "inbox-open"
       ) {
         if (!this.institutionalAuthGateOpen()) {
+          dequeue();
           // Slice 0 containment: a drive-queue entry with no live tab would
           // CREATE a sign-in surface. Autonomous callers (governor overflow,
           // startup requeue, daemon re-offers) all pass through here;
@@ -6729,6 +6749,7 @@ export class Bridge {
           request.jobID,
         )?.candidate_id;
         if (candidateID !== undefined) {
+          dequeue();
           // Slice 3: this drive answers a live institutional candidate —
           // consult the daemon's claim arbitration through openFreshHandoff
           // (the sole mint chokepoint) rather than this queue's own
@@ -6763,8 +6784,6 @@ export class Bridge {
           // Preserve FIFO and retry when the current effect releases. Do not
           // reject an explicit offer merely because an unlike effect won the
           // slot first.
-          this.handoffDriveQueue.unshift(request);
-          this.queuedDriveJobIDs.add(request.jobID);
           return;
         }
       }
@@ -6831,6 +6850,7 @@ export class Bridge {
           this.releaseEffectGovernor(request.jobID, effectToken, false);
       }
       if (focusOnly) {
+        dequeue();
         this.wakeEffectGovernor();
         continue;
       }
@@ -6838,6 +6858,8 @@ export class Bridge {
         await this.parkUndrivableHandoff(request.jobID, "tab creation failed");
         continue;
       }
+      if (this.handoffDriveQueue[0] !== request) continue;
+      if (this.port !== port) return;
       this.beginProviderDrive(request.jobID);
       await this.update((s) =>
         patchJob(s, request.jobID, {
@@ -6855,8 +6877,14 @@ export class Bridge {
       // runaway paper immortal instead of retiring a healthy one. A repeat
       // accept is safe by construction: the daemon folds an acknowledgement
       // into an already-open epoch within lease rather than opening a second.
+      if (this.port !== port) return;
+      if (!dequeue()) continue;
       this.registerHandoffDrive(request.jobID, tabID);
       this.sendJobAccept(request.jobID);
+      // Materialization may have finished navigation while another job held
+      // the slot. Re-observe that retained page now; do not navigate it again.
+      if (!mustNavigate && this.handoffDrives.has(request.jobID))
+        this.scheduleClassifyRetry(request.jobID, "unknown", true);
       if (request.surfaceFallback === true) await this.surfaceWorkTab(tabID);
       this.wakeEffectGovernor();
     }
@@ -19048,6 +19076,7 @@ export class Bridge {
       // and provider SPAs can replace their document after the first complete
       // event.
       if (disposition === "evidence_only") return undefined;
+      if (this.queuedDriveJobIDs.has(jobID)) return undefined;
       if (job.download_initiated === true || this.downloads.has(job.job_id))
         return;
       const live = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
@@ -19282,6 +19311,7 @@ export class Bridge {
       }
       if (currentJob.challenge_blocked === true)
         await this.clearChallengeBlock(currentJob);
+      if (this.queuedDriveJobIDs.has(jobID)) return;
     }
     const providerKey = this.providerKeyForJob(currentJob);
     let providerLeaseOwner = this.providerDrainLeaseOwners.get(providerKey);
@@ -19386,6 +19416,7 @@ export class Bridge {
   private scheduleClassifyRetry(
     jobID: string,
     kind: ClassifyRetryKind = "unknown",
+    allowUnregistered = false,
   ): void {
     const retry = this.classifyRetries.get(jobID);
     if (kind === "unknown" && retry?.kind === "federated_evidence") return;
@@ -19399,7 +19430,7 @@ export class Bridge {
       this.classifyRetries.delete(jobID);
       return;
     }
-    const next: ClassifyRetry = { kind, attempts: attempts + 1 };
+    const next: ClassifyRetry = { kind, attempts: attempts + 1, allowUnregistered };
     this.classifyRetries.set(jobID, next);
     this.deps.setTimeout(
       () => this.retryClassify(jobID, next),
@@ -19535,6 +19566,8 @@ export class Bridge {
     expected?: ClassifyRetry,
   ): Promise<void> {
     await this.ready;
+    const port = this.port;
+    if (port === null) return;
     if (expected !== undefined && this.classifyRetries.get(jobID) !== expected)
       return;
     if (expected?.kind === "federated_evidence") {
@@ -19551,6 +19584,8 @@ export class Bridge {
       this.classifyRetries.delete(jobID);
       return;
     }
+    if (expected?.allowUnregistered === true &&
+      this.handoffDrives.get(jobID)?.tabID !== job.tab_id) return;
     if (
       job.status !== "accepted" &&
       job.status !== "awaiting_download" &&
@@ -19567,7 +19602,8 @@ export class Bridge {
       this.classifyRetries.delete(jobID);
       return;
     }
-    await this.reclassifyCurrentProviderPage(jobID);
+    if (this.port !== port) return;
+    await this.reclassifyCurrentProviderPage(jobID, expected?.allowUnregistered === true);
   }
   private async retryFederatedEvidence(
     jobID: string,
@@ -21407,6 +21443,9 @@ export class Bridge {
         return;
       }
       case "unknown": {
+        // Waiting for a drive is not adapter drift. Known human gates above
+        // still settle normally; the queue drain will re-observe this page.
+        if (this.queuedDriveJobIDs.has(jobID)) return;
         const now = this.deps.now();
         const settled =
           (job.unknown_count ?? 0) >= 1 &&

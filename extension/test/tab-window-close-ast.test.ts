@@ -165,7 +165,7 @@ const KEEPALIVE_ALLOWLIST = new Map<string, { count: number; why: string }>([
   ],
   [
     "keepalive.ts:chromeKeepaliveAPI",
-    { count: 1, why: "Pinned tabs are deliberately skipped by the tab governor, so this is the keepalive-only Chrome lifecycle seam." },
+    { count: 2, why: "Pinned tabs are deliberately skipped by the tab governor, so this is the keepalive-only Chrome lifecycle seam. Its creation rollback removes only the new tab when muting fails, before the manager can publish ownership." },
   ],
 ]);
 // The adapter wires the remove capability, while lifecycle policy code may not

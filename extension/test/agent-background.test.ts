@@ -1,7 +1,7 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 import { afterEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { Bridge, MIN_DAEMON_VERSION, type BridgeDeps, type DownloadItemLike, type NativePort } from "../src/background";
+import { Bridge, MIN_DAEMON_VERSION, assessDrivenPage, isBotChallenge, type BridgeDeps, type DownloadItemLike, type NativePort } from "../src/background";
 import { agentDOM, type AgentDOMRequest } from "../src/agent-dom";
 import { nativeDownloadDocumentCurrent, NATIVE_CLICK_ADOPTION_FEATURE } from "../src/native-download";
 import { AGENT_NAVIGATION_FEATURE, parseBrowserMessage, type BrowserMessage } from "../src/protocol";
@@ -85,8 +85,8 @@ async function harness(options: { features?: string[]; knownAdapter?: boolean; f
     alarms: { create: () => {}, onAlarm: new FakeEmitter<[{ name: string }]>(), },
   };
   const bridge = new Bridge(deps);
-  const inbound = async (type: BrowserMessage["type"], payload: Record<string, unknown>, scoped = true) => port.onMessage.emit({
-    protocol: "papio-browser/1", type, msg_id: `agent-test-${seq}`, seq: seq++, ...(scoped ? { job_id: jobID } : {}), payload,
+  const inbound = async (type: BrowserMessage["type"], payload: Record<string, unknown>, scoped: boolean | string = true) => port.onMessage.emit({
+    protocol: "papio-browser/1", type, msg_id: `agent-test-${seq}`, seq: seq++, ...(scoped ? { job_id: typeof scoped === "string" ? scoped : jobID } : {}), payload,
   });
   backend.store = options.seed ?? emptyStore();
   await bridge.start();
@@ -234,6 +234,133 @@ test("a delayed candidate refresh cannot re-park an authorized no-adapter materi
   expect(h.frames.some(frame => frame.type === "auth_returned" || frame.type === "session_evidence" || frame.type === "claim_observation")).toBe(false);
   expect(h.counts().actions).toBe(0);
   expect(h.tabs.created).toHaveLength(0);
+});
+
+async function queuedMaterialization(knownAdapter = false) {
+  const h = await harness({ knownAdapter, features: [...features, "institutional_materialization_v1", "authentication_claim_v1", "handoff_link_v1"] });
+  const occupierID = "job_occupying_drive";
+  const claimID = "claim_queued_article", bindingID = "binding_queued_article";
+  const expiresAt = "2030-01-01T00:00:00Z";
+  Reflect.get(h.bridge, "handoffDrives").clear();
+  h.tabs.seed({ id: 78, url: "https://other.example/article", status: "complete" });
+  await h.update(store => ({ ...store,
+    activeJobs: [
+      { ...store.activeJobs[0]!, status: "queued", requires_auth: true, engagement_required: true, fresh_handoff: true },
+      { job_id: occupierID, tab_id: 78, status: "accepted", offered_at: h.now(), expires_at: h.now() + 3600_000, provider_hosts: ["other.example"], access_mode: "delegated" },
+    ],
+    materializations: { [jobID]: { job_id: jobID, candidate_id: "candidate_queued_article", claim_id: claimID,
+      binding_id: bindingID, materialization_kind: "browser_tab", candidate_expires_at: expiresAt,
+      lease_until: expiresAt, browser_holder_generation: 1, phase: "bound", tab_id: tabID } },
+  }));
+  if (!knownAdapter) await h.update(store => ({ ...store, activeJobs: store.activeJobs.map(job => {
+    if (job.job_id !== jobID) return job;
+    const fresh = { ...job };
+    delete fresh.unknown_count; delete fresh.last_unknown_ms;
+    return fresh;
+  }) }));
+  Reflect.get(h.bridge, "registerHandoffDrive").call(h.bridge, occupierID, 78);
+  Reflect.get(h.bridge, "scheduleMaterialization").call(h.bridge, jobID);
+  const route = await h.request("institutional_route_request");
+  await h.reply(route, "institutional_route_response", { outcome: "issued", claim_id: claimID, binding_id: bindingID,
+    route_issuance_ordinal: 1, effect_ordinal: 1, institutional_request_id: route.payload["institutional_request_id"], url });
+  const navigated = await h.request("institutional_navigated_request");
+  await h.reply(navigated, "institutional_navigated_response", { outcome: "acknowledged", claim_id: claimID, binding_id: bindingID });
+  await until(() => h.backend.store.materializations?.[jobID]?.phase === "navigated" && Reflect.get(h.bridge, "materializationRuns").size === 0);
+  expect(Reflect.get(h.bridge, "handoffDrives").has(occupierID)).toBe(true);
+  expect(Reflect.get(h.bridge, "handoffDrives").has(jobID)).toBe(false);
+  expect(Reflect.get(h.bridge, "queuedDriveJobIDs").has(jobID)).toBe(true);
+  const classifyTick = async () => {
+    const pending = h.timers.filter(timer => timer.ms === 2500);
+    for (const timer of pending) h.timers.splice(h.timers.indexOf(timer), 1);
+    h.advance(5000);
+    for (const timer of pending) await timer.fn();
+    await flush();
+  };
+  return { ...h, classifyTick, releaseOccupier: () => h.inbound("cancel", {}, occupierID) };
+}
+
+for (const knownAdapter of [false, true]) test(`occupied-slot materialization ${knownAdapter ? "known unknown" : "no-adapter"} waits, then observes and downloads without renavigation`, async () => {
+  const h = await queuedMaterialization(knownAdapter);
+  await h.tabs.completeNavigation(tabID);
+  h.advance(5000);
+  await h.classify();
+  expect(h.frames.filter(frame => frame.type === "provider_outcome")).toHaveLength(0);
+  expect(h.backend.store.activeJobs.find(job => job.job_id === jobID)?.parked_with_tab).not.toBe(true);
+  expect(h.counts()).toMatchObject({ genericPlans: 0, observations: 0, actions: 0 });
+  if (!knownAdapter) expect(h.backend.store.activeJobs.find(job => job.job_id === jobID)?.last_unknown_ms).toBeUndefined();
+  expect(h.frames.some(frame => frame.type === "provider_drive_epoch_start_request" || frame.type === "agent_decide_request_v1")).toBe(false);
+  h.win.document.querySelector("button")!.textContent = "Download PDF after queue";
+  // A browser lookup can yield after the occupier releases its slot. The
+  // landing must still wait until the queued drive is actually registered.
+  const getTab = h.tabs.get.bind(h.tabs);
+  let resumeLookup!: () => void, lookupStarted = false;
+  const lookup = new Promise<void>(resolve => { resumeLookup = resolve; });
+  h.tabs.get = async id => {
+    if (id === tabID && !lookupStarted) { lookupStarted = true; await lookup; }
+    return getTab(id);
+  };
+  const released = h.releaseOccupier();
+  await until(() => lookupStarted);
+  await h.classify();
+  expect(h.frames.filter(frame => frame.type === "provider_outcome")).toHaveLength(0);
+  expect(h.counts()).toMatchObject({ genericPlans: 0, observations: 0, actions: 0 });
+  resumeLookup(); await released;
+  await h.classifyTick(); await h.classifyTick();
+  await h.started();
+  const decision = await h.request("agent_decide_request_v1");
+  expect(decision.payload["observation"]).toMatchObject({ controls: [{ label: "Download PDF after queue [Example article]" }] });
+  h.setOnAct(async () => {
+    expect(Reflect.get(h.bridge, "handoffDrives").size).toBe(1);
+    expect(Reflect.get(h.bridge, "handoffDrives").has(jobID)).toBe(true);
+    expect(Reflect.get(h.bridge, "downloads").get(jobID).generic.epoch).toEqual(localEpoch);
+    await h.downloads.onCreated.emit({ id: 901, tabId: tabID, url: "https://unregistered.example/paper", state: "in_progress" });
+  });
+  await h.decide("decision", "c1");
+  await until(() => h.backend.store.activeJobs.find(job => job.job_id === jobID)?.generic_drive_epoch?.in_flight_download_id === 901);
+  let suggested: string | undefined;
+  await h.downloads.onDeterminingFilename.emit({ id: 901, tabId: tabID, url: "https://unregistered.example/paper", filename: "paper.pdf" }, value => { suggested = value.filename; });
+  expect(suggested).toContain(`papio/${jobID}/`);
+  h.downloads.items.set(901, { id: 901, tabId: tabID, filename: `/tmp/papio/${jobID}/paper.pdf`, fileSize: 123, mime: "application/pdf", state: "complete" });
+  const completing = h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  await h.settle(); await completing;
+  expect(h.frames.find(frame => frame.type === "download_complete")?.payload["producer"]).toEqual({ effect_kind: "generic_drive", ...epoch });
+  expect(h.counts().actions).toBe(1);
+  expect(h.tabs.navigations).toEqual([{ tabID, url }]);
+  expect(h.tabs.created).toHaveLength(0);
+});
+
+for (const stop of ["cancel", "disconnect"] as const) test(`occupied-slot materialization has no late agent work after ${stop}`, async () => {
+  const h = await queuedMaterialization();
+  await h.tabs.completeNavigation(tabID);
+  if (stop === "cancel") await h.inbound("cancel", {});
+  else await Reflect.get(h.bridge, "port").onDisconnect.emit();
+  await h.releaseOccupier();
+  await h.classifyTick(); await h.classifyTick();
+  expect(h.counts()).toMatchObject({ genericPlans: 0, observations: 0, actions: 0 });
+  expect(h.frames.some(frame => frame.type === "provider_drive_epoch_start_request" || frame.type === "agent_decide_request_v1" || frame.type === "download_complete")).toBe(false);
+  expect(h.tabs.navigations).toEqual([{ tabID, url }]);
+  expect(h.downloads.started).toHaveLength(0);
+});
+
+test("occupied-slot materialization still reports a persistent provider challenge", async () => {
+  const h = await queuedMaterialization(true);
+  const execute = h.deps.scripting.executeScript;
+  h.deps.scripting.executeScript = async injection => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "challenge" } }];
+    if (injection.func === isBotChallenge) return [{ result: true }];
+    return execute(injection);
+  };
+  await h.tabs.completeNavigation(tabID);
+  const confirmations = h.timers.filter(timer => timer.ms === 8000);
+  expect(confirmations.length).toBeGreaterThan(0);
+  h.advance(8000);
+  for (const timer of confirmations) await timer.fn();
+  await flush();
+  expect(h.backend.store.activeJobs.find(job => job.job_id === jobID)?.challenge_blocked).toBe(true);
+  expect(Reflect.get(h.bridge, "queuedDriveJobIDs").has(jobID)).toBe(false);
+  await h.releaseOccupier(); await h.classifyTick();
+  expect(h.frames.some(frame => frame.type === "agent_decide_request_v1")).toBe(false);
+  expect(h.counts().actions).toBe(0);
 });
 
 test("a candidate refresh preserves an authentication gate observed during its alarm lookup", async () => {

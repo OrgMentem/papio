@@ -16,6 +16,16 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Chrome institution keepalive creates its tab again.** Papio now creates
+  the pinned tab before muting it, using the operations Chrome supports. A
+  failed mute removes only the new tab so retries do not leave duplicates.
+- **Queued article pages wait for their browser drive.** A page that finishes
+  loading while another paper owns the drive no longer becomes an adapter
+  failure. When its turn arrives, Papio checks the current page without
+  navigating again, including publishers with no adapter.
+
 ### Added
 
 - **Skipped article-agent fallback now explains why.** Unknown provider pages
