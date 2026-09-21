@@ -244,6 +244,9 @@ const AUTH_HOST_SEGMENTS: Record<string, true> = {
 export function isAuthenticationURL(rawURL: string): boolean {
   try {
     const url = new URL(rawURL);
+    // Duo's tenant-hosted push prompt has no login/auth path segment. It
+    // remains a sign-in step, never a provider landing or capture target.
+    if (/^api-[a-z0-9]+\.duosecurity\.com$/i.test(url.hostname)) return true;
     const hostnameHasAuthSegment = url.hostname
       .toLowerCase()
       .split(".")

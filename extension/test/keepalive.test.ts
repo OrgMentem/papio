@@ -1782,6 +1782,15 @@ test("authentication URL detection ignores query strings and uses exact hostname
   expect(isAuthenticationURL("https://notidp.example.edu/account")).toBe(false);
 });
 
+test("Duo tenant prompts remain authentication pages without a login path", () => {
+  for (const path of ["/prompt/EXAMPLE", "/frame/v4/oidc/external/exit", "/"]) {
+    expect(isAuthenticationURL(`https://api-a1b2c3d4.duosecurity.com${path}`)).toBe(true);
+  }
+  for (const host of ["duosecurity.com", "www.duosecurity.com", "api-a1b2c3d4.duosecurity.com.example.org", "notduosecurity.com"]) {
+    expect(isAuthenticationURL(`https://${host}/prompt/EXAMPLE`)).toBe(false);
+  }
+});
+
 test("resolver marker classifier prioritizes sign-out and handles Primo-shaped account markup", () => {
   expect(
     classifyResolverMarkers([

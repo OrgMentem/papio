@@ -128,6 +128,20 @@ async function harness(options: { features?: string[]; knownAdapter?: boolean; f
     setAfterAct: (fn: () => Promise<void>) => { afterAct = fn; }, setOnMenuCheck: (fn: () => Promise<void>) => { onMenuCheck = fn; }, advance: (ms: number) => { now += ms; }, inbound };
 }
 
+test("a Duo prompt preserves the sign-in wait without consuming an article-agent attempt", async () => {
+  const h = await harness({ status: "auth_pending" });
+  const promptURL = "https://api-a1b2c3d4.duosecurity.com/prompt/EXAMPLE";
+  h.win.location.href = promptURL;
+  h.win.document.head.innerHTML = "<title>Login</title>";
+  h.win.document.body.innerHTML = "<main><h1>Check for a Duo Push</h1><button>Other options</button></main>";
+  h.tabs.patch(tabID, { url: promptURL, status: "complete" });
+  await h.tabs.onUpdated.emit(tabID, { url: promptURL, status: "complete" }, h.tabs.snapshot(tabID)!);
+  await flush();
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  expect(h.counts()).toEqual({ observations: 0, actions: 0, genericPlans: 0, menuChecks: 0 });
+  expect(h.frames.filter(frame => ["provider_drive_epoch_start_request", "agent_decide_request_v1", "provider_outcome", "page_capture", "auth_returned"].includes(frame.type))).toEqual([]);
+});
+
 for (const status of ["accepted", "auth_pending"] as const) test(`no-adapter ${status} article: WAIT, click, exact download correlation and normal adoption`, async () => {
   const h = await harness({ status, features: [...features, "session_evidence_v1"] });
   await h.classify(); // Must return while the epoch-start RPC is pending.

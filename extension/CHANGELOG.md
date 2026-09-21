@@ -18,6 +18,9 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Duo push prompts remain part of sign-in.** A prompt without a login path
+  no longer becomes an unsupported-publisher failure or consumes an article-agent
+  attempt. Papio waits for the authentication flow to return.
 - **Chrome adopts agent downloads that omit a tab ID.** Downloads after an
   article-agent navigation now match the exact page referrer, dispatch time and
   current document binding, including publishers with no adapter. Ambiguous or
