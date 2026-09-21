@@ -101,3 +101,8 @@ reported usage, excluding the projection and raw model response. Successful
 recoveries can inform source-controlled adapter repairs, subject to adverse-case
 regressions and a fresh declarative acquisition. Automatic repair promotion and
 shared analytics are separate work.
+
+Credential storage follow-up (2026-09-21): ADR-0030 selects one integration
+credential service with explicit references independent of filesystem paths.
+Its migration is not implemented yet; the path-scoped behavior described above
+remains current until that migration ships. Cloud enrollment stays explicit.

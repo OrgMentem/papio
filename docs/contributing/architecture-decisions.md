@@ -544,3 +544,21 @@ existing download reservation. It preserves the original baseline, expiry,
 permit and inference budget. Unexpected redirects stop the continuation. New
 tabs, cross-origin navigation and native viewers are later work. Browser-store
 acceptance remains unverified.
+
+## One credential service for configured integrations
+
+**Decision:** ADR-0030 selects a common credential service for API keys,
+OpenAIRE client credentials, document-delivery keys and webhook endpoints/tokens. Config
+will hold explicit references to typed records in the user's OS credential
+store, with environment-backed references for headless deployments. References
+survive config and data-directory moves; sharing between profiles is explicit.
+Cloud inference still requires enrollment in the profile that uses it.
+
+**Why:** TypeSafe currently uses the OS store while other integrations keep
+secrets in TOML. Common setup, resolution and diagnostics remove that mismatch
+and prevent config saves from serializing resolved secrets. Migration will
+verify stored records before atomically replacing legacy values, preserve
+working settings on failure, and retain compatibility readers. This is an
+accepted design; implementation is pending. Browser authentication and Zotero
+credentials retain their existing owners, and dataset-bound incident keys
+retain their existing lifecycle.
