@@ -30,6 +30,7 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 	cfg.Sources[SourceOpenAlex] = Source{Enabled: true, APIKey: "secret", RatePerSec: 2, Burst: 1}
 	cfg.Zotio.Executable = filepath.Join(t.TempDir(), "zotio")
 	cfg.Zotio.AttachmentMode = "linked-file"
+	cfg.Zotio.AutoImportPaused = true
 	cfg.Hooks.OnReady = "true"
 	cfg.Browser.DirectRoutesEnabled = false
 	if err := Save(cfg, path); err != nil {
@@ -44,6 +45,7 @@ func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
 		got.Sources[SourceOpenAlex].APIKey != "secret" ||
 		got.Zotio.Executable != cfg.Zotio.Executable ||
 		got.Zotio.AttachmentMode != "linked-file" || got.Hooks.OnReady != "true" ||
+		got.Zotio.AutoImportPaused != cfg.Zotio.AutoImportPaused ||
 		got.Browser.DirectRoutesEnabled != cfg.Browser.DirectRoutesEnabled || got.Path != path {
 		t.Fatalf("round trip = %+v", got)
 	}
@@ -388,12 +390,13 @@ func TestSaveValidatesBrowserIDs(t *testing.T) {
 	}
 }
 
-// TestBooleanConfigDefaultsAndToggles collapses four boolean default/toggle
+// TestBooleanConfigDefaultsAndToggles combines boolean default/toggle
 // checks that share an identical shape: assert the default of one boolean
 // config field, write a TOML snippet that toggles it, load the file, and
 // assert it flipped. Each default is a deliberate product decision —
 //
 //	zotio.auto_import off (import requires explicit opt-in),
+//	zotio.auto_import_paused off (automatic imports run unless paused),
 //	zotio.auto_enrich on (enrichment is expected by default),
 //	notify.enabled on (users expect notifications unless disabled),
 //	updates.check off (update checks are opt-in) —
@@ -414,6 +417,12 @@ func TestBooleanConfigDefaultsAndToggles(t *testing.T) {
 			get:         func(c Config) bool { return c.Zotio.AutoImport },
 			wantDefault: false,
 			toml:        "access_mode='conservative'\n[zotio]\nauto_import=true\n",
+		},
+		{
+			name:        "zotio.auto_import_paused defaults off and loads true",
+			get:         func(c Config) bool { return c.Zotio.AutoImportPaused },
+			wantDefault: false,
+			toml:        "access_mode='conservative'\n[zotio]\nauto_import_paused=true\n",
 		},
 		{
 			name:        "zotio.auto_enrich defaults on and loads false",

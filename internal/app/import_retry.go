@@ -111,7 +111,7 @@ func (r *ImportRetrier) RunDue(ctx context.Context) error {
 }
 
 func (s *Service) retryPendingImports(ctx context.Context) error {
-	if s == nil || s.AutoImporter == nil {
+	if s == nil || s.Config.Zotio.AutoImportPaused || s.AutoImporter == nil {
 		return nil
 	}
 	rows, err := s.Jobs.List(ctx, job.StateReady, readyImportScanLimit)

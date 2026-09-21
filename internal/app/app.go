@@ -4035,7 +4035,9 @@ func (s *Service) recordStandaloneOutcome(ctx context.Context, row *job.Row) {
 }
 
 func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
-	if !row.Policy.AutoImport {
+	if s.Config.Zotio.AutoImportPaused || !row.Policy.AutoImport {
+		// A pause leaves no import outcome: the ready job remains eligible
+		// for the retry sweep when automatic imports resume.
 		return
 	}
 	eventCtx := context.WithoutCancel(ctx)

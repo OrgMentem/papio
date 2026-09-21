@@ -185,6 +185,61 @@ func TestImportRetrierRunDueRetriesOnlyDueJobs(t *testing.T) {
 	}
 }
 
+func TestImportRetrierRunDuePausedLeavesReadyBatchUntouched(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	svc.AutoImporter = &fakeAutoImporter{err: zotio.WithErrorInfo(errors.New("transient"))}
+	due := []string{
+		seedReadyJobWithImportResult(t, svc, jobs, "wr_paused_batch_001"),
+		seedReadyJobWithImportResult(t, svc, jobs, "wr_paused_batch_002"),
+	}
+	// Also retain an already-delivered ready row: pausing the maintenance
+	// runner must skip reconciliation as well as fresh importer calls.
+	svc.AutoImporter = &fakeAutoImporter{status: "applied", parentKey: "P1", attachmentKey: "A1"}
+	delivered := seedReadyJobWithImportResult(t, svc, jobs, "wr_paused_delivered")
+	ids := append(append([]string(nil), due...), delivered)
+	eventCounts := make(map[string]int, len(ids))
+	for _, id := range ids {
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventCounts[id] = len(events)
+	}
+	capt := &selectiveImporter{status: "applied"}
+	svc.AutoImporter = capt
+	svc.Config.Zotio.AutoImportPaused = true
+	for range 2 {
+		if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if capt.callCount() != 0 {
+		t.Fatalf("paused batch imported %d jobs", capt.callCount())
+	}
+	for _, id := range ids {
+		row, err := jobs.Get(ctx, id)
+		if err != nil || row.State != job.StateReady || !row.Policy.AutoImport {
+			t.Fatalf("paused job = %+v, %v; want ready and original import policy", row, err)
+		}
+		events, err := jobs.Events(ctx, id)
+		if err != nil || len(events) != eventCounts[id] {
+			t.Fatalf("paused job %s events = %d, %v; want unchanged %d", id, len(events), err, eventCounts[id])
+		}
+	}
+	svc.Config.Zotio.AutoImportPaused = false
+	for range 2 {
+		if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if capt.callCount() != len(due) || !capt.calledFor(due[0]) || !capt.calledFor(due[1]) || capt.calledFor(delivered) {
+		t.Fatalf("resumed calls = %v, want each pending job once", capt.calls)
+	}
+}
+
 func TestImportRetrierRunDueAtCapIsNotRetried(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)

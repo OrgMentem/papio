@@ -403,6 +403,32 @@ func TestRunReportsActionsThatHaveGoneQuiet(t *testing.T) {
 	}
 }
 
+func TestRunReportsAutomaticImportsPaused(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		t.Run(fmt.Sprint(paused), func(t *testing.T) {
+			cfg := config.Default()
+			cfg.DataDir = t.TempDir()
+			cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+			cfg.Browser.AdoptionRoot = filepath.Join(t.TempDir(), "papio")
+			cfg.Zotio.AutoImportPaused = paused
+			report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil)
+			found := false
+			for _, check := range report.Checks {
+				if check.Name != "zotio_auto_import" {
+					continue
+				}
+				found = true
+				if check.Status != Skip || !strings.Contains(check.Detail, "previously queued jobs") || !strings.Contains(check.Remediation, "restart the daemon") {
+					t.Fatalf("pause diagnostic = %+v", check)
+				}
+			}
+			if found != paused {
+				t.Fatalf("pause diagnostic present = %v, configured = %v", found, paused)
+			}
+		})
+	}
+}
+
 func TestRunReportsMissingModeCredentialsToolsAndUnsafeConfig(t *testing.T) {
 	cfg := config.Default()
 	cfg.Sources[config.SourceOpenAlex] = config.Source{Enabled: true}

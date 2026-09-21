@@ -85,6 +85,9 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	checkCredentials(cfg, add, credentials...)
 	checkFiling(ctx, cfg, db, add)
 	checkRetraction(cfg, add)
+	if cfg.Zotio.AutoImportPaused {
+		add("zotio_auto_import", Skip, "automatic Zotero imports are paused, including previously queued jobs; library lookups are not paused", "set zotio.auto_import_paused to false and restart the daemon when ready to resume imports")
+	}
 
 	if err := checkDataDir(cfg.DataDir); err != nil {
 		msg := err.Error()

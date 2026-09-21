@@ -454,6 +454,10 @@ type Zotio struct {
 	AttachmentMode string `toml:"attachment_mode"`
 	AutoImport     bool   `toml:"auto_import"`
 	AutoEnrich     bool   `toml:"auto_enrich"`
+	// AutoImportPaused suspends automatic imports, including retries of jobs
+	// whose saved policy enables import. It preserves those policies and the
+	// Zotero integration; explicit imports remain available. Off by default.
+	AutoImportPaused bool `toml:"auto_import_paused"`
 	// ExceptionTags enables the reconciled Zotero exception-tag ledger:
 	// papio:needs-action / papio:unavailable written as automatic tags on
 	// linked items in the user's personal library. Off by default because it

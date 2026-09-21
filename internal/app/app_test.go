@@ -2032,6 +2032,70 @@ func TestProcessReadyAutoImportsOnce(t *testing.T) {
 		t.Fatalf("per-paper import notifications = %d, want none", notifier.imported)
 	}
 }
+
+func TestProcessReadyAutoImportPausedPreservesOldPolicyAndResumes(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	importer := &fakeAutoImporter{status: "applied", parentKey: "PARENT01", attachmentKey: "ATTACH01"}
+	svc.AutoImporter = importer
+	readyPipeline(svc)
+	id, err := svc.Submit(ctx, doiRequest("wr_auto_import_paused"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The new-job default cannot revoke an old job's import policy. The
+	// runtime pause must stop it even with the Zotero integration wired.
+	svc.Config.Zotio.AutoImport = false
+	svc.Config.Zotio.AutoImportPaused = true
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.State != job.StateReady || ready.ArtifactSHA256 == "" || !ready.Policy.AutoImport {
+		t.Fatalf("paused acquisition = %+v, want ready artifact and original import policy", ready)
+	}
+	if importer.calls != 0 {
+		t.Fatalf("paused import calls = %d, want 0", importer.calls)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "zotio.auto_import" {
+			t.Fatalf("pause recorded an import outcome: %#v", event)
+		}
+	}
+	if !importNeedsRetry(events) {
+		t.Fatal("paused acquisition lost import retry eligibility")
+	}
+
+	svc.Config.Zotio.AutoImportPaused = false
+	for range 2 {
+		if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if importer.calls != 1 {
+		t.Fatalf("resumed import calls = %d, want exactly 1", importer.calls)
+	}
+	if detail := autoImportEvent(t, jobs, id); detail["status"] != "applied" {
+		t.Fatalf("resumed import = %#v", detail)
+	}
+	after, err := jobs.Get(ctx, id)
+	if err != nil || !after.Policy.AutoImport || after.ArtifactSHA256 != ready.ArtifactSHA256 {
+		t.Fatalf("resumed job = %+v, %v; want original policy and artifact", after, err)
+	}
+}
+
 func TestAutoImportCancellationDoesNotRecordFailure(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Config.Zotio.AutoImport = true

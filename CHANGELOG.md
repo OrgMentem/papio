@@ -11,6 +11,10 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Pause automatic Zotero imports without disabling acquisition or library lookups.**
+  Set `zotio.auto_import_paused = true` and restart the daemon. The pause covers
+  older jobs and import retries, preserves their saved policies, and appears in
+  `papio doctor`. Clearing it resumes eligible pending imports after restart.
 - **One credential service for integration secrets.** `papio config credentials`
   sets, binds, inspects, detaches, deletes and migrates typed records in the OS
   credential store. Config contains stable references; explicit environment
