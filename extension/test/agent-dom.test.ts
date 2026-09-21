@@ -270,6 +270,86 @@ test("scope and live citation are required without an adapter registry", async (
   expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
 });
 
+// Minimal public structure from a labelled article DOI field; no captured
+// title, identifiers, account state, or provider-specific selectors.
+const primaryDOIField = (value = doi) => `<div><strong>DOI: </strong><a href="https://doi.org/${value}">${value}</a></div>`;
+const primaryDOIPage = (field = primaryDOIField()) => `<main><h1>Example article</h1><section><h2>Abstract</h2>${field}</section><button type="button">Download PDF</button></main>`;
+
+test("visible primary DOI field supports independently serialized observation and action", async () => {
+  const win = setup(primaryDOIPage());
+  const injected = new Function(`return (${agentDOM.toString()});`)() as typeof agentDOM;
+  let clicks = 0;
+  win.document.querySelector("button")!.addEventListener("click", () => clicks++);
+  const first = observed(await injected({ method: "observe", entryURL, doi }));
+  expect(first.observation.doi).toBe(doi.toLowerCase());
+  const pdf = first.observation.controls.find(control => control.label.startsWith("Download PDF"))!;
+  expect(pdf.disabled).toBe(false);
+  expect(await injected({ method: "act", entryURL, doi, document: first.document, revision: first.observation.revision, choice: pdf.id })).toEqual({ status: "dispatched", downloadExpected: true });
+  expect(clicks).toBe(1);
+});
+
+for (const secondary of [
+  `<section><h2>References</h2>${primaryDOIField()}</section>`,
+  `<section><div><h2>References</h2></div>${primaryDOIField()}</section>`,
+  `<section><div><div><h2>References</h2><button>Export</button></div></div>${primaryDOIField()}</section>`,
+  `<div class="reference-list">${primaryDOIField()}</div>`,
+  `<section role="doc-bibliography">${primaryDOIField()}</section>`,
+  `<aside>${primaryDOIField()}</aside>`,
+  `<section><h2>More Like This</h2>${primaryDOIField()}</section>`,
+  `<ol><li>${primaryDOIField()}</li></ol>`,
+  `<p>For details see <a href="https://doi.org/${doi}">${doi}</a>.</p>`,
+  `<div hidden>${primaryDOIField()}</div>`,
+  primaryDOIField().replace("<div>", '<div class="reference-item">'),
+  primaryDOIField().replace("<a ", '<a role="doc-biblioref" '),
+] as const) test(`secondary or unlabelled DOI cannot establish article identity: ${secondary.slice(0, 45)}`, async () => {
+  setup(`<main><h1>Example article</h1>${secondary}<button>Download PDF</button></main>`);
+  expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
+});
+
+test("wrong metadata wins over matching primary and reference DOI fields", async () => {
+  setup(`<meta name="citation_doi" content="10.9999/other">${primaryDOIPage()}<article><h2>References</h2>${primaryDOIField()}</article>`);
+  expect(await observe()).toEqual({ status: "blocked", reason: "identity_conflicting" });
+});
+
+test("a primary DOI field ignores a different DOI in a later reference section", async () => {
+  setup(primaryDOIPage().replace("</main>", `<h2>References</h2>${primaryDOIField("10.9999/reference")}</main>`));
+  expect((await observe()).status).toBe("observed");
+});
+
+test("wrapped primary headings and later wrapped references preserve the primary DOI field", async () => {
+  setup(`<main><h1>Example article</h1><section><div><h2>Abstract</h2></div>${primaryDOIField()}</section><section><div><h2>References</h2></div>${primaryDOIField("10.9999/reference")}</section><button>Download PDF</button></main>`);
+  expect((await observe()).status).toBe("observed");
+});
+
+test("conflicting primary DOI fields refuse even without standard metadata", async () => {
+  setup(primaryDOIPage(primaryDOIField() + primaryDOIField("10.9999/other")));
+  expect(await observe()).toEqual({ status: "blocked", reason: "identity_conflicting" });
+});
+
+for (const primary of [
+  primaryDOIField() + primaryDOIField("10.9999/other"),
+  `<div><strong>DOI:</strong><a href="https://doi.org/10.9999/other">${doi}</a></div>`,
+  primaryDOIField("10.9999/other"),
+]) test(`conflicting primary DOI claims refuse: ${primary.slice(-55)}`, async () => {
+  setup(`<meta name="citation_doi" content="${doi}">${primaryDOIPage(primary)}`);
+  expect(await observe()).toEqual({ status: "blocked", reason: "identity_conflicting" });
+});
+
+for (const change of ["href", "text", "remove", "reference", "metadata"] as const)
+  test(`primary DOI identity is rechecked before action after ${change} changes`, async () => {
+    const win = setup(primaryDOIPage());
+    let clicks = 0; win.document.querySelector("button")!.addEventListener("click", () => clicks++);
+    const first = observed(await observe());
+    const field = win.document.querySelector("section div")!;
+    if (change === "href") field.querySelector("a")!.setAttribute("href", "https://doi.org/10.9999/other");
+    if (change === "text") field.querySelector("a")!.textContent = "10.9999/other";
+    if (change === "remove") field.remove();
+    if (change === "reference") win.document.querySelector("h2")!.textContent = "References";
+    if (change === "metadata") win.document.head.insertAdjacentHTML("beforeend", '<meta name="citation_doi" content="10.9999/other">');
+    expect(await act(first)).toEqual({ status: "blocked", reason: change === "remove" || change === "reference" ? "identity_missing" : "identity_conflicting" });
+    expect(clicks).toBe(0);
+  });
+
 for (const [name, content] of [
   ["citation_doi", doi], ["dc.identifier", doi], ["DC.Identifier", `doi:${doi}`],
   ["dc.identifier", `https://doi.org/${doi}`], ["dc.identifier", `http://dx.doi.org/${doi}`],

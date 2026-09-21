@@ -120,21 +120,58 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     if (/\b(accept|agree|consent|acknowledge|permissions?|authorize|allow access)\b/i.test(text)) return "consent_required";
     return "human_action_required";
   };
+  const primaryArticleDOIs = (): string[] => {
+    const claims: string[] = [];
+    const secondary = /(?:^|[\s_-])(?:refs?|references?|bibliograph(?:y|ies)|citations?|related|recommended|recommendations?)(?:$|[\s_-])/i;
+    const secondaryHeading = /^(?:references?|bibliography|citations?|related (?:articles?|content)|recommended (?:articles?|content)|more like this|further reading)\b/i;
+    const headingSelector = 'h1,h2,h3,h4,h5,h6,[role="heading"]';
+    const sectionSelector = 'section,article,aside,main,[role="region"],[role="main"]';
+    for (const anchor of document.querySelectorAll('main a[href],article a[href],[role="main"] a[href]')) {
+      const href = anchor.getAttribute("href") ?? "";
+      if (!/^https?:\/\/(?:dx\.)?doi\.org\//i.test(href) || !visible(anchor) ||
+        anchor.closest(`${privateSelector},aside,blockquote,cite,ol,ul,[itemprop~="citation"],[role="doc-biblioref"],[role="doc-bibliography"],[role="doc-endnotes"]`)) continue;
+      // A property field, not a DOI mentioned in prose or a reference link:
+      // exactly the visible label and its value, with no surrounding text.
+      const field = anchor.parentElement;
+      const name = anchor.previousElementSibling;
+      if (!field?.matches("div,p,dd") || field.children.length !== 2 || !name?.matches("strong,b,span") ||
+        !visible(name) || !/^doi\s*:$/i.test(publicText(name).trim()) ||
+        Array.from(field.childNodes).some(node => node.nodeType === 3 && node.textContent?.trim())) continue;
+      let excluded = false;
+      for (let branch: Element = anchor, region: Element | null = field; region; branch = region, region = region.parentElement) {
+        if (secondary.test([region.id, region.getAttribute("class"), region.getAttribute("aria-label"), region.getAttribute("itemprop")].join(" "))) { excluded = true; break; }
+        // Headings can sit inside layout wrappers. Read only semantic headings
+        // in preceding siblings, within this same section; a separate sibling
+        // section's heading does not relabel the article field.
+        const siblings = Array.from(region.children);
+        const section = region.closest(sectionSelector);
+        const heading = siblings.slice(0, siblings.indexOf(branch)).reverse()
+          .flatMap(node => node.matches(headingSelector) ? [node] : Array.from(node.querySelectorAll(headingSelector)))
+          .find(node => node.closest(sectionSelector) === section && visible(node));
+        if (heading && secondaryHeading.test(publicText(heading).trim())) { excluded = true; break; }
+      }
+      if (!excluded) claims.push(normalizeDOI(href), normalizeDOI(publicText(anchor)));
+    }
+    return claims;
+  };
   const validate = (): AgentDOMRefusalReason | undefined => {
     const current = new URL(location.href);
     if (entry.protocol !== "https:" || current.protocol !== "https:" || entry.username || entry.password || current.username || current.password || current.origin !== entry.origin || current.pathname !== entry.pathname) return "page_binding_failed";
     if (request.allowNavigation && current.href !== entry.href) return "page_binding_failed";
     // DC identifiers can name ISBNs, local records or URLs unrelated to a DOI.
     // Only explicit DOI forms count there; every DOI claim across all three
-    // standard fields must agree. No body/URL sniffing or first-hit fallback.
+    // standard fields must agree before considering a labelled public field.
     const citations = Array.from(document.querySelectorAll("meta[name]"))
       .filter(node => ["citation_doi", "dc.identifier", "prism.doi"].includes((node.getAttribute("name") ?? "").trim().toLowerCase()))
       .filter(node => node.getAttribute("name")?.trim().toLowerCase() !== "dc.identifier" ||
         /^(?:10\.|doi:|https?:\/\/(?:dx\.)?doi\.org\/)/i.test((node.getAttribute("content") ?? "").trim()))
       .map(node => normalizeDOI(node.getAttribute("content") ?? ""));
     if (!/^10\.\d{4,9}\/[^\s<>"\u0000-\u001f\u007f]+$/.test(doi)) return "identity_invalid";
-    if (!citations.length || citations.every(value => value === "")) return "identity_missing";
-    if (citations.some(value => value !== doi)) return "identity_conflicting";
+    const hasMetadata = citations.some(value => value !== "");
+    if (hasMetadata && citations.some(value => value !== doi)) return "identity_conflicting";
+    const primary = primaryArticleDOIs();
+    if (primary.some(value => value !== doi)) return "identity_conflicting";
+    if (!hasMetadata && primary.length === 0) return "identity_missing";
     // Visible credential/payment entry is a human gate. Ordinary search and
     // newsletter fields are unrelated; their values are never projected.
     const field = Array.from(document.querySelectorAll("input,textarea,select")).find(node => sensitiveField(node) && visible(node, false));

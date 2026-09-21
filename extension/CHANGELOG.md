@@ -28,6 +28,12 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Article-agent identity checks accept a labelled DOI in the article.**
+  Publishers without citation metadata can use a visible DOI field in the main
+  article. Link text and destination must agree; conflicting metadata, reference
+  lists and related-paper sections remain excluded. Identity is checked again
+  before an action.
+
 - **Skipped article-agent fallback now explains why.** Unknown provider pages
   report missing backend support, article identity or browser authority, and
   distinguish attempts that already ran or have a download pending.
