@@ -3,7 +3,7 @@
 import type { AgentDecideObservation } from "./protocol";
 export type AgentObservation = AgentDecideObservation;
 export interface AgentDOMRequest {
-  method: "observe" | "prepare" | "act" | "check_menu";
+  method: "observe" | "prepare" | "act" | "check_menu" | "observe_pdf" | "act_pdf";
   entryURL: string;
   doi: string;
   /** Worker-local document identity: a navigation/reload cannot resume a loop. */
@@ -13,7 +13,11 @@ export interface AgentDOMRequest {
   /** Negotiated worker capability; URLs remain internal, never model input. */
   allowNavigation?: boolean;
   destination?: string;
-  /** Absolute browser clock deadline; queued injections cannot outlive it. */
+  /** Worker-only predecessor of its exact selected same-origin navigation.
+   * Authorizes only one exposed PDF transfer, never inherited model controls. */
+  sourceURL?: string;
+  /** Absolute browser clock deadline; queued injections cannot outlive it.
+   * Required at runtime for act_pdf, which cannot inherit an unbounded grant. */
   actionDeadline?: number;
   /** Only the worker's unchanged-source navigation wait can resume this menu. */
   resumeNavigation?: boolean;
@@ -26,6 +30,7 @@ export type AgentDOMRefusalReason =
   | "payment_required" | "human_action_required" | "invalid_request";
 export type AgentDOMResult =
   | { status: "observed"; document: string; observation: AgentObservation }
+  | { status: "pdf_observed"; document: string; revision: string }
   | { status: "prepared"; effect: "local" | "navigate"; destination?: string }
   | { status: "dispatched"; downloadExpected: boolean; menuPending?: true }
   | { status: "menu_checked"; ready: boolean }
@@ -42,6 +47,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   try { entry = new URL(request.entryURL); }
   catch { return { status: "blocked", reason: "page_binding_failed" }; }
   const binding = JSON.stringify([entry.origin, entry.pathname, doi]);
+  const pdfWrapper = request.method === "observe_pdf" || request.method === "act_pdf";
   const host = globalThis as typeof globalThis & { papioArticleAgent?: {
     node: Document; document: string; binding: string; ids: WeakMap<Element, string>; next: number; serial: number;
     consumed: Set<string>;
@@ -49,6 +55,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     prepared?: { revision: string; choice: string; destination: string };
     menuWait?: { revision: string; url: string; enabled: Set<string>; navigation?: true };
     observed?: { revision: string; source: string; targets: Map<string, Element> };
+    pdfObserved?: { revision: string; source: string; target: Element };
   } };
   const safe = (raw: string | null | undefined, limit = 240) => (raw ?? "")
     .replace(/\b[a-z][a-z\d+.-]*:\/\/\S+|\bwww\.\S+|(?:^|\s)\/\S+|[?#]\S+/gi, " [redacted]")
@@ -158,6 +165,15 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     const current = new URL(location.href);
     if (entry.protocol !== "https:" || current.protocol !== "https:" || entry.username || entry.password || current.username || current.password || current.origin !== entry.origin || current.pathname !== entry.pathname) return "page_binding_failed";
     if (request.allowNavigation && current.href !== entry.href) return "page_binding_failed";
+    if (pdfWrapper) {
+      try {
+        if (!request.sourceURL || !/^https:\/\//i.test(request.sourceURL) || /[\u0000-\u0020\u007f\\]/.test(request.sourceURL) ||
+          /%(?![a-f\d]{2})/i.test(request.sourceURL)) return "page_binding_failed";
+        const source = new URL(request.sourceURL ?? "");
+        if (request.allowNavigation !== true || source.protocol !== "https:" || source.username || source.password ||
+          source.origin !== current.origin || source.href === current.href) return "page_binding_failed";
+      } catch { return "page_binding_failed"; }
+    }
     // DC identifiers can name ISBNs, local records or URLs unrelated to a DOI.
     // Only explicit DOI forms count there; every DOI claim across all three
     // standard fields must agree before considering a labelled public field.
@@ -168,10 +184,10 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       .map(node => normalizeDOI(node.getAttribute("content") ?? ""));
     if (!/^10\.\d{4,9}\/[^\s<>"\u0000-\u001f\u007f]+$/.test(doi)) return "identity_invalid";
     const hasMetadata = citations.some(value => value !== "");
-    if (hasMetadata && citations.some(value => value !== doi)) return "identity_conflicting";
+    if ((hasMetadata || pdfWrapper) && citations.some(value => value !== doi)) return "identity_conflicting";
     const primary = primaryArticleDOIs();
     if (primary.some(value => value !== doi)) return "identity_conflicting";
-    if (!hasMetadata && primary.length === 0) return "identity_missing";
+    if (!hasMetadata && primary.length === 0 && !pdfWrapper) return "identity_missing";
     // Visible credential/payment entry is a human gate. Ordinary search and
     // newsletter fields are unrelated; their values are never projected.
     const field = Array.from(document.querySelectorAll("input,textarea,select")).find(node => sensitiveField(node) && visible(node, false));
@@ -184,6 +200,11 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       const text = `${dialog.getAttribute("aria-label") ?? ""} ${gateText(dialog)}`;
       if (human.test(text)) return humanReason(text);
     }
+    // A wrapper transfer has no model-selected control to run through allowed().
+    // Visible gate controls outside dialogs must therefore stop it here too.
+    if (pdfWrapper) for (const control of document.querySelectorAll('a[href],button,[role="button"],[role="link"]')) {
+      if (visible(control, false) && human.test(label(control))) return humanReason(label(control));
+    }
     return undefined;
   };
   const refusal = validate();
@@ -194,6 +215,70 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   const state = host.papioArticleAgent;
   const checkingNavigationMenu = request.method === "check_menu" && request.resumeNavigation === true && state.menuWait?.navigation === true;
   if ((state.retired && !checkingNavigationMenu) || state.binding !== binding || (request.document !== undefined && state.document !== request.document)) return { status: "stale", reason: "document_changed" };
+  if (pdfWrapper) {
+    if (request.method === "act_pdf" && request.actionDeadline === undefined) return { status: "blocked", reason: "invalid_request" };
+    // Only the worker can attest to the preceding selected navigation. This
+    // branch reads the wrapper's exposed attributes, never an embedded document
+    // or a native viewer, and produces no model observation or URL-bearing result.
+    const pdfSnapshot = () => {
+      if (host.papioArticleAgent !== state || state.node !== document) return { status: "stale" as const, reason: "document_changed" as const };
+      const reason = validate();
+      if (reason) return { status: "blocked" as const, reason };
+      // Count every visible embedded medium before testing PDF eligibility. A
+      // second frame of unknown type cannot silently be assumed unrelated.
+      const media = Array.from(document.querySelectorAll("embed,iframe,object,frame,video,audio")).filter(element => visible(element));
+      const target = media[0];
+      if (media.length !== 1 || !target || target.namespaceURI !== "http://www.w3.org/1999/xhtml" ||
+        !target.matches("embed,iframe,object") || target.hasAttribute("srcdoc")) return { status: "blocked" as const, reason: "observation_changed" as const };
+      const raw = target.getAttribute(target.tagName === "OBJECT" ? "data" : "src");
+      if (!raw?.trim() || /[\u0000-\u0020\u007f\\]/.test(raw) || /%(?![a-f\d]{2})/i.test(raw)) return { status: "blocked" as const, reason: "observation_changed" as const };
+      let file: URL;
+      try { file = new URL(raw, document.baseURI); }
+      catch { return { status: "blocked" as const, reason: "observation_changed" as const }; }
+      if (file.protocol !== "https:" || file.origin !== entry.origin || file.username || file.password ||
+        (!/\.pdf$/i.test(file.pathname) && target.getAttribute("type")?.trim().toLowerCase() !== "application/pdf")) return { status: "blocked" as const, reason: "observation_changed" as const };
+      const source = JSON.stringify(["pdf", state.document, location.href, file.href, request.sourceURL, doi]);
+      if (request.actionDeadline !== undefined && (!Number.isSafeInteger(request.actionDeadline) || request.actionDeadline < 0)) return { status: "blocked" as const, reason: "invalid_request" as const };
+      if (request.actionDeadline !== undefined && Date.now() >= request.actionDeadline) return { status: "stale" as const, reason: "observation_changed" as const };
+      return { status: "pdf" as const, source, target, fileURL: file.href };
+    };
+    const current = pdfSnapshot();
+    if (current.status !== "pdf") return current;
+    if (request.method === "act_pdf") {
+      const previous = state.pdfObserved;
+      if (!previous || request.document !== state.document || request.revision !== previous.revision || state.consumed.has(previous.revision) ||
+        previous.source !== current.source || previous.target !== current.target || !current.target.isConnected) return { status: "stale", reason: "observation_changed" };
+      // Synchronous freshness check above, consumption before dispatch: even a
+      // throwing or re-entrant click cannot reuse this inherited authorization.
+      delete state.pdfObserved;
+      delete state.observed;
+      delete state.prepared;
+      delete state.menuWait;
+      state.consumed.add(previous.revision);
+      state.serial++;
+      state.retired = true;
+      const anchor = document.createElement("a");
+      anchor.href = current.fileURL;
+      anchor.download = "";
+      anchor.target = "_self";
+      try {
+        document.body.appendChild(anchor);
+        HTMLElement.prototype.click.call(anchor);
+      } finally { anchor.remove(); }
+      return { status: "dispatched", downloadExpected: true };
+    }
+    const serial = ++state.serial;
+    delete state.pdfObserved;
+    delete state.observed;
+    delete state.prepared;
+    delete state.menuWait;
+    const revision = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(current.source)))).map(n => n.toString(16).padStart(2, "0")).join("");
+    const fresh = pdfSnapshot();
+    if (fresh.status !== "pdf") return { status: "stale", reason: fresh.reason };
+    if (state.serial !== serial || fresh.source !== current.source || fresh.target !== current.target) return { status: "stale", reason: "observation_changed" };
+    state.pdfObserved = { revision, source: fresh.source, target: fresh.target };
+    return { status: "pdf_observed", document: state.document, revision };
+  }
   const scope = 'main,article,[role="main"]';
   const native = 'a[href],button,summary,input[type="button"],input[type="submit"],input[type="image"]';
   const selector = `${native},[role="button"],[role="link"],[role="menuitem"],[role="tab"],[aria-controls],[aria-haspopup],[tabindex],[onclick],.button,.btn`;
@@ -351,6 +436,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   }
   if (request.method !== "observe") return { status: "blocked", reason: "invalid_request" };
   const serial = ++state.serial;
+  delete state.pdfObserved;
   delete state.observed;
   delete state.prepared;
   const revision = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(current.source)))).map(n => n.toString(16).padStart(2, "0")).join("");

@@ -18,6 +18,9 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Article-agent decisions tolerate a page finishing its render.** If controls
+  change during inference, Papio takes a fresh observation before clicking,
+  within the same time and decision limits. It never repeats a dispatched click.
 - **Chrome institution keepalive creates its tab again.** Papio now creates
   the pinned tab before muting it, using the operations Chrome supports. A
   failed mute removes only the new tab so retries do not leave duplicates.
@@ -27,6 +30,13 @@ for the full pre-split extension history.
   navigating again, including publishers with no adapter.
 
 ### Added
+
+- **Article-agent navigation can save a PDF embedded in a publisher page.**
+  After following an exact same-origin link from a verified article, Papio can
+  download the page's single exposed PDF without requiring citation metadata in
+  the surrounding HTML. It retains the original download attempt and validates
+  the saved file before accepting it. Changed pages, conflicting identity,
+  consent prompts and ambiguous embedded files stop the attempt.
 
 - **Article-agent identity checks accept a labelled DOI in the article.**
   Publishers without citation metadata can use a visible DOI field in the main

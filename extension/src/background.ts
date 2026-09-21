@@ -1672,6 +1672,8 @@ interface AgentNavigation {
   departed: boolean;
   invalid: boolean;
   verifying: boolean;
+  /** Navigation has settled; only this wrapper's file download may follow. */
+  acquiringPDF?: boolean;
   settled: Promise<void>;
   settle: () => void;
   stopped: Promise<void>;
@@ -7827,7 +7829,7 @@ export class Bridge {
         for (const pending of this.agentNavigations.values()) {
           if (pending.tabID !== d.tabId) continue;
           pending.departed = true;
-          if (pending.verifying || (d.url !== undefined && d.url !== pending.sourceURL && d.url !== pending.destination)) pending.stop();
+          if (pending.verifying || pending.acquiringPDF || (d.url !== undefined && d.url !== pending.sourceURL && d.url !== pending.destination)) pending.stop();
         }
         observeNavigation(d);
         // A committed top-frame navigation replaces the document the manual
@@ -17945,7 +17947,7 @@ export class Bridge {
       const observedURL = change.url ?? tab.url;
       if (pending && observedURL !== undefined && observedURL !== pending.sourceURL) pending.departed = true;
       if (pending && ((observedURL !== undefined && observedURL !== pending.sourceURL && observedURL !== pending.destination) ||
-        (pending.verifying && change.status === "loading"))) pending.stop();
+        ((pending.verifying || pending.acquiringPDF) && change.status === "loading"))) pending.stop();
       return;
     }
     const staleRecoveryNavigationInFlight =
@@ -20045,10 +20047,19 @@ export class Bridge {
             await pause(); continue;
           }
           pending.verifying = true;
-          const observed = (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
+          let observed = (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
             args: [{ method: "observe", entryURL: pending.destination, doi: job.expected!.doi!, allowNavigation: true } satisfies AgentDOMRequest],
           }).catch(() => []))[0]?.result as AgentDOMResult | undefined;
-          if (!authorized() || pending.invalid || observed?.status !== "observed") {
+          if (authorized() && !pending.invalid && observed?.status === "blocked" && observed.reason === "identity_missing") {
+            // A selected PDF control can lead to an HTML wrapper whose only
+            // article identity is inside the file. It grants no further model
+            // actions: acquire only its exposed PDF, then validate the bytes.
+            observed = (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
+              args: [{ method: "observe_pdf", entryURL: pending.destination, sourceURL: pending.sourceURL,
+                doi: job.expected!.doi!, allowNavigation: true } satisfies AgentDOMRequest],
+            }).catch(() => []))[0]?.result as AgentDOMResult | undefined;
+          }
+          if (!authorized() || pending.invalid || (observed?.status !== "observed" && observed?.status !== "pdf_observed")) {
             if (observed?.status === "blocked" || observed?.status === "stale") exitDetail = domDetail(observed.reason);
             return false;
           }
@@ -20090,6 +20101,40 @@ export class Bridge {
           if (track!.agentDocument) delete track!.agentDocument.dispatchedAt;
           visitedDocuments.add(documentID);
           visitedURLs.add(entryURL);
+          if (observed.status === "pdf_observed") {
+            const sourceURL = pending.sourceURL;
+            // Release receipt checks before dispatch: a synchronous onCreated
+            // must not wait for the very injection that triggered it. Keep the
+            // stop/timer hook alive, now bound to the settled wrapper only.
+            pending.sourceURL = entryURL;
+            pending.departed = false;
+            pending.verifying = false;
+            pending.acquiringPDF = true;
+            pending.settle();
+            if (!(await destinationFresh()) || !(await liveTab()) || !authorized()) return false;
+            if (native && !(await this.nativeDownloadFresh(jobID, track!))) return false;
+            if (!authorized() || pending.invalid || this.deps.now() >= until) return false;
+            if (native) track!.native!.recovery.dispatched_at_ms = this.deps.now();
+            if (track!.agentDocument) track!.agentDocument.dispatchedAt = this.deps.now();
+            const dispatch = this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
+              args: [{ method: "act_pdf", entryURL, sourceURL, doi: job.expected!.doi!, document: documentID,
+                revision: observed.revision, allowNavigation: true,
+                actionDeadline: Date.now() + Math.max(0, until - this.deps.now()) } satisfies AgentDOMRequest],
+            }).catch(() => []);
+            const action = (await Promise.race([dispatch, pending.stopped.then(() => [])]))[0]?.result as AgentDOMResult | undefined;
+            if (downloaded()) return false;
+            if (!authorized() || pending.invalid) return false;
+            if (action?.status !== "dispatched") {
+              if (action?.status === "blocked" || action?.status === "stale") exitDetail = domDetail(action.reason);
+              return false;
+            }
+            await this.update(store => authorized() ? { ...store, activeJobs: store.activeJobs.map(current =>
+              current.job_id === jobID ? { ...current, agent_fallback_pending_until: until } as ActiveJob : current) } : store);
+            if (native) await this.persistNativeDownload(jobID, track!);
+            while (this.deps.now() < until && authorized() && !pending.invalid) await pause();
+            exitDetail = "Article agent fallback timed out waiting for the browser to download the displayed PDF.";
+            return false;
+          }
           return true;
         }
         return false;
@@ -20189,7 +20234,18 @@ export class Bridge {
             args: [{ method: "prepare", entryURL: entryURL!, doi: job.expected!.doi!, document: documentID,
               revision: observation.revision, choice, allowNavigation: true } satisfies AgentDOMRequest],
           }))[0]?.result as AgentDOMResult | undefined;
-          if (!authorized() || prepared?.status !== "prepared") return;
+          if (!authorized()) return;
+          if (prepared?.status !== "prepared") {
+            if (prepared?.status === "blocked" || prepared?.status === "stale") exitDetail = domDetail(prepared.reason);
+            if (prepared?.status === "stale" && prepared.reason === "observation_changed") {
+              // No click has been submitted. A publisher can finish rendering
+              // during inference; decide from a fresh view under the same
+              // deadline and decision budget instead of abandoning the paper.
+              await pause();
+              continue;
+            }
+            return;
+          }
           if (prepared.effect === "navigate") {
             const target = prepared.destination && new URL(prepared.destination);
             if (!target || target.protocol !== "https:" || target.username || target.password || target.origin !== new URL(entryURL!).origin ||
@@ -21934,7 +21990,7 @@ export class Bridge {
     if (!permitted || !this.nativeDownloadAuthority(jobID, track)) return false;
     const result = await this.deps.scripting.executeScript({ target: { tabId: n.tabID }, func: nativeDownloadDocumentCurrent,
       args: [n.recovery.document_id, n.articleURL] }).catch(() => []);
-    return result[0]?.result === true && this.nativeDownloadAuthority(jobID, track);
+    return !transition?.invalid && result[0]?.result === true && this.nativeDownloadAuthority(jobID, track);
   }
 
   private async persistNativeDownload(jobID: string, track: DownloadTrack): Promise<void> {
@@ -22056,9 +22112,10 @@ export class Bridge {
 
   private async agentNavigationDownloadFresh(jobID: string, track: DownloadTrack): Promise<boolean> {
     const binding = track.agentDocument!;
+    const transition = this.agentNavigations.get(jobID);
     const valid = () => {
       const job = findByJob(this.store, jobID);
-      return this.downloads.get(jobID) === track && !track.ambiguous && binding.generation === this.portGeneration &&
+      return !transition?.invalid && this.downloads.get(jobID) === track && !track.ambiguous && binding.generation === this.portGeneration &&
         binding.holderGeneration === this.lastKnownBrowserHolderGeneration &&
         this.agentFallbackAvailable() && !!job && this.hasDelegatedAuthority(job) && job.tab_id === binding.tabID &&
         (job.status === "accepted" || job.status === "awaiting_download" || job.status === "auth_pending") &&
@@ -22085,7 +22142,7 @@ export class Bridge {
       const pending = this.agentNavigations.get(agentJob.job_id);
       agentTrack.agentDocument.checking = (async () => {
         await pending?.settled;
-        if (pending?.invalid || !(await this.agentNavigationDownloadFresh(agentJob.job_id, agentTrack))) agentTrack.ambiguous = true;
+        if (pending?.invalid || !(await this.agentNavigationDownloadFresh(agentJob.job_id, agentTrack)) || pending?.invalid) agentTrack.ambiguous = true;
       })();
       await agentTrack.agentDocument.checking;
       if (agentTrack.ambiguous) return;

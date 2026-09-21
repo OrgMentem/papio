@@ -1484,3 +1484,201 @@ for (const departed of [true, false]) test(`Chrome filename steering ${departed 
   else expect(suggestion).toContain(`papio/${jobID}/`);
   expect(h.frames.some(frame => frame.type === "download_complete")).toBe(false);
 });
+
+for (const firefox of [false, true]) for (const timing of ["synchronous", "delayed"] as const) test(`${firefox ? "Firefox" : "Chrome"} agent PDF wrapper saves the exposed file with the original producer (${timing})`, async () => {
+  const h = await navigationHarness(firefox);
+  const fileURL = "https://unregistered.example/files/article.pdf?token=private";
+  const item = firefoxItem(h, { referrer: navigationURL, url: fileURL, ...(firefox ? {} : { tabId: tabID, filename: "article.pdf" }) });
+  let created: Promise<void> | undefined, saves = 0;
+  h.setAfterAct(async () => {
+    const win = await h.land(navigationURL, "");
+    win.document.body.innerHTML = `<iframe src="${fileURL}"></iframe>`;
+    win.document.body.addEventListener("click", event => {
+      const anchor = event.target as unknown as HTMLAnchorElement;
+      if (anchor.tagName !== "A") return;
+      event.preventDefault();
+      expect(anchor.href).toBe(fileURL); expect(anchor.hasAttribute("download")).toBe(true);
+      saves++; if (timing === "synchronous") created = h.downloads.onCreated.emit(item);
+    });
+  });
+  await h.classify(); await h.started(); await h.decide("decision", "c1");
+  if (firefox) {
+    const arm = await h.request("native_download_arm_request_v1");
+    await h.reply(arm, "native_download_arm_result_v1", { outcome: "armed", reservation_id: reservationID, expires_at_ms: h.now() + 120_000 });
+    const rebound = await h.request("native_download_rebind_request_v1");
+    expect(saves).toBe(0);
+    await h.reply(rebound, "native_download_rebind_result_v1", { reservation_id: reservationID, outcome: "rebound" });
+  }
+  await until(() => saves === 1);
+  if (timing === "delayed") {
+    await until(() => h.timers.some(timer => timer.ms === 1000));
+    await h.tick();
+    expect(h.frames.some(frame => frame.type === "provider_drive_epoch_result_request")).toBe(false);
+    created = h.downloads.onCreated.emit(item);
+  }
+  await created;
+  expect(h.frames.filter(frame => frame.type === "agent_decide_request_v1")).toHaveLength(1);
+  expect(h.counts().actions).toBe(1);
+  if (firefox) {
+    const completing = completeNative(h, item);
+    const imported = await h.request("native_download_import_request_v1");
+    const rebound = h.frames.find(frame => frame.type === "native_download_rebind_request_v1")!;
+    expect(imported.payload["document_id"]).toBe(rebound.payload["next_document_id"]);
+    await h.reply(imported, "native_download_import_result_v1", { reservation_id: reservationID, download_id: item.id, outcome: "ready" });
+    await completing;
+    expect(h.frames.some(frame => frame.type === "provider_drive_epoch_result_request")).toBe(false);
+  } else {
+    let suggestion: string | undefined;
+    await h.downloads.onDeterminingFilename.emit(item, value => { suggestion = value.filename; });
+    expect(suggestion).toContain(`papio/${jobID}/`);
+    h.downloads.items.set(item.id, { ...item, filename: `/tmp/papio/${jobID}/article.pdf`, state: "complete", fileSize: 123, mime: "application/pdf" });
+    const completing = h.downloads.onChanged.emit({ id: item.id, state: { current: "complete" } });
+    await h.settle(); await completing;
+    expect(h.frames.find(frame => frame.type === "download_complete")?.payload["producer"]).toEqual({ effect_kind: "generic_drive", ...epoch });
+  }
+  expect(JSON.stringify(h.frames)).not.toContain(fileURL);
+  expect(JSON.stringify(h.backend.store)).not.toContain(fileURL);
+  expect(h.tabs.created).toHaveLength(0);
+});
+
+for (const change of ["file", "consent", "permission", "reload", "source-receipt"] as const)
+  test(`agent PDF wrapper ${change} during native rebind refuses the save`, async () => {
+    const h = await navigationHarness();
+    let wrapper: Window | undefined, saves = 0;
+    h.setAfterAct(async () => {
+      wrapper = await h.land(navigationURL, "");
+      wrapper.document.body.innerHTML = '<iframe src="/article.pdf"></iframe>';
+      wrapper.document.body.addEventListener("click", event => { if ((event.target as unknown as Element).tagName === "A") { saves++; event.preventDefault(); } });
+    });
+    await nativeArm(h);
+    const request = await h.request("native_download_rebind_request_v1");
+    if (change === "file") wrapper!.document.querySelector("iframe")!.src = "https://unregistered.example/other.pdf";
+    if (change === "consent") wrapper!.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept terms</dialog>');
+    if (change === "permission") h.setPermission(false);
+    if (change === "reload") await h.land(navigationURL, "");
+    const created = change === "source-receipt" ? h.downloads.onCreated.emit(firefoxItem(h)) : undefined;
+    await h.reply(request, "native_download_rebind_result_v1", { reservation_id: reservationID, outcome: "rebound" });
+    if (created) { await created; await completeNative(h, firefoxItem(h)); }
+    else await h.settle();
+    expect(saves).toBe(0);
+    expect(h.frames.filter(frame => frame.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(h.frames.some(frame => frame.type === "native_download_import_request_v1")).toBe(false);
+    expect(Reflect.get(h.bridge, "agentNavigations").size).toBe(0);
+  });
+
+for (const stop of ["cancel", "disconnect", "replacement", "commit", "timeout"] as const)
+  test(`agent PDF wrapper hanging save releases on ${stop} without replay`, async () => {
+    const h = await navigationHarness(false);
+    h.setAfterAct(async () => {
+      const win = await h.land(navigationURL, "");
+      win.document.body.innerHTML = '<iframe src="/article.pdf"></iframe>';
+    });
+    let started = false;
+    const execute = h.deps.scripting.executeScript;
+    h.deps.scripting.executeScript = async injection => {
+      if (injection.func === agentDOM && (injection.args?.[0] as AgentDOMRequest)?.method === "act_pdf") {
+        started = true; return new Promise(() => {});
+      }
+      return execute(injection);
+    };
+    await h.classify(); await h.started(); await h.decide("decision", "c1");
+    await until(() => started);
+    if (stop === "cancel") await h.inbound("cancel", {});
+    if (stop === "disconnect") await Reflect.get(h.bridge, "port").onDisconnect.emit();
+    if (stop === "replacement") await (h.deps.webNavigation as FakeWebNavigation).onTabReplaced.emit({ tabId: 88, replacedTabId: tabID });
+    if (stop === "commit") await (h.deps.webNavigation as FakeWebNavigation).onCommitted.emit({ tabId: tabID, frameId: 0, url: navigationURL });
+    if (stop === "timeout") { h.advance(45_000); for (const timer of h.timers.filter(timer => timer.ms === 45_000)) timer.fn(); }
+    await until(() => Reflect.get(h.bridge, "agentNavigations").size === 0);
+    expect(h.frames.filter(frame => frame.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(h.downloads.started).toHaveLength(0);
+  });
+
+for (const firefox of [false, true]) test(`${firefox ? "Firefox" : "Chrome"} agent PDF wrapper invalidates a receipt when commit overtakes its document check`, async () => {
+  const h = await navigationHarness(firefox);
+  const item = firefoxItem(h, { referrer: navigationURL, url: "https://unregistered.example/article.pdf", ...(firefox ? {} : { tabId: tabID, filename: "article.pdf" }) });
+  let created: Promise<void> | undefined, checkingReceipt = false, checkingDocument = false;
+  let releaseDocument!: () => void, releaseAction!: () => void;
+  const documentGate = new Promise<void>(resolve => { releaseDocument = resolve; });
+  const actionGate = new Promise<void>(resolve => { releaseAction = resolve; });
+  h.setAfterAct(async () => {
+    const win = await h.land(navigationURL, "");
+    win.document.body.innerHTML = '<iframe src="/article.pdf"></iframe>';
+    win.document.body.addEventListener("click", event => {
+      if ((event.target as unknown as Element).tagName !== "A") return;
+      event.preventDefault(); checkingReceipt = true; created = h.downloads.onCreated.emit(item);
+    });
+  });
+  const execute = h.deps.scripting.executeScript;
+  h.deps.scripting.executeScript = async injection => {
+    const result = await execute(injection);
+    if (injection.func === nativeDownloadDocumentCurrent && checkingReceipt) { checkingDocument = true; await documentGate; }
+    if (injection.func === agentDOM && (injection.args?.[0] as AgentDOMRequest)?.method === "act_pdf") await actionGate;
+    return result;
+  };
+  await h.classify(); await h.started(); await h.decide("decision", "c1");
+  if (firefox) {
+    const arm = await h.request("native_download_arm_request_v1");
+    await h.reply(arm, "native_download_arm_result_v1", { outcome: "armed", reservation_id: reservationID, expires_at_ms: h.now() + 120_000 });
+    const rebind = await h.request("native_download_rebind_request_v1");
+    await h.reply(rebind, "native_download_rebind_result_v1", { reservation_id: reservationID, outcome: "rebound" });
+  }
+  await until(() => checkingDocument);
+  await (h.deps.webNavigation as FakeWebNavigation).onCommitted.emit({ tabId: tabID, frameId: 0, url: navigationURL });
+  await until(() => Reflect.get(h.bridge, "agentNavigations").size === 0);
+  releaseDocument(); await created;
+  expect(Reflect.get(h.bridge, "downloads").get(jobID)?.ambiguous).toBe(true);
+  releaseAction(); await flush();
+  expect(h.frames.some(frame => frame.type === "native_download_import_request_v1" || frame.type === "download_complete")).toBe(false);
+});
+
+for (const firefox of [false, true]) test(`${firefox ? "Firefox" : "Chrome"} wrapper freshness retains an invalidated transition after map removal`, async () => {
+  const h = await navigationHarness(firefox);
+  h.setAfterAct(async () => { const win = await h.land(navigationURL, ""); win.document.body.innerHTML = '<iframe src="/article.pdf"></iframe>'; });
+  let reachedSave = false;
+  const execute = h.deps.scripting.executeScript;
+  h.deps.scripting.executeScript = async injection => {
+    if (injection.func === agentDOM && (injection.args?.[0] as AgentDOMRequest)?.method === "act_pdf") { reachedSave = true; return new Promise(() => {}); }
+    return execute(injection);
+  };
+  await h.classify(); await h.started(); await h.decide("decision", "c1");
+  if (firefox) {
+    const arm = await h.request("native_download_arm_request_v1");
+    await h.reply(arm, "native_download_arm_result_v1", { outcome: "armed", reservation_id: reservationID, expires_at_ms: h.now() + 120_000 });
+    const rebind = await h.request("native_download_rebind_request_v1");
+    await h.reply(rebind, "native_download_rebind_result_v1", { reservation_id: reservationID, outcome: "rebound" });
+  }
+  await until(() => reachedSave);
+  let captured = false, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  h.deps.scripting.executeScript = async injection => {
+    const result = await execute(injection);
+    if (injection.func === nativeDownloadDocumentCurrent) { captured = true; await gate; }
+    return result;
+  };
+  const track = Reflect.get(h.bridge, "downloads").get(jobID);
+  const pending = Reflect.get(h.bridge, "agentNavigations").get(jobID);
+  const checking = Reflect.get(h.bridge, firefox ? "nativeDownloadFresh" : "agentNavigationDownloadFresh").call(h.bridge, jobID, track) as Promise<boolean>;
+  await until(() => captured);
+  pending.invalid = true;
+  Reflect.get(h.bridge, "agentNavigations").delete(jobID);
+  release();
+  expect(await checking).toBe(false);
+  pending.stop();
+});
+
+test("agent refreshes a changed pre-click observation without spending or replaying a click", async () => {
+  const h = await navigationHarness(false);
+  await h.classify(); await h.started();
+  const first = await h.request("agent_decide_request_v1");
+  h.win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button>More formats</button>');
+  await h.decide("decision", "c1");
+  await until(() => h.timers.some(timer => timer.ms === 1000));
+  await h.tick();
+  const next = await h.request("agent_decide_request_v1", h.frames.indexOf(first) + 1);
+  expect(next.payload["observation"]).not.toEqual(first.payload["observation"]);
+  expect(h.counts().actions).toBe(0);
+  expect(h.frames.filter(frame => frame.type === "provider_drive_epoch_start_request")).toHaveLength(1);
+  expect(h.frames.some(frame => frame.type === "provider_drive_epoch_result_request")).toBe(false);
+  await h.reply(next, "agent_decide_result_v1", { observation_revision: (next.payload["observation"] as { revision: string }).revision, outcome: "decision", choice: "BLOCKED" });
+  await h.settle();
+});
