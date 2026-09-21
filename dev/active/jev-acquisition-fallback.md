@@ -19,7 +19,10 @@ native-download reservation and daemon adoption path. A naturally unsupported
 eLife article reached `ready` through Firefox on Windows after one explicit Open
 and one Jev decision; the correct 17-page PDF was retained and visually checked.
 This proves assisted startup followed by automatic acquisition, not an unattended
-cohort. The backend contract is shared across platforms and accepts local implementations; the first concrete backend
+cohort. A fresh run on the navigation build also reached ready with the key read
+from Windows Credential Manager and no environment override: two Jev decisions,
+17.4 seconds after Open, and the correct 17-page PDF. No cross-document rebind
+occurred in that run. The backend contract is shared across platforms and accepts local implementations; the first concrete backend
 uses TypeSafe with a profile-scoped OS credential or a daemon-only
 `PAPIO_TYPESAFE_API_KEY` environment variable.
 The key is removed from the process environment before other subprocesses start.
@@ -56,8 +59,8 @@ debugger is introduced by removing the extension.
 
 | Work | Result required |
 | --- | --- |
-| Persistent key setup | Hidden prompt or secret-manager stdin → OS credential store → explicitly enrolled profile → restarted daemon, on macOS, Windows and Linux. No plaintext key in config, browser storage, logs or argv. |
-| Menu and observation progression | Hidden/clipped menu controls do not appear prematurely; an opened PDF menu advances without spending a 45-second download wait. Preserve actual-download grace and exact receipt ownership. |
+| Persistent key setup | Implemented across platforms; Windows interactive-session storage and fresh live acquisition verified. SSH network logons cannot read Credential Manager; launch the enrolled daemon in the signed-in desktop session. Native Linux Secret Service acceptance remains pending. No plaintext key in config, browser storage, logs or argv. |
+| Menu and observation progression | Implemented with delayed-menu and intercepted-anchor regressions. An intercepted link can expose a new local PDF control without replaying the consumed click. Preserve actual-download grace and exact receipt ownership. |
 | Article navigation and new contexts | Same-tab exact same-origin destination implemented; live proof pending. Next: redirects and an owned child tab. Retire old control handles; carry the existing job/permit through a defined handoff, recheck permissions/identity, close only owned tabs, and reconcile any download already started. Test redirects, cancellation, concurrent jobs and operator takeover. |
 | CDN and resident-viewer acquisition | Follow the browser's actual navigation and save resident bytes through the native helper when needed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation on Chrome and Firefox. |
 | Local repair learning | Connect failed declarative capture, successful fallback and validated artifact to the existing repair workspace. Generate/test in isolation, run a fresh model-free declarative canary, promote or revert from the artifact outcome. Keep local operation independent of analytics. |
