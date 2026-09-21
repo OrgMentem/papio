@@ -69,7 +69,7 @@ test("a nested download heading cannot name unrelated article controls or unname
     <section aria-label="Local formats"><div><h3>Unowned heading</h3></div><button>Options</button></section>
   </main>`);
   const controls = observed(await observe()).observation.controls;
-  expect(controls.map(c => c.label)).toEqual(["Download", "Options [Local formats]", "Share", "Save PNG [Figures]", "Cite"]);
+  expect(controls.map(c => c.label)).toEqual(["Download", "Options [Local formats]", "Save PNG [Figures]", "Share", "Cite"]);
   expect(controls.every(c => !c.disabled)).toBe(true);
   expect(JSON.stringify(controls)).not.toContain("SECRET");
 });
@@ -109,14 +109,12 @@ test("own-label ranking precedes the cap without promoting region context or aut
   const first = observed(await observe());
   expect(first.observation.controls).toHaveLength(80);
   expect(first.observation.controls.slice(0, 4).map(c => [c.label, c.disabled])).toEqual([
-    ["Formats", false], ["Article PDF", true], ["Download PDF", false], ["Share 0 [Download PDF]", false],
+    ["Formats", false], ["Download PDF", false], ["Share 0 [Download PDF]", false], ["Share 1 [Download PDF]", false],
   ]);
   expect(first.observation.controls.some(c => /citation|Figures|Supplementary/.test(c.label))).toBe(false);
+  expect(first.observation.controls.some(c => c.label === "Article PDF")).toBe(false);
   expect(first.observation.controls[0]!.id).not.toBe("c1"); // IDs belong to elements, not rank positions.
-  const pdf = first.observation.controls[1]!;
   let clicks = 0; win.document.querySelector("a")!.addEventListener("click", () => clicks++);
-  expect(await act(first, { choice: pdf.id })).toEqual({ status: "stale", reason: "observation_changed" });
-  expect(clicks).toBe(0);
   expect(observed(await observe()).observation).toEqual(first.observation);
   win.document.querySelector("main")!.insertAdjacentHTML("afterbegin", '<button>PDF options</button>');
   const next = observed(await observe());
@@ -125,6 +123,12 @@ test("own-label ranking precedes the cap without promoting region context or aut
   // A control outside the transmitted cap still participates in freshness.
   win.document.querySelector("section button:last-child")!.setAttribute("onclick", "changed()");
   expect(await act(next)).toEqual({ status: "stale", reason: "observation_changed" });
+  win.document.querySelector("section")!.remove();
+  const uncapped = observed(await observe());
+  const viewer = uncapped.observation.controls.find(c => c.label === "Article PDF")!;
+  expect(viewer.disabled).toBe(true);
+  expect(await act(uncapped, { choice: viewer.id })).toEqual({ status: "stale", reason: "observation_changed" });
+  expect(clicks).toBe(0);
 });
 
 for (const [gate, reason] of [
@@ -435,4 +439,196 @@ for (const change of ["href", "base-target", "identity"]) test(`PDF intent reche
   expect((await act(first, { choice: first.observation.controls[0]!.id })).status).not.toBe("dispatched");
   expect(clicks).toBe(0);
   expect(anchor.hasAttribute("download")).toBe(false);
+});
+
+for (const css of [
+  "position:absolute;clip:rect(1px,1px,1px,1px)",
+  "position:fixed;clip:rect(0px,0px,0px,0px)",
+  "clip-path:inset(50%)", "clip-path:inset(0 60% 0 40%)",
+]) test(`empty CSS clipping hides menu controls without a class-name heuristic: ${css}`, async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Formats</button><div style="${css}"><a href="/paper.pdf">Article PDF</a></div></main>`);
+  expect(observed(await observe()).observation.controls.map(c => c.label)).toEqual(["Formats"]);
+  win.document.querySelector("main div")!.removeAttribute("style");
+  const open = observed(await observe());
+  expect(open.observation.controls.find(c => c.label === "Article PDF")?.disabled).toBe(false);
+});
+
+test("offviewport, partially clipped and visible accessible menus stay projected", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main>
+    <div class="visuallyhidden" aria-expanded="false"><button>PDF options</button></div>
+    <div style="position:absolute;clip:rect(0px,10px,10px,0px)"><button>Full text</button></div>
+    <div style="clip-path:inset(40%)"><button>Formats</button></div>
+    <div style="position:static;clip:rect(0px,0px,0px,0px)"><button>Download PDF</button></div>
+  </main>`);
+  Object.assign(win.HTMLElement.prototype, { getClientRects: () => [{ width: 10, height: 10, top: 50000, left: 50000, bottom: 50010, right: 50010 }] });
+  expect(observed(await observe()).observation.controls.map(c => c.label)).toEqual(["PDF options", "Full text", "Formats", "Download PDF"]);
+});
+
+test("clipping changes invalidate a selected control without weakening conservative credential detection", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Download PDF</button></main>`);
+  const first = observed(await observe());
+  win.document.querySelector("main")!.style.clipPath = "inset(50%)";
+  expect(await act(first)).toEqual({ status: "stale", reason: "observation_changed" });
+  win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<input type="password">');
+  expect(await observe()).toEqual({ status: "blocked", reason: "credentials_required" });
+});
+
+test("non-article file controls are disabled and refused PDF links cannot crowd out usable controls", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main>
+    ${Array.from({ length: 85 }, (_, i) => `<a href="https://external.example/${i}.pdf">Article PDF</a>`).join("")}
+    <button>Share</button><button>Download citation</button><button>Figures PDF</button>
+    <button>Supplementary PDF</button><button>Article metrics</button><button>Formats</button>
+  </main>`);
+  const first = observed(await observe());
+  expect(first.observation.controls).toHaveLength(80);
+  expect(first.observation.controls.filter(c => !c.disabled).map(c => c.label)).toEqual(["Formats", "Share"]);
+  win.document.querySelectorAll("a").forEach(node => node.remove());
+  const next = observed(await observe());
+  for (const control of next.observation.controls.filter(c => !["Formats", "Share"].includes(c.label))) {
+    expect(control.disabled).toBe(true);
+    expect(await act(next, { choice: control.id })).toEqual({ status: "stale", reason: "observation_changed" });
+  }
+});
+
+for (const name of ["Share", "Cite this article"]) test(`${name} can open a menu containing the article PDF`, async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>${name}</button></main>`);
+  win.document.querySelector("button")!.addEventListener("click", () => {
+    win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<a href="/paper.pdf">Article PDF</a>');
+  });
+  const first = observed(await observe());
+  expect(first.observation.controls[0]?.disabled).toBe(false);
+  expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "dispatched", downloadExpected: false });
+  const next = observed(await observe());
+  const pdf = next.observation.controls[0]!;
+  expect(pdf.label).toBe("Article PDF");
+  win.document.querySelector("a")!.addEventListener("click", event => event.preventDefault());
+  expect(await act(next, { choice: pdf.id })).toEqual({ status: "dispatched", downloadExpected: true });
+});
+
+test("bare Download progresses after a clipped panel visibly exposes a usable PDF", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><div><a href="">Download</a>
+    <div aria-expanded="false" style="position:absolute;clip:rect(1px,1px,1px,1px)"><a href="/paper.pdf">Article PDF</a></div>
+  </div></main>`);
+  const trigger = win.document.querySelector("a")!;
+  const panel = trigger.nextElementSibling!;
+  trigger.addEventListener("click", event => {
+    event.preventDefault(); panel.removeAttribute("style"); panel.setAttribute("aria-expanded", "true");
+  });
+  const first = observed(await observe());
+  expect(first.observation.controls.map(c => c.label)).toEqual(["Download"]);
+  expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "dispatched", downloadExpected: false });
+  const second = observed(await observe());
+  expect(second.observation.revision).not.toBe(first.observation.revision);
+  const pdf = second.observation.controls.find(c => c.label === "Article PDF")!;
+  win.document.querySelector('a[href="/paper.pdf"]')!.addEventListener("click", event => event.preventDefault());
+  expect(await act(second, { choice: pdf.id })).toEqual({ status: "dispatched", downloadExpected: true });
+});
+
+for (const variant of ["unchanged", "still-clipped", "refused-pdf", "explicit-download"] as const)
+  test(`bare Download retains download grace without usable PDF progression: ${variant}`, async () => {
+    const win = setup(`<meta name="citation_doi" content="${doi}"><main><div><a href="" ${variant === "explicit-download" ? 'download="paper.pdf"' : ''}>Download</a>
+      <div aria-expanded="false" style="clip-path:inset(50%)"><a href="${variant === "refused-pdf" ? 'https://external.example' : ''}/paper.pdf">Article PDF</a></div>
+    </div></main>`);
+    const trigger = win.document.querySelector("a")!;
+    const panel = win.document.querySelector('[aria-expanded="false"]')!;
+    trigger.addEventListener("click", event => {
+      event.preventDefault();
+      if (variant !== "unchanged") panel.setAttribute("aria-expanded", "true");
+      if (variant !== "unchanged" && variant !== "still-clipped") panel.removeAttribute("style");
+    });
+    const first = observed(await observe());
+    expect(await act(first, { choice: first.observation.controls.find(c => c.label === "Download")!.id })).toEqual({ status: "dispatched", downloadExpected: true,
+      ...(variant === "explicit-download" ? {} : { menuPending: true }) });
+  });
+
+for (const variant of ["inserted", "enabled", "existing", "gate", "identity", "navigation"] as const)
+  test(`bare Download uses fresh PDF progression, without depending on menu markup: ${variant}`, async () => {
+    const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Download</button>
+      <section>${variant === "enabled" || variant === "existing" ? `<button ${variant === "enabled" ? 'disabled' : ''}>Download PDF</button>` : ''}</section>
+    </main>`);
+    const trigger = win.document.querySelector("button")!;
+    trigger.addEventListener("click", () => {
+      if (variant === "enabled") win.document.querySelector("section button")!.removeAttribute("disabled");
+      else if (variant !== "existing") win.document.querySelector("section")!.insertAdjacentHTML("beforeend", '<button>Download PDF</button>');
+      if (variant === "gate") win.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept terms</dialog>');
+      if (variant === "identity") win.document.querySelector("meta")!.setAttribute("content", "10.9999/other");
+      if (variant === "navigation") win.location.pathname = "/different";
+    });
+    const first = observed(await observe());
+    const result = await act(first, { choice: first.observation.controls.find(c => c.label === "Download")!.id });
+    if (["gate", "identity", "navigation"].includes(variant)) expect(result.status).not.toBe("dispatched");
+    else expect(result).toEqual({ status: "dispatched", downloadExpected: variant === "existing", ...(variant === "existing" ? { menuPending: true } : {}) });
+  });
+
+test("main article PDF controls mentioning additional material remain executable", async () => {
+  setup(`<meta name="citation_doi" content="${doi}"><main>
+    <button>Download full article including supplementary material</button><button>Article PDF with figures</button>
+  </main>`);
+  expect(observed(await observe()).observation.controls.every(c => !c.disabled)).toBe(true);
+});
+
+test("a visible menu trigger keeps its clipped accessible name", async () => {
+  setup(`<meta name="citation_doi" content="${doi}"><main><button aria-haspopup="menu">
+    <span style="position:absolute;clip:rect(1px,1px,1px,1px)">PDF options</span><span aria-hidden="true">icon</span>
+  </button></main>`);
+  const first = observed(await observe());
+  expect(first.observation.controls).toEqual([{ id: "c1", role: "button", label: "PDF options", disabled: false }]);
+  expect(await act(first, { choice: "c1" })).toEqual({ status: "dispatched", downloadExpected: false });
+});
+
+test("cap reshuffling does not turn an already usable PDF control into menu progression", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Download</button>
+    ${Array.from({ length: 80 }, () => '<button>Formats</button>').join("")}<button>Download PDF</button>
+  </main>`);
+  win.document.querySelector("button")!.addEventListener("click", () => {
+    for (const button of win.document.querySelectorAll("button")) if (button.textContent === "Formats") button.remove();
+  });
+  const first = observed(await observe());
+  expect(first.observation.controls.some(c => c.label === "Download PDF")).toBe(false);
+  expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "dispatched", downloadExpected: true, menuPending: true });
+});
+
+test("local menu checks bind the consumed revision, document and original URL without enabling replay", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Download</button></main>`);
+  const first = observed(await observe());
+  const check = { method: "check_menu" as const, entryURL, doi, document: first.document, revision: first.observation.revision };
+  expect(await agentDOM(check)).toEqual({ status: "stale", reason: "observation_changed" });
+  expect(await act(first, { choice: "c1" })).toEqual({ status: "dispatched", downloadExpected: true, menuPending: true });
+  expect(await agentDOM(check)).toEqual({ status: "menu_checked", ready: false });
+  win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button>Download PDF</button>');
+  expect(await agentDOM({ ...check, revision: "0".repeat(64) })).toEqual({ status: "stale", reason: "observation_changed" });
+  expect(await agentDOM({ ...check, document: "another-document" })).toEqual({ status: "stale", reason: "document_changed" });
+  expect(await agentDOM(check)).toEqual({ status: "menu_checked", ready: true });
+  expect(await act(first, { choice: "c1" })).toEqual({ status: "stale", reason: "observation_changed" });
+  win.location.search = "?changed=1";
+  expect(await agentDOM(check)).toEqual({ status: "stale", reason: "page_binding_failed" });
+});
+
+test("local menu checking uses the uncapped original baseline and never polls an explicit PDF action", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Download</button>
+    ${Array.from({ length: 80 }, () => '<button>Formats</button>').join("")}<a href="/paper.pdf">Article PDF</a>
+  </main>`);
+  const first = observed(await observe());
+  expect(await act(first, { choice: "c1" })).toEqual({ status: "dispatched", downloadExpected: true, menuPending: true });
+  win.document.querySelectorAll("button").forEach(node => { if (node.textContent === "Formats") node.remove(); });
+  const check = { method: "check_menu" as const, entryURL, doi, document: first.document, revision: first.observation.revision };
+  expect(await agentDOM(check)).toEqual({ status: "menu_checked", ready: false });
+  const second = observed(await observe());
+  const pdf = second.observation.controls.find(c => c.label === "Article PDF")!;
+  win.document.querySelector("a")!.addEventListener("click", event => event.preventDefault());
+  expect(await act(second, { choice: pdf.id })).toEqual({ status: "dispatched", downloadExpected: true });
+  expect(await agentDOM(check)).toEqual({ status: "stale", reason: "observation_changed" });
+});
+
+test("local menu readiness requires the new PDF control to fit the next projection", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><button>Download</button>
+    ${Array.from({ length: 80 }, () => '<button>Formats</button>').join("")}
+  </main>`);
+  const first = observed(await observe());
+  await act(first, { choice: "c1" });
+  const check = { method: "check_menu" as const, entryURL, doi, document: first.document, revision: first.observation.revision };
+  win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button>Download PDF</button>');
+  expect(await agentDOM(check)).toEqual({ status: "menu_checked", ready: false });
+  win.document.querySelectorAll("button").forEach(node => { if (node.textContent === "Formats") node.remove(); });
+  expect(await agentDOM(check)).toEqual({ status: "menu_checked", ready: true });
 });

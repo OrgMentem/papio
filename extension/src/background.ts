@@ -20024,14 +20024,37 @@ export class Bridge {
         }
         if (action.downloadExpected) {
           // Provider clicks often disable their button before Chrome announces
-          // a download. No further model decision may turn that into failure.
+          // a download. Only locally confirmed menu progress permits a fresh
+          // decision during grace; an exact download receipt always wins.
           const pendingUntil = Math.min(deadline, track.native?.recovery.expires_at_ms ?? deadline, this.deps.now() + 45_000);
           await this.update(store => authorized() ? { ...store, activeJobs: store.activeJobs.map(current =>
             current.job_id === jobID ? { ...current, agent_fallback_pending_until: pendingUntil } as ActiveJob : current) } : store);
           if (downloaded() || !authorized()) return;
+          let menuReady = false;
           while (this.deps.now() < pendingUntil && authorized()) {
             await pause();
             if (downloaded() || !authorized()) return;
+            if (this.deps.now() >= pendingUntil) break;
+            if (action.menuPending) {
+              if (!(await liveTab()) || !authorized()) return;
+              const checked = (await this.deps.scripting.executeScript({
+                target: { tabId: job.tab_id }, func: agentDOM,
+                args: [{ method: "check_menu", entryURL: entryURL!, doi: job.expected!.doi!,
+                  document: documentID, revision: observation.revision } satisfies AgentDOMRequest],
+              }))[0]?.result as AgentDOMResult | undefined;
+              if (downloaded() || !authorized()) return;
+              if (checked?.status !== "menu_checked") {
+                if (checked?.status === "blocked" || checked?.status === "stale") exitDetail = domDetail(checked.reason);
+                return;
+              }
+              if (checked.ready) { menuReady = true; break; }
+            }
+          }
+          if (menuReady) {
+            await this.update(store => authorized() ? { ...store, activeJobs: store.activeJobs.map(current =>
+              current.job_id === jobID ? { ...current, agent_fallback_pending_until: undefined } as ActiveJob : current) } : store);
+            if (downloaded() || !authorized()) return;
+            continue;
           }
           exitDetail = "Article agent fallback timed out waiting for the browser to start the requested download.";
           return;

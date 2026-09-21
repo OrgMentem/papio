@@ -3,7 +3,7 @@
 import type { AgentDecideObservation } from "./protocol";
 export type AgentObservation = AgentDecideObservation;
 export interface AgentDOMRequest {
-  method: "observe" | "act";
+  method: "observe" | "act" | "check_menu";
   entryURL: string;
   doi: string;
   /** Worker-local document identity: a navigation/reload cannot resume a loop. */
@@ -19,7 +19,8 @@ export type AgentDOMRefusalReason =
   | "payment_required" | "human_action_required" | "invalid_request";
 export type AgentDOMResult =
   | { status: "observed"; document: string; observation: AgentObservation }
-  | { status: "dispatched"; downloadExpected: boolean }
+  | { status: "dispatched"; downloadExpected: boolean; menuPending?: true }
+  | { status: "menu_checked"; ready: boolean }
   | { status: "stale" | "blocked"; reason: AgentDOMRefusalReason };
 
 /** Self-contained isolated-world injection. Only the projection leaves the page;
@@ -38,6 +39,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   const host = globalThis as typeof globalThis & { papioArticleAgent?: {
     node: Document; document: string; binding: string; ids: WeakMap<Element, string>; next: number; serial: number;
     consumed: Set<string>;
+    menuWait?: { revision: string; url: string; enabled: Set<string> };
     observed?: { revision: string; source: string; targets: Map<string, Element> };
   } };
   const safe = (raw: string | null | undefined, limit = 240) => (raw ?? "")
@@ -47,12 +49,30 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     .replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, limit);
   const privateSelector = 'header,footer,nav,[role="banner"],[role="navigation"],[role="contentinfo"],[data-private],[id*="account" i],[class*="account" i],[id*="profile" i],[class*="profile" i],[id*="login" i],[class*="login" i]';
   const fields = "input,textarea,select,script,style,[contenteditable]";
-  const visible = (element: Element) => {
+  // Detect empty clip regions, not viewport position or CSS class names. A
+  // positive layout box can still be entirely clipped (common for closed menus).
+  const emptyClip = (style: CSSStyleDeclaration) => {
+    const rect = /^(?:absolute|fixed)$/.test(style.position) && /^rect\(([^()]*)\)$/.exec(style.clip);
+    if (rect) {
+      const sides = rect[1]!.trim().split(/[,\s]+/).map(value => /^-?(?:\d*\.)?\d+(?:px)?$/.test(value) ? parseFloat(value) : NaN);
+      if (sides.length === 4 && (sides[1]! <= sides[3]! || sides[2]! <= sides[0]!)) return true;
+    }
+    const inset = /^inset\(([^()]*)\)$/.exec(style.clipPath);
+    if (!inset) return false;
+    const values = inset[1]!.split(/\s+round\s+/)[0]!.trim().split(/\s+/);
+    // Percentage insets describe the untransformed reference box. Avoid using
+    // viewport geometry to guess mixed lengths, transforms or arbitrary paths.
+    if (values.length < 1 || values.length > 4 || values.some(value => !/^-?(?:\d*\.)?\d+%$|^0(?:px)?$/.test(value))) return false;
+    const [top, right = top, bottom = top, left = right] = values.map(parseFloat);
+    return top! + bottom! >= 100 || right! + left! >= 100;
+  };
+  const visible = (element: Element, checkClip = true) => {
     if (element.matches('input[type="hidden" i]')) return false;
     if (element.closest('[hidden],[inert],[aria-hidden="true"],dialog:not([open])')) return false;
     for (let node: Element | null = element; node; node = node.parentElement) {
       const style = getComputedStyle(node);
       if (style.display === "none" || /hidden|collapse/.test(style.visibility) || style.opacity === "0") return false;
+      if (checkClip && emptyClip(style)) return false;
     }
     return Array.from(element.getClientRects()).some(rect => rect.width > 0 && rect.height > 0);
   };
@@ -60,14 +80,18 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     if (node.nodeType === 3) return node.textContent ?? "";
     if (node.nodeType !== 1) return "";
     const child = node as Element;
-    return child.matches(`${fields},${privateSelector}`) || !visible(child) ? "" : publicText(child);
+    // Clipped text can be the accessible name of an otherwise visible button.
+    return child.matches(`${fields},${privateSelector}`) || !visible(child, false) ? "" : publicText(child);
   }).join(" ");
   const label = (element: Element) => safe(element.getAttribute("aria-label") || publicText(element).trim() || element.getAttribute("title") || element.getAttribute("alt"));
   const hasPublicLabel = (text: string) => text.replace(/\[redacted\]/g, "").trim() !== "";
   // Rank only the control's own public name, never a neighbouring heading.
   // This orders evidence within the cap; it grants no execution permission.
-  const priority = (text: string) => /\b(citations?|cite|bibtex|ris|figures?|tables?|supplement(?:ary|al)?|appendi(?:x|ces)|references?)\b/i.test(text) ? 2
+  const priority = (text: string) => /\b(share|metrics|statistics|citations?|cite|bibtex|ris|figures?|tables?|supplement(?:ary|al)?|appendi(?:x|ces)|references?)\b/i.test(text) ? 2
     : /\b(pdf|download|full[ -]?text|formats?|options?|menu|(?:read|save|view) article)\b/i.test(text) ? 0 : 1;
+  // Whole-purpose labels only: an article PDF may include figures/supplements.
+  // Share/Cite can open an acquisition menu; rank them lower, don't forbid it.
+  const unrelated = (text: string) => /^(?:download citation|figures? pdf|supplement(?:ary|al)? pdf|article (?:metrics|statistics))$/i.test(text);
   const human = /\b(password|passcode|credentials?|sign[ -]?(?:in|out)|log[ -]?(?:in|out)|authentication|verification|captcha|challenge|accept|agree|consent|acknowledge|purchase|buy|pay|checkout|subscribe|document delivery|interlibrary|request (?:a |the )?(?:copy|document)|permissions?|authorize|allow access)\b/i;
   const sensitiveField = (node: Element) => node.matches('input[type="password" i]') ||
     /password|passcode|credential|one-time-code|cc-number|cc-csc|cc-exp|credit.?card|card.?number|cvv|cvc/i.test(
@@ -104,13 +128,13 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     if (citations.some(value => value !== doi)) return "identity_conflicting";
     // Visible credential/payment entry is a human gate. Ordinary search and
     // newsletter fields are unrelated; their values are never projected.
-    const field = Array.from(document.querySelectorAll("input,textarea,select")).find(node => sensitiveField(node) && visible(node));
+    const field = Array.from(document.querySelectorAll("input,textarea,select")).find(node => sensitiveField(node) && visible(node, false));
     if (field) return /cc-number|cc-csc|cc-exp|credit.?card|card.?number|cvv|cvc/i.test(
       ["type", "name", "id", "autocomplete"].map(key => field.getAttribute(key) ?? "").join(" ")) ? "payment_required" : "credentials_required";
-    if (Array.from(document.querySelectorAll('iframe,frame,[data-sitekey],[id*="captcha" i],[class*="captcha" i],.cf-turnstile')).some(node => visible(node) && (node.hasAttribute("data-sitekey") || /captcha|turnstile|challenge/i.test(["src", "title", "id", "class", "name"].map(key => node.getAttribute(key)).join(" "))))) return "challenge_required";
+    if (Array.from(document.querySelectorAll('iframe,frame,[data-sitekey],[id*="captcha" i],[class*="captcha" i],.cf-turnstile')).some(node => visible(node, false) && (node.hasAttribute("data-sitekey") || /captcha|turnstile|challenge/i.test(["src", "title", "id", "class", "name"].map(key => node.getAttribute(key)).join(" "))))) return "challenge_required";
     const gateText = (node: Node): string => node.nodeType === 3 ? node.textContent ?? "" : Array.from(node.childNodes).map(gateText).join(" ");
     for (const dialog of document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"]')) {
-      if (!visible(dialog)) continue;
+      if (!visible(dialog, false)) continue;
       const text = `${dialog.getAttribute("aria-label") ?? ""} ${gateText(dialog)}`;
       if (human.test(text)) return humanReason(text);
     }
@@ -134,7 +158,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   const explicitPDFLink = (element: Element, anchor: HTMLAnchorElement) =>
     element === anchor && /\bpdf\b/i.test(label(anchor)) && /\.pdf$/i.test(new URL(anchor.href).pathname);
   const allowed = (element: Element) => {
-    if (human.test(label(element))) return false;
+    if (human.test(label(element)) || unrelated(label(element))) return false;
     const anchor = element.closest<HTMLAnchorElement>("a[href]");
     if (anchor) {
       const url = new URL(anchor.href);
@@ -182,17 +206,25 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       const heading = section && Array.from(section.children).find(node => node.matches("h1,h2,h3,h4,h5,h6,[role='heading']") && visible(node) && !node.closest(privateSelector));
       const context = safe(section?.getAttribute("aria-label") || (heading ? publicText(heading) : ""), 100);
       return { priority: priority(ownLabel), control: { id, role: role(element), label: safe(`${ownLabel}${context ? ` [${context}]` : ""}`), disabled: disabled(element) || !allowed(element) } };
-    }).sort((a, b) => a.priority - b.priority).map(({ control }) => control);
+    }).sort((a, b) => Number(a.control.disabled) - Number(b.control.disabled) || a.priority - b.priority).map(({ control }) => control);
     const metadata = Array.from(document.querySelectorAll("meta[name]"));
     const title = ["citation_title", "dc.title", "prism.title"].flatMap(name => metadata
       .filter(node => node.getAttribute("name")?.trim().toLowerCase() === name)
       .map(node => safe(node.getAttribute("content"), 400))).find(hasPublicLabel) ?? "";
     const projection = { doi, title, controls: controls.slice(0, 80) };
     const source = JSON.stringify([state.document, binding, location.href, document.baseURI, projection, fingerprints]);
-    return { status: "snapshot" as const, projection, source, targets };
+    return { status: "snapshot" as const, projection, source, targets, controls };
   };
+  const menuProgress = (view: Extract<ReturnType<typeof snapshot>, { status: "snapshot" }>, enabled: Set<string>) =>
+    view.projection.controls.some(control => !control.disabled && !enabled.has(control.id) && /\bpdf\b/i.test(label(view.targets.get(control.id)!)));
   const current = snapshot();
   if (current.status === "blocked") return current;
+  if (request.method === "check_menu") {
+    const pending = state.menuWait;
+    if (!pending || request.document !== state.document || request.revision !== pending.revision || !state.consumed.has(pending.revision)) return { status: "stale", reason: "observation_changed" };
+    if (location.href !== pending.url) return { status: "stale", reason: "page_binding_failed" };
+    return { status: "menu_checked", ready: menuProgress(current, pending.enabled) };
+  }
   if (request.method === "act") {
     const previous = state.observed;
     const choice = request.choice ?? "";
@@ -208,7 +240,12 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     const anchor = target.closest<HTMLAnchorElement>("a[href]");
     const explicitPDF = anchor !== null && explicitPDFLink(target, anchor);
     const addDownload = explicitPDF && !anchor.hasAttribute("download");
-    const downloadExpected = explicitPDF || (!menu && (/\b(download|pdf|save (?:article|full text))\b/i.test(label(target)) || target.closest("a[download]") !== null));
+    let downloadExpected = explicitPDF || (!menu && (/\b(download|pdf|save (?:article|full text))\b/i.test(label(target)) || target.closest("a[download]") !== null));
+    const bareDownload = /^downloads?$/i.test(label(target)) && !explicitPDF && !anchor?.hasAttribute("download");
+    const beforeURL = location.href;
+    delete state.menuWait;
+    if (bareDownload) state.menuWait = { revision: previous.revision, url: beforeURL,
+      enabled: new Set(current.controls.filter(control => !control.disabled).map(control => control.id)) };
     // Click the original provider element once, preserving its URL, handlers,
     // target and referrer policy. No cloned link, URL replay or invented path.
     if (addDownload) anchor.setAttribute("download", "");
@@ -217,7 +254,18 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       // Leave a publisher handler's own replacement value intact.
       if (addDownload && anchor.getAttribute("download") === "") anchor.removeAttribute("download");
     }
-    return { status: "dispatched", downloadExpected };
+    if (bareDownload) {
+      if (host.papioArticleAgent !== state || state.node !== document) return { status: "stale", reason: "document_changed" };
+      if (location.href !== beforeURL) return { status: "stale", reason: "page_binding_failed" };
+      const after = snapshot();
+      if (after.status === "blocked") return after;
+      // A download menu is demonstrated by new usable PDF evidence, regardless
+      // of publisher markup. The pre-click baseline includes controls beyond
+      // the cap; a new choice must also fit the next transmitted projection.
+      // Explicit download intent and an unchanged page keep their full grace.
+      if (menuProgress(after, state.menuWait!.enabled)) downloadExpected = false;
+    }
+    return { status: "dispatched", downloadExpected, ...(bareDownload && downloadExpected ? { menuPending: true as const } : {}) };
   }
   if (request.method !== "observe") return { status: "blocked", reason: "invalid_request" };
   const serial = ++state.serial;

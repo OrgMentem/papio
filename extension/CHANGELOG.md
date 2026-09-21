@@ -18,6 +18,12 @@ for the full pre-split extension history.
 
 ### Added
 
+- **Article-agent download menus can render asynchronously.** A plain Download
+  control can reveal a PDF choice without triggering the full download timeout.
+  Local checks wait for that choice without paid model polling, while an actual
+  browser download keeps priority. Fully clipped controls are excluded until
+  visible, and usable acquisition choices rank ahead of disabled controls.
+
 - **Optional article-agent fallback in Chrome and Firefox.** With a compatible configured
   daemon, delegated acquisition can select visible controls on DOI-identified
   articles even when the publisher has no adapter. In-page menus and downloads

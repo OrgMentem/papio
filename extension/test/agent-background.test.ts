@@ -53,8 +53,9 @@ async function harness(options: { features?: string[]; firefox?: boolean; ignore
   const downloads = new FakeDownloads();
   if (options.firefox && !options.ignoredSteeringEvent) Reflect.deleteProperty(downloads, "onDeterminingFilename");
   const backend = { store: emptyStore(), load: async () => backend.store, save: async (store: StoreShape) => { backend.store = store; } };
-  let permitted = true, observations = 0, actions = 0, genericPlans = 0;
+  let permitted = true, observations = 0, actions = 0, genericPlans = 0, menuChecks = 0;
   let onAct: (() => Promise<void>) | undefined;
+  let onMenuCheck: (() => Promise<void>) | undefined;
   const deps: BridgeDeps = {
     firefox: options.firefox ?? false,
     connectNative: () => port, manifestVersion: "0.1.0", randomUUID: () => crypto.randomUUID(), now: () => now,
@@ -65,6 +66,7 @@ async function harness(options: { features?: string[]; firefox?: boolean; ignore
       if (injection.func !== agentDOM) return [];
       const request = injection.args![0] as AgentDOMRequest;
       if (request.method === "observe") observations++;
+      else if (request.method === "check_menu") { menuChecks++; await onMenuCheck?.(); }
       else { actions++; await onAct?.(); }
       return [{ result: await agentDOM(request) }];
     } },
@@ -113,7 +115,8 @@ async function harness(options: { features?: string[]; firefox?: boolean; ignore
     now += 1000; timers.splice(index, 1)[0]!.fn(); await flush();
   };
   return { bridge, deps, backend, frames, win, tabs, downloads, timers, classify, started, decide, request, reply, settle, tick, update, now: () => now,
-    counts: () => ({ observations, actions, genericPlans }), setPermission: (value: boolean) => { permitted = value; }, setOnAct: (fn: () => Promise<void>) => { onAct = fn; }, advance: (ms: number) => { now += ms; }, inbound };
+    counts: () => ({ observations, actions, genericPlans, menuChecks }), setPermission: (value: boolean) => { permitted = value; }, setOnAct: (fn: () => Promise<void>) => { onAct = fn; },
+    setOnMenuCheck: (fn: () => Promise<void>) => { onMenuCheck = fn; }, advance: (ms: number) => { now += ms; }, inbound };
 }
 
 for (const status of ["accepted", "auth_pending"] as const) test(`no-adapter ${status} article: WAIT, click, exact download correlation and normal adoption`, async () => {
@@ -793,5 +796,147 @@ test("Firefox explicit PDF link retains native adoption through delayed browser 
   await h.reply(request, "native_download_import_result_v1", { reservation_id: reservationID, download_id: item.id, outcome: "ready" });
   await completing;
   expect(clicks).toBe(1);
+  expectNativeUntouched(h);
+});
+
+for (const render of ["inserted", "clipped"] as const) test(`Firefox bare Download progresses to a ${render} PDF choice under one native reservation`, async () => {
+  const h = await nativeHarness();
+  const main = h.win.document.querySelector("main")!;
+  main.innerHTML = `<button>Download</button><section ${render === "clipped" ? 'style="clip-path:inset(50%)"' : ''}>${render === "clipped" ? '<a href="/paper.pdf">Article PDF</a>' : ''}</section>`;
+  const trigger = main.querySelector("button")!;
+  let clicks = 0;
+  trigger.addEventListener("click", () => {
+    clicks++;
+    const panel = main.querySelector("section")!;
+    panel.removeAttribute("style");
+    if (render === "inserted") panel.insertAdjacentHTML("beforeend", '<a href="/paper.pdf">Article PDF</a>');
+    panel.querySelector("a")!.addEventListener("click", event => {
+      clicks++; event.preventDefault(); void h.downloads.onCreated.emit(firefoxItem(h));
+    });
+  });
+  await nativeArm(h);
+  const after = h.frames.length;
+  await h.tick();
+  const request = await h.request("agent_decide_request_v1", after);
+  const observation = request.payload["observation"] as { revision: string; controls: { id: string; label: string; disabled: boolean }[] };
+  const pdf = observation.controls.find(c => c.label === "Article PDF" && !c.disabled)!;
+  expect(pdf).toBeDefined();
+  await h.reply(request, "agent_decide_result_v1", { observation_revision: observation.revision, outcome: "decision", choice: pdf.id });
+  await until(() => h.backend.store.activeJobs[0]?.native_download?.download_id === 1401);
+  expect(clicks).toBe(2);
+  expect(h.frames.filter(f => f.type === "native_download_arm_request_v1")).toHaveLength(1);
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+  expectNativeUntouched(h);
+});
+
+for (const timing of ["synchronous-with-menu", "delayed-without-menu"] as const)
+  test(`Firefox bare Download retains a real ${timing} native download without another decision`, async () => {
+    const h = await nativeHarness();
+    const trigger = h.win.document.querySelector("button")!;
+    trigger.textContent = "Download";
+    trigger.addEventListener("click", () => {
+      if (timing === "synchronous-with-menu") {
+        h.win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button>Download PDF</button>');
+        void h.downloads.onCreated.emit(firefoxItem(h));
+      }
+    });
+    await nativeArm(h);
+    if (timing === "delayed-without-menu") {
+      for (let i = 0; i < 5; i++) await h.tick();
+      await h.downloads.onCreated.emit(firefoxItem(h));
+      await h.tick();
+    }
+    await until(() => h.backend.store.activeJobs[0]?.native_download?.download_id === 1401);
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(h.counts().actions).toBe(1);
+    expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+    expectNativeUntouched(h);
+  });
+
+test("Firefox asynchronous Download menu resumes after a local grace check, without paid polling", async () => {
+  const h = await nativeHarness();
+  const trigger = h.win.document.querySelector("button")!;
+  trigger.textContent = "Download";
+  trigger.addEventListener("click", () => {
+    h.deps.setTimeout(() => {
+      h.win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<a href="/paper.pdf">Article PDF</a>');
+      h.win.document.querySelector('a[href="/paper.pdf"]')!.addEventListener("click", event => {
+        event.preventDefault(); void h.downloads.onCreated.emit(firefoxItem(h));
+      });
+    }, 2500);
+  });
+  await nativeArm(h);
+  const after = h.frames.length;
+  for (let i = 0; i < 2; i++) {
+    await h.tick(); await until(() => h.timers.some(timer => timer.ms === 1000));
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+  }
+  const render = h.timers.findIndex(timer => timer.ms === 2500);
+  expect(render).toBeGreaterThanOrEqual(0);
+  h.advance(500); h.timers.splice(render, 1)[0]!.fn();
+  await h.tick();
+  const request = await h.request("agent_decide_request_v1", after);
+  const observation = request.payload["observation"] as { revision: string; controls: { id: string; label: string }[] };
+  const pdf = observation.controls.find(c => c.label.startsWith("Article PDF"))!;
+  await h.reply(request, "agent_decide_result_v1", { observation_revision: observation.revision, outcome: "decision", choice: pdf.id });
+  await until(() => h.backend.store.activeJobs[0]?.native_download?.download_id === 1401);
+  expect(h.counts().actions).toBe(2);
+  expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(2);
+  expect(h.frames.filter(f => f.type === "native_download_arm_request_v1")).toHaveLength(1);
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+  expectNativeUntouched(h);
+});
+
+for (const change of ["navigation", "identity", "permission", "cancel"] as const)
+  test(`Firefox async menu settling stops after ${change} without a second decision or click`, async () => {
+    const h = await nativeHarness(); h.win.document.querySelector("button")!.textContent = "Download";
+    await nativeArm(h); await h.tick(); await until(() => h.timers.some(timer => timer.ms === 1000));
+    h.win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button>Download PDF</button>');
+    if (change === "navigation") h.tabs.seed({ id: tabID, url: url + "/different", status: "complete" });
+    if (change === "identity") h.win.document.querySelector('meta[name="citation_doi"]')!.setAttribute("content", "10.9999/other");
+    if (change === "permission") h.setPermission(false);
+    if (change === "cancel") await h.update(store => ({ ...store, activeJobs: [] }));
+    await h.tick(); await h.settle();
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(h.counts().actions).toBe(1);
+    expect(h.frames.some(f => f.type === "native_download_import_request_v1")).toBe(false);
+    expectNativeUntouched(h);
+  });
+
+test("Firefox bare Download with no menu progress keeps its original grace deadline", async () => {
+  const h = await nativeHarness(); h.win.document.querySelector("button")!.textContent = "Download";
+  await nativeArm(h);
+  for (let i = 0; i < 3; i++) {
+    await h.tick(); await until(() => h.timers.some(timer => timer.ms === 1000));
+    expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+    expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
+  }
+  h.advance(41_000); await h.tick(); await h.settle();
+  expect(h.frames.find(f => f.type === "provider_outcome")?.payload["detail"]).toContain("timed out waiting");
+  expect(h.counts().actions).toBe(1);
+});
+
+test("Firefox exact native receipt arriving during an async menu check wins without another decision", async () => {
+  const h = await nativeHarness(); h.win.document.querySelector("button")!.textContent = "Download";
+  await nativeArm(h);
+  const dispatched = h.backend.store.activeJobs[0]?.native_download?.dispatched_at_ms;
+  await h.tick(); await until(() => h.timers.some(timer => timer.ms === 1000));
+  expect(h.backend.store.activeJobs[0]?.native_download?.dispatched_at_ms).toBe(dispatched);
+  const item = firefoxItem(h);
+  h.setOnMenuCheck(async () => {
+    h.win.document.querySelector("main")!.insertAdjacentHTML("beforeend", '<button>Download PDF</button>');
+    await h.downloads.onCreated.emit(item);
+  });
+  await h.tick();
+  await until(() => h.backend.store.activeJobs[0]?.native_download?.download_id === item.id);
+  const completing = completeNative(h, item);
+  const request = await h.request("native_download_import_request_v1");
+  expect(request.payload["download_id"]).toBe(item.id);
+  expect(request.payload["source_path"]).toBe(sourcePath);
+  await h.reply(request, "native_download_import_result_v1", { reservation_id: reservationID, download_id: item.id, outcome: "ready" });
+  await completing;
+  expect(h.counts().actions).toBe(1); expect(h.counts().menuChecks).toBe(2);
+  expect(h.frames.filter(f => f.type === "agent_decide_request_v1")).toHaveLength(1);
+  expect(h.frames.some(f => f.type === "provider_drive_epoch_result_request")).toBe(false);
   expectNativeUntouched(h);
 });
