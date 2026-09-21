@@ -1488,7 +1488,7 @@ for (const departed of [true, false]) test(`Chrome filename steering ${departed 
 for (const firefox of [false, true]) for (const timing of ["synchronous", "delayed"] as const) test(`${firefox ? "Firefox" : "Chrome"} agent PDF wrapper saves the exposed file with the original producer (${timing})`, async () => {
   const h = await navigationHarness(firefox);
   const fileURL = "https://unregistered.example/files/article.pdf?token=private";
-  const item = firefoxItem(h, { referrer: navigationURL, url: fileURL, ...(firefox ? {} : { tabId: tabID, filename: "article.pdf" }) });
+  const item = firefoxItem(h, { referrer: navigationURL, url: fileURL, ...(firefox ? {} : { filename: "article.pdf" }) });
   let created: Promise<void> | undefined, saves = 0;
   h.setAfterAct(async () => {
     const win = await h.land(navigationURL, "");
@@ -1595,7 +1595,7 @@ for (const stop of ["cancel", "disconnect", "replacement", "commit", "timeout"] 
 
 for (const firefox of [false, true]) test(`${firefox ? "Firefox" : "Chrome"} agent PDF wrapper invalidates a receipt when commit overtakes its document check`, async () => {
   const h = await navigationHarness(firefox);
-  const item = firefoxItem(h, { referrer: navigationURL, url: "https://unregistered.example/article.pdf", ...(firefox ? {} : { tabId: tabID, filename: "article.pdf" }) });
+  const item = firefoxItem(h, { referrer: navigationURL, url: "https://unregistered.example/article.pdf", ...(firefox ? {} : { filename: "article.pdf" }) });
   let created: Promise<void> | undefined, checkingReceipt = false, checkingDocument = false;
   let releaseDocument!: () => void, releaseAction!: () => void;
   const documentGate = new Promise<void>(resolve => { releaseDocument = resolve; });
@@ -1682,3 +1682,36 @@ test("agent refreshes a changed pre-click observation without spending or replay
   await h.reply(next, "agent_decide_result_v1", { observation_revision: (next.payload["observation"] as { revision: string }).revision, outcome: "decision", choice: "BLOCKED" });
   await h.settle();
 });
+
+for (const change of ["referrer", "old-time", "future-time", "extension", "holder", "generation", "epoch", "expired", "not-initiated", "ambiguous", "duplicate"] as const)
+  test(`Chrome agent receipt without tabId refuses ${change}`, async () => {
+    const h = await navigationHarness(false);
+    h.setAfterAct(async () => { const win = await h.land(navigationURL, ""); win.document.body.innerHTML = '<iframe src="/article.pdf"></iframe>'; });
+    let reached = false;
+    const execute = h.deps.scripting.executeScript;
+    h.deps.scripting.executeScript = async injection => {
+      if (injection.func === agentDOM && (injection.args?.[0] as AgentDOMRequest)?.method === "act_pdf") { reached = true; return [{ result: { status: "dispatched", downloadExpected: true } }]; }
+      return execute(injection);
+    };
+    await h.classify(); await h.started(); await h.decide("decision", "c1");
+    await until(() => reached);
+    const track = Reflect.get(h.bridge, "downloads").get(jobID);
+    const pending = Reflect.get(h.bridge, "agentNavigations").get(jobID);
+    const item = firefoxItem(h, { referrer: navigationURL, filename: "article.pdf" });
+    if (change === "referrer") item.referrer = "https://unregistered.example/other-article";
+    if (change === "old-time") item.startTime = new Date(h.now() - 1).toISOString();
+    if (change === "future-time") item.startTime = new Date(h.now() + 1).toISOString();
+    if (change === "extension") item.byExtensionId = "other-extension";
+    if (change === "holder") Reflect.set(h.bridge, "lastKnownBrowserHolderGeneration", 2);
+    if (change === "generation") Reflect.set(h.bridge, "portGeneration", Reflect.get(h.bridge, "portGeneration") + 1);
+    if (change === "epoch") await h.update(s => patchJob(s, jobID, { generic_drive_epoch: { ...localEpoch, drive_attempt_id: "other-attempt" } }));
+    if (change === "expired") await h.update(s => patchJob(s, jobID, { expires_at: h.now() }));
+    if (change === "not-initiated") await h.update(s => patchJob(s, jobID, { download_initiated: false }));
+    if (change === "ambiguous") track.ambiguous = true;
+    if (change === "duplicate") Reflect.get(h.bridge, "downloads").set("job_other", { ...track, ids: new Set(), agentDocument: { ...track.agentDocument } });
+    let suggestion: string | undefined;
+    await h.downloads.onDeterminingFilename.emit(item, value => { suggestion = value.filename; });
+    expect(suggestion).toBeUndefined();
+    expect(item.tabId).toBeUndefined();
+    pending.stop(); await flush();
+  });

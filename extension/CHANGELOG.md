@@ -18,6 +18,10 @@ for the full pre-split extension history.
 
 ### Fixed
 
+- **Chrome adopts agent downloads that omit a tab ID.** Downloads after an
+  article-agent navigation now match the exact page referrer, dispatch time and
+  current document binding, including publishers with no adapter. Ambiguous or
+  expired matches are refused.
 - **Article-agent decisions tolerate a page finishing its render.** If controls
   change during inference, Papio takes a fresh observation before clicking,
   within the same time and decision limits. It never repeats a dispatched click.

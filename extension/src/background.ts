@@ -21872,6 +21872,16 @@ export class Bridge {
     // bypass this broad tab/host correlation path.
     if (this.deps.downloads.onDeterminingFilename === undefined)
       return undefined;
+    // Chrome DownloadItem need not carry tabId. Agent clicks already retain a
+    // stronger exact referrer/time/document binding; an empty provider allowlist
+    // must not discard that receipt or fall back to publisher-wide matching.
+    const agents = [...this.downloads.entries()].filter(([, track]) =>
+      track.agentDocument !== undefined && this.agentNavigationReceiptCurrent(track, item));
+    if (agents.length > 0) {
+      if (agents.length !== 1) return undefined;
+      const [jobID, track] = agents[0]!;
+      return this.agentNavigationAuthority(jobID, track) ? findByJob(this.store, jobID) : undefined;
+    }
     const byDOI = this.manualDownloadJobForDOI(item);
     if (byDOI === null) return undefined;
     if (byDOI !== undefined) return byDOI;
@@ -22105,23 +22115,27 @@ export class Bridge {
   private agentNavigationReceiptCurrent(track: DownloadTrack, item: DownloadItemLike): boolean {
     const binding = track.agentDocument!;
     const started = Date.parse(item.startTime ?? "");
-    return item.referrer === binding.url && binding.dispatchedAt !== undefined &&
+    return !item.byExtensionId && item.referrer === binding.url && binding.dispatchedAt !== undefined &&
       Number.isSafeInteger(started) && started >= binding.dispatchedAt && started <= this.deps.now() &&
       started <= binding.dispatchedAt + 45_000 && (item.tabId === undefined || item.tabId === binding.tabID);
+  }
+
+  private agentNavigationAuthority(jobID: string, track: DownloadTrack): boolean {
+    const binding = track.agentDocument;
+    const job = findByJob(this.store, jobID);
+    return !!binding && this.downloads.get(jobID) === track && !track.ambiguous && binding.generation === this.portGeneration &&
+      binding.holderGeneration === this.lastKnownBrowserHolderGeneration &&
+      !this.agentNavigations.get(jobID)?.invalid && this.agentFallbackAvailable() && !!job &&
+      this.hasDelegatedAuthority(job) && job.tab_id === binding.tabID && job.download_initiated === true &&
+      (job.status === "accepted" || job.status === "awaiting_download" || job.status === "auth_pending") &&
+      !job.generic_terminal && !job.challenge_blocked && !job.needs_terms_consent && job.expires_at > this.deps.now() &&
+      !!job.generic_drive_epoch && !!track.generic && this.genericEpochKey(jobID, job.generic_drive_epoch) === this.genericEpochKey(jobID, track.generic.epoch);
   }
 
   private async agentNavigationDownloadFresh(jobID: string, track: DownloadTrack): Promise<boolean> {
     const binding = track.agentDocument!;
     const transition = this.agentNavigations.get(jobID);
-    const valid = () => {
-      const job = findByJob(this.store, jobID);
-      return !transition?.invalid && this.downloads.get(jobID) === track && !track.ambiguous && binding.generation === this.portGeneration &&
-        binding.holderGeneration === this.lastKnownBrowserHolderGeneration &&
-        this.agentFallbackAvailable() && !!job && this.hasDelegatedAuthority(job) && job.tab_id === binding.tabID &&
-        (job.status === "accepted" || job.status === "awaiting_download" || job.status === "auth_pending") &&
-        !job.generic_terminal && !job.challenge_blocked && !job.needs_terms_consent && job.expires_at > this.deps.now() &&
-        !!job.generic_drive_epoch && !!track.generic && this.genericEpochKey(jobID, job.generic_drive_epoch) === this.genericEpochKey(jobID, track.generic.epoch);
-    };
+    const valid = () => !transition?.invalid && this.agentNavigationAuthority(jobID, track);
     if (!valid()) return false;
     const tab = await this.uniqueNativeArticleTab(jobID, binding.tabID, binding.url);
     if (!tab || !valid()) return false;
