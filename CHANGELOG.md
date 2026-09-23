@@ -21,6 +21,15 @@ execution records kept during the initial build.
   the same file without an accept still parks for review. The `ready`
   transition records `reason: review_accepted` and
   `identity_override: operator`.
+- `papio jobs redrive <job-id> --revision <n>` now reopens a `needs_review`
+  job whose one open manual download asks the operator to remove an adopted
+  file that failed validation and could not be moved to `rejected/`. Once no
+  file remains in the job's adoption directories, the job returns to
+  `awaiting_human` with a fresh institutional handoff. While a file remains,
+  or the directory cannot be read, redrive refuses, because the adoption
+  sweep would adopt and reject the same file again. Measured live 2026-09-23:
+  a job sat on that action from 2026-08-30 with its file long gone, and every
+  CLI verb refused it. New actions of this kind name the redrive command.
 - An empty browser `job_reject` no longer ends a job as
   `unavailable / browser_rejected`. The frame carries no reason, and the
   extension sent it only when it had lost its own offer URL. The job now stays

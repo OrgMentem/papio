@@ -977,6 +977,11 @@ accepted with --revision 0: that reason came from an empty browser
 job_reject, which says nothing about the paper, and redrive returns the
 job to awaiting_human with a fresh institutional handoff.
 
+A needs_review job whose one open manual download asks you to remove an
+adopted file that failed validation is accepted once that file is gone
+from the job's adoption directory. Redrive returns it to awaiting_human
+with a fresh institutional handoff; while the file remains, it refuses.
+
 Redrive accepts nothing on the provider: the extension's own terms
 consent setting decides again when the handoff is driven, and without
 consent the job parks on terms again.

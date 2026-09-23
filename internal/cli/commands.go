@@ -535,6 +535,10 @@ func newJobsCommand(opt *options) *cobra.Command {
 			"accepted with --revision 0: that reason came from an empty browser\n" +
 			"job_reject, which says nothing about the paper, and redrive returns the\n" +
 			"job to awaiting_human with a fresh institutional handoff.\n\n" +
+			"A needs_review job whose one open manual download asks you to remove an\n" +
+			"adopted file that failed validation is accepted once that file is gone\n" +
+			"from the job's adoption directory. Redrive returns it to awaiting_human\n" +
+			"with a fresh institutional handoff; while the file remains, it refuses.\n\n" +
 			"Redrive accepts nothing on the provider: the extension's own terms\n" +
 			"consent setting decides again when the handoff is driven, and without\n" +
 			"consent the job parks on terms again.\n\n" +

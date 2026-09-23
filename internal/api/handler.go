@@ -8,8 +8,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"log"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -1148,15 +1150,43 @@ func redriveJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 	if strings.TrimSpace(params.JobID) == "" || params.ExpectedRevision == nil || *params.ExpectedRevision < 0 {
 		return badParams(errors.New("job_id and non-negative expected_revision are required"))
 	}
+	// Only a needs_review park left by an adopted file papio could not move
+	// aside needs the filesystem; every other shape ignores the observation.
+	fileGone := false
+	if row, err := system.Jobs.Get(ctx, params.JobID); err == nil && row.State == job.StateNeedsReview {
+		fileGone = adoptedFileGone(&system.Config, params.JobID)
+	}
 	id, err := system.Jobs.RedriveInstitutionalHandoff(ctx, params.JobID, *params.ExpectedRevision,
 		system.Config.OpenURLBaseFor, func(detail string) bool {
 			_, ok := app.OABrowserHandoffURL(detail)
 			return ok
-		}, app.InstitutionalOpenURLHandoffDetail)
+		}, fileGone, app.InstitutionalOpenURLHandoffDetail)
 	if err != nil {
 		return failure(err)
 	}
 	return marshal(RedriveResult{JobID: params.JobID, ActionID: id})
+}
+
+// adoptedFileGone reports whether no adoption root holds a file for jobID:
+// each job directory is absent or holds only dotfiles (.DS_Store), which the
+// adoption sweep never reads. A listing that fails or hits the TCC deadline is
+// not evidence of absence, so it reports false and the park stays.
+func adoptedFileGone(cfg *config.Config, jobID string) bool {
+	for _, root := range cfg.AdoptionRoots() {
+		entries, err := browser.BoundedReadDir(filepath.Join(root, jobID), nil, nil)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".") {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func jobReceipt(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

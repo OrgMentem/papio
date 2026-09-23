@@ -321,9 +321,10 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		// re-parking in awaiting_human would let the directory sweep re-adopt and
 		// re-reject the same file every tick. Park in needs_review instead — the
 		// adoption sweep never scans it — with an action telling the user to
-		// remove or replace the file so the loop cannot spin.
+		// remove the file and redrive, which reopens the park only once no
+		// file remains, so the loop cannot spin.
 		if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-			"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory",
+			fmt.Sprintf("the adopted download failed validation and could not be quarantined; remove the file from the adoption directory, then run 'papio jobs redrive %s --revision 1'", jobID),
 			replacementAccess, job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
 			return err
 		}

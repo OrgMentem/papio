@@ -3,6 +3,8 @@ package api
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"papio/internal/app"
@@ -76,6 +78,59 @@ func TestRedriveIPCReplacesSpentOpenAccessHandoff(t *testing.T) {
 	var result RedriveResult
 	if rpcErr := callMethod(t, Router(system), "jobs.redrive", map[string]any{"job_id": id, "expected_revision": 1}, &result); rpcErr != nil {
 		t.Fatalf("redrive of a spent OA handoff: %+v", rpcErr)
+	}
+	open, err := system.Jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].ID != result.ActionID || open[0].Detail != app.InstitutionalOpenURLHandoffDetail {
+		t.Fatalf("replacement=%+v err=%v, want the institutional handoff only", open, err)
+	}
+}
+
+// An adopted file that failed validation and could not be moved to rejected/
+// parks the job in needs_review. Redrive reopens it only once the adoption
+// directory holds no file the sweep would adopt and reject again.
+func TestRedriveIPCReopensUnquarantinedAdoptionParkOnceFileIsGone(t *testing.T) {
+	system := testSystem(t)
+	system.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	ctx := context.Background()
+	id, err := system.Jobs.CreateRequest(ctx, "wr_redrive_unquarantined", work.Work{DOI: "10.1111/j.1545-5300.2009.01299.x"}, "", "",
+		job.Policy{AccessMode: "delegated", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := system.Jobs.ParkWithHumanAction(ctx, id, job.StateResolving, job.StateNeedsReview, "manual_download",
+		"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory",
+		nil, job.Access(false, ""), job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
+		t.Fatal(err)
+	}
+	landing := filepath.Join(system.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(landing, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(landing, "paper.pdf")
+	if err := os.WriteFile(stale, []byte("not a pdf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(landing, ".DS_Store"), []byte{0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	router := Router(system)
+	params := map[string]any{"job_id": id, "expected_revision": 1}
+	if rpcErr := callMethod(t, router, "jobs.redrive", params, nil); rpcErr == nil || rpcErr.Code != "conflict" {
+		t.Fatalf("redrive with the rejected file still landed=%+v; want conflict", rpcErr)
+	}
+	if err := os.Remove(stale); err != nil {
+		t.Fatal(err)
+	}
+	var result RedriveResult
+	if rpcErr := callMethod(t, router, "jobs.redrive", params, &result); rpcErr != nil {
+		t.Fatalf("redrive once the file is gone: %+v", rpcErr)
+	}
+	row, err := system.Jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateAwaitingHuman {
+		t.Fatalf("row=%+v err=%v; want awaiting_human", row, err)
 	}
 	open, err := system.Jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
 	if err != nil || len(open) != 1 || open[0].ID != result.ActionID || open[0].Detail != app.InstitutionalOpenURLHandoffDetail {

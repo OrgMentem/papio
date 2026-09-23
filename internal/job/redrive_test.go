@@ -61,7 +61,7 @@ func TestRedriveReplacesManualDownloadAndRetiresClaim(t *testing.T) {
 	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx, "redrive-auth", id, 1, claim.BindingID, 7); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, "institutional handoff detail"); err != nil {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); err != nil {
 		t.Fatal(err)
 	}
 	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
@@ -93,7 +93,7 @@ func TestRedriveReplacesManualDownloadAndRetiresClaim(t *testing.T) {
 	if !found {
 		t.Fatalf("redrive event missing action identity: %+v", events)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("repeat without new outcome=%v", err)
 	}
 }
@@ -115,7 +115,7 @@ func TestRedriveReplacesTermsActionAndRetiresParkedClaim(t *testing.T) {
 	if _, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET phase='parked',lease_until=NULL WHERE id=?`, claim.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, "institutional handoff detail"); err != nil {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); err != nil {
 		t.Fatal(err)
 	}
 	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
@@ -150,6 +150,7 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 		"state", "revision", "other_action", "terms_live_claim", "verify_identity", "unsafe_pdf",
 		"no_action", "no_identifier", "no_resolver", "lease", "held_effect",
 		"unknown_effect", "already_redriven", "institutional_handoff", "unavailable_other_reason",
+		"needs_review_undiagnosed", "needs_review_verify_identity",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
@@ -157,6 +158,7 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 			id, action := redriveJob(t, js)
 			revision := int64(1)
 			route := redriveRoute
+			fileGone := false
 			exec := func(query string, args ...any) {
 				t.Helper()
 				if _, err := js.S.DB().ExecContext(ctx, query, args...); err != nil {
@@ -192,6 +194,14 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 				// Only an empty browser job_reject retired a handoff without
 				// evidence; every other unavailable outcome stays settled.
 				exec(`UPDATE jobs SET state='unavailable', terminal_reason='no_entitlement' WHERE id=?`, id)
+			case "needs_review_undiagnosed", "needs_review_verify_identity":
+				// needs_review reopens only the park an adopted file that could
+				// not be quarantined left, even once that file is gone.
+				fileGone = true
+				exec(`UPDATE jobs SET state='needs_review' WHERE id=?`, id)
+				if scenario == "needs_review_verify_identity" {
+					exec(`UPDATE human_actions SET kind='verify_identity', diagnosis=? WHERE id=?`, DiagnosisReasonAdoptedPDFInvalid, action)
+				}
 			case "no_action":
 				exec(`UPDATE human_actions SET status='cancelled' WHERE id=?`, action)
 				revision = 0
@@ -212,7 +222,7 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := js.RedriveInstitutionalHandoff(ctx, id, revision, route, redriveOAHandoff, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+			if _, err := js.RedriveInstitutionalHandoff(ctx, id, revision, route, redriveOAHandoff, fileGone, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
 				t.Fatalf("redrive=%v; want ErrConflict", err)
 			}
 			var status string
@@ -230,7 +240,7 @@ func TestRedriveResolvedParkAndFreshOutcome(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)
 	id, action := redriveJob(t, js)
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, "institutional handoff detail"); err != nil {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); err != nil {
 		t.Fatal(err)
 	}
 	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
@@ -240,13 +250,13 @@ func TestRedriveResolvedParkAndFreshOutcome(t *testing.T) {
 	if _, err := js.S.DB().ExecContext(ctx, `UPDATE human_actions SET status='resolved' WHERE id=?`, open[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("redrive without outcome=%v", err)
 	}
 	if err := js.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{"outcome": "wrong_work"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, "institutional handoff detail"); err != nil {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); err != nil {
 		t.Fatal(err)
 	}
 	open, err = js.ListOpenHumanActionsForJobs(ctx, []string{id})
@@ -262,7 +272,7 @@ func TestRedrivePreviouslyResolvedPark(t *testing.T) {
 	if _, err := js.S.DB().ExecContext(ctx, `UPDATE human_actions SET status='resolved' WHERE id=?`, old); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, "institutional handoff detail"); err != nil {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); err != nil {
 		t.Fatal(err)
 	}
 	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
@@ -293,7 +303,7 @@ func TestRedriveReopensBrowserRejectedHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fresh, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, "institutional handoff detail")
+	fresh, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, false, "institutional handoff detail")
 	if err != nil {
 		t.Fatalf("redrive of a browser_rejected handoff: %v", err)
 	}
@@ -323,8 +333,68 @@ func TestRedriveReopensBrowserRejectedHandoff(t *testing.T) {
 	if !reopened || !requested {
 		t.Fatalf("redrive events reopened=%t requested=%t: %+v", reopened, requested, events)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, fresh, redriveRoute, redriveOAHandoff, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, fresh, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("repeat redrive=%v; want ErrConflict", err)
+	}
+}
+
+// Live 2026-09-23: job_484c… sat in needs_review from 2026-08-30 on one open
+// manual_download that asked the operator to remove an adopted file papio
+// could not move to rejected/. The file was long gone, and redrive refused
+// the state, so only daily reminders remained.
+func TestRedriveReturnsUnquarantinedAdoptionParkOnceFileIsGone(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id := resolvingParkCandidate(t, js, "redrive-unquarantined")
+	if err := js.ParkWithHumanAction(ctx, id, StateResolving, StateNeedsReview, "manual_download",
+		"the adopted download failed validation and could not be quarantined; remove or replace the file in the adoption directory",
+		map[string]any{"reason": "adopted_download_rejected_unquarantined"}, Access(true, "landing_page"),
+		WithHumanActionDiagnosis(DiagnosisReasonAdoptedPDFInvalid)); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 {
+		t.Fatalf("parked actions=%+v err=%v", open, err)
+	}
+	old := open[0].ID
+
+	// While the file may still be in the adoption directory, awaiting_human
+	// would hand it straight back to the sweep, so the park stays.
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("redrive with the adopted file still present=%v; want ErrConflict", err)
+	}
+	if row, err := js.Get(ctx, id); err != nil || row.State != StateNeedsReview {
+		t.Fatalf("refused redrive moved the job: %+v err=%v", row, err)
+	}
+	fresh, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, true, "institutional handoff detail")
+	if err != nil {
+		t.Fatalf("redrive of an unquarantined adoption park whose file is gone: %v", err)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil || row.State != StateAwaitingHuman {
+		t.Fatalf("row=%+v err=%v; want awaiting_human", row, err)
+	}
+	open, err = js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].ID != fresh || open[0].Kind != "openurl_handoff" || open[0].Detail != "institutional handoff detail" {
+		t.Fatalf("replacement=%+v err=%v", open, err)
+	}
+	var status string
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, old).Scan(&status); err != nil || status != "resolved" {
+		t.Fatalf("old status=%q err=%v", status, err)
+	}
+	events, err := js.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened := false
+	for _, event := range events {
+		detail, _ := event["detail"].(map[string]any)
+		if event["kind"] == "job.transition" && detail["from"] == StateNeedsReview && detail["to"] == StateAwaitingHuman {
+			reopened = detail["reason"] == "operator_redrive"
+		}
+	}
+	if !reopened {
+		t.Fatalf("no needs_review -> awaiting_human operator_redrive transition: %+v", events)
 	}
 }
 
@@ -336,7 +406,7 @@ func TestRedriveRollsBackReplacementIfEventFails(t *testing.T) {
 		WHEN NEW.kind='job.retry_requested' BEGIN SELECT RAISE(ABORT,'injected event failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, "institutional handoff detail"); err == nil {
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); err == nil {
 		t.Fatal("injected event failure ignored")
 	}
 	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})

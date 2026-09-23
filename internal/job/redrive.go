@@ -30,8 +30,17 @@ import (
 // sent when the extension had lost its own worker-local offer URL, into that
 // terminal state. The reject carried no evidence about the paper, so the job
 // returns to awaiting_human with a fresh institutional handoff (revision 0).
+//
+// The fifth shape is a needs_review job on one open manual_download with the
+// adopted_pdf_failed_validation diagnosis: an adopted file failed validation
+// and could not be moved to rejected/, so papio parked it out of the adoption
+// sweep's reach and asked the operator to remove it. adoptedFileGone is the
+// caller's observation that the job's adoption directories now hold no file;
+// without it the job stays parked, because awaiting_human would let the sweep
+// re-adopt and re-reject that same file every tick.
 func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
-	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, handoffDetail string) (int64, error) {
+	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, adoptedFileGone bool,
+	handoffDetail string) (int64, error) {
 	if strings.TrimSpace(jobID) == "" || revision < 0 {
 		return 0, errors.New("job_id and non-negative revision are required")
 	}
@@ -64,8 +73,9 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 		return 0, err
 	}
 	rejected := state == StateUnavailable && terminalReason == string(TerminalReasonBrowserRejected)
-	if state != StateAwaitingHuman && !rejected {
-		return 0, fmt.Errorf("%w: job is %s, not awaiting_human or unavailable after browser_rejected", ErrConflict, state)
+	unquarantined := state == StateNeedsReview
+	if state != StateAwaitingHuman && !rejected && !unquarantined {
+		return 0, fmt.Errorf("%w: job is %s, not awaiting_human, needs_review on an adopted file, or unavailable after browser_rejected", ErrConflict, state)
 	}
 	if leased != 0 || won != 0 || blocked != 0 {
 		return 0, fmt.Errorf("%w: job has a lease, artifact, or unresolved effect permit", ErrConflict)
@@ -84,16 +94,16 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	if latestRedrive > latestOutcome {
 		return 0, fmt.Errorf("%w: redrive already requested since the last browser outcome", ErrConflict)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,kind,COALESCE(detail,''),revision FROM human_actions WHERE job_id=? AND status='open'`, jobID)
+	rows, err := tx.QueryContext(ctx, `SELECT id,kind,COALESCE(detail,''),COALESCE(diagnosis,''),revision FROM human_actions WHERE job_id=? AND status='open'`, jobID)
 	if err != nil {
 		return 0, err
 	}
 	var actionID, actionRevision int64
-	var actionKind, actionDetail string
+	var actionKind, actionDetail, actionDiagnosis string
 	count := 0
 	for rows.Next() {
 		count++
-		if err := rows.Scan(&actionID, &actionKind, &actionDetail, &actionRevision); err != nil {
+		if err := rows.Scan(&actionID, &actionKind, &actionDetail, &actionDiagnosis, &actionRevision); err != nil {
 			_ = rows.Close()
 			return 0, err
 		}
@@ -102,6 +112,14 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	_ = rows.Close()
 	if err != nil {
 		return 0, err
+	}
+	if unquarantined {
+		if count != 1 || actionKind != "manual_download" || actionDiagnosis != DiagnosisReasonAdoptedPDFInvalid || revision != actionRevision {
+			return 0, fmt.Errorf("%w: needs_review redrive expects one unchanged manual_download for an adopted file that failed validation; list actions again", ErrConflict)
+		}
+		if !adoptedFileGone {
+			return 0, fmt.Errorf("%w: the job's adoption directory still holds a file, or could not be read; remove the file, then redrive", ErrConflict)
+		}
 	}
 	// A terms action is the third spent shape: the provider parked the drive
 	// on its consent step, and the extension's own consent setting decides it
@@ -141,17 +159,17 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 			return 0, err
 		}
 	}
-	if rejected {
+	if rejected || unquarantined {
 		res, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, terminal_reason=NULL, updated_at=?,
 			retry_at=NULL, lease_owner=NULL, lease_expires_at=NULL WHERE id=? AND state=?`,
-			StateAwaitingHuman, now, jobID, StateUnavailable)
+			StateAwaitingHuman, now, jobID, state)
 		if err != nil {
 			return 0, err
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
 			return 0, fmt.Errorf("%w: job changed; list jobs again", ErrConflict)
 		}
-		transition, err := json.Marshal(map[string]any{"from": StateUnavailable, "to": StateAwaitingHuman, "reason": "operator_redrive"})
+		transition, err := json.Marshal(map[string]any{"from": state, "to": StateAwaitingHuman, "reason": "operator_redrive"})
 		if err != nil {
 			return 0, err
 		}
