@@ -171,6 +171,12 @@ type RepairResult struct {
 	State    string `json:"state,omitempty"`
 }
 
+// RedriveResult reports the new institutional handoff after one operator request.
+type RedriveResult struct {
+	JobID    string `json:"job_id"`
+	ActionID int64  `json:"action_id"`
+}
+
 // Receipt answers "what happened to this acquisition, and what exactly did it
 // obtain" for one job. It exists for the states `acquisition-bundle/1` cannot
 // describe — failures, which have no bundle — and deliberately does not restate
@@ -324,6 +330,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"jobs.repair_awaiting_human": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return repairAwaitingHuman(ctx, raw, system)
+		},
+		"jobs.redrive": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return redriveJob(ctx, raw, system)
 		},
 		"jobs.failures": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return listFailures(ctx, raw, system)
@@ -1126,6 +1135,25 @@ func repairAwaitingHuman(ctx context.Context, raw json.RawMessage, system *boots
 		return failure(err)
 	}
 	return marshal(RepairResult{JobID: params.JobID, Repaired: true, Outcome: "repaired", State: job.StateResolving})
+}
+
+func redriveJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID            string `json:"job_id"`
+		ExpectedRevision *int64 `json:"expected_revision"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.JobID) == "" || params.ExpectedRevision == nil || *params.ExpectedRevision < 0 {
+		return badParams(errors.New("job_id and non-negative expected_revision are required"))
+	}
+	id, err := system.Jobs.RedriveInstitutionalHandoff(ctx, params.JobID, *params.ExpectedRevision,
+		system.Config.OpenURLBaseFor, app.InstitutionalOpenURLHandoffDetail)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(RedriveResult{JobID: params.JobID, ActionID: id})
 }
 
 func jobReceipt(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

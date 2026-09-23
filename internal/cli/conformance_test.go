@@ -139,6 +139,7 @@ var commandClassification = map[string]commandClass{
 	"papio jobs repair-awaiting-human": {kind: kindStructured, rpcMethods: []string{"jobs.repair_awaiting_human"}},
 	"papio jobs cancel":                {kind: kindStructured, rpcMethods: []string{"jobs.cancel", "jobs.get"}},
 	"papio jobs retry":                 {kind: kindStructured, rpcMethods: []string{"jobs.retry"}},
+	"papio jobs redrive":               {kind: kindStructured, args: []string{"job_01", "--revision", "1"}, rpcMethods: []string{"jobs.redrive"}},
 	"papio jobs failures":              {kind: kindStructured, rpcMethods: []string{"jobs.failures", "jobs.incidents"}},
 	"papio jobs incidents":             {kind: kindEnvelope, rowKey: "incidents", rpcMethods: []string{"jobs.incidents"}},
 	"papio delivery":                   {kind: kindNone},

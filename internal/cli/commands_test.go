@@ -21,6 +21,35 @@ import (
 	"papio/internal/work"
 )
 
+func TestRedriveRequiresRevisionAndReportsNewAction(t *testing.T) {
+	var out, errOut bytes.Buffer
+	calls := 0
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+		calls++
+		if method != "jobs.redrive" {
+			t.Fatalf("method=%s", method)
+		}
+		got := params.(map[string]any)
+		if got["job_id"] != "job_01" || got["expected_revision"] != int64(1) {
+			t.Fatalf("redrive params=%+v", got)
+		}
+		*result.(*api.RedriveResult) = api.RedriveResult{JobID: "job_01", ActionID: 42}
+		return nil
+	})
+	root.SetArgs([]string{"jobs", "redrive", "job_01"})
+	if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "--revision is required") || calls != 0 {
+		t.Fatalf("unguarded redrive err=%v calls=%d", err, calls)
+	}
+	out.Reset()
+	root.SetArgs([]string{"jobs", "redrive", "job_01", "--revision", "1"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "job_01\topenurl_handoff\t42\n" || calls != 1 {
+		t.Fatalf("redrive output=%q calls=%d", got, calls)
+	}
+}
+
 func TestAccessHintClassifiesOpenAndInstitutionalAccess(t *testing.T) {
 	tests := []struct {
 		name   string

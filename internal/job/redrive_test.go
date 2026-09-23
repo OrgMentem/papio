@@ -1,0 +1,214 @@
+// Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
+package job
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+func redriveRoute(name string) (string, bool) {
+	if name == "institute" {
+		return "https://resolver.example.edu/openurl", true
+	}
+	return "", false
+}
+
+func redriveJob(t *testing.T, js *Store) (string, int64) {
+	t.Helper()
+	id := resolvingParkCandidate(t, js, "redrive")
+	if err := js.ParkWithHumanAction(context.Background(), id, StateResolving, StateAwaitingHuman,
+		"manual_download", "papio could not drive the provider", nil, Access(true, "landing_page")); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(context.Background(), []string{id})
+	if err != nil || len(open) != 1 {
+		t.Fatalf("actions=%+v err=%v", open, err)
+	}
+	return id, open[0].ID
+}
+
+func TestRedriveReplacesManualDownloadAndRetiresClaim(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, old := redriveJob(t, js)
+	profile := institutionalProfile(t, js, "institute", "digest", "auth")
+	candidate := institutionalCandidate(t, js, profile, "redrive-claim", id)
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{CandidateID: candidate.ID, BrowserHolderGeneration: 1, JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision, RouteRevision: 7, MaterializationKind: "browser_tab", LeaseUntil: time.Now().Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+		AuthenticationClaimID: "redrive-auth", LeaseID: "redrive-lease", OwnerID: id,
+		BrowserHolderGeneration: 1, LeaseUntil: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx, "redrive-auth", id, 1, claim.BindingID, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, "institutional handoff detail"); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].ID == old || open[0].Kind != "openurl_handoff" || open[0].Detail != "institutional handoff detail" || !open[0].RequiresAuth || open[0].BlockedBy != "paywall" {
+		t.Fatalf("replacement=%+v err=%v", open, err)
+	}
+	var status, phase string
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, old).Scan(&status); err != nil || status != "resolved" {
+		t.Fatalf("old status=%q err=%v", status, err)
+	}
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT phase FROM materialization_claims WHERE id=?`, claim.ID).Scan(&phase); err != nil || phase != "abandoned" {
+		t.Fatalf("claim phase=%q err=%v", phase, err)
+	}
+	lease, ok, err := js.GetAuthenticationEntryLease(ctx, "redrive-auth")
+	if err != nil || !ok || lease.State != AuthenticationEntryLeaseExpired || lease.OwnerBindingID != "" {
+		t.Fatalf("entry lease=%+v ok=%t err=%v", lease, ok, err)
+	}
+	events, err := js.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event["kind"] == "job.retry_requested" {
+			detail, _ := event["detail"].(map[string]any)
+			found = detail["reason"] == "operator_redrive" && detail["action_id"] == float64(old) && detail["action_revision"] == float64(1)
+		}
+	}
+	if !found {
+		t.Fatalf("redrive event missing action identity: %+v", events)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("repeat without new outcome=%v", err)
+	}
+}
+
+func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
+	for _, scenario := range []string{
+		"state", "revision", "other_action", "terms", "verify_identity", "unsafe_pdf",
+		"no_action", "no_identifier", "no_resolver", "lease", "held_effect",
+		"unknown_effect", "already_redriven",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			js := testStore(t)
+			id, action := redriveJob(t, js)
+			revision := int64(1)
+			route := redriveRoute
+			exec := func(query string, args ...any) {
+				t.Helper()
+				if _, err := js.S.DB().ExecContext(ctx, query, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch scenario {
+			case "state":
+				exec(`UPDATE jobs SET state='resolving' WHERE id=?`, id)
+			case "revision":
+				revision = 2
+			case "other_action":
+				_, err := js.OpenHumanAction(ctx, id, "human_auth_required", "login", Access(true, "paywall"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "terms", "verify_identity", "unsafe_pdf":
+				kind := map[string]string{"terms": "terms_acceptance_required", "verify_identity": "verify_identity", "unsafe_pdf": "unsafe_pdf"}[scenario]
+				exec(`UPDATE human_actions SET kind=? WHERE id=?`, kind, action)
+			case "no_action":
+				exec(`UPDATE human_actions SET status='cancelled' WHERE id=?`, action)
+				revision = 0
+			case "no_identifier":
+				exec(`DELETE FROM identifiers`)
+			case "no_resolver":
+				route = func(string) (string, bool) { return "", false }
+			case "lease":
+				exec(`UPDATE jobs SET lease_owner='other',lease_expires_at='2099-01-01T00:00:00Z' WHERE id=?`, id)
+			case "held_effect", "unknown_effect":
+				busy := permitJob(t, js, "redrive-busy")
+				permit := acquireDrive(t, js, driveIdentity(busy, "redrive-effect", 0, "generic"), "institution:example.edu", time.Now().Add(time.Minute))
+				if scenario == "unknown_effect" {
+					exec(`UPDATE effect_permits SET status='unknown_completion' WHERE id=?`, permit.ID)
+				}
+			case "already_redriven":
+				if err := js.RecordEvent(ctx, id, "job.retry_requested", map[string]any{"reason": "operator_redrive"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := js.RedriveInstitutionalHandoff(ctx, id, revision, route, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+				t.Fatalf("redrive=%v; want ErrConflict", err)
+			}
+			var status string
+			if err := js.S.DB().QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, action).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "no_action" && status != "open" {
+				t.Fatalf("refusal changed action status to %s", status)
+			}
+		})
+	}
+}
+
+func TestRedriveResolvedParkAndFreshOutcome(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, action := redriveJob(t, js)
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, "institutional handoff detail"); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 {
+		t.Fatalf("first open=%+v err=%v", open, err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE human_actions SET status='resolved' WHERE id=?`, open[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("redrive without outcome=%v", err)
+	}
+	if err := js.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{"outcome": "wrong_work"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, "institutional handoff detail"); err != nil {
+		t.Fatal(err)
+	}
+	open, err = js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].Kind != "openurl_handoff" || open[0].ID == action {
+		t.Fatalf("resolved park handoff=%+v err=%v", open, err)
+	}
+}
+
+func TestRedrivePreviouslyResolvedPark(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, old := redriveJob(t, js)
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE human_actions SET status='resolved' WHERE id=?`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, "institutional handoff detail"); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].ID == old || open[0].Kind != "openurl_handoff" {
+		t.Fatalf("replacement=%+v err=%v", open, err)
+	}
+}
+
+func TestRedriveRollsBackReplacementIfEventFails(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, old := redriveJob(t, js)
+	if _, err := js.S.DB().ExecContext(ctx, `CREATE TRIGGER fail_redrive BEFORE INSERT ON events
+		WHEN NEW.kind='job.retry_requested' BEGIN SELECT RAISE(ABORT,'injected event failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, "institutional handoff detail"); err == nil {
+		t.Fatal("injected event failure ignored")
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].ID != old || open[0].Kind != "manual_download" {
+		t.Fatalf("partial action replacement=%+v err=%v", open, err)
+	}
+}

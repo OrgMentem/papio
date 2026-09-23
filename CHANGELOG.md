@@ -11,6 +11,10 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- `papio jobs redrive <job-id> --revision <n>` replaces a parked manual
+  download with a fresh institutional handoff. It keeps the failed action and
+  browser history, releases the old browser claim, and allows one request per
+  observed browser outcome. Use `--revision 0` when the action is resolved.
 - `papio actions retry-publisher` can re-offer the original institutional route
   after its DOI retry fails if the refusing provider adapter has since changed.
   The store permits one such re-offer per job and keeps the DOI retry limit.

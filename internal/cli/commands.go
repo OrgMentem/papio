@@ -520,6 +520,35 @@ func newJobsCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "Retrying %s", args[0])
 		},
 	}
+	var redriveRevision int64
+	redrive := &cobra.Command{
+		Use:   "redrive <job-id>",
+		Short: "Replace a spent manual download with an institutional handoff",
+		Long: "Replace a parked manual download with a fresh institutional handoff.\n\n" +
+			"Use the action revision from `papio actions list --json`. For a job\n" +
+			"whose action is already resolved and has no open action, use --revision 0.\n" +
+			"This runs once per observed browser outcome. It does not open a tab.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !cmd.Flags().Changed("revision") || redriveRevision < 0 {
+				return errors.New("--revision is required; use the open action revision, or 0 when no action remains open")
+			}
+			var result api.RedriveResult
+			if err := opt.call(cmd.Context(), "jobs.redrive",
+				map[string]any{"job_id": args[0], "expected_revision": redriveRevision}, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("jobs.redrive")
+				}
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(result)
+			}
+			_, err := fmt.Fprintf(opt.out, "%s\topenurl_handoff\t%d\n", result.JobID, result.ActionID)
+			return err
+		},
+	}
+	redrive.Flags().Int64Var(&redriveRevision, "revision", 0, "revision of the open manual download; 0 if no action is open")
 	var filingFilter string
 	var filingLimit int
 	unfiled := &cobra.Command{
@@ -686,7 +715,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 
 	diagnose := newJobsDiagnoseCommand(opt)
 
-	command.AddCommand(list, get, show, diagnose, cancel, retry, unfiled, refile, failures, incidents, receiptCommand, repairAwaitingHuman, addComponent)
+	command.AddCommand(list, get, show, diagnose, cancel, retry, redrive, unfiled, refile, failures, incidents, receiptCommand, repairAwaitingHuman, addComponent)
 	return command
 }
 

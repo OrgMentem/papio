@@ -964,6 +964,24 @@ Show the outcome and component index for one job
 papio jobs receipt <job-id>
 ```
 
+### `papio jobs redrive`
+
+Replace a spent manual download with an institutional handoff
+
+Replace a parked manual download with a fresh institutional handoff.
+
+Use the action revision from `papio actions list --json`. For a job
+whose action is already resolved and has no open action, use --revision 0.
+This runs once per observed browser outcome. It does not open a tab.
+
+```
+papio jobs redrive <job-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--revision` | `int64` | `0` | revision of the open manual download; 0 if no action is open |
+
 ### `papio jobs refile`
 
 Run the configured on-ready filing hook again
