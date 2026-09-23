@@ -10,6 +10,8 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-09-23
+
 ### Fixed
 - **The released 0.14.0 extension connects to this daemon again.** Daemon
   0.22.0 added a `role` field to the handshake reply. The 0.14.0 extension
