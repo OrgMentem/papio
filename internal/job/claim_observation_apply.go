@@ -214,10 +214,6 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		}
 		result.LeaseUntil = renewed.LeaseUntil
 	case "auth_returned":
-		if !leaseFound || lease.State != AuthenticationEntryLeaseReserved ||
-			lease.OwnerID != ownerJobID {
-			return fail("rejected", "no live reserved entry for this owner")
-		}
 		if candidate == nil {
 			return fail("rejected", "binding has no live materialization claim")
 		}
@@ -227,6 +223,28 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		}
 		if candidateProfile == nil || candidateProfile.AuthenticationClaimID != in.AuthenticationClaimID {
 			return fail("rejected", "binding does not belong to this authentication claim")
+		}
+		// A return that arrives after the lease already settled is late,
+		// not forged: the parallel legacy auth_returned frame (or an
+		// earlier applied observation) already promoted the entry, so there
+		// is nothing left to promote — but the return itself still happened
+		// and the claim is still live. Recording the evidence and journaling
+		// the observation without touching the lease grants no slot; it only
+		// stops discarding facts the follow-up paths read. Anything settled
+		// for another owner stays rejected below.
+		late := false
+		if !leaseFound || lease.State != AuthenticationEntryLeaseReserved ||
+			lease.OwnerID != ownerJobID {
+			switch {
+			case leaseFound && lease.State == AuthenticationEntryLeaseHuman &&
+				lease.HumanOwnerID == ownerJobID:
+				late = true
+			case leaseFound && lease.State == AuthenticationEntryLeaseExpired &&
+				lease.OwnerID == ownerJobID:
+				late = true
+			default:
+				return fail("rejected", "no live reserved entry for this owner")
+			}
 		}
 		evidence := ProfileEvidenceObservation{
 			ObservationID:              in.AuthReturnedEvidenceObservationID,
@@ -241,9 +259,11 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		if err := recordProfileEvidenceTx(ctx, tx, &evidence); err != nil {
 			return fail("error", "profile evidence could not be recorded")
 		}
-		if err := convertAuthenticationEntryLeaseToHumanTx(ctx, tx, in.AuthenticationClaimID, lease.LeaseID, ownerJobID, in.Generation, evidence); err != nil &&
-			!errors.Is(err, ErrAuthenticationEntryLeaseDenied) && !errors.Is(err, ErrAuthenticationEntryLeaseStale) {
-			return fail("error", "authentication entry lease promotion is unavailable")
+		if !late {
+			if err := convertAuthenticationEntryLeaseToHumanTx(ctx, tx, in.AuthenticationClaimID, lease.LeaseID, ownerJobID, in.Generation, evidence); err != nil &&
+				!errors.Is(err, ErrAuthenticationEntryLeaseDenied) && !errors.Is(err, ErrAuthenticationEntryLeaseStale) {
+				return fail("error", "authentication entry lease promotion is unavailable")
+			}
 		}
 	case "entitled_landing":
 		if !leaseFound || lease.State != AuthenticationEntryLeaseHuman ||

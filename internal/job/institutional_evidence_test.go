@@ -1381,6 +1381,171 @@ func TestStrandedBoundLeaseGraceRestartsOnObservedProgress(t *testing.T) {
 	}
 }
 
+// A claim_observation auth_returned that arrives after its lease already
+// settled is a late return, not a forgery: the parallel legacy auth_returned
+// frame (or an earlier applied observation) already promoted the entry, so
+// there is nothing left to promote — but the return itself still happened
+// and the claim is still live. Rejecting it discards drive evidence the
+// follow-up paths read, which is how two live UNE Primo sign-ins stranded on
+// 2026-09-23 with "no live reserved entry for this owner" while their tabs
+// stood on the provider.
+//
+// The late path records evidence and journals the observation without
+// touching the lease: it grants no slot (a rejected observation must never
+// grant one), it only stops discarding facts.
+func TestAuthReturnedLateReturnAppliesAfterLeaseSettles(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func(t *testing.T, prefix string) (*Store, string, *MaterializationClaim, string) {
+		t.Helper()
+		js := testStore(t)
+		jobID, candidateID := seedJobAndCandidate(t, js, prefix)
+		claimID := prefix + "-profile-claim"
+		now := time.Now().UTC()
+		claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+			CandidateID: candidateID, BrowserHolderGeneration: 7, JobAttemptRevision: 1,
+			InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+			LeaseUntil: now.Add(time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := js.S.DB().ExecContext(ctx,
+			`UPDATE materialization_claims SET phase='navigated' WHERE id=?`, claim.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.UpsertHumanGateObservation(ctx, HumanGateObservation{
+			ID: "gate-" + prefix, GateType: HumanGateLogin,
+			ScopeClass: string(HumanGateScopeAuthenticationClaim), ScopeKey: claimID,
+			ObservationRevision: 1, Status: HumanGateOpen, DetailJSON: `{}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return js, jobID, claim, claimID
+	}
+	promote := func(t *testing.T, js *Store, prefix, claimID, leaseID, ownerID string) {
+		t.Helper()
+		now := time.Now().UTC()
+		evidence := ProfileEvidenceObservation{
+			ObservationID: "evidence-" + prefix + "-seed", BrowserHolderGeneration: 7,
+			InstitutionProfileID: prefix + "-profile", InstitutionProfileRevision: 1,
+			Verdict: ProfileEvidenceAuthReturned, Source: ProfileEvidenceAuthReturn,
+			ProducerObservedAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+			DaemonReceivedAt:   now.Format(time.RFC3339Nano),
+		}
+		if err := js.RecordProfileEvidence(ctx, evidence); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.ConvertAuthenticationEntryLeaseToHuman(ctx, claimID, leaseID, ownerID, 7, evidence); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply := func(t *testing.T, js *Store, jobID, claimID, bindingID, prefix string) ApplyClaimObservationResult {
+		t.Helper()
+		now := time.Now().UTC()
+		applied, err := js.ApplyClaimObservation(ctx, ApplyClaimObservationInput{
+			JobID: jobID, AuthenticationClaimID: claimID, BindingID: bindingID,
+			ObservationID: "obs-" + prefix, GateOccurrenceID: "gate-" + prefix,
+			EventKind: "auth_returned", EventOrdinal: 0,
+			FrameGeneration: 7, Generation: 7,
+			AuthReturnedEvidenceObservationID: "evidence-" + prefix,
+			LeaseUntil:                        now.Add(time.Minute), Now: now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return applied
+	}
+	count := func(t *testing.T, js *Store, query, id string) int {
+		t.Helper()
+		var n int
+		if err := js.S.DB().QueryRowContext(ctx, query, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	assertRecordedLive := func(t *testing.T, js *Store, jobID, claimID, claimRowID, prefix string) {
+		t.Helper()
+		if n := count(t, js, `SELECT COUNT(*) FROM profile_evidence WHERE observation_id=?`, "evidence-"+prefix); n != 1 {
+			t.Fatalf("late auth_returned recorded %d evidence rows, want 1", n)
+		}
+		if n := count(t, js, `SELECT COUNT(*) FROM claim_observation_journal WHERE observation_id=?`, "obs-"+prefix); n != 1 {
+			t.Fatalf("late auth_returned journaled %d rows, want 1", n)
+		}
+		var phase string
+		if err := js.S.DB().QueryRowContext(ctx, `SELECT phase FROM materialization_claims WHERE id=?`, claimRowID).Scan(&phase); err != nil || phase != "navigated" {
+			t.Fatalf("claim phase=%q err=%v; the late return must leave a live claim alone", phase, err)
+		}
+	}
+
+	t.Run("human lease for this owner", func(t *testing.T) {
+		js, jobID, claim, claimID := seed(t, "late-human")
+		now := time.Now().UTC()
+		if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+			AuthenticationClaimID: claimID, LeaseID: "lease-late-human", OwnerID: jobID,
+			BrowserHolderGeneration: 7, LeaseUntil: now.Add(time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		promote(t, js, "late-human", claimID, "lease-late-human", jobID)
+		applied := apply(t, js, jobID, claimID, claim.BindingID, "late-human")
+		if applied.Outcome != "applied" {
+			t.Fatalf("late auth_returned on a human lease = %+v; want applied", applied)
+		}
+		if applied.OwnerJobID != jobID {
+			t.Fatalf("late auth_returned attributed to %q, want %q", applied.OwnerJobID, jobID)
+		}
+		assertRecordedLive(t, js, jobID, claimID, claim.ID, "late-human")
+		lease, ok, err := js.GetAuthenticationEntryLease(ctx, claimID)
+		if err != nil || !ok || lease.State != AuthenticationEntryLeaseHuman ||
+			lease.HumanOwnerID != jobID || lease.LeaseID != "lease-late-human" {
+			t.Fatalf("late return mutated the settled lease: %+v ok=%v err=%v", lease, ok, err)
+		}
+	})
+
+	t.Run("expired lease owned by this owner", func(t *testing.T) {
+		js, jobID, claim, claimID := seed(t, "late-expired")
+		now := time.Now().UTC()
+		if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+			AuthenticationClaimID: claimID, LeaseID: "lease-late-expired", OwnerID: jobID,
+			BrowserHolderGeneration: 7, LeaseUntil: now.Add(time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := js.ExpireAuthenticationEntryLease(ctx, claimID, 7, "lease-late-expired"); err != nil {
+			t.Fatal(err)
+		}
+		applied := apply(t, js, jobID, claimID, claim.BindingID, "late-expired")
+		if applied.Outcome != "applied" {
+			t.Fatalf("late auth_returned on an expired lease = %+v; want applied", applied)
+		}
+		assertRecordedLive(t, js, jobID, claimID, claim.ID, "late-expired")
+		lease, ok, err := js.GetAuthenticationEntryLease(ctx, claimID)
+		if err != nil || !ok || lease.State != AuthenticationEntryLeaseExpired || lease.OwnerID != jobID {
+			t.Fatalf("late return resurrected the expired lease: %+v ok=%v err=%v", lease, ok, err)
+		}
+	})
+
+	t.Run("settled lease for another owner stays rejected", func(t *testing.T) {
+		js, jobID, claim, claimID := seed(t, "late-stranger")
+		now := time.Now().UTC()
+		if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+			AuthenticationClaimID: claimID, LeaseID: "lease-late-stranger", OwnerID: "job-stranger",
+			BrowserHolderGeneration: 7, LeaseUntil: now.Add(time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		promote(t, js, "late-stranger", claimID, "lease-late-stranger", "job-stranger")
+		applied := apply(t, js, jobID, claimID, claim.BindingID, "late-stranger")
+		if applied.Outcome != "rejected" {
+			t.Fatalf("auth_returned against another owner's human lease = %+v; want rejected", applied)
+		}
+		if n := count(t, js, `SELECT COUNT(*) FROM claim_observation_journal WHERE observation_id=?`, "obs-late-stranger"); n != 0 {
+			t.Fatalf("rejected observation journaled %d rows, want 0", n)
+		}
+	})
+}
+
 // TestRetireAuthenticationEntryLeaseAfterOwnerCloseFencesOnBinding covers
 // owner_closed's lease-side effect in its owning package. Only
 // internal/browser exercised it, so a regression could strand a dead sign-in

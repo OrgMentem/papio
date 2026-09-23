@@ -49,6 +49,23 @@ execution records kept during the initial build.
   such a job; on 2026-09-23 JSTOR job `job_edfe1b14…` stayed parked after its
   handoff was cancelled.
 
+- A sign-in return that arrives after its entry already settled is recorded
+  instead of rejected. The legacy `auth_returned` frame (or an earlier
+  applied observation) can promote the lease to `human` first, so a late
+  `claim_observation auth_returned` for the same owner now applies as a late
+  return: evidence recorded, observation journaled, lease untouched. On
+  2026-09-23 two UNE Primo sign-ins lost every return this way while their
+  tabs stood on the provider. A return for another owner's settled lease is
+  still rejected, and a late return never reserves, renews, or promotes.
+- A repeated `auth_pending` while the login gate is still open no longer
+  mints a new gate occurrence. The IdP hop bounces across several page loads
+  and the timing frame fires on each one; each mint rolled the occurrence
+  under the extension's in-flight grant, so every `claim_observation`
+  stamped with the grant's occurrence arrived stale and its drive evidence
+  was dropped. Mid-cycle reports now reuse the open occurrence (id and
+  revision, a true idempotent no-op). A sign-out after a resolve still mints
+  a fresh occurrence.
+
 ### Added
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual
   download with a fresh institutional handoff. It keeps the failed action and

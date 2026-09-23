@@ -103,6 +103,14 @@ for the full pre-split extension history.
   failure. When its turn arrives, Papio checks the current page without
   navigating again, including publishers with no adapter.
 
+- **A declined sign-in observation no longer stops the drive.** When the
+  daemon answers a `claim_observation auth_returned` or `entitled_landing`
+  with `rejected` or `stale`, the extension now classifies the bound tab's
+  current page under the still-valid claim instead of dropping the entry
+  silently. After a return the tab is standing on the provider, so the
+  landing is assessed (and downloaded under the existing authority gates)
+  regardless of whether the sign-in bookkeeping accepted the observation.
+
 ### Added
 - **ACS Publications entitled articles can use their primary PDF link.**
   The adapter checks the page DOI, Subscribed badge, and article PDF control

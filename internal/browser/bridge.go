@@ -7558,11 +7558,35 @@ func (b *Bridge) upsertProfileGate(ctx context.Context, observationKey, resolver
 			return nil
 		}
 	}
+	// A report that arrives while this gate's occurrence is still open
+	// belongs to that same open cycle: the IdP hop bounces across several
+	// page loads and the legacy auth_pending frame fires on each one.
+	// Minting a fresh occurrence id per frame rolls the gate under the
+	// extension's in-flight grant, so every claim_observation stamped with
+	// the grant's occurrence arrives stale and its drive evidence is
+	// dropped. Reuse the open occurrence — id AND revision, making the
+	// repeat a true idempotent no-op (the members below derive from the
+	// same candidates either way) — instead. A genuinely new cycle has no
+	// open occurrence (the resolve path above already returned), so the
+	// post-resolve reopen the msg_id mixing exists for still mints.
+	openRevision := int64(0)
+	if status == job.HumanGateOpen {
+		for _, row := range current {
+			if row.GateType == gateType && row.Status == job.HumanGateOpen {
+				id = row.ID
+				openRevision = row.ObservationRevision
+				break
+			}
+		}
+	}
 	var revision int64 = 1
 	for _, row := range current {
 		if row.GateType == gateType && row.ObservationRevision >= revision {
 			revision = row.ObservationRevision + 1
 		}
+	}
+	if openRevision > 0 {
+		revision = openRevision
 	}
 	if detail == "" {
 		detail = "{}"

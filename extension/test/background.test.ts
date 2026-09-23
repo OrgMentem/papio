@@ -5086,6 +5086,62 @@ test("Slice 3 (oracle finding 4): an ack's fresh gate_occurrence_id rotates the 
   expect(h.port.posted.length).toBe(framesBeforeThird);
 });
 
+test("a rejected auth_returned observation still classifies the bound tab's provider landing", async () => {
+  const jobA = "job_claim_rejected_drive";
+  const candidateA = "cand_rejected_drive_a";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobA)],
+  });
+  installManagedTabLedger(h, {});
+  useUnknownProviderClassifier(h, () => false);
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobA, candidateA);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobA,
+    candidateA,
+    `https://${PROVIDER_HOST}/fresh?rejected=1`,
+  );
+  // Onto the wall: the job waits for the human.
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  const unknownBefore = h.backend.store.activeJobs[0]?.unknown_count ?? 0;
+  // The provider landing the return reports: a silent re-point with no tab
+  // event, so only the post-ack drive below can classify it.
+  const landing = "https://provider-nocov.example.com/article/9";
+  h.tabs.seed({ id: tabID, url: landing });
+  const internals = h.bridge as unknown as {
+    emitClaimObservation(
+      jobID: string,
+      tabID: number,
+      eventKind: string,
+      latch?: boolean,
+    ): Promise<void>;
+  };
+  const framesBefore = h.port.posted.length;
+  await internals.emitClaimObservation(jobA, tabID, "auth_returned", true);
+  const sent = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(sent.payload["event_kind"]).toBe("auth_returned");
+  // The daemon declines the bookkeeping (the reservation lapsed mid-cycle),
+  // but the tab is still standing on the provider landing: it must be
+  // classified under the still-valid claim regardless.
+  await h.port.inbound(
+    observationAck(jobA, sent.payload["request_id"], {
+      outcome: "rejected",
+      detail: "no live reserved entry for this owner",
+      gate_occurrence_id: sent.payload["gate_occurrence_id"],
+      browser_holder_generation: 1,
+    }),
+  );
+  // The post-ack classify runs behind the ack dispatch; the outbox drain's
+  // own promise settles only after it, so awaiting it is deterministic.
+  const drain = h.bridge as unknown as { outboxReplayed: Promise<void> };
+  await drain.outboxReplayed;
+  expect(h.backend.store.activeJobs[0]?.unknown_count).toBe(unknownBefore + 1);
+});
+
 test("Slice 3: a claim_observation outbox entry replays before any lease-renewing action after a restart, and a duplicate ack clears it without local mutation", async () => {
   const jobA = "job_claim_replay_owner";
   const jobB = "job_claim_replay_cold";

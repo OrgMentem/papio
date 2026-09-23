@@ -6791,6 +6791,78 @@ func TestRepeatedAuthPendingWithoutElapsedReopensTheLoginGate(t *testing.T) {
 	}
 }
 
+// A second auth_pending while the login gate is still open is the SAME
+// sign-in cycle reporting again (the IdP hop bounces across several page
+// loads), not a fresh sign-out. It must not mint a new gate occurrence:
+// the extension's in-flight claim_observation entries carry the grant's
+// occurrence, and every mid-cycle mint turns them all stale — which is how
+// live sign-ins lost their wall/login/auth_returned evidence on 2026-09-23
+// while the legacy timing frame kept resolving "successfully" beside them.
+// Only a genuinely new cycle (no open occurrence, i.e. after a resolve)
+// mints, which TestRepeatedAuthPendingWithoutElapsedReopensTheLoginGate
+// already pins.
+func TestMidCycleAuthPendingKeepsTheLoginOccurrence(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	cfg.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+	}
+	b.cfg = cfg
+	runSync(t, b, hello())
+	jobID := parkInstitutional(t, jobs, "wr_gate_midcycle_msgid", handoffWork(), "alpha")
+	profile, err := jobs.InstitutionProfileByConfiguredName(ctx, "alpha")
+	if err != nil || profile == nil || profile.AuthenticationClaimID == "" {
+		t.Fatalf("institution profile = %+v, %v; want a claim to scope the gate", profile, err)
+	}
+	loginOccurrence := func() (string, job.HumanGateStatus) {
+		t.Helper()
+		rows, err := jobs.CurrentHumanGateObservations(ctx,
+			string(job.HumanGateScopeAuthenticationClaim), profile.AuthenticationClaimID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if row.GateType == job.HumanGateLogin {
+				return row.ID, row.Status
+			}
+		}
+		return "", ""
+	}
+	authFrame := func(msgID string, typ string) *protocol.BrowserMessage {
+		return &protocol.BrowserMessage{
+			Type: typ, MsgID: msgID, JobID: jobID,
+			Payload: &protocol.AuthPayload{},
+		}
+	}
+	if err := b.recordAuth(ctx, authFrame("midcycle-pending-1", protocol.MsgAuthPending)); err != nil {
+		t.Fatal(err)
+	}
+	first, status := loginOccurrence()
+	if first == "" || status != job.HumanGateOpen {
+		t.Fatalf("first sign-out left occurrence %q status %q, want an open one", first, status)
+	}
+	// Same cycle, second report, distinct frame id: the occurrence must not roll.
+	if err := b.recordAuth(ctx, authFrame("midcycle-pending-2", protocol.MsgAuthPending)); err != nil {
+		t.Fatal(err)
+	}
+	if second, _ := loginOccurrence(); second != first {
+		t.Fatalf("mid-cycle auth_pending rolled the occurrence %q -> %q", first, second)
+	}
+	if err := b.recordAuth(ctx, authFrame("midcycle-returned-1", protocol.MsgAuthReturned)); err != nil {
+		t.Fatal(err)
+	}
+	if resolved, status := loginOccurrence(); resolved != first || status != job.HumanGateResolved {
+		t.Fatalf("auth_returned left occurrence %q status %q, want %q resolved", resolved, status, first)
+	}
+	// After the resolve there is no open cycle, so the next sign-out mints.
+	if err := b.recordAuth(ctx, authFrame("midcycle-pending-3", protocol.MsgAuthPending)); err != nil {
+		t.Fatal(err)
+	}
+	if third, status := loginOccurrence(); third == first || status != job.HumanGateOpen {
+		t.Fatalf("post-resolve sign-out left occurrence %q status %q, want a fresh open one", third, status)
+	}
+}
+
 // Free text authored by an adapter and relayed by the extension is untrusted
 // input. Truncation is not sanitisation: a 500-character cap still admits a
 // whole URL, a query token or a credential, and durable events are exactly

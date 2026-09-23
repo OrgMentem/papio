@@ -10070,9 +10070,53 @@ export class Bridge {
           })();
         }
       }
+      if (
+        (ack.outcome === "rejected" || ack.outcome === "stale") &&
+        (entry.event_kind === "auth_returned" ||
+          entry.event_kind === "entitled_landing")
+      ) {
+        // The sign-in bookkeeping declined the observation, but the tab is
+        // still standing wherever the event happened — after auth_returned
+        // that is the provider. Classify the landing page under the
+        // still-valid claim instead of dropping the drive with the entry.
+        await this.classifyBoundTabAfterDeclinedObservation(
+          jobID,
+          entry.binding_id,
+        );
+      }
+
       this.claimObservationOutboxEntries.delete(entry.observation_id);
       this.persistClaimObservationOutbox();
     }
+  }
+
+  /** Re-assess the bound tab after the daemon declined a drive-evidence
+   * observation (`auth_returned`/`entitled_landing`) as `rejected` or
+   * `stale`. The bookkeeping verdict says nothing about where the tab is
+   * standing — after a return that is the provider — so the landing page
+   * is classified under the still-valid claim instead of leaving the drive
+   * to whatever tab event happens to arrive next. Read-only assessment:
+   * `maybeClassify` runs the adapter verdict and the ordinary download
+   * path under the existing authority gates, and the binding check below
+   * refuses a tab the ledger has since recycled to another surface.
+   */
+  private async classifyBoundTabAfterDeclinedObservation(
+    jobID: string,
+    bindingID: string,
+  ): Promise<void> {
+    const job = findByJob(this.store, jobID);
+    if (job === undefined || job.tab_id < 0) return;
+    const ledgerBinding = this.tabLedgerCache?.[String(job.tab_id)]?.binding_id;
+    if (ledgerBinding !== undefined && ledgerBinding !== bindingID) return;
+    let host: string;
+    try {
+      const live = await this.deps.tabs.get(job.tab_id);
+      if (live?.url === undefined) return;
+      host = new URL(live.url).hostname;
+    } catch {
+      return;
+    }
+    await this.maybeClassify(jobID, host);
   }
 
   private async applyMaterialization(
