@@ -257,6 +257,71 @@ func (js *Store) RetireMaterializationBindingAfterOutcome(ctx context.Context, b
 	return tx.Commit()
 }
 
+// ParkMaterializationBindingForHuman moves a bound materialization to
+// 'parked' because the provider now waits on an operator decision that only
+// the operator can make on this tab (terms_acceptance_required), and frees the
+// institution's sign-in slot the binding occupied. It reports whether the
+// claim was parked.
+//
+// A parked claim keeps its binding and tab: the operator finishes the step on
+// the same surface, and reconciliation keeps confirming it. It stops counting
+// as live, so the scheduler's safety-domain rule and the sign-in slot no
+// longer hold sibling papers behind a drive that is waiting for a human.
+// Measured live 2026-09-23: one JSTOR terms modal kept a `navigated` claim and
+// the library's only slot for 14 minutes while six opened papers waited for
+// the 30-minute stranded sweep.
+//
+// Two states refuse the park, and both keep today's occupancy:
+//   - a sign-in that has not returned. A `reserved` entry owned by this
+//     binding or by the claim's job is a human still at the identity
+//     provider, and the slot is theirs until auth_returned converts it;
+//   - an in-flight institutional effect (`held`, `unknown_completion`). papio
+//     must never release occupancy across an irreversible provider action.
+//
+// lease_until is cleared because a parked claim is held by the operator's
+// pending decision, not by a timer; owner_closed, a terminal job, a holder
+// change, or a re-drive retires it.
+func (js *Store) ParkMaterializationBindingForHuman(ctx context.Context, bindingID string) (bool, error) {
+	if strings.TrimSpace(bindingID) == "" {
+		return false, errors.New("binding is required")
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := store.Now()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE materialization_claims
+		   SET phase='parked', lease_until=NULL, updated_at=?
+		 WHERE binding_id=? AND phase IN ('bound','route_issued','navigated')
+		   AND NOT EXISTS (
+		     SELECT 1 FROM effect_permits p
+		      WHERE p.claim_id=materialization_claims.id
+		        AND p.status IN ('held','unknown_completion'))
+		   AND NOT EXISTS (
+		     SELECT 1 FROM authentication_entry_leases l
+		      WHERE l.state='reserved'
+		        AND (l.owner_binding_id=materialization_claims.binding_id
+		          OR l.owner_id=(SELECT c.job_id FROM browser_candidates c
+		                          WHERE c.id=materialization_claims.candidate_id)))`,
+		now, bindingID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, []string{bindingID}, now); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // abandonMaterializationClaimByBindingTx marks the binding's live claim
 // abandoned and reports whether it actually found one. That boolean is the
 // only honest discriminator between the two ways owner_closed arrives: a
@@ -272,7 +337,7 @@ func abandonMaterializationClaimByBindingTx(ctx context.Context, q dbtx, binding
 	res, err := q.ExecContext(ctx, `
 		UPDATE materialization_claims
 		   SET phase='abandoned', lease_until=?, updated_at=?
-		 WHERE binding_id=? AND phase IN ('claimed','bound','route_issued','navigated')`,
+		 WHERE binding_id=? AND phase IN ('claimed','bound','route_issued','navigated','parked')`,
 		now, now, bindingID)
 	if err != nil {
 		return false, err

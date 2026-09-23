@@ -499,7 +499,7 @@ func (js *Store) TerminalMaterializationJobIDs(ctx context.Context) ([]string, e
 		  JOIN browser_candidates c ON c.id=m.candidate_id
 		  JOIN jobs j ON j.id=c.job_id
 		 WHERE j.state IN ('ready','imported','unavailable','failed','cancelled')
-		   AND m.phase IN ('claimed','bound','route_issued','navigated')
+		   AND m.phase IN ('claimed','bound','route_issued','navigated','parked')
 		 ORDER BY c.job_id
 		 LIMIT ?`, TerminalMaterializationJobIDLimit)
 	if err != nil {
@@ -1205,7 +1205,7 @@ func (js *Store) ReleaseUnconsumedMaterializationClaim(ctx context.Context, cand
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
 		WHERE id=? AND status='claimed'
 		  AND NOT EXISTS (SELECT 1 FROM materialization_claims
-		    WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated'))
+		    WHERE candidate_id=? AND phase IN ('claimed','bound','route_issued','navigated','parked'))
 		  AND NOT EXISTS (SELECT 1 FROM artifact_winners
 		    WHERE candidate_id=browser_candidates.id
 		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`,
@@ -1643,7 +1643,7 @@ func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Ti
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates SET status='eligible', updated_at=?
 		WHERE status IN ('claimed','materializing')
 		  AND NOT EXISTS (SELECT 1 FROM materialization_claims WHERE candidate_id=browser_candidates.id
-		    AND phase IN ('claimed','bound','route_issued','navigated'))
+		    AND phase IN ('claimed','bound','route_issued','navigated','parked'))
 		  AND NOT EXISTS (SELECT 1 FROM artifact_winners
 		    WHERE candidate_id=browser_candidates.id
 		      AND job_attempt_revision=browser_candidates.job_attempt_revision)`, stamp); err != nil {
@@ -1693,7 +1693,7 @@ func (js *Store) AbandonTerminalMaterializations(ctx context.Context, now time.T
 	// One id per statement, like consumeCloseAuthorizationsTx: this package has
 	// no IN-clause idiom and the set is bounded by terminal jobs still holding a
 	// claim, so a built placeholder list would buy nothing.
-	const terminalClaimPredicate = ` phase IN ('claimed','bound','route_issued','navigated')
+	const terminalClaimPredicate = ` phase IN ('claimed','bound','route_issued','navigated','parked')
 		AND EXISTS (
 		  SELECT 1 FROM browser_candidates c
 		    JOIN jobs j ON j.id=c.job_id
@@ -1809,7 +1809,7 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	var retiredBindings []string
 	staleRows, err := tx.QueryContext(ctx, `SELECT binding_id FROM materialization_claims
 		WHERE browser_holder_generation<>?
-		  AND phase IN ('claimed','bound','route_issued','navigated')
+		  AND phase IN ('claimed','bound','route_issued','navigated','parked')
 		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id
 			  AND p.status IN ('held','unknown_completion'))`,
 		currentGeneration)
@@ -1832,7 +1832,7 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	res, err := tx.ExecContext(ctx, `UPDATE materialization_claims
 		SET phase='abandoned', updated_at=?
 		WHERE browser_holder_generation<>?
-		  AND phase IN ('claimed','bound','route_issued','navigated')
+		  AND phase IN ('claimed','bound','route_issued','navigated','parked')
 		  AND NOT EXISTS (SELECT 1 FROM effect_permits p WHERE p.claim_id=materialization_claims.id
 			  AND p.status IN ('held','unknown_completion'))`,
 		now, currentGeneration)
@@ -1858,7 +1858,7 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 		  AND NOT EXISTS (
 			SELECT 1 FROM materialization_claims
 			WHERE candidate_id=browser_candidates.id
-			  AND phase IN ('claimed','bound','route_issued','navigated')
+			  AND phase IN ('claimed','bound','route_issued','navigated','parked')
 		  )
 		  AND NOT EXISTS (
 			SELECT 1 FROM artifact_winners

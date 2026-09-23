@@ -35,6 +35,12 @@ execution records kept during the initial build.
   authorizations. The fallback releases the old browser claim, and the resolver
   route uses the institution's safety domain. `papio jobs redrive` also accepts
   an open-access handoff that is already parked.
+- A `terms_acceptance_required` outcome after the sign-in returned parks the
+  claim on its own tab (`materialization_claims.phase='parked'`) and releases
+  the institution's sign-in slot, so sibling papers proceed while the operator
+  accepts the terms. Papers parked on their own terms step are not offered or
+  re-offered automatically. A terms outcome before the sign-in returned keeps
+  the slot.
 
 ### Added
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual

@@ -109,7 +109,7 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	}
 	bindings, err := tx.QueryContext(ctx, `SELECT DISTINCT m.binding_id FROM materialization_claims m
 		JOIN browser_candidates c ON c.id=m.candidate_id WHERE c.job_id=?
-		AND m.phase IN ('claimed','bound','route_issued','navigated') AND m.binding_id IS NOT NULL AND m.binding_id<>''`, jobID)
+		AND m.phase IN ('claimed','bound','route_issued','navigated','parked') AND m.binding_id IS NOT NULL AND m.binding_id<>''`, jobID)
 	if err != nil {
 		return 0, err
 	}

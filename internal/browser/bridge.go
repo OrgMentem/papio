@@ -823,6 +823,10 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 				continue
 			}
 		}
+		// An explicit Open drives the paper even when its own terms step is
+		// open: the operator is asking for a fresh look at a step papio parked,
+		// and the focusPending checks in the offer loops are the path that
+		// serves it.
 		b.focusPending[jobID] = true
 		queued++
 	}
@@ -1622,6 +1626,28 @@ func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byt
 	}
 	_, err := b.jobs.ReconcileInstitutionProfiles(ctx, specs)
 	return err
+}
+
+// termsActionKind is the operator's own terms step for one paper. While it is
+// open the paper is parked on its surface, and nothing automatic offers it.
+const termsActionKind = "terms_acceptance_required"
+
+// termsPendingJobs names the jobs among ids that carry an open terms action.
+func (b *Bridge) termsPendingJobs(ctx context.Context, ids []string) (map[string]bool, error) {
+	actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	var pending map[string]bool
+	for _, action := range actions {
+		if action.Kind == termsActionKind && action.Status == "open" {
+			if pending == nil {
+				pending = map[string]bool{}
+			}
+			pending[action.JobID] = true
+		}
+	}
+	return pending, nil
 }
 
 func (b *Bridge) openHandoffForJob(ctx context.Context, jobID string) (*job.HumanAction, error) {
@@ -2424,7 +2450,12 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 			if claim == nil {
 				continue
 			}
-			if !liveMaterializationClaim(claim, b.now()) ||
+			// A parked claim waits for the operator on this very tab
+			// (job.ParkMaterializationBindingForHuman). It no longer occupies
+			// the institution, but its surface is still papio's: omitting it
+			// here makes the extension close the tab the operator must use.
+			parked := claim.Phase == "parked"
+			if (!parked && !liveMaterializationClaim(claim, b.now())) ||
 				claim.BrowserHolderGeneration != b.arbitration.generation() || claim.MaterializationKind != "browser_tab" {
 				continue
 			}
@@ -2470,9 +2501,16 @@ func (b *Bridge) institutionalReconcile(ctx context.Context, p *protocol.Institu
 				bound := claim.TabID
 				tabID = &bound
 			}
+			// The wire has no parked phase, and both parsers reject unknown
+			// values. "bound" is the honest projection: the tab is bound and
+			// papio has no route or effect in flight on it.
+			phase := claim.Phase
+			if parked {
+				phase = "bound"
+			}
 			result.Claims = append(result.Claims, protocol.InstitutionalReconcileClaim{
 				ClaimID: claim.ID, BindingID: claim.BindingID, CandidateID: claim.CandidateID,
-				Phase: claim.Phase, TabID: tabID,
+				Phase: phase, TabID: tabID,
 			})
 
 		}
@@ -7849,6 +7887,18 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		}
 		candidates = append(candidates, candidate{action: action, row: row})
 	}
+	// A session going live is not a reason to redrive a paper parked on its
+	// own terms step: the new surface lands on the same terms page and takes
+	// the institution back from the siblings this release is for.
+	ids := make([]string, len(candidates))
+	for i, c := range candidates {
+		ids[i] = c.row.ID
+	}
+	termsPending, err := b.termsPendingJobs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	candidates = slices.DeleteFunc(candidates, func(c candidate) bool { return termsPending[c.row.ID] })
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].row.CreatedAt == candidates[j].row.CreatedAt {
 			return candidates[i].row.ID < candidates[j].row.ID
@@ -8329,10 +8379,17 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		// closed rather than becoming a third stored value, because wrongly
 		// asking a human to sign in costs a prompt while wrongly asserting none
 		// is needed is what this field exists to prevent.
-		_, err = b.jobs.OpenHumanAction(ctx, jobID, p.Outcome,
+		if _, err = b.jobs.OpenHumanAction(ctx, jobID, p.Outcome,
 			"the provider requires a human step before the download can proceed",
-			job.Access(true, "paywall"))
-		return err
+			job.Access(true, "paywall")); err != nil {
+			return err
+		}
+		if p.Outcome == "terms_acceptance_required" {
+			// Opened first: the open action is what keeps this job from being
+			// offered again once its claim stops holding the candidate.
+			b.parkProviderBindingForHuman(ctx, jobID, p.Outcome)
+		}
+		return nil
 
 	default:
 		return fmt.Errorf("unknown provider outcome %q", p.Outcome)
@@ -8379,6 +8436,36 @@ func (b *Bridge) retireFinishedProviderBinding(ctx context.Context, jobID, outco
 				}
 			}
 		}
+	}
+}
+
+// parkProviderBindingForHuman parks the job's bound materialization when the
+// provider waits on a decision only the operator can make on that tab. The
+// tab stays bound so the operator can finish the step there; the institution's
+// sign-in slot and the safety domain are freed for sibling papers. A sign-in
+// that has not returned, or an in-flight institutional effect, keeps today's
+// occupancy (job.ParkMaterializationBindingForHuman). Best-effort like
+// retireFinishedProviderBinding: the human action is already durable, and the
+// extension repeats the outcome while the page still shows the step.
+func (b *Bridge) parkProviderBindingForHuman(ctx context.Context, jobID, outcome string) {
+	if b.materializationGenerationUnavailable {
+		return
+	}
+	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		log.Printf("papio: reading materialization attempt after %s for %s: %v", outcome, jobID, err)
+		return
+	}
+	claim, _, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.arbitration.generation())
+	if err != nil {
+		log.Printf("papio: reading materialization claim after %s for %s: %v", outcome, jobID, err)
+		return
+	}
+	if claim == nil {
+		return
+	}
+	if _, err := b.jobs.ParkMaterializationBindingForHuman(ctx, claim.BindingID); err != nil {
+		log.Printf("papio: parking materialization binding after %s for %s: %v", outcome, jobID, err)
 	}
 }
 
@@ -10621,6 +10708,15 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	if slots < 0 {
 		slots = 0
 	}
+	// A paper whose own terms step is open waits for the operator on the tab
+	// it parked (parkProviderBindingForHuman). Offering it again only rebuilds
+	// a surface that lands on the same terms page and takes the institution
+	// back from its siblings. Only an explicit Open drives it; resolving the
+	// terms action releases it. A read failure withholds nothing.
+	termsPending, termsErr := b.termsPendingJobs(ctx, candidateIDs)
+	if termsErr != nil {
+		log.Printf("papio: reading open terms actions for browser offers: %v", termsErr)
+	}
 	// Slice 4 (dev/adr/0028-surface-lifecycle-ownership.md): claim-paced automatic
 	// candidate offers ride the same maxOutstandingOffers transport budget
 	// as legacy/direct-route offers, so their admission is computed and
@@ -10659,13 +10755,11 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		if automaticCap > slots {
 			automaticCap = slots
 		}
-		automaticCandidates := scheduled
-		if deferReoffers {
-			automaticCandidates = make([]job.BrowserCandidateDescriptor, 0, len(scheduled))
-			for _, candidate := range scheduled {
-				if !b.reofferPending[candidate.JobID] || b.focusPending[candidate.JobID] {
-					automaticCandidates = append(automaticCandidates, candidate)
-				}
+		automaticCandidates := make([]job.BrowserCandidateDescriptor, 0, len(scheduled))
+		for _, candidate := range scheduled {
+			if b.focusPending[candidate.JobID] ||
+				(!termsPending[candidate.JobID] && (!deferReoffers || !b.reofferPending[candidate.JobID])) {
+				automaticCandidates = append(automaticCandidates, candidate)
 			}
 		}
 		automaticAdmitted, automaticParked = b.admitAutomaticMaterializationCandidates(ctx, automaticCandidates, handoff, automaticCap)
@@ -10678,7 +10772,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	heldIDs := make(map[string]bool)
 jobLoop:
 	for _, id := range candidateIDs {
-		if deferReoffers && b.reofferPending[id] && !b.focusPending[id] {
+		if (deferReoffers && b.reofferPending[id] || termsPending[id]) && !b.focusPending[id] {
 			continue
 		}
 		if hasSettledDownload(b.pendingDownloads, id) || b.offered[id] {
