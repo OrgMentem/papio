@@ -412,6 +412,12 @@ extension marks the route unavailable instead of sending you through the same
 institutional-login loop again. An empty or still-loading resolver page remains
 assisted rather than being treated as proof of no access.
 
+*papio* also closes the tabs it opened once it no longer needs them: after it
+files a paper, when a job ends, or when a newer tab for the same paper replaces
+one. Pin a tab, or move it out of *papio*'s window or tab group, to keep it. A
+toast with **Reopen** gives back the tabs of filed papers. See
+[When papio closes its tabs](../concepts/browser-handoff.md#when-papio-closes-its-tabs).
+
 Grant optional extension host permissions only for publisher sites you use.
 The friendly publisher name is the only visible row label; hover the row or
 focus its switch to reveal the exact host pattern being granted. The full
@@ -469,6 +475,148 @@ has three settings:
 (2–30 minutes). The card and options controls describe this browser's session
 only. They do not change daemon access policy or send login details anywhere.
 
+### Let papio open parked handoffs for you
+
+Without help, a parked handoff waits until you run `papio actions open` or open
+it from the inbox. The *paced drive* does that step for you. Use it when many
+papers are parked and you want *papio* to work through them slowly, while your
+browser stays open and you do other work. It is off by default.
+
+To turn it on, add this section to your configuration file, then restart the
+background service:
+
+```toml
+[drive]
+enabled = true
+```
+
+```sh
+papio daemon stop   # the next papio command starts it with the new setting
+```
+
+The drive then works like this:
+
+- It opens one parked handoff at a time, oldest first, through the same path
+  as `papio actions open`. Your extension settings still decide where the tab
+  opens.
+- By default, it opens at most 10 papers in any hour, and it does not open the
+  same paper again for 6 hours, whatever the result was.
+- It waits while no browser is connected to *papio*, while any other browser
+  work is still running, while a sign-in is in progress, and during your
+  `notify.quiet_hours`.
+- It skips papers from a provider that is refusing this browser, together with
+  every paper that has the same DOI prefix.
+- If the sign-in for one paper does not come back within 10 minutes, it leaves
+  that paper, holds back every paper with the same DOI prefix for 6 hours, and
+  goes on to the next paper.
+- If this happens to the two most recent papers, and they come from different
+  providers, the drive pauses and sends you one notification. Sign in to your
+  library in the browser. The drive continues by itself when any sign-in comes
+  back, or when you run `papio drive resume`.
+
+The drive never accepts publisher terms, never submits a document-delivery
+request, and never resolves an identity review. Those decisions stay with you.
+It sends nothing new off your machine: it opens the same handoff links that
+`papio actions open` opens, in your own browser.
+
+Use these commands to check and control it:
+
+```sh
+papio drive status   # what it would open next, and what blocks it
+papio drive pause    # stop paced opens until you resume
+papio drive resume
+```
+
+`papio drive status` prints one line, for example how many of the hourly opens
+it used, the next job, and a `blocked by:` list. The blocker names are:
+
+| Blocker | Meaning |
+| --- | --- |
+| `disabled` | `[drive] enabled` is not `true`. |
+| `paused` | You ran `papio drive pause`, or two sign-ins in a row did not come back. |
+| `quiet_hours` | The time is inside `notify.quiet_hours`. |
+| `holder_absent` | No browser is connected to *papio* to receive handoffs. |
+| `rate_limit` | The hourly limit is used up. |
+| `in_flight` | The previous paced open has not settled yet. |
+| `browser_busy` | Other browser work is still running, including work you started. |
+| `sign_in_pending` | A sign-in is in progress and still inside its 10-minute wait. |
+| `no_eligible_job` | No parked paper can be opened now. |
+
+A pause stays in force across a restart of the background service. The drive
+never lifts a pause that you set; only `papio drive resume` does. A coding agent
+that uses *papio*'s MCP tools can pause the drive but cannot resume it.
+
+Each paced open is recorded on its job as `drive.paced_open`, so
+`papio jobs get <job-id>` shows it. To turn the drive off, set
+`enabled = false` (or remove the section) and restart the background service.
+The limits above are defaults you can change; see
+[`[drive]` in the configuration reference](../reference/config-reference.md#drive).
+
+### Let an article agent choose the download control
+
+Some publisher pages have no packaged *papio* adapter, or the page changed and
+the adapter no longer works. In delegated mode, the optional article agent can
+continue there. It sends a short list of the buttons and links on the article
+page to Jev, a model that TypeSafe runs, and Jev chooses one. The agent runs
+only after the packaged and generic routes have failed.
+
+You need:
+
+- `access_mode = "delegated"`;
+- a TypeSafe API key, which is a paid service;
+- site access for that publisher in the extension; and
+- a daemon and extension that both support the agent. With an older
+  extension, the page stays assisted.
+
+To turn it on, save your key, then restart the background service:
+
+```sh
+papio config agent set      # asks for the key at a hidden prompt
+papio daemon stop           # the next papio command starts it with the key
+papio config agent status   # shows the setup without printing the key
+```
+
+To read the key from a secret manager instead of a prompt, pipe it into
+`papio config agent set --key-stdin`. *papio* keeps the key in macOS Keychain,
+Windows Credential Manager, or Linux Secret Service, and writes only a
+reference to it in your configuration. `papio config credentials` manages the
+same record under the target `agent.typesafe`.
+
+What leaves your machine: for each decision, TypeSafe receives your key, the
+article's DOI, a title of at most 400 characters, and at most 80 visible
+controls, each with a label of at most 240 characters, its role, and whether it
+is disabled. Page addresses, page text, form values, cookies, passwords, and
+other tabs are not sent. [Privacy](../privacy.md#agent-acquisition) lists the
+details.
+
+What the model can do: it answers with exactly one of these:
+
+- one enabled control from the list it received;
+- `WAIT`, when the page is still loading; or
+- `BLOCKED`, when a person must act (a sign-in, a challenge, a payment, or
+  terms), or when no safe control moves toward the PDF.
+
+It cannot type text, supply an address, run code, or choose a control that is
+not on the page. *papio* refuses any other answer. The extension clicks the
+chosen control in *papio*'s own tab, and the downloaded file goes through the
+same PDF and identity checks as every other file.
+
+Each decision is one paid TypeSafe request. For one download attempt, *papio*
+allows at most 60 decisions in ten minutes and 30 seconds for each model call.
+You cannot change these limits in the configuration.
+
+To see what the agent did, run `papio jobs get <job-id>`. When the agent chose
+the control that produced the file, the `artifact.producer` line says
+`producer=agent` and names the decision. `papio stats producers` counts these
+papers (see [See who produced each paper](#see-who-produced-each-paper)).
+
+To turn the agent off, run `papio config agent remove` and restart the
+background service. If you set `PAPIO_TYPESAFE_API_KEY` in the daemon's
+environment, remove it too. `remove` keeps the stored key; to delete it, run
+`papio config credentials delete REFERENCE`. The
+[agent section of the configuration reference](../reference/config-reference.md#agent-acquisition)
+covers Windows sign-in sessions and the Firefox download rules.
+
 ### Send a PDF already open in the browser
 
 If a handoff or a provider page has reached a PDF, open the popup and choose
@@ -504,6 +652,63 @@ filename, but a provider button that starts its own click download cannot be
 rerouted automatically and remains human-assisted. When that happens, wait
 until the PDF is open and use **Send PDF to papio** rather than assuming an
 unrelated file in `Downloads` will be adopted.
+
+### Save a Firefox PDF with the macOS helper (experimental)
+
+Some publishers show a PDF in the browser's viewer but refuse to send it a
+second time (see
+[PDF viewers that need a manual download](../concepts/browser-handoff.md#pdf-viewers-that-need-a-manual-download)).
+Chrome can file that PDF when you press the viewer's **Download** button;
+Firefox cannot. On macOS, an experimental helper program can save the PDF that
+Firefox already shows, so you do not have to open the paper in Chrome.
+
+Know these limits before you use it:
+
+- It is experimental. It works only with Firefox on macOS.
+- The release packages do not include the helper. Homebrew, Scoop, WinGet, the
+  Linux packages, and the release archives contain only the `papio` program.
+  You build the helper yourself from the Swift package in the repository's
+  `extension/tools/native-spike-macos` directory. It needs Swift 6.2 or later
+  and macOS 14 or later.
+- The helper uses macOS Accessibility to press Firefox's own **Save** control
+  and to fill in the save dialog. It never asks for that permission. If macOS
+  has not granted it, the save reports that it is unavailable.
+- If the extension says Firefox cannot identify the open PDF, update to
+  Firefox 153 or later.
+
+From a clone of the repository, build the helper into a folder of your choice:
+
+```sh
+swift build -c release --package-path extension/tools/native-spike-macos \
+  --scratch-path ~/papio-helper-build --product papio-native-spike
+```
+
+The program is then at `~/papio-helper-build/release/papio-native-spike`.
+
+To turn it on, set the absolute path of the helper (a `~/` path also works) in
+`[browser]`, then restart the background service:
+
+```toml
+[browser]
+native_viewer_helper = "~/papio-helper-build/release/papio-native-spike"
+```
+
+Leave `native_viewer_helper` empty, or remove it, to turn the helper off.
+
+When it is configured and a PDF viewer needs a manual download, the extension
+asks *papio* to save the document itself, either when you choose **Send this
+PDF** or when *papio* diagnosed the page as a viewer download. The helper saves
+the PDF from Firefox's viewer into your Downloads folder under a
+`papio-viewer-…` name, and *papio* adopts it from there. The file must pass the
+normal PDF and identity checks before the job becomes ready. *papio* starts
+each save only once: if a save is interrupted, *papio* does not repeat it, and
+you check the paper in *papio* before you try again.
+
+The helper runs only on your machine and makes no network requests. The
+address of the PDF goes to it only on its standard input, and when a save
+fails, *papio* keeps only a fixed error code. A paper saved this way shows
+`producer=native_viewer` in `papio jobs get <job-id>` and in
+`papio stats producers`.
 
 ## 6. Read the batch outcome
 
@@ -658,6 +863,53 @@ human handoff. Every figure is an aggregate computed locally from your own
 job history — nothing is sent anywhere to produce it. Against an older
 daemon that doesn't support the feature, the popup hides the summary and the
 history page shows a muted "stats unavailable" note instead of an error.
+
+### See who produced each paper
+
+Every paper that reaches `ready` records who produced the file and whether a
+person had to help. Use this to see how much of your work *papio* finishes
+without you, for example after you turn on the paced drive or the article
+agent:
+
+```sh
+papio stats producers                 # the last 24 hours
+papio stats producers --since 168h    # the last 7 days
+papio stats producers --since 2026-09-01T00:00:00Z --until 2026-10-01T00:00:00Z
+```
+
+`--since` takes an RFC 3339 time or a Go duration in hours, minutes, or
+seconds, such as `168h` (a value like `7d` is not accepted). `--until` takes an
+RFC 3339 time and defaults to now. Add `--json` for the full breakdown, which
+also counts who opened each handoff.
+
+The first line gives the total, split into **unattended** (no person needed),
+**sign-in only** (only an institutional sign-in), and **intervened** (anything
+more). **No producer record** counts papers that reached `ready` without a
+record: papers from before *papio* 0.22.0, and papers served from a copy
+*papio* already had. The producers are:
+
+| Producer | Meaning |
+| --- | --- |
+| `adapter` | The extension downloaded a PDF that the page declared, inside a drive that *papio* started, with no agent decision. |
+| `agent` | The article agent chose the control that produced the download. |
+| `native_viewer` | The macOS helper saved the PDF from Firefox's viewer. |
+| `daemon_fetch` | *papio* chose the address: it fetched the file itself, or the browser fetched a public address that *papio* selected. |
+| `manual` | A person supplied the file: a PDF you sent from an open tab, or a download that came after the adapter had stopped. |
+| `unknown` | A browser download with no record of who clicked. |
+
+The interventions it counts are `open` (someone other than the paced drive
+opened the handoff), `sign_in`, `terms`, `challenge`, `review`, and
+`manual_file`. A handoff that the paced drive opened is not an intervention.
+
+Know one limit: `unknown` often includes downloads that a packaged adapter
+made in a sign-in handoff tab. The extension does not tell *papio* which
+adapter clicked in that tab, so an adapter click and your own click look the
+same, and *papio* does not guess. Read a high `unknown` count as "not
+recorded", not as "done by hand".
+
+For one paper, `papio jobs get <job-id>` prints the record on its
+`artifact.producer` line, for example
+`producer=adapter … opened_by=pacer unattended`.
 
 ## Why a batch parks
 

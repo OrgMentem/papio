@@ -366,3 +366,36 @@ WARN  quiesced_actions  3 human action(s) have gone quiet after waiting more tha
 If a handoff becomes inactive again, the library may not hold the title, the
 provider may have changed its login, or the DOI may be wrong. Check
 `papio jobs receipt <job-id>` before reopening it.
+
+## The paced drive opens nothing
+
+Ask the drive what blocks it:
+
+```sh
+papio drive status
+```
+
+The `blocked by:` list names each reason; the
+[user guide](user-guide.md#let-papio-open-parked-handoffs-for-you) explains
+every name. The common cases:
+
+- `disabled`: `[drive] enabled = true` is missing, or the background service
+  has not restarted since you added it. Run `papio daemon stop`; the next
+  command starts it with the new setting.
+- `paused`: you paused it, or the sign-ins for two papers from different
+  providers did not come back. Sign in to your library in the browser; the
+  drive continues when any sign-in returns. Or run `papio drive resume`.
+- `holder_absent`: no browser is connected. Open the browser that has the
+  extension; `papio browser sessions` shows which browser receives handoffs.
+- `no_eligible_job`: nothing parked can be opened now. The drive leaves a paper
+  alone for 6 hours after it opens it, skips providers that refuse this
+  browser, and never opens an `openurl_available` advisory.
+
+## *papio* closed a tab you wanted
+
+From extension 0.15.0, *papio* closes the tab of a paper once it filed the paper
+or the job ended, including a PDF tab. For a filed paper, choose **Reopen** in
+the toast to get the tab back, or open the history page. To keep a tab in
+future, pin it or move it out of *papio*'s work window or tab group before
+*papio* is finished with it. Looking at a tab only delays the close. See
+[When papio closes its tabs](../concepts/browser-handoff.md#when-papio-closes-its-tabs).

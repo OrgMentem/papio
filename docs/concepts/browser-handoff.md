@@ -32,21 +32,47 @@ flowchart LR
 
 The extension tracks only its own tabs. It runs provider-specific code only on
 sites you grant, notices when you return from your institution's login page
-without recording that page's address or title, matches up the job's download,
-and retires a tab it opened once that tab has nothing left to do — when the job
-finishes or is cancelled, and also when a paper parks waiting for you, once
-*papio* has confirmed it holds nothing live in that surface. It never closes a
-tab you have touched: making one active, pinning it, opening a PDF in it, or
-moving it out of *papio*'s window or tab group hands it to you permanently. A
-tab *papio* has no record of opening is never closed at all. The extension
-can restart at any time; it keeps only a minimal tab-to-job mapping and asks
-*papio* for the authoritative state.
+without recording that page's address or title, and matches up the job's
+download. The extension can restart at any time; it keeps only a minimal
+tab-to-job mapping and asks *papio* for the authoritative state.
+
+### When *papio* closes its tabs
+
+*papio* does not keep a tab for a paper it no longer needs. From extension
+0.15.0, it closes the tab it opened for a paper in these cases:
+
+- *papio* filed the paper. The PDF viewer tab closes too.
+- The paper's job ended in another way, for example it was cancelled.
+- A newer *papio* tab for the same paper replaced it.
+- The paper parked waiting for you, and *papio* confirmed that it holds
+  nothing live in that tab.
+
+A tab that a publisher opens from a *papio* tab, such as a full-text link or a
+"View PDF" window, belongs to the same paper and closes with it.
+
+*papio* never closes a tab that you pinned, or a tab that you moved out of
+*papio*'s work window or tab group. Do one of these to keep a tab. Looking at a
+tab does not keep it: the tab in front of you stays open while you look at it,
+and *papio* closes it on a later pass after you switch away.
+
+A tab inside *papio*'s tab group that *papio* has no record of, such as a blank
+**New Tab**, closes after nobody has used it for 30 minutes, unless it is pinned
+or in front of you. *papio* does not close unrecorded tabs anywhere else.
+
+When *papio* closes the tab of a paper it filed, a toast says *"papio filed the
+paper and closed its tab."* (for a batch: *"papio filed N papers and closed
+their tabs."*). Choose **Reopen** to open those papers again. If the browser
+put the extension to sleep in the meantime, **Reopen** opens the history page,
+which lists every filed paper.
 
 ## PDF viewers that need a manual download
 
 Some providers display a PDF but return HTML when its signed URL is fetched again.
 For these viewers, papio keeps the PDF open and asks you to choose **Send this PDF**,
-then use the viewer’s **Download** button. On Firefox, open the PDF in Chrome first.
+then use the viewer’s **Download** button. On Firefox, open the PDF in Chrome first,
+unless you use the experimental
+[macOS helper](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental),
+which saves the PDF that Firefox already shows.
 The notice itself does not authorize adoption; Send this PDF binds the current
 browser document. The daemon still validates the downloaded file before marking
 its job ready.
@@ -172,7 +198,10 @@ Two consequences worth knowing:
   the one the tab was opened for.
 - **Firefox declines this rather than half-promising it.** Firefox gives an
   extension no way to adopt a download it did not start, so *papio* says to open
-  that paper in Chrome instead of asking for a click it could not act on.
+  that paper in Chrome instead of asking for a click it could not act on. The
+  exception is the experimental
+  [macOS helper](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental):
+  when you configure it, *papio* saves the PDF from Firefox's viewer itself.
 
 ## The inbox stays current
 
@@ -213,6 +242,7 @@ commits any pending dismissals.
 | `proquest_account_id` | Optional default ProQuest account ID for the `accountid` append. |
 | `download_adoption_root` | Root containing the per-job adopted downloads; when empty, *papio* uses `<your download folder>/papio`. It must be a `papio` directory inside the browser's own download directory — steering cannot reach anywhere else. |
 | `action_expiry_seconds` | Maximum open time for one browser handoff. |
+| `native_viewer_helper` | Experimental. Absolute path to the separately built macOS helper that saves a PDF already open in Firefox's viewer; empty (the default) turns it off. See [the user guide](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental). |
 
 `[browser.resolvers.<name>]` profiles replace the default institution for a
 selected job. They carry only `openurl_base_url` and optional
