@@ -11,6 +11,11 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **A waiting PDF grab no longer makes your browser reconnect every few
+  seconds.** When every open action belonged to a known family, the inbox
+  count listed the grab's family first even though it ranks last. The
+  browser protocol rejected that order, and the native host restarted each
+  time the count was read. The families are now listed in rank order.
 - An accepted identity review whose objection was a foreign front-matter DOI
   now promotes the accepted file. The reuse pass re-ran the automatic
   foreign-DOI rejection over the same bytes, marked them `wrong_work`, and

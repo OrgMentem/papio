@@ -1100,6 +1100,40 @@ func TestUnmappedFamilyStatesStayStandaloneAndInvalidateBreakdown(t *testing.T) 
 	}
 }
 
+// Measured live 2026-09-23: a parked PDF grab sits in the item slice before
+// the human actions but ranks after them (pdfGrabRankBase > humanActionRankBase).
+// Once every action mapped to a family the breakdown became complete, the
+// grab's run was emitted first, and the wire validator refused the whole
+// triage_counts_response ("family runs must be ordered") on every poll, which
+// the native host treats as transport-fatal: the browser session restarted
+// every few seconds.
+func TestFamilyRunsFollowRankOrderAcrossItemKinds(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	createProjectionAction(t, jobs, "rank-order-download", "manual_download", "normal", job.Access(false, "landing_page"))
+	createProjectionAction(t, jobs, "rank-order-delivery", "document_delivery", "request", job.Access(false, ""))
+	service.RegisterSource(staticSource{items: []Item{{
+		Kind: KindPdfGrab, ID: PdfGrabIDPrefix + "rank-order-grab", Title: "PDF",
+		Ops:     []string{"provide_identifier", "dismiss"},
+		PdfGrab: &PdfGrab{GrabID: "rank-order-grab", State: "parked_no_identifier"},
+	}}})
+	counts, err := service.Counts(context.Background(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.FamilyBreakdownComplete == nil || !*counts.FamilyBreakdownComplete || len(counts.FamilyRuns) != 3 {
+		t.Fatalf("breakdown complete %v runs %+v, want a complete breakdown of three runs", counts.FamilyBreakdownComplete, counts.FamilyRuns)
+	}
+	for i := 1; i < len(counts.FamilyRuns); i++ {
+		prev, current := counts.FamilyRuns[i-1], counts.FamilyRuns[i]
+		if prev.FirstRank > current.FirstRank || (prev.FirstRank == current.FirstRank && prev.RunKey >= current.RunKey) {
+			t.Fatalf("family runs not ordered by (first_rank, run_key): %+v", counts.FamilyRuns)
+		}
+	}
+	if last := counts.FamilyRuns[len(counts.FamilyRuns)-1]; last.RouteClass != "pdf_identifier_needed" {
+		t.Fatalf("last run = %+v, want the PDF grab, which ranks after every action", last)
+	}
+}
+
 func TestTurnsIncludePdfGrabsAndRespectBounds(t *testing.T) {
 	service, _, jobs := triageTestService(t)
 	createProjectionAction(t, jobs, "turn-pdf-action", "manual_download", "normal", job.Access(false, "landing_page"))

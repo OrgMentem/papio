@@ -1333,6 +1333,17 @@ func buildFamilyRuns(items []Item, rows []familyRow, counts *Counts) int {
 		row.assignment.RunKey = counts.FamilyRuns[runIndex].RunKey
 		items[i].Family = row.assignment
 	}
+	// The wire contract orders runs by (first_rank, run_key), but the item
+	// slice is not in rank order across kinds: parked PDF grabs are emitted
+	// before the human actions while ranking after them. Sort the runs, not
+	// the items, so the snapshot keeps its emitted order.
+	sort.SliceStable(counts.FamilyRuns, func(left, right int) bool {
+		a, b := counts.FamilyRuns[left], counts.FamilyRuns[right]
+		if a.FirstRank != b.FirstRank {
+			return a.FirstRank < b.FirstRank
+		}
+		return a.RunKey < b.RunKey
+	})
 	return runCount
 }
 
