@@ -17,6 +17,9 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **Article URLs can establish DOI identity.** The agent may act on an article
+  whose own URL names the requested DOI, even without DOI metadata. A conflicting
+  citation still stops it.
 - **Title identity checks ignore typography, not different words.** *papio*
   accepts matching article titles with sentence punctuation, quote or dash
   variants, and diacritics. A different title still fails the work check.

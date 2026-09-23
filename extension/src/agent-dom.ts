@@ -187,7 +187,22 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     if ((hasMetadata || pdfWrapper) && citations.some(value => value !== doi)) return "identity_conflicting";
     const primary = primaryArticleDOIs();
     if (primary.some(value => value !== doi)) return "identity_conflicting";
-    if (!hasMetadata && primary.length === 0 && !pdfWrapper) return "identity_missing";
+    if (!hasMetadata && primary.length === 0 && !pdfWrapper) {
+      let hasURLDOI = false;
+      try {
+        const pathAndQuery = decodeURIComponent(current.pathname + current.search).toLowerCase();
+        for (let index = pathAndQuery.indexOf(doi); index !== -1; index = pathAndQuery.indexOf(doi, index + 1)) {
+          const before = pathAndQuery[index - 1];
+          const after = pathAndQuery[index + doi.length];
+          if ((!before || /[\/=:\s]/.test(before)) &&
+            (!after || /[&#?\s]/.test(after) || (after === "/" && index + doi.length + 1 === pathAndQuery.length))) {
+            hasURLDOI = true;
+            break;
+          }
+        }
+      } catch { /* Malformed escapes cannot establish article identity. */ }
+      if (!hasURLDOI) return "identity_missing";
+    }
     // Visible credential/payment entry is a human gate. Ordinary search and
     // newsletter fields are unrelated; their values are never projected.
     const field = Array.from(document.querySelectorAll("input,textarea,select")).find(node => sensitiveField(node) && visible(node, false));

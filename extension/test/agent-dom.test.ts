@@ -6,6 +6,7 @@ import { agentDOM, type AgentDOMRequest, type AgentDOMResult } from "../src/agen
 
 const entryURL = "https://ebooks.iospress.nl/doi/10.3233/SHTI000001";
 const doi = "10.3233/SHTI000001";
+const metadataOnlyURL = "https://ebooks.iospress.nl/articles/63646";
 const fixture = readFileSync(new URL("../fixtures/iospress/success.html", import.meta.url), "utf8");
 const saved = new Map<string, PropertyDescriptor | undefined>();
 afterEach(() => {
@@ -14,8 +15,8 @@ afterEach(() => {
   }
   saved.clear();
 });
-function setup(html = fixture) {
-  const win = new Window({ url: entryURL, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
+function setup(html = fixture, url = entryURL) {
+  const win = new Window({ url, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
   win.document.write(html);
   for (const [key, value] of Object.entries({ document: win.document, location: win.location, getComputedStyle: win.getComputedStyle.bind(win), HTMLElement: win.HTMLElement, papioArticleAgent: undefined })) {
     if (!saved.has(key)) saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -25,6 +26,7 @@ function setup(html = fixture) {
   return win;
 }
 const observe = () => agentDOM({ method: "observe", entryURL, doi });
+const observeMetadataOnly = () => agentDOM({ method: "observe", entryURL: metadataOnlyURL, doi });
 function observed(result: AgentDOMResult) {
   if (result.status !== "observed") throw new Error(result.status);
   return result;
@@ -260,14 +262,59 @@ test("explicit navigation stays on the bound article; external/new-tab links and
   for (const label of ["Menu", "Local PDF"]) expect(controls.find(c => c.label.startsWith(label))?.disabled).toBe(false);
 });
 
+test("the bound publisher URL can identify an article without DOI metadata", async () => {
+  const pageURL = "https://psycnet.apa.org/doiLanding?doi=10.1037%2Fcfp0000143";
+  const requestedDOI = "10.1037/cfp0000143";
+  setup("<main><h1>Example article</h1><button>Download PDF</button></main>", pageURL);
+  expect((await agentDOM({ method: "observe", entryURL: pageURL, doi: requestedDOI })).status).toBe("observed");
+});
+
+test("the bound article path can identify a DOI without metadata", async () => {
+  const pageURL = "https://publisher.example/doi/10.1002/pits.20149";
+  setup("<main><button>Download PDF</button></main>", pageURL);
+  expect((await agentDOM({ method: "observe", entryURL: pageURL, doi: "10.1002/pits.20149" })).status).toBe("observed");
+});
+
+test("a conflicting citation overrides a matching DOI in the bound URL", async () => {
+  const pageURL = "https://psycnet.apa.org/doiLanding?doi=10.1037%2Fcfp0000143";
+  setup('<meta name="citation_doi" content="10.9999/other"><main><button>Download PDF</button></main>', pageURL);
+  expect(await agentDOM({ method: "observe", entryURL: pageURL, doi: "10.1037/cfp0000143" }))
+    .toEqual({ status: "blocked", reason: "identity_conflicting" });
+});
+
+test("a longer DOI in the bound URL cannot identify its prefix", async () => {
+  const pageURL = "https://psycnet.apa.org/doiLanding?doi=10.1037%2Fcfp00001430";
+  setup("<main><button>Download PDF</button></main>", pageURL);
+  expect(await agentDOM({ method: "observe", entryURL: pageURL, doi: "10.1037/cfp0000143" }))
+    .toEqual({ status: "blocked", reason: "identity_missing" });
+});
+
+test("a bound URL without the requested DOI still needs article identity", async () => {
+  setup("<main><button>Download PDF</button></main>", metadataOnlyURL);
+  expect(await observeMetadataOnly()).toEqual({ status: "blocked", reason: "identity_missing" });
+});
+
+for (const [suffix, expected] of [
+  ["/doi/10.1037/cfp0000143/", "observed"],
+  ["/prefix10.1037/cfp0000143", "identity_missing"],
+  ["/doi/10.1037/cfp0000143/more", "identity_missing"],
+  ["/doiLanding?doi=10.1037%2Fcfp0000143%ZZ", "identity_missing"],
+] as const) test(`URL DOI boundaries and malformed escapes: ${suffix}`, async () => {
+  const pageURL = `https://publisher.example${suffix}`;
+  setup("<main><button>Download PDF</button></main>", pageURL);
+  const result = await agentDOM({ method: "observe", entryURL: pageURL, doi: "10.1037/cfp0000143" });
+  if (expected === "observed") expect(result.status).toBe("observed");
+  else expect(result).toEqual({ status: "blocked", reason: expected });
+});
+
 test("scope and live citation are required without an adapter registry", async () => {
-  const win = setup('<meta name="citation_doi" content="10.3233/SHTI000001"><article><button>Formats</button></article>');
-  expect((await observe()).status).toBe("observed");
+  const win = setup('<meta name="citation_doi" content="10.3233/SHTI000001"><article><button>Formats</button></article>', metadataOnlyURL);
+  expect((await observeMetadataOnly()).status).toBe("observed");
   win.location.pathname = "/different";
-  expect(await observe()).toEqual({ status: "blocked", reason: "page_binding_failed" });
-  win.location.href = entryURL;
+  expect(await observeMetadataOnly()).toEqual({ status: "blocked", reason: "page_binding_failed" });
+  win.location.href = metadataOnlyURL;
   win.document.querySelector("meta")!.remove();
-  expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
+  expect(await observeMetadataOnly()).toEqual({ status: "blocked", reason: "identity_missing" });
 });
 
 // Minimal public structure from a labelled article DOI field; no captured
@@ -302,8 +349,8 @@ for (const secondary of [
   primaryDOIField().replace("<div>", '<div class="reference-item">'),
   primaryDOIField().replace("<a ", '<a role="doc-biblioref" '),
 ] as const) test(`secondary or unlabelled DOI cannot establish article identity: ${secondary.slice(0, 45)}`, async () => {
-  setup(`<main><h1>Example article</h1>${secondary}<button>Download PDF</button></main>`);
-  expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
+  setup(`<main><h1>Example article</h1>${secondary}<button>Download PDF</button></main>`, metadataOnlyURL);
+  expect(await observeMetadataOnly()).toEqual({ status: "blocked", reason: "identity_missing" });
 });
 
 test("wrong metadata wins over matching primary and reference DOI fields", async () => {
@@ -337,16 +384,16 @@ for (const primary of [
 
 for (const change of ["href", "text", "remove", "reference", "metadata"] as const)
   test(`primary DOI identity is rechecked before action after ${change} changes`, async () => {
-    const win = setup(primaryDOIPage());
+    const win = setup(primaryDOIPage(), metadataOnlyURL);
     let clicks = 0; win.document.querySelector("button")!.addEventListener("click", () => clicks++);
-    const first = observed(await observe());
+    const first = observed(await observeMetadataOnly());
     const field = win.document.querySelector("section div")!;
     if (change === "href") field.querySelector("a")!.setAttribute("href", "https://doi.org/10.9999/other");
     if (change === "text") field.querySelector("a")!.textContent = "10.9999/other";
     if (change === "remove") field.remove();
     if (change === "reference") win.document.querySelector("h2")!.textContent = "References";
     if (change === "metadata") win.document.head.insertAdjacentHTML("beforeend", '<meta name="citation_doi" content="10.9999/other">');
-    expect(await act(first)).toEqual({ status: "blocked", reason: change === "remove" || change === "reference" ? "identity_missing" : "identity_conflicting" });
+    expect(await act(first, { entryURL: metadataOnlyURL })).toEqual({ status: "blocked", reason: change === "remove" || change === "reference" ? "identity_missing" : "identity_conflicting" });
     expect(clicks).toBe(0);
   });
 
@@ -369,10 +416,10 @@ for (const [name, content] of [
 
 for (const content of ["urn:isbn:9781234567890", "local-record-63646", "https://publisher.example/63646"])
   test(`non-DOI DC identifier is not identity evidence: ${content}`, async () => {
-    const win = setup(`<meta name="dc.identifier" content="${content}"><main><button>PDF</button></main>`);
-    expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
+    const win = setup(`<meta name="dc.identifier" content="${content}"><main><button>PDF</button></main>`, metadataOnlyURL);
+    expect(await observeMetadataOnly()).toEqual({ status: "blocked", reason: "identity_missing" });
     win.document.head.insertAdjacentHTML("beforeend", `<meta name="prism.doi" content="${doi}">`);
-    expect((await observe()).status).toBe("observed");
+    expect((await observeMetadataOnly()).status).toBe("observed");
   });
 
 for (const name of ["citation_doi", "dc.identifier", "prism.doi"]) {
@@ -402,7 +449,7 @@ for (const [change, reason] of [
   ["conflicting", "identity_conflicting"], ["extra", "identity_conflicting"],
   ["invalid expected", "identity_invalid"],
 ] as const) test(`identity refusal is distinct from a human gate: ${change}`, async () => {
-  const win = setup(), first = observed(await observe());
+  const win = setup(fixture, metadataOnlyURL), first = observed(await observeMetadataOnly());
   let clicks = 0;
   win.document.querySelector(".getpdf")!.addEventListener("click", () => clicks++);
   const citation = win.document.querySelector('meta[name="citation_doi"]')!;
@@ -411,16 +458,16 @@ for (const [change, reason] of [
   if (change === "conflicting") citation.setAttribute("content", "10.9999/PRIVATEIDENTITY");
   if (change === "extra") win.document.head.insertAdjacentHTML("beforeend", '<meta name="citation_doi" content="10.9999/PRIVATEIDENTITY">');
   const expected = change === "invalid expected" ? "PRIVATEINVALID" : doi;
-  expect(await agentDOM({ method: "observe", entryURL, doi: expected })).toEqual({ status: "blocked", reason });
-  expect(await act(first, { doi: expected })).toEqual({ status: "blocked", reason });
+  expect(await agentDOM({ method: "observe", entryURL: metadataOnlyURL, doi: expected })).toEqual({ status: "blocked", reason });
+  expect(await act(first, { entryURL: metadataOnlyURL, doi: expected })).toEqual({ status: "blocked", reason });
   expect(clicks).toBe(0);
 });
 
 test("identity failure does not assert a human gate even when one is also present", async () => {
-  const win = setup();
+  const win = setup(fixture, metadataOnlyURL);
   win.document.querySelector('meta[name="citation_doi"]')!.remove();
   win.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept PRIVATECONSENT</dialog>');
-  expect(await observe()).toEqual({ status: "blocked", reason: "identity_missing" });
+  expect(await observeMetadataOnly()).toEqual({ status: "blocked", reason: "identity_missing" });
 });
 
 test("reload and stale controls have separate bounded reasons", async () => {
@@ -432,7 +479,7 @@ test("reload and stale controls have separate bounded reasons", async () => {
 });
 
 test("a validation failure during the observation digest retains its exact reason", async () => {
-  const win = setup();
+  const win = setup(fixture, metadataOnlyURL);
   const digest = crypto.subtle.digest.bind(crypto.subtle);
   const original = crypto.subtle.digest;
   try {
@@ -440,7 +487,7 @@ test("a validation failure during the observation digest retains its exact reaso
       win.document.querySelector('meta[name="citation_doi"]')!.remove();
       return digest(...args);
     };
-    expect(await observe()).toEqual({ status: "stale", reason: "identity_missing" });
+    expect(await observeMetadataOnly()).toEqual({ status: "stale", reason: "identity_missing" });
   } finally { crypto.subtle.digest = original; }
 });
 
