@@ -1,6 +1,8 @@
 /**
- * Chrome session rules that make a signed PDF viewer response download
- * instead of render, only in the handoff tabs papio arms for a job.
+ * Which handoff tabs papio arms for a job's signed PDF viewer, and Chrome's
+ * session rules that make that viewer response download instead of render.
+ * Firefox arms the same tabs for the stream capture in
+ * viewer-stream-capture.ts.
  *
  * A signed viewer URL is not reusable: ScienceDirect answered a second request
  * with HTML (2026-09-20, and again through Chrome downloads on 2026-09-23), and
@@ -112,6 +114,8 @@ export interface ViewerRuleDeps {
 /** The Bridge state and behaviour the rule sync depends on. */
 export interface ViewerRuleContext {
   isFirefox(): boolean;
+  /** Firefox: whether the webRequest stream capture is available. */
+  viewerCaptureAvailable(): boolean;
   /** The current managed-state snapshot. */
   store(): StoreShape;
   hasDelegatedAuthority(job: ActiveJob): boolean;
@@ -122,7 +126,7 @@ export interface ViewerRuleContext {
   /** Tabs a finished download keeps open until the daemon acknowledges. */
   readonly completedDownloadTabs: ReadonlyMap<string, number>;
   /** Whether the job may still take its one signed-viewer download. */
-  viewerRefetchAllowed(jobID: string): boolean;
+  viewerAttemptAllowed(jobID: string): boolean;
   reportNativeViewerDownloadRequired(
     jobID: string,
     url: string,
@@ -131,15 +135,15 @@ export interface ViewerRuleContext {
   ): Promise<void>;
 }
 
-/** Which tabs the viewer-download rules cover, and keeping Chrome's session
- * rules in line with them. Chrome only: every entry point is a no-op on
- * Firefox or without the declarativeNetRequest seam. */
+/** Which tabs are armed for a signed viewer, and keeping Chrome's session
+ * rules in line with them. On Chrome that needs the declarativeNetRequest
+ * seam; on Firefox, the stream capture. Without either, nothing is armed. */
 export class ViewerRuleSync {
   /** Child tab id -> job id for a tab a job's handoff tab opened; the job's
    * own tab is read from the store. */
   private readonly viewerRuleChildTabs = new Map<number, string>();
-  /** Armed tabs that have since closed. Chrome never reuses a tab id within a
-   * browser session, so a closed id stays disarmed until the job lets go. */
+  /** Armed tabs that have since closed. Neither browser reuses a tab id within
+   * a session, so a closed id stays disarmed until the job lets go. */
   private readonly viewerRuleClosedTabs = new Set<number>();
   /** Sorted tab ids the installed rules cover; undefined until this worker
    * first writes them, so a new worker replaces its predecessor's rules. */
@@ -158,15 +162,21 @@ export class ViewerRuleSync {
     private readonly ctx: ViewerRuleContext,
   ) {}
 
-  /** Tab id -> job id for every tab the viewer-download rules should cover: a
-   * delegated job's handoff tab, and tabs it opened, while that job could
-   * still take its one signed-viewer download. Agent-driven jobs are left out
-   * because the agent binds its own navigation downloads. A tab two jobs claim
-   * belongs to neither. */
+  /** Arming has an effect: Chrome rules that have not been rejected, or
+   * Firefox's stream capture. */
+  private armingActive(): boolean {
+    return this.ctx.isFirefox()
+      ? this.ctx.viewerCaptureAvailable()
+      : this.deps.declarativeNetRequest !== undefined && this.viewerRuleSupport !== "unsupported";
+  }
+
+  /** Tab id -> job id for every armed tab: a delegated job's handoff tab, and
+   * tabs it opened, while that job could still take its one signed-viewer
+   * download. Agent-driven jobs are left out because the agent binds its own
+   * navigation downloads. A tab two jobs claim belongs to neither. */
   private viewerRuleTabs(): Map<number, string> {
     const armed = new Map<number, string>();
-    if (this.ctx.isFirefox() || this.deps.declarativeNetRequest === undefined || this.viewerRuleSupport === "unsupported")
-      return armed;
+    if (!this.armingActive()) return armed;
     const shared = new Set<number>();
     const arm = (tabID: number, jobID: string): void => {
       if (this.viewerRuleClosedTabs.has(tabID)) return;
@@ -179,7 +189,7 @@ export class ViewerRuleSync {
         job.tab_id < 0 || !this.ctx.hasDelegatedAuthority(job) || this.ctx.agentLoops.has(job.job_id) ||
         (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") ||
         (this.ctx.downloads.get(job.job_id)?.ids.size ?? 0) > 0 || this.ctx.completedDownloadTabs.has(job.job_id) ||
-        !this.ctx.viewerRefetchAllowed(job.job_id)
+        !this.ctx.viewerAttemptAllowed(job.job_id)
       )
         continue;
       arm(job.tab_id, job.job_id);
@@ -187,6 +197,11 @@ export class ViewerRuleSync {
     }
     for (const tabID of shared) armed.delete(tabID);
     return armed;
+  }
+
+  /** The job whose armed tab this is, if any. */
+  armedJob(tabID: number): string | undefined {
+    return this.viewerRuleTabs().get(tabID);
   }
 
   /** Bring Chrome's session rules in line with `viewerRuleTabs`. Serialized,
@@ -219,12 +234,13 @@ export class ViewerRuleSync {
   }
 
   /** A tab an armed tab opened (View PDF with target=_blank) is armed too.
-   * Called on its first update, which Chrome sends as the navigation starts
-   * and before the response the rule acts on. */
+   * Chrome calls this on the tab's first update, which it sends as the
+   * navigation starts and before the response the rule acts on. Firefox
+   * also calls it from tabs.onCreated, because there the child's response
+   * can arrive before its first update. */
   noteViewerRuleChild(tabID: number, openerTabID: number | undefined): void {
     if (
-      openerTabID === undefined || this.viewerRuleChildTabs.has(tabID) ||
-      this.deps.declarativeNetRequest === undefined || this.ctx.isFirefox() ||
+      openerTabID === undefined || this.viewerRuleChildTabs.has(tabID) || !this.armingActive() ||
       findByTab(this.ctx.store(), tabID) !== undefined
     )
       return;
@@ -235,7 +251,7 @@ export class ViewerRuleSync {
   }
 
   noteViewerRuleTabRemoved(tabID: number): void {
-    if (this.deps.declarativeNetRequest === undefined || this.ctx.isFirefox()) return;
+    if (!this.armingActive()) return;
     if (!this.viewerRuleChildTabs.delete(tabID)) {
       if (findByTab(this.ctx.store(), tabID) === undefined) return;
       this.viewerRuleClosedTabs.add(tabID);
@@ -277,12 +293,12 @@ export class ViewerRuleSync {
     return undefined;
   }
 
-  /** A signed viewer rendered although the viewer rules are installed. Its one
+  /** A signed viewer rendered although its tab could be armed. Its one
    * response is spent and a refetch returns HTML, so ask for the viewer's
-   * Download button and name why. False only where the rules are unavailable,
-   * so the caller keeps the refetch fallback. */
+   * Download button and name why. False only where arming is unavailable, so
+   * the caller keeps its fallback. */
   async reportViewerRuleMiss(jobID: string, url: string, tabID: number): Promise<boolean> {
-    if (this.viewerRuleSupport !== "active") return false;
+    if (this.ctx.isFirefox() ? !this.ctx.viewerCaptureAvailable() : this.viewerRuleSupport !== "active") return false;
     let permitted = false;
     try {
       permitted = await this.deps.permissions.contains({ origins: [`https://${new URL(url).hostname}/*`] });
@@ -290,7 +306,11 @@ export class ViewerRuleSync {
       permitted = false;
     }
     await this.ctx.reportNativeViewerDownloadRequired(jobID, url, tabID, {
-      detail: permitted ? "the signed viewer rendered outside papio's download rule" : "viewer host permission missing",
+      detail: !permitted
+        ? "viewer host permission missing"
+        : this.ctx.isFirefox()
+          ? "the signed viewer rendered outside papio's capture"
+          : "the signed viewer rendered outside papio's download rule",
     });
     return true;
   }

@@ -153,6 +153,11 @@ import {
   type ViewerRuleSessionRules,
 } from "./viewer-download-rule";
 import {
+  ViewerStreamCapture,
+  type CapturedViewerPDF,
+  type ViewerCaptureWebRequest,
+} from "./viewer-stream-capture";
+import {
   adapters,
   adapterSupportsHost,
   type AdapterSpec,
@@ -1135,6 +1140,9 @@ export interface BridgeDeps {
       props: { active?: boolean; url?: string },
     ): Promise<unknown>;
     onUpdated: Listenable<[number, TabChangeInfo, TabInfo]>;
+    /** Firefox arms a tab an armed tab opened as soon as it exists: its
+     * signed viewer response can arrive before its first onUpdated. */
+    onCreated?: Listenable<[TabInfo]>;
     /** Used only for the singleton inbox tab. */
     sendMessage?(tabID: number, message: object): Promise<unknown>;
     /** `active`+`lastFocusedWindow` finds the page the researcher is actually
@@ -1189,9 +1197,15 @@ export interface BridgeDeps {
   };
   /** chrome.declarativeNetRequest session rules (Chrome only). papio arms its
    * delegated handoff tabs so a signed PDF viewer response downloads instead
-   * of rendering; see viewer-download-rule.ts. Absent on Firefox, which keeps
-   * the native-save path. */
+   * of rendering; see viewer-download-rule.ts. Absent on Firefox, which uses
+   * `webRequest` below instead. */
   declarativeNetRequest?: ViewerRuleSessionRules;
+  /** browser.webRequest with StreamFilter (Firefox only). papio keeps a copy
+   * of a signed PDF viewer response in its armed handoff tabs and saves it
+   * under the job; see viewer-stream-capture.ts. Absent on Chrome. */
+  webRequest?: ViewerCaptureWebRequest;
+  /** Object URLs for a captured PDF's download; defaults to the global URL. */
+  objectURLs?: { create(blob: Blob): string; revoke(url: string): void };
   /** Extension-page broadcast channel (runtime.onMessage), distinct from tabs.sendMessage content-script delivery. */
   runtimeSendMessage?(message: object): Promise<unknown>;
   /** chrome.windows seam. When present (and the user setting allows), broker
@@ -1457,12 +1471,13 @@ interface DownloadTrack {
    * download belongs to the materialization tab. Ordinary/manual downloads
    * must not inherit a job's lingering materialization correlation. */
   institutional?: InstitutionalDownloadAttempt;
-  /** Chrome's one download of a signed PDF viewer: either the viewer
-   * response itself, turned into a download by the session rule (`ruled`), or
-   * the fallback refetch of its URL where that rule is unavailable. The URL is
-   * memory-only and never leaves the worker. A failure spends the attempt and
-   * falls back to the viewer Download notice for `tabID`. */
-  viewerRefetch?: { url: string; tabID: number; ruled?: boolean; settled?: boolean };
+  /** A job's one download of a signed PDF viewer: the viewer response itself,
+   * turned into a download by Chrome's session rule (`ruled`) or saved from
+   * Firefox's stream capture (`ruled` and `captured`), or Chrome's fallback
+   * refetch of its URL where the rule is unavailable. The URL is memory-only
+   * and never leaves the worker. A failure spends the attempt and falls back
+   * to the viewer Download notice for `tabID`. */
+  viewerRefetch?: { url: string; tabID: number; ruled?: boolean; captured?: boolean; settled?: boolean };
 }
 /** Local loop bookkeeping on the existing persisted job, never authority. */
 interface AgentJobState {
@@ -1769,9 +1784,10 @@ function hostMatches(host: string, providerHosts: string[]): boolean {
  * on 2026-09-23). Signed delivery links from other publishers are
  * conservatively treated the same way: possession of their URL does not
  * establish that the delivery grant is reusable. On Chrome the session rules
- * in viewer-download-rule.ts download the viewer's own response instead, so
- * no second request is made; the one refetch remains only where those rules
- * are unavailable.
+ * in viewer-download-rule.ts download the viewer's own response instead, and
+ * on Firefox viewer-stream-capture.ts saves a copy of it, so no second
+ * request is made; Chrome's one refetch remains only where its rules are
+ * unavailable.
  */
 function requiresNativeViewerDownload(url: string): boolean {
   try {
@@ -1785,6 +1801,16 @@ function requiresNativeViewerDownload(url: string): boolean {
 }
 
 const NATIVE_VIEWER_CHROME_MESSAGE = "Choose Send this PDF in papio, then use the PDF viewer Download button.";
+/** Firefox's notice after its stream capture could not save a signed viewer's
+ * PDF. Firefox cannot adopt the viewer's own download, so this names only
+ * what keeps the paper: a copy from the viewer's Download button. */
+const FIREFOX_VIEWER_CAPTURE_MESSAGE = "papio could not save this PDF. Use the PDF viewer Download button to keep a copy.";
+/** The page's own object URLs, for a captured PDF's download (see
+ * BridgeDeps.objectURLs). */
+const GLOBAL_OBJECT_URLS = {
+  create: (blob: Blob) => URL.createObjectURL(blob),
+  revoke: (href: string) => URL.revokeObjectURL(href),
+};
 
 /** Parse a released semver (with an optional leading v) without retaining its
  * prerelease identifier: callers only need to distinguish release from pre-release. */
@@ -2806,8 +2832,13 @@ export class Bridge {
   private readonly surfaces: SurfaceLifecycle;
   /** ADR-0023's seventh surface and the filed-paper reopen batch. */
   private readonly toasts: ToastDelivery;
-  /** Chrome's signed-viewer download rules for armed handoff tabs. */
+  /** Which handoff tabs are armed for a signed viewer; Chrome's rules. */
   private readonly viewerRules: ViewerRuleSync;
+  /** Firefox's capture of a signed viewer response in an armed tab. */
+  private readonly viewerCapture: ViewerStreamCapture;
+  /** Download id -> object URL of a captured PDF, revoked once the download
+   * completes or is interrupted. */
+  private readonly viewerCaptureURLs = new Map<number, string>();
   /** IDs most recently counted from the durable ledger. A worker restart
    * recovers this set during the first badge paint; it lets navigation/removal
    * repaint only when a surface that actually contributed a human sign-in
@@ -3146,14 +3177,23 @@ export class Bridge {
     });
     this.viewerRules = new ViewerRuleSync(deps, {
       isFirefox: () => this.isFirefox(),
+      viewerCaptureAvailable: () => this.viewerCapture.available(),
       store: () => this.store,
       hasDelegatedAuthority: (job) => this.hasDelegatedAuthority(job),
       agentLoops: this.agentLoops,
       downloads: this.downloads,
       completedDownloadTabs: this.completedDownloadTabs,
-      viewerRefetchAllowed: (jobID) => this.viewerRefetchAllowed(jobID),
+      viewerAttemptAllowed: (jobID) => this.viewerAttemptAllowed(jobID),
       reportNativeViewerDownloadRequired: (jobID, url, tabID, spent) =>
         this.reportNativeViewerDownloadRequired(jobID, url, tabID, spent),
+    });
+    this.viewerCapture = new ViewerStreamCapture(deps, {
+      hydrating: () => (this.hydrated ? undefined : this.ready),
+      armedJob: (tabID) => this.viewerRules.armedJob(tabID),
+      armedChanged: () => void this.viewerRules.syncViewerDownloadRules(),
+      save: (capture) => void this.saveViewerCapture(capture),
+      miss: (jobID, url, tabID, detail) =>
+        void this.reportNativeViewerDownloadRequired(jobID, url, tabID, { detail }),
     });
     this.toasts = new ToastDelivery(deps, {
       store: () => this.store,
@@ -12187,6 +12227,19 @@ export class Bridge {
       this.surfaces.touchTab(tabId);
       return this.onTabActivated(tabId);
     });
+    if (this.isFirefox()) {
+      // Firefox's blocking listener must be registered in the event page's
+      // first turn, and a child tab is armed as soon as it exists; see
+      // viewer-stream-capture.ts.
+      this.viewerCapture.bind();
+      this.deps.tabs.onCreated?.addListener((tab) => {
+        const arm = (): void => {
+          if (tab.id !== undefined) this.viewerRules.noteViewerRuleChild(tab.id, tab.openerTabId);
+        };
+        if (this.hydrated) arm();
+        else void this.ready.then(arm, () => {});
+      });
+    }
     this.bindWebNavigation();
     this.deps.downloads.onCreated.addListener((item) => {
       return this.onDownloadCreated(item);
@@ -17410,9 +17463,7 @@ export class Bridge {
     if (!this.hasDelegatedAuthority(findByJob(this.store, jobID)) ||
       this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)) return;
     const code = "native_viewer_download_required";
-    const message = this.isFirefox()
-      ? "Open this PDF in Chrome, choose Send this PDF in papio, then use the PDF viewer Download button."
-      : NATIVE_VIEWER_CHROME_MESSAGE;
+    const message = this.nativeViewerNoticeMessage();
     const pending = this.store.pendingDelivery;
     // Do not overwrite an operator's delivery or an already displayed notice.
     if (pending?.job_id === jobID && pending.error === message) {
@@ -17458,14 +17509,29 @@ export class Bridge {
     }
   }
 
-  /** Chrome may take one download of a signed viewer for the job, through
-   * its download binding; Firefox cannot steer that download. A sent or
-   * displayed viewer notice spends the attempt, and the persisted notice
-   * survives a restart. */
-  private viewerRefetchAllowed(jobID: string): boolean {
-    if (this.isFirefox() || this.handoffOutcomeSent.has(`${jobID}:native_viewer_download_required`)) return false;
+  /** The viewer notice for this browser. On Firefox with the stream capture,
+   * the notice follows a capture that could not save the PDF, so it does not
+   * send the operator to Chrome. */
+  private nativeViewerNoticeMessage(): string {
+    if (!this.isFirefox()) return NATIVE_VIEWER_CHROME_MESSAGE;
+    return this.viewerCapture.available()
+      ? FIREFOX_VIEWER_CAPTURE_MESSAGE
+      : "Open this PDF in Chrome, choose Send this PDF in papio, then use the PDF viewer Download button.";
+  }
+
+  /** A job takes at most one signed-viewer download: Chrome's rule download
+   * or refetch, or Firefox's capture. A capture attempt or a sent or displayed
+   * viewer notice spends it, and the persisted notice survives a restart. */
+  private viewerAttemptAllowed(jobID: string): boolean {
+    if (this.viewerCapture.attempted(jobID) || this.handoffOutcomeSent.has(`${jobID}:native_viewer_download_required`)) return false;
     const pending = this.store.pendingDelivery;
-    return !(pending?.job_id === jobID && pending.error === NATIVE_VIEWER_CHROME_MESSAGE);
+    return !(pending?.job_id === jobID && pending.error === this.nativeViewerNoticeMessage());
+  }
+
+  /** Chrome may take the attempt as a download of the viewer URL, through its
+   * download binding; Firefox cannot steer that download. */
+  private viewerRefetchAllowed(jobID: string): boolean {
+    return !this.isFirefox() && this.viewerAttemptAllowed(jobID);
   }
 
   /** The refetch produced no PDF: drop its file and history entry, then ask
@@ -17516,6 +17582,91 @@ export class Bridge {
       await this.failViewerRefetch(jobID, track, id, "the browser download of the viewer URL was interrupted");
   }
 
+  /** Save Firefox's copy of a signed viewer response under the job. Same
+   * gates as Chrome's refetch, under the job's effect slot; the track is
+   * registered first so `onDownloadCreated` joins it. The daemon adopts,
+   * validates and identifies the file as for Chrome's rule download. */
+  private async saveViewerCapture(capture: CapturedViewerPDF, attempt = 0): Promise<void> {
+    const { jobID, tabID, url } = capture;
+    const effectToken = this.claimEffectGovernor(jobID);
+    if (effectToken === undefined) {
+      if (attempt < MAX_CLASSIFY_RETRIES) {
+        this.deps.setTimeout(() => this.saveViewerCapture(capture, attempt + 1), CLASSIFY_RETRY_MS);
+        return;
+      }
+      this.viewerCapture.settle(jobID, "failed");
+      await this.reportNativeViewerDownloadRequired(jobID, url, tabID, { detail: "papio stayed busy and did not save the captured viewer PDF" });
+      return;
+    }
+    try {
+      let existing: DownloadItemLike[];
+      try {
+        existing = await this.findJobDownloads(jobID);
+      } catch {
+        // A failed duplicate check cannot authorize another download.
+        this.viewerCapture.settle(jobID, "failed");
+        return;
+      }
+      if (
+        existing.some(item => item.state === "in_progress" || item.state === "complete") ||
+        this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID) ||
+        !this.hasDelegatedAuthority(findByJob(this.store, jobID))
+      ) {
+        this.viewerCapture.settle(jobID, "failed");
+        return;
+      }
+      const track: DownloadTrack = {
+        ids: new Set<number>(), ambiguous: false, directOffer: false,
+        viewerRefetch: { url, tabID, ruled: true, captured: true },
+      };
+      this.downloads.set(jobID, track);
+      const objectURLs = this.deps.objectURLs ?? GLOBAL_OBJECT_URLS;
+      const objectURL = objectURLs.create(capture.body);
+      this.pendingDownloadURLs.set(objectURL, jobID);
+      let id: number;
+      try {
+        id = await this.deps.downloads.download({
+          url: objectURL, filename: jobDownloadFilename(jobID), conflictAction: "uniquify", saveAs: false,
+        });
+      } catch {
+        this.pendingDownloadURLs.delete(objectURL);
+        objectURLs.revoke(objectURL);
+        if (this.downloads.get(jobID) === track) this.downloads.delete(jobID);
+        this.viewerCapture.settle(jobID, "failed");
+        await this.reportNativeViewerDownloadRequired(jobID, url, tabID, { detail: "the browser refused to save the captured viewer PDF" });
+        return;
+      }
+      this.pendingDownloadURLs.delete(objectURL);
+      this.viewerCaptureURLs.set(id, objectURL);
+      track.ids.add(id);
+      if (track.ids.size > 1) track.ambiguous = true;
+      this.viewerCapture.settle(jobID, "saved");
+      if (findByJob(this.store, jobID)?.download_initiated !== true)
+        await this.update(s => patchJob(s, jobID, { download_initiated: true }));
+      // A download can end before download() resolves; its onChanged delta
+      // then found no tracked id. Re-read the item once it is tracked.
+      let item: DownloadItemLike | undefined;
+      try {
+        [item] = await this.deps.downloads.search({ id });
+      } catch {
+        return; // onChanged still reports a later interruption.
+      }
+      if (item?.state === "interrupted" || item?.state === "complete") this.revokeViewerCaptureURL(id);
+      if (item?.state === "interrupted")
+        await this.failViewerRefetch(jobID, track, id, "saving the captured viewer PDF was interrupted");
+    } finally {
+      this.releaseEffectGovernor(jobID, effectToken);
+    }
+  }
+
+  /** Release a captured PDF's object URL once its download has ended. */
+  private revokeViewerCaptureURL(downloadID: number): void {
+    const objectURL = this.viewerCaptureURLs.get(downloadID);
+    if (objectURL === undefined) return;
+    this.viewerCaptureURLs.delete(downloadID);
+    (this.deps.objectURLs ?? GLOBAL_OBJECT_URLS).revoke(objectURL);
+  }
+
   /** Download a tracked PDF-viewer navigation through Chrome's download API.
    * The persisted latch and in-memory correlation jointly ensure that a
    * content-disposition download or repeated completion event cannot start a
@@ -17530,7 +17681,9 @@ export class Bridge {
     let job = findByJob(this.store, jobID);
     if (!this.hasDelegatedAuthority(job)) return;
     if (!job) return;
-    if (this.isFirefoxClickDownload(job)) return;
+    // Firefox cannot steer a click adapter's own download, but a signed viewer
+    // it opened is the stream capture's to save or to report.
+    if (this.isFirefoxClickDownload(job) && !(this.viewerCapture.available() && requiresNativeViewerDownload(url))) return;
     if (this.downloads.has(jobID)) return;
 
     let downloadURL = url;
@@ -17561,11 +17714,15 @@ export class Bridge {
       return;
 
     const refetch = requiresNativeViewerDownload(downloadURL);
+    // Firefox's capture of this viewer's response owns the job until it saves
+    // or reports why it could not.
+    if (refetch && this.viewerCapture.owns(jobID)) return;
+    if (refetch && this.viewerAttemptAllowed(jobID) &&
+      await this.viewerRules.reportViewerRuleMiss(jobID, downloadURL, job.tab_id)) return;
     if (refetch && !this.viewerRefetchAllowed(jobID)) {
       await this.reportNativeViewerDownloadRequired(jobID, downloadURL, job.tab_id);
       return;
     }
-    if (refetch && await this.viewerRules.reportViewerRuleMiss(jobID, downloadURL, job.tab_id)) return;
 
     // Re-read after the permission/probe awaits: a content-disposition
     // download may have been correlated while this probe was in flight. A
@@ -17660,7 +17817,7 @@ export class Bridge {
         this.completedDownloadTabs.has(j.job_id)
       )
         return false;
-      if (this.isFirefoxClickDownload(j)) return false;
+      if (this.isFirefoxClickDownload(j) && !(this.viewerCapture.available() && requiresNativeViewerDownload(url))) return false;
       if (j.status !== "accepted" && j.status !== "awaiting_download" && j.status !== "auth_pending")
         return false;
       const openerMatches =
@@ -17715,11 +17872,13 @@ export class Bridge {
       )
         return;
       const refetch = requiresNativeViewerDownload(url);
+      if (refetch && this.viewerCapture.owns(job.job_id)) return;
+      if (refetch && this.viewerAttemptAllowed(job.job_id) &&
+        await this.viewerRules.reportViewerRuleMiss(job.job_id, url, viewerTabId)) return;
       if (refetch && !this.viewerRefetchAllowed(job.job_id)) {
         await this.reportNativeViewerDownloadRequired(job.job_id, url, viewerTabId);
         return;
       }
-      if (refetch && await this.viewerRules.reportViewerRuleMiss(job.job_id, url, viewerTabId)) return;
       this.adoptedViewerTabs.set(job.job_id, viewerTabId);
       if (refetch) {
         await this.startViewerRefetch(job.job_id, url, viewerTabId);
@@ -21446,6 +21605,7 @@ export class Bridge {
       }
     }
     const state = delta.state?.current;
+    if (state === "complete" || state === "interrupted") this.revokeViewerCaptureURL(delta.id);
     const grabID = this.trackedGrabFor(delta.id);
     if (grabID !== undefined) {
       const grab = this.grabDownloads.get(grabID);
@@ -21476,7 +21636,7 @@ export class Bridge {
           if (track?.viewerRefetch !== undefined && track.ids.has(delta.id)) {
             const code = delta.error?.current;
             await this.failViewerRefetch(job.job_id, track, delta.id,
-              `the browser download of the viewer URL was interrupted${code !== undefined && /^[A-Z_]{1,40}$/u.test(code) ? ` (${code})` : ""}`);
+              `${track.viewerRefetch.captured === true ? "saving the captured viewer PDF" : "the browser download of the viewer URL"} was interrupted${code !== undefined && /^[A-Z_]{1,40}$/u.test(code) ? ` (${code})` : ""}`);
             return;
           }
           if (track?.generic !== undefined && track.ids.has(delta.id)) {
@@ -23170,6 +23330,9 @@ function realDeps(): BridgeDeps {
   // downloads.onDeterminingFilename compatibility event. Do not wire that
   // event as a usable steering capability in this browser.
   const firefox = typeof (chrome.runtime as typeof chrome.runtime & { getBrowserInfo?: unknown }).getBrowserInfo === "function";
+  // Firefox's own namespace; the bundled chrome types do not describe it.
+  const firefoxGlobal = globalThis as unknown as { browser?: { webRequest?: ViewerCaptureWebRequest } };
+  const firefoxWebRequest = firefox ? firefoxGlobal.browser?.webRequest : undefined;
   return {
     firefox,
     connectNative: (name) => {
@@ -23222,6 +23385,7 @@ function realDeps(): BridgeDeps {
       sendMessage: (tabID, message) => chrome.tabs.sendMessage(tabID, message),
       onUpdated: { addListener: (cb) => chrome.tabs.onUpdated.addListener(cb) },
       onRemoved: { addListener: (cb) => chrome.tabs.onRemoved.addListener(cb) },
+      onCreated: { addListener: (cb) => chrome.tabs.onCreated.addListener(cb) },
       onActivated: {
         addListener: (cb) => chrome.tabs.onActivated.addListener(cb),
       },
@@ -23320,8 +23484,8 @@ function realDeps(): BridgeDeps {
           },
         }
       : {}),
-    // Chrome only: Firefox keeps the native-save path, and its manifest does
-    // not request the permission.
+    // Chrome only: Firefox uses the stream capture below, and its manifest
+    // does not request the permission.
     ...(!firefox && typeof chrome.declarativeNetRequest?.updateSessionRules === "function"
       ? {
           declarativeNetRequest: {
@@ -23331,6 +23495,11 @@ function realDeps(): BridgeDeps {
               ),
           },
         }
+      : {}),
+    // Firefox only: StreamFilter is Firefox's own `browser.webRequest` API,
+    // and only the Firefox manifest requests webRequest.
+    ...(firefoxWebRequest !== undefined && typeof firefoxWebRequest.filterResponseData === "function"
+      ? { webRequest: firefoxWebRequest }
       : {}),
     downloads: {
       removeFile: (downloadID) => chrome.downloads.removeFile(downloadID),

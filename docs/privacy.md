@@ -201,8 +201,11 @@ configured library session while a paper is waiting for sign-in, or report a
 result to the local application. For example, `nativeMessaging` reaches the
 local daemon, `downloads` saves the requested PDF, `activeTab` permits the
 top-frame scan only after you click it, and host permissions allow the
-extension to read the relevant library and publisher pages. The extension
-store listing explains each permission in detail.
+extension to read the relevant library and publisher pages. On Firefox only,
+`webRequest`, `webRequestBlocking` and `webRequestFilterResponse` let the
+extension keep a copy of a publisher's one-time PDF response in a tab *papio*
+opened for a paper, and save it to your download folder; the bytes do not leave
+your computer. The extension store listing explains each permission in detail.
 
 ## Third parties
 

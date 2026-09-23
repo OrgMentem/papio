@@ -119,11 +119,20 @@ async function buildAll(): Promise<void> {
   // window at runtime, so a lower strict_min_version stays compatible.
   firefoxManifest.background = { scripts: ["dist/background.js"] };
   // declarativeNetRequestWithHostAccess serves only Chrome's signed-viewer
-  // download rules (src/viewer-download-rule.ts). Firefox keeps the
-  // native-save path and never installs them, so it does not ask for it.
-  firefoxManifest.permissions = (chromeManifest.permissions as string[]).filter(
-    (permission) => permission !== "declarativeNetRequestWithHostAccess",
-  );
+  // download rules (src/viewer-download-rule.ts), so Firefox does not ask for
+  // it. Firefox instead keeps a copy of that signed viewer response in
+  // papio's armed handoff tabs with a StreamFilter and saves it under the job
+  // (src/viewer-stream-capture.ts). That needs a blocking onHeadersReceived
+  // listener and filterResponseData, which Chrome has no equivalent of, so
+  // these three permissions are Firefox-only.
+  firefoxManifest.permissions = [
+    ...(chromeManifest.permissions as string[]).filter(
+      (permission) => permission !== "declarativeNetRequestWithHostAccess",
+    ),
+    "webRequest",
+    "webRequestBlocking",
+    "webRequestFilterResponse",
+  ];
   firefoxManifest.browser_specific_settings = {
     gecko: {
       id: "papio@orgmentem.com",

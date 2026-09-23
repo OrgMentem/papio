@@ -16,6 +16,22 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Added
+- **Firefox saves a publisher's one-time PDF link itself.** Some publishers,
+  such as ScienceDirect, send a signed PDF only once: a second request returns
+  a web page. In a tab *papio* opened for a paper, Firefox now keeps a copy of
+  that PDF as the viewer receives it and saves it into the paper's `papio`
+  download folder. The viewer still shows the PDF, the link is not requested a
+  second time, and no helper program is needed. If the copy is incomplete, or
+  the PDF opened before *papio* was watching the tab, *papio* saves nothing
+  and asks you to use the viewer's **Download** button instead. That notice no
+  longer tells you to open the PDF in Chrome.
+- **New Firefox-only permissions: `webRequest`, `webRequestBlocking` and
+  `webRequestFilterResponse`.** They let the extension read the one PDF
+  response in *papio*'s own handoff tabs. The bytes go only to the local
+  `papio` download folder and never leave your computer. Chrome keeps its
+  existing download rule and asks for no new permission.
+
 ## [0.15.0] - 2026-09-23
 
 ### Added

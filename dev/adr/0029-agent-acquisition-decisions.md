@@ -130,3 +130,26 @@ regression, which must also refuse a different DOI. It is a label for an article
 page only: it does not identify the control the fallback used. Promotion needs a
 fresh model-free canary whose validated artifact matches the recovery; `canary.md`
 in the workspace gives the procedure with the agent fallback disabled.
+
+Firefox signed-viewer capture amendment (2026-09-24): the operator rejected the
+OS helper apps (the macOS Accessibility helper and the Windows UI Automation
+helper that press the PDF viewer's Save control) because their install and
+maintenance cost falls on every Firefox user. Firefox instead saves a signed
+viewer's PDF inside the extension. In a handoff tab papio armed for a delegated
+job (the same armed-tab set as Chrome's declarativeNetRequest rules), a blocking
+`webRequest.onHeadersReceived` listener attaches a StreamFilter to the one PDF
+response. Every chunk passes to the viewer unchanged, and the extension keeps a
+copy. When the copy starts with `%PDF-` and, for an unencoded body, matches its
+Content-Length, `downloads.download` saves it from an object URL under
+`papio/<job>/`, and the daemon adopts and validates it as for any browser
+download. The signed URL is never requested a second time. A failed or
+incomplete capture reports the existing `native_viewer_download_required`
+outcome with its reason. The new Firefox-only permissions are `webRequest`,
+`webRequestBlocking` and `webRequestFilterResponse`. The helper code and its
+protocol messages stay until a later cutover removes them; the capture takes
+precedence where both apply.
+
+Residual gap: the capture sees only a response that arrives after papio armed
+the tab. A PDF opened before that, or on a host papio has no access to, has
+already spent its one response. The viewer's own Download button can still keep
+a copy, but Firefox gives papio no way to file that download.

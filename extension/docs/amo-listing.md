@@ -89,14 +89,16 @@ that manifest key is honored from Firefox 140, `web-ext lint` emits a benign
 | `scripting` | Required | Runs a small content routine on the requested provider page to locate its download link, on a configured library resolver to check session indicators while a paper waits for sign-in, on the current page when the user explicitly starts a scan, and on the acted-on page to draw a three-second confirmation. It reads only what those tasks need. |
 | `storage` | Required | Stores extension settings and short-lived job/tab correlation state across MV3 suspension. An active institutional job can retain one configured bare resolver origin and one pending-session-check reason; it never stores the publisher landing or identity-provider data. |
 | `alarms` | Required | Schedules reconnect backoff and bounded resolver keepalive checks without keeping the event page awake continuously. |
+| `webRequest`, `webRequestBlocking`, `webRequestFilterResponse` | Required | *(New in the next version.)* Some publishers (ScienceDirect's `pdf.sciencedirectassets.com`, and links carrying a signed credential) serve a PDF only once; a second request returns HTML. In a tab *papio* itself opened for a requested paper, a blocking `onHeadersReceived` listener attaches `filterResponseData` to that one PDF response. Every chunk passes to the PDF viewer unchanged; the extension keeps a copy and saves it with `downloads.download` into the local `papio/<job>/` download folder, where the local daemon validates it. The listener returns immediately for every other tab and response: it acts only on a status-200 PDF response on those signed hosts, in *papio*'s own handoff tabs and the tabs they open. It never modifies, blocks or redirects a request, never requests the URL again, and sends no bytes, headers or URLs off the machine. |
 | `host_permissions`: `*.alma.exlibrisgroup.com`, `*.primo.exlibrisgroup.com` | Required host access | Reads the configured library discovery/resolver surface to route a requested paper and to check that resolver session while the paper is waiting for sign-in. The session check reads that page's visible affordances and its browser-storage entries, and returns only a signed-in/signed-out/unknown classification. |
 | `host_permissions`: `login.openathens.net` | Required host access | Recognises the OpenAthens sign-in step of a federated route papio itself opened, so it can tell a login wall from a delivered file. It reads that page only to classify it and returns a fixed outcome. |
 | `optional_host_permissions`: jstor.org, proquest.com, ebsco, springer, sciencedirect, dl.acm.org, wiley, tandfonline, sagepub, psycnet.apa.org | Optional host access (runtime opt-in) | Publisher/provider sites where a licensed PDF may live. Firefox prompts for each domain only when a job actually needs it; none are granted at install. |
 | `optional_host_permissions`: `https://*/*` | Optional host access (runtime opt-in) | Some libraries run their OpenURL resolver on a custom domain (e.g. `onesearch.library.<uni>.edu.au`) outside the Ex Libris hosts above. This pattern is **never granted at install and never requested in bulk**: *papio* only ever calls `permissions.request` for the exact resolver origin the user configured in their local daemon (`[browser] openurl_base_url`), so the effective grant is that one host. It exists so any institution works without hard-coding its domain in the extension. |
 
-**Note to reviewer (0.7.0):** this is the first version to request `tabGroups`
-(see the row above); every other permission has already been reviewed and
-approved in a prior version.
+**Note to reviewer (next version):** this version adds `webRequest`,
+`webRequestBlocking` and `webRequestFilterResponse` (see the row above).
+Every other permission has already been reviewed and approved in a prior
+version; `tabGroups` was new in 0.7.0.
 
 ## Reviewer notes and build instructions
 

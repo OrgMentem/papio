@@ -145,6 +145,8 @@ export class ChromeTabsFake {
   readonly onUpdated = new FakeEmitter<[number, TabChangeInfo, FakeTab]>();
   readonly onRemoved = new FakeEmitter<[number, { isWindowClosing: boolean }]>();
   readonly onActivated = new FakeEmitter<[{ tabId: number; windowId: number }]>();
+  /** Never emitted by `create`; a test emits it where the order matters. */
+  readonly onCreated = new FakeEmitter<[FakeTab]>();
   readonly created: TabCreateProperties[] = [];
   readonly removed: number[] = [];
   readonly grouped: {

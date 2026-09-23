@@ -68,8 +68,18 @@ which lists every filed paper.
 ## PDF viewers that need a manual download
 
 Some providers display a PDF but return HTML when its signed URL is fetched again.
-For these viewers, papio keeps the PDF open and asks you to choose **Send this PDF**,
-then use the viewer’s **Download** button. On Firefox, open the PDF in Chrome first,
+In a tab that *papio* opened for a paper, the browser saves that one response
+for you. Chrome turns the response into a download into the job's folder. Firefox
+keeps a copy of the PDF while its viewer shows it, then saves the copy into the
+job's folder. Neither browser asks the publisher for the file a second time. The
+daemon validates the saved file before it marks the job ready.
+
+If that cannot happen, *papio* keeps the PDF open and asks you to use the
+viewer's **Download** button. This occurs when the PDF opened before *papio*
+armed the tab, when *papio* has no access to the PDF's host, or when the
+response did not arrive complete. On Chrome, choose **Send this PDF** first, so
+that *papio* can adopt the file. Firefox gives an extension no way to adopt a
+download it did not start, so on Firefox the button only keeps your own copy,
 unless you use the experimental
 [macOS helper](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental),
 which saves the PDF that Firefox already shows.
@@ -270,6 +280,14 @@ whose content type is PDF, and are removed when the job has its download or
 ends. Chrome applies them only on hosts *papio* already has access to, and
 the permission adds no install warning. The rules need Chrome 128 or later;
 Firefox does not request this permission.
+On Firefox, `webRequest`, `webRequestBlocking`, and `webRequestFilterResponse`
+do the same job in a different way, and Chrome does not request them. For the
+same tabs and the same signed PDF responses, *papio* reads the response as it
+arrives, passes every byte to the viewer unchanged, and saves a copy into the
+job's folder with the `downloads` permission. The listener returns at once for
+every other response. It does not change, block, or redirect a request, and
+Firefox reports responses to it only on hosts *papio* already has access to.
+The PDF bytes go only to your download folder.
 
 Host access splits into two tiers. Three host permissions are required and
 granted at install on Chrome: `https://*.alma.exlibrisgroup.com/*` and

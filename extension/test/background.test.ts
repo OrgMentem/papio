@@ -87,6 +87,7 @@ import type { SurfaceCloseDisposition } from "../src/surface-lifecycle";
 import type { NativeRequestResult } from "../src/correlation";
 import { routeResolverService } from "../src/resolver";
 import { VIEWER_DOWNLOAD_RULE_IDS, type ViewerDownloadRule } from "../src/viewer-download-rule";
+import type { StreamFilterLike, ViewerCaptureWebRequest, ViewerHeadersDetails } from "../src/viewer-stream-capture";
 import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { FakeDownloads } from "./fake-downloads";
 import {
@@ -802,6 +803,7 @@ function makeHarness(
     tabs.onUpdated.snapshot(),
     tabs.onRemoved.snapshot(),
     tabs.onActivated.snapshot(),
+    tabs.onCreated.snapshot(),
     downloads.onCreated.snapshot(),
     downloads.onChanged.snapshot(),
     downloads.onDeterminingFilename?.snapshot(),
@@ -10112,6 +10114,298 @@ test("Firefox installs no viewer rules and keeps the native-save notice", async 
   expect(rules.calls).toEqual([]);
   expect(h.downloads.started).toEqual([]);
   expect(notices().map(f => f.payload["detail"])).toEqual([undefined]);
+});
+
+/** Firefox's webRequest with StreamFilter as papio sees it: the listeners it
+ * registered, and one filter per request it asked to filter. A test drives
+ * the response through `respond`, then each filter's chunks and end. */
+class FakeStreamFilter implements StreamFilterLike {
+  ondata: ((event: { data: ArrayBuffer }) => void) | null = null;
+  onstop: ((event: unknown) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+  error = "";
+  /** What the viewer received, in order. */
+  readonly written: ArrayBuffer[] = [];
+  closed = false;
+  write(data: ArrayBuffer): void {
+    this.written.push(data);
+  }
+  close(): void {
+    this.closed = true;
+  }
+  deliver(bytes: Uint8Array): void {
+    this.ondata?.({ data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer });
+  }
+  stop(): void {
+    this.onstop?.({});
+  }
+  fail(error: string): void {
+    this.error = error;
+    this.onerror?.({});
+  }
+  viewerBytes(): Uint8Array {
+    return new Uint8Array(Buffer.concat(this.written.map(chunk => new Uint8Array(chunk))));
+  }
+}
+
+class FakeWebRequest implements ViewerCaptureWebRequest {
+  readonly listeners: {
+    callback: (details: ViewerHeadersDetails) => Record<string, never> | Promise<Record<string, never>>;
+    filter: { urls: string[]; types: string[] };
+    extraInfoSpec: string[];
+  }[] = [];
+  readonly filters = new Map<string, FakeStreamFilter>();
+  readonly onHeadersReceived: ViewerCaptureWebRequest["onHeadersReceived"] = {
+    addListener: (callback, filter, extraInfoSpec) => {
+      this.listeners.push({ callback, filter, extraInfoSpec });
+    },
+  };
+  filterResponseData(requestId: string): FakeStreamFilter {
+    const filter = new FakeStreamFilter();
+    this.filters.set(requestId, filter);
+    return filter;
+  }
+  /** Headers of a top-level response, as Firefox would report them. */
+  async respond(details: { requestId: string; url: string; tabId: number; statusCode?: number; headers?: Record<string, string> }): Promise<void> {
+    const event: ViewerHeadersDetails = {
+      requestId: details.requestId, url: details.url, tabId: details.tabId, statusCode: details.statusCode ?? 200,
+      responseHeaders: Object.entries(details.headers ?? { "Content-Type": "application/pdf" }).map(([name, value]) => ({ name, value })),
+    };
+    for (const listener of this.listeners) expect(await listener.callback(event)).toEqual({});
+  }
+}
+
+const CAPTURE_LIMIT = 100 * 1024 * 1024;
+const SIGNED_PDF = new TextEncoder().encode("%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+
+/** Two delegated ScienceDirect handoffs on a Firefox with the stream capture. */
+async function captureHarness(opts: { chrome?: boolean; hostGranted?: boolean; clickAdapter?: boolean } = {}) {
+  const job = (jobID: string, tabID: number): ActiveJob => ({
+    job_id: jobID, tab_id: tabID, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
+    status: "auth_pending", provider_hosts: ["www.sciencedirect.com"], access_mode: "delegated",
+    download_initiated: true, expected: { doi: `10.1234/${jobID}` },
+    ...(opts.clickAdapter === true ? { adapter_id: "sciencedirect" } : {}),
+  });
+  const h = makeHarness({ ...emptyStore(), activeJobs: [job("job_rule_a", 100), job("job_rule_b", 200)] },
+    opts.chrome === true ? undefined : { firefox: true });
+  const web = new FakeWebRequest();
+  h.deps.webRequest = web;
+  const rules = new FakeSessionRules();
+  // ScienceDirect's click adapter: Firefox leaves its View PDF click to the operator.
+  if (opts.clickAdapter === true) h.deps.adapterSpecs = adapters;
+  if (opts.chrome === true) h.deps.declarativeNetRequest = rules;
+  const objectURLs = { blobs: new Map<string, Blob>(), revoked: [] as string[] };
+  h.deps.objectURLs = {
+    create: (blob) => {
+      const href = `blob:moz-extension://papio/${objectURLs.blobs.size + 1}`;
+      objectURLs.blobs.set(href, blob);
+      return href;
+    },
+    revoke: (href) => {
+      objectURLs.revoked.push(href);
+    },
+  };
+  h.deps.permissions.contains = async ({ origins }) =>
+    opts.hostGranted !== false && origins[0] === "https://pdf.sciencedirectassets.com/*";
+  h.tabs.seed({ id: 100, url: "https://www.sciencedirect.com/science/article/pii/A" });
+  h.tabs.seed({ id: 200, url: "https://www.sciencedirect.com/science/article/pii/B" });
+  await h.bridge.start();
+  await h.port.onMessage.emit(helloAck({ daemon_version: CURRENT_DAEMON, features: ["native_viewer_download_v1"] }));
+  await settle();
+  const notices = () => h.frames().filter(f =>
+    (f.type === "provider_outcome" && f.payload["outcome"] === "native_viewer_download_required") ||
+    (f.type === "error" && f.payload["code"] === "native_viewer_download_required"));
+  const pdfHeaders = (length: number = SIGNED_PDF.byteLength): Record<string, string> =>
+    ({ "Content-Type": "application/pdf", "Content-Length": String(length) });
+  return { h, web, rules, objectURLs, notices, pdfHeaders };
+}
+
+test("Firefox saves an armed tab's signed viewer response once, from a copy of the bytes the viewer received", async () => {
+  const { h, web, objectURLs, notices, pdfHeaders } = await captureHarness();
+  expect(web.listeners.map(l => [l.filter, l.extraInfoSpec])).toEqual([
+    [{ urls: ["https://*/*"], types: ["main_frame", "sub_frame"] }, ["blocking", "responseHeaders"]],
+  ]);
+  await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 200, headers: pdfHeaders() });
+  expect([...web.filters.keys()]).toEqual(["r1"]);
+  const filter = web.filters.get("r1")!;
+  filter.deliver(SIGNED_PDF.subarray(0, 20));
+  filter.deliver(SIGNED_PDF.subarray(20));
+  filter.stop();
+  await settle();
+  // The viewer keeps working: it received every byte, unchanged.
+  expect(filter.viewerBytes()).toEqual(SIGNED_PDF);
+  expect(filter.closed).toBe(true);
+  // One extension download, from an object URL, under job B's binding. The
+  // signed URL itself is never downloaded.
+  expect(h.downloads.started).toEqual([{
+    url: "blob:moz-extension://papio/1", filename: "papio/job_rule_b/paper.pdf", conflictAction: "uniquify", saveAs: false,
+  }]);
+  expect(new Uint8Array(await objectURLs.blobs.get("blob:moz-extension://papio/1")!.arrayBuffer())).toEqual(SIGNED_PDF);
+  expect(objectURLs.revoked).toEqual([]);
+  // The viewer's own load event does not start anything else.
+  await h.tabs.completeNavigation(200, SIGNED_VIEWER);
+  await settle();
+  // A second response in the same tab finds the attempt spent.
+  await web.respond({ requestId: "r2", url: SIGNED_VIEWER, tabId: 200, headers: pdfHeaders() });
+  expect([...web.filters.keys()]).toEqual(["r1"]);
+  const id = 901;
+  h.downloads.items.set(id, { id, url: "blob:moz-extension://papio/1", state: "complete", mime: "application/pdf",
+    filename: "/Downloads/papio/job_rule_b/paper.pdf", fileSize: SIGNED_PDF.byteLength });
+  await h.downloads.onChanged.emit({ id, state: { current: "complete" } });
+  expect(h.frames().filter(f => f.type === "download_complete").map(f => [f.job_id, f.payload["filename"]]))
+    .toEqual([["job_rule_b", "paper.pdf"]]);
+  expect(objectURLs.revoked).toEqual(["blob:moz-extension://papio/1"]);
+  expect(h.downloads.started).toHaveLength(1);
+  expect(notices()).toHaveLength(0);
+  expect(JSON.stringify(h.frames())).not.toContain("private-token");
+});
+
+test("Firefox filters no response outside an armed tab's signed PDF", async () => {
+  const { h, web, pdfHeaders } = await captureHarness();
+  h.tabs.seed({ id: 300, url: "https://www.sciencedirect.com/science/article/pii/C" });
+  await web.respond({ requestId: "unarmed", url: SIGNED_VIEWER, tabId: 300, headers: pdfHeaders() });
+  await web.respond({ requestId: "background", url: SIGNED_VIEWER, tabId: -1, headers: pdfHeaders() });
+  await web.respond({ requestId: "html", url: SIGNED_VIEWER, tabId: 100, headers: { "Content-Type": "text/html; charset=utf-8" } });
+  await web.respond({ requestId: "redirect", url: SIGNED_VIEWER, tabId: 100, statusCode: 302, headers: pdfHeaders() });
+  await web.respond({ requestId: "partial", url: SIGNED_VIEWER, tabId: 100, statusCode: 206, headers: pdfHeaders() });
+  await web.respond({ requestId: "unsigned", url: "https://www.sciencedirect.com/science/article/pii/A/pdf", tabId: 100, headers: pdfHeaders() });
+  expect(web.filters.size).toBe(0);
+  // The one armed attempt is still there for the real response.
+  await web.respond({ requestId: "signed", url: SIGNED_VIEWER, tabId: 100, headers: { "content-type": "application/x-pdf" } });
+  expect([...web.filters.keys()]).toEqual(["signed"]);
+});
+
+for (const failure of ["truncated", "error", "not_pdf"] as const) {
+  test(`Firefox saves nothing from an incomplete capture and asks for the Download button: ${failure}`, async () => {
+    const { h, web, notices, pdfHeaders } = await captureHarness();
+    await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 100,
+      headers: pdfHeaders(failure === "truncated" ? 5_000 : SIGNED_PDF.byteLength) });
+    const filter = web.filters.get("r1")!;
+    if (failure === "not_pdf") {
+      filter.deliver(new TextEncoder().encode("<html>".padEnd(SIGNED_PDF.byteLength, " ")));
+      filter.stop();
+    } else {
+      filter.deliver(SIGNED_PDF);
+      if (failure === "truncated") filter.stop();
+      else filter.fail("Channel redirected");
+    }
+    await settle();
+    expect(filter.written).toHaveLength(1);
+    expect(h.downloads.started).toEqual([]);
+    expect(notices().map(f => [f.job_id, f.payload["detail"]])).toEqual([["job_rule_a", {
+      truncated: `the signed viewer response ended after ${SIGNED_PDF.byteLength} of 5000 bytes`,
+      error: "the signed viewer response failed before papio had the whole PDF",
+      not_pdf: "the signed viewer response was not a PDF",
+    }[failure]]]);
+    expect(h.bridge.deliveryState()).toMatchObject({ state: "failed", job_id: "job_rule_a" });
+    expect(h.backend.store.pendingDelivery?.error).not.toContain("Chrome");
+    // The viewer's load event and a later response change nothing.
+    await h.tabs.completeNavigation(100, SIGNED_VIEWER);
+    await web.respond({ requestId: "r2", url: SIGNED_VIEWER, tabId: 100, headers: pdfHeaders() });
+    await settle();
+    expect(web.filters.size).toBe(1);
+    expect(h.downloads.started).toEqual([]);
+    expect(notices().filter(f => f.job_id === "job_rule_a")).toHaveLength(1);
+  });
+}
+
+test("Firefox compares a decoded body with Content-Length only when the response is not encoded", async () => {
+  const { h, web, pdfHeaders } = await captureHarness();
+  // Firefox hands the filter the decoded body; the header counts wire bytes.
+  await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 100,
+    headers: { ...pdfHeaders(412), "Content-Encoding": "gzip" } });
+  const filter = web.filters.get("r1")!;
+  filter.deliver(SIGNED_PDF);
+  filter.stop();
+  await settle();
+  expect(h.downloads.started.map(d => d.filename)).toEqual(["papio/job_rule_a/paper.pdf"]);
+});
+
+test("Firefox keeps passing a PDF past the capture limit to the viewer and saves nothing", async () => {
+  const { h, web, notices } = await captureHarness();
+  await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 100 });
+  const filter = web.filters.get("r1")!;
+  const chunk = new Uint8Array(4 * 1024 * 1024);
+  chunk.set(SIGNED_PDF);
+  const chunks = CAPTURE_LIMIT / chunk.byteLength + 2;
+  for (let i = 0; i < chunks; i++) filter.ondata?.({ data: chunk.buffer });
+  filter.stop();
+  await settle();
+  expect(filter.written).toHaveLength(chunks);
+  expect(filter.closed).toBe(true);
+  expect(h.downloads.started).toEqual([]);
+  expect(notices().map(f => f.payload["detail"])).toEqual(["the signed viewer PDF is larger than papio's capture limit"]);
+});
+
+test("Firefox arms a tab an armed tab opens as soon as it is created", async () => {
+  const { h, web, notices } = await captureHarness();
+  h.tabs.seed({ id: 101, url: "about:blank", openerTabId: 100 });
+  // Firefox can deliver the child's response before its first onUpdated.
+  await h.tabs.onCreated.emit(h.tabs.snapshot(101)!);
+  await web.respond({ requestId: "child", url: SIGNED_VIEWER, tabId: 101 });
+  const filter = web.filters.get("child")!;
+  filter.deliver(SIGNED_PDF);
+  filter.stop();
+  await settle();
+  expect(h.downloads.started.map(d => [d.url, d.filename])).toEqual([["blob:moz-extension://papio/1", "papio/job_rule_a/paper.pdf"]]);
+  // A tab opened by no armed tab is not armed.
+  h.tabs.seed({ id: 301, url: "about:blank", openerTabId: 999 });
+  await h.tabs.onCreated.emit(h.tabs.snapshot(301)!);
+  await web.respond({ requestId: "stray", url: SIGNED_VIEWER, tabId: 301 });
+  expect(web.filters.has("stray")).toBe(false);
+  expect(notices()).toHaveLength(0);
+});
+
+test("Firefox holds a response that wakes the event page until the armed tabs are known", async () => {
+  const h = makeHarness({ ...emptyStore(), activeJobs: [{
+    job_id: "job_woken", tab_id: 100, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
+    status: "accepted", provider_hosts: ["www.sciencedirect.com"], access_mode: "delegated", download_initiated: true,
+  }] }, { firefox: true });
+  const web = new FakeWebRequest();
+  h.deps.webRequest = web;
+  h.tabs.seed({ id: 100, url: "https://www.sciencedirect.com/science/article/pii/A" });
+  // The response is what woke the page: it arrives before managed state loads.
+  const started = h.bridge.start();
+  const responded = web.respond({ requestId: "wake", url: SIGNED_VIEWER, tabId: 100 });
+  expect(web.filters.size).toBe(0);
+  await Promise.all([started, responded]);
+  expect([...web.filters.keys()]).toEqual(["wake"]);
+});
+
+for (const clickAdapter of [false, true]) {
+  test(`Firefox names a signed viewer that rendered without a capture instead of sending the operator to Chrome: clickAdapter=${clickAdapter}`, async () => {
+    const { h, web, notices } = await captureHarness({ hostGranted: false, clickAdapter });
+    // No response reached the listener: Firefox withholds webRequest events
+    // for a host papio has no access to.
+    await h.tabs.completeNavigation(100, SIGNED_VIEWER);
+    await settle();
+    expect(web.filters.size).toBe(0);
+    expect(h.downloads.started).toEqual([]);
+    expect(notices().map(f => [f.job_id, f.payload["detail"]])).toEqual([["job_rule_a", "viewer host permission missing"]]);
+    expect(h.backend.store.pendingDelivery?.error).not.toContain("Chrome");
+  });
+}
+
+test("Firefox captures the viewer a click adapter's job opens, although it does not click there", async () => {
+  const { h, web, notices } = await captureHarness({ clickAdapter: true });
+  await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 100 });
+  const filter = web.filters.get("r1")!;
+  filter.deliver(SIGNED_PDF);
+  filter.stop();
+  await settle();
+  await h.tabs.completeNavigation(100, SIGNED_VIEWER);
+  await settle();
+  expect(h.downloads.started.map(d => d.filename)).toEqual(["papio/job_rule_a/paper.pdf"]);
+  expect(notices()).toHaveLength(0);
+});
+
+test("Chrome registers no webRequest listener and keeps its viewer rules", async () => {
+  const { h, web, rules, pdfHeaders } = await captureHarness({ chrome: true });
+  expect(web.listeners).toEqual([]);
+  expect(rules.armedTabs()).toEqual([100, 200]);
+  await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 100, headers: pdfHeaders() });
+  expect(web.filters.size).toBe(0);
+  expect(h.downloads.started).toEqual([]);
 });
 
 for (const scenario of ["unrelated", "assisted", "downloaded", "search_failed", "delivery_busy", "restart"] as const) {
