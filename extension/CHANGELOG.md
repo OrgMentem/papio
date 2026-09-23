@@ -18,89 +18,61 @@ for the full pre-split extension history.
 
 ## [0.15.0] - 2026-09-23
 
-### Changed
-- **papio closes the tab of a paper it filed.** The adopted viewer, and any
-  papio tab whose paper is terminal or superseded, now closes, PDF included
-  (operator decision 2026-09-23). Tabs an older version kept as "content" are
-  closed by the next reconcile pass. A pinned tab, or one moved out of papio's
-  group or work window, is never closed; the tab you are looking at is closed
-  later, once you look away. Activating a papio tab no longer hands it over.
-- **A toast offers the closed papers back.** "papio filed the paper and closed
-  its tab." (or "N papers … their tabs.") with **Reopen**, one toast per batch.
-  Reopen reopens them; if the browser slept meanwhile it opens History instead.
-- **Tabs a provider opens from a papio tab are papio's too.** A full-text link
-  or "View PDF" window opened from papio's tab closes with its paper. A tab in
-  papio's group or work window that papio has no record of (including blank
-  "New Tab" tabs) closes once nobody has used it for 30 minutes, unless it is
-  pinned or in front of you.
-
-### Fixed
-- **Page captures no longer carry your IP address.** The capture sanitizer now
-  masks IPv4 and IPv6 addresses in page text and attribute values, and refuses
-  to send a capture if one is left. Elsevier's refusal page prints the reader's
-  address. DOIs, dates, clock times and versions such as `Chrome/153.0.0.0`
-  are kept.
-- **A provider that refuses the browser is no longer reported as adapter
-  drift.** On 2026-09-23 ScienceDirect served Elsevier's "There was a problem
-  providing the content you requested" page instead of four articles. papio
-  read it as an unrecognised page, the article agent stopped with
-  `identity_missing`, and the daemon latched ScienceDirect drift. papio now
-  recognises refusal pages (Elsevier's refusal page, Cloudflare block and
-  rate-limit pages, Akamai "Access Denied", HTTP 429) by their markup first and
-  their text second. A refusal that is still there after 8 seconds pauses that
-  provider for 10 minutes and reports `rate_limited`, so the daemon retries the
-  paper later. A page that clears by itself inside those 8 seconds is not
-  reported. A Cloudflare "Just a moment..." check is still a check you solve.
-- **Nature pages now download, including Nature news items.** Every Nature page
-  shows the same PDF control three times, so the Nature adapter refused every
-  download as ambiguous. Adapter 0.2.0 uses the sidebar control and reads the
-  DOI from `dc.identifier`, which news pages (`10.1038/d41586-…`) also carry.
-- **papio no longer closes your own tabs.** The unrecorded-tab sweep treated
-  every cold tab in papio's work window as papio's, and papio adopts the
-  window that holds its tab group as that work window, which is your own
-  window. The sweep now closes only unrecorded tabs inside papio's tab group.
-- **A redrive no longer leaves the old tab beside the new one.** Opening a
-  surface for a paper now retires that paper's other papio tabs.
-- **The minimized work window's selected tab is no longer treated as in use.**
-  It is closed with its job, which also clears blank "New Tab" tabs a
-  download-only navigation left behind.
-- **A queued handoff whose offer URL is gone is left for the daemon's
-  re-offer, not rejected.** A same-URL re-offer of a queued institutional
-  handoff dropped that job's URL but kept it queued. When the drive slot freed,
-  the drain sent an empty `job_reject` for each such job, and older daemons
-  made that terminal: six papers at once on 2026-09-23. A tabless re-offer now
-  keeps its URL and drives, and a job with no URL (for example after a worker
-  restart) is dropped locally for the daemon to offer again. The extension no
-  longer sends `job_reject`.
-- **A generic PDF link that returns the article's HTML now hands the drive to
-  the article agent.** On a Nature page, the `citation_pdf_url` candidate
-  downloaded HTML, and papio then reported nothing, so the drive held its
-  provider domain until its lease expired. The agent now takes over the same
-  drive and reads the article page. When the agent is unavailable, papio
-  ends the drive with a provider outcome, attributed to the host's adapter
-  when one exists. Every generic result without a successor now ends in one
-  provider outcome.
+### Added
+- **Science (AAAS) adapter.** An entitled `science.org` article downloads its
+  own PDF. The page must show full access, and the PDF link must name the
+  requested DOI. The journal archive page, where some library resolvers send
+  Science titles, stays unknown.
+- **ACS Publications entitled articles can use their primary PDF link.**
+  The adapter checks the page DOI, Subscribed badge, and article PDF control
+  before passing the same-origin link to the browser downloads API. Clicking
+  Open PDF opens a viewer window instead; a live download and PDF validation
+  remain unverified.
+- **Article-agent navigation can save a PDF embedded in a publisher page.**
+  After following an exact same-origin link from a verified article, Papio can
+  download the page's single exposed PDF without requiring citation metadata in
+  the surrounding HTML. It retains the original download attempt and validates
+  the saved file before accepting it. Changed pages, conflicting identity,
+  consent prompts and ambiguous embedded files stop the attempt.
+- **Article-agent identity checks accept a labelled DOI in the article.**
+  Publishers without citation metadata can use a visible DOI field in the main
+  article. Link text and destination must agree; conflicting metadata, reference
+  lists and related-paper sections remain excluded. Identity is checked again
+  before an action.
+- **Skipped article-agent fallback now explains why.** Unknown provider pages
+  report missing backend support, article identity or browser authority, and
+  distinguish attempts that already ran or have a download pending.
+- **Article-agent fallback can follow a same-origin article link.** With a
+  compatible daemon, a selected link can open another document in the same tab.
+  Papio verifies its DOI and transfers the existing download reservation before
+  continuing. The original time and inference budgets remain in force. Unexpected
+  redirects, new tabs and native PDF viewer saving remain unsupported.
+- **Article-agent download menus can render asynchronously.** A plain Download
+  control can reveal a PDF choice without triggering the full download timeout.
+  Local checks wait for that choice without paid model polling, while an actual
+  browser download keeps priority. Fully clipped controls are excluded until
+  visible, and usable acquisition choices rank ahead of disabled controls.
+- **Optional article-agent fallback in Chrome and Firefox.** With a compatible
+  configured daemon, delegated acquisition can select visible controls on
+  DOI-identified articles even when the publisher has no adapter. In-page menus
+  and downloads use fresh document checks and normal download ownership. Human
+  gates remain explicit, and a pending download is given time to appear before
+  parking. Firefox requires a compatible daemon with `native_click_adoption_v1`
+  and an unambiguous download whose original referrer matches the article. The
+  daemon validates the newly downloaded file and preserves the original. For
+  each decision the extension sends the daemon, which asks TypeSafe, only the
+  article's DOI, its metadata title and at most 80 visible controls, each with
+  a role, a redacted label and whether it is disabled. Labels lose web
+  addresses, e-mail addresses, `key=value` pairs and long tokens, and text in
+  headers, navigation, account and login areas and form fields is never read.
+  No URL, page body text, form value or credential is sent.
 - **The article agent waits for a busy sibling instead of calling itself
   stale.** Papers routed through the same library resolver can share one
   provider lease, and all drives share one effect slot. When a sibling drive
   held either one, the agent stopped at once with "page or authority became
-  stale", consumed its attempt, and never asked the daemon to start. Measured
-  on a SAGE Research Methods chapter back from an OpenAthens sign-in hop. The
-  agent now waits for both within its own time budget, and releases the slot
-  while the lease is busy.
-- **Chrome saves a signed PDF viewer's own response instead of fetching it
-  again.** A ScienceDirect or other signed viewer link returns HTML to a second
-  request, so the one-time refetch failed for every ScienceDirect job. On
-  Chrome 128 and later, papio's handoff tabs now download that PDF response
-  into the job's papio folder instead of showing it in the viewer, and the
-  daemon validates it as usual. The rule covers only papio's handoff tabs and
-  the tabs they open, only PDF responses, and only until the job has its
-  download. This adds the `declarativeNetRequestWithHostAccess` permission,
-  which shows no install warning; it acts only on hosts papio can already
-  reach. If the viewer still opens, papio shows the existing Send this PDF /
-  viewer Download instruction with the reason (for example `viewer host
-  permission missing`). An older Chrome keeps the one refetch. Firefox is
-  unchanged and does not request the permission.
+  stale", consumed its attempt, and never asked the daemon to start. The agent
+  now waits for both within its own time budget, and releases the slot while
+  the lease is busy.
 - **The article agent waits for a freshly loaded page before it reads it.**
   A cookie-check or bot shell served just after navigation, as
   pmc.ncbi.nlm.nih.gov does, no longer ends the attempt as `identity_missing`
@@ -112,157 +84,59 @@ for the full pre-split extension history.
   DOI, as SAGE Research Methods pages do; a visible "Chapter DOI:" list item
   now counts as the chapter's identity. The book DOI alone still does not
   prove the chapter, and sibling or unrelated DOIs still refuse the page.
-- **Closing an institutional sign-in tab releases its claim after a drive timeout.**
-  Bringing the tab forward no longer erases the claim identity needed to
-  report its later close, even when the timed-out job has detached from it.
 - **The article agent can use a new-window PDF link.** A same-origin PDF
   anchor with `target="_blank"` receives download intent instead of being
   refused as a new context; other targets stay refused.
-- **Cookie notices no longer stop the article agent.** A cookie or privacy
-  banner is not a consent gate; its buttons are never offered to the model. A
-  notice that also names terms, a licence or credentials still stops the attempt.
+- **Cookie notices do not stop the article agent.** A cookie or privacy banner
+  is not a consent gate; its buttons are never offered to the model. A notice
+  that also names terms, a licence or credentials still stops the attempt.
 - **The article agent treats a `/PDF` route as a PDF link.** A same-origin
   anchor labelled PDF whose path ends in the bare word receives download intent
   instead of being followed as navigation into the viewer.
-- **Timed-out handoffs need page evidence before reporting sign-in.** An offer's
-  `requires_auth` flag alone no longer puts an entitled article or an access
-  denial into `auth_pending`, and neither does a publisher's header "Sign in"
-  link. Only an authentication URL does. Otherwise, *papio* asks the operator
-  to take over without holding the institution's sign-in slot.
-- **Article agents wait for the browser handshake.** A delegated page no longer
-  records lasting adapter drift while its native connection awaits `hello_ack`.
+- **Article agents wait for the browser handshake.** A delegated page does not
+  record lasting adapter drift while its native connection awaits `hello_ack`.
   A browser with the pending role still cannot drive the article.
-- **The browser handshake reports the browser family.** Connected Chrome and
-  Firefox sessions can now be identified by `papio browser sessions`; unknown
-  browsers appear as `-`.
 - **Article URLs can establish DOI identity.** The agent may act on an article
   whose own URL names the requested DOI, even without DOI metadata. A conflicting
   citation still stops it.
-- **Title identity checks ignore typography, not different words.** *papio*
-  accepts matching article titles with sentence punctuation, quote or dash
-  variants, and diacritics. A different title still fails the work check.
-- **JSTOR keeps entitled articles out of the login queue.** A turnaway
-  account offer beside the primary PDF control no longer masks the article
-  and holds an institution sign-in slot.
-- **Closing a sign-in tab releases its materialization claim.** If a provider
-  landing races the tab close, *papio* reports the lost owner instead of an
-  authentication return. Other papers no longer wait on that dead tab's lease.
-
-- **JSTOR recognizes its article identity correctly.** Its download control's
-  `data-doi` is a numeric record ID, not a DOI. Papio now matches the article's
-  title and separately checks that the primary control identifies the same
-  record as the download route. Publisher terms still require consent.
-- **Chrome keepalive survives its initial blank page loading.** Papio records
-  its newly created tab while `about:blank` is pending, then opens the institution
-  and schedules refreshes. A tab navigating elsewhere is still refused.
-- **The popup no longer mistakes a hidden institution row for successful sign-in.**
-  If a waiting paper cannot be mapped to an institution, Papio reports that
-  sign-in is unconfirmed and keeps the paper's Open action available. The
-  signed-in summary requires fresh evidence for every configured institution.
-- **Institution keepalive recovers its own sign-in tab after a worker restart.**
-  Papio records tab ownership before navigation, so unpinning or redirecting
-  through an identity provider no longer loses the tab. Returning from sign-in
-  resumes refreshes. Tabs without an ownership record remain untouched.
-- **Duo push prompts remain part of sign-in.** A prompt without a login path
-  no longer becomes an unsupported-publisher failure or consumes an article-agent
-  attempt. Papio waits for the authentication flow to return.
+- **Article-agent decisions tolerate a page finishing its render.** If controls
+  change during inference, Papio takes a fresh observation before clicking,
+  within the same time and decision limits. It never repeats a dispatched click.
 - **Chrome adopts agent downloads that omit a tab ID.** Downloads after an
   article-agent navigation now match the exact page referrer, dispatch time and
   current document binding, including publishers with no adapter. Ambiguous or
   expired matches are refused.
-- **Article-agent decisions tolerate a page finishing its render.** If controls
-  change during inference, Papio takes a fresh observation before clicking,
-  within the same time and decision limits. It never repeats a dispatched click.
-- **Chrome institution keepalive creates its tab again.** Papio now creates
-  the pinned tab before muting it, using the operations Chrome supports. A
-  failed mute removes only the new tab so retries do not leave duplicates.
-- **Queued article pages wait for their browser drive.** A page that finishes
-  loading while another paper owns the drive no longer becomes an adapter
-  failure. When its turn arrives, Papio checks the current page without
-  navigating again, including publishers with no adapter.
-
-- **A declined sign-in observation no longer stops the drive.** When the
-  daemon answers a `claim_observation auth_returned` or `entitled_landing`
-  with `rejected` or `stale`, the extension now classifies the bound tab's
-  current page under the still-valid claim instead of dropping the entry
-  silently. After a return the tab is standing on the provider, so the
-  landing is assessed (and downloaded under the existing authority gates)
-  regardless of whether the sign-in bookkeeping accepted the observation.
-
-### Added
-- **Science (AAAS) adapter.** An entitled `science.org` article downloads its
-  own PDF. The page must show full access, and the PDF link must name the
-  requested DOI. The journal archive page, where the institution's resolver
-  sends Science titles, stays unknown.
-- **ACS Publications entitled articles can use their primary PDF link.**
-  The adapter checks the page DOI, Subscribed badge, and article PDF control
-  before passing the same-origin link to the browser downloads API. Clicking
-  Open PDF opens a viewer window instead; a live download and PDF validation
-  remain unverified.
-
-- **Article-agent navigation can save a PDF embedded in a publisher page.**
-  After following an exact same-origin link from a verified article, Papio can
-  download the page's single exposed PDF without requiring citation metadata in
-  the surrounding HTML. It retains the original download attempt and validates
-  the saved file before accepting it. Changed pages, conflicting identity,
-  consent prompts and ambiguous embedded files stop the attempt.
-
-- **Article-agent identity checks accept a labelled DOI in the article.**
-  Publishers without citation metadata can use a visible DOI field in the main
-  article. Link text and destination must agree; conflicting metadata, reference
-  lists and related-paper sections remain excluded. Identity is checked again
-  before an action.
-
-- **Skipped article-agent fallback now explains why.** Unknown provider pages
-  report missing backend support, article identity or browser authority, and
-  distinguish attempts that already ran or have a download pending.
-
-- **Article-agent fallback can follow a same-origin article link.** With a
-  compatible daemon, a selected link can open another document in the same tab.
-  Papio verifies its DOI and transfers the existing download reservation before
-  continuing. The original time and inference budgets remain in force. Unexpected
-  redirects, new tabs and native PDF viewer saving remain unsupported.
-
-- **Article-agent download menus can render asynchronously.** A plain Download
-  control can reveal a PDF choice without triggering the full download timeout.
-  Local checks wait for that choice without paid model polling, while an actual
-  browser download keeps priority. Fully clipped controls are excluded until
-  visible, and usable acquisition choices rank ahead of disabled controls.
-
-- **Optional article-agent fallback in Chrome and Firefox.** With a compatible configured
-  daemon, delegated acquisition can select visible controls on DOI-identified
-  articles even when the publisher has no adapter. In-page menus and downloads
-  use fresh document checks and normal download ownership. Human gates remain
-  explicit, and a pending download is given time to appear before parking.
-  Firefox requires a compatible daemon with `native_click_adoption_v1` and an
-  unambiguous download whose original referrer matches the article. The daemon
-  validates the newly downloaded file and preserves the original.
-
+- **Article-agent fallback can download explicit same-origin PDF links.** It
+  clicks the original publisher link with temporary download intent. Firefox
+  still requires an exact browser download, adoption and PDF validation before
+  reporting success.
+- **Article-agent choices use the control's own label.** Unnamed controls do
+  not inherit unrelated download headings. Standard article titles and relevant
+  controls survive the observation limit, and unchanged pages are rechecked
+  without another paid decision or repeated click.
+- **Article-agent fallback recognizes standard DOI metadata and explains refusals.**
+  Dublin Core and PRISM identifiers can establish an exact article match;
+  conflicting DOI claims still stop the attempt. Missing identity, changed pages,
+  sign-ins, challenges and consent gates now have distinct explanations.
 - **IOS Press ebooks open-access articles can download through their own PDF
   form.** The adapter checks the page DOI, license marker and scoped form
-  control before clicking. A fresh Chrome probe downloaded and validated the
-  correct five-page paper without an Open action or manual PDF click.
-
+  control before clicking.
 - **Figshare records can report that their files are not public.** The adapter
   recognizes the captured unavailable-file status heading and lets papio try
   another route. It does not treat that message as missing adapter support or
   proof that institutional access is unavailable. It adds no download route.
-
 - **ChemRxiv preprints have a version-specific PDF route.** The adapter uses
   the primary self-citation DOI and rendered article toolbar, even when
   `citation_doi` metadata is absent. It refuses a different preprint version,
   the published article’s DOI, and supplementary files.
-
 - **Oxford Academic chapters have a rendered PDF route.** After institutional
   sign-in, the adapter recognizes the chapter PDF control as well as journal
   PDF controls. PDF metadata alone does not establish access; login walls and
   mismatched titles still refuse a download.
-
 - **Europe PMC article pages have a fixture-backed download route.** The
   extension uses the rendered Open PDF control and constructs the file URL
   only when the requested DOI and the page's PMCID metadata agree with the
   article route. It checks that identity again before the download.
-
 - **Losing a tab *papio* opened now offers to bring it back.** A small *papio*
   window appears for eight seconds with one button: `Reopen now` for a route
   *papio* can resume, or `Open a new sign-in tab` when the close ended your
@@ -299,7 +173,21 @@ for the full pre-split extension history.
   taken. Neither now appears in the captured copy. The message you are looking
   at is left alone: the capture works from its own copy of the page, so it can
   never cancel an offer you are reading.
-- **A publisher sign-in can now refresh the matching library-session check.** While a paper is waiting for sign-in, a completed HTTPS navigation on its declared publisher host asks *papio* to check the configured library resolver again. The new publisher trigger reads no page content and never sets the popup verdict; a tracked *papio* tab can still use its existing, job-scoped return evidence to release same-institution work. Other hosts, queued-only work, and ambiguous institutions do not authorize the trigger. A paper stored before this release carries no institution binding; it is bound only when its declared publishers match exactly one configured library, and stays unbound otherwise. An inconclusive resolver check now says what could not be verified instead of repeating an older claim. The binding survives a sleeping extension without storing the landing URL. When a resolver grant is missing in either browser, the card offers **Allow** for that institution only; granting it rechecks only while matching work or a tracked return is pending.
+- **A publisher sign-in can now refresh the matching library-session check.**
+  While a paper is waiting for sign-in, a completed HTTPS navigation on its
+  declared publisher host asks *papio* to check the configured library resolver
+  again. The new publisher trigger reads no page content and cannot set the
+  popup verdict itself (only the resolver check it schedules can); a tracked
+  *papio* tab can still use its existing, job-scoped return evidence to release
+  same-institution work. Other hosts, queued-only work, and ambiguous
+  institutions do not authorize the trigger. A paper stored before this release
+  carries no institution binding; it is bound only when its declared publishers
+  match exactly one configured library, and stays unbound otherwise. An
+  inconclusive resolver check now says what could not be verified instead of
+  repeating an older claim. The binding survives a sleeping extension without
+  storing the landing URL. When a resolver grant is missing in either browser,
+  the card offers **Allow** for that institution only; granting it rechecks
+  only while matching work or a tracked return is pending.
 - **Cochrane reviews now download by themselves.** Every PDF button on a
   Cochrane review page, and the page's own PDF metadata, points at a viewer
   page rather than at the file, so *papio* had no route there and asked you to
@@ -313,7 +201,44 @@ for the full pre-split extension history.
   **Select papers on this page** click is the consent for that one explicit,
   top-frame scan. The scanner has no standing site list, no background watcher,
   and no network path: identifiers go only to your local *papio* app.
-- **Sending a DOI-less PDF asks which paper it belongs to instead of asking you to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI correlation exists, the popup now shows *Which paper is this?* over the list of papers still awaiting a download — the inbox **Open** step is gone, and **Open** in the inbox is now a plain link. Picking a paper binds those bytes to that job alone; there is no ambient pin that a DOI-less PDF in another tab could borrow. **Send PDF** keeps joining by the current tab, then a unique page DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is still identified from the file rather than from whichever row was opened last.
+- **Sending a DOI-less PDF asks which paper it belongs to instead of asking you
+  to pre-pick one.** When you click **Send PDF** and no exact tab or page-DOI
+  correlation exists, the popup now shows *Which paper is this?* over the list
+  of papers still awaiting a download, and the inbox **Open** step no longer
+  pre-picks a paper for **Send PDF**. Picking a paper binds those bytes to that
+  job alone; there is no ambient pin that a DOI-less PDF in another tab could
+  borrow. **Send PDF** keeps joining by the current tab, then a unique page
+  DOI, before it ever consults a pick, so a DOI-less PDF opened elsewhere is
+  still identified from the file rather than from whichever row was opened
+  last.
+
+  A pick is checked against the page the browser reports for the live tab, and
+  a reload, a navigation, a replaced tab or age ends it. Finishing or removing
+  a delivery revokes any open list that named that paper. *papio* stores only
+  the origin and path of the PDF's address, so no signed link is written to
+  extension storage. If the extension worker restarted before you picked, the
+  popup asks for a fresh list once, and a send that a restart interrupted is
+  reconciled at startup. After an extension reload or a browser restart,
+  *papio* rebuilds the list from the daemon's open manual-download tasks; this
+  never opens tabs or starts downloads. On Firefox, a viewer PDF that needs its
+  own **Download** button can be saved only through the daemon's native helper;
+  without it, *papio* says to open that PDF in Chrome.
+- **Firefox can save an open PDF through the daemon's experimental native
+  helper.** On macOS, with a daemon that has `browser.native_viewer_helper` set
+  to a helper you build yourself, *papio* saves the PDF that Firefox's viewer
+  already shows instead of asking you to download it by hand. This happens when
+  a handoff lands on a viewer that needs its own **Download** button, and when
+  you choose **Send this PDF** or pick the PDF's paper. The saved file must
+  pass the daemon's normal PDF and identity checks. *papio* starts one save for
+  a paper and never repeats it on its own; an interrupted save asks you to
+  check the paper in *papio*. This needs Firefox 153 or newer. Without the
+  helper, Firefox still says to open such a PDF in Chrome.
+- **The inbox asks which paper a parked PDF is, and lists the likely ones.**
+  For a captured PDF that *papio* could not file, the inbox row used to print a
+  `papio grabs identify` command for you to run. It now lists the papers you
+  are waiting for, best match first, with the evidence for each, and one click
+  files the PDF against the paper you choose. With a daemon that cannot rank
+  captures, the row keeps the old guidance.
 - **A development build of *papio* can now reload itself from disk on the
   daemon's command.** Building the extension used to end with a manual click on
   Chrome's **Reload** button, and a click on that button reports success even
@@ -324,27 +249,404 @@ for the full pre-split extension history.
   command unless the browser reports it as an unpacked development load, where
   a reload genuinely re-reads the files. Nothing about browsing, acquiring, or
   signing in changes.
-
 - **Institution keep-warm now has an explicit always-on mode.** The Options
   page now separates **While papio has work**, **Always for current library**,
   and **Off**. The existing behavior remains the default. The always-on mode
   keeps the configured resolver warm between acquisition batches, while Off
   stops automatic resolver checks.
 
-### Fixed
+### Changed
+- ***papio* asks for new permissions, and uses each one only for its own
+  work.** `webNavigation` lets *papio* see top-frame navigation events: a
+  navigation that failed on a tab *papio* opened, a tab the browser replaced,
+  and whether the PDF you picked a paper for is still the same page. It reads
+  no page content. Chrome shows no new warning, because the `tabs` permission
+  already covers it; Firefox asks you to allow "Access browser activity during
+  navigation" when it updates. `declarativeNetRequestWithHostAccess` (Chrome
+  only, no warning) saves a signed PDF viewer's response, as described under
+  Fixed. `figshare.com` and `chemrxiv.org` join the optional site list for
+  their new adapters; *papio* asks for them only when you allow that site, so
+  installing or updating shows no prompt.
+- **papio closes the tab of a paper it filed.** The adopted viewer, and any
+  papio tab whose paper is terminal or superseded, now closes, PDF included.
+  Tabs an older version kept as "content" are closed by the next reconcile
+  pass. A pinned tab, or one moved out of papio's group or work window, is
+  never closed; the tab you are looking at is closed later, once you look away.
+  Activating a papio tab no longer hands it over.
+- **A toast offers the closed papers back.** "papio filed the paper and closed
+  its tab." (or "N papers … their tabs.") with **Reopen**, one toast per batch.
+  Reopen reopens them; if the browser slept meanwhile it opens History instead.
+- **Tabs a provider opens from a papio tab are papio's too.** A full-text link
+  or "View PDF" window opened from papio's tab closes with its paper. A tab in
+  papio's tab group that papio has no record of (including blank "New Tab"
+  tabs) closes once nobody has used it for 30 minutes, unless it is pinned or
+  in front of you. Tabs outside papio's group are never swept.
+- **Acquiring the page you are on is a `+` in the popup's header.** It appears
+  beside the settings icon whenever the current tab has a paper to add and
+  nothing already running for it, carries the accent it had as a button, and
+  names the exact target — DOI included — on hover, on keyboard focus, and to
+  assistive technology. The bordered card it used to live in cost 58px to hold
+  one control saying almost nothing, and now appears only when there is
+  something to report: a refusal and its remedy, a *which paper is this?*
+  choice, or an acquisition in progress. Clicking the icon hands the action
+  straight back to that card, so the two are never both live. `Enter` still
+  activates it, and **Select papers on this page** keeps its full label.
+- **The popup header shows how many decisions wait for you, and one add button
+  does every add.** The inbox button now sits beside the *papio* name and
+  carries the decision count. It follows the toolbar's count setting, including
+  **No number**, and the exact number is in its label. The add button always
+  acts on the first click; when the page also offers all its papers, a small
+  arrow beside it opens **Add all papers in this tab**. Adding a paper *papio*
+  already has now says **Already in papio** or **papio already has a validated
+  artifact**, instead of always **Added to papio**.
+- **The popup spends its space on the action, not the explanation twice.**
+  A single browser blocker now occupies one compact row under **Do this in the
+  browser**; its explanation stays on the control for hover and assistive
+  technology instead of being printed again below the same heading. The
+  decision count is no longer repeated in both the pulse and its button, the
+  batch summary remains available in the pulse's accessible detail rather than
+  taking another line, a live paper no longer sits below a disabled copy of its
+  own Acquire control, and a one-paper institutional wait no longer gets a
+  group heading. The prior event behind a paper's current standing also moves
+  to its detail while `No progress for …` remains visible. On the measured
+  worst-case popup this removes 101.5px; one lone security check falls from six
+  lines plus a control to two lines plus a control.
+- **The inbox states a shared instruction once per group.** Security checks,
+  terms, sign-ins and same-kind manual-download rows now carry one
+  sentence-case heading and instruction even when there is only one row,
+  instead of repeating the instruction under every paper — or, on the old
+  incomplete-family path, omitting the heading entirely. A row keeps its title
+  and one identifying fact; citation links collapse to their host only when an
+  author or year already identifies the paper, while the full destination
+  remains available on hover and to assistive technology. The Firefox
+  manual-download caveat remains visible once per group. The page header now
+  keeps only the unique turn count (`N need you`); the Actions and Watch hits
+  tabs remain the inventory authority instead of the same totals being added
+  together and printed again above them.
+- **Permission rows keep the publisher, and move the raw match pattern to
+  detail.** Options no longer spends a second visible line on
+  `https://*.publisher.example/*` beneath every friendly publisher name. Hover
+  the row or focus its switch to see the exact pattern immediately; it remains
+  in the switch's accessible name as well. Twelve ordinary provider rows lose
+  180px while distinct permission, credential, MFA and legal consequences stay
+  visible.
+- **The small labels now say what they mean.** The toolbar's uncapped fallback
+  tooltip has the same `papio:` prefix as every sibling state, and the access
+  landing page now says to return to the paper — or that the tab is no longer
+  valid — instead of exposing the internal phrase `materialization binding`.
+- **The popup says what is happening, and offers the way to act on it.**
+  "Waiting on you · 12 decisions" was plain text: the popup named you as the
+  hold-up and then offered nothing but the two buttons for the page you
+  happened to be on. That count is now the button. Four other lines were
+  rewritten because they read as riddles. The line under it is one submission,
+  not your whole library, and now says so — "Last submission: 20 papers · 15
+  settled · 5 still open", where "5 remaining" used to sit under a different
+  total and look like a contradiction. The session card no longer chains two
+  different times into one sentence: "Signed in — rechecking now · via your
+  library tab · 1h ago" could not tell you whether the check was an hour old or
+  happening now, and now reads "Signed in 1h ago — due a recheck" — which is
+  also the honest claim, since *papio* only reaches that wording when no check
+  is actually running. "Session warm" is now "Signed in", and "All sessions
+  warm" is "All institutions signed in" — *warm* was *papio*'s word for how
+  fresh its evidence is, never yours. And a paper's card no longer prints a
+  bare line from the activity log where its status belongs: "Institution login
+  returned · 2m ago" said what once happened and nothing about where the paper
+  stands, so the standing comes first now, with the event kept and dated after
+  it.
+- **The toolbar badge no longer reports *papio*'s own queue as papers waiting
+  on you.** A library is served by one sign-in at a time, so most institutional
+  papers are waiting for *papio* to reach them, not for you to do anything —
+  yet every one of them was counted into "N papers waiting on your institution
+  sign-in". The count is now exactly the papers whose own page is sitting at a
+  login screen — the ones you can actually finish — and the rest are named as
+  *papio*'s work: "1 paper needs your institution sign-in · 3 more queued for
+  your library". Nothing is hidden: the queued clause also appears when the ask
+  count is zero, so institutional work in flight is still visible with no
+  session evidence and keepalive off.
+- **An acknowledgement now says whether *papio* is driving a paper or queueing
+  it.** The extension drives one paper at a time and queues the rest, but both
+  cases sent the same bare "got it" — so the app counted a paper's turn in the
+  queue as a browser attempt that produced nothing, and gave up on it after
+  three. One stuck sign-in holding the only drive slot could therefore retire
+  every paper behind it without any of them ever opening a tab. The queued case
+  is now named on the wire, based on whether the extension actually holds a
+  drive slot for the paper. Papers retired this way that never reached a page
+  are restored by the app on upgrade.
+- **A *papio* reload no longer forgets the paper you were signing in for.**
+  Reloading or updating the extension wipes its working state, and the daemon
+  cannot re-announce a paper that already owns a live page — so a paper stopped
+  at a login screen went unmentioned, and the badge read "connected" while the
+  one paper you could actually finish sat there. The ask is now recovered from
+  the durable record of the tabs *papio* opened: same browser session, not
+  yours, still live, still on a login page. It only ever reports — it cannot
+  revive work or open anything, and a *papio* tab that has moved past its login
+  page reports nothing.
+- **A *papio* tab you close while nothing is watching is now reported, not just
+  forgotten.** Startup repair used to drop its record of a vanished tab in
+  silence, so the daemon never learned the page was gone — and because that
+  paper had already been granted its navigation, its claim is never expired on
+  a timer, leaving the library's sign-in slot held by a paper with no page. The
+  loss is now reported from the same durable record, using the same one-time
+  closing vocabulary an observed close uses.
+- **A paper's sign-in progress is no longer thrown away when the browser
+  reconnects.** Every queued sign-in observation was stamped with the browser
+  session it was made in, and the daemon answers anything from an older session
+  "stale" — so a reconnect between making an observation and sending it
+  discarded the whole backlog the reload path exists to preserve, silently.
+  Observations now carry the session they are *sent* from; which paper and
+  which sign-in they describe was never in that field.
+- **Closing every *papio* tab and then reloading no longer hides the closures.**
+  The reload could only recognise its own tabs by finding one still open, so
+  closing all of them made it look like a browser restart, and every tab it
+  should have reported became unrecognised. A tab that is *gone* can't be
+  confused with anyone else's, so its closure is now reported regardless.
+- **A paper you ask for is no longer sent to a sign-in page that isn't there.**
+  When *papio* points a paper at another paper's live sign-in and that page
+  turns out to be gone, the extension now says so instead of just failing the
+  click — so the next click gets a real page. This is the recovery that needs
+  no memory of the tab at all: a library slot held by a paper whose page
+  vanished before this release could otherwise stay held forever.
+- ***papio* no longer opens institutional sign-in tabs on its own.** Every
+  autonomous path that used to create a `requires_auth` surface — a warm
+  session admitting a queued offer, the 45-second fallback timer, a daemon
+  re-offer recreating a closed tab, startup re-driving a restored backlog, and
+  the sibling resume after a login — now parks the work tabless in the inbox as
+  *needs your engagement* instead, until the daemon can arbitrate sign-ins
+  (below) and the network is up. Clicking **Open** works exactly as before;
+  what is gone is papio deciding by itself that now is the moment for a sign-in
+  tab. Three sibling fixes land with it: a wake from sleep now checks
+  connectivity before releasing queued work (tabs were being driven into a dead
+  network), a repeated *Sign in* request reuses the live sign-in tab instead of
+  minting another, and a papio-created tab that has navigated through its
+  resolver→SSO→provider redirect chain is no longer forgotten by the tab ledger
+  — it is remembered as papio's own, though never touched, until the
+  durable-ownership work below can prove tab identity across restarts.
+- **Every paper waiting on the same institution now shares one sign-in, and
+  resumes together the moment it succeeds.** The tabless park above is now
+  a real grant: the daemon brokers exactly one login tab per institution
+  across every paper that needs it — a second paper's autonomous drive is
+  told to wait behind it or focus it explicitly, never to open a duplicate
+  — and when that sign-in succeeds, every sibling paper resumes on its own
+  freshly revalidated route without you touching them individually. An
+  abandoned sign-in (the tab closed without success) commits that outcome
+  once; it does not leave a sibling guessing whether to keep waiting.
+- **A papio-opened institutional tab now starts on papio's own blank page,
+  never the provider's.** Automatic sign-in and access tabs open first to
+  an opaque internal `materialize.html#<binding>` page and only navigate to
+  the real provider once the daemon has admitted the route — the provider
+  address is never the tab's first destination, and never a stored one
+  either: the on-disk ledger no longer records any route, provider, host,
+  or paper for a papio-owned tab, only an opaque binding id, a SHA-256
+  digest of the tab's origin, and the bookkeeping needed to prove it is
+  still papio's own. This replaces the previous ledger, which kept the
+  actual sign-in URL in `storage.local`.
+- ***papio* closes a tab only with the daemon's one-use permission.** Every
+  automatic close now requires a fresh, one-use authorization the daemon issues
+  for that exact tab and reason — an idle scaffold you never engaged with, one
+  whose job already finished, or one whose sign-in was abandoned. A pinned tab,
+  or one moved out of *papio*'s group or window, is kept; the tab in front of
+  you closes only after you look away. A *papio* tab from before this shipped
+  that cannot be re-verified this way is listed in the popup's existing
+  stray-tabs review card rather than acted on.
+- **A page that fails to load is no longer mistaken for a sign-in wall.** A
+  dead-end navigation — a broken link, a timeout, a resolver page that
+  never resolves — is now recognized before papio asks whether the page is
+  an authentication wall, so it stops the attempt cleanly instead of
+  charging it against your sign-in retries or opening a cooldown a real
+  wall would deserve.
+- **Sign-in progress is no longer lost or double-counted across a
+  service-worker restart.** Every wall/login/MFA/challenge/landing/close
+  event papio observes on a sign-in tab is now queued durably before it is
+  sent and replayed under the same identity after a restart, so a login
+  completed right as the worker restarted is not asked of you again, and
+  nothing observed before the restart can be counted twice.
+- **Firefox below 139 keeps working, with grouping degraded rather than
+  assumed.** Visually grouping a papio sign-in tab with its siblings needs
+  the `tabGroups` API (Firefox 139+); where it is absent, group identity
+  now falls back cleanly to papio's existing work window instead of ever
+  inferring ownership from a group's title alone. The minimum supported
+  Firefox stays 128.0 ESR, the release many institutions run, unchanged by
+  any of this.
+- **A paper you picked no longer stays picked after you leave the PDF.** The
+  popup's offer is now one-shot: the background mints an opaque nonce held only
+  in service-worker memory, consumes it synchronously on selection, and freezes
+  the page identity — tab, document, same-document navigation sequence and
+  resolved source URL — against that pick. The offer dies when the worker
+  restarts, when the tab navigates, closes, or is replaced, or when the
+  delivery settles or fails; a later page in the same tab id never revives it.
+  The native-viewer *Download* continuation is the one state that does survive
+  a restart, held in session storage with its own job binding and page identity
+  and re-validated when the download is claimed, and it is destroyed on every
+  cancel or close path. This replaces the old `manual_delivery_target` pin
+  (`Open` in the inbox) and `uniqueManualDeliveryTarget` cross-tab authority —
+  a DOI-less file that reaches the daemon without your pick follows the blind
+  grab path as before.
+- **A browser that is not the session holder no longer claims the daemon is
+  unreachable.** With the extension enabled in two browsers, the one waiting
+  its turn showed *papio daemon isn't reachable — run: papio daemon status*,
+  which answers *ok*, and its inbox promised an automatic reconnect that could
+  never happen. A `session_busy` refusal is now its own state: the popup names
+  the situation and the single command that moves the session
+  (`papio browser use --latest`), the toolbar tooltip says another browser
+  holds the session, the inbox says which browser has it, and the options
+  footer reports the daemon as reachable. The refusal is also treated as a
+  settled answer rather than a slow one, so popup and inbox reads in a waiting
+  browser fail immediately instead of after the five-second hello wait.
+  A browser demoted by `papio browser use` reports the same state as soon as
+  the daemon tells it, and keeps every capability it negotiated — holdership
+  gates offers and handoffs, not page acquisition or inbox reads.
+- **The popup no longer flashes a status nobody had measured.** Both the popup
+  and the inbox shipped a default *Can't tell — live progress is unavailable*
+  line in their markup, painted before the first read returned, so every popup
+  opened with a flash of it. Both now start empty and hidden, and only the
+  renderer reveals them.
+- **Opening the inbox no longer flashes "Disconnected".** Connectivity started
+  as `false`, which is "not asked yet" rather than a verdict, and the first
+  paint reported it as lost connectivity — complete with an automatic-reconnect
+  promise and a `papio status` suggestion — before anything had been asked of
+  the daemon. Connectivity is now a third state until the first read settles:
+  the banner stays silent, and a daemon that really is slow gets a neutral
+  *Connecting to daemon…* after a short grace instead of an accusation.
+- **Plain words for an unknown or scheduled status.** *Can't tell* never said
+  whether papio had looked and found nothing or had not looked yet; every
+  unknown state now names its cause (*Progress unknown — the papio daemon
+  isn't answering*). A scheduled instant names the day whenever it is not
+  today, so a retry thirteen hours out reads *tomorrow at 08:00* instead of a
+  bare *at 08:00* that looked imminent. The next action counts papers, and
+  *Acquisition effects 0/1 busy* — an internal mechanism, reporting a
+  configured limit as though it were news — is gone: the line appears only
+  when something is actually held or queued behind the limit.
+- **A fresh line no longer says "just now".** The institution-session card and
+  live job status spent their remaining width restating that nothing had aged
+  yet; the age appears once there is one.
+- **A daemon that has begun advertising more than 32 `hello_ack` features no
+  longer locks this extension out of the whole native session.** The parser's
+  accept-side bound on `hello_ack.features` is now 64, up from the 32 every
+  daemon still emits (`internal/browser/bridge.go`'s fail-closed feature list
+  is unchanged). This is stage 1 of a two-stage mixed-version migration: an
+  extension that tolerates a longer list, so a daemon's emitted cap can be
+  raised later without a manually-upgraded daemon failing the whole
+  `hello`/`hello_ack` handshake against an as-yet-unupdated extension. An
+  older daemon's short feature list still negotiates exactly as before.
+- **An adapter failure now says why no page capture was saved.** When *papio*
+  reports adapter drift or a missing adapter, the outcome detail ends with the
+  result of the latest automatic capture attempt, such as `sent`, `duplicate`
+  or `sanitizer_refused`, or a daily or per-page capture limit with the time
+  until it clears. Before, a missing capture had no explanation, so a quota
+  looked the same as a failure.
+- **A page that no adapter recognises is now reported with its site.** The
+  outcome *papio* sends for such a page names the page's host, so the failure
+  can be traced to the right publisher. The tab is checked again just before
+  the report, so a tab that has moved on to another site is not blamed for the
+  first one. A *papio* app older than 0.22.0 rejects the new field and drops
+  the browser connection, so update the app together with the extension.
 
-- **Article-agent fallback can download explicit same-origin PDF links.** It
-  clicks the original publisher link with temporary download intent. Firefox
-  still requires an exact browser download, adoption and PDF validation before
-  reporting success.
-- **Article-agent choices use the control's own label.** Unnamed controls no
-  longer inherit unrelated download headings. Standard article titles and
-  relevant controls survive the observation limit, and unchanged pages are
-  rechecked without another paid decision or repeated click.
-- **Article-agent fallback recognizes standard DOI metadata and explains refusals.**
-  Dublin Core and PRISM identifiers can establish an exact article match;
-  conflicting DOI claims still stop the attempt. Missing identity, changed pages,
-  sign-ins, challenges and consent gates now have distinct explanations.
+### Fixed
+- **Page captures no longer carry your IP address.** The capture sanitizer now
+  masks IPv4 and IPv6 addresses in page text and attribute values, and refuses
+  to send a capture if one is left. Elsevier's refusal page prints the reader's
+  address. DOIs, dates, clock times and versions such as `Chrome/153.0.0.0`
+  are kept.
+- **A provider that refuses the browser is no longer reported as adapter
+  drift.** ScienceDirect can serve Elsevier's "There was a problem providing
+  the content you requested" page instead of an article. papio read it as an
+  unrecognised page, the article agent stopped with `identity_missing`, and the
+  daemon latched ScienceDirect drift. papio now recognises refusal pages
+  (Elsevier's refusal page, Cloudflare block and rate-limit pages, Akamai
+  "Access Denied", HTTP 429) by their markup first and their text second. A
+  refusal that is still there after 8 seconds pauses that provider for 10
+  minutes and reports `rate_limited`, so the daemon retries the paper later. A
+  page that clears by itself inside those 8 seconds is not reported. A
+  Cloudflare "Just a moment..." check is still a check you solve.
+- **Nature pages now download, including Nature news items.** Every Nature page
+  shows the same PDF control three times, so the Nature adapter refused every
+  download as ambiguous. Adapter 0.2.0 uses the sidebar control and reads the
+  DOI from `dc.identifier`, which news pages (`10.1038/d41586-…`) also carry.
+- **A redrive no longer leaves the old tab beside the new one.** Opening a
+  surface for a paper now retires that paper's other papio tabs.
+- **The minimized work window's selected tab is no longer treated as in use.**
+  It is closed with its job, which also clears blank "New Tab" tabs a
+  download-only navigation left behind.
+- **A queued handoff whose offer URL is gone is left for the daemon's re-offer,
+  not rejected.** A same-URL re-offer of a queued institutional handoff dropped
+  that job's URL but kept it queued. When the drive slot freed, the drain sent
+  an empty `job_reject` for each such job, and older daemons made that
+  terminal. A tabless re-offer now keeps its URL and drives, and a job with no
+  URL (for example after a worker restart) is dropped locally for the daemon to
+  offer again. The extension no longer sends `job_reject`.
+- **A generic PDF link that returns the article's HTML now hands the drive to
+  the article agent.** On a Nature page, the `citation_pdf_url` candidate
+  downloaded HTML, and papio then reported nothing, so the drive held its
+  provider domain until its lease expired. The agent now takes over the same
+  drive and reads the article page. When the agent is unavailable, papio
+  ends the drive with a provider outcome, attributed to the host's adapter
+  when one exists. Every generic result without a successor now ends in one
+  provider outcome.
+- **Chrome saves a signed PDF viewer's own response instead of fetching it
+  again.** A ScienceDirect or other signed viewer link returns HTML to a second
+  request, so the one-time refetch failed for every ScienceDirect job. On
+  Chrome 128 and later, papio's handoff tabs now download that PDF response
+  into the job's papio folder instead of showing it in the viewer, and the
+  daemon validates it as usual. The rule covers only papio's handoff tabs and
+  the tabs they open, only PDF responses, and only until the job has its
+  download. This adds the `declarativeNetRequestWithHostAccess` permission,
+  which shows no install warning; it acts only on hosts papio can already
+  reach. If the viewer still opens, papio shows the existing Send this PDF /
+  viewer Download instruction with the reason (for example `viewer host
+  permission missing`). An older Chrome keeps the one refetch. Firefox is
+  unchanged and does not request the permission.
+- **Closing an institutional sign-in tab releases its claim after a drive timeout.**
+  Bringing the tab forward no longer erases the claim identity needed to
+  report its later close, even when the timed-out job has detached from it.
+- **Timed-out handoffs need page evidence before reporting sign-in.** An offer's
+  `requires_auth` flag alone no longer puts an entitled article or an access
+  denial into `auth_pending`, and neither does a publisher's header "Sign in"
+  link. Only an authentication URL does. Otherwise, *papio* asks the operator
+  to take over without holding the institution's sign-in slot.
+- **The browser handshake reports the browser family.** Connected Chrome and
+  Firefox sessions can now be identified by `papio browser sessions`; unknown
+  browsers appear as `-`.
+- **Title identity checks ignore typography, not different words.** *papio*
+  accepts matching article titles with sentence punctuation, quote or dash
+  variants, and diacritics. A different title still fails the work check.
+- **JSTOR keeps entitled articles out of the login queue.** A turnaway
+  account offer beside the primary PDF control no longer masks the article
+  and holds an institution sign-in slot.
+- **Closing a sign-in tab releases its materialization claim.** If a provider
+  landing races the tab close, *papio* reports the lost owner instead of an
+  authentication return. Other papers no longer wait on that dead tab's lease.
+- **JSTOR recognizes its article identity correctly.** Its download control's
+  `data-doi` is a numeric record ID, not a DOI. Papio now matches the article's
+  title and separately checks that the primary control identifies the same
+  record as the download route. Publisher terms still require consent.
+- **Chrome keepalive survives its initial blank page loading.** Papio records
+  its newly created tab while `about:blank` is pending, then opens the institution
+  and schedules refreshes. A tab navigating elsewhere is still refused.
+- **The popup no longer mistakes a hidden institution row for successful sign-in.**
+  If a waiting paper cannot be mapped to an institution, Papio reports that
+  sign-in is unconfirmed and keeps the paper's Open action available. The
+  signed-in summary requires fresh evidence for every configured institution.
+- **Institution keepalive recovers its own sign-in tab after a worker restart.**
+  Papio records tab ownership before navigation, so unpinning or redirecting
+  through an identity provider no longer loses the tab. Returning from sign-in
+  resumes refreshes. Tabs without an ownership record remain untouched.
+- **Duo push prompts remain part of sign-in.** A prompt without a login path
+  no longer becomes an unsupported-publisher failure or consumes an article-agent
+  attempt. Papio waits for the authentication flow to return.
+- **Chrome institution keepalive creates its tab again.** Papio now creates
+  the pinned tab before muting it, using the operations Chrome supports. A
+  failed mute removes only the new tab so retries do not leave duplicates.
+- **Queued article pages wait for their browser drive.** A page that finishes
+  loading while another paper owns the drive no longer becomes an adapter
+  failure. When its turn arrives, Papio checks the current page without
+  navigating again, including publishers with no adapter.
+- **A declined sign-in observation no longer stops the drive.** When the
+  daemon answers a `claim_observation auth_returned` or `entitled_landing`
+  with `rejected` or `stale`, the extension now classifies the bound tab's
+  current page under the still-valid claim instead of dropping the entry
+  silently. After a return the tab is standing on the provider, so the
+  landing is assessed (and downloaded under the existing authority gates)
+  regardless of whether the sign-in bookkeeping accepted the observation.
 - **ScienceDirect recognizes its captured access-bar sign-in layout.** Paired
   purchase and institutional-access controls now offer sign-in guidance instead
   of an adapter-drift failure. PDF controls marked disabled are refused, including
@@ -356,60 +658,45 @@ for the full pre-split extension history.
   names.** The capture registry now covers every packaged adapter, including
   ScienceDirect, while preserving historical aliases. A regression checks the
   registry and sanitized drift frames; unknown providers remain observations.
-
-- An adapter download that returns HTML now frees its browser drive slot and
-  stays parked across worker restarts. The page remains available for the
+- **An adapter download that returns HTML now frees its browser drive slot and
+  stays parked across worker restarts.** The page remains available for the
   operator, and a later PDF can still be adopted. HTML alone does not establish
   missing access or adapter drift; late results cannot park a newer attempt.
-
 - **PLOS ONE printable PDFs download through the browser handoff.** The
   extension recognizes the exact article-file route, which has no `.pdf`
-  suffix, instead of reporting a missing HTML adapter. Supplement IDs,
-  other hosts, and ambiguous queries remain excluded. A fresh Chrome probe
-  downloaded, adopted, and validated the correct five-page article without
-  an Open action or PDF click during the probe.
-
+  suffix, instead of reporting a missing HTML adapter. Supplement IDs, other
+  hosts, and ambiguous queries remain excluded.
 - **A different paper is reported as the wrong work, instead of adapter drift.**
   When a page's declared DOI or title disagrees with the request, papio stops
   without attempting its PDF or terms controls and offers the existing
   wrong-page recovery. Missing, ambiguous, or malformed identity metadata still
   requires assistance; it does not prove that the page names another work.
-
-- **Manual-download tasks release their completed browser surfaces.**
-  Cleanup now reports that the browser handoff is parked, instead of incorrectly
-  claiming the whole job is inactive. Downloads in flight still prevent closure.
-
 - **Unsupported provider pages no longer leave papers waiting for sign-in.**
   Loading an unregistered provider does not count as authentication. If sign-in
   returns to an unsupported page, papio records the missing adapter and releases
   the drive after a bounded render wait, without claiming successful sign-in or
   attempting a PDF download.
-
 - **Generic downloads exclude files labelled as previews or partial documents.**
   A matching DOI and PDF metadata cannot override a link labelled as a preview,
   sample, abstract, supplement, or full issue. A separate full PDF remains
   eligible, and diagnostics record the excluded links.
-
 - **Ebook Central no longer reports a broken ProQuest article adapter.**
   The book platform now follows the missing-adapter path and preserves its own
   diagnostic evidence. ProQuest article downloads keep their existing route.
-
-- An authorized institutional navigation now releases a paper from its old
-  queued state before the provider page loads. Reconnection also repairs that
+- **An authorized institutional navigation now releases a paper from its old
+  queued state before the provider page loads.** Reconnection also repairs that
   stale state after the daemon confirms the navigation. Loading papio's own
   access tab no longer reports a sign-in attempt.
-
-- PDF viewers that require an explicit download now release their browser drive slot after reporting a manual task to a compatible daemon. The PDF stays open. Choose **Send this PDF** before using the viewer’s **Download** button; the notice alone grants no adoption authority. Older daemons retain the diagnostic-only behavior.
-
-- **Signed PDF viewers stay available for manual delivery.** Automatic viewer
-  adoption now uses the same restriction as Send PDF: it does not re-fetch
-  ScienceDirect's viewer URL or a signed delivery link. The popup directs you
-  to Send this PDF and then the viewer's Download button. This notice does not
-  arm a download or claim success. A child PDF viewer is also recognized while
-  its job still carries a sign-in status. HTML download failures no longer
-  speculate that the library lacks access.
-
-
+- **PDF viewers that require an explicit download now release their browser
+  drive slot after reporting a manual task to a compatible daemon.** The PDF
+  stays open. Choose **Send this PDF** before using the viewer’s **Download**
+  button; the notice alone grants no adoption authority. Older daemons retain
+  the diagnostic-only behavior.
+- **A PDF viewer opened during sign-in is recognised, and an HTML download no
+  longer blames your library.** A child PDF viewer is recognised while its job
+  still carries a sign-in status. The viewer notice does not arm a download or
+  claim success. HTML download failures no longer speculate that the library
+  lacks access.
 - **EBSCO's HTML viewer is no longer downloaded as a PDF.** PDF-like path
   words alone no longer start a download. Known file routes still work, and
   EBSCO's adapter waits longer for its viewer to render before requesting the
@@ -417,21 +704,17 @@ for the full pre-split extension history.
   unrelated hosts and paths remain refused. Execution checks the page's exact
   DOI, so EBSCO's title punctuation does not block the requested paper. Record
   pages without an executable viewer route report the planning refusal.
-
-- Springer downloads now select the article header's PDF control explicitly.
-  The same link also appears in a sticky banner; matching both made the
-  planner refuse the download even though the page classified as an article.
-  A fresh Chrome probe downloaded and validated the correct 16-page article
-  after one explicit Open, without a manual PDF click.
-- A refused adapter plan now records its reason and, when enabled, a diagnostic
-  capture after a bounded render window. Papers no longer remain silently parked
-  when the planner cannot identify one safe download target.
-
-- Springer article pages that offer institutional sign-in now remain sign-in
-  pending instead of reporting no entitlement. An available PDF still takes
+- **Springer downloads now select the article header's PDF control
+  explicitly.** The same link also appears in a sticky banner; matching both
+  made the planner refuse the download even though the page classified as an
+  article.
+- **A refused adapter plan now records its reason and, when enabled, a
+  diagnostic capture after a bounded render window.** Papers no longer remain
+  silently parked when the planner cannot identify one safe download target.
+- **Springer article pages that offer institutional sign-in now remain sign-in
+  pending instead of reporting no entitlement.** An available PDF still takes
   precedence. The change is verified against captured pages; live acquisition
   after this repair remains unverified.
-
 - **ScienceDirect keeps institutional sign-in prompts open.** A Purchase PDF
   link beside an enabled institutional-access link no longer counts as proof
   that the library lacks access or sends the paper to document delivery.
@@ -439,10 +722,6 @@ for the full pre-split extension history.
   adoption checks the browser's job folder while the daemon validates the
   file, including after an extension worker restart. Download recovery also
   recognizes absolute paths and publisher filenames.
-- **Adapter repair prefers the PDF download over a viewer tab.** Article
-  proposals require a PDF-specific affordance; HTML full-text links and
-  citation exports no longer qualify on their own. Explicit PDF downloads
-  rank ahead of viewer tabs even when the viewer has a more stable selector.
 - **Page-authored PDF routes continue after sign-in.** Generic acquisition now
   accepts the live `awaiting_download` state reached on authentication return,
   while retaining the exact daemon authorization and single-download guards.
@@ -465,41 +744,30 @@ for the full pre-split extension history.
 - **Known adapter misses now produce repairable drift captures.** The daemon
   still requires a separate provider outcome before it promotes the evidence.
   Unknown providers keep development-only observations.
-
 - **ClinicalKey downloads now bind to the requested article.** The adapter
   reads the title from the article header, without its toolbar text or section
   headings. It selects the header's PDF link rather than the repeated link in
   the sticky toolbar. A different title still prevents the download.
-
-- **Chrome navigation cancellations no longer end a working sign-in claim.**
-  Chrome can report `net::ERR_ABORTED` when another navigation replaces the
-  first. The extension now leaves the next page free to request sign-in,
-  including after a worker restart. Other navigation errors still use the
-  existing failure path.
-
 - **Europe PMC direct PDFs no longer enter the HTML adapter classifier.**
   The extension recognizes the exact `/api/getPdf?pmcid=PMC…` endpoint in a
   tracked tab or its correlated child tab. Downloads keep their existing
   job ownership and authority checks.
-
 - **A paper brought back after a restart that lands on a terms page no longer
   stalls every other message for fifteen seconds.** The extension waited for
   the daemon's reply to its terms request from inside the very queue that
   reply had to travel through, so the queue parked against itself until the
   request timed out. The terms step now runs beside the queue instead of
   inside it; nothing about the terms flow itself changed.
-
-- **ProQuest papers are fetched again instead of asking you to click.**
-  ProQuest is where this library's link resolver sends most requests, and the
-  adapter (now `proquest` v0.3.0) declared no way to prove the page shows the
-  paper you asked for. *papio* refuses to download without that proof, so every
-  ProQuest paper quietly became a manual click. The docview prints its title in
-  a stable place, and the adapter now binds to it, so the download runs on its
-  own. A page whose title does not match your request is still refused. Two
-  other adapters (`primo`, `clinicalkey`) stay assisted on purpose: their
-  captured pages expose no stable identity to bind, and a test now pins that
-  refusal so it cannot be mistaken for a working automatic path.
-
+- **ProQuest papers are fetched again instead of asking you to click.** Many
+  library link resolvers send requests to ProQuest, and the adapter (now
+  `proquest` v0.3.0) declared no way to prove the page shows the paper you
+  asked for. *papio* refuses to download without that proof, so every ProQuest
+  paper quietly became a manual click. The docview prints its title in a stable
+  place, and the adapter now binds to it, so the download runs on its own. A
+  page whose title does not match your request is still refused. Two other
+  adapters (`primo`, `clinicalkey`) stay assisted on purpose: their captured
+  pages expose no stable identity to bind, and a test now pins that refusal so
+  it cannot be mistaken for a working automatic path.
 - **A publisher sign-in now refreshes a resolver tab stranded on the identity
   provider.** The publisher landing already requested a library-session check,
   but that check found no library page while *papio*'s own tab remained on the
@@ -511,18 +779,16 @@ for the full pre-split extension history.
   longer offers a misleading **Sign in** button.
 - **Signing in now counts, even when it took you a few minutes.** *papio* gave
   itself twenty seconds to read the page after a sign-in returned, then stopped
-  without a verdict. A real sign-in takes minutes, and the browser usually stops
-  the extension worker before the researcher finishes. One measured sign-in took
-  four minutes 28 seconds and produced no entitlement evidence. *papio* now
-  writes a marker only when it routes the exact federated login, then re-reads
-  waiting pages on the one-minute wake that survives a worker restart. It checks
-  at most three least-recently-checked pages per wake, stops after ten attempts,
+  without a verdict. A real sign-in takes minutes, and the browser usually
+  stops the extension worker before the researcher finishes. *papio* now writes
+  a marker only when it routes the exact federated login, then re-reads waiting
+  pages on the one-minute wake that survives a worker restart. It checks at
+  most three least-recently-checked pages per wake, stops after ten attempts,
   and never rechecks a paper whose download started. A full browser restart
   clears the session counters, so daemon re-offer remains the recovery. Before
   a re-offered job starts a download, *papio* checks the browser's durable
   download list for an in-progress item with that job's filename. This blocks a
   browser download from starting twice.
-
 - **A dead sign-in page no longer holds your whole library queue.** When a
   sign-in tab reaches a page that cannot be completed — your identity
   provider's "Stale Request" dead end is the common one — the tab is still
@@ -530,54 +796,48 @@ for the full pre-split extension history.
   waiting paper at that page, reported "waiting for your sign-in", and renewed
   your library's one sign-in claim every few minutes. Renewing the claim is
   what stopped the timers that would otherwise have released it, so the wait
-  had no end: at the measured snapshot, 87 papers required authentication and
-  the oldest open request was 24 days old. *papio* now reads what the tab is
-  showing before claiming a sign-in is under way. A page that cannot finish a
-  sign-in releases the claim and asks you to open the paper again. Your next
-  open builds a **new** sign-in request, which is the only thing a stale one
-  accepts. Reloading the dead page could never have worked. *papio* already
-  knew how to recognise these pages and had never once done so here. It only
-  looked when a page loaded; reusing a tab that was already dead loads nothing.
-
+  had no end. *papio* now reads what the tab is showing before claiming a
+  sign-in is under way. A page that cannot finish a sign-in releases the claim
+  and asks you to open the paper again. Your next open builds a **new** sign-in
+  request, which is the only thing a stale one accepts. Reloading the dead page
+  could never have worked. *papio* already knew how to recognise these pages
+  and had never once done so here. It only looked when a page loaded; reusing a
+  tab that was already dead loads nothing.
 - **A paper your library does not hold is now named as that, not as a broken
-  publisher page.** Your library's search page offers *Get it for me from other
-  libraries* when it cannot give you the full text. *papio* read that page, found
-  no download link, and reported that the publisher had changed its layout — so
-  the paper was filed as a fault someone needs to repair, and you were never told
-  the plain answer. *papio* now says the library does not hold it. Nothing on the
-  page states this: the same availability wording appears on records the library
-  *does* hold, so the only difference is the missing link, and *papio* waits for
-  the whole page before drawing that conclusion. *papio* also waits three times
-  as long as before for that page to finish drawing. Eight of ten pages measured
-  had not drawn at all when *papio* read them, and an undrawn page is now
-  reported as *papio* not being able to tell, rather than as the publisher's
-  fault.
-
-- **Provider error pages no longer look like adapter breakage.** A ScienceDirect
-  500 page and two Cochrane 404 pages were recorded as changed provider layouts.
+  publisher page.** Your library's search page offers to request the paper from
+  other libraries when it cannot give you the full text. *papio* read that
+  page, found no download link, and reported that the publisher had changed its
+  layout — so the paper was filed as a fault someone needs to repair, and you
+  were never told the plain answer. *papio* now says the library does not hold
+  it. Nothing on the page states this: the same availability wording appears on
+  records the library *does* hold, so the only difference is the missing link,
+  and *papio* waits for the whole page before drawing that conclusion. *papio*
+  also waits three times as long as before for that page to finish drawing, and
+  a page that has not drawn is now reported as *papio* not being able to tell,
+  rather than as the publisher's fault.
+- **Provider error pages no longer look like adapter breakage.** ScienceDirect
+  500 pages and Cochrane 404 pages were recorded as changed provider layouts.
   *papio* now requires the provider's exact error title and matching failure
   sentence, reloads up to three times, then leaves the existing action parked.
   It never files the transport page as adapter drift. An article merely titled
   “Internal Server Error” does not match.
-
 - **Sign-in pages no longer enter diagnostic page captures.** The unknown-page
   path used to add the current redirect host to its own capture allowlist. A
   login, identity-provider, SSO, authentication, Shibboleth, or OpenAthens URL is
   now refused before that self-authorization. Unregistered provider pages remain
   capturable for adapter work.
-
 - **ScienceDirect articles are recognised again, in both of its page layouts.**
-  *papio* matched the page's **View PDF** control by requiring the link to *end*
-  in `/pdf`. The real link ends in a download key, not a path, so the match
-  failed on the measured pages and *papio* reported them as changed while they
-  had rendered correctly. The saved copies *papio* tests against have those keys
-  removed for privacy, so the old tests passed. *papio* now matches the path
-  within the link. It also recognises a second layout: an entitled subscription
-  article puts the control in the article's own actions area with no access bar
-  at all, and *papio* used to read those fully-rendered pages as broken. Each
-  layout is matched inside its own container, so a recommended article beside it
-  can never be downloaded in its place, and a control that has not finished
-  rendering still refuses to classify.
+  *papio* matched the page's **View PDF** control by requiring the link to
+  *end* in `/pdf`. The real link ends in a download key, not a path, so the
+  match failed on real pages and *papio* reported them as changed while they
+  had rendered correctly. The saved copies *papio* tests against have those
+  keys removed for privacy, so the old tests passed. *papio* now matches the
+  path within the link. It also recognises a second layout: an entitled
+  subscription article puts the control in the article's own actions area with
+  no access bar at all, and *papio* used to read those fully-rendered pages as
+  broken. Each layout is matched inside its own container, so a recommended
+  article beside it can never be downloaded in its place, and a control that
+  has not finished rendering still refuses to classify.
 - **Pages that need to be on screen are now shown in every handoff layout.**
   Some publishers, ScienceDirect among them, build their download control only
   when the page is actually on screen. *papio* knows which providers need this
@@ -650,26 +910,12 @@ for the full pre-split extension history.
   already open: a later paper can otherwise leave ScienceDirect in a
   background tab with the same disabled link. Nothing is asked of you, and
   pages that draw correctly while hidden are still never surfaced.
-- **One paper no longer collects a tab per attempt.** *papio* deliberately
-  leaves a tab open on a paper it has acquired: the paper on screen is your
-  confirmation, and *papio* never closes a paper you might be reading. It kept
-  one such tab per ATTEMPT, though, not one per paper — each new try on the
-  same paper opened another tab, and every earlier one stayed for good, because
-  *papio* had stopped recording which paper those tabs belonged to. One paper
-  reached fourteen tabs that way, in a window holding thirty-one *papio* pages
-  nothing could close. *papio* now remembers the paper behind a kept tab, keeps
-  the newest one, and retires an older copy of that same paper once nobody has
-  touched it for half an hour. The paper you can read never closes: pinning a
-  tab, using it, or dragging it out of *papio*'s window hands it to you
-  permanently, and a kept paper is never reused for a later attempt.
 - **Bringing a hidden paper into view no longer makes *papio* let go of it.**
   When a publisher page will not draw while hidden, *papio* shows the window
   and makes that paper the active tab. It then read its own action as you
   taking the tab over, and let go of the tab for good — so the tab it had just
   revealed could never be tidied up again, and nothing knew which paper it
-  held. *papio* now recognises its own action. A tab you activate yourself is
-  still yours permanently, and a kept tab now records why *papio* let go of
-  it, so a wrong hand-off can be seen instead of guessed at.
+  held. *papio* now recognises its own action.
 - **A PDF reached through your library now stays connected to its paper when
   the publisher changes.** A library route can end at a different publisher
   host. After *papio* asked you to finish that download yourself, it remembered
@@ -683,25 +929,14 @@ for the full pre-split extension history.
   in.** *papio* gives each paper three minutes on screen to finish. When that
   time ran out it said the paper was waiting on your library sign-in, whatever
   the page in front of it was — so a freely downloadable preprint, on a page
-  with a download link and no sign-in anywhere, said that every three minutes
-  for two days. It counted in the toolbar badge, and it took your library's
-  one sign-in slot from the papers that genuinely needed it. Running out of
-  time says nothing about a sign-in, so *papio* now only reports one when the
-  paper's route was announced as needing a sign-in, or the page it is on really
-  is a login page. A paper that simply ran out of time still asks for you — it
-  moves to the same waiting list, with the same **Open** button, and says it is
-  waiting on you to continue rather than to sign in.
-- **A paper waiting for another paper's sign-in now really does retry.** The
-  wait that was added to stop *papio* hammering the daemon was armed correctly
-  and then fired into nothing: *papio* had already thrown away the record of
-  what it was retrying, so the timer woke up, found no paper, and did nothing.
-  Because the daemon considers such a paper already taken, nothing else woke it
-  either, and it sat for the half hour it takes that claim to lapse — or until
-  the extension was reloaded. *papio* now keeps the record, and the retry
-  resumes against the sign-in slot it already holds instead of asking for a new
-  one. Found by review, not in the wild: the test that was meant to cover this
-  handed the retry a fresh offer of its own, which is exactly the help the real
-  path never gets.
+  with a download link and no sign-in anywhere, said that every three minutes.
+  It counted in the toolbar badge, and it took your library's one sign-in slot
+  from the papers that genuinely needed it. Running out of time says nothing
+  about a sign-in, so *papio* now only reports one when the paper's route was
+  announced as needing a sign-in, or the page it is on really is a login page.
+  A paper that simply ran out of time still asks for you — it moves to the same
+  waiting list, with the same **Open** button, and says it is waiting on you to
+  continue rather than to sign in.
 - **A paper waiting for another paper's sign-in stops hammering the daemon.**
   *papio* signs in to one institution at a time, so while one paper is signing
   in the rest are told the slot is busy. Each of those refusals arrived on the
@@ -714,17 +949,17 @@ for the full pre-split extension history.
   a browser alarm rather than in *papio*'s memory, so it survives the browser
   suspending the extension — the same lesson the stranded sign-in tab taught.
   The refusal itself is unchanged: the scaffold is still retired at once, and
-  only a busy institution schedules the wait.
+  only a busy institution schedules the wait. While it waits, *papio* keeps the
+  paper's record, so the retry resumes against the sign-in slot the paper
+  already holds instead of asking for a new one.
 - **A paper no longer collects one leftover tab per attempt.** When a handoff
   drive timed out, *papio* asked to close its tab while claiming the tab was an
   idle scaffold it had never navigated. That claim is false for any tab a drive
-  has actually opened and steered, so the daemon correctly refused the close and
-  the tab stayed — one stranded tab per attempt, three on screen for a single
-  paper. *papio* now states the fact that is true (it has parked this handoff
-  and is driving nothing through the tab), which is the same thing its own
-  repair pass already said, so the tab is retired on the first ask. Verified
-  against the live daemon: the refusals stopped and the close was authorized at
-  the exact moment the previous build was refused.
+  has actually opened and steered, so the daemon correctly refused the close
+  and the tab stayed — one stranded tab per attempt. *papio* now states the
+  fact that is true (it has parked this handoff and is driving nothing through
+  the tab), which is the same thing its own repair pass already said, so the
+  tab is retired on the first ask.
 - **A close interrupted by the browser suspending *papio* keeps its own
   reason.** A close already agreed with the daemon but not yet carried out is
   retried when *papio* wakes; that retry silently downgraded its reason to the
@@ -735,10 +970,8 @@ for the full pre-split extension history.
   even when the tab was already showing exactly that page. Asking a browser to
   go where it already is is never free: it throws away the rendered article,
   and at publishers who screen automated traffic it summons a fresh "prove
-  you're human" check — one *papio* caused and then handed to you to solve.
-  Measured on a live paper: the check appeared 311 ms after the sign-in
-  returned, on an article whose own page *papio* had twice judged perfectly
-  ordinary. It now navigates only when that would actually move the tab.
+  you're human" check — one *papio* caused and then handed to you to solve. It
+  now navigates only when that would actually move the tab.
 - **The tab group is named "papio", and nothing else.** It used to append the
   title of whichever paper was on screen. With more than one paper in the group
   that label named an arbitrary one of them, the tab strip already shows every
@@ -749,10 +982,8 @@ for the full pre-split extension history.
   handoff silently discards any field set to "nothing". The final safety check
   then compared those fields against "nothing" exactly, found them missing
   rather than empty, and refused — every time, for every publisher whose
-  download link needs no special handling. The paper was correctly recognised
-  fifteen times over, and a CAPTCHA solved for it, without one download being
-  attempted. Nothing in the test suite could see this: tests hand the plan over
-  directly, with the fields intact.
+  download link needs no special handling. A paper could be recognised again
+  and again without one download being attempted.
 - **A paper whose sign-in resolves is no longer left standing on the article
   doing nothing.** When *papio* re-opened its own tab to finish a library
   round-trip, it assumed the resulting page load would arrive as a fresh event
@@ -789,21 +1020,18 @@ for the full pre-split extension history.
   check. That script is injected into ORDINARY pages on sites that enable
   Cloudflare's JS detections, so on those publishers every page — including the
   article you are reading — looked like a check, and looked like one forever,
-  because the script never goes away. Measured on the author's own browser: on
-  a fully loaded SAGE article, that script present, no check widget, no check
-  text, real article title. *papio* now looks for what actually distinguishes
-  Cloudflare's wait page — its title, its text, and a real widget — verified
-  against both the live wait page and the live article.
+  because the script never goes away. *papio* now looks for what actually
+  distinguishes Cloudflare's wait page — its title, its text, and a real
+  widget.
 
   This was the reason a solved check kept nagging, and it also means fewer
   papers get parked and fewer publishers get cooled off for no reason.
-- **A security check you have already solved stops nagging.** That ask only ever
-  went away if *papio* caught one specific browser event for that exact tab.
-  Chrome puts extensions to sleep after about thirty seconds idle and solving a
-  CAPTCHA takes longer than that, so the event could simply never arrive — and
-  then the **Needs you · Security check** card asked forever for work already
-  done. Measured on the author's machine: both of *papio*'s tabs sitting on the
-  article, no check anywhere, the card still asking an hour later.
+- **A security check you have already solved stops nagging.** That ask only
+  ever went away if *papio* caught one specific browser event for that exact
+  tab. Chrome puts extensions to sleep after about thirty seconds idle and
+  solving a CAPTCHA takes longer than that, so the event could simply never
+  arrive — and then the **Needs you · Security check** card asked forever for
+  work already done.
 
   *papio* now re-reads the page itself every minute, on the one timer that
   survives being put to sleep, and keeps the ask **only** while it can actually
@@ -817,277 +1045,36 @@ for the full pre-split extension history.
   measures the page and sizes the window to fit — so the stylesheet asking for
   "380px, or the window's width, whichever is smaller" was asking for a width
   defined by itself. There is no answer to that question, and the browser kept
-  trying: measured on the author's machine, 394px and 364px, alternating,
-  forever, with nobody touching it. The width is now simply 380px, and the
-  scrollbar's space is always reserved so a line of text appearing cannot start
-  the same argument about height.
+  trying, forever, with nobody touching it. The width is now simply 380px, and
+  the scrollbar's space is always reserved so a line of text appearing cannot
+  start the same argument about height.
 - **Tabs *papio* opened for a paper it never finished are now cleaned up.**
   When a paper reached your library's sign-in and *papio* ran out of time
   waiting, it always meant to close that tab — but every one of those closures
   was silently refused, so the tab stayed open forever, and a new one appeared
-  for the next paper. Live on the author's machine: fifteen surviving tabs,
-  thirteen of them the same resolver page, outliving the papers that opened
-  them by days. *papio* now retires those surfaces.
+  for the next paper. *papio* now retires those surfaces.
 
-  A tab you have touched is never taken: activating it, pinning it, opening a
-  PDF in it, or dragging it out of *papio*'s window all make it yours
-  permanently, checked twice — once before the close and once in the same
-  instant as it, so even a click that lands mid-close is caught.
-
-### Changed
-- **Acquiring the page you are on is a `+` in the popup's header.** It appears
-  beside the inbox and settings icons whenever the current tab has a paper to
-  add and nothing already running for it, carries the accent it had as a button,
-  and names the exact target — DOI included — on hover, on keyboard focus, and
-  to assistive technology. The bordered card it used to live in cost 58px to
-  hold one control saying almost nothing, and now appears only when there is
-  something to report: a refusal and its remedy, a *which paper is this?*
-  choice, or an acquisition in progress. Clicking the icon hands the action
-  straight back to that card, so the two are never both live. `Enter` still
-  activates it, and **Select papers on this page** keeps its full label.
-- **The popup spends its space on the action, not the explanation twice.**
-  A single browser blocker now occupies one compact row under **Do this in the
-  browser**; its explanation stays on the control for hover and assistive
-  technology instead of being printed again below the same heading. The
-  decision count is no longer repeated in both the pulse and its button, the
-  batch summary remains available in the pulse's accessible detail rather than
-  taking another line, a live paper no longer sits below a disabled copy of its
-  own Acquire control, and a one-paper institutional wait no longer gets a
-  group heading. The prior event behind a paper's current standing also moves
-  to its detail while `No progress for …` remains visible. On the measured
-  worst-case popup this removes 101.5px; one lone security check falls from six
-  lines plus a control to two lines plus a control.
-- **The inbox states a shared instruction once per group.** Security checks,
-  terms, sign-ins and same-kind manual-download rows now carry one
-  sentence-case heading and instruction even when there is only one row,
-  instead of repeating the instruction under every paper — or, on the old
-  incomplete-family path, omitting the heading entirely. A row keeps its title
-  and one identifying fact; citation links collapse to their host only when an
-  author or year already identifies the paper, while the full destination
-  remains available on hover and to assistive technology. The Firefox
-  manual-download caveat remains visible once per group. The page header now
-  keeps only the unique turn count (`N need you`); the Actions and Watch hits
-  tabs remain the inventory authority instead of the same totals being added
-  together and printed again above them.
-- **Permission rows keep the publisher, and move the raw match pattern to
-  detail.** Options no longer spends a second visible line on
-  `https://*.publisher.example/*` beneath every friendly publisher name. Hover
-  the row or focus its switch to see the exact pattern immediately; it remains
-  in the switch's accessible name as well. Twelve ordinary provider rows lose
-  180px while distinct permission, credential, MFA and legal consequences stay
-  visible.
-- **The small labels now say what they mean.** The toolbar's uncapped fallback
-  tooltip has the same `papio:` prefix as every sibling state, and the access
-  landing page now says to return to the paper — or that the tab is no longer
-  valid — instead of exposing the internal phrase `materialization binding`.
-- **The popup says what is happening, and offers the way to act on it.**
-  "Waiting on you · 125 decisions" was plain text: the popup named you as the
-  hold-up and then offered nothing but the two buttons for the page you happened
-  to be on. That count is now the button. Four other lines were rewritten
-  because they read as riddles on the author's own screen. The line under it is
-  one submission, not your whole library, and now says so — "Last submission:
-  199 papers · 127 settled · 72 still open", where "72 remaining" used to sit
-  under a different total and look like a contradiction. The session card no
-  longer chains two different times into one sentence: "Signed in — rechecking
-  now · via your library tab · 1h ago" could not tell you whether the check was
-  an hour old or happening now, and now reads "Signed in 1h ago — due a
-  recheck" — which is also the honest claim, since *papio* only reaches that
-  wording when no check is actually running. "Session warm" is now "Signed in", and "All sessions warm" is "All
-  institutions signed in" — *warm* was *papio*'s word for how fresh its
-  evidence is, never yours. And a paper's card no longer prints a bare line
-  from the activity log where its status belongs: "Institution login returned ·
-  2m ago" said what once happened and nothing about where the paper stands, so
-  the standing comes first now, with the event kept and dated after it.
-- **The toolbar badge no longer reports *papio*'s own queue as papers waiting
-  on you.** A library is served by one sign-in at a time, so most institutional
-  papers are waiting for *papio* to reach them, not for you to do anything —
-  yet every one of them was counted into "N papers waiting on your institution
-  sign-in". Live, the badge read 13 while exactly one paper could proceed, and
-  a twenty-hour internal stall looked like *papio* patiently waiting on the
-  operator. The count is now exactly the papers whose own page is sitting at a
-  login screen — the ones you can actually finish — and the rest are named as
-  *papio*'s work: "1 paper needs your institution sign-in · 12 more queued for
-  your library". Nothing is hidden: the queued clause also appears when the ask
-  count is zero, so institutional work in flight is still visible with no
-  session evidence and keepalive off.
-- **An acknowledgement now says whether *papio* is driving a paper or queueing
-  it.** The extension drives one paper at a time and queues the rest, but both
-  cases sent the same bare "got it" — so the app counted a paper's turn in the
-  queue as a browser attempt that produced nothing, and gave up on it after
-  three. One stuck sign-in holding the only drive slot could therefore retire
-  every paper behind it without any of them ever opening a tab. The queued case
-  is now named on the wire, and the disposition is read from the paper's own
-  status so seventeen call sites cannot drift apart. Papers already retired
-  this way are restored by the app on upgrade.
-- **A *papio* reload no longer forgets the paper you were signing in for.**
-  Reloading or updating the extension wipes its working state, and the daemon
-  cannot re-announce a paper that already owns a live page — so a paper stopped
-  at a login screen went unmentioned, and the badge read "connected" while the
-  one paper you could actually finish sat there. The ask is now recovered from
-  the durable record of the tabs *papio* opened: same browser session, not
-  yours, still live, still on a login page. It only ever reports — it cannot
-  revive work or open anything, and a *papio* tab that has moved past its login
-  page reports nothing.
-- **A *papio* tab you close while nothing is watching is now reported, not just
-  forgotten.** Startup repair used to drop its record of a vanished tab in
-  silence, so the daemon never learned the page was gone — and because that
-  paper had already been granted its navigation, its claim is never expired on
-  a timer, leaving the library's sign-in slot held by a paper with no page.
-  Measured live: closing *papio*'s tab group during a reload did exactly that.
-  The loss is now reported from the same durable record, using the same
-  one-time closing vocabulary an observed close uses.
-- **A paper's sign-in progress is no longer thrown away when the browser
-  reconnects.** Every queued sign-in observation was stamped with the browser
-  session it was made in, and the daemon answers anything from an older session
-  "stale" — so a reconnect between making an observation and sending it
-  discarded the whole backlog the reload path exists to preserve, silently.
-  Observations now carry the session they are *sent* from; which paper and
-  which sign-in they describe was never in that field.
-- **Closing every *papio* tab and then reloading no longer hides the closures.**
-  The reload could only recognise its own tabs by finding one still open, so
-  closing all of them made it look like a browser restart, and every tab it
-  should have reported became unrecognised. A tab that is *gone* can't be
-  confused with anyone else's, so its closure is now reported regardless.
-- **A paper you ask for is no longer sent to a sign-in page that isn't there.**
-  When *papio* points a paper at another paper's live sign-in and that page
-  turns out to be gone, the extension now says so instead of just failing the
-  click — so the next click gets a real page. This is the recovery that needs
-  no memory of the tab at all: a library slot held by a paper whose page
-  vanished before this release could otherwise stay held forever.
-- ***papio* no longer opens institutional sign-in tabs on its own.** Every
-  autonomous path that used to create a `requires_auth` surface — a warm
-  session admitting a queued offer, the 45-second fallback timer, a daemon
-  re-offer recreating a closed tab, startup re-driving a restored backlog,
-  and the sibling resume after a login — now parks the work tabless in the
-  inbox as *needs your engagement* instead, until the daemon advertises the
-  ADR-0022 authentication-claim feature AND the network is up (the daemon
-  arbitration that grants it, below, has since shipped). Clicking **Open**
-  works exactly as before; what is gone is papio deciding by itself that
-  now is the moment for a sign-in tab, which is how a tab group grew
-  seventeen tabs across a weekend. Three sibling fixes land with it: a wake
-  from sleep now checks connectivity before releasing queued work (tabs
-  were being driven into a dead network), a repeated *Sign in* request
-  reuses the live sign-in tab instead of minting another, and a
-  papio-created tab that has navigated through its resolver→SSO→provider
-  redirect chain is no longer forgotten by the tab ledger — it is
-  remembered as papio's own, though never touched, until the
-  durable-ownership work below can prove tab identity across restarts.
-- **Every paper waiting on the same institution now shares one sign-in, and
-  resumes together the moment it succeeds.** The tabless park above is now
-  a real grant: the daemon brokers exactly one login tab per institution
-  across every paper that needs it — a second paper's autonomous drive is
-  told to wait behind it or focus it explicitly, never to open a duplicate
-  — and when that sign-in succeeds, every sibling paper resumes on its own
-  freshly revalidated route without you touching them individually. An
-  abandoned sign-in (the tab closed without success) commits that outcome
-  once; it does not leave a sibling guessing whether to keep waiting.
-- **A papio-opened institutional tab now starts on papio's own blank page,
-  never the provider's.** Automatic sign-in and access tabs open first to
-  an opaque internal `materialize.html#<binding>` page and only navigate to
-  the real provider once the daemon has admitted the route — the provider
-  address is never the tab's first destination, and never a stored one
-  either: the on-disk ledger no longer records any route, provider, host,
-  or paper for a papio-owned tab, only an opaque binding id, a SHA-256
-  digest of the tab's origin, and the bookkeeping needed to prove it is
-  still papio's own. This replaces the previous ledger, which kept the
-  actual sign-in URL in `storage.local`.
-- ***papio* never closes a tab you have touched.** Every automatic close
-  now requires a fresh, one-use authorization the daemon issues for that
-  exact tab and reason — an idle scaffold you never engaged with, one whose
-  job already finished, or one whose sign-in was abandoned. A tab that went
-  active, was pinned, turned into a PDF, or was adopted into a job is
-  retained instead, every time; a papio tab from before this shipped that
-  cannot be re-verified this way is listed in the popup's existing
-  stray-tabs review card rather than acted on.
-- **A page that fails to load is no longer mistaken for a sign-in wall.** A
-  dead-end navigation — a broken link, a timeout, a resolver page that
-  never resolves — is now recognized before papio asks whether the page is
-  an authentication wall, so it stops the attempt cleanly instead of
-  charging it against your sign-in retries or opening a cooldown a real
-  wall would deserve.
-- **Sign-in progress is no longer lost or double-counted across a
-  service-worker restart.** Every wall/login/MFA/challenge/landing/close
-  event papio observes on a sign-in tab is now queued durably before it is
-  sent and replayed under the same identity after a restart, so a login
-  completed right as the worker restarted is not asked of you again, and
-  nothing observed before the restart can be counted twice.
-- **Firefox below 139 keeps working, with grouping degraded rather than
-  assumed.** Visually grouping a papio sign-in tab with its siblings needs
-  the `tabGroups` API (Firefox 139+); where it is absent, group identity
-  now falls back cleanly to papio's existing work window instead of ever
-  inferring ownership from a group's title alone. The minimum supported
-  Firefox stays 128.0 ESR, the release many institutions run, unchanged by
-  any of this.
-- **A paper you picked no longer stays picked after you leave the PDF.** The popup's offer is now one-shot: the background mints an opaque nonce held only in service-worker memory, consumes it synchronously on selection, and freezes the page identity — tab, document, same-document navigation sequence and resolved source URL — against that pick. The offer dies when the worker restarts, when the tab navigates, closes, or is replaced, or when the delivery settles or fails; a later page in the same tab id never revives it. The native-viewer *Download* continuation is the one state that does survive a restart, held in session storage with its own job binding and page identity and re-validated when the download is claimed, and it is destroyed on every cancel or close path. This replaces the old `manual_delivery_target` pin (`Open` in the inbox) and `uniqueManualDeliveryTarget` cross-tab authority — a DOI-less file that reaches the daemon without your pick follows the blind grab path as before. To recognise when a tab has navigated away from the PDF you picked, the extension now requests the `webNavigation` permission (Chrome and Firefox); no browsing history is collected.
-
-- **A browser that is not the session holder no longer claims the daemon is
-  unreachable.** With the extension enabled in two browsers, the one waiting
-  its turn showed *papio daemon isn't reachable — run: papio daemon status*,
-  which answers *ok*, and its inbox promised an automatic reconnect that could
-  never happen. A `session_busy` refusal is now its own state: the popup names
-  the situation and the single command that moves the session
-  (`papio browser use --latest`), the toolbar tooltip says another browser
-  holds the session, the inbox says which browser has it, and the options
-  footer reports the daemon as reachable. The refusal is also treated as a
-  settled answer rather than a slow one, so popup and inbox reads in a waiting
-  browser fail immediately instead of after the five-second hello wait.
-  A browser demoted by `papio browser use` reports the same state as soon as
-  the daemon tells it, and keeps every capability it negotiated — holdership
-  gates offers and handoffs, not page acquisition or inbox reads.
-- **The popup no longer flashes a status nobody had measured.** Both the popup
-  and the inbox shipped a default *Can't tell — live progress is unavailable*
-  line in their markup, painted before the first read returned, so every popup
-  opened with a flash of it. Both now start empty and hidden, and only the
-  renderer reveals them.
-- **Opening the inbox no longer flashes "Disconnected".** Connectivity started
-  as `false`, which is "not asked yet" rather than a verdict, and the first
-  paint reported it as lost connectivity — complete with an automatic-reconnect
-  promise and a `papio status` suggestion — before anything had been asked of
-  the daemon. Connectivity is now a third state until the first read settles:
-  the banner stays silent, and a daemon that really is slow gets a neutral
-  *Connecting to daemon…* after a short grace instead of an accusation.
-- **Plain words for an unknown or scheduled status.** *Can't tell* never said
-  whether papio had looked and found nothing or had not looked yet; every
-  unknown state now names its cause (*Progress unknown — the papio daemon
-  isn't answering*). A scheduled instant names the day whenever it is not
-  today, so a retry thirteen hours out reads *tomorrow at 08:00* instead of a
-  bare *at 08:00* that looked imminent. The next action counts papers, and
-  *Acquisition effects 0/1 busy* — an internal mechanism, reporting a
-  configured limit as though it were news — is gone: the line appears only
-  when something is actually held or queued behind the limit.
-- **A fresh line no longer says "just now".** The institution-session card and
-  live job status spent their remaining width restating that nothing had aged
-  yet; the age appears once there is one.
-- **A daemon that has begun advertising more than 32 `hello_ack` features no
-  longer locks this extension out of the whole native session.** The parser's
-  accept-side bound on `hello_ack.features` is now 64, up from the 32 every
-  daemon still emits (`internal/browser/bridge.go`'s fail-closed feature list
-  is unchanged). This is stage 1 of a two-stage mixed-version migration: an
-  extension that tolerates a longer list, so a daemon's emitted cap can be
-  raised later without a manually-upgraded daemon failing the whole
-  `hello`/`hello_ack` handshake against an as-yet-unupdated extension. An
-  older daemon's short feature list still negotiates exactly as before.
-
-### Fixed
+  A tab you pin, or move out of *papio*'s group or window, is never taken. The
+  tab in front of you closes only after you look away. Both checks run twice —
+  once before the close and once in the same instant as it — so a click that
+  lands mid-close postpones the close.
 - ***papio* now closes its own inactive working tab when the daemon retires the
   handoff — even after either side restarts.** Provider pages used to outlive
-  cancelled and finished papers forever because a navigated materialization
-  had no authorized closing reason, and both the daemon's cancel index and the
+  cancelled and finished papers forever because a navigated materialization had
+  no authorized closing reason, and both the daemon's cancel index and the
   extension's job lookup were worker-local. Cleanup now acts from either live
   job state or a modern same-browser-epoch birth record, asks the daemon for a
   one-use, binding-scoped `job_inactive` authorization, and closes only an
   inactive tab still inside *papio*'s work window or tab group. After removal,
   its durable claim identity reports `owner_closed` so the daemon can consume
-  the token and free the institution's sign-in slot. Pinned tabs, PDFs, tabs
-  you moved elsewhere, tabs you took over, and browser-restarted tabs remain
-  yours.
+  the token and free the institution's sign-in slot. Pinned tabs, tabs you
+  moved out of *papio*'s group or window, and tabs from before a browser
+  restart remain yours.
 - ***papio* no longer mistakes its own focus for you taking a tab over.**
-  Opening a paper brings its tab to the front — and *papio* read that exact
-  activation as "the human is using this now", permanently, so every tab it
-  opened became one it could never tidy up again. That is why finished papers
-  piled up in the group even after cleanup shipped. *papio* now marks its own
-  focus before it happens, so only an activation it did not cause counts as
-  yours; it never closes the tab you are looking at, and when you move to
+  Opening a paper brings its tab to the front, and *papio* read that activation
+  as "the human is using this now", permanently, so every tab it opened became
+  one it could never tidy up again. Activating a *papio* tab no longer hands it
+  to you. *papio* never closes the tab you are looking at, and when you move to
   another tab, the working tab you left behind retires itself if its paper is
   over.
 - **Chrome's network-error page no longer stays in the *papio* group.** Once
@@ -1124,10 +1111,9 @@ for the full pre-split extension history.
   placeholder it was finished with — it then told the daemon the tab had
   closed, and the daemon read that the only way it could: as you giving up on
   the paper. The paper was cancelled, seconds after you asked for it, with
-  nothing on screen to explain why. Two papers were lost this way while
-  testing on a real library. *papio*'s own closes are now marked as its own, so
-  they retire the tab and keep the paper; closing a *papio* tab **yourself**
-  still cancels the paper, exactly as before.
+  nothing on screen to explain why. *papio*'s own closes are now marked as its
+  own, so they retire the tab and keep the paper; closing a *papio* tab
+  **yourself** still cancels the paper, exactly as before.
 - **Closing an abandoned sign-in tab frees the other papers immediately, even
   hours later.** Giving up on a library sign-in released that institution's
   single sign-in slot only while *papio*'s background worker happened to still
@@ -1146,16 +1132,13 @@ for the full pre-split extension history.
   invisible plumbing. The page's location is now derived from the extension's
   own manifest, the way every other *papio* page already was.
 - **A tab you are looking at is never pulled back under papio's control.**
-  An independent review of the ownership work above found the one remaining
-  path that could: rediscovering an existing placeholder page could flip it
-  back to inactive and re-adopt it, and could close a duplicate it had never
-  proven it owned. Rediscovery now permanently cedes any tab you have
-  activated or pinned, adopts only a tab whose birth record proves it is
-  papio's own, and retires a proven duplicate through the daemon-authorized
-  close — an unproven one is simply left alone. The close primitive itself
-  now also notices a touch that lands *during* the close — activate a tab in
-  the same instant papio decides to retire it and the tab stays, ceded to
-  you, even if it looks untouched again by the time the close would land.
+  Rediscovering an existing placeholder page could flip it back to inactive and
+  re-adopt it, and could close a duplicate it had never proven it owned.
+  Rediscovery now adopts only a tab whose birth record proves it is papio's
+  own, keeps a tab you have pinned, and retires a proven duplicate through the
+  daemon-authorized close — an unproven one is simply left alone. The close of
+  a tab you are using waits until you look away, and a touch that lands
+  *during* a close postpones it the same way.
 - **A close that was authorized just before the extension restarted now
   finishes instead of stranding the tab forever.** The restart replay ran
   before the daemon handshake had supplied the authority it needs, so it
@@ -1173,7 +1156,6 @@ for the full pre-split extension history.
   because reloading never changed the thing being complained about. The
   extension was not telling the daemon it could grab PDFs at all, so the daemon
   turned down a capability the extension had had all along.
-
 - **Pressing Send PDF a second time no longer says "PDF sent to papio" while
   doing nothing.** *papio* keeps one request per paper, so a second press was
   answered "you already have one of those" — and that was reported as a
@@ -1184,31 +1166,33 @@ for the full pre-split extension history.
   attempt belongs to a browser session that is gone, *papio* clears it and starts
   a fresh one; if it cannot be cleared safely — because something may still be
   arriving — you are told that instead of being told it worked.
-
-- **A paper served on an expiring link now reaches *papio* instead of stalling.**
-  Publishers such as Silverchair — JAMA and Oxford University Press among them
-  — hand your browser a single-use link. *papio* was asking for the file a
-  second time, and being told *"Your session has timed out"*, so **Send PDF**
-  fetched an error page and then went quiet. It now recognises a link that can
-  only be used once and, rather than trying, asks you to press the PDF viewer's
-  own **Download** button — the file is already in your browser, so nothing is
-  fetched twice. *papio* takes that file and reads the paper's identity out of
-  it; when the document does not name itself anywhere *papio* can see, it waits
-  in your inbox to be identified rather than guessing.
+- **A paper served on an expiring link now reaches *papio* instead of
+  stalling.** Publishers such as Silverchair — JAMA and Oxford University Press
+  among them — hand your browser a single-use link. *papio* was asking for the
+  file a second time, and being told *"Your session has timed out"*, so **Send
+  PDF** fetched an error page and then went quiet. It now recognises a link
+  that can only be used once and, rather than trying, asks you to press the PDF
+  viewer's own **Download** button — the file is already in your browser, so
+  nothing is fetched twice. *papio* takes that file and reads the paper's
+  identity out of it; when the document does not name itself anywhere *papio*
+  can see, it waits in your inbox to be identified rather than guessing.
 
   On Firefox this is declined outright rather than half-promised. Firefox gives
   an extension no way to adopt a download it did not start itself, so *papio*
   now says to open that paper in Chrome instead of asking for a **Download**
-  click it could never act on.
-
+  click it could never act on. With the daemon's native helper set up, Firefox
+  saves the open PDF instead (see Added).
 - **The viewer's Download button files the paper you are reading, not the one
   the tab was opened for.** A tab *papio* opened for one paper and you then
   reused for another was steering downloads into the first paper's folder while
   the request for the second went unanswered. The paper you named when you
   clicked **Send PDF** now wins over what the tab used to hold. Nothing was
-  misfiled by this — the file was checked against the citation and set aside for
-  review — but it cost you a review that had no reason to exist.
-
+  misfiled by this — the file was checked against the citation and set aside
+  for review — but it cost you a review that had no reason to exist. On Chrome,
+  a download that matches both a *papio* handoff still working in that tab and
+  a waiting **Send PDF** goes to neither: *papio* says why and offers the two
+  ways out — finish or cancel the paper in that tab, or cancel the **Send
+  PDF**.
 - **A download that fails instantly is reported instead of leaving *papio*
   waiting.** When a link failed the moment it was tried, the failure arrived
   before *papio* had finished learning which download it belonged to, so it was
@@ -1216,7 +1200,6 @@ for the full pre-split extension history.
   at a time stayed spoken for, so the next **Send PDF** answered *busy* until
   the browser restarted the extension on its own schedule. The failure is now
   noticed straight away and you are told the link did not work.
-
 - **A paper is no longer left unfiled because its PDF's link confused *papio*.**
   On ACM and Springer, and on any link that carried a DOI beside other
   parameters, *papio* could read the DOI wrong and then look for a paper that
@@ -1231,22 +1214,51 @@ for the full pre-split extension history.
   full-text view — *papio* now leaves it for you instead of filing it under the
   article, because a supplement filed as the paper it accompanies is the one
   mistake you would never notice.
-
 - **Private link details no longer leave your browser when you send a paper.**
   Publisher and library links routinely carry signed tokens and interlibrary-loan
   tickets, which work like passwords. *papio* now shares only the publisher's
   site, never the rest of the link — on every path that files a paper from a
   page, not just the one this started with. A page title that is really an
   address is dropped too, rather than kept as the paper's title.
-
-- **A pick is now checked against the page the browser reports, not the address the popup sent.** The acceptance check rebuilt the "live" page identity from the URL the popup had passed in, so it only ever proved the popup sent the same string twice — and on provider viewer routes the two sides computed that value by different rules, so the check could never succeed at all. Both sides now derive it the same way from the live tab. Ordinary page loads and reloads also count as page changes now (previously only in-page navigation did, so reloading a tab left an earlier pick valid), a pick expires once it is old rather than only when a newer one displaces it, and an epoch known on one side but not the other fails closed instead of falling back to the weaker comparison.
-- **A pick no longer outlives what it was granted for.** Finishing or removing a delivery revokes any outstanding offer that listed that paper, so a second PDF sent from the same page cannot be filed under a choice made for the first. Replacing a tab — a prerendered page activating, for example — clears the *Download* continuation bound to the old tab instead of leaving it stranded so every later pick returned the same stale state. A *sending* delivery interrupted by a service-worker restart is now reconciled at startup rather than leaving a paper you cannot retry.
-- **Only the address without its query is remembered.** A signed provider download link is a credential; the stored comparison value is now the origin and path only, so no signed link is written to extension storage.
-- **The picker no longer promises Firefox behaviour that cannot happen.** Firefox has no way for *papio* to follow a viewer's own *Download* button, so offering the picker for a native-viewer PDF left the delivery waiting forever. Firefox now says to use the viewer's Download button and explains that *papio* files that download.
-- **A pick made against a restarted worker re-offers the list instead of just clearing.** The popup re-requests the choice once and shows the fresh list, rather than resetting the button and making you click **Send PDF** again — which, given how aggressively the worker is stopped, was the common path rather than a rare one.
 - **Send PDF is decided before you press it, and never refuses because another browser is connected.** The button used to render enabled whenever a delivery was not already in flight, so a refusal *papio* could have predicted arrived only after the click — including one that named internal machinery and was not warranted in the first place, since saving a PDF you are looking at has nothing to do with which browser receives the papers *papio* finds. The button now reports what is actually known: it stays enabled when nothing is known to be missing, disables while a send is in progress and says so as progress rather than refusal, and disables with the remedy on it — and on its accessible label — when *papio* genuinely cannot save PDFs. Enter is stopped by the same state as the click. Every refusal *papio* can send now has its own plain sentence naming what to do; a refusal from an older *papio* falls back to its own wording unless that wording is internal, in which case a plain sentence is shown instead. No message this browser can produce says "holder", "permit" or "negotiated".
 - **A browser that is waiting for its turn is no longer a dead end.** While another browser held the connection, this one received no acknowledgement at all, so it believed *papio* supported nothing and refused the inbox, page acquisition and Send PDF locally without ever asking. It is now acknowledged as waiting: everything you start here works, while the offers and handoffs *papio* initiates continue to go to the browser that holds the slot, and page capture — which only that browser can do — is declined here on purpose. The popup no longer claims this browser "gets no papers until you switch it", which stopped being true.
 - **A refused cancellation is no longer reported as a cancellation.** Any outcome that was not an explicit conflict was treated as success, so a download *papio* declined to cancel was shown as cancelled.
+- **The popup and the Options page say when an action fails.** If the history
+  page could not open, the popup closed and said nothing; it now stays open and
+  says why. If Options could not save a feedback, catch-up or handoff
+  preference, the control kept the new value as if it had been saved. It now
+  says *papio could not save this preference* and returns to the saved value.
+- **A library-session check is no longer skipped after a slow settings load.**
+  If a session check became due, or keepalive paused for a new sign-in, while
+  the extension was still loading its settings, the late load could erase that
+  state, and the next wake did not check the session again. The newer state now
+  survives the load.
+- ***papio* no longer reloads or redirects a sign-in tab you are typing in.**
+  When a sign-in succeeded in another tab, *papio* reloaded the waiting sign-in
+  tabs and sent resumed papers back to their pages, even the tab in front of
+  you. That erased anything you had typed. *papio* now leaves the tab you are
+  looking at alone, and your own sign-in in that tab still moves the paper on.
+- **A security check that clears by itself no longer asks you to solve it.**
+  Some Cloudflare checks pass in a few seconds with no action from you. *papio*
+  raised a **Security check** ask the first time it saw one and ended the
+  drive, so a page that became the article moments later still waited for you.
+  A check must now still be on the page after 8 seconds before *papio* asks
+  you. A redirect loop is still reported at once.
+- **A paper keeps its tab when Chrome will not add it to the *papio* group.**
+  Chrome refuses to group a tab when the focused window is not a normal browser
+  window, for example a DevTools window. *papio* then gave up the drive but
+  left the new tab open, so each retry added another tab and the paper did not
+  move. *papio* now keeps the tab and the drive, and creates a new group in the
+  tab's own window.
+- **The popup no longer offers to add a paper *papio* is already fetching.**
+  When *papio* held a paper's DOI as a `https://doi.org/` link, the popup did
+  not match it to the same DOI on the page, so it offered **Acquire** again.
+  Both forms now match.
+- **The inbox Open button for a paper you fetch yourself goes through your
+  library.** It opened the paper's own link, which for a paywalled paper is the
+  publisher's paywall. It now asks *papio* for your library's route when you
+  press it. When no library route applies, as for an open-access paper,
+  **Open** uses the paper's own link.
 
 ## [0.14.0] - 2026-08-14
 
@@ -1303,11 +1315,6 @@ for the full pre-split extension history.
   count by an invented per-paper duration.
 
 ### Fixed
-
-- **Manual PDF delivery recovers after extension reloads and browser restarts.**
-  Papio rebuilds PDF choices from the daemon's open manual-download actions when
-  session storage is empty. Each recovered choice still requires a fresh PDF
-  document binding; recovery does not open tabs or start downloads.
 
 - **Popup refreshes no longer starve on a slow daemon read.** The periodic tick
   now waits for an in-flight refresh instead of repeatedly superseding it, so
