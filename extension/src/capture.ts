@@ -37,6 +37,7 @@ export const PROVIDERS = [
   "springer",
   "elsevier",
   "acm",
+  "acs",
   "wiley",
   "tandfonline",
   "sage",

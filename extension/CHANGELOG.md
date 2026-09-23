@@ -87,6 +87,11 @@ for the full pre-split extension history.
   navigating again, including publishers with no adapter.
 
 ### Added
+- **ACS Publications entitled articles can use their primary PDF link.**
+  The adapter checks the page DOI, Subscribed badge, and article PDF control
+  before passing the same-origin link to the browser downloads API. Clicking
+  Open PDF opens a viewer window instead; a live download and PDF validation
+  remain unverified.
 
 - **Article-agent navigation can save a PDF embedded in a publisher page.**
   After following an exact same-origin link from a verified article, Papio can

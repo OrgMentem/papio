@@ -620,6 +620,62 @@ test("wiley download builds the /doi/pdfdirect endpoint from the DOI in the page
   );
 });
 
+// ACS captured an entitled Silverchair article on 2026-09-23. Its primary
+// contentPdf control has a direct-looking PDF path; clicking Open PDF opened a
+// viewer window without a download event. The href effect avoids that handler.
+const acsArticle = loadFixture("acs", "success");
+const acsDOI = "10.1021/acs.jcim.6c00481";
+const acsPDFPath = "/jcisd8/article-pdf/66/11/6299/65522619/ci6c00481.pdf";
+const acsURL = "https://pubs.acs.org/jcisd8/article/66/11/6299/5185032/NMR-Challenge-for-LLMs-Evaluating-Chemical";
+const acsSpec = adapters.find((a) => a.id === "acs")!;
+
+test.skipIf(acsArticle === null)("captured ACS subscribed article classifies as article", () => {
+  expect(classifyFixture(acsArticle as Document, acsSpec, { doi: acsDOI }).kind).toBe("article");
+  expect(acsSpec.classify.map((rule) => rule.kind)).toEqual(["article"]);
+  const withoutBadge = (acsArticle as Document).cloneNode(true) as Document;
+  withoutBadge.querySelector(".article-top-widget .article-access-icons i.icon-availability_unlocked")?.remove();
+  expect(classifyFixture(withoutBadge, acsSpec).kind).toBe("unknown");
+  const withoutControl = (acsArticle as Document).cloneNode(true) as Document;
+  withoutControl.querySelector(".article-pdf-button-wrapper > a.article-pdf-button")?.remove();
+  expect(classifyFixture(withoutControl, acsSpec).kind).toBe("unknown");
+});
+
+test.skipIf(acsArticle === null)("ACS plans and executes the primary article PDF href", async () => {
+  const page = parseHTML(readFileSync(fixturePath("acs", "success"), "utf8"), acsURL);
+  const rule = acsSpec.download as DownloadRule;
+  const control = page.querySelector(rule.selector);
+  expect(page.querySelectorAll(rule.selector)).toHaveLength(1);
+  expect(control?.getAttribute("href")).toBe(acsPDFPath);
+  expect(control?.getAttribute("data-doi")).toBe(acsDOI);
+  expect(control?.getAttribute("target")).toBe("_blank");
+  const result = planExecution(page, acsSpec, { doi: acsDOI }, { access_mode: "delegated" });
+  if ("assisted" in result) throw new Error(result.assisted);
+  expect(result.verdict.kind).toBe("article");
+  expect(result.method).toBe("href");
+  expect(result.required_consequence).toBe("download");
+  expect(result.url).toBe(`https://pubs.acs.org${acsPDFPath}`);
+  expect(result.target_ref?.selector).toBe(rule.selector);
+  const previous = { document: globalThis.document, location: globalThis.location };
+  Object.assign(globalThis, { document: page, location: new URL(acsURL) });
+  try {
+    expect(await executePlannedPageEffect(result, rule)).toEqual({
+      ok: true,
+      url: `https://pubs.acs.org${acsPDFPath}`,
+    });
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+test.skipIf(acsArticle === null)("ACS refuses a different requested DOI before download", () => {
+  const page = parseHTML(readFileSync(fixturePath("acs", "success"), "utf8"), acsURL);
+  const result = planExecution(page, acsSpec, { doi: "10.1021/acs.jcim.6c00482" }, { access_mode: "delegated" });
+  expect(result.verdict.kind).toBe("wrong_work");
+  if ("assisted" in result) throw new Error(result.assisted);
+  expect(result.required_consequence).toBe("none");
+  expect(result.url).toBeNull();
+});
+
 // Cochrane Library: captured 2026-08-24 from an authenticated review page
 // (fixtures/cochrane/success.html). Every PDF affordance on the page — and
 // citation_pdf_url — names /pdf/full, an HTML viewer wrapper, so the adapter

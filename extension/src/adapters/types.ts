@@ -808,6 +808,35 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
+    // Captured 2026-09-23 on an entitled ACS Publications article
+    // (fixtures/acs/success.html). Its Subscribed badge and primary contentPdf
+    // control appear together; supplementary PDFs use article-supplement instead.
+    // The control's href names a same-origin .pdf file path, but clicking Open PDF
+    // opens a viewer window rather than producing a browser download event.
+    // Read the live href through the downloads API instead. File bytes still
+    // require a live download and PDF validation.
+    id: "acs",
+    version: "0.1.0",
+    hosts: ["pubs.acs.org"],
+    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
+    settleTimeoutMs: 5000,
+    classify: [{
+      kind: "article",
+      all: [
+        "meta[name='citation_doi']",
+        ".article-top-widget .article-access-icons [data-resource-id-access] i.icon-availability_unlocked[title='Subscribed']",
+        ".article-pdf-button-wrapper > a.article-pdf-button[data-doctype='contentPdf'][data-doi][href^='/'][href*='/article-pdf/']",
+      ],
+    }],
+    download: {
+      method: "href",
+      selector: ".article-pdf-button-wrapper > a.article-pdf-button[data-doctype='contentPdf'][data-doi][href^='/'][href*='/article-pdf/']",
+      requireKind: "article",
+      workTarget: { kind: "doi", attribute: "data-doi" },
+      allowedDestinations: [{ origin: "https://pubs.acs.org", pathPrefix: "/" }],
+    },
+  },
+  {
     // Verified live 2026-07-17 against an institutionally authenticated Wiley Online Library
     // article (fixtures/wiley/success.html). The page's citation_pdf_url meta
     // points at /doi/pdf/<doi>, but that path returns an HTML viewer wrapper —
