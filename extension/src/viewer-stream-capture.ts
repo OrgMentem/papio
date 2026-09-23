@@ -47,6 +47,8 @@ export interface StreamFilterLike {
   readonly error: string;
   write(data: ArrayBuffer): void;
   close(): void;
+  /** Hand the rest of the response back to the browser, unfiltered. */
+  disconnect(): void;
 }
 
 export interface ViewerHeadersDetails {
@@ -203,7 +205,16 @@ export class ViewerStreamCapture {
       }
       chunks.push(event.data);
     };
-    filter.onerror = () => fail("the signed viewer response failed before papio had the whole PDF");
+    filter.onerror = () => {
+      fail("the signed viewer response failed before papio had the whole PDF");
+      // Never keep owning a response that errored: whatever the browser still
+      // delivers goes to the viewer without papio in the way.
+      try {
+        filter.disconnect();
+      } catch {
+        // An errored filter may already be detached.
+      }
+    };
     filter.onstop = () => {
       try {
         filter.close();

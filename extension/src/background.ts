@@ -2839,6 +2839,11 @@ export class Bridge {
   /** Download id -> object URL of a captured PDF, revoked once the download
    * completes or is interrupted. */
   private readonly viewerCaptureURLs = new Map<number, string>();
+  /** Captured-PDF saves whose downloads.download() has not resolved yet, and
+   * the ids of downloads that ended meanwhile, so an object URL is released
+   * whichever of the two events comes first. */
+  private viewerCaptureSaving = 0;
+  private readonly viewerCaptureEnded = new Set<number>();
   /** IDs most recently counted from the durable ledger. A worker restart
    * recovers this set during the first badge paint; it lets navigation/removal
    * repaint only when a surface that actually contributed a human sign-in
@@ -17642,6 +17647,7 @@ export class Bridge {
       const objectURL = objectURLs.create(capture.body);
       this.pendingDownloadURLs.set(objectURL, jobID);
       let id: number;
+      this.viewerCaptureSaving++;
       try {
         id = await this.deps.downloads.download({
           url: objectURL, filename: jobDownloadFilename(jobID), conflictAction: "uniquify", saveAs: false,
@@ -17653,9 +17659,15 @@ export class Bridge {
         this.viewerCapture.settle(jobID, "failed");
         await this.reportNativeViewerDownloadRequired(jobID, url, tabID, { detail: "the browser refused to save the captured viewer PDF" });
         return;
+      } finally {
+        this.viewerCaptureSaving--;
       }
       this.pendingDownloadURLs.delete(objectURL);
       this.viewerCaptureURLs.set(id, objectURL);
+      // The download may have ended before download() resolved; its delta then
+      // found no object URL to release.
+      if (this.viewerCaptureEnded.delete(id)) this.revokeViewerCaptureURL(id);
+      if (this.viewerCaptureSaving === 0) this.viewerCaptureEnded.clear();
       track.ids.add(id);
       if (track.ids.size > 1) track.ambiguous = true;
       this.viewerCapture.settle(jobID, "saved");
@@ -17680,7 +17692,12 @@ export class Bridge {
   /** Release a captured PDF's object URL once its download has ended. */
   private revokeViewerCaptureURL(downloadID: number): void {
     const objectURL = this.viewerCaptureURLs.get(downloadID);
-    if (objectURL === undefined) return;
+    if (objectURL === undefined) {
+      // A capture's download can end before its id is known; remember the id
+      // until that save registers it.
+      if (this.viewerCaptureSaving > 0) this.viewerCaptureEnded.add(downloadID);
+      return;
+    }
     this.viewerCaptureURLs.delete(downloadID);
     (this.deps.objectURLs ?? GLOBAL_OBJECT_URLS).revoke(objectURL);
   }

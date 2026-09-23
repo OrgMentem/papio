@@ -10127,11 +10127,15 @@ class FakeStreamFilter implements StreamFilterLike {
   /** What the viewer received, in order. */
   readonly written: ArrayBuffer[] = [];
   closed = false;
+  disconnected = false;
   write(data: ArrayBuffer): void {
     this.written.push(data);
   }
   close(): void {
     this.closed = true;
+  }
+  disconnect(): void {
+    this.disconnected = true;
   }
   deliver(bytes: Uint8Array): void {
     this.ondata?.({ data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer });
@@ -10291,6 +10295,8 @@ for (const failure of ["truncated", "error", "not_pdf"] as const) {
     }
     await settle();
     expect(filter.written).toHaveLength(1);
+    // A filter that errored hands the response back to the browser.
+    expect(filter.disconnected).toBe(failure === "error");
     expect(h.downloads.started).toEqual([]);
     expect(notices().map(f => [f.job_id, f.payload["detail"]])).toEqual([["job_rule_a", {
       truncated: `the signed viewer response ended after ${SIGNED_PDF.byteLength} of 5000 bytes`,
@@ -10319,6 +10325,25 @@ test("Firefox compares a decoded body with Content-Length only when the response
   filter.stop();
   await settle();
   expect(h.downloads.started.map(d => d.filename)).toEqual(["papio/job_rule_a/paper.pdf"]);
+});
+
+test("Firefox releases a captured PDF's object URL when its download ends before download() resolves", async () => {
+  const { h, web, objectURLs } = await captureHarness();
+  h.downloads.afterCreate = async (id) => {
+    // The save completes, and Firefox reports it, before the id comes back;
+    // the follow-up history read then fails.
+    h.downloads.items.set(id, { id, state: "complete", mime: "application/pdf",
+      filename: "/Downloads/papio/job_rule_a/paper.pdf", fileSize: SIGNED_PDF.byteLength });
+    await h.downloads.onChanged.emit({ id, state: { current: "complete" } });
+    h.deps.downloads.search = async () => { throw new Error("history unavailable"); };
+  };
+  await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 100 });
+  const filter = web.filters.get("r1")!;
+  filter.deliver(SIGNED_PDF);
+  filter.stop();
+  await settle();
+  expect(h.downloads.started.map(d => d.url)).toEqual(["blob:moz-extension://papio/1"]);
+  expect(objectURLs.revoked).toEqual(["blob:moz-extension://papio/1"]);
 });
 
 test("Firefox keeps passing a PDF past the capture limit to the viewer and saves nothing", async () => {
