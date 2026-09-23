@@ -17,7 +17,7 @@ import {
   type StoreShape,
 } from "./state";
 import { renderPapio } from "./dom";
-import { adapters, type AdapterSpec } from "./adapters/types";
+import { adapters, deliveryOrigins, type AdapterSpec } from "./adapters/types";
 export {
   ALL_SITES_ORIGIN,
   CATCH_UP_ENABLED_KEY,
@@ -37,6 +37,10 @@ import {
 export interface Source {
   label: string;
   origin: string;
+  /** A provider's delivery-host origins (AdapterSpec.deliveryHosts). The row
+   * grants and revokes them with `origin`, and reads as granted only when all
+   * of them are. */
+  deliveryOrigins?: readonly string[];
 }
 
 const ALL_SITES_SOURCE: Source = {
@@ -81,16 +85,24 @@ function adapterLabel(adapter: AdapterSpec): string {
   return words.join(" ") || adapter.hosts[0] || "Unknown provider";
 }
 
-/** Produce host permissions that match the provider and all its subdomains. */
+/** Produce host permissions that match the provider and all its subdomains.
+ * A provider's delivery hosts ride on its own rows, never as rows of their own. */
 export function providerSourcesFromAdapters(adapterSpecs: readonly AdapterSpec[]): Source[] {
   const sources = new Map<string, Source>();
   for (const adapter of adapterSpecs) {
+    const delivery = deliveryOrigins(adapter);
     for (const host of adapter.hosts) {
       const origin = `https://*.${host.toLowerCase()}/*`;
-      if (!sources.has(origin)) sources.set(origin, { label: adapterLabel(adapter), origin });
+      if (!sources.has(origin))
+        sources.set(origin, { label: adapterLabel(adapter), origin, ...(delivery.length > 0 ? { deliveryOrigins: delivery } : {}) });
     }
   }
   return [...sources.values()];
+}
+
+/** Every origin one source's switch grants or revokes. */
+export function sourceOrigins(source: Source): string[] {
+  return [source.origin, ...(source.deliveryOrigins ?? [])];
 }
 
 export const PROVIDER_SOURCES = providerSourcesFromAdapters(adapters);
@@ -128,7 +140,7 @@ function render(
     host.textContent = source.origin;
     meta.append(label, host);
 
-    const specificallyGranted = permissionSnapshot.origins.includes(source.origin);
+    const specificallyGranted = sourceOrigins(source).every((origin) => permissionSnapshot.origins.includes(origin));
     const coveredByAllSites =
       source.origin !== ALL_SITES_ORIGIN &&
       !specificallyGranted &&
@@ -155,8 +167,8 @@ function render(
       // callback. Awaiting a state read first loses Chrome's user gesture.
       toggle.disabled = true;
       const change = specificallyGranted
-        ? chrome.permissions.remove({ origins: [source.origin] })
-        : chrome.permissions.request({ origins: [source.origin] });
+        ? chrome.permissions.remove({ origins: sourceOrigins(source) })
+        : chrome.permissions.request({ origins: sourceOrigins(source) });
       const refresh = (): void => {
         void renderPermissionLists().then(() => {
           if (toggle.isConnected) toggle.disabled = false;
@@ -173,7 +185,7 @@ function render(
 // Bulk grants keep Firefox's one-click prompt. Revocation includes the broad
 // optional origin so its label remains true when that grant is active.
 function wireProviderBulk(sources: readonly Source[]): void {
-  const origins = sources.map((source) => source.origin);
+  const origins = [...new Set(sources.flatMap(sourceOrigins))];
   const revokeOrigins = [...origins, ALL_SITES_ORIGIN];
   const grantAll = document.getElementById("grant-all");
   const revokeAll = document.getElementById("revoke-all");

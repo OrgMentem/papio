@@ -28,6 +28,13 @@ for the full pre-split extension history.
   notice nor **Send this PDF** on such a link tells you to open the PDF in
   Chrome any more. A viewer tab that the paper's tab opens stays armed while
   Firefox suspends the extension.
+- **Allowing ScienceDirect also allows the host that serves its PDF.** The
+  ScienceDirect switch in the options page, the popup's **Allow** button for a
+  blocked ScienceDirect page, and **Allow all** now also ask for
+  `https://*.sciencedirectassets.com/*`, and turning ScienceDirect off removes
+  both. Without that host, neither Chrome nor Firefox let *papio* save the
+  one-time PDF. If you allowed ScienceDirect before this version, its switch
+  shows as off until you turn it on again.
 - **New Firefox-only permissions: `webRequest`, `webRequestBlocking` and
   `webRequestFilterResponse`.** They let the extension read the one PDF
   response in *papio*'s own handoff tabs. The bytes go only to the local

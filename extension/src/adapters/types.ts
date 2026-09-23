@@ -166,6 +166,12 @@ export interface AdapterSpec {
   /** Separate platforms within a provider domain that this adapter cannot
    * classify. Each exclusion also covers its subdomains. */
   excludedHosts?: string[];
+  /** Domains that serve this provider's PDF bytes but are never provider
+   * pages (ScienceDirect's signed viewer on sciencedirectassets.com). Each
+   * covers its subdomains. They are requested with every grant of the
+   * provider's own hosts, so the browser lets papio act on that PDF response,
+   * and they never select this adapter. */
+  deliveryHosts?: string[];
   /** Ordered rules; first match wins. */
   classify: ClassifyRule[];
   /** Exact packaged page evidence used to bind expected DOI/title identity. */
@@ -221,6 +227,17 @@ export function adapterSupportsHost(host: string, spec: AdapterSpec): boolean {
   const matches = (domain: string): boolean =>
     normalized === domain || normalized.endsWith(`.${domain}`);
   return spec.hosts.some(matches) && !(spec.excludedHosts ?? []).some(matches);
+}
+
+/** The origins of a provider's delivery hosts, requested and revoked together
+ * with every grant of the provider's own hosts. */
+export function deliveryOrigins(spec: AdapterSpec): string[] {
+  return (spec.deliveryHosts ?? []).map((host) => `https://*.${host.toLowerCase()}/*`);
+}
+
+/** The delivery origins of every adapter whose scope covers `host`. */
+export function deliveryOriginsForHost(host: string, specs: readonly AdapterSpec[] = adapters): string[] {
+  return [...new Set(specs.filter((spec) => adapterSupportsHost(host, spec)).flatMap(deliveryOrigins))];
 }
 
 /**
@@ -703,6 +720,10 @@ export const adapters: AdapterSpec[] = [
     id: "sciencedirect",
     version: "0.8.2",
     hosts: ["sciencedirect.com"],
+    // pdf.sciencedirectassets.com serves the signed viewer PDF. Without access
+    // to it, Chrome's viewer rule and Firefox's capture never see that
+    // response (see viewer-download-rule.ts).
+    deliveryHosts: ["sciencedirectassets.com"],
     workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
     settleTimeoutMs: 5000,
     // ScienceDirect's access bar hydrates client-side and does not paint at all

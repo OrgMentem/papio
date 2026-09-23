@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 
 import { Window } from "happy-dom";
 
-import { adapters } from "../src/adapters/types";
+import { adapters, adapterSupportsHost } from "../src/adapters/types";
 import type { Source } from "../src/options";
 import { PAGE_CAPTURE_CONSENT_KEY } from "../src/state";
 
@@ -232,6 +232,48 @@ test("derives unique origins and retains every PsycNet host", async () => {
   expect(page.providerOrigins).toContain("https://*.doi.apa.org/*");
 });
 
+const SCIENCEDIRECT = "https://*.sciencedirect.com/*";
+const SCIENCEDIRECT_DELIVERY = "https://*.sciencedirectassets.com/*";
+/** Every provider origin, each followed by its delivery-host origins. */
+const withDelivery = (origins: readonly string[]): string[] =>
+  origins.flatMap((origin) => origin === SCIENCEDIRECT ? [origin, SCIENCEDIRECT_DELIVERY] : [origin]);
+
+test("granting ScienceDirect also grants its PDF delivery host from the same row", async () => {
+  const page = await optionsDocument();
+  // One row for the provider; the delivery host is never a row of its own.
+  expect(page.providerOrigins).not.toContain(SCIENCEDIRECT_DELIVERY);
+  // The delivery host never selects the provider's adapter.
+  const sciencedirect = adapters.find((adapter) => adapter.id === "sciencedirect")!;
+  expect(adapterSupportsHost("pdf.sciencedirectassets.com", sciencedirect)).toBe(false);
+  expect([...page.document.querySelectorAll("#sources .source-label")]
+    .filter((label) => label.textContent === "ScienceDirect (Elsevier)")).toHaveLength(1);
+  (sourceRow(page.document, "sources", SCIENCEDIRECT)?.querySelector("button[role='switch']") as HTMLButtonElement).click();
+  await settle();
+  expect(page.permissionRequests).toEqual([[SCIENCEDIRECT, SCIENCEDIRECT_DELIVERY]]);
+  expect(sourceRow(page.document, "sources", SCIENCEDIRECT)?.querySelector("button[role='switch']")?.getAttribute("aria-checked")).toBe("true");
+
+  (sourceRow(page.document, "sources", SCIENCEDIRECT)?.querySelector("button[role='switch']") as HTMLButtonElement).click();
+  await settle();
+  expect(page.permissionRemovals).toEqual([[SCIENCEDIRECT, SCIENCEDIRECT_DELIVERY]]);
+  expect(page.grantedOrigins.has(SCIENCEDIRECT_DELIVERY)).toBe(false);
+});
+
+test("a ScienceDirect grant from before its delivery host reads as off and completes on click", async () => {
+  const page = await optionsDocument({ origins: [SCIENCEDIRECT] });
+  const toggle = sourceRow(page.document, "sources", SCIENCEDIRECT)?.querySelector("button[role='switch']") as HTMLButtonElement;
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  toggle.click();
+  await settle();
+  expect(page.permissionRequests).toEqual([[SCIENCEDIRECT, SCIENCEDIRECT_DELIVERY]]);
+});
+
+test("grant all requests every provider origin with the delivery hosts", async () => {
+  const page = await optionsDocument();
+  (page.document.getElementById("grant-all") as HTMLButtonElement).click();
+  await settle();
+  expect(page.permissionRequests).toEqual([withDelivery(page.providerOrigins)]);
+});
+
 test("shows all-sites access as its own controllable permission", async () => {
   const page = await optionsDocument();
   const row = sourceRow(page.document, "all-sites-access", ALL_SITES_ORIGIN);
@@ -272,7 +314,8 @@ test("revoke all removes the broad grant with the provider origins", async () =>
 
   (page.document.getElementById("revoke-all") as HTMLButtonElement).click();
   await settle();
-  expect(page.permissionRemovals).toEqual([[...page.providerOrigins, ALL_SITES_ORIGIN]]);
+  // A provider's delivery host is revoked with it; each origin appears once.
+  expect(page.permissionRemovals).toEqual([[...withDelivery(page.providerOrigins), ALL_SITES_ORIGIN]]);
   expect(page.grantedOrigins.has(ALL_SITES_ORIGIN)).toBe(false);
   const row = sourceRow(page.document, "sources", "https://*.journals.sagepub.com/*");
   expect(row?.querySelector("button[role='switch']")?.getAttribute("aria-checked")).toBe("false");

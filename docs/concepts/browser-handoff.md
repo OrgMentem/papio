@@ -74,6 +74,11 @@ keeps a copy of the PDF while its viewer shows it, then saves the copy into the
 job's folder. Neither browser asks the publisher for the file a second time. The
 daemon validates the saved file before it marks the job ready.
 
+The browser shows *papio* that response only on a host it may access. When you
+allow a provider such as ScienceDirect, *papio* therefore also asks for the host
+that serves its PDF, `https://*.sciencedirectassets.com/*`, on the same switch,
+and removes both together.
+
 If that cannot happen, *papio* keeps the PDF open and asks you to use the
 viewer's **Download** button. This occurs when the PDF opened before *papio*
 armed the tab, when *papio* has no access to the PDF's host, or when the

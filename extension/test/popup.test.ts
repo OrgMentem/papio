@@ -1520,6 +1520,23 @@ test("provider grant requests the exact normalized https origin and rejects path
   expect(requested).toEqual([{ origins: ["https://journals.sagepub.com/*"] }]);
 });
 
+test("provider grant for ScienceDirect also requests its PDF delivery host", async () => {
+  const requested: unknown[] = [];
+  Object.assign(globalThis, {
+    chrome: {
+      permissions: {
+        request: async (permission: unknown) => {
+          requested.push(permission);
+          return true;
+        },
+      },
+    },
+  });
+
+  expect(await grantProviderAccess("www.sciencedirect.com")).toBe(true);
+  expect(requested).toEqual([{ origins: ["https://www.sciencedirect.com/*", "https://*.sciencedirectassets.com/*"] }]);
+});
+
 test("opens the singleton inbox through the broker when it acknowledges", async () => {
   const requests: unknown[] = [];
   const created: unknown[] = [];

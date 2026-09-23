@@ -46,7 +46,7 @@ import {
 } from "./keepalive";
 import { renderPapio } from "./dom";
 import { formatShare, parseStatsReply, type AcquisitionStats } from "./stats";
-import { providerViewerPDFURL } from "./adapters/types";
+import { deliveryOriginsForHost, providerViewerPDFURL } from "./adapters/types";
 
 
 declare const __PAPIO_DEV_CAPTURE__: boolean;
@@ -4643,7 +4643,9 @@ export async function grantProviderAccess(host: string): Promise<boolean> {
   } catch {
     return false;
   }
-  return chrome.permissions.request({ origins: [`https://${normalized}/*`] });
+  // A provider's delivery hosts (ScienceDirect's signed PDF viewer) come with
+  // it, or the browser never shows papio that PDF response.
+  return chrome.permissions.request({ origins: [`https://${normalized}/*`, ...deliveryOriginsForHost(normalized)] });
 }
 
 export async function openOptions(): Promise<void> {

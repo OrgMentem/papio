@@ -122,6 +122,13 @@ provider domains. Exclusions include subdomains and apply wherever the browser
 selects an adapter; they do not change the job’s permitted hosts. Such a platform
 follows the missing-adapter path until its own captured rules exist.
 
+An adapter can declare `deliveryHosts` for a domain that serves the provider's
+PDF but is never a provider page, such as ScienceDirect's
+`sciencedirectassets.com`. Each delivery host includes its subdomains. The
+options page and the popup request it together with the provider's own hosts,
+and revoke it with them, so the browser lets *papio* act on that PDF response.
+A delivery host never selects the adapter.
+
 A classification rule can pair `textAny` with `textSelector` to read a specific
 status heading instead of the whole page. The selector must match exactly one
 element; missing, invalid, or ambiguous matches leave the rule unsatisfied.
