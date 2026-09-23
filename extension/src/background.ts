@@ -1730,6 +1730,10 @@ interface DownloadTrack {
    * download belongs to the materialization tab. Ordinary/manual downloads
    * must not inherit a job's lingering materialization correlation. */
   institutional?: InstitutionalDownloadAttempt;
+  /** Chrome's one refetch of a signed PDF-viewer URL. The URL is memory-only
+   * and never leaves the worker. A failure spends the attempt and falls back
+   * to the viewer Download notice for `tabID`. */
+  viewerRefetch?: { url: string; tabID: number; settled?: boolean };
 }
 /** Local loop bookkeeping on the existing persisted job, never authority. */
 interface AgentJobState {
@@ -2022,14 +2026,15 @@ function hostMatches(host: string, providerHosts: string[]): boolean {
 }
 
 /**
- * True when papio must not fetch this URL itself, and should ask for the PDF
- * viewer's own Download button instead — bytes the browser already holds.
+ * True when papio must not expect a second fetch of this URL to succeed. The
+ * PDF viewer's own Download button serves bytes the browser already holds.
  *
  * ScienceDirect's viewer can display the PDF while a second request to its
  * URL returns HTML (measured again 2026-09-20). Signed delivery links from
  * other publishers are conservatively treated the same way: possession of
  * their URL does not establish that the delivery grant is reusable. This
- * does not assert that every signed URL is single-use.
+ * does not assert that every signed URL is single-use, so Chrome tries the
+ * URL once under the job's download binding before it asks for the button.
  */
 function requiresNativeViewerDownload(url: string): boolean {
   try {
@@ -2041,6 +2046,8 @@ function requiresNativeViewerDownload(url: string): boolean {
   }
   return carriesSignedCredential(url);
 }
+
+const NATIVE_VIEWER_CHROME_MESSAGE = "Choose Send this PDF in papio, then use the PDF viewer Download button.";
 
 /** Parse a released semver (with an optional leading v) without retaining its
  * prerelease identifier: callers only need to distinguish release from pre-release. */
@@ -18982,8 +18989,12 @@ export class Bridge {
    * continuation explicit: Send PDF will bind the live document before the
    * operator's Download click. This notice grants no download authority and
    * persists neither the URL nor its credential. The worker-local URL lets the
-   * popup show the instruction on the PDF tab that actually needs it. */
-  private async reportNativeViewerDownloadRequired(jobID: string, url: string, tabID: number): Promise<void> {
+   * popup show the instruction on the PDF tab that actually needs it. `spent`
+   * names why Chrome's one refetch failed (never the URL) and the discarded
+   * download, which is not evidence of a usable file. */
+  private async reportNativeViewerDownloadRequired(
+    jobID: string, url: string, tabID: number, spent?: { detail: string; downloadID?: number },
+  ): Promise<void> {
     // The click latch alone does not prove a file exists, but a correlated or
     // completed download does. Check browser history too after a worker nap.
     if (this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)) return;
@@ -18994,7 +19005,7 @@ export class Bridge {
       return; // Unknown download state must not invite a duplicate manual copy.
     }
     if (
-      existing.some(item => item.state === "in_progress" || item.state === "complete") ||
+      existing.some(item => item.id !== spent?.downloadID && (item.state === "in_progress" || item.state === "complete")) ||
       this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID)
     ) return;
     if (!this.hasDelegatedAuthority(findByJob(this.store, jobID))) return;
@@ -19004,7 +19015,7 @@ export class Bridge {
     const code = "native_viewer_download_required";
     const message = this.isFirefox()
       ? "Open this PDF in Chrome, choose Send this PDF in papio, then use the PDF viewer Download button."
-      : "Choose Send this PDF in papio, then use the PDF viewer Download button.";
+      : NATIVE_VIEWER_CHROME_MESSAGE;
     const pending = this.store.pendingDelivery;
     // Do not overwrite an operator's delivery or an already displayed notice.
     if (pending?.job_id === jobID && pending.error === message) {
@@ -19030,7 +19041,7 @@ export class Bridge {
     const noticeKey = `${jobID}:${code}`;
     if (this.handoffOutcomeSent.has(noticeKey)) return;
     if ((this.store.daemonFeatures ?? []).some(feature => feature === NATIVE_VIEWER_DOWNLOAD_FEATURE || feature === NATIVE_VIEWER_SAVE_FEATURE)) {
-      if (this.send("provider_outcome", { outcome: code }, jobID)) {
+      if (this.send("provider_outcome", { outcome: code, ...(spent === undefined ? {} : { detail: spent.detail }) }, jobID)) {
         this.handoffOutcomeSent.add(noticeKey);
         // Tear down the drive, not the visible file. The close path retains
         // PDF content; a child viewer is not the parent's managed surface.
@@ -19048,6 +19059,63 @@ export class Bridge {
       // existing diagnostic path and do not pretend it created a task.
       this.handoffOutcomeSent.add(noticeKey);
     }
+  }
+
+  /** Chrome may fetch a signed viewer URL once through the job's download
+   * binding; Firefox cannot steer that download. A sent or displayed viewer
+   * notice spends the attempt, and the persisted notice survives a restart. */
+  private viewerRefetchAllowed(jobID: string): boolean {
+    if (this.isFirefox() || this.handoffOutcomeSent.has(`${jobID}:native_viewer_download_required`)) return false;
+    const pending = this.store.pendingDelivery;
+    return !(pending?.job_id === jobID && pending.error === NATIVE_VIEWER_CHROME_MESSAGE);
+  }
+
+  /** The refetch produced no PDF: drop its file and history entry, then ask
+   * for the viewer's Download button. Idempotent across duplicate events. */
+  private async failViewerRefetch(jobID: string, track: DownloadTrack, downloadID: number, detail: string): Promise<void> {
+    const refetch = track.viewerRefetch;
+    if (refetch === undefined || refetch.settled === true || this.downloads.get(jobID) !== track) return;
+    refetch.settled = true;
+    await this.discardDownload(jobID, downloadID);
+    if (this.adoptedViewerTabs.get(jobID) === refetch.tabID) this.adoptedViewerTabs.delete(jobID);
+    await this.reportNativeViewerDownloadRequired(jobID, refetch.url, refetch.tabID, { detail, downloadID });
+  }
+
+  /** Start Chrome's one refetch of a signed viewer URL. The caller holds the
+   * job's effect slot and has checked history for an existing file. The track
+   * is registered first so `onDownloadCreated` joins it rather than minting a
+   * second one; filename steering and adoption then run as for any viewer. */
+  private async startViewerRefetch(jobID: string, url: string, tabID: number): Promise<void> {
+    const track: DownloadTrack = { ids: new Set<number>(), ambiguous: false, directOffer: false, viewerRefetch: { url, tabID } };
+    this.downloads.set(jobID, track);
+    this.pendingDownloadURLs.set(url, jobID);
+    let id: number;
+    try {
+      id = await this.deps.downloads.download({
+        url, filename: jobDownloadFilename(jobID), conflictAction: "uniquify", saveAs: false,
+      });
+    } catch {
+      if (this.downloads.get(jobID) === track) this.downloads.delete(jobID);
+      if (this.adoptedViewerTabs.get(jobID) === tabID) this.adoptedViewerTabs.delete(jobID);
+      await this.reportNativeViewerDownloadRequired(jobID, url, tabID, { detail: "the browser refused to download the viewer URL" });
+      return;
+    } finally {
+      this.pendingDownloadURLs.delete(url);
+    }
+    track.ids.add(id);
+    if (track.ids.size > 1) track.ambiguous = true;
+    if (findByJob(this.store, jobID)?.download_initiated !== true)
+      await this.update(s => patchJob(s, jobID, { download_initiated: true }));
+    // An expired grant can fail before download() resolves; its onChanged
+    // delta then found no tracked id. Re-read the item once it is tracked.
+    let item: DownloadItemLike | undefined;
+    try {
+      [item] = await this.deps.downloads.search({ id });
+    } catch {
+      return; // onChanged still reports a later interruption.
+    }
+    if (item?.state === "interrupted")
+      await this.failViewerRefetch(jobID, track, id, "the browser download of the viewer URL was interrupted");
   }
 
   /** Download a tracked PDF-viewer navigation through Chrome's download API.
@@ -19094,15 +19162,18 @@ export class Bridge {
     )
       return;
 
-    if (requiresNativeViewerDownload(downloadURL)) {
+    const refetch = requiresNativeViewerDownload(downloadURL);
+    if (refetch && !this.viewerRefetchAllowed(jobID)) {
       await this.reportNativeViewerDownloadRequired(jobID, downloadURL, job.tab_id);
       return;
     }
 
     // Re-read after the permission/probe awaits: a content-disposition
-    // download may have been correlated while this probe was in flight.
+    // download may have been correlated while this probe was in flight. A
+    // signed viewer is what the adapter's click produced, so its latch is not
+    // download evidence there; browser history is checked below instead.
     job = findByJob(this.store, jobID);
-    if (!job || job.download_initiated === true || this.downloads.has(jobID))
+    if (!job || (!refetch && job.download_initiated === true) || this.downloads.has(jobID))
       return;
     const effectToken = this.claimEffectGovernor(jobID);
     if (effectToken === undefined) {
@@ -19113,6 +19184,16 @@ export class Bridge {
       return;
     }
     try {
+      if (refetch) {
+        const existing = await this.findJobDownloads(jobID);
+        if (
+          existing.some(item => item.state === "in_progress" || item.state === "complete") ||
+          this.downloads.has(jobID) || this.completedDownloadTabs.has(jobID) ||
+          !this.hasDelegatedAuthority(findByJob(this.store, jobID))
+        ) return;
+        await this.startViewerRefetch(jobID, downloadURL, job.tab_id);
+        return;
+      }
       await this.update((s) =>
         patchJob(s, jobID, { download_initiated: true }),
       );
@@ -19229,11 +19310,16 @@ export class Bridge {
         this.completedDownloadTabs.has(job.job_id)
       )
         return;
-      if (requiresNativeViewerDownload(url)) {
+      const refetch = requiresNativeViewerDownload(url);
+      if (refetch && !this.viewerRefetchAllowed(job.job_id)) {
         await this.reportNativeViewerDownloadRequired(job.job_id, url, viewerTabId);
         return;
       }
       this.adoptedViewerTabs.set(job.job_id, viewerTabId);
+      if (refetch) {
+        await this.startViewerRefetch(job.job_id, url, viewerTabId);
+        return;
+      }
       this.pendingDownloadURLs.set(url, job.job_id);
       const id = await this.deps.downloads.download({
         url,
@@ -22877,6 +22963,12 @@ export class Bridge {
       if (state === "interrupted") {
         for (const job of this.store.activeJobs) {
           const track = this.downloads.get(job.job_id);
+          if (track?.viewerRefetch !== undefined && track.ids.has(delta.id)) {
+            const code = delta.error?.current;
+            await this.failViewerRefetch(job.job_id, track, delta.id,
+              `the browser download of the viewer URL was interrupted${code !== undefined && /^[A-Z_]{1,40}$/u.test(code) ? ` (${code})` : ""}`);
+            return;
+          }
           if (track?.generic !== undefined && track.ids.has(delta.id)) {
             await this.discardDownload(job.job_id, delta.id);
             await this.sendGenericEpochResult(
@@ -22993,6 +23085,10 @@ export class Bridge {
       if (outcome === "not_pdf" && acknowledged)
         await this.advanceGenericCandidate(owner.job_id, track.generic);
       else await this.retainGenericCandidate(owner.job_id, track.generic);
+      return;
+    }
+    if (track.viewerRefetch !== undefined && (mime === "text/html" || mime === "application/xhtml+xml")) {
+      await this.failViewerRefetch(owner.job_id, track, delta.id, "re-fetching the signed viewer URL returned HTML instead of the PDF");
       return;
     }
     if (track.delivery === true) {

@@ -17,6 +17,12 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **Chrome tries a signed PDF viewer's download once.** When a handoff lands
+  on a ScienceDirect or other signed PDF viewer, Chrome now downloads the
+  viewer URL into the job's papio folder, and the daemon validates it as usual.
+  If the download returns HTML or fails, papio discards it and shows the
+  existing Send this PDF / viewer Download instruction, with the reason in the
+  job's history. papio does not try again for that job. Firefox is unchanged.
 - **The article agent waits for a freshly loaded page before it reads it.**
   A cookie-check or bot shell served just after navigation, as
   pmc.ncbi.nlm.nih.gov does, no longer ends the attempt as `identity_missing`

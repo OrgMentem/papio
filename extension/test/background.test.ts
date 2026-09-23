@@ -9313,6 +9313,16 @@ test("a cross-origin api download with a content-disposition rename steers into 
   expect(complete?.payload["filename"]).toBe("retrieve.pdf");
 });
 
+/** Chrome's one refetch of a signed viewer URL returns HTML, as measured on
+ * ScienceDirect; the discarded item then leaves browser history. */
+async function failSignedRefetch(h: Harness, jobID: string, id = 901) {
+  h.downloads.items.set(id, { id, state: "complete", mime: "text/html",
+    filename: `/Downloads/papio/${jobID}/init.html`, fileSize: 4_000 });
+  await h.downloads.onChanged.emit({ id, state: { current: "complete" } });
+  for (let i = 0; i < 200; i++) await Promise.resolve();
+  h.downloads.items.delete(id);
+}
+
 for (const child of [false, true]) {
   test(`native viewer manual task releases its drive without granting download authority: child=${child}`, async () => {
     const jobID = "job_native_viewer_queue";
@@ -9335,13 +9345,15 @@ for (const child of [false, true]) {
     if (child) h.tabs.seed({ id: viewerID, url: "about:blank", openerTabId: 100 });
     await h.tabs.completeNavigation(viewerID, "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=secret");
     for (let i = 0; i < 200; i++) await Promise.resolve();
+    expect(h.downloads.started).toHaveLength(1);
+    await failSignedRefetch(h, jobID);
     expect(internals.handoffDrives.has(jobID)).toBe(false);
     expect(h.frames().filter(f => f.type === "provider_outcome" && f.payload["outcome"] === "native_viewer_download_required")).toHaveLength(1);
     expect(h.backend.store.activeJobs.find(j => j.job_id === jobID)).toMatchObject({ tab_id: -1, provider_hosts: [] });
     expect(h.backend.store.activeJobs.find(j => j.job_id === jobID)?.access_mode).toBeUndefined();
     expect(h.bridge.deliveryState()).toMatchObject({ state: "failed", job_id: jobID });
     expect(h.tabs.removed).not.toContain(viewerID);
-    expect(h.downloads.started).toEqual([]);
+    expect(h.downloads.started).toHaveLength(1);
     expect(h.backend.store.activeJobs.find(j => j.job_id === "job_next_after_viewer")?.tab_id).toBeGreaterThanOrEqual(0);
     // A browser download before Send PDF is not authorized by the notice.
     const suggestions: unknown[] = [];
@@ -9355,13 +9367,13 @@ for (const child of [false, true]) {
       url: "https://pdf.sciencedirectassets.com/77/main.pdf", doi: "10.1234/example" });
     expect(delivery).toMatchObject({ ok: true, state: "waiting_manual", job_id: jobID });
     expect(h.backend.store.pendingDelivery?.page_identity?.tab_id).toBe(viewerID);
-    expect(h.downloads.started).toEqual([]);
+    expect(h.downloads.started).toHaveLength(1);
   });
 }
 
 for (const status of ["accepted", "auth_pending"] as const) {
   for (const child of [false, true]) {
-    test(`signed viewer navigation asks for Send PDF without re-fetching: ${status}, child=${child}`, async () => {
+    test(`signed viewer navigation asks for Send PDF after one failed refetch: ${status}, child=${child}`, async () => {
       const jobID = "job_signed_viewer";
       const h = makeHarness({
         ...emptyStore(),
@@ -9378,8 +9390,10 @@ for (const status of ["accepted", "auth_pending"] as const) {
       if (child) h.tabs.seed({ id: viewerID, url: "about:blank", openerTabId: 100 });
       const viewerURL = "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=private-token";
       await h.tabs.completeNavigation(viewerID, viewerURL);
+      expect(h.downloads.started).toHaveLength(1);
+      await failSignedRefetch(h, jobID);
       await h.tabs.completeNavigation(viewerID, viewerURL);
-      expect(h.downloads.started).toEqual([]);
+      expect(h.downloads.started).toHaveLength(1);
       expect(h.bridge.deliveryState()).toMatchObject({
         state: "failed", job_id: jobID,
         message: expect.stringMatching(/Send this PDF.*Download/),
@@ -9394,6 +9408,86 @@ for (const status of ["accepted", "auth_pending"] as const) {
     });
   }
 }
+
+/** A resident handoff tab that settles on a signed ScienceDirect viewer. The
+ * adapter's View PDF click already set the download latch; the viewer, not a
+ * download, is what it produced. */
+async function residentSignedViewer(opts: { firefox?: boolean } = {}) {
+  const jobID = "job_resident_viewer";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: jobID, tab_id: 100,
+      offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
+      status: "auth_pending", provider_hosts: ["www.sciencedirect.com"],
+      access_mode: "delegated", download_initiated: true, expected: { doi: "10.1234/example" },
+    }],
+  }, opts.firefox === true ? { firefox: true } : undefined);
+  h.tabs.seed({ id: 100, url: OPENURL });
+  await h.bridge.start();
+  await h.port.onMessage.emit(helloAck({ daemon_version: CURRENT_DAEMON, features: ["native_viewer_download_v1"] }));
+  const viewerURL = "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=private-token";
+  await h.tabs.completeNavigation(100, viewerURL);
+  for (let i = 0; i < 200; i++) await Promise.resolve();
+  const notices = () => h.frames().filter(f =>
+    (f.type === "provider_outcome" && f.payload["outcome"] === "native_viewer_download_required") ||
+    (f.type === "error" && f.payload["code"] === "native_viewer_download_required"));
+  return { h, jobID, viewerURL, notices };
+}
+
+test("Chrome downloads a resident signed viewer's URL under the job binding", async () => {
+  const { h, jobID, viewerURL, notices } = await residentSignedViewer();
+  expect(h.downloads.started).toEqual([{
+    url: viewerURL, filename: `papio/${jobID}/paper.pdf`, conflictAction: "uniquify", saveAs: false,
+  }]);
+  expect(notices()).toHaveLength(0);
+  // A second load event for the same viewer must not start a second fetch.
+  await h.tabs.completeNavigation(100, viewerURL);
+  for (let i = 0; i < 200; i++) await Promise.resolve();
+  expect(h.downloads.started).toHaveLength(1);
+  const id = 901;
+  h.downloads.items.set(id, { id, state: "complete", mime: "application/pdf",
+    filename: `/Downloads/papio/${jobID}/paper.pdf`, fileSize: 250_000 });
+  await h.downloads.onChanged.emit({ id, state: { current: "complete" } });
+  expect(h.frames().filter(f => f.job_id === jobID && f.type === "download_complete")).toHaveLength(1);
+  expect(notices()).toHaveLength(0);
+  expect(JSON.stringify(h.frames())).not.toContain("private-token");
+});
+
+for (const failure of ["html", "interrupted"] as const) {
+  test(`Chrome falls back to the viewer Download notice when the refetch fails: ${failure}`, async () => {
+    const { h, jobID, notices } = await residentSignedViewer();
+    const id = 901;
+    if (failure === "html") {
+      h.downloads.items.set(id, { id, state: "complete", mime: "text/html",
+        filename: `/Downloads/papio/${jobID}/init.html`, fileSize: 4_000 });
+      await h.downloads.onChanged.emit({ id, state: { current: "complete" } });
+    } else {
+      h.downloads.items.set(id, { id, state: "interrupted", filename: `/Downloads/papio/${jobID}/paper.pdf` });
+      await h.downloads.onChanged.emit({ id, state: { current: "interrupted" }, error: { current: "SERVER_BAD_CONTENT" } });
+    }
+    for (let i = 0; i < 200; i++) await Promise.resolve();
+    const outcome = notices();
+    expect(outcome).toHaveLength(1);
+    expect(outcome[0]?.type).toBe("provider_outcome");
+    expect(String(outcome[0]?.payload["detail"])).toMatch(failure === "html" ? /returned HTML/ : /interrupted \(SERVER_BAD_CONTENT\)/);
+    expect(h.downloads.removedFiles).toContain(id);
+    expect(h.frames().filter(f => f.job_id === jobID && (f.type === "download_complete" || f.type === "error"))).toHaveLength(0);
+    expect(h.bridge.deliveryState()).toMatchObject({ state: "failed", job_id: jobID });
+    expect(JSON.stringify(h.frames())).not.toContain("private-token");
+    // The spent attempt is never repeated for the same viewer.
+    await h.tabs.completeNavigation(100, "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=private-token");
+    for (let i = 0; i < 200; i++) await Promise.resolve();
+    expect(h.downloads.started).toHaveLength(1);
+  });
+}
+
+test("Firefox keeps the resident signed viewer on the native-save notice", async () => {
+  const { h, notices } = await residentSignedViewer({ firefox: true });
+  expect(h.downloads.started).toEqual([]);
+  expect(notices()).toHaveLength(1);
+  expect(notices()[0]?.payload["detail"]).toBeUndefined();
+});
 
 for (const scenario of ["unrelated", "assisted", "downloaded", "search_failed", "delivery_busy", "restart"] as const) {
   test(`signed viewer notice preserves authority and existing work: ${scenario}`, async () => {
@@ -9421,6 +9515,10 @@ for (const scenario of ["unrelated", "assisted", "downloaded", "search_failed", 
     h.tabs.seed({ id: 101, url: "about:blank", openerTabId: scenario === "unrelated" ? 999 : 100 });
     const url = "https://pdf.sciencedirectassets.com/77/main.pdf";
     await h.tabs.completeNavigation(101, url);
+    // Only a delegated, file-less job spends its one Chrome refetch.
+    const refetched = scenario === "delivery_busy" || scenario === "restart";
+    expect(h.downloads.started).toHaveLength(refetched ? 1 : 0);
+    if (refetched) await failSignedRefetch(h, jobID);
     if (scenario === "restart") {
       h = restartWorker(h);
       await h.bridge.start();
@@ -9431,7 +9529,7 @@ for (const scenario of ["unrelated", "assisted", "downloaded", "search_failed", 
     } else {
       expect(h.bridge.deliveryState()).toMatchObject({ state: "idle" });
     }
-    expect(h.downloads.started).toEqual([]);
+    expect(h.downloads.started).toHaveLength(refetched ? 1 : 0);
   });
 }
 
