@@ -1,4 +1,4 @@
-import type { TabChangeInfo, TabInfo } from "../src/background";
+import type { TabChangeInfo, TabInfo } from "../src/browser-types";
 
 export class FakeEmitter<A extends unknown[]> {
   private readonly listeners: ((...args: A) => unknown)[] = [];

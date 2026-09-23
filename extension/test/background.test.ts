@@ -78,13 +78,12 @@ import {
   type DownloadDeltaLike,
   type DownloadItemLike,
   type NativePort,
-  type SurfaceCloseDisposition,
   type NavigationErrorMarkerEntry,
   type PageBulkSnapshotView,
   type PdfGrabCorrelation,
-  type TabChangeInfo,
-  type TabInfo,
 } from "../src/background";
+import type { TabChangeInfo, TabInfo } from "../src/browser-types";
+import type { SurfaceCloseDisposition } from "../src/surface-lifecycle";
 import type { NativeRequestResult } from "../src/correlation";
 import { routeResolverService } from "../src/resolver";
 import { VIEWER_DOWNLOAD_RULE_IDS, type ViewerDownloadRule } from "../src/viewer-download-rule";

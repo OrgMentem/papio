@@ -406,13 +406,13 @@ export type MaterializationEvent =
   | { type: "failed" }
   | { type: "clear" };
 
-const MATERIALIZATION_ID = /^[A-Za-z0-9_-]{8,128}$/u;
+export const MATERIALIZATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/u;
 
 const RFC3339 =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
 
 function validMaterializationID(value: unknown): value is string {
-  return typeof value === "string" && MATERIALIZATION_ID.test(value);
+  return typeof value === "string" && MATERIALIZATION_ID_PATTERN.test(value);
 }
 
 function validRFC3339(value: unknown): value is string {

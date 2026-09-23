@@ -131,11 +131,11 @@ function forbiddenCalls(): Map<string, number> {
 
 const KEEPALIVE_ALLOWLIST = new Map<string, { count: number; why: string }>([
   [
-    "background.ts:closeOwnedTab",
+    "surface-lifecycle.ts:closeOwnedTab",
     { count: 1, why: "The sole lifecycle close primitive; its synchronous four-predicate gate is the invariant boundary." },
   ],
   [
-    "background.ts:recoverKeepalive",
+    "surface-lifecycle.ts:recoverKeepalive",
     {
       count: 1,
       why: "The keepalive manager retires only a live, current-epoch keepalive birth record when disabled, superseded, or duplicated. Reload recovery also requires that record's exact document ID; stale hints are forgotten without closing their tabs.",
