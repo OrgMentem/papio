@@ -2667,7 +2667,17 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 		case *p.SurfaceTabID != claim.TabID:
 			eligible = true
 		default:
-			superseded, supErr := b.jobs.SupersededMaterializationClaim(ctx, claim.ID)
+			// A claim that has settled or been abandoned drives nothing any
+			// more, so its own tab is superseded whatever else exists: a
+			// redrive abandons the previous claim and, on the handoff path,
+			// drives the paper through a tab no claim names. Refusing here
+			// kept one tab per redrive on the operator's screen (measured
+			// live 2026-09-23: two to four tabs on single papers).
+			superseded := claim.Phase == "settled" || claim.Phase == "abandoned"
+			var supErr error
+			if !superseded {
+				superseded, supErr = b.jobs.SupersededMaterializationClaim(ctx, claim.ID)
+			}
 			if supErr != nil {
 				result.Outcome, result.Detail = "error", "binding claim state is unavailable"
 				return frame()
@@ -2689,10 +2699,12 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 	case "job_inactive":
 		// A navigated surface is not closable merely because it looks old.
 		// The daemon must prove the browser handoff itself is no longer live:
-		// terminal job, or no open openurl_handoff action after the same direct
-		// lookup poll() uses before emitting cancel. The binding remains the
-		// resource identity, and an unsettled effect for this exact claim still
-		// vetoes closure.
+		// terminal job, a binding whose own claim has settled or been
+		// abandoned (a redrive abandons the old one while the paper waits on
+		// a fresh handoff), or no open openurl_handoff action after the same
+		// direct lookup poll() uses before emitting cancel. The binding
+		// remains the resource identity, and an unsettled effect for this
+		// exact claim still vetoes closure.
 		candidate, candidateErr := b.jobs.GetBrowserCandidate(ctx, claim.CandidateID)
 		if candidateErr != nil || candidate == nil {
 			result.Outcome, result.Detail = "error", "binding candidate state is unavailable"
@@ -2703,7 +2715,7 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 			result.Outcome, result.Detail = "error", "binding job state is unavailable"
 			return frame()
 		}
-		inactive := job.Terminal(row.State)
+		inactive := job.Terminal(row.State) || claim.Phase == "settled" || claim.Phase == "abandoned"
 		if !inactive {
 			_, actionErr := b.openHandoffForJob(ctx, row.ID)
 			switch {

@@ -16168,6 +16168,41 @@ func TestSurfaceCloseSupersededRetiresAReDrivenClaimsOwnTab(t *testing.T) {
 	})
 }
 
+// A redrive abandons the paper's previous claim and parks the paper on a fresh
+// handoff, so the job is alive with an open action while the old binding
+// drives nothing. Both closes the extension asks for that old tab were refused
+// on that basis - job_inactive because the handoff is open, surface_superseded
+// because the tab is the (dead) claim's own - which is how every redrive left
+// a tab behind (measured live 2026-09-23: two to four tabs on single papers).
+// A settled or abandoned claim is the daemon's own proof that its tab is spent.
+func TestSurfaceCloseRetiresTheTabOfAClaimThatDrivesNothing(t *testing.T) {
+	for _, phase := range []string{"settled", "abandoned"} {
+		for _, disposition := range []string{"job_inactive", "surface_superseded"} {
+			t.Run(disposition+"_on_"+phase, func(t *testing.T) {
+				b, jobs, _, _ := newBridge(t)
+				runSync(t, b, materializationHello(t))
+				claim := seedSurfaceCloseClaim(t, b, jobs, "spent-"+disposition+"-"+phase, phase)
+				req := &protocol.SurfaceCloseRequestPayload{
+					RequestID: "req-spent", BindingID: claim.BindingID,
+					BrowserHolderGeneration: b.arbitration.generation(), Disposition: disposition,
+				}
+				if disposition == "surface_superseded" {
+					tab := claim.TabID
+					req.SurfaceTabID = &tab
+				}
+				frames, err := b.surfaceClose(context.Background(), req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := decodeSurfaceCloseResponse(t, frames)
+				if got.Outcome != "authorized" {
+					t.Fatalf("outcome = %q (detail %q), want authorized", got.Outcome, got.Detail)
+				}
+			})
+		}
+	}
+}
+
 func TestRequestDevReloadRequiresHolder(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	_, _, err := b.RequestDevReload("")
