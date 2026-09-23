@@ -2920,9 +2920,17 @@ test("a provider child of a papio tab is ledgered under its paper and closes wit
 // papio never recorded (a child opened before this build, a blank tab a
 // download-only navigation left) is closed once cold. A newborn child in the
 // moment before it is ledgered must never be.
-test("a cold unledgered tab in papio's container closes, and a warm one never does", async () => {
-  const h = makeHarness(undefined, { windows: true });
+test("a cold unledgered tab in papio's group closes; the operator's tabs in the same window never do", async () => {
+  // Live 2026-09-23: papio's group lives in the operator's own window, which
+  // papio also adopts as its work window. A sweep keyed on the window closed
+  // the operator's own reading tab. Only group membership makes an
+  // unrecorded tab papio's.
+  const h = makeHarness(
+    { ...emptyStore(), handoffGroupID: 700, workWindowID: 1 },
+    { windows: true, tabGroups: true, handoffSurface: "tab-group" },
+  );
   installManagedTabLedger(h, {});
+  h.tabGroups!.live.set(700, { id: 700, collapsed: true, title: "papio", windowId: 1 });
   await h.bridge.start();
   await h.port.inbound(
     helloAck({
@@ -2930,14 +2938,17 @@ test("a cold unledgered tab in papio's container closes, and a warm one never do
       browser_holder_generation: 1,
     }),
   );
+  // The live shape: the adopted work window IS the operator's window.
+  // The harness exposes the private store updater; the original test used it too.
   const internals = h.bridge as unknown as {
     update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
   };
   await internals.update((s) => ({ ...s, workWindowID: 1 }));
-  h.windows!.live.set(1, { id: 1, state: "minimized", focused: false });
+  h.windows!.live.set(1, { id: 1, state: "normal", focused: false });
   const cold = h.clock.now - 30 * 60_000;
-  const open = async (url: string, lastAccessed?: number): Promise<number> => {
+  const open = async (url: string, lastAccessed?: number, grouped = true): Promise<number> => {
     const tab = await h.tabs.create({ url, active: false, windowId: 1 });
+    if (grouped) h.tabs.patch(tab.id!, { groupId: 700 });
     if (lastAccessed !== undefined) h.tabs.patch(tab.id!, { lastAccessed });
     return tab.id!;
   };
@@ -2947,6 +2958,8 @@ test("a cold unledgered tab in papio's container closes, and a warm one never do
   h.tabs.patch(pinned, { pinned: true });
   const newborn = await open("https://www.sciencedirect.com/getPdf", h.clock.now);
   const unmeasured = await open("https://ebookcentral.proquest.com/lib/x");
+  const operatorsOwn = await open("https://www.example.edu/teaching/commencing-students", cold, false);
+  const operatorsBlank = await open("", cold, false);
   const elsewhere = await h.tabs.create({ url: "https://example.org/", active: false, windowId: 2 });
   h.tabs.patch(elsewhere.id!, { lastAccessed: cold });
 
@@ -2963,7 +2976,7 @@ test("a cold unledgered tab in papio's container closes, and a warm one never do
   from = h.port.posted.length;
   expect(await h.bridge.reconcileOwnedTabs()).toEqual({ closed: 1 });
   expect(h.tabs.removed).toContain(unmeasured);
-  for (const kept of [pinned, newborn, elsewhere.id!])
+  for (const kept of [pinned, newborn, operatorsOwn, operatorsBlank, elsewhere.id!])
     expect(h.tabs.snapshot(kept)).toBeDefined();
 });
 

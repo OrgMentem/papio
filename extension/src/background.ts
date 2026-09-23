@@ -4694,11 +4694,16 @@ export class Bridge {
       tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
     const inPapioGroup =
       tab.groupId !== undefined && tab.groupId === this.store.handoffGroupID;
+    // An unrecorded tab is papio's only by GROUP membership. The work window
+    // is adopted from wherever papio's tabs live, which is the operator's own
+    // window whenever the group sits there, so window membership alone would
+    // hand the operator's tabs to this sweep. Measured live 2026-09-23: it
+    // closed the operator's own reading tab.
     if (
       !rollbackPrivate &&
       !materializationCleanup &&
       (tab.pinned === true ||
-        (!inWorkWindow && !inPapioGroup) ||
+        (unledgeredContainer ? !inPapioGroup : !inWorkWindow && !inPapioGroup) ||
         (await this.operatorIsViewing(tab)))
     )
       return false;
@@ -5450,15 +5455,13 @@ export class Bridge {
         pinnedToJobs.has(tabID)
       )
         continue;
-      // Group membership needs a lookup; the work window does not.
-      const inWorkWindow =
-        tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
+      // Group membership only, never the work window: see closeOwnedTab's
+      // unledgered-container gate for why the window is not evidence.
       const inPapioGroup =
-        !inWorkWindow &&
         tab.groupId !== undefined &&
         tab.groupId >= 0 &&
         (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !== undefined;
-      if (!inWorkWindow && !inPapioGroup) continue;
+      if (!inPapioGroup) continue;
       present.add(tabID);
       const firstSeen = this.unledgeredSeenAt.get(tabID);
       if (firstSeen === undefined) this.unledgeredSeenAt.set(tabID, now);

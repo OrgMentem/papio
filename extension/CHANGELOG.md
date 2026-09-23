@@ -33,6 +33,10 @@ for the full pre-split extension history.
   pinned or in front of you.
 
 ### Fixed
+- **papio no longer closes your own tabs.** The unrecorded-tab sweep treated
+  every cold tab in papio's work window as papio's, and papio adopts the
+  window that holds its tab group as that work window, which is your own
+  window. The sweep now closes only unrecorded tabs inside papio's tab group.
 - **A redrive no longer leaves the old tab beside the new one.** Opening a
   surface for a paper now retires that paper's other papio tabs.
 - **The minimized work window's selected tab is no longer treated as in use.**
