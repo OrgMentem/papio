@@ -234,18 +234,23 @@ opener's group and papio never recorded.
   `owner_closed`. It stays while its paper is still driven from a tab, and
   otherwise follows the paper: it closes when the paper is filed, ends, is
   driven again, or is tabless and cold.
-- **Unrecorded tabs in papio's container close when cold.** A tab in papio's
-  group or work window with no birth record, not tracked by a live job, not
+- **Unrecorded tabs in papio's tab group close when cold.** A tab inside
+  papio's own tab group with no birth record, not tracked by a live job, not
   pinned and not in front of the operator is closed browser-locally once it is
   cold: last active at least the parked-surface cold window ago, or, where the
   browser does not report that, seen unrecorded by two passes that far apart.
-  The first-seen time lives in worker memory, keyed by tab id, never with a URL.
-  A newborn child is warm by both measures, so the moment before it is recorded
-  can never close it. No `provider_outcome` is sent and no toast is raised.
+  Group membership is the only evidence. The work window is not: papio adopts
+  whichever window holds its tabs, which is the operator's own window whenever
+  the group sits there. The first build also swept the work window, and on
+  2026-09-23 it closed the operator's own reading tab and several ungrouped
+  tabs. The first-seen time lives in worker memory, keyed by tab id, never with
+  a URL. A newborn child is warm by both measures, so the moment before it is
+  recorded can never close it. No `provider_outcome` is sent and no toast is
+  raised.
 
 This collides with two bans in Decision 4: it is a universal backstop over a
 container, and it uses age (last access) as liveness. The operator's decision
-overrides both for papio's own group and work window only. Everywhere else the
+overrides both for papio's own tab group only. Everywhere else the
 bans stand: a tab outside papio's container is never closed on age, and a
 recorded surface still retires only on claim state and explicit transitions.
 
