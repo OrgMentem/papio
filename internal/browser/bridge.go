@@ -12391,13 +12391,18 @@ func (b *Bridge) providerDriveEpochForOffer(row job.Row, action job.HumanAction,
 		}
 		forceNewEpoch = forceNewEpoch || retryAfterEpoch
 	} else if b.jobs != nil {
-		// The last handoff may be the DOI route. A fresh institutional
-		// attempt must not inherit its provider safety domain.
+		// The last handoff may be the DOI route, or the same institutional
+		// route whose epoch ended terminally. A fresh institutional attempt
+		// (adapter upgrade or operator redrive) must not inherit either its
+		// provider safety domain or a terminal epoch: the extension keeps
+		// `generic_terminal` per epoch, so reusing one reports "this browser
+		// attempt is already terminal" (measured 2026-09-23 on ai.jmir.org).
 		institutionalRetryPending := false
 		for _, event := range events {
 			if event["kind"] == "job.retry_requested" {
 				detail, _ := event["detail"].(map[string]any)
-				if stringDetail(detail, "reason") == "adapter_upgraded" {
+				switch stringDetail(detail, "reason") {
+				case "adapter_upgraded", "operator_redrive":
 					institutionalRetryPending = true
 				}
 			}

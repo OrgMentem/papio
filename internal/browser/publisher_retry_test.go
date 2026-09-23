@@ -338,3 +338,42 @@ func TestPublisherRetryCannotRetireSecurityChallenge(t *testing.T) {
 		t.Fatal("publisher retry bypassed challenge")
 	}
 }
+
+// An operator redrive is a fresh institutional attempt: the offer must mint
+// a new drive epoch instead of reusing the attempt whose epoch ended
+// terminally. Measured 2026-09-23 on ai.jmir.org: the reused epoch made the
+// extension report "this browser attempt is already terminal".
+func TestOperatorRedriveMintsAFreshDriveEpoch(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := parkInstitutional(t, jobs, "redrive-fresh-epoch", handoffWork(), "")
+	if err := jobs.RecordEvent(ctx, id, "browser.provider_drive_epoch_offered", map[string]any{
+		"drive_attempt_id": "old-attempt", "ordinal": 0, "strategy": "generic", "revision": "1",
+		"safety_domain": "institution:openurl.example.edu",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "job.retry_requested", map[string]any{"reason": "operator_redrive"}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := b.openHandoffForJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, materializationHello(t))
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, ordinal, err := b.providerDriveEpochForOffer(*row, *action, events, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt == "old-attempt" || ordinal == nil {
+		t.Fatalf("redrive reused the terminal epoch: attempt=%q ordinal=%v", attempt, ordinal)
+	}
+}
