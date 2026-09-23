@@ -87,6 +87,7 @@ import {
 } from "../src/background";
 import type { NativeRequestResult } from "../src/correlation";
 import { routeResolverService } from "../src/resolver";
+import { VIEWER_DOWNLOAD_RULE_IDS, type ViewerDownloadRule } from "../src/viewer-download-rule";
 import { ChromeTabsFake, FakeWebNavigation } from "./fake-tabs";
 import { FakeDownloads } from "./fake-downloads";
 import {
@@ -799,6 +800,7 @@ function makeHarness(
     downloads.onCreated.snapshot(),
     downloads.onChanged.snapshot(),
     downloads.onDeterminingFilename?.snapshot(),
+    webNavigation.onBeforeNavigate.snapshot(),
     webNavigation.onCommitted.snapshot(),
     webNavigation.onHistoryStateUpdated.snapshot(),
     webNavigation.onReferenceFragmentUpdated.snapshot(),
@@ -9543,6 +9545,128 @@ test("Firefox keeps the resident signed viewer on the native-save notice", async
   expect(h.downloads.started).toEqual([]);
   expect(notices()).toHaveLength(1);
   expect(notices()[0]?.payload["detail"]).toBeUndefined();
+});
+
+/** Chrome's declarativeNetRequest as papio sees it: the session rules it
+ * wrote last, and a switch for a Chrome that rejects them (before 128, which
+ * lacks the response-header condition). */
+class FakeSessionRules {
+  readonly calls: { removeRuleIds?: number[]; addRules?: ViewerDownloadRule[] }[] = [];
+  reject = false;
+  async updateSessionRules(options: { removeRuleIds?: number[]; addRules?: ViewerDownloadRule[] }): Promise<void> {
+    this.calls.push(options);
+    if (this.reject && (options.addRules?.length ?? 0) > 0) throw new Error("Unexpected property: 'responseHeaders'");
+  }
+  rules(): ViewerDownloadRule[] {
+    return this.calls.at(-1)?.addRules ?? [];
+  }
+  armedTabs(): number[] {
+    return this.rules()[0]?.condition.tabIds ?? [];
+  }
+}
+
+const SIGNED_VIEWER = "https://pdf.sciencedirectassets.com/77/main.pdf?X-Amz-Signature=private-token";
+
+/** Two delegated ScienceDirect handoffs in flight at once, as live on
+ * 2026-09-23, on a Chrome with viewer-download rules. */
+async function viewerRuleHarness(opts: { firefox?: boolean; reject?: boolean; hostGranted?: boolean } = {}) {
+  const job = (jobID: string, tabID: number): ActiveJob => ({
+    job_id: jobID, tab_id: tabID, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
+    status: "auth_pending", provider_hosts: ["www.sciencedirect.com"], access_mode: "delegated",
+    download_initiated: true, expected: { doi: `10.1234/${jobID}` },
+  });
+  const h = makeHarness({ ...emptyStore(), activeJobs: [job("job_rule_a", 100), job("job_rule_b", 200)] },
+    opts.firefox === true ? { firefox: true } : undefined);
+  const rules = new FakeSessionRules();
+  rules.reject = opts.reject === true;
+  h.deps.declarativeNetRequest = rules;
+  h.deps.permissions.contains = async ({ origins }) =>
+    opts.hostGranted !== false && origins[0] === "https://pdf.sciencedirectassets.com/*";
+  h.tabs.seed({ id: 100, url: "https://www.sciencedirect.com/science/article/pii/A" });
+  h.tabs.seed({ id: 200, url: "https://www.sciencedirect.com/science/article/pii/B" });
+  await h.bridge.start();
+  await h.port.onMessage.emit(helloAck({ daemon_version: CURRENT_DAEMON, features: ["native_viewer_download_v1"] }));
+  await settle();
+  const notices = () => h.frames().filter(f =>
+    f.type === "provider_outcome" && f.payload["outcome"] === "native_viewer_download_required");
+  return { h, rules, notices };
+}
+
+async function settle(): Promise<void> {
+  for (let i = 0; i < 200; i++) await Promise.resolve();
+}
+
+test("Chrome downloads the signed viewer's own response for the tab that navigated, with no refetch", async () => {
+  const { h, rules, notices } = await viewerRuleHarness();
+  expect(rules.armedTabs()).toEqual([100, 200]);
+  // Every rule stays inside papio's tabs and acts only on a PDF response.
+  for (const rule of rules.rules()) {
+    expect(rule.condition.tabIds).toEqual([100, 200]);
+    expect(rule.condition.responseHeaders).toEqual([{ header: "content-type", values: ["application/pdf*", "application/x-pdf*"] }]);
+    expect(rule.action.responseHeaders).toEqual([{ header: "content-disposition", operation: "set", value: 'attachment; filename="paper.pdf"' }]);
+  }
+  // Job B's tab navigates to its signed viewer; the rule makes Chrome download
+  // that response. Host correlation alone cannot choose between two
+  // ScienceDirect jobs, and the item carries no tab id on Chrome.
+  await h.webNavigation.onBeforeNavigate.emit({ tabId: 200, frameId: 0, url: SIGNED_VIEWER });
+  const id = 4242;
+  const item: DownloadItemLike = { id, url: SIGNED_VIEWER, finalUrl: SIGNED_VIEWER, mime: "application/pdf",
+    referrer: "https://www.sciencedirect.com/science/article/pii/B", state: "in_progress", filename: "" };
+  h.downloads.items.set(id, item);
+  await h.downloads.onCreated.emit(item);
+  const suggestions: { filename: string; conflictAction: "uniquify" }[] = [];
+  await h.downloads.onDeterminingFilename.emit({ ...item, filename: "/Downloads/paper.pdf" }, s => suggestions.push(s));
+  expect(suggestions).toEqual([{ filename: "papio/job_rule_b/paper.pdf", conflictAction: "uniquify" }]);
+  await settle();
+  // Job B has its download, so its tab is disarmed; job A stays armed.
+  expect(rules.armedTabs()).toEqual([100]);
+  h.downloads.items.set(id, { ...item, state: "complete", filename: "/Downloads/papio/job_rule_b/paper.pdf", fileSize: 250_000 });
+  await h.downloads.onChanged.emit({ id, state: { current: "complete" } });
+  expect(h.frames().filter(f => f.type === "download_started").map(f => f.job_id)).toEqual(["job_rule_b"]);
+  expect(h.frames().filter(f => f.type === "download_complete").map(f => f.job_id)).toEqual(["job_rule_b"]);
+  expect(h.downloads.started).toEqual([]);
+  expect(notices()).toHaveLength(0);
+  expect(JSON.stringify(h.frames())).not.toContain("private-token");
+});
+
+test("a viewer tab opened from an armed tab is armed, and a closed tab is disarmed", async () => {
+  const { h, rules } = await viewerRuleHarness();
+  h.tabs.seed({ id: 101, url: "about:blank", openerTabId: 100 });
+  await h.tabs.onUpdated.emit(101, { status: "loading" }, h.tabs.snapshot(101)!);
+  await settle();
+  expect(rules.armedTabs()).toEqual([100, 101, 200]);
+  await h.tabs.onRemoved.emit(101, { isWindowClosing: false });
+  await h.tabs.onRemoved.emit(200, { isWindowClosing: false });
+  await settle();
+  expect(rules.armedTabs()).toEqual([100]);
+  expect(rules.rules().every(rule => rule.condition.tabIds.length > 0)).toBe(true);
+});
+
+test("a signed viewer that renders without host access asks for the Download button with the reason", async () => {
+  const { h, notices } = await viewerRuleHarness({ hostGranted: false });
+  await h.tabs.completeNavigation(100, SIGNED_VIEWER);
+  await settle();
+  expect(h.downloads.started).toEqual([]);
+  expect(notices().map(f => [f.job_id, f.payload["detail"]])).toEqual([["job_rule_a", "viewer host permission missing"]]);
+});
+
+test("a Chrome that rejects the viewer rules keeps the one refetch", async () => {
+  const { h, rules, notices } = await viewerRuleHarness({ reject: true });
+  // The rejected write is followed by removing whatever was left.
+  expect(rules.calls.at(-1)).toEqual({ removeRuleIds: [...VIEWER_DOWNLOAD_RULE_IDS] });
+  await h.tabs.completeNavigation(100, SIGNED_VIEWER);
+  await settle();
+  expect(h.downloads.started).toEqual([{ url: SIGNED_VIEWER, filename: "papio/job_rule_a/paper.pdf", conflictAction: "uniquify", saveAs: false }]);
+  expect(notices()).toHaveLength(0);
+});
+
+test("Firefox installs no viewer rules and keeps the native-save notice", async () => {
+  const { h, rules, notices } = await viewerRuleHarness({ firefox: true });
+  await h.tabs.completeNavigation(100, SIGNED_VIEWER);
+  await settle();
+  expect(rules.calls).toEqual([]);
+  expect(h.downloads.started).toEqual([]);
+  expect(notices().map(f => f.payload["detail"])).toEqual([undefined]);
 });
 
 for (const scenario of ["unrelated", "assisted", "downloaded", "search_failed", "delivery_busy", "restart"] as const) {

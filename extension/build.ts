@@ -118,6 +118,12 @@ async function buildAll(): Promise<void> {
   // API is absent and handoffSurface() degrades tab-group mode to the work
   // window at runtime, so a lower strict_min_version stays compatible.
   firefoxManifest.background = { scripts: ["dist/background.js"] };
+  // declarativeNetRequestWithHostAccess serves only Chrome's signed-viewer
+  // download rules (src/viewer-download-rule.ts). Firefox keeps the
+  // native-save path and never installs them, so it does not ask for it.
+  firefoxManifest.permissions = (chromeManifest.permissions as string[]).filter(
+    (permission) => permission !== "declarativeNetRequestWithHostAccess",
+  );
   firefoxManifest.browser_specific_settings = {
     gecko: {
       id: "papio@orgmentem.com",

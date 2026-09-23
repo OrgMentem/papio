@@ -23,7 +23,8 @@
     "storage",
     "alarms",
     "tabGroups",
-    "webNavigation"
+    "webNavigation",
+    "declarativeNetRequestWithHostAccess"
   ],
   "host_permissions": [
     "https://*.alma.exlibrisgroup.com/*",

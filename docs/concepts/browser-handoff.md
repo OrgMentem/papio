@@ -231,6 +231,15 @@ extension uses to gather handoff tabs when tab-group mode is active; and
 notices if that tab later navigates somewhere else and lets the choice lapse
 instead of filing the next document under it. `webNavigation` reports that a
 navigation happened and the address it went to; it reads no page content.
+On Chrome, `declarativeNetRequestWithHostAccess` lets *papio* set
+`Content-Disposition: attachment` on a signed PDF viewer response, such as a
+ScienceDirect `pdf.sciencedirectassets.com` link, so that response downloads
+into the job's folder instead of opening in the viewer. The session rules name
+only *papio*'s own handoff tabs and the tabs they open, match only responses
+whose content type is PDF, and are removed when the job has its download or
+ends. Chrome applies them only on hosts *papio* already has access to, and
+the permission adds no install warning. The rules need Chrome 128 or later;
+Firefox does not request this permission.
 
 Host access splits into two tiers. Three host permissions are required and
 granted at install on Chrome: `https://*.alma.exlibrisgroup.com/*` and

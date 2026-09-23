@@ -159,6 +159,13 @@ import {
   PDF_GRAB_FEATURE,
 } from "./deliver";
 import {
+  matchesViewerDownloadRule,
+  SIGNED_VIEWER_HOST,
+  VIEWER_DOWNLOAD_RULE_IDS,
+  viewerDownloadRules,
+  type ViewerDownloadRule,
+} from "./viewer-download-rule";
+import {
   adapters,
   adapterSupportsHost,
   type AdapterSpec,
@@ -1457,6 +1464,16 @@ export interface BridgeDeps {
       [{ tabId: number; frameId: number; error?: string }]
     >;
   };
+  /** chrome.declarativeNetRequest session rules (Chrome only). papio arms its
+   * delegated handoff tabs so a signed PDF viewer response downloads instead
+   * of rendering; see viewer-download-rule.ts. Absent on Firefox, which keeps
+   * the native-save path. */
+  declarativeNetRequest?: {
+    updateSessionRules(options: {
+      removeRuleIds?: number[];
+      addRules?: ViewerDownloadRule[];
+    }): Promise<void>;
+  };
   /** Extension-page broadcast channel (runtime.onMessage), distinct from tabs.sendMessage content-script delivery. */
   runtimeSendMessage?(message: object): Promise<unknown>;
   /** chrome.windows seam. When present (and the user setting allows), broker
@@ -1730,10 +1747,12 @@ interface DownloadTrack {
    * download belongs to the materialization tab. Ordinary/manual downloads
    * must not inherit a job's lingering materialization correlation. */
   institutional?: InstitutionalDownloadAttempt;
-  /** Chrome's one refetch of a signed PDF-viewer URL. The URL is memory-only
-   * and never leaves the worker. A failure spends the attempt and falls back
-   * to the viewer Download notice for `tabID`. */
-  viewerRefetch?: { url: string; tabID: number; settled?: boolean };
+  /** Chrome's one download of a signed PDF viewer: either the viewer
+   * response itself, turned into a download by the session rule (`ruled`), or
+   * the fallback refetch of its URL where that rule is unavailable. The URL is
+   * memory-only and never leaves the worker. A failure spends the attempt and
+   * falls back to the viewer Download notice for `tabID`. */
+  viewerRefetch?: { url: string; tabID: number; ruled?: boolean; settled?: boolean };
 }
 /** Local loop bookkeeping on the existing persisted job, never authority. */
 interface AgentJobState {
@@ -2030,17 +2049,19 @@ function hostMatches(host: string, providerHosts: string[]): boolean {
  * PDF viewer's own Download button serves bytes the browser already holds.
  *
  * ScienceDirect's viewer can display the PDF while a second request to its
- * URL returns HTML (measured again 2026-09-20). Signed delivery links from
- * other publishers are conservatively treated the same way: possession of
- * their URL does not establish that the delivery grant is reusable. This
- * does not assert that every signed URL is single-use, so Chrome tries the
- * URL once under the job's download binding before it asks for the button.
+ * URL returns HTML (measured 2026-09-20, and again through a Chrome refetch
+ * on 2026-09-23). Signed delivery links from other publishers are
+ * conservatively treated the same way: possession of their URL does not
+ * establish that the delivery grant is reusable. On Chrome the session rules
+ * in viewer-download-rule.ts download the viewer's own response instead, so
+ * no second request is made; the one refetch remains only where those rules
+ * are unavailable.
  */
 function requiresNativeViewerDownload(url: string): boolean {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "https:") return false;
-    if (parsed.hostname === "pdf.sciencedirectassets.com") return true;
+    if (parsed.hostname === SIGNED_VIEWER_HOST) return true;
   } catch {
     return false;
   }
@@ -3194,6 +3215,23 @@ export class Bridge {
     (loaded: boolean) => void
   >();
   private readonly adoptedViewerTabs = new Map<string, number>();
+  /** Viewer-download session rules (Chrome). Child tab id -> job id for a tab
+   * a job's handoff tab opened; the job's own tab is read from the store. */
+  private readonly viewerRuleChildTabs = new Map<number, string>();
+  /** Armed tabs that have since closed. Chrome never reuses a tab id within a
+   * browser session, so a closed id stays disarmed until the job lets go. */
+  private readonly viewerRuleClosedTabs = new Set<number>();
+  /** Sorted tab ids the installed rules cover; undefined until this worker
+   * first writes them, so a new worker replaces its predecessor's rules. */
+  private viewerRuleTabsApplied: string | undefined;
+  /** "unsupported" once Chrome rejects the rules (before Chrome 128, which
+   * lacks the response-header condition); the refetch fallback then applies. */
+  private viewerRuleSupport: "unknown" | "active" | "unsupported" = "unknown";
+  private viewerRuleChain: Promise<void> = Promise.resolve();
+  /** Recent navigation URL -> tab id, so a download a viewer rule produced
+   * binds to the tab that navigated to it (Chrome's DownloadItem has no tab).
+   * Memory-only and bounded; never persisted or sent. */
+  private readonly recentNavigationTabs = new Map<string, number>();
   /** A finished download keeps its broker tab open until the daemon has
    * acknowledged the adoption attempt for that job. */
   private readonly completedDownloadTabs = new Map<string, number>();
@@ -8000,6 +8038,7 @@ export class Bridge {
       };
       n.onBeforeNavigate?.addListener(d => {
         if (d.frameId === 0) this.invalidateNativeViewerTab(d.tabId);
+        this.noteNavigationTab(d.tabId, d.url);
       });
       n.onCommitted?.addListener((d) => {
         if (d.frameId !== 0) return;
@@ -13933,6 +13972,7 @@ export class Bridge {
     this.listenersBound = true;
     this.deps.tabs.onUpdated.addListener((tabID, change, tab) => {
       if (change.status === "loading" || change.url !== undefined) this.invalidateNativeViewerTab(tabID);
+      this.noteViewerRuleChild(tabID, tab.openerTabId);
       this.touchTab(tabID);
       return this.onTabUpdated(tabID, change, tab);
     });
@@ -13940,6 +13980,7 @@ export class Bridge {
       this.invalidateNativeViewerTab(tabID);
       this.tabTouchEpoch.delete(tabID);
       this.keepaliveManager?.noteTabRemoved(tabID);
+      this.noteViewerRuleTabRemoved(tabID);
       return this.onTabRemoved(tabID);
     });
     this.deps.tabs.onActivated.addListener(({ tabId }) => {
@@ -14491,6 +14532,7 @@ export class Bridge {
     const signInBlockersBefore = this.signInBlockerCount();
     // Apply the transform synchronously so in-memory state stays in event order.
     this.store = fn(this.store);
+    void this.syncViewerDownloadRules();
     const signInBlockersChanged =
       signInBlockersBefore !== this.signInBlockerCount();
     // Persist after any in-flight save settles, writing the latest snapshot so
@@ -19105,13 +19147,147 @@ export class Bridge {
     }
   }
 
-  /** Chrome may fetch a signed viewer URL once through the job's download
-   * binding; Firefox cannot steer that download. A sent or displayed viewer
-   * notice spends the attempt, and the persisted notice survives a restart. */
+  /** Chrome may take one download of a signed viewer for the job, through
+   * its download binding; Firefox cannot steer that download. A sent or
+   * displayed viewer notice spends the attempt, and the persisted notice
+   * survives a restart. */
   private viewerRefetchAllowed(jobID: string): boolean {
     if (this.isFirefox() || this.handoffOutcomeSent.has(`${jobID}:native_viewer_download_required`)) return false;
     const pending = this.store.pendingDelivery;
     return !(pending?.job_id === jobID && pending.error === NATIVE_VIEWER_CHROME_MESSAGE);
+  }
+
+  /** Tab id -> job id for every tab the viewer-download rules should cover: a
+   * delegated job's handoff tab, and tabs it opened, while that job could
+   * still take its one signed-viewer download. Agent-driven jobs are left out
+   * because the agent binds its own navigation downloads. A tab two jobs claim
+   * belongs to neither. */
+  private viewerRuleTabs(): Map<number, string> {
+    const armed = new Map<number, string>();
+    if (this.isFirefox() || this.deps.declarativeNetRequest === undefined || this.viewerRuleSupport === "unsupported")
+      return armed;
+    const shared = new Set<number>();
+    const arm = (tabID: number, jobID: string): void => {
+      if (this.viewerRuleClosedTabs.has(tabID)) return;
+      const owner = armed.get(tabID);
+      if (owner !== undefined && owner !== jobID) shared.add(tabID);
+      armed.set(tabID, jobID);
+    };
+    for (const job of this.store.activeJobs) {
+      if (
+        job.tab_id < 0 || !this.hasDelegatedAuthority(job) || this.agentLoops.has(job.job_id) ||
+        (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") ||
+        (this.downloads.get(job.job_id)?.ids.size ?? 0) > 0 || this.completedDownloadTabs.has(job.job_id) ||
+        !this.viewerRefetchAllowed(job.job_id)
+      )
+        continue;
+      arm(job.tab_id, job.job_id);
+      for (const [child, owner] of this.viewerRuleChildTabs) if (owner === job.job_id) arm(child, owner);
+    }
+    for (const tabID of shared) armed.delete(tabID);
+    return armed;
+  }
+
+  /** Bring Chrome's session rules in line with `viewerRuleTabs`. Serialized,
+   * and a no-op while the armed set is unchanged. A rejection (Chrome before
+   * 128 has no response-header condition) marks the rules unsupported, which
+   * restores the refetch fallback and removes anything left installed. */
+  private syncViewerDownloadRules(): Promise<void> {
+    const dnr = this.deps.declarativeNetRequest;
+    if (dnr === undefined || this.isFirefox()) return Promise.resolve();
+    this.viewerRuleChain = this.viewerRuleChain.then(async () => {
+      const tabs = [...this.viewerRuleTabs().keys()].sort((a, b) => a - b);
+      const key = tabs.join(",");
+      if (key === this.viewerRuleTabsApplied) return;
+      try {
+        await dnr.updateSessionRules({
+          removeRuleIds: [...VIEWER_DOWNLOAD_RULE_IDS],
+          ...(tabs.length > 0 ? { addRules: viewerDownloadRules(tabs) } : {}),
+        });
+        this.viewerRuleTabsApplied = key;
+        if (tabs.length > 0) this.viewerRuleSupport = "active";
+      } catch (error) {
+        this.viewerRuleTabsApplied = undefined;
+        if (tabs.length === 0) return;
+        console.error("papio: signed-viewer download rules unavailable; keeping the refetch fallback", error);
+        this.viewerRuleSupport = "unsupported";
+        void this.syncViewerDownloadRules();
+      }
+    });
+    return this.viewerRuleChain;
+  }
+
+  /** A tab an armed tab opened (View PDF with target=_blank) is armed too.
+   * Called on its first update, which Chrome sends as the navigation starts
+   * and before the response the rule acts on. */
+  private noteViewerRuleChild(tabID: number, openerTabID: number | undefined): void {
+    if (
+      openerTabID === undefined || this.viewerRuleChildTabs.has(tabID) ||
+      this.deps.declarativeNetRequest === undefined || this.isFirefox() ||
+      findByTab(this.store, tabID) !== undefined
+    )
+      return;
+    const owner = this.viewerRuleTabs().get(openerTabID);
+    if (owner === undefined) return;
+    this.viewerRuleChildTabs.set(tabID, owner);
+    void this.syncViewerDownloadRules();
+  }
+
+  private noteViewerRuleTabRemoved(tabID: number): void {
+    if (this.deps.declarativeNetRequest === undefined || this.isFirefox()) return;
+    if (!this.viewerRuleChildTabs.delete(tabID)) {
+      if (findByTab(this.store, tabID) === undefined) return;
+      this.viewerRuleClosedTabs.add(tabID);
+    }
+    void this.syncViewerDownloadRules();
+  }
+
+  /** Remember which tab navigated to a URL so the download a viewer rule
+   * produces can be bound to that tab. Recorded whether or not this worker
+   * has written the rules yet: they outlive a sleeping worker, and the
+   * navigation event is what wakes it. Memory-only and bounded. */
+  private noteNavigationTab(tabID: number, url: string | undefined): void {
+    if (url === undefined || this.deps.declarativeNetRequest === undefined || this.isFirefox()) return;
+    this.recentNavigationTabs.delete(url);
+    this.recentNavigationTabs.set(url, tabID);
+    if (this.recentNavigationTabs.size > 64) {
+      const oldest = this.recentNavigationTabs.keys().next().value;
+      if (oldest !== undefined) this.recentNavigationTabs.delete(oldest);
+    }
+  }
+
+  /** The armed job whose tab navigated to this download's URL, when the
+   * download has the shape a viewer rule acts on. Chrome's DownloadItem
+   * carries no tab id, so the navigation URL is the exact link; host
+   * correlation cannot tell two ScienceDirect jobs apart. */
+  private viewerRuleBinding(item: DownloadItemLike): { jobID: string; tabID: number; url: string } | undefined {
+    const url = item.finalUrl ?? item.url;
+    if (item.byExtensionId !== undefined || url === undefined || !matchesViewerDownloadRule(url)) return undefined;
+    const armed = this.viewerRuleTabs();
+    for (const candidate of [item.url, item.finalUrl]) {
+      const tabID = candidate === undefined ? undefined : this.recentNavigationTabs.get(candidate);
+      const jobID = tabID === undefined ? undefined : armed.get(tabID);
+      if (tabID !== undefined && jobID !== undefined) return { jobID, tabID, url };
+    }
+    return undefined;
+  }
+
+  /** A signed viewer rendered although the viewer rules are installed. Its one
+   * response is spent and a refetch returns HTML, so ask for the viewer's
+   * Download button and name why. False only where the rules are unavailable,
+   * so the caller keeps the refetch fallback. */
+  private async reportViewerRuleMiss(jobID: string, url: string, tabID: number): Promise<boolean> {
+    if (this.viewerRuleSupport !== "active") return false;
+    let permitted = false;
+    try {
+      permitted = await this.deps.permissions.contains({ origins: [`https://${new URL(url).hostname}/*`] });
+    } catch {
+      permitted = false;
+    }
+    await this.reportNativeViewerDownloadRequired(jobID, url, tabID, {
+      detail: permitted ? "the signed viewer rendered outside papio's download rule" : "viewer host permission missing",
+    });
+    return true;
   }
 
   /** The refetch produced no PDF: drop its file and history entry, then ask
@@ -19211,6 +19387,7 @@ export class Bridge {
       await this.reportNativeViewerDownloadRequired(jobID, downloadURL, job.tab_id);
       return;
     }
+    if (refetch && await this.reportViewerRuleMiss(jobID, downloadURL, job.tab_id)) return;
 
     // Re-read after the permission/probe awaits: a content-disposition
     // download may have been correlated while this probe was in flight. A
@@ -19359,6 +19536,7 @@ export class Bridge {
         await this.reportNativeViewerDownloadRequired(job.job_id, url, viewerTabId);
         return;
       }
+      if (refetch && await this.reportViewerRuleMiss(job.job_id, url, viewerTabId)) return;
       this.adoptedViewerTabs.set(job.job_id, viewerTabId);
       if (refetch) {
         await this.startViewerRefetch(job.job_id, url, viewerTabId);
@@ -22808,18 +22986,39 @@ export class Bridge {
     // synchronously. Cross-origin redirects then steer by ID, not stale URL
     // correlation; ambiguity parking below still applies only when there is no
     // exact binding yet.
-    const syncJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
+    // A signed viewer response a session rule turned into a download is bound
+    // the same way, to the armed tab whose navigation produced it.
+    let syncJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
+    const viewerRule = syncJobID === undefined ? this.viewerRuleBinding(item) : undefined;
+    syncJobID ??= viewerRule?.jobID;
     if (syncJobID !== undefined) {
       const sync = this.downloads.get(syncJobID) ?? {
         ids: new Set<number>(),
         ambiguous: false,
         directOffer: false,
+        ...(viewerRule === undefined
+          ? {}
+          : { viewerRefetch: { url: viewerRule.url, tabID: viewerRule.tabID, ruled: true } }),
       };
       sync.ids.add(item.id);
       if (sync.ids.size > 1) sync.ambiguous = true;
       this.downloads.set(syncJobID, sync);
+      // The job has its download; stop turning its viewers into more.
+      if (viewerRule !== undefined) void this.syncViewerDownloadRules();
     }
     await this.ready;
+    // A worker Chrome woke for this download could not see its jobs until
+    // hydration; bind a viewer rule's download now, before the fallbacks below.
+    if (this.trackedJobFor(item.id) === undefined && this.pendingJobFor(item) === undefined) {
+      const lateRule = this.viewerRuleBinding(item);
+      if (lateRule !== undefined && !this.downloads.has(lateRule.jobID)) {
+        this.downloads.set(lateRule.jobID, {
+          ids: new Set([item.id]), ambiguous: false, directOffer: false,
+          viewerRefetch: { url: lateRule.url, tabID: lateRule.tabID, ruled: true },
+        });
+        void this.syncViewerDownloadRules();
+      }
+    }
     const earlyJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     if (earlyJobID !== undefined) {
       const early = this.downloads.get(earlyJobID) ?? {
@@ -23148,7 +23347,9 @@ export class Bridge {
       return;
     }
     if (track.viewerRefetch !== undefined && (mime === "text/html" || mime === "application/xhtml+xml")) {
-      await this.failViewerRefetch(owner.job_id, track, delta.id, "re-fetching the signed viewer URL returned HTML instead of the PDF");
+      await this.failViewerRefetch(owner.job_id, track, delta.id, track.viewerRefetch.ruled === true
+        ? "the signed viewer response downloaded as HTML instead of the PDF"
+        : "re-fetching the signed viewer URL returned HTML instead of the PDF");
       return;
     }
     if (track.delivery === true) {
@@ -24849,6 +25050,18 @@ function realDeps(): BridgeDeps {
               chrome.webNavigation.getFrame(details) as Promise<
                 { documentId?: string } | null
               >,
+          },
+        }
+      : {}),
+    // Chrome only: Firefox keeps the native-save path, and its manifest does
+    // not request the permission.
+    ...(!firefox && typeof chrome.declarativeNetRequest?.updateSessionRules === "function"
+      ? {
+          declarativeNetRequest: {
+            updateSessionRules: (options: { removeRuleIds?: number[]; addRules?: ViewerDownloadRule[] }) =>
+              chrome.declarativeNetRequest.updateSessionRules(
+                options as unknown as chrome.declarativeNetRequest.UpdateRuleOptions,
+              ),
           },
         }
       : {}),

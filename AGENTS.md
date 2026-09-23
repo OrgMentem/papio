@@ -724,6 +724,18 @@ There is also a link check, because `zensical build` prints a broken link as an
 - **`fetch()` from the page 403s on many provider PDF endpoints** (bot-gated) but
   `chrome.downloads.download` (a browser-level request, like a real click) succeeds — a
   `fetch` 403 is **not** conclusive when picking a download method. Verify live.
+- **A signed PDF viewer's bytes leave Chrome only through its first response.**
+  ScienceDirect (`pdf.sciencedirectassets.com`) returns HTML to any second request,
+  including `chrome.downloads.download` of the exact live URL (measured 2026-09-20 and
+  2026-09-23). `chrome.pageCapture` is no way out: blink's `FrameSerializer` writes the
+  PDF plugin document as its `<embed>` markup, so the MHTML never holds the PDF. What
+  works is `src/viewer-download-rule.ts`: DNR session rules, scoped by `tabIds` to armed
+  handoff tabs and by a `content-type: application/pdf` response condition (Chrome 128+),
+  set `Content-Disposition: attachment` so the first response downloads. DNR compiles
+  `regexFilter` under a 2 KB RE2 budget: the credential-parameter alternation does not
+  fit, which is why each parameter is its own `urlFilter` rule. Chrome's DownloadItem has
+  no tab id, so the download binds to its tab through the recorded `onBeforeNavigate`
+  URL, not host correlation, which cannot separate two ScienceDirect jobs.
 
 ### Provider / resolver quirks (institution-specific; current setup = Example University)
 - **Example University's resolver routes many titles to ProQuest** (`proquest.com/openurl/handler/…`), not

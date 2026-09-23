@@ -595,7 +595,7 @@ export function pageAcquireOrigin(value: string): string | undefined {
  * `/The-different-relations-of-extrinsic-introjected…` both exceed any length
  * bound that would catch a signature, and declining those would send a
  * researcher hunting for a viewer button on a link papio can simply fetch. */
-const CREDENTIAL_PARAMS = new Set([
+export const CREDENTIAL_PARAMS: ReadonlySet<string> = new Set([
   "token",
   "signature",
   "sig",

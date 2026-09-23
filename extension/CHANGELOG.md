@@ -25,12 +25,19 @@ for the full pre-split extension history.
   on a SAGE Research Methods chapter back from an OpenAthens sign-in hop. The
   agent now waits for both within its own time budget, and releases the slot
   while the lease is busy.
-- **Chrome tries a signed PDF viewer's download once.** When a handoff lands
-  on a ScienceDirect or other signed PDF viewer, Chrome now downloads the
-  viewer URL into the job's papio folder, and the daemon validates it as usual.
-  If the download returns HTML or fails, papio discards it and shows the
-  existing Send this PDF / viewer Download instruction, with the reason in the
-  job's history. papio does not try again for that job. Firefox is unchanged.
+- **Chrome saves a signed PDF viewer's own response instead of fetching it
+  again.** A ScienceDirect or other signed viewer link returns HTML to a second
+  request, so the one-time refetch failed for every ScienceDirect job. On
+  Chrome 128 and later, papio's handoff tabs now download that PDF response
+  into the job's papio folder instead of showing it in the viewer, and the
+  daemon validates it as usual. The rule covers only papio's handoff tabs and
+  the tabs they open, only PDF responses, and only until the job has its
+  download. This adds the `declarativeNetRequestWithHostAccess` permission,
+  which shows no install warning; it acts only on hosts papio can already
+  reach. If the viewer still opens, papio shows the existing Send this PDF /
+  viewer Download instruction with the reason (for example `viewer host
+  permission missing`). An older Chrome keeps the one refetch. Firefox is
+  unchanged and does not request the permission.
 - **The article agent waits for a freshly loaded page before it reads it.**
   A cookie-check or bot shell served just after navigation, as
   pmc.ncbi.nlm.nih.gov does, no longer ends the attempt as `identity_missing`
