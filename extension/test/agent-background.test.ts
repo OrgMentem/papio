@@ -2,7 +2,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { Bridge, MIN_DAEMON_VERSION, assessDrivenPage, isBotChallenge, type BridgeDeps, type DownloadItemLike, type NativePort } from "../src/background";
-import { agentDOM, type AgentDOMRequest } from "../src/agent-dom";
+import { agentDOM, agentPageReadiness, type AgentDOMRequest } from "../src/agent-dom";
 import { nativeDownloadDocumentCurrent, NATIVE_CLICK_ADOPTION_FEATURE } from "../src/native-download";
 import { AGENT_NAVIGATION_FEATURE, parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { planExecution, planGeneric } from "../src/plan";
@@ -33,7 +33,7 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 
-async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape; helloPending?: boolean } = {}) {
+async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape; helloPending?: boolean; readiness?: boolean } = {}) {
   const win = new Window({ url, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
   win.document.write(`<meta name="citation_doi" content="${doi}"><meta name="citation_title" content="Example article"><main><h1>Example article</h1><button type="button">Formats</button></main><header><input type="search" value="PRIVATEQUERY"></header>`);
   Object.assign(win.HTMLElement.prototype, { getClientRects: () => [{ width: 10, height: 10 }] });
@@ -70,6 +70,7 @@ async function harness(options: { features?: string[]; knownAdapter?: boolean; f
         return [{ result: planExecution(win.document as unknown as Document, spec, expected, policy) }];
       }
       if (injection.func === nativeDownloadDocumentCurrent) return [{ result: nativeDownloadDocumentCurrent(...injection.args as [string, string]) }];
+      if (injection.func === agentPageReadiness) return options.readiness ? [{ result: agentPageReadiness() }] : [];
       if (injection.func !== agentDOM) return [];
       const request = injection.args![0] as AgentDOMRequest;
       if (request.method === "observe") observations++;
@@ -530,6 +531,69 @@ for (const firefox of [false, true]) for (const reason of ["identity_missing", "
     expect(retained.requires_auth).not.toBe(true); expect(retained.engagement_required).not.toBe(true);
     expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
   });
+
+// The cookie-check shell pmc.ncbi.nlm.nih.gov served ~1 s after navigation on
+// 2026-09-23 (607 bytes, no DOI), reduced to its public markup.
+const cookieShell = '<div id="cookie-required" class="cookie-required-message" hidden><h1>Cookies must be enabled</h1><p>Enable cookies for <span id="cookie-domain">unregistered.example</span> and reload this page to continue.</p></div>';
+/** Serve the shell until the harness clock passes `readyAfterMs`, then the article. */
+function servesShell(h: AgentHarness, readyAfterMs?: number) {
+  const article = { head: h.win.document.head.innerHTML, body: h.win.document.body.innerHTML };
+  h.win.document.head.innerHTML = "<title>unregistered.example</title>";
+  h.win.document.body.innerHTML = cookieShell;
+  let readyAt = readyAfterMs === undefined ? Infinity : h.now() + readyAfterMs;
+  const execute = h.deps.scripting.executeScript;
+  h.deps.scripting.executeScript = async injection => {
+    if (h.now() >= readyAt) {
+      readyAt = Infinity;
+      h.win.document.head.innerHTML = article.head; h.win.document.body.innerHTML = article.body;
+    }
+    return execute(injection);
+  };
+}
+/** Advance the harness clock through the loop's one-second waits, however
+ * many it takes, until it asks for a decision or settles its epoch. */
+async function runToFirstOutcome(h: AgentHarness) {
+  const done = () => h.frames.some(f => f.type === "agent_decide_request_v1" || f.type === "provider_drive_epoch_result_request");
+  for (let i = 0; i < 20 && !done(); i++) {
+    await until(() => done() || h.timers.some(timer => timer.ms === 1000));
+    if (!done()) await h.tick();
+  }
+}
+
+test("a cookie-check shell that becomes the article 500 ms after navigation proceeds to a decision", async () => {
+  const h = await harness({ readiness: true }); servesShell(h, 500);
+  await h.classify(); await h.started(); await runToFirstOutcome(h);
+  expect(h.frames.some(f => f.type === "agent_decide_request_v1")).toBe(true);
+  expect(h.frames.some(f => f.type === "provider_outcome" || f.type === "provider_drive_epoch_result_request")).toBe(false);
+  expect(h.counts().observations).toBe(1);
+});
+
+test("a shell still present at the first observation is re-observed once after the settle", async () => {
+  const h = await harness({ readiness: true }); servesShell(h, 1500);
+  await h.classify(); await h.started(); await runToFirstOutcome(h);
+  expect(h.frames.some(f => f.type === "agent_decide_request_v1")).toBe(true);
+  expect(h.counts().observations).toBe(2);
+});
+
+test("a page that stays a tiny shell still records identity_missing after one re-observation", async () => {
+  const h = await harness({ readiness: true }); servesShell(h);
+  await h.classify(); await h.started(); await runToFirstOutcome(h); await h.settle();
+  expect(h.frames.find(f => f.type === "provider_outcome")?.payload["detail"]).toContain("[identity_missing]");
+  expect(h.frames.some(f => f.type === "agent_decide_request_v1")).toBe(false);
+  expect(h.counts().observations).toBe(2); expect(h.counts().actions).toBe(0);
+});
+
+for (const urlChanged of [false, true]) test(`a full page without a DOI is re-observed ${urlChanged ? "only because its URL changed" : "never"}`, async () => {
+  const h = await harness({ readiness: true });
+  h.win.document.querySelector('meta[name="citation_doi"]')!.remove();
+  h.win.document.querySelector("main")!.insertAdjacentHTML("beforeend", `<p>${"Article text. ".repeat(400)}</p>`);
+  await h.classify(); await h.started();
+  if (urlChanged) h.tabs.seed({ id: tabID, url: `${url}?cookie=1`, status: "complete" });
+  await runToFirstOutcome(h); await h.settle();
+  expect(h.frames.find(f => f.type === "provider_outcome")?.payload["detail"]).toContain("[identity_missing]");
+  expect(h.frames.some(f => f.type === "agent_decide_request_v1")).toBe(false);
+  expect(h.counts().observations).toBe(urlChanged ? 2 : 1);
+});
 
 for (const [html, reason, message] of [
   ['<input type="password" value="PRIVATESECRET">', "credentials_required", "credential gate"],

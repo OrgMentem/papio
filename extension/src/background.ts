@@ -173,7 +173,7 @@ import {
   type Plan,
   type PlanResult,
 } from "./plan";
-import { agentDOM, type AgentDOMRequest, type AgentDOMResult, type AgentDOMRefusalReason } from "./agent-dom";
+import { agentDOM, agentPageReadiness, type AgentDOMRequest, type AgentDOMResult, type AgentDOMRefusalReason, type AgentPageReadiness } from "./agent-dom";
 import {
   NATIVE_CLICK_ADOPTION_FEATURE, nativeDownloadReceipt, sameNativeReceipt,
   nativeCompletedFile, nativeDownloadDocumentCurrent,
@@ -191,6 +191,7 @@ import {
 } from "./capture";
 import {
   chromeKeepaliveAPI,
+  DEFAULT_RELOAD_SETTLE_MS,
   initKeepalive,
   isAuthenticationURL,
 } from "./keepalive";
@@ -487,6 +488,13 @@ const PAGE_CAPTURE_DEFAULT_SETTLE_MS = 3_000;
 const PAGE_CAPTURE_NAV_TIMEOUT_MS = 30_000;
 const TRIAGE_COUNTS_FRESH_MS = 3 * KEEPALIVE_ALARM_MINUTES * 60_000;
 const SESSION_EVIDENCE_THROTTLE_MS = 60_000;
+/** Upper bound on the article agent's wait for a still-loading first
+ * document. Past it the page is observed as it is; identity still decides. */
+const AGENT_PAGE_READY_TIMEOUT_MS = 10_000;
+/** Below this much document text, an `identity_missing` first observation is
+ * a shell (a cookie check or bot interstitial), not a finished article. The
+ * pmc.ncbi.nlm.nih.gov cookie check measured 2026-09-23 was 607 bytes. */
+const AGENT_SHELL_TEXT_LIMIT = 4 * 1024;
 /** How long a parked handoff surface the operator has never engaged may sit
  * before papio retires it. See surfaceIsCold for the measurement this comes
  * from; 3x the measured p99 operator-return latency. */
@@ -20436,6 +20444,35 @@ export class Bridge {
       return authorized() && permitted === true;
     };
     const pause = () => new Promise<void>(resolve => this.deps.setTimeout(resolve, 1000));
+    const wait = (ms: number) => new Promise<void>(resolve => this.deps.setTimeout(resolve, ms));
+    const readPage = async (): Promise<AgentPageReadiness | undefined> =>
+      (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentPageReadiness })
+        .catch(() => []))[0]?.result as AgentPageReadiness | undefined;
+    // A freshly navigated tab can still be running a cookie check or bot
+    // interstitial. Measured 2026-09-23: pmc.ncbi.nlm.nih.gov served a
+    // 607-byte cookie-check shell ~1 s after navigation, and observing it at
+    // once recorded identity_missing and latched drift on a real article.
+    // Wait for the loaded document, then DEFAULT_RELOAD_SETTLE_MS after its
+    // load event. Bounded: a page that never finishes is observed as it is.
+    // No readiness answer is no evidence of a shell, so observation proceeds;
+    // identity is enforced by the observation either way.
+    const awaitPageReady = async (): Promise<boolean> => {
+      const giveUp = this.deps.now() + AGENT_PAGE_READY_TIMEOUT_MS;
+      for (;;) {
+        if (!authorized()) return false;
+        const tab = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
+        const readiness = tab === undefined || tab.status === "loading" ? undefined : await readPage();
+        if (!authorized()) return false;
+        if (readiness?.readyState === "complete") {
+          const remaining = DEFAULT_RELOAD_SETTLE_MS - (readiness.loadedAgoMs ?? 0);
+          if (remaining > 0) await wait(remaining);
+          return authorized();
+        }
+        if (tab !== undefined && tab.status !== "loading" && readiness === undefined) return true;
+        if (this.deps.now() >= giveUp) return true;
+        await wait(DEFAULT_RELOAD_SETTLE_MS);
+      }
+    };
     const settleNavigation = async (pending: AgentNavigation, until: number): Promise<boolean> => {
       exitDetail = "Article agent navigation stopped: the selected exact target did not produce a fresh matching article; redirects and unrelated navigation require a new attempt.";
       const currentDocument = async (id: string, url: string): Promise<boolean> => {
@@ -20603,6 +20640,8 @@ export class Bridge {
         start.payload?.["revision"] === epoch.revision;
       if (!authorized()) return;
       if (!started) { if (start.kind !== "response") exitDetail = unavailableDetail; return; }
+      if (!(await awaitPageReady())) return;
+      let identityReobserved = false;
       for (let decisions = 0; decisions < 60 && authorized();) {
         if (!(await liveTab()) || !authorized()) return;
         const observed = (await this.deps.scripting.executeScript({
@@ -20612,6 +20651,20 @@ export class Bridge {
         if (!authorized()) return;
         if (observed?.status !== "observed") {
           if (observed?.status === "blocked" || observed?.status === "stale") exitDetail = domDetail(observed.reason);
+          // A first document that is still a tiny shell, or whose URL moved
+          // during the settle, gets one more settled look. A second
+          // identity_missing stands: identity is never inferred.
+          if (observed?.status === "blocked" && observed.reason === "identity_missing" && documentID === undefined && !identityReobserved) {
+            identityReobserved = true;
+            const readiness = await readPage();
+            const current = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
+            if (!authorized()) return;
+            if ((readiness !== undefined && readiness.textLength < AGENT_SHELL_TEXT_LIMIT) || current?.url !== entryURL) {
+              await wait(DEFAULT_RELOAD_SETTLE_MS);
+              if (!(await awaitPageReady())) return;
+              continue;
+            }
+          }
           return;
         }
         documentID = observed.document;

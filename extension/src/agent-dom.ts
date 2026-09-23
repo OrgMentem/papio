@@ -503,3 +503,26 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   state.observed = { revision, source: fresh.source, targets: fresh.targets };
   return { status: "observed", document: state.document, observation: { revision, ...fresh.projection } };
 }
+
+/** Load state of the article-agent tab, never its content. */
+export interface AgentPageReadiness {
+  readyState: DocumentReadyState;
+  /** Characters of document text, including inline script text. */
+  textLength: number;
+  /** Time since the document's load event ended, when the page exposes it. */
+  loadedAgoMs?: number;
+}
+
+/** Self-contained isolated-world injection. Tells the worker whether the
+ * document finished loading, how long ago, and whether it is a tiny shell
+ * (a cookie check or bot interstitial) rather than an article. */
+export function agentPageReadiness(): AgentPageReadiness {
+  const navigation = performance.getEntriesByType?.("navigation")[0] as PerformanceNavigationTiming | undefined;
+  const loadedAgoMs = navigation !== undefined && navigation.loadEventEnd > 0
+    ? Math.max(0, Math.round(performance.now() - navigation.loadEventEnd)) : undefined;
+  return {
+    readyState: document.readyState,
+    textLength: document.documentElement?.textContent?.length ?? 0,
+    ...(loadedAgoMs !== undefined ? { loadedAgoMs } : {}),
+  };
+}

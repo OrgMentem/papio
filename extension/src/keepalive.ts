@@ -239,7 +239,10 @@ const DEFAULT_INTERVAL_MINUTES = 4;
 const MIN_INTERVAL_MINUTES = 2;
 const MAX_INTERVAL_MINUTES = 30;
 const DEFAULT_OBSERVE_MS = 15_000;
-const DEFAULT_RELOAD_SETTLE_MS = 1_000;
+/** Time a freshly loaded document gets for its own scripts (a cookie check,
+ * a redirect, a client render) before papio reads it. The article agent's
+ * first observation reuses it. */
+export const DEFAULT_RELOAD_SETTLE_MS = 1_000;
 const LOGIN_ROUTE = /login|auth|sso|idp|shibboleth|signon/i;
 const AUTH_HOST_SEGMENTS: Record<string, true> = {
   idp: true,

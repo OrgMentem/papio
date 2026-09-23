@@ -17,6 +17,12 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **The article agent waits for a freshly loaded page before it reads it.**
+  A cookie-check or bot shell served just after navigation, as
+  pmc.ncbi.nlm.nih.gov does, no longer ends the attempt as `identity_missing`
+  and a drift latch. The agent waits for the loaded document plus a short
+  settle, and re-reads a tiny or redirected first page once. A page that
+  still shows no DOI still stops as `identity_missing`.
 - **The article agent accepts a book chapter whose page also cites its book.**
   A chapter page may carry its parent book's DOI beside the requested chapter
   DOI, as SAGE Research Methods pages do; a visible "Chapter DOI:" list item
