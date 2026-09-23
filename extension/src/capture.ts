@@ -65,6 +65,7 @@ export const PROVIDERS = [
   "figshare",
   "exlibris-primo",
   "iospress",
+  "science",
 ] as const;
 export type Provider = (typeof PROVIDERS)[number];
 export const SCENARIOS: readonly Scenario[] = ["success", "login-return", "no-entitlement", "drift", "terms"];
