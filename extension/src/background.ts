@@ -20344,7 +20344,13 @@ export class Bridge {
 
   private agentFallbackAvailability(): true | AgentFallbackSkipReason {
     const features = this.store.daemonFeatures ?? [];
-    if (!this.hasCurrentHello()) return "hello_pending";
+    if (!this.hasCurrentHello()) {
+      return this.port !== null &&
+        this.helloSentGeneration === this.portGeneration &&
+        this.helloAckGeneration !== this.portGeneration &&
+        this.helloDeniedGeneration !== this.portGeneration
+        ? "hello_pending" : "authority_unavailable";
+    }
     if (!this.holderRole()) return "authority_unavailable";
     if (!features.includes("agent_fallback_v1")) return "backend_feature_missing";
     if (!features.includes(PROVIDER_DRIVE_EPOCH_FEATURE) || !features.includes(EFFECT_PERMIT_FEATURE)) return "drive_features_missing";

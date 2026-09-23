@@ -1366,6 +1366,8 @@ async function classifyProviderUnknown(
   expectedDOI?: string,
 ): Promise<number> {
   await h.bridge.start();
+  // The daemon sends offers only after acknowledging this holder's hello.
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, role: "holder" }));
   const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
   if (expectedDOI !== undefined)
     offer.payload["expected"] = { doi: expectedDOI };
@@ -7166,6 +7168,7 @@ test("a slow provider can render within its bounded grace, and a stuck page repo
       return [];
     };
     await h.bridge.start();
+    await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, role: "holder" }));
     await h.port.inbound(jobOffer("job_slow_render"));
     const tabID = h.backend.store.activeJobs[0]!.tab_id;
     await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/article`);

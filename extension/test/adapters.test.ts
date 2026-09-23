@@ -21,6 +21,7 @@ import { parseBrowserMessage, type BrowserMessage } from "../src/protocol";
 import { emptyStore, type StateBackend, type StoreShape, type TermsConsent } from "../src/state";
 import {
   Bridge,
+  MIN_DAEMON_VERSION,
   assessDrivenPage,
   executePlannedPageEffect,
   resolveDownloadURL,
@@ -3340,6 +3341,10 @@ test("unknown escalates to ui_changed only on the second observation ≥5s later
   const h = makeMapHarness();
   h.scripting.verdict = { kind: "unknown", adapter_id: "proquest", adapter_version: "0.3.1", evidence: [] };
   await h.bridge.start();
+  await h.port.inbound({
+    protocol: "papio-browser/1", type: "hello_ack", msg_id: "hello_unknown_0001", seq: 1,
+    payload: { daemon_version: MIN_DAEMON_VERSION, role: "holder" },
+  });
   await h.port.inbound(offer("job_unknown_0001"));
 
   // First unknown: no outcome, streak recorded.
