@@ -334,6 +334,11 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Browser sessions show Chrome or Firefox before a reload.** `papio browser
+  sessions` names the reported browser family. `papio browser reload --session
+  <id-prefix>` selects a connected session, including a pending one, instead
+  of reloading whichever browser holds the bridge. Without the flag, reload
+  keeps its previous holder-only behavior.
 - **A retired browser claim no longer holds an institution's sign-in slot.**
   A holder-generation fence releases the claim's bound entry lease in the
   same transaction. An unsettled institutional effect still keeps the slot.

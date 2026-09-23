@@ -13,7 +13,7 @@ import (
 	"papio/internal/browser"
 )
 
-// browserSessionsResult mirrors the browser.sessions RPC response.
+// browserSessionsResult mirrors browser.sessions_v2 (and the old result without browser).
 type browserSessionsResult struct {
 	Sessions     []browser.SessionSummary `json:"sessions"`
 	DeniedHellos int                      `json:"denied_hellos"`
@@ -30,7 +30,7 @@ func newBrowserCommand(opt *options) *cobra.Command {
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var result browserSessionsResult
-			if err := opt.call(cmd.Context(), "browser.sessions", map[string]any{}, &result); err != nil {
+			if err := opt.call(cmd.Context(), "browser.sessions_v2", map[string]any{}, &result); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
@@ -45,8 +45,12 @@ func newBrowserCommand(opt *options) *cobra.Command {
 				if session.Holder {
 					role = "holder"
 				}
-				if _, err := fmt.Fprintf(opt.out, "%s\t%s\tv%s\tlast sync %s\n",
-					shortSessionID(session.ID), role, session.ExtensionVersion, sessionAge(session.LastSyncAt)); err != nil {
+				browserName := session.Browser
+				if browserName != "chrome" && browserName != "firefox" {
+					browserName = "-"
+				}
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\tv%s\tlast sync %s\n",
+					shortSessionID(session.ID), browserName, role, session.ExtensionVersion, sessionAge(session.LastSyncAt)); err != nil {
 					return err
 				}
 			}
@@ -127,10 +131,11 @@ func newBrowserCommand(opt *options) *cobra.Command {
 	}
 	permit.AddCommand(resolvePermit)
 	var reloadTimeout time.Duration
+	var reloadSession string
 	reload := &cobra.Command{
 		Use:         "reload",
 		Short:       "Reload the connected development-mode extension from disk",
-		Long:        "Reload the connected development-mode extension from disk, replacing the manual chrome://extensions Reload click. It only affects an unpacked extension, because the extension refuses the command unless chrome.management.getSelf() reports installType \"development\". A new session id is the proof the new bundle is live.",
+		Long:        "Reload a development-mode extension from disk. --session selects a connected browser by unambiguous session-id prefix, promoting a pending session first. Without it, reload the current holder. The extension refuses reload unless chrome.management.getSelf() reports installType \"development\".",
 		Annotations: map[string]string{"mcp:hidden": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -147,16 +152,21 @@ func newBrowserCommand(opt *options) *cobra.Command {
 					previous = s.ID
 				}
 			}
-			if previous == "" {
+			if previous == "" && reloadSession == "" {
 				return errors.New("no browser session holds the bridge")
 			}
 			var result struct {
 				SessionID string `json:"session_id"`
 				ReloadID  string `json:"reload_id"`
 			}
-			if err := opt.call(ctx, "browser.dev_reload", map[string]any{}, &result); err != nil {
+			params := map[string]string{}
+			if reloadSession != "" {
+				params["session_id"] = reloadSession
+			}
+			if err := opt.call(ctx, "browser.dev_reload", params, &result); err != nil {
 				return err
 			}
+			previous = result.SessionID
 			if reloadTimeout == 0 {
 				return opt.printResult(result, "reload %s sent for browser session %s; not waiting for reconnect (--timeout=0)", result.ReloadID, shortSessionID(previous))
 			}
@@ -215,6 +225,7 @@ func newBrowserCommand(opt *options) *cobra.Command {
 		},
 	}
 	reload.Flags().DurationVar(&reloadTimeout, "timeout", 15*time.Second, "how long to wait for the reloaded extension to reconnect (0 waits not at all)")
+	reload.Flags().StringVar(&reloadSession, "session", "", "reload this browser session (unambiguous id prefix); promote it if pending")
 
 	command.AddCommand(sessions, use, permit, reload)
 	return command

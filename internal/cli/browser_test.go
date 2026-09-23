@@ -14,6 +14,30 @@ import (
 	"papio/internal/config"
 )
 
+func TestBrowserSessionsRendersBrowserFamily(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "browser.sessions_v2" {
+			t.Fatalf("method = %q, want browser.sessions_v2", method)
+		}
+		*result.(*browserSessionsResult) = browserSessionsResult{Sessions: []browser.SessionSummary{
+			{ID: "aaaa1111aaaa1111", Browser: "chrome", Holder: true, ExtensionVersion: "0.15.0", LastSyncAt: "2026-07-21T12:00:05Z"},
+			{ID: "bbbb2222bbbb2222", Browser: "firefox", ExtensionVersion: "0.15.0", LastSyncAt: "2026-07-21T12:00:04Z"},
+			{ID: "cccc3333cccc3333", Browser: "other", ExtensionVersion: "0.15.0", LastSyncAt: "2026-07-21T12:00:03Z"},
+		}}
+		return nil
+	})
+	root.SetArgs([]string{"browser", "sessions"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("sessions: %v (%s)", err, stderr.String())
+	}
+	for _, line := range []string{"aaaa1111aaaa\tchrome\tholder\t", "bbbb2222bbbb\tfirefox\tpending\t", "cccc3333cccc\t-\tpending\t"} {
+		if !strings.Contains(stdout.String(), line) {
+			t.Fatalf("sessions output = %q, missing %q", stdout.String(), line)
+		}
+	}
+}
+
 func TestBrowserUseLatestPicksNewestPendingSession(t *testing.T) {
 	var claimed string
 	var stdout, stderr bytes.Buffer
@@ -235,6 +259,41 @@ func TestBrowserReloadAttributesObservedHolder(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBrowserReloadTargetsPendingSessionByPrefix(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var target string
+	reads := 0
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+		switch method {
+		case "browser.sessions":
+			reads++
+			sessions := []browser.SessionSummary{{ID: "chrome-old", Holder: true}, {ID: "firefox-old"}}
+			if reads > 1 {
+				sessions = []browser.SessionSummary{{ID: "firefox-new", Holder: true}, {ID: "chrome-old"}}
+			}
+			*result.(*browserSessionsResult) = browserSessionsResult{Sessions: sessions}
+			return nil
+		case "browser.dev_reload":
+			target = params.(map[string]string)["session_id"]
+			encoded, err := json.Marshal(map[string]string{"session_id": "firefox-old", "reload_id": "reload-123"})
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(encoded, result)
+		default:
+			t.Fatalf("unexpected method %q", method)
+			return nil
+		}
+	})
+	root.SetArgs([]string{"browser", "reload", "--session", "firefox", "--timeout=1s"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("targeted reload: %v (%s)", err, stderr.String())
+	}
+	if target != "firefox" || !strings.Contains(stdout.String(), "firefox-old reloaded; firefox-new") {
+		t.Fatalf("reload target %q, output %q", target, stdout.String())
 	}
 }
 

@@ -833,6 +833,7 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 type SessionSummary struct {
 	ID               string `json:"id"`
 	ExtensionVersion string `json:"extension_version"`
+	Browser          string `json:"browser,omitempty"`
 	Holder           bool   `json:"holder"`
 	HelloAt          string `json:"hello_at"`
 	LastSyncAt       string `json:"last_sync_at"`
@@ -850,6 +851,7 @@ func summarize(session *browserSession, holder bool) SessionSummary {
 	return SessionSummary{
 		ID:               session.ID,
 		ExtensionVersion: session.ExtensionVersion,
+		Browser:          session.Browser,
 		Holder:           holder,
 		HelloAt:          session.HelloAt.UTC().Format(time.RFC3339),
 		LastSyncAt:       session.LastSyncAt.UTC().Format(time.RFC3339),
@@ -871,21 +873,33 @@ func (b *Bridge) Claim(sessionID string) (string, error) {
 	return resolved, nil
 }
 
-// RequestDevReload latches a one-shot dev_reload for the current holder.
-// Returns the session id it was latched for and the reload id. A latch that
-// has not been emitted yet is returned as-is rather than replaced: the IPC
-// server answers independent calls concurrently, so overwriting would hand
-// the first caller a reload_id that is never delivered, and that id is the
-// only thing making a reload auditable.
-func (b *Bridge) RequestDevReload() (sessionID string, reloadID string, err error) {
+// RequestDevReload latches one dev_reload for the holder, or promotes the
+// unambiguous session selected by prefix before latching. Selection, promotion,
+// and latching share the bridge lock so a competing claim cannot redirect it.
+// An un-emitted latch is idempotent: concurrent callers receive the same id.
+func (b *Bridge) RequestDevReload(sessionPrefix string) (sessionID string, reloadID string, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	holder := b.arbitration.holderSession()
+	if sessionPrefix != "" {
+		holder, err = b.arbitration.resolve(sessionPrefix)
+		if err != nil {
+			return "", "", err
+		}
+	}
 	if holder == nil {
 		return "", "", errors.New("no browser session holds the bridge")
 	}
 	if compareVersion(holder.ExtensionVersion, DevReloadMinExtensionVersion) < 0 {
 		return "", "", fmt.Errorf("browser extension v%s does not support dev_reload (needs v%s)", holder.ExtensionVersion, DevReloadMinExtensionVersion)
+	}
+	if holder != b.arbitration.holderSession() {
+		_, transition, err := b.arbitration.claim(holder.ID)
+		if err != nil {
+			return "", "", err
+		}
+		b.applyPromotion(transition, "claimed via papio browser reload --session")
+		b.reconcileMaterializationGeneration(context.Background())
 	}
 	if pending := b.arbitration.pendingDevReload(holder.ID); pending != "" {
 		return holder.ID, pending, nil
@@ -4297,6 +4311,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	session := &browserSession{
 		ID:                          sessionID,
 		ExtensionVersion:            p.ExtensionVersion,
+		Browser:                     p.Browser,
 		AdapterVersions:             p.AdapterVersions,
 		Features:                    slices.Clone(p.Features),
 		HelloAt:                     now,

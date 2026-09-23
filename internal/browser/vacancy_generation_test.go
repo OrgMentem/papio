@@ -39,7 +39,7 @@ func newVacancyGenerationFixture(t *testing.T) vacancyGenerationFixture {
 		t.Fatalf("holder = %+v, want %s before departure", b.arbitration.holderSession(), vacancyHolderSession)
 	}
 
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("request dev reload: %v", err)
 	}
 	if messages, _ := runSyncAs(t, b, vacancyHolderSession); firstOfType(messages, protocol.MsgDevReload) == nil {

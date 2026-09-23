@@ -2278,6 +2278,7 @@
             "required": ["extension_version"],
             "properties": {
               "extension_version": { "type": "string", "maxLength": 50 },
+              "browser": { "enum": ["chrome", "firefox", "other"] },
               "adapter_versions": {
                 "type": "object",
                 "maxProperties": 50,

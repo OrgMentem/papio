@@ -1734,7 +1734,7 @@ interface AgentJobState {
 
 /** Fixed local gate names only; never include page data in a skip diagnostic. */
 type AgentFallbackSkipReason =
-  | "backend_feature_missing" | "drive_features_missing" | "authority_unavailable"
+  | "backend_feature_missing" | "drive_features_missing" | "hello_pending" | "authority_unavailable"
   | "drive_unavailable" | "tab_unavailable" | "job_state_ineligible"
   | "attempt_terminal" | "download_pending" | "expected_doi_missing"
   | "generic_epoch_missing" | "native_adoption_unavailable" | "attempt_consumed";
@@ -1742,6 +1742,7 @@ type AgentFallbackSkipReason =
 const AGENT_FALLBACK_SKIP_DETAIL: Record<AgentFallbackSkipReason, string> = {
   backend_feature_missing: "Article agent unavailable: reconnect to a daemon with Jev enabled.",
   drive_features_missing: "Article agent unavailable: reconnect to a daemon with browser-drive support.",
+  hello_pending: "Article agent skipped: this browser has not received a hello acknowledgement for this connection.",
   authority_unavailable: "Article agent skipped: this browser lacks authority for the attempt.",
   drive_unavailable: "Article agent skipped: no active browser drive owns this attempt.",
   tab_unavailable: "Article agent skipped: this attempt has no bound browser tab.",
@@ -3505,6 +3506,7 @@ export class Bridge {
   private helloDeniedGeneration = -1;
   private helloRequestID: string | undefined;
   private readonly helloWaiters = new Set<(acknowledged: boolean) => void>();
+  private readonly agentHelloWaits = new Set<string>();
   /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
   /** Durable institutional demand from the most recent negotiated counts poll. */
   private triageActionsRequiresAuth: number | undefined;
@@ -14304,12 +14306,20 @@ export class Bridge {
       adapterVersions[spec.id] = spec.version;
     this.helloSentGeneration = this.portGeneration;
     this.helloRequestID = this.deps.randomUUID().replace(/-/g, "");
+    const userAgent = globalThis.navigator?.userAgent ?? "";
+    const browserFamily = this.deps.browserInfo !== undefined || this.deps.firefox === true ||
+      /\bFirefox\//.test(userAgent)
+        ? "firefox"
+        : /\b(?:Chrome|Chromium)\//.test(userAgent)
+          ? "chrome"
+          : "other";
     if (
       !this.send(
         "hello",
         {
           extension_version: this.deps.manifestVersion,
           adapter_versions: adapterVersions,
+          browser: browserFamily,
           // Every entry here is a capability the DAEMON gates a request on, so
           // an omission is a silently dead feature rather than a parse error:
           // `pdfGrabRefusalReason` (internal/browser/bridge.go) refuses a grab
@@ -19508,14 +19518,15 @@ export class Bridge {
       const captured = await this.recordUnknown(currentJob, host);
       if ((!missingAdapterAfterAuth || this.agentFallbackAvailable()) && await this.runGenericOnSettledUnknown(currentJob)) return;
       const agentStart = this.startAgentFallback(findByJob(this.store, job.job_id) ?? currentJob);
-      if (agentStart === true) return;
-      const outcomeKey = `${job.job_id}:ui_changed`;
-      if (!this.handoffOutcomeSent.has(outcomeKey)) {
+      const reportAgentSkip = async (reason: true | AgentFallbackSkipReason): Promise<void> => {
+        if (reason === true) return;
+        const outcomeKey = `${job.job_id}:ui_changed`;
+        if (this.handoffOutcomeSent.has(outcomeKey)) return;
         this.handoffOutcomeSent.add(outcomeKey);
         const evidence = this.genericEvidence.get(job.job_id) ?? [];
         const detail =
           "No source-controlled adapter matched this provider page." +
-          ` ${AGENT_FALLBACK_SKIP_DETAIL[agentStart]}` +
+          ` ${AGENT_FALLBACK_SKIP_DETAIL[reason]}` +
           (captured
             ? " A sanitized diagnostic was saved locally for adapter development."
             : "") +
@@ -19542,6 +19553,11 @@ export class Bridge {
         } else {
           await this.settleHandoffAfterOutcome(job.job_id, "ui_changed");
         }
+      };
+      if (agentStart === "hello_pending") {
+        this.deferAgentFallbackUntilHello(job.job_id, reportAgentSkip);
+      } else {
+        await reportAgentSkip(agentStart);
       }
       return;
     }
@@ -20304,13 +20320,32 @@ export class Bridge {
     return true;
   }
 
+  private deferAgentFallbackUntilHello(
+    jobID: string,
+    resume: (reason: true | AgentFallbackSkipReason) => Promise<void>,
+  ): void {
+    if (this.agentHelloWaits.has(jobID)) return;
+    this.agentHelloWaits.add(jobID);
+    // Do not block the inbound FIFO: the hello_ack that releases this wait
+    // arrives on that same chain. A timeout evaluates the live port once.
+    void this.waitForCurrentHello().then(async () => {
+      this.agentHelloWaits.delete(jobID);
+      const job = findByJob(this.store, jobID);
+      if (job) await resume(this.startAgentFallback(job));
+    }).catch(() => {
+      this.agentHelloWaits.delete(jobID);
+      console.error("papio: agent fallback hello wait stopped");
+    });
+  }
+
   private agentFallbackAvailable(): boolean {
     return this.agentFallbackAvailability() === true;
   }
 
   private agentFallbackAvailability(): true | AgentFallbackSkipReason {
     const features = this.store.daemonFeatures ?? [];
-    if (!this.hasCurrentHello() || !this.holderRole()) return "authority_unavailable";
+    if (!this.hasCurrentHello()) return "hello_pending";
+    if (!this.holderRole()) return "authority_unavailable";
     if (!features.includes("agent_fallback_v1")) return "backend_feature_missing";
     if (!features.includes(PROVIDER_DRIVE_EPOCH_FEATURE) || !features.includes(EFFECT_PERMIT_FEATURE)) return "drive_features_missing";
     return true;
@@ -21901,19 +21936,15 @@ export class Bridge {
           (diagnostic) => { captureDiagnostic = diagnostic; });
         if (!settled) return;
         const current = findByJob(this.store, jobID);
-        let agentSkipDetail = "";
-        if (current !== undefined) {
-          if (await this.runGenericOnSettledUnknown(current)) return;
-          const agentStart = this.startAgentFallback(findByJob(this.store, jobID) ?? current);
-          if (agentStart === true) return;
-          agentSkipDetail = AGENT_FALLBACK_SKIP_DETAIL[agentStart];
-        }
-        const evidence = this.genericEvidence.get(jobID) ?? [];
-        const detail = captureOutcomeDetail(
-          [agentSkipDetail, ...(evidence.length === 0 ? [] : [`Generic evidence: ${evidence.join(", ")}.`])]
-            .filter(Boolean).join(" "), captureDiagnostic);
-        const outcomeKey = `${jobID}:ui_changed`;
-        if (!this.handoffOutcomeSent.has(outcomeKey)) {
+        const reportAgentSkip = async (reason: true | AgentFallbackSkipReason | undefined): Promise<void> => {
+          if (reason === true) return;
+          const evidence = this.genericEvidence.get(jobID) ?? [];
+          const detail = captureOutcomeDetail(
+            [reason === undefined ? "" : AGENT_FALLBACK_SKIP_DETAIL[reason],
+              ...(evidence.length === 0 ? [] : [`Generic evidence: ${evidence.join(", ")}.`])]
+              .filter(Boolean).join(" "), captureDiagnostic);
+          const outcomeKey = `${jobID}:ui_changed`;
+          if (this.handoffOutcomeSent.has(outcomeKey)) return;
           this.handoffOutcomeSent.add(outcomeKey);
           // A real drift the daemon latches, so it needs attribution as much
           // as the deferred branch — but only if the tab is still on the page
@@ -21936,6 +21967,18 @@ export class Bridge {
           } else {
             await this.settleHandoffAfterOutcome(jobID, "ui_changed");
           }
+        };
+        if (current !== undefined) {
+          if (await this.runGenericOnSettledUnknown(current)) return;
+          const agentStart = this.startAgentFallback(findByJob(this.store, jobID) ?? current);
+          if (agentStart === "hello_pending") {
+            this.deferAgentFallbackUntilHello(jobID, reportAgentSkip);
+            return;
+          }
+          if (agentStart === true) return;
+          await reportAgentSkip(agentStart);
+        } else {
+          await reportAgentSkip(undefined);
         }
         return;
       }

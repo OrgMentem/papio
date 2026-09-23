@@ -14,6 +14,7 @@ import (
 type browserSession struct {
 	ID               string
 	ExtensionVersion string
+	Browser          string
 	AdapterVersions  map[string]string
 	Features         []string
 	HelloAt          time.Time
@@ -162,10 +163,10 @@ func (a *sessionArbitration) poll(sessionID string, now time.Time) pollDecision 
 	return pollDecision{known: true}
 }
 
-func (a *sessionArbitration) claim(prefix string) (string, arbitrationTransition, error) {
+func (a *sessionArbitration) resolve(prefix string) (*browserSession, error) {
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
-		return "", arbitrationTransition{}, errors.New("browser session id is required")
+		return nil, errors.New("browser session id is required")
 	}
 	var matches []*browserSession
 	if a.holder != nil && strings.HasPrefix(a.holder.ID, prefix) {
@@ -178,14 +179,24 @@ func (a *sessionArbitration) claim(prefix string) (string, arbitrationTransition
 	}
 	switch {
 	case len(matches) == 0:
-		return "", arbitrationTransition{}, fmt.Errorf("unknown browser session %q (run 'papio browser sessions')", prefix)
+		return nil, fmt.Errorf("unknown browser session %q (run 'papio browser sessions')", prefix)
 	case len(matches) > 1:
-		return "", arbitrationTransition{}, fmt.Errorf("browser session prefix %q is ambiguous (run 'papio browser sessions')", prefix)
-	case matches[0] == a.holder:
-		return a.holder.ID, arbitrationTransition{}, nil
+		return nil, fmt.Errorf("browser session prefix %q is ambiguous (run 'papio browser sessions')", prefix)
+	default:
+		return matches[0], nil
 	}
-	transition := a.promote(matches[0], false)
-	return a.holder.ID, transition, nil
+}
+
+func (a *sessionArbitration) claim(prefix string) (string, arbitrationTransition, error) {
+	session, err := a.resolve(prefix)
+	if err != nil {
+		return "", arbitrationTransition{}, err
+	}
+	if session == a.holder {
+		return session.ID, arbitrationTransition{}, nil
+	}
+	transition := a.promote(session, false)
+	return session.ID, transition, nil
 }
 
 func (a *sessionArbitration) promote(session *browserSession, dropPrevious bool) arbitrationTransition {

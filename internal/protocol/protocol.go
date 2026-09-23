@@ -1283,6 +1283,7 @@ type HelloPayload struct {
 	ExtensionVersion string            `json:"extension_version"`
 	AdapterVersions  map[string]string `json:"adapter_versions,omitempty"`
 	Features         []string          `json:"features,omitempty"`
+	Browser          string            `json:"browser,omitempty"`
 }
 
 // HelloAckPayload announces the daemon version, supported bridge features and
@@ -2650,7 +2651,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 	case MsgHello:
 		p := &HelloPayload{}
 		if err = browserRequireFields(payloadFields, "extension_version"); err == nil {
-			err = browserRejectNullFields(payloadFields, "adapter_versions", "features")
+			err = browserRejectNullFields(payloadFields, "adapter_versions", "features", "browser")
 		}
 		var adapterFields map[string]json.RawMessage
 		if raw, ok := payloadFields["adapter_versions"]; ok && err == nil {
@@ -2666,6 +2667,9 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 				err = fmt.Errorf("hello.adapter_versions capped at 50")
 			} else if len(p.Features) > 32 {
 				err = fmt.Errorf("hello.features capped at 32")
+			}
+			if _, present := payloadFields["browser"]; err == nil && present && p.Browser != "chrome" && p.Browser != "firefox" && p.Browser != "other" {
+				err = fmt.Errorf("hello.browser must be chrome, firefox, or other")
 			}
 		}
 		if err == nil {

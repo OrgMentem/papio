@@ -171,7 +171,7 @@ var commandClassification = map[string]commandClass{
 	"papio actions retry-publisher":    {kind: kindStructured, args: []string{"1", "--revision", "1"}, rpcMethods: []string{"actions.retry_publisher"}},
 	"papio actions open":               {kind: kindEnvelope, rowKey: "urls", args: []string{"--dry-run"}, rpcMethods: []string{"actions.list", "jobs.list_v2", "jobs.list", "jobs.get", "actions.open"}},
 	"papio browser":                    {kind: kindNone},
-	"papio browser sessions":           {kind: kindStructured, rpcMethods: []string{"browser.sessions"}},
+	"papio browser sessions":           {kind: kindStructured, rpcMethods: []string{"browser.sessions_v2"}},
 	"papio browser use":                {kind: kindStructured, rpcMethods: []string{"browser.sessions", "browser.claim"}},
 	"papio browser reload":             {kind: kindStructured, args: []string{"--timeout", "0"}, rpcMethods: []string{"browser.sessions", "browser.dev_reload"}},
 	"papio browser permit":             {kind: kindNone},

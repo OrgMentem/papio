@@ -17,6 +17,12 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **Article agents wait for the browser handshake.** A delegated page no longer
+  records lasting adapter drift while its native connection awaits `hello_ack`.
+  A browser with the pending role still cannot drive the article.
+- **The browser handshake reports the browser family.** Connected Chrome and
+  Firefox sessions can now be identified by `papio browser sessions`; unknown
+  browsers appear as `-`.
 - **Article URLs can establish DOI identity.** The agent may act on an article
   whose own URL names the requested DOI, even without DOI metadata. A conflicting
   citation still stops it.

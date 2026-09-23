@@ -67,6 +67,52 @@ func TestSecondBrowserHelloIsDeniedNotStolen(t *testing.T) {
 	_ = id
 }
 
+func TestSessionBrowserIdentityAndTargetedReload(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSyncAs(t, b, sessA, inFrame(t, protocol.MsgHello, "",
+		map[string]any{"extension_version": "0.15.0", "browser": "chrome"}))
+	runSyncAs(t, b, sessB, inFrame(t, protocol.MsgHello, "",
+		map[string]any{"extension_version": "0.15.0", "browser": "firefox"}))
+	sessions, _, _ := b.Sessions()
+	if len(sessions) != 2 || sessions[0].Browser != "chrome" || sessions[1].Browser != "firefox" {
+		t.Fatalf("browser identities = %+v", sessions)
+	}
+	if _, _, err := b.RequestDevReload("unknown"); err == nil {
+		t.Fatal("unknown session selected for reload")
+	}
+	if sessions, _, _ := b.Sessions(); !sessions[0].Holder || sessions[0].ID != sessA {
+		t.Fatalf("failed reload selection changed holder: %+v", sessions)
+	}
+	target, _, err := b.RequestDevReload(sessB[:12])
+	if err != nil || target != sessB {
+		t.Fatalf("targeted reload = %q, %v; want %q", target, err, sessB)
+	}
+	sessions, _, _ = b.Sessions()
+	if !sessions[0].Holder || sessions[0].ID != sessB || sessions[0].Browser != "firefox" {
+		t.Fatalf("targeted reload did not promote Firefox: %+v", sessions)
+	}
+	msgs, _ := runSyncAs(t, b, sessB)
+	if firstOfType(msgs, protocol.MsgDevReload) == nil {
+		t.Fatalf("selected session did not receive dev_reload: %+v", msgs)
+	}
+	if msgs, _ = runSyncAs(t, b, sessA); firstOfType(msgs, protocol.MsgDevReload) != nil {
+		t.Fatalf("previous holder received dev_reload: %+v", msgs)
+	}
+}
+
+func TestSessionTargetedReloadRejectsUnsupportedPendingBrowserWithoutPromotion(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	runSyncAs(t, b, sessB, helloAs("0.14.0"))
+	if _, _, err := b.RequestDevReload(sessB[:12]); err == nil {
+		t.Fatal("unsupported pending browser accepted for reload")
+	}
+	sessions, _, _ := b.Sessions()
+	if !sessions[0].Holder || sessions[0].ID != sessA {
+		t.Fatalf("rejected reload changed holder: %+v", sessions)
+	}
+}
+
 // TestHelloAckNamesTheGrantedRole pins the two-frame denial. A denied hello
 // used to get session_busy and nothing else, so that browser learned no
 // daemon features and locally refused even the holder-independent surfaces

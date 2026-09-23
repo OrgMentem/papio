@@ -170,10 +170,10 @@ func TestWatchDigestClearHandlerRejectsBadIDAndMissingRunner(t *testing.T) {
 func TestBrowserDevReloadHandlerRejectsUnknownFieldAndMissingHolder(t *testing.T) {
 	router := Router(testSystem(t))
 
-	// The method takes no parameters at all, so an invented field is refused
-	// rather than ignored: a caller must never believe it scoped a reload to a
-	// session the daemon never read.
-	if rpcErr := callMethod(t, router, "browser.dev_reload", map[string]any{"session_id": "sess-1"}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+	// Only session_id is accepted; an invented field is refused
+	// rather than ignored: a caller must never believe an unknown selector
+	// scoped a reload to the intended session.
+	if rpcErr := callMethod(t, router, "browser.dev_reload", map[string]any{"unexpected": true}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("browser.dev_reload with unknown field = %#v, want invalid_argument", rpcErr)
 	}
 

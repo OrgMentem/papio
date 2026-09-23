@@ -953,6 +953,24 @@ test("hello features are optional but strict, unique, and bounded", () => {
   ).toThrow(ProtocolError);
 });
 
+test("hello browser is optional and has a closed vocabulary", () => {
+  const frame = (payload: Record<string, unknown>) => ({
+    protocol: "papio-browser/1",
+    type: "hello",
+    msg_id: "client-hello-browser",
+    seq: 0,
+    payload,
+  });
+  for (const browser of [undefined, "chrome", "firefox", "other"]) {
+    const payload = { extension_version: "0.15.0", browser };
+    const parsed = parseBrowserMessage(JSON.parse(JSON.stringify(frame(payload))));
+    expect(parsed.payload["browser"]).toBe(browser);
+  }
+  for (const browser of ["", "safari", "Chrome", null, 3]) {
+    expect(() => parseBrowserMessage(frame({ extension_version: "0.15.0", browser }))).toThrow(ProtocolError);
+  }
+});
+
 test("page_acquire messages parse strictly", () => {
   const frame = (
     type: "page_acquire" | "page_acquire_ack",

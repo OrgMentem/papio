@@ -439,6 +439,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"browser.sessions": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserSessions(raw, system)
 		},
+		"browser.sessions_v2": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return browserSessionsV2(raw, system)
+		},
 		"browser.claim": func(_ context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserClaim(raw, system)
 		},
@@ -1667,6 +1670,30 @@ func browserSessions(raw json.RawMessage, system *bootstrap.System) ([]byte, *ip
 		return badParams(err)
 	}
 	sessions, denied, takeovers := system.Browser.Sessions()
+	type legacySession struct {
+		ID               string `json:"id"`
+		ExtensionVersion string `json:"extension_version"`
+		Holder           bool   `json:"holder"`
+		HelloAt          string `json:"hello_at"`
+		LastSyncAt       string `json:"last_sync_at"`
+	}
+	legacy := make([]legacySession, 0, len(sessions))
+	for _, s := range sessions {
+		legacy = append(legacy, legacySession{
+			ID: s.ID, ExtensionVersion: s.ExtensionVersion, Holder: s.Holder,
+			HelloAt: s.HelloAt, LastSyncAt: s.LastSyncAt,
+		})
+	}
+	return marshal(map[string]any{"sessions": legacy, "denied_hellos": denied, "takeovers": takeovers})
+}
+
+// browserSessionsV2 carries browser identity without changing the strict v1 result.
+func browserSessionsV2(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct{}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	sessions, denied, takeovers := system.Browser.Sessions()
 	if sessions == nil {
 		sessions = []browser.SessionSummary{}
 	}
@@ -1696,11 +1723,13 @@ func browserClaim(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.R
 // store-installed extension: the extension refuses the frame unless
 // chrome.management.getSelf() reports installType "development".
 func browserDevReload(raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
-	var params struct{}
+	var params struct {
+		SessionID string `json:"session_id"`
+	}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	sessionID, reloadID, err := system.Browser.RequestDevReload()
+	sessionID, reloadID, err := system.Browser.RequestDevReload(params.SessionID)
 	if err != nil {
 		return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "no browser session holds the bridge")}
 	}

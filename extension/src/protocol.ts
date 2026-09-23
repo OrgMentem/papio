@@ -126,6 +126,7 @@ export interface HelloPayload {
   extension_version: string;
   adapter_versions?: Record<string, string>;
   features?: string[];
+  browser?: "chrome" | "firefox" | "other";
 }
 
 /** Closed session-role vocabulary carried by hello_ack. "holder" owns the
@@ -3475,8 +3476,11 @@ function validatePayload(
         extension_version: "required",
         adapter_versions: "optional",
         features: "optional",
+        browser: "optional",
       });
       const v = str(p, "extension_version", "hello", 50);
+      if ("browser" in p && !["chrome", "firefox", "other"].includes(p["browser"] as string))
+        fail("hello.browser must be chrome, firefox, or other");
       if (v.length === 0) fail("hello.extension_version required");
       if ("adapter_versions" in p) {
         const av = asRecord(p["adapter_versions"], "hello.adapter_versions");

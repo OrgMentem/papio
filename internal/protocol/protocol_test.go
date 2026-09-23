@@ -6,6 +6,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -387,6 +388,48 @@ func TestHelloPayloadFeaturesStrictBoundsAndParity(t *testing.T) {
 				t.Fatalf("hello payload accepted: %#v", payload)
 			}
 		})
+	}
+}
+
+func TestHelloBrowserOptionalVocabularyRoundTrip(t *testing.T) {
+	for _, browser := range []string{"", "chrome", "firefox", "other"} {
+		t.Run(browser, func(t *testing.T) {
+			frame, err := json.Marshal(&BrowserMessage{
+				Protocol: BrowserProtocolVersion,
+				Type:     MsgHello,
+				MsgID:    "client-hello-browser",
+				Seq:      0,
+				Payload:  &HelloPayload{ExtensionVersion: "0.15.0", Browser: browser},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := DecodeBrowserMessage(frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := msg.Payload.(*HelloPayload).Browser; got != browser {
+				t.Fatalf("browser = %q, want %q", got, browser)
+			}
+			if browser == "" && bytes.Contains(frame, []byte(`"browser"`)) {
+				t.Fatalf("absent browser was emitted: %s", frame)
+			}
+		})
+	}
+	for _, browser := range []any{"", "safari", "Chrome", nil, 3} {
+		frame, err := json.Marshal(map[string]any{
+			"protocol": BrowserProtocolVersion,
+			"type":     MsgHello,
+			"msg_id":   "client-hello-browser",
+			"seq":      0,
+			"payload":  map[string]any{"extension_version": "0.15.0", "browser": browser},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeBrowserMessage(frame); err == nil {
+			t.Fatalf("accepted browser %v", browser)
+		}
 	}
 }
 

@@ -1662,6 +1662,12 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
   ]);
 });
 
+test("hello reports Firefox when its browser-info API is present", async () => {
+  const h = makeHarness(undefined, { firefox: true });
+  await h.bridge.start();
+  expect(h.frames()[0]?.payload["browser"]).toBe("firefox");
+});
+
 test("startup clears a stale badge when persisted daemon health is connected", async () => {
   const h = makeHarness({ ...emptyStore(), connectionStatus: "connected" });
   await h.bridge.start();

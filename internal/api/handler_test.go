@@ -898,7 +898,7 @@ func TestRouterBrowserSessionsAndClaim(t *testing.T) {
 	system := testSystem(t)
 	router := Router(system)
 
-	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-2","seq":0,"payload":{"extension_version":"1.2.3"}}`)
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-hello-2","seq":0,"payload":{"extension_version":"1.2.3","browser":"firefox"}}`)
 	if rpcErr := callMethod(t, router, "browser.sync",
 		map[string]any{"session_id": "aaaabbbbccccddddeeeeffff00001111", "messages": []json.RawMessage{hello}}, nil); rpcErr != nil {
 		t.Fatal(rpcErr)
@@ -917,7 +917,22 @@ func TestRouterBrowserSessionsAndClaim(t *testing.T) {
 	if len(result.Sessions) != 1 || !result.Sessions[0].Holder || result.Sessions[0].ExtensionVersion != "1.2.3" {
 		t.Fatalf("sessions = %+v", result)
 	}
-	rpcErr := callMethod(t, router, "browser.claim", map[string]string{"session_id": "nonexistent"}, nil)
+	legacy, rpcErr := browserSessions(json.RawMessage(`{}`), system)
+	if rpcErr != nil || bytes.Contains(legacy, []byte(`"browser"`)) {
+		t.Fatalf("legacy sessions must not include browser: %s, %v", legacy, rpcErr)
+	}
+	var v2 struct {
+		Sessions []struct {
+			Browser string `json:"browser"`
+		} `json:"sessions"`
+	}
+	if rpcErr := callMethod(t, router, "browser.sessions_v2", struct{}{}, &v2); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(v2.Sessions) != 1 || v2.Sessions[0].Browser != "firefox" {
+		t.Fatalf("v2 sessions = %+v", v2)
+	}
+	rpcErr = callMethod(t, router, "browser.claim", map[string]string{"session_id": "nonexistent"}, nil)
 	if rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("claim unknown session = %+v, want invalid_argument", rpcErr)
 	}

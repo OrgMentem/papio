@@ -13,7 +13,7 @@ func TestReloadLatchFreshHelloReleasesCurrentHolder(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	_ = settableClock(b)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
 	msgs, _ := runSyncAs(t, b, sessA)
@@ -54,7 +54,7 @@ func TestReloadLatchExpiredHelloStillDenied(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	advance := settableClock(b)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
 	msgs, _ := runSyncAs(t, b, sessA)

@@ -15973,7 +15973,7 @@ func TestSurfaceCloseSupersededRetiresAReDrivenClaimsOwnTab(t *testing.T) {
 
 func TestRequestDevReloadRequiresHolder(t *testing.T) {
 	b, _, _, _ := newBridge(t)
-	_, _, err := b.RequestDevReload()
+	_, _, err := b.RequestDevReload("")
 	if err == nil || err.Error() != "no browser session holds the bridge" {
 		t.Fatalf("RequestDevReload without holder err = %v, want %q", err, "no browser session holds the bridge")
 	}
@@ -15982,7 +15982,7 @@ func TestRequestDevReloadRequiresHolder(t *testing.T) {
 func TestRequestDevReloadRejectsOldExtensionVersionAndDoesNotLatch(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSyncAs(t, b, sessA, helloAs("0.14.0"))
-	_, _, err := b.RequestDevReload()
+	_, _, err := b.RequestDevReload("")
 	if err == nil {
 		t.Fatal("RequestDevReload against 0.14.0 extension was accepted")
 	}
@@ -16004,7 +16004,7 @@ func TestRequestDevReloadRejectsOldExtensionVersionAndDoesNotLatch(t *testing.T)
 func TestRequestDevReloadHappyPathEmitsOnNextSync(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
-	sid, reloadID, err := b.RequestDevReload()
+	sid, reloadID, err := b.RequestDevReload("")
 	if err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
@@ -16034,7 +16034,7 @@ func TestRequestDevReloadHappyPathEmitsOnNextSync(t *testing.T) {
 func TestDevReloadLatchIsOneShotStopsReloadLoop(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
-	_, reloadID, err := b.RequestDevReload()
+	_, reloadID, err := b.RequestDevReload("")
 	if err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
@@ -16047,7 +16047,7 @@ func TestDevReloadLatchIsOneShotStopsReloadLoop(t *testing.T) {
 		t.Fatalf("second Sync re-emitted dev_reload %v with reload_id %q; latch must be one-shot to stop a reload loop", msgs, second.Payload.(*protocol.DevReloadPayload).ReloadID)
 	}
 	// A second latch must produce a fresh id, not replay the old one.
-	_, secondID, err := b.RequestDevReload()
+	_, secondID, err := b.RequestDevReload("")
 	if err != nil {
 		t.Fatalf("second RequestDevReload: %v", err)
 	}
@@ -16069,7 +16069,7 @@ func TestDevReloadPendingSessionDoesNotReceiveHolderLatch(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
 	runSyncAs(t, b, sessB, helloAs("0.15.0"))
-	_, reloadID, err := b.RequestDevReload()
+	_, reloadID, err := b.RequestDevReload("")
 	if err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
@@ -16095,7 +16095,7 @@ func TestDevReloadReservationHoldsSlotAgainstPendingSibling(t *testing.T) {
 	if busy == nil || busy.Payload.(*protocol.ErrorPayload).Code != "session_busy" {
 		t.Fatalf("B hello must be denied with session_busy, got %+v", msgs)
 	}
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
 	msgs, _ = runSyncAs(t, b, sessA)
@@ -16130,7 +16130,7 @@ func TestDevReloadFreshHelloReclaimsReservedSlot(t *testing.T) {
 	_ = settableClock(b)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
 	runSyncAs(t, b, sessB, helloAs("0.15.0"))
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
 	msgs, _ := runSyncAs(t, b, sessA)
@@ -16176,7 +16176,7 @@ func TestDevReloadReservationExpiryPromotesWaitingSibling(t *testing.T) {
 	advance := settableClock(b)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
 	runSyncAs(t, b, sessB, helloAs("0.15.0"))
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
 	msgs, _ := runSyncAs(t, b, sessA)
@@ -16236,7 +16236,7 @@ func TestDevReloadExplicitClaimOverridesReservation(t *testing.T) {
 	_ = settableClock(b)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
 	runSyncAs(t, b, sessB, helloAs("0.15.0"))
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
 	msgs, _ := runSyncAs(t, b, sessA)
@@ -16292,7 +16292,7 @@ func TestDevReloadLatchDroppedWhenHolderIsDemoted(t *testing.T) {
 	_ = settableClock(b)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
 	runSyncAs(t, b, sessB, helloAs("0.15.0"))
-	if _, _, err := b.RequestDevReload(); err != nil {
+	if _, _, err := b.RequestDevReload(""); err != nil {
 		t.Fatalf("RequestDevReload: %v", err)
 	}
 	// Demote A before it ever polls, so the latch is still un-emitted.
@@ -16317,11 +16317,11 @@ func TestDevReloadRequestIsIdempotentUntilEmitted(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	_ = settableClock(b)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
-	firstSession, firstID, err := b.RequestDevReload()
+	firstSession, firstID, err := b.RequestDevReload("")
 	if err != nil {
 		t.Fatalf("first RequestDevReload: %v", err)
 	}
-	secondSession, secondID, err := b.RequestDevReload()
+	secondSession, secondID, err := b.RequestDevReload("")
 	if err != nil {
 		t.Fatalf("second RequestDevReload: %v", err)
 	}
@@ -16340,7 +16340,7 @@ func TestDevReloadRequestIsIdempotentUntilEmitted(t *testing.T) {
 		t.Fatalf("emitted reload_id %q, want the id both callers were given, %q", got, firstID)
 	}
 	// The latch is still one-shot: a third request after the emit mints a new id.
-	_, thirdID, err := b.RequestDevReload()
+	_, thirdID, err := b.RequestDevReload("")
 	if err != nil {
 		t.Fatalf("third RequestDevReload: %v", err)
 	}
