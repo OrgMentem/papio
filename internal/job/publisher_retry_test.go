@@ -130,8 +130,14 @@ func TestPublisherRetryProfileGateScope(t *testing.T) {
 		dependent bool
 	}{
 		{name: "terms at another provider", gate: HumanGateTermsRequired, allowed: true},
-		{name: "terms for this job", gate: HumanGateTermsRequired, dependent: true},
+		// A terms gate lists every job at the profile as dependent (measured
+		// 2026-09-23: one JSTOR modal named 30 jobs), so membership says
+		// nothing about this paper's route. A paper that itself needs terms
+		// carries its own open terms action, which the other-action guard
+		// already refuses.
+		{name: "terms naming this job", gate: HumanGateTermsRequired, dependent: true, allowed: true},
 		{name: "login", gate: HumanGateLogin},
+		{name: "login naming this job", gate: HumanGateLogin, dependent: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

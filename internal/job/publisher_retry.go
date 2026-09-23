@@ -69,10 +69,11 @@ func (js *Store) RetryPublisherHandoff(ctx context.Context, actionID, revision i
 		  AND p.configured_name=COALESCE(NULLIF(json_extract(j.policy_json,'$.resolver'),''),'default'))
 		AND NOT EXISTS (SELECT 1 FROM human_gate_observations g WHERE g.status='open' AND (
 		  g.scope_class='platform'
-		  OR EXISTS (SELECT 1 FROM json_each(g.detail_json,'$.dependent_job_ids') WHERE value=j.id)
-		  OR EXISTS (SELECT 1 FROM json_each(g.detail_json,'$.claim_member_job_ids') WHERE value=j.id)))
+		  OR (g.gate_type<>? AND (
+		    EXISTS (SELECT 1 FROM json_each(g.detail_json,'$.dependent_job_ids') WHERE value=j.id)
+		    OR EXISTS (SELECT 1 FROM json_each(g.detail_json,'$.claim_member_job_ids') WHERE value=j.id)))))
 		AND NOT EXISTS (SELECT 1 FROM route_suppressions s WHERE s.job_id=j.id AND s.active=1 AND s.reason IN ('provider_challenge','rate_limited'))`,
-		actionID, now, now, HumanGateLogin, HumanGateMFA, HumanGateCaptchaOrSecurity).
+		actionID, now, now, HumanGateLogin, HumanGateMFA, HumanGateCaptchaOrSecurity, HumanGateTermsRequired).
 		Scan(&jobID, &doi, &requiresAuth, &actionDetail, &publisherRetried)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("%w: publisher retry requires one DOI route failure, no pending gate or effect, and no earlier publisher retry", ErrConflict)
