@@ -145,9 +145,11 @@ Content-Length, `downloads.download` saves it from an object URL under
 download. The signed URL is never requested a second time. A failed or
 incomplete capture reports the existing `native_viewer_download_required`
 outcome with its reason. The new Firefox-only permissions are `webRequest`,
-`webRequestBlocking` and `webRequestFilterResponse`. The helper code and its
-protocol messages stay until a later cutover removes them; the capture takes
-precedence where both apply.
+`webRequestBlocking` and `webRequestFilterResponse`. The same day the helper was
+removed from the product: its daemon driver, the `native_viewer_save_v1` feature,
+the `native_viewer_save_request_v1` and `native_viewer_save_result_v1` messages
+and the `browser.native_viewer_helper` setting, which a config may still set
+and papio now ignores. Git history keeps the helper for extension-free work.
 
 Residual gap: the capture sees only a response that arrives after papio armed
 the tab. A PDF opened before that, or on a host papio has no access to, has

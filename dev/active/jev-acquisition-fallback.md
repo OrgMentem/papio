@@ -1,12 +1,12 @@
 # Native agent acquisition and adapter learning
 
-Status: integrated Chrome and Windows Firefox acquisition proven; macOS Firefox resident-save bridge validated on 2026-09-23. The product direction is cross-platform
+Status: integrated Chrome and Windows Firefox acquisition proven. Firefox saves a signed viewer PDF inside the extension; the macOS resident-save helper was removed from the product on 2026-09-24. The product direction is cross-platform
 native acquisition, interchangeable cloud/local decision backends, and learning
 from successful recoveries. Development validation is authorized. This document
 does not grant new OS permissions. ADR-0029 records the acquisition decision
 authority. The new integration is optional, capability-gated and disabled without
-an explicitly supplied backend credential. Deterministic resident saving instead requires an explicitly configured local helper, not an inference key. Native helper distribution is still
-unimplemented.
+an explicitly supplied backend credential. Saving a signed viewer PDF needs neither a helper nor an inference key:
+the extension saves the PDF from its one response (ADR-0029 amendment, 2026-09-24).
 
 ## Current integration
 
@@ -53,15 +53,14 @@ loop's deadline and inference budget. Unexpected redirects stop. New tabs,
 cross-origin navigation and automatic source-repair
 promotion remain subsequent slices.
 
-The macOS Firefox native save is now connected to job authority and normal PDF
-adoption. A live synthetic fixture reached `ready` with the exact three-page PDF
-after its source URL was revoked, without another browser request for that PDF.
-The first page and digest were checked. This exercised the production bridge,
-helper and validator through a test harness; the extension entry still needs live
-acceptance, and this run acquired no backlog paper. Browser navigation was explicit
-test setup. During the measured save, foreground app/window stayed unchanged;
-pointer movement occurred, so the run does not establish an unchanged pointer.
-Failed publication of already admitted staging still requires explicit recovery.
+A macOS Firefox native save, a separately built Accessibility helper that the
+daemon drove through job authority and normal PDF adoption, reached `ready` on a
+revoked-URL synthetic fixture on 2026-09-23. On 2026-09-24 the operator rejected
+helper apps because every Firefox user would carry their install and maintenance
+cost. The helper, its protocol messages and the `native_viewer_helper` setting
+were removed; Firefox now keeps a copy of the signed PDF response in the
+extension (`extension/src/viewer-stream-capture.ts`). Git history keeps the
+helper code for the extension-free executor below.
 
 ## Delivery backlog after the first live proof
 
@@ -77,7 +76,7 @@ debugger is introduced by removing the extension.
 | Persistent key setup | Implemented across platforms; Windows interactive-session storage and fresh live acquisition verified. SSH network logons cannot read Credential Manager; launch the enrolled daemon in the signed-in desktop session. Native Linux Secret Service acceptance remains pending. No plaintext key in config, browser storage, logs or argv. |
 | Menu and observation progression | Implemented with delayed-menu and intercepted-anchor regressions. An intercepted link can expose a new local PDF control without replaying the consumed click. Preserve actual-download grace and exact receipt ownership. |
 | Article navigation and new contexts | Same-tab exact same-origin destination implemented; one live Chrome HTML-wrapper route acquired a validated PDF. Next: redirects and an owned child tab. Retire old control handles; carry the existing job/permit through a defined handoff, recheck permissions/identity, close only owned tabs, and reconcile any download already started. Test redirects, cancellation, concurrent jobs and operator takeover. |
-| CDN and resident-viewer acquisition | Mac Firefox's production bridge/helper/adoption path passed the revoked-URL fixture. Next: live extension entry and backlog acceptance, packaged helper distribution, recovery of admitted staging after publication failure, and Windows/Linux native drivers. Chrome's observed Save path refetched and failed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation. |
+| CDN and resident-viewer acquisition | Chrome: a DNR rule turns the first PDF response in an armed handoff tab into a download. Firefox: a StreamFilter keeps a copy of that response and saves it from the extension. The OS helper route was removed on 2026-09-24. A PDF that opened before papio armed the tab still needs the viewer's Download button. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation. |
 | Local repair learning | Implemented locally, live canary pending. `papio adapter repair <capture> --recovery-job <job>` links the capture to the same job's declarative failure (ui_changed, or an agent reservation whose completion receipt follows) and its validated ready artifact through the existing job/artifact reads; a reservation without completion is recorded as `temporal_correlation` and keeps the revision locked. The recovered DOI labels the generated regression, which must also refuse another DOI. The workspace records `repair.json` and a `canary.md` procedure for a fresh model-free canary with the agent disabled; the canary verdict and rollback command is held for review, so the verdict is the operator's reading of the artifact. A private replay of the saved IOS Press controlled pair reproduced fail-before/pass-after; its artifact identity row was reconstructed. Next: one real browser run of the full cycle. The daemon history cannot yet distinguish an adapter download from a manual click; a success receipt naming the declarative producer would close that. |
 | Extension-free native executor | Reuse and assess maintained OSS accessibility/input components on macOS, Windows and named Linux desktops. The helper starts on demand, yields to user input and cleans up its own tabs/dialogs. Prove article observation, navigation, saving, ownership, cancellation and recovery with the extension disabled and Codex absent. Measure focus, pointer and input interference. |
 

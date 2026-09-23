@@ -84,10 +84,7 @@ viewer's **Download** button. This occurs when the PDF opened before *papio*
 armed the tab, when *papio* has no access to the PDF's host, or when the
 response did not arrive complete. On Chrome, choose **Send this PDF** first, so
 that *papio* can adopt the file. Firefox gives an extension no way to adopt a
-download it did not start, so on Firefox the button only keeps your own copy,
-unless you use the experimental
-[macOS helper](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental),
-which saves the PDF that Firefox already shows.
+download it did not start, so on Firefox the button only keeps your own copy.
 The notice itself does not authorize adoption; Send this PDF binds the current
 browser document. The daemon still validates the downloaded file before marking
 its job ready.
@@ -214,10 +211,7 @@ Two consequences worth knowing:
 - **Firefox declines this rather than half-promising it.** Firefox gives an
   extension no way to adopt a download it did not start, so *papio* says it
   could not save the PDF and that the viewer's **Download** button keeps your
-  own copy, instead of asking for a click it could not act on. The exception
-  is the experimental
-  [macOS helper](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental):
-  when you configure it, *papio* saves the PDF from Firefox's viewer itself.
+  own copy, instead of asking for a click it could not act on.
 
 ## The inbox stays current
 
@@ -258,7 +252,6 @@ commits any pending dismissals.
 | `proquest_account_id` | Optional default ProQuest account ID for the `accountid` append. |
 | `download_adoption_root` | Root containing the per-job adopted downloads; when empty, *papio* uses `<your download folder>/papio`. It must be a `papio` directory inside the browser's own download directory — steering cannot reach anywhere else. |
 | `action_expiry_seconds` | Maximum open time for one browser handoff. |
-| `native_viewer_helper` | Experimental. Absolute path to the separately built macOS helper that saves a PDF already open in Firefox's viewer; empty (the default) turns it off. See [the user guide](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental). |
 
 `[browser.resolvers.<name>]` profiles replace the default institution for a
 selected job. They carry only `openurl_base_url` and optional

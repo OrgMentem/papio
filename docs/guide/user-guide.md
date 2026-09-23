@@ -653,63 +653,6 @@ rerouted automatically and remains human-assisted. When that happens, wait
 until the PDF is open and use **Send PDF to papio** rather than assuming an
 unrelated file in `Downloads` will be adopted.
 
-### Save a Firefox PDF with the macOS helper (experimental)
-
-Some publishers show a PDF in the browser's viewer but refuse to send it a
-second time (see
-[PDF viewers that need a manual download](../concepts/browser-handoff.md#pdf-viewers-that-need-a-manual-download)).
-Chrome can file that PDF when you press the viewer's **Download** button;
-Firefox cannot. On macOS, an experimental helper program can save the PDF that
-Firefox already shows, so you do not have to open the paper in Chrome.
-
-Know these limits before you use it:
-
-- It is experimental. It works only with Firefox on macOS.
-- The release packages do not include the helper. Homebrew, Scoop, WinGet, the
-  Linux packages, and the release archives contain only the `papio` program.
-  You build the helper yourself from the Swift package in the repository's
-  `extension/tools/native-spike-macos` directory. It needs Swift 6.2 or later
-  and macOS 14 or later.
-- The helper uses macOS Accessibility to press Firefox's own **Save** control
-  and to fill in the save dialog. It never asks for that permission. If macOS
-  has not granted it, the save reports that it is unavailable.
-- If the extension says Firefox cannot identify the open PDF, update to
-  Firefox 153 or later.
-
-From a clone of the repository, build the helper into a folder of your choice:
-
-```sh
-swift build -c release --package-path extension/tools/native-spike-macos \
-  --scratch-path ~/papio-helper-build --product papio-native-spike
-```
-
-The program is then at `~/papio-helper-build/release/papio-native-spike`.
-
-To turn it on, set the absolute path of the helper (a `~/` path also works) in
-`[browser]`, then restart the background service:
-
-```toml
-[browser]
-native_viewer_helper = "~/papio-helper-build/release/papio-native-spike"
-```
-
-Leave `native_viewer_helper` empty, or remove it, to turn the helper off.
-
-When it is configured and a PDF viewer needs a manual download, the extension
-asks *papio* to save the document itself, either when you choose **Send this
-PDF** or when *papio* diagnosed the page as a viewer download. The helper saves
-the PDF from Firefox's viewer into your Downloads folder under a
-`papio-viewer-…` name, and *papio* adopts it from there. The file must pass the
-normal PDF and identity checks before the job becomes ready. *papio* starts
-each save only once: if a save is interrupted, *papio* does not repeat it, and
-you check the paper in *papio* before you try again.
-
-The helper runs only on your machine and makes no network requests. The
-address of the PDF goes to it only on its standard input, and when a save
-fails, *papio* keeps only a fixed error code. A paper saved this way shows
-`producer=native_viewer` in `papio jobs get <job-id>` and in
-`papio stats producers`.
-
 ## 6. Read the batch outcome
 
 Ask for a joined view of the original batch manifest, live job state, events,
@@ -892,10 +835,9 @@ record: papers from before *papio* 0.22.0, and papers served from a copy
 | --- | --- |
 | `adapter` | The extension downloaded a PDF that the page declared, inside a drive that *papio* started, with no agent decision. |
 | `agent` | The article agent chose the control that produced the download. |
-| `native_viewer` | The macOS helper saved the PDF from Firefox's viewer. |
 | `daemon_fetch` | *papio* chose the address: it fetched the file itself, or the browser fetched a public address that *papio* selected. |
 | `manual` | A person supplied the file: a PDF you sent from an open tab, or a download that came after the adapter had stopped. |
-| `unknown` | A browser download with no record of who clicked. |
+| `unknown` | A browser download with no record of who clicked. A paper that the removed macOS helper of *papio* 0.22 saved also counts here. |
 
 The interventions it counts are `open` (someone other than the paced drive
 opened the handoff), `sign_in`, `terms`, `challenge`, `review`, and

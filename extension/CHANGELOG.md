@@ -41,6 +41,14 @@ for the full pre-split extension history.
   `papio` download folder and never leave your computer. Chrome keeps its
   existing download rule and asks for no new permission.
 
+### Removed
+- **Saving a Firefox viewer PDF through the daemon's macOS helper.** Firefox
+  now keeps and saves that PDF itself, so the extension no longer asks the
+  daemon to run the separately built helper, and no longer offers that save to
+  the daemon when it connects. A save that an older version left interrupted is
+  forgotten when this version loads it. With an older daemon that still has the
+  helper set up, nothing changes except that the helper is never used.
+
 ## [0.15.0] - 2026-09-23
 
 ### Added

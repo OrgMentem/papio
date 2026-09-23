@@ -10,6 +10,22 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Removed
+- **The experimental macOS helper that saved a PDF from Firefox's viewer.**
+  The next extension release saves that PDF itself, with nothing to build or
+  install. The daemon no longer offers the helper's save to the extension, and
+  `papio stats producers` no longer lists `native_viewer`; a paper that the
+  helper saved counts as `unknown` there. A config that still sets
+  `browser.native_viewer_helper` keeps loading: *papio* ignores the value, and
+  `papio doctor` shows a `config_ignored_settings` warning until you delete the
+  line. If a helper save was interrupted before you upgraded, its effect permit
+  can still hold the browser effect lane. *papio* marks it
+  `unknown_completion`, and `papio doctor` reports it; release it with
+  `papio browser resolve <permit-id> --reason <text>`. A saved file the helper
+  left in the download folder as `native_stage_<id>.tmp` is no longer moved
+  into the paper's folder; it stays where it is for you. A manual-download
+  task in the inbox no longer shows a `Diagnosis` line.
+
 ## [0.22.1] - 2026-09-23
 
 ### Fixed

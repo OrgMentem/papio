@@ -3,6 +3,12 @@
 Evidence date: 2026-09-21. Development tooling only; no production daemon,
 extension, job-policy or native-host changes.
 
+Removed 2026-09-24: the operator rejected OS helper apps for the product, and
+the Swift package (`extension/tools/native-spike-macos`), `native-spike-run.ts`,
+`native-spike-fixture.ts`, `native-resident-proof.ts`, the page and provider
+runners' `--monitor-helper` option and the daemon's helper driver were deleted.
+The commands below need a checkout from before that date. The evidence stands.
+
 ## Result
 
 An independent program completed a local article → PDF viewer → Download → Save
