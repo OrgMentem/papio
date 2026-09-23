@@ -172,6 +172,10 @@ for the full pre-split extension history.
   regardless of whether the sign-in bookkeeping accepted the observation.
 
 ### Added
+- **Science (AAAS) adapter.** An entitled `science.org` article downloads its
+  own PDF. The page must show full access, and the PDF link must name the
+  requested DOI. The journal archive page, where the institution's resolver
+  sends Science titles, stays unknown.
 - **ACS Publications entitled articles can use their primary PDF link.**
   The adapter checks the page DOI, Subscribed badge, and article PDF control
   before passing the same-origin link to the browser downloads API. Clicking

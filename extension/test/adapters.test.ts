@@ -1858,6 +1858,48 @@ test.skipIf(psychiatryPaywall === null)(
   },
 );
 
+// Science: captured 2026-09-23 through the provider's own institutional
+// sign-in entry (/action/ssostart), which returned to the entitled article.
+// The institution's resolver sends Science titles to the journal archive
+// (/loi/science, drift.html) instead, which must never classify.
+function sciencePage(scenario: "success" | "drift"): Document {
+  const html = readFileSync(fixturePath("science", scenario), "utf8");
+  expect(residualLeak(html)).toBeNull();
+  const origin = captureOrigin(html);
+  if (origin === null) throw new Error(`science ${scenario} capture has no origin`);
+  return parseHTML(html, origin);
+}
+const scienceDOI = "10.1126/science.adz4433";
+
+test("captured Science full-access article plans its own DOI's PDF href", () => {
+  const spec = adapters.find((a) => a.id === "science") as AdapterSpec;
+  const result = planExecution(sciencePage("success"), spec, { doi: scienceDOI }, { access_mode: "delegated" });
+  if ("assisted" in result) throw new Error(result.assisted);
+  expect(result.verdict.kind).toBe("article");
+  expect(result.method).toBe("href");
+  expect(result.url).toBe(`https://www.science.org/doi/pdf/${scienceDOI}`);
+});
+
+test("Science refuses a different DOI, a denied page and the journal archive", () => {
+  const spec = adapters.find((a) => a.id === "science") as AdapterSpec;
+  const other = planExecution(sciencePage("success"), spec, { doi: "10.1126/science.aeg8766" }, { access_mode: "delegated" });
+  expect(other.verdict.kind).toBe("wrong_work");
+  if ("assisted" in other) throw new Error(other.assisted);
+  expect(other.url).toBeNull();
+
+  // Atypon can render the PDF anchor without access; the access state decides.
+  const denied = sciencePage("success");
+  denied.querySelector("[data-article-access='full']")?.setAttribute("data-article-access", "no");
+  expect(classifyFixture(denied, spec, { doi: scienceDOI }).kind).toBe("unknown");
+
+  // A PDF anchor for another DOI never becomes this work's download.
+  const foreign = sciencePage("success");
+  foreign.querySelector("a#downloadPdfUrl")?.setAttribute("href", "/doi/pdf/10.1126/science.aeg8766");
+  expect("assisted" in planExecution(foreign, spec, { doi: scienceDOI }, { access_mode: "delegated" })).toBe(true);
+
+  expect(classifyFixture(sciencePage("drift"), spec, { doi: scienceDOI }).kind).toBe("unknown");
+});
+
 const jamaArticle = loadFixture("jamanetwork", "success");
 test.skipIf(jamaArticle === null)(
   "captured free JAMA article classifies through its access-checked PDF control",

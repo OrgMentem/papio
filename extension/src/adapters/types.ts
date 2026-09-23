@@ -1383,6 +1383,38 @@ export const adapters: AdapterSpec[] = [
     },
   },
   {
+    // Captured 2026-09-23 (fixtures/science/*). success.html is the entitled
+    // article for 10.1126/science.adz4433, reached through Science's own
+    // institutional sign-in entry; drift.html is the journal archive
+    // (/loi/science) where the institution's resolver lands every Science
+    // title, which must stay unknown. The page states its access in
+    // data-article-access, and the "PDF format — Download this article as a
+    // PDF file" panel and #downloadPdfUrl both name /doi/pdf/<doi>. The
+    // anchor may render without access, so the full-access state is required,
+    // and its href must carry the requested DOI.
+    id: "science",
+    version: "0.1.0",
+    hosts: ["science.org"],
+    workEvidence: { kind: "doi", selector: "meta[name='publication_doi']", attribute: "content" },
+    settleTimeoutMs: 5000,
+    classify: [
+      {
+        kind: "article",
+        all: [
+          "meta[name='publication_doi']",
+          "[data-article-access='full'][data-article-access-type='full']",
+          "a#downloadPdfUrl[data-doi]",
+        ],
+      },
+    ],
+    download: {
+      selector: "a#downloadPdfUrl[data-doi]",
+      requireKind: "article",
+      workTarget: { kind: "doi", attribute: "href", pattern: "^/doi/pdf/(10\\.[^?#]+)(?:[?#]|$)" },
+      method: "href",
+    },
+  },
+  {
     // Verified 2026-07-20 against an authentic JAMA Psychiatry publisher
     // capture of DOI 10.1001/archgenpsychiatry.2010.116
     // (fixtures/jamanetwork/success.html). This older JAMA control has no href:
