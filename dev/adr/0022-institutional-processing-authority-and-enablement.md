@@ -480,7 +480,11 @@ remain blocking and cannot be re-driven.
 
 ## Amendment 2026-08-26: content retention is per paper, not per attempt
 
-papio never auto-closes content, and that stands. The rule's own justification
+*Superseded 2026-09-23* by the operator's decision recorded below and in
+ADR-0028: papio no longer retains content at all, so this amendment's
+one-copy retention and cold-duplicate rule are retired. It is kept as history.
+
+papio never auto-closes content, and that stood until 2026-09-23. The rule's own justification
 is that one visible tab showing an acquired paper is confirmation rather than
 litter, so retention is scoped to ONE surface per paper. The implementation
 could not honour that scope: a papio-created tab that navigated to a PDF was
@@ -516,3 +520,26 @@ drives that paper, so its surface may be retired, with the pre-existing effect
 veto retained — an unsettled provider effect on that exact claim still refuses.
 A binding that IS the job's live claim keeps its tab, and a binding with no
 claim at all remains browser-local by the existing contract.
+
+## Amendment 2026-09-23: content is not retained
+
+The operator, 2026-09-23, verbatim: "Papio should not retain tabs for articles or PDFs … The idea is that the tab would be automatically closed after it's acquired or other relevant lifecycle states, and a toast or something would allow the user to re-open it if they needed (or they can do so via the browsers own tools). Fix the defects that cause multiple tabs like the redrives, etc. and the lifecycle tab management."
+
+papio no longer retains content. A surface papio owns (birth record, not ceded,
+inside its group or work window, same browser epoch) closes, PDF or article
+included, through the close transaction when its job is adopted, reaches a
+terminal state, or is superseded by a newer attempt (redrive, re-offer, fresh
+link, retry). A cold parked surface closes even on a PDF; the inbox and
+`papio actions open` reopen it on demand. Exactly two guards remain. A tab the
+operator pinned or moved out of papio's container is ceded and never closed.
+The tab the operator is looking at right now (the active tab of a focused,
+non-minimized window, or a tab touched during the close) is deferred, never
+ceded, and a later pass closes it. Activating a tab no longer cedes it. Before
+a new or reused surface is recorded for a job, papio retires the job's other
+owned surfaces as `surface_superseded`. When papio closes the tabs of papers it
+filed, one toast per batch offers to reopen them from URLs held in worker
+memory only.
+
+The superseded-copy pass above is deleted: every owned surface whose job has
+moved on is closed by the ordinary reconcile pass, and a `content` record left
+by an older build is closed like any other.

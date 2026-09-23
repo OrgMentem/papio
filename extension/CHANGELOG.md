@@ -16,7 +16,23 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Changed
+- **papio closes the tab of a paper it filed.** The adopted viewer, and any
+  papio tab whose paper is terminal or superseded, now closes, PDF included
+  (operator decision 2026-09-23). Tabs an older version kept as "content" are
+  closed by the next reconcile pass. A pinned tab, or one moved out of papio's
+  group or work window, is never closed; the tab you are looking at is closed
+  later, once you look away. Activating a papio tab no longer hands it over.
+- **A toast offers the closed papers back.** "papio filed the paper and closed
+  its tab." (or "N papers … their tabs.") with **Reopen**, one toast per batch.
+  Reopen reopens them; if the browser slept meanwhile it opens History instead.
+
 ### Fixed
+- **A redrive no longer leaves the old tab beside the new one.** Opening a
+  surface for a paper now retires that paper's other papio tabs.
+- **The minimized work window's selected tab is no longer treated as in use.**
+  It is closed with its job, which also clears blank "New Tab" tabs a
+  download-only navigation left behind.
 - **A queued handoff whose offer URL is gone is left for the daemon's
   re-offer, not rejected.** A same-URL re-offer of a queued institutional
   handoff dropped that job's URL but kept it queued. When the drive slot freed,

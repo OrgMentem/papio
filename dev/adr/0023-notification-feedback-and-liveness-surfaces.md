@@ -646,6 +646,19 @@ deliberate: the extension cannot mint a route itself, because an offer that
 opened a tab by itself is what *papio* must never do for a paper it asked a human
 to fetch.
 
+**Amended 2026-09-23.** The seventh surface may also be raised for papio's own
+close of the tab of a paper it filed (operator decision 2026-09-23: "Papio should not retain tabs for articles or PDFs … The idea is that the tab would be automatically closed after it's acquired or other relevant lifecycle states, and a toast or something would allow the user to re-open it if they needed (or they can do so via the browsers own tools). Fix the defects that cause multiple tabs like the redrives, etc. and the lifecycle tab management.").
+Kind `paper_filed`: "papio filed the paper and closed its tab." or "papio filed
+N papers and closed their tabs.", action "Reopen". Closes inside one toast
+window are batched into one toast, which replaces rather than stacks. Reopen
+recreates the closed tabs from URLs held in worker memory only, never persisted:
+one paper opens in front, several open inactive where papio's own tabs go. After
+the worker slept the URLs are gone and Reopen opens the history page. No title,
+URL or job id is rendered; the payload carries an opaque batch id. Scaffolds
+(sign-in, capture, one-use login, keepalive) and blank tabs never raise it. The
+existing bounds hold: one at a time, eight seconds, suppressed while a papio
+surface has focus, and the route preference decides in-page or window.
+
 ## Addendum (2026-09-15): Linux and Windows desktop senders
 
 The desktop transport now has per-platform implementations behind the same

@@ -107,6 +107,8 @@ Two amendments, taken as operator decisions:
 - **Automatic waiter-tab closure is re-permitted, narrowly.** It applies to
   scaffolds only, through the close transaction in Decision 6, and never to
   engaged, active, PDF or adopted content. Unknown engagement means retain.
+  *Superseded 2026-09-23 for content:* PDF and adopted content now close too,
+  and "active" means in front of the operator; see the amendment below.
 - **Owner-age and URL-shape liveness stays banned.** Retirement and resume ride
   daemon claim state and explicit transitions only.
 
@@ -115,10 +117,10 @@ Reaffirmed rules, restated so they survive without the plans that held them:
 - Missing federation metadata is a structured engagement failure. It is never
   permission to pre-open a surface. Work that requires authentication goes
   tabless without a granted claim.
-- papio never auto-closes content. Only papio's own scaffolding closes: job,
-  handoff and capture tabs, plus the one narrow case ADR-0022's 2026-08-26
-  amendment ratifies, a cold duplicate copy of a paper that a newer retained
-  surface still shows.
+- papio does not retain content (amended 2026-09-23, see "Amendment
+  2026-09-23" below). A filed, terminal or superseded paper's tab closes
+  through the close transaction; only a pinned or moved-out tab is kept, and
+  the tab in front of the operator waits for a later pass.
 - The forbidden pattern is an unrelated await between check and act, not the one
   authoritative freshness read. No shadow state is reconstructed.
 - The work window is never closed directly. Chrome discards it when its last tab
@@ -161,9 +163,10 @@ These are the invariants the shipped implementation enforces.
 - **Positive evidence closes; absence retains.** A close requires a one-use
   daemon authorization. Absence from a bounded offer batch, a `goodbye` frame,
   timer expiry and transport loss are all insufficient.
-- **Operator cession is causal.** papio issues focus and navigation action
-  tokens keyed to a tab and a document epoch. A matching event consumes the
-  token and is not a takeover. Ambiguity means engagement, which means retain.
+- **Operator cession is causal.** Only pinning a tab or moving it out of
+  papio's container cedes it (amended 2026-09-23: activation and a touch
+  during a close defer the close instead, so papio's focus tokens are gone).
+  Ambiguity about whether the operator is looking means defer, not cede.
 - **Every dead end has a daemon-side disposition.** A navigation error is
   observed before authentication detection, charges no authentication attempt
   and applies no cooldown. Classify exhaustion is reported by the extension with
@@ -194,6 +197,30 @@ A freshness or lapse check at that call site reads exactly that state as free
 and offers a second paper a sign-in at the same institution. Such a check is
 therefore forbidden. Do not reintroduce one as an obvious guard.
 
+## Amendment 2026-09-23: papio does not retain content
+
+The operator, 2026-09-23, verbatim: "Papio should not retain tabs for articles or PDFs … The idea is that the tab would be automatically closed after it's acquired or other relevant lifecycle states, and a toast or something would allow the user to re-open it if they needed (or they can do so via the browsers own tools). Fix the defects that cause multiple tabs like the redrives, etc. and the lifecycle tab management."
+
+papio no longer retains content. A surface papio owns (birth record, not ceded,
+inside its group or work window, same browser epoch) closes, PDF or article
+included, through the close transaction when its job is adopted, reaches a
+terminal state, or is superseded by a newer attempt (redrive, re-offer, fresh
+link, retry). A cold parked surface closes even on a PDF; the inbox and
+`papio actions open` reopen it on demand. Exactly two guards remain. A tab the
+operator pinned or moved out of papio's container is ceded and never closed.
+The tab the operator is looking at right now (the active tab of a focused,
+non-minimized window, or a tab touched during the close) is deferred, never
+ceded, and a later pass closes it. Activating a tab no longer cedes it. Before
+a new or reused surface is recorded for a job, papio retires the job's other
+owned surfaces as `surface_superseded`. When papio closes the tabs of papers it
+filed, one toast per batch offers to reopen them from URLs held in worker
+memory only.
+
+The daemon side: `job_inactive` and `surface_superseded` also authorize the
+tab of a binding whose own claim is settled or abandoned, because such a
+binding drives nothing; an unsettled effect permit on that claim still vetoes.
+No enum or wire field changed.
+
 ## Acceptance scenarios
 
 These are the scenarios that verify this decision. They are stated here, not in
@@ -219,9 +246,10 @@ a plan, so they cannot vanish.
    the scaffold closes. No authentication attempt is charged. No cancellation is
    emitted, because the tombstone is consumed. Exhaustion survives a worker
    restart.
-6. **Operator-active parked tab.** It is never renavigated and never closed.
-   Engagement and cession survive a worker restart. papio's own focus, carrying
-   an action token, does not count as engagement.
+6. **Operator-active parked tab.** It is never renavigated, and it is not
+   closed while it is in front of the operator. Once it is not, and cold, it
+   closes (amended 2026-09-23). Pinning cedes it, and that survives a worker
+   restart.
 7. **Firefox below version 139.** Group identity degrades to the work window
    without silently becoming work-window ownership. A full event-page teardown
    occurs between every protocol step.
