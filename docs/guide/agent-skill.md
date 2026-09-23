@@ -104,6 +104,10 @@ for the user. Working through the queue unprompted is the autonomous drain
 browser is one serial surface, and filling it with tabs nobody asked for is not
 acquisition progress.
 
+The one sanctioned exception is *papio*'s own paced drive (`papio drive`), and
+only the user turns it on in the config. An agent may read `papio drive status`
+and may run `papio drive pause`; resuming the drive is the user's decision.
+
 ### Identity review records a human verdict
 
 Only resolve an open `verify_identity` action. The action detail names a local

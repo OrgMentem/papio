@@ -134,6 +134,8 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 
 **Why:** Version skew is routine, since one binary is CLI, daemon, and native host, so a widened result would make an older CLI reject a newer daemon's response outright. Ratification turns that failure into a release-blocking local test instead of a break an external consumer discovers first.
 
+**Amended 2026-09-23:** the operator authorized one exception to the drain refusal: *papio*'s own paced drive. It is off by default. It opens parked handoffs through the same path as `papio actions open`, one at a time and within an hourly bound. It never accepts terms, submits a delivery request, or resolves an identity review, and it pauses and asks a person when an institutional sign-in waits too long. The refusal still binds every external consumer, script, and agent.
+
 ## Ratifying single-work submission
 
 **Context:** The ratified surface from ADR-0009 gave the external consumer no way to ask *papio* to acquire anything: every uncovered work was reported unattempted, and *papio*'s success rate became unmeasurable from the one side that was counting it.

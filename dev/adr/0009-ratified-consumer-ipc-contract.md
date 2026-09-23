@@ -73,6 +73,9 @@ not a theoretical compatibility concern.
 - **Autonomous drain** is not ratified. A background consumer must not resolve,
   open, or retry human work on its own: its view can be stale and the action is
   intentionally operator-mediated.
+  *Amended 2026-09-23:* one exception, the daemon's own paced drive, which
+  opens parked handoffs only. See "Amendment 2026-09-23: the paced drive"
+  below. The rule stands for every consumer, script and agent.
 
 ## Decision 3: The acquiring-principal boundary
 
@@ -193,3 +196,51 @@ would strand the only external consumer on a version it correctly rejects.
   accepted candidate's bundle is the success provenance document. The proposed
   v2 object extends that one success record only after the consumer can decode
   it.
+
+## Amendment 2026-09-23: the paced drive
+
+Operator decision, 2026-09-23 21:30 AWST, relayed by the orchestrator. The
+operator's words were "do all, as much as you can". The orchestrator's brief
+states what that authorizes: *papio* "should drive the reading backlog without
+an operator". Measured the same day: 72 jobs waited on a person, and the
+roughly 45 papers acquired that day arrived only because the orchestrator ran
+`papio actions open` batches by hand. That is the drain this ADR refused,
+done manually and without bounds.
+
+The operator's decision ratifies one autonomous opener, and only one: the
+daemon's paced drive (`internal/drive`). The rule above still binds every
+consumer, script and agent. The drive is held to these bounds:
+
+- **Off by default.** `[drive] enabled = true` turns it on for one machine.
+  The decision is per operator, not per install.
+- **One open path.** It calls `drive.OpenHandoffs`, the function behind
+  `actions.open`, and records `handoff.opened` with principal `pacer` beside
+  its own `drive.paced_open`. ADR-0014 Decision 6's audit trail therefore
+  covers it unchanged. A second open path is refused.
+- **Open only.** It surfaces a handoff and nothing else. It never accepts
+  terms, never submits a delivery request and never resolves an identity
+  review. A `manual_download` is redriven first, but only when `jobs.redrive`
+  would accept it, through the same store function. An `openurl_available`
+  advisory is never opened, because its only surface is the OS launcher
+  outside *papio*'s window. The extension's handoff surface settings decide
+  where every tab lands.
+- **Serial and bounded.** It keeps at most one paced open in flight. A live
+  claim or unsettled effect permit anywhere, from any opener, holds the next
+  open. It makes at most `max_opens_per_hour` opens (default 10), goes oldest
+  first, and backs a job off for `job_backoff_hours` (default 6) after it
+  opens that job. It opens only while a holder browser session is connected,
+  and never inside `notify.quiet_hours`.
+- **Provider refusal is respected.** A host in a `browser.provider_cooldown`,
+  or a job with a recent `challenge_blocked`, is skipped. The skip covers every
+  paper under the same DOI prefix, because a handoff's final provider is
+  unknown until the resolver redirects.
+- **A person is asked, once.** An institutional sign-in, MFA or security gate
+  open longer than `sign_in_wait_minutes` (default 10) pauses the drive. It
+  records `drive.paused` and sends one `decision_opened` notification. When
+  the gate closes, the drive resumes by itself (`drive.resumed`). An
+  operator's `papio drive pause` holds until `papio drive resume`, and that
+  command is hidden from the MCP facade.
+
+This amendment does not ratify a new method for consumers. `drive.status`,
+`drive.pause` and `drive.resume` serve the CLI and are not part of the pinned
+surface in Decision 1.
