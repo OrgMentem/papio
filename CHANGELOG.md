@@ -332,6 +332,15 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **An admitted Firefox PDF viewer save now finishes after a publication failure.**
+  If *papio* accepted the saved bytes but could not move them into the job's
+  folder, or the daemon stopped in between, the next adoption sweep publishes the
+  exact admitted file and validates it. No second Save runs. Temporary failures
+  are retried with growing waits.
+  After 20 deferred attempts, or when the saved file is missing or altered,
+  *papio* releases that save's effect permit so other work can continue, keeps
+  the saved file in place, and leaves the job's manual download action open so
+  you can supply the file yourself.
 - **Late browser receipts recognize PDFs that Papio sanitized before storing.**
   The daemon verifies the downloaded source, accepted candidate, recorded
   sanitization and stored artifact before pairing delivery details. Removing

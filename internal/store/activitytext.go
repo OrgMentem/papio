@@ -33,6 +33,15 @@ func ActivityText(kind string, detail map[string]any) string {
 			return clampActivityText(fmt.Sprintf("Download needs attention (%s)", filename))
 		}
 		return "Download needs attention"
+	case "browser.native_viewer_save_result":
+		if activityDetailString(detail, "outcome") != "admitted_unpublished" {
+			return clampActivityText(kind)
+		}
+		reason := strings.ReplaceAll(activityDetailString(detail, "reason"), "_", " ")
+		if activityDetailString(detail, "retained_stage") != "" {
+			return clampActivityText(fmt.Sprintf("Saved PDF could not be adopted (%s); the file was kept for you", reason))
+		}
+		return clampActivityText(fmt.Sprintf("Saved PDF could not be adopted (%s)", reason))
 	case "browser.auth_pending":
 		return "Institution login required"
 	case "browser.auth_returned":

@@ -22,6 +22,8 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 		{"action.reminder", nil, "Still waiting on you"},
 		{"browser.download_complete", map[string]any{"filename": "paper.pdf", "size_bytes": int64(1258291)}, "Download complete (paper.pdf, 1.2 MB)"},
 		{"browser.error", map[string]any{"code": "download_not_pdf"}, "Browser reported an error (download_not_pdf)"},
+		{"browser.native_viewer_save_result", map[string]any{"outcome": "admitted_unpublished", "reason": "stage_rejected", "retained_stage": "/d/papio/native_stage_x.tmp"}, "Saved PDF could not be adopted (stage rejected); the file was kept for you"},
+		{"browser.native_viewer_save_result", map[string]any{"outcome": "admitted_unpublished", "reason": "stage_missing"}, "Saved PDF could not be adopted (stage missing)"},
 		{"browser.page_capture", nil, "Diagnostic page captured"},
 		{"browser.provider_outcome", map[string]any{"outcome": "no_entitlement"}, "Provider outcome: no entitlement"},
 		{"browser.no_entitlement_requeue", nil, "No entitlement here — requeued for other routes"},

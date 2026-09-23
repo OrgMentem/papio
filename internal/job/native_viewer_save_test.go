@@ -105,6 +105,64 @@ func TestNativeViewerSaveFreshPermitAndExactProducer(t *testing.T) {
 	}
 }
 
+// Abandonment settles only the authenticated admitted operation, refuses to
+// treat a lost holder as lost authority, and cannot touch a successor.
+func TestNativeViewerStagedAdmissionAbandonsExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	js, in, now := viewerSaveFixture(t)
+	r := reserveViewer(t, js, in, now)
+	if err := js.BeginNativeViewerSaveStep(ctx, r, "advance-1", now); err != nil {
+		t.Fatal(err)
+	}
+	if listed, err := js.NativeViewerStagedAdmissions(ctx); err != nil || len(listed) != 0 {
+		t.Fatalf("unadmitted operation listed: %+v %v", listed, err)
+	}
+	digest := strings.Repeat("b", 64)
+	if err := js.AdmitNativeViewerSave(ctx, r, r.Filename(), digest, 100, now); err != nil {
+		t.Fatal(err)
+	}
+	// A newer holder generation must not make admitted bytes unadoptable.
+	generation, err := js.NextMaterializationHolderGeneration(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := js.NativeViewerStagedAdmissions(ctx)
+	if err != nil || len(listed) != 1 || !listed[0].Adoptable || listed[0].SHA256 != digest || listed[0].Reservation.PermitID != r.PermitID {
+		t.Fatalf("listed=%+v err=%v", listed, err)
+	}
+	if err := js.AbandonNativeViewerStagedAdmission(ctx, r.JobID, r.OperationID, NativeViewerAuthorityLost, ""); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("abandoned adoptable bytes as authority_lost: %v", err)
+	}
+	if err := js.AbandonNativeViewerStagedAdmission(ctx, r.JobID, r.OperationID, NativeViewerStageMissing, "/tmp/other.tmp"); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("foreign retained path accepted: %v", err)
+	}
+	if err := js.AbandonNativeViewerStagedAdmission(ctx, r.JobID, r.OperationID, NativeViewerStageMissing, ""); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := js.GetEffectPermit(ctx, r.PermitID); p == nil || p.Status != Settled {
+		t.Fatalf("permit=%+v", p)
+	}
+	other := permitJob(t, js, "viewer-successor")
+	successor := acquireDrive(t, js, driveIdentity(other, "successor", 0, "generic"), "other-domain", now.Add(time.Minute))
+	if err := js.AbandonNativeViewerStagedAdmission(ctx, r.JobID, r.OperationID, NativeViewerStageMissing, ""); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("second abandonment: %v", err)
+	}
+	if listed, err := js.NativeViewerStagedAdmissions(ctx); err != nil || len(listed) != 0 {
+		t.Fatalf("settled operation listed: %+v %v", listed, err)
+	}
+	live, err := js.LiveEffectPermit(ctx)
+	if err != nil || live == nil || live.ID != successor.ID || live.Status != Held {
+		t.Fatalf("successor released: %+v %v", live, err)
+	}
+	if nativeLedgerCount(t, js, r.JobID, "browser.native_viewer_save_result") != 1 {
+		t.Fatal("abandonment result not exactly once")
+	}
+	in.HolderGeneration = generation
+	if _, err := js.ReserveNativeViewerSave(ctx, in, now); !errors.Is(err, ErrNativeViewerSaveConsumed) {
+		t.Fatalf("abandonment re-armed the action: %v", err)
+	}
+}
+
 func TestNativeViewerSaveOneShotSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	js, in, now := viewerSaveFixture(t)

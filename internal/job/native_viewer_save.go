@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -52,10 +53,16 @@ func nativeViewerID(s string) bool {
 	return nonempty(s) && len(s) <= 128 && !strings.ContainsAny(s, "/\\\x00\r\n:")
 }
 
+// nativeViewerOperationID is the exact shape the bridge mints. Recovery builds
+// daemon-owned file names from it, so nothing looser may reach a path.
+func nativeViewerOperationID(s string) bool {
+	suffix := strings.TrimPrefix(s, "viewer_")
+	_, err := hex.DecodeString(suffix)
+	return strings.HasPrefix(s, "viewer_") && len(suffix) == 26 && err == nil && strings.ToLower(suffix) == suffix
+}
+
 func (in NativeViewerSaveInput) valid(now time.Time) bool {
-	suffix := strings.TrimPrefix(in.OperationID, "viewer_")
-	_, idErr := hex.DecodeString(suffix)
-	return strings.HasPrefix(in.OperationID, "viewer_") && len(suffix) == 26 && idErr == nil && strings.ToLower(suffix) == suffix &&
+	return nativeViewerOperationID(in.OperationID) &&
 		nativeViewerID(in.RequestID) && nativeViewerID(in.JobID) && in.ActionID > 0 &&
 		in.ActionRevision > 0 && in.JobAttemptRevision > 0 && in.HolderGeneration > 0 &&
 		nativeSHA(in.BindingSHA256) && nonempty(in.SafetyDomainID) && in.ExpiresAtMS > now.UnixMilli() && in.ExpiresAtMS <= now.Add(2*time.Minute).UnixMilli()
@@ -428,6 +435,191 @@ func nativeViewerProducerAdmissionTx(ctx context.Context, tx *sql.Tx, jobID stri
 		return a, ErrEffectPermitStale
 	}
 	return a, nil
+}
+
+// NativeViewerStagedAdmission is one admitted native save whose bytes never
+// reached adoption: its exact permit still holds occupancy and no validation
+// transition names the operation. It is a recovery read of existing receipts,
+// not a second ledger, and grants no browser or native effect.
+type NativeViewerStagedAdmission struct {
+	Reservation  NativeViewerSaveReservation
+	SHA256       string
+	SizeBytes    int64
+	PermitStatus EffectPermitStatus
+	JobState     string
+	// Adoptable reports whether the original action, attempt and job still
+	// accept these exact bytes. Holder generation and lease are deliberately
+	// not consulted: a newer holder does not invalidate admitted bytes.
+	Adoptable bool
+	// DeferredAttempts counts durable browser.adoption_deferred events for the
+	// exact filename, so a recovery budget survives restart.
+	DeferredAttempts int
+}
+
+func (s NativeViewerStagedAdmission) StageName() string {
+	return "native_stage_" + s.Reservation.OperationID + ".tmp"
+}
+
+func nativeViewerValidationStartedTx(ctx context.Context, tx *sql.Tx, jobID, operationID string) (bool, error) {
+	var n int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id=? AND kind='job.transition'
+		AND json_extract(detail_json,'$.native_viewer_operation_id')=?`, jobID, operationID).Scan(&n)
+	return n != 0, err
+}
+
+// NativeViewerStagedAdmissions lists admitted native saves that still hold
+// occupancy before validation began. A reservation without an authenticated
+// admission receipt is never listed, so unadmitted staging is never published.
+func (js *Store) NativeViewerStagedAdmissions(ctx context.Context) ([]NativeViewerStagedAdmission, error) {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT id,job_id,drive_attempt_id,status FROM effect_permits
+		WHERE effect_kind='generic_drive' AND strategy=? AND status IN ('held','unknown_completion')
+		ORDER BY created_at,id LIMIT 16`, NativeViewerSaveStrategy)
+	if err != nil {
+		return nil, err
+	}
+	type row struct{ permit, job, operation, status string }
+	var permits []row
+	for rows.Next() {
+		var r row
+		var jobID, operation sql.NullString
+		if err := rows.Scan(&r.permit, &jobID, &operation, &r.status); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		r.job, r.operation = jobID.String, operation.String
+		permits = append(permits, r)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []NativeViewerStagedAdmission
+	for _, p := range permits {
+		if !nativeViewerOperationID(p.operation) || !nativeViewerID(p.job) {
+			continue
+		}
+		r, a, err := nativeViewerAdmissionTx(ctx, tx, p.job, p.operation)
+		if errors.Is(err, ErrEffectPermitStale) {
+			continue // no exact admission: nothing daemon-owned to recover
+		}
+		if err != nil {
+			return nil, err
+		}
+		if r.PermitID != p.permit {
+			continue
+		}
+		started, err := nativeViewerValidationStartedTx(ctx, tx, p.job, p.operation)
+		if err != nil {
+			return nil, err
+		}
+		if started {
+			continue // adoption owns these bytes, including infrastructure retry
+		}
+		s := NativeViewerStagedAdmission{Reservation: r, SHA256: a.SHA256, SizeBytes: a.SizeBytes, PermitStatus: EffectPermitStatus(p.status)}
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id=?`, p.job).Scan(&s.JobState); err != nil {
+			return nil, err
+		}
+		switch err := nativeViewerActionTx(ctx, tx, r.NativeViewerSaveInput); {
+		case err == nil:
+			s.Adoptable = true
+		case !errors.Is(err, ErrEffectPermitStale):
+			return nil, err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE job_id=? AND kind='browser.adoption_deferred'
+			AND json_extract(detail_json,'$.filename')=?`, p.job, r.Filename()).Scan(&s.DeferredAttempts); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// Closed vocabulary for admitted bytes that can never be published under their
+// original authority. Transient failures are not abandonment reasons.
+const (
+	NativeViewerStageMissing       = "stage_missing"
+	NativeViewerStageRejected      = "stage_rejected"
+	NativeViewerPublicationBlocked = "publication_blocked"
+	NativeViewerAuthorityLost      = "authority_lost"
+	NativeViewerPublicationFailed  = "publication_failed"
+)
+
+// AbandonNativeViewerStagedAdmission settles exactly one admitted operation's
+// occupancy after the bridge proved its staging can never be published. The
+// admission proves the native save completed, so releasing occupancy cannot
+// hide an in-flight effect. The open action, the one-shot latch and every
+// other permit are untouched; retained names the kept stage for the operator.
+func (js *Store) AbandonNativeViewerStagedAdmission(ctx context.Context, jobID, operationID, reason, retained string) error {
+	switch reason {
+	case NativeViewerStageMissing, NativeViewerStageRejected, NativeViewerPublicationBlocked, NativeViewerAuthorityLost, NativeViewerPublicationFailed:
+	default:
+		return fmt.Errorf("unknown native viewer abandonment reason %q", reason)
+	}
+	if !nativeViewerOperationID(operationID) || (retained != "" && (!filepath.IsAbs(retained) || filepath.Base(retained) != "native_stage_"+operationID+".tmp")) {
+		return ErrEffectPermitStale
+	}
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Same serialization as the native validation transition.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET updated_at=updated_at WHERE id=?`, jobID); err != nil {
+		return err
+	}
+	r, a, err := nativeViewerAdmissionTx(ctx, tx, jobID, operationID)
+	if err != nil {
+		return err
+	}
+	p, err := nativeViewerRecordTx(ctx, tx, r)
+	if err != nil {
+		return err
+	}
+	if p.Status != Held && p.Status != UnknownCompletion {
+		return ErrEffectPermitStale
+	}
+	if started, err := nativeViewerValidationStartedTx(ctx, tx, jobID, operationID); err != nil {
+		return err
+	} else if started {
+		return ErrEffectPermitStale
+	}
+	if reason == NativeViewerAuthorityLost {
+		switch err := nativeViewerActionTx(ctx, tx, r.NativeViewerSaveInput); {
+		case err == nil:
+			return ErrEffectPermitStale // still adoptable: a lost holder is not lost authority
+		case !errors.Is(err, ErrEffectPermitStale):
+			return err
+		}
+	}
+	detail := map[string]any{
+		"drive_attempt_id": r.OperationID, "ordinal": int64(0), "strategy": NativeViewerSaveStrategy,
+		"revision": r.BindingSHA256, "safety_domain": r.SafetyDomainID, "outcome": "admitted_unpublished", "cleanup_only": true,
+		"reason": reason, "operation_id": r.OperationID, "permit_id": r.PermitID, "filename": a.Filename,
+		"sha256": a.SHA256, "size_bytes": a.SizeBytes,
+	}
+	if retained != "" {
+		detail["retained_stage"] = retained
+	}
+	if err := nativeEventTx(ctx, tx, jobID, "browser.native_viewer_save_result", detail); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE effect_permits SET status='settled',updated_at=? WHERE id=? AND status IN ('held','unknown_completion')`, store.Now(), r.PermitID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return ErrEffectPermitStale
+	}
+	return tx.Commit()
 }
 
 // TransitionAwaitingToValidatingForNativeViewer is the adoption boundary for
