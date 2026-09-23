@@ -847,6 +847,10 @@ export interface StoreShape {
    * persisted; only opaque daemon-minted IDs and the deterministic authority
    * digest survive restart. */
   termsEffects?: Record<string, TermsEffectCorrelation>;
+  /** Tab id -> job id for a tab an armed handoff tab opened, so the signed
+   * viewer arming survives a suspended worker or event page. Only jobs still
+   * active are kept; a closed tab's entry is removed. */
+  viewerChildTabs?: Record<string, string>;
 }
 
 /** Async key/value seam. The real implementation wraps chrome.storage; tests
@@ -1482,6 +1486,17 @@ function migratedNumberMap(value: unknown): Record<string, number> | undefined {
   return Object.keys(out).length === 0 ? undefined : out;
 }
 
+/** Child tab id -> job id, kept only for integer tab ids and active jobs. */
+function migratedViewerChildTabs(value: unknown, activeJobs: readonly ActiveJob[]): Record<string, string> | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [tabID, jobID] of Object.entries(value)) {
+    if (/^\d{1,15}$/u.test(tabID) && typeof jobID === "string" && activeJobs.some((job) => job.job_id === jobID))
+      out[tabID] = jobID;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
 function migratedLeaseMap(
   value: unknown,
 ): Record<string, ProviderDrainLease> | undefined {
@@ -1655,6 +1670,8 @@ function migratedState(raw: UnknownRecord): StoreShape {
   const challengeCooldowns = migratedCooldownMap(raw.challengeCooldowns);
   if (challengeCooldowns !== undefined)
     output.challengeCooldowns = challengeCooldowns;
+  const viewerChildTabs = migratedViewerChildTabs(raw.viewerChildTabs, activeJobs);
+  if (viewerChildTabs !== undefined) output.viewerChildTabs = viewerChildTabs;
   return output;
 }
 

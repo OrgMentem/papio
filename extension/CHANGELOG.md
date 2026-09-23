@@ -24,8 +24,10 @@ for the full pre-split extension history.
   download folder. The viewer still shows the PDF, the link is not requested a
   second time, and no helper program is needed. If the copy is incomplete, or
   the PDF opened before *papio* was watching the tab, *papio* saves nothing
-  and asks you to use the viewer's **Download** button instead. That notice no
-  longer tells you to open the PDF in Chrome.
+  and asks you to use the viewer's **Download** button instead. Neither that
+  notice nor **Send this PDF** on such a link tells you to open the PDF in
+  Chrome any more. A viewer tab that the paper's tab opens stays armed while
+  Firefox suspends the extension.
 - **New Firefox-only permissions: `webRequest`, `webRequestBlocking` and
   `webRequestFilterResponse`.** They let the extension read the one PDF
   response in *papio*'s own handoff tabs. The bytes go only to the local

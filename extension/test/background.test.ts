@@ -10372,6 +10372,45 @@ test("Firefox holds a response that wakes the event page until the armed tabs ar
   expect([...web.filters.keys()]).toEqual(["wake"]);
 });
 
+test("Firefox keeps a child tab armed across an event-page suspension", async () => {
+  const { h: before, web } = await captureHarness();
+  before.tabs.seed({ id: 101, url: "about:blank", openerTabId: 100 });
+  await before.tabs.onCreated.emit(before.tabs.snapshot(101)!);
+  await settle();
+  // The event page suspends: its listeners and memory go, managed state stays,
+  // and the real backend migrates it on load.
+  web.listeners.length = 0;
+  const h = restartWorker(before);
+  h.backend.store = migrateManagedState(JSON.parse(JSON.stringify(h.backend.store)));
+  // The child's response is what wakes the page.
+  const started = h.bridge.start();
+  const responded = web.respond({ requestId: "child", url: SIGNED_VIEWER, tabId: 101 });
+  await Promise.all([started, responded]);
+  const filter = web.filters.get("child")!;
+  filter.deliver(SIGNED_PDF);
+  filter.stop();
+  await settle();
+  expect(h.downloads.started.map(d => d.filename)).toEqual(["papio/job_rule_a/paper.pdf"]);
+  // A closed child is forgotten, and so is a child of a job that let go.
+  await h.tabs.onRemoved.emit(101, { isWindowClosing: false });
+  await settle();
+  expect(migrateManagedState(h.backend.store).viewerChildTabs).toBeUndefined();
+  expect(migrateManagedState({ ...h.backend.store, viewerChildTabs: { "102": "job_gone", "103": "job_rule_b" } }).viewerChildTabs)
+    .toEqual({ "103": "job_rule_b" });
+});
+
+test("Firefox's Send this PDF on a signed viewer does not send the operator to Chrome", async () => {
+  const { h } = await captureHarness();
+  h.tabs.patch(100, { url: SIGNED_VIEWER });
+  const tracked = await h.bridge.startPDFDelivery({ tab_id: 100, url: SIGNED_VIEWER, doi: "10.1234/job_rule_a" });
+  h.tabs.seed({ id: 300, url: SIGNED_VIEWER });
+  const untracked = await h.bridge.startPDFDelivery({ tab_id: 300, url: SIGNED_VIEWER });
+  for (const reply of [tracked, untracked])
+    expect(reply).toMatchObject({ ok: false, error: { code: "not_permitted",
+      message: "papio could not save this PDF. Use the PDF viewer Download button to keep a copy." } });
+  expect(h.downloads.started).toEqual([]);
+});
+
 for (const clickAdapter of [false, true]) {
   test(`Firefox names a signed viewer that rendered without a capture instead of sending the operator to Chrome: clickAdapter=${clickAdapter}`, async () => {
     const { h, web, notices } = await captureHarness({ hostGranted: false, clickAdapter });

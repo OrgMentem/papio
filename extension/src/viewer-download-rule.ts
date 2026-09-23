@@ -116,8 +116,11 @@ export interface ViewerRuleContext {
   isFirefox(): boolean;
   /** Firefox: whether the webRequest stream capture is available. */
   viewerCaptureAvailable(): boolean;
-  /** The current managed-state snapshot. */
+  /** The current managed-state snapshot. Its `viewerChildTabs` holds the
+   * armed child tabs, so they survive a suspended worker or event page. */
   store(): StoreShape;
+  /** Record (or, with no job, forget) an armed child tab in managed state. */
+  setViewerChildTab(tabID: number, jobID: string | undefined): void;
   hasDelegatedAuthority(job: ActiveJob): boolean;
   /** Jobs the article agent drives; it binds its own navigation downloads. */
   readonly agentLoops: ReadonlyMap<string, object>;
@@ -139,9 +142,6 @@ export interface ViewerRuleContext {
  * rules in line with them. On Chrome that needs the declarativeNetRequest
  * seam; on Firefox, the stream capture. Without either, nothing is armed. */
 export class ViewerRuleSync {
-  /** Child tab id -> job id for a tab a job's handoff tab opened; the job's
-   * own tab is read from the store. */
-  private readonly viewerRuleChildTabs = new Map<number, string>();
   /** Armed tabs that have since closed. Neither browser reuses a tab id within
    * a session, so a closed id stays disarmed until the job lets go. */
   private readonly viewerRuleClosedTabs = new Set<number>();
@@ -193,7 +193,8 @@ export class ViewerRuleSync {
       )
         continue;
       arm(job.tab_id, job.job_id);
-      for (const [child, owner] of this.viewerRuleChildTabs) if (owner === job.job_id) arm(child, owner);
+      for (const [child, owner] of Object.entries(this.ctx.store().viewerChildTabs ?? {}))
+        if (owner === job.job_id) arm(Number(child), owner);
     }
     for (const tabID of shared) armed.delete(tabID);
     return armed;
@@ -240,19 +241,21 @@ export class ViewerRuleSync {
    * can arrive before its first update. */
   noteViewerRuleChild(tabID: number, openerTabID: number | undefined): void {
     if (
-      openerTabID === undefined || this.viewerRuleChildTabs.has(tabID) || !this.armingActive() ||
-      findByTab(this.ctx.store(), tabID) !== undefined
+      openerTabID === undefined || this.ctx.store().viewerChildTabs?.[String(tabID)] !== undefined ||
+      !this.armingActive() || findByTab(this.ctx.store(), tabID) !== undefined
     )
       return;
     const owner = this.viewerRuleTabs().get(openerTabID);
     if (owner === undefined) return;
-    this.viewerRuleChildTabs.set(tabID, owner);
+    this.ctx.setViewerChildTab(tabID, owner);
     void this.syncViewerDownloadRules();
   }
 
   noteViewerRuleTabRemoved(tabID: number): void {
     if (!this.armingActive()) return;
-    if (!this.viewerRuleChildTabs.delete(tabID)) {
+    if (this.ctx.store().viewerChildTabs?.[String(tabID)] !== undefined) {
+      this.ctx.setViewerChildTab(tabID, undefined);
+    } else {
       if (findByTab(this.ctx.store(), tabID) === undefined) return;
       this.viewerRuleClosedTabs.add(tabID);
     }

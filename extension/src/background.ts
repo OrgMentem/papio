@@ -3179,6 +3179,15 @@ export class Bridge {
       isFirefox: () => this.isFirefox(),
       viewerCaptureAvailable: () => this.viewerCapture.available(),
       store: () => this.store,
+      // Applied in memory at once; a failed save loses only its survival
+      // across a suspension.
+      setViewerChildTab: (tabID, jobID) =>
+        void this.update((s) => {
+          const viewerChildTabs = { ...s.viewerChildTabs };
+          if (jobID === undefined) delete viewerChildTabs[String(tabID)];
+          else viewerChildTabs[String(tabID)] = jobID;
+          return { ...s, viewerChildTabs };
+        }).catch(() => {}),
       hasDelegatedAuthority: (job) => this.hasDelegatedAuthority(job),
       agentLoops: this.agentLoops,
       downloads: this.downloads,
@@ -6955,7 +6964,7 @@ export class Bridge {
           // viewer's download here would leave the delivery waiting forever.
           return failure(
             "not_permitted",
-            "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it",
+            this.firefoxSignedViewerRefusal(),
           ) as unknown as DeliveryReply;
         const message = "Use the PDF viewer Download button — papio will adopt that authorized file";
         const deliveryPageHostAtStart = sanitizePageHost(liveTabURL);
@@ -7078,7 +7087,7 @@ export class Bridge {
           // `correlate()` refuses a download papio did not start.
           return failure(
             "not_permitted",
-            "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it",
+            this.firefoxSignedViewerRefusal(),
           );
         }
         const candidates = this.advisoryCandidates();
@@ -7211,7 +7220,7 @@ export class Bridge {
         // the platform cannot keep.
         return failure(
           "not_permitted",
-          "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it",
+          this.firefoxSignedViewerRefusal(),
         );
       const message =
         "Use the PDF viewer Download button — papio will adopt that authorized file";
@@ -11114,7 +11123,7 @@ export class Bridge {
           // for the viewer button here would promise filing that cannot happen.
           return failure(
             "not_permitted",
-            "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open the PDF in Chrome to send it",
+            this.firefoxSignedViewerRefusal(),
           );
         this.pdfGrabCorrelations.set(grabID, {
           scanID,
@@ -17517,6 +17526,15 @@ export class Bridge {
     return this.viewerCapture.available()
       ? FIREFOX_VIEWER_CAPTURE_MESSAGE
       : "Open this PDF in Chrome, choose Send this PDF in papio, then use the PDF viewer Download button.";
+  }
+
+  /** Firefox's answer to Send this PDF on a signed viewer it cannot adopt.
+   * With the stream capture, papio already had its one chance at that
+   * response, so it names the viewer's Download button, not Chrome. */
+  private firefoxSignedViewerRefusal(): string {
+    return this.viewerCapture.available()
+      ? FIREFOX_VIEWER_CAPTURE_MESSAGE
+      : "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it";
   }
 
   /** A job takes at most one signed-viewer download: Chrome's rule download

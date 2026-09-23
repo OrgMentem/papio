@@ -207,9 +207,10 @@ Two consequences worth knowing:
   one paper and then reused to read another files the paper you asked about, not
   the one the tab was opened for.
 - **Firefox declines this rather than half-promising it.** Firefox gives an
-  extension no way to adopt a download it did not start, so *papio* says to open
-  that paper in Chrome instead of asking for a click it could not act on. The
-  exception is the experimental
+  extension no way to adopt a download it did not start, so *papio* says it
+  could not save the PDF and that the viewer's **Download** button keeps your
+  own copy, instead of asking for a click it could not act on. The exception
+  is the experimental
   [macOS helper](../guide/user-guide.md#save-a-firefox-pdf-with-the-macos-helper-experimental):
   when you configure it, *papio* saves the PDF from Firefox's viewer itself.
 
