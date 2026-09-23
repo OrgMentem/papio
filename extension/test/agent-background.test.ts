@@ -1275,7 +1275,7 @@ for (const change of ["manual-other", "cross-origin", "wrong-doi", "missing-doi"
     h.setAfterAct(async () => {
       if (change === "same-document") { h.win.location.href = navigationURL; h.tabs.seed({ id: tabID, url: navigationURL, status: "complete" }); return; }
       const destination = change === "manual-other" ? navigationURL + "&manual=1" : change === "cross-origin" ? "https://foreign.example/article" : change === "reload" ? url : navigationURL;
-      const metadata = change === "wrong-doi" ? '<meta name="citation_doi" content="10.9999/wrong">' : change === "missing-doi" ? "" : `<meta name="citation_doi" content="${doi}">${change === "consent" ? '<dialog open>Accept cookies</dialog>' : ''}`;
+      const metadata = change === "wrong-doi" ? '<meta name="citation_doi" content="10.9999/wrong">' : change === "missing-doi" ? "" : `<meta name="citation_doi" content="${doi}">${change === "consent" ? '<dialog open>Accept the licence terms</dialog>' : ''}`;
       await h.land(destination, metadata);
       if (change === "permission") h.setPermission(false);
       if (change === "duplicate-tab") h.tabs.seed({ id: 78, url: navigationURL, status: "complete" });
@@ -1500,7 +1500,7 @@ for (const change of ["committed", "other-url-then-back", "identity", "consent",
         await h.tabs.onUpdated.emit(tabID, { url, status: "complete" }, h.tabs.snapshot(tabID)!);
       }
       if (change === "identity") h.win.document.querySelector("meta[name='citation_doi']")!.setAttribute("content", "10.9999/other");
-      if (change === "consent") h.win.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept cookies</dialog>');
+      if (change === "consent") h.win.document.body.insertAdjacentHTML("beforeend", '<dialog open>Accept the licence terms</dialog>');
     });
     await h.classify(); await h.started(); await h.decide("decision", "c1");
     const arm = await h.request("native_download_arm_request_v1");
