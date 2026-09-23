@@ -331,10 +331,17 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     if (anchor) {
       const url = new URL(anchor.href);
       const target = anchor.target || document.querySelector("base")?.target || "_self";
-      if (target !== "_self" || url.protocol !== "https:" || url.origin !== entry.origin || url.username || url.password) return false;
+      if (url.protocol !== "https:" || url.origin !== entry.origin || url.username || url.password) return false;
       // Explicit PDF links receive download intent at dispatch. Browser policy
       // and publisher handlers still control the outcome; document/receipt
       // checks, rather than the attribute, establish continued ownership.
+      // A `_blank` explicit PDF link is still a download, not a new context:
+      // the download attribute makes the browser save the file in place
+      // (measured 2026-09-23 on pubs.acs.org, whose "Open PDF" anchor is a
+      // same-origin .pdf path with target="_blank"; the model chose it and
+      // the refusal parked an entitled paper). Any other target is a
+      // navigation into a context this attempt does not own.
+      if (target !== "_self" && !(target === "_blank" && explicitPDFLink(element, anchor))) return false;
       if (!anchor.hasAttribute("download") && !explicitPDFLink(element, anchor) &&
         (url.pathname !== entry.pathname || url.search !== location.search) && navigationTarget(element) === undefined) return false;
     }

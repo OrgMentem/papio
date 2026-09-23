@@ -588,7 +588,6 @@ test("a same-origin PDF route whose last segment is the bare word receives downl
 for (const [attributes, text] of [
   ['href="https://external.example/paper.pdf"', "Article PDF"],
   ['href="http://ebooks.iospress.nl/paper.pdf"', "Article PDF"],
-  ['href="/paper.pdf" target="_blank"', "Article PDF"],
   ['href="/paper.pdf" target="other"', "Article PDF"],
   ['href="/viewer?format=pdf"', "Article PDF"],
   ['href="/paper.pdf"', "Next"],
@@ -601,6 +600,21 @@ for (const [attributes, text] of [
   expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "stale", reason: "observation_changed" });
   expect(clicks).toBe(0);
   expect(win.document.querySelector("a")!.hasAttribute("download")).toBe(false);
+});
+
+// ACS's "Open PDF" is a same-origin .pdf anchor with target="_blank"
+// (measured 2026-09-23). With download intent the browser saves the file in
+// place, so a _blank explicit PDF link is a download, not a new context.
+test("a same-origin _blank explicit PDF anchor receives download intent", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/jcisd8/article-pdf/66/11/6299/ci6c00481.pdf" target="_blank">Open PDF</a></main>`);
+  const anchor = win.document.querySelector("a")!;
+  let clicks = 0;
+  anchor.addEventListener("click", event => { clicks++; expect(anchor.getAttribute("download")).toBe(""); event.preventDefault(); });
+  const first = observed(await observe());
+  expect(first.observation.controls[0]?.disabled).toBe(false);
+  expect(await act(first, { choice: first.observation.controls[0]!.id })).toEqual({ status: "dispatched", downloadExpected: true });
+  expect(clicks).toBe(1);
+  expect(anchor.getAttribute("target")).toBe("_blank");
 });
 
 test("PDF download intent restores its attribute even if native dispatch throws", async () => {
@@ -640,7 +654,9 @@ for (const change of ["href", "base-target", "identity"]) test(`PDF intent reche
   let clicks = 0; anchor.addEventListener("click", () => clicks++);
   const first = observed(await observe());
   if (change === "href") anchor.href = "https://external.example/wrong.pdf";
-  if (change === "base-target") win.document.head.insertAdjacentHTML("beforeend", '<base target="_blank">');
+  // `_blank` no longer changes an explicit PDF link's disposition; a named
+  // target still does.
+  if (change === "base-target") win.document.head.insertAdjacentHTML("beforeend", '<base target="reader">');
   if (change === "identity") win.document.querySelector("meta")!.setAttribute("content", "10.1234/wrong");
   expect((await act(first, { choice: first.observation.controls[0]!.id })).status).not.toBe("dispatched");
   expect(clicks).toBe(0);

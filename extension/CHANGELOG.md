@@ -17,6 +17,9 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **The article agent can use a new-window PDF link.** A same-origin PDF
+  anchor with `target="_blank"` receives download intent instead of being
+  refused as a new context; other targets stay refused.
 - **Cookie notices no longer stop the article agent.** A cookie or privacy
   banner is not a consent gate; its buttons are never offered to the model. A
   notice that also names terms, a licence or credentials still stops the attempt.
