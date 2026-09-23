@@ -361,7 +361,7 @@ export const adapters: AdapterSpec[] = [
     // is consent-gated: without recorded auto-accept consent the page stays
     // assisted and the human clicks through the terms modal themselves.
     id: "jstor",
-    version: "0.3.1",
+    version: "0.3.2",
     hosts: ["jstor.org"],
     // data-doi is a JSTOR stable ID, not a DOI. The packaged title identifies
     // the work; the primary control independently binds the URL's stable ID.
@@ -378,16 +378,19 @@ export const adapters: AdapterSpec[] = [
         all: ["mfe-download-pharos-modal.terms-and-conditions[open]"],
         textAny: ["accept and download"],
       },
-      {
-        kind: "login",
-        all: [".turnaway-access-option-content__title"],
-        textAny: ["log in through your school or library", "this is a preview. log in through your library"],
-      },
+      // An entitled article can still show the turnaway account-offer panel.
+      // The primary download control must win over its login prompt, while
+      // the open terms modal above still takes precedence.
       {
         kind: "article",
         all: [
           "mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']",
         ],
+      },
+      {
+        kind: "login",
+        all: [".turnaway-access-option-content__title"],
+        textAny: ["log in through your school or library", "this is a preview. log in through your library"],
       },
     ],
     download: {

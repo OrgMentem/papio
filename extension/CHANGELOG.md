@@ -17,6 +17,9 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **JSTOR keeps entitled articles out of the login queue.** A turnaway
+  account offer beside the primary PDF control no longer masks the article
+  and holds an institution sign-in slot.
 
 - **JSTOR recognizes its article identity correctly.** Its download control's
   `data-doi` is a numeric record ID, not a DOI. Papio now matches the article's

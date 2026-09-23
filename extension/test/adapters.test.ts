@@ -372,6 +372,18 @@ for (const { scenario, id, title } of jstorCases) {
     expect(await executeJstorPlan(doc, plan)).toEqual({ ok: true, url: `https://www.jstor.org/stable/pdf/${id}.pdf?acceptTC=1` });
   });
 
+  test(`JSTOR ${scenario} remains an article when an account-offer panel appears beside its primary download`, () => {
+    const doc = jstorPage(scenario);
+    doc.body.insertAdjacentHTML(
+      "beforeend",
+      '<aside><div class="turnaway-access-option-content__title">Log in through your school or library</div></aside>',
+    );
+    expect(doc.querySelector(jstorSpec.download!.selector)).not.toBeNull();
+    expect(doc.querySelector(".turnaway-access-option-content__title")).not.toBeNull();
+    const result = planExecution(doc, jstorSpec, { title }, { access_mode: "delegated", terms_consent: "accept" });
+    expect(result.verdict.kind).toBe("article");
+  });
+
   test(`JSTOR ${scenario} refuses an exact-title mismatch even when the token check passes`, () => {
     const doc = jstorPage(scenario);
     doc.querySelector("meta[property='og:title']")!.setAttribute("content", `${title}: A Different Article | JSTOR`);
@@ -497,6 +509,13 @@ for (const { scenario, id, title } of jstorCases) {
     });
   }
 }
+
+test("JSTOR captured login return remains a login without the primary download", () => {
+  const doc = jstorPage("login-return");
+  expect(doc.querySelector(jstorSpec.download!.selector)).toBeNull();
+  expect(doc.querySelector(".turnaway-access-option-content__title")).not.toBeNull();
+  expect(classifyFixture(doc, jstorSpec).kind).toBe("login");
+});
 
 // Informit is an Atypon platform. Its entitled record exposes reader and PDF
 // anchors but no citation PDF meta; the adapter clicks the captured PDF control
