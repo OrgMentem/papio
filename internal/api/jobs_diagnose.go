@@ -56,8 +56,29 @@ func diagnoseJobWithProjection(ctx context.Context, raw json.RawMessage, system 
 	for _, item := range attributed {
 		actions = append(actions, item.Action)
 	}
-	if v2 {
-		return marshal(job.DiagnoseV2(row, actions, events))
+	// An opened handoff that is parked behind a sibling's institutional surface
+	// names that sibling instead of repeating advice the operator already took.
+	queued := func(d job.Diagnosis) (job.Diagnosis, error) {
+		handoff, opened := job.OpenedHandoff(row, actions, events)
+		if !opened {
+			return d, nil
+		}
+		blocker, err := system.Jobs.HandoffQueueBlocker(ctx, row.ID, handoff.RequiresAuth)
+		if err != nil || blocker == nil {
+			return d, err
+		}
+		return d.QueuedBehind(*blocker), nil
 	}
-	return marshal(job.Diagnose(row, actions, events))
+	if v2 {
+		diagnosis := job.DiagnoseV2(row, actions, events)
+		if diagnosis.Diagnosis, err = queued(diagnosis.Diagnosis); err != nil {
+			return failure(err)
+		}
+		return marshal(diagnosis)
+	}
+	diagnosis, err := queued(job.Diagnose(row, actions, events))
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(diagnosis)
 }

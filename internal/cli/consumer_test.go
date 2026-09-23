@@ -317,8 +317,15 @@ func TestActionsListReportsStaleRows(t *testing.T) {
 
 // TestListingsStateTruncationOnTheTextSurface closes the other half of the
 // truncation contract: --json has carried a proven `truncated` since ADR-0007,
-// while the human listing stopped at the limit and looked complete.
+// while the human listing stopped at the limit and looked complete. Measured
+// live 2026-09-23: 168 open actions listed as 100 rows and the operator read
+// the table as the whole queue, so the notice is the table's last line and
+// leads with the word the JSON envelope uses.
 func TestListingsStateTruncationOnTheTextSurface(t *testing.T) {
+	lastLine := func(out string) string {
+		lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+		return lines[len(lines)-1]
+	}
 	t.Run("jobs", func(t *testing.T) {
 		var out, errOut bytes.Buffer
 		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
@@ -335,28 +342,45 @@ func TestListingsStateTruncationOnTheTextSurface(t *testing.T) {
 		if err := root.ExecuteContext(context.Background()); err != nil {
 			t.Fatalf("jobs list: %v (%s)", err, errOut.String())
 		}
-		if !strings.Contains(out.String(), "more exist behind this page") {
-			t.Fatalf("output = %q, want a stated truncation", out.String())
+		if got, want := lastLine(out.String()), "truncated: showing 1 jobs; use --limit (max 500)"; got != want {
+			t.Fatalf("last line = %q, want %q (output %q)", got, want, out.String())
 		}
 	})
 	t.Run("actions", func(t *testing.T) {
-		var out, errOut bytes.Buffer
-		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
-			if method != "actions.list_v3" {
-				t.Fatalf("unexpected method %q", method)
-			}
-			*result.(*api.ActionsPageV3) = api.ActionsPageV3{
-				Actions:   []api.ActionRow{{HumanAction: job.HumanAction{ID: 1, JobID: "job_01", Kind: "openurl_handoff", Status: "open"}}},
-				Truncated: true,
-			}
-			return nil
-		})
-		root.SetArgs([]string{"actions", "list", "--limit", "1"})
-		if err := root.ExecuteContext(context.Background()); err != nil {
-			t.Fatalf("actions list: %v (%s)", err, errOut.String())
+		// A daemon holding three open actions answers a --limit 2 page with
+		// two rows and its proven truncated flag, as listHumanActions does.
+		held := []api.ActionRow{
+			{HumanAction: job.HumanAction{ID: 3, JobID: "job_03", Kind: "openurl_handoff", Status: "open"}},
+			{HumanAction: job.HumanAction{ID: 2, JobID: "job_02", Kind: "openurl_handoff", Status: "open"}},
+			{HumanAction: job.HumanAction{ID: 1, JobID: "job_01", Kind: "openurl_handoff", Status: "open"}},
 		}
-		if !strings.Contains(out.String(), "more exist behind this page") {
-			t.Fatalf("output = %q, want a stated truncation", out.String())
+		for _, tc := range []struct {
+			args []string
+			want string
+		}{
+			{args: []string{"actions", "list", "--limit", "2"}, want: "truncated: showing 2 open actions; use --limit (max 500)"},
+			{args: []string{"actions", "list", "--all", "--limit", "2"}, want: "truncated: showing 2 actions; use --limit (max 500)"},
+		} {
+			var out, errOut bytes.Buffer
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+				if method != "actions.list_v3" {
+					t.Fatalf("unexpected method %q", method)
+				}
+				limit := params.(map[string]any)["limit"].(int)
+				rows := held
+				if len(rows) > limit {
+					rows = rows[:limit]
+				}
+				*result.(*api.ActionsPageV3) = api.ActionsPageV3{Actions: rows, Truncated: len(held) > limit}
+				return nil
+			})
+			root.SetArgs(tc.args)
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("%v: %v (%s)", tc.args, err, errOut.String())
+			}
+			if got := lastLine(out.String()); got != tc.want {
+				t.Fatalf("%v last line = %q, want %q (output %q)", tc.args, got, tc.want, out.String())
+			}
 		}
 	})
 	t.Run("json output stays exactly two keys", func(t *testing.T) {

@@ -14,6 +14,14 @@ execution records kept during the initial build.
 - Accept open PDFs with an Identity `/Crypt` filter when pdfcpu cannot parse
   them and Poppler confirms their page count, encryption state, JavaScript,
   and embedded-file status. Missing checks still leave the PDF rejected.
+- `papio jobs diagnose` names the job an opened handoff is queued behind. When
+  another job holds a live claim in the same provider safety domain, or holds
+  the institution's sign-in slot, `next` reads `waiting: institution sign-in
+  slot / live claim held by <job> (phase <p>, since <t>)` instead of "open the
+  handoff". The JSON shape is unchanged.
+- Truncated `jobs list`, `jobs unfiled` and `actions list` tables now end with
+  `truncated: showing N open actions; use --limit (max 500)` (or `jobs`,
+  `actions`), so a clipped table no longer reads as the whole queue.
 
 ### Added
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual

@@ -2,7 +2,10 @@
 
 package job
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Diagnosis reasons are stable, agent-facing classifications. They describe
 // the next human or operator step; they do not authorize that step.
@@ -141,16 +144,7 @@ func Diagnose(row *Row, actions []HumanAction, events []map[string]any) Diagnosi
 		d.AdapterVersion = adapterVersion
 	}
 
-	var current *HumanAction
-	for i := range actions {
-		if actions[i].JobID != row.ID || actions[i].Status != "open" {
-			continue
-		}
-		if current == nil || actions[i].ID > current.ID {
-			current = &actions[i]
-		}
-	}
-	if current != nil {
+	if current := currentAction(row, actions); current != nil {
 		action := classifyAction(*current, outcome, providerDetail)
 		d.Action = &action
 		d.Reason, d.Why, d.Next, d.Source = action.Reason, action.Why, action.Next, action.Source
@@ -183,6 +177,57 @@ func Diagnose(row *Row, actions []HumanAction, events []map[string]any) Diagnosi
 		d.Reason = DiagnosisReasonInProgress
 		d.Why = "papio is still processing the acquisition"
 		d.Next = "wait for the next durable job transition"
+	}
+	return d
+}
+
+// currentAction is the job's newest open action: the one whose next step the
+// diagnosis explains.
+func currentAction(row *Row, actions []HumanAction) *HumanAction {
+	var current *HumanAction
+	for i := range actions {
+		if actions[i].JobID != row.ID || actions[i].Status != "open" {
+			continue
+		}
+		if current == nil || actions[i].ID > current.ID {
+			current = &actions[i]
+		}
+	}
+	return current
+}
+
+// OpenedHandoff returns the job's current handoff action when the operator has
+// already opened a handoff for the job. Such a job may be parked behind a
+// sibling's institutional surface, where "open the handoff" is advice the
+// operator has already followed; the caller asks the store for that sibling
+// (Store.HandoffQueueBlocker) and applies it with QueuedBehind.
+func OpenedHandoff(row *Row, actions []HumanAction, events []map[string]any) (HumanAction, bool) {
+	if row == nil {
+		return HumanAction{}, false
+	}
+	current := currentAction(row, actions)
+	if current == nil || (current.Kind != "openurl_handoff" && current.Kind != "manual_download") {
+		return HumanAction{}, false
+	}
+	for _, event := range events {
+		if event["kind"] == "handoff.opened" {
+			return *current, true
+		}
+	}
+	return HumanAction{}, false
+}
+
+// QueuedBehind rewrites the next step of a diagnosis whose opened handoff is
+// parked behind another job, naming that job. Reason and why are unchanged:
+// the action still needs the same human step once the sibling releases the
+// institution, and the result shape stays exactly the v1/v2 contract.
+func (d Diagnosis) QueuedBehind(blocker HandoffQueueBlocker) Diagnosis {
+	d.Next = fmt.Sprintf("waiting: institution sign-in slot / live claim held by %s (phase %s, since %s)",
+		blocker.JobID, blocker.Phase, blocker.Since)
+	if d.Action != nil {
+		action := *d.Action
+		action.Next = d.Next
+		d.Action = &action
 	}
 	return d
 }

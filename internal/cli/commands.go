@@ -258,12 +258,16 @@ func printDeliverySection(opt *options, delivery *api.DeliverySummary) error {
 // always stated in its `truncated` key. A listing that quietly stopped at the
 // limit and looked complete is how a consumer concludes the daemon holds a
 // fraction of the rows it holds; the JSON side learned that lesson already.
+// The line leads with the envelope's own word so it reads as a verdict on the
+// table above it, not as one more row. Measured live 2026-09-23: 168 open
+// actions listed as 100 rows under a trailing "showing 100 action(s)" note,
+// and the operator read the table as the whole queue. The page carries no
+// total, so the line gives none rather than paying a second query for one.
 func truncationNotice(opt *options, truncated bool, rows int, noun string) error {
 	if !truncated || opt.jsonOutput {
 		return nil
 	}
-	_, err := fmt.Fprintf(opt.out,
-		"showing %d %s; more exist behind this page — raise --limit (max %d)\n",
+	_, err := fmt.Fprintf(opt.out, "truncated: showing %d %s; use --limit (max %d)\n",
 		rows, noun, job.ListLimitMax)
 	return err
 }
@@ -421,7 +425,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			return truncationNotice(opt, truncated, len(rows), "job(s)")
+			return truncationNotice(opt, truncated, len(rows), "jobs")
 		},
 	}
 	list.Flags().StringVar(&state, "state", "", "filter by exact job state")
@@ -590,7 +594,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			return truncationNotice(opt, page.Truncated, len(page.Jobs), "job(s)")
+			return truncationNotice(opt, page.Truncated, len(page.Jobs), "jobs")
 		},
 	}
 	unfiled.Flags().StringVar(&filingFilter, "filter", "all", "filing filter: failed, missing, or all")
@@ -751,7 +755,11 @@ func newActionsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			return truncationNotice(opt, truncated, len(actions), "action(s)")
+			noun := "actions"
+			if openOnly {
+				noun = "open actions"
+			}
+			return truncationNotice(opt, truncated, len(actions), noun)
 		},
 	}
 	list.Flags().BoolVar(&all, "all", false, "include resolved actions")

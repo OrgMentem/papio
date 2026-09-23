@@ -2,6 +2,7 @@ package job
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sort"
 	"strings"
@@ -297,21 +298,8 @@ func (js *Store) scheduleEligibleKeysetPage(ctx context.Context, after Candidate
 			   AND suppression.identifier_strategy=c.identifier_strategy
 		  )
 		  AND NOT EXISTS (
-			SELECT 1
-			  FROM materialization_claims parked
-			  JOIN browser_candidates sibling ON sibling.id=parked.candidate_id
-			  JOIN jobs parked_job ON parked_job.id=sibling.job_id
-			 WHERE sibling.safety_domain_id=c.safety_domain_id
-			   AND parked.phase IN ('bound','route_issued','navigated')
-			   AND (parked.lease_until IS NULL OR parked.lease_until > ?)
-			   AND (
-			     parked_job.state NOT IN ('cancelled','failed','imported','ready','unavailable')
-			     OR EXISTS (
-			       SELECT 1 FROM effect_permits p
-			        WHERE p.claim_id=parked.id
-			          AND p.status IN ('held','unknown_completion')
-			     )
-			   )
+			SELECT 1 FROM ` + parkedSiblingSurfaceTables + `
+			 WHERE ` + parkedSiblingSurfaceMatches + `
 		  )`
 	args := []any{now, now}
 	if after.CreatedAt != "" || after.CandidateID != "" {
@@ -344,4 +332,110 @@ func (js *Store) scheduleEligibleKeysetPage(ctx context.Context, after Candidate
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// parkedSiblingSurfaceTables and parkedSiblingSurfaceMatches are the
+// scheduler's park rule for candidate `c`: a bound, route-issued, or navigated
+// scaffold in the same landed safety domain holds every sibling back. The rule
+// is split into its tables and its predicate so HandoffQueueBlocker, which must
+// NAME the sibling rather than only test for one, evaluates exactly what the
+// scheduler evaluates. The predicate's single `?` is the current time.
+const parkedSiblingSurfaceTables = `materialization_claims parked
+			  JOIN browser_candidates sibling ON sibling.id=parked.candidate_id
+			  JOIN jobs parked_job ON parked_job.id=sibling.job_id`
+
+const parkedSiblingSurfaceMatches = `sibling.safety_domain_id=c.safety_domain_id
+			   AND parked.phase IN ('bound','route_issued','navigated')
+			   AND (parked.lease_until IS NULL OR parked.lease_until > ?)
+			   AND (
+			     parked_job.state NOT IN ('cancelled','failed','imported','ready','unavailable')
+			     OR EXISTS (
+			       SELECT 1 FROM effect_permits p
+			        WHERE p.claim_id=parked.id
+			          AND p.status IN ('held','unknown_completion')
+			     )
+			   )`
+
+// queueBlockerCandidate selects the job's current eligible candidate `c` on a
+// live profile revision `p` - the only candidate the scheduler could offer, so
+// the only one a sibling can be holding back. Its single `?` is the job ID.
+const queueBlockerCandidate = `c.job_id=? AND c.status='eligible'
+		  AND p.tombstoned_at IS NULL AND p.revision=c.institution_profile_revision
+		  AND c.job_attempt_revision = 1 + (
+			SELECT COUNT(*) FROM events e
+			 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
+		  )`
+
+// HandoffQueueBlocker names another job whose live institutional surface keeps
+// a job's eligible candidate from being offered. Phase is the holder's claim
+// phase, or its sign-in slot state when no live claim occupies the slot; Since
+// is when that phase or slot last changed.
+type HandoffQueueBlocker struct {
+	JobID string
+	Phase string
+	Since string
+}
+
+// HandoffQueueBlocker reports the sibling job a candidate is queued behind, or
+// nil when nothing parks it. It checks the two gates that park an eligible
+// candidate, in the order a poll meets them: the scheduler's safety-domain
+// rule, then (only for an action that requires authentication, as in
+// admitAutomaticMaterializationCandidates) the institution's single sign-in
+// slot. The slot reading mirrors institutionSignInHeldElsewhere: an entitled
+// sign-in is shared and a lapsed reservation is free unless an institutional
+// effect is in flight on its binding.
+//
+// It is strictly read-only. GetAuthenticationEntryLease retires a lapsed
+// reservation as a side effect, which a diagnosis must never do, so the lapse
+// rule is evaluated here instead of through it.
+func (js *Store) HandoffQueueBlocker(ctx context.Context, jobID string, requiresAuth bool) (*HandoffQueueBlocker, error) {
+	if strings.TrimSpace(jobID) == "" {
+		return nil, nil
+	}
+	now := store.Now()
+	var blocker HandoffQueueBlocker
+	err := js.S.DB().QueryRowContext(ctx, `SELECT sibling.job_id, parked.phase, parked.updated_at
+		FROM browser_candidates c
+		JOIN institution_profiles p ON p.id=c.institution_profile_id,
+		     `+parkedSiblingSurfaceTables+`
+		WHERE `+queueBlockerCandidate+`
+		  AND sibling.job_id<>c.job_id
+		  AND `+parkedSiblingSurfaceMatches+`
+		ORDER BY parked.updated_at, parked.id LIMIT 1`,
+		jobID, now).Scan(&blocker.JobID, &blocker.Phase, &blocker.Since)
+	if err == nil {
+		return &blocker, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if !requiresAuth {
+		return nil, nil
+	}
+	err = js.S.DB().QueryRowContext(ctx, `SELECT COALESCE(NULLIF(l.human_owner_id,''), l.owner_id),
+		       COALESCE(m.phase, l.state), COALESCE(m.updated_at, l.updated_at)
+		FROM browser_candidates c
+		JOIN institution_profiles p ON p.id=c.institution_profile_id
+		JOIN authentication_entry_leases l ON l.authentication_claim_id=p.authentication_claim_id
+		LEFT JOIN materialization_claims m ON m.binding_id=l.owner_binding_id
+		      AND m.phase IN ('claimed','bound','route_issued','navigated')
+		WHERE `+queueBlockerCandidate+`
+		  AND l.owner_id<>c.job_id AND COALESCE(l.human_owner_id,'')<>c.job_id
+		  AND (
+		    (l.state='human' AND COALESCE(l.entitled_at,'')='')
+		    OR (l.state='reserved' AND (
+		      l.lease_until IS NULL OR l.lease_until > ?
+		      OR EXISTS (SELECT 1 FROM effect_permits e
+		        WHERE e.binding_id=l.owner_binding_id AND e.effect_kind='institutional'
+		          AND e.status IN ('held','unknown_completion'))))
+		  )
+		ORDER BY c.created_at, c.id LIMIT 1`,
+		jobID, now).Scan(&blocker.JobID, &blocker.Phase, &blocker.Since)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &blocker, nil
 }
