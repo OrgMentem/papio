@@ -17114,7 +17114,7 @@ func TestNativeViewerCapabilityKeepsOldPeersAndFeatureCap(t *testing.T) {
 			if capable {
 				peer = []string{nativeViewerDownloadFeature}
 			}
-			raw, err := b.helloAck(role, peer)
+			raw, err := b.helloAck(role, SessionRolesMinExtensionVersion, peer)
 			if err != nil {
 				t.Fatal(err)
 			}

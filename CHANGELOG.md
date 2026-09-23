@@ -11,6 +11,14 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **The released 0.14.0 extension connects to this daemon again.** Daemon
+  0.22.0 added a `role` field to the handshake reply. The 0.14.0 extension
+  rejects any field it does not know, so it dropped the connection and
+  reconnected every 5 seconds, and its popup showed that the daemon was not
+  reachable. This happened whether it held the bridge or waited behind
+  another browser. An extension below 0.15.0 now gets the handshake it
+  knows. When another browser holds the bridge, it gets only the
+  `session_busy` notice and waits without reconnecting.
 - **An extension reload during a direct download no longer stops every
   browser effect until you resolve a permit by hand.** When the extension
   reloaded seconds after papio offered a direct route, the browser could save

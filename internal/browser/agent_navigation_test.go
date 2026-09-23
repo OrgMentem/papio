@@ -28,7 +28,7 @@ func TestAgentNavigationHelloNegotiatesPrerequisites(t *testing.T) {
 						peer = append(peer, feature)
 					}
 				}
-				raw, err := b.helloAck(sessionRoleHolder, peer)
+				raw, err := b.helloAck(sessionRoleHolder, SessionRolesMinExtensionVersion, peer)
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -507,7 +507,7 @@ func TestAgentHelloPreservesLegacyCapAndNativeViewer(t *testing.T) {
 			if agentPeer {
 				peer = append(peer, agentFallbackFeature)
 			}
-			raw, err := b.helloAck(sessionRolePending, peer)
+			raw, err := b.helloAck(sessionRolePending, SessionRolesMinExtensionVersion, peer)
 			if err != nil {
 				t.Fatal(err)
 			}

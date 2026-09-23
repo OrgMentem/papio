@@ -8,6 +8,7 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"slices"
 	"testing"
 	"time"
@@ -121,13 +122,13 @@ func TestSessionTargetedReloadRejectsUnsupportedPendingBrowserWithoutPromotion(t
 func TestHelloAckNamesTheGrantedRole(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 
-	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.14.0"))
+	msgs, _ := runSyncAs(t, b, sessA, helloAs(SessionRolesMinExtensionVersion))
 	ack := firstOfType(msgs, protocol.MsgHelloAck)
 	if ack == nil || ack.Payload.(*protocol.HelloAckPayload).Role != "holder" {
 		t.Fatalf("granted hello = %+v, want a hello_ack with role holder", msgs)
 	}
 
-	msgs, _ = runSyncAs(t, b, sessB, helloAs("0.14.0"))
+	msgs, _ = runSyncAs(t, b, sessB, helloAs(SessionRolesMinExtensionVersion))
 	if len(msgs) != 2 {
 		t.Fatalf("denied hello returned %d frames, want the ack and the refusal: %+v", len(msgs), msgs)
 	}
@@ -148,6 +149,105 @@ func TestHelloAckNamesTheGrantedRole(t *testing.T) {
 
 	if _, denied, _ := b.Sessions(); denied != 1 {
 		t.Fatalf("denied hellos = %d, want the denial still counted", denied)
+	}
+}
+
+// TestReleased014StaysPendingBehindA015Holder replays the 2026-09-23 QA
+// gate: the store build ext-v0.14.0 in Firefox behind a Chrome 0.15.0 holder.
+// Its strict hello_ack rule has no role or browser_holder_generation key,
+// so a role-carrying ack made it drop the port and redial on each 5 s popup
+// refresh. Every frame it can receive must pass that pinned rule, both while
+// pending and once promoted, and the 0.15.0 holder keeps its role.
+func TestReleased014StaysPendingBehindA015Holder(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	hello014 := inFrame(t, protocol.MsgHello, "", map[string]any{
+		"extension_version": "0.14.0",
+		"features":          []string{effectPermitFeature, institutionalMaterializationFeature, surfacePresenceFeature, workPulseFeature},
+	})
+
+	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	if ack := firstOfType(msgs, protocol.MsgHelloAck); ack == nil || ack.Payload.(*protocol.HelloAckPayload).Role != sessionRoleHolder {
+		t.Fatalf("0.15.0 holder hello = %+v, want a role-holder hello_ack", msgs)
+	}
+
+	msgs, raw := runSyncAs(t, b, sessB, hello014)
+	for _, frame := range raw {
+		requireExt014Accepts(t, frame)
+	}
+	if len(msgs) != 1 || msgs[0].Type != protocol.MsgError ||
+		msgs[0].Payload.(*protocol.ErrorPayload).Code != "session_busy" {
+		t.Fatalf("denied 0.14.0 hello = %+v, want only the session_busy refusal", msgs)
+	}
+	if _, raw = runSyncAs(t, b, sessB); len(raw) != 0 {
+		t.Fatalf("pending 0.14.0 poll = %s, want nothing", raw)
+	}
+	if sessions, _, _ := b.Sessions(); len(sessions) != 2 || sessions[0].ID != sessA {
+		t.Fatalf("sessions = %+v, want 0.15.0 holding and 0.14.0 pending", sessions)
+	}
+
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	msgs, raw = runSyncAs(t, b, sessB)
+	for _, frame := range raw {
+		requireExt014Accepts(t, frame)
+	}
+	if firstOfType(msgs, protocol.MsgHelloAck) == nil {
+		t.Fatalf("promoted 0.14.0 poll = %+v, want its holder hello_ack", msgs)
+	}
+}
+
+// requireExt014Accepts pins the ext-v0.14.0 inbound rule for the only frame
+// types a denied or promoted session receives: the envelope
+// (extension/src/protocol.ts:2247-2301), error (:3714-3726), and hello_ack
+// (:3727-3781). Its requireFields rejects any key outside these sets.
+func requireExt014Accepts(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+	fail := func(format string, args ...any) {
+		t.Helper()
+		t.Fatalf("ext-v0.14.0 rejects %s: "+format, append([]any{raw}, args...)...)
+	}
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &env); err != nil {
+		fail("%v", err)
+	}
+	onlyKeys := func(obj map[string]json.RawMessage, allowed ...string) {
+		t.Helper()
+		for key := range obj {
+			if !slices.Contains(allowed, key) {
+				fail("unknown field %q", key)
+			}
+		}
+	}
+	onlyKeys(env, "protocol", "type", "msg_id", "seq", "payload", "job_id")
+	var typ string
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(env["type"], &typ) != nil || json.Unmarshal(env["payload"], &payload) != nil {
+		fail("malformed envelope")
+	}
+	switch typ {
+	case protocol.MsgError:
+		onlyKeys(payload, "code", "message", "request_id")
+		var code, message string
+		if json.Unmarshal(payload["code"], &code) != nil || !regexp.MustCompile(`^[a-z0-9_]{2,50}$`).MatchString(code) {
+			fail("error.code")
+		}
+		if json.Unmarshal(payload["message"], &message) != nil || message == "" || len([]rune(message)) > 1000 {
+			fail("error.message")
+		}
+	case protocol.MsgHelloAck:
+		onlyKeys(payload, "daemon_version", "features", "resolver_origins")
+		var features []string
+		if f, ok := payload["features"]; ok && (json.Unmarshal(f, &features) != nil || len(features) > 32) {
+			fail("hello_ack.features must be at most 32 strings")
+		}
+		for _, feature := range features {
+			if n := len([]rune(feature)); n == 0 || n > 64 {
+				fail("hello_ack.features entry %q", feature)
+			}
+		}
+	default:
+		fail("type %q is outside this pinned rule", typ)
 	}
 }
 

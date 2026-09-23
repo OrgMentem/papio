@@ -252,7 +252,7 @@ func TestNativeViewerSaveRootLossAndPartPending(t *testing.T) {
 func TestNativeViewerSaveHelloCapAndPoll(t *testing.T) {
 	b, jobs, id, _, p, _ := viewerFixture(t, nil)
 	b.mu.Lock()
-	ack, err := b.helloAck(sessionRoleHolder, []string{nativeViewerDownloadFeature, protocol.NativeViewerSaveFeature})
+	ack, err := b.helloAck(sessionRoleHolder, SessionRolesMinExtensionVersion, []string{nativeViewerDownloadFeature, protocol.NativeViewerSaveFeature})
 	b.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -711,7 +711,7 @@ func TestNativeViewerSaveAllFeaturePacking(t *testing.T) {
 			b.SetNativeViewerDriver(nil)
 		}
 		b.mu.Lock()
-		raw, err := b.helloAck(sessionRoleHolder, peer)
+		raw, err := b.helloAck(sessionRoleHolder, SessionRolesMinExtensionVersion, peer)
 		b.mu.Unlock()
 		if err != nil {
 			t.Fatal(err)

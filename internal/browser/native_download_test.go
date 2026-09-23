@@ -236,7 +236,7 @@ func TestNativeDownloadImportFencesAuthority(t *testing.T) {
 }
 func TestNativeDownloadHelloCapAndLegacy(t *testing.T) {
 	b, _, _, _ := newBridge(t)
-	legacy, err := b.helloAck(sessionRoleHolder, nil)
+	legacy, err := b.helloAck(sessionRoleHolder, SessionRolesMinExtensionVersion, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestNativeDownloadHelloCapAndLegacy(t *testing.T) {
 	if !slices.Equal(old, b.Features) || slices.Contains(old, protocol.NativeClickAdoptionFeature) {
 		t.Fatal("legacy capabilities changed")
 	}
-	frame, err := b.helloAck(sessionRoleHolder, []string{protocol.NativeClickAdoptionFeature, nativeViewerDownloadFeature, agentFallbackFeature})
+	frame, err := b.helloAck(sessionRoleHolder, SessionRolesMinExtensionVersion, []string{protocol.NativeClickAdoptionFeature, nativeViewerDownloadFeature, agentFallbackFeature})
 	if err != nil {
 		t.Fatal(err)
 	}

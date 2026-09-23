@@ -142,6 +142,12 @@ const (
 	// DevReloadMinExtensionVersion gates dev_reload away from released 0.14.x
 	// sessions whose strict parser rejects the unknown type outright.
 	DevReloadMinExtensionVersion = "0.15.0"
+	// SessionRolesMinExtensionVersion is the first extension whose strict
+	// hello_ack parser accepts role and browser_holder_generation. Released
+	// 0.14.x rejects either field, drops the native port, and reconnects on
+	// its next popup refresh. It also has no pending role: it must hear only
+	// session_busy on a denied hello, the v0.21 wire it shipped against.
+	SessionRolesMinExtensionVersion = "0.15.0"
 	// pageBulkConsumer is the sole daemon-assigned consumer for every job
 	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
 	// extension never supplies it.
@@ -1139,7 +1145,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 			}
 			out = append(out, outdated...)
 		} else {
-			ack, err := b.helloAck(sessionRoleHolder, promoted.Features)
+			ack, err := b.helloAck(sessionRoleHolder, promoted.ExtensionVersion, promoted.Features)
 			if err != nil {
 				return nil, err
 			}
@@ -1436,8 +1442,10 @@ func (b *Bridge) finishReloadRelease(departed *browserSession) {
 // that lost arbitration. A pending session is acked too — it still drives
 // the holder-independent surfaces the dispatcher admits from a non-holder,
 // and it can only know they exist from the feature list carried here.
+// Below SessionRolesMinExtensionVersion the frame carries neither role nor
+// browser_holder_generation, and handleHello never acks a pending session.
 // The caller holds b.mu.
-func (b *Bridge) helloAck(role string, peerFeatures []string) (json.RawMessage, error) {
+func (b *Bridge) helloAck(role, peerVersion string, peerFeatures []string) (json.RawMessage, error) {
 	features := slices.Clone(b.Features)
 	// A peer requesting native-viewer outcomes also supports snapshot v3+.
 	// Replace its redundant v2 hint rather than exceed the strict 32-feature
@@ -1479,11 +1487,13 @@ func (b *Bridge) helloAck(role string, peerFeatures []string) (json.RawMessage, 
 		DaemonVersion:   b.Version,
 		Features:        features,
 		ResolverOrigins: b.cfg.ResolverOrigins(),
-		Role:            role,
 	}
-	if role == sessionRoleHolder {
-		generation := b.arbitration.generation()
-		payload.BrowserHolderGeneration = &generation
+	if compareVersion(peerVersion, SessionRolesMinExtensionVersion) >= 0 {
+		payload.Role = role
+		if role == sessionRoleHolder {
+			generation := b.arbitration.generation()
+			payload.BrowserHolderGeneration = &generation
+		}
 	}
 	return b.frame(protocol.MsgHelloAck, "", payload)
 }
@@ -4585,13 +4595,19 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 		holder := b.arbitration.holderSession()
 		log.Printf("papio: browser session %s (v%s) denied: session held by %s (v%s)",
 			shortSession(sessionID), session.ExtensionVersion, shortSession(holder.ID), holder.ExtensionVersion)
-		// Ack first, then refuse holdership. A pending browser still serves
-		// user-initiated, holder-independent requests.
-		ack, err := b.helloAck(sessionRolePending, session.Features)
+		busy, err := b.sessionBusy("")
 		if err != nil {
 			return nil, err
 		}
-		busy, err := b.sessionBusy("")
+		// An extension without session roles reads any hello_ack as holdership
+		// and the released one rejects the role field outright, so it hears
+		// only the refusal.
+		if compareVersion(session.ExtensionVersion, SessionRolesMinExtensionVersion) < 0 {
+			return busy, nil
+		}
+		// Ack first, then refuse holdership. A pending browser still serves
+		// user-initiated, holder-independent requests.
+		ack, err := b.helloAck(sessionRolePending, session.ExtensionVersion, session.Features)
 		if err != nil {
 			return nil, err
 		}
@@ -4651,7 +4667,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	if session.Outdated {
 		return b.extensionOutdatedError()
 	}
-	ack, err := b.helloAck(sessionRoleHolder, session.Features)
+	ack, err := b.helloAck(sessionRoleHolder, session.ExtensionVersion, session.Features)
 	if err != nil {
 		return nil, err
 	}

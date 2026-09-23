@@ -503,6 +503,7 @@ There is also a link check, because `zensical build` prints a broken link as an
   through the real parsers in isolation (`parseBrowserMessage` under bun,
   `protocol.DecodeBrowserMessage` in a throwaway Go main) before touching a browser.
 - **`dev_reload` is gated by `DevReloadMinExtensionVersion = "0.15.0"` in `internal/browser/bridge.go`, same mechanism as `ProviderDirectGetMinExtensionVersion`.** The frame is a NEW message type rather than a field on an existing one because both parsers reject unknown fields — a daemon that sent it to a 0.14.x extension would have the whole message rejected. Consequence: `papio browser reload` against an extension below 0.15.0 fails with a version message; rebuild and load the new bundle (the one reload you still have to do by hand) to fix it.
+- **`hello_ack.role` and `hello_ack.browser_holder_generation` are gated by `SessionRolesMinExtensionVersion = "0.15.0"` in `internal/browser/bridge.go`.** They are fields added to an existing message, so the released ext-v0.14.0 hello_ack rule (`extension/src/protocol.ts:3728-3732` at that tag) rejected every ack from daemon v0.22.0, holder and pending alike, and redialled on each 5 s popup refresh. Below the floor a holder gets a role-less ack and a denied hello gets only `session_busy` (the v0.21 wire); 0.14.0 has no pending role, so any ack reads as holdership to it. `TestReleased014StaysPendingBehindA015Holder` pins that rule in Go.
 
 ### Browser sessions & holder arbitration
 - **Only one connected browser holds the bridge; the rest poll as pending.** Two browsers
