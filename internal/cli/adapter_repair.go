@@ -21,6 +21,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/api"
 	"papio/internal/captures"
 )
 
@@ -42,6 +43,9 @@ type adapterRepairCapture struct {
 	SanitizerProvenance string
 	SanitizerVersion    string
 	IndependentEvidence bool
+	// Recovery is the daemon-verified validated fallback for the job that
+	// recorded this capture; nil when no recovery job was linked.
+	Recovery *adapterRepairRecovery
 }
 type adapterRepairMetadata struct {
 	Provider            string    `json:"provider,omitempty"`
@@ -81,8 +85,10 @@ type adapterRepairResult struct {
 	Workspace           string `json:"workspace"`
 	Fixture             string `json:"fixture"`
 	Report              string `json:"report"`
+	Manifest            string `json:"manifest"`
 	NextRevision        string `json:"next_revision"`
 	IndependentEvidence bool   `json:"independent_evidence"`
+	RecoveryJob         string `json:"recovery_job,omitempty"`
 	Outcome             string `json:"outcome"`
 }
 
@@ -106,7 +112,7 @@ type adapterRepairCandidates struct {
 }
 
 func newAdapterRepairCommand(opt *options) *cobra.Command {
-	var provider, scenario string
+	var provider, scenario, recoveryJob string
 	command := &cobra.Command{
 		Use:   "repair <capture-id-or-path>",
 		Short: "Scaffold a reviewed adapter repair workspace",
@@ -115,6 +121,13 @@ func newAdapterRepairCommand(opt *options) *cobra.Command {
 			capture, err := resolveAdapterRepairCapture(cmd.Context(), opt, args[0], provider, scenario)
 			if err != nil {
 				return err
+			}
+			if jobID := strings.TrimSpace(recoveryJob); jobID != "" {
+				recovery, err := fetchAdapterRepairRecovery(cmd, opt, capture, jobID)
+				if err != nil {
+					return err
+				}
+				capture.Recovery = &recovery
 			}
 			repoRoot, err := findAdapterRepairRepoRoot()
 			if err != nil {
@@ -134,6 +147,9 @@ func newAdapterRepairCommand(opt *options) *cobra.Command {
 			message := "No applicable repair patch. Review report.md for the blockers."
 			if result.Outcome == "proposal" {
 				message = "Review report.md and the captured fixture, then use apply.md to apply the proposed repair."
+				if result.RecoveryJob != "" {
+					message += " Follow canary.md for the model-free canary and verdict."
+				}
 			}
 			_, err = fmt.Fprintf(opt.out, "%s\n%s\n", result.Workspace, message)
 			return err
@@ -141,7 +157,29 @@ func newAdapterRepairCommand(opt *options) *cobra.Command {
 	}
 	command.Flags().StringVar(&provider, "provider", "", "provider adapter id (must match daemon capture metadata)")
 	command.Flags().StringVar(&scenario, "scenario", "", "fixture scenario (must match daemon capture metadata)")
+	command.Flags().StringVar(&recoveryJob, "recovery-job", "", "job that recorded this capture, failed declaratively, then reached ready with a validated PDF")
 	return command
+}
+
+// fetchAdapterRepairRecovery reads the recovery job through the daemon's
+// existing job and artifact methods; the artifact read is skipped only when
+// the job itself already disqualifies the link.
+func fetchAdapterRepairRecovery(cmd *cobra.Command, opt *options, capture adapterRepairCapture, jobID string) (adapterRepairRecovery, error) {
+	var detail api.JobDetail
+	if err := opt.call(cmd.Context(), "jobs.get", map[string]string{"job_id": jobID}, &detail); err != nil {
+		return adapterRepairRecovery{}, err
+	}
+	var artifact api.ArtifactResult
+	if detail.Job != nil && acceptedJobState(detail.Job.State) && detail.Job.ArtifactSHA256 != "" {
+		if err := opt.call(cmd.Context(), "artifacts.get", map[string]string{"job_id": jobID}, &artifact); err != nil {
+			return adapterRepairRecovery{}, err
+		}
+	}
+	recovery, err := linkAdapterRepairRecovery(capture, jobID, detail, artifact.Artifact)
+	if err != nil {
+		return adapterRepairRecovery{}, fmt.Errorf("recovery job %s cannot label this repair: %w", jobID, err)
+	}
+	return recovery, nil
 }
 
 func resolveAdapterRepairCapture(ctx context.Context, opt *options, input, providerFlag, scenarioFlag string) (adapterRepairCapture, error) {
@@ -341,6 +379,13 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	if err := validateRepairCapture(capture); err != nil {
 		return adapterRepairResult{}, err
 	}
+	if capture.Recovery != nil {
+		// A validated PDF labels an article page. It says nothing about a
+		// login, terms or entitlement rule.
+		if kind, _ := adapterRepairRuleKind(capture.Scenario); kind != "article" {
+			return adapterRepairResult{}, fmt.Errorf("validated recovery can label only article repairs, not scenario %q", capture.Scenario)
+		}
+	}
 
 	if deps.Now == nil {
 		deps.Now = time.Now
@@ -410,8 +455,16 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	}
 	nextRevision := "unknown"
 	evidenceStatus := "untrusted caller-labelled scenario; revision promotion is locked"
-	if capture.IndependentEvidence {
+	// A linked recovery is daemon correlation too: the job's own history binds
+	// this capture path to the declarative failure and to a validated artifact.
+	// The agent path records no provider outcome, so the capture row alone
+	// cannot say so. A temporal-only link does not count.
+	independent := capture.IndependentEvidence || capture.Recovery.correlates()
+	if independent {
 		evidenceStatus = "independent daemon-correlated provider outcome"
+		if !capture.IndependentEvidence {
+			evidenceStatus = "daemon-verified recovery job " + capture.Recovery.JobID + " recorded this capture before its declarative failure"
+		}
 		if next, nextErr := nextAdapterRevision(currentVersion); nextErr == nil {
 			nextRevision = next
 		}
@@ -486,7 +539,7 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	}
 
 	typesPatchWritten := false
-	if top != nil && capture.IndependentEvidence && nextRevision != "unknown" && candidates.PatchedSource != "" {
+	if top != nil && independent && nextRevision != "unknown" && candidates.PatchedSource != "" {
 		typesPatch, patchErr := adapterSourceUnifiedPatch(string(typesSource), candidates.PatchedSource, capture.Provider, currentVersion, nextRevision)
 		if patchErr != nil {
 			return adapterRepairResult{}, fmt.Errorf("generate types patch: %w", patchErr)
@@ -497,7 +550,7 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 			return adapterRepairResult{}, fmt.Errorf("write types patch: %w", err)
 		}
 		typesPatchWritten = true
-	} else if top != nil && !capture.IndependentEvidence {
+	} else if top != nil && !independent {
 		candidateStatus += "\n\nThe complete candidate remains proposal-only. Independent evidence is absent, so the revision bump and types.ts.patch stay locked."
 	} else if top != nil && nextRevision == "unknown" {
 		candidateStatus += "\n\nThe adapter revision could not be advanced, so types.ts.patch was not emitted."
@@ -512,7 +565,11 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		if readErr != nil {
 			return adapterRepairResult{}, fmt.Errorf("read extension/test/adapters.test.ts: %w", readErr)
 		}
-		testCase := adapterRepairTestCase(capture.Provider, fixtureName, ruleKind)
+		recoveredDOI := ""
+		if capture.Recovery != nil {
+			recoveredDOI = capture.Recovery.WorkDOI
+		}
+		testCase := adapterRepairTestCase(capture.Provider, fixtureName, ruleKind, recoveredDOI)
 		testPatch := appendUnifiedPatch("extension/test/adapters.test.ts", string(adaptersTestSource), testCase)
 		testPatchPath := filepath.Join(workspace, "adapters.test.ts.patch")
 		if err := os.WriteFile(testPatchPath, []byte(testPatch), 0o600); err != nil {
@@ -532,7 +589,7 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		sourceStatus,
 		analysis,
 		candidateStatus,
-	)
+	) + adapterRepairRecoveryReport(capture.Recovery)
 	// #nosec G703 -- reportPath shares the validated, repo-owned workspace above.
 	if err := os.WriteFile(reportPath, []byte(report), 0o600); err != nil {
 		return adapterRepairResult{}, fmt.Errorf("write report: %w", err)
@@ -568,10 +625,35 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		return adapterRepairResult{}, fmt.Errorf("write apply instructions: %w", err)
 	}
 	outcome := "blocked"
+	patches := []string{}
+	if testPatchWritten {
+		patches = append(patches, "adapters.test.ts.patch")
+	}
 	if typesPatchWritten {
 		outcome = "proposal"
+		patches = append(patches, "types.ts.patch")
 	}
-	return adapterRepairResult{Workspace: workspace, Fixture: fixturePath, Report: reportPath, NextRevision: nextRevision, IndependentEvidence: capture.IndependentEvidence, Outcome: outcome}, nil
+	manifest := adapterRepairManifest{
+		Schema: adapterRepairManifestSchema, CreatedAt: now, Provider: capture.Provider,
+		Scenario: capture.Scenario, FixtureSHA256: capture.SHA256, FixtureName: fixtureName,
+		CurrentVersion: currentVersion, NextRevision: nextRevision,
+		IndependentEvidence: capture.IndependentEvidence, Outcome: outcome,
+		Patches: patches, Recovery: capture.Recovery,
+	}
+	manifestPath := filepath.Join(workspace, adapterRepairManifestName)
+	if err := writeAdapterRepairJSON(manifestPath, manifest); err != nil {
+		return adapterRepairResult{}, fmt.Errorf("write repair manifest: %w", err)
+	}
+	result := adapterRepairResult{Workspace: workspace, Fixture: fixturePath, Report: reportPath, Manifest: manifestPath, NextRevision: nextRevision, IndependentEvidence: capture.IndependentEvidence, Outcome: outcome}
+	if capture.Recovery != nil {
+		result.RecoveryJob = capture.Recovery.JobID
+	}
+	if outcome == "proposal" && capture.Recovery != nil {
+		if err := os.WriteFile(filepath.Join(workspace, "canary.md"), []byte(adapterRepairCanaryInstructions(manifest, workspaceRelative)), 0o600); err != nil {
+			return adapterRepairResult{}, fmt.Errorf("write canary instructions: %w", err)
+		}
+	}
+	return result, nil
 }
 
 func adapterRepairRuleKind(scenario string) (string, error) {
@@ -591,10 +673,30 @@ func adapterRepairRuleKind(scenario string) (string, error) {
 	}
 }
 
-func adapterRepairTestCase(provider, scenario, expected string) string {
+// javaScriptString encodes a value as a JSON string, which JavaScript parses
+// to the same code points; Go's %q escapes (\a, \x..) do not round-trip.
+func javaScriptString(value string) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+// adapterRepairTestCase renders the generated regression. With a recovered
+// DOI, the label comes from the validated fallback artifact rather than the
+// page's own identity evidence, so the candidate does not label its own test,
+// and a different DOI must make the same page refuse its effect.
+func adapterRepairTestCase(provider, scenario, expected, recoveredDOI string) string {
 	var planLines string
 	var actionLines string
-	if expected == "article" {
+	if expected == "article" && recoveredDOI != "" {
+		planLines = fmt.Sprintf(
+			"    if (spec.workEvidence?.kind !== \"doi\") throw new Error(%q);\n    const planned = planExecution(page, spec, { doi: %s }, {});\n",
+			"recovered DOI label requires packaged DOI work evidence",
+			javaScriptString(recoveredDOI),
+		)
+		actionLines = "    if (!(\"assisted\" in planned)) {\n      expect(planned.required_consequence).toBe(\"download\");\n      expect(planned.method).not.toBeNull();\n      expect(planned.target_ref).not.toBeNull();\n    }\n" +
+			fmt.Sprintf("    const otherWork = planExecution(page, spec, { doi: %q }, {});\n", adapterRepairOtherDOI) +
+			"    expect(\"assisted\" in otherWork).toBe(false);\n    expect(otherWork.verdict.kind).toBe(\"wrong_work\");\n    if (!(\"assisted\" in otherWork)) {\n      expect(otherWork.method).toBeNull();\n      expect(otherWork.target_ref).toBeNull();\n    }\n"
+	} else if expected == "article" {
 		planLines = fmt.Sprintf(
 			"    const evidence = spec.workEvidence;\n    if (evidence === undefined) throw new Error(%q);\n    const evidenceNode = page.querySelector(evidence.selector);\n    if (evidenceNode === null) throw new Error(%q);\n    let identity = evidence.attribute === undefined ? evidenceNode.textContent?.trim() ?? \"\" : evidenceNode.getAttribute(evidence.attribute)?.trim() ?? \"\";\n    if (evidence.pattern !== undefined) identity = new RegExp(evidence.pattern).exec(identity)?.[1]?.trim() ?? \"\";\n    expect(identity).not.toBe(\"\");\n    const expectedWork = evidence.kind === \"doi\" ? { doi: identity } : { title: identity };\n    const planned = planExecution(page, spec, expectedWork, {});\n",
 			"generated article repair requires packaged work evidence",
@@ -604,9 +706,13 @@ func adapterRepairTestCase(provider, scenario, expected string) string {
 	} else {
 		planLines = "    const planned = planExecution(page, spec, {}, {});\n"
 	}
+	title := fmt.Sprintf("generated %s %s fixture produces a complete %s plan", provider, scenario, expected)
+	if recoveredDOI != "" {
+		title = fmt.Sprintf("generated %s %s fixture plans the recovered work and refuses another", provider, scenario)
+	}
 	return fmt.Sprintf(
 		"\ntest(%q, () => {\n    const html = readFileSync(fixturePath(%q, %q), \"utf8\");\n    const origin = captureOrigin(html);\n    if (origin === null) throw new Error(\"repair fixture has no captured origin\");\n    const page = parseHTML(html, origin);\n    const spec = adapters.find((candidate) => candidate.id === %q) as AdapterSpec;\n%s    expect(\"assisted\" in planned).toBe(false);\n    expect(planned.verdict.kind).toBe(%q);\n%s  });\n",
-		fmt.Sprintf("generated %s %s fixture produces a complete %s plan", provider, scenario, expected),
+		title,
 		provider, scenario, provider, planLines, expected, actionLines,
 	)
 }

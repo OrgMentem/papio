@@ -107,3 +107,26 @@ credential service with explicit references independent of filesystem paths.
 The shared service and explicit migration are now implemented. New setup uses
 references; the path-scoped behavior above remains a compatibility reader until
 each existing profile is migrated. Cloud enrollment stays explicit.
+
+Local repair learning addendum (2026-09-23): a validated recovery may label a
+source-controlled adapter repair; it never changes adapter behavior at runtime.
+`papio adapter repair --recovery-job` accepts the link only from the daemon's own
+record of one job: the `browser.page_capture` event naming the capture path, a
+later declarative failure (a `ui_changed` outcome from that adapter version, or
+the first agent decision reservation, which replaces that report when the
+fallback runs), and a later validating-to-`ready` transition for the job's
+artifact after a browser or native delivery. A transition marked
+`human_identity_override` never counts: the shared artifact row's identity result
+can be overwritten by another job that accepted the same bytes, so the job's own
+transition is the record. The artifact row must still be a PDF with a page count.
+A job later imported keeps its link. That link counts as daemon correlation for
+the revision gate, because the agent path reports no provider outcome and so
+never marks its capture independent. A reservation is fallback evidence only when
+the same request's `browser.agent_decision_completed` receipt follows it before
+`ready`; the daemon writes the reservation before inference, so a reservation
+alone is recorded as route `temporal_correlation` in `repair.json`, which labels
+the regression but does not unlock the revision. The recovered DOI labels the generated
+regression, which must also refuse a different DOI. It is a label for an article
+page only: it does not identify the control the fallback used. Promotion needs a
+fresh model-free canary whose validated artifact matches the recovery; `canary.md`
+in the workspace gives the procedure with the agent fallback disabled.

@@ -139,8 +139,16 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 		!strings.Contains(string(report), "downloaded, adopted, identity-validated PDF") {
 		t.Fatalf("report does not certify the fixture and bound candidate: %s", report)
 	}
-	if result.NextRevision != "0.3.1" {
-		t.Fatalf("next revision = %q, want 0.3.1", result.NextRevision)
+	typesSource, err := os.ReadFile(filepath.Join(root, "extension", "src", "adapters", "types.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := parseAdapterVersion(string(typesSource), "jstor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := nextAdapterRevision(current); result.NextRevision != want {
+		t.Fatalf("next revision = %q, want %q", result.NextRevision, want)
 	}
 	apply, err := os.ReadFile(filepath.Join(result.Workspace, "apply.md"))
 	if err != nil {
@@ -374,8 +382,16 @@ func completeAdapterRepairOutput(t *testing.T, root string) string {
 	}
 	source := string(raw)
 	start := strings.Index(source, `id: "jstor"`)
-	version := strings.Index(source[start:], `version: "0.3.0"`) + start
-	source = source[:version] + strings.Replace(source[version:], `version: "0.3.0"`, `version: "0.3.1"`, 1)
+	current, err := parseAdapterVersion(source, "jstor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := nextAdapterRevision(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := strings.Index(source[start:], `version: "`+current+`"`) + start
+	source = source[:version] + strings.Replace(source[version:], `version: "`+current+`"`, `version: "`+next+`"`, 1)
 	source = strings.ReplaceAll(source, `mfe-download-pharos-button[data-qa='download-pdf'][data-doi][data-sc='but click:pdf download'][variant='primary']`, "a#pdf-download")
 	result["patched_source"] = source
 	data, err := json.Marshal(result)

@@ -78,7 +78,7 @@ debugger is introduced by removing the extension.
 | Menu and observation progression | Implemented with delayed-menu and intercepted-anchor regressions. An intercepted link can expose a new local PDF control without replaying the consumed click. Preserve actual-download grace and exact receipt ownership. |
 | Article navigation and new contexts | Same-tab exact same-origin destination implemented; one live Chrome HTML-wrapper route acquired a validated PDF. Next: redirects and an owned child tab. Retire old control handles; carry the existing job/permit through a defined handoff, recheck permissions/identity, close only owned tabs, and reconcile any download already started. Test redirects, cancellation, concurrent jobs and operator takeover. |
 | CDN and resident-viewer acquisition | Mac Firefox's production bridge/helper/adoption path passed the revoked-URL fixture. Next: live extension entry and backlog acceptance, packaged helper distribution, recovery of admitted staging after publication failure, and Windows/Linux native drivers. Chrome's observed Save path refetched and failed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation. |
-| Local repair learning | Connect failed declarative capture, successful fallback and validated artifact to the existing repair workspace. Generate/test in isolation, run a fresh model-free declarative canary, promote or revert from the artifact outcome. Keep local operation independent of analytics. |
+| Local repair learning | Implemented locally, live canary pending. `papio adapter repair <capture> --recovery-job <job>` links the capture to the same job's declarative failure (ui_changed, or an agent reservation whose completion receipt follows) and its validated ready artifact through the existing job/artifact reads; a reservation without completion is recorded as `temporal_correlation` and keeps the revision locked. The recovered DOI labels the generated regression, which must also refuse another DOI. The workspace records `repair.json` and a `canary.md` procedure for a fresh model-free canary with the agent disabled; the canary verdict and rollback command is held for review, so the verdict is the operator's reading of the artifact. A private replay of the saved IOS Press controlled pair reproduced fail-before/pass-after; its artifact identity row was reconstructed. Next: one real browser run of the full cycle. The daemon history cannot yet distinguish an adapter download from a manual click; a success receipt naming the declarative producer would close that. |
 | Extension-free native executor | Reuse and assess maintained OSS accessibility/input components on macOS, Windows and named Linux desktops. The helper starts on demand, yields to user input and cleans up its own tabs/dialogs. Prove article observation, navigation, saving, ownership, cancellation and recovery with the extension disabled and Codex absent. Measure focus, pointer and input interference. |
 
 Removing the extension also removes its tab IDs, host grants and download events.
@@ -345,6 +345,23 @@ passing fixtures and a successful download alone do not establish equivalence.
 Local canaries use fresh isolated jobs and preserve original jobs and storage.
 Distributed extension repairs use packaged releases and a tested rollout path;
 this plan does not silently add a remote executable selector catalog.
+
+Current state of steps 3–5: repair links the fallback, labels the regression
+with the recovered DOI and emits `repair.json` and `canary.md`. Recording the
+verdict, rolling back, applying the patch, building and reloading are still
+operator steps; automatic application waits for a live receipt of the whole
+cycle.
+
+Future opt-in aggregate diagnostics are a separate possibility, not part of this
+loop. A structural report could count adapter id/version, failure class, fallback
+route and canary verdict, with no captures, URLs, DOIs, titles or selectors. Its
+value would be ranking which adapters drift, not repairing them; a repair still
+needs a local fixture. It would need its own opt-in, retention and deletion, and
+must not start from a TypeSafe key. Mozilla also requires consent for data sent
+off the device. Any distributed fix still ships as a packaged, store-reviewed
+extension release: ADR-0015 refuses runtime selector amendments, and Chrome's
+MV3 policy covers extensions that interpret remotely supplied logic. So
+diagnostics can only inform source changes.
 
 ## Consent, contribution and distribution
 

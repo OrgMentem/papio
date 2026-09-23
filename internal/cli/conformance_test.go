@@ -154,7 +154,7 @@ var commandClassification = map[string]commandClass{
 	"papio adapter capture":            {kind: kindStructured, args: []string{"https://provider.example/article", "--provider", "provider", "--scenario", "success"}, rpcMethods: []string{"adapter.capture_v1"}},
 	"papio adapter captures":           {kind: kindEnvelope, rowKey: "captures", rpcMethods: []string{"adapter.captures.list"}},
 	"papio adapter captures purge":     {kind: kindStructured, rpcMethods: []string{"adapter.captures.purge"}},
-	"papio adapter repair":             {kind: kindStructured, args: []string{"/tmp/papio-capture.html", "--provider", "provider", "--scenario", "success"}},
+	"papio adapter repair":             {kind: kindStructured, args: []string{"/tmp/papio-capture.html", "--provider", "provider", "--scenario", "success"}, rpcMethods: []string{"adapter.captures.list", "jobs.get", "artifacts.get"}},
 	"papio status":                     {kind: kindStructured, rpcMethods: []string{"zotio.missing_count", "jobs.list", "jobs.get"}},
 	"papio bench":                      {kind: kindEnvelope, rowKey: "results", args: []string{"--cohort", "testdata/bench-conformance-cohort.json"}},
 	"papio pulse":                      {kind: kindStructured, rpcMethods: []string{"work.pulse_v1"}},

@@ -250,6 +250,7 @@ papio adapter repair <capture-id-or-path> [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--provider` | `string` |  | provider adapter id (must match daemon capture metadata) |
+| `--recovery-job` | `string` |  | job that recorded this capture, failed declaratively, then reached ready with a validated PDF |
 | `--scenario` | `string` |  | fixture scenario (must match daemon capture metadata) |
 
 ## `papio artifacts`

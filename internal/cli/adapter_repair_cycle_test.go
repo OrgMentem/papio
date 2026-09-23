@@ -17,7 +17,11 @@ import (
 // This is a controlled regression, not provider acceptance. It traverses the
 // daemon capture store, real Bun synthesis, Go patch scaffold, git apply and
 // the generated Bun regression. No provider, normal daemon or browser is used.
-func TestAdapterRepairCycle(t *testing.T) {
+// adapterRepairCycleRepo builds a throwaway extension workspace with the real
+// planner and repair tools and one independently correlated drift capture.
+// It skips unless Bun and the extension dependencies are installed.
+func adapterRepairCycleRepo(t *testing.T) (string, adapterRepairCapture, func(string, []byte)) {
+	t.Helper()
 	repo, err := findAdapterRepairRepoRoot()
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +109,22 @@ test("existing access and legacy rules remain intact", () => {
 	capture := adapterRepairCapture{Path: row.Path, Provider: row.AdapterID, Scenario: row.Scenario,
 		Host: row.Host, Captured: row.Timestamp, AdapterVersion: row.AdapterVersion, SHA256: row.SHA256,
 		SanitizerProvenance: row.SanitizerProvenance, SanitizerVersion: row.SanitizerVersion, IndependentEvidence: row.IndependentEvidence}
+	return root, capture, write
+}
+
+func runCycleCommand(t *testing.T, dir string, wantSuccess bool, command string, args ...string) string {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), command, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if (err == nil) != wantSuccess {
+		t.Fatalf("%s %v: %v\n%s", command, args, err, out)
+	}
+	return string(out)
+}
+
+func TestAdapterRepairCycle(t *testing.T) {
+	root, capture, write := adapterRepairCycleRepo(t)
 	deps := adapterRepairDeps{RepoRoot: root, Now: func() time.Time { return time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC) }}
 	result, err := scaffoldAdapterRepair(context.Background(), capture, deps)
 	if err != nil {
@@ -116,13 +136,7 @@ test("existing access and legacy rules remain intact", () => {
 	}
 	run := func(dir string, wantSuccess bool, command string, args ...string) string {
 		t.Helper()
-		cmd := exec.CommandContext(t.Context(), command, args...)
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if (err == nil) != wantSuccess {
-			t.Fatalf("%s %v: %v\n%s", command, args, err, out)
-		}
-		return string(out)
+		return runCycleCommand(t, dir, wantSuccess, command, args...)
 	}
 	run(root, true, "git", "apply", "--check", filepath.Join(result.Workspace, "adapters.test.ts.patch"), filepath.Join(result.Workspace, "types.ts.patch"))
 	run(root, true, "git", "apply", filepath.Join(result.Workspace, "adapters.test.ts.patch"))
@@ -131,7 +145,7 @@ test("existing access and legacy rules remain intact", () => {
 	if !strings.Contains(missing, "ENOENT") {
 		t.Fatalf("missing fixture failed for another reason: %s", missing)
 	}
-	fixtureRelative := "extension/fixtures/jstor/repair-" + row.SHA256 + ".html"
+	fixtureRelative := "extension/fixtures/jstor/repair-" + capture.SHA256 + ".html"
 	emitted, err := os.ReadFile(filepath.Join(result.Workspace, fixtureRelative))
 	if err != nil {
 		t.Fatal(err)
@@ -163,5 +177,58 @@ test("existing access and legacy rules remain intact", () => {
 	apply, err := os.ReadFile(filepath.Join(again.Workspace, "apply.md"))
 	if err != nil || strings.Contains(string(apply), "git apply") {
 		t.Fatalf("blocked repair suggests applying: %s, %v", apply, err)
+	}
+}
+
+// The recovery variant closes the local learning loop in miniature: the job
+// that recorded the drift capture later reached ready with a validated PDF,
+// and that artifact's DOI labels the generated regression, which fails before
+// the candidate, passes after it, and fails under another DOI. Controlled
+// regression only.
+func TestAdapterRepairRecoveryCycle(t *testing.T) {
+	root, capture, write := adapterRepairCycleRepo(t)
+	history := recoveryHistory(capture.Path)
+	history[1].detail["scenario"] = capture.Scenario
+	recovery, err := linkAdapterRepairRecovery(capture, "job-controlled-regression",
+		jobDetailOverIPC(t, recoveryRow("job-controlled-regression"), history), passingArtifact())
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture.Recovery = &recovery
+	result, err := scaffoldAdapterRepair(context.Background(), capture, adapterRepairDeps{
+		RepoRoot: root, Now: func() time.Time { return time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Outcome != "proposal" {
+		report, _ := os.ReadFile(result.Report)
+		t.Fatalf("repair did not produce a proposal: %s", report)
+	}
+	extension := filepath.Join(root, "extension")
+	runCycleCommand(t, root, true, "git", "apply", filepath.Join(result.Workspace, "adapters.test.ts.patch"))
+	fixtureRelative := "extension/fixtures/jstor/repair-" + capture.SHA256 + ".html"
+	emitted, err := os.ReadFile(filepath.Join(result.Workspace, fixtureRelative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(fixtureRelative, emitted)
+	if before := runCycleCommand(t, extension, false, "bun", "test", "test/adapters.test.ts"); !strings.Contains(before, `Received: "unknown"`) {
+		t.Fatalf("old adapter failed for another reason: %s", before)
+	}
+	runCycleCommand(t, root, true, "git", "apply", filepath.Join(result.Workspace, "types.ts.patch"))
+	runCycleCommand(t, extension, true, "bun", "test", "test/adapters.test.ts")
+
+	// The label is load-bearing: the same candidate must fail a regression
+	// labelled with a DOI the validated artifact did not carry.
+	testsPath := filepath.Join(extension, "test", "adapters.test.ts")
+	applied, err := os.ReadFile(testsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write("extension/test/adapters.test.ts", append(append([]byte{}, applied...),
+		adapterRepairTestCase("jstor", "repair-"+capture.SHA256, "article", "10.2307/not-the-recovered-work")...))
+	if mislabelled := runCycleCommand(t, extension, false, "bun", "test", "test/adapters.test.ts"); !strings.Contains(mislabelled, `Received: "wrong_work"`) {
+		t.Fatalf("mislabelled regression failed for another reason: %s", mislabelled)
 	}
 }
