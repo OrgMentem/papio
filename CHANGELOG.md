@@ -55,9 +55,11 @@ execution records kept during the initial build.
 - **Retry a failed resolver route through the paper's DOI.**
   `papio actions retry-publisher <action-id> --revision <revision>` starts one
   publisher attempt after a wrong-page or adapter failure. The original action
-  and failure evidence remain available. Pending sign-ins, challenges, terms,
-  downloads, and unresolved effects block the retry; publisher access still
-  depends on the browser session's entitlement.
+  and failure evidence remain available. Pending sign-ins, challenges, terms
+  for the job, downloads, and unresolved effects block the retry; publisher
+  access still depends on the browser session's entitlement.
+  A terms gate on the same institution profile now blocks linked jobs, not
+  an unrelated publisher route.
 - **A paper that failed to file into a non-Zotero library can now be found and
   filed again.** When `[hooks] on_ready` fails once (papis mid-upgrade, target
   volume unmounted, a timeout), the PDF was acquired but never filed, and no
@@ -332,6 +334,9 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Dismissing one human action leaves a job waiting on its other open actions.**
+  Closing an obsolete browser handoff no longer cancels a job that still needs
+  a terms decision. Dismissing its last open action can still cancel a parked job.
 - **An admitted Firefox PDF viewer save now finishes after a publication failure.**
   If *papio* accepted the saved bytes but could not move them into the job's
   folder, or the daemon stopped in between, the next adoption sweep publishes the

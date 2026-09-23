@@ -62,13 +62,14 @@ func (js *Store) RetryPublisherHandoff(ctx context.Context, actionID, revision i
 		AND NOT EXISTS (SELECT 1 FROM materialization_claims m JOIN browser_candidates c ON c.id=m.candidate_id
 		  WHERE c.job_id=j.id AND m.phase IN ('claimed','bound','route_issued','navigated') AND (m.lease_until IS NULL OR m.lease_until>?))
 		AND NOT EXISTS (SELECT 1 FROM human_gate_observations g JOIN institution_profiles p ON p.id=g.institution_profile_id
-		  WHERE g.status='open' AND p.configured_name=COALESCE(NULLIF(json_extract(j.policy_json,'$.resolver'),''),'default'))
+		  WHERE g.status='open' AND g.gate_type IN (?,?,?)
+		  AND p.configured_name=COALESCE(NULLIF(json_extract(j.policy_json,'$.resolver'),''),'default'))
 		AND NOT EXISTS (SELECT 1 FROM human_gate_observations g WHERE g.status='open' AND (
 		  g.scope_class='platform'
 		  OR EXISTS (SELECT 1 FROM json_each(g.detail_json,'$.dependent_job_ids') WHERE value=j.id)
 		  OR EXISTS (SELECT 1 FROM json_each(g.detail_json,'$.claim_member_job_ids') WHERE value=j.id)))
 		AND NOT EXISTS (SELECT 1 FROM route_suppressions s WHERE s.job_id=j.id AND s.active=1 AND s.reason IN ('provider_challenge','rate_limited'))`,
-		actionID, now, now).Scan(&jobID, &doi, &requiresAuth)
+		actionID, now, now, HumanGateLogin, HumanGateMFA, HumanGateCaptchaOrSecurity).Scan(&jobID, &doi, &requiresAuth)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("%w: publisher retry requires one DOI route failure, no pending gate or effect, and no earlier publisher retry", ErrConflict)
 	}

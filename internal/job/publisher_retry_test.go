@@ -68,6 +68,45 @@ func TestPublisherRetryPreservesFailureAndIsBounded(t *testing.T) {
 	}
 }
 
+func TestPublisherRetryProfileGateScope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		gate      HumanGateType
+		allowed   bool
+		dependent bool
+	}{
+		{name: "terms at another provider", gate: HumanGateTermsRequired, allowed: true},
+		{name: "terms for this job", gate: HumanGateTermsRequired, dependent: true},
+		{name: "login", gate: HumanGateLogin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			js := testStore(t)
+			id, action := publisherFailure(t, js)
+			profile := institutionalProfile(t, js, testPolicy().Resolver, "digest", "auth")
+			gate := gateObservation("other-provider-gate", tc.gate, HumanGateScopeInstitutionProfile, profile.ID, 1)
+			gate.InstitutionProfileID = profile.ID
+			if tc.dependent {
+				gate.DependentJobIDs = []string{id}
+			}
+			if err := js.UpsertHumanGateObservation(ctx, gate); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := js.RetryPublisherHandoff(ctx, action, 1)
+			if tc.allowed {
+				if err != nil || got != id {
+					t.Fatalf("retry under unrelated terms gate = %q, %v; want job %q", got, err, id)
+				}
+				return
+			}
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("retry under %s gate = %q, %v; want ErrConflict", tc.gate, got, err)
+			}
+		})
+	}
+}
+
 func TestPublisherRetryRefusesUnsafeOrStaleActions(t *testing.T) {
 	for _, scenario := range []string{"revision", "no_doi", "invalid_doi", "sign_in", "terms", "identity", "other_action", "lease", "terminal", "held_effect", "unknown_effect", "profile_gate", "platform_gate", "live_claim"} {
 		t.Run(scenario, func(t *testing.T) {
