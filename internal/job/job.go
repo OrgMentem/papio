@@ -3396,6 +3396,15 @@ func terminalHandoffEvent(kind string, event map[string]any) bool {
 // nor debits, and it resolves nothing.
 const ChallengeClearedEvent = "browser.challenge_cleared"
 
+// ProviderCooldownEvent records that a provider host refused the browser (a
+// block or rate-limit page, reported as provider_outcome rate_limited) and
+// that papio should not drive that host again before detail "until"
+// (RFC 3339, UTC). detail "host" is the lowercase host the extension
+// reported. The job itself waits in retry_wait for the same interval, so a
+// refusal is retried later instead of latching adapter drift or parking the
+// paper for a human who has nothing to solve.
+const ProviderCooldownEvent = "browser.provider_cooldown"
+
 // JobAcceptDispositionQueued marks a browser.job_accept the extension sent
 // while taking the offer into its own queue rather than driving it. Only a
 // driving accept opens a drive epoch, so a paper waiting its turn behind the

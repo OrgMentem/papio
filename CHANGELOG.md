@@ -11,6 +11,13 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **A provider refusal page no longer latches adapter drift or parks the
+  paper.** When the extension reports a provider block (`rate_limited`), the
+  daemon releases the drive's binding, closes the handoff, and puts the job in
+  `retry_wait` for `browser.action_expiry_seconds`. It also records a
+  `browser.provider_cooldown` event with the refusing host and the time until
+  which papio should not drive that host. No drift latch and no manual download
+  are created, because nothing on a refusal page is for a person to do.
 - **A waiting PDF grab no longer makes your browser reconnect every few
   seconds.** When every open action belonged to a known family, the inbox
   count listed the grab's family first even though it ranks last. The

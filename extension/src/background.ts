@@ -920,6 +920,7 @@ export function needsVisibleWindow(spec: AdapterSpec | undefined): boolean {
 export type DrivenPageAssessmentKind =
   | "normal"
   | "challenge"
+  | "provider_block"
   | "redirect_loop"
   | "load_failure";
 export interface DrivenPageAssessment {
@@ -1041,6 +1042,43 @@ export function assessDrivenPage(
     );
   if ((!openAthensHost && genericLoop) || openAthensLoop)
     return { kind: "redirect_loop" };
+  // A provider REFUSAL, unlike a challenge, has nothing for a human to pass:
+  // no widget, no countdown, only a support reference. Measured 2026-09-23:
+  // ScienceDirect served Elsevier's "There was a problem providing the content
+  // you requested" page (fixtures/sciencedirect/blocked.html) in place of four
+  // articles, the planner read it as unknown, and the article agent stopped
+  // with identity_missing and latched adapter drift. The adapter had not
+  // drifted; the provider had refused the browser. Structural markers decide
+  // first. Text needs two independent page-authored signals, as below, so an
+  // article ABOUT access denial stays normal.
+  const refusalStructural =
+    root.querySelector(
+      '.cf-ratelimit-blocked, [data-translate="block_headline"], ' +
+        '[data-translate="blocked_why_headline"], [data-translate="rate_limited"]',
+    ) !== null;
+  const elsevierRefusal =
+    /there\s+was\s+a\s+problem\s+providing\s+the\s+content\s+you\s+requested/i.test(
+      text,
+    ) && /\breference\s+number\b/i.test(text);
+  const akamaiRefusal =
+    /^access\s+denied$/i.test(title) &&
+    /you\s+don['’]?t\s+have\s+permission\s+to\s+access\b/i.test(text);
+  const cloudflareRefusal =
+    /\|\s*cloudflare\s*$/i.test(title) &&
+    /sorry,\s+you\s+have\s+been\s+blocked|you\s+are\s+being\s+rate\s+limited/i.test(
+      text,
+    );
+  const tooManyRequests =
+    /^(?:429\s+)?too\s+many\s+requests$/i.test(title) &&
+    /too\s+many\s+requests|rate[\s-]?limit/i.test(text);
+  if (
+    refusalStructural ||
+    elsevierRefusal ||
+    akamaiRefusal ||
+    cloudflareRefusal ||
+    tooManyRequests
+  )
+    return { kind: "provider_block" };
   // Two independent page-authored signals are required. An article can have a
   // title about server errors; a transport error also carries the provider's
   // own failure sentence. These pairs come from retained live captures:
@@ -3382,6 +3420,9 @@ export class Bridge {
    * memory by design (see confirmThenBlockChallenge): losing it raises nothing,
    * which is the safe direction. */
   private readonly challengeConfirmations = new Map<string, number>();
+  /** job_id -> the tab whose provider-refusal reading awaits confirmation.
+   * Same worker-memory stance as challengeConfirmations. */
+  private readonly providerBlockConfirmations = new Map<string, number>();
   /** Jobs whose work window was already raised for a detected IdP failure this
    * worker lifetime, so a bounded re-drive loop cannot yank focus repeatedly.
    * Cleared on job removal. */
@@ -4247,6 +4288,7 @@ export class Bridge {
     this.federatedLoginRouteEvents.delete(jobID);
     this.classifyRetries.delete(jobID);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
+    this.handoffOutcomeSent.delete(`${jobID}:rate_limited`);
     this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
   }
 
@@ -14381,19 +14423,27 @@ export class Bridge {
   /** True only on a positive, current reading of a live challenge on the job's
    * own tab. Every failure to read is a false: see recheckChallengeBlocks. */
   private async challengeStillPresent(job: ActiveJob): Promise<boolean> {
-    if (job.tab_id < 0) return false;
+    const kind = await this.currentDrivenPageAssessment(job);
+    return kind === "challenge" || kind === "redirect_loop";
+  }
+
+  /** The job's own tab, assessed now; undefined when it cannot be read. */
+  private async currentDrivenPageAssessment(
+    job: ActiveJob,
+  ): Promise<DrivenPageAssessmentKind | undefined> {
+    if (job.tab_id < 0) return undefined;
     let tab: TabInfo;
     try {
       tab = await this.deps.tabs.get(job.tab_id);
     } catch {
-      return false;
+      return undefined;
     }
-    if (tab.url === undefined) return false;
+    if (tab.url === undefined) return undefined;
     let host: string;
     try {
       host = new URL(tab.url).hostname.toLowerCase();
     } catch {
-      return false;
+      return undefined;
     }
     try {
       const results = await this.deps.scripting.executeScript({
@@ -14401,11 +14451,10 @@ export class Bridge {
         func: assessDrivenPage,
         args: [null, host === OPENATHENS_LOGIN_HOST],
       });
-      const assessment = results[0]?.result as DrivenPageAssessment | undefined;
-      return assessment?.kind === "challenge" || assessment?.kind === "redirect_loop";
+      return (results[0]?.result as DrivenPageAssessment | undefined)?.kind;
     } catch (e) {
-      console.error("papio: challenge recheck could not read the page", e);
-      return false;
+      console.error("papio: driven-page recheck could not read the page", e);
+      return undefined;
     }
   }
 
@@ -14937,6 +14986,8 @@ export class Bridge {
     this.handoffOutcomeSent.delete(`${jobID}:stale_sso`);
     this.handoffOutcomeSent.delete(`${jobID}:auth_error`);
     this.handoffOutcomeSent.delete(`${jobID}:ui_changed`);
+    this.handoffOutcomeSent.delete(`${jobID}:rate_limited`);
+    this.providerBlockConfirmations.delete(jobID);
     this.genericEvidence.delete(jobID);
     this.challengeBlockedOutcomeSent.delete(`${jobID}:challenge_blocked`);
     this.authFailureSurfaced.delete(jobID);
@@ -15358,6 +15409,78 @@ export class Bridge {
     }
     await this.parkHandoffForManual(job.job_id);
     await this.syncConnectionBadge();
+  }
+
+  /** Report a provider refusal only once it PERSISTS, for the same reason a
+   * challenge must (CHALLENGE_CONFIRM_MS): an interstitial that clears by
+   * itself inside the window is a stage, not a refusal. A reading that clears
+   * gets one ordinary classification retry, because a page that changes
+   * without a navigation would otherwise never be classified again. */
+  private async confirmThenReportProviderBlock(
+    job: ActiveJob,
+    currentHost: string,
+    currentURL?: string,
+  ): Promise<void> {
+    const tabID = job.tab_id;
+    if (this.providerBlockConfirmations.get(job.job_id) === tabID) return;
+    this.providerBlockConfirmations.set(job.job_id, tabID);
+    this.deps.setTimeout(async () => {
+      await this.ready;
+      if (this.providerBlockConfirmations.get(job.job_id) !== tabID) return;
+      this.providerBlockConfirmations.delete(job.job_id);
+      const current = findByJob(this.store, job.job_id);
+      if (current === undefined || current.tab_id !== tabID) return;
+      if ((await this.currentDrivenPageAssessment(current)) !== "provider_block") {
+        this.scheduleClassifyRetry(current.job_id);
+        return;
+      }
+      await this.reportProviderBlock(current, currentHost, currentURL);
+    }, CHALLENGE_CONFIRM_MS);
+  }
+
+  /** A provider refused the browser (Elsevier's refusal page, a Cloudflare or
+   * Akamai block). No human step on the page can pass it, so this is neither a
+   * challenge ask nor adapter drift: cool the host with the challenge cooldown,
+   * so the drain and new offers stop touching it, and report `rate_limited`,
+   * which the daemon answers with a retry_wait and no drift latch. */
+  private async reportProviderBlock(
+    job: ActiveJob,
+    currentHost: string,
+    currentURL?: string,
+  ): Promise<void> {
+    // A host no adapter or offer names still refused the browser itself.
+    const providerHost =
+      this.challengeHostFor(job, currentHost, currentURL) ??
+      registrableProviderHost(currentHost);
+    if (providerHost !== undefined) {
+      const expiresAt = this.deps.now() + CHALLENGE_COOLDOWN_MS;
+      await this.update((store) => ({
+        ...store,
+        challengeCooldowns: {
+          ...(store.challengeCooldowns ?? {}),
+          [providerHost]: expiresAt,
+        },
+      }));
+      this.scheduleChallengeCooldownExpiry(providerHost, expiresAt);
+    }
+    const outcomeKey = `${job.job_id}:rate_limited`;
+    if (this.handoffOutcomeSent.has(outcomeKey)) return;
+    const host = await this.reportableHost(job.tab_id);
+    if (
+      !this.send(
+        "provider_outcome",
+        {
+          outcome: "rate_limited",
+          detail:
+            "The provider refused the browser with a block page; papio paused this provider and will retry later.",
+          ...(host === undefined ? {} : { host }),
+        },
+        job.job_id,
+      )
+    )
+      return;
+    this.handoffOutcomeSent.add(outcomeKey);
+    await this.settleHandoffAfterOutcome(job.job_id, "rate_limited");
   }
   /** Retire a challenge ask and report whether this job now HOLDS A DRIVE
    * SLOT. The two callers use that as their gate, so the name undersells it:
@@ -18524,6 +18647,10 @@ export class Bridge {
         await this.retryProviderLoadFailure(job);
         return true;
       }
+      if (assessment?.kind === "provider_block") {
+        await this.confirmThenReportProviderBlock(job, host, url);
+        return true;
+      }
       if (
         assessment?.kind === "challenge" ||
         assessment?.kind === "redirect_loop"
@@ -20054,6 +20181,12 @@ export class Bridge {
       }
       const currentJob = findByJob(this.store, job.job_id);
       if (currentJob === undefined) return;
+      // A host papio has no adapter for can refuse the browser too. That is a
+      // provider block, not a coverage gap for the generic path or the agent.
+      if ((await this.currentDrivenPageAssessment(currentJob)) === "provider_block") {
+        await this.confirmThenReportProviderBlock(currentJob, host, live.url);
+        return;
+      }
       const captured = await this.recordUnknown(currentJob, host);
       if ((!missingAdapterAfterAuth || this.agentFallbackAvailable()) && await this.runGenericOnSettledUnknown(currentJob)) return;
       const agentStart = this.startAgentFallback(findByJob(this.store, job.job_id) ?? currentJob);
@@ -20144,6 +20277,7 @@ export class Bridge {
       const result = results[0]?.result as DrivenPageAssessment | undefined;
       if (
         result?.kind === "challenge" ||
+        result?.kind === "provider_block" ||
         result?.kind === "redirect_loop" ||
         result?.kind === "load_failure" ||
         result?.kind === "normal"
@@ -20158,6 +20292,10 @@ export class Bridge {
     }
     if (assessmentKind === "load_failure") {
       await this.retryProviderLoadFailure(currentJob);
+      return undefined;
+    }
+    if (assessmentKind === "provider_block") {
+      await this.confirmThenReportProviderBlock(currentJob, host);
       return undefined;
     }
     if (assessmentKind === "challenge" || assessmentKind === "redirect_loop") {
@@ -20937,6 +21075,8 @@ export class Bridge {
       : "Article agent fallback stopped because the page check returned no recognized refusal reason.";
     const noControlDetail = "Article agent fallback found no usable article control.";
     const noProgressDetail = "Article agent fallback stopped because the clicked control produced no observable article change after a brief wait; operator review is required.";
+    const providerBlockDetail = "Article agent fallback stopped: the provider refused the browser with a block page.";
+    let providerRefused = false;
     let track: DownloadTrack | undefined;
     let entryURL: string | undefined;
     let documentID: string | undefined;
@@ -21198,6 +21338,7 @@ export class Bridge {
       if (!started) { if (start.kind !== "response") exitDetail = unavailableDetail; return; }
       if (!(await awaitPageReady())) return;
       let identityReobserved = false;
+      let refusalRechecked = false;
       for (let decisions = 0; decisions < 60 && authorized();) {
         if (!(await liveTab()) || !authorized()) return;
         const observed = (await this.deps.scripting.executeScript({
@@ -21220,6 +21361,23 @@ export class Bridge {
               if (!(await awaitPageReady())) return;
               continue;
             }
+          }
+          // A provider refusal page carries no DOI, so it arrives here as
+          // identity_missing. It is the provider's block, not the adapter's
+          // drift: report it as one once it persists past the confirmation
+          // window, and give a reading that clears one more settled look.
+          if (observed?.status === "blocked" && observed.reason === "identity_missing" && !refusalRechecked &&
+            (await this.currentDrivenPageAssessment(job)) === "provider_block") {
+            refusalRechecked = true;
+            await wait(CHALLENGE_CONFIRM_MS);
+            if (!authorized()) return;
+            if ((await this.currentDrivenPageAssessment(job)) === "provider_block") {
+              providerRefused = true;
+              exitDetail = providerBlockDetail;
+              return;
+            }
+            if (!(await awaitPageReady())) return;
+            continue;
           }
           return;
         }
@@ -21460,7 +21618,10 @@ export class Bridge {
       }
       const current = sameEpoch();
       if (!downloaded() && current !== undefined && this.handoffDrives.get(jobID) === drive &&
-        (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending")) await this.emitGenericUnknown(jobID, reportDetail(), epoch);
+        (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending")) {
+        if (providerRefused && entryURL !== undefined) await this.reportProviderBlock(current, new URL(entryURL).hostname, entryURL);
+        else await this.emitGenericUnknown(jobID, reportDetail(), epoch);
+      }
     }
   }
 
@@ -21976,15 +22137,16 @@ export class Bridge {
    * The steering window switched itself off at precisely the moment the
    * action asking the researcher to download was created.
    *
-   * `no_entitlement` opens no browser action — the daemon requeues or parks
-   * the job elsewhere — so the browser record dies with its parked surface. */
+   * `no_entitlement` and `rate_limited` open no browser action — the daemon
+   * requeues, retries later, or parks the job elsewhere — so the browser
+   * record dies with its parked surface. */
   private async settleHandoffAfterOutcome(
     jobID: string,
-    outcome: "ui_changed" | "wrong_work" | "no_entitlement",
+    outcome: "ui_changed" | "wrong_work" | "no_entitlement" | "rate_limited",
   ): Promise<void> {
     const job = findByJob(this.store, jobID);
     if (job === undefined) return;
-    if (outcome === "no_entitlement") {
+    if (outcome === "no_entitlement" || outcome === "rate_limited") {
       // This browser-side drive is explicitly parked and has no provider
       // effect left. `job_inactive` races the daemon's no-entitlement requeue:
       // once rediscovery opens a document-delivery action the job is active

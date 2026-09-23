@@ -597,6 +597,35 @@ for (const urlChanged of [false, true]) test(`a full page without a DOI is re-ob
   expect(h.counts().observations).toBe(urlChanged ? 2 : 1);
 });
 
+// Measured 2026-09-23: Elsevier served its refusal page in place of four
+// articles, the agent read it as identity_missing, and the daemon latched
+// sciencedirect drift. The provider refused the browser; nothing drifted.
+test("a provider refusal page that persists ends the agent as rate_limited, not identity_missing drift", async () => {
+  const refusal = new Window({ url });
+  refusal.document.write(readFileSync(new URL("../fixtures/sciencedirect/blocked.html", import.meta.url), "utf8"));
+  const h = await harness();
+  const execute = h.deps.scripting.executeScript;
+  h.deps.scripting.executeScript = async injection => injection.func === assessDrivenPage
+    ? [{ result: assessDrivenPage(h.win.document as unknown as Document) }] : execute(injection);
+  await h.classify();
+  // The provider swaps the article for its refusal page once the drive starts.
+  h.win.document.head.innerHTML = refusal.document.head.innerHTML;
+  h.win.document.body.innerHTML = refusal.document.body.innerHTML;
+  await h.started();
+  await until(() => h.timers.some(timer => timer.ms === 8000) || h.frames.some(f => f.type === "provider_drive_epoch_result_request"));
+  const confirmation = h.timers.findIndex(timer => timer.ms === 8000);
+  if (confirmation >= 0) { h.advance(8000); h.timers.splice(confirmation, 1)[0]!.fn(); }
+  await h.settle();
+  await until(() => h.frames.some(f => f.type === "provider_outcome"));
+  const outcomes = h.frames.filter(f => f.type === "provider_outcome");
+  expect(outcomes.map(f => f.payload["outcome"])).toEqual(["rate_limited"]);
+  expect(outcomes[0]!.payload["host"]).toBe("unregistered.example");
+  expect(String(outcomes[0]!.payload["detail"])).not.toContain("identity_missing");
+  expect(h.backend.store.challengeCooldowns).toEqual({ "unregistered.example": h.now() + 600_000 });
+  expect(h.frames.some(f => f.type === "agent_decide_request_v1")).toBe(false);
+  expect(h.counts().actions).toBe(0);
+});
+
 for (const [html, reason, message] of [
   ['<input type="password" value="PRIVATESECRET">', "credentials_required", "credential gate"],
   ['<iframe title="CAPTCHA PRIVATESECRET"></iframe>', "challenge_required", "CAPTCHA challenge"],

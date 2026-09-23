@@ -5260,6 +5260,74 @@ func latchEvents(t *testing.T, jobs *job.Store, id string) []map[string]any {
 	return out
 }
 
+// Measured 2026-09-23: four ScienceDirect jobs met Elsevier's refusal page and
+// ended as ui_changed with a sciencedirect drift latch. The extension now
+// reports that page as rate_limited. The daemon must not latch drift for it,
+// must retry the job later, and must leave a host cooldown its own drivers can
+// read. The ui_changed control proves this setup does produce a drift latch,
+// so the empty latch list is not vacuous.
+func TestProviderBlockOutcomeCoolsHostAndRetriesWithoutDriftLatch(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	runSync(t, b, helloWithAdapterVersions(t, "1.0.0", map[string]string{"sciencedirect": "0.8.2"}))
+	frame := func(outcome string) map[string]any {
+		return map[string]any{
+			"outcome": outcome, "adapter_id": "sciencedirect", "adapter_version": "0.8.2",
+			"host": "www.sciencedirect.com",
+		}
+	}
+	control := park(t, jobs, "wr_block_control", handoffWork())
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, control, frame("ui_changed")))
+	if got := len(latchEvents(t, jobs, control)); got != 1 {
+		t.Fatalf("control ui_changed latch events = %d, want 1", got)
+	}
+
+	id := park(t, jobs, "wr_block_page", handoffWork())
+	runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, frame("rate_limited")))
+	if latches := latchEvents(t, jobs, id); len(latches) != 0 {
+		t.Fatalf("provider block wrote latches %#v, want none", latches)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateRetryWait || row.RetryAt == "" {
+		t.Fatalf("state = %s retry_at = %q, want retry_wait with a retry time", row.State, row.RetryAt)
+	}
+	retryAt, err := time.Parse(time.RFC3339Nano, row.RetryAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open actions = %#v, want none: nothing on a refusal page is for a human", open)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cooldowns []map[string]any
+	for _, event := range events {
+		if event["kind"] == job.ProviderCooldownEvent {
+			detail, _ := event["detail"].(map[string]any)
+			cooldowns = append(cooldowns, detail)
+		}
+	}
+	if len(cooldowns) != 1 || cooldowns[0]["host"] != "www.sciencedirect.com" {
+		t.Fatalf("cooldown events = %#v, want one for www.sciencedirect.com", cooldowns)
+	}
+	until, err := time.Parse(time.RFC3339Nano, stringDetail(cooldowns[0], "until"))
+	if err != nil {
+		t.Fatalf("cooldown until: %v", err)
+	}
+	if until.Before(retryAt.Add(-time.Second)) || until.After(retryAt.Add(time.Second)) {
+		t.Fatalf("cooldown until %s, want the job's retry time %s", until, retryAt)
+	}
+}
+
 func TestProviderWrongWorkLatchBlocksAutomaticBrowserOffer(t *testing.T) {
 	b, jobs, cfg, _ := newBridge(t)
 	ctx := context.Background()

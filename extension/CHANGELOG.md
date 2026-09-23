@@ -33,6 +33,17 @@ for the full pre-split extension history.
   pinned or in front of you.
 
 ### Fixed
+- **A provider that refuses the browser is no longer reported as adapter
+  drift.** On 2026-09-23 ScienceDirect served Elsevier's "There was a problem
+  providing the content you requested" page instead of four articles. papio
+  read it as an unrecognised page, the article agent stopped with
+  `identity_missing`, and the daemon latched ScienceDirect drift. papio now
+  recognises refusal pages (Elsevier's refusal page, Cloudflare block and
+  rate-limit pages, Akamai "Access Denied", HTTP 429) by their markup first and
+  their text second. A refusal that is still there after 8 seconds pauses that
+  provider for 10 minutes and reports `rate_limited`, so the daemon retries the
+  paper later. A page that clears by itself inside those 8 seconds is not
+  reported. A Cloudflare "Just a moment..." check is still a check you solve.
 - **Nature pages now download, including Nature news items.** Every Nature page
   shows the same PDF control three times, so the Nature adapter refused every
   download as ambiguous. Adapter 0.2.0 uses the sidebar control and reads the

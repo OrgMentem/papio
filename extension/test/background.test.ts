@@ -4,7 +4,7 @@
 // emitter awaits the handler promises it triggers, so the flow is deterministic.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 
 import {
@@ -7590,6 +7590,139 @@ test("driven-page assessment separates challenge, load failure, redirect loop, a
   expect(registrableProviderHost("journals.example.co.uk")).toBe(
     "example.co.uk",
   );
+});
+
+/** fixtures/sciencedirect/blocked.html: Elsevier's refusal page, served in
+ * place of four articles on 2026-09-23 (reference number, IP address, user
+ * agent and timestamp redacted). */
+function scienceDirectBlockPage(): Document {
+  const html = readFileSync(
+    new URL("../fixtures/sciencedirect/blocked.html", import.meta.url),
+    "utf8",
+  );
+  const page = new Window({
+    url: "https://www.sciencedirect.com/science/article/pii/S0000000000000000",
+  });
+  page.document.write(html);
+  return page.document as unknown as Document;
+}
+
+test("a provider refusal page assesses as a provider block, not a challenge or a normal page", () => {
+  const blocked = scienceDirectBlockPage();
+  expect(assessDrivenPage(blocked)).toEqual({ kind: "provider_block" });
+  // Nothing on a refusal page is for a human to solve.
+  expect(isBotChallenge(blocked)).toBe(false);
+  const page = (html: string): Document => {
+    const window = new Window({ url: "https://www.example.com/article/1" });
+    window.document.write(html);
+    return window.document as unknown as Document;
+  };
+  for (const html of [
+    // Akamai reference page.
+    "<html><head><title>Access Denied</title></head><body><h1>Access Denied</h1>" +
+      "You don't have permission to access \"/article/1\" on this server.<p>Reference #18.1.1</p></body></html>",
+    // Cloudflare block and rate-limit pages, by their own markers.
+    '<html><head><title>Attention Required! | Cloudflare</title></head><body><h1 data-translate="block_headline">Sorry, you have been blocked</h1></body></html>',
+    '<html><head><title>Access denied</title></head><body><h2 data-translate="rate_limited">You are being rate limited</h2></body></html>',
+    "<html><head><title>Attention Required! | Cloudflare</title></head><body>Sorry, you have been blocked</body></html>",
+    "<html><head><title>429 Too Many Requests</title></head><body><h1>Too Many Requests</h1></body></html>",
+  ])
+    expect(assessDrivenPage(page(html))).toEqual({ kind: "provider_block" });
+  // One signal is not a refusal: articles about these subjects stay normal.
+  for (const html of [
+    "<html><head><title>Access Denied</title></head><body><article>A history of censorship.</article></body></html>",
+    "<html><head><title>Rate limits in networks</title></head><body><article>Too many requests overwhelm a server.</article></body></html>",
+    "<html><head><title>Support</title></head><body><article>There was a problem providing the content you requested.</article></body></html>",
+  ])
+    expect(assessDrivenPage(page(html))).toEqual({ kind: "normal" });
+  // A Cloudflare managed challenge is still a challenge, not a refusal.
+  expect(
+    assessDrivenPage(page("<html><head><title>Just a moment...</title></head><body></body></html>")),
+  ).toEqual({ kind: "challenge" });
+  // No other committed capture, articles and walls alike, reads as a refusal.
+  const root = new URL("../fixtures/", import.meta.url);
+  let swept = 0;
+  for (const provider of readdirSync(root, { withFileTypes: true })) {
+    if (!provider.isDirectory()) continue;
+    for (const name of readdirSync(new URL(`${provider.name}/`, root))) {
+      if (!name.endsWith(".html") || `${provider.name}/${name}` === "sciencedirect/blocked.html") continue;
+      const html = readFileSync(new URL(`${provider.name}/${name}`, root), "utf8");
+      const window = new Window({
+        url: "https://fixture.local/",
+        settings: { disableJavaScriptEvaluation: true, disableJavaScriptFileLoading: true, disableCSSFileLoading: true },
+      });
+      window.document.write(html);
+      expect([provider.name, name, assessDrivenPage(window.document as unknown as Document).kind])
+        .not.toEqual([provider.name, name, "provider_block"]);
+      swept++;
+    }
+  }
+  expect(swept).toBeGreaterThan(50);
+}, 30_000);
+
+// Measured 2026-09-23: four ScienceDirect jobs met Elsevier's refusal page, the
+// planner read it as unknown, and the article agent stopped with
+// identity_missing and latched sciencedirect drift. The provider had refused
+// the browser; the adapter had not drifted.
+test("Elsevier's refusal page reports rate_limited and cools the host instead of drift", async () => {
+  const blocked = scienceDirectBlockPage();
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage)
+      return [{ result: assessDrivenPage(blocked) }];
+    if (injection.func === isBotChallenge)
+      return [{ result: isBotChallenge(blocked) }];
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "unknown" });
+    return [];
+  };
+  const jobID = "job_elsevier_block";
+  await classifyProviderUnknown(h, jobID);
+
+  const outcomes = h.frames().filter((frame) => frame.type === "provider_outcome");
+  expect(outcomes.map((frame) => frame.payload["outcome"])).toEqual(["rate_limited"]);
+  expect(outcomes[0]?.payload["host"]).toBe(PROVIDER_HOST);
+  expect(outcomes[0]?.payload["adapter_id"]).toBeUndefined();
+  expect(h.backend.store.challengeCooldowns).toEqual({
+    "jstor.org": h.clock.now + 600_000,
+  });
+  expect(
+    h.frames().some((frame) => frame.type === "error" && frame.payload["code"] === "challenge_blocked"),
+  ).toBe(false);
+  expect(h.frames().some((frame) => frame.type === "page_capture")).toBe(false);
+  expect(h.backend.store.activeJobs.some((job) => job.job_id === jobID)).toBe(false);
+});
+
+test("a refusal page that clears inside the confirmation window is never reported", async () => {
+  const blocked = scienceDirectBlockPage();
+  let refusing = true;
+  const h = makeHarness();
+  h.deps.adapterSpecs.push(PROVIDER_ADAPTER);
+  h.deps.permissions.contains = async () => true;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage)
+      return [{ result: refusing ? assessDrivenPage(blocked) : { kind: "normal" } }];
+    if (injection.func === planExecution)
+      return plannerResult(injection, { kind: "unknown" });
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ daemon_version: CURRENT_DAEMON, role: "holder" }));
+  await h.port.inbound(jobOffer("job_refusal_transient"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const url = `https://${PROVIDER_HOST}/stable/refusal`;
+  h.tabs.seed({ id: tabID, url });
+  await h.tabs.completeNavigation(tabID, url);
+  expect(h.timers.some((timer) => timer.ms === 8_000)).toBe(true);
+
+  refusing = false;
+  await settleChallengeConfirmation(h);
+
+  expect(h.frames().some((frame) => frame.type === "provider_outcome")).toBe(false);
+  expect(h.backend.store.challengeCooldowns ?? {}).toEqual({});
+  expect(h.backend.store.activeJobs[0]?.job_id).toBe("job_refusal_transient");
 });
 
 test("a provider-authored load failure reloads three times and never records drift", async () => {

@@ -8459,8 +8459,23 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		return err
 
 	case "rate_limited":
+		// The provider refused the browser (a block or rate-limit page). The
+		// drive is over and the route is not disproven: release its binding,
+		// record the host's cooldown where the daemon's own drivers can read
+		// it, and retry the job after the cooldown. No drift latch is written
+		// (recordProviderLatch ignores this outcome): the adapter did not drift.
+		b.retireFinishedProviderBinding(ctx, jobID, p.Outcome)
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 			return err
+		}
+		if host := strings.ToLower(strings.TrimSpace(p.Host)); host != "" {
+			if err := b.jobs.RecordEvent(ctx, jobID, job.ProviderCooldownEvent, map[string]any{
+				"host":    host,
+				"until":   b.now().Add(b.actionExpiry()).UTC().Format(time.RFC3339Nano),
+				"outcome": p.Outcome,
+			}); err != nil {
+				return err
+			}
 		}
 		return b.leaveHandoff(ctx, jobID, job.StateRetryWait, p.Outcome)
 
