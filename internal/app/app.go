@@ -605,7 +605,7 @@ func (s *Service) reuseAcceptedReview(ctx context.Context, row *job.Row) (bool, 
 		job.WithCandidate(stored.ID)); err != nil {
 		return false, err
 	}
-	accepted, parked, err := s.validateAcceptedReview(ctx, row, stored, result, binding.QuarantineSHA256)
+	accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
 	if err != nil {
 		return false, err
 	}
@@ -3661,21 +3661,12 @@ func (s *Service) materializeDeferredIdentityReview(ctx context.Context, jobID s
 }
 
 func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, leaseOwners ...*string) (accepted, parked bool, err error) {
-	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result, "", s.parkConclusiveIdentityReview, leaseOwners...)
-}
-
-// validateAcceptedReview re-validates the quarantined bytes an operator
-// accepted, bound to the digest the accept named. Every structural and safety
-// check still runs; only the identity objection the operator overruled is
-// waived, and only while the bytes still hash to acceptedSHA256.
-func (s *Service) validateAcceptedReview(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, acceptedSHA256 string) (accepted, parked bool, err error) {
-	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result, acceptedSHA256, s.parkConclusiveIdentityReview)
-}
-
-func (s *Service) parkConclusiveIdentityReview(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
-	markErr := s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
-	reviewErr := s.openConclusiveIdentityReview(ctx, row.ID, job.StateValidating, review)
-	return true, errors.Join(markErr, reviewErr)
+	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
+		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
+			markErr := s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
+			reviewErr := s.openConclusiveIdentityReview(ctx, row.ID, job.StateValidating, review)
+			return true, errors.Join(markErr, reviewErr)
+		}, leaseOwners...)
 }
 
 // validateFetchCandidate is the only validator entry point allowed to defer a
@@ -3684,7 +3675,7 @@ func (s *Service) parkConclusiveIdentityReview(ctx context.Context, row *job.Row
 func (s *Service) validateFetchCandidate(
 	ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result,
 ) (accepted, parked bool, deferred *conclusiveIdentityReview, err error) {
-	accepted, parked, err = s.validateCandidateWithConclusiveReview(ctx, row, stored, result, "",
+	accepted, parked, err = s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
 		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
 			// Keep the candidate in its durable fetching status until this pass
 			// either binds the review or discards it for a later outcome.
@@ -3702,7 +3693,6 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	row *job.Row,
 	stored *job.Candidate,
 	result fetch.Result,
-	acceptedSHA256 string,
 	onConclusiveReview conclusiveIdentityReviewHandler,
 	leaseOwners ...*string,
 ) (accepted, parked bool, err error) {
@@ -3719,11 +3709,17 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	if err != nil {
 		return false, false, err
 	}
-	// The operator's accept names a digest. It speaks for these bytes only when
-	// they still hash to it and the candidate carries the durable override the
-	// accept wrote; a re-fetch under the same candidate is new bytes, and the
-	// automatic checks judge those again in full.
-	operatorAccepted := stored.ReviewOverride && acceptedSHA256 != "" && strings.EqualFold(acceptedSHA256, result.SHA256)
+	// An operator's identity accept names a digest. It speaks for these bytes
+	// only when they hash to it: a re-fetch under the same candidate that
+	// served other bytes is judged again in full by the automatic checks.
+	var acceptedSHA256 string
+	if stored.ReviewOverride {
+		if acceptedSHA256, err = s.Jobs.AcceptedIdentityReviewSHA256(ctx, stored.ID); err != nil {
+			_ = s.Jobs.FinishAttempt(context.WithoutCancel(ctx), attempt, "error", 0, safeType(err))
+			return false, false, err
+		}
+	}
+	operatorAccepted := acceptedSHA256 != "" && strings.EqualFold(acceptedSHA256, result.SHA256)
 	report, validateErr := s.Validate(ctx, result.TempPath, result.ContentType, validationTarget(anchor, row))
 	if validateErr != nil {
 		if ctx.Err() != nil {
@@ -3753,6 +3749,8 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	// whenever the rewrite fails or the file carries anything else.
 	if sanitized, sanitizedReport, ok := s.sanitizeEmbeddedFiles(ctx, row, stored, result, report); ok {
 		result, report = sanitized, sanitizedReport
+		// A review bound the sanitized rewrite when the first pass made one.
+		operatorAccepted = operatorAccepted || (acceptedSHA256 != "" && strings.EqualFold(acceptedSHA256, result.SHA256))
 	}
 	active := report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
 	needsIdentityReview := report.Text.NeedsReview || report.Identity.Result == pdf.IdentityReview

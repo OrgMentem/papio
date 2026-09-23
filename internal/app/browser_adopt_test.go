@@ -571,6 +571,67 @@ func TestAcceptedAdoptionReviewReusesExactContentOverride(t *testing.T) {
 	}
 }
 
+// Recovery for job_c988…: before the reuse fix, the pass that re-validated the
+// accepted JSTOR copy rejected it, deleted its quarantine copy, and returned
+// the job to awaiting_human while the same file still sat in its adoption
+// directory. Adopting those bytes again finds the content-keyed candidate the
+// operator's accept marked, so the accept holds for them too.
+func TestReadoptingAcceptedForeignDOIBytesPromotesThem(t *testing.T) {
+	svc, jobs := newTestService(t)
+	excerpt := "DOI: 10.2307/48596942\nIt's Time to Broaden the Replicability Conversation\n"
+	svc.Validate = func(_ context.Context, _, _ string, target work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 8},
+			Text:       pdf.TextReport{Chars: int64(len(excerpt)), Excerpt: excerpt},
+			Identity:   pdf.MatchIdentity(excerpt, target),
+		}, nil
+	}
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_readopt_foreign_doi")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "Tackett-ItsTimeBroaden-2017.pdf")
+	if err := os.WriteFile(path, pdfBytes("jstor copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("first adopt: %v", err)
+	}
+	parked, _ := jobs.Get(ctx, id)
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil || parked.State != job.StateNeedsReview || len(actions) != 1 || actions[0].Kind != "verify_identity" {
+		t.Fatalf("unaccepted foreign-DOI adoption: job=%+v actions=%+v err=%v; want needs_review", parked, actions, err)
+	}
+	review := actions[0]
+	if resolution, err := jobs.ResolveReviewCAS(ctx, job.ResolveReviewInput{
+		ActionID: review.ID, Verdict: "accept", ExpectedRevision: review.Revision, ExpectedSHA256: review.QuarantineSHA256,
+	}); err != nil || resolution.Outcome != job.ReviewApplied {
+		t.Fatalf("accept review = %+v, %v", resolution, err)
+	}
+	// Replay the end state the old reuse pass left: candidate invalid, its
+	// quarantine copy deleted, the job parked on a fresh institutional handoff.
+	if err := os.Remove(review.QuarantinePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.MarkCandidate(ctx, review.CandidateID, "invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.ParkWithHumanAction(ctx, id, job.StateFetching, job.StateAwaitingHuman, "openurl_handoff",
+		"institutional handoff", nil, job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("re-adopt accepted bytes: %v", err)
+	}
+	ready, _ := jobs.Get(ctx, id)
+	if ready.State != job.StateReady || ready.ArtifactSHA256 != review.QuarantineSHA256 {
+		t.Fatalf("re-adopted accepted bytes: job=%+v; want ready with sha %s", ready, review.QuarantineSHA256)
+	}
+}
+
 func TestAdoptDownloadRetainsPreparedPublicationOnPromotionError(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Validate = passValidation()

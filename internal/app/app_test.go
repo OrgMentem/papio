@@ -1490,78 +1490,86 @@ func TestAcceptedForeignDOIReviewPromotesTheAcceptedBytes(t *testing.T) {
 }
 
 func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
-	for name, report := range map[string]pdf.ValidationReport{
-		"identity_reject": {
-			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true},
-			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReject},
-		},
-		// An override on the candidate is not an accept of these bytes: only the
-		// sha256-bound reuse of accepted quarantine bytes may waive a foreign DOI.
-		"foreign_doi_reject": {
-			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true},
-			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReject, ForeignDOI: true},
-		},
-		"unsafe_pdf": {
+	const bytesSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	reject := pdf.ValidationReport{
+		Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true},
+		Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReject},
+	}
+	foreignDOI := reject
+	foreignDOI.Identity.ForeignDOI = true
+	// Each case carries the resolved review on the candidate, if any. Only a
+	// verify_identity accept naming these exact bytes answers a foreign DOI.
+	for name, test := range map[string]struct {
+		report     pdf.ValidationReport
+		reviewKind string
+		reviewSHA  string
+	}{
+		"identity_reject":             {report: reject, reviewKind: "verify_identity", reviewSHA: bytesSHA},
+		"foreign_doi_without_accept":  {report: foreignDOI},
+		"foreign_doi_other_bytes":     {report: foreignDOI, reviewKind: "verify_identity", reviewSHA: strings.Repeat("b", 64)},
+		"foreign_doi_unsafe_accepted": {report: foreignDOI, reviewKind: "unsafe_pdf", reviewSHA: bytesSHA},
+		"unsafe_pdf": {report: pdf.ValidationReport{
 			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Encrypted: true},
 			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReview},
-		},
+		}, reviewKind: "verify_identity", reviewSHA: bytesSHA},
 	} {
 		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
 			svc, jobs := newTestService(t)
 			svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
-				return report, nil
+				return test.report, nil
 			}
-			id, err := jobs.CreateRequest(context.Background(), "wr_override_"+name, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
+			id, err := jobs.CreateRequest(ctx, "wr_override_"+name, work.Work{DOI: "10.1002/example"}, "", "", job.Policy{
 				AccessMode: config.ModeConservative, DesiredVersion: "any",
 			}, nil, job.PrincipalUnknown)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := jobs.InsertCandidates(context.Background(), id, []job.Candidate{{
+			if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
 				JobID: id, Source: "fixture", URLRedacted: "https://example.test/" + name + ".pdf", URLKey: name,
 				Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
 				ReviewOverride: true,
 			}}); err != nil {
 				t.Fatal(err)
 			}
-			candidate, _ := jobs.NextPendingCandidate(context.Background(), id)
+			candidate, _ := jobs.NextPendingCandidate(ctx, id)
+			if test.reviewKind != "" {
+				if _, err := jobs.S.DB().ExecContext(ctx, `INSERT INTO human_actions
+					(job_id, kind, status, detail, created_at, resolved_at, candidate_id, quarantine_path, quarantine_sha256)
+					VALUES (?, ?, 'resolved', 'reviewed', '2026-09-23T00:00:00Z', '2026-09-23T00:00:01Z', ?, '/tmp/reviewed.pdf', ?)`,
+					id, test.reviewKind, candidate.ID, test.reviewSHA); err != nil {
+					t.Fatal(err)
+				}
+			}
 			for _, edge := range [][2]string{
 				{job.StateQueued, job.StateResolving},
 				{job.StateResolving, job.StateFetching},
 				{job.StateFetching, job.StateValidating},
 			} {
-				if err := jobs.Transition(context.Background(), id, edge[0], edge[1], nil); err != nil {
+				if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
 					t.Fatal(err)
 				}
 			}
-			row, _ := jobs.Get(context.Background(), id)
+			row, _ := jobs.Get(ctx, id)
 			temp := t.TempDir() + "/candidate.pdf"
 			if err := os.WriteFile(temp, pdfBytes(name), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			// identity_reject and unsafe_pdf run as the operator's own accept of
-			// these exact bytes: neither objection is the one that accept answers.
-			sha := strings.Repeat("a", 64)
-			acceptedSHA := sha
-			if name == "foreign_doi_reject" {
-				acceptedSHA = ""
-			}
-			accepted, parked, err := svc.validateAcceptedReview(context.Background(), row, candidate, fetch.Result{
-				TempPath: temp, SHA256: sha, SniffedMIME: "application/pdf",
-			}, acceptedSHA)
+			accepted, parked, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+				TempPath: temp, SHA256: bytesSHA, SniffedMIME: "application/pdf",
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, _ := jobs.Get(context.Background(), id)
-			switch name {
-			case "identity_reject", "foreign_doi_reject":
-				if accepted || parked || got.State != job.StateFetching {
-					t.Fatalf("identity reject bypassed by override: accepted=%t parked=%t job=%+v", accepted, parked, got)
-				}
-			case "unsafe_pdf":
+			got, _ := jobs.Get(ctx, id)
+			if name == "unsafe_pdf" {
 				if accepted || !parked || got.State != job.StateNeedsReview {
 					t.Fatalf("unsafe PDF bypassed by override: accepted=%t parked=%t job=%+v", accepted, parked, got)
 				}
+				return
+			}
+			if accepted || parked || got.State != job.StateFetching {
+				t.Fatalf("identity reject bypassed by override: accepted=%t parked=%t job=%+v", accepted, parked, got)
 			}
 		})
 	}

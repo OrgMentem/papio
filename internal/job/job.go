@@ -2681,6 +2681,34 @@ func (js *Store) AcceptedReviewBinding(ctx context.Context, jobID string) (*Huma
 	return &binding, nil
 }
 
+// AcceptedIdentityReviewSHA256 returns the digest of the bytes an operator
+// accepted in the latest identity review of candidateID, or "" when there is
+// none. Only verify_identity counts: an unsafe_pdf accept answered a question
+// about active content, never about which work the file is. A resolved review
+// on a candidate that carries review_override was an accept, because a reject
+// cancels the job and never sets the override.
+func (js *Store) AcceptedIdentityReviewSHA256(ctx context.Context, candidateID int64) (string, error) {
+	var sha string
+	err := js.S.DB().QueryRowContext(ctx, `
+		SELECT ha.quarantine_sha256
+		FROM human_actions ha
+		JOIN candidates c ON c.id = ha.candidate_id AND c.job_id = ha.job_id
+		WHERE ha.candidate_id = ?
+		  AND ha.kind = 'verify_identity'
+		  AND ha.status = 'resolved'
+		  AND c.review_override = 1
+		  AND COALESCE(ha.quarantine_sha256, '') <> ''
+		ORDER BY ha.resolved_at DESC, ha.id DESC
+		LIMIT 1`, candidateID).Scan(&sha)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("loading accepted identity review digest: %w", err)
+	}
+	return sha, nil
+}
+
 type openHumanActionOptions struct {
 	binding                    *HumanActionBinding
 	requiresAuth               bool

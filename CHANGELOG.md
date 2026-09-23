@@ -16,11 +16,12 @@ execution records kept during the initial build.
   foreign-DOI rejection over the same bytes, marked them `wrong_work`, and
   sent the job back to acquisition. Measured live 2026-09-23: JSTOR's copy of
   a SAGE article prints JSTOR's own 10.2307 DOI, and the operator's accept was
-  silently overridden. The waiver holds only while the quarantined file still
-  hashes to the SHA-256 the accept named. Every other check still runs, and
-  the same file without an accept still parks for review. The `ready`
-  transition records `reason: review_accepted` and
-  `identity_override: operator`.
+  silently overridden. The waiver holds only for a `verify_identity` accept,
+  and only while the file hashes to the SHA-256 that accept named, so
+  adopting the same file again also promotes it. Other rejects, other bytes,
+  and an `unsafe_pdf` accept still go through every check, and the same file
+  without an accept still parks for review. The `ready` transition records
+  `reason: review_accepted` and `identity_override: operator`.
 - `papio jobs redrive <job-id> --revision <n>` now reopens a `needs_review`
   job whose one open manual download asks the operator to remove an adopted
   file that failed validation and could not be moved to `rejected/`. Once no
