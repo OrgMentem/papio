@@ -246,10 +246,15 @@ installed extensions, or provider grants.
 - [ ] Daemon restart with a papio page open: the reconnect banner appears and
       the page recovers. Use §3's hold procedure: capture the banner during
       step 6 and the recovery at step 8.
-- [ ] A mutation attempted during disconnect fails cleanly, is not replayed on
-      reconnect, and a refresh shows canonical state. Attempt it during step 6
-      of §3's hold procedure. Use an extension-local setting, never a daemon
-      job/action/provider effect.
+- [ ] While disconnected (step 6 of §3's hold procedure), a **daemon-bound**
+      control fails cleanly, or is disabled with the disconnect reason: an
+      inbox row action or the popup's refresh. Look at it; do not click through
+      a real job, action or provider effect. After reconnect nothing is
+      replayed, and a refresh shows canonical state. An **extension-local**
+      setting (catch-up, terms consent) is expected to save while the daemon
+      is down, because it never goes through the daemon; the QA run on
+      cbdf8b99 recorded that as a FAIL against the old wording. Check only
+      that it persists and is still correct after reconnect.
 - [ ] Singleton pages focus the existing tab instead of duplicating; a
       duplicate opened by direct URL does not corrupt shared state.
 - [ ] Badge precedence resolves when several states are simultaneously true
