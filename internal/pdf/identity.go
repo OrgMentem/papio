@@ -183,7 +183,9 @@ func MatchIdentityWithThreshold(text string, target work.Work, titleThreshold fl
 		// title rules below get their turn instead of discarding the candidate.
 		// A slash-run-only difference never reaches here: it was accepted above.
 		if len(conclusiveDOIs) != 0 {
-			return reject("document DOI does not match requested DOI", "document DOI: "+strings.Join(conclusiveDOIs, ", "))
+			decision := reject("document DOI does not match requested DOI", "document DOI: "+strings.Join(conclusiveDOIs, ", "))
+			decision.ForeignDOI = true
+			return decision
 		}
 	}
 

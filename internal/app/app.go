@@ -605,7 +605,7 @@ func (s *Service) reuseAcceptedReview(ctx context.Context, row *job.Row) (bool, 
 		job.WithCandidate(stored.ID)); err != nil {
 		return false, err
 	}
-	accepted, parked, err := s.validateCandidate(ctx, row, stored, result)
+	accepted, parked, err := s.validateAcceptedReview(ctx, row, stored, result, binding.QuarantineSHA256)
 	if err != nil {
 		return false, err
 	}
@@ -3661,12 +3661,21 @@ func (s *Service) materializeDeferredIdentityReview(ctx context.Context, jobID s
 }
 
 func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, leaseOwners ...*string) (accepted, parked bool, err error) {
-	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
-		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
-			markErr := s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
-			reviewErr := s.openConclusiveIdentityReview(ctx, row.ID, job.StateValidating, review)
-			return true, errors.Join(markErr, reviewErr)
-		}, leaseOwners...)
+	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result, "", s.parkConclusiveIdentityReview, leaseOwners...)
+}
+
+// validateAcceptedReview re-validates the quarantined bytes an operator
+// accepted, bound to the digest the accept named. Every structural and safety
+// check still runs; only the identity objection the operator overruled is
+// waived, and only while the bytes still hash to acceptedSHA256.
+func (s *Service) validateAcceptedReview(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, acceptedSHA256 string) (accepted, parked bool, err error) {
+	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result, acceptedSHA256, s.parkConclusiveIdentityReview)
+}
+
+func (s *Service) parkConclusiveIdentityReview(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
+	markErr := s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
+	reviewErr := s.openConclusiveIdentityReview(ctx, row.ID, job.StateValidating, review)
+	return true, errors.Join(markErr, reviewErr)
 }
 
 // validateFetchCandidate is the only validator entry point allowed to defer a
@@ -3675,7 +3684,7 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 func (s *Service) validateFetchCandidate(
 	ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result,
 ) (accepted, parked bool, deferred *conclusiveIdentityReview, err error) {
-	accepted, parked, err = s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
+	accepted, parked, err = s.validateCandidateWithConclusiveReview(ctx, row, stored, result, "",
 		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
 			// Keep the candidate in its durable fetching status until this pass
 			// either binds the review or discards it for a later outcome.
@@ -3693,6 +3702,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	row *job.Row,
 	stored *job.Candidate,
 	result fetch.Result,
+	acceptedSHA256 string,
 	onConclusiveReview conclusiveIdentityReviewHandler,
 	leaseOwners ...*string,
 ) (accepted, parked bool, err error) {
@@ -3709,6 +3719,11 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	if err != nil {
 		return false, false, err
 	}
+	// The operator's accept names a digest. It speaks for these bytes only when
+	// they still hash to it and the candidate carries the durable override the
+	// accept wrote; a re-fetch under the same candidate is new bytes, and the
+	// automatic checks judge those again in full.
+	operatorAccepted := stored.ReviewOverride && acceptedSHA256 != "" && strings.EqualFold(acceptedSHA256, result.SHA256)
 	report, validateErr := s.Validate(ctx, result.TempPath, result.ContentType, validationTarget(anchor, row))
 	if validateErr != nil {
 		if ctx.Err() != nil {
@@ -3741,6 +3756,11 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	}
 	active := report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
 	needsIdentityReview := report.Text.NeedsReview || report.Identity.Result == pdf.IdentityReview
+	// A foreign front-matter DOI is the objection a conclusive review puts to
+	// the operator, so an accept of those bytes answers it. Any other reject
+	// (a non-article marker, a missing title) was never shown as the question
+	// and still discards the candidate.
+	foreignDOIOverride := operatorAccepted && report.Identity.Result == pdf.IdentityReject && report.Identity.ForeignDOI
 	// The conclusive-identity veto: MatchIdentityWithThreshold's foreign-DOI
 	// rejection is gated on wantDOI != "" (identity.go:148-162), so a job
 	// with NO DOI can never be contradicted by the document's own
@@ -3810,7 +3830,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		}
 		s.notifyParked(ctx, row.ID, job.StateNeedsReview)
 		return false, true, nil
-	case report.Identity.Result != pdf.IdentityPass && report.Identity.Result != pdf.IdentityReview:
+	case !foreignDOIOverride && report.Identity.Result != pdf.IdentityPass && report.Identity.Result != pdf.IdentityReview:
 		_ = s.Jobs.FinishAttempt(ctx, attempt, "invalid", 0, "identity_rejected")
 		_ = s.Jobs.MarkCandidate(ctx, stored.ID, "invalid")
 		_ = os.Remove(result.TempPath)
@@ -3823,7 +3843,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		return false, false, err
 	}
 	identityResult := report.Identity.Result
-	if stored.ReviewOverride && needsIdentityReview {
+	if stored.ReviewOverride && (needsIdentityReview || foreignDOIOverride) {
 		identityResult = "user_confirmed"
 	}
 	art := job.Artifact{
@@ -3845,6 +3865,12 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	acceptDetail := map[string]any{"candidate_id": stored.ID, "sha256": result.SHA256}
 	if stored.ReviewOverride && needsIdentityReview {
 		acceptDetail["reason"] = "human_identity_override"
+	}
+	if operatorAccepted && (foreignDOIOverride || conclusiveVeto.Blocks()) {
+		// The ledger must show a human, not a rule, let these bytes through.
+		acceptDetail["reason"] = "review_accepted"
+		acceptDetail["identity_override"] = "operator"
+		acceptDetail["overridden"] = validationConclusiveDOI
 	}
 	publication := job.PublicationInput{
 		ID:               job.NewID("publication"),

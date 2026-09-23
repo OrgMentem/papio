@@ -11,6 +11,16 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- An accepted identity review whose objection was a foreign front-matter DOI
+  now promotes the accepted file. The reuse pass re-ran the automatic
+  foreign-DOI rejection over the same bytes, marked them `wrong_work`, and
+  sent the job back to acquisition. Measured live 2026-09-23: JSTOR's copy of
+  a SAGE article prints JSTOR's own 10.2307 DOI, and the operator's accept was
+  silently overridden. The waiver holds only while the quarantined file still
+  hashes to the SHA-256 the accept named. Every other check still runs, and
+  the same file without an accept still parks for review. The `ready`
+  transition records `reason: review_accepted` and
+  `identity_override: operator`.
 - An empty browser `job_reject` no longer ends a job as
   `unavailable / browser_rejected`. The frame carries no reason, and the
   extension sent it only when it had lost its own offer URL. The job now stays

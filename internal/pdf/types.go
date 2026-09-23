@@ -64,4 +64,9 @@ const (
 type IdentityDecision struct {
 	Result   string
 	Evidence []string
+	// ForeignDOI marks a reject that rests only on a front-matter DOI
+	// contradicting the requested one. It is the one objection an operator's
+	// accept of the exact bytes may overrule: the same article carries a
+	// second DOI when an aggregator (JSTOR's 10.2307) re-issues it.
+	ForeignDOI bool
 }

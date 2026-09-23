@@ -1413,11 +1413,93 @@ func TestAcceptedIdentityReviewRedownloadsWhenQuarantineIsMissing(t *testing.T) 
 	}
 }
 
+// Live 2026-09-23: job_c988… parked verify_identity because its PDF was
+// JSTOR's copy of the requested SAGE article, whose front matter prints
+// JSTOR's own 10.2307 DOI. The operator accepted those exact bytes, and the
+// reuse pass re-ran the automatic foreign-DOI rejection over them: wrong_work,
+// then back to acquisition with a fresh handoff. The accept must hold for the
+// sha256-bound bytes it named; the automatic check must still park them first.
+func TestAcceptedForeignDOIReviewPromotesTheAcceptedBytes(t *testing.T) {
+	svc, jobs := newTestService(t)
+	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+		Source: "fixture", URL: "https://example.test/jstor-copy.pdf", Version: resolver.VersionPublished,
+		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: config.Source{Enabled: true}}}
+	fetches := 0
+	svc.Fetch = fakeDownload(&fetches)
+	excerpt := "DOI: 10.2307/48596942\nIt's Time to Broaden the Replicability Conversation\nJennifer L. Tackett\n"
+	svc.Validate = func(_ context.Context, _, _ string, target work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Pages: 8},
+			Text:     pdf.TextReport{Chars: int64(len(excerpt)), Excerpt: excerpt},
+			Identity: pdf.MatchIdentity(excerpt, target),
+		}, nil
+	}
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, doiRequest("wr_foreign_doi_accept"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "first-worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("first claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	parked, _ := jobs.Get(ctx, id)
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil || parked.State != job.StateNeedsReview || len(actions) != 1 || actions[0].Kind != "verify_identity" ||
+		!strings.Contains(actions[0].Detail, "10.2307/48596942") || len(actions[0].QuarantineSHA256) != 64 {
+		t.Fatalf("unaccepted foreign-DOI bytes: job=%+v actions=%+v err=%v; want needs_review on one verify_identity", parked, actions, err)
+	}
+	resolution, err := jobs.ResolveReviewCAS(ctx, job.ResolveReviewInput{
+		ActionID: actions[0].ID, Verdict: "accept", ExpectedRevision: actions[0].Revision,
+		ExpectedSHA256: actions[0].QuarantineSHA256,
+	})
+	if err != nil || resolution.Outcome != job.ReviewApplied || resolution.State != job.StateFetching {
+		t.Fatalf("accept review = %+v, %v", resolution, err)
+	}
+	row, err = jobs.ClaimNext(ctx, "second-worker", time.Minute)
+	if err != nil || row == nil || row.ID != id {
+		t.Fatalf("resumed claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	ready, _ := jobs.Get(ctx, id)
+	if ready.State != job.StateReady || ready.ArtifactSHA256 != actions[0].QuarantineSHA256 || fetches != 1 {
+		t.Fatalf("accepted foreign-DOI bytes: job=%+v fetches=%d; want ready with the accepted sha and no refetch", ready, fetches)
+	}
+	artifact, err := jobs.GetArtifact(ctx, ready.ArtifactSHA256)
+	if err != nil || artifact == nil || artifact.IdentityResult != "user_confirmed" {
+		t.Fatalf("accepted artifact = %+v, %v; want identity user_confirmed", artifact, err)
+	}
+	events, _ := jobs.Events(ctx, id)
+	recorded := false
+	for _, event := range events {
+		detail, _ := event["detail"].(map[string]any)
+		if event["kind"] == "job.transition" && detail["to"] == job.StateReady {
+			recorded = detail["reason"] == "review_accepted" && detail["identity_override"] == "operator"
+		}
+	}
+	if !recorded {
+		t.Fatalf("ready transition does not record the operator override: %+v", events)
+	}
+}
+
 func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
 	for name, report := range map[string]pdf.ValidationReport{
 		"identity_reject": {
 			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true},
 			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReject},
+		},
+		// An override on the candidate is not an accept of these bytes: only the
+		// sha256-bound reuse of accepted quarantine bytes may waive a foreign DOI.
+		"foreign_doi_reject": {
+			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true},
+			Text: pdf.TextReport{Chars: 2000}, Identity: pdf.IdentityDecision{Result: pdf.IdentityReject, ForeignDOI: true},
 		},
 		"unsafe_pdf": {
 			Payload: pdf.PayloadReport{OK: true}, Structural: pdf.StructuralReport{Valid: true, Encrypted: true},
@@ -1457,15 +1539,22 @@ func TestReviewOverrideDoesNotBypassRejectOrUnsafePDF(t *testing.T) {
 			if err := os.WriteFile(temp, pdfBytes(name), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			accepted, parked, err := svc.validateCandidate(context.Background(), row, candidate, fetch.Result{
-				TempPath: temp, SHA256: strings.Repeat("a", 64), SniffedMIME: "application/pdf",
-			})
+			// identity_reject and unsafe_pdf run as the operator's own accept of
+			// these exact bytes: neither objection is the one that accept answers.
+			sha := strings.Repeat("a", 64)
+			acceptedSHA := sha
+			if name == "foreign_doi_reject" {
+				acceptedSHA = ""
+			}
+			accepted, parked, err := svc.validateAcceptedReview(context.Background(), row, candidate, fetch.Result{
+				TempPath: temp, SHA256: sha, SniffedMIME: "application/pdf",
+			}, acceptedSHA)
 			if err != nil {
 				t.Fatal(err)
 			}
 			got, _ := jobs.Get(context.Background(), id)
 			switch name {
-			case "identity_reject":
+			case "identity_reject", "foreign_doi_reject":
 				if accepted || parked || got.State != job.StateFetching {
 					t.Fatalf("identity reject bypassed by override: accepted=%t parked=%t job=%+v", accepted, parked, got)
 				}
