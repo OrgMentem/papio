@@ -1762,3 +1762,19 @@ func TestRunWarnsWhenOneWorkHasTwoLiveJobs(t *testing.T) {
 		t.Fatalf("status = %v once one job is terminal, want Pass (%q)", after.Status, after.Detail)
 	}
 }
+
+func TestRunWarnsOnceAboutIgnoredConfigSettings(t *testing.T) {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = t.TempDir()
+	cfg.IgnoredKeys = []string{"browser.native_viewer_helper"}
+	var found []Check
+	for _, c := range Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil).Checks {
+		if strings.Contains(c.Detail, "native_viewer_helper") {
+			found = append(found, c)
+		}
+	}
+	if len(found) != 1 || found[0].Name != "config_ignored_settings" || found[0].Status != Warn {
+		t.Fatalf("ignored setting checks = %+v", found)
+	}
+}

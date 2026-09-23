@@ -178,6 +178,17 @@ var removedSourceNames = map[string]bool{
 	"openalex_content": true,
 }
 
+// removedFieldKeys are config keys a released papio accepted and this build
+// no longer reads. A config written for that release may still set one, so
+// rejecting it would make the whole file unparseable on upgrade. Load accepts
+// and drops them, naming each in Config.IgnoredKeys so doctor can say so, and
+// Save never writes them again. Every other unknown key stays a hard error.
+var removedFieldKeys = map[string]bool{
+	// The separately built macOS helper that saved a PDF from Firefox's viewer.
+	// The extension now saves that PDF itself (ADR-0029, 2026-09-24).
+	"browser.native_viewer_helper": true,
+}
+
 // validSourceNamesList renders the catalog for error messages, in catalog
 // order, so the names papio accepts and the names it advertises are one list.
 var validSourceNamesList = strings.Join(catalogNames(), ", ")
@@ -309,9 +320,6 @@ type Browser struct {
 	// AdoptionDirName). Setting it elsewhere disables adoption entirely, and
 	// papio doctor fails on exactly that.
 	AdoptionRoot string `toml:"download_adoption_root,omitempty"`
-	// NativeViewerHelper opts into the separately installed native PDF-save
-	// helper. Empty disables it; the first driver supports Firefox on macOS.
-	NativeViewerHelper string `toml:"native_viewer_helper,omitempty"`
 	// ActionExpirySeconds sets browser-offer expiry and the first human-action
 	// reminder threshold. Subsequent reminders back off independently per action.
 	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
@@ -747,6 +755,9 @@ type Config struct {
 
 	// Path this config was loaded from ("" for defaults).
 	Path string `toml:"-"`
+	// IgnoredKeys names removedFieldKeys the file still sets, in file order.
+	// Their values are dropped on load and never read.
+	IgnoredKeys []string `toml:"-"`
 }
 
 // LibraryFingerprint identifies the normalized generic holdings sources. It is
@@ -914,14 +925,29 @@ func Load(path string) (Config, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
 		var missing *toml.StrictMissingError
-		if errors.As(err, &missing) {
-			fields := make([]string, 0, len(missing.Errors))
-			for _, decodeErr := range missing.Errors {
-				fields = append(fields, strings.Join(decodeErr.Key(), "."))
+		if !errors.As(err, &missing) {
+			return cfg, fmt.Errorf("parsing config %s (unknown fields are rejected): %w", path, err)
+		}
+		var fields, ignored []string
+		for _, decodeErr := range missing.Errors {
+			key := strings.Join(decodeErr.Key(), ".")
+			if removedFieldKeys[key] {
+				ignored = append(ignored, key)
+			} else {
+				fields = append(fields, key)
 			}
+		}
+		if len(fields) > 0 {
 			return cfg, fmt.Errorf("config %s contains fields this papio build does not recognize (%s). This usually means the config was written for a newer papio — update papio, or remove those fields: %w", path, strings.Join(fields, ", "), err)
 		}
-		return cfg, fmt.Errorf("parsing config %s (unknown fields are rejected): %w", path, err)
+		// Only removed keys were unknown, so a lenient decode reads exactly
+		// what a strict one would have read, without them.
+		cfg = Default()
+		cfg.Path = path
+		if err := toml.Unmarshal(data, &cfg); err != nil {
+			return cfg, fmt.Errorf("parsing config %s: %w", path, err)
+		}
+		cfg.IgnoredKeys = ignored
 	}
 	if err := cfg.validate(); err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
@@ -931,7 +957,6 @@ func Load(path string) (Config, error) {
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
 	cfg.Browser.AdoptionRoot = expandHome(cfg.Browser.AdoptionRoot)
-	cfg.Browser.NativeViewerHelper = expandHome(cfg.Browser.NativeViewerHelper)
 	cfg.Zotio.Executable = expandHome(cfg.Zotio.Executable)
 	return cfg, nil
 }
@@ -960,10 +985,6 @@ func normalizeLibrarySourcePath(path string) string {
 }
 
 func (c *Config) validate() error {
-	if helper := c.Browser.NativeViewerHelper; helper != "" &&
-		(!filepath.IsAbs(expandHome(helper)) || strings.ContainsAny(helper, "\x00\r\n")) {
-		return errors.New("browser.native_viewer_helper must be an absolute executable path")
-	}
 	if err := c.validateCredentialReferences(); err != nil {
 		return err
 	}

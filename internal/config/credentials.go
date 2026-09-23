@@ -226,6 +226,7 @@ func (c Config) clone() Config {
 	c.Notify.Categories = maps.Clone(c.Notify.Categories)
 	c.Library.Sources = slices.Clone(c.Library.Sources)
 	c.Discovery.Sources = slices.Clone(c.Discovery.Sources)
+	c.IgnoredKeys = slices.Clone(c.IgnoredKeys)
 	if c.Agent != nil {
 		agent := *c.Agent
 		c.Agent = &agent

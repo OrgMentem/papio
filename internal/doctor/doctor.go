@@ -129,6 +129,11 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 			add("config_permissions", Fail, "configuration metadata cannot be read", "check file ownership and permissions")
 		}
 	}
+	if len(cfg.IgnoredKeys) > 0 {
+		add("config_ignored_settings", Warn,
+			"configuration sets "+strings.Join(cfg.IgnoredKeys, ", ")+", which this papio no longer supports; the value is ignored",
+			"delete the setting from the configuration file")
+	}
 
 	if db == nil {
 		add("database", Skip, "database integrity is checked by the daemon", "")
