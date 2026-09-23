@@ -334,6 +334,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Old browser sessions cannot reclaim work after a holder sweep.** The
+  daemon records each swept holder generation before offering work to its
+  replacement. A late claim from the old session now receives a stale response
+  instead of blocking the institution's next job.
 - **Dismissing one human action leaves a job waiting on its other open actions.**
   Closing an obsolete browser handoff no longer cancels a job that still needs
   a terms decision. Dismissing its last open action can still cancel a parked job.

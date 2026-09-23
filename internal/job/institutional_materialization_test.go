@@ -110,6 +110,51 @@ func TestMaterializationClaimRejectsProfileDriftAndTombstones(t *testing.T) {
 	})
 }
 
+func TestMaterializationClaimRejectsSweptHolderGeneration(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID, err := js.CreateRequest(ctx, "materialization-holder-fence", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := institutionalProfile(t, js, "library", "digest-a", "auth-a")
+	candidate := institutionalCandidate(t, js, profile, "candidate-holder-fence", jobID)
+	oldGeneration, err := js.NextMaterializationHolderGeneration(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentGeneration, err := js.NextMaterializationHolderGeneration(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := js.AbandonStaleMaterializations(ctx, currentGeneration); err != nil || count != 0 {
+		t.Fatalf("empty holder sweep = %d, %v", count, err)
+	}
+	input := MaterializationClaimInput{
+		CandidateID: candidate.ID, BrowserHolderGeneration: oldGeneration, JobAttemptRevision: 1,
+		InstitutionProfileRevision: profile.Revision, RouteRevision: 7,
+		MaterializationKind: "browser_tab", LeaseUntil: time.Now().UTC().Add(time.Minute),
+	}
+	if _, err := js.ClaimMaterialization(ctx, input); !errors.Is(err, ErrMaterializationStale) {
+		t.Fatalf("old holder claim = %v, want stale", err)
+	}
+	var count int
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM materialization_claims WHERE candidate_id=?`, candidate.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("old holder created %d claims", count)
+	}
+	input.BrowserHolderGeneration = currentGeneration
+	claim, err := js.ClaimMaterialization(ctx, input)
+	if err != nil {
+		t.Fatalf("current holder claim: %v", err)
+	}
+	if claim.BrowserHolderGeneration != currentGeneration {
+		t.Fatalf("claim holder = %d, want %d", claim.BrowserHolderGeneration, currentGeneration)
+	}
+}
+
 func TestMaterializationClaimExactRetryRecoversBinding(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

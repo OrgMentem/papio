@@ -834,6 +834,23 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Take SQLite's writer lock before reading the sweep marker. A holder
+	// promotion and this claim now serialize: either the sweep retires the
+	// claim, or this transaction sees the completed sweep and refuses it.
+	if _, err := tx.ExecContext(ctx, `UPDATE daemon_authority_key
+		SET fenced_through_generation=fenced_through_generation WHERE singleton=1`); err != nil {
+		return nil, err
+	}
+	var fencedThrough sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT fenced_through_generation
+		FROM daemon_authority_key WHERE singleton=1`).Scan(&fencedThrough)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if fencedThrough.Valid && in.BrowserHolderGeneration <= fencedThrough.Int64 {
+		return nil, ErrMaterializationStale
+	}
+
 	// The candidate's profile is an authority fence, not merely a historical
 	// foreign key. A tombstoned profile or a revision drift invalidates the
 	// candidate before any claim state is inspected or changed.
@@ -1774,6 +1791,20 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if currentGeneration < 1 {
+		return 0, ErrMaterializationStale
+	}
+	// This write and the claim insert share SQLite's writer lock. Keep the
+	// marker through a daemon restart, even when there were no claims to sweep.
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO daemon_authority_key
+		(singleton, hmac_key, created_at) VALUES (1, randomblob(32), ?)`, now); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE daemon_authority_key
+		SET fenced_through_generation=MAX(COALESCE(fenced_through_generation, -1), ?)
+		WHERE singleton=1`, currentGeneration-1); err != nil {
+		return 0, err
+	}
 
 	var retiredBindings []string
 	staleRows, err := tx.QueryContext(ctx, `SELECT binding_id FROM materialization_claims
