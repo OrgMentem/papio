@@ -271,6 +271,8 @@ func (js *Store) SettleOrphanedPermitNoEffect(ctx context.Context, permitID stri
 		args = append(args, kind)
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(orphanPermitEvidenceKinds)), ",")
+	// #nosec G202 -- only generated "?" placeholders enter the query text; the
+	// job ID and event kinds remain bound arguments.
 	rows, err := tx.QueryContext(ctx, `SELECT at FROM events WHERE job_id=? AND kind IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return err
