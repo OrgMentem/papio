@@ -3443,6 +3443,9 @@ export class Bridge {
    * map only remembers the last rung while the worker remains alive; it never
    * decides whether a retry is allowed. */
   private readonly institutionalRetryAttempts = new Map<string, number>();
+  /** Installed before scaffold cleanup can wake another run. Durable alarms
+   * supply the same scheduling gate after a worker restart. */
+  private readonly institutionalBindBackoffs = new Set<string>();
   /** One detached response-loss retry timer per materialization job. */
   private readonly materializationRetryTimers = new Map<string, object>();
   /** One offline-revival timer per materialization job, deliberately SEPARATE
@@ -10653,7 +10656,6 @@ export class Bridge {
             bindOutcome === "not_eligible" &&
             bindResponse.payload["detail"] ===
               "another sign-in for this institution is in progress";
-          await this.removeMaterializationTab(tabID);
           if (institutionBusy) {
             // Retire the scaffold - holding a tab open while another paper
             // signs in is the whole point of this refusal - but KEEP the
@@ -10667,7 +10669,9 @@ export class Bridge {
             // materializeScaffold re-enters by scanning for the binding
             // rather than trusting the removed tab id.
             this.scheduleInstitutionalBindRetry(jobID);
-          } else {
+          }
+          await this.removeMaterializationTab(tabID);
+          if (!institutionBusy) {
             await this.clearMaterializationWorkflow(jobID);
           }
         } else {
@@ -11010,7 +11014,10 @@ export class Bridge {
     }
   }
 
-  private scheduleMaterialization(jobID: string, immediate = false): void {
+  private async scheduleMaterialization(
+    jobID: string,
+    immediate = false,
+  ): Promise<void> {
     // Stop before the workflow, not only before its frames: materializing opens
     // a real browser tab to bind, and a pending session that cannot claim would
     // leave that tab orphaned with nothing to attach it to.
@@ -11047,6 +11054,17 @@ export class Bridge {
       return;
     }
     this.materializationOfflineTimers.delete(jobID);
+    // Every wake (including the run's own finally, governor, and startup)
+    // must honor institutional backoff. Gating only candidate refreshes let
+    // claimed/tabless jobs create and remove scaffolds in a tight loop.
+    try {
+      if (await this.institutionalRetryAlarmPending(jobID)) return;
+    } catch (error) {
+      console.error("papio: institutional retry alarm could not be read", error);
+      return;
+    }
+    // A refusal or holder change can arrive while alarms.get is pending.
+    if (!this.holderRole() || this.institutionalBindBackoffs.has(jobID)) return;
     if (this.materializationRuns.has(jobID)) {
       this.materializationReruns.add(jobID);
       return;
@@ -13914,25 +13932,33 @@ export class Bridge {
   }
 
   private async institutionalRetryAlarmPending(jobID: string): Promise<boolean> {
+    if (this.institutionalBindBackoffs.has(jobID)) return true;
+    if (this.deps.alarms.get === undefined) return false;
     const remembered = this.institutionalRetryAttempts.get(jobID);
     if (remembered !== undefined) {
       const name = this.institutionalRetryAlarmName(jobID, remembered);
-      if (this.deps.alarms.get === undefined) return true;
-      if ((await this.deps.alarms.get(name)) !== undefined) return true;
+      if ((await this.deps.alarms.get(name)) !== undefined) {
+        return true;
+      }
     }
-    if (this.deps.alarms.get === undefined) return false;
     for (let attempt = 1; attempt <= INSTITUTIONAL_RETRY_MAX_ATTEMPTS; attempt += 1) {
       if (
         (await this.deps.alarms.get(
           this.institutionalRetryAlarmName(jobID, attempt),
         )) !== undefined
-      )
+      ) {
+        this.institutionalRetryAttempts.set(
+          jobID,
+          Math.max(attempt, this.institutionalRetryAttempts.get(jobID) ?? 0),
+        );
         return true;
+      }
     }
     return false;
   }
 
   private scheduleInstitutionalBindRetry(jobID: string): void {
+    this.institutionalBindBackoffs.add(jobID);
     const previous = this.institutionalRetryAttempts.get(jobID) ?? 0;
     const attempt = Math.min(
       INSTITUTIONAL_RETRY_MAX_ATTEMPTS,
@@ -13953,7 +13979,7 @@ export class Bridge {
     }
     void this.deps.alarms.get(name).then((existing) => {
       if (existing === undefined) create();
-    });
+    }, create);
   }
 
   private async onInstitutionalRetryAlarm(name: string): Promise<void> {
@@ -13969,7 +13995,9 @@ export class Bridge {
       attempt > INSTITUTIONAL_RETRY_MAX_ATTEMPTS
     )
       return;
+    if (attempt < (this.institutionalRetryAttempts.get(jobID) ?? 0)) return;
     this.institutionalRetryAttempts.set(jobID, attempt);
+    this.institutionalBindBackoffs.delete(jobID);
     await this.ready;
     this.scheduleMaterialization(jobID, true);
   }

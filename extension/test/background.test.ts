@@ -19622,8 +19622,9 @@ test("an offline materialization revives itself when the network returns, with n
   const claim = await h.port.waitForFrame("institutional_claim_request");
   expect(claim.job_id).toBe("job_mat_revive");
 });
-test("institutional bind busy refusal backs off and wakes from its durable alarm", async () => {
+test.each([true, false])("institutional bind busy refusal backs off and wakes from its durable alarm (query API: %s)", async (queryAPI) => {
   const h = makeHarness();
+  if (!queryAPI) delete h.deps.alarms.get;
   await h.bridge.start();
   await h.port.inbound(
     helloAck({
@@ -19662,12 +19663,27 @@ test("institutional bind busy refusal backs off and wakes from its durable alarm
       detail: "another sign-in for this institution is in progress",
     },
   });
-  for (let i = 0; i < 30; i += 1) await Promise.resolve();
+  // Let the detached run finish, including its automatic tabless rerun.
+  for (let i = 0; i < 250; i += 1) await Promise.resolve();
   const alarm = h.alarms.created.find((entry) =>
     entry.name.startsWith("papio-institutional-bind-retry:"),
   );
   expect(alarm).toBeDefined();
   expect(alarm?.info?.when).toBe(h.clock.now + 15_000);
+  expect(h.frames().filter((frame) => frame.type === "institutional_bind_request"))
+    .toHaveLength(1);
+  expect(h.tabs.created).toHaveLength(1);
+
+  // Other wakes used to bypass the offer-only alarm check. An immediate
+  // rerun (including governor release) must not create another scaffold.
+  const scheduling = h.bridge as unknown as {
+    scheduleMaterialization(jobID: string, immediate?: boolean): Promise<void>;
+  };
+  await scheduling.scheduleMaterialization(jobID, true);
+  for (let i = 0; i < 250; i += 1) await Promise.resolve();
+  expect(h.frames().filter((frame) => frame.type === "institutional_bind_request"))
+    .toHaveLength(1);
+  expect(h.tabs.created).toHaveLength(1);
   const claimsBeforeRefresh = h.frames().filter(
     (frame) => frame.type === "institutional_claim_request",
   ).length;
@@ -19678,10 +19694,13 @@ test("institutional bind busy refusal backs off and wakes from its durable alarm
   reoffer.msg_id = "candidate_offer_busy_backoff_0002";
   reoffer.seq = 5;
   await h.port.inbound(reoffer);
-  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  for (let i = 0; i < 250; i += 1) await Promise.resolve();
   expect(
     h.frames().filter((frame) => frame.type === "institutional_claim_request"),
   ).toHaveLength(claimsBeforeRefresh);
+  expect(h.frames().filter((frame) => frame.type === "institutional_bind_request"))
+    .toHaveLength(1);
+  expect(h.tabs.created).toHaveLength(1);
 
   // The alarm is the ONLY wake-up on this path: the daemon leaves the
   // candidate `claimed` and its scheduler re-offers only `eligible` ones, so
@@ -19694,9 +19713,50 @@ test("institutional bind busy refusal backs off and wakes from its durable alarm
   );
   await h.alarms.fire(alarm!.name);
   expect((await retry).job_id).toBe(jobID);
+  expect(h.tabs.created).toHaveLength(2);
   expect(
     h.frames().filter((frame) => frame.type === "institutional_claim_request"),
   ).toHaveLength(claimsBeforeRefresh);
+});
+
+test("a restarted worker honors a durable institutional backoff without a candidate reoffer", async () => {
+  const jobID = "job_mat_restart_backoff";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [{
+      job_id: jobID, tab_id: -1, offered_at: 1_700_000_000_000,
+      expires_at: 1_900_000_000_000, status: "accepted",
+      provider_hosts: [PROVIDER_HOST],
+    }],
+    materializations: { [jobID]: {
+      job_id: jobID, candidate_id: "cand_0001", materialization_kind: "browser_tab",
+      candidate_expires_at: "2030-01-01T00:00:00Z", phase: "claimed", tab_id: -1,
+      claim_id: "claim_0001", binding_id: "bind_0001", browser_holder_generation: 1,
+      lease_until: "2030-01-01T00:00:00Z",
+    } },
+  });
+  const alarm = `papio-institutional-bind-retry:${jobID}:2`;
+  h.alarms.create(alarm, { when: h.clock.now + 30_000 });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["institutional_materialization_v1", "effect_permit_v1"],
+  }));
+  const scheduling = h.bridge as unknown as {
+    scheduleMaterialization(jobID: string, immediate?: boolean): Promise<void>;
+  };
+  await scheduling.scheduleMaterialization(jobID, true);
+  for (let i = 0; i < 250; i += 1) await Promise.resolve();
+  expect(h.tabs.created).toHaveLength(0);
+  expect(h.frames().filter((frame) => frame.type === "institutional_bind_request"))
+    .toHaveLength(0);
+
+  h.clock.now += 30_000;
+  await h.alarms.fire(alarm);
+  const bind = await h.port.waitForFrame("institutional_bind_request");
+  expect(bind.job_id).toBe(jobID);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(h.frames().filter((frame) => frame.type === "institutional_claim_request"))
+    .toHaveLength(0);
 });
 
 test("institutional candidate offer dispatches claim without awaiting the correlated response", async () => {
@@ -20167,10 +20227,6 @@ test("scaffold creation failure retries and converges to one replacement", async
   h.tabs.failCreate = false;
   const bindPromise = h.port.waitForFrame("institutional_bind_request");
   await retryTimer!.fn();
-  for (let i = 0; i < 20; i += 1) await Promise.resolve();
-  expect(h.frames().map((frame) => frame.type)).toContain(
-    "institutional_bind_request",
-  );
   const bind = await bindPromise;
   expect(bind.payload["tab_id"]).toBe(
     h.backend.store.materializations?.["job_mat_scaffold_retry"]?.tab_id,
