@@ -395,6 +395,10 @@ type Bridge struct {
 	// reofferPending prioritizes jobs released by the institutional-session
 	// sweep when poll turns them back into job_offer frames.
 	reofferPending map[string]bool
+	// driveOutcomeDue holds, per job, the deadline for the provider outcome
+	// that must follow a generic drive result with no daemon successor. See
+	// retireSilentProviderDrives.
+	driveOutcomeDue map[string]driveOutcomeWait
 	// directRouteAttempts retains a never-acquired tuple across busy polls.
 	// It is not authorization state; successful acquire is the durable source.
 	directRouteAttempts map[string]string
@@ -696,6 +700,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		cancelAnnounced:        map[string]bool{},
 		authReleased:           map[int64]bool{},
 		reofferPending:         map[string]bool{},
+		driveOutcomeDue:        map[string]driveOutcomeWait{},
 		directRouteAttempts:    map[string]string{},
 		effectPermitReconciles: map[string]pendingEffectPermitReconcile{},
 		reofferSourceJobID:     map[string]string{},
@@ -3825,6 +3830,9 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 								// same tuple, attempt, holder generation, and
 								// safety domain, with the permit still held.
 								outcome, detail = "started", ""
+								// A live drive owns this job again; its own
+								// result re-arms the outcome deadline.
+								delete(b.driveOutcomeDue, jobID)
 							case permitOutcome == job.EffectPermitDuplicate:
 								outcome, detail = "duplicate", "drive epoch was already resolved or fenced"
 							case permitOutcome == job.EffectPermitBusyOutcome:
@@ -3956,6 +3964,13 @@ func (b *Bridge) providerDriveEpochResultForSession(ctx context.Context, jobID s
 							!settledPermit.OperatorOverridden &&
 							(settleOutcome == job.EffectPermitApplied || settleOutcome == job.EffectPermitSettleDuplicate) {
 							b.reofferPending[jobID] = true
+						}
+						if current && settleErr == nil && settleOutcome == job.EffectPermitApplied &&
+							settledPermit != nil && settledPermit.CurrentAtSettlement && !settledPermit.OperatorOverridden &&
+							providerDriveResultAwaitsOutcome(effectOutcome) {
+							b.driveOutcomeDue[jobID] = driveOutcomeWait{
+								due: b.now().Add(providerDriveOutcomeGrace), outcome: effectOutcome,
+							}
 						}
 					}
 				}
@@ -4187,6 +4202,68 @@ func (b *Bridge) termsEffectResult(ctx context.Context, jobID string, p *protoco
 		return nil, err
 	}
 	return []json.RawMessage{frame}, nil
+}
+
+// providerDriveOutcomeGrace bounds the gap between a generic drive's terminal
+// result and the provider outcome that ends its handoff. The extension sends
+// the outcome right after the result is applied (an agent that takes over a
+// candidate settles only when it stops), so this covers transport and a tab
+// lookup, not a drive.
+const providerDriveOutcomeGrace = 30 * time.Second
+
+type driveOutcomeWait struct {
+	due     time.Time
+	outcome string
+}
+
+// providerDriveResultAwaitsOutcome reports whether a generic drive result
+// ends the drive without a daemon successor. not_pdf and cancelled append the
+// next ordinal, and success hands off to delivery; every other result leaves
+// the extension owing one provider outcome.
+func providerDriveResultAwaitsOutcome(outcome string) bool {
+	switch outcome {
+	case "success", "not_pdf", "cancelled":
+		return false
+	default:
+		return true
+	}
+}
+
+// retireSilentProviderDrives ends generic drives whose terminal result was
+// followed by no provider outcome within providerDriveOutcomeGrace. The
+// provider outcome is what retires the navigated claim and resolves the
+// handoff; without it the claim holds its safety domain until lease expiry.
+// Measured live 2026-09-23 (job_2c3c6f40ad69e1e4282a272d25): an `html`
+// result on a Nature page, then silence, kept publisher:doi.org held for the
+// whole 30-minute lease while two sibling papers were never authorized. The
+// daemon records the ending the extension owed, through the one outcome path.
+func (b *Bridge) retireSilentProviderDrives(ctx context.Context) {
+	now := b.now()
+	for jobID, wait := range b.driveOutcomeDue {
+		if now.Before(wait.due) {
+			continue
+		}
+		delete(b.driveOutcomeDue, jobID)
+		row, err := b.jobs.Get(ctx, jobID)
+		if err != nil || row.State != job.StateAwaitingHuman {
+			continue
+		}
+		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+		if err != nil || !slices.ContainsFunc(actions, func(a job.HumanAction) bool { return a.Kind == handoffActionKind }) {
+			continue
+		}
+		outcome := "ui_changed"
+		if wait.outcome == "wrong_work" {
+			outcome = "wrong_work"
+		}
+		detail := fmt.Sprintf("papio daemon: no provider outcome followed the generic drive's %s result within %s; the drive ended", wait.outcome, providerDriveOutcomeGrace)
+		msgID := fmt.Sprintf("drive-outcome-silence-%s-%d", jobID, wait.due.UnixNano())
+		if err := b.outcome(ctx, jobID, msgID, &protocol.ProviderOutcomePayload{Outcome: outcome, Detail: detail}); err != nil {
+			log.Printf("papio: ending silent provider drive for %s: %v", jobID, err)
+			continue
+		}
+		log.Printf("papio: ended provider drive for %s: no provider outcome followed its %s result within %s", jobID, wait.outcome, providerDriveOutcomeGrace)
+	}
 }
 
 func providerDriveStrongOutcome(outcome string) bool {
@@ -8103,6 +8180,8 @@ func (b *Bridge) suppressCurrentRoute(ctx context.Context, jobID string, reason 
 
 // outcome maps a terminal provider observation onto a policy-legal transition.
 func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.ProviderOutcomePayload) (err error) {
+	// The extension spoke for this drive; nothing is owed any longer.
+	delete(b.driveOutcomeDue, jobID)
 	if p.Outcome == "native_viewer_download_required" {
 		row, readErr := b.jobs.Get(ctx, jobID)
 		if readErr != nil {
@@ -10536,6 +10615,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		}
 	}()
 	if b.jobs != nil {
+		b.retireSilentProviderDrives(ctx)
 		if _, err := b.jobs.ReconcileMaterializationClaims(ctx, b.now()); err != nil {
 			b.materializationClaimReconcileUnavailable = true
 			b.materializationScheduleBlocked = true

@@ -11,6 +11,13 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- A generic browser drive that ends without a provider outcome no longer holds
+  its provider safety domain until the 30-minute lease expires. If no outcome
+  follows a drive result that has no daemon successor (for example `html`)
+  within 30 seconds, the daemon ends the drive itself: it retires the claim,
+  resolves the handoff, and opens a manual download task. Sibling papers
+  queued behind that domain are then offered. Measured on a Nature Medicine
+  DOI, where two sibling papers waited behind one silent drive.
 - Accept open PDFs with an Identity `/Crypt` filter when pdfcpu cannot parse
   them and Poppler confirms their page count, encryption state, JavaScript,
   and embedded-file status. Missing checks still leave the PDF rejected.

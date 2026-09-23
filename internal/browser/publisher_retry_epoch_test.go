@@ -4,6 +4,7 @@ package browser
 import (
 	"context"
 	"testing"
+	"time"
 
 	"papio/internal/config"
 	"papio/internal/job"
@@ -192,5 +193,93 @@ func TestPublisherRetryEpochOffersWaitForGlobalPermit(t *testing.T) {
 				t.Fatalf("occupier changed: %+v %v", live, err)
 			}
 		})
+	}
+}
+
+// A generic drive result with no daemon successor ends the drive, and the
+// provider outcome that follows it is what retires the navigated claim.
+// Measured live 2026-09-23 (job_2c3c6f40ad69e1e4282a272d25, Nature Medicine):
+// the extension settled `html` and then sent nothing, so the claim kept
+// publisher:doi.org for its whole 30-minute lease and the two sibling papers
+// queued behind that domain were never authorized. Silence past the grace
+// must end the drive and release the domain; silence inside it must not.
+func TestSilentGenericHTMLResultReleasesSafetyDomainForSibling(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	var offset time.Duration
+	b.now = func() time.Time { return time.Now().Add(offset) }
+	runSync(t, b, helloWithFeatures(t, "0.21.0", institutionalMaterializationFeature, effectPermitFeature, providerDriveEpochV1Feature))
+	const prefix = "silent-html"
+	claim := seedSurfaceCloseClaim(t, b, jobs, prefix, "navigated")
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET lease_until=? WHERE id=?`,
+		time.Now().UTC().Add(30*time.Minute).Format(time.RFC3339Nano), claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := jobs.GetBrowserCandidate(ctx, claim.CandidateID)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate = %+v, %v", candidate, err)
+	}
+	stranded, domain := candidate.JobID, candidate.SafetyDomainID
+	siblingWork := handoffWork()
+	siblingWork.DOI = "10.1002/example.44"
+	sibling := parkInstitutional(t, jobs, "wr_"+prefix+"-sibling", siblingWork, "")
+	explicitMaterializationCandidate(t, jobs, sibling, domain)
+
+	effectPermitOffer(t, jobs, stranded, prefix, domain)
+	tuple := protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: prefix, Ordinal: 0, Strategy: "generic", Revision: "1"}
+	if frames, err := b.providerDriveEpochStart(ctx, stranded, &tuple); err != nil || permitOutcome(t, frames) != "started" {
+		t.Fatalf("start: %v", err)
+	}
+	if frames, err := b.providerDriveEpochResult(ctx, stranded, &protocol.ProviderDriveEpochResultRequestPayload{
+		DriveAttemptID: prefix, Ordinal: 0, Strategy: "generic", Revision: "1",
+		Outcome: "html", Detail: "generic candidate returned HTML",
+	}); err != nil || permitOutcome(t, frames) != "applied" {
+		t.Fatalf("html result: %v", err)
+	}
+	blockedBy := func() string {
+		t.Helper()
+		blocker, err := jobs.HandoffQueueBlocker(ctx, sibling, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocker == nil {
+			return ""
+		}
+		return blocker.JobID
+	}
+
+	offset = providerDriveOutcomeGrace - time.Second
+	runSync(t, b)
+	if got := blockedBy(); got != stranded {
+		t.Fatalf("inside the grace the sibling is blocked by %q, want the live drive %q", got, stranded)
+	}
+
+	offset = providerDriveOutcomeGrace + time.Second
+	runSync(t, b)
+	if got := blockedBy(); got != "" {
+		t.Fatalf("after a silent html result the sibling is still blocked by %q", got)
+	}
+	retired, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil || retired == nil || retired.Phase != "abandoned" {
+		t.Fatalf("stranded claim = %+v, %v; want abandoned", retired, err)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{stranded})
+	if err != nil || len(actions) != 1 || actions[0].Kind != "manual_download" {
+		t.Fatalf("stranded job actions = %+v, %v; want one manual_download", actions, err)
+	}
+	// One ending only: a later poll must not record a second outcome.
+	runSync(t, b)
+	events, err := jobs.Events(ctx, stranded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcomes := 0
+	for _, event := range events {
+		if event["kind"] == "browser.provider_outcome" {
+			outcomes++
+		}
+	}
+	if outcomes != 1 {
+		t.Fatalf("provider outcomes = %d, want 1", outcomes)
 	}
 }

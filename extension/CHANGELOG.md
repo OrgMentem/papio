@@ -17,6 +17,14 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **A generic PDF link that returns the article's HTML now hands the drive to
+  the article agent.** On a Nature page, the `citation_pdf_url` candidate
+  downloaded HTML, and papio then reported nothing, so the drive held its
+  provider domain until its lease expired. The agent now takes over the same
+  drive and reads the article page. When the agent is unavailable, papio
+  ends the drive with a provider outcome, attributed to the host's adapter
+  when one exists. Every generic result without a successor now ends in one
+  provider outcome.
 - **The article agent waits for a busy sibling instead of calling itself
   stale.** Papers routed through the same library resolver can share one
   provider lease, and all drives share one effect slot. When a sibling drive

@@ -1763,6 +1763,12 @@ interface AgentJobState {
   agent_fallback_pending_until?: number;
 }
 
+/** A started generic epoch's terminal result that has not been sent yet. */
+interface GenericHeldResult {
+  outcome: string;
+  detail: string;
+}
+
 /** Fixed local gate names only; never include page data in a skip diagnostic. */
 type AgentFallbackSkipReason =
   | "backend_feature_missing" | "drive_features_missing" | "hello_pending" | "authority_unavailable"
@@ -20606,8 +20612,12 @@ export class Bridge {
 
   /** True means started or already running; otherwise return a fixed skip reason.
    * Reserve locally before returning to the inbound FIFO, which must remain
-   * available for the daemon reply while this loop waits for it. */
-  private startAgentFallback(job: ActiveJob): true | AgentFallbackSkipReason {
+   * available for the daemon reply while this loop waits for it.
+   *
+   * `held` is a generic candidate's unsent terminal result: its epoch is
+   * still started, so the agent replays that exact start, and the loop's exit
+   * owes the daemon this one result even if the agent never starts. */
+  private startAgentFallback(job: ActiveJob, held?: GenericHeldResult): true | AgentFallbackSkipReason {
     if (this.agentLoops.has(job.job_id)) return true;
     const availability = this.agentFallbackAvailability();
     if (availability !== true) return availability;
@@ -20625,7 +20635,7 @@ export class Bridge {
     if ((job as ActiveJob & AgentJobState).agent_fallback_attempt === key) return "attempt_consumed";
     const token = {};
     this.agentLoops.set(job.job_id, token);
-    void this.runAgentFallback(job, epoch, key, token).catch(() => {
+    void this.runAgentFallback(job, epoch, key, token, held).catch(() => {
       // No page error text is safe diagnostic material for the daemon.
       console.error("papio: agent fallback stopped; operator action retained");
     }).finally(() => {
@@ -20671,7 +20681,7 @@ export class Bridge {
     return true;
   }
 
-  private async runAgentFallback(job: ActiveJob, epoch: ProviderDriveEpoch, key: string, token: object): Promise<void> {
+  private async runAgentFallback(job: ActiveJob, epoch: ProviderDriveEpoch, key: string, token: object, held?: GenericHeldResult): Promise<void> {
     const jobID = job.job_id;
     const drive = this.handoffDrives.get(jobID);
     const generation = this.portGeneration;
@@ -20683,6 +20693,9 @@ export class Bridge {
     let leaseOwner: string | undefined;
     let started = false;
     let exitDetail = "Article agent fallback stopped because its page or authority became stale.";
+    // A handed-over generic result keeps its evidence in the one detail the
+    // daemon receives for this tuple and in the provider outcome.
+    const reportDetail = (): string => held === undefined ? exitDetail : `${held.detail}; ${exitDetail}`;
     const unavailableDetail = "Article agent fallback is unavailable; the decision backend did not return a usable response.";
     const budgetDetail = "Article agent fallback exhausted its decision or time budget.";
     const blockedDetail = "Article agent fallback stopped because the decision backend reported BLOCKED; operator review is required.";
@@ -21207,13 +21220,14 @@ export class Bridge {
       try {
         if (!downloaded()) {
           if (track !== undefined && this.downloads.get(jobID) === track) this.downloads.delete(jobID);
-          if (started) await this.sendGenericEpochResult(jobID, epoch, "unknown", exitDetail);
+          if (started) await this.sendGenericEpochResult(jobID, epoch, "unknown", reportDetail());
+          else if (held !== undefined) await this.sendGenericEpochResult(jobID, epoch, held.outcome, reportDetail());
           if (sameEpoch() !== undefined) {
             await this.update(store => sameEpoch() === undefined ? store : ({ ...store,
               activeJobs: store.activeJobs.map(current => current.job_id === jobID ? {
                 ...current, agent_fallback_detail: exitDetail, agent_fallback_pending_until: undefined,
                 ...(track === undefined ? {} : { download_initiated: false }),
-                ...(started ? { generic_terminal: true } : {}),
+                ...(started || held !== undefined ? { generic_terminal: true } : {}),
               } as ActiveJob : current),
             }));
           }
@@ -21227,7 +21241,7 @@ export class Bridge {
       }
       const current = sameEpoch();
       if (!downloaded() && current !== undefined && this.handoffDrives.get(jobID) === drive &&
-        (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending")) await this.emitGenericUnknown(jobID, exitDetail, epoch);
+        (current.status === "accepted" || current.status === "awaiting_download" || current.status === "auth_pending")) await this.emitGenericUnknown(jobID, reportDetail(), epoch);
     }
   }
 
@@ -21647,6 +21661,11 @@ export class Bridge {
     // host is worse than none, because adapter work would be aimed at the
     // wrong provider.
     const host = await this.reportableHost(job.tab_id);
+    // A packaged adapter that owns this host already classified the page as
+    // unknown before any generic or agent step ran, so the drive that ends
+    // here is that adapter's drift, not a missing adapter.
+    const adapter = host === undefined ? undefined
+      : this.deps.adapterSpecs.find((candidate) => adapterSupportsHost(host, candidate));
     if (expectedEpoch !== undefined) {
       const current = findByJob(this.store, jobID);
       if (current?.tab_id !== job.tab_id || current.generic_drive_epoch === undefined ||
@@ -21657,7 +21676,9 @@ export class Bridge {
       !this.handoffOutcomeSent.has(outcomeKey) &&
       this.send(
         "provider_outcome",
-        { outcome: "ui_changed", detail, ...(host === undefined ? {} : { host }) },
+        { outcome: "ui_changed",
+          ...(adapter === undefined ? {} : { adapter_id: adapter.id, adapter_version: adapter.version }),
+          detail, ...(host === undefined ? {} : { host }) },
         jobID,
       )
     ) {
@@ -21703,6 +21724,25 @@ export class Bridge {
         } as ActiveJob;
       }),
     }));
+  }
+
+  /** A generic candidate that downloaded HTML leaves the article page itself
+   * as the only lead, so the article agent gets the drive. Its epoch is still
+   * started: the agent replays that exact start and owes the daemon the one
+   * terminal result. Settling HTML first would spend the tuple, leaving the
+   * agent nothing to start and the drive with no provider outcome. */
+  private async handGenericHtmlToAgent(
+    jobID: string,
+    track: GenericDownloadAttempt,
+    held: GenericHeldResult,
+  ): Promise<true | AgentFallbackSkipReason> {
+    this.downloads.delete(jobID);
+    await this.update((s) => patchJob(s, jobID, { download_initiated: false }));
+    const current = findByJob(this.store, jobID);
+    if (current?.generic_drive_epoch === undefined ||
+      this.genericEpochKey(jobID, current.generic_drive_epoch) !== this.genericEpochKey(jobID, track.epoch))
+      return "generic_epoch_missing";
+    return this.startAgentFallback(current, held);
   }
 
   /** Settle the handoff this provider outcome ended, and decide whether the
@@ -23327,6 +23367,12 @@ export class Bridge {
       } catch {
         // Keep the bounded MIME classification.
       }
+      let agentSkip: AgentFallbackSkipReason | undefined;
+      if (outcome === "html") {
+        const agentStart = await this.handGenericHtmlToAgent(owner.job_id, track.generic, { outcome, detail });
+        if (agentStart === true) return;
+        agentSkip = agentStart;
+      }
       const observation = await this.sendGenericEpochResult(
         owner.job_id,
         track.generic.epoch,
@@ -23341,9 +23387,19 @@ export class Bridge {
         observation.payload?.["strategy"] === "generic" &&
         observation.payload?.["revision"] === track.generic.epoch.revision &&
         observation.payload?.["outcome"] === "applied";
-      if (outcome === "not_pdf" && acknowledged)
+      if (outcome === "not_pdf" && acknowledged) {
         await this.advanceGenericCandidate(owner.job_id, track.generic);
-      else await this.retainGenericCandidate(owner.job_id, track.generic);
+        return;
+      }
+      await this.retainGenericCandidate(owner.job_id, track.generic);
+      // Only not_pdf earns a daemon successor. Every other applied result
+      // ends this drive, and without a provider outcome its navigated claim
+      // keeps the safety domain, and every sibling behind it, until lease
+      // expiry (measured live 2026-09-23: 30 minutes on publisher:doi.org).
+      if (acknowledged)
+        await this.emitGenericUnknown(owner.job_id,
+          agentSkip === undefined ? detail : `${detail}; ${AGENT_FALLBACK_SKIP_DETAIL[agentSkip]}`,
+          track.generic.epoch);
       return;
     }
     if (track.viewerRefetch !== undefined && (mime === "text/html" || mime === "application/xhtml+xml")) {

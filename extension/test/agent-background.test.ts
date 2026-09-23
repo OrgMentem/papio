@@ -34,7 +34,7 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 
-async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape; helloPending?: boolean; readiness?: boolean; page?: { url: string; html: string; doi: string } } = {}) {
+async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape; helloPending?: boolean; readiness?: boolean; page?: { url: string; html: string; doi: string }; genericCandidates?: { strategy_id: string; strategy_version: string; url: string }[] } = {}) {
   const pageURL = options.page?.url ?? url, pageDOI = options.page?.doi ?? doi;
   const win = new Window({ url: pageURL, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
   win.document.write(options.page?.html ?? `<meta name="citation_doi" content="${doi}"><meta name="citation_title" content="Example article"><main><h1>Example article</h1><button type="button">Formats</button></main><header><input type="search" value="PRIVATEQUERY"></header>`);
@@ -66,7 +66,7 @@ async function harness(options: { features?: string[]; knownAdapter?: boolean; f
     setTimeout: (fn, ms) => timers.push({ fn, ms }), backend, tabs, downloads,
     adapterSpecs: options.knownAdapter ? [{ id: "test-unknown", version: "1", hosts: ["unregistered.example"], classify: [] }] : [],
     scripting: { executeScript: async injection => {
-      if (injection.func === planGeneric) { genericPlans++; return [{ result: { evidence: [], candidates: [] } }]; }
+      if (injection.func === planGeneric) { genericPlans++; return [{ result: { evidence: [], candidates: options.genericCandidates ?? [] } }]; }
       if (injection.func === planExecution) {
         const [, spec, expected, policy] = injection.args as Parameters<typeof planExecution>;
         return [{ result: planExecution(win.document as unknown as Document, spec, expected, policy) }];
@@ -1881,3 +1881,62 @@ for (const holder of ["effect slot", "provider lease"] as const)
     expect(h.frames.some(frame => frame.type === "provider_outcome")).toBe(false);
     await h.decide("decision", "BLOCKED"); await h.settle();
   });
+
+// Measured live 2026-09-23 (job_2c3c6f40ad69e1e4282a272d25, Nature Medicine):
+// the nature adapter settled unknown, the generic citation_pdf_url candidate
+// downloaded HTML, and the extension settled `html` and then said nothing
+// else. The navigated claim held publisher:doi.org for its whole 30-minute
+// lease while two sibling papers queued behind it. An HTML candidate leaves
+// the article page as the only lead: the agent gets the still-held epoch, or,
+// without an agent, the drive ends with an attributed provider outcome.
+const htmlCandidate = { strategy_id: "generic-citation-pdf/1", strategy_version: "1", url: "https://unregistered.example/article/one.pdf" };
+async function genericCandidateReturnsHTML(h: AgentHarness) {
+  // The generic drive awaits its start reply inside classification.
+  const classifying = h.classify();
+  await h.started();
+  await classifying;
+  await until(() => h.downloads.started.length === 1);
+  const id = 901;
+  h.downloads.items.set(id, { id, tabId: tabID, url: htmlCandidate.url, finalUrl: url, filename: `/tmp/papio/${jobID}/one.pdf`, mime: "text/html", state: "complete" });
+  const before = h.frames.length;
+  // Settling awaits its daemon reply inside the download handler.
+  void h.downloads.onChanged.emit({ id, state: { current: "complete" } });
+  await flush();
+  return before;
+}
+for (const knownAdapter of [false, true]) {
+  test(`${knownAdapter ? "known unknown" : "no-adapter"} generic HTML candidate hands its held epoch to the article agent`, async () => {
+    const h = await harness({ knownAdapter, genericCandidates: [htmlCandidate] });
+    const before = await genericCandidateReturnsHTML(h);
+    // The agent replays the exact held tuple; HTML is not settled first,
+    // because a settled tuple can never be started again.
+    const replay = await h.request("provider_drive_epoch_start_request", before);
+    expect(replay.payload).toMatchObject(epoch);
+    await h.reply(replay, "provider_drive_epoch_start_result", { ...epoch, outcome: "started" });
+    await h.decide("decision", "BLOCKED", before);
+    await h.settle();
+    const results = h.frames.filter(f => f.type === "provider_drive_epoch_result_request");
+    const outcomes = h.frames.filter(f => f.type === "provider_outcome");
+    expect(results).toHaveLength(1);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.payload["outcome"]).toBe("ui_changed");
+    expect(outcomes[0]!.payload["detail"]).toContain("generic candidate returned HTML");
+    expect(outcomes[0]!.payload["adapter_id"]).toBe(knownAdapter ? "test-unknown" : undefined);
+    expect(h.counts().actions).toBe(0);
+  });
+
+  test(`${knownAdapter ? "known unknown" : "no-adapter"} generic HTML candidate without an agent settles HTML and ends the drive`, async () => {
+    const h = await harness({ knownAdapter, genericCandidates: [htmlCandidate], features: ["provider_drive_epoch_v1", "effect_permit_v1"] });
+    const before = await genericCandidateReturnsHTML(h);
+    const result = await h.request("provider_drive_epoch_result_request", before);
+    expect(result.payload).toMatchObject({ ...epoch, outcome: "html" });
+    await h.reply(result, "provider_drive_epoch_result", { ...epoch, outcome: "applied" });
+    await until(() => h.frames.some(f => f.type === "provider_outcome"));
+    const outcomes = h.frames.filter(f => f.type === "provider_outcome");
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.payload["outcome"]).toBe("ui_changed");
+    expect(outcomes[0]!.payload["detail"]).toContain("generic candidate returned HTML");
+    expect(outcomes[0]!.payload["adapter_id"]).toBe(knownAdapter ? "test-unknown" : undefined);
+    expect(h.frames.filter(f => f.type === "provider_drive_epoch_start_request")).toHaveLength(1);
+  });
+}
