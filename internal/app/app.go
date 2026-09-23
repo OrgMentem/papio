@@ -79,6 +79,14 @@ type WorkLookup interface {
 	LookupWork(context.Context, string) (discovery.DiscoveredWork, error)
 }
 
+// PMIDLookup reads the bibliographic record indexed under one PubMed ID. A
+// resolver adapter that implements it (Europe PMC) is also the metadata source
+// for PMID-only works: matched means the record echoed the requested PMID, so
+// its DOI is that PMID's own identifier rather than a search guess.
+type PMIDLookup interface {
+	LookupPMID(ctx context.Context, pmid string) (work.Work, bool, error)
+}
+
 // DOIRegistry reports whether a DOI is registered with the global Handle
 // System. The bool is only meaningful when the error is nil: an unreachable
 // registry means "unknown", never "unregistered".
@@ -663,6 +671,13 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 	if err != nil {
 		return nil, plan, err
 	}
+	// PMID first: a DOI it adopts is what enrichDOIWork, the resolvers, and a
+	// later institutional OpenURL (rft_id=info:doi/...) all key on.
+	enrichPMIDPlan, err := s.enrichPMIDWork(ctx, row, anchor)
+	if err != nil {
+		return nil, plan, err
+	}
+	plan.merge(enrichPMIDPlan)
 	enrichDOIPlan, err := s.enrichDOIWork(ctx, row)
 	if err != nil {
 		return nil, plan, err
@@ -1398,6 +1413,102 @@ func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) (retryPlan, e
 	return plan, nil
 }
 
+// enrichPMIDWork gives a PMID-anchored work without a DOI the DOI, title,
+// authors, and year of the PMID's own record. Nothing else ever did: enrich
+// runs title searches only, enrichDOIWork needs a DOI, and the Europe PMC
+// resolver reads this same record on every pass but discards it unless it is
+// open access. 27 PMID-only jobs cycled resolving -> retry_wait for six weeks
+// and then parked on an institutional handoff whose OpenURL carried only
+// info:pmid, which the browser route could not verify. The lookup is keyed on
+// the identifier, so the record is exact-echo evidence and may fill strong
+// identifiers the anchor left open (enrichmentPersistWork); the PMID stays the
+// submitted anchor. Budgeted and charged like enrich; it never fails the job.
+// A record without a DOI fills bibliography only, and the lookup then repeats
+// on later passes alongside the same source's resolver query.
+func (s *Service) enrichPMIDWork(ctx context.Context, row *job.Row, anchor job.SubmittedIdentity) (retryPlan, error) {
+	var plan retryPlan
+	if strings.TrimSpace(row.Work.DOI) != "" {
+		return plan, nil
+	}
+	pmid, err := work.NormalizePMID(row.Work.PMID)
+	if err != nil {
+		return plan, nil
+	}
+	for _, entry := range s.Resolvers {
+		lookup, ok := entry.Adapter.(PMIDLookup)
+		if !ok {
+			continue
+		}
+		name := entry.Adapter.Name()
+		if !row.Policy.SourceAllowed(name) || !entry.Policy.Enabled {
+			continue
+		}
+		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
+		if err != nil {
+			return plan, err
+		}
+		chosen := entry.Policy
+		if s.Budgets != nil {
+			var acquireErr error
+			chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), 0)
+			if acquireErr != nil {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
+				if plan.observeBudgetRefusal(acquireErr) {
+					continue
+				}
+				return plan, acquireErr
+			}
+		}
+		enriched, matched, err := lookup.LookupPMID(anonymousIfFallback(ctx, entry.Policy, chosen), pmid)
+		if errors.Is(err, resolver.ErrNotApplicable) {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "not_applicable")
+			continue
+		}
+		plan.observeSourceCalled()
+		if err != nil {
+			if ctx.Err() != nil {
+				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
+				return plan, ctx.Err()
+			}
+			if delay, temporary := resolver.Temporary(err); temporary {
+				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
+				if s.Budgets != nil {
+					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
+				}
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+			} else {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+			}
+			continue
+		}
+		// The adapter's echo is re-checked here: only the queried PMID's own
+		// record may lend this work a DOI.
+		if !matched || enriched.PMID != pmid {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match")
+			continue
+		}
+		persistable, hasWrite, accepted := enrichmentPersistWork(anchor, enriched, resolver.AuthorityExactEcho)
+		if !accepted {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
+			continue
+		}
+		if hasWrite {
+			updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, persistable)
+			if err != nil {
+				return plan, err
+			}
+			row.Work = updated.Work
+		}
+		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
+		if row.Work.DOI != "" {
+			// First moment this job has a canonical DOI to dedup on.
+			_, _ = s.Jobs.RecordDuplicateWork(ctx, row.ID, row.Work)
+		}
+		return plan, nil
+	}
+	return plan, nil
+}
+
 func (s *Service) metadataEnricherEntries() []MetadataEnricherEntry {
 	if len(s.MetadataEnrichers) > 0 {
 		return s.MetadataEnrichers
@@ -1494,7 +1605,7 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 		// and validation then compares the PDF against that adopted identity
 		// and agrees with itself. enrichmentPersistWork keeps the durable
 		// write to gaps the anchor left open.
-		persistable, hasWrite, accepted := enrichmentPersistWork(anchor, enriched)
+		persistable, hasWrite, accepted := enrichmentPersistWork(anchor, enriched, resolver.AuthoritySearch)
 		if !accepted {
 			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
 			continue

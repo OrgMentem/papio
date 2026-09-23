@@ -16,6 +16,10 @@ const strandedNeedsReviewMinAge = 5 * time.Minute
 
 const adapterUpgradeRepairReason = "adapter_upgrade_repair"
 
+// pmidEnrichmentRepairReason marks the one-shot return of a PMID-only park to
+// resolving so enrichPMIDWork can give it the DOI its handoff lacked.
+const pmidEnrichmentRepairReason = "pmid_enrichment_repair"
+
 // HandoffRepairer heals awaiting_human jobs stranded by a crash between the
 // browser bridge's non-transactional handoff mutations (requeue event, action
 // resolution, state transition). It runs as bounded best-effort maintenance,
@@ -65,6 +69,14 @@ func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{s
 // adapter has been upgraded. Captures bind the outcome to its adapter id; old
 // events without that evidence conservatively fall back to a newer extension
 // bundle. The bridge supplies both live-only signals to RepairAdapterUpgrade.
+//
+// Rule 6 (unenriched PMID park): a job whose only open actions are
+// institutional handoffs and whose work still has a PMID but no DOI parked
+// before enrichPMIDWork existed. Its OpenURL carries only info:pmid, which the
+// browser route cannot verify, while the PMID's own record usually names the
+// DOI. It re-enters resolving once (the transition reason is the latch), and
+// only when a PMID lookup source is enabled for the job; a record without a
+// DOI therefore re-parks as before instead of looping.
 //
 // The transactional repair rejects a state/action snapshot that has gone
 // stale, including an adoption lease acquired after its page read.
@@ -132,7 +144,10 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 		switch {
 		case !routeable:
 			repair = "unfetchable_handoff_repair"
-		case !s.institutionalRouteExhausted(ctx, row.ID):
+		case s.institutionalRouteExhausted(ctx, row.ID):
+		case s.pmidEnrichmentDue(ctx, row):
+			repair = pmidEnrichmentRepairReason
+		default:
 			continue
 		}
 		actionIDs := make([]int64, 0, len(open))
@@ -256,6 +271,38 @@ func allManualDownloads(actions []job.HumanAction) bool {
 	}
 	for _, action := range actions {
 		if action.Kind != "manual_download" {
+			return false
+		}
+	}
+	return true
+}
+
+// pmidEnrichmentDue reports whether rule 6 applies: a PMID without a DOI, a
+// PMID lookup source this job may call, and no earlier rule-6 repair.
+func (s *Service) pmidEnrichmentDue(ctx context.Context, row *job.Row) bool {
+	if row.Work.DOI != "" || row.Work.PMID == "" {
+		return false
+	}
+	available := false
+	for _, entry := range s.Resolvers {
+		if _, ok := entry.Adapter.(PMIDLookup); ok && entry.Policy.Enabled && row.Policy.SourceAllowed(entry.Adapter.Name()) {
+			available = true
+			break
+		}
+	}
+	if !available {
+		return false
+	}
+	events, err := s.Jobs.Events(ctx, row.ID)
+	if err != nil {
+		return false
+	}
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "job.transition" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if reason, _ := detail["reason"].(string); reason == pmidEnrichmentRepairReason {
 			return false
 		}
 	}

@@ -100,6 +100,34 @@ func TestResolveByDOIExactFields(t *testing.T) {
 	}
 }
 
+// LookupPMID must return the PMID's own record even when it is not open
+// access (Resolve drops it), and must not lend a DOI from a record that does
+// not echo the requested PMID.
+func TestLookupPMIDReturnsTheEchoedRecordRegardlessOfAccess(t *testing.T) {
+	nonOA := strings.Replace(oaResultJSON, `"isOpenAccess": "Y"`, `"isOpenAccess": "N"`, 1)
+	t.Run("non-OA record", func(t *testing.T) {
+		var query string
+		srv := serveJSON(t, http.StatusOK, nil, nonOA, &query)
+		got, matched, err := newResolver(srv).LookupPMID(context.Background(), "456")
+		if err != nil || !matched {
+			t.Fatalf("LookupPMID = matched:%v err:%v, want a match", matched, err)
+		}
+		if query != "EXT_ID:456 AND SRC:MED" {
+			t.Fatalf("query = %q", query)
+		}
+		if got.DOI != "10.1000/xyz" || got.PMID != "456" || got.Title != "Some OA Paper" || got.Year != 2020 {
+			t.Fatalf("work = %+v, want the record's DOI, PMID, title, and year", got)
+		}
+	})
+	t.Run("record for another PMID", func(t *testing.T) {
+		srv := serveJSON(t, http.StatusOK, nil, nonOA, nil)
+		got, matched, err := newResolver(srv).LookupPMID(context.Background(), "457")
+		if err != nil || matched || got.DOI != "" {
+			t.Fatalf("LookupPMID = %+v matched:%v err:%v, want no match", got, matched, err)
+		}
+	})
+}
+
 func TestNoQueryOrFragmentSecretsInRedactedURL(t *testing.T) {
 	srv := serveJSON(t, http.StatusOK, nil, oaResultJSON, nil)
 	r := newResolver(srv)

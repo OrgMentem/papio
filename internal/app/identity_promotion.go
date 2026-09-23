@@ -94,12 +94,19 @@ func accumulatePromotedIdentity(base work.Work, ranked []resolver.Candidate) wor
 }
 
 // enrichmentPersistWork returns the subset of enricher output that may be written
-// durably. Every enricher reached from the enrich loop matches by title search,
-// so its strong identifiers are its guess about which of several same-titled
-// works the requester meant — never exact-echo verified — and adopting one makes
-// the guess this job's canonical identity, which validation then compares the
-// document against and confirms. Only bibliographic gaps the anchor left open
-// may be filled, and only when the record does not contradict it.
+// durably. A title-search enricher (authority AuthoritySearch) reports its guess
+// about which of several same-titled works the requester meant — never
+// exact-echo verified — and adopting one of its identifiers would make the
+// guess this job's canonical identity, which validation then compares the
+// document against and confirms. For such a record only bibliographic gaps the
+// anchor left open may be filled, and only when it does not contradict it.
+//
+// An identifier-keyed lookup whose record echoes the requested identifier
+// (AuthorityExactEcho, e.g. the PMID's own Europe PMC record) is the same
+// authority that lets fillMissingFromCandidate promote identity: it may also
+// fill strong identifiers the anchor left open. The anchor's own identifiers
+// are never replaced, so a PMID-anchored job keeps its PMID as the submitted
+// anchor while gaining the DOI as its routing identity.
 //
 // The anchor's completeness is deliberately NOT a licence here: a full
 // title/authors/year tuple says the requester described the work, not that any
@@ -108,9 +115,24 @@ func accumulatePromotedIdentity(base work.Work, ranked []resolver.Candidate) wor
 // CONTRADICTS the anchor must abandon the match, while a record that simply has
 // nothing new to offer is a successful enrichment with no write. Folding both
 // into one bool made an agreeing record read as a conflict.
-func enrichmentPersistWork(anchor job.SubmittedIdentity, enriched work.Work) (out work.Work, changed, ok bool) {
+func enrichmentPersistWork(anchor job.SubmittedIdentity, enriched work.Work, authority resolver.EvidenceAuthority) (out work.Work, changed, ok bool) {
 	if conflictsIdentity(anchor.Work, enriched) {
 		return work.Work{}, false, false
+	}
+	if authority.MayPromoteIdentity() {
+		for _, field := range []struct {
+			dst          *string
+			held, record string
+		}{
+			{&out.DOI, anchor.Work.DOI, enriched.DOI}, {&out.PMID, anchor.Work.PMID, enriched.PMID},
+			{&out.ArXiv, anchor.Work.ArXiv, enriched.ArXiv}, {&out.ISBN, anchor.Work.ISBN, enriched.ISBN},
+			{&out.OpenAlex, anchor.Work.OpenAlex, enriched.OpenAlex},
+		} {
+			if field.held == "" && field.record != "" {
+				*field.dst = field.record
+				changed = true
+			}
+		}
 	}
 	if anchor.Work.Title == "" && enriched.Title != "" {
 		out.Title = enriched.Title

@@ -11,6 +11,13 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- A PMID-only job now gains its DOI, title, authors, and year from the PMID's
+  own Europe PMC record before routing, so resolvers can use the DOI and the
+  institutional OpenURL carries `rft_id=info:doi/...` instead of only
+  `info:pmid/...`. The Europe PMC resolver read that record on every pass but
+  kept nothing unless it was open access. The PMID stays the submitted anchor.
+  Handoff repair returns an existing PMID-only institutional park to resolving
+  once so it gets the DOI; a record with no DOI parks again as before.
 - A generic browser drive that ends without a provider outcome no longer holds
   its provider safety domain until the 30-minute lease expires. If no outcome
   follows a drive result that has no daemon successor (for example `html`)

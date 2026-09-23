@@ -73,58 +73,15 @@ func (*Resolver) Name() string { return "europepmc" }
 // Resolve searches Europe PMC and returns legal OA full-text candidates.
 func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver.Candidate, error) {
 	if r.client == nil {
-		return nil, errors.New("europepmc: HTTP client is not configured")
+		return nil, errClientMissing
 	}
-
 	queryString, mode := buildQuery(requested)
 	if queryString == "" {
 		return nil, nil
 	}
-
-	endpoint, err := url.Parse(r.baseURL + "/search")
-	if err != nil {
-		return nil, errors.New("europepmc: invalid endpoint configuration")
-	}
-	params := endpoint.Query()
-	params.Set("query", queryString)
-	params.Set("format", "json")
-	params.Set("resultType", "core")
-	params.Set("pageSize", strconv.Itoa(defaultPageSize))
-	endpoint.RawQuery = params.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, errors.New("europepmc: could not construct request")
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("europepmc: request failed")}
-	}
-	if resp == nil {
-		return nil, &resolver.TemporaryError{Err: errors.New("europepmc: empty HTTP response")}
-	}
-	if resp.Body == nil {
-		return nil, errors.New("europepmc: response body is missing")
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		return nil, nil
-	case resp.StatusCode == http.StatusRequestTimeout:
-		return nil, temporaryStatus("europepmc", resp)
-	case resp.StatusCode == http.StatusTooManyRequests:
-		return nil, temporaryStatus("europepmc", resp)
-	case resp.StatusCode >= 500 && resp.StatusCode <= 599:
-		return nil, temporaryStatus("europepmc", resp)
-	case resp.StatusCode < 200 || resp.StatusCode > 299:
-		return nil, fmt.Errorf("europepmc: unexpected HTTP status %d", resp.StatusCode)
-	}
-
-	var record searchResponse
-	if err := decodeBoundedJSON(resp.Body, r.maxBody, &record); err != nil {
-		return nil, fmt.Errorf("europepmc: invalid response: %w", err)
+	record, err := r.search(ctx, queryString, "core")
+	if err != nil || record == nil {
+		return nil, err
 	}
 
 	result := selectResult(record.ResultList.Result, requested, mode)
@@ -219,6 +176,87 @@ func (r *Resolver) Resolve(ctx context.Context, requested work.Work) ([]resolver
 		return nil, nil
 	}
 	return candidates, nil
+}
+
+// LookupPMID returns the bibliographic record Europe PMC indexes under one
+// PubMed ID, open access or not. It is the identifier-keyed metadata lookup a
+// PMID-only request needs before routing: Resolve deliberately discards a
+// non-OA record (it has no legal candidate to offer), and that discard is where
+// a PMID-only work's DOI used to be lost on every pass. matched is true only
+// when the record echoes the requested PMID, so the returned DOI is that
+// PMID's own DOI and never a search guess. A record without a DOI is still a
+// match; the caller fills only what the record carries.
+func (r *Resolver) LookupPMID(ctx context.Context, pmid string) (work.Work, bool, error) {
+	requested := work.Work{PMID: pmid}
+	queryString, mode := buildQuery(requested)
+	if mode != matchPMID {
+		return work.Work{}, false, resolver.ErrNotApplicable
+	}
+	record, err := r.search(ctx, queryString, "lite")
+	if err != nil || record == nil {
+		return work.Work{}, false, err
+	}
+	result := selectResult(record.ResultList.Result, requested, mode)
+	if result == nil {
+		return work.Work{}, false, nil
+	}
+	return resolvedWork(result), true, nil
+}
+
+var errClientMissing = errors.New("europepmc: HTTP client is not configured")
+
+// search runs one Europe PMC REST search. A 404 is (nil, nil); 408/429/5xx and
+// transport failures are retryable resolver.TemporaryError.
+func (r *Resolver) search(ctx context.Context, queryString, resultType string) (*searchResponse, error) {
+	if r.client == nil {
+		return nil, errClientMissing
+	}
+	endpoint, err := url.Parse(r.baseURL + "/search")
+	if err != nil {
+		return nil, errors.New("europepmc: invalid endpoint configuration")
+	}
+	params := endpoint.Query()
+	params.Set("query", queryString)
+	params.Set("format", "json")
+	params.Set("resultType", resultType)
+	params.Set("pageSize", strconv.Itoa(defaultPageSize))
+	endpoint.RawQuery = params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, errors.New("europepmc: could not construct request")
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, &resolver.TemporaryError{Err: errors.New("europepmc: request failed")}
+	}
+	if resp == nil {
+		return nil, &resolver.TemporaryError{Err: errors.New("europepmc: empty HTTP response")}
+	}
+	if resp.Body == nil {
+		return nil, errors.New("europepmc: response body is missing")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, nil
+	case resp.StatusCode == http.StatusRequestTimeout:
+		return nil, temporaryStatus("europepmc", resp)
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, temporaryStatus("europepmc", resp)
+	case resp.StatusCode >= 500 && resp.StatusCode <= 599:
+		return nil, temporaryStatus("europepmc", resp)
+	case resp.StatusCode < 200 || resp.StatusCode > 299:
+		return nil, fmt.Errorf("europepmc: unexpected HTTP status %d", resp.StatusCode)
+	}
+
+	var record searchResponse
+	if err := decodeBoundedJSON(resp.Body, r.maxBody, &record); err != nil {
+		return nil, fmt.Errorf("europepmc: invalid response: %w", err)
+	}
+	return &record, nil
 }
 
 type matchMode string
