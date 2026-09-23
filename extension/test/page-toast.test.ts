@@ -1,7 +1,7 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 import { afterEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { renderPageToast } from "../src/background";
+import { renderPageToast } from "../src/toast-delivery";
 import { capturePage } from "../src/capture";
 import {
   PAPIO_MARK,
