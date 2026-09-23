@@ -543,3 +543,45 @@ memory only.
 The superseded-copy pass above is deleted: every owned surface whose job has
 moved on is closed by the ordinary reconcile pass, and a `content` record left
 by an older build is closed like any other.
+
+## Amendment 2026-09-23: orphaned direct-get permits settle from evidence
+
+The 2026-08-13 amendment lets only an exact result, a correlated artifact
+winner, kind-specific reconciliation or an operator settle a permit. On
+2026-09-23 a direct route was offered at 14:36Z and an extension reload came
+seconds later. The browser saved an HTML page as the job's `paper.pdf`, but no
+result or `download_complete` reached the daemon. The permit went to
+`unknown_completion`, and every later browser effect, for every paper, was
+refused as busy until an operator ran `papio browser permit resolve` at
+14:58Z.
+
+The adoption sweep may now settle an orphan, but only a `direct_get` permit
+and only from evidence. A direct get's whole effect is one browser download
+steered into the job's adoption directory. That directory, its `rejected/`
+sibling and the job's download events are therefore a complete record of it.
+While the permit occupies the global lane no other effect can run, so a file
+modified after the permit was created (less two seconds of timestamp slack) is
+its consequence. The rules are:
+
+- **One settled PDF in the job directory** of a job the sweep adopts from is
+  recorded as `effect_permit.orphan_attributed`. The sweep then adopts it with
+  the permit's producer tuple, and ordinary validation and producer correlation
+  settle the permit. If the job is terminal, the permit settles as
+  `effect_completed_job_terminal`.
+- **One settled file that is not a PDF** is moved to `rejected/<job>/`, as a
+  rejected adoption is, and the permit settles as `effect_completed_no_paper`.
+- **Nothing at all** settles the permit as `no_effect_observed`. This needs a
+  holder generation newer than the permit's, an expired permit lease, every
+  candidate directory read without error, and no download or direct-result
+  event since the permit.
+
+A held permit is never considered. A partial or zero-byte file, two files, an
+unreadable directory, the same holder generation, or an unexpired lease leaves
+the permit occupying, and doctor reports it as before. Elapsed time alone still
+settles nothing. Every settlement appends `effect_permit.orphan_resolved` with
+its evidence in the transaction that settles the permit. Unlike an operator
+override, it does not suppress a later exact result, which is appended as
+history. A download that lands after settlement is adopted by the ordinary
+sweep. Every other effect kind can change provider state without writing a
+file, so none of it proves that nothing happened. Those kinds keep the
+2026-08-13 rule.

@@ -10,6 +10,23 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Fixed
+- **An extension reload during a direct download no longer stops every
+  browser effect until you resolve a permit by hand.** When the extension
+  reloaded seconds after papio offered a direct route, the browser could save
+  the download with no result reaching the daemon. The permit stayed
+  `unknown_completion`, held the global effect lane, and papio refused every
+  later browser effect as busy, for every paper. The adoption sweep now
+  settles such a `direct_get` permit from evidence it reads itself. A file the
+  route saved into the job's adoption directory settles it: a PDF is adopted
+  and validated as usual, and anything else is moved to `rejected/<job>/` so
+  it is not adopted. With no file and no download event since the permit, it
+  settles only after a new holder generation replaced the one that received
+  it and its lease has expired. Each settlement records an
+  `effect_permit.orphan_resolved` event with its evidence. A held permit, a
+  download still being written, or two candidate files are never settled, and
+  `papio doctor` still reports any permit papio cannot resolve.
+
 ## [0.22.0] - 2026-09-23
 
 ### Fixed

@@ -9215,15 +9215,28 @@ func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 	// Admitted native-viewer stages publish into job directories first, so
 	// the scan below sees any bytes this tick recovered.
 	b.recoverNativeViewerStages(ctx)
+	// An orphaned effect permit settles here from what its job's directories
+	// show, or names the PDF the scan below must attribute to it.
+	orphan := b.recoverOrphanedEffectPermit(ctx)
 	for _, root := range b.cfg.AdoptionRoots() {
-		if err := b.sweepAdoptionsIn(ctx, root); err != nil {
+		if err := b.sweepAdoptionsIn(ctx, root, orphan); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string) error {
+// sweepAdoptableState is the set of job states whose adoption directory the
+// sweep adopts from.
+func sweepAdoptableState(state string) bool {
+	switch state {
+	case job.StateQueued, job.StateResolving, job.StateFetching, job.StateAwaitingHuman:
+		return true
+	}
+	return false
+}
+
+func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.EffectPermit) error {
 	entries, err := b.readAdoptionDir(root)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
 		return nil // root not responding (TCC); latch already logged, skip this tick
@@ -9243,9 +9256,7 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string) error {
 		if err != nil || row == nil {
 			continue
 		}
-		switch row.State {
-		case job.StateQueued, job.StateResolving, job.StateFetching, job.StateAwaitingHuman:
-		default:
+		if !sweepAdoptableState(row.State) {
 			continue
 		}
 		name, ok := b.scanAdoptionDir(ctx, jobID)
@@ -9259,7 +9270,11 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string) error {
 			}
 			continue
 		}
-		if _, err := b.ingestAdoptedFile(ctx, jobID, name, nil, nil); err != nil {
+		var producer *job.ArtifactProducerIdentity
+		if orphan != nil && orphan.JobID == jobID {
+			producer = b.attributeOrphanedArtifact(ctx, orphan, name)
+		}
+		if _, err := b.ingestAdoptedFile(ctx, jobID, name, nil, producer); err != nil {
 			if errors.Is(err, errArtifactSuperseded) {
 				// Another delivery already won this attempt. Re-scanning would
 				// refuse the same bytes every tick, so the job is latched out
