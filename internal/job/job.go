@@ -152,7 +152,8 @@ func RecheckExempt(reason string) bool {
 		TerminalReasonInsufficientIdentityEvidence,
 		TerminalReasonCancelledByUser,
 		TerminalReasonBrowserCancelled,
-		// internal/browser/bridge.go's JobReject path records this explicit human decision.
+		// Written by the bridge for an empty browser job_reject until
+		// 2026-09-23; `papio jobs redrive` reopens those rows.
 		TerminalReasonBrowserRejected,
 		TerminalReasonUserDismissed,
 		TerminalReasonReviewRejected:

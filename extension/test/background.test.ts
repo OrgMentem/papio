@@ -15584,6 +15584,77 @@ test("live accepted handoffs queue behind the restored governor owner after rest
   expect([...internals.handoffDrives.keys()]).toEqual(["job_restart_live_b"]);
 });
 
+// Live 2026-09-23 10:51:17Z: six institutional handoffs queued behind the one
+// drive slot were re-offered on `institutional_session_live` with the same
+// OpenURL. The re-offer dropped each job's worker-local offer URL but kept the
+// job waiting for a URL-driven open, so the drain that ran when the slot freed
+// answered every one with an empty `job_reject` - terminal `unavailable`
+// daemon-side. A lost URL is papio's own state, never a provider refusal.
+test("a same-URL re-offer of a governor-queued institutional handoff keeps its URL and drives it instead of rejecting", async () => {
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  const institutionalOffer = (jobID: string): unknown => {
+    const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+    offer.payload["requires_auth"] = true;
+    return offer;
+  };
+  const jobIDs = ["job_reoffer_slot_0", "job_reoffer_slot_1", "job_reoffer_slot_2"];
+  for (const jobID of jobIDs) await h.port.inbound(institutionalOffer(jobID));
+  expect(h.tabs.created).toHaveLength(1);
+  for (const jobID of jobIDs.slice(1)) await h.port.inbound(institutionalOffer(jobID));
+
+  await h.bridge.requestCancel(jobIDs[0]!);
+
+  expect(h.frames().filter((frame) => frame.type === "job_reject")).toEqual([]);
+  expect(h.tabs.created).toHaveLength(2);
+  expect(h.tabs.created[1]?.url).toBe(OPENURL);
+  const driven = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1]);
+  expect(driven?.tab_id).toBeGreaterThanOrEqual(0);
+});
+
+test("a hydrated queued handoff without its worker-local offer URL is left for the daemon's re-offer, never rejected", async () => {
+  const jobID = "job_hydrated_queued_no_url";
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+    activeJobs: [
+      {
+        job_id: jobID,
+        tab_id: -1,
+        offered_at: 1_700_000_000_000,
+        expires_at: 1_900_000_000_000,
+        status: "queued",
+        provider_hosts: [PROVIDER_HOST],
+        access_mode: "delegated",
+        institution_origin: "https://resolver.example.edu",
+      },
+    ],
+  });
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ resolver_origins: ["https://resolver.example.edu"] }),
+  );
+  // Test seam: the drain is private; the harness drives it the way the
+  // queued-release timer and evidence arrivals do.
+  const internals = h.bridge as unknown as {
+    releaseQueuedHandoffs(): Promise<void>;
+  };
+  await internals.releaseQueuedHandoffs();
+
+  expect(h.frames().filter((frame) => frame.type === "job_reject")).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+
+  // The daemon still holds the handoff open and re-offers it on reconnect:
+  // that offer carries the URL the drive needs.
+  await h.port.inbound(jobOffer(jobID));
+  expect(h.frames().filter((frame) => frame.type === "job_reject")).toEqual([]);
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
+});
+
 test("a timeout-detached auth job survives restart without re-consuming its governor slot", async () => {
   const first = makeHarness({
     ...emptyStore(),

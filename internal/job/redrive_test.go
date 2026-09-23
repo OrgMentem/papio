@@ -149,7 +149,7 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 	for _, scenario := range []string{
 		"state", "revision", "other_action", "terms_live_claim", "verify_identity", "unsafe_pdf",
 		"no_action", "no_identifier", "no_resolver", "lease", "held_effect",
-		"unknown_effect", "already_redriven", "institutional_handoff",
+		"unknown_effect", "already_redriven", "institutional_handoff", "unavailable_other_reason",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
@@ -188,6 +188,10 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 				// Only an open-access route is spent by parking on it; the
 				// institutional handoff is the route redrive would open.
 				exec(`UPDATE human_actions SET kind='openurl_handoff', detail='institutional OpenURL handoff' WHERE id=?`, action)
+			case "unavailable_other_reason":
+				// Only an empty browser job_reject retired a handoff without
+				// evidence; every other unavailable outcome stays settled.
+				exec(`UPDATE jobs SET state='unavailable', terminal_reason='no_entitlement' WHERE id=?`, id)
 			case "no_action":
 				exec(`UPDATE human_actions SET status='cancelled' WHERE id=?`, action)
 				revision = 0
@@ -264,6 +268,63 @@ func TestRedrivePreviouslyResolvedPark(t *testing.T) {
 	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
 	if err != nil || len(open) != 1 || open[0].ID == old || open[0].Kind != "openurl_handoff" {
 		t.Fatalf("replacement=%+v err=%v", open, err)
+	}
+}
+
+// Live 2026-09-23 10:51:17Z: six queued institutional handoffs were answered
+// with an empty browser job_reject after the extension lost its worker-local
+// offer URLs, and the bridge moved them to unavailable/browser_rejected. The
+// reject said nothing about the paper, so redrive reopens that park.
+func TestRedriveReopensBrowserRejectedHandoff(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id := resolvingParkCandidate(t, js, "redrive-rejected")
+	if err := js.ParkWithHumanAction(ctx, id, StateResolving, StateAwaitingHuman,
+		"openurl_handoff", "institutional handoff detail", nil, Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 {
+		t.Fatalf("parked actions=%+v err=%v", open, err)
+	}
+	old := open[0].ID
+	if err := js.Transition(ctx, id, StateAwaitingHuman, StateUnavailable,
+		map[string]any{"reason": "browser_rejected"}, WithTerminalReason(TerminalReasonBrowserRejected)); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := js.RedriveInstitutionalHandoff(ctx, id, 0, redriveRoute, redriveOAHandoff, "institutional handoff detail")
+	if err != nil {
+		t.Fatalf("redrive of a browser_rejected handoff: %v", err)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil || row.State != StateAwaitingHuman || row.TerminalReason != "" {
+		t.Fatalf("row=%+v err=%v; want awaiting_human with no terminal reason", row, err)
+	}
+	open, err = js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].ID != fresh || open[0].ID == old || open[0].Kind != "openurl_handoff" ||
+		open[0].Detail != "institutional handoff detail" || !open[0].RequiresAuth || open[0].BlockedBy != "paywall" {
+		t.Fatalf("reopened handoff=%+v err=%v", open, err)
+	}
+	events, err := js.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, requested := false, false
+	for _, event := range events {
+		detail, _ := event["detail"].(map[string]any)
+		switch event["kind"] {
+		case "job.transition":
+			reopened = reopened || (detail["from"] == StateUnavailable && detail["to"] == StateAwaitingHuman && detail["reason"] == "operator_redrive")
+		case "job.retry_requested":
+			requested = requested || (detail["reason"] == "operator_redrive" && detail["action_id"] == float64(old))
+		}
+	}
+	if !reopened || !requested {
+		t.Fatalf("redrive events reopened=%t requested=%t: %+v", reopened, requested, events)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, fresh, redriveRoute, redriveOAHandoff, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("repeat redrive=%v; want ErrConflict", err)
 	}
 }
 

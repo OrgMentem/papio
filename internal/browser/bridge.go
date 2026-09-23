@@ -3397,23 +3397,19 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return nil, nil
 
 	case protocol.MsgJobReject:
-		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", nil); err != nil {
+		// job_reject has an empty payload, so it carries no provider evidence
+		// about the paper or its route. The extension sent it only when its own
+		// worker-local offer URL was gone, and treating that as a refusal moved
+		// six queued institutional handoffs to terminal browser_rejected in one
+		// drain (2026-09-23). The job keeps its open handoff and its route; only
+		// this holder's offer bookkeeping is dropped so a later poll offers it
+		// again through the ordinary offer gates.
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, "browser.job_reject", map[string]any{"disposition": "requeued"}); err != nil {
 			log.Printf("papio: recording browser.job_reject: %v", err)
 			return nil, nil
 		}
-		if fellBack, err := b.fallbackOAHandoff(ctx, msg.JobID, "browser_rejected"); err != nil {
-			log.Printf("papio: applying browser rejection fallback: %v", err)
-			return nil, nil
-		} else if fellBack {
-			return nil, nil
-		}
-		if err := b.resolveHandoff(ctx, msg.JobID, "cancelled"); err != nil {
-			log.Printf("papio: resolving rejected handoff: %v", err)
-			return nil, nil
-		}
-		if err := b.leaveHandoff(ctx, msg.JobID, job.StateUnavailable, string(job.TerminalReasonBrowserRejected)); err != nil {
-			log.Printf("papio: closing rejected handoff: %v", err)
-		}
+		delete(b.offered, msg.JobID)
+		delete(b.queuedOffers, msg.JobID)
 		return nil, nil
 
 	case protocol.MsgAuthPending, protocol.MsgAuthReturned:

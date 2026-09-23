@@ -17,6 +17,14 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **A queued handoff whose offer URL is gone is left for the daemon's
+  re-offer, not rejected.** A same-URL re-offer of a queued institutional
+  handoff dropped that job's URL but kept it queued. When the drive slot freed,
+  the drain sent an empty `job_reject` for each such job, and older daemons
+  made that terminal: six papers at once on 2026-09-23. A tabless re-offer now
+  keeps its URL and drives, and a job with no URL (for example after a worker
+  restart) is dropped locally for the daemon to offer again. The extension no
+  longer sends `job_reject`.
 - **A generic PDF link that returns the article's HTML now hands the drive to
   the article agent.** On a Nature page, the `citation_pdf_url` candidate
   downloaded HTML, and papio then reported nothing, so the drive held its

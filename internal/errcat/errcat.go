@@ -52,7 +52,7 @@ func Explain(state, reason, resolver, accessMode string, cfg config.Config) Expl
 	case "document_delivery_pending":
 		return Explanation{Category: "document_delivery_pending", Guidance: "A document-delivery request is lodged; papio is polling the provider. No action needed."}
 	case string(job.TerminalReasonBrowserRejected):
-		return Explanation{Category: "browser_rejected", Guidance: "You rejected this browser acquisition. Papio will not try it again automatically."}
+		return Explanation{Category: "browser_rejected", Guidance: "The browser dropped this handoff without a provider reason. Run 'papio jobs redrive <job-id> --revision 0' to reopen it."}
 	case "no_identifier":
 		// The single most expensive wrong answer papio can give is "sign in" for
 		// a work no login can deliver. Name what is missing and the one remedy

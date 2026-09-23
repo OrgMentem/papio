@@ -24,6 +24,12 @@ import (
 // The third shape is an open terms_acceptance_required action with no live
 // browser claim: the provider parked the drive on its consent step, and the
 // resolved terms action's reason travels in the job.retry_requested event.
+//
+// The fourth shape is an unavailable job whose terminal reason is
+// browser_rejected. Until 2026-09-23 the bridge turned an empty job_reject,
+// sent when the extension had lost its own worker-local offer URL, into that
+// terminal state. The reject carried no evidence about the paper, so the job
+// returns to awaiting_human with a fresh institutional handoff (revision 0).
 func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
 	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, handoffDetail string) (int64, error) {
 	if strings.TrimSpace(jobID) == "" || revision < 0 {
@@ -42,9 +48,9 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	if n, _ := res.RowsAffected(); n != 1 {
 		return 0, sql.ErrNoRows
 	}
-	var state, resolver, doi, pmid, isbn string
+	var state, terminalReason, resolver, doi, pmid, isbn string
 	var leased, won, blocked int
-	err = tx.QueryRowContext(ctx, `SELECT j.state,
+	err = tx.QueryRowContext(ctx, `SELECT j.state, COALESCE(j.terminal_reason,''),
 		COALESCE(json_extract(j.policy_json,'$.resolver'),''),
 		COALESCE((SELECT value FROM identifiers WHERE work_request_id=j.work_request_id AND kind='doi' LIMIT 1),''),
 		COALESCE((SELECT value FROM identifiers WHERE work_request_id=j.work_request_id AND kind='pmid' LIMIT 1),''),
@@ -53,12 +59,13 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 		(j.artifact_sha256 IS NOT NULL OR EXISTS (SELECT 1 FROM artifact_winners w WHERE w.job_id=j.id)),
 		(SELECT COUNT(*) FROM effect_permits p WHERE p.status IN ('held','unknown_completion'))+
 		(SELECT COUNT(*) FROM legacy_effect_blockers l WHERE l.status='unresolved')
-		FROM jobs j WHERE j.id=?`, now, jobID).Scan(&state, &resolver, &doi, &pmid, &isbn, &leased, &won, &blocked)
+		FROM jobs j WHERE j.id=?`, now, jobID).Scan(&state, &terminalReason, &resolver, &doi, &pmid, &isbn, &leased, &won, &blocked)
 	if err != nil {
 		return 0, err
 	}
-	if state != StateAwaitingHuman {
-		return 0, fmt.Errorf("%w: job is %s, not awaiting_human", ErrConflict, state)
+	rejected := state == StateUnavailable && terminalReason == string(TerminalReasonBrowserRejected)
+	if state != StateAwaitingHuman && !rejected {
+		return 0, fmt.Errorf("%w: job is %s, not awaiting_human or unavailable after browser_rejected", ErrConflict, state)
 	}
 	if leased != 0 || won != 0 || blocked != 0 {
 		return 0, fmt.Errorf("%w: job has a lease, artifact, or unresolved effect permit", ErrConflict)
@@ -118,12 +125,37 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 		}
 	}
 	if count == 0 {
-		err := tx.QueryRowContext(ctx, `SELECT id,revision FROM human_actions
-			WHERE job_id=? AND status='resolved' ORDER BY id DESC LIMIT 1`, jobID).Scan(&actionID, &actionRevision)
+		// A browser_rejected job's handoff was cancelled by that terminal
+		// transition; any other park names the action it last resolved.
+		query := `SELECT id,revision FROM human_actions
+			WHERE job_id=? AND status='resolved' ORDER BY id DESC LIMIT 1`
+		if rejected {
+			query = `SELECT id,revision FROM human_actions
+			WHERE job_id=? AND kind='openurl_handoff' AND status='cancelled' ORDER BY id DESC LIMIT 1`
+		}
+		err := tx.QueryRowContext(ctx, query, jobID).Scan(&actionID, &actionRevision)
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, fmt.Errorf("%w: no resolved action on parked job", ErrConflict)
 		}
 		if err != nil {
+			return 0, err
+		}
+	}
+	if rejected {
+		res, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, terminal_reason=NULL, updated_at=?,
+			retry_at=NULL, lease_owner=NULL, lease_expires_at=NULL WHERE id=? AND state=?`,
+			StateAwaitingHuman, now, jobID, StateUnavailable)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return 0, fmt.Errorf("%w: job changed; list jobs again", ErrConflict)
+		}
+		transition, err := json.Marshal(map[string]any{"from": StateUnavailable, "to": StateAwaitingHuman, "reason": "operator_redrive"})
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO events(job_id,at,kind,detail_json) VALUES(?,?,'job.transition',?)`, jobID, now, string(transition)); err != nil {
 			return 0, err
 		}
 	}

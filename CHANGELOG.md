@@ -11,6 +11,14 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- An empty browser `job_reject` no longer ends a job as
+  `unavailable / browser_rejected`. The frame carries no reason, and the
+  extension sent it only when it had lost its own offer URL. The job now stays
+  `awaiting_human` with its handoff open, and a later poll offers it again.
+  Measured live 2026-09-23: six queued institutional papers were retired in
+  one second this way. `papio jobs redrive <job-id> --revision 0` now also
+  accepts an `unavailable` job whose terminal reason is `browser_rejected`
+  and returns it to `awaiting_human` with a fresh institutional handoff.
 - A PMID-only job now gains its DOI, title, authors, and year from the PMID's
   own Europe PMC record before routing, so resolvers can use the DOI and the
   institutional OpenURL carries `rft_id=info:doi/...` instead of only

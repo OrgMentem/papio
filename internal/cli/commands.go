@@ -531,6 +531,10 @@ func newJobsCommand(opt *options) *cobra.Command {
 		Long: "Replace a parked manual download, an open-access browser handoff whose\n" +
 			"URL answered HTML, or an open terms_acceptance_required action with no\n" +
 			"live browser claim, with a fresh institutional handoff.\n\n" +
+			"An unavailable job whose terminal reason is browser_rejected is also\n" +
+			"accepted with --revision 0: that reason came from an empty browser\n" +
+			"job_reject, which says nothing about the paper, and redrive returns the\n" +
+			"job to awaiting_human with a fresh institutional handoff.\n\n" +
 			"Redrive accepts nothing on the provider: the extension's own terms\n" +
 			"consent setting decides again when the handoff is driven, and without\n" +
 			"consent the job parks on terms again.\n\n" +

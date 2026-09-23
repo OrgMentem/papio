@@ -7033,8 +7033,15 @@ export class Bridge {
           }
         }
         if (tabID === undefined && url === undefined) {
-          this.send("job_reject", {}, request.jobID);
-          await this.removeJobWithOffer(request.jobID);
+          // The offer URL is worker-local state papio lost (a same-URL
+          // re-offer, a worker restart), not a provider refusal. `job_reject`
+          // would retire the paper as unavailable; park it for the daemon's
+          // re-offer instead.
+          dequeue();
+          await this.parkUndrivableHandoff(
+            request.jobID,
+            "queued drive has no offer URL",
+          );
           continue;
         }
         if (tabID === undefined && url !== undefined) {
@@ -14699,15 +14706,15 @@ export class Bridge {
     await this.update((s) => upsertJob(s, job));
   }
 
-  /** A browser that will not give papio a surface has said nothing about the
-   * paper. `job_reject` is terminal daemon-side (`browser_rejected` ->
-   * `unavailable`), so answering a local surface failure with it retires work a
-   * later epoch would drive: measured live, 19 papers between 2026-08-19 and
-   * 08-23 ended exactly that way, each with an empty `browser.job_reject {}` as
-   * its whole diagnosis, after two offers it had answered `queued`. Drop local
+  /** A browser that will not give papio a surface, or has lost the offer URL
+   * it needs, has said nothing about the paper. Older daemons made
+   * `job_reject` terminal (`browser_rejected` -> `unavailable`), so answering
+   * local failures with it retired work a later epoch would drive: 19 papers
+   * between 2026-08-19 and 08-23, and six queued institutional handoffs at
+   * once on 2026-09-23, each with an empty `browser.job_reject {}` as its whole
+   * diagnosis. This extension no longer sends `job_reject`. Drop local
    * tracking, free the drive slot, and let the daemon re-offer - the same
-   * disposition the MAX_AUTH_ATTEMPTS path already documents ("No job_reject -
-   * that is terminal; the job stays parked and is re-offered"). */
+   * disposition the MAX_AUTH_ATTEMPTS path already documents. */
   private async parkUndrivableHandoff(
     jobID: string,
     reason: string,
@@ -16124,9 +16131,13 @@ export class Bridge {
           this.queuedHandoffTimers.delete(queued.job_id);
           const url = this.offerURLs.get(queued.job_id);
           if (url === undefined) {
+            // Lost worker-local state, not a provider refusal: see
+            // parkUndrivableHandoff. The daemon re-offers with the URL.
             this.pendingForcedReleases.delete(queued.job_id);
-            this.send("job_reject", {}, queued.job_id);
-            await this.removeJobWithOffer(queued.job_id);
+            await this.parkUndrivableHandoff(
+              queued.job_id,
+              "queued handoff has no offer URL",
+            );
             continue;
           }
           if (!(await this.acknowledgePendingProviderHandoffs(providerKey)))
@@ -17705,7 +17716,12 @@ export class Bridge {
       return;
     }
     if (freshLinks && requiresAuth === true && existing !== undefined) {
-      this.offerURLs.delete(jobID);
+      // A live-tab fresh-link job never reuses the resolver URL. A tabless
+      // job re-offered with the same URL stays queued for exactly that URL
+      // (the branch below keeps the record), so dropping it here stranded
+      // the job for an empty `job_reject` when its drive slot freed - six
+      // institutional papers at once on 2026-09-23.
+      if (existing.tab_id >= 0) this.offerURLs.delete(jobID);
       this.keepaliveManager?.learnResolver(openurl);
     }
     if (existing !== undefined && existing.requires_auth !== requiresAuth) {

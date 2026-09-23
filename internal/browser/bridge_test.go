@@ -3251,16 +3251,20 @@ func TestOABrowserHandoffOffersCandidateThenFallsBackToInstitution(t *testing.T)
 	if !foundAction {
 		t.Fatal("missing fallback handoff action")
 	}
+	// An empty reject is not evidence against the institutional route: the
+	// job stays parked on it, and any re-offer is that route, never the OA URL.
 	msgs, _ = runSync(t, b, inFrame(t, protocol.MsgJobReject, id, map[string]any{}))
-	if countType(msgs, protocol.MsgJobOffer) != 0 {
-		t.Fatal("institutional fallback must not re-open the OA browser offer")
+	for _, msg := range msgs {
+		if msg.Type == protocol.MsgJobOffer && msg.Payload.(*protocol.JobOfferPayload).OpenURL == oaURL {
+			t.Fatal("institutional fallback must not re-open the OA browser offer")
+		}
 	}
 	row, err = jobs.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.State != job.StateUnavailable {
-		t.Fatalf("state after institutional rejection = %s, want unavailable", row.State)
+	if row.State != job.StateAwaitingHuman {
+		t.Fatalf("state after empty institutional rejection = %s, want awaiting_human", row.State)
 	}
 }
 
@@ -5816,12 +5820,6 @@ func TestOAFallbackRequiresFetchableIdentifier(t *testing.T) {
 			payload:     map[string]any{"outcome": "no_entitlement"},
 		},
 		{
-			name:        "browser rejection without identifier settles",
-			w:           work.Work{Title: "A title-matched report without an identifier"},
-			messageType: protocol.MsgJobReject,
-			payload:     map[string]any{},
-		},
-		{
 			name:         "identified OA handoff retains institutional fallback",
 			w:            handoffWork(),
 			messageType:  protocol.MsgProviderOutcome,
@@ -6121,22 +6119,40 @@ func TestRequeuedRouteNeverConvertsOAHandoffBackToInstitution(t *testing.T) {
 	}
 }
 
-func TestJobRejectEndsHandoffUnavailable(t *testing.T) {
+// TestEmptyJobRejectKeepsHandoffOpenForReoffer pins that an empty job_reject
+// is not a provider refusal. The frame has no payload, and the extension sent
+// it only when its own worker-local offer URL was gone. Live 2026-09-23
+// 10:51:17Z, six queued institutional handoffs were rejected that way in one
+// drain and moved to terminal unavailable/browser_rejected. The job stays
+// awaiting_human with its handoff open, and a later offer carries it again.
+func TestEmptyJobRejectKeepsHandoffOpenForReoffer(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
 	id := park(t, jobs, "wr_reject", handoffWork())
 	runSync(t, b, hello())
-	runSync(t, b, inFrame(t, protocol.MsgJobReject, id, map[string]any{}))
+	if !b.offered[id] {
+		t.Fatal("handoff was not offered on first sync")
+	}
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgJobReject, id, map[string]any{}))
 
 	row, _ := jobs.Get(ctx, id)
-	if row.State != job.StateUnavailable || row.TerminalReason != "browser_rejected" {
-		t.Fatalf("rejected job = %+v", row)
+	if row.State != job.StateAwaitingHuman || row.TerminalReason != "" {
+		t.Fatalf("rejected job = state:%s terminal:%q, want awaiting_human with no terminal reason", row.State, row.TerminalReason)
 	}
-	actions, _ := jobs.ListHumanActions(ctx, false)
+	actions, _ := jobs.ListHumanActions(ctx, true)
+	open := false
 	for _, a := range actions {
-		if a.Kind == handoffActionKind && a.Status == "open" {
-			t.Fatal("handoff action still open after reject")
+		if a.JobID == id && a.Kind == handoffActionKind {
+			open = true
 		}
+	}
+	if !open {
+		t.Fatal("handoff action closed by an empty reject")
+	}
+	later, _ := runSync(t, b)
+	offer := firstOfType(append(msgs, later...), protocol.MsgJobOffer)
+	if offer == nil || offer.JobID != id {
+		t.Fatalf("rejected handoff was not offered again: %+v %+v", msgs, later)
 	}
 }
 

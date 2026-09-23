@@ -972,6 +972,11 @@ Replace a parked manual download, an open-access browser handoff whose
 URL answered HTML, or an open terms_acceptance_required action with no
 live browser claim, with a fresh institutional handoff.
 
+An unavailable job whose terminal reason is browser_rejected is also
+accepted with --revision 0: that reason came from an empty browser
+job_reject, which says nothing about the paper, and redrive returns the
+job to awaiting_human with a fresh institutional handoff.
+
 Redrive accepts nothing on the provider: the extension's own terms
 consent setting decides again when the handoff is driven, and without
 consent the job parks on terms again.
