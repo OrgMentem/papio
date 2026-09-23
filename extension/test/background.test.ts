@@ -2861,6 +2861,112 @@ test("closing a filed paper's sign-in surface raises no toast", async () => {
   expect(internals.toastPending()).toBeUndefined();
 });
 
+// Measured live 2026-09-23: about twenty-four tabs in papio's group against two
+// ledger records. Primo's full-text link and ScienceDirect's "View PDF" open
+// children of papio's tab, Chrome groups them with it, and papio never recorded
+// them, so no lifecycle path could close them.
+test("a provider child of a papio tab is ledgered under its paper and closes with it", async () => {
+  const jobID = "job_provider_child";
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const windowId = h.tabs.snapshot(tabID)!.windowId!;
+  const child = await h.tabs.create({
+    url: "https://primo.example.edu/fulltext",
+    active: false,
+    windowId,
+    openerTabId: tabID,
+  });
+  await h.tabs.completeNavigation(child.id!, "https://primo.example.edu/fulltext");
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  const record = internals.tabLedgerCache[String(child.id)];
+  expect(record).toMatchObject({ job_id: jobID, purpose: "provider-child" });
+  // The child is not the claim's owner: its loss must never report one.
+  expect(record?.claim).toBeUndefined();
+
+  // While the paper is still driven, the child is part of that drive.
+  let from = h.port.posted.length;
+  expect(await h.bridge.reconcileOwnedTabs()).toEqual({ closed: 0 });
+  expect(h.frames().slice(from).map((f) => f.type)).not.toContain("surface_close_request");
+
+  // The paper ends: its tab and its child both close, and neither is a
+  // cancellation.
+  from = h.port.posted.length;
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "cancel",
+    msg_id: "cancel-provider-child",
+    seq: 9,
+    job_id: jobID,
+    payload: {},
+  });
+  await answerCloseRequests(h, from, 2, "unclaimed");
+  expect(h.tabs.removed).toContain(tabID);
+  expect(h.tabs.removed).toContain(child.id!);
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+});
+
+// Operator decision 2026-09-23: papio's group is papio's. A tab in it that
+// papio never recorded (a child opened before this build, a blank tab a
+// download-only navigation left) is closed once cold. A newborn child in the
+// moment before it is ledgered must never be.
+test("a cold unledgered tab in papio's container closes, and a warm one never does", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  const internals = h.bridge as unknown as {
+    update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
+  };
+  await internals.update((s) => ({ ...s, workWindowID: 1 }));
+  h.windows!.live.set(1, { id: 1, state: "minimized", focused: false });
+  const cold = h.clock.now - 30 * 60_000;
+  const open = async (url: string, lastAccessed?: number): Promise<number> => {
+    const tab = await h.tabs.create({ url, active: false, windowId: 1 });
+    if (lastAccessed !== undefined) h.tabs.patch(tab.id!, { lastAccessed });
+    return tab.id!;
+  };
+  const coldArticle = await open("https://www.sciencedirect.com/science/article/pii/S0006322399002309", cold);
+  const blank = await open("", cold);
+  const pinned = await open("https://primo.example.edu/keep", cold);
+  h.tabs.patch(pinned, { pinned: true });
+  const newborn = await open("https://www.sciencedirect.com/getPdf", h.clock.now);
+  const unmeasured = await open("https://ebookcentral.proquest.com/lib/x");
+  const elsewhere = await h.tabs.create({ url: "https://example.org/", active: false, windowId: 2 });
+  h.tabs.patch(elsewhere.id!, { lastAccessed: cold });
+
+  let from = h.port.posted.length;
+  expect(await h.bridge.reconcileOwnedTabs()).toEqual({ closed: 2 });
+  expect([...h.tabs.removed].sort()).toEqual([coldArticle, blank].sort());
+  // Browser-local: there is no binding to ask the daemon about.
+  expect(h.frames().slice(from).map((f) => f.type)).not.toContain("surface_close_request");
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+
+  // A tab without lastAccessed is cold only after two passes that far apart.
+  h.clock.now += 30 * 60_000;
+  h.tabs.patch(newborn, { lastAccessed: h.clock.now });
+  from = h.port.posted.length;
+  expect(await h.bridge.reconcileOwnedTabs()).toEqual({ closed: 1 });
+  expect(h.tabs.removed).toContain(unmeasured);
+  for (const kept of [pinned, newborn, elsewhere.id!])
+    expect(h.tabs.snapshot(kept)).toBeDefined();
+});
+
 // A drive says so, and a paper parked behind the single drive slot says the
 // opposite. The daemon charges a fruitless drive epoch per DRIVING accept and
 // retires a paper after three, so a queued accept reported as a drive retires

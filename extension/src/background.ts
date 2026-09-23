@@ -1093,6 +1093,10 @@ export interface TabInfo {
   /** Whether the tab is the selected tab in its window. Orphan cleanup never
    * closes a tab the user is actively looking at. */
   active?: boolean | undefined;
+  /** When the tab was last active, in ms since the epoch; a tab never made
+   * active reports its creation time. The positive signal that an unledgered
+   * tab in papio's container has gone cold. */
+  lastAccessed?: number | undefined;
 }
 /** Normalize only the fragment component for managed-tab dedupe. Chrome may
  * canonicalize a URL while creating a tab, so use URL.href when possible and
@@ -1143,6 +1147,12 @@ export type ManagedTabPurpose =
  * record (Slice 2b): excluded from cross-job reuse pools the same way the
  * legacy raw-URL ledger's `privateURL` flag was. */
 const PRIVATE_SURFACE_PURPOSE = "federated-login";
+/** Birth-record purpose for a tab a provider or resolver opened from a papio
+ * surface (a `target=_blank` full-text link, a "View PDF" window.open). papio
+ * did not create it, but it opened inside papio's container for papio's
+ * paper, so it follows that paper's lifecycle: it closes when the paper is
+ * filed, ends, or is driven again. */
+const PROVIDER_CHILD_PURPOSE = "provider-child";
 /** Bound on how many same-epoch ledger records classifyRestart() probes
  * with tabs.get while re-proving an update-class restart. */
 const RESTART_LIVENESS_SCAN_LIMIT = 25;
@@ -4525,6 +4535,9 @@ export class Bridge {
           // finished paper, not the route this drive needs; it is retired as
           // superseded below instead of being driven.
           entry.content === true ||
+          // A provider's child is the provider's page, not a route papio
+          // drives; a new drive retires it rather than renavigating it.
+          entry.purpose === PROVIDER_CHILD_PURPOSE ||
           entry.job_id !== options.jobId
         )
           continue;
@@ -4630,9 +4643,14 @@ export class Bridge {
     const rollbackPrivate =
       reason === "fresh-materialization-rollback" &&
       entry?.purpose === PRIVATE_SURFACE_PURPOSE;
+    // An unledgered tab in papio's container (retireUnledgeredContainerTabs)
+    // is closable only while it STAYS unledgered: a record written meanwhile
+    // hands it to the ordinary lifecycle instead.
+    const unledgeredContainer = reason === "unledgered-container";
     if (
       !materializationCleanup &&
-      (entry === undefined || findByTab(this.store, tabID) !== undefined)
+      ((unledgeredContainer ? entry !== undefined : entry === undefined) ||
+        findByTab(this.store, tabID) !== undefined)
     )
       return false;
     // Captured before the first await below: any onActivated/onUpdated
@@ -4693,7 +4711,8 @@ export class Bridge {
     // removing a tracked tab is what onTabRemoved reads as a cancellation.
     if (
       (this.tabTouchEpoch.get(tabID) ?? 0) !== epochAtStart ||
-      (!materializationCleanup && findByTab(this.store, tabID) !== undefined)
+      (!materializationCleanup && findByTab(this.store, tabID) !== undefined) ||
+      (unledgeredContainer && this.tabLedgerCache?.[String(tabID)] !== undefined)
     )
       return false;
     await this.deps.tabs.remove(tabID).catch(() => undefined);
@@ -4769,19 +4788,27 @@ export class Bridge {
    * still runs. The closes are fired, not awaited: callers ride the serialized
    * inbound chain, and the close transaction's daemon answer can only arrive
    * through that same chain. `skipBindingID` leaves a binding the caller
-   * already retires itself (a scaffold's own duplicates) to that caller. */
+   * already retires itself (a scaffold's own duplicates) to that caller.
+   *
+   * `disposition` is `surface_superseded` while the paper is driven from
+   * `keepTabID`; removeJobWithOffer passes its own disposition and -1 when
+   * the paper keeps no surface at all. The viewer papio is adopting from is
+   * spared either way: closeAfterAdoption retires it once the ack lands. */
   private async retireSupersededSurfaces(
     jobID: string,
     keepTabID: number,
     skipBindingID?: string,
+    disposition: SurfaceCloseDisposition = "surface_superseded",
   ): Promise<void> {
     const ledger = await this.snapshotTabLedger();
+    const adopting = this.adoptedViewerTabs.get(jobID);
     for (const [key, entry] of Object.entries(ledger)) {
       const tabID = Number(key);
       if (
         !Number.isInteger(tabID) ||
         tabID < 0 ||
         tabID === keepTabID ||
+        tabID === adopting ||
         entry.job_id !== jobID ||
         entry.purpose === "keepalive" ||
         entry.binding_id === skipBindingID ||
@@ -4790,7 +4817,7 @@ export class Bridge {
         findByTab(this.store, tabID) !== undefined
       )
         continue;
-      void this.closeOwnedSurface(tabID, "surface_superseded");
+      void this.closeOwnedSurface(tabID, disposition);
     }
   }
   private async saveTabLedger(
@@ -4913,6 +4940,69 @@ export class Bridge {
         ...(originDigest === undefined ? {} : { origin_digest: originDigest }),
         ...(jobID === undefined ? {} : { job_id: jobID }),
         ...(claim === undefined ? {} : { claim }),
+      };
+      return { value: undefined, changed: true };
+    });
+  }
+
+  /** Give a tab a provider or resolver opened from a papio surface a birth
+   * record under the opener's paper. Primo opens full text with
+   * `target=_blank`, and ScienceDirect's "View PDF" and getPdf are
+   * window.open children; Chrome puts each into the opener's group, and
+   * without a record no lifecycle path could ever judge them (measured live
+   * 2026-09-23: the ledger held two records while papio's group held about
+   * twenty-four tabs). The record carries no claim: the child is not the
+   * claim's owner, and closing it must never report owner_closed. Never
+   * throws, and a no-op for a tab already ledgered or an opener papio does
+   * not own. */
+  private async ledgerProviderChild(
+    tabID: number,
+    openerTabID: number,
+  ): Promise<void> {
+    if (this.deps.tabLedger === undefined) return;
+    if (this.tabLedgerCache?.[String(tabID)] !== undefined) return;
+    // Most tabs with an opener are the operator's own; with the ledger loaded
+    // they are refused here without queueing a ledger transaction.
+    if (
+      this.tabLedgerCache !== undefined &&
+      this.tabLedgerCache[String(openerTabID)] === undefined &&
+      findByTab(this.store, openerTabID) === undefined
+    )
+      return;
+    try {
+      const ledger = await this.snapshotTabLedger();
+      if (ledger[String(tabID)] !== undefined) return;
+      const opener = ledger[String(openerTabID)];
+      const jobID =
+        findByTab(this.store, openerTabID)?.job_id ??
+        (opener !== undefined &&
+        opener.purpose !== "keepalive" &&
+        !surfaceIsCeded(opener) &&
+        opener.browser_epoch === this.browserEpoch
+          ? opener.job_id
+          : undefined);
+      if (jobID === undefined) return;
+      await this.recordProviderChild(tabID, jobID);
+    } catch {
+      // Unrecorded is the state this tab was already in; the container sweep
+      // in reconcileOwnedTabs still covers it.
+    }
+  }
+
+  /** Write the claim-free provider-child record. Additive: an existing
+   * record for the tab is never rebound. */
+  private async recordProviderChild(tabID: number, jobID: string): Promise<void> {
+    await this.runTabLedgerTransaction((ledger) => {
+      const key = String(tabID);
+      if (ledger[key] !== undefined) return { value: undefined, changed: false };
+      ledger[key] = {
+        binding_id: this.deps.randomUUID(),
+        tab_hint: tabID,
+        purpose: PROVIDER_CHILD_PURPOSE,
+        browser_epoch: this.browserEpoch ?? "unknown",
+        extension_generation: this.deps.manifestVersion,
+        created_at: this.deps.now(),
+        job_id: jobID,
       };
       return { value: undefined, changed: true };
     });
@@ -5247,7 +5337,13 @@ export class Bridge {
         // may still act on (a live provider challenge is the case that
         // matters) is never taken out from under them.
         (owner?.tab_id === tabID &&
-          !(owner.parked_with_tab === true && this.surfaceIsCold(entry)))
+          !(owner.parked_with_tab === true && this.surfaceIsCold(entry))) ||
+        // A provider's child of a paper still being driven is part of that
+        // drive (the viewer it is about to adopt, the page it reads); it goes
+        // with the paper, or once the paper is tabless and the child cold.
+        (entry.purpose === PROVIDER_CHILD_PURPOSE &&
+          owner !== undefined &&
+          (owner.tab_id >= 0 || !this.surfaceIsCold(entry)))
       )
         continue;
       let tab: TabInfo;
@@ -5310,7 +5406,81 @@ export class Bridge {
       );
       if (result.closed) closed += 1;
     }
+    closed += await this.retireUnledgeredContainerTabs();
     return { closed };
+  }
+
+  /** When each unledgered tab in papio's container was first seen by this
+   * worker. Tab id and time only, never a URL. A worker that slept forgets,
+   * which only delays a close; `lastAccessed` is the signal that survives. */
+  private readonly unledgeredSeenAt = new Map<number, number>();
+
+  /** Close cold tabs in papio's own group or work window that papio has no
+   * record of: provider and resolver children opened before papio ledgered
+   * them, blank tabs a download-only navigation left, tabs restored into
+   * the group after a restart. Operator decision 2026-09-23: papio's group is
+   * papio's. Measured live that day: about twenty-four tabs in the group
+   * against two ledger records, so no record-driven path could reach them.
+   *
+   * Browser-local, because there is no binding to ask the daemon about. A
+   * tab is closed only when it is not pinned, no live job tracks it, the
+   * operator is not looking at it, and it is cold: last active at least
+   * PARKED_SURFACE_COLD_MS ago, or seen unledgered by two passes that far
+   * apart. A newborn child is warm by both measures, so the gap before
+   * onUpdated ledgers it can never close it. No toast: papio does not know
+   * that such a tab showed a paper it filed. */
+  private async retireUnledgeredContainerTabs(): Promise<number> {
+    if (this.deps.tabs.query === undefined) return 0;
+    const tabs = await this.deps.tabs.query({}).catch(() => []);
+    const ledger = await this.snapshotTabLedger();
+    const now = this.deps.now();
+    const pinnedToJobs = new Set<number>([
+      ...this.adoptedViewerTabs.values(),
+      ...this.completedDownloadTabs.values(),
+    ]);
+    const present = new Set<number>();
+    let closed = 0;
+    for (const tab of tabs) {
+      const tabID = tab.id;
+      if (
+        tabID === undefined ||
+        tab.pinned === true ||
+        ledger[String(tabID)] !== undefined ||
+        findByTab(this.store, tabID) !== undefined ||
+        pinnedToJobs.has(tabID)
+      )
+        continue;
+      // Group membership needs a lookup; the work window does not.
+      const inWorkWindow =
+        tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
+      const inPapioGroup =
+        !inWorkWindow &&
+        tab.groupId !== undefined &&
+        tab.groupId >= 0 &&
+        (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !== undefined;
+      if (!inWorkWindow && !inPapioGroup) continue;
+      present.add(tabID);
+      const firstSeen = this.unledgeredSeenAt.get(tabID);
+      if (firstSeen === undefined) this.unledgeredSeenAt.set(tabID, now);
+      // lastAccessed is authoritative when the browser reports it: a tab
+      // someone used a minute ago is warm however long this worker has
+      // known it. Only without it do two passes that far apart decide.
+      const cold =
+        typeof tab.lastAccessed === "number"
+          ? now - tab.lastAccessed >= PARKED_SURFACE_COLD_MS
+          : firstSeen !== undefined && now - firstSeen >= PARKED_SURFACE_COLD_MS;
+      if (!cold) continue;
+      // closeOwnedTab re-reads the tab and applies the same gates as every
+      // other close: pinned, outside the container, in front of the
+      // operator, touched, or taken by a job meanwhile all keep it.
+      if (await this.closeOwnedTab(tabID, "unledgered-container")) {
+        closed += 1;
+        this.unledgeredSeenAt.delete(tabID);
+      }
+    }
+    for (const tabID of this.unledgeredSeenAt.keys())
+      if (!present.has(tabID)) this.unledgeredSeenAt.delete(tabID);
+    return closed;
   }
 
   /** Operator-initiated review focuses one bounded orphan surface; the
@@ -13989,7 +14159,13 @@ export class Bridge {
       if (change.status === "loading" || change.url !== undefined) this.invalidateNativeViewerTab(tabID);
       this.noteViewerRuleChild(tabID, tab.openerTabId);
       this.touchTab(tabID);
-      return this.onTabUpdated(tabID, change, tab);
+      // Ledgered before classification, so a child papio's paper opened is
+      // papio's surface from its first event, never an unowned stray.
+      if (tab.openerTabId === undefined)
+        return this.onTabUpdated(tabID, change, tab);
+      return this.ledgerProviderChild(tabID, tab.openerTabId).then(() =>
+        this.onTabUpdated(tabID, change, tab),
+      );
     });
     this.deps.tabs.onRemoved.addListener((tabID) => {
       this.invalidateNativeViewerTab(tabID);
@@ -14802,6 +14978,14 @@ export class Bridge {
       tabID !== undefined && tabID >= 0 ? tabID : materializationTabID;
     if (closeTabID !== undefined && closeTabID >= 0)
       void this.closeOwnedSurface(closeTabID, closeDisposition);
+    // Every other surface of this paper - a provider's child tab, an earlier
+    // attempt's tab - goes with it under the same disposition.
+    await this.retireSupersededSurfaces(
+      jobID,
+      closeTabID ?? -1,
+      undefined,
+      closeDisposition,
+    );
   }
 
   /** A keepalive tab can outlive a cancellation, so clear its removed paper's
@@ -18271,8 +18455,12 @@ export class Bridge {
     // transaction; only a different surface (a viewer the provider opened)
     // needs a close of its own.
     const jobTabID = findByJob(this.store, jobID)?.tab_id;
+    // A viewer already ledgered for this paper (a provider child) is retired
+    // by removeJobWithOffer with the paper's other surfaces.
+    const viewerLedgered =
+      (await this.snapshotTabLedger())[String(tabID)]?.job_id === jobID;
     await this.removeJobWithOffer(jobID);
-    if (tabID === settledTabID || tabID === jobTabID) return;
+    if (tabID === settledTabID || tabID === jobTabID || viewerLedgered) return;
     // A viewer the provider opened is not papio's birth, but papio adopted
     // the paper from it inside its own container, and that is the authority
     // to close it. `job_id` is supplied because removeJobWithOffer above has
@@ -19528,6 +19716,11 @@ export class Bridge {
         ? candidates[0]
         : candidates.find((j) => j.tab_id === openerTabId);
     if (!job) return;
+    // The viewer is this paper's surface even when Chrome dropped the opener
+    // on a cross-origin PDF navigation and only the ledger or CDN relation
+    // proved it. The job's own tab keeps whatever authority it already has.
+    if (viewerTabId !== job.tab_id && this.deps.tabLedger !== undefined)
+      await this.recordProviderChild(viewerTabId, job.job_id);
     // Viewer adoption starts a browser download, so it participates in the
     // same single effect slot as every other download initiation. If another
     // effect is in flight, retry classification rather than parking the slot.
@@ -22471,7 +22664,13 @@ export class Bridge {
     )
       return;
     const owner = findByJob(this.store, record.job_id);
-    if (owner?.tab_id === tabID) return;
+    // A live paper's own tab and its provider children are left to the
+    // reconcile pass, which alone knows whether they have gone cold.
+    if (
+      owner?.tab_id === tabID ||
+      (owner !== undefined && record.purpose === PROVIDER_CHILD_PURPOSE)
+    )
+      return;
     await this.closeOwnedSurface(
       tabID,
       owner === undefined
