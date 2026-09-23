@@ -3144,14 +3144,15 @@ func normalizeReviewBusy(err error) error {
 }
 
 // DismissHumanAction atomically closes an open human action (compare-and-swap
-// on revision). It cancels the job only when that job is currently parked on
-// the dismissed action: awaiting_human for openurl_handoff, manual_download,
-// openurl_available, or document_delivery; or needs_review for
-// verify_identity or unsafe_pdf. A stale action from another state is closed without
-// disturbing the job's live work. downloads_access_required is deliberately
-// excluded from the awaiting_human list even though that action also parks a
-// job there: the pending download itself is fine, only the folder grant is
-// missing, so dismissing it must never cancel the acquisition.
+// on revision). It cancels the job only when no other human actions remain open
+// and that job is currently parked on the dismissed action: awaiting_human for
+// openurl_handoff, manual_download, openurl_available, or document_delivery; or
+// needs_review for verify_identity or unsafe_pdf. A stale action from another
+// state is closed without disturbing the job's live work.
+// downloads_access_required is deliberately excluded from the awaiting_human
+// list even though that action also parks a job there: the pending download
+// itself is fine, only the folder grant is missing, so dismissing it must never
+// cancel the acquisition.
 func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevision int64) (jobID string, err error) {
 	if actionID <= 0 || expectedRevision <= 0 {
 		return "", errors.New("dismiss requires a positive action ID and revision")
@@ -3194,10 +3195,16 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 		jobID, now, string(resolutionDetail)); err != nil {
 		return "", normalizeReviewBusy(err)
 	}
+	var otherActionOpen bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM human_actions
+			WHERE job_id = ? AND status = 'open')`, jobID).Scan(&otherActionOpen); err != nil {
+		return "", normalizeReviewBusy(err)
+	}
 	if err := tx.Commit(); err != nil {
 		return "", normalizeReviewBusy(err)
 	}
-	if dismissalCancelsParkedJob(actionKind, state) {
+	if !otherActionOpen && dismissalCancelsParkedJob(actionKind, state) {
 		return jobID, js.Cancel(ctx, jobID, TerminalReasonUserDismissed)
 	}
 	return jobID, nil

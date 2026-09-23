@@ -1200,6 +1200,52 @@ func TestDismissHumanActionCancelsAwaitingHandoff(t *testing.T) {
 	}
 }
 
+func TestDismissHumanActionKeepsAwaitingJobWithAnotherOpenAction(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_dismiss_handoff_with_terms", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{StateQueued, StateResolving},
+		{StateResolving, StateAwaitingHuman},
+	} {
+		if err := js.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handoffID, err := js.OpenHumanAction(ctx, id, "openurl_handoff", "institutional handoff", Access(false, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	termsID, err := js.OpenHumanAction(ctx, id, "terms_acceptance_required", "terms need acceptance", Access(false, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.DismissHumanAction(ctx, handoffID, 1); err != nil {
+		t.Fatal(err)
+	}
+	row, err := js.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != StateAwaitingHuman || row.TerminalReason != "" {
+		t.Fatalf("dismiss with terms still open: state = %q, reason = %q; want awaiting_human with no terminal reason", row.State, row.TerminalReason)
+	}
+	actions, err := js.ListHumanActions(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := make(map[int64]string, len(actions))
+	for _, action := range actions {
+		statuses[action.ID] = action.Status
+	}
+	if statuses[handoffID] != "cancelled" || statuses[termsID] != "open" {
+		t.Fatalf("actions after dismiss = %+v; want handoff cancelled and terms open", statuses)
+	}
+}
+
 func TestWithOpenHandoffJobHoldsAuthorizationThroughCallback(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
