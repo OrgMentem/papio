@@ -5,11 +5,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { createInterface } from "node:readline";
-import { Readable } from "node:stream";
 import { runTrial } from "./jev-trial";
 import { runNativeLoop, observationHash, type NativeObservation, type NativeDriver } from "./native-spike-loop";
-const { values } = parseArgs({ args: Bun.argv.slice(2), options: { "run-dir": { type: "string" }, "extension-id": { type: "string" }, "monitor-helper": { type: "string" }, "pdf-source": { type: "string" }, "job-id": { type: "string" }, "adoption-root": { type: "string" }, backend: { type: "string", default: "local-fixture" } }, strict: true });
+const { values } = parseArgs({ args: Bun.argv.slice(2), options: { "run-dir": { type: "string" }, "extension-id": { type: "string" }, "pdf-source": { type: "string" }, "job-id": { type: "string" }, "adoption-root": { type: "string" }, backend: { type: "string", default: "local-fixture" } }, strict: true });
 if (!values["run-dir"] || !/^[a-p]{32}$/.test(values["extension-id"] ?? "") || !["local-fixture", "jev"].includes(values.backend!)) throw new Error("Required --run-dir NEW_DIR --extension-id ID [--backend local-fixture|jev]");
 if ((values["job-id"] === undefined) !== (values["adoption-root"] === undefined) || (values["job-id"] && !/^job_[a-f0-9]+$/.test(values["job-id"]))) throw new Error("Adoption needs both --job-id job_HEX and --adoption-root PATH");
 const dir = resolve(values["run-dir"]), nonce = randomUUID(), origin = `chrome-extension://${values["extension-id"]}`;
@@ -74,15 +72,6 @@ const timeout = setTimeout(() => abort.abort(new Error("Fixture connection/start
 for (const name of ["SIGINT", "SIGTERM"] as const) process.on(name, () => abort.abort(new Error("Fixture cancelled")));
 const aborted = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(abort.signal.reason), { once: true }));
 let created = false;
-let monitor: ReturnType<typeof Bun.spawn> | undefined;
-let monitorLines: AsyncIterator<string> | undefined;
-async function monitorLine() {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const line = await Promise.race([monitorLines!.next(), new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { monitor?.kill(); reject(new Error("Monitor timed out")); }, 5000); })]);
-    if (line.done) throw new Error("Monitor exited without a report"); return JSON.parse(line.value);
-  } finally { clearTimeout(timer); }
-}
 try {
   await Promise.race([ready, aborted]);
   const setup = await rpc("setup"); created = true; record({ kind: "setup", ...setup });
@@ -93,11 +82,6 @@ try {
     const binding = await rpc("binding"); record({ kind: "binding_preflight", ...binding });
     if (binding?.job?.job_id !== values["job-id"] || binding.job.status !== "awaiting_download") throw new Error("Isolated job has no eligible PDF delivery binding; no model call or download attempted");
   }
-  if (values["monitor-helper"]) {
-    monitor = Bun.spawn([resolve(values["monitor-helper"]), "--passive-monitor"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
-    monitorLines = createInterface({ input: Readable.fromWeb(monitor.stdout as ReadableStream<Uint8Array> as never), crlfDelay: Infinity })[Symbol.asyncIterator]();
-    record({ kind: "monitor_start", ...await monitorLine() });
-  }
   const start = performance.now(), signal = AbortSignal.any([AbortSignal.timeout(90000), abort.signal]);
   let current: NativeObservation | undefined, count = 0;
   const driver: NativeDriver = {
@@ -106,8 +90,7 @@ try {
       if (!current || observationHash(current) !== hash) return { status: "stale", focusChanged: false, pointerMoved: false };
       const result = await rpc("act", { choice, revision: current.provenance.revision, filename });
       record({ kind: "browser_effect", ...result });
-      // The separate passive native monitor measures OS interference; these
-      // fields only state that this driver issues no focus/pointer operations.
+      // This driver issues no focus or pointer operations.
       return { status: result.status, focusChanged: false, pointerMoved: false };
     },
     artifact: async () => {
@@ -142,13 +125,5 @@ try {
 } finally {
   clearTimeout(timeout);
   if (created && socket) { try { record({ kind: "cleanup", ...await rpc("cleanup") }); } catch (error) { record({ kind: "cleanup_failed", error: String(error) }); } }
-  if (monitor) {
-    try {
-      (monitor.stdin as import("bun").FileSink).end();
-      const report = await monitorLine();
-      writeFileSync(`${dir}/monitor.json`, JSON.stringify(report, null, 2) + "\n", { mode: 0o600, flag: "wx" }); record({ kind: "monitor_stop", ...report });
-    } catch (error) { record({ kind: "monitor_failed", error: String(error) }); }
-    finally { monitor.kill(); }
-  }
   socket?.close(); server.stop(true);
 }

@@ -64,9 +64,8 @@ func (r *adapterRepairRecovery) correlates() bool {
 }
 
 const (
-	repairDeliveryBrowser    = "browser_download"
-	repairDeliveryNative     = "native_download"
-	repairDeliveryNativeSave = "native_viewer_save"
+	repairDeliveryBrowser = "browser_download"
+	repairDeliveryNative  = "native_download"
 )
 
 type repairEvent struct {
@@ -188,12 +187,8 @@ func deliveryBetween(events []repairEvent, after, before int64) string {
 			continue
 		}
 		switch event.kind {
-		case "browser.native_viewer_save_admitted":
-			delivery = repairDeliveryNativeSave
 		case "browser.native_download_admitted":
-			if delivery != repairDeliveryNativeSave {
-				delivery = repairDeliveryNative
-			}
+			delivery = repairDeliveryNative
 		case "browser.download_started":
 			if delivery == "" {
 				delivery = repairDeliveryBrowser
@@ -310,8 +305,6 @@ func linkAdapterRepairRecovery(capture adapterRepairCapture, jobID string, detai
 		route = repairRouteTemporal
 	case decisions > 0:
 		route = "agent_decision"
-	case delivery == repairDeliveryNativeSave:
-		route = repairDeliveryNativeSave
 	}
 	opens := countRepairEvents(events, 0, math.MaxInt64, func(event repairEvent) bool { return event.kind == "handoff.opened" })
 	return adapterRepairRecovery{
@@ -325,14 +318,12 @@ func adapterRepairRecoveryReport(recovery *adapterRepairRecovery) string {
 	if recovery == nil {
 		return "\n## validated fallback evidence\n\nNone linked. Pass `--recovery-job <job-id>` for a job that recorded this capture, failed declaratively, and then reached ready. canary.md is written only for a linked proposal.\n"
 	}
-	route := "The durable history does not attribute the delivery to an agent decision or native save; it may have been a manual download."
+	route := "The durable history does not attribute the delivery to an agent decision; it may have been a manual download."
 	switch recovery.Route {
 	case repairRouteTemporal:
 		route = "The failure record is an agent decision reservation with no completion receipt, so this link is temporal correlation only: it labels the regression but does not unlock the revision."
 	case "agent_decision":
 		route = fmt.Sprintf("%d agent decision(s) completed between the failure and the delivery.", recovery.AgentDecisions)
-	case repairDeliveryNativeSave:
-		route = "A deterministic native viewer save produced the delivery."
 	}
 	return fmt.Sprintf(`
 ## validated fallback evidence
@@ -400,7 +391,7 @@ PAPIO_TYPESAFE_API_KEY= papio --config <canary-config> doctor
 papio --config <canary-config> config agent status
 `+"```"+`
 
-The status must show no enabled backend. The verdict refuses any canary job that records an agent decision or a native save.
+The status must show no enabled backend. The verdict refuses any canary job that records an agent decision or a native admission.
 
 ## 2. Reproduce the failure with the current adapter %[6]s
 

@@ -869,8 +869,6 @@ const (
 	MsgProviderDriveEpochResult        = "provider_drive_epoch_result"
 	MsgAgentDecideRequestV1            = "agent_decide_request_v1"
 	MsgAgentDecideResultV1             = "agent_decide_result_v1"
-	MsgNativeViewerSaveRequestV1       = "native_viewer_save_request_v1"
-	MsgNativeViewerSaveResultV1        = "native_viewer_save_result_v1"
 	MsgNativeDownloadRebindRequestV1   = "native_download_rebind_request_v1"
 	MsgNativeDownloadRebindResultV1    = "native_download_rebind_result_v1"
 	MsgNativeDownloadArmRequestV1      = "native_download_arm_request_v1"
@@ -1260,7 +1258,6 @@ var jobScoped = map[string]bool{
 	MsgProviderDriveEpochStartRequest: true, MsgProviderDriveEpochStartResult: true,
 	MsgProviderDriveEpochResultRequest: true, MsgProviderDriveEpochResult: true,
 	MsgAgentDecideRequestV1: true, MsgAgentDecideResultV1: true,
-	MsgNativeViewerSaveRequestV1: true, MsgNativeViewerSaveResultV1: true,
 	MsgNativeDownloadRebindRequestV1: true, MsgNativeDownloadRebindResultV1: true,
 	MsgNativeDownloadArmRequestV1: true, MsgNativeDownloadArmResultV1: true,
 	MsgNativeDownloadImportRequestV1: true, MsgNativeDownloadImportResultV1: true,
@@ -2595,12 +2592,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 	if err != nil {
 		return nil, err
 	}
-	if env.Type == MsgNativeViewerSaveRequestV1 || env.Type == MsgNativeViewerSaveResultV1 {
-		if err := rejectNativeViewerDuplicateKeys(data); err != nil {
-			return nil, err
-		}
-	}
-	if env.Type == MsgAgentDecideRequestV1 || env.Type == MsgAgentDecideResultV1 || env.Type == MsgNativeViewerSaveRequestV1 || env.Type == MsgNativeViewerSaveResultV1 {
+	if env.Type == MsgAgentDecideRequestV1 || env.Type == MsgAgentDecideResultV1 {
 		if _, err := agentDecideObjectFields(data, "browser message",
 			[]string{"protocol", "type", "msg_id", "job_id", "seq", "payload"}); err != nil {
 			return nil, err
@@ -3022,8 +3014,6 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			err = p.validate()
 		}
 		msg.Payload = p
-	case MsgNativeViewerSaveRequestV1, MsgNativeViewerSaveResultV1:
-		msg.Payload, err = decodeNativeViewerSave(env.Payload, env.Type)
 	case MsgNativeDownloadRebindRequestV1, MsgNativeDownloadRebindResultV1, MsgNativeDownloadArmRequestV1, MsgNativeDownloadArmResultV1, MsgNativeDownloadImportRequestV1, MsgNativeDownloadImportResultV1:
 		msg.Payload, err = decodeNativeDownload(env.Payload, env.Type)
 	case MsgAgentDecideRequestV1:

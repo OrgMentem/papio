@@ -54,7 +54,6 @@ func (b *Bridge) CloseAcquisitionBackend() {
 	defer b.mu.Unlock()
 	b.agentClosed = true
 	b.retireNativeDownloads("")
-	b.retireNativeViewerSaves("")
 	for _, pending := range b.agentDecisions {
 		pending.cancel()
 	}
@@ -100,7 +99,6 @@ func (b *Bridge) agentAuthority(ctx context.Context, sessionID, jobID string, p 
 // replies. A browser that never polls again cannot occupy a decision slot.
 func (b *Bridge) retireAgentDecisions(sessionID string) {
 	b.retireNativeDownloads(sessionID)
-	b.retireNativeViewerSaves(sessionID)
 	for id, pending := range b.agentDecisions {
 		if pending.sessionID == sessionID || pending.generation != b.arbitration.generation() {
 			pending.cancel()

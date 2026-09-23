@@ -13,7 +13,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"papio/internal/artifact"
@@ -253,24 +252,12 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		TempPath: temp, SHA256: sha, SizeBytes: size,
 		SniffedMIME: "application/pdf", ContentType: "application/pdf", FinalHost: "browser",
 	}
-	filename := filepath.Base(path)
-	nativeViewer := strings.HasPrefix(filename, "papio-viewer-")
-	replacementAccess := s.adoptionReplacementAccess(ctx, jobID)
-	if nativeViewer {
-		// Native saves retain the selected action and attempt through delayed
-		// adoption and restart sweeps. Another open action is not authority to
-		// adopt bytes saved for a superseded selection.
-		err = s.Jobs.TransitionAwaitingToValidatingForNativeViewer(ctx, jobID, stored.ID, filename, sha)
-	} else {
-		err = s.Jobs.TransitionAwaitingToValidatingIfAdoptEligible(ctx, jobID, stored.ID)
-	}
-	if err != nil {
+	if err := s.Jobs.TransitionAwaitingToValidatingIfAdoptEligible(ctx, jobID, stored.ID); err != nil {
 		_ = os.Remove(temp)
 		return err
 	}
-	if !nativeViewer {
-		s.resolveAdoptedHandoffActions(ctx, jobID)
-	}
+	replacementAccess := s.adoptionReplacementAccess(ctx, jobID)
+	s.resolveAdoptedHandoffActions(ctx, jobID)
 
 	accepted, parked, err := s.validateCandidate(ctx, row, stored, result, &owner)
 	if err != nil {

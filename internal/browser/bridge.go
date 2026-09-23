@@ -45,7 +45,6 @@ import (
 	"papio/internal/config"
 	"papio/internal/grab"
 	"papio/internal/job"
-	"papio/internal/nativeviewer"
 	"papio/internal/notify"
 	"papio/internal/ownership"
 	"papio/internal/pdf"
@@ -363,17 +362,12 @@ type Bridge struct {
 	Version  string
 	Features []string
 
-	mu                 sync.Mutex
-	agentBackend       acquisitionagent.Backend
-	agentDecisions     map[string]*pendingAgentDecision
-	agentClosed        bool
-	nativeViewerDriver nativeviewer.Driver
-	nativeViewerSaves  map[string]*nativeViewerSave
-	nativeDownloads    map[string]*nativeDownloadReservation
-	nativeIOGate       chan struct{}
-	// nativeViewerRecovery serializes admitted-stage recovery. Its pacing map is
-	// never authority: every attempt re-reads durable admission and occupancy.
-	nativeViewerRecovery nativeViewerRecovery
+	mu                   sync.Mutex
+	agentBackend         acquisitionagent.Backend
+	agentDecisions       map[string]*pendingAgentDecision
+	agentClosed          bool
+	nativeDownloads      map[string]*nativeDownloadReservation
+	nativeIOGate         chan struct{}
 	providerDriveEpochMu sync.Mutex
 	seq                  int64
 	// arbitration owns holder identity, pending sessions, generation fences,
@@ -1474,13 +1468,6 @@ func (b *Bridge) helloAck(role, peerVersion string, peerFeatures []string) (json
 	if slices.Contains(peerFeatures, protocol.AgentNavigationFeature) && slices.Contains(features, agentFallbackFeature) && slices.Contains(features, protocol.NativeClickAdoptionFeature) && slices.Contains(features, triageCountsSchema3Feature) {
 		if i := slices.Index(features, triageCountsSchema2Feature); i >= 0 {
 			features[i] = protocol.AgentNavigationFeature
-		}
-	}
-	// Save v1 includes the older native-viewer parking outcome. Only peers
-	// advertising both can exchange that existing slot without changing the cap.
-	if b.nativeViewerDriver != nil && !b.agentClosed && slices.Contains(peerFeatures, protocol.NativeViewerSaveFeature) && slices.Contains(peerFeatures, nativeViewerDownloadFeature) {
-		if i := slices.Index(features, nativeViewerDownloadFeature); i >= 0 {
-			features[i] = protocol.NativeViewerSaveFeature
 		}
 	}
 	payload := protocol.HelloAckPayload{
@@ -3281,8 +3268,6 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	}
 
 	switch msg.Type {
-	case protocol.MsgNativeViewerSaveRequestV1:
-		return b.nativeViewerSaveRequest(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeViewerSaveRequestV1Payload))
 	case protocol.MsgNativeDownloadRebindRequestV1:
 		return b.rebindNativeDownload(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeDownloadRebindRequestV1Payload))
 	case protocol.MsgNativeDownloadArmRequestV1:
@@ -3482,15 +3467,6 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgDownloadComplete:
 		p := msg.Payload.(*protocol.DownloadCompletePayload)
-		// This producer can only come from daemon-admitted native staging.
-		// A browser completion must never manufacture its admission proof.
-		if p.Producer != nil && p.Producer.Strategy == job.NativeViewerSaveStrategy {
-			frame, err := b.frame(protocol.MsgError, msg.JobID, protocol.ErrorPayload{Code: "native_viewer_admission_required", Message: "Native viewer files require daemon admission."})
-			if err != nil {
-				return nil, err
-			}
-			return []json.RawMessage{frame}, nil
-		}
 		key := browserDownloadKey{JobID: msg.JobID, DownloadID: p.DownloadID}
 		detail := map[string]any{
 			"download_id": p.DownloadID, "filename": p.Filename,
@@ -9228,9 +9204,6 @@ func settledFileName(entries []os.DirEntry) (string, bool) {
 // before the default moved under the browser's download directory keeps
 // draining. A per-root error is fatal to the tick the same way it always was.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
-	// Admitted native-viewer stages publish into job directories first, so
-	// the scan below sees any bytes this tick recovered.
-	b.recoverNativeViewerStages(ctx)
 	// An orphaned effect permit settles here from what its job's directories
 	// show, or names the PDF the scan below must attribute to it.
 	orphan := b.recoverOrphanedEffectPermit(ctx)
@@ -11469,7 +11442,7 @@ jobLoop:
 		}
 	}
 	if b.effectPermitAvailable() && b.jobs != nil {
-		if permit, _ := b.jobs.LiveEffectPermit(ctx); permit != nil && permit.Strategy != job.NativeViewerSaveStrategy && !b.effectPermitWorkerLive(permit) {
+		if permit, _ := b.jobs.LiveEffectPermit(ctx); permit != nil && !b.effectPermitWorkerLive(permit) {
 			payload := protocol.EffectPermitReconcileRequestPayload{
 				RequestID:  newMsgID(),
 				PermitID:   permit.ID,
@@ -12119,10 +12092,6 @@ func (b *Bridge) effectPermitAvailable() bool {
 // durable generation; zero or a failed allocation never proves continuity.
 // This only defers recovery: it neither grants authority nor settles a permit.
 func (b *Bridge) effectPermitWorkerLive(permit *job.EffectPermit) bool {
-	if permit.Strategy == job.NativeViewerSaveStrategy {
-		r := b.nativeViewerSaves[permit.JobID]
-		return r != nil && r.record.PermitID == permit.ID && !r.terminal && r.ctx.Err() == nil && r.record.HolderGeneration == b.arbitration.generation()
-	}
 	holder := b.arbitration.holderSession()
 	generation := b.arbitration.generation()
 	now := b.now()

@@ -281,6 +281,15 @@ test("migration scrubs every legacy URL, claim hash, and global terms authority"
     "https://provider.example.edu",
   );
 });
+test("migration drops the retired helper-save latch and keeps the job", () => {
+  const migrated = migrateManagedState({
+    activeJobs: [migrationJob({
+      native_viewer_save: { token: "latch123", action_id: 42, action_revision: 3, state: "settled" },
+    })],
+  });
+  expect(migrated.activeJobs.map(job => job.job_id)).toEqual(["job_migrate_0001"]);
+  expect(migrated.activeJobs[0]).not.toHaveProperty("native_viewer_save");
+});
 test("legacy federated wait authority is scrubbed without stranding the job or its tab", () => {
   const migrated = migrateManagedState({
     version: 1,

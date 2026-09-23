@@ -31,8 +31,6 @@ const (
 	// ProducerAgent is a generic drive in which the article agent chose the
 	// control that produced the download.
 	ProducerAgent Producer = "agent"
-	// ProducerNativeViewer is a daemon-admitted native viewer save.
-	ProducerNativeViewer Producer = "native_viewer"
 	// ProducerDaemonFetch is bytes whose URL the daemon chose: a resolver
 	// candidate the daemon fetched itself, or a browser direct_get of a
 	// daemon-selected public route.
@@ -49,7 +47,7 @@ const (
 )
 
 // Producers lists the closed vocabulary in reporting order.
-var Producers = []Producer{ProducerAdapter, ProducerAgent, ProducerNativeViewer, ProducerDaemonFetch, ProducerManual, ProducerUnknown}
+var Producers = []Producer{ProducerAdapter, ProducerAgent, ProducerDaemonFetch, ProducerManual, ProducerUnknown}
 
 // Intervention names one kind of human involvement the job's own events
 // record for the attempt that produced the artifact.
@@ -276,8 +274,6 @@ func classifyBrowserDownload(record *ArtifactProducerRecord, in producerInputs, 
 	record.EffectKind = string(producer.Kind)
 	record.Basis = basis
 	switch {
-	case producer.Kind == GenericDrive && producer.Strategy == NativeViewerSaveStrategy:
-		record.Producer = ProducerNativeViewer
 	case producer.Kind == DirectGet:
 		record.Producer = ProducerDaemonFetch
 	case producer.Kind == GenericDrive && producer.Ordinal != nil:

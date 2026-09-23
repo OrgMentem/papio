@@ -1670,7 +1670,6 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
     "agent_fallback_v1",
     "native_click_adoption_v1",
     "agent_navigation_v1",
-    "native_viewer_save_v1",
   ]);
 });
 
@@ -9987,7 +9986,7 @@ for (const failure of ["html", "interrupted"] as const) {
   });
 }
 
-test("Firefox keeps the resident signed viewer on the native-save notice", async () => {
+test("Firefox keeps the resident signed viewer on the viewer-download notice", async () => {
   const { h, notices } = await residentSignedViewer({ firefox: true });
   expect(h.downloads.started).toEqual([]);
   expect(notices()).toHaveLength(1);

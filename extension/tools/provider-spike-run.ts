@@ -4,11 +4,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, readFileSync, appendFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { createInterface } from "node:readline";
-import { Readable } from "node:stream";
 import { runTrial } from "./jev-trial";
 import { runNativeLoop, observationHash, type NativeObservation, type NativeDriver } from "./native-spike-loop";
-const options = Object.fromEntries(["run-dir", "extension-id", "job-id", "entry-url", "doi", "adoption-root", "monitor-helper"].map(name => [name, { type: "string" as const }]));
+const options = Object.fromEntries(["run-dir", "extension-id", "job-id", "entry-url", "doi", "adoption-root"].map(name => [name, { type: "string" as const }]));
 const allOptions: Record<string, { type: "string" }> = { ...options, "drift-evidence": { type: "string" } };
 const { values } = parseArgs({ args: Bun.argv.slice(2), options: allOptions, strict: true });
 for (const name of Object.keys(options)) if (!values[name]) throw new Error(`Required --${name}`);
@@ -67,22 +65,11 @@ save("setup", receipt); console.log(JSON.stringify(receipt));
 const abort = new AbortController(), timeout = setTimeout(() => abort.abort(new Error("Provider setup deadline elapsed")), 600000);
 for (const name of ["SIGINT", "SIGTERM"] as const) process.on(name, () => abort.abort(new Error("Provider experiment cancelled")));
 const aborted = new Promise<never>((_resolve, reject) => abort.signal.addEventListener("abort", () => reject(abort.signal.reason), { once: true }));
-let monitor: ReturnType<typeof Bun.spawn> | undefined, lines: AsyncIterator<string> | undefined;
-async function monitorLine() {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const line = await Promise.race([lines!.next(), new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { monitor?.kill(); reject(new Error("Monitor timed out")); }, 5000); })]);
-    if (line.done) throw new Error("Monitor ended early"); return JSON.parse(line.value);
-  } finally { clearTimeout(timer); }
-}
 try {
   await Promise.race([ready, aborted]);
   const setup = await rpc("setup"); record({ kind: "setup", ...setup }); console.log(JSON.stringify({ ready: true, tabID: setup.tabID }));
   while (!startRequested) { abort.signal.throwIfAborted(); await Bun.sleep(100); }
   clearTimeout(timeout);
-  monitor = Bun.spawn([resolve(values["monitor-helper"]!), "--passive-monitor"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
-  lines = createInterface({ input: Readable.fromWeb(monitor.stdout as ReadableStream<Uint8Array> as never), crlfDelay: Infinity })[Symbol.asyncIterator]();
-  record({ kind: "monitor_start", ...await monitorLine() });
   const start = performance.now(), signal = AbortSignal.any([AbortSignal.timeout(90000), abort.signal]);
   let current: NativeObservation | undefined, count = 0;
   const driver: NativeDriver = {
@@ -118,11 +105,6 @@ finally {
   if (socket) {
     try { record({ kind: "final_download_evidence", ...await rpc("artifact") }); } catch {}
     try { record({ kind: "cleanup", ...await rpc("cleanup") }); } catch (error) { record({ kind: "cleanup_failed", error: String(error) }); }
-  }
-  if (monitor) {
-    try { (monitor.stdin as import("bun").FileSink).end(); save("monitor", await monitorLine()); }
-    catch (error) { record({ kind: "monitor_failed", error: String(error) }); }
-    finally { monitor.kill(); }
   }
   socket?.close(); server.stop(true);
 }

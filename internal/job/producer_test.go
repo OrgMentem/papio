@@ -315,7 +315,7 @@ func TestPacerOpenedJobIsUnattendedApartFromSignIn(t *testing.T) {
 	if stats.Acquired != 3 || stats.Unattended != 1 || stats.SignInOnly != 1 || stats.Intervened != 1 || stats.Unrecorded != 0 {
 		t.Fatalf("stats = %+v, want 3 acquired: 1 unattended, 1 sign-in only, 1 intervened", stats)
 	}
-	want := map[Producer]int{ProducerAdapter: 1, ProducerAgent: 0, ProducerNativeViewer: 0, ProducerDaemonFetch: 1, ProducerManual: 0, ProducerUnknown: 1}
+	want := map[Producer]int{ProducerAdapter: 1, ProducerAgent: 0, ProducerDaemonFetch: 1, ProducerManual: 0, ProducerUnknown: 1}
 	if !reflect.DeepEqual(stats.Producers, want) {
 		t.Fatalf("producers = %v, want %v", stats.Producers, want)
 	}

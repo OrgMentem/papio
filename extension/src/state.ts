@@ -8,7 +8,6 @@
 // is persisted. Legacy URL-bearing state is migrated to the URL-free managed
 // shape below; handoff URLs remain worker-local compatibility data only.
 
-import { migrateNativeViewerLatch, type NativeViewerLatch } from "./native-viewer";
 import type { DeliverySessionEvidence } from "./protocol";
 import { migrateNativeDownloadRecovery, type NativeDownloadRecovery } from "./native-download";
 
@@ -233,8 +232,6 @@ export interface ActiveJob {
   generic_drive_epoch?: ProviderDriveEpoch;
   /** Native observation recovery evidence only; never resumes actions or IDs. */
   native_download?: NativeDownloadRecovery;
-  /** Monotone no-replay evidence for an existing manual action. */
-  native_viewer_save?: NativeViewerLatch;
   /** Generic epoch bookkeeping is opaque correlation only. Candidate URLs and
    * page-derived evidence remain worker-local. */
   generic_evaluated?: boolean;
@@ -270,7 +267,7 @@ export interface ActiveJob {
    * source-controlled adapter id allows concurrent provider downloads to be
    * correlated without persisting a page URL, referrer, or live host. */
   download_initiated?: boolean;
-  /** Native-viewer notice: only a fresh explicit Send PDF may bind a download. */
+  /** Viewer-download notice: only a fresh explicit Send PDF may bind a download. */
   manual_delivery_required?: boolean;
   adapter_id?: string;
   /** Consecutive `unknown` classification streak, and the epoch-ms of the
@@ -1220,9 +1217,8 @@ function migratedJob(value: ActiveJob): ActiveJob {
   delete migrated.institution_claim_key;
   delete migrated.waiting_for_session_key;
   delete migrated.direct_envelope;
-  delete migrated.native_viewer_save;
-  const viewerLatch = migrateNativeViewerLatch(raw.native_viewer_save);
-  if (viewerLatch !== undefined) migrated.native_viewer_save = viewerLatch;
+  // Retired helper-save latch; an old persisted job may still carry it.
+  delete (migrated as unknown as UnknownRecord).native_viewer_save;
   delete migrated.native_download;
   const nativeDownload = migrateNativeDownloadRecovery(raw.native_download);
   if (nativeDownload !== undefined) migrated.native_download = nativeDownload;
@@ -1703,23 +1699,12 @@ function serializeManagedState(store: StoreShape): UnknownRecord {
 
 /** chrome.storage-backed StateBackend. Prefers session storage (cleared when
  * the browser restarts) and falls back to local when session is unavailable. */
-const NATIVE_VIEWER_LATCH_KEY = "papio_native_viewer_latches_v1";
 export function chromeBackend(storage: typeof chrome.storage): StateBackend {
   const area: chrome.storage.StorageArea = storage.session ?? storage.local;
   return {
     async load(): Promise<StoreShape> {
       const got: Record<string, unknown> = await area.get(STORAGE_KEY);
       const migrated = migrateManagedState(got[STORAGE_KEY]);
-      const saved = (await storage.local.get(NATIVE_VIEWER_LATCH_KEY))[NATIVE_VIEWER_LATCH_KEY];
-      if (isRecord(saved)) for (const [jobID, raw] of Object.entries(saved)) {
-        const latch = migrateNativeViewerLatch(raw);
-        if (!latch || !/^job_[a-zA-Z0-9_-]+$/.test(jobID)) continue;
-        const existing = migrated.activeJobs.find(j => j.job_id === jobID);
-        if (existing) existing.native_viewer_save = latch;
-        else migrated.activeJobs.push({ job_id: jobID, tab_id: -1, offered_at: 0,
-          expires_at: 0, status: "awaiting_download", provider_hosts: [],
-          manual_delivery_required: true, native_viewer_save: latch });
-      }
       // Persist the cutover immediately, so a legacy URL-bearing blob is not
       // left behind until some later unrelated state update.
       try {
@@ -1731,19 +1716,6 @@ export function chromeBackend(storage: typeof chrome.storage): StateBackend {
       return migrated;
     },
     async save(store: StoreShape): Promise<void> {
-      // Keep tombstones after job retirement: an extension update clears session
-      // storage and a later triage snapshot can recover the same action again.
-      const saved = (await storage.local.get(NATIVE_VIEWER_LATCH_KEY))[NATIVE_VIEWER_LATCH_KEY];
-      const latches: Record<string, NativeViewerLatch> = {};
-      if (isRecord(saved)) for (const [jobID, raw] of Object.entries(saved)) {
-        const latch = migrateNativeViewerLatch(raw);
-        if (latch) latches[jobID] = latch;
-      }
-      for (const job of store.activeJobs) {
-        const latch = migrateNativeViewerLatch(job.native_viewer_save);
-        if (latch) latches[job.job_id] = latch;
-      }
-      await storage.local.set({ [NATIVE_VIEWER_LATCH_KEY]: latches });
       await area.set({ [STORAGE_KEY]: serializeManagedState(store) });
     },
   };

@@ -2,7 +2,6 @@
 package browser
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -49,9 +48,7 @@ func nativePathKey(s string) string {
 	return s
 }
 
-// openNativeDownloadRoot pins the configured source and landing roots without
-// listing either. Recovery uses it directly: it never scans user files.
-func openNativeDownloadRoot(cfg config.Config) (_ *nativeDownloadRoot, err error) {
+func snapshotNativeDownloadRoot(ctx context.Context, cfg config.Config) (_ *nativeDownloadRoot, err error) {
 	landing := filepath.Clean(cfg.EffectiveAdoptionRoot())
 	if !filepath.IsAbs(landing) || !config.BrowserSteerableAdoptionRoot(landing) {
 		return nil, errNativeSource
@@ -94,19 +91,6 @@ func openNativeDownloadRoot(cfg config.Config) (_ *nativeDownloadRoot, err error
 	if err != nil || !os.SameFile(landingInfo, r.landingInfo) {
 		return nil, errNativeSource
 	}
-	return r, nil
-}
-
-func snapshotNativeDownloadRoot(ctx context.Context, cfg config.Config) (_ *nativeDownloadRoot, err error) {
-	r, err := openNativeDownloadRoot(cfg)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			r.close()
-		}
-	}()
 	dir, err := r.source.Open(".")
 	if err != nil {
 		return nil, errNativeSource
@@ -328,229 +312,4 @@ func (r *nativeDownloadRoot) publish(ctx context.Context, jobID, filename string
 		return errNativeSource
 	}
 	return nil
-}
-
-// Recovery classification. Anything else (errNativeSource, a timeout, a busy
-// gate, cancellation) is transient and never abandons admitted bytes.
-var (
-	errNativeStageMissing       = errors.New("native stage missing")
-	errNativeStageRejected      = errors.New("native stage does not hold the admitted bytes")
-	errNativePublicationBlocked = errors.New("native publication name is occupied")
-)
-
-// readNativeExact authenticates an open file against a prior Lstat and the
-// admitted digest/size. Identity drift or different bytes return mismatch;
-// only a read failure is transient.
-func readNativeExact(ctx context.Context, f *os.File, before os.FileInfo, digest string, size int64, singleLink bool, mismatch error) error {
-	opened, err := f.Stat()
-	if err != nil {
-		return errNativeSource
-	}
-	if !sameAdoptionFile(before, opened) || (singleLink && !nativeSingleLink(f, opened)) {
-		return mismatch
-	}
-	h := sha256.New()
-	buffer := make([]byte, 64*1024)
-	var n int64
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		read, rerr := f.Read(buffer)
-		if read > 0 {
-			n += int64(read)
-			if n > size {
-				return mismatch
-			}
-			_, _ = h.Write(buffer[:read])
-		}
-		if errors.Is(rerr, io.EOF) {
-			break
-		}
-		if rerr != nil {
-			return errNativeSource
-		}
-	}
-	after, err := f.Stat()
-	if err != nil {
-		return errNativeSource
-	}
-	if n != size || hex.EncodeToString(h.Sum(nil)) != digest || !sameAdoptionFile(before, after) {
-		return mismatch
-	}
-	return nil
-}
-
-// verifyStage re-authenticates retained daemon staging by its exact name. A
-// link, a non-regular or hard-linked entry, or bytes other than the durable
-// admission are rejected; nothing is chosen by recency or listing.
-func (r *nativeDownloadRoot) verifyStage(ctx context.Context, name, digest string, size int64) (nativeStagedFile, error) {
-	if !r.unchanged() {
-		return nativeStagedFile{}, errNativeSource
-	}
-	_, err := verifyNativeExactIn(ctx, r.landing, name, digest, size, true, errNativeStageRejected)
-	if errors.Is(err, os.ErrNotExist) {
-		return nativeStagedFile{}, errNativeStageMissing
-	}
-	if err != nil {
-		return nativeStagedFile{}, err
-	}
-	return nativeStagedFile{name: name, digest: digest, size: size}, nil
-}
-
-// verifyNativeExactIn authenticates one exact name, never following a link.
-// A missing name returns os.ErrNotExist; a non-regular entry or different
-// bytes return mismatch; only an I/O failure is transient.
-func verifyNativeExactIn(ctx context.Context, root *os.Root, name, digest string, size int64, singleLink bool, mismatch error) (os.FileInfo, error) {
-	before, err := root.Lstat(name)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, os.ErrNotExist
-	}
-	if err != nil {
-		return nil, errNativeSource
-	}
-	if !before.Mode().IsRegular() || before.Size() != size {
-		return nil, mismatch
-	}
-	f, err := root.Open(name)
-	if err != nil {
-		return nil, errNativeSource
-	}
-	defer func() { _ = f.Close() }()
-	if err := readNativeExact(ctx, f, before, digest, size, singleLink, mismatch); err != nil {
-		return nil, err
-	}
-	return before, nil
-}
-
-// nativePrefixOf reports whether part is a regular single-link file whose
-// bytes are a prefix of the already verified reference: the only shape a
-// crash inside publish's copy can leave. Such a part holds nothing that the
-// reference does not, so removing it cannot lose bytes.
-func nativePrefixOf(ctx context.Context, partRoot *os.Root, part string, partInfo os.FileInfo, refRoot *os.Root, ref string, refInfo os.FileInfo) (bool, error) {
-	if !partInfo.Mode().IsRegular() || partInfo.Size() > refInfo.Size() {
-		return false, nil
-	}
-	pf, err := partRoot.Open(part)
-	if err != nil {
-		return false, errNativeSource
-	}
-	defer func() { _ = pf.Close() }()
-	rf, err := refRoot.Open(ref)
-	if err != nil {
-		return false, errNativeSource
-	}
-	defer func() { _ = rf.Close() }()
-	opened, perr := pf.Stat()
-	refOpened, rerr := rf.Stat()
-	if perr != nil || rerr != nil {
-		return false, errNativeSource
-	}
-	if !sameAdoptionFile(partInfo, opened) || !nativeSingleLink(pf, opened) || !sameAdoptionFile(refInfo, refOpened) {
-		return false, nil
-	}
-	got, want := make([]byte, 64*1024), make([]byte, 64*1024)
-	var total int64
-	for {
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
-		n, readErr := pf.Read(got)
-		if n > 0 {
-			total += int64(n)
-			if total > refInfo.Size() {
-				return false, nil
-			}
-			if _, err := io.ReadFull(rf, want[:n]); err != nil || !bytes.Equal(got[:n], want[:n]) {
-				return false, nil
-			}
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return false, errNativeSource
-		}
-	}
-	after, err := pf.Stat()
-	if err != nil {
-		return false, errNativeSource
-	}
-	return total == partInfo.Size() && sameAdoptionFile(partInfo, after), nil
-}
-
-// resumePublication makes the job's final name hold exactly the admitted
-// bytes, from an exact existing final copy (a crash after publish's link) or
-// by publishing the verified stage. It never deletes the stage. A leftover
-// part file is removed only when provably redundant: the same inode as the
-// verified final copy, or a prefix of the admitted bytes (a crash mid-copy).
-// Anything else at those names blocks publication and is kept.
-func (r *nativeDownloadRoot) resumePublication(ctx context.Context, jobID, filename, stageName, digest string, size int64) error {
-	if !r.unchanged() || !filepath.IsLocal(jobID) || filepath.Base(jobID) != jobID {
-		return errNativeSource
-	}
-	var jobRoot *os.Root
-	info, err := r.landing.Lstat(jobID)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return errNativeSource
-	case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
-		return errNativePublicationBlocked
-	default:
-		if jobRoot, err = r.landing.OpenRoot(jobID); err != nil {
-			return errNativeSource
-		}
-		defer func() { _ = jobRoot.Close() }()
-		if pinned, err := jobRoot.Stat("."); err != nil || !os.SameFile(info, pinned) {
-			return errNativeSource
-		}
-	}
-	var final os.FileInfo
-	if jobRoot != nil {
-		final, err = verifyNativeExactIn(ctx, jobRoot, filename, digest, size, false, errNativePublicationBlocked)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	refRoot, refName, refInfo := jobRoot, filename, final
-	if final == nil {
-		stage, err := verifyNativeExactIn(ctx, r.landing, stageName, digest, size, true, errNativeStageRejected)
-		if errors.Is(err, os.ErrNotExist) {
-			return errNativeStageMissing
-		}
-		if err != nil {
-			return err
-		}
-		refRoot, refName, refInfo = r.landing, stageName, stage
-	}
-	if jobRoot != nil {
-		part := filename + ".part"
-		p, err := jobRoot.Lstat(part)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-		case err != nil:
-			return errNativeSource
-		default:
-			redundant := final != nil && os.SameFile(p, final)
-			if !redundant {
-				if redundant, err = nativePrefixOf(ctx, jobRoot, part, p, refRoot, refName, refInfo); err != nil {
-					return err
-				}
-			}
-			if !redundant {
-				return errNativePublicationBlocked
-			}
-			if err := jobRoot.Remove(part); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return errNativeSource
-			}
-		}
-	}
-	if final != nil {
-		return nil
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return r.publish(ctx, jobID, filename, nativeStagedFile{name: stageName, digest: digest, size: size})
 }

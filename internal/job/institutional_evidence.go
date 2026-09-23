@@ -846,15 +846,6 @@ func (js *Store) CommitArtifactWinnerAndProducer(
 		return ArtifactWinner{}, false, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if producer != nil && producer.Kind == GenericDrive && producer.Strategy == NativeViewerSaveStrategy {
-		admission, err := nativeViewerProducerAdmissionTx(ctx, tx, winner.JobID, *producer)
-		if err != nil {
-			return ArtifactWinner{}, false, false, err
-		}
-		if admission.SHA256 != winner.SHA256 || admission.JobAttemptRevision != winner.JobAttemptRevision {
-			return ArtifactWinner{}, false, false, ErrEffectPermitStale
-		}
-	}
 	if producer != nil {
 		// Artifact producer identity is historical. A file can arrive after the
 		// bridge and materialization claim move to a replacement holder, so the
