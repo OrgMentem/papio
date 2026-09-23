@@ -111,6 +111,8 @@ Two amendments, taken as operator decisions:
   and "active" means in front of the operator; see the amendment below.
 - **Owner-age and URL-shape liveness stays banned.** Retirement and resume ride
   daemon claim state and explicit transitions only.
+  *Amended 2026-09-23:* one exception, papio's own container. See "Amendment
+  2026-09-23: papio's group is papio's" below.
 
 Reaffirmed rules, restated so they survive without the plans that held them:
 
@@ -215,6 +217,37 @@ a new or reused surface is recorded for a job, papio retires the job's other
 owned surfaces as `surface_superseded`. When papio closes the tabs of papers it
 filed, one toast per batch offers to reopen them from URLs held in worker
 memory only.
+
+### Amendment 2026-09-23: papio's group is papio's
+
+Operator decision, 2026-09-23, relayed by the orchestrator in these words:
+"papio's group is papio's". Measured the same day: about twenty-four tabs in
+papio's tab group against two birth records. Most were tabs a provider or
+resolver opened from a papio tab (Primo's `target=_blank` full-text link,
+ScienceDirect's "View PDF" and getPdf windows), which Chrome places in the
+opener's group and papio never recorded.
+
+- **Provider children are papio's surfaces.** When a tab's opener is a papio
+  surface for a paper (a birth record with a job, or a live job's tab), the
+  child gets a birth record for that paper with purpose `provider-child`, before
+  it is classified. It carries no claim, so its loss never reports
+  `owner_closed`. It stays while its paper is still driven from a tab, and
+  otherwise follows the paper: it closes when the paper is filed, ends, is
+  driven again, or is tabless and cold.
+- **Unrecorded tabs in papio's container close when cold.** A tab in papio's
+  group or work window with no birth record, not tracked by a live job, not
+  pinned and not in front of the operator is closed browser-locally once it is
+  cold: last active at least the parked-surface cold window ago, or, where the
+  browser does not report that, seen unrecorded by two passes that far apart.
+  The first-seen time lives in worker memory, keyed by tab id, never with a URL.
+  A newborn child is warm by both measures, so the moment before it is recorded
+  can never close it. No `provider_outcome` is sent and no toast is raised.
+
+This collides with two bans in Decision 4: it is a universal backstop over a
+container, and it uses age (last access) as liveness. The operator's decision
+overrides both for papio's own group and work window only. Everywhere else the
+bans stand: a tab outside papio's container is never closed on age, and a
+recorded surface still retires only on claim state and explicit transitions.
 
 The daemon side: `job_inactive` and `surface_superseded` also authorize the
 tab of a binding whose own claim is settled or abandoned, because such a

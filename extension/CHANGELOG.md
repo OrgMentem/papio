@@ -26,6 +26,11 @@ for the full pre-split extension history.
 - **A toast offers the closed papers back.** "papio filed the paper and closed
   its tab." (or "N papers … their tabs.") with **Reopen**, one toast per batch.
   Reopen reopens them; if the browser slept meanwhile it opens History instead.
+- **Tabs a provider opens from a papio tab are papio's too.** A full-text link
+  or "View PDF" window opened from papio's tab closes with its paper. A tab in
+  papio's group or work window that papio has no record of (including blank
+  "New Tab" tabs) closes once nobody has used it for 30 minutes, unless it is
+  pinned or in front of you.
 
 ### Fixed
 - **A redrive no longer leaves the old tab beside the new one.** Opening a
