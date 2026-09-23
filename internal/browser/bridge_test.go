@@ -6956,7 +6956,16 @@ func TestMisfencedOpenAccessCandidateIsRefencedInPlace(t *testing.T) {
 			name: "claimed by a superseded browser generation",
 			claim: func(t *testing.T, b *Bridge, jobs *job.Store, cand *job.BrowserCandidate) {
 				t.Helper()
-				mustClaim(t, b, jobs, cand, b.arbitration.generation()-1, b.now().UTC().Add(10*time.Minute))
+				mustClaim(t, b, jobs, cand, b.arbitration.generation(), b.now().UTC().Add(10*time.Minute))
+				// ClaimMaterialization refuses a generation the fence has
+				// already swept (migration 0053), so the fixture ages a real
+				// claim into the superseded generation - the shape a live
+				// store holds after a promotion.
+				if _, err := jobs.S.DB().ExecContext(context.Background(),
+					`UPDATE materialization_claims SET browser_holder_generation=? WHERE candidate_id=?`,
+					b.arbitration.generation()-1, cand.ID); err != nil {
+					t.Fatal(err)
+				}
 			},
 		},
 		{
