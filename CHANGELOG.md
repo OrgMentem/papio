@@ -39,127 +39,6 @@ execution records kept during the initial build.
 
 ## [0.22.0] - 2026-09-23
 
-### Fixed
-- **Diagnostic captures and support reports no longer carry your IP address.**
-  Elsevier's refusal page prints the reader's IP address, and every capture of
-  it kept that address. The capture store now masks IPv4 and IPv6 addresses
-  before it writes a capture, even one from an older extension, and records
-  `sanitizer_version` `2`. `papio adapter diagnose` masks them too. DOIs,
-  dates, clock times and software versions such as `Chrome/153.0.0.0` are
-  kept. `papio adapter repair` accepts only version 2 captures, so capture a
-  page again to repair from it; version 1 captures may still hold an address.
-- **A provider refusal page no longer latches adapter drift or parks the
-  paper.** When the extension reports a provider block (`rate_limited`), the
-  daemon releases the drive's binding, closes the handoff, and puts the job in
-  `retry_wait` for `browser.action_expiry_seconds`. It also records a
-  `browser.provider_cooldown` event with the refusing host and the time until
-  which papio should not drive that host. No drift latch and no manual download
-  are created, because nothing on a refusal page is for a person to do.
-- **A waiting PDF grab no longer makes your browser reconnect every few
-  seconds.** When every open action belonged to a known family, the inbox
-  count listed the grab's family first even though it ranks last. The
-  browser protocol rejected that order, and the native host restarted each
-  time the count was read. The families are now listed in rank order.
-- An accepted identity review whose objection was a foreign front-matter DOI
-  now promotes the accepted file. The reuse pass re-ran the automatic
-  foreign-DOI rejection over the same bytes, marked them `wrong_work`, and
-  sent the job back to acquisition. Measured live 2026-09-23: JSTOR's copy of
-  a SAGE article prints JSTOR's own 10.2307 DOI, and the operator's accept was
-  silently overridden. The waiver holds only for a `verify_identity` accept,
-  and only while the file hashes to the SHA-256 that accept named, so
-  adopting the same file again also promotes it. Other rejects, other bytes,
-  and an `unsafe_pdf` accept still go through every check, and the same file
-  without an accept still parks for review. The `ready` transition records
-  `reason: review_accepted` and `identity_override: operator`.
-- `papio jobs redrive <job-id> --revision <n>` now reopens a `needs_review`
-  job whose one open manual download asks the operator to remove an adopted
-  file that failed validation and could not be moved to `rejected/`. Once no
-  file remains in the job's adoption directories, the job returns to
-  `awaiting_human` with a fresh institutional handoff. While a file remains,
-  or the directory cannot be read, redrive refuses, because the adoption
-  sweep would adopt and reject the same file again. Measured live 2026-09-23:
-  a job sat on that action from 2026-08-30 with its file long gone, and every
-  CLI verb refused it. New actions of this kind name the redrive command.
-- An empty browser `job_reject` no longer ends a job as
-  `unavailable / browser_rejected`. The frame carries no reason, and the
-  extension sent it only when it had lost its own offer URL. The job now stays
-  `awaiting_human` with its handoff open, and a later poll offers it again.
-  Measured live 2026-09-23: six queued institutional papers were retired in
-  one second this way. `papio jobs redrive <job-id> --revision 0` now also
-  accepts an `unavailable` job whose terminal reason is `browser_rejected`
-  and returns it to `awaiting_human` with a fresh institutional handoff.
-- A PMID-only job now gains its DOI, title, authors, and year from the PMID's
-  own Europe PMC record before routing, so resolvers can use the DOI and the
-  institutional OpenURL carries `rft_id=info:doi/...` instead of only
-  `info:pmid/...`. The Europe PMC resolver read that record on every pass but
-  kept nothing unless it was open access. The PMID stays the submitted anchor.
-  Handoff repair returns an existing PMID-only institutional park to resolving
-  once so it gets the DOI; a record with no DOI parks again as before.
-- A generic browser drive that ends without a provider outcome no longer holds
-  its provider safety domain until the 30-minute lease expires. If no outcome
-  follows a drive result that has no daemon successor (for example `html`)
-  within 30 seconds, the daemon ends the drive itself: it retires the claim,
-  resolves the handoff, and opens a manual download task. Sibling papers
-  queued behind that domain are then offered. Measured on a Nature Medicine
-  DOI, where two sibling papers waited behind one silent drive.
-- Accept open PDFs with an Identity `/Crypt` filter when pdfcpu cannot parse
-  them and Poppler confirms their page count, encryption state, JavaScript,
-  and embedded-file status. Missing checks still leave the PDF rejected.
-- `papio jobs diagnose` names the job an opened handoff is queued behind. When
-  another job holds a live claim in the same provider safety domain, or holds
-  the institution's sign-in slot, `next` reads `waiting: institution sign-in
-  slot / live claim held by <job> (phase <p>, since <t>)` instead of "open the
-  handoff". The JSON shape is unchanged.
-- Truncated `jobs list`, `jobs unfiled` and `actions list` tables now end with
-  `truncated: showing N open actions; use --limit (max 500)` (or `jobs`,
-  `actions`), so a clipped table no longer reads as the whole queue.
-- American Journal of Psychiatry (DOI prefix `10.1176`) and ACS (`10.1021`)
-  papers now get their DOI as the first browser handoff, because a packaged
-  adapter drives that publisher page. If the DOI route fails, papio offers the
-  institution's resolver as the next route in a new attempt. Previously the
-  UNE Primo route landed on the journal homepage and needed a manual
-  `papio actions retry-publisher`.
-- Science (DOI prefix `10.1126`) papers also get their DOI as the first browser
-  handoff, now that the extension ships a `science` adapter. The institution's
-  resolver sent Science titles to the journal archive page, not the article.
-- An open-access browser route that downloads HTML instead of a PDF now falls
-  back once to the institution's resolver. Before, papio kept the open-access
-  handoff, so each new browser claim opened the same URL again. On
-  2026-09-23 a Wiley `pdfdirect` link returned HTML three times and got five
-  authorizations. The fallback releases the old browser claim, and the resolver
-  route uses the institution's safety domain. `papio jobs redrive` also accepts
-  an open-access handoff that is already parked.
-- A `terms_acceptance_required` outcome after the sign-in returned parks the
-  claim on its own tab (`materialization_claims.phase='parked'`) and releases
-  the institution's sign-in slot, so sibling papers proceed while the operator
-  accepts the terms. Papers parked on their own terms step are not offered or
-  re-offered automatically. A terms outcome before the sign-in returned keeps
-  the slot.
-- `papio jobs redrive` now accepts a job whose only open action is
-  `terms_acceptance_required` and that holds no live browser claim. It resolves
-  the terms action, retires any parked claim, and opens a fresh institutional
-  handoff. Redrive accepts no terms itself: the extension's consent setting
-  decides again when the handoff is driven. Before, no command could restart
-  such a job; on 2026-09-23 JSTOR job `job_edfe1b14…` stayed parked after its
-  handoff was cancelled.
-
-- A sign-in return that arrives after its entry already settled is recorded
-  instead of rejected. The legacy `auth_returned` frame (or an earlier
-  applied observation) can promote the lease to `human` first, so a late
-  `claim_observation auth_returned` for the same owner now applies as a late
-  return: evidence recorded, observation journaled, lease untouched. On
-  2026-09-23 two UNE Primo sign-ins lost every return this way while their
-  tabs stood on the provider. A return for another owner's settled lease is
-  still rejected, and a late return never reserves, renews, or promotes.
-- A repeated `auth_pending` while the login gate is still open no longer
-  mints a new gate occurrence. The IdP hop bounces across several page loads
-  and the timing frame fires on each one; each mint rolled the occurrence
-  under the extension's in-flight grant, so every `claim_observation`
-  stamped with the grant's occurrence arrived stale and its drive evidence
-  was dropped. Mid-cycle reports now reuse the open occurrence (id and
-  revision, a true idempotent no-op). A sign-out after a resolve still mints
-  a fresh occurrence.
-
 ### Added
 - **The paced drive works through parked handoffs without you.** With
   `[drive] enabled = true` (off by default), the daemon opens one parked
@@ -190,13 +69,23 @@ execution records kept during the initial build.
   period by producer and as unattended, sign-in only, or intervened. A browser
   download that carries no effect tuple stays `unknown`: the extension does
   not report which adapter clicked, so papio does not guess.
-- `papio jobs redrive <job-id> --revision <n>` replaces a parked manual
-  download with a fresh institutional handoff. It keeps the failed action and
+- **`papio jobs redrive` gives a stuck paper a fresh institutional handoff.**
+  `papio jobs redrive <job-id> --revision <n>` replaces a parked manual
+  download, a parked open-access handoff, or a terms step with no live browser
+  claim with a fresh institutional handoff. It keeps the failed action and
   browser history, releases the old browser claim, and allows one request per
-  observed browser outcome. Use `--revision 0` when the action is resolved.
-- `papio actions retry-publisher` can re-offer the original institutional route
-  after its DOI retry fails if the refusing provider adapter has since changed.
-  The store permits one such re-offer per job and keeps the DOI retry limit.
+  observed browser outcome; the job needs a configured institutional resolver
+  and no unresolved browser effect. The redrive starts a fresh browser attempt:
+  provider latches from the earlier attempt stay in history but do not veto the
+  restored route, so the adapter or article agent runs again. Redrive accepts no
+  terms itself; the extension's consent setting decides again when the handoff
+  is driven. Use `--revision 0` when the action is already resolved, or to
+  reopen an `unavailable` job whose terminal reason is `browser_rejected`.
+  Redrive also reopens a `needs_review` job whose only open action asks you to
+  remove an adopted file that failed validation and could not be moved to
+  `rejected/`, once no file remains in the job's adoption directories; while a
+  file remains, or the directory cannot be read, it refuses. New actions of this
+  kind name the command.
 - **Pause automatic Zotero imports without disabling acquisition or library lookups.**
   Set `zotio.auto_import_paused = true` and restart the daemon. The pause covers
   older jobs and import retries, preserves their saved policies, and appears in
@@ -216,43 +105,114 @@ execution records kept during the initial build.
   a freshly verified document. The daemon retains the original download-directory
   baseline, expiry and permit, and rejects imports from the previous document.
 - **Persistent article-agent setup.** `papio config agent set` saves a TypeSafe
-  key in the OS credential store and enables Jev for that profile. A hidden prompt
-  and `--key-stdin` keep it out of command arguments. `status` reports setup
-  without exposing the key; `remove` disables enrollment without deleting a shared record.
-  Restart the daemon after changes. The environment override remains supported,
-  and a locked credential store leaves ordinary acquisition available.
+  key in the OS credential store and enables Jev for that profile. A hidden
+  prompt and `--key-stdin` keep it out of command arguments. `status` reports
+  setup without exposing the key; `remove` disables the agent in config without
+  deleting a shared record. Restart the daemon after changes.
+  `PAPIO_TYPESAFE_API_KEY` still works, but a saved key takes precedence over
+  it; after `remove`, also unset the variable if you use it. A locked credential
+  store leaves ordinary acquisition available.
 - **Firefox can adopt downloads made by the optional article agent.** The daemon
   reserves the attempt before a click, copies the newly observed file from the
   configured download directory, and applies normal PDF and identity checks.
   It leaves the browser's original file intact and never repeats the download.
+- **Experimental: *papio* can save a PDF that Firefox on macOS already shows in
+  its viewer.** Set `browser.native_viewer_helper` to the absolute (or `~/`)
+  path of the separately built native helper, then restart the daemon; empty,
+  the default, leaves it off, and the release archives and packages do not
+  include the helper. When a paper's manual download waits on a PDF that
+  Firefox's own viewer already shows, *papio* asks the helper to save that
+  loaded file once, with no new request to the publisher, and the saved file
+  must pass the normal PDF and identity checks. The helper needs macOS
+  Accessibility permission that you already granted and never asks for it;
+  Windows and Linux have no driver yet. If the daemon stops or cannot move the
+  saved file into the paper's folder, the next adoption sweep publishes and
+  validates that exact file without a second Save, with growing waits between
+  tries; after 20 deferred tries, or if the saved file is missing or altered,
+  *papio* releases the save's effect permit so other work can continue, keeps
+  the file and leaves the manual download action open.
 - **Optional daemon-owned agent acquisition.** A TypeSafe key supplied through
   `PAPIO_TYPESAFE_API_KEY` enables bounded Jev decisions for delegated article
   downloads when packaged and generic routes fail, including publishers without
   adapters. Decisions share the existing job and effect permit; cancellation,
   stale sessions and consumed requests cannot authorize a new action. The
   backend interface also accepts local implementations without cloud access.
+  Each decision request sends TypeSafe only the job's normalized DOI, the page's
+  metadata title (at most 400 characters), a SHA-256 revision of the
+  observation, and at most 80 visible controls, each with an opaque id, its role
+  (button, link, menu item or tab), a label of at most 240 characters and
+  whether it is disabled. The extension removes URLs, paths, e-mail addresses,
+  `key=value` pairs and long tokens from the title and labels, and it skips form
+  fields and header, navigation, account, profile and sign-in regions; no page
+  address, page body, form value or library credential is sent.
 - **Adapter repair proposals now preserve the exact verified change.** The
   generator examines later rules as well as the first, edits parsed source
   fields without changing sibling rules, and explains blocked proposals.
   Separate workspaces prevent stale patches from leaking into repeat runs.
   Generated regressions preserve existing fixtures, fail if their capture is
   missing, and use its real origin. CI applies the generated patch and checks
-  that the regression fails before it and passes afterward.
-- **Retry a failed resolver route through the paper's DOI.**
-  `papio actions retry-publisher <action-id> --revision <revision>` starts one
-  publisher attempt after a wrong-page or adapter failure. The original action
-  and failure evidence remain available. Pending sign-ins, challenges, terms
-  for the job, downloads, and unresolved effects block the retry; publisher
-  access still depends on the browser session's entitlement.
-  A terms gate on the same institution profile now blocks linked jobs, not
-  an unrelated publisher route.
+  that the regression fails before it and passes afterward. Proposals prefer the
+  interactive PDF control over its surrounding form and a control's class or a
+  bounded PDF path segment over page position, avoid numeric article IDs and
+  redacted document tokens, and keep ancestor, form and disabled-control guards
+  when they repair a leaf class. Selectors built from attributes that contain
+  apostrophes use CSS hexadecimal escapes. All complete plans are checked before
+  the list of proposals is cut, so a low-ranked working selector is not lost
+  behind generic controls. A file labelled as a preview, sample, abstract,
+  supplement or full issue stays a diagnostic candidate and cannot produce a
+  source patch, and a PDF control cannot stand in for a separate access or
+  identity check.
+- **Retry a failed resolver route through the paper's DOI.** `papio actions
+  retry-publisher <action-id> --revision <revision>` replaces a manual download
+  left by a wrong page, adapter drift or a missing adapter with one publisher
+  attempt through the paper's DOI. The retry starts a fresh browser attempt that
+  keeps the original action, its failure evidence and the old route's provider
+  latch, and a superseded route keeps any unresolved effect under its original
+  safety domain. The retry waits while the job has any other open action
+  (including its own terms step), a live browser claim, or an active challenge
+  or rate-limit suppression; while a sign-in, MFA or captcha gate is open on the
+  job's institution, or a platform-wide gate is open; and while any browser
+  effect is unresolved. An institution's terms gate therefore blocks only a
+  paper that has its own open terms action, and publisher access still depends
+  on the browser session's entitlement. If the DOI attempt parks again and the
+  connected extension has a newer version of the adapter that refused the
+  original route, the same command re-offers the original institutional route
+  once per job, in a fresh attempt whose earlier latches stay in history but do
+  not veto it.
 - **A paper that failed to file into a non-Zotero library can now be found and
   filed again.** When `[hooks] on_ready` fails once (papis mid-upgrade, target
   volume unmounted, a timeout), the PDF was acquired but never filed, and no
   command showed it. `papio jobs unfiled` lists ready papers whose newest hook
   run is missing or failed, `papio jobs refile <id>` runs the hook again for one
-  paper and records the result, and `papio doctor` warns with the count. Hooks
-  are still never retried on their own.
+  paper and records the result, and `papio doctor` warns with the count. A `jobs
+  unfiled` table that stops at the limit ends with `truncated: showing N jobs;
+  use --limit (max 500)`. Hooks are still never retried on their own.
+- **`papio doctor` warns about papers that were fetched but never reached
+  Zotero.** A paper with automatic import turned on could have a validated PDF
+  but no successful import, and it looked finished. The new
+  `undelivered_zotero_imports` check counts these papers, gives the age of the
+  oldest, and tells you to inspect their `zotio.auto_import` events.
+- **`papio zotio import-backfill` files papers that were fetched but never
+  reached Zotero.** A paper with a validated PDF whose import never ran, or
+  never succeeded, stayed out of your library, and no command could deliver
+  these papers together. The command takes them oldest first, one page at a time
+  with `--limit` (at most 50) and `--cursor`, and only reports what it would do
+  until you pass `--apply`. Papers you submitted without automatic import are
+  included only with `--include-not-requested`, and the report separates papers
+  newly filed from papers already in your library and from failures.
+- **`papio doctor` warns when Zotero refuses to store a paper's file.** The new
+  `zotero_file_storage_refused` check counts the Zotero imports of the last
+  seven days that failed on file storage, gives the dates first and last seen,
+  and ignores a refusal for a paper that *papio* has since filed. It separates a
+  full Zotero storage plan, reported with Zotero's own figures and the date they
+  were measured, from an upload that had no route because the Zotero item
+  already exists and your library keeps its files on your own file store. When
+  both causes appear, the more recent one and its advice come first, and an
+  older full-plan reading stays in the past tense. The PDF stays in *papio*'s
+  own store, and the advice names the way out for each cause: free space in
+  Zotero, set `attachment_mode = "linked-file"`, or upgrade *zotio* to a release
+  whose `attachments add` accepts `--via connector` and then run `papio zotio
+  import-backfill --include-not-requested --apply`.
 - **Desktop notifications on Linux and Windows.** *papio* pinged only through
   macOS `osascript`; Linux and Windows builds had no desktop leg at all, so a
   paper waiting on a sign-in pass went unnoticed until you looked. Linux now
@@ -273,12 +233,28 @@ execution records kept during the initial build.
   in one cached request per day instead of one request per paper, so cost no
   longer grows with your library. The default stays `"acquired"`, so an upgrade
   does not widen anything on its own.
+- **`papio doctor` reports the retraction sweep.** A new `retraction` row passes
+  with the age of the last successful sweep and the number of current notices.
+  It warns when the latest Retraction Watch fetch failed, when the last success
+  is more than 48 hours old, or when the saved sweep status cannot be read. It
+  is skipped when `sources.retraction_watch` is disabled or no sweep has
+  completed yet.
 - **`papio adapter repair` now proposes a patch instead of instructions.** It
   scores candidate selectors from the captured page by stability, verifies each
   one against the production classifier, and writes the fixture at its final
   path plus two review-only patches: the adapter test case and the adapter
   source change with its revision bump. When no candidate verifies it says so
   and writes no source patch — never a guessed selector.
+- **`papio adapter repair --recovery-job <job-id>` can use a paper that was
+  recovered after its adapter failed.** Name a job that recorded the capture,
+  then failed on that adapter version (or was handed to the article agent), and
+  then reached `ready` through validation with a PDF delivered through the
+  browser and a DOI. This works only for article repairs. The link counts as
+  independent evidence, so it can unlock the source patch, and the generated
+  regression uses the recovered DOI and must refuse a different DOI; a link that
+  rests only on timing labels the regression but does not unlock the patch. Each
+  repair folder now also holds `repair.json`, and a linked proposal adds
+  `canary.md`, a check to run with the article agent turned off.
 - **arXiv is a discovery backend.** `papio search --source arxiv` and standing
   watches now query arXiv directly with no key and no credit spend, so weekly
   "what is new" watches in CS, ML, physics, and math are not gated on aggregator
@@ -302,13 +278,12 @@ execution records kept during the initial build.
   will not file a document that carries anything runnable, so those papers
   stopped and asked you — for a decision you had no way to give: approving that
   kind of review was refused outright, and rejecting it asked you to fetch by
-  hand a paper *papio* was already holding. Three papers were waiting that way,
-  the oldest for twelve days. *papio* now removes the attachments, re-checks the
-  result from scratch, and files it when it comes back clean. An encrypted paper
-  and one carrying a script are left alone deliberately: those are different
-  repairs with different risks. Your library keeps the paper, not the extra
-  file, and *papio* records both fingerprints - the publisher's file and the one
-  it filed - so the difference is never silent.
+  hand a paper *papio* was already holding. *papio* now removes the attachments,
+  re-checks the result from scratch, and files it when it comes back clean. An
+  encrypted paper and one carrying a script are left alone deliberately: those
+  are different repairs with different risks. Your library keeps the paper, not
+  the extra file, and *papio* records both fingerprints - the publisher's file
+  and the one it filed - so the difference is never silent.
 - **`papio doctor` now tells you when the same paper is queued twice.** Two live
   jobs for one paper each open their own row, so the popup asks you to fetch the
   same paper twice with nothing marking the pair — and until now *papio* recorded
@@ -332,8 +307,12 @@ execution records kept during the initial build.
   the slot. *papio* will not break the tie on a timer. A paper whose human is
   genuinely working through an identity provider looks exactly like a stranded
   one while it is happening, and cutting a live sign-in is the half of this that
-  cannot be undone. Doctor stays quiet once the sign-in has landed and is being
-  shared, and for a slot that already carries a deadline.
+  cannot be undone. The count of waiting papers leaves out open-access papers,
+  which do not need that sign-in, and with more than one institution configured
+  it says those papers are *also* waiting for an institutional sign-in rather
+  than claiming they wait behind this one. Doctor stays quiet once the sign-in
+  has landed and is being shared, and for a slot that already carries a
+  deadline.
 - **`papio browser reload` reloads a development extension without a mouse
   click.** Working on the extension used to end with a click on Chrome's
   **Reload** button, which cannot be scripted and which reports success even
@@ -375,42 +354,51 @@ execution records kept during the initial build.
   candidates and prints the `papio grabs confirm` line for the top one. Older
   daemons keep the previous guidance text, since the browser asks first whether
   the daemon can answer.
+
+  A choice you make in the browser's "Which paper is this?" is checked against
+  the page as the browser reports it, and it lapses on a page load or reload,
+  with age, when its tab is replaced, or when its delivery finishes. A choice
+  that survives a browser restart is re-checked against the live tab. Only the
+  address without its query is kept, so a signed download link is never
+  stored. On Firefox, where *papio* cannot follow a viewer's own Download
+  button, the picker does not promise to file something it cannot see.
 - **A captured PDF that names itself in its own file metadata can now be
   recognised, without reading a word of the page.** Publishers stamp a paper's
-  DOI into the PDF's invisible metadata during production (the PRISM,
-  CrossMark, `pdfx` and Dublin Core fields), and *papio* never looked. Reading
-  it answers a question the page text cannot: a reference list can never reach
-  a file's metadata packet, so a DOI found there is the document stating its
-  own identity rather than text that might be a citation of someone else's
-  work — the ambiguity that made automatic filing unsafe. Measured against the
-  papers in your own library that reach this decision, it recognises **27%**,
-  and nearly all of them are papers where the printed page never shows the
-  identifier at all. It is deliberately narrow: only fields whose defined
-  meaning is "this document's identifier" are read, never free text like the
-  Subject or Title, which anyone can fill with anything. It corroborates and
-  never decides alone — title, authors and year must still agree, which is what
-  keeps a supplementary-materials file, whose metadata carries its parent
-  article's DOI, from being filed as the article. Reading it raised the number
-  of captures *papio* can file on its own by half again — see the next entry.
+  DOI into the PDF's invisible metadata during production (the PRISM, CrossMark,
+  `pdfx` and Dublin Core fields), and *papio* never looked. Reading it answers a
+  question the page text cannot: a reference list can never reach a file's
+  metadata packet, so a DOI found there is the document stating its own identity
+  rather than text that might be a citation of someone else's work — the
+  ambiguity that made automatic filing unsafe. Most of the captures it
+  recognises are papers where the printed page never shows the identifier at
+  all. It is deliberately narrow: only fields whose defined meaning is "this
+  document's identifier" are read, never free text like the Subject or Title,
+  which anyone can fill with anything. It corroborates and never decides alone —
+  title, authors and year must still agree, which is what keeps a
+  supplementary-materials file, whose metadata carries its parent article's DOI,
+  from being filed as the article. It also lets *papio* file more captures on
+  its own — see the next entry.
 - **A captured PDF with no DOI on its first page can now be filed automatically,
   against the one paper you are waiting for that it matches.** You send a PDF;
   if exactly one pending paper agrees on title, authors, year and identifier,
   *papio* files it and says so, instead of parking it and asking you which paper
-  it was. Measured against your own library, this handles about **one capture in
-  five**; the other four still park and ask, unchanged. Automatic filing was
-  built earlier, then **withdrawn before release** during review, because it read
-  a *mention* of a paper's identifier as the document identifying itself — so an
-  erratum or a journal expansion printing "Extended from DOI …" could be filed as
-  the paper it merely discusses. What changed is measurement rather than
-  confidence: replaying every paper in your library as if you had just sent it,
-  against pending lists of 2 to 25 papers, produced **no wrong filing in roughly
-  9,800 trials**, and the size of your pending list turns out not to matter at
-  all. One document family is still known to defeat it — an editorial note or
-  commentary that reprints the discussed paper's title, authors, year and DOI
-  with no correction word anywhere. The two real forms of it (an Oxford Academic
-  "Editor's Note", an eNeuro "See related article") are now recognised and park;
-  an unlabelled one would still be filed wrongly, which is why the structural
-  work on front-matter parsing is still planned rather than dropped.
+  it was. Captures that do not meet that bar still park and ask, as before. A
+  *mention* of a paper's identifier does not count as the document identifying
+  itself, so an erratum or a journal expansion printing "Extended from DOI …" is
+  not filed as the paper it merely discusses. The match uses the complete title
+  and the document's own byline: a numeric title marker cannot hide a different
+  subtitle, and an earlier title prefix cannot supply author evidence for a
+  later exact title. In testing that replayed a real library against pending
+  lists of 2 to 25 papers, it made no wrong filing, and the size of the pending
+  list did not matter. One document family is still known to defeat it — an
+  editorial note or commentary that reprints the discussed paper's title,
+  authors, year and DOI with no correction word anywhere. The two real forms of
+  it (an Oxford Academic "Editor's Note", an eNeuro "See related article") are
+  recognised and park; an unlabelled one would still be filed wrongly. The claim
+  that owns a capture is recorded before any bytes reach the paper's folder, and
+  only the validated quarantine copy is staged, so a crash cannot leave a file
+  that a later sweep adopts for a paper that never claimed it. A paper cancelled
+  between the claim and ingestion keeps its bytes recoverable.
 - **`papio grabs binds` shows you what *papio* filed on its own.** An automatic
   filing cannot currently be undone — `papio grabs identify` binds a parked
   capture, but nothing reverses a bind — so the decision record is the only
@@ -418,14 +406,38 @@ execution records kept during the initial build.
   command lists automatic filings newest first with the rule version, how many
   pending papers were considered, and the evidence the winning match was made
   on. Worth a glance after a batch of captures.
-- **`papio doctor` now says how much of today's metered allowance is gone.** A
-  daily ceiling that can park a source was enforced with nothing on any surface
-  reporting it, so reaching it read as *papio* having stopped working. Doctor
-  now names today's committed credits, the ceiling, whether that ceiling came
-  from the provider's own reported limit or from the conservative cap used
-  before the day's first response, and the credential fingerprints the allowance is
-  shared by — while the allowance is still healthy, not only once it is spent.
-  A spent allowance warns and says work resumes at `00:00 UTC`.
+- **A daily credit ceiling for OpenAlex.** *papio* now charges each OpenAlex
+  request against the day's allowance before it sends the request. Both OpenAlex
+  accounts, with and without an API key, share the allowance. *papio* stops for
+  the day when it has used `daily_credit_fraction` (default `0.5`) of the daily
+  limit that OpenAlex reports, and work that reaches the ceiling waits until
+  `00:00 UTC`. Under `[sources.openalex]`, `daily_credit_limit` sets an absolute
+  maximum (`0`, the default, means no absolute cap), and `daily_credit_fraction
+  = 0` turns the ceiling off. Until OpenAlex reports its limit for the day, a
+  small fixed allowance applies. If the prepaid balance that OpenAlex reports
+  goes down, *papio* closes the source, and a running daemon does not reopen it
+  at midnight.
+- **OpenAlex is paced by its own daily-budget headers.** Every OpenAlex response
+  says how much of the day's allowance is left, and *papio* now stops using a
+  credential when 5% of its allowance remains, until the reset time OpenAlex
+  gives. The stop holds for every OpenAlex caller — resolving, metadata
+  enrichment, discovery, watch digests and the MCP server — and it binds from
+  the moment the headers are read, even if *papio* cannot save it to disk. It is
+  checked again when each request is committed, so a request that was waiting
+  its turn cannot pass it, and a paper stopped this way waits for the reset
+  instead of retrying on the ordinary schedule. When a configured API key
+  reaches its stop, resolving and enrichment continue on OpenAlex's keyless
+  tier, which has its own allowance and the same 5% stop; discovery does not
+  fall back and waits for the reset. Both credentials still count against the
+  one daily credit ceiling. A `429` without these figures is still an ordinary
+  retry, figures that do not add up are ignored, and an ordinary retry wait or
+  local throttle never switches credentials.
+- **`papio doctor` shows how much of today's OpenAlex allowance is gone.** It
+  names today's committed OpenAlex credits, the ceiling, where the ceiling came
+  from — the provider's reported limit, or the conservative cap used before the
+  day's first response — and the credentials that share it, while the allowance
+  is still healthy. A spent allowance warns and says work resumes at `00:00
+  UTC`.
 - **OpenAIRE can now be authenticated in a way that survives the night, raising
   its ceiling 120×.** Authenticating with OpenAIRE lifts you from 60 requests an
   hour to 7,200, and *papio* accepted a token for this before — but the only
@@ -444,46 +456,42 @@ execution records kept during the initial build.
   an unauthenticated caller is allowed. `papio doctor` names which credential
   you are on and warns when it is the expiring one. Setup is on the
   configuration reference page.
-- **One paper can no longer eat a whole day's search allowance while your other
-  papers get nothing.** A daily spending ceiling already stopped *papio* running
-  a metered source dry, but it bounded the **day**, not any one paper — so a
-  single hopeless request could still spend the entire allowance every morning
-  and leave everything else you asked for waiting until midnight, every day.
-  Now, **while other work is waiting**, no single paper may use more than a
-  quarter of a source's daily allowance; the rest stays available to the queue.
-  Nothing is ever given up on: a paper that reaches its quarter waits for
-  tomorrow and keeps going, rather than being abandoned. When nothing else is
-  waiting, one paper may still use the whole day, because an unused allowance
-  cannot be saved up — refusing the only running job would cost you throughput
-  and buy nothing.
-
-  The obvious version of this rule would have been "stop after N tries", and
-  measuring it against your own history is what ruled it out: papers that
-  eventually **succeeded** needed 11 tries at the median but **1,376** at the
-  worst, while the worst runaway sat at 3,404. Any cutoff low enough to catch
-  the runaway would have thrown away a paper that was going to arrive, so the
-  rule counts *spending under contention* instead of attempts. A paper parked
-  this way now says so specifically, rather than being indistinguishable from
-  the whole day's allowance being gone.
-- **Institutional sign-ins are now brokered so only one tab per institution
-  ever asks for one.** The daemon now arbitrates every request for an
-  autonomous sign-in tab in one transaction over a durable
-  authentication-entry lease (migration `0042`, extending the
-  already-shipped `authentication_entry_leases` table and adding an
-  append-only `claim_observation_journal`): a job whose institution has no
-  live sign-in gets a fresh grant, a job whose institution is already
-  mid-sign-in is told to wait or focus the tab that has it, and every paper
-  waiting behind that one login resumes automatically, on its own freshly
-  revalidated route, the moment it succeeds. The lease is renewed only by
-  the human-paced wall/login/MFA/challenge events the extension reports —
-  never by a worker-local timer — and a duplicated or out-of-order report
-  can never mutate it twice, since every observation is journaled against a
-  strictly increasing sequence number. The daemon advertises this as
-  `institutional_authentication_claim_v1`, the 32nd and last protocol
-  feature the current fail-closed negotiation cap allows — any protocol
-  feature added after this one has to retire or fold in an existing one
-  first. An extension that has not yet negotiated it keeps behaving exactly
-  as before: tabless parking until you click Open.
+- **One paper can no longer use up a day's OpenAlex allowance while your other
+  papers wait.** While other work is waiting, no single paper may use more than
+  a quarter of the daily credit allowance, and the rest stays available to the
+  queue. A paper that reaches its quarter waits for the next UTC day and then
+  continues; it is never abandoned. When nothing else is waiting, one paper may
+  use the whole allowance, because an unused allowance cannot be saved. The rule
+  counts credits spent while others wait, not attempts, because papers that do
+  arrive can need many more attempts than usual. A paper stopped this way says
+  so, separately from the whole day's allowance being gone.
+- **Institutional sign-ins are now brokered so only one tab per institution ever
+  asks for one.** The daemon now arbitrates every request for an autonomous
+  sign-in tab in one transaction over a durable authentication-entry lease
+  (migration `0042`, extending the already-shipped `authentication_entry_leases`
+  table and adding an append-only `claim_observation_journal`): a job whose
+  institution has no live sign-in gets a fresh grant, a job whose institution is
+  already mid-sign-in is told to wait or focus the tab that has it, and every
+  paper waiting behind that one login resumes automatically, on its own freshly
+  revalidated route, the moment it succeeds. The lease is renewed only by the
+  human-paced wall/login/MFA/challenge events the extension reports — never by a
+  worker-local timer — and a duplicated or out-of-order report can never mutate
+  it twice, since every observation is journaled against a strictly increasing
+  sequence number. The daemon advertises this as
+  `institutional_authentication_claim_v1`, the 32nd and last protocol feature
+  the current fail-closed negotiation cap allows — any protocol feature added
+  after this one has to retire or fold in an existing one first. A sign-in
+  return that arrives after the same paper's lease already settled is recorded
+  as a late return: *papio* keeps the evidence and journals the observation but
+  leaves the lease unchanged. A late return never reserves, renews or promotes a
+  lease, and a return for another paper's settled lease is still rejected. While
+  the login gate stays open, a repeated sign-in-pending report reuses the gate's
+  open occurrence, so the extension's observations for that sign-in stay
+  current; a sign-out after a resolve still starts a new occurrence. A sign-in
+  reservation whose deadline has passed cannot have a tab bound to it, and
+  retiring an expired claim also frees the institution slot that claim held. An
+  extension that has not yet negotiated it keeps behaving exactly as before:
+  tabless parking until you click Open.
 - **Automatic institutional offers no longer race every waiting paper into
   the same poll.** Offering a candidate for automatic sign-in is now paced
   by its authentication claim: an institution with a sign-in still
@@ -493,14 +501,24 @@ execution records kept during the initial build.
   owner stands. Automatic admissions continue to share the existing
   four-per-poll transport budget with every other kind of offer.
 - **The daemon now authorizes, one use at a time, every tab the extension
-  automatically closes.** Migration `0041` adds a `close_authorizations`
-  table issuing a single live token per browser tab, gated behind the new
-  `surface_close_v1` feature: the extension may close an idle,
-  never-engaged scaffold, a tab whose materialization already settled, or a
-  sign-in whose claim was abandoned, but only against a token the daemon
-  minted for that exact tab and reason — never on the tab's mere absence
-  from a poll, a lost connection, or a timer. An extension that has not yet
-  negotiated `surface_close_v1` keeps its existing closing behavior
+  automatically closes.** Migrations `0041`, `0044`, `0047` and `0048` add a
+  `close_authorizations` table behind the new `surface_close_v1` feature: the
+  extension closes a daemon-bound tab only with a one-use token that the daemon
+  issues for that exact binding and reason, and only one token per binding is
+  live at a time. The reasons are an idle placeholder (`scaffold_idle`), a
+  settled materialization (`materialization_settled`), an abandoned claim
+  (`claim_abandoned`), a paper that is over or has no open browser handoff
+  (`job_inactive`), a handoff the browser has parked (`handoff_parked`), and a
+  duplicate or superseded tab for the same paper (`surface_superseded`); the
+  daemon refuses while that claim's own provider effect is in flight. A tab with
+  no claim gets the answer `unclaimed`, because *papio* has no stake in it, and
+  the extension's own guards decide. After the close, the extension reports
+  `owner_closed`, which consumes the token and frees the institution's sign-in
+  slot. The daemon derives terminal browser cancellations from durable claims,
+  so this works after either side restarts. The extension never closes a pinned
+  tab, a tab you took over or moved out of *papio*'s window or group, a tab from
+  before a browser restart, or the tab you are looking at. An extension that has
+  not yet negotiated `surface_close_v1` keeps its existing closing behavior
   unchanged.
 
 ### Changed
@@ -518,12 +536,152 @@ execution records kept during the initial build.
   library record, or the title returned by the existing Crossref lookup when
   the local record has none. No additional request is made; old cached notices
   without a title keep the generic fallback until refreshed.
+- **`papio doctor` now reports a data directory that other users can read, and
+  does not change it.** The `data_dir` check set the directory to mode `0700`
+  before it tested it, so the check always passed and overrode the mode you
+  chose. On Unix it now fails with `data directory is not private`, gives `chmod
+  0700 <dir>` as the fix, and leaves the mode as it is. A directory that is not
+  writable, is not a directory, is not set, or cannot be read now gets its own
+  message. A missing directory is still created with mode `0700`.
+- **`papio acquire --batch` refuses a batch that lists the same work twice.**
+  Two entries with the same identifiers, or with the same title, authors and
+  year when they have no identifiers, got the same request id. The earlier entry
+  never got its job id, so the batch manifest and report were wrong. The batch
+  now fails before anything is submitted, with `batch contains duplicate work
+  "…" at positions N and M`, and the MCP batch tool applies the same rule.
+- **Metadata sources now open one connection per request.** Metadata requests
+  use HTTP/1.1 and do not reuse connections, so a failed request cannot be sent
+  again silently and charged twice. To allow reuse, set `allow_keep_alives =
+  true` under `[sources.<name>]`. The client that several sources share reuses
+  connections only when all of them allow it. When *papio* looks up a paper to
+  acquire it, the OpenAlex key now goes in an `Authorization: Bearer` header and
+  not in the query string.
+- **New Zotero items now hand their PDF to Zotero desktop, so the file goes
+  where Zotero is set to store it.** *papio* created every new item with
+  *zotio*'s `--via web` route. That route uploads the file to Zotero's own cloud
+  storage even when Zotero keeps your files on a WebDAV server, and a full
+  storage plan then stopped every new filing. *papio* now asks for `--via auto`,
+  which uses Zotero desktop when it is running and the web API only when it is
+  not. The route is now part of each cached import plan, so a paper planned
+  before the upgrade is planned again with the new route. *papio* waits at least
+  10 seconds between Zotero imports, automatic or from `papio zotio
+  import-backfill --apply`, so Zotero desktop is not overloaded. One maintenance
+  pass tries at most three imports, and the rest wait for the next pass. The
+  first import in a run starts at once.
+- **A PDF for an existing Zotero item now goes through Zotero desktop, with a
+  readable name.** In `stored` mode, *papio* now asks *zotio* to attach the file
+  with `--via connector`, so Zotero desktop stores it wherever you set Zotero to
+  keep files, WebDAV included. Before, the file went through Zotero's web API,
+  which used Zotero's own storage plan, and a library that keeps files on WebDAV
+  refused it. Zotero desktop must be running, and you need a *zotio* release
+  whose `attachments add` accepts `--via connector`. An older *zotio* ignores
+  the flag and uses the web API as before; for a refused paper, the
+  `zotero_file_storage_refused` check in `papio doctor` tells you to upgrade
+  *zotio* and run `papio zotio import-backfill --include-not-requested --apply`.
+  The attachment is now named after the paper's title, or its identifier when it
+  has no title, not after a 64-character content hash.
+- **Adding a page's paper from the browser now says whether *papio* already had
+  it.** The reply to a browser add now carries an `outcome` of `submitted`,
+  `already_queued` or `already_validated`. Before it adds anything, the daemon
+  checks the paper's DOI against live, ready and imported papers, so the popup
+  no longer says *Added to papio* for a paper that *papio* already has.
+- **The daemon log now records a malformed request from a local client.** A
+  command or native host that sent a partial or malformed request was
+  disconnected with no trace. The daemon now logs it as `ipc: decode request:
+  …`. A connection that closes without sending anything, such as the check each
+  command makes to see whether the daemon is running, is not logged.
+- **Searching OpenAlex by title for another copy of a paywalled paper is now off
+  by default.** Each search costs 10 credits, and it used far more credits for
+  each paper it delivered than it saved. Turning it off does not change how
+  papers are accepted or ranked, and the free lookups through publisher-declared
+  version links still run. If you turn it back on, it runs only when the paper's
+  other sources have no ordinary retry left and only when *papio* knows an
+  author to match the results against. It is not asked again for the same title,
+  year, authors and DOI unless enrichment changes them; a search that fails in
+  transit can still be retried. Each search makes one request, and it uses the
+  record that the same pass already read, or your own citation details, instead
+  of fetching the record again. To turn it back on:
+
+  ```toml
+  [sources.openalex]
+  sibling_title_search = true
+  ```
 
 ### Fixed
-- **An operator redrive starts a fresh browser attempt.** Provider latches
-  from the earlier attempt stay in history but no longer veto the restored
-  institutional route, so the adapter or article agent runs again. A
-  publisher retry still leaves the old route's latch in force.
+- **Diagnostic captures and support reports no longer carry your IP address.**
+  Elsevier's refusal page prints the reader's IP address, and every capture of
+  it kept that address. The capture store now masks IPv4 and IPv6 addresses
+  before it writes a capture, even one from an older extension, and records
+  `sanitizer_version` `2`. `papio adapter diagnose` masks them too. DOIs,
+  dates, clock times and software versions such as `Chrome/153.0.0.0` are
+  kept. `papio adapter repair` accepts only version 2 captures, so capture a
+  page again to repair from it; version 1 captures may still hold an address.
+- **A provider refusal page no longer latches adapter drift or parks the
+  paper.** A compatible extension now reports a provider's block or rate-limit
+  page as `rate_limited` instead of as a broken adapter. The daemon then
+  releases the drive's binding and records a `browser.provider_cooldown` event
+  with the refusing host and the time until which *papio* should not drive that
+  host. As before, it closes the handoff and puts the job in `retry_wait` for
+  `browser.action_expiry_seconds`, with no drift latch and no manual download,
+  because nothing on a refusal page is for a person to do.
+- **A waiting PDF grab no longer makes your browser reconnect every few
+  seconds.** When every open action belonged to a known family, the inbox
+  count listed the grab's family first even though it ranks last. The
+  browser protocol rejected that order, and the native host restarted each
+  time the count was read. The families are now listed in rank order.
+- **An empty browser `job_reject` no longer ends a job as `unavailable /
+  browser_rejected`.** The frame carries no reason, and the extension sent it
+  only when it had lost its own offer URL. The job now stays `awaiting_human`
+  with its handoff open, and a later poll offers it again. `papio jobs redrive
+  <job-id> --revision 0` reopens a job that was already ended this way.
+- **A paper submitted by PMID alone now gains its DOI before routing.** The job
+  takes its DOI, title, authors and year from the PMID's own Europe PMC record,
+  so resolvers can use the DOI and the institutional OpenURL carries
+  `rft_id=info:doi/...` instead of only `info:pmid/...`. The Europe PMC resolver
+  read that record on every pass but kept nothing unless it was open access. The
+  PMID stays the submitted anchor. Handoff repair returns an existing PMID-only
+  institutional park to resolving once so it gets the DOI; a record with no DOI
+  parks again as before.
+- **A browser drive that ends without a provider outcome no longer holds its
+  safety domain for 30 minutes.** If no outcome follows a generic drive result
+  that has no daemon successor (for example `html`) within 30 seconds, the
+  daemon ends the drive itself: it retires the claim, resolves the handoff, and
+  opens a manual download task. Sibling papers queued behind that provider
+  safety domain are then offered.
+- **Unencrypted PDFs with an Identity `Crypt` filter are no longer rejected.**
+  When pdfcpu cannot parse such a file, *papio* now accepts it only if Poppler's
+  `pdfinfo` and `pdfdetach` confirm its page count, that it is not encrypted,
+  and that it has no JavaScript and no embedded files. If any check fails, the
+  PDF stays rejected.
+- **`papio jobs diagnose` names the job an opened handoff is waiting behind.**
+  When another job holds a live claim in the same provider safety domain, or
+  holds the institution's sign-in slot, `next` reads `waiting: institution
+  sign-in slot / live claim held by <job> (phase <p>, since <t>)` instead of
+  "open the handoff". The JSON shape is unchanged.
+- **A truncated job or action list now says so.** `papio jobs list` and `papio
+  actions list` tables that stop at the limit now end with `truncated: showing N
+  jobs; use --limit (max 500)` (`actions` or `open actions` for `actions list`),
+  so a clipped table no longer reads as the whole queue.
+- **American Journal of Psychiatry, ACS and Science papers now open at the
+  publisher first.** For DOI prefixes `10.1176`, `10.1021` and `10.1126`, the
+  first browser handoff is the paper's DOI, because a packaged adapter
+  (`psychiatryonline`, `acs`, `science`) drives that publisher page. The
+  institution's resolver sent these papers to the journal homepage or archive
+  page, not the article. If the DOI route fails, *papio* offers the
+  institution's resolver as the next route in a new attempt.
+- **An open-access browser route that downloads HTML now falls back to the
+  institution's resolver.** Before, *papio* kept the open-access handoff, so
+  each new browser claim opened the same URL again. For example, a Wiley
+  `pdfdirect` link without an entitlement kept returning HTML. The fallback
+  happens once, releases the old browser claim, and uses the institution's
+  safety domain for the resolver route.
+- **A terms page after sign-in no longer holds the institution's sign-in slot.**
+  When a provider asks for terms acceptance after the sign-in returned, *papio*
+  parks that paper on its own tab and releases the slot, so sibling papers
+  proceed while you accept the terms. A paper parked on its own terms step is
+  not offered again automatically; `papio actions open` still drives it. A terms
+  outcome before the sign-in returns, or while an institutional effect is in
+  flight, keeps the slot.
 - **Explicitly opened handoffs survive a daemon restart.** The bridge restores
   pending focus from job events and does not repeat an open after an offer or
   provider outcome. An open made without a browser can start on the next sync.
@@ -549,33 +707,16 @@ execution records kept during the initial build.
 - **Dismissing one human action leaves a job waiting on its other open actions.**
   Closing an obsolete browser handoff no longer cancels a job that still needs
   a terms decision. Dismissing its last open action can still cancel a parked job.
-- **An admitted Firefox PDF viewer save now finishes after a publication failure.**
-  If *papio* accepted the saved bytes but could not move them into the job's
-  folder, or the daemon stopped in between, the next adoption sweep publishes the
-  exact admitted file and validates it. No second Save runs. Temporary failures
-  are retried with growing waits.
-  After 20 deferred attempts, or when the saved file is missing or altered,
-  *papio* releases that save's effect permit so other work can continue, keeps
-  the saved file in place, and leaves the job's manual download action open so
-  you can supply the file yourself.
 - **Late browser receipts recognize PDFs that Papio sanitized before storing.**
   The daemon verifies the downloaded source, accepted candidate, recorded
   sanitization and stored artifact before pairing delivery details. Removing
   embedded content no longer causes a successfully acquired paper to be reported
   as an unmatched download. Unrelated files and missing producer evidence remain
   refused.
-- **Publisher retries no longer prevent the daemon from restarting.**
-  Retiring an open-access attempt now records that attempt's original safety
-  domain. Startup also reads older retry histories correctly while retaining
-  any unresolved effect under its original domain.
 - **Late browser receipts no longer report a failed adoption for an acquired PDF.**
   If a directory sweep validates the file before its producer receipt arrives,
   Papio records the missing delivery provenance separately. It keeps the accepted
   PDF and refuses to invent the missing producer binding from a late receipt.
-- **Publisher retries now receive fresh browser drive authority.** Retrying a
-  consumed route through a materialized candidate no longer reuses its old
-  attempt, which stopped the article agent before it could inspect the page.
-  Repeated offers reuse the new attempt and retain the original route history.
 - **Windows can create its incident key on first use.** Publication still flushes
   complete key bytes and never overwrites a competing key. It preserves Windows
   ACLs and read-only attributes without requiring an unsupported directory flush.
@@ -598,52 +739,24 @@ execution records kept during the initial build.
   same PDF is already ready.** The daemon checks the landed bytes, stored artifact
   and accepted browser candidate before acknowledging the duplicate. Mismatched
   files and unsupported producer claims remain refused.
-
-- **Adapter repairs retain working selector constraints.** Proposals prefer the
-  interactive PDF control over its surrounding form, avoid numeric article IDs,
-  and preserve ancestor, form and disabled-control guards when repairing a leaf
-  class. Unsupported compound changes remain explained diagnostics.
-
 - **HTML downloads no longer consume a waiting paper's browser handoff during
   folder scans.** The daemon checks the file header before starting adoption,
   leaving the original action available for a later PDF. The check shares the
   existing filesystem timeout and still requires full PDF and identity validation.
-
 - **A manual-download task cannot restart an automated sign-in attempt.**
   Late browser requests are refused once the provider handoff has become a
   manual-download task, preventing a spent attempt from reserving the
   institution's sign-in slot again. The operator's Open action remains available.
-
-- **A PDF preview cannot qualify as a full-work adapter repair.** Proposals
-  labelled as previews, samples, abstracts, supplements, or full issues remain
-  diagnostic candidates but cannot produce a source patch for the requested
-  article. Matching page metadata alone does not make those files the work.
-
-- **Adapter repair proposals prefer stable PDF routes over page position.**
-  A rendered control’s class and bounded PDF path segment can survive layout
-  changes without embedding a document ID. Proposals still pass through the
-  production planner and cannot replace independent access or identity checks.
-
-- **Identity review distinguishes ambiguous DOI evidence from a definite
-  mismatch.** A PDF with multiple front-matter DOIs, such as a book DOI and a
-  chapter DOI, now asks the operator to check which identifies the requested
-  work. The quarantined file and review requirement remain in place.
-
 - A provider route that ends in a manual-download task no longer reuses the
   route's earlier Open request. Explicitly opening that task also withholds
   delegated adapter clicks, so papio does not race the manual download it
   just requested.
-
 - Browser effect reconciliation now accepts a delayed reply after intervening polls. A busy connection no longer keeps replacing the request before the browser can answer it; uncertain effects still require independent resolution.
-
 - When a provider opens a PDF that needs the browser viewer’s Download button, papio now records a manual task and releases the institution’s sign-in slot. Other queued papers can proceed; the waiting paper remains unfinished.
 - **A cited author no longer makes a short-title paper pass identity checks.**
   A surname followed by a citation year before the printed title does not
   establish authorship. If that is the only author evidence, papio holds the
   PDF for review.
-- **PDF binding uses the complete title and its own byline.** A numeric title
-  marker cannot hide a different subtitle. An earlier title prefix cannot
-  supply author evidence for a later exact title.
 - **Open-access article handoffs survive resolver retries.** The daemon
   preserves a skipped article page as a browser route before retrying an
   unrelated resolver. It no longer loses that route when the candidate
@@ -657,16 +770,6 @@ execution records kept during the initial build.
   materialization path, which has no candidate for that action. It sends
   the institution's route and the focus request without automatic download
   authority. Existing safety latches still apply.
-- **Adapter repair handles apostrophes in captured attributes.** It emits
-  CSS hexadecimal escapes that its offline selector parser accepts.
-  A ProQuest capture previously stopped the entire repair with a selector
-  parse error. The tool still requires work evidence before it reports a
-  complete plan.
-- **Adapter repair checks complete plans before limiting its proposals.**
-  A low-ranked working selector no longer disappears behind generic controls.
-  Proposals exclude redacted document tokens that would fail on a live page.
-  A PDF control cannot replace a separate access or identity check and unlock
-  a source patch.
 - **Status shows the paper and the next action.** It uses known titles rather
   than preferring identifiers, groups matching advice by institution profile
   and recorded provider, and keeps each job ID visible. Browser commands
@@ -675,41 +778,6 @@ execution records kept during the initial build.
   limit. Document-delivery actions point to the request and its blockers;
   an explicit browser rejection no longer appears as missing institutional
   access. `acquire --wait` also shows the scoped action command.
-- **A conclusive DOI mismatch no longer stops the candidate queue.** The fetch
-  path tries the remaining candidates before asking for identity review. If
-  none succeeds, it keeps the first mismatch and binds the review to its
-  checked quarantine bytes. Browser-download review and explicit review
-  acceptance keep their existing behavior.
-- **A library sign-in is no longer held by a paper whose tab is already
-  gone.** When a materialization claim expired, the *next* claim request
-  retired it on the spot — but only released the close authorization, not the
-  institution slot the dead surface still occupied. Because the retired claim
-  was now `abandoned`, the reconciliation sweep that does release the slot
-  never looked at it again, so every sibling paper at that library read a
-  sign-in as already in progress until the stranded-bound grace sweep ran. The
-  request path now performs the same release the sweep does.
-- **A sign-in reservation that ran out of time can no longer have a tab bound
-  to it.** The bind fenced the authentication entry on claim, owner, holder
-  generation and state, but not on the reservation's own deadline, and this
-  path never takes the lazy-expiry read that would have caught it. A bind
-  arriving after the deadline recorded a live surface against a reservation
-  the deadline had already rejected. The deadline is now part of the fence,
-  and a late bind is refused whole rather than leaving a bound scaffold no
-  lease names as owned.
-- **Automatic institutional offers now respect the transport budget.** A
-  candidate whose action needs no sign-in was admitted without checking the
-  remaining offer budget, so a poll with nothing left to spend still admitted
-  the whole scheduled page and put more browser work in flight than the bridge
-  guarantees. Admitting spends a slot exactly like reserving one does, and now
-  obeys the same cap; retiring a dead institution slot stays deliberately
-  uncapped.
-- **A download you started while no browser held the bridge can no longer be
-  mistaken for the next holder's work.** Releasing the bridge advanced the
-  in-memory generation to exactly the value the next holder would be issued, so
-  a PDF grab permit stamped during that gap passed the incoming holder's fence
-  and resumed as current. The gap now carries a generation no holder can be
-  issued; the grab itself still succeeds, because you start and route that
-  download in your own browser.
 - **Stopping *papio* while a filing hook is still running no longer loses the
   hook's result.** Shutdown waited five seconds for hooks, then closed the
   database whether or not they had finished, while a hook may be allowed ten
@@ -741,11 +809,6 @@ execution records kept during the initial build.
   recording the fresh request failed, the question was already gone: the paper
   sat waiting with no prompt on any surface, and nothing short of reading the
   database explained why. The question now comes back when that happens.
-- **Filing a second copy of a paper can no longer delete the copy you keep.**
-  When *papio* had prepared two copies of one file and finished with one of them,
-  it removed the file's bytes without checking whether the other copy still
-  pointed at them, so tidying up could take the delivered file with it. It now
-  removes the bytes only when nothing else owns them.
 - **Opening one paper no longer reads every paper's decisions.** `papio jobs
   show` and the status card gathered the whole decision table in order to display
   a single paper's, so both got slower as your library grew. They now read only
@@ -755,10 +818,6 @@ execution records kept during the initial build.
   document that needs your review, and left the attempt open. The same applies
   to an interrupted sibling-version lookup. Both now record the interruption for
   what it is.
-- **A paper whose file was already filed can no longer stall.** A leftover
-  publication record for a file *papio* had already filed made the scheduler
-  treat the paper as unfinished and skip it on every pass. Recovery now clears
-  the redundant record and keeps the filed copy.
 - **`papio jobs failures` no longer leaks a database connection** when a row
   fails to read, and two advisories in an indirect dependency
   (`golang.org/x/crypto`) are closed by moving to v0.57.0.
@@ -785,98 +844,60 @@ execution records kept during the initial build.
   and tore down the native-messaging session. Both protocol readers and the
   schema now treat omitted complete lists as empty only when their exact count
   is zero. Non-empty responses still fail closed when either list is missing.
-- **`papio actions open` on a paper you download yourself now goes through your
-  browser.** These papers reach your library through the institution's route,
-  and *papio* had already taught the daemon to surface them in the tab you are
-  signed into. The CLI half never followed: it still treated only an OpenURL
-  handoff as something the browser could open, so it handed the link to the
-  operating system instead. That opens a plain browser window on the publisher's
-  own page, which paywalls it, and *papio* recorded nothing — so the paper
-  looked opened while nothing had been surfaced and no trace was kept. Both
-  halves now agree, and these papers are focused in the signed-in tab and
-  recorded like every other handoff. Measured on a parked paper with a live
-  browser: no event before the fix, a recorded handoff after it.
-- **A paper's stale tab can now be retired while the paper is still being
-  worked on.** *papio* keeps one tab per paper it has acquired, and a retry
-  opens a fresh one. Retiring the previous tab needs the daemon's permission,
-  and the daemon granted it only for a tab that was not the tab its own record
-  named - which is never true of a retry, because a retry records a new attempt
-  and leaves the previous one alone. The old attempt then held its tab for the
-  rest of the browsing session. The daemon now answers from the paper's CURRENT
-  attempt: a tab belonging to a superseded attempt may be retired, the tab of
-  the attempt actually driving the paper may not, and an unfinished publisher
-  action on the superseded attempt still refuses. One paper had six attempts and
-  six tabs when this was measured.
+- **A paper's stale tab can now be retired while the paper is still being worked
+  on.** A retry opens a fresh tab. Retiring the previous tab needs the daemon's
+  permission, and the daemon granted it only for a tab that was not the tab its
+  own record named - which is never true of a retry, because a retry records a
+  new attempt and leaves the previous one alone. The old attempt then held its
+  tab for the rest of the browsing session. The daemon now answers from the
+  paper's CURRENT attempt: a tab belonging to a superseded attempt may be
+  retired, the tab of the attempt actually driving the paper may not, and an
+  unfinished publisher action on the superseded attempt still refuses.
 - **A publisher that proves there is no access no longer keeps the whole
-  library's sign-in slot.** The browser correctly ended that provider drive,
-  but the daemon requeued the paper before its tab-close request arrived.
+  library's sign-in slot.** The browser correctly ended that provider drive, but
+  the daemon requeued the paper before its tab-close request arrived.
   Rediscovery then parked the paper in document delivery, making it active
   again, so the close was refused and the old navigated claim held the
-  institution's only sign-in slot without a deadline. Fifty-three other papers
-  were waiting behind one ScienceDirect paywall when this was measured.
-  *papio* now retires the exact materialization binding and its authentication
-  lease as part of accepting `no_entitlement`, before rediscovery runs. The tab
-  can still complete its one-use close transaction afterwards, but correctness
-  no longer depends on winning that race.
+  institution's only sign-in slot without a deadline. *papio* now retires the
+  exact materialization binding and its authentication lease as part of
+  accepting `no_entitlement`, before rediscovery runs. The tab can still
+  complete its one-use close transaction afterwards, but correctness no longer
+  depends on winning that race.
 - **A refused Zotero filing now says which of two very different things went
-  wrong.** Both failures used to arrive as `unknown` with the explanation cut
-  mid-word, so the same message covered "your library keeps files somewhere
-  Zotero's upload cannot reach" and "Zotero itself is broken right now". The
-  first refusal was recognised only when *papio* could read *zotio*'s machine
-  envelope; the plain error line beside it, which is what *papio* usually holds,
-  names the same cause and went unrecognised. The second was never recognised at
-  all: when Zotero desktop rejects the hand-off that files bytes into your own
-  file store, that is the only route that respects your storage choice, so
-  *papio* will not quietly upload to Zotero's cloud instead. It now names the
-  fault, tells you to restart Zotero and read one item back from its own local
-  API to see whether Zotero's item layer is the thing that is broken — a plugin
-  update can break it — and keeps retrying the filing by itself afterwards. The
-  paper is in *papio*'s store throughout; nothing is lost either way.
+  wrong.** A library that keeps its files somewhere Zotero's upload cannot reach
+  was recognised only when *papio* could read *zotio*'s machine envelope; the
+  plain error line beside it, which is what *papio* usually holds, names the
+  same cause and went unrecognised, so the failure arrived as `unknown` with its
+  explanation cut mid-word. It is now recognised from either form. When Zotero
+  desktop rejects the hand-off that files bytes into your own file store,
+  *papio* names that fault separately: that route is the only one that respects
+  your storage choice, so *papio* does not quietly upload to Zotero's cloud
+  instead. It tells you to restart Zotero and check its plugins, and keeps
+  retrying the filing by itself. The paper is in *papio*'s store throughout;
+  nothing is lost either way.
 - **Papers already filed in Zotero no longer sit in the queue as unfinished.**
-  Twenty-six papers on the author's own library had been delivered — the PDF
-  attached, the item created — and still read as outstanding for between 34 and
-  40 days. Every part of *papio* agreed there was nothing left to do, which is
-  exactly why nobody did it: the retry pass skips a paper whose import already
-  succeeded, and doctor's undelivered-imports check excludes it for the same
-  reason. The step that marks the paper finished runs inline with the import,
-  and these had missed it, so no later pass owned the repair. That left more
-  than a wrong number on a list: one of those papers refused a download that
-  arrived afterwards, because a finished paper was still holding an unfinished
-  paper's place. *papio* now marks a delivered paper finished on its next
-  maintenance pass, reading the Zotero keys it already recorded rather than
-  asking Zotero again — so nothing re-opens the library application to
-  re-learn something it already knows.
-- **`papio doctor` no longer reports a storage problem you have already
-  fixed.** Zotero's "storage plan is full" figure is not a live measurement;
-  it is the wording Zotero used when it last refused an upload, replayed from
-  *papio*'s own records. The author cleared their plan to about 20 MB and
-  doctor kept naming 300.4 of 300 MB, and led its advice with "free space in
-  Zotero" — for a plan with plenty of space. Worse for anyone whose files sync
-  to their own WebDAV server: *papio* uploads through Zotero's web API, which
-  bills Zotero's own plan rather than that server, so freeing space could
-  never have been the answer. An earlier fix dated the figure but left it as
-  the headline. Doctor now leads with whichever cause is most recent, keeps a
-  superseded reading on the record in the past tense, and puts the advice for
-  the live cause first.
-  The same check also counted refusals for papers *papio* had already sorted
-  out. When the Zotero item turns out to hold the PDF already, *papio* records
-  that conclusion in one place and the failed upload in another, and the check
-  only read the second — so a paper settled within the hour was still being
-  reported days later. On the author's library every one of the 129 recent
-  failures belonged to a paper that had since been filed, and the check named
-  one of them as having nowhere to put the file. It now ignores a refusal whose
-  paper has been filed, while still reporting one it cannot attribute to any
-  paper at all.
+  Some papers that had been delivered — the PDF attached, the item created —
+  still read as outstanding for weeks. Every part of *papio* agreed there was
+  nothing left to do, which is exactly why nobody did it: the retry pass skips a
+  paper whose import already succeeded, and doctor's undelivered-imports check
+  excludes it for the same reason. The step that marks the paper finished runs
+  inline with the import, and these had missed it, so no later pass owned the
+  repair. That left more than a wrong number on a list: such a paper could
+  refuse a download that arrived afterwards, because a finished paper was still
+  holding an unfinished paper's place. *papio* now marks a delivered paper
+  finished on its next maintenance pass, reading the Zotero keys it already
+  recorded rather than asking Zotero again — so nothing re-opens the library
+  application to re-learn something it already knows.
 - **A paper you have to fetch yourself now opens through your library, not at
   the paywall.** When *papio* asks you to download a PDF by hand, the page it
-  needs you to reach is almost always behind your institution's sign-in: of 34
-  such papers measured, 32 required auth and the publisher's own link paywalled
-  every one. `papio actions open` worked the library route out; the browser did
-  not, so the extension's Open button sent you to the publisher — right for the
-  two open-access papers, wrong for the other 32. Both now ask the daemon for
-  the route at the moment you press the button, and the extension no longer
-  picks the address itself. If no library route applies, which is the
-  open-access case, Open still uses the paper's own link.
+  needs you to reach is almost always behind your institution's sign-in, and
+  the publisher's own link paywalls it. `papio actions open` handed that link
+  to the operating system, which opened a plain browser window on the
+  publisher's page and recorded nothing. Now `papio actions open` and the
+  extension's Open button both ask the daemon for the route when you press
+  them. The paper is focused in the tab you are signed into and recorded like
+  every other handoff. If no library route applies, which is the open-access
+  case, Open still uses the paper's own link.
 
   Two things deliberately do not change. *papio* never starts opening these
   papers on its own, only when you ask. And it never tries to drive the page
@@ -906,13 +927,13 @@ execution records kept during the initial build.
   library, find that no interlibrary-loan request was ever lodged, and tell
   *papio* so from the extension, it cancelled the stale request and then failed
   with a job state conflict — every time, on any normally parked paper. The
-  paper was left with a cancelled request and the same unresolved prompt, so
-  the one button that clears a phantom request cleared nothing. The equivalent
-  `papio delivery confirm-absent` on the command line was fixed in August; the
+  paper was left with a cancelled request and the same unresolved prompt, so the
+  one button that clears a phantom request cleared nothing. The equivalent
+  `papio delivery confirm-absent` on the command line was fixed earlier; the
   extension kept the old order, which closed the prompt only after re-running
-  the gate and so asked the paper to move from "waiting for you" to "waiting
-  for you" — a step the state graph refuses. Both paths now close the prompt
-  first, then re-run the gate, and both re-open a fresh prompt rather than
+  the gate and so asked the paper to move from "waiting for you" to "waiting for
+  you" — a step the state graph refuses. Both paths now close the prompt first,
+  then re-run the gate, and both re-open a fresh prompt rather than
   resubmitting: *papio* still never sends a second request while an earlier
   one's outcome is unknown. Nothing about your existing papers changes, and no
   request is resubmitted by upgrading.
@@ -940,83 +961,55 @@ execution records kept during the initial build.
   whose route goes to doi.org and never touches the library at all. So an
   open-access paper that opened a tab held that lane for the life of its
   attempt, and every paper genuinely waiting for the library was passed over
-  until it lapsed. Then the next attempt took the lane again. Measured on this
-  machine: one open-access preprint held it while 22 papers queued behind it,
-  each fresh attempt re-arming the hold. An open-access route is now filed
-  under the site it actually visits, and a paper already recorded the old way
-  is corrected the next time *papio* looks at it — including while it is
-  driving a tab you can see, because only the filing changes and the tab
-  itself is never disturbed. Verified on the same preprint: correcting it
-  released all 22 papers at once, and its own tab kept going.
-- **`papio doctor` no longer counts open-access papers as blocked by a sign-in.**
-  The line that names which paper holds your library's sign-in slot also counts
-  the papers waiting on it, and it was counting every waiting paper — including
-  open-access ones, which do not need that sign-in and no longer wait for it.
-  The count is also honest about what it can prove now: with more than one
-  institution configured *papio* cannot yet attribute a waiting paper to a
-  particular library, so the line says those papers are *also* waiting for an
-  institutional sign-in rather than claiming they are stuck behind this one.
+  until it lapsed. Then the next attempt took the lane again. An open-access
+  route is now filed under the site it actually visits, and a paper already
+  recorded the old way is corrected the next time *papio* looks at it —
+  including while it is driving a tab you can see, because only the filing
+  changes and the tab itself is never disturbed.
 - **A rate-limited open-access paper no longer gets sent to your library.** When
   every open-access source *papio* wanted to ask was temporarily gated — a rate
   limit, a spend cap, a provider cooldown — it spent its retry budget on the
   ordinary failures beside them and then treated the whole route as exhausted,
   which opens a library sign-in. The paper was fetchable the whole time; nothing
-  had refused it, and no request had even been made. Measured on one paper: a
-  *JMIR AI* article, fully open access, took a library route and then held that
-  library's only sign-in slot for two and a half hours while 58 other papers
-  waited behind it. A pass that met only a closed gate and still has a live
-  open-access candidate now keeps waiting for the gate to open. A route that is
-  genuinely exhausted — no candidates, or a real refusal — still goes to a
-  handoff, and a gated route still cannot wait with no wake-up time.
+  had refused it, and no request had even been made. A pass that met only a
+  closed gate and still has a live open-access candidate now keeps waiting for
+  the gate to open. A route that is genuinely exhausted — no candidates, or a
+  real refusal — still goes to a handoff, and a gated route still cannot wait
+  with no wake-up time.
 - **An open-access paper no longer takes your library's sign-in slot and blocks
-  every other paper behind it.** *papio* signs in to one institution at a time on
-  purpose: two logins at one library can invalidate each other's session, so
+  every other paper behind it.** *papio* signs in to one institution at a time
+  on purpose: two logins at one library can invalidate each other's session, so
   while one paper is signing in the rest are refused and wait. An open-access
   paper reaches doi.org and needs no library at all, yet it was taking that slot
-  and holding it. The two were impossible to tell apart at the point it mattered,
-  because both arrive as the same kind of handoff and every route *papio* builds
-  for a browser is stamped institutional. Measured on one library: an open-access
-  ChemRxiv preprint held the slot while a waiting paper was refused about twice a
-  second, and 58 healthy papers sat behind it. An open-access handoff now stays
-  out of that arbitration entirely, and is also denied the side channel whose
-  close would end the whole library session — a paper you are only reading must
-  never be able to sign you out.
+  and holding it. The two were impossible to tell apart at the point it
+  mattered, because both arrive as the same kind of handoff and every route
+  *papio* builds for a browser is stamped institutional. An open-access handoff
+  now stays out of that arbitration entirely, and is also denied the side
+  channel whose close would end the whole library session — a paper you are only
+  reading must never be able to sign you out.
 - **One parked capture no longer hides your whole inbox.** `papio inbox` failed
   outright with `unsupported triage item kind "pdf_grab"` the moment a captured
   PDF was waiting to be identified — the very row the new picker above exists to
   answer. It printed nothing at all, so every other pending paper vanished with
   it. The capture now prints as its own row, with its state and label.
-- **A sign-in that lands you back where you already were no longer reloads the
-  page, or summons a security check.** After finishing a library round-trip
-  *papio* sent the tab to the resolver link a second time even when the tab was
-  already showing that exact page. Asking a browser to go where it already is
-  discards the rendered article for nothing, and at publishers who screen
-  automated traffic it provokes a fresh "prove you're human" check — one
-  *papio* caused and then asked you to solve. Measured on a live paper: the
-  check appeared 311 ms after the sign-in returned, on an article *papio* had
-  twice judged perfectly ordinary. It now navigates only when doing so would
-  actually move the tab.
-- **Solving a security check no longer counts against the paper.** *papio*
-  stops driving a paper on its own after three attempts that achieved nothing —
-  the rule that stops it hammering a publisher forever. A provider CAPTCHA
-  counted as one of those attempts, even when you went and solved it: the
-  daemon could not see security checks at all, so the attempt simply looked
-  silent and expired. Measured on the author's own machine: a paper retired
-  after three attempts, every one of them interrupted by a check that had been
-  solved. The browser now reports when a check it drove into is gone, and that
+- **Solving a security check no longer counts against the paper.** *papio* stops
+  driving a paper on its own after three attempts that achieved nothing — the
+  rule that stops it hammering a publisher forever. A provider CAPTCHA counted
+  as one of those attempts, even when you went and solved it: the daemon could
+  not see security checks at all, so the attempt simply looked silent and
+  expired. The browser now reports when a check it drove into is gone, and that
   attempt is neither counted against the paper nor credited to it. A check
   nobody clears still expires and still counts, so a paper stuck behind a wall
-  is still retired rather than retried forever. Timing only crosses the
-  channel — the publisher that showed the check does not.
+  is still retired rather than retried forever. Timing only crosses the channel
+  — the publisher that showed the check does not.
 - **A tab you closed is now recorded as closed even if you signed in again
   since.** When the browser reported that one of *papio*'s tabs was gone,
   *papio* rejected the report if your institution sign-in had cycled in the
   meantime — and then went on holding that tab's slot, for a tab that no longer
   existed, which is one of the ways a leftover tab became impossible to clean
-  up. Measured on the author's own machine: 36 rejected reports. A closed tab
-  cannot un-close because you signed in again, so the report is now accepted on
-  its own terms. Reports that *can* affect a live sign-in are still rejected
-  when they belong to a finished one.
+  up. A closed tab cannot un-close because you signed in again, so the report is
+  now accepted on its own terms. Reports that *can* affect a live sign-in are
+  still rejected when they belong to a finished one.
 - **A paper waiting for you no longer holds a browser tab as well.** After the
   fix below, one refusal was left standing: a paper that has asked you for
   something keeps that request open by definition, so the daemon read every
@@ -1027,15 +1020,14 @@ execution records kept during the initial build.
   with the tab gone. An unfinished job at the publisher still vetoes it. Adds
   database schema version 47.
 - **A tab *papio* opened for a paper it never finished is no longer kept open
-  forever.** The extension has always asked the daemon before closing a tab,
-  and the daemon answered "not eligible" for every ordinary sign-in tab —
-  wording the extension correctly obeyed as a refusal. But the daemon was not
-  withholding anything: it simply had no record to consult, because that kind
-  of tab never creates one. So every paper that reached your library's sign-in
-  and ran out of time left a tab behind, and the next paper opened another.
-  Live on the author's machine: fifteen tabs, thirteen of them the same page,
-  days old. The daemon now distinguishes "I am holding this one" from "this is
-  not mine to hold", and only the first is a refusal.
+  forever.** The extension has always asked the daemon before closing a tab, and
+  the daemon answered "not eligible" for every ordinary sign-in tab — wording
+  the extension correctly obeyed as a refusal. But the daemon was not
+  withholding anything: it simply had no record to consult, because that kind of
+  tab never creates one. So every paper that reached your library's sign-in and
+  ran out of time left a tab behind, and the next paper opened another. The
+  daemon now distinguishes "I am holding this one" from "this is not mine to
+  hold", and only the first is a refusal.
 - **Search results no longer call a PubMed paper "not in your library" when it
   is.** Discovery asked Zotero about each result using only its DOI and arXiv
   id, so a paper identified by PMID alone — ordinary for PubMed-sourced results
@@ -1045,39 +1037,22 @@ execution records kept during the initial build.
   a missing field, so the duplicate is gone: discovery now asks through the same
   converter the import and filing paths use, and a future identifier cannot
   reach one of them and miss the other.
-- ***papio* now retires a working tab when its paper is over — including after
-  either side restarts.** A tab that had reached a library or publisher page
-  could never be closed by *papio*: only an untouched placeholder, a paper that
-  had arrived, or an abandoned sign-in had a permitted closing reason.
-  Cancelled and otherwise-finished papers therefore accumulated in the *papio*
-  group indefinitely. The daemon now derives terminal browser cancellations
-  from durable claims instead of worker memory, and can authorize one exact
-  binding to close when its job is terminal or has no open browser handoff,
-  provided no provider effect is still in flight. The extension can act from
-  either live job state or the same-browser-epoch birth ledger; after the
-  physical close it reports `owner_closed`, consuming the one-use token and
-  freeing the institution's sign-in slot. It still refuses pinned, PDF, ceded,
-  foreign-window, and browser-restarted tabs, and never closes the tab you are
-  looking at — those belong to you, not cleanup.
-- **Signing in at your library now releases the papers waiting for it, even
-  when that library is configured twice.** Naming your own institution under
+- **Signing in at your library now releases the papers waiting for it, even when
+  that library is configured twice.** Naming your own institution under
   `[browser.resolvers.<name>]` while it is also the top-level default is
   ordinary configuration, and it had two silent consequences: one library held
   *two* sign-in slots, and every sign-in *papio* observed at that library's own
-  address was discarded as ambiguous — no record, and no paper released.
-  Measured on a real sign-in: two observations arrived, nothing was stored, 132
-  papers kept waiting. A library is now identified by the sign-in it actually
-  uses, and one address's sign-in counts for every profile that shares that
-  same sign-in. Two genuinely different logins behind one address are still
-  kept apart.
+  address was discarded as ambiguous — no record, and no paper released. A
+  library is now identified by the sign-in it actually uses, and one address's
+  sign-in counts for every profile that shares that same sign-in. Two genuinely
+  different logins behind one address are still kept apart.
 - **Signing in for one paper no longer strands every other paper at that
   library.** A sign-in that completed before *papio* had a page to sign in on
   claimed the library's single sign-in slot with no expiry at all, so it held
   that library forever: every other paper was refused with "another sign-in for
-  this institution is in progress" while nothing was in progress. Measured live
-  — one such hold refused 71 attempts across the whole queue. A sign-in with no
-  page attached now keeps the short deadline it was granted, a real sign-in in
-  progress still runs as long as you need, and an abandoned one is released
+  this institution is in progress" while nothing was in progress. A sign-in with
+  no page attached now keeps the short deadline it was granted, a real sign-in
+  in progress still runs as long as you need, and an abandoned one is released
   automatically instead of waiting for another paper to collide with it.
 - **Closing *papio*'s tabs yourself no longer strands your library.** If a
   *papio* tab disappears while nothing is watching — you close it during an
@@ -1085,12 +1060,10 @@ execution records kept during the initial build.
   been granted its one navigation, and a granted paper's page is deliberately
   never expired on a timer. So the library's single sign-in slot stayed held by
   a paper with no page at all, and every other paper queued behind it forever.
-  Measured live: the tab group was closed during a reload and the slot was
-  still held ten minutes later with no expiry set. The extension now reports
-  that exact loss from its own durable record of the tabs it opened, and a
-  paper whose page is retired releases the library slot it was occupying. A
-  sign-in still survives a browser reconnect untouched — that is a new session,
-  not a lost page.
+  The extension now reports that exact loss from its own durable record of the
+  tabs it opened, and a paper whose page is retired releases the library slot it
+  was occupying. A sign-in still survives a browser reconnect untouched — that
+  is a new session, not a lost page.
 - **A library slot held by a paper whose page vanished now frees itself three
   ways.** The first release of this fix could only report a vanished tab when
   the extension still recognised its own record of it — and reloading after you
@@ -1103,42 +1076,41 @@ execution records kept during the initial build.
   the tab at all, so even a slot stranded by an older version frees itself the
   next time you ask for a paper. Relatedly, queued sign-in progress is no
   longer discarded when the browser reconnects.
-- **Signing in no longer releases the same four dead papers every time.** When
-  an institutional sign-in returns, *papio* releases a few of the papers that
-  were waiting on it. Four papers it had already given up on — each having been
-  handed to the browser three times without ever reporting an outcome, and so
-  permanently retired from being offered — were still first in that queue, and
-  took every slot, on every sign-in. Measured on a real library: 424 releases
-  spent on those four while 58 papers that could still be fetched were never
-  offered once. The release now applies the same "papio has stopped
-  volunteering this one" rule the ordinary path already applied, so the slots
-  go to papers that can still move. Nothing is dismissed or hidden: `papio
-  actions open` still drives any of them on demand, and `papio doctor` still
-  reports the count that has gone quiet.
+- **Signing in no longer releases the same dead papers every time.** When an
+  institutional sign-in returns, *papio* releases a few of the papers that were
+  waiting on it. Papers it had already given up on — each having been handed to
+  the browser three times without ever reporting an outcome, and so permanently
+  retired from being offered — were still first in that queue, and took every
+  slot, on every sign-in. The release now applies the same "papio has stopped
+  volunteering this one" rule the ordinary path already applied, so the slots go
+  to papers that can still move. Nothing is dismissed or hidden: `papio actions
+  open` still drives any of them on demand, and `papio doctor` still reports the
+  count that has gone quiet.
 - **Papers no longer get retired for waiting their turn.** The extension drives
   one paper at a time; the rest queue behind it. But its acknowledgement said
   only "got it", never whether it was *driving* that paper or *queueing* it —
   and *papio* counted every acknowledgement as a drive that produced nothing,
-  giving up on a paper after three. So one stuck sign-in, holding the only
-  drive slot, could retire the whole queue behind it without a single browser
-  tab ever opening. Measured on a real library: **78 papers** permanently
-  retired across 438 acknowledgements, and **77 of those papers had never had a
-  tab at all**. The acknowledgement now says which it is, only a real drive
-  counts, and being asked about a paper costs it nothing. Those 78 papers are
-  restored on upgrade — a one-off repair, recorded per paper, that makes no
-  claim about any attempt: a paper that really is dead simply goes quiet again
-  after its next three real attempts.
+  giving up on a paper after three. So one stuck sign-in, holding the only drive
+  slot, could retire the whole queue behind it without a single browser tab ever
+  opening. The acknowledgement now says which it is, only a real drive counts, a
+  paper that waits behind another paper's sign-in is not charged for the wait,
+  and the drive that later starts is reported. Papers retired this way that
+  never reached a page are restored on upgrade — a one-off repair, recorded per
+  paper; a paper that genuinely failed stays retired, and a paper that really is
+  dead goes quiet again after its next three real attempts.
 - **A cancelled paper no longer keeps its browser surface on the books
   forever.** The two sweeps that retire browser claims both refuse to touch one
   carrying any provider-effect record, so an irreversible provider action is
   never interrupted mid-flight. For a paper that has already finished there is
-  nothing left to interrupt, and the record made the claim immortal: eleven
-  claims on cancelled papers were sitting live with tab ids days dead, and
-  *papio* re-announced their teardown on every restart while never closing its
-  own book on them. A finished paper's claim is now retired, guarded the same
-  way the institution's sign-in slot already was — only an effect still in
-  flight defers it — and only after the teardown was actually delivered to the
-  browser, so the tab can never outlive *papio*'s knowledge of it.
+  nothing left to interrupt, and the record made the claim immortal: claims on
+  cancelled papers stayed live with tab ids long dead, and *papio* re-announced
+  their teardown on every restart while never closing its own book on them. A
+  finished paper's claim is now retired, guarded the same way the institution's
+  sign-in slot already was — only an effect still in flight defers it — and only
+  after the teardown was actually delivered to the browser, so the tab can never
+  outlive *papio*'s knowledge of it. A cancellation that the browser reported
+  itself does not count as that delivery, so the paper keeps its place at the
+  library while its page is still open.
 - **A paper that needs you to download it by hand now hands you the page.**
   *papio* asks for a manual download when its own attempt could not produce the
   file — then had no way to take you where the file is. `papio actions open`
@@ -1149,32 +1121,6 @@ execution records kept during the initial build.
 - **An open-access paper's listing names the command that fetches it.** A row
   needing no login read "open access — no login needed" and stopped, which says
   nothing about how to get the paper.
-- **A paper waiting behind another paper's sign-in is no longer charged for
-  waiting.** *papio* drives one handoff at a time; the papers behind it queue.
-  The queue wait was reported as a drive, so three turns in line retired a
-  paper — and the drive that eventually started was never reported at all,
-  which would have left a genuinely stuck paper running forever. Both halves
-  now say what they are.
-- **A cancelled paper's tab is only forgotten once the browser has been told
-  about it.** A cancellation the browser reported itself stopped *papio* from
-  sending a redundant message, and that silence was misread as the browser
-  having been told — so the paper's place at the library could be released
-  while its page was still open.
-- **A sign-in page that cannot be reached is no longer assumed closed.** When a
-  momentary browser error hid a live page, *papio* concluded the page was gone,
-  released the library slot, and destroyed the record it needed to notice.
-  Absence is now proven before anything is released.
-- **Closing a paper's page after an extension update is noticed again.** An
-  update clears *papio*'s memory of which papers are in flight while the pages
-  stay open; closing one then freed nothing, and permanently, because the
-  record that could have recovered it was discarded in the same breath.
-- **A stuck sign-in no longer hides behind an out-of-date badge.** After an
-  update the toolbar counted a sign-in page that had already been finished or
-  closed, and nothing repainted it.
-- **Papers retired for waiting are only revived where the waiting is
-  provable.** The repair released every paper that had ever been retired; it
-  now releases only those that never reached a page at all, so a paper that
-  genuinely failed stays retired.
 - **A network failure no longer leaves a dead browser tab behind or retries
   into an offline network.** The extension already asked to close a route after
   Chrome reported a navigation error, but the daemon never marked that route
@@ -1251,10 +1197,8 @@ execution records kept during the initial build.
   sign-ins racing on the same site. Deciding whose turn it is looked at every
   paper ever queued for that provider — including papers you had cancelled and
   papers that had already arrived, which keep their place in the queue forever.
-  Each one costs a live paper another wait, and nothing says so: measured here,
-  a paper sitting behind two cancelled ones took seven minutes to open after
-  being asked for, with no tab and no message in between. Finished and cancelled
-  papers now give up their place.
+  Each one cost a live paper another wait, with no tab and no message in
+  between. Finished and cancelled papers now give up their place.
 - **Asking again for a paper *papio* is already working on no longer reports a
   refusal.** `papio actions open` on a paper whose sign-in was already queued
   said the paper's access mode did not permit an institutional handoff — a
@@ -1308,10 +1252,36 @@ execution records kept during the initial build.
 - **Cancelling someone else's download no longer disconnects your browser.** The refusal for "only the browser that started this download can cancel it" was assembled in a form *papio* rejects on its way out, so instead of declining one request it failed the whole exchange and dropped the browser's connection. The same refusal is also no longer reported back as though the download had been successfully cancelled.
 - **The identity rules that guard a picked paper got stricter, and the ones that could not be made safe were withdrawn.** A correction notice, comment, retraction or supplement is now recognised and never treated as the work it refers to, while a footnote merely pointing at a chapter's erratum is still the chapter. A candidate title that is only a prefix of the printed title (`Foo` against `Foo: A Different Study`) no longer counts as that title; a running head or a citation in a second column no longer counts as the document's own title; an author surname appearing only in the title or journal line no longer counts as author evidence; and a year is matched as a year rather than as digits that can hide inside an identifier. Five documents that still defeat these rules — a journal expansion citing the conference paper's DOI, a repository cover card reprinting someone else's citation, a subtitle wrapped across two lines, a numbered sequel, and a year hidden in a dotted DOI — are kept in the measurement corpus as the standing bar any future automatic rule must clear.
 - **Two identifiers that name different papers are no longer treated as one.** Some registrars have published the same paper with a doubled slash after the registrant, and others have registered genuinely different papers at the single- and double-slash forms of one identifier. Nothing in the text can tell those apart, so *papio* now stops and asks instead of guessing, in both directions; a document printing both forms is likewise ambiguous rather than silently collapsed to one. Separately, a paper whose registered identifier contains a doubled slash could previously be "confirmed" by a page printing the other paper's identifier.
-- **Bytes are no longer staged into a paper's folder before the claim that owns them is durable.** Automatic binding copied the file into the job's adoption directory and only then recorded the claim, so a crash in between left a file indistinguishable from an ordinary browser delivery, which a later sweep adopted for a job that never claimed it. The claim now commits first and the validated quarantine copy — never the mutable landing file, which could be replaced after validation — is what gets staged. A paper cancelled between the claim and ingestion keeps its bytes recoverable instead of having them swept, retrying a quarantined capture no longer attempts to copy a directory, and a folder that already holds a file no longer starves the retry.
 - **A capture that stops being wanted is no longer filed anyway.** Bytes are accepted into a paper awaiting a human only while some human action for it is still open, checked in the same transaction that accepts them. Dismissing a download request left a brief window where the request was closed but the paper still looked like it was waiting, and a delivery already in flight was filed into it.
-- **The popup's paper choice can no longer be reused after the page changes underneath it.** The choice you make in "Which paper is this?" is now checked against the page as the browser actually reports it rather than against the address the popup sent, is invalidated by ordinary page loads and reloads rather than only by in-page navigation, expires when it is old rather than only when a newer choice displaces it, and is revoked when its tab is replaced or its delivery finishes. A choice that survives a browser restart is re-checked against the live tab and dropped if it cannot be confirmed. Only the address without its query is remembered, so a signed download link is never stored. On Firefox, where *papio* cannot follow a viewer's own Download button, the picker no longer promises to file something it cannot see.
-- **A document that names a different paper is now held for review instead of being filed.** A captured or directly delivered PDF whose front matter conclusively names a DOI belonging to a work the job is not bound to now parks for `verify_identity` instead of being accepted. This closes a wrong-accept that ordinary identity scoring did not cover for DOI-less jobs: a PDF whose printed title and authors matched the requested paper exactly could be filed under the wrong citation, because the foreign-DOI check only applied when the job itself had a DOI. The veto runs in `validateCandidate` — the single convergence for direct delivery, grab binds, adoption sweeps and resolver fetches — so every bytes-to-artifact path is gated the same way. An explicit human review of the quarantined preview (`ReviewOverride`, ADR-0002) still overrides the veto, exactly as it overrides the neighbouring identity-review arm; picking a job in the popup does not — a selection supplies correlation evidence, not authority to overrule conclusive document identity, and a review remains the only way to accept a document whose own front matter says it is a different work. That extra step is deliberate: a silent wrong-accept is a worse failure than an honest `verify_identity` turn.
+- **A document that names a different paper is now held for review instead of
+  being filed.** A captured or directly delivered PDF whose front matter
+  conclusively names a DOI belonging to a work the job is not bound to now parks
+  for `verify_identity` instead of being accepted. This closes a wrong-accept
+  that ordinary identity scoring did not cover for DOI-less jobs: a PDF whose
+  printed title and authors matched the requested paper exactly could be filed
+  under the wrong citation, because the foreign-DOI check only applied when the
+  job itself had a DOI. The veto runs in `validateCandidate` — the single
+  convergence for direct delivery, grab binds, adoption sweeps and resolver
+  fetches — so every bytes-to-artifact path is gated the same way. An explicit
+  human review of the quarantined preview (`ReviewOverride`, ADR-0002) still
+  overrides the veto, exactly as it overrides the neighbouring identity-review
+  arm; picking a job in the popup does not — a selection supplies correlation
+  evidence, not authority to overrule conclusive document identity, and a review
+  remains the only way to accept a document whose own front matter says it is a
+  different work. That extra step is deliberate: a silent wrong-accept is a
+  worse failure than an honest `verify_identity` turn. A conclusive mismatch
+  does not stop the candidate queue: the fetch path tries the remaining
+  candidates first, and if none succeeds it keeps the first mismatch and binds
+  the review to its checked quarantine bytes. A PDF with several front-matter
+  DOIs, such as a book DOI and a chapter DOI, is ambiguous rather than a
+  mismatch, and the review asks which one identifies the requested work. An
+  accepted review of such a document promotes the file, even when the job's own
+  DOI check also rejects the foreign DOI. The waiver holds only for a
+  `verify_identity` accept, and only while the file hashes to the SHA-256 that
+  the accept named, so adopting the same file again also promotes it. Other
+  rejects, other bytes and an `unsafe_pdf` accept still go through every check,
+  and the `ready` transition records `reason: review_accepted` and
+  `identity_override: operator`.
 - **A paper found by title search no longer gets filed under that search's own
   identifier.** Looking a title up returns a record, and *papio* was writing
   that record's DOI onto your request as if you had supplied it. Two papers can
@@ -1321,7 +1291,11 @@ execution records kept during the initial build.
   document the guess came from: a wrong paper, filed under a citation it
   matched, with nothing reporting a problem. The search still guides the same
   attempt's search for a copy; it just no longer renames your request. Gaps you
-  left open — an author list, a year — are still filled in.
+  left open — an author list, a year — are still filled in. When a request gives
+  only a title, with no year, authors or identifier, and every lead comes from
+  search results, the job now ends as `unavailable` with reason
+  `insufficient_identity_evidence`, and *papio* fetches no PDF for it. Resubmit
+  the paper with a DOI, PMID or arXiv id, or add its year or authors.
 - **Checking a downloaded PDF now asks whether it is the paper you asked for.**
   The comparison used whichever identity the job had accumulated, so an
   identifier adopted from an earlier search was the thing the document had to
@@ -1329,223 +1303,26 @@ execution records kept during the initial build.
   your database that picked up an identifier this way are re-checked against
   your original request rather than against that identifier.
 - **An OpenAlex address copied out of a browser is now accepted.** The address
-  the OpenAlex website actually shows — `https://openalex.org/works/W2741809807`
-  — was refused as an invalid work id, because *papio* recognized only the
-  shorter form OpenAlex uses in its own records. Both are accepted now, along
-  with the `www.` and `api.` hosts and a trailing slash. A bare `works/…` with
-  no address around it is still refused: the positional argument guesses only at
+  the OpenAlex website shows — `https://openalex.org/works/W2741809807` — was
+  refused as an invalid work id, because *papio* recognized only the forms
+  OpenAlex uses in its own records and its API. It is accepted now, along with
+  the `www.` and `api.` hosts and a trailing slash. A bare `works/…` with no
+  address around it is still refused: the positional argument guesses only at
   shapes that cannot name a different kind of identifier.
-
-- **A "slow down" from OpenAlex now holds for every account, and an exhausted
-  account no longer blocks the other one.** These are two different messages that
-  arrive the same way, and *papio* was treating them as one. Being out of credit
-  belongs to the account that spent them — the second account exists precisely to
-  be usable then — while a request to slow down belongs to this machine's
-  connection and no change of account satisfies it. They are recorded separately
-  now, and the shared pause is re-checked at the last moment before a call goes
-  out, so a pause that arrives while *papio* is waiting its turn still stops it.
-
-- **A reply that names two different papers is no longer half-believed.**
-  OpenAlex repeats each identifier in two places. *papio* checked only the one it
-  had searched by, and for the others quietly took whichever appeared first — so a
-  reply carrying two conflicting record numbers had one of them attached to your
-  paper as certain fact. When a reply disagrees with itself about an identifier,
-  that identifier is now discarded; the identifier that was actually verified is
-  kept.
-
-- **A paper no longer loses its place in the lookup cache to a record already
-  there.** Refreshing something the cache already held counted as needing room,
-  and evicted an unrelated paper's freshly fetched details — even though replacing
-  an entry cannot make the cache any bigger. The evicted paper then went looking
-  for related versions with nothing to search on.
-
-- **When OpenAlex says it is nearly out of budget, *papio* now stops even if it
-  cannot write that down.** The warning was recorded to the database and, if that
-  write failed — a busy or full disk — the warning was logged and otherwise
-  discarded, so the next request went out as though nothing had been said. *papio*
-  now stops asking that account until the provider's own reset regardless of
-  whether the note could be saved, and it stops the moment the warning is read
-  rather than after trying to save it. The two OpenAlex accounts — with and
-  without an API key — are budgeted separately, so stopping one never silences
-  the other.
-
-- **A paper that had already waited its turn could slip past that stop.** The
-  budget check happened before the wait for a free slot, not after, so a request
-  held up for a moment could be sent against a limit that had been reached while
-  it waited. The check is now part of the same step that records the spend, so
-  there is no gap between deciding and sending.
-
-- **Reaching an API key's daily limit no longer parks work that the keyless
-  account could still do.** Tightening the check above made a spent key look like
-  an ordinary outage, which stopped everything instead of falling back — the
-  fallback's whole purpose. A limit reached on one account now moves to the next
-  one, while an ordinary outage still stops the source for everybody, since that
-  is not something a different account can fix.
-
-- **A busy cache no longer throws away the one record a paper's search depends
-  on.** The reused-record cache has a size limit, and on reaching it *papio*
-  discarded stale entries — but if none were stale, it emptied the cache outright.
-  A paper waiting to search for other versions of itself could therefore lose the
-  only description it had, purely because 512 unrelated papers were looked up in
-  the meantime, and the search was then skipped as having nothing to search on.
-  Only the single oldest entry is discarded now.
-
-- **"Out of budget for today" no longer arrives as an unexplained network
-  failure.** When a daily budget stop paused OpenAlex, the message reaching the
-  rest of *papio* had its reason stripped out and replaced with a generic failure,
-  so the paper retried on the ordinary schedule instead of waiting for the budget
-  to reset. No money was spent by those retries — each was refused before leaving
-  the machine — but the wait was wrong and the logs said nothing useful.
-
-- **An OpenAlex-ID lookup now has to come back about the work that was asked
-  for.** *papio* already refused a record that answered a DOI lookup with a
-  different paper, but the equivalent lookup by OpenAlex identifier trusted
-  whatever arrived — and both are treated as exact, fully-confident matches. A
-  misrouted or duplicated answer could therefore be filed under the citation that
-  requested it. Both lookups now apply the same rule, and disagreement between a
-  record's own identifier fields is refused rather than resolved by field order.
-
-- **An API key with stray whitespace no longer disables the daily-budget stop.**
-  The key is trimmed everywhere it is used — on the wire, and when deciding which
-  credential a budget belongs to — but the component that records "this
-  credential is nearly out" compared the trimmed key it saw against the untrimmed
-  one from configuration, matched neither, and silently recorded nothing. A
-  configuration *papio* otherwise treats as identical turned the stop off
-  entirely.
-
-- **A partial cached record no longer cancels sibling discovery.** The reused
-  canonical record replaced the work's own metadata outright, so a cached record
-  carrying a title but no readable authors could leave nothing to search on and
-  silently skip the search — even when the work's own title and authors were
-  perfectly usable. The cache now only takes precedence when it actually yields a
-  usable basis.
-
-- **An unreadable retry history no longer authorizes the expensive search.**
-  Whether a job has spent its retry budget is read in two opposite senses: for
-  deciding when to stop trying, "cannot tell" must mean stop, but the same
-  answer is also one of the conditions that *permits* the ten-credit title
-  search. A single transient history read failure therefore bought a search
-  while an ordinary retry was still pending. Stopping still fails closed on an
-  unreadable history; permitting the expensive call now requires a fact *papio*
-  actually read.
-
-- **A DOI-only work is less likely to lose its search basis to cache eviction.**
-  The sibling hop reuses the canonical record fetched earlier in the same pass
-  rather than fetching it twice, but that memo is an evictable two-minute cache,
-  and filling it used to discard everything — including entries still in use.
-  It now discards expired entries first and clears wholesale only if that frees
-  nothing. When no basis survives, the hop still makes no request at all and
-  reports exactly that, so the pass is not charged for a call that never
-  happened.
-
-- **A corrupt search marker no longer buys the expensive search again.** The
-  per-question marker that stops *papio* re-asking a title search it has
-  already paid for is read back through the job's event stream, which decodes
-  each event detail leniently and yields nothing at all on a malformed row. An
-  illegible marker therefore matched no question and authorized a fresh
-  ten-credit query — exactly when storage was already misbehaving. A marker of
-  the right kind is now proof the search happened; only a legible, different
-  question buys another one.
-
-- **The daily-quota floor now stops every caller, not just acquisition.** When a
-  provider reports its daily budget nearly spent, *papio* records that against
-  the exact credential involved — but only the acquisition path consulted the
-  record. Discovery, DOI-only enrichment, watch digests and MCP admit through a
-  different entry point, so they kept sending on a credential already known to
-  be spent until an outright refusal arrived. The floor is now checked where
-  every path passes. A caller with no alternative credential waits for the
-  provider's own reset instead of falling back, and acquisition's keyed-then-
-  keyless preference is unchanged.
-
-- **The expensive sibling search is no longer bought on a foregone conclusion,
-  nor skipped when it could have worked.** Results are only accepted when they
-  share an author surname with the work being acquired, which cannot happen when
-  no author is known — yet a bare title was enough to pay for the search. In the
-  other direction, a record of "this DOI is not in the provider's index"
-  cancelled the search outright, even though the work's own title and authors
-  were a perfectly good basis for finding a copy published under a different
-  DOI. Both now follow one rule: the search runs when, and only when, the
-  information *papio* holds could actually produce an acceptable match.
-
-- **The expensive sibling search runs once per question, at the boundary where
-  it is the last thing left to try.** OpenAlex prices a singleton record
-  lookup at one credit and a title search at ten; measured against a day of
-  real traffic, 304 of those searches ran, 280 found nothing, and together
-  they were ~90% of the day's spend. The search now waits until the primary
-  candidates have no ordinary retry left to take — the rule the
-  exhaustion-boundary hop already followed and the resolver pass ignored — and
-  a search that completed for a given title, year, authors, and DOI is not
-  asked again, because a zero-result answer is a fact about the provider's
-  index rather than a transient failure. A transport failure records nothing
-  and stays retryable, enrichment that materially changes the bibliography
-  buys one new search, and the free typed version relations are unaffected.
-
-- **Two spend guards no longer fail open.** A job's retry history is the only
-  bound on provider spend once its candidates are all dead, so an unreadable
-  history now settles the job instead of authorizing another paid pass — the
-  cost of being wrong is one `papio jobs retry` against a quota that cannot be
-  refunded until the provider's next reset. The daily-budget floor is written
-  with a context detached from the request that carried the news, so a
-  shutdown racing a low-quota response can no longer discard the only durable
-  record that the provider asked *papio* to stop; a floor that cannot be
-  recorded is now logged rather than silently dropped. The floor also ignores
-  a response whose reported budget is not self-consistent, and one bearing an
-  API key *papio* did not send, rather than gating an identity it cannot name.
-
-- **A job whose candidates are all dead stops re-running the resolver chain
-  forever.** A pass that reached at least one source was labelled
-  `source_gate` — uncharged against the bounded retry budget — whenever some
-  unrelated source happened to be gated in the same pass, so the budget never
-  bound and the loop repeated every cadence indefinitely, spending real
-  provider credits each cycle. Metadata enrichment and DOI enrichment made
-  budgeted requests that the retry plan never saw at all; both now report
-  their own observations. A pass that made no request is still uncharged, and
-  when several sources are gated for different durations the one wait granted
-  past exhaustion now targets the longest of them, so the slowest gated source
-  still gets the call that rule exists to grant it.
-
-- **OpenAlex is paced by its own daily-budget headers instead of sprinting
-  into a day-long block.** Every response's `X-RateLimit-Remaining`/`Limit`/
-  `Reset` now lands a durable floor at 5% remaining for the exact credential
-  that served the request; the resolver, metadata enricher, and discovery
-  backend all read and honor it. A bare `429` deliberately does not trigger
-  it — the same status answers a per-second burst — and keeps using the
-  ordinary retry path. Once the keyed identity's own quota signal says stop,
-  acquisition continues on OpenAlex's keyless tier, which respects the
-  identical floor; an ordinary retry gate, a local throttle, or a candidate
-  file host's failure never switches credentials, and discovery stays
-  keyed-only.
-
-- **The sibling version hop no longer re-fetches a record *papio* just read.**
-  It reuses the canonical work record from the same pass's `Resolve` call, or
-  the caller's own metadata, instead of issuing a second lookup; with neither
-  it reports that it made no request rather than being charged for one. Every
-  works lookup now also bounds the response to the fields *papio* reads.
-
-- **Searching OpenAlex by title for another copy of a paywalled paper is now off by default.** That search costs 10 credits and was measured against the operator's own history at **at least 138 credits for every paper it actually delivered** — and it plainly did not deliver all of them — so it did not pay for itself in its current form. Nothing about how papers are accepted or ranked changed. You can turn it back on with one line under `[sources.openalex]`:
-
-  ```toml
-  [sources.openalex]
-  sibling_title_search = true
-  ```
-
 - **Clean scheduler completion no longer races its final heartbeat.** A
   heartbeat already in flight when a worker parks or completes its job now
   recognizes the lease-releasing state as success, while a wrong owner on
   active work still fails closed.
-
 - **A browser demoted by `papio browser use` is told once.** Claiming the
   session moved the offer/handoff flow without the previous holder's extension
   ever hearing about it, so that browser kept reporting a live *papio*
   connection while receiving no work. Its next poll now carries the same
   `session_busy` frame a refused hello gets, which the extension renders as
   the browser that holds the session instead of a healthy connection.
-
 - **The work pulse's next action counts every paper sharing its deadline.** A
   backoff cohort is scheduled on one common instant, and only the first row's
   count was reported — so a browser popup said *retrying 1* directly beneath
   *51 scheduled*, reading as though papio had forgotten the other fifty.
-
 - **An agent driving *papio* over MCP can no longer sever its own connection by
   asking for standard input.** The MCP tools run each CLI command in-process
   with its output captured, but standard input was left pointing at the real one
@@ -1555,6 +1332,314 @@ execution records kept during the initial build.
   was waiting for them. Commands run this way are now given no standard input at
   all, so that request fails plainly and the connection is untouched. Supplying
   many papers at once over MCP is what `papio_acquire_batch` is for.
+- **The latest batch in the work pulse now counts a paper whose worker died as
+  stalled.** A queued or running batch paper whose lease had expired still
+  counted as `continuing`, so `latest_batch.stalled` in `papio pulse --json` was
+  always `0`. An expired lease now counts as `stalled`. A lease that expires at
+  this exact moment still counts as in flight.
+- **Document-delivery bookkeeping no longer loses a provider result or a
+  reconciliation prompt.** Cancelling a paper or dismissing its request could
+  overwrite a status check that had just recorded the request as fulfilled,
+  declined or cancelled with `unknown_outcome`; the provider's answer now
+  stands. `papio delivery confirm-exists`, and the same answer in the popup, now
+  commits in one step, so a failure part-way leaves the reconciliation prompt
+  open. A prepared but unsent request that a new paper reuses from a cancelled
+  paper now moves to the new paper before *papio* sends it, so the library's
+  transaction does not belong to a cancelled paper. After failed status checks,
+  random jitter could push the next check past the 24-hour maximum interval; it
+  now stays inside it.
+- **Cancelling a document-delivery request can no longer report success for a
+  request your library already received.** *papio* sends a request to the
+  library first and records it as submitted a moment later. A `papio delivery
+  cancel` in that gap overwrote the live request with "cancelled" and said it
+  had worked. The cancel now applies only if the request is still in the state
+  it read, and otherwise reports the state the request reached. Two similar
+  races are closed: confirming a request absent while it was being confirmed
+  present could cancel the live request, and a status check that overlapped a
+  change of the request's library transaction number could record the old
+  transaction's result on the new one.
+- **A failed update check no longer repeats on every command.** When the release
+  check failed (network error, error status, bad reply or empty release),
+  *papio* did not record the attempt, so every later command and `papio doctor`
+  checked again for as long as the failure lasted. A failed check now waits for
+  the same daily interval as a successful one, and the cached release is kept. A
+  cache time in the future no longer counts as recent. The *zotio* release check
+  works the same way.
+- **The update notice appears once a day, however many *papio* processes are
+  running.** The daemon and each command read and rewrote the same update cache
+  without a common lock, so both could print the notice, or one could overwrite
+  a newer check result. They now take a shared lock on the cache and re-read it
+  before each change.
+- **Very large timeout and cadence values are now refused instead of wrapping.**
+  `fetch.timeout_seconds`, `browser.action_expiry_seconds` and
+  `actions.stale_after_seconds` had only a lower limit, so a very large value
+  overflowed and every deadline derived from it expired at once. They must now
+  be in `5..3600`, `0..2592000` and `0..31536000`, and a value outside these
+  limits fails config validation. `papio watch add --cadence` also refuses more
+  than `87600h`, because a larger value overflowed and made the watch run on
+  every scheduler pass.
+- **A timed-out Zotero change is no longer recorded as a failure.** When a
+  *zotio* command that changes your library timed out or was cancelled, *papio*
+  recorded a definite failure and discarded the plan, but Zotero may already
+  have made the change, so a retry could import the paper or attach its PDF a
+  second time. The outcome is now recorded as ambiguous. The plan is kept, and
+  *papio* does not run the change again on its own. A staged PDF whose checksum
+  does not match is now removed, not left where the import treats it as
+  verified. Two plans for the same paper no longer race while they stage files.
+- **A failed Zotero import now keeps its reason, and a paper already in your
+  library is no longer reported as a failure.** An import error that *papio*
+  could not classify was recorded as `unknown` with no message, and the daemon
+  log said nothing. The import record now keeps the cleaned-up message, the
+  daemon logs each failed automatic import, and a missing citation title or
+  authors has its own class, `bundle_validation`. Before an automatic import,
+  *papio* now checks whether Zotero already holds the paper with a PDF, and if
+  it does, records a duplicate (`already_in_library`) instead of an error.
+- **A paper with no citation title or authors can now be filed in Zotero.** When
+  `papio acquire --doi` matched a PDF already in *papio*'s store, the paper
+  became ready with no title or authors, and every later Zotero import failed
+  with `identity.title length out of range`; no retry could fill the gap.
+  *papio* now looks up the citation from the DOI in that case, and before it
+  files a ready paper whose citation has no title, it gets the missing title and
+  authors by DOI from your configured discovery source. A paper that used up its
+  automatic attempts is repaired when you run `papio zotio import-backfill
+  --apply`. If no citation is found, the import error asks you to check the DOI
+  or supply the title and authors.
+- **A Zotero upload refused with HTTP 413 now says why.** *papio* recorded it as
+  a generic `zotero_http_4xx` error. When Zotero's reply names its storage
+  quota, *papio* now records `zotero_storage_quota_exceeded` with Zotero's own
+  figures, and otherwise records `zotero_file_storage_refused`.
+- **A paper whose cached Zotero plan selected nothing is planned again instead
+  of failing on every retry.** *papio* replayed a cached plan in which *zotio*
+  had selected no import, so the paper failed with `Zotio manifest entry is
+  "unresolved", not resolved` on every attempt. *papio* now discards that plan
+  and makes a new one. A plan that may already have written to your library is
+  still never discarded.
+- **A paper without a DOI can now be filed in Zotero as a new item.** *papio*
+  required a DOI to create a Zotero item, but it used the DOI only to name the
+  PDF it hands to Zotero. Book chapters, preprints, reports and older articles
+  identified by PMID, arXiv ID or ISBN were refused, and they are now filed. A
+  paper known only by its title is still refused.
+- **Checks for papers already in your Zotero library work with current *zotio*
+  again.** `zotio items find` returns its results inside a `{meta, results}`
+  envelope, but *papio* read only a bare list. Every lookup failed: search
+  results came back unclassified, watch runs stopped with an ownership-lookup
+  error, and the browser could not tell that you already had a paper. *papio*
+  now reads both shapes. It also reads `zotio items missing-pdf` in both shapes,
+  so a newer *zotio* that wraps that list does not break the queue of Zotero
+  items without a PDF.
+- **A paper whose Zotero item already has a PDF is now marked as filed.**
+  *papio* tried to attach the PDF to the existing Zotero item again on every
+  retry pass, even when the item already held a PDF. On a library that keeps its
+  files on its own storage, each upload was refused, so the paper stayed unfiled
+  and was retried without end. *papio* now checks whether the item already holds
+  a PDF. If it does, *papio* records the paper as already in your library and
+  makes no upload.
+- **An HTTP 408 from arXiv or Europe PMC is now a temporary failure.** A request
+  timeout from these two sources was treated as a permanent error, and
+  `Retry-After` was ignored. It is now handled like a 429 or 5xx reply, as the
+  other sources already did.
+- **BibTeX export keeps an author name that contains "and" as one author.**
+  BibTeX reads a top-level ` and ` as the separator between authors, so a name
+  such as `Research and Development, Ada` became two authors on import. `papio
+  export --format bibtex` now wraps each author name in braces, so BibTeX reads
+  it as one literal name, as the CSL-JSON export already does.
+- **`papio bundle export` no longer reuses a symlink or leaves a partial
+  export.** A symlink at the artifact's place in the destination counted as the
+  exported artifact when it pointed at matching bytes, so the bundle depended on
+  a file outside it that could change. *papio* now replaces a symlink, or any
+  other file that is not a regular file, with its own read-only copy. A failure
+  while it created the artifacts folder or copied the artifact also left a
+  half-written tree, and any failure now rolls the export back.
+- **A PDF that *papio* has already stored is no longer reported as a failed
+  save.** *papio* made the stored file read-only and removed its temporary copy
+  only after the file was already in place. A failure in either step reported
+  the save as failed, and *papio* deleted the file's record while the file
+  stayed in its store. The file is now made read-only before it is put in place,
+  and a failed cleanup of the temporary copy no longer fails the save.
+- **A crash while *papio* files a paper no longer leaves a file that no paper
+  owns.** *papio* now records each file it is about to publish before it moves
+  the bytes into place, then records the file's owner, the accepted candidate
+  and the paper's next state in one step. After a crash or an interrupted
+  database write, it checks the published file or the held copy and finishes the
+  same publication; if neither survives, it removes the record. If the paper
+  already owns the file, recovery removes the leftover record and keeps the
+  filed copy, so the paper does not stall.
+- **Search results no longer merge different papers that share a title.** When
+  search sources returned results with no DOI, *papio* merged them on the title
+  alone, so two different works with the same title became one row in `papio
+  search` and in watch runs. Such results now merge only when the title, year
+  and authors agree, and a result that has only a title is never merged.
+  Semantic Scholar arXiv ids are now put in the standard form, and an id that
+  cannot be read is dropped, so an arXiv result matches the same id in your
+  library.
+- **`papio init` reads a ProQuest account id only from the query of your library
+  URL.** When you gave a library URL with `--institution-url` or at the resolver
+  prompt, *papio* ran the account-id pattern over the whole address. An
+  `accountid=` in the fragment or the path could be saved as
+  `proquest_account_id`, which *papio* adds to ProQuest link-resolver requests.
+  The id now comes only from an `accountid` query parameter that contains only
+  digits.
+- **A truncated RIS file is now refused.** A final record with no `ER` end tag
+  was read as complete, so a cut-off RIS export loaded without an error and its
+  last entry could be incomplete. `papio acquire --batch` now fails with `ris:
+  unterminated record: missing ER terminator`. A RIS library export that *papio*
+  reads to know what you own keeps its last good reading.
+- **A retraction notice that covers several papers now flags all of them.** New
+  notices were matched by the notice's own DOI, so when one notice covered
+  several papers in your library, only the first reached the inbox and the
+  notification. Each affected paper now gets its own inbox item.
+- **A daemon that never becomes ready is now stopped.** When an automatic start
+  timed out before the daemon opened its socket (after 5 seconds by default),
+  the half-started process kept running, and each later attempt started another
+  one. *papio* now asks that process to stop, kills it if it has not exited
+  after 2 seconds, and reaps it. On Unix the signals go to the daemon's whole
+  process group.
+- **Watch runs and digests no longer lose or repeat work.** When the reply that
+  says which discoveries are already in your library came back shorter than the
+  request, with no incomplete marker, *papio* read it as the end of the list,
+  dropped the trailing discoveries, and still reported success. The run now
+  fails. Acquiring from a digest saves its manifest before it submits, so a
+  retry after a write failure reuses the manifest and does not create the jobs
+  again. An inbox decision on a paper that several watches found now checks
+  every watch before it changes any, so one conflict no longer leaves the
+  earlier watches consumed.
+- **Paging through the inbox no longer skips or repeats items.** The page cursor
+  was a plain position in a list that changes while watches run, so items moved
+  between pages. The cursor now marks the last item it returned. A cursor whose
+  item has gone, that was made for a different inbox format, or that an older
+  daemon issued is refused, and the next read starts again from the first page.
+- **A PDF whose DOI wraps onto the next line is no longer rejected as the wrong
+  paper.** PLOS and similar publishers print a long DOI that `pdftotext` breaks
+  after a `.` or `/`. *papio* read the cut-off prefix (for example
+  `10.1371/journal`) as the document naming a different paper, so it refused
+  every copy of the correct PDF. A DOI split after a separator is now joined
+  again, but only to confirm the DOI you asked for. A joined DOI never refuses a
+  file and never names a captured file.
+- **A spent monthly budget now parks a paper instead of ending it.** When the
+  only sources left had used up their `max_cost_usd` budget, *papio* skipped
+  them without a record, and the job could end with no legal candidates. A spent
+  budget is a reason to wait. It is not proof that no legal copy exists. The job
+  now waits for the budget to reset at the start of the next month.
+- **`papio doctor` now names the papers whose files it will never collect from
+  the old download folder.** The `adoption_root_legacy` warning said that
+  *papio* still adopts settled files from the superseded download folder. That
+  never happens for a paper you cancelled before its file reached *papio*'s
+  store, because *papio* will not delete the only copy, so the warning never
+  cleared. Doctor now separates the folders that still drain from the folders
+  that never will, and lists those papers by title. To file one, open its PDF
+  and use **Send PDF** in the extension popup, or acquire the paper again with
+  **Acquire this page** on the publisher page.
+- **The popup's progress line no longer fails while a sign-in wait still lists a
+  finished paper.** A paper that had finished or been cancelled could stay
+  listed on an open institutional sign-in. *papio* counted it in one total but
+  not in the other, rejected its own progress summary as inconsistent, and the
+  popup said live progress was temporarily unavailable. Finished papers no
+  longer count toward a sign-in wait. When a popup read fails the same way on
+  every refresh, `daemon.log` now logs it once and then a count of the repeats
+  every five minutes, and a new or different failure is still logged at once.
+- **Identity checks on a scanned PDF now read only its first page.** *papio*
+  joined the OCR text of each page with no page break, so the checks meant for
+  page one read every OCR page. A DOI on page two, for example in the reference
+  list, could then be taken as the scan's own identifier, and a captured PDF
+  could be filed as a paper it only cites. OCR text now keeps its page breaks.
+- **Repository copies of a paper found through OpenAIRE are now tried.**
+  OpenAIRE lists `doi.org` links among a paper's copies, and *papio* keeps only
+  three copies from each record. Those links lead back to the publisher page
+  that *papio* already knew, and they often took all three places, so no
+  repository copy was tried. *papio* now skips `doi.org` and `dx.doi.org` links,
+  and still keeps handle links, which point to repository copies.
+- **A cancelled or finished paper no longer holds its library's sign-in slot.**
+  The slot was freed only when another paper tried to take it, so with no other
+  paper asking it could stay held for hours, and every status read showed a
+  sign-in in progress. *papio* now frees such a slot the next time the browser
+  extension checks in. A paper whose request to the publisher may still be in
+  progress keeps the slot.
+- **A paper is no longer blocked by its own earlier attempt after the browser
+  restarts.** When a paper's request to the publisher had finished on a tab that
+  was then closed, *papio* kept that attempt as the paper's live claim and
+  waited for a result that could no longer arrive. The paper was not offered
+  again, and when it asked for a new page it was refused. *papio* now retires
+  such an attempt when the browser session that made it is gone, and frees the
+  library sign-in slot that it held. An attempt whose publisher request may
+  still be running still blocks a second attempt.
+- **A browser restart no longer gives your library's sign-in to a second paper
+  while a publisher request is unresolved.** A finished sign-in was released
+  when the extension's background worker restarted, when its paper ended, or
+  when the proof of sign-in aged out. This happened even while that paper's
+  request to the publisher was still unresolved, so a second paper could take
+  the library's only sign-in slot. The slot now stays with its paper until that
+  request resolves, whatever the reason for the release.
+- **Papers queued in your browser no longer stop other papers from being
+  offered.** The daemon keeps at most four papers in flight in the browser. It
+  counted a paper that the extension had only queued behind its single drive
+  slot, so four queued papers could fill every place and the rest of the queue
+  did not move. The daemon now leaves out each paper that the extension reports
+  as queued. The extension still drives one paper at a time, and each library
+  still has one sign-in at a time.
+- **A paper that meets the same library sign-in wall on every attempt now stops
+  being retried.** *papio* stops offering a paper on its own after three browser
+  drives that achieve nothing. Drives through the institutional sign-in path
+  were not counted, so such a paper went back into the same wall without end. It
+  also held its library's publisher lane, so other papers at that library waited
+  behind it. That path now counts toward the limit, and a download on a later
+  drive still clears the count. `papio actions open` still drives the paper when
+  you ask.
+- **A publisher page that no adapter recognises is now recorded with its host.**
+  When no adapter rule matched a publisher page, the outcome and the drift
+  record named no host, because the host came only from a page capture that this
+  case never takes. The browser now reports the page's host with its outcome,
+  and *papio* keeps it in the paper's history, so a compiled direct download
+  route for that host can be found. An outcome from an older extension that
+  sends no host still uses the capture.
+- **A filing hook that times out or is cancelled on Windows now stops the
+  programs it started.** *papio* runs each hook in a Windows job object and ends
+  the whole process tree at the deadline. Before, only the shell was stopped,
+  and programs it had started kept running.
+- **A replaced notification stays replaced, and a webhook digest keeps every
+  event.** A batch progress notification held for quiet hours could come back
+  after the final notification had replaced it, and was then shown after the
+  final one. A webhook digest also stopped taking new events once the desktop
+  notification was sent, or when desktop notifications were off for that
+  category, so it reported only the first part of its window. It now includes
+  every event in the window.
+- **The preview of a PDF held for identity review works again after its local
+  server stops.** When the preview server stopped on its own, *papio* still
+  treated it as running and handed out preview links to a closed port until the
+  daemon restarted. The next preview request now starts the server again.
+- **Saving a page capture no longer stalls the browser connection.** The daemon
+  wrote each diagnostic capture while it held the lock that every browser
+  request needs, so a slow disk delayed all of them. It now writes the capture
+  outside that lock and discards it if the request or the connected browser
+  changed during the write.
+- **A long batch label in a non-Latin script no longer disconnects the
+  browser.** The work summary sent to the extension cut a batch label to 256
+  characters, but the limit is 256 bytes. A long label with accented or
+  non-Latin characters therefore produced a message that *papio* itself refused
+  to send, and that refusal ended the browser session. The label is now cut to
+  256 bytes at a character boundary.
+- **A browser download keeps how it was reached when its route details arrive
+  during the file check.** If the browser's route and sign-in details for a
+  download arrived while *papio* was still checking the downloaded file, *papio*
+  kept the file but never recorded those details, so the paper's access basis
+  stayed empty. *papio* now applies them to the file when the check ends.
+- **A paper whose candidates have all failed no longer repeats its lookups
+  forever.** When another source was closed in the same pass, a pass that did
+  reach a source was counted as held back and not charged against the paper's
+  retry limit. The limit then never took effect, and the paper repeated its
+  lookups at every retry interval, spending provider credits each time. Metadata
+  and DOI enrichment requests now count toward the limit too, and a pass that
+  made no request still does not. If the retry history cannot be read, the paper
+  settles instead of trying again; `papio jobs retry` restarts it. When several
+  sources are closed for different times, the one final wait after the limit now
+  lasts until the last of them reopens.
+- **An OpenAlex lookup by DOI or OpenAlex ID must now come back about the paper
+  that was asked for.** Both lookups count as exact, fully confident matches,
+  but *papio* used whatever record arrived, so a misrouted or duplicated answer
+  could be filed under your citation. The record must now repeat the identifier
+  that was requested; a record that OpenAlex has merged into another is accepted
+  under its new identifier. OpenAlex gives most identifiers in two places, and
+  *papio* took whichever came first. When the two disagree, that identifier is
+  now discarded.
 
 ## [0.21.0] - 2026-08-14
 
