@@ -398,6 +398,47 @@ for (const primary of [
   expect(await observe()).toEqual({ status: "blocked", reason: "identity_conflicting" });
 });
 
+// Measured 2026-09-23 on methods.sagepub.com: a chapter page carries its
+// parent book's DOI as citation_doi and names the chapter only in a visible
+// "Chapter DOI:" list item. Minimal structure; no captured text.
+const chapterDOI = "10.4135/9781849209823.n2", bookDOI = "10.4135/9781849209823";
+const chapterURL = "https://methods.sagepub.com/book/edvol/example/chpt/example-chapter";
+const observeChapter = (url = chapterURL, requested = chapterDOI) => agentDOM({ method: "observe", entryURL: url, doi: requested });
+const chapterField = (value = chapterDOI, name = "Chapter DOI:") => `<ul class="meta-list"><li><strong class="title">${name}</strong>https://<wbr>doi.<wbr>org/${value}</li></ul>`;
+const chapterPage = (metas: string[], field = "") => `${metas.map(value => `<meta name="citation_doi" content="${value}">`).join("")}<main><h1>Example chapter</h1>${field}<button>Download PDF</button></main>`;
+
+for (const [name, html, url] of [
+  ["book and chapter citation metadata", chapterPage([bookDOI, chapterDOI]), chapterURL],
+  ["chapter then book citation metadata", chapterPage([chapterDOI, bookDOI]), chapterURL],
+  ["book metadata with a visible chapter DOI field", chapterPage([bookDOI], chapterField()), chapterURL],
+  ["chapter DOI field without metadata", chapterPage([], chapterField()), chapterURL],
+  ["book metadata with the chapter DOI in the bound path", chapterPage([bookDOI]), `https://publisher.example/doi/${chapterDOI}`],
+] as const) test(`a requested chapter DOI with its parent book DOI establishes identity: ${name}`, async () => {
+  setup(html, url);
+  expect((await observeChapter(url)).status).toBe("observed");
+});
+
+for (const [name, html, reason] of [
+  ["book metadata only", chapterPage([bookDOI]), "identity_conflicting"],
+  ["book metadata and a book DOI field", chapterPage([bookDOI], chapterField(bookDOI, "DOI:")), "identity_conflicting"],
+  ["a sibling chapter beside the requested chapter", chapterPage([bookDOI, chapterDOI, "10.4135/9781849209823.n3"]), "identity_conflicting"],
+  ["an unrelated DOI beside the requested chapter", chapterPage([chapterDOI, "10.9999/other"]), "identity_conflicting"],
+  ["a DOI prefix without a separator", chapterPage([chapterDOI, "10.4135/978184920982"]), "identity_conflicting"],
+  ["a DOI registrant prefix", chapterPage([chapterDOI, "10.4135"]), "identity_conflicting"],
+  ["a sibling chapter DOI field", chapterPage([bookDOI], chapterField("10.4135/9781849209823.n3")), "identity_conflicting"],
+  ["a plain DOI list item without metadata", chapterPage([], chapterField(chapterDOI, "DOI:")), "identity_missing"],
+  ["a chapter DOI field in references", chapterPage([], `<section><h2>References</h2>${chapterField()}</section>`), "identity_missing"],
+  ["a chapter DOI field with surrounding text", chapterPage([], `<p><strong>Chapter DOI:</strong> see ${chapterDOI}</p>`), "identity_missing"],
+] as const) test(`a chapter request is not proven by its book or other DOIs: ${name}`, async () => {
+  setup(html, chapterURL);
+  expect(await observeChapter()).toEqual({ status: "blocked", reason });
+});
+
+test("a book request is not proven by a page that also names one of its chapters", async () => {
+  setup(chapterPage([bookDOI, chapterDOI]), chapterURL);
+  expect(await observeChapter(chapterURL, bookDOI)).toEqual({ status: "blocked", reason: "identity_conflicting" });
+});
+
 for (const change of ["href", "text", "remove", "reference", "metadata"] as const)
   test(`primary DOI identity is rechecked before action after ${change} changes`, async () => {
     const win = setup(primaryDOIPage(), metadataOnlyURL);

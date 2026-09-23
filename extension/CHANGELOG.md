@@ -17,6 +17,11 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **The article agent accepts a book chapter whose page also cites its book.**
+  A chapter page may carry its parent book's DOI beside the requested chapter
+  DOI, as SAGE Research Methods pages do; a visible "Chapter DOI:" list item
+  now counts as the chapter's identity. The book DOI alone still does not
+  prove the chapter, and sibling or unrelated DOIs still refuse the page.
 - **Closing an institutional sign-in tab releases its claim after a drive timeout.**
   Bringing the tab forward no longer erases the claim identity needed to
   report its later close, even when the timed-out job has detached from it.
