@@ -21,6 +21,7 @@ func TestExhaustedCandidatesOffersPublisherFirstForPackagedDOIPrefix(t *testing.
 	}{
 		{"psychiatryonline", "10.1176/appi.ajp.2010.09111680", "https://doi.org/10.1176/appi.ajp.2010.09111680"},
 		{"acs", "10.1021/acs.jcim.6c00481", "https://doi.org/10.1021/acs.jcim.6c00481"},
+		{"science", "10.1126/science.adz4433", "https://doi.org/10.1126/science.adz4433"},
 		{"unmapped prefix keeps resolver first", "10.1002/example.pf", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

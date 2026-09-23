@@ -328,6 +328,8 @@ func TestPublisherFirstAdapterMatchesOnlyTheRegistrantPrefix(t *testing.T) {
 		{"10.1176/appi.ajp.2010.09111680", "psychiatryonline"},
 		{"https://doi.org/10.1176/appi.ajp.2010.09111680", "psychiatryonline"},
 		{"10.1021/acs.jcim.6c00481", "acs"},
+		{"10.1126/science.adz4433", "science"},
+		{"10.11260/science.adz4433", ""},
 		{"10.11760/appi.ajp.2010.09111680", ""},
 		{"10.1177/0018720814547570", ""},
 		{"10.1002/example", ""},

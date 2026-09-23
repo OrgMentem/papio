@@ -75,6 +75,9 @@ execution records kept during the initial build.
   institution's resolver as the next route in a new attempt. Previously the
   UNE Primo route landed on the journal homepage and needed a manual
   `papio actions retry-publisher`.
+- Science (DOI prefix `10.1126`) papers also get their DOI as the first browser
+  handoff, now that the extension ships a `science` adapter. The institution's
+  resolver sent Science titles to the journal archive page, not the article.
 - An open-access browser route that downloads HTML instead of a PDF now falls
   back once to the institution's resolver. Before, papio kept the open-access
   handoff, so each new browser claim opened the same URL again. On

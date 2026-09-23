@@ -94,13 +94,16 @@ var routeTable = []routeTemplate{
 // Measured 2026-09-23: UNE Primo sent AJP (10.1176) to the psychiatryonline
 // journal homepage (identity_missing), while `papio actions retry-publisher`
 // reached the correct PDF through doi.org 3/3 times. ACS (10.1021) now has the
-// packaged `acs` adapter for the same DOI landing page.
+// packaged `acs` adapter for the same DOI landing page. The same day Primo sent
+// both Science (10.1126) attempts to the journal archive, /loi/science, while
+// doi.org reached the article the packaged `science` adapter reads.
 var publisherFirstTable = []struct {
 	doiPrefix string
 	adapterID string
 }{
 	{doiPrefix: "10.1176", adapterID: "psychiatryonline"},
 	{doiPrefix: "10.1021", adapterID: "acs"},
+	{doiPrefix: "10.1126", adapterID: "science"},
 }
 
 // PublisherFirstAdapter reports the packaged adapter that drives doi's
