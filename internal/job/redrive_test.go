@@ -24,9 +24,14 @@ func redriveOAHandoff(detail string) bool {
 
 func redriveJob(t *testing.T, js *Store) (string, int64) {
 	t.Helper()
+	return redriveJobParkedOn(t, js, "manual_download")
+}
+
+func redriveJobParkedOn(t *testing.T, js *Store, kind string) (string, int64) {
+	t.Helper()
 	id := resolvingParkCandidate(t, js, "redrive")
 	if err := js.ParkWithHumanAction(context.Background(), id, StateResolving, StateAwaitingHuman,
-		"manual_download", "papio could not drive the provider", nil, Access(true, "landing_page")); err != nil {
+		kind, "papio could not drive the provider", nil, Access(true, "landing_page")); err != nil {
 		t.Fatal(err)
 	}
 	open, err := js.ListOpenHumanActionsForJobs(context.Background(), []string{id})
@@ -93,9 +98,56 @@ func TestRedriveReplacesManualDownloadAndRetiresClaim(t *testing.T) {
 	}
 }
 
+// A job parked on the provider's terms step has no route left to open, so
+// redrive is the operator's only way back once consent is settled in the
+// extension. Measured live 2026-09-23: JSTOR job_edfe… sat on one open terms
+// action after its handoff was cancelled, and every CLI verb refused it.
+func TestRedriveReplacesTermsActionAndRetiresParkedClaim(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, terms := redriveJobParkedOn(t, js, "terms_acceptance_required")
+	profile := institutionalProfile(t, js, "institute", "digest", "auth")
+	candidate := institutionalCandidate(t, js, profile, "redrive-terms", id)
+	claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{CandidateID: candidate.ID, BrowserHolderGeneration: 1, JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision, RouteRevision: 7, MaterializationKind: "browser_tab", LeaseUntil: time.Now().Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET phase='parked',lease_until=NULL WHERE id=?`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, "institutional handoff detail"); err != nil {
+		t.Fatal(err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].Kind != "openurl_handoff" || open[0].Detail != "institutional handoff detail" || !open[0].RequiresAuth {
+		t.Fatalf("replacement=%+v err=%v", open, err)
+	}
+	var status, phase string
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, terms).Scan(&status); err != nil || status != "resolved" {
+		t.Fatalf("terms status=%q err=%v", status, err)
+	}
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT phase FROM materialization_claims WHERE id=?`, claim.ID).Scan(&phase); err != nil || phase != "abandoned" {
+		t.Fatalf("parked claim phase=%q err=%v", phase, err)
+	}
+	events, err := js.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event["kind"] == "job.retry_requested" {
+			detail, _ := event["detail"].(map[string]any)
+			found = detail["reason"] == "operator_redrive" && detail["action_id"] == float64(terms)
+		}
+	}
+	if !found {
+		t.Fatalf("redrive event missing terms action identity: %+v", events)
+	}
+}
+
 func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 	for _, scenario := range []string{
-		"state", "revision", "other_action", "terms", "verify_identity", "unsafe_pdf",
+		"state", "revision", "other_action", "terms_live_claim", "verify_identity", "unsafe_pdf",
 		"no_action", "no_identifier", "no_resolver", "lease", "held_effect",
 		"unknown_effect", "already_redriven", "institutional_handoff",
 	} {
@@ -121,9 +173,17 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-			case "terms", "verify_identity", "unsafe_pdf":
-				kind := map[string]string{"terms": "terms_acceptance_required", "verify_identity": "verify_identity", "unsafe_pdf": "unsafe_pdf"}[scenario]
-				exec(`UPDATE human_actions SET kind=? WHERE id=?`, kind, action)
+			case "terms_live_claim":
+				// A live claim is a drive still on the terms surface; only a
+				// parked or retired claim leaves the job to the operator.
+				exec(`UPDATE human_actions SET kind='terms_acceptance_required' WHERE id=?`, action)
+				profile := institutionalProfile(t, js, "institute", "digest", "auth")
+				candidate := institutionalCandidate(t, js, profile, "redrive-terms-live", id)
+				if _, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{CandidateID: candidate.ID, BrowserHolderGeneration: 1, JobAttemptRevision: 1, InstitutionProfileRevision: profile.Revision, RouteRevision: 7, MaterializationKind: "browser_tab", LeaseUntil: time.Now().Add(time.Minute)}); err != nil {
+					t.Fatal(err)
+				}
+			case "verify_identity", "unsafe_pdf":
+				exec(`UPDATE human_actions SET kind=? WHERE id=?`, scenario, action)
 			case "institutional_handoff":
 				// Only an open-access route is spent by parking on it; the
 				// institutional handoff is the route redrive would open.

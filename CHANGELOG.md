@@ -41,6 +41,13 @@ execution records kept during the initial build.
   accepts the terms. Papers parked on their own terms step are not offered or
   re-offered automatically. A terms outcome before the sign-in returned keeps
   the slot.
+- `papio jobs redrive` now accepts a job whose only open action is
+  `terms_acceptance_required` and that holds no live browser claim. It resolves
+  the terms action, retires any parked claim, and opens a fresh institutional
+  handoff. Redrive accepts no terms itself: the extension's consent setting
+  decides again when the handoff is driven. Before, no command could restart
+  such a job; on 2026-09-23 JSTOR job `job_edfe1b14…` stayed parked after its
+  handoff was cancelled.
 
 ### Added
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual

@@ -966,10 +966,15 @@ papio jobs receipt <job-id>
 
 ### `papio jobs redrive`
 
-Replace a spent manual download or open-access handoff with an institutional handoff
+Replace a spent manual download, open-access handoff, or terms park with an institutional handoff
 
-Replace a parked manual download, or an open-access browser handoff whose
-URL answered HTML, with a fresh institutional handoff.
+Replace a parked manual download, an open-access browser handoff whose
+URL answered HTML, or an open terms_acceptance_required action with no
+live browser claim, with a fresh institutional handoff.
+
+Redrive accepts nothing on the provider: the extension's own terms
+consent setting decides again when the handoff is driven, and without
+consent the job parks on terms again.
 
 Use the action revision from `papio actions list --json`. For a job
 whose action is already resolved and has no open action, use --revision 0.
@@ -981,7 +986,7 @@ papio jobs redrive <job-id> [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--revision` | `int64` | `0` | revision of the open manual download or open-access handoff; 0 if no action is open |
+| `--revision` | `int64` | `0` | revision of the open manual download, open-access handoff, or terms action; 0 if no action is open |
 
 ### `papio jobs refile`
 

@@ -527,9 +527,13 @@ func newJobsCommand(opt *options) *cobra.Command {
 	var redriveRevision int64
 	redrive := &cobra.Command{
 		Use:   "redrive <job-id>",
-		Short: "Replace a spent manual download or open-access handoff with an institutional handoff",
-		Long: "Replace a parked manual download, or an open-access browser handoff whose\n" +
-			"URL answered HTML, with a fresh institutional handoff.\n\n" +
+		Short: "Replace a spent manual download, open-access handoff, or terms park with an institutional handoff",
+		Long: "Replace a parked manual download, an open-access browser handoff whose\n" +
+			"URL answered HTML, or an open terms_acceptance_required action with no\n" +
+			"live browser claim, with a fresh institutional handoff.\n\n" +
+			"Redrive accepts nothing on the provider: the extension's own terms\n" +
+			"consent setting decides again when the handoff is driven, and without\n" +
+			"consent the job parks on terms again.\n\n" +
 			"Use the action revision from `papio actions list --json`. For a job\n" +
 			"whose action is already resolved and has no open action, use --revision 0.\n" +
 			"This runs once per observed browser outcome. It does not open a tab.",
@@ -553,7 +557,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 			return err
 		},
 	}
-	redrive.Flags().Int64Var(&redriveRevision, "revision", 0, "revision of the open manual download or open-access handoff; 0 if no action is open")
+	redrive.Flags().Int64Var(&redriveRevision, "revision", 0, "revision of the open manual download, open-access handoff, or terms action; 0 if no action is open")
 	var filingFilter string
 	var filingLimit int
 	unfiled := &cobra.Command{

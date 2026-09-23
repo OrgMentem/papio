@@ -21,6 +21,9 @@ import (
 // oaHandoff recognizes as an open-access browser route: an OA URL that
 // answered HTML (Wiley's pdfdirect without an entitlement) leaves the job
 // parked on that handoff, and the institutional route is the one left to try.
+// The third shape is an open terms_acceptance_required action with no live
+// browser claim: the provider parked the drive on its consent step, and the
+// resolved terms action's reason travels in the job.retry_requested event.
 func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
 	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, handoffDetail string) (int64, error) {
 	if strings.TrimSpace(jobID) == "" || revision < 0 {
@@ -93,9 +96,26 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	if err != nil {
 		return 0, err
 	}
-	spent := actionKind == "manual_download" || (actionKind == "openurl_handoff" && oaHandoff(actionDetail))
+	// A terms action is the third spent shape: the provider parked the drive
+	// on its consent step, and the extension's own consent setting decides it
+	// again when the fresh handoff is driven. Nothing is accepted here; a
+	// profile without consent simply parks on terms again. A live claim means
+	// a drive is still on that surface, so only a parked or retired one yields.
+	terms := actionKind == "terms_acceptance_required"
+	spent := actionKind == "manual_download" || terms || (actionKind == "openurl_handoff" && oaHandoff(actionDetail))
 	if count > 1 || (count == 1 && (!spent || revision != actionRevision)) || (count == 0 && revision != 0) {
-		return 0, fmt.Errorf("%w: expected one unchanged manual_download or open-access handoff action, or no open action with revision 0; list actions again", ErrConflict)
+		return 0, fmt.Errorf("%w: expected one unchanged manual_download, open-access handoff, or terms_acceptance_required action, or no open action with revision 0; list actions again", ErrConflict)
+	}
+	if count == 1 && terms {
+		var live int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM materialization_claims m
+			JOIN browser_candidates c ON c.id=m.candidate_id WHERE c.job_id=?
+			AND m.phase IN ('claimed','bound','route_issued','navigated'))`, jobID).Scan(&live); err != nil {
+			return 0, err
+		}
+		if live != 0 {
+			return 0, fmt.Errorf("%w: job still has a live browser claim on its terms step", ErrConflict)
+		}
 	}
 	if count == 0 {
 		err := tx.QueryRowContext(ctx, `SELECT id,revision FROM human_actions
