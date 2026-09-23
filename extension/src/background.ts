@@ -3361,6 +3361,9 @@ export class Bridge {
   /** Broker-tab ids whose auth attempt is already counted, so the SSO redirect
    * dance within one drive increments the budget only once. Worker-local. */
   private readonly authCountedTabs = new Set<number>();
+  /** A return may persist its new status while the owning tab closes. Keep
+   * this same-worker handoff visible to onTabRemoved until the frame is sent. */
+  private readonly authReturnsInFlight = new Set<number>();
   /** Tabs this worker is removing as its OWN housekeeping — reconcile dedupe,
    * a superseded correlation, a non-chosen candidate. `onTabRemoved` consumes
    * the marker and treats the removal as deliberate: no `provider_outcome`,
@@ -18664,12 +18667,21 @@ export class Bridge {
     const now = this.deps.now();
     const elapsed = Math.max(0, now - started);
     this.deliverySessionEvidence.set(jobID, "fresh_auth");
-    await this.update((s) =>
-      patchJob(s, jobID, {
-        status: "awaiting_download",
-        parked_with_tab: false,
-      }),
-    );
+    this.authReturnsInFlight.add(tabID);
+    try {
+      await this.update((s) =>
+        patchJob(s, jobID, {
+          status: "awaiting_download",
+          parked_with_tab: false,
+        }),
+      );
+    } catch (error) {
+      this.authReturnsInFlight.delete(tabID);
+      throw error;
+    }
+    // onRemoved consumes this marker synchronously, before its first await.
+    // A close during persistence wins over the stale provider landing.
+    if (!this.authReturnsInFlight.delete(tabID)) return false;
     this.send("auth_returned", { elapsed_ms: elapsed }, jobID);
     const authReturnedOriginHint = this.jobInstitutionOrigin(job);
     this.emitSessionEvidence("auth_returned", authReturnedOriginHint);
@@ -21983,6 +21995,7 @@ export class Bridge {
   }
 
   private async onTabRemoved(tabID: number): Promise<void> {
+    const authReturnInterrupted = this.authReturnsInFlight.delete(tabID);
     for (const pending of this.agentNavigations.values()) {
       if (pending.tabID === tabID) pending.stop();
     }
@@ -22081,7 +22094,7 @@ export class Bridge {
       !authorizedClose &&
       !deliberate &&
       ownerBindingID !== undefined &&
-      job.status !== "awaiting_download"
+      (job.status !== "awaiting_download" || authReturnInterrupted)
     ) {
       const grant = this.claimGrants.get(job.job_id);
       if (grant !== undefined) {

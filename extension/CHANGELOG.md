@@ -23,6 +23,9 @@ for the full pre-split extension history.
 - **JSTOR keeps entitled articles out of the login queue.** A turnaway
   account offer beside the primary PDF control no longer masks the article
   and holds an institution sign-in slot.
+- **Closing a sign-in tab releases its materialization claim.** If a provider
+  landing races the tab close, *papio* reports the lost owner instead of an
+  authentication return. Other papers no longer wait on that dead tab's lease.
 
 - **JSTOR recognizes its article identity correctly.** Its download control's
   `data-doi` is a numeric record ID, not a DOI. Papio now matches the article's

@@ -4556,6 +4556,119 @@ test("Slice 3: an owner tab closed without success emits owner_closed with the c
   expect(h.tabs.created).toHaveLength(1);
 });
 
+test("a sign-in return racing tab removal cannot mask owner_closed", async () => {
+  const jobID = "job_claim_auth_close";
+  const candidateID = "cand_auth_close";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/stable/article`,
+  );
+  const record = ledger.current()[String(tabID)] as SurfaceBirthRecord;
+  expect(record.binding_id).toBeTruthy();
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  h.clock.now += 294_996;
+
+  // A provider landing begins to finalize sign-in just as the operator closes
+  // the tab. Storage pauses after the state moves to awaiting_download, before
+  // the auth_returned frame. The close must win over that stale landing.
+  const save = h.backend.save.bind(h.backend);
+  let releaseSave: (() => void) | undefined;
+  let reachedSave: (() => void) | undefined;
+  const saveReached = new Promise<void>((resolve) => {
+    reachedSave = resolve;
+  });
+  const saveReleased = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  h.backend.save = async (store) => {
+    if (
+      store.activeJobs.find((job) => job.job_id === jobID)?.status ===
+      "awaiting_download"
+    ) {
+      reachedSave?.();
+      await saveReleased;
+    }
+    await save(store);
+  };
+  const framesBefore = h.port.posted.length;
+  const landing = h.tabs.completeNavigation(
+    tabID,
+    `https://${PROVIDER_HOST}/stable/article`,
+  );
+  await saveReached;
+  const closing = h.tabs.userClose(tabID);
+  releaseSave?.();
+  await Promise.all([landing, closing]);
+  const frames = h.frames().slice(framesBefore);
+  const observations = frames.filter(
+    (frame) => frame.type === "claim_observation",
+  );
+  expect(frames.some((frame) => frame.type === "auth_returned")).toBe(false);
+  expect(observations.map((frame) => frame.payload["event_kind"])).toContain(
+    "owner_closed",
+  );
+  expect(
+    observations.find((frame) => frame.payload["event_kind"] === "owner_closed")
+      ?.payload["binding_id"],
+  ).toBe(record.binding_id);
+});
+
+test("a parked auth_pending claim closes from its birth record after worker restart", async () => {
+  const jobID = "job_claim_auth_restart_close";
+  const candidateID = "cand_auth_restart_close";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/stable/article`,
+  );
+  const record = ledger.current()[String(tabID)] as SurfaceBirthRecord;
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(
+    helloAck({
+      features: [AUTH_CLAIM, "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  const framesBefore = restarted.port.posted.length;
+  await restarted.tabs.userClose(tabID);
+  const closed = await restarted.port.waitForFrame(
+    "claim_observation",
+    framesBefore,
+  );
+  expect(closed.payload["event_kind"]).toBe("owner_closed");
+  expect(closed.payload["binding_id"]).toBe(record.binding_id);
+  expect(
+    restarted
+      .frames()
+      .slice(framesBefore)
+      .some((frame) => frame.type === "auth_returned"),
+  ).toBe(false);
+});
+
 // Live-smoke regression (2026-08-19): reproduced on the operator's own
 // browser. The grant that authorizes owner_closed is worker memory, and MV3
 // sleeps the worker after ~30s idle, so a sign-in tab abandoned minutes later
