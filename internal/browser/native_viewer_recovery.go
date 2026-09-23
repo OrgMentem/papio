@@ -62,8 +62,7 @@ func (b *Bridge) recoverNativeViewerStages(ctx context.Context) {
 }
 
 type nativeViewerRecoveryFS struct {
-	published bool
-	retained  string
+	retained string
 }
 
 func (b *Bridge) recoverNativeViewerStage(ctx context.Context, s job.NativeViewerStagedAdmission) {
@@ -115,7 +114,7 @@ func (b *Bridge) recoverNativeViewerStage(ctx context.Context, s job.NativeViewe
 		if err := root.resumePublication(ctx, r.JobID, filename, s.StageName(), s.SHA256, s.SizeBytes); err != nil {
 			return nativeViewerRecoveryFS{}, err
 		}
-		return nativeViewerRecoveryFS{published: true}, nil
+		return nativeViewerRecoveryFS{}, nil
 	})
 	switch {
 	case errors.Is(err, errNativeStageMissing):
