@@ -17,6 +17,11 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **Timed-out handoffs need page evidence before reporting sign-in.** An offer's
+  `requires_auth` flag alone no longer puts an entitled article or an access
+  denial into `auth_pending`. *papio* checks the page for an authentication URL
+  or a sign-in control without a sign-out control. Otherwise, it asks the
+  operator to take over without holding the institution's sign-in slot.
 - **Article agents wait for the browser handshake.** A delegated page no longer
   records lasting adapter drift while its native connection awaits `hello_ack`.
   A browser with the pending role still cannot drive the article.

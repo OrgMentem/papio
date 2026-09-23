@@ -192,6 +192,9 @@ import {
 import {
   chromeKeepaliveAPI,
   initKeepalive,
+  collectResolverMarkers,
+  classifyResolverMarkers,
+  MAX_SCANNED_CONTROLS,
   isAuthenticationURL,
 } from "./keepalive";
 import type {
@@ -6768,28 +6771,35 @@ export class Bridge {
         // ran out of time knows nothing about a login, so asserting one
         // fabricates all three.
         //
-        // The offer already carries the answer and this path never read it:
-        // `requires_auth` is the daemon's own statement that the route needs a
-        // human sign-in. An open-access route sets it false, so the claim is
-        // available exactly where it is true. A wall the paper reached anyway
-        // still counts - a route can meet one unannounced - so the page is
-        // consulted as well, and an unreadable tab simply adds nothing.
+        // `requires_auth` describes the offered route, not the page after
+        // navigation. Only a live authentication URL or a visible sign-in
+        // control without a sign-out control proves this is a sign-in surface.
+        // An unreadable page and a page with no such control prove nothing.
         //
         // Measured live 2026-08-23: an open-access ChemRxiv preprint, offered
         // with requires_auth false and serving a plain citation_pdf_url behind
         // no wall at all, reported auth_pending every three minutes for two
         // days. It held the library's sign-in slot while 22 papers queued
         // behind it, and the toolbar badge counted it as blocked on that
-        // sign-in.
-        let signInSurface = current.requires_auth === true;
-        if (!signInSurface) {
-          try {
-            const tab = await this.deps.tabs.get(tabID);
-            signInSurface =
-              typeof tab.url === "string" && isAuthenticationURL(tab.url);
-          } catch {
-            signInSurface = false;
+        // sign-in. Measured 2026-09-23: entitled ACS and Ebook Central IP-denial
+        // pages likewise reported auth_pending from requires_auth alone.
+        let signInSurface = false;
+        try {
+          const tab = await this.deps.tabs.get(tabID);
+          if (typeof tab.url === "string") {
+            signInSurface = isAuthenticationURL(tab.url);
+            if (!signInSurface) {
+              const [injection] = await this.deps.scripting.executeScript({
+                target: { tabId: tabID },
+                func: collectResolverMarkers,
+              });
+              const markers = injection?.result;
+              if (Array.isArray(markers) && markers.length <= MAX_SCANNED_CONTROLS)
+                signInSurface = classifyResolverMarkers(markers) === "out";
+            }
           }
+        } catch {
+          // An unreadable or closed tab cannot establish a sign-in surface.
         }
         if (signInSurface) {
           await this.update((s) =>

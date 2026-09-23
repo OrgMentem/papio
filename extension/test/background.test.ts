@@ -39,6 +39,7 @@ import {
 } from "../src/capture";
 import {
   KeepaliveManager,
+  collectResolverMarkers,
   type FreshSessionEvidence,
   type KeepaliveAPI,
 } from "../src/keepalive";
@@ -3265,9 +3266,11 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   await driveTimeout?.fn();
   expect(h.backend.store.activeJobs[0]).toMatchObject({
     tab_id: 100,
-    status: "auth_pending",
+    status: "queued",
+    engagement_required: true,
     parked_with_tab: true,
   });
+  expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
   expect(h.tabs.removed).not.toContain(100);
   const internals = h.bridge as unknown as {
     handoffDrives: Map<string, unknown>;
@@ -3279,7 +3282,8 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   await h.port.inbound(offer);
   expect(h.backend.store.activeJobs[0]).toMatchObject({
     tab_id: 100,
-    status: "auth_pending",
+    status: "queued",
+    engagement_required: true,
     parked_with_tab: true,
   });
   expect(internals.handoffDrives.has(jobID)).toBe(false);
@@ -3294,6 +3298,124 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   expect(
     h.frames().filter((frame) => frame.type === "handoff_link_request"),
   ).toHaveLength(1);
+});
+
+test("a timed-out auth-required article with Sign out parks without reporting sign-in", async () => {
+  const jobID = "job_entitled_article_timeout";
+  const articleURL = "https://pubs.acs.org/doi/10.1021/example";
+  const h = makeHarness();
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = "https://idp.example.edu/entity";
+  const scans: number[] = [];
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === collectResolverMarkers) scans.push(injection.target.tabId);
+    if (injection.func === collectResolverMarkers)
+      return [{ result: [
+        { text: "Sign in", label: "", visible: true },
+        { text: "Sign out", label: "", visible: true },
+      ] }];
+    return [];
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+  const opening = h.bridge.openHandoff(jobID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(nativeResult("handoff_link_result", {
+    request_id: request.payload["request_id"], outcome: "opened", url: articleURL,
+  }));
+  await opening;
+  const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+  const beforeTimeout = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  await driveTimeout!.fn();
+  expect(scans).toEqual([tabID]);
+
+  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(false);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    tab_id: tabID, status: "queued", engagement_required: true, parked_with_tab: true,
+  });
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+  expect(h.tabs.removed).not.toContain(tabID);
+});
+
+test("a timed-out auth-required article with Sign in reports auth_pending", async () => {
+  const jobID = "job_article_sign_in_timeout";
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  h.deps.scripting.executeScript = async (injection) =>
+    injection.func === collectResolverMarkers
+      ? [{ result: [{ text: "Sign in", label: "", visible: true }] }]
+      : [];
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  await h.port.inbound(offer);
+  const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+  h.tabs.seed({ id: tabID, url: "https://pubs.acs.org/doi/10.1021/example" });
+  const beforeTimeout = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  await driveTimeout!.fn();
+
+  expect(findByJob(h.backend.store, jobID)?.status).toBe("auth_pending");
+  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(true);
+});
+
+test("a timed-out open-access offer on an IdP URL reports auth_pending", async () => {
+  const jobID = "job_open_access_idp_timeout";
+  const h = makeHarness();
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = false;
+  h.deps.scripting.executeScript = async () => {
+    throw new Error("IdP URL should not need a marker scan");
+  };
+  await h.bridge.start();
+  await h.port.inbound(offer);
+  const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+  h.tabs.seed({ id: tabID, url: "https://idp.example.edu/sso" });
+  const beforeTimeout = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  await driveTimeout!.fn();
+
+  expect(findByJob(h.backend.store, jobID)?.status).toBe("auth_pending");
+  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(true);
+});
+
+test("an unreadable auth-required article parks without a sign-in claim", async () => {
+  const jobID = "job_unreadable_article_timeout";
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  await h.port.inbound(offer);
+  const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+  h.tabs.seed({ id: tabID, url: "https://ebookcentral.proquest.com/lib/une/reader.action" });
+  h.tabs.get = async () => { throw new Error("tab cannot be read"); };
+  const beforeTimeout = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  await driveTimeout!.fn();
+
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "queued", engagement_required: true,
+  });
+  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
 test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async () => {
