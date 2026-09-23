@@ -3300,22 +3300,15 @@ test("handoff_link_v1 keeps a cold auth offer tabless until explicit engagement"
   ).toHaveLength(1);
 });
 
-test("a timed-out auth-required article with Sign out parks without reporting sign-in", async () => {
+test("a timed-out auth-required article parks without reporting sign-in", async () => {
   const jobID = "job_entitled_article_timeout";
   const articleURL = "https://pubs.acs.org/doi/10.1021/example";
   const h = makeHarness();
   const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
   offer.payload["requires_auth"] = true;
   offer.payload["login_entity_id"] = "https://idp.example.edu/entity";
-  const scans: number[] = [];
-  h.deps.scripting.executeScript = async (injection) => {
-    if (injection.func === collectResolverMarkers) scans.push(injection.target.tabId);
-    if (injection.func === collectResolverMarkers)
-      return [{ result: [
-        { text: "Sign in", label: "", visible: true },
-        { text: "Sign out", label: "", visible: true },
-      ] }];
-    return [];
+  h.deps.scripting.executeScript = async () => {
+    throw new Error("a timed-out drive must not read page controls");
   };
 
   await h.bridge.start();
@@ -3333,7 +3326,6 @@ test("a timed-out auth-required article with Sign out parks without reporting si
   expect(driveTimeout).toBeDefined();
   h.clock.now += 180_000;
   await driveTimeout!.fn();
-  expect(scans).toEqual([tabID]);
 
   expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(false);
   expect(findByJob(h.backend.store, jobID)).toMatchObject({
@@ -3343,7 +3335,11 @@ test("a timed-out auth-required article with Sign out parks without reporting si
   expect(h.tabs.removed).not.toContain(tabID);
 });
 
-test("a timed-out auth-required article with Sign in reports auth_pending", async () => {
+// A publisher's permanent header "Sign in" is a personal-account link shown to
+// entitled readers too (measured 2026-09-23 on an open-access ScienceDirect
+// article with a visible "View PDF"), so a visible sign-in control is not a
+// wall. Only the URL decides.
+test("a timed-out auth-required article showing a Sign in control still parks without a sign-in claim", async () => {
   const jobID = "job_article_sign_in_timeout";
   const h = makeHarness({
     ...emptyStore(),
@@ -3359,15 +3355,15 @@ test("a timed-out auth-required article with Sign in reports auth_pending", asyn
   await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
   await h.port.inbound(offer);
   const tabID = findByJob(h.backend.store, jobID)!.tab_id;
-  h.tabs.seed({ id: tabID, url: "https://pubs.acs.org/doi/10.1021/example" });
+  h.tabs.seed({ id: tabID, url: "https://www.sciencedirect.com/science/article/pii/S0149763419300000" });
   const beforeTimeout = h.frames().length;
   const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
   expect(driveTimeout).toBeDefined();
   h.clock.now += 180_000;
   await driveTimeout!.fn();
 
-  expect(findByJob(h.backend.store, jobID)?.status).toBe("auth_pending");
-  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(true);
+  expect(findByJob(h.backend.store, jobID)?.status).toBe("queued");
+  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
 test("a timed-out open-access offer on an IdP URL reports auth_pending", async () => {

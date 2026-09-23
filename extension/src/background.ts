@@ -192,9 +192,6 @@ import {
 import {
   chromeKeepaliveAPI,
   initKeepalive,
-  collectResolverMarkers,
-  classifyResolverMarkers,
-  MAX_SCANNED_CONTROLS,
   isAuthenticationURL,
 } from "./keepalive";
 import type {
@@ -6772,9 +6769,13 @@ export class Bridge {
         // fabricates all three.
         //
         // `requires_auth` describes the offered route, not the page after
-        // navigation. Only a live authentication URL or a visible sign-in
-        // control without a sign-out control proves this is a sign-in surface.
-        // An unreadable page and a page with no such control prove nothing.
+        // navigation. Only a live authentication URL proves this is a sign-in
+        // surface. Page controls do not: measured 2026-09-23 16:15 on an
+        // open-access ScienceDirect article with a visible "View PDF", the
+        // publisher's permanent header "Sign in" (a personal-account link,
+        // shown to entitled readers too) read as a wall and parked the paper
+        // as auth_pending, which reopened the institution's login gate. An
+        // unreadable page proves nothing either.
         //
         // Measured live 2026-08-23: an open-access ChemRxiv preprint, offered
         // with requires_auth false and serving a plain citation_pdf_url behind
@@ -6786,18 +6787,7 @@ export class Bridge {
         let signInSurface = false;
         try {
           const tab = await this.deps.tabs.get(tabID);
-          if (typeof tab.url === "string") {
-            signInSurface = isAuthenticationURL(tab.url);
-            if (!signInSurface) {
-              const [injection] = await this.deps.scripting.executeScript({
-                target: { tabId: tabID },
-                func: collectResolverMarkers,
-              });
-              const markers = injection?.result;
-              if (Array.isArray(markers) && markers.length <= MAX_SCANNED_CONTROLS)
-                signInSurface = classifyResolverMarkers(markers) === "out";
-            }
-          }
+          signInSurface = typeof tab.url === "string" && isAuthenticationURL(tab.url);
         } catch {
           // An unreadable or closed tab cannot establish a sign-in surface.
         }
