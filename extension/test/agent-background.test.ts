@@ -33,7 +33,7 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 
-async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape } = {}) {
+async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape; helloPending?: boolean } = {}) {
   const win = new Window({ url, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
   win.document.write(`<meta name="citation_doi" content="${doi}"><meta name="citation_title" content="Example article"><main><h1>Example article</h1><button type="button">Formats</button></main><header><input type="search" value="PRIVATEQUERY"></header>`);
   Object.assign(win.HTMLElement.prototype, { getClientRects: () => [{ width: 10, height: 10 }] });
@@ -90,7 +90,7 @@ async function harness(options: { features?: string[]; knownAdapter?: boolean; f
   });
   backend.store = options.seed ?? emptyStore();
   await bridge.start();
-  await inbound("hello_ack", { daemon_version: MIN_DAEMON_VERSION, role: "holder", browser_holder_generation: 1, features: options.features ?? features }, false);
+  if (!options.helloPending) await inbound("hello_ack", { daemon_version: MIN_DAEMON_VERSION, role: "holder", browser_holder_generation: 1, features: options.features ?? features }, false);
   const update = (reducer: (store: StoreShape) => StoreShape): Promise<void> => Reflect.get(bridge, "update").call(bridge, reducer);
   const job: ActiveJob = { job_id: jobID, tab_id: tabID, offered_at: now - 20_000, expires_at: now + 3600_000,
     status: options.status ?? "accepted", provider_hosts: [], access_mode: "delegated", expected: { doi }, generic_drive_epoch: localEpoch,
@@ -414,6 +414,46 @@ for (const mode of ["old", "firefox", "permission"] as const) test(`fallback doe
   await h.classify(); await flush();
   expect(h.frames.some(frame => frame.type === "agent_decide_request_v1" || frame.type === "provider_drive_epoch_start_request")).toBe(false);
   expect(h.counts().actions).toBe(0);
+});
+
+test("a delegated fallback waits for the current port's hello before reporting drift", async () => {
+  const h = await harness({ helloPending: true });
+  const classify = h.classify();
+  h.advance(200);
+  await flush();
+  expect(h.frames.some(frame => frame.type === "provider_outcome")).toBe(false);
+  await h.inbound("hello_ack", { daemon_version: MIN_DAEMON_VERSION, role: "holder", browser_holder_generation: 1, features }, false);
+  await classify;
+  await h.started();
+  await h.request("agent_decide_request_v1");
+  expect(h.frames.some(frame => frame.type === "provider_outcome")).toBe(false);
+});
+
+test("an unacknowledged port reports hello_pending only after its bounded hello wait", async () => {
+  const h = await harness({ helloPending: true });
+  await h.classify();
+  expect(h.frames.some(frame => frame.type === "provider_outcome")).toBe(false);
+  const timeout = h.timers.find(timer => timer.ms === 5000);
+  expect(timeout).toBeDefined();
+  h.advance(5000);
+  timeout!.fn();
+  await flush();
+  const outcomes = h.frames.filter(frame => frame.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]!.payload["outcome"]).toBe("ui_changed");
+  expect(outcomes[0]!.payload["detail"]).toContain("Article agent skipped: this browser has not received a hello acknowledgement");
+  expect(h.frames.some(frame => frame.type === "agent_decide_request_v1")).toBe(false);
+});
+
+test("a delegated fallback refuses an acknowledged pending browser", async () => {
+  const h = await harness();
+  await h.inbound("hello_ack", { daemon_version: MIN_DAEMON_VERSION, role: "pending", features }, false);
+  await h.classify();
+  const outcomes = h.frames.filter(frame => frame.type === "provider_outcome");
+  expect(outcomes).toHaveLength(1);
+  expect(outcomes[0]!.payload["outcome"]).toBe("ui_changed");
+  expect(outcomes[0]!.payload["detail"]).toContain("Article agent skipped: this browser lacks authority for the attempt.");
+  expect(h.frames.some(frame => frame.type === "provider_drive_epoch_start_request" || frame.type === "agent_decide_request_v1")).toBe(false);
 });
 
 for (const knownAdapter of [false, true]) for (const [reason, message] of [
