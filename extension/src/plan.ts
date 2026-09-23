@@ -484,15 +484,14 @@ export function planExecution(
           const metaContent = titleMeta ? titleMeta.getAttribute("content") : null;
           if (metaContent) parts.push(metaContent);
           if (root.title) parts.push(root.title);
-          const haystack = parts.join(" ").toLowerCase();
-          const tokens = expectedTitle
-            .toLowerCase()
-            .split(/[^a-z0-9]+/)
+          const haystack = normalizeTitle(parts.join(" "));
+          const tokens = normalizeTitle(expectedTitle)
+            .split(" ")
             .filter((token) => token.length > 3);
           let present = 0;
           for (const token of tokens) if (haystack.indexOf(token) !== -1) present++;
           const ratio = tokens.length === 0 ? 1 : present / tokens.length;
-          if (ratio < 0.6) {
+          if (ratio < 0.6 && haystack !== "") {
             evidence.push("title-token-check failed");
             return {
               verdict: { kind: "wrong_work", adapter_id, adapter_version, evidence },
@@ -523,7 +522,12 @@ export function planExecution(
     }
     return normalized;
   };
-  const normalizeTitle = (raw: string): string => raw.trim().toLowerCase().replace(/\s+/g, " ");
+  const normalizeTitle = (raw: string): string =>
+    raw.toLowerCase().normalize("NFD")
+      .replace(/\p{M}/gu, "")
+      .replace(/[\p{Pd}\u2212]+/gu, " ")
+      .replace(/[^\p{L}\p{N}\s]/gu, "")
+      .trim().replace(/\s+/g, " ");
   const workEvidenceFor = (
     contract: WorkEvidenceContract | undefined,
     requestedDOI: string | null,
@@ -581,8 +585,9 @@ export function planExecution(
       const source = { selector: contract.selector, attribute: contract.attribute ?? null, pattern: contract.pattern ?? null };
       return { evidence: { normalized, fingerprint: fingerprint(element), ...source }, title: null };
     }
-    if (normalizeTitle(extracted) === "") return { assisted: "declared work title evidence is empty" };
-    if (normalizeTitle(extracted) !== requestedTitle) return { wrong_work: true };
+    const normalizedTitle = normalizeTitle(extracted);
+    if (normalizedTitle === "") return { assisted: "declared work title evidence is empty" };
+    if (normalizedTitle !== requestedTitle) return { wrong_work: true };
     const source = { selector: contract.selector, attribute: contract.attribute ?? null, pattern: contract.pattern ?? null };
     return { evidence: null, title: { fingerprint: fingerprint(element), ...source } };
   };
@@ -741,8 +746,11 @@ export function planExecution(
     })();
     const requestedDOI =
       expected.doi === undefined || normalizeDOI(expected.doi) === "" ? null : normalizeDOI(expected.doi);
-    const requestedTitle =
-      expected.title === undefined || normalizeTitle(expected.title) === "" ? null : normalizeTitle(expected.title);
+    const normalizedTitle = expected.title === undefined ? null : normalizeTitle(expected.title);
+    if (expected.title !== undefined && normalizedTitle === "") {
+      return { assisted: "requested work title is empty after normalization" };
+    }
+    const requestedTitle = normalizedTitle;
     const expectedWork: ExpectedWorkEvidence = {
       requested_doi: requestedDOI,
       requested_title: requestedTitle,

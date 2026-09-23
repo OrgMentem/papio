@@ -17,6 +17,9 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **Title identity checks ignore typography, not different words.** *papio*
+  accepts matching article titles with sentence punctuation, quote or dash
+  variants, and diacritics. A different title still fails the work check.
 - **JSTOR keeps entitled articles out of the login queue.** A turnaway
   account offer beside the primary PDF control no longer masks the article
   and holds an institution sign-in slot.

@@ -574,6 +574,54 @@ test("declared page identity mismatches are passive wrong-work verdicts, not ada
   }
 });
 
+test("declared title identity tolerates typography but still rejects a different work", () => {
+  const spec: AdapterSpec = {
+    id: "title-bound", version: "1", hosts: ["publisher.test"],
+    classify: [{ kind: "article", all: ["h1"] }],
+    workEvidence: { kind: "title", selector: "h1" },
+  };
+  const planFor = (requested: string, page: string) =>
+    planExecution(
+      parseHTML(`<h1>${page}</h1>`, "https://publisher.test/article"),
+      spec,
+      { title: requested },
+      { access_mode: "delegated" },
+    );
+  const requested = "Overparenting is associated with perfectionism in parents of young adults.";
+  const page = "Overparenting Is Associated With Perfectionism in Parents of Young Adults";
+  const sameWork = planFor(requested, page);
+  expect("assisted" in sameWork).toBe(false);
+  expect(sameWork).toMatchObject({
+    verdict: { kind: "article" },
+    expected_work: {
+      requested_title: "overparenting is associated with perfectionism in parents of young adults",
+      title: expect.objectContaining({ selector: "h1" }),
+    },
+  });
+
+  const typography = planFor("“Café’s” long–term effects.", '"Cafe\'s" long-term effects');
+  expect(typography).toMatchObject({
+    verdict: { kind: "article" },
+    expected_work: {
+      requested_title: "cafes long term effects",
+      title: expect.objectContaining({ selector: "h1" }),
+    },
+  });
+
+  expect(planFor(requested, "Overparenting Is Associated With Perfectionism in Parents of Young Children")).toMatchObject({
+    verdict: { kind: "wrong_work" },
+    required_consequence: "none",
+  });
+  expect(planFor(requested, "!!!")).toEqual({
+    assisted: "declared work title evidence is empty",
+    verdict: expect.objectContaining({ kind: "article" }),
+  });
+  expect(planFor("!!!", page)).toEqual({
+    assisted: "requested work title is empty after normalization",
+    verdict: expect.objectContaining({ kind: "article" }),
+  });
+});
+
 test("missing, ambiguous, or malformed page identity stays assisted", () => {
   const spec: AdapterSpec = {
     id: "identity-bound", version: "1", hosts: ["publisher.test"],
