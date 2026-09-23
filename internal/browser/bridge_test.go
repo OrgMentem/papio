@@ -3023,6 +3023,105 @@ func TestInstitutionalCandidateOfferCancellationIsDelivered(t *testing.T) {
 	}
 }
 
+func TestExplicitOpenFocusRecoversAfterDaemonRestart(t *testing.T) {
+	for _, outcome := range []string{"", "browser.handoff_offered", "browser.provider_outcome", "browser.institutional_effect_result"} {
+		name := outcome
+		if name == "" {
+			name = "open_latest"
+		}
+		t.Run(name, func(t *testing.T) {
+			b, jobs, cfg, _ := newBridge(t)
+			ctx := context.Background()
+			id := park(t, jobs, "durable-focus-"+name, handoffWork())
+			if _, err := jobs.S.DB().ExecContext(ctx,
+				`UPDATE human_actions SET created_at=? WHERE job_id=?`,
+				time.Now().Add(-8*24*time.Hour).UTC().Format(time.RFC3339Nano), id); err != nil {
+				t.Fatal(err)
+			}
+			runSync(t, b, hello())
+			if queued, live, err := b.FocusHandoffs(ctx, []string{id}); err != nil || !live || queued != 1 {
+				t.Fatalf("initial open = queued %d live %v err %v", queued, live, err)
+			}
+			if err := jobs.RecordEvent(ctx, id, "handoff.opened", map[string]any{"principal": "cli"}); err != nil {
+				t.Fatal(err)
+			}
+			if outcome != "" {
+				if err := jobs.RecordEvent(ctx, id, outcome, map[string]any{"outcome": "landing_only"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fresh := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+			msgs, _ := runSync(t, fresh, hello())
+			want := outcome == ""
+			got := false
+			for _, msg := range msgs {
+				if msg.Type == protocol.MsgJobOffer && msg.JobID == id {
+					got = true
+				}
+			}
+			if got != want {
+				t.Fatalf("offer after restart = %v, want %v; frames: %v", got, want, msgs)
+			}
+			if !want && fresh.focusPending[id] {
+				t.Fatalf("settled open retained focus for %s", id)
+			}
+		})
+	}
+}
+
+func TestExplicitOpenCandidateRecoveryStopsAfterOutcome(t *testing.T) {
+	for _, settled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("settled=%t", settled), func(t *testing.T) {
+			b, jobs, cfg, _ := newBridge(t)
+			ctx := context.Background()
+			id := parkInstitutional(t, jobs, fmt.Sprintf("durable-candidate-%t", settled), handoffWork(), "")
+			runSync(t, b, materializationHello(t))
+			if queued, live, err := b.FocusHandoffs(ctx, []string{id}); err != nil || !live || queued != 1 {
+				t.Fatalf("initial open = queued %d live %v err %v", queued, live, err)
+			}
+			if err := jobs.RecordEvent(ctx, id, "handoff.opened", map[string]any{"principal": "cli"}); err != nil {
+				t.Fatal(err)
+			}
+			if settled {
+				if err := jobs.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{"outcome": "landing_only"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fresh := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+			// Isolate explicit recovery from the separate automatic claim scheduler.
+			fresh.Features = []string{institutionalMaterializationFeature, effectPermitFeature}
+			msgs, _ := runSync(t, fresh, materializationHello(t))
+			got := false
+			for _, msg := range msgs {
+				if msg.Type == protocol.MsgInstitutionalCandidateOffer && msg.JobID == id {
+					got = true
+				}
+			}
+			if got == settled {
+				t.Fatalf("candidate offer after restart = %v, want %v; frames: %v", got, !settled, msgs)
+			}
+		})
+	}
+}
+
+func TestExplicitOpenWithoutHolderRecoversCandidateOnFirstSync(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := parkInstitutional(t, jobs, "durable-open-offline", handoffWork(), "")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{id}); err != nil || live || queued != 0 {
+		t.Fatalf("offline open = queued %d live %v err %v", queued, live, err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "handoff.opened", map[string]any{"principal": "cli"}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	msgs, _ := runSync(t, fresh, materializationHello(t))
+	offer := firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil || offer.JobID != id {
+		t.Fatalf("offline explicit open was not offered on the first sync: %v", msgs)
+	}
+}
+
 func TestInstitutionalCandidateOfferRecoversAfterHolderRestart(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

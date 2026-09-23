@@ -334,6 +334,9 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **Explicitly opened handoffs survive a daemon restart.** The bridge restores
+  pending focus from job events and does not repeat an open after an offer or
+  provider outcome. An open made without a browser can start on the next sync.
 - **Browser sessions show Chrome or Firefox before a reload.** `papio browser
   sessions` names the reported browser family. `papio browser reload --session
   <id-prefix>` selects a connected session, including a pending one, instead

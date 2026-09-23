@@ -977,9 +977,9 @@ func (b *Bridge) reconcileMaterializationGeneration(ctx context.Context) {
 	}
 }
 
-// recoverMaterializationFocus reconstructs only explicit, durable candidate
-// work after a holder/daemon restart. Candidate rows are never created here;
-// they must already be attached to an open institutional handoff action.
+// recoverMaterializationFocus restores explicit focus and durable candidate
+// tracking after a holder or daemon restart. Only open awaiting-human handoffs
+// can regain focus. An open made without a holder can create its first candidate.
 func (b *Bridge) recoverMaterializationFocus(ctx context.Context) error {
 	if b.materializationGenerationUnavailable || b.materializationProfileAuthorityUnavailable || b.materializationAuthorityUncertain || b.materializationClaimReconcileUnavailable {
 		return nil
@@ -997,6 +997,13 @@ func (b *Bridge) recoverMaterializationFocus(ctx context.Context) error {
 			continue
 		}
 		attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, row.ID)
+		events, eventErr := b.jobs.Events(ctx, row.ID)
+		if eventErr != nil {
+			return eventErr
+		}
+		if pending, opened := explicitOpenPending(events); opened && !pending {
+			continue
+		}
 		if attemptErr != nil || attempt < 1 {
 			continue
 		}
@@ -1011,7 +1018,59 @@ func (b *Bridge) recoverMaterializationFocus(ctx context.Context) error {
 		b.materializationTracked[row.ID] = true
 		b.materializationOffered[row.ID] = materializationOffer{CandidateID: candidate.ID}
 	}
+	// An explicit CLI open can precede candidate creation (or use a holder
+	// without materialization). The candidate-only recovery above cannot
+	// restore that focus. Use the same bounded handoff page as the offer poll;
+	// Events is ordered by sequence, so equal timestamps cannot change which
+	// open or offer/claim outcome wins.
+	handoffs, _, err := b.jobs.ListOpenHandoffJobsPage(ctx, handoffPageLimit)
+	if err != nil {
+		return err
+	}
+	for _, item := range handoffs {
+		events, eventErr := b.jobs.Events(ctx, item.Row.ID)
+		if eventErr != nil {
+			return eventErr
+		}
+		if pending, _ := explicitOpenPending(events); pending {
+			b.focusPending[item.Row.ID] = true
+			if b.institutionalMaterializationAvailable() {
+				attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, item.Row.ID)
+				if attemptErr != nil {
+					return attemptErr
+				}
+				candidate, candidateErr := b.jobs.CurrentBrowserCandidateForJob(ctx, item.Row.ID, attempt)
+				if candidateErr != nil {
+					return candidateErr
+				}
+				if candidate == nil {
+					if _, err := b.prepareMaterializationCandidate(ctx, item.Row); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 	return nil
+}
+
+// explicitOpenPending compares event sequence, not timestamps. An offer or
+// either claim outcome closes every earlier open; a later CLI open restores it.
+func explicitOpenPending(events []map[string]any) (pending, opened bool) {
+	consumed := false
+	for i := len(events) - 1; i >= 0; i-- {
+		switch events[i]["kind"] {
+		case "browser.handoff_offered", "browser.provider_outcome", "browser.institutional_effect_result":
+			consumed = true
+		case "handoff.opened":
+			detail, _ := events[i]["detail"].(map[string]any)
+			if detail["principal"] == "cli" {
+				return !consumed, true
+			}
+			return false, true
+		}
+	}
+	return false, false
 }
 func shortSession(id string) string {
 	if len(id) > 12 {
@@ -1144,6 +1203,15 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		b.reconcileMaterializationGeneration(ctx)
 	}
 	b.repairAdapterUpgradeParks(ctx)
+	// Rebuild explicit focus before scheduling, so an open recorded while no
+	// holder was live can create and offer its candidate on this first sync.
+	if b.materializationRecoveryPending {
+		if err := b.recoverMaterializationFocus(ctx); err != nil {
+			log.Printf("papio: recovering durable materialization focus: %v", err)
+		} else {
+			b.materializationRecoveryPending = false
+		}
+	}
 	// Candidate selection is durable scheduler work, not session arbitration.
 	// Release b.mu while the indexed query runs so a stalled database cannot
 	// prevent a live replacement holder from taking over. Revalidate both
@@ -10323,15 +10391,6 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		// restarts the window, and an in-flight institutional permit outranks it.
 		if _, err := b.jobs.ExpireStrandedBoundAuthenticationEntryLeases(ctx, b.now()); err != nil {
 			log.Printf("papio: expiring stranded bound authentication entry leases: %v", err)
-		}
-	}
-	if b.materializationRecoveryPending {
-		if err := b.recoverMaterializationFocus(ctx); err != nil {
-			b.materializationScheduleBlocked = true
-			b.materializationScheduleProcessed = false
-			log.Printf("papio: recovering durable materialization focus: %v", err)
-		} else {
-			b.materializationRecoveryPending = false
 		}
 	}
 	// Auth-return and session-evidence reoffers are deliberately bounded. Keep
