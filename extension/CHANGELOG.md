@@ -16,6 +16,8 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-23
+
 ### Changed
 - **papio closes the tab of a paper it filed.** The adopted viewer, and any
   papio tab whose paper is terminal or superseded, now closes, PDF included
