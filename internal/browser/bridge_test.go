@@ -3491,6 +3491,101 @@ func TestInstitutionalReofferPacingReleasesOldestFourAndContinuesOnSync(t *testi
 	}
 }
 
+// An operator's open must take the remaining offer slot before an older
+// session-live reoffer. The reoffer keeps its place for the next free slot.
+func TestExplicitFocusPrecedesSessionLiveReoffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	source := parkInstitutional(t, jobs, "priority-source", handoffWork(), "")
+	reoffered := parkInstitutional(t, jobs, "priority-reoffer", handoffWork(), "")
+	focused := parkInstitutional(t, jobs, "priority-focus", handoffWork(), "")
+	newerFocus := parkInstitutional(t, jobs, "priority-focus-newer", handoffWork(), "")
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for i, id := range []string{focused, newerFocus} {
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at=? WHERE id=?`,
+			base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	occupiedOne := park(t, jobs, "priority-occupied-one", handoffWork())
+	occupiedTwo := park(t, jobs, "priority-occupied-two", handoffWork())
+	runSync(t, b, hello())
+	b.mu.Lock()
+	b.offered = map[string]bool{source: true}
+	b.mu.Unlock()
+	if queued, live, err := b.FocusHandoffs(ctx, []string{newerFocus, focused}); err != nil || !live || queued != 2 {
+		t.Fatalf("focus = queued %d live %v err %v", queued, live, err)
+	}
+	b.mu.Lock()
+	if err := b.reofferInstitutionalSiblings(ctx, source); err != nil {
+		b.mu.Unlock()
+		t.Fatal(err)
+	}
+	b.offered[occupiedOne] = true
+	b.offered[occupiedTwo] = true
+	b.mu.Unlock()
+	msgs, _ := runSync(t, b)
+	var offers []string
+	for _, msg := range msgs {
+		if msg.Type == protocol.MsgJobOffer {
+			offers = append(offers, msg.JobID)
+		}
+	}
+	if len(offers) != 1 || offers[0] != focused {
+		t.Fatalf("one free offer slot went to %v, want focused job %s before reoffer %s", offers, focused, reoffered)
+	}
+	if !b.reofferPending[reoffered] {
+		t.Fatalf("reoffer %s lost its place after focused job took the slot", reoffered)
+	}
+}
+
+func TestExplicitCandidatePrecedesSessionLiveReoffer(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	source := parkInstitutional(t, jobs, "candidate-priority-source", handoffWork(), "")
+	reoffered := parkInstitutional(t, jobs, "candidate-priority-reoffer", handoffWork(), "")
+	focused := parkInstitutional(t, jobs, "candidate-priority-focus", handoffWork(), "")
+	occupiedOne := park(t, jobs, "candidate-priority-occupied-one", handoffWork())
+	occupiedTwo := park(t, jobs, "candidate-priority-occupied-two", handoffWork())
+	runSync(t, b, materializationHello(t))
+	explicitMaterializationCandidate(t, jobs, reoffered, "priority-reoffer-domain")
+	b.mu.Lock()
+	b.offered = map[string]bool{source: true, occupiedOne: true, occupiedTwo: true}
+	b.mu.Unlock()
+	if queued, live, err := b.FocusHandoffs(ctx, []string{focused}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus = queued %d live %v err %v", queued, live, err)
+	}
+	b.mu.Lock()
+	if err := b.reofferInstitutionalSiblings(ctx, source); err != nil {
+		b.mu.Unlock()
+		t.Fatal(err)
+	}
+	b.mu.Unlock()
+	msgs, _ := runSync(t, b)
+	offer := firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil || offer.JobID != focused {
+		t.Fatalf("explicit candidate offer = %#v, want %s; frames: %v", offer, focused, msgs)
+	}
+	if got := countType(msgs, protocol.MsgInstitutionalCandidateOffer); got != 1 {
+		t.Fatalf("session-live candidate also took the explicit candidate's first turn: %v", msgs)
+	}
+	if got := firstOfType(msgs, protocol.MsgJobOffer); got != nil {
+		t.Fatalf("reoffer %s spent the one slot before explicit claim: %v", reoffered, msgs)
+	}
+	if !b.reofferPending[reoffered] {
+		t.Fatalf("reoffer %s lost its place", reoffered)
+	}
+	candidateID := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID
+	claimed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalClaimRequest, focused,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: "explicit-priority-claim", CandidateID: candidateID, MaterializationKind: "browser_tab",
+		}))
+	response := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if response == nil || response.Payload.(*protocol.InstitutionalClaimResponsePayload).Outcome != "claimed" {
+		t.Fatalf("explicit candidate was not claimed before reoffer: %v", claimed)
+	}
+}
+
 func TestOrdinaryOffersChooseOldestHandoffsFirst(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

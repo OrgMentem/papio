@@ -11,11 +11,9 @@ import (
 	"papio/internal/protocol"
 )
 
-// The store sweep is useless unless the daemon runs it, and neither of its two
-// siblings has a wiring test — so an untested call site is exactly the kind a
-// later cleanup deletes in good faith. One ordinary poll must free a stranded
-// slot, because that poll is the only thing a researcher waiting on 42 parked
-// papers can rely on.
+// An ordinary poll still runs the backstop for a slot left bound to a claim
+// abandoned by older code. The generation fence now releases the slot itself,
+// but historical stranded entries still need the grace sweep.
 func TestSyncFreesAStrandedBoundEntryLease(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
@@ -34,23 +32,24 @@ func TestSyncFreesAStrandedBoundEntryLease(t *testing.T) {
 	}
 	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-stranded-sweep", 21)
 
-	// The live shape: bound, human-paced, no deadline, and its claim abandoned
-	// by a holder-generation fence rather than by any observation.
+	// Recreate a legacy stranded slot: bound, human-paced, no deadline.
 	if _, err := jobs.S.DB().ExecContext(ctx,
 		`UPDATE authentication_entry_leases SET state='human', human_owner_id=?, lease_until=NULL
 		  WHERE authentication_claim_id='auth-stranded-sweep'`, jobID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := jobs.AbandonStaleMaterializations(ctx, b.arbitration.generation()+1); err != nil {
+	if _, err := jobs.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='abandoned', updated_at=? WHERE binding_id=?`,
+		time.Now().UTC().Format(time.RFC3339Nano), bindingID); err != nil {
 		t.Fatal(err)
 	}
 	stranded, ok, err := jobs.GetAuthenticationEntryLease(ctx, "auth-stranded-sweep")
 	if err != nil || !ok || stranded.State != job.AuthenticationEntryLeaseHuman ||
 		stranded.OwnerBindingID != bindingID {
-		t.Fatalf("pre-sweep lease = %+v ok=%v err=%v; want the stranded shape", stranded, ok, err)
+		t.Fatalf("legacy stranded lease = %+v ok=%v err=%v; want the bound human shape", stranded, ok, err)
 	}
 
-	// One poll inside the grace changes nothing: the reconnect window is real.
+	// One poll inside the grace leaves the legacy slot held.
 	runSync(t, b)
 	held, _, err := jobs.GetAuthenticationEntryLease(ctx, "auth-stranded-sweep")
 	if err != nil || held.State != job.AuthenticationEntryLeaseHuman {

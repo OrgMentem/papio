@@ -338,6 +338,9 @@ execution records kept during the initial build.
   daemon records each swept holder generation before offering work to its
   replacement. A late claim from the old session now receives a stale response
   instead of blocking the institution's next job.
+- **An explicit `papio actions open` takes the next browser slot before session-live reoffers.**
+  The daemon offers older explicit opens first and waits one poll before releasing
+  reoffers when it first sends a focused institutional candidate.
 - **Dismissing one human action leaves a job waiting on its other open actions.**
   Closing an obsolete browser handoff no longer cancels a job that still needs
   a terms decision. Dismissing its last open action can still cancel a parked job.

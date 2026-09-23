@@ -1088,21 +1088,90 @@ func TestProfileEvidenceRejectsSupersededRevisionAndTombstone(t *testing.T) {
 	}
 }
 
-// A generation fence abandons a claim without proving the sign-in died, so
-// AbandonStaleMaterializations deliberately keeps the entry lease: §4.5 keys a
-// reserved entry on the owner JOB precisely so a human sign-in survives a
-// service-worker restart. Nothing bounded that kindness. A bound human lease
-// carries a NULL deadline by design, the three binding-keyed release paths all
-// need an event the fence does not produce, and RetireTerminalAuthentication-
-// EntryLeases needs the owner job terminal — so a parked paper's slot is held
-// forever. Observed live 2026-08-28 on the operator's own machine: the fence
-// abandoned three claims and left lease `8924301f…` `human` with a NULL
-// deadline naming binding `a3264ff7…` whose claim had just died, while 42
-// candidates sat eligible and two `papio actions open` calls produced no tab
-// and no claim. That instance cleared five minutes later because its owner job
-// reached `cancelled`; the parked-owner case is an inference from the release
-// paths, which is why this test drives the exact shape rather than a timer.
-func TestExpireStrandedBoundAuthenticationEntryLeasesFreesAFencedSlot(t *testing.T) {
+func TestGenerationFenceReleasesBoundHumanSlotUnlessInstitutionalEffectIsUnresolved(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		permitStatus string
+		wantReleased bool
+	}{
+		{name: "no permit", wantReleased: true},
+		{name: "settled permit", permitStatus: "settled", wantReleased: true},
+		{name: "held permit", permitStatus: "held"},
+		{name: "unknown completion", permitStatus: "unknown_completion"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			jobID, candidateID := seedJobAndCandidate(t, js, "fenced-slot")
+			now := time.Now().UTC()
+			claim, err := js.ClaimMaterialization(ctx, MaterializationClaimInput{
+				CandidateID: candidateID, BrowserHolderGeneration: 7, JobAttemptRevision: 1,
+				InstitutionProfileRevision: 1, RouteRevision: 1, MaterializationKind: "browser_tab",
+				LeaseUntil: now.Add(time.Hour),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{
+				AuthenticationClaimID: "claim-fenced-slot", LeaseID: "lease-fenced-slot",
+				OwnerID: jobID, BrowserHolderGeneration: 7, LeaseUntil: now.Add(time.Minute),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := js.SetAuthenticationEntryLeaseOwnerBinding(ctx,
+				"claim-fenced-slot", jobID, 7, claim.BindingID, 9); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := js.S.DB().ExecContext(ctx,
+				`UPDATE authentication_entry_leases SET state='human', human_owner_id=?, lease_until=NULL
+				 WHERE authentication_claim_id='claim-fenced-slot'`, jobID); err != nil {
+				t.Fatal(err)
+			}
+			if tc.permitStatus != "" {
+				if _, err := js.S.DB().ExecContext(ctx, `
+					INSERT INTO effect_permits
+					  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+					   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+					VALUES ('permit-fenced-slot', ?, 1, 7, 'domain-fenced-slot', 'institutional',
+					        ?, ?, 1, 'request-fenced-slot', ?, ?, ?, ?)`,
+					jobID, claim.ID, claim.BindingID, tc.permitStatus,
+					now.Add(time.Minute).Format(time.RFC3339Nano), store.Now(), store.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			count, err := js.AbandonStaleMaterializations(ctx, 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-fenced-slot")
+			if err != nil || !ok {
+				t.Fatalf("lease=%+v found=%v err=%v", lease, ok, err)
+			}
+			gotClaim, err := js.GetMaterializationClaim(ctx, claim.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantReleased {
+				if count != 1 || gotClaim.Phase != "abandoned" ||
+					lease.State != AuthenticationEntryLeaseExpired || lease.OwnerBindingID != "" ||
+					lease.OwnerTabHint != nil || lease.LeaseUntil != "" {
+					t.Fatalf("fenced claim=%+v count=%d lease=%+v; want abandoned and free immediately",
+						gotClaim, count, lease)
+				}
+			} else if count != 0 || gotClaim.Phase != "claimed" ||
+				lease.State != AuthenticationEntryLeaseHuman || lease.OwnerBindingID != claim.BindingID {
+				t.Fatalf("protected claim=%+v count=%d lease=%+v; want live claim and held slot",
+					gotClaim, count, lease)
+			}
+		})
+	}
+}
+
+// The sweep remains a backstop for slots stranded by a daemon that did not
+// release a binding when its claim was abandoned. Unlike a new fence, that
+// historical state has no immediate binding-keyed release path to repair it.
+// A parked owner cannot use the terminal-owner sweep.
+func TestExpireStrandedBoundAuthenticationEntryLeasesFreesLegacySlot(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
 	jobID, candidateID := seedJobAndCandidate(t, js, "stranded-slot")
@@ -1139,21 +1208,22 @@ func TestExpireStrandedBoundAuthenticationEntryLeasesFreesAFencedSlot(t *testing
 		t.Fatalf("swept a live surface's slot: freed=%d err=%v", freed, err)
 	}
 
-	// The fence abandons the claim and, by design, leaves the lease bound.
-	if _, err := js.AbandonStaleMaterializations(ctx, 8); err != nil {
+	// Recreate a legacy stranded binding without running the fixed fence path.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='abandoned', updated_at=? WHERE id=?`,
+		store.Now(), claim.ID); err != nil {
 		t.Fatal(err)
 	}
 	stranded, ok, err := js.GetAuthenticationEntryLease(ctx, "claim-stranded-slot")
 	if err != nil || !ok || stranded.State != AuthenticationEntryLeaseHuman ||
 		stranded.OwnerBindingID != claim.BindingID || stranded.LeaseUntil != "" {
-		t.Fatalf("post-fence lease = %+v ok=%v err=%v; want the stranded shape this test exists for",
+		t.Fatalf("legacy stranded lease = %+v ok=%v err=%v; want human with a bound owner",
 			stranded, ok, err)
 	}
 
-	// Inside the grace the slot is still held: this is the reconnect window the
-	// fence's asymmetry exists to protect, and a returning worker renews here.
+	// Inside the grace the backstop leaves this recently abandoned slot held.
 	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, now.Add(time.Minute)); err != nil || freed != 0 {
-		t.Fatalf("swept inside the reconnect grace: freed=%d err=%v", freed, err)
+		t.Fatalf("swept inside the backstop grace: freed=%d err=%v", freed, err)
 	}
 
 	// §4.5 outranks the timer: an in-flight institutional effect keeps the slot.
@@ -1240,15 +1310,17 @@ func TestStrandedBoundLeaseGraceRestartsOnObservedProgress(t *testing.T) {
 		"claim-stranded-renew", jobID, 7, claim.BindingID, 1); err != nil {
 		t.Fatal(err)
 	}
-	// Bound, and with no deadline of its own, so the new sweep is the only
-	// thing that can ever bound it.
+	// A bound reservation can have no deadline, leaving the grace sweep as
+	// a backstop if older code failed to retire the entry.
 	if _, err := js.S.DB().ExecContext(ctx,
 		`UPDATE authentication_entry_leases SET lease_until=NULL
 		  WHERE authentication_claim_id='claim-stranded-renew'`); err != nil {
 		t.Fatal(err)
 	}
-	// The fence abandons the claim and deliberately leaves the lease bound.
-	if _, err := js.AbandonStaleMaterializations(ctx, 8); err != nil {
+	// Recreate an abandoned claim from older code with its lease still bound.
+	if _, err := js.S.DB().ExecContext(ctx,
+		`UPDATE materialization_claims SET phase='abandoned', updated_at=? WHERE id=?`,
+		store.Now(), claim.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Age both rows past the grace, so the sweep would fire on the next pass.

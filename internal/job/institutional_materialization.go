@@ -1846,14 +1846,12 @@ func (js *Store) AbandonStaleMaterializations(ctx context.Context, currentGenera
 	if err := consumeCloseAuthorizationsTx(ctx, tx, retiredBindings, now); err != nil {
 		return 0, err
 	}
-	// The entry lease is deliberately NOT released here, and the asymmetry with
-	// the expiry path is the point. A generation fence means the browser
-	// session changed, not that the sign-in died: §4.5 keys a reserved entry on
-	// the owner JOB precisely so a human sign-in survives a service-worker
-	// restart or a reconnect. Releasing it here cut off exactly that case -
-	// TestClaimObservationSurvivesAReconnectSinceArbitration caught it. Expiry
-	// is different: no renewal arrived for the claim's own lease, which is real
-	// death of the surface.
+	// The retired binding no longer names a live surface. Release its entry
+	// in this transaction, just as expiry and terminal retirement do. Claims
+	// with an in-flight institutional permit were excluded above.
+	if err := releaseAuthenticationEntryLeasesForBindingsTx(ctx, tx, retiredBindings, now); err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE browser_candidates
 		SET status='eligible', updated_at=?
 		WHERE status IN ('claimed','materializing')

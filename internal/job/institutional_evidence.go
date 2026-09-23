@@ -1669,11 +1669,8 @@ func retireAuthenticationEntryLeaseAfterOwnerCloseTx(ctx context.Context, q dbtx
 // it, and the claim's own expiry left the library slot occupied.
 //
 // Callers must only pass bindings whose claims carry no unsettled
-// institutional effect permit; the expiry path already excludes those, which is
-// what keeps a navigation genuinely in flight from being retired underneath
-// itself. Claim EXPIRY is the only caller: a generation fence must not release
-// an entry, because §4.5 keys a reserved entry on the owner job so a human
-// sign-in survives a reconnect (see AbandonStaleMaterializations).
+// institutional effect permit. Expiry, terminal retirement, and the holder
+// generation fence exclude those claims before releasing the entry.
 func releaseAuthenticationEntryLeasesForBindingsTx(ctx context.Context, q dbtx, bindings []string, nowText string) error {
 	for _, binding := range bindings {
 		if strings.TrimSpace(binding) == "" {
@@ -1773,20 +1770,15 @@ func (js *Store) ExpireUnboundAuthenticationEntryLeases(ctx context.Context, now
 // StrandedBoundEntryGrace bounds how long a BOUND entry may keep its
 // institution after the surface it names stopped being live.
 //
-// A bound sign-in earns §4.5's unbounded human-paced window, which is why
-// MarkAuthenticationEntryLeaseHuman gives it a NULL deadline. The three
-// binding-keyed release paths then need an event: an owner_closed observation,
-// a provider outcome, or a claim retirement that calls
-// releaseAuthenticationEntryLeasesForBindingsTx. AbandonStaleMaterializations
-// produces none of them on purpose — a holder-generation fence means the
-// browser session changed, not that the sign-in died, so the slot is held for
-// a reconnecting worker to renew.
+// A bound sign-in earns §4.5's unbounded human-paced window, so
+// MarkAuthenticationEntryLeaseHuman gives it a NULL deadline. The binding-keyed
+// release paths need an event: an owner_closed observation, a provider outcome,
+// or a claim retirement. The generation fence also retires the occupying claim
+// and frees its slot immediately. This grace remains a backstop for bindings
+// stranded by older code or a missed retirement.
 //
-// This window is what bounds that kindness. It is deliberately generous
-// against the reconnect it protects: an MV3 worker sleeps at ~30s and rebinds
-// in seconds, and any real sign-in keeps touching this row through §4.5's
-// human-paced renewals on every wall/login/MFA/challenge observation, so a
-// human sitting on a prompt restarts the window rather than losing the slot.
+// A live claim or recent claim update prevents the sweep from firing.
+//
 // Deliberately NOT browser.action_expiry_seconds: that value is a reminder
 // cadence (config.go's own warning against reusing it as a staleness
 // threshold), and this one answers "has this surface been gone a while".
@@ -1796,19 +1788,11 @@ const StrandedBoundEntryGrace = 30 * time.Minute
 // held by a bound entry whose named surface has not been live for a whole
 // grace window. It returns how many it released.
 //
-// The gap it closes: a claim retired by the generation fence leaves the entry
-// `human` with a NULL deadline naming a dead binding, and none of the three
-// binding-keyed release paths can fire without an event the fence does not
-// produce. RetireTerminalAuthenticationEntryLeases is the only other exit and
-// it needs the owner JOB terminal.
-//
-// Observed live 2026-08-28: the fence abandoned three claims, leaving one entry
-// `human` with a NULL deadline naming a binding whose claim had just died,
-// while 42 candidates sat eligible and two `papio actions open` calls produced
-// no tab and no claim. That instance cleared five minutes later only because
-// its owner job reached `cancelled`. A parked owner never reaches a terminal
-// state, so for a parked paper nothing would have cleared it — that part
-// follows from the release paths above rather than from a measurement.
+// The gap it closes: an entry can still name an abandoned claim from an older
+// daemon or a missed retirement. A bound human entry has no deadline, and
+// RetireTerminalAuthenticationEntryLeases cannot help while its owner job is
+// parked. The generation fence now releases its bindings in the same
+// transaction, so ordinary fences do not wait for this grace window.
 //
 // The effect-permit condition is claim-observation-protocol.md §4.5's, kept
 // verbatim from its two siblings: an unresolved browser-local effect must keep

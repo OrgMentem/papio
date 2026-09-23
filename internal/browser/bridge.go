@@ -10447,9 +10447,9 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	sort.SliceStable(candidateIDs, func(i, j int) bool {
 		priority := func(id string) int {
 			switch {
-			case b.reofferPending[id]:
-				return 0
 			case b.focusPending[id]:
+				return 0
+			case b.reofferPending[id]:
 				return 1
 			default:
 				return 2
@@ -10479,6 +10479,25 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	// claim-paced candidates alongside legacy/direct-route offers — always
 	// leaves the legacy loop room instead of a same-poll flood of distinct
 	// automatic claims spending the whole transport budget.
+	// A new explicit candidate must reach the holder before a session-live
+	// reoffer can consume its only drive slot. Defer reoffers for this poll;
+	// the next poll may release them after the candidate offer is delivered.
+	deferReoffers := false
+	if b.institutionalMaterializationAvailable() {
+		for _, candidate := range scheduled {
+			if !b.focusPending[candidate.JobID] || candidate.Status != "eligible" {
+				continue
+			}
+			if _, sent := b.materializationOffered[candidate.JobID]; sent {
+				continue
+			}
+			if action, ok := handoff[candidate.JobID]; ok &&
+				(!action.RequiresAuth || !b.institutionSignInHeldElsewhere(ctx, candidate)) {
+				deferReoffers = true
+				break
+			}
+		}
+	}
 	automaticAdmitted := map[string]bool{}
 	automaticParked := map[string]bool{}
 	if b.claimBoundAutomaticMaterializationEnabled() {
@@ -10489,7 +10508,16 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		if automaticCap > slots {
 			automaticCap = slots
 		}
-		automaticAdmitted, automaticParked = b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, automaticCap)
+		automaticCandidates := scheduled
+		if deferReoffers {
+			automaticCandidates = make([]job.BrowserCandidateDescriptor, 0, len(scheduled))
+			for _, candidate := range scheduled {
+				if !b.reofferPending[candidate.JobID] || b.focusPending[candidate.JobID] {
+					automaticCandidates = append(automaticCandidates, candidate)
+				}
+			}
+		}
+		automaticAdmitted, automaticParked = b.admitAutomaticMaterializationCandidates(ctx, automaticCandidates, handoff, automaticCap)
 		slots -= len(automaticAdmitted)
 		if slots < 0 {
 			slots = 0
@@ -10499,6 +10527,9 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	heldIDs := make(map[string]bool)
 jobLoop:
 	for _, id := range candidateIDs {
+		if deferReoffers && b.reofferPending[id] && !b.focusPending[id] {
+			continue
+		}
 		if hasSettledDownload(b.pendingDownloads, id) || b.offered[id] {
 			continue
 		}
@@ -10836,8 +10867,14 @@ jobLoop:
 				rest = append(rest, id)
 			}
 		}
-		sort.Strings(rest)
 		ids = append(ids, rest...)
+		sort.SliceStable(ids, func(i, j int) bool {
+			left, right := rows[ids[i]], rows[ids[j]]
+			if left.CreatedAt != right.CreatedAt {
+				return left.CreatedAt < right.CreatedAt
+			}
+			return ids[i] < ids[j]
+		})
 		focused := 0
 		for _, id := range ids {
 			if _, ok := handoff[id]; !ok {

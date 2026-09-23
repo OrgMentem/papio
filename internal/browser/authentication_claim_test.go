@@ -619,6 +619,25 @@ func TestClaimObservationSurvivesAReconnectSinceArbitration(t *testing.T) {
 	bindingID := bindCandidate(t, b, jobID, candidateID, "auth-observation-reconnect", 5)
 	reservedUnder := b.arbitration.generation()
 
+	// An unsettled institutional effect keeps this binding live across the
+	// holder fence. Without one, the fence retires the binding and releases
+	// its entry rather than accepting an observation for a dead surface.
+	claim, err := jobs.MaterializationClaimByBindingID(ctx, bindingID)
+	if err != nil || claim == nil {
+		t.Fatalf("bound claim=%+v err=%v", claim, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		INSERT INTO effect_permits
+		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+		   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+		VALUES ('permit-reconnect', ?, 1, ?, 'domain-reconnect', 'institutional',
+		        ?, ?, 1, 'request-reconnect', 'held', ?, ?, ?)`,
+		jobID, reservedUnder, claim.ID, bindingID,
+		time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano), now, now); err != nil {
+		t.Fatal(err)
+	}
+
 	// The service worker dies mid-login and reconnects as a new session: the
 	// port closes (goodbye), then the fresh worker says hello and is promoted,
 	// which is what advances the holder generation live.
