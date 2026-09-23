@@ -337,7 +337,10 @@ execution records kept during the initial build.
 - **A retired browser claim no longer holds an institution's sign-in slot.**
   A holder-generation fence releases the claim's bound entry lease in the
   same transaction. An unsettled institutional effect still keeps the slot.
-  The 30-minute sweep remains a backstop for older stranded leases.
+  The 30-minute sweep remains a backstop for older stranded leases, and it
+  now frees a returned sign-in whose claim is already abandoned or settled on
+  the next poll instead of after the grace; a sign-in still in progress keeps
+  the grace.
 - **Old browser sessions cannot reclaim work after a holder sweep.** The
   daemon records each swept holder generation before offering work to its
   replacement. A late claim from the old session now receives a stale response

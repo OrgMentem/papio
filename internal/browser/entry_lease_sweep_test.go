@@ -12,8 +12,9 @@ import (
 )
 
 // An ordinary poll still runs the backstop for a slot left bound to a claim
-// abandoned by older code. The generation fence now releases the slot itself,
-// but historical stranded entries still need the grace sweep.
+// abandoned outside the generation fence. A `human` entry whose claim is
+// terminal is released on the next poll, not after the 30-minute grace
+// (measured live 2026-09-23: six opened papers queued behind one such slot).
 func TestSyncFreesAStrandedBoundEntryLease(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()
@@ -49,16 +50,8 @@ func TestSyncFreesAStrandedBoundEntryLease(t *testing.T) {
 		t.Fatalf("legacy stranded lease = %+v ok=%v err=%v; want the bound human shape", stranded, ok, err)
 	}
 
-	// One poll inside the grace leaves the legacy slot held.
-	runSync(t, b)
-	held, _, err := jobs.GetAuthenticationEntryLease(ctx, "auth-stranded-sweep")
-	if err != nil || held.State != job.AuthenticationEntryLeaseHuman {
-		t.Fatalf("a poll inside the grace freed the slot: %+v err=%v", held, err)
-	}
-
-	// One poll past the grace frees it, and the owner job is still parked —
+	// The next ordinary poll frees it, and the owner job is still parked —
 	// which is the whole point, because the terminal-owner sweep cannot help.
-	b.now = func() time.Time { return time.Now().UTC().Add(job.StrandedBoundEntryGrace + time.Minute) }
 	runSync(t, b)
 	freed, ok, err := jobs.GetAuthenticationEntryLease(ctx, "auth-stranded-sweep")
 	if err != nil || !ok {

@@ -1167,9 +1167,11 @@ func TestGenerationFenceReleasesBoundHumanSlotUnlessInstitutionalEffectIsUnresol
 	}
 }
 
-// The sweep remains a backstop for slots stranded by a daemon that did not
-// release a binding when its claim was abandoned. Unlike a new fence, that
-// historical state has no immediate binding-keyed release path to repair it.
+// The sweep remains a backstop for slots stranded by a path that did not
+// release a binding when its claim was abandoned (measured live 2026-09-23:
+// a claim abandoned outside the fence left the institution held with six
+// opened papers queued). A terminal claim cannot be in flight, so the slot
+// is released at once; only §4.5's held institutional effect outranks that.
 // A parked owner cannot use the terminal-owner sweep.
 func TestExpireStrandedBoundAuthenticationEntryLeasesFreesLegacySlot(t *testing.T) {
 	js := testStore(t)
@@ -1221,12 +1223,8 @@ func TestExpireStrandedBoundAuthenticationEntryLeasesFreesLegacySlot(t *testing.
 			stranded, ok, err)
 	}
 
-	// Inside the grace the backstop leaves this recently abandoned slot held.
-	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, now.Add(time.Minute)); err != nil || freed != 0 {
-		t.Fatalf("swept inside the backstop grace: freed=%d err=%v", freed, err)
-	}
-
-	// §4.5 outranks the timer: an in-flight institutional effect keeps the slot.
+	// §4.5 outranks the terminal claim: an in-flight institutional effect keeps
+	// the slot, however late the sweep runs.
 	if _, err := js.S.DB().ExecContext(ctx, `
 		INSERT INTO effect_permits
 		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
@@ -1245,9 +1243,10 @@ func TestExpireStrandedBoundAuthenticationEntryLeasesFreesLegacySlot(t *testing.
 		t.Fatal(err)
 	}
 
-	// Past the grace, with nothing in flight and no surface alive: released.
-	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, late); err != nil || freed != 1 {
-		t.Fatalf("stranded slot past its grace: freed=%d err=%v, want 1", freed, err)
+	// Nothing in flight and the claim already abandoned: released inside the
+	// grace, not 30 minutes later.
+	if freed, err := js.ExpireStrandedBoundAuthenticationEntryLeases(ctx, now.Add(time.Minute)); err != nil || freed != 1 {
+		t.Fatalf("stranded slot with a terminal claim: freed=%d err=%v, want 1 at once", freed, err)
 	}
 	// Freed for real, and the sweep is idempotent.
 	next, err := js.ReserveAuthenticationEntryLease(ctx, AuthenticationEntryLeaseInput{

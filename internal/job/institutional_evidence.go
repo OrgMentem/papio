@@ -1785,14 +1785,19 @@ func (js *Store) ExpireUnboundAuthenticationEntryLeases(ctx context.Context, now
 const StrandedBoundEntryGrace = 30 * time.Minute
 
 // ExpireStrandedBoundAuthenticationEntryLeases releases every institution slot
-// held by a bound entry whose named surface has not been live for a whole
-// grace window. It returns how many it released.
+// held by a bound entry whose named surface is gone. It returns how many it
+// released.
 //
-// The gap it closes: an entry can still name an abandoned claim from an older
-// daemon or a missed retirement. A bound human entry has no deadline, and
-// RetireTerminalAuthenticationEntryLeases cannot help while its owner job is
-// parked. The generation fence now releases its bindings in the same
-// transaction, so ordinary fences do not wait for this grace window.
+// Two populations, two rules. A `human` entry (the sign-in already returned)
+// whose claim row is terminal (`abandoned` or `settled`) has nothing in
+// flight, so the slot is released at once: measured live 2026-09-23, a `human`
+// entry naming a claim abandoned at 06:47:05Z held the institution with six
+// explicitly opened papers queued behind it, and the only exit was this
+// sweep's 30-minute grace. A `reserved` entry keeps the grace even with an
+// abandoned claim, because a reconnect abandons the claim while the researcher
+// may still be typing at the wall, and an applied observation renews it. A
+// binding with no claim row at all (older daemons, a missed retirement) keeps
+// the grace too, because nothing else can vouch for its surface being gone.
 //
 // The effect-permit condition is claim-observation-protocol.md §4.5's, kept
 // verbatim from its two siblings: an unresolved browser-local effect must keep
@@ -1808,22 +1813,31 @@ func (js *Store) ExpireStrandedBoundAuthenticationEntryLeases(ctx context.Contex
 		       owner_tab_hint=NULL, entitled_at=NULL, updated_at=?
 		 WHERE state IN ('reserved','human')
 		   AND owner_binding_id IS NOT NULL AND owner_binding_id<>''
-		   AND updated_at <= ?
 		   AND NOT EXISTS (
 		     SELECT 1 FROM materialization_claims m
 		      WHERE m.binding_id = authentication_entry_leases.owner_binding_id
 		        AND m.phase IN ('claimed','bound','route_issued','navigated')
 		   )
 		   AND NOT EXISTS (
-		     SELECT 1 FROM materialization_claims m
-		      WHERE m.binding_id = authentication_entry_leases.owner_binding_id
-		        AND m.updated_at > ?
-		   )
-		   AND NOT EXISTS (
 		     SELECT 1 FROM effect_permits p
 		      WHERE p.binding_id = authentication_entry_leases.owner_binding_id
 		        AND p.effect_kind='institutional'
 		        AND p.status IN ('held','unknown_completion')
+		   )
+		   AND (
+		     (state='human' AND EXISTS (
+		       SELECT 1 FROM materialization_claims m
+		        WHERE m.binding_id = authentication_entry_leases.owner_binding_id
+		          AND m.phase IN ('abandoned','settled')
+		     ))
+		     OR (
+		       updated_at <= ?
+		       AND NOT EXISTS (
+		         SELECT 1 FROM materialization_claims m
+		          WHERE m.binding_id = authentication_entry_leases.owner_binding_id
+		            AND m.updated_at > ?
+		       )
+		     )
 		   )`,
 		nowText, staleBefore, staleBefore)
 	if err != nil {
