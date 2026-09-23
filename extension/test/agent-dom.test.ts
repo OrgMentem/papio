@@ -551,6 +551,24 @@ test("an explicit same-origin PDF anchor uses its original native click with tem
   expect(clicks).toBe(1);
 });
 
+test("a same-origin PDF route whose last segment is the bare word receives download intent", async () => {
+  const win = setup(`<meta name="citation_doi" content="${doi}"><main><a href="/2026/1/e83927/PDF" aria-label="Download PDF">Download PDF</a><a href="/2026/1/e83927/pdfviewer">Viewer</a></main>`);
+  const anchors = Array.from(win.document.querySelectorAll("a"));
+  let clicks = 0;
+  anchors[0]!.addEventListener("click", event => {
+    clicks++;
+    expect(anchors[0]!.getAttribute("download")).toBe("");
+    event.preventDefault();
+  });
+  const first = observed(await observe());
+  const [route, viewer] = first.observation.controls;
+  expect(route?.disabled).toBe(false);
+  expect(await act(first, { choice: route!.id })).toEqual({ status: "dispatched", downloadExpected: true });
+  expect(clicks).toBe(1);
+  // `/pdfviewer` is not a PDF route: with navigation off it stays disabled.
+  expect(viewer?.disabled).toBe(true);
+});
+
 for (const [attributes, text] of [
   ['href="https://external.example/paper.pdf"', "Article PDF"],
   ['href="http://ebooks.iospress.nl/paper.pdf"', "Article PDF"],

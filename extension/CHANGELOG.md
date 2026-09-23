@@ -17,6 +17,9 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **The article agent treats a `/PDF` route as a PDF link.** A same-origin
+  anchor labelled PDF whose path ends in the bare word receives download intent
+  instead of being followed as navigation into the viewer.
 - **Timed-out handoffs need page evidence before reporting sign-in.** An offer's
   `requires_auth` flag alone no longer puts an entitled article or an access
   denial into `auth_pending`, and neither does a publisher's header "Sign in"

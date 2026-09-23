@@ -302,8 +302,12 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     const value = element.getAttribute("role");
     return value === "button" || value === "link" || value === "menuitem" || value === "tab" ? value : element.tagName === "A" ? "link" : "button";
   };
+  // A PDF path is `…/name.pdf` or a route whose last segment is the bare word
+  // (JMIR serves `/2026/1/e83927/PDF`, measured 2026-09-23: the agent chose
+  // that "Download PDF" anchor as navigation, the tab became a viewer, and
+  // the attempt stopped as "no fresh matching article").
   const explicitPDFLink = (element: Element, anchor: HTMLAnchorElement) =>
-    element === anchor && /\bpdf\b/i.test(label(anchor)) && /\.pdf$/i.test(new URL(anchor.href).pathname);
+    element === anchor && /\bpdf\b/i.test(label(anchor)) && /(?:\.pdf|\/pdf)$/i.test(new URL(anchor.href).pathname);
   const navigationTarget = (element: Element): string | undefined => {
     const anchor = element.closest<HTMLAnchorElement>("a[href]");
     if (!request.allowNavigation || element !== anchor || anchor.hasAttribute("download") || explicitPDFLink(element, anchor)) return undefined;
