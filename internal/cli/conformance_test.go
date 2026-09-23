@@ -165,6 +165,7 @@ var commandClassification = map[string]commandClass{
 	"papio notify test":                {kind: kindStructured, args: []string{"request_outcome"}, rpcMethods: []string{"notify.test_v1"}},
 	"papio stats":                      {kind: kindStructured, rpcMethods: []string{"stats.get"}},
 	"papio stats page-bulk":            {kind: kindEnvelope, rowKey: "origins", rpcMethods: []string{"stats.page_bulk"}},
+	"papio stats producers":            {kind: kindStructured, rpcMethods: []string{"stats.producers_v1"}},
 	"papio actions":                    {kind: kindNone},
 	"papio actions list":               {kind: kindEnvelope, rowKey: "actions", rpcMethods: []string{"actions.list_v3", "actions.list_v2", "actions.list"}},
 	"papio actions resolve":            {kind: kindStructured, rpcMethods: []string{"actions.resolve"}},

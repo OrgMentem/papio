@@ -1182,6 +1182,19 @@ Show page-bulk scan/submit funnel and identifier yield
 papio stats page-bulk
 ```
 
+### `papio stats producers`
+
+Show who produced each acquired artifact and how many needed a person
+
+```
+papio stats producers [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--since` | `string` | `24h` | count promotions since this RFC3339 instant or within this Go duration (e.g. 24h) |
+| `--until` | `string` |  | count promotions before this RFC3339 instant (default now) |
+
 ## `papio status`
 
 Show active and recent acquisition jobs

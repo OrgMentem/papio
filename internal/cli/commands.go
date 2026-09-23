@@ -464,7 +464,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 					return err
 				}
 				for _, event := range detail.Events {
-					if _, err := fmt.Fprintf(opt.out, "  %v  %v\n", event["at"], event["kind"]); err != nil {
+					if _, err := fmt.Fprintf(opt.out, "  %v  %v%s\n", event["at"], event["kind"], producerEventSummary(event)); err != nil {
 						return err
 					}
 				}

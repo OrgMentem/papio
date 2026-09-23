@@ -607,6 +607,11 @@ func transitionPublicationMainTx(ctx context.Context, tx *sql.Tx, input Publicat
 		input.JobID, now, detailJSON); err != nil {
 		return err
 	}
+	if input.ToState == StateReady && input.Role == PublicationRoleMain {
+		if err := recordArtifactProducerTx(ctx, tx, input, now); err != nil {
+			return err
+		}
+	}
 	if Terminal(input.ToState) {
 		return closeTerminalHumanActions(ctx, tx, input.JobID, input.ToState, now)
 	}

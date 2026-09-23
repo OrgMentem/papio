@@ -142,6 +142,12 @@ func ActivityText(kind string, detail map[string]any) string {
 			return clampActivityText(fmt.Sprintf("Notification digest queued for %d items", count))
 		}
 		return "Notification digest queued"
+	case "artifact.producer":
+		producer := strings.ReplaceAll(activityDetailString(detail, "producer"), "_", " ")
+		if producer == "" {
+			return "Artifact producer recorded"
+		}
+		return clampActivityText(fmt.Sprintf("Artifact produced by %s", producer))
 	default:
 		return clampActivityText(kind)
 	}

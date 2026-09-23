@@ -124,6 +124,16 @@ execution records kept during the initial build.
   a fresh occurrence.
 
 ### Added
+- **Every acquired artifact now records who produced it.** Each promotion to
+  `ready` writes one `artifact.producer` event: `adapter`, `agent`,
+  `native_viewer`, `daemon_fetch`, `manual` or `unknown`, with the adapter or
+  agent decision when the record names one, and the interventions the attempt
+  needed (`open`, `sign_in`, `terms`, `challenge`, `review`, `manual_file`). A
+  handoff opened by the paced drive is not an intervention. `papio jobs show`
+  prints the record, and `papio stats producers --since <instant>` counts a
+  period by producer and as unattended, sign-in only, or intervened. A browser
+  download that carries no effect tuple stays `unknown`: the extension does
+  not report which adapter clicked, so papio does not guess.
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual
   download with a fresh institutional handoff. It keeps the failed action and
   browser history, releases the old browser claim, and allows one request per

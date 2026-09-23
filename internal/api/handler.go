@@ -300,6 +300,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"stats.page_bulk": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return pageBulkStats(ctx, raw, system)
 		},
+		"stats.producers_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return producerStats(ctx, raw, system)
+		},
 		"triage.decide": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageDecide(ctx, raw, system)
 		},
