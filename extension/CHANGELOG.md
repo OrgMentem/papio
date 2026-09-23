@@ -17,6 +17,9 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **Cookie notices no longer stop the article agent.** A cookie or privacy
+  banner is not a consent gate; its buttons are never offered to the model. A
+  notice that also names terms, a licence or credentials still stops the attempt.
 - **The article agent treats a `/PDF` route as a PDF link.** A same-origin
   anchor labelled PDF whose path ends in the bare word receives download intent
   instead of being followed as navigation into the viewer.

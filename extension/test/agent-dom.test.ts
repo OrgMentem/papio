@@ -200,6 +200,22 @@ for (const [gate, reason] of [
   expect(clicks).toBe(0);
 });
 
+// A cookie or privacy notice is ambient: it asks nothing about the article.
+// Measured 2026-09-23 on methods.sagepub.com, where a cookie banner's
+// "Accept" halted an entitled page as consent_required. Its buttons are
+// never offered; a notice that also names terms stays a gate.
+test("a cookie notice neither blocks observation nor exposes its buttons", async () => {
+  const win = setup(), first = observed(await observe());
+  win.document.body.insertAdjacentHTML("beforeend",
+    '<div role="dialog" aria-label="Cookie preferences">We use cookies to improve your experience.<button>Accept all cookies</button><button>Reject</button></div>');
+  const next = observed(await observe());
+  expect(next.observation.controls.map(c => c.label)).toEqual(first.observation.controls.map(c => c.label));
+  expect(next.observation.controls.some(c => /cookies|reject/i.test(c.label))).toBe(false);
+  win.document.body.insertAdjacentHTML("beforeend",
+    '<div role="dialog">Cookies and terms of use: accept the licence agreement<button>Continue</button></div>');
+  expect(await observe()).toEqual({ status: "blocked", reason: "consent_required" });
+});
+
 for (const label of ["Accept license", "Buy article", "Request a copy", "Document delivery", "Grant permission", "Subscribe", "Verify credentials"])
   test(`human action is never executable: ${label}`, async () => {
     const win = setup();

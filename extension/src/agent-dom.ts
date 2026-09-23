@@ -127,6 +127,11 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     if (/\b(accept|agree|consent|acknowledge|permissions?|authorize|allow access)\b/i.test(text)) return "consent_required";
     return "human_action_required";
   };
+  const cookieNotice = (dialog: Element) => {
+    const text = `${dialog.getAttribute("aria-label") ?? ""} ${dialog.textContent ?? ""}`;
+    return /\b(cookies?|privacy (?:notice|preferences|settings)|tracking)\b/i.test(text) &&
+      !/\b(terms|licen[cs]e|agreement|purchase|buy|subscribe|password|sign[ -]?in|log[ -]?in)\b/i.test(text);
+  };
   const primaryArticleDOIs = (): string[] => {
     const claims: string[] = [];
     const secondary = /(?:^|[\s_-])(?:refs?|references?|bibliograph(?:y|ies)|citations?|related|recommended|recommendations?)(?:$|[\s_-])/i;
@@ -210,8 +215,14 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       ["type", "name", "id", "autocomplete"].map(key => field.getAttribute(key) ?? "").join(" ")) ? "payment_required" : "credentials_required";
     if (Array.from(document.querySelectorAll('iframe,frame,[data-sitekey],[id*="captcha" i],[class*="captcha" i],.cf-turnstile')).some(node => visible(node, false) && (node.hasAttribute("data-sitekey") || /captcha|turnstile|challenge/i.test(["src", "title", "id", "class", "name"].map(key => node.getAttribute(key)).join(" "))))) return "challenge_required";
     const gateText = (node: Node): string => node.nodeType === 3 ? node.textContent ?? "" : Array.from(node.childNodes).map(gateText).join(" ");
+    // A cookie or privacy notice is ambient, not a gate: it asks nothing about
+    // the article, and its buttons are never offered to the model (see
+    // `cookieNotice` in the candidate filter). Measured 2026-09-23 on
+    // methods.sagepub.com: a cookie banner's "Accept" halted the attempt as
+    // consent_required on an entitled page. A notice that also names terms,
+    // a licence, a purchase or credentials stays a gate.
     for (const dialog of document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"]')) {
-      if (!visible(dialog, false)) continue;
+      if (!visible(dialog, false) || cookieNotice(dialog)) continue;
       const text = `${dialog.getAttribute("aria-label") ?? ""} ${gateText(dialog)}`;
       if (human.test(text)) return humanReason(text);
     }
@@ -341,9 +352,11 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   const snapshot = () => {
     const reason = validate();
     if (reason) return { status: "blocked" as const, reason };
+    const notices = Array.from(document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"]')).filter(cookieNotice);
     const candidates = Array.from(document.querySelectorAll(selector)).filter(element =>
       element.namespaceURI === "http://www.w3.org/1999/xhtml" && !sensitiveForm(element) && element.closest(scope) && !element.closest(privateSelector) && visible(element) &&
       (!element.matches(fields) || element.matches(native)) && (element.matches(native) || !element.querySelector(selector)) &&
+      !notices.some(notice => notice.contains(element)) &&
       !/\b(my account|sign[ -]?(?:in|out)|log[ -]?(?:in|out)|profile)\b/i.test(label(element)))
       .map(element => ({ element, ownLabel: label(element) }))
       .filter(({ ownLabel }) => hasPublicLabel(ownLabel));
