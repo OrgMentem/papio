@@ -20748,13 +20748,29 @@ export class Bridge {
         current.job_id === jobID && authorized()
           ? { ...current, agent_fallback_attempt: key } as ActiveJob : current) }));
       if (!authorized() || !(await liveTab()) || !authorized()) return;
-      effectToken = this.claimEffectGovernor(jobID);
-      if (effectToken === undefined) return;
-      const leaseJob = this.providerDrainLeaseJobs.get(providerKey);
-      if (leaseJob !== undefined && leaseJob !== jobID) return;
-      leaseOwner = this.providerDrainLeaseOwners.get(providerKey);
-      if (leaseOwner === undefined) leaseOwner = await this.claimProviderDrainLease(job);
-      if (!authorized() || leaseOwner === undefined) return;
+      // The effect slot and this provider's drain lease are shared. Sibling
+      // offers from one resolver with no landing evidence share a provider key,
+      // so a sibling that holds either one is busy; that does not make this
+      // attempt stale. Measured 2026-09-23 on job_6137e775227b19bb52eb79bf5d: a
+      // SAGE chapter back from a sign-in hop stopped here as "stale" while
+      // sibling UNE drives were active, and the daemon never saw a start. Wait
+      // within this attempt's own deadline. Never hold the slot while the lease
+      // is busy: the lease holder can need the slot to finish.
+      for (;;) {
+        effectToken = this.claimEffectGovernor(jobID);
+        if (effectToken !== undefined) {
+          const leaseJob = this.providerDrainLeaseJobs.get(providerKey);
+          if (leaseJob === undefined || leaseJob === jobID)
+            leaseOwner = this.providerDrainLeaseOwners.get(providerKey) ?? await this.claimProviderDrainLease(job);
+          if (leaseOwner !== undefined) break;
+          this.releaseEffectGovernor(jobID, effectToken);
+          effectToken = undefined;
+        }
+        if (!authorized()) return;
+        await pause();
+        if (!authorized()) return;
+      }
+      if (!authorized()) return;
       await this.update(store => authorized() ? { ...store, providerDrainLeases: {
         ...store.providerDrainLeases, [providerKey]: { ...store.providerDrainLeases![providerKey]!, expiresAt: deadline },
       } } : store);

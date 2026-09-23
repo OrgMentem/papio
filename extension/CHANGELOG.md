@@ -17,6 +17,14 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **The article agent waits for a busy sibling instead of calling itself
+  stale.** Papers routed through the same library resolver can share one
+  provider lease, and all drives share one effect slot. When a sibling drive
+  held either one, the agent stopped at once with "page or authority became
+  stale", consumed its attempt, and never asked the daemon to start. Measured
+  on a SAGE Research Methods chapter back from an OpenAthens sign-in hop. The
+  agent now waits for both within its own time budget, and releases the slot
+  while the lease is busy.
 - **Chrome tries a signed PDF viewer's download once.** When a handoff lands
   on a ScienceDirect or other signed PDF viewer, Chrome now downloads the
   viewer URL into the job's papio folder, and the daemon validates it as usual.

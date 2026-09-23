@@ -1,5 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 import { afterEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { Window } from "happy-dom";
 import { Bridge, MIN_DAEMON_VERSION, assessDrivenPage, isBotChallenge, type BridgeDeps, type DownloadItemLike, type NativePort } from "../src/background";
 import { agentDOM, agentPageReadiness, type AgentDOMRequest } from "../src/agent-dom";
@@ -33,9 +34,10 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 
-async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape; helloPending?: boolean; readiness?: boolean } = {}) {
-  const win = new Window({ url, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
-  win.document.write(`<meta name="citation_doi" content="${doi}"><meta name="citation_title" content="Example article"><main><h1>Example article</h1><button type="button">Formats</button></main><header><input type="search" value="PRIVATEQUERY"></header>`);
+async function harness(options: { features?: string[]; knownAdapter?: boolean; firefox?: boolean; ignoredSteeringEvent?: boolean; status?: ActiveJob["status"]; seed?: StoreShape; helloPending?: boolean; readiness?: boolean; page?: { url: string; html: string; doi: string } } = {}) {
+  const pageURL = options.page?.url ?? url, pageDOI = options.page?.doi ?? doi;
+  const win = new Window({ url: pageURL, settings: { enableJavaScriptEvaluation: false, disableCSSFileLoading: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } });
+  win.document.write(options.page?.html ?? `<meta name="citation_doi" content="${doi}"><meta name="citation_title" content="Example article"><main><h1>Example article</h1><button type="button">Formats</button></main><header><input type="search" value="PRIVATEQUERY"></header>`);
   Object.assign(win.HTMLElement.prototype, { getClientRects: () => [{ width: 10, height: 10 }] });
   for (const [key, value] of Object.entries({ document: win.document, location: win.location, getComputedStyle: win.getComputedStyle.bind(win), HTMLElement: win.HTMLElement, papioArticleAgent: undefined })) {
     if (!globals.has(key)) globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -49,7 +51,7 @@ async function harness(options: { features?: string[]; knownAdapter?: boolean; f
     disconnect() {}, postMessage(message) { frames.push(parseBrowserMessage(message)); },
   };
   const tabs = new ChromeTabsFake();
-  tabs.seed({ id: tabID, url, status: "complete" });
+  tabs.seed({ id: tabID, url: pageURL, status: "complete" });
   const downloads = new FakeDownloads();
   if (options.firefox && !options.ignoredSteeringEvent) Reflect.deleteProperty(downloads, "onDeterminingFilename");
   const backend = { store: emptyStore(), load: async () => backend.store, save: async (store: StoreShape) => { backend.store = store; } };
@@ -94,7 +96,7 @@ async function harness(options: { features?: string[]; knownAdapter?: boolean; f
   if (!options.helloPending) await inbound("hello_ack", { daemon_version: MIN_DAEMON_VERSION, role: "holder", browser_holder_generation: 1, features: options.features ?? features }, false);
   const update = (reducer: (store: StoreShape) => StoreShape): Promise<void> => Reflect.get(bridge, "update").call(bridge, reducer);
   const job: ActiveJob = { job_id: jobID, tab_id: tabID, offered_at: now - 20_000, expires_at: now + 3600_000,
-    status: options.status ?? "accepted", provider_hosts: [], access_mode: "delegated", expected: { doi }, generic_drive_epoch: localEpoch,
+    status: options.status ?? "accepted", provider_hosts: [], access_mode: "delegated", expected: { doi: pageDOI }, generic_drive_epoch: localEpoch,
     unknown_count: 1, last_unknown_ms: now - 10_000 };
   await update(store => ({ ...store, ...(options.seed ?? {}), activeJobs: options.seed?.activeJobs ?? [job] }));
   Reflect.get(bridge, "handoffDrives").set(jobID, { tabID, token: {} });
@@ -1832,4 +1834,50 @@ for (const change of ["referrer", "old-time", "future-time", "extension", "holde
     expect(suggestion).toBeUndefined();
     expect(item.tabId).toBeUndefined();
     pending.stop(); await flush();
+  });
+
+// Measured 2026-09-23 on job_6137e775227b19bb52eb79bf5d: the drive went through
+// the OpenAthens redirector (a genuine sign-in hop, so auth_pending), landed on
+// this SAGE Research Methods chapter, and stopped with "page or authority became
+// stale" 66 ms after its capture. No start reached the daemon. Two sibling UNE
+// jobs with the same resolver-only provider key were active, and all drives
+// share one effect slot. A busy sibling is contention, not a stale attempt.
+const sageURL = "https://methods.sagepub.com/book/edvol/researching-childrens-experience/chpt/researching-child-developmental-psychology";
+const sageHTML = readFileSync(new URL("../fixtures/sage-research-methods/success.html", import.meta.url), "utf8");
+for (const holder of ["effect slot", "provider lease"] as const)
+  test(`an agent drive back from a sign-in hop waits out a sibling's ${holder} and decides on the article`, async () => {
+    const h = await harness({ page: { url: sageURL, html: sageHTML, doi: "10.4135/9781849209823.n2" } });
+    // Captures blank inline style, so the page's closed Kendo sign-in windows
+    // parse as open. Restore the closed state they carry live.
+    for (const dialog of h.win.document.querySelectorAll(".k-window")) dialog.setAttribute("style", "display: none");
+    const navigate = async (to: string) => {
+      h.tabs.patch(tabID, { url: to, status: "loading" });
+      await h.tabs.onUpdated.emit(tabID, { url: to, status: "loading" }, h.tabs.snapshot(tabID)!);
+      h.tabs.patch(tabID, { url: to, status: "complete" });
+      await h.tabs.onUpdated.emit(tabID, { status: "complete" }, h.tabs.snapshot(tabID)!);
+      await flush();
+    };
+    await navigate("https://go.openathens.net/redirector/une.edu.au?url=https%3A%2F%2Fdoi.org%2F10.4135%2F9781849209823.n2");
+    expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+    const providerKey = "unknown-provider";
+    if (holder === "effect slot") Reflect.set(h.bridge, "effectGovernorOwner", { jobID: "job_sibling", token: "sibling" });
+    else {
+      Reflect.get(h.bridge, "providerDrainLeaseOwners").set(providerKey, "sibling");
+      Reflect.get(h.bridge, "providerDrainLeaseJobs").set(providerKey, "job_sibling");
+      await h.update(store => ({ ...store, providerDrainLeases: { [providerKey]: { providerKey, expiresAt: h.now() + 60_000 } } }));
+    }
+    await navigate(sageURL);
+    await until(() => h.timers.some(timer => timer.ms === 1000) || h.frames.some(frame => frame.type === "provider_outcome"));
+    expect(h.frames.find(frame => frame.type === "provider_outcome")?.payload["detail"]).toBeUndefined();
+    expect(h.frames.some(frame => frame.type === "provider_drive_epoch_start_request")).toBe(false);
+    if (holder === "effect slot") Reflect.get(h.bridge, "releaseEffectGovernor").call(h.bridge, "job_sibling", "sibling", false);
+    else await Reflect.get(h.bridge, "releaseProviderDrainLease").call(h.bridge, providerKey, "sibling");
+    await h.tick();
+    await h.started();
+    const observation = (await h.request("agent_decide_request_v1")).payload["observation"];
+    expect(observation !== null && typeof observation === "object" && "controls" in observation &&
+      Array.isArray(observation.controls) && observation.controls.length > 0).toBe(true);
+    expect(h.backend.store.activeJobs[0]?.status).toBe("awaiting_download");
+    expect(h.frames.some(frame => frame.type === "provider_outcome")).toBe(false);
+    await h.decide("decision", "BLOCKED"); await h.settle();
   });
