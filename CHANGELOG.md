@@ -341,6 +341,10 @@ execution records kept during the initial build.
   without a title keep the generic fallback until refreshed.
 
 ### Fixed
+- **An operator redrive starts a fresh browser attempt.** Provider latches
+  from the earlier attempt stay in history but no longer veto the restored
+  institutional route, so the adapter or article agent runs again. A
+  publisher retry still leaves the old route's latch in force.
 - **Explicitly opened handoffs survive a daemon restart.** The bridge restores
   pending focus from job events and does not repeat an open after an offer or
   provider outcome. An open made without a browser can start on the next sync.

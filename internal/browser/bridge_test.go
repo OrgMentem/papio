@@ -5566,6 +5566,16 @@ func TestBrowserOfferLatchUsesRouteDomainAndLandingEvidence(t *testing.T) {
 	} else if !latched {
 		t.Fatal("same-domain latch did not survive bridge restart")
 	}
+	// An operator redrive is a new attempt: the latch stays in history but no
+	// longer vetoes the restored route (measured 2026-09-23 on JMIR and ACS).
+	if err := jobs.RecordEvent(ctx, id, "job.retry_requested", map[string]any{"reason": "operator_redrive"}); err != nil {
+		t.Fatal(err)
+	}
+	if latched, err := b.browserOfferLatched(ctx, *row, action, "route:sage-doi-pdf", "journals.sagepub.com"); err != nil {
+		t.Fatal(err)
+	} else if latched {
+		t.Fatal("an operator redrive did not start a new attempt")
+	}
 
 	driftID := park(t, jobs, "wr_latch_global_host", handoffWork())
 	driftRow, err := jobs.Get(ctx, driftID)

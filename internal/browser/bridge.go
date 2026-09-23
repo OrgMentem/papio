@@ -12075,14 +12075,21 @@ func (b *Bridge) browserOfferLatched(
 	if domain == "" {
 		return false, nil
 	}
-	// An explicit adapter-upgrade retry starts a new institutional attempt.
 	// Preserve old latches in history, but apply only observations from this
-	// attempt when deciding whether the restored route may be offered.
+	// attempt when deciding whether the restored route may be offered. A
+	// retry that restores the institutional route starts a new attempt: an
+	// adapter-upgrade retry or an operator redrive. A publisher retry does
+	// not — it offers the DOI route and leaves the old route's latch in force
+	// (TestPublisherRetryDoesNotClearResolverLatch). Measured 2026-09-23: a
+	// JMIR and an ACS paper redriven by `papio jobs redrive` kept the drift
+	// latch from their first attempt, so no drive epoch was offered and the
+	// article agent reported its authority as stale before any decision.
 	start := 0
 	for i, event := range events {
 		if event["kind"] == "job.retry_requested" {
 			detail, _ := event["detail"].(map[string]any)
-			if stringDetail(detail, "reason") == "adapter_upgraded" {
+			switch stringDetail(detail, "reason") {
+			case "adapter_upgraded", "operator_redrive":
 				start = i + 1
 			}
 		}
