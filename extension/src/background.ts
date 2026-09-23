@@ -2639,10 +2639,18 @@ export async function executePlannedPageEffect(
         normalize(extracted) === entry.normalized
       );
     }
-    return (
-      extracted.trim().toLowerCase().replace(/\s+/g, " ") ===
-      requested.trim().toLowerCase().replace(/\s+/g, " ")
-    );
+    // Same normalization as plan.ts's normalizeTitle (this function is
+    // injected into the page, so it cannot import it): case, diacritics,
+    // dashes, punctuation and whitespace are typography, not identity. The
+    // plan already bound `requested` in that form; re-read the page the same
+    // way or an entitled ProQuest docview refuses its own plan here.
+    const normalizeTitle = (raw: string): string =>
+      raw.toLowerCase().normalize("NFD")
+        .replace(/\p{M}/gu, "")
+        .replace(/[\p{Pd}\u2212]+/gu, " ")
+        .replace(/[^\p{L}\p{N}\s]/gu, "")
+        .trim().replace(/\s+/g, " ");
+    return normalizeTitle(extracted) === normalizeTitle(requested);
   };
   const evidenceVerdict =
     plan.verdict.kind === "article" || plan.verdict.kind === "terms";
