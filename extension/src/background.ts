@@ -4619,17 +4619,15 @@ export class Bridge {
   }
 
   /** Detach a surface from automation without removing it: ceded permanently
-   * per the retained-forever contract, its pending tombstone and job binding
-   * cleared so nothing (a replay, a later reconcile pass) acts on it again.
+   * per the retained-forever contract, its pending tombstone cleared so
+   * nothing (a replay, a later reconcile pass) acts on it again. Keep the
+   * job identity only for a claim-owned surface: if the drive later detaches
+   * its tab, the operator's physical close must still retire the claim.
    * A no-op when the ledger no longer has a matching record for `tabID`, or
-   * when `bindingID` is given and the current record binds to a different
-   * one (the numeric id was reused under a stale record).
+   * when `bindingID` names a different binding.
    *
-   * `reason` is durable on purpose. A cede is terminal and it erases the job
-   * binding, so a record that reached this call cannot afterwards say which
-   * of the five call sites decided it - and attributing one live took two
-   * full observation rounds on 2026-08-26 without an answer. The value is a
-   * fixed call-site name, never page-derived text. */
+   * `reason` is durable so a later investigation can identify which call
+   * ceded the surface without inferring it from the page. */
   private async cedeOwnedTab(
     tabID: number,
     bindingID: string | undefined,
@@ -4648,7 +4646,7 @@ export class Bridge {
         ceded_reason: reason,
       };
       delete next.pending_close;
-      delete next.job_id;
+      if (next.claim === undefined) delete next.job_id;
       ledger[String(tabID)] = next;
       return { value: undefined, changed: true };
     });
@@ -22106,18 +22104,15 @@ export class Bridge {
     const durableClaim = ledgerRecord?.claim;
     const job = findByTab(this.store, tabID);
     if (!job) {
-      // job_inactive detaches browser-local job state BEFORE asking to close.
-      // The tab is gone now: this is the physical evidence owner_closed
-      // represents, so report it from the ledger identity instead of
-      // returning early. The reducer consumes the one-use token and retires
-      // the exact authentication-entry binding; releasing it at authorization
-      // time would let a sibling open before this surface actually closed.
-      // A claim_abandoned tombstone already has its owner_closed counterpart
-      // in the outbox; only the job_inactive tombstone (or no tombstone) needs
-      // this physical-loss report.
+      // job_inactive and the drive timeout can detach browser-local job state
+      // before the tab closes. Ceding a sign-in tab stops papio from closing
+      // it, but does not erase its claim ownership: the operator's physical
+      // close still retires that binding. A claim_abandoned tombstone already
+      // has its owner_closed counterpart in the outbox.
       if (
         pendingClose?.disposition !== "claim_abandoned" &&
-        ledgerRecord?.ceded !== true &&
+        !deliberate &&
+        ledgerRecord?.content !== true &&
         ledgerJobID !== undefined &&
         ownerBindingID !== undefined &&
         durableClaim !== undefined

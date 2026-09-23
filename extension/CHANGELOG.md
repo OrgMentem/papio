@@ -17,6 +17,9 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Fixed
+- **Closing an institutional sign-in tab releases its claim after a drive timeout.**
+  Bringing the tab forward no longer erases the claim identity needed to
+  report its later close, even when the timed-out job has detached from it.
 - **The article agent can use a new-window PDF link.** A same-origin PDF
   anchor with `target="_blank"` receives download intent instead of being
   refused as a new context; other targets stay refused.

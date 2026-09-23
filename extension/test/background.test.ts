@@ -4795,6 +4795,106 @@ test("a parked auth_pending claim closes from its birth record after worker rest
   ).toBe(false);
 });
 
+test("a timed-out institutional IdP tab reports owner_closed for its navigated binding", async () => {
+  const jobID = "job_claim_idp_timeout_close";
+  const candidateID = "cand_idp_timeout_close";
+  const bindingID = "bind_idp_timeout_close";
+  const claimID = "claim_idp_timeout_close";
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: [
+      "institutional_materialization_v1",
+      "effect_permit_v1",
+      AUTH_CLAIM,
+      "surface_close_v1",
+    ],
+    browser_holder_generation: 1,
+  }));
+  const framesBefore = h.port.posted.length;
+  await h.port.inbound(candidateOffer(jobID, candidateID));
+  const claim = await h.port.waitForFrame("institutional_claim_request", framesBefore);
+  const claimReply = institutionalClaimResponse(
+    jobID, candidateID, claimID, bindingID,
+  ) as { payload: Record<string, unknown> };
+  claimReply.payload["request_id"] = claim.payload["request_id"];
+  await h.port.inbound(claimReply);
+  const bind = await h.port.waitForFrame("institutional_bind_request", framesBefore);
+  const bindReply = institutionalBindResponse(
+    jobID, claimID, bindingID,
+  ) as { payload: Record<string, unknown> };
+  bindReply.payload["request_id"] = bind.payload["request_id"];
+  bindReply.payload["authentication_claim_id"] = "auth_claim_idp_timeout_close";
+  bindReply.payload["gate_occurrence_id"] = "occ_idp_timeout_close";
+  await h.port.inbound(bindReply);
+  const route = await h.port.waitForFrame("institutional_route_request", framesBefore);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_route_response",
+    msg_id: "route_response_idp_timeout_close",
+    job_id: jobID,
+    seq: 5,
+    payload: {
+      request_id: route.payload["request_id"],
+      outcome: "issued",
+      claim_id: claimID,
+      binding_id: bindingID,
+      route_issuance_ordinal: 1,
+      effect_ordinal: (route.payload["expected_effect_ordinal"] as number) + 1,
+      institutional_request_id: route.payload["institutional_request_id"],
+      url: `https://${PROVIDER_HOST}/article`,
+    },
+  });
+  const navigated = await h.port.waitForFrame("institutional_navigated_request", framesBefore);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_navigated_response",
+    msg_id: "navigated_response_idp_timeout_close",
+    job_id: jobID,
+    seq: 6,
+    payload: {
+      request_id: navigated.payload["request_id"],
+      outcome: "acknowledged",
+      claim_id: claimID,
+      binding_id: bindingID,
+    },
+  });
+  const tabID = h.backend.store.materializations?.[jobID]?.tab_id ?? -1;
+  expect(h.backend.store.materializations?.[jobID]?.phase).toBe("navigated");
+  expect(ledger.current()[String(tabID)]).toMatchObject({
+    binding_id: bindingID,
+    claim: { authentication_claim_id: "auth_claim_idp_timeout_close" },
+  });
+  const idpURL = "https://id.elsevier.com/as/authorization.oauth2?client_id=test";
+  await h.tabs.userNavigate(tabID, idpURL);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID)).toMatchObject({
+    tab_id: tabID,
+    status: "auth_pending",
+  });
+  // The operator brings the IdP tab forward to sign in. This cedes automatic
+  // closing but cannot erase the claim owner's identity on a later real close.
+  await h.tabs.userActivate(tabID);
+  const cededRecord = ledger.current()[String(tabID)] as SurfaceBirthRecord;
+  expect(cededRecord.ceded).toBe(true);
+  expect(cededRecord.job_id).toBe(jobID);
+  const timeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(timeout).toBeDefined();
+  h.clock.now += 180_000;
+  await timeout!.fn();
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id).toBe(-1);
+  expect(h.frames().filter((frame) => frame.type === "auth_pending")).toHaveLength(2);
+  expect(h.tabs.snapshot(tabID)?.url).toBe(idpURL);
+  const closeAt = h.port.posted.length;
+  await h.tabs.userClose(tabID);
+  const observations = h.frames().slice(closeAt).filter((frame) =>
+    frame.type === "claim_observation" && frame.payload["event_kind"] === "owner_closed"
+  );
+  expect(observations).toHaveLength(1);
+  expect(observations[0]?.payload["binding_id"]).toBe(bindingID);
+  expect(h.frames().slice(closeAt).some((frame) => frame.type === "auth_returned")).toBe(false);
+});
+
 // Live-smoke regression (2026-08-19): reproduced on the operator's own
 // browser. The grant that authorizes owner_closed is worker memory, and MV3
 // sleeps the worker after ~30s idle, so a sign-in tab abandoned minutes later
