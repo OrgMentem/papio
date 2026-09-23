@@ -116,7 +116,11 @@ notification and lock-screen settings.
 
 **Diagnostic captures.** Diagnostic captures are sanitized HTML from pages you
 choose to capture. They are stored in `<data_dir>/captures/<host>/` and may still
-contain article text, account labels, or other page content. Captures are retained
+contain article text, account labels, or other page content. Sanitization removes
+scripts, query strings, form values, token-shaped values, email addresses, and
+IPv4 and IPv6 addresses; some provider error pages print your IP address. A
+capture whose sidecar records `sanitizer_version` `1` predates the address rule
+and may still contain your IP address. Captures are retained
 for 14 days and up to 10 per host by default; both limits are configurable in
 `[captures]`. Run `papio adapter captures purge` to remove every capture, or
 `papio adapter captures purge --host <host>` to remove captures for one host.

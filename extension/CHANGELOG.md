@@ -33,6 +33,11 @@ for the full pre-split extension history.
   pinned or in front of you.
 
 ### Fixed
+- **Page captures no longer carry your IP address.** The capture sanitizer now
+  masks IPv4 and IPv6 addresses in page text and attribute values, and refuses
+  to send a capture if one is left. Elsevier's refusal page prints the reader's
+  address. DOIs, dates, clock times and versions such as `Chrome/153.0.0.0`
+  are kept.
 - **A provider that refuses the browser is no longer reported as adapter
   drift.** On 2026-09-23 ScienceDirect served Elsevier's "There was a problem
   providing the content you requested" page instead of four articles. papio

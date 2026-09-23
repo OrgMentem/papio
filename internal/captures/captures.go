@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"papio/internal/redact"
 )
 
 const (
@@ -35,8 +37,12 @@ const (
 	// SanitizerProvenance and SanitizerVersion are the only provenance values
 	// accepted for adapter repair. They describe the extension sanitizer whose
 	// canonical fixture header is checked before bytes enter this store.
+	// Version 2: IPv4 and IPv6 addresses are masked, by the extension sanitizer
+	// and again by this store (redact.IPAddresses), so a version 2 capture
+	// carries no address even from an older extension. A version 1 capture may
+	// still hold the operator's IP address.
 	SanitizerProvenance = "papio.extension.sanitizer"
-	SanitizerVersion    = "1"
+	SanitizerVersion    = "2"
 )
 
 var sanitizerFixtureHeader = regexp.MustCompile(`^<!-- papio-fixture provider="([^"]+)" scenario="([^"]+)" origin="([^"]+)" captured="([^"]+)" -->$`)
@@ -178,7 +184,7 @@ func (s *Store) StoreSanitized(ctx context.Context, host, scenario, adapterID, a
 	if !IsSanitizedFixture(html) {
 		return "", errors.New("refusing page capture without a canonical extension-sanitized fixture header")
 	}
-	return s.store(ctx, host, scenario, adapterID, adapterVersion, SanitizerProvenance, SanitizerVersion, "", html)
+	return s.store(ctx, host, scenario, adapterID, adapterVersion, SanitizerProvenance, SanitizerVersion, "", maskIPAddresses(html))
 }
 
 // StoreSanitizedPinned writes and pins a decisive capture before count pruning
@@ -188,7 +194,13 @@ func (s *Store) StoreSanitizedPinned(ctx context.Context, jobID, host, scenario,
 	if !IsSanitizedFixture(html) {
 		return "", errors.New("refusing page capture without a canonical extension-sanitized fixture header")
 	}
-	return s.store(ctx, host, scenario, adapterID, adapterVersion, SanitizerProvenance, SanitizerVersion, strings.TrimSpace(jobID), html)
+	return s.store(ctx, host, scenario, adapterID, adapterVersion, SanitizerProvenance, SanitizerVersion, strings.TrimSpace(jobID), maskIPAddresses(html))
+}
+
+// maskIPAddresses applies the version 2 address rule at the trusted ingress,
+// with the extension sanitizer's own placeholder.
+func maskIPAddresses(html []byte) []byte {
+	return []byte(redact.IPAddresses(string(html), "TOKEN"))
 }
 
 // ReleaseJob releases a pre-outcome capture lease. It is safe to call on

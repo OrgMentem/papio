@@ -165,7 +165,7 @@ func buildDiagnoseReport(detail api.JobDetail, ping daemonPingResult) diagnoseRe
 	seenHosts := make(map[string]struct{})
 	addHosts := func(value any) {
 		for _, raw := range diagnoseURLs(diagnoseDetail(value)) {
-			host := redact.Host(raw)
+			host := redact.IPAddresses(redact.Host(raw), "<ip-address>")
 			if _, seen := seenHosts[host]; seen {
 				continue
 			}
@@ -220,6 +220,9 @@ func diagnoseURLs(text string) []string {
 
 func scrubDiagnoseText(text string) string {
 	text = diagnoseURLRE.ReplaceAllStringFunc(text, redact.URL)
+	// A support report must never carry the reader's IP address: provider
+	// pages print it, and outcome details can quote them.
+	text = redact.IPAddresses(text, "<ip-address>")
 	return diagnosePathRE.ReplaceAllString(text, "<local-path>")
 }
 

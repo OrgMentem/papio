@@ -190,6 +190,47 @@ func TestStoreSanitizedRecordsHashAndProvenance(t *testing.T) {
 		t.Fatal("raw HTML was accepted through trusted ingress")
 	}
 }
+
+// An older extension sanitizer left the reader's IP address on Elsevier's
+// refusal page. The trusted ingress masks it anyway, so a version 2 capture
+// never carries one, and the stamp says which rule the bytes passed.
+func TestStoreSanitizedMasksIPAddressesAndStampsVersion2(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
+	header := "<!-- papio-fixture provider=\"sciencedirect\" scenario=\"drift\" origin=\"https://www.sciencedirect.com/science/article/pii/TOKEN\" captured=\"2026-09-23T13:29:45.752Z\" -->\n"
+	html := []byte(header + `<meta name="citation_doi" content="10.1016/j.chb.2016.04.041">` +
+		`<li><strong>IP Address: </strong>203.0.113.42</li><li>2001:db8::7334</li><li>Chrome/153.0.0.0</li>`)
+	for _, pinned := range []bool{false, true} {
+		var path string
+		var err error
+		if pinned {
+			path, err = store.StoreSanitizedPinned(ctx, "job-ip", "www.sciencedirect.com", "drift", "sciencedirect", "0.8.2", html)
+		} else {
+			path, err = store.StoreSanitized(ctx, "www.sciencedirect.com", "drift", "sciencedirect", "0.8.2", html)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := header + `<meta name="citation_doi" content="10.1016/j.chb.2016.04.041">` +
+			`<li><strong>IP Address: </strong>TOKEN</li><li>TOKEN</li><li>Chrome/153.0.0.0</li>`
+		if string(stored) != want {
+			t.Fatalf("pinned=%t stored bytes:\n got %q\nwant %q", pinned, stored, want)
+		}
+	}
+	rows, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.SanitizerVersion != "2" {
+			t.Fatalf("sanitizer_version = %q, want 2", row.SanitizerVersion)
+		}
+	}
+}
 func TestUpdateJobMarksOnlyDaemonCorrelatedEvidenceIndependent(t *testing.T) {
 	ctx := context.Background()
 	store := New(t.TempDir(), Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})

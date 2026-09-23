@@ -199,6 +199,36 @@ func TestAdapterDiagnoseRedactsURLsInBothOutputModes(t *testing.T) {
 	}
 }
 
+// Elsevier's refusal page prints the reader's IP address, and a provider
+// outcome detail can quote such a page. The support report must not carry it,
+// while a DOI and version strings stay readable. Documentation addresses.
+func TestAdapterDiagnoseReportMasksIPAddresses(t *testing.T) {
+	detail := diagnoseTestDetail()
+	detail.Events = append(detail.Events, map[string]any{
+		"at": "2026-09-23T13:29:45Z", "kind": "browser.provider_outcome",
+		"detail": map[string]any{
+			"detail":            "IP Address: 203.0.113.42 / 2001:db8::7334 for doi 10.1016/j.chb.2016.04.041",
+			"extension_version": "0.21.1",
+			"provider_url":      "https://198.51.100.7/support",
+		},
+	})
+	encoded, err := json.Marshal(buildDiagnoseReport(detail, daemonPingResult{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(encoded)
+	for _, address := range []string{"203.0.113.42", "2001:db8::7334", "198.51.100.7"} {
+		if strings.Contains(got, address) {
+			t.Fatalf("support report carries IP address %s: %s", address, got)
+		}
+	}
+	for _, keep := range []string{"10.1016/j.chb.2016.04.041", "0.21.1", "ip-address"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("support report lost %q: %s", keep, got)
+		}
+	}
+}
+
 func TestAdapterDiagnoseCommandIsReadOnly(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, _ any) error {

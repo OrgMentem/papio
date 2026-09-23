@@ -145,3 +145,28 @@ func TestHost(t *testing.T) {
 		})
 	}
 }
+
+// Elsevier's refusal page prints the reader's IP address beside its reference
+// number, so every capture of it carried the operator's address. The addresses
+// here are documentation ranges.
+func TestIPAddressesMasksAddressesButNotDOIsVersionsOrTimes(t *testing.T) {
+	blocked := `<li><strong>IP Address: </strong>203.0.113.42</li>` +
+		`<li>2001:db8:85a3::8a2e:370:7334 or 2001:0db8:0000:0000:0000:ff00:0042:8329, loopback ::1.</li>` +
+		`<a data-client="198.51.100.7" href="https://192.0.2.1/support">x</a>`
+	got := IPAddresses(blocked, "TOKEN")
+	for _, address := range []string{"203.0.113.42", "2001:db8:85a3::8a2e:370:7334", "2001:0db8:0000:0000:0000:ff00:0042:8329", "::1", "198.51.100.7", "192.0.2.1"} {
+		if strings.Contains(got, address) {
+			t.Fatalf("address %s survived: %q", address, got)
+		}
+	}
+	if !strings.Contains(got, "<strong>IP Address: </strong>TOKEN</li>") || !strings.Contains(got, `data-client="TOKEN"`) {
+		t.Fatalf("addresses not replaced in place: %q", got)
+	}
+	article := `<meta name="citation_doi" content="10.1016/j.chb.2016.04.041">` +
+		`<p>doi:10.1016/j.chb.2016.04.041 and 10.1000.10.1000/x</p>` +
+		`<p>Chrome/153.0.0.0 Safari/537.36; Version 4.2.1.0; v1.2.3.4; 1.2.3.4.5</p>` +
+		`<p>Published 2026.09.23 at 13:29:37 UTC; see section 3.1.2.1-a; li::before; ::TOKEN::</p>`
+	if got := IPAddresses(article, "TOKEN"); got != article {
+		t.Fatalf("non-address text changed:\n got %q\nwant %q", got, article)
+	}
+}

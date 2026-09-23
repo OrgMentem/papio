@@ -107,6 +107,40 @@ const EMPTIED_CONTENT = /(<(script|noscript|iframe|object|embed|style|textarea|s
  * and rejected by residualLeak if one survives. */
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 
+/** IP addresses identify the capturing browser: Elsevier's refusal page, for
+ * one, prints the operator's own address beside its reference number. They
+ * are never selector evidence. An IPv4 address is four dotted octets that are
+ * not part of a longer dotted run or a `name/version` pair, so a DOI
+ * (10.1016/j.x), a date, and a user-agent version (Chrome/153.0.0.0) are left
+ * alone while a URL host (https://192.0.2.1/) is not. An IPv6 address needs
+ * eight groups or a `::`, so a clock time (13:29:37) is left alone too.
+ * internal/redact.IPAddresses applies the same rules in the daemon. */
+const IPV4_RE =
+  /(?<![A-Za-z0-9_.-])(?<![A-Za-z0-9_.-]\/)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![A-Za-z0-9_-]|\.\d)/g;
+const IPV6_RE =
+  /(?<![A-Za-z0-9_:.])(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?)(?![A-Za-z0-9_:])/g;
+/** A four-part number a page labels as a version is not an address. */
+const VERSION_LABEL_RE = /\b(?:version|release|build|v)\s*:?\s*$/i;
+
+function scrubIPAddresses(text: string): string {
+  return text
+    .replace(IPV4_RE, (address, offset: number, whole: string) =>
+      VERSION_LABEL_RE.test(whole.slice(Math.max(0, offset - 16), offset)) ? address : "TOKEN",
+    )
+    .replace(IPV6_RE, (address) => (address === "::" ? address : "TOKEN"));
+}
+
+/** Whether an IP address is left in `text`. */
+function containsIPAddress(text: string): boolean {
+  for (const match of text.matchAll(new RegExp(IPV4_RE.source, "g"))) {
+    if (!VERSION_LABEL_RE.test(text.slice(Math.max(0, match.index - 16), match.index))) return true;
+  }
+  for (const match of text.matchAll(new RegExp(IPV6_RE.source, "g"))) {
+    if (match[0] !== "::") return true;
+  }
+  return false;
+}
+
 /** URL-bearing attributes: query string and fragment are removed from each.
  * Beyond the fixed names, any attribute whose (dash/underscore-insensitive)
  * name ends in url/uri/href/src/link is URL-valued — providers ship
@@ -161,9 +195,10 @@ const STRUCTURAL_ATTRS: Record<string, true> = {
   "data-qa": true,
 };
 
-/** Replace every token-shaped run and email address with the literal `TOKEN`. */
+/** Replace every token-shaped run, email address, and IP address with the
+ * literal `TOKEN`. */
 function scrubTokens(text: string): string {
-  return text.replace(EMAIL_RE, "TOKEN").replace(TOKEN_RE, "TOKEN");
+  return scrubIPAddresses(text).replace(EMAIL_RE, "TOKEN").replace(TOKEN_RE, "TOKEN");
 }
 
 function isSemanticSelectorToken(token: string): boolean {
@@ -306,7 +341,7 @@ function rewriteStartTag(raw: string): string {
       } else {
         value = STRUCTURAL_ATTRS[lname] ? scrubSelectorTokens(value) : scrubTokens(value);
       }
-      value = value.replace(EMAIL_RE, "TOKEN");
+      value = scrubIPAddresses(value.replace(EMAIL_RE, "TOKEN"));
     }
 
     rendered.push(`${a.name}="${value}"`);
@@ -383,6 +418,8 @@ export function fixtureHeader(meta: SanitizedFixtureMeta): string {
 export function residualLeak(sanitized: string): string | null {
   const email = new RegExp(EMAIL_RE.source).exec(sanitized);
   if (email) return `an email address survived sanitization (${email[0].slice(0, 8)}…)`;
+  // Never echo the address itself: this message reaches logs.
+  if (containsIPAddress(sanitized)) return "an IP address survived sanitization";
 
   const residual = (value: string, allowSemanticSelector = false): string | undefined => {
     for (const match of value.matchAll(new RegExp(TOKEN_RE.source, "g"))) {

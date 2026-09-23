@@ -11,6 +11,14 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Fixed
+- **Diagnostic captures and support reports no longer carry your IP address.**
+  Elsevier's refusal page prints the reader's IP address, and every capture of
+  it kept that address. The capture store now masks IPv4 and IPv6 addresses
+  before it writes a capture, even one from an older extension, and records
+  `sanitizer_version` `2`. `papio adapter diagnose` masks them too. DOIs,
+  dates, clock times and software versions such as `Chrome/153.0.0.0` are
+  kept. `papio adapter repair` accepts only version 2 captures, so capture a
+  page again to repair from it; version 1 captures may still hold an address.
 - **A provider refusal page no longer latches adapter drift or parks the
   paper.** When the extension reports a provider block (`rate_limited`), the
   daemon releases the drive's binding, closes the handoff, and puts the job in

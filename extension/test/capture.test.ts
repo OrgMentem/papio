@@ -397,3 +397,41 @@ test("capture rejects an encoded-frame oversize document without sending", async
   if (!result.ok) expect(result.error).toContain(`${MAX_CAPTURE_FRAME_BYTES}-byte native frame cap`);
   expect(sent).toHaveLength(0);
 });
+
+// Elsevier's refusal page (fixtures/sciencedirect/blocked.html) prints the
+// capturing browser's IP address in its support details, so every raw capture
+// of it carried the operator's address. Addresses here are documentation ranges.
+test("IPv4 and IPv6 addresses are masked in text and attribute values", () => {
+  const out = sanitizeFixture(
+    `<main class="error-card"><h1>There was a problem providing the content you requested</h1><ul>` +
+      `<li><strong>Reference number: </strong>0000000000000000</li>` +
+      `<li><strong>IP Address: </strong>203.0.113.42</li>` +
+      `<li><strong>IP Address: </strong>2001:db8:85a3::8a2e:370:7334</li>` +
+      `<li>Full form 2001:0db8:0000:0000:0000:ff00:0042:8329 and loopback ::1.</li></ul>` +
+      `<a data-client="198.51.100.7" href="https://192.0.2.1/support">support</a></main>`,
+    META,
+  );
+  for (const address of ["203.0.113.42", "2001:db8:85a3::8a2e:370:7334", "2001:0db8:0000:0000:0000:ff00:0042:8329", "::1", "198.51.100.7", "192.0.2.1"])
+    expect(out).not.toContain(address);
+  expect(out).toContain("<strong>IP Address: </strong>TOKEN</li>");
+  expect(out).toContain('data-client="TOKEN"');
+  expect(out).toContain("There was a problem providing the content you requested");
+  expect(residualLeak(out)).toBeNull();
+});
+
+test("DOIs, versions, dates, and clock times are not mistaken for IP addresses", () => {
+  const page =
+    `<meta name="citation_doi" content="10.1016/j.chb.2016.04.041">` +
+    `<p>doi:10.1016/j.chb.2016.04.041 and 10.1000.10.1000/x</p>` +
+    `<p>Chrome/153.0.0.0 Safari/537.36; Version 4.2.1.0; v1.2.3.4; 1.2.3.4.5</p>` +
+    `<p>Published 2026.09.23 at 13:29:37 UTC; see section 3.1.2.1-a; li::before</p>`;
+  const out = sanitizeFixture(page, META);
+  expect(out.slice(out.indexOf("\n") + 1)).toBe(page);
+  expect(residualLeak(out)).toBeNull();
+});
+
+test("residualLeak refuses a capture that still carries an IP address", () => {
+  const header = sanitizeFixture("", META);
+  expect(residualLeak(`${header}<p>IP Address: 203.0.113.42</p>`)).toBe("an IP address survived sanitization");
+  expect(residualLeak(`${header}<p data-ip="2001:db8::1"></p>`)).toBe("an IP address survived sanitization");
+});
