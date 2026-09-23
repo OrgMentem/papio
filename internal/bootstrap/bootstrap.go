@@ -28,6 +28,7 @@ import (
 	"papio/internal/discovery"
 	"papio/internal/doctor"
 	"papio/internal/doiregistry"
+	"papio/internal/drive"
 	"papio/internal/enrich"
 	"papio/internal/fetch"
 	"papio/internal/hook"
@@ -92,6 +93,9 @@ type System struct {
 	Updates     *update.Checker
 	Retractions *retraction.Sentinel
 	Triage      *triage.Service
+	// Drive is the paced drive; it runs as a maintenance runner and serves
+	// drive.status / drive.pause / drive.resume.
+	Drive *drive.Pacer
 }
 
 const autoImportRetryBackoff = 2 * time.Second
@@ -352,6 +356,16 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 			}
 			return status == "open", nil
 		}
+		if strings.HasPrefix(aggregate, "drive:paused:") {
+			// The paced drive's sign-in notice is stale once the drive has
+			// resumed; a notice held through quiet hours must not arrive
+			// after the person already signed in.
+			paused, err := drive.Paused(ctx, jobs)
+			if err != nil {
+				return true, nil
+			}
+			return paused, nil
+		}
 		if strings.HasPrefix(aggregate, "decision:") || strings.HasPrefix(aggregate, "actions:") {
 			var count int
 			err := dbh.QueryRowContext(ctx, `SELECT COUNT(*) FROM human_actions WHERE status='open'`).Scan(&count)
@@ -517,7 +531,10 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if retractions != nil {
 		triageService.RegisterSource(retractions)
 	}
-	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.UnavailableRechecker(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), retractions, router}
+	// The paced drive (ADR-0009, amended 2026-09-23). It opens nothing unless
+	// [drive] enabled = true; Browser is attached once the bridge exists below.
+	pacer := &drive.Pacer{Jobs: jobs, Config: cfg, Notifier: router}
+	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.UnavailableRechecker(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), pacer, retractions, router}
 	if reconciler := zotioService.TagReconciler(); reconciler != nil {
 		maintenance = append(maintenance, reconciler)
 	}
@@ -547,6 +564,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	// capability. Saving an already-loaded PDF needs no inference credential.
 	bridge.SetNativeViewerDriver(nativeviewer.NewDriver(cfg.Browser.NativeViewerHelper))
 	router.SetPresence(bridge.PresenceProvider())
+	pacer.Browser = bridge
 
 	pulseService := &pulse.Service{
 		Jobs: jobs, Cohorts: batch.New(db), EffectLimit: 1, Now: time.Now,
@@ -557,6 +575,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		App: service, Notify: router, Pulse: pulseService, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
 		Bundle:        bundleExporter,
 		Browser:       bridge,
+		Drive:         pacer,
 		Preview:       previewServer,
 		Discovery:     discoveryClient,
 		Zotio:         zotioService,

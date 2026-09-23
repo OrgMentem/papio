@@ -493,6 +493,54 @@ action — so reusing it as a staleness threshold would report a handoff queued
 over lunch as abandoned. This one answers "has anyone given up on this?", which
 is measured in days.
 
+## `[drive]`
+
+The paced drive opens parked handoffs for you, one paper at a time, oldest
+first, through the same path `papio actions open` uses. The extension's own
+handoff settings still decide where the tab opens (the work window or
+*papio*'s tab group). The drive never accepts terms, never submits a delivery
+request, and never resolves an identity review. It only puts the handoff on
+screen, as an operator's open would.
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Turns the paced drive on. Off unless set: opening human work with nobody asking is an operator's decision for one machine. |
+| `max_opens_per_hour` | integer | `10` | Maximum paced opens in a rolling hour. `0` selects the default. Must be in `0..60`. |
+| `job_backoff_hours` | integer hours | `6` | How long the drive leaves a paper it opened before it may open that paper again, whatever the result was. `0` selects the default. Must be in `0..168`. |
+| `sign_in_wait_minutes` | integer minutes | `10` | How long an open institutional sign-in, MFA prompt or security check may wait for its return. After that the drive pauses and sends one `decision_opened` notification; it resumes by itself when the sign-in returns. `0` selects the default. Must be in `0..1440`. |
+| `settle_minutes` | integer minutes | `30` | How long one paced open counts as in flight when the browser reports nothing about it. `0` selects the default. Must be in `0..1440`. |
+
+The drive opens nothing while any of these holds, and `papio drive status`
+names each one as a blocker:
+
+- it is disabled, or paused by `papio drive pause` or by a sign-in that waited
+  longer than `sign_in_wait_minutes`;
+- the time is inside `notify.quiet_hours`;
+- no browser holds the *papio* session;
+- the hourly bound is spent;
+- its previous open is still in flight;
+- any browser claim or effect permit is live, including one an operator started;
+- a sign-in is open and still inside its wait;
+- no parked job is eligible.
+
+Eligible jobs are those awaiting a person on one open `openurl_handoff`, and
+those on one open `manual_download` that `papio jobs redrive` would accept; the
+drive redrives such a job through the same store function first. It never opens
+an `openurl_available` advisory, because that link opens outside *papio*'s
+window. It skips a job it opened within `job_backoff_hours`, and every job
+behind a provider host that is refusing this browser: a host in a
+`browser.provider_cooldown`, or a job with a Cloudflare-style challenge in the
+last 10 minutes. The skip covers the papers that went to that host and every
+paper under the same DOI prefix.
+
+Every paced open records `drive.paced_open` on the job and `handoff.opened` with
+principal `pacer`. Pauses and resumes are the system events `drive.paused` and
+`drive.resumed`.
+
+This section is strict-mode configuration. Deploy the binary that understands
+it together with the configuration change; an older daemon rejects the whole
+file when `[drive]` is present.
+
 ## `[sources.<name>]`
 
 `[sources]` is a map of resolver policies. Its keys are whitelisted

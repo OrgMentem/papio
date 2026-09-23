@@ -124,6 +124,21 @@ execution records kept during the initial build.
   a fresh occurrence.
 
 ### Added
+- **The paced drive works through parked handoffs without you.** With
+  `[drive] enabled = true` (off by default), the daemon opens one parked
+  handoff at a time, oldest first, through the same path as `papio actions
+  open`, and records `drive.paced_open` plus `handoff.opened` with principal
+  `pacer`. It opens at most 10 papers an hour, leaves a paper alone for 6
+  hours after it opens it, and waits while a claim, effect permit or sign-in
+  is live, while no browser holds the session, during `notify.quiet_hours`,
+  and for any provider host in cooldown (every paper under that DOI prefix).
+  A manual download is redriven first when `papio jobs redrive` would accept
+  it; an `openurl_available` advisory is never opened. A sign-in nobody
+  completes within 10 minutes pauses the drive and sends one notification; it
+  resumes when the sign-in returns. `papio drive status` shows what it would
+  do and what blocks it; `papio drive pause` and `papio drive resume` hold it.
+  The drive never accepts terms, submits a delivery request or resolves an
+  identity review. ADR-0009 records the operator decision that permits it.
 - **Every acquired artifact now records who produced it.** Each promotion to
   `ready` writes one `artifact.producer` event: `adapter`, `agent`,
   `native_viewer`, `daemon_fetch`, `manual` or `unknown`, with the adapter or

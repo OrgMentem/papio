@@ -236,6 +236,38 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 	}
 }
 
+// The paced drive ranks manual downloads by asking whether a redrive would be
+// accepted. The check must agree with the verb and must change nothing: a
+// status read that replaced the operator's manual download would be a redrive
+// nobody asked for.
+func TestCheckRedriveAgreesWithRedriveAndChangesNothing(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, action := redriveJob(t, js)
+	if err := js.CheckRedriveInstitutionalHandoff(ctx, id, 2, redriveRoute, redriveOAHandoff); !errors.Is(err, ErrConflict) {
+		t.Fatalf("check with a stale revision = %v, want conflict", err)
+	}
+	if err := js.CheckRedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff); err != nil {
+		t.Fatalf("check on a redrivable park = %v", err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].ID != action || open[0].Kind != "manual_download" {
+		t.Fatalf("open actions after the check = %+v err=%v, want the manual download untouched", open, err)
+	}
+	events, err := js.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == "job.retry_requested" {
+			t.Fatalf("the check recorded a redrive: %+v", event)
+		}
+	}
+	if _, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, false, "institutional handoff detail"); err != nil {
+		t.Fatalf("redrive after a passing check = %v", err)
+	}
+}
+
 func TestRedriveResolvedParkAndFreshOutcome(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)

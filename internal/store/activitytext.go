@@ -88,6 +88,20 @@ func ActivityText(kind string, detail map[string]any) string {
 		return "Handoff re-offered (institution session live)"
 	case "browser.surface_closed":
 		return "Access tab closed — this paper waits for another attempt"
+	case "drive.paced_open":
+		return "Opened by the paced drive"
+	case "drive.open_declined":
+		if reason := strings.ReplaceAll(activityDetailString(detail, "reason"), "_", " "); reason != "" {
+			return clampActivityText(fmt.Sprintf("Paced open not taken (%s)", reason))
+		}
+		return "Paced open not taken"
+	case "drive.paused":
+		if activityDetailString(detail, "reason") == "sign_in_needed" {
+			return "Paced drive paused — a sign-in is waiting for you"
+		}
+		return "Paced drive paused"
+	case "drive.resumed":
+		return "Paced drive resumed"
 	case "job.transition":
 		to := strings.ReplaceAll(activityDetailString(detail, "to"), "_", " ")
 		if to == "" {

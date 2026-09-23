@@ -1064,7 +1064,10 @@ func (b *Bridge) recoverMaterializationFocus(ctx context.Context) error {
 }
 
 // explicitOpenPending compares event sequence, not timestamps. An offer or
-// either claim outcome closes every earlier open; a later CLI open restores it.
+// either claim outcome closes every earlier open; a later explicit open
+// restores it. Explicit means the operator's CLI or the operator-authorized
+// paced drive (ADR-0009, amended 2026-09-23): a restart must not drop the
+// paper either one is waiting on.
 func explicitOpenPending(events []map[string]any) (pending, opened bool) {
 	consumed := false
 	for i := len(events) - 1; i >= 0; i-- {
@@ -1073,7 +1076,7 @@ func explicitOpenPending(events []map[string]any) (pending, opened bool) {
 			consumed = true
 		case "handoff.opened":
 			detail, _ := events[i]["detail"].(map[string]any)
-			if detail["principal"] == "cli" {
+			if principal := detail["principal"]; principal == "cli" || principal == job.PacerPrincipal {
 				return !consumed, true
 			}
 			return false, true

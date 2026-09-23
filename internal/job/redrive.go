@@ -41,6 +41,23 @@ import (
 func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
 	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, adoptedFileGone bool,
 	handoffDetail string) (int64, error) {
+	return js.redriveInstitutionalHandoff(ctx, jobID, revision, openURLBaseFor, oaHandoff, adoptedFileGone, handoffDetail, true)
+}
+
+// CheckRedriveInstitutionalHandoff answers whether RedriveInstitutionalHandoff
+// would accept the same request, without changing anything: it runs the very
+// same preconditions inside a transaction it always rolls back. The paced
+// drive uses it to rank a manual download without replacing it, so its status
+// view never mutates and its eligibility can never drift from the verb's.
+func (js *Store) CheckRedriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
+	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool) error {
+	_, err := js.redriveInstitutionalHandoff(ctx, jobID, revision, openURLBaseFor, oaHandoff, false, "", false)
+	return err
+}
+
+func (js *Store) redriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
+	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, adoptedFileGone bool,
+	handoffDetail string, apply bool) (int64, error) {
 	if strings.TrimSpace(jobID) == "" || revision < 0 {
 		return 0, errors.New("job_id and non-negative revision are required")
 	}
@@ -158,6 +175,9 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 		if err != nil {
 			return 0, err
 		}
+	}
+	if !apply {
+		return 0, nil
 	}
 	if rejected || unquarantined {
 		res, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, terminal_reason=NULL, updated_at=?,

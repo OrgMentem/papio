@@ -98,6 +98,7 @@ func newRoot(opt *options) *cobra.Command {
 		newBenchCommand(opt),
 		newStatsCommand(opt),
 		newActionsCommand(opt),
+		newDriveCommand(opt),
 		newBrowserCommand(opt),
 		newInboxCommand(opt),
 		newArtifactsCommand(opt),

@@ -3122,6 +3122,27 @@ func TestExplicitOpenWithoutHolderRecoversCandidateOnFirstSync(t *testing.T) {
 	}
 }
 
+// The paced drive's open is an explicit open too (ADR-0009, amended
+// 2026-09-23): a daemon restart between the pacer's open and the browser's
+// answer must not drop the paper the pacer is waiting on.
+func TestPacedOpenRecoversAfterDaemonRestart(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := parkInstitutional(t, jobs, "durable-paced-open", handoffWork(), "")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{id}); err != nil || live || queued != 0 {
+		t.Fatalf("offline open = queued %d live %v err %v", queued, live, err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "handoff.opened", map[string]any{"principal": job.PacerPrincipal}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+	msgs, _ := runSync(t, fresh, materializationHello(t))
+	offer := firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer)
+	if offer == nil || offer.JobID != id {
+		t.Fatalf("paced open was not offered after a restart: %v", msgs)
+	}
+}
+
 func TestInstitutionalCandidateOfferRecoversAfterHolderRestart(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	ctx := context.Background()

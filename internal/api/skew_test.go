@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"papio/internal/config"
+	"papio/internal/drive"
 	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
@@ -418,9 +419,9 @@ func TestUnattributedJobOmitsTheConsumerKey(t *testing.T) {
 // so "consumer X opened N human actions in M minutes" has to be answerable from
 // the event stream.
 //
-// It exercises recordHandoffOpened directly: system.Browser is a concrete
+// It exercises drive.RecordHandoffOpened directly: system.Browser is a concrete
 // *browser.Bridge, nil under test, so openActions returns before reaching the
-// audit write. openActions calls this helper only after FocusHandoffs succeeds —
+// audit write. drive.OpenHandoffs calls it only after FocusHandoffs succeeds —
 // papio does not claim to have opened a tab it failed to open.
 func TestHandoffOpenAuditTrailNamesTheConsumer(t *testing.T) {
 	system := testSystem(t)
@@ -429,7 +430,7 @@ func TestHandoffOpenAuditTrailNamesTheConsumer(t *testing.T) {
 	attributed := attributedJob(t, router, "wr_audit_owned", "10.1000/audit-owned", "inscribi:project:psyc101")
 	bare := attributedJob(t, router, "wr_audit_bare", "10.1000/audit-bare", "")
 
-	recordHandoffOpened(ctx, system, []string{attributed, bare})
+	drive.RecordHandoffOpened(ctx, system.Jobs, []string{attributed, bare}, job.PrincipalCLI)
 
 	events, err := system.Jobs.Events(ctx, attributed)
 	if err != nil {
@@ -437,12 +438,12 @@ func TestHandoffOpenAuditTrailNamesTheConsumer(t *testing.T) {
 	}
 	var opened map[string]any
 	for _, event := range events {
-		if event["kind"] == handoffOpenedEvent {
+		if event["kind"] == drive.HandoffOpenedEvent {
 			opened = event
 		}
 	}
 	if opened == nil {
-		t.Fatalf("no %s event recorded; the drain prohibition would be neither enforced nor observable", handoffOpenedEvent)
+		t.Fatalf("no %s event recorded; the drain prohibition would be neither enforced nor observable", drive.HandoffOpenedEvent)
 	}
 	detail, ok := opened["detail"].(map[string]any)
 	if !ok {
@@ -469,7 +470,7 @@ func TestHandoffOpenAuditTrailNamesTheConsumer(t *testing.T) {
 	}
 	var bareOpened map[string]any
 	for _, event := range bareEvents {
-		if event["kind"] == handoffOpenedEvent {
+		if event["kind"] == drive.HandoffOpenedEvent {
 			bareOpened = event
 		}
 	}

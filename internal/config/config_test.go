@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/routes"
 
@@ -1367,5 +1368,40 @@ func TestTimeoutFieldsRejectAboveCeiling(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The paced drive opens human work with nobody asking, so an install that
+// never mentions [drive] must not get it, and a config that only switches it
+// on must get the documented pacing rather than zero (which would read as
+// "unlimited" to a careless consumer).
+func TestDriveIsOffByDefaultAndPacedWhenEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode = \"delegated\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Drive.Enabled {
+		t.Fatal("drive is enabled on a config that never mentions it")
+	}
+	if err := os.WriteFile(path, []byte("access_mode = \"delegated\"\n[drive]\nenabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Drive.Enabled || cfg.Drive.EffectiveMaxOpensPerHour() != 10 || cfg.Drive.EffectiveJobBackoff() != 6*time.Hour ||
+		cfg.Drive.EffectiveSignInWait() != 10*time.Minute || cfg.Drive.EffectiveSettle() != 30*time.Minute {
+		t.Fatalf("enabled drive = %+v, want the documented defaults", cfg.Drive)
+	}
+	if err := os.WriteFile(path, []byte("access_mode = \"delegated\"\n[drive]\nenabled = true\nmax_opens_per_hour = 61\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "drive.max_opens_per_hour must be in 0..60") {
+		t.Fatalf("Load with 61 opens an hour = %v, want the bound", err)
 	}
 }

@@ -629,6 +629,93 @@ func (a Actions) EffectiveActionStaleAfter() time.Duration {
 	return time.Duration(a.StaleAfterSeconds) * time.Second
 }
 
+// Drive configures the paced drive: a daemon maintenance pass that opens the
+// parked handoff backlog one paper at a time, through the same server path
+// `papio actions open` uses, so the backlog moves without an operator at the
+// keyboard. It is off by default: opening human work without a person asking
+// is the autonomous drain ADR-0009 refused until the operator decision of
+// 2026-09-23, and that decision authorizes it per machine, not per install.
+//
+// Every duration field reads 0 as "use the default", like
+// actions.stale_after_seconds, so a config that only sets `enabled = true`
+// gets the safe pacing.
+type Drive struct {
+	// Enabled turns the pacer on. Default false.
+	Enabled bool `toml:"enabled"`
+	// MaxOpensPerHour caps paced opens in any rolling hour.
+	MaxOpensPerHour int `toml:"max_opens_per_hour,omitempty"`
+	// JobBackoffHours is how long the pacer leaves a paper it opened alone,
+	// whatever happened to it.
+	JobBackoffHours int `toml:"job_backoff_hours,omitempty"`
+	// SignInWaitMinutes is how long an open institutional sign-in, MFA or
+	// security check may wait for its return before the pacer pauses and
+	// asks for a person.
+	SignInWaitMinutes int `toml:"sign_in_wait_minutes,omitempty"`
+	// SettleMinutes bounds how long one paced open counts as in flight when
+	// the browser reports nothing about it.
+	SettleMinutes int `toml:"settle_minutes,omitempty"`
+}
+
+// The paced drive's defaults. Ten opens an hour is one paper every six
+// minutes at most, which is slower than an operator batch and far slower
+// than any provider's documented page rate.
+const (
+	DefaultDriveMaxOpensPerHour   = 10
+	DefaultDriveJobBackoffHours   = 6
+	DefaultDriveSignInWaitMinutes = 10
+	DefaultDriveSettleMinutes     = 30
+)
+
+// EffectiveMaxOpensPerHour resolves drive.max_opens_per_hour.
+func (d Drive) EffectiveMaxOpensPerHour() int {
+	if d.MaxOpensPerHour <= 0 {
+		return DefaultDriveMaxOpensPerHour
+	}
+	return d.MaxOpensPerHour
+}
+
+// EffectiveJobBackoff resolves drive.job_backoff_hours.
+func (d Drive) EffectiveJobBackoff() time.Duration {
+	if d.JobBackoffHours <= 0 {
+		return DefaultDriveJobBackoffHours * time.Hour
+	}
+	return time.Duration(d.JobBackoffHours) * time.Hour
+}
+
+// EffectiveSignInWait resolves drive.sign_in_wait_minutes.
+func (d Drive) EffectiveSignInWait() time.Duration {
+	if d.SignInWaitMinutes <= 0 {
+		return DefaultDriveSignInWaitMinutes * time.Minute
+	}
+	return time.Duration(d.SignInWaitMinutes) * time.Minute
+}
+
+// EffectiveSettle resolves drive.settle_minutes.
+func (d Drive) EffectiveSettle() time.Duration {
+	if d.SettleMinutes <= 0 {
+		return DefaultDriveSettleMinutes * time.Minute
+	}
+	return time.Duration(d.SettleMinutes) * time.Minute
+}
+
+func (d Drive) validate() error {
+	for _, field := range []struct {
+		name     string
+		value    int
+		maxValue int
+	}{
+		{"drive.max_opens_per_hour", d.MaxOpensPerHour, 60},
+		{"drive.job_backoff_hours", d.JobBackoffHours, 168},
+		{"drive.sign_in_wait_minutes", d.SignInWaitMinutes, 1440},
+		{"drive.settle_minutes", d.SettleMinutes, 1440},
+	} {
+		if field.value < 0 || field.value > field.maxValue {
+			return fmt.Errorf("%s must be in 0..%d", field.name, field.maxValue)
+		}
+	}
+	return nil
+}
+
 // Agent enrolls this profile in optional acquisition decisions. Credentials
 // remain in the OS credential store, never in this configuration.
 type Agent struct {
@@ -653,6 +740,7 @@ type Config struct {
 	Updates    Updates           `toml:"updates"`
 	Discovery  Discovery         `toml:"discovery"`
 	Actions    Actions           `toml:"actions"`
+	Drive      Drive             `toml:"drive"`
 	Agent      *Agent            `toml:"agent,omitempty"`
 	Sources    map[string]Source `toml:"sources"`
 
@@ -730,6 +818,7 @@ func Default() Config {
 		Browser:    Browser{DirectRoutesEnabled: true, ActionExpirySeconds: 1800},
 		Captures:   Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
 		Actions:    Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
+		Drive:      Drive{MaxOpensPerHour: DefaultDriveMaxOpensPerHour, JobBackoffHours: DefaultDriveJobBackoffHours, SignInWaitMinutes: DefaultDriveSignInWaitMinutes, SettleMinutes: DefaultDriveSettleMinutes},
 		Zotio:      Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
 		Retraction: Retraction{Scope: RetractionScopeAcquired},
 		Notify: Notify{
@@ -983,6 +1072,9 @@ func (c *Config) validate() error {
 	}
 	if c.Actions.StaleAfterSeconds < 0 || c.Actions.StaleAfterSeconds > 365*24*60*60 {
 		return fmt.Errorf("actions.stale_after_seconds must be in 0..31536000")
+	}
+	if err := c.Drive.validate(); err != nil {
+		return err
 	}
 	if c.Captures.MaxPerHost < 1 || c.Captures.MaxPerHost > 1000 {
 		return fmt.Errorf("captures.max_per_host must be in 1..1000")

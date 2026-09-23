@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"papio/internal/bootstrap"
+	"papio/internal/drive"
 	"papio/internal/ipc"
 )
 
@@ -25,6 +26,6 @@ func retryPublisher(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	if err != nil {
 		return failure(err)
 	}
-	recordHandoffOpened(ctx, system, []string{id})
+	drive.RecordHandoffOpened(ctx, system.Jobs, []string{id}, PrincipalFrom(ctx))
 	return marshal(SubmitResult{JobID: id})
 }

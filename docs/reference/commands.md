@@ -654,6 +654,44 @@ Check acquisition readiness and local integrations
 papio doctor
 ```
 
+## `papio drive`
+
+Inspect and pause the paced drive of parked handoffs
+
+The paced drive opens parked handoffs for you, one at a time, oldest first,
+through the same path as 'papio actions open'. It is off unless [drive]
+enabled = true in the config, and it waits whenever the browser is busy,
+a sign-in is open, a provider is refusing this browser, or the hourly
+bound is spent. A sign-in nobody completes pauses it and notifies you.
+
+```
+papio drive
+```
+
+### `papio drive pause`
+
+Stop paced opens until 'papio drive resume'
+
+```
+papio drive pause
+```
+
+### `papio drive resume`
+
+Let the paced drive open handoffs again
+
+```
+papio drive resume
+```
+
+### `papio drive status`
+
+Show whether the paced drive would open a handoff, and what blocks it
+
+```
+papio drive status
+```
+
 ## `papio export`
 
 Export normalized citation records (CSL-JSON, RIS, BibTeX)
