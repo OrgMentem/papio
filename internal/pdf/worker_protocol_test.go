@@ -3,10 +3,125 @@ package pdf
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+const cryptFilterReason = "pdfcpu inspection: Invalid filter: <Crypt>"
+
+func TestCryptFilterFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		reason      string
+		jsOutput    string
+		infoWarning bool
+		attachment  string
+		wantValid   bool
+	}{
+		{name: "identity filter without active content", attachment: "0 embedded files", wantValid: true},
+		{name: "lowercase parser wording", reason: "pdfcpu inspection: info: prepare PDF context: invalid filter: <Crypt>", attachment: "0 embedded files", wantValid: true},
+		{name: "pdfinfo warns about identity filter", infoWarning: true, attachment: "0 embedded files", wantValid: true},
+		{name: "embedded file", attachment: "1 embedded files"},
+		{name: "JavaScript", jsOutput: "name: script", attachment: "0 embedded files"},
+		{name: "JavaScript output is not empty", jsOutput: " ", attachment: "0 embedded files"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := tc.reason
+			if reason == "" {
+				reason = cryptFilterReason
+			}
+			worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":false,"Reason":"`+reason+`"}'`)
+			warning := ""
+			if tc.infoWarning {
+				warning = `printf 'Syntax Error: identity stream\n' >&2;`
+			}
+			pdfinfo := fakeTool(t, `if [ "$1" = "-js" ]; then printf '%s' '`+tc.jsOutput+`'; else `+warning+` printf 'Pages: 10\nEncrypted: no\n'; fi`)
+			pdfdetach := fakeTool(t, `printf '%s\n' '`+tc.attachment+`'`)
+			report, err := ValidateStructural(t.Context(), worker, writeTempPDF(t), StructuralOptions{
+				PDFInfoPath: pdfinfo, PDFDetachPath: pdfdetach,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Valid != tc.wantValid {
+				t.Fatalf("report=%+v, want valid=%v", report, tc.wantValid)
+			}
+			if tc.wantValid {
+				if report.Pages != 10 || report.Encrypted || report.HasJavaScript || report.HasEmbeddedFiles || report.Reason != "" {
+					t.Fatalf("fallback report=%+v", report)
+				}
+			} else if report.Reason != reason {
+				t.Fatalf("report=%+v, want unchanged pdfcpu rejection", report)
+			}
+		})
+	}
+}
+
+func TestCryptFilterFallbackDoesNotRunForOtherErrors(t *testing.T) {
+	const reason = "pdfcpu inspection: malformed xref"
+	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":false,"Reason":"`+reason+`"}'`)
+	marker := t.TempDir() + "/invoked"
+	unwanted := fakeTool(t, `touch "`+marker+`"; exit 1`)
+	report, err := ValidateStructural(t.Context(), worker, writeTempPDF(t), StructuralOptions{
+		PDFInfoPath: unwanted, PDFDetachPath: unwanted,
+	})
+	if err != nil || report.Valid || report.Reason != reason {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("unexpected fallback invocation: stat err=%v", err)
+	}
+}
+
+func TestCryptFilterFallbackFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		info        string
+		detach      string
+		maxPages    int
+		noPDFInfo   bool
+		noPDFDetach bool
+	}{
+		{name: "encrypted", info: "Pages: 10\nEncrypted: yes\n", detach: "0 embedded files"},
+		{name: "missing encryption evidence", info: "Pages: 10\n", detach: "0 embedded files"},
+		{name: "page cap", info: "Pages: 10\nEncrypted: no\n", detach: "0 embedded files", maxPages: 9},
+		{name: "missing pdfinfo", noPDFInfo: true},
+		{name: "missing pdfdetach", info: "Pages: 10\nEncrypted: no\n", noPDFDetach: true},
+		{name: "unrecognized attachment status", info: "Pages: 10\nEncrypted: no\n", detach: "nothing found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":false,"Reason":"`+cryptFilterReason+`"}'`)
+			pdfinfo := fakeTool(t, `if [ "$1" = "-js" ]; then exit 0; fi; printf '`+tc.info+`'`)
+			pdfdetach := fakeTool(t, `printf '%s\n' '`+tc.detach+`'`)
+			if tc.noPDFInfo {
+				pdfinfo = ""
+			}
+			if tc.noPDFDetach {
+				pdfdetach = ""
+			}
+			report, err := ValidateStructural(t.Context(), worker, writeTempPDF(t), StructuralOptions{
+				MaxPages: tc.maxPages, PDFInfoPath: pdfinfo, PDFDetachPath: pdfdetach,
+			})
+			if err != nil || report.Valid || report.Reason != cryptFilterReason {
+				t.Fatalf("report=%+v err=%v, want unchanged pdfcpu rejection", report, err)
+			}
+		})
+	}
+}
+
+func TestCryptFilterFallbackNeverSanitizes(t *testing.T) {
+	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":false,"Reason":"`+cryptFilterReason+`"}'`)
+	pdfinfo := fakeTool(t, `if [ "$1" = "-js" ]; then exit 0; fi; printf 'Pages: 10\nEncrypted: no\n'`)
+	pdfdetach := fakeTool(t, `printf '0 embedded files\n'`)
+	report, err := SanitizeEmbeddedFiles(t.Context(), worker, writeTempPDF(t), t.TempDir()+"/sanitized.pdf", StructuralOptions{
+		PDFInfoPath: pdfinfo, PDFDetachPath: pdfdetach,
+	})
+	if err != nil || report.Valid || report.Reason != cryptFilterReason {
+		t.Fatalf("report=%+v err=%v, sanitizer must not use the inspection fallback", report, err)
+	}
+}
 
 func TestStructuralParentRejectsWorkerPageCapViolation(t *testing.T) {
 	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":11}'`)

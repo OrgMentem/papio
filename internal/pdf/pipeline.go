@@ -56,6 +56,9 @@ func Validate(ctx context.Context, in ValidationInput, opt ValidationOptions) (V
 		// enables an independent external page-count cross-check.
 		opt.Structural.PDFInfoPath = in.Capability.PDFInfo
 	}
+	if opt.Structural.PDFDetachPath == "" {
+		opt.Structural.PDFDetachPath = in.Capability.PDFDetach
+	}
 	structural, err := ValidateStructural(ctx, in.WorkerBinary, in.Path, opt.Structural)
 	if err != nil {
 		return report, err

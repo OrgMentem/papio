@@ -60,6 +60,7 @@ var toolSearchPath = []string{
 func DetectCapability() Capability {
 	c := Capability{PDFCPU: true}
 	c.PDFInfo = lookTool("pdfinfo")
+	c.PDFDetach = lookTool("pdfdetach")
 	c.PDFToText = lookTool("pdftotext")
 	c.PDFToPPM = lookTool("pdftoppm")
 	c.Tesseract = lookTool("tesseract")

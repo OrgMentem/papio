@@ -18,7 +18,7 @@ type PayloadReport struct {
 	Reason      string // set when !OK
 }
 
-// StructuralReport comes from the isolated pdfcpu worker.
+// StructuralReport is the isolated worker verdict or the narrow Poppler fallback.
 type StructuralReport struct {
 	Valid            bool
 	Pages            int
@@ -41,6 +41,7 @@ type TextReport struct {
 type Capability struct {
 	PDFCPU    bool   // in-binary structural worker (always true once built)
 	PDFInfo   string // absolute path or ""
+	PDFDetach string // absolute path or ""
 	PDFToText string
 	PDFToPPM  string
 	Tesseract string

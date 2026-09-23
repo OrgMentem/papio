@@ -10,6 +10,11 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Fixed
+- Accept open PDFs with an Identity `/Crypt` filter when pdfcpu cannot parse
+  them and Poppler confirms their page count, encryption state, JavaScript,
+  and embedded-file status. Missing checks still leave the PDF rejected.
+
 ### Added
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual
   download with a fresh institutional handoff. It keeps the failed action and

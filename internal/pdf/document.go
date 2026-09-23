@@ -57,7 +57,7 @@ type PayloadDocument struct {
 	Reason      string `json:"reason,omitempty"`
 }
 
-// StructuralDoc is the isolated worker's parse verdict.
+// StructuralDoc is the structural validation verdict.
 type StructuralDoc struct {
 	Valid            bool   `json:"valid"`
 	Pages            int    `json:"pages"`
