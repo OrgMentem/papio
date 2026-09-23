@@ -3,12 +3,13 @@ package browser
 
 import (
 	"context"
-	"papio/internal/job"
+	"errors"
 	"testing"
 	"time"
 
 	"papio/internal/app"
 	"papio/internal/config"
+	"papio/internal/job"
 	"papio/internal/protocol"
 )
 
@@ -110,6 +111,111 @@ func TestPublisherRetryOffersDOIWithoutReusingResolverAuthority(t *testing.T) {
 	}
 	if msg.Payload.(*protocol.JobOfferPayload).DriveAttemptID != "" {
 		t.Fatal("manual Open regained drive authority")
+	}
+}
+
+func TestPublisherRetryReoffersOriginalInstitutionAfterAdapterUpgrade(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	id := parkInstitutional(t, jobs, "publisher-upgraded-original", handoffWork(), "")
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := b.openHandoffForJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalURL := b.handoffURL(*row, *original)
+	originalDomain := actionSafetyDomain(b.cfg, *row, *original)
+	hello := func(version string) {
+		t.Helper()
+		runSync(t, b, inFrame(t, protocol.MsgHello, "", map[string]any{
+			"extension_version": version,
+			"adapter_versions":  map[string]string{"proquest": version},
+			"features":          []string{institutionalMaterializationFeature, effectPermitFeature, "provider_drive_epoch_v1"},
+		}))
+	}
+	hello("1.0.0")
+	if err := jobs.RecordEvent(ctx, id, "browser.provider_drive_epoch_offered", map[string]any{
+		"drive_attempt_id": "original-attempt", "ordinal": int64(0),
+		"strategy": "generic", "revision": "1", "safety_domain": originalDomain,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.outcome(ctx, id, "wrong-original", &protocol.ProviderOutcomePayload{
+		Outcome: "wrong_work", AdapterID: "proquest", AdapterVersion: "1.0.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, providerLatchEventKind, map[string]any{
+		"kind": "no_positive_effects", "safety_domain": originalDomain,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := b.openHandoffForJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.RetryPublisher(ctx, failed.ID, failed.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.outcome(ctx, id, "wrong-publisher", &protocol.ProviderOutcomePayload{Outcome: "wrong_work"}); err != nil {
+		t.Fatal(err)
+	}
+	failed, err = b.openHandoffForJob(ctx, id)
+	if err != nil || !job.IsPublisherHandoff(*failed) {
+		t.Fatalf("failed publisher action=%+v err=%v", failed, err)
+	}
+	if _, err := b.RetryPublisher(ctx, failed.ID, failed.Revision); !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("same-version retry=%v", err)
+	}
+	hello("1.0.1")
+	if got, err := b.RetryPublisher(ctx, failed.ID, failed.Revision); err != nil || got != id {
+		t.Fatalf("upgraded retry=%q err=%v", got, err)
+	}
+	reoffered, err := b.openHandoffForJob(ctx, id)
+	if err != nil || reoffered.Kind != "openurl_handoff" || job.IsPublisherHandoff(*reoffered) {
+		t.Fatalf("institutional handoff=%+v err=%v", reoffered, err)
+	}
+	if got := b.handoffURL(*row, *reoffered); got != originalURL {
+		t.Fatalf("reoffered URL=%q, want %q", got, originalURL)
+	}
+	candidate, err := jobs.CurrentBrowserCandidateForJob(ctx, id, 3)
+	if err != nil || candidate == nil || candidate.JobAttemptRevision != 3 || candidate.SafetyDomainID == "publisher:doi.org" {
+		t.Fatalf("restored institutional candidate=%+v err=%v", candidate, err)
+	}
+	if latched, err := b.browserOfferLatched(ctx, *row, *reoffered); err != nil || latched {
+		t.Fatalf("old institutional latch blocked new attempt=%v err=%v", latched, err)
+	}
+	raw, err := b.offer(*row, *reoffered, config.ModeDelegated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := protocol.DecodeBrowserMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer := msg.Payload.(*protocol.JobOfferPayload)
+	if offer.OpenURL != originalURL || offer.DriveAttemptID == "" || offer.DriveAttemptID == "original-attempt" {
+		t.Fatalf("institutional drive offer=%+v", offer)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain := ""
+	for _, event := range events {
+		if event["kind"] == "browser.provider_drive_epoch_offered" {
+			detail, _ := event["detail"].(map[string]any)
+			domain, _ = detail["safety_domain"].(string)
+		}
+	}
+	if domain != originalDomain {
+		t.Fatalf("restored drive domain=%q, want %q", domain, originalDomain)
+	}
+	if _, err := b.RetryPublisher(ctx, failed.ID, failed.Revision); !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("replayed retry=%v", err)
 	}
 }
 

@@ -12075,6 +12075,19 @@ func (b *Bridge) browserOfferLatched(
 	if domain == "" {
 		return false, nil
 	}
+	// An explicit adapter-upgrade retry starts a new institutional attempt.
+	// Preserve old latches in history, but apply only observations from this
+	// attempt when deciding whether the restored route may be offered.
+	start := 0
+	for i, event := range events {
+		if event["kind"] == "job.retry_requested" {
+			detail, _ := event["detail"].(map[string]any)
+			if stringDetail(detail, "reason") == "adapter_upgraded" {
+				start = i + 1
+			}
+		}
+	}
+	events = events[start:]
 	for _, event := range events {
 		if event["kind"] != providerLatchEventKind {
 			continue
@@ -12371,8 +12384,25 @@ func (b *Bridge) providerDriveEpochForOffer(row job.Row, action job.HumanAction,
 		}
 		forceNewEpoch = forceNewEpoch || retryAfterEpoch
 	} else if b.jobs != nil {
-		if durableDomain := b.latestHandoffSafetyDomain(row.ID); durableDomain != "" {
-			domain = durableDomain
+		// The last handoff may be the DOI route. A fresh institutional
+		// attempt must not inherit its provider safety domain.
+		institutionalRetryPending := false
+		for _, event := range events {
+			if event["kind"] == "job.retry_requested" {
+				detail, _ := event["detail"].(map[string]any)
+				if stringDetail(detail, "reason") == "adapter_upgraded" {
+					institutionalRetryPending = true
+				}
+			}
+			if event["kind"] == "browser.provider_drive_epoch_offered" {
+				institutionalRetryPending = false
+			}
+		}
+		forceNewEpoch = forceNewEpoch || institutionalRetryPending
+		if !institutionalRetryPending {
+			if durableDomain := b.latestHandoffSafetyDomain(row.ID); durableDomain != "" {
+				domain = durableDomain
+			}
 		}
 	}
 	if forceNewEpoch && ok && b.jobs != nil {

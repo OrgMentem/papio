@@ -11,6 +11,9 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- `papio actions retry-publisher` can re-offer the original institutional route
+  after its DOI retry fails if the refusing provider adapter has since changed.
+  The store permits one such re-offer per job and keeps the DOI retry limit.
 - **Pause automatic Zotero imports without disabling acquisition or library lookups.**
   Set `zotio.auto_import_paused = true` and restart the daemon. The pause covers
   older jobs and import retries, preserves their saved policies, and appears in

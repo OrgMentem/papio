@@ -158,15 +158,16 @@ papio actions resolve <action-id> [flags]
 
 ### `papio actions retry-publisher`
 
-Retry a failed browser route through the paper's DOI
+Retry a failed route through the DOI or an upgraded institution adapter
 
-Retry one wrong-page or adapter failure through the paper's DOI in your browser.
+Retry a failed browser route through the paper's DOI in your browser.
 
+If the DOI retry has already failed, this command re-offers the original
+institutional route only when the refusing adapter has since been upgraded.
 Use the action id and revision from 'papio actions list --json'. The failed
-action and its evidence remain in the job history. Only one publisher retry
-is allowed per job. Pending sign-ins, challenges, terms, downloads, and
-unresolved browser effects must be handled first. Publisher access may
-still require sign-in; this command does not establish entitlement.
+action and its evidence remain in the job history. Each route can be retried
+once. Pending sign-ins, challenges, terms, downloads, and unresolved browser
+effects must be handled first. Neither retry establishes entitlement.
 
 ```
 papio actions retry-publisher <action-id> [flags]
@@ -369,7 +370,7 @@ papio browser permit resolve <permit-id> [flags]
 
 Reload the connected development-mode extension from disk
 
-Reload the connected development-mode extension from disk, replacing the manual chrome://extensions Reload click. It only affects an unpacked extension, because the extension refuses the command unless chrome.management.getSelf() reports installType "development". A new session id is the proof the new bundle is live.
+Reload a development-mode extension from disk. --session selects a connected browser by unambiguous session-id prefix, promoting a pending session first. Without it, reload the current holder. The extension refuses reload unless chrome.management.getSelf() reports installType "development".
 
 ```
 papio browser reload [flags]
@@ -377,6 +378,7 @@ papio browser reload [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--session` | `string` |  | reload this browser session (unambiguous id prefix); promote it if pending |
 | `--timeout` | `duration` | `15s` | how long to wait for the reloaded extension to reconnect (0 waits not at all) |
 
 ### `papio browser sessions`

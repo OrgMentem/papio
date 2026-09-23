@@ -9,8 +9,8 @@ import (
 	"papio/internal/job"
 )
 
-// RetryPublisher records an explicit route change. Ordinary Open requests keep
-// their existing meaning; they cannot change the target of a failed handoff.
+// RetryPublisher records an explicit route change. Once the DOI attempt has
+// been used, an upgraded refusing adapter can restore the original route.
 func (b *Bridge) RetryPublisher(ctx context.Context, actionID, revision int64) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -42,7 +42,7 @@ func (b *Bridge) RetryPublisher(ctx context.Context, actionID, revision int64) (
 	if !found {
 		return "", fmt.Errorf("%w: action is no longer open; list actions again", job.ErrConflict)
 	}
-	id, err := b.jobs.RetryPublisherHandoff(ctx, actionID, revision)
+	id, err := b.jobs.RetryPublisherHandoff(ctx, actionID, revision, b.arbitration.holderSession().AdapterVersions)
 	if err != nil {
 		return "", err
 	}
@@ -55,7 +55,7 @@ func (b *Bridge) RetryPublisher(ctx context.Context, actionID, revision int64) (
 		_, err = b.prepareMaterializationCandidate(ctx, *row)
 	}
 	if err != nil {
-		return "", fmt.Errorf("%w: publisher retry recorded for %s; use actions open --job %s to resume: %v", job.ErrConflict, id, id, err)
+		return "", fmt.Errorf("%w: route retry recorded for %s; use actions open --job %s to resume: %v", job.ErrConflict, id, id, err)
 	}
 	return id, nil
 }

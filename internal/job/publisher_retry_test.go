@@ -68,6 +68,60 @@ func TestPublisherRetryPreservesFailureAndIsBounded(t *testing.T) {
 	}
 }
 
+func TestPublisherRetryReoffersUpgradedInstitutionalRouteOnce(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, action := publisherFailure(t, js)
+	if err := js.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{
+		"outcome": "wrong_work", "adapter_id": "proquest", "adapter_version": "1.0.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RetryPublisherHandoff(ctx, action, 1); err != nil {
+		t.Fatal(err)
+	}
+	publisher, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(publisher) != 1 {
+		t.Fatalf("publisher actions=%+v err=%v", publisher, err)
+	}
+	if _, err := js.S.DB().Exec(`UPDATE human_actions SET status='resolved' WHERE id=?`, publisher[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := js.OpenHumanAction(ctx, id, "manual_download", PublisherHandoffDetail+"\nstill wrong",
+		Access(true, "landing_page"), WithHumanActionDiagnosis(DiagnosisReasonWrongWork))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RetryPublisherHandoff(ctx, failed, 1, map[string]string{"proquest": "1.0.0"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("same adapter version retry=%v, want ErrConflict", err)
+	}
+	if _, err := js.RetryPublisherHandoff(ctx, failed, 1, map[string]string{"other": "2.0.0"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("unrelated adapter upgrade retry=%v, want ErrConflict", err)
+	}
+	got, err := js.RetryPublisherHandoff(ctx, failed, 1, map[string]string{"proquest": "1.0.1"})
+	if err != nil || got != id {
+		t.Fatalf("upgraded adapter retry=%q err=%v", got, err)
+	}
+	open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 1 || open[0].Kind != "openurl_handoff" || IsPublisherHandoff(open[0]) {
+		t.Fatalf("institutional reoffer=%+v err=%v", open, err)
+	}
+	if attempt, err := js.MaterializationAttemptRevision(ctx, id); err != nil || attempt != 3 {
+		t.Fatalf("attempt=%d err=%v, want 3", attempt, err)
+	}
+	if _, err := js.S.DB().Exec(`UPDATE human_actions SET status='resolved' WHERE id=?`, open[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := js.OpenHumanAction(ctx, id, "manual_download", "wrong again",
+		Access(true, "landing_page"), WithHumanActionDiagnosis(DiagnosisReasonWrongWork))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.RetryPublisherHandoff(ctx, second, 1, map[string]string{"proquest": "1.0.2"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("second institutional reoffer=%v, want ErrConflict", err)
+	}
+}
+
 func TestPublisherRetryProfileGateScope(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
