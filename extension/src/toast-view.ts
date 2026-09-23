@@ -1,11 +1,12 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 //
 // ADR-0023's seventh surface: a real in-browser toast for a loss *papio*
-// observed on a tab it opened itself, carrying exactly one take-back-control
-// action. It exists because the third surface cannot serve this case by
-// construction — the host-page acknowledgement is defined as a noninteractive
-// receipt for an action the researcher just requested in the popup, "never for
-// a failure, a later job transition, or an event that arrived on its own"
+// observed on a tab it opened itself, or for papio's own close of the tab of a
+// paper it filed, carrying exactly one take-back-control action. It exists
+// because the third surface cannot serve this case by construction — the
+// host-page acknowledgement is defined as a noninteractive receipt for an
+// action the researcher just requested in the popup, "never for a failure, a
+// later job transition, or an event that arrived on its own"
 // (dev/adr/0023-notification-feedback-and-liveness-surfaces.md:43-60). A tab
 // closing is exactly an event that arrived on its own.
 //
@@ -15,18 +16,22 @@
 // builds is identical, so the two routes can never drift in copy or in what
 // they offer.
 
-/** The closed set of losses that may raise a toast. A kind exists only when
+/** The closed set of events that may raise a toast. A kind exists only when
  * papio can offer a truthful action for it, which is why an `awaiting_download`
  * park and an in-flight delivery detach are absent: neither lost anything, so
- * neither has a recovery to offer. */
-export type ToastKind = "route_lost" | "institution_claim_lost";
+ * neither has a recovery to offer. `paper_filed` is papio's own act, not a
+ * loss: papio closed the tabs of papers it filed, and Reopen gives them back. */
+export type ToastKind = "route_lost" | "institution_claim_lost" | "paper_filed";
 
 export interface ToastPayload {
   readonly kind: ToastKind;
   /** Carried in the extension's own message only. Never rendered, and never
    * placed in a page's DOM or URL: bound 3 of the plan, and the same rule
-   * Decision 1 already applies to the host-page acknowledgement. */
+   * Decision 1 already applies to the host-page acknowledgement. For
+   * `paper_filed` it is an opaque batch id, not a job id. */
   readonly job_id: string;
+  /** `paper_filed` only: how many papers the one toast stands for. */
+  readonly count?: number;
 }
 
 interface ToastCopy {
@@ -49,7 +54,22 @@ export const TOAST_COPY: Readonly<Record<ToastKind, ToastCopy>> = {
     message: "papio lost the sign-in tab for your library, so a paper is waiting again.",
     action: "Open a new sign-in tab",
   },
+  paper_filed: {
+    message: "papio filed the paper and closed its tab.",
+    action: "Reopen",
+  },
 };
+
+/** The copy for one payload. Only a batch of filed papers varies, and only by
+ * its count: several closes inside one toast window become one sentence. */
+export function toastCopy(payload: ToastPayload): ToastCopy {
+  if (payload.kind === "paper_filed" && payload.count !== undefined && payload.count > 1)
+    return {
+      message: `papio filed ${payload.count} papers and closed their tabs.`,
+      action: TOAST_COPY.paper_filed.action,
+    };
+  return TOAST_COPY[payload.kind];
+}
 
 /** Eight seconds, and expiry commits NOTHING. The recovery stays reachable in
  * the inbox afterwards, which is what keeps this clear of WCAG 2.2.1: the toast
@@ -236,7 +256,7 @@ export interface ToastElements {
  * identical DOM. `textContent` throughout — build.ts rejects a page bundle
  * containing `innerHTML`. */
 export function renderToast(doc: Document, container: HTMLElement, payload: ToastPayload): ToastElements {
-  const copy = TOAST_COPY[payload.kind];
+  const copy = toastCopy(payload);
   container.replaceChildren();
   container.dataset.kind = payload.kind;
   // papio's mark leads, so the researcher reads the sender before the claim.

@@ -22,7 +22,6 @@ import {
   PAPIO_MARK,
   PAPIO_MARK_SIZE_PX,
   PAPIO_MARK_VIEWBOX,
-  TOAST_COPY,
   TOAST_PAGE_ACTION_MESSAGE,
   TOAST_PAGE_DISMISS_MESSAGE,
   TOAST_WINDOW_MS,
@@ -30,6 +29,7 @@ import {
   type ToastInjection,
   type ToastKind,
   type ToastPayload,
+  toastCopy,
   toastKindForLoss,
 } from "./toast-view";
 import {
@@ -530,6 +530,17 @@ const MATERIALIZE_PAGE_PATH = POPUP_PAGE_PATH.replace(
 const TOAST_PAGE_PATH = POPUP_PAGE_PATH.replace(/[^/]*$/, "toast.html");
 /** How long a papio surface's focus report suppresses the toast. */
 const TOAST_PRESENCE_TTL_MS = 30_000;
+/** Same derivation rule again: where Reopen sends the operator when the
+ * worker slept and the closed papers' URLs went with it. */
+const HISTORY_PAGE_PATH = POPUP_PAGE_PATH.replace(/[^/]*$/, "history.html");
+/** The reopen toast waits this long after the last close of a batch, so a
+ * reconcile pass that closes several filed papers raises one toast. */
+const FILED_TOAST_SETTLE_MS = 1_500;
+/** How many filed jobs a worker remembers for the reopen toast. */
+const FILED_JOB_MEMORY = 64;
+/** Prefix of a reopen toast's batch id. It lets Reopen fall back to the
+ * history page after the worker slept and forgot the batch itself. */
+const FILED_TOAST_PREFIX = "filed:";
 
 /**
  * ADR-0023's seventh surface, delivered into the page the researcher is reading
@@ -1181,16 +1192,58 @@ function isSurfaceCloseDisposition(
  * ceding is terminal and erases the job binding, so the record's own account
  * of which site decided it is the only evidence that survives. */
 export type CedeReason =
-  /** The operator activated a tab papio did not focus itself. */
-  | "operator_activated"
   /** A close attempt found the tab pinned: an operator act on this tab. */
   | "pinned_at_close"
   /** The reconcile pass found the tab pinned, or outside papio's container. */
   | "pinned_or_moved_out"
-  /** A touch landed between the close decision and the removal. */
-  | "touched_mid_close"
-  /** Scaffold rediscovery found an operator-active or pinned duplicate. */
+  /** Scaffold rediscovery found a pinned duplicate. */
   | "duplicate_operator_owned";
+/** Cession reasons earlier builds recorded for acts that no longer cede.
+ * Activating a papio tab, or touching it while papio closes it, now only
+ * defers the close (operator decision, 2026-09-23): the tab papio opened for
+ * a paper does not become the operator's by being looked at. */
+const VOIDED_CESSION_REASONS: Readonly<Record<string, true>> = {
+  operator_activated: true,
+  touched_mid_close: true,
+};
+/** Whether the operator took this surface over. A record ceded only for a
+ * reason in VOIDED_CESSION_REASONS is papio's again. */
+function surfaceIsCeded(entry: SurfaceBirthRecord): boolean {
+  return (
+    entry.ceded === true &&
+    (entry.ceded_reason === undefined ||
+      VOIDED_CESSION_REASONS[entry.ceded_reason] !== true)
+  );
+}
+/** Whether a closed surface was showing the paper itself, so closing it is
+ * worth offering back. Scaffolds never were: a sign-in, capture, keepalive or
+ * one-use login tab carries no paper, and neither does an extension page or
+ * a blank tab whose navigation became a download. */
+function surfaceShowedPaper(purpose: string, url: string): boolean {
+  if (
+    purpose === "session-signin" ||
+    purpose === "capture" ||
+    purpose === "keepalive" ||
+    purpose === "claim-scaffold" ||
+    purpose === PRIVATE_SURFACE_PURPOSE
+  )
+    return false;
+  try {
+    const protocol = new URL(url).protocol;
+    if (protocol !== "https:" && protocol !== "http:") return false;
+  } catch {
+    return false;
+  }
+  return !isAuthenticationURL(url);
+}
+/** A close transaction's outcome. `removedURL` is set only when papio itself
+ * removed the tab, never when the tab was already gone, so a caller that
+ * offers to reopen what papio closed can never offer a tab the operator
+ * closed. Worker memory only: it is a route URL, which is never persisted. */
+interface SurfaceCloseResult {
+  closed: boolean;
+  removedURL?: string;
+}
 export interface OpenManagedTabOptions {
   url: string;
   jobId?: string;
@@ -3107,18 +3160,9 @@ export class Bridge {
    * pin, or navigation alike. closeOwnedTab captures this per-tab counter
    * at entry and compares it again immediately before tabs.remove, with no
    * intervening await, so a touch that happens (and even reverts) during a
-   * close attempt is never invisible to a single before/after tabs.get. */
+   * close attempt is never invisible to a single before/after tabs.get. A
+   * touch defers the close; the next reconcile pass asks again. */
   private readonly tabTouchEpoch = new Map<number, number>();
-  /** papio-issued focus action tokens (dev/adr/0028-surface-lifecycle-ownership.md):
-   * Slice 2, "Causal operator cession": one pending token per tab that papio itself
-   * is about to activate. The matching onActivated event consumes the token
-   * and is therefore NOT operator takeover; an activation with no token is.
-   *
-   * Worker memory is the correct tier for the same reason deliberateRemovals
-   * is: the activation event for a focus this worker requests always arrives
-   * in the same worker lifetime. A token that is somehow never consumed
-   * decays into ambiguity, and ambiguity retains rather than cedes. */
-  private readonly papioFocusTokens = new Map<number, number>();
   /** Last tab observed active per window. An activation makes the previous
    * tab in that window inactive, which is the event-driven moment a retained
    * surface becomes retirable. */
@@ -4475,10 +4519,11 @@ export class Bridge {
         if (
           entry === undefined ||
           entry.purpose === PRIVATE_SURFACE_PURPOSE ||
-          // Retained content keeps its paper identity so duplicates can be
-          // counted, NOT so a drive can reuse it: a redrive navigates the tab
-          // it reuses, which would read the acquired paper away and leave the
-          // operator with no confirmation surface at all.
+          // The operator's tab is never renavigated.
+          surfaceIsCeded(entry) ||
+          // A record an older build marked as retained content shows a
+          // finished paper, not the route this drive needs; it is retired as
+          // superseded below instead of being driven.
           entry.content === true ||
           entry.job_id !== options.jobId
         )
@@ -4524,6 +4569,8 @@ export class Bridge {
         // the live id and the browser removal path will recover the job.
       }
       await this.recordManagedTab(options.jobId, reusable.id);
+      if (options.jobId !== undefined)
+        await this.retireSupersededSurfaces(options.jobId, reusable.id);
       return reusable.id;
     }
     const tabID = await this.openBrokerTab(
@@ -4540,6 +4587,8 @@ export class Bridge {
       options.jobId,
       options.bindingID,
     );
+    if (options.jobId !== undefined)
+      await this.retireSupersededSurfaces(options.jobId, tabID);
     if (options.purpose === "session-signin") {
       try {
         await this.focusManagedTab(tabID);
@@ -4565,12 +4614,13 @@ export class Bridge {
   /** The authoritative get is followed immediately by remove in this turn.
    * A failed fresh-link materialization is the one surface exception: the
    * private one-use tab never bound to a live job, so preserving it would let
-   * a sibling open a duplicate institutional login. PDF content still stays,
-   * with one narrow exception: `superseded-content`, a cold duplicate copy of
-   * a paper a NEWER retained surface still shows. That exemption is minted
-   * only by retireSupersededContent, behind a daemon authorization, so the
-   * promise this guard exists for - never close the paper someone may be
-   * reading - is kept by keeping the newest copy. */
+   * a sibling open a duplicate institutional login.
+   *
+   * A PDF or article is closed like any other owned surface. papio does not
+   * keep a tab for a paper it has filed or given up on (operator decision,
+   * 2026-09-23). What still stops a close is the operator: a tab they pinned
+   * or moved out of papio's container is theirs, and the tab they are looking
+   * at right now waits for the next pass. */
   private async closeOwnedTab(
     tabID: number,
     reason: string,
@@ -4585,7 +4635,7 @@ export class Bridge {
       (entry === undefined || findByTab(this.store, tabID) !== undefined)
     )
       return false;
-    // Captured before the only await below: any onActivated/onUpdated
+    // Captured before the first await below: any onActivated/onUpdated
     // listener that fires while the fresh tabs.get is in flight bumps this
     // tab's touch epoch synchronously (bindListeners), so a transient
     // activate-then-revert invisible to the fresh get's active/pinned
@@ -4597,18 +4647,12 @@ export class Bridge {
     } catch {
       return false;
     }
-    if (
-      reason !== "superseded-content" &&
-      tab.url !== undefined &&
-      isPDFPage(tab.url)
-    )
-      return false;
     if (materializationCleanup) {
       const base = this.deps.runtimeGetURL?.(MATERIALIZE_PAGE_PATH);
       if (
         base === undefined ||
-        tab.active === true ||
-        typeof tab.url !== "string"
+        typeof tab.url !== "string" ||
+        (await this.operatorIsViewing(tab))
       )
         return false;
       try {
@@ -4635,50 +4679,54 @@ export class Bridge {
     if (
       !rollbackPrivate &&
       !materializationCleanup &&
-      (tab.active === true ||
-        tab.pinned === true ||
-        (!inWorkWindow && !inPapioGroup))
+      (tab.pinned === true ||
+        (!inWorkWindow && !inPapioGroup) ||
+        (await this.operatorIsViewing(tab)))
     )
       return false;
     // Final recheck immediately before remove, no intervening await: a
     // touch epoch bumped since entry — even one the fresh get above cannot
-    // see because it already reverted — means the operator touched this
-    // tab sometime during this close attempt. Cede rather than risk it.
-    if ((this.tabTouchEpoch.get(tabID) ?? 0) !== epochAtStart) {
-      await this.cedeOwnedTab(tabID, entry?.binding_id, "touched_mid_close");
+    // see because it already reverted — means the tab changed under this
+    // close attempt. Defer: the record and any tombstone stay, so the next
+    // reconcile pass asks again once the tab has settled. A job that took
+    // the tab back during the awaits above (a re-offer reusing it) keeps it:
+    // removing a tracked tab is what onTabRemoved reads as a cancellation.
+    if (
+      (this.tabTouchEpoch.get(tabID) ?? 0) !== epochAtStart ||
+      (!materializationCleanup && findByTab(this.store, tabID) !== undefined)
+    )
       return false;
-    }
     await this.deps.tabs.remove(tabID).catch(() => undefined);
     return true;
   }
-  /** Activate a tab papio owns, minting the focus token first so the
-   * resulting onActivated event is recognizable as papio's own act rather
-   * than the operator taking the surface over. Every papio-initiated
-   * activation of an owned surface MUST go through here; a bare
-   * tabs.update({active:true}) is indistinguishable from a click. */
-  private async focusOwnedTab(tabID: number): Promise<void> {
-    this.papioFocusTokens.set(tabID, (this.papioFocusTokens.get(tabID) ?? 0) + 1);
+
+  /** Whether the operator is looking at this tab right now: it is the
+   * selected tab of the window that has focus. Chrome reports `active` for
+   * the selected tab of EVERY window, the minimized work window included, so
+   * `active` alone does not mean anyone is looking. A focus papio cannot read
+   * counts as looking: the close waits for a later pass rather than taking a
+   * tab out from under the operator. */
+  private async operatorIsViewing(tab: TabInfo): Promise<boolean> {
+    if (tab.active !== true) return false;
+    const windows = this.deps.windows;
+    if (windows === undefined || tab.windowId === undefined) return true;
     try {
-      await this.deps.tabs.update?.(tabID, { active: true });
-    } catch (e) {
-      const pending = (this.papioFocusTokens.get(tabID) ?? 0) - 1;
-      if (pending > 0) this.papioFocusTokens.set(tabID, pending);
-      else this.papioFocusTokens.delete(tabID);
-      throw e;
+      const win = await windows.get(tab.windowId);
+      if (win.state === "minimized") return false;
+      return win.focused !== false;
+    } catch {
+      return true;
     }
   }
 
-  /** True when this activation was papio's own, consuming one token. */
-  private consumePapioFocusToken(tabID: number): boolean {
-    const pending = this.papioFocusTokens.get(tabID) ?? 0;
-    if (pending <= 0) return false;
-    if (pending === 1) this.papioFocusTokens.delete(tabID);
-    else this.papioFocusTokens.set(tabID, pending - 1);
-    return true;
+  /** Activate a tab papio owns. Every papio-initiated activation of an owned
+   * surface goes through here, so the one call site is easy to find. */
+  private async focusOwnedTab(tabID: number): Promise<void> {
+    await this.deps.tabs.update?.(tabID, { active: true });
   }
 
-  /** Detach a surface from automation without removing it: ceded permanently
-   * per the retained-forever contract, its pending tombstone cleared so
+  /** Detach a surface from automation without removing it: the operator
+   * took it over, so it is ceded permanently, its pending tombstone cleared so
    * nothing (a replay, a later reconcile pass) acts on it again. Keep the
    * job identity only for a claim-owned surface: if the drive later detaches
    * its tab, the operator's physical close must still retire the claim.
@@ -4710,40 +4758,40 @@ export class Bridge {
       return { value: undefined, changed: true };
     });
   }
-  /** Mark a surface as retained content: papio opened it, it now shows a PDF
-   * inside papio's own container, and the acquired paper is on screen.
+  /** Retire every other surface papio owns for this job now that `keepTabID`
+   * is the one it drives. A redrive, re-offer, fresh link or publisher retry
+   * opened its tab beside the previous attempt's and nothing retired the old
+   * one: measured live 2026-09-23 as two, two, two and four tabs on single
+   * papers.
    *
-   * This is the retention half of the same decision `cedeOwnedTab` makes for
-   * an operator takeover, and it deliberately differs in one field: the job
-   * binding STAYS. Ceding a content surface dropped it, which took the paper
-   * identity with it - so `openManagedTab` could no longer recognise the
-   * retained copy, every later drive minted another one, and each new copy
-   * was retained in turn. Retention is meant to be one confirmation surface
-   * per paper; without the identity it cannot count to one. The pending
-   * tombstone is cleared for the same reason ceding clears it: a close the
-   * operator's own content has overtaken must never be replayed.
-   *
-   * A no-op when the record is gone, already ceded, or binds elsewhere (a
-   * recycled tab id under a stale record). */
-  private async retainContentSurface(
-    tabID: number,
-    bindingID: string | undefined,
+   * Callers first point the job at `keepTabID`, so closeOwnedTab's
+   * tracked-tab guard no longer shields the old surfaces; every other guard
+   * still runs. The closes are fired, not awaited: callers ride the serialized
+   * inbound chain, and the close transaction's daemon answer can only arrive
+   * through that same chain. `skipBindingID` leaves a binding the caller
+   * already retires itself (a scaffold's own duplicates) to that caller. */
+  private async retireSupersededSurfaces(
+    jobID: string,
+    keepTabID: number,
+    skipBindingID?: string,
   ): Promise<void> {
-    await this.runTabLedgerTransaction((ledger) => {
-      const current = ledger[String(tabID)];
+    const ledger = await this.snapshotTabLedger();
+    for (const [key, entry] of Object.entries(ledger)) {
+      const tabID = Number(key);
       if (
-        current === undefined ||
-        current.ceded === true ||
-        (bindingID !== undefined && current.binding_id !== bindingID)
+        !Number.isInteger(tabID) ||
+        tabID < 0 ||
+        tabID === keepTabID ||
+        entry.job_id !== jobID ||
+        entry.purpose === "keepalive" ||
+        entry.binding_id === skipBindingID ||
+        surfaceIsCeded(entry) ||
+        entry.browser_epoch !== this.browserEpoch ||
+        findByTab(this.store, tabID) !== undefined
       )
-        return { value: undefined, changed: false };
-      if (current.content === true && current.pending_close === undefined)
-        return { value: undefined, changed: false };
-      const next: SurfaceBirthRecord = { ...current, content: true };
-      delete next.pending_close;
-      ledger[String(tabID)] = next;
-      return { value: undefined, changed: true };
-    });
+        continue;
+      void this.closeOwnedSurface(tabID, "surface_superseded");
+    }
   }
   private async saveTabLedger(
     ledger: Record<string, SurfaceBirthRecord>,
@@ -5154,8 +5202,11 @@ export class Bridge {
    * same browser epoch proves the record; a fresh tabs.get plus papio
    * work-window/group membership proves the physical surface. Pre-v2 records,
    * browser-restart epochs, surfaces a live job still points at, and ceded
-   * tabs remain review-only. A surface the operator made active/pinned, opened
-   * as a PDF, or moved out of papio's container is ceded, never closed. */
+   * tabs remain review-only. A surface the operator pinned or moved out of
+   * papio's container is ceded, never closed; the one they are looking at is
+   * left for a later pass. A PDF or article is closed like anything else:
+   * papio keeps no tab for a paper it has filed (operator decision,
+   * 2026-09-23), and records an older build marked `content` are swept here. */
   async reconcileOwnedTabs(): Promise<{ closed: number }> {
     await this.classifyLedgeredTabs();
     const ledger = await this.snapshotTabLedger();
@@ -5169,12 +5220,7 @@ export class Bridge {
       if (
         !Number.isInteger(tabID) ||
         tabID < 0 ||
-        entry.ceded === true ||
-        // Retained content is decided by the content pass below, and asserting
-        // job_inactive for it would be a request to close the operator's
-        // acquired paper. The PDF guards downstream refuse that anyway; not
-        // asking spares a daemon round trip on every pass.
-        entry.content === true ||
+        surfaceIsCeded(entry) ||
         entry.job_id === undefined ||
         entry.browser_epoch !== this.browserEpoch ||
         // The question is whether anything still POINTS AT this surface, not
@@ -5229,22 +5275,10 @@ export class Bridge {
         );
         continue;
       }
-      if (tab.url !== undefined && isPDFPage(tab.url)) {
-        // Content papio must never auto-close, still inside papio's own
-        // container: retained rather than ceded, so the paper identity
-        // survives and the pass below can tell a second copy of THIS paper
-        // from the one confirmation surface retention promises.
-        await this.retainContentSurface(tabID, entry.binding_id);
-        continue;
-      }
-      if (tab.active === true) {
-        // Ambiguity retains, it does not cede (plan: "never for
-        // engaged/active/PDF/adopted content. Unknown engagement => retain").
-        // papio focuses its own surfaces - explicit Open, a work-window
-        // raise - so treating active as takeover ceded papio's own tabs the
-        // instant it opened them, permanently, and the record could never be
-        // retired again. Operator activation is recorded where it happens,
-        // in onTabActivated, against a papio-issued focus token.
+      if (await this.operatorIsViewing(tab)) {
+        // The operator is looking at it right now. Deferred, never ceded:
+        // onTabActivated retires it the moment another tab takes the
+        // foreground, and the next pass covers a window switch.
         continue;
       }
       // Two different facts, two different dispositions. The paper being GONE
@@ -5263,106 +5297,20 @@ export class Bridge {
         // is actually ready.
         await this.update((s) => patchJob(s, owner.job_id, { tab_id: -1 }));
       }
+      // A live paper driving ANOTHER tab has superseded this one: a redrive,
+      // re-offer or retry that opened elsewhere. That is the fact the daemon
+      // can verify against the tab, so it is the one asserted.
       const result = await this.closeOwnedSurface(
         tabID,
-        owner === undefined ? "job_inactive" : "handoff_parked",
+        owner === undefined
+          ? "job_inactive"
+          : owner.tab_id >= 0 && owner.tab_id !== tabID
+            ? "surface_superseded"
+            : "handoff_parked",
       );
       if (result.closed) closed += 1;
     }
-    closed += await this.retireSupersededContent();
     return { closed };
-  }
-
-  /** Retire cold, superseded copies of a paper papio already retains.
-   *
-   * Retention of content is deliberate and stays deliberate: one visible tab
-   * showing an acquired paper is confirmation, not litter. The newest copy is
-   * always the one kept, so the paper never leaves the operator's screen.
-   * What this removes is the second, third and fourteenth copy of the SAME
-   * paper, minted by successive drives of one job that each ended on the same
-   * PDF - measured live 2026-08-26 at fourteen tabs for one paper.
-   *
-   * Every predicate is positive evidence, never age or title. papio created
-   * the surface (birth record), for THIS paper (`job_id`), at the same origin
-   * (`origin_digest`), in this browser session (`browser_epoch`), a newer copy
-   * of the same pair exists, the surface is still content inside papio's own
-   * container, the operator has not made it active or pinned it, and it has
-   * outlived PARKED_SURFACE_COLD_MS. The daemon then decides independently:
-   * `claim_abandoned` is eligible only when the binding's claim really is
-   * abandoned, and a binding with no claim at all answers `unclaimed`, which
-   * is browser-local by contract. A live or settled claim refuses, and the
-   * copy is retained. */
-  private async retireSupersededContent(): Promise<number> {
-    const ledger = await this.snapshotTabLedger();
-    const groups = new Map<
-      string,
-      { tabID: number; entry: SurfaceBirthRecord }[]
-    >();
-    for (const [key, entry] of Object.entries(ledger)) {
-      const tabID = Number(key);
-      if (
-        !Number.isInteger(tabID) ||
-        tabID < 0 ||
-        entry.content !== true ||
-        entry.ceded === true ||
-        entry.job_id === undefined ||
-        entry.browser_epoch !== this.browserEpoch
-      )
-        continue;
-      // The paper is the whole grouping key. Only content records reach here,
-      // and every content record is a PDF surface, so two records under one
-      // job are two copies of one acquired paper - even when they were born at
-      // different origins (a provider page and a CDN asset host digest
-      // differently, and the birth digest is never re-dated). Adding the
-      // digest to the key therefore only ever splits a real duplicate pair.
-      const bucket = groups.get(entry.job_id);
-      if (bucket === undefined) groups.set(entry.job_id, [{ tabID, entry }]);
-      else bucket.push({ tabID, entry });
-    }
-    let closed = 0;
-    for (const bucket of groups.values()) {
-      if (bucket.length < 2) continue;
-      bucket.sort((a, b) => b.entry.created_at - a.entry.created_at);
-      for (const { tabID, entry } of bucket.slice(1)) {
-        if (!this.surfaceIsCold(entry)) continue;
-        let tab: TabInfo;
-        try {
-          tab = await this.deps.tabs.get(tabID);
-        } catch {
-          continue;
-        }
-        const inWorkWindow =
-          tab.windowId !== undefined && tab.windowId === this.store.workWindowID;
-        const inPapioGroup =
-          tab.groupId !== undefined &&
-          tab.groupId >= 0 &&
-          (await this.knownHandoffGroup(tab.groupId, tab.windowId)) !==
-            undefined;
-        if (
-          tab.active === true ||
-          tab.pinned === true ||
-          tab.url === undefined ||
-          !isPDFPage(tab.url) ||
-          (!inWorkWindow && !inPapioGroup)
-        )
-          continue;
-        // `surface_superseded` is the assertion that is actually true here,
-        // and the one the daemon can verify: this paper is driven from another
-        // surface now. `claim_abandoned` was tried first and is false in the
-        // common case - a re-drive mints a new claim and leaves the previous
-        // one in `navigated` until the next holder promotion sweeps it, so
-        // every ask was refused and the duplicates stayed (measured live
-        // 2026-08-26).
-        const result = await this.closeOwnedSurface(
-          tabID,
-          "surface_superseded",
-          undefined,
-          true,
-        );
-        if (result.closed) closed += 1;
-      }
-    }
-    return closed;
   }
 
   /** Operator-initiated review focuses one bounded orphan surface; the
@@ -5714,28 +5662,26 @@ export class Bridge {
     tabID: number,
     disposition: SurfaceCloseDisposition,
     gateOccurrenceID?: string,
-    // Retained content is never closable by default: the two downstream PDF
-    // guards refuse it, which is the standing promise never to close a paper
-    // someone may be reading. retireSupersededContent is the one caller that
-    // may set this, and only for a copy a NEWER retained copy of the same
-    // paper supersedes, so the paper itself stays on screen either way.
-    supersededContent = false,
   ): Promise<{ closed: boolean }> {
     await this.surfaceReady;
     const ledger = await this.snapshotTabLedger();
     const record = ledger[String(tabID)];
-    if (record === undefined || record.ceded === true)
+    if (record === undefined || surfaceIsCeded(record))
       return { closed: false };
-    if (supersededContent && record.content !== true) return { closed: false };
-    return this.inLifecycleChain(() =>
-      this.closeAuthorizedRecord(
-        tabID,
-        record,
-        disposition,
-        gateOccurrenceID,
-        supersededContent,
-      ),
+    const result = await this.inLifecycleChain(() =>
+      this.closeAuthorizedRecord(tabID, record, disposition, gateOccurrenceID),
     );
+    // Whatever path closed it - adoption, a terminal cancel, a later pass
+    // once the operator looked away - a tab that showed a paper papio just
+    // filed is offered back once.
+    if (
+      result.removedURL !== undefined &&
+      record.job_id !== undefined &&
+      this.filedJobs.has(record.job_id) &&
+      surfaceShowedPaper(record.purpose, result.removedURL)
+    )
+      this.noteFiledPaperClosed(record.job_id, result.removedURL);
+    return { closed: result.closed };
   }
 
   /** §2.3: request a one-use close authorization for `bindingID` under
@@ -5807,8 +5753,7 @@ export class Bridge {
     record: SurfaceBirthRecord,
     disposition: SurfaceCloseDisposition,
     gateOccurrenceID: string | undefined,
-    supersededContent = false,
-  ): Promise<{ closed: boolean }> {
+  ): Promise<SurfaceCloseResult> {
     const authorization = await this.requestCloseAuthorization(
       record.binding_id,
       disposition,
@@ -5823,12 +5768,7 @@ export class Bridge {
       // timeout has always intended - that intent was simply refused every
       // time before the daemon could say which kind of "no" it meant.
       if (authorization.unclaimed === true)
-        return this.retireOwnedSurface(
-          tabID,
-          record.binding_id,
-          "unclaimed",
-          supersededContent,
-        );
+        return this.retireOwnedSurface(tabID, record.binding_id, "unclaimed");
       return { closed: false };
     }
     const bindingID = record.binding_id;
@@ -5849,12 +5789,7 @@ export class Bridge {
       return { value: true, changed: true };
     });
     if (!tombstoned) return { closed: false };
-    return this.retireOwnedSurface(
-      tabID,
-      bindingID,
-      "authorized",
-      supersededContent,
-    );
+    return this.retireOwnedSurface(tabID, bindingID, "authorized");
   }
 
   /** The one fresh tabs.get the plan requires before the awaited removal,
@@ -5863,26 +5798,20 @@ export class Bridge {
    * daemon has no stake in. The guards are identical because they are the
    * whole of the decision in the unclaimed case, so they must never diverge.
    *
-   * A tab that became active, pinned, or navigated to content papio must
-   * never auto-close (a PDF viewer — closeOwnedTab's own group/window gate
-   * covers "not adopted-content") is ceded and detached instead of
-   * retried: its tombstone is cleared so a later restart never re-requests
-   * a closure the operator has already claimed by using the tab. This is
-   * the FIRST of two independent freshness checks, not the only one —
-   * closeOwnedTab below re-derives the same predicates off its own fresh
-   * get, and additionally compares the touch epoch, so a touch landing
-   * anywhere between this get and the eventual tabs.remove is still caught
-   * even when it is invisible to this particular snapshot. */
+   * A pinned tab is ceded and detached instead of retried: its tombstone is
+   * cleared so a later restart never re-requests a closure the operator has
+   * already claimed by pinning. A PDF or article is not a reason to keep the
+   * tab (operator decision, 2026-09-23). This is the FIRST of two
+   * independent freshness checks, not the only one — closeOwnedTab below
+   * re-derives the same predicates off its own fresh get, and additionally
+   * compares the touch epoch, so a touch landing anywhere between this get
+   * and the eventual tabs.remove is still caught even when it is invisible to
+   * this particular snapshot. */
   private async retireOwnedSurface(
     tabID: number,
     bindingID: string,
     authority: "authorized" | "unclaimed",
-    // A superseded duplicate is content by construction, so the PDF predicate
-    // here would cede every one of them. The exemption is narrow on purpose:
-    // only a copy whose paper is retained on a NEWER surface reaches this, and
-    // pinning still cedes, because pinning is an operator act on this tab.
-    supersededContent = false,
-  ): Promise<{ closed: boolean }> {
+  ): Promise<SurfaceCloseResult> {
     let tab: TabInfo;
     try {
       tab = await this.deps.tabs.get(tabID);
@@ -5895,38 +5824,21 @@ export class Bridge {
       await this.cedeOwnedTab(tabID, bindingID, "pinned_at_close");
       return { closed: false };
     }
-    if (
-      !supersededContent &&
-      tab.url !== undefined &&
-      isPDFPage(tab.url)
-    ) {
-      // Content, which papio never auto-closes - but retaining it is not the
-      // same act as ceding it, and conflating the two is what made retention
-      // per-attempt. This is the close path a settled or abandoned
-      // MATERIALIZATION surface takes, and it runs before any reconcile pass
-      // sees the tab, so ceding here stripped the paper identity from every
-      // scaffold that ended on a PDF - which is every copy measured live on
-      // 2026-08-26, all of them `purpose: "materialization"`.
-      await this.retainContentSurface(tabID, bindingID);
-      return { closed: false };
-    }
-    if (tab.active === true) {
-      // Retain, do not cede: papio's own focus is not takeover, and this
-      // tombstone stays replayable so the surface retires once it is no
-      // longer the foreground tab. Ceding here burned the one-use
-      // authorization AND detached the binding, which is how an explicitly
-      // opened sign-in tab became permanently unretirable (live 2026-08-20).
+    if (await this.operatorIsViewing(tab)) {
+      // Deferred, not ceded: the tombstone stays replayable, so the surface
+      // retires once it is no longer in front of the operator. Ceding here
+      // burned the one-use authorization AND detached the binding, which is
+      // how an explicitly opened sign-in tab became permanently unretirable
+      // (live 2026-08-20).
       return { closed: false };
     }
     const removed = await this.closeOwnedTab(
       tabID,
-      supersededContent
-        ? "superseded-content"
-        : authority === "unclaimed"
-          ? "unclaimed-close"
-          : "authorized-close",
+      authority === "unclaimed" ? "unclaimed-close" : "authorized-close",
     );
-    return { closed: removed };
+    return removed
+      ? { closed: true, ...(tab.url === undefined ? {} : { removedURL: tab.url }) }
+      : { closed: false };
   }
 
   /** Startup replay: a failed remove or a worker death between tombstone
@@ -6603,12 +6515,7 @@ export class Bridge {
       const tab = await this.deps.tabs.get(tabID);
       if (tab.active !== true) {
         if (this.deps.tabs.update === undefined) return false;
-        // Through focusOwnedTab, never a raw tabs.update: an activation papio
-        // does not claim is indistinguishable from an operator's click, so
-        // onTabActivated reads it as takeover and cedes the record - which
-        // erases the paper identity from the very surface this reveal exists
-        // to make usable. Measured live 2026-08-26: every revealed
-        // ScienceDirect surface came back `ceded_reason: operator_activated`.
+        // Through focusOwnedTab, the one place papio activates its own tabs.
         await this.focusOwnedTab(tabID);
         changed = true;
       }
@@ -10430,9 +10337,9 @@ export class Bridge {
       return { reliable: false };
     if (!scan.reliable) return { reliable: false };
     const candidates = scan.byBinding.get(bindingID) ?? [];
-    // review round finding 1: an operator-active/pinned candidate is ceded
-    // permanently, never flipped back to inactive and reclaimed — Chrome's
-    // active flag is the one signal papio must never overrule. Adoption is
+    // review round finding 1: an active or pinned candidate is never
+    // flipped back to inactive and reclaimed — Chrome's active flag is the
+    // one signal papio must never overrule when choosing a tab to drive. Adoption is
     // restricted to a candidate that positively re-proves itself as papio's
     // own — ledgered under this exact binding and the current browser
     // epoch, never ceded — so a merely-URL-matching tab (a restored or
@@ -10458,18 +10365,18 @@ export class Bridge {
     }
     chosen ??= candidates.find(eligible);
     // Every other candidate is a duplicate papio must never silently
-    // adopt, deactivate, or delete out from under the operator or before
-    // proving ownership: active/pinned is ceded permanently (a no-op when
-    // unledgered — nothing to mark); a positively owned idle duplicate
-    // retires through the same authorized-close transaction every other
-    // owned surface uses, fired without blocking this reconciliation on
-    // an unrelated tab's daemon round trip; anything else — unledgered,
-    // or ledgered under a stale epoch that cannot re-prove itself — is
-    // left open and untouched, never directly removed.
+    // adopt or delete before proving ownership: a pinned one is the
+    // operator's and is ceded permanently (a no-op when unledgered — nothing
+    // to mark); a positively owned duplicate retires through the same
+    // authorized-close transaction every other owned surface uses, which
+    // waits while the operator is looking at it, fired without blocking this
+    // reconciliation on an unrelated tab's daemon round trip; anything else
+    // — unledgered, or ledgered under a stale epoch that cannot re-prove
+    // itself — is left open and untouched, never directly removed.
     for (const candidate of candidates) {
       if (candidate.id === undefined || candidate.id === chosen?.id)
         continue;
-      if (candidate.active === true || candidate.pinned === true) {
+      if (candidate.pinned === true) {
         await this.cedeOwnedTab(
           candidate.id,
           ledger[String(candidate.id)]?.binding_id,
@@ -10501,6 +10408,7 @@ export class Bridge {
       // browser epoch, and a no-op entirely when no tabLedger backend is
       // configured (ledgerManagedTab's own guard).
       await this.ledgerManagedTab(chosen.id, "materialization", false, jobID, bindingID);
+      await this.retireSupersededSurfaces(jobID, chosen.id, bindingID);
       return { tabID: chosen.id, reliable: true };
     }
     const scaffoldURL = this.materializationURL(bindingID);
@@ -10517,6 +10425,9 @@ export class Bridge {
       tab_id: createdID,
     });
     await this.ledgerManagedTab(createdID, "materialization", false, jobID, bindingID);
+    // A new binding for a paper that already had a surface: the earlier
+    // attempt's tab (a redrive, a re-offer) is superseded, not kept beside it.
+    await this.retireSupersededSurfaces(jobID, createdID, bindingID);
     return { tabID: createdID, reliable: true };
   }
 
@@ -11692,6 +11603,19 @@ export class Bridge {
    * daemon already writes. */
   private pendingToast: ToastPayload | undefined;
   private toastWindowID: number | undefined;
+  /** Jobs papio filed in this worker lifetime, so a later close of any of
+   * their surfaces (a tab deferred while the operator looked at it, the page
+   * that led to the viewer) is offered back too. Insertion-ordered and
+   * bounded to FILED_JOB_MEMORY; a worker that slept simply forgets. */
+  private readonly filedJobs = new Set<string>();
+  /** Papers whose tabs papio closed after filing them, gathered into one
+   * reopen toast. Worker memory only: the URLs are route URLs and are never
+   * persisted, so a worker that slept has lost them and Reopen falls back to
+   * the history page. `revision` debounces the raise until the batch has
+   * been quiet for FILED_TOAST_SETTLE_MS. */
+  private filedBatch:
+    | { readonly id: string; readonly urls: Map<string, string>; revision: number }
+    | undefined;
   /** The in-page route's one-use authorization. Present only while an injected
    * toast is live, and cleared by the first action, dismissal, or replacement.
    *
@@ -11745,7 +11669,7 @@ export class Bridge {
       return false;
     }
     if (!httpsPage || isPDFPage(tab.url)) return false;
-    const copy = TOAST_COPY[payload.kind];
+    const copy = toastCopy(payload);
     const token = this.deps.randomUUID();
     try {
       const [injected] = await this.deps.scripting.executeScript({
@@ -11778,15 +11702,18 @@ export class Bridge {
     return true;
   }
 
-  /** Raise the seventh surface for a loss papio observed itself. Returns
-   * whether a surface was delivered, so the caller can fall back to silence
-   * rather than assume. */
+  /** Raise the seventh surface for a loss papio observed itself, or for
+   * papio's own close of a paper it filed. Returns whether a surface was
+   * delivered, so the caller can fall back to silence rather than assume. */
   private async raiseToast(payload: ToastPayload): Promise<boolean> {
     // A papio surface already in front reports the same event, and Decision 9's
     // presence hint is exactly the signal for that. Interrupting a researcher
     // who is looking at the popup would be a duplicate, not an aid.
     if (this.papioSurfaceLikelyFocused()) return false;
     this.pendingToast = payload;
+    // A loss replaces a pending reopen offer; the closed papers are still in
+    // the history page and the browser's own reopen-closed-tab.
+    if (payload.kind !== "paper_filed") this.filedBatch = undefined;
     // Replace rather than stack: retire the previous surface on BOTH routes
     // before raising either, so the researcher is never asked about two losses
     // at once and a superseded injected toast can no longer act.
@@ -11850,6 +11777,74 @@ export class Bridge {
     await this.raiseToast({ kind, job_id: job.job_id });
   }
 
+  /** Remember that papio filed this job, so closing its surfaces offers the
+   * paper back. */
+  private noteFiledJob(jobID: string): void {
+    this.filedJobs.delete(jobID);
+    this.filedJobs.add(jobID);
+    for (const oldest of this.filedJobs) {
+      if (this.filedJobs.size <= FILED_JOB_MEMORY) break;
+      this.filedJobs.delete(oldest);
+    }
+  }
+
+  /** Add one closed paper to the reopen batch and raise the batch's toast
+   * once it has been quiet for FILED_TOAST_SETTLE_MS. A close that lands
+   * while the toast is up replaces it with the larger count: one toast at a
+   * time, never a stack. */
+  private noteFiledPaperClosed(jobID: string, url: string): void {
+    const batch = this.filedBatch ?? {
+      id: `${FILED_TOAST_PREFIX}${this.deps.randomUUID()}`,
+      urls: new Map<string, string>(),
+      revision: 0,
+    };
+    this.filedBatch = batch;
+    // One entry per paper. The PDF is a better thing to reopen than the page
+    // that led to it.
+    const known = batch.urls.get(jobID);
+    if (known === undefined || (!isPDFPage(known) && isPDFPage(url)))
+      batch.urls.set(jobID, url);
+    batch.revision += 1;
+    const revision = batch.revision;
+    this.deps.setTimeout(async () => {
+      if (this.filedBatch !== batch || batch.revision !== revision) return;
+      const raised = await this.raiseToast({
+        kind: "paper_filed",
+        job_id: batch.id,
+        count: batch.urls.size,
+      });
+      // An offer nobody saw is dropped rather than carried into a later,
+      // larger toast.
+      if (!raised && this.filedBatch === batch) this.filedBatch = undefined;
+    }, FILED_TOAST_SETTLE_MS);
+  }
+
+  /** Reopen what papio closed. One paper opens in front of the operator;
+   * several open quietly where papio's own tabs go, per the work-window
+   * setting. After the worker slept the URLs are gone, and the history page,
+   * which lists every filed paper, is the honest fallback. */
+  private async reopenFiledPapers(batchID: string): Promise<boolean> {
+    const batch = this.filedBatch;
+    this.filedBatch = undefined;
+    try {
+      if (batch?.id !== batchID) {
+        const history = this.deps.runtimeGetURL?.(HISTORY_PAGE_PATH);
+        if (history === undefined) return false;
+        await this.deps.tabs.create({ url: history, active: true });
+        return true;
+      }
+      const urls = [...batch.urls.values()];
+      if (urls.length === 1) {
+        await this.deps.tabs.create({ url: urls[0]!, active: true });
+        return true;
+      }
+      for (const url of urls) await this.openBrokerTab(url, false);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Close the toast window papio opened, and ONLY that window.
    *
    * The ownership re-check is not defensive padding. A researcher who closes
@@ -11889,14 +11884,20 @@ export class Bridge {
    * route `papio actions open` mints — because the extension cannot mint one
    * itself: `WithOpenRouteJob` is the daemon's authorization boundary, and an
    * offer that opened a tab by itself is exactly what papio must never do for
-   * a paper it asked a human to fetch. */
+   * a paper it asked a human to fetch. `paper_filed` reopens the tabs papio
+   * itself closed, from worker memory. */
   async toastAction(jobID: string): Promise<boolean> {
     const payload = this.pendingToast;
     this.pendingToast = undefined;
     this.toastWindowID = undefined;
+    // A reopen offer whose worker slept still deserves an answer: the batch is
+    // gone with the worker, and reopenFiledPapers falls back to the history.
+    if (payload === undefined && jobID.startsWith(FILED_TOAST_PREFIX))
+      return this.reopenFiledPapers(jobID);
     // Ignore an id that is not the offer papio made. A stale window reloaded
     // after a replacement would otherwise reopen the wrong paper.
     if (payload === undefined || payload.job_id !== jobID) return false;
+    if (payload.kind === "paper_filed") return this.reopenFiledPapers(jobID);
     const minted = await this.requestFreshHandoffLink(jobID);
     if (minted.ok !== true) return false;
     try {
@@ -11912,6 +11913,7 @@ export class Bridge {
    * seconds from being a deadline. */
   toastDismiss(jobID: string): void {
     if (this.pendingToast?.job_id === jobID) this.pendingToast = undefined;
+    if (this.filedBatch?.id === jobID) this.filedBatch = undefined;
     this.toastWindowID = undefined;
   }
 
@@ -18199,7 +18201,7 @@ export class Bridge {
           !Number.isInteger(tabID) ||
           tabID < 0 ||
           entry.job_id !== jobID ||
-          entry.ceded === true ||
+          surfaceIsCeded(entry) ||
           entry.browser_epoch !== this.browserEpoch
         )
           continue;
@@ -18211,7 +18213,9 @@ export class Bridge {
   }
 
   /** The daemon acknowledges download_complete only after it has attempted
-   * adoption. Close the broker-owned viewer then, never on a raw tab event. */
+   * adoption. Close the surfaces that showed the paper then, never on a raw
+   * tab event: papio keeps no tab for a paper it has filed (operator
+   * decision, 2026-09-23), and the reopen toast gives it back on request. */
   private async closeAfterAdoption(jobID: string | undefined): Promise<void> {
     if (jobID === undefined) return;
     const isDelivery =
@@ -18230,8 +18234,11 @@ export class Bridge {
       await this.removeJobWithOffer(jobID);
       return;
     }
+    this.noteFiledJob(jobID);
     const materialization = this.materializationCorrelation(jobID);
-    if (materialization?.phase === "navigated") {
+    const settledTabID =
+      materialization?.phase === "navigated" ? materialization.tab_id : undefined;
+    if (settledTabID !== undefined) {
       // A successfully-delivered institutional materialize.html scaffold has
       // no other retirement path — the close authorization transaction is
       // the only thing that ever tells the daemon (and then this browser)
@@ -18241,7 +18248,6 @@ export class Bridge {
       // and reduceMaterialization's "scaffolded"/"reconcile_tab" tabSync
       // mirrors the scaffold's tab id onto job.tab_id) so the close
       // transaction can actually run the removal, not just tombstone it.
-      const settledTabID = materialization.tab_id;
       const gateOccurrenceID = this.claimGrants.get(jobID)?.gateOccurrenceID;
       void (async () => {
         const current = findByJob(this.store, jobID);
@@ -18261,18 +18267,19 @@ export class Bridge {
     if (tabID === undefined) return;
     this.adoptedViewerTabs.delete(jobID);
     this.completedDownloadTabs.delete(jobID);
+    // removeJobWithOffer closes the job's own tab through the same
+    // transaction; only a different surface (a viewer the provider opened)
+    // needs a close of its own.
+    const jobTabID = findByJob(this.store, jobID)?.tab_id;
     await this.removeJobWithOffer(jobID);
-    // The viewer holding the just-adopted paper IS the confirmation surface,
-    // so it is retained on purpose - and it is marked as retained content
-    // here, at the one moment papio positively knows which paper it shows.
-    // The previous `closeOwnedTab(tabID, "adopted-viewer")` was dead code:
-    // the primitive refused that reason unconditionally, so it read as
-    // cleanup while doing nothing, and the record kept no content marker for
-    // a later duplicate to supersede. `job_id` is supplied because
-    // removeJobWithOffer above has already dropped the live job, so a record
-    // minted here would otherwise carry no paper identity at all.
+    if (tabID === settledTabID || tabID === jobTabID) return;
+    // A viewer the provider opened is not papio's birth, but papio adopted
+    // the paper from it inside its own container, and that is the authority
+    // to close it. `job_id` is supplied because removeJobWithOffer above has
+    // already dropped the live job. The close is fired, not awaited: `ack`
+    // is an inbound frame, and the daemon's answer rides the same chain.
     await this.ledgerManagedTab(tabID, "adopted-viewer", false, jobID);
-    await this.retainContentSurface(tabID, undefined);
+    void this.closeOwnedSurface(tabID, "job_inactive");
   }
 
   /** A provider-authored 500/404 page is a failed load, not adapter drift.
@@ -22427,7 +22434,6 @@ export class Bridge {
    * up rather than trust the event payload. A tab that vanished between the
    * event and the lookup is not evidence of anything — swallow and drop. */
   private async onTabActivated(tabID: number): Promise<void> {
-    const papioFocused = this.consumePapioFocusToken(tabID);
     let tab: TabInfo;
     try {
       tab = await this.deps.tabs.get(tabID);
@@ -22435,51 +22441,45 @@ export class Bridge {
       return;
     }
     this.keepaliveManager?.noteResolverActivated(tabID, tab.url);
-    if (!papioFocused) {
-      // Positive operator takeover, recorded where it happens rather than
-      // inferred later from tab.active - which papio itself sets.
-      await this.cedeOwnedTabIfOwned(tabID);
-    }
+    // Activation is not takeover. Looking at a tab papio opened for a paper
+    // defers its close while it is in front; it does not make the tab the
+    // operator's (operator decision, 2026-09-23). Only pinning it or moving
+    // it out of papio's container cedes it.
     if (tab.windowId === undefined) return;
     const previous = this.lastActiveTabByWindow.get(tab.windowId);
     this.lastActiveTabByWindow.set(tab.windowId, tabID);
     if (previous !== undefined && previous !== tabID) {
       // The surface that just lost the foreground is the event-driven moment
-      // a retained-because-active owned tab becomes retirable.
+      // a deferred owned tab becomes retirable.
       await this.retireDeactivatedSurface(previous);
     }
   }
 
-  /** Mark an owned, unceded, current-epoch record as taken over. A tab papio
-   * does not own is not touched. */
-  private async cedeOwnedTabIfOwned(tabID: number): Promise<void> {
-    const ledger = await this.snapshotTabLedger();
-    const record = ledger[String(tabID)];
-    if (
-      record === undefined ||
-      record.purpose === "keepalive" || // Focusing its sign-in surface does not cede it.
-      record.ceded === true ||
-      record.browser_epoch !== this.browserEpoch
-    )
-      return;
-    await this.cedeOwnedTab(tabID, record.binding_id, "operator_activated");
-  }
-
-  /** Retire one owned surface whose job papio no longer tracks, now that it
-   * is no longer the foreground tab. Same predicate reconcileOwnedTabs uses;
-   * the daemon still authorizes (or refuses) the close, one use per attempt. */
+  /** Retire one owned surface that no live job still drives, now that it is
+   * no longer the foreground tab. Same predicate and dispositions as
+   * reconcileOwnedTabs; the daemon still authorizes (or refuses) the close,
+   * one use per attempt. A parked paper's own tab is left to the reconcile
+   * pass, which alone knows whether it has gone cold. */
   private async retireDeactivatedSurface(tabID: number): Promise<void> {
     const ledger = await this.snapshotTabLedger();
     const record = ledger[String(tabID)];
     if (
       record === undefined ||
-      record.ceded === true ||
+      surfaceIsCeded(record) ||
       record.job_id === undefined ||
-      record.browser_epoch !== this.browserEpoch ||
-      findByJob(this.store, record.job_id) !== undefined
+      record.browser_epoch !== this.browserEpoch
     )
       return;
-    await this.closeOwnedSurface(tabID, "job_inactive");
+    const owner = findByJob(this.store, record.job_id);
+    if (owner?.tab_id === tabID) return;
+    await this.closeOwnedSurface(
+      tabID,
+      owner === undefined
+        ? "job_inactive"
+        : owner.tab_id >= 0
+          ? "surface_superseded"
+          : "handoff_parked",
+    );
   }
 
   private async onTabRemoved(tabID: number): Promise<void> {

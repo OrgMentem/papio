@@ -198,6 +198,19 @@ test("parseToastPayload keeps the kind vocabulary closed", () => {
   expect(parseToastPayload({ ok: true, toast: { kind: "surface_lost", job_id: "j" } })).toBeUndefined();
 });
 
+test("a filed-papers toast needs the count it renders", () => {
+  expect(
+    parseToastPayload({ ok: true, toast: { kind: "paper_filed", job_id: "filed:b", count: 3 } }),
+  ).toEqual({ kind: "paper_filed", job_id: "filed:b", count: 3 });
+  // Without a count the sentence cannot be built, and a zero or fraction is
+  // not a number of papers.
+  for (const count of [undefined, 0, 1.5, "3"]) {
+    expect(
+      parseToastPayload({ ok: true, toast: { kind: "paper_filed", job_id: "filed:b", count } }),
+    ).toBeUndefined();
+  }
+});
+
 test("being brought forward restarts the clock, because macOS spends the first click activating the window", async () => {
   // Measured against a real unfocused Chrome popup: on macOS the first click on
   // an unfocused window activates it and does not reach the button underneath.

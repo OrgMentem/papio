@@ -49,9 +49,12 @@ export function parseToastPayload(value: unknown): ToastPayload | undefined {
   if (typeof toast !== "object" || toast === null) return undefined;
   const kind = "kind" in toast ? toast.kind : undefined;
   const jobID = "job_id" in toast ? toast.job_id : undefined;
-  if (kind !== "route_lost" && kind !== "institution_claim_lost") return undefined;
   if (typeof jobID !== "string" || jobID === "") return undefined;
-  return { kind, job_id: jobID };
+  if (kind === "route_lost" || kind === "institution_claim_lost") return { kind, job_id: jobID };
+  if (kind !== "paper_filed") return undefined;
+  const count = "count" in toast ? toast.count : undefined;
+  if (typeof count !== "number" || !Number.isInteger(count) || count < 1) return undefined;
+  return { kind, job_id: jobID, count };
 }
 
 /** Drives one toast window from load to close. Exported with injected deps so

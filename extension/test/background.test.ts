@@ -539,7 +539,13 @@ class FakeWindows {
     };
   }[] = [];
   readonly removed: number[] = [];
-  readonly live = new Map<number, { id: number; state: string }>();
+  /** `focused` is reported by `get` only when a test sets it: whether the
+   * operator is looking at a window is what decides if its active tab may
+   * close now. */
+  readonly live = new Map<
+    number,
+    { id: number; state: string; focused?: boolean }
+  >();
   nextId = 500;
   constructor(private readonly tabs: ChromeTabsFake) {}
   async create(props: {
@@ -2495,34 +2501,28 @@ test("a parked surface is retired once cold, and never while it is warm", async 
   }
 });
 
-// Retention of content is deliberate: one visible tab showing an acquired
-// paper is confirmation, not litter. Retention was PER-ATTEMPT, though,
-// because ceding a PDF surface dropped its job_id and took the paper identity
-// with it - so every later drive minted another retained copy and nothing
-// could count them. Measured live 2026-08-26: fourteen tabs on one paper, none
-// reachable by any close path.
-async function seedRetainedCopies(
+// Operator decision 2026-09-23: papio keeps no tab for a paper it filed. An
+// older build marked such tabs `content: true` and every close path refused
+// them, which is how 27 tabs piled up in the operator's papio group. The next
+// reconcile pass after this ships has to close them.
+async function seedFiledContent(
   h: Harness,
   opts: {
-    olderCreatedAt: number;
-    olderActive?: boolean;
-    olderPinned?: boolean;
     copies?: number;
-  },
-): Promise<{ olderTabID: number; newerTabID: number; olderBinding: string }> {
+    /** One per copy; every copy is the same paper when omitted. */
+    jobIDs?: string[];
+    purpose?: string;
+    pinned?: boolean;
+    active?: boolean;
+    workWindow?: { state: "minimized" | "normal"; focused: boolean };
+  } = {},
+): Promise<{ tabIDs: number[] }> {
   await h.port.inbound(
     helloAck({
       features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"],
       browser_holder_generation: 1,
     }),
   );
-  const pdfURL = "https://pdf.assets.example/main.pdf";
-  const older = await h.tabs.create({ url: pdfURL, active: false, windowId: 1 });
-  const newer = await h.tabs.create({ url: pdfURL, active: false, windowId: 1 });
-  const olderTabID = older.id!;
-  const newerTabID = newer.id!;
-  if (opts.olderPinned === true) h.tabs.patch(olderTabID, { pinned: true });
-  if (opts.olderActive === true) h.tabs.patch(olderTabID, { active: true });
   const internals = h.bridge as unknown as {
     tabLedgerCache: Record<string, SurfaceBirthRecord>;
     browserEpoch: string | undefined;
@@ -2530,157 +2530,335 @@ async function seedRetainedCopies(
     update: (fn: (s: StoreShape) => StoreShape) => Promise<void>;
   };
   const epoch = internals.browserEpoch ?? "test-epoch";
-  const olderBinding = "binding-content-older";
-  internals.tabLedgerCache = {
-    [String(olderTabID)]: fakeBirthRecord({
-      binding_id: olderBinding,
-      tab_hint: olderTabID,
+  const tabIDs: number[] = [];
+  const ledger: Record<string, SurfaceBirthRecord> = {};
+  const copies = opts.jobIDs?.length ?? opts.copies ?? 2;
+  for (let i = 0; i < copies; i += 1) {
+    const tab = await h.tabs.create({
+      url: `https://pdf.assets.example/main-${i}.pdf`,
+      active: false,
+      windowId: 1,
+    });
+    const tabID = tab.id!;
+    tabIDs.push(tabID);
+    ledger[String(tabID)] = fakeBirthRecord({
+      binding_id: `binding-filed-${i}`,
+      tab_hint: tabID,
       browser_epoch: epoch,
-      created_at: opts.olderCreatedAt,
-      job_id: "job_one_paper",
+      created_at: h.clock.now,
+      job_id: opts.jobIDs?.[i] ?? "job_one_paper",
       content: true,
-    }),
-    ...((opts.copies ?? 2) < 2
-      ? {}
-      : {
-          [String(newerTabID)]: fakeBirthRecord({
-            binding_id: "binding-content-newer",
-            tab_hint: newerTabID,
-            browser_epoch: epoch,
-            created_at: h.clock.now,
-            job_id: "job_one_paper",
-            content: true,
-          }),
-        }),
-  };
+      ...(opts.purpose === undefined ? {} : { purpose: opts.purpose }),
+    });
+  }
+  if (opts.pinned === true) h.tabs.patch(tabIDs[0]!, { pinned: true });
+  if (opts.active === true) h.tabs.patch(tabIDs[0]!, { active: true });
+  if (opts.workWindow !== undefined)
+    h.windows!.live.set(1, { id: 1, ...opts.workWindow });
+  internals.tabLedgerCache = ledger;
   internals.lastKnownBrowserHolderGeneration = 1;
   await internals.update((s) => ({ ...s, workWindowID: 1 }));
-  return { olderTabID, newerTabID, olderBinding };
+  return { tabIDs };
 }
 
-test("a cold superseded copy of a retained paper retires and the newest stays", async () => {
+/** Answer the next `count` close requests, one at a time, as the daemon
+ * would: a reconcile pass asks about the next surface only after the previous
+ * answer arrives. */
+async function answerCloseRequests(
+  h: Harness,
+  from: number,
+  count: number,
+  outcome: "unclaimed" | "not_eligible",
+): Promise<Record<string, unknown>[]> {
+  const answered: Record<string, unknown>[] = [];
+  let cursor = from;
+  for (let i = 0; i < count; i += 1) {
+    const request = await h.port.waitForFrame("surface_close_request", cursor);
+    cursor = h.port.posted.length;
+    answered.push(request.payload);
+    await h.port.inbound(
+      nativeResult("surface_close_response", {
+        request_id: request.payload["request_id"],
+        outcome,
+        detail:
+          outcome === "unclaimed"
+            ? "binding has no live materialization claim"
+            : "the binding still has an active browser handoff",
+      }),
+    );
+  }
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  return answered;
+}
+
+test("a filed paper's retained content tabs close on the next reconcile pass", async () => {
   const h = makeHarness(undefined, { windows: true });
   installManagedTabLedger(h, {});
   await h.bridge.start();
-  const { olderTabID, newerTabID, olderBinding } = await seedRetainedCopies(h, {
-    olderCreatedAt: 1,
-  });
+  const { tabIDs } = await seedFiledContent(h);
 
-  const framesBefore = h.frames().length;
+  const from = h.port.posted.length;
   const reconciling = h.bridge.reconcileOwnedTabs();
-  const request = await h.port.waitForFrame(
-    "surface_close_request",
-    framesBefore,
+  const asked = await answerCloseRequests(h, from, 2, "unclaimed");
+  // No live job points at either copy, so the true fact for both is that the
+  // paper's handoff is over. Every copy goes, the newest included.
+  expect(asked.map((payload) => payload["disposition"])).toEqual([
+    "job_inactive",
+    "job_inactive",
+  ]);
+  expect(await reconciling).toEqual({ closed: 2 });
+  expect([...h.tabs.removed].sort()).toEqual([...tabIDs].sort());
+  expect(h.frames().some((frame) => frame.type === "provider_outcome")).toBe(false);
+});
+
+test("a pinned copy is the operator's and never closes", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabIDs } = await seedFiledContent(h, { copies: 1, pinned: true });
+
+  const from = h.port.posted.length;
+  expect(await h.bridge.reconcileOwnedTabs()).toEqual({ closed: 0 });
+  expect(h.tabs.removed).toEqual([]);
+  expect(
+    h.frames().slice(from).map((frame) => frame.type),
+  ).not.toContain("surface_close_request");
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  expect(internals.tabLedgerCache[String(tabIDs[0])]?.ceded_reason).toBe(
+    "pinned_or_moved_out",
   );
-  // The older copy, named by ITS binding and ITS tab, under the one assertion
-  // that is true here and that the daemon verifies against the job's live
-  // claim: this paper is driven from another surface now. `claim_abandoned`
-  // was tried first and is false whenever a re-drive left the previous claim
-  // in `navigated`, which is the common case.
-  expect(request.payload["binding_id"]).toBe(olderBinding);
-  expect(request.payload["disposition"]).toBe("surface_superseded");
-  expect(request.payload["surface_tab_id"]).toBe(olderTabID);
+});
+
+// `active` is true for the selected tab of EVERY window, the minimized work
+// window included, so it cannot mean "the operator is looking at it". Only the
+// active tab of a focused window waits, and only until the next pass.
+test("an active tab waits only while its window has focus", async () => {
+  // The work window, minimized as papio keeps it: its selected tab closes now.
+  const hidden = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(hidden, {});
+  await hidden.bridge.start();
+  const { tabIDs: hiddenTabs } = await seedFiledContent(hidden, {
+    copies: 1,
+    active: true,
+    workWindow: { state: "minimized", focused: false },
+  });
+  let from = hidden.port.posted.length;
+  const hiddenPass = hidden.bridge.reconcileOwnedTabs();
+  await answerCloseRequests(hidden, from, 1, "unclaimed");
+  expect(await hiddenPass).toEqual({ closed: 1 });
+  expect(hidden.tabs.removed).toEqual(hiddenTabs);
+
+  // The operator raised the work window and is reading that tab: deferred.
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabIDs } = await seedFiledContent(h, {
+    copies: 1,
+    active: true,
+    workWindow: { state: "normal", focused: true },
+  });
+  from = h.port.posted.length;
+  expect(await h.bridge.reconcileOwnedTabs()).toEqual({ closed: 0 });
+  expect(h.tabs.removed).toEqual([]);
+  expect(
+    h.frames().slice(from).map((frame) => frame.type),
+  ).not.toContain("surface_close_request");
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  expect(internals.tabLedgerCache[String(tabIDs[0])]?.ceded).toBeUndefined();
+
+  // The operator switched to another window. The next pass closes it.
+  h.windows!.live.set(1, { id: 1, state: "normal", focused: false });
+  from = h.port.posted.length;
+  const later = h.bridge.reconcileOwnedTabs();
+  await answerCloseRequests(h, from, 1, "unclaimed");
+  expect(await later).toEqual({ closed: 1 });
+  expect(h.tabs.removed).toEqual(tabIDs);
+});
+
+test("a daemon refusal keeps a filed paper's tab open", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabIDs } = await seedFiledContent(h, { copies: 1 });
+
+  const from = h.port.posted.length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  // Papio asserts, the daemon decides: a refusal is not positive evidence,
+  // so the tab stays until a later pass is authorized.
+  await answerCloseRequests(h, from, 1, "not_eligible");
+  expect(await reconciling).toEqual({ closed: 0 });
+  expect(h.tabs.removed).toEqual([]);
+  expect(h.tabs.snapshot(tabIDs[0]!)).toBeDefined();
+});
+
+// The live defect of 2026-09-23: every `papio jobs redrive` opened a new tab
+// beside the previous attempt's and nothing retired the old one (two, two, two
+// and four tabs on single papers). The old tab here is exactly the live shape:
+// the paper parked, papio's close of it was refused, and it stayed on the PDF,
+// marked retained by the old build.
+test("a redrive of a parked paper whose old tab still exists leaves exactly one tab for it", async () => {
+  const jobID = "job_redrive_one_tab";
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
   await h.port.inbound(
-    nativeResult("surface_close_response", {
-      request_id: request.payload["request_id"],
-      outcome: "authorized",
-      close_authorization_id: "auth_dup_older",
-      nonce: "nonce_dup_older",
+    helloAck({
+      features: ["handoff_link_v1", "surface_close_v1"],
       browser_holder_generation: 1,
     }),
   );
-  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+  await h.port.inbound(jobOffer(jobID));
+  const oldTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(oldTabID).toBeGreaterThanOrEqual(0);
+  const internals = h.bridge as unknown as {
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+    parkUndrivableHandoff: (jobID: string, reason: string) => Promise<void>;
+  };
+  let from = h.port.posted.length;
+  await internals.parkUndrivableHandoff(jobID, "test park");
+  await answerCloseRequests(h, from, 1, "not_eligible");
+  h.tabs.patch(oldTabID, { url: "https://pdf.assets.example/parked.pdf" });
+  internals.tabLedgerCache[String(oldTabID)] = {
+    ...internals.tabLedgerCache[String(oldTabID)]!,
+    content: true,
+  };
+  expect(h.tabs.snapshot(oldTabID)).toBeDefined();
 
-  expect(await reconciling).toEqual({ closed: 1 });
-  expect(h.tabs.removed).toEqual([olderTabID]);
-  // The promise this whole rule exists for: the paper is still on screen.
-  expect(h.tabs.snapshot(newerTabID)).toBeDefined();
-  // Exactly one ask, so the newest copy is never even a candidate.
-  expect(
-    h
-      .frames()
-      .slice(framesBefore)
-      .filter((frame) => frame.type === "surface_close_request"),
-  ).toHaveLength(1);
+  // `papio jobs redrive`: the daemon offers the same paper again.
+  from = h.port.posted.length;
+  const reoffer = jobOffer(jobID) as Record<string, unknown>;
+  await h.port.inbound({ ...reoffer, msg_id: "offer_00000002", seq: 1 });
+  const newTabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(newTabID).toBeGreaterThanOrEqual(0);
+  expect(newTabID).not.toBe(oldTabID);
+  const asked = await answerCloseRequests(h, from, 1, "unclaimed");
+  expect(asked[0]).toMatchObject({
+    disposition: "surface_superseded",
+    surface_tab_id: oldTabID,
+  });
+  const liveForJob = h.tabs
+    .list()
+    .filter((tab) => internals.tabLedgerCache[String(tab.id)]?.job_id === jobID)
+    .map((tab) => tab.id);
+  expect(liveForJob).toEqual([newTabID]);
+  expect(h.frames().some((frame) => frame.type === "provider_outcome")).toBe(false);
 });
 
-test("a warm superseded copy is retained, and a lone copy is never asked about", async () => {
-  for (const shape of ["warm-duplicate", "lone-copy"] as const) {
-    const h = makeHarness(undefined, { windows: true });
-    installManagedTabLedger(h, {});
-    await h.bridge.start();
-    const { olderTabID } = await seedRetainedCopies(h, {
-      // 30 minutes is PARKED_SURFACE_COLD_MS; one second short of it is warm.
-      olderCreatedAt:
-        shape === "warm-duplicate" ? h.clock.now - (30 * 60_000 - 1_000) : 1,
-      copies: shape === "lone-copy" ? 1 : 2,
-    });
-
-    const framesBefore = h.frames().length;
-    const reconciling = h.bridge.reconcileOwnedTabs();
-    for (let i = 0; i < 200; i += 1) await Promise.resolve();
-    expect(await reconciling).toEqual({ closed: 0 });
-    expect(h.tabs.removed).not.toContain(olderTabID);
-    expect(
-      h
-        .frames()
-        .slice(framesBefore)
-        .map((frame) => frame.type),
-    ).not.toContain("surface_close_request");
-  }
-});
-
-test("a superseded copy the operator touched is retained, never retired", async () => {
-  for (const touch of ["active", "pinned"] as const) {
-    const h = makeHarness(undefined, { windows: true });
-    installManagedTabLedger(h, {});
-    await h.bridge.start();
-    const { olderTabID } = await seedRetainedCopies(h, {
-      olderCreatedAt: 1,
-      olderActive: touch === "active",
-      olderPinned: touch === "pinned",
-    });
-
-    const framesBefore = h.frames().length;
-    const reconciling = h.bridge.reconcileOwnedTabs();
-    for (let i = 0; i < 200; i += 1) await Promise.resolve();
-    expect(await reconciling).toEqual({ closed: 0 });
-    expect(h.tabs.removed).not.toContain(olderTabID);
-    expect(
-      h
-        .frames()
-        .slice(framesBefore)
-        .map((frame) => frame.type),
-    ).not.toContain("surface_close_request");
-  }
-});
-
-test("a daemon refusal keeps a superseded copy open", async () => {
+// The work window is minimized, and Chrome still reports its selected tab as
+// `active`. A tab whose navigation became a download commits no document, so
+// it sits in papio's container blank ("New Tab"); the old `active` guard read
+// it as the operator's foreground and kept it, and nothing ever retried.
+test("a blank tab left selected in the minimized work window closes with its job", async () => {
+  const jobID = "job_blank_download_tab";
   const h = makeHarness(undefined, { windows: true });
   installManagedTabLedger(h, {});
   await h.bridge.start();
-  const { olderTabID } = await seedRetainedCopies(h, { olderCreatedAt: 1 });
-
-  const framesBefore = h.frames().length;
-  const reconciling = h.bridge.reconcileOwnedTabs();
-  const request = await h.port.waitForFrame(
-    "surface_close_request",
-    framesBefore,
-  );
-  // The claim is still navigated, so claim_abandoned is false for it. Papio
-  // asserts, the daemon decides, and a refusal keeps the paper on screen.
   await h.port.inbound(
-    nativeResult("surface_close_response", {
-      request_id: request.payload["request_id"],
-      outcome: "not_eligible",
-      detail: "disposition does not match the binding's current phase",
+    helloAck({
+      features: ["handoff_link_v1", "surface_close_v1"],
+      browser_holder_generation: 1,
     }),
   );
-  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const workWindowID = h.tabs.snapshot(tabID)?.windowId;
+  expect(h.windows?.live.get(workWindowID!)?.state).toBe("minimized");
+  h.tabs.patch(tabID, { url: "", active: true });
 
-  expect(await reconciling).toEqual({ closed: 0 });
-  expect(h.tabs.removed).not.toContain(olderTabID);
-  expect(h.tabs.snapshot(olderTabID)).toBeDefined();
+  const from = h.port.posted.length;
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "cancel",
+    msg_id: "cancel-blank-tab",
+    seq: 9,
+    job_id: jobID,
+    payload: {},
+  });
+  const asked = await answerCloseRequests(h, from, 1, "unclaimed");
+  expect(asked[0]?.["disposition"]).toBe("job_inactive");
+  expect(h.tabs.removed).toContain(tabID);
+  // A blank tab never showed the paper, so there is nothing to offer back.
+  expect(h.timers.filter((timer) => timer.ms === 1_500)).toHaveLength(0);
+});
+
+test("several filed papers closed together raise one toast, and Reopen recreates each", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const jobIDs = ["job_filed_one", "job_filed_two"];
+  const { tabIDs } = await seedFiledContent(h, {
+    jobIDs,
+    workWindow: { state: "minimized", focused: false },
+  });
+  const urls = tabIDs.map((tabID) => h.tabs.snapshot(tabID)!.url!);
+  const internals = h.bridge as unknown as {
+    noteFiledJob: (jobID: string) => void;
+    toastPending(): { kind: string; job_id: string; count?: number } | undefined;
+    toastAction(jobID: string): Promise<boolean>;
+  };
+  for (const jobID of jobIDs) internals.noteFiledJob(jobID);
+
+  const from = h.port.posted.length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  await answerCloseRequests(h, from, 2, "unclaimed");
+  expect(await reconciling).toEqual({ closed: 2 });
+  for (const timer of h.timers.filter((candidate) => candidate.ms === 1_500))
+    await timer.fn();
+
+  const toasts = h.windows?.created.filter((props) => props.url.endsWith("toast.html")) ?? [];
+  expect(toasts).toHaveLength(1);
+  const pending = internals.toastPending();
+  expect(pending).toMatchObject({ kind: "paper_filed", count: 2 });
+
+  // Several papers reopen quietly where papio's own tabs go, never in front.
+  const createdBefore = h.tabs.created.length;
+  expect(await internals.toastAction(pending!.job_id)).toBe(true);
+  const reopened = h.tabs.created.slice(createdBefore);
+  expect(reopened.map((props) => props.url)).toEqual(urls);
+  expect(reopened.every((props) => props.active !== true)).toBe(true);
+});
+
+test("Reopen after the worker forgot the batch opens the history page", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  await h.bridge.start();
+  const internals = h.bridge as unknown as {
+    toastAction(jobID: string): Promise<boolean>;
+  };
+  const createdBefore = h.tabs.created.length;
+  expect(await internals.toastAction("filed:forgotten-batch")).toBe(true);
+  const opened = h.tabs.created.slice(createdBefore);
+  expect(opened).toHaveLength(1);
+  expect(opened[0]?.url).toContain("history.html");
+  expect(opened[0]?.active).toBe(true);
+});
+
+// A sign-in tab carries no paper, so closing it for a filed job is not a
+// reopen offer: the toast would promise the paper and deliver a login page.
+test("closing a filed paper's sign-in surface raises no toast", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await seedFiledContent(h, {
+    jobIDs: ["job_filed_signin"],
+    purpose: "session-signin",
+    workWindow: { state: "minimized", focused: false },
+  });
+  const internals = h.bridge as unknown as {
+    noteFiledJob: (jobID: string) => void;
+    toastPending(): unknown;
+  };
+  internals.noteFiledJob("job_filed_signin");
+
+  const from = h.port.posted.length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  await answerCloseRequests(h, from, 1, "unclaimed");
+  expect(await reconciling).toEqual({ closed: 1 });
+  expect(h.timers.filter((timer) => timer.ms === 1_500)).toHaveLength(0);
+  expect(internals.toastPending()).toBeUndefined();
 });
 
 // A drive says so, and a paper parked behind the single drive slot says the
@@ -4874,16 +5052,32 @@ test("a timed-out institutional IdP tab reports owner_closed for its navigated b
     tab_id: tabID,
     status: "auth_pending",
   });
-  // The operator brings the IdP tab forward to sign in. This cedes automatic
-  // closing but cannot erase the claim owner's identity on a later real close.
+  // The operator brings the IdP tab forward to sign in. Looking at the tab
+  // defers papio's own close; it no longer cedes the tab, and it never erases
+  // the claim owner's identity for a later real close.
   await h.tabs.userActivate(tabID);
-  const cededRecord = ledger.current()[String(tabID)] as SurfaceBirthRecord;
-  expect(cededRecord.ceded).toBe(true);
-  expect(cededRecord.job_id).toBe(jobID);
+  const activatedRecord = ledger.current()[String(tabID)] as SurfaceBirthRecord;
+  expect(activatedRecord.ceded).toBeUndefined();
+  expect(activatedRecord.job_id).toBe(jobID);
   const timeout = h.timers.find((timer) => timer.ms === 180_000);
   expect(timeout).toBeDefined();
   h.clock.now += 180_000;
-  await timeout!.fn();
+  const timeoutFramesBefore = h.port.posted.length;
+  const timingOut = timeout!.fn();
+  // The drive timeout asks to close its parked surface. The daemon may say
+  // yes; the tab is still in front of the operator, so the close waits.
+  const parkClose = await h.port.waitForFrame("surface_close_request", timeoutFramesBefore);
+  expect(parkClose.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: parkClose.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-idp-timeout",
+      nonce: "nonce-idp-timeout",
+      browser_holder_generation: 1,
+    }),
+  );
+  await timingOut;
   expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id).toBe(-1);
   expect(h.frames().filter((frame) => frame.type === "auth_pending")).toHaveLength(2);
   expect(h.tabs.snapshot(tabID)?.url).toBe(idpURL);
@@ -10175,16 +10369,23 @@ test("a PDF that lands after an auth wall is still adopted", async () => {
   expect(h.downloads.started.map((d) => d.url)).toEqual([pdfURL]);
 });
 
-// The adopted viewer is kept on purpose - and the record has to SAY so. The
-// old code called closeOwnedTab(tabID, "adopted-viewer"), which the primitive
-// refused unconditionally: cleanup in appearance, nothing in effect, and no
-// content marker, so nothing could ever tell a second copy of this paper from
-// the first. Measured live 2026-08-26: fourteen copies of one paper.
-test("an adopted viewer is marked as this paper's retained content", async () => {
-  const h = makeHarness();
-  const ledger = installManagedTabLedger(h, {});
+// Operator decision 2026-09-23: papio keeps no tab for a paper it has filed.
+// The adopted viewer used to be retained as "content", and those tabs were
+// most of the 27 live on the operator's screen. It now closes through the
+// close transaction once the daemon acknowledges adoption, and the paper is
+// offered back once through the reopen toast.
+test("an adopted PDF viewer closes after the ack and Reopen brings the paper back", async () => {
+  const jobID = "job_adopted_content";
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
   await h.bridge.start();
-  await h.port.inbound(jobOffer("job_adopted_content"));
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", "surface_close_v1"],
+      browser_holder_generation: 1,
+    }),
+  );
+  await h.port.inbound(jobOffer(jobID));
   const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
   const viewerURL = `https://${PROVIDER_HOST}/reader/kept-paper.pdf`;
 
@@ -10204,24 +10405,50 @@ test("an adopted viewer is marked as this paper's retained content", async () =>
     state: "complete",
   });
   await h.downloads.onChanged.emit({ id: 901, state: { current: "complete" } });
+  const framesBefore = h.frames().length;
   await h.port.inbound({
     protocol: "papio-browser/1",
     type: "ack",
     msg_id: "ack_00000001",
-    job_id: "job_adopted_content",
+    job_id: jobID,
     seq: 1,
     payload: {},
   });
+  const request = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(request.payload["disposition"]).toBe("job_inactive");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: request.payload["request_id"],
+      outcome: "unclaimed",
+      detail: "binding has no live materialization claim",
+    }),
+  );
   for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  expect(h.tabs.removed).toContain(tabID);
+  expect(
+    h.frames().some((frame) => frame.type === "provider_outcome"),
+  ).toBe(false);
 
-  const record = ledger.current()[String(tabID)] as
-    | SurfaceBirthRecord
-    | undefined;
-  // Retained, and retained AS this paper: both halves are load-bearing. The
-  // job identity is what a later duplicate is counted against.
-  expect(record?.content).toBe(true);
-  expect(record?.job_id).toBe("job_adopted_content");
-  expect(h.tabs.removed).toEqual([]);
+  // One toast, after the batch settles, naming no paper.
+  const settle = h.timers.filter((timer) => timer.ms === 1_500);
+  expect(settle).toHaveLength(1);
+  await settle[0]!.fn();
+  const toasts = h.windows?.created.filter((props) => props.url.endsWith("toast.html")) ?? [];
+  expect(toasts).toHaveLength(1);
+  const internals = h.bridge as unknown as {
+    toastPending(): { kind: string; job_id: string; count?: number } | undefined;
+    toastAction(jobID: string): Promise<boolean>;
+  };
+  const pending = internals.toastPending();
+  expect(pending).toMatchObject({ kind: "paper_filed", count: 1 });
+  expect(pending?.job_id).not.toContain(jobID);
+
+  // Reopen recreates the closed paper from worker memory, in front.
+  const createdBefore = h.tabs.created.length;
+  expect(await internals.toastAction(pending!.job_id)).toBe(true);
+  expect(h.tabs.created.slice(createdBefore)).toEqual([
+    { url: viewerURL, active: true },
+  ]);
 });
 
 test("Chrome's built-in PDF viewer downloads the memory-only offered URL", async () => {
@@ -22862,28 +23089,51 @@ test("Slice 2b: a non-authorized outcome retains the surface", async () => {
   expect(h.tabs.snapshot(tabID)).toBeDefined();
 });
 
-test("Slice 2b: an operator activation cedes the surface before any close is requested", async () => {
+// Operator decision 2026-09-23: looking at a tab papio opened does not make it
+// the operator's. The close waits while the tab is in front of them and runs
+// once it is not; only pinning it or moving it out of papio's container cedes.
+test("Slice 2b: an operator activation defers papio's close and cedes nothing", async () => {
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();
   const { tabID, bindingID } = await seedOwnedScaffold(h);
+  h.windows!.live.set(1, { id: 1, state: "normal", focused: true });
   await h.tabs.userActivate(tabID);
-  // Causal cession: the takeover is recorded at the activation papio did not
-  // cause, so the close is refused locally and no one-use authorization is
-  // spent proving what the extension already knows.
   const record = closeInternals(h).tabLedgerCache[String(tabID)];
-  expect(record?.ceded).toBe(true);
+  expect(record?.ceded).toBeUndefined();
   expect(record?.binding_id).toBe(bindingID);
-  expect(record?.pending_close).toBeUndefined();
-  await expect(
-    closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle"),
-  ).resolves.toEqual({ closed: false });
-  expect(
-    h.frames().filter((frame) => frame.type === "surface_close_request"),
-  ).toHaveLength(0);
+
+  const authorize = async (from: number, n: number): Promise<void> => {
+    const request = await h.port.waitForFrame("surface_close_request", from);
+    await h.port.inbound(
+      nativeResult("surface_close_response", {
+        request_id: request.payload["request_id"],
+        outcome: "authorized",
+        close_authorization_id: `auth-activation-${n}`,
+        nonce: `nonce-activation-${n}`,
+        browser_holder_generation: 1,
+      }),
+    );
+  };
+  // In front of the operator: deferred, and the tombstone stays replayable.
+  let framesBefore = h.frames().length;
+  const deferred = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  await authorize(framesBefore, 1);
+  await expect(deferred).resolves.toEqual({ closed: false });
   expect(h.tabs.removed).not.toContain(tabID);
+  expect(closeInternals(h).tabLedgerCache[String(tabID)]?.pending_close).toBeDefined();
+
+  // The operator looks elsewhere; the next attempt closes it.
+  const other = await h.tabs.create({ url: "https://example.org/", active: false, windowId: 1 });
+  await h.tabs.userActivate(other.id!);
+  framesBefore = h.frames().length;
+  const retried = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
+  await authorize(framesBefore, 1);
+  await expect(retried).resolves.toEqual({ closed: true });
+  expect(h.tabs.removed).toContain(tabID);
+  expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
 });
 
-test("Review round finding 3: an operator activation landing inside the close window (after consumeCloseTombstone's own check, strictly before tabs.remove is issued) cedes instead of closing", async () => {
+test("Review round finding 3: an operator activation landing inside the close window (after consumeCloseTombstone's own check, strictly before tabs.remove is issued) defers instead of closing", async () => {
   const h = makeHarness(undefined, { windows: true });
   await h.bridge.start();
   const { tabID, bindingID } = await seedOwnedScaffold(h);
@@ -22919,18 +23169,19 @@ test("Review round finding 3: an operator activation landing inside the close wi
       browser_holder_generation: 1,
     }),
   );
-  // The cession, not merely an earlier activity check the operator's
-  // later touch could still outrun.
+  // Deferred, not merely an earlier activity check the operator's later
+  // touch could still outrun - and not ceded either: the record and its
+  // tombstone stay, so a later pass asks again once the tab has settled.
   await expect(closing).resolves.toEqual({ closed: false });
   expect(h.tabs.removed).not.toContain(tabID);
   expect(h.tabs.snapshot(tabID)).toBeDefined();
   const record = closeInternals(h).tabLedgerCache[String(tabID)];
-  expect(record?.ceded).toBe(true);
+  expect(record?.ceded).toBeUndefined();
   expect(record?.binding_id).toBe(bindingID);
-  expect(record?.pending_close).toBeUndefined();
+  expect(record?.pending_close).toBeDefined();
 });
 
-test("Scenario 6: papio's own focus_owner activation leaves no cession trace, but a genuine operator activation cedes and that survives a worker restart", async () => {
+test("Scenario 6: papio's own focus_owner activation leaves no cession trace, and an activation an older build recorded as cession no longer holds the tab", async () => {
   // Part (a): papio-initiated focus_owner (the daemon routing an explicit
   // dependent to an already-live owner tab) activates that tab itself —
   // this must never be conflated with operator engagement. A later
@@ -23039,37 +23290,35 @@ test("Scenario 6: papio's own focus_owner activation leaves no cession trace, bu
   await expect(retiring).resolves.toEqual({ closed: true });
   expect(h1.tabs.removed).toContain(focusedTabID);
 
-  // Part (c): a genuine operator activation cedes at the activation itself,
-  // and that cession survives a worker restart — no close is ever attempted.
+  // Part (c): an older build ceded a tab the operator merely activated, and
+  // that record would have held the tab for ever. Activation no longer cedes
+  // (operator decision 2026-09-23), so such a record is papio's again and its
+  // close runs the ordinary round trip.
   const h2 = makeHarness(undefined, { windows: true });
   await h2.bridge.start();
   const { tabID: scaffoldTabID } = await seedOwnedScaffold(h2);
-  await h2.tabs.userActivate(scaffoldTabID);
-  const ledgerBeforeRestart = closeInternals(h2).tabLedgerCache;
-  expect(ledgerBeforeRestart[String(scaffoldTabID)]?.ceded).toBe(true);
-  await expect(
-    closeInternals(h2).closeOwnedSurface(scaffoldTabID, "scaffold_idle"),
-  ).resolves.toEqual({ closed: false });
-  expect(h2.tabs.removed).not.toContain(scaffoldTabID);
-
-  const restarted = restartWorker(h2);
-  await restarted.bridge.start();
-  const framesBeforeRestart = restarted.frames().length;
-  const closing3 = closeInternals(restarted).closeOwnedSurface(
+  const legacy = closeInternals(h2).tabLedgerCache[String(scaffoldTabID)]!;
+  closeInternals(h2).tabLedgerCache[String(scaffoldTabID)] = {
+    ...legacy,
+    ceded: true,
+    ceded_reason: "operator_activated",
+  };
+  const closing3 = closeInternals(h2).closeOwnedSurface(
     scaffoldTabID,
     "scaffold_idle",
   );
-  await expect(closing3).resolves.toEqual({ closed: false });
-  expect(restarted.tabs.removed).not.toContain(scaffoldTabID);
-  expect(restarted.tabs.snapshot(scaffoldTabID)).toBeDefined();
-  // Refused at the ledger-entry gate before even attempting the wire round
-  // trip: no renavigation, no close, no surface_close_request at all.
-  expect(
-    restarted
-      .frames()
-      .slice(framesBeforeRestart)
-      .some((f) => f.type === "surface_close_request"),
-  ).toBe(false);
+  const legacyRequest = await h2.port.waitForFrame("surface_close_request");
+  await h2.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: legacyRequest.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-s6-legacy",
+      nonce: "nonce-s6-legacy",
+      browser_holder_generation: 1,
+    }),
+  );
+  await expect(closing3).resolves.toEqual({ closed: true });
+  expect(h2.tabs.removed).toContain(scaffoldTabID);
 });
 
 test("Slice 2b: a failed remove leaves the tombstone; startup replay completes it", async () => {
@@ -23494,13 +23743,11 @@ test("Slice 2b: a browser restart's fresh epoch retains a stale pending tombston
   expect(record?.pending_close).toBeUndefined();
 });
 
-// The close path a settled or abandoned materialization surface takes runs
-// BEFORE any reconcile pass sees the tab, so retaining content only in the
-// reconcile left this site ceding it - and a cede drops the paper identity.
-// Measured live 2026-08-26: every duplicate copy of one paper was ledgered
-// `purpose: "materialization"` and `ceded: true` with no job_id, which is why
-// nothing could count them.
-test("a settled materialization surface showing a PDF is retained with its paper, not ceded", async () => {
+// Operator decision 2026-09-23: papio keeps no tab for a paper it filed. A
+// settled materialization surface that ended on the PDF itself used to be
+// retained as "content" by this very path, and every copy piled up; now it
+// closes. Pinning is still the operator's act, so a pinned copy is ceded.
+test("a settled materialization surface showing a PDF closes unless the operator pinned it", async () => {
   for (const shape of ["content", "pinned"] as const) {
     const h = makeHarness(undefined, { windows: true });
     await h.bridge.start();
@@ -23533,27 +23780,23 @@ test("a settled materialization surface showing a PDF is retained with its paper
         browser_holder_generation: 1,
       }),
     );
+    if (shape === "content") {
+      expect(await closing).toEqual({ closed: true });
+      expect(h.tabs.removed).toContain(tabID);
+      expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
+      continue;
+    }
     expect(await closing).toEqual({ closed: false });
     expect(h.tabs.removed).not.toContain(tabID);
-
+    // Pinning is an operator act on this tab: takeover, ceded permanently,
+    // identity dropped so nothing acts on it again - and the record names
+    // the site that decided it, because nothing else can afterwards.
     const record = internals.tabLedgerCache[String(tabID)];
     expect(record?.binding_id).toBe(bindingID);
     expect(record?.pending_close).toBeUndefined();
-    if (shape === "pinned") {
-      // Pinning is an operator act on this tab: takeover, ceded permanently,
-      // identity dropped so nothing acts on it again - and the record names
-      // the site that decided it, because nothing else can afterwards.
-      expect(record?.ceded).toBe(true);
-      expect(record?.ceded_reason).toBe("pinned_at_close");
-      expect(record?.content).toBeUndefined();
-      expect(record?.job_id).toBeUndefined();
-      continue;
-    }
-    // Content is papio's own confirmation surface: retained, and retained AS
-    // this paper, so a later copy can be counted against it.
-    expect(record?.content).toBe(true);
-    expect(record?.ceded).toBeUndefined();
-    expect(record?.job_id).toBe("job_settled_content");
+    expect(record?.ceded).toBe(true);
+    expect(record?.ceded_reason).toBe("pinned_at_close");
+    expect(record?.job_id).toBeUndefined();
   }
 });
 
@@ -23733,7 +23976,7 @@ test("Scenario 2: a live institutional materialize.html scaffold survives simula
   expect(liveScaffoldsForBinding).toHaveLength(1);
 });
 
-test("Review round finding 1: reconciliation facing an operator-active scaffold plus an unledgered duplicate cedes the active one and retains both, never adopting, deactivating, or deleting either", async () => {
+test("Review round finding 1: reconciliation facing an operator-active scaffold plus an unledgered duplicate keeps the active one in front and retains both, never adopting, deactivating, or deleting either", async () => {
   const jobID = "job_scenario_duplicate_reconcile";
   const candidateID = "cand_duplicate_0001";
   const bindingID = "bind_duplicate_0001";
@@ -23785,9 +24028,9 @@ test("Review round finding 1: reconciliation facing an operator-active scaffold 
   // bind request (for whichever tab it ends up driving) proves that pass
   // has already completed.
   await h.port.waitForFrame("institutional_bind_request");
-  // Never deactivated, never adopted as the working scaffold: the
-  // operator's activation is permanent cession, not a papio-overridable
-  // hint — persisted on the ledger record, not merely inferred.
+  // Never deactivated, never adopted as the working scaffold, never closed
+  // while in front. Activation alone no longer cedes (operator decision
+  // 2026-09-23): only pinning or moving a tab out of papio's container does.
   expect(
     h.tabs.updates.some(
       (update) =>
@@ -23796,7 +24039,7 @@ test("Review round finding 1: reconciliation facing an operator-active scaffold 
   ).toBe(false);
   expect(h.tabs.snapshot(activeTab.id!)?.active).toBe(true);
   expect(h.tabs.removed).not.toContain(activeTab.id);
-  expect(internals.tabLedgerCache[String(activeTab.id)]?.ceded).toBe(true);
+  expect(internals.tabLedgerCache[String(activeTab.id)]?.ceded).toBeUndefined();
   // Never silently deleted: an unledgered duplicate is retained, never
   // routed through closeOwnedTab's materialization-reconcile bypass
   // (which needs no birth record at all) just because its URL matches.

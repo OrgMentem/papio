@@ -74,14 +74,13 @@ export interface SurfaceBirthRecord {
    * (background.ts `CedeReason`), never page-derived text. Absent on records
    * ceded before this field existed. */
   ceded_reason?: string;
-  /** Set once the surface has become retained content: papio created it, it
-   * navigated to a PDF inside papio's own container, and the acquired paper
-   * is now on screen. Retention is deliberate (papio never auto-closes
-   * content), but it is retention of ONE confirmation surface per paper -
-   * so unlike `ceded` this keeps `job_id`, which is what lets a later
-   * duplicate for the same paper supersede an older cold copy. Ceding
-   * instead dropped that identity, so retention silently became
-   * per-attempt: measured live 2026-08-26, fourteen copies of one paper. */
+  /** Written only by builds before 2026-09-23, which retained a surface that
+   * showed an acquired PDF as the paper's "confirmation surface" and refused
+   * every close of it. papio no longer keeps such tabs (operator decision,
+   * 2026-09-23): nothing writes this field now, and the reconcile pass closes
+   * a record that carries it like any other surface whose job has moved on.
+   * It is still parsed so those records load, and still read so a drive never
+   * reuses a finished paper's tab as its route. */
   content?: true;
   /** True only for entries migrated from the pre-v2 raw-URL ledger whose
    * provenance cannot be re-verified (e.g. no jobID to correlate against).

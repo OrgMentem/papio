@@ -11,6 +11,7 @@ import {
   TOAST_WINDOW_SIZE,
   renderPapioMark,
   renderToast,
+  toastCopy,
   toastKindForLoss,
 } from "../src/toast-view";
 
@@ -21,6 +22,13 @@ function toastDocument(): { doc: Document; container: HTMLElement } {
   doc.body.append(container);
   return { doc, container };
 }
+
+/** Every sentence the surface can show: the closed table, plus the one copy
+ * built from a count, at a count wide enough to be the longest it gets. */
+const EVERY_COPY = [
+  ...Object.entries(TOAST_COPY),
+  ["paper_filed (batch)", toastCopy({ kind: "paper_filed", job_id: "filed:b", count: 999 })],
+] as const;
 
 test("the toast offers exactly one action and one dismissal", () => {
   const { doc, container } = toastDocument();
@@ -114,7 +122,7 @@ test("no copy entry names an identifier, provider, or URL", () => {
   // The closed copy table is the whole vocabulary of this surface. A future
   // entry that interpolates a title or a provider name fails here rather than
   // in review.
-  for (const [kind, copy] of Object.entries(TOAST_COPY)) {
+  for (const [kind, copy] of EVERY_COPY) {
     expect(copy.message, kind).not.toMatch(/https?:|\bdoi\b|10\.\d{4}|job[_-]/i);
     expect(copy.action, kind).not.toMatch(/https?:|\bdoi\b|10\.\d{4}|job[_-]/i);
     // Brevity, measured directly. A sentence count was the wrong proxy:
@@ -139,6 +147,17 @@ test("re-rendering replaces the toast instead of stacking it", () => {
   expect(container.querySelectorAll(".toast-message")).toHaveLength(1);
   expect(doc.getElementById("toast-action")?.textContent).toBe("Open a new sign-in tab");
   expect(container.dataset.kind).toBe("institution_claim_lost");
+});
+
+test("a batch of filed papers is one sentence with its count, and one paper reads as one", () => {
+  const { doc, container } = toastDocument();
+  const batch = renderToast(doc, container, { kind: "paper_filed", job_id: "filed:b", count: 3 });
+  expect(batch.message.textContent).toBe("papio filed 3 papers and closed their tabs.");
+  expect(batch.action.textContent).toBe("Reopen");
+  const single = renderToast(doc, container, { kind: "paper_filed", job_id: "filed:b", count: 1 });
+  expect(single.message.textContent).toBe("papio filed the paper and closed its tab.");
+  // The batch id is the extension's own handle, never shown.
+  expect(container.textContent).not.toContain("filed:b");
 });
 
 test("a loss that lost nothing raises no toast", () => {
@@ -197,7 +216,7 @@ test("the window is wide enough for the longest copy to wrap to two lines", () =
   expect(TOAST_WINDOW_SIZE.width).toBeGreaterThanOrEqual(measuredBoundaryAt28 + 20);
   // And this one pins the COPY, which is what a future wording change would
   // break: a longer sentence re-wraps and the window no longer fits it.
-  for (const [kind, copy] of Object.entries(TOAST_COPY)) {
+  for (const [kind, copy] of EVERY_COPY) {
     const longestWord = Math.max(...copy.message.split(" ").map((word) => word.length));
     expect(longestWord, `${kind} has an unwrappable word`).toBeLessThanOrEqual(14);
     // Mark, message, and action label share one row. Both together past this and
