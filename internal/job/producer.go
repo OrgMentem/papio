@@ -183,6 +183,8 @@ func deriveArtifactProducerTx(ctx context.Context, tx *sql.Tx, jobID string, can
 	for _, kind := range producerEventKinds {
 		args = append(args, kind)
 	}
+	// #nosec G202 -- only generated "?" placeholders enter the query text; the
+	// job ID and event kinds remain bound arguments.
 	rows, err := tx.QueryContext(ctx, `SELECT seq, kind, detail_json FROM events
 		WHERE job_id = ? AND kind IN (`+placeholders+`) ORDER BY seq ASC`, args...)
 	if err != nil {

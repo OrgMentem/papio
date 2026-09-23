@@ -22,6 +22,13 @@ import (
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+// sameSentinel reports whether err is target with nothing added: errors.Is
+// matches and the message is target's own, so no wrapper carries private
+// content out.
+func sameSentinel(err, target error) bool {
+	return errors.Is(err, target) && err.Error() == target.Error()
+}
+
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 const validResponse = `{"model":"jev-1.13.0","answers":{"action":{"type":"choice","choice":"c_1","probabilities":{"c_1":0.8,"WAIT":0.1,"BLOCKED":0.1},"confidence":0.7}},"usage":{"input_tokens":123,"output_tokens":27}}`
@@ -335,7 +342,7 @@ func TestTypeSafeCancellationDuringRequest(t *testing.T) {
 	cancel()
 	select {
 	case err := <-result:
-		if err != context.Canceled {
+		if !sameSentinel(err, context.Canceled) {
 			t.Fatalf("unredacted or incorrect cancellation: %v", err)
 		}
 	case <-time.After(time.Second):
@@ -357,7 +364,7 @@ func TestTypeSafeTimeoutCeiling(t *testing.T) {
 				start := time.Now()
 				_, err := backend.Decide(ctx, observation())
 				want := min(callerTimeout, 30*time.Second)
-				if err != context.DeadlineExceeded || time.Since(start) != want {
+				if !sameSentinel(err, context.DeadlineExceeded) || time.Since(start) != want {
 					t.Fatalf("elapsed=%s error=%v want=%s", time.Since(start), err, want)
 				}
 			})
@@ -398,7 +405,8 @@ func TestTypeSafeCancellationWhileReadingBody(t *testing.T) {
 	cancel()
 	select {
 	case err := <-result:
-		if err != context.Canceled || !body.closed {
+		// The body error wraps private response content; only the bare sentinel may escape.
+		if !sameSentinel(err, context.Canceled) || !body.closed {
 			t.Fatalf("body cancellation error=%v closed=%t", err, body.closed)
 		}
 	case <-time.After(time.Second):
@@ -424,7 +432,7 @@ func TestTypeSafeBodyRespectsShorterClientTimeout(t *testing.T) {
 		}
 		start := time.Now()
 		_, err = backend.Decide(context.Background(), observation())
-		if err != context.DeadlineExceeded || time.Since(start) != 2*time.Second || !body.closed {
+		if !sameSentinel(err, context.DeadlineExceeded) || time.Since(start) != 2*time.Second || !body.closed {
 			t.Fatalf("body deadline error=%v elapsed=%s closed=%t", err, time.Since(start), body.closed)
 		}
 	})

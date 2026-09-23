@@ -35,7 +35,7 @@ func keyringReference(ref string) bool {
 		return false
 	}
 	for _, c := range ref[len("keyring:"):] {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -52,7 +52,9 @@ func EnvironmentName(ref string) (string, bool) {
 		return "", false
 	}
 	for i, c := range name {
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || (i > 0 && c >= '0' && c <= '9')) {
+		letter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'
+		digit := i > 0 && c >= '0' && c <= '9'
+		if !letter && !digit {
 			return "", false
 		}
 	}

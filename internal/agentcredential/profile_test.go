@@ -60,7 +60,7 @@ func TestProfileRelativePaths(t *testing.T) {
 
 func TestProfileRejectsUnusablePathsWithoutExposingThem(t *testing.T) {
 	for _, paths := range [][2]string{{"", "data"}, {"config", ""}, {"private\x00config", "data"}, {"config", "private\x00data"}, {"invalid\xffconfig", "data"}} {
-		if got, err := Profile(paths[0], paths[1]); got != "" || err != ErrInvalidProfile {
+		if got, err := Profile(paths[0], paths[1]); got != "" || !sameSentinel(err, ErrInvalidProfile) {
 			t.Fatal("invalid path accepted or exposed")
 		}
 	}

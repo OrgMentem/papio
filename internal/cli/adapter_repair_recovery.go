@@ -213,10 +213,6 @@ func countRepairEvents(events []repairEvent, after, before int64, match func(rep
 	return count
 }
 
-func isAgentDecisionEvent(event repairEvent) bool {
-	return event.kind == "browser.agent_decision_requested" || event.kind == "browser.agent_decision_completed"
-}
-
 // linkAdapterRepairRecovery proves, from the daemon's own record, that the
 // capture being repaired is the declarative failure of one job and that the
 // same job then reached ready with a validated PDF through a browser delivery.

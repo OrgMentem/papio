@@ -141,6 +141,8 @@ func Encode(r Record) (string, error) {
 		return "", err
 	}
 	w := wireRecord{1, r.Kind, r.APIKey, r.ClientID, r.ClientSecret, r.URL, r.Bearer}
+	// #nosec G117 -- Encode exists to serialize the secret for the credential
+	// store; callers persist the result there or discard it after validation.
 	encoded, err := json.Marshal(w)
 	if err != nil || len(encoded) > MaxEncodedBytes {
 		return "", ErrInvalidRecord

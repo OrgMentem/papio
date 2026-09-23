@@ -172,7 +172,7 @@ func (js *Store) ReserveNativeViewerSave(ctx context.Context, in NativeViewerSav
 }
 
 func nativeViewerCurrentTx(ctx context.Context, tx *sql.Tx, r NativeViewerSaveReservation, now time.Time) error {
-	if !r.NativeViewerSaveInput.valid(now) || !nativeViewerID(r.OperationID) || !nativeViewerID(r.PermitID) {
+	if !r.valid(now) || !nativeViewerID(r.OperationID) || !nativeViewerID(r.PermitID) {
 		return ErrEffectPermitStale
 	}
 	p, err := nativeViewerRecordTx(ctx, tx, r)

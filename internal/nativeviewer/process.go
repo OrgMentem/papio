@@ -60,6 +60,8 @@ func (d *processDriver) Prepare(ctx context.Context, r Request) (Session, error)
 	if _, err := encodeRequest(request); err != nil {
 		return nil, err
 	}
+	// #nosec G204 -- d.path is the operator-selected helper that NewDriver
+	// resolved to an absolute, regular, executable file; it takes no arguments.
 	cmd := exec.Command(d.path)
 	if d.command != nil {
 		cmd = d.command()

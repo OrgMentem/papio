@@ -1046,7 +1046,8 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 			droppedForMissingJob++
 			continue
 		}
-		if row.State != job.StateAwaitingHuman && !(row.State == job.StateUnavailable && action.Kind == "openurl_available") {
+		openable := row.State == job.StateAwaitingHuman || (row.State == job.StateUnavailable && action.Kind == "openurl_available")
+		if !openable {
 			continue
 		}
 		target, ok := actionURL(action, row, instFor)

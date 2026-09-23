@@ -55,7 +55,10 @@ func (b *Bridge) RetryPublisher(ctx context.Context, actionID, revision int64) (
 		_, err = b.prepareMaterializationCandidate(ctx, *row)
 	}
 	if err != nil {
-		return "", fmt.Errorf("%w: route retry recorded for %s; use actions open --job %s to resume: %v", job.ErrConflict, id, id, err)
+		// The cause is formatted, not wrapped: the retry is already recorded, so
+		// the caller must see ErrConflict and the resume hint even when the cause
+		// is sql.ErrNoRows, which api.failure would otherwise report as not_found.
+		return "", fmt.Errorf("%w: route retry recorded for %s; use actions open --job %s to resume: %v", job.ErrConflict, id, id, err) //nolint:errorlint // see above
 	}
 	return id, nil
 }

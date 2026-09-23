@@ -17,6 +17,13 @@ import (
 
 const testReference = "keyring:0123456789abcdef0123456789abcdef"
 
+// sameSentinel reports whether err is target with nothing added: errors.Is
+// matches and the message is target's own, so no wrapper carries private
+// content out.
+func sameSentinel(err, target error) bool {
+	return errors.Is(err, target) && err.Error() == target.Error()
+}
+
 func testStore(b backend) *Store {
 	return &Store{service: serviceName, backend: b, busy: new(atomic.Bool), timeout: operationTimeout}
 }
@@ -68,7 +75,7 @@ func TestStoreRoundTripReplaceAndIsolation(t *testing.T) {
 	other := "keyring:" + strings.Repeat("b", 32)
 	initial := Record{Kind: KindOpenAIREClient, ClientID: "synthetic-id", ClientSecret: "synthetic-secret"}
 	replacement := Record{Kind: KindOpenAIREClient, ClientID: "synthetic-new-id", ClientSecret: "synthetic-new-secret"}
-	if r, err := s.Load(ctx, testReference); r != (Record{}) || err != ErrNotFound {
+	if r, err := s.Load(ctx, testReference); r != (Record{}) || !sameSentinel(err, ErrNotFound) {
 		t.Fatal("missing entry misclassified")
 	}
 	for _, ref := range []string{testReference, other} {
@@ -85,7 +92,7 @@ func TestStoreRoundTripReplaceAndIsolation(t *testing.T) {
 	if err := s.Delete(ctx, testReference); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Delete(ctx, testReference); err != ErrNotFound {
+	if err := s.Delete(ctx, testReference); !sameSentinel(err, ErrNotFound) {
 		t.Fatal("second delete was not missing")
 	}
 	if r, err := s.Load(ctx, other); r != initial || err != nil {
@@ -105,18 +112,18 @@ func TestStoreSanitizesBackendErrorsAndCorruptRecords(t *testing.T) {
 			save:   func(string, string, string) error { return cause },
 			delete: func(string, string) error { return cause },
 		})
-		if record, err := s.Load(context.Background(), testReference); record != (Record{}) || err != want {
+		if record, err := s.Load(context.Background(), testReference); record != (Record{}) || !sameSentinel(err, want) {
 			t.Fatal("load exposed backend data or misclassified error")
 		}
 		for _, err := range []error{s.Save(context.Background(), testReference, validRecords()[0]), s.Delete(context.Background(), testReference)} {
-			if err != want || errors.Is(err, cause) {
+			if !sameSentinel(err, want) || errors.Is(err, cause) {
 				t.Fatal("mutation exposed backend error or misclassified it")
 			}
 		}
 	}
 	for _, invalid := range []string{"", "private-malformed", `{"version":1,"kind":"core","api_key":"private","surprise":true}`, strings.Repeat("a", MaxEncodedBytes+1)} {
 		s := testStore(backend{load: func(string, string) (string, error) { return invalid, nil }})
-		if record, err := s.Load(context.Background(), testReference); record != (Record{}) || err != ErrInvalidRecord {
+		if record, err := s.Load(context.Background(), testReference); record != (Record{}) || !sameSentinel(err, ErrInvalidRecord) {
 			t.Fatal("invalid stored value escaped")
 		}
 	}
@@ -131,18 +138,18 @@ func TestStoreRejectsBeforeDispatch(t *testing.T) {
 	})
 	ctx := context.Background()
 	for _, ref := range []string{"", "../private/path", "env:VALID_ENV", "keyring:" + strings.Repeat("A", 32)} {
-		if _, err := s.Load(ctx, ref); err != ErrInvalidReference {
+		if _, err := s.Load(ctx, ref); !sameSentinel(err, ErrInvalidReference) {
 			t.Fatal("non-keyring reference accepted by store")
 		}
-		if err := s.Save(ctx, ref, validRecords()[0]); err != ErrInvalidReference {
+		if err := s.Save(ctx, ref, validRecords()[0]); !sameSentinel(err, ErrInvalidReference) {
 			t.Fatal("non-keyring reference accepted by store")
 		}
-		if err := s.Delete(ctx, ref); err != ErrInvalidReference {
+		if err := s.Delete(ctx, ref); !sameSentinel(err, ErrInvalidReference) {
 			t.Fatal("non-keyring reference accepted by store")
 		}
 	}
 	for _, record := range []Record{{}, {Kind: KindCORE, APIKey: strings.Repeat("\"", 1024)}, {Kind: KindOpenAIREClient, ClientID: strings.Repeat("a", 1100), ClientSecret: strings.Repeat("b", 1100)}} {
-		if err := s.Save(ctx, testReference, record); err != ErrInvalidRecord {
+		if err := s.Save(ctx, testReference, record); !sameSentinel(err, ErrInvalidRecord) {
 			t.Fatal("invalid/oversized record accepted")
 		}
 	}
@@ -150,7 +157,7 @@ func TestStoreRejectsBeforeDispatch(t *testing.T) {
 	cancel(errors.New("synthetic-private-cancellation-cause"))
 	_, err := s.Load(canceled, testReference)
 	for _, err := range []error{err, s.Save(canceled, testReference, validRecords()[0]), s.Delete(canceled, testReference)} {
-		if err != context.Canceled || errors.Is(err, ErrUncertain) {
+		if !sameSentinel(err, context.Canceled) || errors.Is(err, ErrUncertain) {
 			t.Fatal("pre-dispatch cancellation should be certain and sanitized")
 		}
 	}
@@ -158,10 +165,10 @@ func TestStoreRejectsBeforeDispatch(t *testing.T) {
 		t.Fatal("invalid request dispatched or retained gate")
 	}
 	var missing *Store
-	if _, err := missing.Load(ctx, testReference); err != ErrUnavailable {
+	if _, err := missing.Load(ctx, testReference); !sameSentinel(err, ErrUnavailable) {
 		t.Fatal("nil store was not unavailable")
 	}
-	if err := (&Store{}).Delete(ctx, testReference); err != ErrUnavailable {
+	if err := (&Store{}).Delete(ctx, testReference); !sameSentinel(err, ErrUnavailable) {
 		t.Fatal("zero store was not unavailable")
 	}
 }
@@ -207,13 +214,13 @@ func TestStoreCanceledMutationRetainsGateUntilCompletion(t *testing.T) {
 			var wg sync.WaitGroup
 			for range 100 {
 				wg.Go(func() {
-					if err := sibling.Save(context.Background(), testReference, validRecords()[0]); err != ErrBusy {
+					if err := sibling.Save(context.Background(), testReference, validRecords()[0]); !sameSentinel(err, ErrBusy) {
 						t.Errorf("overlapping save: %v", err)
 					}
-					if err := sibling.Delete(context.Background(), testReference); err != ErrBusy {
+					if err := sibling.Delete(context.Background(), testReference); !sameSentinel(err, ErrBusy) {
 						t.Errorf("overlapping delete: %v", err)
 					}
-					if record, err := sibling.Load(context.Background(), testReference); record != (Record{}) || err != ErrBusy {
+					if record, err := sibling.Load(context.Background(), testReference); record != (Record{}) || !sameSentinel(err, ErrBusy) {
 						t.Errorf("overlapping load: %v", err)
 					}
 				})
@@ -261,7 +268,7 @@ func TestStoreLoadTimeoutIsNotAbsenceOrMutation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	record, err := s.Load(ctx, testReference)
-	if record != (Record{}) || err != context.DeadlineExceeded || errors.Is(err, ErrUncertain) || errors.Is(err, ErrNotFound) || !s.busy.Load() {
+	if record != (Record{}) || !sameSentinel(err, context.DeadlineExceeded) || errors.Is(err, ErrUncertain) || errors.Is(err, ErrNotFound) || !s.busy.Load() {
 		t.Fatal("load deadline misclassified or gate released")
 	}
 }
@@ -278,7 +285,7 @@ func TestNewStoresShareOneGateWithoutOSAccess(t *testing.T) {
 		t.Fatal("unexpected real store operation")
 	}
 	defer a.busy.Store(false)
-	if _, err := b.Load(context.Background(), testReference); err != ErrBusy {
+	if _, err := b.Load(context.Background(), testReference); !sameSentinel(err, ErrBusy) {
 		t.Fatal("new store bypassed gate")
 	}
 }

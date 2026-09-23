@@ -63,7 +63,7 @@ func TestRecordKindValidation(t *testing.T) {
 		} else {
 			bad.ClientSecret = "synthetic-unexpected"
 		}
-		if bad.Validate() != ErrInvalidRecord {
+		if !sameSentinel(bad.Validate(), ErrInvalidRecord) {
 			t.Fatal("fields from another kind accepted")
 		}
 	}
@@ -78,12 +78,12 @@ func TestRecordKindValidation(t *testing.T) {
 		{Kind: KindWebhook, URL: "https://example.com/space here"},
 		{Kind: KindWebhook, URL: "https://example.com", Bearer: "unsafe\r\nheader"},
 	} {
-		if invalid.Validate() != ErrInvalidRecord {
+		if !sameSentinel(invalid.Validate(), ErrInvalidRecord) {
 			t.Fatal("invalid credential accepted")
 		}
 	}
 	for _, key := range []string{"", " ", " leading", "trailing ", "embedded space", "line\nbreak", "\x00", "\t", "\r", "\x1f", "\x7f", "é", "\xff", strings.Repeat("a", 1025)} {
-		if (Record{Kind: KindTypeSafe, APIKey: key}).Validate() != ErrInvalidRecord {
+		if !sameSentinel((Record{Kind: KindTypeSafe, APIKey: key}).Validate(), ErrInvalidRecord) {
 			t.Fatal("TypeSafe compatibility validation changed")
 		}
 	}
@@ -105,7 +105,7 @@ func TestRecordKindValidation(t *testing.T) {
 			}
 		}
 		for _, key := range []string{"", " ", "bad\nkey", "bad\x7fkey", "bad\u0085key", "\xff"} {
-			if (Record{Kind: kind, APIKey: key}).Validate() != ErrInvalidRecord {
+			if !sameSentinel((Record{Kind: kind, APIKey: key}).Validate(), ErrInvalidRecord) {
 				t.Fatal("invalid token accepted")
 			}
 		}
@@ -138,7 +138,7 @@ func TestDecodeStrictWireShape(t *testing.T) {
 		`{"version":1,"kind":"core","api_key":"synthetic"} trailing`,
 		"{\"version\":1,\"kind\":\"core\",\"api_key\":\"\xff\"}",
 	} {
-		if record, err := Decode(encoded); err != ErrInvalidRecord || record != (Record{}) {
+		if record, err := Decode(encoded); !sameSentinel(err, ErrInvalidRecord) || record != (Record{}) {
 			t.Fatal("invalid wire record accepted or included in error")
 		}
 	}
@@ -170,14 +170,14 @@ func TestEncodedSizeBoundUsesWholeUTF8Record(t *testing.T) {
 		t.Fatal("exact limit did not round trip")
 	}
 	base.ClientSecret += "a"
-	if value, err := Encode(base); value != "" || err != ErrInvalidRecord {
+	if value, err := Encode(base); value != "" || !sameSentinel(err, ErrInvalidRecord) {
 		t.Fatal("oversized record encoded")
 	}
-	if record, err := Decode(exact + " "); record != (Record{}) || err != ErrInvalidRecord {
+	if record, err := Decode(exact + " "); record != (Record{}) || !sameSentinel(err, ErrInvalidRecord) {
 		t.Fatal("oversized wire decoded")
 	}
 	for _, secret := range []string{strings.Repeat("界", 700), strings.Repeat("\"", 1024), strings.Repeat("<", 500)} {
-		if encoded, err := Encode(Record{Kind: KindCORE, APIKey: secret}); encoded != "" || err != ErrInvalidRecord {
+		if encoded, err := Encode(Record{Kind: KindCORE, APIKey: secret}); encoded != "" || !sameSentinel(err, ErrInvalidRecord) {
 			t.Fatal("UTF8 or escaped JSON expansion bypassed bound")
 		}
 	}
@@ -204,14 +204,14 @@ func TestDecodeEnvironment(t *testing.T) {
 		}
 	}
 	for _, value := range []string{"raw-ambiguous-token", `{"kind":"openaire_token","api_key":"token"}`, `{"version":1,"kind":"core","api_key":"token"}`} {
-		if got, err := DecodeEnvironment(value, allowed); got != (Record{}) || err != ErrInvalidRecord {
+		if got, err := DecodeEnvironment(value, allowed); got != (Record{}) || !sameSentinel(err, ErrInvalidRecord) {
 			t.Fatal("ambiguous or wrong-kind environment value accepted")
 		}
 	}
-	if _, err := DecodeEnvironment(" leading", []Kind{KindTypeSafe}); err != ErrInvalidRecord {
+	if _, err := DecodeEnvironment(" leading", []Kind{KindTypeSafe}); !sameSentinel(err, ErrInvalidRecord) {
 		t.Fatal("raw environment value was trimmed")
 	}
-	if _, err := DecodeEnvironment("synthetic", nil); err != ErrInvalidRecord {
+	if _, err := DecodeEnvironment("synthetic", nil); !sameSentinel(err, ErrInvalidRecord) {
 		t.Fatal("missing kind accepted")
 	}
 }
@@ -237,7 +237,7 @@ func TestReferenceValidationAndGeneration(t *testing.T) {
 		}
 	}
 	for _, ref := range []string{"", "ENV:KEY", "env:", "env:1KEY", "env:MY-KEY", "env:é", "env:" + strings.Repeat("A", 129), "env:KEY\n", "keyring:" + strings.Repeat("A", 32), "keyring:" + strings.Repeat("g", 32), "keyring:" + strings.Repeat("a", 31), "keyring:" + strings.Repeat("a", 33), "file:/secret", "../path"} {
-		if ValidateReference(ref) != ErrInvalidReference {
+		if !sameSentinel(ValidateReference(ref), ErrInvalidReference) {
 			t.Fatal("invalid reference accepted")
 		}
 		if name, ok := EnvironmentName(ref); name != "" || ok {

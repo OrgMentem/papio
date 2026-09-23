@@ -80,7 +80,7 @@ func IPAddresses(text, replacement string) string {
 		if start > 0 && (wordByte(text[start-1]) || text[start-1] == ':' || text[start-1] == '.') {
 			return false
 		}
-		return end == len(text) || !(wordByte(text[end]) || text[end] == ':')
+		return end == len(text) || (!wordByte(text[end]) && text[end] != ':')
 	})
 }
 

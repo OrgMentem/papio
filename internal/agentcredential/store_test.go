@@ -17,13 +17,20 @@ import (
 
 const testProfile = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+// sameSentinel reports whether err is target with nothing added: errors.Is
+// matches and the message is target's own, so no wrapper carries private
+// content out.
+func sameSentinel(err, target error) bool {
+	return errors.Is(err, target) && err.Error() == target.Error()
+}
+
 func testStore(b backend) *Store {
 	return &Store{service: serviceName, backend: b, busy: new(atomic.Bool), timeout: operationTimeout}
 }
 
 func TestValidateKey(t *testing.T) {
 	for _, key := range []string{"", " ", " leading", "trailing ", "embedded space", "line\nbreak", "\x00", "\t", "\r", "\x1f", "\x7f", "é", "\xff", strings.Repeat("a", 1025)} {
-		if err := ValidateKey(key); err != ErrInvalidKey {
+		if err := ValidateKey(key); !sameSentinel(err, ErrInvalidKey) {
 			t.Fatal("invalid key was accepted or exposed in an error")
 		}
 	}
@@ -75,7 +82,7 @@ func TestStoreRoundTripAndProfileIsolation(t *testing.T) {
 	s := testStore(b)
 	ctx := context.Background()
 	other := strings.Repeat("b", 64)
-	if key, err := s.Load(ctx, testProfile); key != "" || err != ErrNotFound {
+	if key, err := s.Load(ctx, testProfile); key != "" || !sameSentinel(err, ErrNotFound) {
 		t.Fatalf("missing load: empty=%v err=%v", key == "", err)
 	}
 	for _, profile := range []string{testProfile, other} {
@@ -92,7 +99,7 @@ func TestStoreRoundTripAndProfileIsolation(t *testing.T) {
 	if err := s.Delete(ctx, testProfile); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Delete(ctx, testProfile); err != ErrNotFound {
+	if err := s.Delete(ctx, testProfile); !sameSentinel(err, ErrNotFound) {
 		t.Fatalf("second delete: %v", err)
 	}
 	if key, err := s.Load(ctx, other); key != "synthetic-initial" || err != nil {
@@ -113,18 +120,18 @@ func TestStoreSanitizesBackendErrorsAndStoredKeys(t *testing.T) {
 			delete: func(string, string) error { return cause },
 		})
 		key, err := s.Load(context.Background(), testProfile)
-		if key != "" || err != want {
+		if key != "" || !sameSentinel(err, want) {
 			t.Fatal("load exposed backend data or misclassified error")
 		}
 		for _, err := range []error{s.Save(context.Background(), testProfile, private), s.Delete(context.Background(), testProfile)} {
-			if err != want || errors.Is(err, cause) {
+			if !sameSentinel(err, want) || errors.Is(err, cause) {
 				t.Fatal("mutation exposed backend error or misclassified it")
 			}
 		}
 	}
 	for _, invalid := range []string{"", " ", "synthetic invalid", "synthetic\ninvalid", strings.Repeat("a", 1025)} {
 		s := testStore(backend{load: func(string, string) (string, error) { return invalid, nil }})
-		if key, err := s.Load(context.Background(), testProfile); key != "" || err != ErrInvalidKey {
+		if key, err := s.Load(context.Background(), testProfile); key != "" || !sameSentinel(err, ErrInvalidKey) {
 			t.Fatal("invalid stored value escaped")
 		}
 	}
@@ -135,24 +142,24 @@ func TestStoreRejectsBeforeDispatch(t *testing.T) {
 	s := testStore(backend{})
 	ctx := context.Background()
 	for _, profile := range []string{"", "../private/path", strings.Repeat("a", 63), strings.Repeat("a", 65), strings.Repeat("A", 64), strings.Repeat("g", 64)} {
-		if _, err := s.Load(ctx, profile); err != ErrInvalidProfile {
+		if _, err := s.Load(ctx, profile); !sameSentinel(err, ErrInvalidProfile) {
 			t.Fatal("invalid profile accepted")
 		}
-		if err := s.Save(ctx, profile, "synthetic-valid"); err != ErrInvalidProfile {
+		if err := s.Save(ctx, profile, "synthetic-valid"); !sameSentinel(err, ErrInvalidProfile) {
 			t.Fatal("invalid profile accepted")
 		}
-		if err := s.Delete(ctx, profile); err != ErrInvalidProfile {
+		if err := s.Delete(ctx, profile); !sameSentinel(err, ErrInvalidProfile) {
 			t.Fatal("invalid profile accepted")
 		}
 	}
-	if err := s.Save(ctx, testProfile, ""); err != ErrInvalidKey {
+	if err := s.Save(ctx, testProfile, ""); !sameSentinel(err, ErrInvalidKey) {
 		t.Fatal("invalid key accepted")
 	}
 	canceled, cancel := context.WithCancelCause(ctx)
 	cancel(errors.New("synthetic-private-cancellation-cause"))
 	_, err := s.Load(canceled, testProfile)
 	for _, err := range []error{err, s.Save(canceled, testProfile, "synthetic-valid"), s.Delete(canceled, testProfile)} {
-		if err != context.Canceled || errors.Is(err, ErrUncertain) {
+		if !sameSentinel(err, context.Canceled) || errors.Is(err, ErrUncertain) {
 			t.Fatal("pre-dispatch cancellation should be certain and sanitized")
 		}
 	}
@@ -205,13 +212,13 @@ func TestStoreTimedOutMutationRetainsGateUntilCompletion(t *testing.T) {
 			var wg sync.WaitGroup
 			for range 100 {
 				wg.Go(func() {
-					if err := sibling.Save(context.Background(), testProfile, "synthetic-retry"); err != ErrBusy {
+					if err := sibling.Save(context.Background(), testProfile, "synthetic-retry"); !sameSentinel(err, ErrBusy) {
 						t.Errorf("overlapping save: %v", err)
 					}
-					if err := sibling.Delete(context.Background(), testProfile); err != ErrBusy {
+					if err := sibling.Delete(context.Background(), testProfile); !sameSentinel(err, ErrBusy) {
 						t.Errorf("overlapping delete: %v", err)
 					}
-					if key, err := sibling.Load(context.Background(), testProfile); key != "" || err != ErrBusy {
+					if key, err := sibling.Load(context.Background(), testProfile); key != "" || !sameSentinel(err, ErrBusy) {
 						t.Errorf("overlapping load: %v", err)
 					}
 				})
@@ -261,7 +268,7 @@ func TestStoreLoadTimeoutIsNotAbsenceOrMutation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	key, err := s.Load(ctx, testProfile)
-	if key != "" || err != context.DeadlineExceeded || errors.Is(err, ErrUncertain) || errors.Is(err, ErrNotFound) {
+	if key != "" || !sameSentinel(err, context.DeadlineExceeded) || errors.Is(err, ErrUncertain) || errors.Is(err, ErrNotFound) {
 		t.Fatalf("load deadline misclassified: %v", err)
 	}
 	if !s.busy.Load() {
@@ -282,7 +289,7 @@ func TestNewStoresShareOneGateWithoutOSAccess(t *testing.T) {
 		t.Fatal("unexpected real store operation")
 	}
 	defer a.busy.Store(false)
-	if _, err := b.Load(context.Background(), testProfile); err != ErrBusy {
+	if _, err := b.Load(context.Background(), testProfile); !sameSentinel(err, ErrBusy) {
 		t.Fatalf("new store bypassed gate: %v", err)
 	}
 }

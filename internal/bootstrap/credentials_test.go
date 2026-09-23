@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pelletier/go-toml/v2"
 	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/discovery"
@@ -21,6 +20,8 @@ import (
 	"papio/internal/runtimecredential"
 	"papio/internal/store/storetest"
 	"papio/internal/work"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 func TestRuntimeCredentialsReachProductionClientsWithoutConfigHydration(t *testing.T) {

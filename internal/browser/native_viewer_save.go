@@ -298,6 +298,9 @@ func (b *Bridge) nativeViewerSaveRequest(ctx context.Context, sessionID, jobID s
 	r.root, r.helper = nil, nil
 	done := make(chan struct{})
 	request := *p // raw URL exists only for this native dispatch, never in receipts
+	// #nosec G118 -- the native save outlives this request by design: the
+	// handler waits at most five seconds, and r.ctx bounds the operation to
+	// nativeViewerLifetime.
 	go b.runNativeViewer(r, request, root, helper, done)
 	b.mu.Unlock()
 	timer := time.NewTimer(5 * time.Second)

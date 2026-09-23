@@ -184,6 +184,9 @@ func (b *Bridge) agentDecide(ctx context.Context, sessionID, jobID string, p *pr
 	}
 	b.agentDecisions[jobID] = pending
 	backend := b.agentBackend
+	// #nosec G118 -- the decision outlives this poll by design: its context is
+	// bounded by the decision deadline, and cancellation arrives through
+	// pending.cancel and the job-state observer, not the browser request.
 	go b.runAgentDecision(requestContext, pending, backend)
 	return nil, nil
 }

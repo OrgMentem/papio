@@ -19,6 +19,13 @@ import (
 
 const testURL = "https://example.test/resident.pdf?signature=private-test-sentinel#page=1"
 
+// sameSentinel reports whether err is target with nothing added: errors.Is
+// matches and the message is target's own, so no wrapper carries private
+// content out.
+func sameSentinel(err, target error) bool {
+	return errors.Is(err, target) && err.Error() == target.Error()
+}
+
 func requestForTest() Request {
 	return Request{URL: testURL, Filename: "papio-viewer-test_123.pdf", Deadline: time.Now().Add(20 * time.Second)}
 }
@@ -238,7 +245,7 @@ func TestRejectsUniformAndEarlySuccessResponses(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.Advance(context.Background()); err != errProtocol {
+			if _, err := s.Advance(context.Background()); !sameSentinel(err, errProtocol) {
 				t.Fatalf("accepted invalid transition: %v", err)
 			}
 			assertReaped(t, s)
@@ -253,7 +260,7 @@ func TestRefusedSurfaceCancelsBeforeReapWithoutLeakingError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Advance(context.Background()); err != errRejected {
+	if _, err := s.Advance(context.Background()); !sameSentinel(err, errRejected) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertReaped(t, s)
@@ -273,7 +280,7 @@ func TestOnlyKnownHelperCodesSurviveInErrors(t *testing.T) {
 	}
 	for _, code := range []string{"viewer_changed https://example.test/?secret=x", "viewer_changed\nsecret", "unknown"} {
 		err := helperRejection(code)
-		if err != errRejected {
+		if !sameSentinel(err, errRejected) {
 			t.Fatal("unrecognized helper text escaped the allowlist")
 		}
 	}
@@ -370,7 +377,7 @@ func TestValidateRequestBeforeStartingHelper(t *testing.T) {
 		d, trace := helperDriver(t, "normal")
 		r := requestForTest()
 		change(&r)
-		if _, err := d.Prepare(context.Background(), r); err != errRequest {
+		if _, err := d.Prepare(context.Background(), r); !sameSentinel(err, errRequest) {
 			t.Fatalf("invalid request: %v", err)
 		}
 		if len(readCalls(t, trace)) != 0 {
@@ -401,7 +408,7 @@ func TestPrepareEnvelopePreservesURLAndBoundsEncodedLine(t *testing.T) {
 	// starting a helper, rather than writing a line its bounded reader rejects.
 	d, trace := helperDriver(t, "normal")
 	r.URL = prefix + strings.Repeat(`"`, 8192-len(prefix))
-	if _, err := d.Prepare(context.Background(), r); err != errRequest {
+	if _, err := d.Prepare(context.Background(), r); !sameSentinel(err, errRequest) {
 		t.Fatalf("oversized encoded line: %v", err)
 	}
 	if len(readCalls(t, trace)) != 0 {

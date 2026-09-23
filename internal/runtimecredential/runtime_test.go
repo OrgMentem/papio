@@ -11,12 +11,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pelletier/go-toml/v2"
 	"papio/internal/agentcredential"
 	"papio/internal/budget"
 	"papio/internal/config"
 	"papio/internal/credential"
 	"papio/internal/delivery"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 type readerFunc func(context.Context, string) (credential.Record, error)

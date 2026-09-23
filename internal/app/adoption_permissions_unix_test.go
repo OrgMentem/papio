@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func failAdoptionRootResolution(t *testing.T, _ *Service, root string) (error, func()) {
+func failAdoptionRootResolution(t *testing.T, _ *Service, root string) (func(), error) {
 	t.Helper()
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory permissions")
@@ -27,5 +27,5 @@ func failAdoptionRootResolution(t *testing.T, _ *Service, root string) (error, f
 	if err := os.Chmod(root, 0o000); err != nil {
 		t.Fatal(err)
 	}
-	return os.ErrPermission, restore
+	return restore, os.ErrPermission
 }

@@ -536,7 +536,7 @@ func TestAdoptComponentLeavesOperationalRootFailureUnclassified(t *testing.T) {
 	if err := os.WriteFile(path, pdfBytes("unreadable root"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	want, restore := failAdoptionRootResolution(t, svc, root)
+	restore, want := failAdoptionRootResolution(t, svc, root)
 	// Prove the real filesystem lookup fails with the intended operational
 	// error. The supplied component remains an existing file in the test root.
 	if _, err := filepath.EvalSymlinks(filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)); !errors.Is(err, want) {

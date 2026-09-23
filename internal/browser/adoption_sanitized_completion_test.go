@@ -149,9 +149,10 @@ func TestDownloadCompleteAfterSanitizedSweepRefusesUnprovenLineage(t *testing.T)
 				_, err = jobs.S.DB().ExecContext(ctx, "DELETE FROM events WHERE job_id=? AND kind='job.pdf_sanitized'", id)
 			case "wrong_source_hash", "wrong_artifact_hash", "wrong_event_candidate":
 				field, value := "$.source_sha256", any(strings.Repeat("0", 64))
-				if mode == "wrong_artifact_hash" {
+				switch mode {
+				case "wrong_artifact_hash":
 					field = "$.adopted_sha256"
-				} else if mode == "wrong_event_candidate" {
+				case "wrong_event_candidate":
 					field, value = "$.candidate_id", before.SelectedCandidateID+1
 				}
 				_, err = jobs.S.DB().ExecContext(ctx, "UPDATE events SET detail_json=json_set(detail_json,?,?) WHERE job_id=? AND kind='job.pdf_sanitized'", field, value, id)

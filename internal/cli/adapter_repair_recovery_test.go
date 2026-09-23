@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"papio/internal/api"
-	"papio/internal/config"
-	"papio/internal/daemon"
 	"papio/internal/job"
 	"papio/internal/work"
 )
@@ -254,47 +252,6 @@ func TestScaffoldAdapterRepairAcceptsAgentPathRecoveryAsCorrelation(t *testing.T
 	}
 	if result.Outcome != "proposal" || result.IndependentEvidence {
 		t.Fatalf("result = %+v; want a proposal that still reports the capture row as caller-labelled", result)
-	}
-}
-
-// fixedRPCOptions answers each daemon method from a per-job table and fails on
-// any job or method the caller did not declare.
-func fixedRPCOptions(t *testing.T, details map[string]api.JobDetail, artifacts map[string]*job.Artifact) *options {
-	t.Helper()
-	call := func(_ context.Context, method string, params, result any) error {
-		id := params.(map[string]string)["job_id"]
-		var value any
-		switch method {
-		case "jobs.get":
-			detail, ok := details[id]
-			if !ok {
-				t.Fatalf("unexpected jobs.get %q", id)
-			}
-			value = detail
-		case "artifacts.get":
-			artifact, ok := artifacts[id]
-			if !ok {
-				t.Fatalf("unexpected artifacts.get %q", id)
-			}
-			value = api.ArtifactResult{Artifact: artifact}
-		default:
-			t.Fatalf("unexpected method %q", method)
-		}
-		data, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
-		return json.Unmarshal(data, result)
-	}
-	return &options{
-		daemonVersionChecked: true,
-		configLoader:         func(string) (config.Config, error) { return config.Config{DataDir: t.TempDir()}, nil },
-		newAutostarter: func(socket string) *daemon.Autostarter {
-			return &daemon.Autostarter{SocketPath: socket, Ready: func(context.Context, string) error { return nil }}
-		},
-		rpcCall: func(ctx context.Context, _ string, method string, params, result any) error {
-			return call(ctx, method, params, result)
-		},
 	}
 }
 

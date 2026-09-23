@@ -836,7 +836,7 @@ func TestNativeViewerFixtureTrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := wrapped.Advance(context.Background()); err != safeError {
+	if _, err := wrapped.Advance(context.Background()); !errors.Is(err, safeError) || err.Error() != safeError.Error() {
 		t.Fatal(err)
 	}
 	if err := wrapped.Close(); err != nil {

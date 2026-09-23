@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func failAdoptionRootResolution(t *testing.T, svc *Service, _ string) (error, func()) {
+func failAdoptionRootResolution(t *testing.T, svc *Service, _ string) (func(), error) {
 	t.Helper()
 	// Windows metadata lookup can succeed despite a read-denying DACL. Use an
 	// invalid configured root to exercise the same operational-error branch
@@ -26,5 +26,5 @@ func failAdoptionRootResolution(t *testing.T, svc *Service, _ string) (error, fu
 	t.Cleanup(restore)
 	svc.Config.DataDir = dataDir + "\x00"
 	svc.Config.Browser.AdoptionRoot = filepath.Join(svc.Config.DataDir, "adoptions")
-	return syscall.EINVAL, restore
+	return restore, syscall.EINVAL
 }
