@@ -24,6 +24,15 @@ import (
 // an outbound illiad HTTP call.
 func deliveryTestSystem(t *testing.T) *bootstrap.System {
 	t.Helper()
+	return deliveryTestSystemWith(t, nil)
+}
+
+// deliveryTestSystemWith applies mutate to the configuration before
+// bootstrap. Configuration must change here, not on the returned system:
+// bootstrap hands a copy to the credential runtime, which answers
+// institution lookups from that copy.
+func deliveryTestSystemWith(t *testing.T, mutate func(*config.Config)) *bootstrap.System {
+	t.Helper()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeDelegated
 	cfg.DataDir = storetest.DataDir(t)
@@ -40,6 +49,9 @@ func deliveryTestSystem(t *testing.T) *bootstrap.System {
 		PatronAttestation: "not_required",
 		PatronFeePolicy:   "zero_standard",
 		MonthlyRequestCap: 25,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	system, err := bootstrap.New(context.Background(), cfg)
 	if err != nil {
@@ -133,9 +145,7 @@ func TestDeliverySubmitPrefillOnlyThenGetExplainsGate(t *testing.T) {
 }
 
 func TestDeliverySubmitUnconfiguredProfileReportsNotConfigured(t *testing.T) {
-	system := deliveryTestSystem(t)
-	system.Config.Browser.DocumentDelivery = nil
-	system.App.Config.Browser.DocumentDelivery = nil
+	system := deliveryTestSystemWith(t, func(cfg *config.Config) { cfg.Browser.DocumentDelivery = nil })
 	router := Router(system)
 	jobID := deliveryTestJob(t, system, "req_delivery_unconfigured", "10.1234/unconfigured")
 
