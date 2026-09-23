@@ -344,11 +344,31 @@ func (js *Store) ArtifactProducerForArtifact(ctx context.Context, jobID, filenam
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if found != nil && found.Kind == GenericDrive && found.Strategy == NativeViewerSaveStrategy {
+		tx, err := js.S.DB().BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = tx.Rollback() }()
+		admission, err := nativeViewerProducerAdmissionTx(ctx, tx, jobID, *found)
+		if err != nil {
+			return nil, err
+		}
+		if admission.Filename != filename || admission.SHA256 != sha256 {
+			return nil, ErrEffectPermitStale
+		}
+	}
 	return found, nil
 }
 func (in EffectPermitAcquireInput) validate() error {
 	if err := in.Identity.validate(); err != nil {
 		return err
+	}
+	if in.Identity.Strategy == NativeViewerSaveStrategy {
+		return errors.New("native viewer saves require ReserveNativeViewerSave")
 	}
 	if in.Identity.Kind == Institutional {
 		return errors.New("institutional permits require institutional acquire")
@@ -712,6 +732,9 @@ func artifactPermitResultEvent(permit *EffectPermit) (EffectPermitEvent, error) 
 		base["strategy"] = permit.Strategy
 		base["revision"] = permit.Revision
 		base["outcome"] = "applied"
+		if permit.Strategy == NativeViewerSaveStrategy {
+			return EffectPermitEvent{Kind: "browser.native_viewer_save_result", Detail: base}, nil
+		}
 		return EffectPermitEvent{Kind: "browser.provider_drive_epoch_result", Detail: base}, nil
 	case DirectGet:
 		if permit.Ordinal == nil {
@@ -744,6 +767,11 @@ func artifactPermitResultEvent(permit *EffectPermit) (EffectPermitEvent, error) 
 func settleArtifactProducerTx(ctx context.Context, tx *sql.Tx, jobID string, producer ArtifactProducerIdentity) (bool, error) {
 	if err := producer.validate(jobID); err != nil {
 		return false, err
+	}
+	if producer.Kind == GenericDrive && producer.Strategy == NativeViewerSaveStrategy {
+		if _, err := nativeViewerProducerAdmissionTx(ctx, tx, jobID, producer); err != nil {
+			return false, err
+		}
 	}
 	now := store.Now()
 	identity := producer.effectIdentity(jobID)
@@ -1052,6 +1080,7 @@ func (js *Store) SettleEffectPermit(ctx context.Context, in EffectPermitSettleIn
 func effectResultEventKind(kind string) bool {
 	switch kind {
 	case "browser.provider_drive_epoch_result",
+		"browser.native_viewer_save_result",
 		"browser.provider_direct_get_result",
 		"browser.terms_effect_result",
 		"browser.institutional_effect_result":
@@ -1121,7 +1150,11 @@ func permitResultIdentityMatches(permit *EffectPermit, kind string, detail map[s
 	switch permit.Kind {
 	case GenericDrive:
 		ordinal, ok := intField("ordinal")
-		return kind == "browser.provider_drive_epoch_result" && ok && permit.Ordinal != nil &&
+		resultKind := "browser.provider_drive_epoch_result"
+		if permit.Strategy == NativeViewerSaveStrategy {
+			resultKind = "browser.native_viewer_save_result"
+		}
+		return kind == resultKind && ok && permit.Ordinal != nil &&
 			stringField("drive_attempt_id") == permit.DriveAttemptID && ordinal == *permit.Ordinal &&
 			stringField("strategy") == permit.Strategy && stringField("revision") == permit.Revision
 	case DirectGet:

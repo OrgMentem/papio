@@ -33,6 +33,7 @@ import (
 	"papio/internal/hook"
 	"papio/internal/job"
 	"papio/internal/landingmeta"
+	"papio/internal/nativeviewer"
 	"papio/internal/notify"
 	"papio/internal/ownership"
 	"papio/internal/ownershipsnapshot"
@@ -542,6 +543,9 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	// Only a resolved, explicitly configured backend reaches the browser.
 	// Credential values remain in the daemon; they never enter browser IPC.
 	bridge.SetAcquisitionBackend(agentBackend)
+	// The native viewer driver is a separate, explicitly configured local
+	// capability. Saving an already-loaded PDF needs no inference credential.
+	bridge.SetNativeViewerDriver(nativeviewer.NewDriver(cfg.Browser.NativeViewerHelper))
 	router.SetPresence(bridge.PresenceProvider())
 
 	pulseService := &pulse.Service{

@@ -1,11 +1,11 @@
 # Native agent acquisition and adapter learning
 
-Status: integrated Chrome and Windows Firefox acquisition proven, 2026-09-21. The product direction is cross-platform
+Status: integrated Chrome and Windows Firefox acquisition proven; macOS Firefox resident-save bridge validated on 2026-09-23. The product direction is cross-platform
 native acquisition, interchangeable cloud/local decision backends, and learning
 from successful recoveries. Development validation is authorized. This document
 does not grant new OS permissions. ADR-0029 records the acquisition decision
 authority. The new integration is optional, capability-gated and disabled without
-an explicitly supplied backend credential; native helper distribution is still
+an explicitly supplied backend credential. Deterministic resident saving instead requires an explicitly configured local helper, not an inference key. Native helper distribution is still
 unimplemented.
 
 ## Current integration
@@ -50,8 +50,18 @@ one wrapper route; general navigation and menu reliability remain unmeasured. It
 the exact selected destination and a fresh DOI-bound document, transfers an idle
 native reservation without changing its baseline or expiry, and preserves the
 loop's deadline and inference budget. Unexpected redirects stop. New tabs,
-cross-origin navigation, native viewer saving and automatic source-repair
+cross-origin navigation and automatic source-repair
 promotion remain subsequent slices.
+
+The macOS Firefox native save is now connected to job authority and normal PDF
+adoption. A live synthetic fixture reached `ready` with the exact three-page PDF
+after its source URL was revoked, without another browser request for that PDF.
+The first page and digest were checked. This exercised the production bridge,
+helper and validator through a test harness; the extension entry still needs live
+acceptance, and this run acquired no backlog paper. Browser navigation was explicit
+test setup. During the measured save, foreground app/window stayed unchanged;
+pointer movement occurred, so the run does not establish an unchanged pointer.
+Failed publication of already admitted staging still requires explicit recovery.
 
 ## Delivery backlog after the first live proof
 
@@ -67,7 +77,7 @@ debugger is introduced by removing the extension.
 | Persistent key setup | Implemented across platforms; Windows interactive-session storage and fresh live acquisition verified. SSH network logons cannot read Credential Manager; launch the enrolled daemon in the signed-in desktop session. Native Linux Secret Service acceptance remains pending. No plaintext key in config, browser storage, logs or argv. |
 | Menu and observation progression | Implemented with delayed-menu and intercepted-anchor regressions. An intercepted link can expose a new local PDF control without replaying the consumed click. Preserve actual-download grace and exact receipt ownership. |
 | Article navigation and new contexts | Same-tab exact same-origin destination implemented; one live Chrome HTML-wrapper route acquired a validated PDF. Next: redirects and an owned child tab. Retire old control handles; carry the existing job/permit through a defined handoff, recheck permissions/identity, close only owned tabs, and reconcile any download already started. Test redirects, cancellation, concurrent jobs and operator takeover. |
-| CDN and resident-viewer acquisition | Mac Firefox passed the revoked-URL native-save fixture; Chrome's observed Save path refetched and failed. Connect the proven save operation to job authority and adoption. Follow the browser's actual navigation and save resident bytes through the native helper when needed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation on Chrome and Firefox. |
+| CDN and resident-viewer acquisition | Mac Firefox's production bridge/helper/adoption path passed the revoked-URL fixture. Next: live extension entry and backlog acceptance, packaged helper distribution, recovery of admitted staging after publication failure, and Windows/Linux native drivers. Chrome's observed Save path refetched and failed. No second fetch of signed URLs and no claiming the newest arbitrary Downloads file. Require an exact job-bound file, adoption and identity validation. |
 | Local repair learning | Connect failed declarative capture, successful fallback and validated artifact to the existing repair workspace. Generate/test in isolation, run a fresh model-free declarative canary, promote or revert from the artifact outcome. Keep local operation independent of analytics. |
 | Extension-free native executor | Reuse and assess maintained OSS accessibility/input components on macOS, Windows and named Linux desktops. The helper starts on demand, yields to user input and cleans up its own tabs/dialogs. Prove article observation, navigation, saving, ownership, cancellation and recovery with the extension disabled and Codex absent. Measure focus, pointer and input interference. |
 

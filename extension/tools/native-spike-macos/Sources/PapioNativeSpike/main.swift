@@ -1,10 +1,11 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// Development-only AXorcist evaluation. Only operates on the nonce-scoped local
-// fixture; never activates an app, posts global input, or opens a debugger.
+// Legacy fixture evaluation plus an independent bounded viewer-save API. The
+// fixture path remains nonce-scoped and cannot enter the production viewer API.
 import AppKit
 import ApplicationServices
 import AXorcist
 import CryptoKit
+import Darwin
 import Foundation
 
 enum SpikeError: Error, Equatable {
@@ -27,6 +28,8 @@ final class NativeSpike {
     var targetActions: [String: String] = [:]
     var attention = "background"
     var monitor: PassiveMonitor?
+    private var viewer: NativeViewerSave?
+    private var fixtureRequestsStarted = false
 
     func status(timeout: Float? = nil) -> [String: Any] {
         // Query the AX server directly: NSWorkspace notifications need a run
@@ -270,6 +273,15 @@ final class NativeSpike {
     }
 
     func request(_ input: [String: Any]) throws -> [String: Any] {
+        // Each fresh process chooses one API. The fixture's configure/prefix
+        // restrictions remain intact; production never enters its generic act.
+        if (input["method"] as? String)?.hasPrefix("viewer_") == true {
+            guard !fixtureRequestsStarted else { throw ViewerSaveError.invalidRequest }
+            if viewer == nil { viewer = NativeViewerSave() }
+            return try viewer!.request(input)
+        }
+        guard viewer == nil else { throw ViewerSaveError.invalidRequest }
+        fixtureRequestsStarted = true
         switch input["method"] as? String {
         case "start_monitor":
             guard monitor == nil else { throw SpikeError.invalidRequest }
@@ -291,6 +303,41 @@ final class NativeSpike {
     }
 }
 
+// Bound allocation before parsing, including a sender that never terminates a
+// line. Oversized input terminates this fresh helper instead of draining forever.
+struct BoundedRequestReader {
+    private var buffer = Data()
+    var read: (Int) throws -> Data?
+
+    static func readAvailable(from descriptor: Int32, count: Int) throws -> Data? {
+        var bytes = [UInt8](repeating: 0, count: count)
+        while true {
+            let size = Darwin.read(descriptor, &bytes, count)
+            if size < 0 && errno == EINTR { continue }
+            guard size >= 0 else { throw SpikeError.invalidRequest }
+            return size == 0 ? nil : Data(bytes.prefix(size))
+        }
+    }
+
+    mutating func next() throws -> Data? {
+        while true {
+            if let newline = buffer.firstIndex(of: 10) {
+                let line = Data(buffer[..<newline])
+                buffer.removeSubrange(...newline)
+                guard line.count < 16384 else { throw SpikeError.invalidRequest }
+                return line
+            }
+            guard buffer.count < 16384 else { throw SpikeError.invalidRequest }
+            guard let chunk = try read(min(4096, 16384 - buffer.count)), !chunk.isEmpty else {
+                if buffer.isEmpty { return nil }
+                defer { buffer.removeAll() }
+                return buffer
+            }
+            buffer.append(chunk)
+        }
+    }
+}
+
 @main struct Main {
     @MainActor static func main() {
         if CommandLine.arguments.dropFirst().first == "--passive-monitor" {
@@ -299,12 +346,24 @@ final class NativeSpike {
         }
         let helper = NativeSpike()
         defer { _ = try? helper.monitor?.stop() }
-        while let line = readLine() {
+        // Foundation's read(upToCount:) can wait to fill its buffer on a pipe.
+        // POSIX read returns the available bytes without requiring stdin EOF.
+        var reader = BoundedRequestReader { try BoundedRequestReader.readAvailable(from: STDIN_FILENO, count: $0) }
+        while true {
+            let data: Data
+            do {
+                guard let next = try reader.next() else { break }
+                data = next
+            } catch {
+                FileHandle.standardOutput.write(Data("{\"ok\":false,\"error\":\"invalidRequest\"}\n".utf8))
+                break
+            }
             var response: [String: Any]
             do {
-                guard line.utf8.count < 16384, let data = line.data(using: .utf8),
-                      let input = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw SpikeError.invalidRequest }
+                guard let input = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw SpikeError.invalidRequest }
                 response = ["ok": true, "result": try helper.request(input)]
+            } catch let error as ViewerSaveError {
+                response = ["ok": false, "error": error.rawValue]
             } catch { response = ["ok": false, "error": String(describing: error)] }
             let encoded = (try? JSONSerialization.data(withJSONObject: response, options: [.sortedKeys])) ?? Data("{\"ok\":false}".utf8)
             FileHandle.standardOutput.write(encoded + Data([10]))

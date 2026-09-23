@@ -4,6 +4,7 @@ import {
   EFFECT_PERMIT_FEATURE,
   AGENT_NAVIGATION_FEATURE,
   NATIVE_CLICK_ADOPTION_FEATURE,
+  NATIVE_VIEWER_SAVE_FEATURE,
   INSTITUTIONAL_AUTHENTICATION_CLAIM_FEATURE,
   SURFACE_CLOSE_FEATURE,
   type BrowserMessage,
@@ -63,6 +64,10 @@ type RequestPolicy = {
  * class on the daemon's inbound dispatch.
  */
 const REQUEST_POLICIES = {
+  native_viewer_save_request_v1: {
+    responseType: "native_viewer_save_result_v1", feature: NATIVE_VIEWER_SAVE_FEATURE,
+    operation: "mutation", transport: "single_attempt", timeoutMs: 60_000,
+  },
   native_download_rebind_request_v1: {
     responseType: "native_download_rebind_result_v1", feature: AGENT_NAVIGATION_FEATURE,
     operation: "mutation", transport: "single_attempt", timeoutMs: 45_000,

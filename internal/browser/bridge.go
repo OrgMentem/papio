@@ -45,6 +45,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/grab"
 	"papio/internal/job"
+	"papio/internal/nativeviewer"
 	"papio/internal/notify"
 	"papio/internal/ownership"
 	"papio/internal/pdf"
@@ -360,6 +361,8 @@ type Bridge struct {
 	agentBackend         acquisitionagent.Backend
 	agentDecisions       map[string]*pendingAgentDecision
 	agentClosed          bool
+	nativeViewerDriver   nativeviewer.Driver
+	nativeViewerSaves    map[string]*nativeViewerSave
 	nativeDownloads      map[string]*nativeDownloadReservation
 	nativeIOGate         chan struct{}
 	providerDriveEpochMu sync.Mutex
@@ -1366,6 +1369,13 @@ func (b *Bridge) helloAck(role string, peerFeatures []string) (json.RawMessage, 
 	if slices.Contains(peerFeatures, protocol.AgentNavigationFeature) && slices.Contains(features, agentFallbackFeature) && slices.Contains(features, protocol.NativeClickAdoptionFeature) && slices.Contains(features, triageCountsSchema3Feature) {
 		if i := slices.Index(features, triageCountsSchema2Feature); i >= 0 {
 			features[i] = protocol.AgentNavigationFeature
+		}
+	}
+	// Save v1 includes the older native-viewer parking outcome. Only peers
+	// advertising both can exchange that existing slot without changing the cap.
+	if b.nativeViewerDriver != nil && !b.agentClosed && slices.Contains(peerFeatures, protocol.NativeViewerSaveFeature) && slices.Contains(peerFeatures, nativeViewerDownloadFeature) {
+		if i := slices.Index(features, nativeViewerDownloadFeature); i >= 0 {
+			features[i] = protocol.NativeViewerSaveFeature
 		}
 	}
 	payload := protocol.HelloAckPayload{
@@ -3112,6 +3122,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 	}
 
 	switch msg.Type {
+	case protocol.MsgNativeViewerSaveRequestV1:
+		return b.nativeViewerSaveRequest(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeViewerSaveRequestV1Payload))
 	case protocol.MsgNativeDownloadRebindRequestV1:
 		return b.rebindNativeDownload(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeDownloadRebindRequestV1Payload))
 	case protocol.MsgNativeDownloadArmRequestV1:
@@ -3315,6 +3327,15 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 
 	case protocol.MsgDownloadComplete:
 		p := msg.Payload.(*protocol.DownloadCompletePayload)
+		// This producer can only come from daemon-admitted native staging.
+		// A browser completion must never manufacture its admission proof.
+		if p.Producer != nil && p.Producer.Strategy == job.NativeViewerSaveStrategy {
+			frame, err := b.frame(protocol.MsgError, msg.JobID, protocol.ErrorPayload{Code: "native_viewer_admission_required", Message: "Native viewer files require daemon admission."})
+			if err != nil {
+				return nil, err
+			}
+			return []json.RawMessage{frame}, nil
+		}
 		key := browserDownloadKey{JobID: msg.JobID, DownloadID: p.DownloadID}
 		detail := map[string]any{
 			"download_id": p.DownloadID, "filename": p.Filename,
@@ -10999,7 +11020,7 @@ jobLoop:
 		}
 	}
 	if b.effectPermitAvailable() && b.jobs != nil {
-		if permit, _ := b.jobs.LiveEffectPermit(ctx); permit != nil && !b.effectPermitWorkerLive(permit) {
+		if permit, _ := b.jobs.LiveEffectPermit(ctx); permit != nil && permit.Strategy != job.NativeViewerSaveStrategy && !b.effectPermitWorkerLive(permit) {
 			payload := protocol.EffectPermitReconcileRequestPayload{
 				RequestID:  newMsgID(),
 				PermitID:   permit.ID,
@@ -11649,6 +11670,10 @@ func (b *Bridge) effectPermitAvailable() bool {
 // durable generation; zero or a failed allocation never proves continuity.
 // This only defers recovery: it neither grants authority nor settles a permit.
 func (b *Bridge) effectPermitWorkerLive(permit *job.EffectPermit) bool {
+	if permit.Strategy == job.NativeViewerSaveStrategy {
+		r := b.nativeViewerSaves[permit.JobID]
+		return r != nil && r.record.PermitID == permit.ID && !r.terminal && r.ctx.Err() == nil && r.record.HolderGeneration == b.arbitration.generation()
+	}
 	holder := b.arbitration.holderSession()
 	generation := b.arbitration.generation()
 	now := b.now()

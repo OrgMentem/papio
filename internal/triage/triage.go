@@ -1692,6 +1692,12 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 		if r.detail = bounded(r.detail, 400); r.detail != "" {
 			facts = append(facts, Fact{Label: "Detail", Text: r.detail})
 		}
+		// The native viewer continuation needs the durable reason, not Detail
+		// prose or the broader manual_download guidance family. Keep this in
+		// the existing facts shape so older snapshot parsers remain compatible.
+		if r.action.ActionKind == "manual_download" && r.action.DiagnosisReason == job.DiagnosisReasonNativeViewerDownload {
+			facts = append(facts, Fact{Label: "Diagnosis", Text: r.action.DiagnosisReason})
+		}
 		facts = append(facts, Fact{Label: "Job", Text: bounded(r.action.JobID, 400)})
 
 		links := canonicalLinks(ids["doi"], ids["arxiv"], ids["openalex"])

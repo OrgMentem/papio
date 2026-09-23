@@ -1658,6 +1658,7 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
     "agent_fallback_v1",
     "native_click_adoption_v1",
     "agent_navigation_v1",
+    "native_viewer_save_v1",
   ]);
 });
 

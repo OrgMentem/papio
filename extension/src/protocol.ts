@@ -45,6 +45,8 @@ export type BrowserMessageType =
   | "provider_drive_epoch_result"
   | "agent_decide_request_v1"
   | "agent_decide_result_v1"
+  | "native_viewer_save_request_v1"
+  | "native_viewer_save_result_v1"
   | "native_download_rebind_request_v1"
   | "native_download_rebind_result_v1"
   | "native_download_arm_request_v1"
@@ -358,6 +360,32 @@ export interface ProviderDriveEpochTuple {
   revision: string;
 }
 export const AGENT_NAVIGATION_FEATURE = "agent_navigation_v1";
+export const NATIVE_VIEWER_SAVE_FEATURE = "native_viewer_save_v1";
+export const MsgNativeViewerSaveRequestV1 = "native_viewer_save_request_v1" as const;
+export const MsgNativeViewerSaveResultV1 = "native_viewer_save_result_v1" as const;
+export interface NativeViewerSaveRequestV1Payload {
+  request_id: string;
+  action_id: number;
+  action_revision: number;
+  browser_epoch: string;
+  document_id: string;
+  /** Sensitive transient identity: preserve exactly, including the fragment. */
+  source_url: string;
+  operation_id?: string;
+  step: "prepare" | "advance" | "cancel";
+  /** Prepare only. Omission has automatic authority. */
+  selection?: "automatic" | "explicit";
+}
+export type NativeViewerSaveReason =
+  | "unavailable" | "authority_lost" | "already_started" | "expired"
+  | "source_rejected" | "source_busy" | "invalid_pdf" | "validation_pending"
+  | "native_failed" | "document_changed" | "unsupported";
+export interface NativeViewerSaveResultV1Payload {
+  request_id: string;
+  operation_id?: string;
+  outcome: "prepared" | "pending" | "ready" | "review" | "rejected" | "refused" | "stale" | "unavailable";
+  reason?: NativeViewerSaveReason;
+}
 export const NATIVE_CLICK_ADOPTION_FEATURE = "native_click_adoption_v1";
 export type NativeDownloadProducer = Required<Pick<ArtifactProducerPayload, "drive_attempt_id" | "ordinal" | "revision">> & {
   effect_kind: "generic_drive"; strategy: "generic";
@@ -1551,6 +1579,8 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   provider_drive_epoch_result: true,
   agent_decide_request_v1: true,
   agent_decide_result_v1: true,
+  native_viewer_save_request_v1: true,
+  native_viewer_save_result_v1: true,
   native_download_rebind_request_v1: true,
   native_download_rebind_result_v1: true,
   native_download_arm_request_v1: true,
@@ -1647,6 +1677,8 @@ const JOB_SCOPED: Record<string, true> = {
   provider_drive_epoch_result: true,
   agent_decide_request_v1: true,
   agent_decide_result_v1: true,
+  native_viewer_save_request_v1: true,
+  native_viewer_save_result_v1: true,
   native_download_rebind_request_v1: true,
   native_download_rebind_result_v1: true,
   native_download_arm_request_v1: true,
@@ -2814,7 +2846,8 @@ export function parseBrowserMessageWithLegacyInstitutionalNavigation(
     jobID = str(env, "job_id", "message", 128);
     if (!JOB_ID_RE.test(jobID)) fail(`invalid job_id ${JSON.stringify(jobID)}`);
   }
-  if (type === "agent_decide_request_v1" || type === "agent_decide_result_v1") {
+  if (type === "agent_decide_request_v1" || type === "agent_decide_result_v1" ||
+      type === "native_viewer_save_request_v1" || type === "native_viewer_save_result_v1") {
     if (!isAgentControlID(msgID) ||
         (jobID !== undefined && /[^A-Za-z0-9_-]/u.test(jobID)))
       fail(`${type} envelope identifiers must contain only ASCII identifier characters`);
@@ -2862,7 +2895,37 @@ export function parseBrowserMessageBytes(text: string): BrowserMessage {
   } catch (e) {
     fail(`invalid JSON: ${String(e)}`);
   }
+  if (typeof doc === "object" && doc !== null &&
+      (Reflect.get(doc, "type") === "native_viewer_save_request_v1" ||
+       Reflect.get(doc, "type") === "native_viewer_save_result_v1")) {
+    rejectNativeViewerDuplicateKeys(text);
+  }
   return parseBrowserMessage(doc);
+}
+
+// JSON.parse has already checked syntax. Scan tokens without recursion so deeply
+// nested rejected input cannot overflow the stack, retaining keys before overwrite.
+function rejectNativeViewerDuplicateKeys(text: string): void {
+  const stack: { keys: Set<string> | undefined; expectingKey: boolean }[] = [];
+  const tokens = /"(?:[^"\\]|\\[\s\S])*"|[{}\[\]:,]|[^\s{}\[\]:,]+/gu;
+  for (const match of text.matchAll(tokens)) {
+    const token = match[0];
+    if (token === "{" || token === "[") {
+      stack.push({ keys: token === "{" ? new Set() : undefined, expectingKey: true });
+    } else if (token === "}" || token === "]") {
+      stack.pop();
+    } else {
+      const current = stack.at(-1);
+      if (current?.keys === undefined) continue;
+      if (token === ",") current.expectingKey = true;
+      else if (token.startsWith('"') && current.expectingKey) {
+        const key: string = JSON.parse(token);
+        if (current.keys.has(key)) fail("native viewer JSON contains a duplicate object member");
+        current.keys.add(key);
+        current.expectingKey = false;
+      }
+    }
+  }
 }
 
 function validatePayload(
@@ -4138,6 +4201,54 @@ function validatePayload(
       } catch {
         fail("provider_direct_get_request URL is invalid");
       }
+      break;
+    }
+    case "native_viewer_save_request_v1": {
+      requireAgentDecideFields<NativeViewerSaveRequestV1Payload>(p, type, {
+        request_id: "required", action_id: "required", action_revision: "required",
+        browser_epoch: "required", document_id: "required", source_url: "required",
+        operation_id: "optional", step: "required", selection: "optional",
+      });
+      nativeIdentifier(p, "request_id", type);
+      int(p, "action_id", type, 1); int(p, "action_revision", type, 1);
+      nativeIdentifier(p, "browser_epoch", type, 1, 128);
+      nativeIdentifier(p, "document_id", type, 1, 128);
+      const source = str(p, "source_url", type, 8192);
+      if (new TextEncoder().encode(source).byteLength > 8192 ||
+          /[\u0000-\u0020\u007f-\u009f\\]/u.test(source) ||
+          !/^https?:\/\//iu.test(source) || /%(?![a-f0-9]{2})/iu.test(source))
+        fail(`${type}.source_url is invalid`);
+      try {
+        const parsed = new URL(source);
+        const authority = source.split(/\/\//u)[1]!.split(/[/?#]/u)[0]!;
+        if (!authority || !parsed.hostname || parsed.username || parsed.password || authority.includes("@"))
+          fail(`${type}.source_url is invalid`);
+      } catch {
+        fail(`${type}.source_url is invalid`);
+      }
+      const step = str(p, "step", type, 16);
+      if (step === "prepare") {
+        if ("selection" in p && p["selection"] !== "automatic" && p["selection"] !== "explicit")
+          fail(`${type}.selection is invalid`);
+        if ("operation_id" in p) fail(`${type} prepare must not carry operation_id`);
+      } else if (step === "advance" || step === "cancel") {
+        if ("selection" in p) fail(`${type}.selection is prepare-only`);
+        nativeIdentifier(p, "operation_id", type);
+      } else fail(`${type}.step is invalid`);
+      break;
+    }
+    case "native_viewer_save_result_v1": {
+      requireAgentDecideFields<NativeViewerSaveResultV1Payload>(p, type, {
+        request_id: "required", operation_id: "optional", outcome: "required", reason: "optional",
+      });
+      nativeIdentifier(p, "request_id", type);
+      const outcome = str(p, "outcome", type, 16);
+      if (!["prepared", "pending", "ready", "review", "rejected", "refused", "stale", "unavailable"].includes(outcome))
+        fail(`${type}.outcome is invalid`);
+      if ("operation_id" in p || outcome === "prepared" || outcome === "pending")
+        nativeIdentifier(p, "operation_id", type);
+      if ("reason" in p && !["unavailable", "authority_lost", "already_started", "expired", "source_rejected", "source_busy", "invalid_pdf", "validation_pending", "native_failed", "document_changed", "unsupported"].includes(str(p, "reason", type, 32)))
+        fail(`${type}.reason is invalid`);
       break;
     }
     case "native_download_rebind_request_v1": {

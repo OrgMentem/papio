@@ -39,6 +39,8 @@
         "provider_drive_epoch_result",
         "agent_decide_request_v1",
         "agent_decide_result_v1",
+        "native_viewer_save_request_v1",
+        "native_viewer_save_result_v1",
         "native_download_rebind_request_v1",
         "native_download_rebind_result_v1",
         "native_download_arm_request_v1",
@@ -7583,6 +7585,194 @@
         "required": [
           "job_id"
         ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_viewer_save_request_v1"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ],
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "action_id",
+              "action_revision",
+              "browser_epoch",
+              "document_id",
+              "source_url",
+              "step"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "action_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "action_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "browser_epoch": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "document_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "source_url": {
+                "type": "string",
+                "maxLength": 8192,
+                "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://(?:\\[[0-9A-Fa-f:.]+\\]|[^:/?#@\\[\\]\\\\\u0000- \u007f-\u009f]+)(?::(?:0*[0-9]{1,4}|0*[1-5][0-9]{4}|0*6[0-4][0-9]{3}|0*65[0-4][0-9]{2}|0*655[0-2][0-9]|0*6553[0-5])?)?(?:[/?#][^\u0000- \u007f-\u009f\\\\]*)?$",
+                "description": "Sensitive transient exact URL, including query and fragment. Never normalize, persist, or log it. Runtime validators also check URL syntax and an 8192 UTF-8 byte cap; JSON Schema maxLength counts characters.",
+                "not": {
+                  "pattern": "%($|[^0-9A-Fa-f]|[0-9A-Fa-f]($|[^0-9A-Fa-f]))"
+                }
+              },
+              "operation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "step": {
+                "enum": [
+                  "prepare",
+                  "advance",
+                  "cancel"
+                ]
+              },
+              "selection": {
+                "enum": [
+                  "automatic",
+                  "explicit"
+                ],
+                "description": "Prepare only. Omission means automatic; only explicit grants explicit-selection authority."
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "step": {
+                      "const": "prepare"
+                    }
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "operation_id"
+                    ]
+                  }
+                },
+                "else": {
+                  "required": [
+                    "operation_id"
+                  ],
+                  "not": {
+                    "required": [
+                      "selection"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_viewer_save_result_v1"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "job_id"
+        ],
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "outcome"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "operation_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,64}$"
+              },
+              "outcome": {
+                "enum": [
+                  "prepared",
+                  "pending",
+                  "ready",
+                  "review",
+                  "rejected",
+                  "refused",
+                  "stale",
+                  "unavailable"
+                ]
+              },
+              "reason": {
+                "enum": [
+                  "unavailable",
+                  "authority_lost",
+                  "already_started",
+                  "expired",
+                  "source_rejected",
+                  "source_busy",
+                  "invalid_pdf",
+                  "validation_pending",
+                  "native_failed",
+                  "document_changed",
+                  "unsupported"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "enum": [
+                        "prepared",
+                        "pending"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "operation_id"
+                  ]
+                }
+              }
+            ]
+          }
+        }
       }
     }
   ]

@@ -309,6 +309,9 @@ type Browser struct {
 	// AdoptionDirName). Setting it elsewhere disables adoption entirely, and
 	// papio doctor fails on exactly that.
 	AdoptionRoot string `toml:"download_adoption_root,omitempty"`
+	// NativeViewerHelper opts into the separately installed native PDF-save
+	// helper. Empty disables it; the first driver supports Firefox on macOS.
+	NativeViewerHelper string `toml:"native_viewer_helper,omitempty"`
 	// ActionExpirySeconds sets browser-offer expiry and the first human-action
 	// reminder threshold. Subsequent reminders back off independently per action.
 	ActionExpirySeconds int `toml:"action_expiry_seconds,omitempty"`
@@ -838,6 +841,7 @@ func Load(path string) (Config, error) {
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
 	cfg.Browser.AdoptionRoot = expandHome(cfg.Browser.AdoptionRoot)
+	cfg.Browser.NativeViewerHelper = expandHome(cfg.Browser.NativeViewerHelper)
 	cfg.Zotio.Executable = expandHome(cfg.Zotio.Executable)
 	return cfg, nil
 }
@@ -866,6 +870,10 @@ func normalizeLibrarySourcePath(path string) string {
 }
 
 func (c *Config) validate() error {
+	if helper := c.Browser.NativeViewerHelper; helper != "" &&
+		(!filepath.IsAbs(expandHome(helper)) || strings.ContainsAny(helper, "\x00\r\n")) {
+		return errors.New("browser.native_viewer_helper must be an absolute executable path")
+	}
 	if err := c.validateCredentialReferences(); err != nil {
 		return err
 	}

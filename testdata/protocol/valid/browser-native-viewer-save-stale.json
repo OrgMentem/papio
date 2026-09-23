@@ -1,0 +1,11 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "native_viewer_save_result_v1",
+  "msg_id": "viewer-message-1",
+  "job_id": "job_viewer-1",
+  "seq": 1,
+  "payload": {
+    "request_id": "viewer-request-1",
+    "outcome": "stale"
+  }
+}

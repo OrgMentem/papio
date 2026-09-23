@@ -41,6 +41,9 @@ import {
   BROWSER_PROTOCOL_VERSION,
   EFFECT_PERMIT_FEATURE,
   AGENT_NAVIGATION_FEATURE,
+  NATIVE_VIEWER_SAVE_FEATURE,
+  type NativeViewerSaveRequestV1Payload,
+  type NativeViewerSaveResultV1Payload,
   durablePdfGrabState,
   MAX_BROWSER_MESSAGE_BYTES,
   MsgPageCapture,
@@ -78,6 +81,7 @@ import {
   type ClaimObservationPayload,
   type ClaimObservationAckPayload,
 } from "./protocol";
+import { nativeViewerAction, nativeViewerReason, NATIVE_VIEWER_INTERRUPTED, type NativeViewerLatch } from "./native-viewer";
 import {
   NativeRequestCorrelation,
   type CorrelatedRequestKind,
@@ -1420,6 +1424,7 @@ export interface BridgeDeps {
     }): Promise<number>;
   };
   webNavigation?: {
+    onBeforeNavigate?: Listenable<[{ tabId: number; frameId: number; url?: string }]>;
     onCommitted?: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onHistoryStateUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onReferenceFragmentUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
@@ -3075,6 +3080,10 @@ export class Bridge {
   /** This worker lifetime's browser-session epoch (Slice 2b), resolved by
    * classifyRestart(). Undefined until bootstrapSurfaceLifecycle() runs. */
   private browserEpoch: string | undefined;
+  /** Live URL/document authority never survives this worker. */
+  private readonly nativeViewerHistory = new Map<string, NativeViewerLatch>();
+  private readonly nativeViewerSendGuards = new Map<string, () => boolean>();
+  private readonly nativeViewerRuns = new Map<string, { tabID: number; invalidated: boolean }>();
   private restartClass: "worker" | "update" | "browser" | undefined;
   /** Most recently observed daemon browser-holder-generation fence, tapped
    * from any response that carries one. Undefined until the daemon has told
@@ -7311,6 +7320,15 @@ export class Bridge {
     this.bindListeners();
     this.ready = this.deps.backend.load().then(async (s) => {
       this.store = clearNegotiationState(s);
+      for (const job of this.store.activeJobs) {
+        if (job.native_viewer_save) this.nativeViewerHistory.set(job.job_id, job.native_viewer_save);
+        if (job.native_viewer_save?.state !== "running") continue;
+        this.store = patchJob(this.store, job.job_id, {
+          native_viewer_save: { ...job.native_viewer_save, state: "interrupted" },
+        });
+        this.store = startPendingDelivery(this.store, { job_id: job.job_id,
+          initiated_at: this.deps.now(), status: "failed", error: NATIVE_VIEWER_INTERRUPTED });
+      }
       const correlations =
         this.deps.pdfGrabCorrelations === undefined
           ? {}
@@ -7916,6 +7934,7 @@ export class Bridge {
         ) => void;
       };
       type NavAPI = {
+        onBeforeNavigate?: NavListener;
         onCommitted?: NavListener;
         onHistoryStateUpdated?: NavListener;
         onReferenceFragmentUpdated?: NavListener;
@@ -7946,9 +7965,13 @@ export class Bridge {
       const n = nav as NavAPI;
       const observeNavigation = (d: { tabId: number; frameId: number }): void => {
         if (d.frameId !== 0) return;
+        this.invalidateNativeViewerTab(d.tabId);
         this.pageNavSeq.set(d.tabId, (this.pageNavSeq.get(d.tabId) ?? 0) + 1);
         this.destroyDeliveryChoiceForTab(d.tabId);
       };
+      n.onBeforeNavigate?.addListener(d => {
+        if (d.frameId === 0) this.invalidateNativeViewerTab(d.tabId);
+      });
       n.onCommitted?.addListener((d) => {
         if (d.frameId !== 0) return;
         for (const pending of this.agentNavigations.values()) {
@@ -7970,6 +7993,8 @@ export class Bridge {
       // that took over; `replacedTabId` is the one that went away. Neither id
       // keeps any authority: the page the researcher was looking at is gone.
       n.onTabReplaced?.addListener((d) => {
+        this.invalidateNativeViewerTab(d.replacedTabId);
+        this.invalidateNativeViewerTab(d.tabId);
         for (const pending of this.agentNavigations.values()) {
           if (pending.tabID === d.replacedTabId || pending.tabID === d.tabId) pending.stop();
         }
@@ -8135,6 +8160,173 @@ export class Bridge {
     }
   }
 
+  private nativeViewerAvailable(): boolean {
+    return this.isFirefox() && this.hasCurrentHello() && this.holderRole() &&
+      this.store.connectionStatus === "connected" &&
+      (this.store.daemonFeatures ?? []).includes(NATIVE_VIEWER_SAVE_FEATURE);
+  }
+
+  private async currentNativeViewerAction(jobID: string, automatic: boolean, stillCurrent: () => boolean) {
+    const items: unknown[] = [];
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    for (let page = 0; page < 20; page++) {
+      if (!stillCurrent()) return undefined;
+      const result = await this.requestTriageSnapshot({ schema_versions: [1], limit: 100,
+        ...(cursor === undefined ? {} : { cursor }) });
+      if (!result.ok || !Array.isArray(result.snapshot.items)) return undefined;
+      items.push(...result.snapshot.items);
+      if (result.snapshot.has_more === false) return nativeViewerAction({ items }, jobID, automatic);
+      const next = result.snapshot.cursor;
+      if (typeof next !== "string" || seen.has(next)) return undefined;
+      seen.add(next);
+      cursor = next;
+    }
+    return undefined;
+  }
+
+  private invalidateNativeViewerTab(tabID: number): void {
+    for (const run of this.nativeViewerRuns.values()) if (run.tabID === tabID) run.invalidated = true;
+  }
+
+  /** Existing manual action continuation, never provider/adapter authority.
+   * All callers run outside the serialized inbound queue. */
+  private async startNativeViewerSave(
+    jobID: string, tabID: number, sourceURL: string, automatic: boolean, expectedDocument?: string,
+  ): Promise<DeliveryReply> {
+    if (!this.nativeViewerAvailable()) return failure("unavailable", nativeViewerReason("unavailable"));
+    const previous = findByJob(this.store, jobID)?.native_viewer_save ?? this.nativeViewerHistory.get(jobID);
+    if (this.nativeViewerRuns.has(jobID) || (previous && (automatic || previous.state !== "retryable")))
+      return failure("already_started", nativeViewerReason("already_started"));
+    const run = { tabID, invalidated: false };
+    this.nativeViewerRuns.set(jobID, run); // reserve before the first await
+    const generation = this.portGeneration;
+    const browserEpoch = this.browserEpoch;
+    const deadline = this.deps.now() + 120_000;
+    let token: string | undefined = previous?.token;
+    let retryable = false;
+    let completed = false;
+    let cancelSent = false;
+    let operationID: string | undefined;
+    let binding: Omit<NativeViewerSaveRequestV1Payload, "request_id" | "step" | "operation_id"> | undefined;
+    const currentSession = (): boolean => this.nativeViewerAvailable() &&
+      this.portGeneration === generation && this.browserEpoch === browserEpoch && browserEpoch !== undefined;
+    const nativeRequest = (request: Omit<NativeViewerSaveRequestV1Payload, "request_id">,
+      guard: () => boolean): Promise<NativeRequestResult> => {
+      const requestID = this.deps.randomUUID().replace(/-/g, "");
+      this.nativeViewerSendGuards.set(requestID, guard);
+      return this.requestCorrelated("native_viewer_save_request_v1", { ...request }, { jobID, requestID })
+        .finally(() => this.nativeViewerSendGuards.delete(requestID));
+    };
+    const current = async (): Promise<boolean> => {
+      const job = findByJob(this.store, jobID);
+      if (!currentSession() || run.invalidated || !job || job.status !== "awaiting_download" ||
+          this.nativeViewerRuns.get(jobID) !== run || this.deps.now() >= deadline ||
+          (token !== undefined && job.native_viewer_save?.token !== token)) return false;
+      try {
+        const tabs = await this.deps.tabs.query?.({});
+        const exact = tabs?.filter(tab => tab.url === sourceURL);
+        if (exact?.length !== 1 || exact[0]?.id !== tabID || exact[0]?.active !== true) return false;
+        const tab = await this.deps.tabs.get(tabID);
+        const document = await this.liveDocumentEpoch(tabID);
+        return !run.invalidated && currentSession() && this.deps.now() < deadline &&
+          findByJob(this.store, jobID)?.native_viewer_save?.token === token &&
+          tab.url === sourceURL && tab.active === true && document !== undefined &&
+          document === (binding?.document_id ?? expectedDocument);
+      } catch { return false; }
+    };
+    const finish = async (outcome: NativeViewerSaveResultV1Payload["outcome"] | "interrupted",
+      reason?: NativeViewerSaveResultV1Payload["reason"]): Promise<DeliveryReply> => {
+      if (outcome === "interrupted" && !cancelSent && binding && operationID && currentSession()) {
+        cancelSent = true;
+        // Revocation carries the original tuple; it authorizes no new save.
+        // Do not await it: a lost cancel reply must not extend the operation.
+        void nativeRequest({ ...binding, operation_id: operationID, step: "cancel" }, currentSession).catch(() => {});
+      }
+      const message = outcome === "ready" ? "Papio saved and validated this PDF." :
+        outcome === "review" ? "The saved PDF needs review in papio." :
+        nativeViewerReason(reason ?? (outcome === "rejected" ? "invalid_pdf" : outcome === "unavailable" ? "unavailable" : "interrupted"));
+      const state = outcome === "ready" ? "adopted" : outcome === "review" ? "waiting_manual" : "failed";
+      const previousLatch = this.nativeViewerHistory.get(jobID);
+      if (previousLatch !== undefined && previousLatch.token === token) this.nativeViewerHistory.set(jobID, { ...previousLatch,
+        state: retryable ? "retryable" : outcome === "interrupted" ? "interrupted" : "settled" });
+      await this.update(s => {
+        const job = findByJob(s, jobID);
+        if (!job || token === undefined || job.native_viewer_save?.token !== token) return s;
+        const next = patchJob(s, jobID, { native_viewer_save: this.nativeViewerHistory.get(jobID)! });
+        return updatePendingDelivery(next, jobID, { status: state, error: message });
+      });
+      if (state === "failed") return failure(reason ?? "interrupted", message);
+      return { ok: true, state, job_id: jobID, message };
+    };
+    try {
+      return await Promise.race([(async (): Promise<DeliveryReply> => {
+        expectedDocument ??= await this.liveDocumentEpoch(tabID);
+        if (expectedDocument === undefined) return failure("unsupported", nativeViewerReason("unsupported"));
+        if (!await current()) return failure("document_changed", nativeViewerReason("document_changed"));
+        const action = await this.currentNativeViewerAction(jobID, automatic,
+          () => !run.invalidated && currentSession() && this.deps.now() < deadline);
+        if (!action || !await current()) return failure("authority_lost", nativeViewerReason("authority_lost"));
+        const pending = this.store.pendingDelivery;
+        if (pending && pending.job_id !== jobID && pending.status !== "failed")
+          return failure("delivery_busy", "Another PDF is already being sent to papio");
+        binding = { ...action, browser_epoch: browserEpoch!, document_id: expectedDocument, source_url: sourceURL };
+        token = this.deps.randomUUID().replace(/-/g, "");
+        // Persist before dispatch. Failure leaves a latch, never a replayable request.
+        this.nativeViewerHistory.set(jobID, { token, ...action, state: "running" });
+        await this.update(s => startPendingDelivery(patchJob(s, jobID, {
+          native_viewer_save: { token: token!, ...action, state: "running" },
+        }), { job_id: jobID, url: sourceURL, initiated_at: this.deps.now(), status: "sending" }));
+        this.lastDeliveryState = undefined;
+        for (let step = 0; step < 120; step++) {
+          // A fresh action snapshot on every step catches cancellation, resolution,
+          // revision change and replacement before asking the helper to act again.
+          if (step > 0) {
+            const actionNow = await this.currentNativeViewerAction(jobID, automatic,
+              () => !run.invalidated && currentSession() && this.deps.now() < deadline);
+            if (!actionNow || actionNow.action_id !== action.action_id || actionNow.action_revision !== action.action_revision)
+              return await finish("interrupted", "authority_lost");
+          }
+          if (!await current()) return await finish("interrupted", "document_changed");
+          const request: Omit<NativeViewerSaveRequestV1Payload, "request_id"> = {
+            ...binding, step: operationID === undefined ? "prepare" : "advance",
+            ...(operationID === undefined ? { selection: automatic ? "automatic" as const : "explicit" as const } : { operation_id: operationID }),
+          };
+          const result = await Promise.race([
+            nativeRequest(request, () => currentSession() && !run.invalidated &&
+              this.deps.now() < deadline && findByJob(this.store, jobID)?.native_viewer_save?.token === token),
+            new Promise<undefined>(resolve => this.deps.setTimeout(() => resolve(undefined), Math.min(60_000, deadline - this.deps.now()))),
+          ]);
+          if (!result || result.kind !== "response" || !result.payload || result.code !== undefined)
+            return await finish("interrupted");
+          const reply = result.payload as unknown as NativeViewerSaveResultV1Payload;
+          if (operationID !== undefined && reply.operation_id !== operationID)
+            return await finish("interrupted", "authority_lost");
+          if (step === 0 && reply.operation_id !== undefined) operationID = reply.operation_id;
+          if (!await current()) return await finish("interrupted", "document_changed");
+          if (reply.outcome !== "prepared" && reply.outcome !== "pending") {
+            retryable = step === 0 && reply.operation_id === undefined &&
+              (reply.reason === "unavailable" || reply.reason === "source_rejected" || reply.reason === "unsupported");
+            return await finish(reply.outcome, reply.reason);
+          }
+          if (!reply.operation_id) return await finish("interrupted");
+          operationID = reply.operation_id;
+          await new Promise<void>(resolve => this.deps.setTimeout(resolve, 250));
+        }
+        return await finish("interrupted", "expired");
+      })(), new Promise<DeliveryReply>(resolve => this.deps.setTimeout(() => {
+        if (completed) return;
+        run.invalidated = true;
+        void finish("interrupted", "expired").then(resolve, () => resolve(failure("expired", NATIVE_VIEWER_INTERRUPTED)));
+      }, 120_000))]);
+    } catch {
+      return await finish("interrupted");
+    } finally {
+      completed = true;
+      this.nativeViewerRuns.delete(jobID);
+    }
+  }
+
   async startPDFDelivery(
     payload: DeliveryStartPayload,
     fixture?: PageSpikeDeliveryFence,
@@ -8212,6 +8404,8 @@ export class Bridge {
         return { ok: true, state: pending.status ?? "sending", job_id: pickedJob.job_id } as DeliveryReply;
       }
       if (requiresNativeViewerDownload(urlForChoice)) {
+        if (this.isFirefox() && this.nativeViewerAvailable())
+          return this.startNativeViewerSave(pickedJob.job_id, payload.tab_id, liveTabURL, false, liveEpoch);
         if (this.isFirefox())
           // Firefox has no onDeterminingFilename, so a download papio did not
           // start cannot be steered or adopted: `correlate()` refuses it before
@@ -8336,7 +8530,7 @@ export class Bridge {
     let duplicate = false;
     if (job === undefined) {
       if (doi === undefined || doi.trim() === "") {
-        if (requiresNativeViewerDownload(url) && this.isFirefox()) {
+        if (requiresNativeViewerDownload(url) && this.isFirefox() && !this.nativeViewerAvailable()) {
           // The old copy here promised papio would file the viewer's download,
           // which on Firefox it cannot: there is no onDeterminingFilename, so
           // `correlate()` refuses a download papio did not start.
@@ -8349,6 +8543,8 @@ export class Bridge {
         if (candidates.length > 0) {
           const pageIdentity = await this.currentPageIdentity(payload.tab_id, url);
           if (pageIdentity === undefined) {
+            if (requiresNativeViewerDownload(url) && this.nativeViewerAvailable())
+              return failure("unsupported", nativeViewerReason("unsupported"));
             return failure(
               "page_unverified",
               "papio can't confirm which document this tab is showing — reload the page, then click Send this PDF again",
@@ -8465,6 +8661,8 @@ export class Bridge {
       };
     }
     if (requiresNativeViewerDownload(url)) {
+      if (this.isFirefox() && this.nativeViewerAvailable())
+        return this.startNativeViewerSave(job.job_id, payload.tab_id, tabURL, false);
       if (this.isFirefox())
         // Same reason as the choice path above: Firefox cannot steer or adopt a
         // download papio did not start, so this instruction would be a promise
@@ -13646,10 +13844,12 @@ export class Bridge {
     if (this.listenersBound) return;
     this.listenersBound = true;
     this.deps.tabs.onUpdated.addListener((tabID, change, tab) => {
+      if (change.status === "loading" || change.url !== undefined) this.invalidateNativeViewerTab(tabID);
       this.touchTab(tabID);
       return this.onTabUpdated(tabID, change, tab);
     });
     this.deps.tabs.onRemoved.addListener((tabID) => {
+      this.invalidateNativeViewerTab(tabID);
       this.tabTouchEpoch.delete(tabID);
       this.keepaliveManager?.noteTabRemoved(tabID);
       return this.onTabRemoved(tabID);
@@ -14092,6 +14292,7 @@ export class Bridge {
             "agent_fallback_v1",
             NATIVE_CLICK_ADOPTION_FEATURE,
             AGENT_NAVIGATION_FEATURE,
+            NATIVE_VIEWER_SAVE_FEATURE,
           ],
         },
         undefined,
@@ -14367,6 +14568,8 @@ export class Bridge {
     jobID: string,
     closeDisposition: SurfaceCloseDisposition = "job_inactive",
   ): Promise<void> {
+    const nativeRun = this.nativeViewerRuns.get(jobID);
+    if (nativeRun) nativeRun.invalidated = true;
     this.destroyDeliveryChoicesForJob(jobID);
     const job = findByJob(this.store, jobID);
     const materialization = this.materializationCorrelation(jobID);
@@ -16147,6 +16350,12 @@ export class Bridge {
   ): boolean {
     const port = this.port;
     if (!port) return false;
+    if (type === "native_viewer_save_request_v1") {
+      const request = payload as NativeViewerSaveRequestV1Payload;
+      // Correlation awaits ensureConnected. Recheck the captured session at
+      // the actual send boundary so reconnect/takeover cannot spend it.
+      if (this.nativeViewerSendGuards.get(request.request_id)?.() !== true) return false;
+    }
     const env: Record<string, unknown> = {
       protocol: BROWSER_PROTOCOL_VERSION,
       type,
@@ -18756,12 +18965,19 @@ export class Bridge {
     }
     const noticeKey = `${jobID}:${code}`;
     if (this.handoffOutcomeSent.has(noticeKey)) return;
-    if ((this.store.daemonFeatures ?? []).includes(NATIVE_VIEWER_DOWNLOAD_FEATURE)) {
+    if ((this.store.daemonFeatures ?? []).some(feature => feature === NATIVE_VIEWER_DOWNLOAD_FEATURE || feature === NATIVE_VIEWER_SAVE_FEATURE)) {
       if (this.send("provider_outcome", { outcome: code }, jobID)) {
         this.handoffOutcomeSent.add(noticeKey);
         // Tear down the drive, not the visible file. The close path retains
         // PDF content; a child viewer is not the parent's managed surface.
         await this.retainForManualDownload(jobID, true);
+        // Never await a correlated request inside the inbound frame queue.
+        // This fresh viewer event is the only automatic trigger; startup and
+        // triage reconciliation never resume a native save.
+        if (this.nativeViewerAvailable())
+          void this.startNativeViewerSave(jobID, tabID, url, true, pageIdentity?.document_id).then(reply => {
+            if (!reply.ok) return this.update(s => updatePendingDelivery(s, jobID, { status: "failed", error: reply.error.message }));
+          }).catch(() => {});
       }
     } else if (this.send("error", { code, message }, jobID)) {
       // An older strict parser cannot accept the new outcome. Keep its
@@ -21104,6 +21320,7 @@ export class Bridge {
     if (job === undefined) return;
     const retained: ActiveJob = {
       job_id: job.job_id,
+      ...(job.native_viewer_save ? { native_viewer_save: job.native_viewer_save } : {}),
       tab_id: -1,
       offered_at: job.offered_at,
       expires_at: job.expires_at,
@@ -24302,6 +24519,7 @@ function realDeps(): BridgeDeps {
     ...(typeof chrome.webNavigation !== "undefined"
       ? {
           webNavigation: {
+            onBeforeNavigate: { addListener: cb => chrome.webNavigation.onBeforeNavigate.addListener(cb as never) },
             onCommitted: {
               addListener: (cb) =>
                 chrome.webNavigation.onCommitted.addListener(cb as never),
