@@ -1191,10 +1191,23 @@ export const adapters: AdapterSpec[] = [
     // signal. Require both access=Yes and the rendered download control, then
     // use that control's href: Article-in-Press pages can use _reference.pdf
     // while their citation meta still points at an HTML-canonicalizing .pdf.
+    //
+    // 0.2.0 (captured 2026-09-23, fixtures/nature/success-news.html): every
+    // Nature page renders the download-pdf anchor three times (sticky context
+    // bar, in-article box, sidebar), so 0.1.0's selector could never plan a
+    // download. Take the sidebar's copy, the one the desktop layout shows.
+    // Nature news items (10.1038/d41586-…) carry no citation_doi or
+    // citation_title; dc.identifier is the identity meta every captured page
+    // type shares.
     id: "nature",
-    version: "0.1.0",
+    version: "0.2.0",
     hosts: ["nature.com"],
-    workEvidence: { kind: "doi", selector: "meta[name='citation_doi']", attribute: "content" },
+    workEvidence: {
+      kind: "doi",
+      selector: "meta[name='dc.identifier']",
+      attribute: "content",
+      pattern: "^doi:(10\\.1038/\\S+)$",
+    },
     settleTimeoutMs: 5000,
     classify: [
       {
@@ -1208,13 +1221,13 @@ export const adapters: AdapterSpec[] = [
         kind: "article",
         all: [
           "meta[name='access'][content='Yes']",
-          "meta[name='citation_title']",
-          "a[data-test='download-pdf'][data-article-pdf='true']",
+          "meta[name='dc.identifier']",
+          "aside.c-article-extras a[data-test='download-pdf'][data-article-pdf='true']",
         ],
       },
     ],
     download: {
-      selector: "a[data-test='download-pdf'][data-article-pdf='true']",
+      selector: "aside.c-article-extras a[data-test='download-pdf'][data-article-pdf='true']",
       requireKind: "article",
       workTarget: { kind: "opaque" },
       method: "href",

@@ -33,6 +33,10 @@ for the full pre-split extension history.
   pinned or in front of you.
 
 ### Fixed
+- **Nature pages now download, including Nature news items.** Every Nature page
+  shows the same PDF control three times, so the Nature adapter refused every
+  download as ambiguous. Adapter 0.2.0 uses the sidebar control and reads the
+  DOI from `dc.identifier`, which news pages (`10.1038/d41586-…`) also carry.
 - **papio no longer closes your own tabs.** The unrecorded-tab sweep treated
   every cold tab in papio's work window as papio's, and papio adopts the
   window that holds its tab group as that work window, which is your own

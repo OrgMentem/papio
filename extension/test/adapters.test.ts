@@ -1140,8 +1140,48 @@ test.skipIf(naturePaywall === null)(
     const spec = adapters.find((a) => a.id === "nature") as AdapterSpec;
     const verdict = classifyFixture(naturePaywall as Document, spec);
     expect(verdict.kind).toBe("no_entitlement");
+    // The requested DOI binds the denial to this work, so it is reported as
+    // no entitlement rather than drift.
+    expect(classifyFixture(naturePaywall as Document, spec, { doi: "10.1038/nature14539" }).kind)
+      .toBe("no_entitlement");
   },
 );
+
+// Nature renders the same download-pdf anchor three times: the sticky context
+// bar, the in-article box and the sidebar. Adapter 0.1.0 selected all three,
+// so every plan refused as "declared action target is not unique" (measured
+// live 2026-09-23 on a PMID-only job). The news capture (success-news.html,
+// captured as drift by 0.1.0 through the institutional route) is an entitled
+// Nature news item: it has no citation_doi or citation_title, only
+// dc.identifier, and its PDF control sits in the entitlement boxes.
+const natureCases = [
+  { scenario: "success", doi: "10.1038/s41467-025-67227-0" },
+  { scenario: "success-news", doi: "10.1038/d41586-025-02495-w" },
+] as const;
+for (const { scenario, doi } of natureCases) {
+  test(`captured Nature ${scenario} plans exactly one article PDF href for its DOI`, () => {
+    const spec = adapters.find((a) => a.id === "nature") as AdapterSpec;
+    const html = readFileSync(fixturePath("nature", scenario), "utf8");
+    const origin = captureOrigin(html);
+    if (origin === null) throw new Error(`nature ${scenario} capture has no origin`);
+    expect(residualLeak(html)).toBeNull();
+    const page = parseHTML(html, origin);
+    const result = planExecution(page, spec, { doi }, { access_mode: "delegated" });
+    if ("assisted" in result) throw new Error(result.assisted);
+    expect(result.verdict.kind).toBe("article");
+    expect(result.method).toBe("href");
+    expect(result.url).toBe(`https://www.nature.com/articles/${doi.slice("10.1038/".length)}.pdf`);
+
+    const other = planExecution(page, spec, { doi: "10.1038/s41591-024-03456-y" }, { access_mode: "delegated" });
+    expect(other.verdict.kind).toBe("wrong_work");
+    if ("assisted" in other) throw new Error(other.assisted);
+    expect(other.url).toBeNull();
+
+    const withoutAccess = page.cloneNode(true) as Document;
+    withoutAccess.querySelector("meta[name='access']")?.setAttribute("content", "No");
+    expect(classifyFixture(withoutAccess, spec).kind).not.toBe("article");
+  });
+}
 
 const thiemeArticle = loadFixture("thieme", "success");
 test.skipIf(thiemeArticle === null)(
