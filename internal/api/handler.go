@@ -1149,7 +1149,10 @@ func redriveJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 		return badParams(errors.New("job_id and non-negative expected_revision are required"))
 	}
 	id, err := system.Jobs.RedriveInstitutionalHandoff(ctx, params.JobID, *params.ExpectedRevision,
-		system.Config.OpenURLBaseFor, app.InstitutionalOpenURLHandoffDetail)
+		system.Config.OpenURLBaseFor, func(detail string) bool {
+			_, ok := app.OABrowserHandoffURL(detail)
+			return ok
+		}, app.InstitutionalOpenURLHandoffDetail)
 	if err != nil {
 		return failure(err)
 	}

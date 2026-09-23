@@ -16,8 +16,13 @@ import (
 // institutional handoff. The resolver lookup and handoff detail come from the
 // daemon's configuration and ordinary park path, not from the operator.
 // revision is zero only for a parked job with no open action.
+//
+// The spent route is a manual download, or an open handoff whose detail
+// oaHandoff recognizes as an open-access browser route: an OA URL that
+// answered HTML (Wiley's pdfdirect without an entitlement) leaves the job
+// parked on that handoff, and the institutional route is the one left to try.
 func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
-	openURLBaseFor func(string) (string, bool), handoffDetail string) (int64, error) {
+	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, handoffDetail string) (int64, error) {
 	if strings.TrimSpace(jobID) == "" || revision < 0 {
 		return 0, errors.New("job_id and non-negative revision are required")
 	}
@@ -69,16 +74,16 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	if latestRedrive > latestOutcome {
 		return 0, fmt.Errorf("%w: redrive already requested since the last browser outcome", ErrConflict)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,kind,revision FROM human_actions WHERE job_id=? AND status='open'`, jobID)
+	rows, err := tx.QueryContext(ctx, `SELECT id,kind,COALESCE(detail,''),revision FROM human_actions WHERE job_id=? AND status='open'`, jobID)
 	if err != nil {
 		return 0, err
 	}
 	var actionID, actionRevision int64
-	var actionKind string
+	var actionKind, actionDetail string
 	count := 0
 	for rows.Next() {
 		count++
-		if err := rows.Scan(&actionID, &actionKind, &actionRevision); err != nil {
+		if err := rows.Scan(&actionID, &actionKind, &actionDetail, &actionRevision); err != nil {
 			_ = rows.Close()
 			return 0, err
 		}
@@ -88,8 +93,9 @@ func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	if err != nil {
 		return 0, err
 	}
-	if count > 1 || (count == 1 && (actionKind != "manual_download" || revision != actionRevision)) || (count == 0 && revision != 0) {
-		return 0, fmt.Errorf("%w: expected one unchanged manual_download action, or no open action with revision 0; list actions again", ErrConflict)
+	spent := actionKind == "manual_download" || (actionKind == "openurl_handoff" && oaHandoff(actionDetail))
+	if count > 1 || (count == 1 && (!spent || revision != actionRevision)) || (count == 0 && revision != 0) {
+		return 0, fmt.Errorf("%w: expected one unchanged manual_download or open-access handoff action, or no open action with revision 0; list actions again", ErrConflict)
 	}
 	if count == 0 {
 		err := tx.QueryRowContext(ctx, `SELECT id,revision FROM human_actions

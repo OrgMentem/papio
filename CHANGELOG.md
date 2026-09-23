@@ -28,6 +28,13 @@ execution records kept during the initial build.
   institution's resolver as the next route in a new attempt. Previously the
   UNE Primo route landed on the journal homepage and needed a manual
   `papio actions retry-publisher`.
+- An open-access browser route that downloads HTML instead of a PDF now falls
+  back once to the institution's resolver. Before, papio kept the open-access
+  handoff, so each new browser claim opened the same URL again. On
+  2026-09-23 a Wiley `pdfdirect` link returned HTML three times and got five
+  authorizations. The fallback releases the old browser claim, and the resolver
+  route uses the institution's safety domain. `papio jobs redrive` also accepts
+  an open-access handoff that is already parked.
 
 ### Added
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual

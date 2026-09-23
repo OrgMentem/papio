@@ -1693,9 +1693,14 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 	if existing, getErr := b.jobs.CurrentBrowserCandidateForJob(ctx, row.ID, attempt); getErr != nil {
 		return nil, getErr
 	} else if existing != nil {
-		// The repair is scoped to the ONE mismatch known to be wrong: this
+		// The repair is scoped to the mismatches known to be wrong: this
 		// job's route is open-access and its stored candidate carries some
-		// other fence. Nothing else in production writes this column, so a
+		// other fence, or the stored candidate carries an open-access or
+		// publisher fence and the route has since fallen back to another one
+		// (fallbackOAHandoff replaces the action, not the candidate, so the
+		// library route it opens would otherwise be claimed under the OA
+		// host's fence and never serialize with its institution siblings).
+		// Nothing else in production writes this column, so a
 		// general "any mismatch is stale" rule would also be true today, but
 		// it is a wider claim than the defect needs and it would rewrite the
 		// candidates that tests and future callers legitimately pre-create.
@@ -1709,7 +1714,8 @@ func (b *Bridge) prepareMaterializationCandidate(ctx context.Context, row job.Ro
 		// surface depends on this value: the tab is reached by candidate id,
 		// binding, and tab id, and the offer path re-reads the row every poll,
 		// so at worst one poll declines to offer and the next agrees.
-		misfenced := strings.HasPrefix(domain, "oa:") && existing.SafetyDomainID != domain
+		misfenced := existing.SafetyDomainID != domain && (strings.HasPrefix(domain, "oa:") ||
+			strings.HasPrefix(existing.SafetyDomainID, "oa:") || strings.HasPrefix(existing.SafetyDomainID, "publisher:"))
 		if !misfenced {
 			return existing, nil
 		}
@@ -3608,11 +3614,72 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			map[string]any{"code": p.Code}); err != nil {
 			log.Printf("papio: recording browser error: %v", err)
 		}
+		if p.Code == "download_not_pdf" {
+			if err := b.fallbackOAAfterNotPDF(ctx, msg.JobID); err != nil {
+				log.Printf("papio: applying download_not_pdf fallback for %s: %v", msg.JobID, err)
+			}
+		}
 		return nil, nil
 
 	default:
 		return nil, fmt.Errorf("%w: unexpected inbound frame type %q", ErrInvalidFrame, msg.Type)
 	}
+}
+
+// fallbackOAAfterNotPDF ends an open-access browser route that answered HTML.
+// Unpaywall and OpenAlex hand papio publisher URLs (Wiley's pdfdirect) for
+// articles that are not free to this browser; without an entitlement they
+// serve the abstract page, and the old handler only recorded the error, so
+// every new claim re-issued the same URL and authorized another effect for it
+// (measured live 2026-09-23: three download_not_pdf and five authorizations of
+// one pdfdirect URL in five minutes, while a same-journal sibling succeeded
+// through the library). The route earns the same one institutional fallback
+// as an explicit no_entitlement.
+//
+// The frame is job-level and uncorrelated, like job_reject, so it acts only
+// while the job is parked on an OA handoff: HTML from the institutional route,
+// a document delivery, or a late frame after the job moved on stays
+// diagnostic. An OA alternate found after the institutional route already
+// proved empty is never converted back to that route.
+func (b *Bridge) fallbackOAAfterNotPDF(ctx context.Context, jobID string) error {
+	if strings.TrimSpace(jobID) == "" {
+		return nil
+	}
+	row, err := b.jobs.Get(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if row.State != job.StateAwaitingHuman {
+		return nil
+	}
+	actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+	if err != nil {
+		return err
+	}
+	oa := false
+	for _, action := range actions {
+		if action.Kind == handoffActionKind {
+			_, oa = app.OABrowserHandoffURL(action.Detail)
+			break
+		}
+	}
+	if !oa {
+		return nil
+	}
+	if requeued, err := b.institutionalRouteRequeued(ctx, jobID); err != nil || requeued {
+		return err
+	}
+	fellBack, err := b.fallbackOAHandoff(ctx, jobID, "download_not_pdf")
+	if err != nil || !fellBack {
+		return err
+	}
+	// The OA attempt is finished: retire its binding so no later claim, holder
+	// promotion, or re-offer can re-authorize the URL that answered HTML.
+	b.retireFinishedProviderBinding(ctx, jobID, "download_not_pdf")
+	return nil
 }
 func (b *Bridge) providerDriveEpochAuthorized(ctx context.Context, jobID, safetyDomain string) (bool, error) {
 	if b == nil || b.jobs == nil || strings.TrimSpace(jobID) == "" {
