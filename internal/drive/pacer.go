@@ -33,6 +33,10 @@ const (
 	// is the pause state, so it survives a daemon restart.
 	PausedEvent  = "drive.paused"
 	ResumedEvent = "drive.resumed"
+	// SignInStalledEvent settles a paced open whose provider asked for an
+	// institutional sign-in that did not return within sign_in_wait. It
+	// carries "until": the paper's route stays cooled until then.
+	SignInStalledEvent = "drive.sign_in_stalled"
 )
 
 // Pause reasons.
@@ -87,6 +91,7 @@ var settleKinds = map[string]bool{
 	"browser.error":                       true,
 	job.ProviderCooldownEvent:             true,
 	OpenDeclinedEvent:                     true,
+	SignInStalledEvent:                    true,
 }
 
 // Pacer is the paced drive: a maintenance runner that opens at most one parked
@@ -144,7 +149,17 @@ type Candidate struct {
 // evaluation is Status plus the facts RunDue acts on.
 type evaluation struct {
 	Status
-	signInStale *job.HumanGateObservation
+	// stalled is the newest paced open, when its sign-in stalled and the
+	// stall is not yet recorded.
+	stalled *job.EventRecord
+	// shared is evidence that the institution's shared sign-in, not one
+	// provider route, needs a person.
+	shared *sharedSignIn
+}
+
+// sharedSignIn names the paced papers whose stalls are the evidence.
+type sharedSignIn struct {
+	jobs []string
 }
 
 func (p *Pacer) now() time.Time {
@@ -183,8 +198,9 @@ func (p *Pacer) Pause(ctx context.Context) (Status, error) {
 	return eval.Status, err
 }
 
-// Resume lifts any pause. A sign-in that still needs a person pauses the
-// pacer again on its next pass, with a fresh notification.
+// Resume lifts any pause. Sign-in evidence recorded before the resume never
+// pauses the drive again: the operator has seen it. Only a new stall after
+// the resume can pause it, with a fresh notification.
 func (p *Pacer) Resume(ctx context.Context) (Status, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -214,10 +230,18 @@ func (p *Pacer) RunDue(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if eval.stalled != nil {
+		if err := p.recordStall(ctx, now, *eval.stalled); err != nil {
+			return err
+		}
+		if eval, err = p.evaluate(ctx, now); err != nil {
+			return err
+		}
+	}
 	switch {
-	case eval.signInStale != nil && !eval.Paused:
-		return p.pauseForSignIn(ctx, now, *eval.signInStale)
-	case eval.signInStale == nil && eval.Paused && eval.PausedReason == PauseSignIn:
+	case eval.shared != nil && !eval.Paused:
+		return p.pauseForSignIn(ctx, now, *eval.shared)
+	case eval.shared == nil && eval.Paused && eval.PausedReason == PauseSignIn:
 		if err := p.Jobs.S.RecordSystemEvent(ctx, ResumedEvent, map[string]any{"reason": "sign_in_cleared"}); err != nil {
 			return err
 		}
@@ -270,9 +294,129 @@ func (p *Pacer) decline(ctx context.Context, jobID, reason string) {
 	}
 }
 
-func (p *Pacer) pauseForSignIn(ctx context.Context, now time.Time, gate job.HumanGateObservation) error {
+// recordStall settles a paced open whose sign-in did not return. The paper
+// is already backed off by its paced open; the stall event also cools its
+// route (the DOI prefix, and the host its events last named) for one backoff
+// period, so the next paper on the same provider is not opened into the
+// same sign-in.
+func (p *Pacer) recordStall(ctx context.Context, now time.Time, open job.EventRecord) error {
+	events, err := p.Jobs.JobEventsAfter(ctx, open.JobID, 0)
+	if err != nil {
+		return err
+	}
+	detail := map[string]any{
+		"paced_open_seq": open.Seq,
+		"until":          now.Add(p.Config.Drive.EffectiveJobBackoff()).UTC().Format(time.RFC3339Nano),
+	}
+	for _, event := range events {
+		if host, _ := event.Detail["host"].(string); host != "" {
+			detail["host"] = strings.ToLower(host)
+		}
+	}
+	return p.Jobs.RecordEvent(ctx, open.JobID, SignInStalledEvent, detail)
+}
+
+// signInStalled reports whether a paced open is stuck at an institutional
+// sign-in: since the open, the browser reported auth_pending, never
+// auth_returned after it, and nothing else, and the first auth_pending is
+// older than sign_in_wait.
+func (p *Pacer) signInStalled(ctx context.Context, now time.Time, open job.EventRecord) (bool, error) {
+	after, err := p.Jobs.JobEventsAfter(ctx, open.JobID, open.Seq)
+	if err != nil {
+		return false, err
+	}
+	var firstPending time.Time
+	returned := false
+	for _, event := range after {
+		switch {
+		case settleKinds[event.Kind]:
+			return false, nil
+		case event.Kind == "browser.auth_pending":
+			if firstPending.IsZero() {
+				firstPending = event.At
+			}
+			returned = false
+		case event.Kind == "browser.auth_returned":
+			returned = true
+		}
+	}
+	if firstPending.IsZero() || returned || now.Sub(firstPending) < p.Config.Drive.EffectiveSignInWait() {
+		return false, nil
+	}
+	row, err := p.Jobs.Get(ctx, open.JobID)
+	if err != nil || row.State != job.StateAwaitingHuman {
+		return false, nil
+	}
+	return true, nil
+}
+
+// sharedSignInEvidence reports whether the institution's shared sign-in,
+// not one provider route, needs a person. Every login gate the bridge opens
+// is keyed on the institution's authentication claim, whichever page asked,
+// so a gate cannot tell an IdP from a provider. The evidence is the drive's
+// own: its two most recent paced opens both stalled at the sign-in, on two
+// different DOI prefixes (one prefix is one provider, and its route is
+// already cooled). A sign-in that returned anywhere after the later stall,
+// or an operator resume after it, clears the evidence.
+func (p *Pacer) sharedSignInEvidence(ctx context.Context, opens []job.EventRecord) (*sharedSignIn, error) {
+	if len(opens) < 2 {
+		return nil, nil
+	}
+	stalls, err := p.Jobs.EventsOfKind(ctx, SignInStalledEvent, 200)
+	if err != nil {
+		return nil, err
+	}
+	stalledOpen := map[int64]int64{}
+	for _, stall := range stalls {
+		if seq, ok := stall.Detail["paced_open_seq"].(float64); ok {
+			stalledOpen[int64(seq)] = stall.Seq
+		}
+	}
+	latest, earlier := opens[0], opens[1]
+	latestStall, latestOK := stalledOpen[latest.Seq]
+	earlierStall, earlierOK := stalledOpen[earlier.Seq]
+	if !latestOK || !earlierOK || latest.JobID == earlier.JobID {
+		return nil, nil
+	}
+	latestPrefix, earlierPrefix := p.jobDOIPrefix(ctx, latest.JobID), p.jobDOIPrefix(ctx, earlier.JobID)
+	if latestPrefix != "" && latestPrefix == earlierPrefix {
+		return nil, nil
+	}
+	evidenceSeq := max(latestStall, earlierStall)
+	returned, err := p.Jobs.EventsOfKind(ctx, "browser.auth_returned", 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(returned) > 0 && returned[0].Seq > evidenceSeq {
+		return nil, nil
+	}
+	resumes, err := p.Jobs.EventsOfKind(ctx, ResumedEvent, 50)
+	if err != nil {
+		return nil, err
+	}
+	for _, resume := range resumes {
+		if reason, _ := resume.Detail["reason"].(string); reason == PauseOperator {
+			if resume.Seq > evidenceSeq {
+				return nil, nil
+			}
+			break
+		}
+	}
+	return &sharedSignIn{jobs: []string{latest.JobID, earlier.JobID}}, nil
+}
+
+func (p *Pacer) jobDOIPrefix(ctx context.Context, jobID string) string {
+	row, err := p.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return ""
+	}
+	return doiPrefix(row.Work.DOI)
+}
+
+func (p *Pacer) pauseForSignIn(ctx context.Context, now time.Time, shared sharedSignIn) error {
 	if err := p.Jobs.S.RecordSystemEvent(ctx, PausedEvent, map[string]any{
-		"reason": PauseSignIn, "gate_type": string(gate.GateType), "paused_at": now.UTC().Format(time.RFC3339Nano),
+		"reason": PauseSignIn, "trigger": "consecutive_sign_in_stalls", "jobs": shared.jobs,
+		"paused_at": now.UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		return err
 	}
@@ -281,17 +425,14 @@ func (p *Pacer) pauseForSignIn(ctx context.Context, now time.Time, gate job.Huma
 	}
 	// The pause event is durable before routing, so a restart never repeats
 	// the notice: the next pass reads the pause and does not come back here.
-	message := "papio paused its paced drive: an institutional sign-in is waiting for you. Sign in; the drive resumes by itself (papio drive status)."
+	message := "papio paused its paced drive: sign-ins for two papers from different providers did not come back. Sign in to your library in the browser; the drive resumes when a sign-in returns, or run papio drive resume."
 	window := 5 * time.Minute
 	if policy, err := notify.ResolvePolicy(p.Config.Notify); err == nil {
 		if configured := policy.For(notify.CategoryDecisionOpened).Window; configured > 0 {
 			window = configured
 		}
 	}
-	jobID := ""
-	if members := append(append([]string(nil), gate.DependentJobIDs...), gate.ClaimMemberJobIDs...); len(members) > 0 {
-		jobID = members[0]
-	}
+	jobID := shared.jobs[0]
 	intent := notify.Intent{
 		EventKind: PausedEvent, Category: notify.CategoryDecisionOpened, Phase: notify.PhaseOpened,
 		AggregateKey: "drive:paused:" + now.UTC().Format(time.RFC3339Nano),
@@ -342,27 +483,46 @@ func (p *Pacer) evaluate(ctx context.Context, now time.Time) (evaluation, error)
 		eval.PausedAt = eventTime(latest, "paused_at").UTC().Format(time.RFC3339)
 	}
 
+	opens, err := p.Jobs.EventsOfKind(ctx, PacedOpenEvent, 1000)
+	if err != nil {
+		return eval, err
+	}
+	// A stalled sign-in on the newest paced open is that paper's problem:
+	// RunDue settles it and cools its route. Only the shared evidence below
+	// pauses the whole drive.
+	if len(opens) > 0 {
+		stalled, err := p.signInStalled(ctx, now, opens[0])
+		if err != nil {
+			return eval, err
+		}
+		if stalled {
+			eval.stalled = &opens[0]
+		}
+	}
+	if eval.shared, err = p.sharedSignInEvidence(ctx, opens); err != nil {
+		return eval, err
+	}
+	if eval.Paused || (eval.shared != nil && cfg.Enabled) {
+		block(BlockPaused)
+	}
+
 	// Sign-in gates. One sign-in slot serves every paper at an institution,
-	// so an open gate anywhere blocks the next open; one older than the wait
-	// bound means nobody is completing it and a person is needed.
+	// so a sign-in someone is still inside (a gate younger than the wait)
+	// blocks the next open. An older gate blocks nothing by itself: nobody is
+	// completing it, and a paced paper stuck behind it is settled above.
 	attention, err := p.Jobs.CurrentHumanAttention(ctx)
 	if err != nil {
 		return eval, err
 	}
 	signInPending := false
-	for i, gate := range attention.Gates {
+	for _, gate := range attention.Gates {
 		if gate.GateType != job.HumanGateLogin && gate.GateType != job.HumanGateMFA && gate.GateType != job.HumanGateCaptchaOrSecurity {
 			continue
 		}
-		signInPending = true
 		since, parseErr := time.Parse(time.RFC3339Nano, gate.UpdatedAt)
-		if parseErr != nil || now.Sub(since) >= cfg.EffectiveSignInWait() {
-			eval.signInStale = &attention.Gates[i]
-			break
+		if parseErr == nil && now.Sub(since) < cfg.EffectiveSignInWait() {
+			signInPending = true
 		}
-	}
-	if eval.Paused || (eval.signInStale != nil && cfg.Enabled) {
-		block(BlockPaused)
 	}
 
 	if quiet, err := notify.ParseQuietHours(p.Config.Notify.QuietHours, time.Local); err == nil && quiet.Contains(now) {
@@ -382,10 +542,6 @@ func (p *Pacer) evaluate(ctx context.Context, now time.Time) (evaluation, error)
 		block(BlockHolderAbsent)
 	}
 
-	opens, err := p.Jobs.EventsOfKind(ctx, PacedOpenEvent, 1000)
-	if err != nil {
-		return eval, err
-	}
 	backedOff := map[string]bool{}
 	for _, open := range opens {
 		age := now.Sub(eventTime(open, "opened_at"))
@@ -417,7 +573,7 @@ func (p *Pacer) evaluate(ctx context.Context, now time.Time) (evaluation, error)
 	if claims > 0 || permits > 0 {
 		block(BlockBrowserBusy)
 	}
-	if signInPending && eval.signInStale == nil {
+	if signInPending {
 		block(BlockSignInPending)
 	}
 
@@ -568,7 +724,9 @@ func (c cooldown) covers(jobID, doi string) bool {
 // the resolver redirects, so a cooled host is mapped back to the papers that
 // have been there (their events name the host) and to those papers' DOI
 // prefixes: a publisher serves every DOI under its prefix, so while
-// www.sciencedirect.com refuses this browser no 10.1016 paper is opened.
+// www.sciencedirect.com refuses this browser no 10.1016 paper is opened. A
+// paced paper whose sign-in stalled cools its own route the same way, with
+// the host its events last named when there is one.
 func (p *Pacer) cooldowns(ctx context.Context, now time.Time) (cooldown, error) {
 	out := cooldown{jobs: map[string]bool{}, prefixes: map[string]bool{}}
 	addJob := func(jobID string) error {
@@ -586,21 +744,24 @@ func (p *Pacer) cooldowns(ctx context.Context, now time.Time) (cooldown, error) 
 		}
 		return nil
 	}
-	cooldowns, err := p.Jobs.EventsOfKind(ctx, job.ProviderCooldownEvent, 500)
-	if err != nil {
-		return out, err
-	}
 	hosts := map[string]bool{}
-	for _, event := range cooldowns {
-		until, _ := event.Detail["until"].(string)
-		host, _ := event.Detail["host"].(string)
-		deadline, err := time.Parse(time.RFC3339Nano, until)
-		if err != nil || !deadline.After(now) || host == "" {
-			continue
-		}
-		hosts[strings.ToLower(host)] = true
-		if err := addJob(event.JobID); err != nil {
+	for _, kind := range []string{job.ProviderCooldownEvent, SignInStalledEvent} {
+		cooldowns, err := p.Jobs.EventsOfKind(ctx, kind, 500)
+		if err != nil {
 			return out, err
+		}
+		for _, event := range cooldowns {
+			until, _ := event.Detail["until"].(string)
+			deadline, err := time.Parse(time.RFC3339Nano, until)
+			if err != nil || !deadline.After(now) {
+				continue
+			}
+			if host, _ := event.Detail["host"].(string); host != "" {
+				hosts[strings.ToLower(host)] = true
+			}
+			if err := addJob(event.JobID); err != nil {
+				return out, err
+			}
 		}
 	}
 	for host := range hosts {

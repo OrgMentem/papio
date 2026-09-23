@@ -97,11 +97,13 @@ func ActivityText(kind string, detail map[string]any) string {
 		return "Paced open not taken"
 	case "drive.paused":
 		if activityDetailString(detail, "reason") == "sign_in_needed" {
-			return "Paced drive paused — a sign-in is waiting for you"
+			return "Paced drive paused — your library sign-in needs you"
 		}
 		return "Paced drive paused"
 	case "drive.resumed":
 		return "Paced drive resumed"
+	case "drive.sign_in_stalled":
+		return "Sign-in for this paper did not return — the paced drive moved on"
 	case "job.transition":
 		to := strings.ReplaceAll(activityDetailString(detail, "to"), "_", " ")
 		if to == "" {

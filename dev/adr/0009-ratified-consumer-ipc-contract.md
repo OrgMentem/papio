@@ -234,12 +234,25 @@ consumer, script and agent. The drive is held to these bounds:
   or a job with a recent `challenge_blocked`, is skipped. The skip covers every
   paper under the same DOI prefix, because a handoff's final provider is
   unknown until the resolver redirects.
-- **A person is asked, once.** An institutional sign-in, MFA or security gate
-  open longer than `sign_in_wait_minutes` (default 10) pauses the drive. It
-  records `drive.paused` and sends one `decision_opened` notification. When
-  the gate closes, the drive resumes by itself (`drive.resumed`). An
-  operator's `papio drive pause` holds until `papio drive resume`, and that
+- **A person is asked, once, and only about the shared sign-in.** Every
+  login gate the bridge opens is keyed on the institution's authentication
+  claim, whichever page asked, so a gate cannot tell the library's IdP from
+  one provider's own sign-in. A paced paper whose sign-in did not return
+  within `sign_in_wait_minutes` (default 10) is therefore that paper's
+  problem: the drive records `drive.sign_in_stalled`, cools that paper's
+  route (its DOI prefix and any host its events name) for
+  `job_backoff_hours`, and moves on. The drive pauses, with `drive.paused`
+  and one `decision_opened` notification, only when its two most recent
+  paced papers, on two different DOI prefixes, both stalled that way. It
+  resumes by itself (`drive.resumed`) when any sign-in returns. An
+  operator's `papio drive pause` holds until `papio drive resume`, and a
+  resume holds against the sign-in evidence recorded before it. That
   command is hidden from the MCP facade.
+
+  Corrected the same day. The first cut paused the whole drive on any stale
+  gate. Live, one Informit route asked for a sign-in nobody completed, and
+  the drive stopped for every paper. The other sign-ins that day returned in
+  2-14 seconds, so the library's SSO was working.
 
 This amendment does not ratify a new method for consumers. `drive.status`,
 `drive.pause` and `drive.resume` serve the CLI and are not part of the pinned

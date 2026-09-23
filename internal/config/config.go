@@ -647,9 +647,10 @@ type Drive struct {
 	// JobBackoffHours is how long the pacer leaves a paper it opened alone,
 	// whatever happened to it.
 	JobBackoffHours int `toml:"job_backoff_hours,omitempty"`
-	// SignInWaitMinutes is how long an open institutional sign-in, MFA or
-	// security check may wait for its return before the pacer pauses and
-	// asks for a person.
+	// SignInWaitMinutes is how long a paced paper's institutional sign-in
+	// may wait for its return. After that the pacer settles that paper and
+	// cools its route; two such stalls in a row on different providers
+	// pause the drive and ask for a person.
 	SignInWaitMinutes int `toml:"sign_in_wait_minutes,omitempty"`
 	// SettleMinutes bounds how long one paced open counts as in flight when
 	// the browser reports nothing about it.

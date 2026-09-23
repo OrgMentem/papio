@@ -3,6 +3,7 @@ package drive
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -271,43 +272,137 @@ func TestPacerSkipsAJobBehindARecentChallenge(t *testing.T) {
 	}
 }
 
-// A sign-in nobody completes pauses the drive once, with one notification,
-// and the drive resumes by itself when the sign-in returns.
-func TestPacerPausesForAStaleSignInAndResumes(t *testing.T) {
-	h := newHarness(t, true)
+// stallSignIn stands in for a paced paper whose provider asked for an
+// institutional sign-in that never came back: the bridge records
+// browser.auth_pending on the job and opens the institution's login gate,
+// keyed on the authentication claim like every login gate the bridge opens.
+func (h *harness) stallSignIn(jobID string) {
+	h.t.Helper()
 	ctx := context.Background()
-	id := h.park("wr_signin", "10.1000/signin", "openurl_handoff")
-	opened := h.clock.Add(-11 * time.Minute).UTC().Format(time.RFC3339Nano)
+	if err := h.jobs.S.AppendEvent(ctx, jobID, "browser.auth_pending", nil); err != nil {
+		h.t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := h.jobs.UpsertHumanGateObservation(ctx, job.HumanGateObservation{
-		ID: "gate-signin-1", GateType: job.HumanGateLogin, ScopeClass: string(job.HumanGateScopeAuthenticationClaim),
-		ScopeKey: "claim-signin", DependentJobIDs: []string{id}, ObservationRevision: 1, Status: job.HumanGateOpen,
-		DetailJSON: `{"source":"auth_pending"}`, CreatedAt: opened, UpdatedAt: opened,
+		ID: "gate-login-institution", GateType: job.HumanGateLogin, ScopeClass: string(job.HumanGateScopeAuthenticationClaim),
+		ScopeKey: "claim-institution", ClaimMemberJobIDs: []string{jobID}, ObservationRevision: 1, Status: job.HumanGateOpen,
+		DetailJSON: `{"source":"auth_pending"}`, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
+}
+
+// Measured live 2026-09-23: one paced paper's provider route (Informit)
+// asked for a sign-in nobody completed, and the whole drive stopped. A stall
+// on one paper settles that paper and cools its route; the drive goes on.
+func TestAStalledPacedSignInSettlesThatPaperAndTheDriveContinues(t *testing.T) {
+	h := newHarness(t, true)
+	stalled := h.park("wr_stall_a", "10.3316/informit.a", "openurl_handoff")
+	sameRoute := h.park("wr_stall_c", "10.3316/informit.c", "openurl_handoff")
+	other := h.park("wr_stall_b", "10.5555/other", "openurl_handoff")
 	h.run()
+	h.stallSignIn(stalled)
+	h.clock = h.clock.Add(11 * time.Minute)
 	h.run()
-	if len(h.browser.opened) != 0 {
-		t.Fatalf("opened %v while a sign-in waited for a person", h.browser.opened)
-	}
-	if len(h.sink.intents) != 1 || h.sink.intents[0].Category != notify.CategoryDecisionOpened {
-		t.Fatalf("notifications = %+v, want exactly one decision notice", h.sink.intents)
+	if got := h.browser.openedJobs(); !slices.Equal(got, []string{stalled, other}) {
+		t.Fatalf("opened %v, want the stalled paper then the next paper on another route (not %s)", got, sameRoute)
 	}
 	status := h.status()
-	if !status.Paused || status.PausedReason != PauseSignIn {
-		t.Fatalf("status = %+v, want paused for sign-in", status)
+	if status.Paused || len(h.sink.intents) != 0 {
+		t.Fatalf("status = %+v with %d notices, want no pause for one paper's sign-in", status, len(h.sink.intents))
 	}
+	if !slices.Contains(h.eventKinds(stalled), SignInStalledEvent) {
+		t.Fatalf("events %v, want the stalled open settled", h.eventKinds(stalled))
+	}
+	if status.Skipped[SkipHostCooldown] < 1 {
+		t.Fatalf("status.skipped = %v, want the same-route paper cooled", status.Skipped)
+	}
+}
 
-	if err := h.jobs.ResolveHumanGate(ctx, job.HumanGateLogin, string(job.HumanGateScopeAuthenticationClaim), "claim-signin", 1); err != nil {
-		t.Fatal(err)
+// Two consecutive paced papers on different providers both stuck at the
+// sign-in is evidence about the shared institutional sign-in: the drive
+// pauses once and notifies once. It resumes on the next sign-in that
+// returns, or on an operator resume, which that same evidence cannot undo.
+func TestConsecutiveStallsOnDifferentProvidersPauseTheDriveOnce(t *testing.T) {
+	for _, exit := range []string{"sign_in_returns", "operator_resume"} {
+		t.Run(exit, func(t *testing.T) {
+			h := newHarness(t, true)
+			ctx := context.Background()
+			first := h.park("wr_shared_a", "10.1111/a", "openurl_handoff")
+			second := h.park("wr_shared_b", "10.2222/b", "openurl_handoff")
+			third := h.park("wr_shared_c", "10.3333/c", "openurl_handoff")
+			h.run()
+			h.stallSignIn(first)
+			h.clock = h.clock.Add(11 * time.Minute)
+			h.run()
+			h.stallSignIn(second)
+			h.clock = h.clock.Add(11 * time.Minute)
+			h.run()
+			h.run()
+			if got := h.browser.openedJobs(); !slices.Equal(got, []string{first, second}) {
+				t.Fatalf("opened %v, want two opens and then a pause", got)
+			}
+			if len(h.sink.intents) != 1 || h.sink.intents[0].Category != notify.CategoryDecisionOpened {
+				t.Fatalf("notifications = %+v, want exactly one decision notice", h.sink.intents)
+			}
+			if status := h.status(); !status.Paused || status.PausedReason != PauseSignIn {
+				t.Fatalf("status = %+v, want paused for the shared sign-in", status)
+			}
+
+			if exit == "sign_in_returns" {
+				if err := h.jobs.S.AppendEvent(ctx, second, "browser.auth_returned", nil); err != nil {
+					t.Fatal(err)
+				}
+				if err := h.jobs.ResolveHumanGate(ctx, job.HumanGateLogin, string(job.HumanGateScopeAuthenticationClaim), "claim-institution", 1); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := h.pacer.Resume(ctx); err != nil {
+				t.Fatal(err)
+			}
+			h.run()
+			h.run()
+			if got := h.browser.openedJobs(); !slices.Equal(got, []string{first, second, third}) {
+				t.Fatalf("opened %v after %s, want the drive resumed", got, exit)
+			}
+			if status := h.status(); status.Paused || len(h.sink.intents) != 1 {
+				t.Fatalf("status = %+v with %d notices after %s, want resumed and still one notice", status, len(h.sink.intents), exit)
+			}
+		})
 	}
-	h.run()
-	if got := h.browser.openedJobs(); !slices.Equal(got, []string{id}) {
-		t.Fatalf("opened %v after the sign-in returned, want the drive resumed", got)
-	}
-	latest, found, err := h.jobs.LatestSystemEvent(ctx, PausedEvent, ResumedEvent)
-	if err != nil || !found || latest.Kind != ResumedEvent {
-		t.Fatalf("latest drive event = %+v found=%t err=%v, want drive.resumed", latest, found, err)
+}
+
+// The live pause of 2026-09-23 was written by the old binary for one
+// paper's stall. After the upgrade it must clear by itself, and an operator
+// resume must hold against the sign-in evidence that is already known.
+func TestAnOldSignInPauseClearsAndAnOperatorResumeHolds(t *testing.T) {
+	for _, operatorResume := range []bool{false, true} {
+		t.Run(fmt.Sprintf("operator_resume=%t", operatorResume), func(t *testing.T) {
+			h := newHarness(t, true)
+			ctx := context.Background()
+			stalled := h.park("wr_legacy_a", "10.3316/legacy", "openurl_handoff")
+			next := h.park("wr_legacy_b", "10.5555/next", "openurl_handoff")
+			h.run()
+			h.stallSignIn(stalled)
+			h.clock = h.clock.Add(11 * time.Minute)
+			if err := h.jobs.S.RecordSystemEvent(ctx, PausedEvent, map[string]any{
+				"reason": PauseSignIn, "gate_type": string(job.HumanGateLogin),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if operatorResume {
+				if _, err := h.pacer.Resume(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.run()
+			h.run()
+			if status := h.status(); status.Paused || len(h.sink.intents) != 0 {
+				t.Fatalf("status = %+v with %d notices, want the old pause cleared and not re-raised", status, len(h.sink.intents))
+			}
+			if got := h.browser.openedJobs(); !slices.Equal(got, []string{stalled, next}) {
+				t.Fatalf("opened %v, want the drive to continue with the next paper", got)
+			}
+		})
 	}
 }
 

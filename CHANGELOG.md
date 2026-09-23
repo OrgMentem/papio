@@ -141,10 +141,14 @@ execution records kept during the initial build.
   is live, while no browser holds the session, during `notify.quiet_hours`,
   and for any provider host in cooldown (every paper under that DOI prefix).
   A manual download is redriven first when `papio jobs redrive` would accept
-  it; an `openurl_available` advisory is never opened. A sign-in nobody
-  completes within 10 minutes pauses the drive and sends one notification; it
-  resumes when the sign-in returns. `papio drive status` shows what it would
-  do and what blocks it; `papio drive pause` and `papio drive resume` hold it.
+  it; an `openurl_available` advisory is never opened. When one paper's
+  sign-in does not return within 10 minutes, the drive settles that paper,
+  cools its route (its DOI prefix) for 6 hours and goes on to the next paper.
+  Only when the two most recent paced papers, from different providers, both
+  stall at the sign-in does the drive pause and send one notification; it
+  resumes when any sign-in returns. `papio drive status` shows what it would
+  do and what blocks it; `papio drive pause` and `papio drive resume` hold it,
+  and a resume is not undone by sign-in evidence that is already known.
   The drive never accepts terms, submits a delivery request or resolves an
   identity review. ADR-0009 records the operator decision that permits it.
 - **Every acquired artifact now records who produced it.** Each promotion to

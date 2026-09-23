@@ -507,20 +507,20 @@ screen, as an operator's open would.
 | `enabled` | boolean | `false` | Turns the paced drive on. Off unless set: opening human work with nobody asking is an operator's decision for one machine. |
 | `max_opens_per_hour` | integer | `10` | Maximum paced opens in a rolling hour. `0` selects the default. Must be in `0..60`. |
 | `job_backoff_hours` | integer hours | `6` | How long the drive leaves a paper it opened before it may open that paper again, whatever the result was. `0` selects the default. Must be in `0..168`. |
-| `sign_in_wait_minutes` | integer minutes | `10` | How long an open institutional sign-in, MFA prompt or security check may wait for its return. After that the drive pauses and sends one `decision_opened` notification; it resumes by itself when the sign-in returns. `0` selects the default. Must be in `0..1440`. |
+| `sign_in_wait_minutes` | integer minutes | `10` | How long a paced paper's institutional sign-in may wait for its return. After that the drive settles that paper (`drive.sign_in_stalled`), cools its route for `job_backoff_hours`, and moves on. When the two most recent paced papers, on two different DOI prefixes, both stall this way, the drive pauses and sends one `decision_opened` notification; it resumes by itself when any sign-in returns. `0` selects the default. Must be in `0..1440`. |
 | `settle_minutes` | integer minutes | `30` | How long one paced open counts as in flight when the browser reports nothing about it. `0` selects the default. Must be in `0..1440`. |
 
 The drive opens nothing while any of these holds, and `papio drive status`
 names each one as a blocker:
 
-- it is disabled, or paused by `papio drive pause` or by a sign-in that waited
-  longer than `sign_in_wait_minutes`;
+- it is disabled, or paused by `papio drive pause` or because two paced papers
+  in a row stalled at the sign-in;
 - the time is inside `notify.quiet_hours`;
 - no browser holds the *papio* session;
 - the hourly bound is spent;
 - its previous open is still in flight;
 - any browser claim or effect permit is live, including one an operator started;
-- a sign-in is open and still inside its wait;
+- a sign-in is open and still inside `sign_in_wait_minutes`;
 - no parked job is eligible.
 
 Eligible jobs are those awaiting a person on one open `openurl_handoff`, and
@@ -531,11 +531,13 @@ window. It skips a job it opened within `job_backoff_hours`, and every job
 behind a provider host that is refusing this browser: a host in a
 `browser.provider_cooldown`, or a job with a Cloudflare-style challenge in the
 last 10 minutes. The skip covers the papers that went to that host and every
-paper under the same DOI prefix.
+paper under the same DOI prefix. A paced paper whose sign-in stalled cools its
+own route the same way.
 
 Every paced open records `drive.paced_open` on the job and `handoff.opened` with
 principal `pacer`. Pauses and resumes are the system events `drive.paused` and
-`drive.resumed`.
+`drive.resumed`. `papio drive resume` always holds: sign-in evidence recorded
+before it never pauses the drive again.
 
 This section is strict-mode configuration. Deploy the binary that understands
 it together with the configuration change; an older daemon rejects the whole
