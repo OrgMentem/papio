@@ -36,6 +36,7 @@ import (
 	"papio/internal/protocol"
 	"papio/internal/redact"
 	"papio/internal/resolver"
+	"papio/internal/routes"
 	"papio/internal/store"
 	"papio/internal/work"
 	"papio/internal/zotio"
@@ -2100,6 +2101,33 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 	return false
 }
 
+// PublisherFirstEventKind records the one publisher-first DOI offer a job
+// receives. Its presence makes the offer one-shot across rediscovery passes
+// and daemon restarts, and it starts a fresh drive epoch for the DOI route.
+const PublisherFirstEventKind = "handoff.publisher_first"
+
+// publisherFirstAdapter reports the packaged adapter that should receive this
+// job's DOI before the institution's resolver, when the job has not already
+// had that offer.
+func (s *Service) publisherFirstAdapter(ctx context.Context, row *job.Row) (string, bool) {
+	adapterID, ok := routes.PublisherFirstAdapter(row.Work.DOI)
+	if !ok {
+		return "", false
+	}
+	events, err := s.Jobs.Events(ctx, row.ID)
+	if err != nil {
+		// Fail toward the ordinary resolver route: an unreadable history
+		// cannot prove the DOI offer has not already been spent.
+		return "", false
+	}
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind == PublisherFirstEventKind {
+			return "", false
+		}
+	}
+	return adapterID, true
+}
+
 // handoffGate reports whether this work carries an identifier a human handoff
 // could actually act on, and — when it does not — the durable classification
 // that says why.
@@ -2206,6 +2234,16 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				}
 				row.Policy.AccessMode = config.ModeAssisted
 				detail = InstitutionalBookOpenURLHandoffDetail
+			} else if adapterID, ok := s.publisherFirstAdapter(ctx, row); ok {
+				// A packaged adapter drives this DOI's publisher page, while
+				// the resolver is known to miss it. Offer the DOI once, first;
+				// the bridge falls back to this same institutional detail when
+				// that route fails. The event is written first so a failed open
+				// can only ever fall toward the resolver, never repeat the DOI.
+				if err := s.Jobs.RecordEvent(ctx, row.ID, PublisherFirstEventKind, map[string]any{"adapter_id": adapterID}); err != nil {
+					return err
+				}
+				detail = job.PublisherFirstHandoffDetail
 			}
 			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", detail, job.Access(true, "paywall")); err != nil {
 				return err

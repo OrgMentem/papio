@@ -8160,11 +8160,12 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 		// binding would block an explicit publisher retry until lease expiry.
 		// A security challenge remains owned by the human gate instead.
 		lowerDetail := strings.ToLower(p.Detail)
-		if p.Outcome == "wrong_work" || p.Outcome == "native_viewer_download_required" || (!strings.Contains(lowerDetail, "captcha") && !strings.Contains(lowerDetail, "security")) {
+		driveEnded := p.Outcome == "wrong_work" || p.Outcome == "native_viewer_download_required" || (!strings.Contains(lowerDetail, "captcha") && !strings.Contains(lowerDetail, "security"))
+		if driveEnded {
 			b.retireFinishedProviderBinding(ctx, jobID, p.Outcome)
 		}
 		requiresAuth := true
-		publisherRoute := false
+		publisherRoute, publisherFirst := false, false
 		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
 		if err != nil {
 			return err
@@ -8174,7 +8175,16 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 			if action.Kind == handoffActionKind {
 				requiresAuth = action.RequiresAuth
 				publisherRoute = job.IsPublisherHandoff(action)
+				publisherFirst = action.Detail == job.PublisherFirstHandoffDetail
 				break
+			}
+		}
+		// A failed publisher-first DOI offer is not the job's last route: the
+		// institution's resolver is next. A PDF viewer means the DOI route
+		// reached the paper, so that outcome keeps its manual step.
+		if publisherFirst && driveEnded && p.Outcome != "native_viewer_download_required" {
+			if fellBack, err := b.fallbackOAHandoff(ctx, jobID, p.Outcome); err != nil || fellBack {
+				return err
 			}
 		}
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
@@ -12378,11 +12388,12 @@ func (b *Bridge) providerDriveEpochForOffer(row job.Row, action job.HumanAction,
 	attempt, ordinal, ok := b.latestProviderDriveEpoch(row.ID)
 	domain := actionSafetyDomain(b.cfg, row, action)
 	if job.IsPublisherHandoff(action) {
-		// A publisher retry must not inherit the failed resolver's epoch
-		// or safety domain. A newly offered epoch remains reusable.
+		// A publisher retry, or the publisher-first offer, must not inherit
+		// an earlier resolver epoch or safety domain. A newly offered epoch
+		// remains reusable.
 		retryAfterEpoch := false
 		for _, event := range events {
-			if event["kind"] == "browser.publisher_retry_requested" {
+			if event["kind"] == "browser.publisher_retry_requested" || event["kind"] == app.PublisherFirstEventKind {
 				retryAfterEpoch = true
 			}
 			if event["kind"] == "browser.provider_drive_epoch_offered" {
@@ -12393,7 +12404,8 @@ func (b *Bridge) providerDriveEpochForOffer(row job.Row, action job.HumanAction,
 	} else if b.jobs != nil {
 		// The last handoff may be the DOI route, or the same institutional
 		// route whose epoch ended terminally. A fresh institutional attempt
-		// (adapter upgrade or operator redrive) must not inherit either its
+		// (adapter upgrade, operator redrive, or the fallback after a failed
+		// publisher-first DOI offer) must not inherit either its
 		// provider safety domain or a terminal epoch: the extension keeps
 		// `generic_terminal` per epoch, so reusing one reports "this browser
 		// attempt is already terminal" (measured 2026-09-23 on ai.jmir.org).
@@ -12402,7 +12414,7 @@ func (b *Bridge) providerDriveEpochForOffer(row job.Row, action job.HumanAction,
 			if event["kind"] == "job.retry_requested" {
 				detail, _ := event["detail"].(map[string]any)
 				switch stringDetail(detail, "reason") {
-				case "adapter_upgraded", "operator_redrive":
+				case "adapter_upgraded", "operator_redrive", job.PublisherFirstFallbackReason:
 					institutionalRetryPending = true
 				}
 			}
@@ -12644,10 +12656,11 @@ func (b *Bridge) handoffOutcome(ctx context.Context, jobID string, p *protocol.H
 	return nil
 }
 
-// fallbackOAHandoff replaces the one-time OA browser offer with the ordinary
-// institutional resolver offer while keeping the job parked. The action's
-// detail is the durable offer discriminator, so a restart cannot re-open the
-// OA URL and alternate forever.
+// fallbackOAHandoff replaces the one-time OA browser offer, or the one-time
+// publisher-first DOI offer, with the ordinary institutional resolver offer
+// while keeping the job parked. The action's detail is the durable offer
+// discriminator, so a restart cannot re-open the first route and alternate
+// forever.
 func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (bool, error) {
 	row, err := b.jobs.Get(ctx, jobID)
 	if err != nil {
@@ -12663,6 +12676,20 @@ func (b *Bridge) fallbackOAHandoff(ctx context.Context, jobID, failure string) (
 	for _, action := range actions {
 		if action.JobID != jobID || action.Kind != handoffActionKind {
 			continue
+		}
+		if action.Detail == job.PublisherFirstHandoffDetail {
+			// The DOI drive has ended. Release its binding before the new
+			// attempt: the resolver route gets its own candidate, safety
+			// domain and drive epoch rather than the finished DOI attempt's.
+			b.retireFinishedProviderBinding(ctx, jobID, failure)
+			fellBack, err := b.jobs.FallBackFromPublisherFirstHandoff(ctx, jobID, app.InstitutionalOpenURLHandoffDetail, failure)
+			if err != nil || !fellBack {
+				return false, err
+			}
+			delete(b.offered, jobID)
+			delete(b.queuedOffers, jobID)
+			delete(b.materializationTracked, jobID)
+			return true, nil
 		}
 		if _, ok := app.OABrowserHandoffURL(action.Detail); !ok {
 			return false, nil

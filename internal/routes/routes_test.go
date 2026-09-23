@@ -320,3 +320,23 @@ func TestValidateCandidateRejectsAdversarialManualCandidates(t *testing.T) {
 		})
 	}
 }
+
+func TestPublisherFirstAdapterMatchesOnlyTheRegistrantPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		doi, adapter string
+	}{
+		{"10.1176/appi.ajp.2010.09111680", "psychiatryonline"},
+		{"https://doi.org/10.1176/appi.ajp.2010.09111680", "psychiatryonline"},
+		{"10.1021/acs.jcim.6c00481", "acs"},
+		{"10.11760/appi.ajp.2010.09111680", ""},
+		{"10.1177/0018720814547570", ""},
+		{"10.1002/example", ""},
+		{"10.1176", ""},
+		{"", ""},
+	} {
+		got, ok := PublisherFirstAdapter(tc.doi)
+		if got != tc.adapter || ok != (tc.adapter != "") {
+			t.Errorf("PublisherFirstAdapter(%q) = %q, %v; want %q", tc.doi, got, ok, tc.adapter)
+		}
+	}
+}

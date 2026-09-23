@@ -259,6 +259,9 @@ func classifyAction(action HumanAction, outcome, providerDetail string) ActionDi
 	if action.Kind == "openurl_handoff" && IsPublisherHandoff(action) {
 		result.Reason = DiagnosisReasonInProgress
 		result.Why = "an explicit publisher retry is pending through the paper's DOI"
+		if action.Detail == PublisherFirstHandoffDetail {
+			result.Why = "a packaged publisher adapter is trying the paper's DOI before the institution's resolver"
+		}
 		result.Next = "let the browser finish the publisher attempt; respond if it asks for sign-in or another human step"
 		return result
 	}

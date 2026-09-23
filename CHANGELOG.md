@@ -22,6 +22,12 @@ execution records kept during the initial build.
 - Truncated `jobs list`, `jobs unfiled` and `actions list` tables now end with
   `truncated: showing N open actions; use --limit (max 500)` (or `jobs`,
   `actions`), so a clipped table no longer reads as the whole queue.
+- American Journal of Psychiatry (DOI prefix `10.1176`) and ACS (`10.1021`)
+  papers now get their DOI as the first browser handoff, because a packaged
+  adapter drives that publisher page. If the DOI route fails, papio offers the
+  institution's resolver as the next route in a new attempt. Previously the
+  UNE Primo route landed on the journal homepage and needed a manual
+  `papio actions retry-publisher`.
 
 ### Added
 - `papio jobs redrive <job-id> --revision <n>` replaces a parked manual

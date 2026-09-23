@@ -24,6 +24,50 @@ func IsPublisherHandoff(action HumanAction) bool {
 	return action.Detail == PublisherHandoffDetail || strings.HasPrefix(action.Detail, PublisherHandoffDetail+"\n")
 }
 
+// PublisherFirstHandoffDetail is the automatic DOI route papio offers before
+// the institution's resolver when a packaged adapter drives the publisher page
+// (routes.PublisherFirstAdapter). It is a PublisherHandoffDetail variant, so
+// every DOI-route rule applies; the exact detail is the durable discriminator
+// that lets a failure fall back once to the resolver route.
+const PublisherFirstHandoffDetail = PublisherHandoffDetail + "\npackaged publisher adapter: papio tries the paper's DOI before your institution's resolver"
+
+// PublisherFirstFallbackReason is the job.retry_requested reason recorded when
+// a failed publisher-first handoff falls back to the institutional route. The
+// new attempt gives the resolver route its own candidate, safety domain and
+// drive epoch instead of inheriting the finished DOI attempt's.
+const PublisherFirstFallbackReason = "publisher_first_fallback"
+
+// FallBackFromPublisherFirstHandoff replaces an open publisher-first handoff
+// with the institutional handoff detail and starts the next materialization
+// attempt in the same transaction. It reports false, changing nothing, when
+// the job's open handoff is not the publisher-first route.
+func (js *Store) FallBackFromPublisherFirstHandoff(ctx context.Context, jobID, institutionalDetail, failure string) (bool, error) {
+	tx, err := js.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var open int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM human_actions
+		WHERE job_id=? AND kind='openurl_handoff' AND status='open' AND detail=?`,
+		jobID, PublisherFirstHandoffDetail).Scan(&open); err != nil {
+		return false, err
+	}
+	if open == 0 {
+		return false, nil
+	}
+	now := store.Now()
+	if _, err := js.OpenHumanActionTx(ctx, tx, jobID, "openurl_handoff", institutionalDetail, now, Access(true, "paywall")); err != nil {
+		return false, err
+	}
+	detail, _ := json.Marshal(map[string]any{"reason": PublisherFirstFallbackReason, "failure": failure})
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(job_id,at,kind,detail_json) VALUES(?,?,?,?)`,
+		jobID, now, "job.retry_requested", string(detail)); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // RetryPublisherHandoff replaces one observed failure with one explicit DOI
 // attempt. After that attempt, a newer refusing adapter can re-offer the
 // original institutional route once. All checks share the write transaction.

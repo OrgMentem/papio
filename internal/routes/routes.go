@@ -84,6 +84,46 @@ var routeTable = []routeTemplate{
 	},
 }
 
+// publisherFirstTable names DOI registrant prefixes whose publisher page a
+// packaged extension adapter drives from https://doi.org/<doi>, and whose
+// institutional resolver route cannot reach that page reliably. For these
+// prefixes the DOI is the first browser handoff and the institution's resolver
+// is the fallback. It is compiled-in data, like routeTable: an entry is a claim
+// about a packaged adapter, not a user preference.
+//
+// Measured 2026-09-23: UNE Primo sent AJP (10.1176) to the psychiatryonline
+// journal homepage (identity_missing), while `papio actions retry-publisher`
+// reached the correct PDF through doi.org 3/3 times. ACS (10.1021) now has the
+// packaged `acs` adapter for the same DOI landing page.
+var publisherFirstTable = []struct {
+	doiPrefix string
+	adapterID string
+}{
+	{doiPrefix: "10.1176", adapterID: "psychiatryonline"},
+	{doiPrefix: "10.1021", adapterID: "acs"},
+}
+
+// PublisherFirstAdapter reports the packaged adapter that drives doi's
+// publisher landing page when the DOI route must be offered before the
+// institution's resolver. Only the registrant prefix is matched; a malformed
+// DOI never matches.
+func PublisherFirstAdapter(doi string) (string, bool) {
+	canonical, ok := canonicalDOI(doi)
+	if !ok {
+		return "", false
+	}
+	prefix, _, ok := strings.Cut(canonical, "/")
+	if !ok {
+		return "", false
+	}
+	for _, route := range publisherFirstTable {
+		if prefix == route.doiPrefix {
+			return route.adapterID, true
+		}
+	}
+	return "", false
+}
+
 // Validate checks every compiled-in route's declared URL envelope. It is
 // intentionally exported so release tests can fail closed when a seed row is
 // edited incorrectly.
