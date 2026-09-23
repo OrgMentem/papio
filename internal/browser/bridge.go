@@ -357,14 +357,17 @@ type Bridge struct {
 	Version  string
 	Features []string
 
-	mu                   sync.Mutex
-	agentBackend         acquisitionagent.Backend
-	agentDecisions       map[string]*pendingAgentDecision
-	agentClosed          bool
-	nativeViewerDriver   nativeviewer.Driver
-	nativeViewerSaves    map[string]*nativeViewerSave
-	nativeDownloads      map[string]*nativeDownloadReservation
-	nativeIOGate         chan struct{}
+	mu                 sync.Mutex
+	agentBackend       acquisitionagent.Backend
+	agentDecisions     map[string]*pendingAgentDecision
+	agentClosed        bool
+	nativeViewerDriver nativeviewer.Driver
+	nativeViewerSaves  map[string]*nativeViewerSave
+	nativeDownloads    map[string]*nativeDownloadReservation
+	nativeIOGate       chan struct{}
+	// nativeViewerRecovery serializes admitted-stage recovery. Its pacing map is
+	// never authority: every attempt re-reads durable admission and occupancy.
+	nativeViewerRecovery nativeViewerRecovery
 	providerDriveEpochMu sync.Mutex
 	seq                  int64
 	// arbitration owns holder identity, pending sessions, generation fences,
@@ -8833,6 +8836,9 @@ func settledFileName(entries []os.DirEntry) (string, bool) {
 // before the default moved under the browser's download directory keeps
 // draining. A per-root error is fatal to the tick the same way it always was.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
+	// Admitted native-viewer stages publish into job directories first, so
+	// the scan below sees any bytes this tick recovered.
+	b.recoverNativeViewerStages(ctx)
 	for _, root := range b.cfg.AdoptionRoots() {
 		if err := b.sweepAdoptionsIn(ctx, root); err != nil {
 			return err
