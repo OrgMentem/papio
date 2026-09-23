@@ -207,12 +207,13 @@ eventually automate away.
 store submission (Release order step 3).** That file owns the matrix itself —
 skew, lifecycle, security, update lifecycle, transport proof — plus the
 execution rules an agent needs to produce trustworthy evidence: the
-locked-display and stale-native-addon preflights, the artifact-freeze protocol
-(a pass is meaningless if a sibling edit lands mid-run, or if the loaded
-service worker predates the bundles), the `dist/`-prefixed page URLs, the rule
-that every `papio` command except `daemon status`/`stop` autostarts the daemon
-and so destroys any daemon-down observation, and the PASS/FAIL/NOT-RUN
-discipline that keeps "we didn't test it" from being recorded as a pass.
+locked-display, stale-native-addon, and orphaned-effect-permit preflights, the
+artifact-freeze protocol (a pass is meaningless if a sibling edit lands mid-run,
+or if the loaded service worker predates the bundles), the `dist/`-prefixed
+page URLs, the procedure that holds the daemon down (every `papio` command
+except `daemon status`/`stop` autostarts it, and so does every connected
+browser's native host), and the PASS/FAIL/NOT-RUN discipline that keeps "we
+didn't test it" from being recorded as a pass.
 
 ## Extension store submission
 
