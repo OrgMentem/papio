@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -246,11 +247,13 @@ func TestDescribeNewItemFillsOnlyMissingFieldsOfTheJobsWork(t *testing.T) {
 	}
 }
 
-// A desktop that saved the item but could not file it answers "conflict".
-// Nothing about that outcome proves the filing or the PDF, so the item keeps
-// the follow-ups: here the next plan finds the committed parent, attaches the
-// PDF to it, and files and enriches it after the import.
-func TestSaveTimeFilingConflictKeepsFollowUps(t *testing.T) {
+// A desktop that saved the item but could not file it answers "conflict" with
+// committed evidence. The item exists, so a later pass must never create it
+// again. The mirror has not seen it yet, so zotio's resolver would still call
+// the paper new, and a second create would put a duplicate paper in the
+// library. papio refuses every create for the job until it can name the
+// committed item, then attaches the PDF to that item and runs the follow-ups.
+func TestCommittedConflictAttachesToTheCommittedItemAndNeverCreatesAgain(t *testing.T) {
 	cli := &planCLI{
 		manifest: newItemManifest, preview: saveTimePreview, collections: readingCollections,
 		apply: filingConflictApply, applyErr: errMutationIncomplete,
@@ -273,18 +276,51 @@ func TestSaveTimeFilingConflictKeepsFollowUps(t *testing.T) {
 		}
 	}
 
-	cli.manifest = `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"attach_candidate","action":"attach","matched_key":"PA12RE34","identifier_type":"doi","identifier":"10.1002/example","status":"resolved"}]}`
-	cli.apply = `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"PA12RE34","status":"applied","reason":{"parent_key":"PA12RE34","attachment_key":"AT56CH90"}}]}}`
-	cli.applyErr = nil
+	// The desktop has the item, but the mirror does not show it yet, so the
+	// resolver still answers "new". Nothing may be created.
+	cli.apply, cli.applyErr = connectorApplied, nil
+	for pass := 0; pass < 2; pass++ {
+		if status, _, _, err := service.PlanAndApply(context.Background(), jobID); err == nil || status != "failed" {
+			t.Fatalf("pass %d before the item is visible = (%q, %v), want a failure", pass, status, err)
+		}
+	}
+	if cli.applyCalls != 1 {
+		t.Fatalf("zotio apply ran %d times, want 1: an unreconciled committed create was created again", cli.applyCalls)
+	}
+
+	// Once the mirror shows the committed item, the PDF goes to that item.
+	cli.found = `[{"key":"PA12RE34","data":{"key":"PA12RE34","itemType":"journalArticle"}}]`
+	cli.apply = `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"PA12RE34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`
 	status, parentKey, _, err := service.PlanAndApply(context.Background(), jobID)
 	if err != nil || status != "applied" || parentKey != "PA12RE34" {
 		t.Fatalf("attach after conflict = (%q, %q, %v)", status, parentKey, err)
+	}
+	if cli.applyCalls != 2 || !slices.Contains(cli.applyArgs, "attachments") || !slices.Contains(cli.applyArgs, "PA12RE34") {
+		t.Fatalf("apply calls = %d, last apply = %v, want the PDF attached to PA12RE34", cli.applyCalls, cli.applyArgs)
 	}
 	if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
 		t.Fatalf("follow-ups after attaching to the committed parent: add-to-collection=%d enrich=%d, want 1 each", cli.collectionCalls, cli.enrichCalls)
 	}
 	if filing, _ := latestZotioEvent(t, service, jobID, followUpCollectionFiling); filing["status"] != "applied" || filing["with_import"] != nil {
 		t.Fatalf("collection filing event = %#v, want the follow-up's", filing)
+	}
+}
+
+// A collection list that ignores --start answers every page with the first
+// page. The repeated page adds no key, which used to read as the end of the
+// list, so a name duplicated on a later page looked unique and the item could
+// be filed into the wrong collection.
+func TestCollectionKeyByNameGivesUpWhenPagesRepeat(t *testing.T) {
+	rows := make([]string, 0, collectionPageSize)
+	rows = append(rows, `{"key":"RD12NG34","data":{"key":"RD12NG34","name":"Reading"}}`)
+	for i := range collectionPageSize - 1 {
+		key := fmt.Sprintf("OT%06d", i+1)
+		rows = append(rows, `{"key":"`+key+`","data":{"key":"`+key+`","name":"Other `+key+`"}}`)
+	}
+	cli := &planCLI{collections: `{"meta":{"source":"live"},"results":[` + strings.Join(rows, ",") + `]}`}
+	service := &Service{CLI: cli}
+	if key := service.collectionKeyByName(context.Background(), "Reading"); key != "" {
+		t.Fatalf("collection key = %q from a list whose pages repeat, want none", key)
 	}
 }
 

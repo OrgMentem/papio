@@ -38,8 +38,9 @@ execution records kept during the initial build.
   the registry supplied. The job's events record these steps as `applied`
   with `with_import`. *papio* still runs the Web API steps after the import
   when the save did not do them: for a paper that was already in your
-  library, for a collection name that matches no collection or more than one,
-  and for a save that zotio did not report as complete.
+  library, for a collection name that matches no collection or more than one
+  (or a collection list that *papio* cannot read to its end), and for a save
+  that zotio did not report as complete.
 - **In `stored` mode, a new paper goes to Zotero desktop only.** *papio* now
   asks zotio for `--via connector` in place of `--via auto`. With `auto`, a
   closed Zotero desktop sent the paper through the Web API, which stored the
@@ -154,6 +155,16 @@ execution records kept during the initial build.
   second plan for the same paper cannot rewrite the first plan's manifest. A
   new-item plan made by an earlier *papio* has no manifest SHA-256 and is
   refused; run `papio zotio plan` again.
+- **A Zotero import that saved the paper's item but did not finish no longer
+  creates the item a second time.** Zotero desktop saves a new item, files
+  it, and then saves its PDF in separate steps. When a later step failed,
+  *papio* recorded an ordinary failed import. The next attempt asked zotio
+  about the paper again, zotio did not show the saved item yet, and the paper
+  was created again as a duplicate. *papio* now records the saved item on the
+  job as `zotio.import_committed` and never creates another item for that
+  job. It waits until zotio shows the item, then attaches the PDF to it and
+  files it after the import. If zotio shows more than one item for the paper,
+  the import stops and asks you to delete the extra items in Zotero.
 
 ## [0.22.1] - 2026-09-23
 

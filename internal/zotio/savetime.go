@@ -204,9 +204,13 @@ func (s *Service) collectionKeyByName(ctx context.Context, name string) string {
 				matches = append(matches, key)
 			}
 		}
-		// A short page ends the list. A page with nothing new means the source
-		// ignored the offset and would repeat itself forever.
-		complete = len(rows) < collectionPageSize || fresh == 0
+		// A full page that adds no key means the source ignored the offset,
+		// so the rest of the list is unknown: a later page could hold the
+		// same name again. Only a short page ends the list.
+		if len(rows) == collectionPageSize && fresh == 0 {
+			return ""
+		}
+		complete = len(rows) < collectionPageSize
 	}
 	if !complete || len(matches) != 1 || !keyRE.MatchString(matches[0]) {
 		return ""
