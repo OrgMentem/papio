@@ -172,8 +172,10 @@ export class ViewerRuleSync {
 
   /** Tab id -> job id for every armed tab: a delegated job's handoff tab, and
    * tabs it opened, while that job could still take its one signed-viewer
-   * download. Agent-driven jobs are left out because the agent binds its own
-   * navigation downloads. A tab two jobs claim belongs to neither. */
+   * download. A child stays armed when its opener closes: the viewer it
+   * waits for does not depend on that tab. Agent-driven jobs are left out
+   * because the agent binds its own navigation downloads. A tab two jobs
+   * claim belongs to neither. */
   private viewerRuleTabs(): Map<number, string> {
     const armed = new Map<number, string>();
     if (!this.armingActive()) return armed;
@@ -186,13 +188,17 @@ export class ViewerRuleSync {
     };
     for (const job of this.ctx.store().activeJobs) {
       if (
-        job.tab_id < 0 || !this.ctx.hasDelegatedAuthority(job) || this.ctx.agentLoops.has(job.job_id) ||
+        !this.ctx.hasDelegatedAuthority(job) || this.ctx.agentLoops.has(job.job_id) ||
         (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") ||
         (this.ctx.downloads.get(job.job_id)?.ids.size ?? 0) > 0 || this.ctx.completedDownloadTabs.has(job.job_id) ||
         !this.ctx.viewerAttemptAllowed(job.job_id)
       )
         continue;
-      arm(job.tab_id, job.job_id);
+      // Measured live 2026-09-24 (job_272d01737a): a Cloudflare check in the
+      // View PDF child lasted 80 minutes, and papio closes a parked paper's
+      // tab after 30 (reconcileOwnedTabs). Arming the child through that tab
+      // disarmed it, and the PDF that rendered after the check was not saved.
+      if (job.tab_id >= 0) arm(job.tab_id, job.job_id);
       for (const [child, owner] of Object.entries(this.ctx.store().viewerChildTabs ?? {}))
         if (owner === job.job_id) arm(Number(child), owner);
     }

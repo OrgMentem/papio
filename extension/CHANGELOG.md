@@ -67,6 +67,11 @@ for the full pre-split extension history.
   (seen live on 2026-09-24). Now, when the drive runs out while such a tab is
   open, *papio* only stops driving: the paper's tab stays open and the new tab
   stays watched.
+- **The PDF tab stays watched when the paper's tab closes.** *papio* watched
+  a PDF tab that the paper's tab opened only while the paper's tab stayed
+  open. *papio* closes a paper's tab that it no longer drives after 30
+  minutes, and a security check in the PDF tab can take longer than that.
+  The PDF tab now stays watched while *papio* still works on the paper.
 - **A ScienceDirect PDF that you open yourself no longer stops papio's
   paper.** While *papio* worked on a ScienceDirect paper, any signed
   ScienceDirect PDF that you opened in a tab of your own counted as that

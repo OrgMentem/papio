@@ -10904,25 +10904,58 @@ async function viewerChildOutlivesDrive() {
   return { h, web, tabID, childID, ids, framesBefore };
 }
 
+/** The operator passes the check: the child returns to the article, which
+ * renders the signed PDF inside the page through a `type` request. Returns
+ * the files papio then saved. */
+async function inlineViewerPDF(
+  h: Harness,
+  web: FakeWebRequest,
+  childID: number,
+  type: "sub_frame" | "object",
+): Promise<string[]> {
+  await h.tabs.completeNavigation(childID,
+    "https://www.sciencedirect.com/science/article/pii/S1877042811019240?fr=RR-1&ref=cra_js_challenge");
+  await web.respond({ requestId: "inline-pdf", url: SIGNED_VIEWER, tabId: childID, type });
+  const filter = web.filters.get("inline-pdf");
+  filter?.deliver(SIGNED_PDF);
+  filter?.stop();
+  await settle();
+  return h.downloads.started.map((download) => download.filename);
+}
+
 test("a drive that runs out while the operator's View PDF child is open keeps the paper's tab and its capture", async () => {
   const { h, web, tabID, childID, ids, framesBefore } = await viewerChildOutlivesDrive();
   expect(h.frames().slice(framesBefore).map((frame) => frame.type)).not.toContain("surface_close_request");
   expect(h.tabs.removed).not.toContain(tabID);
   expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({ tab_id: tabID, parked_with_tab: true });
 
-  // The operator passes the check. The child returns to the article, which
-  // renders the signed PDF inside the page.
   h.clock.now += 60_000;
-  await h.tabs.completeNavigation(childID,
-    "https://www.sciencedirect.com/science/article/pii/S1877042811019240?fr=RR-1&ref=cra_js_challenge");
-  await web.respond({ requestId: "inline-pdf", url: SIGNED_VIEWER, tabId: childID, type: "sub_frame" });
-  const filter = web.filters.get("inline-pdf");
-  expect(filter).toBeDefined();
-  filter!.deliver(SIGNED_PDF);
-  filter!.stop();
-  await settle();
-  expect(h.downloads.started.map((download) => download.filename)).toEqual([`papio/${ids.jobID}/paper.pdf`]);
+  expect(await inlineViewerPDF(h, web, childID, "sub_frame")).toEqual([`papio/${ids.jobID}/paper.pdf`]);
   expect(h.frames().filter((frame) => frame.type === "viewer_capture").map((frame) => frame.job_id)).toEqual([ids.jobID]);
+});
+
+test("Firefox keeps a viewer child armed after papio closes its paper's parked tab", async () => {
+  const { h, web, tabID, childID, ids } = await viewerChildOutlivesDrive();
+  // The challenge outlasts PARKED_SURFACE_COLD_MS (live: 80 minutes), so the
+  // reconcile pass retires the parked tab the operator is not looking at.
+  h.clock.now += 30 * 60_000;
+  const framesBefore = h.port.posted.length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  const request = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(request.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(nativeResult("surface_close_response", {
+    request_id: request.payload["request_id"],
+    outcome: "authorized",
+    close_authorization_id: "close_parked_viewer_parent",
+    nonce: "nonce_parked_viewer_parent",
+    browser_holder_generation: 1,
+  }));
+  expect(await reconciling).toEqual({ closed: 1 });
+  expect(h.tabs.removed).toEqual([tabID]);
+  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(-1);
+
+  h.clock.now += 50 * 60_000;
+  expect(await inlineViewerPDF(h, web, childID, "sub_frame")).toEqual([`papio/${ids.jobID}/paper.pdf`]);
 });
 
 // `papio actions open` for a paper whose claim already navigated its tab now
