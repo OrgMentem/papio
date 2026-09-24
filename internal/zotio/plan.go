@@ -147,8 +147,10 @@ type importManifest struct {
 		Classification string `json:"classification"`
 		Action         string `json:"action"`
 		MatchedKey     string `json:"matched_key"`
+		IdentifierType string `json:"identifier_type"`
 		Identifier     string `json:"identifier"`
 		Status         string `json:"status"`
+		Note           string `json:"note"`
 	} `json:"entries"`
 }
 
@@ -295,6 +297,11 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		manifestJSON, manifest, err := s.resolveManifest(ctx, plan, row.Work)
 		if err != nil {
 			return nil, err
+		}
+		if manifestIsUnresolved(manifest) {
+			if manifestJSON, manifest, err = s.describeUnresolved(ctx, row.Work, manifestJSON, manifest); err != nil {
+				return nil, err
+			}
 		}
 		plan.Route, plan.ExpectedParentKey, err = manifestRoute(manifest)
 		if err != nil {
@@ -751,8 +758,10 @@ func (s *Service) stageAttachment(plan *Plan, w work.Work) (string, error) {
 }
 
 // resolveManifest asks zotio to resolve the staged PDF and returns the manifest
-// it answered, unwritten: describeNewItem may still complete it, and
-// writeManifest stores what the plan binds.
+// it answered, unwritten: describeUnresolved and describeNewItem may still
+// complete it, and writeManifest stores what the plan binds. A non-zero exit
+// that reports one unresolved entry still returns that entry, whose note
+// names the cause (unresolvedEntryReport).
 func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) (json.RawMessage, importManifest, error) {
 	stagingDir := filepath.Join(s.DataDir, "zotio", "staging", plan.JobID, plan.ArtifactSHA256)
 	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
@@ -767,7 +776,7 @@ func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) 
 		return nil, importManifest{}, err
 	}
 	manifestJSON, err := s.CLI.RunJSON(ctx, "--agent", "import", "resolve", stagingDir)
-	if err != nil {
+	if err != nil && !unresolvedEntryReport(manifestJSON, err) {
 		return nil, importManifest{}, fmt.Errorf("resolving Zotio import manifest: %w", err)
 	}
 	var manifest importManifest

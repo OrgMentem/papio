@@ -33,6 +33,7 @@ const (
 	ErrorClassBundleValidation         = "bundle_validation"
 	ErrorClassRoutingRequiresDOI       = "routing_requires_doi"
 	ErrorClassAlreadyInLibrary         = "already_in_library"
+	ErrorClassMetadataUnresolved       = "metadata_unresolved"
 	ErrorClassUnknown                  = "unknown"
 )
 
@@ -119,6 +120,20 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 	text := classificationText(err, envelopes...)
 	lower := strings.ToLower(text)
 
+	// zotio's "import resolve" asks the DOI registries for a new paper's
+	// metadata, not Zotero, and words their failures with a status:
+	// "fetching CrossRef metadata: HTTP 404". The status check below read
+	// that as Zotero's own 4xx. Measured 2026-09-24: a DOI registered with
+	// mEDRA, which neither registry holds, reported "Zotero HTTP 404" on every
+	// attempt, which sends the operator to the wrong system. The phrases are
+	// zotio's own (import_doi.go): the first names both registries' misses,
+	// the second a Crossref failure that stopped the lookup there.
+	if strings.Contains(lower, "resolving doi metadata") {
+		return safeErrorInfo(ErrorClassMetadataUnresolved, "neither Crossref nor DataCite returned a record for this DOI", 0)
+	}
+	if strings.Contains(lower, "fetching crossref metadata") {
+		return safeErrorInfo(ErrorClassMetadataUnresolved, "the Crossref lookup for this DOI failed", 0)
+	}
 	if status := zoteroHTTP4xxStatus(text, envelopes...); status != 0 {
 		if status == 413 {
 			// HTTP 413 reads as "Payload Too Large", but Zotero returns it for a
@@ -274,6 +289,7 @@ func IsErrorClass(class string) bool {
 		ErrorClassBundleValidation,
 		ErrorClassRoutingRequiresDOI,
 		ErrorClassAlreadyInLibrary,
+		ErrorClassMetadataUnresolved,
 		ErrorClassUnknown:
 		return true
 	default:

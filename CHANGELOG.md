@@ -71,6 +71,27 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **A ready paper that zotio cannot describe now reaches Zotero.** zotio
+  describes a new paper from its DOI registry record, and it asks Crossref and
+  DataCite only. A DOI from another registration agency, such as mEDRA, is in
+  neither, so zotio left the paper unresolved. A paper that *papio* knows only
+  by its PMID or ISBN came back unidentified, because zotio does not read
+  those identifiers. *papio* refused both papers on every attempt, and the
+  validated PDF never reached your library. Now *papio* describes such a paper
+  from its own record: the title, the authors as *papio* holds them, the year,
+  the DOI, and the PMID or arXiv ID as a line in Extra. First it looks for the
+  paper's identifiers in your library, so a paper that is already there gets
+  the PDF, or counts as a duplicate, instead of a second item. *papio* does not
+  describe a paper when the DOI that zotio read from the PDF is not the job's
+  DOI.
+- **An import that fails at the DOI registry no longer reports a Zotero
+  error.** zotio's registry lookup answered "HTTP 404", and *papio* recorded
+  it as `zotero_http_4xx` with the hint `Zotero HTTP 404`, which pointed at
+  Zotero. The class is now `metadata_unresolved`, and the hint names the
+  registry. The recorded error message also lost the cause: it ended at
+  `Error: 1 fanout...`, because zotio's summary line used all of the
+  recorded length. *papio* now reads the cause from the entry that zotio
+  prints, and the service log keeps the whole error.
 - **A paper with an open-access copy no longer ends unavailable because your
   library has no entitlement.** When the browser could not drive an
   open-access page (for example a PubMed Central article) and asked you to

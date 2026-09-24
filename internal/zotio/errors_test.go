@@ -91,6 +91,21 @@ func TestClassifyErrorTable(t *testing.T) {
 		{name: "already in library manifest", err: errors.New(`unsupported Zotio manifest outcome action="skip" classification="duplicate"`), wantClass: ErrorClassAlreadyInLibrary, wantHint: "paper already in Zotero library"},
 		{name: "unknown carries sanitized text", err: errors.New(pathLaden), wantClass: ErrorClassUnknown, wantHint: SanitizeErrorHint(pathLaden)},
 		{name: "routing requires doi", err: errors.New("planning job job_deadbeef: new-item Zotio routing requires a DOI"), wantClass: ErrorClassRoutingRequiresDOI, wantHint: newItemRoutingRefusal},
+		{
+			// The 2026-09-24 production error: a DOI registered with mEDRA
+			// is a 404 at both registries zotio asks, and neither 404 came
+			// from Zotero.
+			name:      "doi registry miss is not a zotero 4xx",
+			err:       errors.New("planning job job_deadbeef: resolving Zotio import manifest: zotio import: Error: 1 fanout request(s) failed: /private/staging/10.4415%2Fann_23_04_05.pdf: " + registryMissNote),
+			wantClass: ErrorClassMetadataUnresolved,
+			wantHint:  "neither Crossref nor DataCite returned a record for this DOI",
+		},
+		{
+			name:      "crossref lookup failure is not a zotero 4xx",
+			err:       errors.New("zotio import: Error: 1 fanout request(s) failed: paper.pdf: fetching CrossRef metadata: HTTP 429: Too Many Requests"),
+			wantClass: ErrorClassMetadataUnresolved,
+			wantHint:  "the Crossref lookup for this DOI failed",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -27,7 +27,10 @@ import (
 )
 
 type planCLI struct {
-	manifest        string
+	manifest string
+	// resolveErr is the process error "import resolve" returns beside its
+	// manifest: zotio exits non-zero when an entry's metadata lookup failed.
+	resolveErr      error
 	preview         string
 	apply           string
 	applyErr        error
@@ -47,7 +50,10 @@ type planCLI struct {
 	collections     string
 	collectionLists int
 	// found answers "items find"; empty means no item matches.
-	found      string
+	found string
+	// missing answers the missing-PDF queue; nil fails the call, as a CLI
+	// that cannot read the queue does.
+	missing    func() ([]MissingPDFItem, error)
 	applyArgs  []string
 	enrichArgs []string
 	callOrder  []string
@@ -57,6 +63,9 @@ func (c *planCLI) Preflight(context.Context) (*PreflightResult, error) {
 	return &PreflightResult{Executable: "zotio", Version: "1.0.0"}, nil
 }
 func (c *planCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, error) {
+	if c.missing != nil {
+		return c.missing()
+	}
 	return nil, fmt.Errorf("unexpected MissingPDF")
 }
 func (c *planCLI) GetItem(context.Context, string) (*Item, error) {
@@ -72,7 +81,7 @@ func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage,
 	case strings.Contains(joined, "import resolve"):
 		c.resolveCalls++
 		c.lastResolveAt = args[len(args)-1]
-		return json.RawMessage(c.manifest), nil
+		return json.RawMessage(c.manifest), c.resolveErr
 	case strings.Contains(joined, "collections list"):
 		c.collectionLists++
 		if c.collections == "" {

@@ -128,6 +128,15 @@ abstract as soon as Zotero saves it. The abstract comes from the DOI registry
 not send the paper through the Zotero Web API instead, because that route
 stores the PDF in Zotero's own file storage.
 
+Sometimes zotio cannot describe a new paper. The DOI registries that zotio
+asks, Crossref and DataCite, do not hold every DOI: a DOI from another
+registration agency, such as mEDRA, is not in either. And zotio does not read a
+PMID or an ISBN from the PDF. In these cases *papio* describes the Zotero item
+from its own record of the paper: the title, the authors as *papio* holds them,
+the year, the DOI, and the PMID or arXiv ID as a line in Extra. Before it does
+this, *papio* looks for the paper's identifiers in your library, so a paper that
+is already there gets the PDF instead of a second item.
+
 Some steps still happen after the import, through the Zotero Web API: filing a
 paper that was already in your library, filing into a collection whose name
 matches no collection (zotio creates it) or more than one, and filing into a

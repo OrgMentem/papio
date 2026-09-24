@@ -92,6 +92,10 @@ func hasNewItemRoutingIdentifier(w work.Work) bool {
 	return lw.DOI != "" || lw.ArXiv != "" || lw.PMID != "" || lw.ISBN != ""
 }
 
+// importStagingBasename names the file papio hands to "import resolve", which
+// reads a DOI or an arXiv ID from the name. zotio reads no PMID or ISBN from
+// it, so a paper named by those alone comes back "unidentified", and
+// describeUnresolved describes it from papio's own record.
 func importStagingBasename(w work.Work) (string, error) {
 	switch {
 	case strings.TrimSpace(w.DOI) != "":

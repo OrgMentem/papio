@@ -4341,11 +4341,11 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutco
 				detail["error_hint"] = message
 			}
 		}
-		logged := message
-		if logged == "" {
-			logged = hint
-		}
-		log.Printf("papio: auto-import for job %s failed [%s]: %s", row.ID, class, logged)
+		// The recorded message is bounded, and the bound is a privacy
+		// contract. The log is the operator's own, and it keeps the whole
+		// chain: a bounded copy cut zotio's cause off as "Error: 1
+		// fanout..." on every attempt.
+		log.Printf("papio: auto-import for job %s failed [%s]: %v", row.ID, class, err)
 		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
 		return importAttempted
 	}

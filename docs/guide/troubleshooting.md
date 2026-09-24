@@ -267,6 +267,7 @@ copying credentials or filesystem paths into a ticket.
 | Error class | Meaning | What to do |
 | --- | --- | --- |
 | `zotero_http_4xx` | zotio reported a Zotero HTTP 4xx response. | Check the local zotio/Zotero authorization and the operation shown by the sanitized hint, correct it there, then make and inspect a new zotio plan. |
+| `metadata_unresolved` | zotio found no registry record for the paper, and *papio* could not describe it from its own record. The hint says why: for example, the DOI that zotio read from the PDF is not the job's DOI. | Compare the hint with the job's identifiers in `papio jobs show <job-id>`. If an identifier is wrong, submit the paper again with the correct one. Otherwise keep the class and the hint for a bug report. |
 | `zotero_field_validation` | zotio rejected an item field, such as an unknown item field. | Update the incompatible field mapping or compatible zotio version, then create a new plan rather than reusing the failed one. |
 | `mirror_sync_failed` | Synchronizing the zotio mirror failed. | Restore local zotio connectivity and synchronization, then retry planning. |
 | `zotio_exec_timeout` | A zotio command exceeded its deadline. | Confirm the executable works; if the operation legitimately needs more time, set `[zotio].timeout_seconds` within 5–600 and retry. |
