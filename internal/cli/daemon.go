@@ -39,12 +39,13 @@ func newDaemonCommand(opt *options) *cobra.Command {
 			if probeErr == nil {
 				return fmt.Errorf("daemon already running at %s", socket)
 			}
-			// The instance is claimed before the store is opened and held until
-			// the process exits, so exactly one daemon migrates the database and
-			// none starts beside one that is still stopping.
-			instance, err := daemon.AcquireInstance(socket)
+			// The data directory is claimed before the store is opened and held
+			// until the process exits, so exactly one daemon migrates and writes
+			// the database, whatever socket it serves, and none starts beside one
+			// that is still stopping.
+			instance, err := daemon.AcquireInstance(cfg.DataDir, socket)
 			if errors.Is(err, daemon.ErrInstanceHeld) {
-				return daemonInstanceHeld(socket)
+				return daemonInstanceHeld(cfg.DataDir)
 			}
 			if err != nil {
 				return err
@@ -132,11 +133,27 @@ func newDaemonCommand(opt *options) *cobra.Command {
 		Short: "Stop the running daemon without autostarting one",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			stopSocket := socket
+			if stopSocket == "" {
+				cfg, err := opt.loadConfig()
+				if err != nil {
+					return err
+				}
+				stopSocket = filepath.Join(cfg.DataDir, "papio.sock")
+			}
 			var result map[string]bool
-			if err := callExisting(cmd.Context(), "daemon.shutdown", &result); err != nil {
+			shutdown := func(ctx context.Context) error { return callExisting(ctx, "daemon.shutdown", &result) }
+			// Returning only once the process has exited is what keeps the next
+			// command from starting a new daemon beside the old one, which still
+			// writes the database after its socket is gone.
+			if err := daemon.StopDaemon(cmd.Context(), stopSocket, shutdown, func(pid int) {
+				if opt.errOut != nil {
+					_, _ = fmt.Fprintf(opt.errOut, "papio: waiting for the daemon (pid %d) to finish stopping\n", pid)
+				}
+			}); err != nil {
 				return err
 			}
-			return opt.printResult(result, "Daemon stopping")
+			return opt.printResult(result, "Daemon stopped")
 		},
 	}
 	status := &cobra.Command{
@@ -156,13 +173,13 @@ func newDaemonCommand(opt *options) *cobra.Command {
 }
 
 // daemonInstanceHeld explains a daemon process that exits because another
-// daemon process owns its socket. Autostart waits for that process instead of
-// launching a second one, so only a race or a manual start gets here, and the
-// database is untouched: this process never opened it.
-func daemonInstanceHeld(socket string) error {
-	status, _ := daemon.ReadInstance(socket)
+// daemon process owns its data directory. Autostart waits for that process
+// instead of launching a second one, so only a race or a manual start gets
+// here, and the database is untouched: this process never opened it.
+func daemonInstanceHeld(dataDir string) error {
+	status, _ := daemon.ReadInstance(dataDir)
 	if status.PID == 0 {
-		return fmt.Errorf("daemon already starting at %s", socket)
+		return fmt.Errorf("daemon already starting for %s", dataDir)
 	}
-	return fmt.Errorf("daemon already %s at %s (pid %d)", status.Activity(), socket, status.PID)
+	return fmt.Errorf("daemon already %s for %s (pid %d, socket %s)", status.Activity(), dataDir, status.PID, status.Socket)
 }

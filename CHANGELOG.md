@@ -84,14 +84,20 @@ execution records kept during the initial build.
   until it exits. A command or connector that finds that process upgrading
   the database waits for it and prints
   `papio: upgrading the database; this can take a minute`, and a start
-  deadline never stops an upgrade. After ten minutes the command stops
-  waiting and says so, and the upgrade continues. A command run just after
-  `papio daemon stop` waits for the old service to exit, with
+  deadline never stops an upgrade. A long database check after the upgrade
+  prints `papio: checking the database; this can take a minute`. After ten
+  minutes the command stops waiting and says so, and the upgrade continues.
+  `papio daemon stop` now returns only when the service process has exited,
+  also for a service started by an earlier version. It prints
+  `papio: waiting for the daemon (pid N) to finish stopping` when this takes
+  some time, and prints `Daemon stopped` at the end. A command run while a
+  service is still stopping waits for it, with
   `papio: waiting for the previous daemon to stop`, instead of starting a
-  second service beside it. A second service that finds another one running
-  exits with a short message, without opening the database. The service
-  log no longer reports an interrupted upgrade as `rollback also failed`: the
-  upgrade was rolled back, and the log now says so.
+  second service beside it. A second service for the same data directory,
+  also one started with a different `--socket`, exits with a short message
+  and does not open the database. The service log no longer reports an
+  interrupted upgrade as `rollback also failed`: the upgrade was rolled back,
+  and the log now says so.
 - **A paper that the browser queued for sign-in now opens after you sign in
   to your library.** When the extension had no sign-in evidence yet, for
   example right after it reloaded, it accepted an institutional paper into

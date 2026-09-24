@@ -26,39 +26,59 @@ import (
 const (
 	upgradingDaemonSocketEnv = "PAPIO_TEST_UPGRADING_DAEMON_SOCKET"
 	upgradingDaemonDataEnv   = "PAPIO_TEST_UPGRADING_DAEMON_DATA"
+	// upgradingDaemonHoldEnv names the phase the daemon stops in:
+	// "upgrading" (the default) or "checking".
+	upgradingDaemonHoldEnv = "PAPIO_TEST_UPGRADING_DAEMON_HOLD"
 )
 
 func TestMain(m *testing.M) {
 	if socket := os.Getenv(upgradingDaemonSocketEnv); socket != "" {
 		os.Exit(upgradingDaemon(socket, os.Getenv(upgradingDaemonDataEnv)))
 	}
+	if socket := os.Getenv(legacyDaemonSocketEnv); socket != "" {
+		os.Exit(legacyDaemon(socket))
+	}
 	os.Exit(m.Run())
 }
 
-// upgradingDaemon starts as the papio daemon does: it claims the socket's
-// instance, then opens a new store under the instance's trace, so it reports
-// its phases exactly as a real daemon does. Its first migration waits for the
-// parent test: it prints "upgrading" once the phase is recorded, and applies
-// the migrations only when the parent writes a line to its stdin. That is a
-// migration exactly as slow as the test needs. Then it serves the socket
-// until its stdin closes.
+// upgradingDaemon starts as the papio daemon does: it claims the instance,
+// then opens a new store under the instance's trace, so it reports its phases
+// exactly as a real daemon does. It stops in one phase, the first migration
+// or the integrity check, for the parent test: it prints the phase name once
+// the phase is recorded, and carries on only when the parent writes a line to
+// its stdin. That is store work exactly as slow as the test needs. Then it
+// serves the socket until its stdin closes.
 func upgradingDaemon(socket, dataDir string) int {
-	instance, err := AcquireInstance(socket)
+	instance, err := AcquireInstance(dataDir, socket)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrading daemon:", err)
 		return 3
 	}
 	defer instance.Release()
+	hold := os.Getenv(upgradingDaemonHoldEnv)
+	if hold == "" {
+		hold = "upgrading"
+	}
 	stdin := bufio.NewReader(os.Stdin)
 	trace := instance.StoreTrace()
-	recordUpgrade := trace.Migrating
 	parentGone := false
-	trace.Migrating = func(from, to int) {
-		recordUpgrade(from, to)
-		fmt.Println("upgrading")
+	gate := func(phase string) {
+		if phase != hold {
+			return
+		}
+		fmt.Println(phase)
 		if _, err := stdin.ReadString('\n'); err != nil {
 			parentGone = true
 		}
+	}
+	recordUpgrade, recordCheck := trace.Migrating, trace.Checking
+	trace.Migrating = func(from, to int) {
+		recordUpgrade(from, to)
+		gate("upgrading")
+	}
+	trace.Checking = func() {
+		recordCheck()
+		gate("checking")
 	}
 	db, err := store.Open(store.WithOpenTrace(context.Background(), trace), dataDir)
 	if parentGone {
@@ -92,13 +112,17 @@ func upgradingDaemon(socket, dataDir string) int {
 // upgradeFixture launches upgradingDaemon through Autostarter's seams and
 // records every launch. Each launch gets its own stdin gate, which release
 // opens, and its own output pipe, which Start reads until the daemon reports
-// that it is migrating.
+// that it has reached the phase it holds in.
 type upgradeFixture struct {
 	t       *testing.T
 	dir     string
 	socket  string
 	dataDir string
 	image   string
+	// hold is the phase launched daemons stop in; empty means "upgrading".
+	hold string
+	// afterHold, when set, runs in Start once the daemon has reached hold.
+	afterHold func()
 
 	mu       sync.Mutex
 	launched []*exec.Cmd
@@ -149,6 +173,7 @@ func newUpgradeFixture(t *testing.T) *upgradeFixture {
 func (f *upgradeFixture) starter(onWait func(Status)) *Autostarter {
 	return &Autostarter{
 		SocketPath:    f.socket,
+		DataDir:       f.dataDir,
 		LogPath:       filepath.Join(f.dir, "daemon.log"),
 		StartTimeout:  time.Nanosecond,
 		RetryInterval: 5 * time.Millisecond,
@@ -156,7 +181,7 @@ func (f *upgradeFixture) starter(onWait func(Status)) *Autostarter {
 		Executable:    func() (string, error) { return f.image, nil },
 		Command: func(name string, _ ...string) *exec.Cmd {
 			cmd := exec.Command(name)
-			cmd.Env = append(os.Environ(), upgradingDaemonSocketEnv+"="+f.socket, upgradingDaemonDataEnv+"="+f.dataDir)
+			cmd.Env = append(os.Environ(), upgradingDaemonSocketEnv+"="+f.socket, upgradingDaemonDataEnv+"="+f.dataDir, upgradingDaemonHoldEnv+"="+f.hold)
 			f.mu.Lock()
 			f.launched = append(f.launched, cmd)
 			f.mu.Unlock()
@@ -189,25 +214,35 @@ func (f *upgradeFixture) starter(onWait func(Status)) *Autostarter {
 			if err := cmd.Start(); err != nil {
 				return err
 			}
-			return f.awaitUpgrading(output)
+			if err := f.awaitHold(output); err != nil {
+				return err
+			}
+			if f.afterHold != nil {
+				f.afterHold()
+			}
+			return nil
 		},
 	}
 }
 
-// awaitUpgrading reads a launched daemon's output until it reports that it is
-// migrating, then keeps draining it for the failure report.
-func (f *upgradeFixture) awaitUpgrading(output *os.File) error {
+// awaitHold reads a launched daemon's output until it reports the phase it
+// holds in, then keeps draining it for the failure report.
+func (f *upgradeFixture) awaitHold(output *os.File) error {
+	hold := f.hold
+	if hold == "" {
+		hold = "upgrading"
+	}
 	lines := bufio.NewReader(output)
 	for {
 		line, err := lines.ReadString('\n')
 		f.mu.Lock()
 		f.logs.WriteString(line)
 		f.mu.Unlock()
-		if strings.TrimSpace(line) == "upgrading" {
+		if strings.TrimSpace(line) == hold {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("upgrading daemon exited before it migrated: %w", err)
+			return fmt.Errorf("upgrading daemon exited before it reached %s: %w", hold, err)
 		}
 	}
 	go func() {
@@ -285,7 +320,7 @@ func TestConcurrentStartersWaitForOneUpgradingDaemon(t *testing.T) {
 	}
 	// The daemon serves before it records PhaseRunning, so only its claim on
 	// the socket is certain here.
-	if status, held := ReadInstance(f.socket); !held || status.PID != launched[0].Process.Pid {
+	if status, held := ReadInstance(f.dataDir); !held || status.PID != launched[0].Process.Pid {
 		t.Fatalf("instance = %+v held %v, want it held by the one launched daemon", status, held)
 	}
 }
@@ -306,7 +341,7 @@ func TestStarterGivesUpOnALongUpgradeWithoutStoppingIt(t *testing.T) {
 	if len(launched) != 1 || isProcessGone(t, launched[0]) {
 		t.Fatalf("launched %d daemons, and the migrating one must still be running\ndaemon output:\n%s", len(launched), f.output())
 	}
-	if status, held := ReadInstance(f.socket); !held || status.Phase != PhaseUpgrading {
+	if status, held := ReadInstance(f.dataDir); !held || status.Phase != PhaseUpgrading {
 		t.Fatalf("instance = %+v held %v, want the daemon still upgrading", status, held)
 	}
 }
@@ -318,7 +353,7 @@ func TestStarterGivesUpOnALongUpgradeWithoutStoppingIt(t *testing.T) {
 // the command waits for the old process to exit and then starts one.
 func TestStarterWaitsForAStoppingDaemonInsteadOfStartingASecond(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "papio.sock")
-	previous, err := AcquireInstance(socket)
+	previous, err := AcquireInstance(filepath.Dir(socket), socket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,5 +413,68 @@ func TestStarterWaitsForAStoppingDaemonInsteadOfStartingASecond(t *testing.T) {
 	}
 	if starts != 1 {
 		t.Fatalf("starts = %d, want 1", starts)
+	}
+}
+
+// TestCancelledStarterLeavesAnUnobservedUpgradeRunning covers a caller that
+// gives up (Ctrl-C) after the daemon it launched has recorded that it is
+// upgrading but before the wait loop has read that phase. Terminating the
+// daemon then would roll the migration back for the next start to repeat, so
+// the phase is read again before any signal.
+func TestCancelledStarterLeavesAnUnobservedUpgradeRunning(t *testing.T) {
+	f := newUpgradeFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.afterHold = cancel
+	starter := f.starter(nil)
+	// Only the cancellation may end this wait.
+	starter.StartTimeout = time.Hour
+	_, err := starter.EnsureWithResult(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("EnsureWithResult error = %v, want context.Canceled", err)
+	}
+	launched := f.launches()
+	if len(launched) != 1 || isProcessGone(t, launched[0]) {
+		t.Fatalf("launched %d daemons, and the upgrading one must still be running\ndaemon output:\n%s", len(launched), f.output())
+	}
+	if status, held := ReadInstance(f.dataDir); !held || status.Phase != PhaseUpgrading {
+		t.Fatalf("instance = %+v held %v, want the daemon still upgrading", status, held)
+	}
+}
+
+// TestStarterSaysWhenItWaitsForTheIntegrityCheck pins the notice for the
+// other long store step: the integrity check reads the whole database file,
+// so a command waiting on it says so instead of sitting silent.
+func TestStarterSaysWhenItWaitsForTheIntegrityCheck(t *testing.T) {
+	f := newUpgradeFixture(t)
+	f.hold = "checking"
+	notices := make(chan Status, 4)
+	starter := f.starter(func(status Status) { notices <- status })
+	// The check is announced once it outlasts checkingNotice; any wait does.
+	starter.checkingNotice = time.Nanosecond
+	// Bounds only a failing run, which would otherwise wait ten minutes.
+	starter.MaxWait = 5 * time.Second
+	done := make(chan error, 1)
+	go func() {
+		_, err := starter.EnsureWithResult(context.Background())
+		done <- err
+	}()
+	for checking := false; !checking; {
+		select {
+		case status := <-notices:
+			if status.Phase != PhaseChecking {
+				continue
+			}
+			if got, want := status.Waiting(), "checking the database; this can take a minute"; got != want {
+				t.Fatalf("checking notice = %q, want %q", got, want)
+			}
+			checking = true
+		case err := <-done:
+			t.Fatalf("EnsureWithResult returned %v without saying it waited for the integrity check\ndaemon output:\n%s", err, f.output())
+		}
+	}
+	f.release()
+	if err := <-done; err != nil {
+		t.Fatalf("EnsureWithResult after the check: %v\ndaemon output:\n%s", err, f.output())
 	}
 }

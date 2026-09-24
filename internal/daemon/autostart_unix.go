@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"errors"
 	"os/exec"
 	"syscall"
 )
@@ -26,4 +27,10 @@ func terminateSignal(cmd *exec.Cmd, sig syscall.Signal) error {
 		}
 	}
 	return cmd.Process.Signal(sig)
+}
+
+// processExited reports whether no process has pid. A process owned by
+// another user answers EPERM, which means it exists.
+func processExited(pid int) bool {
+	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
 }

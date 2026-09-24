@@ -23,9 +23,13 @@ type CommandFactory func(name string, args ...string) *exec.Cmd
 // unit-testable without launching a daemon.
 type Autostarter struct {
 	SocketPath string
-	Args       []string
-	LockPath   string
-	LogPath    string
+	// DataDir is the data directory the daemon serves, whose instance claim
+	// says whether a daemon process is alive. It defaults to the socket's
+	// directory, which is where papio puts the socket.
+	DataDir  string
+	Args     []string
+	LockPath string
+	LogPath  string
 
 	// StartTimeout is how long a daemon this call started may take to reach
 	// its socket before it is treated as hung and terminated. A daemon that
@@ -38,8 +42,10 @@ type Autostarter struct {
 	MaxWait       time.Duration
 	RetryInterval time.Duration
 	// OnWait is told, once for each phase, when this call waits for a daemon
-	// that is upgrading its database or stopping, so that a person can be
-	// told why the command is slow.
+	// that is upgrading or checking its database or stopping, so that a
+	// person can be told why the command is slow. The integrity check runs on
+	// every start and is usually brief, so it is announced only once it has
+	// lasted checkingNotice, or when it follows an announced upgrade.
 	OnWait func(Status)
 
 	Executable func() (string, error)
@@ -49,7 +55,8 @@ type Autostarter struct {
 	OpenNull   func() (*os.File, error)
 	OpenLog    func() (*os.File, error)
 
-	gracePeriod time.Duration
+	gracePeriod    time.Duration
+	checkingNotice time.Duration
 }
 
 // NewAutostarter returns an autostarter with production-safe defaults.
@@ -104,6 +111,8 @@ type startWait struct {
 	deadline time.Time
 	// announced is the last phase passed to OnWait.
 	announced Phase
+	// checkingSince is when this wait first saw the daemon checking.
+	checkingSince time.Time
 }
 
 // errWaitExpired reports that MaxWait has passed.
@@ -159,12 +168,13 @@ func (w *startWait) run(ctx context.Context) (EnsureResult, error) {
 			return result, w.abandon(child, ctx.Err())
 		}
 		status, held := w.observe()
-		if child != nil && held && status.PID != 0 && status.PID == child.pid() && status.Phase.storeWork() {
-			child.busy = true
+		child.noteStoreWork(status, held)
+		if held && status.Phase == PhaseRunning && status.Socket != "" && filepath.Clean(status.Socket) != filepath.Clean(w.cfg.SocketPath) {
+			return result, fmt.Errorf("the daemon (pid %d) for %s serves %s, not %s; stop it with 'papio daemon stop' or use its socket", status.PID, w.cfg.DataDir, status.Socket, w.cfg.SocketPath)
 		}
 		switch {
 		case child != nil && !child.exited():
-			if !child.busy && time.Since(child.started) >= w.cfg.StartTimeout {
+			if !child.busy && time.Since(child.started) >= w.cfg.StartTimeout && !w.recheckStoreWork(child) {
 				child.terminate(w.cfg.gracePeriod)
 				return result, fmt.Errorf("wait for daemon socket: the daemon did not become ready within %s; see %s", w.cfg.StartTimeout, w.cfg.LogPath)
 			}
@@ -176,7 +186,8 @@ func (w *startWait) run(ctx context.Context) (EnsureResult, error) {
 				return result, fmt.Errorf("the daemon exited before it became ready; see %s", w.cfg.LogPath)
 			}
 			// The daemon this call launched found another daemon process
-			// holding the socket and left. That one is what will answer.
+			// holding the data directory and left. That one is what will
+			// answer.
 			child = nil
 			result.Started = false
 		case !held:
@@ -203,14 +214,43 @@ func (w *startWait) run(ctx context.Context) (EnsureResult, error) {
 // observe reads the daemon instance, and announces through OnWait a phase
 // that a person would otherwise wait through in silence.
 func (w *startWait) observe() (Status, bool) {
-	status, held := ReadInstance(w.cfg.SocketPath)
-	if held && (status.Phase == PhaseUpgrading || status.Phase == PhaseStopping) && status.Phase != w.announced {
+	status, held := ReadInstance(w.cfg.DataDir)
+	if held && status.Phase != w.announced && w.worthAnnouncing(status.Phase) {
 		w.announced = status.Phase
 		if w.cfg.OnWait != nil {
 			w.cfg.OnWait(status)
 		}
 	}
 	return status, held
+}
+
+// worthAnnouncing reports whether a person should be told that the command
+// waits for a daemon in phase.
+func (w *startWait) worthAnnouncing(phase Phase) bool {
+	switch phase {
+	case PhaseUpgrading, PhaseStopping:
+		return true
+	case PhaseChecking:
+		if w.announced == PhaseUpgrading {
+			return true
+		}
+		if w.checkingSince.IsZero() {
+			w.checkingSince = time.Now()
+		}
+		return time.Since(w.checkingSince) >= w.cfg.checkingNotice
+	default:
+		return false
+	}
+}
+
+// recheckStoreWork reads the instance again just before this call would
+// terminate child, and reports whether child has begun store work since the
+// wait loop last looked. Without it a daemon that recorded "upgrading" a
+// moment after the last read would be stopped part way through a migration.
+func (w *startWait) recheckStoreWork(child *daemonChild) bool {
+	status, held := ReadInstance(w.cfg.DataDir)
+	child.noteStoreWork(status, held)
+	return child.busy
 }
 
 // pause waits one retry interval, unless the caller's context ends or MaxWait
@@ -234,7 +274,7 @@ func (w *startWait) pause(ctx context.Context) error {
 // one that is upgrading or checking its database carries on, and the next
 // command finds it.
 func (w *startWait) abandon(child *daemonChild, err error) error {
-	if child == nil || child.busy || child.exited() {
+	if child == nil || child.busy || child.exited() || w.recheckStoreWork(child) {
 		return err
 	}
 	child.terminate(w.cfg.gracePeriod)
@@ -244,9 +284,12 @@ func (w *startWait) abandon(child *daemonChild, err error) error {
 // expired explains a wait that reached MaxWait. It terminates only a daemon
 // this call launched that never reported store work.
 func (w *startWait) expired(child *daemonChild, status Status, held bool) error {
-	if child != nil && !child.busy && !child.exited() {
+	if child != nil && !child.busy && !child.exited() && !w.recheckStoreWork(child) {
 		child.terminate(w.cfg.gracePeriod)
 		return fmt.Errorf("wait for daemon socket: the daemon did not become ready within %s; see %s", w.cfg.MaxWait, w.cfg.LogPath)
+	}
+	if child != nil && child.busy {
+		status, held = ReadInstance(w.cfg.DataDir)
 	}
 	if !held {
 		return fmt.Errorf("wait for daemon socket: another papio process was still starting the daemon after %s; see %s", w.cfg.MaxWait, w.cfg.LogPath)
@@ -330,6 +373,14 @@ func newDaemonChild(cmd *exec.Cmd) *daemonChild {
 	return child
 }
 
+// noteStoreWork marks c busy when the instance says c is doing store work.
+// A nil c is no child, and nothing to mark.
+func (c *daemonChild) noteStoreWork(status Status, held bool) {
+	if c != nil && held && status.PID != 0 && status.PID == c.pid() && status.Phase.storeWork() {
+		c.busy = true
+	}
+}
+
 func (c *daemonChild) pid() int {
 	if c.cmd.Process == nil {
 		return 0
@@ -379,8 +430,11 @@ func (a *Autostarter) defaults() (Autostarter, error) {
 	if len(cfg.Args) == 0 {
 		cfg.Args = []string{"daemon", "--socket", cfg.SocketPath}
 	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = filepath.Dir(cfg.SocketPath)
+	}
 	if cfg.LockPath == "" {
-		cfg.LockPath = cfg.SocketPath + ".start.lock"
+		cfg.LockPath = startLockPath(cfg.SocketPath)
 	}
 	if cfg.LogPath == "" {
 		cfg.LogPath = filepath.Join(filepath.Dir(cfg.SocketPath), "daemon.log")
@@ -390,6 +444,9 @@ func (a *Autostarter) defaults() (Autostarter, error) {
 	}
 	if cfg.MaxWait <= 0 {
 		cfg.MaxWait = 10 * time.Minute
+	}
+	if cfg.checkingNotice <= 0 {
+		cfg.checkingNotice = 2 * time.Second
 	}
 	if cfg.RetryInterval <= 0 {
 		cfg.RetryInterval = 25 * time.Millisecond
@@ -422,6 +479,11 @@ func (a *Autostarter) defaults() (Autostarter, error) {
 	}
 	return cfg, nil
 }
+
+// startLockPath is the lock every command that starts a daemon for
+// socketPath takes, and that StopDaemon holds while the old daemon exits.
+// Older papio binaries use the same path.
+func startLockPath(socketPath string) string { return socketPath + ".start.lock" }
 
 func probeSocket(ctx context.Context, socketPath string) error {
 	conn, err := ipc.Dial(ctx, socketPath)

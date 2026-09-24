@@ -16,9 +16,9 @@ import (
 )
 
 // Phase is how far a daemon process has got between its start and its exit.
-// The daemon records it beside its socket, so that a command waiting for the
-// socket can tell a daemon that is busy from one that is hung, and can tell
-// the person why it waits.
+// The daemon records it in its data directory, so that a command waiting for
+// the socket can tell a daemon that is busy from one that is hung, and can
+// tell the person why it waits.
 type Phase string
 
 const (
@@ -60,6 +60,8 @@ type Status struct {
 	// FromSchema is the schema version an upgrade started from. Zero during
 	// PhaseUpgrading means the daemon is creating a new database.
 	FromSchema int `json:"from_schema,omitempty"`
+	// Socket is the socket this daemon serves, or will serve.
+	Socket string `json:"socket,omitempty"`
 }
 
 // Activity names what the daemon is doing, for a person.
@@ -85,7 +87,7 @@ func (s Status) Activity() string {
 // this status.
 func (s Status) Waiting() string {
 	switch s.Phase {
-	case PhaseUpgrading:
+	case PhaseUpgrading, PhaseChecking:
 		return s.Activity() + "; this can take a minute"
 	case PhaseStopping:
 		return "waiting for the previous daemon to stop"
@@ -94,9 +96,9 @@ func (s Status) Waiting() string {
 	}
 }
 
-// ErrInstanceHeld means another live papio daemon process owns the socket:
-// it is starting, upgrading the database, serving, or stopping.
-var ErrInstanceHeld = errors.New("another papio daemon process owns this socket")
+// ErrInstanceHeld means another live papio daemon process owns the data
+// directory: it is starting, upgrading the database, serving, or stopping.
+var ErrInstanceHeld = errors.New("another papio daemon process owns this data directory")
 
 // A command that probes the instance lock holds it only for the probe, so
 // AcquireInstance retries long enough to outlast one. A daemon holds the lock
@@ -106,11 +108,15 @@ const (
 	instanceAcquireRetry = 5 * time.Millisecond
 )
 
-// Instance is a daemon process's claim on its socket, held from before it
-// opens the store until it exits. Only one process can hold it, so only one
-// daemon migrates a database and a second one never runs beside a daemon that
-// is still stopping. The operating system releases the lock when the process
-// exits, however it exits, so a crash leaves no stale claim.
+// Instance is a daemon process's claim on its data directory, and so on the
+// database in it, held from before it opens the store until it exits. Only one
+// process can hold it, so only one daemon migrates a database, a daemon
+// started with another --socket cannot open a database that one already
+// serves, and a second daemon never runs beside one that is still stopping.
+// The lock file lives in the directory itself, so every spelling of the
+// directory's path, through a symlink or not, reaches the same file. The
+// operating system releases the lock when the process exits, however it
+// exits, so a crash leaves no stale claim.
 type Instance struct {
 	mu         sync.Mutex
 	lock       *os.File
@@ -119,19 +125,20 @@ type Instance struct {
 	released   bool
 }
 
-func instanceLockPath(socketPath string) string   { return socketPath + ".instance.lock" }
-func instanceStatusPath(socketPath string) string { return socketPath + ".instance.json" }
+func instanceLockPath(dataDir string) string   { return filepath.Join(dataDir, "papio.daemon.lock") }
+func instanceStatusPath(dataDir string) string { return filepath.Join(dataDir, "papio.daemon.json") }
 
-// AcquireInstance claims socketPath for this process, in PhaseStarting. It
-// returns ErrInstanceHeld when another daemon process holds the claim.
-func AcquireInstance(socketPath string) (*Instance, error) {
-	// #nosec G703 -- socketPath is this daemon's own socket, from its config or
-	// its --socket flag; the instance files sit beside it with the same owner.
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return nil, fmt.Errorf("create daemon instance directory: %w", err)
+// AcquireInstance claims dataDir for this process, which will serve
+// socketPath, in PhaseStarting. It returns ErrInstanceHeld when another daemon
+// process holds the claim.
+func AcquireInstance(dataDir, socketPath string) (*Instance, error) {
+	// #nosec G703 -- dataDir is this daemon's own data directory from its
+	// config; the instance files live in it with the same owner.
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create daemon data directory: %w", err)
 	}
 	// #nosec G703 -- same provenance as the directory above.
-	file, err := os.OpenFile(instanceLockPath(socketPath), os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(instanceLockPath(dataDir), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open daemon instance lock: %w", err)
 	}
@@ -153,8 +160,8 @@ func AcquireInstance(socketPath string) (*Instance, error) {
 	}
 	instance := &Instance{
 		lock:       file,
-		statusPath: instanceStatusPath(socketPath),
-		status:     Status{PID: os.Getpid(), Phase: PhaseStarting},
+		statusPath: instanceStatusPath(dataDir),
+		status:     Status{PID: os.Getpid(), Phase: PhaseStarting, Socket: socketPath},
 	}
 	instance.record()
 	return instance, nil
@@ -184,8 +191,8 @@ func (i *Instance) Release() {
 		return
 	}
 	i.released = true
-	// #nosec G703 -- statusPath is derived from the socket path AcquireInstance
-	// was given, as the lock file is.
+	// #nosec G703 -- statusPath is in the data directory AcquireInstance was
+	// given, as the lock file is.
 	_ = os.Remove(i.statusPath)
 	_ = unlockFile(i.lock)
 	_ = i.lock.Close()
@@ -197,7 +204,7 @@ func (i *Instance) advance(next Status) {
 	if i.released || phaseOrder[next.Phase] <= phaseOrder[i.status.Phase] {
 		return
 	}
-	next.PID = i.status.PID
+	next.PID, next.Socket = i.status.PID, i.status.Socket
 	i.status = next
 	i.record()
 }
@@ -222,8 +229,8 @@ func writeStatus(path string, status Status) error {
 		return err
 	}
 	staging := path + ".new"
-	// #nosec G703 -- path is this daemon's own status file beside its socket
-	// (see AcquireInstance); staging only adds a fixed suffix to it.
+	// #nosec G703 -- path is this daemon's own status file in its data
+	// directory (see AcquireInstance); staging only adds a fixed suffix to it.
 	if err := os.WriteFile(staging, data, 0o600); err != nil {
 		return err
 	}
@@ -242,12 +249,12 @@ func writeStatus(path string, status Status) error {
 	return err
 }
 
-// ReadInstance reports whether a live daemon process holds socketPath's
+// ReadInstance reports whether a live daemon process holds dataDir's
 // instance, and the status it last recorded. When no daemon holds it, the
 // probe holds the lock for the moment it takes, which AcquireInstance
 // tolerates. An unreadable status is returned as the zero Status.
-func ReadInstance(socketPath string) (Status, bool) {
-	file, err := os.OpenFile(instanceLockPath(socketPath), os.O_RDWR, 0)
+func ReadInstance(dataDir string) (Status, bool) {
+	file, err := os.OpenFile(instanceLockPath(dataDir), os.O_RDWR, 0)
 	if err != nil {
 		return Status{}, false
 	}
@@ -261,7 +268,7 @@ func ReadInstance(socketPath string) (Status, bool) {
 		return Status{}, false
 	}
 	var status Status
-	if data, err := os.ReadFile(instanceStatusPath(socketPath)); err == nil {
+	if data, err := os.ReadFile(instanceStatusPath(dataDir)); err == nil {
 		if json.Unmarshal(data, &status) != nil {
 			status = Status{}
 		}

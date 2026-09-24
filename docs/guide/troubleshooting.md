@@ -63,7 +63,10 @@ papio daemon status
 papio status
 ```
 
-The second command confirms it is stopped without starting it again; the last
+`papio daemon stop` returns when the service process has exited. The service
+can take up to half a minute to finish its work, and the command then prints
+`papio: waiting for the daemon (pid N) to finish stopping`. The second command
+confirms it is stopped without starting it again; the last
 command is a normal call and can start a fresh service. On a healthy recovery,
 the extension recognizes the fresh service, closes its stale connection,
 reconnects, and re-offers your saved browser jobs. It re-offers them within
@@ -110,9 +113,12 @@ that takes a minute or more: the command prints
 commands and the browser extension wait for the same upgrade instead of
 starting a second service. Let it finish. If it takes longer than ten minutes,
 the command stops waiting and says so, and the upgrade carries on in the
-background; run the command again later. A command run while the previous
-service is still stopping prints `papio: waiting for the previous daemon to stop`
-and starts the new service once the old one has exited.
+background; run the command again later. A database check can also take a
+while on a large database, and the command then prints
+`papio: checking the database; this can take a minute`. A command run while
+the previous service is still stopping prints
+`papio: waiting for the previous daemon to stop` and starts the new service
+once the old one has exited.
 
 The extension popup reports **daemon unreachable**, ***papio* daemon out of
 date**, and **extension out of date** when it needs attention; the toolbar shows
