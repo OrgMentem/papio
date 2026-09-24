@@ -490,12 +490,22 @@ type ProducerStats struct {
 }
 
 // ProducerStats aggregates artifact.producer events recorded in [since, until).
+//
+// A zero until leaves the period open at its end, so the count takes every
+// event recorded before the query, and Until reports when it ran. "Until now"
+// cannot be a bound: the event recorded just before the query can carry the
+// same clock reading as the query, and a half-open period then drops it.
+// Windows advances the wall clock about once a millisecond, so measured there
+// the second of two promotions recorded back to back read equal to the
+// default end in 12 of 20 runs.
 func (js *Store) ProducerStats(ctx context.Context, since, until time.Time) (ProducerStats, error) {
+	openEnd := until.IsZero()
+	if openEnd {
+		until = time.Now()
+	}
 	if !until.After(since) {
 		return ProducerStats{}, errors.New("producer stats period must end after it starts")
 	}
-	// events.at is compared as text, so the bounds are bound in store.TimeLayout.
-	from, to := store.FormatTime(since), store.FormatTime(until)
 	stats := ProducerStats{
 		Since: since.UTC().Format(time.RFC3339Nano), Until: until.UTC().Format(time.RFC3339Nano),
 		Producers: map[Producer]int{}, Interventions: map[Intervention]int{}, OpenedBy: map[string]int{},
@@ -506,9 +516,20 @@ func (js *Store) ProducerStats(ctx context.Context, since, until time.Time) (Pro
 	for _, intervention := range Interventions {
 		stats.Interventions[intervention] = 0
 	}
+	// period is the WHERE clause on one events alias. The bounds are bound in
+	// store.TimeLayout because events.at is compared as text.
+	period := func(alias string) (string, []any) {
+		clause, args := alias+".at >= ?", []any{store.FormatTime(since)}
+		if !openEnd {
+			clause += " AND " + alias + ".at < ?"
+			args = append(args, store.FormatTime(until))
+		}
+		return clause, args
+	}
+	recorded, recordedArgs := period("e")
 	rows, err := js.S.DB().QueryContext(ctx,
-		`SELECT detail_json FROM events WHERE kind = ? AND at >= ? AND at < ? ORDER BY seq ASC`,
-		ArtifactProducerEvent, from, to)
+		`SELECT e.detail_json FROM events e WHERE e.kind = ? AND `+recorded+` ORDER BY e.seq ASC`,
+		append([]any{ArtifactProducerEvent}, recordedArgs...)...)
 	if err != nil {
 		return ProducerStats{}, err
 	}
@@ -546,14 +567,15 @@ func (js *Store) ProducerStats(ctx context.Context, since, until time.Time) (Pro
 		return ProducerStats{}, err
 	}
 	// Ready transitions in the period that no producer record accompanies.
+	promoted, promotedArgs := period("t")
 	if err := js.S.DB().QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM events t
-		 WHERE t.kind = 'job.transition' AND t.at >= ? AND t.at < ?
+		 WHERE t.kind = 'job.transition' AND `+promoted+`
 		   AND json_extract(t.detail_json, '$.to') = 'ready'
 		   AND NOT EXISTS (
 		     SELECT 1 FROM events p
 		      WHERE p.job_id = t.job_id AND p.kind = ? AND p.at = t.at)`,
-		from, to, ArtifactProducerEvent).Scan(&stats.Unrecorded); err != nil {
+		append(promotedArgs, ArtifactProducerEvent)...).Scan(&stats.Unrecorded); err != nil {
 		return ProducerStats{}, err
 	}
 	return stats, nil

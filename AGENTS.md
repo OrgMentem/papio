@@ -176,7 +176,10 @@ There is also a link check, because `zensical build` prints a broken link as an
   one second (`…:05Z` sorts after `…:05.1Z`). Write and bind with
   `store.FormatTime`/`store.Now` (UTC, nine digits, 30 bytes); parse with
   `time.RFC3339Nano`, which reads both widths. Migration 0056 rewrote the old
-  values.
+  values. A bound of "now" on a half-open period also drops an event recorded
+  in the same clock reading — Windows advances the wall clock about once a
+  millisecond — so an omitted end must leave the period open, as
+  `job.ProducerStats` does.
 - **NEVER edit an applied migration in place.** A constraint or column change needs a
   *new* migration, even when the old one is "obviously wrong" — no schema version
   records an in-place edit, and every test migrates a fresh database and so never sees

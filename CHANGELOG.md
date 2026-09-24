@@ -108,6 +108,12 @@ execution records kept during the initial build.
   that were stored in local time and in another form. Times that come from
   the database, for example in `--json` output, now show all nine digits
   (`…:05.595612000Z`).
+- **`papio stats producers` without `--until` counts a paper that was filed
+  just before the command.** The period ended at the time of the command, and
+  an event at the end of a period is outside it. Windows advances its clock
+  only about once a millisecond, so a paper filed less than a millisecond
+  before the command had the same time and was not counted. Without
+  `--until`, the period now has no end.
 
 ## [0.22.1] - 2026-09-23
 

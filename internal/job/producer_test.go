@@ -413,3 +413,30 @@ func TestProducerStatsSplitsASecondByInstant(t *testing.T) {
 		t.Fatalf("stats = %+v, want only the adapter event and the unrecorded promotion inside [since, until)", stats)
 	}
 }
+
+// Without an end the period takes every event already recorded, whatever the
+// clock read when it was recorded: on Windows the wall clock advances about
+// once a millisecond, so a promotion recorded just before the query can carry
+// the query's own reading, and a bound at "now" dropped it.
+func TestProducerStatsWithoutAnEndCountsEveryRecordedEvent(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	since := time.Now().Add(-time.Minute)
+	for _, at := range []time.Time{since, time.Now(), time.Now().Add(time.Hour)} {
+		if _, err := js.S.DB().ExecContext(ctx,
+			`INSERT INTO events (job_id, at, kind, detail_json) VALUES ('job-open-end', ?, ?, '{"producer":"adapter"}')`,
+			store.FormatTime(at), ArtifactProducerEvent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := js.ProducerStats(ctx, since, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Acquired != 3 {
+		t.Fatalf("stats = %+v, want all 3 recorded events counted", stats)
+	}
+	if _, err := js.ProducerStats(ctx, time.Now().Add(time.Hour), time.Time{}); err == nil {
+		t.Fatal("ProducerStats accepted an open period that starts in the future")
+	}
+}
