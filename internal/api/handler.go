@@ -64,6 +64,16 @@ type ActionsOpenResult struct {
 	SessionLive bool `json:"session_live"`
 }
 
+// ActionsOpenPlanResult names the jobs among an actions.open_plan request that
+// actions.open would send back to resolving instead of focusing: each one's
+// open manual download was left by an open-access route, or its library
+// already reported no entitlement, so its library link cannot serve it. A new
+// method rather than a field on ActionsOpenResult, because results decode
+// strictly and an older CLI would reject the wider shape.
+type ActionsOpenPlanResult struct {
+	Rediscover []string `json:"rediscover"`
+}
+
 // AcquireReportParams names one persisted batch manifest, or "latest".
 type AcquireReportParams struct {
 	BatchID string `json:"batch_id"`
@@ -381,6 +391,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"actions.open": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return openActions(ctx, raw, system)
+		},
+		"actions.open_plan": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return planOpenActions(ctx, raw, system)
 		},
 		"drive.status": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return driveStatus(ctx, raw, system)
@@ -1454,14 +1467,46 @@ func openActions(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	if system == nil || system.Browser == nil {
+	if system == nil {
 		return marshal(ActionsOpenResult{})
 	}
-	queued, sessionLive, err := drive.OpenHandoffs(ctx, system.Browser, system.Jobs, params.JobIDs, PrincipalFrom(ctx))
+	// A manual download whose route is not the library's goes back to
+	// resolving before anything is focused; focusing it would open the
+	// library link. This does not need a browser: resolving re-derives the
+	// open-access handoff, which the bridge offers once one is connected.
+	jobIDs := params.JobIDs
+	if system.Jobs != nil {
+		var err error
+		if jobIDs, err = drive.RediscoverManualDownloads(ctx, system.Jobs, system.Config.OpenURLBaseFor, jobIDs); err != nil {
+			return failure(err)
+		}
+	}
+	if system.Browser == nil {
+		return marshal(ActionsOpenResult{})
+	}
+	queued, sessionLive, err := drive.OpenHandoffs(ctx, system.Browser, system.Jobs, jobIDs, PrincipalFrom(ctx))
 	if err != nil {
 		return failure(err)
 	}
 	return marshal(ActionsOpenResult{Queued: queued, SessionLive: sessionLive})
+}
+
+// planOpenActions answers, without changing anything, which of the named
+// jobs actions.open would send back to resolving; `papio actions open` prints
+// that for --dry-run and keeps those jobs off its OS-launcher fallback.
+func planOpenActions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params ActionsOpenParams
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Jobs == nil {
+		return marshal(ActionsOpenPlanResult{Rediscover: []string{}})
+	}
+	rediscover, err := drive.ManualDownloadsToRediscover(ctx, system.Jobs, params.JobIDs)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(ActionsOpenPlanResult{Rediscover: rediscover})
 }
 
 func getArtifact(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

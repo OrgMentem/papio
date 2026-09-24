@@ -182,36 +182,14 @@ func (js *Store) redriveInstitutionalHandoff(ctx context.Context, jobID string, 
 			return 0, err
 		}
 	}
-	// Two spent routes are redriven through rediscovery, not a fresh
-	// institutional handoff, because that handoff is not the route left to
-	// try. A manual download the open-access browser route left behind asks
-	// for that route again: the page was reachable, only papio's drive of it
-	// failed. And an institutional route that already reported no entitlement
-	// (browser.no_entitlement_requeue) can only report it again. Live
-	// 2026-09-24, a paced redrive of a PMC manual download opened exactly that
-	// route, and its second no_entitlement ended the job unavailable.
-	// Resolving hands the choice to exhaustion, its one owner: it re-derives a
-	// live open-access URL, falls back to an untried institutional route, or
-	// settles the job when neither remains. A stored open-access URL is never
-	// reused, because it can be a bearer link that has since expired.
 	rediscover := false
 	if state == StateAwaitingHuman {
-		var provenEmpty int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM events
-			WHERE job_id=? AND kind='browser.no_entitlement_requeue')`, jobID).Scan(&provenEmpty); err != nil {
-			return 0, err
+		spentKind := ""
+		if count == 1 {
+			spentKind = actionKind
 		}
-		rediscover = provenEmpty != 0
-		if !rediscover && count == 1 && actionKind == "manual_download" {
-			// The bridge resolves the handoff it drove before it opens the
-			// manual download, so the newest earlier handoff is its route.
-			var route string
-			err := tx.QueryRowContext(ctx, `SELECT COALESCE(detail,'') FROM human_actions
-				WHERE job_id=? AND kind='openurl_handoff' AND id<? ORDER BY id DESC LIMIT 1`, jobID, actionID).Scan(&route)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return 0, err
-			}
-			rediscover = oaHandoff(route)
+		if rediscover, err = spentRouteRediscovers(ctx, tx, jobID, spentKind, actionID, oaHandoff); err != nil {
+			return 0, err
 		}
 	}
 	if !apply {
@@ -301,4 +279,89 @@ func (js *Store) redriveInstitutionalHandoff(ctx context.Context, jobID string, 
 		return 0, err
 	}
 	return fresh, tx.Commit()
+}
+
+// spentRouteRediscovers is the one rule for where a spent route of an
+// awaiting_human job goes next: back to resolving instead of to a fresh
+// institutional handoff, because that handoff is not the route left to try.
+// A manual download the open-access browser route left behind asks for that
+// route again: the page was reachable, only papio's drive of it failed. An
+// institutional route that already reported no entitlement
+// (browser.no_entitlement_requeue) can only report it again. Live 2026-09-24,
+// a paced redrive of a PMC manual download opened exactly that route, and its
+// second no_entitlement ended the job unavailable. Resolving hands the choice
+// to exhaustion, its one owner: it re-derives a live open-access URL, falls
+// back to an untried institutional route, or settles the job when neither
+// remains. A stored open-access URL is never reused, because it can be a
+// bearer link that has since expired.
+//
+// spentKind is the open spent action's kind, or empty when none is open;
+// spentID is that action's id.
+func spentRouteRediscovers(ctx context.Context, q dbtx, jobID, spentKind string, spentID int64, oaHandoff func(detail string) bool) (bool, error) {
+	var provenEmpty int
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM events
+		WHERE job_id=? AND kind='browser.no_entitlement_requeue')`, jobID).Scan(&provenEmpty); err != nil {
+		return false, err
+	}
+	if provenEmpty != 0 {
+		return true, nil
+	}
+	if spentKind != "manual_download" {
+		return false, nil
+	}
+	// The bridge resolves the handoff it drove before it opens the manual
+	// download, so the newest earlier handoff is the download's route.
+	var route string
+	err := q.QueryRowContext(ctx, `SELECT COALESCE(detail,'') FROM human_actions
+		WHERE job_id=? AND kind='openurl_handoff' AND id<? ORDER BY id DESC LIMIT 1`, jobID, spentID).Scan(&route)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return oaHandoff(route), nil
+}
+
+// OpenManualDownloadRediscovers reports whether a job's one open action is a
+// manual download whose route is not the institution's library: the
+// open-access browser route left it, or the job's institutional route has
+// already reported no entitlement. Opening such a download must not mint the
+// library link; a redrive of it returns the job to resolving. It also returns
+// the action's revision, for that redrive. It changes nothing.
+func (js *Store) OpenManualDownloadRediscovers(ctx context.Context, jobID string, oaHandoff func(detail string) bool) (revision int64, ok bool, err error) {
+	db := js.S.DB()
+	var state string
+	if err := db.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id=?`, jobID).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if state != StateAwaitingHuman {
+		return 0, false, nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT id,kind,revision FROM human_actions WHERE job_id=? AND status='open'`, jobID)
+	if err != nil {
+		return 0, false, err
+	}
+	var actionID int64
+	var kind string
+	count := 0
+	for rows.Next() {
+		count++
+		if err := rows.Scan(&actionID, &kind, &revision); err != nil {
+			_ = rows.Close()
+			return 0, false, err
+		}
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil || count != 1 || kind != "manual_download" {
+		return 0, false, err
+	}
+	if ok, err = spentRouteRediscovers(ctx, db, jobID, kind, actionID, oaHandoff); err != nil || !ok {
+		return 0, false, err
+	}
+	return revision, true, nil
 }

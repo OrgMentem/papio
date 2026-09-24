@@ -127,6 +127,13 @@ picking one, and a selector naming no open action is an error: falling
 back to the head of the queue would open somebody else's handoff and
 report success.
 
+A manual download opens on your library's route, with one exception.
+When an open-access route left the download, or your library has
+already reported no entitlement for the paper, that route cannot serve
+it: papio sends the job back to resolving instead, where it looks up the
+open-access route again and offers it in the browser. No library link
+opens. --dry-run prints each such job with "would return to resolving".
+
 The selector is for choosing a row, not for iterating the queue. A
 background caller that loops it over every row has built the autonomous
 drain ADR-0009 does not ratify: your browser is one serial surface, and
@@ -139,7 +146,7 @@ papio actions open [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--action` | `int64` | `0` | open only this action id |
-| `--dry-run` | `bool` | `false` | print URLs without opening them |
+| `--dry-run` | `bool` | `false` | print URLs, and the jobs sent back to resolving, without opening anything |
 | `--job` | `string` |  | open only this job's open action |
 | `--limit` | `int` | `0` | maximum actions to open (default all) |
 

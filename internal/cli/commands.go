@@ -862,6 +862,12 @@ func newActionsCommand(opt *options) *cobra.Command {
 			"picking one, and a selector naming no open action is an error: falling\n" +
 			"back to the head of the queue would open somebody else's handoff and\n" +
 			"report success.\n\n" +
+			"A manual download opens on your library's route, with one exception.\n" +
+			"When an open-access route left the download, or your library has\n" +
+			"already reported no entitlement for the paper, that route cannot serve\n" +
+			"it: papio sends the job back to resolving instead, where it looks up the\n" +
+			"open-access route again and offers it in the browser. No library link\n" +
+			"opens. --dry-run prints each such job with \"would return to resolving\".\n\n" +
 			"The selector is for choosing a row, not for iterating the queue. A\n" +
 			"background caller that loops it over every row has built the autonomous\n" +
 			"drain ADR-0009 does not ratify: your browser is one serial surface, and\n" +
@@ -892,10 +898,21 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			targets, droppedForMissingJob := actionHandoffTargets(actions, rows, cfg.InstitutionFor, limit)
+			rediscover, err := manualDownloadsToRediscover(cmd.Context(), opt, targets)
+			if err != nil {
+				return err
+			}
 			urls := make([]string, 0, len(targets))
 			untrackedURLs := make([]string, 0, len(targets))
 			jobIDs := make([]string, 0, len(targets))
+			rediscoverIDs := make([]string, 0, len(rediscover))
 			for _, target := range targets {
+				if rediscover[target.JobID] {
+					// Its library link cannot serve it: the daemon sends
+					// the job back to resolving instead, so no URL opens.
+					rediscoverIDs = append(rediscoverIDs, target.JobID)
+					continue
+				}
 				urls = append(urls, target.URL)
 				if target.Tracked {
 					jobIDs = append(jobIDs, target.JobID)
@@ -905,14 +922,32 @@ func newActionsCommand(opt *options) *cobra.Command {
 			}
 			urls, urlsTruncated := agentjson.Capped(urls, limit)
 			truncated := urlsTruncated || droppedForMissingJob > 0
-			if len(urls) == 0 && len(actions) > 0 && !opt.jsonOutput {
+			if len(urls) == 0 && len(rediscoverIDs) == 0 && len(actions) > 0 && !opt.jsonOutput {
 				if _, err := fmt.Fprintf(opt.out, "%s, none openable from here — run 'papio actions list' for details\n", selector.describe(len(actions))); err != nil {
 					return err
 				}
 				return nil
 			}
+			// Rediscovery lines are the plan, not rows of the URL page, so JSON
+			// output keeps them off stdout.
+			planOut := opt.out
+			if opt.jsonOutput {
+				planOut = opt.errOut
+			}
 			if dryRun && opt.jsonOutput {
-				return printPage(opt, "urls", urls, truncated)
+				if err := printPage(opt, "urls", urls, truncated); err != nil {
+					return err
+				}
+				return printRediscovery(planOut, rediscoverIDs, true)
+			}
+			if !dryRun && len(rediscoverIDs) > 0 {
+				var result api.ActionsOpenResult
+				if err := opt.call(cmd.Context(), "actions.open", map[string]any{"job_ids": rediscoverIDs}, &result); err != nil {
+					return err
+				}
+				if err := printRediscovery(planOut, rediscoverIDs, false); err != nil {
+					return err
+				}
 			}
 			if err := focusOrOpenActionURLs(cmd.Context(), urls, untrackedURLs, jobIDs, dryRun, opt.out, func(ctx context.Context, ids []string) (api.ActionsOpenResult, error) {
 				var result api.ActionsOpenResult
@@ -923,6 +958,11 @@ func newActionsCommand(opt *options) *cobra.Command {
 			}, commandExec); err != nil {
 				return err
 			}
+			if dryRun {
+				if err := printRediscovery(planOut, rediscoverIDs, true); err != nil {
+					return err
+				}
+			}
 			if opt.jsonOutput {
 				return printPage(opt, "urls", urls, truncated)
 			}
@@ -930,7 +970,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 		},
 	}
 	open.Flags().IntVar(&limit, "limit", 0, "maximum actions to open (default all)")
-	open.Flags().BoolVar(&dryRun, "dry-run", false, "print URLs without opening them")
+	open.Flags().BoolVar(&dryRun, "dry-run", false, "print URLs, and the jobs sent back to resolving, without opening anything")
 	open.Flags().StringVar(&openJobID, "job", "", "open only this job's open action")
 	open.Flags().Int64Var(&openActionID, "action", 0, "open only this action id")
 
@@ -1021,6 +1061,7 @@ func actionJobs(ctx context.Context, opt *options, actions []job.HumanAction, se
 
 type actionHandoffTarget struct {
 	JobID   string
+	Kind    string
 	URL     string
 	Tracked bool
 }
@@ -1064,12 +1105,58 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 		if !ok {
 			continue
 		}
-		targets = append(targets, actionHandoffTarget{JobID: action.JobID, URL: target, Tracked: browserFocusableActionKind(action.Kind)})
+		targets = append(targets, actionHandoffTarget{JobID: action.JobID, Kind: action.Kind, URL: target, Tracked: browserFocusableActionKind(action.Kind)})
 		if limit > 0 && len(targets) >= limit {
 			break
 		}
 	}
 	return targets, droppedForMissingJob
+}
+
+// manualDownloadsToRediscover asks the daemon which manual-download targets
+// actions.open would send back to resolving instead of focusing: those whose
+// library link cannot serve them, because an open-access route left the
+// download or the library already reported no entitlement. Their URL is that
+// library link, so it is never printed or handed to the OS launcher. A daemon
+// that predates actions.open_plan also predates that routing and still
+// focuses them, so the answer there is none.
+func manualDownloadsToRediscover(ctx context.Context, opt *options, targets []actionHandoffTarget) (map[string]bool, error) {
+	ids := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.Kind == "manual_download" {
+			ids = append(ids, target.JobID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var plan api.ActionsOpenPlanResult
+	if err := opt.call(ctx, "actions.open_plan", map[string]any{"job_ids": ids}, &plan); err != nil {
+		if isUnknownMethod(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	rediscover := make(map[string]bool, len(plan.Rediscover))
+	for _, id := range plan.Rediscover {
+		rediscover[id] = true
+	}
+	return rediscover, nil
+}
+
+// printRediscovery names each job an open sends (or, with --dry-run, would
+// send) back to resolving, where papio looks up its open-access route again.
+func printRediscovery(out io.Writer, jobIDs []string, dryRun bool) error {
+	verb := "returned to resolving"
+	if dryRun {
+		verb = "would return to resolving"
+	}
+	for _, id := range jobIDs {
+		if _, err := fmt.Fprintf(out, "%s\t%s: papio looks up its open-access route again; no library link opens\n", id, verb); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func actionURL(action job.HumanAction, row job.Row, instFor func(string) (config.Institution, bool)) (string, bool) {

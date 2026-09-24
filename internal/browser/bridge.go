@@ -758,6 +758,10 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 	// paywalls every one — so the CLI already sends `papio actions open` for
 	// both kinds. Only the browser path was handoff-only, which left the
 	// extension opening the canonical link while the CLI minted a route.
+	// actions.open first sends the other manual downloads (left by an
+	// open-access route, or on a library that already reported no
+	// entitlement) back to resolving through drive.RediscoverManualDownloads,
+	// so this path never receives one to open on the library route.
 	//
 	// This widens the EXPLICIT focus path only. handoffJobs, which feeds the
 	// automatic offer gate, stays openurl_handoff: papio must not start

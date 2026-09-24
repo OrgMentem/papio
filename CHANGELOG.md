@@ -91,6 +91,17 @@ execution records kept during the initial build.
   it still has an open-access copy to try, whether untried or waiting to be
   retried. An open-access copy that itself reported no entitlement does not
   count, and the paper still becomes unavailable when no other route exists.
+- **`papio actions open` no longer opens your library for a download that an
+  open-access page left behind.** Every manual download opened on your
+  library's sign-in route, also when an open-access page had left it or when
+  the library had already reported no entitlement to the paper. Now such a
+  paper goes back to resolving instead, where *papio* looks up the
+  open-access copy again and offers it in the browser; no library link opens,
+  in the browser or through the system's default browser. The command prints
+  `<job>` followed by `returned to resolving`, and `--dry-run` prints
+  `would return to resolving` for each such paper. With `--json` these lines
+  go to standard error, and the `urls` list leaves the paper out. Other
+  manual downloads still open on the library's route.
 - **The first command after an upgrade waits for the database upgrade
   instead of failing.** A command that starts the background service gave it
   five seconds to open its socket, then stopped it. A database upgrade that

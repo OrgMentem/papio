@@ -368,6 +368,10 @@ func TestActionsOpenFocusesAManualDownloadThroughTheBrowser(t *testing.T) {
 			*result.(*[]job.HumanAction) = []job.HumanAction{action}
 		case "jobs.list_v2":
 			*result.(*api.JobsPage) = api.JobsPage{Jobs: []job.Row{row}}
+		case "actions.open_plan":
+			// A manual download with no open-access route behind it keeps
+			// its library route.
+			*result.(*api.ActionsOpenPlanResult) = api.ActionsOpenPlanResult{Rediscover: []string{}}
 		case "actions.open":
 			focusParams = params.(map[string]any)
 			*result.(*api.ActionsOpenResult) = api.ActionsOpenResult{Queued: 1, SessionLive: true}
@@ -392,6 +396,68 @@ func TestActionsOpenFocusesAManualDownloadThroughTheBrowser(t *testing.T) {
 	}
 	if len(page.URLs) != 1 || !strings.HasPrefix(page.URLs[0], "https://resolver.example.test/openurl") {
 		t.Fatalf("JSON URLs = %+v, want the institution's route", page)
+	}
+}
+
+// Live 2026-09-24 (job_49a7…): the manual download the PMC open-access page
+// left behind resolved, like every manual download, to the library's OpenURL
+// route, and that library had already reported no entitlement. `papio actions
+// open` must not open it there. The daemon says which jobs it sends back to
+// resolving instead (actions.open_plan); --dry-run prints that, and a real
+// open asks actions.open for those jobs without any library link.
+func TestActionsOpenRediscoversAnOpenAccessManualDownloadInsteadOfTheLibrary(t *testing.T) {
+	action := job.HumanAction{
+		ID: 1490, JobID: "job_oa_manual", Kind: "manual_download", Status: "open", Revision: 1,
+		Detail: "papio has no adapter for this provider yet; download the PDF yourself for now",
+	}
+	row := job.Row{ID: action.JobID, State: job.StateAwaitingHuman, Work: work.Work{DOI: "10.1001/jamaophthalmol.2025.2413"}}
+	cfg := config.Config{Browser: config.Browser{OpenURLBase: "https://resolver.example.test/openurl"}}
+	for _, dryRun := range []bool{true, false} {
+		t.Run(fmt.Sprintf("dry_run=%t", dryRun), func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			var opened [][]string
+			planned := false
+			root := NewInProcessRoot(&out, &errOut, cfg, func(_ context.Context, method string, params any, result any) error {
+				switch method {
+				case "actions.list":
+					*result.(*[]job.HumanAction) = []job.HumanAction{action}
+				case "jobs.list_v2":
+					*result.(*api.JobsPage) = api.JobsPage{Jobs: []job.Row{row}}
+				case "actions.open_plan":
+					planned = true
+					if got := params.(map[string]any)["job_ids"]; !reflect.DeepEqual(got, []string{action.JobID}) {
+						t.Fatalf("plan asked for %v", got)
+					}
+					*result.(*api.ActionsOpenPlanResult) = api.ActionsOpenPlanResult{Rediscover: []string{action.JobID}}
+				case "actions.open":
+					opened = append(opened, params.(map[string]any)["job_ids"].([]string))
+					*result.(*api.ActionsOpenResult) = api.ActionsOpenResult{SessionLive: true}
+				default:
+					t.Fatalf("unexpected method %q", method)
+				}
+				return nil
+			})
+			args := []string{"actions", "open"}
+			if dryRun {
+				args = append(args, "--dry-run")
+			}
+			root.SetArgs(args)
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("actions open: %v (%s)", err, errOut.String())
+			}
+			if !planned || strings.Contains(out.String(), "resolver.example.test") {
+				t.Fatalf("output %q (planned=%t); want no library link", out.String(), planned)
+			}
+			want := action.JobID + "\treturned to resolving: papio looks up its open-access route again; no library link opens\n"
+			wantOpened := [][]string{{action.JobID}}
+			if dryRun {
+				want = action.JobID + "\twould return to resolving: papio looks up its open-access route again; no library link opens\n"
+				wantOpened = nil
+			}
+			if out.String() != want || !reflect.DeepEqual(opened, wantOpened) {
+				t.Fatalf("output %q, actions.open %v; want %q and %v", out.String(), opened, want, wantOpened)
+			}
+		})
 	}
 }
 

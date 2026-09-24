@@ -39,7 +39,11 @@ func HumanActionNextStepFor(action job.HumanAction) HumanActionNextStep {
 		// the 34 open manual downloads measured on 2026-08-21 require auth, and
 		// a canonical publisher link paywalls every one of them. `actions open`
 		// resolves the same fresh route a handoff gets; the instruction says
-		// what to do once there.
+		// what to do once there. The exception needs the job's history, which
+		// this action alone does not carry: a download that an open-access
+		// route left, or one whose library already reported no entitlement,
+		// goes back to resolving through the same command instead
+		// (drive.RediscoverManualDownloads), so it never opens the library.
 		next.Command = actionsOpenCommand
 		next.Instruction = "download the PDF yourself — papio will adopt it"
 	default:

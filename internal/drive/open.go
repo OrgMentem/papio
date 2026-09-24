@@ -11,7 +11,9 @@ package drive
 
 import (
 	"context"
+	"errors"
 
+	"papio/internal/app"
 	"papio/internal/job"
 )
 
@@ -42,6 +44,55 @@ func OpenHandoffs(ctx context.Context, focus Focuser, jobs *job.Store, jobIDs []
 	}
 	RecordHandoffOpened(ctx, jobs, jobIDs, principal)
 	return queued, sessionLive, nil
+}
+
+// ManualDownloadsToRediscover names the jobs among jobIDs that
+// RediscoverManualDownloads would send back to resolving: each job's one open
+// action is a manual download whose route is not the library's (the
+// open-access browser route left it, or the library already reported no
+// entitlement). It changes nothing, so `papio actions open --dry-run` can say
+// what an open will do.
+func ManualDownloadsToRediscover(ctx context.Context, jobs *job.Store, jobIDs []string) ([]string, error) {
+	rediscover := []string{}
+	for _, jobID := range jobIDs {
+		_, ok, err := jobs.OpenManualDownloadRediscovers(ctx, jobID, isOAHandoff)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			rediscover = append(rediscover, jobID)
+		}
+	}
+	return rediscover, nil
+}
+
+// RediscoverManualDownloads runs before an explicit open. Opening a manual
+// download mints the library's OpenURL route, and for a download that the
+// open-access route left behind, or on a job whose library already reported
+// no entitlement, that route cannot serve the paper: live 2026-09-24 it sent
+// a PMC paper back to a library that then ended it unavailable. Such a job is
+// redriven instead, through the store function `papio jobs redrive` and the
+// paced drive use, which returns it to resolving; there the live open-access
+// handoff is re-derived and offered. It returns the jobs left to focus. A
+// redrive the store refuses leaves its job parked and unfocused rather than
+// opened on the library route.
+func RediscoverManualDownloads(ctx context.Context, jobs *job.Store, openURLBaseFor func(string) (string, bool), jobIDs []string) ([]string, error) {
+	focus := make([]string, 0, len(jobIDs))
+	for _, jobID := range jobIDs {
+		revision, ok, err := jobs.OpenManualDownloadRediscovers(ctx, jobID, isOAHandoff)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			focus = append(focus, jobID)
+			continue
+		}
+		if _, err := jobs.RedriveInstitutionalHandoff(ctx, jobID, revision, openURLBaseFor, isOAHandoff, false,
+			app.InstitutionalOpenURLHandoffDetail); err != nil && !errors.Is(err, job.ErrConflict) {
+			return nil, err
+		}
+	}
+	return focus, nil
 }
 
 // RecordHandoffOpened leaves an auditable trace of who drove a human handoff

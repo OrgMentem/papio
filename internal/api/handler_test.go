@@ -894,6 +894,108 @@ func TestRouterActionsOpenQueuesCompatibleHandoff(t *testing.T) {
 	}
 }
 
+// Live 2026-09-24 (job_49a7…): the manual download that the PMC open-access
+// page left behind resolved, like every manual download, to the library's
+// OpenURL route, and that library had already reported no entitlement. An
+// operator's `papio actions open` on it must not open the library: the daemon
+// sends that job back to resolving, where the live open-access handoff is
+// re-derived, and `actions.open_plan` tells the CLI so beforehand. A plain
+// manual download keeps its library route.
+func TestRouterActionsOpenRediscoversAnOpenAccessManualDownload(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeDelegated
+	cfg.DataDir = storetest.DataDir(t)
+	cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
+	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+	system, err := bootstrap.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+	parkManual := func(requestID, doi, route string) (string, int64) {
+		t.Helper()
+		id, err := system.Jobs.CreateRequest(ctx, requestID, work.Work{DOI: doi}, "", "", job.Policy{
+			AccessMode: config.ModeDelegated, DesiredVersion: "any",
+		}, nil, job.PrincipalUnknown)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := system.Jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := system.Jobs.ParkWithHumanAction(ctx, id, job.StateResolving, job.StateAwaitingHuman, "openurl_handoff",
+			route, nil, job.Access(false, "anti_bot")); err != nil {
+			t.Fatal(err)
+		}
+		// The browser drove the handoff and could not work the page.
+		if _, err := system.Jobs.S.DB().ExecContext(ctx, `UPDATE human_actions SET status='resolved' WHERE job_id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := system.Jobs.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{"outcome": "ui_changed"}); err != nil {
+			t.Fatal(err)
+		}
+		manual, err := system.Jobs.OpenHumanAction(ctx, id, "manual_download",
+			"papio has no adapter for this provider yet; download the PDF yourself for now", job.Access(false, "landing_page"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id, manual
+	}
+	oa, oaManual := parkManual("request_api_oa_manual", "10.1000/oa-manual",
+		app.OABrowserHandoffActionDetail("https://pmc.example.org/articles/PMC1/"))
+	plain, _ := parkManual("request_api_plain_manual", "10.1000/plain-manual", app.InstitutionalOpenURLHandoffDetail)
+	router := Router(system)
+	const sessionID = "aaaabbbbccccddddeeeeffff00002222"
+	hello := json.RawMessage(`{"protocol":"papio-browser/1","type":"hello","msg_id":"client-oa-manual-001","seq":0,"payload":{"extension_version":"0.8.0"}}`)
+	if rpcErr := callMethod(t, router, "browser.sync",
+		map[string]any{"session_id": sessionID, "messages": []json.RawMessage{hello}}, nil); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+
+	var plan ActionsOpenPlanResult
+	if rpcErr := callMethod(t, router, "actions.open_plan", map[string]any{"job_ids": []string{oa, plain}}, &plan); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !slices.Equal(plan.Rediscover, []string{oa}) {
+		t.Fatalf("plan = %+v, want only the open-access manual download rediscovered", plan)
+	}
+	if row, err := system.Jobs.Get(ctx, oa); err != nil || row.State != job.StateAwaitingHuman {
+		t.Fatalf("the plan changed the job: %+v, %v", row, err)
+	}
+
+	var opened ActionsOpenResult
+	if rpcErr := callMethod(t, router, "actions.open", map[string]any{"job_ids": []string{oa, plain}}, &opened); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if !opened.SessionLive || opened.Queued != 1 {
+		t.Fatalf("actions.open = %+v, want only the plain manual download focused", opened)
+	}
+	row, err := system.Jobs.Get(ctx, oa)
+	if err != nil || row.State != job.StateResolving {
+		t.Fatalf("open-access manual download job = %+v, %v; want resolving", row, err)
+	}
+	var status string
+	if err := system.Jobs.S.DB().QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, oaManual).Scan(&status); err != nil || status != "resolved" {
+		t.Fatalf("open-access manual download status=%q err=%v", status, err)
+	}
+	open, err := system.Jobs.ListOpenHumanActionsForJobs(ctx, []string{oa})
+	if err != nil || len(open) != 0 {
+		t.Fatalf("open actions = %+v, %v; want no library handoff", open, err)
+	}
+	var polled struct {
+		Outbound []json.RawMessage `json:"outbound"`
+	}
+	if rpcErr := callMethod(t, router, "browser.sync", map[string]any{"session_id": sessionID}, &polled); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	for _, raw := range polled.Outbound {
+		if msg, err := protocol.DecodeBrowserMessage(raw); err == nil && msg.JobID == oa {
+			t.Fatalf("the open-access manual download was offered to the browser: %s", msg.Type)
+		}
+	}
+}
+
 func TestRouterBrowserSessionsAndClaim(t *testing.T) {
 	system := testSystem(t)
 	router := Router(system)
