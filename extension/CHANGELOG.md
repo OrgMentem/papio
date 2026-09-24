@@ -72,6 +72,12 @@ for the full pre-split extension history.
   open. *papio* closes a paper's tab that it no longer drives after 30
   minutes, and a security check in the PDF tab can take longer than that.
   The PDF tab now stays watched while *papio* still works on the paper.
+- **Firefox also saves a one-time PDF that a page shows inside itself.**
+  After a security check, ScienceDirect can show the PDF inside the article
+  page instead of in its own tab. Firefox saved the PDF when it filled a tab
+  or a frame of the page, but not when the page held it in an `<object>` or
+  `<embed>` element. It now saves that PDF too, with the same checks. A PDF
+  that a page's own script downloads is still not saved.
 - **A ScienceDirect PDF that you open yourself no longer stops papio's
   paper.** While *papio* worked on a ScienceDirect paper, any signed
   ScienceDirect PDF that you opened in a tab of your own counted as that

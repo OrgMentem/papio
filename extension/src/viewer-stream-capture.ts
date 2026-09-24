@@ -27,6 +27,15 @@
  *   channels (a tail request, or the whole file where the server serves 206),
  *   yet the original response still runs to completion through the filter,
  *   even when those Range requests get HTML.
+ *
+ * Firefox's viewer can be a top-level tab, an <iframe> (`sub_frame`), or an
+ * <object> or <embed> (`object`), and the listener takes all three. On
+ * 2026-09-24 a ScienceDirect article reached through a Cloudflare check
+ * rendered its PDF in a pdf.js viewer inside the page, not as a top-level
+ * tab; which element held it was not recorded. A PDF that a page script
+ * fetches itself (`xmlhttprequest`) stays outside the capture: a blocking
+ * listener on every script request would wake the event page for each one,
+ * in every tab.
  */
 import { matchesViewerDownloadRule } from "./viewer-download-rule";
 
@@ -64,7 +73,7 @@ export interface ViewerCaptureWebRequest {
   onHeadersReceived: {
     addListener(
       callback: (details: ViewerHeadersDetails) => Record<string, never> | Promise<Record<string, never>>,
-      filter: { urls: string[]; types: ("main_frame" | "sub_frame")[] },
+      filter: { urls: string[]; types: ("main_frame" | "sub_frame" | "object")[] },
       extraInfoSpec: ("blocking" | "responseHeaders")[],
     ): void;
   };
@@ -121,7 +130,7 @@ export class ViewerStreamCapture {
     this.bound = true;
     webRequest.onHeadersReceived.addListener(
       (details) => this.onHeadersReceived(details),
-      { urls: ["https://*/*"], types: ["main_frame", "sub_frame"] },
+      { urls: ["https://*/*"], types: ["main_frame", "sub_frame", "object"] },
       ["blocking", "responseHeaders"],
     );
   }

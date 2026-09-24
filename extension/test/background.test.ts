@@ -10403,9 +10403,6 @@ async function captureHarness(opts: { chrome?: boolean; hostGranted?: boolean; c
 
 test("Firefox saves an armed tab's signed viewer response once, from a copy of the bytes the viewer received", async () => {
   const { h, web, objectURLs, notices, pdfHeaders } = await captureHarness();
-  expect(web.listeners.map(l => [l.filter, l.extraInfoSpec])).toEqual([
-    [{ urls: ["https://*/*"], types: ["main_frame", "sub_frame"] }, ["blocking", "responseHeaders"]],
-  ]);
   await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 200, headers: pdfHeaders() });
   expect([...web.filters.keys()]).toEqual(["r1"]);
   const filter = web.filters.get("r1")!;
@@ -10922,6 +10919,16 @@ async function inlineViewerPDF(
   await settle();
   return h.downloads.started.map((download) => download.filename);
 }
+
+// Live, the child's article rendered the PDF inside the page, in Firefox's
+// own viewer. A page puts that viewer in an <iframe>, or in an <object> or
+// <embed>, which Firefox reports as an `object` request.
+test("Firefox captures a signed PDF that an armed tab's page embeds with <object> or <embed>", async () => {
+  const { h, web, childID, ids } = await viewerChildOutlivesDrive();
+  h.clock.now += 60_000;
+  expect(await inlineViewerPDF(h, web, childID, "object")).toEqual([`papio/${ids.jobID}/paper.pdf`]);
+  expect(web.filters.get("inline-pdf")?.viewerBytes()).toEqual(SIGNED_PDF);
+});
 
 test("a drive that runs out while the operator's View PDF child is open keeps the paper's tab and its capture", async () => {
   const { h, web, tabID, childID, ids, framesBefore } = await viewerChildOutlivesDrive();

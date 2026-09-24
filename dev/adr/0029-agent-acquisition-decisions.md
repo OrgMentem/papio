@@ -155,3 +155,13 @@ Residual gap: the capture sees only a response that arrives after papio armed
 the tab. A PDF opened before that, or on a host papio has no access to, has
 already spent its one response. The viewer's own Download button can still keep
 a copy, but Firefox gives papio no way to file that download.
+
+Armed-child amendment (2026-09-24, job_272d01737a): a View PDF child tab stays
+armed while its job can still take the one viewer response, whether or not its
+opener is still open, and a handoff-drive timeout that finds such a child alive
+only releases the drive slot instead of re-queueing the job and closing its
+tab. The listener takes `main_frame`, `sub_frame` and `object` responses, so a
+PDF that Firefox's viewer shows inside a page is captured too. A PDF that a
+page script fetches (`xmlhttprequest`) is outside the capture by design: a
+blocking listener on every script request would wake the event page for each
+one, in every tab.
