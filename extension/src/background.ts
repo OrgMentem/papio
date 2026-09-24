@@ -19261,11 +19261,16 @@ export class Bridge {
       if (!(await awaitPageReady())) return;
       let identityReobserved = false;
       let refusalRechecked = false;
+      // The first document may lack any DOI claim. Then its one explicit PDF
+      // link is the only permitted effect, the bytes must pass daemon
+      // validation, and the allowance holds only while that page stays so.
+      let identityMissingPDF = false;
       for (let decisions = 0; decisions < 60 && authorized();) {
         if (!(await liveTab()) || !authorized()) return;
         const observed = (await this.deps.scripting.executeScript({
           target: { tabId: job.tab_id }, func: agentDOM,
-          args: [{ method: "observe", entryURL: entryURL!, doi: job.expected!.doi!, allowNavigation: navigationAvailable(), ...(documentID ? { document: documentID } : {}) } satisfies AgentDOMRequest],
+          args: [{ method: "observe", entryURL: entryURL!, doi: job.expected!.doi!, allowNavigation: navigationAvailable(), ...(documentID ? { document: documentID } : {}),
+            ...(documentID === undefined || identityMissingPDF ? { identityMissingPDF: true } : {}) } satisfies AgentDOMRequest],
         }))[0]?.result as AgentDOMResult | undefined;
         if (!authorized()) return;
         if (observed?.status !== "observed") {
@@ -19304,6 +19309,7 @@ export class Bridge {
           return;
         }
         documentID = observed.document;
+        identityMissingPDF = observed.identityMissingPDF === true;
         visitedDocuments.add(documentID);
         visitedURLs.add(entryURL!);
         const observation = observed.observation;
@@ -19349,7 +19355,7 @@ export class Bridge {
         if (navigationAvailable()) {
           const prepared = (await this.deps.scripting.executeScript({ target: { tabId: job.tab_id }, func: agentDOM,
             args: [{ method: "prepare", entryURL: entryURL!, doi: job.expected!.doi!, document: documentID,
-              revision: observation.revision, choice, allowNavigation: true } satisfies AgentDOMRequest],
+              revision: observation.revision, choice, allowNavigation: true, ...(identityMissingPDF ? { identityMissingPDF: true } : {}) } satisfies AgentDOMRequest],
           }))[0]?.result as AgentDOMResult | undefined;
           if (!authorized()) return;
           if (prepared?.status !== "prepared") {
@@ -19442,7 +19448,8 @@ export class Bridge {
         const dispatch = this.deps.scripting.executeScript({
           target: { tabId: job.tab_id }, func: agentDOM,
           args: [{ method: "act", entryURL: entryURL!, doi: job.expected!.doi!, document: documentID,
-            revision: observation.revision, choice, allowNavigation: navigationAvailable(), actionDeadline, ...(destination === undefined ? {} : { destination }) } satisfies AgentDOMRequest],
+            revision: observation.revision, choice, allowNavigation: navigationAvailable(), actionDeadline, ...(destination === undefined ? {} : { destination }),
+            ...(identityMissingPDF ? { identityMissingPDF: true } : {}) } satisfies AgentDOMRequest],
         }).catch(error => { if (!navigation) throw error; return []; });
         const action = (await (navigation ? Promise.race([dispatch, navigation.stopped.then(() => [])]) : dispatch))[0]?.result as AgentDOMResult | undefined;
         if (navigation) {

@@ -27,6 +27,7 @@ function setup(html = fixture, url = entryURL) {
 }
 const observe = () => agentDOM({ method: "observe", entryURL, doi });
 const observeMetadataOnly = () => agentDOM({ method: "observe", entryURL: metadataOnlyURL, doi });
+const observeMetadataOnlyFlag = () => agentDOM({ method: "observe", entryURL: metadataOnlyURL, doi, identityMissingPDF: true });
 function observed(result: AgentDOMResult) {
   if (result.status !== "observed") throw new Error(result.status);
   return result;
@@ -308,6 +309,38 @@ test("a longer DOI in the bound URL cannot identify its prefix", async () => {
 test("a bound URL without the requested DOI still needs article identity", async () => {
   setup("<main><button>Download PDF</button></main>", metadataOnlyURL);
   expect(await observeMetadataOnly()).toEqual({ status: "blocked", reason: "identity_missing" });
+});
+// An aggregator record page states no DOI at all. With the worker's
+// identity-missing allowance, exactly one explicit same-origin PDF link is
+// the only permitted effect; without the allowance the page stays refused.
+test("an identity-missing page exposes only its single explicit PDF link", async () => {
+  const win = setup(`<main><h1>Example article</h1><a href="https://ebooks.iospress.nl/article.pdf">Download PDF</a><button type="button">Formats</button><button type="button">Cite</button></main>`, metadataOnlyURL);
+  expect(await agentDOM({ method: "observe", entryURL: metadataOnlyURL, doi })).toEqual({ status: "blocked", reason: "identity_missing" });
+  const first = observed(await observeMetadataOnlyFlag());
+  expect(first.identityMissingPDF).toBe(true);
+  expect(first.observation.controls.map(c => c.label)).toEqual(["Download PDF [Example article]"]);
+  let clicks = 0;
+  win.document.querySelector("a")!.addEventListener("click", event => { event.preventDefault(); clicks++; });
+  const choice = first.observation.controls[0]!.id;
+  // No navigation exists in this mode, so the click dispatches without a prepare.
+  expect(await agentDOM({ method: "act", entryURL: metadataOnlyURL, doi, identityMissingPDF: true, document: first.document, revision: first.observation.revision, choice }))
+    .toEqual({ status: "dispatched", downloadExpected: true });
+  expect(clicks).toBe(1);
+});
+
+for (const [name, html] of [
+  ["a foreign DOI", `<meta name="citation_doi" content="10.9999/other"><main><a href="https://ebooks.iospress.nl/article.pdf">Download PDF</a></main>`],
+  ["an invalid expected DOI", `<main><a href="https://ebooks.iospress.nl/article.pdf">Download PDF</a></main>`],
+  ["two PDF links to different files", `<main><a href="https://ebooks.iospress.nl/one.pdf">Download PDF</a><a href="https://ebooks.iospress.nl/two.pdf">Download PDF</a></main>`],
+  ["a PDF link only in references", `<main><section><h2>References</h2><a href="https://ebooks.iospress.nl/article.pdf">Download PDF</a></section></main>`],
+  ["a cross-origin PDF link", `<main><a href="https://cdn.example/article.pdf">Download PDF</a></main>`],
+  ["a supplementary PDF link", `<main><a href="https://ebooks.iospress.nl/supplement.pdf">Supplementary PDF</a></main>`],
+] as const) test(`an identity-missing allowance refuses ${name}`, async () => {
+  setup(html, metadataOnlyURL);
+  const request = name === "an invalid expected DOI"
+    ? { method: "observe", entryURL: metadataOnlyURL, doi: "PRIVATEINVALID", identityMissingPDF: true } as const
+    : { method: "observe", entryURL: metadataOnlyURL, doi, identityMissingPDF: true } as const;
+  expect(await agentDOM(request)).toEqual({ status: "blocked", reason: name === "a foreign DOI" ? "identity_conflicting" : name === "an invalid expected DOI" ? "identity_invalid" : "identity_missing" });
 });
 
 for (const [suffix, expected] of [

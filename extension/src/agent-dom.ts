@@ -21,6 +21,11 @@ export interface AgentDOMRequest {
   actionDeadline?: number;
   /** Only the worker's unchanged-source navigation wait can resume this menu. */
   resumeNavigation?: boolean;
+  /** Worker-only, for the first document of an attempt. A page that states no
+   * DOI at all (never a foreign or invalid one) may expose exactly one explicit
+   * same-origin PDF link, and nothing else: no navigation, no other control.
+   * The downloaded bytes, not the page, must then establish identity. */
+  identityMissingPDF?: boolean;
 }
 /** Fixed public diagnostics only; never include page text or identity values. */
 export type AgentDOMRefusalReason =
@@ -29,7 +34,7 @@ export type AgentDOMRefusalReason =
   | "credentials_required" | "challenge_required" | "consent_required"
   | "payment_required" | "human_action_required" | "invalid_request";
 export type AgentDOMResult =
-  | { status: "observed"; document: string; observation: AgentObservation }
+  | { status: "observed"; document: string; observation: AgentObservation; identityMissingPDF?: true }
   | { status: "pdf_observed"; document: string; revision: string }
   | { status: "prepared"; effect: "local" | "navigate"; destination?: string }
   | { status: "dispatched"; downloadExpected: boolean; menuPending?: true }
@@ -48,6 +53,9 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   catch { return { status: "blocked", reason: "page_binding_failed" }; }
   const binding = JSON.stringify([entry.origin, entry.pathname, doi]);
   const pdfWrapper = request.method === "observe_pdf" || request.method === "act_pdf";
+  // Set by validate(): this page carries no DOI claim and the worker allowed
+  // its single explicit PDF link to stand in for identity until validation.
+  let identityMissing = false;
   const host = globalThis as typeof globalThis & { papioArticleAgent?: {
     node: Document; document: string; binding: string; ids: WeakMap<Element, string>; next: number; serial: number;
     consumed: Set<string>;
@@ -132,12 +140,23 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     return /\b(cookies?|privacy (?:notice|preferences|settings)|tracking)\b/i.test(text) &&
       !/\b(terms|licen[cs]e|agreement|purchase|buy|subscribe|password|sign[ -]?in|log[ -]?in)\b/i.test(text);
   };
+  // Reference and related-content regions name other works. Shared by the
+  // labelled-DOI reader and the identity-missing PDF link below.
+  const secondary = /(?:^|[\s_-])(?:refs?|references?|bibliograph(?:y|ies)|citations?|related|recommended|recommendations?)(?:$|[\s_-])/i;
+  const secondaryHeading = /^(?:references?|bibliography|citations?|related (?:articles?|content)|recommended (?:articles?|content)|more like this|further reading)\b/i;
+  const headingSelector = 'h1,h2,h3,h4,h5,h6,[role="heading"]';
+  const sectionSelector = 'section,article,aside,main,[role="region"],[role="main"]';
+  const secondaryRegion = (element: Element) => {
+    if (element.closest('blockquote,cite,[itemprop~="citation"],[role="doc-biblioref"],[role="doc-bibliography"],[role="doc-endnotes"]')) return true;
+    for (let node: Element | null = element; node; node = node.parentElement) {
+      if (secondary.test([node.id, node.getAttribute("class"), node.getAttribute("aria-label"), node.getAttribute("itemprop")].join(" "))) return true;
+      const heading = node.matches(sectionSelector) ? Array.from(node.children).find(child => child.matches(headingSelector)) : undefined;
+      if (heading && secondaryHeading.test(publicText(heading).trim())) return true;
+    }
+    return false;
+  };
   const primaryArticleDOIs = (): string[] => {
     const claims: string[] = [];
-    const secondary = /(?:^|[\s_-])(?:refs?|references?|bibliograph(?:y|ies)|citations?|related|recommended|recommendations?)(?:$|[\s_-])/i;
-    const secondaryHeading = /^(?:references?|bibliography|citations?|related (?:articles?|content)|recommended (?:articles?|content)|more like this|further reading)\b/i;
-    const headingSelector = 'h1,h2,h3,h4,h5,h6,[role="heading"]';
-    const sectionSelector = 'section,article,aside,main,[role="region"],[role="main"]';
     const labels = ["main", "article", '[role="main"]'].flatMap(scope => ["strong", "b", "span"].map(tag => `${scope} ${tag}`)).join(",");
     for (const name of document.querySelectorAll(labels)) {
       // A property field, not a DOI mentioned in prose or a reference link:
@@ -181,6 +200,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     return claims;
   };
   const validate = (): AgentDOMRefusalReason | undefined => {
+    identityMissing = false;
     const current = new URL(location.href);
     if (entry.protocol !== "https:" || current.protocol !== "https:" || entry.username || entry.password || current.username || current.password || current.origin !== entry.origin || current.pathname !== entry.pathname) return "page_binding_failed";
     if (request.allowNavigation && current.href !== entry.href) return "page_binding_failed";
@@ -224,7 +244,12 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
           }
         }
       } catch { /* Malformed escapes cannot establish article identity. */ }
-      if (!hasURLDOI) return claims.length ? "identity_conflicting" : "identity_missing";
+      if (!hasURLDOI && claims.length) return "identity_conflicting";
+      // No claim at all is the only state the worker's PDF allowance covers.
+      // Every gate below still applies; snapshot() then requires the single
+      // explicit PDF link and offers nothing else.
+      if (!hasURLDOI && (request.identityMissingPDF !== true || pdfWrapper || request.method === "check_menu")) return "identity_missing";
+      identityMissing = !hasURLDOI;
     }
     // Visible credential/payment entry is a human gate. Ordinary search and
     // newsletter fields are unrelated; their values are never projected.
@@ -339,7 +364,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     element === anchor && /\bpdf\b/i.test(label(anchor)) && /(?:\.pdf|\/pdf)$/i.test(new URL(anchor.href).pathname);
   const navigationTarget = (element: Element): string | undefined => {
     const anchor = element.closest<HTMLAnchorElement>("a[href]");
-    if (!request.allowNavigation || element !== anchor || anchor.hasAttribute("download") || explicitPDFLink(element, anchor)) return undefined;
+    if (!request.allowNavigation || identityMissing || element !== anchor || anchor.hasAttribute("download") || explicitPDFLink(element, anchor)) return undefined;
     const url = new URL(anchor.href);
     return url.pathname !== entry.pathname || url.search !== location.search ? url.href : undefined;
   };
@@ -378,13 +403,23 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
     const reason = validate();
     if (reason) return { status: "blocked" as const, reason };
     const notices = Array.from(document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"]')).filter(cookieNotice);
-    const candidates = Array.from(document.querySelectorAll(selector)).filter(element =>
+    const visibleControls = Array.from(document.querySelectorAll(selector)).filter(element =>
       element.namespaceURI === "http://www.w3.org/1999/xhtml" && !sensitiveForm(element) && element.closest(scope) && !element.closest(privateSelector) && visible(element) &&
       (!element.matches(fields) || element.matches(native)) && (element.matches(native) || !element.querySelector(selector)) &&
       !notices.some(notice => notice.contains(element)) &&
       !/\b(my account|sign[ -]?(?:in|out)|log[ -]?(?:in|out)|profile)\b/i.test(label(element)))
       .map(element => ({ element, ownLabel: label(element) }))
       .filter(({ ownLabel }) => hasPublicLabel(ownLabel));
+    // Without a DOI claim the page cannot say which work a control fetches, so
+    // the model may not choose between works: only enabled explicit PDF links
+    // outside reference and related regions, all naming one file, survive.
+    // A list of several (search results, an issue, a book's chapters) keeps
+    // the page refused. Validation of the bytes decides identity.
+    const candidates = identityMissing ? visibleControls.filter(({ element }) => {
+      const anchor = element.closest<HTMLAnchorElement>("a[href]");
+      return anchor !== null && explicitPDFLink(element, anchor) && allowed(element) && !disabled(element) && !secondaryRegion(element);
+    }) : visibleControls;
+    if (identityMissing && new Set(candidates.map(({ element }) => (element as HTMLAnchorElement).href)).size !== 1) return { status: "blocked" as const, reason: "identity_missing" as const };
     const targets = new Map<string, Element>();
     const fingerprints: unknown[] = [];
     const controls = candidates.map(({ element, ownLabel }) => {
@@ -407,8 +442,8 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
       .filter(node => node.getAttribute("name")?.trim().toLowerCase() === name)
       .map(node => safe(node.getAttribute("content"), 400))).find(hasPublicLabel) ?? "";
     const projection = { doi, title, controls: controls.slice(0, 80) };
-    const source = JSON.stringify([state.document, binding, location.href, document.baseURI, request.allowNavigation === true, projection, fingerprints]);
-    return { status: "snapshot" as const, projection, source, targets, controls };
+    const source = JSON.stringify([state.document, binding, location.href, document.baseURI, request.allowNavigation === true, identityMissing, projection, fingerprints]);
+    return { status: "snapshot" as const, projection, source, targets, controls, identityMissing };
   };
   const menuProgress = (view: Extract<ReturnType<typeof snapshot>, { status: "snapshot" }>, enabled: Set<string>) =>
     view.projection.controls.some(control => !control.disabled && !enabled.has(control.id) && /\bpdf\b/i.test(label(view.targets.get(control.id)!)));
@@ -501,7 +536,7 @@ export async function agentDOM(request: AgentDOMRequest): Promise<AgentDOMResult
   if (fresh.status === "blocked") return { status: "stale", reason: fresh.reason };
   if (state.serial !== serial || fresh.source !== current.source) return { status: "stale", reason: "observation_changed" };
   state.observed = { revision, source: fresh.source, targets: fresh.targets };
-  return { status: "observed", document: state.document, observation: { revision, ...fresh.projection } };
+  return { status: "observed", document: state.document, observation: { revision, ...fresh.projection }, ...(fresh.identityMissing ? { identityMissingPDF: true as const } : {}) };
 }
 
 /** Load state of the article-agent tab, never its content. */

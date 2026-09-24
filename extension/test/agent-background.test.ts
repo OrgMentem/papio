@@ -533,6 +533,42 @@ for (const firefox of [false, true]) for (const reason of ["identity_missing", "
     expect(retained.requires_auth).not.toBe(true); expect(retained.engagement_required).not.toBe(true);
     expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
   });
+// An aggregator page that states no DOI (measured on ProQuest, EBSCO and
+// Informit record pages) still cannot identify the work itself. When its one
+// explicit PDF link is the only eligible control, the worker lets the model
+// take only that download; the daemon's byte validation decides identity.
+test("an identity-missing page with one explicit PDF link proceeds to exactly that download", async () => {
+  const pageURL = "https://unregistered.example/record/abc";
+  const h = await harness({ page: { url: pageURL,
+    html: `<main><h1>Example article</h1><a href="https://unregistered.example/record/abc.pdf">Download PDF</a><button type="button">Export citation</button></main>`,
+    doi } });
+  await h.classify(); await h.started();
+  const frame = await h.request("agent_decide_request_v1");
+  const observation = frame.payload["observation"] as { revision: string; controls: { id: string; label: string; disabled: boolean }[] };
+  expect(observation.controls.filter(c => !c.disabled).map(c => c.label)).toEqual(["Download PDF [Example article]"]);
+  h.setOnAct(async () => {
+    await h.downloads.onCreated.emit({ id: 917, tabId: tabID, url: "https://unregistered.example/record/abc.pdf", state: "in_progress" });
+  });
+  await h.reply(frame, "agent_decide_result_v1", { observation_revision: observation.revision, outcome: "decision", choice: observation.controls[0]!.id });
+  await until(() => h.counts().actions === 1);
+  await flush();
+  expect(h.backend.store.activeJobs[0]?.generic_drive_epoch?.in_flight_download_id).toBe(917);
+  expect(h.counts().observations).toBe(1);
+  expect(h.frames.some(frame => frame.type === "provider_outcome" || frame.type === "provider_drive_epoch_result_request")).toBe(false);
+});
+
+test("an identity-missing page with a foreign DOI still refuses its PDF link", async () => {
+  const pageURL = "https://unregistered.example/record/abc";
+  const h = await harness({ page: { url: pageURL,
+    html: `<meta name="citation_doi" content="10.9999/other"><main><h1>Example article</h1><a href="https://unregistered.example/record/abc.pdf">Download PDF</a></main>`,
+    doi } });
+  await h.classify(); await h.started(); await h.settle();
+  const detail = h.frames.find(frame => frame.type === "provider_outcome")?.payload["detail"];
+  expect(detail).toContain("[identity_conflicting]");
+  expect(h.frames.some(frame => frame.type === "agent_decide_request_v1")).toBe(false);
+  expect(h.counts().actions).toBe(0);
+  expect(h.downloads.started).toHaveLength(0);
+});
 
 // The cookie-check shell pmc.ncbi.nlm.nih.gov served ~1 s after navigation on
 // 2026-09-23 (607 bytes, no DOI), reduced to its public markup.

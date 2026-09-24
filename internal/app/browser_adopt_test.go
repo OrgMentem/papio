@@ -327,6 +327,131 @@ func parkAwaitingHuman(t *testing.T, jobs *job.Store, reqID string) string {
 	return id
 }
 
+// An agent that clicks the single PDF link on a page with no DOI claim hands
+// papio bytes whose identity must be judged in full: a download of a
+// different paper must never become ready. The adopted file's printed DOI
+// contradicts the job's, so the job parks for a human identity check.
+func TestAdoptDownloadOfWrongPaperStaysNotReady(t *testing.T) {
+	svc, jobs := newTestService(t)
+	excerpt := "DOI: 10.9999/other-paper\nSome unrelated title and content\n"
+	svc.Validate = func(_ context.Context, _, _ string, target work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 8},
+			Text:       pdf.TextReport{Chars: int64(len(excerpt)), Excerpt: excerpt},
+			Identity:   pdf.MatchIdentity(excerpt, target),
+		}, nil
+	}
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_wrong_paper")
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pdf.MatchIdentity(excerpt, row.Work); got.Result == pdf.IdentityPass {
+		t.Fatalf("fixture accepted as the requested work: %v", got.Evidence)
+	}
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "agent-single-link.pdf")
+	if err := os.WriteFile(path, pdfBytes("agent acquired wrong paper"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	after, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State == job.StateReady || after.ArtifactSHA256 != "" {
+		t.Fatalf("wrong paper adopted as ready: state=%s artifact=%s", after.State, after.ArtifactSHA256)
+	}
+	if after.State != job.StateNeedsReview {
+		t.Fatalf("rejected adoption state = %s, want needs_review", after.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == id && action.Kind == "verify_identity" && action.Status == "open" {
+			return
+		}
+	}
+	t.Fatal("missing verify_identity action for the contradicted download")
+}
+
+// Same protection one layer down: the bytes print no DOI at all but a
+// wholly different title, so the identity rules reject them outright and the
+// job re-parks for a different file instead of fetching forever.
+func TestAdoptDownloadOfUntitledWrongPaperReparksForAnotherFile(t *testing.T) {
+	svc, jobs := newTestService(t)
+	excerpt := "Methods for Cultivating Greenhouse Tomatoes\nby Robert Smith\n2021\n"
+	svc.Validate = func(_ context.Context, _, _ string, target work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 8},
+			Text:       pdf.TextReport{Chars: int64(len(excerpt)), Excerpt: excerpt},
+			Identity:   pdf.MatchIdentity(excerpt, target),
+		}, nil
+	}
+	ctx := context.Background()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_untitled_wrong_paper")
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.EnrichWorkRequestMetadata(ctx, row.WorkRequestID,
+		"SUVA: A Probabilistic Framework for Auditing LLMs with an Application to Social Preferences",
+		[]string{"Yan Leng", "Yuan Yuan"}, 2026); err != nil {
+		t.Fatal(err)
+	}
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pdf.MatchIdentity(excerpt, row.Work); got.Result != pdf.IdentityReject {
+		t.Fatalf("fixture is not a hard reject: %+v", got)
+	}
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "agent-single-link.pdf")
+	if err := os.WriteFile(path, pdfBytes("agent acquired wrong paper"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, path); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	after, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State == job.StateReady || after.ArtifactSHA256 != "" {
+		t.Fatalf("wrong paper adopted as ready: state=%s artifact=%s", after.State, after.ArtifactSHA256)
+	}
+	if after.State != job.StateAwaitingHuman {
+		t.Fatalf("rejected adoption state = %s, want awaiting_human", after.State)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range actions {
+		if action.JobID == id && action.Kind == "manual_download" && action.Status == "open" {
+			if got := actionDiagnosis(t, jobs, action.ID); got != job.DiagnosisReasonAdoptedPDFInvalid {
+				t.Fatalf("diagnosis = %q, want %q", got, job.DiagnosisReasonAdoptedPDFInvalid)
+			}
+			return
+		}
+	}
+	t.Fatal("missing replacement manual_download action")
+}
+
 func TestAdoptDownloadRejectsPathOutsideAdoptionRoot(t *testing.T) {
 	svc, jobs := newTestService(t)
 	svc.Validate = passValidation()

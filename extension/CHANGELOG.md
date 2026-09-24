@@ -17,6 +17,16 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+- **The article agent can take the one PDF link on a page that names no
+  DOI.** Aggregator record pages (ProQuest, EBSCO, Informit) and some
+  publisher pages state no DOI at all, so the agent stopped there. Now, on
+  the first page only, when it carries no DOI claim of any kind and exposes
+  exactly one explicit same-origin PDF link, the agent may click only that
+  link: no navigation and no other control. A page that names a different
+  DOI is still refused, and a page with several PDF links (search results,
+  an issue, a book's chapters) stays refused. The downloaded file still
+  passes papio's full PDF identity check before it can become the paper, so
+  a wrong file parks for review instead of filing itself.
 - **Firefox saves a publisher's one-time PDF link itself.** Some publishers,
   such as ScienceDirect, send a signed PDF only once: a second request returns
   a web page. In a tab *papio* opened for a paper, Firefox now keeps a copy of
