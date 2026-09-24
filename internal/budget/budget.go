@@ -613,7 +613,7 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 	_, err = tx.ExecContext(ctx, `UPDATE source_budgets
 		SET window_start = ?, requests_in_window = ?, spent_usd = ?,
 		    next_allowed_at = CASE WHEN next_allowed_at <= ? THEN NULL ELSE next_allowed_at END
-		WHERE source = ? AND identity = ?`, window, requests+1, spent+cost, now.Format(time.RFC3339Nano), source, identity)
+		WHERE source = ? AND identity = ?`, window, requests+1, spent+cost, store.FormatTime(now), source, identity)
 	if err != nil {
 		return err
 	}
@@ -644,7 +644,7 @@ func (m *Manager) Defer(ctx context.Context, source string, policy config.Source
 		ON CONFLICT(source, identity) DO UPDATE SET next_allowed_at =
 		CASE WHEN next_allowed_at IS NULL OR next_allowed_at < excluded.next_allowed_at
 		     THEN excluded.next_allowed_at ELSE next_allowed_at END`,
-		source, identityFor(policy), m.now().UTC().Format("2006-01"), until.Format(time.RFC3339Nano))
+		source, identityFor(policy), m.now().UTC().Format("2006-01"), store.FormatTime(until))
 	return err
 }
 

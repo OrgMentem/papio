@@ -152,9 +152,9 @@ func recordProfileEvidenceTx(ctx context.Context, q dbtx, observation *ProfileEv
 	if err != nil {
 		return err
 	}
-	observation.DaemonReceivedAt = received.Format(time.RFC3339Nano)
-	observation.ProducerObservedAt = produced.Format(time.RFC3339Nano)
-	observation.ExpiresAt = received.Add(ProfileEvidenceTTL).Format(time.RFC3339Nano)
+	observation.DaemonReceivedAt = store.FormatTime(received)
+	observation.ProducerObservedAt = store.FormatTime(produced)
+	observation.ExpiresAt = store.FormatTime(received.Add(ProfileEvidenceTTL))
 	var liveProfile int
 	if err := q.QueryRowContext(ctx, `SELECT 1 FROM institution_profiles
 		WHERE id = ? AND revision = ? AND (tombstoned_at IS NULL OR tombstoned_at = '')`,
@@ -218,7 +218,7 @@ func (js *Store) CurrentProfileEvidence(ctx context.Context, profileID string, p
 			&o.InstitutionProfileRevision, &o.Verdict, &o.Source, &o.ProducerObservedAt,
 			&o.DaemonReceivedAt, &o.ExpiresAt)
 	}
-	cutoff := time.Now().UTC().Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano)
+	cutoff := store.FormatTime(time.Now().Add(-ProfileEvidenceTTL))
 	args := []any{profileID, profileRevision, holderGeneration, cutoff}
 	err := scan(js.S.DB().QueryRowContext(ctx, `
 		SELECT observation_id, browser_holder_generation, institution_profile_id,
@@ -1130,8 +1130,8 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 		return nil, err
 	}
 	now := time.Now().UTC()
-	nowText := now.Format(time.RFC3339Nano)
-	untilText := in.LeaseUntil.UTC().Format(time.RFC3339Nano)
+	nowText := store.FormatTime(now)
+	untilText := store.FormatTime(in.LeaseUntil)
 	// An entry nobody has bound a surface to yet is not a sign-in in progress:
 	// it is a permission to open one, and it only has to outlive the
 	// grant -> open -> bind round trip (one browser poll plus a tab creation).
@@ -1147,7 +1147,7 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 	// sign-in is never cut short by this.
 	unboundUntil := untilText
 	if deadline := now.Add(AuthenticationEntryBindDeadline); in.LeaseUntil.After(deadline) {
-		unboundUntil = deadline.Format(time.RFC3339Nano)
+		unboundUntil = store.FormatTime(deadline)
 	}
 	row := q.QueryRowContext(ctx, authenticationEntryLeaseSelect+` WHERE authentication_claim_id = ?`, in.AuthenticationClaimID)
 	current, err := scanAuthenticationEntryLease(row.Scan)
@@ -1173,7 +1173,7 @@ func reserveAuthenticationEntryLeaseTx(ctx context.Context, q dbtx, in Authentic
 				ORDER BY CASE WHEN pe.verdict IN ('auth_returned','signed_out') THEN 1 ELSE 0 END DESC,
 				         pe.daemon_received_at DESC, pe.observation_id DESC LIMIT 1`,
 				in.AuthenticationClaimID, in.BrowserHolderGeneration,
-				now.Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano),
+				store.FormatTime(now.Add(-ProfileEvidenceTTL)),
 			).Scan(&verdict)
 			switch {
 			case errors.Is(evidenceErr, sql.ErrNoRows):
@@ -1437,7 +1437,7 @@ func convertAuthenticationEntryLeaseToHumanTx(ctx context.Context, q dbtx, authe
 		observed.Source != evidence.Source ||
 		observed.Verdict != ProfileEvidenceAuthReturned ||
 		observed.Source != ProfileEvidenceAuthReturn ||
-		observed.DaemonReceivedAt <= time.Now().UTC().Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano) {
+		observed.DaemonReceivedAt <= store.FormatTime(time.Now().Add(-ProfileEvidenceTTL)) {
 		return ErrAuthenticationEntryLeaseDenied
 	}
 	var profileMatchesClaim int
@@ -1460,7 +1460,7 @@ func convertAuthenticationEntryLeaseToHumanTx(ctx context.Context, q dbtx, authe
 		  AND verdict NOT IN ('unknown','inconclusive')
 		ORDER BY daemon_received_at DESC, observation_id DESC LIMIT 1`,
 		observed.InstitutionProfileID, observed.InstitutionProfileRevision, holderGeneration,
-		time.Now().UTC().Add(-ProfileEvidenceTTL).Format(time.RFC3339Nano),
+		store.FormatTime(time.Now().Add(-ProfileEvidenceTTL)),
 	).Scan(&currentObservationID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrAuthenticationEntryLeaseDenied
@@ -1492,7 +1492,7 @@ func convertAuthenticationEntryLeaseToHumanTx(ctx context.Context, q dbtx, authe
 		   AND browser_holder_generation=? AND state='reserved'
 		   AND (lease_until IS NULL OR lease_until > ?)`,
 		ownerID, observed.ObservationID,
-		time.Now().UTC().Add(AuthenticationEntryBindDeadline).Format(time.RFC3339Nano),
+		store.FormatTime(time.Now().Add(AuthenticationEntryBindDeadline)),
 		now, authenticationClaimID, leaseID, ownerID,
 		holderGeneration, now)
 	if err != nil {
@@ -1642,7 +1642,7 @@ func retireAuthenticationEntryLeaseAfterOwnerCloseTx(ctx context.Context, q dbtx
 		       owner_tab_hint=NULL, entitled_at=NULL, updated_at=?
 		 WHERE authentication_claim_id=? AND owner_binding_id=?
 		   AND state IN ('reserved','human')`,
-		now.UTC().Format(time.RFC3339Nano), authenticationClaimID, bindingID)
+		store.FormatTime(now), authenticationClaimID, bindingID)
 	return err
 }
 
@@ -1712,7 +1712,7 @@ func (js *Store) RetireTerminalAuthenticationEntryLeases(ctx context.Context, no
 		        AND p.effect_kind='institutional'
 		        AND p.status IN ('held','unknown_completion')
 		   )`,
-		now.UTC().Format(time.RFC3339Nano))
+		store.FormatTime(now))
 	if err != nil {
 		return 0, err
 	}
@@ -1737,7 +1737,7 @@ func (js *Store) RetireTerminalAuthenticationEntryLeases(ctx context.Context, no
 // The `updated_at` bound gives a NULL-lease legacy row the same window a fresh
 // reservation gets, rather than retiring it the instant the daemon starts.
 func (js *Store) ExpireUnboundAuthenticationEntryLeases(ctx context.Context, now time.Time) (int, error) {
-	nowText := now.UTC().Format(time.RFC3339Nano)
+	nowText := store.FormatTime(now)
 	result, err := js.S.DB().ExecContext(ctx, `
 		UPDATE authentication_entry_leases
 		   SET state='expired', lease_until=NULL, owner_tab_hint=NULL,
@@ -1747,7 +1747,7 @@ func (js *Store) ExpireUnboundAuthenticationEntryLeases(ctx context.Context, now
 		   AND (lease_until IS NULL OR lease_until <= ?)
 		   AND updated_at <= ?`,
 		nowText, nowText,
-		now.UTC().Add(-AuthenticationEntryBindDeadline).Format(time.RFC3339Nano))
+		store.FormatTime(now.Add(-AuthenticationEntryBindDeadline)))
 	if err != nil {
 		return 0, err
 	}
@@ -1796,8 +1796,8 @@ const StrandedBoundEntryGrace = 30 * time.Minute
 // never retired out from under itself. papio must never start a second attempt
 // across an irreversible effect.
 func (js *Store) ExpireStrandedBoundAuthenticationEntryLeases(ctx context.Context, now time.Time) (int, error) {
-	nowText := now.UTC().Format(time.RFC3339Nano)
-	staleBefore := now.UTC().Add(-StrandedBoundEntryGrace).Format(time.RFC3339Nano)
+	nowText := store.FormatTime(now)
+	staleBefore := store.FormatTime(now.Add(-StrandedBoundEntryGrace))
 	result, err := js.S.DB().ExecContext(ctx, `
 		UPDATE authentication_entry_leases
 		   SET state='expired', lease_until=NULL, owner_binding_id=NULL,

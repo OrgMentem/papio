@@ -988,7 +988,7 @@ func (js *Store) ClaimMaterialization(ctx context.Context, in MaterializationCla
 		(id, candidate_id, browser_holder_generation, materialization_kind, binding_id, tab_id, phase,
 		 route_issuance_ordinal, effect_ordinal, lease_until, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, 0, 'claimed', 0, 0, ?, ?, ?)`, claimID, in.CandidateID,
-		in.BrowserHolderGeneration, in.MaterializationKind, bindingID, in.LeaseUntil.UTC().Format(time.RFC3339Nano), now, now); err != nil {
+		in.BrowserHolderGeneration, in.MaterializationKind, bindingID, store.FormatTime(in.LeaseUntil), now, now); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return nil, ErrMaterializationBusy
 		}
@@ -1573,7 +1573,7 @@ func (js *Store) RenewMaterializationClaim(ctx context.Context, claimID string, 
 				SELECT COUNT(*) FROM events e
 				 WHERE e.job_id=c.job_id AND e.kind='job.retry_requested'
 			  )
-		  )`, leaseUntil.UTC().Format(time.RFC3339Nano),
+		  )`, store.FormatTime(leaseUntil),
 		store.Now(), claimID, holderGeneration, store.Now())
 	if err != nil {
 		return err
@@ -1592,7 +1592,7 @@ func (js *Store) RenewMaterializationClaim(ctx context.Context, claimID string, 
 // returns the rows it retired. Unexpired claims, including those from an older
 // holder generation, are never stolen by reconciliation.
 func (js *Store) ReconcileMaterializationClaims(ctx context.Context, now time.Time) ([]MaterializationClaim, error) {
-	stamp := now.UTC().Format(time.RFC3339Nano)
+	stamp := store.FormatTime(now)
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1689,7 +1689,7 @@ func (js *Store) AbandonTerminalMaterializations(ctx context.Context, now time.T
 	if len(jobIDs) == 0 {
 		return nil, nil
 	}
-	stamp := now.UTC().Format(time.RFC3339Nano)
+	stamp := store.FormatTime(now)
 	// One id per statement, like consumeCloseAuthorizationsTx: this package has
 	// no IN-clause idiom and the set is bounded by terminal jobs still holding a
 	// claim, so a built placeholder list would buy nothing.

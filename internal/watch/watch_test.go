@@ -207,7 +207,7 @@ func TestRecordDigestIsIdempotentAndNewestFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(digest) != 2 || digest[0].WorkKey != "second" || digest[1].WorkKey != "10.1000/first" || digest[0].FirstSeenAt != now.Format(time.RFC3339Nano) {
+	if len(digest) != 2 || digest[0].WorkKey != "second" || digest[1].WorkKey != "10.1000/first" || digest[0].FirstSeenAt != store.FormatTime(now) {
 		t.Fatalf("Digest() = %+v", digest)
 	}
 	if _, err := watches.Digest(ctx, created.ID+1, 100); !errors.Is(err, sql.ErrNoRows) {
@@ -594,7 +594,7 @@ func TestRunnerBackfillQueuesAndMarksRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.LastRunAt != now.Format(time.RFC3339Nano) || stored.ConsecutiveFailures != 0 {
+	if stored.LastRunAt != store.FormatTime(now) || stored.ConsecutiveFailures != 0 {
 		t.Fatalf("stored backfill run = %+v", stored)
 	}
 }

@@ -80,12 +80,10 @@ func (s *Store) FailureSummaries(ctx context.Context, limit int, byProvider bool
 		if err := rows.Scan(&jobID, &updatedAtText, &terminalReason, &source, &candidateURL, &eventKind, &detailJSON); err != nil {
 			return nil, false, err
 		}
-		// store.Now() formats with time.RFC3339Nano, which omits the fractional
-		// part entirely when nanoseconds are zero (…T00:00:01Z vs
-		// …T00:00:01.5Z). Byte-wise string comparison sorts 'Z' (0x5A) above
-		// '.' (0x2E), so a fraction-less timestamp would beat a genuinely later
-		// one with a fractional part — parse both sides so "most recent" is
-		// chronological, not lexical.
+		// Compare parsed times, not text: "most recent" must be chronological
+		// even for a row that holds a legacy variable-width RFC3339Nano value
+		// (…T00:00:01Z sorts after …T00:00:01.5Z byte-wise) rather than the
+		// fixed-width FormatTime form.
 		updatedAt, err := time.Parse(time.RFC3339Nano, updatedAtText)
 		if err != nil {
 			return nil, false, fmt.Errorf("parsing job %s updated_at: %w", jobID, err)

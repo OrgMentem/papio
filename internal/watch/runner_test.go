@@ -16,6 +16,7 @@ import (
 	"papio/internal/discovery"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
+	"papio/internal/store"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
@@ -659,8 +660,8 @@ func TestRunDueExecutesOnlyDueWatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotDue.LastRunAt != now.Format(time.RFC3339Nano) {
-		t.Fatalf("due watch LastRunAt = %q, want %q (due watch must have advanced)", gotDue.LastRunAt, now.Format(time.RFC3339Nano))
+	if gotDue.LastRunAt != store.FormatTime(now) {
+		t.Fatalf("due watch LastRunAt = %q, want %q (due watch must have advanced)", gotDue.LastRunAt, store.FormatTime(now))
 	}
 	if gotDue.ConsecutiveFailures != 0 {
 		t.Fatalf("due watch ConsecutiveFailures = %d, want 0", gotDue.ConsecutiveFailures)
@@ -669,12 +670,12 @@ func TestRunDueExecutesOnlyDueWatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotNotDue.LastRunAt == now.Format(time.RFC3339Nano) {
+	if gotNotDue.LastRunAt == store.FormatTime(now) {
 		t.Fatalf("not-due watch LastRunAt = %q, must not have advanced", gotNotDue.LastRunAt)
 	}
 	// Inverted predicate would either leave due unadvanced or advance notDue.
-	if gotNotDue.LastRunAt != now.Add(-23*time.Hour).Format(time.RFC3339Nano) {
-		t.Fatalf("not-due watch LastRunAt = %q, want %q (must not have run)", gotNotDue.LastRunAt, now.Add(-23*time.Hour).Format(time.RFC3339Nano))
+	if gotNotDue.LastRunAt != store.FormatTime(now.Add(-23*time.Hour)) {
+		t.Fatalf("not-due watch LastRunAt = %q, want %q (must not have run)", gotNotDue.LastRunAt, store.FormatTime(now.Add(-23*time.Hour)))
 	}
 	if len(lookup.requests) != 1 {
 		t.Fatalf("lookup requests = %d, want 1 (only due watch should have run)", len(lookup.requests))
@@ -737,14 +738,14 @@ func TestRunDueSwallowsPerWatchFailureAndContinues(t *testing.T) {
 	if gotFirst.ConsecutiveFailures != 1 || !contains(gotFirst.LastError, "discovery search") {
 		t.Fatalf("first watch failure = %+v, want RecordFailure with discovery error", gotFirst)
 	}
-	if gotFirst.LastRunAt != now.Format(time.RFC3339Nano) {
-		t.Fatalf("first watch LastRunAt = %q, want %q (RecordFailure advances last_run_at)", gotFirst.LastRunAt, now.Format(time.RFC3339Nano))
+	if gotFirst.LastRunAt != store.FormatTime(now) {
+		t.Fatalf("first watch LastRunAt = %q, want %q (RecordFailure advances last_run_at)", gotFirst.LastRunAt, store.FormatTime(now))
 	}
 	gotSecond, err := watches.Get(ctx, secondDue.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotSecond.ConsecutiveFailures != 0 || gotSecond.LastRunAt != now.Format(time.RFC3339Nano) {
+	if gotSecond.ConsecutiveFailures != 0 || gotSecond.LastRunAt != store.FormatTime(now) {
 		t.Fatalf("second watch = %+v, want successful MarkRun despite first failure", gotSecond)
 	}
 	digest, err := watches.Digest(ctx, secondDue.ID, 100)
@@ -806,8 +807,8 @@ func TestRunFailsWhenZotioReturnsFewerWorksThanRequests(t *testing.T) {
 	if stored.ConsecutiveFailures != 1 {
 		t.Fatalf("ConsecutiveFailures = %d, want 1 (fail-closed: no MarkRun, recorded via RecordFailure)", stored.ConsecutiveFailures)
 	}
-	if stored.LastRunAt != now.Format(time.RFC3339Nano) {
-		t.Fatalf("LastRunAt = %q, want %q (RecordFailure must advance last_run_at)", stored.LastRunAt, now.Format(time.RFC3339Nano))
+	if stored.LastRunAt != store.FormatTime(now) {
+		t.Fatalf("LastRunAt = %q, want %q (RecordFailure must advance last_run_at)", stored.LastRunAt, store.FormatTime(now))
 	}
 	if !contains(stored.LastError, "Zotio ownership lookup returned 1 results for 2 works") {
 		t.Fatalf("LastError = %q, want cardinality mismatch", stored.LastError)

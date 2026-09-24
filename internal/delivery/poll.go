@@ -460,10 +460,10 @@ func (s *Service) persistPollSuccess(ctx context.Context, req *Request, now time
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
 	origRef := req.ProviderReference
-	nowStr := now.UTC().Format(time.RFC3339Nano)
+	nowStr := store.FormatTime(now)
 	var nextCheckVal any
 	if !nextCheckAt.IsZero() {
-		nextCheckVal = nextCheckAt.UTC().Format(time.RFC3339Nano)
+		nextCheckVal = store.FormatTime(nextCheckAt)
 	}
 	state := origState
 	if newState != "" {
@@ -525,8 +525,8 @@ func (s *Service) persistPollFailure(ctx context.Context, req *Request, now time
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
 	origRef := req.ProviderReference
-	nowStr := now.UTC().Format(time.RFC3339Nano)
-	nextStr := nextCheck.UTC().Format(time.RFC3339Nano)
+	nowStr := store.FormatTime(now)
+	nextStr := store.FormatTime(nextCheck)
 	res, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET last_poll_at = ?, consecutive_poll_failures = ?, last_poll_error_class = ?, next_check_at = ?, updated_at = ?
@@ -558,7 +558,7 @@ func (s *Service) persistUnknownOutcome(ctx context.Context, req *Request, now t
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
 	origRef := req.ProviderReference
-	nowStr := now.UTC().Format(time.RFC3339Nano)
+	nowStr := store.FormatTime(now)
 
 	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -616,7 +616,7 @@ func (s *Service) persistProviderReference(ctx context.Context, req *Request, ne
 	origState := req.State
 	origNextCheckAt := req.NextCheckAt
 	origRef := req.ProviderReference
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	res, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests SET provider_reference = ?, updated_at = ?
 		WHERE id = ? AND state = ? AND COALESCE(next_check_at,'') = ? AND provider_reference = ?`,

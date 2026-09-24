@@ -95,6 +95,19 @@ execution records kept during the initial build.
   1 hour and 12 hours after each failed attempt. A paper that already used its
   five attempts before you upgrade does not try again by itself; import it
   with `papio zotio import-backfill --apply`.
+- **Times that *papio* compares inside one second are in the right order.**
+  *papio* keeps each time in its database as text and compares the text. The
+  text dropped the trailing zeros of the fraction of a second, so its order
+  was not the time order inside one second: `…:05Z` sorted after `…:05.1Z`.
+  A lease or a retry could look due or not due up to one second too early or
+  too late, a count over a period could take or miss an event at the ends of
+  the period, and a list could show two events of one second in the wrong
+  order. *papio* now writes every time with exactly nine digits after the
+  second, and database migration 56 rewrites the times that are already
+  stored. It also corrects the start and update times of a few PDF captures
+  that were stored in local time and in another form. Times that come from
+  the database, for example in `--json` output, now show all nine digits
+  (`…:05.595612000Z`).
 
 ## [0.22.1] - 2026-09-23
 

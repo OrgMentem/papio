@@ -22,7 +22,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func schema33Fixture(t *testing.T, seed string) string {
+// schemaFixture builds a database at schema version, as the binary that shipped
+// that version left it, then runs seed against it.
+func schemaFixture(t *testing.T, version int, seed string) string {
 	t.Helper()
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -39,12 +41,12 @@ func schema33Fixture(t *testing.T, seed string) string {
 	sort.Strings(paths)
 	for _, path := range paths {
 		base := filepath.Base(path)
-		// This fixture must stay a schema-33 database: rolling the later
-		// migrations forward is exactly what the test exercises, so applying one
+		// This fixture must stay a database at exactly `version`: rolling the
+		// later migrations forward is what the tests exercise, so applying one
 		// here would make store.Open apply it twice. Deriving the bound from the
 		// filename keeps the next migration from silently landing in the fixture
 		// and failing as a duplicate column.
-		if migrationNumber(t, base) > 33 {
+		if migrationNumber(t, base) > version {
 			continue
 		}
 		migration, err := os.ReadFile(path)
@@ -57,13 +59,13 @@ func schema33Fixture(t *testing.T, seed string) string {
 			t.Fatalf("apply %s: %v", path, err)
 		}
 	}
-	if _, err := raw.ExecContext(ctx, "PRAGMA user_version = 33"); err != nil {
+	if _, err := raw.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(version)); err != nil {
 		_ = raw.Close()
 		t.Fatal(err)
 	}
 	if _, err := raw.ExecContext(ctx, seed); err != nil {
 		_ = raw.Close()
-		t.Fatalf("seed schema-33 fixture: %v", err)
+		t.Fatalf("seed schema-%d fixture: %v", version, err)
 	}
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
@@ -120,7 +122,7 @@ func TestSchema33UpgradeImportsEveryLegacyEffectKind(t *testing.T) {
 		VALUES ('legacy-claim', 'legacy-candidate', 1, 'browser_tab', 'legacy-binding',
 		        'route_issued', 2, 3, '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z');
 	`
-	dir := schema33Fixture(t, seed)
+	dir := schemaFixture(t, 33, seed)
 	ctx := context.Background()
 	db, err := store.Open(ctx, dir)
 	if err != nil {
@@ -155,7 +157,7 @@ func TestSchema33UpgradeImportsEveryLegacyEffectKind(t *testing.T) {
 }
 
 func TestSchema33UpgradeRejectsMalformedLegacyStart(t *testing.T) {
-	dir := schema33Fixture(t, `
+	dir := schemaFixture(t, 33, `
 		INSERT INTO work_requests(id, created_at, desired_version)
 		VALUES ('req-malformed', '2026-08-13T00:00:00Z', 'any');
 		INSERT INTO jobs(id, work_request_id, state, policy_json, created_at, updated_at)
@@ -186,33 +188,16 @@ func TestSchema33UpgradeRejectsMalformedLegacyStart(t *testing.T) {
 //go:embed migrations/0001_init.sql
 var schemaV1 string
 
-//go:embed migrations/0013_zotio_tag_state.sql
-var schemaV13 string
-
+// The fixture is a real schema-13 database: every migration through 0013
+// applied in order, as store.Open itself would have. Applying 0001 and 0013
+// alone left out the tables 0002-0012 create, which no database has ever
+// lacked, and 0056 rewrites timestamps in those tables.
 func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	ctx := context.Background()
-	dataDir := t.TempDir()
-	dbPath := filepath.Join(dataDir, "papio.db")
-	raw, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(ON)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.ExecContext(ctx, schemaV1); err != nil {
-		t.Fatalf("apply schema v1: %v", err)
-	}
-	if _, err := raw.ExecContext(ctx, schemaV13); err != nil {
-		t.Fatalf("apply schema v13: %v", err)
-	}
-	if _, err := raw.ExecContext(ctx, `
+	dataDir := schemaFixture(t, 13, `
 		INSERT INTO zotio_tag_state (item_key, tag, updated_at)
 		VALUES ('LEGACY13', 'papio:unavailable', '2026-07-23T00:00:00Z');
-		PRAGMA user_version = 13;
-	`); err != nil {
-		t.Fatalf("seed schema v13: %v", err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatal(err)
-	}
+	`)
 
 	migrated, err := store.Open(ctx, dataDir)
 	if err != nil {
@@ -220,8 +205,8 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 55 {
-		t.Fatalf("user_version = %d, %v; want 55", version, err)
+	if err != nil || version != 56 {
+		t.Fatalf("user_version = %d, %v; want 56", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -250,7 +235,7 @@ func TestOpenRollsForwardSchemaThirteenTagLedger(t *testing.T) {
 // opposite without guessing about historical acknowledgements.
 func TestHandoffEpochRepairNarrowing(t *testing.T) {
 	ctx := context.Background()
-	dataDir := schema33Fixture(t, `
+	dataDir := schemaFixture(t, 33, `
 		INSERT INTO work_requests(id, created_at, desired_version)
 		VALUES ('repair-request-no-surface', '2026-08-21T00:00:00Z', 'any'),
 		       ('repair-request-with-surface', '2026-08-21T00:00:00Z', 'any');
@@ -360,8 +345,8 @@ func TestOpenRollsForwardSchemaOneWithoutLosingDurableRows(t *testing.T) {
 	}
 	defer migrated.Close()
 	version, err := migrated.UserVersion(ctx)
-	if err != nil || version != 55 {
-		t.Fatalf("user_version = %d, %v; want 55", version, err)
+	if err != nil || version != 56 {
+		t.Fatalf("user_version = %d, %v; want 56", version, err)
 
 	}
 	assertInstitutionalMaterializationSchema(t, ctx, migrated)
@@ -649,7 +634,7 @@ func assertInstitutionalMaterializationSchema(t *testing.T, ctx context.Context,
 // against a database that actually carries the legacy constraint.
 func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
 	ctx := context.Background()
-	dataDir := schema33Fixture(t, "")
+	dataDir := schemaFixture(t, 33, "")
 	dbPath := filepath.Join(dataDir, "papio.db")
 	raw, err := sql.Open("sqlite", "file:"+dbPath)
 	if err != nil {
@@ -737,7 +722,7 @@ func TestOpenRepairsLegacyPdfGrabStateConstraint(t *testing.T) {
 // until a human resolves the collision.
 func TestOpenToleratesDuplicateActiveCaptures(t *testing.T) {
 	ctx := context.Background()
-	dataDir := schema33Fixture(t, "")
+	dataDir := schemaFixture(t, 33, "")
 	dbPath := filepath.Join(dataDir, "papio.db")
 	raw, err := sql.Open("sqlite", "file:"+dbPath)
 	if err != nil {

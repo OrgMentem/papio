@@ -1521,7 +1521,7 @@ type TransitionOpt func(*transitionCfg)
 
 // WithRetryAt schedules the next attempt for a retry_wait transition.
 func WithRetryAt(t time.Time) TransitionOpt {
-	return func(c *transitionCfg) { c.retryAt = t.UTC().Format(time.RFC3339Nano) }
+	return func(c *transitionCfg) { c.retryAt = store.FormatTime(t) }
 }
 
 // WithTerminalReason records why a job ended.
@@ -1544,7 +1544,7 @@ func WithCandidate(id int64) TransitionOpt {
 // RecoverStale) or when their prior lease expired.
 func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duration) (*Row, error) {
 	now := store.Now()
-	expires := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)
+	expires := store.FormatTime(time.Now().Add(lease))
 	db := js.S.DB()
 
 	var id string
@@ -1579,7 +1579,7 @@ func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duratio
 // durable table points at a job and must not accidentally claim another job.
 func (js *Store) Claim(ctx context.Context, jobID, owner string, lease time.Duration) (*Row, error) {
 	now := store.Now()
-	expires := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)
+	expires := store.FormatTime(time.Now().Add(lease))
 	res, err := js.S.DB().ExecContext(ctx, `
 		UPDATE jobs SET lease_owner = ?, lease_expires_at = ?
 		WHERE id = ? AND (
@@ -1605,7 +1605,7 @@ func (js *Store) Claim(ctx context.Context, jobID, owner string, lease time.Dura
 
 // Heartbeat extends a held lease.
 func (js *Store) Heartbeat(ctx context.Context, jobID, owner string, lease time.Duration) error {
-	expires := time.Now().UTC().Add(lease).Format(time.RFC3339Nano)
+	expires := store.FormatTime(time.Now().Add(lease))
 	res, err := js.S.DB().ExecContext(ctx,
 		`UPDATE jobs SET lease_expires_at = ? WHERE id = ? AND lease_owner = ?`, expires, jobID, owner)
 	if err != nil {

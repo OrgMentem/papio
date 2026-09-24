@@ -172,8 +172,6 @@ func newBatchID() (string, error) {
 	return "ab_" + hex.EncodeToString(b[:]), nil
 }
 
-func timestamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
-
 func sameSource(a, b Source) bool {
 	return a.Kind == b.Kind && a.Label == b.Label && a.Detector == b.Detector && a.ScanID == b.ScanID
 }
@@ -362,7 +360,7 @@ func (c *Cohorts) SubmitChunk(ctx context.Context, req ChunkRequest, submit func
 	if err != nil {
 		return ChunkResult{}, err
 	}
-	created := timestamp(now)
+	created := store.FormatTime(now)
 	if expected == 0 {
 		_, err = tx.ExecContext(ctx, `INSERT INTO acquisition_batches(id,cohort_id,source_kind,source_label,source_detector,source_scan_id,expected_total,created_at,updated_at,membership_state) VALUES(?,?,?,?,?,?,?,?,?,?)`, batchID, req.CohortID, req.Source.Kind, req.Source.Label, nullable(req.Source.Detector), nullable(req.Source.ScanID), req.CohortTotal, created, created, res.Membership)
 	} else {
@@ -591,7 +589,7 @@ func (c *Cohorts) Projection(ctx context.Context, batchID string, now time.Time)
 	p.Unavailable = intPtr(unavailable)
 	if settled == len(rows) && terminalAt != nil {
 		p.SettledAt = terminalAt
-		_, _ = c.S.DB().ExecContext(ctx, `UPDATE acquisition_batches SET closed_at=COALESCE(closed_at,?),updated_at=? WHERE id=?`, timestamp(*terminalAt), timestamp(*terminalAt), batchID)
+		_, _ = c.S.DB().ExecContext(ctx, `UPDATE acquisition_batches SET closed_at=COALESCE(closed_at,?),updated_at=? WHERE id=?`, store.FormatTime(*terminalAt), store.FormatTime(*terminalAt), batchID)
 	}
 	return &p, nil
 }
@@ -627,7 +625,7 @@ func (c *Cohorts) RecordCLIBatch(ctx context.Context, label string, outcomes []M
 	if err != nil {
 		return ChunkResult{}, err
 	}
-	now := timestamp(c.Now())
+	now := store.FormatTime(c.Now())
 	expected := len(keys)
 	result := ChunkResult{BatchID: batchID, Membership: "complete", CohortTotal: &expected, PersistedMembers: expected, Submitted: counts["submitted"], Joined: counts["joined"], AlreadyOwned: counts["already_owned"], Invalid: counts["invalid"]}
 	resultJSON, err := encodeChunkResult(result)

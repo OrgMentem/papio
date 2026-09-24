@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/store"
 )
 
 // BootstrapCreditCap is the bounded egress permitted before a primary identity
@@ -679,7 +680,7 @@ func (m *Manager) ObservePrepaidRemaining(ctx context.Context, source string, re
 		m.setDriftLatch(source, reason)
 		if _, err := tx.ExecContext(ctx, `UPDATE source_credit_fuse SET drift_closed_at = ?, drift_reason = ?
 			WHERE source = ? AND utc_day = ? AND drift_closed_at IS NULL`,
-			m.now().UTC().Format(time.RFC3339Nano), reason, source, day); err != nil {
+			store.FormatTime(m.now()), reason, source, day); err != nil {
 			return err
 		}
 	}
@@ -702,7 +703,7 @@ func (m *Manager) DriftClose(ctx context.Context, source, reason string) error {
 		ON CONFLICT(source, utc_day) DO UPDATE SET
 			drift_closed_at = COALESCE(drift_closed_at, excluded.drift_closed_at),
 			drift_reason = COALESCE(drift_reason, excluded.drift_reason)`,
-		source, day, m.now().UTC().Format(time.RFC3339Nano), reason)
+		source, day, store.FormatTime(m.now()), reason)
 	return err
 }
 

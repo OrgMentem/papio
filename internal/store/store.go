@@ -218,8 +218,22 @@ func (s *Store) UserVersion(ctx context.Context) (int, error) {
 	return v, err
 }
 
-// Now formats the canonical UTC timestamp used across tables.
-func Now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+// TimeLayout is the one text form of every timestamp the store writes: UTC
+// RFC 3339 with exactly nine fractional digits, so every value is 30 bytes
+// wide. SQLite compares TEXT byte by byte, and only a fixed-width form makes
+// that order the time order. time.RFC3339Nano trims trailing fraction zeros,
+// and trimmed values misorder within a second: "…:05Z" sorts after
+// "…:05.1Z" because 'Z' > '.', and "…:05.59561Z" sorts after the later
+// "…:05.595612Z". Migration 0056 rewrote the rows written before this form.
+// Parse stored values with time.RFC3339Nano, which accepts every width.
+const TimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// FormatTime renders t in TimeLayout. Every Go value that is written to a
+// timestamp column, or bound against one in a comparison, goes through it.
+func FormatTime(t time.Time) string { return t.UTC().Format(TimeLayout) }
+
+// Now formats the current instant in TimeLayout.
+func Now() string { return FormatTime(time.Now()) }
 
 // AppendEvent writes one append-only event. Detail must already be redacted;
 // this is enforced by convention at call sites plus the redact package, since

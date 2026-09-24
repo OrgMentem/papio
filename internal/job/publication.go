@@ -257,12 +257,12 @@ func (js *Store) LeaseAwaitingHuman(ctx context.Context, jobID, owner string, le
 	if strings.TrimSpace(jobID) == "" || strings.TrimSpace(owner) == "" || lease <= 0 {
 		return false, errors.New("awaiting-human lease requires a job, owner, and positive duration")
 	}
-	now := time.Now().UTC()
-	expires := now.Add(lease).Format(time.RFC3339Nano)
+	now := time.Now()
+	expires := store.FormatTime(now.Add(lease))
 	res, err := js.S.DB().ExecContext(ctx, `
 		UPDATE jobs SET lease_owner = ?, lease_expires_at = ?
 		 WHERE id = ? AND state = ? AND (lease_owner IS NULL OR lease_expires_at < ?)`,
-		owner, expires, jobID, StateAwaitingHuman, now.Format(time.RFC3339Nano))
+		owner, expires, jobID, StateAwaitingHuman, store.FormatTime(now))
 	if err != nil {
 		return false, err
 	}
@@ -306,12 +306,12 @@ func (js *Store) ReclaimPublicationLease(ctx context.Context, publicationID, own
 	if prepared.LeaseOwner == nil {
 		return PreparedPublication{}, fmt.Errorf("%w: publication %s has no lease to reclaim", ErrConflict, publicationID)
 	}
-	now := time.Now().UTC()
-	expires := now.Add(lease).Format(time.RFC3339Nano)
+	now := time.Now()
+	expires := store.FormatTime(now.Add(lease))
 	res, err = tx.ExecContext(ctx, `
 		UPDATE jobs SET lease_owner = ?, lease_expires_at = ?
 		 WHERE id = ? AND (lease_owner IS NULL OR lease_expires_at < ?)`,
-		owner, expires, prepared.JobID, now.Format(time.RFC3339Nano))
+		owner, expires, prepared.JobID, store.FormatTime(now))
 	if err != nil {
 		return PreparedPublication{}, err
 	}

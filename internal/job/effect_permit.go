@@ -603,7 +603,7 @@ func (js *Store) AcquireEffectPermit(ctx context.Context, in EffectPermitAcquire
 	}
 	now := store.Now()
 	id := NewID("permit")
-	lease := in.LeaseUntil.UTC().Format(time.RFC3339Nano)
+	lease := store.FormatTime(in.LeaseUntil)
 	i := in.Identity
 	var ordinal any
 	if i.Kind == GenericDrive || i.Kind == DirectGet {
@@ -1408,7 +1408,7 @@ func (js *Store) AcquireInstitutionalEffectPermit(ctx context.Context, in Instit
 		return nil, EffectPermitStaleOutcome, ErrEffectPermitStale
 	}
 	id := NewID("permit")
-	_, e = tx.ExecContext(ctx, `INSERT INTO effect_permits(id,job_id,job_attempt_revision,browser_holder_generation,safety_domain_id,effect_kind,slot_index,claim_id,binding_id,effect_ordinal,institutional_request_id,status,lease_until,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?,?,?,'held',?,?,?)`, id, in.JobID, in.JobAttemptRevision, in.BrowserHolderGeneration, in.SafetyDomainID, string(Institutional), in.ClaimID, in.BindingID, newOrd, in.InstitutionalRequestID, in.LeaseUntil.UTC().Format(time.RFC3339Nano), now, now)
+	_, e = tx.ExecContext(ctx, `INSERT INTO effect_permits(id,job_id,job_attempt_revision,browser_holder_generation,safety_domain_id,effect_kind,slot_index,claim_id,binding_id,effect_ordinal,institutional_request_id,status,lease_until,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?,?,?,'held',?,?,?)`, id, in.JobID, in.JobAttemptRevision, in.BrowserHolderGeneration, in.SafetyDomainID, string(Institutional), in.ClaimID, in.BindingID, newOrd, in.InstitutionalRequestID, store.FormatTime(in.LeaseUntil), now, now)
 	if e != nil {
 		return nil, EffectPermitStaleOutcome, e
 	}

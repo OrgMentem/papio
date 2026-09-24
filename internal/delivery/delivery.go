@@ -413,7 +413,7 @@ func (s *Service) UpdateState(ctx context.Context, id int64, state State) error 
 	if !validState(state) {
 		return fmt.Errorf("delivery: invalid state %q", state)
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	if state == StateSubmitted {
 		_, err := s.store.DB().ExecContext(ctx, `
 			UPDATE delivery_requests
@@ -443,7 +443,7 @@ func (s *Service) UpdateStateFrom(ctx context.Context, id int64, from, to State)
 	if !validState(from) {
 		return false, fmt.Errorf("delivery: invalid expected state %q", from)
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	query := `UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ? AND state = ?`
 	args := []any{string(to), now, id, string(from)}
 	if to == StateSubmitted {
@@ -488,7 +488,7 @@ func (s *Service) UpdateStateTx(ctx context.Context, tx *sql.Tx, id int64, state
 	if !validState(state) {
 		return fmt.Errorf("delivery: invalid state %q", state)
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	if state == StateSubmitted {
 		_, err := tx.ExecContext(ctx, `
 			UPDATE delivery_requests
@@ -505,7 +505,7 @@ func (s *Service) RecordPollTx(ctx context.Context, tx *sql.Tx, id int64, provid
 		return err
 	}
 	now := store.Now()
-	next := nextCheckAt.UTC().Format(time.RFC3339Nano)
+	next := store.FormatTime(nextCheckAt)
 	_, err := tx.ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET provider_reference = ?, last_checked_at = ?, next_check_at = ?, updated_at = ?
@@ -518,7 +518,7 @@ func (s *Service) RecordPollTx(ctx context.Context, tx *sql.Tx, id int64, provid
 // caller-supplied schedule (typically NextCheck's result).
 func (s *Service) RecordPoll(ctx context.Context, id int64, providerReference string, nextCheckAt time.Time) error {
 	now := store.Now()
-	next := nextCheckAt.UTC().Format(time.RFC3339Nano)
+	next := store.FormatTime(nextCheckAt)
 	_, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET provider_reference = ?, last_checked_at = ?, next_check_at = ?, updated_at = ?
@@ -540,8 +540,8 @@ func (s *Service) RecordSubmission(ctx context.Context, id int64, providerRefere
 	if providerReference == "" {
 		return false, errors.New("delivery: provider reference is required")
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
-	next := nextCheckAt.UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
+	next := store.FormatTime(nextCheckAt)
 	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -609,7 +609,7 @@ func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	res, err := tx.ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET job_id = ?, updated_at = ?
@@ -671,7 +671,7 @@ func (s *Service) Resume(ctx context.Context, id int64) (*Request, error) {
 	if row.State != StateSubmitted && row.State != StatePending {
 		return row, ErrRequestNotLive
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	if _, err := s.store.DB().ExecContext(ctx, `
 		UPDATE delivery_requests
 		SET consecutive_poll_failures = 0, last_poll_error_class = NULL, next_check_at = ?, updated_at = ?
@@ -771,7 +771,7 @@ func (s *Service) SubmittedThisMonth(ctx context.Context, institutionProfile, pr
 		WHERE institution_profile = ? AND provider = ?
 		  AND submitted_at IS NOT NULL AND submitted_at >= ? AND submitted_at < ?`,
 		institutionProfile, provider,
-		monthStart.Format(time.RFC3339Nano), monthEnd.Format(time.RFC3339Nano)).Scan(&count)
+		store.FormatTime(monthStart), store.FormatTime(monthEnd)).Scan(&count)
 	return count, err
 }
 
@@ -937,7 +937,7 @@ func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 			return err
 		}
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	tx, err := s.store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err

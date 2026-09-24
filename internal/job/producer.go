@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"papio/internal/store"
 )
 
 // ArtifactProducerEvent is the one event a successful main-artifact promotion
@@ -492,9 +494,10 @@ func (js *Store) ProducerStats(ctx context.Context, since, until time.Time) (Pro
 	if !until.After(since) {
 		return ProducerStats{}, errors.New("producer stats period must end after it starts")
 	}
-	from, to := since.UTC().Format(time.RFC3339Nano), until.UTC().Format(time.RFC3339Nano)
+	// events.at is compared as text, so the bounds are bound in store.TimeLayout.
+	from, to := store.FormatTime(since), store.FormatTime(until)
 	stats := ProducerStats{
-		Since: from, Until: to,
+		Since: since.UTC().Format(time.RFC3339Nano), Until: until.UTC().Format(time.RFC3339Nano),
 		Producers: map[Producer]int{}, Interventions: map[Intervention]int{}, OpenedBy: map[string]int{},
 	}
 	for _, producer := range Producers {

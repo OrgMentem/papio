@@ -178,7 +178,7 @@ func (s *Service) Allocate(ctx context.Context, urlHost, title string) (*Grab, e
 		return nil, fmt.Errorf("checking existing pdf grab: %w", err)
 	}
 	id := NewID()
-	now := s.now()
+	now := store.FormatTime(s.now())
 	if _, err := s.store.DB().ExecContext(ctx, `
 		INSERT INTO pdf_grabs (id, url_host, title, state, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
@@ -269,7 +269,7 @@ func (s *Service) AllocateEffect(ctx context.Context, urlHost, title string, hol
 	grabID := NewID()
 	permitID := newPermitID()
 	nowStr := store.Now()
-	leaseStr := leaseUntil.UTC().Format(time.RFC3339Nano)
+	leaseStr := store.FormatTime(leaseUntil)
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO pdf_grabs (id, url_host, title, effect_request_id, state, created_at, updated_at)
@@ -873,7 +873,7 @@ func (s *Service) AbandonStaleAwaiting(ctx context.Context, cutoff time.Time) er
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	cutoffStr := cutoff.UTC().Format(time.RFC3339Nano)
+	cutoffStr := store.FormatTime(cutoff)
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id FROM pdf_grabs
 		WHERE state = ? AND updated_at < ?

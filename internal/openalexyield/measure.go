@@ -63,6 +63,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"papio/internal/store"
 )
 
 // CreditsPerTitleSearch is OpenAlex's measured per-call price for a search
@@ -173,13 +175,16 @@ type FreeReport struct {
 // over [since, now]. A zero since means all history. Measure makes no writes
 // and no provider requests.
 func Measure(ctx context.Context, db *sql.DB, since time.Time) (FreeReport, error) {
-	sinceStr := ""
+	// The report shows RFC3339 text; the SQL bounds use the stored layout so
+	// they compare against started_at/at/created_at in time order.
+	sinceStr, sinceBound := "", ""
 	if !since.IsZero() {
 		sinceStr = since.UTC().Format(time.RFC3339Nano)
+		sinceBound = store.FormatTime(since)
 	}
 	now := time.Now().UTC()
 	nowStr := now.Format(time.RFC3339Nano)
-	inFlightCutoff := now.Add(-finishAttemptInFlightGrace).Format(time.RFC3339Nano)
+	inFlightCutoff := store.FormatTime(now.Add(-finishAttemptInFlightGrace))
 
 	report := FreeReport{Since: sinceStr, Until: nowStr}
 
@@ -187,7 +192,7 @@ func Measure(ctx context.Context, db *sql.DB, since time.Time) (FreeReport, erro
 		SELECT COUNT(*) FROM attempts
 		 WHERE source = 'openalex' AND stage = 'resolve' AND outcome = 'success'
 		   AND detail LIKE 'sibling_candidates=%'
-		   AND started_at >= ?`, sinceStr)
+		   AND started_at >= ?`, sinceBound)
 	if err != nil {
 		return FreeReport{}, fmt.Errorf("counting sibling-hop searches: %w", err)
 	}
@@ -197,7 +202,7 @@ func Measure(ctx context.Context, db *sql.DB, since time.Time) (FreeReport, erro
 		SELECT COUNT(*) FROM attempts
 		 WHERE source = 'openalex' AND stage = 'resolve' AND outcome = 'success'
 		   AND detail IN ('no_confident_match', 'metadata_conflict_rejected', 'metadata_enriched')
-		   AND started_at >= ?`, sinceStr)
+		   AND started_at >= ?`, sinceBound)
 	if err != nil {
 		return FreeReport{}, fmt.Errorf("counting enrichment searches: %w", err)
 	}
@@ -207,7 +212,7 @@ func Measure(ctx context.Context, db *sql.DB, since time.Time) (FreeReport, erro
 	report.HasCredits = report.TitleSearchCredits > 0
 
 	siblingSearchEvents, err := scalarCount(ctx, db, `
-		SELECT COUNT(*) FROM events WHERE kind = 'job.sibling_search' AND at >= ?`, sinceStr)
+		SELECT COUNT(*) FROM events WHERE kind = 'job.sibling_search' AND at >= ?`, sinceBound)
 	if err != nil {
 		return FreeReport{}, fmt.Errorf("counting job.sibling_search events: %w", err)
 	}
@@ -218,7 +223,7 @@ func Measure(ctx context.Context, db *sql.DB, since time.Time) (FreeReport, erro
 	lostToFinish, err := scalarCount(ctx, db, `
 		SELECT COUNT(*) FROM attempts
 		 WHERE source = 'openalex' AND stage = 'resolve' AND ended_at IS NULL
-		   AND started_at >= ? AND started_at <= ?`, sinceStr, inFlightCutoff)
+		   AND started_at >= ? AND started_at <= ?`, sinceBound, inFlightCutoff)
 	if err != nil {
 		return FreeReport{}, fmt.Errorf("counting unfinished openalex attempts: %w", err)
 	}
@@ -227,13 +232,13 @@ func Measure(ctx context.Context, db *sql.DB, since time.Time) (FreeReport, erro
 	ambiguous, err := scalarCount(ctx, db, `
 		SELECT COUNT(*) FROM attempts
 		 WHERE source = 'openalex' AND stage = 'resolve' AND outcome IN ('retryable', 'failed')
-		   AND started_at >= ?`, sinceStr)
+		   AND started_at >= ?`, sinceBound)
 	if err != nil {
 		return FreeReport{}, fmt.Errorf("counting ambiguous openalex attempts: %w", err)
 	}
 	report.AmbiguousResolveAttempts = ambiguous
 
-	if err := measureAcceptedArtifacts(ctx, db, sinceStr, &report); err != nil {
+	if err := measureAcceptedArtifacts(ctx, db, sinceBound, &report); err != nil {
 		return FreeReport{}, err
 	}
 
@@ -251,10 +256,10 @@ func Measure(ctx context.Context, db *sql.DB, since time.Time) (FreeReport, erro
 // 'accepted') recovers a cache-completed job's source acquisition. A win with
 // neither is unattributable, per this package's evidence-only rule — never
 // guessed from timing.
-func measureAcceptedArtifacts(ctx context.Context, db *sql.DB, sinceStr string, report *FreeReport) error {
+func measureAcceptedArtifacts(ctx context.Context, db *sql.DB, sinceBound string, report *FreeReport) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT job_id, artifact_sha256 FROM job_artifacts
-		 WHERE role = 'main' AND created_at >= ?`, sinceStr)
+		 WHERE role = 'main' AND created_at >= ?`, sinceBound)
 	if err != nil {
 		return fmt.Errorf("listing accepted main artifacts: %w", err)
 	}

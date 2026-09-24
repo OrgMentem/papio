@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"papio/internal/store"
 )
 
 // ApplyClaimObservationInput carries everything ApplyClaimObservation needs
@@ -185,7 +187,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 		return fail("error", "authentication entry lease state is unavailable")
 	}
 
-	nowText := in.Now.UTC().Format(time.RFC3339Nano)
+	nowText := store.FormatTime(in.Now)
 	// The lease's OWN BrowserHolderGeneration is deliberately not compared
 	// against in.Generation on any path below. The sender's staleness is
 	// already fenced above (in.FrameGeneration != in.Generation -> stale), so

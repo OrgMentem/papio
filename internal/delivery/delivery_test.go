@@ -303,8 +303,8 @@ func TestRecordSubmissionAtomicallyCommitsAllFieldsAndCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantNow := now.Format(time.RFC3339Nano)
-	wantNext := next.Format(time.RFC3339Nano)
+	wantNow := store.FormatTime(now)
+	wantNext := store.FormatTime(next)
 	if got.State != StateSubmitted || got.ProviderReference != "provider-123" ||
 		got.SubmittedAt != wantNow || got.LastCheckedAt != wantNow || got.NextCheckAt != wantNext {
 		t.Fatalf("recorded row = %+v, want submitted/provider/timestamps committed together", got)

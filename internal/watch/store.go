@@ -217,7 +217,7 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	firstSeenAt := at.UTC().Format(time.RFC3339Nano)
+	firstSeenAt := store.FormatTime(at)
 	reported := 0
 	for _, entry := range entries {
 		entry.WorkKey = strings.TrimSpace(entry.WorkKey)
@@ -1031,7 +1031,7 @@ func (s *Store) MarkRun(ctx context.Context, id int64, at time.Time) error {
 	result, err := s.S.DB().ExecContext(ctx, `
 		UPDATE watches
 		SET last_run_at = ?, consecutive_failures = 0, last_error = ''
-		WHERE id = ?`, at.UTC().Format(time.RFC3339Nano), id)
+		WHERE id = ?`, store.FormatTime(at), id)
 	if err != nil {
 		return fmt.Errorf("recording watch run: %w", err)
 	}
@@ -1059,7 +1059,7 @@ func (s *Store) MarkDegradedRun(ctx context.Context, id int64, at time.Time, fai
 		UPDATE watches
 		SET last_run_at = ?, consecutive_failures = 0, last_error = ?
 		WHERE id = ?`,
-		at.UTC().Format(time.RFC3339Nano),
+		store.FormatTime(at),
 		fmt.Sprintf("%d of %d watch submissions failed", failed, total), id)
 	if err != nil {
 		return fmt.Errorf("recording degraded watch run: %w", err)
@@ -1101,7 +1101,7 @@ func (s *Store) RecordFailure(ctx context.Context, id int64, at time.Time, runEr
 		UPDATE watches
 		SET last_run_at = ?, consecutive_failures = ?, last_error = ?, enabled = ?
 		WHERE id = ?`,
-		at.UTC().Format(time.RFC3339Nano), failures, storedError(runErr), newEnabled, id); err != nil {
+		store.FormatTime(at), failures, storedError(runErr), newEnabled, id); err != nil {
 		return FailureResult{}, fmt.Errorf("recording watch failure: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

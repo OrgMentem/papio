@@ -468,7 +468,7 @@ func (s *Service) observePersonalItems(ctx context.Context, items []MissingPDFIt
 	if len(items) == 0 {
 		return nil
 	}
-	now := s.now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.now())
 	tx, err := s.Store.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
