@@ -2225,6 +2225,37 @@ func (s *Service) institutionalRouteExhausted(ctx context.Context, jobID string)
 	return false
 }
 
+// oaHandoffFallbackEventKind is the bridge's record that an open-access
+// browser route reported no entitlement and fell back to the institution.
+const oaHandoffFallbackEventKind = "browser.oa_handoff_fallback"
+
+// OpenAccessRouteRemains reports whether a job still holds an open-access
+// route that has not itself reported no entitlement: an open-access candidate
+// a fresh pass would fetch, or the browser-eligible one an earlier pass
+// recorded (job.oa_browser_hint) after the job's last open-access
+// no-entitlement fallback. It names no URL. Rediscovery re-derives a live one,
+// and exhaustion settles the job no_entitlement when the route is gone, so the
+// bridge's library no_entitlement need not end a job that still has one.
+func (s *Service) OpenAccessRouteRemains(ctx context.Context, jobID string) (bool, error) {
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	hint, fallback := -1, -1
+	for i, event := range events {
+		switch kind, _ := event["kind"].(string); kind {
+		case oaBrowserHintEventKind:
+			hint = i
+		case oaHandoffFallbackEventKind:
+			fallback = i
+		}
+	}
+	if hint > fallback {
+		return true, nil
+	}
+	return s.Jobs.HasOpenAccessCandidateToTry(ctx, jobID)
+}
+
 // PublisherFirstEventKind records the one publisher-first DOI offer a job
 // receives. Its presence makes the offer one-shot across rediscovery passes
 // and daemon restarts, and it starts a fresh drive epoch for the DOI route.

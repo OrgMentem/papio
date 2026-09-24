@@ -539,6 +539,12 @@ func newJobsCommand(opt *options) *cobra.Command {
 			"adopted file that failed validation is accepted once that file is gone\n" +
 			"from the job's adoption directory. Redrive returns it to awaiting_human\n" +
 			"with a fresh institutional handoff; while the file remains, it refuses.\n\n" +
+			"Two parks go back to resolving instead, with no new action: a manual\n" +
+			"download left by an open-access browser route, where papio looks up that\n" +
+			"route again, and any spent route of a job whose institution has already\n" +
+			"reported no entitlement. Resolving offers a live open-access handoff when\n" +
+			"one remains, an untried institutional handoff next, and otherwise settles\n" +
+			"the job.\n\n" +
 			"Redrive accepts nothing on the provider: the extension's own terms\n" +
 			"consent setting decides again when the handoff is driven, and without\n" +
 			"consent the job parks on terms again.\n\n" +
@@ -560,6 +566,10 @@ func newJobsCommand(opt *options) *cobra.Command {
 			}
 			if opt.jsonOutput {
 				return opt.printJSON(result)
+			}
+			if result.ActionID == 0 {
+				_, err := fmt.Fprintf(opt.out, "%s\tresolving\n", result.JobID)
+				return err
 			}
 			_, err := fmt.Fprintf(opt.out, "%s\topenurl_handoff\t%d\n", result.JobID, result.ActionID)
 			return err

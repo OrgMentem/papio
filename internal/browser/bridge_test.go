@@ -6357,6 +6357,98 @@ func TestRequeuedRouteNeverConvertsOAHandoffBackToInstitution(t *testing.T) {
 	}
 }
 
+// Live 2026-09-24 (job_49a7…): a paper with a PMC open-access route ended
+// unavailable/no_entitlement because its library route, already proved empty,
+// was opened again and reported no entitlement a second time. A library
+// no_entitlement proves nothing about an open-access route the job still
+// holds, so the job returns to resolving, where exhaustion re-derives that
+// route or settles the job. An open-access route that itself reported no
+// entitlement is not left, and the terminal park stands.
+func TestProvenEmptyLibraryNoEntitlementKeepsRemainingOpenAccessRoute(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		evidence  func(t *testing.T, jobs *job.Store, id string)
+		wantState string
+	}{
+		{"a browser-eligible open-access candidate", func(t *testing.T, jobs *job.Store, id string) {
+			if err := jobs.RecordEvent(context.Background(), id, "job.oa_browser_hint", map[string]any{"url_key": "pmc"}); err != nil {
+				t.Fatal(err)
+			}
+		}, job.StateResolving},
+		{"a retryable open-access candidate", func(t *testing.T, jobs *job.Store, id string) {
+			ctx := context.Background()
+			if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{JobID: id, Source: "unpaywall",
+				URLRedacted: "https://oa.example.org/paper.pdf", URLKey: "oa-retry", Version: "published",
+				AccessBasis: "open_access", ReuseLicense: "unknown", Direct: true}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE candidates SET status='retryable' WHERE job_id=?`, id); err != nil {
+				t.Fatal(err)
+			}
+		}, job.StateResolving},
+		{"an open-access route that reported no entitlement itself", func(t *testing.T, jobs *job.Store, id string) {
+			ctx := context.Background()
+			if err := jobs.RecordEvent(ctx, id, "job.oa_browser_hint", map[string]any{"url_key": "pmc"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.RecordEvent(ctx, id, "browser.oa_handoff_fallback", map[string]any{"reason": "no_entitlement"}); err != nil {
+				t.Fatal(err)
+			}
+		}, job.StateUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridge(t)
+			ctx := context.Background()
+			id := park(t, jobs, "wr_oa_remains", handoffWork())
+			runSync(t, b, hello())
+
+			// The library proves empty once and earns its rediscovery pass.
+			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": "no_entitlement"}))
+			if row, err := jobs.Get(ctx, id); err != nil || row.State != job.StateResolving {
+				t.Fatalf("after the first no_entitlement: %+v, %v; want resolving", row, err)
+			}
+			tc.evidence(t, jobs, id)
+			// A redrive then parked the job on that library route again.
+			if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, app.InstitutionalOpenURLHandoffDetail, job.Access(true, "paywall")); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman,
+				map[string]any{"reason": "institutional_handoff"}); err != nil {
+				t.Fatal(err)
+			}
+
+			runSync(t, b, inFrame(t, protocol.MsgProviderOutcome, id, map[string]any{"outcome": "no_entitlement"}))
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != tc.wantState {
+				t.Fatalf("state/reason after the second library no_entitlement = %s/%q, want %s", row.State, row.TerminalReason, tc.wantState)
+			}
+			if tc.wantState == job.StateUnavailable && row.TerminalReason != "no_entitlement" {
+				t.Fatalf("terminal reason = %q, want no_entitlement", row.TerminalReason)
+			}
+			open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+			if err != nil || len(open) != 0 {
+				t.Fatalf("open actions = %+v, %v; want the library handoff resolved", open, err)
+			}
+			events, err := jobs.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requeues := 0
+			for _, event := range events {
+				if event["kind"] == "browser.no_entitlement_requeue" {
+					requeues++
+				}
+			}
+			if requeues != 1 {
+				t.Fatalf("requeue events = %d, want 1: the library route stays proved empty", requeues)
+			}
+		})
+	}
+}
+
 // TestEmptyJobRejectKeepsHandoffOpenForReoffer pins that an empty job_reject
 // is not a provider refusal. The frame has no payload, and the extension sent
 // it only when its own worker-local offer URL was gone. Live 2026-09-23

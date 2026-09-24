@@ -71,6 +71,26 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **A paper with an open-access copy no longer ends unavailable because your
+  library has no entitlement.** When the browser could not drive an
+  open-access page (for example a PubMed Central article) and asked you to
+  download the PDF yourself, the paced drive and `papio jobs redrive`
+  replaced that request with your library's sign-in route, even after the
+  library had already reported that it holds no entitlement to the paper.
+  The library then reported it again, and *papio* marked the paper
+  `unavailable` with the reason `no_entitlement` while the open-access copy
+  was still known. Now a redrive of a manual download that an open-access
+  page left behind, or of any paper whose library has already reported no
+  entitlement, sends the paper back to resolving. There *papio* looks up the
+  open-access copy again and offers it in the browser; it offers the library
+  route only if that route is still untried, and marks the paper unavailable
+  only when no route remains. `papio jobs redrive` then prints the job id and
+  `resolving` instead of a new action, and the paced drive opens no tab
+  on that pass. A library report of no entitlement on a route that was
+  already known to be empty now also sends a paper back to resolving while
+  it still has an open-access copy to try, whether untried or waiting to be
+  retried. An open-access copy that itself reported no entitlement does not
+  count, and the paper still becomes unavailable when no other route exists.
 - **The first command after an upgrade waits for the database upgrade
   instead of failing.** A command that starts the background service gave it
   five seconds to open its socket, then stopped it. A database upgrade that

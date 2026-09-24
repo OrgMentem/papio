@@ -38,6 +38,12 @@ import (
 // caller's observation that the job's adoption directories now hold no file;
 // without it the job stays parked, because awaiting_human would let the sweep
 // re-adopt and re-reject that same file every tick.
+//
+// Two awaiting_human shapes return the job to resolving instead and yield no
+// new action, so the returned id is zero: a manual download that the
+// open-access browser route left behind (oaHandoff recognizes the handoff the
+// bridge resolved before it), and any spent route of a job whose
+// institutional route has already reported no entitlement.
 func (js *Store) RedriveInstitutionalHandoff(ctx context.Context, jobID string, revision int64,
 	openURLBaseFor func(string) (string, bool), oaHandoff func(detail string) bool, adoptedFileGone bool,
 	handoffDetail string) (int64, error) {
@@ -176,6 +182,38 @@ func (js *Store) redriveInstitutionalHandoff(ctx context.Context, jobID string, 
 			return 0, err
 		}
 	}
+	// Two spent routes are redriven through rediscovery, not a fresh
+	// institutional handoff, because that handoff is not the route left to
+	// try. A manual download the open-access browser route left behind asks
+	// for that route again: the page was reachable, only papio's drive of it
+	// failed. And an institutional route that already reported no entitlement
+	// (browser.no_entitlement_requeue) can only report it again. Live
+	// 2026-09-24, a paced redrive of a PMC manual download opened exactly that
+	// route, and its second no_entitlement ended the job unavailable.
+	// Resolving hands the choice to exhaustion, its one owner: it re-derives a
+	// live open-access URL, falls back to an untried institutional route, or
+	// settles the job when neither remains. A stored open-access URL is never
+	// reused, because it can be a bearer link that has since expired.
+	rediscover := false
+	if state == StateAwaitingHuman {
+		var provenEmpty int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM events
+			WHERE job_id=? AND kind='browser.no_entitlement_requeue')`, jobID).Scan(&provenEmpty); err != nil {
+			return 0, err
+		}
+		rediscover = provenEmpty != 0
+		if !rediscover && count == 1 && actionKind == "manual_download" {
+			// The bridge resolves the handoff it drove before it opens the
+			// manual download, so the newest earlier handoff is its route.
+			var route string
+			err := tx.QueryRowContext(ctx, `SELECT COALESCE(detail,'') FROM human_actions
+				WHERE job_id=? AND kind='openurl_handoff' AND id<? ORDER BY id DESC LIMIT 1`, jobID, actionID).Scan(&route)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return 0, err
+			}
+			rediscover = oaHandoff(route)
+		}
+	}
 	if !apply {
 		return 0, nil
 	}
@@ -228,18 +266,32 @@ func (js *Store) redriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	if err := consumeCloseAuthorizationsTx(ctx, tx, ids, now); err != nil {
 		return 0, err
 	}
-	if count == 1 {
-		res, err := tx.ExecContext(ctx, `UPDATE human_actions SET status='resolved',resolved_at=? WHERE id=? AND status='open' AND revision=?`, now, actionID, revision)
+	var fresh int64
+	if rediscover {
+		var resolve []int64
+		if count == 1 {
+			resolve = []int64{actionID}
+		}
+		transition, err := json.Marshal(map[string]any{"from": StateAwaitingHuman, "to": StateResolving, "reason": "operator_redrive"})
 		if err != nil {
 			return 0, err
 		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			return 0, fmt.Errorf("%w: action changed; list actions again", ErrConflict)
+		if err := js.RepairAwaitingHumanTx(ctx, tx, jobID, resolve, string(transition), now); err != nil {
+			return 0, err
 		}
-	}
-	fresh, err := js.OpenHumanActionTx(ctx, tx, jobID, "openurl_handoff", handoffDetail, now, Access(true, "paywall"))
-	if err != nil {
-		return 0, err
+	} else {
+		if count == 1 {
+			res, err := tx.ExecContext(ctx, `UPDATE human_actions SET status='resolved',resolved_at=? WHERE id=? AND status='open' AND revision=?`, now, actionID, revision)
+			if err != nil {
+				return 0, err
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				return 0, fmt.Errorf("%w: action changed; list actions again", ErrConflict)
+			}
+		}
+		if fresh, err = js.OpenHumanActionTx(ctx, tx, jobID, "openurl_handoff", handoffDetail, now, Access(true, "paywall")); err != nil {
+			return 0, err
+		}
 	}
 	detail, err := json.Marshal(map[string]any{"reason": "operator_redrive", "action_id": actionID, "action_revision": actionRevision})
 	if err != nil {

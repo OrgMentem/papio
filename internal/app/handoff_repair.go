@@ -42,7 +42,8 @@ func (s *Service) HandoffRepairer() *HandoffRepairer { return &HandoffRepairer{s
 // openurl_handoffs while a durable browser.no_entitlement_requeue event says
 // that route already proved empty would re-offer a dead login loop. The
 // actions are resolved and the job re-enters resolving, where exhaustion
-// observes the event and parks it unavailable with terminal no_entitlement.
+// observes the event: it re-parks the job on an open-access route that
+// remains, and otherwise parks it unavailable with terminal no_entitlement.
 //
 // Rule 3 (unfetchable park): a job whose only open actions are institutional
 // handoffs but whose work carries nothing a sign-in could act on is asking for

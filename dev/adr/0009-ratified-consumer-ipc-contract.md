@@ -220,7 +220,11 @@ consumer, script and agent. The drive is held to these bounds:
 - **Open only.** It surfaces a handoff and nothing else. It never accepts
   terms, never submits a delivery request and never resolves an identity
   review. A `manual_download` is redriven first, but only when `jobs.redrive`
-  would accept it, through the same store function. An `openurl_available`
+  would accept it, through the same store function. When that redrive returns
+  the job to resolving (a manual download the open-access route left, or a
+  job whose institution already reported no entitlement), the pass opens
+  nothing: resolving re-derives the open-access handoff, which the bridge
+  offers like any other. An `openurl_available`
   advisory is never opened, because its only surface is the OS launcher
   outside *papio*'s window. The extension's handoff surface settings decide
   where every tab lands.

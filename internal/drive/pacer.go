@@ -263,8 +263,9 @@ func (p *Pacer) open(ctx context.Context, now time.Time, next Candidate) error {
 		return err
 	}
 	if next.Action == manualDownloadKind {
-		if _, err := p.Jobs.RedriveInstitutionalHandoff(ctx, next.JobID, next.revision,
-			p.Config.OpenURLBaseFor, isOAHandoff, false, app.InstitutionalOpenURLHandoffDetail); err != nil {
+		fresh, err := p.Jobs.RedriveInstitutionalHandoff(ctx, next.JobID, next.revision,
+			p.Config.OpenURLBaseFor, isOAHandoff, false, app.InstitutionalOpenURLHandoffDetail)
+		if err != nil {
 			// The check and the redrive share one precondition set, so this is
 			// a race with the browser or the operator. The paced open event
 			// already backs the job off; settle it so the browser is free.
@@ -273,6 +274,13 @@ func (p *Pacer) open(ctx context.Context, now time.Time, next Candidate) error {
 				return nil
 			}
 			return err
+		}
+		if fresh == 0 {
+			// The redrive returned the job to resolving: an open-access manual
+			// download, or a library route already proved empty. There is no
+			// handoff to surface; resolving re-derives the open-access handoff,
+			// which the bridge offers like any other, or settles the job.
+			return nil
 		}
 	}
 	queued, live, err := OpenHandoffs(ctx, p.Browser, p.Jobs, []string{next.JobID}, Principal)

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/notify"
@@ -488,6 +489,61 @@ func TestPacerRedrivesManualDownloadsAndNeverOpensAdvisories(t *testing.T) {
 	}
 	if !slices.Contains(h.eventKinds(manual), "job.retry_requested") {
 		t.Fatalf("events %v, want the ordinary redrive record", h.eventKinds(manual))
+	}
+}
+
+// Live 2026-09-24 (job_49a7…): the paced drive redrove the manual download the
+// PMC open-access page left, and the redrive opened the library route, which
+// had already reported no entitlement. The browser drove it, the library said
+// no entitlement again, and the job ended unavailable with PMC still in hand.
+// The redrive now returns the job to resolving, so the pass opens nothing:
+// resolving re-derives the open-access handoff, which the bridge offers.
+func TestPacerRedriveOfOpenAccessManualDownloadNeverOpensTheLibraryRoute(t *testing.T) {
+	h := newHarness(t, true)
+	ctx := context.Background()
+	id, err := h.jobs.CreateRequest(ctx, "wr_oa_manual", work.Work{DOI: "10.1001/oa.manual"}, "", "",
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The library route proved empty on an earlier pass.
+	if err := h.jobs.RecordEvent(ctx, id, "browser.no_entitlement_requeue", map[string]any{"outcome": "no_entitlement"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.jobs.ParkWithHumanAction(ctx, id, job.StateResolving, job.StateAwaitingHuman, handoffKind,
+		app.OABrowserHandoffActionDetail("https://pmc.example.org/articles/PMC1/"), nil, job.Access(false, "anti_bot")); err != nil {
+		t.Fatal(err)
+	}
+	// The article agent could not drive the open-access page.
+	if _, err := h.jobs.S.DB().ExecContext(ctx, `UPDATE human_actions SET status='resolved' WHERE job_id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.jobs.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{"outcome": "ui_changed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.jobs.OpenHumanAction(ctx, id, manualDownloadKind,
+		"papio has no adapter for this provider yet; download the PDF yourself for now", job.Access(false, "landing_page")); err != nil {
+		t.Fatal(err)
+	}
+
+	h.run()
+	if got := h.browser.openedJobs(); len(got) != 0 {
+		t.Fatalf("pacer surfaced %v, want nothing opened on the rediscovery pass", got)
+	}
+	open, err := h.jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(open) != 0 {
+		t.Fatalf("open actions after the paced redrive = %+v err=%v; want no library handoff", open, err)
+	}
+	row, err := h.jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateResolving {
+		t.Fatalf("job after the paced redrive = %+v err=%v; want resolving", row, err)
+	}
+	kinds := h.eventKinds(id)
+	if !slices.Contains(kinds, PacedOpenEvent) || !slices.Contains(kinds, "job.retry_requested") || slices.Contains(kinds, OpenDeclinedEvent) {
+		t.Fatalf("events %v; want the paced open and its redrive, and no declined open", kinds)
 	}
 }
 

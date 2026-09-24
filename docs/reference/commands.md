@@ -1020,6 +1020,13 @@ adopted file that failed validation is accepted once that file is gone
 from the job's adoption directory. Redrive returns it to awaiting_human
 with a fresh institutional handoff; while the file remains, it refuses.
 
+Two parks go back to resolving instead, with no new action: a manual
+download left by an open-access browser route, where papio looks up that
+route again, and any spent route of a job whose institution has already
+reported no entitlement. Resolving offers a live open-access handoff when
+one remains, an untried institutional handoff next, and otherwise settles
+the job.
+
 Redrive accepts nothing on the provider: the extension's own terms
 consent setting decides again when the handoff is driven, and without
 consent the job parks on terms again.

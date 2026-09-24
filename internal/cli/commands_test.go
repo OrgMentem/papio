@@ -24,6 +24,7 @@ import (
 func TestRedriveRequiresRevisionAndReportsNewAction(t *testing.T) {
 	var out, errOut bytes.Buffer
 	calls := 0
+	actionID := int64(42)
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
 		calls++
 		if method != "jobs.redrive" {
@@ -33,7 +34,7 @@ func TestRedriveRequiresRevisionAndReportsNewAction(t *testing.T) {
 		if got["job_id"] != "job_01" || got["expected_revision"] != int64(1) {
 			t.Fatalf("redrive params=%+v", got)
 		}
-		*result.(*api.RedriveResult) = api.RedriveResult{JobID: "job_01", ActionID: 42}
+		*result.(*api.RedriveResult) = api.RedriveResult{JobID: "job_01", ActionID: actionID}
 		return nil
 	})
 	root.SetArgs([]string{"jobs", "redrive", "job_01"})
@@ -47,6 +48,17 @@ func TestRedriveRequiresRevisionAndReportsNewAction(t *testing.T) {
 	}
 	if got := out.String(); got != "job_01\topenurl_handoff\t42\n" || calls != 1 {
 		t.Fatalf("redrive output=%q calls=%d", got, calls)
+	}
+	// A redrive that returned the job to resolving opened no action; action
+	// 0 must not read as a handoff to open.
+	out.Reset()
+	actionID = 0
+	root.SetArgs([]string{"jobs", "redrive", "job_01", "--revision", "1"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != "job_01\tresolving\n" {
+		t.Fatalf("rediscovery redrive output=%q", got)
 	}
 }
 

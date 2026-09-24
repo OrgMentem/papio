@@ -268,6 +268,92 @@ func TestCheckRedriveAgreesWithRedriveAndChangesNothing(t *testing.T) {
 	}
 }
 
+// A redrive must not hand a paper to a library route that cannot serve it.
+// Live 2026-09-24 (job_49a7…): a paced redrive turned the manual download the
+// PMC open-access page left into a fresh library handoff, although that
+// library had already reported no entitlement. Its second no_entitlement then
+// ended the job unavailable with the PMC route still in hand. Both shapes go
+// back to resolving, where exhaustion re-derives the live open-access route,
+// or settles the job when no route remains.
+func TestRedriveRediscoversInsteadOfOpeningASpentLibraryRoute(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		park func(t *testing.T, js *Store) (string, int64)
+	}{
+		{"manual download left by the open-access route", func(t *testing.T, js *Store) (string, int64) {
+			ctx := context.Background()
+			id := resolvingParkCandidate(t, js, "redrive-oa-manual")
+			if err := js.ParkWithHumanAction(ctx, id, StateResolving, StateAwaitingHuman, "openurl_handoff",
+				"open-access fetch via browser\nhttps://pmc.example.org/articles/PMC1/", nil, Access(false, "anti_bot")); err != nil {
+				t.Fatal(err)
+			}
+			// The bridge resolves the driven handoff, then opens the manual
+			// download for the page it could not drive.
+			if _, err := js.S.DB().ExecContext(ctx, `UPDATE human_actions SET status='resolved' WHERE job_id=?`, id); err != nil {
+				t.Fatal(err)
+			}
+			if err := js.RecordEvent(ctx, id, "browser.provider_outcome", map[string]any{"outcome": "ui_changed"}); err != nil {
+				t.Fatal(err)
+			}
+			manual, err := js.OpenHumanAction(ctx, id, "manual_download",
+				"papio has no adapter for this provider yet; download the PDF yourself for now", Access(false, "landing_page"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return id, manual
+		}},
+		{"library route that already reported no entitlement", func(t *testing.T, js *Store) (string, int64) {
+			id, manual := redriveJob(t, js)
+			if err := js.RecordEvent(context.Background(), id, "browser.no_entitlement_requeue", map[string]any{"outcome": "no_entitlement"}); err != nil {
+				t.Fatal(err)
+			}
+			return id, manual
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			js := testStore(t)
+			id, manual := tc.park(t, js)
+			if err := js.CheckRedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff); err != nil {
+				t.Fatalf("check = %v, want the spent route redrivable", err)
+			}
+			fresh, err := js.RedriveInstitutionalHandoff(ctx, id, 1, redriveRoute, redriveOAHandoff, false, "institutional handoff detail")
+			if err != nil {
+				t.Fatal(err)
+			}
+			open, err := js.ListOpenHumanActionsForJobs(ctx, []string{id})
+			if err != nil || fresh != 0 || len(open) != 0 {
+				t.Fatalf("redrive opened action %d, open=%+v err=%v; want no library handoff", fresh, open, err)
+			}
+			row, err := js.Get(ctx, id)
+			if err != nil || row.State != StateResolving {
+				t.Fatalf("job after redrive = %+v err=%v; want resolving", row, err)
+			}
+			var status string
+			if err := js.S.DB().QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, manual).Scan(&status); err != nil || status != "resolved" {
+				t.Fatalf("manual download status=%q err=%v", status, err)
+			}
+			events, err := js.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			moved, requested := false, false
+			for _, event := range events {
+				detail, _ := event["detail"].(map[string]any)
+				switch event["kind"] {
+				case "job.transition":
+					moved = moved || (detail["from"] == StateAwaitingHuman && detail["to"] == StateResolving && detail["reason"] == "operator_redrive")
+				case "job.retry_requested":
+					requested = requested || (detail["reason"] == "operator_redrive" && detail["action_id"] == float64(manual))
+				}
+			}
+			if !moved || !requested {
+				t.Fatalf("events %+v; want an operator_redrive transition to resolving and its retry request", events)
+			}
+		})
+	}
+}
+
 func TestRedriveResolvedParkAndFreshOutcome(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)

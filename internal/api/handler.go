@@ -174,7 +174,10 @@ type RepairResult struct {
 	State    string `json:"state,omitempty"`
 }
 
-// RedriveResult reports the new institutional handoff after one operator request.
+// RedriveResult reports the new institutional handoff after one operator
+// request. ActionID is zero when the redrive returned the job to resolving
+// instead: a manual download the open-access route left, or a job whose
+// institutional route has already reported no entitlement.
 type RedriveResult struct {
 	JobID    string `json:"job_id"`
 	ActionID int64  `json:"action_id"`

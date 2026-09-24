@@ -8427,10 +8427,36 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 			return b.leaveHandoff(ctx, jobID, job.StateResolving, "no_entitlement_rediscovery")
 		}
 		// The route already proved empty. Never convert a rediscovered OA
-		// action back to that institutional route and never requeue again:
-		// resolve whatever handoff reported this and park terminally.
+		// action back to that institutional route and never requeue again.
+		// A library route that reports it once more (a redrive or restart
+		// offered it again) proves nothing about an open-access route the
+		// job still holds. Live 2026-09-24, a paper with a PMC route ended
+		// unavailable here. Such a job returns to resolving, where
+		// exhaustion re-derives the open-access handoff, or settles the job
+		// no_entitlement once no route remains. An open-access action that
+		// reported no entitlement leaves nothing, and parks terminally.
+		actions, err := b.jobs.ListOpenHumanActionsForJobs(ctx, []string{jobID})
+		if err != nil {
+			return err
+		}
+		openAccessReported := false
+		for _, action := range actions {
+			if action.Kind == handoffActionKind {
+				_, openAccessReported = app.OABrowserHandoffURL(action.Detail)
+				break
+			}
+		}
+		openAccessRemains := false
+		if !openAccessReported && b.svc != nil {
+			if openAccessRemains, err = b.svc.OpenAccessRouteRemains(ctx, jobID); err != nil {
+				return err
+			}
+		}
 		if err := b.resolveHandoff(ctx, jobID, "resolved"); err != nil {
 			return err
+		}
+		if openAccessRemains {
+			return b.leaveHandoff(ctx, jobID, job.StateResolving, "open_access_route_remains")
 		}
 		return b.leaveHandoff(ctx, jobID, job.StateUnavailable, p.Outcome)
 

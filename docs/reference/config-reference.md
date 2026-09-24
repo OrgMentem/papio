@@ -525,7 +525,11 @@ names each one as a blocker:
 
 Eligible jobs are those awaiting a person on one open `openurl_handoff`, and
 those on one open `manual_download` that `papio jobs redrive` would accept; the
-drive redrives such a job through the same store function first. It never opens
+drive redrives such a job through the same store function first. When that
+redrive sends the job back to resolving (a manual download left by an
+open-access route, or a job whose institution has already reported no
+entitlement), the drive opens nothing on that pass: resolving offers the
+open-access handoff again when that route remains. It never opens
 an `openurl_available` advisory, because that link opens outside *papio*'s
 window. It skips a job it opened within `job_backoff_hours`, and every job
 behind a provider host that is refusing this browser: a host in a
@@ -534,10 +538,10 @@ last 10 minutes. The skip covers the papers that went to that host and every
 paper under the same DOI prefix. A paced paper whose sign-in stalled cools its
 own route the same way.
 
-Every paced open records `drive.paced_open` on the job and `handoff.opened` with
-principal `pacer`. Pauses and resumes are the system events `drive.paused` and
-`drive.resumed`. `papio drive resume` always holds: sign-in evidence recorded
-before it never pauses the drive again.
+Every paced open records `drive.paced_open` on the job and, when it opens a
+handoff, `handoff.opened` with principal `pacer`. Pauses and resumes are the
+system events `drive.paused` and `drive.resumed`. `papio drive resume` always
+holds: sign-in evidence recorded before it never pauses the drive again.
 
 This section is strict-mode configuration. Deploy the binary that understands
 it together with the configuration change; an older daemon rejects the whole

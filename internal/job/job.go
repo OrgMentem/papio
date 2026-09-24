@@ -2385,6 +2385,16 @@ func (js *Store) ResetCandidates(ctx context.Context, jobID string) error {
 	return err
 }
 
+// HasOpenAccessCandidateToTry reports whether a job holds an open-access
+// candidate that a fresh resolution pass would fetch: one still pending, or
+// one ResetCandidates hands back (interrupted or retryable).
+func (js *Store) HasOpenAccessCandidateToTry(ctx context.Context, jobID string) (bool, error) {
+	var found int
+	err := js.S.DB().QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM candidates
+		WHERE job_id = ? AND access_basis = 'open_access' AND status IN ('pending','fetching','retryable'))`, jobID).Scan(&found)
+	return found != 0, err
+}
+
 // Attempt records one resolve/fetch/validate execution.
 func (js *Store) StartAttempt(ctx context.Context, jobID string, candidateID int64, stage, source string) (int64, error) {
 	var cand any
