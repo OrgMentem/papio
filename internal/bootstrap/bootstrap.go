@@ -459,6 +459,14 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		ExceptionTags:      cfg.Zotio.ExceptionTags,
 		UnavailableRecheck: time.Duration(cfg.Zotio.UnavailableRecheckDays) * 24 * time.Hour,
 	}
+	// The budgeted lookup enrichDOIWork uses also gives a new Zotero item the
+	// abstract its registry record lacks, before Zotero desktop saves it.
+	if lookup := service.Discovery; lookup != nil {
+		zotioService.Abstracts = func(ctx context.Context, doi string) (string, error) {
+			found, err := lookup.LookupWork(ctx, doi)
+			return found.Abstract, err
+		}
+	}
 	holdings := ownership.NewRegistry()
 	// browserZotio is the page-bulk status ownership seam (nil when zotio is
 	// not configured, mirroring the ADR-0008 exclusivity with holdings below):
