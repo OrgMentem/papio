@@ -8,6 +8,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,44 +110,86 @@ func TestExhaustedCandidatesRouteToInstitutionalHandoff(t *testing.T) {
 	}
 }
 
+// publicHostResolver answers every host with one public address, so the real
+// downloader's destination policy admits a fixture host. The transport below
+// never dials it.
+type publicHostResolver struct{}
+
+func (publicHostResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+}
+
+// handlerTransport serves every request from an in-process handler.
+type handlerTransport struct{ handler http.Handler }
+
+func (t handlerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	recorder := httptest.NewRecorder()
+	t.handler.ServeHTTP(recorder, r)
+	return recorder.Result(), nil
+}
+
 func TestBotBlockedOACandidateRoutesToBrowserHandoff(t *testing.T) {
 	const oaURL = "https://oa.example.org/articles/blocked-paper.pdf"
-	svc, jobs := newTestService(t)
-	svc.Config.AccessMode = config.ModeDelegated
-	svc.Config.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
-	svc.Resolvers = []ResolverEntry{{
-		Adapter: &fakeResolver{name: "openalex", cands: []resolver.Candidate{{
-			Source: "openalex", URL: oaURL, ResolvedWork: work.Work{DOI: "10.1002/example"},
-			Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
-			ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
-		}}},
-		Policy: config.Source{Enabled: true},
-	}}
-	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
-		return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "permanent HTTP response"}
-	}
-	svc.Validate = passValidation()
-
-	row := processToEnd(t, svc, jobs, "wr_oa_bot_block")
-	if row.State != job.StateAwaitingHuman {
-		t.Fatalf("state = %s, want awaiting_human", row.State)
-	}
-	actions, err := jobs.ListHumanActions(context.Background(), true)
+	// An AWS WAF challenge answers 202 with an empty body. A gold open-access
+	// paper's repository copy answered exactly that on 2026-09-24, papio called
+	// the candidate invalid, and the paper went to the institution's resolver,
+	// which it never needed. This case runs the production downloader.
+	wafChallenge, err := fetch.New(fetch.DefaultPolicy(), publicHostResolver{}, handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		w.Header().Set("X-Amzn-Waf-Action", "challenge")
+		w.WriteHeader(http.StatusAccepted)
+	})})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, action := range actions {
-		if action.JobID == row.ID && action.Kind == "openurl_handoff" {
-			if action.Detail != OABrowserHandoffActionDetail(oaURL) {
-				t.Fatalf("handoff detail = %q, want OA browser marker and URL", action.Detail)
+	for _, tc := range []struct {
+		name  string
+		fetch FetchFunc
+	}{
+		{"forbidden", func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+			return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: 403, Msg: "permanent HTTP response"}
+		}},
+		{"aws waf challenge", func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
+			return wafChallenge.DownloadWithHeaders(ctx, candidate.URL, candidate.RequestHeaders, path)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			svc.Config.AccessMode = config.ModeDelegated
+			svc.Config.Browser.OpenURLBase = "https://openurl.example.edu/resolve"
+			svc.Resolvers = []ResolverEntry{{
+				Adapter: &fakeResolver{name: "openalex", cands: []resolver.Candidate{{
+					Source: "openalex", URL: oaURL, ResolvedWork: work.Work{DOI: "10.1002/example"},
+					Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+					ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+				}}},
+				Policy: config.Source{Enabled: true},
+			}}
+			svc.Fetch = tc.fetch
+			svc.Validate = passValidation()
+
+			row := processToEnd(t, svc, jobs, "wr_oa_bot_block")
+			if row.State != job.StateAwaitingHuman {
+				t.Fatalf("state = %s, want awaiting_human", row.State)
 			}
-			if action.RequiresAuth || action.BlockedBy != "anti_bot" {
-				t.Fatalf("handoff access = requires_auth %t, blocked_by %q, want false/anti_bot", action.RequiresAuth, action.BlockedBy)
+			actions, err := jobs.ListHumanActions(context.Background(), true)
+			if err != nil {
+				t.Fatal(err)
 			}
-			return
-		}
+			for _, action := range actions {
+				if action.JobID == row.ID && action.Kind == "openurl_handoff" {
+					if action.Detail != OABrowserHandoffActionDetail(oaURL) {
+						t.Fatalf("handoff detail = %q, want OA browser marker and URL", action.Detail)
+					}
+					if action.RequiresAuth || action.BlockedBy != "anti_bot" {
+						t.Fatalf("handoff access = requires_auth %t, blocked_by %q, want false/anti_bot", action.RequiresAuth, action.BlockedBy)
+					}
+					return
+				}
+			}
+			t.Fatal("missing OA browser handoff")
+		})
 	}
-	t.Fatal("missing OA browser handoff")
 }
 
 func TestForbiddenNonOACandidateKeepsInstitutionalHandoff(t *testing.T) {
