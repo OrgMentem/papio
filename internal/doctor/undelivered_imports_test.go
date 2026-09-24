@@ -115,6 +115,17 @@ func TestRunReportsPapersWaitingForZoteroDesktop(t *testing.T) {
 		t.Fatalf("stuck zotero_desktop_waiting = %+v, want the restart remedy for 3 papers", stuck)
 	}
 
+	// A busy Zotero (a large sync holds it) needs neither opening nor a
+	// restart.
+	if _, err := db.DB().ExecContext(ctx, `UPDATE events SET detail_json = json_set(detail_json, '$.reason', 'zotero_busy') WHERE job_id = 'job_waiting_stuck'`); err != nil {
+		t.Fatal(err)
+	}
+	busy := importCheck(t, ctx, db, "zotero_desktop_waiting")
+	if !strings.Contains(busy.Detail, "Zotero desktop is busy: 3 papers") ||
+		strings.Contains(busy.Remediation, "restart") || strings.Contains(busy.Remediation, "open Zotero") {
+		t.Fatalf("busy zotero_desktop_waiting = %+v, want the busy condition without an open or restart remedy", busy)
+	}
+
 	empty, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)

@@ -135,8 +135,10 @@ execution records kept during the initial build.
   when no paper waits for that reason any more. `papio activity`
   and the extension show "Waiting for Zotero desktop", `papio status` shows
   `import=waiting` and what to do, and the new `papio doctor` check
-  `zotero_desktop_waiting` gives the number of papers. When Zotero is open
-  but does not respond, or its connector is turned off, the papers also wait
+  `zotero_desktop_waiting` gives the number of papers. When Zotero is busy,
+  for example with a large sync, the papers wait and every surface says that
+  Zotero is busy. When Zotero is open
+  but does not respond for a minute, or its connector is turned off, the papers also wait
   without using attempts. Then every surface tells you to restart Zotero, or
   to turn on "Allow other applications to communicate with Zotero" in its
   Advanced settings, and you get one notification for that condition.

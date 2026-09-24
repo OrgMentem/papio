@@ -745,3 +745,34 @@ func TestWaitingPapersPastThePassBoundAreQueuedWhenZoteroOpens(t *testing.T) {
 		}
 	}
 }
+
+// A large sync can hold Zotero's main thread for seconds, and zotio then
+// reports the open Zotero as busy. That is neither "open Zotero" nor
+// "restart Zotero": the paper waits without spending an attempt, and the
+// notice says Zotero is busy.
+func TestBusyZoteroWaitsAndSaysBusy(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	desktop := newFakeZoteroDesktop()
+	desktop.setStuck(zotio.DesktopStateBusy)
+	svc.AutoImporter = desktop
+	svc.ZoteroDesktop = desktop
+	sink := &fakeNotificationSink{}
+	svc.Notifier = sink
+	id := seedReadyExistingItemJob(t, svc, jobs, "wr_zotero_busy")
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(importReasons(t, jobs, id), ","); got != "waiting:zotero_busy" {
+		t.Fatalf("import events = %s, want one busy wait", got)
+	}
+	notices := zoteroWaitingIntents(sink)
+	if len(notices) != 1 {
+		t.Fatalf("waiting notices = %d, want 1", len(notices))
+	}
+	if want := "Zotero is busy. 1 paper is ready to add. papio adds it when Zotero answers."; notices[0].Message != want {
+		t.Fatalf("notice = %q, want %q", notices[0].Message, want)
+	}
+}

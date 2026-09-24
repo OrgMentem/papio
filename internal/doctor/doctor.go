@@ -804,6 +804,10 @@ func zoteroDesktopWaitingCopy(reason string) (condition, remedy string) {
 	case "zotero_connector_off":
 		return "Zotero desktop is open but does not accept papers from papio",
 			`in Zotero, turn on Settings > Advanced > "Allow other applications to communicate with Zotero"` + spent
+	case "zotero_busy":
+		// A large sync can hold Zotero for seconds; zotio reports a hang only
+		// after a minute of silence, and the reason then changes.
+		return "Zotero desktop is busy", "wait for Zotero desktop to finish its current work, such as a large sync" + spent
 	case "zotero_connector_unreachable":
 		return "Zotero desktop is starting", "wait for Zotero desktop to finish starting, or restart it if it does not" + spent
 	}

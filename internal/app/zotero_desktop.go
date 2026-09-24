@@ -35,6 +35,9 @@ const (
 	// requests; waiting alone does not end these.
 	importReasonZoteroUnresponsive = "zotero_unresponsive"
 	importReasonConnectorOff       = "zotero_connector_off"
+	// Zotero runs past its startup window and did not answer one check, as
+	// a large sync makes it; waiting ends it.
+	importReasonZoteroBusy = "zotero_busy"
 	// A queued import waited for Zotero desktop, which now accepts connector
 	// saves; it waits only for its turn in the paced import pass.
 	importStatusQueued      = "queued"
@@ -53,6 +56,8 @@ func desktopWaitReason(status zotio.DesktopStatus) string {
 		return importReasonConnectorOff
 	case status.Stuck():
 		return importReasonZoteroUnresponsive
+	case status.State == zotio.DesktopStateBusy:
+		return importReasonZoteroBusy
 	case status.Running:
 		return importReasonConnectorUnreachable
 	default:
@@ -387,6 +392,8 @@ func zoteroWaitingMessage(waiting int, reason string) string {
 		return fmt.Sprintf("Zotero is open but not responding. %s ready to add. Restart Zotero and papio adds %s.", papers, them)
 	case importReasonConnectorOff:
 		return fmt.Sprintf("Zotero is open but does not accept papers from papio. %s ready to add. In Zotero, turn on Settings > Advanced > \"Allow other applications to communicate with Zotero\".", papers)
+	case importReasonZoteroBusy:
+		return fmt.Sprintf("Zotero is busy. %s ready to add. papio adds %s when Zotero answers.", papers, them)
 	case importReasonConnectorUnreachable:
 		return fmt.Sprintf("Zotero is starting. %s ready to add. papio adds %s when Zotero is ready.", papers, them)
 	default:

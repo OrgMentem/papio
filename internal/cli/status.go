@@ -315,6 +315,8 @@ func zoteroWaitingGuidance(reason string) string {
 		return "Zotero desktop is open but not responding. Restart Zotero and papio adds these papers."
 	case "zotero_connector_off":
 		return "Zotero desktop does not accept papers from papio. In Zotero, turn on Settings > Advanced > \"Allow other applications to communicate with Zotero\"."
+	case "zotero_busy":
+		return "Zotero desktop is busy. papio adds these papers when it answers."
 	case "zotero_connector_unreachable":
 		return "Zotero desktop is starting. papio adds these papers when it is ready."
 	}

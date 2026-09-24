@@ -41,6 +41,9 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 		// An open but stuck Zotero needs a restart, not "open Zotero".
 		{"zotio.auto_import", map[string]any{"status": "waiting", "reason": "zotero_unresponsive"}, "Waiting for Zotero desktop to respond (restart Zotero)"},
 		{"zotio.auto_import", map[string]any{"status": "waiting", "reason": "zotero_connector_off"}, "Waiting for Zotero's connector (turn it on in Zotero)"},
+		// A busy Zotero, as a large sync makes it, needs neither opening nor
+		// a restart.
+		{"zotio.auto_import", map[string]any{"status": "waiting", "reason": "zotero_busy"}, "Waiting for Zotero desktop (Zotero is busy)"},
 		// Zotero opened: the paper waits only for its turn in the paced pass.
 		{"zotio.auto_import", map[string]any{"status": "queued", "reason": "zotero_ready"}, "Queued for Zotero (Zotero desktop is ready)"},
 		{"zotio.collection_filing", map[string]any{"status": "applied"}, "Filed into Zotero collection"},

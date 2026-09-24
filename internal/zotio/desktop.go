@@ -49,7 +49,8 @@ type DesktopStatus struct {
 	// ConnectorReachable is true when the connector answered its ping; a
 	// connector save needs this, not merely a running process.
 	ConnectorReachable bool `json:"connector_reachable"`
-	// State is "ready", "starting", or "stopped".
+	// State is "ready", "starting", "busy", "unresponsive", "connector_off",
+	// or "stopped".
 	State    string `json:"state,omitempty"`
 	Evidence string `json:"evidence,omitempty"`
 	// Outcome is set only by `desktop wait`: "ready", "timeout", or a
@@ -68,6 +69,13 @@ const (
 	DesktopStateUnresponsive = "unresponsive"
 	DesktopStateConnectorOff = "connector_off"
 )
+
+// DesktopStateBusy is a Zotero past its startup window whose connector port
+// accepted a connection and did not answer one check. A large sync can hold
+// Zotero's main thread for seconds, so this is not a hang and waiting ends
+// it: `zotio desktop wait` keeps checking, and reports unresponsive only
+// after the connector stays silent for 60 seconds.
+const DesktopStateBusy = "busy"
 
 // Stuck reports whether Zotero runs but its connector will not recover on its
 // own: it accepts connections and does not answer (unresponsive), or nothing
