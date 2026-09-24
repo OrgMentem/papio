@@ -401,6 +401,8 @@ export type MaterializationEvent =
   | { type: "retry_route_response"; attempt: number; retry_after?: number }
   | { type: "retry_navigated"; attempt: number; retry_after?: number }
   | { type: "failed" }
+  /** The tab a navigated binding drove is gone. See reduceMaterialization. */
+  | { type: "surface_lost"; tab_id: number; lost_at: string }
   | { type: "clear" };
 
 export const MATERIALIZATION_ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/u;
@@ -546,6 +548,7 @@ const MATERIALIZATION_TRANSITIONS: Readonly<
     "route_issued",
     "navigating",
   ],
+  surface_lost: ["navigated"],
   clear: MATERIALIZATION_PHASES,
 };
 
@@ -625,6 +628,41 @@ export function reduceMaterialization(
       return next;
     }
     return { ...store, activeJobs, materializations };
+  }
+  if (event.type === "surface_lost") {
+    // A navigated binding is spent once its tab is gone: the daemon abandons
+    // or settles its claim, and papio never navigates one attempt twice. Kept
+    // as it was, the correlation read every later offer of the same candidate
+    // as a lease refresh and handed the dead tab id back to the job. Measured
+    // live 2026-09-24: eight papers whose sign-in tabs timed out showed Focus
+    // with no tab, and neither the paced drive nor `papio actions open` could
+    // produce a surface. What survives is the candidate identity, so the
+    // operator's Open still asks the daemon's claim arbitration. The expiry
+    // becomes the loss time: the offer this correlation answered is used up,
+    // so only a fresh daemon offer (always a later expiry) claims again, and a
+    // reconnect or wake cannot build a surface the daemon did not offer.
+    if (current.tab_id !== event.tab_id || !validRFC3339(event.lost_at)) return store;
+    const lostAt = Date.parse(event.lost_at);
+    const retired: MaterializationCorrelation = {
+      job_id: current.job_id,
+      candidate_id: current.candidate_id,
+      materialization_kind: current.materialization_kind,
+      candidate_expires_at:
+        lostAt < Date.parse(current.candidate_expires_at)
+          ? event.lost_at
+          : current.candidate_expires_at,
+      phase: "failed",
+      tab_id: -1,
+    };
+    return {
+      ...store,
+      materializations: { ...(store.materializations ?? {}), [jobID]: retired },
+      activeJobs: store.activeJobs.map((job) =>
+        job.job_id === jobID && job.tab_id === current.tab_id
+          ? { ...job, tab_id: -1 }
+          : job,
+      ),
+    };
   }
   let next: MaterializationCorrelation = { ...current };
   switch (event.type) {

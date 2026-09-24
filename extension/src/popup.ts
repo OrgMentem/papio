@@ -1951,7 +1951,7 @@ function renderWaitingOnSignIn(
     // Institution session — it only restates what is directly below it.
     heading.hidden = jobs.length < 2;
     heading.textContent = jobs.some(
-      (job) => job.engagement_required === true && job.tab_id < 0,
+      (job) => job.waiting_for_session !== true && job.tab_id < 0,
     )
       ? "Open institutional access"
       : "Waiting on your sign-in";
@@ -2004,7 +2004,10 @@ function renderWaitingOnSignIn(
     const button = doc.createElement("button");
     button.className = "ghost";
     button.type = "button";
-    const actionLabel = job.engagement_required === true && job.tab_id < 0 ? "Open" : "Focus";
+    // Focus needs a tab to raise. A paper with none - the drive timeout parks
+    // an unattended sign-in as auth_pending and closes its tab - listed Focus
+    // on eight papers on 2026-09-24, and clicking it could not open anything.
+    const actionLabel = job.tab_id < 0 ? "Open" : "Focus";
     button.textContent = actionLabel;
     button.addEventListener("click", () => {
       button.disabled = true;

@@ -68,6 +68,15 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **An institutional paper whose sign-in tab closed can be opened again.**
+  When the three-minute drive timeout closed an unattended sign-in tab, the
+  extension kept the dead surface as live. Every later offer of that paper
+  (the paced drive, `papio actions open`, a sign-in release) then did
+  nothing, and the popup listed the paper under **Focus** with no tab to
+  focus. The extension now retires a closed surface, so the next offer builds
+  a new one and the popup offers **Open**. A reconnect also retires dead
+  surfaces again: its reconcile ignored the daemon's answer when no binding
+  was live. **Focus** on a tab that has gone opens a fresh surface.
 - **The article-agent skip reason names the paper's assisted mode.** On a page
   with no adapter, the autonomous article agent refused to act on an
   assisted paper and reported "this browser lacks authority for the attempt",

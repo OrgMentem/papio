@@ -7567,6 +7567,45 @@ export class Bridge {
     }
   }
 
+  /** A paper can hold the id of a tab that no longer exists: a sibling that
+   * waited on another paper's sign-in tab keeps that tab's id when it closes.
+   * Focusing it throws, which left the popup's Focus doing nothing on screen.
+   * Only proven absence detaches; any other failure keeps the tab. */
+  private async detachClosedHandoffTab(
+    jobID: string,
+  ): Promise<ActiveJob | undefined> {
+    const job = findByJob(this.store, jobID);
+    if (job === undefined || job.tab_id < 0) return job;
+    const tabID = job.tab_id;
+    try {
+      const tab = await this.deps.tabs.get(tabID);
+      if (tab.id === tabID) return findByJob(this.store, jobID);
+    } catch (e) {
+      if (!isTabAbsenceRejection(e)) return findByJob(this.store, jobID);
+    }
+    await this.update((s) =>
+      findByJob(s, jobID)?.tab_id === tabID
+        ? patchJob(s, jobID, { tab_id: -1 })
+        : s,
+    );
+    return findByJob(this.store, jobID);
+  }
+
+  /** A sign-in paper with no tab and no retained resolver URL is reachable
+   * only through a fresh surface. That is the operator's engagement park, and
+   * also a paper the drive timeout detached from its sign-in page: it stays
+   * `auth_pending` and never gains `engagement_required`. A Slice 0 legacy
+   * park keeps its offer URL, and the queued release below drives that URL;
+   * openFreshHandoff would dead-end on requiring a fresh link. */
+  private needsFreshSignInSurface(job: ActiveJob): boolean {
+    return (
+      job.requires_auth === true &&
+      job.tab_id < 0 &&
+      (job.engagement_required === true || job.status === "auth_pending") &&
+      !this.offerURLs.has(job.job_id)
+    );
+  }
+
   private async openHandoffUnlocked(
     jobID: string,
   ): Promise<BrokerReply<{ opened: true }>> {
@@ -7577,6 +7616,7 @@ export class Bridge {
       await this.ensureConnected();
       job = findByJob(this.store, jobID);
     }
+    job = await this.detachClosedHandoffTab(jobID);
     if (job !== undefined && job.tab_id >= 0) {
       return (await this.focusExistingHandoff(jobID, job.tab_id))
         ? { ok: true, opened: true }
@@ -7586,7 +7626,7 @@ export class Bridge {
           );
     }
     const engagementRequired =
-      job?.requires_auth === true && job.engagement_required === true;
+      job !== undefined && this.needsFreshSignInSurface(job);
     if (
       job === undefined ||
       (!engagementRequired && !this.offerURLs.has(jobID))
@@ -7606,8 +7646,8 @@ export class Bridge {
         }
       }
       await this.inboundChain;
-      job = findByJob(this.store, jobID);
     }
+    job = await this.detachClosedHandoffTab(jobID);
     if (job === undefined) {
       return failure(
         "handoff_unavailable",
@@ -7622,15 +7662,8 @@ export class Bridge {
             "The handoff is waiting for the active browser effect",
           );
     }
-    if (job.requires_auth === true && job.engagement_required === true) {
-      // A Slice 0 legacy park retains its offer URL (the offer predates
-      // fresh links or carried no institution identity); the operator's
-      // open drives that URL through the forced queued release below —
-      // openFreshHandoff would dead-end on requiring a fresh link. Fresh
-      // parks have no retained URL and mint a new route.
-      if (!this.offerURLs.has(jobID)) {
-        return this.openFreshHandoff(jobID, job, "explicit");
-      }
+    if (this.needsFreshSignInSurface(job)) {
+      return this.openFreshHandoff(jobID, job, "explicit");
     }
     if (!this.offerURLs.has(jobID)) {
       return failure(
@@ -8527,6 +8560,26 @@ export class Bridge {
   private async clearMaterializationWorkflow(jobID: string): Promise<void> {
     this.cancelMaterializationWorkflow(jobID);
     await this.applyMaterialization(jobID, { type: "clear" });
+  }
+
+  /** Retire the materialization correlation whose navigated surface was
+   * `tabID`. The drive timeout detaches a paper from its sign-in tab before
+   * closing it, so the closed tab belongs to no job and the correlation is the
+   * only thing still pointing at it. A deliberate removal is excluded: that
+   * caller settles its own correlation. */
+  private async retireLostMaterializationSurface(
+    tabID: number,
+    bindingID: string | undefined,
+  ): Promise<void> {
+    for (const [jobID, entry] of Object.entries(this.store.materializations ?? {})) {
+      if (entry.phase !== "navigated" || entry.tab_id !== tabID) continue;
+      if (bindingID !== undefined && entry.binding_id !== bindingID) continue;
+      await this.applyMaterialization(jobID, {
+        type: "surface_lost",
+        tab_id: tabID,
+        lost_at: new Date(this.deps.now()).toISOString(),
+      });
+    }
   }
 
   private materializationCorrelation(
@@ -9714,7 +9767,14 @@ export class Bridge {
       {},
     );
     const payload = response?.payload;
-    if (payload === undefined || !Array.isArray(payload["claims"])) return;
+    // The daemon omits an empty `claims` (`omitempty`), which is exactly the
+    // answer when every submitted binding is dead. Returning early on it left
+    // each dead binding's correlation `navigated` across the handshake that
+    // exists to retire it. On 2026-09-24 every claim in the store was already
+    // abandoned when the 11:25Z handshake ran, so it cleared nothing, and each
+    // later offer of those papers' candidates restored a closed tab id.
+    const claims = payload?.["claims"] ?? [];
+    if (payload === undefined || !Array.isArray(claims)) return;
     const liveBindings = new Set<string>();
     const currentFor = (snapshot: {
       job_id: string;
@@ -9727,7 +9787,7 @@ export class Bridge {
         ? entry
         : undefined;
     };
-    for (const rawClaim of payload["claims"]) {
+    for (const rawClaim of claims) {
       if (typeof rawClaim !== "object" || rawClaim === null) continue;
       const claim = rawClaim as Record<string, unknown>;
       const bindingID = claim["binding_id"];
@@ -9909,6 +9969,10 @@ export class Bridge {
       offered_at: existingJob?.offered_at ?? now,
       expires_at: expiresMs,
       provider_hosts: providerHosts,
+      // The candidate names the institution, so the operator's Open can mint a
+      // fresh link after the daemon retires this correlation (a reconnect's
+      // reconcile clears an abandoned claim outright).
+      claim_identity_known: true,
       ...(accessMode !== undefined ? { access_mode: accessMode } : {}),
       ...(expected !== undefined ? { expected } : {}),
       ...(requiresAuth !== undefined ? { requires_auth: requiresAuth } : {}),
@@ -20860,6 +20924,7 @@ export class Bridge {
       // extension update this birth record is the only durable proof of the
       // claim, and a worker crash between the two must not lose the report.
       void this.surfaces.forgetLedgeredTab(tabID);
+      if (!deliberate) await this.retireLostMaterializationSurface(tabID, ownerBindingID);
       if (wasBadgedAuthWall) await this.syncConnectionBadge();
       return;
     }
@@ -20913,6 +20978,7 @@ export class Bridge {
       }
     }
     this.clearClaimGrant(job.job_id);
+    if (!deliberate) await this.retireLostMaterializationSurface(tabID, ownerBindingID);
     if (authorizedClose || deliberate) {
       // Deliberate: either a daemon-authorized close (closeOwnedSurface) or
       // this worker's own reconcile removal. Detach the job from its now-gone
