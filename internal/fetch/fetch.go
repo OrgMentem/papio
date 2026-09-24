@@ -554,6 +554,15 @@ func contentLengthAllowed(resp *http.Response, max int64) error {
 
 func statusError(resp *http.Response) error {
 	status := resp.StatusCode
+	// A bot wall names its challenge in a header, whatever the status: AWS WAF
+	// answers a challenge with 202 and an empty body and a CAPTCHA with 405,
+	// both carrying x-amzn-waf-action, and Cloudflare sets cf-mitigated. This
+	// client cannot pass one and a retry cannot either, but an ordinary browser
+	// can, so the candidate is invalid here and the message says challenge,
+	// which is what lets an open-access candidate take the browser route.
+	if botChallenge(resp.Header) {
+		return invalidStatus(status, "anti-bot challenge response")
+	}
 	switch {
 	case status >= 200 && status < 300:
 		return nil
@@ -564,6 +573,14 @@ func statusError(resp *http.Response) error {
 	default:
 		return invalidStatus(status, "HTTP response rejected")
 	}
+}
+
+func botChallenge(header http.Header) bool {
+	switch strings.ToLower(strings.TrimSpace(header.Get("X-Amzn-Waf-Action"))) {
+	case "challenge", "captcha":
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(header.Get("Cf-Mitigated")), "challenge")
 }
 
 func retryAfter(value string) time.Duration {

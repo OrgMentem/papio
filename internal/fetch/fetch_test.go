@@ -405,6 +405,30 @@ func TestHTTPStatusClassificationAndRetryAfter(t *testing.T) {
 	}
 }
 
+// A bot wall's challenge is neither a payload failure nor a transient one:
+// papio's client cannot pass it, a retry cannot either, and a browser can.
+// AWS WAF answers a challenge with 202 and an empty body (measured 2026-09-24
+// on a Digital Commons repository) and a CAPTCHA with 405; Cloudflare marks its
+// challenge with cf-mitigated, which on a 503 would otherwise read as temporary.
+func TestBotChallengeResponsesAreInvalidChallenges(t *testing.T) {
+	for _, tc := range []struct {
+		status        int
+		header, value string
+	}{
+		{http.StatusAccepted, "X-Amzn-Waf-Action", "challenge"},
+		{http.StatusMethodNotAllowed, "X-Amzn-Waf-Action", "captcha"},
+		{http.StatusServiceUnavailable, "Cf-Mitigated", "challenge"},
+	} {
+		d := testDownloader(t, publicResolver(nil), roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return response(tc.status, "", map[string]string{tc.header: tc.value, "Content-Type": "text/html"}), nil
+		}))
+		_, err := d.Download(context.Background(), "https://papers.example/file", filepath.Join(t.TempDir(), "x"))
+		if got := fetchError(t, err); got.Class != ClassInvalid || got.HTTPStatus != tc.status || !strings.Contains(got.Msg, "challenge") {
+			t.Fatalf("%d %s: %+v", tc.status, tc.header, got)
+		}
+	}
+}
+
 func TestResolverFailureAndNetworkFailureAreRetryable(t *testing.T) {
 	resolver := resolverFunc(func(context.Context, string, string) ([]netip.Addr, error) { return nil, errors.New("dns down") })
 	d := testDownloader(t, resolver, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("unreachable") }))

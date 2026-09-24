@@ -4654,7 +4654,9 @@ func isOABrowserBlocked(candidate resolver.Candidate, err error) bool {
 	}
 	// Fetch keeps the classification message redacted. Challenge/captcha
 	// payloads are meaningful here: the ordinary browser can clear a public
-	// anti-bot gate without presenting an institutional credential.
+	// anti-bot gate without presenting an institutional credential. fetch
+	// names a response whose WAF header marks a challenge this way (an AWS
+	// WAF challenge is a 202 with an empty body, not a 403).
 	msg := strings.ToLower(fe.Msg)
 	return strings.Contains(msg, "challenge") || strings.Contains(msg, "anti-bot") || strings.Contains(msg, "captcha")
 }

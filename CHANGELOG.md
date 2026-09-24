@@ -71,6 +71,16 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **An open-access copy behind a bot challenge now opens in the browser.**
+  Some repositories answer a download with an AWS WAF challenge: HTTP 202,
+  an empty body, and the header `x-amzn-waf-action: challenge`. *papio*
+  read that answer as a PDF that was not valid. It then sent the paper to
+  your institution's sign-in, which an open-access paper does not need. Now
+  *papio* reads the header as a challenge and opens the copy in your browser,
+  the same route that it uses for a copy that answers 403. This also applies
+  to an AWS WAF CAPTCHA (405, `x-amzn-waf-action: captcha`) and to a
+  Cloudflare challenge (`cf-mitigated: challenge`). Before, *papio* retried a
+  Cloudflare challenge on a 503 as a temporary failure.
 - **A ready paper that zotio cannot describe now reaches Zotero.** zotio
   describes a new paper from its DOI registry record, and it asks Crossref and
   DataCite only. A DOI from another registration agency, such as mEDRA, is in
