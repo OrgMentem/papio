@@ -354,7 +354,7 @@ mutation remains preview-first: `papio zotio plan` returns immutable plans and
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `on_ready` | shell command string | empty | When set, runs once via the system shell (`/bin/sh -c`; `cmd /C` on Windows) each time a job reaches `ready` (validated artifact). Job metadata arrives as `PAPIO_*` environment variables. Fire-and-forget: a failing hook is recorded as a `hook.on_ready` job event but never fails or retries the job. Empty disables it. See the [hooks guide](../guide/hooks.md). |
+| `on_ready` | shell command string | empty | When set, runs once via the system shell (`/bin/sh -c`; on Windows `cmd /d /s /c "<command>"`, which runs the command exactly as written, quotes included) each time a job reaches `ready` (validated artifact). Job metadata arrives as `PAPIO_*` environment variables. Fire-and-forget: a failing hook is recorded as a `hook.on_ready` job event but never fails or retries the job. Empty disables it. See the [hooks guide](../guide/hooks.md). |
 | `timeout_seconds` | integer seconds | `120` | Deadline for one hook run. Validated (5..600) only when `on_ready` is set. |
 
 ## `[[library.sources]]`

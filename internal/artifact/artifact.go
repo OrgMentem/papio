@@ -112,9 +112,10 @@ func (s *Store) Promote(tempPath, expectedSHA string) (path string, created bool
 		return "", false, fmt.Errorf("quarantine file hash %s does not match expected %s", sha, expectedSHA)
 	}
 
-	// Apply read-only mode before the artifact becomes visible so no
-	// post-publication chmod is needed. This is the last fallible step
-	// before the atomic publication (link or rename).
+	// Apply read-only mode before the artifact becomes visible, so it is never
+	// published writable. This is the last fallible step before the atomic
+	// publication (link or rename). Only Windows needs the mode again after
+	// cleanup (reassertReadOnly).
 	if err := chmodFile(tempPath, 0o400); err != nil {
 		return "", false, err
 	}
@@ -157,6 +158,11 @@ func (s *Store) Promote(tempPath, expectedSHA string) (path string, created bool
 	// incorrectly delete a valid artifact if cleanup were treated as fatal.
 	if !renamed {
 		_ = removeFile(tempPath)
+		if created {
+			// The removed name was a hard link to the artifact; see
+			// reassertReadOnly for why that can cost the read-only mode.
+			reassertReadOnly(dest)
+		}
 	}
 	return dest, created, nil
 }

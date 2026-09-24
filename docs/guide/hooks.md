@@ -27,8 +27,9 @@ Contract:
   `status`, `exit_code`, `duration_ms`, and `trigger` (`ready` or `manual`). Hook stdout/stderr is **not**
   recorded (it could carry secrets from your environment) — have your
   command do its own logging if you need output.
-- **Shell semantics.** The command runs via `/bin/sh -c` (`cmd /C` on
-  Windows). The recipes below are POSIX-shell.
+- **Shell semantics.** The command runs via `/bin/sh -c` (on Windows,
+  `cmd /d /s /c "<command>"`, which keeps your quotes as written). The
+  recipes below are POSIX-shell.
 - **Concurrency.** Concurrent ready jobs may run hooks concurrently; if your
   command needs serialization, own it (e.g. `flock`).
 

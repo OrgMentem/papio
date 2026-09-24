@@ -78,6 +78,27 @@ func TestEnvDelivered(t *testing.T) {
 	}
 }
 
+// A Windows hook that names anything under C:\Program Files needs quotes.
+// os/exec quoted the command for CommandLineToArgvW, so cmd.exe received \"
+// and failed with "The filename, directory name, or volume label syntax is
+// incorrect." The same command line is valid in sh and in cmd.
+func TestQuotedPathReachesTheShellVerbatim(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "with space")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "out.txt")
+	r := &Runner{Command: `echo ok> "` + marker + `"`, Timeout: 10 * time.Second}
+	result := r.Run(context.Background(), nil)
+	if !result.Ran || result.ExitCode != 0 || result.Err != nil {
+		t.Fatalf("result = %+v, want exit 0", result)
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil || strings.TrimSpace(string(got)) != "ok" {
+		t.Fatalf("marker = %q, %v; want the quoted redirect to write ok", got, err)
+	}
+}
+
 func TestInjectableExecReceivesSortedEnv(t *testing.T) {
 	var gotCommand string
 	var gotEnv []string

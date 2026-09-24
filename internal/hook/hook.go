@@ -13,7 +13,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -77,11 +76,7 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	shell, flag := "/bin/sh", "-c"
-	if runtime.GOOS == "windows" {
-		shell, flag = "cmd", "/C"
-	}
-	cmd := exec.CommandContext(ctx, shell, flag, command)
+	cmd := shellCommand(ctx, command)
 	cmd.Env = append(os.Environ(), extra...)
 	cmd.Stdout = io.Discard
 	stderr := &tailBuffer{limit: 2 * stderrTailLimit}

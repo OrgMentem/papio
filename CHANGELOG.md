@@ -42,6 +42,22 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **On Windows, an `on_ready` hook with quotes in it now runs.** *papio*
+  ran the hook through `cmd /C`, but Go quoted the command for a different
+  parser, so `cmd.exe` saw `\"` in place of each quote. A hook that named a
+  quoted path, such as anything under `C:\Program Files`, failed with "The
+  filename, directory name, or volume label syntax is incorrect." *papio* now
+  gives `cmd.exe` the command exactly as written, as
+  `cmd /d /s /c "<command>"`. `/d` means that an AutoRun command in the
+  registry no longer runs before the hook. macOS and Linux are unchanged.
+- **On Windows, a stored PDF stays read-only.** *papio* makes each validated
+  PDF read-only before it moves the PDF into its store, then deletes the
+  download's temporary name. On Windows the read-only flag belongs to the
+  file, not to one of its names, and deleting that temporary name also
+  cleared the flag on the stored PDF. *papio* now sets the flag again after
+  the temporary name is gone. A PDF stored by an earlier version stays
+  writable until you set it read-only yourself. macOS and Linux are
+  unchanged.
 - **A sign-in on a new tab for your library is recorded again.** One library
   sign-in often serves many papers, and *papio* keeps one login record open
   across them. Each browser tab numbers its sign-in reports from zero, but
