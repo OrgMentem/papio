@@ -13825,10 +13825,20 @@ export class Bridge {
     if (!this.isInstitutionalSessionLanding(job, rawURL)) return false;
     const origin = this.jobInstitutionOrigin(job);
     if (origin === undefined) return false;
-    // §2.2.1 auth_returned (Slice 3): a claim-owned job's warm landing is
-    // exactly the same first-hand evidence this function already exists to
-    // record; latched so only the first landing per grant reports it.
-    void this.emitClaimObservation(job.job_id, job.tab_id, "auth_returned", true);
+    // §2.2.1 auth_returned (Slice 3): a RETURN, so only after this surface
+    // met a sign-in wall. The route's first landing is often the provider
+    // itself, before any wall, and that landing proves no sign-in. The report
+    // is latched per surface and occurrence, so an early one also silenced
+    // the real return: measured live 2026-09-24, job_cb931061ba reported
+    // auth_returned two seconds after its route and nothing when the
+    // operator signed in eight minutes later. `auth_pending` is the durable
+    // record of the wall; the latched wall_observed covers a status another
+    // path has already advanced.
+    if (
+      job.status === "auth_pending" ||
+      this.hasLatchedObservation(job.job_id, job.tab_id, "wall_observed")
+    )
+      void this.emitClaimObservation(job.job_id, job.tab_id, "auth_returned", true);
     await this.keepaliveManager?.noteInstitutionalLanding(
       origin,
       "tracked_auth_return",
@@ -16990,6 +17000,14 @@ export class Bridge {
     // A close during persistence wins over the stale provider landing.
     if (!this.authReturnsInFlight.delete(tabID)) return false;
     this.send("auth_returned", { elapsed_ms: elapsed }, jobID);
+    // A sign-in that outlived the drive timeout comes back to a paper whose
+    // drive was released and parked. The returned surface is papio's to drive
+    // again: without the drive, the generic candidate, the ScienceDirect CDN
+    // relation and every other drive-gated step refuse the article the operator
+    // just signed in for. Measured live 2026-09-24: job_cb931061ba returned
+    // eight minutes after its drive timed out and was never driven. A job
+    // whose drive is still live is unchanged.
+    await this.resumeHandoffAfterManual(jobID);
     const authReturnedOriginHint = this.jobInstitutionOrigin(job);
     this.emitSessionEvidence("auth_returned", authReturnedOriginHint);
     await this.recollapseHandoffGroup(tabID);

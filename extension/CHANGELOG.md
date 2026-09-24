@@ -58,6 +58,19 @@ for the full pre-split extension history.
   had failed. The daemon then gave up the paper's tab while you were still
   signing in. Firefox's cancelled pages are now ignored in the same way as
   Chrome's.
+- **A sign-in that takes longer than three minutes no longer stops the
+  paper.** *papio* drives one paper's tab for three minutes. When your
+  library sign-in took longer, *papio* stopped driving the tab. After you
+  signed in, it did not start again. Chrome then did not save a ScienceDirect
+  PDF that opened in a new tab, and other steps that need a driven tab
+  refused the article. When you come back from the sign-in, *papio* now drives
+  the tab again.
+- **The sign-in return is reported when you come back, not before.** The
+  first page of a library route is often the publisher's page, before the
+  sign-in page. The extension reported that page to the daemon as your return
+  from the sign-in. It reports a return only once per tab, so your real return
+  was not reported. The extension now reports a return only after the tab has
+  shown a sign-in page.
 
 ## [0.15.0] - 2026-09-23
 

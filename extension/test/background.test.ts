@@ -5210,6 +5210,153 @@ test("a timed-out institutional IdP tab reports owner_closed for its navigated b
   expect(h.frames().slice(closeAt).some((frame) => frame.type === "auth_returned")).toBe(false);
 });
 
+interface ClaimSurfaceIDs {
+  jobID: string;
+  candidateID: string;
+  claimID: string;
+  bindingID: string;
+}
+
+/** The daemon's candidate offer for `ids`, as its poll sends it. A later
+ * `expiresAt` makes it the same-candidate refresh the daemon repeats while
+ * the candidate stays live. */
+function claimSurfaceOffer(
+  ids: ClaimSurfaceIDs,
+  providerHosts: string[],
+  expiresAt = "2030-01-01T00:00:00Z",
+): unknown {
+  const offer = candidateOffer(ids.jobID, ids.candidateID, expiresAt) as {
+    msg_id: string;
+    payload: Record<string, unknown>;
+  };
+  offer.msg_id = `candidate_offer_${crypto.randomUUID().replace(/-/g, "")}`;
+  offer.payload["provider_hosts"] = providerHosts;
+  return offer;
+}
+
+/** Runs one institutional candidate through the daemon-orchestrated pipeline
+ * (claim, bind with an authentication-claim grant, route, navigate) and
+ * returns the tab the route navigated. */
+async function navigatedClaimSurface(
+  h: Harness,
+  ids: ClaimSurfaceIDs,
+  routeURL: string,
+  providerHosts: string[] = [PROVIDER_HOST],
+): Promise<number> {
+  const { jobID, candidateID, claimID, bindingID } = ids;
+  const framesBefore = h.port.posted.length;
+  await h.port.inbound(claimSurfaceOffer(ids, providerHosts));
+  const claim = await h.port.waitForFrame("institutional_claim_request", framesBefore);
+  const claimReply = institutionalClaimResponse(
+    jobID, candidateID, claimID, bindingID,
+  ) as { payload: Record<string, unknown> };
+  claimReply.payload["request_id"] = claim.payload["request_id"];
+  await h.port.inbound(claimReply);
+  const bind = await h.port.waitForFrame("institutional_bind_request", framesBefore);
+  const bindReply = institutionalBindResponse(
+    jobID, claimID, bindingID,
+  ) as { payload: Record<string, unknown> };
+  bindReply.payload["request_id"] = bind.payload["request_id"];
+  bindReply.payload["authentication_claim_id"] = `auth_${claimID}`;
+  bindReply.payload["gate_occurrence_id"] = `occ_${claimID}`;
+  await h.port.inbound(bindReply);
+  const route = await h.port.waitForFrame("institutional_route_request", framesBefore);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_route_response",
+    msg_id: `route_response_${bindingID}`,
+    job_id: jobID,
+    seq: 5,
+    payload: {
+      request_id: route.payload["request_id"],
+      outcome: "issued",
+      claim_id: claimID,
+      binding_id: bindingID,
+      route_issuance_ordinal: 1,
+      effect_ordinal: (route.payload["expected_effect_ordinal"] as number) + 1,
+      institutional_request_id: route.payload["institutional_request_id"],
+      url: routeURL,
+    },
+  });
+  const navigated = await h.port.waitForFrame("institutional_navigated_request", framesBefore);
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "institutional_navigated_response",
+    msg_id: `navigated_response_${bindingID}`,
+    job_id: jobID,
+    seq: 6,
+    payload: {
+      request_id: navigated.payload["request_id"],
+      outcome: "acknowledged",
+      claim_id: claimID,
+      binding_id: bindingID,
+    },
+  });
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(h.backend.store.materializations?.[jobID]?.phase).toBe("navigated");
+  return h.backend.store.materializations?.[jobID]?.tab_id ?? -1;
+}
+
+/** Acks every claim_observation posted so far as applied, until the outbox
+ * drain posts nothing new, and returns the event kinds in send order. The
+ * drain sends one frame per ack, so an unacked frame would hold every later
+ * observation back. */
+async function ackClaimObservations(h: Harness, acked: Set<string>): Promise<string[]> {
+  const kinds: string[] = [];
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const pending = h.frames().filter((frame) =>
+      frame.type === "claim_observation" && !acked.has(String(frame.payload["request_id"])));
+    if (pending.length === 0) return kinds;
+    for (const frame of pending) {
+      acked.add(String(frame.payload["request_id"]));
+      kinds.push(String(frame.payload["event_kind"]));
+      await h.port.inbound(observationAck(frame.job_id ?? "", frame.payload["request_id"], {
+        outcome: "applied",
+        gate_occurrence_id: frame.payload["gate_occurrence_id"],
+        browser_holder_generation: 1,
+      }));
+    }
+  }
+}
+
+// Measured live 2026-09-24 on job_cb931061ba: the route landed on the provider
+// two seconds after it was issued, before any sign-in wall, and the extension
+// reported that landing as auth_returned. The report is latched per surface
+// and occurrence, so when the operator really signed in, eight minutes later,
+// nothing was reported: a return must follow a wall.
+test("auth_returned is reported once, for the landing after the sign-in wall and not for the landing before it", async () => {
+  const ids = {
+    jobID: "job_claim_early_landing",
+    candidateID: "cand_early_landing",
+    claimID: "claim_early_landing",
+    bindingID: "bind_early_landing",
+  };
+  const articleURL = `https://${PROVIDER_HOST}/stable/early-landing`;
+  const idpURL = "https://idp.example.edu/sso";
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["institutional_materialization_v1", "effect_permit_v1", AUTH_CLAIM, "surface_close_v1"],
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  const tabID = await navigatedClaimSurface(h, ids, articleURL, ["resolver.example.edu", PROVIDER_HOST]);
+  const acked = new Set<string>();
+
+  await h.tabs.completeNavigation(tabID, articleURL);
+  expect(await ackClaimObservations(h, acked)).not.toContain("auth_returned");
+
+  await h.tabs.completeNavigation(tabID, idpURL);
+  expect(await ackClaimObservations(h, acked)).toContain("wall_observed");
+
+  await h.tabs.completeNavigation(tabID, `${articleURL}?signed-in=1`);
+  await h.tabs.completeNavigation(tabID, `${articleURL}?signed-in=2`);
+  expect((await ackClaimObservations(h, acked)).filter((kind) => kind === "auth_returned")).toHaveLength(1);
+  expect(h.frames().filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
+});
+
 // Live-smoke regression (2026-08-19): reproduced on the operator's own
 // browser. The grant that authorizes owner_closed is worker memory, and MV3
 // sleeps the worker after ~30s idle, so a sign-in tab abandoned minutes later
@@ -10468,6 +10615,96 @@ test("Firefox captures the viewer a click adapter's job opens, although it does 
   await settle();
   expect(h.downloads.started.map(d => d.filename)).toEqual(["papio/job_rule_a/paper.pdf"]);
   expect(notices()).toHaveLength(0);
+});
+
+/** Replays job_cb931061ba (2026-09-24): an institutional route reaches the
+ * library's sign-in wall, the operator signs in somewhere else first, and the
+ * three-minute drive runs out with the tab on the wall. The daemon's
+ * candidate refresh hands the surface back to the job, and the operator then
+ * signs in on papio's own tab, which returns to the ScienceDirect article. */
+async function signInOutlivesDrive(opts: { firefox: boolean }) {
+  const ids = {
+    jobID: "job_signin_outlived_drive",
+    candidateID: "cand_signin_outlived",
+    claimID: "claim_signin_outlived",
+    bindingID: "bind_signin_outlived",
+  };
+  const providerHosts = ["resolver.example.edu", "www.sciencedirect.com"];
+  const articleURL = "https://www.sciencedirect.com/science/article/pii/S0000000000000024";
+  const idpURL = "https://idp.example.edu/sso";
+  const h = makeHarness(undefined, opts.firefox ? { firefox: true } : undefined);
+  const web = new FakeWebRequest();
+  if (opts.firefox) h.deps.webRequest = web;
+  let objectURLCount = 0;
+  h.deps.objectURLs = {
+    create: () => `blob:moz-extension://papio/${++objectURLCount}`,
+    revoke: () => {},
+  };
+  h.deps.permissions.contains = async () => true;
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["institutional_materialization_v1", "effect_permit_v1", AUTH_CLAIM, "surface_close_v1", "native_viewer_download_v1"],
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  const tabID = await navigatedClaimSurface(h, ids, articleURL, providerHosts);
+  const acked = new Set<string>();
+  await h.tabs.completeNavigation(tabID, idpURL);
+  await ackClaimObservations(h, acked);
+  expect(findByJob(h.backend.store, ids.jobID)?.status).toBe("auth_pending");
+
+  await h.tabs.userActivate(tabID);
+  const timeout = h.timers.filter((timer) => timer.ms === 180_000).at(-1);
+  expect(timeout).toBeDefined();
+  h.clock.now += 180_000;
+  const framesBefore = h.port.posted.length;
+  const timingOut = timeout!.fn();
+  const parkClose = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(parkClose.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(nativeResult("surface_close_response", {
+    request_id: parkClose.payload["request_id"],
+    outcome: "authorized",
+    close_authorization_id: "close_signin_outlived",
+    nonce: "nonce_signin_outlived",
+    browser_holder_generation: 1,
+  }));
+  await timingOut;
+  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(-1);
+
+  await h.port.inbound(claimSurfaceOffer(ids, providerHosts, "2030-01-02T00:00:00Z"));
+  await settle();
+  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(tabID);
+
+  await h.tabs.completeNavigation(tabID, articleURL);
+  await ackClaimObservations(h, acked);
+  await settle();
+  expect(h.frames().filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
+  return { h, web, tabID, ids };
+}
+
+test("Firefox captures the signed viewer of an article reached by a sign-in that outlived the drive", async () => {
+  const { h, web, tabID, ids } = await signInOutlivesDrive({ firefox: true });
+  // View PDF opens the signed viewer in a child tab of the returned surface.
+  h.tabs.seed({ id: 9114, url: "about:blank", openerTabId: tabID });
+  await h.tabs.onCreated.emit(h.tabs.snapshot(9114)!);
+  await web.respond({ requestId: "view-pdf", url: SIGNED_VIEWER, tabId: 9114 });
+  const filter = web.filters.get("view-pdf");
+  expect(filter).toBeDefined();
+  filter!.deliver(SIGNED_PDF);
+  filter!.stop();
+  await settle();
+  expect(h.downloads.started.map((download) => download.filename)).toEqual([`papio/${ids.jobID}/paper.pdf`]);
+});
+
+test("Chrome adopts the article's CDN PDF viewer after a sign-in that outlived the drive", async () => {
+  const { h, ids } = await signInOutlivesDrive({ firefox: false });
+  // ScienceDirect hands its PDF to the CDN in a tab with no opener: only a
+  // live drive for this paper relates that viewer to it.
+  h.tabs.seed({ id: 9115, url: "about:blank" });
+  await h.tabs.completeNavigation(9115, "https://content.sciencedirectassets.com/77/paper.pdf");
+  await settle();
+  expect(h.downloads.started.map((download) => download.filename)).toEqual([`papio/${ids.jobID}/paper.pdf`]);
 });
 
 test("Chrome registers no webRequest listener and keeps its viewer rules", async () => {
