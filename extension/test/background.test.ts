@@ -10622,7 +10622,7 @@ test("Firefox captures the viewer a click adapter's job opens, although it does 
  * three-minute drive runs out with the tab on the wall. The daemon's
  * candidate refresh hands the surface back to the job, and the operator then
  * signs in on papio's own tab, which returns to the ScienceDirect article. */
-async function signInOutlivesDrive(opts: { firefox: boolean }) {
+async function signInOutlivesDrive(opts: { firefox: boolean; rules?: FakeSessionRules }) {
   const ids = {
     jobID: "job_signin_outlived_drive",
     candidateID: "cand_signin_outlived",
@@ -10635,6 +10635,7 @@ async function signInOutlivesDrive(opts: { firefox: boolean }) {
   const h = makeHarness(undefined, opts.firefox ? { firefox: true } : undefined);
   const web = new FakeWebRequest();
   if (opts.firefox) h.deps.webRequest = web;
+  if (opts.rules !== undefined) h.deps.declarativeNetRequest = opts.rules;
   let objectURLCount = 0;
   h.deps.objectURLs = {
     create: () => `blob:moz-extension://papio/${++objectURLCount}`,
@@ -10706,6 +10707,59 @@ test("Chrome adopts the article's CDN PDF viewer after a sign-in that outlived t
   await settle();
   expect(h.downloads.started.map((download) => download.filename)).toEqual([`papio/${ids.jobID}/paper.pdf`]);
 });
+
+// Replays the loopback run of 2026-09-24 (runA): while a ScienceDirect job is
+// armed, the operator opens a signed viewer in a tab of their own, with no
+// opener. That tab must not spend, fail or tear down the job's one viewer
+// attempt, and the paper's real View PDF child must still be captured.
+for (const firefox of [true, false]) {
+  test(`an openerless signed viewer the operator opened leaves the armed job's viewer attempt to its own View PDF: ${firefox ? "Firefox" : "Chrome"}`, async () => {
+    const rules = firefox ? undefined : new FakeSessionRules();
+    const { h, web, tabID, ids } = await signInOutlivesDrive({ firefox, ...(rules === undefined ? {} : { rules }) });
+    const framesBefore = h.frames().length;
+    const deliveryBefore = h.backend.store.pendingDelivery;
+    const userViewer = "https://pdf.sciencedirectassets.com/88/main.pdf?X-Amz-Signature=operator-token";
+    h.tabs.seed({ id: 9200, url: "about:blank" });
+    if (firefox) {
+      await h.tabs.onCreated.emit(h.tabs.snapshot(9200)!);
+      await web.respond({ requestId: "operator-tab", url: userViewer, tabId: 9200 });
+      expect(web.filters.has("operator-tab")).toBe(false);
+    }
+    await h.tabs.completeNavigation(9200, userViewer);
+    await settle();
+    expect(h.frames().slice(framesBefore).filter((f) => f.type === "provider_outcome" || f.type === "error")).toEqual([]);
+    expect(h.backend.store.pendingDelivery).toEqual(deliveryBefore);
+    expect(h.tabs.removed).not.toContain(tabID);
+    expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(tabID);
+    expect(h.downloads.started).toEqual([]);
+
+    // The paper's own View PDF opens its child tab, as papio armed it.
+    h.tabs.seed({ id: 9114, url: "about:blank", openerTabId: tabID });
+    if (firefox) {
+      await h.tabs.onCreated.emit(h.tabs.snapshot(9114)!);
+      await web.respond({ requestId: "view-pdf", url: SIGNED_VIEWER, tabId: 9114 });
+      const filter = web.filters.get("view-pdf");
+      expect(filter).toBeDefined();
+      filter!.deliver(SIGNED_PDF);
+      filter!.stop();
+      await settle();
+      expect(h.downloads.started.map((download) => download.filename)).toEqual([`papio/${ids.jobID}/paper.pdf`]);
+    } else {
+      await h.tabs.onUpdated.emit(9114, { status: "loading" }, h.tabs.snapshot(9114)!);
+      await settle();
+      expect(rules!.armedTabs()).toEqual([tabID, 9114].sort((a, b) => a - b));
+      await h.webNavigation.onBeforeNavigate.emit({ tabId: 9114, frameId: 0, url: SIGNED_VIEWER });
+      const item: DownloadItemLike = { id: 4343, url: SIGNED_VIEWER, finalUrl: SIGNED_VIEWER, mime: "application/pdf",
+        state: "in_progress", filename: "" };
+      h.downloads.items.set(item.id, item);
+      await h.downloads.onCreated.emit(item);
+      const suggestions: { filename: string; conflictAction: "uniquify" }[] = [];
+      await h.downloads.onDeterminingFilename.emit({ ...item, filename: "/Downloads/paper.pdf" }, (s) => suggestions.push(s));
+      expect(suggestions).toEqual([{ filename: `papio/${ids.jobID}/paper.pdf`, conflictAction: "uniquify" }]);
+    }
+    expect(h.frames().slice(framesBefore).filter((f) => f.type === "provider_outcome" || f.type === "error")).toEqual([]);
+  });
+}
 
 // `papio actions open` for a paper whose claim already navigated its tab now
 // sends the daemon's candidate refresh followed by handoff_focus. The refresh

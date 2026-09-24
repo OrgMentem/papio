@@ -50,6 +50,17 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **A ScienceDirect PDF that you open yourself no longer stops papio's
+  paper.** While *papio* worked on a ScienceDirect paper, any signed
+  ScienceDirect PDF that you opened in a tab of your own counted as that
+  paper's one PDF attempt. Within a second, the extension reported that the
+  viewer had opened outside its capture, closed the paper's tab and asked
+  you to download the paper by hand. The paper's own **View PDF** was then
+  never saved. Now only a tab that the paper's tab opened, or that *papio*
+  armed for the paper, can use that attempt. A tab of your own changes
+  nothing, and the paper's own PDF is still saved on Firefox and Chrome.
+  Chrome can still adopt a reusable ScienceDirect CDN file in a tab with no
+  opener, as before.
 - **Firefox no longer treats a sign-in redirect as a failed page.** When one
   page replaces another during a library sign-in, Firefox reports the first
   page as cancelled with its own error code. The extension recognized only

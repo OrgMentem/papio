@@ -17692,6 +17692,21 @@ export class Bridge {
         ? candidates[0]
         : candidates.find((j) => j.tab_id === openerTabId);
     if (!job) return;
+    // A signed viewer answers once, and that answer is the job's only viewer
+    // attempt. Only a tab papio can tie to this job may spend it, fail it or
+    // close the job's surface: one its handoff tab opened (the opener, or the
+    // provider-child ledger entry written from the child's first update,
+    // which outlives Chrome dropping openerTabId on the cross-origin hop), or
+    // one armed as its viewer child. The CDN relation alone matches every
+    // ScienceDirect PDF the operator opens while the handoff runs, so it
+    // still adopts a reusable CDN file but never a signed viewer.
+    if (
+      requiresNativeViewerDownload(url) &&
+      !(openerTabId !== undefined && (job.tab_id === openerTabId || openerLedgerEntry?.job_id === job.job_id)) &&
+      ledger[String(viewerTabId)]?.job_id !== job.job_id &&
+      this.store.viewerChildTabs?.[String(viewerTabId)] !== job.job_id
+    )
+      return;
     // The viewer is this paper's surface even when Chrome dropped the opener
     // on a cross-origin PDF navigation and only the ledger or CDN relation
     // proved it. The job's own tab keeps whatever authority it already has.
@@ -17912,7 +17927,9 @@ export class Bridge {
 
   /** The only openerless viewer relationship shipped in the extension is the
    * ScienceDirect provider -> science-direct-assets CDN redirect. It is valid
-   * only while this exact delegated job has an active drive marker. */
+   * only while this exact delegated job has an active drive marker. It names
+   * no tab, so it may adopt a reusable CDN file but never a signed viewer:
+   * see maybeAdoptViewerTab. */
   private hasRecordedProviderCDNRelationship(
     job: ActiveJob,
     host: string,
