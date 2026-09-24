@@ -5304,19 +5304,15 @@ export class Bridge {
       this.handoffDriveTimeouts.delete(jobID);
       const current = findByJob(this.store, jobID);
       if (current !== undefined && current.tab_id === tabID) {
-        // The operator clicked View PDF and the paper's signed viewer is still
-        // on its way in the child tab that click opened - measured live
-        // 2026-09-24 on job_272d01737a, a Cloudflare challenge in that child
-        // outlasted this timeout by 80 minutes. That child is armed only
-        // while this job keeps its status (viewerRuleTabs), so re-queueing
-        // the job disarmed it, and closing this tab detached the job from the
-        // capture: the PDF then rendered and papio saved nothing. The drive
-        // is spent, so its slot is released; the surface and the job's
-        // status stay the operator's.
-        if (await this.liveViewerChild(jobID)) {
-          await this.parkHandoffForManual(jobID);
-          return;
-        }
+        // The drive is spent, but the paper may still be live in a child tab
+        // this tab opened (View PDF with target=_blank). Measured live
+        // 2026-09-24 on job_272d01737a: a Cloudflare check in that child
+        // outlasted this timeout by 80 minutes. Re-queueing the job then
+        // disarmed the child (arming needs the job's status), and closing
+        // this tab detached the job from the capture: the PDF that rendered
+        // after the check was never saved. The sign-in branch below wins
+        // over parking: auth_pending is what opens the login gate and
+        // reserves the institution slot.
         // `auth_pending` asserts that this paper's surface reached a login page
         // - signInBlockerCount's contract, and what the daemon acts on: it
         // records auth-return profile evidence, opens a HumanGateLogin, and
@@ -5355,6 +5351,12 @@ export class Bridge {
             }),
           );
           this.send("auth_pending", {}, jobID);
+        } else if (await this.liveViewerChild(jobID)) {
+          // Not a sign-in surface, and the operator is still working the
+          // paper in an armed viewer child. Release the spent drive slot;
+          // the surface and the job's status stay the operator's.
+          await this.parkHandoffForManual(jobID);
+          return;
         } else {
           // A spent drive still needs the operator, so silence is not the
           // alternative to the false claim - this is the same state the drive
