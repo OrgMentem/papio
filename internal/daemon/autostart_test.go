@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-// isProcessGone asks the kernel, never the *exec.Cmd. Both the ready path
-// (autostart.go:139) and terminateOrphan reap the child in their OWN goroutine,
-// so cmd.ProcessState is written concurrently and a test that reads it is
-// racing the reaper for an answer signal 0 already gives correctly.
+// isProcessGone asks the kernel, never the *exec.Cmd. The autostarter reaps
+// every child it launches in its OWN goroutine (daemonChild), so
+// cmd.ProcessState is written concurrently and a test that reads it is racing
+// the reaper for an answer signal 0 already gives correctly.
 func isProcessGone(t *testing.T, cmd *exec.Cmd) bool {
 	t.Helper()
 	if cmd == nil || cmd.Process == nil {
@@ -41,10 +41,9 @@ func isProcessGone(t *testing.T, cmd *exec.Cmd) bool {
 // that same command, so a test can make readiness depend on the child.
 //
 // The caller must never call cmd.Wait and must never read cmd.ProcessState
-// before the child is gone: the ready path (autostart.go:139) and
-// terminateOrphan each reap the child in their OWN goroutine, exec.Cmd.Wait may
-// be called exactly once, and racing the reaper is what the race detector
-// caught. Use isProcessGone, which asks the kernel instead.
+// before the child is gone: daemonChild reaps the child in its OWN goroutine,
+// exec.Cmd.Wait may be called exactly once, and racing the reaper is what the
+// race detector caught. Use isProcessGone, which asks the kernel instead.
 func autostarterFixture(t *testing.T, child []string, grace time.Duration, ready func(*exec.Cmd) error) (*Autostarter, func() *exec.Cmd) {
 	t.Helper()
 	dir := t.TempDir()
@@ -64,7 +63,7 @@ func autostarterFixture(t *testing.T, child []string, grace time.Duration, ready
 		OpenLog:  func() (*os.File, error) { return os.CreateTemp(dir, "daemon-*.log") },
 		Ready:    func(context.Context, string) error { return ready(launched) },
 	}
-	// Zero keeps terminateOrphan's own 2s default.
+	// Zero keeps daemonChild.terminate's own 2s default.
 	starter.gracePeriod = grace
 	return starter, func() *exec.Cmd { return launched }
 }
@@ -90,7 +89,7 @@ func TestAutostarterTerminatesOrphanOnReadinessTimeout(t *testing.T) {
 		t.Fatal("no process was launched")
 	}
 	// The helper must be terminated AND reaped, not merely signalled.
-	// terminateOrphan does SIGTERM, waits 2s, escalates to SIGKILL and waits 3s.
+	// daemonChild.terminate does SIGTERM, waits 2s, escalates to SIGKILL and waits 3s.
 	// If it only sent SIGTERM without waiting, ProcessState would still be nil.
 	if !isProcessGone(t, launched) {
 		// Clean up for test hygiene if our fix regresses.
@@ -154,8 +153,8 @@ func TestAutostarterLeavesReadyDaemonRunning(t *testing.T) {
 	if err := syscall.Kill(launched.Process.Pid, 0); err != nil {
 		t.Fatalf("ready daemon pid %d not running after detach: %v", launched.Process.Pid, err)
 	}
-	// Cleanup. The test does NOT own this process: EnsureWithResult reaps a
-	// ready child in its own goroutine (autostart.go:139), and exec.Cmd.Wait
+	// Cleanup. The test does NOT own this process: EnsureWithResult reaps
+	// every child it launches in its own goroutine (daemonChild), and exec.Cmd.Wait
 	// may be called exactly once, so waiting here raced that reaper — which is
 	// what the race detector caught. Kill the group and let the reaper reap;
 	// the pid disappearing is the observable completion.

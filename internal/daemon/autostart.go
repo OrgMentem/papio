@@ -18,16 +18,29 @@ import (
 // with the current executable; it never invokes a shell.
 type CommandFactory func(name string, args ...string) *exec.Cmd
 
-// Autostarter starts the daemon once when its local socket is unavailable.
-// Its seams make command wiring unit-testable without launching a daemon.
+// Autostarter starts the daemon when its local socket is unavailable and no
+// daemon process is alive to answer it. Its seams make command wiring
+// unit-testable without launching a daemon.
 type Autostarter struct {
 	SocketPath string
 	Args       []string
 	LockPath   string
 	LogPath    string
 
-	StartTimeout  time.Duration
+	// StartTimeout is how long a daemon this call started may take to reach
+	// its socket before it is treated as hung and terminated. A daemon that
+	// reports it is upgrading or checking its database is never terminated:
+	// that work takes as long as the database needs.
+	StartTimeout time.Duration
+	// MaxWait bounds the whole call: waiting for another command that is
+	// starting the daemon, and for a daemon that is upgrading its database or
+	// stopping. A daemon still at work when it passes keeps running.
+	MaxWait       time.Duration
 	RetryInterval time.Duration
+	// OnWait is told, once for each phase, when this call waits for a daemon
+	// that is upgrading its database or stopping, so that a person can be
+	// told why the command is slow.
+	OnWait func(Status)
 
 	Executable func() (string, error)
 	Command    CommandFactory
@@ -46,7 +59,8 @@ func NewAutostarter(socketPath string) *Autostarter {
 
 // EnsureResult describes how EnsureWithResult made the daemon available.
 type EnsureResult struct {
-	// Started reports whether this call launched the daemon process.
+	// Started reports whether this call launched the daemon process that
+	// answers. It stays true when readiness fails after the launch.
 	Started bool
 }
 
@@ -57,54 +71,214 @@ func (a *Autostarter) Ensure(ctx context.Context) error {
 	return err
 }
 
-// EnsureWithResult returns once another daemon is ready or a single daemon
-// command has been started and its socket becomes ready. Contending callers
-// share an advisory lock and always check readiness both before and after
-// acquiring it.
+// EnsureWithResult returns once a daemon's socket is ready. Contending
+// callers share an advisory lock, so at most one of them launches a daemon at
+// a time, and none launches one while a daemon process is alive: a daemon
+// that is starting, upgrading its database or stopping is waited for, never
+// joined by a second one.
 func (a *Autostarter) EnsureWithResult(ctx context.Context) (EnsureResult, error) {
-	result := EnsureResult{}
 	cfg, err := a.defaults()
 	if err != nil {
-		return result, err
+		return EnsureResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return result, err
+		return EnsureResult{}, err
 	}
 	if err := cfg.Ready(ctx, cfg.SocketPath); err == nil {
-		return result, nil
+		return EnsureResult{}, nil
 	} else if ctx.Err() != nil {
-		return result, ctx.Err()
+		return EnsureResult{}, ctx.Err()
 	}
-	unlock, err := acquireLock(ctx, cfg.LockPath, cfg.RetryInterval)
-	if err != nil {
-		return result, err
+	wait := &startWait{cfg: cfg, deadline: time.Now().Add(cfg.MaxWait)}
+	unlock, ready, err := wait.lock(ctx)
+	if err != nil || ready {
+		return EnsureResult{}, err
 	}
 	defer unlock()
+	return wait.run(ctx)
+}
 
-	if err := cfg.Ready(ctx, cfg.SocketPath); err == nil {
-		return result, nil
-	} else if ctx.Err() != nil {
-		return result, ctx.Err()
+// startWait is one EnsureWithResult call's wait for a daemon.
+type startWait struct {
+	cfg      Autostarter
+	deadline time.Time
+	// announced is the last phase passed to OnWait.
+	announced Phase
+}
+
+// errWaitExpired reports that MaxWait has passed.
+var errWaitExpired = errors.New("autostart wait expired")
+
+// lock takes the autostart lock. While another command holds it, the daemon
+// that command started can become ready, and then no lock is needed.
+func (w *startWait) lock(ctx context.Context) (unlock func(), ready bool, err error) {
+	if err := os.MkdirAll(filepath.Dir(w.cfg.LockPath), 0o700); err != nil {
+		return nil, false, fmt.Errorf("create autostart lock directory: %w", err)
 	}
-	if err := ctx.Err(); err != nil {
-		return result, err
-	}
-	executable, err := cfg.Executable()
+	file, err := os.OpenFile(w.cfg.LockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return result, fmt.Errorf("locate papio executable: %w", err)
+		return nil, false, fmt.Errorf("open autostart lock: %w", err)
 	}
-	cmd := cfg.Command(executable, cfg.Args...)
+	for {
+		locked, err := tryLockFile(file)
+		if err != nil {
+			_ = file.Close()
+			return nil, false, fmt.Errorf("lock autostart: %w", err)
+		}
+		if locked {
+			return func() {
+				_ = unlockFile(file)
+				_ = file.Close()
+			}, false, nil
+		}
+		if w.cfg.Ready(ctx, w.cfg.SocketPath) == nil {
+			_ = file.Close()
+			return nil, true, nil
+		}
+		status, held := w.observe()
+		if err := w.pause(ctx); err != nil {
+			_ = file.Close()
+			if errors.Is(err, errWaitExpired) {
+				return nil, false, w.expired(nil, status, held)
+			}
+			return nil, false, err
+		}
+	}
+}
+
+// run holds the autostart lock. Each round it returns once the socket
+// answers, waits while a daemon process is alive, or launches one when none
+// is.
+func (w *startWait) run(ctx context.Context) (EnsureResult, error) {
+	var result EnsureResult
+	var child *daemonChild
+	for {
+		if err := w.cfg.Ready(ctx, w.cfg.SocketPath); err == nil {
+			return result, nil
+		} else if ctx.Err() != nil {
+			return result, w.abandon(child, ctx.Err())
+		}
+		status, held := w.observe()
+		if child != nil && held && status.PID != 0 && status.PID == child.pid() && status.Phase.storeWork() {
+			child.busy = true
+		}
+		switch {
+		case child != nil && !child.exited():
+			if !child.busy && time.Since(child.started) >= w.cfg.StartTimeout {
+				child.terminate(w.cfg.gracePeriod)
+				return result, fmt.Errorf("wait for daemon socket: the daemon did not become ready within %s; see %s", w.cfg.StartTimeout, w.cfg.LogPath)
+			}
+		case child != nil:
+			if !held {
+				if child.err != nil {
+					return result, fmt.Errorf("the daemon exited before it became ready: %w; see %s", child.err, w.cfg.LogPath)
+				}
+				return result, fmt.Errorf("the daemon exited before it became ready; see %s", w.cfg.LogPath)
+			}
+			// The daemon this call launched found another daemon process
+			// holding the socket and left. That one is what will answer.
+			child = nil
+			result.Started = false
+		case !held:
+			launched, err := w.launch(ctx)
+			if err != nil {
+				return result, err
+			}
+			child = launched
+			// Callers must learn a daemon was launched even when readiness
+			// later fails: the CLI suppresses its version-skew warning on
+			// this flag.
+			result.Started = true
+			continue
+		}
+		if err := w.pause(ctx); err != nil {
+			if errors.Is(err, errWaitExpired) {
+				return result, w.expired(child, status, held)
+			}
+			return result, w.abandon(child, err)
+		}
+	}
+}
+
+// observe reads the daemon instance, and announces through OnWait a phase
+// that a person would otherwise wait through in silence.
+func (w *startWait) observe() (Status, bool) {
+	status, held := ReadInstance(w.cfg.SocketPath)
+	if held && (status.Phase == PhaseUpgrading || status.Phase == PhaseStopping) && status.Phase != w.announced {
+		w.announced = status.Phase
+		if w.cfg.OnWait != nil {
+			w.cfg.OnWait(status)
+		}
+	}
+	return status, held
+}
+
+// pause waits one retry interval, unless the caller's context ends or MaxWait
+// has passed.
+func (w *startWait) pause(ctx context.Context) error {
+	if !time.Now().Before(w.deadline) {
+		return errWaitExpired
+	}
+	timer := time.NewTimer(w.cfg.RetryInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// abandon ends the wait for a caller whose context ended. A daemon this call
+// launched that is still in its first steps is terminated, as a hung one is;
+// one that is upgrading or checking its database carries on, and the next
+// command finds it.
+func (w *startWait) abandon(child *daemonChild, err error) error {
+	if child == nil || child.busy || child.exited() {
+		return err
+	}
+	child.terminate(w.cfg.gracePeriod)
+	return fmt.Errorf("wait for daemon socket: %w", err)
+}
+
+// expired explains a wait that reached MaxWait. It terminates only a daemon
+// this call launched that never reported store work.
+func (w *startWait) expired(child *daemonChild, status Status, held bool) error {
+	if child != nil && !child.busy && !child.exited() {
+		child.terminate(w.cfg.gracePeriod)
+		return fmt.Errorf("wait for daemon socket: the daemon did not become ready within %s; see %s", w.cfg.MaxWait, w.cfg.LogPath)
+	}
+	if !held {
+		return fmt.Errorf("wait for daemon socket: another papio process was still starting the daemon after %s; see %s", w.cfg.MaxWait, w.cfg.LogPath)
+	}
+	daemon := "the daemon"
+	if status.PID != 0 {
+		daemon = fmt.Sprintf("the daemon (pid %d)", status.PID)
+	}
+	if status.Phase.storeWork() {
+		return fmt.Errorf("%s is still %s after %s; it keeps running, so retry in a few minutes (see %s)", daemon, status.Activity(), w.cfg.MaxWait, w.cfg.LogPath)
+	}
+	return fmt.Errorf("wait for daemon socket: %s is still %s after %s; see %s", daemon, status.Activity(), w.cfg.MaxWait, w.cfg.LogPath)
+}
+
+// launch starts one detached daemon process.
+func (w *startWait) launch(ctx context.Context) (*daemonChild, error) {
+	executable, err := w.cfg.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("locate papio executable: %w", err)
+	}
+	cmd := w.cfg.Command(executable, w.cfg.Args...)
 	if cmd == nil {
-		return result, errors.New("daemon command factory returned nil")
+		return nil, errors.New("daemon command factory returned nil")
 	}
-	null, err := cfg.OpenNull()
+	null, err := w.cfg.OpenNull()
 	if err != nil {
-		return result, fmt.Errorf("open detached daemon stdio: %w", err)
+		return nil, fmt.Errorf("open detached daemon stdio: %w", err)
 	}
-	logFile, err := cfg.OpenLog()
+	logFile, err := w.cfg.OpenLog()
 	if err != nil {
 		_ = null.Close()
-		return result, fmt.Errorf("open detached daemon log: %w", err)
+		return nil, fmt.Errorf("open detached daemon log: %w", err)
 	}
 	// stdin is discarded; stdout/stderr persist to the daemon log so that
 	// server-side errors (see the api failure handlers, which log the wrapped
@@ -116,49 +290,83 @@ func (a *Autostarter) EnsureWithResult(ctx context.Context) (EnsureResult, error
 	if err := ctx.Err(); err != nil {
 		_ = null.Close()
 		_ = logFile.Close()
-		return result, err
+		return nil, err
 	}
 	configureDaemonProcessGroup(cmd)
-	err = cfg.Start(ctx, cmd)
+	err = w.cfg.Start(ctx, cmd)
 	_ = null.Close()
 	_ = logFile.Close()
 	if err != nil {
-		return result, fmt.Errorf("start daemon: %w", err)
+		return nil, fmt.Errorf("start daemon: %w", err)
 	}
-	// The process was launched, so callers must learn a daemon was started even
-	// when readiness later fails: the CLI suppresses its version-skew warning on
-	// this flag, and the readiness-failure path below still terminates the child.
-	result.Started = true
-	readyCtx, cancel := context.WithTimeout(ctx, cfg.StartTimeout)
-	defer cancel()
-	if err := waitReady(readyCtx, cfg.Ready, cfg.SocketPath, cfg.RetryInterval); err != nil {
-		terminateOrphan(cmd, cfg.gracePeriod)
-		return result, fmt.Errorf("wait for daemon socket: %w", err)
-	}
-	if cmd.Process != nil {
-		go func() { _ = cmd.Wait() }()
-	}
-	return result, nil
+	return newDaemonChild(cmd), nil
 }
 
-func terminateOrphan(cmd *exec.Cmd, gracePeriod time.Duration) {
-	if cmd == nil || cmd.Process == nil {
+// daemonChild is a daemon process this call launched. One goroutine reaps
+// it, so exec.Cmd.Wait runs exactly once whether the daemon becomes ready,
+// exits early, or is terminated.
+type daemonChild struct {
+	cmd     *exec.Cmd
+	started time.Time
+	// busy is set once the daemon reports store work. From then on no start
+	// deadline terminates it.
+	busy bool
+	// done is closed once the process is reaped. It is nil when the Start
+	// seam launched no process, which leaves nothing to reap or terminate.
+	done chan struct{}
+	// err is Wait's result, valid once done is closed.
+	err error
+}
+
+func newDaemonChild(cmd *exec.Cmd) *daemonChild {
+	child := &daemonChild{cmd: cmd, started: time.Now()}
+	if cmd.Process != nil {
+		child.done = make(chan struct{})
+		go func() {
+			child.err = cmd.Wait()
+			close(child.done)
+		}()
+	}
+	return child
+}
+
+func (c *daemonChild) pid() int {
+	if c.cmd.Process == nil {
+		return 0
+	}
+	return c.cmd.Process.Pid
+}
+
+func (c *daemonChild) exited() bool {
+	if c.done == nil {
+		return false
+	}
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// terminate signals the daemon's process group, escalates to a hard kill if
+// the graceful signal is ignored, and waits for the reaper.
+func (c *daemonChild) terminate(gracePeriod time.Duration) {
+	if c.done == nil {
 		return
 	}
 	if gracePeriod <= 0 {
 		gracePeriod = 2 * time.Second
 	}
-	_ = terminateSignal(cmd, graceful)
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	_ = terminateSignal(c.cmd, graceful)
 	select {
-	case <-done:
+	case <-c.done:
 		return
 	case <-time.After(gracePeriod):
 	}
-	_ = terminateSignal(cmd, hard)
+	_ = terminateSignal(c.cmd, hard)
 	select {
-	case <-done:
+	case <-c.done:
 	case <-time.After(3 * time.Second):
 	}
 }
@@ -179,6 +387,9 @@ func (a *Autostarter) defaults() (Autostarter, error) {
 	}
 	if cfg.StartTimeout <= 0 {
 		cfg.StartTimeout = 5 * time.Second
+	}
+	if cfg.MaxWait <= 0 {
+		cfg.MaxWait = 10 * time.Minute
 	}
 	if cfg.RetryInterval <= 0 {
 		cfg.RetryInterval = 25 * time.Millisecond
@@ -212,59 +423,10 @@ func (a *Autostarter) defaults() (Autostarter, error) {
 	return cfg, nil
 }
 
-func acquireLock(ctx context.Context, path string, retry time.Duration) (func(), error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return nil, fmt.Errorf("create autostart lock directory: %w", err)
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("open autostart lock: %w", err)
-	}
-	for {
-		locked, err := tryLockFile(file)
-		if err != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("lock autostart: %w", err)
-		}
-		if locked {
-			return func() {
-				_ = unlockFile(file)
-				_ = file.Close()
-			}, nil
-		}
-		timer := time.NewTimer(retry)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			_ = file.Close()
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
 func probeSocket(ctx context.Context, socketPath string) error {
 	conn, err := ipc.Dial(ctx, socketPath)
 	if err != nil {
 		return err
 	}
 	return conn.Close()
-}
-
-func waitReady(ctx context.Context, ready func(context.Context, string) error, socketPath string, retry time.Duration) error {
-	for {
-		if err := ready(ctx, socketPath); err == nil {
-			return nil
-		}
-		timer := time.NewTimer(retry)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
 }

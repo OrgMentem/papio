@@ -201,6 +201,21 @@ There is also a link check, because `zensical build` prints a broken link as an
   daemon leaves its unix socket file behind (never runs its own cleanup), so a subsequent
   command hangs connecting to a dead socket; `rm` the socket at the configured `--socket` path
   and restart before assuming a code-level bug.
+- **A daemon owns its socket's instance lock for its whole life, and autostart
+  waits for a long migration instead of killing it.** The daemon claims
+  `<socket>.instance.lock` before it opens the store and holds it until the process
+  exits, recording its phase (`starting`, `upgrading`, `checking`, `running`,
+  `stopping`) in `<socket>.instance.json`. Autostart (`internal/daemon/autostart.go`)
+  never launches a daemon while that lock is held, terminates its own child at
+  `StartTimeout` only while the child still reports `starting`, and gives up on an
+  `upgrading`/`checking` daemon after `MaxWait` (10 min) without stopping it. This
+  replaced a 5 s socket deadline that SIGTERMed the daemon partway through migration
+  0056 (~600k timestamps, 20-30 s); the migration rolled back and the next starter,
+  CLI or a native host that the browser respawns every ~2 s, began it again from
+  scratch. Consequences: a command after `papio daemon stop` now waits for the old
+  process to exit; a daemon with no socket says what it is doing in
+  `papio.sock.instance.json`; and `papio mcp`/`papio init`, which open the store
+  in-process, do not take the lock.
 - **macOS TCC can hang the daemon's `open(2)` on `~/Downloads/papio` — and every
   `make dev-deploy` re-arms it.** `download_adoption_root` lives under `~/Downloads`
   (it must: Chrome's `onDeterminingFilename` can only steer downloads to relative

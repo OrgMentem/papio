@@ -71,6 +71,27 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **The first command after an upgrade waits for the database upgrade
+  instead of failing.** A command that starts the background service gave it
+  five seconds to open its socket, then stopped it. A database upgrade that
+  rewrites many rows takes longer than that on a large database, so the
+  service was stopped part way through, the upgrade was undone, and the
+  command failed with `papio: wait for daemon socket: context deadline
+  exceeded`. The next command, or the browser extension's connector, which
+  the browser restarts every few seconds, then started the upgrade again from
+  the beginning, so it could fail for as long as anything kept trying. Now
+  only one service process runs at a time, from before it opens the database
+  until it exits. A command or connector that finds that process upgrading
+  the database waits for it and prints
+  `papio: upgrading the database; this can take a minute`, and a start
+  deadline never stops an upgrade. After ten minutes the command stops
+  waiting and says so, and the upgrade continues. A command run just after
+  `papio daemon stop` waits for the old service to exit, with
+  `papio: waiting for the previous daemon to stop`, instead of starting a
+  second service beside it. A second service that finds another one running
+  exits with a short message, without opening the database. The service
+  log no longer reports an interrupted upgrade as `rollback also failed`: the
+  upgrade was rolled back, and the log now says so.
 - **A paper that the browser queued for sign-in now opens after you sign in
   to your library.** When the extension had no sign-in evidence yet, for
   example right after it reloaded, it accepted an institutional paper into

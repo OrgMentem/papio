@@ -195,11 +195,22 @@ func (o *options) callExisting(ctx context.Context, method string, params, resul
 	return o.socketCall(ctx, socket, method, params, result)
 }
 
+// autostarter returns the starter every autostarting command uses. It tells
+// the person on stderr when the command waits for a daemon that is upgrading
+// the database or still stopping, which can take minutes.
 func (o *options) autostarter(socket string) *daemon.Autostarter {
+	var starter *daemon.Autostarter
 	if o.newAutostarter != nil {
-		return o.newAutostarter(socket)
+		starter = o.newAutostarter(socket)
+	} else {
+		starter = daemon.NewAutostarter(socket)
 	}
-	return daemon.NewAutostarter(socket)
+	if starter.OnWait == nil && o.errOut != nil {
+		starter.OnWait = func(status daemon.Status) {
+			_, _ = fmt.Fprintf(o.errOut, "papio: %s\n", status.Waiting())
+		}
+	}
+	return starter
 }
 
 func (o *options) socketCall(ctx context.Context, socket, method string, params, result any) error {

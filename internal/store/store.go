@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -25,10 +26,38 @@ import (
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
+// migrations is the migration set migrate reads. Tests replace it with a
+// fixture set; production always reads the embedded files.
+var migrations fs.FS = migrationFS
+
 // Store wraps the single-writer database handle.
 type Store struct {
 	db   *sql.DB
 	path string
+}
+
+// OpenTrace observes the two steps of Open that can take a long time on a
+// large database, so a daemon can tell whoever waits for it that it is busy
+// rather than hung. Both hooks run on the goroutine that called Open.
+type OpenTrace struct {
+	// Migrating runs once, before the first pending migration is applied,
+	// with the schema version the database is at and the one it is moving to.
+	// It does not run when the database is already current.
+	Migrating func(from, to int)
+	// Checking runs before the integrity check, which reads the whole file.
+	Checking func()
+}
+
+type openTraceKey struct{}
+
+// WithOpenTrace returns a context under which Open reports to trace.
+func WithOpenTrace(ctx context.Context, trace *OpenTrace) context.Context {
+	return context.WithValue(ctx, openTraceKey{}, trace)
+}
+
+func openTraceFrom(ctx context.Context) *OpenTrace {
+	trace, _ := ctx.Value(openTraceKey{}).(*OpenTrace)
+	return trace
 }
 
 // Open creates/opens the database at dir/papio.db, applies migrations, and
@@ -60,6 +89,9 @@ func open(ctx context.Context, dir string, migrationCeiling int) (*Store, error)
 	if err := ensurePdfGrabActiveSourceIndex(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if trace := openTraceFrom(ctx); trace != nil && trace.Checking != nil {
+		trace.Checking()
 	}
 	var integrity string
 	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); err != nil || integrity != "ok" {
@@ -132,7 +164,7 @@ func ensurePdfGrabActiveSourceIndex(ctx context.Context, db *sql.DB) error {
 // migrate applies numbered migrations above the current user_version, each in
 // its own transaction, then bumps user_version inside that transaction.
 func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
-	entries, err := fs.ReadDir(migrationFS, "migrations")
+	entries, err := fs.ReadDir(migrations, "migrations")
 	if err != nil {
 		return fmt.Errorf("reading embedded migrations: %w", err)
 	}
@@ -166,6 +198,9 @@ func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
 			latest,
 		)
 	}
+	if trace := openTraceFrom(ctx); current < latest && trace != nil && trace.Migrating != nil {
+		trace.Migrating(current, latest)
+	}
 	for _, name := range names {
 		num, err := strconv.Atoi(strings.SplitN(name, "_", 2)[0])
 		if err != nil {
@@ -180,28 +215,19 @@ func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
 		if num != current+1 {
 			return fmt.Errorf("migration gap: at version %d, next file is %s", current, name)
 		}
-		body, err := migrationFS.ReadFile("migrations/" + name)
+		body, err := fs.ReadFile(migrations, "migrations/"+name)
 		if err != nil {
 			return err
 		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return err
-		}
-		// A failed rollback here is a second fault on top of the migration
-		// error: the on-disk schema state is then ambiguous, so it must not be
-		// swallowed behind the original error.
-		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				return fmt.Errorf("applying %s: %w (rollback also failed: %w)", name, err, rbErr)
-			}
 			return fmt.Errorf("applying %s: %w", name, err)
 		}
+		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+			return abortMigration(tx, "applying "+name, err)
+		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", num)); err != nil {
-			if rbErr := tx.Rollback(); rbErr != nil {
-				return fmt.Errorf("bumping user_version for %s: %w (rollback also failed: %w)", name, err, rbErr)
-			}
-			return fmt.Errorf("bumping user_version for %s: %w", name, err)
+			return abortMigration(tx, "bumping user_version for "+name, err)
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("committing %s: %w", name, err)
@@ -209,6 +235,25 @@ func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
 		current = num
 	}
 	return nil
+}
+
+// abortMigration rolls back a migration's transaction after step failed with
+// err, and says what became of the migration.
+//
+// database/sql rolls a transaction back by itself as soon as its context
+// ends, so after a cancelled startup the explicit Rollback finds the
+// transaction done and returns sql.ErrTxDone. That is the rollback having
+// happened: no path here commits before rolling back. Any other rollback error
+// is a second fault on top of err that leaves the schema state ambiguous, so
+// it must not be swallowed behind the original error.
+func abortMigration(tx *sql.Tx, step string, err error) error {
+	if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+		return fmt.Errorf("%s: %w (rollback also failed: %w)", step, err, rbErr)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: interrupted and rolled back; the next start applies it again: %w", step, err)
+	}
+	return fmt.Errorf("%s: %w", step, err)
 }
 
 // UserVersion returns the applied schema version.

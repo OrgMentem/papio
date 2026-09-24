@@ -104,6 +104,16 @@ different versions, the tool prints a warning. An unknown-field configuration
 error means your config was written by a newer *papio*; install a matching or
 newer version before continuing.
 
+The first start after an update can upgrade the database. On a large database
+that takes a minute or more: the command prints
+`papio: upgrading the database; this can take a minute` and waits, and other
+commands and the browser extension wait for the same upgrade instead of
+starting a second service. Let it finish. If it takes longer than ten minutes,
+the command stops waiting and says so, and the upgrade carries on in the
+background; run the command again later. A command run while the previous
+service is still stopping prints `papio: waiting for the previous daemon to stop`
+and starts the new service once the old one has exited.
+
 The extension popup reports **daemon unreachable**, ***papio* daemon out of
 date**, and **extension out of date** when it needs attention; the toolbar shows
 `!` in those states. When healthy, the popup shows the daemon version, and its

@@ -232,6 +232,14 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	// platform-specific: it follows the symlink on Unix and reads the recorded
 	// target on Windows.
 	starter.Executable = resolveDaemonExecutable
+	// While the daemon upgrades its database or finishes stopping, the host
+	// waits for it instead of failing at a start deadline. The browser
+	// respawns a failed host within seconds, so failing turned one slow
+	// migration into a series of interrupted ones. The wait is recorded in the
+	// diagnostic log, the only place the operator can see it.
+	starter.OnWait = func(status daemon.Status) {
+		fmt.Fprintf(stderr, "papio-native-host: %s\n", status.Waiting())
+	}
 	if err := starter.Ensure(ctx); err != nil {
 		return fmt.Errorf("ensure daemon: %w", err)
 	}

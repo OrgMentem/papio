@@ -13,7 +13,9 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/bootstrap"
+	"papio/internal/daemon"
 	"papio/internal/ipc"
+	"papio/internal/store"
 )
 
 func newDaemonCommand(opt *options) *cobra.Command {
@@ -37,7 +39,19 @@ func newDaemonCommand(opt *options) *cobra.Command {
 			if probeErr == nil {
 				return fmt.Errorf("daemon already running at %s", socket)
 			}
-			system, err := bootstrap.NewWithVersion(cmd.Context(), cfg, api.Version)
+			// The instance is claimed before the store is opened and held until
+			// the process exits, so exactly one daemon migrates the database and
+			// none starts beside one that is still stopping.
+			instance, err := daemon.AcquireInstance(socket)
+			if errors.Is(err, daemon.ErrInstanceHeld) {
+				return daemonInstanceHeld(socket)
+			}
+			if err != nil {
+				return err
+			}
+			// Deferred first, so it runs last: the claim outlives the store.
+			defer instance.Release()
+			system, err := bootstrap.NewWithVersion(store.WithOpenTrace(cmd.Context(), instance.StoreTrace()), cfg, api.Version)
 			if err != nil {
 				return err
 			}
@@ -48,6 +62,10 @@ func newDaemonCommand(opt *options) *cobra.Command {
 			}()
 			runCtx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
+			// Shutdown starts when runCtx ends; from then until the process
+			// exits, a command waits for this daemon instead of starting one.
+			stopping := context.AfterFunc(runCtx, func() { instance.SetPhase(daemon.PhaseStopping) })
+			defer stopping()
 			server := &ipc.Server{SocketPath: socket, Handler: api.RouterWithShutdown(system, cancel)}
 			serverDone := make(chan error, 1)
 			go func() { serverDone <- server.Serve(runCtx) }()
@@ -67,6 +85,7 @@ func newDaemonCommand(opt *options) *cobra.Command {
 				return serverErr
 			default:
 			}
+			instance.SetPhase(daemon.PhaseRunning)
 			schedulerDone := make(chan error, 1)
 			go func() { schedulerDone <- system.Scheduler.Run(runCtx) }()
 			sweeperDone := make(chan error, 1)
@@ -134,4 +153,16 @@ func newDaemonCommand(opt *options) *cobra.Command {
 	}
 	command.AddCommand(stop, status)
 	return command
+}
+
+// daemonInstanceHeld explains a daemon process that exits because another
+// daemon process owns its socket. Autostart waits for that process instead of
+// launching a second one, so only a race or a manual start gets here, and the
+// database is untouched: this process never opened it.
+func daemonInstanceHeld(socket string) error {
+	status, _ := daemon.ReadInstance(socket)
+	if status.PID == 0 {
+		return fmt.Errorf("daemon already starting at %s", socket)
+	}
+	return fmt.Errorf("daemon already %s at %s (pid %d)", status.Activity(), socket, status.PID)
 }
