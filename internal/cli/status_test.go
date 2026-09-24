@@ -67,6 +67,34 @@ func TestBuildStatusSnapshotGroupsRecentJobsAndDetails(t *testing.T) {
 	}
 }
 
+// A paper queued after Zotero opened waits only for the paced import pass.
+// Its guidance must not tell the user to open a Zotero that is open.
+func TestBuildStatusSnapshotSaysQueuedPapersNeedNothing(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	rows := []job.Row{{ID: "queued", State: job.StateReady, UpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), Work: work.Work{Title: "Queued paper"}}}
+	details := map[string]api.JobDetail{"queued": {Events: []map[string]any{
+		{"kind": "zotio.auto_import", "detail": map[string]any{"status": "waiting", "reason": "zotero_not_running"}},
+		{"kind": "zotio.auto_import", "detail": map[string]any{"status": "queued", "reason": "zotero_ready"}},
+	}}}
+	item := buildStatusSnapshot(rows, details, now, config.Config{}).Groups[0].Jobs[0]
+	if item.ImportStatus != "queued" || item.Guidance != "Zotero desktop is ready. papio adds these papers within minutes." {
+		t.Fatalf("queued paper = %q / %q, want queued with the ready guidance", item.ImportStatus, item.Guidance)
+	}
+}
+
+// A busy Zotero (a large sync holds it) needs neither opening nor a restart.
+func TestBuildStatusSnapshotSaysBusyZoteroNeedsNothing(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	rows := []job.Row{{ID: "busy", State: job.StateReady, UpdatedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), Work: work.Work{Title: "Busy paper"}}}
+	details := map[string]api.JobDetail{"busy": {Events: []map[string]any{
+		{"kind": "zotio.auto_import", "detail": map[string]any{"status": "waiting", "reason": "zotero_busy"}},
+	}}}
+	item := buildStatusSnapshot(rows, details, now, config.Config{}).Groups[0].Jobs[0]
+	if item.Guidance != "Zotero desktop is busy. papio adds these papers when it answers." {
+		t.Fatalf("busy guidance = %q", item.Guidance)
+	}
+}
+
 func TestBuildStatusSnapshotUsesCurrentOpenActionGuidance(t *testing.T) {
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	rows := []job.Row{{

@@ -115,6 +115,17 @@ func TestRunReportsPapersWaitingForZoteroDesktop(t *testing.T) {
 		t.Fatalf("stuck zotero_desktop_waiting = %+v, want the restart remedy for 3 papers", stuck)
 	}
 
+	// A busy Zotero (a large sync holds it) needs neither opening nor a
+	// restart.
+	if _, err := db.DB().ExecContext(ctx, `UPDATE events SET detail_json = json_set(detail_json, '$.reason', 'zotero_busy') WHERE job_id = 'job_waiting_stuck'`); err != nil {
+		t.Fatal(err)
+	}
+	busy := importCheck(t, ctx, db, "zotero_desktop_waiting")
+	if !strings.Contains(busy.Detail, "Zotero desktop is busy: 3 papers") ||
+		strings.Contains(busy.Remediation, "restart") || strings.Contains(busy.Remediation, "open Zotero") {
+		t.Fatalf("busy zotero_desktop_waiting = %+v, want the busy condition without an open or restart remedy", busy)
+	}
+
 	empty, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)
@@ -122,6 +133,29 @@ func TestRunReportsPapersWaitingForZoteroDesktop(t *testing.T) {
 	t.Cleanup(func() { _ = empty.Close() })
 	if got := importCheck(t, ctx, empty, "zotero_desktop_waiting"); got.Status != Pass {
 		t.Fatalf("zotero_desktop_waiting on an empty store = %+v, want pass", got)
+	}
+}
+
+// Once Zotero accepts papers, the daemon queues the papers that waited past
+// one pass's bound. Doctor must stop telling the user to open Zotero, and a
+// queued paper is not a stranded import either.
+func TestRunReportsQueuedPapersAsReadyForZotero(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	queuedAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	seedReadyImport(t, db, "job_queued_a", queuedAt, true, "queued")
+	seedReadyImport(t, db, "job_queued_b", queuedAt, true, "queued")
+
+	waiting := importCheck(t, ctx, db, "zotero_desktop_waiting")
+	if waiting.Status != Pass || !strings.Contains(waiting.Detail, "2 papers are queued") {
+		t.Fatalf("zotero_desktop_waiting = %+v, want a pass naming the 2 queued papers", waiting)
+	}
+	if undelivered := undeliveredImportCheck(t, ctx, db); undelivered.Status != Pass {
+		t.Fatalf("undelivered_zotero_imports = %+v, want queued papers not counted as stranded", undelivered)
 	}
 }
 

@@ -189,8 +189,30 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 			}
 		}
 	}
+	s.queueWaitingImports(ctx, rows)
 	s.notifyImportsWaiting(ctx, waiting, waitingSince)
 	return nil
+}
+
+// claimImport admits one import of a job at a time and reports whether this
+// caller holds the job. releaseImport ends the claim.
+func (s *Service) claimImport(jobID string) bool {
+	s.importMu.Lock()
+	defer s.importMu.Unlock()
+	if s.importInFlight == nil {
+		s.importInFlight = make(map[string]struct{})
+	}
+	if _, running := s.importInFlight[jobID]; running {
+		return false
+	}
+	s.importInFlight[jobID] = struct{}{}
+	return true
+}
+
+func (s *Service) releaseImport(jobID string) {
+	s.importMu.Lock()
+	delete(s.importInFlight, jobID)
+	s.importMu.Unlock()
 }
 
 // importWaitingSince reports when a job's import began waiting for Zotero
@@ -271,7 +293,8 @@ func settledImport(events []map[string]any) (status, parentKey, attachmentKey st
 // failures accumulate, after which the job is left import_failed. A missing or
 // skipped outcome retries: the inline import never recorded a result (a dropped
 // event insert) or ran before Zotio was configured. A waiting outcome retries
-// and spends no attempt: the import waited for a closed Zotero desktop.
+// and spends no attempt: the import waited for a closed Zotero desktop. So
+// does a queued one: it waited, and Zotero desktop now accepts saves.
 func importNeedsRetry(events []map[string]any) bool {
 	var status string
 	errorCount := 0

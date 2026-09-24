@@ -46,8 +46,11 @@ type planCLI struct {
 	// collections answers "collections list"; empty means no collections.
 	collections     string
 	collectionLists int
-	enrichArgs      []string
-	callOrder       []string
+	// found answers "items find"; empty means no item matches.
+	found      string
+	applyArgs  []string
+	enrichArgs []string
+	callOrder  []string
 }
 
 func (c *planCLI) Preflight(context.Context) (*PreflightResult, error) {
@@ -76,6 +79,11 @@ func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage,
 			return json.RawMessage(`{"meta":{"source":"live"},"results":[]}`), nil
 		}
 		return json.RawMessage(c.collections), nil
+	case strings.Contains(joined, "items find"):
+		if c.found == "" {
+			return json.RawMessage(`[]`), nil
+		}
+		return json.RawMessage(c.found), nil
 	case strings.Contains(joined, "items add-to-collection"):
 		c.collectionCalls++
 		c.collectionArgs = append([]string(nil), args...)
@@ -92,6 +100,7 @@ func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage,
 		return json.RawMessage(out), c.enrichErr
 	case strings.Contains(joined, "--yes"):
 		c.applyCalls++
+		c.applyArgs = append([]string(nil), args...)
 		if c.applyFn != nil {
 			return c.applyFn(ctx)
 		}

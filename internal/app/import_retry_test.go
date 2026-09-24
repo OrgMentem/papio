@@ -614,3 +614,77 @@ func TestEnsureCitationMetadataFillsTitlelessReadyJob(t *testing.T) {
 		t.Fatalf("lookup calls = %d, want %d: a job with a title must not be looked up again", lookup.calls, before)
 	}
 }
+
+// blockingImporter holds the first connector save open until release, and
+// refuses a second save while one runs, as zotio's apply reservation does.
+type blockingImporter struct {
+	mu        sync.Mutex
+	calls     int
+	active    int
+	enterOnce sync.Once
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (b *blockingImporter) PlanAndApply(context.Context, string) (string, string, string, error) {
+	b.mu.Lock()
+	b.calls++
+	b.active++
+	first := b.active == 1
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.active--
+		b.mu.Unlock()
+	}()
+	if !first {
+		return "", "", "", zotio.WithErrorInfo(errors.New("applying Zotio mutation: apply reservation was not finalized"))
+	}
+	b.enterOnce.Do(func() { close(b.entered) })
+	<-b.release
+	return "applied", "PARENT", "ATTACH", nil
+}
+
+// The inline import that follows `ready` and the retry pass shared nothing.
+// A pass that ran while the inline save was still open imported the same job
+// again, zotio refused the second claim, and papio counted the refusal as a
+// failed attempt. One import of a job runs at a time; the other path skips
+// the job and records nothing.
+func TestInlineImportAndRetryPassNeverImportOneJobAtOnce(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	importer := &blockingImporter{entered: make(chan struct{}), release: make(chan struct{})}
+	svc.AutoImporter = importer
+	id, err := svc.Submit(ctx, doiRequestFor("wr_inline_and_pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", 100000000000)
+	if err != nil || row == nil {
+		t.Fatalf("claim: %v %+v", err, row)
+	}
+	processed := make(chan error, 1)
+	go func() { processed <- svc.Process(ctx, row) }()
+	select {
+	case <-importer.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the inline import never started")
+	}
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(importer.release)
+	if err := <-processed; err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(autoImportStatuses(t, jobs, id), ","); got != "applied" {
+		t.Fatalf("auto-import outcomes = %s, want only the inline import's applied", got)
+	}
+	importer.mu.Lock()
+	defer importer.mu.Unlock()
+	if importer.calls != 1 {
+		t.Fatalf("connector saves = %d, want 1", importer.calls)
+	}
+}

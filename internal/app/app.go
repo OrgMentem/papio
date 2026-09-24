@@ -180,6 +180,10 @@ type Service struct {
 	// importPassMu keeps the maintenance tick's import-retry pass and the
 	// one the Zotero watcher starts from overlapping.
 	importPassMu sync.Mutex
+	// importMu protects importInFlight, which admits one import of a job at
+	// a time: the inline import after `ready` does not take importPassMu.
+	importMu       sync.Mutex
+	importInFlight map[string]struct{}
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -4227,6 +4231,10 @@ const (
 	importWaiting
 )
 
+// autoImportReady imports a ready job into Zotero. The inline call after
+// `ready` and the retry pass both reach it, so it admits one import of a job
+// at a time and skips a job whose import another call settled or just tried
+// since its caller looked. A skipped job records nothing and spends nothing.
 func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutcome {
 	if s.Config.Zotio.AutoImportPaused || !row.Policy.AutoImport {
 		// A pause leaves no import outcome: the ready job remains eligible
@@ -4239,6 +4247,13 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutco
 		detail["status"] = "skipped"
 		detail["reason"] = "zotio_not_configured"
 		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
+		return importNotAttempted
+	}
+	if !s.claimImport(row.ID) {
+		return importNotAttempted // the import that holds the job records its outcome
+	}
+	defer s.releaseImport(row.ID)
+	if events, err := s.Jobs.Events(eventCtx, row.ID); err == nil && (!importNeedsRetry(events) || !importRetryDue(events, s.Now())) {
 		return importNotAttempted
 	}
 	// A connector save cannot succeed while Zotero desktop is closed, so
@@ -4257,17 +4272,28 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutco
 		if ctx.Err() != nil {
 			return importAttempted
 		}
+		class, hint, httpStatus := autoImportErrorInfo(err)
 		if needsDesktop {
 			// Presence may be stale: Zotero can quit after the last probe.
 			// Ask again, and when it is closed the failure is the closure,
 			// so the job waits instead of spending an attempt.
 			s.desktop.forget()
-			if s.probeDesktop(ctx) == desktopClosed {
+			presence, probeErr := s.probeDesktop(ctx)
+			if presence == desktopUnknown && probeErr != nil &&
+				!errors.Is(probeErr, zotio.ErrDesktopPresenceUnsupported) && connectorClosedFailure(err, class) {
+				// zotio could not say whether Zotero runs, but the save
+				// found the connector closed, which is what a closed Zotero
+				// does. Hold the job as closed; the watcher's waiter then
+				// learns when Zotero accepts saves, and a failing waiter
+				// backs off and forgets this, so nothing is stranded.
+				s.desktop.set(zotio.DesktopStatus{})
+				presence = desktopClosed
+			}
+			if presence == desktopClosed {
 				s.recordImportWaiting(ctx, row)
 				return importWaiting
 			}
 		}
-		class, hint, httpStatus := autoImportErrorInfo(err)
 		detail["status"] = "error"
 		detail["error_type"] = safeType(err)
 		detail["error_class"] = class

@@ -365,6 +365,15 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 			}
 			return paused, nil
 		}
+		if reason, ok := strings.CutPrefix(aggregate, app.ZoteroNoticePrefix); ok {
+			// "Open Zotero" held through quiet hours is stale once Zotero
+			// accepts papers or no paper waits for this reason any more.
+			current, err := service.ZoteroWaitNoticeCurrent(ctx, reason)
+			if err != nil {
+				return true, nil
+			}
+			return current, nil
+		}
 		if strings.HasPrefix(aggregate, "decision:") || strings.HasPrefix(aggregate, "actions:") {
 			var count int
 			err := dbh.QueryRowContext(ctx, `SELECT COUNT(*) FROM human_actions WHERE status='open'`).Scan(&count)

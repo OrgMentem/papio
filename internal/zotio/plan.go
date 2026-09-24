@@ -193,10 +193,18 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 	artifactPath := filepath.Join(filepath.Dir(bundlePath), filepath.FromSlash(acquisition.Artifact.Path))
 	attachmentMode := s.attachmentMode()
 	collection := strings.TrimSpace(row.Policy.Collection)
+	// A job whose earlier create committed an item attaches to that item and
+	// never creates another (committed.go).
+	itemKey := acquisition.ZotioItemKey
+	if itemKey == "" {
+		if itemKey, err = s.committedParentKey(ctx, jobID, row.Work); err != nil {
+			return nil, err
+		}
+	}
 	// The route belongs in the key, and the two branches below ask for different
 	// ones, so it is resolved before the lookup rather than inside them.
 	planRoute := newItemRoute(attachmentMode)
-	if acquisition.ZotioItemKey != "" {
+	if itemKey != "" {
 		planRoute = existingItemRoute(attachmentMode)
 	}
 	idempotencyKey := planIdempotencyKey(jobID, acquisition.Artifact.SHA256, attachmentMode, collection, planRoute)
@@ -207,6 +215,10 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A stored new-item plan and an existing-item plan both ask for the
+		// connector, so they share a key: a cached create is stale once the
+		// job has an item to attach to.
+		stale = stale || (itemKey != "" && existing.Route == "manifest_create")
 		if stale {
 			// Safe to invalidate: an unresolved manifest entry means Zotio
 			// selected zero import operations (selected=0, planned=0), so no
@@ -235,18 +247,18 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		AttachmentMode: attachmentMode,
 		Collection:     collection,
 	}
-	if acquisition.ZotioItemKey != "" {
-		if !keyRE.MatchString(acquisition.ZotioItemKey) {
-			return nil, fmt.Errorf("invalid Zotero item key %q", acquisition.ZotioItemKey)
+	if itemKey != "" {
+		if !keyRE.MatchString(itemKey) {
+			return nil, fmt.Errorf("invalid Zotero item key %q", itemKey)
 		}
 		// Missing-PDF queue jobs carry an existing Zotio item and a collection
 		// key. Direct acquisitions normally have no item key, so a key-shaped
 		// collection name remains a name and is filed. The unsupported case of
 		// supplying both an explicit item key and a key-shaped collection name
 		// remains ambiguous.
-		plan.CollectionIsKey = keyRE.MatchString(collection)
+		plan.CollectionIsKey = acquisition.ZotioItemKey != "" && keyRE.MatchString(collection)
 		plan.Route = "existing_item"
-		plan.ExpectedParentKey = acquisition.ZotioItemKey
+		plan.ExpectedParentKey = itemKey
 		// "stored" mode here used to have no route to choose: attaching to an
 		// item that already exists went through the Zotero Web API, which
 		// uploads into Zotero's own file storage and consumes that plan whatever
@@ -267,7 +279,7 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		if err != nil {
 			return nil, err
 		}
-		attach := []string{"attachments", "add", acquisition.ZotioItemKey, staged, "--mode", attachmentMode}
+		attach := []string{"attachments", "add", itemKey, staged, "--mode", attachmentMode}
 		if planRoute != "" {
 			attach = append(attach, "--via", planRoute)
 		}
@@ -384,6 +396,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if err := verifyPlanManifest(plan); err != nil {
 		return nil, err
 	}
+	if err := s.refuseCreateAfterCommit(ledgerCtx, plan); err != nil {
+		return nil, err
+	}
 	claimed, err := s.claimApply(ledgerCtx, idempotencyKey, plan.JobID)
 	if err != nil {
 		return nil, err
@@ -421,6 +436,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		if errors.Is(commandErr, context.DeadlineExceeded) || errors.Is(commandErr, context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) {
 			return nil, s.recordAmbiguousApply(ctx, idempotencyKey, plan, out, applyErr)
 		}
+		if evidence := committedCreateEvidence(out); plan.Route == "manifest_create" && evidence != nil {
+			return nil, s.recordCommittedCreate(ctx, idempotencyKey, plan, out, evidence, applyErr)
+		}
 		failure := s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 		if plan.CollectionKey != "" && desktopTargetMissing(out) {
 			// zotio refused before saving anything, and the plan is gone, so
@@ -435,6 +453,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		applyErr := fmt.Errorf("decoding Zotio apply result: %w", err)
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) {
 			return nil, s.recordAmbiguousApply(ctx, idempotencyKey, plan, out, applyErr)
+		}
+		if evidence := committedCreateEvidence(out); plan.Route == "manifest_create" && evidence != nil {
+			return nil, s.recordCommittedCreate(ctx, idempotencyKey, plan, out, evidence, applyErr)
 		}
 		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}

@@ -24,6 +24,7 @@ import (
 	"papio/internal/fetch"
 	"papio/internal/hook"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
 	"papio/internal/resolver"
@@ -601,5 +602,75 @@ func TestSystemCloseCancelsHookAndPersistsOutcome(t *testing.T) {
 	}
 	if detail["status"] != "cancelled" || detail["trigger"] != "ready" {
 		t.Fatalf("persisted hook outcome = %#v", detail)
+	}
+}
+
+// Quiet hours can hold a "Zotero is closed" notice until after Zotero
+// opened. The drain asks before it delivers a held or pending notice, and a
+// notice whose papers no longer wait for that reason is superseded, never
+// delivered. A notice whose papers still wait is kept.
+func TestZoteroWaitingNoticeIsSupersededOnceNoPaperWaits(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = storetest.DataDir(t)
+	cfg.PDF.OCREnabled = false
+	cfg.Zotio.AutoEnrich = false
+	cfg.Notify.Enabled = false // no platform sender: the drain must not post a real notification
+	system, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+	now := time.Now().UTC()
+	route := func(reason string) {
+		t.Helper()
+		message := "Zotero is closed. 1 paper is ready to add. Open Zotero and papio adds it."
+		if err := system.Notify.Route(ctx, notify.Intent{
+			EventKind: "zotio.import_waiting", Category: notify.CategorySystemDegraded,
+			AggregateKey: "zotero:" + reason, Phase: notify.PhaseEpisode,
+			WindowStart: now, HappenedAt: now, Message: message,
+			Detail: notify.Event{Kind: "zotio.import_waiting", Message: message},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	desktopState := func(reason string) string {
+		t.Helper()
+		var state string
+		if err := system.Store.DB().QueryRowContext(ctx,
+			`SELECT desktop_state FROM notification_intents WHERE aggregate_key = ?`, "zotero:"+reason).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+
+	// One paper still waits because Zotero is not running.
+	if _, err := system.Store.DB().ExecContext(ctx, `
+		INSERT INTO work_requests (id, created_at, title) VALUES ('wr_waiting', ?, 'Example paper')`, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Store.DB().ExecContext(ctx, `
+		INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES ('job_waiting', 'wr_waiting', ?, '{"auto_import":true}', ?, ?)`,
+		job.StateReady, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Store.DB().ExecContext(ctx, `
+		INSERT INTO events (job_id, at, kind, detail_json)
+		VALUES ('job_waiting', ?, 'zotio.auto_import', '{"status":"waiting","reason":"zotero_not_running"}')`,
+		now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	route("zotero_not_running")
+	route("zotero_unresponsive")
+	if err := system.Notify.RunDueAt(ctx, now.Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := desktopState("zotero_not_running"); got == "superseded" {
+		t.Fatal("the notice for a paper that still waits was superseded")
+	}
+	if got := desktopState("zotero_unresponsive"); got != "superseded" {
+		t.Fatalf("notice for a condition no paper waits on = %q, want superseded", got)
 	}
 }

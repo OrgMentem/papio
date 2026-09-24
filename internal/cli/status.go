@@ -199,9 +199,13 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		}
 		if group == "ready" {
 			item.ImportStatus = autoImportStatus(detail.Events)
-			if item.ImportStatus == "waiting" {
+			switch item.ImportStatus {
+			case "waiting":
 				// A wait for Zotero is not a failed import: say what ends it.
 				item.Guidance = zoteroWaitingGuidance(autoImportReason(detail.Events))
+			case "queued":
+				// The wait ended; the paced import pass reaches it next.
+				item.Guidance = "Zotero desktop is ready. papio adds these papers within minutes."
 			}
 		}
 		groups[group] = append(groups[group], item)
@@ -311,6 +315,8 @@ func zoteroWaitingGuidance(reason string) string {
 		return "Zotero desktop is open but not responding. Restart Zotero and papio adds these papers."
 	case "zotero_connector_off":
 		return "Zotero desktop does not accept papers from papio. In Zotero, turn on Settings > Advanced > \"Allow other applications to communicate with Zotero\"."
+	case "zotero_busy":
+		return "Zotero desktop is busy. papio adds these papers when it answers."
 	case "zotero_connector_unreachable":
 		return "Zotero desktop is starting. papio adds these papers when it is ready."
 	}

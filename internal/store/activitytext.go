@@ -128,8 +128,12 @@ func ActivityText(kind string, detail map[string]any) string {
 				return "Waiting for Zotero desktop to respond (restart Zotero)"
 			case "zotero_connector_off":
 				return "Waiting for Zotero's connector (turn it on in Zotero)"
+			case "zotero_busy":
+				return "Waiting for Zotero desktop (Zotero is busy)"
 			}
 			return "Waiting for Zotero desktop"
+		case "queued":
+			return "Queued for Zotero (Zotero desktop is ready)"
 		default:
 			return "Zotero import attempted"
 		}

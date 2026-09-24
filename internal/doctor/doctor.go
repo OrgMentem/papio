@@ -274,10 +274,13 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	if db == nil {
 		add("zotero_desktop_waiting", Skip, "papers waiting for Zotero desktop are checked by the daemon", "")
 	} else {
-		n, oldest, reason, err := zoteroDesktopWaitingImports(ctx, db)
+		n, oldest, reason, queued, err := zoteroDesktopWaitingImports(ctx, db)
 		switch {
 		case err != nil:
 			add("zotero_desktop_waiting", Warn, "papers waiting for Zotero desktop could not be counted", "inspect database permissions")
+		case n == 0 && queued > 0:
+			add("zotero_desktop_waiting", Pass, fmt.Sprintf("Zotero desktop is ready: %d %s %s queued, and papio adds them within minutes",
+				queued, plural(queued, "paper", "papers"), plural(queued, "is", "are")), "")
 		case n == 0:
 			add("zotero_desktop_waiting", Pass, "no paper is waiting for Zotero desktop", "")
 		default:
@@ -710,7 +713,9 @@ func duplicateLiveWorks(ctx context.Context, db *store.Store) (int, int, error) 
 
 // undeliveredZoteroImports counts ready jobs whose bytes are validated but whose
 // latest durable zotio.auto_import outcome is neither a successful delivery nor
-// a wait for Zotero desktop, which zotero_desktop_waiting reports instead.
+// a wait for Zotero desktop, which zotero_desktop_waiting reports instead. A
+// queued outcome is that wait ended: Zotero desktop is ready and the paced
+// import pass reaches the paper within minutes.
 func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.Duration, error) {
 	row := db.DB().QueryRowContext(ctx, `
 		SELECT COUNT(*), COALESCE(MIN(j.created_at), '')
@@ -724,7 +729,7 @@ func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.D
 			FROM events e
 			WHERE e.job_id = j.id
 			  AND e.kind = 'zotio.auto_import'
-			  AND json_extract(e.detail_json, '$.status') IN ('applied', 'no_op', 'duplicate', 'waiting')
+			  AND json_extract(e.detail_json, '$.status') IN ('applied', 'no_op', 'duplicate', 'waiting', 'queued')
 			  AND e.seq = (
 				SELECT MAX(e2.seq)
 				FROM events e2
@@ -750,39 +755,42 @@ func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.D
 // zotio.auto_import outcome is a wait for Zotero desktop, how long the oldest
 // has waited, and the reason on the newest wait, which names the current
 // condition. The daemon records a wait only while zotio reports Zotero unable
-// to take connector saves, and replaces it with the import result once it can.
-func zoteroDesktopWaitingImports(ctx context.Context, db *store.Store) (int, time.Duration, string, error) {
+// to take connector saves. When Zotero becomes ready the daemon imports some
+// and marks the rest queued, which queued counts.
+func zoteroDesktopWaitingImports(ctx context.Context, db *store.Store) (n int, waited time.Duration, reason string, queued int, err error) {
 	row := db.DB().QueryRowContext(ctx, `
-		WITH waiting AS (
-			SELECT e.seq, e.at, json_extract(e.detail_json, '$.reason') AS reason
+		WITH latest AS (
+			SELECT e.seq, e.at, json_extract(e.detail_json, '$.status') AS status,
+			       json_extract(e.detail_json, '$.reason') AS reason
 			FROM jobs j
 			JOIN events e ON e.job_id = j.id
 			WHERE j.state = 'ready'
 			  AND json_extract(j.policy_json, '$.auto_import') = 1
 			  AND e.kind = 'zotio.auto_import'
-			  AND json_extract(e.detail_json, '$.status') = 'waiting'
+			  AND json_extract(e.detail_json, '$.status') IN ('waiting', 'queued')
 			  AND e.seq = (
 				SELECT MAX(e2.seq)
 				FROM events e2
 				WHERE e2.job_id = j.id AND e2.kind = 'zotio.auto_import'
 			  )
 		)
-		SELECT COUNT(*), COALESCE(MIN(at), ''),
-		       COALESCE((SELECT reason FROM waiting ORDER BY seq DESC LIMIT 1), '')
-		FROM waiting`)
-	var n int
-	var oldest, reason string
-	if err := row.Scan(&n, &oldest, &reason); err != nil {
-		return 0, 0, "", err
+		SELECT COALESCE(SUM(status = 'waiting'), 0),
+		       COALESCE(MIN(CASE WHEN status = 'waiting' THEN at END), ''),
+		       COALESCE((SELECT reason FROM latest WHERE status = 'waiting' ORDER BY seq DESC LIMIT 1), ''),
+		       COALESCE(SUM(status = 'queued'), 0)
+		FROM latest`)
+	var oldest string
+	if err := row.Scan(&n, &oldest, &reason, &queued); err != nil {
+		return 0, 0, "", 0, err
 	}
 	if n == 0 || oldest == "" {
-		return n, 0, reason, nil
+		return n, 0, reason, queued, nil
 	}
 	since, err := time.Parse(time.RFC3339Nano, oldest)
 	if err != nil {
-		return n, 0, reason, nil
+		return n, 0, reason, queued, nil
 	}
-	return n, time.Since(since), reason, nil
+	return n, time.Since(since), reason, queued, nil
 }
 
 // zoteroDesktopWaitingCopy names the condition behind a wait and the one
@@ -796,6 +804,10 @@ func zoteroDesktopWaitingCopy(reason string) (condition, remedy string) {
 	case "zotero_connector_off":
 		return "Zotero desktop is open but does not accept papers from papio",
 			`in Zotero, turn on Settings > Advanced > "Allow other applications to communicate with Zotero"` + spent
+	case "zotero_busy":
+		// A large sync can hold Zotero for seconds; zotio reports a hang only
+		// after a minute of silence, and the reason then changes.
+		return "Zotero desktop is busy", "wait for Zotero desktop to finish its current work, such as a large sync" + spent
 	case "zotero_connector_unreachable":
 		return "Zotero desktop is starting", "wait for Zotero desktop to finish starting, or restart it if it does not" + spent
 	}

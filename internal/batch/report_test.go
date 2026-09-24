@@ -407,17 +407,22 @@ func TestBuildReportReadyWithoutImportEventSettlesAcquired(t *testing.T) {
 			manifestWork("wr-dropped", "job-dropped", "submitted", "Import event dropped"),
 			manifestWork("wr-skipped", "job-skipped", "submitted", "Zotio not configured"),
 			manifestWork("wr-waiting", "job-waiting", "submitted", "Zotero desktop closed"),
+			manifestWork("wr-queued", "job-queued", "submitted", "Zotero desktop opened"),
 		},
 	}
 	autoImportRow := func(id string) *job.Row {
 		return &job.Row{ID: id, State: job.StateReady, Policy: job.Policy{Collection: "Reading", AutoImport: true}}
 	}
 	jobs := fakeJobs{
-		rows: map[string]*job.Row{"job-dropped": autoImportRow("job-dropped"), "job-skipped": autoImportRow("job-skipped"), "job-waiting": autoImportRow("job-waiting")},
+		rows: map[string]*job.Row{"job-dropped": autoImportRow("job-dropped"), "job-skipped": autoImportRow("job-skipped"), "job-waiting": autoImportRow("job-waiting"), "job-queued": autoImportRow("job-queued")},
 		events: map[string][]map[string]any{
 			// job-dropped: no auto_import event at all (the insert was dropped).
 			"job-skipped": {{"kind": "zotio.auto_import", "detail": map[string]any{"status": "skipped", "reason": "zotio_not_configured"}}},
 			"job-waiting": {{"kind": "zotio.auto_import", "detail": map[string]any{"status": "waiting", "reason": "zotero_not_running"}}},
+			"job-queued": {
+				{"kind": "zotio.auto_import", "detail": map[string]any{"status": "waiting", "reason": "zotero_not_running"}},
+				{"kind": "zotio.auto_import", "detail": map[string]any{"status": "queued", "reason": "zotero_ready"}},
+			},
 		},
 	}
 	report, err := BuildReport(context.Background(), manifest, jobs)
@@ -433,6 +438,10 @@ func TestBuildReportReadyWithoutImportEventSettlesAcquired(t *testing.T) {
 	// A wait for a closed Zotero is not an import failure.
 	if got := report.Works[2]; got.Outcome != OutcomeAcquired || got.Reason != "import_waiting_for_zotero" {
 		t.Fatalf("waiting ready job = %+v, want acquired/import_waiting_for_zotero", got)
+	}
+	// Zotero opened and the paper is queued behind the paced pass.
+	if got := report.Works[3]; got.Outcome != OutcomeAcquired || got.Reason != "import_queued" {
+		t.Fatalf("queued ready job = %+v, want acquired/import_queued", got)
 	}
 	if report.Summary.Outcomes[OutcomeInProgress] != 0 {
 		t.Fatalf("ready job misclassified as in_progress: %+v", report.Summary)
