@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
@@ -544,6 +545,126 @@ func TestDownloadCompleteRefusesUnsuccessfulTerminalJob(t *testing.T) {
 				}
 			}
 			t.Fatal("terminal completion silently accepted")
+		})
+	}
+}
+
+// Reproduces job_272d01737a12bbb6a68958eab1 (2026-09-24): a Firefox stream
+// capture landed, the sweep promoted it to ready, SweepTerminalAdoptions
+// collected the landing directory, and only then did the extension report
+// download_complete and delivery_context for the same download. Each frame
+// re-ran adoption against a directory that no longer existed and recorded
+// browser.adoption_deferred, naming the legacy root the job never used.
+func TestDownloadCompleteAfterReadyCollectionIsQuiet(t *testing.T) {
+	for _, mode := range []string{"same_download", "later_download"} {
+		t.Run(mode, func(t *testing.T) {
+			b, jobs, cfg, data := newBridgeWithHoldingsAndZotio(t, nil, nil, func(cfg *config.Config) {
+				// Production layout: the effective root is distinct from the
+				// drain-only <data_dir>/adoptions legacy root.
+				cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "Downloads", "papio")
+			})
+			if len(cfg.AdoptionRoots()) != 2 {
+				t.Fatalf("adoption roots = %v, want effective and legacy", cfg.AdoptionRoots())
+			}
+			ctx := context.Background()
+			runSync(t, b, hello())
+			id := park(t, jobs, "stream-capture-ready", handoffWork())
+			runSync(t, b,
+				inFrame(t, protocol.MsgViewerCapture, id, map[string]any{"mechanism": "stream_capture"}),
+				inFrame(t, protocol.MsgDownloadStarted, id, map[string]any{"download_id": 2, "filename": "paper.pdf"}),
+			)
+			writeFixturePDF(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"))
+			if err := b.SweepAdoptions(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := b.SweepTerminalAdoptions(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(cfg.EffectiveAdoptionRoot(), id)); !os.IsNotExist(err) {
+				t.Fatalf("ready landing directory was not collected: %v", err)
+			}
+			before, err := jobs.Get(ctx, id)
+			if err != nil || before.State != job.StateReady {
+				t.Fatalf("sweep: row=%+v err=%v", before, err)
+			}
+			downloadID := 2
+			if mode == "later_download" {
+				// A download that starts after the promotion cannot have
+				// produced it; its missing file stays a deferred adoption.
+				downloadID = 3
+				runSync(t, b, inFrame(t, protocol.MsgDownloadStarted, id, map[string]any{"download_id": downloadID, "filename": "paper.pdf"}))
+			}
+			eventsBefore, err := jobs.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				msgs, _ := runSync(t, b,
+					inFrame(t, protocol.MsgDownloadComplete, id, map[string]any{
+						"download_id": downloadID, "filename": "paper.pdf", "size_bytes": 533,
+					}),
+					inFrame(t, protocol.MsgDeliveryContext, id, map[string]any{
+						"download_id": downloadID, "route": "direct", "session_evidence": "fresh_auth",
+					}),
+				)
+				if firstOfType(msgs, protocol.MsgAck) == nil {
+					t.Fatal("completion was not acknowledged")
+				}
+			}
+			after, err := jobs.Get(ctx, id)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("late completion changed ready job: %+v err=%v", after, err)
+			}
+			candidate, err := jobs.GetCandidate(ctx, before.SelectedCandidateID)
+			if err != nil || candidate.BrowserRoute != "" || candidate.SessionEvidence != "" {
+				t.Fatalf("byte-less completion applied provenance: %+v err=%v", candidate, err)
+			}
+			eventsAfter, err := jobs.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var deferred []map[string]any
+			diagnostics := 0
+			for _, event := range eventsAfter[len(eventsBefore):] {
+				switch event["kind"] {
+				case "browser.adoption_deferred":
+					deferred = append(deferred, event)
+				case deliveryProvenanceUnconfirmedEvent:
+					diagnostics++
+				case "browser.download_complete", "browser.delivery_context":
+				default:
+					t.Errorf("late completion produced %+v", event)
+				}
+			}
+			key := browserDownloadKey{JobID: id, DownloadID: int64(downloadID)}
+			if mode == "same_download" {
+				if len(deferred) != 0 {
+					t.Fatalf("adopted download reported as deferred: %+v", deferred)
+				}
+				if diagnostics != 1 {
+					t.Fatalf("unconfirmed provenance diagnostics = %d, want 1", diagnostics)
+				}
+				if _, ok := b.pendingDownloads[key]; ok {
+					t.Error("adopted download remains pending")
+				}
+				if _, ok := b.deliveryContexts[key]; ok {
+					t.Error("adopted download context remains pending")
+				}
+				return
+			}
+			if len(deferred) == 0 || diagnostics != 0 {
+				t.Fatalf("later download: deferred=%d diagnostics=%d, want deferral only", len(deferred), diagnostics)
+			}
+			// Both roots lack the job directory; the reason must name the
+			// effective root, not the drain-only legacy root.
+			realData, err := filepath.EvalSymlinks(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reason, _ := deferred[0]["detail"].(map[string]any)["reason"].(string)
+			if !strings.Contains(reason, filepath.Join(realData, "Downloads", "papio")) || strings.Contains(reason, filepath.Join(realData, "adoptions")) {
+				t.Fatalf("deferral reason %q does not name the effective root", reason)
+			}
 		})
 	}
 }

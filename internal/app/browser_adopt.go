@@ -72,25 +72,31 @@ func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) erro
 // browser's download directory must still be adoptable, and its job may well
 // have an (empty) directory under the effective root too.
 //
-// When no root holds a directory for the job it returns the last resolution
-// error unwrapped enough for callers to test it with errors.Is(fs.ErrNotExist).
+// When no root holds a directory for the job it returns the effective root's
+// resolution error, unwrapped enough for callers to test it with
+// errors.Is(fs.ErrNotExist), unless that error is a plain absence and a later
+// root failed operationally. The drain-only legacy root is normally absent;
+// reporting its lstat hid both where the landing directory went and an
+// EACCES/EIO on the effective root.
 func (s *Service) resolveAdoptionRoots(jobID string) ([]string, error) {
 	bases := s.Config.AdoptionRoots()
 	roots := make([]string, 0, len(bases))
-	var last error
+	var rootErr error
 	for _, base := range bases {
 		real, err := filepath.EvalSymlinks(filepath.Join(base, jobID))
 		if err != nil {
-			last = err
+			if rootErr == nil || errors.Is(rootErr, fs.ErrNotExist) && !errors.Is(err, fs.ErrNotExist) {
+				rootErr = err
+			}
 			continue
 		}
 		roots = append(roots, real)
 	}
 	if len(roots) == 0 {
-		if last == nil {
-			last = fs.ErrNotExist
+		if rootErr == nil {
+			rootErr = fs.ErrNotExist
 		}
-		return nil, last
+		return nil, rootErr
 	}
 	return roots, nil
 }

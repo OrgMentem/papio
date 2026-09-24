@@ -53,6 +53,18 @@ execution records kept during the initial build.
   daemon now compares a report only with the earlier reports from the same
   tab. A late report from that tab is still refused, and the log now says
   why. This change adds database migration 55.
+- **A late download report for a paper that is already filed no longer says
+  the download "needs attention".** The daemon can file a PDF from the
+  download folder before the browser reports that the download finished. For
+  a Firefox viewer capture, the report came 14 seconds later. By then the
+  daemon had removed the paper's download folder, so the report started a
+  second adoption, which failed and recorded `browser.adoption_deferred`
+  twice. The daemon now recognizes a report for the download that the ready
+  paper came from, records one `browser.delivery_provenance_unconfirmed`
+  note, and does nothing else. A download that started after the paper was
+  filed still records `browser.adoption_deferred`. The deferral reason now
+  names the configured download folder, not the old `<data_dir>/adoptions`
+  folder that is only searched for leftover files.
 - **`papio actions open` shows a paper's tab again after papio has opened
   the paper's route.** When *papio* had already sent the paper's tab to the
   library, the command recorded the open and did nothing in the browser. It

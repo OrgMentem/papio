@@ -7,6 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log"
+	"os"
+	"strings"
 
 	"papio/internal/app"
 	"papio/internal/job"
@@ -96,6 +100,66 @@ func (b *Bridge) completedAdoption(ctx context.Context, jobID, filename string, 
 		}
 	}
 	return candidate.ID, nil
+}
+
+// downloadAlreadyPromoted reports whether a completion whose landing bytes are
+// gone names the download the job's current ready artifact was adopted from.
+// The directory sweep can promote a landed file before the browser reports
+// completion (Firefox stream captures reported it 14s later), and
+// SweepTerminalAdoptions then collects the ready job's landing directory, so
+// the late frame has nothing left to weigh. Such a frame is not a deferred
+// adoption. Without bytes it proves nothing about provenance or producers, so
+// the caller only records the unconfirmed-delivery disposition.
+//
+// The durable record must show this exact download (id and filename) started
+// before a browser adoption began, and that the first validation to finish
+// after it is the promotion the job still stands on. A download that started
+// later, or one whose bytes a rejected validation already consumed, keeps
+// deferring. Call with b.mu held; it reads only the store.
+func (b *Bridge) downloadAlreadyPromoted(ctx context.Context, key browserDownloadKey, filename string, adoptErr error) bool {
+	if !errors.Is(adoptErr, fs.ErrNotExist) {
+		return false
+	}
+	row, err := b.jobs.Get(ctx, key.JobID)
+	if err != nil || row == nil || (row.State != job.StateReady && row.State != job.StateImported) {
+		return false
+	}
+	candidate, err := b.jobs.GetCandidate(ctx, row.SelectedCandidateID)
+	if err != nil || candidate == nil || candidate.JobID != key.JobID || candidate.Source != "browser" ||
+		candidate.Status != job.CandidateAccepted || !strings.HasPrefix(candidate.URLKey, "browser-adopt:sha256:") {
+		return false
+	}
+	artifactPath, err := b.svc.Artifacts.ArtifactPath(row.ArtifactSHA256)
+	if err != nil {
+		return false
+	}
+	if info, err := os.Stat(artifactPath); err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	var promoted bool
+	err = b.jobs.S.DB().QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM events s
+		WHERE s.job_id = ?1 AND s.kind = 'browser.download_started'
+		AND json_extract(s.detail_json, '$.download_id') = ?2
+		AND json_extract(s.detail_json, '$.filename') = ?3
+		AND EXISTS (
+			SELECT 1 FROM events a WHERE a.job_id = s.job_id AND a.kind = 'job.transition'
+			AND a.seq > s.seq AND json_extract(a.detail_json, '$.reason') = 'adopt_browser_download'
+		)
+		AND (
+			SELECT r.seq FROM events r WHERE r.job_id = s.job_id AND r.kind = 'job.transition'
+			AND r.seq > s.seq AND json_extract(r.detail_json, '$.from') = ?4
+			ORDER BY r.seq LIMIT 1
+		) = (
+			SELECT MAX(r.seq) FROM events r WHERE r.job_id = s.job_id AND r.kind = 'job.transition'
+			AND json_extract(r.detail_json, '$.from') = ?4 AND json_extract(r.detail_json, '$.to') = ?5
+		)
+	)`, key.JobID, key.DownloadID, filename, job.StateValidating, job.StateReady).Scan(&promoted)
+	if err != nil {
+		log.Printf("papio: checking promoted browser download: %v", err)
+		return false
+	}
+	return promoted
 }
 
 // deliveryProvenanceUnconfirmed recognizes an observed completion disposition,

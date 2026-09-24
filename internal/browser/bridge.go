@@ -3513,7 +3513,9 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			b.pendingDownloads[key] = current
 		}
 		switch {
-		case errors.Is(err, errDeliveryProvenanceUnconfirmed):
+		case errors.Is(err, errDeliveryProvenanceUnconfirmed) || b.downloadAlreadyPromoted(ctx, key, p.Filename, err):
+			// A completion for bytes the sweep already promoted (and whose
+			// landing directory is already collected) is not a deferral.
 			if evErr := b.finishUnconfirmedDelivery(ctx, key, p.Filename); evErr != nil {
 				log.Printf("papio: recording unconfirmed browser delivery provenance: %v", evErr)
 			}
@@ -6836,7 +6838,7 @@ func (b *Bridge) deliveryContext(ctx context.Context, jobID string, payload *pro
 		current.Adopting = false
 		b.pendingDownloads[key] = current
 	}
-	if errors.Is(err, errDeliveryProvenanceUnconfirmed) {
+	if errors.Is(err, errDeliveryProvenanceUnconfirmed) || b.downloadAlreadyPromoted(ctx, key, pending.Filename, err) {
 		return b.finishUnconfirmedDelivery(ctx, key, pending.Filename)
 	}
 	if err != nil {
@@ -6888,6 +6890,11 @@ var errArtifactSuperseded = errors.New("artifact winner already decided for this
 // app-side confinement. It walks cfg.AdoptionRoots so a file that landed in
 // the superseded <data_dir>/adoptions root before the default moved under the
 // browser's download directory is still adoptable.
+//
+// When no root holds the job's directory, the error names the effective root
+// unless a later root failed for an operational reason. The drain-only legacy
+// root is normally absent, and reporting its lstat hid where the landing
+// directory actually went.
 func (b *Bridge) adoptionPath(jobID, filename string) (string, error) {
 	if !filepath.IsLocal(filename) {
 		return "", fmt.Errorf("adoption filename %q is not a local name", filename)
@@ -6896,7 +6903,7 @@ func (b *Bridge) adoptionPath(jobID, filename string) (string, error) {
 	for _, base := range b.cfg.AdoptionRoots() {
 		realRoot, err := filepath.EvalSymlinks(filepath.Join(base, jobID))
 		if err != nil {
-			rootErr = err
+			rootErr = preferredAdoptionRootError(rootErr, err)
 			continue
 		}
 		full := filepath.Join(realRoot, filename)
@@ -6907,6 +6914,16 @@ func (b *Bridge) adoptionPath(jobID, filename string) (string, error) {
 		return full, nil
 	}
 	return "", fmt.Errorf("adoption root unavailable: %w", rootErr)
+}
+
+// preferredAdoptionRootError keeps the first root's resolution failure (the
+// effective root comes first in cfg.AdoptionRoots) unless it is a plain
+// absence and next is an operational failure worth surfacing instead.
+func preferredAdoptionRootError(current, next error) error {
+	if current == nil || errors.Is(current, os.ErrNotExist) && !errors.Is(next, os.ErrNotExist) {
+		return next
+	}
+	return current
 }
 
 func fileDigest(path string) (string, error) {
