@@ -125,6 +125,29 @@ func TestRunReportsPapersWaitingForZoteroDesktop(t *testing.T) {
 	}
 }
 
+// Once Zotero accepts papers, the daemon queues the papers that waited past
+// one pass's bound. Doctor must stop telling the user to open Zotero, and a
+// queued paper is not a stranded import either.
+func TestRunReportsQueuedPapersAsReadyForZotero(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	queuedAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	seedReadyImport(t, db, "job_queued_a", queuedAt, true, "queued")
+	seedReadyImport(t, db, "job_queued_b", queuedAt, true, "queued")
+
+	waiting := importCheck(t, ctx, db, "zotero_desktop_waiting")
+	if waiting.Status != Pass || !strings.Contains(waiting.Detail, "2 papers are queued") {
+		t.Fatalf("zotero_desktop_waiting = %+v, want a pass naming the 2 queued papers", waiting)
+	}
+	if undelivered := undeliveredImportCheck(t, ctx, db); undelivered.Status != Pass {
+		t.Fatalf("undelivered_zotero_imports = %+v, want queued papers not counted as stranded", undelivered)
+	}
+}
+
 // seedReadyImport inserts one validated ready job and, when importStatus is
 // set, its latest zotio.auto_import outcome.
 func seedReadyImport(t *testing.T, db *store.Store, id, settled string, autoImport bool, importStatus string) {

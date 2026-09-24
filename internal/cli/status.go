@@ -199,9 +199,13 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		}
 		if group == "ready" {
 			item.ImportStatus = autoImportStatus(detail.Events)
-			if item.ImportStatus == "waiting" {
+			switch item.ImportStatus {
+			case "waiting":
 				// A wait for Zotero is not a failed import: say what ends it.
 				item.Guidance = zoteroWaitingGuidance(autoImportReason(detail.Events))
+			case "queued":
+				// The wait ended; the paced import pass reaches it next.
+				item.Guidance = "Zotero desktop is ready. papio adds these papers within minutes."
 			}
 		}
 		groups[group] = append(groups[group], item)

@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +22,9 @@ type fakeZoteroDesktop struct {
 	mu          sync.Mutex
 	open        bool
 	unsupported bool
-	waitErr     error
+	// statusErr fails `zotio desktop status` the way a broken zotio does.
+	statusErr error
+	waitErr   error
 	// stuck is a zotio state ("unresponsive", "connector_off") for a Zotero
 	// that runs while its connector cannot take requests.
 	stuck       string
@@ -43,6 +46,9 @@ func (f *fakeZoteroDesktop) DesktopStatus(context.Context) (zotio.DesktopStatus,
 	f.statusCalls++
 	if f.unsupported {
 		return zotio.DesktopStatus{}, zotio.ErrDesktopPresenceUnsupported
+	}
+	if f.statusErr != nil {
+		return zotio.DesktopStatus{}, f.statusErr
 	}
 	if f.stuck != "" {
 		return zotio.DesktopStatus{Running: true, State: f.stuck}, nil
@@ -582,5 +588,160 @@ func TestStuckZoteroSaysRestartOnceAndRewaitsWithoutSpendingAttempts(t *testing.
 	<-done
 	if n := len(sink.waitingMessages()); n != 2 {
 		t.Fatalf("notices after recovery = %d, want still 2", n)
+	}
+}
+
+// A broken zotio can fail `desktop status` while Zotero is closed. The
+// refused connector save is then the only evidence, and it is the closure:
+// the paper waits, spends no attempt, and the next pass does not try the
+// save again. A failure that says nothing about the connector still counts.
+func TestConnectorRefusalWaitsWhenThePresenceProbeFails(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	desktop := newFakeZoteroDesktop()
+	desktop.statusErr = errors.New("zotio desktop status: exit status 1")
+	svc.AutoImporter = desktop
+	svc.ZoteroDesktop = desktop
+	id := seedReadyExistingItemJob(t, svc, jobs, "wr_zotero_probe_fails")
+	if got := strings.Join(importReasons(t, jobs, id), ","); got != "waiting:zotero_not_running" {
+		t.Fatalf("import events = %s, want one wait and no counted error", got)
+	}
+	pastImportBackoff(svc)
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, imports, _ := desktop.counts(); imports != 1 {
+		t.Fatalf("connector saves = %d, want 1: the refusal holds the paper until the waiter sees Zotero", imports)
+	}
+
+	other, otherJobs := newTestService(t)
+	other.Config.Zotio.AutoImport = true
+	readyPipeline(other)
+	broken := newFakeZoteroDesktop()
+	broken.statusErr = errors.New("zotio desktop status: exit status 1")
+	other.ZoteroDesktop = broken
+	other.AutoImporter = &selectiveImporter{fallback: zotio.WithErrorInfo(errors.New("planning job: bundle validation: identity has no citation title"))}
+	failed := seedReadyExistingItemJob(t, other, otherJobs, "wr_zotero_probe_fails_bundle")
+	if got := strings.Join(autoImportStatuses(t, otherJobs, failed), ","); got != "error" {
+		t.Fatalf("bundle failure with a failed probe = %s, want one counted error", got)
+	}
+}
+
+// failingSink fails the first `failures` Zotero waiting notices, as a
+// notification ledger that cannot write does.
+type failingSink struct {
+	mu       sync.Mutex
+	failures int
+	attempts int
+	recorded int
+}
+
+func (f *failingSink) Route(_ context.Context, intent notify.Intent) error {
+	if intent.EventKind != "zotio.import_waiting" {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attempts++
+	if f.failures > 0 {
+		f.failures--
+		return errors.New("notification ledger: disk I/O error")
+	}
+	f.recorded++
+	return nil
+}
+
+// The episode's notice is latched only once the ledger holds it. A failed
+// write must not leave a closed Zotero with no notice at all.
+func TestZoteroWaitingNoticeIsRoutedAgainAfterAFailedRoute(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	desktop := newFakeZoteroDesktop()
+	svc.AutoImporter = desktop
+	svc.ZoteroDesktop = desktop
+	sink := &failingSink{failures: 1}
+	svc.Notifier = sink
+	seedReadyExistingItemJob(t, svc, jobs, "wr_notice_route_fails")
+	for range 3 {
+		if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if sink.attempts != 2 || sink.recorded != 1 {
+		t.Fatalf("notice routes = %d (%d recorded), want 2 routes and 1 recorded notice", sink.attempts, sink.recorded)
+	}
+}
+
+// Zotero opened with more papers waiting than one pass imports. The papers
+// past the bound must stop telling doctor, status and activity to open
+// Zotero: they are queued, spend no attempt, and later passes import them.
+func TestWaitingPapersPastThePassBoundAreQueuedWhenZoteroOpens(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	desktop := newFakeZoteroDesktop()
+	svc.AutoImporter = desktop
+	svc.ZoteroDesktop = desktop
+	var ids []string
+	for i := range maxImportsPerPass + 2 {
+		ids = append(ids, seedReadyExistingItemJob(t, svc, jobs, fmt.Sprintf("wr_queue_%d", i)))
+	}
+	latest := func(id string) string {
+		events := importReasons(t, jobs, id)
+		return events[len(events)-1]
+	}
+
+	watchCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.ZoteroDesktopWatcher().Run(watchCtx)
+	}()
+	waitFor(t, "the watcher to start zotio desktop wait", func() bool {
+		_, waits, _, _ := desktop.counts()
+		return waits == 1
+	})
+	desktop.setOpen(true)
+	waitFor(t, "the papers past the pass bound to be queued", func() bool {
+		queued := 0
+		for _, id := range ids {
+			if latest(id) == "queued:zotero_ready" {
+				queued++
+			}
+		}
+		return queued == 2
+	})
+	stop()
+	<-done
+	applied := 0
+	for _, id := range ids {
+		if latest(id) == "applied:" {
+			applied++
+		}
+	}
+	if applied != maxImportsPerPass {
+		t.Fatalf("papers imported by the pass after Zotero opened = %d, want %d", applied, maxImportsPerPass)
+	}
+
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		events := importReasons(t, jobs, id)
+		if latest(id) != "applied:" {
+			t.Fatalf("job %s import events = %v, want the queued paper imported by the next pass", id, events)
+		}
+		for _, event := range events {
+			if strings.HasPrefix(event, "error:") {
+				t.Fatalf("job %s import events = %v, want no attempt spent", id, events)
+			}
+		}
 	}
 }

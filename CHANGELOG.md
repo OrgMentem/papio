@@ -126,9 +126,13 @@ execution records kept during the initial build.
   paper waits. The daemon does not try the import, uses none of the five
   attempts, and records one `waiting` import event for the paper. One
   `zotio desktop wait` process sleeps until Zotero starts, and then the
-  daemon imports the waiting papers at once, at the usual pace. You get one
-  desktop notification when papers start to wait: "Zotero is closed. 3
-  papers are ready to add. Open Zotero and papio adds them." `papio activity`
+  daemon imports the waiting papers at once, at the usual pace of 3 papers a
+  minute. The papers that must wait for a later pass change from `waiting`
+  to `queued`, so no surface tells you to open a Zotero that is open. You get
+  one desktop notification when papers start to wait: "Zotero is closed. 3
+  papers are ready to add. Open Zotero and papio adds them." A notification
+  that quiet hours held is dropped if Zotero opens before it is shown, or
+  when no paper waits for that reason any more. `papio activity`
   and the extension show "Waiting for Zotero desktop", `papio status` shows
   `import=waiting` and what to do, and the new `papio doctor` check
   `zotero_desktop_waiting` gives the number of papers. When Zotero is open
@@ -137,14 +141,22 @@ execution records kept during the initial build.
   to turn on "Allow other applications to communicate with Zotero" in its
   Advanced settings, and you get one notification for that condition.
   *papio* asks zotio again every 3 minutes, and imports the papers when
-  Zotero answers. The
-  `undelivered_zotero_imports` check no longer counts them, and a batch
-  report gives them the reason `import_waiting_for_zotero`. This needs a
+  Zotero answers. If zotio cannot say whether Zotero runs, an import that
+  Zotero's connector refused also waits and uses no attempt. The
+  `undelivered_zotero_imports` check no longer counts waiting or queued
+  papers, and a batch report gives them the reason `import_waiting_for_zotero`
+  or `import_queued`. This needs a
   zotio that has the `desktop status` and `desktop wait` commands. With an
   older zotio, and for every other import failure, the daemon tries a failed
   import again after 1 minute, 10 minutes, 1 hour and 12 hours. A paper that
   already used its five attempts before you upgrade does not try again by
   itself; import it with `papio zotio import-backfill --apply`.
+- **One Zotero import of a paper runs at a time.** The import that starts
+  when a paper becomes ready and the import-retry pass did not know about
+  each other. When the pass ran during the first import, it imported the same
+  paper again. zotio refused the second import because the first one was
+  still running, and *papio* counted the refusal as a failed attempt. Now the
+  second import skips the paper and records nothing.
 - **`papio zotio apply` refuses a plan whose zotio manifest changed after
   the preview.** zotio reads the manifest from disk when it applies a new
   item, but the plan's confirmation digest covered only the manifest's file
