@@ -199,6 +199,11 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		}
 		if group == "ready" {
 			item.ImportStatus = autoImportStatus(detail.Events)
+			if item.ImportStatus == "waiting" {
+				// A closed Zotero is a wait, not a failed import: say what
+				// ends it.
+				item.Guidance = "Zotero desktop is closed. Open Zotero and papio adds these papers."
+			}
 		}
 		groups[group] = append(groups[group], item)
 	}

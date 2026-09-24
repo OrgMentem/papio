@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"papio/internal/config"
@@ -102,6 +103,9 @@ type Client struct {
 	Executable string
 	Timeout    time.Duration
 	Exec       ExecFunc
+	// desktopPresence caches whether this zotio advertises
+	// DesktopPresenceCapabilities (see desktop.go).
+	desktopPresence atomic.Int32
 }
 
 // Capability is the subset of Zotio's machine registry needed for preflight.
@@ -205,6 +209,7 @@ func (c *Client) Preflight(ctx context.Context) (*PreflightResult, error) {
 	for _, capability := range capabilities {
 		seen[capability.Path] = capability
 	}
+	c.recordDesktopPresence(seen)
 	for path, operation := range RequiredCapabilities {
 		capability, ok := seen[path]
 		if !ok {

@@ -123,11 +123,26 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 	if s == nil || s.Config.Zotio.AutoImportPaused || s.AutoImporter == nil {
 		return nil
 	}
+	s.importPassMu.Lock()
+	defer s.importPassMu.Unlock()
 	rows, err := s.Jobs.List(ctx, job.StateReady, readyImportScanLimit)
 	if err != nil {
 		return err
 	}
 	applied := 0
+	// waiting counts the papers that wait for Zotero desktop after this pass,
+	// and waitingSince is the oldest of their waiting events; together they
+	// name the one notification for this closed-Zotero episode.
+	waiting := 0
+	var waitingSince time.Time
+	countWaiting := func(events []map[string]any) {
+		if at, ok := importWaitingSince(events); ok {
+			waiting++
+			if waitingSince.IsZero() || at.Before(waitingSince) {
+				waitingSince = at
+			}
+		}
+	}
 	for _, row := range rows {
 		if ctx.Err() != nil {
 			return nil
@@ -138,6 +153,15 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 		events, err := s.Jobs.Events(ctx, row.ID)
 		if err != nil {
 			continue // best-effort per job; the next pass retries this one
+		}
+		if applied >= maxImportsPerPass {
+			// Past the per-pass bound the scan only counts the papers that
+			// wait for a closed Zotero desktop; it changes nothing more.
+			if s.desktop.current() != desktopClosed {
+				break
+			}
+			countWaiting(events)
+			continue
 		}
 		if !importNeedsRetry(events) {
 			// A delivered paper whose lifecycle never advanced stays in ready
@@ -153,15 +177,42 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 			continue
 		}
 		if !importRetryDue(events, s.Now()) {
+			countWaiting(events)
 			continue
 		}
-		s.autoImportReady(ctx, &row)
-		applied++
-		if applied >= maxImportsPerPass {
-			return nil
+		switch s.autoImportReady(ctx, &row) {
+		case importAttempted:
+			applied++
+		case importWaiting:
+			if events, err := s.Jobs.Events(ctx, row.ID); err == nil {
+				countWaiting(events)
+			}
 		}
 	}
+	s.notifyImportsWaiting(ctx, waiting, waitingSince)
 	return nil
+}
+
+// importWaitingSince reports when a job's import began waiting for Zotero
+// desktop, if its latest durable outcome is a wait.
+func importWaitingSince(events []map[string]any) (time.Time, bool) {
+	var status, at string
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		status, _ = detail["status"].(string)
+		at, _ = event["at"].(string)
+	}
+	if status != importStatusWaiting {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 // reconcileDeliveredReady advances a ready job whose durable auto-import
@@ -219,7 +270,8 @@ func settledImport(events []map[string]any) (status, parentKey, attachmentKey st
 // duplicate) is done. An error outcome retries until maxImportAttempts distinct
 // failures accumulate, after which the job is left import_failed. A missing or
 // skipped outcome retries: the inline import never recorded a result (a dropped
-// event insert) or ran before Zotio was configured.
+// event insert) or ran before Zotio was configured. A waiting outcome retries
+// and spends no attempt: the import waited for a closed Zotero desktop.
 func importNeedsRetry(events []map[string]any) bool {
 	var status string
 	errorCount := 0

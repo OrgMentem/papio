@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -331,6 +332,55 @@ func TestSchedulerRunsMaintenanceHookWithoutAffectingWorkers(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("scheduler did not stop after cancellation")
+	}
+}
+
+type backgroundFunc func(context.Context)
+
+func (f backgroundFunc) Run(ctx context.Context) { f(ctx) }
+
+// A background runner owns a child process (the Zotero desktop waiter). Run
+// must not return while it is still stopping, or the daemon closes its store
+// and exits with the process still attached.
+func TestSchedulerJoinsBackgroundRunnersBeforeReturning(t *testing.T) {
+	started := make(chan struct{})
+	var stopped atomic.Bool
+	runner := backgroundFunc(func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		time.Sleep(50 * time.Millisecond) // a waiter being reaped
+		stopped.Store(true)
+	})
+	scheduler, err := NewScheduler(
+		&fakeLeaseStore{heartbeats: make(chan struct{}, 1)},
+		ProcessorFunc(func(context.Context, *job.Row) error { return nil }),
+		SchedulerConfig{
+			Owner: "background-worker", LeaseDuration: time.Second, HeartbeatInterval: 100 * time.Millisecond,
+			PollInterval: time.Millisecond, Background: []BackgroundRunner{runner, nil},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not start its background runner")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop after cancellation")
+	}
+	if !stopped.Load() {
+		t.Fatal("Run returned before its background runner stopped")
 	}
 }
 

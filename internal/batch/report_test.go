@@ -400,16 +400,18 @@ func TestBuildReportReadyWithoutImportEventSettlesAcquired(t *testing.T) {
 		Works: []ManifestWork{
 			manifestWork("wr-dropped", "job-dropped", "submitted", "Import event dropped"),
 			manifestWork("wr-skipped", "job-skipped", "submitted", "Zotio not configured"),
+			manifestWork("wr-waiting", "job-waiting", "submitted", "Zotero desktop closed"),
 		},
 	}
 	autoImportRow := func(id string) *job.Row {
 		return &job.Row{ID: id, State: job.StateReady, Policy: job.Policy{Collection: "Reading", AutoImport: true}}
 	}
 	jobs := fakeJobs{
-		rows: map[string]*job.Row{"job-dropped": autoImportRow("job-dropped"), "job-skipped": autoImportRow("job-skipped")},
+		rows: map[string]*job.Row{"job-dropped": autoImportRow("job-dropped"), "job-skipped": autoImportRow("job-skipped"), "job-waiting": autoImportRow("job-waiting")},
 		events: map[string][]map[string]any{
 			// job-dropped: no auto_import event at all (the insert was dropped).
 			"job-skipped": {{"kind": "zotio.auto_import", "detail": map[string]any{"status": "skipped", "reason": "zotio_not_configured"}}},
+			"job-waiting": {{"kind": "zotio.auto_import", "detail": map[string]any{"status": "waiting", "reason": "zotero_not_running"}}},
 		},
 	}
 	report, err := BuildReport(context.Background(), manifest, jobs)
@@ -421,6 +423,10 @@ func TestBuildReportReadyWithoutImportEventSettlesAcquired(t *testing.T) {
 	}
 	if got := report.Works[1]; got.Outcome != OutcomeAcquired || got.Reason != "import_skipped" {
 		t.Fatalf("skipped ready job = %+v, want acquired/import_skipped", got)
+	}
+	// A wait for a closed Zotero is not an import failure.
+	if got := report.Works[2]; got.Outcome != OutcomeAcquired || got.Reason != "import_waiting_for_zotero" {
+		t.Fatalf("waiting ready job = %+v, want acquired/import_waiting_for_zotero", got)
 	}
 	if report.Summary.Outcomes[OutcomeInProgress] != 0 {
 		t.Fatalf("ready job misclassified as in_progress: %+v", report.Summary)

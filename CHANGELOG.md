@@ -87,14 +87,30 @@ execution records kept during the initial build.
   desktop has not synced the item. `papio activity` no longer shows a failed
   filing as "Filed into Zotero collection" or a failed enrichment as "Zotero
   metadata enriched".
-- **A paper acquired while Zotero desktop is closed reaches Zotero after you
-  open it.** When an import failed, the daemon tried again on each one-minute
-  maintenance pass. A closed Zotero refuses every import, so the daemon used
-  all five attempts in four minutes and then stopped. The paper stayed out of
-  Zotero after you opened it. The daemon now waits 1 minute, 10 minutes,
-  1 hour and 12 hours after each failed attempt. A paper that already used its
-  five attempts before you upgrade does not try again by itself; import it
-  with `papio zotio import-backfill --apply`.
+- **A paper acquired while Zotero desktop is closed waits for Zotero and
+  reaches it after you open it.** When an import failed, the daemon tried
+  again on each one-minute maintenance pass. A closed Zotero refuses every
+  import, so the daemon used all five attempts in four minutes and then
+  stopped. The paper stayed out of Zotero after you opened it, and nothing
+  told you. Now, when an import must go through Zotero desktop (a PDF for an
+  item that is already in your library, in `stored` mode), the daemon asks
+  zotio whether Zotero runs before it tries. While Zotero is closed, the
+  paper waits. The daemon does not try the import, uses none of the five
+  attempts, and records one `waiting` import event for the paper. One
+  `zotio desktop wait` process sleeps until Zotero starts, and then the
+  daemon imports the waiting papers at once, at the usual pace. You get one
+  desktop notification when papers start to wait: "Zotero is closed. 3
+  papers are ready to add. Open Zotero and papio adds them." `papio activity`
+  and the extension show "Waiting for Zotero desktop", `papio status` shows
+  `import=waiting` and what to do, and the new `papio doctor` check
+  `zotero_desktop_waiting` gives the number of papers. The
+  `undelivered_zotero_imports` check no longer counts them, and a batch
+  report gives them the reason `import_waiting_for_zotero`. This needs a
+  zotio that has the `desktop status` and `desktop wait` commands. With an
+  older zotio, and for every other import failure, the daemon tries a failed
+  import again after 1 minute, 10 minutes, 1 hour and 12 hours. A paper that
+  already used its five attempts before you upgrade does not try again by
+  itself; import it with `papio zotio import-backfill --apply`.
 
 ## [0.22.1] - 2026-09-23
 

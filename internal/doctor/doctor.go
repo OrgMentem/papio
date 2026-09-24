@@ -272,6 +272,25 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 
 	if db == nil {
+		add("zotero_desktop_waiting", Skip, "papers waiting for Zotero desktop are checked by the daemon", "")
+	} else {
+		n, oldest, err := zoteroDesktopWaitingImports(ctx, db)
+		switch {
+		case err != nil:
+			add("zotero_desktop_waiting", Warn, "papers waiting for Zotero desktop could not be counted", "inspect database permissions")
+		case n == 0:
+			add("zotero_desktop_waiting", Pass, "no paper is waiting for Zotero desktop", "")
+		default:
+			detail := fmt.Sprintf("Zotero desktop is closed: %d %s %s ready to add", n, plural(n, "paper", "papers"), plural(n, "is", "are"))
+			if oldest > 0 {
+				detail += fmt.Sprintf("; waiting for %s", oldest.Round(time.Minute))
+			}
+			add("zotero_desktop_waiting", Warn, detail,
+				"open Zotero desktop; papio notices it and adds the papers within a minute, spending none of their import attempts")
+		}
+	}
+
+	if db == nil {
 		add("zotero_file_storage_refused", Skip, "Zotero file-storage upload refusals are checked by the daemon", "")
 	} else {
 		summary, err := recentZoteroFileStorageRefusedApplies(ctx, db)
@@ -690,7 +709,8 @@ func duplicateLiveWorks(ctx context.Context, db *store.Store) (int, int, error) 
 }
 
 // undeliveredZoteroImports counts ready jobs whose bytes are validated but whose
-// latest durable zotio.auto_import outcome is not a successful delivery.
+// latest durable zotio.auto_import outcome is neither a successful delivery nor
+// a wait for Zotero desktop, which zotero_desktop_waiting reports instead.
 func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.Duration, error) {
 	row := db.DB().QueryRowContext(ctx, `
 		SELECT COUNT(*), COALESCE(MIN(j.created_at), '')
@@ -704,7 +724,7 @@ func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.D
 			FROM events e
 			WHERE e.job_id = j.id
 			  AND e.kind = 'zotio.auto_import'
-			  AND json_extract(e.detail_json, '$.status') IN ('applied', 'no_op', 'duplicate')
+			  AND json_extract(e.detail_json, '$.status') IN ('applied', 'no_op', 'duplicate', 'waiting')
 			  AND e.seq = (
 				SELECT MAX(e2.seq)
 				FROM events e2
@@ -724,6 +744,39 @@ func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.D
 		return n, 0, nil
 	}
 	return n, time.Since(created), nil
+}
+
+// zoteroDesktopWaitingImports counts ready jobs whose latest durable
+// zotio.auto_import outcome is a wait for Zotero desktop, and how long the
+// oldest has waited. The daemon records that outcome only while zotio reports
+// Zotero closed, and replaces it with the import result once Zotero opens.
+func zoteroDesktopWaitingImports(ctx context.Context, db *store.Store) (int, time.Duration, error) {
+	row := db.DB().QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MIN(e.at), '')
+		FROM jobs j
+		JOIN events e ON e.job_id = j.id
+		WHERE j.state = 'ready'
+		  AND json_extract(j.policy_json, '$.auto_import') = 1
+		  AND e.kind = 'zotio.auto_import'
+		  AND json_extract(e.detail_json, '$.status') = 'waiting'
+		  AND e.seq = (
+			SELECT MAX(e2.seq)
+			FROM events e2
+			WHERE e2.job_id = j.id AND e2.kind = 'zotio.auto_import'
+		  )`)
+	var n int
+	var oldest string
+	if err := row.Scan(&n, &oldest); err != nil {
+		return 0, 0, err
+	}
+	if n == 0 || oldest == "" {
+		return n, 0, nil
+	}
+	since, err := time.Parse(time.RFC3339Nano, oldest)
+	if err != nil {
+		return n, 0, nil
+	}
+	return n, time.Since(since), nil
 }
 
 // zoteroFileStorageRefusedRecency is how long a failed Zotero apply in the

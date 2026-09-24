@@ -125,6 +125,15 @@ or receive its abstract. Both steps read the new item through the Zotero Web API
 but an import through Zotero desktop syncs there only afterwards. *papio* repeats a
 step the Web API refused with 404 after 1 minute, and then after 10 minutes, 1 hour,
 and 6 hours, and then stops. It does not run the import again.
+
+An import that attaches a PDF to an item already in your library goes through
+Zotero desktop. When Zotero is closed, *papio* does not spend an import attempt
+on it: the paper waits, `papio activity` shows "Waiting for Zotero desktop", and
+you get one notification. Open Zotero and *papio* imports the waiting papers
+within seconds. This needs a zotio with the `desktop status` and `desktop wait`
+commands; with an older zotio, *papio* tries a failed import again after 1
+minute, 10 minutes, 1 hour, and 12 hours, and then stops.
+
 When zotio is configured, *papio* first classifies batch works against your zotio
 library: works already owning a PDF are skipped, a known item without a PDF is
 queued on its existing-item attachment route, and other works are acquired as new

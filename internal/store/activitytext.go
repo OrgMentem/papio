@@ -122,6 +122,8 @@ func ActivityText(kind string, detail map[string]any) string {
 			return "Imported into Zotero"
 		case "skipped":
 			return "Zotero import skipped"
+		case "waiting":
+			return "Waiting for Zotero desktop"
 		default:
 			return "Zotero import attempted"
 		}
