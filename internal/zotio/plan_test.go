@@ -33,6 +33,7 @@ type planCLI struct {
 	applyErr        error
 	applyFn         func(context.Context) (json.RawMessage, error)
 	enrichErr       error
+	enrichOut       string
 	resolveCalls    int
 	syncCalls       int
 	previewCalls    int
@@ -73,7 +74,11 @@ func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage,
 		c.enrichCalls++
 		c.enrichArgs = append([]string(nil), args...)
 		c.callOrder = append(c.callOrder, "enrich")
-		return json.RawMessage(`{"ok":true}`), c.enrichErr
+		out := c.enrichOut
+		if out == "" {
+			out = `{"ok":true}`
+		}
+		return json.RawMessage(out), c.enrichErr
 	case strings.Contains(joined, "--yes"):
 		c.applyCalls++
 		if c.applyFn != nil {

@@ -119,6 +119,12 @@ batch report and can be retried through the normal zotio preview flow.
 
 `--collection` carries the requested zotio collection with each work; the
 collection is created on demand by zotio, and importing the same work again is safe.
+
+A paper that *papio* imports can take minutes to appear in its Zotero collection
+or receive its abstract. Both steps read the new item through the Zotero Web API,
+but an import through Zotero desktop syncs there only afterwards. *papio* repeats a
+step the Web API refused with 404 after 1 minute, and then after 10 minutes, 1 hour,
+and 6 hours, and then stops. It does not run the import again.
 When zotio is configured, *papio* first classifies batch works against your zotio
 library: works already owning a PDF are skipped, a known item without a PDF is
 queued on its existing-item attachment route, and other works are acquired as new

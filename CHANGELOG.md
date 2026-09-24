@@ -58,6 +58,23 @@ execution records kept during the initial build.
   library, the command recorded the open and did nothing in the browser. It
   now brings that tab to the front. It does not open a second tab, and it does
   not load the route again. This works with extension 0.15.0 and later.
+- **A paper imported through Zotero desktop reaches its collection and gets
+  its abstract.** After an import, *papio* files the paper into the job's
+  collection and fills a missing DOI and abstract. zotio does both through the
+  Zotero Web API, and both first read the new item there. An import through
+  Zotero desktop reaches the Web API only after the desktop syncs it, some
+  seconds later, but *papio* asked about one second after the import. So the
+  Web API answered HTTP 404, and nothing asked again: the paper stayed outside
+  its collection and without its abstract. The daemon now tries such a
+  follow-up again after 1 minute, and after each further failure after 10
+  minutes, 1 hour, and 6 hours, and then stops. It does not import the paper
+  again, and it does not retry any other failure. The config key
+  `[zotio] auto_import_paused` pauses these retries too. The
+  job's events now name the 404 for the enrichment, which read `unknown` and
+  "mutation incomplete" before, and the hint for both says that Zotero
+  desktop has not synced the item. `papio activity` no longer shows a failed
+  filing as "Filed into Zotero collection" or a failed enrichment as "Zotero
+  metadata enriched".
 
 ## [0.22.1] - 2026-09-23
 

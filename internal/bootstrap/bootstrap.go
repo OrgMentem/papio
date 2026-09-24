@@ -537,6 +537,11 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if reconciler := zotioService.TagReconciler(); reconciler != nil {
 		maintenance = append(maintenance, reconciler)
 	}
+	// A paused config stops every automatic Zotero write, and the follow-up
+	// retries are Zotero writes papio starts on its own.
+	if retrier := zotioService.FollowUpRetrier(); retrier != nil && !cfg.Zotio.AutoImportPaused {
+		maintenance = append(maintenance, retrier)
+	}
 	scheduler, err := daemon.NewScheduler(jobs, service, daemon.SchedulerConfig{
 		Owner:               job.NewID("daemon"),
 		Workers:             3,

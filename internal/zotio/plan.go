@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -475,71 +476,79 @@ func (s *Service) markImported(ctx context.Context, result *ApplyResult) error {
 // fileCollection applies the optional policy filing after the import has been
 // durably recorded. Filing is deliberately best-effort: an attachment/import
 // must not be rolled back because a collection write cannot be completed.
-func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyResult) {
+// It reports whether it asked zotio to file, which is when it records an event.
+func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyResult) bool {
 	if plan == nil || result == nil || result.ParentKey == "" {
-		return
+		return false
 	}
 	collection := strings.TrimSpace(plan.Collection)
 	if collection == "" {
-		return
+		return false
 	}
 	if plan.CollectionIsKey {
 		// A missing-PDF queue filter is a Zotero collection key. The existing
 		// parent already belongs to that collection; filing accepts names only.
-		return
+		return false
 	}
 	detail := map[string]any{"collection": collection}
-	if _, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", collection); err != nil {
-		info := ErrorInfoFrom(err)
-		detail["status"] = "error"
-		detail["error_type"] = fmt.Sprintf("%T", err)
-		detail["error_class"] = info.Class
-		if info.Hint != "" {
-			detail["error_hint"] = info.Hint
-		}
-		if info.HTTPStatus != 0 {
-			detail["error_http_status"] = info.HTTPStatus
-		}
+	if out, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", collection); err != nil {
+		recordFollowUpFailure(detail, err, out)
 	} else {
 		detail["status"] = "applied"
 	}
-	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.collection_filing", detail)
+	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpCollectionFiling, detail)
+	return true
 }
 
 // enrichAutoImportedParent fills only missing DOI and abstract metadata after a
 // successful policy-driven auto-import. It deliberately does not request any
 // OA-PDF remediation or validation mode, and its failure cannot undo the import.
-func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, result *ApplyResult) {
+// It reports whether it asked zotio to enrich, which is when it records an event.
+func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, result *ApplyResult) bool {
 	if !s.AutoEnrich || plan == nil || result == nil || result.Status != "applied" || result.ParentKey == "" {
-		return
+		return false
 	}
 	row, err := s.Bundle.Jobs.Get(ctx, plan.JobID)
 	if err != nil || !row.Policy.AutoImport {
-		return
+		return false
 	}
 	detail := map[string]any{
 		"parent_key": result.ParentKey,
 		"summary":    "filled missing DOI and abstract metadata",
 	}
-	if _, err := s.CLI.RunJSON(ctx,
+	if out, err := s.CLI.RunJSON(ctx,
 		"--agent", "--yes", "items", "enrich",
 		"--missing-doi", "--missing-abstract", "--keys", result.ParentKey,
 	); err != nil {
-		info := ErrorInfoFrom(err)
-		detail["status"] = "error"
 		detail["summary"] = "metadata enrichment failed"
-		detail["error_type"] = fmt.Sprintf("%T", err)
-		detail["error_class"] = info.Class
-		if info.Hint != "" {
-			detail["error_hint"] = info.Hint
-		}
-		if info.HTTPStatus != 0 {
-			detail["error_http_status"] = info.HTTPStatus
-		}
+		recordFollowUpFailure(detail, err, out)
 	} else {
 		detail["status"] = "applied"
 	}
-	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, "zotio.enrich", detail)
+	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpEnrich, detail)
+	return true
+}
+
+// recordFollowUpFailure adds a failed follow-up's classification to its event
+// detail. It classifies the mutation envelope zotio printed on stdout as well
+// as the error line: a mutation names its per-item cause, such as the Web
+// API's 404, only in the envelope, while its error line says just "mutation
+// incomplete". A 404 is the one failure FollowUpRetrier repeats, so its hint
+// says why instead of repeating the status.
+func recordFollowUpFailure(detail map[string]any, err error, out json.RawMessage) {
+	info := ErrorInfoFrom(WithErrorInfo(err, out))
+	if info.HTTPStatus == http.StatusNotFound {
+		info.Hint = webAPINotSyncedHint
+	}
+	detail["status"] = "error"
+	detail["error_type"] = fmt.Sprintf("%T", err)
+	detail["error_class"] = info.Class
+	if info.Hint != "" {
+		detail["error_hint"] = info.Hint
+	}
+	if info.HTTPStatus != 0 {
+		detail["error_http_status"] = info.HTTPStatus
+	}
 }
 
 // PlanAndApply creates an immutable plan for one ready job and immediately

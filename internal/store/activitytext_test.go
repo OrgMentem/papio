@@ -35,8 +35,13 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 		{"drive.resumed", nil, "Paced drive resumed"},
 		{"acquisition.component_added", map[string]any{"role": "supplement"}, "Added supplement component"},
 		{"zotio.auto_import", map[string]any{"status": "applied"}, "Imported into Zotero"},
-		{"zotio.collection_filing", nil, "Filed into Zotero collection"},
-		{"zotio.enrich", nil, "Zotero metadata enriched"},
+		{"zotio.collection_filing", map[string]any{"status": "applied"}, "Filed into Zotero collection"},
+		// A failed follow-up read "Filed into Zotero collection" and "Zotero
+		// metadata enriched" for job_cb931061… on 2026-09-24, while Zotero
+		// held the paper in no collection and without the abstract.
+		{"zotio.collection_filing", map[string]any{"status": "error"}, "Zotero collection filing failed"},
+		{"zotio.enrich", map[string]any{"status": "applied"}, "Zotero metadata enriched"},
+		{"zotio.enrich", map[string]any{"status": "error"}, "Zotero metadata enrichment failed"},
 		{"notify.attempted", map[string]any{"count": int64(2)}, "Notification attempted for 2 items"},
 		{"notify.held", map[string]any{"reason": "quiet_hours"}, "Notification held (quiet hours)"},
 		{"notify.digest", nil, "Notification digest queued"},

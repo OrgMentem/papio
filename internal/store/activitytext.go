@@ -126,9 +126,23 @@ func ActivityText(kind string, detail map[string]any) string {
 			return "Zotero import attempted"
 		}
 	case "zotio.collection_filing":
-		return "Filed into Zotero collection"
+		switch activityDetailString(detail, "status") {
+		case "applied":
+			return "Filed into Zotero collection"
+		case "error":
+			return "Zotero collection filing failed"
+		default:
+			return "Zotero collection filing attempted"
+		}
 	case "zotio.enrich":
-		return "Zotero metadata enriched"
+		switch activityDetailString(detail, "status") {
+		case "applied":
+			return "Zotero metadata enriched"
+		case "error":
+			return "Zotero metadata enrichment failed"
+		default:
+			return "Zotero metadata enrichment attempted"
+		}
 	case "hook.on_ready":
 		if status := activityDetailString(detail, "status"); status != "" {
 			return clampActivityText(fmt.Sprintf("On-ready hook ran (%s)", status))
