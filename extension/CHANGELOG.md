@@ -68,6 +68,17 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **An Ebook Central refusal after sign-in no longer asks you to sign in
+  again.** After a completed institutional sign-in, Ebook Central can send
+  the tab to its "does not allow access ... from your current IP" page
+  (`/auth/lib/<library>/message.action?code=UNAUTHORIZED`). The extension read
+  that `/auth/` address as a sign-in page, so the paper stayed waiting for a
+  sign-in that had already finished. Three minutes later it reported a second
+  sign-in and held the library's one sign-in slot. The extension now reports
+  the refusal as a provider refusal. The daemon retries the paper later,
+  because the same route opened the book on the next attempt. Ebook Central's
+  real sign-in page, OpenAthens and the institution's sign-in pages still
+  count as sign-in.
 - **An institutional paper whose sign-in tab closed can be opened again.**
   When the three-minute drive timeout closed an unattended sign-in tab, the
   extension kept the dead surface as live. Every later offer of that paper

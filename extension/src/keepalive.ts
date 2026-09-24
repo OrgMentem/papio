@@ -261,11 +261,36 @@ export function isAuthenticationURL(rawURL: string): boolean {
     // Duo's tenant-hosted push prompt has no login/auth path segment. It
     // remains a sign-in step, never a provider landing or capture target.
     if (/^api-[a-z0-9]+\.duosecurity\.com$/i.test(url.hostname)) return true;
+    if (isEbookCentralSignInRefusalURL(rawURL)) return false;
     const hostnameHasAuthSegment = url.hostname
       .toLowerCase()
       .split(".")
       .some((segment) => AUTH_HOST_SEGMENTS[segment] === true);
     return LOGIN_ROUTE.test(url.pathname) || hostnameHasAuthSegment;
+  } catch {
+    return false;
+  }
+}
+
+const EBOOK_CENTRAL_HOST = "ebookcentral.proquest.com";
+const EBOOK_CENTRAL_MESSAGE_PATH = /^\/auth\/lib\/[^/]+\/message\.action$/i;
+
+/** Ebook Central's refusal of a completed institutional sign-in. Measured
+ * 2026-09-24 in the operator's browser history: the institution's OpenAthens
+ * sign-in finished, `SignInPartnerUser` redirected the handoff tab to
+ * `/auth/lib/<library>/message.action?code=UNAUTHORIZED` ("does not allow
+ * access ... from your current IP"), and the same route reached the book on
+ * the next attempt. ProQuest serves the page under `/auth/`, the same prefix as
+ * its real `login.action`, but nothing on it signs anyone in. Only that code
+ * was observed; other codes stay whatever the path says they are. */
+export function isEbookCentralSignInRefusalURL(rawURL: string): boolean {
+  try {
+    const url = new URL(rawURL);
+    return (
+      url.hostname.toLowerCase() === EBOOK_CENTRAL_HOST &&
+      EBOOK_CENTRAL_MESSAGE_PATH.test(url.pathname) &&
+      url.searchParams.get("code") === "UNAUTHORIZED"
+    );
   } catch {
     return false;
   }

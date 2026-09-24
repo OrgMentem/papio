@@ -190,6 +190,7 @@ import {
   DEFAULT_RELOAD_SETTLE_MS,
   initKeepalive,
   isAuthenticationURL,
+  isEbookCentralSignInRefusalURL,
 } from "./keepalive";
 import type {
   FreshSessionEvidence,
@@ -13398,6 +13399,14 @@ export class Bridge {
       }));
       this.scheduleChallengeCooldownExpiry(providerHost, expiresAt);
     }
+    await this.reportRateLimited(
+      job,
+      "The provider refused the browser with a block page; papio paused this provider and will retry later.",
+    );
+  }
+
+  /** Report `rate_limited` once per job and release the drive. */
+  private async reportRateLimited(job: ActiveJob, detail: string): Promise<void> {
     const outcomeKey = `${job.job_id}:rate_limited`;
     if (this.handoffOutcomeSent.has(outcomeKey)) return;
     const host = await this.reportableHost(job.tab_id);
@@ -13406,8 +13415,7 @@ export class Bridge {
         "provider_outcome",
         {
           outcome: "rate_limited",
-          detail:
-            "The provider refused the browser with a block page; papio paused this provider and will retry later.",
+          detail,
           ...(host === undefined ? {} : { host }),
         },
         job.job_id,
@@ -16846,6 +16854,24 @@ export class Bridge {
       // proxy for "the human began interacting" (the wall→post-wall URL
       // transition the design falls back to).
       void this.emitClaimObservation(job.job_id, tabID, "login_started", true);
+    }
+    if (successfulLanding && isEbookCentralSignInRefusalURL(url)) {
+      // Ebook Central refused a completed sign-in (see
+      // isEbookCentralSignInRefusalURL). Nothing on this page is for a human,
+      // and the same route has reached the book on the next attempt, so the
+      // refusal is `rate_limited`: the daemon releases the drive's institution
+      // binding, cools this exact host and retries later, with no drift
+      // latch. `no_entitlement` would suppress a route the library is
+      // entitled to; the adapter-less classifier would report `ui_changed`,
+      // which latches drift and opens a manual download. The browser adds no
+      // host cooldown: its cooldown key is the registrable host, and pausing
+      // proquest.com would also stop ProQuest's article platform over one
+      // Ebook Central session.
+      await this.reportRateLimited(
+        job,
+        "Ebook Central refused the completed institutional sign-in; papio will retry later.",
+      );
+      return;
     }
     if (
       change.status === "complete" &&

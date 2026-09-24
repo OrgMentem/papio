@@ -3714,6 +3714,97 @@ test("an unreadable auth-required article parks without a sign-in claim", async 
   expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
+// Measured 2026-09-24: the operator finished the institution's OpenAthens
+// sign-in (IdP and Duo), then Ebook Central's partner sign-in redirected the
+// handoff tab to /auth/lib/<library>/message.action?code=UNAUTHORIZED. The
+// /auth/ path read as a sign-in page, so the paper never returned from
+// auth_pending, and the drive timeout three minutes after the route reported
+// auth_pending again and held the institution's one sign-in slot. The same
+// route reached the book on the next attempt, so the refusal is retried later.
+test("an Ebook Central sign-in refusal after OpenAthens reports rate_limited, not a second auth_pending", async () => {
+  const jobID = "job_ebook_central_refusal";
+  const refusalURL =
+    "https://ebookcentral.proquest.com/auth/lib/example/message.action?code=UNAUTHORIZED";
+  const h = makeHarness();
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  offer.payload["login_entity_id"] = "https://idp.example.edu/entity";
+  h.deps.scripting.executeScript = async () => {
+    throw new Error("a sign-in refusal URL needs no page read");
+  };
+
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1"] }));
+  await h.port.inbound(offer);
+  const opening = h.bridge.openHandoff(jobID);
+  const request = await h.port.waitForFrame("handoff_link_request");
+  await h.port.inbound(nativeResult("handoff_link_result", {
+    request_id: request.payload["request_id"], outcome: "opened", url: OPENURL,
+  }));
+  await opening;
+  const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+
+  // The resolver hands the tab to the institution's OpenAthens redirector.
+  await h.tabs.userNavigate(
+    tabID,
+    "https://go.openathens.net/redirector/example.edu?url=http%3A%2F%2Febookcentral.proquest.com%2Flib%2Fexample%2Fdetail.action%3FdocID%3D1",
+  );
+  expect(findByJob(h.backend.store, jobID)?.status).toBe("auth_pending");
+  const afterSignInStarted = h.frames().length;
+
+  // Sign-in completes; Ebook Central refuses the partner sign-in.
+  h.clock.now += 42_000;
+  await h.tabs.completeNavigation(tabID, refusalURL);
+  const outcomes = h.frames()
+    .slice(afterSignInStarted)
+    .filter((frame) => frame.type === "provider_outcome");
+  expect(outcomes.map((frame) => frame.payload["outcome"])).toEqual(["rate_limited"]);
+  expect(outcomes[0]?.payload["host"]).toBe("ebookcentral.proquest.com");
+  // The refusal releases the drive: nothing is left to hold a sign-in slot.
+  expect(findByJob(h.backend.store, jobID)).toBeUndefined();
+  // ProQuest's article platform shares the registrable host; one Ebook
+  // Central session refusal must not pause it.
+  expect(h.backend.store.challengeCooldowns?.["proquest.com"]).toBeUndefined();
+
+  h.clock.now += 180_000 - 42_000;
+  await driveTimeout!.fn();
+  expect(
+    h.frames().slice(afterSignInStarted).some((frame) => frame.type === "auth_pending"),
+  ).toBe(false);
+});
+
+test("a drive that times out on Ebook Central's sign-in refusal claims no sign-in", async () => {
+  const jobID = "job_ebook_central_refusal_timeout";
+  const h = makeHarness({
+    ...emptyStore(),
+    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+  });
+  const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
+  offer.payload["requires_auth"] = true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [AUTH_CLAIM] }));
+  await h.port.inbound(offer);
+  const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+  // No navigation event reached this worker (for example, it restarted), so
+  // only the timeout sees the refusal page.
+  h.tabs.seed({
+    id: tabID,
+    url: "https://ebookcentral.proquest.com/auth/lib/example/message.action?code=UNAUTHORIZED",
+  });
+  const beforeTimeout = h.frames().length;
+  const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(driveTimeout).toBeDefined();
+  h.clock.now += 180_000;
+  await driveTimeout!.fn();
+
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "queued", engagement_required: true,
+  });
+  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(false);
+});
+
 test("handoff_link_v1 keeps a warm requires-auth offer on the eager path", async () => {
   const jobID = "job_fresh_link_warm";
   const h = makeHarness({

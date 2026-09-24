@@ -12,6 +12,7 @@ import {
   chromeKeepaliveAPI,
   collectResolverMarkers,
   isAuthenticationURL,
+  isEbookCentralSignInRefusalURL,
   keepaliveModeFromStorage,
   KeepaliveManager,
   MAX_AFFORDANCE_LENGTH,
@@ -1660,6 +1661,34 @@ test("Duo tenant prompts remain authentication pages without a login path", () =
   for (const host of ["duosecurity.com", "www.duosecurity.com", "api-a1b2c3d4.duosecurity.com.example.org", "notduosecurity.com"]) {
     expect(isAuthenticationURL(`https://${host}/prompt/EXAMPLE`)).toBe(false);
   }
+});
+
+// Measured 2026-09-24: after the institution's OpenAthens sign-in completed,
+// Ebook Central's partner sign-in redirected the handoff tab to its refusal
+// page. ProQuest serves that page under /auth/, but it is a message, not a
+// sign-in form, while its login.action sibling on the same path is one.
+test("Ebook Central's sign-in refusal page is not an authentication page", () => {
+  const refusal = "https://ebookcentral.proquest.com/auth/lib/example/message.action?code=UNAUTHORIZED";
+  expect(isAuthenticationURL(refusal)).toBe(false);
+  expect(isEbookCentralSignInRefusalURL(refusal)).toBe(true);
+  expect(isEbookCentralSignInRefusalURL("https://ebookcentral.proquest.com/auth/lib/EXAMPLE/message.action?code=UNAUTHORIZED")).toBe(true);
+  for (const signIn of [
+    "https://ebookcentral.proquest.com/auth/lib/example/login.action?returnURL=https%3A%2F%2Febookcentral.proquest.com%2Flib%2Fexample%2Fdetail.action%3FdocID%3D1",
+    "https://go.openathens.net/redirector/example.edu?url=http%3A%2F%2Febookcentral.proquest.com%2Flib%2Fexample%2Fdetail.action%3FdocID%3D1",
+    "https://connect.openathens.net/ebrary.com/00000000-0000-0000-0000-000000000000/login?entity=https%3A%2F%2Fidp.example.edu%2Fentity",
+    "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=e1s1",
+  ]) {
+    expect(isAuthenticationURL(signIn)).toBe(true);
+    expect(isEbookCentralSignInRefusalURL(signIn)).toBe(false);
+  }
+  for (const other of [
+    // Another message, or the same page elsewhere, is not the measured refusal.
+    "https://ebookcentral.proquest.com/auth/lib/example/message.action?code=SESSION_EXPIRED",
+    "https://ebookcentral.proquest.com/auth/lib/example/message.action",
+    "https://ebookcentral.proquest.com.example.org/auth/lib/example/message.action?code=UNAUTHORIZED",
+    "https://ebookcentral.proquest.com/lib/example/detail.action?docID=1",
+  ])
+    expect(isEbookCentralSignInRefusalURL(other)).toBe(false);
 });
 
 test("resolver marker classifier prioritizes sign-out and handles Primo-shaped account markup", () => {
