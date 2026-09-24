@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"papio/internal/incident"
+	"papio/internal/store"
 )
 
 // FailuresLimitMax and FailuresLimitDefault bound Store.Failures's limit
@@ -63,7 +64,7 @@ func (js *Store) Failures(ctx context.Context, since time.Time, limit int) ([]Fa
 		  AND (? = '' OR julianday(j.updated_at) >= julianday(?))`
 	coarseCutoff := ""
 	if !since.IsZero() {
-		coarseCutoff = since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+		coarseCutoff = store.FormatTime(since.Add(-failureCutoffPad))
 	}
 	rows, err := js.S.DB().QueryContext(ctx, query, coarseCutoff, coarseCutoff)
 	if err != nil {
@@ -152,12 +153,12 @@ func (js *Store) IncidentFailures(ctx context.Context, since time.Time, limit in
 			if since.IsZero() {
 				return ""
 			}
-			return since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+			return store.FormatTime(since.Add(-failureCutoffPad))
 		}(), func() string {
 			if since.IsZero() {
 				return ""
 			}
-			return since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+			return store.FormatTime(since.Add(-failureCutoffPad))
 		}())
 	if err != nil {
 		return nil, err
@@ -213,7 +214,7 @@ func (js *Store) FailureGroupCount(ctx context.Context, tx *sql.Tx, since time.T
 	}
 	coarseCutoff := ""
 	if !since.IsZero() {
-		coarseCutoff = since.Add(-failureCutoffPad).UTC().Format(time.RFC3339Nano)
+		coarseCutoff = store.FormatTime(since.Add(-failureCutoffPad))
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT j.id, j.state, j.updated_at, COALESCE(j.terminal_reason, ''),

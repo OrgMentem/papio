@@ -8,6 +8,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"papio/internal/store"
 )
 
 // ErrCloseAuthorizationConflict reports that a live close-authorization
@@ -47,7 +49,7 @@ func (js *Store) IssueCloseAuthorization(ctx context.Context, bindingID string, 
 	if bindingID == "" || len(bindingID) > 256 || generation < 0 || !closeAuthorizationDispositions[disposition] {
 		return "", "", errors.New("invalid close authorization input")
 	}
-	nowText := now.UTC().Format(time.RFC3339Nano)
+	nowText := store.FormatTime(now)
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return "", "", err
@@ -121,7 +123,7 @@ func (js *Store) ExpireCloseAuthorizations(ctx context.Context, before time.Time
 		UPDATE close_authorizations
 		   SET status = 'expired'
 		 WHERE status = 'issued' AND issued_at < ?`,
-		before.UTC().Format(time.RFC3339Nano))
+		store.FormatTime(before))
 	if err != nil {
 		return 0, err
 	}

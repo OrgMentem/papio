@@ -163,11 +163,23 @@ There is also a link check, because `zensical build` prints a broken link as an
   schema version <N+1> is newer than this binary supports (<N>); refusing to open"`.
   Leave alone: that file's sibling `TestGuardCapableSchema33RefusesSchema34`
   deliberately models a historical ceiling, and `migrate_forward_test.go`'s
-  *fixture* pins schema 33 on purpose — it selects migrations by
-  `migrationNumber(filename) > 33` rather than a hardcoded prefix list, so the
-  bound stays 33 and a new migration needs no entry there. `go test ./...` fails
+  schema-33 tests pin their fixture at 33 on purpose — `schemaFixture(t, 33, …)`
+  selects migrations by `migrationNumber(filename) > version` rather than a
+  hardcoded prefix list, so the bound stays 33 and a new migration needs no entry
+  there. `go test ./...` fails
   after adding `internal/store/migrations/NNNN_*.sql` until the four latest-version
   assertions are bumped.
+- **Every stored timestamp is `store.FormatTime` text, never `time.RFC3339Nano`.**
+  SQLite compares TEXT byte by byte and papio compares timestamps as text (lease
+  and retry checks, `[since, until)` counts, keyset cursors, ORDER BY).
+  `RFC3339Nano` trims trailing fraction zeros, and trimmed text misorders inside
+  one second (`…:05Z` sorts after `…:05.1Z`). Write and bind with
+  `store.FormatTime`/`store.Now` (UTC, nine digits, 30 bytes); parse with
+  `time.RFC3339Nano`, which reads both widths. Migration 0056 rewrote the old
+  values. A bound of "now" on a half-open period also drops an event recorded
+  in the same clock reading — Windows advances the wall clock about once a
+  millisecond — so an omitted end must leave the period open, as
+  `job.ProducerStats` does.
 - **NEVER edit an applied migration in place.** A constraint or column change needs a
   *new* migration, even when the old one is "obviously wrong" — no schema version
   records an in-place edit, and every test migrates a fresh database and so never sees

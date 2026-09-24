@@ -50,7 +50,7 @@ func formatNotificationTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return FormatTime(t)
 }
 
 func parseNotificationTime(rowID int64, column string, text sql.NullString) (time.Time, error) {

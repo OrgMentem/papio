@@ -2613,7 +2613,7 @@ func (s *Service) ReconcileDelivery(ctx context.Context, input DeliveryReconcili
 		if err != nil {
 			return DeliveryReconciliationResult{}, err
 		}
-		now := s.Now().UTC().Format(time.RFC3339Nano)
+		now := store.FormatTime(s.Now())
 		if err := s.Jobs.RepairAwaitingHumanTx(ctx, tx, input.JobID, []int64{action.ID}, string(repairDetail), now); err != nil {
 			return DeliveryReconciliationResult{}, err
 		}
@@ -2626,7 +2626,7 @@ func (s *Service) ReconcileDelivery(ctx context.Context, input DeliveryReconcili
 		if err != nil {
 			return DeliveryReconciliationResult{}, err
 		}
-		if err := s.Jobs.TransitionTx(ctx, tx, input.JobID, job.StateResolving, job.StateRetryWait, string(retryDetail), job.TransitionTxConfig{RetryAt: next.UTC().Format(time.RFC3339Nano)}, now); err != nil {
+		if err := s.Jobs.TransitionTx(ctx, tx, input.JobID, job.StateResolving, job.StateRetryWait, string(retryDetail), job.TransitionTxConfig{RetryAt: store.FormatTime(next)}, now); err != nil {
 			return DeliveryReconciliationResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -2651,7 +2651,7 @@ func (s *Service) ReconcileDelivery(ctx context.Context, input DeliveryReconcili
 		if err != nil {
 			return DeliveryReconciliationResult{}, err
 		}
-		if err := s.Jobs.RepairAwaitingHumanTx(ctx, tx, input.JobID, []int64{action.ID}, string(repairDetail), s.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := s.Jobs.RepairAwaitingHumanTx(ctx, tx, input.JobID, []int64{action.ID}, string(repairDetail), store.FormatTime(s.Now())); err != nil {
 			return DeliveryReconciliationResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -2715,7 +2715,7 @@ func (s *Service) restoreDeliveryReconciliationAction(ctx context.Context, jobID
 	if err != nil {
 		return fmt.Errorf("encoding delivery reconciliation restore: %w", err)
 	}
-	now := s.Now().UTC().Format(time.RFC3339Nano)
+	now := store.FormatTime(s.Now())
 	if err := s.Jobs.TransitionTx(restoreCtx, tx, jobID, job.StateResolving, job.StateAwaitingHuman,
 		string(detail), job.TransitionTxConfig{}, now); err != nil {
 		return fmt.Errorf("restoring delivery reconciliation job state: %w", err)

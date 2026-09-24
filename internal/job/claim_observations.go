@@ -371,7 +371,7 @@ func (js *Store) ConsumeCloseAuthorizationForBinding(ctx context.Context, bindin
 	if strings.TrimSpace(bindingID) == "" {
 		return errors.New("binding is required")
 	}
-	return consumeCloseAuthorizationTx(ctx, js.S.DB(), bindingID, now.UTC().Format(time.RFC3339Nano))
+	return consumeCloseAuthorizationTx(ctx, js.S.DB(), bindingID, store.FormatTime(now))
 }
 
 func consumeCloseAuthorizationTx(ctx context.Context, q dbtx, bindingID, now string) error {

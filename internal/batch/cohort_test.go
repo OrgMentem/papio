@@ -208,15 +208,15 @@ func seedCohortJob(t *testing.T, s *store.Store, jobID, state, leaseOwner string
 	t.Helper()
 	ctx := context.Background()
 	requestID := "wr-" + jobID
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO work_requests (id,created_at,requester,desired_version) VALUES (?,?,'cli','any')`, requestID, timestamp(now)); err != nil {
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO work_requests (id,created_at,requester,desired_version) VALUES (?,?,'cli','any')`, requestID, store.FormatTime(now)); err != nil {
 		t.Fatal(err)
 	}
 	var expires any
 	if !leaseExpires.IsZero() {
-		expires = timestamp(leaseExpires)
+		expires = store.FormatTime(leaseExpires)
 	}
 	if _, err := s.DB().ExecContext(ctx, `INSERT INTO jobs (id,work_request_id,state,policy_json,lease_owner,lease_expires_at,created_at,updated_at) VALUES (?,?,?,'{}',?,?,?,?)`,
-		jobID, requestID, state, leaseOwner, expires, timestamp(now), timestamp(now)); err != nil {
+		jobID, requestID, state, leaseOwner, expires, store.FormatTime(now), store.FormatTime(now)); err != nil {
 		t.Fatal(err)
 	}
 }

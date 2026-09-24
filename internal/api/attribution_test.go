@@ -12,6 +12,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/delivery"
 	"papio/internal/job"
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -475,7 +476,7 @@ func TestJobsGetV3CarriesDeliverySectionWhenPresent(t *testing.T) {
 	}
 	want := DeliverySummary{
 		Provider: "illiad", Reference: "ILLIAD-REF-1", State: string(delivery.StateSubmitted),
-		NextCheckAt: nextCheck.Format(time.RFC3339Nano), GateClass: string(delivery.GateClassAutoCapable),
+		NextCheckAt: store.FormatTime(nextCheck), GateClass: string(delivery.GateClassAutoCapable),
 	}
 	if summary.Provider != want.Provider || summary.Reference != want.Reference || summary.State != want.State ||
 		summary.NextCheckAt != want.NextCheckAt || summary.GateClass != want.GateClass || len(summary.GateBlockers) != 0 {

@@ -32,13 +32,18 @@ func producerStats(ctx context.Context, raw json.RawMessage, system *bootstrap.S
 	if err != nil {
 		return badParams(errors.New("since must be an RFC3339 instant"))
 	}
-	until := time.Now()
+	// An omitted until leaves the period open at its end (a zero time), so a
+	// promotion recorded just before this call counts even when the clock
+	// gives it the same reading as now.
+	var until time.Time
+	end := time.Now()
 	if params.Until != "" {
 		if until, err = time.Parse(time.RFC3339Nano, params.Until); err != nil {
 			return badParams(errors.New("until must be an RFC3339 instant"))
 		}
+		end = until
 	}
-	if !until.After(since) {
+	if !end.After(since) {
 		return badParams(errors.New("until must be after since"))
 	}
 	if system == nil || system.Jobs == nil {

@@ -608,7 +608,7 @@ func uncollectedAcquisitions(ctx context.Context, db *store.Store) (int, time.Du
 		WHERE j.state = 'ready'
 		  AND j.updated_at < ?
 		  AND NOT EXISTS (SELECT 1 FROM exports e WHERE e.job_id = j.id)`,
-		time.Now().UTC().Add(-uncollectedGracePeriod).Format(time.RFC3339Nano))
+		store.FormatTime(time.Now().Add(-uncollectedGracePeriod)))
 	var n int
 	var oldest string
 	if err := row.Scan(&n, &oldest); err != nil {
@@ -781,7 +781,7 @@ type zoteroFileStorageRefusedSummary struct {
 // The join is a LEFT JOIN so a row with no job id still counts: an unattributed
 // refusal is exactly the kind this check exists to surface.
 func recentZoteroFileStorageRefusedApplies(ctx context.Context, db *store.Store) (*zoteroFileStorageRefusedSummary, error) {
-	cutoff := time.Now().UTC().Add(-zoteroFileStorageRefusedRecency).Format(time.RFC3339Nano)
+	cutoff := store.FormatTime(time.Now().Add(-zoteroFileStorageRefusedRecency))
 	rows, err := db.DB().QueryContext(ctx, `
 		SELECT e.created_at, e.result_json
 		FROM exports e
@@ -950,7 +950,7 @@ func quiescedActions(ctx context.Context, db *store.Store) (int, time.Duration, 
 		SELECT COUNT(*), COALESCE(MIN(created_at), '')
 		FROM human_actions
 		WHERE status = 'open' AND created_at < ?`,
-		time.Now().UTC().Add(-job.QuiesceAfter).Format(time.RFC3339Nano))
+		store.FormatTime(time.Now().Add(-job.QuiesceAfter)))
 	var n int
 	var oldest string
 	if err := row.Scan(&n, &oldest); err != nil {

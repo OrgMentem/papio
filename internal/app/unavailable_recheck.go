@@ -10,6 +10,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/store"
 )
 
 // unavailableRecheckScanLimit bounds one maintenance pass to two submissions.
@@ -59,7 +60,7 @@ func (r *UnavailableRecheck) runDue(ctx context.Context) error {
 	if r.svc.Now != nil {
 		now = r.svc.Now
 	}
-	cutoff := now().UTC().Add(-time.Duration(days) * 24 * time.Hour).Format(time.RFC3339Nano)
+	cutoff := store.FormatTime(now().Add(-time.Duration(days) * 24 * time.Hour))
 	ids, cursor, err := r.selectDue(ctx, cutoff, r.cursor)
 	if err != nil {
 		return err

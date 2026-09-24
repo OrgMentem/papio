@@ -378,3 +378,65 @@ func TestProducerStatsCountsReadyWithoutARecord(t *testing.T) {
 		t.Fatalf("stats = %+v, want the unrecorded promotion counted apart", stats)
 	}
 }
+
+// A period that begins or ends inside a second must split that second by
+// instant. Every row here is written in the store's own text form; under
+// time.RFC3339Nano, which trims trailing fraction zeros, "…:05Z" sorted after
+// the later since "…:05.1Z", and "…:06.59561Z" after the later until
+// "…:06.595612Z", so the event before the period was counted and the two
+// inside it were not.
+func TestProducerStatsSplitsASecondByInstant(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	second := time.Date(2026, 9, 24, 6, 19, 5, 0, time.UTC)
+	since, until := second.Add(100*time.Millisecond), second.Add(time.Second+595612*time.Microsecond)
+	for _, event := range []struct {
+		at               time.Time
+		jobID, kind, raw string
+	}{
+		{second, "job-before", ArtifactProducerEvent, `{"producer":"manual"}`},
+		{second.Add(time.Second + 595610*time.Microsecond), "job-inside", ArtifactProducerEvent, `{"producer":"adapter"}`},
+		{second.Add(time.Second + 595600*time.Microsecond), "job-unrecorded", "job.transition", `{"to":"ready"}`},
+		{until, "job-at-end", ArtifactProducerEvent, `{"producer":"agent"}`},
+	} {
+		if _, err := js.S.DB().ExecContext(ctx,
+			`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)`,
+			event.jobID, store.FormatTime(event.at), event.kind, event.raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := js.ProducerStats(ctx, since, until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Acquired != 1 || stats.Producers[ProducerAdapter] != 1 || stats.Unrecorded != 1 {
+		t.Fatalf("stats = %+v, want only the adapter event and the unrecorded promotion inside [since, until)", stats)
+	}
+}
+
+// Without an end the period takes every event already recorded, whatever the
+// clock read when it was recorded: on Windows the wall clock advances about
+// once a millisecond, so a promotion recorded just before the query can carry
+// the query's own reading, and a bound at "now" dropped it.
+func TestProducerStatsWithoutAnEndCountsEveryRecordedEvent(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	since := time.Now().Add(-time.Minute)
+	for _, at := range []time.Time{since, time.Now(), time.Now().Add(time.Hour)} {
+		if _, err := js.S.DB().ExecContext(ctx,
+			`INSERT INTO events (job_id, at, kind, detail_json) VALUES ('job-open-end', ?, ?, '{"producer":"adapter"}')`,
+			store.FormatTime(at), ArtifactProducerEvent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := js.ProducerStats(ctx, since, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Acquired != 3 {
+		t.Fatalf("stats = %+v, want all 3 recorded events counted", stats)
+	}
+	if _, err := js.ProducerStats(ctx, time.Now().Add(time.Hour), time.Time{}); err == nil {
+		t.Fatal("ProducerStats accepted an open period that starts in the future")
+	}
+}

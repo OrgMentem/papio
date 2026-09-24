@@ -24,6 +24,7 @@ import (
 	"papio/internal/protocol"
 	"papio/internal/redact"
 	"papio/internal/resolver"
+	"papio/internal/store"
 )
 
 // Exporter materializes bundles from the durable job/artifact stores.
@@ -535,6 +536,6 @@ func (e *Exporter) record(ctx context.Context, jobID, sha, path string) error {
 		INSERT INTO exports(job_id, kind, idempotency_key, path, result_json, created_at)
 		VALUES(?, 'bundle', ?, ?, ?, ?)
 		ON CONFLICT(idempotency_key) DO UPDATE SET path = excluded.path, result_json = excluded.result_json`,
-		jobID, key, path, string(result), time.Now().UTC().Format(time.RFC3339Nano))
+		jobID, key, path, string(result), store.Now())
 	return err
 }

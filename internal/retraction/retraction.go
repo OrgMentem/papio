@@ -402,7 +402,7 @@ func (s *Sentinel) AcknowledgeRetraction(ctx context.Context, itemID string) (bo
 	result, err := s.store.DB().ExecContext(ctx, `
 		INSERT OR IGNORE INTO retraction_acks (doi, nature, notice_doi, acked_at)
 		VALUES (?, ?, ?, ?)`,
-		target.DOI, string(target.Nature), target.NoticeDOI, s.now().UTC().Format(time.RFC3339Nano))
+		target.DOI, string(target.Nature), target.NoticeDOI, store.FormatTime(s.now()))
 	if err != nil {
 		return false, fmt.Errorf("retraction: acknowledge notice: %w", err)
 	}

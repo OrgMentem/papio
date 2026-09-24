@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"papio/internal/protocol"
+	"papio/internal/store"
 )
 
 func TestRecordDigestMigratesTitleKeyToDOI(t *testing.T) {
@@ -47,7 +48,7 @@ func TestRecordDigestMigratesIdentifierAliases(t *testing.T) {
 
 	t.Run("arXiv to DOI", func(t *testing.T) {
 		created := createWatch(t, watches, testWatchInput("arxiv digest migration"))
-		firstSeen := now.Format(time.RFC3339Nano)
+		firstSeen := store.FormatTime(now)
 		if reported, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{{
 			WorkKey: "arxiv:2601.12345v2", Title: "ArXiv Work",
 			Identifiers: &protocol.Identifiers{ArXiv: "2601.12345v2"},
@@ -321,7 +322,7 @@ func TestRecordDigestBridgesStableAliasesInEitherOrder(t *testing.T) {
 			if err := json.Unmarshal([]byte(identifiersJSON), &identifiers); err != nil {
 				t.Fatal(err)
 			}
-			if count != 1 || workKey != doi || firstSeenAt != now.Format(time.RFC3339Nano) || !consumed ||
+			if count != 1 || workKey != doi || firstSeenAt != store.FormatTime(now) || !consumed ||
 				authors != "Ada" || identifiers.DOI != doi || identifiers.ArXiv != arXiv {
 				t.Fatalf("bridged row = key %q, first seen %q, authors %q, ids %+v, consumed %t, count %d",
 					workKey, firstSeenAt, authors, identifiers, consumed, count)

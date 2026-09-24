@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/job"
+	"papio/internal/store"
 )
 
 // Exception tags are the only Zotero-visible state papio maintains: durable,
@@ -321,7 +322,7 @@ func (s *Service) upsertTagState(ctx context.Context, key, tag, status string) e
 	_, err := s.Store.DB().ExecContext(ctx, `
 		INSERT INTO zotio_tag_state(item_key, tag, status, updated_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT(item_key) DO UPDATE SET tag = excluded.tag, status = excluded.status, updated_at = excluded.updated_at`,
-		key, tag, status, s.now().UTC().Format(time.RFC3339Nano))
+		key, tag, status, store.FormatTime(s.now()))
 	if err != nil {
 		return fmt.Errorf("recording tag ledger: %w", err)
 	}

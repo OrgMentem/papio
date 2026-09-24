@@ -5924,7 +5924,7 @@ func (b *Bridge) recordPageBulkScan(ctx context.Context, request *protocol.PageB
 			ownershipIncomplete++
 		}
 	}
-	ts := at.Format(time.RFC3339Nano)
+	ts := store.FormatTime(at)
 	_, err := b.jobs.S.DB().ExecContext(ctx, `
 		INSERT INTO page_bulk_runs
 			(detector_id, source_origin, detected_raw, canonical_unique, eligible, owned_with_pdf, owned_missing_pdf, queued, ownership_incomplete, invalid, batch_id, opened_at, rendered_record_count_hint)
@@ -6399,7 +6399,7 @@ func pageBulkWorkRequest(canonicalKey string) (protocol.WorkRequest, bool) {
 // pageBulkSubmit's doc comments), so this row honestly reports only what the
 // submit call itself observed.
 func (b *Bridge) recordPageBulkRun(ctx context.Context, source protocol.PageBulkSubmitSource, selected int, submitted, invalid int64, batchID string, at time.Time) error {
-	ts := at.Format(time.RFC3339Nano)
+	ts := store.FormatTime(at)
 	_, err := b.jobs.S.DB().ExecContext(ctx, `
 		INSERT INTO page_bulk_runs (detector_id, source_origin, selected, submitted, invalid, batch_id, opened_at, submitted_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -7384,7 +7384,7 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 	}
 	received := b.now().UTC()
 	if strings.TrimSpace(producerObservedAt) == "" {
-		producerObservedAt = received.Format(time.RFC3339Nano)
+		producerObservedAt = store.FormatTime(received)
 	}
 	idParts := []string{
 		profile.ID, strconv.FormatInt(observedRevision, 10),
@@ -7401,8 +7401,8 @@ func (b *Bridge) recordProfileEvidence(ctx context.Context, observationID, resol
 		ObservationID: observationID, BrowserHolderGeneration: b.arbitration.generation(),
 		InstitutionProfileID: profile.ID, InstitutionProfileRevision: observedRevision,
 		Verdict: verdict, Source: source, ProducerObservedAt: producerObservedAt,
-		DaemonReceivedAt: received.Format(time.RFC3339Nano),
-		ExpiresAt:        received.Add(profileEvidenceTTL).Format(time.RFC3339Nano),
+		DaemonReceivedAt: store.FormatTime(received),
+		ExpiresAt:        store.FormatTime(received.Add(profileEvidenceTTL)),
 	})
 	if errors.Is(recordErr, job.ErrProfileEvidenceStale) {
 		// The observation describes a superseded profile identity. Discarding
@@ -7723,7 +7723,7 @@ func (b *Bridge) upsertProfileGate(ctx context.Context, observationKey, resolver
 		// owner; dependent siblings are derived by the gate authority.
 		ClaimMemberJobIDs:   []string{jobID},
 		ObservationRevision: revision, Status: status, DetailJSON: detail,
-		CreatedAt: b.now().UTC().Format(time.RFC3339Nano), UpdatedAt: b.now().UTC().Format(time.RFC3339Nano),
+		CreatedAt: store.FormatTime(b.now()), UpdatedAt: store.FormatTime(b.now()),
 	})
 }
 
@@ -7801,7 +7801,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 		// and auth_pending arrives with an empty payload and can toggle several
 		// times per tab, so keying it per frame grows the table with browsing
 		// activity instead of with distinct facts.
-		accepted, _, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		accepted, _, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_returned", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceAuthReturned, job.ProfileEvidenceAuthReturn, store.FormatTime(b.now()))
 		if err != nil {
 			return err
 		}
@@ -7833,7 +7833,7 @@ func (b *Bridge) recordAuth(ctx context.Context, msg *protocol.BrowserMessage) e
 			return err
 		}
 	} else {
-		accepted, _, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, b.now().UTC().Format(time.RFC3339Nano))
+		accepted, _, err := b.recordProfileEvidence(ctx, evidenceObservationID("auth_pending", msg.JobID, elapsed), resolverName, msg.JobID, job.ProfileEvidenceUnknown, job.ProfileEvidenceAuthReturn, store.FormatTime(b.now()))
 		if err != nil {
 			return err
 		}
@@ -8314,7 +8314,7 @@ func (b *Bridge) outcome(ctx context.Context, jobID, msgID string, p *protocol.P
 	evidenceAccepted, storedEvidenceID, err := b.recordProfileEvidence(ctx,
 		outcomeObservationKey,
 		rowForEvidence.Policy.Resolver, jobID, verdict, job.ProfileEvidenceProviderOutcome,
-		b.now().UTC().Format(time.RFC3339Nano))
+		store.FormatTime(b.now()))
 	if err != nil {
 		return err
 	}

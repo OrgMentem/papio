@@ -7,6 +7,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"papio/internal/store"
 )
 
 func seedGateOccurrence(t *testing.T, js *Store, id string) {
@@ -403,9 +405,9 @@ func TestAuthenticationEntryUnboundReservationYieldsAtTheBindDeadline(t *testing
 	if err != nil {
 		t.Fatalf("renewing a bound entry: %v", err)
 	}
-	if bound.LeaseUntil != full.Format(time.RFC3339Nano) {
+	if bound.LeaseUntil != store.FormatTime(full) {
 		t.Fatalf("bound renewal holds until %s, want the caller's full window %s",
-			bound.LeaseUntil, full.Format(time.RFC3339Nano))
+			bound.LeaseUntil, store.FormatTime(full))
 	}
 }
 
