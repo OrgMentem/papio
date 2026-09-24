@@ -603,6 +603,11 @@ func TestSameSizeSameMtimeReplacementAndRewriteRefresh(t *testing.T) {
 // must leave the prior snapshot stale rather than publishing unlinked bytes as
 // current evidence.
 func TestUnknownIdentityRejectsInFlightSameRevisionReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Go opens files without FILE_SHARE_DELETE, so Windows refuses the
+		// rename below with "Access is denied" while Lookup holds the file.
+		t.Skip("Windows cannot rename over a file another handle holds open")
+	}
 	dir := t.TempDir()
 	one := oneEntryBibTeX("10.1000/one")
 	two := oneEntryBibTeX("10.1000/two")

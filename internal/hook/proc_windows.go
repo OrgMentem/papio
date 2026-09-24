@@ -3,6 +3,7 @@
 package hook
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -12,6 +13,18 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+// shellCommand runs command through cmd.exe exactly as the user wrote it.
+// os/exec quotes each argument for CommandLineToArgvW, which cmd.exe does not
+// parse, so a quoted path such as "C:\Program Files\x\y.exe" reached cmd as
+// \"...\" and the hook failed. The command line is therefore written whole:
+// /s makes cmd strip only the outer quote pair and run the rest verbatim, and
+// /d skips any AutoRun command in the registry, as a hook runs one command.
+func shellCommand(ctx context.Context, command string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "cmd")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: `cmd /d /s /c "` + command + `"`}
+	return cmd
+}
 
 // procGuard confines one hook run to a Windows Job Object so the deadline
 // kills the whole process tree, not just the cmd.exe shell.
@@ -38,7 +51,11 @@ type procGuard struct {
 // A job assignment only covers descendants created after it, so cmd.exe must
 // not run a single instruction before it is inside the job.
 func newProcGuard(cmd *exec.Cmd) *procGuard {
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_SUSPENDED}
+	// Keep the command line shellCommand wrote; only add the suspension.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
 	guard := &procGuard{}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
@@ -80,7 +97,7 @@ func (g *procGuard) confine(cmd *exec.Cmd) error {
 	}
 	// The shell is suspended and its handle is held by os/exec, so the pid
 	// cannot have been reused between Start and this OpenProcess.
-	pid := uint32(cmd.Process.Pid)
+	pid := uint32(cmd.Process.Pid) //nolint:gosec // G115: a Windows pid is the DWORD CreateProcess returned, so it fits in uint32.
 	proc, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, pid)
 	if err != nil {
 		return fmt.Errorf("open hook shell: %w", err)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -415,7 +416,8 @@ func TestCompositeReviewRoundTripAndStrictness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	// POSIX mode contract; Windows reports no group or other bits to check.
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Errorf("review file mode %v; it holds the operator's own library titles", perm)
 	}
 	loaded, err := LoadCompositeReview(path)

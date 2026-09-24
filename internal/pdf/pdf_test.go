@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -470,6 +471,9 @@ func writeTempPDF(t *testing.T) string {
 
 func fakeTool(t *testing.T, body string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tools are POSIX shell scripts, which Windows cannot execute")
+	}
 	p := filepath.Join(t.TempDir(), "tool")
 	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -483,6 +487,9 @@ func fakeTool(t *testing.T, body string) string {
 // who started the daemon — from a shell it worked, from the browser every PDF
 // failed semantic extraction and was staged for human review.
 func TestCapabilityDetectionSurvivesAGUIStrippedPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("toolSearchPath lists Unix package-manager prefixes; Windows finds tools through PATH and PATHEXT only")
+	}
 	tool := filepath.Join(t.TempDir(), "pdftotext")
 	if err := os.WriteFile(tool, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -505,7 +512,11 @@ func TestCapabilityDetectionSurvivesAGUIStrippedPath(t *testing.T) {
 
 func TestCapabilityDetectionPrefersPATH(t *testing.T) {
 	dir := t.TempDir()
-	onPath := filepath.Join(dir, "pdftotext")
+	name := "pdftotext"
+	if runtime.GOOS == "windows" {
+		name += ".exe" // exec.LookPath matches only PATHEXT names on Windows
+	}
+	onPath := filepath.Join(dir, name)
 	if err := os.WriteFile(onPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}

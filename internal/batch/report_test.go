@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +48,9 @@ func TestManifestWriteAndLoadPreservesBatchShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// POSIX mode contract; Windows reports no group or other bits, and the data
+	// directory's ACL is what keeps the manifest private there.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("manifest mode = %v, want 0600", info.Mode().Perm())
 	}
 	raw, err := os.ReadFile(filepath.Join(dataDir, "batches", manifest.ID+".json"))
@@ -104,6 +107,9 @@ func TestWriteFailsEncodingBatchManifest(t *testing.T) {
 func TestWriteFailsOnUnwritableManifestDestination(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory permission bits")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows directory's mode bits do not stop file creation inside it")
 	}
 	requests := []protocol.WorkRequest{
 		{SchemaVersion: protocol.WorkRequestSchemaVersion, Identifiers: &protocol.Identifiers{DOI: "10.1000/one"}},

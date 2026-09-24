@@ -91,7 +91,8 @@ func TestDownloadStreamsPDFToExclusiveQuarantinePath(t *testing.T) {
 	if err != nil || string(got) != payload {
 		t.Fatalf("quarantine contents = %q, %v", got, err)
 	}
-	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+	// POSIX mode contract; Windows reports no group or other bits to check.
+	if info, err := os.Stat(path); err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o600) {
 		t.Fatalf("quarantine mode = %v, %v", info.Mode(), err)
 	}
 }

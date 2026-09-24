@@ -312,7 +312,11 @@ func TestStoreHandlerFailuresListV1RejectsBadParams(t *testing.T) {
 
 func TestStoreHandlerFailuresListV1WithoutStoreFailsPrecondition(t *testing.T) {
 	system := testSystem(t)
+	// Hand the store back before testSystem's cleanup: System.Close skips a nil
+	// Store, and Windows cannot remove a TempDir that holds an open database.
+	detached := system.Store
 	system.Store = nil
+	t.Cleanup(func() { system.Store = detached })
 	rpcErr := callMethod(t, Router(system), "failures.list_v1", map[string]any{}, nil)
 	if rpcErr == nil || rpcErr.Code != "precondition_failed" {
 		t.Fatalf("failures.list_v1 without a store = %+v, want precondition_failed", rpcErr)
@@ -373,7 +377,11 @@ func TestStoreHandlerPageBulkStatsRejectsBadParams(t *testing.T) {
 
 func TestStoreHandlerPageBulkStatsWithoutStoreFailsPrecondition(t *testing.T) {
 	system := testSystem(t)
+	// Hand the store back before testSystem's cleanup: System.Close skips a nil
+	// Store, and Windows cannot remove a TempDir that holds an open database.
+	detached := system.Store
 	system.Store = nil
+	t.Cleanup(func() { system.Store = detached })
 	rpcErr := callMethod(t, Router(system), "stats.page_bulk", map[string]any{}, nil)
 	if rpcErr == nil || rpcErr.Code != "precondition_failed" {
 		t.Fatalf("stats.page_bulk without a store = %+v, want precondition_failed", rpcErr)

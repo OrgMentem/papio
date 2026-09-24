@@ -3,9 +3,15 @@
 package hook
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
 )
+
+// shellCommand runs command through sh -c.
+func shellCommand(ctx context.Context, command string) *exec.Cmd {
+	return exec.CommandContext(ctx, "/bin/sh", "-c", command)
+}
 
 // procGuard confines one hook run so the deadline can address the whole hook
 // process tree. On Unix the confinement is a POSIX process group, which the

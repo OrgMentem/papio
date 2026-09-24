@@ -37,6 +37,11 @@ function offlineIO(body: unknown = response()) {
   return { io, calls: () => calls, keys: () => keys };
 }
 
+// runTrial refuses a run directory unless POSIX mode bits and uid prove it is
+// private. Windows reports neither (process.getuid is undefined), so the tool
+// refuses every run directory there and these runs cannot start.
+const posixRun = test.skipIf(process.platform === "win32");
+
 test("request allowlists state and choices, removes URL secrets and binds all snapshot provenance locally", () => {
   const input = { ...snapshot(), cookies: "cookie-secret" };
   Object.assign(input.controls[0]!, { value: "password-secret", selector: "#secret", href: "https://example.test/?token=hidden" });
@@ -98,7 +103,7 @@ test("validator rejects invented or disabled actions and malformed distributions
   }
 });
 
-test("run writes private hash receipts and exact usage, enforces persistent call and byte budgets before key access", async () => {
+posixRun("run writes private hash receipts and exact usage, enforces persistent call and byte budgets before key access", async () => {
   const options = fixture(), mock = offlineIO();
   const result = await runTrial({ ...options, maxCalls: 1 }, mock.io);
   expect(result.responseHash).toBe(sha256(JSON.stringify(response())));
@@ -116,7 +121,7 @@ test("run writes private hash receipts and exact usage, enforces persistent call
   expect(receipt.counters).toEqual({ calls: 1, inputBytes: buildRequest(snapshot()).inputBytes });
 });
 
-test("failed HTTP/validation/network attempts remain counted and never retry or expose response/error secrets", async () => {
+posixRun("failed HTTP/validation/network attempts remain counted and never retry or expose response/error secrets", async () => {
   for (const fetch of [async () => new Response("remote-secret", { status: 401 }), async () => Response.json({ secret: "remote-secret" }),
     async () => { throw new Error("network-secret"); }]) {
     const options = fixture(); let calls = 0;
@@ -128,7 +133,7 @@ test("failed HTTP/validation/network attempts remain counted and never retry or 
   }
 });
 
-test("missing credential fails without a request; unsafe directories and symlink snapshots fail before key access", async () => {
+posixRun("missing credential fails without a request; unsafe directories and symlink snapshots fail before key access", async () => {
   const options = fixture(), mock = offlineIO();
   await expect(runTrial(options, { ...mock.io, key: () => "" })).rejects.toThrow("credential unavailable");
   await expect(runTrial(options, { ...mock.io, key: () => { throw new Error("keychain-secret"); } })).rejects.toThrow("Keychain credential unavailable");
@@ -141,7 +146,7 @@ test("missing credential fails without a request; unsafe directories and symlink
   expect(mock.keys()).toBe(0);
 });
 
-test("concurrent run cannot bill or overwrite an in-flight receipt", async () => {
+posixRun("concurrent run cannot bill or overwrite an in-flight receipt", async () => {
   const options = fixture(), mock = offlineIO();
   let release!: (value: Response) => void;
   const pending = runTrial(options, { key: () => "test-key-only", fetch: () => new Promise(resolve => { release = resolve; }) });
@@ -152,7 +157,7 @@ test("concurrent run cannot bill or overwrite an in-flight receipt", async () =>
   release(Response.json(response())); await pending;
 });
 
-test("oversized responses fail once and consume the attempt budget", async () => {
+posixRun("oversized responses fail once and consume the attempt budget", async () => {
   const options = fixture(); let calls = 0;
   const io: TrialIO = { key: () => "test-key-only", fetch: async () => { calls++; return new Response("x".repeat(LIMITS.fileBytes + 1)); } };
   await expect(runTrial({ ...options, maxCalls: 1 }, io)).rejects.toThrow("attempt recorded");
@@ -160,7 +165,7 @@ test("oversized responses fail once and consume the attempt budget", async () =>
   expect(calls).toBe(1);
 });
 
-test("validation failures retain bounded private body evidence with key redacted and safe reason only", async () => {
+posixRun("validation failures retain bounded private body evidence with key redacted and safe reason only", async () => {
   const options = fixture(), value = { ...response(), debug: "echo test-key-only twice test-key-only" };
   value.answers.action.probabilities.pdf = 0.79;
   const raw = JSON.stringify(value);
