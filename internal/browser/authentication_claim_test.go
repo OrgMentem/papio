@@ -1019,6 +1019,133 @@ func TestClaimObservationNavigationErrorParksWithoutMutatingLease(t *testing.T) 
 	}
 }
 
+// TestClaimObservationNewSurfaceAfterHolderSwitchAppliesOnALongLivedOccurrence
+// replays 2026-09-24. One login occurrence stays open while papio works through
+// several papers: an earlier surface journals an ordered observation, and its
+// loss journals an owner_closed whose ordinal the daemon assigns. Then the
+// operator moves the bridge to another browser (`papio browser use`), a new
+// paper claims the institution, and that browser opens a new surface. Its
+// extension counts that surface's observations from 0, because it cannot know
+// what other surfaces reported. The ordering fence compared them with the
+// highest ordinal of the whole occurrence, so every observation on the new
+// surface was acked `stale` with no detail. The auth_returned that promotes
+// the entry and the entitled_landing that resumes siblings never applied.
+// Live, occurrence 180cae2d… had reached ordinal 10 through ten owner_closed
+// reports before job_cb931061ba's surface opened.
+func TestClaimObservationNewSurfaceAfterHolderSwitchAppliesOnALongLivedOccurrence(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	const claimID = "auth-observation-long-lived"
+	earlier := parkInstitutional(t, jobs, "wr_long_lived_earlier", handoffWork(), "")
+	later := parkInstitutional(t, jobs, "wr_long_lived_later", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, claimID)
+
+	earlierCandidate := explicitMaterializationCandidate(t, jobs, earlier, "domain-long-lived-earlier")
+	earlierGrant := authClaimResponse(t, mustSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, earlier,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "long-lived-earlier-req", CandidateID: earlierCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		})))
+	earlierBinding := bindCandidate(t, b, earlier, earlierCandidate, "long-lived-earlier", 21)
+	for i, kind := range []string{"wall_observed", "login_started"} {
+		ack := claimObservationAckPayload(t, mustSync(t, b, claimObservationFrame(t, earlier,
+			fmt.Sprintf("long-lived-earlier-obs-%d", i), claimID, earlierBinding, earlierGrant.GateOccurrenceID,
+			fmt.Sprintf("observation-long-lived-earlier-%d", i), b.arbitration.generation(), int64(i), kind)))
+		if ack.Outcome != "applied" {
+			t.Fatalf("earlier surface %s = %+v, want applied", kind, ack)
+		}
+	}
+	if ack := claimObservationAckPayload(t, mustSync(t, b, claimObservationFrame(t, earlier,
+		"long-lived-earlier-closed", claimID, earlierBinding, earlierGrant.GateOccurrenceID,
+		"observation-long-lived-earlier-closed", b.arbitration.generation(), 0, "owner_closed"))); ack.Outcome != "applied" {
+		t.Fatalf("earlier surface owner_closed = %+v, want applied", ack)
+	}
+
+	// The operator moves the bridge to the other browser.
+	const firefox = "session-firefox-after-use"
+	runSyncAs(t, b, firefox, authClaimHello(t))
+	before := b.arbitration.generation()
+	if _, err := b.Claim(firefox); err != nil {
+		t.Fatalf("papio browser use: %v", err)
+	}
+	if b.arbitration.generation() == before {
+		t.Fatalf("holder switch did not advance the generation (still %d)", before)
+	}
+	runSyncAs(t, b, firefox)
+
+	laterCandidate := explicitMaterializationCandidate(t, jobs, later, "domain-long-lived-later")
+	laterGrant := authClaimResponse(t, mustSyncAs(t, b, firefox, inFrame(t, protocol.MsgAuthenticationClaimRequest, later,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "long-lived-later-req", CandidateID: laterCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		})))
+	if laterGrant.Outcome != "open_new" || laterGrant.GateOccurrenceID != earlierGrant.GateOccurrenceID {
+		t.Fatalf("later grant = %+v, want open_new on the still-open occurrence %s", laterGrant, earlierGrant.GateOccurrenceID)
+	}
+	laterBinding := bindCandidateAs(t, b, firefox, later, laterCandidate, "long-lived-later", 9105)
+	generation := b.arbitration.generation()
+
+	returned := claimObservationAckPayload(t, mustSyncAs(t, b, firefox, claimObservationFrame(t, later,
+		"long-lived-later-returned", claimID, laterBinding, laterGrant.GateOccurrenceID,
+		"observation-long-lived-later-returned", generation, 0, "auth_returned")))
+	if returned.Outcome != "applied" {
+		t.Fatalf("auth_returned on the new surface = %+v, want applied", returned)
+	}
+	lease, found, err := jobs.GetAuthenticationEntryLease(ctx, claimID)
+	if err != nil || !found || lease.State != job.AuthenticationEntryLeaseHuman || lease.HumanOwnerID != later {
+		t.Fatalf("lease after auth_returned = %+v found=%v err=%v, want human owned by %s", lease, found, err, later)
+	}
+	landed := claimObservationAckPayload(t, mustSyncAs(t, b, firefox, claimObservationFrame(t, later,
+		"long-lived-later-landed", claimID, laterBinding, laterGrant.GateOccurrenceID,
+		"observation-long-lived-later-landed", generation, 1, "entitled_landing")))
+	if landed.Outcome != "applied" {
+		t.Fatalf("entitled_landing on the new surface = %+v, want applied", landed)
+	}
+
+	// The fence still holds within the surface's own stream: a new report
+	// that claims a position this surface already passed is stale.
+	late := claimObservationAckPayload(t, mustSyncAs(t, b, firefox, claimObservationFrame(t, later,
+		"long-lived-later-late", claimID, laterBinding, laterGrant.GateOccurrenceID,
+		"observation-long-lived-later-late", generation, 1, "wall_observed")))
+	if late.Outcome != "stale" {
+		t.Fatalf("superseded ordinal on the new surface = %+v, want stale", late)
+	}
+}
+
+func mustSyncAs(t *testing.T, b *Bridge, sessionID string, frames ...json.RawMessage) []*protocol.BrowserMessage {
+	t.Helper()
+	msgs, _ := runSyncAs(t, b, sessionID, frames...)
+	return msgs
+}
+
+// bindCandidateAs is bindCandidate for a specific native-host session.
+func bindCandidateAs(t *testing.T, b *Bridge, sessionID, jobID, candidateID, requestPrefix string, tabID int64) string {
+	t.Helper()
+	claimed := mustSyncAs(t, b, sessionID, inFrame(t, protocol.MsgInstitutionalClaimRequest, jobID,
+		protocol.InstitutionalClaimRequestPayload{
+			RequestID: requestPrefix + "-claim", CandidateID: candidateID, MaterializationKind: "browser_tab",
+		}))
+	claimResp := firstOfType(claimed, protocol.MsgInstitutionalClaimResponse)
+	if claimResp == nil {
+		t.Fatalf("institutional_claim_response missing: %v", claimed)
+	}
+	claimPayload := claimResp.Payload.(*protocol.InstitutionalClaimResponsePayload)
+	if claimPayload.Outcome != "claimed" {
+		t.Fatalf("institutional claim outcome = %s, want claimed: %+v", claimPayload.Outcome, claimPayload)
+	}
+	bound := mustSyncAs(t, b, sessionID, inFrame(t, protocol.MsgInstitutionalBindRequest, jobID,
+		protocol.InstitutionalBindRequestPayload{
+			RequestID: requestPrefix + "-bind", ClaimID: claimPayload.ClaimID,
+			BindingID: claimPayload.BindingID, TabID: tabID,
+		}))
+	bindResp := firstOfType(bound, protocol.MsgInstitutionalBindResponse)
+	if bindResp == nil || bindResp.Payload.(*protocol.InstitutionalBindResponsePayload).Outcome != "bound" {
+		t.Fatalf("institutional bind = %v, want bound", bound)
+	}
+	return claimPayload.BindingID
+}
+
 // The following tests pin Slice 4 (dev/adr/0028-surface-lifecycle-ownership.md):
 // automatic (non-focus) materialization candidate offers, claim-paced by
 // the authentication-entry lease this file already exercises. None of them

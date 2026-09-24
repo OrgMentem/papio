@@ -133,7 +133,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	}
 
 	if in.FrameGeneration != in.Generation {
-		return fail("stale", "")
+		return fail("stale", "browser holder generation is not current")
 	}
 
 	claim, err := materializationClaimByBindingIDTx(ctx, tx, in.BindingID)
@@ -158,7 +158,7 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	eventOrdinal := in.EventOrdinal
 	var journalOutcome string
 	if ordered {
-		journalOutcome, err = checkClaimObservationJournalTx(ctx, tx, in.ObservationID, result.GateOccurrenceID, in.EventOrdinal)
+		journalOutcome, err = checkClaimObservationJournalTx(ctx, tx, in.ObservationID, result.GateOccurrenceID, in.BindingID, in.EventOrdinal)
 	} else {
 		journalOutcome, err = checkClaimObservationReplayTx(ctx, tx, in.ObservationID)
 	}
@@ -167,10 +167,15 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	}
 	if journalOutcome != "" {
 		result.Outcome = journalOutcome
+		if journalOutcome == "stale" {
+			// Named, because an empty reason made this refusal
+			// indistinguishable from a stale holder generation in the log.
+			result.Detail = "event ordinal does not follow this surface's last applied observation"
+		}
 		return result, nil
 	}
 	if !ordered {
-		if eventOrdinal, err = nextClaimObservationOrdinalTx(ctx, tx, result.GateOccurrenceID); err != nil {
+		if eventOrdinal, err = nextClaimObservationOrdinalTx(ctx, tx, result.GateOccurrenceID, in.BindingID); err != nil {
 			return fail("error", "claim observation journal state is unavailable")
 		}
 	}

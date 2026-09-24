@@ -54,9 +54,20 @@ func (r ClaimObservationRecord) validate() error {
 // "rejected" for a supposedly-identical observation_id whose recorded
 // ordinal/occurrence disagrees with the replayed frame, and "stale" for a
 // new observation_id whose event_ordinal does not exceed the highest
-// applied ordinal for this gate_occurrence_id.
-func (js *Store) CheckClaimObservationJournal(ctx context.Context, observationID, gateOccurrenceID string, eventOrdinal int64) (string, error) {
-	return checkClaimObservationJournalTx(ctx, js.S.DB(), observationID, gateOccurrenceID, eventOrdinal)
+// ordinal already applied for the same surface (binding_id) under this
+// gate_occurrence_id.
+//
+// The order is per surface because the sequence is per surface. The
+// extension numbers one binding's observations from 0 and cannot know what
+// any other surface, or the daemon's own owner_closed assignment, has
+// journaled under the same occurrence. And one login occurrence stays open
+// across many papers. An occurrence-wide maximum therefore refused every
+// observation of each new surface until its count passed all earlier
+// surfaces together: measured live 2026-09-24, occurrence 180cae2d... at
+// ordinal 10 refused a new surface's auth_returned, so the sign-in never
+// promoted the entry. A late report on the SAME surface stays stale.
+func (js *Store) CheckClaimObservationJournal(ctx context.Context, observationID, gateOccurrenceID, bindingID string, eventOrdinal int64) (string, error) {
+	return checkClaimObservationJournalTx(ctx, js.S.DB(), observationID, gateOccurrenceID, bindingID, eventOrdinal)
 }
 
 // checkClaimObservationJournalTx is CheckClaimObservationJournal's core.
@@ -65,9 +76,9 @@ func (js *Store) CheckClaimObservationJournal(ctx context.Context, observationID
 // GetAuthenticationEntryLease performs a mutating expiry UPDATE for an
 // overdue reserved lease, and §3 requires a duplicate/stale/rejected
 // observation to be a true no-op that never touches lease state.
-func checkClaimObservationJournalTx(ctx context.Context, q dbtx, observationID, gateOccurrenceID string, eventOrdinal int64) (string, error) {
-	if strings.TrimSpace(observationID) == "" || strings.TrimSpace(gateOccurrenceID) == "" {
-		return "", errors.New("claim observation journal check requires observation and occurrence ids")
+func checkClaimObservationJournalTx(ctx context.Context, q dbtx, observationID, gateOccurrenceID, bindingID string, eventOrdinal int64) (string, error) {
+	if strings.TrimSpace(observationID) == "" || strings.TrimSpace(gateOccurrenceID) == "" || strings.TrimSpace(bindingID) == "" {
+		return "", errors.New("claim observation journal check requires observation, occurrence and binding ids")
 	}
 	var existingOrdinal int64
 	var existingOccurrence string
@@ -86,8 +97,8 @@ func checkClaimObservationJournalTx(ctx context.Context, q dbtx, observationID, 
 	}
 	var maxOrdinal sql.NullInt64
 	if err := q.QueryRowContext(ctx,
-		`SELECT MAX(event_ordinal) FROM claim_observation_journal WHERE gate_occurrence_id=?`,
-		gateOccurrenceID).Scan(&maxOrdinal); err != nil {
+		`SELECT MAX(event_ordinal) FROM claim_observation_journal WHERE gate_occurrence_id=? AND binding_id=?`,
+		gateOccurrenceID, bindingID).Scan(&maxOrdinal); err != nil {
 		return "", err
 	}
 	if maxOrdinal.Valid && eventOrdinal <= maxOrdinal.Int64 {
@@ -148,18 +159,21 @@ func checkClaimObservationReplayTx(ctx context.Context, q dbtx, observationID st
 }
 
 // nextClaimObservationOrdinalTx assigns an unordered observation its journal
-// position: after everything already applied under this gate occurrence. The
-// daemon assigns it because the daemon is the only party that knows it, and
-// because the schema's UNIQUE (gate_occurrence_id, event_ordinal) index would
-// otherwise reject a frame-supplied ordinal that a live cycle has already used.
-func nextClaimObservationOrdinalTx(ctx context.Context, q dbtx, gateOccurrenceID string) (int64, error) {
-	if strings.TrimSpace(gateOccurrenceID) == "" {
-		return 0, errors.New("claim observation ordinal assignment requires an occurrence id")
+// position: after everything already applied for the same surface under this
+// gate occurrence. The daemon assigns it because the daemon is the only party
+// that knows it, and because the schema's UNIQUE (gate_occurrence_id,
+// binding_id, event_ordinal) index would otherwise reject a frame-supplied
+// ordinal that the surface has already used. It is scoped to the surface for
+// the same reason the ordered fence is: an occurrence-wide position here
+// pushed every later surface's own sequence into `stale`.
+func nextClaimObservationOrdinalTx(ctx context.Context, q dbtx, gateOccurrenceID, bindingID string) (int64, error) {
+	if strings.TrimSpace(gateOccurrenceID) == "" || strings.TrimSpace(bindingID) == "" {
+		return 0, errors.New("claim observation ordinal assignment requires occurrence and binding ids")
 	}
 	var maxOrdinal sql.NullInt64
 	if err := q.QueryRowContext(ctx,
-		`SELECT MAX(event_ordinal) FROM claim_observation_journal WHERE gate_occurrence_id=?`,
-		gateOccurrenceID).Scan(&maxOrdinal); err != nil {
+		`SELECT MAX(event_ordinal) FROM claim_observation_journal WHERE gate_occurrence_id=? AND binding_id=?`,
+		gateOccurrenceID, bindingID).Scan(&maxOrdinal); err != nil {
 		return 0, err
 	}
 	if !maxOrdinal.Valid {
@@ -174,9 +188,9 @@ func nextClaimObservationOrdinalTx(ctx context.Context, q dbtx, gateOccurrenceID
 // succeeded — recording first would let a side-effect failure strand a
 // journal entry that a legitimate retry can then never re-apply (the retry
 // would see "duplicate" and skip it). The schema's unique
-// (gate_occurrence_id, event_ordinal) index is the second line of defense
-// against a concurrent double-apply this single-writer daemon should never
-// reach in practice.
+// (gate_occurrence_id, binding_id, event_ordinal) index is the second line of
+// defense against a concurrent double-apply this single-writer daemon should
+// never reach in practice.
 func (js *Store) RecordClaimObservation(ctx context.Context, in ClaimObservationRecord) error {
 	return recordClaimObservationTx(ctx, js.S.DB(), in)
 }

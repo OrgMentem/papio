@@ -389,12 +389,17 @@ refusal that never calls this RPC at all — no wire round trip needed to say
 
 ## 3. Ordering and idempotency
 
-- **Business order is `(gate_occurrence_id, event_ordinal)`, never native
-  receipt order.** `inboundChain`/`onInbound` (background.ts) is FIFO per
-  port generation only — a worker restart, a lost response, or a retried
-  frame can all reorder or duplicate delivery relative to when events
-  actually happened in the browser. The daemon reducer keys off the pair,
-  not arrival order.
+- **Business order is `(gate_occurrence_id, binding_id, event_ordinal)`,
+  never native receipt order.** `inboundChain`/`onInbound` (background.ts)
+  is FIFO per port generation only — a worker restart, a lost response, or
+  a retried frame can all reorder or duplicate delivery relative to when
+  events actually happened in the browser. The daemon reducer keys off the
+  triple, not arrival order. The binding is part of the key because the
+  sequence is per surface: the extension numbers one binding's observations
+  from 0 and cannot see other surfaces, and one login occurrence stays open
+  across many papers. An occurrence-wide order refused every observation of
+  each new surface (measured live 2026-09-24; migration 0055 moved the
+  unique index).
 - **Idempotency table**: new `claim_observation_journal` (§4.2),
   `observation_id` as primary key. A `claim_observation` whose
   `observation_id` already has a row is **not reapplied** — the daemon reads
@@ -404,8 +409,9 @@ refusal that never calls this RPC at all — no wire round trip needed to say
   evidence, or scheduler state a second time.
 - **Monotonic-apply**: within one transaction, before touching any lease/
   evidence/scheduler state, `SELECT MAX(event_ordinal) FROM
-  claim_observation_journal WHERE gate_occurrence_id = ?` (or `0` absent).
-  `event_ordinal <= current_max` on a **new** `observation_id` is `stale` —
+  claim_observation_journal WHERE gate_occurrence_id = ? AND binding_id = ?`
+  (or `0` absent). `event_ordinal <= current_max` on a **new**
+  `observation_id` is `stale` —
   a late, superseded event, rejected without mutation. This mirrors the
   existing exact-ordinal CAS pattern already used for
   `institutional_route_request.expected_effect_ordinal`

@@ -26,7 +26,7 @@ func TestClaimObservationJournalIdempotencyTrio(t *testing.T) {
 	seedGateOccurrence(t, js, "occurrence-2")
 
 	// Fresh: nothing recorded yet.
-	outcome, err := js.CheckClaimObservationJournal(ctx, "observation-fresh", "occurrence-1", 1)
+	outcome, err := js.CheckClaimObservationJournal(ctx, "observation-fresh", "occurrence-1", "binding-journal", 1)
 	if err != nil || outcome != "" {
 		t.Fatalf("fresh check = %q, %v; want empty outcome", outcome, err)
 	}
@@ -40,33 +40,54 @@ func TestClaimObservationJournalIdempotencyTrio(t *testing.T) {
 	}
 
 	// Duplicate: exact same observation_id, ordinal, and occurrence replayed.
-	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-fresh", "occurrence-1", 1)
+	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-fresh", "occurrence-1", "binding-journal", 1)
 	if err != nil || outcome != "duplicate" {
 		t.Fatalf("duplicate check = %q, %v; want duplicate", outcome, err)
 	}
 
 	// Rejected: same observation_id, but the replayed frame disagrees with
 	// what was actually recorded (mismatched ordinal).
-	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-fresh", "occurrence-1", 2)
+	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-fresh", "occurrence-1", "binding-journal", 2)
 	if err != nil || outcome != "rejected" {
 		t.Fatalf("mismatched replay check = %q, %v; want rejected", outcome, err)
 	}
 
 	// Stale: a genuinely new observation_id whose ordinal does not exceed
-	// the highest applied ordinal for this occurrence.
-	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-stale", "occurrence-1", 1)
+	// the highest applied ordinal for this surface under this occurrence.
+	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-stale", "occurrence-1", "binding-journal", 1)
 	if err != nil || outcome != "stale" {
 		t.Fatalf("stale check = %q, %v; want stale", outcome, err)
 	}
 
 	// A higher ordinal for the same occurrence is genuinely fresh.
-	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-next", "occurrence-1", 2)
+	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-next", "occurrence-1", "binding-journal", 2)
 	if err != nil || outcome != "" {
 		t.Fatalf("next ordinal check = %q, %v; want empty outcome", outcome, err)
 	}
 
+	// Another surface under the same occurrence keeps its own sequence: the
+	// extension numbers each binding's observations from 0.
+	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-other-surface", "occurrence-1", "binding-other", 0)
+	if err != nil || outcome != "" {
+		t.Fatalf("independent surface check = %q, %v; want empty outcome", outcome, err)
+	}
+	if err := js.RecordClaimObservation(ctx, ClaimObservationRecord{
+		ObservationID: "observation-other-surface", GateOccurrenceID: "occurrence-1",
+		AuthenticationClaimID: "claim-journal", BindingID: "binding-other",
+		BrowserHolderGeneration: 3, EventKind: "wall_observed", EventOrdinal: 0,
+	}); err != nil {
+		t.Fatalf("record for another surface at an ordinal the first surface never used: %v", err)
+	}
+	if err := js.RecordClaimObservation(ctx, ClaimObservationRecord{
+		ObservationID: "observation-other-surface-one", GateOccurrenceID: "occurrence-1",
+		AuthenticationClaimID: "claim-journal", BindingID: "binding-other",
+		BrowserHolderGeneration: 3, EventKind: "login_started", EventOrdinal: 1,
+	}); err != nil {
+		t.Fatalf("record for another surface at an ordinal the first surface already used: %v", err)
+	}
+
 	// A different occurrence entirely starts its own ordinal sequence at 0.
-	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-other-occurrence", "occurrence-2", 0)
+	outcome, err = js.CheckClaimObservationJournal(ctx, "observation-other-occurrence", "occurrence-2", "binding-journal", 0)
 	if err != nil || outcome != "" {
 		t.Fatalf("independent occurrence check = %q, %v; want empty outcome", outcome, err)
 	}

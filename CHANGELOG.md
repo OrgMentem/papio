@@ -26,6 +26,19 @@ execution records kept during the initial build.
   into the paper's folder; it stays where it is for you. A manual-download
   task in the inbox no longer shows a `Diagnosis` line.
 
+### Fixed
+- **A sign-in on a new tab for your library is recorded again.** One library
+  sign-in often serves many papers, and *papio* keeps one login record open
+  across them. Each browser tab numbers its sign-in reports from zero, but
+  the daemon compared every report with the highest number that any earlier
+  tab had used. After a few papers, it refused every report from the next
+  tab: the sign-in return, the arrival on the article, and the progress
+  reports. The daemon log showed each refusal as `stale ()`. So a completed
+  sign-in did not release the other papers that wait for your library. The
+  daemon now compares a report only with the earlier reports from the same
+  tab. A late report from that tab is still refused, and the log now says
+  why. This change adds database migration 55.
+
 ## [0.22.1] - 2026-09-23
 
 ### Fixed
