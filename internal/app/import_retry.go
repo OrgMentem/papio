@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"time"
 
 	"papio/internal/job"
 )
@@ -17,6 +18,14 @@ import (
 // that runs after acquisition, so a persistently failing import eventually
 // surfaces as import_failed instead of re-driving Zotio forever.
 const maxImportAttempts = 5
+
+// importRetryDelays spaces the retries after each failed import attempt: the
+// Nth failure waits importRetryDelays[N-1] before the next attempt. The
+// commonest failure is a closed Zotero desktop, which refuses every connector
+// save until the operator starts it; an unspaced one-minute pass spent all
+// maxImportAttempts in four minutes, so the paper stayed unfiled after Zotero
+// opened. The last delay spans an operator's night.
+var importRetryDelays = []time.Duration{time.Minute, 10 * time.Minute, time.Hour, 12 * time.Hour}
 
 // readyImportScanLimit bounds one retry pass to the newest ready jobs, matching
 // the daemon's other newest-first scans. A failed import ages out of the window
@@ -143,6 +152,9 @@ func (s *Service) retryPendingImports(ctx context.Context) error {
 			s.reconcileDeliveredReady(ctx, &row, events)
 			continue
 		}
+		if !importRetryDue(events, s.Now()) {
+			continue
+		}
 		s.autoImportReady(ctx, &row)
 		applied++
 		if applied >= maxImportsPerPass {
@@ -226,4 +238,32 @@ func importNeedsRetry(events []map[string]any) bool {
 		return false
 	}
 	return errorCount < maxImportAttempts
+}
+
+// importRetryDue reports whether a job that importNeedsRetry selects has
+// waited out the backoff after its latest failed attempt. A job with no failed
+// attempt, or whose failure time cannot be read, is due: the attempt cap still
+// bounds it.
+func importRetryDue(events []map[string]any, now time.Time) bool {
+	failures := 0
+	var lastFailure string
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if status, _ := detail["status"].(string); status == "error" {
+			failures++
+			lastFailure, _ = event["at"].(string)
+		}
+	}
+	if failures == 0 {
+		return true
+	}
+	at, err := time.Parse(time.RFC3339Nano, lastFailure)
+	if err != nil {
+		return true
+	}
+	delay := importRetryDelays[min(failures, len(importRetryDelays))-1]
+	return !now.Before(at.Add(delay))
 }

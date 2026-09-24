@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"papio/internal/discovery"
 	"papio/internal/job"
@@ -87,6 +88,13 @@ func seedReadyJobWithImportResult(t *testing.T, svc *Service, jobs *job.Store, w
 	return id
 }
 
+// pastImportBackoff moves the service clock beyond every import retry delay,
+// for tests that model successive maintenance passes rather than the spacing
+// between them.
+func pastImportBackoff(svc *Service) {
+	svc.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+}
+
 func TestImportRetrierRunDueRetriesOnlyDueJobs(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
@@ -103,6 +111,7 @@ func TestImportRetrierRunDueRetriesOnlyDueJobs(t *testing.T) {
 
 	// capturing importer for the RunDue pass: succeeds for any retried job.
 	capt := &selectiveImporter{status: "applied"}
+	pastImportBackoff(svc)
 	svc.AutoImporter = capt
 
 	dueBefore, err := jobs.Events(ctx, dueID)
@@ -210,6 +219,7 @@ func TestImportRetrierRunDuePausedLeavesReadyBatchUntouched(t *testing.T) {
 	}
 	capt := &selectiveImporter{status: "applied"}
 	svc.AutoImporter = capt
+	pastImportBackoff(svc)
 	svc.Config.Zotio.AutoImportPaused = true
 	for range 2 {
 		if err := svc.ImportRetrier().RunDue(ctx); err != nil {
@@ -250,6 +260,7 @@ func TestImportRetrierRunDueAtCapIsNotRetried(t *testing.T) {
 	svc.AutoImporter = &fakeAutoImporter{err: zotio.WithErrorInfo(errors.New("transient"))}
 	id := seedReadyJobWithImportResult(t, svc, jobs, "wr_import_cap_001")
 	// Already 1 error from inline import. Need maxImportAttempts-1 more via retryPendingImports.
+	pastImportBackoff(svc)
 	for i := 1; i < maxImportAttempts; i++ {
 		if err := svc.retryPendingImports(ctx); err != nil {
 			t.Fatalf("retry %d: %v", i, err)
@@ -281,6 +292,82 @@ func TestImportRetrierRunDueAtCapIsNotRetried(t *testing.T) {
 	}
 }
 
+// A closed Zotero desktop refuses every connector save until the operator
+// starts it. Measured live: the inline import and four one-minute maintenance
+// passes spent all five attempts in four minutes, so a paper acquired while
+// Zotero was closed stayed unfiled after the operator opened it. The attempts
+// must be spaced so that a reopened Zotero still receives one.
+func TestImportRetrierSpacesAttemptsSoAClosedZoteroCanReopen(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+
+	svc.AutoImporter = &selectiveImporter{fallback: zotio.WithErrorInfo(errors.New("zotero connector refused"))}
+	id := seedReadyJobWithImportResult(t, svc, jobs, "wr_import_zotero_closed")
+
+	// Zotero stays closed for fifteen minutes of one-minute maintenance ticks.
+	start := time.Now()
+	for minute := 1; minute <= 15; minute++ {
+		svc.Now = func() time.Time { return start.Add(time.Duration(minute) * time.Minute) }
+		if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !importNeedsRetry(events) {
+		t.Fatal("fifteen minutes of a closed Zotero exhausted the import attempts")
+	}
+
+	// The operator opens Zotero; a later tick files the paper.
+	opened := &selectiveImporter{status: "applied"}
+	svc.AutoImporter = opened
+	svc.Now = func() time.Time { return start.Add(2 * time.Hour) }
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := settledImport(after); status != "applied" || !opened.calledFor(id) {
+		t.Fatalf("import after Zotero reopened = %q (called %v), want applied", status, opened.calledFor(id))
+	}
+}
+
+// A failed import is not re-driven on the very next tick: the attempt after
+// the first failure waits its backoff, measured from the failure it follows.
+func TestImportRetrierWaitsBackoffAfterFailure(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+
+	svc.AutoImporter = &selectiveImporter{fallback: zotio.WithErrorInfo(errors.New("zotero connector refused"))}
+	id := seedReadyJobWithImportResult(t, svc, jobs, "wr_import_backoff")
+
+	capt := &selectiveImporter{status: "applied"}
+	svc.AutoImporter = capt
+	start := time.Now()
+	svc.Now = func() time.Time { return start.Add(importRetryDelays[0] - 5*time.Second) }
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if capt.calledFor(id) {
+		t.Fatal("import retried before its backoff elapsed")
+	}
+	svc.Now = func() time.Time { return start.Add(importRetryDelays[0] + 5*time.Second) }
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !capt.calledFor(id) {
+		t.Fatal("import not retried after its backoff elapsed")
+	}
+}
+
 func TestImportRetrierRunDueContinuesAfterPerItemFailure(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
@@ -305,6 +392,7 @@ func TestImportRetrierRunDueContinuesAfterPerItemFailure(t *testing.T) {
 		status: "applied",
 	}
 	svc.AutoImporter = capt
+	pastImportBackoff(svc)
 
 	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
 		t.Fatalf("RunDue = %v, want nil (must continue past per-item failure and return nil)", err)
@@ -455,6 +543,7 @@ func TestImportRetrierRunDueStopsAtPerPassCap(t *testing.T) {
 
 	capt := &selectiveImporter{status: "applied"}
 	svc.AutoImporter = capt
+	pastImportBackoff(svc)
 	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
 		t.Fatalf("RunDue = %v, want nil", err)
 	}

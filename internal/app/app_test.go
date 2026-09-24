@@ -2486,6 +2486,7 @@ func TestRetryPendingImportsRedrivesFailedImportUntilCap(t *testing.T) {
 
 	// Ready is terminal, so only the retry pass re-drives the failing import.
 	// It must re-drive up to the attempt cap, then give up.
+	pastImportBackoff(svc)
 	for range 10 {
 		if err := svc.retryPendingImports(ctx); err != nil {
 			t.Fatal(err)
@@ -2524,6 +2525,7 @@ func TestRetryPendingImportsStopsAfterSuccess(t *testing.T) {
 	}
 
 	// Zotio recovers: the next retry imports, and no further retry re-drives it.
+	pastImportBackoff(svc)
 	importer.err = nil
 	importer.status = "applied"
 	importer.parentKey = "PARENT01"
