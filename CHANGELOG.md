@@ -75,6 +75,14 @@ execution records kept during the initial build.
   desktop has not synced the item. `papio activity` no longer shows a failed
   filing as "Filed into Zotero collection" or a failed enrichment as "Zotero
   metadata enriched".
+- **A paper acquired while Zotero desktop is closed reaches Zotero after you
+  open it.** When an import failed, the daemon tried again on each one-minute
+  maintenance pass. A closed Zotero refuses every import, so the daemon used
+  all five attempts in four minutes and then stopped. The paper stayed out of
+  Zotero after you opened it. The daemon now waits 1 minute, 10 minutes,
+  1 hour and 12 hours after each failed attempt. A paper that already used its
+  five attempts before you upgrade does not try again by itself; import it
+  with `papio zotio import-backfill --apply`.
 
 ## [0.22.1] - 2026-09-23
 
