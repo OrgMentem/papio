@@ -68,6 +68,12 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **The article-agent skip reason names the paper's assisted mode.** On a page
+  with no adapter, the autonomous article agent refused to act on an
+  assisted paper and reported "this browser lacks authority for the attempt",
+  which blamed the browser. It now says the paper needs your own sign-in or
+  download, so the autonomous agent stays off. The browser-side causes (no
+  hello acknowledgement, not the holder session) keep the old text.
 - **Firefox keeps the paper's tab while its PDF is still opening in a new
   tab.** On ScienceDirect, you click **View PDF** yourself on Firefox, and the
   PDF opens in a new tab. When that tab stopped on a security check, *papio*'s

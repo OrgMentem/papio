@@ -463,7 +463,7 @@ for (const knownAdapter of [false, true]) for (const [reason, message] of [
   ["backend_feature_missing", "Article agent unavailable: reconnect to a daemon with Jev enabled."],
   ["generic_epoch_missing", "Article agent skipped: the daemon has not authorized a fresh browser attempt."],
   ["expected_doi_missing", "Article agent skipped: this attempt has no DOI."],
-  ["authority_unavailable", "Article agent skipped: this browser lacks authority for the attempt."],
+  ["access_mode_not_delegated", "Article agent skipped: this paper needs your own sign-in or download, so the autonomous agent stays off."],
 ] as const) test(`${knownAdapter ? "known unknown" : "no-adapter"} reports safe fallback skip: ${reason}`, async () => {
   const h = await harness({ knownAdapter,
     ...(reason === "backend_feature_missing" ? { features: features.filter(feature => feature !== "agent_fallback_v1") } : {}),
@@ -472,7 +472,7 @@ for (const knownAdapter of [false, true]) for (const [reason, message] of [
     const current = { ...job }; delete current.generic_drive_epoch; return current;
   }) }));
   if (reason === "expected_doi_missing") await h.update(s => patchJob(s, jobID, { expected: { title: "PRIVATEEXPECTED" } }));
-  if (reason === "authority_unavailable") await h.update(s => patchJob(s, jobID, { access_mode: "assisted" }));
+  if (reason === "access_mode_not_delegated") await h.update(s => patchJob(s, jobID, { access_mode: "assisted" }));
   await h.classify(); await flush();
   const outcomes = h.frames.filter(frame => frame.type === "provider_outcome");
   expect(outcomes).toHaveLength(1);

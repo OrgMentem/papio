@@ -1512,6 +1512,7 @@ interface GenericHeldResult {
 /** Fixed local gate names only; never include page data in a skip diagnostic. */
 type AgentFallbackSkipReason =
   | "backend_feature_missing" | "drive_features_missing" | "hello_pending" | "authority_unavailable"
+  | "access_mode_not_delegated"
   | "drive_unavailable" | "tab_unavailable" | "job_state_ineligible"
   | "attempt_terminal" | "download_pending" | "expected_doi_missing"
   | "generic_epoch_missing" | "native_adoption_unavailable" | "attempt_consumed";
@@ -1521,6 +1522,7 @@ const AGENT_FALLBACK_SKIP_DETAIL: Record<AgentFallbackSkipReason, string> = {
   drive_features_missing: "Article agent unavailable: reconnect to a daemon with browser-drive support.",
   hello_pending: "Article agent skipped: this browser has not received a hello acknowledgement for this connection.",
   authority_unavailable: "Article agent skipped: this browser lacks authority for the attempt.",
+  access_mode_not_delegated: "Article agent skipped: this paper needs your own sign-in or download, so the autonomous agent stays off. papio does not act on provider pages by itself for it.",
   drive_unavailable: "Article agent skipped: no active browser drive owns this attempt.",
   tab_unavailable: "Article agent skipped: this attempt has no bound browser tab.",
   job_state_ineligible: "Article agent skipped: this job is not awaiting article acquisition.",
@@ -18901,7 +18903,7 @@ export class Bridge {
     const availability = this.agentFallbackAvailability();
     if (availability !== true) return availability;
     const epoch = job.generic_drive_epoch;
-    if (!this.hasDelegatedAuthority(job)) return "authority_unavailable";
+    if (!this.hasDelegatedAuthority(job)) return "access_mode_not_delegated";
     if (!this.handoffDrives.has(job.job_id)) return "drive_unavailable";
     if (job.tab_id < 0) return "tab_unavailable";
     if (job.status !== "accepted" && job.status !== "awaiting_download" && job.status !== "auth_pending") return "job_state_ineligible";
