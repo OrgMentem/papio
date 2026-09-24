@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +22,21 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// TestMain lets this test image serve as the doctor's pdf worker in
+// TestOpenRollsForwardSchemaOneWithoutLosingDurableRows. On Windows doctor runs
+// the worker against a missing PDF instead of checking an execute bit, so the
+// image must answer the real worker protocol, as internal/cli's does.
+func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == pdf.WorkerArgument {
+		if err := pdf.WorkerMain(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func schema33Fixture(t *testing.T, seed string) string {
 	t.Helper()

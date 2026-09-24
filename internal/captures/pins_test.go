@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -199,6 +200,9 @@ func captureCount(snapshot map[string]string) int {
 func TestStoreSanitizedPinnedRollsBackWhenLeaseIndexFails(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory permission bits")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows directory's mode bits do not stop file creation inside it")
 	}
 	ctx := context.Background()
 	store, first, latest, at := pendingRollbackStore(t)

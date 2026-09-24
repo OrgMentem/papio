@@ -1,5 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 import { afterEach, beforeAll, expect, mock, test } from "bun:test";
+import { join } from "node:path";
 import type { ActiveJob } from "../src/state";
 import { FakeEmitter } from "./fake-tabs";
 
@@ -19,7 +20,8 @@ beforeAll(async () => {
   // without importing that runner, opening a socket, or writing a dist bundle.
   for (const afterDrift of [false, true]) {
     const built = await Bun.build({
-      entrypoints: [new URL("../tools/provider-spike-browser.ts", import.meta.url).pathname],
+      // A file URL's pathname is "/C:/..." on Windows, which Bun.build rejects.
+      entrypoints: [join(import.meta.dir, "..", "tools", "provider-spike-browser.ts")],
       target: "browser", format: "esm",
       define: { PROVIDER_SPIKE: JSON.stringify({ ...config, afterDrift }) },
     });

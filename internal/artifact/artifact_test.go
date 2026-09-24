@@ -6,10 +6,21 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
 )
+
+// wantArtifactPerm is Promote's read-only mode as Stat reports it. Windows has
+// no owner, group or other bits: Chmod(0o400) sets the read-only attribute,
+// which Stat reports as 0444.
+var wantArtifactPerm = func() os.FileMode {
+	if runtime.GOOS == "windows" {
+		return 0o444
+	}
+	return 0o400
+}()
 
 func TestPromoteIsAtomicIdempotentAndVerifiable(t *testing.T) {
 	s, err := New(t.TempDir())
@@ -44,8 +55,8 @@ func TestPromoteIsAtomicIdempotentAndVerifiable(t *testing.T) {
 		t.Fatalf("verify: %v", err)
 	}
 	info, _ := os.Stat(dest)
-	if info.Mode().Perm() != 0o400 {
-		t.Fatalf("artifact mode = %v, want read-only 0400", info.Mode().Perm())
+	if info.Mode().Perm() != wantArtifactPerm {
+		t.Fatalf("artifact mode = %v, want read-only %v", info.Mode().Perm(), wantArtifactPerm)
 	}
 
 	// Second promotion of identical content is a no-op (crash-recovery re-fetch).
@@ -244,8 +255,8 @@ func TestPromoteSucceedsWhenTempCleanupFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat dest after cleanup failure: %v", err)
 	}
-	if info.Mode().Perm() != 0o400 {
-		t.Fatalf("artifact mode = %v, want 0400", info.Mode().Perm())
+	if info.Mode().Perm() != wantArtifactPerm {
+		t.Fatalf("artifact mode = %v, want %v", info.Mode().Perm(), wantArtifactPerm)
 	}
 	// Temp duplicate remains because removal was injected to fail,
 	// but promotion itself succeeded — caller must not treat this as failure.
