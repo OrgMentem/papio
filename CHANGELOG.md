@@ -92,6 +92,15 @@ execution records kept during the initial build.
   `Error: 1 fanout...`, because zotio's summary line used all of the
   recorded length. *papio* now reads the cause from the entry that zotio
   prints, and the service log keeps the whole error.
+- **An institutional paper whose sign-in tab closed can be opened again.**
+  When the three-minute drive timeout closed an unattended sign-in tab, the
+  extension kept the dead surface as live. Every later offer of that paper
+  (the paced drive, `papio actions open`, a sign-in release) then did
+  nothing, and the popup listed the paper under **Focus** with no tab to
+  focus. The extension now retires a closed surface, so the next offer builds
+  a new one and the popup offers **Open**. A reconnect also retires dead
+  surfaces again: its reconcile ignored the daemon's answer when no binding
+  was live. **Focus** on a tab that has gone opens a fresh surface.
 - **A paper with an open-access copy no longer ends unavailable because your
   library has no entitlement.** When the browser could not drive an
   open-access page (for example a PubMed Central article) and asked you to

@@ -5358,6 +5358,229 @@ test("auth_returned is reported once, for the landing after the sign-in wall and
   expect(h.frames().filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
 });
 
+/** The production sequence measured live 2026-09-24 on job_da3d17eefe and
+ * job_111cef1876: an automatic institutional surface reached the institution
+ * sign-in page, nobody attended it, the three-minute drive timeout parked the
+ * paper and papio closed the tab, and the owner_closed report abandoned the
+ * claim. Returns the job's state and the dead tab. */
+async function timedOutSignInSurface(
+  h: Harness,
+  ids: ClaimSurfaceIDs,
+): Promise<{ tabID: number; acked: Set<string> }> {
+  await h.port.inbound(helloAck({
+    features: [
+      "institutional_materialization_v1",
+      "effect_permit_v1",
+      "handoff_link_v1",
+      AUTH_CLAIM,
+      "surface_close_v1",
+    ],
+    browser_holder_generation: 1,
+  }));
+  const tabID = await navigatedClaimSurface(h, ids, `https://${PROVIDER_HOST}/stable/timed-out`);
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  const acked = new Set<string>();
+  await ackClaimObservations(h, acked);
+  // Nobody is looking at the sign-in page: the operator is in another window.
+  const workWindow = h.windows?.live.get(h.backend.store.workWindowID ?? -1);
+  expect(workWindow).toBeDefined();
+  workWindow!.focused = false;
+  const timeout = h.timers.find((timer) => timer.ms === 180_000);
+  expect(timeout).toBeDefined();
+  h.clock.now += 180_000;
+  const framesBefore = h.port.posted.length;
+  const timingOut = timeout!.fn();
+  const parkClose = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(parkClose.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: parkClose.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: `auth-${ids.bindingID}`,
+      nonce: `nonce-${ids.bindingID}`,
+      browser_holder_generation: 1,
+    }),
+  );
+  await timingOut;
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  expect(h.tabs.removed).toContain(tabID);
+  expect(await ackClaimObservations(h, acked)).toContain("owner_closed");
+  return { tabID, acked };
+}
+
+// Measured live 2026-09-24: after the sequence above the daemon offered the
+// same candidate again (the paced drive at 12:29Z, `papio actions open` at
+// 12:55Z and 13:07Z), and nothing happened: no claim, no tab, no event. The
+// extension still held the dead binding as a `navigated` correlation, so every
+// offer read as a lease refresh, and the first one copied the closed tab's id
+// back onto the job.
+test("a closed sign-in surface is rebuilt when the daemon offers its candidate again", async () => {
+  const ids = {
+    jobID: "job_surface_timed_out_reoffer",
+    candidateID: "cand_surface_timed_out_reoffer",
+    claimID: "claim_surface_timed_out_reoffer",
+    bindingID: "bind_surface_timed_out_reoffer",
+  };
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID } = await timedOutSignInSurface(h, ids);
+
+  const offeredAt = h.port.posted.length;
+  await h.port.inbound(claimSurfaceOffer(ids, [PROVIDER_HOST], "2030-06-01T00:00:00Z"));
+  const claim = await h.port.waitForFrame("institutional_claim_request", offeredAt);
+  expect(claim.payload["candidate_id"]).toBe(ids.candidateID);
+  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).not.toBe(tabID);
+});
+
+// The same live state, seen from the popup: eight papers listed under Focus,
+// none with a tab, and a real click on Focus changed nothing.
+test("the operator's Open on a paper whose sign-in surface timed out asks for a fresh surface", async () => {
+  const ids = {
+    jobID: "job_surface_timed_out_open",
+    candidateID: "cand_surface_timed_out_open",
+    claimID: "claim_surface_timed_out_open",
+    bindingID: "bind_surface_timed_out_open",
+  };
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await timedOutSignInSurface(h, ids);
+  expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({
+    status: "auth_pending",
+    tab_id: -1,
+  });
+
+  const framesBefore = h.port.posted.length;
+  const opening = h.bridge.openHandoff(ids.jobID);
+  const consult = await h.port.waitForFrame("authentication_claim_request", framesBefore);
+  expect(consult.payload["candidate_id"]).toBe(ids.candidateID);
+  expect(consult.payload["trigger"]).toBe("explicit");
+  await h.port.inbound(
+    claimResponse(ids.jobID, consult.payload["request_id"], {
+      outcome: "open_new",
+      authentication_claim_id: `auth_${ids.claimID}`,
+      browser_holder_generation: 1,
+      gate_occurrence_id: `occ_reopen_${ids.claimID}`,
+      lease_until: "2030-01-01T00:00:00Z",
+    }),
+  );
+  const link = await h.port.waitForFrame("handoff_link_request", framesBefore);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: link.payload["request_id"],
+      outcome: "opened",
+      url: `https://${PROVIDER_HOST}/fresh?reopen=1`,
+    }),
+  );
+  expect(await opening).toEqual({ ok: true, opened: true });
+  const reopened = findByJob(h.backend.store, ids.jobID);
+  expect(reopened?.tab_id).toBeGreaterThanOrEqual(0);
+  expect(h.tabs.snapshot(reopened?.tab_id ?? -1)?.url).toBe(`https://${PROVIDER_HOST}/fresh?reopen=1`);
+});
+
+// A paper can also hold the id of a tab that no longer exists: the offer
+// above copied it back from the dead correlation, and a sibling parked on
+// another paper's sign-in tab keeps that tab's id when it closes. Focusing it
+// threw inside the broker, so the popup's Focus did nothing on screen.
+test("Focus on a paper whose tab is gone opens a fresh surface instead", async () => {
+  const jobID = "job_focus_dead_tab";
+  const h = makeHarness();
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  const internals = h.bridge as unknown as {
+    update: (fn: (store: StoreShape) => StoreShape) => Promise<void>;
+  };
+  // Parked on another paper's sign-in tab, which has since closed.
+  await internals.update.call(h.bridge, (store) => ({
+    ...store,
+    activeJobs: [{
+      ...coldClaimJob(jobID),
+      status: "auth_pending",
+      tab_id: 4242,
+      engagement_required: false,
+      claim_identity_known: true,
+    }],
+  }));
+  expect(h.tabs.snapshot(4242)).toBeUndefined();
+
+  const framesBefore = h.port.posted.length;
+  const opening = h.bridge.openHandoff(jobID);
+  const link = await h.port.waitForFrame("handoff_link_request", framesBefore);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: link.payload["request_id"],
+      outcome: "opened",
+      url: `https://${PROVIDER_HOST}/fresh?dead-tab=1`,
+    }),
+  );
+  expect(await opening).toEqual({ ok: true, opened: true });
+  const job = findByJob(h.backend.store, jobID);
+  expect(job?.tab_id).not.toBe(4242);
+  expect(h.tabs.snapshot(job?.tab_id ?? -1)?.url).toBe(`https://${PROVIDER_HOST}/fresh?dead-tab=1`);
+});
+
+// A reconnect retires a sign-in surface too: the handshake's reconcile clears
+// a correlation whose claim the daemon abandoned and closes its tab. The paper
+// keeps waiting on the sign-in, now with no tab and no candidate, and its Open
+// refused it as "missing institution identity" although a candidate offer had
+// named the institution.
+test("Open on a paper whose sign-in surface a reconnect retired mints a fresh link", async () => {
+  const ids = {
+    jobID: "job_surface_reconnect_retired",
+    candidateID: "cand_surface_reconnect_retired",
+    claimID: "claim_surface_reconnect_retired",
+    bindingID: "bind_surface_reconnect_retired",
+  };
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const features = [
+    "institutional_materialization_v1",
+    "effect_permit_v1",
+    "handoff_link_v1",
+    AUTH_CLAIM,
+    "surface_close_v1",
+  ];
+  await h.port.inbound(helloAck({ features, browser_holder_generation: 1 }));
+  const tabID = await navigatedClaimSurface(h, ids, `https://${PROVIDER_HOST}/stable/reconnect`);
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  await ackClaimObservations(h, new Set<string>());
+  const workWindow = h.windows?.live.get(h.backend.store.workWindowID ?? -1);
+  workWindow!.focused = false;
+
+  const reconnectAt = h.port.posted.length;
+  await h.port.inbound(helloAck({ features, browser_holder_generation: 2 }));
+  const reconcile = await h.port.waitForFrame("institutional_reconcile_request", reconnectAt);
+  expect(reconcile.payload["bindings"]).toEqual([{ binding_id: ids.bindingID, tab_id: tabID }]);
+  // The claim is abandoned, so the daemon confirms no live binding.
+  await h.port.inbound(
+    nativeResult("institutional_reconcile_response", {
+      request_id: reconcile.payload["request_id"],
+      outcome: "reconciled",
+    }),
+  );
+  for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(h.backend.store.materializations?.[ids.jobID]).toBeUndefined();
+  expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({
+    status: "auth_pending",
+    tab_id: -1,
+  });
+
+  const framesBefore = h.port.posted.length;
+  const opening = h.bridge.openHandoff(ids.jobID);
+  const link = await h.port.waitForFrame("handoff_link_request", framesBefore);
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: link.payload["request_id"],
+      outcome: "opened",
+      url: `https://${PROVIDER_HOST}/fresh?reconnect=1`,
+    }),
+  );
+  expect(await opening).toEqual({ ok: true, opened: true });
+});
+
 // Live-smoke regression (2026-08-19): reproduced on the operator's own
 // browser. The grant that authorizes owner_closed is worker memory, and MV3
 // sleeps the worker after ~30s idle, so a sign-in tab abandoned minutes later
@@ -6516,11 +6739,38 @@ async function drainReconcileRequests(h: Harness): Promise<void> {
     }
   }
   for (const count of bindingRequestCounts.values()) expect(count).toBe(1);
+  // Every claim here is still live, and the daemon says so by listing it: an
+  // omitted binding is a dead one, and the extension retires its correlation.
+  const wirePhase: Partial<Record<string, string>> = {
+    claimed: "claimed",
+    bound: "bound",
+    route_issued: "route_issued",
+    navigating: "route_issued",
+    navigated: "navigated",
+  };
   for (const req of requests) {
+    const bindings = Array.isArray(req.payload["bindings"])
+      ? (req.payload["bindings"] as Record<string, unknown>[])
+      : [];
+    const claims = bindings.flatMap((binding) => {
+      const entry = Object.values(h.backend.store.materializations ?? {}).find(
+        (candidate) => candidate.binding_id === binding["binding_id"],
+      );
+      const phase = entry === undefined ? undefined : wirePhase[entry.phase];
+      if (entry?.claim_id === undefined || phase === undefined) return [];
+      return [{
+        claim_id: entry.claim_id,
+        binding_id: entry.binding_id,
+        candidate_id: entry.candidate_id,
+        phase,
+        ...(phase === "claimed" ? {} : { tab_id: binding["tab_id"] }),
+      }];
+    });
     await h.port.inbound(
       nativeResult("institutional_reconcile_response", {
         request_id: req.payload["request_id"],
         outcome: "reconciled",
+        ...(claims.length > 0 ? { claims } : {}),
       }),
     );
   }
@@ -15476,7 +15726,7 @@ test("handoff_focus surfaces the tracked work-window tab without creating anothe
   });
   for (
     let i = 0;
-    i < 10 &&
+    i < 40 &&
     !h.windows?.updated.some(
       (update) => update.windowID === 500 && update.props.focused === true,
     );

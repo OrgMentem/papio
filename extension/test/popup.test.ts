@@ -1268,6 +1268,35 @@ test("a cold institutional handoff renders an explicit Open action", async () =>
   expect(button.textContent).toBe("Open");
 });
 
+// Measured live 2026-09-24: eight papers whose sign-in tabs the drive timeout
+// had closed stayed auth_pending without engagement_required, and the popup
+// listed every one of them under Focus with no tab to focus.
+test("a sign-in paper whose tab is gone offers Open, not Focus", () => {
+  const doc = popupDocument();
+  renderNeedsAttention(
+    doc,
+    [
+      job({
+        job_id: "job-timed-out-sign-in",
+        tab_id: -1,
+        status: "auth_pending",
+        requires_auth: true,
+        expected: { title: "A paper whose sign-in timed out" },
+      }),
+      job({ job_id: "job-live-sign-in", status: "auth_pending", requires_auth: true }),
+    ],
+    [],
+    async () => {},
+  );
+
+  const heading = doc.getElementById("institution-session-waiting-heading");
+  expect(heading?.textContent).toBe("Open institutional access");
+  const labels = [...doc.querySelectorAll(".institution-session-waiting-row button")].map(
+    (button) => button.textContent,
+  );
+  expect(labels).toEqual(["Open", "Focus"]);
+});
+
 test("a cold engagement failure displays its structured reason", async () => {
   const doc = popupDocument();
   Object.assign(globalThis, {
