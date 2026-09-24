@@ -143,7 +143,10 @@ type Service struct {
 	Validate          ValidateFunc
 	Sanitize          SanitizeFunc
 	AutoImporter      AutoImporter
-	Notifier          notify.Sink
+	// ZoteroDesktop, when set, lets an import that needs Zotero desktop wait
+	// for it instead of failing while it is closed (see zotero_desktop.go).
+	ZoteroDesktop ZoteroDesktop
+	Notifier      notify.Sink
 	// Delivery is ADR-0017's document-delivery/ILL service (Decisions 1,
 	// 3A-3C, 4). Nil disables the feature entirely: exhaustedCandidates
 	// falls back to its pre-ADR-0017 OpenURL/no_entitlement behavior
@@ -171,6 +174,12 @@ type Service struct {
 	hookCtx      context.Context
 	hookCancel   context.CancelFunc
 	hooksClosing bool
+
+	// desktop is the in-memory Zotero desktop presence (zotero_desktop.go).
+	desktop zoteroDesktopState
+	// importPassMu keeps the maintenance tick's import-retry pass and the
+	// one the Zotero watcher starts from overlapping.
+	importPassMu sync.Mutex
 
 	RetryDelay time.Duration
 	Now        func() time.Time
@@ -4207,11 +4216,22 @@ func (s *Service) recordStandaloneOutcome(ctx context.Context, row *job.Row) {
 	}
 }
 
-func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
+// importOutcome tells the retry pass whether an import spent an attempt.
+type importOutcome int
+
+const (
+	importNotAttempted importOutcome = iota
+	importAttempted
+	// importWaiting means the import waits for Zotero desktop; no attempt
+	// was spent.
+	importWaiting
+)
+
+func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutcome {
 	if s.Config.Zotio.AutoImportPaused || !row.Policy.AutoImport {
 		// A pause leaves no import outcome: the ready job remains eligible
 		// for the retry sweep when automatic imports resume.
-		return
+		return importNotAttempted
 	}
 	eventCtx := context.WithoutCancel(ctx)
 	detail := map[string]any{"parent_key": "", "attachment_key": ""}
@@ -4219,14 +4239,33 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 		detail["status"] = "skipped"
 		detail["reason"] = "zotio_not_configured"
 		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
-		return
+		return importNotAttempted
+	}
+	// A connector save cannot succeed while Zotero desktop is closed, so
+	// spending an attempt on it only burns the cap: measured live, a paper
+	// that reached ready while Zotero was closed used all five attempts in
+	// four minutes and was never filed after Zotero opened.
+	needsDesktop := s.importNeedsDesktop(row)
+	if needsDesktop && s.desktopClosed(ctx) {
+		s.recordImportWaiting(ctx, row)
+		return importWaiting
 	}
 	status, parentKey, attachmentKey, err := s.AutoImporter.PlanAndApply(ctx, row.ID)
 	detail["parent_key"] = parentKey
 	detail["attachment_key"] = attachmentKey
 	if err != nil {
 		if ctx.Err() != nil {
-			return
+			return importAttempted
+		}
+		if needsDesktop {
+			// Presence may be stale: Zotero can quit after the last probe.
+			// Ask again, and when it is closed the failure is the closure,
+			// so the job waits instead of spending an attempt.
+			s.desktop.forget()
+			if s.probeDesktop(ctx) == desktopClosed {
+				s.recordImportWaiting(ctx, row)
+				return importWaiting
+			}
 		}
 		class, hint, httpStatus := autoImportErrorInfo(err)
 		detail["status"] = "error"
@@ -4251,13 +4290,14 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) {
 		}
 		log.Printf("papio: auto-import for job %s failed [%s]: %s", row.ID, class, logged)
 		_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
-		return
+		return importAttempted
 	}
 	detail["status"] = status
 	if status == "duplicate" {
 		detail["reason"] = "already_in_library"
 	}
 	_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
+	return importAttempted
 }
 
 // runReadyHook fires the user's on_ready hook exactly once per ready

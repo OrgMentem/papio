@@ -120,11 +120,32 @@ batch report and can be retried through the normal zotio preview flow.
 `--collection` carries the requested zotio collection with each work; the
 collection is created on demand by zotio, and importing the same work again is safe.
 
-A paper that *papio* imports can take minutes to appear in its Zotero collection
-or receive its abstract. Both steps read the new item through the Zotero Web API,
-but an import through Zotero desktop syncs there only afterwards. *papio* repeats a
-step the Web API refused with 404 after 1 minute, and then after 10 minutes, 1 hour,
-and 6 hours, and then stops. It does not run the import again.
+In `stored` mode, *papio* gives a new paper's collection, DOI and abstract to
+Zotero desktop with the paper, so the paper is in its collection and has its
+abstract as soon as Zotero saves it. The abstract comes from the DOI registry
+(Crossref or DataCite), or from OpenAlex when the registry has none and
+`auto_enrich` is on. The import needs Zotero desktop to be open: *papio* does
+not send the paper through the Zotero Web API instead, because that route
+stores the PDF in Zotero's own file storage.
+
+Some steps still happen after the import, through the Zotero Web API: filing a
+paper that was already in your library, filing into a collection whose name
+matches no collection (zotio creates it) or more than one, and filing into a
+collection that Zotero desktop does not show yet. The Web API has a new item
+only after Zotero desktop syncs it, so such a step can take minutes. *papio*
+repeats a step the Web API refused with 404 after 1 minute, and then after
+10 minutes, 1 hour, and 6 hours, and then stops. It does not run the import again.
+
+When Zotero desktop is closed, *papio* does not spend an import attempt on a
+paper that needs it: the paper waits, `papio activity` shows "Waiting for Zotero
+desktop", and you get one notification. Open Zotero and *papio* imports the waiting papers
+within seconds. When Zotero is open but does not respond, *papio* tells you to
+restart it; when its connector is off, *papio* tells you to turn on
+"Allow other applications to communicate with Zotero" in Zotero's Advanced
+settings. This needs a zotio with the `desktop status` and `desktop wait`
+commands; with an older zotio, *papio* tries a failed import again after 1
+minute, 10 minutes, 1 hour, and 12 hours, and then stops.
+
 When zotio is configured, *papio* first classifies batch works against your zotio
 library: works already owning a PDF are skipped, a known item without a PDF is
 queued on its existing-item attachment route, and other works are acquired as new

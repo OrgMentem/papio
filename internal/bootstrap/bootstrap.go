@@ -459,6 +459,14 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		ExceptionTags:      cfg.Zotio.ExceptionTags,
 		UnavailableRecheck: time.Duration(cfg.Zotio.UnavailableRecheckDays) * 24 * time.Hour,
 	}
+	// The budgeted lookup enrichDOIWork uses also gives a new Zotero item the
+	// abstract its registry record lacks, before Zotero desktop saves it.
+	if lookup := service.Discovery; lookup != nil {
+		zotioService.Abstracts = func(ctx context.Context, doi string) (string, error) {
+			found, err := lookup.LookupWork(ctx, doi)
+			return found.Abstract, err
+		}
+	}
 	holdings := ownership.NewRegistry()
 	// browserZotio is the page-bulk status ownership seam (nil when zotio is
 	// not configured, mirroring the ADR-0008 exclusivity with holdings below):
@@ -470,12 +478,16 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		// zotio is optional: an empty executable disables the deep Zotero
 		// integration (auto-import, plan/apply, queue) while hooks remain the
 		// generic hand-off seam.
-		zotioService.CLI = zotio.New(cfg.Zotio)
+		zotioClient := zotio.New(cfg.Zotio)
+		zotioService.CLI = zotioClient
 		browserZotio = zotioService
 		service.AutoImporter = citationEnrichingImporter{
 			next: newSerialAutoImporter(zotioService, autoImportMinInterval),
 			svc:  service,
 		}
+		// An import that needs the connector waits for Zotero desktop
+		// instead of failing while it is closed, when zotio can tell.
+		service.ZoteroDesktop = zotioClient
 	} else {
 		// Generic holdings sources answer ownership only when zotio is absent.
 		// Mixing them is deliberately out of scope (ADR-0008): "make this Zotero
@@ -542,6 +554,10 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if retrier := zotioService.FollowUpRetrier(); retrier != nil && !cfg.Zotio.AutoImportPaused {
 		maintenance = append(maintenance, retrier)
 	}
+	var background []daemon.BackgroundRunner
+	if watcher := service.ZoteroDesktopWatcher(); watcher != nil {
+		background = append(background, watcher)
+	}
 	scheduler, err := daemon.NewScheduler(jobs, service, daemon.SchedulerConfig{
 		Owner:               job.NewID("daemon"),
 		Workers:             3,
@@ -550,6 +566,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		PollInterval:        250 * time.Millisecond,
 		Maintenance:         maintenance,
 		MaintenanceInterval: time.Minute,
+		Background:          background,
 	})
 	if err != nil {
 		return nil, err

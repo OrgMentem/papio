@@ -122,6 +122,14 @@ func ActivityText(kind string, detail map[string]any) string {
 			return "Imported into Zotero"
 		case "skipped":
 			return "Zotero import skipped"
+		case "waiting":
+			switch activityDetailString(detail, "reason") {
+			case "zotero_unresponsive":
+				return "Waiting for Zotero desktop to respond (restart Zotero)"
+			case "zotero_connector_off":
+				return "Waiting for Zotero's connector (turn it on in Zotero)"
+			}
+			return "Waiting for Zotero desktop"
 		default:
 			return "Zotero import attempted"
 		}
@@ -131,6 +139,8 @@ func ActivityText(kind string, detail map[string]any) string {
 			return "Filed into Zotero collection"
 		case "error":
 			return "Zotero collection filing failed"
+		case "deferred":
+			return "Zotero collection filing deferred until after import"
 		default:
 			return "Zotero collection filing attempted"
 		}

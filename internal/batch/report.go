@@ -402,6 +402,10 @@ func buildWorkReport(ctx context.Context, manifestWork ManifestWork, jobs Jobs, 
 			// terminal success ("already in your library"), not in-progress.
 			item.Outcome = OutcomeExistingItemAttached
 			item.ParentKey = autoImport.ParentKey
+		case autoImport.Status == "waiting":
+			// The import waits for a closed Zotero desktop and spent no
+			// attempt; it is neither failed nor unconfirmed.
+			item.Outcome, item.Reason = OutcomeAcquired, "import_waiting_for_zotero"
 		case autoImport.Status == "skipped" || !row.Policy.AutoImport:
 			// Acquisition succeeded and import was not requested (auto-import
 			// off) or could not run (zotio not configured). The PDF is a

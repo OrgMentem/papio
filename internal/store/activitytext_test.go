@@ -35,6 +35,12 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 		{"drive.resumed", nil, "Paced drive resumed"},
 		{"acquisition.component_added", map[string]any{"role": "supplement"}, "Added supplement component"},
 		{"zotio.auto_import", map[string]any{"status": "applied"}, "Imported into Zotero"},
+		// A closed Zotero is a wait, not an attempt: "Zotero import attempted"
+		// read as a failure while nothing had been tried.
+		{"zotio.auto_import", map[string]any{"status": "waiting", "reason": "zotero_not_running"}, "Waiting for Zotero desktop"},
+		// An open but stuck Zotero needs a restart, not "open Zotero".
+		{"zotio.auto_import", map[string]any{"status": "waiting", "reason": "zotero_unresponsive"}, "Waiting for Zotero desktop to respond (restart Zotero)"},
+		{"zotio.auto_import", map[string]any{"status": "waiting", "reason": "zotero_connector_off"}, "Waiting for Zotero's connector (turn it on in Zotero)"},
 		{"zotio.collection_filing", map[string]any{"status": "applied"}, "Filed into Zotero collection"},
 		// A failed follow-up read "Filed into Zotero collection" and "Zotero
 		// metadata enriched" for job_cb931061… on 2026-09-24, while Zotero

@@ -24,54 +24,10 @@ func TestRunReportsUndeliveredZoteroImports(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	seed := func(id, settled string, autoImport bool, importStatus string) {
-		t.Helper()
-		policy, err := json.Marshal(map[string]any{"auto_import": autoImport})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx, `
-			INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, 'Example paper')`,
-			"wr_"+id, settled); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx, `
-			INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
-			VALUES (?, ?, 'ready', ?, ?, ?)`, id, "wr_"+id, string(policy), settled, settled); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx, `
-			INSERT INTO artifacts (sha256, size_bytes, mime, path, created_at)
-			VALUES (?, 1, 'application/pdf', ?, ?)`, id+"sha", "/tmp/"+id, settled); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.DB().ExecContext(ctx, `
-			INSERT INTO job_artifacts (job_id, artifact_sha256, role, identity_result, created_at)
-			VALUES (?, ?, 'main', 'pass', ?)`, id, id+"sha", settled); err != nil {
-			t.Fatal(err)
-		}
-		if importStatus != "" {
-			detail, err := json.Marshal(map[string]any{
-				"status":      importStatus,
-				"parent_key":  "",
-				"error_class": "bundle_validation",
-				"error_hint":  "bundle title missing or out of range",
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := db.DB().ExecContext(ctx, `
-				INSERT INTO events (job_id, at, kind, detail_json)
-				VALUES (?, ?, 'zotio.auto_import', ?)`, id, settled, string(detail)); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
 	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
-	seed("job_waiting_import", old, true, "error")
-	seed("job_imported", old, true, "applied")
-	seed("job_no_auto_import", old, false, "error")
+	seedReadyImport(t, db, "job_waiting_import", old, true, "error")
+	seedReadyImport(t, db, "job_imported", old, true, "applied")
+	seedReadyImport(t, db, "job_no_auto_import", old, false, "error")
 
 	got := undeliveredImportCheck(t, ctx, db)
 	if got.Status != Warn {
@@ -101,15 +57,117 @@ func TestRunPassesWhenValidatedImportsDelivered(t *testing.T) {
 
 func undeliveredImportCheck(t *testing.T, ctx context.Context, db *store.Store) Check {
 	t.Helper()
+	return importCheck(t, ctx, db, "undelivered_zotero_imports")
+}
+
+func importCheck(t *testing.T, ctx context.Context, db *store.Store, name string) Check {
+	t.Helper()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
 	cfg.DataDir = t.TempDir()
 	report := Run(ctx, cfg, db, pdf.Capability{}, "", nil)
 	for _, c := range report.Checks {
-		if c.Name == "undelivered_zotero_imports" {
+		if c.Name == name {
 			return c
 		}
 	}
-	t.Fatalf("no undelivered_zotero_imports check: %+v", report.Checks)
+	t.Fatalf("no %s check: %+v", name, report.Checks)
 	return Check{}
+}
+
+// A paper waiting for a closed Zotero desktop is neither delivered nor
+// failed. Doctor names the wait, its size, and the one action that ends it,
+// and the undelivered check no longer counts it as a stranded import.
+func TestRunReportsPapersWaitingForZoteroDesktop(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	waitingSince := time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339Nano)
+	seedReadyImport(t, db, "job_waiting_a", waitingSince, true, "waiting")
+	seedReadyImport(t, db, "job_waiting_b", waitingSince, true, "waiting")
+	seedReadyImport(t, db, "job_failed", waitingSince, true, "error")
+	seedReadyImport(t, db, "job_waiting_no_auto", waitingSince, false, "waiting")
+
+	got := importCheck(t, ctx, db, "zotero_desktop_waiting")
+	if got.Status != Warn || !strings.Contains(got.Detail, "2 papers are ready to add") || !strings.Contains(got.Detail, "waiting for 3h") {
+		t.Fatalf("zotero_desktop_waiting = %+v, want a warning naming 2 papers waiting 3h", got)
+	}
+	if !strings.Contains(got.Remediation, "open Zotero desktop") {
+		t.Fatalf("remediation = %q, want the one action that ends the wait", got.Remediation)
+	}
+	undelivered := undeliveredImportCheck(t, ctx, db)
+	if !strings.Contains(undelivered.Detail, "1 validated paper is waiting") {
+		t.Fatalf("undelivered = %+v, want only the failed import counted", undelivered)
+	}
+
+	// When the newest wait says Zotero is open but not responding, doctor
+	// says restart it, not open it.
+	stuckSince := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	seedReadyImport(t, db, "job_waiting_stuck", stuckSince, true, "waiting")
+	if _, err := db.DB().ExecContext(ctx, `UPDATE events SET detail_json = json_set(detail_json, '$.reason', 'zotero_unresponsive') WHERE job_id = 'job_waiting_stuck'`); err != nil {
+		t.Fatal(err)
+	}
+	stuck := importCheck(t, ctx, db, "zotero_desktop_waiting")
+	if !strings.Contains(stuck.Detail, "open but not responding: 3 papers") || !strings.HasPrefix(stuck.Remediation, "restart Zotero desktop") {
+		t.Fatalf("stuck zotero_desktop_waiting = %+v, want the restart remedy for 3 papers", stuck)
+	}
+
+	empty, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = empty.Close() })
+	if got := importCheck(t, ctx, empty, "zotero_desktop_waiting"); got.Status != Pass {
+		t.Fatalf("zotero_desktop_waiting on an empty store = %+v, want pass", got)
+	}
+}
+
+// seedReadyImport inserts one validated ready job and, when importStatus is
+// set, its latest zotio.auto_import outcome.
+func seedReadyImport(t *testing.T, db *store.Store, id, settled string, autoImport bool, importStatus string) {
+	t.Helper()
+	ctx := context.Background()
+	policy, err := json.Marshal(map[string]any{"auto_import": autoImport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO work_requests (id, created_at, title) VALUES (?, ?, 'Example paper')`,
+		"wr_"+id, settled); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+		VALUES (?, ?, 'ready', ?, ?, ?)`, id, "wr_"+id, string(policy), settled, settled); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO artifacts (sha256, size_bytes, mime, path, created_at)
+		VALUES (?, 1, 'application/pdf', ?, ?)`, id+"sha", "/tmp/"+id, settled); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO job_artifacts (job_id, artifact_sha256, role, identity_result, created_at)
+		VALUES (?, ?, 'main', 'pass', ?)`, id, id+"sha", settled); err != nil {
+		t.Fatal(err)
+	}
+	if importStatus != "" {
+		detail, err := json.Marshal(map[string]any{
+			"status":      importStatus,
+			"parent_key":  "",
+			"error_class": "bundle_validation",
+			"error_hint":  "bundle title missing or out of range",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx, `
+			INSERT INTO events (job_id, at, kind, detail_json)
+			VALUES (?, ?, 'zotio.auto_import', ?)`, id, settled, string(detail)); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

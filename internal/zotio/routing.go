@@ -14,15 +14,31 @@ import (
 const newItemRoutingRefusal = "new-item Zotio routing requires a DOI, PMID, arXiv ID, or ISBN"
 
 // newItemRoute is the zotio item-creation route papio asks for when it creates
-// a Zotero item. "auto" uses the local Zotero desktop when it is reachable and
-// falls back to api.zotero.org otherwise.
+// a Zotero item. In "stored" mode that is "connector": Zotero desktop saves the
+// item and its PDF, and files it into the policy collection in the same
+// session (see describeNewItem).
 //
-// It must not be "web". That route uploads the attachment into Zotero's own
-// file storage and so ignores the file storage the operator configured inside
-// Zotero. On a WebDAV setup it consumes a storage plan the operator never chose
-// to use, and when that plan fills, every filing stops with a bare HTTP 413.
-// Handing the file to the desktop lets Zotero honour its own configuration.
-const newItemRoute = "auto"
+// It must not be "web", and it is no longer "auto" either. The Web route
+// uploads the attachment into Zotero's own file storage and so ignores the
+// file storage the operator configured inside Zotero: on a WebDAV setup it
+// consumes a storage plan the operator never chose to use, and when that plan
+// fills, every filing stops with a bare HTTP 413. "auto" fell back to exactly
+// that route whenever the desktop was closed, and zotio also takes it under
+// "auto" when the desktop cannot resolve the manifest's collection, which
+// would land the item unfiled with nothing saying why. "connector" fails
+// closed instead: a closed desktop fails the import rather than re-routing
+// it, and a collection the desktop cannot see yet comes back as a refusal
+// that Apply turns into a recorded fallback to filing after the import.
+//
+// "linked-file" gets no route, as in existingItemRoute: zotio creates that
+// item through the Web API and ignores "--via", so it needs no desktop and
+// must not wait for one.
+func newItemRoute(attachmentMode string) string {
+	if attachmentMode == "stored" {
+		return "connector"
+	}
+	return ""
+}
 
 // existingItemRoute names the route papio asks for when the Zotero item already
 // exists and only its file is missing. "connector" creates a throwaway parent

@@ -25,6 +25,34 @@ execution records kept during the initial build.
   feature. The handshake still lists 32 features. An older extension sees no
   change, and a daemon older than this one never receives the message.
 
+### Changed
+- **A new paper reaches its Zotero collection, with its DOI and abstract,
+  when Zotero desktop saves it.** Before, *papio* filed the paper and filled a
+  missing DOI and abstract after the import, through the Zotero Web API. The
+  Web API has the paper only after Zotero desktop syncs it, so both steps
+  waited for that sync, and never finished while sync was paused. *papio* now
+  gives the collection, the DOI and the abstract to zotio with the paper, and
+  Zotero desktop saves and files them in one session. The abstract comes from
+  the DOI registry (Crossref or DataCite), or from OpenAlex when the registry
+  has none and `[zotio] auto_enrich` is on; *papio* never replaces a value that
+  the registry supplied. The job's events record these steps as `applied`
+  with `with_import`. *papio* still runs the Web API steps after the import
+  when the save did not do them: for a paper that was already in your
+  library, for a collection name that matches no collection or more than one,
+  and for a save that zotio did not report as complete.
+- **In `stored` mode, a new paper goes to Zotero desktop only.** *papio* now
+  asks zotio for `--via connector` in place of `--via auto`. With `auto`, a
+  closed Zotero desktop sent the paper through the Web API, which stored the
+  PDF in Zotero's own file storage whatever storage you chose in Zotero. A
+  closed Zotero desktop now fails the import, and the import is tried again
+  later. If Zotero desktop does not
+  show the job's collection yet, for example a collection that the Web API
+  created before the desktop synced, zotio saves nothing. *papio* then records
+  the collection filing as `deferred`, imports the paper without the
+  collection in the same pass, and files it after the import as before. A
+  `linked-file` import does not change: it goes through the Web API, which
+  has the paper at once.
+
 ### Removed
 - **The experimental macOS helper that saved a PDF from Firefox's viewer.**
   The next extension release saves that PDF itself, with nothing to build or
@@ -114,14 +142,45 @@ execution records kept during the initial build.
   desktop has not synced the item. `papio activity` no longer shows a failed
   filing as "Filed into Zotero collection" or a failed enrichment as "Zotero
   metadata enriched".
-- **A paper acquired while Zotero desktop is closed reaches Zotero after you
-  open it.** When an import failed, the daemon tried again on each one-minute
-  maintenance pass. A closed Zotero refuses every import, so the daemon used
-  all five attempts in four minutes and then stopped. The paper stayed out of
-  Zotero after you opened it. The daemon now waits 1 minute, 10 minutes,
-  1 hour and 12 hours after each failed attempt. A paper that already used its
-  five attempts before you upgrade does not try again by itself; import it
-  with `papio zotio import-backfill --apply`.
+- **A paper acquired while Zotero desktop is closed waits for Zotero and
+  reaches it after you open it.** When an import failed, the daemon tried
+  again on each one-minute maintenance pass. A closed Zotero refuses every
+  import, so the daemon used all five attempts in four minutes and then
+  stopped. The paper stayed out of Zotero after you opened it, and nothing
+  told you. Now, when an import must go through Zotero desktop (every import in
+  `stored` mode), the daemon asks zotio whether Zotero runs before it tries. While Zotero is closed, the
+  paper waits. The daemon does not try the import, uses none of the five
+  attempts, and records one `waiting` import event for the paper. One
+  `zotio desktop wait` process sleeps until Zotero starts, and then the
+  daemon imports the waiting papers at once, at the usual pace. You get one
+  desktop notification when papers start to wait: "Zotero is closed. 3
+  papers are ready to add. Open Zotero and papio adds them." `papio activity`
+  and the extension show "Waiting for Zotero desktop", `papio status` shows
+  `import=waiting` and what to do, and the new `papio doctor` check
+  `zotero_desktop_waiting` gives the number of papers. When Zotero is open
+  but does not respond, or its connector is turned off, the papers also wait
+  without using attempts. Then every surface tells you to restart Zotero, or
+  to turn on "Allow other applications to communicate with Zotero" in its
+  Advanced settings, and you get one notification for that condition.
+  *papio* asks zotio again every 3 minutes, and imports the papers when
+  Zotero answers. The
+  `undelivered_zotero_imports` check no longer counts them, and a batch
+  report gives them the reason `import_waiting_for_zotero`. This needs a
+  zotio that has the `desktop status` and `desktop wait` commands. With an
+  older zotio, and for every other import failure, the daemon tries a failed
+  import again after 1 minute, 10 minutes, 1 hour and 12 hours. A paper that
+  already used its five attempts before you upgrade does not try again by
+  itself; import it with `papio zotio import-backfill --apply`.
+- **`papio zotio apply` refuses a plan whose zotio manifest changed after
+  the preview.** zotio reads the manifest from disk when it applies a new
+  item, but the plan's confirmation digest covered only the manifest's file
+  name. A manifest that changed after `papio zotio plan` was therefore applied
+  under the old confirmation. The plan now records the manifest's SHA-256, the
+  digest covers it, and the apply stops with `plan_confirmation_mismatch`
+  before zotio runs. Each plan also gets a manifest file of its own, so a
+  second plan for the same paper cannot rewrite the first plan's manifest. A
+  new-item plan made by an earlier *papio* has no manifest SHA-256 and is
+  refused; run `papio zotio plan` again.
 - **Times that *papio* compares inside one second are in the right order.**
   *papio* keeps each time in its database as text and compares the text. The
   text dropped the trailing zeros of the fraction of a second, so its order

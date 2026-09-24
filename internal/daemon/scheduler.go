@@ -73,6 +73,14 @@ func (rs MaintenanceRunners) RunDue(ctx context.Context) error {
 	return firstErr
 }
 
+// BackgroundRunner is a long-lived best-effort loop that runs beside
+// maintenance, such as a watcher that sleeps until an external event. Run
+// must return once ctx ends; the scheduler waits for it before Run returns,
+// so anything it started is gone by then.
+type BackgroundRunner interface {
+	Run(context.Context)
+}
+
 // SchedulerConfig controls worker, lease, polling, and periodic maintenance behavior.
 type SchedulerConfig struct {
 	Owner               string
@@ -82,6 +90,8 @@ type SchedulerConfig struct {
 	PollInterval        time.Duration
 	Maintenance         MaintenanceRunner
 	MaintenanceInterval time.Duration
+	// Background loops start with maintenance and stop with it.
+	Background []BackgroundRunner
 }
 
 // Scheduler claims durable jobs and processes them while renewing their lease.
@@ -161,7 +171,19 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	maintenanceDone := make(chan struct{})
 	go func() {
 		defer close(maintenanceDone)
+		var background sync.WaitGroup
+		for _, runner := range s.Config.Background {
+			if runner == nil {
+				continue
+			}
+			background.Add(1)
+			go func() {
+				defer background.Done()
+				runner.Run(runCtx)
+			}()
+		}
 		s.maintenance(runCtx)
+		background.Wait()
 	}()
 
 	errs := make(chan error, s.Config.Workers)
