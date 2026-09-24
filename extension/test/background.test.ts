@@ -10319,18 +10319,39 @@ class FakeWebRequest implements ViewerCaptureWebRequest {
       this.listeners.push({ callback, filter, extraInfoSpec });
     },
   };
+  /** Firefox hands a filter only to a blocking listener: a non-blocking one
+   * runs after the response has started streaming. */
+  private blocking = 0;
   filterResponseData(requestId: string): FakeStreamFilter {
+    if (this.blocking === 0) throw new Error("filterResponseData outside a blocking listener");
     const filter = new FakeStreamFilter();
     this.filters.set(requestId, filter);
     return filter;
   }
-  /** Headers of a top-level response, as Firefox would report them. */
-  async respond(details: { requestId: string; url: string; tabId: number; statusCode?: number; headers?: Record<string, string> }): Promise<void> {
-    const event: ViewerHeadersDetails = {
-      requestId: details.requestId, url: details.url, tabId: details.tabId, statusCode: details.statusCode ?? 200,
-      responseHeaders: Object.entries(details.headers ?? { "Content-Type": "application/pdf" }).map(([name, value]) => ({ name, value })),
-    };
-    for (const listener of this.listeners) expect(await listener.callback(event)).toEqual({});
+  /** Headers of a response, as Firefox would report them to each listener
+   * whose filter names the request's resource type. */
+  async respond(details: {
+    requestId: string; url: string; tabId: number; statusCode?: number; headers?: Record<string, string>;
+    type?: "main_frame" | "sub_frame" | "object" | "xmlhttprequest";
+  }): Promise<void> {
+    const type = details.type ?? "main_frame";
+    for (const listener of this.listeners) {
+      if (!listener.filter.types.includes(type)) continue;
+      const event: ViewerHeadersDetails = {
+        requestId: details.requestId, url: details.url, tabId: details.tabId, statusCode: details.statusCode ?? 200,
+        ...(listener.extraInfoSpec.includes("responseHeaders")
+          ? { responseHeaders: Object.entries(details.headers ?? { "Content-Type": "application/pdf" }).map(([name, value]) => ({ name, value })) }
+          : {}),
+      };
+      const blocking = listener.extraInfoSpec.includes("blocking");
+      if (blocking) this.blocking += 1;
+      try {
+        const result = listener.callback(event);
+        expect(blocking ? await result : {}).toEqual({});
+      } finally {
+        if (blocking) this.blocking -= 1;
+      }
+    }
   }
 }
 
@@ -10807,6 +10828,102 @@ for (const firefox of [true, false]) {
     expect(h.frames().slice(framesBefore).filter((f) => f.type === "provider_outcome" || f.type === "error")).toEqual([]);
   });
 }
+
+/** Replays job_272d01737a12bbb6a68958eab1 (2026-09-24, Firefox): the
+ * institutional route lands on the entitled open-access ScienceDirect
+ * article, and Firefox leaves its View PDF click to the operator. The operator
+ * clicks it 126 seconds into the drive, and ScienceDirect opens the PDF in a
+ * new tab that hits a Cloudflare challenge. The three-minute drive timeout
+ * then runs out while that child is open. A `surface_close_request` it sends
+ * is authorized, as the daemon authorized it live. */
+async function viewerChildOutlivesDrive() {
+  const ids = {
+    jobID: "job_viewer_child_outlived_drive",
+    candidateID: "cand_viewer_child_outlived",
+    claimID: "claim_viewer_child_outlived",
+    bindingID: "bind_viewer_child_outlived",
+  };
+  const providerHosts = ["resolver.example.edu", "www.sciencedirect.com"];
+  const articleURL = "https://www.sciencedirect.com/science/article/pii/S1877042811019240?via%3Dihub";
+  const h = makeHarness(undefined, { firefox: true, windows: true });
+  const web = new FakeWebRequest();
+  h.deps.webRequest = web;
+  h.deps.adapterSpecs = adapters;
+  let objectURLCount = 0;
+  h.deps.objectURLs = {
+    create: () => `blob:moz-extension://papio/${++objectURLCount}`,
+    revoke: () => {},
+  };
+  h.deps.permissions.contains = async () => true;
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["institutional_materialization_v1", "effect_permit_v1", AUTH_CLAIM, "surface_close_v1", "native_viewer_download_v2"],
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  const tabID = await navigatedClaimSurface(h, ids, articleURL, providerHosts);
+  const timeout = h.timers.filter((timer) => timer.ms === 180_000).at(-1);
+  expect(timeout).toBeDefined();
+  await h.tabs.completeNavigation(tabID, articleURL);
+  await ackClaimObservations(h, new Set<string>());
+  await settle();
+
+  // View PDF: ScienceDirect opens the PDF route in a new tab, and Cloudflare
+  // answers it with a challenge page.
+  h.clock.now += 126_000;
+  const childID = tabID + 1;
+  const challengeURL = "https://www.sciencedirect.com/science/article/pii/S1877042811019240/pdf?crasolve=1&r=8f2a";
+  const windowId = h.tabs.snapshot(tabID)?.windowId;
+  h.tabs.seed({ id: childID, url: "about:blank", openerTabId: tabID, ...(windowId === undefined ? {} : { windowId }) });
+  await h.tabs.onCreated.emit(h.tabs.snapshot(childID)!);
+  // The operator is looking at papio's window, now on the child.
+  if (windowId !== undefined) h.windows!.live.set(windowId, { id: windowId, state: "normal", focused: true });
+  await h.tabs.userActivate(childID);
+  await web.respond({ requestId: "challenge", url: challengeURL, tabId: childID, statusCode: 403,
+    headers: { "Content-Type": "text/html; charset=UTF-8" } });
+  await h.tabs.completeNavigation(childID, challengeURL);
+  await settle();
+
+  h.clock.now += 54_000;
+  const framesBefore = h.port.posted.length;
+  const timingOut = timeout!.fn();
+  for (let i = 0; i < 200; i += 1) await Promise.resolve();
+  const close = h.frames().slice(framesBefore).find((frame) => frame.type === "surface_close_request");
+  if (close !== undefined) {
+    await h.port.inbound(nativeResult("surface_close_response", {
+      request_id: close.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "close_viewer_child_outlived",
+      nonce: "nonce_viewer_child_outlived",
+      browser_holder_generation: 1,
+    }));
+  }
+  await timingOut;
+  await settle();
+  return { h, web, tabID, childID, ids, framesBefore };
+}
+
+test("a drive that runs out while the operator's View PDF child is open keeps the paper's tab and its capture", async () => {
+  const { h, web, tabID, childID, ids, framesBefore } = await viewerChildOutlivesDrive();
+  expect(h.frames().slice(framesBefore).map((frame) => frame.type)).not.toContain("surface_close_request");
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({ tab_id: tabID, parked_with_tab: true });
+
+  // The operator passes the check. The child returns to the article, which
+  // renders the signed PDF inside the page.
+  h.clock.now += 60_000;
+  await h.tabs.completeNavigation(childID,
+    "https://www.sciencedirect.com/science/article/pii/S1877042811019240?fr=RR-1&ref=cra_js_challenge");
+  await web.respond({ requestId: "inline-pdf", url: SIGNED_VIEWER, tabId: childID, type: "sub_frame" });
+  const filter = web.filters.get("inline-pdf");
+  expect(filter).toBeDefined();
+  filter!.deliver(SIGNED_PDF);
+  filter!.stop();
+  await settle();
+  expect(h.downloads.started.map((download) => download.filename)).toEqual([`papio/${ids.jobID}/paper.pdf`]);
+  expect(h.frames().filter((frame) => frame.type === "viewer_capture").map((frame) => frame.job_id)).toEqual([ids.jobID]);
+});
 
 // `papio actions open` for a paper whose claim already navigated its tab now
 // sends the daemon's candidate refresh followed by handoff_focus. The refresh

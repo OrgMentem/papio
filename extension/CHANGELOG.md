@@ -58,6 +58,15 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **Firefox keeps the paper's tab while its PDF is still opening in a new
+  tab.** On ScienceDirect, you click **View PDF** yourself on Firefox, and the
+  PDF opens in a new tab. When that tab stopped on a security check, *papio*'s
+  three-minute drive of the paper ran out first. *papio* then closed the
+  paper's tab and put the paper back in the queue, so it stopped watching the
+  new tab. When you passed the check, the PDF opened and *papio* saved nothing
+  (seen live on 2026-09-24). Now, when the drive runs out while such a tab is
+  open, *papio* only stops driving: the paper's tab stays open and the new tab
+  stays watched.
 - **A ScienceDirect PDF that you open yourself no longer stops papio's
   paper.** While *papio* worked on a ScienceDirect paper, any signed
   ScienceDirect PDF that you opened in a tab of your own counted as that

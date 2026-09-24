@@ -5304,6 +5304,19 @@ export class Bridge {
       this.handoffDriveTimeouts.delete(jobID);
       const current = findByJob(this.store, jobID);
       if (current !== undefined && current.tab_id === tabID) {
+        // The operator clicked View PDF and the paper's signed viewer is still
+        // on its way in the child tab that click opened - measured live
+        // 2026-09-24 on job_272d01737a, a Cloudflare challenge in that child
+        // outlasted this timeout by 80 minutes. That child is armed only
+        // while this job keeps its status (viewerRuleTabs), so re-queueing
+        // the job disarmed it, and closing this tab detached the job from the
+        // capture: the PDF then rendered and papio saved nothing. The drive
+        // is spent, so its slot is released; the surface and the job's
+        // status stay the operator's.
+        if (await this.liveViewerChild(jobID)) {
+          await this.parkHandoffForManual(jobID);
+          return;
+        }
         // `auth_pending` asserts that this paper's surface reached a login page
         // - signInBlockerCount's contract, and what the daemon acts on: it
         // records auth-return profile evidence, opens a HumanGateLogin, and
@@ -17402,6 +17415,21 @@ export class Bridge {
    * download binding; Firefox cannot steer that download. */
   private viewerRefetchAllowed(jobID: string): boolean {
     return !this.isFirefox() && this.viewerAttemptAllowed(jobID);
+  }
+
+  /** Whether an armed child tab of this job is still open, so the job's
+   * signed viewer response can still arrive there. A record whose tab closed
+   * while this page was not listening proves nothing. */
+  private async liveViewerChild(jobID: string): Promise<boolean> {
+    for (const tabID of this.viewerRules.armedChildTabs(jobID)) {
+      try {
+        await this.deps.tabs.get(tabID);
+        return true;
+      } catch {
+        // Gone: its onRemoved never reached this page.
+      }
+    }
+    return false;
   }
 
   /** The refetch produced no PDF: drop its file and history entry, then ask

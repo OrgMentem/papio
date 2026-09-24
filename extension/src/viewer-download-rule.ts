@@ -205,6 +205,16 @@ export class ViewerRuleSync {
     return this.viewerRuleTabs().get(tabID);
   }
 
+  /** The armed child tabs of this job: tabs its handoff tab opened (View PDF
+   * with target=_blank) while the job can still take its one signed-viewer
+   * response. That response can still arrive in a live one. */
+  armedChildTabs(jobID: string): number[] {
+    const armed = this.viewerRuleTabs();
+    return Object.entries(this.ctx.store().viewerChildTabs ?? {})
+      .filter(([child, owner]) => owner === jobID && armed.get(Number(child)) === jobID)
+      .map(([child]) => Number(child));
+  }
+
   /** Bring Chrome's session rules in line with `viewerRuleTabs`. Serialized,
    * and a no-op while the armed set is unchanged. A rejection (Chrome before
    * 128 has no response-header condition) marks the rules unsupported, which
