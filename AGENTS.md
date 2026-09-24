@@ -560,6 +560,15 @@ There is also a link check, because `zensical build` prints a broken link as an
   occupied by real work; `not_permitted` = the provider host grant is missing;
   `nav_failed: browser session disconnected …` = the transport teardown above, not a
   provider problem.
+- **"Offered" is not "driving": a `job_accept` with `disposition: "queued"` means the
+  browser holds no surface for that job.** The daemon tracks it in `queuedOffers`. A
+  requires-auth offer that reaches a worker without release evidence (after a reload,
+  say) becomes a tabless `engagement_required` park, and with `handoff_link_v1` the
+  extension keeps no URL for it; the extension's own evidence drain skips it by design,
+  so only a daemon re-offer moves it. Any daemon rule that assumes an offered job carries
+  itself forward must check `queuedOffers` — the session-evidence sweep's source
+  exemption in `reofferInstitutionalSiblings` did not, and stranded the only waiting
+  paper after a sign-in until `papio actions open`.
 
 ### Firefox / cross-browser extension
 - Firefox MV3 has **no service worker** — background is a classic **event-page iife**

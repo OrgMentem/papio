@@ -42,6 +42,17 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **A paper that the browser queued for sign-in now opens after you sign in
+  to your library.** When the extension had no sign-in evidence yet, for
+  example right after it reloaded, it accepted an institutional paper into
+  its queue without a tab and told the daemon `queued`. When you then signed
+  in, the daemon re-offered the papers that wait for your library, but it
+  treated the first paper already offered to the browser as the paper whose
+  own tab had carried the sign-in, and skipped it. When that paper was the
+  queued one, nothing re-offered it, and it waited until you ran
+  `papio actions open`. The daemon now re-offers that paper too when the
+  browser said it is only queued. A paper that the browser is driving is
+  still not offered twice.
 - **A sign-in on a new tab for your library is recorded again.** One library
   sign-in often serves many papers, and *papio* keeps one login record open
   across them. Each browser tab numbers its sign-in reports from zero, but

@@ -7917,6 +7917,16 @@ func (b *Bridge) handoffQuiescedByEvidence(
 
 // reofferInstitutionalSiblings lets poll reopen only the handoffs that a
 // returned institutional session can actually unlock. The caller holds b.mu.
+//
+// The source is exempt from its own release only because a browser surface
+// carries it forward: auth_returned names the tab that just came back, and
+// the evidence sweep prefers an already-offered handoff for that reason. A
+// source whose latest job_accept said "queued" has no such surface - the
+// extension parked it tabless, and with a fresh-link offer it no longer holds
+// the URL to open it - so it is released like any sibling. Measured live
+// 2026-09-24: a reloaded extension re-accepted the only open institutional
+// handoff as queued, both sign-in evidence frames picked it as the source and
+// skipped it, and the paper waited for an operator open.
 func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID string) error {
 	if b.arbitration.holderSession() == nil || b.now().Sub(b.arbitration.holderSession().LastSyncAt) > sessionStaleAfter {
 		return nil
@@ -7942,6 +7952,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 			break
 		}
 	}
+	sourceQueued := b.offered[sourceJobID] && b.queuedOffers[sourceJobID]
 	sourceProfile := ""
 	if source != nil {
 		sourceProfile = resolverProfileKey(source.Policy.Resolver)
@@ -7970,7 +7981,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		if pinnedSource == "" && sourceActionID != 0 {
 			b.reofferSourceJobID[profile] = sourceJobID
 		}
-		if sourceActionID != 0 {
+		if sourceActionID != 0 && !sourceQueued {
 			b.authReleased[sourceActionID] = true
 		}
 	}
@@ -8003,7 +8014,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		// completed. An explicit `papio actions open` still does. Both
 		// quiescence rules apply — the cheap age one here, the evidence one
 		// below once the cheap filters have narrowed the set.
-		if item.Row.ID == sourceJobID ||
+		if (item.Row.ID == sourceJobID && !sourceQueued) ||
 			!action.RequiresAuth ||
 			action.Quiesced(b.now()) ||
 			b.authReleased[action.ID] {

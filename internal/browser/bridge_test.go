@@ -3859,6 +3859,97 @@ func TestSessionEvidenceReoffersParkedOpenURLHandoffsNotManualDownloads(t *testi
 	}
 }
 
+// A paper the browser holds only in its queue has no surface carrying it
+// forward, so a sign-in must release it even when it is the handoff the
+// evidence sweep picks as its source. Measured live 2026-09-24: a dev reload
+// abandoned the paper's claim, the reloaded extension re-accepted the offer
+// as "queued" (a cold sign-in park, tabless), and the operator then signed in
+// to the library. Two session_evidence frames arrived; the sweep chose the
+// only open institutional handoff - this one - as its source and skipped it,
+// so nothing was re-offered, the extension never drove it, and the paper sat
+// queued for twenty minutes until an operator ran `papio actions open`.
+//
+// Live, the reloaded holder got the URL-bearing job_offer (recorded as
+// browser.handoff_offered) because the candidate scheduler gave that safety
+// domain's turn to an older sibling candidate. A holder without the
+// institutional materialization pair gets the same offer directly, so this
+// test uses one rather than rebuilding that backlog.
+func TestSessionEvidenceReleasesAQueuedSourceAfterReloadAbandonsItsClaim(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	jobID := parkInstitutional(t, jobs, "wr_signin_queue_source", handoffWork(), "")
+
+	// The first holder drives the paper: it holds a claim at its generation,
+	// accepts the offer as a drive, and its tab reaches the sign-in page.
+	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	if offer := firstOfType(msgs, protocol.MsgJobOffer); offer == nil || offer.JobID != jobID {
+		t.Fatalf("first holder offer = %v, want job_offer for %s", msgs, jobID)
+	}
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-signin-queue")
+	profiles, err := jobs.ListInstitutionProfiles(ctx, false)
+	if err != nil || len(profiles) == 0 {
+		t.Fatalf("list institution profiles: %v (%d)", err, len(profiles))
+	}
+	claim, err := jobs.ClaimMaterialization(ctx, job.MaterializationClaimInput{
+		CandidateID: candidateID, BrowserHolderGeneration: b.arbitration.generation(),
+		JobAttemptRevision: 1, InstitutionProfileRevision: profiles[0].Revision,
+		RouteRevision: 1, MaterializationKind: "browser_tab",
+		LeaseUntil: time.Now().UTC().Add(30 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSyncAs(t, b, sessA,
+		inFrame(t, protocol.MsgJobAccept, jobID, protocol.JobAcceptPayload{}),
+		inFrame(t, protocol.MsgAuthPending, jobID, map[string]any{}))
+
+	// A dev reload tears the extension down; it comes back as a new session.
+	if _, _, err := b.RequestDevReload(""); err != nil {
+		t.Fatalf("RequestDevReload: %v", err)
+	}
+	if msgs, _ := runSyncAs(t, b, sessA); firstOfType(msgs, protocol.MsgDevReload) == nil {
+		t.Fatalf("dev_reload not emitted: %v", msgs)
+	}
+	if _, err := b.Sync(ctx, sessA, true, nil); err != nil {
+		t.Fatalf("goodbye: %v", err)
+	}
+	const reloaded = "cccc3333cccc3333cccc3333cccc3333"
+	msgs, _ = runSyncAs(t, b, reloaded, helloAs("0.15.0"))
+	if got, err := jobs.GetMaterializationClaim(ctx, claim.ID); err != nil || got == nil || got.Phase != "abandoned" {
+		t.Fatalf("claim after reload = %+v, %v; want abandoned", got, err)
+	}
+	if offer := firstOfType(msgs, protocol.MsgJobOffer); offer == nil || offer.JobID != jobID {
+		t.Fatalf("reloaded holder offer = %v, want job_offer for %s", msgs, jobID)
+	}
+	// The reloaded worker has no evidence yet, so it parks the paper tabless
+	// and says so.
+	runSyncAs(t, b, reloaded, inFrame(t, protocol.MsgJobAccept, jobID,
+		protocol.JobAcceptPayload{Disposition: job.JobAcceptDispositionQueued}))
+
+	// The operator signs in; the resolver probe reports it.
+	msgs, _ = runSyncAs(t, b, reloaded, inFrame(t, protocol.MsgSessionEvidence, "", map[string]any{
+		"evidence":    "warm_verified",
+		"origin_hint": "https://openurl.example.edu",
+		"at":          "2026-09-24T05:02:42Z",
+	}))
+	if offer := firstOfType(msgs, protocol.MsgJobOffer); offer == nil || offer.JobID != jobID {
+		t.Fatalf("after sign-in evidence the queued paper was not re-offered: %v", msgs)
+	}
+	events, err := jobs.Events(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reoffered := false
+	for _, event := range events {
+		if event["kind"] == "browser.handoff_reoffered" {
+			reoffered = true
+		}
+	}
+	if !reoffered {
+		t.Fatal("the release recorded no browser.handoff_reoffered for the queued paper")
+	}
+}
+
 func TestSessionEvidenceOriginScopesReoffersToMatchingProfile(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	b.cfg.Browser.Resolvers = map[string]config.Institution{
