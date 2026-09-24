@@ -61,6 +61,21 @@ type DesktopStatus struct {
 // runs but does not answer yet is still starting, and the import would fail.
 func (s DesktopStatus) Ready() bool { return s.ConnectorReachable }
 
+// Desktop states zotio reports for a Zotero that runs past its startup window
+// with a connector that cannot take requests. Waiting does not end them;
+// the operator must restart Zotero or turn its connector on.
+const (
+	DesktopStateUnresponsive = "unresponsive"
+	DesktopStateConnectorOff = "connector_off"
+)
+
+// Stuck reports whether Zotero runs but its connector will not recover on its
+// own: it accepts connections and does not answer (unresponsive), or nothing
+// listens on its port (connector_off).
+func (s DesktopStatus) Stuck() bool {
+	return !s.Ready() && (s.State == DesktopStateUnresponsive || s.State == DesktopStateConnectorOff)
+}
+
 // ImportNeedsDesktop reports whether an import for a job must reach Zotero
 // desktop's connector. It derives from the same route choice PlanJobs makes,
 // so a route change moves both together: a route of "connector" fails
@@ -138,8 +153,10 @@ func (c *Client) DesktopStatus(ctx context.Context) (DesktopStatus, error) {
 // filesystem notifications, so this costs one sleeping process rather than a
 // poll, and it answers at once when the connector already accepts saves. A
 // timeout returns a status that is not Ready and a nil error; the caller
-// restarts the wait. Any other exit, such as zotio finding no Zotero profile,
-// is an error, so the caller backs off instead of respawning in a loop.
+// restarts the wait. A Zotero that runs but is stuck (DesktopStatus.Stuck)
+// returns at once with a nil error. Any other exit, such as zotio finding no
+// Zotero profile, is an error, so the caller backs off instead of respawning in
+// a loop.
 //
 // The waiter gets a stdin pipe that stays open for its whole life and asks
 // zotio to watch it: if the daemon dies without cancelling ctx, the pipe
@@ -173,6 +190,11 @@ func (c *Client) WaitForDesktop(ctx context.Context) (DesktopStatus, error) {
 	case decodeErr == nil && status.Outcome == "timeout":
 		// zotio exits non-zero on its own timeout. The wait ended without
 		// Zotero, which is an answer, not a failure.
+		return status, nil
+	case decodeErr == nil && status.Stuck():
+		// zotio exits 15 at once when Zotero runs but its connector cannot
+		// take requests. That is an answer too: the caller tells the
+		// operator and waits again later.
 		return status, nil
 	case decodeErr == nil && status.Outcome != "":
 		return DesktopStatus{}, fmt.Errorf("%w (outcome %s)", err, SanitizeErrorHint(status.Outcome))

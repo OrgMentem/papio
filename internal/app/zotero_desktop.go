@@ -30,7 +30,32 @@ const (
 	importStatusWaiting              = "waiting"
 	importReasonZoteroNotRunning     = "zotero_not_running"
 	importReasonConnectorUnreachable = "zotero_connector_unreachable"
+	// Zotero runs past its startup window with a connector that cannot take
+	// requests; waiting alone does not end these.
+	importReasonZoteroUnresponsive = "zotero_unresponsive"
+	importReasonConnectorOff       = "zotero_connector_off"
 )
+
+// desktopWaitReason names why an import waits, from the status that set
+// presence.
+func desktopWaitReason(status zotio.DesktopStatus) string {
+	switch {
+	case status.Stuck() && status.State == zotio.DesktopStateConnectorOff:
+		return importReasonConnectorOff
+	case status.Stuck():
+		return importReasonZoteroUnresponsive
+	case status.Running:
+		return importReasonConnectorUnreachable
+	default:
+		return importReasonZoteroNotRunning
+	}
+}
+
+// desktopStuckRewait is how long the watcher waits before it asks zotio again
+// about a Zotero that is open but stuck. zotio answers such a wait at once, and
+// nothing on disk announces a recovery, so this bounds the cost to one short
+// process per interval until the operator restarts Zotero.
+var desktopStuckRewait = 3 * time.Minute
 
 // desktopWaitRetryDelays space the restarts of a waiter that failed rather
 // than timed out, so a broken zotio costs one process per delay instead of a
@@ -53,9 +78,11 @@ type zoteroDesktopState struct {
 	presence desktopPresence
 	// lastStatus is the status that set presence, for the notification copy.
 	lastStatus zotio.DesktopStatus
-	// notified is set once the waiting notification for the current closed
-	// episode has been routed, and cleared when Zotero is ready again.
-	notified bool
+	// notified is the wait reason the current episode has already told the
+	// operator about; empty when nothing was sent. Zotero turning ready
+	// clears it, and a different reason (closed, then open but not
+	// responding) is a new thing to say.
+	notified string
 	// probeMu serializes status probes so concurrent imports ask zotio once.
 	probeMu sync.Mutex
 	// wake tells the watcher that an import waits. It holds at most one
@@ -93,7 +120,7 @@ func (d *zoteroDesktopState) set(status zotio.DesktopStatus) {
 	d.presence = next
 	d.lastStatus = status
 	if next == desktopReady {
-		d.notified = false
+		d.notified = ""
 	}
 }
 
@@ -141,23 +168,22 @@ func (s *Service) probeDesktop(ctx context.Context) desktopPresence {
 }
 
 // recordImportWaiting records that a job's import waits for Zotero desktop.
-// A job already waiting gets no second event, so a closed Zotero leaves one
-// durable event per job however many passes it spans. No attempt is counted:
+// A job already waiting for the same reason gets no second event, so a closed
+// Zotero leaves one durable event per job however many passes it spans; a
+// changed reason (closed, then open but not responding) records the new one so
+// every surface names the current remedy. No attempt is counted:
 // importNeedsRetry counts only error outcomes.
 func (s *Service) recordImportWaiting(ctx context.Context, row *job.Row) {
 	defer s.desktop.signal()
 	eventCtx := context.WithoutCancel(ctx)
+	s.desktop.mu.Lock()
+	reason := desktopWaitReason(s.desktop.lastStatus)
+	s.desktop.mu.Unlock()
 	if events, err := s.Jobs.Events(eventCtx, row.ID); err == nil {
-		if status, _, _ := settledImport(events); status == importStatusWaiting {
+		if status, previous := latestImportReason(events); status == importStatusWaiting && previous == reason {
 			return
 		}
 	}
-	reason := importReasonZoteroNotRunning
-	s.desktop.mu.Lock()
-	if s.desktop.lastStatus.Running {
-		reason = importReasonConnectorUnreachable
-	}
-	s.desktop.mu.Unlock()
 	_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", map[string]any{
 		"status": importStatusWaiting, "reason": reason,
 		"parent_key": "", "attachment_key": "",
@@ -175,19 +201,19 @@ func (s *Service) notifyImportsWaiting(ctx context.Context, waiting int, since t
 		return
 	}
 	s.desktop.mu.Lock()
-	if s.desktop.presence != desktopClosed || s.desktop.notified {
+	reason := desktopWaitReason(s.desktop.lastStatus)
+	if s.desktop.presence != desktopClosed || s.desktop.notified == reason {
 		s.desktop.mu.Unlock()
 		return
 	}
-	s.desktop.notified = true
-	running := s.desktop.lastStatus.Running
+	s.desktop.notified = reason
 	s.desktop.mu.Unlock()
 
-	message := zoteroWaitingMessage(waiting, running)
+	message := zoteroWaitingMessage(waiting, reason)
 	happened := s.Now().UTC()
 	intent := notify.Intent{
 		EventKind: "zotio.import_waiting", Category: notify.CategorySystemDegraded,
-		AggregateKey: "zotero:desktop_closed", Phase: notify.PhaseEpisode,
+		AggregateKey: "zotero:" + reason, Phase: notify.PhaseEpisode,
 		WindowStart: since.UTC(), HappenedAt: happened, Message: message,
 		Detail: notify.Event{Kind: "zotio.import_waiting", Message: message},
 	}
@@ -196,15 +222,37 @@ func (s *Service) notifyImportsWaiting(ctx context.Context, waiting int, since t
 	}
 }
 
-func zoteroWaitingMessage(waiting int, running bool) string {
-	state := "Zotero is closed."
-	if running {
-		state = "Zotero is not accepting papers yet."
+// zoteroWaitingMessage names the condition, the number of papers, and the one
+// action that ends the wait.
+func zoteroWaitingMessage(waiting int, reason string) string {
+	papers, them := "1 paper is", "it"
+	if waiting != 1 {
+		papers, them = fmt.Sprintf("%d papers are", waiting), "them"
 	}
-	if waiting == 1 {
-		return state + " 1 paper is ready to add. Open Zotero and papio adds it."
+	switch reason {
+	case importReasonZoteroUnresponsive:
+		return fmt.Sprintf("Zotero is open but not responding. %s ready to add. Restart Zotero and papio adds %s.", papers, them)
+	case importReasonConnectorOff:
+		return fmt.Sprintf("Zotero is open but does not accept papers from papio. %s ready to add. In Zotero, turn on Settings > Advanced > \"Allow other applications to communicate with Zotero\".", papers)
+	case importReasonConnectorUnreachable:
+		return fmt.Sprintf("Zotero is starting. %s ready to add. papio adds %s when Zotero is ready.", papers, them)
+	default:
+		return fmt.Sprintf("Zotero is closed. %s ready to add. Open Zotero and papio adds %s.", papers, them)
 	}
-	return fmt.Sprintf("%s %d papers are ready to add. Open Zotero and papio adds them.", state, waiting)
+}
+
+// latestImportReason returns the latest durable auto-import status and its
+// reason.
+func latestImportReason(events []map[string]any) (status, reason string) {
+	for _, event := range events {
+		if kind, _ := event["kind"].(string); kind != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		status, _ = detail["status"].(string)
+		reason, _ = detail["reason"].(string)
+	}
+	return status, reason
 }
 
 // ZoteroDesktopWatcher runs at most one `zotio desktop wait` while any import
@@ -274,8 +322,30 @@ func (w *ZoteroDesktopWatcher) waitUntilReady(ctx context.Context) {
 			return
 		}
 		w.failures = 0
+		if status.Stuck() {
+			// Zotero is open but its connector cannot take requests, and
+			// zotio answered at once. Record the new reason and tell the
+			// operator (the pass does both, once per reason), then ask
+			// again after a pause instead of respawning in a loop.
+			s.desktop.set(status)
+			if err := s.retryPendingImports(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("papio: import-retry pass after Zotero stopped responding: %v", err)
+			}
+			timer := time.NewTimer(desktopStuckRewait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
 		if !status.Ready() {
-			continue // zotio's timeout elapsed: restart the wait
+			// zotio's timeout elapsed: record what it saw, so a stuck Zotero
+			// the operator has since quit reads as closed again, and wait
+			// again.
+			s.desktop.set(status)
+			continue
 		}
 		s.desktop.set(status)
 		if err := s.retryPendingImports(ctx); err != nil && ctx.Err() == nil {

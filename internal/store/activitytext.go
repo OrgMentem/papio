@@ -123,6 +123,12 @@ func ActivityText(kind string, detail map[string]any) string {
 		case "skipped":
 			return "Zotero import skipped"
 		case "waiting":
+			switch activityDetailString(detail, "reason") {
+			case "zotero_unresponsive":
+				return "Waiting for Zotero desktop to respond (restart Zotero)"
+			case "zotero_connector_off":
+				return "Waiting for Zotero's connector (turn it on in Zotero)"
+			}
 			return "Waiting for Zotero desktop"
 		default:
 			return "Zotero import attempted"

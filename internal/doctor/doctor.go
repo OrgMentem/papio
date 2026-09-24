@@ -274,19 +274,19 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	if db == nil {
 		add("zotero_desktop_waiting", Skip, "papers waiting for Zotero desktop are checked by the daemon", "")
 	} else {
-		n, oldest, err := zoteroDesktopWaitingImports(ctx, db)
+		n, oldest, reason, err := zoteroDesktopWaitingImports(ctx, db)
 		switch {
 		case err != nil:
 			add("zotero_desktop_waiting", Warn, "papers waiting for Zotero desktop could not be counted", "inspect database permissions")
 		case n == 0:
 			add("zotero_desktop_waiting", Pass, "no paper is waiting for Zotero desktop", "")
 		default:
-			detail := fmt.Sprintf("Zotero desktop is closed: %d %s %s ready to add", n, plural(n, "paper", "papers"), plural(n, "is", "are"))
+			condition, remedy := zoteroDesktopWaitingCopy(reason)
+			detail := fmt.Sprintf("%s: %d %s %s ready to add", condition, n, plural(n, "paper", "papers"), plural(n, "is", "are"))
 			if oldest > 0 {
 				detail += fmt.Sprintf("; waiting for %s", oldest.Round(time.Minute))
 			}
-			add("zotero_desktop_waiting", Warn, detail,
-				"open Zotero desktop; papio notices it and adds the papers within a minute, spending none of their import attempts")
+			add("zotero_desktop_waiting", Warn, detail, remedy)
 		}
 	}
 
@@ -747,36 +747,59 @@ func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.D
 }
 
 // zoteroDesktopWaitingImports counts ready jobs whose latest durable
-// zotio.auto_import outcome is a wait for Zotero desktop, and how long the
-// oldest has waited. The daemon records that outcome only while zotio reports
-// Zotero closed, and replaces it with the import result once Zotero opens.
-func zoteroDesktopWaitingImports(ctx context.Context, db *store.Store) (int, time.Duration, error) {
+// zotio.auto_import outcome is a wait for Zotero desktop, how long the oldest
+// has waited, and the reason on the newest wait, which names the current
+// condition. The daemon records a wait only while zotio reports Zotero unable
+// to take connector saves, and replaces it with the import result once it can.
+func zoteroDesktopWaitingImports(ctx context.Context, db *store.Store) (int, time.Duration, string, error) {
 	row := db.DB().QueryRowContext(ctx, `
-		SELECT COUNT(*), COALESCE(MIN(e.at), '')
-		FROM jobs j
-		JOIN events e ON e.job_id = j.id
-		WHERE j.state = 'ready'
-		  AND json_extract(j.policy_json, '$.auto_import') = 1
-		  AND e.kind = 'zotio.auto_import'
-		  AND json_extract(e.detail_json, '$.status') = 'waiting'
-		  AND e.seq = (
-			SELECT MAX(e2.seq)
-			FROM events e2
-			WHERE e2.job_id = j.id AND e2.kind = 'zotio.auto_import'
-		  )`)
+		WITH waiting AS (
+			SELECT e.seq, e.at, json_extract(e.detail_json, '$.reason') AS reason
+			FROM jobs j
+			JOIN events e ON e.job_id = j.id
+			WHERE j.state = 'ready'
+			  AND json_extract(j.policy_json, '$.auto_import') = 1
+			  AND e.kind = 'zotio.auto_import'
+			  AND json_extract(e.detail_json, '$.status') = 'waiting'
+			  AND e.seq = (
+				SELECT MAX(e2.seq)
+				FROM events e2
+				WHERE e2.job_id = j.id AND e2.kind = 'zotio.auto_import'
+			  )
+		)
+		SELECT COUNT(*), COALESCE(MIN(at), ''),
+		       COALESCE((SELECT reason FROM waiting ORDER BY seq DESC LIMIT 1), '')
+		FROM waiting`)
 	var n int
-	var oldest string
-	if err := row.Scan(&n, &oldest); err != nil {
-		return 0, 0, err
+	var oldest, reason string
+	if err := row.Scan(&n, &oldest, &reason); err != nil {
+		return 0, 0, "", err
 	}
 	if n == 0 || oldest == "" {
-		return n, 0, nil
+		return n, 0, reason, nil
 	}
 	since, err := time.Parse(time.RFC3339Nano, oldest)
 	if err != nil {
-		return n, 0, nil
+		return n, 0, reason, nil
 	}
-	return n, time.Since(since), nil
+	return n, time.Since(since), reason, nil
+}
+
+// zoteroDesktopWaitingCopy names the condition behind a wait and the one
+// action that ends it. An open Zotero that does not answer needs a restart,
+// not "open Zotero".
+func zoteroDesktopWaitingCopy(reason string) (condition, remedy string) {
+	const spent = "; papio notices it and adds the papers within minutes, spending none of their import attempts"
+	switch reason {
+	case "zotero_unresponsive":
+		return "Zotero desktop is open but not responding", "restart Zotero desktop" + spent
+	case "zotero_connector_off":
+		return "Zotero desktop is open but does not accept papers from papio",
+			`in Zotero, turn on Settings > Advanced > "Allow other applications to communicate with Zotero"` + spent
+	case "zotero_connector_unreachable":
+		return "Zotero desktop is starting", "wait for Zotero desktop to finish starting, or restart it if it does not" + spent
+	}
+	return "Zotero desktop is closed", "open Zotero desktop" + spent
 }
 
 // zoteroFileStorageRefusedRecency is how long a failed Zotero apply in the

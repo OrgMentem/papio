@@ -130,7 +130,13 @@ execution records kept during the initial build.
   papers are ready to add. Open Zotero and papio adds them." `papio activity`
   and the extension show "Waiting for Zotero desktop", `papio status` shows
   `import=waiting` and what to do, and the new `papio doctor` check
-  `zotero_desktop_waiting` gives the number of papers. The
+  `zotero_desktop_waiting` gives the number of papers. When Zotero is open
+  but does not respond, or its connector is turned off, the papers also wait
+  without using attempts. Then every surface tells you to restart Zotero, or
+  to turn on "Allow other applications to communicate with Zotero" in its
+  Advanced settings, and you get one notification for that condition.
+  *papio* asks zotio again every 3 minutes, and imports the papers when
+  Zotero answers. The
   `undelivered_zotero_imports` check no longer counts them, and a batch
   report gives them the reason `import_waiting_for_zotero`. This needs a
   zotio that has the `desktop status` and `desktop wait` commands. With an

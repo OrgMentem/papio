@@ -139,7 +139,10 @@ repeats a step the Web API refused with 404 after 1 minute, and then after
 When Zotero desktop is closed, *papio* does not spend an import attempt on a
 paper that needs it: the paper waits, `papio activity` shows "Waiting for Zotero
 desktop", and you get one notification. Open Zotero and *papio* imports the waiting papers
-within seconds. This needs a zotio with the `desktop status` and `desktop wait`
+within seconds. When Zotero is open but does not respond, *papio* tells you to
+restart it; when its connector is off, *papio* tells you to turn on
+"Allow other applications to communicate with Zotero" in Zotero's Advanced
+settings. This needs a zotio with the `desktop status` and `desktop wait`
 commands; with an older zotio, *papio* tries a failed import again after 1
 minute, 10 minutes, 1 hour, and 12 hours, and then stops.
 

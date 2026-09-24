@@ -22,6 +22,9 @@ type fakeZoteroDesktop struct {
 	open        bool
 	unsupported bool
 	waitErr     error
+	// stuck is a zotio state ("unresponsive", "connector_off") for a Zotero
+	// that runs while its connector cannot take requests.
+	stuck       string
 	opened      chan struct{}
 	statusCalls int
 	waitCalls   int
@@ -41,6 +44,9 @@ func (f *fakeZoteroDesktop) DesktopStatus(context.Context) (zotio.DesktopStatus,
 	if f.unsupported {
 		return zotio.DesktopStatus{}, zotio.ErrDesktopPresenceUnsupported
 	}
+	if f.stuck != "" {
+		return zotio.DesktopStatus{Running: true, State: f.stuck}, nil
+	}
 	return zotio.DesktopStatus{Running: f.open, ConnectorReachable: f.open}, nil
 }
 
@@ -49,7 +55,7 @@ func (f *fakeZoteroDesktop) WaitForDesktop(ctx context.Context) (zotio.DesktopSt
 	f.waitCalls++
 	f.activeWaits++
 	f.maxWaits = max(f.maxWaits, f.activeWaits)
-	opened, waitErr := f.opened, f.waitErr
+	opened, waitErr, stuck := f.opened, f.waitErr, f.stuck
 	f.mu.Unlock()
 	defer func() {
 		f.mu.Lock()
@@ -58,6 +64,10 @@ func (f *fakeZoteroDesktop) WaitForDesktop(ctx context.Context) (zotio.DesktopSt
 	}()
 	if waitErr != nil {
 		return zotio.DesktopStatus{}, waitErr
+	}
+	if stuck != "" {
+		// zotio answers a stuck Zotero at once (exit 15).
+		return zotio.DesktopStatus{Running: true, State: stuck, Outcome: stuck}, nil
 	}
 	select {
 	case <-ctx.Done():
@@ -89,6 +99,12 @@ func (f *fakeZoteroDesktop) PlanAndApply(_ context.Context, jobID string) (strin
 		return "", "UMXT6G74", "", zotio.WithErrorInfo(errors.New("applying Zotio mutation: checking for a resumable connector attachment: looking for a resumable temporary parent: connector refused"))
 	}
 	return "applied", "UMXT6G74", "ATTACH01", nil
+}
+
+func (f *fakeZoteroDesktop) setStuck(state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stuck = state
 }
 
 func (f *fakeZoteroDesktop) counts() (status, wait, imports, maxWaits int) {
@@ -460,5 +476,111 @@ func TestStoredNewItemImportWaitsForZotero(t *testing.T) {
 	}
 	if _, _, imports, _ := desktop.counts(); imports != 0 {
 		t.Fatalf("connector save attempted %d times while Zotero was closed, want 0", imports)
+	}
+}
+
+// lockedSink records intents routed from the watcher's goroutine.
+type lockedSink struct {
+	mu      sync.Mutex
+	intents []notify.Intent
+}
+
+func (l *lockedSink) Route(_ context.Context, intent notify.Intent) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.intents = append(l.intents, intent)
+	return nil
+}
+
+func (l *lockedSink) waitingMessages() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, intent := range l.intents {
+		if intent.EventKind == "zotio.import_waiting" {
+			out = append(out, intent.Message)
+		}
+	}
+	return out
+}
+
+func importReasons(t *testing.T, jobs *job.Store, id string) []string {
+	t.Helper()
+	events, err := jobs.Events(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, event := range events {
+		if event["kind"] == "zotio.auto_import" {
+			detail, _ := event["detail"].(map[string]any)
+			status, _ := detail["status"].(string)
+			reason, _ := detail["reason"].(string)
+			out = append(out, status+":"+reason)
+		}
+	}
+	return out
+}
+
+// Seen live 2026-09-24: Zotero was open and held its profile lock, its
+// connector port accepted connections, and nothing answered. "Open Zotero" is
+// the wrong advice then. papio must say to restart it, once for that
+// condition, keep the papers waiting without spending attempts, ask zotio
+// again only after a pause, and import as soon as Zotero answers.
+func TestStuckZoteroSaysRestartOnceAndRewaitsWithoutSpendingAttempts(t *testing.T) {
+	ctx := context.Background()
+	previous := desktopStuckRewait
+	desktopStuckRewait = 20 * time.Millisecond
+	t.Cleanup(func() { desktopStuckRewait = previous })
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	readyPipeline(svc)
+	desktop := newFakeZoteroDesktop()
+	svc.AutoImporter = desktop
+	svc.ZoteroDesktop = desktop
+	sink := &lockedSink{}
+	svc.Notifier = sink
+	id := seedReadyExistingItemJob(t, svc, jobs, "wr_zotero_stuck")
+	if err := svc.ImportRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	desktop.setStuck(zotio.DesktopStateUnresponsive)
+	watchCtx, stop := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.ZoteroDesktopWatcher().Run(watchCtx)
+	}()
+	waitFor(t, "several stuck re-waits", func() bool {
+		_, waits, _, _ := desktop.counts()
+		return waits >= 4
+	})
+	messages := sink.waitingMessages()
+	want := []string{
+		"Zotero is closed. 1 paper is ready to add. Open Zotero and papio adds it.",
+		"Zotero is open but not responding. 1 paper is ready to add. Restart Zotero and papio adds it.",
+	}
+	if strings.Join(messages, "|") != strings.Join(want, "|") {
+		t.Fatalf("notices = %q, want %q (one per condition, not one per re-wait)", messages, want)
+	}
+	if got := strings.Join(importReasons(t, jobs, id), ","); got != "waiting:zotero_not_running,waiting:zotero_unresponsive" {
+		t.Fatalf("import events = %s, want one wait per condition", got)
+	}
+	if _, _, imports, maxWaits := desktop.counts(); imports != 0 || maxWaits != 1 {
+		t.Fatalf("while stuck: imports=%d concurrent waiters=%d, want 0 and 1", imports, maxWaits)
+	}
+
+	// The operator restarts Zotero; the next re-wait sees it answer.
+	desktop.setStuck("")
+	desktop.setOpen(true)
+	waitFor(t, "the import after Zotero was restarted", func() bool {
+		got := autoImportStatuses(t, jobs, id)
+		return len(got) > 0 && got[len(got)-1] == "applied"
+	})
+	stop()
+	<-done
+	if n := len(sink.waitingMessages()); n != 2 {
+		t.Fatalf("notices after recovery = %d, want still 2", n)
 	}
 }

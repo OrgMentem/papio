@@ -79,10 +79,12 @@ func TestWaitForDesktopOutcomes(t *testing.T) {
 		wantReady bool
 		wantErr   string
 	}{
-		"ready":      {stdout: `{"running":true,"connector_reachable":true,"state":"ready","outcome":"ready","waited_ms":1200}`, wantReady: true},
-		"timeout":    {stdout: `{"running":false,"connector_reachable":false,"state":"stopped","outcome":"timeout"}`, err: errors.New("exit status 14")},
-		"no profile": {stdout: `{"running":false,"connector_reachable":false,"state":"stopped","outcome":"no_profile"}`, err: errors.New("exit status 9"), wantErr: "no_profile"},
-		"signalled":  {err: errors.New("exit status 1"), wantErr: "exit status 1"},
+		"ready":         {stdout: `{"running":true,"connector_reachable":true,"state":"ready","outcome":"ready","waited_ms":1200}`, wantReady: true},
+		"timeout":       {stdout: `{"running":false,"connector_reachable":false,"state":"stopped","outcome":"timeout"}`, err: errors.New("exit status 14")},
+		"unresponsive":  {stdout: `{"running":true,"connector_reachable":false,"state":"unresponsive","outcome":"unresponsive"}`, err: errors.New("exit status 15")},
+		"connector off": {stdout: `{"running":true,"connector_reachable":false,"state":"connector_off","outcome":"connector_off"}`, err: errors.New("exit status 15")},
+		"no profile":    {stdout: `{"running":false,"connector_reachable":false,"state":"stopped","outcome":"no_profile"}`, err: errors.New("exit status 9"), wantErr: "no_profile"},
+		"signalled":     {err: errors.New("exit status 1"), wantErr: "exit status 1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var waitArgs string

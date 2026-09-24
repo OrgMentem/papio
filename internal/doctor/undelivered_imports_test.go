@@ -103,6 +103,18 @@ func TestRunReportsPapersWaitingForZoteroDesktop(t *testing.T) {
 		t.Fatalf("undelivered = %+v, want only the failed import counted", undelivered)
 	}
 
+	// When the newest wait says Zotero is open but not responding, doctor
+	// says restart it, not open it.
+	stuckSince := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	seedReadyImport(t, db, "job_waiting_stuck", stuckSince, true, "waiting")
+	if _, err := db.DB().ExecContext(ctx, `UPDATE events SET detail_json = json_set(detail_json, '$.reason', 'zotero_unresponsive') WHERE job_id = 'job_waiting_stuck'`); err != nil {
+		t.Fatal(err)
+	}
+	stuck := importCheck(t, ctx, db, "zotero_desktop_waiting")
+	if !strings.Contains(stuck.Detail, "open but not responding: 3 papers") || !strings.HasPrefix(stuck.Remediation, "restart Zotero desktop") {
+		t.Fatalf("stuck zotero_desktop_waiting = %+v, want the restart remedy for 3 papers", stuck)
+	}
+
 	empty, err := store.Open(ctx, storetest.DataDir(t))
 	if err != nil {
 		t.Fatal(err)

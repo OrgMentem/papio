@@ -200,9 +200,8 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 		if group == "ready" {
 			item.ImportStatus = autoImportStatus(detail.Events)
 			if item.ImportStatus == "waiting" {
-				// A closed Zotero is a wait, not a failed import: say what
-				// ends it.
-				item.Guidance = "Zotero desktop is closed. Open Zotero and papio adds these papers."
+				// A wait for Zotero is not a failed import: say what ends it.
+				item.Guidance = zoteroWaitingGuidance(autoImportReason(detail.Events))
 			}
 		}
 		groups[group] = append(groups[group], item)
@@ -294,6 +293,28 @@ func autoImportStatus(events []map[string]any) string {
 		}
 	}
 	return "—"
+}
+
+// autoImportReason is the reason on the latest zotio.auto_import event.
+func autoImportReason(events []map[string]any) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] == "zotio.auto_import" {
+			return eventDetailString(events[i], "reason")
+		}
+	}
+	return ""
+}
+
+func zoteroWaitingGuidance(reason string) string {
+	switch reason {
+	case "zotero_unresponsive":
+		return "Zotero desktop is open but not responding. Restart Zotero and papio adds these papers."
+	case "zotero_connector_off":
+		return "Zotero desktop does not accept papers from papio. In Zotero, turn on Settings > Advanced > \"Allow other applications to communicate with Zotero\"."
+	case "zotero_connector_unreachable":
+		return "Zotero desktop is starting. papio adds these papers when it is ready."
+	}
+	return "Zotero desktop is closed. Open Zotero and papio adds these papers."
 }
 
 func eventDetailString(event map[string]any, key string) string {
