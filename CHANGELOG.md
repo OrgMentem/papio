@@ -38,6 +38,11 @@ execution records kept during the initial build.
   daemon now compares a report only with the earlier reports from the same
   tab. A late report from that tab is still refused, and the log now says
   why. This change adds database migration 55.
+- **`papio actions open` shows a paper's tab again after papio has opened
+  the paper's route.** When *papio* had already sent the paper's tab to the
+  library, the command recorded the open and did nothing in the browser. It
+  now brings that tab to the front. It does not open a second tab, and it does
+  not load the route again. This works with extension 0.15.0 and later.
 
 ## [0.22.1] - 2026-09-23
 

@@ -2959,6 +2959,64 @@ func TestInstitutionalCandidateOfferReoffersUntilClaim(t *testing.T) {
 	}
 }
 
+// TestExplicitOpenFocusesTheNavigatedSurface replays `papio actions open --job
+// job_cb931061ba…` on 2026-09-24 (00:17:40 and 00:24:45 UTC). The paper's
+// claim had navigated tab 9105, which was still open. The explicit-focus loop
+// serviced the candidate and skipped the focus frame, and the extension reads
+// a same-candidate offer for a navigated claim as a lease refresh. Both opens
+// recorded handoff.opened and did nothing in the browser. The open must raise
+// the surface the claim already drove, and must not authorize a second
+// navigation.
+func TestExplicitOpenFocusesTheNavigatedSurface(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	jobID := parkInstitutional(t, jobs, "explicit-open-navigated", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-explicit-open-navigated")
+	bindingID := bindCandidate(t, b, jobID, candidateID, "explicit-open-navigated", 9105)
+	claim, err := jobs.MaterializationClaimByBindingID(ctx, bindingID)
+	if err != nil || claim == nil {
+		t.Fatalf("bound claim = %+v, %v", claim, err)
+	}
+	routed, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalRouteRequest, jobID,
+		protocol.InstitutionalRouteRequestPayload{
+			RequestID: "explicit-open-navigated-route", ClaimID: claim.ID, BindingID: bindingID,
+			InstitutionalRequestID: "explicit-open-navigated-request",
+		}))
+	route := firstOfType(routed, protocol.MsgInstitutionalRouteResponse)
+	if route == nil || route.Payload.(*protocol.InstitutionalRouteResponsePayload).Outcome != "issued" {
+		t.Fatalf("route = %v, want issued", routed)
+	}
+	issued := route.Payload.(*protocol.InstitutionalRouteResponsePayload)
+	navigated, _ := runSync(t, b, inFrame(t, protocol.MsgInstitutionalNavigatedRequest, jobID,
+		protocol.InstitutionalNavigatedRequestPayload{
+			RequestID: "explicit-open-navigated-navigated", ClaimID: claim.ID, BindingID: bindingID,
+			RouteIssuanceOrdinal: issued.RouteIssuanceOrdinal, EffectOrdinal: issued.EffectOrdinal,
+			InstitutionalRequestID: "explicit-open-navigated-request", TabID: 9105,
+		}))
+	if ack := firstOfType(navigated, protocol.MsgInstitutionalNavigatedResponse); ack == nil ||
+		ack.Payload.(*protocol.InstitutionalNavigatedResponsePayload).Outcome != "acknowledged" {
+		t.Fatalf("navigated = %v, want acknowledged", navigated)
+	}
+
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	opened, _ := runSync(t, b)
+	focus := firstOfType(opened, protocol.MsgHandoffFocus)
+	if focus == nil || focus.JobID != jobID {
+		t.Fatalf("explicit open of a navigated claim sent no handoff_focus: %v", opened)
+	}
+	after, err := jobs.GetMaterializationClaim(ctx, claim.ID)
+	if err != nil || after == nil || after.Phase != "navigated" || after.TabID != 9105 || after.RouteIssuanceOrdinal != issued.RouteIssuanceOrdinal {
+		t.Fatalf("claim after the open = %+v, %v; want the same navigated surface and no new route", after, err)
+	}
+	again, _ := runSync(t, b)
+	if firstOfType(again, protocol.MsgHandoffFocus) != nil {
+		t.Fatalf("one open focused the surface twice: %v", again)
+	}
+}
+
 // TestFocusedOfferSurvivesACancelledSiblingOnTheSameDomain pins the operator's own
 // request against delay by a corpse, through the whole chain: the real scheduler,
 // the bridge's one-candidate-per-safety-domain admission, and the offer frame.

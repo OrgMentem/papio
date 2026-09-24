@@ -10707,6 +10707,31 @@ test("Chrome adopts the article's CDN PDF viewer after a sign-in that outlived t
   expect(h.downloads.started.map((download) => download.filename)).toEqual([`papio/${ids.jobID}/paper.pdf`]);
 });
 
+// `papio actions open` for a paper whose claim already navigated its tab now
+// sends the daemon's candidate refresh followed by handoff_focus. The refresh
+// hands a detached job its surface back, and the focus raises that tab. It
+// must not open a tab or navigate the one the operator signed in on.
+test("an explicit open of a navigated claim raises its tab and navigates nothing", async () => {
+  const { h, tabID, ids } = await signInOutlivesDrive({ firefox: true });
+  const createdBefore = h.tabs.created.length;
+  const updatesBefore = h.tabs.updates.length;
+  await h.port.inbound(claimSurfaceOffer(ids, ["resolver.example.edu", "www.sciencedirect.com"], "2030-01-03T00:00:00Z"));
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "handoff_focus",
+    msg_id: "handoff_focus_navigated_claim",
+    seq: 8,
+    job_id: ids.jobID,
+    payload: {},
+  });
+  await settle();
+  const updates = h.tabs.updates.slice(updatesBefore);
+  expect(updates).toContainEqual({ id: tabID, properties: { active: true } });
+  expect(updates.some((update) => update.properties.url !== undefined)).toBe(false);
+  expect(h.tabs.created).toHaveLength(createdBefore);
+  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(tabID);
+});
+
 test("Chrome registers no webRequest listener and keeps its viewer rules", async () => {
   const { h, web, rules, pdfHeaders } = await captureHarness({ chrome: true });
   expect(web.listeners).toEqual([]);

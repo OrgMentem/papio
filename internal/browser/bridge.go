@@ -11313,6 +11313,31 @@ jobLoop:
 				if frame != nil {
 					out = append(out, frame)
 				}
+				// A claim that has already navigated its surface has nothing
+				// left for the candidate offer to do: the extension reads a
+				// same-candidate offer as a lease refresh, so the operator's
+				// Open changed nothing on screen. Measured live 2026-09-24:
+				// two `papio actions open` for job_cb931061ba recorded
+				// handoff.opened while its claim sat on tab 9105, and no tab
+				// moved. handoff_focus raises the job's own tab (it navigates
+				// nothing when the job holds a tab), and the offer above goes
+				// first so a job detached from that tab is handed it back. A
+				// claim with no surface yet keeps the offer alone: that offer
+				// is what builds the surface.
+				if surfaced, surfaceErr := b.materializationSurfaceBound(ctx, id); surfaceErr != nil {
+					log.Printf("papio: reading the focused materialization surface for %s: %v", id, surfaceErr)
+				} else if surfaced {
+					focusFrame, frameErr := b.frame(protocol.MsgHandoffFocus, id, protocol.EmptyPayload{})
+					if frameErr != nil {
+						return nil, frameErr
+					}
+					out = append(out, focusFrame)
+					delete(b.focusPending, id)
+					focused++
+					if focused >= maxFocusFramesPerPoll {
+						break
+					}
+				}
 				continue
 			}
 			if !b.offered[id] && b.providerDriveEpochAvailable() {
@@ -11504,6 +11529,22 @@ jobLoop:
 		}
 	}
 	return out, nil
+}
+
+// materializationSurfaceBound reports whether jobID's current attempt holds a
+// live claim, under the current holder generation, that has already navigated
+// a browser tab. Only such a claim has a surface an explicit Open can raise
+// instead of build. The caller holds b.mu.
+func (b *Bridge) materializationSurfaceBound(ctx context.Context, jobID string) (bool, error) {
+	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	claim, _, err := b.jobs.LiveMaterializationClaimForJob(ctx, jobID, attempt, b.arbitration.generation())
+	if err != nil || claim == nil {
+		return false, err
+	}
+	return claim.Phase == "navigated" && claim.TabID > 0, nil
 }
 
 // serviceMaterializationCandidate resolves, refreshes, or clears one
