@@ -4,6 +4,8 @@ package store_test
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,5 +77,102 @@ func TestOpenRewritesStoredTimestampsToFixedWidth(t *testing.T) {
 	}
 	if stats.Acquired != 1 || stats.Producers[job.ProducerAdapter] != 1 || stats.Producers[job.ProducerManual] != 0 || stats.Unrecorded != 1 {
 		t.Fatalf("stats over migrated rows = %+v, want only the adapter event and the unrecorded promotion", stats)
+	}
+}
+
+// Migration 0056 must agree with the parser papio reads timestamps with: a
+// value time.RFC3339Nano accepts becomes FormatTime of that exact instant,
+// whatever its offset or fraction width, and a value it rejects stays as it is.
+func TestOpenRewritesEveryRFC3339FormToUTCAndLeavesOtherTextAlone(t *testing.T) {
+	ctx := context.Background()
+	converted := map[string]string{
+		// Offsets of both signs, across a day, a month and a year.
+		"2026-01-01T02:00:00+08:00":           "2025-12-31T18:00:00.000000000Z",
+		"2026-12-31T23:30:00.5-05:00":         "2027-01-01T04:30:00.500000000Z",
+		"2026-02-28T22:15:00.123456789-02:45": "2026-03-01T01:00:00.123456789Z",
+		"2026-03-01T00:10:00+05:30":           "2026-02-28T18:40:00.000000000Z",
+		"2024-03-01T01:00:00.25+14:00":        "2024-02-29T11:00:00.250000000Z",
+		"2026-09-24T06:19:05-00:00":           "2026-09-24T06:19:05.000000000Z",
+		"2026-09-24T06:19:05+00:00":           "2026-09-24T06:19:05.000000000Z",
+		// Every fraction width in UTC; nine digits is already the fixed form.
+		"2026-09-24T06:19:05Z":           "2026-09-24T06:19:05.000000000Z",
+		"2026-09-24T06:19:05.1Z":         "2026-09-24T06:19:05.100000000Z",
+		"2026-09-24T06:19:05.12Z":        "2026-09-24T06:19:05.120000000Z",
+		"2026-09-24T06:19:05.123Z":       "2026-09-24T06:19:05.123000000Z",
+		"2026-09-24T06:19:05.1234Z":      "2026-09-24T06:19:05.123400000Z",
+		"2026-09-24T06:19:05.12345Z":     "2026-09-24T06:19:05.123450000Z",
+		"2026-09-24T06:19:05.123456Z":    "2026-09-24T06:19:05.123456000Z",
+		"2026-09-24T06:19:05.1234567Z":   "2026-09-24T06:19:05.123456700Z",
+		"2026-09-24T06:19:05.12345678Z":  "2026-09-24T06:19:05.123456780Z",
+		"2026-09-24T06:19:05.123456789Z": "2026-09-24T06:19:05.123456789Z",
+		"2026-09-24T06:19:05.000000000Z": "2026-09-24T06:19:05.000000000Z",
+		// Every fraction width with an offset.
+		"2026-09-24T14:19:05.1+08:00":         "2026-09-24T06:19:05.100000000Z",
+		"2026-09-24T14:19:05.1234+08:00":      "2026-09-24T06:19:05.123400000Z",
+		"2026-09-24T01:19:05.12345678-05:00":  "2026-09-24T06:19:05.123456780Z",
+		"2026-09-24T01:19:05.000000001-05:00": "2026-09-24T06:19:05.000000001Z",
+	}
+	untouched := []string{
+		"2026-13-99T88:77:66Z",
+		"2026-00-10T00:00:00Z",
+		"2026-02-29T00:00:00Z", // not a leap year
+		"2026-04-31T00:00:00Z",
+		"2026-01-01T24:00:00Z",
+		"2026-01-01T23:60:00Z",
+		"2026-01-01T23:59:60Z",
+		"2026-01-01T00:00:00.Z",
+		"2026-01-01T00:00:00.12a4Z",
+		"2026-01-01T00:00:00",
+		"2026-01-01T00:00:00+0800",
+		"2026-01-01T00:00:00+8:00",
+		"2026-01-01 00:00:00Z",
+		"2026-09",
+		"not a timestamp",
+	}
+	var seed strings.Builder
+	seed.WriteString(`INSERT INTO events(job_id, at, kind, detail_json) VALUES `)
+	values := make([]string, 0, len(converted)+len(untouched))
+	for old := range converted {
+		values = append(values, old)
+	}
+	values = append(values, untouched...)
+	for i, old := range values {
+		if i > 0 {
+			seed.WriteString(", ")
+		}
+		fmt.Fprintf(&seed, "('case-%d', '%s', 'fixture', '{}')", i, old)
+	}
+	db, err := store.Open(ctx, schemaFixture(t, 55, seed.String()+";"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	stored := func(i int) string {
+		t.Helper()
+		var got string
+		if err := db.DB().QueryRowContext(ctx, `SELECT at FROM events WHERE job_id = ?`, fmt.Sprintf("case-%d", i)).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	for i, old := range values {
+		got := stored(i)
+		parsed, parseErr := time.Parse(time.RFC3339Nano, old)
+		if want, ok := converted[old]; ok {
+			if parseErr != nil || store.FormatTime(parsed) != want {
+				t.Fatalf("case %q: Go reads %s (%v), which is not the expected %q", old, parsed, parseErr, want)
+			}
+			if got != want {
+				t.Errorf("0056 rewrote %q to %q, want %q", old, got, want)
+			}
+			continue
+		}
+		if parseErr == nil {
+			t.Fatalf("case %q is a valid time.RFC3339Nano value, so it cannot be left as it is", old)
+		}
+		if got != old {
+			t.Errorf("0056 rewrote non-timestamp text %q to %q, want it unchanged", old, got)
+		}
 	}
 }
