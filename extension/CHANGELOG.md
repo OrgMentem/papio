@@ -49,6 +49,16 @@ for the full pre-split extension history.
   forgotten when this version loads it. With an older daemon that still has the
   helper set up, nothing changes except that the helper is never used.
 
+### Fixed
+- **Firefox no longer treats a sign-in redirect as a failed page.** When one
+  page replaces another during a library sign-in, Firefox reports the first
+  page as cancelled with its own error code. The extension recognized only
+  Chrome's code for this. So on Firefox, each redirect of the sign-in marked
+  the tab as failed, and the extension told the daemon that the paper's route
+  had failed. The daemon then gave up the paper's tab while you were still
+  signing in. Firefox's cancelled pages are now ignored in the same way as
+  Chrome's.
+
 ## [0.15.0] - 2026-09-23
 
 ### Added

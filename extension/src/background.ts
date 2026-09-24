@@ -242,6 +242,21 @@ function unknownGraceMs(spec?: AdapterSpec): number {
   return configured !== undefined && Number.isFinite(configured)
     ? Math.max(5_000, Math.min(configured, 60_000)) : 5_000;
 }
+/** webNavigation.onErrorOccurred `error` values that mean "cancelled", not
+ * "failed": a navigation superseded by the next one, or handed to the
+ * download manager. Chrome reports these as net::ERR_ABORTED. Firefox reports
+ * `Error code <nsresult>`, and NS_BINDING_ABORTED (0x804B0002) is what every
+ * IdP redirect hop of a Firefox sign-in produced, measured live 2026-09-24:
+ * each hop marked a navigation error, the next settled login page reported
+ * `navigation_error` for the surface, and papio abandoned the claim of a
+ * sign-in the operator was completing. NS_BINDING_REDIRECTED (0x804B0003) and
+ * NS_BINDING_RETARGETED (0x804B0004) are the same family. */
+const CANCELLED_NAVIGATION_ERRORS: Readonly<Record<string, true>> = {
+  "net::ERR_ABORTED": true,
+  "Error code 2152398850": true,
+  "Error code 2152398851": true,
+  "Error code 2152398852": true,
+};
 
 function captureOutcomeDetail(detail: string | undefined, diagnostic: ObservationCaptureDiagnostic | undefined): string {
   if (diagnostic === undefined) return detail ?? "";
@@ -6566,10 +6581,10 @@ export class Bridge {
     frameId: number;
     error?: string;
   }): Promise<void> {
-    // Chrome cancels a superseded navigation with ERR_ABORTED. The next
-    // document may be a working sign-in page, not an exhausted route.
-    // Do not let that cancellation create a durable failure marker.
-    if (d.frameId !== 0 || d.error === "net::ERR_ABORTED") return;
+    // A superseded navigation is cancelled, not failed. The next document may
+    // be a working sign-in page, not an exhausted route. Do not let that
+    // cancellation create a durable failure marker.
+    if (d.frameId !== 0 || (d.error !== undefined && CANCELLED_NAVIGATION_ERRORS[d.error] === true)) return;
     for (const pending of this.agentNavigations.values()) {
       if (pending.tabID === d.tabId) pending.stop();
     }
@@ -7910,11 +7925,13 @@ export class Bridge {
   }
   /** Record the claim identity governing this job's surface.
    *
-   * §5: the ordinal is monotonic per gate_occurrence_id, never per grant — a
-   * fresh grant on the SAME occurrence (a restart re-consulting before its own
-   * prior observations drained) must never restart at 0 while those entries
-   * still queue; the daemon's unique (occurrence, ordinal) index would reject
-   * the collision as stale.
+   * §3: the daemon orders observations per surface — (occurrence, binding,
+   * ordinal) — so a new surface may start at 0 whatever other surfaces sent
+   * under the same occurrence. A fresh grant for the SAME surface (a restart
+   * re-consulting before its own prior observations drained) must still never
+   * restart at 0 while those entries queue: the daemon would answer the
+   * collision as stale. Seeding past every queued entry of the occurrence is
+   * a superset of that rule.
    */
   private registerClaimGrant(
     jobID: string,

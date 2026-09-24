@@ -6014,8 +6014,16 @@ test("Slice 3: trigger routing — explicit open on a claim owned elsewhere focu
   expect(h2.tabs.updates).toEqual([]);
 });
 
+// A superseded navigation is not a failed one. Chrome reports it as
+// net::ERR_ABORTED; Firefox reports "Error code <nsresult>" with
+// NS_BINDING_ABORTED (0x804B0002), measured live 2026-09-24 as a burst of
+// navigation_error reports on every IdP redirect hop of a Firefox sign-in.
+for (const [browserName, abortedError] of [
+  ["Chrome", "net::ERR_ABORTED"],
+  ["Firefox", "Error code 2152398850"],
+] as const)
 for (const restartBeforeLanding of [false, true]) {
-  test(`a cancelled navigation preserves the next sign-in${restartBeforeLanding ? " across worker restart" : ""}`, async () => {
+  test(`a cancelled ${browserName} navigation preserves the next sign-in${restartBeforeLanding ? " across worker restart" : ""}`, async () => {
     const jobID = "job_claim_aborted";
     const candidateID = "cand_aborted_0001";
     const idpURL = "https://idp.example.edu/sso";
@@ -6034,7 +6042,7 @@ for (const restartBeforeLanding of [false, true]) {
       `https://${PROVIDER_HOST}/fresh?aborted=1`,
     );
 
-    await h.webNavigation.emitError(tabID, "net::ERR_ABORTED");
+    await h.webNavigation.emitError(tabID, abortedError);
     const active = restartBeforeLanding ? restartWorker(h) : h;
     if (restartBeforeLanding) {
       h.tabs.patch(tabID, { url: idpURL, status: "complete" });
