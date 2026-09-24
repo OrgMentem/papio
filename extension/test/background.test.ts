@@ -5453,10 +5453,12 @@ test("auth_returned is reported once, for the landing after the sign-in wall and
  * job_111cef1876: an automatic institutional surface reached the institution
  * sign-in page, nobody attended it, the three-minute drive timeout parked the
  * paper and papio closed the tab, and the owner_closed report abandoned the
- * claim. Returns the job's state and the dead tab. */
+ * claim. Returns the job's state and the dead tab. A `resolverOrigin` names
+ * the institution, so its landings count as institutional sessions. */
 async function timedOutSignInSurface(
   h: Harness,
   ids: ClaimSurfaceIDs,
+  resolverOrigin?: string,
 ): Promise<{ tabID: number; acked: Set<string> }> {
   await h.port.inbound(helloAck({
     features: [
@@ -5466,9 +5468,13 @@ async function timedOutSignInSurface(
       AUTH_CLAIM,
       "surface_close_v1",
     ],
+    ...(resolverOrigin !== undefined ? { resolver_origins: [resolverOrigin] } : {}),
     browser_holder_generation: 1,
   }));
-  const tabID = await navigatedClaimSurface(h, ids, `https://${PROVIDER_HOST}/stable/timed-out`);
+  const providerHosts = resolverOrigin !== undefined
+    ? [new URL(resolverOrigin).hostname, PROVIDER_HOST]
+    : [PROVIDER_HOST];
+  const tabID = await navigatedClaimSurface(h, ids, `https://${PROVIDER_HOST}/stable/timed-out`, providerHosts);
   await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
   const acked = new Set<string>();
   await ackClaimObservations(h, acked);
@@ -5522,6 +5528,51 @@ test("a closed sign-in surface is rebuilt when the daemon offers its candidate a
   const claim = await h.port.waitForFrame("institutional_claim_request", offeredAt);
   expect(claim.payload["candidate_id"]).toBe(ids.candidateID);
   expect(findByJob(h.backend.store, ids.jobID)?.tab_id).not.toBe(tabID);
+});
+
+// Measured live 2026-09-24 in Firefox, whose profile had no library session:
+// the paper above stayed `auth_pending` after the timeout closed its sign-in
+// tab, and `papio actions open` rebuilt the surface through the daemon's
+// candidate offer. The rebuilt tab's first resolver landing, before the
+// sign-in page loaded, was reported as a return from sign-in: auth_returned
+// timed from the closed tab's wall, a claim observation that closed that
+// wall's gate occurrence, and session evidence that re-offered a sibling as
+// "institutional_session_live". The daemon then refused the rebuilt tab's own
+// wall_observed and login_started, so the sign-in nobody had done looked done.
+test("a rebuilt sign-in surface reports no return for its landing before the wall", async () => {
+  const ids = {
+    jobID: "job_surface_rebuilt_landing",
+    candidateID: "cand_surface_rebuilt_landing",
+    claimID: "claim_surface_rebuilt_landing",
+    bindingID: "bind_surface_rebuilt_landing",
+  };
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { acked } = await timedOutSignInSurface(h, ids, "https://resolver.example.edu");
+  expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({
+    status: "auth_pending",
+    tab_id: -1,
+  });
+
+  const resolverURL = "https://resolver.example.edu/openurl?rebuilt=1";
+  const rebuiltAt = h.port.posted.length;
+  const tabID = await navigatedClaimSurface(
+    h,
+    { ...ids, claimID: "claim_surface_rebuilt_again", bindingID: "bind_surface_rebuilt_again" },
+    resolverURL,
+    ["resolver.example.edu", PROVIDER_HOST],
+  );
+  await h.tabs.completeNavigation(tabID, resolverURL);
+  expect(await ackClaimObservations(h, acked)).not.toContain("auth_returned");
+  expect(h.frames().slice(rebuiltAt).some((frame) => frame.type === "auth_returned")).toBe(false);
+
+  await h.tabs.completeNavigation(tabID, "https://idp.example.edu/sso");
+  expect(await ackClaimObservations(h, acked)).toContain("wall_observed");
+
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/rebuilt?signed-in=1`);
+  expect(await ackClaimObservations(h, acked)).toContain("auth_returned");
+  expect(h.frames().slice(rebuiltAt).filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
 });
 
 // The same live state, seen from the popup: eight papers listed under Focus,

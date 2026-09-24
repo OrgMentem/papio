@@ -841,9 +841,21 @@ export function reduceMaterialization(
     activeJobs: store.activeJobs.map((job) => {
       if (job.job_id !== jobID) return job;
       const boundJob = tabSync ? { ...job, tab_id: tabID } : job;
-      return navigationAuthorized && job.status === "queued"
-        ? { ...boundJob, status: "accepted", engagement_required: false }
-        : boundJob;
+      if (navigationAuthorized && job.status === "queued")
+        return { ...boundJob, status: "accepted", engagement_required: false };
+      // `auth_pending` is the record that THIS surface met a sign-in wall, and
+      // the next institutional landing reads as the return from it. Papio's own
+      // route navigation starts the surface over, so a wall recorded before it
+      // is not this journey's: a paper whose sign-in tab closed keeps
+      // `auth_pending`, and its rebuilt tab's first resolver landing, before
+      // the sign-in page, was reported as a return (measured live 2026-09-24).
+      // Only `navigating` clears it: a reconcile re-applies `navigated` to a
+      // surface that may still be on its wall.
+      if (navigationAuthorized && event.type === "navigating" && job.status === "auth_pending") {
+        const { auth_started_ms: _priorWall, ...restarted } = boundJob;
+        return { ...restarted, status: "accepted" };
+      }
+      return boundJob;
     }),
   };
 }
@@ -1373,6 +1385,7 @@ function migratedJob(value: ActiveJob): ActiveJob {
     migrated.engagement_required = value.engagement_required;
   if (typeof value.fresh_handoff === "boolean")
     migrated.fresh_handoff = value.fresh_handoff;
+  if (value.claim_identity_known === true) migrated.claim_identity_known = true;
   if (value.manual_delivery_required === true) migrated.manual_delivery_required = true;
   if (typeof value.download_initiated === "boolean")
     migrated.download_initiated = value.download_initiated;

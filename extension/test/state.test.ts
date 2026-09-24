@@ -163,6 +163,22 @@ test("migration accepts a clean current state and writes an explicit version on 
   });
 });
 
+// claim_identity_known exists to outlive a worker restart, and the Open on a
+// paper whose sign-in correlation a reconnect retired depends on it. Migration
+// did not carry it, so every save dropped it: read live from Firefox's session
+// storage on 2026-09-24, a paper that had just received a candidate offer had
+// no claim_identity_known on disk.
+test("a job's known institution identity survives a save and reload", async () => {
+  const fixture = storageWith({ version: MANAGED_STATE_VERSION, activeJobs: [] });
+  const backend = chromeBackend(fixture.storage);
+  await backend.save({
+    ...emptyStore(),
+    activeJobs: [job({ status: "auth_pending", tab_id: -1, requires_auth: true, claim_identity_known: true })],
+  });
+  const reloaded = await chromeBackend(fixture.storage).load();
+  expect(reloaded.activeJobs[0]?.claim_identity_known).toBe(true);
+});
+
 test("version 3 upgrades and old manual_delivery_target is dropped", () => {
   const legacy = migrateManagedState({
     version: 3,

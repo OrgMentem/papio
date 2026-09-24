@@ -111,6 +111,15 @@ execution records kept during the initial build.
   a new one and the popup offers **Open**. A reconnect also retires dead
   surfaces again: its reconcile ignored the daemon's answer when no binding
   was live. **Focus** on a tab that has gone opens a fresh surface.
+- **A reopened sign-in tab no longer reports a sign-in that never happened.**
+  When papio rebuilt the sign-in tab for a paper still waiting on your
+  library, the new tab's first library page, before the sign-in page loaded,
+  counted as your return from signing in. papio then treated the library
+  session as live, offered other waiting papers again, and ignored the real
+  sign-in page and the real return that followed. A rebuilt tab now waits for
+  its own sign-in page. The extension also keeps, across a background
+  restart, the fact that a paper's library is known, so **Open** still
+  builds a fresh tab after the restart.
 - **A paper with an open-access copy no longer ends unavailable because your
   library has no entitlement.** When the browser could not drive an
   open-access page (for example a PubMed Central article) and asked you to

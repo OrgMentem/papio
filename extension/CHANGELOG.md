@@ -88,6 +88,15 @@ for the full pre-split extension history.
   a new one and the popup offers **Open**. A reconnect also retires dead
   surfaces again: its reconcile ignored the daemon's answer when no binding
   was live. **Focus** on a tab that has gone opens a fresh surface.
+- **A reopened sign-in tab no longer reports a sign-in that never happened.**
+  When papio rebuilt the sign-in tab for a paper still waiting on your
+  library, the new tab's first library page, before the sign-in page loaded,
+  counted as your return from signing in. papio then treated the library
+  session as live, offered other waiting papers again, and ignored the real
+  sign-in page and the real return that followed. A rebuilt tab now waits for
+  its own sign-in page. The extension also keeps, across a background
+  restart, the fact that a paper's library is known, so **Open** still
+  builds a fresh tab after the restart.
 - **The article-agent skip reason names the paper's assisted mode.** On a page
   with no adapter, the autonomous article agent refused to act on an
   assisted paper and reported "this browser lacks authority for the attempt",
