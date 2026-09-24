@@ -61,17 +61,26 @@ jobs:
       - name: Check Formatting
         run: test -z "$(gofmt -l .)"
 
+  # Lint each target's build: Windows-only files (named-pipe IPC, Job Object
+  # hooks, registry native host) are never compiled for the linux lint, so
+  # nothing else in CI lints them.
   lint:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, windows]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.27.1'
-      - name: golangci-lint
+      - name: golangci-lint (${{ matrix.goos }})
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.13.2
+        env:
+          GOOS: ${{ matrix.goos }}
 
   secrets:
     runs-on: ubuntu-latest

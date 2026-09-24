@@ -231,6 +231,8 @@ func ExecTarget() (string, bool) {
 	if _, err := os.Stat(ExecPath()); err != nil {
 		return target, false
 	}
+	// #nosec G703 -- target is the path native-host install recorded in this
+	// user's own config dir; the Stat only reports whether it still exists.
 	if _, err := os.Stat(target); err != nil {
 		return target, false
 	}

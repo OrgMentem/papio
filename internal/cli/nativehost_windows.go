@@ -70,6 +70,8 @@ func browserTargets() ([]browserTarget, error) {
 }
 
 func dirExists(path string) bool {
+	// #nosec G703 -- the path is a browser's profile root under this user's own
+	// LOCALAPPDATA; a Stat as the same user reveals nothing it could not read.
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
 }

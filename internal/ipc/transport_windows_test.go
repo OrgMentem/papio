@@ -93,8 +93,12 @@ func TestWindowsPipeEndpointSecurityAndCloseWrite(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		data, err := io.ReadAll(server)
-		if err != nil || string(data) != "request" {
-			done <- fmt.Errorf("read through request EOF: %q (%v)", data, err)
+		if err != nil {
+			done <- fmt.Errorf("read through request EOF: %w", err)
+			return
+		}
+		if string(data) != "request" {
+			done <- fmt.Errorf("read through request EOF: %q", data)
 			return
 		}
 		if _, err := server.Write([]byte("response")); err != nil {

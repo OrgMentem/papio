@@ -41,7 +41,7 @@ func TestWindowsConfigPublicationSharingDenialPreservesPriorFile(t *testing.T) {
 	closed := false
 	defer func() {
 		if !closed {
-			windows.CloseHandle(handle)
+			_ = windows.CloseHandle(handle)
 		}
 	}()
 	cfg.Email = "replacement@example.test"

@@ -97,7 +97,7 @@ func (g *procGuard) confine(cmd *exec.Cmd) error {
 	}
 	// The shell is suspended and its handle is held by os/exec, so the pid
 	// cannot have been reused between Start and this OpenProcess.
-	pid := uint32(cmd.Process.Pid)
+	pid := uint32(cmd.Process.Pid) //nolint:gosec // G115: a Windows pid is the DWORD CreateProcess returned, so it fits in uint32.
 	proc, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, pid)
 	if err != nil {
 		return fmt.Errorf("open hook shell: %w", err)

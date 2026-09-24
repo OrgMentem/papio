@@ -14,11 +14,14 @@ func openSource(path string) (*os.File, error) {
 	return os.Open(path)
 }
 
+// fileBasicInfo mirrors FILE_BASIC_INFO. The times are LARGE_INTEGERs, read
+// here as uint64 because papio only compares changeTime for equality as part of
+// a file identity; the bits are the same either way.
 type fileBasicInfo struct {
-	creationTime   int64
-	lastAccessTime int64
-	lastWriteTime  int64
-	changeTime     int64
+	creationTime   uint64
+	lastAccessTime uint64
+	lastWriteTime  uint64
+	changeTime     uint64
 	fileAttributes uint32
 }
 
@@ -39,7 +42,7 @@ func fileIdentity(file *os.File, _ os.FileInfo) fileID {
 	return fileID{
 		device:  uint64(handleInfo.VolumeSerialNumber),
 		inode:   uint64(handleInfo.FileIndexHigh)<<32 | uint64(handleInfo.FileIndexLow),
-		changeA: uint64(basic.changeTime),
+		changeA: basic.changeTime,
 		known:   true,
 	}
 }
