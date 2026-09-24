@@ -70,6 +70,7 @@ import {
   type AuthenticationClaimResponsePayload,
   type ClaimObservationPayload,
   type ClaimObservationAckPayload,
+  type ViewerCapturePayload,
 } from "./protocol";
 import {
   NativeRequestCorrelation,
@@ -393,6 +394,9 @@ const TRIAGE_REQUEST_TIMEOUT_MS = 15_000;
 const HELLO_WAIT_TIMEOUT_MS = 5_000;
 const TRIAGE_SNAPSHOT_FEATURE = "triage_snapshot_v1";
 const NATIVE_VIEWER_DOWNLOAD_FEATURE = "native_viewer_download_v1";
+/** v1 plus the `viewer_capture` record. A daemon advertises it in v1's slot,
+ * so it also grants every v1 outcome. */
+const NATIVE_VIEWER_DOWNLOAD_V2_FEATURE = "native_viewer_download_v2";
 const TRIAGE_SNAPSHOT_SCHEMA_2_FEATURE = "triage_snapshot_schema_v2";
 const TRIAGE_SNAPSHOT_SCHEMA_3_FEATURE = "triage_snapshot_schema_v3";
 const TRIAGE_SNAPSHOT_SCHEMA_4_FEATURE = "triage_snapshot_schema_v4";
@@ -12528,6 +12532,7 @@ export class Bridge {
             EFFECT_PERMIT_FEATURE,
             PDF_GRAB_FEATURE,
             NATIVE_VIEWER_DOWNLOAD_FEATURE,
+            NATIVE_VIEWER_DOWNLOAD_V2_FEATURE,
             INSTITUTIONAL_MATERIALIZATION_FEATURE,
             SURFACE_PRESENCE_FEATURE,
             WORK_PULSE_FEATURE,
@@ -17332,7 +17337,8 @@ export class Bridge {
     }
     const noticeKey = `${jobID}:${code}`;
     if (this.handoffOutcomeSent.has(noticeKey)) return;
-    if ((this.store.daemonFeatures ?? []).includes(NATIVE_VIEWER_DOWNLOAD_FEATURE)) {
+    const features = this.store.daemonFeatures ?? [];
+    if (features.includes(NATIVE_VIEWER_DOWNLOAD_FEATURE) || features.includes(NATIVE_VIEWER_DOWNLOAD_V2_FEATURE)) {
       if (this.send("provider_outcome", { outcome: code, ...(spent === undefined ? {} : { detail: spent.detail }) }, jobID)) {
         this.handoffOutcomeSent.add(noticeKey);
         // Tear down the drive, not the visible file. The close path retains
@@ -17363,6 +17369,24 @@ export class Bridge {
     return this.viewerCapture.available()
       ? FIREFOX_VIEWER_CAPTURE_MESSAGE
       : "This publisher's link can only be used once, and papio can't adopt a download on Firefox — open this PDF in Chrome to send it";
+  }
+
+  /** Tell the daemon, before the file can land, that the signed viewer PDF it
+   * is about to adopt for this job is papio's own save of the viewer's one
+   * response, and which adapter matched the paper's page. The daemon's
+   * adoption sweep can promote the file before download_complete arrives, so
+   * this record is what attributes the bytes. Only a daemon that advertised
+   * native_viewer_download_v2 accepts the message: an older strict parser
+   * rejects the unknown type and ends the session. */
+  private reportViewerCapture(jobID: string, mechanism: ViewerCapturePayload["mechanism"]): void {
+    if (!this.daemonNegotiated() || !(this.store.daemonFeatures ?? []).includes(NATIVE_VIEWER_DOWNLOAD_V2_FEATURE)) return;
+    const adapterID = findByJob(this.store, jobID)?.adapter_id;
+    const adapter = adapterID === undefined ? undefined : this.deps.adapterSpecs.find((spec) => spec.id === adapterID);
+    const payload: ViewerCapturePayload = {
+      mechanism,
+      ...(adapter === undefined ? {} : { adapter_id: adapter.id, adapter_version: adapter.version }),
+    };
+    this.send("viewer_capture", payload, jobID);
   }
 
   /** A job takes at most one signed-viewer download: Chrome's rule download
@@ -17466,6 +17490,9 @@ export class Bridge {
         viewerRefetch: { url, tabID, ruled: true, captured: true },
       };
       this.downloads.set(jobID, track);
+      // Before the file exists: the daemon's adoption sweep can promote it
+      // before download_complete arrives.
+      this.reportViewerCapture(jobID, "stream_capture");
       const objectURLs = this.deps.objectURLs ?? GLOBAL_OBJECT_URLS;
       const objectURL = objectURLs.create(capture.body);
       this.pendingDownloadURLs.set(objectURL, jobID);
@@ -21274,6 +21301,7 @@ export class Bridge {
     // the same way, to the armed tab whose navigation produced it.
     let syncJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     const viewerRule = syncJobID === undefined ? this.viewerRules.viewerRuleBinding(item) : undefined;
+    let ruledJobID = viewerRule?.jobID;
     syncJobID ??= viewerRule?.jobID;
     if (syncJobID !== undefined) {
       const sync = this.downloads.get(syncJobID) ?? {
@@ -21301,8 +21329,12 @@ export class Bridge {
           viewerRefetch: { url: lateRule.url, tabID: lateRule.tabID, ruled: true },
         });
         void this.viewerRules.syncViewerDownloadRules();
+        ruledJobID = lateRule.jobID;
       }
     }
+    // Chrome writes the rule's download under a temporary name until it
+    // completes, so this record reaches the daemon before the file can land.
+    if (ruledJobID !== undefined) this.reportViewerCapture(ruledJobID, "download_rule");
     const earlyJobID = this.trackedJobFor(item.id) ?? this.pendingJobFor(item);
     if (earlyJobID !== undefined) {
       const early = this.downloads.get(earlyJobID) ?? {

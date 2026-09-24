@@ -17191,6 +17191,48 @@ func TestNativeViewerCapabilityKeepsOldPeersAndFeatureCap(t *testing.T) {
 	}
 }
 
+// A peer that sends viewer_capture records learns that this daemon accepts
+// them from native_viewer_download_v2, which takes v1's slot: an older daemon
+// never advertises v2, so it never receives a frame it would reject, and the
+// emitted list stays at the 32-feature cap.
+func TestNativeViewerDownloadV2TakesV1SlotAndRecordsViewerCapture(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id := park(t, jobs, "wr_viewer_capture_record", handoffWork())
+	runSync(t, b, hello())
+	for _, peer := range [][]string{{nativeViewerDownloadFeature}, {nativeViewerDownloadFeature, nativeViewerDownloadV2Feature}} {
+		raw, err := b.helloAck(sessionRoleHolder, SessionRolesMinExtensionVersion, peer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := protocol.DecodeBrowserMessage(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		features := msg.Payload.(*protocol.HelloAckPayload).Features
+		v2 := len(peer) == 2
+		if len(features) != 32 || slices.Contains(features, nativeViewerDownloadV2Feature) != v2 || slices.Contains(features, nativeViewerDownloadFeature) == v2 {
+			t.Fatalf("peer=%v features=%v", peer, features)
+		}
+	}
+	runSync(t, b, inFrame(t, protocol.MsgViewerCapture, id, map[string]any{
+		"mechanism": "download_rule", "adapter_id": "sciencedirect", "adapter_version": "sciencedirect/0.4.0",
+	}))
+	events, err := jobs.Events(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded []any
+	for _, event := range events {
+		if event["kind"] == job.ViewerCaptureEvent {
+			recorded = append(recorded, event["detail"])
+		}
+	}
+	want := []any{map[string]any{"mechanism": "download_rule", "adapter_id": "sciencedirect", "adapter_version": "sciencedirect/0.4.0"}}
+	if !reflect.DeepEqual(recorded, want) {
+		t.Fatalf("viewer capture events = %v, want %v", recorded, want)
+	}
+}
+
 func TestNativeViewerOutcomeRequiresNegotiation(t *testing.T) {
 	for _, capable := range []bool{false, true} {
 		t.Run(fmt.Sprint(capable), func(t *testing.T) {

@@ -62,6 +62,10 @@ import (
 const (
 	handoffActionKind           = "openurl_handoff"
 	nativeViewerDownloadFeature = "native_viewer_download_v1"
+	// nativeViewerDownloadV2Feature is v1 plus the viewer_capture record: the
+	// daemon accepts that message and attributes the bytes it names. It takes
+	// v1's slot for a peer that advertises both, so the 32-feature cap holds.
+	nativeViewerDownloadV2Feature = "native_viewer_download_v2"
 	// manualDownloadActionKind is focusable and offerable, but never driven:
 	// the offer hands the institution's route to the human, who fetches the
 	// file themselves and lets papio adopt it.
@@ -1447,6 +1451,13 @@ func (b *Bridge) helloAck(role, peerVersion string, peerFeatures []string) (json
 	if slices.Contains(peerFeatures, nativeViewerDownloadFeature) && slices.Contains(features, triageSnapshotSchema3Feature) {
 		if i := slices.Index(features, triageSnapshotSchema2Feature); i >= 0 {
 			features[i] = nativeViewerDownloadFeature
+		}
+	}
+	// A peer that sends viewer_capture records takes v2 in the same slot; v2
+	// implies v1's outcomes, and older peers keep v1.
+	if slices.Contains(peerFeatures, nativeViewerDownloadV2Feature) {
+		if i := slices.Index(features, nativeViewerDownloadFeature); i >= 0 {
+			features[i] = nativeViewerDownloadV2Feature
 		}
 	}
 	// Agent peers implement snapshot v5. Reuse its superseded v3 hint;
@@ -3571,6 +3582,23 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		}
 		if err := b.outcome(ctx, msg.JobID, msg.MsgID, msg.Payload.(*protocol.ProviderOutcomePayload)); err != nil {
 			log.Printf("papio: recording browser provider outcome: %v", err)
+		}
+		return nil, nil
+
+	case protocol.MsgViewerCapture:
+		// Recorded before the capture's file can land, so the promotion that
+		// adopts it finds its producer even when the adoption sweep wins the
+		// race with download_complete. A lost record only costs attribution.
+		p := msg.Payload.(*protocol.ViewerCapturePayload)
+		detail := map[string]any{"mechanism": p.Mechanism}
+		if p.AdapterID != "" {
+			detail["adapter_id"] = p.AdapterID
+		}
+		if p.AdapterVersion != "" {
+			detail["adapter_version"] = p.AdapterVersion
+		}
+		if err := b.jobs.S.AppendEvent(ctx, msg.JobID, job.ViewerCaptureEvent, detail); err != nil {
+			log.Printf("papio: recording %s: %v", job.ViewerCaptureEvent, err)
 		}
 		return nil, nil
 

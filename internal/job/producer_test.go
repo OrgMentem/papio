@@ -254,6 +254,42 @@ func TestTermsStopIsAnInterventionNotAManualDownload(t *testing.T) {
 	assertProducer(t, got, ProducerUnknown, InterventionOpen, InterventionSignIn, InterventionTerms)
 }
 
+func TestViewerCaptureRecordAttributesBytesAdoptedBeforeTheirDownloadReport(t *testing.T) {
+	js := testStore(t)
+	// The loopback run of 2026-09-24: Firefox captured ScienceDirect's signed
+	// viewer response, and the adoption sweep promoted the saved file before
+	// download_complete reached the daemon. Only the capture record, which the
+	// extension sends before it saves, was on file.
+	jobID, candidateID := producerJob(t, js, "wr_producer_viewer_capture", "browser", []producerFixtureEvent{
+		{"handoff.opened", map[string]any{"batch_size": 1, "principal": "cli"}},
+		{"browser.institutional_effect_result", map[string]any{"binding_id": "binding_v", "claim_id": "claim_v", "effect_ordinal": 1, "outcome": "acknowledged"}},
+		{"browser.viewer_capture", map[string]any{"mechanism": "stream_capture", "adapter_id": "sciencedirect", "adapter_version": "sciencedirect/0.4.0"}},
+		{"browser.download_started", map[string]any{"download_id": 1, "filename": "paper.pdf"}},
+	})
+	got := promoteForProducer(t, js, jobID, candidateID, strings.Repeat("d", 64))
+	assertProducer(t, got, ProducerViewerCapture, InterventionOpen)
+	if got.AdapterID != "sciencedirect" || got.AdapterVersion != "sciencedirect/0.4.0" || got.Basis != "viewer_capture" || got.OpenedBy != "cli" {
+		t.Fatalf("record = %+v, want the capture and the adapter that armed it", got)
+	}
+}
+
+func TestViewerCaptureThatFailedDoesNotClaimALaterManualDownload(t *testing.T) {
+	js := testStore(t)
+	// The capture was incomplete, so the extension asked for the viewer's
+	// Download button; the file that then arrived was saved by a person.
+	jobID, candidateID := producerJob(t, js, "wr_producer_viewer_capture_failed", "browser", []producerFixtureEvent{
+		{"handoff.opened", map[string]any{"batch_size": 1, "principal": "cli"}},
+		{"browser.viewer_capture", map[string]any{"mechanism": "download_rule", "adapter_id": "sciencedirect", "adapter_version": "sciencedirect/0.4.0"}},
+		{"browser.provider_outcome", map[string]any{"outcome": "native_viewer_download_required", "detail": "the browser download of the viewer URL was interrupted"}},
+		{"browser.download_complete", map[string]any{"download_id": 12, "filename": "paper.pdf", "size_bytes": 1}},
+	})
+	got := promoteForProducer(t, js, jobID, candidateID, strings.Repeat("e", 64))
+	assertProducer(t, got, ProducerManual, InterventionOpen, InterventionManualFile)
+	if got.Basis != "adapter_stopped" {
+		t.Fatalf("record = %+v, want the stopped capture, not the capture", got)
+	}
+}
+
 func TestDaemonOAFetchRecordsDaemonFetchUnattended(t *testing.T) {
 	js := testStore(t)
 	jobID, candidateID := producerJob(t, js, "wr_producer_oa", "unpaywall", nil)
@@ -315,7 +351,7 @@ func TestPacerOpenedJobIsUnattendedApartFromSignIn(t *testing.T) {
 	if stats.Acquired != 3 || stats.Unattended != 1 || stats.SignInOnly != 1 || stats.Intervened != 1 || stats.Unrecorded != 0 {
 		t.Fatalf("stats = %+v, want 3 acquired: 1 unattended, 1 sign-in only, 1 intervened", stats)
 	}
-	want := map[Producer]int{ProducerAdapter: 1, ProducerAgent: 0, ProducerDaemonFetch: 1, ProducerManual: 0, ProducerUnknown: 1}
+	want := map[Producer]int{ProducerAdapter: 1, ProducerAgent: 0, ProducerViewerCapture: 0, ProducerDaemonFetch: 1, ProducerManual: 0, ProducerUnknown: 1}
 	if !reflect.DeepEqual(stats.Producers, want) {
 		t.Fatalf("producers = %v, want %v", stats.Producers, want)
 	}

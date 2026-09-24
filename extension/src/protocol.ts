@@ -37,6 +37,7 @@ export type BrowserMessageType =
   | "download_complete"
   | "delivery_context"
   | "provider_outcome"
+  | "viewer_capture"
   | "provider_direct_get_request"
   | "provider_direct_get_result"
   | "provider_drive_epoch_start_request"
@@ -314,6 +315,15 @@ export interface ProviderOutcomePayload {
   adapter_version?: string;
   detail?: string;
   host?: string;
+}
+/** papio is about to save a signed PDF viewer's one response for the job:
+ * Firefox's stream capture or Chrome's session download rule. Sent before the
+ * file can land in the job's adoption directory, and only to a daemon that
+ * advertised native_viewer_download_v2. Carries no URL. */
+export interface ViewerCapturePayload {
+  mechanism: "stream_capture" | "download_rule";
+  adapter_id?: string;
+  adapter_version?: string;
 }
 export interface ProviderDirectGetRequestPayload {
   drive_attempt_id: string;
@@ -1544,6 +1554,7 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   download_complete: true,
   delivery_context: true,
   provider_outcome: true,
+  viewer_capture: true,
   provider_direct_get_request: true,
   provider_direct_get_result: true,
   provider_drive_epoch_start_request: true,
@@ -1640,6 +1651,7 @@ const JOB_SCOPED: Record<string, true> = {
   download_complete: true,
   delivery_context: true,
   provider_outcome: true,
+  viewer_capture: true,
   provider_direct_get_request: true,
   provider_direct_get_result: true,
   provider_drive_epoch_start_request: true,
@@ -4043,6 +4055,24 @@ function validatePayload(
           );
         }
       }
+      break;
+    }
+    case "viewer_capture": {
+      requireFields<ViewerCapturePayload>(p, "viewer_capture", {
+        mechanism: "required",
+        adapter_id: "optional",
+        adapter_version: "optional",
+      });
+      const mechanism = str(p, "mechanism", "viewer_capture", 20);
+      if (mechanism !== "stream_capture" && mechanism !== "download_rule")
+        fail(`viewer_capture.mechanism is invalid: ${JSON.stringify(mechanism)}`);
+      if (
+        "adapter_id" in p &&
+        !/^[A-Za-z0-9_-]{1,64}$/.test(str(p, "adapter_id", "viewer_capture", 64))
+      ) {
+        fail("viewer_capture.adapter_id must use the id charset");
+      }
+      if ("adapter_version" in p) str(p, "adapter_version", "viewer_capture", 50);
       break;
     }
     case "provider_direct_get_request": {

@@ -10,6 +10,21 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Added
+- **`papio stats producers` counts a signed viewer PDF that the extension
+  saved as `viewer_capture`.** Before, such a paper (for example a
+  ScienceDirect PDF that Firefox kept a copy of, or that Chrome's download
+  rule saved) counted as `unknown`, with the basis `no_download_record`. The
+  daemon often adopts that file before the extension's download report
+  arrives, so nothing named the source. The extension now sends a
+  `viewer_capture` message before the file can land, and the
+  `artifact.producer` record names the adapter that matched the paper's page.
+  An extension that asks for the new record gets the
+  `native_viewer_download_v2` feature in the handshake, in the place of
+  `native_viewer_download_v1`, and sends the message only when it sees that
+  feature. The handshake still lists 32 features. An older extension sees no
+  change, and a daemon older than this one never receives the message.
+
 ### Removed
 - **The experimental macOS helper that saved a PDF from Firefox's viewer.**
   The next extension release saves that PDF itself, with nothing to build or

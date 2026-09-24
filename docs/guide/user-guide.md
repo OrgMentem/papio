@@ -835,6 +835,7 @@ record: papers from before *papio* 0.22.0, and papers served from a copy
 | --- | --- |
 | `adapter` | The extension downloaded a PDF that the page declared, inside a drive that *papio* started, with no agent decision. |
 | `agent` | The article agent chose the control that produced the download. |
+| `viewer_capture` | The extension saved the one response of a signed PDF viewer, such as ScienceDirect's, in a tab that *papio* armed for the paper: Firefox kept a copy of the PDF, or Chrome's download rule saved it. The record names the adapter that matched the paper's page. It does not record who pressed **View PDF**. |
 | `daemon_fetch` | *papio* chose the address: it fetched the file itself, or the browser fetched a public address that *papio* selected. |
 | `manual` | A person supplied the file: a PDF you sent from an open tab, or a download that came after the adapter had stopped. |
 | `unknown` | A browser download with no record of who clicked. A paper that the removed macOS helper of *papio* 0.22 saved also counts here. |
@@ -847,7 +848,9 @@ Know one limit: `unknown` often includes downloads that a packaged adapter
 made in a sign-in handoff tab. The extension does not tell *papio* which
 adapter clicked in that tab, so an adapter click and your own click look the
 same, and *papio* does not guess. Read a high `unknown` count as "not
-recorded", not as "done by hand".
+recorded", not as "done by hand". A signed viewer PDF that the extension saved
+counts as `viewer_capture` only with extension and daemon versions that both
+support the record; with an older extension or daemon it counts as `unknown`.
 
 For one paper, `papio jobs get <job-id>` prints the record on its
 `artifact.producer` line, for example

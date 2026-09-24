@@ -835,6 +835,7 @@ const (
 	MsgDownloadComplete                = "download_complete"
 	MsgDeliveryContext                 = "delivery_context"
 	MsgProviderOutcome                 = "provider_outcome"
+	MsgViewerCapture                   = "viewer_capture"
 	MsgCancel                          = "cancel"
 	MsgHandoffFocus                    = "handoff_focus"
 	MsgAck                             = "ack"
@@ -1254,7 +1255,7 @@ type ClaimObservationAckPayload struct {
 // jobScoped lists the types that must carry a job_id.
 var jobScoped = map[string]bool{
 	MsgDownloadStarted: true, MsgDownloadComplete: true, MsgDeliveryContext: true,
-	MsgProviderOutcome: true, MsgProviderDirectGetRequest: true, MsgProviderDirectGetResult: true,
+	MsgProviderOutcome: true, MsgViewerCapture: true, MsgProviderDirectGetRequest: true, MsgProviderDirectGetResult: true,
 	MsgProviderDriveEpochStartRequest: true, MsgProviderDriveEpochStartResult: true,
 	MsgProviderDriveEpochResultRequest: true, MsgProviderDriveEpochResult: true,
 	MsgAgentDecideRequestV1: true, MsgAgentDecideResultV1: true,
@@ -1700,6 +1701,20 @@ type ProviderOutcomePayload struct {
 	AdapterVersion string `json:"adapter_version,omitempty"`
 	Detail         string `json:"detail,omitempty"`
 	Host           string `json:"host,omitempty"`
+}
+
+// ViewerCapturePayload says that papio is about to save a signed PDF viewer's
+// one response for the job: Firefox's stream capture ("stream_capture") or
+// Chrome's session download rule ("download_rule"). The extension sends it
+// before the file can land in the job's adoption directory, so the record is
+// durable before any adoption path promotes the bytes. AdapterID and
+// AdapterVersion name the adapter that matched the paper's page, when one
+// did. It carries no URL. An extension sends it only to a daemon that
+// advertised native_viewer_download_v2.
+type ViewerCapturePayload struct {
+	Mechanism      string `json:"mechanism"`
+	AdapterID      string `json:"adapter_id,omitempty"`
+	AdapterVersion string `json:"adapter_version,omitempty"`
 }
 
 // ProviderDirectGetRequestPayload asks a feature-capable extension to fetch one
@@ -2987,6 +3002,26 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			// two parsers disagree about the same frame.
 			if _, present := payloadFields["host"]; present && p.Host == "" {
 				err = fmt.Errorf("provider_outcome.host must not be empty when present")
+			}
+		}
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgViewerCapture:
+		p := &ViewerCapturePayload{}
+		if err = browserRequireFields(payloadFields, "mechanism"); err == nil {
+			err = browserRejectNullFields(payloadFields, "adapter_id", "adapter_version")
+		}
+		if err == nil {
+			err = strictDecode(env.Payload, p)
+		}
+		if err == nil {
+			if _, present := payloadFields["adapter_id"]; present && p.AdapterID == "" {
+				err = fmt.Errorf("viewer_capture.adapter_id must not be empty when present")
+			}
+			if _, present := payloadFields["adapter_version"]; present && p.AdapterVersion == "" {
+				err = fmt.Errorf("viewer_capture.adapter_version must not be empty when present")
 			}
 		}
 		if err == nil {
@@ -4901,6 +4936,19 @@ func (p *ProviderOutcomePayload) validate() error {
 			strings.Contains(p.Host, "..") || strings.HasPrefix(p.Host, ".") || strings.HasSuffix(p.Host, ".") {
 			return fmt.Errorf("provider_outcome.host must be a bounded lowercase registrable hostname")
 		}
+	}
+	return nil
+}
+
+func (p *ViewerCapturePayload) validate() error {
+	if err := enumRequired("viewer_capture.mechanism", p.Mechanism, "stream_capture", "download_rule"); err != nil {
+		return err
+	}
+	if p.AdapterID != "" && !adapterIDRE.MatchString(p.AdapterID) {
+		return fmt.Errorf("viewer_capture.adapter_id must use the id charset (max 64)")
+	}
+	if browserTextLen(p.AdapterVersion) > 50 {
+		return fmt.Errorf("viewer_capture.adapter_version exceeds 50 chars")
 	}
 	return nil
 }

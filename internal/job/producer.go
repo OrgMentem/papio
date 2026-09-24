@@ -31,6 +31,11 @@ const (
 	// ProducerAgent is a generic drive in which the article agent chose the
 	// control that produced the download.
 	ProducerAgent Producer = "agent"
+	// ProducerViewerCapture is a signed PDF viewer's one response that the
+	// extension saved in a tab it armed for the job: Firefox's stream capture
+	// or Chrome's download rule. AdapterID names the adapter that matched the
+	// paper's page, when one did; who clicked View PDF is not recorded.
+	ProducerViewerCapture Producer = "viewer_capture"
 	// ProducerDaemonFetch is bytes whose URL the daemon chose: a resolver
 	// candidate the daemon fetched itself, or a browser direct_get of a
 	// daemon-selected public route.
@@ -47,7 +52,7 @@ const (
 )
 
 // Producers lists the closed vocabulary in reporting order.
-var Producers = []Producer{ProducerAdapter, ProducerAgent, ProducerDaemonFetch, ProducerManual, ProducerUnknown}
+var Producers = []Producer{ProducerAdapter, ProducerAgent, ProducerViewerCapture, ProducerDaemonFetch, ProducerManual, ProducerUnknown}
 
 // Intervention names one kind of human involvement the job's own events
 // record for the attempt that produced the artifact.
@@ -75,6 +80,11 @@ var Interventions = []Intervention{InterventionOpen, InterventionSignIn, Interve
 // PacerPrincipal is the handoff.opened principal of the daemon's own paced
 // opener. It is the one opener that is not a human intervention.
 const PacerPrincipal = "pacer"
+
+// ViewerCaptureEvent records that the extension is about to save a signed
+// viewer's one response for the job. It arrives before the file can land in
+// the adoption directory, so it precedes the promotion it attributes.
+const ViewerCaptureEvent = "browser.viewer_capture"
 
 // ArtifactProducerRecord is the detail of one artifact.producer event.
 type ArtifactProducerRecord struct {
@@ -119,7 +129,7 @@ var producerEventKinds = []string{
 	"browser.auth_pending", "browser.auth_returned",
 	"browser.provider_outcome", "browser.error", "browser.challenge_cleared",
 	"browser.provider_drive_epoch_started", "browser.agent_decision_completed",
-	"browser.download_complete", "human_action.resolve",
+	"browser.download_complete", "human_action.resolve", ViewerCaptureEvent,
 }
 
 // adapterStopOutcomes are provider outcomes after which the adapter does not
@@ -262,6 +272,14 @@ func deriveArtifactProducer(in producerInputs) ArtifactProducerRecord {
 func classifyBrowserDownload(record *ArtifactProducerRecord, in producerInputs, window []producerEvent) {
 	producer, basis := boundArtifactProducer(in.events, window, in.sha)
 	if producer == nil {
+		// Two download tuples for the same bytes stay ambiguous: a capture
+		// record cannot say which of them saved the file.
+		if capture, ok := viewerCaptureBeforePromotion(window); ok && basis != "ambiguous_producer" {
+			record.Producer, record.Basis = ProducerViewerCapture, "viewer_capture"
+			record.AdapterID = detailString(capture.detail, "adapter_id")
+			record.AdapterVersion = detailString(capture.detail, "adapter_version")
+			return
+		}
 		if outcome, ok := adapterStoppedBeforeDownload(window); ok {
 			record.Producer, record.Basis = ProducerManual, "adapter_stopped"
 			record.AdapterID = detailString(outcome.detail, "adapter_id")
@@ -377,6 +395,29 @@ func adapterStoppedBeforeDownload(window []producerEvent) (producerEvent, bool) 
 			return producerEvent{}, false
 		case "browser.provider_outcome":
 			return window[i], adapterStopOutcomes[detailString(window[i].detail, "outcome")]
+		}
+	}
+	return producerEvent{}, false
+}
+
+// viewerCaptureBeforePromotion returns the attempt's latest viewer capture
+// record when nothing after it names a different source for the bytes: a new
+// handoff or drive, a provider outcome (the capture failed and a person was
+// asked to download), or a validation that rejected bytes (the capture's
+// file was not the paper). A download tuple is checked first by the caller,
+// so this runs only when no effect identity bound the bytes.
+func viewerCaptureBeforePromotion(window []producerEvent) (producerEvent, bool) {
+	for i := len(window) - 1; i >= 0; i-- {
+		event := window[i]
+		switch event.kind {
+		case ViewerCaptureEvent:
+			return event, true
+		case "handoff.opened", "browser.provider_drive_epoch_started", "browser.provider_outcome":
+			return producerEvent{}, false
+		case "job.transition":
+			if detailString(event.detail, "from") == StateValidating && detailString(event.detail, "to") != StateReady {
+				return producerEvent{}, false
+			}
 		}
 	}
 	return producerEvent{}, false

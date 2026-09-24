@@ -1,0 +1,10 @@
+{
+  "protocol": "papio-browser/1",
+  "type": "viewer_capture",
+  "msg_id": "m_viewer_capture_02",
+  "job_id": "job_0003_leventhal",
+  "seq": 6,
+  "payload": {
+    "mechanism": "refetch"
+  }
+}

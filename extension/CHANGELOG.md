@@ -40,6 +40,14 @@ for the full pre-split extension history.
   response in *papio*'s own handoff tabs. The bytes go only to the local
   `papio` download folder and never leave your computer. Chrome keeps its
   existing download rule and asks for no new permission.
+- **The daemon learns which saves are signed viewer PDFs.** Just before
+  Firefox saves its copy of a signed viewer PDF, or when Chrome's download
+  rule starts to save one, the extension sends a `viewer_capture` message
+  with the adapter that matched the paper's page. `papio stats producers`
+  then counts the paper as `viewer_capture` instead of `unknown`. The
+  extension sends the message only to a daemon that advertises
+  `native_viewer_download_v2`; an older daemon would refuse the message and
+  end the session.
 
 ### Removed
 - **Saving a Firefox viewer PDF through the daemon's macOS helper.** Firefox

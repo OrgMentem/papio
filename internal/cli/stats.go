@@ -57,7 +57,7 @@ func newStatsCommand(opt *options) *cobra.Command {
 }
 
 // newStatsProducersCommand reports who produced the artifacts promoted in a
-// period — adapter, agent, native viewer, daemon fetch, manual or unknown —
+// period — adapter, agent, viewer capture, daemon fetch, manual or unknown —
 // and how many needed a person, from each promotion's artifact.producer
 // record. Sign-in is counted apart from other interventions, so a paced run
 // that only needed an institutional login does not read as operator work.

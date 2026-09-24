@@ -1664,6 +1664,7 @@ test("hello is the first outgoing frame with a valid msg_id and seq 0", async ()
     "effect_permit_v1",
     "pdf_grab_v1",
     "native_viewer_download_v1",
+    "native_viewer_download_v2",
     "institutional_materialization_v1",
     "surface_presence_v1",
     "work_pulse_v1",
@@ -10337,7 +10338,7 @@ const CAPTURE_LIMIT = 100 * 1024 * 1024;
 const SIGNED_PDF = new TextEncoder().encode("%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
 
 /** Two delegated ScienceDirect handoffs on a Firefox with the stream capture. */
-async function captureHarness(opts: { chrome?: boolean; hostGranted?: boolean; clickAdapter?: boolean } = {}) {
+async function captureHarness(opts: { chrome?: boolean; hostGranted?: boolean; clickAdapter?: boolean; viewerCaptureRecord?: boolean } = {}) {
   const job = (jobID: string, tabID: number): ActiveJob => ({
     job_id: jobID, tab_id: tabID, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
     status: "auth_pending", provider_hosts: ["www.sciencedirect.com"], access_mode: "delegated",
@@ -10368,7 +10369,8 @@ async function captureHarness(opts: { chrome?: boolean; hostGranted?: boolean; c
   h.tabs.seed({ id: 100, url: "https://www.sciencedirect.com/science/article/pii/A" });
   h.tabs.seed({ id: 200, url: "https://www.sciencedirect.com/science/article/pii/B" });
   await h.bridge.start();
-  await h.port.onMessage.emit(helloAck({ daemon_version: CURRENT_DAEMON, features: ["native_viewer_download_v1"] }));
+  await h.port.onMessage.emit(helloAck({ daemon_version: CURRENT_DAEMON,
+    features: opts.viewerCaptureRecord === true ? ["native_viewer_download_v2"] : ["native_viewer_download_v1"] }));
   await settle();
   const notices = () => h.frames().filter(f =>
     (f.type === "provider_outcome" && f.payload["outcome"] === "native_viewer_download_required") ||
@@ -10616,6 +10618,51 @@ test("Firefox captures the viewer a click adapter's job opens, although it does 
   expect(h.downloads.started.map(d => d.filename)).toEqual(["papio/job_rule_a/paper.pdf"]);
   expect(notices()).toHaveLength(0);
 });
+
+// The loopback run of 2026-09-24 recorded the capture as producer "unknown":
+// the daemon's adoption sweep promoted the saved file before download_complete
+// arrived, and nothing else named the source. A daemon that advertises
+// native_viewer_download_v2 now gets a viewer_capture record before the file
+// can land; an older daemon, whose strict parser would reject the unknown
+// type and end the session, never gets one.
+for (const chrome of [false, true]) {
+  for (const viewerCaptureRecord of [true, false]) {
+    test(`the signed viewer save is announced before its file lands, only to a v2 daemon: ${chrome ? "Chrome" : "Firefox"} v2=${viewerCaptureRecord}`, async () => {
+      const { h, web, notices } = await captureHarness({ chrome, clickAdapter: true, viewerCaptureRecord });
+      let typesBeforeFile: string[] = [];
+      if (chrome) {
+        await h.webNavigation.onBeforeNavigate.emit({ tabId: 100, frameId: 0, url: SIGNED_VIEWER });
+        const item: DownloadItemLike = { id: 4444, url: SIGNED_VIEWER, finalUrl: SIGNED_VIEWER, mime: "application/pdf",
+          state: "in_progress", filename: "" };
+        h.downloads.items.set(item.id, item);
+        await h.downloads.onCreated.emit(item);
+        // Chrome still holds the bytes under a temporary name.
+        typesBeforeFile = h.frames().map((f) => f.type);
+        const suggestions: { filename: string; conflictAction: "uniquify" }[] = [];
+        await h.downloads.onDeterminingFilename.emit({ ...item, filename: "/Downloads/paper.pdf" }, (s) => suggestions.push(s));
+        expect(suggestions).toEqual([{ filename: "papio/job_rule_a/paper.pdf", conflictAction: "uniquify" }]);
+      } else {
+        h.downloads.afterCreate = () => {
+          typesBeforeFile = h.frames().map((f) => f.type);
+        };
+        await web.respond({ requestId: "r1", url: SIGNED_VIEWER, tabId: 100 });
+        const filter = web.filters.get("r1")!;
+        filter.deliver(SIGNED_PDF);
+        filter.stop();
+        await settle();
+        expect(h.downloads.started.map((d) => d.filename)).toEqual(["papio/job_rule_a/paper.pdf"]);
+      }
+      const records = h.frames().filter((f) => f.type === "viewer_capture");
+      expect(typesBeforeFile.includes("viewer_capture")).toBe(viewerCaptureRecord);
+      expect(records.map((f) => [f.job_id, f.payload])).toEqual(viewerCaptureRecord ? [["job_rule_a", {
+        mechanism: chrome ? "download_rule" : "stream_capture",
+        adapter_id: "sciencedirect",
+        adapter_version: adapters.find((adapter) => adapter.id === "sciencedirect")!.version,
+      }]] : []);
+      expect(notices()).toHaveLength(0);
+    });
+  }
+}
 
 /** Replays job_cb931061ba (2026-09-24): an institutional route reaches the
  * library's sign-in wall, the operator signs in somewhere else first, and the
