@@ -443,3 +443,22 @@ func TestFailedWaiterDoesNotStrandWaitingPapers(t *testing.T) {
 		t.Fatalf("outcomes = %v, want waiting then applied", got)
 	}
 }
+
+// In stored mode a new Zotero item is saved by Zotero desktop too, so it waits
+// for a closed Zotero like an attachment to an existing item does.
+func TestStoredNewItemImportWaitsForZotero(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Config.Zotio.AutoImport = true
+	svc.Config.Zotio.AttachmentMode = "stored"
+	readyPipeline(svc)
+	desktop := newFakeZoteroDesktop()
+	svc.ZoteroDesktop = desktop
+	svc.AutoImporter = desktop
+	id := seedReadyJobWithImportResult(t, svc, jobs, "wr_new_item_stored_closed")
+	if got := autoImportStatuses(t, jobs, id); strings.Join(got, ",") != "waiting" {
+		t.Fatalf("stored new-item import with Zotero closed = %v, want waiting", got)
+	}
+	if _, _, imports, _ := desktop.counts(); imports != 0 {
+		t.Fatalf("connector save attempted %d times while Zotero was closed, want 0", imports)
+	}
+}

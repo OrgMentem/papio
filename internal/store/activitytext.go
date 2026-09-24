@@ -133,6 +133,8 @@ func ActivityText(kind string, detail map[string]any) string {
 			return "Filed into Zotero collection"
 		case "error":
 			return "Zotero collection filing failed"
+		case "deferred":
+			return "Zotero collection filing deferred until after import"
 		default:
 			return "Zotero collection filing attempted"
 		}

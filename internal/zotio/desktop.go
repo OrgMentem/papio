@@ -64,14 +64,14 @@ func (s DesktopStatus) Ready() bool { return s.ConnectorReachable }
 // ImportNeedsDesktop reports whether an import for a job must reach Zotero
 // desktop's connector. It derives from the same route choice PlanJobs makes,
 // so a route change moves both together: a route of "connector" fails
-// outright while Zotero is closed, "auto" falls back to the Web API, and a
-// linked file uploads nothing.
+// outright while Zotero is closed, and a linked file gets no route and needs
+// no desktop.
 func ImportNeedsDesktop(zotioItemKey, attachmentMode string) bool {
 	mode := "stored"
 	if strings.TrimSpace(attachmentMode) == "linked-file" {
 		mode = "linked-file"
 	}
-	route := newItemRoute
+	route := newItemRoute(mode)
 	if strings.TrimSpace(zotioItemKey) != "" {
 		route = existingItemRoute(mode)
 	}

@@ -42,6 +42,10 @@ type planCLI struct {
 	lastResolveAt   string
 	collectionCalls int
 	collectionErr   error
+	collectionArgs  []string
+	// collections answers "collections list"; empty means no collections.
+	collections     string
+	collectionLists int
 	enrichArgs      []string
 	callOrder       []string
 }
@@ -66,8 +70,15 @@ func (c *planCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage,
 		c.resolveCalls++
 		c.lastResolveAt = args[len(args)-1]
 		return json.RawMessage(c.manifest), nil
+	case strings.Contains(joined, "collections list"):
+		c.collectionLists++
+		if c.collections == "" {
+			return json.RawMessage(`{"meta":{"source":"live"},"results":[]}`), nil
+		}
+		return json.RawMessage(c.collections), nil
 	case strings.Contains(joined, "items add-to-collection"):
 		c.collectionCalls++
+		c.collectionArgs = append([]string(nil), args...)
 		c.callOrder = append(c.callOrder, "collection")
 		return json.RawMessage(`{"ok":true}`), c.collectionErr
 	case strings.Contains(joined, "items enrich"):
@@ -398,34 +409,47 @@ func TestMaterializePrivateFileRemovesTargetOnSHAMismatch(t *testing.T) {
 	}
 }
 
-// New-item creation must not force zotio's "web" route. That route uploads the
-// attachment into Zotero's own file storage, which ignores the file storage the
-// operator configured in Zotero — for a WebDAV user it silently consumes a
-// storage plan they never chose to use, and when it fills, filing stops
-// entirely with a bare HTTP 413. "auto" prefers the local desktop, which hands
-// the file to Zotero and lets Zotero honour that configuration, and still falls
-// back to the web API when no desktop is reachable.
-func TestNewItemPlanDoesNotForceZoteroCloudRoute(t *testing.T) {
-	cli := &planCLI{
-		manifest: `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`,
-		preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
-	}
-	service, jobID := readyPlanService(t, "", cli)
-	plans, err := service.PlanJobs(context.Background(), []string{jobID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, args := range map[string][]string{
-		"preview": plans[0].PreviewArgs,
-		"apply":   plans[0].ApplyArgs,
-	} {
-		joined := strings.Join(args, " ")
-		if strings.Contains(joined, "--via web") {
-			t.Fatalf("%s args force the Zotero cloud route: %s", name, joined)
-		}
-		if !strings.Contains(joined, "--via auto") {
-			t.Fatalf("%s args = %s, want the auto route", name, joined)
-		}
+// New-item creation must never reach zotio's "web" route in stored mode. That
+// route uploads the attachment into Zotero's own file storage, which ignores
+// the file storage the operator configured in Zotero: for a WebDAV user it
+// silently consumes a storage plan they never chose to use, and when it fills,
+// filing stops entirely with a bare HTTP 413. "auto" fell back to it whenever
+// the desktop was closed or could not resolve the collection, so stored mode
+// asks for "connector", which fails closed instead.
+//
+// A linked-file create goes through the Web API whatever "--via" says and
+// uploads nothing, so it asks for no route and never waits for the desktop.
+func TestNewItemPlanAsksForConnectorInStoredModeOnly(t *testing.T) {
+	for _, tc := range []struct {
+		mode, wantVia string
+	}{{mode: "stored", wantVia: "connector"}, {mode: "linked-file"}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			cli := &planCLI{
+				manifest: `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`,
+				preview:  `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+			}
+			service, jobID := readyPlanService(t, "", cli)
+			service.AttachmentMode = tc.mode
+			plans, err := service.PlanJobs(context.Background(), []string{jobID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, args := range map[string][]string{
+				"preview": plans[0].PreviewArgs,
+				"apply":   plans[0].ApplyArgs,
+			} {
+				via := slices.Index(args, "--via")
+				if tc.wantVia == "" {
+					if via >= 0 {
+						t.Fatalf("%s args = %v, want no --via", name, args)
+					}
+					continue
+				}
+				if via < 0 || via+1 >= len(args) || args[via+1] != tc.wantVia {
+					t.Fatalf("%s args = %v, want --via %s", name, args, tc.wantVia)
+				}
+			}
+		})
 	}
 }
 
@@ -1431,7 +1455,7 @@ func TestPlanIdempotencyKeyDistinguishesTheExistingItemRoute(t *testing.T) {
 	const job, sha = "job_1", "sha256:abc"
 	stored := planIdempotencyKey(job, sha, "stored", "", existingItemRoute("stored"))
 	linked := planIdempotencyKey(job, sha, "linked-file", "", existingItemRoute("linked-file"))
-	preChange := planIdempotencyKey(job, sha, "stored", "", newItemRoute)
+	preChange := planIdempotencyKey(job, sha, "stored", "", "auto")
 	if stored == preChange {
 		t.Fatalf("key = %q, want the connector route to invalidate the pre-change plan", stored)
 	}

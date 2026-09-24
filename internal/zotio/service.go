@@ -42,6 +42,10 @@ type Service struct {
 	DataDir        string
 	AttachmentMode string
 	AutoEnrich     bool
+	// Abstracts looks up the abstract a discovery source holds for a DOI.
+	// describeNewItem uses it to give an auto-imported item the abstract its
+	// registry record lacks; nil leaves that to the post-import enrichment.
+	Abstracts AbstractLookup
 	// ExceptionTags enables the reconciled exception-tag ledger on linked
 	// Zotero items (config zotio.exception_tags).
 	ExceptionTags bool

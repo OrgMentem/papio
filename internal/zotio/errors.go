@@ -178,7 +178,8 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 		strings.Contains(lower, "zotio plan/apply integration is not configured") {
 		return safeErrorInfo(ErrorClassZotioNotConfigured, "Zotio is not configured", 0)
 	}
-	if strings.Contains(lower, "confirmation sha-256 does not match") || strings.Contains(lower, "plan confirmation digest mismatch") {
+	if strings.Contains(lower, "confirmation sha-256 does not match") || strings.Contains(lower, "plan confirmation digest mismatch") ||
+		strings.Contains(lower, "verifying planned manifest") || strings.Contains(lower, "does not bind its manifest") {
 		return safeErrorInfo(ErrorClassPlanConfirmationMismatch, "plan confirmation does not match", 0)
 	}
 	if strings.Contains(lower, "apply reservation was not finalized") || errors.Is(err, job.ErrConflict) {

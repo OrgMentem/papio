@@ -89,6 +89,19 @@ type Plan struct {
 	Preview            json.RawMessage `json:"preview"`
 	CreatedAt          string          `json:"created_at"`
 	ConfirmationSHA256 string          `json:"confirmation_sha256"`
+	// ManifestSHA256 binds the manifest bytes zotio will apply to this plan.
+	// The plan names its manifest only by path, so the confirmation digest
+	// covers the manifest only through this field, and Apply refuses a
+	// manifest that no longer hashes to it.
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	// CollectionKey is the policy collection the new item's manifest carries,
+	// so the desktop save files it (describeNewItem). Empty means the item is
+	// filed after the import, as every item was before.
+	CollectionKey string `json:"collection_key,omitempty"`
+	// SavesDOIAndAbstract reports that the new item's manifest carries both a
+	// DOI and an abstract, so a desktop save leaves the post-import enrichment
+	// nothing to fill.
+	SavesDOIAndAbstract bool `json:"saves_doi_and_abstract,omitempty"`
 }
 
 // ApplyResult is the durable outcome returned on both first apply and replay.
@@ -182,7 +195,7 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 	collection := strings.TrimSpace(row.Policy.Collection)
 	// The route belongs in the key, and the two branches below ask for different
 	// ones, so it is resolved before the lookup rather than inside them.
-	planRoute := newItemRoute
+	planRoute := newItemRoute(attachmentMode)
 	if acquisition.ZotioItemKey != "" {
 		planRoute = existingItemRoute(attachmentMode)
 	}
@@ -267,25 +280,33 @@ func (s *Service) planJob(ctx context.Context, jobID string) (*Plan, error) {
 		if err := s.CLI.Sync(ctx); err != nil {
 			return nil, fmt.Errorf("refreshing Zotio library before deduplication: %w", err)
 		}
-		manifestPath, manifest, err := s.resolveManifest(ctx, plan, row.Work)
+		manifestJSON, manifest, err := s.resolveManifest(ctx, plan, row.Work)
 		if err != nil {
 			return nil, err
 		}
-		plan.ManifestPath = manifestPath
 		plan.Route, plan.ExpectedParentKey, err = manifestRoute(manifest)
 		if err != nil {
 			return nil, err
 		}
-		// "auto" prefers the local Zotero desktop and falls back to
-		// api.zotero.org when it is not reachable. Forcing "web" here uploaded
-		// every attachment into Zotero's own file storage, which ignores
-		// whatever file storage the operator configured in Zotero — a WebDAV
-		// server, for instance. On this machine that quietly consumed a 300 MB
-		// plan the operator does not use and had not chosen, and once it filled
-		// no paper could be filed at all. The desktop route hands the file to
-		// Zotero, so Zotero puts it wherever the operator told it to.
-		plan.PreviewArgs = []string{"--agent", "--via", newItemRoute, "import", "apply", manifestPath, "--attach-mode", attachmentMode}
-		plan.ApplyArgs = []string{"--agent", "--yes", "--via", newItemRoute, "import", "apply", manifestPath, "--attach-mode", attachmentMode}
+		// Only a desktop save can file and describe the item before the Web
+		// API has it. A linked-file create goes through the Web API, where the
+		// follow-ups find the new item at once.
+		if plan.Route == "manifest_create" && planRoute == "connector" {
+			if manifestJSON, err = s.describeNewItem(ctx, plan, row, manifestJSON); err != nil {
+				return nil, err
+			}
+		}
+		if plan.ManifestPath, plan.ManifestSHA256, err = s.writeManifest(plan, manifestJSON); err != nil {
+			return nil, err
+		}
+		// Never "--via web": see newItemRoute for what that route did to a
+		// WebDAV operator's storage plan, and why "auto" went too.
+		importArgs := []string{"import", "apply", plan.ManifestPath, "--attach-mode", attachmentMode}
+		if planRoute != "" {
+			importArgs = append([]string{"--via", planRoute}, importArgs...)
+		}
+		plan.PreviewArgs = append([]string{"--agent"}, importArgs...)
+		plan.ApplyArgs = append([]string{"--agent", "--yes"}, importArgs...)
 	}
 
 	preview, err := s.CLI.RunJSON(ctx, plan.PreviewArgs...)
@@ -350,11 +371,18 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		if existing.Status == "ambiguous" {
 			return nil, s.ambiguousReplayError(existing, plan.ID)
 		}
-		s.fileCollection(ctx, plan, existing)
+		if !filedWithImport(plan, existing) {
+			s.fileCollection(ctx, plan, existing)
+		}
 		if err := s.markImported(ctx, existing); err != nil {
 			return nil, err
 		}
 		return existing, nil
+	}
+	// Only a real zotio write needs the manifest to be the one the plan was
+	// confirmed against; a replay above writes nothing.
+	if err := verifyPlanManifest(plan); err != nil {
+		return nil, err
 	}
 	claimed, err := s.claimApply(ledgerCtx, idempotencyKey, plan.JobID)
 	if err != nil {
@@ -369,7 +397,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 			if result.Status == "ambiguous" {
 				return nil, s.ambiguousReplayError(result, plan.ID)
 			}
-			s.fileCollection(ctx, plan, result)
+			if !filedWithImport(plan, result) {
+				s.fileCollection(ctx, plan, result)
+			}
 			if err := s.markImported(ctx, result); err != nil {
 				return nil, err
 			}
@@ -391,7 +421,14 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		if errors.Is(commandErr, context.DeadlineExceeded) || errors.Is(commandErr, context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled) {
 			return nil, s.recordAmbiguousApply(ctx, idempotencyKey, plan, out, applyErr)
 		}
-		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
+		failure := s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
+		if plan.CollectionKey != "" && desktopTargetMissing(out) {
+			// zotio refused before saving anything, and the plan is gone, so
+			// the next plan can safely leave the collection to the follow-up.
+			s.deferCollectionFiling(ctx, plan)
+			return nil, fmt.Errorf("%w: %w", errFilingTargetMissing, failure)
+		}
+		return nil, failure
 	}
 	envelope, err := decodeApply(out)
 	if err != nil {
@@ -443,8 +480,7 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if err := s.markImported(ctx, result); err != nil {
 		return nil, err
 	}
-	s.fileCollection(ctx, plan, result)
-	s.enrichAutoImportedParent(ctx, plan, result)
+	s.followUp(ctx, plan, result)
 	return result, nil
 }
 
@@ -505,11 +541,7 @@ func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyR
 // OA-PDF remediation or validation mode, and its failure cannot undo the import.
 // It reports whether it asked zotio to enrich, which is when it records an event.
 func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, result *ApplyResult) bool {
-	if !s.AutoEnrich || plan == nil || result == nil || result.Status != "applied" || result.ParentKey == "" {
-		return false
-	}
-	row, err := s.Bundle.Jobs.Get(ctx, plan.JobID)
-	if err != nil || !row.Policy.AutoImport {
+	if !s.autoEnrichApplies(ctx, plan, result) {
 		return false
 	}
 	detail := map[string]any{
@@ -527,6 +559,16 @@ func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, resu
 	}
 	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpEnrich, detail)
 	return true
+}
+
+// autoEnrichApplies reports whether a successful import gets the post-import
+// enrichment: auto-enrich is on and the job's policy asked for auto-import.
+func (s *Service) autoEnrichApplies(ctx context.Context, plan *Plan, result *ApplyResult) bool {
+	if !s.AutoEnrich || plan == nil || result == nil || result.Status != "applied" || result.ParentKey == "" {
+		return false
+	}
+	row, err := s.Bundle.Jobs.Get(ctx, plan.JobID)
+	return err == nil && row.Policy.AutoImport
 }
 
 // recordFollowUpFailure adds a failed follow-up's classification to its event
@@ -558,15 +600,16 @@ func (s *Service) PlanAndApply(ctx context.Context, jobID string) (status, paren
 	if status, parentKey, skip, err := s.skipOwnedReadyImport(ctx, jobID); skip || err != nil {
 		return status, parentKey, "", err
 	}
-	plans, err := s.PlanJobs(ctx, []string{jobID})
-	if err != nil {
+	plan, result, err := s.planAndApplyOnce(ctx, jobID)
+	if errors.Is(err, errFilingTargetMissing) {
+		// Zotero desktop could not see the policy collection, so zotio saved
+		// nothing. Apply has dropped that plan and recorded the filing as
+		// deferred, so this plan leaves the collection to the follow-up.
+		plan, result, err = s.planAndApplyOnce(ctx, jobID)
+	}
+	if plan == nil {
 		return "failed", "", "", err
 	}
-	if len(plans) != 1 || plans[0] == nil {
-		return "failed", "", "", errors.New("planning Zotio auto-import returned no plan")
-	}
-	plan := plans[0]
-	result, err := s.Apply(ctx, plan.ID, plan.ConfirmationSHA256)
 	if result == nil {
 		if err == nil {
 			err = errors.New("applying Zotio auto-import returned no result")
@@ -574,6 +617,18 @@ func (s *Service) PlanAndApply(ctx context.Context, jobID string) (status, paren
 		return "failed", plan.ExpectedParentKey, "", err
 	}
 	return result.Status, result.ParentKey, result.AttachmentKey, err
+}
+
+func (s *Service) planAndApplyOnce(ctx context.Context, jobID string) (*Plan, *ApplyResult, error) {
+	plans, err := s.PlanJobs(ctx, []string{jobID})
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(plans) != 1 || plans[0] == nil {
+		return nil, nil, errors.New("planning Zotio auto-import returned no plan")
+	}
+	result, err := s.Apply(ctx, plans[0].ID, plans[0].ConfirmationSHA256)
+	return plans[0], result, err
 }
 
 // skipOwnedReadyImport short-circuits auto-import when Zotio's mirror already
@@ -674,42 +729,72 @@ func (s *Service) stageAttachment(plan *Plan, w work.Work) (string, error) {
 	return staged, nil
 }
 
-func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) (string, importManifest, error) {
+// resolveManifest asks zotio to resolve the staged PDF and returns the manifest
+// it answered, unwritten: describeNewItem may still complete it, and
+// writeManifest stores what the plan binds.
+func (s *Service) resolveManifest(ctx context.Context, plan *Plan, w work.Work) (json.RawMessage, importManifest, error) {
 	stagingDir := filepath.Join(s.DataDir, "zotio", "staging", plan.JobID, plan.ArtifactSHA256)
 	if err := os.MkdirAll(stagingDir, 0o700); err != nil {
-		return "", importManifest{}, err
+		return nil, importManifest{}, err
 	}
 	name, err := importStagingBasename(w)
 	if err != nil {
-		return "", importManifest{}, err
+		return nil, importManifest{}, err
 	}
 	staged := filepath.Join(stagingDir, name)
 	if err := materializePrivateFile(plan.ArtifactPath, staged, plan.ArtifactSHA256); err != nil {
-		return "", importManifest{}, err
+		return nil, importManifest{}, err
 	}
 	manifestJSON, err := s.CLI.RunJSON(ctx, "--agent", "import", "resolve", stagingDir)
 	if err != nil {
-		return "", importManifest{}, fmt.Errorf("resolving Zotio import manifest: %w", err)
+		return nil, importManifest{}, fmt.Errorf("resolving Zotio import manifest: %w", err)
 	}
 	var manifest importManifest
 	if err := json.Unmarshal(manifestJSON, &manifest); err != nil {
-		return "", importManifest{}, fmt.Errorf("decoding Zotio import manifest: %w", err)
+		return nil, importManifest{}, fmt.Errorf("decoding Zotio import manifest: %w", err)
 	}
 	if len(manifest.Entries) != 1 {
-		return "", importManifest{}, fmt.Errorf("Zotio resolver returned %d entries, want exactly one", len(manifest.Entries))
+		return nil, importManifest{}, fmt.Errorf("Zotio resolver returned %d entries, want exactly one", len(manifest.Entries))
 	}
-	manifestDir := filepath.Join(s.DataDir, "zotio", "manifests")
-	if err := os.MkdirAll(manifestDir, 0o700); err != nil {
-		return "", importManifest{}, err
+	return manifestJSON, manifest, nil
+}
+
+// writeManifest stores the manifest zotio will apply and returns its path and
+// SHA-256. The name carries the plan ID as well as the job and artifact: two
+// plans for the same file (another attachment mode, a changed policy, two
+// planners racing) used to share one path, so the later resolve rewrote the
+// manifest the earlier plan had been confirmed against. The binding would now
+// refuse that plan instead, so each plan gets a manifest of its own.
+func (s *Service) writeManifest(plan *Plan, manifestJSON []byte) (string, string, error) {
+	dir := filepath.Join(s.DataDir, "zotio", "manifests")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", err
 	}
-	manifestPath := filepath.Join(manifestDir, plan.JobID+"-"+plan.ArtifactSHA256+".json")
-	if err := s.removeStaleUnresolvedManifest(manifestPath); err != nil {
-		return "", importManifest{}, err
+	path := filepath.Join(dir, plan.JobID+"-"+plan.ArtifactSHA256+"-"+plan.ID+".json")
+	data := append(append(make([]byte, 0, len(manifestJSON)+1), manifestJSON...), '\n')
+	if err := atomicPrivateWrite(path, data); err != nil {
+		return "", "", err
 	}
-	if err := atomicPrivateWrite(manifestPath, append(manifestJSON, '\n')); err != nil {
-		return "", importManifest{}, err
+	sum := sha256.Sum256(data)
+	return path, hex.EncodeToString(sum[:]), nil
+}
+
+// verifyPlanManifest refuses to apply a manifest other than the one the plan
+// was confirmed against. zotio reads the manifest from disk at apply time, so
+// without this check a manifest rewritten after the preview would run under
+// the old confirmation. A plan from before the binding cannot prove its
+// manifest, so it is refused too.
+func verifyPlanManifest(plan *Plan) error {
+	if plan.ManifestPath == "" {
+		return nil
 	}
-	return manifestPath, manifest, nil
+	if plan.ManifestSHA256 == "" {
+		return fmt.Errorf("Zotio plan %s does not bind its manifest; replan required", plan.ID)
+	}
+	if err := verifyFileSHA256(plan.ManifestPath, plan.ManifestSHA256); err != nil {
+		return fmt.Errorf("verifying planned manifest: %w", err)
+	}
+	return nil
 }
 
 func manifestIsUnresolved(manifest importManifest) bool {
@@ -749,23 +834,6 @@ func (s *Service) planManifestUnresolved(plan *Plan) (bool, error) {
 		return false, err
 	}
 	return manifestIsUnresolved(manifest), nil
-}
-
-func (s *Service) removeStaleUnresolvedManifest(path string) error {
-	manifest, err := s.loadManifestAt(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !manifestIsUnresolved(manifest) {
-		return nil
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
 }
 
 func manifestRoute(manifest importManifest) (route, parent string, err error) {
