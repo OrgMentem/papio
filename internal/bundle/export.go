@@ -5,6 +5,7 @@
 package bundle
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -345,6 +346,12 @@ var exportPreMaterializeHook func()
 
 // Export creates (or verifies and reuses) bundle.json and its relative
 // content-addressed artifact. An empty destination uses DataDir/bundles/<job>.
+//
+// Same-destination safety: a destination that already holds a bundle for a
+// different job is left untouched and Export returns a conflict. A provable
+// partial artifact (a strict prefix, shorter than the verified source) heals
+// through a staged publish; any other mismatch is refused so unrelated caller
+// data is never replaced.
 func (e *Exporter) Export(ctx context.Context, jobID, destination string) (string, *protocol.AcquisitionBundle, error) {
 	b, art, err := e.Document(ctx, jobID)
 	if err != nil {
@@ -379,14 +386,27 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if err := os.MkdirAll(artifactsDir, 0o700); err != nil {
 		return rollback(err, false)
 	}
+	// No automatic staging reap: staging names are unique per attempt so
+	// leftovers never block a retry, and only the owning (possibly dead)
+	// process can prove abandonment. A cross-process Export must never
+	// remove another writer's active staging or a matching user file.
+	oldBundle, bundleExisted, err := inspectExistingBundle(bundlePath)
+	if err != nil {
+		return rollback(err, false)
+	}
+	if bundleExisted {
+		existing, decodeErr := protocol.DecodeAcquisitionBundle(oldBundle)
+		if decodeErr != nil {
+			return rollback(fmt.Errorf("existing bundle %s is not a valid bundle: %w", bundlePath, decodeErr), false)
+		}
+		if existing.JobID != jobID {
+			return rollback(fmt.Errorf("%w: destination %s holds bundle for job %s, not %s", job.ErrConflict, destination, existing.JobID, jobID), false)
+		}
+	}
 	if exportPreMaterializeHook != nil {
 		exportPreMaterializeHook()
 	}
 	artifactCreated, err = materializeArtifact(art.Path, artifactPath, art.SHA256)
-	if err != nil {
-		return rollback(err, false)
-	}
-	bundleExisted, err := pathExists(bundlePath)
 	if err != nil {
 		return rollback(err, false)
 	}
@@ -398,7 +418,23 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 		return rollback(err, false)
 	}
 	if err := e.record(ctx, jobID, art.SHA256, bundlePath); err != nil {
-		return rollback(err, !bundleExisted)
+		if bundleExisted {
+			restoreErr := atomicWrite(bundlePath, oldBundle, 0o600)
+			var cleanupErr error
+			if artifactCreated {
+				if rmErr := os.Remove(artifactPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					cleanupErr = rmErr
+				}
+			}
+			if restoreErr != nil {
+				return "", nil, fmt.Errorf("exporting bundle: %w", errors.Join(err, restoreErr, cleanupErr))
+			}
+			if cleanupErr != nil {
+				return "", nil, fmt.Errorf("exporting bundle: %w", errors.Join(err, cleanupErr))
+			}
+			return "", nil, err
+		}
+		return rollback(err, true)
 	}
 	return bundlePath, b, nil
 }
@@ -416,11 +452,15 @@ func digest(b *protocol.AcquisitionBundle) (string, error) {
 
 func materializeArtifact(source, target, expectedSHA string) (created bool, retErr error) {
 	if info, err := os.Lstat(target); err == nil {
+		if info.IsDir() {
+			return false, fmt.Errorf("existing bundle artifact %s is a directory", target)
+		}
 		if !info.Mode().IsRegular() {
 			// Preserve immutability contract: a symlink (or other non-regular
 			// file) to matching bytes would reference mutable/external bytes.
-			// Chose to replace it with a real immutable copy rather than
-			// failing, so the bundle always owns its bytes.
+			// Replace the link itself with a real immutable copy rather than
+			// failing, so the bundle always owns its bytes. Removing the link
+			// never touches the link target.
 			if rmErr := os.Remove(target); rmErr != nil {
 				return false, fmt.Errorf("existing bundle artifact %s is not a regular file (%s) and could not be replaced: %w", target, info.Mode().String(), rmErr)
 			}
@@ -429,7 +469,18 @@ func materializeArtifact(source, target, expectedSHA string) (created bool, retE
 				if got == expectedSHA {
 					return false, nil
 				}
-				return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
+				// A mismatch heals only when the existing file is provably a
+				// truncated copy of this source: a strict prefix shorter than
+				// the verified source. Anything else may be unrelated caller
+				// data under a colliding name, so it is preserved and the
+				// export fails.
+				partial, perr := isLegacyPartial(source, target)
+				if perr != nil {
+					return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s (partial check: %w)", target, got, expectedSHA, perr)
+				}
+				if !partial {
+					return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
+				}
 			} else if !os.IsNotExist(err) {
 				return false, err
 			}
@@ -446,27 +497,119 @@ func materializeArtifact(source, target, expectedSHA string) (created bool, retE
 			retErr = closeErr
 		}
 	}()
-	out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
+	dir := filepath.Dir(target)
+	out, err := os.CreateTemp(dir, ".artifact-*.tmp")
 	if err != nil {
 		return false, err
 	}
+	tmpName := out.Name()
 	_, copyErr := io.Copy(out, in)
+	syncErr := out.Sync()
 	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil {
-		_ = os.Remove(target)
+	if copyErr != nil || syncErr != nil || closeErr != nil {
+		_ = os.Remove(tmpName)
 		if copyErr != nil {
 			return false, copyErr
 		}
+		if syncErr != nil {
+			return false, syncErr
+		}
 		return false, closeErr
 	}
-	got, _, err := artifact.HashFile(target)
+	if err := os.Chmod(tmpName, 0o400); err != nil {
+		_ = os.Remove(tmpName)
+		return false, err
+	}
+	got, _, err := artifact.HashFile(tmpName)
 	if err != nil {
-		_ = os.Remove(target)
+		_ = os.Remove(tmpName)
 		return false, err
 	}
 	if got != expectedSHA {
-		_ = os.Remove(target)
+		_ = os.Remove(tmpName)
 		return false, fmt.Errorf("copied artifact hash %s, want %s", got, expectedSHA)
+	}
+	// Atomic publish in the same directory. Renaming over a provable partial
+	// heals it; the mismatch gate above already refused anything else, so a
+	// different artifact never reaches this rename.
+	if err := os.Rename(tmpName, target); err != nil {
+		_ = os.Remove(tmpName)
+		return false, err
+	}
+	return true, nil
+}
+
+// inspectExistingBundle reads a pre-existing bundle.json without following
+// surprises: directories and non-regular files are refused so unrelated user
+// data is never replaced.
+func inspectExistingBundle(bundlePath string) ([]byte, bool, error) {
+	info, err := os.Lstat(bundlePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if info.IsDir() || !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("existing bundle path %s is %s, refusing to replace", bundlePath, info.Mode().String())
+	}
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		return nil, false, err
+	}
+	return data, true, nil
+}
+
+// isLegacyPartial reports whether the existing target is provably a truncated
+// copy of source: strictly shorter and byte-equal over its full length.
+// Anything else (same/longer length, divergent bytes, unreadable files) is
+// not a provable partial and must be preserved, not replaced.
+func isLegacyPartial(source, target string) (bool, error) {
+	sinfo, err := os.Stat(source)
+	if err != nil {
+		return false, err
+	}
+	tinfo, err := os.Stat(target)
+	if err != nil {
+		return false, err
+	}
+	if tinfo.Size() >= sinfo.Size() {
+		return false, nil
+	}
+	sf, err := os.Open(source)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = sf.Close() }()
+	tf, err := os.Open(target)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tf.Close() }()
+	const chunk = 32 * 1024
+	sbuf := make([]byte, chunk)
+	tbuf := make([]byte, chunk)
+	for {
+		tn, terr := io.ReadFull(tf, tbuf)
+		if terr == io.EOF {
+			break
+		}
+		if terr != nil && terr != io.ErrUnexpectedEOF {
+			return false, terr
+		}
+		sn, serr := io.ReadFull(sf, sbuf[:tn])
+		if serr != nil && serr != io.ErrUnexpectedEOF {
+			if serr == io.EOF {
+				return false, nil
+			}
+			return false, serr
+		}
+		if sn != tn || !bytes.Equal(sbuf[:tn], tbuf[:tn]) {
+			return false, nil
+		}
+		if terr == io.ErrUnexpectedEOF {
+			break
+		}
 	}
 	return true, nil
 }

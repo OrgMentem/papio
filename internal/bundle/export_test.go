@@ -359,8 +359,18 @@ func TestExportRejectsNonReadyAndCorruptExistingTarget(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// "corrupt" is not a prefix of the verified source, so it may be unrelated
+	// caller data under a colliding name. The export fails and preserves it;
+	// only a provable truncated prefix heals (see TestExportHealsInterruptedPartialArtifact).
 	if _, _, err := exporter.Export(ctx, id, dest); err == nil {
 		t.Fatal("reused a corrupt destination artifact")
+	}
+	kept, err := os.ReadFile(bad)
+	if err != nil || string(kept) != "corrupt" {
+		t.Fatalf("mismatched artifact changed after refused export: %q, %v", kept, err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "bundle.json")); !os.IsNotExist(err) {
+		t.Fatalf("bundle.json written over refused export: %v", err)
 	}
 }
 
@@ -851,6 +861,215 @@ func TestExportRollbackPreservesExistingDestinationWhenMaterializeFails(t *testi
 	}
 	if _, err := os.Stat(filepath.Join(destination, "bundle.json")); !os.IsNotExist(err) {
 		t.Fatalf("bundle.json should not exist after materialize failure: %v", err)
+	}
+}
+
+// secondReadyJob adds another ready job with distinct bytes to the same store,
+// so same-destination tests cover a different job with a different content
+// address. The body must differ from the fixture body to get a different SHA.
+func secondReadyJob(t *testing.T, exporter *Exporter, workReqID, body string) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	jobs := exporter.Jobs
+	arts := exporter.Artifacts
+	id, err := jobs.CreateRequest(ctx, workReqID, work.Work{
+		DOI: "10.1002/second", Title: "Second Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}, "CD34EF56", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := "https://example.test/second.pdf?signature=SECRET"
+	_, err = jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		JobID: id, Source: "unpaywall", URLRedacted: redact.URL(live), URLKey: "url-key-second",
+		LandingRedacted: "https://example.test/second", Version: "published", AccessBasis: "open_access",
+		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1, Rank: 0,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, _ := jobs.NextPendingCandidate(ctx, id)
+	if candidate == nil {
+		t.Fatal("candidate missing")
+	}
+	_ = jobs.MarkCandidate(ctx, candidate.ID, "accepted")
+	q, _ := arts.QuarantineDir(id)
+	temp := filepath.Join(q, "fixture-second.tmp")
+	if err := os.WriteFile(temp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, _ := artifact.HashFile(temp)
+	path, _, err := arts.Promote(temp, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.UpsertArtifact(ctx, job.Artifact{
+		SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1,
+		TextChars: 1200, IdentityResult: "pass", Path: path,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateValidating}} {
+		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jobs.Transition(ctx, id, job.StateValidating, job.StateReady, nil,
+		job.WithCandidate(candidate.ID), job.WithArtifact(sha)); err != nil {
+		t.Fatal(err)
+	}
+	return id, sha
+}
+
+// A failed second export into a destination that already holds another job's
+// bundle must leave the original manifest, its PDF, and its ledger row
+// untouched instead of pointing the manifest at a deleted PDF.
+func TestExportRefusesDifferentJobOverExistingBundle(t *testing.T) {
+	exporter, idA, shaA := readyFixture(t)
+	ctx := context.Background()
+	idB, shaB := secondReadyJob(t, exporter, "wr_bundle_002", "%PDF-1.4\nsecond fixture\n%%EOF")
+	if shaA == shaB {
+		t.Fatal("fixture jobs share an artifact SHA; want distinct bytes")
+	}
+	destination := filepath.Join(t.TempDir(), "export")
+	bundlePath, _, err := exporter.Export(ctx, idA, destination)
+	if err != nil {
+		t.Fatalf("export job A: %v", err)
+	}
+	beforeBundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeArtifact := filepath.Join(destination, "artifacts", shaA+".pdf")
+	beforeHash, _, err := artifact.HashFile(beforeArtifact)
+	if err != nil || beforeHash != shaA {
+		t.Fatalf("job A artifact hash = %q, %v; want %q", beforeHash, err, shaA)
+	}
+	var beforePath, beforeResult string
+	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT path, result_json FROM exports WHERE job_id = ?`, idA).Scan(&beforePath, &beforeResult); err != nil {
+		t.Fatalf("job A ledger row missing: %v", err)
+	}
+	marker := filepath.Join(destination, "keep.txt")
+	if err := os.WriteFile(marker, []byte("user data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exporter.Jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_bundle_export_insert
+		BEFORE INSERT ON exports
+		WHEN NEW.kind = 'bundle'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected ledger failure');
+		END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	if _, _, err := exporter.Export(ctx, idB, destination); err == nil {
+		t.Fatal("export of job B over job A destination succeeded; want conflict")
+	} else if !errors.Is(err, job.ErrConflict) && !strings.Contains(err.Error(), "holds bundle for job") {
+		t.Fatalf("export B error = %v; want destination conflict", err)
+	}
+	afterBundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterBundle) != string(beforeBundle) {
+		t.Fatal("job A bundle.json changed after failed job B export")
+	}
+	got, _, err := artifact.HashFile(beforeArtifact)
+	if err != nil || got != shaA {
+		t.Fatalf("job A artifact hash = %q, %v; want %q", got, err, shaA)
+	}
+	if _, err := os.Stat(filepath.Join(destination, "artifacts", shaB+".pdf")); !os.IsNotExist(err) {
+		t.Fatalf("job B artifact left behind after refused export: %v", err)
+	}
+	keep, err := os.ReadFile(marker)
+	if err != nil || string(keep) != "user data" {
+		t.Fatalf("user file changed after refused export: %q, %v", keep, err)
+	}
+	var afterPath, afterResult string
+	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT path, result_json FROM exports WHERE job_id = ?`, idA).Scan(&afterPath, &afterResult); err != nil {
+		t.Fatalf("job A ledger row missing after refused export: %v", err)
+	}
+	if afterPath != beforePath || afterResult != beforeResult {
+		t.Fatal("job A ledger row changed after failed job B export")
+	}
+	var countB int
+	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM exports WHERE job_id = ?`, idB).Scan(&countB); err != nil || countB != 0 {
+		t.Fatalf("job B ledger count = %d, %v; want zero", countB, err)
+	}
+}
+
+// An interrupted export that left a provable partial (a strict prefix shorter
+// than the verified source) must not block retries: the next export heals the
+// bytes through a staged publish and completes the bundle and ledger row
+// without manual cleanup. Any other mismatch stays refused.
+func TestExportHealsInterruptedPartialArtifact(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	destination := filepath.Join(t.TempDir(), "export")
+	artifactsDir := filepath.Join(destination, "artifacts")
+	if err := os.MkdirAll(artifactsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	art, err := exporter.Jobs.GetArtifact(ctx, sha)
+	if err != nil || art == nil {
+		t.Fatalf("get artifact: %v", err)
+	}
+	full, err := os.ReadFile(art.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) < 8 {
+		t.Fatalf("fixture artifact too short to truncate: %d bytes", len(full))
+	}
+	partial := filepath.Join(artifactsDir, sha+".pdf")
+	out, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.Write(full[:8]); err != nil {
+		_ = out.Close()
+		t.Fatal(err)
+	}
+	_ = out.Close()
+	// A staging-like name may be another writer's active file or user data.
+	// Export never reaps it; unique staging names mean it cannot block retry.
+	foreignStaging := filepath.Join(artifactsDir, ".artifact-foreign.tmp")
+	if err := os.WriteFile(foreignStaging, []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(destination, "keep.txt")
+	if err := os.WriteFile(marker, []byte("user data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bundlePath, b, err := exporter.Export(ctx, id, destination)
+	if err != nil {
+		t.Fatalf("export over partial artifact failed: %v", err)
+	}
+	if b.Artifact.SHA256 != sha {
+		t.Fatalf("bundle sha = %q, want %q", b.Artifact.SHA256, sha)
+	}
+	got, _, err := artifact.HashFile(partial)
+	if err != nil || got != sha {
+		t.Fatalf("healed artifact hash = %q, %v; want %q", got, err, sha)
+	}
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := protocol.DecodeAcquisitionBundle(data)
+	if err != nil || decoded.JobID != id {
+		t.Fatalf("bundle decode = %+v, %v; want job %s", decoded, err, id)
+	}
+	var count int
+	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM exports WHERE job_id = ?`, id).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("export ledger count = %d, %v; want one", count, err)
+	}
+	keep, err := os.ReadFile(marker)
+	if err != nil || string(keep) != "user data" {
+		t.Fatalf("user file changed after heal: %q, %v", keep, err)
+	}
+	foreign, err := os.ReadFile(foreignStaging)
+	if err != nil || string(foreign) != "foreign" {
+		t.Fatalf("foreign staging file touched after heal: %q, %v", foreign, err)
 	}
 }
 
