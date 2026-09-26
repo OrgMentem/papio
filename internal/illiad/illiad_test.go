@@ -341,3 +341,69 @@ func TestRejectsOversizedResponse(t *testing.T) {
 		t.Fatalf("an oversized body is a malformed response, not a retryable condition: %v", err)
 	}
 }
+
+// TestRequestTimeoutDefaultsToBounded verifies the zero-value client still
+// bounds a provider call: a stalled ILLiad service must surface as a
+// retryable TemporaryError, never hold the caller indefinitely.
+func TestRequestTimeoutDefaultsToBounded(t *testing.T) {
+	if got := NewWithOptions(Options{}).requestTimeout; got != defaultRequestTimeout {
+		t.Fatalf("default request timeout = %v, want %v", got, defaultRequestTimeout)
+	}
+	if got := NewWithOptions(Options{RequestTimeout: 250 * time.Millisecond}).requestTimeout; got != 250*time.Millisecond {
+		t.Fatalf("custom request timeout = %v, want 250ms", got)
+	}
+}
+
+// TestStalledProviderResponseReturnsWithinTimeout proves a service that
+// accepts the POST but never sends headers releases the caller at the
+// configured bound with a retryable error the submission path reconciles
+// (fail-closed ambiguous) rather than replaying blindly.
+func TestStalledProviderResponseReturnsWithinTimeout(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		<-release
+		_, _ = w.Write([]byte(`{"TransactionNumber": 1}`))
+	}))
+	defer server.Close()
+	defer close(release)
+
+	client := NewWithOptions(Options{Client: server.Client(), BaseURL: server.URL, APIKey: "key", RequestTimeout: 200 * time.Millisecond})
+	start := time.Now()
+	_, err := client.CreateTransaction(context.Background(), TransactionRequest{ExternalUserID: "patron-1"})
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("CreateTransaction blocked %v against a stalled provider, want return near the 200ms bound", elapsed)
+	}
+	if err == nil {
+		t.Fatal("CreateTransaction = nil, want a timeout error")
+	}
+	if _, temporary := Temporary(err); !temporary {
+		t.Fatalf("CreateTransaction error = %v, want a retryable TemporaryError", err)
+	}
+}
+
+// TestExplicitCallerDeadlineWins proves the client bound never extends a
+// caller that already set a tighter deadline of its own.
+func TestExplicitCallerDeadlineWins(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		_, _ = w.Write([]byte(`{"TransactionNumber": 1}`))
+	}))
+	defer server.Close()
+	defer close(release)
+
+	client := NewWithOptions(Options{Client: server.Client(), BaseURL: server.URL, APIKey: "key", RequestTimeout: time.Minute})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := client.GetTransaction(ctx, 1)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("GetTransaction blocked %v, want return near the caller 200ms deadline", elapsed)
+	}
+	if err == nil {
+		t.Fatal("GetTransaction = nil, want a deadline error")
+	}
+}

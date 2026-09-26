@@ -159,7 +159,10 @@ type Service struct {
 	// per-request Client this package constructs (one per institution
 	// profile, from that profile's document_delivery.base_url/api_key).
 	// Defaults to http.DefaultClient in New; tests inject an httptest
-	// server's client instead.
+	// server's client instead. The transport's own Timeout may be zero:
+	// internal/illiad bounds each create/list/read call with its own
+	// deadline, so a stalled provider still releases the worker/handler
+	// and the submission path reconciles the ambiguous outcome.
 	IlliadHTTPClient illiad.HTTPClient
 	// ReadyHook, when non-nil with a command, runs the user's on_ready hook
 	// once per ready transition. Nil disables it.
@@ -439,6 +442,7 @@ func (s *Service) Process(ctx context.Context, row *job.Row) error {
 		return err
 	}
 	if row.State == job.StateReady {
+		s.recoverMissingReadyHook(ctx, row)
 		return nil
 	}
 
@@ -3074,7 +3078,8 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 		// would check the original owner's job state and leave a provider
 		// transaction orphaned with no durable local reference.
 		if created.JobID != row.ID {
-			ok, err := s.Delivery.ReassignOfferedRequest(ctx, created.ID, row.ID, created.JobID)
+			oldJobID := created.JobID
+			ok, err := s.Delivery.ReassignOfferedRequest(ctx, created.ID, row.ID, oldJobID)
 			if err != nil {
 				return created, err
 			}
@@ -3088,12 +3093,28 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 			if refreshed != nil {
 				created = refreshed
 			}
-			// Successfully re-owned an offered row that never reached the
-			// provider: allow the retry without requiring a prior failure
-			// classification for this new job (the row itself proves no live
-			// request exists). This is the ea626f43 fix — bypass the gate
-			// that would otherwise route an unclassified duplicate to
-			// reconciliation.
+			// The re-owned row is still offered with no provider reference,
+			// but that alone does not prove no POST reached the provider:
+			// the old owner may have sent one whose response never arrived
+			// (cancelled job, crash between the accepted POST and
+			// RecordSubmission). Its outcome lives in the old job's durable
+			// failure classification, not in this new job's event stream, so
+			// consult it before any new POST. Only a row no owner ever
+			// attempted (unclassified) or one proven pre-send may POST;
+			// anything else reconciles the shared token first. This is the
+			// ea626f43 fix narrowed by the ambiguous-reassignment guard: the
+			// bypass below stays valid only while the old owner agrees no
+			// live request exists.
+			class, classified, err := s.submissionFailureClass(ctx, oldJobID, created.ID)
+			if err != nil {
+				return created, err
+			}
+			if classified && class != illiad.FailurePreSend {
+				if class == illiad.FailureAmbiguous {
+					return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
+				}
+				return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
+			}
 			return s.submitToProvider(ctx, row, from, dd, key, profile, created)
 		}
 		class, classified, err := s.submissionFailureClass(ctx, row.ID, created.ID)
@@ -3988,7 +4009,10 @@ func (s *Service) RecoverPreparedPublications(ctx context.Context) error {
 	if err := s.Jobs.SweepOrphanComponentStages(ctx); err != nil {
 		return err
 	}
-	return s.reconcilePreparedPublications(ctx, "")
+	if err := s.reconcilePreparedPublications(ctx, ""); err != nil {
+		return err
+	}
+	return s.recoverMissingReadyHookForSettled(ctx)
 }
 
 // removeQuarantineBytes removes bytes only when no remaining publication owns
@@ -4371,6 +4395,15 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return
 	}
+	// The ready transition already committed; this marker is the durable fact
+	// that one automatic attempt was queued. It must commit before the
+	// detached launch: if it fails, nothing proves an attempt was queued, so
+	// return without launching and let the job stay undispatched for the next
+	// recovery instead of risking a hook whose launch no marker describes.
+	if err := s.Jobs.RecordEvent(context.WithoutCancel(ctx), row.ID, "hook.on_ready_dispatched", map[string]any{"trigger": "ready"}); err != nil {
+		log.Printf("papio: recording on_ready dispatch for job %s: %v", row.ID, err)
+		return
+	}
 	if !s.beginReadyHook(row.ID) {
 		return
 	}
@@ -4381,6 +4414,105 @@ func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
 		defer s.endReadyHook(row.ID)
 		_, _ = s.executeReadyHook(execCtx, row, sha, "ready")
 	}()
+}
+
+// readyHookDispatched reports whether the ready transition already recorded an
+// automatic on_ready attempt for this job: one dispatched event or any
+// hook.on_ready outcome means the crash window between the ready commit and
+// the detached hook launch is closed. Imported jobs reviewed the same evidence
+// on the ready path before leaving it, so they are covered too.
+func (s *Service) readyHookDispatched(ctx context.Context, jobID string) bool {
+	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
+		return true
+	}
+	events, err := s.Jobs.Events(ctx, jobID)
+	if err != nil {
+		return true
+	}
+	for _, event := range events {
+		kind, _ := event["kind"].(string)
+		if kind != "hook.on_ready" && kind != "hook.on_ready_dispatched" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if trigger, _ := detail["trigger"].(string); trigger == "manual" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// recoverMissingReadyHook dispatches one settled job whose ready commit has no
+// automatic attempt marker. runReadyHook writes that marker itself, so this
+// path writes nothing first: a crash between the marker and the launch still
+// leaves a launch of unknown status, and jobs unfiled surfaces it as missing
+// with no outcome (never as a proven launch or failure). No blind replay
+// happens here: a crash after the launch but before the outcome is not
+// redispatched while its marker stands.
+func (s *Service) recoverMissingReadyHook(ctx context.Context, row *job.Row) {
+	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
+		return
+	}
+	if strings.TrimSpace(row.ArtifactSHA256) == "" || s.Artifacts.Verify(row.ArtifactSHA256) != nil {
+		return
+	}
+	if s.readyHookDispatched(ctx, row.ID) {
+		return
+	}
+	s.runReadyHook(ctx, row, row.ArtifactSHA256)
+}
+
+// recoverMissingReadyHookForSettled replays the detached hook launch for
+// settled jobs whose ready transition crashed before dispatching it. It runs
+// at startup after prepared-publication recovery, where no hook can be
+// in flight yet, so launched jobs are bounded by the query rather than by an
+// extra in-memory guard.
+func (s *Service) recoverMissingReadyHookForSettled(ctx context.Context) error {
+	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
+		return nil
+	}
+	rows, err := s.Jobs.S.DB().QueryContext(ctx, `
+		SELECT j.id
+		FROM jobs j
+		WHERE j.state IN ('ready', 'imported')
+		  AND NOT EXISTS (
+			SELECT 1 FROM events e
+			WHERE e.job_id = j.id
+			  AND e.kind IN ('hook.on_ready', 'hook.on_ready_dispatched')
+			  AND COALESCE(json_extract(e.detail_json, '$.trigger'), '') <> 'manual'
+		)
+		LIMIT 101`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i, id := range ids {
+		if i >= 100 {
+			log.Printf("papio: %d settled jobs still lack an on_ready dispatch; rerun startup recovery after the first batch files", len(ids)-100)
+			break
+		}
+		row, err := s.Jobs.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		s.recoverMissingReadyHook(ctx, row)
+	}
+	return nil
 }
 
 // RefileJob synchronously reruns the configured on_ready hook for a settled
@@ -4521,9 +4653,13 @@ func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigg
 	return out, nil
 }
 
-// UnfiledJobs returns ready and imported jobs whose newest on_ready attempt is
-// absent or unsuccessful. The window query derives the newest event and attempt
-// count in SQLite, so the read stays bounded by limit plus its truncation probe.
+// UnfiledJobs returns ready and imported jobs whose newest on_ready outcome is
+// absent or unsuccessful. A dispatched marker without an outcome keeps the job
+// listed as missing with zero attempts: the marker proves an attempt was
+// queued, never that the hook launched or what it did, so this read model
+// reports unknown launch status rather than a proven failure. The window query
+// derives the newest event and attempt count in SQLite, so the read stays
+// bounded by limit plus its truncation probe.
 func (s *Service) UnfiledJobs(ctx context.Context, filter UnfiledFilter, limit int) ([]UnfiledJob, bool, error) {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return nil, false, ErrReadyHookNotConfigured

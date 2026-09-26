@@ -590,6 +590,13 @@ func (s *Service) RecordSubmission(ctx context.Context, id int64, providerRefere
 // the row is still offered with an empty provider reference and still owned
 // by oldJobID. The old job releases its pointer and the new job pins this row
 // in the same transaction.
+//
+// The offered/empty-reference state alone does not prove the provider never
+// received a POST: the old owner may have sent one whose response never
+// arrived. The caller MUST consult the old owner's durable submission-failure
+// classification before POSTing against the re-owned row and reconcile the
+// shared idempotency token first unless the prior outcome is proven
+// pre-send (or no attempt was ever recorded).
 func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID, oldJobID string) (bool, error) {
 	if newJobID == "" || oldJobID == "" {
 		return false, errors.New("delivery: job ids required for reassignment")

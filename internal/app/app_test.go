@@ -2391,9 +2391,15 @@ type fakeNotificationSink struct {
 	human, imported int
 	reminders       []string
 	intents         []notify.Intent
+	routeErr        error
 }
 
 func (f *fakeNotificationSink) Route(_ context.Context, intent notify.Intent) error {
+	if f.routeErr != nil {
+		err := f.routeErr
+		f.routeErr = nil
+		return err
+	}
 	f.intents = append(f.intents, intent)
 	switch intent.Category {
 	case notify.CategoryDecisionOpened:
@@ -3302,6 +3308,123 @@ func TestDrainHooksCancelsManualRefileAndRecordsOutcome(t *testing.T) {
 	detail := events[len(events)-1]["detail"].(map[string]any)
 	if detail["status"] != "cancelled" || detail["trigger"] != "manual" {
 		t.Fatalf("cancelled manual filing event = %#v", detail)
+	}
+}
+
+// seedReadyArtifact stores real artifact bytes and binds their digest to the
+// job. Ready-hook recovery only dispatches for an artifact it can verify, so a
+// bare sha256 column would leave nothing to file.
+func seedReadyArtifact(t *testing.T, svc *Service, jobs *job.Store, jobID, body string) string {
+	t.Helper()
+	ctx := context.Background()
+	digest := sha256.Sum256([]byte(body))
+	sha := hex.EncodeToString(digest[:])
+	staged := filepath.Join(t.TempDir(), "artifact.pdf")
+	if err := os.WriteFile(staged, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.Artifacts.Promote(staged, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET artifact_sha256 = ? WHERE id = ?`, sha, jobID); err != nil {
+		t.Fatal(err)
+	}
+	return sha
+}
+
+// A kill between the ready commit and the detached hook launch must surface
+// through recovery: a settled ready job with no dispatch marker is launched
+// once, and the marker keeps a second recovery from doubling it.
+func TestRecoverMissingReadyHookDispatchesOnce(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, _ []string) hook.Result {
+			return hook.Result{Ran: true, ExitCode: 0, Duration: 3 * time.Millisecond}
+		},
+	}
+	id := createFilingStateJob(t, jobs, "wr_ready_hook_missing", job.StateReady)
+	seedReadyArtifact(t, svc, jobs, id, "%PDF-1.4\nrecovered\n%%EOF")
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ready transition committed; the detached launch never ran.
+	svc.recoverMissingReadyHook(ctx, row)
+	if !svc.DrainHooks(5 * time.Second) {
+		t.Fatal("recovered hook did not drain")
+	}
+	outcomes := waitForHookEvents(t, jobs, id, 1)
+	if outcomes[0]["status"] != "ok" || outcomes[0]["trigger"] != "ready" {
+		t.Fatalf("recovered filing event = %#v", outcomes[0])
+	}
+	// A restart after the dispatch marker must not launch the hook again.
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.recoverMissingReadyHook(ctx, row)
+	if !svc.DrainHooks(100 * time.Millisecond) {
+		t.Fatal("second recovery queued unexpected hook work")
+	}
+	if got := waitForHookEvents(t, jobs, id, 1); len(got) != 1 {
+		t.Fatalf("filing events = %#v, want exactly one launch", got)
+	}
+}
+
+// Startup recovery replays the detached launch for settled jobs whose ready
+// transition crashed before dispatching it.
+func TestRecoverPreparedPublicationsDispatchesMissingReadyHook(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, _ []string) hook.Result {
+			return hook.Result{Ran: true, ExitCode: 0, Duration: 3 * time.Millisecond}
+		},
+	}
+	id := createFilingStateJob(t, jobs, "wr_ready_hook_startup", job.StateReady)
+	seedReadyArtifact(t, svc, jobs, id, "%PDF-1.4\nstartup\n%%EOF")
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !svc.DrainHooks(5 * time.Second) {
+		t.Fatal("startup-recovered hook did not drain")
+	}
+	if outcomes := waitForHookEvents(t, jobs, id, 1); outcomes[0]["trigger"] != "ready" {
+		t.Fatalf("startup filing event = %#v", outcomes[0])
+	}
+}
+
+// waitForHookEvents waits for at least want hook.on_ready events, then
+// returns every hook.on_ready detail in order.
+func waitForHookEvents(t *testing.T, jobs *job.Store, id string, want int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		events, err := jobs.Events(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []map[string]any
+		for _, event := range events {
+			if event["kind"] != "hook.on_ready" {
+				continue
+			}
+			detail, ok := event["detail"].(map[string]any)
+			if !ok {
+				t.Fatalf("hook event detail = %#v", event["detail"])
+			}
+			out = append(out, detail)
+		}
+		if len(out) >= want {
+			return out
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hook.on_ready events = %d, want at least %d", len(out), want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

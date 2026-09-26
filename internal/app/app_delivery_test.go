@@ -2924,3 +2924,213 @@ func TestReconcileDeliveryReportsRestoreFailures(t *testing.T) {
 		}
 	})
 }
+
+// seedReassignedOfferedRow stages the reassignment boundary for one DOI: an
+// old job owns an offered row carrying the live gate digest, optionally with
+// a durable delivery.submission_failure_classified outcome for that row, and
+// then cancels — the "cancel an in-flight submission, resubmit as a new job"
+// sequence. An empty class records no outcome: the row was never attempted.
+func seedReassignedOfferedRow(t *testing.T, svc *Service, jobs *job.Store, deliverySvc *delivery.Service, requestID, doi, class string) (string, *delivery.Request) {
+	t.Helper()
+	ctx := context.Background()
+	oldID, err := svc.Submit(ctx, deliveryWorkRequest(requestID, doi))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := jobs.Get(ctx, oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: oldID, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: old.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if class != "" {
+		if err := jobs.RecordEvent(ctx, oldID, "delivery.submission_failure_classified", map[string]any{
+			"delivery_request_id": req.ID,
+			"class":               class,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jobs.Cancel(ctx, oldID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+	return oldID, req
+}
+
+// processNewDeliveryJob submits fresh work for a DOI whose idempotency key is
+// already occupied and drives it to the delivery verdict, returning the new
+// job ID.
+func processNewDeliveryJob(t *testing.T, svc *Service, jobs *job.Store, requestID, doi string) string {
+	t.Helper()
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest(requestID, doi))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("ClaimNext: %v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestReassignAfterAmbiguousAttemptReconcilesWithoutSecondPost proves the
+// reassignment guard: the old owner POSTed (response lost — ambiguous), the
+// job was cancelled before RecordSubmission, and the new job for the same
+// work must reconcile the shared token with read-only GETs instead of
+// issuing a second provider POST.
+func TestReassignAfterAmbiguousAttemptReconcilesWithoutSecondPost(t *testing.T) {
+	var posts, gets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost:
+			posts.Add(1)
+			http.Error(w, "must not POST an ambiguously submitted request", http.StatusInternalServerError)
+		case strings.Contains(r.URL.Path, "Users/ExternalUserId/"):
+			gets.Add(1)
+			_, _ = w.Write([]byte(`{"UserName":"campus-student"}`))
+		case strings.Contains(r.URL.Path, "Transaction/UserRequests/"):
+			gets.Add(1)
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			gets.Add(1)
+			http.Error(w, "unexpected provider read", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	const doi = "10.1000/reassign-ambiguous"
+	_, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_amb_old", doi, "ambiguous")
+	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_amb_new", doi)
+
+	if posts.Load() != 0 {
+		t.Fatalf("provider POSTs = %d, want 0: the prior attempt is ambiguous, not proven pre-send", posts.Load())
+	}
+	if gets.Load() == 0 {
+		t.Fatal("provider GETs = 0, want read-only reconciliation against the shared token")
+	}
+	got, err := deliverySvc.Get(ctx, staged.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.JobID != newID {
+		t.Fatalf("row owner = %q, want the new job %q", got.JobID, newID)
+	}
+	if got.State != delivery.StateOffered || got.ProviderReference != "" {
+		t.Fatalf("row = %+v, want offered with no reference: nothing was proven submitted", got)
+	}
+	parked, err := jobs.Get(ctx, newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked.State != job.StateRetryWait {
+		t.Fatalf("new job state = %q, want retry_wait for the bounded reconciliation recheck", parked.State)
+	}
+	events, err := jobs.Events(ctx, newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempt bool
+	for _, event := range events {
+		if event["kind"] == "delivery.reconciliation_attempt" {
+			attempt = true
+		}
+	}
+	if !attempt {
+		t.Fatal("new job recorded no delivery.reconciliation_attempt event")
+	}
+}
+
+// TestReassignAfterProvenPreSendStillSubmitsOnce proves the guard stays
+// narrow: when the old owner's outcome is proven pre-send (no POST could
+// have landed), the re-owned row still submits exactly once.
+func TestReassignAfterProvenPreSendStillSubmitsOnce(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		_, _ = w.Write([]byte(`{"TransactionNumber": 7702, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	const doi = "10.1000/reassign-presend"
+	_, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_pre_old", doi, "pre_send")
+	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_pre_new", doi)
+
+	if posts.Load() != 1 {
+		t.Fatalf("provider POSTs = %d, want exactly 1 for a proven pre-send row", posts.Load())
+	}
+	got, err := deliverySvc.Get(ctx, staged.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateSubmitted || got.ProviderReference != "7702" || got.JobID != newID {
+		t.Fatalf("row = %+v, want submitted/7702 owned by %q", got, newID)
+	}
+}
+
+// TestReassignUnattemptedOfferedRowStillSubmitsOnce pins the other carve-out:
+// a row no owner ever attempted (no classification on the old job) still
+// submits exactly once after reassignment.
+func TestReassignUnattemptedOfferedRowStillSubmitsOnce(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		_, _ = w.Write([]byte(`{"TransactionNumber": 7703, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	const doi = "10.1000/reassign-unattempted"
+	_, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_unatt_old", doi, "")
+	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_unatt_new", doi)
+
+	if posts.Load() != 1 {
+		t.Fatalf("provider POSTs = %d, want exactly 1 for a never-attempted row", posts.Load())
+	}
+	got, err := deliverySvc.Get(ctx, staged.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != delivery.StateSubmitted || got.ProviderReference != "7703" || got.JobID != newID {
+		t.Fatalf("row = %+v, want submitted/7703 owned by %q", got, newID)
+	}
+}

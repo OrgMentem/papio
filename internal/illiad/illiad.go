@@ -32,6 +32,16 @@ import (
 
 const defaultMaxBody = int64(1 << 20)
 
+// defaultRequestTimeout bounds one ILLiad Web Platform API call when the
+// caller supplies a context without a deadline. A hung institution service
+// that accepts the connection but never sends response headers must not
+// occupy the caller forever: the daemon worker lease keeps renewing and the
+// delivery.submit handler never returns while Client.Do blocks. A timeout
+// here surfaces as a TemporaryError, which the submission path classifies
+// fail-closed as ambiguous and reconciles by the durable idempotency token
+// before any retry POST.
+const defaultRequestTimeout = 30 * time.Second
+
 // HTTPClient is the injected HTTP dependency used to call the ILLiad Web
 // Platform API.
 type HTTPClient interface {
@@ -46,15 +56,19 @@ type Options struct {
 	BaseURL          string
 	APIKey           string
 	MaxResponseBytes int64
+	// RequestTimeout bounds one API call when ctx carries no deadline.
+	// Non-positive selects defaultRequestTimeout.
+	RequestTimeout time.Duration
 }
 
 // Client is an ILLiad Web Platform API v1 client bound to one institution's
 // deployment and server-side ApiKey.
 type Client struct {
-	client  HTTPClient
-	baseURL string
-	apiKey  string
-	maxBody int64
+	client         HTTPClient
+	baseURL        string
+	apiKey         string
+	maxBody        int64
+	requestTimeout time.Duration
 }
 
 // New constructs a Client for the given institution-hosted base URL and
@@ -69,11 +83,16 @@ func NewWithOptions(opts Options) *Client {
 	if maxBody <= 0 {
 		maxBody = defaultMaxBody
 	}
+	timeout := opts.RequestTimeout
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
 	return &Client{
-		client:  opts.Client,
-		baseURL: strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/"),
-		apiKey:  strings.TrimSpace(opts.APIKey),
-		maxBody: maxBody,
+		client:         opts.Client,
+		baseURL:        strings.TrimRight(strings.TrimSpace(opts.BaseURL), "/"),
+		apiKey:         strings.TrimSpace(opts.APIKey),
+		maxBody:        maxBody,
+		requestTimeout: timeout,
 	}
 }
 
@@ -310,8 +329,18 @@ func (c *Client) UserRequests(ctx context.Context, userRef string) ([]Transactio
 
 // do issues one ILLiad Web Platform API request, classifies the response,
 // and (for a successful response, when out is non-nil) bounded-decodes the
-// body into out.
+// body into out. When ctx carries no deadline of its own, do bounds the
+// call with the client's RequestTimeout so a stalled provider cannot hold
+// the caller indefinitely. An explicit caller deadline always wins: a child
+// timeout never extends the parent.
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {
+	if c.requestTimeout > 0 {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, c.requestTimeout)
+			defer cancel()
+		}
+	}
 	endpoint, err := c.endpointURL(path)
 	if err != nil {
 		return errors.New("illiad: invalid endpoint configuration")
