@@ -165,7 +165,7 @@ no local model runtime ships yet. Credential setup is currently a CLI command.
 | --- | --- | --- | --- |
 | `access_mode` | string | empty | Required before acquisition. Allowed values are `conservative`, `assisted`, and `delegated`; a fresh guided `papio init` chooses `conservative`. Conservative records institutional OpenURL availability without opening a handoff; assisted and delegated can route eligible exhaustion to browser handoff. |
 | `email` | string | empty | Contact identity for polite API pools. **Sent to third parties**: as a query parameter to Unpaywall (required) and OpenAlex (required), to Crossref when set, and in the `User-Agent` of DOI-registration lookups. See [Privacy](../privacy.md). Doctor fails when enabled Unpaywall has no email; enabled OpenAlex also requires an email and API key. |
-| `data_dir` | path string | `~/.local/share/papio` (Windows: `%LOCALAPPDATA%\papio`) | Private writable data directory for the database, artifacts, socket, and default browser-adoption directory. |
+| `data_dir` | path string | `~/.local/share/papio` (Windows: `%LOCALAPPDATA%\papio`) | Private writable data directory for the database, artifacts, and socket. Browser-download adoption does not follow this directory: the adoption root defaults to `<your download folder>/papio` (see `[browser] download_adoption_root`), while the historical `<data_dir>/adoptions` path remains drain-only for files already sitting there. |
 
 ## `[fetch]`
 
@@ -346,9 +346,11 @@ daemon version that recognizes it.
 | `exception_tags` | boolean | `false` | Enables the reconciled exception-tag ledger: *papio* maintains `papio:needs-action` and `papio:unavailable` as Zotero *automatic* tags on provenance-confirmed personal-library items, reconciling job state with current attachment state (`papio zotio tags reconcile` runs one pass on demand). Requires `executable` and zotio ≥ 0.13.0. Lifecycle states are never tagged; a same-name manual tag is never retyped or removed. After a daemon reload, turning this off makes the next pass remove papio-owned tags. |
 | `unavailable_recheck_days` | integer days | `14` | How long an `unavailable` outcome parks an item before Zotero backfill or the source-independent daemon runner re-checks it through the ordinary submission path (open-access availability drifts upward). Must be between 1 and 365 inclusive. |
 
-*papio* invokes zotio but does not read or store Zotero credentials. Manual
-mutation remains preview-first: `papio zotio plan` returns immutable plans and
-`papio zotio apply` requires the exact confirmation SHA-256.
+*papio* invokes zotio but does not read or store Zotero credentials. Item and
+attachment mutation stays preview-first: `papio zotio plan` returns immutable
+plans and `papio zotio apply` requires the exact confirmation SHA-256.
+`papio zotio tags reconcile` is the separate exception: it converges papio's
+own `papio:needs-action` and `papio:unavailable` tags with no preview step.
 
 ## `[hooks]`
 

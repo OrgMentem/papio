@@ -819,13 +819,18 @@ func newActionsCommand(opt *options) *cobra.Command {
 	var revision int64
 	dismiss := &cobra.Command{
 		Use:   "dismiss <action-id>",
-		Short: "Close a stale human action without touching its job",
-		Long: "Close a stale human action without touching its job.\n\n" +
+		Short: "Close a stale human action; cancels its parked job when it was the last open action",
+		Long: "Close a stale human action.\n\n" +
 			"An advisory on a terminal job has no other way out: cancel refuses a\n" +
 			"terminal job, resolve is identity-review only, and the startup sweep\n" +
 			"deliberately leaves informational advisories alone so a real trace\n" +
 			"survives. Without this, retiring one meant editing the database or\n" +
 			"retrying the job purely to cancel it again.\n\n" +
+			"When the dismissed action is the job's last open action and the job is\n" +
+			"parked on it (awaiting_human on an openurl_handoff, manual_download,\n" +
+			"openurl_available, or document_delivery action; needs_review on a\n" +
+			"verify_identity or unsafe_pdf action), dismissing it also cancels the\n" +
+			"job. Otherwise the job is left untouched.\n\n" +
 			"--revision guards against dismissing an action that changed after you\n" +
 			"listed it; take it from `papio actions list --json`.",
 		Args: cobra.ExactArgs(1),

@@ -69,13 +69,13 @@ func renderCommands(root *cobra.Command) []byte {
 	var b bytes.Buffer
 	b.WriteString(genHeader)
 	b.WriteString("# Command reference\n\n")
-	b.WriteString("Every `papio` command, generated directly from the binary. Pass `--json` to any command for structured output; see the [user guide](../guide/user-guide.md) for the operational workflow and the [configuration reference](config-reference.md) for policy.\n\n")
+	b.WriteString("Every `papio` command, generated directly from the binary. The `--json` flag is accepted globally, but it does not guarantee JSON output: `init` prints setup text, and `mcp` runs a server. Result-producing commands such as `acquire`, `daemon status`, and `native-host status` honor the flag. See the [user guide](../guide/user-guide.md) for the operational workflow and the [configuration reference](config-reference.md) for policy.\n\n")
 
 	writeJSONContract(&b)
 
 	if gf := globalFlagRows(root); len(gf) > 0 {
 		b.WriteString("## Global flags\n\n")
-		b.WriteString("These flags are available on every command.\n\n")
+		b.WriteString("These flags are available on every command. `--version` is not one of them: it is a root-only flag, so run `papio --version`, not `papio <subcommand> --version`.\n\n")
 		writeFlagTable(&b, gf)
 		b.WriteString("\n")
 	}
@@ -168,19 +168,13 @@ func flagRows(fs *pflag.FlagSet) []flagRow {
 	return rows
 }
 
-// globalFlagRows is flagRows(root.PersistentFlags()) plus --version: cobra
-// registers the version flag lazily inside Command.execute(), so it never
-// reaches root.PersistentFlags() (or even root.Flags(), until forced) even
-// though `papio --version` is real and documented — see
-// Command.InitDefaultVersionFlag in the cobra source.
+// globalFlagRows returns the persistent flags shared by every command.
+// `--version` is intentionally absent: cobra registers the version flag on
+// the root command only (see Command.InitDefaultVersionFlag), so
+// `papio --version` works but `papio <subcommand> --version` is rejected.
+// The Global flags section names this root-only exception in prose.
 func globalFlagRows(root *cobra.Command) []flagRow {
-	rows := flagRows(root.PersistentFlags())
-	root.InitDefaultVersionFlag()
-	if v := root.Flags().Lookup("version"); v != nil && !v.Hidden {
-		rows = append(rows, flagRowFor(v))
-		sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
-	}
-	return rows
+	return flagRows(root.PersistentFlags())
 }
 
 func writeFlagTable(b *bytes.Buffer, rows []flagRow) {
