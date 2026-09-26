@@ -157,11 +157,17 @@ func ActivityText(kind string, detail map[string]any) string {
 		default:
 			return "Zotero metadata enrichment attempted"
 		}
+	case "zotio.follow_ups":
+		return "Zotero follow-ups checked"
+	case "hook.on_ready_dispatched":
+		return "On-ready hook attempt recorded"
 	case "hook.on_ready":
 		if status := activityDetailString(detail, "status"); status != "" {
 			return clampActivityText(fmt.Sprintf("On-ready hook ran (%s)", status))
 		}
 		return "On-ready hook ran"
+	case "notify.webhook_failed":
+		return "Webhook notification failed"
 	case "notify.attempted":
 		if count, ok := activityDetailInt64(detail, "count"); ok && count > 1 {
 			return clampActivityText(fmt.Sprintf("Notification attempted for %d items", count))

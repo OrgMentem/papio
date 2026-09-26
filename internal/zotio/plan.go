@@ -390,9 +390,7 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		if existing.Status == "ambiguous" {
 			return nil, s.ambiguousReplayError(existing, plan.ID)
 		}
-		if !filedWithImport(plan, existing) {
-			s.fileCollection(ctx, plan, existing)
-		}
+		s.completeFollowUps(ctx, plan, existing)
 		if err := s.markImported(ctx, existing); err != nil {
 			return nil, err
 		}
@@ -419,9 +417,7 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 			if result.Status == "ambiguous" {
 				return nil, s.ambiguousReplayError(result, plan.ID)
 			}
-			if !filedWithImport(plan, result) {
-				s.fileCollection(ctx, plan, result)
-			}
+			s.completeFollowUps(ctx, plan, result)
 			if err := s.markImported(ctx, result); err != nil {
 				return nil, err
 			}

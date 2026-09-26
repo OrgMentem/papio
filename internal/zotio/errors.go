@@ -18,6 +18,7 @@ import (
 // the Zotio boundary. They are safe to persist and show to a local CLI user.
 const (
 	ErrorClassZoteroHTTP4xx            = "zotero_http_4xx"
+	ErrorClassZoteroHTTP5xx            = "zotero_http_5xx"
 	ErrorClassZoteroFileStorageRefused = "zotero_file_storage_refused"
 	ErrorClassZoteroConnectorRefused   = "zotero_connector_refused"
 	ErrorClassZoteroStorageQuota       = "zotero_storage_quota_exceeded"
@@ -179,6 +180,16 @@ func ClassifyError(err error, envelopes ...json.RawMessage) ErrorInfo {
 			strings.Contains(lower, "temporary parent")) {
 		return safeErrorInfo(ErrorClassZoteroConnectorRefused, "Zotero desktop rejected the connector save: restart Zotero, then check its plugins", 0)
 	}
+	// Zotero's Web API answers a temporary outage or an overload with a 5xx.
+	// Unlike a 4xx, that says nothing about the request, so the same write can
+	// succeed later. It does not say the write was refused either: Zotero can
+	// commit and then lose the response, which is why only a caller whose
+	// write converges may repeat it (see pendingFollowUps). It is placed after
+	// the connector branch above, so a desktop connector fault keeps naming
+	// the desktop rather than reporting a Web API outage.
+	if status := zoteroHTTP5xxStatus(text, envelopes...); status != 0 {
+		return safeErrorInfo(ErrorClassZoteroHTTP5xx, "Zotero HTTP "+strconv.Itoa(status), status)
+	}
 	if strings.Contains(lower, "unknown item field") {
 		return safeErrorInfo(ErrorClassZoteroFieldValidation, "unknown item field", 0)
 	}
@@ -274,6 +285,7 @@ func safeErrorInfo(class, hint string, status int) ErrorInfo {
 func IsErrorClass(class string) bool {
 	switch class {
 	case ErrorClassZoteroHTTP4xx,
+		ErrorClassZoteroHTTP5xx,
 		ErrorClassZoteroFileStorageRefused,
 		ErrorClassZoteroConnectorRefused,
 		ErrorClassZoteroStorageQuota,
@@ -324,6 +336,8 @@ func classificationText(err error, envelopes ...json.RawMessage) string {
 var (
 	httpStatusRE      = regexp.MustCompile(`(?i)\b(?:http(?:[_ -]?status)?|status(?:[_ -]?code)?)\b\s*(?:is|was|=|:)?\s*(4[0-9]{2})\b`)
 	jsonHTTPStatusRE  = regexp.MustCompile(`(?i)["'](?:http_status|status_code|status)["']\s*:\s*"?(4[0-9]{2})\b`)
+	http5xxStatusRE   = regexp.MustCompile(`(?i)\b(?:http(?:[_ -]?status)?|status(?:[_ -]?code)?)\b\s*(?:is|was|=|:)?\s*(5[0-9]{2})\b`)
+	json5xxStatusRE   = regexp.MustCompile(`(?i)["'](?:http_status|status_code|status)["']\s*:\s*"?(5[0-9]{2})\b`)
 	urlHintRE         = regexp.MustCompile(`(?i)\b(?:https?|ftp)://[^\s<>"']+|\bwww\.[^\s<>"']+`)
 	posixPathHintRE   = regexp.MustCompile(`(?:^|\s)(?:~/|/(?:[^\s/]+/)+[^\s/]+)`)
 	windowsPathHintRE = regexp.MustCompile(`(?i)\b[a-z]:\\(?:[^\s\\]+\\)*[^\s\\]+`)
@@ -341,6 +355,27 @@ func zoteroHTTP4xxStatus(text string, envelopes ...json.RawMessage) int {
 	}
 	for _, envelope := range envelopes {
 		if status := jsonHTTPStatus(envelope); status >= 400 && status <= 499 {
+			return status
+		}
+	}
+	return 0
+}
+
+// zoteroHTTP5xxStatus reads the server-side status of a failed Zotero write,
+// in the same two places as its 4xx sibling: the error line zotio returns and
+// the mutation envelope it prints on stdout.
+func zoteroHTTP5xxStatus(text string, envelopes ...json.RawMessage) int {
+	for _, matcher := range []*regexp.Regexp{http5xxStatusRE, json5xxStatusRE} {
+		match := matcher.FindStringSubmatch(text)
+		if len(match) == 2 {
+			status, _ := strconv.Atoi(match[1])
+			if status >= 500 && status <= 599 {
+				return status
+			}
+		}
+	}
+	for _, envelope := range envelopes {
+		if status := jsonHTTPStatus(envelope); status >= 500 && status <= 599 {
 			return status
 		}
 	}

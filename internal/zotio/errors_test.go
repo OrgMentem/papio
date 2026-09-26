@@ -30,6 +30,17 @@ func TestClassifyErrorTable(t *testing.T) {
 			wantStatus: 429,
 		},
 		{
+			// A 5xx is Zotero's own failure, not a verdict on the request, so
+			// FollowUpRetrier may ask again. The connector case below keeps
+			// naming the desktop, which is why this class sits after it.
+			name:       "zotero http 5xx envelope",
+			err:        errors.New("zotio items: mutation incomplete"),
+			envelope:   json.RawMessage(`{"ok":false,"error":{"http_status":503,"message":"service unavailable"}}`),
+			wantClass:  ErrorClassZoteroHTTP5xx,
+			wantHint:   "Zotero HTTP 503",
+			wantStatus: 503,
+		},
+		{
 			name:       "zotero file storage refused http 413",
 			err:        errors.New("zotio import apply failed"),
 			envelope:   json.RawMessage(`{"ok":false,"error":{"http_status":413,"message":"payload too large"}}`),

@@ -299,8 +299,12 @@ func filedWithImport(plan *Plan, result *ApplyResult) bool {
 // for what the desktop save did not already do. A save that did it records the
 // same event kinds with "with_import", so the job's activity, the batch report
 // and FollowUpRetrier all read one history whichever way the item was filed.
+// It records the completion marker last, on every path: the marker is what
+// tells maintenance that a process death, and not a policy, is why an import
+// carries no follow-up (see followUpsComplete).
 func (s *Service) followUp(ctx context.Context, plan *Plan, result *ApplyResult) {
 	durable := context.WithoutCancel(ctx)
+	defer s.recordFollowUpsComplete(ctx, plan.JobID)
 	if filedWithImport(plan, result) {
 		_ = s.Bundle.Jobs.RecordEvent(durable, plan.JobID, followUpCollectionFiling, map[string]any{
 			"collection":     strings.TrimSpace(plan.Collection),

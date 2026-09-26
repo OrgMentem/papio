@@ -6,6 +6,9 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"papio/internal/job"
+	"papio/internal/store"
 )
 
 // Both follow-up errors are what zotio printed for job_cb931061ba59b7de0229e07fb6
@@ -151,14 +154,193 @@ func TestFollowUpRetrierGivesUpAfterSchedule(t *testing.T) {
 	}
 }
 
-// Only the Web API's 404 is sync lag. Any other failure is not known to heal
-// by waiting, so the retrier must not repeat a write it cannot explain.
+// A failure that waiting cannot explain is not repeated: the request itself
+// is wrong, or the write may already have happened. The timeout case is the
+// fail-closed one — zotio may have reached Zotero before the deadline.
 func TestFollowUpRetrierLeavesOtherFailuresAlone(t *testing.T) {
-	service, cli, jobID := connectorImportService(t,
-		errors.New("zotio items: collection service unavailable"), errors.New("zotio items: enrichment unavailable"), "")
-	_, failedAt := latestZotioEvent(t, service, jobID, "zotio.enrich")
-	runFollowUps(t, service, failedAt.Add(time.Hour))
+	for name, failure := range map[string]string{
+		"unclassified": "zotio items: collection service unavailable",
+		"timeout":      "zotio command timed out after 2m0s",
+		"forbidden":    "zotio items: POST /collections returned HTTP 403: Forbidden",
+	} {
+		t.Run(name, func(t *testing.T) {
+			service, cli, jobID := connectorImportService(t, errors.New(failure), errors.New(failure), "")
+			_, failedAt := latestZotioEvent(t, service, jobID, "zotio.enrich")
+			runFollowUps(t, service, failedAt.Add(30*24*time.Hour))
+			if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
+				t.Fatalf("retried %s: collection=%d enrich=%d", name, cli.collectionCalls, cli.enrichCalls)
+			}
+		})
+	}
+}
+
+// A Zotero outage, a rate limit and a refused connection are all reasons to
+// ask again, and both follow-ups converge rather than add, so repeating one
+// is safe even when Zotero committed the write and lost the response. Before,
+// only the Web API's 404 entered the schedule: a 503 or a refused connection
+// left the paper outside its collection and without its metadata for good.
+func TestFollowUpRetrierRetriesTransientOutage(t *testing.T) {
+	for name, tc := range map[string]struct{ collection, enrich, envelope string }{
+		"service unavailable": {
+			collection: "zotio items: → writing via Zotero Web API\nError: POST /collections returned HTTP 503: Service Unavailable",
+			enrich:     "zotio items: → writing via Zotero Web API\nError: mutation incomplete",
+			envelope:   `{"schema_version":1,"ok":false,"operation":"items.enrich","mode":"apply","result":{"summary":{"attempted":1,"applied":0,"failed":1},"items":[{"key":"PA12RE34","status":"failed","reason":"PATCH /items/PA12RE34 returned HTTP 503: Service Unavailable"}]}}`,
+		},
+		"rate limited": {
+			collection: "zotio items: → writing via Zotero Web API\nError: POST /collections returned HTTP 429: Too Many Requests",
+			enrich:     "zotio items: → writing via Zotero Web API\nError: PATCH /items/PA12RE34 returned HTTP 429: Too Many Requests",
+		},
+		"connection refused": {
+			collection: "zotio items: writing via Zotero Web API: dial tcp 1.2.3.4:443: connect: connection refused",
+			enrich:     "zotio items: writing via Zotero Web API: dial tcp 1.2.3.4:443: connect: connection refused",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service, cli, jobID := connectorImportService(t, errors.New(tc.collection), errors.New(tc.enrich), tc.envelope)
+			_, failedAt := latestZotioEvent(t, service, jobID, "zotio.enrich")
+
+			runFollowUps(t, service, failedAt.Add(followUpRetryDelays[0]-time.Second))
+			if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
+				t.Fatalf("retried inside the first delay: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+			}
+
+			cli.collectionErr, cli.enrichErr, cli.enrichOut = nil, nil, ""
+			runFollowUps(t, service, failedAt.Add(followUpRetryDelays[0]))
+			if cli.collectionCalls != 2 || cli.enrichCalls != 2 || cli.applyCalls != 1 {
+				t.Fatalf("calls: collection=%d enrich=%d import=%d, want one retry of each and no second import",
+					cli.collectionCalls, cli.enrichCalls, cli.applyCalls)
+			}
+			if filing, _ := latestZotioEvent(t, service, jobID, "zotio.collection_filing"); filing["status"] != "applied" {
+				t.Fatalf("retried filing event = %#v", filing)
+			}
+			if enrich, _ := latestZotioEvent(t, service, jobID, "zotio.enrich"); enrich["status"] != "applied" {
+				t.Fatalf("retried enrich event = %#v", enrich)
+			}
+		})
+	}
+}
+
+// crashAfterRecordingImport leaves the durable state a process death between
+// recording the import and running its follow-ups leaves: the exports ledger
+// holds the successful apply, the job is imported, and neither follow-up has
+// an event, nor does the completion marker. The CLI counters are reset so a
+// later assertion counts only what the repair ran.
+func crashAfterRecordingImport(t *testing.T, service *Service, cli *planCLI, jobID string) {
+	t.Helper()
+	if _, err := service.Store.DB().Exec(
+		`DELETE FROM events WHERE job_id = ? AND kind IN (?, ?, ?)`,
+		jobID, followUpCollectionFiling, followUpEnrich, followUpsComplete); err != nil {
+		t.Fatal(err)
+	}
+	cli.collectionCalls, cli.enrichCalls = 0, 0
+}
+
+// markFollowUpsCompleteAt records another job's completion marker, which is
+// what dates the epoch the repair scan reads.
+func markFollowUpsCompleteAt(t *testing.T, service *Service, jobID string, at time.Time) {
+	t.Helper()
+	if _, err := service.Store.DB().Exec(
+		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, '{"status":"done"}')`,
+		jobID, store.FormatTime(at), followUpsComplete); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Nothing drives an imported job again, so a death between the recorded
+// import and its follow-ups used to leave the paper outside its collection
+// and without its metadata for good. Maintenance must finish both, once.
+func TestFollowUpRetrierRepairsImportThatRecordedNoFollowUp(t *testing.T) {
+	service, cli, jobID := connectorImportService(t, nil, nil, "")
+	if _, at := latestZotioEvent(t, service, jobID, followUpsComplete); at.IsZero() {
+		t.Fatal("a finished import records no completion marker, so a crash cannot be told from a policy")
+	}
+	crashAfterRecordingImport(t, service, cli, jobID)
+	// A store that has been recording markers: an earlier import completed.
+	markFollowUpsCompleteAt(t, service, "job_earlier_import", time.Now().Add(-30*24*time.Hour))
+
+	runFollowUps(t, service, time.Now())
+	if cli.collectionCalls != 1 || cli.enrichCalls != 1 || cli.applyCalls != 1 {
+		t.Fatalf("repair: collection=%d enrich=%d import=%d, want one of each follow-up and no second import",
+			cli.collectionCalls, cli.enrichCalls, cli.applyCalls)
+	}
+	if filing, _ := latestZotioEvent(t, service, jobID, "zotio.collection_filing"); filing["status"] != "applied" ||
+		filing["collection"] != "Trust in AI advice" {
+		t.Fatalf("repaired filing event = %#v", filing)
+	}
+	if enrich, _ := latestZotioEvent(t, service, jobID, "zotio.enrich"); enrich["status"] != "applied" ||
+		enrich["parent_key"] != "PA12RE34" {
+		t.Fatalf("repaired enrich event = %#v", enrich)
+	}
+	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+	if err != nil || row.State != job.StateImported {
+		t.Fatalf("job state = %q, %v; want imported", row.State, err)
+	}
+
+	runFollowUps(t, service, time.Now())
 	if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
-		t.Fatalf("retried a non-404 failure: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+		t.Fatalf("repaired follow-ups ran again: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+	}
+}
+
+// An import that the same death left in ready is replayed from the exports
+// ledger. That replay filed the collection but never enriched, so the parent
+// kept no DOI or abstract however often the import retry ran it.
+func TestApplyReplayCompletesFollowUpsMissedByACrash(t *testing.T) {
+	service, cli, jobID := connectorImportService(t, nil, nil, "")
+	crashAfterRecordingImport(t, service, cli, jobID)
+
+	status, parentKey, _, err := service.PlanAndApply(context.Background(), jobID)
+	if err != nil || status != "applied" || parentKey != "PA12RE34" {
+		t.Fatalf("replay = (%q, %q, %v), want the recorded import", status, parentKey, err)
+	}
+	if cli.collectionCalls != 1 || cli.enrichCalls != 1 || cli.applyCalls != 1 {
+		t.Fatalf("replay: collection=%d enrich=%d import=%d, want one of each follow-up and no second import",
+			cli.collectionCalls, cli.enrichCalls, cli.applyCalls)
+	}
+
+	if _, _, _, err := service.PlanAndApply(context.Background(), jobID); err != nil {
+		t.Fatal(err)
+	}
+	if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
+		t.Fatalf("a second replay repeated the follow-ups: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+	}
+}
+
+// The repair has no age cutoff, so its bound is the epoch the store records
+// on its first maintenance pass. An import older than that instant predates
+// the marker itself, so its missing follow-ups are not evidence of a crash,
+// and repairing them would rewrite the operator's library from today's
+// configuration.
+func TestFollowUpRepairIgnoresImportsFromBeforeTheMarkerEpoch(t *testing.T) {
+	service, cli, jobID := connectorImportService(t, nil, nil, "")
+	crashAfterRecordingImport(t, service, cli, jobID)
+
+	// A store with no marker yet: the first pass dates the epoch and sweeps
+	// nothing, because every import it holds is from before that instant.
+	runFollowUps(t, service, time.Now())
+	if cli.collectionCalls != 0 || cli.enrichCalls != 0 {
+		t.Fatalf("the epoch pass swept history: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+	}
+	var epochs int
+	if err := service.Store.DB().QueryRow(
+		`SELECT COUNT(*) FROM events WHERE kind = ? AND job_id IS NULL`, followUpsComplete).Scan(&epochs); err != nil {
+		t.Fatal(err)
+	}
+	if epochs != 1 {
+		t.Fatalf("epoch rows = %d, want exactly one", epochs)
+	}
+
+	// Later passes do not re-date it, and the import stays out.
+	runFollowUps(t, service, time.Now())
+	if cli.collectionCalls != 0 || cli.enrichCalls != 0 {
+		t.Fatalf("swept an import from before the epoch: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+	}
+
+	// On a store that was already marking imports, the same crash victim is
+	// repaired however old it is.
+	markFollowUpsCompleteAt(t, service, "job_earlier_import", time.Now().Add(-365*24*time.Hour))
+	runFollowUps(t, service, time.Now())
+	if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
+		t.Fatalf("repair behind the epoch: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
 	}
 }
