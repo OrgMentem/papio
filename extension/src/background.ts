@@ -8,9 +8,14 @@
 //   - Outgoing frames are validated with the same parser before postMessage, so
 //     the extension can never emit a malformed or privacy-violating frame.
 //   - auth_pending/auth_returned carry timing only. URL/host/title are compared
-//     locally and NEVER placed in any outgoing frame or persisted state.
-//   - Exactly one broker-owned tab per job; downloads are adopted only when they
-//     correlate to that tab, and only when a single candidate is unambiguous.
+//     locally and NEVER placed in those frames. Other features carry their own
+//     scoped bindings under their own contracts: ActiveJob keeps provider_hosts
+//     and a bare institution origin, delivery keeps a query-free source token
+//     with a document epoch, and session_evidence may carry a bare origin hint.
+//   - One primary broker-owned handoff tab per job plus ledgered job-owned
+//     provider or viewer children; downloads are adopted only when they
+//     correlate to an armed tab of that job, and only when a single candidate
+//     is unambiguous.
 //
 // The class is constructed with an injected BridgeDeps seam so the whole flow is
 // unit-testable without a real chrome runtime.
@@ -7890,9 +7895,11 @@ export class Bridge {
    * features to the CURRENT port: a disconnected worker's stale feature
    * list must not authorize surface creation during the reconnect gap, and
    * a pending (non-holder) session must not act on another browser's queue.
-   * While the gate is closed — every shipped daemon today — institutional
-   * work parks tabless as engagement_required; the operator's explicit open
-   * (inbox click, popup retry) is the only path to a sign-in surface. */
+   * While the gate is closed institutional work parks tabless as
+   * engagement_required and waits for the operator's explicit open (inbox
+   * click, popup retry). When the gate is open the daemon has advertised
+   * the claim feature and the autonomous requires_auth path may create its
+   * sign-in surface. */
   private institutionalAuthGateOpen(): boolean {
     return (
       this.hasCurrentHello() &&
