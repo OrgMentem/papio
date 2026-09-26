@@ -70,10 +70,16 @@ func (c *recordingHTTPClient) Do(*http.Request) (*http.Response, error) {
 }
 
 type recordingNotifier struct {
-	events []notify.Event
+	events  []notify.Event
+	intents []notify.Intent
+	err     error
 }
 
 func (n *recordingNotifier) Route(_ context.Context, intent notify.Intent) error {
+	if n.err != nil {
+		return n.err
+	}
+	n.intents = append(n.intents, intent)
 	n.events = append(n.events, intent.Detail)
 	return nil
 }
@@ -1294,5 +1300,138 @@ func addReadyDOI(t *testing.T, db *store.Store, doi string, index int) {
 	}
 	if err := jobs.Transition(context.Background(), id, job.StateValidating, job.StateReady, nil, job.WithArtifact(sha)); err != nil {
 		t.Fatalf("ready transition: %v", err)
+	}
+}
+
+// TestRetractionNotificationRetriedAfterRouteFailure covers the crash window
+// between cache publication and notification delivery: a sweep whose router
+// fails must still publish the notice to the inbox, and a restart — even
+// before the next sweep is due — must deliver exactly one notification
+// without resending it on later sweeps.
+func TestRetractionNotificationRetriedAfterRouteFailure(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/original", 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Dataset title", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/original", nature: "retraction",
+		})
+	}))
+	defer server.Close()
+	dataDir := t.TempDir()
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	newSentinel := func(notifier *recordingNotifier, at time.Time) *Sentinel {
+		return New(Options{
+			Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+			Client: server.Client(), BaseURL: server.URL, DataDir: dataDir, Notifier: notifier,
+			Now: func() time.Time { return at },
+		})
+	}
+	failing := &recordingNotifier{err: errors.New("desktop unavailable")}
+	if err := newSentinel(failing, now).RunDue(ctx); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	if len(failing.events) != 0 {
+		t.Fatalf("events after failed route = %d, want none delivered", len(failing.events))
+	}
+	raw, err := os.ReadFile(filepath.Join(dataDir, cacheFileName))
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	var published cache
+	if err := json.Unmarshal(raw, &published); err != nil || len(published.Notices) != 1 {
+		t.Fatalf("published cache = %#v, err = %v; want one notice", published, err)
+	}
+	if published.Notified == nil {
+		t.Fatal("published cache carries no delivery markers")
+	}
+	if items, err := newSentinel(failing, now).SnapshotItems(ctx, nil); err != nil || len(items) != 1 {
+		t.Fatalf("inbox after failed route = %#v, %v; want the published notice", items, err)
+	}
+	// Simulate a restart an hour later, before the next sweep is due.
+	restart := &recordingNotifier{}
+	if err := newSentinel(restart, now.Add(time.Hour)).RunDue(ctx); err != nil {
+		t.Fatalf("restart sweep: %v", err)
+	}
+	if len(restart.events) != 1 {
+		t.Fatalf("events after restart = %d, want exactly one", len(restart.events))
+	}
+	if got := restart.intents[0].AggregateKey; got != published.ScanID || got == "" {
+		t.Fatalf("repair aggregate key = %q, want the publishing sweep %q", got, published.ScanID)
+	}
+	items, err := newSentinel(restart, now.Add(time.Hour)).SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 || !items[0].Retraction.NoticedAt.Equal(now) {
+		t.Fatalf("inbox after restart = %#v, %v; want the notice dated to its first sighting", items, err)
+	}
+	// The next daily sweep must not resend the delivered notice.
+	later := &recordingNotifier{}
+	if err := newSentinel(later, now.Add(25*time.Hour)).RunDue(ctx); err != nil {
+		t.Fatalf("later sweep: %v", err)
+	}
+	if len(later.events) != 0 {
+		t.Fatalf("events after later sweep = %#v, want none", later.events)
+	}
+}
+
+// TestSnapshotItemsSurfacesCorruptCache pins the two sides of an unreadable
+// notice cache: a missing file before the first sweep reads as an empty
+// inbox, but an existing cache that cannot be decoded degrades the triage
+// read instead of reporting a false all-clear.
+func TestSnapshotItemsSurfacesCorruptCache(t *testing.T) {
+	ctx := context.Background()
+	fresh := New(Options{
+		Store: testStore(t), Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		DataDir: t.TempDir(), Now: time.Now,
+	})
+	if items, err := fresh.SnapshotItems(ctx, nil); err != nil || len(items) != 0 {
+		t.Fatalf("missing cache items = %#v, %v; want empty without an error", items, err)
+	}
+	jobs := testStore(t)
+	addReadyDOI(t, jobs, "10.1234/original", 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Dataset title", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/original", nature: "retraction",
+		})
+	}))
+	defer server.Close()
+	dataDir := t.TempDir()
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: dataDir,
+		Notifier: &recordingNotifier{}, Now: func() time.Time { return now },
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if items, err := sentinel.SnapshotItems(ctx, nil); err != nil || len(items) != 1 {
+		t.Fatalf("healthy items = %#v, %v; want one notice", items, err)
+	}
+	damaged := []struct {
+		name    string
+		payload string
+	}{
+		{name: "truncated JSON", payload: "{invalid json"},
+		{name: "empty file", payload: ""},
+		{name: "unknown version", payload: `{"version":99,"checked_at":"2026-07-21T12:00:00Z","notices":{}}`},
+	}
+	for _, tc := range damaged {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(filepath.Join(dataDir, cacheFileName), []byte(tc.payload), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			items, err := sentinel.SnapshotItems(ctx, nil)
+			if err == nil {
+				t.Fatalf("damaged cache items = %#v, want an explicit error", items)
+			}
+			if len(items) != 0 {
+				t.Fatalf("damaged cache items = %#v, want none alongside the error", items)
+			}
+			if _, err := sentinel.AcknowledgeRetraction(ctx, "retraction:10.1234/original"); err == nil || errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("acknowledge over a damaged cache = %v, want the cache error", err)
+			}
+		})
 	}
 }

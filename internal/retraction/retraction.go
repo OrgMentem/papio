@@ -198,6 +198,9 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	fresh := ok && !latestAttempt.IsZero() && now.Sub(latestAttempt) < sweepEvery
 	s.mu.Unlock()
 	if fresh {
+		// A previous sweep may have published notices without delivering
+		// their notification; repair that without waiting for the next sweep.
+		s.repairPendingNotifications(ctx, cached)
 		return nil
 	}
 
@@ -276,7 +279,37 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	if scanID == "" || !ok || !fresh {
 		scanID = fmt.Sprintf("scan:%d", now.UnixNano())
 	}
-	nextCache := cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices}
+	// nextNotified carries forward delivery markers for notices that stay
+	// current. Notices from a pre-tracking cache count as delivered, so an
+	// upgrade notifies only genuinely new findings.
+	nextNotified := make(map[string]bool, len(notices))
+	for key := range notices {
+		switch _, wasPrevious := previous[key]; {
+		case s.notifier == nil:
+			nextNotified[key] = true
+		case cached.Notified == nil:
+			if wasPrevious {
+				nextNotified[key] = true
+			}
+		case cached.Notified[key]:
+			nextNotified[key] = true
+		}
+	}
+	// repair resends notices that an earlier sweep published without a
+	// successful notification. It keeps the publishing sweep as its aggregate
+	// key so retries coalesce instead of opening a new aggregate per sweep.
+	var repair []Finding
+	for key, finding := range notices {
+		if _, wasPrevious := previous[key]; wasPrevious && !nextNotified[key] {
+			repair = append(repair, finding)
+		}
+	}
+	sort.Slice(repair, func(i, j int) bool { return repair[i].DOI < repair[j].DOI })
+	repairScanID := cached.ScanID
+	if repairScanID == "" {
+		repairScanID = scanID
+	}
+	nextCache := cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices, Notified: nextNotified}
 	if lastFetchErr != nil {
 		nextCache.LastFetchError = boundedFetchError(lastFetchErr)
 		nextCache.LastFetchErrorAt = now
@@ -290,27 +323,128 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		return err
 	}
 	s.mu.Unlock()
-	if len(newFindings) > 0 && s.notifier != nil {
-		message := integrityNoticeMessage(newFindings)
-		details := make([]map[string]any, 0, len(newFindings))
-		for _, finding := range newFindings {
-			details = append(details, map[string]any{
-				"doi": finding.DOI, "nature": finding.Nature,
-				"noticed_at": finding.NoticedAt.UTC().Format(time.RFC3339Nano),
-				"notice_doi": finding.NoticeDOI,
-			})
+	if len(repair) > 0 {
+		if acked, err := s.acknowledged(ctx, nil); err != nil {
+			log.Printf("papio: reading retraction acknowledgements: %v", err)
+		} else {
+			unacked := make([]Finding, 0, len(repair))
+			for _, finding := range repair {
+				if !acked[findingKey(finding)] {
+					unacked = append(unacked, finding)
+				}
+			}
+			repair = unacked
 		}
-		event := notify.Event{Kind: "library.retraction", Message: message, Count: len(newFindings), Detail: map[string]any{"findings": details, "scan_id": scanID}}
-		intent := notify.Intent{
-			EventKind: "library.retraction", Category: notify.CategoryIntegrityNotice,
-			AggregateKey: scanID, Phase: notify.PhaseScan, WindowStart: now,
-			ScanID: scanID, HappenedAt: now, Message: message, Detail: event,
-		}
-		if err := s.notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
-			log.Printf("papio: routing retraction notification: %v", err)
+		if len(repair) > 0 {
+			// Retry under the publishing sweep's identity so the ledger
+			// sees the same notification across retry and crash.
+			repairAt := cached.CheckedAt
+			if repairAt.IsZero() {
+				repairAt = now
+			}
+			s.routeIntegrityFindings(ctx, repairScanID, repair, repairAt)
 		}
 	}
+	if len(newFindings) > 0 && s.notifier != nil {
+		s.routeIntegrityFindings(ctx, scanID, newFindings, now)
+	}
 	return nil
+}
+
+// routeIntegrityFindings routes one integrity notification for findings and,
+// on success, durably marks them notified so a later sweep does not resend
+// them. A routing failure stays pending; the next sweep retries it with the
+// same scan key.
+func (s *Sentinel) routeIntegrityFindings(ctx context.Context, scanID string, findings []Finding, at time.Time) {
+	if s.notifier == nil || len(findings) == 0 {
+		return
+	}
+	message := integrityNoticeMessage(findings)
+	details := make([]map[string]any, 0, len(findings))
+	for _, finding := range findings {
+		details = append(details, map[string]any{
+			"doi": finding.DOI, "nature": finding.Nature,
+			"noticed_at": finding.NoticedAt.UTC().Format(time.RFC3339Nano),
+			"notice_doi": finding.NoticeDOI,
+		})
+	}
+	event := notify.Event{Kind: "library.retraction", Message: message, Count: len(findings), Detail: map[string]any{"findings": details, "scan_id": scanID}}
+	intent := notify.Intent{
+		EventKind: "library.retraction", Category: notify.CategoryIntegrityNotice,
+		AggregateKey: scanID, Phase: notify.PhaseScan, WindowStart: at,
+		ScanID: scanID, HappenedAt: at, Message: message, Detail: event,
+	}
+	if err := s.notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
+		log.Printf("papio: routing retraction notification: %v", err)
+		return
+	}
+	s.markNotified(findings)
+}
+
+// repairPendingNotifications delivers cached notices that an earlier sweep
+// published without a successful notification, without waiting for the next
+// daily sweep.
+func (s *Sentinel) repairPendingNotifications(ctx context.Context, cached cache) {
+	if s.notifier == nil || cached.Notified == nil {
+		return
+	}
+	acked, err := s.acknowledged(ctx, nil)
+	if err != nil {
+		log.Printf("papio: reading retraction acknowledgements: %v", err)
+		return
+	}
+	pending := make([]Finding, 0)
+	for key, finding := range cached.Notices {
+		if cached.Notified[key] || acked[key] {
+			continue
+		}
+		pending = append(pending, finding)
+	}
+	if len(pending) == 0 {
+		return
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].DOI < pending[j].DOI })
+	scanID := cached.ScanID
+	if scanID == "" {
+		scanID = fmt.Sprintf("scan:%d", cached.CheckedAt.UnixNano())
+	}
+	// Retry under the publishing sweep's identity so the ledger sees the
+	// same notification across retry and crash.
+	at := cached.CheckedAt
+	if at.IsZero() {
+		at = s.now().UTC()
+	}
+	s.routeIntegrityFindings(ctx, scanID, pending, at)
+}
+
+// markNotified records successful notification delivery for findings still in
+// the cache. A crash between routing and this write leaves the notices
+// pending, so the next sweep retries them.
+func (s *Sentinel) markNotified(findings []Finding) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cached, ok := s.readCache()
+	if !ok {
+		return
+	}
+	if cached.Notified == nil {
+		cached.Notified = make(map[string]bool, len(cached.Notices))
+	}
+	changed := false
+	for _, finding := range findings {
+		key := findingKey(finding)
+		if _, live := cached.Notices[key]; !live || cached.Notified[key] {
+			continue
+		}
+		cached.Notified[key] = true
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	if err := s.writeCache(cached); err != nil {
+		log.Printf("papio: recording retraction notification delivery: %v", err)
+	}
 }
 
 // SnapshotItems supplies the current retraction notices for one consistent
@@ -323,9 +457,14 @@ func (s *Sentinel) SnapshotItems(ctx context.Context, tx *sql.Tx) ([]triage.Item
 		return nil, nil
 	}
 	s.mu.Lock()
-	cached, ok := s.readCache()
+	cached, ok, cacheErr := s.readCacheDetailed()
 	s.mu.Unlock()
 	if !ok {
+		if cacheErr != nil {
+			// An existing cache that cannot be read may hide published
+			// notices; report it as unavailable instead of an empty inbox.
+			return nil, cacheErr
+		}
 		return nil, nil
 	}
 	acked, err := s.acknowledged(ctx, tx)
@@ -369,9 +508,10 @@ func (s *Sentinel) SnapshotItems(ctx context.Context, tx *sql.Tx) ([]triage.Item
 
 // AcknowledgeRetraction clears one current notice from the inbox. It reports
 // whether this call was the one that recorded the acknowledgement; a repeat is
-// not an error. An unknown item, or a work with no current notice, reports
-// sql.ErrNoRows so callers can render the same conflict they render for a
-// vanished watch hit.
+// not an error. An unknown item, a work with no current notice, or a missing
+// cache reports sql.ErrNoRows so callers can render the same conflict they
+// render for a vanished watch hit. A damaged cache reports its read error
+// instead, so dismissal cannot confirm removal of notices that cannot be read.
 func (s *Sentinel) AcknowledgeRetraction(ctx context.Context, itemID string) (bool, error) {
 	if s == nil || s.store == nil {
 		return false, sql.ErrNoRows
@@ -381,9 +521,12 @@ func (s *Sentinel) AcknowledgeRetraction(ctx context.Context, itemID string) (bo
 		return false, sql.ErrNoRows
 	}
 	s.mu.Lock()
-	cached, cacheOK := s.readCache()
+	cached, cacheOK, cacheErr := s.readCacheDetailed()
 	s.mu.Unlock()
 	if !cacheOK {
+		if cacheErr != nil {
+			return false, cacheErr
+		}
 		return false, sql.ErrNoRows
 	}
 	var target Finding
@@ -946,6 +1089,13 @@ type cache struct {
 	Notices          map[string]Finding `json:"notices"`
 	LastFetchError   string             `json:"last_fetch_error,omitempty"`
 	LastFetchErrorAt time.Time          `json:"last_fetch_error_at,omitempty"`
+	// Notified marks published notices whose integrity notification left the
+	// process successfully, keyed by finding key. A missing map predates
+	// delivery tracking; those notices were already surfaced through the
+	// inbox, so they count as delivered and an upgrade does not resurface
+	// every old notice. The key is always present in newly written caches,
+	// which distinguishes "none delivered yet" from a pre-tracking cache.
+	Notified map[string]bool `json:"notified"`
 }
 
 func (s *Sentinel) cachePath() string {
@@ -953,7 +1103,7 @@ func (s *Sentinel) cachePath() string {
 }
 func (s *Sentinel) recordFetchFailure(cached cache, valid bool, at time.Time, fetchErr error) {
 	if !valid {
-		cached = cache{Version: cacheVersion, Notices: map[string]Finding{}}
+		cached = cache{Version: cacheVersion, Notices: map[string]Finding{}, Notified: map[string]bool{}}
 	}
 	cached.LastFetchError = boundedFetchError(fetchErr)
 	cached.LastFetchErrorAt = at
@@ -979,19 +1129,40 @@ func boundedFetchError(err error) string {
 // readCache requires the caller to hold s.mu so readers cannot observe a cache
 // replacement in progress.
 func (s *Sentinel) readCache() (cache, bool) {
+	cached, ok, _ := s.readCacheDetailed()
+	return cached, ok
+}
+
+// readCacheDetailed reports why a cache is unusable. A missing file means no
+// sweep has published yet and carries no error; any other failure means an
+// existing cache cannot be read, which callers surface instead of an empty
+// result. Callers must hold s.mu.
+func (s *Sentinel) readCacheDetailed() (cache, bool, error) {
 	data, err := os.ReadFile(s.cachePath())
-	if err != nil || int64(len(data)) > maxCacheBody {
-		return cache{}, false
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cache{}, false, nil
+		}
+		return cache{}, false, fmt.Errorf("retraction: read notice cache: %w", err)
+	}
+	if int64(len(data)) > maxCacheBody {
+		return cache{}, false, fmt.Errorf("retraction: notice cache exceeds %d bytes", maxCacheBody)
 	}
 	var cached cache
-	if err := decodeBoundedJSON(bytes.NewReader(data), maxCacheBody, &cached); err != nil ||
-		cached.Version != cacheVersion ||
-		(cached.CheckedAt.IsZero() && cached.LastFetchErrorAt.IsZero()) ||
-		len(cached.Notices) > maxNotices {
-		return cache{}, false
+	if err := decodeBoundedJSON(bytes.NewReader(data), maxCacheBody, &cached); err != nil {
+		return cache{}, false, fmt.Errorf("retraction: decode notice cache: %w", err)
+	}
+	if cached.Version != cacheVersion {
+		return cache{}, false, fmt.Errorf("retraction: notice cache version %d, want %d", cached.Version, cacheVersion)
+	}
+	if cached.CheckedAt.IsZero() && cached.LastFetchErrorAt.IsZero() {
+		return cache{}, false, fmt.Errorf("retraction: notice cache has no sweep timestamp")
+	}
+	if len(cached.Notices) > maxNotices {
+		return cache{}, false, fmt.Errorf("retraction: notice cache holds %d notices, limit %d", len(cached.Notices), maxNotices)
 	}
 	cached.Notices = validNotices(cached.Notices)
-	return cached, true
+	return cached, true, nil
 }
 
 // writeCache requires the caller to hold s.mu so replacement is atomic to
