@@ -41,8 +41,8 @@ Add `--json` for structured output: it is a global flag, and every command that
 reports data honours it (`init`, `daemon`, and `mcp` are prompts and processes,
 not reports). A list-shaped payload is always
 `{"<name>": [...], "truncated": bool}`, never a bare array — except
-`papio_command_search` with neither `name` nor `query`, which returns a bare
-JSON array of command summaries; the commands returning a single record —
+`papio_command_search` without `name`, which returns a bare JSON array of
+command summaries, with or without `query`; the commands returning a single record —
 `jobs get`, `doctor`, `status`, `batch report`, `zotio plan`, `inbox` —
 return that object directly, with no `truncated` key.
 The MCP resources return the identical envelope, so one parser serves both

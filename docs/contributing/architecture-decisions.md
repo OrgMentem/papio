@@ -16,7 +16,7 @@
 
 **Decision:** Use an ordinary user-authenticated browser through the extension and native host. Do not use CDP, headless Chrome, stealth patches, copied cookies, or anti-bot evasion for publisher access.
 
-**Why:** The browser handoff preserves the user's control and keeps protected-site access inside legitimate, user-authorized sessions. The extension reports narrow, metadata-only outcomes to the daemon for ordinary handoff frames, with opt-in diagnostic page captures carrying bounded sanitized HTML as the documented exception; it does not turn browser automation into a credential or evasion channel. See [Browser handoff](../concepts/browser-handoff.md).
+**Why:** The browser handoff preserves the user's control and keeps protected-site access inside legitimate, user-authorized sessions. The extension reports narrow, metadata-only outcomes in ordinary handoff frames. Unknown provider pages can trigger bounded, sanitized diagnostic captures when captures are enabled; Chrome and Firefox 140+ allow transmission by default, while older Firefox requires separate consent. It does not turn browser automation into a credential or evasion channel. See [Browser handoff](../concepts/browser-handoff.md).
 
 ## zotio is the Zotero boundary
 

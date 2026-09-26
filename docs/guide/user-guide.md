@@ -95,13 +95,13 @@ OpenAlex-related papers.
 Give `acquire --batch` a JSONL file of work records, or a RIS (`.ris`), BibTeX
 (`.bib` or `.bibtex`), CSL-JSON (a `.json` file whose top level is an array), or
 MEDLINE/NBIB (`.nbib`) file. *papio* detects file formats by extension and
-A batch holds up to 50 works; identifier normalization and deduplication are
-identical for every format. Reruns reuse only live jobs: works whose jobs
-already settled (`ready`, `imported`, `unavailable`, `failed`, `cancelled`)
-are acquired again as new jobs, so running the same file again after
-completion creates duplicates. To inspect an existing run without
-re-acquiring it, use `papio batch report`; to filter already-held works
-before submission, configure zotio or `library.sources` ownership.
+content-sniffs standard input (`-`). A batch holds up to 50 works; identifier
+normalization and deduplication are identical for every format. Reruns reuse
+only live jobs. A settled work creates a new job unless zotio or a
+`pdf_present` library source reports an existing PDF. To inspect an existing
+run without re-acquiring it, use `papio batch report latest` or pass its batch
+ID. To filter already-held works before submission, configure zotio or
+`library.sources` ownership.
 
 ```sh
 papio acquire --batch works.jsonl --auto-import \
