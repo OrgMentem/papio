@@ -324,10 +324,12 @@ as ADR-0013's Option A rejected inventing a second read model for what a poll
 already covers.
 
 **`unknown_outcome`, only after exhausting deterministic reconciliation.**
-Before Papio ever asks a human, it must have tried, in order: (1) lookup by
-provider reference; (2) lookup by Papio's own idempotency key, where the
-provider supports it; (3) search the patron's request list by exact
-work identity; (4) one delayed status re-check. Only once all four are
+Before *papio* ever asks a human, it must have tried, in order: (1) lookup by
+provider reference; (2) lookup by *papio*'s own idempotency key, where the
+provider supports it; (3) adoption on one exact idempotency-token match in the
+patron's request list, with work identity used to reject contradictions and
+title/author similarity used only as a human-review signal; (4) one delayed
+status re-check. Only once all four are
 exhausted does the delivery request move to `unknown_outcome` and the job to
 the existing `StateAwaitingHuman`
 (`internal/job/job.go:35`), opening a new human-action kind,

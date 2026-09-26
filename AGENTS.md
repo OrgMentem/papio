@@ -119,10 +119,13 @@ There is also a link check, because `zensical build` prints a broken link as an
 - **`DisallowUnknownFields` covers struct fields, NOT map keys — but `[sources.*]` names
   are now whitelisted separately.** `Config.Sources` is a `map[string]Source`, so strict
   decoding never rejected an unknown source name; `[sources.unpaywal]` used to parse cleanly
-  and silently do nothing. `validate()` now fails closed against `validSourceNames` in
-  `internal/config/config.go`, so **adding a resolver source means two edits**: the `Source*`
-  const and the `validSourceNames` entry beside it (both live next to each other for exactly
-  this reason). Removing a source needs a third: add it to `removedSourceNames`, which is
+  and silently do nothing. `validate()` now fails closed against the `sourceCatalog`
+  in `internal/config/config.go`, so **adding a resolver source means a `Source*`
+  const plus a `sourceCatalog` row** (name, roles, shipped defaults), which also
+  fixes its resolver precedence through the acquisition role; each role has one
+  constructor in `internal/bootstrap` (resolver chain, discovery backends,
+  metadata enrichers, retraction sentinel), pinned both ways by the role tests.
+  Removing a source needs one more edit: add it to `removedSourceNames`, which is
   tolerated-and-dropped on load, because `papio init`/`config save` writes every default
   source into the user's config — a hard rejection would make every existing config
   unparseable on upgrade. The same map-vs-struct distinction applies to
@@ -615,11 +618,15 @@ There is also a link check, because `zensical build` prints a broken link as an
 - Firefox treats MV3 `host_permissions` as **runtime opt-in** — the options page must let
   the user grant them (Chrome grants at install). Same gecko id (`papio@orgmentem.com`) as
   the Web Store build, so the native host `allowed_extensions` matches.
-- **Firefox never acknowledges native/manual downloads.** Without `onDeterminingFilename`
-  a file cannot be steered into `papio/<job>/`, so broad tab/host download correlation is
-  disabled on Firefox — only exact `downloads.download`-started files are owned, and click
-  adapters stay human-assisted there by design. Don't "fix" a Firefox click adapter by
-  widening correlation; the daemon would acknowledge a file it can never adopt.
+- **Firefox acknowledges native downloads only through the ADR-0029 agent path.**
+  Without `onDeterminingFilename` a file cannot be steered into `papio/<job>/`,
+  so broad tab/host download correlation stays disabled on Firefox and click
+  adapters stay human-assisted there by design. The narrow exception is a
+  `native_click_adoption_v1` reservation held under a generic-drive permit:
+  the browser reserves one native download before dispatch and admits it only
+  on an unambiguous fresh download with the exact original article referrer.
+  Don't "fix" a Firefox click adapter by widening generic correlation; the
+  daemon would acknowledge a file it can never adopt.
 - **Tab-group handoff now runs on Firefox 139+ (`tabGroups` API), not just Chrome.**
   `build.ts` keeps the `tabGroups` permission in `firefox/manifest.json`; the bridge
   is dep-driven (`chrome.tabGroups`/`chrome.tabs.group` runtime-detected), never gated

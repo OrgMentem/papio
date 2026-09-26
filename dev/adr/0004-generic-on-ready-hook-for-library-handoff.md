@@ -52,9 +52,12 @@ Option B.
   permitted direction; the list is pinned to `runReadyHook` and to
   `docs/guide/hooks.md` by `TestReadyHookEnvContractIsPinned`, so a later
   addition cannot leave this list stale and a rename fails the build.
-- **Hooks are fire-and-forget.** One run per ready transition, bounded by
-  `hooks.timeout_seconds`, never retried, never able to fail or block the
-  job. The durable `hook.on_ready` job event (`status`, `exit_code`,
+- **Hooks are fire-and-forget.** One automatic run per ready transition, bounded by
+  `hooks.timeout_seconds`, never automatically retried, never able to fail or block the
+  job. An explicit operator recovery path stays available: `jobs refile`
+  (`papio jobs refile`) synchronously reruns the configured hook once for an
+  unfiled `ready` or `imported` job whose latest hook run did not succeed, and
+  records the manual attempt. The durable `hook.on_ready` job event (`status`, `exit_code`,
   `duration_ms`) is the audit trail. Raw hook stderr is never persisted:
   the hook inherits the daemon environment, so its output can carry
   credentials, and durable events stay secret-free by invariant.
