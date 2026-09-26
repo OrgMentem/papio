@@ -5,16 +5,23 @@ package batch
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"papio/internal/ipc"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/zotio"
+
+	_ "modernc.org/sqlite"
 )
 
 // baseBatchCaller answers the daemon RPCs every batch mock needs alike: an
@@ -353,5 +360,305 @@ func TestSubmitDistinctWorksBehaveUnchanged(t *testing.T) {
 	}
 	if output.Submitted[0].JobID == "" || output.Submitted[1].JobID == "" {
 		t.Fatalf("JobIDs must be populated: %+v", output.Submitted)
+	}
+}
+
+// blockingStateCaller holds every jobs.get until its release channel closes,
+// so a test can observe what an interrupted Submit left on disk before the
+// final manifest write.
+type blockingStateCaller struct {
+	baseBatchCaller
+	mu      sync.Mutex
+	submits int
+	release chan struct{}
+	jobID   string
+	state   string
+}
+
+func (c *blockingStateCaller) Call(ctx context.Context, method string, params, result any) error {
+	switch method {
+	case "acquire.submit_v2":
+		c.mu.Lock()
+		c.submits++
+		c.mu.Unlock()
+		result.(*submitResult).JobID = c.jobID
+		return nil
+	case "jobs.get":
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		result.(*jobDetail).Job = json.RawMessage(`{"id":` + strconv.Quote(c.jobID) + `,"state":` + strconv.Quote(c.state) + `}`)
+		return nil
+	default:
+		return c.baseBatchCaller.Call(ctx, method, params, result)
+	}
+}
+
+// replayBatchCaller never creates jobs. It answers jobs.get from a fixed
+// state table so a retry must reattach to already-known jobs or fail loudly.
+type replayBatchCaller struct {
+	baseBatchCaller
+	mu      sync.Mutex
+	submits int
+	states  map[string]string
+}
+
+func (c *replayBatchCaller) Call(ctx context.Context, method string, params, result any) error {
+	switch method {
+	case "acquire.submit_v2":
+		c.mu.Lock()
+		c.submits++
+		c.mu.Unlock()
+		return fmt.Errorf("retry must not submit work again")
+	case "jobs.get":
+		id := params.(map[string]string)["job_id"]
+		state, ok := c.states[id]
+		if !ok {
+			return fmt.Errorf("job %q is gone", id)
+		}
+		result.(*jobDetail).Job = json.RawMessage(`{"id":` + strconv.Quote(id) + `,"state":` + strconv.Quote(state) + `}`)
+		return nil
+	default:
+		return c.baseBatchCaller.Call(ctx, method, params, result)
+	}
+}
+
+// A retry after an interrupted batch must reattach to the original jobs,
+// including terminal ones, instead of submitting the work again. The first
+// Submit is stalled inside its state read; the association must already be
+// durable on disk before that read completes.
+func TestSubmitRetryReusesTerminalJobsAfterInterruption(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	works := []protocol.WorkRequest{doiWork("retry-one", "10.1000/retry-one")}
+	manifestPath := filepath.Join(dataDir, "batches", ID(works, now)+".json")
+
+	first := &blockingStateCaller{release: make(chan struct{}), jobID: "job-interrupted", state: "queued"}
+	type submitOutcome struct {
+		output *SubmitOutput
+		err    error
+	}
+	done := make(chan submitOutcome, 1)
+	go func() {
+		output, err := Submit(context.Background(), first, dataDir, []protocol.WorkRequest{doiWork("retry-one", "10.1000/retry-one")}, SubmitOptions{Now: now})
+		done <- submitOutcome{output, err}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, err := os.ReadFile(manifestPath)
+		if err == nil && strings.Contains(string(data), "job-interrupted") {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(first.release)
+			t.Fatalf("interrupted Submit left no durable job association before its state read (read err %v)", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(first.release)
+	firstOut := <-done
+	if firstOut.err != nil {
+		t.Fatalf("first Submit = %v", firstOut.err)
+	}
+	if len(firstOut.output.Submitted) != 1 || firstOut.output.Submitted[0].JobID != "job-interrupted" {
+		t.Fatalf("first Submitted = %+v, want job-interrupted", firstOut.output.Submitted)
+	}
+
+	// The job completes while the CLI is gone. The retry runs with the same
+	// clock and work set, so it derives the same batch identity.
+	replay := &replayBatchCaller{states: map[string]string{"job-interrupted": "ready"}}
+	output, err := Submit(context.Background(), replay, dataDir, []protocol.WorkRequest{doiWork("retry-one", "10.1000/retry-one")}, SubmitOptions{Now: now})
+	if err != nil {
+		t.Fatalf("retry Submit = %v", err)
+	}
+	if replay.submits != 0 {
+		t.Fatalf("retry submitted %d new jobs, want none", replay.submits)
+	}
+	if len(output.Submitted) != 1 || output.Submitted[0].JobID != "job-interrupted" {
+		t.Fatalf("retry Submitted = %+v, want the original terminal job", output.Submitted)
+	}
+	if output.Submitted[0].State != "ready" {
+		t.Fatalf("retry state = %q, want ready", output.Submitted[0].State)
+	}
+	manifest, err := Load(dataDir, output.BatchID)
+	if err != nil {
+		t.Fatalf("Load retry manifest = %v", err)
+	}
+	if len(manifest.Works) != 1 || manifest.Works[0].JobID != "job-interrupted" {
+		t.Fatalf("retry manifest = %+v, want the original job, not a replacement", manifest.Works)
+	}
+}
+
+// goneJobBatchCaller answers jobs.get only for the job it just created, so a
+// test can prove a retry falls back to a fresh submit when the prior job is
+// gone from the daemon.
+type goneJobBatchCaller struct {
+	baseBatchCaller
+	jobID string
+}
+
+func (c *goneJobBatchCaller) Call(ctx context.Context, method string, params, result any) error {
+	switch method {
+	case "acquire.submit_v2":
+		result.(*submitResult).JobID = c.jobID
+		return nil
+	case "jobs.get":
+		id := params.(map[string]string)["job_id"]
+		if id != c.jobID {
+			return fmt.Errorf("job %q is gone", id)
+		}
+		result.(*jobDetail).Job = json.RawMessage(`{"id":` + strconv.Quote(id) + `,"state":"queued"}`)
+		return nil
+	default:
+		return c.baseBatchCaller.Call(ctx, method, params, result)
+	}
+}
+
+// A recorded job the daemon no longer confirms, with no readable store to
+// prove absence, must stop the work instead of risking a duplicate provider
+// effect.
+func TestSubmitRefusesResubmitWhenStoreUnreadable(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	works := []protocol.WorkRequest{doiWork("retry-two", "10.1000/retry-two")}
+	batchID := ID(works, now)
+	stale := NewManifest(works, "", "", now)
+	stale.Works[0].JobID = "job-gone"
+	if err := Write(dataDir, stale); err != nil {
+		t.Fatalf("Write stale manifest = %v", err)
+	}
+	caller := &goneJobBatchCaller{jobID: "job-fresh"}
+	output, err := Submit(context.Background(), caller, dataDir, []protocol.WorkRequest{doiWork("retry-two", "10.1000/retry-two")}, SubmitOptions{Now: now})
+	if err == nil || !strings.Contains(err.Error(), "refusing to resubmit") {
+		t.Fatalf("Submit err = %v, want a refusal to resubmit", err)
+	}
+	if output == nil || len(output.Submitted) != 0 || output.Failed != 1 {
+		t.Fatalf("output = %+v, want no submissions and one failure", output)
+	}
+	if output.BatchID != batchID {
+		t.Fatalf("BatchID = %q, want %q", output.BatchID, batchID)
+	}
+}
+
+// seedJobsDB builds the smallest database the store inspector can read: a
+// papio.db holding only the jobs rows the test needs.
+func seedJobsDB(t *testing.T, dataDir string, rows [][3]string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(dataDir, "papio.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE jobs (id TEXT PRIMARY KEY, work_request_id TEXT, state TEXT, created_at TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if _, err := db.Exec(`INSERT INTO jobs (id, work_request_id, state, created_at) VALUES (?, ?, ?, ?)`, row[0], row[1], row[2], "2026-09-26T12:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A readable store proving absence lets the retry submit anew: the recorded
+// job is really gone, not merely unconfirmed.
+func TestSubmitProvesAbsenceViaStoreThenSubmits(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	works := []protocol.WorkRequest{doiWork("retry-three", "10.1000/retry-three")}
+	batchID := ID(works, now)
+	stale := NewManifest(works, "", "", now)
+	stale.Works[0].JobID = "job-gone"
+	if err := Write(dataDir, stale); err != nil {
+		t.Fatalf("Write stale manifest = %v", err)
+	}
+	seedJobsDB(t, dataDir, nil)
+	caller := &goneJobBatchCaller{jobID: "job-fresh"}
+	output, err := Submit(context.Background(), caller, dataDir, []protocol.WorkRequest{doiWork("retry-three", "10.1000/retry-three")}, SubmitOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Submit = %v", err)
+	}
+	if output.BatchID != batchID {
+		t.Fatalf("BatchID = %q, want %q", output.BatchID, batchID)
+	}
+	if len(output.Submitted) != 1 || output.Submitted[0].JobID != "job-fresh" {
+		t.Fatalf("Submitted = %+v, want a fresh job after proven absence", output.Submitted)
+	}
+}
+
+// The commit-before-reply window: the daemon committed a job that turned
+// terminal, but the killed run never learned its ID, so the manifest holds
+// only a jobless intent. The retry must adopt the committed job with zero
+// new submits.
+func TestSubmitAdoptsStoreCommittedTerminalJob(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	works := []protocol.WorkRequest{doiWork("retry-four", "10.1000/retry-four")}
+	batchID := ID(works, now)
+	intent := NewManifest(works, "", "", now)
+	if err := Write(dataDir, intent); err != nil {
+		t.Fatalf("Write intent manifest = %v", err)
+	}
+	requestID := RequestID(batchID, works[0])
+	seedJobsDB(t, dataDir, [][3]string{{"job-committed", requestID, "ready"}})
+	replay := &replayBatchCaller{states: map[string]string{}}
+	output, err := Submit(context.Background(), replay, dataDir, []protocol.WorkRequest{doiWork("retry-four", "10.1000/retry-four")}, SubmitOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Submit = %v", err)
+	}
+	if replay.submits != 0 {
+		t.Fatalf("retry submitted %d new jobs, want none", replay.submits)
+	}
+	if len(output.Submitted) != 1 || output.Submitted[0].JobID != "job-committed" {
+		t.Fatalf("Submitted = %+v, want the committed terminal job", output.Submitted)
+	}
+	if output.Submitted[0].State != "ready" {
+		t.Fatalf("retry state = %q, want ready", output.Submitted[0].State)
+	}
+}
+
+// A dataDir that cannot persist the intent must fail before any provider
+// effect: no job may exist without a durable association.
+func TestSubmitIntentWriteFailureSubmitsNothing(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.Chmod(dataDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(dataDir, 0o700); err != nil {
+			t.Error(err)
+		}
+	})
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	caller := &fingerprintBatchCaller{expectedFingerprint: ""}
+	_, err := Submit(context.Background(), caller, dataDir, []protocol.WorkRequest{doiWork("retry-five", "10.1000/retry-five")}, SubmitOptions{Now: now})
+	if err == nil || !strings.Contains(err.Error(), "writing batch intent") {
+		t.Fatalf("Submit err = %v, want an intent write failure", err)
+	}
+	if caller.called("acquire.submit_v2") {
+		t.Fatal("a batch that cannot persist its intent must not submit")
+	}
+}
+
+// A corrupt manifest may describe submitted work. The retry must abort
+// rather than overwrite it with a jobless intent and submit again.
+func TestSubmitCorruptManifestAbortsBeforeSubmit(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	works := []protocol.WorkRequest{doiWork("retry-six", "10.1000/retry-six")}
+	if err := os.MkdirAll(filepath.Join(dataDir, "batches"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "batches", ID(works, now)+".json"), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	caller := &fingerprintBatchCaller{expectedFingerprint: ""}
+	_, err := Submit(context.Background(), caller, dataDir, []protocol.WorkRequest{doiWork("retry-six", "10.1000/retry-six")}, SubmitOptions{Now: now})
+	if err == nil || !strings.Contains(err.Error(), "reading batch manifest") {
+		t.Fatalf("Submit err = %v, want a manifest read failure", err)
+	}
+	if caller.called("acquire.submit_v2") {
+		t.Fatal("a batch with an unreadable manifest must not submit")
 	}
 }

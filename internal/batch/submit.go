@@ -373,6 +373,63 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	for i := range manifest.Works {
 		manifestIndices[manifest.Works[i].RequestID] = i
 	}
+	// A killed CLI may have submitted jobs without reaching the manifest
+	// write below. Reuse that durable association, including terminal jobs
+	// which live-job deduplication no longer returns, instead of submitting
+	// the same work again. Retry identity is same-day by construction: the
+	// batch ID derives from the calendar date and the work set, so a retry
+	// must run under the same clock to find this run; cross-day retries
+	// mint new request IDs and remain a stated residual.
+	priorJobs := make(map[string]string, len(manifest.Works))
+	priorWorks := make(map[string]bool, len(manifest.Works))
+	prior, loadErr := Load(dataDir, manifest.ID)
+	priorExists := loadErr == nil
+	switch {
+	case priorExists:
+		for _, entry := range prior.Works {
+			priorWorks[entry.RequestID] = true
+			if entry.RequestID != "" && entry.JobID != "" {
+				priorJobs[entry.RequestID] = entry.JobID
+			}
+		}
+	case errors.Is(loadErr, ErrManifestNotFound):
+		// Persist the batch intent before any provider effect so a retry
+		// can find this run. Fail closed: nothing has been submitted yet,
+		// so aborting here creates no orphan work.
+		if err := Write(dataDir, manifest); err != nil {
+			return nil, fmt.Errorf("writing batch intent: %w", err)
+		}
+	default:
+		// An unreadable manifest may describe submitted work. Never
+		// overwrite it with a jobless intent; abort before any submit.
+		return nil, fmt.Errorf("reading batch manifest for %s: %w", manifest.ID, loadErr)
+	}
+	// The store inspector closes the commit-before-reply window: a run
+	// killed after the daemon committed but before the reply reached
+	// recordJob leaves a jobless intent that no manifest entry can answer.
+	// A missing store means no daemon ever committed here, so lookups are
+	// simply absent. Any other open failure leaves the inspector nil, and
+	// the per-work rule below then refuses every work a prior run may
+	// have submitted instead of risking a duplicate provider effect.
+	inspector, err := openStoreInspector(dataDir)
+	if err != nil {
+		inspector = nil
+	}
+	if inspector != nil {
+		defer inspector.close()
+	}
+	var manifestMu sync.Mutex
+	recordJob := func(requestID, jobID string) error {
+		manifestMu.Lock()
+		defer manifestMu.Unlock()
+		if index, ok := manifestIndices[requestID]; ok {
+			manifest.Works[index].JobID = jobID
+		}
+		if err := Write(dataDir, manifest); err != nil {
+			return fmt.Errorf("recording batch association for request %q: %w", requestID, err)
+		}
+		return nil
+	}
 	classified, err := classifyBatchOwnership(ctx, caller, requests, options)
 	if err != nil {
 		return nil, err
@@ -408,12 +465,74 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 		group.Add(1)
 		go func(index int, request protocol.WorkRequest) {
 			defer group.Done()
+			// adopt records a job the daemon already owns and makes the
+			// association durable before returning. If durability fails
+			// the in-memory JobID is cleared, so the assembly below
+			// files the work as submission_failed: output.Submitted
+			// never names a job the manifest cannot prove.
+			adopt := func(jobID, state string) {
+				results[index].RequestID, results[index].JobID = request.RequestID, jobID
+				results[index].State = state
+				if err := recordJob(request.RequestID, jobID); err != nil {
+					results[index].JobID = ""
+					results[index].State = "unknown"
+					errs[index] = err
+				}
+			}
+			// A previous interrupted run may already own this work:
+			// reattach to its job whatever its state instead of
+			// submitting again.
+			if priorID := priorJobs[request.RequestID]; priorID != "" {
+				var detail jobDetail
+				if err := caller.Call(ctx, "jobs.get", map[string]string{"job_id": priorID}, &detail); err == nil {
+					if state, ok := detail.state(); ok {
+						adopt(priorID, state)
+						return
+					}
+				}
+				// The recorded job is unconfirmed. Only a positive
+				// absence proof from the store permits a fresh submit.
+				if inspector == nil {
+					errs[index] = fmt.Errorf("cannot prove no prior submission for request %q; refusing to resubmit", request.RequestID)
+					return
+				}
+				jobID, state, found, err := inspector.jobForRequest(ctx, request.RequestID)
+				if err != nil {
+					errs[index] = fmt.Errorf("verifying prior submission for request %q: %w", request.RequestID, err)
+					return
+				}
+				if found {
+					adopt(jobID, state)
+					return
+				}
+			} else if inspector != nil {
+				jobID, state, found, err := inspector.jobForRequest(ctx, request.RequestID)
+				if err != nil {
+					errs[index] = fmt.Errorf("verifying prior submission for request %q: %w", request.RequestID, err)
+					return
+				}
+				if found {
+					adopt(jobID, state)
+					return
+				}
+			} else if priorWorks[request.RequestID] {
+				// A prior run wrote an intent for this request but no
+				// association, and the store cannot be read. Submitting
+				// could duplicate a committed-but-unreported job.
+				errs[index] = fmt.Errorf("cannot prove no prior submission for request %q; refusing to resubmit", request.RequestID)
+				return
+			}
 			submitted, err := submitOne(ctx, caller, request, options.AutoImport, options.Consumer)
 			if err != nil {
 				errs[index] = err
 				return
 			}
-			results[index].RequestID, results[index].JobID = request.RequestID, submitted.JobID
+			// Durable before the state read: a kill from here on must
+			// leave the association behind for the next retry.
+			adopt(submitted.JobID, "")
+			if errs[index] != nil {
+				return
+			}
 			var detail jobDetail
 			if err := caller.Call(ctx, "jobs.get", map[string]string{"job_id": submitted.JobID}, &detail); err != nil {
 				results[index].State = "unknown"
