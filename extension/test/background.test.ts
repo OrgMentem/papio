@@ -25729,6 +25729,47 @@ test("startup reconciliation reports a vanished owned surface instead of pruning
   expect(Object.keys(ledger.current())).not.toContain(String(tabID));
 });
 
+// An older build ceded a tab the operator merely activated, and activation no
+// longer cedes (operator decision 2026-09-23). When such a record vanishes with
+// no listener alive, restart reconciliation must still report its claim loss:
+// the cession is void, so the surface is papio's again.
+test("startup reconciliation reports a vanished surface with a voided activation cession", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    browserEpoch: string | undefined;
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  const record = fakeBirthRecord({
+    binding_id: bindingID,
+    tab_hint: tabID,
+    browser_epoch: internals.browserEpoch ?? "test-epoch",
+    job_id: "job_voided_cession_0001",
+    ceded: true,
+    ceded_reason: "operator_activated",
+    claim: {
+      authentication_claim_id: "auth-voided-cession",
+      browser_holder_generation: 1,
+      gate_occurrence_id: "gate-voided-cession",
+    },
+  });
+  internals.tabLedgerCache = { [String(tabID)]: record };
+  await h.deps.tabLedger?.save({ [String(tabID)]: record });
+  await h.port.inbound(
+    helloAck({
+      features: ["surface_close_v1", "institutional_authentication_claim_v1"],
+    }),
+  );
+  h.tabs.forget(tabID);
+  await h.bridge.reconcileOwnedTabs();
+  const observation = await h.port.waitForFrame("claim_observation");
+  expect(observation.payload["event_kind"]).toBe("owner_closed");
+  expect(observation.payload["binding_id"]).toBe(bindingID);
+  expect(observation.job_id).toBe("job_voided_cession_0001");
+});
+
 // A reconnect between enqueue and drain used to make the daemon answer `stale`
 // (its fence compares the frame's generation to its own CURRENT one), and a
 // stale ack is terminal - so the replayed backlog §4.5 exists to preserve was

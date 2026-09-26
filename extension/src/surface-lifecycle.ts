@@ -849,7 +849,7 @@ export class SurfaceLifecycle {
           // reported became prior-epoch. Measured live 2026-08-21: reported
           // nothing, and the library stayed held.
           if (
-            entry.ceded !== true &&
+            !surfaceIsCeded(entry) &&
             entry.job_id !== undefined &&
             entry.binding_id !== undefined &&
             entry.claim !== undefined

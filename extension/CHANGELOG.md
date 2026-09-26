@@ -68,6 +68,11 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **Closing an old sign-in tab after an extension restart releases its claim.**
+  Earlier builds marked a tab as operator-owned when you only activated it.
+  If you closed that tab while the extension was asleep, restart recovery
+  missed the closure and held later papers at the same library. The extension
+  now reports that closure; a tab you pinned or moved out remains yours.
 - **An Ebook Central refusal after sign-in no longer asks you to sign in
   again.** After a completed institutional sign-in, Ebook Central can send
   the tab to its "does not allow access ... from your current IP" page
