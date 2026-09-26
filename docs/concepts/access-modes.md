@@ -37,7 +37,9 @@ journal issue; only OA and API sources process batches, and each batch is capped
     Delegated automation operates only inside legitimate, user-authorized access.
     *papio* never bypasses access controls, captures credentials, solves CAPTCHAs,
     evades anti-bot measures, circumvents paywalls, automates MFA, or accepts
-    publisher or library terms. Terms acceptance is always a human action.
+    publisher or library terms without prior explicit consent. A supported publisher
+    terms control is accepted only after the user records durable auto-accept consent,
+    and library login and MFA stay human actions.
 
 - **Login stays human and local.** Authentication happens in the user's ordinary
   browser. The extension has no `cookies` or `debugger` permission. It holds three

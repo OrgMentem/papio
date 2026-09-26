@@ -22,7 +22,7 @@ Requests go through the browser session you use for institutional access.
 
 ```mermaid
 flowchart LR
-    D["papio<br/>background service"] <-->|"metadata only"| H[Local connector]
+    D["papio<br/>background service"] <-->|"metadata; bounded page captures"| H[Local connector]
     H <-->|local link| E[Browser extension]
     E --> B["Your ordinary browser<br/>papio's own tabs"]
     B --> I["Library resolver<br/>and publisher"]
@@ -251,12 +251,12 @@ commits any pending dismissals.
 | `shibboleth_entity_id` | Optional default IdP entity ID for skipping a provider's WAYF selector. |
 | `proquest_account_id` | Optional default ProQuest account ID for the `accountid` append. |
 | `download_adoption_root` | Root containing the per-job adopted downloads; when empty, *papio* uses `<your download folder>/papio`. It must be a `papio` directory inside the browser's own download directory — steering cannot reach anywhere else. |
-| `action_expiry_seconds` | Maximum open time for one browser handoff. |
+| `action_expiry_seconds` | Browser-offer expiry and the first human-action reminder threshold; later reminders back off per action. |
 
 `[browser.resolvers.<name>]` profiles replace the default institution for a
-selected job. They carry only `openurl_base_url` and optional
-`shibboleth_entity_id` and `proquest_account_id`; they never inherit a default
-identity.
+selected job. They carry their own `openurl_base_url` and optional
+`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, `libkey_library_id`,
+and `document_delivery`; they never inherit a default identity.
 
 ## Permissions and data boundary
 
@@ -304,8 +304,9 @@ be revoked at any time. *papio* does not request `<all_urls>`, `cookies`, or
 other institution's own login domain.
 Selecting delegated mode does not grant a browser permission.
 
-The link to the browser carries metadata only, within *papio*'s fixed message-size limit.
-PDF bytes, cookies, credentials, page contents, screenshots, and secret- or
+The link to the browser carries metadata for ordinary download and handoff frames,
+plus bounded, sanitized HTML page-capture frames for diagnostics, within *papio*'s fixed message-size limit.
+Raw PDF bytes, cookies, credentials, screenshots, and secret- or
 signed-URL values never cross that link. For a selected download, the extension reports metadata such as
 the download item and final filename; the file itself lands under
 `<download_adoption_root>/<job_id>/` for adoption and validation. Because
@@ -325,7 +326,8 @@ the resolver link, which can unlock the institution's ProQuest route.
 
 For multiple libraries, define `[browser.resolvers.<name>]` profiles. Every
 named profile carries its own `openurl_base_url` and optional
-`shibboleth_entity_id` and `proquest_account_id`. A named profile never inherits
+`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, `libkey_library_id`,
+and `document_delivery`. A named profile never inherits
 the default profile's login identity, so a job stays with the institution that
 was selected for it. The complete key constraints and profile syntax are in the
 [Configuration reference](../reference/config-reference.md#browserresolvers).

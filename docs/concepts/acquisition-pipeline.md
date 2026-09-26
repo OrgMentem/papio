@@ -41,7 +41,7 @@ invalid one.
 1. Files *papio* has already validated for the same work.
 2. Identifier-native open sources: arXiv, PubMed Central/Europe PMC where applicable.
 3. Unpaywall OA locations.
-4. OpenAlex work locations and, when explicitly enabled, OpenAlex Content API.
+4. OpenAlex work locations, with account-keyed capacity when `sources.openalex` credentials are configured.
 5. CORE and other identifier-native repositories with configured API keys/terms.
 6. Crossref full-text/TDM links only when the specific publisher/API credential and use are configured; a link is metadata, not entitlement.
 7. Open-access sibling versions: when the requested identifier itself yields

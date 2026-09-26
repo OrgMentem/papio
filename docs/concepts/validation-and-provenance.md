@@ -14,8 +14,11 @@ not accepted merely because a server returned PDF-like bytes.
 1. **Structural gate.** *papio* rejects anything that isn't a usable download,
    then checks the PDF's header and end marker, parses its structure and page
    count in an isolated worker under strict resource limits, and records whether it is
-   encrypted or carries active content. A malformed, zero-page, encrypted/password-protected, active-JavaScript,
-   or embedded-file PDF is never accepted. Encrypted and
+   encrypted or carries active content. A malformed, zero-page, encrypted/password-protected,
+   or active-JavaScript PDF is never accepted as-is, and neither is an embedded-file PDF
+   in its original bytes. When embedded files are the only marker, *papio* strips them,
+   revalidates the attachment-free rewrite end to end, and adopts the rewrite only when
+   that full revalidation passes. Encrypted and
    active-content PDFs are explicit rejections; a review decision cannot waive
    either one.
 2. **Identity gate.** Extracted evidence is compared with the requested work,
