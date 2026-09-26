@@ -129,6 +129,11 @@ func migrateCredentials(ctx context.Context, opt *options, deps credentialConfig
 		}
 		staged := credentialConfigResult{Target: entry.binding.Target, Reference: ref, Outcome: "staged", RestartRequired: true}
 		result.Credentials = append(result.Credentials, staged)
+		// Journal before the OS write so an interrupted migration leaves a
+		// discoverable reference instead of a silent orphan.
+		if err := journalPendingCredential(cfg.Path, ref, entry.binding.Target); err != nil {
+			return result, stagedCredentialError(errors.New("credential staging could not be journaled; no credential was stored for this entry"), result.Credentials)
+		}
 		if err := stageCredential(ctx, deps, ref, entry.record); err != nil {
 			return result, stagedCredentialError(err, result.Credentials)
 		}
@@ -139,6 +144,14 @@ func migrateCredentials(ctx context.Context, opt *options, deps credentialConfig
 	}
 	if err := deps.saveConfig(next, cfg.Path, snapshot); err != nil {
 		return result, stagedCredentialError(errors.New("configuration changed or could not be saved; original configuration was not replaced"), result.Credentials)
+	}
+
+	// The bindings now own every staged reference. The save is committed, so
+	// a journal failure must say the configuration was saved.
+	for _, staged := range result.Credentials {
+		if err := clearPendingCredential(cfg.Path, staged.Reference); err != nil {
+			return result, errors.New("configuration saved, but the pending credential journal could not be updated; old vault entries are unchanged; inspect pending-credentials.json beside the configuration before restarting")
+		}
 	}
 	for i, entry := range inventory {
 		binding, err := credentialBinding(next, entry.binding.Target)

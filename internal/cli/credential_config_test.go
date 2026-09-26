@@ -790,3 +790,134 @@ func TestCredentialConfigHumanStatusShowsReferenceWithoutSecrets(t *testing.T) {
 		})
 	}
 }
+
+// An interrupted set (vault write without a config publish) must leave a
+// discoverable reference: status surfaces the orphan, delete removes it,
+// and a retry binds cleanly with no invisible extra secret.
+func TestCredentialConfigInterruptedSetSurfacesOrphanForDelete(t *testing.T) {
+	f := newCredentialCLIFixture(t)
+	f.deps.saveConfig = func(config.Config, string, config.Snapshot) error { return errors.New("private-file-path") }
+	err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private")
+	if err == nil || !strings.Contains(err.Error(), "keyring:") {
+		t.Fatal("interrupted set must report its staged reference")
+	}
+	var staged string
+	for ref := range f.store.records {
+		staged = ref
+	}
+	if staged == "" {
+		t.Fatal("interrupted set stored nothing to reconcile")
+	}
+	entries, err := readPendingCredentials(f.path)
+	if err != nil || len(entries) != 1 || entries[0].Reference != staged {
+		t.Fatalf("journal = %+v, err = %v, want the staged reference", entries, err)
+	}
+	if err := f.run([]string{"status"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), staged) || !strings.Contains(f.out.String(), "unbound") {
+		t.Fatalf("status = %q, want the orphan surfaced as unbound", f.out.String())
+	}
+	f.assertNoSecret(nil, "original-private")
+	if err := f.run([]string{"delete", staged}, ""); err != nil {
+		t.Fatalf("delete orphan = %v", err)
+	}
+	if err := f.run([]string{"status"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.out.String(), staged) {
+		t.Fatalf("status after delete = %q, want the orphan gone", f.out.String())
+	}
+	if entries, err := readPendingCredentials(f.path); err != nil || len(entries) != 0 {
+		t.Fatalf("journal after delete = %+v, err = %v, want empty", entries, err)
+	}
+}
+
+// A successful set clears its journal entry, so status never reports the
+// bound reference as unbound and a retry creates no hidden duplicates.
+func TestCredentialConfigSuccessfulSetClearsJournal(t *testing.T) {
+	f := newCredentialCLIFixture(t)
+	if err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private"); err != nil {
+		t.Fatalf("set = %v", err)
+	}
+	bound := f.reference("sources.openalex")
+	if bound == "" {
+		t.Fatal("set bound no reference")
+	}
+	if entries, err := readPendingCredentials(f.path); err != nil || len(entries) != 0 {
+		t.Fatalf("journal after set = %+v, err = %v, want empty", entries, err)
+	}
+	if err := f.run([]string{"status"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.out.String(), "unbound") {
+		t.Fatalf("status = %q, want no unbound rows for a bound reference", f.out.String())
+	}
+	if !strings.Contains(f.out.String(), bound) {
+		t.Fatalf("status = %q, want the bound reference %q", f.out.String(), bound)
+	}
+	f.assertNoSecret(nil, "original-private")
+}
+
+// A journal that exists but cannot be trusted must fail closed: set writes
+// nothing to the vault and leaves the journal bytes alone, and status
+// reports the damage instead of a clean bill of health.
+func TestCredentialConfigCorruptJournalFailsClosed(t *testing.T) {
+	for _, scenario := range []struct {
+		name string
+		body string
+	}{
+		{"trailing garbage", `[{"reference":"keyring:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"sources.openalex","created_at":"2026-01-01T00:00:00Z"}, garbage`},
+		{"invalid entry", `[{"reference":"env:STATUS_TEST_KEY","target":"sources.openalex","created_at":"2026-01-01T00:00:00Z"}]`},
+		{"empty file", ``},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			f := newCredentialCLIFixture(t)
+			journalPath := pendingCredentialPath(f.path)
+			if err := os.WriteFile(journalPath, []byte(scenario.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(journalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private")
+			if err == nil || !strings.Contains(err.Error(), "could not be journaled") {
+				t.Fatalf("set with corrupt journal = %v, want a journaling failure", err)
+			}
+			if f.store.saved != 0 {
+				t.Fatal("set with corrupt journal wrote to the vault")
+			}
+			after, err := os.ReadFile(journalPath)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("set with corrupt journal altered the journal")
+			}
+			if _, err := readPendingCredentials(f.path); !errors.Is(err, errPendingCredentialJournal) {
+				t.Fatalf("readPendingCredentials = %v, want the journal sentinel", err)
+			}
+			err = f.run([]string{"status"}, "")
+			if err == nil || !strings.Contains(err.Error(), "pending-credentials.json") {
+				t.Fatalf("status with corrupt journal = %v, want the journal failure, not a clean report", err)
+			}
+			f.assertNoSecret(err, "original-private")
+		})
+	}
+}
+
+// An unreadable journal path (here a directory in place of the file) fails
+// closed the same way a corrupt file does.
+func TestCredentialConfigUnreadableJournalPathFailsClosed(t *testing.T) {
+	f := newCredentialCLIFixture(t)
+	if err := os.MkdirAll(pendingCredentialPath(f.path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private"); err == nil || !strings.Contains(err.Error(), "could not be journaled") {
+		t.Fatalf("set with unreadable journal = %v, want a journaling failure", err)
+	}
+	if f.store.saved != 0 {
+		t.Fatal("set with unreadable journal wrote to the vault")
+	}
+	if err := f.run([]string{"status"}, ""); err == nil || !strings.Contains(err.Error(), "pending-credentials.json") {
+		t.Fatalf("status with unreadable journal = %v, want the journal failure", err)
+	}
+}

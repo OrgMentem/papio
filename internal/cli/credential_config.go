@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -142,6 +144,16 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 			bindings = []credential.Binding{b}
 		}
 		rows := credentialStatuses(cmd.Context(), cfg, bindings, depsForCall)
+		orphans, err := unboundPendingCredentials(cmd.Context(), cfg, depsForCall)
+		if err != nil {
+			return err
+		}
+		for _, orphan := range orphans {
+			if len(args) == 1 && orphan.Target != args[0] {
+				continue
+			}
+			rows = append(rows, orphan)
+		}
 		if opt.jsonOutput {
 			return printPage(opt, "credentials", rows, false)
 		}
@@ -178,6 +190,11 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 		}
 		if err := depsForCall.store.Delete(cmd.Context(), ref); err != nil && !errors.Is(err, credential.ErrNotFound) {
 			return sanitizedCredentialError(err)
+		}
+		// The record deletion is committed at this point. A journal failure
+		// must say so instead of failing as if nothing happened.
+		if err := clearPendingCredential(cfg.Path, ref); err != nil {
+			return fmt.Errorf("stored credential deleted (%s), but the pending credential journal could not be updated; inspect pending-credentials.json beside the configuration", ref)
 		}
 		return opt.printResult(credentialConfigResult{Reference: ref, Outcome: "deleted", RestartRequired: true}, "Stored credential deleted. Configurations that reference it are unchanged; restart affected daemons.")
 	}}
@@ -295,6 +312,11 @@ func setCredential(cmd *cobra.Command, opt *options, deps credentialConfigDepend
 	if err != nil {
 		return credentialConfigResult{}, errors.New("credential reference could not be created")
 	}
+	// Journal before the OS write: a kill between the vault mutation and the
+	// config save must leave a discoverable reference, not a silent orphan.
+	if err := journalPendingCredential(cfg.Path, ref, target); err != nil {
+		return credentialConfigResult{}, errors.New("credential staging could not be journaled; no credential was stored")
+	}
 	if err := stageCredential(cmd.Context(), deps, ref, record); err != nil {
 		return credentialConfigResult{}, stagedCredentialError(err, []credentialConfigResult{{Target: target, Reference: ref, Outcome: "staged"}})
 	}
@@ -308,6 +330,12 @@ func setCredential(cmd *cobra.Command, opt *options, deps credentialConfigDepend
 	}
 	if err := deps.saveConfig(next, cfg.Path, snapshot); err != nil {
 		return credentialConfigResult{}, stagedCredentialError(errors.New("configuration changed or could not be saved; original configuration was not replaced"), []credentialConfigResult{result})
+	}
+	// The binding now owns the reference; the journal entry served its
+	// purpose. Verification below only reads. The save is committed, so a
+	// journal failure must say the configuration was saved.
+	if err := clearPendingCredential(cfg.Path, ref); err != nil {
+		return credentialConfigResult{}, fmt.Errorf("configuration saved (%s), but the pending credential journal could not be updated; inspect pending-credentials.json beside the configuration before restarting.%s", ref, retainedCredentialNotice(result.PreviousReference))
 	}
 	binding.Reference = ref
 	binding.Legacy = credential.Record{}
@@ -379,6 +407,149 @@ func stagedCredentialError(cause error, staged []credentialConfigResult) error {
 		refs = append(refs, r.Reference)
 	}
 	return fmt.Errorf("%s; staged credential references (a dispatched write may still complete): %s; inspect status or explicitly delete unused records", cause.Error(), strings.Join(refs, ", "))
+}
+
+// errPendingCredentialJournal reports a journal that exists but cannot be
+// trusted: an unreadable file, an empty file, undecodable JSON, or an entry
+// with an invalid reference. Callers fail closed on it. A missing file is
+// the only clean first run and is not an error.
+var errPendingCredentialJournal = errors.New("pending credential journal is unreadable or corrupt; inspect pending-credentials.json beside the configuration before retrying")
+
+// pendingCredential journals an OS-store write that is not yet bound to
+// configuration, so an interrupted set or migrate cannot strand an
+// undiscoverable secret. Entries are advisory and carry no secret material:
+// status surfaces journaled references that no binding owns, and only an
+// explicit delete removes the stored record.
+type pendingCredential struct {
+	Reference string `json:"reference"`
+	Target    string `json:"target"`
+	CreatedAt string `json:"created_at"`
+}
+
+func pendingCredentialPath(configPath string) string {
+	dir := filepath.Dir(strings.TrimSpace(configPath))
+	if dir == "" || dir == "." {
+		dir = config.Dir()
+	}
+	return filepath.Join(dir, "pending-credentials.json")
+}
+
+func readPendingCredentials(configPath string) ([]pendingCredential, error) {
+	data, err := os.ReadFile(pendingCredentialPath(configPath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errPendingCredentialJournal
+	}
+	if len(data) == 0 {
+		return nil, errPendingCredentialJournal
+	}
+	var entries []pendingCredential
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, errPendingCredentialJournal
+	}
+	for _, entry := range entries {
+		if credential.ValidateReference(entry.Reference) != nil || !strings.HasPrefix(entry.Reference, "keyring:") {
+			return nil, errPendingCredentialJournal
+		}
+	}
+	return entries, nil
+}
+
+func writePendingCredentials(configPath string, entries []pendingCredential) error {
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(pendingCredentialPath(configPath))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(dir, ".pending-credentials-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, pendingCredentialPath(configPath))
+}
+
+func journalPendingCredential(configPath, ref, target string) error {
+	entries, err := readPendingCredentials(configPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Reference == ref {
+			return nil
+		}
+	}
+	return writePendingCredentials(configPath, append(entries, pendingCredential{Reference: ref, Target: target, CreatedAt: time.Now().UTC().Format(time.RFC3339)}))
+}
+
+func clearPendingCredential(configPath, ref string) error {
+	entries, err := readPendingCredentials(configPath)
+	if err != nil {
+		return err
+	}
+	kept := make([]pendingCredential, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Reference != ref {
+			kept = append(kept, entry)
+		}
+	}
+	if len(kept) == len(entries) {
+		return nil
+	}
+	return writePendingCredentials(configPath, kept)
+}
+
+// unboundPendingCredentials surfaces journaled OS-store writes that no
+// current binding owns. A stored record the operator did not keep is
+// discoverable here and deletable with credentials delete; nothing is
+// removed implicitly, so a reference shared with another profile is safe.
+func unboundPendingCredentials(ctx context.Context, cfg config.Config, deps credentialConfigDependencies) ([]credentialStatusRow, error) {
+	entries, err := readPendingCredentials(cfg.Path)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	owned := make(map[string]bool, len(entries))
+	for _, binding := range cfg.CredentialBindings() {
+		if binding.Reference != "" {
+			owned[binding.Reference] = true
+		}
+	}
+	var rows []credentialStatusRow
+	for _, entry := range entries {
+		if owned[entry.Reference] {
+			continue
+		}
+		if _, err := deps.store.Load(ctx, entry.Reference); err != nil {
+			continue
+		}
+		target := entry.Target
+		if target == "" {
+			target = "(unbound)"
+		}
+		rows = append(rows, credentialStatusRow{Target: target, Reference: entry.Reference, Source: "keyring", State: "unbound"})
+	}
+	return rows, nil
 }
 
 // Capture the prospective env binding as well as the profile's current inputs.
