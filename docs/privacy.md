@@ -25,8 +25,8 @@ a limited article observation to TypeSafe as described below.
 
 ## Requests to third-party services
 
-Every destination below is contacted directly by the daemon on your computer. Each
-request carries the identifier being looked up. The “Data sent besides the lookup”
+Every destination below is contacted directly by the daemon on your computer. Most
+requests carry the identifier being looked up; the retraction-check fetch downloads a shared dataset instead and carries no library identifiers. The “Data sent besides the lookup”
 column lists anything else sent.
 
 | Service | Data sent besides the lookup | Used for | Default |
@@ -34,7 +34,7 @@ column lists anything else sent.
 | `api.typesafe.ai` | your TypeSafe key; article DOI, bounded article title, sanitized visible control labels/roles/disabled states, opaque IDs and observation revision | Optional agent acquisition decisions | Off — requires explicit `papio config agent set` enrollment or `PAPIO_TYPESAFE_API_KEY` in the daemon environment |
 | `api.unpaywall.org` | your `email` (required by their terms) | Resolving a DOI | **On** |
 | `api.crossref.org` | your `email`, if set | Adding metadata to a title-only request; checking a DOI's registered version relations when other candidates are exhausted | **On** |
-| `api.crossref.org` | — | Daily retraction checks for papers already in your library | **On** |
+| `api.labs.crossref.org` | your `email`, if configured | Daily retraction checks for papers already in your library | **On** |
 | `www.ebi.ac.uk` (Europe PMC) | — | Resolving a DOI, PMID, or title | **On** |
 | `export.arxiv.org` | — | Resolving an arXiv ID or DOI, and `papio search` when configured | **On** |
 | `doi.org` | your `email`, in the User-Agent | Confirming that a DOI exists before an institutional handoff | **On** |
@@ -45,7 +45,7 @@ column lists anything else sent.
 | `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv ID, or PMID, and `papio search` when configured | **On** |
 | `api.openaire.eu` | your API token, if set | Resolving | **On** |
 | Publisher and repository hosts | — | Downloading the PDF | **On** |
-| `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **On**, `updates.check = false` disables it |
+| `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **Off** by default (`updates.check` defaults to `false`; guided init may enable it), `updates.check = false` disables it |
 | Your webhook URL | job event and message | Job state changes | Off |
 
 ### Important details
@@ -54,11 +54,10 @@ column lists anything else sent.
 it. Unpaywall and OpenAlex require an email address. Crossref and DOI lookup use it
 when configured. Leaving it empty prevents Unpaywall and OpenAlex lookups.
 
-**Retraction checks.** Retraction checks send the DOIs of papers already in your
-library to Crossref. Disable them with
+**Retraction checks.** Retraction checks download the Retraction Watch dataset and match the DOIs of papers already in your library locally on your machine; the request carries no library DOIs, only your configured `email` as a `mailto` parameter when one is set. Disable them with
 `[sources.retraction_watch] enabled = false`.
 
-**Update checks.** Update checks make an unauthenticated request to the public
+**Update checks.** Update checks are off by default and, when enabled, make an unauthenticated request to the public
 GitHub releases page. GitHub receives your IP address, as it would for any web
 request, but *papio* does not send your identifiers or usage information. Disable
 the check with `updates.check = false`.

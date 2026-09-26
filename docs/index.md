@@ -16,7 +16,7 @@ Every request becomes a job. `papio` ranks the possible sources and tries them i
 ![papio pipeline: discover works, acquire from open or institutional sources, validate PDFs, and file them in Zotero or another destination](assets/architecture-dark.svg#only-dark)
 
 1. **Discover.** `papio search` returns read-only OpenAlex results and, when zotio or a configured `library.sources` authority is available, marks works already in your library; without either, results are unowned/unclassified.
-2. **Acquire.** A batch (up to 50 works) or a single work becomes jobs, each with a stable ID, so running the same request again is safe and won't duplicate.
+2. **Acquire.** A batch (up to 50 works) or a single work creates jobs with unique IDs. Repeating a request reuses a matching live job; after a job reaches a terminal state, a new request can start a new job.
 3. **Find & download.** Open-access and licensed sources are tried before institutional access; each candidate is downloaded under strict size and time limits, then held in quarantine.
 4. **Validate.** Every PDF must pass checks on its structure, its identity, and — if needed — a text scan before it is trusted; anything ambiguous waits in `needs_review`.
 5. **File.** Validated PDFs use Zotero's `zotio` preview-and-confirmation path. Filing anywhere else — papis, Calibre, a plain folder, your own script — is a best-effort [`on_ready` hook](guide/hooks.md) handoff; hook failures never fail or retry the acquisition job.

@@ -289,9 +289,9 @@ configuration, background service, jobs, and zotio boundary as the CLI:
 claude mcp add papio -- papio mcp
 ```
 
-**One writer into Zotero, on both surfaces.** `papio zotio apply` is the only
-path that writes to Zotero, and it demands the exact confirmation SHA-256 from
-`papio zotio plan`.
+**One item writer into Zotero, on both surfaces.** `papio zotio apply` is the only
+path that creates Zotero items and attachments, and it demands the exact confirmation SHA-256 from
+`papio zotio plan`. The separate `papio zotio tags reconcile` command writes exception tags without a preview.
 
 ---
 
@@ -378,8 +378,8 @@ papio doctor        # sources, PDF tools, background service, extension, connect
 
 Config file: `~/.config/papio/config.toml` — on Windows `%APPDATA%\papio\config.toml`
 (override with `--config`). Access
-modes, resolver profiles, source allow/deny lists, budgets, OCR, and the zotio
-executable are all configured there — every key, default, constraint, and
+modes, resolver profiles, source allow/deny lists, budgets, OCR, the zotio
+executable, notifications, drive pacing, update checks, and captures are all configured there — every key, default, constraint, and
 effect is in the
 [configuration reference](https://orgmentem.github.io/papio/reference/config-reference/).
 
@@ -393,9 +393,9 @@ any subcommand.
 <details>
 <summary>Top-level commands</summary>
 
-`acquire` · `actions` · `artifacts` · `batch` · `bundle` · `config` · `daemon`
-· `doctor` · `init` · `jobs` · `mcp` · `native-host` · `search` · `status` ·
-`version` · `watch` · `zotio`
+`acquire` · `actions` · `activity` · `adapter` · `artifacts` · `batch` · `bench` · `browser` · `bundle` · `config` · `daemon`
+· `delivery` · `doctor` · `drive` · `export` · `failures` · `grabs` · `inbox` · `init` · `jobs` · `mcp` · `native-host` · `notify` · `pulse` · `search` · `status` · `stats`
+· `version` · `watch` · `zotio`
 
 </details>
 

@@ -16,7 +16,7 @@
 
 **Decision:** Use an ordinary user-authenticated browser through the extension and native host. Do not use CDP, headless Chrome, stealth patches, copied cookies, or anti-bot evasion for publisher access.
 
-**Why:** The browser handoff preserves the user's control and keeps protected-site access inside legitimate, user-authorized sessions. The extension reports narrow, metadata-only outcomes to the daemon; it does not turn browser automation into a credential or evasion channel. See [Browser handoff](../concepts/browser-handoff.md).
+**Why:** The browser handoff preserves the user's control and keeps protected-site access inside legitimate, user-authorized sessions. The extension reports narrow, metadata-only outcomes to the daemon for ordinary handoff frames, with opt-in diagnostic page captures carrying bounded sanitized HTML as the documented exception; it does not turn browser automation into a credential or evasion channel. See [Browser handoff](../concepts/browser-handoff.md).
 
 ## zotio is the Zotero boundary
 
@@ -32,7 +32,7 @@
 
 **Decision:** Require an explicit access-mode choice; never silently enable automation. `conservative`, `assisted`, and `delegated` define the allowed behavior, and licensed/TDM adapters remain separately enabled capabilities.
 
-**Why:** Delegated automation is still limited to legitimate, user-authorized access: login, MFA, CAPTCHA, and publisher/library terms remain human actions. Unknown or changed provider UI falls back to assisted behavior rather than guessing. See [Access modes](../concepts/access-modes.md).
+**Why:** Delegated automation is still limited to legitimate, user-authorized access: login, MFA, and CAPTCHA remain human actions, as does any publisher or library terms step without recorded auto-accept consent. With explicit persisted consent for a supported publisher terms control, the extension may accept that control on the user's behalf. Unknown or changed provider UI falls back to assisted behavior rather than guessing. See [Access modes](../concepts/access-modes.md).
 
 ## Daemon-owned durable state
 
@@ -122,7 +122,7 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 
 **Context:** Without a configured Zotero integration, *papio* had no de-duplication: search couldn't mark a result already held, batch acquisition re-fetched owned papers, and backfill watches were impossible.
 
-**Decision:** ADR-0008 introduces a pluggable holdings-provider model that emits positive evidence only — "this record or PDF is present" — and never a negative "not owned" claim; a source failure or incomplete read yields `unknown`, not a skip. Sources are declared file or command exports (for example a BibTeX export of papers already holding a PDF), their claims are unioned across sources, and a generic source can never route into zotio's Zotero-attachment flow, which stays its own concept.
+**Decision:** ADR-0008 introduces a pluggable holdings-provider model that emits positive evidence only — "this record or PDF is present" — and never a negative "not owned" claim; a source failure or incomplete read yields `unknown`, not a skip. Sources are declared file exports (for example a BibTeX export of papers already holding a PDF), with command-driven sources planned rather than supported, their claims are unioned across sources, and a generic source can never route into zotio's Zotero-attachment flow, which stays its own concept.
 
 **Why:** A false "owned" verdict silently withholds a paper the user asked for, while a false negative just costs one redundant download. The design biases hard toward the cheaper mistake, the same asymmetry provenance decisions use elsewhere.
 
@@ -222,9 +222,9 @@ data.
 
 **Context:** When a work is only obtainable through interlibrary loan, *papio* recognizes that outcome internally but historically just gave up — no request record, no polling, no reconciliation if a human placed the request by hand outside *papio*.
 
-**Decision:** ADR-0017 proposes a new durable, idempotency-keyed request table, fed by up to three route sources: an institution's OpenURL request form, a LibKey-resolved delivery route (ADR-0016), or a direct interlibrary-loan provider API. A pending request keeps the job in an existing retry-wait state rather than a human action, since nothing needs a person's attention while *papio* is only waiting on a reply. Automatic submission — as opposed to opening a prefilled form for a human to send — is proposed only for a narrow, explicitly configured case: digital journal articles, zero patron fee, no required human step, gated by a seven-point per-request check, and only after one supervised submission against the real deployment has succeeded.
+**Decision:** ADR-0017 adds a durable, idempotency-keyed request table, fed by up to three route sources: an institution's OpenURL request form, a LibKey-resolved delivery route (ADR-0016), or a direct interlibrary-loan provider API (ILLiad in v1). A pending request keeps the job in an existing retry-wait state rather than a human action, since nothing needs a person's attention while *papio* is only waiting on a reply; submitted requests are polled through the delivery service and managed with `papio delivery` commands. Automatic submission — as opposed to opening a prefilled form for a human to send — is supported only for a narrow, explicitly configured case: digital journal articles, zero patron fee, no required human step, gated by a seven-point per-request check, and only after one supervised submission against the real deployment has succeeded. Delivery providers beyond the configured ILLiad route remain unimplemented.
 
-**Why:** Treating delivery as a first-class, polled state instead of a dead end closes a real gap in acquisition coverage, but auto-submission on a person's behalf is powerful enough that the design deliberately keeps the bar for it high and explicit rather than inferring consent from configuration alone. This ADR is proposed and not yet built.
+**Why:** Treating delivery as a first-class, polled state instead of a dead end closes a real gap in acquisition coverage, but auto-submission on a person's behalf is powerful enough that the design deliberately keeps the bar for it high and explicit rather than inferring consent from configuration alone.
 
 ## Recording the browser session behind an adopted PDF
 
