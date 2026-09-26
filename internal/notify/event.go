@@ -21,6 +21,11 @@ type Event struct {
 	// Detail carries producer-owned structured fields (for example all findings
 	// in one retraction scan) without changing the event kind or core fields.
 	Detail map[string]any `json:"detail,omitempty"`
+	// DeliveryKey is the stable ledger identity for this notification row
+	// (for example "papio-42"). The router sets it from the durable row ID
+	// before a webhook POST so receivers can correlate retries. It is empty
+	// when the event bypasses the ledger. Text-only senders ignore it.
+	DeliveryKey string `json:"delivery_key,omitempty"`
 }
 
 // EventSender is optionally implemented by senders that can deliver the

@@ -303,11 +303,13 @@ interruptive, while `verbose` surfaces more category events. Use
 [`[notify]` in the configuration reference](../reference/config-reference.md#notify)
 for the preset table and per-category overrides.
 
-Webhooks are a separate automation channel. They are not delayed by human
-quiet hours or the desktop rate limit, and each category can override its
-webhook mode independently of desktop routing. Webhook delivery and desktop
-delivery are both best-effort; the durable inbox and Activity records remain
-the recovery path.
+Webhooks are a separate automation channel. Human quiet hours and the desktop
+rate limit do not delay them. Each category can set its own webhook mode.
+*papio* attempts each webhook once and sends a stable delivery key with it.
+If the endpoint fails, *papio* records a failed attempt in Activity; it does
+not retry the POST. If *papio* stops during a send, the result can be unknown.
+The receiver can use the key to detect repeat requests. Check the inbox and
+Activity for the durable outcome when a notification does not arrive.
 
 ### Read the pulse for a batch
 

@@ -413,6 +413,10 @@ unsupported platform is reported by `papio doctor` and does not consume the
 desktop rate budget. Webhooks are not subject to quiet hours, focused-surface
 suppression, or the desktop rate ceiling.
 
+The daemon claims a webhook before it sends the POST. It does not send that
+intent again after a crash or a failed response. Activity records a failed
+attempt, and the JSON event carries a stable `delivery_key` for receiver checks.
+
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Enables best-effort local desktop notifications from the daemon. This affects only the desktop leg; it does not disable webhooks. |

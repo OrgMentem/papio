@@ -82,6 +82,12 @@ func (l *StoreLedger) ReserveDesktop(ctx context.Context, id int64, now time.Tim
 func (l *StoreLedger) SetDesktopState(ctx context.Context, id int64, state string, now time.Time) (bool, error) {
 	return l.ledger.SetDesktopState(ctx, id, state, now)
 }
+func (l *StoreLedger) ClaimWebhook(ctx context.Context, id int64) (bool, error) {
+	if l == nil || l.ledger == nil {
+		return false, fmt.Errorf("notification ledger is unavailable")
+	}
+	return l.ledger.ClaimWebhook(ctx, id)
+}
 func (l *StoreLedger) SetWebhookState(ctx context.Context, id int64, state string, now time.Time) error {
 	return l.ledger.SetWebhookState(ctx, id, state, now)
 }

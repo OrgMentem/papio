@@ -30,9 +30,22 @@ type Ledger interface {
 	DueDesktop(context.Context, time.Time, int) ([]Record, error)
 	ReserveDesktop(context.Context, int64, time.Time, int) (bool, error)
 	SetDesktopState(context.Context, int64, string, time.Time) (bool, error)
+	// ClaimWebhook atomically moves a pending webhook leg to sending and
+	// reports whether the claim applied. The router POSTs only on a won
+	// claim, which keeps replay, concurrent, and restart delivery to one
+	// POST per row at most. See the store ClaimWebhook for the full policy.
+	ClaimWebhook(context.Context, int64) (bool, error)
 	SetWebhookState(context.Context, int64, string, time.Time) error
 	SupersedeCheckpoints(context.Context, string, time.Time) (int, error)
 	LatestCheckpoint(context.Context, string) (Record, bool, error)
+}
+
+// webhookResultSender is optionally implemented by webhook senders that
+// report delivery outcome. The production Webhook implements it; legacy
+// senders that only satisfy Sender or EventSender keep the old
+// fire-and-forget behavior and always settle as attempted.
+type webhookResultSender interface {
+	SendEventResult(context.Context, Event) error
 }
 
 type Router struct {
@@ -184,10 +197,32 @@ func (r *Router) Route(ctx context.Context, intent Intent) error {
 	// Webhooks are automation: they are not subject to desktop focus, quiet
 	// hours, supersession, or rate state. Immediate legs dispatch now; digest
 	// legs are drained by RunDue.
-	if webhookState == "pending" && categoryPolicy.Webhook != "digest" {
-		r.sendEvent(ctx, r.webhook, payload)
-		if err := r.ledger.SetWebhookState(ctx, record.ID, "attempted", now); err != nil {
+	//
+	// Webhook delivery is at-most-once per ledger row. The router claims the
+	// pending leg before its POST, so a replayed intent, a concurrent Route,
+	// or a restart after the claim cannot POST twice. A crash between claim
+	// and settle leaves sending, which never becomes due again: the delivery
+	// may be lost but is never duplicated. Local ledger state cannot give
+	// exactly-once across a lost HTTP response, so every POST carries the
+	// stable per-row delivery key for receiver correlation.
+	if webhookState == "pending" && categoryPolicy.Webhook != "digest" && r.webhook != nil && record.WebhookState == "pending" {
+		claimed, err := r.ledger.ClaimWebhook(ctx, record.ID)
+		if err != nil {
 			return err
+		}
+		if claimed {
+			event := record.Intent.Detail
+			event.Count = record.Count
+			event.Message = ComposeMessage(record.Intent.Category, record.Count, event, record.Intent.Message)
+			event.DeliveryKey = WebhookDeliveryKey(record.ID)
+			if err := r.deliverWebhook(ctx, event); err != nil {
+				if serr := r.ledger.SetWebhookState(ctx, record.ID, "failed", now); serr != nil {
+					return serr
+				}
+				r.audit(ctx, "notify.webhook_failed", record, "webhook_failed")
+			} else if err := r.ledger.SetWebhookState(ctx, record.ID, "attempted", now); err != nil {
+				return err
+			}
 		}
 	}
 	if intent.Category == CategoryDecisionPending && categoryPolicy.Desktop == "digest" {
@@ -230,10 +265,28 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 			if r.policy.For(row.Intent.Category).Webhook != "digest" {
 				continue
 			}
+			// Same at-most-once claim as immediate legs: only the drain that
+			// wins the pending-to-sending claim POSTs. A crash between claim
+			// and settle leaves sending behind, which DueWebhook never
+			// returns, so a restart cannot duplicate the POST.
+			claimed, err := r.ledger.ClaimWebhook(ctx, row.ID)
+			if err != nil {
+				return err
+			}
+			if !claimed {
+				continue
+			}
 			event := row.Intent.Detail
 			event.Count = row.Count
 			event.Message = ComposeMessage(row.Intent.Category, row.Count, event, row.Intent.Message)
-			r.sendEvent(ctx, r.webhook, event)
+			event.DeliveryKey = WebhookDeliveryKey(row.ID)
+			if err := r.deliverWebhook(ctx, event); err != nil {
+				if serr := r.ledger.SetWebhookState(ctx, row.ID, "failed", now); serr != nil {
+					return serr
+				}
+				r.audit(ctx, "notify.webhook_failed", row, "webhook_failed")
+				continue
+			}
 			if err := r.ledger.SetWebhookState(ctx, row.ID, "attempted", now); err != nil {
 				return err
 			}
@@ -404,6 +457,24 @@ func (r *Router) sendEvent(ctx context.Context, sender Sender, event Event) {
 		return
 	}
 	sender.Send(ctx, event.Message)
+}
+
+// deliverWebhook POSTs one claimed webhook event and reports the endpoint
+// outcome. Senders that implement SendEventResult give a real signal, so a
+// transport error or non-2xx status settles the leg as failed instead of
+// attempted. Legacy senders keep fire-and-forget and always report success.
+func (r *Router) deliverWebhook(ctx context.Context, event Event) error {
+	if r == nil || r.webhook == nil {
+		return fmt.Errorf("notification webhook is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if reporter, ok := r.webhook.(webhookResultSender); ok {
+		return reporter.SendEventResult(ctx, event)
+	}
+	r.sendEvent(ctx, r.webhook, event)
+	return nil
 }
 
 func (r *Router) audit(ctx context.Context, kind string, row Record, reason string) {

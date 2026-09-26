@@ -7,6 +7,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,6 +111,15 @@ func (l *routerLedger) SetDesktopState(_ context.Context, id int64, state string
 		return false, nil
 	}
 	r.DesktopState = state
+	l.rows[id] = r
+	return true, nil
+}
+func (l *routerLedger) ClaimWebhook(_ context.Context, id int64) (bool, error) {
+	r, ok := l.rows[id]
+	if !ok || r.WebhookState != "pending" {
+		return false, nil
+	}
+	r.WebhookState = "sending"
 	l.rows[id] = r
 	return true, nil
 }
@@ -920,5 +930,266 @@ func TestRunDueAtDoesNotResurrectSupersededCheckpoint(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func webhookStateColumn(t *testing.T, db *store.Store, id int64) string {
+	t.Helper()
+	var state string
+	if err := db.DB().QueryRowContext(context.Background(),
+		`SELECT webhook_state FROM notification_intents WHERE id=?`, id).Scan(&state); err != nil {
+		t.Fatalf("reading webhook_state of intent %d: %v", id, err)
+	}
+	return state
+}
+
+type resultWebhookSender struct {
+	events []Event
+	calls  int
+	err    error
+}
+
+func (s *resultWebhookSender) Send(_ context.Context, message string) {
+	s.calls++
+	s.events = append(s.events, Event{Message: message})
+}
+func (s *resultWebhookSender) SendEvent(_ context.Context, event Event) {
+	s.calls++
+	s.events = append(s.events, event)
+}
+func (s *resultWebhookSender) SendEventResult(_ context.Context, event Event) error {
+	s.calls++
+	s.events = append(s.events, event)
+	return s.err
+}
+
+func immediateTestPolicy() Policy {
+	return Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "immediate", Window: time.Minute},
+	}}
+}
+
+func immediateTestIntent(now time.Time) Intent {
+	return Intent{EventKind: "request.outcome", Category: CategoryRequestOutcome, AggregateKey: "job:1",
+		Phase: PhaseTerminal, WindowStart: now, HappenedAt: now,
+		Message: "Request finished — open the papio inbox",
+		Detail:  Event{Kind: "request.outcome", Message: "Request finished — open the papio inbox", Count: 1}}
+}
+
+// A replayed immediate intent must not POST twice: the second Route sees the
+// claimed row and skips delivery.
+func TestImmediateWebhookReplayPostsOnce(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &recordingEventSender{}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	intent := immediateTestIntent(now)
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %d, want exactly one POST for a replayed intent", len(webhook.events))
+	}
+	if got := webhook.events[0].DeliveryKey; got == "" {
+		t.Fatal("immediate POST carries no stable delivery key")
+	}
+	rows, err := NewStoreLedger(db).DueWebhook(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("replayed leg is still due: %+v", rows)
+	}
+}
+
+// Concurrent immediate Routes for the same identity share one ledger row and
+// one claim, so only one POST leaves the process.
+func TestImmediateWebhookConcurrentRoutesPostOnce(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &recordingEventSender{}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	intent := immediateTestIntent(now)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = router.Route(ctx, intent)
+		}()
+	}
+	wg.Wait()
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %d, want one POST for eight concurrent Routes", len(webhook.events))
+	}
+}
+
+// A digest claim held across a restart never becomes due again, so the next
+// drain cannot duplicate the POST. The held sending row is the at-most-once
+// boundary, not a retry.
+func TestDigestWebhookClaimPreventsRestartDuplicate(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &recordingEventSender{}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	ledger := NewStoreLedger(db)
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	due, err := ledger.DueWebhook(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 {
+		t.Fatalf("pending digest rows = %d, want one", len(due))
+	}
+	// Simulate a crash after the claim but before the POST settled.
+	claimed, err := ledger.ClaimWebhook(ctx, due[0].ID)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	clock = now.Add(time.Hour)
+	if err := router.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 0 {
+		t.Fatalf("webhook events after a crashed claim = %d, want no duplicate POST", len(webhook.events))
+	}
+	if got := webhookStateColumn(t, db, due[0].ID); got != "sending" {
+		t.Fatalf("webhook_state after crashed claim = %q, want sending held for at-most-once", got)
+	}
+}
+
+// A normal digest delivers once with a stable key and never replays.
+func TestDigestWebhookDeliversOnceWithStableKey(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &recordingEventSender{}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(time.Hour)
+	if err := router.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %d, want one digest POST", len(webhook.events))
+	}
+	key := webhook.events[0].DeliveryKey
+	if key == "" {
+		t.Fatal("digest POST carries no stable delivery key")
+	}
+	if err := router.RunDueAt(ctx, clock.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events after second drain = %d, want no replay", len(webhook.events))
+	}
+}
+
+// Failed endpoint responses settle visibly as failed for both immediate and
+// digest legs, never as attempted.
+func TestWebhookFailureSettlesFailedState(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &resultWebhookSender{err: errors.New("endpoint returned 503")}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	if webhook.calls != 1 {
+		t.Fatalf("immediate delivery calls = %d, want one attempt", webhook.calls)
+	}
+	rows, err := NewStoreLedger(db).DueWebhook(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("failed immediate leg is still due: %+v", rows)
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "failed" {
+		t.Fatalf("immediate webhook_state = %q, want failed so the outage stays visible", got)
+	}
+}
+
+func TestDigestWebhookFailureSettlesFailedState(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &resultWebhookSender{err: errors.New("connection refused")}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	ledger := NewStoreLedger(db)
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(time.Hour)
+	if err := router.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if webhook.calls != 1 {
+		t.Fatalf("digest delivery calls = %d, want one attempt", webhook.calls)
+	}
+	due, err := ledger.DueWebhook(ctx, clock.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("failed digest leg is still due: %+v", due)
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "failed" {
+		t.Fatalf("digest webhook_state = %q, want failed so the outage stays visible", got)
 	}
 }

@@ -598,3 +598,88 @@ func TestNotificationLedgerWebhookStateAndDesktopAvailabilityRoundTrip(t *testin
 		t.Fatalf("released desktop rows = %+v, want the held leg %d", released, row.ID)
 	}
 }
+
+// The webhook claim is the at-most-once boundary: one claimant wins, the leg
+// leaves the due set, and failures settle visibly as failed with a stamp.
+func TestNotificationLedgerClaimWebhookIsAtMostOnce(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	row, err := ledger.Upsert(ctx, NotificationRecord{Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:claim", Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := ledger.ClaimWebhook(ctx, row.ID)
+	if err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v, want true", claimed, err)
+	}
+	again, err := ledger.ClaimWebhook(ctx, row.ID)
+	if err != nil || again {
+		t.Fatalf("second claim = %v, %v, want false so concurrent drains cannot POST twice", again, err)
+	}
+	if missing, err := ledger.ClaimWebhook(ctx, row.ID+999); err != nil || missing {
+		t.Fatalf("missing claim = %v, %v, want false", missing, err)
+	}
+	due, err := ledger.DueWebhook(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("claimed leg is still due: %+v", due)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_state"); got != "sending" {
+		t.Fatalf("webhook_state after claim = %q, want sending", got)
+	}
+	failedAt := now.Add(time.Minute)
+	if err := ledger.SetWebhookState(ctx, row.ID, "failed", failedAt); err != nil {
+		t.Fatal(err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_state"); got != "failed" {
+		t.Fatalf("webhook_state after failure = %q, want failed", got)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_attempted_at"); got != formatNotificationTime(failedAt) {
+		t.Fatalf("webhook_attempted_at after failure = %q, want the failure time", got)
+	}
+	due, err = ledger.DueWebhook(ctx, now.Add(2*time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("failed leg is still due: %+v", due)
+	}
+	if settled, err := ledger.ClaimWebhook(ctx, row.ID); err != nil || settled {
+		t.Fatalf("claim after failure = %v, %v, want false", settled, err)
+	}
+}
+
+// A successful POST settles as attempted with the same visible stamp the
+// failure path uses, so both outcomes stay distinguishable from pending.
+func TestNotificationLedgerClaimWebhookSuccessStampsAttempt(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	row, err := ledger.Upsert(ctx, NotificationRecord{Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:deliver", Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, row.ID); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	settledAt := now.Add(time.Minute)
+	if err := ledger.SetWebhookState(ctx, row.ID, "attempted", settledAt); err != nil {
+		t.Fatal(err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_attempted_at"); got != formatNotificationTime(settledAt) {
+		t.Fatalf("webhook_attempted_at after success = %q, want the settle time", got)
+	}
+}

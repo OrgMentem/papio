@@ -301,3 +301,59 @@ func TestFanoutDeliversSequentiallyAndSkipsNil(t *testing.T) {
 		})
 	}
 }
+
+// SendEventResult reports endpoint failures so the router can settle a
+// visible failed state instead of marking the delivery attempted.
+func TestWebhookSendEventResultReportsDeliveryOutcome(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ok.Close()
+	if err := NewWebhook(ok.URL, "").SendEventResult(context.Background(), Event{Message: "ready"}); err != nil {
+		t.Fatalf("2xx delivery = %v, want nil", err)
+	}
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer failing.Close()
+	if err := NewWebhook(failing.URL, "").SendEventResult(context.Background(), Event{Message: "ready"}); err == nil {
+		t.Fatal("503 delivery = nil, want an error that settles failed")
+	}
+	closed := httptest.NewServer(nil)
+	closedURL := closed.URL
+	closed.Close()
+	if err := NewWebhook(closedURL, "").SendEventResult(context.Background(), Event{Message: "ready"}); err == nil {
+		t.Fatal("refused delivery = nil, want an error that settles failed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := NewWebhook(ok.URL, "").SendEventResult(ctx, Event{Message: "ready"}); err == nil {
+		t.Fatal("cancelled delivery = nil, want the context error")
+	}
+}
+
+// Every ledger-backed POST carries the same stable delivery key so a
+// receiver can correlate the row across drains.
+func TestWebhookSendEventResultCarriesDeliveryKey(t *testing.T) {
+	requests := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode webhook body: %v", err)
+		}
+		requests <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	sender := NewWebhook(server.URL, "")
+	if err := sender.SendEventResult(context.Background(), Event{Message: "ready", DeliveryKey: "papio-42"}); err != nil {
+		t.Fatal(err)
+	}
+	payload := <-requests
+	if payload["delivery_key"] != "papio-42" {
+		t.Fatalf("delivery_key = %v, want papio-42", payload["delivery_key"])
+	}
+	if payload["source"] != "papio" || payload["message"] != "ready" {
+		t.Fatalf("payload = %v, want source and message", payload)
+	}
+}

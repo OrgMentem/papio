@@ -329,13 +329,39 @@ func (l *NotificationLedger) SetDesktopState(ctx context.Context, id int64, stat
 	return changed == 1, nil
 }
 
+// Webhook legs are at-most-once per row. ClaimWebhook atomically moves a
+// pending leg to sending before its HTTP POST so a replay, a concurrent
+// drain, or a restart cannot POST twice. The caller POSTs only when the claim
+// applies, then settles with SetWebhookState to attempted (endpoint accepted,
+// any 2xx) or failed (transport error or non-2xx, terminal best-effort loss).
+// A crash between claim and settle leaves sending, which never becomes due
+// again: the notification may be lost but is never duplicated. Local state
+// cannot give exactly-once across a lost HTTP response, so sending rows stay
+// terminal and the stable per-row delivery key lets receivers correlate.
+func (l *NotificationLedger) ClaimWebhook(ctx context.Context, id int64) (bool, error) {
+	result, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state='sending' WHERE id=? AND webhook_state='pending'`, id)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// SetWebhookState settles the webhook leg. Terminal attempt states
+// (attempted, delivered, failed) stamp webhook_attempted_at so the failure
+// stays visible next to the success; other transitions leave it untouched.
 func (l *NotificationLedger) SetWebhookState(ctx context.Context, id int64, state string, now time.Time) error {
-	if state == "attempted" {
+	switch state {
+	case "attempted", "delivered", "failed":
 		_, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state=?, webhook_attempted_at=? WHERE id=?`, state, formatNotificationTime(now), id)
 		return err
+	default:
+		_, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state=? WHERE id=?`, state, id)
+		return err
 	}
-	_, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state=? WHERE id=?`, state, id)
-	return err
 }
 
 func (l *NotificationLedger) SupersedeCheckpoints(ctx context.Context, aggregateKey string, now time.Time) (int, error) {
@@ -415,7 +441,9 @@ func (l *NotificationLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, a
 	return l.getByIdentity(ctx, rec.Category, rec.EventKind, rec.AggregateKey, rec.Phase, rec.WindowStart)
 }
 
-// DueWebhook returns digest legs whose shared availability window has elapsed.
+// DueWebhook returns pending digest legs whose shared availability window has
+// elapsed. Claimed (sending), delivered, failed, and skipped legs are never
+// due again, which is what makes the webhook leg at-most-once per row.
 func (l *NotificationLedger) DueWebhook(ctx context.Context, now time.Time, limit int) ([]NotificationRecord, error) {
 	if limit <= 0 {
 		limit = 100
