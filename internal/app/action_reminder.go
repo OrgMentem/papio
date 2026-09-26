@@ -40,10 +40,13 @@ var reminderActionKindDefaultOK = map[string]struct{}{
 
 // RunDue performs one bounded reminder pass over active human-action jobs.
 //
-// Each reminder is recorded before delivery because a failed process restart
-// must not repeat a notice that was already handed to the configured sinks.
-// The event also gives each action its own exponentially growing schedule, so
-// a long-lived handoff remains visible without becoming a fixed-rate alert.
+// Each due action is routed before any reminder marker for this pass is
+// recorded: the queued notification intent is the durable fact, and the
+// per-action marker only advances the backoff after the route succeeded. A
+// crash between the route and the markers leaves the actions due, so the next
+// pass routes again under the same aggregate window and the ledger coalesces
+// the retry instead of losing the alert for a full backoff. A failed route
+// likewise records nothing, so the next pass retries instead of skipping.
 func (r *ActionReminder) RunDue(ctx context.Context) error {
 	if r == nil || r.svc == nil || r.svc.Jobs == nil || r.svc.Notifier == nil {
 		return nil
@@ -72,6 +75,7 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 	loadedEvents := make(map[string]bool)
 	waiting := [actionReminderClassCount]actionReminderBatch{}
 	due := [actionReminderClassCount]bool{}
+	var pending []pendingActionReminder
 	window := 4 * time.Hour
 	if policy, policyErr := notify.ResolvePolicy(s.Config.Notify); policyErr == nil {
 		if configured := policy.For(notify.CategoryDecisionPending).Window; configured > 0 {
@@ -133,15 +137,12 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 		if digestWindow.IsZero() || windowStart.Before(digestWindow) {
 			digestWindow = windowStart
 		}
-		if err := s.Jobs.RecordEvent(ctx, action.JobID, actionReminderEvent, map[string]any{
-			"action_id": action.ID, "count": count,
-			"age_seconds":  int64(age / time.Second),
-			"reminded_at":  now.UTC().Format(time.RFC3339Nano),
-			"window_start": windowStart.Format(time.RFC3339Nano),
-		}); err != nil {
-			record(err)
-			continue
-		}
+		// Collect first, record after the route below: a crash before routing
+		// must leave no marker, or the next pass would honor a backoff for an
+		// alert that was never queued.
+		pending = append(pending, pendingActionReminder{
+			action: action, count: count, age: age, windowStart: windowStart,
+		})
 		class := reminderBatchIndex(action)
 		waiting[class].add(action.JobID, age)
 		due[class] = true
@@ -178,10 +179,35 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 			Message: message, Detail: event,
 		}
 		if err := s.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
+			// No marker is recorded below, so the actions stay due and the
+			// next pass retries the route instead of waiting out a backoff
+			// for an alert that never queued.
 			log.Printf("papio: routing action reminder: %v", err)
+			return firstErr
+		}
+		// The route queued the alert; only now advance each action's backoff,
+		// so a crash before this point redelivers instead of silencing.
+		for _, item := range pending {
+			if err := s.Jobs.RecordEvent(ctx, item.action.JobID, actionReminderEvent, map[string]any{
+				"action_id": item.action.ID, "count": item.count,
+				"age_seconds":  int64(item.age / time.Second),
+				"reminded_at":  now.UTC().Format(time.RFC3339Nano),
+				"window_start": item.windowStart.Format(time.RFC3339Nano),
+			}); err != nil {
+				record(err)
+			}
 		}
 	}
 	return firstErr
+}
+
+// pendingActionReminder is one due action collected for routing. Its marker is
+// recorded only after the pass's notification intent is queued.
+type pendingActionReminder struct {
+	action      job.HumanAction
+	count       int
+	age         time.Duration
+	windowStart time.Time
 }
 
 type actionReminderState struct {

@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,6 +11,10 @@ import (
 
 	"papio/internal/job"
 )
+
+// errReminderRouteCrash stands in for a kill between the pass's Route and its
+// marker writes: the first attempt fails after queuing, so no marker exists.
+var errReminderRouteCrash = errors.New("route crashed after queueing")
 
 func openReminderAction(t *testing.T, svc *Service, jobs *job.Store, requestID string, createdAt time.Time, requiresAuth bool) (int64, string) {
 	t.Helper()
@@ -380,5 +385,52 @@ func TestActionReminderStillNotifiesJustInsideTheQuiesceWindow(t *testing.T) {
 	}
 	if len(sink.reminders) != 1 {
 		t.Fatalf("reminders = %q, want one — the window must not shorten by rounding", sink.reminders)
+	}
+}
+
+// A failed route must not advance the backoff: with no marker recorded the
+// next pass retries the alert once, then stays quiet until the backoff
+// expires. The same ordering covers a crash between Route and markers in
+// production: no marker means the action stays due.
+func TestActionReminderRecoversARouteThatOutlivedItsMarkers(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	svc, jobs, sink := newReminderTestService(t, &now)
+	actionID, jobID := openReminderAction(t, svc, jobs, "wr_reminder_crash_window", now.Add(-30*time.Minute), true)
+
+	// The alert fails to queue, so no action.reminder event records it and the
+	// next pass retries the route instead of honoring a backoff.
+	sink.routeErr = errReminderRouteCrash
+	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.reminders) != 0 {
+		t.Fatalf("reminders = %q, want none after the failed route", sink.reminders)
+	}
+	events, err := jobs.Events(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == actionReminderEvent {
+			t.Fatalf("found %s before recovery, want the crash to precede markers", actionReminderEvent)
+		}
+	}
+
+	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.reminders) != 1 {
+		t.Fatalf("reminders = %q, want the alert queued after the retry", sink.reminders)
+	}
+	detail := reminderDetail(t, jobs, jobID, actionID)
+	if got := eventInt(detail["count"]); got != 1 {
+		t.Fatalf("reminder count = %d, want 1: the retry must not double-count", got)
+	}
+
+	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.reminders) != 1 {
+		t.Fatalf("reminders = %q, want no repeat before the backoff expires", sink.reminders)
 	}
 }
