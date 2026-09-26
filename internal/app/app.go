@@ -409,7 +409,10 @@ func canonicalWork(wr protocol.WorkRequest) (work.Work, map[string]string, error
 
 // Process executes one already-leased runnable job until it reaches ready,
 // unavailable, a retry wait, or a human-review state. Live URLs and headers
-// never escape this call; after a crash the state machine rewinds to resolving.
+// never escape this call; unprepared fetching/validating work rewinds to
+// resolving after a crash because bearer URLs are never reused, while a
+// prepared publication retains its validating intent and is reconciled and
+// finalized directly (and may reach ready) without re-resolving.
 func (s *Service) Process(ctx context.Context, row *job.Row) error {
 	if row == nil {
 		return errors.New("nil job")

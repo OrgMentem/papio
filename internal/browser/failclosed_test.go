@@ -1,9 +1,13 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
-// internal/nativehost/host.go treats any non-nil error out of Bridge.Sync as a
-// bad connection and tears down the native-messaging session, so a handler that
-// returns a plain error for a routine condition disconnects the user's browser
-// instead of failing one request. reviewPreview shipped that bug: every click on
-// a stale review action silently dropped the extension.
+// Bridge.Sync errors divide by disposition (see internal/api/handler.go's
+// browserSync and internal/nativehost/host.go's handleInbound): ordinary
+// application failures return a structured application failure for one request
+// without tearing down the native-messaging session, while protocol and
+// outbound-frame errors stay session-fatal. Leaf handlers keep the stricter
+// discipline below and return only the marshal failure of their own response
+// frame, so a plain error for a routine condition cannot become a transport
+// failure. reviewPreview shipped that bug: every click on a stale review
+// action silently dropped the extension.
 //
 // A one-off audit walked all 37 error returns in bridge.go and found every leaf
 // handler already correct, and correct in exactly one shape: the error is the

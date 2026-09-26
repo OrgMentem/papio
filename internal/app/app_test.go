@@ -955,8 +955,11 @@ func TestOALandingRoutesToBrowserHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := jobs.Get(context.Background(), id)
-	// The daemon never fetches a landing page server-side; the extension's
-	// provider adapters resolve the file from the open-access page.
+	// This direct, non-downloadable open-access landing candidate routes to
+	// browser handoff; the extension's provider adapters resolve the file from
+	// the open-access page. Permanently failed direct candidates with a recorded
+	// landing URL can still trigger the daemon's bounded citation_pdf_url fallback
+	// through LandingReader (see expandLandingSeeds).
 	if got.State != job.StateAwaitingHuman || fetches != 0 {
 		t.Fatalf("oa landing result = %+v fetches=%d", got, fetches)
 	}

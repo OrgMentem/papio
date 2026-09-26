@@ -576,10 +576,11 @@ func TestEntitlementIsDerivedNeverInferred(t *testing.T) {
 			},
 		},
 		{
-			// A warm session is a real institutional basis but an inherited
-			// one: papio found it already authenticated and never observed the
-			// login this mode would claim. ADR-0018 chose the honest floor.
-			name: "a warm session is an institutional basis but no witnessed login",
+			// A warm session carries a real institutional basis but aged
+			// evidence: something confirmed the session within the TTL once,
+			// and nothing has confirmed it since. Recency is the gate, so
+			// only `fresh_auth` emits this mode. ADR-0018 chose the honest floor.
+			name: "a warm session is an institutional basis but aged evidence",
 			candidate: job.Candidate{
 				Source:          "browser",
 				AccessBasis:     resolver.AccessInstitutional,

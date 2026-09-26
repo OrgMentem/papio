@@ -1262,8 +1262,9 @@ func browserOpenCommand(target string) (string, []string) {
 }
 
 // chromeBundleID pins macOS handoff tabs to the browser hosting the papio
-// extension. The native-messaging host manifests are Chrome-scoped today; if
-// other Chromium channels are ever supported this becomes configuration.
+// extension. The macOS handoff launcher targets Chrome only; the
+// native-messaging host itself already registers Chrome, Chromium forks, and
+// Firefox, so a configured Firefox or fork host keeps working there.
 const chromeBundleID = "com.google.Chrome"
 
 func commandExec(ctx context.Context, name string, args ...string) error {

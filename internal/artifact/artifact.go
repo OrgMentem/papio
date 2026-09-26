@@ -1,8 +1,11 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Package artifact owns the quarantine area and the immutable content-addressed
-// store: validated files are atomically renamed to artifacts/<sha256>.pdf and
-// never mutated afterward. Re-fetching the same bytes is a no-op by
-// construction, which is what makes crash recovery duplicate-free.
+// store: validated files are atomically published to artifacts/<sha256>.pdf by
+// hard link on supported filesystems (rename where hard links are unsupported)
+// and never mutated afterward. Quarantine cleanup after publication is
+// best-effort and destination-authoritative, so a surviving quarantine name
+// does not mean the artifact is unpublished. Re-fetching the same bytes is a
+// no-op by construction, which is what makes crash recovery duplicate-free.
 package artifact
 
 import (

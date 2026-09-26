@@ -2,7 +2,10 @@
 // Package store owns the SQLite database: WAL, foreign keys, busy timeout,
 // a single writer connection, numbered transactional migrations gated on
 // PRAGMA user_version, startup integrity check, and append-only redacted
-// events. Only the daemon process opens the store for writing.
+// events. Each Store caps its own pool at one connection so writes serialize
+// in-process. The daemon additionally holds the data-directory instance lock
+// for its whole life; `papio init` and `papio mcp` open the store in-process
+// through bootstrap and do not take that lock.
 package store
 
 import (

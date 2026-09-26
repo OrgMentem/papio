@@ -11,10 +11,10 @@ import (
 )
 
 // newBenchCommand runs papio's hermetic comparative acquisition benchmark
-// (dev/post-build-followups.md item 4). Unlike every other command in this
-// tree it never talks to the daemon: it builds its own ephemeral,
-// fixture-backed acquisition service in-process, so it needs no opt.call
-// and no rpcMethods entry in commandClassification.
+// (dev/post-build-followups.md item 4). Like the local native-host and
+// configuration commands it never talks to the daemon: it builds its own
+// ephemeral, fixture-backed acquisition service in-process, so it needs no
+// opt.call and no rpcMethods entry in commandClassification.
 func newBenchCommand(opt *options) *cobra.Command {
 	var cohortPath, fixturesDir string
 	cmd := &cobra.Command{
