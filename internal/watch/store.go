@@ -397,7 +397,98 @@ func (s *Store) ClearDigest(ctx context.Context, watchID int64) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("counting cleared watch digest entries: %w", err)
 	}
+	// Drop alert receipts for the consumed entries: a consumed work key never
+	// returns to pending (RecordDigest preserves the consumed flag on merge),
+	// so the receipts are dead weight. Clearing keeps a re-recorded identity
+	// from inheriting a stale receipt if it ever becomes pending again.
+	// The watch_digest_alerts table comes from migration 0057; every open
+	// store has migrated past it, so no CREATE TABLE IF NOT EXISTS here.
+	if _, err := s.S.DB().ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ?`, watchID); err != nil {
+		return 0, fmt.Errorf("clearing watch digest alert receipts: %w", err)
+	}
 	return int(count), nil
+}
+
+// UnalertedDigestEntries returns pending (unconsumed) digest entries that have
+// no durable alert receipt. The alert path routes one alert for these after
+// every RecordDigest — including entries stranded by a crash or a notifier
+// failure on an earlier run, which RecordDigest deduplicates to reported=0
+// and would otherwise never be announced.
+func (s *Store) UnalertedDigestEntries(ctx context.Context, watchID int64) ([]DigestEntry, error) {
+	if s == nil || s.S == nil {
+		return nil, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return nil, errors.New("watch id must be positive")
+	}
+	if _, err := s.Get(ctx, watchID); err != nil {
+		return nil, err
+	}
+	rows, err := s.S.DB().QueryContext(ctx, `
+		SELECT work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json
+		FROM watch_digest_entries
+		WHERE watch_id = ? AND consumed = 0
+			AND work_key NOT IN (SELECT work_key FROM watch_digest_alerts WHERE watch_id = ?)
+		ORDER BY id DESC`, watchID, watchID)
+	if err != nil {
+		return nil, fmt.Errorf("listing unalerted watch digest: %w", err)
+	}
+	defer rows.Close()
+	entries := make([]DigestEntry, 0)
+	for rows.Next() {
+		var entry DigestEntry
+		var identifiersJSON, authorsJSON string
+		if err := rows.Scan(
+			&entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
+			&entry.DOI, &entry.IsOA, &entry.Abstract, &entry.FirstSeenAt, &identifiersJSON,
+		); err != nil {
+			return nil, err
+		}
+		if err := decodeDigestAuthors(&entry, authorsJSON); err != nil {
+			return nil, err
+		}
+		if err := decodeDigestIdentifiers(&entry, identifiersJSON); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating unalerted watch digest: %w", err)
+	}
+	return entries, nil
+}
+
+// MarkDigestAlerted records durable alert receipts for digest entries whose
+// alert has been routed. Callers must invoke it only after the route
+// succeeds: the receipt suppresses future catch-up alerts, so recording it
+// before delivery would reintroduce the loss it exists to prevent.
+func (s *Store) MarkDigestAlerted(ctx context.Context, watchID int64, workKeys []string, at time.Time) error {
+	if s == nil || s.S == nil {
+		return errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return errors.New("watch id must be positive")
+	}
+	if len(workKeys) == 0 {
+		return errors.New("watch digest alert keys are required")
+	}
+	if _, err := s.Get(ctx, watchID); err != nil {
+		return err
+	}
+	alertedAt := store.FormatTime(at)
+	for _, workKey := range workKeys {
+		workKey = strings.TrimSpace(workKey)
+		if workKey == "" {
+			return errors.New("watch digest alert key must not be empty")
+		}
+		if _, err := s.S.DB().ExecContext(ctx, `
+			INSERT INTO watch_digest_alerts (watch_id, work_key, alerted_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(watch_id, work_key) DO NOTHING`, watchID, workKey, alertedAt); err != nil {
+			return fmt.Errorf("recording watch digest alert: %w", err)
+		}
+	}
+	return nil
 }
 
 // TakeDigest returns pending alert discoveries without removing them.
@@ -525,6 +616,9 @@ func (s *Store) ConsumeDigest(ctx context.Context, watchID int64, workKeys []str
 		if count != 1 {
 			return 0, fmt.Errorf("%w: %q", ErrDigestEntryNotFound, entry.WorkKey)
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, entry.WorkKey); err != nil {
+			return 0, fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("committing watch digest consume: %w", err)
@@ -557,6 +651,9 @@ func (s *Store) consumeDigestEntry(ctx context.Context, watchID int64, workKey s
 	if count != 1 {
 		return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, workKey)
 	}
+	if _, err := s.S.DB().ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, workKey); err != nil {
+		return fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
+	}
 	return nil
 }
 
@@ -584,6 +681,9 @@ func (s *Store) consumeDigestEntriesTx(ctx context.Context, entries []DigestEntr
 		}
 		if count != 1 {
 			return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, entry.WorkKey)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, entry.WorkKey); err != nil {
+			return fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1063,6 +1163,39 @@ func (s *Store) MarkDegradedRun(ctx context.Context, id int64, at time.Time, fai
 		fmt.Sprintf("%d of %d watch submissions failed", failed, total), id)
 	if err != nil {
 		return fmt.Errorf("recording degraded watch run: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// MarkPartialRun records a discovery scan that succeeded on some backends
+// while others failed. Like MarkDegradedRun it advances the cadence and
+// resets consecutive complete-run failures — the healthy results stand and
+// must not be rediscovered — but it names the failed backends in last_error
+// so a partial scan is never mistaken for a clean success. A persistently
+// dead backend keeps the watch degraded rather than disabling discoveries
+// that still work; callers pass discovery.SummarizeFailures output as detail.
+func (s *Store) MarkPartialRun(ctx context.Context, id int64, at time.Time, detail string) error {
+	if s == nil || s.S == nil {
+		return errors.New("watch store is not configured")
+	}
+	if strings.TrimSpace(detail) == "" {
+		return errors.New("partial watch run requires failure detail")
+	}
+	result, err := s.S.DB().ExecContext(ctx, `
+		UPDATE watches
+		SET last_run_at = ?, consecutive_failures = 0, last_error = ?
+		WHERE id = ?`,
+		store.FormatTime(at),
+		"discovery partially failed: "+storedError(errors.New(detail)), id)
+	if err != nil {
+		return fmt.Errorf("recording partial watch run: %w", err)
 	}
 	count, err := result.RowsAffected()
 	if err != nil {

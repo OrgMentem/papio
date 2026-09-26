@@ -4,9 +4,12 @@ package watch
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +63,11 @@ type RunResult struct {
 	ManifestID          string `json:"manifest_id,omitempty"`
 	ConsecutiveFailures int    `json:"consecutive_failures"`
 	Disabled            bool   `json:"disabled"`
+	// Degraded reports a run that processed healthy discovery results while
+	// one or more discovery backends failed. The cadence advances and the
+	// failed backends are named in the watch's persisted last_error; the run
+	// is deliberately not a clean success.
+	Degraded bool `json:"degraded,omitempty"`
 }
 
 // Runner composes the existing discovery, Zotio ownership, acquisition batch,
@@ -388,6 +396,40 @@ func (r *Runner) route(ctx context.Context, intent notify.Intent) {
 	}
 }
 
+// routeChecked delivers one watch notification and reports its failure. The
+// alert path uses it instead of route so a lost alert fails the run (and is
+// retried from durable digest state) rather than passing silently.
+func (r *Runner) routeChecked(ctx context.Context, intent notify.Intent) error {
+	if r == nil || r.Notifier == nil {
+		return nil
+	}
+	return r.Notifier.Route(context.WithoutCancel(ctx), intent)
+}
+
+// searchDiscovery runs the configured discovery source, preferring partial
+// results when the source can report per-backend failures. A plain Search
+// source keeps its old behavior: usable results or a hard error.
+func (r *Runner) searchDiscovery(ctx context.Context, params discovery.SearchParams) ([]discovery.DiscoveredWork, []discovery.BackendFailure, error) {
+	if partial, ok := r.Discovery.(discovery.PartialSearcher); ok {
+		return partial.SearchPartial(ctx, params)
+	}
+	works, err := r.Discovery.Search(ctx, params)
+	return works, nil, err
+}
+
+// markDiscoveryRun advances the watch cadence after a scan that produced no
+// hard error. When every backend answered it is a clean success; when some
+// backends failed while others answered, the healthy results stand but the
+// run is recorded as degraded with the failed backends named, so a partial
+// scan — including a zero-result one — is never reported as complete.
+func (r *Runner) markDiscoveryRun(ctx context.Context, watch Watch, runStart time.Time, failures []discovery.BackendFailure, result *RunResult) error {
+	if len(failures) == 0 {
+		return r.Store.MarkRun(ctx, watch.ID, runStart)
+	}
+	result.Degraded = true
+	return r.Store.MarkPartialRun(ctx, watch.ID, runStart, discovery.SummarizeFailures(failures))
+}
+
 // countedNoun renders an exact quantity with a noun that agrees with it. Watch
 // notices carry real counts, and a single discovery must not read as
 // unfinished plural copy.
@@ -409,6 +451,50 @@ func (r *Runner) watchIntent(watch Watch, runStart time.Time, event notify.Event
 		Phase:        notify.PhaseDigest, WindowStart: runStart.UTC(),
 		HappenedAt: runStart.UTC(), Message: event.Message, Detail: event,
 		ScanID: fmt.Sprintf("watch:%d:%s", watch.ID, runStart.UTC().Format(time.RFC3339Nano)),
+	}
+}
+
+// alertIntent builds the new-work alert for one pending digest generation.
+//
+// Its identity must not move between attempts. A retry after a successful
+// Route but a lost receipt (crash between the two) re-routes the same alert,
+// and a run-start-derived identity would make that a fresh ledger row and a
+// second webhook POST. The identity is therefore derived from the pending set
+// itself: the aggregate key hashes the sorted pending work keys, and the
+// window is the earliest first sighting among them. The same pending entries
+// then coalesce into the same notification row, whose at-most-once webhook
+// claim rejects the second dispatch; a genuinely different pending set is a
+// different generation and alerts on its own.
+func (r *Runner) alertIntent(watch Watch, pending []DigestEntry, runStart time.Time) notify.Intent {
+	keys := make([]string, 0, len(pending))
+	windowStart := time.Time{}
+	for _, entry := range pending {
+		keys = append(keys, entry.WorkKey)
+		seen, err := time.Parse(time.RFC3339Nano, entry.FirstSeenAt)
+		if err != nil {
+			continue
+		}
+		if windowStart.IsZero() || seen.Before(windowStart) {
+			windowStart = seen.UTC()
+		}
+	}
+	sort.Strings(keys)
+	sum := sha256.Sum256([]byte(strings.Join(keys, "\n")))
+	generation := hex.EncodeToString(sum[:8])
+	if windowStart.IsZero() {
+		windowStart = runStart.UTC()
+	}
+	message := fmt.Sprintf("watch %s: %s found — papio watch digest %d",
+		watch.Label, countedNoun(len(pending), "new work", "new works"), watch.ID)
+	event := notify.Event{
+		Kind: "watch.alert", Message: message,
+		WatchID: watch.ID, WatchLabel: watch.Label, Count: len(pending),
+	}
+	identity := fmt.Sprintf("watch:%d:digest:%s", watch.ID, generation)
+	return notify.Intent{
+		EventKind: event.Kind, Category: notify.CategoryDiscoveryNew,
+		AggregateKey: identity, Phase: notify.PhaseDigest, WindowStart: windowStart,
+		HappenedAt: windowStart, Message: message, Detail: event, ScanID: identity,
 	}
 }
 func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Time) (*RunResult, error) {
@@ -452,7 +538,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	if r.Discovery == nil || (needsZotio && r.Lookup == nil) || (watch.Mode == ModeAcquire && r.Submitter == nil) {
 		return result, errors.New("watch runner dependencies are not configured")
 	}
-	works, err := r.Discovery.Search(ctx, discovery.SearchParams{
+	works, discoveryFailures, err := r.searchDiscovery(ctx, discovery.SearchParams{
 		Query: watch.Query, Limit: min(watch.PerRunCap*3, 25), Slim: true,
 		YearFrom: watch.Filters.YearFrom, YearTo: watch.Filters.YearTo, OAOnly: watch.Filters.OAOnly,
 		Cites: watch.Filters.Cites, CitedBy: watch.Filters.CitedBy, RelatedTo: watch.Filters.RelatedTo,
@@ -462,7 +548,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	}
 	requests := requestsForDiscoveredWithWork(works)
 	if len(requests) == 0 {
-		return result, r.Store.MarkRun(ctx, watch.ID, runStart)
+		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
 	}
 	var queued []discoveredRequest
 	if watch.Mode == ModeAcquire && r.holdingsEnabled() {
@@ -486,6 +572,13 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		if ownership == nil || len(ownership.Works) != len(requests) {
 			return result, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", ownershipCount(ownership), len(requests))
 		}
+		// A stale mirror (or an unconfigured Zotio) classifies from old or no
+		// data. Recording those not-owned verdicts as new alert discoveries
+		// would persist false claims past recovery, so fail the scan like
+		// AcquireDigest does and retry on the next cadence.
+		if strings.TrimSpace(ownership.StalenessWarning) != "" {
+			return result, fmt.Errorf("Zotio ownership lookup is stale: %s", ownership.StalenessWarning)
+		}
 		queued = make([]discoveredRequest, 0, min(watch.PerRunCap, len(requests)))
 		for i, classification := range ownership.Works {
 			switch classification.Status {
@@ -502,7 +595,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		}
 	}
 	if len(queued) == 0 {
-		return result, r.Store.MarkRun(ctx, watch.ID, runStart)
+		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
 	}
 	if watch.Mode == ModeAlert {
 		entries, err := digestEntriesForDiscovered(queued)
@@ -514,17 +607,32 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 			return result, err
 		}
 		result.Reported = reported
-		if err := r.Store.MarkRun(ctx, watch.ID, runStart); err != nil {
+		// Alert delivery is at-least-once: the digest rows above are durable,
+		// but a crash (or a notifier failure) between RecordDigest and the
+		// route below used to leave them permanently unannounced, because the
+		// next run deduplicates them to reported=0 and never routes. Re-read
+		// every pending entry without a durable alert receipt — including ones
+		// stranded by an earlier run — route one alert for them, and record
+		// the receipt only after the route succeeds. A failed route returns
+		// before MarkRun so the run is recorded as a failure and the stranded
+		// entries are retried without rediscovery on the next cadence.
+		pending, err := r.Store.UnalertedDigestEntries(ctx, watch.ID)
+		if err != nil {
 			return result, err
 		}
-		if reported > 0 {
-			r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
-				Kind:    "watch.alert",
-				Message: fmt.Sprintf("watch %s: %s found — papio watch digest %d", watch.Label, countedNoun(reported, "new work", "new works"), watch.ID),
-				WatchID: watch.ID, WatchLabel: watch.Label, Count: reported,
-			}, notify.CategoryDiscoveryNew))
+		if len(pending) > 0 {
+			if err := r.routeChecked(ctx, r.alertIntent(watch, pending, runStart)); err != nil {
+				return result, fmt.Errorf("routing watch alert: %w", err)
+			}
+			keys := make([]string, 0, len(pending))
+			for _, entry := range pending {
+				keys = append(keys, entry.WorkKey)
+			}
+			if err := r.Store.MarkDigestAlerted(ctx, watch.ID, keys, runStart); err != nil {
+				return result, err
+			}
 		}
-		return result, nil
+		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
 	}
 
 	queuedWorks := make([]protocol.WorkRequest, len(queued))
@@ -561,7 +669,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		if err := r.Store.MarkDegradedRun(ctx, watch.ID, runStart, result.Failed, len(manifest.Works)); err != nil {
 			return result, err
 		}
-	} else if err := r.Store.MarkRun(ctx, watch.ID, runStart); err != nil {
+	} else if err := r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result); err != nil {
 		return result, err
 	}
 	if result.Queued > 0 {

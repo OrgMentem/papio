@@ -399,12 +399,37 @@ func (f *fakeSubmitter) SubmitWithAutoImport(_ context.Context, request protocol
 type fakeNotifier struct {
 	messages []string
 	intents  []notify.Intent
+	// offered records every intent the runner presented, delivered or not, so
+	// a test can compare the identity of a failed route with its retry.
+	offered  []notify.Intent
+	err      error
+	attempts int
 }
 
 func (f *fakeNotifier) Route(_ context.Context, intent notify.Intent) error {
+	f.attempts++
+	f.offered = append(f.offered, intent)
+	if f.err != nil {
+		return f.err
+	}
 	f.intents = append(f.intents, intent)
 	f.messages = append(f.messages, intent.Message)
 	return nil
+}
+
+// fakePartialDiscovery is a Discovery source that also reports per-backend
+// failures, like discovery.Multi does when one backend is down.
+type fakePartialDiscovery struct {
+	fakeDiscovery
+	failures []discovery.BackendFailure
+}
+
+func (f *fakePartialDiscovery) SearchPartial(_ context.Context, params discovery.SearchParams) ([]discovery.DiscoveredWork, []discovery.BackendFailure, error) {
+	f.params = append(f.params, params)
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return append([]discovery.DiscoveredWork(nil), f.works...), append([]discovery.BackendFailure(nil), f.failures...), nil
 }
 
 type fakeBackfillQueue struct {

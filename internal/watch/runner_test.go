@@ -967,3 +967,285 @@ func TestRunnerClearDigestAndMultiWatchConsumeCommit(t *testing.T) {
 		t.Fatal("ClearDigest on an unconfigured runner was accepted")
 	}
 }
+
+func TestRunnerAlertFailsClosedOnStaleOwnership(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "stale alert", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	discoveryFake := &fakeDiscovery{works: []discovery.DiscoveredWork{{
+		Work: work.Work{DOI: "10.1000/stale-alert", Title: "Stale Alert", Authors: []string{"Ada"}, Year: 2026},
+	}}}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{
+		Works:            []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}},
+		StalenessWarning: "Zotio mirror sync failed; ownership classification may be stale",
+	}}
+	notifier := &fakeNotifier{}
+	runner := &Runner{
+		Store: watches, Discovery: discoveryFake, Lookup: lookup, Notifier: notifier,
+		DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+
+	result, err := runner.Run(ctx, watched.ID)
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("Run() error = %v; want a stale ownership failure", err)
+	}
+	if result.Reported != 0 || result.Degraded {
+		t.Fatalf("stale run result = %+v; want no reported works and no degraded flag", result)
+	}
+	if digest, err := watches.Digest(ctx, watched.ID, 100); err != nil || len(digest) != 0 {
+		t.Fatalf("digest after stale lookup = %+v, %v; want no persisted false discovery", digest, err)
+	}
+	if len(notifier.intents) != 0 {
+		t.Fatalf("notifications = %+v; want none for an unverified scan", notifier.messages)
+	}
+	stored, err := watches.Get(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 1 || !strings.Contains(stored.LastError, "stale") {
+		t.Fatalf("watch health = %+v; want one recorded failure naming staleness", stored)
+	}
+
+	// After the mirror recovers, the same work classifies as owned: the
+	// failed scan left no false digest entry behind to contradict it.
+	lookup.result = &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipOwnedWithPDF}}}
+	recovered, err := runner.Run(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Reported != 0 || recovered.Degraded {
+		t.Fatalf("recovered run result = %+v; want a clean run with nothing new", recovered)
+	}
+	if digest, err := watches.Digest(ctx, watched.ID, 100); err != nil || len(digest) != 0 {
+		t.Fatalf("digest after healthy lookup = %+v, %v; want the owned work absent", digest, err)
+	}
+	if len(notifier.intents) != 0 {
+		t.Fatalf("notifications = %+v; want none for an owned work", notifier.messages)
+	}
+}
+
+func TestRunnerAlertDegradesOnPartialDiscoveryFailure(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	outage := []discovery.BackendFailure{{Source: "semanticscholar", Message: "backend is down", At: now}}
+	newAlertRunner := func(t *testing.T, source *fakePartialDiscovery, owned []zotio.WorkOwnership) (*Store, *Watch, *Runner, *fakeNotifier) {
+		t.Helper()
+		watches := testStore(t)
+		watched := createWatch(t, watches, CreateInput{
+			Kind: KindDiscovery, Mode: ModeAlert, Query: "partial", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+		})
+		notifier := &fakeNotifier{}
+		runner := &Runner{
+			Store: watches, Discovery: source, Notifier: notifier,
+			Lookup:  &fakeLookup{result: &zotio.LookupWorksResult{Works: owned}},
+			DataDir: t.TempDir(), Now: func() time.Time { return now },
+		}
+		return watches, watched, runner, notifier
+	}
+
+	// One backend answers while another fails: the healthy work is digested
+	// and announced, but the run is degraded — not a clean success — and the
+	// failed backend is named in persisted watch health.
+	healthy := &fakePartialDiscovery{failures: outage}
+	healthy.works = []discovery.DiscoveredWork{{
+		Work: work.Work{DOI: "10.1000/partial", Title: "Partial Work", Authors: []string{"Ada"}, Year: 2026},
+	}}
+	watches, watched, runner, notifier := newAlertRunner(t, healthy, []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}})
+	result, err := runner.Run(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Reported != 1 || !result.Degraded {
+		t.Fatalf("partial run result = %+v; want one reported work and the degraded flag", result)
+	}
+	if digest, err := watches.Digest(ctx, watched.ID, 100); err != nil || len(digest) != 1 {
+		t.Fatalf("digest after partial scan = %+v, %v; want the healthy work", digest, err)
+	}
+	if len(notifier.intents) != 1 {
+		t.Fatalf("notifications = %+v; want the healthy discovery announced once", notifier.messages)
+	}
+	stored, err := watches.Get(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 0 || !strings.Contains(stored.LastError, "semanticscholar") {
+		t.Fatalf("watch health = %+v; want no failure count and the failed backend named", stored)
+	}
+
+	// A zero-result partial scan advances the cadence but is still degraded,
+	// never a clean success.
+	empty := &fakePartialDiscovery{failures: outage}
+	watches, watched, runner, notifier = newAlertRunner(t, empty, nil)
+	result, err = runner.Run(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Reported != 0 || !result.Degraded {
+		t.Fatalf("empty partial run result = %+v; want nothing reported and the degraded flag", result)
+	}
+	if len(notifier.intents) != 0 {
+		t.Fatalf("notifications = %+v; want none for an empty partial scan", notifier.messages)
+	}
+	stored, err = watches.Get(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.LastRunAt == "" || stored.ConsecutiveFailures != 0 || !strings.Contains(stored.LastError, "semanticscholar") {
+		t.Fatalf("watch health = %+v; want an advanced degraded run naming the backend", stored)
+	}
+}
+
+func TestRunnerAlertRetriesUnalertedDigestAfterRouteFailure(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "flaky alert", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	discoveryFake := &fakeDiscovery{works: []discovery.DiscoveredWork{{
+		Work: work.Work{DOI: "10.1000/flaky", Title: "Flaky Work", Authors: []string{"Ada"}, Year: 2026},
+	}}}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}}
+	broken := &fakeNotifier{err: errors.New("desktop unavailable")}
+	runner := &Runner{
+		Store: watches, Discovery: discoveryFake, Lookup: lookup, Notifier: broken,
+		DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+
+	// The notifier fails after the digest is durable: the run fails without a
+	// success marker, but the discovery itself is persisted.
+	result, err := runner.Run(ctx, watched.ID)
+	if err == nil || !strings.Contains(err.Error(), "routing watch alert") {
+		t.Fatalf("Run() error = %v; want the alert routing failure", err)
+	}
+	if result.Reported != 1 {
+		t.Fatalf("failed run result = %+v; want the discovery still reported", result)
+	}
+	if digest, err := watches.Digest(ctx, watched.ID, 100); err != nil || len(digest) != 1 {
+		t.Fatalf("digest after failed alert = %+v, %v; want the durable discovery", digest, err)
+	}
+	if unalerted, err := watches.UnalertedDigestEntries(ctx, watched.ID); err != nil || len(unalerted) != 1 {
+		t.Fatalf("unalerted entries = %+v, %v; want the stranded discovery", unalerted, err)
+	}
+	stored, err := watches.Get(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 1 {
+		t.Fatalf("watch health = %+v; want the failed alert recorded, not a success", stored)
+	}
+
+	// After restart with a working notifier, the next run rediscovers nothing
+	// new yet delivers exactly one catch-up alert for the stranded digest.
+	fixed := &fakeNotifier{}
+	rerun := &Runner{
+		Store: watches, Discovery: discoveryFake, Lookup: lookup, Notifier: fixed,
+		DataDir: runner.DataDir, Now: func() time.Time { return now },
+	}
+	recovered, err := rerun.Run(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Reported != 0 {
+		t.Fatalf("recovery run result = %+v; want no new discoveries", recovered)
+	}
+	if len(fixed.intents) != 1 || fixed.intents[0].Detail.Count != 1 {
+		t.Fatalf("notifications = %+v; want exactly one catch-up alert", fixed.messages)
+	}
+	if unalerted, err := watches.UnalertedDigestEntries(ctx, watched.ID); err != nil || len(unalerted) != 0 {
+		t.Fatalf("unalerted entries = %+v, %v; want the receipt recorded", unalerted, err)
+	}
+	stored, err = watches.Get(ctx, watched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 0 {
+		t.Fatalf("watch health = %+v; want the failure cleared after recovery", stored)
+	}
+
+	// A further run announces nothing again: the alert fired exactly once.
+	if _, err := rerun.Run(ctx, watched.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixed.intents) != 1 {
+		t.Fatalf("notifications = %+v; want no duplicate alert", fixed.messages)
+	}
+}
+
+// A retry after a delivered alert whose receipt was lost must present the
+// SAME notification identity, because the notify ledger deduplicates and
+// claims webhooks per row: a run-start-derived identity would make the retry
+// a new row and POST the same alert twice.
+func TestRunnerAlertIdentityIsStableAcrossRetryForTheSamePendingSet(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "stable identity", Collection: "Reading", CadenceHours: 24, PerRunCap: 3,
+	})
+	first := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	discoveryFake := &fakeDiscovery{works: []discovery.DiscoveredWork{
+		{Work: work.Work{DOI: "10.1000/stable-a", Title: "Stable A", Authors: []string{"Ada"}, Year: 2026}},
+		{Work: work.Work{DOI: "10.1000/stable-b", Title: "Stable B", Authors: []string{"Bob"}, Year: 2026}},
+	}}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+		{Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned},
+	}}}
+	notifier := &fakeNotifier{err: errors.New("receipt lost after delivery")}
+	runStart := first
+	runner := &Runner{
+		Store: watches, Discovery: discoveryFake, Lookup: lookup, Notifier: notifier,
+		DataDir: t.TempDir(), Now: func() time.Time { return runStart },
+	}
+	if _, err := runner.Run(ctx, watched.ID); err == nil {
+		t.Fatal("Run() succeeded; want the simulated post-delivery failure")
+	}
+
+	// Retry a day later: a different run start, the same pending entries.
+	notifier.err = nil
+	runStart = first.Add(24 * time.Hour)
+	if _, err := runner.Run(ctx, watched.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.offered) != 2 {
+		t.Fatalf("offered intents = %d; want the failed alert and its retry", len(notifier.offered))
+	}
+	lost, retry := notifier.offered[0], notifier.offered[1]
+	if lost.AggregateKey != retry.AggregateKey || lost.ScanID != retry.ScanID {
+		t.Fatalf("retry identity = %q/%q, want the lost alert's %q/%q", retry.AggregateKey, retry.ScanID, lost.AggregateKey, lost.ScanID)
+	}
+	if !lost.WindowStart.Equal(retry.WindowStart) || !lost.HappenedAt.Equal(retry.HappenedAt) {
+		t.Fatalf("retry window = %s/%s, want the lost alert's %s/%s", retry.WindowStart, retry.HappenedAt, lost.WindowStart, lost.HappenedAt)
+	}
+	if !retry.WindowStart.Equal(first) {
+		t.Fatalf("alert window = %s; want the earliest first sighting %s", retry.WindowStart, first)
+	}
+	if retry.Detail.Count != 2 {
+		t.Fatalf("retry count = %d; want both pending works", retry.Detail.Count)
+	}
+
+	// A genuinely new discovery is a different generation, so it does not
+	// silently coalesce into the already-delivered alert's identity.
+	discoveryFake.works = append(discoveryFake.works, discovery.DiscoveredWork{
+		Work: work.Work{DOI: "10.1000/stable-c", Title: "Stable C", Authors: []string{"Cara"}, Year: 2026},
+	})
+	lookup.result = &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+		{Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned}, {Status: zotio.OwnershipNotOwned},
+	}}
+	runStart = first.Add(48 * time.Hour)
+	if _, err := runner.Run(ctx, watched.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.offered) != 3 {
+		t.Fatalf("offered intents = %d; want a third alert for the new work", len(notifier.offered))
+	}
+	fresh := notifier.offered[2]
+	if fresh.AggregateKey == retry.AggregateKey {
+		t.Fatalf("new discovery reused the delivered alert identity %q", fresh.AggregateKey)
+	}
+	if fresh.Detail.Count != 1 {
+		t.Fatalf("new alert count = %d; want only the newly pending work", fresh.Detail.Count)
+	}
+}
