@@ -50,6 +50,13 @@ const (
 	TimedOut Outcome = "timed_out"
 	// SubmitFailed means the daemon refused the submission.
 	SubmitFailed Outcome = "submit_failed"
+	// SubmitAmbiguous means the submission RPC failed after the request was
+	// sent, so the run cannot prove the daemon did not commit a job. The
+	// daemon commits CreateRequestForWork before it answers, so a lost or
+	// late response leaves a real acquisition with an unknown id. Such a
+	// work is never reported as SubmitFailed, because cleanup cannot see a
+	// job without an id and a later run may submit the paper again.
+	SubmitAmbiguous Outcome = "submit_ambiguous"
 )
 
 // readyOutcomes are the outcomes in which papio produced a filed artifact.

@@ -68,7 +68,8 @@ func main() {
 	rpcTimeout := flag.Duration("rpc-timeout", 30*time.Second, "per-RPC timeout")
 	force := flag.Bool("force", false, "submit even when the daemon already holds a live job for a work; without it such works are skipped and disclosed")
 	keep := flag.Bool("keep", false, "keep the jobs this run created; by default every created job that produced no artifact is cancelled")
-	noStore := flag.Bool("no-store", false, "skip the read-only store read that fills the untried-candidate column")
+	noStore := flag.Bool("no-store", false, "skip the read-only store read that fills the untried-candidate column; the safety lookup that names a submitted job stays on")
+	journalPath := flag.String("journal", "", "durable record of the request ids this run submits, so a later run reconciles a lost submission instead of submitting the paper again; defaults to <data-dir>/live-cohort-journal.json")
 	jsonOut := flag.Bool("json", false, "emit the report as indented JSON instead of the rendered text report")
 	out := flag.String("out", "", "write the report to this path as well as stdout")
 	flag.Parse()
@@ -83,6 +84,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *journalPath == "" {
+		*journalPath = filepath.Join(*dataDir, "live-cohort-journal.json")
+	}
 	socket := filepath.Join(*dataDir, "papio.sock")
 	caller := &socketCaller{client: ipc.NewSocketClient(socket), timeout: *rpcTimeout}
 
@@ -91,12 +95,6 @@ func main() {
 	// results, and discarding them would make a long run all-or-nothing.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	if err := probe(ctx, caller); err != nil {
-		fmt.Fprintf(os.Stderr, "live-cohort: no daemon at %s: %v\n", socket, err)
-		fmt.Fprintln(os.Stderr, "live-cohort: start it with `papio daemon status` (any ordinary command autostarts it), then re-run")
-		os.Exit(1)
-	}
 
 	opts := livecohort.Options{
 		Cohort:        cohort,
@@ -108,16 +106,24 @@ func main() {
 		Force:         *force,
 		Cleanup:       !*keep,
 	}
-	if !*noStore {
-		inspector, err := livecohort.OpenStoreInspector(*dataDir)
-		if err != nil {
-			// Unfilled, not fatal: the column is evidence, and a run that
-			// cannot gather it is still a run.
-			fmt.Fprintln(os.Stderr, "live-cohort: untried-candidate column unfilled:", err)
-		} else {
-			defer func() { _ = inspector.Close() }()
-			opts.Inspector = inspector
-		}
+	// The store and the journal are safety dependencies, not evidence. The
+	// lookup names the job a lost submit response committed, and the
+	// journal lets a later run find it instead of submitting the paper
+	// again. Without either one this run could duplicate a real
+	// acquisition, so they are wired before the run contacts the daemon at
+	// all. -no-store only drops the untried-candidate column.
+	closeSafety, err := wireSafety(&opts, *dataDir, *journalPath, *noStore)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "live-cohort:", err)
+		fmt.Fprintln(os.Stderr, "live-cohort: refusing to run without the safety records that prevent duplicate submissions")
+		os.Exit(1)
+	}
+	defer closeSafety()
+
+	if err := probe(ctx, caller); err != nil {
+		fmt.Fprintf(os.Stderr, "live-cohort: no daemon at %s: %v\n", socket, err)
+		fmt.Fprintln(os.Stderr, "live-cohort: start it with `papio daemon status` (any ordinary command autostarts it), then re-run")
+		os.Exit(1)
 	}
 
 	fmt.Fprintf(os.Stderr, "live-cohort: %d work(s), budget %s each, cleanup %v — this submits REAL jobs to %s\n",
@@ -142,6 +148,32 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "live-cohort: report written to", *out)
 	}
+}
+
+// wireSafety opens the two dependencies that keep a run from duplicating
+// a real acquisition: the read-only store lookup, which names the job a
+// lost submit response committed, and the journal, which lets a later
+// run find it instead of submitting the paper again. Any failure is an
+// error, because the run must stop before its first submission rather
+// than measure without its safety records. noStore only drops the
+// untried-candidate column, which is evidence, not safety.
+// The caller owns closing the returned inspector.
+func wireSafety(opts *livecohort.Options, dataDir, journalPath string, noStore bool) (func(), error) {
+	inspector, err := livecohort.OpenStoreInspector(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("no read-only store: %w", err)
+	}
+	journal, err := livecohort.OpenFileJournal(journalPath)
+	if err != nil {
+		_ = inspector.Close()
+		return nil, fmt.Errorf("no submission journal: %w", err)
+	}
+	opts.Lookup = inspector
+	if !noStore {
+		opts.Inspector = inspector
+	}
+	opts.Journal = journal
+	return func() { _ = inspector.Close() }, nil
 }
 
 // probe fails fast when no daemon is listening, so a thirty-work run does

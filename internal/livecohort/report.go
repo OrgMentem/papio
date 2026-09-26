@@ -40,6 +40,11 @@ type Result struct {
 	CleanedUp         bool   `json:"cleaned_up,omitempty"`
 	CleanupNote       string `json:"cleanup_note,omitempty"`
 
+	// RequestID is the daemon-side work request id this run submitted for
+	// the work. It names the acquisition even when the submission response
+	// was lost, so an ambiguous submit stays recoverable by hand.
+	RequestID string `json:"request_id,omitempty"`
+
 	submittedAt time.Time
 	// parkedSince is when this job was FIRST seen in a parking state, so a
 	// parked sighting can be confirmed before it is recorded. Zeroed again
@@ -93,6 +98,11 @@ type Report struct {
 	// were spared. They are the operator's to keep or discard; the report
 	// states them so the decision is theirs and not this tool's silence.
 	Kept []string `json:"kept_job_ids,omitempty"`
+	// JournalFailures names the durable safety records this run could not
+	// write. Each one is a submission a later run may repeat, or an
+	// accounted work a later run will keep refusing, so they are reported
+	// rather than swallowed.
+	JournalFailures []string `json:"journal_failures,omitempty"`
 
 	// Measured is the number of works that actually ran — the denominator
 	// of every rate below.
@@ -114,6 +124,15 @@ type Report struct {
 	// reader can see what GaveUpHolding is a count out of.
 	CandidatesInspected int     `json:"candidates_inspected"`
 	TotalSpentUSD       float64 `json:"total_spent_usd"`
+}
+
+// noteJournalFailure records one durable-write failure for the report. A
+// nil error is the ordinary case and records nothing.
+func (r *Report) noteJournalFailure(err error) {
+	if err == nil {
+		return
+	}
+	r.JournalFailures = append(r.JournalFailures, err.Error())
 }
 
 // summarize computes every aggregate from Results. It runs once, at the end
@@ -228,9 +247,62 @@ func (r Report) Render(w io.Writer) error {
 		fmt.Fprintf(&b, "         your ready queue; review with `papio jobs list --state ready`.\n")
 		fmt.Fprintf(&b, "         %s\n", strings.Join(r.Kept, " "))
 	}
+	if troubled := cleanupFailures(r.Results); len(troubled) > 0 {
+		fmt.Fprintf(&b, "\ncleanup: %d job(s) could NOT be confirmed cancelled, so they may still be running\n", len(troubled))
+		b.WriteString("         cancel each by hand with `papio jobs cancel <job-id>` and check `papio jobs list` for strays\n")
+		for _, row := range troubled {
+			name := row.JobID
+			if name == "" {
+				name = row.Key
+			}
+			fmt.Fprintf(&b, "  %-22s %s\n", truncate(name, 22), row.CleanupNote)
+		}
+	}
+	if unresolved := ambiguousSubmissions(r.Results); len(unresolved) > 0 {
+		fmt.Fprintf(&b, "\nAMBIGUOUS SUBMISSIONS: %d work(s) may have a real job this run could not name\n", len(unresolved))
+		b.WriteString("         the daemon commits an acquisition before it answers, so a lost response can\n")
+		b.WriteString("         leave a live job. Find each by its request id with `papio jobs list`, and\n")
+		b.WriteString("         cancel what you do not want. The next run reads the same request ids and\n")
+		b.WriteString("         will not submit these works again until they are accounted for.\n")
+		for _, row := range unresolved {
+			fmt.Fprintf(&b, "  %-22s %s\n", truncate(row.Key, 22), row.RequestID)
+		}
+	}
+	if len(r.JournalFailures) > 0 {
+		fmt.Fprintf(&b, "\nJOURNAL FAILURES: %d durable safety record(s) could not be written\n", len(r.JournalFailures))
+		b.WriteString("         the journal is what stops a later run from submitting a paper this run\n")
+		b.WriteString("         already asked for, so repair it before the next run.\n")
+		for _, failure := range r.JournalFailures {
+			fmt.Fprintf(&b, "  %s\n", failure)
+		}
+	}
 
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// cleanupFailures lists the results whose cancellation could not be
+// confirmed, so the report can name them instead of silently dropping them.
+func cleanupFailures(results []Result) []Result {
+	var out []Result
+	for _, row := range results {
+		if row.CleanupNote != "" {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// ambiguousSubmissions lists the works whose submission may have committed
+// a job this run could not name, so the report states each request id.
+func ambiguousSubmissions(results []Result) []Result {
+	var out []Result
+	for _, row := range results {
+		if row.Outcome == SubmitAmbiguous {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 func deref(v *int) int {

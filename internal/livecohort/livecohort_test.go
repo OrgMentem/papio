@@ -6,12 +6,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"papio/internal/api"
 	"papio/internal/bench"
+	"papio/internal/ipc"
 	"papio/internal/job"
 )
 
@@ -20,25 +23,63 @@ import (
 type fakeDaemon struct {
 	// states[jobID] is the sequence of job rows successive polls observe;
 	// the last entry repeats once exhausted.
-	states    map[string][]api.JobDetailV3
+	states map[string][]api.JobDetailV3
+	// requestOf[jobID] is the committed work_request_id the ownership
+	// read returns; unset means the job owns the request id the run
+	// used to submit it.
+	requestOf map[string]string
 	polls     map[string]int
 	existing  map[string]bool
 	cancelled []string
 	submitted []string
 	submitErr map[string]error
-	nextID    int
+	// submitFails counts remaining submit failures per request id, so a
+	// test can lose the response the daemon's commit already outran.
+	submitFails map[string]int
+	// committed[requestID] is the job the daemon committed for a request,
+	// which the store lookup reads back. A lost response leaves it set and
+	// the caller ignorant, which is the whole defect under test.
+	committed map[string]committedJob
+	// loseWithoutCommit marks requests whose submit fails before any job
+	// is committed, so the lookup truthfully finds nothing.
+	loseWithoutCommit map[string]bool
+	// refuseCancel makes jobs.cancel fail, to prove the failure is named.
+	refuseCancel bool
+	// cancelSawLiveCtx records whether jobs.cancel arrived on a live
+	// context, which is the interrupted-run regression.
+	cancelSawLiveCtx bool
+	nextID           int
+}
+
+type committedJob struct {
+	id    string
+	state string
 }
 
 func newFakeDaemon() *fakeDaemon {
 	return &fakeDaemon{
-		states:    map[string][]api.JobDetailV3{},
-		polls:     map[string]int{},
-		existing:  map[string]bool{},
-		submitErr: map[string]error{},
+		states:            map[string][]api.JobDetailV3{},
+		requestOf:         map[string]string{},
+		polls:             map[string]int{},
+		existing:          map[string]bool{},
+		submitErr:         map[string]error{},
+		submitFails:       map[string]int{},
+		committed:         map[string]committedJob{},
+		loseWithoutCommit: map[string]bool{},
 	}
 }
 
-func (f *fakeDaemon) Call(_ context.Context, method string, params, result any) error {
+// JobForRequest is the read-only store lookup: it finds the committed job
+// for a request id in EVERY state, terminal ones included.
+func (f *fakeDaemon) JobForRequest(_ context.Context, requestID string) (string, string, bool, error) {
+	entry, ok := f.committed[requestID]
+	if !ok {
+		return "", "", false, nil
+	}
+	return entry.id, entry.state, true, nil
+}
+
+func (f *fakeDaemon) Call(ctx context.Context, method string, params, result any) error {
 	switch method {
 	case "acquire.submit_v2":
 		var decoded submitParams
@@ -49,19 +90,45 @@ func (f *fakeDaemon) Call(_ context.Context, method string, params, result any) 
 		if err := f.submitErr[key]; err != nil {
 			return err
 		}
+		if n := f.submitFails[key]; n > 0 {
+			f.submitFails[key] = n - 1
+			if f.loseWithoutCommit[key] {
+				return context.DeadlineExceeded
+			}
+			// The daemon commits the acquisition BEFORE it answers, so a
+			// lost response leaves a real job the caller cannot name.
+			id := f.idFor(key)
+			state := job.StateQueued
+			if seq := f.states[id]; len(seq) > 0 {
+				state = seq[len(seq)-1].Job.State
+			} else {
+				f.states[id] = []api.JobDetailV3{detailFor(id, state, "")}
+			}
+			f.requestOf[id] = key
+			f.committed[key] = committedJob{id: id, state: state}
+			return context.DeadlineExceeded
+		}
 		if decoded.AutoImport == nil || *decoded.AutoImport {
 			return errors.New("a measurement must submit with auto_import false")
 		}
 		f.nextID++
 		id := f.idFor(key)
 		f.submitted = append(f.submitted, id)
+		if _, ok := f.requestOf[id]; !ok {
+			f.requestOf[id] = key
+		}
+		state := job.StateQueued
+		if seq := f.states[id]; len(seq) > 0 {
+			state = seq[len(seq)-1].Job.State
+		}
+		f.committed[key] = committedJob{id: id, state: state}
 		return roundTrip(api.SubmitV2Result{JobID: id, Existing: f.existing[key]}, result)
 	case "jobs.get_v3":
-		var decoded map[string]string
-		if err := roundTrip(params, &decoded); err != nil {
+		var getParams map[string]string
+		if err := roundTrip(params, &getParams); err != nil {
 			return err
 		}
-		id := decoded["job_id"]
+		id := getParams["job_id"]
 		seq := f.states[id]
 		if len(seq) == 0 {
 			return errors.New("no such job " + id)
@@ -71,8 +138,16 @@ func (f *fakeDaemon) Call(_ context.Context, method string, params, result any) 
 			i = len(seq) - 1
 		}
 		f.polls[id] = i + 1
-		return roundTrip(seq[i], result)
+		got := seq[i]
+		if req, ok := f.requestOf[id]; ok && got.Job != nil {
+			got.Job.WorkRequestID = req
+		}
+		return roundTrip(got, result)
 	case "jobs.cancel":
+		f.cancelSawLiveCtx = f.cancelSawLiveCtx || ctx.Err() == nil
+		if f.refuseCancel {
+			return errors.New("daemon unavailable for cancel")
+		}
 		var decoded map[string]string
 		if err := roundTrip(params, &decoded); err != nil {
 			return err
@@ -102,12 +177,16 @@ func roundTrip(from, into any) error {
 }
 
 func detail(state, terminalReason string, actions ...job.HumanAction) api.JobDetailV3 {
+	return detailFor("job", state, terminalReason, actions...)
+}
+
+func detailFor(id, state, terminalReason string, actions ...job.HumanAction) api.JobDetailV3 {
 	rows := make([]api.ActionRow, 0, len(actions))
 	for _, action := range actions {
 		rows = append(rows, api.ActionRow{HumanAction: action})
 	}
 	return api.JobDetailV3{
-		Job:     &api.JobRow{Row: job.Row{ID: "job", State: state, TerminalReason: terminalReason}},
+		Job:     &api.JobRow{Row: job.Row{ID: id, State: state, TerminalReason: terminalReason}},
 		Actions: rows,
 	}
 }
@@ -122,9 +201,12 @@ func work(key string, expected bench.ExpectedClass) bench.Work {
 
 func runWith(t *testing.T, daemon *fakeDaemon, cohort bench.Cohort, mutate func(*Options)) Report {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	opts := Options{
 		Cohort:        cohort,
 		Caller:        daemon,
+		Lookup:        daemon,
 		RunID:         "testrun",
 		PerWorkBudget: time.Minute,
 		ParkSettle:    time.Microsecond,
@@ -133,7 +215,10 @@ func runWith(t *testing.T, daemon *fakeDaemon, cohort bench.Cohort, mutate func(
 	if mutate != nil {
 		mutate(&opts)
 	}
-	report, err := Run(context.Background(), opts)
+	oldTimeout, oldPoll := reconcileTimeout, reconcilePoll
+	reconcileTimeout, reconcilePoll = 100*time.Millisecond, 5*time.Millisecond
+	defer func() { reconcileTimeout, reconcilePoll = oldTimeout, oldPoll }()
+	report, err := Run(ctx, opts)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -335,11 +420,436 @@ func TestCleanupReportsACompletionAfterTheParkedObservation(t *testing.T) {
 	}
 }
 
+// A submission whose response is lost after the daemon commits is named by
+// READING the committed job for its request id. The run never asks for the
+// paper a second time, so the job it measures is the job it caused.
+func TestALostSubmitResponseIsReconciledByRequestID(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.submitFails["livecohort-testrun-flaky"] = 1
+	daemon.states["job_flaky"] = []api.JobDetailV3{detailFor("job_flaky", job.StateUnavailable, "no legal candidates")}
+
+	report := runWith(t, daemon, cohortOf(work("flaky", bench.HonestUnavailable)), func(o *Options) {
+		o.Cleanup = true
+	})
+
+	row := report.Results[0]
+	if row.JobID != "job_flaky" {
+		t.Fatalf("job id = %q, want the committed job the lookup named", row.JobID)
+	}
+	if row.Outcome != Unavailable {
+		t.Fatalf("outcome = %q, want the settled job rather than a submit verdict", row.Outcome)
+	}
+	if !row.CreatedByRun {
+		t.Fatalf("created_by_run = false, want the recovered job owned by this run")
+	}
+	if row.RequestID != "livecohort-testrun-flaky" {
+		t.Fatalf("request id = %q, want the id that names the acquisition for cleanup by hand", row.RequestID)
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %d answered submissions, want none: recovery reads the store and never asks again", got)
+	}
+}
+
+// The duplicate this path exists to prevent: the hidden job is already
+// TERMINAL, so a resubmission would create a second real acquisition. The
+// lookup finds a terminal job where the daemon's own deduplication does not.
+func TestALostSubmitIsNeverResubmittedOnceItsJobIsTerminal(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_fast"] = []api.JobDetailV3{detailFor("job_fast", job.StateReady, "")}
+	daemon.submitFails["livecohort-testrun-fast"] = 100
+
+	report := runWith(t, daemon, cohortOf(work("fast", bench.AutonomousReady)), nil)
+
+	row := report.Results[0]
+	if row.JobID != "job_fast" {
+		t.Fatalf("job id = %q, want the terminal job the lookup named", row.JobID)
+	}
+	if row.Outcome != AutonomousReady {
+		t.Fatalf("outcome = %q, want the terminal job measured", row.Outcome)
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %d, want no second acquisition for a paper the daemon already finished", got)
+	}
+}
+
+// A lost response with nothing committed stays visible: it is an explicit
+// ambiguity carrying its request id, never a silent refusal, and cleanup
+// leaves it alone rather than cancelling blind.
+func TestAnUnrecoverableSubmitStaysExplicitlyAmbiguous(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.submitFails["livecohort-testrun-lost"] = 100
+	daemon.loseWithoutCommit["livecohort-testrun-lost"] = true
+
+	report := runWith(t, daemon, cohortOf(work("lost", bench.AutonomousReady)), func(o *Options) {
+		o.Cleanup = true
+	})
+	row := report.Results[0]
+	if row.Outcome != SubmitAmbiguous {
+		t.Fatalf("outcome = %q, want %q", row.Outcome, SubmitAmbiguous)
+	}
+	if row.JobID != "" {
+		t.Fatalf("job id = %q, want empty when no job could be named", row.JobID)
+	}
+	if !strings.Contains(row.StopDetail, "livecohort-testrun-lost") {
+		t.Fatalf("stop detail = %q, want the request id for cleanup by hand", row.StopDetail)
+	}
+	if len(daemon.cancelled) != 0 {
+		t.Fatalf("cancelled = %v, want no blind cancellation of an unnamed job", daemon.cancelled)
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %d, want no submission on a guess", got)
+	}
+	if row.Verdict != VerdictMissed {
+		t.Fatalf("verdict = %q, want a miss rather than silent success", row.Verdict)
+	}
+	// The operator must be able to find the possible job by hand, so the
+	// rendered report names the request id rather than burying it.
+	var rendered strings.Builder
+	if err := report.Render(&rendered); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(rendered.String(), "livecohort-testrun-lost") ||
+		!strings.Contains(rendered.String(), "AMBIGUOUS SUBMISSIONS") {
+		t.Fatalf("rendered report hides the ambiguous submission:\n%s", rendered.String())
+	}
+}
+
+// Without a store lookup the run cannot name a committed job, so it keeps
+// the ambiguity instead of resubmitting into a possible duplicate.
+func TestWithoutALookupALostSubmitIsAmbiguousAndNeverResubmitted(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.submitFails["livecohort-testrun-blind"] = 1
+
+	report := runWith(t, daemon, cohortOf(work("blind", bench.AutonomousReady)), func(o *Options) {
+		o.Lookup = nil
+	})
+
+	if got := report.Results[0].Outcome; got != SubmitAmbiguous {
+		t.Fatalf("outcome = %q, want %q without a lookup", got, SubmitAmbiguous)
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %d, want no resubmission while the committed job cannot be read", got)
+	}
+}
+
+// The cross-run duplicate: a run loses a submit response, and a LATER run
+// with a fresh run id would mint a second acquisition for the same paper
+// once the first job is terminal. The durable journal is what lets the
+// second run find the first run's job instead of repeating it.
+func TestARerunReconcilesAnUnaccountedSubmissionInsteadOfDuplicatingIt(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.submitFails["livecohort-runone-slow"] = 100
+	daemon.loseWithoutCommit["livecohort-runone-slow"] = false
+	journal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	cohort := cohortOf(work("slow", bench.AutonomousReady))
+
+	// The first run loses the response after the daemon committed job_slow,
+	// and no lookup is available to it, so the ambiguity stays durable.
+	first := runWith(t, daemon, cohort, func(o *Options) {
+		o.RunID = "runone"
+		o.Lookup = nil
+		o.Journal = journal
+	})
+	if got := first.Results[0].Outcome; got != SubmitAmbiguous {
+		t.Fatalf("first run outcome = %q, want %q", got, SubmitAmbiguous)
+	}
+
+	// The job the first run could not name finishes before the rerun.
+	daemon.states["job_slow"] = []api.JobDetailV3{detailFor("job_slow", job.StateReady, "")}
+	daemon.committed["livecohort-runone-slow"] = committedJob{id: "job_slow", state: job.StateReady}
+
+	second := runWith(t, daemon, cohort, func(o *Options) {
+		o.RunID = "runtwo"
+		o.Journal = journal
+	})
+
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %v, want no second acquisition for a work the first run already asked for", daemon.submitted)
+	}
+	if len(second.Results) != 0 {
+		t.Fatalf("results = %+v, want the work disclosed as skipped rather than measured from history", second.Results)
+	}
+	if len(second.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want the unaccounted submission disclosed", second.Skipped)
+	}
+	skip := second.Skipped[0]
+	if skip.JobID != "job_slow" || !strings.Contains(skip.Reason, "livecohort-runone-slow") {
+		t.Fatalf("skip = %+v, want the earlier run's request id and its job named", skip)
+	}
+
+	// Once disclosed, the association is accounted for: a third run may
+	// measure the work again rather than refusing it forever.
+	third := runWith(t, daemon, cohort, func(o *Options) {
+		o.RunID = "runthree"
+		o.Journal = journal
+	})
+	if len(third.Results) != 1 || third.Results[0].JobID == "" {
+		t.Fatalf("third run = %+v, want the work measured again after the ambiguity was accounted for", third.Results)
+	}
+}
+
+// A rerun that cannot read the store must not submit on a guess either: an
+// unaccounted submission with no lookup is disclosed, not repeated.
+func TestARerunWithoutALookupRefusesToResubmitAnUnaccountedWork(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.submitFails["livecohort-runone-slow"] = 100
+	daemon.loseWithoutCommit["livecohort-runone-slow"] = true
+	journal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	cohort := cohortOf(work("slow", bench.AutonomousReady))
+
+	runWith(t, daemon, cohort, func(o *Options) {
+		o.RunID = "runone"
+		o.Lookup = nil
+		o.Journal = journal
+	})
+	second := runWith(t, daemon, cohort, func(o *Options) {
+		o.RunID = "runtwo"
+		o.Lookup = nil
+		o.Journal = journal
+	})
+
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %v, want no submission while the earlier one is unaccounted for", daemon.submitted)
+	}
+	if len(second.Skipped) != 1 || !strings.Contains(second.Skipped[0].Reason, "force") {
+		t.Fatalf("skipped = %+v, want the unresolved submission disclosed with the force remedy", second.Skipped)
+	}
+}
+
+// Force is the operator overriding that refusal on purpose: it submits.
+func TestForceSubmitsEvenWithAnUnaccountedEarlierSubmission(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.submitFails["livecohort-runone-slow"] = 100
+	daemon.loseWithoutCommit["livecohort-runone-slow"] = true
+	daemon.states["job_slow"] = []api.JobDetailV3{detailFor("job_slow", job.StateReady, "")}
+	journal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	cohort := cohortOf(work("slow", bench.AutonomousReady))
+
+	runWith(t, daemon, cohort, func(o *Options) {
+		o.RunID = "runone"
+		o.Lookup = nil
+		o.Journal = journal
+	})
+	second := runWith(t, daemon, cohort, func(o *Options) {
+		o.RunID = "runtwo"
+		o.Journal = journal
+		o.Force = true
+	})
+
+	if len(daemon.submitted) != 1 {
+		t.Fatalf("submitted = %v, want the forced submission to go through", daemon.submitted)
+	}
+	if len(second.Results) != 1 || second.Results[0].JobID == "" {
+		t.Fatalf("results = %+v, want the forced work measured", second.Results)
+	}
+}
+
+// A journal the run cannot read may name a submission an earlier run left
+// live. The run refuses before it submits anything rather than measuring
+// on a safety record it could not consult.
+func TestAnUnreadableJournalStopsTheRunBeforeAnySubmission(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+	}{
+		{"corrupt", "{not json"},
+		{"truncated to empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "journal.json")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatalf("seeding the journal: %v", err)
+			}
+			journal, err := OpenFileJournal(path)
+			if err != nil {
+				t.Fatalf("OpenFileJournal: %v", err)
+			}
+			daemon := newFakeDaemon()
+			_, runErr := Run(context.Background(), Options{
+				Cohort:        cohortOf(work("w", bench.AutonomousReady)),
+				Caller:        daemon,
+				Lookup:        daemon,
+				Journal:       journal,
+				RunID:         "testrun",
+				PerWorkBudget: time.Minute,
+				Poll:          time.Microsecond,
+				ParkSettle:    time.Microsecond,
+			})
+			if runErr == nil {
+				t.Fatal("Run measured a cohort against a journal it could not read")
+			}
+			if len(daemon.submitted) != 0 {
+				t.Fatalf("submitted = %v, want no submission behind an unreadable safety record", daemon.submitted)
+			}
+		})
+	}
+}
+
+// An intent the run cannot durably record is a submission it must not
+// make: the next run would have nothing to reconcile against.
+func TestAnUnwritableJournalStopsTheRunBeforeSubmitting(t *testing.T) {
+	daemon := newFakeDaemon()
+	_, err := Run(context.Background(), Options{
+		Cohort:        cohortOf(work("w", bench.AutonomousReady)),
+		Caller:        daemon,
+		Lookup:        daemon,
+		Journal:       failingJournal{noteErr: errors.New("disk full")},
+		RunID:         "testrun",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+	})
+	if err == nil {
+		t.Fatal("Run submitted without recording the association that protects the next run")
+	}
+	if !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("error = %v, want the underlying write failure", err)
+	}
+	if len(daemon.submitted) != 0 {
+		t.Fatalf("submitted = %v, want no submission before its intent is durable", daemon.submitted)
+	}
+}
+
+// A request the run cannot mark accounted for stays unresolved, and the
+// failure is named: silence would refuse the work on every later run.
+func TestAFailedResolveIsNamedInTheReport(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_w"] = []api.JobDetailV3{detailFor("job_w", job.StateReady, "")}
+	report := runWith(t, daemon, cohortOf(work("w", bench.AutonomousReady)), func(o *Options) {
+		o.Journal = failingJournal{resolveErr: errors.New("read-only file system")}
+	})
+	if len(report.JournalFailures) == 0 {
+		t.Fatal("a journal write this run could not make was swallowed")
+	}
+	var rendered strings.Builder
+	if err := report.Render(&rendered); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(rendered.String(), "JOURNAL FAILURES") ||
+		!strings.Contains(rendered.String(), "read-only file system") {
+		t.Fatalf("rendered report hides the journal failure:\n%s", rendered.String())
+	}
+}
+
+// failingJournal fails the one durable write a test names and accepts the
+// rest, so each failure mode is exercised on its own.
+type failingJournal struct {
+	noteErr       error
+	resolveErr    error
+	unresolvedErr error
+}
+
+func (j failingJournal) Note(JournalEntry) error { return j.noteErr }
+func (j failingJournal) Resolve(string) error    { return j.resolveErr }
+func (j failingJournal) Unresolved(string) ([]JournalEntry, error) {
+	return nil, j.unresolvedErr
+}
+
+// A classified daemon refusal is an answer, not a lost response, so it
+// stays a refusal and never triggers a reconciling resubmit.
+func TestAClassifiedRefusalNeverReconciles(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.submitErr["livecohort-testrun-bad"] = &ipc.RemoteError{Code: "invalid_argument", Message: "no identity evidence"}
+
+	report := runWith(t, daemon, cohortOf(work("bad", bench.AutonomousReady)), nil)
+
+	if got := report.Results[0].Outcome; got != SubmitFailed {
+		t.Fatalf("outcome = %q, want %q", got, SubmitFailed)
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %d, want no resubmit after an answered refusal", got)
+	}
+}
+
+// A run cancelled before a work is submitted records the work it never
+// sent instead of submitting into the interrupt and reconciling a job
+// the operator never asked this run to start.
+func TestACancelledRunNeverSubmitsIntoTheInterrupt(t *testing.T) {
+	daemon := newFakeDaemon()
+	ctx, stop := context.WithCancel(context.Background())
+	stop()
+	opts := Options{
+		Cohort:        cohortOf(work("late", bench.AutonomousReady)),
+		Caller:        daemon,
+		RunID:         "testrun",
+		PerWorkBudget: time.Minute,
+		ParkSettle:    time.Microsecond,
+		Poll:          time.Microsecond,
+	}
+	report, err := Run(ctx, opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %d, want no submission after the run was cancelled", got)
+	}
+	row := report.Results[0]
+	if row.Outcome != TimedOut {
+		t.Fatalf("outcome = %q, want %q for a work never sent", row.Outcome, TimedOut)
+	}
+	if row.JobID != "" {
+		t.Fatalf("job id = %q, want empty for a work never sent", row.JobID)
+	}
+}
+
+// Cancelling on an already interrupted measurement context must still
+// reach the daemon: cleanup runs on its own bounded clock.
+func TestCleanupCancelsAfterTheRunContextIsInterrupted(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_parked"] = []api.JobDetailV3{
+		detail(job.StateAwaitingHuman, "", job.HumanAction{Kind: "openurl_handoff", Status: "open"}),
+	}
+	observed := &Result{JobID: "job_parked", Outcome: HumanBoundary, CreatedByRun: true}
+	ctx, stop := context.WithCancel(context.Background())
+	stop()
+	cancelled, _ := cleanup(ctx, Options{Caller: daemon, Cleanup: true}, []*Result{observed})
+	if len(cancelled) != 1 {
+		t.Fatalf("cancelled = %v, want the parked job even though the run context is done", cancelled)
+	}
+	if !daemon.cancelSawLiveCtx {
+		t.Fatal("jobs.cancel arrived on a dead context, so an interrupted run cannot clean up")
+	}
+}
+
+// A cleanup the daemon will not confirm must be named in the rendered
+// report with its job id, or an interrupted operator walks away while
+// the job keeps running.
+func TestAFailedCleanupNamesTheJobInTheRenderedReport(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_parked"] = []api.JobDetailV3{
+		detail(job.StateAwaitingHuman, "", job.HumanAction{Kind: "openurl_handoff", Status: "open"}),
+	}
+	daemon.refuseCancel = true
+	report := runWith(t, daemon, cohortOf(work("parked", bench.ReadyAfterHumanBoundary)), func(o *Options) {
+		o.Cleanup = true
+	})
+	row := report.Results[0]
+	if !strings.Contains(row.CleanupNote, "job_parked") {
+		t.Fatalf("cleanup note = %q, want the stranded job id", row.CleanupNote)
+	}
+	var rendered strings.Builder
+	if err := report.Render(&rendered); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(rendered.String(), "job_parked") || !strings.Contains(rendered.String(), "could NOT be confirmed cancelled") {
+		t.Fatalf("rendered report hides the failed cleanup:\n%s", rendered.String())
+	}
+}
+
 // A submission the daemon refuses is a recorded outcome, not a dropped work
 // and not an aborted run.
 func TestARefusedSubmissionIsRecordedAndTheRunContinues(t *testing.T) {
 	daemon := newFakeDaemon()
-	daemon.submitErr["livecohort-testrun-bad"] = errors.New("invalid_argument: no identity evidence")
+	daemon.submitErr["livecohort-testrun-bad"] = &ipc.RemoteError{Code: "invalid_argument", Message: "no identity evidence"}
 	daemon.states["job_good"] = []api.JobDetailV3{detail(job.StateReady, "")}
 
 	report := runWith(t, daemon, cohortOf(

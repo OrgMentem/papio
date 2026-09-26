@@ -5,6 +5,7 @@ package livecohort
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -67,4 +68,29 @@ func (s *StoreInspector) UntriedCandidates(ctx context.Context, jobID string) (i
 		return 0, 0, fmt.Errorf("counting candidates for %s: %w", jobID, err)
 	}
 	return untried, total, nil
+}
+
+// JobForRequest returns the job the daemon committed for a work request id,
+// TERMINAL ones included, and whether one exists at all.
+//
+// This is the lookup the submit path needs and no RPC provides. The daemon
+// reuses a LIVE job for a request id and mints a fresh one once that job is
+// terminal (internal/job/job.go createRequest), so resubmitting a request id
+// to discover its job is only safe while the job is live and duplicates the
+// acquisition after it is not. Reading the committed row answers the same
+// question without asking for a second acquisition, which is why this
+// lookup must be available even when the untried-candidate column is off.
+func (s *StoreInspector) JobForRequest(ctx context.Context, requestID string) (string, string, bool, error) {
+	var jobID, state string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, state FROM jobs
+		WHERE work_request_id = ?
+		ORDER BY created_at DESC LIMIT 1`, requestID).Scan(&jobID, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("looking up the job for request %s: %w", requestID, err)
+	}
+	return jobID, state, true, nil
 }

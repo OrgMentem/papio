@@ -27,12 +27,20 @@ run always measures the daemon you meant. Flags worth knowing:
 
 | flag | effect |
 |---|---|
-| `-force` | submit even when a live job already exists for the work. Without it such works are **skipped and disclosed** — measuring a job this run did not create measures your history, not papio's current behaviour. Required for a repeat run. |
+| `-force` | submit a new job even when a prior run or a live job already owns this work. Use it only when you intend another acquisition. |
 | `-budget` | per-work settlement budget. A work still working at the budget is recorded `timed_out`, which is a result, not an error. |
-| `-park-settle` | how long a job seen in `awaiting_human` or `needs_review` must stay there before the run believes it. Default 60s. Those states are **not terminal** — the daemon advances out of them, and recording the first sighting counts successes as human stops. See the note below. |
+| `-park-settle` | how long a job seen in `awaiting_human` or `needs_review` must stay there before the run believes it. Default 60s. Those states are **not terminal**. |
 | `-keep` | keep every job the run created. By default a created job that produced no artifact is cancelled. |
-| `-no-store` | skip the read-only store read that fills the untried-candidate column. |
+| `-no-store` | skip only the untried-candidate column. The run still reads the store to reconcile lost submit responses. |
+| `-journal` | path to the durable submission journal. The default is `<data-dir>/live-cohort-journal.json`. Keep it with the data directory across interrupted runs. |
 | `-json` / `-out` | machine form, and write the report to a path as well as stdout. |
+
+The journal records a work's request ID before its submit call. If a response
+goes missing, *papio* reads the store for that request ID, including terminal
+jobs. A later run checks unresolved journal entries before it submits the same
+work. If it cannot prove the prior request did not create a job, it skips the
+work and names the request ID. Do not delete the journal to clear an ambiguous
+submission; inspect the named request first.
 
 ## Reading the report
 
@@ -125,11 +133,15 @@ reaches real providers. Two guardrails, both deliberate:
   `papio doctor`'s `uncollected_acquisitions` warning. Budget for that before
   running a public cohort repeatedly.
 
-The untried-candidate column opens `papio.db` read-only. `mode=ro` makes the
-driver refuse every write, but opening a WAL database for read still recreates
-the `-wal`/`-shm` sidecars if the daemon has checkpointed and closed. Harmless,
-and the next daemon open reuses them, but it is a visible effect of taking a
-measurement.
+An interrupt stops new submissions. Cleanup uses its own short deadline to
+cancel jobs without artifacts. If a cancellation fails or stays uncertain,
+the report names the job and shows a manual cancel command. A missing submit
+response stays ambiguous until the store confirms the request's job; the
+report names that request instead of claiming the submit failed.
+
+The safety lookup opens `papio.db` read-only, even with `-no-store`. `mode=ro`
+refuses writes, but reading a WAL database can recreate the `-wal` and `-shm`
+files after the daemon closes. The next daemon open can reuse those files.
 
 ## Cohort files
 

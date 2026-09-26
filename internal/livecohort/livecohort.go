@@ -43,6 +43,7 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/bench"
+	"papio/internal/ipc"
 	"papio/internal/job"
 	"papio/internal/protocol"
 )
@@ -66,12 +67,35 @@ type CandidateInspector interface {
 	UntriedCandidates(ctx context.Context, jobID string) (untried, total int, err error)
 }
 
+// JobLookup answers which job the daemon committed for a work request id,
+// terminal jobs included.
+//
+// It exists because the submit RPC cannot answer that question safely. The
+// daemon deduplicates a request id against LIVE jobs only, so asking again
+// discovers a live job and duplicates a terminal one. A lookup reads the
+// committed association instead of asking for a second acquisition, and it
+// is what lets a lost submit response and an interrupted earlier run both
+// be reconciled rather than repeated.
+type JobLookup interface {
+	JobForRequest(ctx context.Context, requestID string) (jobID, state string, found bool, err error)
+}
+
 // Options configures one run.
 type Options struct {
 	Cohort bench.Cohort
 	Caller Caller
 	// Inspector is optional; nil leaves the untried-candidate column unfilled.
 	Inspector CandidateInspector
+	// Lookup resolves a request id to the job the daemon committed for it.
+	// Without one, a submission whose response was lost stays an explicit
+	// ambiguity: this run never resubmits on a guess, because the daemon
+	// would mint a second acquisition once the hidden job is terminal.
+	Lookup JobLookup
+	// Journal durably associates this run's cohort works with the request
+	// ids it submitted, so a LATER run can reconcile an unaccounted
+	// submission instead of asking for the same paper again. Optional; a
+	// run without one cannot protect a rerun.
+	Journal Journal
 	// RunID namespaces this run's request ids. It must satisfy the
 	// protocol's request_id charset; NewRunID builds a conforming one.
 	RunID string
@@ -96,7 +120,7 @@ type Options struct {
 	Now func() time.Time
 }
 
-const (
+var (
 	defaultPerWorkBudget = 5 * time.Minute
 	defaultPoll          = 2 * time.Second
 	// defaultParkSettle bounds the confirmation window for a parked
@@ -108,6 +132,16 @@ const (
 	// every park in a thirty-work cohort costs one extra minute overall
 	// rather than one per work.
 	defaultParkSettle = time.Minute
+	// reconcileTimeout bounds the read that names the job a lost submit
+	// response may have committed.
+	reconcileTimeout = 30 * time.Second
+	// reconcilePoll is how often that read is repeated while its window is
+	// open, because the commit and the lost response race.
+	reconcilePoll = 500 * time.Millisecond
+	// cleanupTimeout bounds the whole best-effort cancellation pass. It is
+	// independent of the measurement context, which is already cancelled
+	// on exactly the path that needs cleanup most.
+	cleanupTimeout = 60 * time.Second
 )
 
 // NewRunID derives a request-id-legal run stamp from a timestamp.
@@ -168,26 +202,84 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		Results:       make([]Result, 0, len(opts.Cohort.Works)),
 	}
 
+	// A journal this run cannot read cannot protect it: every unaccounted
+	// submission it holds would become a duplicate acquisition. The run
+	// refuses before it submits anything rather than measuring on a
+	// safety record it could not consult.
+	prior, err := unresolvedByWork(opts)
+	if err != nil {
+		return Report{}, err
+	}
+
 	pending := make([]*Result, 0, len(opts.Cohort.Works))
 	for _, work := range opts.Cohort.Works {
 		result := Result{Key: work.Key, Expected: work.ExpectedClass, Request: describeRequest(work.Request)}
-		jobID, existing, err := submit(ctx, opts, work)
-		switch {
-		case err != nil:
-			result.Outcome = SubmitFailed
-			result.StopDetail = err.Error()
+		req := workRequest(work, opts.RunID)
+		result.RequestID = req.RequestID
+		if ctx.Err() != nil {
+			result.Outcome = TimedOut
+			result.StopDetail = "run cancelled before this work was submitted"
 			result.Verdict = VerdictMissed
 			report.Results = append(report.Results, result)
 			continue
+		}
+		// An earlier run that lost a submit response left this work's
+		// request id unaccounted for. Submitting now would ask for the same
+		// paper a second time, because the daemon only deduplicates against
+		// a LIVE job and the earlier one may already be terminal. Resolve
+		// the earlier submission first, and disclose it.
+		if entry, ok := prior[work.Key]; ok && !opts.Force {
+			skip, settled := resolvePriorSubmission(ctx, opts, entry)
+			report.Skipped = append(report.Skipped, skip)
+			if settled {
+				report.noteJournalFailure(noteJournalResolved(opts, entry.RequestID))
+			}
+			continue
+		}
+		// The intent is durable BEFORE the RPC, because an association
+		// recorded after a lost response is one that was never recorded.
+		// An intent this run cannot write is a submission it must not make.
+		if err := noteJournal(opts, JournalEntry{CohortID: opts.Cohort.ID, WorkKey: work.Key, RequestID: req.RequestID, RunID: opts.RunID}); err != nil {
+			return Report{}, fmt.Errorf("%w; %d work(s) already submitted are recorded in the journal", err, len(pending))
+		}
+		jobID, existing, err := submit(ctx, opts, work, req)
+		switch {
+		case err != nil:
+			var ambiguous *ambiguousSubmitError
+			if errors.As(err, &ambiguous) {
+				// The response was lost after the request was sent, so the
+				// daemon may already hold a committed job this process
+				// cannot name. Read the committed association rather than
+				// resubmitting: a resubmission finds a live job and mints a
+				// SECOND acquisition once the hidden one is terminal.
+				recovered, rerr := reconcileLostSubmit(ctx, opts, req)
+				if rerr != nil {
+					result.Outcome = SubmitAmbiguous
+					result.StopDetail = ambiguousDetail(ambiguous, rerr)
+					result.Verdict = VerdictMissed
+					report.Results = append(report.Results, result)
+					continue
+				}
+				jobID, existing, err = recovered, false, nil
+			} else {
+				result.Outcome = SubmitFailed
+				result.StopDetail = err.Error()
+				result.Verdict = VerdictMissed
+				report.noteJournalFailure(noteJournalResolved(opts, req.RequestID))
+				report.Results = append(report.Results, result)
+				continue
+			}
 		case existing && !opts.Force:
 			// Disclosed, never silently dropped: a skipped work changes what
 			// every rate below it is a rate OF.
 			report.Skipped = append(report.Skipped, Skip{Key: work.Key, Reason: "the daemon already holds a live job for this work; re-run with force to mint a new one", JobID: jobID})
+			report.noteJournalFailure(noteJournalResolved(opts, req.RequestID))
 			continue
 		}
 		result.JobID = jobID
 		result.CreatedByRun = !existing || opts.Force
 		result.submittedAt = opts.now()
+		report.noteJournalFailure(noteJournal(opts, JournalEntry{CohortID: opts.Cohort.ID, WorkKey: work.Key, RequestID: req.RequestID, JobID: jobID, RunID: opts.RunID}))
 		report.Results = append(report.Results, result)
 		pending = append(pending, &report.Results[len(report.Results)-1])
 	}
@@ -201,6 +293,12 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		if row.Verdict == "" {
 			row.Verdict = grade(row.Expected, row.Outcome)
 		}
+		// An outcome the report NAMES is accounted for: it carries its job
+		// id, so a later run may measure the work again. An unresolved
+		// ambiguity deliberately stays in the journal.
+		if row.Outcome != SubmitAmbiguous && row.RequestID != "" {
+			report.noteJournalFailure(noteJournalResolved(opts, row.RequestID))
+		}
 	}
 	report.FinishedAt = opts.now().UTC().Format(time.RFC3339)
 	report.summarize()
@@ -208,17 +306,180 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 }
 
 // submit sends one work and returns its job id.
-func submit(ctx context.Context, opts Options, work bench.Work) (string, bool, error) {
+func submit(ctx context.Context, opts Options, work bench.Work, req protocol.WorkRequest) (string, bool, error) {
 	params := submitParams{
-		Request:    workRequest(work, opts.RunID),
+		Request:    req,
 		AutoImport: new(false),
 		Force:      opts.Force,
 	}
 	var result api.SubmitV2Result
 	if err := opts.Caller.Call(ctx, "acquire.submit_v2", params, &result); err != nil {
-		return "", false, err
+		if isRefusal(err) {
+			return "", false, err
+		}
+		return "", false, &ambiguousSubmitError{requestID: req.RequestID, cause: err}
 	}
 	return result.JobID, result.Existing, nil
+}
+
+// ambiguousSubmitError says the submission RPC failed after the request
+// was sent, so the run cannot prove the daemon did not commit a job.
+type ambiguousSubmitError struct {
+	requestID string
+	cause     error
+}
+
+func (e *ambiguousSubmitError) Error() string {
+	base := "livecohort: submission may have committed before its response was lost"
+	if e != nil && e.requestID != "" {
+		base += " for request " + e.requestID
+	}
+	if e == nil || e.cause == nil {
+		return base
+	}
+	return base + ": " + e.cause.Error()
+}
+
+func (e *ambiguousSubmitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// isRefusal reports whether the daemon answered and refused the work.
+// A classified RemoteError is an answer, even when it fails the run: the
+// daemon produced it instead of a job, so no hidden acquisition can sit
+// behind it. Any other error may have struck after the commit, on a
+// response the caller never saw.
+func isRefusal(err error) bool {
+	var remote *ipc.RemoteError
+	return errors.As(err, &remote)
+}
+
+// reconcileLostSubmit names the job a lost submission may have committed,
+// by READING the committed association for its request id.
+//
+// It never resubmits. The daemon deduplicates a request id against live
+// jobs only (internal/job/job.go createRequest), so a resubmission that
+// arrives after the hidden job turned terminal creates a SECOND
+// acquisition for the same paper — the duplicate this whole path exists
+// to prevent. The read finds the job in every state, including terminal.
+//
+// Without a lookup the ambiguity stands: the caller reports it with its
+// request id rather than guessing.
+func reconcileLostSubmit(ctx context.Context, opts Options, req protocol.WorkRequest) (string, error) {
+	if opts.Lookup == nil {
+		return "", errors.New("livecohort: no store lookup available, so the submitted job cannot be named; resolve request " + req.RequestID + " by hand")
+	}
+	timeout := reconcileTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	// The recovery runs on its own clock: the measurement context is
+	// cancelled on exactly the interrupt that needs recovering.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	// The daemon commits before it answers, but the commit and the lost
+	// response race, so the read is retried until the window closes.
+	ticker := time.NewTicker(reconcilePoll)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		jobID, _, found, err := opts.Lookup.JobForRequest(rctx, req.RequestID)
+		switch {
+		case err != nil:
+			lastErr = err
+		case found && jobID != "":
+			return jobID, nil
+		default:
+			lastErr = errors.New("no committed job for request " + req.RequestID)
+		}
+		select {
+		case <-rctx.Done():
+			return "", lastErr
+		case <-ticker.C:
+		}
+	}
+}
+
+// resolvePriorSubmission reports what became of an earlier run's
+// unaccounted submission, and whether it is now accounted for.
+func resolvePriorSubmission(ctx context.Context, opts Options, entry JournalEntry) (Skip, bool) {
+	skip := Skip{Key: entry.WorkKey, JobID: entry.JobID}
+	jobID := entry.JobID
+	state := ""
+	if opts.Lookup != nil {
+		if found, foundState, ok, err := opts.Lookup.JobForRequest(ctx, entry.RequestID); err == nil && ok {
+			jobID, state = found, foundState
+		}
+	}
+	if jobID == "" {
+		skip.Reason = "run " + entry.RunID + " lost the response to request " + entry.RequestID +
+			" and no job can be found for it; submitting again could duplicate a real acquisition, so check `papio jobs list` and re-run with force"
+		return skip, false
+	}
+	skip.JobID = jobID
+	if state == "" {
+		state = "of unknown state"
+	}
+	skip.Reason = "run " + entry.RunID + " already submitted this work as request " + entry.RequestID +
+		"; its job " + jobID + " is " + state + ", so this run did not ask for the paper again — re-run with force to mint a new job"
+	return skip, true
+}
+
+func ambiguousDetail(cause *ambiguousSubmitError, reconcileErr error) string {
+	detail := cause.Error()
+	if reconcileErr != nil && reconcileErr.Error() != "" {
+		detail += "; reconcile: " + reconcileErr.Error()
+	}
+	return detail
+}
+
+// unresolvedByWork indexes the journal entries no run has accounted for.
+//
+// A journal this run cannot read is a failure, never an empty journal: the
+// entries it holds are what keep this run from submitting a paper an
+// earlier run already asked for, so reading them is a precondition of
+// submitting at all.
+func unresolvedByWork(opts Options) (map[string]JournalEntry, error) {
+	if opts.Journal == nil {
+		return nil, nil
+	}
+	entries, err := opts.Journal.Unresolved(opts.Cohort.ID)
+	if err != nil {
+		return nil, fmt.Errorf("livecohort: reading the submission journal: %w", err)
+	}
+	byWork := make(map[string]JournalEntry, len(entries))
+	for _, entry := range entries {
+		byWork[entry.WorkKey] = entry
+	}
+	return byWork, nil
+}
+
+// noteJournal records one association. Its error is the caller's to act on:
+// an association that was not written cannot protect the next run.
+func noteJournal(opts Options, entry JournalEntry) error {
+	if opts.Journal == nil {
+		return nil
+	}
+	if err := opts.Journal.Note(entry); err != nil {
+		return fmt.Errorf("livecohort: recording request %s in the submission journal: %w", entry.RequestID, err)
+	}
+	return nil
+}
+
+// noteJournalResolved marks one request accounted for and reports a write
+// it could not make, because an entry that stayed unresolved silently would
+// refuse the work on every later run.
+func noteJournalResolved(opts Options, requestID string) error {
+	if opts.Journal == nil || requestID == "" {
+		return nil
+	}
+	if err := opts.Journal.Resolve(requestID); err != nil {
+		return fmt.Errorf("livecohort: marking request %s accounted for in the submission journal: %w", requestID, err)
+	}
+	return nil
 }
 
 // submitParams mirrors the ratified acquire.submit_v2 params. auto_import is
@@ -452,6 +713,15 @@ func cleanup(ctx context.Context, opts Options, pending []*Result) (cancelled, k
 	if !opts.Cleanup {
 		return nil, nil
 	}
+	// An interrupted run still cancels: the measurement context is
+	// already done on exactly the path that needs cleanup most, so this
+	// pass runs on its own bounded clock instead of inheriting it.
+	timeout := cleanupTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
 	for _, row := range pending {
 		if !row.CreatedByRun || row.JobID == "" {
 			continue
@@ -461,20 +731,20 @@ func cleanup(ctx context.Context, opts Options, pending []*Result) (cancelled, k
 			continue
 		}
 		switch row.Outcome {
-		case Unavailable, Failed, Cancelled, SubmitFailed:
+		case Unavailable, Failed, Cancelled, SubmitFailed, SubmitAmbiguous:
 			continue
 		}
 		var result map[string]any
-		if err := opts.Caller.Call(ctx, "jobs.cancel", map[string]string{"job_id": row.JobID}, &result); err != nil {
-			row.CleanupNote = err.Error()
+		if err := opts.Caller.Call(cctx, "jobs.cancel", map[string]string{"job_id": row.JobID}, &result); err != nil {
+			row.CleanupNote = "cancellation unconfirmed for " + row.JobID + ": " + err.Error()
 			continue
 		}
 		// Cancel is a successful no-op for terminal jobs. A browser download
 		// can complete after measurement, so read the committed state rather
 		// than reporting the earlier parked observation as a cancellation.
-		detail, err := jobDetail(ctx, opts, row.JobID)
+		detail, err := jobDetail(cctx, opts, row.JobID)
 		if err != nil {
-			row.CleanupNote = err.Error()
+			row.CleanupNote = "cancellation of " + row.JobID + " unconfirmed: " + err.Error()
 			continue
 		}
 		if detail.Job.State == job.StateReady || detail.Job.State == job.StateImported {
@@ -482,7 +752,7 @@ func cleanup(ctx context.Context, opts Options, pending []*Result) (cancelled, k
 			continue
 		}
 		if detail.Job.State != job.StateCancelled {
-			row.CleanupNote = fmt.Sprintf("job is %s after cancellation", detail.Job.State)
+			row.CleanupNote = row.JobID + " is " + detail.Job.State + " after cancellation, so it may still be running"
 			continue
 		}
 		row.CleanedUp = true
