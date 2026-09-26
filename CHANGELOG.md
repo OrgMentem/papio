@@ -71,6 +71,44 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **Interrupted exports no longer damage an existing bundle.** Export refuses
+  another job at the same destination. A failed ledger write restores the
+  earlier manifest. A retry can replace a truncated PDF only when its bytes
+  match the start of the verified source; other files stay untouched.
+- **A lost live-cohort submit response no longer hides a job or causes a
+  repeat acquisition.** The tool records each request before submission,
+  checks the store for its job even after that job finishes, and names
+  unresolved requests in its report. An interrupted run still tries to cancel
+  its unfinished jobs and lists every uncertain cancellation.
+- **Notification failures remain visible without repeat webhook POSTs.**
+  Webhooks carry a stable delivery key. The daemon claims each send before
+  posting, records failed attempts, and does not resend after an uncertain
+  result. A watch, retraction sweep, or paused drive can recover a notice it
+  recorded but did not route.
+- **Watch scans report incomplete evidence.** A failed discovery backend
+  appears in the watch result, and a stale Zotero ownership lookup cannot
+  record a paper as newly unowned. New-work alerts survive a restart between
+  the digest write and notification routing.
+- **Zotero follow-ups recover after interrupted imports and temporary
+  outages.** Missing collection filing and metadata work resumes from the
+  recorded import. Bounded retries cover rate limits, server errors, and
+  refused connections without repeating the import.
+- **A delivery request cannot submit a second ILLiad POST after an uncertain
+  first attempt.** Reassignment consults the first job's submission record.
+  Provider requests have a server-side deadline; uncertain outcomes enter
+  read-only reconciliation instead of blind resubmission.
+- **Maintenance failures now name the failing runner in the daemon log and
+  `papio doctor`.** Successful passes clear the warning. A stalled holdings
+  file read no longer blocks every other maintenance runner.
+- **The inbox reports an unreadable retraction cache instead of an empty
+  result.** Interrupted capture pin writes no longer keep evidence forever,
+  and the extension checks the durable status of completed PDF grabs after
+  it restarts.
+- **Interrupted setup and filing can recover.** Credential status shows a
+  staged OS-store reference after a failed config write. A same-day batch
+  retry reuses the recorded job, even if that job is terminal. A ready PDF
+  with no on-ready hook attempt gets one after restart; uncertain hook
+  launches stay available for manual review.
 - **An open-access copy behind a bot challenge now opens in the browser.**
   Some repositories answer a download with an AWS WAF challenge: HTTP 202,
   an empty body, and the header `x-amzn-waf-action: challenge`. *papio*
