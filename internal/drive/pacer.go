@@ -33,6 +33,11 @@ const (
 	// is the pause state, so it survives a daemon restart.
 	PausedEvent  = "drive.paused"
 	ResumedEvent = "drive.resumed"
+	// PausedNotifiedEvent marks that one pause episode's sign-in notice reached
+	// the notification ledger. It is a third system-event kind on purpose: the
+	// pause state stays the newest of Paused/Resumed while restarts can tell a
+	// pause that was never announced from one that was.
+	PausedNotifiedEvent = "drive.pause_notified"
 	// SignInStalledEvent settles a paced open whose provider asked for an
 	// institutional sign-in that did not return within sign_in_wait. It
 	// carries "until": the paper's route stays cooled until then.
@@ -249,6 +254,16 @@ func (p *Pacer) RunDue(ctx context.Context) error {
 			return err
 		}
 	}
+	// A pause that survives this pass still owes its sign-in notice when the
+	// pause commit outlived the Route: a crash between them, or a Route
+	// failure, otherwise silences the episode forever because later passes see
+	// eval.Paused and never come back to pauseForSignIn. Pauses that just
+	// cleared resume above with no notice: the sign-in already returned.
+	if eval.Paused && eval.PausedReason == PauseSignIn {
+		if err := p.ensurePauseNotified(ctx); err != nil {
+			return err
+		}
+	}
 	if len(eval.Blockers) > 0 || eval.Next == nil {
 		return nil
 	}
@@ -422,35 +437,123 @@ func (p *Pacer) jobDOIPrefix(ctx context.Context, jobID string) string {
 }
 
 func (p *Pacer) pauseForSignIn(ctx context.Context, now time.Time, shared sharedSignIn) error {
+	pausedAt := now.UTC()
+	window := p.pauseNoticeWindow()
+	windowStart := pausedAt.Truncate(window)
+	key := "drive:paused:" + pausedAt.Format(time.RFC3339Nano)
+	var jobID string
+	if len(shared.jobs) > 0 {
+		jobID = shared.jobs[0]
+	}
 	if err := p.Jobs.S.RecordSystemEvent(ctx, PausedEvent, map[string]any{
 		"reason": PauseSignIn, "trigger": "consecutive_sign_in_stalls", "jobs": shared.jobs,
-		"paused_at": now.UTC().Format(time.RFC3339Nano),
+		"paused_at": pausedAt.Format(time.RFC3339Nano), "notify_key": key,
+		"window_start": windowStart.Format(time.RFC3339Nano),
 	}); err != nil {
 		return err
 	}
 	if p.Notifier == nil {
 		return nil
 	}
-	// The pause event is durable before routing, so a restart never repeats
-	// the notice: the next pass reads the pause and does not come back here.
-	message := "papio paused its paced drive: sign-ins for two papers from different providers did not come back. Sign in to your library in the browser; the drive resumes when a sign-in returns, or run papio drive resume."
+	// The pause event is durable before routing, so a restart can tell a pause
+	// that was never announced from one that was and retry the notice under
+	// the same episode key instead of losing it or duplicating it.
+	if err := p.Notifier.Route(context.WithoutCancel(ctx), pauseSignInNotice(pausedAt, windowStart, jobID, key)); err != nil {
+		log.Printf("papio: drive: routing the sign-in pause notice: %v", err)
+		return nil
+	}
+	return p.Jobs.S.RecordSystemEvent(ctx, PausedNotifiedEvent, map[string]any{
+		"reason": PauseSignIn, "notify_key": key,
+		"notified_at": p.now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// ensurePauseNotified routes the sign-in notice for the current pause episode
+// when it carries this binary's episode key but no notified marker: the pause
+// commit outlived the Route (crash) or the Route failed. Pauses without an
+// episode key predate it and are left alone; their notice may already have
+// been sent. Marking never lifts the pause.
+func (p *Pacer) ensurePauseNotified(ctx context.Context) error {
+	latest, found, err := p.Jobs.LatestSystemEvent(ctx, PausedEvent, ResumedEvent)
+	if err != nil || !found || latest.Kind != PausedEvent {
+		return err
+	}
+	if reason, _ := latest.Detail["reason"].(string); reason != PauseSignIn {
+		return nil
+	}
+	key, _ := latest.Detail["notify_key"].(string)
+	if key == "" {
+		return nil
+	}
+	markers, err := p.Jobs.EventsOfKind(ctx, PausedNotifiedEvent, 1000)
+	if err != nil {
+		return err
+	}
+	for _, marker := range markers {
+		if marked, _ := marker.Detail["notify_key"].(string); marked == key {
+			return nil
+		}
+	}
+	if p.Notifier == nil {
+		return nil
+	}
+	pausedAt := eventTime(latest, "paused_at")
+	windowStart := pausedAt.UTC().Truncate(p.pauseNoticeWindow())
+	if stored, ok := latest.Detail["window_start"].(string); ok {
+		if parsed, parseErr := time.Parse(time.RFC3339Nano, stored); parseErr == nil {
+			windowStart = parsed
+		}
+	}
+	if err := p.Notifier.Route(context.WithoutCancel(ctx), pauseSignInNotice(pausedAt, windowStart, pauseEpisodeJobID(latest.Detail), key)); err != nil {
+		log.Printf("papio: drive: routing the sign-in pause notice: %v", err)
+		return nil
+	}
+	return p.Jobs.S.RecordSystemEvent(ctx, PausedNotifiedEvent, map[string]any{
+		"reason": PauseSignIn, "notify_key": key,
+		"notified_at": p.now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// pauseNoticeWindow is the notification coalescing window for the sign-in
+// pause notice: retries of one episode must share it to coalesce.
+func (p *Pacer) pauseNoticeWindow() time.Duration {
 	window := 5 * time.Minute
 	if policy, err := notify.ResolvePolicy(p.Config.Notify); err == nil {
 		if configured := policy.For(notify.CategoryDecisionOpened).Window; configured > 0 {
 			window = configured
 		}
 	}
-	jobID := shared.jobs[0]
-	intent := notify.Intent{
+	return window
+}
+
+// pauseSignInNotice builds the sign-in pause notification for one pause
+// episode. The aggregate key names the episode (its pause timestamp), never
+// the send time, so a retried route coalesces instead of duplicating.
+func pauseSignInNotice(pausedAt, windowStart time.Time, jobID, key string) notify.Intent {
+	message := "papio paused its paced drive: sign-ins for two papers from different providers did not come back. Sign in to your library in the browser; the drive resumes when a sign-in returns, or run papio drive resume."
+	return notify.Intent{
 		EventKind: PausedEvent, Category: notify.CategoryDecisionOpened, Phase: notify.PhaseOpened,
-		AggregateKey: "drive:paused:" + now.UTC().Format(time.RFC3339Nano),
-		WindowStart:  now.UTC().Truncate(window), JobID: jobID, HappenedAt: now.UTC(),
+		AggregateKey: key,
+		WindowStart:  windowStart, JobID: jobID, HappenedAt: pausedAt,
 		Message: message, Detail: notify.Event{Kind: PausedEvent, Message: message, Count: 1},
 	}
-	if err := p.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
-		log.Printf("papio: drive: routing the sign-in pause notice: %v", err)
+}
+
+// pauseEpisodeJobID recovers the episode's representative job from a pause
+// event that already crossed the JSON store boundary.
+func pauseEpisodeJobID(detail map[string]any) string {
+	switch jobs := detail["jobs"].(type) {
+	case []string:
+		if len(jobs) > 0 {
+			return jobs[0]
+		}
+	case []any:
+		if len(jobs) > 0 {
+			id, _ := jobs[0].(string)
+			return id
+		}
 	}
-	return nil
+	return ""
 }
 
 func (p *Pacer) pauseState(ctx context.Context) (paused bool, reason string, err error) {

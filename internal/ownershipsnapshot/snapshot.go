@@ -25,6 +25,13 @@ import (
 	"papio/internal/ownership"
 )
 
+// refreshWaitBound caps how long one Lookup waits for an in-flight filesystem
+// refresh before answering from the last known index. The worker keeps its
+// single attempt running to publish for the next lookup; the waiter must not
+// hold maintenance behind a stalled file. Tests override it; production keeps
+// it generous enough for a cold 32 MiB parse on slow storage.
+var refreshWaitBound = 10 * time.Second
+
 // defaultMaxBytes caps one snapshot read. A bibliographic export of a large
 // personal library is a few megabytes; anything past this is more likely a
 // mistargeted path than a library, and reading it would stall every lookup.
@@ -71,7 +78,6 @@ func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.P
 		maxBytes: defaultMaxBytes,
 		now:      now,
 		current:  empty,
-		refresh:  make(chan struct{}, 1),
 		read:     readBounded,
 		identity: fileIdentity,
 	}, nil
@@ -165,12 +171,15 @@ type fileProvider struct {
 	maxBytes int64
 	now      func() time.Time
 
-	// refresh is a cancellable single-flight gate. The mutex only protects the
-	// published immutable snapshot and diagnostics; no caller holds it while
-	// doing filesystem I/O or parsing.
-	refresh chan struct{}
+	// pending is the single in-flight filesystem refresh. Every Lookup that
+	// arrives while it runs waits on the same worker instead of starting
+	// another reader, so a stalled file can never spawn unbounded replacements.
+	// The mutex only protects the published immutable snapshot, the pending
+	// worker, and diagnostics; no caller holds it while doing filesystem I/O
+	// or parsing.
 	mu      sync.RWMutex
 	current *snapshot
+	pending *pendingRefresh
 	reads   int
 	read    func(context.Context, io.Reader) ([]byte, error)
 	// identity is per-provider so tests can exercise the metadata-less fallback
@@ -178,11 +187,25 @@ type fileProvider struct {
 	identity func(*os.File, os.FileInfo) fileID
 }
 
+// pendingRefresh is one filesystem refresh shared by every Lookup that
+// arrives while it runs. Waiters leave on their own context or on
+// refreshWaitBound; the worker always runs its single attempt to completion
+// so the next lookup answers from a published result.
+type pendingRefresh struct {
+	done     chan struct{}
+	snap     *snapshot
+	complete bool
+	failure  string
+}
+
 func (p *fileProvider) Name() string { return p.name }
 
 // Lookup refreshes the index when the file has changed, then answers from it.
 // A failed refresh preserves the last immutable index as annotation, but marks
-// its claims stale so uncertainty never suppresses an acquisition.
+// its claims stale so uncertainty never suppresses an acquisition. A refresh
+// stuck on a stalled file never holds the caller past its context or
+// refreshWaitBound: the waiter keeps the previous index as incomplete while
+// the single worker finishes for the next lookup.
 func (p *fileProvider) Lookup(ctx context.Context, queries []ownership.Query) ([][]ownership.Claim, ownership.SourceHealth) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -190,19 +213,39 @@ func (p *fileProvider) Lookup(ctx context.Context, queries []ownership.Query) ([
 	if ctx.Err() != nil {
 		return p.answer(p.currentSnapshot(), false, ownership.FailureTimeout, queries)
 	}
-
+	pend := p.startRefresh(ctx)
+	timer := time.NewTimer(refreshWaitBound)
+	defer timer.Stop()
 	select {
-	case p.refresh <- struct{}{}:
-		defer func() { <-p.refresh }()
+	case <-pend.done:
+		return p.answer(pend.snap, pend.complete, pend.failure, queries)
 	case <-ctx.Done():
 		return p.answer(p.currentSnapshot(), false, ownership.FailureTimeout, queries)
-	}
-	if ctx.Err() != nil {
+	case <-timer.C:
 		return p.answer(p.currentSnapshot(), false, ownership.FailureTimeout, queries)
 	}
+}
 
-	snap, complete, failure := p.refreshSnapshot(ctx)
-	return p.answer(snap, complete, failure, queries)
+// startRefresh attaches to the in-flight refresh or starts its single worker.
+// The worker runs detached from any one waiter's cancellation so an abandoned
+// wait cannot cancel the attempt a later lookup is already sharing.
+func (p *fileProvider) startRefresh(ctx context.Context) *pendingRefresh {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pending != nil {
+		return p.pending
+	}
+	pend := &pendingRefresh{done: make(chan struct{})}
+	p.pending = pend
+	go func() {
+		snap, complete, failure := p.refreshSnapshot(context.WithoutCancel(ctx))
+		p.mu.Lock()
+		pend.snap, pend.complete, pend.failure = snap, complete, failure
+		p.pending = nil
+		p.mu.Unlock()
+		close(pend.done)
+	}()
+	return pend
 }
 
 func (p *fileProvider) answer(snap *snapshot, complete bool, failure string, queries []ownership.Query) ([][]ownership.Claim, ownership.SourceHealth) {

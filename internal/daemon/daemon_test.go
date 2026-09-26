@@ -889,3 +889,87 @@ func TestSchedulerSurfacesLeaseReleaseFailure(t *testing.T) {
 		})
 	}
 }
+
+type failingMaintenance struct {
+	err error
+}
+
+func (m *failingMaintenance) RunDue(context.Context) error { return m.err }
+
+// A failing maintenance runner must stay visible while workers keep running:
+// every runner's error is named and kept until a clean pass clears it.
+func TestMaintenanceFailuresNameFailingRunnersUntilACleanPass(t *testing.T) {
+	boom := errors.New("intent store unavailable")
+	scheduler, err := NewScheduler(
+		&fakeLeaseStore{heartbeats: make(chan struct{}, 1)},
+		ProcessorFunc(func(context.Context, *job.Row) error { return nil }),
+		SchedulerConfig{
+			Owner: "maintenance-health", LeaseDuration: time.Second, HeartbeatInterval: 100 * time.Millisecond,
+			PollInterval: time.Millisecond,
+			Maintenance: MaintenanceRunners{
+				&failingMaintenance{err: boom},
+				&fakeMaintenance{calls: make(chan struct{}, 1)},
+			},
+			MaintenanceInterval: time.Hour,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.runMaintenancePass(context.Background())
+	failures := scheduler.MaintenanceFailures()
+	if len(failures) != 1 {
+		t.Fatalf("failures = %v, want one named failure", failures)
+	}
+	for name, failure := range failures {
+		if !strings.Contains(name, "failingMaintenance") {
+			t.Fatalf("failure name = %q, want the failing runner type", name)
+		}
+		if !errors.Is(failure, boom) {
+			t.Fatalf("failure = %v, want %v", failure, boom)
+		}
+	}
+	if status := scheduler.MaintenanceStatus(); !strings.Contains(status, "degraded") {
+		t.Fatalf("status = %q, want a degraded signal", status)
+	}
+	healthy, err := NewScheduler(
+		&fakeLeaseStore{heartbeats: make(chan struct{}, 1)},
+		ProcessorFunc(func(context.Context, *job.Row) error { return nil }),
+		SchedulerConfig{
+			Owner: "maintenance-health", LeaseDuration: time.Second, HeartbeatInterval: 100 * time.Millisecond,
+			PollInterval: time.Millisecond,
+			Maintenance: MaintenanceRunners{
+				&fakeMaintenance{calls: make(chan struct{}, 1)},
+			},
+			MaintenanceInterval: time.Hour,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy.maintenanceErr = scheduler.maintenanceErr
+	healthy.runMaintenancePass(context.Background())
+	if failures := healthy.MaintenanceFailures(); len(failures) != 0 {
+		t.Fatalf("failures after a clean pass = %v, want none", failures)
+	}
+	if status := healthy.MaintenanceStatus(); status != "" {
+		t.Fatalf("status after a clean pass = %q, want empty", status)
+	}
+}
+
+// Every runner in one pass reports under its own name, even for repeats.
+func TestMaintenanceRunnersReportEveryOutcomeByName(t *testing.T) {
+	first := &fakeMaintenance{calls: make(chan struct{}, 1)}
+	second := &fakeMaintenance{calls: make(chan struct{}, 1)}
+	runners := MaintenanceRunners{first, nil, second}
+	errs := runners.RunDueAll(context.Background())
+	if len(errs) != 2 {
+		t.Fatalf("outcomes = %v, want two named outcomes", errs)
+	}
+	if _, ok := errs["*daemon.fakeMaintenance"]; !ok {
+		t.Fatalf("outcomes = %v, want the base runner name", errs)
+	}
+	if _, ok := errs["*daemon.fakeMaintenance#2"]; !ok {
+		t.Fatalf("outcomes = %v, want the repeated runner disambiguated", errs)
+	}
+}

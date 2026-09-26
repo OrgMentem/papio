@@ -560,3 +560,43 @@ func TestPacerHonoursQuietHours(t *testing.T) {
 		t.Fatalf("opened %v with blockers %v inside quiet hours", h.browser.opened, status.Blockers)
 	}
 }
+
+// A crash between the pause commit and the sign-in notice must not silence
+// the episode: the next pass retries the notice under the same episode key
+// instead of pausing again, and the retry does not duplicate a notice that
+// already went out.
+func TestPauseNoticeRetriesAfterACrashBetweenPauseAndRoute(t *testing.T) {
+	newUnannouncedPause := func(t *testing.T) *harness {
+		h := newHarness(t, true)
+		first := h.park("wr_pause_retry_a", "10.1111/a", "openurl_handoff")
+		second := h.park("wr_pause_retry_b", "10.2222/b", "openurl_handoff")
+		h.run()
+		h.stallSignIn(first)
+		h.clock = h.clock.Add(11 * time.Minute)
+		h.run()
+		h.stallSignIn(second)
+		h.clock = h.clock.Add(11 * time.Minute)
+		// This pass pauses without a notifier, so only the pause episode
+		// survives, exactly like a kill after RecordSystemEvent.
+		h.pacer.Notifier = nil
+		h.run()
+		if status := h.status(); !status.Paused || len(h.sink.intents) != 0 {
+			t.Fatalf("status = %+v with %d notices, want an unannounced pause", status, len(h.sink.intents))
+		}
+		h.pacer.Notifier = h.sink
+		return h
+	}
+	h := newUnannouncedPause(t)
+	opensBefore := len(h.browser.openedJobs())
+	h.run()
+	if len(h.sink.intents) != 1 {
+		t.Fatalf("notices = %d, want exactly one retried pause notice", len(h.sink.intents))
+	}
+	if got := len(h.browser.openedJobs()); got != opensBefore {
+		t.Fatalf("opened %d jobs after the retry, want no new open while paused", got)
+	}
+	h.run()
+	if len(h.sink.intents) != 1 {
+		t.Fatalf("notices = %d after a second pass, want no duplicate", len(h.sink.intents))
+	}
+}

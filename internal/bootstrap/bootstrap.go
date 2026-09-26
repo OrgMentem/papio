@@ -58,6 +58,7 @@ import (
 	"papio/internal/watch"
 	"papio/internal/work"
 	"papio/internal/zotio"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -689,10 +690,28 @@ func (s *System) Close() error {
 // DoctorReport runs readiness checks against this live system without exposing
 // credentials or opening a second database connection.
 func (s *System) DoctorReport(ctx context.Context) doctor.Report {
+	var report doctor.Report
 	if s.Credentials == nil {
-		return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery)
+		report = doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery)
+	} else {
+		report = doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery, s.Credentials)
 	}
-	return doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery, s.Credentials)
+	if s.Scheduler != nil {
+		failures := s.Scheduler.MaintenanceFailures()
+		if len(failures) > 0 {
+			names := make([]string, 0, len(failures))
+			for name := range failures {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			report.Checks = append(report.Checks, doctor.Check{
+				Name: "maintenance", Status: doctor.Warn,
+				Detail:      "maintenance runners failed: " + strings.Join(names, ", "),
+				Remediation: "inspect the daemon log for the failure; run papio doctor again after repair",
+			})
+		}
+	}
+	return report
 }
 
 // metadataDisableKeepAlives aggregates every configured source's keep-alive

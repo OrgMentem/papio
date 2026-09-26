@@ -452,8 +452,9 @@ func TestStarterSaysWhenItWaitsForTheIntegrityCheck(t *testing.T) {
 	starter := f.starter(func(status Status) { notices <- status })
 	// The check is announced once it outlasts checkingNotice; any wait does.
 	starter.checkingNotice = time.Nanosecond
-	// Bounds only a failing run, which would otherwise wait ten minutes.
-	starter.MaxWait = 5 * time.Second
+	// Allow the race-enabled migration and integrity check to finish after
+	// release. This bound only limits a broken test, not daemon startup.
+	starter.MaxWait = 30 * time.Second
 	done := make(chan error, 1)
 	go func() {
 		_, err := starter.EnsureWithResult(context.Background())

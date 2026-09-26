@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -61,16 +63,82 @@ type MaintenanceRunners []MaintenanceRunner
 
 // RunDue runs each non-nil runner once and returns the first error, if any.
 func (rs MaintenanceRunners) RunDue(ctx context.Context) error {
-	var firstErr error
+	names := rs.runnerNames()
+	errs := make(map[string]error, len(names))
+	ordered := make([]string, 0, len(names))
+	i := 0
 	for _, r := range rs {
 		if r == nil {
 			continue
 		}
-		if err := r.RunDue(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		name := names[i]
+		ordered = append(ordered, name)
+		errs[name] = r.RunDue(ctx)
+		i++
+	}
+	for _, name := range ordered {
+		if err := errs[name]; err != nil {
+			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
-	return firstErr
+	return nil
+}
+
+// RunDueAll runs each non-nil runner once and reports every runner's outcome
+// by name, so operators can see which maintenance keeps failing without
+// stopping acquisition workers. Nil runners are skipped; a nil runner would
+// report an empty name and hide the failure.
+func (rs MaintenanceRunners) RunDueAll(ctx context.Context) map[string]error {
+	names := rs.runnerNames()
+	errs := make(map[string]error, len(names))
+	i := 0
+	for _, r := range rs {
+		if r == nil {
+			continue
+		}
+		errs[names[i]] = r.RunDue(ctx)
+		i++
+	}
+	return errs
+}
+
+// runnerNames lists the disambiguated diagnostic name of each non-nil runner
+// in order, so RunDue and RunDueAll agree on identity.
+func (rs MaintenanceRunners) runnerNames() []string {
+	names := make([]string, 0, len(rs))
+	for _, r := range rs {
+		if r == nil {
+			continue
+		}
+		names = append(names, runnerName(r))
+	}
+	return disambiguateRunnerNames(names)
+}
+
+// runnerName names one maintenance runner for diagnostics. Pointer receivers
+// report their concrete type; disambiguateRunnerNames makes repeats unique.
+func runnerName(r MaintenanceRunner) string {
+	name := fmt.Sprintf("%T", r)
+	if name == "" || name == "<nil>" {
+		return "unknown"
+	}
+	return name
+}
+
+// disambiguateRunnerNames appends a "#n" suffix to a repeated runner type so a
+// name always identifies exactly one runner in one pass.
+func disambiguateRunnerNames(names []string) []string {
+	seen := make(map[string]int, len(names))
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		seen[name]++
+		if seen[name] == 1 {
+			out = append(out, name)
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s#%d", name, seen[name]))
+	}
+	return out
 }
 
 // BackgroundRunner is a long-lived best-effort loop that runs beside
@@ -99,6 +167,9 @@ type Scheduler struct {
 	Store     LeaseStore
 	Processor Processor
 	Config    SchedulerConfig
+
+	maintenanceMu  sync.Mutex
+	maintenanceErr map[string]error
 }
 
 // NewScheduler validates configuration and returns a scheduler ready for Run.
@@ -235,7 +306,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 func (s *Scheduler) maintenance(ctx context.Context) {
 	if s.Config.Maintenance != nil {
-		_ = s.Config.Maintenance.RunDue(ctx)
+		s.runMaintenancePass(ctx)
 	}
 	s.sweepTerminalQuarantine(ctx)
 	if s.Config.Maintenance == nil {
@@ -248,10 +319,131 @@ func (s *Scheduler) maintenance(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = s.Config.Maintenance.RunDue(ctx)
+			s.runMaintenancePass(ctx)
 			s.sweepTerminalQuarantine(ctx)
 		}
 	}
+}
+
+// runMaintenancePass runs one maintenance pass and remembers per-runner
+// failures for diagnostics. Failures are best-effort: they are logged and
+// surfaced through MaintenanceFailures/Status, never returned to stop
+// acquisition workers.
+func (s *Scheduler) runMaintenancePass(ctx context.Context) {
+	multi, ok := s.Config.Maintenance.(MaintenanceRunners)
+	if !ok {
+		if err := s.Config.Maintenance.RunDue(ctx); err != nil {
+			log.Printf("papio: maintenance failed: %v", err)
+			s.setMaintenanceFailure("maintenance", err)
+		} else {
+			s.clearMaintenanceFailures()
+		}
+		return
+	}
+	errs := multi.RunDueAll(ctx)
+	failed := false
+	for _, name := range multi.runnerNames() {
+		if err := errs[name]; err != nil {
+			failed = true
+			log.Printf("papio: maintenance %s failed: %v", name, err)
+			s.setMaintenanceFailure(name, err)
+		} else {
+			s.clearMaintenanceFailure(name)
+		}
+	}
+	if !failed {
+		s.clearMaintenanceFailures()
+	}
+}
+
+// setMaintenanceFailure remembers one runner's latest maintenance failure.
+func (s *Scheduler) setMaintenanceFailure(name string, err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if s.maintenanceErr == nil {
+		s.maintenanceErr = make(map[string]error)
+	}
+	s.maintenanceErr[name] = err
+}
+
+// clearMaintenanceFailure drops one runner's remembered failure after it
+// succeeds, so a recovered runner stops looking degraded while a still-failing
+// sibling stays named.
+func (s *Scheduler) clearMaintenanceFailure(name string) {
+	if s == nil {
+		return
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	delete(s.maintenanceErr, name)
+}
+
+// clearMaintenanceFailures drops every remembered maintenance failure after a
+// clean pass. It runs on success, so a recovered runner stops looking
+// degraded.
+func (s *Scheduler) clearMaintenanceFailures() {
+	if s == nil {
+		return
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	s.maintenanceErr = nil
+}
+
+// MaintenanceFailures reports the latest failure per maintenance runner since
+// the last clean pass. An empty map means the last pass was clean or no pass
+// has run yet.
+func (s *Scheduler) MaintenanceFailures() map[string]error {
+	if s == nil {
+		return nil
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	if len(s.maintenanceErr) == 0 {
+		return nil
+	}
+	out := make(map[string]error, len(s.maintenanceErr))
+	for name, err := range s.maintenanceErr {
+		out[name] = err
+	}
+	return out
+}
+
+// MaintenanceStatus summarizes maintenance health for daemon diagnostics: one
+// line per failing runner, in name order for stable output. Empty means the
+// last pass was clean. Main owns the bootstrap/doctor seam; this is the data
+// it can expose: runner names come from runnerName (%T per runner, "#2" for
+// repeats) and per-runner errors persist until a clean pass clears them.
+func (s *Scheduler) MaintenanceStatus() string {
+	failures := s.MaintenanceFailures()
+	if len(failures) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(failures))
+	for name := range failures {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	lines := make([]string, 0, len(names))
+	for _, name := range names {
+		lines = append(lines, fmt.Sprintf("maintenance %s failed: %v", name, failures[name]))
+	}
+	return "degraded: " + joinLines(lines)
+}
+
+// joinLines joins status lines without pulling in strings for one call.
+func joinLines(lines []string) string {
+	out := ""
+	for i, line := range lines {
+		if i > 0 {
+			out += "; "
+		}
+		out += line
+	}
+	return out
 }
 
 // sweepTerminalQuarantine is best-effort maintenance. A cleanup failure must

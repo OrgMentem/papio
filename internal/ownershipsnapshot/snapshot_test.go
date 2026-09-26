@@ -757,3 +757,70 @@ func TestCancelledLookupReturnsWhileRefreshIsBlocked(t *testing.T) {
 		t.Fatalf("active refresh health = %+v", health)
 	}
 }
+
+// A read stuck past open must not hold maintenance: the timed-out waiter
+// reports the previous index as incomplete while the single worker publishes
+// for the next lookup, and a stuck file never spawns a second reader.
+func TestStalledReadReleasesWaiterAndKeepsOneReader(t *testing.T) {
+	oldBound := refreshWaitBound
+	refreshWaitBound = 50 * time.Millisecond
+	defer func() { refreshWaitBound = oldBound }()
+	dir := t.TempDir()
+	path := writeFile(t, dir, "refs.bib", oneEntryBibTeX("10.1000/one"))
+	provider := newTestProvider(t, path, config.LibraryClaimPDFPresent, time.Now)
+	queries := []ownership.Query{doiQuery("10.1000/one")}
+
+	reading := make(chan struct{})
+	var releaseOnce sync.Once
+	release := make(chan struct{})
+	var closeReadingOnce sync.Once
+	provider.read = func(ctx context.Context, reader io.Reader) ([]byte, error) {
+		closeReadingOnce.Do(func() { close(reading) })
+		select {
+		case <-release:
+			return readBounded(ctx, reader)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	stalled := make(chan ownership.SourceHealth, 1)
+	go func() {
+		_, health := provider.Lookup(context.Background(), queries)
+		stalled <- health
+	}()
+	<-reading
+	second := make(chan ownership.SourceHealth, 1)
+	go func() {
+		_, health := provider.Lookup(context.Background(), queries)
+		second <- health
+	}()
+
+	select {
+	case health := <-stalled:
+		if health.Complete || health.FailureCode != ownership.FailureTimeout || !health.Stale {
+			t.Fatalf("stalled health = %+v, want incomplete timeout", health)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled lookup did not release its waiter")
+	}
+	select {
+	case health := <-second:
+		if health.Complete || health.FailureCode != ownership.FailureTimeout || !health.Stale {
+			t.Fatalf("second health = %+v, want incomplete timeout", health)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second lookup did not release its waiter")
+	}
+	provider.mu.RLock()
+	reads := provider.reads
+	provider.mu.RUnlock()
+	if reads != 1 {
+		t.Fatalf("reads while one refresh is blocked = %d, want 1", reads)
+	}
+	releaseOnce.Do(func() { close(release) })
+	_, health := provider.Lookup(context.Background(), queries)
+	if !health.Complete {
+		t.Fatalf("health after the worker publishes = %+v, want complete", health)
+	}
+}
