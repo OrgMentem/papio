@@ -510,6 +510,11 @@ type Bridge struct {
 	// adoptionScanGate is a capacity-1 semaphore held for the full lifetime
 	// of one underlying root/dir listing.
 	adoptionScanGate chan struct{}
+	// captureOrphanPinsReconciled records the one-time pre-index-first orphan
+	// reconciliation. Index-first ordering makes new orphans impossible, so
+	// the full capture-tree scan runs at most once per bridge; a failure
+	// leaves the flag clear and the next poll retries. The caller holds b.mu.
+	captureOrphanPinsReconciled bool
 }
 
 type presenceLease struct {
@@ -10833,6 +10838,20 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 				}
 			}
 		}
+		// Pins without an index entry predate index-first ordering and are
+		// invisible to the release pass above while exempt from retention.
+		// Index-first ordering makes new orphans impossible, so this full
+		// tree scan runs once per bridge rather than on every two-second
+		// poll; an error retries on the next poll. The store holds its lock
+		// throughout the scan, so no live capture can be mid-flight while
+		// orphans are collected.
+		if !b.captureOrphanPinsReconciled {
+			if _, orphanErr := b.captureStore.ReleaseOrphanPendingPins(ctx); orphanErr != nil {
+				log.Printf("papio: capture orphan pin release: %v", orphanErr)
+			} else {
+				b.captureOrphanPinsReconciled = true
+			}
+		}
 	}
 	handoff := make(map[string]job.HumanAction, len(handoffJobs))
 	present := map[string]bool{}
@@ -11533,6 +11552,7 @@ jobLoop:
 			pending.delivered = true
 		}
 	}
+	var stagedGrabIDs []string
 	if b.grabs != nil {
 		pending, err := b.grabs.PendingNotifications(ctx, 10)
 		if err != nil {
@@ -11547,10 +11567,15 @@ jobLoop:
 				return nil, err
 			}
 			out = append(out, frame)
-			if err := b.grabs.MarkNotified(ctx, g.ID); err != nil {
-				log.Printf("papio: marking PDF grab notification %s: %v", g.ID, err)
-			}
+			stagedGrabIDs = append(stagedGrabIDs, g.ID)
 		}
+		// The durable notified_at mark is applied after the whole poll reply is
+		// built (see below), never while staging it: a later frame-construction
+		// failure discards this reply in Sync, and marking here would consume a
+		// notification the extension never observed. A crash after the mark but
+		// before delivery is recovered through the extension's terminal-status
+		// reconciliation, and a repeated push is duplicate-safe because the
+		// extension clears its correlation on first delivery.
 	}
 	if b.effectPermitAvailable() && b.jobs != nil {
 		if permit, _ := b.jobs.LiveEffectPermit(ctx); permit != nil && !b.effectPermitWorkerLive(permit) {
@@ -11612,6 +11637,11 @@ jobLoop:
 					return nil, err
 				}
 			}
+		}
+	}
+	for _, id := range stagedGrabIDs {
+		if err := b.grabs.MarkNotified(ctx, id); err != nil {
+			log.Printf("papio: marking PDF grab notification %s: %v", id, err)
 		}
 	}
 	return out, nil

@@ -962,11 +962,13 @@ func (s *Service) PendingNotifications(ctx context.Context, limit int) ([]*Grab,
 	return out, rows.Err()
 }
 
-// MarkNotified records that a terminal grab's outcome was pushed at least
-// once. Best-effort, at-most-once from the extension's point of view: a
-// push the extension never received (tab closed, daemon restarted mid-Sync)
-// is not retried — the grab's durable disposition already lives in this row
-// and, for job_created/already_owned, in the job itself.
+// MarkNotified records that a terminal grab's outcome was staged into a poll
+// reply the daemon is about to return. Poll stages frames first and marks only
+// after the whole reply is built, so a discarded reply never consumes its
+// notifications. A mark followed by a crash before delivery is recovered
+// through the extension's terminal-status reconciliation against this same row;
+// a repeated push is duplicate-safe because the extension clears its
+// correlation on first delivery.
 func (s *Service) MarkNotified(ctx context.Context, id string) error {
 	_, err := s.store.DB().ExecContext(ctx, `UPDATE pdf_grabs SET notified_at = ? WHERE id = ?`, store.Now(), id)
 	return err

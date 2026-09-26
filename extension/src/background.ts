@@ -10770,7 +10770,27 @@ export class Bridge {
         void this.finishAbandon(grabID, correlation);
         continue;
       }
-      if (item?.state === "complete") continue;
+      if (item?.state === "complete") {
+        // The daemon may have marked this grab notified in a poll reply the
+        // browser never observed (Sync discarded the reply, or the daemon
+        // restarted after marking). The durable row still answers status, so
+        // recover the terminal result at worker startup instead of waiting
+        // for a push that never comes. Non-terminal grabs keep their tracking
+        // for the later unsolicited push; a failed query keeps the correlation
+        // for the next restart. Fire-and-forget like finishAbandon above, so
+        // one slow or absent daemon never stalls worker setup: the underlying
+        // status request already fails fast without a session and times out
+        // otherwise.
+        this.grabDownloads.set(grabID, {
+          ids: new Set([downloadID]),
+          tabID: correlation.tabID,
+          scanID: correlation.scanID,
+          url: item?.url ?? item?.finalUrl ?? "",
+          steeringPath: correlation.steeringPath,
+        });
+        void this.recoverCompletedGrabStatus(grabID, correlation);
+        continue;
+      }
       this.grabDownloads.set(grabID, {
         ids: new Set([downloadID]),
         tabID: correlation.tabID,
@@ -10779,6 +10799,51 @@ export class Bridge {
         steeringPath: correlation.steeringPath,
       });
     }
+  }
+
+  /** Deliver a completed download's terminal grab result queried at startup.
+   * Fire-and-forget from reconcilePdfGrabCorrelations so worker setup never
+   * waits on the daemon. A failed query keeps the correlation for the next
+   * restart; an unsolicited push that lands first clears the correlation, and
+   * the guard below makes the late status answer a no-op instead of a second
+   * notification. */
+  private async recoverCompletedGrabStatus(
+    grabID: string,
+    correlation: PdfGrabCorrelation,
+  ): Promise<void> {
+    let status: BrokerReply<{
+      grab_id: string;
+      state: string;
+      outcome?: string;
+      detail?: string;
+      job_id?: string;
+    }>;
+    try {
+      status = await this.requestPdfGrabStatus(grabID);
+    } catch {
+      return;
+    }
+    if (!status.ok) return;
+    const raw =
+      typeof status.outcome === "string" && status.outcome !== ""
+        ? status.outcome
+        : status.state;
+    const display = durablePdfGrabState(raw);
+    if (
+      display !== "job_created" &&
+      display !== "already_owned" &&
+      display !== "needs_identifier" &&
+      display !== "failed" &&
+      display !== "abandoned"
+    ) {
+      return;
+    }
+    if (!this.pdfGrabCorrelations.has(grabID)) return;
+    this.notifyPdfGrab(correlation.scanID, grabID, display, status.detail);
+    this.evictPdfGrabRouteSteering(grabID, correlation);
+    this.grabDownloads.delete(grabID);
+    this.pdfGrabCorrelations.delete(grabID);
+    this.persistPdfGrabCorrelations();
   }
 
   private async finishAbandon(

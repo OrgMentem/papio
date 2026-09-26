@@ -15105,6 +15105,157 @@ test("papio.pageBulk.grabPdf reconciles an interrupted download after a service-
   });
 });
 
+/** Drives one grab to a started download and returns the persisted
+ * correlation, so a restart test can model the worker dying while the
+ * download was still running. */
+async function persistedGrabDownload(
+  grabID: string,
+  scanID: string,
+): Promise<{
+  correlations: Record<string, PdfGrabCorrelation>;
+  store: StoreShape;
+  url: string;
+}> {
+  const first = makeHarness();
+  const urls = pageBulkTestURLs;
+  const url = `https://resolver.example.edu/content/${grabID}.pdf`;
+  await first.bridge.start();
+  await first.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const replyPromise: Promise<unknown> = handleInboxRuntimeMessage(
+    first.bridge,
+    {
+      type: "papio.pageBulk.grabPdf",
+      request: { tab_id: 42, url, scan_id: scanID },
+    },
+    { id: urls.runtimeID, url: urls.pageBulkURL, tab: { id: 42 } },
+    urls,
+  );
+  const requestFrame = await first.port.waitForFrame("pdf_grab_request");
+  await first.port.inbound(
+    nativeResult("pdf_grab_result", {
+      request_id: requestFrame.payload["request_id"] as string,
+      outcome: "steering",
+      grab_id: grabID,
+      steering_path: `papio/grabs/${grabID}/`,
+    }),
+  );
+  await expect(replyPromise).resolves.toEqual({ ok: true, grab_id: grabID });
+  return {
+    correlations: JSON.parse(
+      JSON.stringify(first.pdfGrabCorrelations.current),
+    ) as Record<string, PdfGrabCorrelation>,
+    store: JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
+    url,
+  };
+}
+
+/** The grab-state notifications a harness delivered to the page, narrowed
+ * without asserting a shape onto the runtime message record. */
+function grabStateMessages(messages: readonly object[]): object[] {
+  return messages.filter(
+    (message) =>
+      "type" in message && message.type === "papio.pageBulk.grabState",
+  );
+}
+
+test("a completed grab download recovers its terminal result after a service-worker restart", async () => {
+  // The daemon pushes a terminal grab result once and then marks the row
+  // notified. A restart (or a discarded poll reply) loses that push, so the
+  // researcher would never learn the paper landed. Startup reconciliation
+  // asks the durable row instead of waiting for a push that never comes.
+  const grabID = "grab-complete-recover";
+  const scanID = "scan-grab-complete";
+  const seeded = await persistedGrabDownload(grabID, scanID);
+
+  const restarted = makeHarness(seeded.store);
+  restarted.pdfGrabCorrelations.current = seeded.correlations;
+  restarted.downloads.items.set(901, {
+    id: 901,
+    url: seeded.url,
+    filename: `papio/grabs/${grabID}/paper.pdf`,
+    state: "complete",
+  });
+  await restarted.bridge.start();
+  await restarted.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const statusFrame = await restarted.port.waitForFrame(
+    "pdf_grab_status_request",
+  );
+  expect(statusFrame.payload["grab_id"]).toBe(grabID);
+  await restarted.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: statusFrame.payload["request_id"] as string,
+      grab_id: grabID,
+      state: "job_created",
+      outcome: "job_created",
+      job_id: "job_grab_complete",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+
+  const states = grabStateMessages(restarted.runtimeMessages);
+  expect(states).toEqual([
+    {
+      type: "papio.pageBulk.grabState",
+      scan_id: scanID,
+      grab_id: grabID,
+      state: "job_created",
+    },
+  ]);
+  // Delivered exactly once: the correlation is gone, so a later unsolicited
+  // push for the same grab cannot report it a second time.
+  expect(restarted.pdfGrabCorrelations.current[grabID]).toBeUndefined();
+});
+
+test("a completed grab whose status is still non-terminal keeps its correlation", async () => {
+  // The daemon has the bytes but has not classified them yet. Dropping the
+  // correlation here would discard the researcher's only route to the result.
+  const grabID = "grab-complete-pending";
+  const scanID = "scan-grab-pending";
+  const seeded = await persistedGrabDownload(grabID, scanID);
+
+  const restarted = makeHarness(seeded.store);
+  restarted.pdfGrabCorrelations.current = seeded.correlations;
+  restarted.downloads.items.set(901, {
+    id: 901,
+    url: seeded.url,
+    filename: `papio/grabs/${grabID}/paper.pdf`,
+    state: "complete",
+  });
+  await restarted.bridge.start();
+  await restarted.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const statusFrame = await restarted.port.waitForFrame(
+    "pdf_grab_status_request",
+  );
+  await restarted.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: statusFrame.payload["request_id"] as string,
+      grab_id: grabID,
+      state: "quarantined",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+
+  expect(grabStateMessages(restarted.runtimeMessages)).toEqual([]);
+  expect(restarted.pdfGrabCorrelations.current[grabID]).toMatchObject({
+    downloadID: 901,
+  });
+});
+
 test("papio.pageBulk.grabPdf clears a conflict acknowledgment with its settled state", async () => {
   const h = makeHarness();
   const urls = pageBulkTestURLs;

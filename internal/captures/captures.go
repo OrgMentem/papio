@@ -359,7 +359,10 @@ func (s *Store) pendingRoleLocked(ctx context.Context, fingerprint string) (PinR
 // the pin sidecar and the index entry this call published, and it displaces a
 // prior latest marker only after both are durable. A caller that sees an error
 // therefore never observes a demoted earlier capture, an unenumerable lease, or
-// a pin that exempts the capture from retention forever.
+// a pin that exempts the capture from retention forever. The index is published
+// before the pin so a crash between the two leaves an index entry without a pin
+// (reconciled through PendingJobs/ReleaseJob) rather than a pin without an
+// index (invisible to PendingJobs and exempt from retention sweeps forever).
 func (s *Store) pinPendingLocked(ctx context.Context, path, jobID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -373,12 +376,14 @@ func (s *Store) pinPendingLocked(ctx context.Context, path, jobID string) error 
 	if err != nil {
 		return err
 	}
-	if err := s.writePinLocked(file, fingerprint, role); err != nil {
-		return err
-	}
 	indexed, err := s.addPendingIndexLocked(jobID)
 	if err != nil {
-		s.discardPinLocked(file.Path)
+		return err
+	}
+	if err := s.writePinLocked(file, fingerprint, role); err != nil {
+		if indexed {
+			_ = s.removePendingIndexLocked(jobID)
+		}
 		return err
 	}
 	if role != PinLatest {
@@ -729,6 +734,71 @@ func (s *Store) ReleaseIncident(ctx context.Context, fingerprint string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.releaseIncidentLocked(ctx, fingerprint)
+}
+
+// ReleaseOrphanPendingPins drops pending-lease pins that have no durable index
+// entry. Such pins predate index-first ordering (a crash between the pin write
+// and the index write) and are invisible to PendingJobs while exempt from
+// retention sweeps. Pins with an index entry are left alone; their jobs are
+// released through PendingJobs/ReleaseJob once terminal. The store lock is held
+// throughout, so no concurrent pinPendingLocked can be mid-flight while orphans
+// are collected.
+func (s *Store) ReleaseOrphanPendingPins(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(pendingIndexPath(s.root))
+	index := map[string]string{}
+	if err == nil {
+		if err := json.Unmarshal(data, &index); err != nil {
+			return 0, fmt.Errorf("decoding capture pending index: %w", err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return 0, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("reading capture directory: %w", err)
+	}
+	removed := 0
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return removed, err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if err != nil {
+			return removed, err
+		}
+		for _, file := range files {
+			if err := ctx.Err(); err != nil {
+				return removed, err
+			}
+			pin, ok := readPin(file.Path)
+			if !ok || !strings.HasPrefix(pin.Fingerprint, "pending:") {
+				continue
+			}
+			if _, ok := index[pin.Fingerprint]; ok {
+				continue
+			}
+			if err := os.Remove(pinPath(file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return removed, err
+			}
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // Sweep applies retention to every host, including captures that became
