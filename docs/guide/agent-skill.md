@@ -10,8 +10,10 @@ There are two ways to do that, and they are not equal:
 - **The MCP server** (`papio mcp`) exposes the same surface to hosts that speak
   MCP rather than shell. Use it when your host cannot run commands.
 
-Both obey identical safety boundaries: human gates stay human, and `zotio apply`
-remains the only path that writes to Zotero.
+Both obey identical safety boundaries: human gates stay human, `zotio apply`
+is the only path that creates Zotero items or attachments, and `papio zotio
+tags reconcile` is the one other Zotero write, converging papio's own
+exception tags with no preview step.
 
 ## Invoke the skill
 
@@ -38,9 +40,11 @@ papio version
 Add `--json` for structured output: it is a global flag, and every command that
 reports data honours it (`init`, `daemon`, and `mcp` are prompts and processes,
 not reports). A list-shaped payload is always
-`{"<name>": [...], "truncated": bool}`, never a bare array; the commands
-returning a single record — `jobs get`, `doctor`, `status`, `batch report`,
-`zotio plan`, `inbox` — return that object directly, with no `truncated` key.
+`{"<name>": [...], "truncated": bool}`, never a bare array — except
+`papio_command_search` with neither `name` nor `query`, which returns a bare
+JSON array of command summaries; the commands returning a single record —
+`jobs get`, `doctor`, `status`, `batch report`, `zotio plan`, `inbox` —
+return that object directly, with no `truncated` key.
 The MCP resources return the identical envelope, so one parser serves both
 surfaces. The generated
 [JSON output contract](../reference/commands.md#json-output-contract) is

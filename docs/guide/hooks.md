@@ -139,13 +139,16 @@ claim  = "pdf_present"
 that is per-manager convention, and a wrong guess would skip a paper you asked
 for. Export the subset you mean, or declare `record_present`.
 
-Matching is exact on identifiers represented by the source format. BibTeX
+Ownership matches normalized DOI and PMID identifiers. It also collapses arXiv
+version suffixes, so `v2` matches `v1` as the same work. BibTeX
 supports DOI, arXiv, and PMID; CSL-JSON and NBIB support DOI and PMID; RIS
 supports DOI only. No format supports every identifier, and titles are never
 matched. ISBN is excluded — an edited volume shares one ISBN with every
 chapter in it, so one match would suppress twenty distinct requests. A `.bib`
 also cannot say *which* manifestation it holds, so a source never satisfies an
-explicit `--desired-version published` request.
+explicit `--desired-version published` request; conversely, a request without
+an explicit desired version matches any manifestation, so an exported `v1`
+can suppress a requested `v2`.
 
 Any tool that exports RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB works — papis,
 JabRef, Calibre, Mendeley, EndNote, a hand-kept `.bib`. There is no supported-app

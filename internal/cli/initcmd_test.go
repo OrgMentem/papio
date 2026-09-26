@@ -129,6 +129,7 @@ func TestInitRerunPreservesValuesAndFlagOverridesOneField(t *testing.T) {
 	cfg.Email = "custom@example.test"
 	cfg.Zotio.Executable = filepath.Join(home, "tools", "custom-zotio")
 	cfg.Zotio.AttachmentMode = "stored"
+	cfg.Updates.Check = false
 	if err := config.Save(cfg, path); err != nil {
 		t.Fatalf("customize config: %v", err)
 	}
@@ -143,11 +144,24 @@ func TestInitRerunPreservesValuesAndFlagOverridesOneField(t *testing.T) {
 	if got.Email != "custom@example.test" {
 		t.Fatalf("email changed on rerun: %q", got.Email)
 	}
+	if got.Updates.Check {
+		t.Fatal("update checks changed on rerun without --check-updates")
+	}
 	if got.Zotio.Executable != cfg.Zotio.Executable {
 		t.Fatalf("zotio path changed on rerun: %q, want %q", got.Zotio.Executable, cfg.Zotio.Executable)
 	}
 	if got.Zotio.AttachmentMode != "linked-file" {
 		t.Fatalf("attachment mode = %q, want linked-file", got.Zotio.AttachmentMode)
+	}
+	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--check-updates=true", "--skip-browser"); err != nil {
+		t.Fatalf("explicit update opt-in: %v\n%s", err, out)
+	}
+	got, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Updates.Check {
+		t.Fatal("explicit --check-updates=true did not enable update checks")
 	}
 }
 

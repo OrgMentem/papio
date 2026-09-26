@@ -765,7 +765,11 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 	if input.firefoxIDSet {
 		cfg.Browser.FirefoxExtensionID = strings.TrimSpace(input.firefoxExtensionID)
 	}
-	if input.nonInteractive || input.checkUpdatesSet {
+	if input.nonInteractive {
+		if !exists || input.checkUpdatesSet {
+			cfg.Updates.Check = input.checkUpdates
+		}
+	} else if input.checkUpdatesSet {
 		cfg.Updates.Check = input.checkUpdates
 	} else {
 		sections.header("Updates", "Queries GitHub releases only; nothing else is sent.")

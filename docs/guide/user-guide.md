@@ -95,9 +95,13 @@ OpenAlex-related papers.
 Give `acquire --batch` a JSONL file of work records, or a RIS (`.ris`), BibTeX
 (`.bib` or `.bibtex`), CSL-JSON (a `.json` file whose top level is an array), or
 MEDLINE/NBIB (`.nbib`) file. *papio* detects file formats by extension and
-content-sniffs standard input (`-`). A batch holds up to 50 works; identifier
-normalization and deduplication are identical for every format, so running the
-same file again is safe and will not create duplicates.
+A batch holds up to 50 works; identifier normalization and deduplication are
+identical for every format. Reruns reuse only live jobs: works whose jobs
+already settled (`ready`, `imported`, `unavailable`, `failed`, `cancelled`)
+are acquired again as new jobs, so running the same file again after
+completion creates duplicates. To inspect an existing run without
+re-acquiring it, use `papio batch report`; to filter already-held works
+before submission, configure zotio or `library.sources` ownership.
 
 ```sh
 papio acquire --batch works.jsonl --auto-import \
@@ -900,7 +904,7 @@ A batch report labels `awaiting_human` work with one of these reasons:
 | --- | --- | --- |
 | `institutional` | No direct candidate completed; an institutional OpenURL handoff is waiting. **Sign in to your institution first**, then open the handoff. | Open the queue, sign in through ordinary Chrome if needed, and complete the allowed provider flow. If the provider reports a stale session, re-run `papio actions open` for a fresh link. |
 | `oa_browser` | The work is **open access — no login needed**; its URL just refuses non-browser downloads. | Use the offered browser handoff; the browser may download through its existing cookie jar or present a page for you. |
-| `terms` | The extension observed terms acceptance is required. | Read and decide on the publisher's terms yourself; *papio* does not accept them for you. |
+| `terms` | The extension observed terms acceptance is required. | Without recorded auto-accept consent, read and decide on the publisher's terms yourself; *papio* does not accept them for you. With explicit persistent consent and a supported accept rule, *papio* can accept them on your behalf. |
 
 `needs_review` is separate from these browser states: it is an identity decision
 on a quarantined file. `openurl_available` is an advisory action in

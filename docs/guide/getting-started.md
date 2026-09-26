@@ -108,9 +108,14 @@ Install `zotio` and put it on your `PATH` when you want *papio* to import finish
 
 === "Development install (unpacked)"
 
-    For hacking on the extension itself, load it unpacked from a checkout:
+    For hacking on the extension itself, load it unpacked from a checkout.
+    The manifest points at generated bundles, so build them first:
 
-    1. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `extension/`.
+    ```sh
+    cd extension && bun install && bun run build
+    ```
+
+    1. Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `extension/` (the extension root — `dist/` is generated, not the load target).
     2. Hand the ID to `papio init --extension-id <id>` — or pass the extension *folder path* instead and *papio* computes the ID itself (macOS/Linux only: Chrome derives unpacked IDs from the load directory, but Windows hashes paths differently, so paste the literal ID there).
 
     Manually loaded builds do not auto-update; reload after each rebuild.

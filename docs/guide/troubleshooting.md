@@ -34,10 +34,13 @@ killing the process, or reloading the extension's folder alone is not enough.
 
 ### Automated Chrome reload
 
-Where local Chrome automation is already authorized, use Chrome's
-`developerPrivate.reload` operation for the *papio* extension. This is the
-programmatic equivalent of the reload arrow; it is not a *papio* CLI command and
-must target the installed *papio* extension, not an arbitrary extension.
+Prefer `papio browser reload`: it reloads the connected development-mode
+extension from disk and then waits for the new session to reconnect. It
+refuses store-installed extensions by design, so use it only with an
+unpacked development install. Where local Chrome automation is already
+authorized, Chrome's `developerPrivate.reload` operation for the *papio*
+extension is the programmatic equivalent of the reload arrow and must target
+the installed *papio* extension, not an arbitrary extension.
 
 ### Last resort: purge the service-worker cache
 
@@ -223,16 +226,17 @@ papio browser use <session-id>  # or pick one explicitly
 
 Quitting the holding browser releases the session immediately; a crashed
 holder yields within about ten seconds. If you never want a browser to hold
-the session, disable the *papio* extension there. Until a waiting browser is
-given the session, its popup and inbox only report which browser has it: the
-daemon negotiates page acquisition and the inbox with the browser it
-acknowledged, and it acknowledges one at a time. Both surfaces resume by
-themselves in the browser you claim.
+the session, disable the *papio* extension there. Only daemon-initiated offers
+and handoffs are holder-routed: a waiting browser is acknowledged with its own
+connection, and anything you initiate yourself — **Acquire this page**,
+**Send PDF**, reading the inbox — still works where you click. Its popup and
+inbox stay usable; the holder switch only changes where automatic handoffs
+land. Both surfaces resume by themselves in the browser you claim.
 
 ## Read `doctor` output
 
 `doctor` prints stable `PASS`, `WARN`, and `FAIL` rows. Any `FAIL` makes the
-report not OK. The checks below explain every check the command can emit.
+report not OK. The checks below explain the common ones; run `papio doctor --json` for every check the current build can emit.
 
 | Check | PASS means | WARN or FAIL: what to do |
 | --- | --- | --- |
