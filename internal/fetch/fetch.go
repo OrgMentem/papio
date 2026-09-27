@@ -30,11 +30,21 @@ type Resolver interface {
 // It owns neither injected dependency and never changes a supplied transport.
 type requestSchemeKey struct{}
 
+// HostGate, when non-nil, runs before every request hop (initial URL and
+// each redirect target) beside the SSRF policy. It reports whether the hop
+// may proceed; a refusal aborts the download with a *Error naming the gate
+// (ClassInvalid, HTTPStatus 0) before any request reaches that host. It is
+// nil by default: the downloader alone never suppresses. The app wires its
+// host-suppression state through this hook, so the check runs per hop inside
+// the redirect loop rather than once on the candidate host.
+type HostGate func(ctx context.Context, host string) error
+
 type Downloader struct {
 	policy          Policy
 	resolver        Resolver
 	transport       http.RoundTripper
 	followRedirects bool
+	hostGate        HostGate
 }
 
 // New constructs a bounded downloader. A nil resolver uses net.DefaultResolver
@@ -62,6 +72,12 @@ func newDownloader(policy Policy, resolver Resolver, transport http.RoundTripper
 	d := &Downloader{policy: policy, resolver: resolver, followRedirects: followRedirects}
 	d.transport = d.secureTransport(transport)
 	return d, nil
+}
+
+// SetHostGate installs the per-hop host gate. A nil gate disables the check.
+// It must be set before Download; changing it mid-download races.
+func (d *Downloader) SetHostGate(gate HostGate) {
+	d.hostGate = gate
 }
 
 func validatePolicy(p Policy) error {
@@ -134,6 +150,11 @@ func (d *Downloader) DownloadRequest(ctx context.Context, request *http.Request,
 		if err := d.validateURL(overall, current.URL); err != nil {
 			return Result{}, err
 		}
+		if d.hostGate != nil {
+			if err := d.hostGate(overall, strings.ToLower(current.URL.Hostname())); err != nil {
+				return Result{}, err
+			}
+		}
 		resp, err := d.roundTrip(overall, current)
 		if err != nil {
 			return Result{}, classifyRequestError(err)
@@ -143,14 +164,14 @@ func (d *Downloader) DownloadRequest(ctx context.Context, request *http.Request,
 			location := resp.Header.Get("Location")
 			closeBody(resp)
 			if location == "" {
-				return Result{}, invalidStatus(resp.StatusCode, "redirect missing location")
+				return Result{}, answeredBy(invalidStatus(resp.StatusCode, "redirect missing location"), current.URL)
 			}
 			if redirects >= d.policy.MaxRedirects {
-				return Result{}, invalidStatus(resp.StatusCode, "redirect limit exceeded")
+				return Result{}, answeredBy(invalidStatus(resp.StatusCode, "redirect limit exceeded"), current.URL)
 			}
 			nextURL, err := current.URL.Parse(location)
 			if err != nil {
-				return Result{}, invalidStatus(resp.StatusCode, "invalid redirect location")
+				return Result{}, answeredBy(invalidStatus(resp.StatusCode, "invalid redirect location"), current.URL)
 			}
 			next := current.Clone(overall)
 			next.URL = nextURL
@@ -163,8 +184,29 @@ func (d *Downloader) DownloadRequest(ctx context.Context, request *http.Request,
 			continue
 		}
 
-		return d.saveResponse(overall, resp, current.URL, quarantinePath)
+		result, err := d.saveResponse(overall, resp, current.URL, quarantinePath)
+		if err != nil {
+			return Result{}, answeredBy(err, current.URL)
+		}
+		return result, nil
 	}
+}
+
+// answeredBy names the host that answered on a failure the response itself
+// decided: an HTTP status verdict, a challenge, a non-PDF payload, or a size
+// violation. Failures with no answer to attribute (body read timeouts,
+// network drops, local quarantine errors) keep FinalHost empty, so the
+// store never records a responder that did not refuse anything.
+func answeredBy(err error, u *url.URL) error {
+	var fe *Error
+	if !errors.As(err, &fe) || u == nil {
+		return err
+	}
+	switch kind := fe.FailureKind(); {
+	case fe.HTTPStatus > 0, kind == FetchKindChallenge, kind == FetchKindNotAPDF, kind == FetchKindSizeLimit:
+		fe.FinalHost = strings.ToLower(u.Hostname())
+	}
+	return err
 }
 
 func (d *Downloader) roundTrip(overall context.Context, request *http.Request) (*http.Response, error) {
@@ -250,6 +292,7 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 
 	hash := sha256.New()
 	var sample []byte
+	var head []byte
 	var written int64
 	buf := make([]byte, 32*1024)
 	reader := newBodyReader(resp.Body)
@@ -270,6 +313,16 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 					need = len(chunk)
 				}
 				sample = append(sample, chunk[:need]...)
+			}
+			// head is the bounded prefix the body-marker scan reads. It rides
+			// the chunks the daemon already streams, so the scan never issues
+			// another read and never holds more than bodyChallengePrefixBytes.
+			if len(head) < bodyChallengePrefixBytes {
+				need := bodyChallengePrefixBytes - len(head)
+				if need > len(chunk) {
+					need = len(chunk)
+				}
+				head = append(head, chunk[:need]...)
 			}
 			if _, err := f.Write(chunk); err != nil {
 				return Result{}, retryable("unable to write quarantine file")
@@ -295,6 +348,13 @@ func (d *Downloader) saveResponse(overall context.Context, resp *http.Response, 
 	}
 	sniffed := http.DetectContentType(sample)
 	declared := mediaType(resp.Header.Get("Content-Type"))
+	// A soft challenge arrives as 200 HTML where a PDF was asked for. The
+	// header classifier lets it through, so the bounded head gets a marker
+	// scan before the generic payload rejection. bodyChallenge never fires
+	// on a PDF prefix, so a 200 that is a PDF keeps its existing verdict.
+	if rule := bodyChallenge(head); rule != "" {
+		return Result{}, invalidStatus(resp.StatusCode, "anti-bot challenge response")
+	}
 	if unsafePayload(sample, sniffed, declared) {
 		return Result{}, invalid("response payload is not an acceptable PDF")
 	}
@@ -560,6 +620,13 @@ func statusError(resp *http.Response) error {
 	// client cannot pass one and a retry cannot either, but an ordinary browser
 	// can, so the candidate is invalid here and the message says challenge,
 	// which is what lets an open-access candidate take the browser route.
+	// A 429 is a rate limit even when a WAF names a challenge beside it: the
+	// host asks papio to slow down, and a retry after Retry-After is the
+	// answer. Reading it as a challenge would drop Retry-After and count a
+	// pacing signal as an access-control wall (ADR-0031).
+	if status == http.StatusTooManyRequests {
+		return &Error{Class: ClassRetryable, HTTPStatus: status, RetryAfter: retryAfter(resp.Header.Get("Retry-After")), Msg: "temporary HTTP response"}
+	}
 	if botChallenge(resp.Header) {
 		return invalidStatus(status, "anti-bot challenge response")
 	}

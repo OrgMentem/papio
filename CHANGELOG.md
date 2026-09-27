@@ -177,6 +177,29 @@ execution records kept during the initial build.
 - `papio delivery submit` without `--confirm` now says whether `--confirm`
   would place a real provider request, open a prefill action, or reuse an
   existing request.
+- **The daemon stops sending its own downloads to publisher hosts that only
+  refuse it.** After three challenge or 403 refusals from a host, spread over
+  at least 24 hours, with no daemon download from that host that succeeded
+  in 90 days, the daemon skips its own request to that host. This includes a
+  redirect into the host. The paper goes on to the browser or institutional
+  route, and an open-access copy still opens in your browser. The daemon
+  sends one probe to such a host a week, never more than one at a time, and
+  stops skipping at the first success. A success in your browser does not
+  count, because it says nothing about the daemon's own access. A host that
+  answers 429 is slowed down (it honors `Retry-After`, up to one hour), never
+  skipped, even when the 429 carries a bot-check header. A skip shows in
+  the attempt history as `suppressed`, and a job that ends with skips names
+  the hosts in its transition. The new `[host_suppression]` section sets the
+  counts and intervals, or turns the rule off (ADR-0031). Config is strict:
+  install the new binary before you add the section. Replayed over one
+  operator's store of 677 daemon fetches, the rule skipped 54 fetches, and
+  none of those hosts ever served a daemon download.
+- **A failed daemon download now says what failed and where.** Each failed
+  fetch in the attempt history records a stable kind (challenge, HTTP 403,
+  rate limit, not a PDF, network, and more), the host that *papio* asked,
+  and the host that answered after redirects. Before, every failed fetch
+  said only `*fetch.Error`, so a bot challenge and a plain 403 looked the
+  same. Older rows stay readable.
 
 ### Changed
 - **The daemon can advertise up to 64 browser features, up from 32.** The
@@ -612,6 +635,13 @@ execution records kept during the initial build.
   The CLI reports that it has not observed a new session within the timeout.
   The reload may still complete; `papio browser sessions` checks the result
   without requesting another reload. The default timeout remains 15 seconds.
+- **The daemon recognizes more bot challenges that answer with HTTP 200.**
+  Fastly, Anubis, proof-of-work, and CAPTCHA interstitials send a normal
+  200 page, so *papio* read them as a PDF that was not valid. It now reads
+  them as a challenge from marks in the first 32 KiB of the page. Each mark
+  needs both vendor text and challenge structure, and a PDF is never read
+  as a challenge. An open-access copy behind such a page now opens in your
+  browser, as a copy that answers 403 does.
 - **An open-access copy behind a bot challenge now opens in the browser.**
   Some repositories answer a download with an AWS WAF challenge: HTTP 202,
   an empty body, and the header `x-amzn-waf-action: challenge`. *papio*

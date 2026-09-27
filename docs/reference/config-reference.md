@@ -178,6 +178,22 @@ no local model runtime ships yet. Credential setup is currently a CLI command.
 | `timeout_seconds` | integer seconds | `120` | Fetch deadline. It must be at least 5 seconds. |
 | `allow_http_loopback` | boolean | `false` | Development and test override that permits HTTP loopback. Doctor warns while it is enabled; production policy is HTTPS-only. |
 
+## `[host_suppression]`
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Pace the daemon away from publisher hosts that answer with access-control walls instead of files (challenge/403). Suppression skips the daemon fetch, never the candidate: the candidate still reaches the browser or institutional route. |
+| `failure_threshold` | integer | `3` | Kind-matching daemon failures (challenge + 403 pooled) with zero daemon fetch successes for the host inside the window before suppression starts. It must be between 1 and 100. |
+| `window_days` | integer days | `90` | Trailing window for the failure and success counts. It must be between 1 and 365. |
+| `probe_interval_days` | integer days | `7` | At most one real revival probe per suppressed host per interval. It must be between 1 and 90. |
+| `rate_limit_backoff_cap_seconds` | integer seconds | `3600` | Cap for the per-host 429 backoff honoring `Retry-After`. 429s back off, never suppress. It must be between 60 and 86400. |
+| `min_wall_span_hours` | integer hours | `24` | The walls inside the window must span at least this long before a host suppresses, so one burst of refusals from an intermittent host never does. `0` disables the check. It must be between 0 and 720. |
+| `excluded_hosts` | list of hostnames | `["doi.org"]` | Hosts that never suppress (pure redirectors). Each entry must be a bare hostname. |
+
+The `[host_suppression]` section is strict-mode configuration: an older daemon rejects a
+config containing it. Deploy the binary that supports this section together with
+the configuration change.
+
 ## `[captures]`
 
 | Key | Type | Default | Effect and constraints |

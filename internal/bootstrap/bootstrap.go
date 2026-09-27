@@ -479,6 +479,11 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	service.Fetch = func(ctx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
 		return downloader.DownloadWithHeaders(ctx, candidate.URL, candidate.RequestHeaders, path)
 	}
+	// ADR-0031: host-aware daemon fetch suppression. The gate runs on every
+	// request hop inside the downloader, so a redirect into a walled host is
+	// refused before the request; with the rule disabled it admits all.
+	service.EnableHostSuppression(cfg.HostSuppression)
+	downloader.SetHostGate(service.HostGate)
 	executable, err := os.Executable()
 	if err != nil {
 		return nil, err

@@ -266,6 +266,69 @@ type Fetch struct {
 	AllowHTTPLoopback bool  `toml:"allow_http_loopback,omitempty"` // tests/dev only
 }
 
+// HostSuppression paces the daemon away from publisher hosts that answer
+// with access-control walls instead of files (ADR-0031). Thresholds below
+// default to the measured cut: N kind-matching daemon failures with zero
+// daemon fetch successes for the host inside the trailing window W. 429s
+// never suppress; they back off per host up to RateLimitBackoffCapSeconds.
+// ProbeIntervalDays bounds the revival probe to one real attempt per
+// suppressed host per interval. ExcludedHosts names hosts that never
+// suppress (pure redirectors such as doi.org); the zero-success gate stays
+// on regardless, so this list only short-circuits the counting.
+type HostSuppression struct {
+	Enabled                 bool `toml:"enabled"`
+	FailureThreshold        int  `toml:"failure_threshold"`
+	WindowDays              int  `toml:"window_days"`
+	ProbeIntervalDays       int  `toml:"probe_interval_days"`
+	RateLimitBackoffCapSecs int  `toml:"rate_limit_backoff_cap_seconds"`
+	// MinWallSpanHours requires the window's walls to span at least this
+	// long before a host suppresses: a persistent wall, not one burst of
+	// refusals from a host that serves intermittently. 0 disables the check.
+	MinWallSpanHours int      `toml:"min_wall_span_hours"`
+	ExcludedHosts    []string `toml:"excluded_hosts,omitempty"`
+}
+
+// DefaultHostSuppression is the shipped [host_suppression] baseline.
+func DefaultHostSuppression() HostSuppression {
+	return HostSuppression{
+		Enabled:                 true,
+		FailureThreshold:        3,
+		WindowDays:              90,
+		ProbeIntervalDays:       7,
+		RateLimitBackoffCapSecs: 3600,
+		MinWallSpanHours:        24,
+		ExcludedHosts:           []string{"doi.org"},
+	}
+}
+
+// validate fails closed on every knob: a threshold of zero would suppress on
+// the first failure (or never probe), a negative window looks into the
+// future, and an unparseable excluded host never matches anything it should.
+func (h HostSuppression) validate() error {
+	if h.FailureThreshold < 1 || h.FailureThreshold > 100 {
+		return fmt.Errorf("host_suppression.failure_threshold must be in 1..100")
+	}
+	if h.WindowDays < 1 || h.WindowDays > 365 {
+		return fmt.Errorf("host_suppression.window_days must be in 1..365")
+	}
+	if h.ProbeIntervalDays < 1 || h.ProbeIntervalDays > 90 {
+		return fmt.Errorf("host_suppression.probe_interval_days must be in 1..90")
+	}
+	if h.RateLimitBackoffCapSecs < 60 || h.RateLimitBackoffCapSecs > 86400 {
+		return fmt.Errorf("host_suppression.rate_limit_backoff_cap_seconds must be in 60..86400")
+	}
+	if h.MinWallSpanHours < 0 || h.MinWallSpanHours > 720 {
+		return fmt.Errorf("host_suppression.min_wall_span_hours must be in 0..720")
+	}
+	for _, host := range h.ExcludedHosts {
+		host = strings.TrimSpace(strings.ToLower(host))
+		if host == "" || strings.ContainsAny(host, "/ :") {
+			return fmt.Errorf("host_suppression.excluded_hosts %q must be a bare hostname", host)
+		}
+	}
+	return nil
+}
+
 // PDF controls validation and OCR fallback.
 type PDF struct {
 	OCREnabled          bool    `toml:"ocr_enabled"`
@@ -916,26 +979,27 @@ type Filing struct {
 
 // Config is the loaded, validated configuration.
 type Config struct {
-	AccessMode string            `toml:"access_mode"`
-	Email      string            `toml:"email"`
-	DataDir    string            `toml:"data_dir"`
-	Fetch      Fetch             `toml:"fetch"`
-	PDF        PDF               `toml:"pdf"`
-	Browser    Browser           `toml:"browser"`
-	Captures   Captures          `toml:"captures"`
-	Zotio      Zotio             `toml:"zotio"`
-	Notify     Notify            `toml:"notify"`
-	Hooks      Hooks             `toml:"hooks"`
-	Filing     Filing            `toml:"filing"`
-	Library    Library           `toml:"library"`
-	Retraction Retraction        `toml:"retraction"`
-	Updates    Updates           `toml:"updates"`
-	Discovery  Discovery         `toml:"discovery"`
-	OpenBooks  OpenBooks         `toml:"open_books"`
-	Actions    Actions           `toml:"actions"`
-	Drive      Drive             `toml:"drive"`
-	Agent      *Agent            `toml:"agent,omitempty"`
-	Sources    map[string]Source `toml:"sources"`
+	AccessMode      string            `toml:"access_mode"`
+	Email           string            `toml:"email"`
+	DataDir         string            `toml:"data_dir"`
+	Fetch           Fetch             `toml:"fetch"`
+	HostSuppression HostSuppression   `toml:"host_suppression"`
+	PDF             PDF               `toml:"pdf"`
+	Browser         Browser           `toml:"browser"`
+	Captures        Captures          `toml:"captures"`
+	Zotio           Zotio             `toml:"zotio"`
+	Notify          Notify            `toml:"notify"`
+	Hooks           Hooks             `toml:"hooks"`
+	Filing          Filing            `toml:"filing"`
+	Library         Library           `toml:"library"`
+	Retraction      Retraction        `toml:"retraction"`
+	Updates         Updates           `toml:"updates"`
+	Discovery       Discovery         `toml:"discovery"`
+	OpenBooks       OpenBooks         `toml:"open_books"`
+	Actions         Actions           `toml:"actions"`
+	Drive           Drive             `toml:"drive"`
+	Agent           *Agent            `toml:"agent,omitempty"`
+	Sources         map[string]Source `toml:"sources"`
 
 	// Path this config was loaded from ("" for defaults).
 	Path string `toml:"-"`
@@ -1020,15 +1084,16 @@ func defaultDataDir() string {
 // callers that acquire must see ErrAccessModeUnset until the user chooses.
 func Default() Config {
 	return Config{
-		DataDir:    defaultDataDir(),
-		Fetch:      Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
-		PDF:        PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
-		Browser:    Browser{DirectRoutesEnabled: true, ActionExpirySeconds: 1800},
-		Captures:   Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
-		Actions:    Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
-		Drive:      Drive{MaxOpensPerHour: DefaultDriveMaxOpensPerHour, JobBackoffHours: DefaultDriveJobBackoffHours, SignInWaitMinutes: DefaultDriveSignInWaitMinutes, SettleMinutes: DefaultDriveSettleMinutes},
-		Zotio:      Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
-		Retraction: Retraction{Scope: RetractionScopeAcquired},
+		DataDir:         defaultDataDir(),
+		Fetch:           Fetch{MaxBytes: 100 << 20, TimeoutSeconds: 120},
+		HostSuppression: DefaultHostSuppression(),
+		PDF:             PDF{OCREnabled: true, MinTextChars: 400, MaxOCRPages: 4, TitleMatchThreshold: 0.6},
+		Browser:         Browser{DirectRoutesEnabled: true, ActionExpirySeconds: 1800},
+		Captures:        Captures{Enabled: true, MaxPerHost: 10, MaxAgeDays: 14},
+		Actions:         Actions{StaleAfterSeconds: DefaultActionStaleAfterSeconds},
+		Drive:           Drive{MaxOpensPerHour: DefaultDriveMaxOpensPerHour, JobBackoffHours: DefaultDriveJobBackoffHours, SignInWaitMinutes: DefaultDriveSignInWaitMinutes, SettleMinutes: DefaultDriveSettleMinutes},
+		Zotio:           Zotio{Executable: "zotio", TimeoutSeconds: 120, AttachmentMode: "stored", AutoImport: false, AutoEnrich: true, UnavailableRecheckDays: 14},
+		Retraction:      Retraction{Scope: RetractionScopeAcquired},
 		Notify: Notify{
 			Enabled: true, Preset: "milestones", MaxPerHour: 6,
 			QuietMode: "hold", DigestEveryMinutes: 240,
@@ -1265,6 +1330,9 @@ func (c *Config) validate() error {
 	}
 	if c.Fetch.TimeoutSeconds < 5 || c.Fetch.TimeoutSeconds > 3600 {
 		return fmt.Errorf("fetch.timeout_seconds must be in 5..3600")
+	}
+	if err := c.HostSuppression.validate(); err != nil {
+		return err
 	}
 	if c.PDF.TitleMatchThreshold <= 0 || c.PDF.TitleMatchThreshold > 1 {
 		return fmt.Errorf("pdf.title_match_threshold must be in (0,1]")

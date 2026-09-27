@@ -564,3 +564,24 @@ working settings on failed publication, and retains compatibility readers.
 `papio config credentials` provides the common operator commands. Browser authentication and Zotero
 credentials retain their existing owners, and dataset-bound incident keys
 retain their existing lifecycle.
+
+## Host-aware daemon fetch suppression
+
+**Decision:** ADR-0031 records every failed daemon fetch as an enumerated kind
+(`challenge`, `http-403`, `http-429`, `not-a-pdf`, and the rest) with the
+candidate host and the host that answered, in the existing attempt detail, and
+detects soft anti-bot pages from paired vendor-structure-plus-text body markers
+that never fire on a PDF. On that record it skips the daemon fetch — never the
+candidate — on a host with at least three challenge-or-403 refusals spanning a
+day inside ninety days and no daemon fetch success, checked at every redirect
+hop. Such a host gets one probe pass a week; a daemon success clears it, while
+browser and adoption accepts do not. Skipped open-access candidates keep their
+browser hint and landing-page recovery, a pass of only skips exhausts to the
+browser or institutional route, and a 429 only backs its host off. Settings
+live in `[host_suppression]`.
+
+**Why:** A quarter of daemon fetch attempts went to hosts that had never
+served it, and the store could not tell a challenge from a plain 403. Replayed
+over the operator's own history, the shipped defaults skip 54 of 677 attempts
+and none that would have succeeded; the reviewed rule without the one-day span
+and the probe pass would have skipped two that did.
