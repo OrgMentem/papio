@@ -74,8 +74,9 @@ for the full pre-split extension history.
   missed the closure and held later papers at the same library. The extension
   now reports that closure; a tab you pinned or moved out remains yours.
 - **A completed PDF grab can recover its result after a lost daemon reply.**
-  When the extension starts again, it checks the durable status of a completed
-  download and clears its saved correlation after it shows the outcome.
+  After the extension starts or reconnects, it checks the durable status of
+  a completed download and clears its saved correlation after it shows the
+  outcome.
 - **An Ebook Central refusal after sign-in no longer asks you to sign in
   again.** After a completed institutional sign-in, Ebook Central can send
   the tab to its "does not allow access ... from your current IP" page
