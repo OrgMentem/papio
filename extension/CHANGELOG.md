@@ -149,6 +149,26 @@ for the full pre-split extension history.
   a challenge instead of not found. The widget now counts only together
   with a challenge title or challenge text. The challenge-form markers
   still decide alone, so real challenge pages are still detected.
+- **A saved page capture keeps its DOI and its structured article data.**
+  The sanitizer dropped a `citation_doi` tag whose DOI suffix was long
+  enough to look like a secret token, and it emptied every JSON-LD block.
+  Captures and fixtures then disagreed with the live page on 63 of 297
+  measured pages; now they disagree on 18, and 13 of those come from the
+  intended URL masking. A DOI is kept as written unless its suffix itself looks like a
+  token. JSON-LD keeps only a fixed list of fields: identifiers, titles,
+  dates, journal, publisher, pages, article and PDF links, and author and
+  affiliation names. Everything else is removed, including contact details,
+  birth dates, and personal profile links. The block is written back so that
+  no value can close its script element, and a block over 256 KiB or nested
+  deeper than 16 levels is emptied. A capture that still holds anything
+  outside these rules is refused.
+- **The capture sanitizer removes credentials from every URL and no longer
+  stalls on long text.** A `user:password@` part is now removed from every
+  URL in a capture, not only from JSON-LD, and a capture that still holds one
+  is refused. Email masking had quadratic time: one 300 KB run of letters
+  took about 57 seconds, so a hostile page could stall a capture. It now
+  takes about 20 ms. Four committed Springer fixtures held the visitor's IP
+  address from the page footer; it is now masked.
 - **Closing an old sign-in tab after an extension restart releases its claim.**
   Earlier builds marked a tab as operator-owned when you only activated it.
   If you closed that tab while the extension was asleep, restart recovery

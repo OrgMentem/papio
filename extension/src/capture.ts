@@ -14,7 +14,13 @@
 // no secrets. Scripts/inline JS, query strings, fragments, form values, and any
 // token-shaped string are stripped or masked. The popup additionally REFUSES to
 // emit a fixture whose sanitized form still contains a residual secret, so a
-// dirty capture cannot cross the bridge.
+// dirty capture cannot cross the bridge. Fixtures are committed to a PUBLIC
+// repo, so the sanitizer fails closed: JSON-LD keeps only an allowlist of
+// bibliographic keys (a person keeps only its name and affiliation name;
+// contact data, profile links and every unlisted key are dropped), and its
+// output must be a fixed point of the scrub or residualLeak refuses it.
+// Public bibliographic identifiers are NOT secrets: a DOI whose suffix is not
+// token-shaped survives masking verbatim in DOI-named meta tags and JSON-LD.
 
 import {
   BROWSER_PROTOCOL_VERSION,
@@ -94,6 +100,27 @@ type SanitizedFixtureMeta = FixtureMeta | ObservedFixtureMeta;
  * enough to catch signed values, session ids, JWT segments, and API keys while
  * leaving ordinary words and short slugs alone. */
 const TOKEN_RE = /[A-Za-z0-9+/_-]{24,}/g;
+/** A bibliographic DOI candidate. A DOI names a public work, so a DOI whose
+ * suffix is not token-shaped (`isSafeDOI`) is kept verbatim even where a long
+ * separator-joined suffix trips TOKEN_RE (for example the run
+ * `1590/1806-9061-2017-0499` in `10.1590/1806-9061-2017-0499`). `?` and `#`
+ * end the match so a query or fragment can never hide inside a DOI. A match
+ * whose suffix IS token-shaped gets no exemption and is scrubbed like any
+ * other token. */
+const DOI_RE = /\b10\.\d{4,9}\/[^\s"'<>?#]+/g;
+
+/** Meta names whose `content` is a bibliographic DOI. Their tags survive the
+ * token-content drop and their values keep the DOI verbatim (queries are still
+ * stripped from URL-shaped values). */
+const DOI_META_NAMES: Record<string, true> = {
+  citation_doi: true,
+  "dc.identifier.doi": true,
+  bepress_citation_doi: true,
+  "dc.doi": true,
+  "dcterms.identifier": true,
+  doi: true,
+  "dc.identifier": true,
+};
 
 /** Elements whose *contents* never belong in a selector fixture. Their bodies
  * are emptied; the (attribute-scrubbed) open/close tags stay so structure and
@@ -104,8 +131,17 @@ const EMPTIED_CONTENT = /(<(script|noscript|iframe|object|embed|style|textarea|s
 
 /** Email addresses identify real people (authors, librarians, the capturing
  * user) and are never selector evidence. Masked in text and attribute values,
- * and rejected by residualLeak if one survives. */
-const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+ * and rejected by residualLeak if one survives. Every part is length-bounded
+ * (RFC 5321: local part 64, label 63) so matching stays linear: an unbounded
+ * local part made one 300 KB alphanumeric run cost ~57 s of backtracking. */
+const EMAIL_RE = /[A-Za-z0-9._%+-]{1,64}@(?:[A-Za-z0-9-]{1,63}\.){1,8}[A-Za-z]{2,63}/g;
+
+/** URL userinfo (`scheme://user:pass@`) anywhere in a value or text. Short
+ * credentials pass every token rule, and a single-label host escapes the
+ * email rule, so userinfo is removed wherever URLs are scrubbed and refused
+ * by residualLeak anywhere in the output. The scheme is length-bounded and
+ * the userinfo class stops at `/`, so matching stays linear. */
+const USERINFO_RE = /([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/?#@"'<>]*@/gi;
 
 /** IP addresses identify the capturing browser: Elsevier's refusal page, for
  * one, prints the operator's own address beside its reference number. They
@@ -196,12 +232,101 @@ const STRUCTURAL_ATTRS: Record<string, true> = {
 };
 
 /** Replace every token-shaped run, email address, and IP address with the
- * literal `TOKEN`, and cut the query/fragment from any absolute URL written
- * into text: a page can print a short signed link that no length rule sees. */
+ * literal `TOKEN`, drop URL userinfo, and cut the query/fragment from any
+ * absolute URL written into text: a page can print a short signed link that
+ * no length rule sees. */
 function scrubTokens(text: string): string {
-  return scrubIPAddresses(text.replace(TEXT_URL_RE, (url) => scrubURLValue(url)))
+  return scrubIPAddresses(text.replace(USERINFO_RE, "$1").replace(TEXT_URL_RE, (url) => scrubURLValue(url)))
     .replace(EMAIL_RE, "TOKEN")
     .replace(TOKEN_RE, "TOKEN");
+}
+/**
+ * Opaque-piece rule, shared by DOI suffixes and retained JSON-LD values.
+ * A value is cut into pieces at every character outside `[A-Za-z0-9+=]`
+ * (so `-._;()/:` all separate). A piece is plain when it reads as a word or a
+ * short number: lowercase up to 16, Capitalized up to 16, ALLCAPS up to 8,
+ * digits up to 13 (an ISBN-13), or a camelCase/compound semantic word.
+ * Everything else (letter+digit mixes, random case, long runs) is opaque.
+ * A value is token-shaped when its opaque pieces carry 16 or more characters
+ * IN TOTAL: this catches one bearer token split across several path
+ * segments (`AbCdEf0123456789/GhIjKl0123456789`), which a per-segment
+ * 24-character check misses, while record ids such as `p1hs8-6wm96` or
+ * `2012v10n16` stay below the bound.
+ */
+const PIECE_RE = /[A-Za-z0-9+=]+/g;
+const OPAQUE_BUDGET = 16;
+
+function isPlainPiece(piece: string): boolean {
+  return (
+    /^[a-z]{1,16}$/.test(piece) ||
+    /^[A-Z][a-z]{1,15}$/.test(piece) ||
+    /^[A-Z]{1,8}$/.test(piece) ||
+    /^\d{1,13}$/.test(piece) ||
+    isSemanticSelectorToken(piece)
+  );
+}
+
+function opaqueChars(text: string): number {
+  let total = 0;
+  for (const m of text.matchAll(PIECE_RE)) if (!isPlainPiece(m[0])) total += m[0].length;
+  return total;
+}
+
+/** A DOI keeps its exemption only when its suffix is not token-shaped (no
+ * opaque budget overrun, which also covers any 24+ character run between
+ * separators). The 8 measured `citation_doi` losses, e.g.
+ * `10.1590/1806-9061-2017-0499` and
+ * `10.21062/ujep/x.2016/a/1213-2489/MT/16/5/1033`, all qualify;
+ * `10.1234/ABCDEFGHIJKLMNOPQRSTUVWXYZ012345` does not. */
+function isSafeDOI(doi: string): boolean {
+  return opaqueChars(doi.slice(doi.indexOf("/") + 1)) < OPAQUE_BUDGET;
+}
+
+/** Split `text` around safe DOIs: `parts` never contains a safe DOI; `dois`
+ * holds them in order, to be put back verbatim between transformed parts. */
+function splitSafeDOIs(text: string): { parts: string[]; dois: string[] } {
+  const parts: string[] = [];
+  const dois: string[] = [];
+  let last = 0;
+  for (const m of text.matchAll(new RegExp(DOI_RE.source, "g"))) {
+    if (!isSafeDOI(m[0])) continue;
+    parts.push(text.slice(last, m.index));
+    dois.push(m[0]);
+    last = m.index + m[0].length;
+  }
+  parts.push(text.slice(last));
+  return { parts, dois };
+}
+
+function joinAroundDOIs(parts: string[], dois: string[]): string {
+  let out = parts[0] ?? "";
+  for (let i = 0; i < dois.length; i += 1) out += `${dois[i]}${parts[i + 1] ?? ""}`;
+  return out;
+}
+
+/** Same as scrubTokens, but a safe bibliographic DOI passes through verbatim:
+ * the DOI is a public work identifier, and its suffix alone can trip
+ * TOKEN_RE. A token-shaped DOI suffix gets no exemption. */
+function scrubTokensPreservingDOI(text: string): string {
+  const { parts, dois } = splitSafeDOIs(text);
+  return joinAroundDOIs(parts.map(scrubTokens), dois);
+}
+
+/** Remove URL userinfo (`user:pass@`): at the start of a URL value
+ * (including protocol-relative `//user@host`) and after every `scheme://`
+ * anywhere in the text. */
+function stripUserinfo(value: string): string {
+  return value.replace(/^((?:[a-z][a-z0-9+.-]{0,31}:)?\/\/)[^/?#]*@/i, "$1").replace(USERINFO_RE, "$1");
+}
+
+/** Scrub the `content` of a DOI-named meta tag: a safe DOI survives verbatim,
+ * URL-shaped values lose userinfo and query/fragment, and every other secret
+ * pattern (email, IP, token runs, token-shaped DOI suffixes) is masked. */
+function scrubDoiMetaContent(value: string): string {
+  const isURL = /^(?:[a-z][a-z0-9+.-]*:\/\/|\/)/i.test(value);
+  const bare = isURL ? stripUserinfo(value) : value;
+  const cut = bare.search(/[?#]/);
+  return scrubTokensPreservingDOI(isURL && cut !== -1 ? bare.slice(0, cut) : bare);
 }
 
 function isSemanticSelectorToken(token: string): boolean {
@@ -235,8 +360,9 @@ function scrubSelectorTokens(text: string): string {
 const URL_TOKEN_RE = /[A-Za-z0-9+_-]{24,}/g;
 
 function scrubURLValue(value: string): string {
-  const cut = value.search(/[?#]/);
-  const queryless = cut === -1 ? value : value.slice(0, cut);
+  const bare = stripUserinfo(value);
+  const cut = bare.search(/[?#]/);
+  const queryless = cut === -1 ? bare : bare.slice(0, cut);
   return queryless
     .split("/")
     .map((segment) =>
@@ -277,10 +403,14 @@ function parseAttrs(attrRegion: string): ParsedAttr[] {
 }
 
 /** Does a start tag carry a token-shaped `content` attribute? Used to drop
- * `<meta>` tags that ship a CSRF token / build hash / session value. */
+ * `<meta>` tags that ship a CSRF token / build hash / session value. DOI
+ * substrings are carved out first: a DOI suffix can itself be token-shaped,
+ * and a DOI is a public identifier, never a drop reason. */
 function hasTokenContent(attrs: ParsedAttr[]): boolean {
   for (const a of attrs) {
-    if (a.name.toLowerCase() === "content" && new RegExp(TOKEN_RE.source).test(a.value)) return true;
+    if (a.name.toLowerCase() !== "content") continue;
+    const withoutDOI = splitSafeDOIs(a.value).parts.join(" ");
+    if (new RegExp(TOKEN_RE.source).test(withoutDOI)) return true;
   }
   return false;
 }
@@ -365,10 +495,12 @@ function rewriteStartTag(raw: string): string {
         value = scrubTokens(
           value.replace(REFRESH_URL_RE, (_match, lead: string, url: string) => lead + scrubURLValue(url)),
         );
+      } else if (tag === "meta" && lname === "content" && DOI_META_NAMES[metaName] === true) {
+        value = scrubDoiMetaContent(value);
       } else {
         value = STRUCTURAL_ATTRS[lname] ? scrubSelectorTokens(value) : scrubTokens(value);
       }
-      value = scrubIPAddresses(value.replace(EMAIL_RE, "TOKEN"));
+      value = scrubIPAddresses(value.replace(USERINFO_RE, "$1").replace(EMAIL_RE, "TOKEN"));
     }
 
     rendered.push(`${a.name}="${value}"`);
@@ -379,21 +511,196 @@ function rewriteStartTag(raw: string): string {
 }
 
 const TOKEN_STREAM = /<!--[\s\S]*?-->|<[^>]*>/g;
+/** `application/ld+json` script elements: structured bibliographic metadata
+ * (identifiers, DOI, name/headline, datePublished, isPartOf, url, contentUrl)
+ * that E0 reads. They are stashed before the emptying pass and restored by
+ * `scrubJsonLdBody` instead of being emptied: emptying them both loses the
+ * metadata and leaves an empty script that E0 reports as `e0:json-ld-invalid`.
+ * The unquoted-type alternative is matched because provider markup varies. */
+const LDJSON_RE =
+  /<script\b[^>]*type=(?:"application\/ld\+json"|'application\/ld\+json'|application\/ld\+json)[^>]*>[\s\S]*?<\/script\s*>/gi;
+const LDJSON_MARKER_RE = /<script\b[^>]*data-papio-ldjson="(\d+)"[^>]*><\/script\s*>/g;
+const LDJSON_BODY_RE = /^<script\b[^>]*>([\s\S]*?)<\/script\s*>$/i;
+
+/** A JSON-LD body larger or deeper than these is not parsed at all: it
+ * becomes empty. Measured maxima on 297 pages: 9.4 KB and depth 7. */
+const JSONLD_MAX_BYTES = 256 * 1024;
+const JSONLD_MAX_DEPTH = 16;
+
+/**
+ * JSON-LD privacy rule. Fixtures are committed to a PUBLIC repo, so the walk
+ * is an ALLOWLIST: a key survives only when its context lists it; every other
+ * key (contact data, birthDate, a person's url/sameAs/identifier, token-shaped
+ * property names, anything unforeseen) is dropped with its whole subtree.
+ *
+ * - work: the bibliographic record and nested works/media/publishers.
+ * - person: anything typed Person (`Person`, `schema:Person`, the
+ *   `http(s)://schema.org/Person` IRIs, alone or in a type array), anything
+ *   carrying givenName/familyName, and every untyped or non-Organization
+ *   value under author/creator/editor/contributor. Keeps only the name.
+ * - org: an affiliation, or an Organization in an author slot: name only.
+ * - identifier: a PropertyValue under `identifier`.
+ * - context: `@context` keeps strings only (an inline term map is dropped).
+ */
+type JsonLdContext = "work" | "personSlot" | "person" | "org" | "identifier" | "context";
+
+type JsonLdScope = "work" | "person" | "org" | "identifier";
+
+const JSONLD_KEYS: Record<JsonLdScope, Record<string, true>> = {
+  work: {
+    "@context": true, "@type": true, "@id": true, "@graph": true,
+    identifier: true, doi: true, name: true, headline: true, alternativeHeadline: true,
+    datePublished: true, dateCreated: true, dateModified: true,
+    isPartOf: true, hasPart: true, publisher: true, url: true, sameAs: true,
+    // plan.ts reads contentUrl under encoding, associatedMedia, and any nested
+    // record; a PDF part declared through hasPart was measured (2026-09).
+    encoding: true, associatedMedia: true, contentUrl: true, encodingFormat: true,
+    pagination: true, pageStart: true, pageEnd: true, volumeNumber: true, issueNumber: true, inLanguage: true,
+    author: true, creator: true, editor: true, contributor: true,
+  },
+  person: { "@type": true, name: true, givenName: true, familyName: true, affiliation: true },
+  org: { "@type": true, name: true },
+  identifier: { "@type": true, name: true, propertyID: true, value: true },
+};
+const JSONLD_PERSON_SLOTS: Record<string, true> = { author: true, creator: true, editor: true, contributor: true };
+
+/** Normalized schema.org type names of a node (`schema:Person`,
+ * `https://schema.org/Person` and `Person` all read as `person`). */
+function jsonLdTypes(record: Record<string, unknown>): string[] {
+  const raw = record["@type"];
+  return (Array.isArray(raw) ? raw : [raw])
+    .filter((t): t is string => typeof t === "string")
+    .map((t) => t.replace(/^(?:https?:\/\/schema\.org\/|schema:)/i, "").toLowerCase());
+}
+
+/**
+ * Scrub one retained JSON-LD string. URL-shaped values lose userinfo and
+ * query/fragment. Safe DOIs stay verbatim (`isSafeDOI`). The whole value
+ * (host and path joined) then passes the opaque-piece rule, so a token split
+ * across path segments is masked; after that URLs get the per-segment token
+ * rule and other text the full token rule, plus email and IP masking.
+ * Opaque masking runs first so the result is a fixed point, which
+ * `residualLeak` relies on.
+ */
+function scrubJsonLdString(text: string): string {
+  const isURL = /^(?:[a-z][a-z0-9+.-]*:\/\/|\/)/i.test(text);
+  let value = text;
+  if (isURL) {
+    value = stripUserinfo(value);
+    const cut = value.search(/[?#]/);
+    if (cut !== -1) value = value.slice(0, cut);
+  }
+  const { parts, dois } = splitSafeDOIs(value);
+  const masked =
+    opaqueChars(parts.join(" ")) >= OPAQUE_BUDGET
+      ? parts.map((part) => part.replace(PIECE_RE, (piece) => (isPlainPiece(piece) ? piece : "TOKEN")))
+      : parts;
+  const scrubbed = masked.map((part) =>
+    isURL ? scrubIPAddresses(scrubURLValue(part).replace(EMAIL_RE, "TOKEN")) : scrubTokens(part),
+  );
+  return joinAroundDOIs(scrubbed, dois);
+}
+
+/** Walk one parsed JSON-LD value under the allowlist; `undefined` drops it.
+ * Depth is bounded by the caller's pre-parse scan. */
+function scrubJsonLdValue(value: unknown, context: JsonLdContext): unknown {
+  if (typeof value === "string") return scrubJsonLdString(value);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => scrubJsonLdValue(item, context)).filter((item) => item !== undefined);
+  }
+  if (typeof value !== "object" || context === "context") return undefined;
+  const record = value as Record<string, unknown>;
+  const types = jsonLdTypes(record);
+  const isOrg = types.includes("organization");
+  let scope: JsonLdScope;
+  if (types.includes("person") || "givenName" in record || "familyName" in record) scope = "person";
+  else if (context === "personSlot") scope = isOrg ? "org" : "person";
+  else if (context === "person" || context === "org") scope = context === "person" && !isOrg ? "person" : "org";
+  else scope = context === "identifier" ? "identifier" : "work";
+  const allowed = JSONLD_KEYS[scope];
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(record)) {
+    // `=== true`, not truthiness: inherited names such as `constructor` or
+    // `__proto__` must never pass the allowlist.
+    if (allowed[key] !== true) continue;
+    let child: JsonLdContext = scope;
+    if (key === "@context") child = "context";
+    else if (scope === "work" && JSONLD_PERSON_SLOTS[key] === true) child = "personSlot";
+    else if (scope === "work" && key === "identifier") child = "identifier";
+    else if (scope === "person" && key === "affiliation") child = "org";
+    const scrubbed = scrubJsonLdValue(item, child);
+    if (scrubbed !== undefined) out[key] = scrubbed;
+  }
+  return out;
+}
+
+/** Whether a JSON text nests deeper than `max`, by a linear scan that never
+ * recurses (strings and escapes are skipped). */
+function jsonDeeperThan(body: string, max: number): boolean {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (inString) {
+      if (ch === "\\") i += 1;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") {
+      depth += 1;
+      if (depth > max) return true;
+    } else if (ch === "}" || ch === "]") depth -= 1;
+  }
+  return false;
+}
+
+/**
+ * Scrub one stashed JSON-LD body, returning its replacement. An oversized,
+ * over-deep, empty, or invalid body becomes empty (the raw page already
+ * reports an empty/invalid block as `e0:json-ld-invalid`, so the sanitizer
+ * never invents that signal). A parsed body is walked under the allowlist
+ * and serialized with `<`, `>`, `&`, U+2028 and U+2029 escaped as `\uXXXX`,
+ * so no retained string can close the script element or open markup.
+ * The output is a fixed point: scrubbing it again returns it unchanged.
+ */
+function scrubJsonLdBody(body: string): string {
+  if (body.length > JSONLD_MAX_BYTES || jsonDeeperThan(body, JSONLD_MAX_DEPTH)) return "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return "";
+  }
+  const scrubbed = scrubJsonLdValue(parsed, "work");
+  if (scrubbed === undefined) return "";
+  return JSON.stringify(scrubbed).replace(
+    /[<>&\u2028\u2029]/g,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
 
 /**
  * Deterministically sanitize a captured document into an adapter fixture.
  *
  * Order matters and is fixed:
+ *  0. Stash `application/ld+json` script elements as markers (their bodies
+ *     are structured metadata, scrubbed and restored in step 4).
  *  1. Empty the bodies of script/style/etc. (their content is never a selector).
  *  2. Walk the remaining markup as a tag/comment/text stream:
  *     - start tags   → strip URL tails, blank form values, mask token attrs;
  *     - comments      → emptied (comments are never selector evidence);
  *     - text nodes    → mask token-shaped runs;
  *     - end tags/etc. → passed through untouched.
- *  3. Prepend the papio-fixture header (added last, so it is never scrubbed).
+ *  3. Restore the stashed JSON-LD bodies, scrubbed by `scrubJsonLdBody`.
+ *  4. Prepend the papio-fixture header (added last, so it is never scrubbed).
  */
 export function sanitizeFixture(html: string, meta: SanitizedFixtureMeta): string {
-  const emptied = html.replace(EMPTIED_CONTENT, "$1$3");
+  const stashed: string[] = [];
+  const withPlaceholders = html.replace(LDJSON_RE, (m) => {
+    stashed.push(m);
+    return `<script type="application/ld+json" data-papio-ldjson="${stashed.length - 1}"></script>`;
+  });
+  const emptied = withPlaceholders.replace(EMPTIED_CONTENT, "$1$3");
 
   let out = "";
   let last = 0;
@@ -419,7 +726,17 @@ export function sanitizeFixture(html: string, meta: SanitizedFixtureMeta): strin
   }
   if (last < emptied.length) out += scrubTokens(emptied.slice(last));
 
-  return `${fixtureHeader(meta)}\n${out}`;
+  // Restore JSON-LD with person-identifying subtrees removed (step 0 stashed
+  // the raw elements; the marker carries only an index, never page content).
+  // A plain `<script type>` open tag replaces the original: the original's
+  // attributes (nonces, ids) are never selector evidence.
+  const restored = out.replace(LDJSON_MARKER_RE, (_m, i: string) => {
+    const original = stashed[Number(i)] ?? "";
+    const body = LDJSON_BODY_RE.exec(original)?.[1] ?? "";
+    return `<script type="application/ld+json">${scrubJsonLdBody(body)}</script>`;
+  });
+
+  return `${fixtureHeader(meta)}\n${restored}`;
 }
 
 /** The first-line provenance comment the adapter harness keys on. Dynamic
@@ -447,6 +764,9 @@ export function residualLeak(sanitized: string): string | null {
   if (email) return `an email address survived sanitization (${email[0].slice(0, 8)}…)`;
   // Never echo the address itself: this message reaches logs.
   if (containsIPAddress(sanitized)) return "an IP address survived sanitization";
+  // URL credentials anywhere: after any `scheme://`, or at the start of a
+  // URL-bearing attribute (`//user@host`, checked with the attributes below).
+  if (new RegExp(USERINFO_RE.source, "i").test(sanitized)) return "URL credentials survived sanitization";
 
   const residual = (value: string, allowSemanticSelector = false): string | undefined => {
     for (const match of value.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
@@ -456,6 +776,10 @@ export function residualLeak(sanitized: string): string | null {
     }
     return undefined;
   };
+  // A safe DOI is a public work identifier, not a secret: its suffix alone
+  // can trip TOKEN_RE, so safe DOIs are carved out before the token check on
+  // DOI-named meta contents. A token-shaped DOI suffix (`isSafeDOI` false)
+  // gets no exemption.
   const residualURL = (value: string): string | undefined => {
     for (const segment of value.split("/")) {
       for (const match of segment.matchAll(new RegExp(URL_TOKEN_RE.source, "g"))) {
@@ -467,13 +791,28 @@ export function residualLeak(sanitized: string): string | null {
     return undefined;
   };
   let last = 0;
+  let inLdJson = false;
+  // A restored `application/ld+json` body must be exactly what
+  // `scrubJsonLdBody` emits: re-scrubbing it must return it unchanged. That
+  // one check enforces every JSON-LD rule at once (allowlisted keys only,
+  // person scope, userinfo, whole-URL opaque pieces, token-shaped DOIs,
+  // escaped `<`/`>`/`&`, size and depth bounds). A body cut short by a stray
+  // tag fails to parse and is refused too. All other script bodies are
+  // emptied, so only JSON-LD gets this treatment; other text keeps the
+  // token check.
+  const textLeak = (text: string): string | undefined => {
+    if (inLdJson) {
+      return text === "" || scrubJsonLdBody(text) === text ? undefined : "a JSON-LD block is not in sanitized form";
+    }
+    const token = residual(text);
+    if (token) return `a token-shaped value survived sanitization (${token.slice(0, 8)}…)`;
+    return TEXT_URL_QUERY_RE.test(text) ? "a URL in page text still contains a query string" : undefined;
+  };
   for (const m of sanitized.matchAll(TOKEN_STREAM)) {
     const start = m.index;
     const syntax = m[0];
-    const text = sanitized.slice(last, start);
-    const textToken = residual(text);
-    if (textToken) return `a token-shaped value survived sanitization (${textToken.slice(0, 8)}…)`;
-    if (TEXT_URL_QUERY_RE.test(text)) return "a URL in page text still contains a query string";
+    const leak = textLeak(sanitized.slice(last, start));
+    if (leak) return leak;
 
     if (syntax.startsWith("<!--")) {
       // The first comment is generated by fixtureHeader(). Its origin is
@@ -499,8 +838,15 @@ export function residualLeak(sanitized: string): string | null {
       const head = /^<\s*([a-zA-Z][-\w]*)/.exec(syntax);
       const close = /\s*\/?>$/.exec(syntax);
       if (head && close) {
+        const tag = head[1]?.toLowerCase() ?? "";
         const attrs = parseAttrs(syntax.slice(head[0].length, syntax.length - close[0].length));
-        if (head[1]?.toLowerCase() === "meta") {
+        if (tag === "script") {
+          inLdJson =
+            attrs.some(
+              (a) => a.name.toLowerCase() === "type" && a.value.toLowerCase() === "application/ld+json",
+            );
+        }
+        if (tag === "meta") {
           const metaName =
             attrs.find((a) => a.name.toLowerCase() === "name")?.value.toLowerCase() ?? "";
           const content = attrs.find((a) => a.name.toLowerCase() === "content")?.value ?? "";
@@ -508,10 +854,14 @@ export function residualLeak(sanitized: string): string | null {
             return `a per-request identifier meta survived sanitization (${metaName})`;
           }
         }
-        const safeURLMeta = head[1]?.toLowerCase() === "meta" && urlMeta(attrs);
+        const safeURLMeta = tag === "meta" && urlMeta(attrs);
         const refreshMeta =
-          head[1]?.toLowerCase() === "meta" &&
+          tag === "meta" &&
           attrs.some((a) => a.name.toLowerCase() === "http-equiv" && a.value.trim().toLowerCase() === "refresh");
+        const doiMeta =
+          tag === "meta" &&
+          DOI_META_NAMES[attrs.find((a) => a.name.toLowerCase() === "name")?.value.toLowerCase() ?? ""] ===
+            true;
         for (const attr of attrs) {
           if (!attr.hasValue) continue;
           const lname = attr.name.toLowerCase();
@@ -528,20 +878,27 @@ export function residualLeak(sanitized: string): string | null {
           ) {
             return "a URL inside an attribute value still contains a query string";
           }
+          const doiContent = doiMeta && lname === "content";
+          if ((urlValued || doiContent) && /^(?:[a-z][a-z0-9+.-]{0,31}:)?\/\/[^/?#]*@/i.test(attr.value)) {
+            return "a URL-bearing attribute still contains credentials";
+          }
+          if (doiContent && /^(?:[a-z][a-z0-9+.-]*:\/\/|\/)/i.test(attr.value) && /[?#]/.test(attr.value)) {
+            return "a URL-bearing attribute still contains a query string";
+          }
           const attrToken = urlValued
             ? residualURL(attr.value)
-            : residual(attr.value, STRUCTURAL_ATTRS[lname] === true);
+            : doiContent
+              ? residual(splitSafeDOIs(attr.value).parts.join(" "))
+              : residual(attr.value, STRUCTURAL_ATTRS[lname] === true);
           if (attrToken) return `a token-shaped value survived sanitization (${attrToken.slice(0, 8)}…)`;
         }
       }
+    } else if (/^<\s*\//.test(syntax)) {
+      if (/^<\s*\/\s*script\b/i.test(syntax)) inLdJson = false;
     }
     last = start + syntax.length;
   }
-  const tail = sanitized.slice(last);
-  const tailToken = residual(tail);
-  if (tailToken) return `a token-shaped value survived sanitization (${tailToken.slice(0, 8)}…)`;
-  if (TEXT_URL_QUERY_RE.test(tail)) return "a URL in page text still contains a query string";
-  return null;
+  return textLeak(sanitized.slice(last)) ?? null;
 }
 
 // ---------------------------------------------------------------------------

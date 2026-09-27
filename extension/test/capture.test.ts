@@ -189,6 +189,39 @@ test("email addresses are masked in text, attributes, and mailto links", () => {
   expect(residualLeak(`<span>owen@stanford.edu</span>`)).toContain("email address");
 });
 
+test("URL credentials are removed from every URL and refused anywhere", () => {
+  const out = sanitizeFixture(
+    `<a href="https://alice:pw@publisher.example/file.pdf">a</a>` +
+      `<img src="//bob:pw2@cdn.example/x.png">` +
+      `<div data-link="ftp://carol:s3cret@files.example/doc">t</div>` +
+      `<p>mirror at https://dave:pw4@host/y</p>`, // betterleaks:allow -- synthetic negative-test input, never sent
+    META,
+  );
+  for (const secret of ["alice", "bob:", "pw2", "carol", "s3cret", "dave", "pw4"]) expect(out).not.toContain(secret);
+  expect(out).toContain(`href="https://publisher.example/file.pdf"`);
+  expect(out).toContain(`src="//cdn.example/x.png"`);
+  expect(out).toContain(`data-link="ftp://files.example/doc"`);
+  expect(out).toContain("mirror at https://host/y");
+  expect(residualLeak(out)).toBeNull();
+  // The guard refuses credentials that the rewriter never saw. Single-label
+  // hosts: `user:pw@host.tld` would already be refused as an email address.
+  expect(residualLeak(`<a href="https://alice:pw@publisher/f">a</a>`)).toContain("credentials"); // betterleaks:allow -- synthetic negative-test input, never sent
+  expect(residualLeak(`<img src="//bob:pw2@cdn/x.png">`)).toContain("credentials");
+  expect(residualLeak(`<p>mirror at https://dave:pw4@host/y</p>`)).toContain("credentials"); // betterleaks:allow -- synthetic negative-test input, never sent
+});
+
+test("a long unbroken run is sanitized and guarded in linear time", () => {
+  // An unbounded email pattern backtracked quadratically: one 300 KB
+  // alphanumeric run cost ~57 s. The bound is generous; linear takes ~20 ms.
+  for (const run of ["x".repeat(300_000), `a@${"b".repeat(300_000)}`]) {
+    const started = performance.now();
+    const out = sanitizeFixture(`<p>${run}</p>`, META);
+    expect(residualLeak(out)).toBeNull();
+    expect(residualLeak(`<p>${run}</p>`)).toContain("token-shaped");
+    expect(performance.now() - started).toBeLessThan(2_000);
+  }
+});
+
 test("provider-specific URL attributes lose queries like href/src do", () => {
   const out = sanitizeFixture(
     `<div data-fullTexturl="/content/journals/10.1146/x.html?itemId=/content/journals/10.1146/x&mimeType=html">a</div>` +
@@ -279,6 +312,181 @@ test("meta tags carrying a token-shaped content are dropped", () => {
   expect(out).not.toContain("csrf-token");
   expect(out).not.toContain(TOKEN);
   expect(out).toContain("<title>ok</title>");
+});
+// Fixtures are committed to a PUBLIC repo. The sanitizer keeps public
+// bibliographic metadata (DOIs, titles, dates, publication and PDF URLs,
+// author names) and must fail closed on everything else: residualLeak is the
+// guard that refuses a capture, so each rule is checked against it too.
+
+const LD = (json: string): string => `<script type="application/ld+json">${json}</script>`;
+const HEADER =
+  `<!-- papio-fixture provider="proquest" scenario="success" origin="https://www.proquest.com/docview/1" captured="2026-07-14T00:00:00.000Z" -->\n`;
+
+test("every measured citation_doi loss survives verbatim", () => {
+  // The 8 pages of the 2026-09 fidelity study whose citation_doi the old
+  // token-content drop removed: separator-joined suffixes of 24+ characters.
+  for (const doi of [
+    "10.1590/1806-9061-2017-0499",
+    "10.30906/0869-2092-2018-81-5s-68-69",
+    "10.18041/1900-0642/criteriolibre.2012v10n16.1167",
+    "10.31652/2415-7872-2022-71-18-22",
+    "10.20324/nelumbo/v62/2020/153742",
+    "10.55813/gaea/ccri/v6/nE1/693",
+    "10.24160/1993-6982-2019-6-58-63",
+    "10.21062/ujep/x.2016/a/1213-2489/MT/16/5/1033",
+  ]) {
+    const out = sanitizeFixture(`<meta name="citation_doi" content="${doi}"><title>ok</title>`, META);
+    expect(out).toContain(`name="citation_doi" content="${doi}"`);
+    expect(residualLeak(out)).toBeNull();
+  }
+});
+
+test("a DOI whose suffix is token-shaped gets no exemption", () => {
+  const doi = `10.1234/${TOKEN}`;
+  const meta = sanitizeFixture(`<meta name="citation_doi" content="${doi}">`, META);
+  expect(meta).not.toContain(TOKEN);
+  expect(residualLeak(meta)).toBeNull();
+  const jsonld = sanitizeFixture(LD(JSON.stringify({ "@type": "ScholarlyArticle", identifier: doi })), META);
+  expect(jsonld).not.toContain(TOKEN);
+  expect(residualLeak(jsonld)).toBeNull();
+  // The guard refuses the unsanitized forms on its own.
+  expect(residualLeak(`${HEADER}<meta name="citation_doi" content="${doi}">`)).toContain("token-shaped");
+  expect(residualLeak(`${HEADER}${LD(JSON.stringify({ identifier: doi }))}`)).not.toBeNull();
+});
+
+test("JSON-LD keeps allowlisted bibliographic fields and author names only", () => {
+  const body = JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "ScholarlyArticle",
+    identifier: { "@type": "PropertyValue", propertyID: "DOI", value: "10.1590/1806-9061-2017-0499" },
+    headline: "A study of fixtures",
+    datePublished: "2017-01-01",
+    url: "https://example.org/article/10.1590/1806-9061-2017-0499",
+    encoding: { "@type": "MediaObject", contentUrl: "https://example.org/article/file.pdf" },
+    isPartOf: { "@type": "Periodical", name: "Journal of Fixtures" },
+    description: "free text is not on the allowlist",
+    author: [
+      {
+        "@type": "Person",
+        name: "Ada Example",
+        email: "ada@example.org",
+        telephone: "+1-555-0100",
+        birthDate: "1990-01-01",
+        address: { streetAddress: "1 Main St" },
+        url: "https://ada.example/me",
+        sameAs: "https://orcid.org/0000-0002-1825-0097",
+        affiliation: { "@type": "Organization", name: "Fixture University", url: "https://uni.example/" },
+      },
+    ],
+    publisher: { "@type": "Organization", name: "Example Press" },
+  });
+  const out = sanitizeFixture(`${LD(body)}<p>text</p>`, META);
+  for (const kept of [
+    "10.1590/1806-9061-2017-0499",
+    "A study of fixtures",
+    "2017-01-01",
+    "https://example.org/article/file.pdf",
+    "Journal of Fixtures",
+    "Ada Example",
+    "Fixture University",
+    "Example Press",
+  ])
+    expect(out).toContain(kept);
+  for (const dropped of [
+    "free text",
+    "ada@example.org",
+    "+1-555-0100",
+    "1990-01-01",
+    "1 Main St",
+    "ada.example",
+    "orcid.org",
+    "uni.example",
+  ])
+    expect(out).not.toContain(dropped);
+  expect(residualLeak(out)).toBeNull();
+});
+
+test("JSON-LD person scope covers untyped authors and schema.org type IRIs", () => {
+  const body = JSON.stringify({
+    "@graph": [
+      { "@type": "https://schema.org/Person", name: "Ada", sameAs: "https://profiles.example/ada" },
+      { "@type": ["schema:Person"], name: "Bo", url: "https://profiles.example/bo" },
+      { "@type": "ScholarlyArticle", author: { name: "Cy", birthDate: "1991-02-03", sameAs: "https://profiles.example/cy" } },
+    ],
+  });
+  const out = sanitizeFixture(LD(body), META);
+  expect(out).toContain("Ada");
+  expect(out).toContain("Cy");
+  expect(out).not.toContain("profiles.example");
+  expect(out).not.toContain("1991-02-03");
+  expect(residualLeak(out)).toBeNull();
+  // The guard refuses person data that was never scrubbed.
+  expect(residualLeak(`${HEADER}${LD(body)}`)).not.toBeNull();
+});
+
+test("JSON-LD drops token-shaped property names", () => {
+  const key = "AbCdEf0123456789/GhIjKl0123456789"; // betterleaks:allow -- synthetic negative-test input, never sent
+  const body = JSON.stringify({ "@type": "ScholarlyArticle", [key]: "x", name: "t" });
+  const out = sanitizeFixture(LD(body), META);
+  expect(out).not.toContain(key);
+  expect(residualLeak(out)).toBeNull();
+  expect(residualLeak(`${HEADER}${LD(body)}`)).not.toBeNull();
+});
+
+test("JSON-LD URLs lose credentials and tokens split across path segments", () => {
+  const split = "https://pub.example/AbCdEf0123456789/GhIjKl0123456789/file.pdf";
+  const creds = "https://alice:shortsecret@publisher/file.pdf"; // betterleaks:allow -- synthetic negative-test input, never sent
+  const semantic = "https://www.kci.go.kr/kciportal/journal/articleDetail/view.pdf";
+  const body = JSON.stringify({ "@type": "ScholarlyArticle", contentUrl: split, url: creds, sameAs: semantic });
+  const out = sanitizeFixture(LD(body), META);
+  expect(out).not.toContain("AbCdEf0123456789");
+  expect(out).not.toContain("GhIjKl0123456789");
+  expect(out).toContain("https://pub.example/TOKEN/TOKEN/file.pdf");
+  expect(out).not.toContain("alice");
+  expect(out).not.toContain("shortsecret");
+  expect(out).toContain("https://publisher/file.pdf");
+  // A long route made of words stays usable as evidence.
+  expect(out).toContain(semantic);
+  expect(residualLeak(out)).toBeNull();
+  for (const url of [split, creds]) {
+    expect(residualLeak(`${HEADER}${LD(JSON.stringify({ url }))}`)).not.toBeNull();
+  }
+});
+
+test("JSON-LD text can never close its script element", () => {
+  const payload = '{"@type":"ScholarlyArticle","name":"\\u003c/script\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e & \\u2028"}';
+  const out = sanitizeFixture(LD(payload), META);
+  expect(out).not.toContain("<script>alert");
+  expect(out.match(/<\/script>/g)).toHaveLength(1);
+  expect(out).toContain("\\u003c/script\\u003e");
+  expect(out).toContain("\\u0026");
+  expect(out).toContain("\\u2028");
+  expect(residualLeak(out)).toBeNull();
+  // An unescaped `<` or `>` inside a retained body is refused by the guard.
+  expect(residualLeak(`${HEADER}${LD('{"name":"a>b"}')}`)).not.toBeNull();
+  expect(residualLeak(`${HEADER}<script type="application/ld+json">{"name":"</script><script>x</script>`)).not.toBeNull();
+});
+
+test("JSON-LD secrets are masked and empty, invalid, huge, or deep blocks stay empty", () => {
+  const secret = `sk-live-${TOKEN}`;
+  const out = sanitizeFixture(LD(JSON.stringify({ "@type": "ScholarlyArticle", headline: secret, name: "t" })), META);
+  expect(out).not.toContain(TOKEN);
+  expect(out).toContain('"name":"t"');
+  expect(residualLeak(out)).toBeNull();
+  // A block with no usable JSON stays empty: an empty or invalid raw block
+  // already reports `e0:json-ld-invalid`, so the sanitizer never invents it.
+  const huge = JSON.stringify({ "@type": "ScholarlyArticle", name: "word ".repeat(60_000) });
+  const deep = `${"[".repeat(100_000)}${"]".repeat(100_000)}`;
+  for (const body of ["", "{oops", huge, deep, `${"[".repeat(17)}${"]".repeat(17)}`]) {
+    const emptied = sanitizeFixture(LD(body), META);
+    expect(emptied).toContain(`<script type="application/ld+json"></script>`);
+    expect(residualLeak(emptied)).toBeNull();
+  }
+  // Depth 16 is still inside the bound.
+  const nested = sanitizeFixture(LD(`${"[".repeat(16)}${"]".repeat(16)}`), META);
+  expect(nested).toContain(`<script type="application/ld+json">[[`);
+  // The guard refuses an oversized body it did not produce.
+  expect(residualLeak(`${HEADER}${LD(huge)}`)).not.toBeNull();
 });
 
 test("class/id selectors and explicit provider test hooks stay verbatim", () => {

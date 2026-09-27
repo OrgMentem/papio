@@ -6,7 +6,10 @@ import { planExecution } from "../src/plan";
 import { captureOrigin, fixturePath, parseHTML } from "./harness";
 
 const html = readFileSync(fixturePath("chemrxiv", "success"), "utf8");
-const doi = "10.26434/chemrxiv-2026-example-v2";
+// Synthetic, in the real ChemRxiv shape (`chemrxiv-YYYY-xxxxx-vN`, under 24
+// characters): the reduced fixture must pass residualLeak, which reads a 24+
+// character path segment as token-shaped.
+const doi = "10.26434/chemrxiv-2026-x8h36-v2";
 const page = () => parseHTML(html, captureOrigin(html)!);
 const spec = () => adapters.find((a) => a.id === "chemrxiv") as AdapterSpec;
 const refuses = (doc: Document) => {
