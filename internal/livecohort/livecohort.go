@@ -76,8 +76,15 @@ type CandidateInspector interface {
 // committed association instead of asking for a second acquisition, and it
 // is what lets a lost submit response and an interrupted earlier run both
 // be reconciled rather than repeated.
+//
+// JobForConsumer answers the same question by the acquire.submit_v3 consumer
+// tag a force submission carried. The daemon replaces the supplied request
+// id with a generated one before storing on the force path, so the request
+// id alone cannot name that job back; the consumer tag is stored on the job
+// row itself and survives the replacement, terminal states included.
 type JobLookup interface {
 	JobForRequest(ctx context.Context, requestID string) (jobID, state string, found bool, err error)
+	JobForConsumer(ctx context.Context, consumer string) (jobID, state string, found bool, err error)
 }
 
 // Options configures one run.
@@ -211,6 +218,11 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		return Report{}, err
 	}
 
+	// intentErr remembers a journal intent this run could not write. The work
+	// is recorded as unsubmitted and the run continues so earlier submissions
+	// are still settled, cleaned up, and reported; the error is returned with
+	// the report at the end.
+	var intentErr error
 	pending := make([]*Result, 0, len(opts.Cohort.Works))
 	for _, work := range opts.Cohort.Works {
 		result := Result{Key: work.Key, Expected: work.ExpectedClass, Request: describeRequest(work.Request)}
@@ -239,8 +251,26 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		// The intent is durable BEFORE the RPC, because an association
 		// recorded after a lost response is one that was never recorded.
 		// An intent this run cannot write is a submission it must not make.
-		if err := noteJournal(opts, JournalEntry{CohortID: opts.Cohort.ID, WorkKey: work.Key, RequestID: req.RequestID, RunID: opts.RunID}); err != nil {
-			return Report{}, fmt.Errorf("%w; %d work(s) already submitted are recorded in the journal", err, len(pending))
+		// The failure must not abandon the jobs earlier works already
+		// submitted: they still need settlement, cleanup, and a report, so
+		// the work is recorded as unsubmitted and the run continues.
+		// A force intent carries the consumer tag the committed job will
+		// store even as the daemon replaces the request id, so a lost
+		// response and a later run both reconcile by that tag.
+		intent := JournalEntry{CohortID: opts.Cohort.ID, WorkKey: work.Key, RequestID: req.RequestID, RunID: opts.RunID}
+		if opts.Force {
+			intent.Consumer = forceConsumer(req)
+		}
+		if err := noteJournal(opts, intent); err != nil {
+			if intentErr == nil {
+				intentErr = err
+			}
+			result.Outcome = SubmitFailed
+			result.StopDetail = err.Error()
+			result.Verdict = VerdictMissed
+			report.noteJournalFailure(err)
+			report.Results = append(report.Results, result)
+			continue
 		}
 		jobID, existing, err := submit(ctx, opts, work, req)
 		switch {
@@ -279,7 +309,27 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		result.JobID = jobID
 		result.CreatedByRun = !existing || opts.Force
 		result.submittedAt = opts.now()
-		report.noteJournalFailure(noteJournal(opts, JournalEntry{CohortID: opts.Cohort.ID, WorkKey: work.Key, RequestID: req.RequestID, JobID: jobID, RunID: opts.RunID}))
+		completed := JournalEntry{CohortID: opts.Cohort.ID, WorkKey: work.Key, RequestID: req.RequestID, JobID: jobID, RunID: opts.RunID}
+		if opts.Force {
+			completed.Consumer = forceConsumer(req)
+		}
+		if committed := committedRequestID(ctx, opts, jobID, req.RequestID); committed != req.RequestID {
+			// With force the daemon stores a generated request id instead of
+			// the supplied one. The committed entry goes down FIRST and the
+			// intent is retired only after: a crash between the two then leaves
+			// both entries unresolved — recoverable by consumer tag — while the
+			// reverse order would leave no entry at all and invite a duplicate
+			// acquisition on the next run.
+			result.RequestID = committed
+			completed.RequestID = committed
+			if nerr := noteJournal(opts, completed); nerr != nil {
+				report.noteJournalFailure(nerr)
+			} else {
+				report.noteJournalFailure(noteJournalResolved(opts, req.RequestID))
+			}
+		} else {
+			report.noteJournalFailure(noteJournal(opts, completed))
+		}
 		report.Results = append(report.Results, result)
 		pending = append(pending, &report.Results[len(report.Results)-1])
 	}
@@ -302,15 +352,44 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	}
 	report.FinishedAt = opts.now().UTC().Format(time.RFC3339)
 	report.summarize()
+	if intentErr != nil {
+		return report, fmt.Errorf("%w; %d work(s) already submitted are settled and reported", intentErr, len(pending))
+	}
 	return report, nil
 }
 
 // submit sends one work and returns its job id.
+//
+// Non-force submissions use the ratified acquire.submit_v2 unchanged: the
+// daemon preserves the supplied request id, so the request-id lookup names
+// the committed job. Force submissions use acquire.submit_v3 with the
+// request id as the consumer tag, because the daemon replaces the supplied
+// request id with a generated one before storing on the force path and the
+// request id alone cannot name that job back. The consumer tag is stored on
+// the job row itself and is what the force recovery path reconciles by.
 func submit(ctx context.Context, opts Options, work bench.Work, req protocol.WorkRequest) (string, bool, error) {
+	if opts.Force {
+		params := submitV3Params{
+			Request:    req,
+			AutoImport: new(false),
+			Force:      true,
+			Consumer:   forceConsumer(req),
+		}
+		var result api.SubmitV2Result
+		if err := opts.Caller.Call(ctx, "acquire.submit_v3", params, &result); err != nil {
+			if isUnknownMethod(err) {
+				return "", false, fmt.Errorf("livecohort: daemon predates acquire.submit_v3, upgrade to run with -force: %w", err)
+			}
+			if isRefusal(err) {
+				return "", false, err
+			}
+			return "", false, &ambiguousSubmitError{requestID: req.RequestID, cause: err}
+		}
+		return result.JobID, result.Existing, nil
+	}
 	params := submitParams{
 		Request:    req,
 		AutoImport: new(false),
-		Force:      opts.Force,
 	}
 	var result api.SubmitV2Result
 	if err := opts.Caller.Call(ctx, "acquire.submit_v2", params, &result); err != nil {
@@ -320,6 +399,28 @@ func submit(ctx context.Context, opts Options, work bench.Work, req protocol.Wor
 		return "", false, &ambiguousSubmitError{requestID: req.RequestID, cause: err}
 	}
 	return result.JobID, result.Existing, nil
+}
+
+// forceConsumer is the acquire.submit_v3 attribution a force submission
+// carries. It is the work's own request id: unique per run and work, drawn
+// from the request-id charset which is a subset of the consumer charset, so
+// it is always a legal consumer and always names exactly this submission.
+func forceConsumer(req protocol.WorkRequest) string { return req.RequestID }
+
+// isUnknownMethod reports whether the daemon answered that it has no such
+// method, so the caller can name the skew instead of misreading it as a
+// refusal or a lost response.
+func isUnknownMethod(err error) bool {
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) {
+		return false
+	}
+	switch remote.Code {
+	case "unknown_method", "method_not_found", "unsupported_method":
+		return true
+	default:
+		return false
+	}
 }
 
 // ambiguousSubmitError says the submission RPC failed after the request
@@ -357,8 +458,26 @@ func isRefusal(err error) bool {
 	return errors.As(err, &remote)
 }
 
+// committedRequestID names the work_request_id the daemon actually stored
+// for jobID. Without force it is the supplied id. With force the daemon
+// replaces the supplied id with a generated one before storing
+// (internal/job/job.go createRequest), so the caller must read the committed
+// row back rather than assuming the id it sent. An unreadable detail keeps
+// the supplied id: the journal keeps a handle the operator can correct by
+// hand rather than losing the association entirely.
+func committedRequestID(ctx context.Context, opts Options, jobID, supplied string) string {
+	if !opts.Force || jobID == "" || supplied == "" {
+		return supplied
+	}
+	detail, err := jobDetail(ctx, opts, jobID)
+	if err != nil || detail == nil || detail.Job == nil || detail.Job.WorkRequestID == "" {
+		return supplied
+	}
+	return detail.Job.WorkRequestID
+}
+
 // reconcileLostSubmit names the job a lost submission may have committed,
-// by READING the committed association for its request id.
+// by READING the committed association rather than resubmitting.
 //
 // It never resubmits. The daemon deduplicates a request id against live
 // jobs only (internal/job/job.go createRequest), so a resubmission that
@@ -366,11 +485,36 @@ func isRefusal(err error) bool {
 // acquisition for the same paper — the duplicate this whole path exists
 // to prevent. The read finds the job in every state, including terminal.
 //
-// Without a lookup the ambiguity stands: the caller reports it with its
-// request id rather than guessing.
+// Non-force submissions reconcile by request id, which the daemon preserves.
+// Force submissions reconcile by the submit_v3 consumer tag, which the daemon
+// stores on the job row itself even as it replaces the supplied request id
+// with a generated one. Without a lookup the ambiguity stands: the caller
+// reports it with its request id rather than guessing.
 func reconcileLostSubmit(ctx context.Context, opts Options, req protocol.WorkRequest) (string, error) {
 	if opts.Lookup == nil {
 		return "", errors.New("livecohort: no store lookup available, so the submitted job cannot be named; resolve request " + req.RequestID + " by hand")
+	}
+	lookup := func(rctx context.Context) (string, error) {
+		if opts.Force {
+			jobID, _, found, err := opts.Lookup.JobForConsumer(rctx, forceConsumer(req))
+			switch {
+			case err != nil:
+				return "", err
+			case found && jobID != "":
+				return jobID, nil
+			default:
+				return "", errors.New("no committed job for consumer " + forceConsumer(req))
+			}
+		}
+		jobID, _, found, err := opts.Lookup.JobForRequest(rctx, req.RequestID)
+		switch {
+		case err != nil:
+			return "", err
+		case found && jobID != "":
+			return jobID, nil
+		default:
+			return "", errors.New("no committed job for request " + req.RequestID)
+		}
 	}
 	timeout := reconcileTimeout
 	if timeout <= 0 {
@@ -386,14 +530,10 @@ func reconcileLostSubmit(ctx context.Context, opts Options, req protocol.WorkReq
 	defer ticker.Stop()
 	var lastErr error
 	for {
-		jobID, _, found, err := opts.Lookup.JobForRequest(rctx, req.RequestID)
-		switch {
-		case err != nil:
-			lastErr = err
-		case found && jobID != "":
+		if jobID, err := lookup(rctx); err == nil {
 			return jobID, nil
-		default:
-			lastErr = errors.New("no committed job for request " + req.RequestID)
+		} else {
+			lastErr = err
 		}
 		select {
 		case <-rctx.Done():
@@ -405,12 +545,22 @@ func reconcileLostSubmit(ctx context.Context, opts Options, req protocol.WorkReq
 
 // resolvePriorSubmission reports what became of an earlier run's
 // unaccounted submission, and whether it is now accounted for.
+//
+// A tagged force entry resolves by its consumer tag alone: the supplied
+// request id names nothing on the force path, and a request-id row — if
+// one exists — belongs to a different acquisition than the tag does, so
+// consulting it first could attribute an older job. An untagged entry
+// resolves by request id alone and is never guessed by consumer.
 func resolvePriorSubmission(ctx context.Context, opts Options, entry JournalEntry) (Skip, bool) {
 	skip := Skip{Key: entry.WorkKey, JobID: entry.JobID}
 	jobID := entry.JobID
 	state := ""
 	if opts.Lookup != nil {
-		if found, foundState, ok, err := opts.Lookup.JobForRequest(ctx, entry.RequestID); err == nil && ok {
+		if entry.Consumer != "" {
+			if found, foundState, ok, err := opts.Lookup.JobForConsumer(ctx, entry.Consumer); err == nil && ok {
+				jobID, state = found, foundState
+			}
+		} else if found, foundState, ok, err := opts.Lookup.JobForRequest(ctx, entry.RequestID); err == nil && ok {
 			jobID, state = found, foundState
 		}
 	}
@@ -490,6 +640,16 @@ type submitParams struct {
 	Request    protocol.WorkRequest `json:"request"`
 	AutoImport *bool                `json:"auto_import,omitempty"`
 	Force      bool                 `json:"force,omitempty"`
+}
+
+// submitV3Params mirrors acquire.submit_v3, which carries the consumer
+// attribution submit_v2 cannot. Force submissions use it so the committed
+// job carries the run/work tag the recovery lookup reads back.
+type submitV3Params struct {
+	Request    protocol.WorkRequest `json:"request"`
+	AutoImport *bool                `json:"auto_import,omitempty"`
+	Force      bool                 `json:"force,omitempty"`
+	Consumer   string               `json:"consumer,omitempty"`
 }
 
 func workRequest(work bench.Work, runID string) protocol.WorkRequest {
