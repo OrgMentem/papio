@@ -88,9 +88,9 @@ func overlayConfig(dataDir string, current bool) config.Config {
 // benchAcquisitionSources are the acquisition resolvers bench points at fixture
 // servers. It is a membership set only — never an order — because precedence
 // comes from config's catalog, the same authority production reads. openalex/
-// core/crossref_tdm stay unwired in both overlays: config.Default() already
-// ships them disabled, and bench's "current" overlay means "today's shipped
-// default," not "every resolver that exists."
+// core/crossref_tdm stay unwired in both overlays: bench has no fixture-backed
+// adapter for them, and bench's "current" overlay means "today's shipped
+// default among the wired set," not "every resolver that exists."
 var benchAcquisitionSources = []string{
 	config.SourceArXiv, config.SourceEuropePMC, config.SourceUnpaywall,
 	config.SourceSemanticScholar, config.SourceOpenAIRE,

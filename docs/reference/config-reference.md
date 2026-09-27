@@ -167,7 +167,7 @@ no local model runtime ships yet. Credential setup is currently a CLI command.
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `access_mode` | string | empty | Required before acquisition. Allowed values are `conservative`, `assisted`, and `delegated`; a fresh guided `papio init` chooses `conservative`. Conservative records institutional OpenURL availability without opening a handoff; assisted and delegated can route eligible exhaustion to browser handoff. |
-| `email` | string | empty | Contact identity for polite API pools. **Sent to third parties**: as a query parameter to Unpaywall (required) and OpenAlex (required), to Crossref when set, and in the `User-Agent` of DOI-registration lookups. See [Privacy](../privacy.md). Doctor fails when enabled Unpaywall has no email; enabled OpenAlex also requires an email and API key. |
+| `email` | string | empty | Contact identity for polite API pools. **Sent to third parties**: as a query parameter to Unpaywall (required) and OpenAlex (required), to Crossref when set, and in the `User-Agent` of DOI-registration lookups. See [Privacy](../privacy.md). Doctor fails when an enabled source that needs one (Unpaywall, OpenAlex) has no email; OpenAlex without an API key runs on the smaller anonymous allowance instead, and doctor warns. |
 | `data_dir` | path string | `~/.local/share/papio` (Windows: `%LOCALAPPDATA%\papio`) | Private writable data directory for the database, artifacts, and socket. Browser-download adoption does not follow this directory: the adoption root defaults to `<your download folder>/papio` (see `[browser] download_adoption_root`), while the historical `<data_dir>/adoptions` path remains drain-only for files already sitting there. |
 
 ## `[fetch]`
@@ -661,7 +661,7 @@ raises the effective pacing; a short-lived personal token does not. Each named s
 | `arxiv` | `true` | 1 | 1 |
 | `europepmc` | `true` | 2 | 2 |
 | `unpaywall` | `true` | 1 | 1 |
-| `openalex` | `false` | 2 | 2 |
+| `openalex` | `true` | 2 | 2 |
 | `openaire` | `true` | 0.016 | 1 |
 | `core` | `false` | 0.4 | 1 |
 | `crossref_tdm` | `false` | 1 | 1 |

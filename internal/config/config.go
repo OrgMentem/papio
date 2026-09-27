@@ -116,8 +116,10 @@ var sourceCatalog = []sourceCatalogEntry{
 	// keyed daily allowance, which is why its credit fuse ships armed:
 	// DailyCreditFraction is non-zero in the baseline so the fuse is not
 	// inert on first install (papio init and Load's Default() overlay both
-	// depend on that).
-	{Name: SourceOpenAlex, Roles: RoleAcquisitionResolver | RoleDiscoveryBackend | RoleMetadataEnricher, Default: Source{Enabled: false, RatePerSec: 2, Burst: 2, DailyCreditFraction: DefaultDailyCreditFraction}},
+	// depend on that). It ships enabled: the resolver needs a contact email
+	// and refuses before any request without one, exactly like Unpaywall, so
+	// a missing email parks the source instead of failing jobs.
+	{Name: SourceOpenAlex, Roles: RoleAcquisitionResolver | RoleDiscoveryBackend | RoleMetadataEnricher, Default: Source{Enabled: true, RatePerSec: 2, Burst: 2, DailyCreditFraction: DefaultDailyCreditFraction}},
 	{Name: SourceSemanticScholar, Roles: RoleAcquisitionResolver | RoleDiscoveryBackend, Default: Source{Enabled: true, RatePerSec: 1, Burst: 1}},
 	{Name: SourceCORE, Roles: RoleAcquisitionResolver, Default: Source{Enabled: false, RatePerSec: 0.4, Burst: 1}},
 	{Name: SourceCrossrefTDM, Roles: RoleAcquisitionResolver, Default: Source{Enabled: false, RatePerSec: 1, Burst: 1}},

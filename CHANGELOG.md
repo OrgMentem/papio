@@ -229,6 +229,17 @@ execution records kept during the initial build.
   library, for a collection name that matches no collection or more than one
   (or a collection list that *papio* cannot read to its end), and for a save
   that zotio did not report as complete.
+- **OpenAlex now looks for an open-access copy by default, as Unpaywall
+  does.** On a uniform-random sample of 189 recent articles, OpenAlex added a
+  PDF that passed the identity check for 17 papers that the page and the
+  other open resolvers did not cover. It still needs your contact `email`:
+  without one, the source sits out and `papio doctor` fails the check (it
+  already fails the same way for Unpaywall), and no job fails because of it.
+  Without an account key, OpenAlex runs on the smaller anonymous allowance,
+  and `papio doctor` warns. The daily credit fuse stays on, and
+  `sibling_title_search` stays off. An existing config keeps its explicit
+  `[sources.openalex] enabled` value, because `papio init` and
+  `papio config save` write every default source into the file.
 - **In `stored` mode, a new paper goes to Zotero desktop only.** *papio* now
   asks zotio for `--via connector` in place of `--via auto`. With `auto`, a
   closed Zotero desktop sent the paper through the Web API, which stored the

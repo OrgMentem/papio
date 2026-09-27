@@ -20,7 +20,7 @@ var shippedSourceDefaults = map[string]Source{
 	SourceArXiv:            {Enabled: true, RatePerSec: 1, Burst: 1},
 	SourceEuropePMC:        {Enabled: true, RatePerSec: 2, Burst: 2},
 	SourceUnpaywall:        {Enabled: true, RatePerSec: 1, Burst: 1},
-	SourceOpenAlex:         {Enabled: false, RatePerSec: 2, Burst: 2, DailyCreditFraction: DefaultDailyCreditFraction},
+	SourceOpenAlex:         {Enabled: true, RatePerSec: 2, Burst: 2, DailyCreditFraction: DefaultDailyCreditFraction},
 	SourceSemanticScholar:  {Enabled: true, RatePerSec: 1, Burst: 1},
 	SourceCORE:             {Enabled: false, RatePerSec: 0.4, Burst: 1},
 	SourceCrossrefTDM:      {Enabled: false, RatePerSec: 1, Burst: 1},

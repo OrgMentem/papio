@@ -1438,3 +1438,75 @@ func TestDriveIsOffByDefaultAndPacedWhenEnabled(t *testing.T) {
 		t.Fatalf("Load with 61 opens an hour = %v, want the bound", err)
 	}
 }
+
+// TestDefaultEnablesOpenAlexWithArmedFuse pins the I7 default: OpenAlex
+// resolves by default, its daily credit fuse ships armed (ADR-0024 decision
+// 6: a zero fraction would ship the fuse inert), and the fuzzy sibling title
+// search stays off (ADR-0024 section 12: measured >=138 credits per accepted
+// artifact). An existing config that explicitly disabled OpenAlex keeps its
+// value: Load layers the file over Default(), and papio init/config save
+// write every default source into the file.
+func TestDefaultEnablesOpenAlexWithArmedFuse(t *testing.T) {
+	got := Default().Sources[SourceOpenAlex]
+	if !got.Enabled {
+		t.Fatalf("default openalex = %+v, want enabled", got)
+	}
+	if got.DailyCreditFraction != DefaultDailyCreditFraction || got.DailyCreditFraction <= 0 {
+		t.Fatalf("default openalex daily_credit_fraction = %v, want armed (%v)", got.DailyCreditFraction, DefaultDailyCreditFraction)
+	}
+	if got.SiblingTitleSearch {
+		t.Fatal("default openalex sibling_title_search = true, want false (opt-in only)")
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.openalex]\nenabled=false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sources[SourceOpenAlex].Enabled {
+		t.Fatal("explicit [sources.openalex] enabled=false was overridden by the new default; existing configs must keep their value")
+	}
+}
+
+// An existing config that never mentions [host_suppression] must keep
+// loading with the shipped rule, a partial section must keep the defaults it
+// does not name, and a knob that would suppress on the first failure or
+// never probe must be refused.
+func TestHostSuppressionDefaultsOverlayAndBounds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	load := func(body string) (Config, error) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("access_mode = \"delegated\"\n"+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(path)
+	}
+	cfg, err := load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.HostSuppression, DefaultHostSuppression()) {
+		t.Fatalf("absent section = %+v, want the shipped defaults", cfg.HostSuppression)
+	}
+	cfg, err = load("[host_suppression]\nenabled = false\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HostSuppression.Enabled || cfg.HostSuppression.FailureThreshold != 3 || cfg.HostSuppression.ProbeIntervalDays != 7 {
+		t.Fatalf("partial section = %+v, want only enabled changed", cfg.HostSuppression)
+	}
+	for body, want := range map[string]string{
+		"[host_suppression]\nfailure_threshold = 0\n":                  "host_suppression.failure_threshold must be in 1..100",
+		"[host_suppression]\nprobe_interval_days = 0\n":                "host_suppression.probe_interval_days must be in 1..90",
+		"[host_suppression]\nwindow_days = 366\n":                      "host_suppression.window_days must be in 1..365",
+		"[host_suppression]\nrate_limit_backoff_cap_seconds = 59\n":    "host_suppression.rate_limit_backoff_cap_seconds must be in 60..86400",
+		"[host_suppression]\nexcluded_hosts = [\"https://doi.org\"]\n": "must be a bare hostname",
+		"[host_suppression]\nmin_wall_span_hours = 721\n":              "host_suppression.min_wall_span_hours must be in 0..720",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("Load(%q) = %v, want an error containing %q", body, err, want)
+		}
+	}
+}

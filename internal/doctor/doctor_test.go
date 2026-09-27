@@ -1941,3 +1941,35 @@ func TestRunWarnsOnceAboutIgnoredConfigSettings(t *testing.T) {
 		t.Fatalf("ignored setting checks = %+v", found)
 	}
 }
+
+// TestRunFailsDefaultOpenAlexWithoutEmail pins the I7 safety posture:
+// OpenAlex ships enabled following the Unpaywall precedent, so a default
+// install without a contact email fails the source check (the resolver
+// refuses before any request, parking the source instead of failing jobs).
+// With an email but no API key it warns onto the smaller anonymous
+// allowance instead of failing.
+func TestRunFailsDefaultOpenAlexWithoutEmail(t *testing.T) {
+	base := func(t *testing.T) config.Config {
+		cfg := config.Default()
+		cfg.AccessMode = config.ModeConservative
+		cfg.DataDir = t.TempDir()
+		cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(cfg.Path, []byte("access_mode='conservative'"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	def := config.Default()
+	if !def.SourcePolicy(config.SourceOpenAlex).Enabled {
+		t.Fatal("default OpenAlex acquisition source is disabled; this test pins the enabled-by-default posture")
+	}
+	cfg := base(t)
+	if status, detail := checkStatus(t, Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil), "source_openalex"); status != Fail {
+		t.Errorf("email-less source_openalex = %s (%s), want Fail", status, detail)
+	}
+	cfg = base(t)
+	cfg.Email = "reader@example.org"
+	if status, detail := checkStatus(t, Run(context.Background(), cfg, nil, pdf.Capability{}, "", nil), "source_openalex"); status != Warn || !strings.Contains(detail, "anonymous") {
+		t.Errorf("keyless source_openalex = %s (%s), want Warn onto the anonymous allowance", status, detail)
+	}
+}
