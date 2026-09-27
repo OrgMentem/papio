@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -72,16 +73,35 @@ const notificationColumns = `id,category,event_kind,aggregate_key,phase,window_s
 	desktop_sent_count,desktop_sent_payload_json`
 
 // notificationCoalescable gates every ON CONFLICT merge. One row carries one
-// shared count and payload for both legs, so it stays mutable while either leg
-// can still deliver it: the desktop leg is nonterminal, or the webhook leg has
-// not been sent yet. A desktop leg that already delivered keeps its own
+// shared count and payload for both legs, so it stays mutable while either
+// leg can still deliver it: the desktop leg is nonterminal, or the webhook
+// leg is still pending. A desktop leg that already delivered keeps its own
 // snapshot of what it sent, so later merging cannot rewrite that audit.
+// A claimed or settled (non-pending) webhook row is an immutable snapshot
+// for its delivery key: UpsertWebhookGeneration redirects a merge that
+// lands after the claim to a new generation row instead of rewriting the
+// claimed payload.
 const notificationCoalescable = `(notification_intents.desktop_state IN ('pending','held') OR notification_intents.webhook_state='pending')`
 
-// Upsert merges an intent by its five-part desktop identity. Coalesced rows
-// remain mutable only while a leg can still deliver them; a row both legs have
-// finished with is an immutable audit record.
+// plain Upsert merges an intent by its five-part desktop identity. Rows merge
+// only while the desktop leg can still deliver (pending/held): the desktop
+// leg owns coalescing, and the desktopSent snapshot preserves what it
+// delivered. The webhook leg owns no merge right.
 func (l *NotificationLedger) Upsert(ctx context.Context, rec NotificationRecord) (NotificationRecord, error) {
+	return l.upsert(ctx, rec, false)
+}
+
+// UpsertWebhookGeneration stores one immediate-webhook event under the
+// current pending generation: it merges into the identity row only while the
+// identity row's webhook leg is still pending, and redirects to a fresh
+// generation row with its own delivery key once the identity row is claimed
+// or settled. The claimed snapshot stays immutable; the late event is never
+// dropped and never reuses the claimed key.
+func (l *NotificationLedger) UpsertWebhookGeneration(ctx context.Context, rec NotificationRecord) (NotificationRecord, error) {
+	return l.upsert(ctx, rec, true)
+}
+
+func (l *NotificationLedger) upsert(ctx context.Context, rec NotificationRecord, webhookGeneration bool) (NotificationRecord, error) {
 	if l == nil || l.s == nil || l.s.db == nil {
 		return NotificationRecord{}, fmt.Errorf("notification ledger is unavailable")
 	}
@@ -107,6 +127,16 @@ func (l *NotificationLedger) Upsert(ctx context.Context, rec NotificationRecord)
 		available = last
 	}
 	rec.FirstAt, rec.LastAt, rec.AvailableAt = first, last, available
+	if webhookGeneration {
+		return l.upsertWebhookGeneration(ctx, rec, first, last, available)
+	}
+	return l.upsertMerge(ctx, rec)
+}
+
+// upsertMerge is the plain desktop-coalescing path: one row carries one
+// shared count and payload for both legs, and merges while either leg can
+// still deliver it.
+func (l *NotificationLedger) upsertMerge(ctx context.Context, rec NotificationRecord) (NotificationRecord, error) {
 	_, err := l.s.db.ExecContext(ctx, `
 		INSERT INTO notification_intents
 		(category,event_kind,aggregate_key,phase,window_start,job_id,batch_id,scan_id,
@@ -130,6 +160,279 @@ func (l *NotificationLedger) Upsert(ctx context.Context, rec NotificationRecord)
 		return NotificationRecord{}, err
 	}
 	return l.getByIdentity(ctx, rec.Category, rec.EventKind, rec.AggregateKey, rec.Phase, rec.WindowStart)
+}
+
+// upsertWebhookGeneration is the atomic generation path for immediate
+// webhooks. One transaction decides merge versus redirect under the write
+// lock: when the identity row's webhook leg is still pending, the event
+// merges into the identity generation; once it is claimed or settled, the
+// event queues as a fresh pending generation with its own delivery key and
+// never rewrites the claimed snapshot. A byte-identical retry of the same
+// event returns the stored generation in any non-pending state, so the
+// lost claim skips delivery without a duplicate POST; the replay search
+// covers the identity row and every existing generation, so a retry of a
+// redirected event matches its own generation. Any event with a later
+// LastAt is a new event and opens a new generation. Redirect windows are
+// identity+1ns, +2ns, and so on. Each attempt runs in one transaction, and
+// a lost unique-index race on the same generation window retries so the
+// re-read sees the winner.
+func (l *NotificationLedger) upsertWebhookGeneration(ctx context.Context, rec NotificationRecord, first, last, available time.Time) (NotificationRecord, error) {
+	for attempt := 0; ; attempt++ {
+		row, retry, err := l.upsertWebhookGenerationOnce(ctx, rec, first, last, available)
+		if err != nil {
+			return NotificationRecord{}, err
+		}
+		if !retry {
+			return row, nil
+		}
+		if attempt >= 32 {
+			// A sustained insert race means concurrent Routes keep
+			// colliding on the same window; surface it instead of
+			// looping forever.
+			return NotificationRecord{}, fmt.Errorf("notification generation insert race did not settle")
+		}
+	}
+}
+
+func (l *NotificationLedger) upsertWebhookGenerationOnce(ctx context.Context, rec NotificationRecord, first, last, available time.Time) (NotificationRecord, bool, error) {
+	ok := func(row NotificationRecord) (NotificationRecord, bool, error) { return row, false, nil }
+	retry := func() (NotificationRecord, bool, error) { return NotificationRecord{}, true, nil }
+	fail := func(err error) (NotificationRecord, bool, error) {
+		if isUniqueConflict(err) {
+			// Lost a concurrent insert race for the same generation
+			// window: roll back and retry so the re-read sees the
+			// winner instead of reporting a failure.
+			return retry()
+		}
+		return NotificationRecord{}, false, err
+	}
+	tx, err := l.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return NotificationRecord{}, false, err
+	}
+	rollback := func(err error) (NotificationRecord, bool, error) {
+		_ = tx.Rollback()
+		return fail(err)
+	}
+	identity := tx.QueryRowContext(ctx, `SELECT `+notificationColumns+`
+		FROM notification_intents WHERE category=? AND event_kind=? AND aggregate_key=? AND phase=? AND window_start=?`,
+		rec.Category, rec.EventKind, rec.AggregateKey, rec.Phase, formatNotificationTime(rec.WindowStart))
+	current, err := scanNotificationRow(identity)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			_ = tx.Rollback()
+			return NotificationRecord{}, false, err
+		}
+		inserted, err := insertGenerationRow(ctx, tx, rec, rec.WindowStart, first, last, available)
+		if err != nil {
+			return rollback(err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fail(err)
+		}
+		row, err := l.getByIdentity(ctx, inserted.Category, inserted.EventKind, inserted.AggregateKey, inserted.Phase, inserted.WindowStart)
+		if err != nil {
+			return NotificationRecord{}, false, err
+		}
+		return ok(row)
+	}
+	if current.WebhookState == "" || current.WebhookState == "pending" {
+		merged, err := mergeGenerationRow(ctx, tx, current.ID, rec)
+		if err != nil {
+			return rollback(err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fail(err)
+		}
+		row, err := l.getByIdentity(ctx, merged.Category, merged.EventKind, merged.AggregateKey, merged.Phase, merged.WindowStart)
+		if err != nil {
+			return NotificationRecord{}, false, err
+		}
+		return ok(row)
+	}
+	// Fail open: every Route after the claim queues a fresh pending
+	// generation with its own key, except the router's own byte-identical
+	// retry of the same event, which returns the stored generation so the
+	// lost claim skips delivery without a duplicate POST. The check
+	// covers the identity row and every existing generation
+	// (findGenerationReplayTx): a retry of a redirected event matches its
+	// own generation instead of opening another one. Settled states are
+	// included: an identical retry after settle returns the row, while a
+	// later LastAt opens a new generation.
+	if isPureReplay(current, rec) {
+		if err := tx.Rollback(); err != nil {
+			return NotificationRecord{}, false, err
+		}
+		return ok(current)
+	}
+	match, free, err := findGenerationReplayTx(ctx, tx, rec)
+	if err != nil {
+		_ = tx.Rollback()
+		return NotificationRecord{}, false, err
+	}
+	if match != nil {
+		if err := tx.Rollback(); err != nil {
+			return NotificationRecord{}, false, err
+		}
+		return ok(*match)
+	}
+	inserted, err := insertGenerationRow(ctx, tx, rec, free, last, last, available)
+	if err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fail(err)
+	}
+	row, err := l.getByIdentity(ctx, inserted.Category, inserted.EventKind, inserted.AggregateKey, inserted.Phase, inserted.WindowStart)
+	if err != nil {
+		return NotificationRecord{}, false, err
+	}
+	return ok(row)
+}
+
+// isUniqueConflict reports a lost concurrent-insert race for the same
+// notification identity window.
+func isUniqueConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "constraint failed")
+}
+
+// insertGenerationRow writes one pending generation row inside the caller's
+// transaction and returns its identity for the post-commit re-read.
+func insertGenerationRow(ctx context.Context, tx *sql.Tx, rec NotificationRecord, window, first, last, available time.Time) (NotificationRecord, error) {
+	redirect := rec
+	redirect.ID = 0
+	redirect.WindowStart = window
+	redirect.FirstAt, redirect.LastAt, redirect.AvailableAt = first, last, available
+	redirect.Count = maxInt(rec.Count, 1)
+	redirect.DesktopState = ""
+	redirect.WebhookState = ""
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO notification_intents
+		(category,event_kind,aggregate_key,phase,window_start,job_id,batch_id,scan_id,
+		 payload_json,first_at,last_at,count,available_at,desktop_state,webhook_state)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		redirect.Category, redirect.EventKind, redirect.AggregateKey, redirect.Phase, formatNotificationTime(window),
+		nullIfEmpty(redirect.JobID), nullIfEmpty(redirect.BatchID), nullIfEmpty(redirect.ScanID), redirect.PayloadJSON,
+		formatNotificationTime(redirect.FirstAt), formatNotificationTime(redirect.LastAt), redirect.Count,
+		formatNotificationTime(redirect.AvailableAt), defaultDesktopState(""), defaultWebhookState("")); err != nil {
+		return NotificationRecord{}, err
+	}
+	return redirect, nil
+}
+
+// mergeGenerationRow adds one event to a pending identity generation inside
+// the caller's transaction, mirroring the ON CONFLICT count and payload
+// merge of the plain path, and returns the row identity for re-read.
+func mergeGenerationRow(ctx context.Context, tx *sql.Tx, id int64, rec NotificationRecord) (NotificationRecord, error) {
+	var storedCount int
+	var storedPayload string
+	if err := tx.QueryRowContext(ctx, `SELECT count, payload_json FROM notification_intents WHERE id=?`, id).Scan(&storedCount, &storedPayload); err != nil {
+		return NotificationRecord{}, err
+	}
+	mergedCount := storedCount + maxInt(rec.Count, 1)
+	mergedPayload := storedPayload
+	if json.Valid([]byte(rec.PayloadJSON)) && json.Valid([]byte(storedPayload)) {
+		mergedPayload = mergeWebhookPayload(storedPayload, rec.PayloadJSON, mergedCount)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE notification_intents SET last_at=?, count=?, payload_json=?, available_at=? WHERE id=?`,
+		formatNotificationTime(rec.LastAt), mergedCount, mergedPayload, formatNotificationTime(rec.AvailableAt), id); err != nil {
+		return NotificationRecord{}, err
+	}
+	identity := rec
+	identity.ID = id
+	return identity, nil
+}
+
+// mergeWebhookPayload mirrors the ON CONFLICT payload merge: the incoming
+// payload deep-patches the stored one key by key, so nested event maps
+// keep both sides' entries, and a numeric $.count becomes the merged
+// total. Non-object payloads fall back to the incoming payload.
+func mergeWebhookPayload(stored, incoming string, mergedCount int) string {
+	var a, b map[string]any
+	if err := json.Unmarshal([]byte(stored), &a); err != nil {
+		return incoming
+	}
+	if err := json.Unmarshal([]byte(incoming), &b); err != nil {
+		return incoming
+	}
+	deepPatchWebhookPayload(a, b)
+	a["count"] = mergedCount
+	out, err := json.Marshal(a)
+	if err != nil {
+		return incoming
+	}
+	return string(out)
+}
+
+// isPureReplay reports whether rec is the router's own retry of the stored
+// generation rather than a new producer event. It matches only the exact
+// stored row: same payload bytes and count, same identity columns, and a
+// LastAt that does not advance past the stored row. It applies in every
+// non-pending webhook state, so an identical retry after the generation
+// settles returns the row and the lost claim skips delivery without a
+// duplicate POST. Any new producer event advances LastAt (the router
+// stamps HappenedAt per Route), so it fails this check and queues a new
+// generation. Unknown provenance fails open to a new generation.
+func isPureReplay(current, rec NotificationRecord) bool {
+	if current.PayloadJSON != rec.PayloadJSON {
+		return false
+	}
+	if current.Count != maxInt(rec.Count, 1) {
+		return false
+	}
+	if current.JobID != rec.JobID || current.BatchID != rec.BatchID || current.ScanID != rec.ScanID {
+		return false
+	}
+	if rec.LastAt.After(current.LastAt) {
+		return false
+	}
+	return true
+}
+
+// deepPatchWebhookPayload merges src into dst key by key, recursing into
+// nested objects so per-event detail entries accumulate instead of
+// replacing each other.
+func deepPatchWebhookPayload(dst, src map[string]any) {
+	for key, value := range src {
+		srcMap, srcIsMap := value.(map[string]any)
+		dstValue, dstHas := dst[key]
+		dstMap, dstIsMap := dstValue.(map[string]any)
+		if srcIsMap && dstHas && dstIsMap {
+			deepPatchWebhookPayload(dstMap, srcMap)
+			continue
+		}
+		dst[key] = value
+	}
+}
+
+// findGenerationReplayTx scans the existing generations after the identity
+// row for an exact retry of rec, returning the matching row when present
+// and the first free window otherwise. Generations are dense from
+// identity+1ns while rows are never deleted, so the first free window ends
+// the scan. A retry of a redirected event matches its own generation
+// instead of opening another one; a later event matches nothing and queues
+// a new generation at the free window.
+func findGenerationReplayTx(ctx context.Context, tx *sql.Tx, rec NotificationRecord) (*NotificationRecord, time.Time, error) {
+	for offset := int64(1); ; offset++ {
+		candidate := rec.WindowStart.Add(time.Duration(offset) * time.Nanosecond)
+		row := tx.QueryRowContext(ctx, `SELECT `+notificationColumns+`
+			FROM notification_intents WHERE category=? AND event_kind=? AND aggregate_key=? AND phase=? AND window_start=?`,
+			rec.Category, rec.EventKind, rec.AggregateKey, rec.Phase, formatNotificationTime(candidate))
+		existing, err := scanNotificationRow(row)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, candidate, nil
+			}
+			return nil, time.Time{}, err
+		}
+		if isPureReplay(existing, rec) {
+			match := existing
+			return &match, time.Time{}, nil
+		}
+	}
 }
 
 func nullIfEmpty(value string) any {
@@ -329,15 +632,19 @@ func (l *NotificationLedger) SetDesktopState(ctx context.Context, id int64, stat
 	return changed == 1, nil
 }
 
-// Webhook legs are at-most-once per row. ClaimWebhook atomically moves a
-// pending leg to sending before its HTTP POST so a replay, a concurrent
-// drain, or a restart cannot POST twice. The caller POSTs only when the claim
-// applies, then settles with SetWebhookState to attempted (endpoint accepted,
-// any 2xx) or failed (transport error or non-2xx, terminal best-effort loss).
-// A crash between claim and settle leaves sending, which never becomes due
-// again: the notification may be lost but is never duplicated. Local state
-// cannot give exactly-once across a lost HTTP response, so sending rows stay
-// terminal and the stable per-row delivery key lets receivers correlate.
+// Webhook legs are at-most-once per row and per delivery key. ClaimWebhook
+// atomically moves a pending leg to sending before its HTTP POST so a replay,
+// a concurrent drain, or a restart cannot POST the same row twice. The
+// claimed row is an immutable snapshot for its key: a merge that lands
+// after the claim redirects to a fresh generation row with its own key
+// (see Upsert), so the second POST never reuses the first key. The caller
+// POSTs only when the claim applies, then settles with SetWebhookState to
+// attempted (endpoint accepted, any 2xx) or failed (transport error or
+// non-2xx, terminal best-effort loss). A crash between claim and settle
+// leaves sending, which never becomes due again: the notification may be
+// lost but is never duplicated. Local state cannot give exactly-once across
+// a lost HTTP response, so sending rows stay terminal and the stable
+// per-row delivery key lets receivers correlate.
 func (l *NotificationLedger) ClaimWebhook(ctx context.Context, id int64) (bool, error) {
 	result, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state='sending' WHERE id=? AND webhook_state='pending'`, id)
 	if err != nil {

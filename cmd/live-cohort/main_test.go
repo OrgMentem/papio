@@ -3,11 +3,14 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"papio/internal/bench"
 	"papio/internal/livecohort"
 )
 
@@ -77,5 +80,58 @@ func TestWireSafetyKeepsTheLookupUnderNoStore(t *testing.T) {
 	}
 	if opts.Journal == nil {
 		t.Fatal("journal is nil: the safety record must always be wired")
+	}
+}
+
+// A run that measured work before failing must still emit its report: the
+// settled rows and cleanup it holds are real, and dropping them repeats the
+// invisible situation the instrument exists to prevent. Fail-first: the old
+// call site exited before rendering, so the measurements never reached the
+// operator.
+func TestFinishEmitsReportAlongsideRunError(t *testing.T) {
+	report := livecohort.Report{
+		CohortID: "test",
+		RunID:    "testrun",
+		Results: []livecohort.Result{{
+			Key:        "w",
+			Request:    "doi:10.1/w",
+			Expected:   bench.AutonomousReady,
+			Outcome:    livecohort.SubmitFailed,
+			Verdict:    livecohort.VerdictMissed,
+			StopDetail: "disk full for second",
+			RequestID:  "livecohort-testrun-w",
+		}},
+		JournalFailures: []string{"livecohort: recording request livecohort-testrun-w: disk full for second"},
+	}
+	var stdout, stderr bytes.Buffer
+	outPath := filepath.Join(t.TempDir(), "report.txt")
+	code := finish(&stdout, &stderr, report, errors.New("disk full for second"), false, outPath)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 alongside the run error", code)
+	}
+	if !strings.Contains(stdout.String(), "JOURNAL FAILURES") || !strings.Contains(stdout.String(), "disk full for second") {
+		t.Fatalf("stdout = %q, want the measured report with its journal failure", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "disk full for second") {
+		t.Fatalf("stderr = %q, want the run error named", stderr.String())
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading the written report: %v", err)
+	}
+	if string(data) != stdout.String() {
+		t.Fatal("the file report differs from the printed report")
+	}
+}
+
+// A complete run still exits 0 with no error on stderr.
+func TestFinishSucceedsWithoutRunError(t *testing.T) {
+	report := livecohort.Report{CohortID: "test", RunID: "testrun"}
+	var stdout, stderr bytes.Buffer
+	if code := finish(&stdout, &stderr, report, nil, true, ""); code != 0 {
+		t.Fatalf("exit = %d, want 0 for a complete run (stderr %q)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"cohort_id"`) {
+		t.Fatalf("stdout = %q, want the JSON report", stdout.String())
 	}
 }

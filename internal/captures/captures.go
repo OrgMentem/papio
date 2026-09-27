@@ -361,8 +361,10 @@ func (s *Store) pendingRoleLocked(ctx context.Context, fingerprint string) (PinR
 // therefore never observes a demoted earlier capture, an unenumerable lease, or
 // a pin that exempts the capture from retention forever. The index is published
 // before the pin so a crash between the two leaves an index entry without a pin
-// (reconciled through PendingJobs/ReleaseJob) rather than a pin without an
-// index (invisible to PendingJobs and exempt from retention sweeps forever).
+// rather than a pin without an index (invisible to PendingJobs and exempt from
+// retention sweeps forever). The capture metadata already links the bytes to
+// the job, so ReconcilePendingPins restores the missing pin for an active lease
+// and retention exempts the indexed capture until then.
 func (s *Store) pinPendingLocked(ctx context.Context, path, jobID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -380,7 +382,7 @@ func (s *Store) pinPendingLocked(ctx context.Context, path, jobID string) error 
 	if err != nil {
 		return err
 	}
-	if err := s.writePinLocked(file, fingerprint, role); err != nil {
+	if err := s.writePinLocked(file, fingerprint, jobID, role); err != nil {
 		if indexed {
 			_ = s.removePendingIndexLocked(jobID)
 		}
@@ -436,10 +438,14 @@ func (s *Store) store(ctx context.Context, host, scenario, adapterID, adapterVer
 		return "", err
 	}
 	sum := sha256.Sum256(html)
+	pendingJobID := strings.TrimSpace(jobID)
+	if scenario == "observed" {
+		pendingJobID = ""
+	}
 	metadata, err := json.Marshal(captureMetadata{
 		Host: verbatimHost, AdapterID: adapterID, AdapterVersion: adapterVersion,
 		SHA256: hex.EncodeToString(sum[:]), SanitizerProvenance: sanitizerProvenance,
-		SanitizerVersion: sanitizerVersion,
+		SanitizerVersion: sanitizerVersion, PendingJobID: pendingJobID,
 	})
 	if err != nil {
 
@@ -589,12 +595,7 @@ func (s *Store) Pin(ctx context.Context, path, fingerprint string, role PinRole)
 	if err != nil {
 		return err
 	}
-	marker := capturePin{Fingerprint: strings.TrimSpace(fingerprint), Role: role}
-	data, err := json.Marshal(marker)
-	if err != nil {
-		return fmt.Errorf("encoding capture pin: %w", err)
-	}
-	return writeAtomically(filepath.Dir(file.Path), pinPath(file.Path), data)
+	return s.writePinLocked(file, strings.TrimSpace(fingerprint), "", role)
 }
 
 // PinIncident pins the first decisive and latest captures for one open
@@ -632,19 +633,32 @@ func (s *Store) PinIncident(ctx context.Context, fingerprint, firstPath, latestP
 	if filepath.Clean(first.Path) == filepath.Clean(latest.Path) {
 		firstRole = PinFirstDecisive
 	}
-	if err := s.writePinLocked(first, fingerprint, firstRole); err != nil {
+	if err := s.writePinLocked(first, fingerprint, "", firstRole); err != nil {
 		return err
 	}
 	if filepath.Clean(latest.Path) != filepath.Clean(first.Path) {
-		if err := s.writePinLocked(latest, fingerprint, PinLatest); err != nil {
+		if err := s.writePinLocked(latest, fingerprint, "", PinLatest); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) writePinLocked(file captureFile, fingerprint string, role PinRole) error {
-	data, err := json.Marshal(capturePin{Fingerprint: fingerprint, Role: role})
+func (s *Store) writePinLocked(file captureFile, fingerprint, jobID string, role PinRole) error {
+	fingerprint = strings.TrimSpace(fingerprint)
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" && strings.HasPrefix(fingerprint, "pending:") {
+		// Recover the job for a pending lease from the durable index so a pin
+		// rewritten without its caller (PinIncident, displacement restore)
+		// still carries the link the reconciler needs when the index is lost.
+		if data, err := os.ReadFile(pendingIndexPath(s.root)); err == nil {
+			var index map[string]string
+			if json.Unmarshal(data, &index) == nil {
+				jobID = strings.TrimSpace(index[fingerprint])
+			}
+		}
+	}
+	data, err := json.Marshal(capturePin{Fingerprint: fingerprint, Role: role, JobID: jobID})
 	if err != nil {
 		return fmt.Errorf("encoding capture pin: %w", err)
 	}
@@ -700,7 +714,11 @@ func (s *Store) findIncidentRoleLocked(ctx context.Context, fingerprint string, 
 // removeIncidentRoleLocked drops every marker for one incident role except the
 // capture at keepPath. It is all-or-nothing: a failure part way through
 // republishes the markers already removed, so no caller can lose a prior
-// latest capture to a partially applied displacement.
+// latest capture to a partially applied displacement. A displaced pending-lease
+// capture also drops its metadata lease link, so retention treats it as
+// ordinary evidence again instead of keeping every intermediate capture for an
+// active job forever. The link clear is best-effort: the pins are already
+// displaced, so a metadata write failure only leaks retention, never evidence.
 func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string, role PinRole, keepPath string) error {
 	displaced, err := s.findIncidentRoleLocked(ctx, fingerprint, role, keepPath)
 	if err != nil {
@@ -712,12 +730,35 @@ func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string
 			return err
 		}
 	}
+	for _, marker := range displaced {
+		s.clearPendingLinkLocked(marker.file, fingerprint)
+	}
 	return nil
+}
+
+// clearPendingLinkLocked drops the metadata lease link when a capture stops
+// being first/latest evidence for its fingerprint. Best-effort: callers have
+// already displaced the pin, so a failure only delays eviction. Callers hold
+// s.mu.
+func (s *Store) clearPendingLinkLocked(file captureFile, fingerprint string) {
+	metadata, err := readMetadata(file.metadataPath)
+	if err != nil || strings.TrimSpace(metadata.PendingJobID) == "" {
+		return
+	}
+	if pendingFingerprint(metadata.PendingJobID) != fingerprint {
+		return
+	}
+	metadata.PendingJobID = ""
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return
+	}
+	_ = writeAtomically(filepath.Dir(file.metadataPath), file.metadataPath, encoded)
 }
 
 func (s *Store) restorePinsLocked(displaced []displacedPin) {
 	for _, marker := range displaced {
-		_ = s.writePinLocked(marker.file, marker.pin.Fingerprint, marker.pin.Role)
+		_ = s.writePinLocked(marker.file, marker.pin.Fingerprint, marker.pin.JobID, marker.pin.Role)
 	}
 }
 
@@ -737,12 +778,14 @@ func (s *Store) ReleaseIncident(ctx context.Context, fingerprint string) error {
 }
 
 // ReleaseOrphanPendingPins drops pending-lease pins that have no durable index
-// entry. Such pins predate index-first ordering (a crash between the pin write
-// and the index write) and are invisible to PendingJobs while exempt from
-// retention sweeps. Pins with an index entry are left alone; their jobs are
-// released through PendingJobs/ReleaseJob once terminal. The store lock is held
-// throughout, so no concurrent pinPendingLocked can be mid-flight while orphans
-// are collected.
+// entry and no active lease to re-index them. Callers reconcile active leases
+// with ReconcilePendingPins first, so a pin that survives here belongs to no
+// awaiting job: it predates index-first ordering (a crash between the pin write
+// and the index write) or its job already left, and it is invisible to
+// PendingJobs while exempt from retention sweeps. Pins with an index entry are
+// left alone; their jobs are released through PendingJobs/ReleaseJob once
+// terminal. The store lock is held throughout, so no concurrent
+// pinPendingLocked can be mid-flight while orphans are collected.
 func (s *Store) ReleaseOrphanPendingPins(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -796,9 +839,258 @@ func (s *Store) ReleaseOrphanPendingPins(ctx context.Context) (int, error) {
 				return removed, err
 			}
 			removed++
+			// The file stays ordinary: drop its lease link too, so a later
+			// retry with the same job ID cannot resurrect it through
+			// ReconcilePendingPins. Best-effort like displacement clearing.
+			s.clearPendingLinkLocked(file, pin.Fingerprint)
 		}
 	}
 	return removed, nil
+}
+
+// ReconcilePendingPins restores interrupted provisional-lease writes for jobs
+// that are still active, before retention or orphan cleanup can evict their
+// evidence. For each active job it re-indexes a pin whose index write never
+// landed and restores pins for captures whose pin write never landed (found
+// through the metadata lease link written with the capture bytes). Jobs absent
+// from active are untouched: their index entries are released through
+// PendingJobs/ReleaseJob and their indexless pins through
+// ReleaseOrphanPendingPins, so genuinely orphan state is still collected. The
+// store lock is held throughout, so no concurrent pinPendingLocked can be
+// mid-flight while leases are reconciled.
+//
+// It reports reindexed index entries and restored pin sidecars. A corrupt
+// pending index fails instead of guessing; a missing index or no active jobs
+// is a no-op.
+func (s *Store) ReconcilePendingPins(ctx context.Context, activeJobIDs []string) (reindexed, restored int, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := make(map[string]string, len(activeJobIDs))
+	for _, jobID := range activeJobIDs {
+		trimmed := strings.TrimSpace(jobID)
+		if trimmed == "" {
+			continue
+		}
+		active[pendingFingerprint(trimmed)] = trimmed
+	}
+	if len(active) == 0 {
+		return 0, 0, nil
+	}
+	index, err := s.readPendingIndexLocked()
+	if err != nil {
+		return 0, 0, err
+	}
+	type leaseFile struct {
+		file     captureFile
+		pinned   bool
+		pin      capturePin
+		metadata captureMetadata
+	}
+	pinsByFingerprint := make(map[string]int)
+	byFingerprint := make(map[string][]leaseFile)
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		entries = nil
+	} else if err != nil {
+		return 0, 0, fmt.Errorf("reading capture directory: %w", err)
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return reindexed, restored, err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return reindexed, restored, err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if err != nil {
+			return reindexed, restored, err
+		}
+		for _, file := range files {
+			if err := ctx.Err(); err != nil {
+				return reindexed, restored, err
+			}
+			pin, pinned := readPin(file.Path)
+			metadata, _ := readMetadata(file.metadataPath)
+			if pinned && strings.HasPrefix(pin.Fingerprint, "pending:") {
+				pinsByFingerprint[pin.Fingerprint]++
+			}
+			fingerprints := map[string]bool{}
+			if pinned && strings.HasPrefix(pin.Fingerprint, "pending:") {
+				fingerprints[pin.Fingerprint] = true
+			}
+			if strings.TrimSpace(metadata.PendingJobID) != "" {
+				fingerprints[pendingFingerprint(metadata.PendingJobID)] = true
+			}
+			if pin.JobID != "" && strings.HasPrefix(pin.Fingerprint, "pending:") {
+				fingerprints[pendingFingerprint(pin.JobID)] = true
+			}
+			for fingerprint := range fingerprints {
+				byFingerprint[fingerprint] = append(byFingerprint[fingerprint], leaseFile{file: file, pinned: pinned, pin: pin, metadata: metadata})
+			}
+		}
+	}
+	indexChanged := false
+	for fingerprint, jobID := range active {
+		if err := ctx.Err(); err != nil {
+			return reindexed, restored, err
+		}
+		if _, ok := index[fingerprint]; !ok && len(byFingerprint[fingerprint]) > 0 {
+			index[fingerprint] = jobID
+			indexChanged = true
+			reindexed++
+		}
+		// Restore every unpinned capture that still links to this lease, in
+		// timestamp order. A displaced intermediate lost its link when its
+		// latest pin moved, so it is not a candidate; a crash victim kept its
+		// link and comes back with the role pendingRoleLocked computes now
+		// (first when no first pin exists, otherwise latest, displacing the
+		// prior latest exactly like the original write would have).
+		var unpinned []captureFile
+		for _, candidate := range byFingerprint[fingerprint] {
+			if candidate.pinned {
+				continue
+			}
+			if strings.TrimSpace(candidate.metadata.PendingJobID) == "" {
+				continue
+			}
+			if pendingFingerprint(candidate.metadata.PendingJobID) != fingerprint {
+				continue
+			}
+			unpinned = append(unpinned, candidate.file)
+		}
+		if len(unpinned) == 0 {
+			continue
+		}
+		sort.Slice(unpinned, func(i, j int) bool {
+			if unpinned[i].Timestamp.Equal(unpinned[j].Timestamp) {
+				return unpinned[i].Path < unpinned[j].Path
+			}
+			return unpinned[i].Timestamp.Before(unpinned[j].Timestamp)
+		})
+		for _, file := range unpinned {
+			if err := ctx.Err(); err != nil {
+				return reindexed, restored, err
+			}
+			role, err := s.pendingRoleLocked(ctx, fingerprint)
+			if err != nil {
+				return reindexed, restored, err
+			}
+			// The capture bytes prove the file still IS the capture the
+			// metadata describes; restoring a pin for modified bytes would
+			// protect evidence that no longer matches its recorded hash.
+			metadata, err := readMetadata(file.metadataPath)
+			if err != nil || strings.TrimSpace(metadata.SHA256) == "" {
+				continue
+			}
+			data, err := os.ReadFile(file.Path)
+			if err != nil {
+				continue
+			}
+			sum := sha256.Sum256(data)
+			if hex.EncodeToString(sum[:]) != metadata.SHA256 {
+				continue
+			}
+			if err := s.writePinLocked(file, fingerprint, jobID, role); err != nil {
+				return reindexed, restored, err
+			}
+			restored++
+			pinsByFingerprint[fingerprint]++
+			if role == PinLatest {
+				if err := s.removeIncidentRoleLocked(ctx, fingerprint, PinLatest, file.Path); err != nil {
+					s.discardPinLocked(file.Path)
+					restored--
+					pinsByFingerprint[fingerprint]--
+					return reindexed, restored, err
+				}
+			}
+		}
+	}
+	if indexChanged {
+		if err := s.writePendingIndexLocked(index); err != nil {
+			return 0, 0, err
+		}
+	}
+	return reindexed, restored, nil
+}
+
+// PendingLeaseCandidates lists every job ID referenced by a provisional-lease
+// trace on disk: pending index entries, pending pin sidecars, and capture
+// metadata lease links. The poll uses it to complete the active set when the
+// awaiting-job page is truncated: a pin-first crash leaves no index entry, so
+// a job past the page cap would otherwise miss reconciliation and lose its pin
+// to orphan cleanup. A corrupt index fails instead of guessing. Pins without
+// any resolvable job ID (legacy pins with no JobID and no metadata link) are
+// skipped; they stay genuine orphans.
+func (s *Store) PendingLeaseCandidates(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	set := make(map[string]struct{})
+	data, err := os.ReadFile(pendingIndexPath(s.root))
+	if err == nil {
+		var index map[string]string
+		if err := json.Unmarshal(data, &index); err != nil {
+			return nil, fmt.Errorf("decoding capture pending index: %w", err)
+		}
+		for _, jobID := range index {
+			if trimmed := strings.TrimSpace(jobID); trimmed != "" {
+				set[trimmed] = struct{}{}
+			}
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		entries = nil
+	} else if err != nil {
+		return nil, fmt.Errorf("reading capture directory: %w", err)
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			pin, ok := readPin(file.Path)
+			if ok && strings.HasPrefix(pin.Fingerprint, "pending:") && strings.TrimSpace(pin.JobID) != "" {
+				set[strings.TrimSpace(pin.JobID)] = struct{}{}
+			}
+			if metadata, err := readMetadata(file.metadataPath); err == nil {
+				if trimmed := strings.TrimSpace(metadata.PendingJobID); trimmed != "" {
+					set[trimmed] = struct{}{}
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for jobID := range set {
+		out = append(out, jobID)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // Sweep applies retention to every host, including captures that became
@@ -846,11 +1138,21 @@ type captureMetadata struct {
 	SanitizerProvenance string `json:"sanitizer_provenance,omitempty"`
 	SanitizerVersion    string `json:"sanitizer_version,omitempty"`
 	IndependentEvidence bool   `json:"independent_evidence,omitempty"`
+	// PendingJobID links a pre-outcome capture to its provisional lease. It is
+	// written with the capture bytes before the pending index and pin sidecars,
+	// so a crash between those two writes still leaves a durable link that the
+	// reconciler uses to restore the missing sidecar. Empty for observed
+	// captures and legacy captures written before this link existed.
+	PendingJobID string `json:"pending_job_id,omitempty"`
 }
 
 type capturePin struct {
 	Fingerprint string  `json:"fingerprint"`
 	Role        PinRole `json:"role"`
+	// JobID recovers the pending index entry when the index write never landed.
+	// Old pins carry only the opaque fingerprint; the reconciler falls back to
+	// the capture metadata link in that case.
+	JobID string `json:"job_id,omitempty"`
 }
 
 func pinPath(path string) string {
@@ -916,6 +1218,26 @@ func (s *Store) releaseIncidentLocked(ctx context.Context, fingerprint string) e
 				if err := os.Remove(pinPath(file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return err
 				}
+			}
+			// A released lease must not resurrect: a retry with the same job
+			// ID would otherwise restore these captures through their
+			// metadata lease link. Read failures are ignored (a missing or
+			// corrupt sidecar carries no link to resurrect); write failures
+			// abort so the caller retries instead of leaving a stale link.
+			metadata, err := readMetadata(file.metadataPath)
+			if err != nil || strings.TrimSpace(metadata.PendingJobID) == "" {
+				continue
+			}
+			if pendingFingerprint(metadata.PendingJobID) != fingerprint {
+				continue
+			}
+			metadata.PendingJobID = ""
+			encoded, err := json.Marshal(metadata)
+			if err != nil {
+				return fmt.Errorf("encoding capture metadata: %w", err)
+			}
+			if err := writeAtomically(filepath.Dir(file.metadataPath), file.metadataPath, encoded); err != nil {
+				return err
 			}
 		}
 	}
@@ -992,6 +1314,15 @@ func (s *Store) pruneHost(ctx context.Context, hostDir, host string) error {
 		}
 		return files[i].Timestamp.Before(files[j].Timestamp)
 	})
+	// An index entry without its pin sidecar is an interrupted write for a
+	// live lease, not an ordinary capture. The metadata link keeps it exempt
+	// from retention until ReconcilePendingPins restores the pin (or
+	// ReleaseJob drops the lease). Without this, the next store for the host
+	// would prune the very evidence the lease exists to protect.
+	index, err := s.readPendingIndexLocked()
+	if err != nil {
+		return err
+	}
 
 	cutoff := s.now().UTC().Add(-s.retention.MaxAge)
 	kept := files[:0]
@@ -999,7 +1330,7 @@ func (s *Store) pruneHost(ctx context.Context, hostDir, host string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if pinned, _ := readPin(file.Path); pinned.Fingerprint != "" {
+		if s.isLeaseExemptLocked(file, index) {
 			kept = append(kept, file)
 			continue
 		}
@@ -1014,7 +1345,7 @@ func (s *Store) pruneHost(ctx context.Context, hostDir, host string) error {
 	for len(kept) > s.retention.MaxPerHost {
 		evict := -1
 		for i, file := range kept {
-			if _, pinned := readPin(file.Path); !pinned {
+			if !s.isLeaseExemptLocked(file, index) {
 				evict = i
 				break
 			}
@@ -1028,6 +1359,41 @@ func (s *Store) pruneHost(ctx context.Context, hostDir, host string) error {
 		kept = append(kept[:evict], kept[evict+1:]...)
 	}
 	return nil
+}
+
+// readPendingIndexLocked returns the durable lease map. A missing index means
+// no provisional leases; a corrupt one fails retention rather than silently
+// evicting leased evidence. Callers hold s.mu.
+func (s *Store) readPendingIndexLocked() (map[string]string, error) {
+	data, err := os.ReadFile(pendingIndexPath(s.root))
+	if errors.Is(err, fs.ErrNotExist) {
+		return map[string]string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	index := map[string]string{}
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, fmt.Errorf("decoding capture pending index: %w", err)
+	}
+	return index, nil
+}
+
+// isLeaseExemptLocked reports whether retention must keep a capture: any pin
+// sidecar, or a metadata lease link whose fingerprint is still indexed. The
+// second clause covers the crash window after .pending.json is durable but
+// before the pin sidecar lands. Metadata or pin read failures mean no
+// exemption; retention then treats the file as ordinary. Callers hold s.mu.
+func (s *Store) isLeaseExemptLocked(file captureFile, index map[string]string) bool {
+	if pinned, _ := readPin(file.Path); pinned.Fingerprint != "" {
+		return true
+	}
+	metadata, err := readMetadata(file.metadataPath)
+	if err != nil || strings.TrimSpace(metadata.PendingJobID) == "" {
+		return false
+	}
+	_, ok := index[pendingFingerprint(metadata.PendingJobID)]
+	return ok
 }
 func (s *Store) nextPath(ctx context.Context, hostDir, scenario string, timestamp time.Time) (string, time.Time, error) {
 	for candidate := timestamp; ; candidate = candidate.Add(time.Nanosecond) {

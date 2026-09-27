@@ -18,6 +18,11 @@ import (
 	"papio/internal/job"
 )
 
+type committedJob struct {
+	id    string
+	state string
+}
+
 // fakeDaemon answers the three methods a run uses, marshalling through JSON
 // the way the real ipc client does so a shape mismatch fails here too.
 type fakeDaemon struct {
@@ -28,11 +33,17 @@ type fakeDaemon struct {
 	// read returns; unset means the job owns the request id the run
 	// used to submit it.
 	requestOf map[string]string
-	polls     map[string]int
-	existing  map[string]bool
-	cancelled []string
-	submitted []string
-	submitErr map[string]error
+	// consumerOf[jobID] is the submit_v3 consumer tag the job was stored
+	// with; only force submissions carry one.
+	consumerOf map[string]string
+	polls      map[string]int
+	existing   map[string]bool
+	cancelled  []string
+	submitted  []string
+	// submittedVia records the RPC method per submitted job id, so tests
+	// can pin force onto submit_v3 and non-force onto submit_v2.
+	submittedVia map[string]string
+	submitErr    map[string]error
 	// submitFails counts remaining submit failures per request id, so a
 	// test can lose the response the daemon's commit already outran.
 	submitFails map[string]int
@@ -40,6 +51,11 @@ type fakeDaemon struct {
 	// which the store lookup reads back. A lost response leaves it set and
 	// the caller ignorant, which is the whole defect under test.
 	committed map[string]committedJob
+	// byConsumer[consumer] is the job the daemon committed for a submit_v3
+	// consumer tag, terminal ones included. Force replaces the request id
+	// before storing, so this — not committed — is what names a forced job
+	// back after a lost response.
+	byConsumer map[string]committedJob
 	// loseWithoutCommit marks requests whose submit fails before any job
 	// is committed, so the lookup truthfully finds nothing.
 	loseWithoutCommit map[string]bool
@@ -51,20 +67,18 @@ type fakeDaemon struct {
 	nextID           int
 }
 
-type committedJob struct {
-	id    string
-	state string
-}
-
 func newFakeDaemon() *fakeDaemon {
 	return &fakeDaemon{
 		states:            map[string][]api.JobDetailV3{},
 		requestOf:         map[string]string{},
+		consumerOf:        map[string]string{},
 		polls:             map[string]int{},
 		existing:          map[string]bool{},
+		submittedVia:      map[string]string{},
 		submitErr:         map[string]error{},
 		submitFails:       map[string]int{},
 		committed:         map[string]committedJob{},
+		byConsumer:        map[string]committedJob{},
 		loseWithoutCommit: map[string]bool{},
 	}
 }
@@ -79,6 +93,16 @@ func (f *fakeDaemon) JobForRequest(_ context.Context, requestID string) (string,
 	return entry.id, entry.state, true, nil
 }
 
+// JobForConsumer is the force-path store lookup: it finds the committed job
+// for a submit_v3 consumer tag in EVERY state, terminal ones included.
+func (f *fakeDaemon) JobForConsumer(_ context.Context, consumer string) (string, string, bool, error) {
+	entry, ok := f.byConsumer[consumer]
+	if !ok {
+		return "", "", false, nil
+	}
+	return entry.id, entry.state, true, nil
+}
+
 func (f *fakeDaemon) Call(ctx context.Context, method string, params, result any) error {
 	switch method {
 	case "acquire.submit_v2":
@@ -86,43 +110,13 @@ func (f *fakeDaemon) Call(ctx context.Context, method string, params, result any
 		if err := roundTrip(params, &decoded); err != nil {
 			return err
 		}
-		key := decoded.Request.RequestID
-		if err := f.submitErr[key]; err != nil {
+		return f.submitWork(decoded.Request.RequestID, "", decoded.Force, decoded.AutoImport, "acquire.submit_v2", result)
+	case "acquire.submit_v3":
+		var decoded submitV3Params
+		if err := roundTrip(params, &decoded); err != nil {
 			return err
 		}
-		if n := f.submitFails[key]; n > 0 {
-			f.submitFails[key] = n - 1
-			if f.loseWithoutCommit[key] {
-				return context.DeadlineExceeded
-			}
-			// The daemon commits the acquisition BEFORE it answers, so a
-			// lost response leaves a real job the caller cannot name.
-			id := f.idFor(key)
-			state := job.StateQueued
-			if seq := f.states[id]; len(seq) > 0 {
-				state = seq[len(seq)-1].Job.State
-			} else {
-				f.states[id] = []api.JobDetailV3{detailFor(id, state, "")}
-			}
-			f.requestOf[id] = key
-			f.committed[key] = committedJob{id: id, state: state}
-			return context.DeadlineExceeded
-		}
-		if decoded.AutoImport == nil || *decoded.AutoImport {
-			return errors.New("a measurement must submit with auto_import false")
-		}
-		f.nextID++
-		id := f.idFor(key)
-		f.submitted = append(f.submitted, id)
-		if _, ok := f.requestOf[id]; !ok {
-			f.requestOf[id] = key
-		}
-		state := job.StateQueued
-		if seq := f.states[id]; len(seq) > 0 {
-			state = seq[len(seq)-1].Job.State
-		}
-		f.committed[key] = committedJob{id: id, state: state}
-		return roundTrip(api.SubmitV2Result{JobID: id, Existing: f.existing[key]}, result)
+		return f.submitWork(decoded.Request.RequestID, decoded.Consumer, decoded.Force, decoded.AutoImport, "acquire.submit_v3", result)
 	case "jobs.get_v3":
 		var getParams map[string]string
 		if err := roundTrip(params, &getParams); err != nil {
@@ -159,6 +153,57 @@ func (f *fakeDaemon) Call(ctx context.Context, method string, params, result any
 		return roundTrip(map[string]bool{"cancelled": true}, result)
 	}
 	return errors.New("unexpected method " + method)
+}
+
+// submitWork models the daemon commit for one submit RPC. Force replaces the
+// supplied request id with a generated one before storing, so the committed
+// request-id association lives under a key the caller never sent; the v3
+// consumer tag rides on the job row itself and is what names a forced job
+// back. The job id stays derived from the supplied key so tests can seed
+// states ahead of time.
+func (f *fakeDaemon) submitWork(key, consumer string, force bool, autoImport *bool, method string, result any) error {
+	commitKey := key
+	if force {
+		commitKey = "forced-" + key
+	}
+	if err := f.submitErr[key]; err != nil {
+		return err
+	}
+	commit := func() (string, string) {
+		id := f.idFor(key)
+		state := job.StateQueued
+		if seq := f.states[id]; len(seq) > 0 {
+			state = seq[len(seq)-1].Job.State
+		} else {
+			f.states[id] = []api.JobDetailV3{detailFor(id, state, "")}
+		}
+		f.requestOf[id] = commitKey
+		f.committed[commitKey] = committedJob{id: id, state: state}
+		if consumer != "" {
+			f.consumerOf[id] = consumer
+			f.byConsumer[consumer] = committedJob{id: id, state: state}
+		}
+		return id, state
+	}
+	if n := f.submitFails[key]; n > 0 {
+		f.submitFails[key] = n - 1
+		if f.loseWithoutCommit[key] {
+			return context.DeadlineExceeded
+		}
+		// The daemon commits the acquisition BEFORE it answers, so a
+		// lost response leaves a real job the caller cannot name.
+		commit()
+		return context.DeadlineExceeded
+	}
+	if autoImport == nil || *autoImport {
+		return errors.New("a measurement must submit with auto_import false")
+	}
+	f.nextID++
+	id, _ := commit()
+	f.submitted = append(f.submitted, id)
+	f.submittedVia[id] = method
+	existing := f.existing[key] && !force
+	return roundTrip(api.SubmitV2Result{JobID: id, Existing: existing}, result)
 }
 
 // idFor maps a request id onto a stable job id so a test can seed states
@@ -648,8 +693,454 @@ func TestForceSubmitsEvenWithAnUnaccountedEarlierSubmission(t *testing.T) {
 	if len(daemon.submitted) != 1 {
 		t.Fatalf("submitted = %v, want the forced submission to go through", daemon.submitted)
 	}
+	if got := daemon.submittedVia["job_slow"]; got != "acquire.submit_v3" {
+		t.Fatalf("submitted via %q, want force to use acquire.submit_v3 with the consumer tag", got)
+	}
 	if len(second.Results) != 1 || second.Results[0].JobID == "" {
 		t.Fatalf("results = %+v, want the forced work measured", second.Results)
+	}
+}
+
+// With force the daemon stores a generated request id instead of the
+// supplied one, so the run must move the durable association onto the
+// committed id it reads back. Otherwise the next run can never reconcile
+// this submission by request id.
+func TestForceSuccessMovesJournalOntoCommittedRequestID(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_forced"] = []api.JobDetailV3{detailFor("job_forced", job.StateReady, "")}
+	journal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oldTimeout, oldPoll := reconcileTimeout, reconcilePoll
+	reconcileTimeout, reconcilePoll = 100*time.Millisecond, 5*time.Millisecond
+	defer func() { reconcileTimeout, reconcilePoll = oldTimeout, oldPoll }()
+	report, err := Run(ctx, Options{
+		Cohort:        cohortOf(work("forced", bench.AutonomousReady)),
+		Caller:        daemon,
+		Lookup:        daemon,
+		Journal:       journal,
+		RunID:         "testrun",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+		Force:         true,
+		Cleanup:       true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	row := report.Results[0]
+	supplied := "livecohort-testrun-forced"
+	committed := "forced-" + supplied
+	if row.JobID != "job_forced" {
+		t.Fatalf("job id = %q, want the forced job", row.JobID)
+	}
+	if row.RequestID != committed {
+		t.Fatalf("request id = %q, want the committed id %q the lookup can find", row.RequestID, committed)
+	}
+	if !row.CreatedByRun {
+		t.Fatalf("created_by_run = false, want the forced job owned by this run")
+	}
+	if got := daemon.submittedVia["job_forced"]; got != "acquire.submit_v3" {
+		t.Fatalf("submitted via %q, want force to use acquire.submit_v3 with the consumer tag", got)
+	}
+	if got := daemon.consumerOf["job_forced"]; got != supplied {
+		t.Fatalf("consumer = %q, want the run/work tag %q stored on the job", got, supplied)
+	}
+	if _, ok := daemon.committed[supplied]; ok {
+		t.Fatalf("committed[%q] exists, want the daemon to store only the generated id", supplied)
+	}
+	entry, _, found, _ := daemon.JobForRequest(context.Background(), committed)
+	if !found || entry != "job_forced" {
+		t.Fatalf("lookup(%q) = %q, %v, want the committed job", committed, entry, found)
+	}
+	if entry, _, found, _ := daemon.JobForConsumer(context.Background(), supplied); !found || entry != "job_forced" {
+		t.Fatalf("consumer lookup(%q) = %q, %v, want the forced job by its tag", supplied, entry, found)
+	}
+	unresolved, err := journal.Unresolved("test")
+	if err != nil {
+		t.Fatalf("Unresolved: %v", err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unresolved = %+v, want the stale supplied intent resolved and the committed one accounted for", unresolved)
+	}
+}
+
+// A tagged force entry resolves by its consumer tag alone. A request-id row
+// under the supplied id — if one exists — belongs to a different acquisition
+// than the tag does, so consulting it first would attribute an older job.
+// Fail-first: the old request-first order returned the stale row.
+func TestTaggedPriorEntryPrefersConsumerOverRequestRow(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.committed["livecohort-runone-slow"] = committedJob{id: "job_stale", state: job.StateReady}
+	daemon.byConsumer["tag-runone-slow"] = committedJob{id: "job_fresh", state: job.StateQueued}
+	skip, settled := resolvePriorSubmission(context.Background(), Options{Lookup: daemon},
+		JournalEntry{CohortID: "test", WorkKey: "slow", RequestID: "livecohort-runone-slow", Consumer: "tag-runone-slow", RunID: "runone"})
+	if !settled {
+		t.Fatal("settled = false, want the consumer tag's job")
+	}
+	if skip.JobID != "job_fresh" {
+		t.Fatalf("job = %q, want the consumer tag's job, not the stale request-id row", skip.JobID)
+	}
+}
+
+// orderJournal records journal operations so tests can pin their sequence.
+type orderJournal struct {
+	Journal
+	events []string
+}
+
+func (j *orderJournal) Note(entry JournalEntry) error {
+	j.events = append(j.events, "note:"+entry.RequestID)
+	return j.Journal.Note(entry)
+}
+
+func (j *orderJournal) Resolve(requestID string) error {
+	j.events = append(j.events, "resolve:"+requestID)
+	return j.Journal.Resolve(requestID)
+}
+
+func indexOf(events []string, want string) int {
+	for i, event := range events {
+		if event == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// On a successful force the committed entry must go down BEFORE the intent
+// is retired: a crash between the two then leaves both entries unresolved —
+// recoverable by consumer tag — while the reverse order would leave no entry
+// at all and invite a duplicate acquisition on the next run.
+func TestForceSuccessNotesCommittedBeforeRetiringIntent(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_forced"] = []api.JobDetailV3{detailFor("job_forced", job.StateReady, "")}
+	fileJournal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	journal := &orderJournal{Journal: fileJournal}
+	supplied := "livecohort-testrun-forced"
+	committed := "forced-" + supplied
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oldTimeout, oldPoll := reconcileTimeout, reconcilePoll
+	reconcileTimeout, reconcilePoll = 100*time.Millisecond, 5*time.Millisecond
+	defer func() { reconcileTimeout, reconcilePoll = oldTimeout, oldPoll }()
+	if _, err := Run(ctx, Options{
+		Cohort:        cohortOf(work("forced", bench.AutonomousReady)),
+		Caller:        daemon,
+		Lookup:        daemon,
+		Journal:       journal,
+		RunID:         "testrun",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+		Force:         true,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	note := indexOf(journal.events, "note:"+committed)
+	resolve := indexOf(journal.events, "resolve:"+supplied)
+	if note < 0 {
+		t.Fatalf("events = %v, want the committed entry noted", journal.events)
+	}
+	if resolve < 0 {
+		t.Fatalf("events = %v, want the supplied intent retired", journal.events)
+	}
+	if note > resolve {
+		t.Fatalf("events = %v, want the committed note before the intent resolve: the reverse order loses the association on a crash", journal.events)
+	}
+}
+
+// failCommittedJournal refuses one durable note and delegates the rest, so
+// a test can prove the crash-gap order: the intent must survive when the
+// committed note does not land.
+type failCommittedJournal struct {
+	Journal
+	failID  string
+	noteErr error
+}
+
+func (j failCommittedJournal) Note(entry JournalEntry) error {
+	if entry.RequestID == j.failID {
+		return j.noteErr
+	}
+	return j.Journal.Note(entry)
+}
+
+// If the committed note fails, the run must NOT retire the intent: the
+// intent carrying the consumer tag is then the only record keeping the next
+// run from submitting the paper again.
+func TestForceCommittedNoteFailureKeepsIntentRecoverable(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_forced"] = []api.JobDetailV3{detailFor("job_forced", job.StateReady, "")}
+	fileJournal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	supplied := "livecohort-testrun-forced"
+	committed := "forced-" + supplied
+	journal := failCommittedJournal{Journal: fileJournal, failID: committed, noteErr: errors.New("disk full for committed")}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oldTimeout, oldPoll := reconcileTimeout, reconcilePoll
+	reconcileTimeout, reconcilePoll = 100*time.Millisecond, 5*time.Millisecond
+	defer func() { reconcileTimeout, reconcilePoll = oldTimeout, oldPoll }()
+	report, err := Run(ctx, Options{
+		Cohort:        cohortOf(work("forced", bench.AutonomousReady)),
+		Caller:        daemon,
+		Lookup:        daemon,
+		Journal:       journal,
+		RunID:         "testrun",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+		Force:         true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	row := report.Results[0]
+	if row.JobID != "job_forced" {
+		t.Fatalf("job id = %q, want the submitted job still measured", row.JobID)
+	}
+	if row.RequestID != committed {
+		t.Fatalf("request id = %q, want committed id %q", row.RequestID, committed)
+	}
+	if len(report.JournalFailures) == 0 {
+		t.Fatal("journal failures empty, want the failed committed note named in the report")
+	}
+	unresolved, err := fileJournal.Unresolved("test")
+	if err != nil {
+		t.Fatalf("Unresolved: %v", err)
+	}
+	if len(unresolved) != 1 || unresolved[0].RequestID != supplied {
+		t.Fatalf("unresolved = %+v, want the supplied intent kept for the next run", unresolved)
+	}
+	if unresolved[0].Consumer == "" {
+		t.Fatalf("unresolved = %+v, want the consumer tag kept with the intent", unresolved)
+	}
+}
+
+// A forced submission whose response is lost is named by its submit_v3
+// consumer tag, which the daemon stores on the job row even as it replaces
+// the request id. The run measures the committed job and never resubmits.
+// Fail-first: on the old request-id lookup this stayed SubmitAmbiguous with
+// an empty job id.
+func TestForceLostSubmitRecoversByConsumerTag(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_flakyforce"] = []api.JobDetailV3{detailFor("job_flakyforce", job.StateUnavailable, "no legal candidates")}
+	daemon.submitFails["livecohort-testrun-flakyforce"] = 1
+	journal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oldTimeout, oldPoll := reconcileTimeout, reconcilePoll
+	reconcileTimeout, reconcilePoll = 100*time.Millisecond, 5*time.Millisecond
+	defer func() { reconcileTimeout, reconcilePoll = oldTimeout, oldPoll }()
+	report, err := Run(ctx, Options{
+		Cohort:        cohortOf(work("flakyforce", bench.HonestUnavailable)),
+		Caller:        daemon,
+		Lookup:        daemon,
+		Journal:       journal,
+		RunID:         "testrun",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+		Force:         true,
+		Cleanup:       true,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	row := report.Results[0]
+	if row.JobID != "job_flakyforce" {
+		t.Fatalf("job id = %q, want the committed job the consumer tag named", row.JobID)
+	}
+	if row.Outcome != Unavailable {
+		t.Fatalf("outcome = %q, want the settled job rather than a submit verdict", row.Outcome)
+	}
+	if !row.CreatedByRun {
+		t.Fatalf("created_by_run = false, want the recovered job owned by this run")
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %d answered submissions, want none: recovery reads the store and never asks again", got)
+	}
+	unresolved, err := journal.Unresolved("test")
+	if err != nil {
+		t.Fatalf("Unresolved: %v", err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unresolved = %+v, want the recovered submission accounted for", unresolved)
+	}
+}
+
+// A later run reconciles an earlier force run's unaccounted submission by its
+// consumer tag instead of submitting the paper again. Fail-first: on the old
+// request-id lookup the tag-less read missed and the paper was duplicated.
+func TestRerunReconcilesForceEntryByConsumerTag(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_slow"] = []api.JobDetailV3{detailFor("job_slow", job.StateReady, "")}
+	daemon.submitFails["livecohort-runone-slow"] = 1
+	journal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	cohort := cohortOf(work("slow", bench.AutonomousReady))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oldTimeout, oldPoll := reconcileTimeout, reconcilePoll
+	reconcileTimeout, reconcilePoll = 100*time.Millisecond, 5*time.Millisecond
+	defer func() { reconcileTimeout, reconcilePoll = oldTimeout, oldPoll }()
+	first, err := Run(ctx, Options{
+		Cohort:        cohort,
+		Caller:        daemon,
+		Lookup:        nil,
+		Journal:       journal,
+		RunID:         "runone",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+		Force:         true,
+	})
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if got := first.Results[0].Outcome; got != SubmitAmbiguous {
+		t.Fatalf("first run outcome = %q, want %q without a lookup", got, SubmitAmbiguous)
+	}
+	second, err := Run(ctx, Options{
+		Cohort:        cohort,
+		Caller:        daemon,
+		Lookup:        daemon,
+		Journal:       journal,
+		RunID:         "runtwo",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+	})
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if len(second.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want the earlier force submission reconciled, not resubmitted", second.Skipped)
+	}
+	if got := second.Skipped[0].JobID; got != "job_slow" {
+		t.Fatalf("skipped job = %q, want the consumer tag's job", got)
+	}
+	if got := len(daemon.submitted); got != 0 {
+		t.Fatalf("submitted = %v, want no second acquisition for a paper the earlier force run already asked for", daemon.submitted)
+	}
+}
+
+// Non-force submissions stay on the ratified submit_v2 with no consumer tag,
+// so the ordinary path gains no new failure mode and no new attribution.
+func TestNonForceSubmitsViaV2WithoutConsumer(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_plain"] = []api.JobDetailV3{detailFor("job_plain", job.StateReady, "")}
+	report := runWith(t, daemon, cohortOf(work("plain", bench.AutonomousReady)), func(o *Options) {
+		o.Cleanup = true
+	})
+	if len(report.Results) != 1 || report.Results[0].JobID != "job_plain" {
+		t.Fatalf("results = %+v, want the submitted job measured", report.Results)
+	}
+	if got := daemon.submittedVia["job_plain"]; got != "acquire.submit_v2" {
+		t.Fatalf("submitted via %q, want non-force to stay on acquire.submit_v2", got)
+	}
+	if got := daemon.consumerOf["job_plain"]; got != "" {
+		t.Fatalf("consumer = %q, want no attribution on the ordinary path", got)
+	}
+}
+
+// noteFailingJournal fails the intent write for one work key and delegates
+// the rest to a real journal, so the run has earlier submissions to settle
+// when the failure lands.
+type noteFailingJournal struct {
+	Journal
+	failKey string
+	noteErr error
+}
+
+func (j noteFailingJournal) Note(entry JournalEntry) error {
+	if entry.WorkKey == j.failKey {
+		return j.noteErr
+	}
+	return j.Journal.Note(entry)
+}
+
+// A journal intent the run cannot write for a later work must not abandon
+// the jobs earlier works already submitted: they still need settlement,
+// cleanup, and a report that names them.
+func TestJournalIntentFailureStillSettlesAndCleansEarlierJobs(t *testing.T) {
+	daemon := newFakeDaemon()
+	daemon.states["job_first"] = []api.JobDetailV3{
+		detail(job.StateAwaitingHuman, "", job.HumanAction{Kind: "openurl_handoff", Status: "open"}),
+	}
+	fileJournal, err := OpenFileJournal(filepath.Join(t.TempDir(), "journal.json"))
+	if err != nil {
+		t.Fatalf("OpenFileJournal: %v", err)
+	}
+	journal := noteFailingJournal{Journal: fileJournal, failKey: "second", noteErr: errors.New("disk full for second")}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oldTimeout, oldPoll := reconcileTimeout, reconcilePoll
+	reconcileTimeout, reconcilePoll = 100*time.Millisecond, 5*time.Millisecond
+	defer func() { reconcileTimeout, reconcilePoll = oldTimeout, oldPoll }()
+	report, runErr := Run(ctx, Options{
+		Cohort: cohortOf(
+			work("first", bench.ReadyAfterHumanBoundary),
+			work("second", bench.AutonomousReady),
+		),
+		Caller:        daemon,
+		Lookup:        daemon,
+		Journal:       journal,
+		RunID:         "testrun",
+		PerWorkBudget: time.Minute,
+		Poll:          time.Microsecond,
+		ParkSettle:    time.Microsecond,
+		Cleanup:       true,
+	})
+	if runErr == nil {
+		t.Fatal("Run succeeded while a journal intent could not be written")
+	}
+	if !strings.Contains(runErr.Error(), "disk full for second") {
+		t.Fatalf("error = %v, want the underlying write failure", runErr)
+	}
+	if len(report.Results) != 2 {
+		t.Fatalf("results = %+v, want both the settled job and the unsubmitted work reported", report.Results)
+	}
+	first := report.Results[0]
+	if first.JobID != "job_first" {
+		t.Fatalf("first job id = %q, want the submitted job settled", first.JobID)
+	}
+	if first.Outcome != HumanBoundary {
+		t.Fatalf("first outcome = %q, want %q: the earlier job must still settle", first.Outcome, HumanBoundary)
+	}
+	second := report.Results[1]
+	if second.Outcome != SubmitFailed {
+		t.Fatalf("second outcome = %q, want %q: the intent failure must not submit", second.Outcome, SubmitFailed)
+	}
+	if second.JobID != "" {
+		t.Fatalf("second job id = %q, want empty when the intent was never durable", second.JobID)
+	}
+	if !strings.Contains(second.StopDetail, "disk full for second") {
+		t.Fatalf("second stop detail = %q, want the write failure named", second.StopDetail)
+	}
+	if len(daemon.cancelled) != 1 || daemon.cancelled[0] != "job_first" {
+		t.Fatalf("cancelled = %v, want the earlier parked job cancelled despite the later failure", daemon.cancelled)
+	}
+	if len(report.Cancelled) != 1 || report.Cancelled[0] != "job_first" {
+		t.Fatalf("report cancelled = %v, want the earlier job named", report.Cancelled)
+	}
+	if len(report.JournalFailures) == 0 {
+		t.Fatal("journal failures empty, want the unwritten intent named in the report")
 	}
 }
 

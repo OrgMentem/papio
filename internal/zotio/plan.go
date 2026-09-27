@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -390,7 +391,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		if existing.Status == "ambiguous" {
 			return nil, s.ambiguousReplayError(existing, plan.ID)
 		}
-		s.completeFollowUps(ctx, plan, existing)
+		if err := s.completeFollowUps(ctx, plan, existing); err != nil {
+			log.Printf("papio: completing Zotio follow-ups of job %s: %v", plan.JobID, err)
+		}
 		if err := s.markImported(ctx, existing); err != nil {
 			return nil, err
 		}
@@ -403,6 +406,13 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	}
 	if err := s.refuseCreateAfterCommit(ledgerCtx, plan); err != nil {
 		return nil, err
+	}
+	// The epoch must predate the import it bounds: the daemon serves the
+	// socket before its first maintenance pass, so an import that crashes
+	// before that pass would otherwise be older than the epoch that pass
+	// writes and fall outside the repair scan for good.
+	if err := s.ensureFollowUpEpoch(ledgerCtx); err != nil {
+		return nil, fmt.Errorf("recording the Zotio follow-up epoch: %w", err)
 	}
 	claimed, err := s.claimApply(ledgerCtx, idempotencyKey, plan.JobID)
 	if err != nil {
@@ -417,7 +427,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 			if result.Status == "ambiguous" {
 				return nil, s.ambiguousReplayError(result, plan.ID)
 			}
-			s.completeFollowUps(ctx, plan, result)
+			if err := s.completeFollowUps(ctx, plan, result); err != nil {
+				log.Printf("papio: completing Zotio follow-ups of job %s: %v", plan.JobID, err)
+			}
 			if err := s.markImported(ctx, result); err != nil {
 				return nil, err
 			}
@@ -446,7 +458,9 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		if plan.CollectionKey != "" && desktopTargetMissing(out) {
 			// zotio refused before saving anything, and the plan is gone, so
 			// the next plan can safely leave the collection to the follow-up.
-			s.deferCollectionFiling(ctx, plan)
+			if err := s.deferCollectionFiling(ctx, plan); err != nil {
+				log.Printf("papio: deferring Zotio collection filing for job %s: %v", plan.JobID, err)
+			}
 			return nil, fmt.Errorf("%w: %w", errFilingTargetMissing, failure)
 		}
 		return nil, failure
@@ -504,7 +518,11 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if err := s.markImported(ctx, result); err != nil {
 		return nil, err
 	}
-	s.followUp(ctx, plan, result)
+	// The import is durable; a follow-up recording failure stays unmarked
+	// for maintenance instead of failing the apply.
+	if err := s.followUp(ctx, plan, result); err != nil {
+		log.Printf("papio: finishing Zotio follow-ups of job %s: %v", plan.JobID, err)
+	}
 	return result, nil
 }
 
@@ -537,18 +555,21 @@ func (s *Service) markImported(ctx context.Context, result *ApplyResult) error {
 // durably recorded. Filing is deliberately best-effort: an attachment/import
 // must not be rolled back because a collection write cannot be completed.
 // It reports whether it asked zotio to file, which is when it records an event.
-func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyResult) bool {
+// The error reports whether that event was durably recorded: a recording
+// failure leaves the job without its completion marker so maintenance can
+// finish it instead of losing it.
+func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyResult) (bool, error) {
 	if plan == nil || result == nil || result.ParentKey == "" {
-		return false
+		return false, nil
 	}
 	collection := strings.TrimSpace(plan.Collection)
 	if collection == "" {
-		return false
+		return false, nil
 	}
 	if plan.CollectionIsKey {
 		// A missing-PDF queue filter is a Zotero collection key. The existing
 		// parent already belongs to that collection; filing accepts names only.
-		return false
+		return false, nil
 	}
 	detail := map[string]any{"collection": collection}
 	if out, err := s.CLI.RunJSON(ctx, "--agent", "--yes", "items", "add-to-collection", result.ParentKey, "--collection-name", collection); err != nil {
@@ -556,17 +577,22 @@ func (s *Service) fileCollection(ctx context.Context, plan *Plan, result *ApplyR
 	} else {
 		detail["status"] = "applied"
 	}
-	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpCollectionFiling, detail)
-	return true
+	if err := s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpCollectionFiling, detail); err != nil {
+		return true, fmt.Errorf("recording Zotio collection filing: %w", err)
+	}
+	return true, nil
 }
 
 // enrichAutoImportedParent fills only missing DOI and abstract metadata after a
 // successful policy-driven auto-import. It deliberately does not request any
 // OA-PDF remediation or validation mode, and its failure cannot undo the import.
 // It reports whether it asked zotio to enrich, which is when it records an event.
-func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, result *ApplyResult) bool {
+// The error reports whether that event was durably recorded: a recording
+// failure leaves the job without its completion marker so maintenance can
+// finish it instead of losing it.
+func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, result *ApplyResult) (bool, error) {
 	if !s.autoEnrichApplies(ctx, plan, result) {
-		return false
+		return false, nil
 	}
 	detail := map[string]any{
 		"parent_key": result.ParentKey,
@@ -581,8 +607,10 @@ func (s *Service) enrichAutoImportedParent(ctx context.Context, plan *Plan, resu
 	} else {
 		detail["status"] = "applied"
 	}
-	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpEnrich, detail)
-	return true
+	if err := s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpEnrich, detail); err != nil {
+		return true, fmt.Errorf("recording Zotio enrich: %w", err)
+	}
+	return true, nil
 }
 
 // autoEnrichApplies reports whether a successful import gets the post-import

@@ -15255,6 +15255,184 @@ test("a completed grab whose status is still non-terminal keeps its correlation"
     downloadID: 901,
   });
 });
+test("a failed startup grab-status query retries after daemon reconnect", async () => {
+  // The daemon already marked the row notified, so no push will ever recover
+  // it. A status query that fails while the daemon is away (hello timeout
+  // here) must park the grab and retry on the next hello_ack, not wait for
+  // another worker restart.
+  const grabID = "grab-complete-retry";
+  const scanID = "scan-grab-retry";
+  const seeded = await persistedGrabDownload(grabID, scanID);
+  const restarted = makeHarness(seeded.store);
+  restarted.pdfGrabCorrelations.current = seeded.correlations;
+  restarted.downloads.items.set(901, {
+    id: 901,
+    url: seeded.url,
+    filename: `papio/grabs/${grabID}/paper.pdf`,
+    state: "complete",
+  });
+  await restarted.bridge.start();
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  // No hello yet, so the startup recovery is still waiting on the session.
+  expect(
+    restarted.frames().some((frame) => frame.type === "pdf_grab_status_request"),
+  ).toBe(false);
+  // The daemon is away: expire the hello wait so the startup query fails fast
+  // and parks the grab instead of stalling worker setup.
+  const helloTimeouts = restarted.timers.filter((timer) => timer.ms === 5_000);
+  expect(helloTimeouts.length).toBeGreaterThan(0);
+  for (const timer of helloTimeouts) await timer.fn();
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(grabStateMessages(restarted.runtimeMessages)).toEqual([]);
+  expect(restarted.pdfGrabCorrelations.current[grabID]).toMatchObject({
+    downloadID: 901,
+  });
+  expect(
+    restarted.frames().some((frame) => frame.type === "pdf_grab_status_request"),
+  ).toBe(false);
+  // The daemon reconnects. This inbound must resolve without any status reply
+  // already waiting: the retry runs off the serialized inbound chain, so
+  // awaiting the correlated reply inside the hello_ack handler would deadlock
+  // here and this await would never settle.
+  const timersBeforeHello = restarted.timers.length;
+  await restarted.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const scheduled = restarted.timers
+    .slice(timersBeforeHello)
+    .filter((timer) => timer.ms === 0);
+  expect(scheduled.length).toBeGreaterThan(0);
+  for (const timer of scheduled) await timer.fn();
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const statusFrame = restarted
+    .frames()
+    .find(
+      (frame) =>
+        frame.type === "pdf_grab_status_request" &&
+        frame.payload["grab_id"] === grabID,
+    );
+  expect(statusFrame).toBeDefined();
+  await restarted.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: statusFrame!.payload["request_id"] as string,
+      grab_id: grabID,
+      state: "job_created",
+      outcome: "job_created",
+      job_id: "job_grab_retry",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(grabStateMessages(restarted.runtimeMessages)).toEqual([
+    {
+      type: "papio.pageBulk.grabState",
+      scan_id: scanID,
+      grab_id: grabID,
+      state: "job_created",
+    },
+  ]);
+  expect(restarted.pdfGrabCorrelations.current[grabID]).toBeUndefined();
+});
+test("a non-terminal grab-status answer stays eligible for a later reconnect", async () => {
+  // A quarantined answer is not terminal, but the later terminal push can be
+  // lost by another disconnect while the daemon already marked the row
+  // notified. The grab must stay parked for the next hello_ack instead of
+  // being dropped, without polling again while still connected.
+  const grabID = "grab-complete-retry-nt";
+  const scanID = "scan-grab-retry-nt";
+  const seeded = await persistedGrabDownload(grabID, scanID);
+  const restarted = makeHarness(seeded.store);
+  restarted.pdfGrabCorrelations.current = seeded.correlations;
+  restarted.downloads.items.set(901, {
+    id: 901,
+    url: seeded.url,
+    filename: `papio/grabs/${grabID}/paper.pdf`,
+    state: "complete",
+  });
+  await restarted.bridge.start();
+  await restarted.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const firstFrame = restarted
+    .frames()
+    .find(
+      (frame) =>
+        frame.type === "pdf_grab_status_request" &&
+        frame.payload["grab_id"] === grabID,
+    );
+  expect(firstFrame).toBeDefined();
+  await restarted.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: firstFrame!.payload["request_id"] as string,
+      grab_id: grabID,
+      state: "quarantined",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(grabStateMessages(restarted.runtimeMessages)).toEqual([]);
+  expect(restarted.pdfGrabCorrelations.current[grabID]).toMatchObject({
+    downloadID: 901,
+  });
+  // Still connected: no second query may fire on its own.
+  expect(
+    restarted
+      .frames()
+      .filter(
+        (frame) =>
+          frame.type === "pdf_grab_status_request" &&
+          frame.payload["grab_id"] === grabID,
+      ),
+  ).toHaveLength(1);
+  // The terminal push is lost by another disconnect. The next handshake must
+  // re-query the still-parked grab.
+  const timersBeforeHello = restarted.timers.length;
+  await restarted.port.inbound(
+    helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["pdf_grab_v1", "effect_permit_v1"],
+    }),
+  );
+  const scheduled = restarted.timers
+    .slice(timersBeforeHello)
+    .filter((timer) => timer.ms === 0);
+  expect(scheduled.length).toBeGreaterThan(0);
+  for (const timer of scheduled) await timer.fn();
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  const frames = restarted
+    .frames()
+    .filter(
+      (frame) =>
+        frame.type === "pdf_grab_status_request" &&
+        frame.payload["grab_id"] === grabID,
+    );
+  expect(frames).toHaveLength(2);
+  const secondFrame = frames[1]!;
+  await restarted.port.inbound(
+    nativeResult("pdf_grab_status_result", {
+      request_id: secondFrame.payload["request_id"] as string,
+      grab_id: grabID,
+      state: "job_created",
+      outcome: "job_created",
+      job_id: "job_grab_retry_nt",
+    }),
+  );
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(grabStateMessages(restarted.runtimeMessages)).toEqual([
+    {
+      type: "papio.pageBulk.grabState",
+      scan_id: scanID,
+      grab_id: grabID,
+      state: "job_created",
+    },
+  ]);
+  expect(restarted.pdfGrabCorrelations.current[grabID]).toBeUndefined();
+});
 
 test("papio.pageBulk.grabPdf clears a conflict acknowledgment with its settled state", async () => {
   const h = makeHarness();

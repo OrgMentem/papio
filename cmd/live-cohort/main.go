@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -129,25 +130,38 @@ func main() {
 	fmt.Fprintf(os.Stderr, "live-cohort: %d work(s), budget %s each, cleanup %v — this submits REAL jobs to %s\n",
 		len(cohort.Works), *budget, !*keep, socket)
 
-	report, err := livecohort.Run(ctx, opts)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "live-cohort:", err)
-		os.Exit(1)
-	}
+	report, runErr := livecohort.Run(ctx, opts)
+	os.Exit(finish(os.Stdout, os.Stderr, report, runErr, *jsonOut, *out))
+}
 
-	rendered, err := render(report, *jsonOut)
+// finish emits whatever the run measured even when the run reports an
+// error, then names the error. A run that settled and cleaned up earlier
+// works before a later journal intent failed still holds real measurements,
+// and dropping them would repeat the invisible situation this instrument
+// exists to prevent. It returns the process exit code: 0 for a complete
+// run, 1 when the run — or the report of it — failed.
+func finish(stdout, stderr io.Writer, report livecohort.Report, runErr error, asJSON bool, outPath string) int {
+	rendered, err := render(report, asJSON)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "live-cohort: rendering report:", err)
-		os.Exit(1)
-	}
-	fmt.Print(rendered)
-	if *out != "" {
-		if err := os.WriteFile(*out, []byte(rendered), 0o600); err != nil {
-			fmt.Fprintln(os.Stderr, "live-cohort: writing report:", err)
-			os.Exit(1)
+		fmt.Fprintln(stderr, "live-cohort: rendering report:", err)
+		if runErr != nil {
+			fmt.Fprintln(stderr, "live-cohort:", runErr)
 		}
-		fmt.Fprintln(os.Stderr, "live-cohort: report written to", *out)
+		return 1
 	}
+	fmt.Fprint(stdout, rendered)
+	if outPath != "" {
+		if err := os.WriteFile(outPath, []byte(rendered), 0o600); err != nil {
+			fmt.Fprintln(stderr, "live-cohort: writing report:", err)
+			return 1
+		}
+		fmt.Fprintln(stderr, "live-cohort: report written to", outPath)
+	}
+	if runErr != nil {
+		fmt.Fprintln(stderr, "live-cohort:", runErr)
+		return 1
+	}
+	return 0
 }
 
 // wireSafety opens the two dependencies that keep a run from duplicating

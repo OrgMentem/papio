@@ -1073,6 +1073,69 @@ func TestExportHealsInterruptedPartialArtifact(t *testing.T) {
 	}
 }
 
+// A ledger failure after healing a truncated artifact at an already valid
+// same-job destination must preserve the original partial file: rollback
+// restores the old bundle and the truncated bytes instead of leaving the
+// restored bundle without any PDF.
+func TestExportLedgerFailurePreservesHealedPartialArtifact(t *testing.T) {
+	exporter, id, sha := readyFixture(t)
+	ctx := context.Background()
+	destination := filepath.Join(t.TempDir(), "export")
+	bundlePath, _, err := exporter.Export(ctx, id, destination)
+	if err != nil {
+		t.Fatalf("initial export: %v", err)
+	}
+	beforeBundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactPath := filepath.Join(destination, "artifacts", sha+".pdf")
+	full, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) < 8 {
+		t.Fatalf("fixture artifact too short to truncate: %d bytes", len(full))
+	}
+	partial := append([]byte(nil), full[:8]...)
+	if err := os.Chmod(artifactPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactPath, partial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exporter.Jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_bundle_export_healed_update
+		BEFORE UPDATE ON exports
+		WHEN NEW.kind = 'bundle'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected ledger update failure');
+		END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	if _, _, err := exporter.Export(ctx, id, destination); err == nil {
+		t.Fatal("export succeeded despite ledger failure")
+	}
+	afterBundle, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterBundle) != string(beforeBundle) {
+		t.Fatal("bundle.json changed after failed heal export")
+	}
+	afterArtifact, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("original partial artifact missing after failed heal export: %v", err)
+	}
+	if string(afterArtifact) != string(partial) {
+		t.Fatalf("partial artifact changed after failed heal export: got %d bytes, want %d truncated bytes", len(afterArtifact), len(partial))
+	}
+	var count int
+	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM exports WHERE job_id = ?`, id).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("export ledger count = %d, %v; want one", count, err)
+	}
+}
+
 // Locate is the artifacts.locate half of the exporter: it answers "where are the
 // verified bytes", and nothing about bundle provenance. These tests call it
 // directly, because reaching it through Export cannot distinguish a locate

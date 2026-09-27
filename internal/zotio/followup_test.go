@@ -3,12 +3,18 @@ package zotio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"papio/internal/artifact"
 	"papio/internal/job"
+	"papio/internal/redact"
 	"papio/internal/store"
+	"papio/internal/work"
 )
 
 // Both follow-up errors are what zotio printed for job_cb931061ba59b7de0229e07fb6
@@ -306,22 +312,53 @@ func TestApplyReplayCompletesFollowUpsMissedByACrash(t *testing.T) {
 	}
 }
 
-// The repair has no age cutoff, so its bound is the epoch the store records
-// on its first maintenance pass. An import older than that instant predates
-// the marker itself, so its missing follow-ups are not evidence of a crash,
-// and repairing them would rewrite the operator's library from today's
+// The repair has no age cutoff, so its bound is the epoch Apply records
+// before it claims an import. An import older than that instant predates the
+// marker itself, so its missing follow-ups are not evidence of a crash, and
+// repairing them would rewrite the operator's library from today's
 // configuration.
 func TestFollowUpRepairIgnoresImportsFromBeforeTheMarkerEpoch(t *testing.T) {
 	service, cli, jobID := connectorImportService(t, nil, nil, "")
 	crashAfterRecordingImport(t, service, cli, jobID)
 
-	// A store with no marker yet: the first pass dates the epoch and sweeps
-	// nothing, because every import it holds is from before that instant.
+	// Apply dated the epoch before it claimed the import, so exactly one
+	// epoch exists and it predates the import it bounds.
+	var epochs int
+	if err := service.Store.DB().QueryRow(
+		`SELECT COUNT(*) FROM events WHERE kind = ? AND job_id IS NULL`, followUpsComplete).Scan(&epochs); err != nil {
+		t.Fatal(err)
+	}
+	if epochs != 1 {
+		t.Fatalf("epoch rows = %d, want exactly one from Apply", epochs)
+	}
+
+	// A legacy import from before papio wrote markers carries no completion
+	// marker for a reason that is not a crash. Backdate this victim behind
+	// the epoch to stand in for one: the pass must leave it alone.
+	var epochAt string
+	if err := service.Store.DB().QueryRow(
+		`SELECT at FROM events WHERE kind = ? AND job_id IS NULL ORDER BY at ASC LIMIT 1`, followUpsComplete).Scan(&epochAt); err != nil {
+		t.Fatal(err)
+	}
+	epochTime, err := time.Parse(time.RFC3339Nano, epochAt)
+	if err != nil {
+		t.Fatalf("epoch at = %q: %v", epochAt, err)
+	}
+	if _, err := service.Store.DB().Exec(
+		`UPDATE exports SET created_at = ? WHERE job_id = ? AND kind = 'zotio_apply'`,
+		store.FormatTime(epochTime.Add(-30*24*time.Hour)), jobID); err != nil {
+		t.Fatal(err)
+	}
 	runFollowUps(t, service, time.Now())
 	if cli.collectionCalls != 0 || cli.enrichCalls != 0 {
-		t.Fatalf("the epoch pass swept history: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+		t.Fatalf("swept an import from before the epoch: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
 	}
-	var epochs int
+
+	// Later passes do not re-date the epoch, and the legacy import stays out.
+	runFollowUps(t, service, time.Now())
+	if cli.collectionCalls != 0 || cli.enrichCalls != 0 {
+		t.Fatalf("swept an import from before the epoch: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+	}
 	if err := service.Store.DB().QueryRow(
 		`SELECT COUNT(*) FROM events WHERE kind = ? AND job_id IS NULL`, followUpsComplete).Scan(&epochs); err != nil {
 		t.Fatal(err)
@@ -330,17 +367,257 @@ func TestFollowUpRepairIgnoresImportsFromBeforeTheMarkerEpoch(t *testing.T) {
 		t.Fatalf("epoch rows = %d, want exactly one", epochs)
 	}
 
-	// Later passes do not re-date it, and the import stays out.
-	runFollowUps(t, service, time.Now())
-	if cli.collectionCalls != 0 || cli.enrichCalls != 0 {
-		t.Fatalf("swept an import from before the epoch: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
+	// The same crash victim newer than the epoch is a crash, not policy, and
+	// is repaired however old its earlier marker is.
+	if _, err := service.Store.DB().Exec(
+		`UPDATE exports SET created_at = ? WHERE job_id = ? AND kind = 'zotio_apply'`,
+		store.Now(), jobID); err != nil {
+		t.Fatal(err)
 	}
-
-	// On a store that was already marking imports, the same crash victim is
-	// repaired however old it is.
 	markFollowUpsCompleteAt(t, service, "job_earlier_import", time.Now().Add(-365*24*time.Hour))
 	runFollowUps(t, service, time.Now())
 	if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
 		t.Fatalf("repair behind the epoch: collection=%d enrich=%d", cli.collectionCalls, cli.enrichCalls)
 	}
+}
+
+// A follow-up whose event was lost must not look finished: the completion
+// marker commits only when every follow-up event was durably recorded, so
+// maintenance still finds the work.
+func TestFollowUpLeavesJobUnmarkedWhenEventRecordingFails(t *testing.T) {
+	service, cli, jobID := connectorImportService(t, nil, nil, "")
+	crashAfterRecordingImport(t, service, cli, jobID)
+
+	if _, err := service.Store.DB().Exec(
+		`CREATE TRIGGER fail_zotio_filing BEFORE INSERT ON events WHEN NEW.kind = 'zotio.collection_filing' BEGIN SELECT RAISE(ABORT, 'fail filing'); END`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = service.Store.DB().Exec(`DROP TRIGGER IF EXISTS fail_zotio_filing`)
+	})
+
+	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := row.Policy.Collection
+	applyJSON := recordedApplyJSON(t, service, jobID)
+	var apply ApplyResult
+	if err := json.Unmarshal([]byte(applyJSON), &apply); err != nil {
+		t.Fatal(err)
+	}
+	plan := &Plan{JobID: jobID, Collection: collection}
+	did, err := service.fileCollection(context.Background(), plan, &apply)
+	if !did || err == nil {
+		t.Fatalf("fileCollection = (%v, %v), want (true, error) when the event insert fails", did, err)
+	}
+	if countZotioEvents(t, service, jobID, followUpCollectionFiling) != 0 {
+		t.Fatal("a failed event insert left a filing event behind")
+	}
+	if countZotioEvents(t, service, jobID, followUpsComplete) != 0 {
+		t.Fatal("a failed filing event still recorded a completion marker candidate")
+	}
+	if cli.collectionCalls != 1 {
+		t.Fatalf("collection calls = %d, want 1: the Zotero write ran, only its record failed", cli.collectionCalls)
+	}
+
+	// The repair must not mark the job while its filing event cannot be
+	// recorded either: the work stays visible instead of being lost.
+	runFollowUps(t, service, time.Now())
+	if countZotioEvents(t, service, jobID, followUpsComplete) != 0 {
+		t.Fatal("repair committed a completion marker without a durable filing event")
+	}
+
+	// Once the store accepts events again, the next pass finishes the same
+	// work and only then marks it done.
+	if _, err := service.Store.DB().Exec(`DROP TRIGGER fail_zotio_filing`); err != nil {
+		t.Fatal(err)
+	}
+	cli.collectionCalls, cli.enrichCalls = 0, 0
+	runFollowUps(t, service, time.Now())
+	if filing := zotioEventDetail(t, service, jobID, followUpCollectionFiling); filing["status"] != "applied" {
+		t.Fatalf("repaired filing event = %#v, want applied", filing)
+	}
+	if enrich := zotioEventDetail(t, service, jobID, followUpEnrich); enrich["status"] != "applied" {
+		t.Fatalf("repaired enrich event = %#v, want applied", enrich)
+	}
+	if countZotioEvents(t, service, jobID, followUpsComplete) == 0 {
+		t.Fatal("repaired import carries no completion marker")
+	}
+}
+
+// The daemon serves the socket before its first maintenance pass, so an
+// import that crashes before that pass is the socket-availability window,
+// not history: Apply already dated the epoch before it claimed the import,
+// so the first maintenance pass must repair it with no earlier marker.
+func TestFollowUpRepairIncludesCrashBeforeFirstMaintenance(t *testing.T) {
+	service, cli, jobID := connectorImportService(t, nil, nil, "")
+	var epochs int
+	if err := service.Store.DB().QueryRow(
+		`SELECT COUNT(*) FROM events WHERE kind = ? AND job_id IS NULL`, followUpsComplete).Scan(&epochs); err != nil {
+		t.Fatal(err)
+	}
+	if epochs != 1 {
+		t.Fatalf("epoch rows = %d, want the one Apply recorded before the import", epochs)
+	}
+	var epochAt, importedAt string
+	if err := service.Store.DB().QueryRow(
+		`SELECT at FROM events WHERE kind = ? AND job_id IS NULL ORDER BY at ASC LIMIT 1`, followUpsComplete).Scan(&epochAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Store.DB().QueryRow(
+		`SELECT created_at FROM exports WHERE job_id = ? AND kind = 'zotio_apply' ORDER BY id DESC LIMIT 1`, jobID).Scan(&importedAt); err != nil {
+		t.Fatal(err)
+	}
+	if importedAt < epochAt {
+		t.Fatalf("import created_at %q predates epoch %q: the durable boundary excludes the crash it should repair", importedAt, epochAt)
+	}
+
+	crashAfterRecordingImport(t, service, cli, jobID)
+	runFollowUps(t, service, time.Now())
+	if cli.collectionCalls != 1 || cli.enrichCalls != 1 {
+		t.Fatalf("first maintenance after the crash: collection=%d enrich=%d, want one of each", cli.collectionCalls, cli.enrichCalls)
+	}
+	if countZotioEvents(t, service, jobID, followUpsComplete) == 0 {
+		t.Fatal("repaired import carries no completion marker")
+	}
+}
+
+// One maintenance pass runs at most maxFollowUpsPerPass Zotio commands. A
+// repair that counts imports instead of commands runs two commands for one
+// import and exceeds the bound.
+func TestFollowUpRepairBoundsCommandsNotImports(t *testing.T) {
+	service, cli, firstID := connectorImportService(t, nil, nil, "")
+	jobIDs := []string{firstID}
+	for range 3 {
+		jobIDs = append(jobIDs, crashVictimJob(t, service, "Trust in AI advice"))
+	}
+	for _, id := range jobIDs {
+		crashAfterRecordingImport(t, service, cli, id)
+	}
+	cli.collectionCalls, cli.enrichCalls = 0, 0
+
+	runFollowUps(t, service, time.Now())
+	total := cli.collectionCalls + cli.enrichCalls
+	if total != maxFollowUpsPerPass {
+		t.Fatalf("first pass commands = %d (collection=%d enrich=%d), want exactly %d",
+			total, cli.collectionCalls, cli.enrichCalls, maxFollowUpsPerPass)
+	}
+	// The pass stopped mid-job or mid-scan, so later passes still have work:
+	// nothing was marked finished without its events.
+	secondCollection, secondEnrich := cli.collectionCalls, cli.enrichCalls
+	runFollowUps(t, service, time.Now())
+	if cli.collectionCalls+cli.enrichCalls <= secondCollection+secondEnrich {
+		t.Fatalf("second pass made no progress: collection=%d enrich=%d",
+			cli.collectionCalls, cli.enrichCalls)
+	}
+	for range 4 {
+		runFollowUps(t, service, time.Now())
+	}
+	for _, id := range jobIDs {
+		if countZotioEvents(t, service, id, followUpsComplete) == 0 {
+			t.Fatalf("job %s carries no completion marker after bounded passes", id)
+		}
+	}
+}
+
+// countZotioEvents reports how many events of kind a job carries.
+func countZotioEvents(t *testing.T, service *Service, jobID, kind string) int {
+	t.Helper()
+	var n int
+	if err := service.Store.DB().QueryRow(
+		`SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?`, jobID, kind).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// recordedApplyJSON returns the newest recorded zotio_apply result for a job.
+func recordedApplyJSON(t *testing.T, service *Service, jobID string) string {
+	t.Helper()
+	var raw string
+	if err := service.Store.DB().QueryRow(
+		`SELECT result_json FROM exports WHERE job_id = ? AND kind = 'zotio_apply' ORDER BY id DESC LIMIT 1`, jobID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// crashVictimJob imports one more paper through the same service and store so
+// a bound test can hold several crash victims behind one epoch. It returns
+// the new job's ID with its follow-ups still recorded; the caller crashes it.
+func crashVictimJob(t *testing.T, service *Service, collection string) string {
+	t.Helper()
+	ctx := context.Background()
+	w := work.Work{
+		DOI: "10.1002/example", Title: "Example Paper", Authors: []string{"Ada Lovelace"}, Year: 2024,
+	}
+	requestID := "request_plan_" + job.NewID("wr")
+	jobID, err := service.Bundle.Jobs.CreateRequest(ctx, requestID, w, "", "", job.Policy{AccessMode: "conservative", DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Bundle.Jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
+		JobID: jobID, Source: "unpaywall", URLRedacted: redact.URL("https://example.test/paper.pdf"), URLKey: "url-key-" + jobID,
+		LandingRedacted: "https://example.test/article", Version: "published", AccessBasis: "open_access",
+		ReuseLicense: "cc-by-4.0", ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 1,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := service.Bundle.Jobs.NextPendingCandidate(ctx, jobID)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate = %+v, %v", candidate, err)
+	}
+	if err := service.Bundle.Jobs.MarkCandidate(ctx, candidate.ID, "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	quarantine, err := service.Bundle.Artifacts.QuarantineDir(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(quarantine, "paper.tmp")
+	body := []byte("%PDF-1.4\nfixture " + w.Describe() + "\n%%EOF")
+	if err := os.WriteFile(temp, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha, _, err := artifact.HashFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactPath, _, err := service.Bundle.Artifacts.Promote(temp, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Bundle.Jobs.UpsertArtifact(ctx, job.Artifact{
+		SHA256: sha, SizeBytes: int64(len(body)), MIME: "application/pdf", PageCount: 1,
+		TextChars: 1000, IdentityResult: "pass", Path: artifactPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}, {job.StateFetching, job.StateValidating}} {
+		if err := service.Bundle.Jobs.Transition(ctx, jobID, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := service.Bundle.Jobs.Transition(ctx, jobID, job.StateValidating, job.StateReady, nil, job.WithCandidate(candidate.ID), job.WithArtifact(sha)); err != nil {
+		t.Fatal(err)
+	}
+	row, err := service.Bundle.Jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.Policy.AutoImport = true
+	row.Policy.Collection = collection
+	policyJSON, err := json.Marshal(row.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Store.DB().Exec(`UPDATE jobs SET policy_json = ? WHERE id = ?`, string(policyJSON), jobID); err != nil {
+		t.Fatal(err)
+	}
+	status, parentKey, _, err := service.PlanAndApply(ctx, jobID)
+	if err != nil || status != "applied" || parentKey != "PA12RE34" {
+		t.Fatalf("victim import = (%q, %q, %v), want applied PA12RE34", status, parentKey, err)
+	}
+	return jobID
 }

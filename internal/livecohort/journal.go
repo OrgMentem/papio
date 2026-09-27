@@ -44,7 +44,14 @@ type JournalEntry struct {
 	RequestID string `json:"request_id"`
 	// JobID is empty while the daemon's answer is unknown, which is the
 	// state this journal exists for.
-	JobID    string `json:"job_id,omitempty"`
+	JobID string `json:"job_id,omitempty"`
+	// Consumer is the acquire.submit_v3 attribution a force submission
+	// carried. The daemon replaces the supplied request id with a generated
+	// one before storing on the force path, so the request id alone cannot
+	// name that job back; the consumer tag is stored on the job row itself
+	// and is what a later run reconciles by. Empty for non-force entries
+	// and for journals written before the tag existed.
+	Consumer string `json:"consumer,omitempty"`
 	RunID    string `json:"run_id"`
 	At       string `json:"at"`
 	Resolved bool   `json:"resolved,omitempty"`

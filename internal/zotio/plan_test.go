@@ -680,10 +680,12 @@ func TestPlanAndApplyFilesPolicyCollectionWithoutRollingBackImport(t *testing.T)
 func TestFileCollectionSkipsQueueCollectionKey(t *testing.T) {
 	cli := &planCLI{}
 	service := &Service{CLI: cli}
-	service.fileCollection(context.Background(),
+	if _, err := service.fileCollection(context.Background(),
 		&Plan{Collection: "ZX98YU76", CollectionIsKey: true},
 		&ApplyResult{ParentKey: "AB12CD34"},
-	)
+	); err != nil {
+		t.Fatal(err)
+	}
 	if cli.collectionCalls != 0 {
 		t.Fatalf("collection calls = %d, want 0", cli.collectionCalls)
 	}
@@ -692,10 +694,12 @@ func TestFileCollectionSkipsQueueCollectionKey(t *testing.T) {
 func TestFileCollectionFilesKeyShapedNameWithoutItemKey(t *testing.T) {
 	cli := &planCLI{}
 	service, jobID := readyPlanService(t, "", cli)
-	service.fileCollection(context.Background(),
+	if _, err := service.fileCollection(context.Background(),
 		&Plan{JobID: jobID, Collection: "PAPERS24"},
 		&ApplyResult{ParentKey: "AB12CD34"},
-	)
+	); err != nil {
+		t.Fatal(err)
+	}
 	if cli.collectionCalls != 1 {
 		t.Fatalf("collection calls = %d, want 1", cli.collectionCalls)
 	}

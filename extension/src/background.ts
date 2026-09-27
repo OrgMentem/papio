@@ -2825,6 +2825,16 @@ export class Bridge {
     { grabID: string; tabID: number; steeringPath: string }
   >();
   private readonly pdfGrabCorrelations = new Map<string, PdfGrabCorrelation>();
+  /** Completed grabs still needing a status query: the startup query failed
+    * (offline at worker start, hello timeout, or transport loss) or answered
+    * non-terminal (quarantined/identified) while the download was already
+    * complete. The daemon may already have marked the row notified, so a lost
+    * terminal push never comes again: each hello_ack retries the query once.
+    * Worker-memory only, like every other correlation in this file. */
+  private readonly pendingGrabStatusRetries = new Set<string>();
+  /** Status recoveries currently in flight, so a reconnect retry never sends
+    * a second query for a grab the startup pass is still asking about. */
+  private readonly grabStatusRecovering = new Set<string>();
   private seq = 0;
   private store: StoreShape = emptyStore();
   private ready: Promise<void> = Promise.resolve();
@@ -10777,10 +10787,10 @@ export class Bridge {
         // recover the terminal result at worker startup instead of waiting
         // for a push that never comes. Non-terminal grabs keep their tracking
         // for the later unsolicited push; a failed query keeps the correlation
-        // for the next restart. Fire-and-forget like finishAbandon above, so
-        // one slow or absent daemon never stalls worker setup: the underlying
-        // status request already fails fast without a session and times out
-        // otherwise.
+        // and parks the grab for the reconnect retry below. Fire-and-forget
+        // like finishAbandon above, so one slow or absent daemon never stalls
+        // worker setup: the underlying status request already fails fast
+        // without a session and times out otherwise.
         this.grabDownloads.set(grabID, {
           ids: new Set([downloadID]),
           tabID: correlation.tabID,
@@ -10803,47 +10813,118 @@ export class Bridge {
 
   /** Deliver a completed download's terminal grab result queried at startup.
    * Fire-and-forget from reconcilePdfGrabCorrelations so worker setup never
-   * waits on the daemon. A failed query keeps the correlation for the next
-   * restart; an unsolicited push that lands first clears the correlation, and
-   * the guard below makes the late status answer a no-op instead of a second
-   * notification. */
+   * waits on the daemon. A failed query keeps the correlation and parks the
+   * grab in pendingGrabStatusRetries for the hello_ack retry below. A
+   * non-terminal answer also stays parked: the daemon settles the row later
+   * and the single terminal push can be lost by another disconnect, so the
+   * grab must remain eligible across later handshakes. An unsolicited push
+   * that lands first clears the correlation, and the guard below makes the
+   * late status answer a no-op instead of a second notification. */
   private async recoverCompletedGrabStatus(
     grabID: string,
     correlation: PdfGrabCorrelation,
   ): Promise<void> {
-    let status: BrokerReply<{
-      grab_id: string;
-      state: string;
-      outcome?: string;
-      detail?: string;
-      job_id?: string;
-    }>;
+    if (this.grabStatusRecovering.has(grabID)) return;
+    this.grabStatusRecovering.add(grabID);
     try {
-      status = await this.requestPdfGrabStatus(grabID);
-    } catch {
+      let status: BrokerReply<{
+        grab_id: string;
+        state: string;
+        outcome?: string;
+        detail?: string;
+        job_id?: string;
+      }>;
+      try {
+        status = await this.requestPdfGrabStatus(grabID);
+      } catch {
+        this.pendingGrabStatusRetries.add(grabID);
+        return;
+      }
+      if (!status.ok) {
+        this.pendingGrabStatusRetries.add(grabID);
+        return;
+      }
+      const raw =
+        typeof status.outcome === "string" && status.outcome !== ""
+          ? status.outcome
+          : status.state;
+      const display = durablePdfGrabState(raw);
+      if (
+        display !== "job_created" &&
+        display !== "already_owned" &&
+        display !== "needs_identifier" &&
+        display !== "failed" &&
+        display !== "abandoned"
+      ) {
+        this.pendingGrabStatusRetries.add(grabID);
+        return;
+      }
+      if (!this.pdfGrabCorrelations.has(grabID)) {
+        this.pendingGrabStatusRetries.delete(grabID);
+        return;
+      }
+      this.notifyPdfGrab(correlation.scanID, grabID, display, status.detail);
+      this.evictPdfGrabRouteSteering(grabID, correlation);
+      this.grabDownloads.delete(grabID);
+      this.pdfGrabCorrelations.delete(grabID);
+      this.persistPdfGrabCorrelations();
+      this.pendingGrabStatusRetries.delete(grabID);
+    } finally {
+      this.grabStatusRecovering.delete(grabID);
+    }
+  }
+
+  /** Retry parked status queries after (re)connect: failed queries and
+   * non-terminal answers from an earlier handshake. Scheduled off the inbound
+   * chain from the hello_ack handler (never awaited there): the status reply
+   * must traverse that same serialized queue, so awaiting it inside the
+   * handler would deadlock. Runs once per handshake, never while connected,
+   * so a long-lived quarantined grab costs one query per reconnect, not a
+   * poll loop. Re-checks the browser download first, so an interruption that
+   * landed while offline still abandons instead of querying a stale row. */
+  private async retryPendingGrabStatuses(): Promise<void> {
+    if (this.pendingGrabStatusRetries.size === 0) return;
+    if (!(this.store.daemonFeatures ?? []).includes(PDF_GRAB_FEATURE)) {
       return;
     }
-    if (!status.ok) return;
-    const raw =
-      typeof status.outcome === "string" && status.outcome !== ""
-        ? status.outcome
-        : status.state;
-    const display = durablePdfGrabState(raw);
-    if (
-      display !== "job_created" &&
-      display !== "already_owned" &&
-      display !== "needs_identifier" &&
-      display !== "failed" &&
-      display !== "abandoned"
-    ) {
-      return;
+    for (const grabID of [...this.pendingGrabStatusRetries]) {
+      const correlation = this.pdfGrabCorrelations.get(grabID);
+      if (
+        correlation === undefined ||
+        correlation.abandonPending === true ||
+        correlation.downloadID === undefined
+      ) {
+        this.pendingGrabStatusRetries.delete(grabID);
+        continue;
+      }
+      const downloadID = correlation.downloadID;
+      let items: DownloadItemLike[];
+      try {
+        items = await this.deps.downloads.search({ id: downloadID });
+      } catch {
+        continue;
+      }
+      const item = items[0];
+      if (item?.state === "interrupted") {
+        this.pendingGrabStatusRetries.delete(grabID);
+        correlation.abandonPending = true;
+        this.persistPdfGrabCorrelations();
+        void this.finishAbandon(grabID, correlation);
+        continue;
+      }
+      if (item?.state !== "complete") {
+        this.pendingGrabStatusRetries.delete(grabID);
+        continue;
+      }
+      this.grabDownloads.set(grabID, {
+        ids: new Set([downloadID]),
+        tabID: correlation.tabID,
+        scanID: correlation.scanID,
+        url: item?.url ?? item?.finalUrl ?? "",
+        steeringPath: correlation.steeringPath,
+      });
+      await this.recoverCompletedGrabStatus(grabID, correlation);
     }
-    if (!this.pdfGrabCorrelations.has(grabID)) return;
-    this.notifyPdfGrab(correlation.scanID, grabID, display, status.detail);
-    this.evictPdfGrabRouteSteering(grabID, correlation);
-    this.grabDownloads.delete(grabID);
-    this.pdfGrabCorrelations.delete(grabID);
-    this.persistPdfGrabCorrelations();
   }
 
   private async finishAbandon(
@@ -15622,6 +15703,16 @@ export class Bridge {
         if (features.includes(EFFECT_PERMIT_FEATURE)) {
           this.deps.setTimeout(() => {
             void this.retryTermsEffectResults();
+          }, 0);
+        }
+        if (features.includes(PDF_GRAB_FEATURE)) {
+          // A startup status query that failed while the daemon was away
+          // parked its grab above; the row is already notified, so no push
+          // will recover it. Retry off-chain like every other hello_ack
+          // reconciliation: awaiting the correlated reply here would deadlock
+          // the inbound FIFO that must deliver it.
+          this.deps.setTimeout(() => {
+            void this.retryPendingGrabStatuses();
           }, 0);
         }
         return;

@@ -118,7 +118,11 @@ func (r *FollowUpRetrier) RunDue(ctx context.Context) error {
 		if !p.due(now) {
 			continue
 		}
-		if r.service.retryFollowUp(ctx, p) {
+		did, err := r.service.retryFollowUp(ctx, p)
+		if err != nil {
+			log.Printf("papio: recording Zotio follow-up for job %s: %v", p.jobID, err)
+		}
+		if did {
 			ran++
 		}
 	}
@@ -129,10 +133,10 @@ func (r *FollowUpRetrier) RunDue(ctx context.Context) error {
 // follow-ups, once, if no marker exists yet. It dates the repair scan on a
 // store that has imports from before papio wrote markers: those imports are
 // older than the epoch, so their missing follow-ups are read as the policy of
-// the day rather than as a crash. Without it, the first import after an
-// upgrade would set the epoch itself and any import that crashed before it
-// would fall outside the scan for good. The insert is one statement, so two
-// daemons cannot write two epochs.
+// the day rather than as a crash. Apply records the epoch before it claims an
+// import, so every import this version records is newer than the epoch and an
+// early crash before the first maintenance pass stays inside the scan. The
+// insert is one statement, so two daemons cannot write two epochs.
 func (s *Service) ensureFollowUpEpoch(ctx context.Context) error {
 	_, err := s.Store.DB().ExecContext(ctx, `
 		INSERT INTO events (job_id, at, kind, detail_json)
@@ -143,8 +147,10 @@ func (s *Service) ensureFollowUpEpoch(ctx context.Context) error {
 }
 
 // retryFollowUp repeats exactly what failed: the same collection name, or the
-// same parent, for the import the exports ledger recorded.
-func (s *Service) retryFollowUp(ctx context.Context, p pendingFollowUp) bool {
+// same parent, for the import the exports ledger recorded. It reports whether
+// it ran a Zotio command and whether that command's event was durably
+// recorded; a lost event stays retryable on the next pass.
+func (s *Service) retryFollowUp(ctx context.Context, p pendingFollowUp) (bool, error) {
 	plan := &Plan{JobID: p.jobID}
 	switch p.kind {
 	case followUpCollectionFiling:
@@ -153,7 +159,7 @@ func (s *Service) retryFollowUp(ctx context.Context, p pendingFollowUp) bool {
 	case followUpEnrich:
 		return s.enrichAutoImportedParent(ctx, plan, &p.apply)
 	default:
-		return false
+		return false, nil
 	}
 }
 
@@ -269,9 +275,13 @@ func (s *Service) outstandingFollowUps(ctx context.Context, jobID string) (follo
 }
 
 // recordFollowUpsComplete marks an import's follow-ups as run, which is what
-// takes it out of the repair scan for good.
-func (s *Service) recordFollowUpsComplete(ctx context.Context, jobID string) {
-	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), jobID, followUpsComplete, map[string]any{"status": "done"})
+// takes it out of the repair scan for good. Its error leaves the job
+// unmarked so the next pass still repairs it.
+func (s *Service) recordFollowUpsComplete(ctx context.Context, jobID string) error {
+	if err := s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), jobID, followUpsComplete, map[string]any{"status": "done"}); err != nil {
+		return fmt.Errorf("recording Zotio follow-ups marker: %w", err)
+	}
+	return nil
 }
 
 // completeFollowUps runs the follow-ups of a recorded import that have never
@@ -279,25 +289,32 @@ func (s *Service) recordFollowUpsComplete(ctx context.Context, jobID string) {
 // the exports ledger already holds, which is what a process death between
 // recording the import and running its follow-ups leaves behind. Repeating a
 // follow-up that did run would write a second event for work already done,
-// and the retry schedule, not this path, owns a follow-up that failed.
-func (s *Service) completeFollowUps(ctx context.Context, plan *Plan, result *ApplyResult) {
+// and the retry schedule, not this path, owns a follow-up that failed. A
+// follow-up whose event was lost leaves the job unmarked for maintenance.
+func (s *Service) completeFollowUps(ctx context.Context, plan *Plan, result *ApplyResult) error {
 	if plan == nil || result == nil {
-		return
+		return nil
 	}
 	outstanding, err := s.outstandingFollowUps(ctx, plan.JobID)
 	if err != nil {
-		log.Printf("papio: reading Zotio follow-ups of job %s: %v", plan.JobID, err)
-		return
+		return fmt.Errorf("reading Zotio follow-ups of job %s: %w", plan.JobID, err)
 	}
 	if outstanding.filing && !filedWithImport(plan, result) {
-		s.fileCollection(ctx, plan, result)
+		if _, err := s.fileCollection(ctx, plan, result); err != nil {
+			return err
+		}
 	}
 	if outstanding.enrich {
-		s.enrichAutoImportedParent(ctx, plan, result)
+		if _, err := s.enrichAutoImportedParent(ctx, plan, result); err != nil {
+			return err
+		}
 	}
 	if !outstanding.marked {
-		s.recordFollowUpsComplete(ctx, plan.JobID)
+		if err := s.recordFollowUpsComplete(ctx, plan.JobID); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // missingFollowUp is one recorded import that carries no completion marker,
@@ -312,9 +329,10 @@ type missingFollowUp struct {
 // repairMissingFollowUps finishes the imports whose follow-ups never ran,
 // sharing the pass budget with the retry schedule. It repeats nothing: each
 // follow-up that ran recorded an event, and an event takes that follow-up out
-// of outstandingFollowUps. Every job it reads leaves the scan in the same
-// pass, because it records the completion marker whether or not a follow-up
-// applied to that job.
+// of outstandingFollowUps. A job leaves the scan only when its follow-up
+// events and its completion marker are all durably recorded, so a lost event
+// never looks finished. Each Zotio command counts against the pass budget,
+// not each import: one import can run two commands.
 func (s *Service) repairMissingFollowUps(ctx context.Context, ran int) error {
 	if ran >= maxFollowUpsPerPass || ctx.Err() != nil {
 		return nil
@@ -349,16 +367,39 @@ func (s *Service) repairMissingFollowUps(ctx context.Context, ran int) error {
 			Collection:      collection,
 			CollectionIsKey: row.ZotioItemKey != "" && keyRE.MatchString(collection),
 		}
-		did := false
+		durable := true
 		if outstanding.filing {
-			did = s.fileCollection(ctx, plan, &m.apply)
+			if ran >= maxFollowUpsPerPass {
+				return nil
+			}
+			did, err := s.fileCollection(ctx, plan, &m.apply)
+			if did {
+				ran++
+			}
+			if err != nil {
+				log.Printf("papio: recording Zotio follow-up for job %s: %v", m.jobID, err)
+				durable = false
+			}
 		}
-		if outstanding.enrich && s.enrichAutoImportedParent(ctx, plan, &m.apply) {
-			did = true
+		if outstanding.enrich {
+			if ran >= maxFollowUpsPerPass {
+				return nil
+			}
+			did, err := s.enrichAutoImportedParent(ctx, plan, &m.apply)
+			if did {
+				ran++
+			}
+			if err != nil {
+				log.Printf("papio: recording Zotio follow-up for job %s: %v", m.jobID, err)
+				durable = false
+			}
 		}
-		s.recordFollowUpsComplete(ctx, m.jobID)
-		if did {
-			ran++
+		if !durable {
+			continue
+		}
+		if err := s.recordFollowUpsComplete(ctx, m.jobID); err != nil {
+			log.Printf("papio: recording Zotio follow-ups marker for job %s: %v", m.jobID, err)
+			continue
 		}
 	}
 	return nil

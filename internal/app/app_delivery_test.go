@@ -3134,3 +3134,219 @@ func TestReassignUnattemptedOfferedRowStillSubmitsOnce(t *testing.T) {
 		t.Fatalf("row = %+v, want submitted/7703 owned by %q", got, newID)
 	}
 }
+
+// TestReassignedAmbiguousStaysBoundedAcrossRetries proves the reassignment
+// guard survives the retry: the old owner's ambiguous classification is
+// mirrored onto the new owner, so the second not_found_yet still parks for a
+// bounded recheck instead of opening a human action prematurely. The third
+// consecutive not_found_yet exhausts the bound and opens reconciliation.
+func TestReassignedAmbiguousStaysBoundedAcrossRetries(t *testing.T) {
+	var posts, gets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost:
+			posts.Add(1)
+			http.Error(w, "must not POST an ambiguously submitted request", http.StatusInternalServerError)
+		case strings.Contains(r.URL.Path, "Users/ExternalUserId/"):
+			gets.Add(1)
+			_, _ = w.Write([]byte(`{"UserName":"campus-student"}`))
+		case strings.Contains(r.URL.Path, "Transaction/UserRequests/"):
+			gets.Add(1)
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			gets.Add(1)
+			http.Error(w, "unexpected provider read", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	const doi = "10.1000/reassign-ambiguous-bounded"
+	oldID, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_bound_old", doi, "ambiguous")
+	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_bound_new", doi)
+
+	countAttempts := func() int {
+		t.Helper()
+		events, err := jobs.Events(ctx, newID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, event := range events {
+			if event["kind"] != "delivery.reconciliation_attempt" {
+				continue
+			}
+			detail, _ := event["detail"].(map[string]any)
+			id, _ := detail["delivery_request_id"].(float64)
+			if int64(id) == staged.ID {
+				count++
+			}
+		}
+		return count
+	}
+	openDeliveryActions := func() int {
+		t.Helper()
+		actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{newID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, action := range actions {
+			if action.Kind == job.ActionKindDocumentDelivery {
+				count++
+			}
+		}
+		return count
+	}
+	driveRetry := func() {
+		t.Helper()
+		row, err := jobs.Get(ctx, newID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.State != job.StateRetryWait {
+			t.Fatalf("retry precondition state = %q, want retry_wait", row.State)
+		}
+		if err := jobs.Transition(ctx, newID, job.StateRetryWait, job.StateResolving, map[string]any{"reason": "test_bounded_retry"}); err != nil {
+			t.Fatal(err)
+		}
+		row, err = jobs.Get(ctx, newID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.deliveryRoute(ctx, row, row.State); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// First reconcile parks for a bounded recheck with no second POST.
+	if posts.Load() != 0 {
+		t.Fatalf("provider POSTs after first reconcile = %d, want 0", posts.Load())
+	}
+	if got := countAttempts(); got != 1 {
+		t.Fatalf("reconciliation attempts after first reconcile = %d, want 1", got)
+	}
+	if got := openDeliveryActions(); got != 0 {
+		t.Fatalf("open delivery actions after first reconcile = %d, want 0 (bounded park, not human)", got)
+	}
+	// The old owner's ambiguous outcome must now live on the new owner, or
+	// the retry below would consult only the new owner and escalate early.
+	events, err := jobs.Events(ctx, newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inherited := false
+	for _, event := range events {
+		if event["kind"] != "delivery.submission_failure_classified" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		id, _ := detail["delivery_request_id"].(float64)
+		class, _ := detail["class"].(string)
+		from, _ := detail["inherited_from"].(string)
+		if int64(id) == staged.ID && class == "ambiguous" && from == oldID {
+			inherited = true
+		}
+	}
+	if !inherited {
+		t.Fatal("new owner carries no inherited ambiguous classification for the re-owned row")
+	}
+
+	// Second consecutive not_found_yet must still park, not escalate.
+	driveRetry()
+	if posts.Load() != 0 {
+		t.Fatalf("provider POSTs after second reconcile = %d, want 0", posts.Load())
+	}
+	if got := countAttempts(); got != 2 {
+		t.Fatalf("reconciliation attempts after second reconcile = %d, want 2", got)
+	}
+	if row, err := jobs.Get(ctx, newID); err != nil {
+		t.Fatal(err)
+	} else if row.State != job.StateRetryWait {
+		t.Fatalf("new job state after second reconcile = %q, want retry_wait (bounded, not human)", row.State)
+	}
+	if got := openDeliveryActions(); got != 0 {
+		t.Fatalf("open delivery actions after second reconcile = %d, want 0 (bound not yet exhausted)", got)
+	}
+
+	// Third consecutive not_found_yet exhausts the bound and opens human
+	// reconciliation. This proves the loop is bounded, not premature.
+	driveRetry()
+	if got := countAttempts(); got != 3 {
+		t.Fatalf("reconciliation attempts after third reconcile = %d, want 3", got)
+	}
+	if row, err := jobs.Get(ctx, newID); err != nil {
+		t.Fatal(err)
+	} else if row.State != job.StateAwaitingHuman {
+		t.Fatalf("new job state after third reconcile = %q, want awaiting_human (bound exhausted)", row.State)
+	}
+	if got := openDeliveryActions(); got != 1 {
+		t.Fatalf("open delivery actions after third reconcile = %d, want 1 (bounded exhaustion)", got)
+	}
+	if posts.Load() != 0 {
+		t.Fatalf("provider POSTs after bounded retries = %d, want 0: never a second POST", posts.Load())
+	}
+	if gets.Load() == 0 {
+		t.Fatal("provider GETs = 0, want read-only reconciliation against the shared token")
+	}
+}
+
+func TestReassignmentKeepsEarlierReconciliationAttempts(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts.Add(1)
+			http.Error(w, "must not resubmit", http.StatusInternalServerError)
+			return
+		}
+		switch {
+		case strings.Contains(r.URL.Path, "Users/ExternalUserId/"):
+			_, _ = w.Write([]byte(`{"UserName":"campus-student"}`))
+		case strings.Contains(r.URL.Path, "Transaction/UserRequests/"):
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.Error(w, "unexpected provider read", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	const doi = "10.1000/reassign-prior-reconciliation"
+	oldID, offered := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_prior_old", doi, "ambiguous")
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := jobs.RecordEvent(ctx, oldID, "delivery.reconciliation_attempt", map[string]any{
+			"delivery_request_id": offered.ID,
+			"attempt":             attempt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_prior_new", doi)
+	if row, err := jobs.Get(ctx, newID); err != nil {
+		t.Fatal(err)
+	} else if row.State != job.StateAwaitingHuman {
+		t.Fatalf("new owner state = %s, want awaiting_human after the shared third attempt", row.State)
+	}
+	if attempts := reconciliationAttemptCount(ctx, jobs, newID, offered.ID); attempts != 3 {
+		t.Fatalf("reconciliation attempts = %d, want 3 across both owners", attempts)
+	}
+	if posts.Load() != 0 {
+		t.Fatalf("provider POSTs = %d, want no second submission", posts.Load())
+	}
+}

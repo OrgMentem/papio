@@ -414,8 +414,10 @@ desktop rate budget. Webhooks are not subject to quiet hours, focused-surface
 suppression, or the desktop rate ceiling.
 
 The daemon claims a webhook before it sends the POST. It does not send that
-intent again after a crash or a failed response. Activity records a failed
-attempt, and the JSON event carries a stable `delivery_key` for receiver checks.
+intent again after a crash or a failed response. A later event that arrives
+after the claim gets a new `delivery_key` and its own POST. Activity attempts
+to record a failed attempt, but a logging failure can leave no Activity row.
+The JSON event carries the key so receivers can check each delivery.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"papio/internal/job"
+	"papio/internal/notify"
 )
 
 // errReminderRouteCrash stands in for a kill between the pass's Route and its
@@ -432,5 +433,67 @@ func TestActionReminderRecoversARouteThatOutlivedItsMarkers(t *testing.T) {
 	}
 	if len(sink.reminders) != 1 {
 		t.Fatalf("reminders = %q, want no repeat before the backoff expires", sink.reminders)
+	}
+}
+
+// TestActionReminderRetryRoutesIdenticalDigest proves the crash-retry contract
+// the pending-digest ledger depends on: a crash between Route and marker
+// writes leaves the same actions due, so the next pass must route the
+// identical absolute total under the identical five-part identity
+// (category/event/aggregate/phase/WindowStart). The ledger replaces that
+// identical retry instead of adding it, so the digest stays at the true due
+// count (2) instead of doubling to 4.
+func TestActionReminderRetryRoutesIdenticalDigest(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	svc, jobs, sink := newReminderTestService(t, &now)
+	openReminderAction(t, svc, jobs, "wr_reminder_digest_a", now.Add(-30*time.Minute), true)
+	openReminderAction(t, svc, jobs, "wr_reminder_digest_b", now.Add(-30*time.Minute), true)
+
+	if err := svc.ActionReminder().RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("intents after first pass = %d, want 1", len(sink.intents))
+	}
+	first := sink.intents[0]
+	if first.Category != notify.CategoryDecisionPending || first.Phase != notify.PhaseReminder {
+		t.Fatalf("first intent = %q/%q, want decision_pending/reminder", first.Category, first.Phase)
+	}
+	if first.AggregateKey != "actions:pending" {
+		t.Fatalf("first aggregate = %q, want actions:pending", first.AggregateKey)
+	}
+	if first.Detail.Count != 2 {
+		t.Fatalf("first digest count = %d, want the absolute total 2", first.Detail.Count)
+	}
+
+	// Simulate the crash: the Route queued (sink kept the intent) but none
+	// of the per-action markers reached the job event stream.
+	ctx := context.Background()
+	if _, err := jobs.S.DB().ExecContext(ctx, `DELETE FROM events WHERE kind = ?`, actionReminderEvent); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.ActionReminder().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 2 {
+		t.Fatalf("intents after retry = %d, want 2 (first plus one identical retry)", len(sink.intents))
+	}
+	second := sink.intents[1]
+	if second.Category != first.Category || second.EventKind != first.EventKind ||
+		second.AggregateKey != first.AggregateKey || second.Phase != first.Phase {
+		t.Fatalf("retry identity = %q/%q/%q/%q, want identical to first %q/%q/%q/%q",
+			second.Category, second.EventKind, second.AggregateKey, second.Phase,
+			first.Category, first.EventKind, first.AggregateKey, first.Phase)
+	}
+	if !second.WindowStart.Equal(first.WindowStart) {
+		t.Fatalf("retry window = %v, want the stable first window %v", second.WindowStart, first.WindowStart)
+	}
+	if second.Detail.Count != first.Detail.Count {
+		t.Fatalf("retry count = %d, want the identical absolute total %d (replace keeps %d, add would make %d)",
+			second.Detail.Count, first.Detail.Count, first.Detail.Count, first.Detail.Count+second.Detail.Count)
+	}
+	if second.Detail.Count != 2 {
+		t.Fatalf("retry digest count = %d, want 2: the retry must not double-count", second.Detail.Count)
 	}
 }

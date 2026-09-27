@@ -683,3 +683,205 @@ func TestNotificationLedgerClaimWebhookSuccessStampsAttempt(t *testing.T) {
 		t.Fatalf("webhook_attempted_at after success = %q, want the settle time", got)
 	}
 }
+
+// A merge that lands after the webhook claim must neither rewrite the
+// claimed snapshot nor drop the late event: the generation upsert queues a
+// fresh generation row with its own delivery key, and the claimed payload
+// stays frozen. Plain Upsert keeps desktop-leg coalescing: it still merges
+// into the row, because only the webhook snapshot is immutable.
+func TestNotificationLedgerPostClaimMergeRedirectsToNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	first, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "decision:postclaim", Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1,"message":"first"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	before := notificationColumn(t, db, first.ID, "payload_json")
+	second, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "decision:postclaim", Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now.Add(time.Minute), AvailableAt: now.Add(time.Minute), Count: 1, PayloadJSON: `{"count":1,"message":"second"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("post-claim merge reused row %d, want a fresh generation row with its own key", first.ID)
+	}
+	if second.Count != 1 || second.WebhookState != "pending" {
+		t.Fatalf("generation = %+v, want count 1 with a pending webhook leg", second)
+	}
+	if got := notificationColumn(t, db, first.ID, "payload_json"); got != before {
+		t.Fatalf("claimed payload = %q, want the frozen snapshot %q", got, before)
+	}
+	if got := notificationColumn(t, db, first.ID, "count"); got != "1" {
+		t.Fatalf("claimed count = %q, want 1", got)
+	}
+}
+
+// A non-pending desktop leg never blocks the webhook generation redirect:
+// the redirect fires on the webhook leg alone.
+func TestNotificationLedgerPostClaimMergeRedirectsWithHeldDesktop(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	first, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "decision:held", Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1,"message":"first"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := ledger.SetDesktopState(ctx, first.ID, "suppressed_presence", now); err != nil || !applied {
+		t.Fatalf("suppression transition = %v, %v, want true", applied, err)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	second, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "decision:held", Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now.Add(time.Minute), AvailableAt: now.Add(time.Minute), Count: 1, PayloadJSON: `{"count":1,"message":"second"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("post-claim merge reused row %d, want a fresh generation row", first.ID)
+	}
+	if got := notificationColumn(t, db, first.ID, "count"); got != "1" {
+		t.Fatalf("claimed count = %q, want 1", got)
+	}
+}
+
+// A distinct second decision with an identical payload is a new event even
+// when nothing else differs except time: a later LastAt must queue a fresh
+// generation instead of being suppressed as a replay.
+func TestNotificationLedgerIdenticalPayloadWithLaterTimeOpensNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	first, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:distinct", Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	second, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:distinct", Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now.Add(time.Minute), AvailableAt: now.Add(time.Minute), Count: 1, PayloadJSON: `{"count":1}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("identical payload with a later time reused row %d: a distinct decision was dropped", first.ID)
+	}
+	if second.Count != 1 || second.WebhookState != "pending" {
+		t.Fatalf("generation = %+v, want count 1 with a pending webhook leg", second)
+	}
+}
+
+// A producer retry after the first generation settles is the exact same
+// event: same identity, LastAt, count, and payload. It must return the
+// settled row instead of opening a new generation, so the lost claim skips
+// delivery and the key POSTs once.
+func TestNotificationLedgerSettledRetryReturnsSameGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	mkrow := func() NotificationRecord {
+		return NotificationRecord{Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:settled-retry", Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1}`}
+	}
+	first, err := ledger.UpsertWebhookGeneration(ctx, mkrow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	if err := ledger.SetWebhookState(ctx, first.ID, "attempted", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := ledger.UpsertWebhookGeneration(ctx, mkrow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ID != first.ID {
+		t.Fatalf("settled retry opened row %d, want the settled generation %d", retry.ID, first.ID)
+	}
+	var n int
+	if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("ledger rows = %d, want the single settled generation", n)
+	}
+}
+
+// A retry of a redirected event matches its own generation: after the
+// original generation settles, event B redirects to +1ns and settles, and
+// a byte-identical retry of B must return the +1ns row instead of opening
+// a +2ns duplicate.
+func TestNotificationLedgerRedirectedGenerationRetryMatchesOwnGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	first, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "decision:breplay", Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1,"message":"first"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	if err := ledger.SetWebhookState(ctx, first.ID, "attempted", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	secondAt := now.Add(2 * time.Minute)
+	eventB := func() NotificationRecord {
+		return NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "decision:breplay", Phase: "opened", WindowStart: now, FirstAt: secondAt, LastAt: secondAt, AvailableAt: secondAt, Count: 1, PayloadJSON: `{"count":1,"message":"second"}`}
+	}
+	second, err := ledger.UpsertWebhookGeneration(ctx, eventB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("late event reused settled row %d, want a fresh generation", first.ID)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, second.ID); err != nil || !claimed {
+		t.Fatalf("generation claim = %v, %v, want true", claimed, err)
+	}
+	if err := ledger.SetWebhookState(ctx, second.ID, "attempted", secondAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := ledger.UpsertWebhookGeneration(ctx, eventB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ID != second.ID {
+		t.Fatalf("redirected retry opened row %d, want its own settled generation %d", retry.ID, second.ID)
+	}
+	var n int
+	if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM notification_intents`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("ledger rows = %d, want the two settled generations", n)
+	}
+}

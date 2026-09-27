@@ -94,3 +94,27 @@ func (s *StoreInspector) JobForRequest(ctx context.Context, requestID string) (s
 	}
 	return jobID, state, true, nil
 }
+
+// JobForConsumer returns the job the daemon committed for a submit_v3 consumer
+// tag, TERMINAL ones included, and whether one exists at all.
+//
+// This is the lookup the force path needs and no RPC provides. The daemon
+// replaces the supplied request id with a generated one before storing on
+// the force path (internal/job/job.go createRequest), so the request-id row
+// cannot name that job back. The consumer tag rides on the job row itself
+// and survives the replacement, which is why force submissions carry their
+// run/work tag as the consumer.
+func (s *StoreInspector) JobForConsumer(ctx context.Context, consumer string) (string, string, bool, error) {
+	var jobID, state string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, state FROM jobs
+		WHERE consumer = ?
+		ORDER BY created_at DESC LIMIT 1`, consumer).Scan(&jobID, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("looking up the job for consumer %s: %w", consumer, err)
+	}
+	return jobID, state, true, nil
+}

@@ -427,11 +427,18 @@ type pendingCredential struct {
 }
 
 func pendingCredentialPath(configPath string) string {
-	dir := filepath.Dir(strings.TrimSpace(configPath))
-	if dir == "" || dir == "." {
-		dir = config.Dir()
+	if strings.TrimSpace(configPath) == "" {
+		configPath = filepath.Join(config.Dir(), "config.toml")
 	}
-	return filepath.Join(dir, "pending-credentials.json")
+	absolute, err := filepath.Abs(configPath)
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(absolute)
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	return filepath.Join(dir, "."+filepath.Base(absolute)+".pending-credentials.json")
 }
 
 func readPendingCredentials(configPath string) ([]pendingCredential, error) {
@@ -487,34 +494,51 @@ func writePendingCredentials(configPath string, entries []pendingCredential) err
 	return os.Rename(temporaryPath, pendingCredentialPath(configPath))
 }
 
-func journalPendingCredential(configPath, ref, target string) error {
+func updatePendingCredentials(configPath string, update func([]pendingCredential) ([]pendingCredential, bool)) error {
+	path := pendingCredentialPath(configPath)
+	if path == "" {
+		return errPendingCredentialJournal
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	unlock, err := lockPendingCredentials(path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	entries, err := readPendingCredentials(configPath)
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if entry.Reference == ref {
-			return nil
-		}
+	next, changed := update(entries)
+	if !changed {
+		return nil
 	}
-	return writePendingCredentials(configPath, append(entries, pendingCredential{Reference: ref, Target: target, CreatedAt: time.Now().UTC().Format(time.RFC3339)}))
+	return writePendingCredentials(configPath, next)
+}
+
+func journalPendingCredential(configPath, ref, target string) error {
+	return updatePendingCredentials(configPath, func(entries []pendingCredential) ([]pendingCredential, bool) {
+		for _, entry := range entries {
+			if entry.Reference == ref {
+				return entries, false
+			}
+		}
+		return append(entries, pendingCredential{Reference: ref, Target: target, CreatedAt: time.Now().UTC().Format(time.RFC3339)}), true
+	})
 }
 
 func clearPendingCredential(configPath, ref string) error {
-	entries, err := readPendingCredentials(configPath)
-	if err != nil {
-		return err
-	}
-	kept := make([]pendingCredential, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Reference != ref {
-			kept = append(kept, entry)
+	return updatePendingCredentials(configPath, func(entries []pendingCredential) ([]pendingCredential, bool) {
+		kept := make([]pendingCredential, 0, len(entries))
+		for _, entry := range entries {
+			if entry.Reference != ref {
+				kept = append(kept, entry)
+			}
 		}
-	}
-	if len(kept) == len(entries) {
-		return nil
-	}
-	return writePendingCredentials(configPath, kept)
+		return kept, len(kept) != len(entries)
+	})
 }
 
 // unboundPendingCredentials surfaces journaled OS-store writes that no

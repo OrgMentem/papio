@@ -44,9 +44,11 @@ var reminderActionKindDefaultOK = map[string]struct{}{
 // recorded: the queued notification intent is the durable fact, and the
 // per-action marker only advances the backoff after the route succeeded. A
 // crash between the route and the markers leaves the actions due, so the next
-// pass routes again under the same aggregate window and the ledger coalesces
-// the retry instead of losing the alert for a full backoff. A failed route
-// likewise records nothing, so the next pass retries instead of skipping.
+// pass routes again with the identical absolute total under the same aggregate
+// window and the pending-digest ledger replaces the retry instead of adding
+// it, keeping the digest at the true due count instead of doubling it. A
+// failed route likewise records nothing, so the next pass retries instead of
+// skipping.
 func (r *ActionReminder) RunDue(ctx context.Context) error {
 	if r == nil || r.svc == nil || r.svc.Jobs == nil || r.svc.Notifier == nil {
 		return nil
@@ -180,8 +182,9 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 		}
 		if err := s.Notifier.Route(context.WithoutCancel(ctx), intent); err != nil {
 			// No marker is recorded below, so the actions stay due and the
-			// next pass retries the route instead of waiting out a backoff
-			// for an alert that never queued.
+			// next pass retries the identical absolute total under the same
+			// window instead of waiting out a backoff for an alert that never
+			// queued. The pending-digest ledger replaces that identical retry.
 			log.Printf("papio: routing action reminder: %v", err)
 			return firstErr
 		}

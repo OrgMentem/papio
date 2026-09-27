@@ -110,6 +110,10 @@ type DigestEntry struct {
 	FirstSeenAt  string                `json:"first_seen_at"`
 	Identifiers  *protocol.Identifiers `json:"identifiers,omitempty"`
 	titleAliases []string
+	// rowID is the durable watch_digest_entries id. It survives
+	// RecordDigest key rewrites (title key to DOI), so alert identity keyed
+	// on row IDs stays stable across upgrades where work keys move.
+	rowID int64 `json:"-"`
 }
 
 const maxDigestAbstractRunes = 2000
@@ -277,6 +281,25 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 					return 0, fmt.Errorf("merging duplicate watch digest identity: %w", err)
 				}
 			}
+			// Move alert receipts to the new canonical key in the same
+			// transaction that rewrites the digest row. A title-keyed receipt
+			// must follow its work to the DOI key so the renamed entry stays
+			// suppressed under strict matching; the old title receipt is
+			// removed so a different identified work sharing the title is not
+			// falsely suppressed. Consumed merges drop their receipts.
+			mergedPayload, err := decodeDigestIdentifierPayload(identifiersJSON)
+			if err != nil {
+				return 0, err
+			}
+			mergedEntry := DigestEntry{WorkKey: workKey, TitleKey: entry.TitleKey, Title: entry.Title, DOI: doi}
+			if mergedPayload.Identifiers != (protocol.Identifiers{}) {
+				identifiers := mergedPayload.Identifiers
+				mergedEntry.Identifiers = &identifiers
+			}
+			mergedEntry.titleAliases = append(mergedEntry.titleAliases, mergedPayload.TitleAliases...)
+			if err := migrateDigestAlertReceiptsTx(ctx, tx, watchID, workKey, digestIdentityAliases(mergedEntry), consumed); err != nil {
+				return 0, err
+			}
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE watch_digest_entries
 				SET work_key = ?, title = ?, authors = ?, authors_json = ?, year = ?, doi = ?,
@@ -414,6 +437,18 @@ func (s *Store) ClearDigest(ctx context.Context, watchID int64) (int, error) {
 // every RecordDigest — including entries stranded by a crash or a notifier
 // failure on an earlier run, which RecordDigest deduplicates to reported=0
 // and would otherwise never be announced.
+//
+// Receipt matching is identity-aware, not an exact work_key comparison.
+// RecordDigest rewrites a title-derived work_key to its canonical DOI (or
+// arXiv/OpenAlex) key when a later sighting supplies the stable identifier,
+// and migrates the receipt to the new key in the same transaction, so an
+// exact work_key join would lose the earlier receipt and re-alert the same
+// work. An entry is therefore considered alerted only when a receipt shares
+// a stable identity with it — canonical key or stable identifier — never on
+// a bare title overlap. A title-only receipt must not suppress a different
+// identified work that happens to share the title: RecordDigest retains both
+// rows when their stable IDs conflict, and a title match would hide the
+// second work forever; see digestAlertReceiptSuppressesEntry.
 func (s *Store) UnalertedDigestEntries(ctx context.Context, watchID int64) ([]DigestEntry, error) {
 	if s == nil || s.S == nil {
 		return nil, errors.New("watch store is not configured")
@@ -425,21 +460,20 @@ func (s *Store) UnalertedDigestEntries(ctx context.Context, watchID int64) ([]Di
 		return nil, err
 	}
 	rows, err := s.S.DB().QueryContext(ctx, `
-		SELECT work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json
+		SELECT id, work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json
 		FROM watch_digest_entries
 		WHERE watch_id = ? AND consumed = 0
-			AND work_key NOT IN (SELECT work_key FROM watch_digest_alerts WHERE watch_id = ?)
-		ORDER BY id DESC`, watchID, watchID)
+		ORDER BY id DESC`, watchID)
 	if err != nil {
 		return nil, fmt.Errorf("listing unalerted watch digest: %w", err)
 	}
 	defer rows.Close()
-	entries := make([]DigestEntry, 0)
+	pending := make([]DigestEntry, 0)
 	for rows.Next() {
 		var entry DigestEntry
 		var identifiersJSON, authorsJSON string
 		if err := rows.Scan(
-			&entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
+			&entry.rowID, &entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
 			&entry.DOI, &entry.IsOA, &entry.Abstract, &entry.FirstSeenAt, &identifiersJSON,
 		); err != nil {
 			return nil, err
@@ -450,10 +484,48 @@ func (s *Store) UnalertedDigestEntries(ctx context.Context, watchID int64) ([]Di
 		if err := decodeDigestIdentifiers(&entry, identifiersJSON); err != nil {
 			return nil, err
 		}
-		entries = append(entries, entry)
+		pending = append(pending, entry)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating unalerted watch digest: %w", err)
+	}
+	if len(pending) == 0 {
+		return pending, nil
+	}
+	receiptRows, err := s.S.DB().QueryContext(ctx, `
+		SELECT work_key FROM watch_digest_alerts WHERE watch_id = ?`, watchID)
+	if err != nil {
+		return nil, fmt.Errorf("listing watch digest alert receipts: %w", err)
+	}
+	defer receiptRows.Close()
+	receipts := make([]string, 0)
+	for receiptRows.Next() {
+		var workKey string
+		if err := receiptRows.Scan(&workKey); err != nil {
+			return nil, err
+		}
+		receipts = append(receipts, workKey)
+	}
+	if err := receiptRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating watch digest alert receipts: %w", err)
+	}
+	if len(receipts) == 0 {
+		return pending, nil
+	}
+	entries := make([]DigestEntry, 0, len(pending))
+	for _, entry := range pending {
+		aliases := digestIdentityAliases(entry)
+		stable := digestStableIdentityAliases(entry)
+		alerted := false
+		for _, receipt := range receipts {
+			if digestAlertReceiptSuppressesEntry(aliases, stable, receipt) {
+				alerted = true
+				break
+			}
+		}
+		if !alerted {
+			entries = append(entries, entry)
+		}
 	}
 	return entries, nil
 }
@@ -462,6 +534,11 @@ func (s *Store) UnalertedDigestEntries(ctx context.Context, watchID int64) ([]Di
 // alert has been routed. Callers must invoke it only after the route
 // succeeds: the receipt suppresses future catch-up alerts, so recording it
 // before delivery would reintroduce the loss it exists to prevent.
+//
+// All receipts for the one routed alert commit atomically. Writing each row
+// in its own statement would leave a crash between two inserts with a
+// partial receipt set: the next run would re-alert the entries still
+// missing receipts, duplicating an alert that already reached the user.
 func (s *Store) MarkDigestAlerted(ctx context.Context, watchID int64, workKeys []string, at time.Time) error {
 	if s == nil || s.S == nil {
 		return errors.New("watch store is not configured")
@@ -475,18 +552,30 @@ func (s *Store) MarkDigestAlerted(ctx context.Context, watchID int64, workKeys [
 	if _, err := s.Get(ctx, watchID); err != nil {
 		return err
 	}
-	alertedAt := store.FormatTime(at)
+	cleaned := make([]string, 0, len(workKeys))
 	for _, workKey := range workKeys {
 		workKey = strings.TrimSpace(workKey)
 		if workKey == "" {
 			return errors.New("watch digest alert key must not be empty")
 		}
-		if _, err := s.S.DB().ExecContext(ctx, `
+		cleaned = append(cleaned, workKey)
+	}
+	tx, err := s.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting watch digest alert transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	alertedAt := store.FormatTime(at)
+	for _, workKey := range cleaned {
+		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO watch_digest_alerts (watch_id, work_key, alerted_at)
 			VALUES (?, ?, ?)
 			ON CONFLICT(watch_id, work_key) DO NOTHING`, watchID, workKey, alertedAt); err != nil {
 			return fmt.Errorf("recording watch digest alert: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing watch digest alert: %w", err)
 	}
 	return nil
 }
@@ -616,8 +705,8 @@ func (s *Store) ConsumeDigest(ctx context.Context, watchID int64, workKeys []str
 		if count != 1 {
 			return 0, fmt.Errorf("%w: %q", ErrDigestEntryNotFound, entry.WorkKey)
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, entry.WorkKey); err != nil {
-			return 0, fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
+		if err := deleteDigestAlertReceiptsForEntryTx(ctx, tx, watchID, entry); err != nil {
+			return 0, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -637,7 +726,32 @@ func (s *Store) consumeDigestEntry(ctx context.Context, watchID int64, workKey s
 	if workKey == "" {
 		return errors.New("watch digest key must not be empty")
 	}
-	result, err := s.S.DB().ExecContext(ctx, `
+	tx, err := s.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting watch digest consume transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var entry DigestEntry
+	var identifiersJSON, authorsJSON string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT work_key, title, authors, authors_json, year, doi, is_oa, abstract, first_seen_at, identifiers_json
+		FROM watch_digest_entries
+		WHERE watch_id = ? AND work_key = ? AND consumed = 0`, watchID, workKey).Scan(
+		&entry.WorkKey, &entry.Title, &entry.Authors, &authorsJSON, &entry.Year,
+		&entry.DOI, &entry.IsOA, &entry.Abstract, &entry.FirstSeenAt, &identifiersJSON,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, workKey)
+		}
+		return fmt.Errorf("reading watch digest entry: %w", err)
+	}
+	if err := decodeDigestAuthors(&entry, authorsJSON); err != nil {
+		return err
+	}
+	if err := decodeDigestIdentifiers(&entry, identifiersJSON); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `
 		UPDATE watch_digest_entries
 		SET consumed = 1
 		WHERE watch_id = ? AND work_key = ? AND consumed = 0`, watchID, workKey)
@@ -651,8 +765,11 @@ func (s *Store) consumeDigestEntry(ctx context.Context, watchID int64, workKey s
 	if count != 1 {
 		return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, workKey)
 	}
-	if _, err := s.S.DB().ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, workKey); err != nil {
-		return fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
+	if err := deleteDigestAlertReceiptsForEntryTx(ctx, tx, watchID, entry); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing watch digest consume: %w", err)
 	}
 	return nil
 }
@@ -682,8 +799,8 @@ func (s *Store) consumeDigestEntriesTx(ctx context.Context, entries []DigestEntr
 		if count != 1 {
 			return fmt.Errorf("%w: %q", ErrDigestEntryNotFound, entry.WorkKey)
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, entry.WorkKey); err != nil {
-			return fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
+		if err := deleteDigestAlertReceiptsForEntryTx(ctx, tx, watchID, entry); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -819,6 +936,247 @@ func digestIdentityAliases(entry DigestEntry) map[string]struct{} {
 		add("isbn", entry.Identifiers.ISBN)
 	}
 	return aliases
+}
+
+// digestAlertReceiptMatchesEntry reports whether a stored alert receipt
+// suppresses entry. Receipts hold the canonical work_key at the time of the
+// alert, but RecordDigest may later rewrite that key (title key to DOI, or
+// one stable identifier to another) while the logical work stays the same.
+// The receipt therefore matches when it shares any identity alias with the
+// current entry: the canonical key, a normalized title, or a stable
+// identifier (DOI, arXiv, OpenAlex) plus the legacy PMID/ISBN aliases.
+func digestAlertReceiptMatchesEntry(entryAliases map[string]struct{}, receipt string) bool {
+	receipt = strings.TrimSpace(receipt)
+	if receipt == "" || len(entryAliases) == 0 {
+		return false
+	}
+	lower := strings.ToLower(receipt)
+	if _, ok := entryAliases["key:"+lower]; ok {
+		return true
+	}
+	if title := normalizeDigestTitle(receipt); title != "" {
+		if _, ok := entryAliases["title:"+title]; ok {
+			return true
+		}
+	}
+	if _, ok := entryAliases["doi:"+lower]; ok {
+		return true
+	}
+	if _, ok := entryAliases["arxiv:"+lower]; ok {
+		return true
+	}
+	if stripped := strings.TrimPrefix(lower, "arxiv:"); stripped != lower {
+		if _, ok := entryAliases["arxiv:"+stripped]; ok {
+			return true
+		}
+	}
+	if _, ok := entryAliases["openalex:"+lower]; ok {
+		return true
+	}
+	if stripped := strings.TrimPrefix(lower, "openalex:"); stripped != lower {
+		if _, ok := entryAliases["openalex:"+stripped]; ok {
+			return true
+		}
+	}
+	// OpenAlex discoveries may record a full URL in one sighting and a bare
+	// identifier in another; match either form so the receipt survives.
+	if strings.Contains(lower, "openalex.org/") {
+		if parts := strings.Split(lower, "/"); len(parts) > 0 {
+			if id := strings.TrimSpace(parts[len(parts)-1]); id != "" {
+				if _, ok := entryAliases["openalex:"+id]; ok {
+					return true
+				}
+				if _, ok := entryAliases["key:openalex:"+id]; ok {
+					return true
+				}
+			}
+		}
+	}
+	if _, ok := entryAliases["pmid:"+lower]; ok {
+		return true
+	}
+	if _, ok := entryAliases["isbn:"+lower]; ok {
+		return true
+	}
+	return false
+}
+
+// digestAlertReceiptSuppressesEntry reports whether a stored alert receipt
+// keeps entry from being unalerted. Identified entries (those with a DOI,
+// arXiv, or OpenAlex identifier) match only on a shared stable identity —
+// canonical key or stable identifier — never on a bare title overlap. A
+// title-only receipt must not suppress a different identified work that
+// happens to share the title: RecordDigest retains both rows when their
+// stable IDs conflict, and a title match would hide the second work forever.
+// Title-only entries, which have no stable identity to share, keep the
+// broader title/key matching. Title-to-stable migration is preserved by
+// RecordDigest, which moves the receipt to the new canonical key in the same
+// transaction that rewrites the work key.
+func digestAlertReceiptSuppressesEntry(entryAliases, entryStable map[string]struct{}, receipt string) bool {
+	receipt = strings.TrimSpace(receipt)
+	if receipt == "" || len(entryAliases) == 0 {
+		return false
+	}
+	if len(entryStable) == 0 {
+		return digestAlertReceiptMatchesEntry(entryAliases, receipt)
+	}
+	lower := strings.ToLower(receipt)
+	if _, ok := entryAliases["key:"+lower]; ok {
+		return true
+	}
+	if _, ok := entryAliases["doi:"+lower]; ok {
+		return true
+	}
+	if _, ok := entryAliases["arxiv:"+lower]; ok {
+		return true
+	}
+	if stripped := strings.TrimPrefix(lower, "arxiv:"); stripped != lower {
+		if _, ok := entryAliases["arxiv:"+stripped]; ok {
+			return true
+		}
+	}
+	if _, ok := entryAliases["openalex:"+lower]; ok {
+		return true
+	}
+	if stripped := strings.TrimPrefix(lower, "openalex:"); stripped != lower {
+		if _, ok := entryAliases["openalex:"+stripped]; ok {
+			return true
+		}
+	}
+	if strings.Contains(lower, "openalex.org/") {
+		if parts := strings.Split(lower, "/"); len(parts) > 0 {
+			if id := strings.TrimSpace(parts[len(parts)-1]); id != "" {
+				if _, ok := entryAliases["openalex:"+id]; ok {
+					return true
+				}
+				if _, ok := entryAliases["key:openalex:"+id]; ok {
+					return true
+				}
+			}
+		}
+	}
+	if _, ok := entryAliases["pmid:"+lower]; ok {
+		return true
+	}
+	if _, ok := entryAliases["isbn:"+lower]; ok {
+		return true
+	}
+	return false
+}
+
+// migrateDigestAlertReceiptsTx moves alert receipts from a merged digest
+// identity's old keys to its new canonical key in the same transaction that
+// rewrites the digest row. A title-keyed receipt must follow its work when
+// RecordDigest canonicalizes the key to a DOI: without the move the renamed
+// entry would re-alert under strict suppression (which ignores bare title
+// overlap for identified entries), and without deleting the old title receipt
+// a different identified work sharing the title would stay falsely
+// suppressed. Matching uses the broad alias overlap so pre-existing orphans
+// are caught; the survivors are keyed by the stable identity, so later
+// same-title distinct works no longer collide. When the merged result is
+// consumed the receipts are dead weight and are all removed instead.
+func migrateDigestAlertReceiptsTx(ctx context.Context, tx *sql.Tx, watchID int64, newWorkKey string, mergedAliases map[string]struct{}, consumed bool) error {
+	newWorkKey = strings.TrimSpace(newWorkKey)
+	if newWorkKey == "" || len(mergedAliases) == 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT work_key, alerted_at FROM watch_digest_alerts WHERE watch_id = ?`, watchID)
+	if err != nil {
+		return fmt.Errorf("listing watch digest alert receipts: %w", err)
+	}
+	defer rows.Close()
+	type receipt struct{ key, at string }
+	matching := make([]receipt, 0)
+	for rows.Next() {
+		var r receipt
+		if err := rows.Scan(&r.key, &r.at); err != nil {
+			return err
+		}
+		if digestAlertReceiptMatchesEntry(mergedAliases, r.key) {
+			matching = append(matching, r)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating watch digest alert receipts: %w", err)
+	}
+	if len(matching) == 0 {
+		return nil
+	}
+	if consumed {
+		for _, r := range matching {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, r.key); err != nil {
+				return fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
+			}
+		}
+		return nil
+	}
+	alreadyStored := false
+	earliest := ""
+	for _, r := range matching {
+		if earliest == "" || r.at < earliest {
+			earliest = r.at
+		}
+		if strings.EqualFold(strings.TrimSpace(r.key), newWorkKey) {
+			alreadyStored = true
+		}
+	}
+	if !alreadyStored {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO watch_digest_alerts (watch_id, work_key, alerted_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(watch_id, work_key) DO NOTHING`, watchID, newWorkKey, earliest); err != nil {
+			return fmt.Errorf("migrating watch digest alert receipt: %w", err)
+		}
+	}
+	for _, r := range matching {
+		if strings.EqualFold(strings.TrimSpace(r.key), newWorkKey) {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, r.key); err != nil {
+			return fmt.Errorf("clearing superseded watch digest alert receipt: %w", err)
+		}
+	}
+	return nil
+}
+
+// deleteDigestAlertReceiptsForEntryTx removes every alert receipt for watchID
+// that suppresses entry under identity-aware matching. Consuming an entry
+// must clear not only the receipt stored under its current canonical key
+// but also any older receipt stored under a previous key for the same work
+// (for example a title key later rewritten to a DOI); otherwise the orphan
+// would linger and could suppress a different re-recorded work that happens
+// to share the old title. Callers must hold the transaction that consumed
+// the entry so the consume and its receipt cleanup commit atomically.
+func deleteDigestAlertReceiptsForEntryTx(ctx context.Context, tx *sql.Tx, watchID int64, entry DigestEntry) error {
+	rows, err := tx.QueryContext(ctx, `SELECT work_key FROM watch_digest_alerts WHERE watch_id = ?`, watchID)
+	if err != nil {
+		return fmt.Errorf("listing watch digest alert receipts: %w", err)
+	}
+	defer rows.Close()
+	receipts := make([]string, 0)
+	for rows.Next() {
+		var workKey string
+		if err := rows.Scan(&workKey); err != nil {
+			return err
+		}
+		receipts = append(receipts, workKey)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating watch digest alert receipts: %w", err)
+	}
+	if len(receipts) == 0 {
+		return nil
+	}
+	aliases := digestIdentityAliases(entry)
+	for _, receipt := range receipts {
+		if !digestAlertReceiptMatchesEntry(aliases, receipt) {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM watch_digest_alerts WHERE watch_id = ? AND work_key = ?`, watchID, receipt); err != nil {
+			return fmt.Errorf("clearing consumed watch digest alert receipt: %w", err)
+		}
+	}
+	return nil
 }
 
 func digestEntryMatchesKey(entry DigestEntry, key string) bool {

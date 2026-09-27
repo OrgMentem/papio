@@ -10821,6 +10821,12 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	}
 	b.materializationScheduleProcessed = true
 	if b.captureStore != nil {
+		activeLeases := make(map[string]struct{}, len(awaiting))
+		for _, row := range awaiting {
+			if strings.TrimSpace(row.ID) != "" {
+				activeLeases[row.ID] = struct{}{}
+			}
+		}
 		if pending, pendingErr := b.captureStore.PendingJobs(ctx); pendingErr == nil {
 			awaitingIDs := make(map[string]struct{}, len(awaiting))
 			for _, row := range awaiting {
@@ -10828,6 +10834,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 			}
 			for _, jobID := range pending {
 				if _, ok := awaitingIDs[jobID]; ok {
+					activeLeases[jobID] = struct{}{}
 					continue
 				}
 				row, getErr := b.jobs.Get(ctx, jobID)
@@ -10835,21 +10842,50 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 					if releaseErr := b.captureStore.ReleaseJob(ctx, jobID); releaseErr != nil {
 						log.Printf("papio: capture retention release for %s: %v", jobID, releaseErr)
 					}
+					continue
 				}
+				activeLeases[jobID] = struct{}{}
 			}
 		}
-		// Pins without an index entry predate index-first ordering and are
-		// invisible to the release pass above while exempt from retention.
-		// Index-first ordering makes new orphans impossible, so this full
-		// tree scan runs once per bridge rather than on every two-second
-		// poll; an error retries on the next poll. The store holds its lock
-		// throughout the scan, so no live capture can be mid-flight while
-		// orphans are collected.
+		// An interrupted provisional write leaves either an index entry
+		// without its pin (retention would prune the live evidence) or a pin
+		// without its index (orphan cleanup would drop it). Reconciling active
+		// leases first re-indexes live pins and restores missing pins, so the
+		// orphan scan below only collects pins for jobs that already left.
+		// Index-first ordering makes new orphans rare, so this full tree scan
+		// runs once per bridge rather than on every two-second poll; an error
+		// retries on the next poll. The store holds its lock throughout each
+		// scan, so no live capture can be mid-flight while leases are
+		// reconciled or orphans collected.
 		if !b.captureOrphanPinsReconciled {
-			if _, orphanErr := b.captureStore.ReleaseOrphanPendingPins(ctx); orphanErr != nil {
-				log.Printf("papio: capture orphan pin release: %v", orphanErr)
+			// The awaiting page above is capped, so an active job past the cap
+			// with a pin-first crash (pin on disk, no index entry) would miss
+			// reconciliation and lose its pin to the orphan scan below.
+			// Complete the set from on-disk lease traces before reconciling.
+			if candidates, candErr := b.captureStore.PendingLeaseCandidates(ctx); candErr != nil {
+				log.Printf("papio: capture pending lease candidates: %v", candErr)
 			} else {
-				b.captureOrphanPinsReconciled = true
+				for _, jobID := range candidates {
+					if _, ok := activeLeases[jobID]; ok {
+						continue
+					}
+					row, getErr := b.jobs.Get(ctx, jobID)
+					if getErr != nil || row.State != job.StateAwaitingHuman {
+						continue
+					}
+					activeLeases[jobID] = struct{}{}
+				}
+				active := make([]string, 0, len(activeLeases))
+				for jobID := range activeLeases {
+					active = append(active, jobID)
+				}
+				if _, _, reconcileErr := b.captureStore.ReconcilePendingPins(ctx, active); reconcileErr != nil {
+					log.Printf("papio: capture pending lease reconcile: %v", reconcileErr)
+				} else if _, orphanErr := b.captureStore.ReleaseOrphanPendingPins(ctx); orphanErr != nil {
+					log.Printf("papio: capture orphan pin release: %v", orphanErr)
+				} else {
+					b.captureOrphanPinsReconciled = true
+				}
 			}
 		}
 	}

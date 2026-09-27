@@ -31,10 +31,16 @@ type Ledger interface {
 	ReserveDesktop(context.Context, int64, time.Time, int) (bool, error)
 	SetDesktopState(context.Context, int64, string, time.Time) (bool, error)
 	// ClaimWebhook atomically moves a pending webhook leg to sending and
-	// reports whether the claim applied. The router POSTs only on a won
-	// claim, which keeps replay, concurrent, and restart delivery to one
-	// POST per row at most. See the store ClaimWebhook for the full policy.
-	ClaimWebhook(context.Context, int64) (bool, error)
+	// returns the claimed row's immutable snapshot with whether the claim
+	// applied. The router POSTs only on a won claim, which keeps replay,
+	// concurrent, and restart delivery to one POST per row and one POST per
+	// delivery key. The returned row is the send source: a concurrent Route
+	// can coalesce another event after this Route's Upsert returned but
+	// before its claim won, so the Upsert snapshot can be stale. A merge
+	// after the claim queues a new generation row under its own key instead
+	// of rewriting the claimed snapshot. See the store ClaimWebhook for the
+	// full policy.
+	ClaimWebhook(context.Context, int64) (Record, bool, error)
 	SetWebhookState(context.Context, int64, string, time.Time) error
 	SupersedeCheckpoints(context.Context, string, time.Time) (int, error)
 	LatestCheckpoint(context.Context, string) (Record, bool, error)
@@ -188,6 +194,30 @@ func (r *Router) Route(ctx context.Context, intent Intent) error {
 				record, err = r.ledger.Upsert(ctx, recordInput)
 			}
 		}
+	} else if intent.Category == CategoryDecisionPending && intent.Phase == PhaseReminder {
+		// The reminder producer routes an absolute total snapshot each pass.
+		// A crash between Route and its markers retries the identical total,
+		// so replace the count instead of adding it. Production StoreLedger
+		// implements the snapshot; alternate ledgers keep additive Upsert.
+		// When the current generation's webhook leg is already claimed or
+		// settled, the store redirects the retry to a fresh pending
+		// generation; the router then claims and POSTs that generation.
+		if replacer, ok := r.ledger.(pendingDigestReplacer); ok {
+			record, err = replacer.UpsertPendingDigest(ctx, recordInput)
+		} else {
+			record, err = r.ledger.Upsert(ctx, recordInput)
+		}
+	} else if redirector, ok := r.ledger.(webhookGenerationRedirector); ok {
+		// Immediate-webhook events merge only into a pending webhook
+		// generation; a merge after the claim redirects to a fresh
+		// generation row with its own delivery key. Categories without a
+		// webhook leg use plain desktop coalescing below, which is the
+		// same path ledgers without the method take.
+		if webhookState == "pending" {
+			record, err = redirector.UpsertWebhookGeneration(ctx, recordInput)
+		} else {
+			record, err = r.ledger.Upsert(ctx, recordInput)
+		}
 	} else {
 		record, err = r.ledger.Upsert(ctx, recordInput)
 	}
@@ -200,27 +230,30 @@ func (r *Router) Route(ctx context.Context, intent Intent) error {
 	//
 	// Webhook delivery is at-most-once per ledger row. The router claims the
 	// pending leg before its POST, so a replayed intent, a concurrent Route,
-	// or a restart after the claim cannot POST twice. A crash between claim
-	// and settle leaves sending, which never becomes due again: the delivery
-	// may be lost but is never duplicated. Local ledger state cannot give
-	// exactly-once across a lost HTTP response, so every POST carries the
-	// stable per-row delivery key for receiver correlation.
+	// or a restart after the claim cannot POST the same row twice. A crash
+	// between claim and settle leaves sending, which never becomes due
+	// again: the delivery may be lost but is never duplicated. The claimed
+	// snapshot is immutable: a concurrent Route that lands after the claim
+	// queues its event under a new generation row with its own delivery
+	// key, so the second POST never reuses the first key. Local ledger state
+	// cannot give exactly-once across a lost HTTP response, so every POST
+	// carries the stable per-row delivery key for receiver correlation.
 	if webhookState == "pending" && categoryPolicy.Webhook != "digest" && r.webhook != nil && record.WebhookState == "pending" {
-		claimed, err := r.ledger.ClaimWebhook(ctx, record.ID)
+		claimedRow, claimed, err := r.ledger.ClaimWebhook(ctx, record.ID)
 		if err != nil {
 			return err
 		}
 		if claimed {
-			event := record.Intent.Detail
-			event.Count = record.Count
-			event.Message = ComposeMessage(record.Intent.Category, record.Count, event, record.Intent.Message)
-			event.DeliveryKey = WebhookDeliveryKey(record.ID)
+			event := claimedRow.Intent.Detail
+			event.Count = claimedRow.Count
+			event.Message = ComposeMessage(claimedRow.Intent.Category, claimedRow.Count, event, claimedRow.Intent.Message)
+			event.DeliveryKey = WebhookDeliveryKey(claimedRow.ID)
 			if err := r.deliverWebhook(ctx, event); err != nil {
-				if serr := r.ledger.SetWebhookState(ctx, record.ID, "failed", now); serr != nil {
+				if serr := r.ledger.SetWebhookState(ctx, claimedRow.ID, "failed", now); serr != nil {
 					return serr
 				}
-				r.audit(ctx, "notify.webhook_failed", record, "webhook_failed")
-			} else if err := r.ledger.SetWebhookState(ctx, record.ID, "attempted", now); err != nil {
+				r.audit(ctx, "notify.webhook_failed", claimedRow, "webhook_failed")
+			} else if err := r.ledger.SetWebhookState(ctx, claimedRow.ID, "attempted", now); err != nil {
 				return err
 			}
 		}
@@ -233,6 +266,21 @@ func (r *Router) Route(ctx context.Context, intent Intent) error {
 
 type atomicFinalizer interface {
 	SupersedeAndUpsertCheckpoint(context.Context, string, time.Time, Record) (Record, error)
+}
+
+// webhookGenerationRedirector stores one event under the current pending
+// webhook generation, redirecting to a fresh generation row when the
+// identity row's webhook leg is already claimed or settled. Production
+// StoreLedger implements it; test ledgers mirror it in Upsert.
+type webhookGenerationRedirector interface {
+	UpsertWebhookGeneration(context.Context, Record) (Record, error)
+}
+
+// pendingDigestReplacer stores an absolute digest snapshot instead of adding
+// to the row. Production StoreLedger implements it for the reminder retry
+// contract; test ledgers may keep additive Upsert.
+type pendingDigestReplacer interface {
+	UpsertPendingDigest(context.Context, Record) (Record, error)
 }
 
 type webhookDueLedger interface {
@@ -268,26 +316,28 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 			// Same at-most-once claim as immediate legs: only the drain that
 			// wins the pending-to-sending claim POSTs. A crash between claim
 			// and settle leaves sending behind, which DueWebhook never
-			// returns, so a restart cannot duplicate the POST.
-			claimed, err := r.ledger.ClaimWebhook(ctx, row.ID)
+			// returns, so a restart cannot duplicate the POST. The claimed
+			// snapshot is immutable: a concurrent Route after the claim
+			// queues a new generation row under its own key.
+			claimedRow, claimed, err := r.ledger.ClaimWebhook(ctx, row.ID)
 			if err != nil {
 				return err
 			}
 			if !claimed {
 				continue
 			}
-			event := row.Intent.Detail
-			event.Count = row.Count
-			event.Message = ComposeMessage(row.Intent.Category, row.Count, event, row.Intent.Message)
-			event.DeliveryKey = WebhookDeliveryKey(row.ID)
+			event := claimedRow.Intent.Detail
+			event.Count = claimedRow.Count
+			event.Message = ComposeMessage(claimedRow.Intent.Category, claimedRow.Count, event, claimedRow.Intent.Message)
+			event.DeliveryKey = WebhookDeliveryKey(claimedRow.ID)
 			if err := r.deliverWebhook(ctx, event); err != nil {
-				if serr := r.ledger.SetWebhookState(ctx, row.ID, "failed", now); serr != nil {
+				if serr := r.ledger.SetWebhookState(ctx, claimedRow.ID, "failed", now); serr != nil {
 					return serr
 				}
-				r.audit(ctx, "notify.webhook_failed", row, "webhook_failed")
+				r.audit(ctx, "notify.webhook_failed", claimedRow, "webhook_failed")
 				continue
 			}
-			if err := r.ledger.SetWebhookState(ctx, row.ID, "attempted", now); err != nil {
+			if err := r.ledger.SetWebhookState(ctx, claimedRow.ID, "attempted", now); err != nil {
 				return err
 			}
 		}

@@ -299,34 +299,44 @@ func filedWithImport(plan *Plan, result *ApplyResult) bool {
 // for what the desktop save did not already do. A save that did it records the
 // same event kinds with "with_import", so the job's activity, the batch report
 // and FollowUpRetrier all read one history whichever way the item was filed.
-// It records the completion marker last, on every path: the marker is what
-// tells maintenance that a process death, and not a policy, is why an import
-// carries no follow-up (see followUpsComplete).
-func (s *Service) followUp(ctx context.Context, plan *Plan, result *ApplyResult) {
+// It records the completion marker last, and only when every follow-up event
+// was durably recorded: a lost event with a committed marker would leave
+// maintenance with nothing to repair and lose the work (see followUpsComplete).
+func (s *Service) followUp(ctx context.Context, plan *Plan, result *ApplyResult) error {
 	durable := context.WithoutCancel(ctx)
-	defer s.recordFollowUpsComplete(ctx, plan.JobID)
+	if plan == nil || result == nil {
+		return nil
+	}
 	if filedWithImport(plan, result) {
-		_ = s.Bundle.Jobs.RecordEvent(durable, plan.JobID, followUpCollectionFiling, map[string]any{
+		if err := s.Bundle.Jobs.RecordEvent(durable, plan.JobID, followUpCollectionFiling, map[string]any{
 			"collection":     strings.TrimSpace(plan.Collection),
 			"collection_key": plan.CollectionKey,
 			"status":         "applied",
 			"with_import":    true,
-		})
-	} else {
-		s.fileCollection(ctx, plan, result)
+		}); err != nil {
+			return fmt.Errorf("recording Zotio collection filing: %w", err)
+		}
+	} else if _, err := s.fileCollection(ctx, plan, result); err != nil {
+		return err
 	}
 	if !plan.SavesDOIAndAbstract || !savedWithImport(plan, result) {
-		s.enrichAutoImportedParent(ctx, plan, result)
-		return
-	}
-	if s.autoEnrichApplies(ctx, plan, result) {
-		_ = s.Bundle.Jobs.RecordEvent(durable, plan.JobID, followUpEnrich, map[string]any{
+		if _, err := s.enrichAutoImportedParent(ctx, plan, result); err != nil {
+			return err
+		}
+	} else if s.autoEnrichApplies(ctx, plan, result) {
+		if err := s.Bundle.Jobs.RecordEvent(durable, plan.JobID, followUpEnrich, map[string]any{
 			"parent_key":  result.ParentKey,
 			"summary":     "saved DOI and abstract with the new item",
 			"status":      "applied",
 			"with_import": true,
-		})
+		}); err != nil {
+			return fmt.Errorf("recording Zotio enrich: %w", err)
+		}
 	}
+	if err := s.recordFollowUpsComplete(ctx, plan.JobID); err != nil {
+		return err
+	}
+	return nil
 }
 
 // desktopTargetMissing reports whether zotio refused a save-time filing
@@ -363,12 +373,15 @@ func desktopTargetMissing(raw json.RawMessage) bool {
 
 // deferCollectionFiling records that this job's item is filed after the
 // import instead of at save time. The record is what the next plan reads.
-func (s *Service) deferCollectionFiling(ctx context.Context, plan *Plan) {
-	_ = s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpCollectionFiling, map[string]any{
+func (s *Service) deferCollectionFiling(ctx context.Context, plan *Plan) error {
+	if err := s.Bundle.Jobs.RecordEvent(context.WithoutCancel(ctx), plan.JobID, followUpCollectionFiling, map[string]any{
 		"collection":     strings.TrimSpace(plan.Collection),
 		"collection_key": plan.CollectionKey,
 		"status":         filingDeferred,
 		"reason":         desktopTargetMissingReason,
 		"error_hint":     desktopTargetMissingHint,
-	})
+	}); err != nil {
+		return fmt.Errorf("recording deferred Zotio collection filing: %w", err)
+	}
+	return nil
 }

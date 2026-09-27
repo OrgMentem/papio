@@ -3109,6 +3109,33 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 			if err != nil {
 				return created, err
 			}
+			if classified {
+				// The ambiguous outcome lives on the old owner's event stream.
+				// Mirror it onto the new owner so a later retry, which only
+				// consults the current owner, stays in the bounded
+				// reconciliation loop instead of opening a human action after
+				// a single not_found_yet.
+				if _, newClassified, cerr := s.submissionFailureClass(ctx, row.ID, created.ID); cerr != nil {
+					return created, cerr
+				} else if !newClassified {
+					if rerr := s.Jobs.RecordEvent(ctx, row.ID, "delivery.submission_failure_classified", map[string]any{
+						"delivery_request_id": created.ID,
+						"class":               string(class),
+						"inherited_from":      oldJobID,
+					}); rerr != nil {
+						return created, rerr
+					}
+				}
+				if inherited := reconciliationAttemptCount(ctx, s.Jobs, oldJobID, created.ID); inherited > 0 {
+					if rerr := s.Jobs.RecordEvent(ctx, row.ID, "delivery.reconciliation_attempt", map[string]any{
+						"delivery_request_id": created.ID,
+						"attempt":             inherited,
+						"inherited_from":      oldJobID,
+					}); rerr != nil {
+						return created, rerr
+					}
+				}
+			}
 			if classified && class != illiad.FailurePreSend {
 				if class == illiad.FailureAmbiguous {
 					return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
@@ -3305,7 +3332,12 @@ func reconciliationAttemptCount(ctx context.Context, jobs *job.Store, jobID stri
 		}
 		detail, _ := event["detail"].(map[string]any)
 		id, _ := detail["delivery_request_id"].(float64)
-		if int64(id) == requestID {
+		if int64(id) != requestID {
+			continue
+		}
+		if attempt, ok := detail["attempt"].(float64); ok && int(attempt) > count {
+			count = int(attempt)
+		} else if !ok {
 			count++
 		}
 	}

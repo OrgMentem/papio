@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -901,6 +902,63 @@ func TestCredentialConfigCorruptJournalFailsClosed(t *testing.T) {
 			}
 			f.assertNoSecret(err, "original-private")
 		})
+	}
+}
+
+func TestPendingCredentialJournalIsScopedToConfig(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.toml")
+	second := filepath.Join(dir, "second.toml")
+	ref := "keyring:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := journalPendingCredential(first, ref, "sources.openalex"); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCredentialPath(first) == pendingCredentialPath(second) {
+		t.Fatal("two configs share a pending credential journal")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pendingCredentialPath(relative) != pendingCredentialPath(first) {
+		t.Fatal("relative and absolute config paths use different journals")
+	}
+	if entries, err := readPendingCredentials(second); err != nil || len(entries) != 0 {
+		t.Fatalf("second config sees first config's credential: %+v, %v", entries, err)
+	}
+	if err := clearPendingCredential(second, ref); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := readPendingCredentials(first); err != nil || len(entries) != 1 || entries[0].Reference != ref {
+		t.Fatalf("first config lost its pending reference: %+v, %v", entries, err)
+	}
+}
+
+func TestPendingCredentialJournalSerializesConcurrentWriters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	const writers = 32
+	start := make(chan struct{})
+	failures := make(chan error, writers)
+	for i := range writers {
+		go func() {
+			<-start
+			ref := fmt.Sprintf("keyring:%032x", i)
+			failures <- journalPendingCredential(path, ref, "sources.openalex")
+		}()
+	}
+	close(start)
+	for range writers {
+		if err := <-failures; err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := readPendingCredentials(path)
+	if err != nil || len(entries) != writers {
+		t.Fatalf("concurrent journal entries = %d, err = %v; want %d", len(entries), err, writers)
 	}
 }
 

@@ -4,6 +4,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"regexp"
 	"strings"
@@ -31,6 +32,112 @@ func (l *routerLedger) Upsert(_ context.Context, r Record) (Record, error) {
 			if old.DesktopState == "pending" || old.DesktopState == "held" {
 				old.Intent.Detail = r.Intent.Detail
 			}
+			l.rows[id] = old
+			return old, nil
+		}
+	}
+	l.next++
+	r.ID = l.next
+	if r.Count == 0 {
+		r.Count = 1
+	}
+	if r.DesktopState == "" {
+		r.DesktopState = "pending"
+	}
+	if r.WebhookState == "" {
+		r.WebhookState = "pending"
+	}
+	l.rows[r.ID] = r
+	return r, nil
+}
+
+func sameFakeWebhookIdentity(a, b Record) bool {
+	return a.Intent.Category == b.Intent.Category && a.Intent.EventKind == b.Intent.EventKind && a.Intent.AggregateKey == b.Intent.AggregateKey && a.Intent.Phase == b.Intent.Phase
+}
+
+func isFakePureReplay(stored, incoming Record) bool {
+	a, aErr := json.Marshal(stored.Intent.Detail)
+	b, bErr := json.Marshal(incoming.Intent.Detail)
+	if aErr != nil || bErr != nil || string(a) != string(b) {
+		return false
+	}
+	if stored.Count != incoming.Count {
+		return false
+	}
+	if stored.Intent.JobID != incoming.Intent.JobID || stored.Intent.BatchID != incoming.Intent.BatchID || stored.Intent.ScanID != incoming.Intent.ScanID {
+		return false
+	}
+	return !incoming.LastAt.After(stored.LastAt)
+}
+
+func (l *routerLedger) UpsertWebhookGeneration(ctx context.Context, r Record) (Record, error) {
+	for id, old := range l.rows {
+		if sameFakeWebhookIdentity(old, r) && old.Intent.WindowStart.Equal(r.Intent.WindowStart) {
+			if old.WebhookState == "" || old.WebhookState == "pending" {
+				old.Count += r.Count
+				old.LastAt = r.LastAt
+				old.Intent.Detail = r.Intent.Detail
+				l.rows[id] = old
+				return old, nil
+			}
+			// Mirror the store rule: a byte-identical retry of the
+			// same event returns the stored generation in any
+			// non-pending state, while any event with a later LastAt
+			// queues a new generation. The search covers the identity
+			// row and every existing generation window.
+			if isFakePureReplay(old, r) {
+				return old, nil
+			}
+			for offset := int64(1); ; offset++ {
+				candidate := r.Intent.WindowStart.Add(time.Duration(offset) * time.Nanosecond)
+				var matched *Record
+				free := true
+				for _, generation := range l.rows {
+					if sameFakeWebhookIdentity(generation, r) && generation.Intent.WindowStart.Equal(candidate) {
+						free = false
+						if isFakePureReplay(generation, r) {
+							found := generation
+							matched = &found
+						}
+						break
+					}
+				}
+				if matched != nil {
+					return *matched, nil
+				}
+				if free {
+					l.next++
+					r.ID = l.next
+					r.Intent.WindowStart = candidate
+					if r.Count == 0 {
+						r.Count = 1
+					}
+					if r.DesktopState == "" {
+						r.DesktopState = "pending"
+					}
+					if r.WebhookState == "" {
+						r.WebhookState = "pending"
+					}
+					l.rows[r.ID] = r
+					return r, nil
+				}
+			}
+		}
+	}
+	return l.Upsert(ctx, r)
+}
+
+func (l *routerLedger) UpsertPendingDigest(_ context.Context, r Record) (Record, error) {
+	for id, old := range l.rows {
+		if old.Intent.Category == r.Intent.Category && old.Intent.EventKind == r.Intent.EventKind && old.Intent.AggregateKey == r.Intent.AggregateKey && old.Intent.Phase == r.Intent.Phase && old.Intent.WindowStart.Equal(r.Intent.WindowStart) {
+			if old.DesktopState != "pending" && old.DesktopState != "held" && old.WebhookState != "pending" {
+				return old, nil
+			}
+			old.Count = r.Count
+			old.LastAt = r.LastAt
+			old.AvailableAt = r.AvailableAt
+			old.Intent.Detail = r.Intent.Detail
+			old.Intent.Message = r.Intent.Message
 			l.rows[id] = old
 			return old, nil
 		}
@@ -114,20 +221,28 @@ func (l *routerLedger) SetDesktopState(_ context.Context, id int64, state string
 	l.rows[id] = r
 	return true, nil
 }
-func (l *routerLedger) ClaimWebhook(_ context.Context, id int64) (bool, error) {
+func (l *routerLedger) ClaimWebhook(_ context.Context, id int64) (Record, bool, error) {
 	r, ok := l.rows[id]
 	if !ok || r.WebhookState != "pending" {
-		return false, nil
+		return Record{}, false, nil
 	}
 	r.WebhookState = "sending"
 	l.rows[id] = r
-	return true, nil
+	return r, true, nil
 }
 func (l *routerLedger) SetWebhookState(_ context.Context, id int64, state string, _ time.Time) error {
 	r := l.rows[id]
 	r.WebhookState = state
 	l.rows[id] = r
 	return nil
+}
+
+func (l *routerLedger) GetByID(_ context.Context, id int64) (Record, error) {
+	r, ok := l.rows[id]
+	if !ok {
+		return Record{}, errors.New("notification row not found")
+	}
+	return r, nil
 }
 func (l *routerLedger) SetDesktopAvailable(_ context.Context, id int64, _ time.Time) error {
 	if l.failSetDesktopAvailable != nil {
@@ -970,14 +1085,22 @@ func immediateTestPolicy() Policy {
 }
 
 func immediateTestIntent(now time.Time) Intent {
+	return immediateTestIntentAt(now, now)
+}
+
+func immediateTestIntentAt(window, happened time.Time) Intent {
 	return Intent{EventKind: "request.outcome", Category: CategoryRequestOutcome, AggregateKey: "job:1",
-		Phase: PhaseTerminal, WindowStart: now, HappenedAt: now,
+		Phase: PhaseTerminal, WindowStart: window, HappenedAt: happened,
 		Message: "Request finished — open the papio inbox",
 		Detail:  Event{Kind: "request.outcome", Message: "Request finished — open the papio inbox", Count: 1}}
 }
 
-// A replayed immediate intent must not POST twice: the second Route sees the
-// claimed row and skips delivery.
+// A replayed immediate intent is the same event twice: the generation upsert
+// returns the in-flight generation without queueing a new one, and the lost
+// claim skips delivery, so exactly one POST leaves the row. The replay runs
+// while the first generation is still sending; a distinct second decision
+// with an identical payload but a later HappenedAt is a new event and opens
+// a new generation (see TestIdenticalPayloadAfterClaimOpensNewGeneration).
 func TestImmediateWebhookReplayPostsOnce(t *testing.T) {
 	ctx := context.Background()
 	db, err := openTestStore(ctx, t)
@@ -986,20 +1109,30 @@ func TestImmediateWebhookReplayPostsOnce(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	webhook := &recordingEventSender{}
-	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	ledger := NewStoreLedger(db)
+	webhook := &blockingEventSender{ch: make(chan Event, 8), release: make(chan struct{}, 8)}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
 	intent := immediateTestIntent(now)
+	done := make(chan error, 1)
+	go func() { done <- router.Route(ctx, intent) }()
+	// Wait for the winner's claim snapshot to be in flight, then replay
+	// the identical intent while the webhook leg is still sending.
+	first := <-webhook.ch
 	if err := router.Route(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
-	if err := router.Route(ctx, intent); err != nil {
+	webhook.release <- struct{}{}
+	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+	if n := countIntentRows(t, db); n != 1 {
+		t.Fatalf("ledger rows = %d, want the single in-flight generation", n)
 	}
 	if len(webhook.events) != 1 {
 		t.Fatalf("webhook events = %d, want exactly one POST for a replayed intent", len(webhook.events))
 	}
-	if got := webhook.events[0].DeliveryKey; got == "" {
-		t.Fatal("immediate POST carries no stable delivery key")
+	if got := webhook.events[0].DeliveryKey; got == "" || got != first.DeliveryKey {
+		t.Fatalf("delivery key = %q, want the stable key %q", webhook.events[0].DeliveryKey, first.DeliveryKey)
 	}
 	rows, err := NewStoreLedger(db).DueWebhook(ctx, now.Add(time.Hour), 10)
 	if err != nil {
@@ -1010,8 +1143,113 @@ func TestImmediateWebhookReplayPostsOnce(t *testing.T) {
 	}
 }
 
-// Concurrent immediate Routes for the same identity share one ledger row and
-// one claim, so only one POST leaves the process.
+// A producer retry after the first generation settles is the exact same
+// event: the generation upsert returns the settled row, the lost claim
+// skips delivery, and the key POSTs once across both Routes.
+func TestImmediateWebhookSettledRetryPostsOnce(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := NewStoreLedger(db)
+	webhook := &recordingEventSender{}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	intent := immediateTestIntent(now)
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	// Producer crashes before its marker and retries the identical
+	// intent: same identity, HappenedAt, count, and payload.
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %d, want exactly one POST for a settled retry", len(webhook.events))
+	}
+	if got := webhook.events[0].DeliveryKey; got == "" {
+		t.Fatal("settled POST carries no stable delivery key")
+	}
+	if n := countIntentRows(t, db); n != 1 {
+		t.Fatalf("ledger rows = %d, want the single settled generation", n)
+	}
+}
+
+// A distinct second decision with an identical payload is a new event, not
+// a replay: it carries a later HappenedAt, so the generation upsert must
+// queue a fresh generation with its own key instead of suppressing it.
+func TestIdenticalPayloadAfterClaimOpensNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := NewStoreLedger(db)
+	webhook := &recordingEventSender{}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	intent := immediateTestIntent(now)
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %d, want the first generation", len(webhook.events))
+	}
+	// Same payload bytes and count as the settled generation, but a later
+	// HappenedAt: a distinct second decision the ledger must not drop.
+	second := immediateTestIntent(now.Add(time.Minute))
+	if err := router.Route(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 2 {
+		t.Fatalf("webhook events = %d, want the settled generation plus the distinct second decision", len(webhook.events))
+	}
+	first, next := webhook.events[0], webhook.events[1]
+	if first.DeliveryKey == "" || next.DeliveryKey == "" || first.DeliveryKey == next.DeliveryKey {
+		t.Fatalf("delivery keys = %q/%q, want two distinct generation keys", first.DeliveryKey, next.DeliveryKey)
+	}
+	if total := first.Count + next.Count; total != 2 {
+		t.Fatalf("total delivered = %d, want 2 across both generations", total)
+	}
+	if n := countIntentRows(t, db); n != 2 {
+		t.Fatalf("ledger rows = %d, want two generations", n)
+	}
+}
+
+func countIntentRows(t *testing.T, db *store.Store) int {
+	t.Helper()
+	var n int
+	if err := db.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM notification_intents`).Scan(&n); err != nil {
+		t.Fatalf("counting notification rows: %v", err)
+	}
+	return n
+}
+
+// blockingEventSender holds each POST open until the test releases it, so
+// the test can Route a replay while the first generation is still sending.
+type blockingEventSender struct {
+	ch      chan Event
+	release chan struct{}
+	events  []Event
+}
+
+func (s *blockingEventSender) Send(_ context.Context, _ string) {}
+
+func (s *blockingEventSender) SendEventResult(_ context.Context, event Event) error {
+	s.events = append(s.events, event)
+	s.ch <- event
+	<-s.release
+	return nil
+}
+
+// Concurrent immediate Routes are competing producers, so each Route is one
+// new event: the first claims the identity generation, and every later
+// Route that finds the identity claimed or settled queues a fresh
+// generation with its own key. Each key POSTs exactly once and the counts
+// across keys total the eight concurrent events.
 func TestImmediateWebhookConcurrentRoutesPostOnce(t *testing.T) {
 	ctx := context.Background()
 	db, err := openTestStore(ctx, t)
@@ -1022,18 +1260,37 @@ func TestImmediateWebhookConcurrentRoutesPostOnce(t *testing.T) {
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	webhook := &recordingEventSender{}
 	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
-	intent := immediateTestIntent(now)
 	var wg sync.WaitGroup
-	for range 8 {
+	for i := range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = router.Route(ctx, intent)
+			// Distinct WindowStart per producer keeps the eight events in
+			// eight generations: the replay rule matches only the exact
+			// same event, so distinct starts never collapse into one.
+			_ = router.Route(ctx, immediateTestIntentAt(now.Add(time.Duration(i)*time.Microsecond), now.Add(time.Duration(i)*time.Microsecond)))
 		}()
 	}
 	wg.Wait()
-	if len(webhook.events) != 1 {
-		t.Fatalf("webhook events = %d, want one POST for eight concurrent Routes", len(webhook.events))
+	if len(webhook.events) == 0 {
+		t.Fatal("webhook events = 0, want coverage for eight concurrent Routes")
+	}
+	seen := map[string]int{}
+	total := 0
+	for i, event := range webhook.events {
+		if event.DeliveryKey == "" {
+			t.Fatalf("webhook event %d carries no stable delivery key", i)
+		}
+		seen[event.DeliveryKey]++
+		total += event.Count
+	}
+	for key, posts := range seen {
+		if posts != 1 {
+			t.Fatalf("delivery key %q POSTed %d times, want exactly once per key", key, posts)
+		}
+	}
+	if total != 8 {
+		t.Fatalf("total delivered = %d, want 8: every concurrent Route's event exactly once", total)
 	}
 }
 
@@ -1066,7 +1323,7 @@ func TestDigestWebhookClaimPreventsRestartDuplicate(t *testing.T) {
 		t.Fatalf("pending digest rows = %d, want one", len(due))
 	}
 	// Simulate a crash after the claim but before the POST settled.
-	claimed, err := ledger.ClaimWebhook(ctx, due[0].ID)
+	_, claimed, err := ledger.ClaimWebhook(ctx, due[0].ID)
 	if err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
@@ -1191,5 +1448,324 @@ func TestDigestWebhookFailureSettlesFailedState(t *testing.T) {
 	}
 	if got := webhookStateColumn(t, db, id); got != "failed" {
 		t.Fatalf("digest webhook_state = %q, want failed so the outage stays visible", got)
+	}
+}
+
+// A concurrent Route can coalesce another event into the same decision_opened
+// row after the winner's Upsert returns but before its webhook claim wins.
+// The winner must send the claimed row's authoritative count, not the stale
+// Upsert snapshot, because the loser of the claim sends nothing.
+type mergeBeforeClaimLedger struct {
+	*routerLedger
+	merge  func(id int64)
+	merged bool
+}
+
+func (l *mergeBeforeClaimLedger) ClaimWebhook(ctx context.Context, id int64) (Record, bool, error) {
+	if !l.merged && l.merge != nil {
+		l.merged = true
+		l.merge(id)
+	}
+	return l.routerLedger.ClaimWebhook(ctx, id)
+}
+
+func TestImmediateWebhookSendsClaimedCountAfterConcurrentMerge(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	window := now.Add(-5 * time.Minute)
+	base := newRouterLedger()
+	ledger := &mergeBeforeClaimLedger{routerLedger: base}
+	webhook := &recordingEventSender{}
+	policy := Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+		CategoryDecisionOpened: {Desktop: "off", Webhook: "immediate", Window: 5 * time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return now }})
+	intent := Intent{EventKind: "action.opened", Category: CategoryDecisionOpened, AggregateKey: "decision:interleave",
+		Phase: PhaseOpened, WindowStart: window, HappenedAt: now,
+		Message: "1 paper needs you — open the papio inbox",
+		Detail:  Event{Kind: "action.opened", Message: "1 paper needs you — open the papio inbox", Count: 1}}
+	// The losing concurrent Route merges its event after the winner's Upsert
+	// snapshot but before the winner's claim.
+	ledger.merge = func(id int64) {
+		r := base.rows[id]
+		r.Count++
+		detail := r.Intent.Detail
+		detail.Count = r.Count
+		r.Intent.Detail = detail
+		base.rows[id] = r
+	}
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %d, want one POST covering both merged intents", len(webhook.events))
+	}
+	if got := webhook.events[0].Count; got != 2 {
+		t.Fatalf("webhook count = %d, want 2 from the claimed row, not the stale Upsert snapshot of 1", got)
+	}
+	if got, want := webhook.events[0].Message, "2 papers need you — open the papio inbox"; got != want {
+		t.Fatalf("webhook message = %q, want %q", got, want)
+	}
+}
+
+// A crash between the reminder Route and its markers retries the identical
+// absolute total. The pending digest must replace the count, not add it,
+// so the retry stays at 2 instead of inflating to 4.
+func TestPendingDigestRetryReplacesInsteadOfAdding(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	policy := Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+		CategoryDecisionPending: {Desktop: "digest", Webhook: "off", Window: 4 * time.Hour},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Policy: policy, Now: func() time.Time { return now }})
+	intent := Intent{EventKind: "action.reminder", Category: CategoryDecisionPending, AggregateKey: "actions:pending",
+		Phase: PhaseReminder, WindowStart: now, HappenedAt: now,
+		Message: "reminder", Detail: Event{Kind: "action.reminder", Message: "reminder", Count: 2}}
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	// Crash before markers: the next pass sees the same due set and routes
+	// the identical snapshot again.
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(ledger.rows) != 1 {
+		t.Fatalf("ledger rows = %d, want one snapshot row", len(ledger.rows))
+	}
+	for _, row := range ledger.rows {
+		if row.Count != 2 {
+			t.Fatalf("pending digest count = %d, want 2 after an identical retry, not 4", row.Count)
+		}
+	}
+}
+
+// The production snapshot path replaces through the store: two identical
+// Routes keep the row at the absolute total.
+func TestStorePendingDigestRetryKeepsAbsoluteTotal(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := NewStoreLedger(db)
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	rec := Record{Intent: Intent{EventKind: "action.reminder", Category: CategoryDecisionPending, AggregateKey: "actions:pending",
+		Phase: PhaseReminder, WindowStart: now, HappenedAt: now, Message: "reminder",
+		Detail: Event{Kind: "action.reminder", Message: "reminder", Count: 2}},
+		FirstAt: now, LastAt: now, AvailableAt: now, Count: 2, DesktopState: "pending", WebhookState: "pending"}
+	if _, err := ledger.UpsertPendingDigest(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledger.UpsertPendingDigest(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := ledger.DueDesktop(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("pending digest rows = %d, want one snapshot row", len(rows))
+	}
+	if rows[0].Count != 2 {
+		t.Fatalf("pending digest count = %d, want the absolute total 2, not 4", rows[0].Count)
+	}
+}
+
+// A Route that lands after the winner's webhook claim must not rewrite the
+// claimed snapshot and must not be lost: the fake ledger mirrors the store
+// redirect below by queueing the late event as a fresh generation row with
+// its own key. The winner POSTs only the immutable claim snapshot; the new
+// generation drains separately with a distinct key, and the two counts sum
+// to the full total.
+type postClaimRedirectLedger struct {
+	*routerLedger
+	redirected *Record
+}
+
+func (l *postClaimRedirectLedger) UpsertWebhookGeneration(ctx context.Context, r Record) (Record, error) {
+	rec, err := l.routerLedger.UpsertWebhookGeneration(ctx, r)
+	if err != nil {
+		return Record{}, err
+	}
+	if len(l.rows) > 1 {
+		for id, old := range l.rows {
+			if id == rec.ID {
+				redirected := old
+				l.redirected = &redirected
+				break
+			}
+		}
+	}
+	return rec, nil
+}
+
+type mergeAfterClaimSender struct {
+	events []Event
+}
+
+func (s *mergeAfterClaimSender) Send(_ context.Context, _ string) {}
+
+func (s *mergeAfterClaimSender) SendEventResult(_ context.Context, event Event) error {
+	s.events = append(s.events, event)
+	return nil
+}
+
+func TestImmediateWebhookPostClaimMergeQueuesNewGeneration(t *testing.T) {
+	// Deterministic by construction: drive the winner, then drive the loser
+	// after the winner settled, and assert the generation upsert redirected
+	// the late event instead of rewriting the claimed snapshot.
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	window := now.Add(-5 * time.Minute)
+	ledger := &postClaimRedirectLedger{routerLedger: newRouterLedger()}
+	sender := &mergeAfterClaimSender{}
+	// Quiet-like preset: the desktop leg stays pending so only the webhook
+	// claim makes the row immutable, while the webhook is immediate.
+	policy := Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+		CategoryDecisionOpened: {Desktop: "digest", Webhook: "immediate", Window: 5 * time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: sender, Policy: policy, Now: func() time.Time { return now }})
+	intent := Intent{EventKind: "action.opened", Category: CategoryDecisionOpened, AggregateKey: "decision:postclaim",
+		Phase: PhaseOpened, WindowStart: window, HappenedAt: now,
+		Message: "1 paper needs you — open the papio inbox",
+		Detail:  Event{Kind: "action.opened", Message: "1 paper needs you — open the papio inbox", Count: 1}}
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.events) != 1 || sender.events[0].Count != 1 {
+		t.Fatalf("winner events = %#v, want the single immutable claim snapshot with count 1", sender.events)
+	}
+	// The loser lands after the winner settled: same identity, same event.
+	// The generation upsert must redirect it to a new generation row with
+	// its own key instead of rewriting the claimed snapshot.
+	secondIntent := intent
+	secondIntent.HappenedAt = now.Add(time.Minute)
+	if err := router.Route(ctx, secondIntent); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.redirected == nil {
+		t.Fatal("post-claim merge did not redirect to a new generation row")
+	}
+	if len(sender.events) != 2 {
+		t.Fatalf("webhook events = %d, want the claim snapshot plus the redirected generation", len(sender.events))
+	}
+	first, second := sender.events[0], sender.events[1]
+	if first.Count != 1 || second.Count != 1 {
+		t.Fatalf("webhook counts = %d/%d, want 1/1: immutable snapshot plus one new generation", first.Count, second.Count)
+	}
+	if first.DeliveryKey == "" || second.DeliveryKey == "" {
+		t.Fatal("both POSTs must carry stable delivery keys")
+	}
+	if first.DeliveryKey == second.DeliveryKey {
+		t.Fatalf("delivery keys = %q twice, want distinct keys per generation", first.DeliveryKey)
+	}
+	if total := first.Count + second.Count; total != 2 {
+		t.Fatalf("total delivered = %d, want 2 across both generations", total)
+	}
+	if got, want := second.Message, "1 paper needs you — open the papio inbox"; got != want {
+		t.Fatalf("generation message = %q, want %q", got, want)
+	}
+}
+
+// End-to-end post-claim timing on decision_opened: the first Route claims and
+// POSTs the immutable snapshot while the desktop leg stays pending, a second
+// Route merges after the claim and must not rewrite the claimed payload, and
+// the late event drains under its own delivery key. Both keys POST exactly
+// once and the counts total the full set.
+func TestDecisionOpenedPostClaimMergeDeliversTwoKeys(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &recordingEventSender{}
+	ledger := NewStoreLedger(db)
+	policy := Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+		CategoryDecisionOpened: {Desktop: "digest", Webhook: "immediate", Window: 5 * time.Minute},
+	}}
+	window := now.Add(-5 * time.Minute)
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return now }})
+	first := Intent{EventKind: "action.opened", Category: CategoryDecisionOpened, AggregateKey: "decision:two-keys",
+		Phase: PhaseOpened, WindowStart: window, HappenedAt: now,
+		Message: "1 paper needs you — open the papio inbox",
+		Detail:  Event{Kind: "action.opened", Message: "1 paper needs you — open the papio inbox", Count: 1}}
+	if err := router.Route(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.HappenedAt = now.Add(time.Minute)
+	if err := router.Route(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 2 {
+		t.Fatalf("webhook events = %d, want the claim snapshot plus the redirected generation", len(webhook.events))
+	}
+	seen := map[string]int{}
+	total := 0
+	for i, event := range webhook.events {
+		if event.DeliveryKey == "" {
+			t.Fatalf("webhook event %d carries no stable delivery key", i)
+		}
+		seen[event.DeliveryKey]++
+		total += event.Count
+	}
+	for key, posts := range seen {
+		if posts != 1 {
+			t.Fatalf("delivery key %q POSTed %d times, want exactly once per key", key, posts)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("delivery keys = %d, want two generations with distinct keys", len(seen))
+	}
+	if total != 2 {
+		t.Fatalf("total delivered = %d, want 2 across both generations", total)
+	}
+}
+
+// A second Route after the first generation settled opens a new generation
+// under its own key; the two keys total both events exactly once.
+func TestImmediateWebhookSecondRouteOpensNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	window := now.Add(-5 * time.Minute)
+	ledger := newRouterLedger()
+	webhook := &recordingEventSender{}
+	policy := Policy{MaxPerHour: 10, Categories: map[Category]CategoryPolicy{
+		CategoryDecisionOpened: {Desktop: "off", Webhook: "immediate", Window: 5 * time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return now }})
+	intent := Intent{EventKind: "action.opened", Category: CategoryDecisionOpened, AggregateKey: "decision:preclaim",
+		Phase: PhaseOpened, WindowStart: window, HappenedAt: now,
+		Message: "1 paper needs you — open the papio inbox",
+		Detail:  Event{Kind: "action.opened", Message: "1 paper needs you — open the papio inbox", Count: 1}}
+	if err := router.Route(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events = %d, want the single claim snapshot", len(webhook.events))
+	}
+	key := webhook.events[0].DeliveryKey
+	if key == "" {
+		t.Fatal("claim snapshot carries no stable delivery key")
+	}
+	// The claim settled the first generation, so the second Route opens a
+	// new generation under its own key; the two keys total both events.
+	second := intent
+	second.HappenedAt = now.Add(time.Minute)
+	if err := router.Route(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 2 {
+		t.Fatalf("webhook events = %d, want the claim plus the next generation", len(webhook.events))
+	}
+	if webhook.events[1].DeliveryKey == "" || webhook.events[1].DeliveryKey == key {
+		t.Fatalf("second key = %q, want a distinct generation key after the claim settled", webhook.events[1].DeliveryKey)
+	}
+	if total := webhook.events[0].Count + webhook.events[1].Count; total != 2 {
+		t.Fatalf("total delivered = %d, want 2 across both generations", total)
 	}
 }

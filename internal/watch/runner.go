@@ -406,6 +406,33 @@ func (r *Runner) routeChecked(ctx context.Context, intent notify.Intent) error {
 	return r.Notifier.Route(context.WithoutCancel(ctx), intent)
 }
 
+// deliverPendingDigestAlerts routes one alert for every pending digest entry
+// without a durable alert receipt and records the receipts only after the
+// route succeeds. It is the shared catch-up path for both a scan that just
+// recorded new entries and a scan that found nothing new: stranded entries
+// from a failed route must be retried even when later scans report no hits
+// or only owned work, which otherwise return early without routing.
+func (r *Runner) deliverPendingDigestAlerts(ctx context.Context, watch Watch, runStart time.Time) error {
+	pending, err := r.Store.UnalertedDigestEntries(ctx, watch.ID)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	if err := r.routeChecked(ctx, r.alertIntent(watch, pending, runStart)); err != nil {
+		return fmt.Errorf("routing watch alert: %w", err)
+	}
+	keys := make([]string, 0, len(pending))
+	for _, entry := range pending {
+		keys = append(keys, entry.WorkKey)
+	}
+	if err := r.Store.MarkDigestAlerted(ctx, watch.ID, keys, runStart); err != nil {
+		return err
+	}
+	return nil
+}
+
 // searchDiscovery runs the configured discovery source, preferring partial
 // results when the source can report per-backend failures. A plain Search
 // source keeps its old behavior: usable results or a hard error.
@@ -460,16 +487,24 @@ func (r *Runner) watchIntent(watch Watch, runStart time.Time, event notify.Event
 // Route but a lost receipt (crash between the two) re-routes the same alert,
 // and a run-start-derived identity would make that a fresh ledger row and a
 // second webhook POST. The identity is therefore derived from the pending set
-// itself: the aggregate key hashes the sorted pending work keys, and the
-// window is the earliest first sighting among them. The same pending entries
-// then coalesce into the same notification row, whose at-most-once webhook
-// claim rejects the second dispatch; a genuinely different pending set is a
-// different generation and alerts on its own.
+// itself: the aggregate key hashes the sorted pending digest row IDs, and the
+// window is the earliest first sighting among them. Row IDs survive
+// RecordDigest key rewrites (title key to DOI), where work keys move: a retry
+// after a key upgrade hashes the same row and coalesces into the same
+// notification row, whose at-most-once webhook claim rejects the second
+// dispatch. Distinct rows keep distinct IDs even when they share a title, so
+// a genuinely different pending set is a different generation and alerts on
+// its own. Entries without a row ID (synthetic, never routed) fall back to
+// their work keys.
 func (r *Runner) alertIntent(watch Watch, pending []DigestEntry, runStart time.Time) notify.Intent {
 	keys := make([]string, 0, len(pending))
 	windowStart := time.Time{}
 	for _, entry := range pending {
-		keys = append(keys, entry.WorkKey)
+		if entry.rowID != 0 {
+			keys = append(keys, fmt.Sprintf("row:%d", entry.rowID))
+		} else {
+			keys = append(keys, entry.WorkKey)
+		}
 		seen, err := time.Parse(time.RFC3339Nano, entry.FirstSeenAt)
 		if err != nil {
 			continue
@@ -548,6 +583,11 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	}
 	requests := requestsForDiscoveredWithWork(works)
 	if len(requests) == 0 {
+		if watch.Mode == ModeAlert {
+			if err := r.deliverPendingDigestAlerts(ctx, watch, runStart); err != nil {
+				return result, err
+			}
+		}
 		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
 	}
 	var queued []discoveredRequest
@@ -595,6 +635,11 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		}
 	}
 	if len(queued) == 0 {
+		if watch.Mode == ModeAlert {
+			if err := r.deliverPendingDigestAlerts(ctx, watch, runStart); err != nil {
+				return result, err
+			}
+		}
 		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
 	}
 	if watch.Mode == ModeAlert {
@@ -615,22 +660,12 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		// stranded by an earlier run — route one alert for them, and record
 		// the receipt only after the route succeeds. A failed route returns
 		// before MarkRun so the run is recorded as a failure and the stranded
-		// entries are retried without rediscovery on the next cadence.
-		pending, err := r.Store.UnalertedDigestEntries(ctx, watch.ID)
-		if err != nil {
+		// entries are retried without rediscovery on the next cadence. The
+		// same catch-up runs when this scan finds nothing new (the early
+		// returns above), so a failed route is retried even when later scans
+		// report no hits or only owned work.
+		if err := r.deliverPendingDigestAlerts(ctx, watch, runStart); err != nil {
 			return result, err
-		}
-		if len(pending) > 0 {
-			if err := r.routeChecked(ctx, r.alertIntent(watch, pending, runStart)); err != nil {
-				return result, fmt.Errorf("routing watch alert: %w", err)
-			}
-			keys := make([]string, 0, len(pending))
-			for _, entry := range pending {
-				keys = append(keys, entry.WorkKey)
-			}
-			if err := r.Store.MarkDigestAlerted(ctx, watch.ID, keys, runStart); err != nil {
-				return result, err
-			}
 		}
 		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
 	}

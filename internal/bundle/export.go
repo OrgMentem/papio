@@ -375,11 +375,18 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	artifactPath := filepath.Join(destination, filepath.FromSlash(b.Artifact.Path))
 	bundlePath := filepath.Join(destination, "bundle.json")
 	var artifactCreated bool
+	var artifactBackup string
 	rollback := func(primary error, bundleCreated bool) (string, *protocol.AcquisitionBundle, error) {
+		var restoreErr error
+		dropArtifact := artifactCreated
+		if artifactBackup != "" {
+			restoreErr = os.Rename(artifactBackup, artifactPath)
+			dropArtifact = false
+		}
 		cleanupErr := cleanupExport(destination, artifactsDir, artifactPath, bundlePath,
-			destinationExisted, artifactsDirExisted, artifactCreated, bundleCreated)
-		if cleanupErr != nil {
-			return "", nil, fmt.Errorf("exporting bundle: %w", errors.Join(primary, cleanupErr))
+			destinationExisted, artifactsDirExisted, dropArtifact, bundleCreated)
+		if restoreErr != nil || cleanupErr != nil {
+			return "", nil, fmt.Errorf("exporting bundle: %w", errors.Join(primary, restoreErr, cleanupErr))
 		}
 		return "", nil, primary
 	}
@@ -406,7 +413,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if exportPreMaterializeHook != nil {
 		exportPreMaterializeHook()
 	}
-	artifactCreated, err = materializeArtifact(art.Path, artifactPath, art.SHA256)
+	artifactCreated, artifactBackup, err = materializeArtifact(art.Path, artifactPath, art.SHA256)
 	if err != nil {
 		return rollback(err, false)
 	}
@@ -421,7 +428,11 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 		if bundleExisted {
 			restoreErr := atomicWrite(bundlePath, oldBundle, 0o600)
 			var cleanupErr error
-			if artifactCreated {
+			if artifactBackup != "" {
+				if rerr := os.Rename(artifactBackup, artifactPath); rerr != nil {
+					cleanupErr = rerr
+				}
+			} else if artifactCreated {
 				if rmErr := os.Remove(artifactPath); rmErr != nil && !os.IsNotExist(rmErr) {
 					cleanupErr = rmErr
 				}
@@ -435,6 +446,11 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 			return "", nil, err
 		}
 		return rollback(err, true)
+	}
+	if artifactBackup != "" {
+		if rmErr := os.Remove(artifactBackup); rmErr != nil && !os.IsNotExist(rmErr) {
+			return "", nil, fmt.Errorf("exporting bundle: %w", errors.Join(rmErr))
+		}
 	}
 	return bundlePath, b, nil
 }
@@ -450,10 +466,11 @@ func digest(b *protocol.AcquisitionBundle) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-func materializeArtifact(source, target, expectedSHA string) (created bool, retErr error) {
+func materializeArtifact(source, target, expectedSHA string) (created bool, backup string, retErr error) {
+	healed := false
 	if info, err := os.Lstat(target); err == nil {
 		if info.IsDir() {
-			return false, fmt.Errorf("existing bundle artifact %s is a directory", target)
+			return false, "", fmt.Errorf("existing bundle artifact %s is a directory", target)
 		}
 		if !info.Mode().IsRegular() {
 			// Preserve immutability contract: a symlink (or other non-regular
@@ -462,12 +479,12 @@ func materializeArtifact(source, target, expectedSHA string) (created bool, retE
 			// failing, so the bundle always owns its bytes. Removing the link
 			// never touches the link target.
 			if rmErr := os.Remove(target); rmErr != nil {
-				return false, fmt.Errorf("existing bundle artifact %s is not a regular file (%s) and could not be replaced: %w", target, info.Mode().String(), rmErr)
+				return false, "", fmt.Errorf("existing bundle artifact %s is not a regular file (%s) and could not be replaced: %w", target, info.Mode().String(), rmErr)
 			}
 		} else {
 			if got, _, err := artifact.HashFile(target); err == nil {
 				if got == expectedSHA {
-					return false, nil
+					return false, "", nil
 				}
 				// A mismatch heals only when the existing file is provably a
 				// truncated copy of this source: a strict prefix shorter than
@@ -476,21 +493,22 @@ func materializeArtifact(source, target, expectedSHA string) (created bool, retE
 				// export fails.
 				partial, perr := isLegacyPartial(source, target)
 				if perr != nil {
-					return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s (partial check: %w)", target, got, expectedSHA, perr)
+					return false, "", fmt.Errorf("existing bundle artifact %s has hash %s, want %s (partial check: %w)", target, got, expectedSHA, perr)
 				}
 				if !partial {
-					return false, fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
+					return false, "", fmt.Errorf("existing bundle artifact %s has hash %s, want %s", target, got, expectedSHA)
 				}
+				healed = true
 			} else if !os.IsNotExist(err) {
-				return false, err
+				return false, "", err
 			}
 		}
 	} else if !os.IsNotExist(err) {
-		return false, err
+		return false, "", err
 	}
 	in, err := os.Open(source)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	defer func() {
 		if closeErr := in.Close(); retErr == nil && closeErr != nil {
@@ -500,7 +518,7 @@ func materializeArtifact(source, target, expectedSHA string) (created bool, retE
 	dir := filepath.Dir(target)
 	out, err := os.CreateTemp(dir, ".artifact-*.tmp")
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	tmpName := out.Name()
 	_, copyErr := io.Copy(out, in)
@@ -509,34 +527,67 @@ func materializeArtifact(source, target, expectedSHA string) (created bool, retE
 	if copyErr != nil || syncErr != nil || closeErr != nil {
 		_ = os.Remove(tmpName)
 		if copyErr != nil {
-			return false, copyErr
+			return false, "", copyErr
 		}
 		if syncErr != nil {
-			return false, syncErr
+			return false, "", syncErr
 		}
-		return false, closeErr
+		return false, "", closeErr
 	}
 	if err := os.Chmod(tmpName, 0o400); err != nil {
 		_ = os.Remove(tmpName)
-		return false, err
+		return false, "", err
 	}
 	got, _, err := artifact.HashFile(tmpName)
 	if err != nil {
 		_ = os.Remove(tmpName)
-		return false, err
+		return false, "", err
 	}
 	if got != expectedSHA {
 		_ = os.Remove(tmpName)
-		return false, fmt.Errorf("copied artifact hash %s, want %s", got, expectedSHA)
+		return false, "", fmt.Errorf("copied artifact hash %s, want %s", got, expectedSHA)
 	}
-	// Atomic publish in the same directory. Renaming over a provable partial
-	// heals it; the mismatch gate above already refused anything else, so a
-	// different artifact never reaches this rename.
+	if !healed {
+		// Fresh publish or symlink replacement: no pre-existing partial to
+		// preserve, so a single atomic rename completes the write.
+		if err := os.Rename(tmpName, target); err != nil {
+			_ = os.Remove(tmpName)
+			return false, "", err
+		}
+		return true, "", nil
+	}
+	// Heal path: the staged bytes are verified, so move the pre-existing
+	// partial aside in the same directory (a metadata-only rename, never a
+	// byte copy) before the atomic publish. The caller owns the backup:
+	// a later rollback renames it back over the healed file, while success
+	// removes it. Backup names are unique per attempt so leftovers never
+	// block a retry.
+	bakTmp, err := os.CreateTemp(dir, ".artifact-heal-*.bak")
+	if err != nil {
+		_ = os.Remove(tmpName)
+		return false, "", err
+	}
+	bakName := bakTmp.Name()
+	_ = bakTmp.Close()
+	if err := os.Remove(bakName); err != nil {
+		_ = os.Remove(tmpName)
+		_ = os.Remove(bakName)
+		return false, "", err
+	}
+	if err := os.Rename(target, bakName); err != nil {
+		_ = os.Remove(tmpName)
+		return false, "", err
+	}
+	// Atomic publish. The mismatch gate above already refused anything but
+	// a provable partial, so only a healed partial ever reaches this rename.
 	if err := os.Rename(tmpName, target); err != nil {
 		_ = os.Remove(tmpName)
-		return false, err
+		if rerr := os.Rename(bakName, target); rerr != nil {
+			return false, bakName, errors.Join(err, rerr)
+		}
+		return false, "", err
 	}
-	return true, nil
+	return true, bakName, nil
 }
 
 // inspectExistingBundle reads a pre-existing bundle.json without following
