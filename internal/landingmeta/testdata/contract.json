@@ -24,12 +24,12 @@
     "note": "Agreed, but only because the Go side does the work explicitly. WHATWG URL strips leading/trailing ASCII whitespace itself; Go's net/url does NOT \u2014 base.Parse(\"   \") yields %20%20%20. landingmeta trims ASCII whitespace (space/tab/CR/LF/VT/FF, not Unicode spaces) before parsing so the two agree."
   },
   {
-    "name": "http_is_rejected",
+    "name": "http_is_upgraded",
     "file": "http_is_rejected.html",
     "base": "https://publisher.example/x",
-    "want": "",
-    "agreed_with_extension": true,
-    "note": "plaintext downgrade is refused on both sides"
+    "want": "https://publisher.example/a.pdf",
+    "agreed_with_extension": false,
+    "note": "DAEMON-UPGRADES: the daemon serves an http citation URL as its https form (plaintext is never fetched). The extension planExecution resolveURL still refuses it; see the named divergence there."
   },
   {
     "name": "absent_meta",

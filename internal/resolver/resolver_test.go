@@ -149,3 +149,62 @@ func TestCandidateKeyStableAndURLFree(t *testing.T) {
 		t.Fatal("key must be a hash, never the URL")
 	}
 }
+
+func TestUpgradeHTTPRewritesSchemeOnly(t *testing.T) {
+	base := Candidate{Source: "openalex", URL: "https://keep.example/a.pdf", Landing: "https://keep.example/a",
+		Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 1}
+	t.Run("http url and landing both upgrade with evidence", func(t *testing.T) {
+		c := base
+		c.URL, c.Landing = "http://repo.example/paper.pdf", "http://repo.example/article"
+		got, changed := UpgradeHTTP(c)
+		if !changed {
+			t.Fatal("changed = false, want true")
+		}
+		if got.URL != "https://repo.example/paper.pdf" || got.Landing != "https://repo.example/article" {
+			t.Fatalf("upgraded = %q %q", got.URL, got.Landing)
+		}
+		if len(got.Evidence) != 2 || got.Evidence[0] != UpgradeEvidenceURL || got.Evidence[1] != UpgradeEvidenceLanding {
+			t.Fatalf("evidence = %q", got.Evidence)
+		}
+		// Key and dedupe follow the upgraded URL: the upgraded candidate
+		// keys exactly like a natively-https one from the same source.
+		native := base
+		native.URL, native.Landing = got.URL, got.Landing
+		if got.Key() != native.Key() {
+			t.Fatalf("upgraded key %q != native https key %q", got.Key(), native.Key())
+		}
+	})
+	t.Run("query and port survive the upgrade", func(t *testing.T) {
+		c := base
+		c.URL = "http://repo.example:8080/paper.pdf?download=true"
+		got, changed := UpgradeHTTP(c)
+		if !changed || got.URL != "https://repo.example:8080/paper.pdf?download=true" {
+			t.Fatalf("changed = %v, url = %q", changed, got.URL)
+		}
+	})
+	t.Run("https is untouched", func(t *testing.T) {
+		got, changed := UpgradeHTTP(base)
+		if changed || got.URL != base.URL || len(got.Evidence) != 0 {
+			t.Fatalf("changed = %v, candidate = %+v", changed, got)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		url  string
+	}{
+		{"userinfo is never upgraded", "http://user@repo.example/paper.pdf"},
+		{"unparseable is left alone", "http://exa mple/paper.pdf"},
+		{"relative is left alone", "/paper.pdf"},
+		{"non-http scheme is left alone", "ftp://repo.example/paper.pdf"},
+		{"empty landing upgrades nothing", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base
+			c.URL, c.Landing = tc.url, tc.url
+			got, changed := UpgradeHTTP(c)
+			if changed || got.URL != tc.url || got.Landing != tc.url || len(got.Evidence) != 0 {
+				t.Fatalf("changed = %v, candidate = %+v", changed, got)
+			}
+		})
+	}
+}

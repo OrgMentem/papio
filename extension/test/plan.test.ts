@@ -387,6 +387,60 @@ test("planGeneric prioritizes one declared citation PDF before article links", (
   });
 });
 
+test("planGeneric serves the https form of an http citation PDF, never http", () => {
+  const doc = parseHTML(
+    '<head><meta name="citation_doi" content="10.1000/right">' +
+      '<meta name="citation_pdf_url" content="http://publisher.example/download/citation.pdf"></head>',
+    "https://publisher.example/article",
+  );
+  const planned = planGeneric(doc, { doi: "10.1000/right" }, { access_mode: "delegated" });
+  expect(planned.candidates).toEqual([{
+    strategy_id: "generic-citation-pdf/1",
+    strategy_version: "1",
+    url: "https://publisher.example/download/citation.pdf",
+  }]);
+  expect(planned.evidence).toContain("e0:citation-pdf=unique");
+  for (const candidate of planned.candidates) expect(candidate.url.startsWith("http://")).toBe(false);
+});
+
+test("planGeneric keeps the DOI gate on an upgraded http citation PDF", () => {
+  const doc = parseHTML(
+    '<head><meta name="citation_doi" content="10.1000/other">' +
+      '<meta name="citation_pdf_url" content="http://publisher.example/download/citation.pdf"></head>',
+    "https://publisher.example/article",
+  );
+  const planned = planGeneric(doc, { doi: "10.1000/right" }, { access_mode: "delegated" });
+  expect(planned.candidates).toEqual([]);
+  expect(planned.evidence).toContain("e0:citation-doi=missing");
+});
+
+test("planGeneric still refuses upgraded http URLs that are cross-origin or carry userinfo", () => {
+  for (const target of [
+    "http://cdn.publisher.example/download/citation.pdf",
+    "http://user:pass@publisher.example/download/citation.pdf",
+    "http://localhost/download/citation.pdf",
+  ]) {
+    const doc = parseHTML(
+      `<head><meta name="citation_doi" content="10.1000/right">` +
+        `<meta name="citation_pdf_url" content="${target}"></head>`,
+      "https://publisher.example/article",
+    );
+    expect(planGeneric(doc, { doi: "10.1000/right" }, { access_mode: "delegated" }).candidates).toEqual([]);
+  }
+});
+
+test("planGeneric stays ambiguous when two http citation PDFs upgrade to two URLs", () => {
+  const doc = parseHTML(
+    '<head><meta name="citation_doi" content="10.1000/right">' +
+      '<meta name="citation_pdf_url" content="http://publisher.example/download/one.pdf">' +
+      '<meta name="citation_pdf_url" content="http://publisher.example/download/two.pdf"></head>',
+    "https://publisher.example/article",
+  );
+  const planned = planGeneric(doc, { doi: "10.1000/right" }, { access_mode: "delegated" });
+  expect(planned.candidates).toEqual([]);
+  expect(planned.evidence).toContain("e0:citation-pdf=ambiguous");
+});
+
 test.each(["Preview PDF", "Download sample PDF", "Abstract PDF", "Download full issue PDF", "Supplementary PDF"])(
   "planGeneric refuses a %s even when metadata names the same URL",
   (label) => {

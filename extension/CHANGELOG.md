@@ -137,6 +137,12 @@ for the full pre-split extension history.
   tombstones. It now keeps the stored ledger and reads it again next time.
 - When the browser refuses to close a tab, the extension no longer reports the
   paper as closed or offers to reopen a tab that is still open.
+- **A page whose `citation_pdf_url` is `http://` now offers the `https://`
+  form of the same address.** The daemon never fetches plaintext `http`, so
+  such a page offered no PDF at all. Now the generic page check tries the
+  `https://` form when it points back to the page's own site. The `http://`
+  address is never fetched. A page that names another paper, several
+  different PDFs, or a PDF on another site behaves as before.
 - **Closing an old sign-in tab after an extension restart releases its claim.**
   Earlier builds marked a tab as operator-owned when you only activated it.
   If you closed that tab while the extension was asleep, restart recovery

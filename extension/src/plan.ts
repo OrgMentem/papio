@@ -193,6 +193,22 @@ export function planGeneric(
       return null;
     }
   };
+  // An http declared URL is never fetched as http: the daemon refuses the
+  // scheme. Offer its https form instead, subject to the same userinfo,
+  // public-host, same-origin, and self-reference gates as a native https URL.
+  const upgradeHttp = (raw: string): string | null => {
+    const trimmed = raw.trim();
+    if (!/^http:\/\//i.test(trimmed)) return null;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.username !== "" || parsed.password !== "") return null;
+      if (!isPublicHost(parsed.hostname)) return null;
+      parsed.protocol = "https:";
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  };
   const page = (() => {
     try {
       const parsed = new URL(pageHref);
@@ -323,7 +339,11 @@ export function planGeneric(
   const declaredURLs = [...citationPDFURLs, ...jsonURLs, ...alternatePDFURLs];
   const declaredSeen = new Set<string>();
   for (const raw of declaredURLs) {
-    const parsed = safeURL(raw);
+    let parsed = safeURL(raw);
+    if (parsed === null) {
+      const upgraded = upgradeHttp(raw);
+      if (upgraded !== null) parsed = safeURL(upgraded);
+    }
     if (parsed === null || !sameAllowedOrigin(parsed) || parsed.href === page.href || partialDocumentURLs.has(parsed.href)) continue;
     if (declaredSeen.has(parsed.href)) continue;
     declaredSeen.add(parsed.href);

@@ -128,14 +128,14 @@ test("landingmeta contract corpus has at least 10 cases, each backed by a fixtur
   }
 });
 
-// The corpus currently pins exactly two deliberate JS/Go divergences, both
-// daemon-stricter (asserted explicitly below by name). Any other case
-// flipping to agreed_with_extension:false would otherwise be silently
-// dropped by the agreement loop that follows — fail loudly instead so a new
-// divergence has to be named and asserted here, not discovered by drift.
-const KNOWN_DIVERGENT_CASES = ["malformed_content", "duplicate_conflicting"];
+// The corpus currently pins exactly three deliberate JS/Go divergences, all
+// daemon-stricter-or-daemon-upgrading (asserted explicitly below by name). Any
+// other case flipping to agreed_with_extension:false would otherwise be
+// silently dropped by the agreement loop that follows — fail loudly instead
+// so a new divergence has to be named and asserted here, not discovered by drift.
+const KNOWN_DIVERGENT_CASES = ["malformed_content", "duplicate_conflicting", "http_is_upgraded"];
 
-test("the only cases marked agreed_with_extension:false are the two named divergences below", () => {
+test("the only cases marked agreed_with_extension:false are the three named divergences below", () => {
   const divergent = contract
     .filter((c) => !c.agreed_with_extension)
     .map((c) => c.name)
@@ -150,7 +150,7 @@ for (const c of contract) {
   });
 }
 
-// --- The two deliberate divergences --------------------------------------------
+// --- The three deliberate divergences -------------------------------------------
 //
 // Each must be an explicit, named, PASSING test: the divergence is real and
 // permanent, not a gap to close, so it has to stay visible rather than being
@@ -189,6 +189,20 @@ test("malformed_content: extension resolves it as a relative path; daemon's pars
   // against location.href — producing a syntactically valid but bogus https
   // URL, not null.
   expect(extractMetaURLMirror(doc)).toBe("https://publisher.example/ht!tp://%%%");
+  expect(c.note.length).toBeGreaterThan(0);
+});
+
+test("http_is_upgraded: daemon serves the https form; extension E1 still refuses plaintext", () => {
+  const c = getCase("http_is_upgraded");
+  const doc = loadCase(c);
+  // Go's contract: landingmeta upgrades an http citation URL to its https
+  // form (I2a-daemon), never fetching plaintext.
+  expect(wantURL(c)).toBe("https://publisher.example/a.pdf");
+  // The extension's actual behavior: planExecution's resolveURL admits only
+  // native https targets, so a plaintext citation URL resolves to null. E0
+  // (planGeneric) performs the same https upgrade as the daemon; the E1
+  // provider-rule path was never measured with it, so it stays closed.
+  expect(extractMetaURLMirror(doc)).toBeNull();
   expect(c.note.length).toBeGreaterThan(0);
 });
 

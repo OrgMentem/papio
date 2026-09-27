@@ -105,12 +105,23 @@ scan:
 			if hasContent {
 				if u := resolveCandidate(base, content); u != "" {
 					resolved = appendResolved(resolved, u)
+				} else if up := upgradeHTTP(content); up != "" {
+					// An http:// tag value is tried as its https:// form
+					// (http itself is never emitted, and the daemon never
+					// fetches it). The upgraded value goes through the same
+					// resolveCandidate gates, so the self-reference and
+					// userinfo rules still apply; two tags that differ only
+					// by the upgraded scheme collapse in appendResolved and
+					// are not a conflict.
+					if u := resolveCandidate(base, up); u != "" {
+						resolved = appendResolved(resolved, u)
+					}
 				}
 			}
+		}
 
-			if candidates >= maxCandidates {
-				break scan
-			}
+		if candidates >= maxCandidates {
+			break scan
 		}
 	}
 
@@ -122,6 +133,23 @@ scan:
 	default:
 		return "", ErrConflictingPDFURL
 	}
+}
+
+// upgradeHTTP rewrites an absolute http URL to its https form, returning ""
+// for anything that must never be tried (unparseable, userinfo). Scheme
+// upgrade only: whether the result is usable is left to resolveCandidate's
+// own gates, which the caller applies to the upgraded value next.
+func upgradeHTTP(content string) string {
+	trimmed := strings.TrimFunc(content, isASCIISpace)
+	if len(trimmed) < 8 || !strings.EqualFold(trimmed[:7], "http://") {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || u.User != nil {
+		return ""
+	}
+	u.Scheme = "https"
+	return u.String()
 }
 
 // resolveCandidate resolves a citation_pdf_url content value against base,

@@ -635,6 +635,15 @@ execution records kept during the initial build.
   The CLI reports that it has not observed a new session within the timeout.
   The reload may still complete; `papio browser sessions` checks the result
   without requesting another reload. The default timeout remains 15 seconds.
+- **A PDF link that arrives as `http://` is now tried as `https://`.** The
+  daemon never fetches plaintext `http`, so a resolver candidate or a
+  `citation_pdf_url` with an `http://` address ended as blocked. *papio* now
+  records the `https://` form of the same address instead, and marks the
+  change in the candidate's evidence. The upgraded address goes through the
+  same validation and identity check as any other candidate, so a wrong
+  paper served over `https` is still refused. A `citation_pdf_url` that
+  points at another site, carries a user name, or points back at the page
+  itself is still refused.
 - **The daemon recognizes more bot challenges that answer with HTTP 200.**
   Fastly, Anubis, proof-of-work, and CAPTCHA interstitials send a normal
   200 page, so *papio* read them as a PDF that was not valid. It now reads

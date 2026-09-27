@@ -163,3 +163,63 @@ func TestPDFURL_CandidateCapBoundary(t *testing.T) {
 		}
 	})
 }
+
+// TestPDFURL_HTTPUpgradesToHTTPS pins the http -> https upgrade: an http://
+// tag value on an https page yields its https form, never the plaintext URL.
+// The upgraded value passes through the same resolveCandidate gates, so the
+// self-reference, userinfo and conflict rules keep working on it, and two
+// tags that differ only by the upgraded scheme collapse instead of
+// conflicting.
+func TestPDFURL_HTTPUpgradesToHTTPS(t *testing.T) {
+	base, err := url.Parse("https://publisher.example/x")
+	if err != nil {
+		t.Fatalf("parsing base: %v", err)
+	}
+	document := func(tags ...string) []byte {
+		return []byte("<!DOCTYPE html><html><head>" + strings.Join(tags, "") + "</head><body></body></html>")
+	}
+	tag := func(content string) string {
+		return `<meta name="citation_pdf_url" content="` + content + `">`
+	}
+	for _, tc := range []struct {
+		name string
+		tags []string
+		want string
+	}{
+		{"http upgrades", []string{tag("http://publisher.example/a.pdf")}, "https://publisher.example/a.pdf"},
+		{"https untouched", []string{tag("https://publisher.example/a.pdf")}, "https://publisher.example/a.pdf"},
+		{"scheme-only pair is not a conflict", []string{tag("http://publisher.example/a.pdf"), tag("https://publisher.example/a.pdf")}, "https://publisher.example/a.pdf"},
+		{"upgraded self reference stays empty", []string{tag("http://publisher.example/x")}, ""},
+		{"http with userinfo stays empty", []string{tag("http://user@publisher.example/a.pdf")}, ""},
+		{"non-http scheme stays empty", []string{tag("ftp://publisher.example/a.pdf")}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := PDFURL(document(tc.tags...), base)
+			if err != nil {
+				t.Fatalf("PDFURL() unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("PDFURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	t.Run("genuinely different urls still conflict", func(t *testing.T) {
+		_, err := PDFURL(document(tag("http://publisher.example/a.pdf"), tag("https://publisher.example/b.pdf")), base)
+		if !errors.Is(err, ErrConflictingPDFURL) {
+			t.Fatalf("PDFURL() error = %v, want ErrConflictingPDFURL", err)
+		}
+	})
+	t.Run("http tag on http base yields the https form", func(t *testing.T) {
+		httpBase, err := url.Parse("http://publisher.example/x")
+		if err != nil {
+			t.Fatalf("parsing base: %v", err)
+		}
+		got, err := PDFURL(document(tag("http://publisher.example/a.pdf")), httpBase)
+		if err != nil {
+			t.Fatalf("PDFURL() unexpected error: %v", err)
+		}
+		if got != "https://publisher.example/a.pdf" {
+			t.Errorf("PDFURL() = %q, want the https form", got)
+		}
+	})
+}

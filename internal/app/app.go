@@ -863,20 +863,42 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 
 // candidateRows converts ranked candidates into their persisted (redacted)
 // rows and the in-memory live map keyed for fetch-time lookup.
+//
+// This is the single ingestion point for resolver-produced candidates: the
+// resolve loop, the sibling hop and landing-seed expansion all persist
+// through here, so the http -> https upgrade lives here and nowhere else. A
+// resolver that produces an http:// candidate (or landing) URL has it tried
+// as its https:// form instead: the daemon refuses http before any request,
+// so the http form would only ever end blocked. The url_key, dedupe and
+// redaction are all computed from the upgraded URL below, and the upgrade is
+// recorded in the persisted rank evidence where candidate provenance already
+// lives (following the derived=citation_pdf_url precedent).
 func candidateRows(row *job.Row, ranked []resolver.Candidate, evidence []string) ([]job.Candidate, map[string]resolver.Candidate) {
 	persisted := make([]job.Candidate, 0, len(ranked))
 	live := make(map[string]resolver.Candidate, len(ranked))
 	for i, c := range ranked {
+		c, _ = resolver.UpgradeHTTP(c)
 		key := c.Key()
 		live[key] = c
 		persisted = append(persisted, job.Candidate{
 			JobID: row.ID, Source: c.Source, URLRedacted: redact.URL(c.URL), URLKey: key,
 			LandingRedacted: redact.URL(c.Landing), Version: c.Version, AccessBasis: c.AccessBasis,
 			ReuseLicense: c.ReuseLicense, ExpectedMIME: c.ExpectedMIME, CostUSD: c.CostUSD,
-			Direct: c.Direct, IdentityConfidence: c.IdentityConfidence, RankEvidence: evidence[i], Rank: i,
+			Direct: c.Direct, IdentityConfidence: c.IdentityConfidence, RankEvidence: rankEvidenceWithUpgrades(evidence[i], c), Rank: i,
 		})
 	}
 	return persisted, live
+}
+
+// rankEvidenceWithUpgrades carries the http -> https upgrade markers from a
+// candidate's in-memory evidence into its persisted rank evidence string.
+func rankEvidenceWithUpgrades(rankEvidence string, c resolver.Candidate) string {
+	for _, e := range c.Evidence {
+		if e == resolver.UpgradeEvidenceURL || e == resolver.UpgradeEvidenceLanding {
+			rankEvidence += " " + e
+		}
+	}
+	return rankEvidence
 }
 
 // landingSeed is a landing page worth checking for citation_pdf_url,

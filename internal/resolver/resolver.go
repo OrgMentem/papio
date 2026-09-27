@@ -110,6 +110,59 @@ func (c Candidate) Key() string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// Upgrade evidence markers. UpgradeHTTP appends them to Candidate.Evidence,
+// and candidate ingestion carries them into the persisted rank evidence, so
+// the upgrade stays visible where candidate provenance is already recorded.
+const (
+	// UpgradeEvidenceURL marks a candidate URL upgraded http -> https.
+	UpgradeEvidenceURL = "upgraded=url:http-to-https"
+	// UpgradeEvidenceLanding marks a candidate landing URL upgraded http -> https.
+	UpgradeEvidenceLanding = "upgraded=landing:http-to-https"
+)
+
+// UpgradeHTTP rewrites an http:// candidate URL (and landing URL) to its
+// https:// form. The daemon refuses the http scheme before any request, so an
+// http candidate as produced is unfetchable; the https form is tried instead
+// and the http form is never fetched. Validation of the upgraded URL stays
+// where it is: the identity gate still accepts or rejects the served bytes,
+// and one https form in the measurement served a different work and was
+// correctly rejected.
+//
+// Only absolute http URLs without userinfo are upgraded. Anything else
+// (https, unparseable, userinfo, relative) is left untouched and keeps its
+// existing fate. Key and redaction semantics follow automatically: both are
+// computed from the final URL at ingestion. It returns the candidate and
+// whether either field changed.
+func UpgradeHTTP(c Candidate) (Candidate, bool) {
+	upgraded := false
+	if u, ok := upgradeHTTPScheme(c.URL); ok {
+		c.URL = u
+		c.Evidence = append(c.Evidence, UpgradeEvidenceURL)
+		upgraded = true
+	}
+	if u, ok := upgradeHTTPScheme(c.Landing); ok {
+		c.Landing = u
+		c.Evidence = append(c.Evidence, UpgradeEvidenceLanding)
+		upgraded = true
+	}
+	return c, upgraded
+}
+
+// upgradeHTTPScheme returns the https form of raw when raw is an absolute
+// http URL without userinfo, and false otherwise. Scheme comparison is
+// case-insensitive; the rewrite sets the canonical lowercase form.
+func upgradeHTTPScheme(raw string) (string, bool) {
+	if raw == "" {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "http") || u.Host == "" || u.User != nil {
+		return "", false
+	}
+	u.Scheme = "https"
+	return u.String(), true
+}
+
 // Resolver is one source adapter.
 type Resolver interface {
 	Name() string
