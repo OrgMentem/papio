@@ -113,6 +113,10 @@ execution records kept during the initial build.
   A same-day batch retry reuses the recorded job, even if that job is
   terminal. A ready PDF with no on-ready hook attempt gets one after
   restart; uncertain hook launches stay available for manual review.
+- **A browser-reload timeout no longer implies a store-installed extension.**
+  The CLI reports that it has not observed a new session within the timeout.
+  The reload may still complete; `papio browser sessions` checks the result
+  without requesting another reload. The default timeout remains 15 seconds.
 - **An open-access copy behind a bot challenge now opens in the browser.**
   Some repositories answer a download with an AWS WAF challenge: HTTP 202,
   an empty body, and the header `x-amzn-waf-action: challenge`. *papio*

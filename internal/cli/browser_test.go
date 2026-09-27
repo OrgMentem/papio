@@ -179,17 +179,17 @@ func TestBrowserReloadAttributesObservedHolder(t *testing.T) {
 			wantErr:        observationErr,
 		},
 		{
-			name:          "cancelled wait",
-			before:        []browser.SessionSummary{holderBefore},
-			cancelContext: true,
-			wantErr:       context.Canceled,
-		},
-		{
 			name:            "no replacement holder before timeout",
 			args:            []string{"--timeout=1ms"},
 			before:          []browser.SessionSummary{holderBefore},
 			after:           nil,
-			wantErrContains: "did not reconnect",
+			wantErrContains: "no new session observed within 1ms; the reload may still complete",
+		},
+		{
+			name:          "cancelled wait",
+			before:        []browser.SessionSummary{holderBefore},
+			cancelContext: true,
+			wantErr:       context.Canceled,
 		},
 	}
 

@@ -180,7 +180,7 @@ func newBrowserCommand(opt *options) *cobra.Command {
 				default:
 				}
 				if time.Now().After(deadline) {
-					return fmt.Errorf("browser session %s did not reconnect within %s: the extension did not reconnect with a new session; a store-installed extension refuses dev_reload by design — this is the expected outcome when the loaded extension is not unpacked", shortSessionID(previous), reloadTimeout)
+					return fmt.Errorf("browser session %s: no new session observed within %s; the reload may still complete. Run `papio browser sessions` to check. A timeout does not establish the extension's installation mode", shortSessionID(previous), reloadTimeout)
 				}
 				var cur browserSessionsResult
 				if err := opt.call(ctx, "browser.sessions", map[string]any{}, &cur); err != nil {
