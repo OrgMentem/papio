@@ -160,8 +160,10 @@ for the full pre-split extension history.
   affiliation names. Everything else is removed, including contact details,
   birth dates, and personal profile links. The block is written back so that
   no value can close its script element, and a block over 256 KiB or nested
-  deeper than 16 levels is emptied. A capture that still holds anything
-  outside these rules is refused.
+  deeper than 16 levels is emptied. A link loses its query and fragment,
+  a relative link such as `download.pdf?sid=...` included, so a session
+  value in a link never reaches a capture. A capture that still holds
+  anything outside these rules is refused.
 - **The capture sanitizer removes credentials from every URL and no longer
   stalls on long text.** A `user:password@` part is now removed from every
   URL in a capture, not only from JSON-LD, and a capture that still holds one

@@ -453,6 +453,28 @@ test("JSON-LD URLs lose credentials and tokens split across path segments", () =
   }
 });
 
+test("relative JSON-LD and DOI-meta URLs lose their query and fragment", () => {
+  // A relative link carries a session credential in its query exactly as an
+  // absolute one does; read as text it used to keep it, and residualLeak
+  // repeated the same scrub and accepted it.
+  const relative = "download.pdf?sid=AbC91x";
+  const fragment = "../files/view#access=Zq81kP";
+  const body = JSON.stringify({ "@type": "ScholarlyArticle", contentUrl: relative, url: fragment, name: "Why?", headline: "C#7" });
+  const out = sanitizeFixture(LD(body), META);
+  expect(out).not.toContain("AbC91x");
+  expect(out).not.toContain("Zq81kP");
+  expect(out).toContain('"contentUrl":"download.pdf"');
+  expect(out).toContain('"url":"../files/view"');
+  // Punctuation in ordinary text is not a query or fragment.
+  expect(out).toContain('"name":"Why?"');
+  expect(out).toContain('"headline":"C#7"');
+  expect(residualLeak(out)).toBeNull();
+  expect(residualLeak(`${HEADER}${LD(JSON.stringify({ contentUrl: relative }))}`)).not.toBeNull();
+  const meta = sanitizeFixture(`<meta name="dc.identifier" content="resolve.php?doi=10.1234/abc&amp;sid=AbC91x">`, META);
+  expect(meta).not.toContain("AbC91x");
+  expect(residualLeak(meta)).toBeNull();
+});
+
 test("JSON-LD text can never close its script element", () => {
   const payload = '{"@type":"ScholarlyArticle","name":"\\u003c/script\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e & \\u2028"}';
   const out = sanitizeFixture(LD(payload), META);

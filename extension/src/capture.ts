@@ -319,11 +319,22 @@ function stripUserinfo(value: string): string {
   return value.replace(/^((?:[a-z][a-z0-9+.-]{0,31}:)?\/\/)[^/?#]*@/i, "$1").replace(USERINFO_RE, "$1");
 }
 
+/** A value read as a URL: absolute (`scheme://`), protocol-relative or
+ * rooted (`/`), or a whitespace-free relative reference whose query or
+ * fragment carries a `key=value` pair (`download.pdf?sid=...`,
+ * `../f#t=...`). The last form matters because a session credential rides
+ * in the query of a relative link exactly as in an absolute one; read as
+ * text it would keep that query. Text such as `C#7` or `Why?` carries no
+ * pair and stays text. */
+function looksLikeURL(value: string): boolean {
+  return /^(?:[a-z][a-z0-9+.-]*:\/\/|\/)/i.test(value) || /^[^\s?#]+[?#]\S*=\S*$/.test(value);
+}
+
 /** Scrub the `content` of a DOI-named meta tag: a safe DOI survives verbatim,
  * URL-shaped values lose userinfo and query/fragment, and every other secret
  * pattern (email, IP, token runs, token-shaped DOI suffixes) is masked. */
 function scrubDoiMetaContent(value: string): string {
-  const isURL = /^(?:[a-z][a-z0-9+.-]*:\/\/|\/)/i.test(value);
+  const isURL = looksLikeURL(value);
   const bare = isURL ? stripUserinfo(value) : value;
   const cut = bare.search(/[?#]/);
   return scrubTokensPreservingDOI(isURL && cut !== -1 ? bare.slice(0, cut) : bare);
@@ -583,7 +594,7 @@ function jsonLdTypes(record: Record<string, unknown>): string[] {
  * `residualLeak` relies on.
  */
 function scrubJsonLdString(text: string): string {
-  const isURL = /^(?:[a-z][a-z0-9+.-]*:\/\/|\/)/i.test(text);
+  const isURL = looksLikeURL(text);
   let value = text;
   if (isURL) {
     value = stripUserinfo(value);
