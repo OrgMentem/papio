@@ -516,6 +516,21 @@ There is also a link check, because `zensical build` prints a broken link as an
   `instanceof HTMLInputElement`) needs the matching constructor added to that
   `Object.assign(globalThis, {...})` block too, or every test in the file fails with an
   unhelpful generic error.
+- **happy-dom loads subresources over the real network by default, and `<link rel=preload>`
+  bypasses its loader flags.** A default `new Window({ url })` fetches stylesheets and iframes
+  (with UA `HappyDOM`, outside any logging), and a self-nesting iframe loaded 1196 times in
+  1.5 s. Two scratch scripts that parsed stored pages in a loop without closing their windows
+  reached 26-30 GB and crashed the Mac (2026-09-26). The settings that prevent it live in
+  one module, `extension/test/hermetic-dom.ts` (loaders off, a fetch interceptor that
+  refuses and records every request). `extension/bunfig.toml` preloads
+  `extension/test/preload-hermetic.ts`, which makes them happy-dom's `DefaultBrowserSettings`
+  before any window exists, so every `new Window(...)` in the suite inherits them. That
+  only holds under `bun test` from `extension/` (CI and the Makefile run it there). Code
+  that runs under `bun run` gets no preload: the adapter tools import `parseHTML`, which
+  passes `hermeticWindowSettings` explicitly for that reason. Do the same in any script,
+  and call `happyDOM.abort()` and `close()` on every window that you create.
+  `internal/cli/adapter_repair_cycle_test.go` copies the harness and its imports into a
+  temp tree, so a new import of `extension/test/harness.ts` must go into its file list too.
 - **`ipc.MaxRequestBytes` MUST exceed `protocol.MaxBrowserMessageBytes` (256 KiB), and
   `ipc.MaxResultBytes` MUST bound the whole response.** The native host relays each browser
   frame to the daemon inside **one** `browser.sync` request, so a legal max-size frame has

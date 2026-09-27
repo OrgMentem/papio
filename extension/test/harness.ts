@@ -12,7 +12,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { afterEach, beforeEach } from "bun:test";
 import { Window } from "happy-dom";
+
+import { hermeticWindowSettings } from "./hermetic-dom";
 
 import type { AdapterSpec, PageVerdict } from "../src/adapters/types";
 import { planExecution, type ExpectedWork, type PlanPolicy, type PlanResult } from "../src/plan";
@@ -31,13 +34,70 @@ export function fixtureExists(provider: string, scenario: string): boolean {
 }
 
 /**
+ * Windows opened by `parseHTML` that the current test has not closed itself.
+ * Fixture documents must stay alive for the whole test, so each window is
+ * aborted and closed in `afterEach` — never during the test. Documents built
+ * at module scope (shared across tests in one file) predate the first
+ * `beforeEach` seal and are left alone.
+ */
+const openWindows: Window[] = [];
+let sealedWindows = 0;
+function closeOwnedWindows(): Promise<void> {
+  const owned = openWindows.splice(sealedWindows);
+  sealedWindows = openWindows.length;
+  return (async () => {
+    for (const win of owned) {
+      try {
+        await win.happyDOM.abort();
+      } catch {
+        // The test already aborted or closed this window; closing is idempotent.
+      }
+      try {
+        await win.happyDOM.close();
+      } catch {
+        // Same as above: a test-owned close must not fail the suite.
+      }
+    }
+  })();
+}
+try {
+  beforeEach(() => {
+    sealedWindows = openWindows.length;
+  });
+  afterEach(() => closeOwnedWindows());
+} catch {
+  // Imported outside `bun test` (the adapter tools under `bun run`): no
+  // per-test lifecycle exists, so windows stay open until the process exits.
+}
+
+/** Close every window the current test opened via `parseHTML`. */
+export function closeHarnessWindows(): Promise<void> {
+  return closeOwnedWindows();
+}
+
+/** URLs the refusing fetch interceptor has blocked since the last drain. */
+export { drainRefusedRequests } from "./hermetic-dom";
+
+/**
  * Parse a full HTML document string into a happy-dom Document. The captured
  * fixture's `<!-- papio-fixture ... -->` header comment is parsed as a harmless
  * comment node and ignored by `planExecution`, the production planner the
  * browser injects.
+ *
+ * Hermetic: happy-dom's stylesheet/script/iframe loaders are off and a
+ * refusing fetch interceptor blocks the rest (./hermetic-dom.ts), so parsing
+ * a fixture with its real capture origin never touches the network. The
+ * settings are passed explicitly, not left to the test preload, because the
+ * adapter tools import this module under `bun run`. Refused URLs are counted
+ * in `drainRefusedRequests`. Under `bun test` the window is aborted and
+ * closed in `afterEach`.
  */
 export function parseHTML(html: string, baseURL = "https://fixture.local/"): Document {
-  const window = new Window({ url: baseURL });
+  const window = new Window({
+    url: baseURL,
+    settings: { ...hermeticWindowSettings, disableJavaScriptEvaluation: true },
+  });
+  openWindows.push(window);
   window.document.write(html);
   return window.document as unknown as Document;
 }

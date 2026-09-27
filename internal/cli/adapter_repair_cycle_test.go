@@ -47,7 +47,7 @@ func adapterRepairCycleRepo(t *testing.T) (string, adapterRepairCapture, func(st
 		}
 	}
 	for _, relative := range []string{
-		"extension/src/plan.ts", "extension/test/harness.ts",
+		"extension/src/plan.ts", "extension/test/harness.ts", "extension/test/hermetic-dom.ts",
 		"extension/tools/adapter-try.ts", "extension/tools/adapter-repair.ts", "extension/tools/adapter-repair-source.ts",
 	} {
 		data, err := os.ReadFile(filepath.Join(repo, relative))
