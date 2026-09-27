@@ -187,7 +187,8 @@ execution records kept during the initial build.
   stops skipping at the first success. A success in your browser does not
   count, because it says nothing about the daemon's own access. A host that
   answers 429 is slowed down (it honors `Retry-After`, up to one hour), never
-  skipped, even when the 429 carries a bot-check header. A skip shows in
+  skipped, even when the 429 carries a bot-check header, and a redirect into
+  it waits too. A skip shows in
   the attempt history as `suppressed`, and a job that ends with skips names
   the hosts in its transition. The new `[host_suppression]` section sets the
   counts and intervals, or turns the rule off (ADR-0031). Config is strict:

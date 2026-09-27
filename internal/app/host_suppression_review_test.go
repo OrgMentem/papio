@@ -4,6 +4,8 @@ package app
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,8 +15,10 @@ import (
 	"papio/internal/config"
 	"papio/internal/delivery"
 	"papio/internal/fetch"
+	"papio/internal/hostsuppress"
 	"papio/internal/job"
 	"papio/internal/resolver"
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -205,4 +209,201 @@ func (g *gatingResolver) Resolve(ctx context.Context, requested work.Work) ([]re
 	cands, err := g.fakeResolver.Resolve(ctx, requested)
 	g.gate()
 	return cands, err
+}
+
+// A startup rebuild that fails part-way through its scan must leave the
+// tracker untouched. The rows it had already read would otherwise stay
+// counted while the rebuild is retried from the start on the next pass, and
+// two historical 403s counted twice suppress a host that never earned it.
+func TestFailedStartupRebuildCountsNothingTwice(t *testing.T) {
+	h := newSuppressionHarness(t)
+	cfg := config.DefaultHostSuppression()
+	cfg.MinWallSpanHours = 0
+	h.svc.EnableHostSuppression(cfg)
+	h.seedWalls(walledHost, 2)
+	h.seed("invalid", "*fetch.Error", h.now.Add(-time.Minute))
+	scans := 0
+	realScan := scanSuppressionRow
+	scanSuppressionRow = func(rows *sql.Rows, dest ...any) error {
+		scans++
+		if scans == 3 {
+			return errors.New("injected scan failure")
+		}
+		return realScan(rows, dest...)
+	}
+	t.Cleanup(func() { scanSuppressionRow = realScan })
+	if h.svc.hostSuppression(context.Background()) == nil {
+		t.Fatal("tracker is nil")
+	}
+	if scans != 3 {
+		t.Fatalf("first rebuild scanned %d rows, want the injected failure on the third", scans)
+	}
+	h.fetchWith(map[string]int{walledHost: http.StatusForbidden})
+	h.run("wr_rebuild_retry", h.candidate("https://"+walledHost+"/p.pdf", resolver.AccessLicensedAPI))
+	if len(h.fetched) != 1 {
+		t.Fatalf("after a failed then a clean rebuild of two walls: fetched %v, want a normal fetch", h.fetched)
+	}
+}
+
+// A redirect into a host inside its 429 backoff is deferred on the hop, not
+// sent: the job waits out the cooldown and nothing is recorded as a wall.
+func TestRedirectIntoARateLimitedHostWaitsOutTheBackoff(t *testing.T) {
+	h := newSuppressionHarness(t)
+	const busy = "busy.example.org"
+	tracker := h.svc.hostSuppression(context.Background())
+	tracker.Observe429(busy, 10*time.Minute, h.now)
+	var reached []string
+	dl, err := fetch.New(fetch.DefaultPolicy(), publicHostResolver{}, handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.Host)
+		http.Redirect(w, r, "https://"+busy+"/paper.pdf", http.StatusFound)
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl.SetHostGate(h.svc.HostGate)
+	h.svc.Fetch = func(ctx context.Context, c resolver.Candidate, path string) (fetch.Result, error) {
+		return dl.DownloadWithHeaders(ctx, c.URL, c.RequestHeaders, path)
+	}
+	row := h.run("wr_hop_backoff", h.candidate("https://doi.example.org/10.1/x", resolver.AccessLicensedAPI))
+	if len(reached) != 1 || reached[0] != "doi.example.org" {
+		t.Fatalf("requests reached %v, want only the redirector inside the backoff", reached)
+	}
+	want := attemptRow{outcome: fetch.ClassRetryable, detail: "*fetch.Error(backoff) host=doi.example.org"}
+	if got := h.fetchAttempts(row.ID); len(got) != 1 || got[0] != want {
+		t.Fatalf("attempts = %+v, want [%+v]", got, want)
+	}
+	if row.State != job.StateRetryWait || h.candidateStatus(row.ID, "doi.example.org") != "retryable" {
+		t.Fatalf("state %s, candidate %s; want a retry wait with the row retryable", row.State, h.candidateStatus(row.ID, "doi.example.org"))
+	}
+}
+
+// A candidate whose redirect was refused at a walled publisher is revived
+// for that publisher's probe. The skip recorded the publisher; keying the
+// revival on the candidate's own host (a DOI resolver that is never walled)
+// would never revive it, and the publisher would never be probed.
+func TestProbeRevivesARedirectRefusedCandidate(t *testing.T) {
+	h := newSuppressionHarness(t)
+	h.seedWalls(walledHost, 3)
+	const busy = "busy.example.org"
+	var walledHits int
+	dl, err := fetch.New(fetch.DefaultPolicy(), publicHostResolver{}, handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Host {
+		case "doi.example.org":
+			http.Redirect(w, r, "https://"+walledHost+"/via-doi.pdf", http.StatusFound)
+		case busy:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			walledHits++
+			w.WriteHeader(http.StatusForbidden)
+		}
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl.SetHostGate(h.svc.HostGate)
+	h.svc.Fetch = func(ctx context.Context, c resolver.Candidate, path string) (fetch.Result, error) {
+		return dl.DownloadWithHeaders(ctx, c.URL, c.RequestHeaders, path)
+	}
+	row := h.run("wr_revive_redirect",
+		h.candidate("https://doi.example.org/10.1/x", resolver.AccessLicensedAPI),
+		h.candidate("https://"+busy+"/paper.pdf", resolver.AccessLicensedAPI))
+	if walledHits != 0 || row.State != job.StateRetryWait {
+		t.Fatalf("pass 1: walled reached %d times, state %s; want a skip and a retry wait", walledHits, row.State)
+	}
+	h.now = h.now.Add(8 * 24 * time.Hour)
+	if _, err := h.jobs.S.DB().Exec(`UPDATE jobs SET retry_at = ? WHERE id = ?`, store.FormatTime(time.Now().Add(-time.Minute)), row.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.process(row.ID)
+	if walledHits != 1 {
+		t.Fatalf("probe pass reached the walled publisher %d times, want one probe", walledHits)
+	}
+	attempts := h.fetchAttempts(row.ID)
+	probe := false
+	for _, a := range attempts {
+		if strings.HasPrefix(a.detail, "*fetch.Error(http-403) host=doi.example.org final="+walledHost) && strings.HasSuffix(a.detail, " probe") {
+			probe = true
+		}
+	}
+	if !probe {
+		t.Fatalf("attempts %+v: want the revived candidate's 403 probe row", attempts)
+	}
+}
+
+// A 429 that lands between candidateSuppression claiming a host's probe and
+// the first hop defers that hop before any request. The unspent probe goes
+// back: the host is probed once its backoff ends, not a whole probe interval
+// later, and the deferred attempt carries no probe marker.
+func TestBackoffOnTheFirstHopReleasesTheProbe(t *testing.T) {
+	h := newSuppressionHarness(t)
+	h.seedWalls(walledHost, 3)
+	h.now = h.now.Add(8 * 24 * time.Hour)
+	var reached []string
+	dl, err := fetch.New(fetch.DefaultPolicy(), publicHostResolver{}, handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = append(reached, r.Host)
+		w.WriteHeader(http.StatusForbidden)
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl.SetHostGate(h.svc.HostGate)
+	tracker := h.svc.hostSuppression(context.Background())
+	h.svc.Fetch = func(ctx context.Context, c resolver.Candidate, path string) (fetch.Result, error) {
+		// The concurrent worker's 429 arrives after the probe was claimed.
+		tracker.Observe429(walledHost, 10*time.Minute, h.now)
+		return dl.DownloadWithHeaders(ctx, c.URL, c.RequestHeaders, path)
+	}
+	row := h.run("wr_probe_backoff", h.candidate("https://"+walledHost+"/p.pdf", resolver.AccessLicensedAPI))
+	if len(reached) != 0 {
+		t.Fatalf("requests reached %v, want none inside the backoff", reached)
+	}
+	want := attemptRow{outcome: fetch.ClassRetryable, detail: "*fetch.Error(backoff) host=" + walledHost}
+	if got := h.fetchAttempts(row.ID); len(got) != 1 || got[0] != want {
+		t.Fatalf("attempts = %+v, want [%+v] without the probe marker", got, want)
+	}
+	if got := tracker.Decide(walledHost, h.now.Add(time.Hour)); got != hostsuppress.Probe {
+		t.Fatalf("after the backoff the host's decision is %v, want its probe still owed", got)
+	}
+}
+
+// A deferral later in a redirect chain keeps the probe: the first hop
+// already reached the probed host, so the probe is spent even though a 429
+// elsewhere put the host into backoff before the chain came back to it.
+func TestBackoffAfterTheProbedHopKeepsTheProbe(t *testing.T) {
+	h := newSuppressionHarness(t)
+	h.seedWalls(walledHost, 3)
+	h.now = h.now.Add(8 * 24 * time.Hour)
+	tracker := h.svc.hostSuppression(context.Background())
+	var reached []string
+	dl, err := fetch.New(fetch.DefaultPolicy(), publicHostResolver{}, handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if host == "" {
+			host = r.URL.Host
+		}
+		reached = append(reached, host)
+		if host == walledHost {
+			http.Redirect(w, r, "https://mid.example.org/hop", http.StatusFound)
+			return
+		}
+		// Another job's 429 from the probed host lands mid-chain.
+		tracker.Observe429(walledHost, 10*time.Minute, h.now)
+		http.Redirect(w, r, "https://"+walledHost+"/back.pdf", http.StatusFound)
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl.SetHostGate(h.svc.HostGate)
+	h.svc.Fetch = func(ctx context.Context, c resolver.Candidate, path string) (fetch.Result, error) {
+		return dl.DownloadWithHeaders(ctx, c.URL, c.RequestHeaders, path)
+	}
+	row := h.run("wr_probe_chain_backoff", h.candidate("https://"+walledHost+"/p.pdf", resolver.AccessLicensedAPI))
+	if strings.Join(reached, ",") != walledHost+",mid.example.org" {
+		t.Fatalf("requests reached %v, want the probed host then the redirector", reached)
+	}
+	if got := h.fetchAttempts(row.ID); len(got) != 1 || !strings.HasSuffix(got[0].detail, " probe") {
+		t.Fatalf("attempts = %+v, want one deferred row carrying the probe marker", got)
+	}
+	if got := tracker.Decide(walledHost, h.now.Add(time.Hour)); got != hostsuppress.Skip {
+		t.Fatalf("after the backoff the host's decision is %v, want Skip: the probe was spent", got)
+	}
 }

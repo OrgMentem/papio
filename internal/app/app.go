@@ -2080,6 +2080,34 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				}
 				continue
 			}
+			// A per-hop 429 backoff deferral (O3) records like the
+			// candidate-level one: the row stays retryable and the job waits
+			// out the host's cooldown. It paces a host (usually a redirect
+			// target), not the source, so the source budget is never
+			// deferred, and the deferred host was never contacted.
+			if _, wait, deferred := fetch.IsBackedOff(err); deferred {
+				if err := s.Jobs.ReleaseReservedCost(context.WithoutCancel(ctx), row.ID, stored.Source, stored.CostUSD); err != nil {
+					return err
+				}
+				// A 429 that landed after candidateSuppression claimed this
+				// host's probe can defer the very first hop. When the gate
+				// admitted no hop, nothing was sent, so the probe is unspent:
+				// hand it back, or the host would wait a whole probe interval
+				// with nothing probed. A deferral later in a redirect chain
+				// keeps the claim, because an earlier hop may have reached
+				// the probed host already.
+				if !pass.admitted {
+					s.releaseUnspentProbe(verdict, passProbes)
+					probed = pass.probed
+				}
+				detail := withProbeMarker(fetchAttemptDetail(err, candidate.URL), probed)
+				_ = s.Jobs.FinishAttempt(ctx, attempt, fetch.ClassRetryable, 0, detail)
+				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "retryable"); err != nil {
+					return err
+				}
+				plan.observeCandidateTemporary(s.Now(), wait, s.RetryDelay)
+				continue
+			}
 			class, status, delay := fetchFailure(err)
 			detail := withProbeMarker(fetchAttemptDetail(err, candidate.URL), probed)
 			_ = s.Jobs.FinishAttempt(ctx, attempt, class, status, detail)

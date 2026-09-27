@@ -70,6 +70,9 @@ type Error struct {
 	FinalHost string
 	// SuppressedHost names the hop host a HostGate refused; "" otherwise.
 	SuppressedHost string
+	// BackedOffHost names the hop host a HostGate deferred because it is
+	// inside its 429 backoff; "" otherwise. RetryAfter carries the wait.
+	BackedOffHost string
 }
 
 func (e *Error) Error() string {
@@ -94,7 +97,8 @@ const (
 	FetchKindTimeout   = "timeout"
 	FetchKindCancelled = "cancelled"
 	FetchKindBlocked   = "blocked"
-	FetchKindLocal     = "local" // quarantine/request-shape failure, never the provider
+	FetchKindLocal     = "local"   // quarantine/request-shape failure, never the provider
+	FetchKindBackoff   = "backoff" // a hop deferred inside its host's 429 backoff; nothing sent to that host
 )
 
 // FailureKind maps a classified error to its persisted kind. HTTP statuses
@@ -109,6 +113,9 @@ func (e *Error) FailureKind() string {
 	// HTTP 429 outranks every other signal: it is pacing, never a wall.
 	if e.HTTPStatus == 429 {
 		return "http-429"
+	}
+	if e.BackedOffHost != "" {
+		return FetchKindBackoff
 	}
 	msg := strings.ToLower(e.Msg)
 	if strings.Contains(msg, "challenge") || strings.Contains(msg, "anti-bot") ||
@@ -244,6 +251,25 @@ func IsSuppressed(err error) (string, bool) {
 		return "", false
 	}
 	return fe.SuppressedHost, true
+}
+
+// BackedOff is a per-hop host-gate deferral: the named host is inside its
+// 429 backoff for another wait, so the hop was not attempted. It is
+// retryable pacing, never a wall, and carries no HTTPStatus or FinalHost
+// because the host never answered.
+func BackedOff(host string, wait time.Duration) *Error {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return &Error{Class: ClassRetryable, RetryAfter: wait, Msg: "host inside rate-limit backoff", BackedOffHost: host}
+}
+
+// IsBackedOff reports whether err is a host-gate backoff deferral, naming
+// the deferred hop host and the remaining wait.
+func IsBackedOff(err error) (string, time.Duration, bool) {
+	var fe *Error
+	if !errors.As(err, &fe) || fe.BackedOffHost == "" {
+		return "", 0, false
+	}
+	return fe.BackedOffHost, fe.RetryAfter, true
 }
 
 func detailHost(rawURL string) string {

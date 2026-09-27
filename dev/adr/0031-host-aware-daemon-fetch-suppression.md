@@ -107,9 +107,12 @@ the probed host carries the marker, because on the
 operator store SAGE served one source's URL for a work one second after
 refusing another source's URL for the same work. Every other job still skips.
 Revival is explicit: before the pending-queue loop, the daemon resets to
-`pending` at most one row per host whose latest fetch attempt was
-`suppressed`, whose host is owed its probe, and whose URL this pass resolved
-again (`internal/app/host_suppression_wire.go:reviveSuppressionProbe`): a row
+`pending` at most one row per refused host whose latest fetch attempt was
+`suppressed`, whose refused host is owed its probe, and whose URL this pass
+resolved again (`internal/app/host_suppression_wire.go:reviveSuppressionProbe`).
+The refused host is read from the skip's `suppressed=` field, not from the
+candidate URL: a DOI-resolver candidate refused at the publisher it redirects
+into must be revived for that publisher's probe. A row
 the resolvers no longer return cannot be fetched and must not shadow the live
 one.
 `ResetCandidates` never revives `skipped` rows, and `candidates_dedupe` keeps a
@@ -146,14 +149,21 @@ maps are additive-safe (ADR-0009).
 **State (R6).** The rule lives in memory (`internal/hostsuppress/hostsuppress.go:Tracker`)
 and is pure bookkeeping over attempt rows. On first use after start the
 daemon rebuilds it with one bounded query over fetch-stage rows inside the
-window, fed through the same `Observe` path live attempts use. No new table.
+window, fed through the same `Observe` path live attempts use. The window is
+read in full before any row is observed; a rebuild that fails part-way leaves
+the tracker empty and is retried whole, so no row counts twice. No new table.
 
 **429 pacing (O3).** A 429 never writes a suppression. It starts a per-host
 backoff honoring `Retry-After` when named, otherwise doubling from one minute
 per consecutive 429, capped (default 3600 s); an answer other than 429 resets
 the doubling, and a daemon success ends the backoff. A candidate on a host inside its backoff is marked `retryable` and joins
-the pass's retry plan without a request. The existing per-source deferral is
-unchanged. Backoff state is not rebuilt at start: it is at most the cap long.
+the pass's retry plan without a request. The per-hop gate honors the backoff
+too: a redirect into a host inside its backoff is not sent, and the attempt
+records kind `backoff` with the row `retryable`. A backoff row is not a wire
+attempt, so the tracker ignores it, and a probe claimed for a host whose first
+hop is deferred is released unspent. The existing per-source
+deferral is unchanged and is not applied to a hop deferral, which paces a
+host, not a source. Backoff state is not rebuilt at start: it is at most the cap long.
 
 **Network context (O1).** No egress-IP, VPN, or campus dimension. The store
 has no such signal, durable network identifiers carry a privacy cost, and a

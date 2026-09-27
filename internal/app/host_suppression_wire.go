@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sort"
 	"strings"
@@ -33,6 +34,11 @@ func (s *Service) EnableHostSuppression(cfg config.HostSuppression) {
 	s.suppression = hostsuppress.New(cfg)
 }
 
+// scanSuppressionRow reads one startup-rebuild row. It is a variable only so
+// a test can fail the rebuild part-way through a scan, the one failure the
+// store cannot produce on demand.
+var scanSuppressionRow = func(rows *sql.Rows, dest ...any) error { return rows.Scan(dest...) }
+
 // hostSuppression returns the live tracker, running the bounded startup
 // rebuild once (R6): one query over fetch-stage rows inside the window, fed
 // through the same Observe path live attempts use. Unknown-kind legacy rows
@@ -56,21 +62,31 @@ func (s *Service) hostSuppression(ctx context.Context) *hostsuppress.Tracker {
 	if err != nil {
 		return t
 	}
-	defer func() { _ = rows.Close() }()
+	// Collect the whole window before observing any of it. A scan or
+	// iteration error part-way through must leave the tracker untouched:
+	// the next pass retries the rebuild from the start, and rows already
+	// folded in would then count twice, so duplicated historical 403s could
+	// suppress a host that never earned it.
+	var history []hostsuppress.Row
 	for rows.Next() {
 		var outcome, detail, ended string
-		if err := rows.Scan(&outcome, &detail, &ended); err != nil {
+		if err := scanSuppressionRow(rows, &outcome, &detail, &ended); err != nil {
+			_ = rows.Close()
 			return t
 		}
 		at, err := time.Parse(time.RFC3339Nano, ended)
 		if err != nil {
 			continue
 		}
-		t.Observe(hostsuppress.Row{Outcome: outcome, Detail: detail, At: at.UTC()})
+		history = append(history, hostsuppress.Row{Outcome: outcome, Detail: detail, At: at.UTC()})
 	}
-	if rows.Err() == nil {
-		s.suppressionLoaded = true
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return t
 	}
+	for _, row := range history {
+		t.Observe(row)
+	}
+	s.suppressionLoaded = true
 	return t
 }
 
@@ -82,14 +98,18 @@ func (s *Service) observeFetchAttempt(ctx context.Context, outcome, detail strin
 	}
 }
 
-// probePass is one fetch pass's probe state, carried into the downloader's
-// per-hop gate through the fetch context. hosts are the hosts this pass
-// holds a probe for (claimed on a candidate or on a redirect target); probed
-// reports whether the attempt in flight touched one of them, so its row
-// carries the probe marker. One pass runs on one goroutine: no locking.
+// probePass is one fetch attempt's probe state, carried into the
+// downloader's per-hop gate through the fetch context. hosts are the hosts
+// this pass holds a probe for (claimed on a candidate or on a redirect
+// target), shared across the pass; probed reports whether this attempt
+// touched one of them, so its row carries the probe marker; admitted
+// reports whether the gate let any hop of this attempt through, so a
+// refusal with admitted false means no request was sent at all. One pass
+// runs on one goroutine: no locking.
 type probePass struct {
-	hosts  map[string]bool
-	probed bool
+	hosts    map[string]bool
+	probed   bool
+	admitted bool
 }
 
 type probePassKey struct{}
@@ -99,19 +119,28 @@ type probePassKey struct{}
 // host this pass already probes is let through; a due probe on a redirect
 // target is claimed for the pass, so the job's later candidates on that host
 // join it and the attempt is marked. Excluded hosts and pure redirectors
-// never refuse. With the rule off it admits all.
+// never refuse. A host inside its 429 backoff is deferred on every hop
+// (O3), never suppressed. With the rule off it admits all.
 func (s *Service) HostGate(ctx context.Context, host string) error {
 	t := s.hostSuppression(ctx)
 	if t == nil {
 		return nil
 	}
 	host = strings.ToLower(host)
+	now := s.Now().UTC()
+	// A 429 backoff outranks everything, a probe this pass holds included:
+	// the host asked papio to slow down, and a redirect into it inside the
+	// cooldown is exactly the request it asked papio not to send.
+	if until, ok := t.BackedOff(host, now); ok {
+		return fetch.BackedOff(host, until.Sub(now))
+	}
 	pass, _ := ctx.Value(probePassKey{}).(*probePass)
 	if pass != nil && pass.hosts[host] {
 		pass.probed = true
+		pass.admitted = true
 		return nil
 	}
-	switch decision, _ := t.Claim(host, s.Now().UTC()); decision {
+	switch decision, _ := t.Claim(host, now); decision {
 	case hostsuppress.Skip:
 		return fetch.Suppressed(host)
 	case hostsuppress.Probe:
@@ -119,6 +148,9 @@ func (s *Service) HostGate(ctx context.Context, host string) error {
 			pass.hosts[host] = true
 			pass.probed = true
 		}
+	}
+	if pass != nil {
+		pass.admitted = true
 	}
 	return nil
 }
@@ -287,7 +319,11 @@ func (s *Service) observeRateLimit(ctx context.Context, err error) {
 // candidates_dedupe, so without this the probe rule would have no row to
 // run. Before the pending-queue loop, it resets at most one row per host to
 // pending: a row of this job whose latest fetch attempt was `suppressed`
-// and whose host is owed its probe. Rows skipped for any other reason
+// and whose refused host is owed its probe. The refused host is the one the
+// skip recorded (`suppressed=` in the attempt detail), not the candidate's
+// own host: a DOI-redirected candidate is refused at the publisher it
+// redirects into, and keying on the candidate host would never revive it.
+// Rows skipped for any other reason
 // (landing pages, cost ceilings, stale bearer URLs) are never touched. The
 // row then meets candidateSuppression, which claims it as the probe. Only a
 // row this pass can fetch is revived: its url_key must be in live. A stale
@@ -299,11 +335,10 @@ func (s *Service) reviveSuppressionProbe(ctx context.Context, jobID string, live
 		return nil
 	}
 	rows, err := s.Jobs.S.DB().QueryContext(ctx, `
-		SELECT c.id, c.url_redacted, c.url_key FROM candidates c
-		 WHERE c.job_id = ? AND c.status = 'skipped'
-		   AND (SELECT a.outcome FROM attempts a
-		         WHERE a.candidate_id = c.id AND a.stage = 'fetch'
-		         ORDER BY a.id DESC LIMIT 1) = 'suppressed'
+		SELECT c.id, c.url_redacted, c.url_key, COALESCE(a.detail,'') FROM candidates c
+		  JOIN attempts a ON a.id = (SELECT MAX(a2.id) FROM attempts a2
+		                              WHERE a2.candidate_id = c.id AND a2.stage = 'fetch')
+		 WHERE c.job_id = ? AND c.status = 'skipped' AND a.outcome = 'suppressed'
 		 ORDER BY c.rank, c.id`, jobID)
 	if err != nil {
 		return err
@@ -315,15 +350,18 @@ func (s *Service) reviveSuppressionProbe(ctx context.Context, jobID string, live
 	var skipped []skippedRow
 	for rows.Next() {
 		var row skippedRow
-		var redacted, key string
-		if err := rows.Scan(&row.id, &redacted, &key); err != nil {
+		var redacted, key, detail string
+		if err := rows.Scan(&row.id, &redacted, &key, &detail); err != nil {
 			_ = rows.Close()
 			return err
 		}
 		if _, ok := live[key]; !ok {
 			continue
 		}
-		row.host = candidateHost(redacted)
+		row.host = suppressedHostOf(detail)
+		if row.host == "" {
+			row.host = candidateHost(redacted)
+		}
 		skipped = append(skipped, row)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
@@ -341,4 +379,15 @@ func (s *Service) reviveSuppressionProbe(ctx context.Context, jobID string, live
 		revived[row.host] = true
 	}
 	return nil
+}
+
+// suppressedHostOf reads the refused host back out of a suppressed
+// attempt's detail (the `suppressed=` field suppressedDetail writes), or "".
+func suppressedHostOf(detail string) string {
+	for _, field := range strings.Fields(detail) {
+		if host, ok := strings.CutPrefix(field, "suppressed="); ok {
+			return strings.ToLower(host)
+		}
+	}
+	return ""
 }

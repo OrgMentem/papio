@@ -120,7 +120,9 @@ func (t *Tracker) probeInterval() time.Duration {
 // Observe folds one fetch-stage attempt into the rule. Rows must arrive in
 // time order (the startup rebuild sorts by ended_at). Legacy failure rows
 // (bare "*fetch.Error", unknown kind) carry no host and are ignored;
-// suppressed and cancelled rows are not wire attempts and are ignored.
+// suppressed and cancelled rows, and hops deferred inside a 429 backoff,
+// are not wire attempts and are ignored: counting one as an attempt would
+// push the host's next probe a whole interval out for a request never sent.
 // Success rows name the responding host; only they clear a wall. Validate
 // accepts, browser accepts, and adoptions never reach this function.
 func (t *Tracker) Observe(row Row) {
@@ -143,7 +145,7 @@ func (t *Tracker) Observe(row Row) {
 		return
 	}
 	kind, candidate, final := fetch.ParsePersistedDetail(row.Detail)
-	if kind == "" {
+	if kind == "" || kind == fetch.FetchKindBackoff {
 		return
 	}
 	candidate, final = normalize(candidate), normalize(final)
