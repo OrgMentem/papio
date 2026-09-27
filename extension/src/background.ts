@@ -795,31 +795,41 @@ export interface DrivenPageAssessment {
  * fixtures do not show this (their captures predate JSD on those hosts), which
  * is why this was settled against a live tab rather than against a fixture.
  *
- * What distinguishes the interstitial is its own title and text plus a real
- * widget. Verified against the live 403 interstitial the same day: "Just a
- * moment…" in the title, and NO widget markers in the served HTML at all -
- * Cloudflare injects those at runtime.
+ * A Turnstile widget alone is NOT a marker. The widget also ships inside
+ * ordinary pages: every doi.org "DOI Not Found" 404 carries one in its error
+ * report form, and blogs put one in comment widgets. Measured 2026-09-27 on
+ * 1096 stored bodies: all 129 widget-only "challenge" calls are that shape
+ * (127 doi.org 404s, 2 blog pages), and no real interstitial is widget-only.
+ * A Turnstile marker counts only beside challenge title or challenge text.
+ * (The 2026-08-21 live tab measurement still applies: Cloudflare injects the
+ * widget markers at runtime, so the served HTML of a real interstitial can
+ * carry no widget at all — its title and text do the work.)
  */
 export function isBotChallenge(doc: Document | null): boolean {
   const root: Document = doc ?? document;
   const title = (root.title ?? "").trim().slice(0, 256);
   const text = (root.body?.textContent ?? "").slice(0, 40_000);
-  const structural =
+  // A bare Turnstile embed is an ordinary page (doi.org 404 report form,
+  // blog comment widget). It counts only beside challenge title or text.
+  const turnstileStructural =
     root.querySelector(
       'script[src*="challenges.cloudflare.com/turnstile/"], ' +
         'input[name="cf-turnstile-response"], ' +
-        '#challenge-form, #challenge-running, .cf-turnstile, ' +
+        ".cf-turnstile",
+    ) !== null;
+  const hardStructural =
+    root.querySelector(
+      "#challenge-form, #challenge-running, " +
         '[id*="cf-chl-"], [class*="cf-chl-"], ' +
         '#captcha-box .main-wrapper[role="main"]',
     ) !== null;
-  return (
-    structural ||
+  const challengeWords =
     /^just a moment/i.test(title) ||
     /are\s+you\s+a\s+robot\??/i.test(title) ||
     /verif(?:y|ying)\s+you\s+are\s+human|checking\s+your\s+browser|needs\s+to\s+review\s+the\s+security\s+of\s+your\s+connection/i.test(
       `${title}\n${text}`,
-    )
-  );
+    );
+  return hardStructural || challengeWords || (turnstileStructural && challengeWords);
 }
 
 /** OpenAthens and browser redirect-loop dead ends remain human-visible.
@@ -864,22 +874,28 @@ export function assessDrivenPage(
   // block, the other whether it may be retired, so a marker in only one of
   // them creates an ask that can be raised and never cleared. That is exactly
   // the shape of the defect this fixes.
-  const structural =
+  // A bare Turnstile embed is an ordinary page (doi.org "DOI Not Found" 404
+  // report form, blog comment widget). It counts only beside challenge title
+  // or challenge text; the other markers decide alone.
+  const turnstileStructural =
     root.querySelector(
       'script[src*="challenges.cloudflare.com/turnstile/"], ' +
         'input[name="cf-turnstile-response"], ' +
-        '#challenge-form, #challenge-running, .cf-turnstile, ' +
+        ".cf-turnstile",
+    ) !== null;
+  const hardStructural =
+    root.querySelector(
+      "#challenge-form, #challenge-running, " +
         '[id*="cf-chl-"], [class*="cf-chl-"], ' +
         '#captcha-box .main-wrapper[role="main"]',
     ) !== null;
-  if (
-    structural ||
+  const challengeWords =
     /^just a moment/i.test(title) ||
     /are\s+you\s+a\s+robot\??/i.test(title) ||
     /verif(?:y|ying)\s+you\s+are\s+human|checking\s+your\s+browser|needs\s+to\s+review\s+the\s+security\s+of\s+your\s+connection/i.test(
       `${title}\n${text}`,
-    )
-  ) {
+    );
+  if (hardStructural || challengeWords || (turnstileStructural && challengeWords)) {
     return { kind: "challenge" };
   }
   const genericLoop =

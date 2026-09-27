@@ -143,6 +143,12 @@ for the full pre-split extension history.
   `https://` form when it points back to the page's own site. The `http://`
   address is never fetched. A page that names another paper, several
   different PDFs, or a PDF on another site behaves as before.
+- **A page that only embeds a Cloudflare Turnstile widget is no longer a
+  bot challenge.** `doi.org` "DOI Not Found" pages and blog comment forms
+  embed the widget, so a paper with a wrong DOI was reported as blocked by
+  a challenge instead of not found. The widget now counts only together
+  with a challenge title or challenge text. The challenge-form markers
+  still decide alone, so real challenge pages are still detected.
 - **Closing an old sign-in tab after an extension restart releases its claim.**
   Earlier builds marked a tab as operator-owned when you only activated it.
   If you closed that tab while the extension was asleep, restart recovery

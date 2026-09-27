@@ -8807,9 +8807,12 @@ test("a stored provider blocker remains visible until effective access changes",
 
 test("Cloudflare challenge detection survives the observed marker sanitization", () => {
   // SAGE, ACM, and the newer ScienceDirect captures share these widget markers;
-  // their script bodies are intentionally absent from committed fixtures.
+  // their script bodies are intentionally absent from committed fixtures. Real
+  // interstitials carry a challenge title beside the widget, so the fixture
+  // below does too: a bare widget without challenge words is an ordinary page
+  // (doi.org 404 report form, blog comment widget), not a challenge.
   const widgetChallenge = sanitizedObservedChallenge(`
-    <html><head>
+    <html><head><title>Just a moment...</title>
       <script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1">discarded body</script>
       <script src="https://challenges.cloudflare.com/turnstile/v0/b/3104729c556c/api.js">discarded body</script>
     </head><body>
@@ -8995,9 +8998,10 @@ test("driven-page assessment separates challenge, load failure, redirect loop, a
   const challengeFixtures = [
     "<html><head><title>Are you a robot?</title></head><body></body></html>",
     '<form id="challenge-form"></form>',
-    '<div class="cf-turnstile"></div>',
     '<div id="data-cf-chl-token"></div>',
     "<main>Verify you are human to continue</main>",
+    "<html><head><title>Just a moment...</title></head><body>" +
+      '<div class="cf-turnstile"></div></body></html>',
   ];
   for (const html of challengeFixtures) {
     const doc = fixture(html);
@@ -9039,6 +9043,43 @@ test("driven-page assessment separates challenge, load failure, redirect loop, a
   expect(registrableProviderHost("journals.example.co.uk")).toBe(
     "example.co.uk",
   );
+});
+test("a Turnstile widget alone is not a challenge", () => {
+  // doi.org embeds a Turnstile widget in the error-report form of every "DOI
+  // Not Found" 404, and blogs embed one in comment widgets. Both read as
+  // ordinary pages: the widget counts only beside challenge title or text.
+  const page = (html: string): Document => {
+    const window = new Window({ url: "https://doi.org/10.1093/chidev/aacag124" });
+    window.document.write(html);
+    return window.document as unknown as Document;
+  };
+  const doiNotFound = page(
+    "<html><head><title>Error: DOI Not Found</title></head><body>" +
+      "<h2>DOI Not Found</h2><p>This DOI cannot be found in the DOI System.</p>" +
+      '<form><div class="cf-turnstile" data-sitekey="0x4AAAAAACiF3eA8err_tBga"></div></form>' +
+      '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>' +
+      "</body></html>",
+  );
+  expect(assessDrivenPage(doiNotFound).kind).toBe("normal");
+  expect(isBotChallenge(doiNotFound)).toBe(false);
+  const blogComment = page(
+    "<html><head><title>Good points from James Gilliland</title></head><body>" +
+      "<article>Marginal Revolution post text.</article>" +
+      '<div class="cf-turnstile"></div>' +
+      "</body></html>",
+  );
+  expect(assessDrivenPage(blogComment).kind).toBe("normal");
+  expect(isBotChallenge(blogComment)).toBe(false);
+  // A real interstitial pairs the widget with challenge title and text.
+  const interstitial = page(
+    "<html><head><title>Just a moment...</title></head><body>" +
+      "<p>Verifying you are human. This may take a few seconds.</p>" +
+      '<div class="cf-turnstile"></div>' +
+      '<input type="hidden" name="cf-turnstile-response">' +
+      "</body></html>",
+  );
+  expect(assessDrivenPage(interstitial).kind).toBe("challenge");
+  expect(isBotChallenge(interstitial)).toBe(true);
 });
 
 /** fixtures/sciencedirect/blocked.html: Elsevier's refusal page, served in
