@@ -1085,17 +1085,30 @@ translators against the stored capture/fixture corpus and count PDF
 candidates the generic engine and route table missed. It earns
 implementation only if that marginal yield is material.
 
-**Replay yield measured 2026-08-10** (same pinned corpus; 106 pages — 45
-live captures, 61 fixtures; network-denied translation-server harness,
-report in `dev/scratch/zotero-replay/`): `detectWeb` succeeded on 41% of
-regex-matched runs, `doWeb` completed without network on 46% of those,
-translators produced PDF candidates on exactly 2 pages — and both were
-already covered by the generic citation/anchor checks. **Marginal yield: 0
-pages.** The daemon-hosted runtime therefore does NOT clear its gate on
-current evidence and stays unimplemented. Standing revisit trigger: re-run
-the replay (cheap, offline) whenever the capture corpus gains a meaningfully
-different provider mix — the corpus today is biased toward providers *papio*
-already handles, which is exactly where translators are redundant.
+**Replay yield, corrected 2026-09-26.** The first measurement (2026-08-10;
+106 pages — 45 live captures, 61 fixtures; network-denied translation-server
+harness in `dev/scratch/zotero-replay/`) reported translator PDF candidates on
+2 pages and a marginal yield of 0 pages. That harness was flawed: it never ran
+`wgxpath.install` on its JSDOM documents, so Embedded Metadata could not read
+`citation_pdf_url` (rerun on the 71 inputs that still exist: PDF URLs 3 → 37,
+PDF pages 2 → 26); it denied all network; it replayed papio's own corpus; it
+counted candidate URLs instead of verified PDFs; and it credited a simplified
+generic check with pages papio's real code does not cover. The corrected
+replay (`dev/scratch/zotero-replay-v2/report.md`: network through one polite
+fetch service, 108 public pages papio did not select, every candidate
+downloaded and run through papio's real validation and identity gate) found a
+verified PDF on 30 pages with translators and on 31 with papio's real
+page-level code plus its keyless resolvers. Translators alone found 2 pages
+(1 under translation-server's own translator selection), both refused by
+papio safety rules on purpose (conflicting OJS `citation_pdf_url` galleys; an
+`http://` `citation_pdf_url`). On papio's own corpora translators found 0
+extra pages. **Marginal yield: 2 of 108 pages.** The daemon-hosted runtime
+therefore still does NOT clear its gate and stays unimplemented. Of the two
+narrow rule changes those pages suggest, only the https form of an `http://`
+`citation_pdf_url` gained accepted pages on a uniform-random sample (5 of 189);
+ordered OJS galleys gained none and were dropped. Standing revisit trigger:
+re-run the corrected replay whenever the capture corpus gains a meaningfully
+different provider mix.
 
 **Static yield measured 2026-08-10** (pinned corpus
 `fbee32689eca0d88105ac518c3b7f53bdbdd2508`, 749 translators): exactly **1**
