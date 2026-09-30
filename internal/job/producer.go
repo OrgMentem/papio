@@ -43,8 +43,9 @@ const (
 	// daemon-selected public route.
 	ProducerDaemonFetch Producer = "daemon_fetch"
 	// ProducerManual is bytes a person supplied: a PDF grab of a document the
-	// operator had open, or a browser download that arrived after the
-	// provider adapter had declared it could not proceed.
+	// operator had open, a browser download that arrived after the provider
+	// adapter had declared it could not proceed, or a local file the operator
+	// supplied with `papio jobs supply-pdf`.
 	ProducerManual Producer = "manual"
 	// ProducerUnknown is a browser download with no durable evidence of who
 	// clicked. A browser download outside a drive epoch is reported without
@@ -52,6 +53,11 @@ const (
 	// look identical to the daemon.
 	ProducerUnknown Producer = "unknown"
 )
+
+// CandidateSourceOperator is the candidate source of a main PDF the operator
+// supplied from a local file (`papio jobs supply-pdf`). No URL and no browser
+// produced those bytes, so the producer record names them manual.
+const CandidateSourceOperator = "operator"
 
 // Producers lists the closed vocabulary in reporting order.
 var Producers = []Producer{ProducerAdapter, ProducerAgent, ProducerViewerCapture, ProducerDaemonFetch, ProducerManual, ProducerUnknown}
@@ -260,6 +266,8 @@ func deriveArtifactProducer(in producerInputs) ArtifactProducerRecord {
 		window = in.events[start:]
 	}
 	switch {
+	case in.source == CandidateSourceOperator:
+		record.Producer, record.Basis = ProducerManual, "operator_supplied"
 	case in.source != "browser":
 		record.Producer, record.Basis = ProducerDaemonFetch, "resolver_candidate"
 	case in.grabbed:

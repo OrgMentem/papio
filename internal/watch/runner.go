@@ -34,8 +34,8 @@ type OwnershipLookup interface {
 	LookupWorks(context.Context, zotio.LookupWorksRequest) (*zotio.LookupWorksResult, error)
 }
 
-// HoldingsLookup is the generic (non-Zotero) ownership surface. It is consulted
-// for acquisition watches when configured (ADR-0008).
+// HoldingsLookup is the generic (non-Zotero) ownership surface. When enabled it
+// answers ownership for every discovery watch stage (ADR-0008).
 type HoldingsLookup interface {
 	Enabled() bool
 	Lookup(context.Context, []ownership.Query) ownership.Result
@@ -70,16 +70,17 @@ type RunResult struct {
 	Degraded bool `json:"degraded,omitempty"`
 }
 
-// Runner composes the existing discovery, Zotio ownership, acquisition batch,
-// and desktop notification services for a single watch execution at a time.
-// Generic holdings apply only to acquisition watches; alert watches retain their
-// established Zotio ownership path.
+// Runner composes the existing discovery, ownership, acquisition batch, and
+// desktop notification services for a single watch execution at a time.
+// Ownership comes from generic holdings when they are enabled (the daemon only
+// enables them without zotio) and from Zotio otherwise, for acquisition runs,
+// alert runs, and digest acquisition alike.
 type Runner struct {
 	Store     *Store
 	Discovery Discovery
 	Lookup    OwnershipLookup
-	// Holdings answers acquisition ownership when configured; nil or disabled
-	// leaves the Zotio path exactly as it was.
+	// Holdings answers ownership when configured; nil or disabled leaves the
+	// Zotio path exactly as it was.
 	Holdings  HoldingsLookup
 	Submitter Submitter
 	Backfill  BackfillQueue
@@ -106,7 +107,7 @@ func (r *Runner) Run(ctx context.Context, id int64) (*RunResult, error) {
 }
 
 func (r *Runner) AcquireDigest(ctx context.Context, watchID int64, keys []string) (queued int, err error) {
-	if r == nil || r.Store == nil || r.Lookup == nil || r.Submitter == nil {
+	if r == nil || r.Store == nil || (r.Lookup == nil && !r.holdingsEnabled()) || r.Submitter == nil {
 		return 0, errors.New("watch runner dependencies are not configured")
 	}
 	r.mu.Lock()
@@ -146,45 +147,29 @@ func (r *Runner) acquireDigestWithEntriesLocked(ctx context.Context, watchID int
 		return 0, fmt.Errorf("watch %d is not a discovery watch", watchID)
 	}
 	works := make([]protocol.WorkRequest, len(entries))
-	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(entries))}
 	for i, entry := range entries {
 		works[i], err = workRequestForDigest(entry)
 		if err != nil {
 			return 0, err
 		}
-		if works[i].Identifiers != nil {
-			lookupRequest.Works[i] = zotio.LookupWork{
-				DOI:   works[i].Identifiers.DOI,
-				ArXiv: works[i].Identifiers.ArXiv,
-			}
-		}
-		if lookupRequest.Works[i].DOI == "" && lookupRequest.Works[i].ArXiv == "" {
+		if works[i].Identifiers == nil || (works[i].Identifiers.DOI == "" && works[i].Identifiers.ArXiv == "") {
 			return 0, fmt.Errorf("watch digest entry %q cannot be authoritatively classified without a DOI or arXiv ID", entry.WorkKey)
 		}
 	}
-	ownership, err := r.Lookup.LookupWorks(ctx, lookupRequest)
+	unheld, err := r.classifyUnheld(ctx, works)
 	if err != nil {
-		return 0, fmt.Errorf("Zotio ownership lookup: %w", err)
-	}
-	if ownership == nil || len(ownership.Works) != len(entries) {
-		return 0, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", ownershipCount(ownership), len(entries))
-	}
-	if strings.TrimSpace(ownership.StalenessWarning) != "" {
-		return 0, fmt.Errorf("Zotio ownership lookup is stale: %s", ownership.StalenessWarning)
+		return 0, err
 	}
 
 	eligibleEntries := make([]DigestEntry, 0, len(entries))
 	eligibleWorks := make([]protocol.WorkRequest, 0, len(works))
 	consumedEntries := make([]DigestEntry, 0, len(entries))
-	for i, classification := range ownership.Works {
-		switch classification.Status {
-		case zotio.OwnershipNotOwned:
+	for i := range entries {
+		if unheld[i] {
 			eligibleEntries = append(eligibleEntries, entries[i])
 			eligibleWorks = append(eligibleWorks, works[i])
-		case zotio.OwnershipOwnedWithPDF, zotio.OwnershipOwnedMissingPDF:
+		} else {
 			consumedEntries = append(consumedEntries, entries[i])
-		default:
-			return 0, fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
 		}
 	}
 	for _, entry := range consumedEntries {
@@ -277,7 +262,7 @@ type DigestTarget struct {
 // no target's entry is consumed. It holds one mutex across the whole operation so
 // the API's multi-watch decide either applies everywhere or nowhere.
 func (r *Runner) AcquireDigests(ctx context.Context, targets []DigestTarget) error {
-	if r == nil || r.Store == nil || r.Lookup == nil || r.Submitter == nil {
+	if r == nil || r.Store == nil || (r.Lookup == nil && !r.holdingsEnabled()) || r.Submitter == nil {
 		return errors.New("watch runner dependencies are not configured")
 	}
 	if len(targets) == 0 {
@@ -567,10 +552,9 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	if watch.Mode != ModeAcquire && watch.Mode != ModeAlert {
 		return result, fmt.Errorf("unknown watch mode %q", watch.Mode)
 	}
-	// Acquisition may use either ownership authority; alert watches retain their
-	// historical Zotio ownership dependency regardless of generic holdings.
-	needsZotio := watch.Mode == ModeAlert || !r.holdingsEnabled()
-	if r.Discovery == nil || (needsZotio && r.Lookup == nil) || (watch.Mode == ModeAcquire && r.Submitter == nil) {
+	// Both modes use the same ownership authority: generic holdings when they
+	// are enabled, Zotio otherwise.
+	if r.Discovery == nil || (r.Lookup == nil && !r.holdingsEnabled()) || (watch.Mode == ModeAcquire && r.Submitter == nil) {
 		return result, errors.New("watch runner dependencies are not configured")
 	}
 	works, discoveryFailures, err := r.searchDiscovery(ctx, discovery.SearchParams{
@@ -590,48 +574,21 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		}
 		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
 	}
-	var queued []discoveredRequest
-	if watch.Mode == ModeAcquire && r.holdingsEnabled() {
-		queued, err = r.selectUnheldRequests(ctx, requests, watch.PerRunCap)
-		if err != nil {
-			return result, err
-		}
-	} else {
-		lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(requests))}
-		for i, request := range requests {
-			if request.Work.Identifiers != nil {
-				lookupRequest.Works[i] = zotio.LookupWork{
-					DOI: request.Work.Identifiers.DOI, ArXiv: request.Work.Identifiers.ArXiv,
-				}
-			}
-		}
-		ownership, err := r.Lookup.LookupWorks(ctx, lookupRequest)
-		if err != nil {
-			return result, fmt.Errorf("Zotio ownership lookup: %w", err)
-		}
-		if ownership == nil || len(ownership.Works) != len(requests) {
-			return result, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", ownershipCount(ownership), len(requests))
-		}
-		// A stale mirror (or an unconfigured Zotio) classifies from old or no
-		// data. Recording those not-owned verdicts as new alert discoveries
-		// would persist false claims past recovery, so fail the scan like
-		// AcquireDigest does and retry on the next cadence.
-		if strings.TrimSpace(ownership.StalenessWarning) != "" {
-			return result, fmt.Errorf("Zotio ownership lookup is stale: %s", ownership.StalenessWarning)
-		}
-		queued = make([]discoveredRequest, 0, min(watch.PerRunCap, len(requests)))
-		for i, classification := range ownership.Works {
-			switch classification.Status {
-			case zotio.OwnershipNotOwned:
-				if len(queued) < watch.PerRunCap {
-					queued = append(queued, requests[i])
-				}
-			case zotio.OwnershipOwnedWithPDF, zotio.OwnershipOwnedMissingPDF:
-				// Existing Zotio items are not new watch discoveries, regardless of
-				// whether their attachment is currently missing.
-			default:
-				return result, fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
-			}
+	requestWorks := make([]protocol.WorkRequest, len(requests))
+	for i, request := range requests {
+		requestWorks[i] = request.Work
+	}
+	// Classification fails the whole run before anything is recorded or
+	// submitted, so an unverifiable answer is retried on the next cadence
+	// instead of turning an unknown work into a new discovery.
+	unheld, err := r.classifyUnheld(ctx, requestWorks)
+	if err != nil {
+		return result, err
+	}
+	queued := make([]discoveredRequest, 0, min(watch.PerRunCap, len(requests)))
+	for i, request := range requests {
+		if unheld[i] && len(queued) < watch.PerRunCap {
+			queued = append(queued, request)
 		}
 	}
 	if len(queued) == 0 {
@@ -877,43 +834,85 @@ func (r *Runner) now() time.Time {
 	return time.Now().UTC()
 }
 
-// selectUnheldRequests keeps the works no configured library already holds.
-//
-// Automation is strict on purpose: an incomplete lookup fails the run so it
-// retries on the next cadence, rather than turning one unreadable export into a
-// recurring burst of duplicate acquisitions. This deliberately regularises an
-// inconsistency in the older zotio paths, where the digest run treats a
-// staleness warning as fatal while the acquire run never inspects it.
-func (r *Runner) selectUnheldRequests(ctx context.Context, requests []discoveredRequest, cap int) ([]discoveredRequest, error) {
-	queries := make([]ownership.Query, len(requests))
-	for i, request := range requests {
-		var doi, arxiv, pmid string
-		if request.Work.Identifiers != nil {
-			doi = request.Work.Identifiers.DOI
-			arxiv = request.Work.Identifiers.ArXiv
-			pmid = request.Work.Identifiers.PMID
+// classifyUnheld reports, aligned by index, which works the configured
+// ownership authority does not already hold. It is the single classification
+// used by acquisition runs, alert runs, and digest acquisition.
+func (r *Runner) classifyUnheld(ctx context.Context, works []protocol.WorkRequest) ([]bool, error) {
+	if r.holdingsEnabled() {
+		return r.unheldByHoldings(ctx, works)
+	}
+	return r.unownedByZotio(ctx, works)
+}
+
+// unownedByZotio classifies works against Zotio. Any existing Zotio item, with
+// or without its attachment, counts as held: it is neither a new discovery nor
+// a digest entry to acquire. A stale mirror (or an unconfigured Zotio)
+// classifies from old or no data, so it fails closed rather than persisting
+// false not-owned verdicts past recovery.
+func (r *Runner) unownedByZotio(ctx context.Context, works []protocol.WorkRequest) ([]bool, error) {
+	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(works))}
+	for i, request := range works {
+		if request.Identifiers != nil {
+			lookupRequest.Works[i] = zotio.LookupWork{
+				DOI: request.Identifiers.DOI, ArXiv: request.Identifiers.ArXiv,
+			}
 		}
-		queries[i] = ownership.QueryFor(doi, arxiv, pmid, request.Work.DesiredVersion, "")
+	}
+	owned, err := r.Lookup.LookupWorks(ctx, lookupRequest)
+	if err != nil {
+		return nil, fmt.Errorf("Zotio ownership lookup: %w", err)
+	}
+	if owned == nil || len(owned.Works) != len(works) {
+		return nil, fmt.Errorf("Zotio ownership lookup returned %d results for %d works", ownershipCount(owned), len(works))
+	}
+	if strings.TrimSpace(owned.StalenessWarning) != "" {
+		return nil, fmt.Errorf("Zotio ownership lookup is stale: %s", owned.StalenessWarning)
+	}
+	unowned := make([]bool, len(works))
+	for i, classification := range owned.Works {
+		switch classification.Status {
+		case zotio.OwnershipNotOwned:
+			unowned[i] = true
+		case zotio.OwnershipOwnedWithPDF, zotio.OwnershipOwnedMissingPDF:
+			// Held, whether or not its attachment is currently missing.
+		default:
+			return nil, fmt.Errorf("Zotio ownership result %d has unknown status %q", i+1, classification.Status)
+		}
+	}
+	return unowned, nil
+}
+
+// unheldByHoldings classifies works against the generic holdings sources.
+//
+// Automation is strict on purpose: an incomplete lookup fails the caller so a
+// run retries on the next cadence, rather than turning one unreadable export
+// into a recurring burst of duplicate acquisitions or false new-work alerts.
+// Only a fresh pdf_present claim counts as held; a record_present citation
+// without full text stays unheld, because acquiring it is the point of a watch
+// for someone backfilling a library.
+func (r *Runner) unheldByHoldings(ctx context.Context, works []protocol.WorkRequest) ([]bool, error) {
+	queries := make([]ownership.Query, len(works))
+	for i, request := range works {
+		var doi, arxiv, pmid string
+		if request.Identifiers != nil {
+			doi = request.Identifiers.DOI
+			arxiv = request.Identifiers.ArXiv
+			pmid = request.Identifiers.PMID
+		}
+		queries[i] = ownership.QueryFor(doi, arxiv, pmid, request.DesiredVersion, "")
 	}
 	lookup := r.Holdings.Lookup(ctx, queries)
 	if incomplete := lookup.Incomplete(); len(incomplete) != 0 {
-		return nil, fmt.Errorf("library sources unavailable (%s); ownership could not be verified, so this run was not acquired", strings.Join(incomplete, ", "))
+		return nil, fmt.Errorf("library sources unavailable (%s); ownership could not be verified, so nothing was recorded or acquired", strings.Join(incomplete, ", "))
 	}
-	if len(lookup.Works) != len(requests) {
-		return nil, fmt.Errorf("holdings lookup returned %d results for %d works", len(lookup.Works), len(requests))
+	if len(lookup.Works) != len(works) {
+		return nil, fmt.Errorf("holdings lookup returned %d results for %d works", len(lookup.Works), len(works))
 	}
-	queued := make([]discoveredRequest, 0, min(cap, len(requests)))
-	for i := range requests {
-		// A known citation without full text is not "already held": acquiring it
-		// is the whole point of a watch for someone backfilling a library.
-		if ownership.Decide(queries[i], lookup.Works[i]).Suppress {
-			continue
-		}
-		if len(queued) < cap {
-			queued = append(queued, requests[i])
-		}
+	unheld := make([]bool, len(works))
+	for i := range works {
+		unheld[i] = !ownership.Decide(queries[i], lookup.Works[i]).Suppress
 	}
-	return queued, nil
+	return unheld, nil
 }
 
 // holdingsEnabled reports whether generic holdings sources are configured and

@@ -1841,7 +1841,7 @@ func TestAdoptDownloadNormalPickedDeliveryStillSucceeds(t *testing.T) {
 }
 
 // createLiveJob makes one job and leaves it in the requested live state, so
-// parkForBrowserAdoption's own entry paths can be exercised. Existing adoption
+// parkForAdoption's own entry paths can be exercised. Existing adoption
 // tests all start from awaiting_human, where AdoptDownload returns before ever
 // calling it.
 func createLiveJob(t *testing.T, jobs *job.Store, reqID string, states ...[2]string) string {
@@ -1877,7 +1877,7 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, jobs := newTestService(t)
 			id := createLiveJob(t, jobs, "wr_park_"+tc.name, tc.steps...)
-			if err := svc.parkForBrowserAdoption(ctx, id); err != nil {
+			if err := svc.parkForAdoption(ctx, id, "browser_download_adoption"); err != nil {
 				t.Fatalf("park from %s: %v", tc.name, err)
 			}
 			row, err := jobs.Get(ctx, id)
@@ -1899,7 +1899,7 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 			}
 			// Idempotent: a second report of the same download must not open a
 			// second action or move the job again.
-			if err := svc.parkForBrowserAdoption(ctx, id); err != nil {
+			if err := svc.parkForAdoption(ctx, id, "browser_download_adoption"); err != nil {
 				t.Fatalf("second park: %v", err)
 			}
 			actions, err := jobs.ListHumanActionsForJob(ctx, id)
@@ -1930,7 +1930,7 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 		if err := jobs.Cancel(ctx, id, job.TerminalReasonBrowserCancelled); err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.parkForBrowserAdoption(ctx, id); err == nil {
+		if err := svc.parkForAdoption(ctx, id, "browser_download_adoption"); err == nil {
 			t.Fatal("a terminal job was accepted for browser adoption")
 		}
 		row, err := jobs.Get(ctx, id)

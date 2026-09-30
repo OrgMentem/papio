@@ -128,6 +128,147 @@ func (m *Multi) SearchPartial(ctx context.Context, params SearchParams) ([]Disco
 	return finalize(results, params), failures, nil
 }
 
+// SourcePage is one backend's share of a Multi paged search.
+type SourcePage struct {
+	Source string    `json:"source"`
+	State  PageState `json:"state"`
+	// Works are this backend's rows for the page, before cross-source
+	// deduplication, so a caller can judge each backend's coverage alone.
+	Works []DiscoveredWork `json:"works"`
+	// Next is the token to persist for this backend: the continuation when
+	// State is PageMore, the token the caller passed when State is
+	// PageFailed (so the position is kept), and empty otherwise.
+	Next string `json:"next,omitempty"`
+	// Failure is set only when State is PageFailed.
+	Failure *BackendFailure `json:"failure,omitempty"`
+	// Err is the unsanitized cause behind Failure, kept for errors.Is
+	// (ErrInvalidPageToken, a budget deferral). Never display it: use Failure.
+	Err error `json:"-"`
+}
+
+// MultiPage is one page of a Multi paged search.
+type MultiPage struct {
+	// Works merges every answering backend's page in preference order,
+	// deduplicated and ranked like Search, but never cut to the page size:
+	// each backend's token has already moved past every row it returned, so
+	// dropping one here would skip it for good.
+	Works []DiscoveredWork `json:"works"`
+	// Sources holds one entry per searched backend, in preference order.
+	Sources []SourcePage `json:"sources"`
+}
+
+// SearchPages is the paged form of SearchPartial. tokens maps a backend name
+// to the Next it returned last time; a missing or empty entry requests that
+// backend's first page. Each backend resumes independently, so one backend
+// running dry or failing never moves another's position.
+//
+// Every searched backend reports its own State: a backend that fails is
+// PageFailed while the others still answer, and a backend that cannot page
+// answers its single page as PageUnsupported. A token for a backend that is
+// not searched (not configured, or excluded by params.Source) is ignored, and
+// that backend is absent from Sources.
+//
+// A hard error is returned when no backend is configured, params.Source names
+// an unknown backend, or every searched backend failed; in the last case the
+// returned MultiPage still lists each backend's failed page.
+func (m *Multi) SearchPages(ctx context.Context, params SearchParams, tokens map[string]string) (MultiPage, error) {
+	if m == nil || len(m.sources) == 0 {
+		return MultiPage{}, errors.New("discovery: no discovery sources are configured")
+	}
+	params = normalizeParams(params)
+	selected := m.sources
+	if params.Source != "" {
+		selected = nil
+		for _, source := range m.sources {
+			if source != nil && source.Name() == params.Source {
+				selected = []Source{source}
+				break
+			}
+		}
+		if selected == nil {
+			return MultiPage{}, fmt.Errorf("unknown discovery source %q", params.Source)
+		}
+	}
+	result := MultiPage{Sources: make([]SourcePage, 0, len(selected))}
+	answered := make([][]DiscoveredWork, 0, len(selected))
+	hard := make([]error, 0, len(selected))
+	for _, source := range selected {
+		if source == nil {
+			hard = append(hard, errors.New("discovery: configured source is nil"))
+			continue
+		}
+		page := m.searchSourcePage(ctx, source, params, tokens[source.Name()])
+		result.Sources = append(result.Sources, page)
+		if page.State == PageFailed {
+			hard = append(hard, fmt.Errorf("%s: %w", page.Source, page.Err))
+			continue
+		}
+		answered = append(answered, page.Works)
+	}
+	if len(answered) == 0 {
+		return result, errors.Join(hard...)
+	}
+	result.Works = mergeWorks(answered)
+	rank(result.Works, params.Query)
+	return result, nil
+}
+
+// searchSourcePage fetches one backend's page and folds any error into a
+// PageFailed entry, retaining real backend failures for diagnostics exactly
+// as SearchPartial does.
+func (m *Multi) searchSourcePage(ctx context.Context, source Source, params SearchParams, token string) SourcePage {
+	name := source.Name()
+	var page Page
+	var err error
+	if pager, ok := source.(PageSearcher); ok {
+		page, err = pager.SearchPage(ctx, params, token)
+		if err == nil {
+			err = checkPage(page)
+		}
+	} else if token != "" {
+		err = fmt.Errorf("%w: %s cannot page, so it never issued a token", ErrInvalidPageToken, name)
+	} else {
+		var works []DiscoveredWork
+		works, err = source.Search(ctx, params)
+		page = Page{Works: works, State: PageUnsupported}
+	}
+	if err != nil {
+		failure := m.pageFailure(ctx, name, err)
+		return SourcePage{Source: name, State: PageFailed, Next: token, Failure: &failure, Err: err}
+	}
+	m.clearFailure(name)
+	return SourcePage{Source: name, State: page.State, Works: withSource(page.Works, name), Next: page.Next}
+}
+
+// checkPage rejects a backend page whose state and token disagree, which would
+// otherwise send a caller back to page one or end its walk silently.
+func checkPage(page Page) error {
+	switch page.State {
+	case PageMore:
+		if page.Next == "" {
+			return errors.New("discovery: backend reported more results without a page token")
+		}
+		return nil
+	case PageExhausted, PageTruncated:
+		if page.Next != "" {
+			return fmt.Errorf("discovery: backend returned a page token with state %q", page.State)
+		}
+		return nil
+	default:
+		return fmt.Errorf("discovery: backend returned invalid page state %q", page.State)
+	}
+}
+
+// pageFailure describes a failed page. Like SearchPartial it does not retain
+// a failure caused by the caller giving up; nor one caused by the caller's
+// own bad token, which says nothing about the backend's health.
+func (m *Multi) pageFailure(ctx context.Context, name string, err error) BackendFailure {
+	if ctx.Err() != nil || errors.Is(err, ErrInvalidPageToken) {
+		return BackendFailure{Source: name, Message: SanitizeError(err), At: m.clock()}
+	}
+	return m.recordFailure(name, err)
+}
+
 func withSource(works []DiscoveredWork, name string) []DiscoveredWork {
 	for _, discovered := range works {
 		if discovered.Source == "" {

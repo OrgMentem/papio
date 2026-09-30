@@ -11,6 +11,48 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **`papio jobs supply-pdf <job-id> <path>` gives a job the PDF you already
+  have.** An emailed copy, an interlibrary loan file, or an earlier download
+  no longer needs a trip through the browser's **Send PDF to papio**. The
+  command refuses a directory, a symbolic link, a file that is not a PDF, and a
+  file larger than `[fetch] max_bytes`. It copies the file into *papio*'s data
+  directory, and the daemon reads only that copy, never a path it is given. The
+  PDF then passes the same checks as a browser download: a PDF of a different
+  paper goes to identity review or is rejected, and never becomes ready. The
+  command works on a job that is still open, refuses a finished one, and
+  prints the outcome (`accepted`, `needs_review`, or `rejected`) with the
+  file's SHA-256. `papio stats producers` counts the paper as `manual`. The
+  MCP command tools do not offer this command, because it reads a local file.
+- **A `[[library.sources]]` entry can now run a command instead of reading an
+  export file.** With `kind = "command"` and an `argv` array, *papio* runs your
+  program directly, with no shell, and reads its standard output as the
+  library export. Ownership checks in `papio search`,
+  `papio acquire --batch`, and discovery watches then see your library as it
+  is now rather than as it was at the last export. The command runs at most once every
+  `refresh_seconds` (default 300), and lookups during a run share it.
+  `timeout_seconds` (default 30) and `max_output_bytes` (default 32 MiB) bound
+  each run. A run that exits non-zero, times out, prints too much, or prints
+  output that does not parse marks the source unreadable; it never makes your
+  library look empty. For `claim = "pdf_present"`, the command must print only
+  the entries whose PDF you hold.
+- **`papio watch resume <id>` puts a disabled watch back on its schedule.**
+  After five consecutive failures a watch stops running on its own, and before
+  this the only way to schedule it again was to recreate it, which gave it a new
+  id and left its digest history behind. Now fix the cause, force a run with
+  `papio watch run <id>`, and once that run succeeds, resume the watch. It keeps
+  its id, query, and digest history, and its next scheduled run comes one
+  cadence after the forced run. Resume refuses while the watch's latest run is
+  still a failure, so a broken source is never put back on the schedule
+  unchecked.
+- **Alert watches and `papio acquire --from-digest` work with a non-Zotero
+  library.** Before, only acquire watches consulted `[[library.sources]]`; an
+  alert watch without zotio failed every run, and digest acquisition could not
+  check what you already hold. Without zotio, both now use your library
+  sources with the same rules as acquire watches: a `pdf_present` match is not
+  reported as new and leaves the digest without a job, and a `record_present`
+  citation is still reported and acquired. If a source cannot be read, the
+  alert run fails and records nothing, and `--from-digest` creates no jobs and
+  keeps the digest entries. With zotio configured, nothing changes.
 - **`papio stats producers` counts a signed viewer PDF that the extension
   saved as `viewer_capture`.** Before, such a paper (for example a
   ScienceDirect PDF that Firefox kept a copy of, or that Chrome's download

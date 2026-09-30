@@ -81,18 +81,12 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 	cmd.Stdout = io.Discard
 	stderr := &tailBuffer{limit: 2 * stderrTailLimit}
 	cmd.Stderr = stderr
-	// Kill the whole process tree at deadline, not just the shell: a hook
-	// like `worker & wait` must not outlive the timeout or hold the stderr
-	// pipe open. The tree is confined the moment it starts - a process group
-	// on Unix, a kill-on-close Job Object on Windows. WaitDelay only bounds
-	// papio's wait on the pipes if a descendant escaped; it never ends one.
-	guard := newProcGuard(cmd)
-	defer guard.close()
-	cmd.Cancel = func() error { return guard.kill(cmd) }
+	// WaitDelay only bounds papio's wait on the pipes if a descendant escaped
+	// the confinement RunConfined applies; it never ends one.
 	cmd.WaitDelay = 3 * time.Second
 
 	start := time.Now()
-	err := runConfined(cmd, guard)
+	err := RunConfined(cmd)
 	result := Result{
 		Ran:        true,
 		Duration:   time.Since(start),
@@ -113,6 +107,20 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 		}
 	}
 	return result
+}
+
+// RunConfined runs cmd as one confined process tree and waits for it exactly
+// once. The tree is confined the moment it starts - a process group on Unix,
+// a kill-on-close Job Object on Windows - and cmd.Cancel is set so a context
+// deadline kills the whole tree, not just the direct child: a command like
+// `worker & wait` must not outlive its timeout or hold an output pipe open.
+// cmd must come from exec.CommandContext and must not be started yet; RunConfined
+// owns cmd.Cancel and the Unix process-group attribute.
+func RunConfined(cmd *exec.Cmd) error {
+	guard := newProcGuard(cmd)
+	defer guard.close()
+	cmd.Cancel = func() error { return guard.kill(cmd) }
+	return runConfined(cmd, guard)
 }
 
 // runConfined starts the shell, confines it before it can spawn a descendant,

@@ -151,15 +151,9 @@ func NewWithOptions(opts Options) *Client {
 // Search performs bounded OpenAlex requests and returns the mapped works. It
 // never creates or mutates an acquisition job.
 func (c *Client) Search(ctx context.Context, params SearchParams) ([]DiscoveredWork, error) {
-	if c == nil || c.client == nil {
-		return nil, errors.New("discovery: HTTP client is not configured")
-	}
-	if c.email == "" {
-		return nil, errors.New("discovery: contact email is required for the OpenAlex polite pool")
-	}
-	query := strings.TrimSpace(params.Query)
-	if query == "" && !params.HasCitationSnowball() {
-		return nil, errors.New("discovery: query is required unless a citation snowball DOI is supplied")
+	query, err := c.searchQuery(params)
+	if err != nil {
+		return nil, err
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -171,24 +165,149 @@ func (c *Client) Search(ctx context.Context, params SearchParams) ([]DiscoveredW
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.do(requestCtx, endpoint)
+	payload, err := c.fetchWorks(requestCtx, endpoint)
 	if err != nil {
 		return nil, err
 	}
+	return payload.works(), nil
+}
+
+// SearchPage is the paged form of Search, using OpenAlex cursor paging: the
+// first page sends cursor=* and each later page sends the meta.next_cursor the
+// previous page returned. Cursor paging has no result window, unlike OpenAlex's
+// page=N paging, which stops at 10,000 results.
+//
+// Ordering stability: pages keep Search's ordering, which is OpenAlex's default
+// sort — relevance_score descending when a free-text query is present, and
+// OpenAlex's own default order for a citation-only search. The cursor encodes
+// the last row's sort values, not a server-side session, so a persisted token
+// stays usable across days; but relevance scores and the corpus both drift as
+// OpenAlex reindexes, so a resumed walk can skip works that moved above the
+// cursor or repeat ones that moved below it. Callers treating a walk as
+// coverage should restart from an empty token once it is exhausted.
+func (c *Client) SearchPage(ctx context.Context, params SearchParams, token string) (Page, error) {
+	query, err := c.searchQuery(params)
+	if err != nil {
+		return Page{}, err
+	}
+	cursor := "*"
+	var seeds map[string]string
+	if token != "" {
+		decoded, err := decodePageToken(token, c.Name(), params)
+		if err != nil {
+			return Page{}, err
+		}
+		if err := validateOpenAlexPageToken(decoded, params); err != nil {
+			return Page{}, err
+		}
+		cursor, seeds = decoded.Cursor, decoded.Seeds
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if token == "" {
+		if seeds, err = c.resolveSeeds(requestCtx, params); err != nil {
+			return Page{}, err
+		}
+	}
+	endpoint, err := c.searchURL(params, query, seedFilters(seeds))
+	if err != nil {
+		return Page{}, err
+	}
+	values := endpoint.Query()
+	values.Set("cursor", cursor)
+	endpoint.RawQuery = values.Encode()
+	payload, err := c.fetchWorks(requestCtx, endpoint)
+	if err != nil {
+		return Page{}, err
+	}
+	page := Page{Works: payload.works(), State: PageExhausted}
+	next := strings.TrimSpace(payload.Meta.NextCursor)
+	// OpenAlex ends a cursor walk with a null next_cursor, and an empty page
+	// means nothing is left even if a cursor came back with it.
+	if next == "" || len(payload.Results) == 0 {
+		return page, nil
+	}
+	if next == cursor {
+		return Page{}, errors.New("discovery: OpenAlex cursor did not advance")
+	}
+	if len(next) > maxOpenAlexCursorBytes {
+		return Page{}, fmt.Errorf("discovery: OpenAlex cursor exceeds %d bytes", maxOpenAlexCursorBytes)
+	}
+	page.State = PageMore
+	page.Next = encodePageToken(pageToken{
+		Backend: c.Name(), Fingerprint: searchFingerprint(params), Cursor: next, Seeds: seeds,
+	})
+	return page, nil
+}
+
+// maxOpenAlexCursorBytes bounds a cursor carried in a page token. Real cursors
+// are about a hundred bytes; the bound keeps an issued token decodable.
+const maxOpenAlexCursorBytes = 1024
+
+// validateOpenAlexPageToken checks a decoded token's cursor and that it carries
+// a well-formed resolved work ID for exactly the citation seeds params names.
+func validateOpenAlexPageToken(token pageToken, params SearchParams) error {
+	if token.Offset != 0 || token.Cursor == "" || token.Cursor == "*" || len(token.Cursor) > maxOpenAlexCursorBytes {
+		return fmt.Errorf("%w: openalex token needs a continuation cursor", ErrInvalidPageToken)
+	}
+	wanted := 0
+	for _, seed := range openAlexSeeds(params) {
+		if strings.TrimSpace(seed.doi) == "" {
+			continue
+		}
+		wanted++
+		if id, ok := token.Seeds[seed.filter]; !ok || !validOpenAlexWorkID(id) {
+			return fmt.Errorf("%w: openalex token lacks a valid %s seed", ErrInvalidPageToken, seed.filter)
+		}
+	}
+	if len(token.Seeds) != wanted {
+		return fmt.Errorf("%w: openalex token carries unexpected seeds", ErrInvalidPageToken)
+	}
+	return nil
+}
+
+func validOpenAlexWorkID(id string) bool {
+	if openAlexWorkID(id) != id {
+		return false
+	}
+	for _, r := range id[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// searchQuery checks the client and parameters every search shares and
+// returns the trimmed free-text query.
+func (c *Client) searchQuery(params SearchParams) (string, error) {
+	if c == nil || c.client == nil {
+		return "", errors.New("discovery: HTTP client is not configured")
+	}
+	if c.email == "" {
+		return "", errors.New("discovery: contact email is required for the OpenAlex polite pool")
+	}
+	query := strings.TrimSpace(params.Query)
+	if query == "" && !params.HasCitationSnowball() {
+		return "", errors.New("discovery: query is required unless a citation snowball DOI is supplied")
+	}
+	return query, nil
+}
+
+func (c *Client) fetchWorks(ctx context.Context, endpoint *url.URL) (searchResponse, error) {
+	resp, err := c.do(ctx, endpoint)
+	if err != nil {
+		return searchResponse{}, err
+	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("discovery: OpenAlex returned HTTP %d", resp.StatusCode)
+		return searchResponse{}, fmt.Errorf("discovery: OpenAlex returned HTTP %d", resp.StatusCode)
 	}
-
 	var payload searchResponse
 	if err := decodeBoundedJSON(resp.Body, c.maxBody, &payload); err != nil {
-		return nil, fmt.Errorf("discovery: invalid OpenAlex response: %w", err)
+		return searchResponse{}, fmt.Errorf("discovery: invalid OpenAlex response: %w", err)
 	}
-	works := make([]DiscoveredWork, 0, len(payload.Results))
-	for _, record := range payload.Results {
-		works = append(works, discoveredWork(record))
-	}
-	return works, nil
+	return payload, nil
 }
 
 // LookupWork retrieves one OpenAlex work by DOI using the same bounded,
@@ -253,15 +372,30 @@ type citationSeed struct {
 	doi    string
 }
 
-func (c *Client) citationFilters(ctx context.Context, params SearchParams) ([]string, error) {
-	seeds := []citationSeed{
+// openAlexSeeds lists the citation seeds in the fixed order their filters are
+// written, so filter strings stay deterministic.
+func openAlexSeeds(params SearchParams) []citationSeed {
+	return []citationSeed{
 		{filter: "cites", doi: params.Cites},
 		{filter: "cited_by", doi: params.CitedBy},
 		{filter: "related_to", doi: params.RelatedTo},
 	}
-	resolved := make(map[string]string, len(seeds))
-	filters := make([]string, 0, len(seeds))
-	for _, seed := range seeds {
+}
+
+func (c *Client) citationFilters(ctx context.Context, params SearchParams) ([]string, error) {
+	seeds, err := c.resolveSeeds(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	return seedFilters(seeds), nil
+}
+
+// resolveSeeds maps each supplied citation filter to its OpenAlex work ID,
+// resolving each distinct DOI once. It returns nil when no seed is supplied.
+func (c *Client) resolveSeeds(ctx context.Context, params SearchParams) (map[string]string, error) {
+	var seeds map[string]string
+	resolved := make(map[string]string, 3)
+	for _, seed := range openAlexSeeds(params) {
 		if strings.TrimSpace(seed.doi) == "" {
 			continue
 		}
@@ -277,9 +411,24 @@ func (c *Client) citationFilters(ctx context.Context, params SearchParams) ([]st
 			}
 			resolved[doi] = workID
 		}
-		filters = append(filters, seed.filter+":"+workID)
+		if seeds == nil {
+			seeds = make(map[string]string, 3)
+		}
+		seeds[seed.filter] = workID
 	}
-	return filters, nil
+	return seeds, nil
+}
+
+// seedFilters renders resolved seeds as OpenAlex filter clauses in
+// openAlexSeeds order.
+func seedFilters(seeds map[string]string) []string {
+	filters := make([]string, 0, len(seeds))
+	for _, seed := range openAlexSeeds(SearchParams{}) {
+		if workID, ok := seeds[seed.filter]; ok {
+			filters = append(filters, seed.filter+":"+workID)
+		}
+	}
+	return filters
 }
 
 func (c *Client) resolveDOI(ctx context.Context, doi string) (string, error) {
@@ -397,7 +546,18 @@ func normalizeParams(params SearchParams) SearchParams {
 }
 
 type searchResponse struct {
+	Meta struct {
+		NextCursor string `json:"next_cursor"`
+	} `json:"meta"`
 	Results []workRecord `json:"results"`
+}
+
+func (payload searchResponse) works() []DiscoveredWork {
+	works := make([]DiscoveredWork, 0, len(payload.Results))
+	for _, record := range payload.Results {
+		works = append(works, discoveredWork(record))
+	}
+	return works
 }
 
 type workRecord struct {

@@ -2102,14 +2102,18 @@ func runLibraryChecks(ctx context.Context, cfg config.Config, deps IntegrationDe
 			continue
 		}
 		if !status.Complete {
-			detail := "could not be read: " + libraryFailureReason(status.FailureCode)
+			detail := "could not be read: " + libraryFailureReason(source.Kind, status.FailureCode)
 			// A source that has never loaded cannot suppress anything, which is
 			// safe; say so, because the user's real question is "why is nothing
 			// being skipped?".
 			if status.LastSuccess.IsZero() {
 				detail += "; never loaded, so nothing is de-duplicated against it"
 			}
-			add(name, Fail, detail, "check the path and format of library.sources."+source.Name)
+			remedy := "check the path and format of library.sources." + source.Name
+			if source.Kind == config.LibraryKindCommand {
+				remedy = "check the argv and format of library.sources." + source.Name + ", then run that command by hand"
+			}
+			add(name, Fail, detail, remedy)
 			continue
 		}
 		entries := "entries"
@@ -2134,7 +2138,21 @@ func runLibraryChecks(ctx context.Context, cfg config.Config, deps IntegrationDe
 // act on. The codes stay bounded on purpose: a provider inherits the daemon
 // environment, so its raw output can carry credentials and never reaches a
 // durable report.
-func libraryFailureReason(code string) string {
+func libraryFailureReason(kind, code string) string {
+	if kind == config.LibraryKindCommand {
+		switch code {
+		case ownership.FailureUnreadable:
+			return "the command could not be started, or a process it started kept its output open"
+		case ownership.FailureParse:
+			return "the command's output could not be parsed"
+		case ownership.FailureTruncated:
+			return "the command printed more than max_output_bytes"
+		case ownership.FailureTimeout:
+			return "the command did not finish within timeout_seconds"
+		case ownership.FailureExit:
+			return "the command exited with a non-zero status"
+		}
+	}
 	switch code {
 	case ownership.FailureUnreadable:
 		return "the file is missing or unreadable"

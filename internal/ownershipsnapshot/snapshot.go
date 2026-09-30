@@ -1,6 +1,7 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 // Package ownershipsnapshot loads a user's holdings from a bibliographic export
-// and answers ownership lookups from it (ADR-0008, tier 1).
+// — a file, or the stdout of a configured command — and answers ownership
+// lookups from it (ADR-0008, tiers 1 and 1.1).
 //
 // Everything here exists to make one failure impossible: a source that papio
 // cannot read must never be mistaken for a source that holds nothing. A bad
@@ -47,9 +48,9 @@ const freshnessWindow = 15 * time.Minute
 // proportional drop is unremarkable: deleting two of three entries is plausible.
 const collapseFloor = 20
 
-// NewProvider builds the holdings provider for one configured source. Only
-// kind = "file" exists in v1; a command loader and a PDF-folder scanner are
-// planned (ADR-0008) and are rejected here rather than silently ignored.
+// NewProvider builds the holdings provider for one configured source: kind =
+// "file" or "command". A PDF-folder scanner is planned (ADR-0008); unknown
+// kinds are rejected here rather than silently ignored.
 func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.Provider, error) {
 	if now == nil {
 		now = time.Now
@@ -58,16 +59,24 @@ func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.P
 	if name == "" {
 		return nil, fmt.Errorf("library source name is required")
 	}
-	if source.Kind != config.LibraryKindFile {
-		return nil, fmt.Errorf("library source %q: kind %q is not supported yet (only %q)", name, source.Kind, config.LibraryKindFile)
+	artifact, err := artifactStateForClaim(source.Claim)
+	if err != nil {
+		return nil, fmt.Errorf("library source %q: %w", name, err)
+	}
+	switch source.Kind {
+	case config.LibraryKindFile:
+	case config.LibraryKindCommand:
+		provider, err := newCommandProvider(name, source, artifact, now)
+		if err != nil {
+			return nil, err
+		}
+		return provider, nil
+	default:
+		return nil, fmt.Errorf("library source %q: kind %q is not supported (only %q or %q)", name, source.Kind, config.LibraryKindFile, config.LibraryKindCommand)
 	}
 	path := expandHome(strings.TrimSpace(source.Path))
 	if path == "" {
 		return nil, fmt.Errorf("library source %q: path is required", name)
-	}
-	artifact, err := artifactStateForClaim(source.Claim)
-	if err != nil {
-		return nil, fmt.Errorf("library source %q: %w", name, err)
 	}
 	empty := &snapshot{index: ownership.BuildIndex(nil)}
 	return &fileProvider{
@@ -249,6 +258,13 @@ func (p *fileProvider) startRefresh(ctx context.Context) *pendingRefresh {
 }
 
 func (p *fileProvider) answer(snap *snapshot, complete bool, failure string, queries []ownership.Query) ([][]ownership.Claim, ownership.SourceHealth) {
+	return answerFrom(p.name, snap, complete, failure, queries)
+}
+
+// answerFrom is the one place a snapshot becomes claims and health, shared by
+// every loader so file and command sources cannot disagree about what an
+// incomplete read may still assert.
+func answerFrom(name string, snap *snapshot, complete bool, failure string, queries []ownership.Query) ([][]ownership.Claim, ownership.SourceHealth) {
 	if snap == nil {
 		snap = &snapshot{index: ownership.BuildIndex(nil)}
 	}
@@ -257,7 +273,7 @@ func (p *fileProvider) answer(snap *snapshot, complete bool, failure string, que
 	// but never let it decide that requested work can be skipped.
 	stale := !complete
 	health := ownership.SourceHealth{
-		Name:        p.name,
+		Name:        name,
 		Complete:    complete,
 		Stale:       stale,
 		EntryCount:  snap.entryCount,
@@ -267,7 +283,7 @@ func (p *fileProvider) answer(snap *snapshot, complete bool, failure string, que
 
 	claims := make([][]ownership.Claim, len(queries))
 	for i, query := range queries {
-		claims[i] = snap.index.Claims(p.name, query)
+		claims[i] = snap.index.Claims(name, query)
 		if stale {
 			for j := range claims[i] {
 				claims[i][j].Stale = true
@@ -356,48 +372,13 @@ func (p *fileProvider) refreshSnapshot(ctx context.Context) (*snapshot, bool, st
 		return previous, false, ownership.FailureTimeout
 	}
 
-	format := p.format
-	if strings.TrimSpace(string(format)) == "" {
-		format = bibparse.Detect(p.path, data)
+	records, failure := parseHoldings(p.format, p.path, data)
+	if failure != "" {
+		return previous, false, failure
 	}
-	records, err := bibparse.ParseRecords(format, data)
-	if err != nil && !errors.Is(err, bibparse.ErrNoEntries) {
-		return previous, false, ownership.FailureParse
-	}
-	// A library with no entries is a real, successfully read state — someone who
-	// has just started — and must stay distinguishable from a source papio could
-	// not read. Acquisition treats the same input as an error; holdings does not.
+	index := ownership.BuildIndex(entriesFromRecords(records, p.artifact))
 
-	entries := make([]ownership.Entry, 0, len(records))
-	for _, record := range records {
-		identifiers := make([]ownership.Identifier, 0, 3)
-		for kind, value := range map[string]string{
-			ownership.KindDOI:   record.DOI,
-			ownership.KindArXiv: record.ArXiv,
-			ownership.KindPMID:  record.PMID,
-		} {
-			if strings.TrimSpace(value) != "" {
-				identifiers = append(identifiers, ownership.Identifier{Kind: kind, Value: value})
-			}
-		}
-		if len(identifiers) == 0 {
-			// Counted as a source record, not an error: a real library holds
-			// books, reports, and hand-typed notes with no matchable identifier.
-			continue
-		}
-		entries = append(entries, ownership.Entry{
-			Identifiers: identifiers,
-			Artifact:    p.artifact,
-			// A bibliographic export says nothing about which manifestation its
-			// full text is, which is exactly why such a source can never satisfy
-			// an explicit --desired-version published request (ownership.Decide).
-			ArtifactVersion: ownership.VersionUnknown,
-			EntityKind:      ownership.EntityUnknown,
-		})
-	}
-	index := ownership.BuildIndex(entries)
-
-	if p.collapsed(previous, len(records)) {
+	if collapsed(previous, len(records)) {
 		// A truncated or half-written export parses cleanly and simply contains
 		// less. Accepting it would quietly disable de-duplication.
 		return previous, false, ownership.FailureCountCollapse
@@ -422,9 +403,59 @@ func (p *fileProvider) refreshSnapshot(ctx context.Context) (*snapshot, bool, st
 	return next, true, ""
 }
 
+// parseHoldings decodes one export with the tolerant holdings rules shared by
+// every loader. An empty format is detected from pathHint (empty for command
+// output) and content. A structural parse error is FailureParse; a library
+// with no entries is a real, successfully read state — someone who has just
+// started — and must stay distinguishable from a source papio could not read.
+// Acquisition treats the same input as an error; holdings does not.
+func parseHoldings(format bibparse.Format, pathHint string, data []byte) ([]bibparse.Record, string) {
+	if strings.TrimSpace(string(format)) == "" {
+		format = bibparse.Detect(pathHint, data)
+	}
+	records, err := bibparse.ParseRecords(format, data)
+	if err != nil && !errors.Is(err, bibparse.ErrNoEntries) {
+		return nil, ownership.FailureParse
+	}
+	return records, ""
+}
+
+// entriesFromRecords indexes each record's DOI, arXiv, and PMID identifiers
+// with the artifact state the source declared. Titles are never indexed.
+func entriesFromRecords(records []bibparse.Record, artifact string) []ownership.Entry {
+	entries := make([]ownership.Entry, 0, len(records))
+	for _, record := range records {
+		identifiers := make([]ownership.Identifier, 0, 3)
+		for kind, value := range map[string]string{
+			ownership.KindDOI:   record.DOI,
+			ownership.KindArXiv: record.ArXiv,
+			ownership.KindPMID:  record.PMID,
+		} {
+			if strings.TrimSpace(value) != "" {
+				identifiers = append(identifiers, ownership.Identifier{Kind: kind, Value: value})
+			}
+		}
+		if len(identifiers) == 0 {
+			// Counted as a source record, not an error: a real library holds
+			// books, reports, and hand-typed notes with no matchable identifier.
+			continue
+		}
+		entries = append(entries, ownership.Entry{
+			Identifiers: identifiers,
+			Artifact:    artifact,
+			// A bibliographic export says nothing about which manifestation its
+			// full text is, which is exactly why such a source can never satisfy
+			// an explicit --desired-version published request (ownership.Decide).
+			ArtifactVersion: ownership.VersionUnknown,
+			EntityKind:      ownership.EntityUnknown,
+		})
+	}
+	return entries
+}
+
 // collapsed reports a catastrophic drop against the last good source record
 // count: not an ordinary edit, but the shape of a truncated write.
-func (p *fileProvider) collapsed(previous *snapshot, count int) bool {
+func collapsed(previous *snapshot, count int) bool {
 	if previous == nil || previous.entryCount < collapseFloor {
 		return false
 	}

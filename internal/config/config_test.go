@@ -879,10 +879,10 @@ func TestLibrarySourceValidation(t *testing.T) {
 			name: "unsupported kind",
 			cfg: func() Config {
 				cfg := valid()
-				cfg.Library.Sources[0].Kind = "command"
+				cfg.Library.Sources[0].Kind = "folder"
 				return cfg
 			}(),
-			want: "kind \"command\" is not supported",
+			want: "kind \"folder\" is not supported",
 		},
 		{
 			name: "missing path",

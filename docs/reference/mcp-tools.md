@@ -87,6 +87,7 @@ because no single CLI command supplies their MCP operation.
 
 Commands annotated `mcp:hidden`, and their whole subtrees, are excluded from
 both surfaces. The excluded commands are `init`, `config`, `daemon`,
-`native-host`, `mcp`, `browser reload`, and `drive resume`. Commands annotated `mcp:read-only` report
+`native-host`, `mcp`, `browser reload`, `drive resume`, and `jobs supply-pdf`
+(it reads a file on the local disk). Commands annotated `mcp:read-only` report
 `read_only: true` through `papio_command_search`.
 

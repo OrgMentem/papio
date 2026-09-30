@@ -83,7 +83,7 @@ func TestNewProviderRejectsUnsupportedConfiguration(t *testing.T) {
 		source config.LibrarySource
 	}{
 		{"missing name", config.LibrarySource{Kind: config.LibraryKindFile, Path: "x.bib", Claim: config.LibraryClaimPDFPresent}},
-		{"unsupported kind", config.LibrarySource{Name: "n", Kind: "command", Path: "x.bib", Claim: config.LibraryClaimPDFPresent}},
+		{"unsupported kind", config.LibrarySource{Name: "n", Kind: "folder", Path: "x.bib", Claim: config.LibraryClaimPDFPresent}},
 		{"missing path", config.LibrarySource{Name: "n", Kind: config.LibraryKindFile, Claim: config.LibraryClaimPDFPresent}},
 		{"missing claim", config.LibrarySource{Name: "n", Kind: config.LibraryKindFile, Path: "x.bib"}},
 		{"unknown claim", config.LibrarySource{Name: "n", Kind: config.LibraryKindFile, Path: "x.bib", Claim: "maybe"}},

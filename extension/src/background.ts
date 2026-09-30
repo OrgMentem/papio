@@ -7020,7 +7020,7 @@ export class Bridge {
         // filed the file. Now it reports duplicate, and this refuses.
         //
         // Bypassing the refusal is WORSE: it synthesizes an ActiveJob for a
-        // terminal job, and `parkForBrowserAdoption` rejects terminal states
+        // terminal job, and `parkForAdoption` rejects terminal states
         // (internal/app/browser_adopt.go), so `download_complete` returns
         // ErrAdoptNotAwaiting and the PDF is dropped with no message. A refusal
         // the researcher can read beats a file that vanishes.

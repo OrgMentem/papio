@@ -707,6 +707,22 @@ func TestRunIntegrationLibrarySourceChecks(t *testing.T) {
 			t.Fatalf("library source check = %#v, want actionable Fail", got)
 		}
 	})
+
+	t.Run("command source failure names the command", func(t *testing.T) {
+		cfg := libraryConfig()
+		cfg.Library.Sources[0].Kind = config.LibraryKindCommand
+		cfg.Library.Sources[0].Path = ""
+		cfg.Library.Sources[0].Argv = []string{"/usr/local/bin/export-holdings"}
+		report := RunIntegration(context.Background(), baseDeps(cfg, func(context.Context, config.Config) ([]LibrarySourceStatus, error) {
+			return []LibrarySourceStatus{{
+				Name: "owned-pdfs", FailureCode: ownership.FailureExit,
+			}}, nil
+		}))
+		got := check(t, report, "library_source:owned-pdfs")
+		if got.Status != Fail || !strings.Contains(got.Detail, "exited with a non-zero status") || !strings.Contains(got.Remediation, "check the argv") {
+			t.Fatalf("library source check = %#v, want a command-specific Fail", got)
+		}
+	})
 }
 
 func TestRunIntegrationFailsOnDanglingHostExecutable(t *testing.T) {

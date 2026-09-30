@@ -161,6 +161,67 @@ func TestWatchDigestClearHandlerRejectsBadIDAndMissingRunner(t *testing.T) {
 	}
 }
 
+// TestWatchResumeHandlerRequiresRecoveryRun drives the disable-repair-resume
+// procedure through the router: five failed runs disable the watch, resume
+// refuses until a forced run succeeds, and then restores the same watch.
+func TestWatchResumeHandlerRequiresRecoveryRun(t *testing.T) {
+	system, watchID := watchRunnerFixture(t, errors.New("fixture discovery backend refused the request"))
+	router := Router(system)
+
+	for _, params := range []map[string]any{
+		{},
+		{"id": 0},
+		{"id": -2},
+		{"id": watchID, "force": true},
+		{"id": "not-a-number"},
+	} {
+		if rpcErr := callMethod(t, router, "watch.resume", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("watch.resume %v = %#v, want invalid_argument", params, rpcErr)
+		}
+	}
+	if rpcErr := callMethod(t, router, "watch.resume", map[string]any{"id": watchID + 10_000}, nil); rpcErr == nil || rpcErr.Code != "not_found" {
+		t.Fatalf("watch.resume(missing) = %#v, want not_found", rpcErr)
+	}
+	rpcErr := callMethod(t, router, "watch.resume", map[string]any{"id": watchID}, nil)
+	if rpcErr == nil || rpcErr.Code != "precondition_failed" || rpcErr.Detail == nil || rpcErr.Detail.ErrorClass != WatchResumeNotDisabledClass {
+		t.Fatalf("watch.resume(enabled) = %#v, want precondition_failed/%s", rpcErr, WatchResumeNotDisabledClass)
+	}
+
+	for attempt := 1; attempt <= watch.DisableAfterFailures; attempt++ {
+		if rpcErr := callMethod(t, router, "watch.run", map[string]any{"id": watchID}, nil); rpcErr == nil {
+			t.Fatalf("watch.run attempt %d succeeded against a failing backend", attempt)
+		}
+	}
+	disabled, err := system.Watches.Get(context.Background(), watchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Enabled {
+		t.Fatalf("watch after %d failures = %+v, want disabled", watch.DisableAfterFailures, disabled)
+	}
+	rpcErr = callMethod(t, router, "watch.resume", map[string]any{"id": watchID}, nil)
+	if rpcErr == nil || rpcErr.Code != "precondition_failed" || rpcErr.Detail == nil || rpcErr.Detail.ErrorClass != WatchResumeRecoveryNeededClass {
+		t.Fatalf("watch.resume(before recovery) = %#v, want precondition_failed/%s", rpcErr, WatchResumeRecoveryNeededClass)
+	}
+
+	system.WatchRunner.Discovery = stubWatchBackend{}
+	if rpcErr := callMethod(t, router, "watch.run", map[string]any{"id": watchID}, nil); rpcErr != nil {
+		t.Fatalf("forced recovery watch.run = %#v", rpcErr)
+	}
+	var resumed watch.Watch
+	if rpcErr := callMethod(t, router, "watch.resume", map[string]any{"id": watchID}, &resumed); rpcErr != nil {
+		t.Fatalf("watch.resume(after recovery) = %#v", rpcErr)
+	}
+	if resumed.ID != watchID || !resumed.Enabled || resumed.ConsecutiveFailures != 0 {
+		t.Fatalf("resumed watch = %+v, want watch %d enabled with no failures", resumed, watchID)
+	}
+
+	system.Watches = nil
+	if rpcErr := callMethod(t, router, "watch.resume", map[string]any{"id": watchID}, nil); rpcErr == nil || rpcErr.Code != "precondition_failed" {
+		t.Fatalf("watch.resume without store = %#v, want precondition_failed", rpcErr)
+	}
+}
+
 // TestBrowserDevReloadHandlerRejectsUnknownFieldAndMissingHolder covers the
 // only two answers browser.dev_reload can give without a live extension
 // attached to the bridge. A latched reload needs a session that completed the

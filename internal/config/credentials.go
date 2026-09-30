@@ -225,6 +225,9 @@ func (c Config) clone() Config {
 	}
 	c.Notify.Categories = maps.Clone(c.Notify.Categories)
 	c.Library.Sources = slices.Clone(c.Library.Sources)
+	for i := range c.Library.Sources {
+		c.Library.Sources[i].Argv = slices.Clone(c.Library.Sources[i].Argv)
+	}
 	c.Discovery.Sources = slices.Clone(c.Discovery.Sources)
 	c.IgnoredKeys = slices.Clone(c.IgnoredKeys)
 	if c.Agent != nil {

@@ -171,7 +171,7 @@ no local model runtime ships yet. Credential setup is currently a CLI command.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `max_bytes` | integer bytes | `104857600` (100 MiB) | Maximum artifact-download size. It must be at least `1048576` (1 MiB). |
+| `max_bytes` | integer bytes | `104857600` (100 MiB) | Maximum artifact-download size, and the largest file `papio jobs supply-pdf` accepts. It must be at least `1048576` (1 MiB). |
 | `timeout_seconds` | integer seconds | `120` | Fetch deadline. It must be at least 5 seconds. |
 | `allow_http_loopback` | boolean | `false` | Development and test override that permits HTTP loopback. Doctor warns while it is enabled; production policy is HTTPS-only. |
 
@@ -363,18 +363,37 @@ own `papio:needs-action` and `papio:unavailable` tags with no preview step.
 
 Libraries *papio* consults to answer "do I already hold this paper?" for users
 who do not run Zotero. Repeat the table for each source (maximum 8 — every one is
-read on every search, batch, and discovery acquire-watch pass). Generic
+read on every search, batch, and discovery watch pass). Generic
 `library.sources` are ignored while `zotio.executable` is configured; otherwise
-they are the ownership authority for discovery acquire watches. Alert watches
-retain their historical zotio ownership path and do not consult generic sources.
+they are the ownership authority for discovery watches: acquire watches, alert
+watches, and `papio acquire --from-digest`.
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `name` | string | — | Required, unique, and must have no leading or trailing whitespace. Identifies the source in `papio doctor` output and in warnings. |
-| `kind` | string | — | Required. `file` is the only supported kind; anything else is rejected rather than ignored. |
-| `path` | string | — | Required for `kind = "file"`. The bibliographic export to read. `~` is expanded and the resulting path must be absolute. |
-| `format` | string | empty | `bibtex`, `ris`, `csl-json`, or `nbib`. Empty detects from the path and content. |
+| `kind` | string | — | Required. `file` reads a bibliographic export; `command` runs a program and reads its standard output as the export. Anything else is rejected rather than ignored. |
+| `path` | string | — | Required for `kind = "file"`, and must be empty for `kind = "command"`. The bibliographic export to read. `~` is expanded and the resulting path must be absolute. |
+| `format` | string | empty | `bibtex`, `ris`, `csl-json`, or `nbib`. Empty detects from the path (file sources) and content. |
 | `claim` | string | — | Required, **no default**: `pdf_present` (entries whose full text you hold, so a match may skip acquisition) or `record_present` (citations only — annotates `papio search` but never skips). |
+| `argv` | array of strings | — | Required for `kind = "command"`, rejected for `kind = "file"`. The program and its arguments, run directly with no shell. The first element is an absolute path (`~/` expands) or a bare program name, which *papio* looks up on `PATH` when it loads the config and then runs by its absolute path. A relative path such as `./export` is rejected. A shell string is not accepted: to use a pipeline, name the shell, for example `["/bin/sh", "-c", "papis export --all --format bibtex"]`. |
+| `timeout_seconds` | integer seconds | `30` | `kind = "command"` only. Deadline for one run, 1 to 300. At the deadline *papio* stops the command and all the processes it started, and the read fails. |
+| `max_output_bytes` | integer bytes | `33554432` (32 MiB) | `kind = "command"` only. Largest standard output accepted, 1 to 134217728 (128 MiB). More output fails the read; *papio* never indexes a cut-off export. |
+| `refresh_seconds` | integer seconds | `300` | `kind = "command"` only. How long one successful run answers lookups before the command runs again, 10 to 86400. |
+
+A command source runs at most once per `refresh_seconds`, never once per
+paper. Lookups that arrive while it runs share that one run. The command
+inherits the daemon's environment. Its standard input is empty, and *papio*
+never reads or reports its standard error. The command must print only the
+records its `claim` covers. For `pdf_present`, print only the entries whose PDF
+you hold; *papio* does not filter the output by attachment fields. A run fails
+when the command exits non-zero, passes `timeout_seconds`, prints more than
+`max_output_bytes`, or prints output that does not parse. A failed run never
+counts as an empty library: the source reports as unreadable. The previous
+successful run can then still mark `papio search` results, but it never skips an
+acquisition. After a failure, *papio* waits up to 30 seconds (or
+`refresh_seconds`, if shorter) before it runs the command again. When the last
+successful run is older than `refresh_seconds` plus 15 minutes, its results are
+no longer shown at all.
 
 Matching is exact on identifiers represented by the source format. No format
 supports every identifier, and titles are never matched. ISBN is excluded,
@@ -393,9 +412,9 @@ A source unreadable to *papio* is reported as unreadable, not as holding
 nothing: `papio acquire --batch` then refuses to create jobs rather than
 re-downloading the whole batch. Before the fifth consecutive failure, each
 cadence attempts another run; a successful run resets the failure count. The
-fifth consecutive failure disables the watch; there is no re-enable command.
-After fixing the source, you may force-run it once with `papio watch run <id>`,
-but scheduled execution resumes only if you recreate the watch.
+fifth consecutive failure disables the watch. After fixing the source, force a
+run with `papio watch run <id>`; when it succeeds, `papio watch resume <id>`
+puts the same watch back on its schedule.
 `--include-owned` is available only for `papio acquire --batch`, meaning
 "proceed despite ownership uncertainty". Because a bibliographic export cannot
 say *which* manifestation it holds, such a source never satisfies an explicit

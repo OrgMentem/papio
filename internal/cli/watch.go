@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/agentjson"
+	"papio/internal/api"
+	"papio/internal/ipc"
 	"papio/internal/store"
 	"papio/internal/watch"
 )
@@ -21,6 +24,7 @@ func newWatchCommand(opt *options) *cobra.Command {
 		newWatchListCommand(opt),
 		newWatchDigestCommand(opt),
 		newWatchRemoveCommand(opt),
+		newWatchResumeCommand(opt),
 		newWatchRunCommand(opt),
 	)
 	return command
@@ -215,6 +219,50 @@ func newWatchRemoveCommand(opt *options) *cobra.Command {
 			}
 			return opt.printResult(result, "Removed watch %d", result.ID)
 		},
+	}
+}
+
+func newWatchResumeCommand(opt *options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume <id>",
+		Short: "Re-enable a watch that repeated failures disabled",
+		Long: "Re-enable a watch that five consecutive failures disabled, keeping its id, query, and digest history.\n\n" +
+			"Fix the failing source first, then force a run with `papio watch run <id>`. Resume refuses until a run has succeeded since the watch was disabled.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			var result watch.Watch
+			if err := opt.call(cmd.Context(), "watch.resume", watch.IDInput{ID: id}, &result); err != nil {
+				return watchResumeError(id, err)
+			}
+			return opt.printResult(result, "Resumed watch %d (%s); it runs again every %dh", result.ID, result.Label, result.CadenceHours)
+		},
+	}
+}
+
+// watchResumeError turns a watch.resume refusal into the next step the user
+// must take. Other errors pass through unchanged.
+func watchResumeError(id int64, err error) error {
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) {
+		return err
+	}
+	class := ""
+	if remote.Detail != nil {
+		class = remote.Detail.ErrorClass
+	}
+	switch {
+	case remote.Code == "not_found":
+		return fmt.Errorf("watch %d not found (papio watch list shows existing watches): %w", id, err)
+	case class == api.WatchResumeNotDisabledClass:
+		return fmt.Errorf("watch %d is already enabled; there is nothing to resume: %w", id, err)
+	case class == api.WatchResumeRecoveryNeededClass:
+		return fmt.Errorf("watch %d has not run successfully since it was disabled; fix the failing source, run `papio watch run %d` until it succeeds, then resume it: %w", id, id, err)
+	default:
+		return err
 	}
 }
 

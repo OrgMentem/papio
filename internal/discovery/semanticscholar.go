@@ -20,6 +20,10 @@ const (
 	semanticScholarMaxLimit       = 100
 )
 
+// semanticScholarSearchWindow is how many relevance-ranked results
+// /paper/search will page through (offset+limit may not exceed it).
+const semanticScholarSearchWindow = 1000
+
 const semanticScholarFields = "externalIds,title,year,authors,isOpenAccess,openAccessPdf,citationCount,venue"
 
 // SemanticScholarOptions configures a bounded Semantic Scholar client.
@@ -66,68 +70,174 @@ func (s *SemanticScholar) Name() string {
 
 // Search performs a bounded Semantic Scholar query and maps returned papers.
 func (s *SemanticScholar) Search(ctx context.Context, params SearchParams) ([]DiscoveredWork, error) {
+	query, kind, doi, err := s.searchInputs(params)
+	if err != nil {
+		return nil, err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if kind == "" {
+		endpoint, err := s.searchURL(params, query, 0, semanticScholarLimitFor(params.Limit))
+		if err != nil {
+			return nil, err
+		}
+		payload, err := s.fetchSearch(requestCtx, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		return mapSemanticScholarPapers(payload.Data), nil
+	}
+	endpoint, err := s.snowballURL(kind, doi, 0, semanticScholarSnowballFetchLimit(params))
+	if err != nil {
+		return nil, err
+	}
+	payload, err := s.fetchCitations(requestCtx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return mapSemanticScholarPapers(filterSemanticScholarSnowballPapers(payload.papers(kind), params)), nil
+}
+
+// SearchPage is the paged form of Search, using Semantic Scholar's offset
+// paging on both /paper/search and the citation snowball endpoints. The page
+// size is capped at MaxLimit, below Search's own 100-row ceiling, so every
+// backend shares one per-call bound.
+//
+// A snowball page filtered client-side by year or OA-only fetches a larger raw
+// slice and keeps at most the page size; the next offset counts only the raw
+// rows actually examined, so a row filtered out of one page is never skipped
+// by the next.
+//
+// Ordering stability: /paper/search is relevance-ranked and reranks as the
+// corpus changes, so a persisted offset can skip or repeat papers; it also
+// stops at a 1,000-result window, reported as PageTruncated. The citation and
+// reference lists have no documented order; in practice they are stable
+// between runs for a given seed, and a new citing paper can shift a persisted
+// offset in either direction. Callers treating a walk as coverage should
+// restart from an empty token once it ends.
+func (s *SemanticScholar) SearchPage(ctx context.Context, params SearchParams, token string) (Page, error) {
+	query, kind, doi, err := s.searchInputs(params)
+	if err != nil {
+		return Page{}, err
+	}
+	window := 0
+	if kind == "" {
+		window = semanticScholarSearchWindow
+	}
+	offset := 0
+	if token != "" {
+		decoded, err := decodePageToken(token, s.Name(), params)
+		if err != nil {
+			return Page{}, err
+		}
+		if err := decoded.requireOffset(window); err != nil {
+			return Page{}, err
+		}
+		offset = decoded.Offset
+	}
+	size := pageSize(params)
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var papers []semanticScholarPaper
+	var returned, consumed int
+	var hasNext bool
+	total := -1
+	if kind == "" {
+		endpoint, err := s.searchURL(params, query, offset, min(size, window-offset))
+		if err != nil {
+			return Page{}, err
+		}
+		payload, err := s.fetchSearch(requestCtx, endpoint)
+		if err != nil {
+			return Page{}, err
+		}
+		papers, returned, consumed = payload.Data, len(payload.Data), len(payload.Data)
+		hasNext, total = payload.Next != nil, payload.Total
+	} else {
+		fetch := size
+		if semanticScholarSnowballFiltered(params) {
+			fetch = semanticScholarMaxLimit
+		}
+		endpoint, err := s.snowballURL(kind, doi, offset, fetch)
+		if err != nil {
+			return Page{}, err
+		}
+		payload, err := s.fetchCitations(requestCtx, endpoint)
+		if err != nil {
+			return Page{}, err
+		}
+		raw := payload.papers(kind)
+		returned, hasNext = len(raw), payload.Next != nil
+		papers, consumed = filterSemanticScholarSnowballPage(raw, params, size)
+	}
+	page := Page{Works: mapSemanticScholarPapers(papers), State: PageExhausted}
+	end := offset + consumed
+	switch {
+	case consumed < returned:
+		// Rows already fetched but past the page size are still pending.
+	case !hasNext:
+		// The API omits next at the end of the list, and also at the search
+		// window even when more matched; total tells the two apart.
+		if window > 0 && end >= window && total > end {
+			page.State = PageTruncated
+		}
+		return page, nil
+	case returned == 0:
+		return Page{}, errors.New("semanticscholar: pagination did not advance")
+	case window > 0 && end >= window:
+		page.State = PageTruncated
+		return page, nil
+	}
+	page.State = PageMore
+	page.Next = offsetPageToken(s.Name(), params, end)
+	return page, nil
+}
+
+// searchInputs checks the client and parameters every search shares. It
+// returns the trimmed query, or the snowball kind and normalized seed DOI.
+func (s *SemanticScholar) searchInputs(params SearchParams) (string, string, string, error) {
 	if s == nil || s.client == nil {
-		return nil, errors.New("semanticscholar: HTTP client is not configured")
+		return "", "", "", errors.New("semanticscholar: HTTP client is not configured")
 	}
 	query := strings.TrimSpace(params.Query)
 	kind, doi, err := semanticScholarSnowball(params)
 	if err != nil {
-		return nil, err
+		return "", "", "", err
 	}
 	if kind != "" && query != "" {
-		return nil, errors.New("semanticscholar: text query cannot be combined with a citation snowball")
+		return "", "", "", errors.New("semanticscholar: text query cannot be combined with a citation snowball")
 	}
 	if query == "" && kind == "" {
-		return nil, errors.New("semanticscholar: query is required unless a citation snowball DOI is supplied")
+		return "", "", "", errors.New("semanticscholar: query is required unless a citation snowball DOI is supplied")
 	}
+	return query, kind, doi, nil
+}
 
-	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if kind == "" {
-		endpoint, err := s.searchURL(params, query)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := s.do(requestCtx, endpoint)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-			return nil, fmt.Errorf("semanticscholar: returned HTTP %d", resp.StatusCode)
-		}
-		var payload semanticScholarSearchResponse
-		if err := decodeBoundedJSON(resp.Body, s.maxBody, &payload); err != nil {
-			return nil, fmt.Errorf("semanticscholar: invalid response: %w", err)
-		}
-		return mapSemanticScholarPapers(payload.Data), nil
-	}
+func (s *SemanticScholar) fetchSearch(ctx context.Context, endpoint *url.URL) (semanticScholarSearchResponse, error) {
+	var payload semanticScholarSearchResponse
+	err := s.fetchJSON(ctx, endpoint, &payload)
+	return payload, err
+}
 
-	endpoint, err := s.snowballURL(kind, doi, params)
+func (s *SemanticScholar) fetchCitations(ctx context.Context, endpoint *url.URL) (semanticScholarCitationResponse, error) {
+	var payload semanticScholarCitationResponse
+	err := s.fetchJSON(ctx, endpoint, &payload)
+	return payload, err
+}
+
+func (s *SemanticScholar) fetchJSON(ctx context.Context, endpoint *url.URL, into any) error {
+	resp, err := s.do(ctx, endpoint)
 	if err != nil {
-		return nil, err
-	}
-	resp, err := s.do(requestCtx, endpoint)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("semanticscholar: returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("semanticscholar: returned HTTP %d", resp.StatusCode)
 	}
-	var payload semanticScholarCitationResponse
-	if err := decodeBoundedJSON(resp.Body, s.maxBody, &payload); err != nil {
-		return nil, fmt.Errorf("semanticscholar: invalid response: %w", err)
+	if err := decodeBoundedJSON(resp.Body, s.maxBody, into); err != nil {
+		return fmt.Errorf("semanticscholar: invalid response: %w", err)
 	}
-	papers := make([]semanticScholarPaper, 0, len(payload.Data))
-	for _, citation := range payload.Data {
-		if kind == "citations" {
-			papers = append(papers, citation.CitingPaper)
-		} else {
-			papers = append(papers, citation.CitedPaper)
-		}
-	}
-	return mapSemanticScholarPapers(filterSemanticScholarSnowballPapers(papers, params)), nil
+	return nil
 }
 
 func semanticScholarSnowball(params SearchParams) (string, string, error) {
@@ -187,7 +297,9 @@ func (s *SemanticScholar) do(ctx context.Context, endpoint *url.URL) (*http.Resp
 	return resp, nil
 }
 
-func (s *SemanticScholar) searchURL(params SearchParams, query string) (*url.URL, error) {
+// searchURL builds a /paper/search URL. offset is omitted at zero so the first
+// page matches Search's request exactly.
+func (s *SemanticScholar) searchURL(params SearchParams, query string, offset, limit int) (*url.URL, error) {
 	base, err := s.base()
 	if err != nil {
 		return nil, err
@@ -195,7 +307,10 @@ func (s *SemanticScholar) searchURL(params SearchParams, query string) (*url.URL
 	base.Path = strings.TrimRight(base.Path, "/") + "/paper/search"
 	values := base.Query()
 	values.Set("query", query)
-	values.Set("limit", strconv.Itoa(semanticScholarLimitFor(params.Limit)))
+	if offset > 0 {
+		values.Set("offset", strconv.Itoa(offset))
+	}
+	values.Set("limit", strconv.Itoa(limit))
 	values.Set("fields", semanticScholarFields)
 	if year := semanticScholarYear(params); year != "" {
 		values.Set("year", year)
@@ -207,7 +322,7 @@ func (s *SemanticScholar) searchURL(params SearchParams, query string) (*url.URL
 	return base, nil
 }
 
-func (s *SemanticScholar) snowballURL(kind, doi string, params SearchParams) (*url.URL, error) {
+func (s *SemanticScholar) snowballURL(kind, doi string, offset, limit int) (*url.URL, error) {
 	base, err := s.base()
 	if err != nil {
 		return nil, err
@@ -223,7 +338,10 @@ func (s *SemanticScholar) snowballURL(kind, doi string, params SearchParams) (*u
 		fields[i] = prefix + "." + field
 	}
 	values.Set("fields", strings.Join(fields, ","))
-	values.Set("limit", strconv.Itoa(semanticScholarSnowballFetchLimit(params)))
+	if offset > 0 {
+		values.Set("offset", strconv.Itoa(offset))
+	}
+	values.Set("limit", strconv.Itoa(limit))
 	base.RawQuery = values.Encode()
 	return base, nil
 }
@@ -250,10 +368,16 @@ func semanticScholarLimitFor(limit int) int {
 }
 
 func semanticScholarSnowballFetchLimit(params SearchParams) int {
-	if params.YearFrom != 0 || params.YearTo != 0 || params.OAOnly {
+	if semanticScholarSnowballFiltered(params) {
 		return semanticScholarMaxLimit
 	}
 	return semanticScholarLimitFor(params.Limit)
+}
+
+// semanticScholarSnowballFiltered reports whether snowball rows are filtered
+// client-side, which needs a larger raw fetch to fill a page.
+func semanticScholarSnowballFiltered(params SearchParams) bool {
+	return params.YearFrom != 0 || params.YearTo != 0 || params.OAOnly
 }
 
 func semanticScholarYear(params SearchParams) string {
@@ -272,9 +396,16 @@ func semanticScholarYear(params SearchParams) string {
 }
 
 func filterSemanticScholarSnowballPapers(papers []semanticScholarPaper, params SearchParams) []semanticScholarPaper {
-	limit := semanticScholarLimitFor(params.Limit)
+	filtered, _ := filterSemanticScholarSnowballPage(papers, params, semanticScholarLimitFor(params.Limit))
+	return filtered
+}
+
+// filterSemanticScholarSnowballPage keeps up to limit papers that pass the
+// client-side filters and reports how many raw papers it examined, so a paged
+// caller resumes right after the last one rather than after the whole slice.
+func filterSemanticScholarSnowballPage(papers []semanticScholarPaper, params SearchParams, limit int) ([]semanticScholarPaper, int) {
 	filtered := make([]semanticScholarPaper, 0, min(len(papers), limit))
-	for _, paper := range papers {
+	for i, paper := range papers {
 		if paper.Year == 0 && (params.YearFrom != 0 || params.YearTo != 0) {
 			continue
 		}
@@ -289,21 +420,41 @@ func filterSemanticScholarSnowballPapers(papers []semanticScholarPaper, params S
 		}
 		filtered = append(filtered, paper)
 		if len(filtered) == limit {
-			break
+			return filtered, i + 1
 		}
 	}
-	return filtered
+	return filtered, len(papers)
 }
 
+// semanticScholarSearchResponse is a /paper/search page. Next is absent on the
+// last page and at the relevance window.
 type semanticScholarSearchResponse struct {
-	Data []semanticScholarPaper `json:"data"`
+	Total int                    `json:"total"`
+	Next  *int                   `json:"next"`
+	Data  []semanticScholarPaper `json:"data"`
 }
 
+// semanticScholarCitationResponse is a citations or references page. Next is
+// absent on the last page.
 type semanticScholarCitationResponse struct {
+	Next *int `json:"next"`
 	Data []struct {
 		CitingPaper semanticScholarPaper `json:"citingPaper"`
 		CitedPaper  semanticScholarPaper `json:"citedPaper"`
 	} `json:"data"`
+}
+
+// papers selects the side of each citation edge the snowball kind asks for.
+func (payload semanticScholarCitationResponse) papers(kind string) []semanticScholarPaper {
+	papers := make([]semanticScholarPaper, 0, len(payload.Data))
+	for _, citation := range payload.Data {
+		if kind == "citations" {
+			papers = append(papers, citation.CitingPaper)
+		} else {
+			papers = append(papers, citation.CitedPaper)
+		}
+	}
+	return papers
 }
 
 type semanticScholarPaper struct {

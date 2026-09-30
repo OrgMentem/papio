@@ -300,6 +300,19 @@ func TestDaemonOAFetchRecordsDaemonFetchUnattended(t *testing.T) {
 	}
 }
 
+// An operator-supplied file has no URL and never passed through the browser:
+// read as a resolver candidate it would count as daemon_fetch, the one
+// producer that claims papio chose the bytes itself.
+func TestOperatorSuppliedPDFRecordsManualProducer(t *testing.T) {
+	js := testStore(t)
+	jobID, candidateID := producerJob(t, js, "wr_producer_operator", CandidateSourceOperator, nil)
+	got := promoteForProducer(t, js, jobID, candidateID, strings.Repeat("f", 64))
+	assertProducer(t, got, ProducerManual, InterventionManualFile)
+	if got.Source != CandidateSourceOperator || got.Basis != "operator_supplied" {
+		t.Fatalf("record = %+v, want the operator source and basis", got)
+	}
+}
+
 func TestBrowserDirectGetRecordsDaemonFetch(t *testing.T) {
 	js := testStore(t)
 	sha := strings.Repeat("9", 64)

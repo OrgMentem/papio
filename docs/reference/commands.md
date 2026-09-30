@@ -1091,6 +1091,23 @@ papio jobs show <job-id> [flags]
 | --- | --- | --- | --- |
 | `--wait` | `bool` | `false` | wait for completion or human action |
 
+### `papio jobs supply-pdf`
+
+Supply a local PDF as a job's main file
+
+Supply a PDF you already have — an email attachment, an interlibrary loan copy, or an
+earlier download — as the main file of an existing job. papio copies the file into its
+data directory and runs the same checks as a browser download: the PDF must be readable
+and must be the requested work. A PDF of a different work goes to identity review or is
+rejected; it never becomes ready unchecked. Your original file is not changed.
+
+The job must still be live: queued, resolving, fetching, or awaiting a human download.
+Use add-component for supplements and appendices.
+
+```
+papio jobs supply-pdf <job-id> <path>
+```
+
 ### `papio jobs unfiled`
 
 List ready jobs whose on-ready filing is missing or failed
@@ -1339,6 +1356,18 @@ Remove a scheduled discovery watch
 
 ```
 papio watch remove <id>
+```
+
+### `papio watch resume`
+
+Re-enable a watch that repeated failures disabled
+
+Re-enable a watch that five consecutive failures disabled, keeping its id, query, and digest history.
+
+Fix the failing source first, then force a run with `papio watch run <id>`. Resume refuses until a run has succeeded since the watch was disabled.
+
+```
+papio watch resume <id>
 ```
 
 ### `papio watch run`

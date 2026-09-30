@@ -21,15 +21,27 @@ import (
 	"papio/internal/resolver"
 )
 
-// parkForBrowserAdoption moves a live job onto the existing human-adoption
-// boundary. queued has no direct edge to awaiting_human, so it first follows
-// the legal queued -> resolving edge; a scheduler race is retried from the
-// durable state it won. Parking from resolving/fetching opens a
-// manual_download action so the any-open-action adoption fence sees a genuine
-// awaiting-human action — the browser download itself is the human gesture
-// that justified the park.
-func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) error {
-	const detailReason = "browser_download_adoption"
+// adoptionStateError reports a job whose state has no legal edge onto the
+// human-adoption boundary: a terminal job, or one already validating, held
+// for review, or waiting to retry.
+type adoptionStateError struct {
+	jobID string
+	state string
+}
+
+func (e *adoptionStateError) Error() string {
+	return fmt.Sprintf("job %s is not adoptable while in state %s", e.jobID, e.state)
+}
+
+// parkForAdoption moves a live job onto the existing human-adoption boundary.
+// queued has no direct edge to awaiting_human, so it first follows the legal
+// queued -> resolving edge; a scheduler race is retried from the durable
+// state it won. Parking from resolving/fetching opens a manual_download
+// action so the any-open-action adoption fence sees a genuine awaiting-human
+// action — the browser download or the operator's supply-pdf command is
+// itself the human gesture that justified the park. reason names that
+// gesture in the transition detail.
+func (s *Service) parkForAdoption(ctx context.Context, jobID, reason string) error {
 	for range 4 {
 		row, err := s.Jobs.Get(ctx, jobID)
 		if err != nil {
@@ -40,11 +52,11 @@ func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) erro
 			return nil
 		case job.StateQueued:
 			err = s.Jobs.Transition(ctx, jobID, job.StateQueued, job.StateResolving,
-				map[string]any{"reason": detailReason})
+				map[string]any{"reason": reason})
 		case job.StateResolving, job.StateFetching:
 			prev := row.State
 			err = s.Jobs.Transition(ctx, jobID, prev, job.StateAwaitingHuman,
-				map[string]any{"reason": detailReason})
+				map[string]any{"reason": reason})
 			if err == nil {
 				if _, aErr := s.Jobs.OpenHumanAction(ctx, jobID, job.CandidateEligibleKind, "please download the paper", job.Access(false, "")); aErr != nil {
 					return nil
@@ -52,7 +64,7 @@ func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) erro
 				return nil
 			}
 		default:
-			return fmt.Errorf("job %s is not adoptable while in state %s", jobID, row.State)
+			return &adoptionStateError{jobID: jobID, state: row.State}
 		}
 		if err == nil {
 			continue
@@ -61,7 +73,7 @@ func (s *Service) parkForBrowserAdoption(ctx context.Context, jobID string) erro
 			return err
 		}
 	}
-	return fmt.Errorf("job %s changed while preparing browser adoption", jobID)
+	return fmt.Errorf("job %s changed while preparing adoption", jobID)
 }
 
 // resolveAdoptionRoots returns the symlink-resolved landing directories for
@@ -143,27 +155,9 @@ func confineToAdoptionRoots(roots []string, resolved string) error {
 // manual_download action) when the file is rejected so the human can supply a
 // different one.
 func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
-	if s.Validate == nil {
-		return fmt.Errorf("acquisition service is missing its validation dependency")
-	}
-	if err := s.reconcilePreparedPublications(ctx, jobID); err != nil {
-		return err
-	}
-	row, err := s.Jobs.Get(ctx, jobID)
+	row, err := s.prepareMainAdoption(ctx, jobID, "browser_download_adoption")
 	if err != nil {
 		return err
-	}
-	if row.State != job.StateAwaitingHuman {
-		if err := s.parkForBrowserAdoption(ctx, jobID); err != nil {
-			return err
-		}
-		row, err = s.Jobs.Get(ctx, jobID)
-		if err != nil {
-			return err
-		}
-	}
-	if row.State != job.StateAwaitingHuman {
-		return fmt.Errorf("job %s is not awaiting a human handoff (state %s)", jobID, row.State)
 	}
 	// Defense in depth: the bridge already confined the path, but re-confine
 	// under the job's adoption root and reject symlinks/irregular files here too.
@@ -182,15 +176,99 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	if err := confineToAdoptionRoots(roots, resolved); err != nil {
 		return fmt.Errorf("adoption path rejected: %w", err)
 	}
-	path = resolved
+	_, err = s.adoptMainPDF(ctx, row, mainPDFOrigin{
+		source:     "browser",
+		url:        "browser://adopted-download",
+		keyPrefix:  "browser-adopt:sha256:",
+		copyInto:   func(dst string) (string, int64, error) { return copyHashed(resolved, dst) },
+		transition: s.Jobs.TransitionAwaitingToValidatingIfAdoptEligible,
+		rejected: func(ctx context.Context, jobID string, access job.AccessClassification) error {
+			return s.rejectAdoptedDownload(ctx, jobID, resolved, access)
+		},
+	})
+	return err
+}
 
+// prepareMainAdoption brings jobID onto the awaiting_human adoption boundary
+// for a main PDF and returns its row. parkReason names the human gesture that
+// supplied the file in the park's transition detail.
+func (s *Service) prepareMainAdoption(ctx context.Context, jobID, parkReason string) (*job.Row, error) {
+	if s.Validate == nil {
+		return nil, fmt.Errorf("acquisition service is missing its validation dependency")
+	}
+	if err := s.reconcilePreparedPublications(ctx, jobID); err != nil {
+		return nil, err
+	}
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if row.State != job.StateAwaitingHuman {
+		if err := s.parkForAdoption(ctx, jobID, parkReason); err != nil {
+			return nil, err
+		}
+		row, err = s.Jobs.Get(ctx, jobID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if row.State != job.StateAwaitingHuman {
+		return nil, fmt.Errorf("job %s is not awaiting a human handoff (state %s)", jobID, row.State)
+	}
+	return row, nil
+}
+
+// mainPDFOrigin is what differs between the two ways a person hands papio a
+// job's main PDF: a browser download and a local file the operator supplied.
+// Everything else — the lease, quarantine, the candidate keyed by content,
+// validation, the review gate and the outcomes — is one path.
+type mainPDFOrigin struct {
+	// source, url and keyPrefix shape the synthetic candidate; the content
+	// hash follows keyPrefix in its url_key.
+	source    string
+	url       string
+	keyPrefix string
+	// copyInto copies the supplied bytes into the quarantine file dst while
+	// hashing them.
+	copyInto func(dst string) (sha string, size int64, err error)
+	// transition is the guarded awaiting_human -> validating move.
+	transition func(ctx context.Context, jobID string, candidateID int64) error
+	// rejected handles a file validation rejected. The job is in fetching;
+	// the handler must park it again and ask for a different file.
+	rejected func(ctx context.Context, jobID string, access job.AccessClassification) error
+}
+
+// Main-PDF adoption outcomes, as SupplyPDF reports them.
+const (
+	// AdoptionAccepted: the file passed validation and the job is ready.
+	AdoptionAccepted = "accepted"
+	// AdoptionNeedsReview: validation held the file for a human decision.
+	AdoptionNeedsReview = "needs_review"
+	// AdoptionRejected: validation refused the file and the job waits for a
+	// different one.
+	AdoptionRejected = "rejected"
+)
+
+// adoptedMainPDF is what one main-PDF adoption did.
+type adoptedMainPDF struct {
+	candidateID int64
+	sha256      string
+	outcome     string
+}
+
+// adoptMainPDF runs one human-supplied main PDF for a job parked at
+// awaiting_human through the validation pipeline fetched candidates use. See
+// AdoptDownload for the lease and the outcomes.
+func (s *Service) adoptMainPDF(ctx context.Context, row *job.Row, origin mainPDFOrigin) (adoptedMainPDF, error) {
+	jobID := row.ID
+	var adopted adoptedMainPDF
 	owner := job.NewID("adopt")
 	held, err := s.Jobs.LeaseAwaitingHuman(ctx, jobID, owner, 5*time.Minute)
 	if err != nil {
-		return err
+		return adopted, err
 	}
 	if !held {
-		return fmt.Errorf("job %s is not adoptable right now", jobID)
+		return adopted, fmt.Errorf("job %s is not adoptable right now", jobID)
 	}
 	defer func() { _ = s.Jobs.Release(context.WithoutCancel(ctx), jobID, owner) }()
 
@@ -198,44 +276,45 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	// validated file promotes with an atomic rename) while hashing it.
 	qdir, err := s.Artifacts.QuarantineDir(jobID)
 	if err != nil {
-		return err
+		return adopted, err
 	}
 	temp := filepath.Join(qdir, job.NewID("adopt")+".tmp")
-	sha, size, err := copyHashed(path, temp)
+	sha, size, err := origin.copyInto(temp)
 	if err != nil {
-		return err
+		return adopted, err
 	}
+	adopted.sha256 = sha
 
-	// Synthetic provenance: a browser-adopted institutional download of unknown
-	// reuse license. Key the candidate by content so accepting an identity review
-	// applies only to those exact bytes. The scheduler deliberately re-resolves
-	// after review acceptance; a repeated adoption of the unchanged file must
+	// Synthetic provenance: a human-supplied file of unknown reuse license.
+	// Key the candidate by content so accepting an identity review applies
+	// only to those exact bytes. The scheduler deliberately re-resolves after
+	// review acceptance; a repeated adoption of the unchanged file must
 	// therefore recover the candidate's durable review_override instead of
 	// creating a fresh candidate and parking the same PDF forever.
 	//
 	// The version is `unknown` and must stay that way: adoption observes bytes
-	// arriving from a human's browser, never which version that human chose.
+	// arriving from a human, never which version that human chose.
 	// `Policy.DesiredVersion` is a ranking *preference* for resolver candidates —
 	// echoing it back here would report the request as an obtained fact, and a
 	// consumer that gates an adverse finding on the version would act on papio's
 	// own guess (ADR-0007).
 	version := resolver.VersionUnknown
-	key := "browser-adopt:sha256:" + sha
+	key := origin.keyPrefix + sha
 	if result, ok := ctx.Value(adoptionCandidateResultKey{}).(*adoptionCandidateResult); ok {
 		result.Key = key
 	}
 	if _, err := s.Jobs.InsertCandidates(ctx, jobID, []job.Candidate{{
-		JobID: jobID, Source: "browser", URLRedacted: "browser://adopted-download",
+		JobID: jobID, Source: origin.source, URLRedacted: origin.url,
 		URLKey: key, Version: version, AccessBasis: resolver.AccessManual, ReuseLicense: "unknown",
 		ExpectedMIME: "application/pdf", Direct: true, IdentityConfidence: 0.5, Rank: 0,
 	}}); err != nil {
 		_ = os.Remove(temp)
-		return err
+		return adopted, err
 	}
 	id, err := s.Jobs.CandidateIDByKey(ctx, jobID, key)
 	if err != nil {
 		_ = os.Remove(temp)
-		return err
+		return adopted, err
 	}
 	// InsertCandidates is INSERT OR IGNORE on (job_id, url_key), so re-adopting
 	// the same bytes keeps whatever row already exists — including one written
@@ -243,24 +322,25 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 	// back, or the old `published` claim outlives the fix.
 	if err := s.Jobs.MarkCandidateVersionUnobserved(ctx, id); err != nil {
 		_ = os.Remove(temp)
-		return err
+		return adopted, err
 	}
 	stored, err := s.Jobs.GetCandidate(ctx, id)
 	if err != nil {
 		_ = os.Remove(temp)
-		return err
+		return adopted, err
 	}
+	adopted.candidateID = stored.ID
 	if result, ok := ctx.Value(adoptionCandidateResultKey{}).(*adoptionCandidateResult); ok {
 		result.ID = stored.ID
 	}
 
 	result := fetch.Result{
 		TempPath: temp, SHA256: sha, SizeBytes: size,
-		SniffedMIME: "application/pdf", ContentType: "application/pdf", FinalHost: "browser",
+		SniffedMIME: "application/pdf", ContentType: "application/pdf", FinalHost: origin.source,
 	}
-	if err := s.Jobs.TransitionAwaitingToValidatingIfAdoptEligible(ctx, jobID, stored.ID); err != nil {
+	if err := origin.transition(ctx, jobID, stored.ID); err != nil {
 		_ = os.Remove(temp)
-		return err
+		return adopted, err
 	}
 	replacementAccess := s.adoptionReplacementAccess(ctx, jobID)
 	s.resolveAdoptedHandoffActions(ctx, jobID)
@@ -273,35 +353,48 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 		// reply. Leave it validating for the journal recovery path instead.
 		prepared, preparedErr := s.Jobs.PreparedPublications(context.WithoutCancel(ctx), jobID)
 		if preparedErr != nil {
-			return errors.Join(err, fmt.Errorf("checking prepared browser publication: %w", preparedErr))
+			return adopted, errors.Join(err, fmt.Errorf("checking prepared adoption publication: %w", preparedErr))
 		}
 		for _, publication := range prepared {
 			if publication.Role == job.PublicationRoleMain && publication.CandidateID != nil && *publication.CandidateID == stored.ID {
-				return err
+				return adopted, err
 			}
 		}
 		// validateCandidate returns before completing a transition on an
 		// infrastructure error (start-attempt / preparation failure),
 		// leaving the job in validating. Left there, the scheduler's
 		// RecoverStale rewinds it to resolving and re-fetches, discarding the
-		// user's supplied download for whatever OA resolution finds. Re-park in
-		// awaiting_human (best-effort) so the file — still in the adoption
-		// directory — is preserved and re-driven by the directory sweep; a
-		// transient store error clears on a later tick. The original error is
-		// still returned so the bridge records it as browser.adoption_deferred.
+		// human's supplied file for whatever OA resolution finds. Re-park in
+		// awaiting_human (best-effort) so the file can be supplied again: a
+		// browser download stays in the adoption directory and the directory
+		// sweep re-drives it; a transient store error clears on a later tick.
+		// The original error is still returned so the caller reports it (the
+		// bridge records it as browser.adoption_deferred).
 		_ = s.park(context.WithoutCancel(ctx), jobID, job.StateValidating, job.StateAwaitingHuman,
 			map[string]any{"reason": "adoption_validation_error"})
-		return err
+		return adopted, err
 	}
-	if accepted || parked {
-		return nil
+	switch {
+	case accepted:
+		adopted.outcome = AdoptionAccepted
+		return adopted, nil
+	case parked:
+		adopted.outcome = AdoptionNeedsReview
+		return adopted, nil
 	}
 	// Rejected: validateCandidate returned the job to fetching. There is no next
-	// candidate to fetch for an adopted download, so re-park in awaiting_human
-	// and ask the human for a different file. Move the rejected file out of the
-	// adoption directory (into a sibling rejected/<job_id>/ dir, preserving it
-	// for the user) so the daemon's directory sweep does not re-adopt and
-	// re-reject the same file forever.
+	// candidate to fetch for a supplied file, so the origin re-parks the job and
+	// asks the human for a different file.
+	adopted.outcome = AdoptionRejected
+	return adopted, origin.rejected(ctx, jobID, replacementAccess)
+}
+
+// rejectAdoptedDownload re-parks a job whose browser download failed
+// validation in awaiting_human and asks the human for a different file. It
+// moves the rejected file out of the adoption directory (into a sibling
+// rejected/<job_id>/ dir, preserving it for the user) so the daemon's
+// directory sweep does not re-adopt and re-reject the same file forever.
+func (s *Service) rejectAdoptedDownload(ctx context.Context, jobID, path string, replacementAccess job.AccessClassification) error {
 	rejectDir := filepath.Join(s.Config.EffectiveAdoptionRoot(), "rejected", jobID)
 	moved := false
 	if mkErr := os.MkdirAll(rejectDir, 0o700); mkErr == nil {
@@ -447,12 +540,18 @@ func copyHashed(src, dst string) (sha string, size int64, err error) {
 		return "", 0, err
 	}
 	defer func() { _ = in.Close() }()
+	return writeHashed(in, dst)
+}
+
+// writeHashed streams r into dst (created 0600, never an existing file) while
+// computing its SHA-256 and size. dst is removed if the copy fails.
+func writeHashed(r io.Reader, dst string) (sha string, size int64, err error) {
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", 0, err
 	}
 	h := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(out, h), in)
+	n, copyErr := io.Copy(io.MultiWriter(out, h), r)
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(dst)

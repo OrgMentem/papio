@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -559,14 +560,15 @@ type LibrarySource struct {
 	// Name identifies the source in health reporting and doctor output. It must
 	// be unique: it is the only handle a user has on one feed among several.
 	Name string `toml:"name"`
-	// Kind is "file" — the only v1 loader. A command loader and a PDF-folder
-	// scanner are planned (ADR-0008), so the field exists to keep the config
-	// shape final; unknown kinds are rejected rather than ignored.
+	// Kind is "file" (read a bibliographic export) or "command" (run a program
+	// whose stdout is the export). A PDF-folder scanner is planned (ADR-0008);
+	// unknown kinds are rejected rather than ignored.
 	Kind string `toml:"kind"`
-	// Path is the bibliographic export to read, for kind = "file".
+	// Path is the bibliographic export to read, for kind = "file". It must be
+	// empty for kind = "command".
 	Path string `toml:"path"`
 	// Format names the encoding: bibtex, ris, csl-json, or nbib. Empty means
-	// detect from the path and content.
+	// detect from the path (file sources only) and content.
 	Format string `toml:"format"`
 	// Claim is what this source asserts about every record it emits:
 	// "pdf_present" (entries whose full text you hold, so a match may suppress
@@ -577,6 +579,25 @@ type LibrarySource struct {
 	// papis `files`, CSL `note`) — that is manager convention knowledge this
 	// abstraction must not carry, and CSL `note` is free text, not a contract.
 	Claim string `toml:"claim"`
+	// Argv is the program and arguments for kind = "command", run directly
+	// with no shell. argv[0] is an absolute path (a leading "~/" expands) or a
+	// bare program name, which validation resolves on PATH once and pins as an
+	// absolute path. A pipeline names its shell explicitly, e.g.
+	// ["/bin/sh", "-c", "…"], so the shell is visible in the config. The
+	// command must print only the records its claim covers: papio does not
+	// filter its output by attachment status.
+	Argv []string `toml:"argv,omitempty"`
+	// TimeoutSeconds bounds one command run, for kind = "command". Zero means
+	// DefaultLibraryCommandTimeoutSeconds.
+	TimeoutSeconds int `toml:"timeout_seconds,omitempty"`
+	// MaxOutputBytes caps a command's stdout, for kind = "command". Output past
+	// the cap fails the read rather than indexing a truncated library. Zero
+	// means DefaultLibraryCommandMaxOutputBytes.
+	MaxOutputBytes int64 `toml:"max_output_bytes,omitempty"`
+	// RefreshSeconds is how long one successful command run answers lookups
+	// before the command runs again, for kind = "command". Zero means
+	// DefaultLibraryCommandRefreshSeconds.
+	RefreshSeconds int `toml:"refresh_seconds,omitempty"`
 }
 
 // Claim values for LibrarySource.Claim.
@@ -585,8 +606,61 @@ const (
 	LibraryClaimRecordPresent = "record_present"
 )
 
-// LibraryKindFile is the only source kind v1 implements.
-const LibraryKindFile = "file"
+// Source kinds for LibrarySource.Kind.
+const (
+	LibraryKindFile    = "file"
+	LibraryKindCommand = "command"
+)
+
+// Bounds for command sources (ADR-0008). A command runs at most once per
+// refresh interval, never once per work, so the defaults favour a complete
+// read over a fast one.
+const (
+	DefaultLibraryCommandTimeoutSeconds = 30
+	MaxLibraryCommandTimeoutSeconds     = 300
+	DefaultLibraryCommandMaxOutputBytes = 32 << 20
+	MaxLibraryCommandMaxOutputBytes     = 128 << 20
+	DefaultLibraryCommandRefreshSeconds = 300
+	MinLibraryCommandRefreshSeconds     = 10
+	MaxLibraryCommandRefreshSeconds     = 86400
+)
+
+// LibraryCommandLimits are a command source's resolved execution bounds.
+type LibraryCommandLimits struct {
+	Timeout        time.Duration
+	MaxOutputBytes int64
+	Refresh        time.Duration
+}
+
+// CommandLimits resolves a command source's bounds, substituting the default
+// for each zero field and rejecting any value outside its range. Validation and
+// the loader share it so the two can never disagree about a bound.
+func (s LibrarySource) CommandLimits() (LibraryCommandLimits, error) {
+	limits := LibraryCommandLimits{
+		Timeout:        DefaultLibraryCommandTimeoutSeconds * time.Second,
+		MaxOutputBytes: DefaultLibraryCommandMaxOutputBytes,
+		Refresh:        DefaultLibraryCommandRefreshSeconds * time.Second,
+	}
+	if s.TimeoutSeconds != 0 {
+		if s.TimeoutSeconds < 1 || s.TimeoutSeconds > MaxLibraryCommandTimeoutSeconds {
+			return LibraryCommandLimits{}, fmt.Errorf("timeout_seconds must be between 1 and %d", MaxLibraryCommandTimeoutSeconds)
+		}
+		limits.Timeout = time.Duration(s.TimeoutSeconds) * time.Second
+	}
+	if s.MaxOutputBytes != 0 {
+		if s.MaxOutputBytes < 1 || s.MaxOutputBytes > MaxLibraryCommandMaxOutputBytes {
+			return LibraryCommandLimits{}, fmt.Errorf("max_output_bytes must be between 1 and %d", MaxLibraryCommandMaxOutputBytes)
+		}
+		limits.MaxOutputBytes = s.MaxOutputBytes
+	}
+	if s.RefreshSeconds != 0 {
+		if s.RefreshSeconds < MinLibraryCommandRefreshSeconds || s.RefreshSeconds > MaxLibraryCommandRefreshSeconds {
+			return LibraryCommandLimits{}, fmt.Errorf("refresh_seconds must be between %d and %d", MinLibraryCommandRefreshSeconds, MaxLibraryCommandRefreshSeconds)
+		}
+		limits.Refresh = time.Duration(s.RefreshSeconds) * time.Second
+	}
+	return limits, nil
+}
 
 // MaxLibrarySources bounds per-lookup work: every configured source is consulted
 // on every search, batch, and watch pass.
@@ -787,6 +861,18 @@ func (c Config) LibraryFingerprint() string {
 			_, _ = hash.Write(length[:])
 			_, _ = hash.Write([]byte(value))
 		}
+		// Only a command source carries an argv block, and its kind is already
+		// hashed above, so the encoding stays unambiguous while file-source
+		// fingerprints stay what they were before command sources existed.
+		if source.Kind == LibraryKindCommand {
+			binary.BigEndian.PutUint64(length[:], uint64(len(source.Argv)))
+			_, _ = hash.Write(length[:])
+			for _, arg := range source.Argv {
+				binary.BigEndian.PutUint64(length[:], uint64(len(arg)))
+				_, _ = hash.Write(length[:])
+				_, _ = hash.Write([]byte(arg))
+			}
+		}
 	}
 	return hex.EncodeToString(hash.Sum(nil))
 }
@@ -982,6 +1068,45 @@ func normalizeLibrarySourcePath(path string) string {
 		return filepath.Clean(path)
 	}
 	return path
+}
+
+// normalizeLibraryCommandArgv returns a command source's argv with argv[0]
+// pinned to an absolute program path. A bare program name is resolved on PATH
+// here, once, so the daemon runs exactly the program validation accepted rather
+// than whatever its own PATH finds later. A relative path is rejected: it would
+// depend on the daemon's working directory. Errors start with the field name.
+func normalizeLibraryCommandArgv(argv []string) ([]string, error) {
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("argv is required for kind %q", LibraryKindCommand)
+	}
+	for i, arg := range argv {
+		if strings.ContainsRune(arg, 0) {
+			return nil, fmt.Errorf("argv[%d] must not contain a NUL byte", i)
+		}
+	}
+	program := argv[0]
+	if program == "" || strings.TrimSpace(program) != program {
+		return nil, errors.New("argv[0] must name a program without surrounding whitespace")
+	}
+	program = normalizeLibrarySourcePath(program)
+	switch {
+	case filepath.IsAbs(program):
+	case strings.ContainsAny(program, `/\`):
+		return nil, fmt.Errorf("argv[0] %q must be an absolute path or a program name on PATH", argv[0])
+	default:
+		resolved, err := exec.LookPath(program)
+		if err != nil {
+			return nil, fmt.Errorf("argv[0] %q is not an absolute path and was not found on PATH: %w", argv[0], err)
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return nil, fmt.Errorf("argv[0] %q: %w", argv[0], err)
+		}
+		program = resolved
+	}
+	out := slices.Clone(argv)
+	out[0] = program
+	return out, nil
 }
 
 func (c *Config) validate() error {
@@ -1303,10 +1428,27 @@ func (c *Config) validateLibrary() error {
 			if !filepath.IsAbs(source.Path) {
 				return fmt.Errorf("library.sources[%q].path must be absolute", name)
 			}
+			if len(source.Argv) > 0 || source.TimeoutSeconds != 0 || source.MaxOutputBytes != 0 || source.RefreshSeconds != 0 {
+				return fmt.Errorf("library.sources[%q]: argv, timeout_seconds, max_output_bytes, and refresh_seconds apply only to kind %q", name, LibraryKindCommand)
+			}
+		case LibraryKindCommand:
+			// The command's stdout is the export. A path beside it would be a
+			// second, contradictory answer to "what does this source read?".
+			if source.Path != "" {
+				return fmt.Errorf("library.sources[%q].path must be empty for kind %q (the command's stdout is the export)", name, LibraryKindCommand)
+			}
+			argv, err := normalizeLibraryCommandArgv(source.Argv)
+			if err != nil {
+				return fmt.Errorf("library.sources[%q].%w", name, err)
+			}
+			c.Library.Sources[i].Argv = argv
+			if _, err := source.CommandLimits(); err != nil {
+				return fmt.Errorf("library.sources[%q].%w", name, err)
+			}
 		case "":
-			return fmt.Errorf("library.sources[%q].kind is required (%q)", name, LibraryKindFile)
+			return fmt.Errorf("library.sources[%q].kind is required (%q or %q)", name, LibraryKindFile, LibraryKindCommand)
 		default:
-			return fmt.Errorf("library.sources[%q].kind %q is not supported (only %q in v1; command sources are planned for v1.1)", name, source.Kind, LibraryKindFile)
+			return fmt.Errorf("library.sources[%q].kind %q is not supported (only %q or %q)", name, source.Kind, LibraryKindFile, LibraryKindCommand)
 		}
 		switch source.Format {
 		case "", string(bibparse.FormatBibTeX), string(bibparse.FormatRIS), string(bibparse.FormatCSLJSON), string(bibparse.FormatNBIB):

@@ -86,6 +86,18 @@ func AdoptEligibleTx(ctx context.Context, tx *sql.Tx, jobID string) (bool, error
 // the same connection, so a concurrent DismissHumanAction commit cannot slip
 // between them. Reads inside go through tx only.
 func (js *Store) TransitionAwaitingToValidatingIfAdoptEligible(ctx context.Context, jobID string, candidateID int64) error {
+	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_browser_download", "browser")
+}
+
+// TransitionAwaitingToValidatingForSuppliedPDF is the same guarded transition
+// for a main PDF the operator supplied from a local file. Only the recorded
+// reason and source differ, so the job's events never attribute those bytes
+// to the browser.
+func (js *Store) TransitionAwaitingToValidatingForSuppliedPDF(ctx context.Context, jobID string, candidateID int64) error {
+	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_supplied_pdf", CandidateSourceOperator)
+}
+
+func (js *Store) transitionAwaitingToValidating(ctx context.Context, jobID string, candidateID int64, reason, source string) error {
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -99,7 +111,7 @@ func (js *Store) TransitionAwaitingToValidatingIfAdoptEligible(ctx context.Conte
 		return fmt.Errorf("%w: %s", ErrAdoptNotAwaiting, AdoptAwaitingDetail)
 	}
 	now := store.Now()
-	detail := map[string]any{"reason": "adopt_browser_download", "source": "browser", "from": StateAwaitingHuman, "to": StateValidating}
+	detail := map[string]any{"reason": reason, "source": source, "from": StateAwaitingHuman, "to": StateValidating}
 	detailJSON, err := json.Marshal(detail)
 	if err != nil {
 		return err

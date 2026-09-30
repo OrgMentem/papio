@@ -184,6 +184,19 @@ type RepairResult struct {
 	State    string `json:"state,omitempty"`
 }
 
+// SupplyPDFResult reports what jobs.supply_pdf did with one main PDF the
+// operator supplied from a local file. Outcome is a closed vocabulary —
+// accepted (the job is ready), needs_review (identity or safety review holds
+// it), rejected (validation refused it; the job waits for a different file) —
+// and State is the job's state afterwards. SHA256 names the supplied bytes.
+type SupplyPDFResult struct {
+	JobID       string `json:"job_id"`
+	Outcome     string `json:"outcome"`
+	State       string `json:"state"`
+	SHA256      string `json:"sha256"`
+	CandidateID int64  `json:"candidate_id"`
+}
+
 // RedriveResult reports the new institutional handoff after one operator
 // request. ActionID is zero when the redrive returned the job to resolving
 // instead: a manual download the open-access route left, or a job whose
@@ -287,6 +300,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"watch.remove": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return removeWatch(ctx, raw, system)
 		},
+		"watch.resume": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return resumeWatch(ctx, raw, system)
+		},
 		"watch.run": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return runWatch(ctx, raw, system)
 		},
@@ -346,6 +362,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"jobs.add_component": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return addComponent(ctx, raw, system)
+		},
+		"jobs.supply_pdf": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return supplyPDF(ctx, raw, system)
 		},
 		"jobs.repair_awaiting_human": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return repairAwaitingHuman(ctx, raw, system)
@@ -1011,6 +1030,39 @@ func removeWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.Sys
 	return marshal(WatchRemoveResult{ID: params.ID, Removed: true})
 }
 
+// Error classes for watch.resume refusals. The CLI keys its guidance on them,
+// so they are part of the method's contract.
+const (
+	WatchResumeNotDisabledClass    = "watch_not_disabled"
+	WatchResumeRecoveryNeededClass = "watch_recovery_run_required"
+)
+
+// resumeWatch re-enables a watch that repeated failures disabled. It is its
+// own method rather than a flag on watch.run so existing IPC shapes stay
+// strict. It refuses unless a forced run has succeeded since the disable.
+func resumeWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params watch.IDInput
+	if err := ipc.DecodeParams(raw, &params); err != nil || params.ID <= 0 {
+		if err == nil {
+			err = errors.New("watch id is required")
+		}
+		return badParams(err)
+	}
+	if system == nil || system.Watches == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
+	}
+	resumed, err := system.Watches.Resume(ctx, params.ID)
+	switch {
+	case errors.Is(err, watch.ErrWatchNotDisabled):
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: err.Error(), Detail: &ipc.ErrorDetail{ErrorClass: WatchResumeNotDisabledClass}}
+	case errors.Is(err, watch.ErrWatchRecoveryRunRequired):
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: err.Error(), Detail: &ipc.ErrorDetail{ErrorClass: WatchResumeRecoveryNeededClass}}
+	case err != nil:
+		return failure(err)
+	}
+	return marshal(resumed)
+}
+
 func runWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params watch.IDInput
 	if err := ipc.DecodeParams(raw, &params); err != nil || params.ID <= 0 {
@@ -1313,6 +1365,53 @@ func addComponent(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		return failure(err)
 	}
 	return marshal(agentjson.Envelope("components", components, false))
+}
+
+// supplyPDF adopts a main PDF the operator staged with `papio jobs
+// supply-pdf`. The params name the job and one file name inside the
+// daemon-owned staging directory for that job, never a filesystem path, so a
+// caller cannot make the daemon read an arbitrary file. The file then takes
+// the browser adoption path: quarantine, identity validation, and the review
+// gate.
+func supplyPDF(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+		Name  string `json:"name"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.JobID) == "" || strings.TrimSpace(params.Name) == "" {
+		return badParams(errors.New("job_id and name are required"))
+	}
+	if system == nil || system.App == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "acquisition service is not configured"}
+	}
+	supplied, err := system.App.SupplyPDF(ctx, params.JobID, params.Name)
+	if err != nil {
+		// The name sentinel does not echo the wrapped error: confinement
+		// failures carry the staging path, which belongs in the daemon log.
+		switch {
+		case errors.Is(err, app.ErrSuppliedPDFName):
+			log.Printf("rpc supply_pdf name rejected: %v", err)
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: "the name must be a regular file staged in the job's supply directory"}
+		case errors.Is(err, app.ErrSuppliedPDFSize):
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "the supplied PDF is too large")}
+		case errors.Is(err, app.ErrSuppliedPDFState):
+			return nil, &ipc.RPCError{Code: "precondition_failed", Message: safeMessage(err, "the job cannot take a supplied PDF")}
+		case errors.Is(err, job.ErrAdoptNotAwaiting):
+			return nil, &ipc.RPCError{Code: "precondition_failed", Message: "the job is not waiting for a PDF; check it with papio jobs get"}
+		}
+		return failure(err)
+	}
+	row, err := system.Jobs.Get(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(SupplyPDFResult{
+		JobID: params.JobID, Outcome: supplied.Outcome, State: row.State,
+		SHA256: supplied.SHA256, CandidateID: supplied.CandidateID,
+	})
 }
 
 func getJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

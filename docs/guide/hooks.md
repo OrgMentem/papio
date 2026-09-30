@@ -154,18 +154,49 @@ Any tool that exports RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB works — papis,
 JabRef, Calibre, Mendeley, EndNote, a hand-kept `.bib`. There is no supported-app
 list because there is nothing app-specific to support.
 
+### A live library: command sources
+
+An export file goes stale as soon as your library changes. A `command` source
+runs a program instead and reads its standard output as the export, so *papio*
+sees your library as it is now:
+
+```toml
+[[library.sources]]
+name            = "owned-pdfs-live"
+kind            = "command"
+argv            = ["~/bin/export-owned-pdfs"]
+format          = "bibtex"
+claim           = "pdf_present"
+refresh_seconds = 300
+```
+
+`argv` is the program and its arguments. *papio* runs it directly, with no
+shell. To use a pipeline, name the shell yourself, for example
+`argv = ["/bin/sh", "-c", "papis export --all --format bibtex"]`. The same
+`claim` contract applies: for `pdf_present`, the command must print only the
+entries whose PDF you hold. *papio* does not filter the output for you.
+
+*papio* runs the command at most once every `refresh_seconds` (default 300),
+not once for each paper, and lookups during a run share it. A run that exits
+non-zero, passes `timeout_seconds` (default 30), prints more than
+`max_output_bytes` (default 32 MiB), or prints output that does not parse makes
+the source unreadable, exactly like a missing export file. The
+[configuration reference](../reference/config-reference.md)
+lists every limit.
+
 !!! warning "An unreadable source is not an empty library"
     If zotio is configured, generic `library.sources` are ignored. Otherwise,
     if a configured source cannot be read, *papio* refuses to guess.
-    `--batch` creates **no jobs** and tells you which source failed. Generic
-    `library.sources` are consulted by discovery **acquire** watches only;
-    alert watches retain their historical zotio ownership path and do not consult
-    generic sources. Before the fifth consecutive failure, each cadence
+    `--batch` creates **no jobs** and tells you which source failed. Discovery
+    watches fail the run the same way: an acquire watch queues nothing, an
+    alert watch records no digest entries, and `papio acquire --from-digest`
+    creates no jobs. Before the fifth consecutive failure, each cadence
     attempts another run; a successful run resets the failure count. The fifth
-    consecutive failure disables the watch; there is no re-enable command.
-    After fixing the source, you may force-run it once with
-    `papio watch run <id>`, but scheduled execution resumes only if you recreate
-    the watch. `--include-owned` is available only for
+    consecutive failure disables the watch. After fixing the source, force a
+    run with `papio watch run <id>`; when it succeeds, `papio watch resume <id>`
+    puts the same watch back on its schedule, with its id, query, and digest
+    history intact. Resume refuses until a run has succeeded since the watch
+    was disabled. `--include-owned` is available only for
     `papio acquire --batch`, meaning "proceed despite ownership uncertainty".
     `papio doctor` performs a fresh one-shot probe of each source and reports
     that read's record count and outcome; it does not report daemon cached age,

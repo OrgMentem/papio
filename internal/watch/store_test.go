@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"math"
@@ -498,4 +499,129 @@ func TestCadenceHoursBound(t *testing.T) {
 			t.Fatalf("watch at MaxCadenceHours should be due after full cadence; due=%+v", due)
 		}
 	})
+}
+
+func TestResumeRequiresRecoveryRunAndRestoresSchedule(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("resume after repair"))
+	start := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+
+	if _, err := watches.Resume(ctx, created.ID); !errors.Is(err, ErrWatchNotDisabled) {
+		t.Fatalf("Resume(enabled watch) error = %v, want ErrWatchNotDisabled", err)
+	}
+	reported, err := watches.RecordDigest(ctx, created.ID, start, []DigestEntry{{
+		WorkKey: "10.1000/kept", Title: "Kept Work", DOI: "10.1000/kept",
+	}})
+	if err != nil || reported != 1 {
+		t.Fatalf("RecordDigest() = %d, %v; want 1, nil", reported, err)
+	}
+
+	sourceDown := errors.New("library export unreadable")
+	for attempt := 1; attempt <= DisableAfterFailures; attempt++ {
+		failure, err := watches.RecordFailure(ctx, created.ID, start.Add(time.Duration(attempt)*time.Hour), sourceDown)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failure.Disabled != (attempt == DisableAfterFailures) {
+			t.Fatalf("failure %d disabled = %v, want disable only on failure %d", attempt, failure.Disabled, DisableAfterFailures)
+		}
+	}
+	if _, err := watches.Resume(ctx, created.ID); !errors.Is(err, ErrWatchRecoveryRunRequired) {
+		t.Fatalf("Resume(before recovery run) error = %v, want ErrWatchRecoveryRunRequired", err)
+	}
+	// A forced run that fails again is not a recovery.
+	if _, err := watches.RecordFailure(ctx, created.ID, start.Add(10*time.Hour), sourceDown); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watches.Resume(ctx, created.ID); !errors.Is(err, ErrWatchRecoveryRunRequired) {
+		t.Fatalf("Resume(after failed forced run) error = %v, want ErrWatchRecoveryRunRequired", err)
+	}
+
+	recovered := start.Add(11 * time.Hour)
+	if err := watches.MarkRun(ctx, created.ID, recovered); err != nil {
+		t.Fatal(err)
+	}
+	// The successful forced run alone does not put the watch back on the schedule.
+	due, err := watches.Due(ctx, recovered.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("Due() before Resume = %+v, want none", due)
+	}
+
+	resumed, err := watches.Resume(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Resume(after recovery run) error = %v", err)
+	}
+	if resumed.ID != created.ID || resumed.Query != created.Query || resumed.CreatedAt != created.CreatedAt ||
+		!resumed.Enabled || resumed.ConsecutiveFailures != 0 {
+		t.Fatalf("resumed watch = %+v, want same watch %+v re-enabled with no failures", resumed, created)
+	}
+	due, err = watches.Due(ctx, recovered.Add(23*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("Due() within cadence of recovery run = %+v, want none", due)
+	}
+	due, err = watches.Due(ctx, recovered.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != created.ID {
+		t.Fatalf("Due() one cadence after recovery run = %+v, want watch %d", due, created.ID)
+	}
+	digest, err := watches.Digest(ctx, created.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != 1 || digest[0].WorkKey != "10.1000/kept" {
+		t.Fatalf("Digest() after Resume = %+v, want the pre-disable entry", digest)
+	}
+
+	if _, err := watches.Resume(ctx, created.ID); !errors.Is(err, ErrWatchNotDisabled) {
+		t.Fatalf("second Resume() error = %v, want ErrWatchNotDisabled", err)
+	}
+	if _, err := watches.Resume(ctx, created.ID+1000); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("Resume(missing watch) error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// TestResumeFollowsLatestRunOutcome pins the recovery rule to the most recent
+// run: a failure after a recovery run revokes it, and a partial discovery run,
+// which the scheduler already treats as healthy, counts as a recovery.
+func TestResumeFollowsLatestRunOutcome(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("latest outcome"))
+	start := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	sourceDown := errors.New("library export unreadable")
+	for attempt := 1; attempt <= DisableAfterFailures; attempt++ {
+		if _, err := watches.RecordFailure(ctx, created.ID, start.Add(time.Duration(attempt)*time.Hour), sourceDown); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := watches.MarkRun(ctx, created.ID, start.Add(10*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watches.RecordFailure(ctx, created.ID, start.Add(11*time.Hour), sourceDown); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watches.Resume(ctx, created.ID); !errors.Is(err, ErrWatchRecoveryRunRequired) {
+		t.Fatalf("Resume(failure after recovery run) error = %v, want ErrWatchRecoveryRunRequired", err)
+	}
+
+	if err := watches.MarkPartialRun(ctx, created.ID, start.Add(12*time.Hour), "crossref: timeout"); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := watches.Resume(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("Resume(after partial run) error = %v", err)
+	}
+	if !resumed.Enabled || !strings.Contains(resumed.LastError, "crossref") {
+		t.Fatalf("resumed watch = %+v, want enabled with the partial-run detail kept", resumed)
+	}
 }

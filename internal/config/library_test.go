@@ -5,8 +5,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
 )
@@ -91,7 +93,7 @@ func TestLibrarySourceValidationIsFailClosed(t *testing.T) {
 		},
 		{
 			name: "unsupported kind is rejected rather than ignored",
-			body: "[[library.sources]]\nname = \"a\"\nkind = \"command\"\npath = \"a.bib\"\nclaim = \"pdf_present\"\n",
+			body: "[[library.sources]]\nname = \"a\"\nkind = \"folder\"\npath = \"a.bib\"\nclaim = \"pdf_present\"\n",
 			want: "not supported",
 		},
 		{
@@ -166,11 +168,146 @@ func TestLibrarySourceCountIsBounded(t *testing.T) {
 }
 
 // Config is strict-mode, so a field name we might later want must be rejected
-// today rather than silently ignored.
+// today rather than silently ignored. `command` is also the shell-string
+// spelling a user might reach for instead of an argv array.
 func TestUnknownLibraryFieldIsRejected(t *testing.T) {
-	body := "[[library.sources]]\nname = \"a\"\nkind = \"file\"\npath = \"a.bib\"\nclaim = \"pdf_present\"\nrefresh_seconds = 60\n"
+	path := libraryPathTOML(t, filepath.Join(t.TempDir(), "a.bib"))
+	body := "[[library.sources]]\nname = \"a\"\nkind = \"file\"\n" + path + "\nclaim = \"pdf_present\"\ncommand = \"papis export\"\n"
 	if _, err := Load(writeConfig(t, body)); err == nil {
 		t.Fatal("an unknown library source field must be rejected")
+	}
+}
+
+// argvTOML preserves native path separators as data, not TOML escapes.
+func argvTOML(t *testing.T, argv ...string) string {
+	t.Helper()
+	data, err := toml.Marshal(struct {
+		Argv []string `toml:"argv"`
+	}{Argv: argv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func TestLibraryCommandSourceLoads(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "export-holdings")
+	body := "[[library.sources]]\nname = \"live\"\nkind = \"command\"\n" + argvTOML(t, program, "--with-pdf") +
+		"\nformat = \"bibtex\"\nclaim = \"pdf_present\"\n"
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := cfg.Library.Sources[0]
+	if len(source.Argv) != 2 || source.Argv[0] != program || source.Argv[1] != "--with-pdf" {
+		t.Fatalf("argv = %q", source.Argv)
+	}
+	limits, err := source.CommandLimits()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := LibraryCommandLimits{
+		Timeout:        DefaultLibraryCommandTimeoutSeconds * time.Second,
+		MaxOutputBytes: DefaultLibraryCommandMaxOutputBytes,
+		Refresh:        DefaultLibraryCommandRefreshSeconds * time.Second,
+	}
+	if limits != want {
+		t.Fatalf("limits = %+v, want defaults %+v", limits, want)
+	}
+
+	bounded := body + "timeout_seconds = 300\nmax_output_bytes = 1\nrefresh_seconds = 10\n"
+	cfg, err = Load(writeConfig(t, bounded))
+	if err != nil {
+		t.Fatalf("bounds at the edge of their ranges: %v", err)
+	}
+	limits, err = cfg.Library.Sources[0].CommandLimits()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limits.Timeout != 300*time.Second || limits.MaxOutputBytes != 1 || limits.Refresh != 10*time.Second {
+		t.Fatalf("limits = %+v", limits)
+	}
+}
+
+// A bare program name is resolved once, at validation, so the daemon runs the
+// program the config was checked against rather than whatever its own PATH
+// finds later.
+func TestLibraryCommandBareProgramIsPinnedToAnAbsolutePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX program fixture")
+	}
+	bin := t.TempDir()
+	program := filepath.Join(bin, "export-holdings")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	body := "[[library.sources]]\nname = \"live\"\nkind = \"command\"\nargv = [\"export-holdings\", \"--all\"]\nclaim = \"record_present\"\n"
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Library.Sources[0].Argv; len(got) != 2 || got[0] != program || got[1] != "--all" {
+		t.Fatalf("argv = %q, want [%q --all]", got, program)
+	}
+}
+
+func TestLibraryCommandSourceValidationIsFailClosed(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "export-holdings")
+	command := "[[library.sources]]\nname = \"live\"\nkind = \"command\"\nclaim = \"pdf_present\"\n"
+	withArgv := command + argvTOML(t, program) + "\n"
+	file := "[[library.sources]]\nname = \"a\"\nkind = \"file\"\n" +
+		libraryPathTOML(t, filepath.Join(t.TempDir(), "a.bib")) + "\nclaim = \"pdf_present\"\n"
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"argv is required", command, "argv is required"},
+		{"empty argv", command + "argv = []\n", "argv is required"},
+		{"blank program", command + "argv = [\"\"]\n", "argv[0] must name a program"},
+		{"padded program", command + "argv = [\" sh\"]\n", "argv[0] must name a program"},
+		{"relative program path", command + "argv = [\"./export-holdings\"]\n", "must be an absolute path or a program name on PATH"},
+		{"program not on PATH", command + "argv = [\"papio-test-no-such-program\"]\n", "not found on PATH"},
+		{"NUL in an argument", command + argvTOML(t, program, "a\x00b") + "\n", "NUL"},
+		{"shell string instead of argv", command + "argv = \"papis export --all\"\n", "parsing config"},
+		{"path beside argv", withArgv + libraryPathTOML(t, filepath.Join(t.TempDir(), "a.bib")) + "\n", "path must be empty"},
+		{"timeout below range", withArgv + "timeout_seconds = -1\n", "timeout_seconds must be between"},
+		{"timeout above range", withArgv + "timeout_seconds = 301\n", "timeout_seconds must be between"},
+		{"output cap above range", withArgv + "max_output_bytes = 134217729\n", "max_output_bytes must be between"},
+		{"output cap negative", withArgv + "max_output_bytes = -5\n", "max_output_bytes must be between"},
+		{"refresh below range", withArgv + "refresh_seconds = 9\n", "refresh_seconds must be between"},
+		{"refresh above range", withArgv + "refresh_seconds = 86401\n", "refresh_seconds must be between"},
+		{"file source with argv", file + argvTOML(t, program) + "\n", "apply only to kind \"command\""},
+		{"file source with a timeout", file + "timeout_seconds = 5\n", "apply only to kind \"command\""},
+		{"file source with a refresh interval", file + "refresh_seconds = 60\n", "apply only to kind \"command\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.body))
+			if err == nil {
+				t.Fatal("expected validation to reject this configuration")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLibraryFingerprintCoversCommandArgv(t *testing.T) {
+	source := LibrarySource{
+		Name:  "live",
+		Kind:  LibraryKindCommand,
+		Argv:  []string{"/usr/local/bin/export-holdings", "--with-pdf"},
+		Claim: LibraryClaimPDFPresent,
+	}
+	base := Config{Library: Library{Sources: []LibrarySource{source}}}
+	changed := source
+	changed.Argv = []string{"/usr/local/bin/export-holdings", "--all"}
+	other := Config{Library: Library{Sources: []LibrarySource{changed}}}
+	if base.LibraryFingerprint() == other.LibraryFingerprint() {
+		t.Fatal("fingerprint did not change when the command's argv changed")
 	}
 }
 

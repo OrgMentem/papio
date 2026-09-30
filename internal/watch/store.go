@@ -133,6 +133,14 @@ func truncateDigestAbstract(value string) string {
 // ErrDigestEntryNotFound indicates a requested digest work key is absent.
 var ErrDigestEntryNotFound = errors.New("watch digest entry not found")
 
+// ErrWatchNotDisabled reports a Resume of a watch that is already enabled.
+var ErrWatchNotDisabled = errors.New("watch is not disabled")
+
+// ErrWatchRecoveryRunRequired reports a Resume of a disabled watch whose most
+// recent run was a failure: no forced run has succeeded since it was disabled,
+// so resuming would put a still-broken dependency back on the schedule.
+var ErrWatchRecoveryRunRequired = errors.New("watch has no successful run since it was disabled")
+
 // Store layers watch semantics over the process-wide single-writer SQLite
 // handle.
 type Store struct{ S *store.Store }
@@ -1567,7 +1575,8 @@ func (s *Store) MarkPartialRun(ctx context.Context, id int64, at time.Time, deta
 
 // RecordFailure records an execution failure as an attempted run. The fifth
 // consecutive failure disables the watch so periodic scheduling cannot loop
-// indefinitely on a broken dependency.
+// indefinitely on a broken dependency. Only Resume, after a successful forced
+// run, puts a disabled watch back on the schedule.
 func (s *Store) RecordFailure(ctx context.Context, id int64, at time.Time, runErr error) (FailureResult, error) {
 	if s == nil || s.S == nil {
 		return FailureResult{}, errors.New("watch store is not configured")
@@ -1599,6 +1608,50 @@ func (s *Store) RecordFailure(ctx context.Context, id int64, at time.Time, runEr
 		return FailureResult{}, fmt.Errorf("committing watch failure: %w", err)
 	}
 	return FailureResult{ConsecutiveFailures: failures, Disabled: disabled}, nil
+}
+
+// Resume re-enables a watch that RecordFailure disabled, keeping its ID, query,
+// and digest history. It refuses unless a forced run has succeeded since the
+// watch was disabled. Disabling leaves consecutive_failures at
+// DisableAfterFailures or more, and only a run that the scheduler itself treats
+// as healthy (MarkRun, MarkPartialRun, or MarkDegradedRun) resets it to zero,
+// so a disabled watch with zero consecutive failures has recovered and a
+// disabled watch with any failures has not. The guard and the re-enable are one
+// conditional UPDATE, so a failure recorded concurrently cannot slip between
+// the check and the write. The recovery run's last_run_at stays, so the watch
+// next becomes due one cadence after that run.
+func (s *Store) Resume(ctx context.Context, id int64) (*Watch, error) {
+	if s == nil || s.S == nil {
+		return nil, errors.New("watch store is not configured")
+	}
+	if id <= 0 {
+		return nil, errors.New("watch id must be positive")
+	}
+	result, err := s.S.DB().ExecContext(ctx, `
+		UPDATE watches
+		SET enabled = 1, consecutive_failures = 0
+		WHERE id = ? AND enabled = 0 AND consecutive_failures = 0`, id)
+	if err != nil {
+		return nil, fmt.Errorf("resuming watch: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	current, err := s.Get(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("watch %d not found: %w", id, sql.ErrNoRows)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if count == 1 {
+		return current, nil
+	}
+	if current.Enabled {
+		return nil, ErrWatchNotDisabled
+	}
+	return nil, ErrWatchRecoveryRunRequired
 }
 
 const watchSelect = `

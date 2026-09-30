@@ -105,8 +105,9 @@ func TestFacadeSearchHidesLifecycleAndMarksReadOnly(t *testing.T) {
 			t.Errorf("facade should expose %q; got %v", want, present)
 		}
 	}
-	// Lifecycle/setup/system commands are hidden, along with their subtrees.
-	for _, hidden := range []string{"daemon", "daemon stop", "mcp", "config", "config init", "config agent", "config agent set", "config agent status", "config agent remove", "init", "native-host", "native-host install", "browser reload", "drive resume"} {
+	// Lifecycle/setup/system commands are hidden, along with their subtrees,
+	// and so is jobs supply-pdf: it reads a local file the caller names.
+	for _, hidden := range []string{"daemon", "daemon stop", "mcp", "config", "config init", "config agent", "config agent set", "config agent status", "config agent remove", "init", "native-host", "native-host install", "browser reload", "drive resume", "jobs supply-pdf"} {
 		if present[hidden] {
 			t.Errorf("facade should hide %q", hidden)
 		}

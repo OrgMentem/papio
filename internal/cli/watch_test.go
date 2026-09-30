@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/ipc"
 	"papio/internal/watch"
 	"papio/internal/zotio"
 )
@@ -196,6 +198,67 @@ func TestWatchRunDisplaysReportedAlertWorks(t *testing.T) {
 	}
 	if got := stdout.String(); got != "Watch 7 reported 2 new work(s) — papio watch digest 7\n" {
 		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestWatchResumeReportsResumedWatch(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+		if method != "watch.resume" {
+			t.Fatalf("method = %q, want watch.resume", method)
+		}
+		if input, ok := params.(watch.IDInput); !ok || input.ID != 7 {
+			t.Fatalf("params = %#v, want watch.IDInput{ID: 7}", params)
+		}
+		*result.(*watch.Watch) = watch.Watch{ID: 7, Label: "folding", CadenceHours: 24, Enabled: true}
+		return nil
+	})
+	root.SetArgs([]string{"watch", "resume", "7"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("watch resume: %v (%s)", err, stderr.String())
+	}
+	if got := stdout.String(); got != "Resumed watch 7 (folding); it runs again every 24h\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestWatchResumeRefusalsNameTheNextStep(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		remote *ipc.RemoteError
+		want   string
+	}{
+		{
+			name:   "no recovery run",
+			remote: &ipc.RemoteError{Code: "precondition_failed", Message: "watch has no successful run since it was disabled", Detail: &ipc.ErrorDetail{ErrorClass: api.WatchResumeRecoveryNeededClass}},
+			want:   "run `papio watch run 7` until it succeeds, then resume it",
+		},
+		{
+			name:   "already enabled",
+			remote: &ipc.RemoteError{Code: "precondition_failed", Message: "watch is not disabled", Detail: &ipc.ErrorDetail{ErrorClass: api.WatchResumeNotDisabledClass}},
+			want:   "watch 7 is already enabled",
+		},
+		{
+			name:   "missing watch",
+			remote: &ipc.RemoteError{Code: "not_found", Message: "record not found"},
+			want:   "watch 7 not found",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(context.Context, string, any, any) error {
+				return test.remote
+			})
+			root.SetArgs([]string{"watch", "resume", "7"})
+			err := root.Execute()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("watch resume error = %v, want it to contain %q", err, test.want)
+			}
+			var remote *ipc.RemoteError
+			if !errors.As(err, &remote) || remote.Code != test.remote.Code {
+				t.Fatalf("watch resume error = %v, want the daemon's %s error wrapped", err, test.remote.Code)
+			}
+		})
 	}
 }
 

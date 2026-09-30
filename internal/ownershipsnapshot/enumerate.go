@@ -19,8 +19,10 @@ type LibraryRecord struct {
 	Title string
 }
 
-// EnumerateLibraryRecords reads one configured file through the bounded
-// bibliographic parser used by the ownership snapshot provider.
+// EnumerateLibraryRecords reads one configured source — a file, or one run of
+// a command — through the bounded bibliographic parser used by the ownership
+// snapshot provider. A command that fails, times out, or overflows its output
+// cap is an error, never an empty library.
 func EnumerateLibraryRecords(ctx context.Context, source config.LibrarySource) ([]LibraryRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -29,28 +31,45 @@ func EnumerateLibraryRecords(ctx context.Context, source config.LibrarySource) (
 	if name == "" {
 		return nil, fmt.Errorf("library source name is required")
 	}
-	if source.Kind != config.LibraryKindFile {
-		return nil, fmt.Errorf("library source %q: kind %q is not supported yet (only %q)", name, source.Kind, config.LibraryKindFile)
-	}
-	path := expandHome(strings.TrimSpace(source.Path))
-	if path == "" {
-		return nil, fmt.Errorf("library source %q: path is required", name)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("library source %q: %w", name, err)
-	}
-	defer func() { _ = file.Close() }()
-	data, err := readBounded(ctx, file)
-	if err != nil {
-		return nil, fmt.Errorf("library source %q: %w", name, err)
+	var data []byte
+	pathHint := ""
+	switch source.Kind {
+	case config.LibraryKindFile:
+		path := expandHome(strings.TrimSpace(source.Path))
+		if path == "" {
+			return nil, fmt.Errorf("library source %q: path is required", name)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("library source %q: %w", name, err)
+		}
+		defer func() { _ = file.Close() }()
+		data, err = readBounded(ctx, file)
+		if err != nil {
+			return nil, fmt.Errorf("library source %q: %w", name, err)
+		}
+		pathHint = path
+	case config.LibraryKindCommand:
+		argv, limits, err := commandSettings(source)
+		if err != nil {
+			return nil, fmt.Errorf("library source %q: %w", name, err)
+		}
+		out, failure := runCommand(ctx, argv, limits.Timeout, limits.MaxOutputBytes)
+		if failure != "" {
+			// The failure code, never the command's output: it inherits the
+			// daemon environment and may print credentials.
+			return nil, fmt.Errorf("library source %q: command failed (%s)", name, failure)
+		}
+		data = out
+	default:
+		return nil, fmt.Errorf("library source %q: kind %q is not supported (only %q or %q)", name, source.Kind, config.LibraryKindFile, config.LibraryKindCommand)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	format := bibparse.Format(source.Format)
 	if format == "" {
-		format = bibparse.Detect(path, data)
+		format = bibparse.Detect(pathHint, data)
 	}
 	records, err := bibparse.ParseRecords(format, data)
 	if err != nil && !errors.Is(err, bibparse.ErrNoEntries) {

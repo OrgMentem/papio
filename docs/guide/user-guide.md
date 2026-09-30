@@ -380,6 +380,8 @@ or the corresponding CLI command to recover it.
 When an inbox row says **manual download**, open the provider's PDF in the
 ordinary browser and use the popup's **Send PDF to papio** action. The activity
 panel then makes the download and adoption steps visible while validation runs.
+If you already have the PDF as a file, use `papio jobs supply-pdf` instead (see
+[Supply a PDF you already have](#supply-a-pdf-you-already-have)).
 
 ## 5. Complete one browser pass when required
 
@@ -695,6 +697,38 @@ rerouted automatically and remains human-assisted. When that happens, wait
 until the PDF is open and use **Send PDF to papio** rather than assuming an
 unrelated file in `Downloads` will be adopted.
 
+### Supply a PDF you already have
+
+If you already have the paper as a file — an email attachment, an
+interlibrary loan copy, or an earlier download — give it to its job directly:
+
+```sh
+papio jobs supply-pdf <job-id> ~/Documents/paper.pdf
+```
+
+The command refuses a directory, a symbolic link, a file that does not begin
+with `%PDF-`, and a file larger than `[fetch] max_bytes`. It copies the file
+into `<data_dir>/supplied/<job-id>/`, and the daemon reads the copy only from
+there. Your original file does not change. The daemon then runs the same
+checks as **Send PDF to papio**: the PDF must be readable, and it must be the
+paper that the job asked for. A PDF of a different paper never becomes ready.
+
+The command prints the job, the outcome, the job state, and the SHA-256 of the
+file. The outcome is one of these:
+
+- `accepted`: the PDF passed, and the job is `ready`.
+- `needs_review`: the PDF names a different work, or it is encrypted or holds
+  active content. The job waits for your review action.
+- `rejected`: the PDF failed validation. The job waits for a different file.
+
+The job must still be open: `queued`, `resolving`, `fetching`, or
+`awaiting_human`. The command refuses a finished job (`ready`, `imported`,
+`unavailable`, `failed`, or `cancelled`), and a job that is validating or
+waiting for review. `papio stats producers` counts a supplied PDF as `manual`.
+
+Use `papio jobs add-component` for supplements and appendices. The MCP command
+tools do not offer `supply-pdf`, because it reads a file on this computer.
+
 ## 6. Read the batch outcome
 
 Ask for a joined view of the original batch manifest, live job state, events,
@@ -721,14 +755,19 @@ papio watch add "appropriate reliance on AI" \
   --cadence weekly --limit-per-run 10 --collection "AI reading" --oa-only
 papio watch list
 papio watch run <watch-id>
+papio watch resume <watch-id>
 papio watch remove <watch-id>
 ```
 
 `--cadence` accepts `daily`, `weekly`, or `Nh`; `--limit-per-run` accepts 1
 through 50. `--year-from` and `--year-to` apply the same publication-year limits
 as search. Watch execution is serial, records its last result, and auto-disables
-a watch after five consecutive failures. Removing a watch does not remove jobs
-or Zotero items created by earlier runs.
+a watch after five consecutive failures. To bring a disabled watch back, fix the
+cause, force a run with `papio watch run <watch-id>`, and once that run
+succeeds, run `papio watch resume <watch-id>`. The watch keeps its id, query, and
+digest history, and its next scheduled run comes one cadence after the forced
+run. Resume refuses while the latest run is still a failure. Removing a watch
+does not remove jobs or Zotero items created by earlier runs.
 
 ### Alert-only watches: report first, acquire on demand
 
@@ -746,6 +785,13 @@ papio watch digest clear <watch-id>      # discard the rest
 
 Acquired entries leave the digest automatically; cleared ones simply stop
 being pending (they will not be re-reported).
+
+Alert watches check ownership twice: when the run records new works, and again
+when `--from-digest` acquires them. Both checks use zotio when it is configured
+and your `library.sources` otherwise, with the same rules as acquisition
+watches. A digest entry you already hold leaves the digest without a job. If a
+library source cannot be read, the run fails and `--from-digest` creates no
+jobs, rather than report an unknown work as new.
 
 ### Backfill watches: acquire missing PDFs
 
@@ -879,7 +925,7 @@ record: papers from before *papio* 0.22.0, and papers served from a copy
 | `agent` | The article agent chose the control that produced the download. |
 | `viewer_capture` | The extension saved the one response of a signed PDF viewer, such as ScienceDirect's, in a tab that *papio* armed for the paper: Firefox kept a copy of the PDF, or Chrome's download rule saved it. The record names the adapter that matched the paper's page. It does not record who pressed **View PDF**. |
 | `daemon_fetch` | *papio* chose the address: it fetched the file itself, or the browser fetched a public address that *papio* selected. |
-| `manual` | A person supplied the file: a PDF you sent from an open tab, or a download that came after the adapter had stopped. |
+| `manual` | A person supplied the file: a PDF you sent from an open tab, a download that came after the adapter had stopped, or a file you gave with `papio jobs supply-pdf`. |
 | `unknown` | A browser download with no record of who clicked. A paper that the removed macOS helper of *papio* 0.22 saved also counts here. |
 
 The interventions it counts are `open` (someone other than the paced drive

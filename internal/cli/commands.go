@@ -742,7 +742,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 
 	diagnose := newJobsDiagnoseCommand(opt)
 
-	command.AddCommand(list, get, show, diagnose, cancel, retry, redrive, unfiled, refile, failures, incidents, receiptCommand, repairAwaitingHuman, addComponent)
+	command.AddCommand(list, get, show, diagnose, cancel, retry, redrive, unfiled, refile, failures, incidents, receiptCommand, repairAwaitingHuman, addComponent, newJobsSupplyPDFCommand(opt))
 	return command
 }
 
