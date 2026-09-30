@@ -660,26 +660,128 @@ func TestIdentityReadsIdentifiersSeparatedByUnicodeSpaces(t *testing.T) {
 // verdict at IdentityReview no matter which path through
 // MatchIdentityWithThreshold would otherwise have returned IdentityPass.
 
-// Before this guard, the front-matter DOI rule was unconditional: it runs
-// before any title or author check at all, so an erratum notice printing the
-// original paper's DOI passed as the paper outright, and neither the
-// erratum's own title ("Erratum: …") nor its own byline ("Bob Clarke") ever
-// entered the decision. The fixture is 92 bytes — comfortably inside the
-// 1 KiB front-matter window the DOI rule reads — so the DOI genuinely sits in
-// the window this test means to exercise.
-func TestIdentityCapsAnErratumPrintingTheRequestedDOI(t *testing.T) {
+// TestIdentityCapsAnErratumAgainstThePaperItCorrects pins one contract over
+// the extraction shapes that each once let a correction notice escape the
+// guard: a notice for the requested paper, printing that paper's DOI, is
+// capped at IdentityReview with its marker named, and a notice printing a
+// DIFFERENT DOI keeps rejecting, because the DOI-mismatch reject runs, and
+// wins, ahead of the cap. Every case shares one requested work and one
+// erratum; only the bytes around the marker vary.
+func TestIdentityCapsAnErratumAgainstThePaperItCorrects(t *testing.T) {
 	target := work.Work{
 		DOI: "10.1234/cal.7", Year: 2025,
 		Title:   "Sensor Network Calibration Under Adverse Weather",
 		Authors: []string{"Priya Natarajan"},
 	}
-	erratum := "Erratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
-	got := MatchIdentity(erratum, target)
-	if got.Result != IdentityReview {
-		t.Fatalf("result = %+v, want review: an erratum is not the paper it corrects", got)
-	}
-	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
-		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
+	const body = "Bob Clarke\n2025\ndoi:10.1234/cal.7\n"
+	for _, tc := range []struct {
+		name, text string
+		// want is IdentityReview unless set; marker is the named evidence a
+		// capped verdict must carry.
+		want, marker string
+		// forbidden evidence proves the marker, not a blind window, parked it.
+		forbidden string
+	}{
+		{
+			// Before the guard the front-matter DOI rule ran before any title
+			// or author check, so an erratum printing the original paper's DOI
+			// passed as the paper outright. The 92-byte fixture keeps the DOI
+			// inside the 1 KiB front-matter window the DOI rule reads.
+			name:   "printing the requested DOI",
+			text:   "Erratum: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "erratum",
+		},
+		{
+			// pdftotext glues a running header onto the first line of a page
+			// because they share one horizontal band. Detection used to be an
+			// exact line prefix, so the glued line reached IdentityPass on the
+			// DOI match alone; splitting on the double space restores it.
+			name:   "glued running header",
+			text:   "J Sensor Syst 2025;12:1  Erratum: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "erratum",
+		},
+		{
+			// The single-column shape of the same escape: a bare page number
+			// stands in for the masthead.
+			name:   "glued page number",
+			text:   "1  Erratum: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "erratum",
+		},
+		{
+			// A single TAB is pdftotext's other way to represent the column
+			// break; 28 of 632 cached documents in a reference library carry
+			// one. wideGapSegments once saw only runs of ASCII spaces.
+			name:   "glued by a single tab",
+			text:   "J Sensor Syst 2025;12:1\tErratum: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "erratum",
+		},
+		{
+			// A run of U+00A0 no-break spaces is the third column-break shape.
+			// A single plain ASCII space must stay inert; that boundary is
+			// pinned by TestIdentityCorrectionMarkersAnchorAsLinePrefixes.
+			name:   "glued by two no-break spaces",
+			text:   "J Sensor Syst 2025;12:1\u00a0\u00a0Erratum: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "erratum",
+		},
+		{
+			// A marker hyphenated across a line wrap is one word; splitting on
+			// the raw "\n" before folding left each half on its own line.
+			name:   "hyphenated across a wrap",
+			text:   "Errat-\num: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "erratum",
+		},
+		{
+			// strings.TrimSpace does not strip U+FEFF, so a byte-order mark
+			// before "Erratum:" defeated the prefix test like a glued header.
+			name:   "leading byte-order mark",
+			text:   "\ufeffErratum: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "erratum",
+		},
+		{
+			// The plural heading covers a notice with several corrections and
+			// matched no marker before it was added.
+			name:   "plural errata",
+			text:   "Errata: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker: "errata",
+		},
+		{
+			// identityWindow used to cut at the first form feed, so a document
+			// opening with a blank cover leaf had EMPTY windows and parked only
+			// because its title tokens "matched only outside the front matter".
+			name:      "leading form feed",
+			text:      "\fErratum: Sensor Network Calibration Under Adverse Weather\n" + body,
+			marker:    "erratum",
+			forbidden: "title tokens matched only outside the front matter",
+		},
+		{
+			name: "different DOI still rejects",
+			text: "Erratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.9999/other\n",
+			want: IdentityReject,
+		},
+		{
+			name: "different DOI behind a glued header still rejects",
+			text: "J Sensor Syst 2025;12:1  Erratum: Sensor Network Calibration Under Adverse Weather\n" +
+				"Bob Clarke\n2025\ndoi:10.9999/other\n",
+			want: IdentityReject,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.want
+			if want == "" {
+				want = IdentityReview
+			}
+			got := MatchIdentity(tc.text, target)
+			if got.Result != want {
+				t.Fatalf("result = %+v, want %s", got, want)
+			}
+			evidence := strings.Join(got.Evidence, " ")
+			if tc.marker != "" && !strings.Contains(evidence, "front matter marks a correction or comment: "+tc.marker) {
+				t.Fatalf("evidence = %v, want the %q marker named", got.Evidence, tc.marker)
+			}
+			if tc.forbidden != "" && strings.Contains(evidence, tc.forbidden) {
+				t.Fatalf("evidence = %v, want the marker itself to explain the park, not %q", got.Evidence, tc.forbidden)
+			}
+		})
 	}
 }
 
@@ -704,23 +806,6 @@ func TestIdentityCapsTheErratumWhenItIsTheRequestedWork(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
 		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-	}
-}
-
-// A correction marker must never soften a wrong-document verdict into a
-// park: a correction notice whose front matter names a DIFFERENT DOI than
-// requested has to keep rejecting exactly as it did before the guard existed,
-// proving the DOI-mismatch reject still runs — and still wins — ahead of the
-// cap.
-func TestIdentityCorrectionMarkerDoesNotSoftenADOIMismatch(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "Erratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.9999/other\n"
-	if got := MatchIdentity(erratum, target); got.Result != IdentityReject {
-		t.Fatalf("result = %+v, want the front-matter DOI mismatch to stand", got)
 	}
 }
 
@@ -840,168 +925,6 @@ func TestIdentityCorrectionMarkerNamedEvenWhenAlreadyReview(t *testing.T) {
 	}
 }
 
-// pdftotext routinely glues a running header and a page number onto the
-// first text line of a page, because the header, the page number, and the
-// erratum's own heading all sit in the same horizontal band and extraction
-// concatenates whatever it read left to right — "J Sensor Syst 2025;12:1
-// Erratum: <title>". Detection used to be an exact line prefix after
-// strings.TrimSpace, so this glued line matched no entry in correctionMarkers
-// and the erratum reached IdentityPass on nothing but "exact normalized DOI
-// match: 10.1234/cal.7" — the escape a reviewer demonstrated with an
-// executed MatchIdentity call. Splitting the line into segments on the
-// double space extraction leaves behind restores the erratum heading to its
-// own segment, where the ordinary prefix test can see it again.
-func TestIdentityCorrectionMarkerSurvivesAGluedRunningHeader(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "J Sensor Syst 2025;12:1  Erratum: Sensor Network Calibration Under Adverse Weather\n" +
-		"Bob Clarke\n2025\ndoi:10.1234/cal.7\n"
-	got := MatchIdentity(erratum, target)
-	if got.Result != IdentityReview {
-		t.Fatalf("result = %+v, want review: a glued running header must not hide the erratum marker", got)
-	}
-	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
-		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-	}
-}
-
-// The same escape with a bare page number standing in for the running
-// header — "1  Erratum: <title>" — is the shape a single-column journal
-// leaves behind instead of a full masthead, and needs the same segmentation
-// to recover.
-func TestIdentityCorrectionMarkerSurvivesAGluedPageNumber(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "1  Erratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
-	got := MatchIdentity(erratum, target)
-	if got.Result != IdentityReview {
-		t.Fatalf("result = %+v, want review: a glued page number must not hide the erratum marker", got)
-	}
-	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
-		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-	}
-}
-
-// wideGapSegments only recognized a run of two or more ASCII spaces as a
-// join, so a running header glued to the erratum heading by a single TAB, or
-// by a run of U+00A0 no-break spaces — pdftotext's other two ways of
-// representing the same column break — defeated it exactly like the
-// exact-prefix test did before the double-space fix above. Both bytes are
-// real: 28 of 632 cached documents in the operator's reference library carry
-// a literal tab, and one carries a run of no-break spaces. Before
-// wideGapSegments recognised anything but two-or-more plain spaces, each of
-// the first two cases below reached IdentityPass with nothing but "exact
-// normalized DOI match" as evidence — the correction marker was right there
-// on the page and invisible to the guard. The third case is the boundary
-// that makes the other two meaningful: a single plain ASCII space must stay
-// inert, or "applied a Bonferroni correction for multiple comparisons"
-// starts tripping the same rule.
-func TestIdentityCorrectionMarkerSurvivesATabOrNoBreakSpaceGlue(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	t.Run("glued by a single tab", func(t *testing.T) {
-		erratum := "J Sensor Syst 2025;12:1\tErratum: Sensor Network Calibration Under Adverse Weather\n" +
-			"Bob Clarke\n2025\ndoi:10.1234/cal.7\n"
-		got := MatchIdentity(erratum, target)
-		if got.Result != IdentityReview {
-			t.Fatalf("result = %+v, want review: a single tab must join a running header to the marker exactly like two spaces", got)
-		}
-		if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
-			t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-		}
-	})
-	t.Run("glued by two no-break spaces", func(t *testing.T) {
-		erratum := "J Sensor Syst 2025;12:1\u00a0\u00a0Erratum: Sensor Network Calibration Under Adverse Weather\n" +
-			"Bob Clarke\n2025\ndoi:10.1234/cal.7\n"
-		got := MatchIdentity(erratum, target)
-		if got.Result != IdentityReview {
-			t.Fatalf("result = %+v, want review: no-break spaces must join a running header to the marker exactly like ASCII spaces", got)
-		}
-		if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
-			t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-		}
-	})
-	t.Run("a single plain space stays inert", func(t *testing.T) {
-		plainSpaceTarget := work.Work{Title: "Statistical Power Analysis for Clinical Trials", Authors: []string{"Alice Smith"}, Year: 2024}
-		text := "Statistical Power Analysis for Clinical Trials\nAlice Smith\n2024\n" +
-			"We applied a Bonferroni correction for multiple comparisons across all endpoints.\n"
-		if got := MatchIdentity(text, plainSpaceTarget); got.Result != IdentityPass {
-			t.Fatalf("result = %+v, want pass: a single ASCII space must never widen into a gap", got)
-		}
-	})
-}
-
-// correctionMarkerIn used to split the byline window into lines before any
-// typographic folding ran, while its sibling bylineSegments folds first
-// precisely because pdftotext hyphenates justified text across a line wrap.
-// A marker broken the same way — "Errat-\num: <title>" — is one word the
-// text layer split across the wrap, not two, and splitting on the raw "\n"
-// before folding left each half on its own line where no prefix test could
-// see either.
-func TestIdentityFoldsAHyphenatedCorrectionMarker(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "Errat-\num: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
-	got := MatchIdentity(erratum, target)
-	if got.Result != IdentityReview {
-		t.Fatalf("result = %+v, want review: a hyphenated marker must be folded before the line split, not after", got)
-	}
-	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
-		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-	}
-}
-
-// strings.TrimSpace does not strip U+FEFF: a byte-order mark some extractors
-// prepend to the very first character of the document survives untouched and
-// sits between the start of the line and "Erratum:", so a document opening
-// with a BOM defeated the exact-prefix test exactly like a glued header did.
-func TestIdentityCorrectionMarkerSurvivesALeadingByteOrderMark(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "\ufeffErratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
-	got := MatchIdentity(erratum, target)
-	if got.Result != IdentityReview {
-		t.Fatalf("result = %+v, want review: a leading byte-order mark must not hide the erratum marker", got)
-	}
-	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
-		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-	}
-}
-
-// correctionMarkers was missing the plural "errata", the heading a journal
-// uses for a single notice that covers more than one correction, so this
-// shape matched no marker at all before the plural was added.
-func TestIdentityCorrectionMarkersIncludeErrata(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "Errata: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
-	got := MatchIdentity(erratum, target)
-	if got.Result != IdentityReview {
-		t.Fatalf("result = %+v, want review: \"errata\" must be recognised alongside \"erratum\"", got)
-	}
-	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: errata") {
-		t.Fatalf("evidence = %v, want the errata marker named", got.Evidence)
-	}
-}
-
 // A long copyright line or a repeated running header before the title can
 // push an erratum's own heading well past the 1 KiB front-matter window the
 // DOI rule reads, while it still sits inside the wider byline window a
@@ -1035,36 +958,6 @@ func TestIdentityCorrectionMarkerReachesPastTheFrontMatter(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter marks a correction or comment: erratum") {
 		t.Fatalf("evidence = %v, want the correction marker named", got.Evidence)
-	}
-}
-
-// identityWindow used to cut text at the first form feed unconditionally, so
-// a document whose extracted text opens with one — a blank cover leaf, which
-// a publisher inserts as an unnumbered title page — produced an EMPTY
-// front-matter, byline, and page-one window. Every rule that reads one of
-// those windows went blind, and this document did not even reach a
-// marker-named review: it parked for the unrelated reason that its title
-// tokens "matched only outside the front matter", which happened to be true
-// but was coincidence rather than the guard doing its job. Trimming a
-// leading form feed before cutting at the next one restores the intended
-// window and makes the marker itself the reason for the park.
-func TestIdentityCorrectionMarkerSurvivesALeadingFormFeed(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "\fErratum: Sensor Network Calibration Under Adverse Weather\nBob Clarke\n2025\ndoi:10.1234/cal.7\n"
-	got := MatchIdentity(erratum, target)
-	if got.Result != IdentityReview {
-		t.Fatalf("result = %+v, want review: a leading form feed must not blind every window", got)
-	}
-	evidence := strings.Join(got.Evidence, " ")
-	if !strings.Contains(evidence, "front matter marks a correction or comment: erratum") {
-		t.Fatalf("evidence = %v, want the marker named rather than a park for an unrelated reason", got.Evidence)
-	}
-	if strings.Contains(evidence, "title tokens matched only outside the front matter") {
-		t.Fatalf("evidence = %v, want the marker itself to explain the park, not a blind window", got.Evidence)
 	}
 }
 
@@ -1183,25 +1076,6 @@ func TestIdentityBonferroniCorrectionStaysOneSegment(t *testing.T) {
 		"\nWe applied a Bonferroni correction for multiple comparisons across all primary and secondary endpoints in this trial.\n"
 	if got := MatchIdentity(text, target); got.Result != IdentityPass {
 		t.Fatalf("result = %+v, want pass: single-spaced prose must never be split into a segment that matches a marker", got)
-	}
-}
-
-// The segmentation above must never soften the one verdict the guard is not
-// allowed to touch: a correction notice glued to a running header exactly
-// like the escape above, but printing a DIFFERENT DOI than requested, still
-// names the wrong document and has to reject outright — proving the
-// DOI-mismatch reject still runs, and still wins, ahead of the new
-// detection path.
-func TestIdentityCorrectionMarkerDetectionDoesNotSoftenAGluedHeaderDOIMismatch(t *testing.T) {
-	target := work.Work{
-		DOI: "10.1234/cal.7", Year: 2025,
-		Title:   "Sensor Network Calibration Under Adverse Weather",
-		Authors: []string{"Priya Natarajan"},
-	}
-	erratum := "J Sensor Syst 2025;12:1  Erratum: Sensor Network Calibration Under Adverse Weather\n" +
-		"Bob Clarke\n2025\ndoi:10.9999/other\n"
-	if got := MatchIdentity(erratum, target); got.Result != IdentityReject {
-		t.Fatalf("result = %+v, want the front-matter DOI mismatch to stand even behind a glued header", got)
 	}
 }
 
