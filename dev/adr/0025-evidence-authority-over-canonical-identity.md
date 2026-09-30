@@ -115,6 +115,22 @@ registry, or human confirmation. Otherwise the job stays unresolved and says so
 (`insufficient_identity_evidence`, via `InsufficientIdentityAuthority` and
 `settleInsufficientIdentity`).
 
+*Amended 2026-10-01 — what ships.* No in-pass corroboration route exists. When
+`InsufficientIdentityAuthority` holds and the pass ranks any candidate,
+`settleInsufficientIdentity` moves the job to terminal `unavailable` with
+`insufficient_identity_evidence` before any candidate is stored, so a title-only
+job never reaches validation or `ready`, however many resolvers return the same
+record. "Stays unresolved and says so" means that terminal settlement. The
+independent authority arrives only as a new submission: a resubmission that
+carries an identifier, a year, or authors no longer satisfies
+`InsufficientIdentityAuthority` and takes the ordinary path. A second resolver
+agreeing is deliberately **not** admitted automatically. *papio*'s resolvers are
+not independent in the sense this decision needs — several echo the same
+upstream registry record — so agreement between them can be one piece of
+evidence counted twice. Admitting it needs an independence model for the
+sources and a before/after wrong-accept measurement (Decision 8), and Decision 7
+forbids buying the yield without them.
+
 ### 7. Never buy yield by loosening the acceptance predicate
 
 This trades the worst outcome *papio* has for a metric. It is prohibited
