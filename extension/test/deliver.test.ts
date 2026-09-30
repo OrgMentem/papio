@@ -230,6 +230,14 @@ test("sniffDOI returns the first DOI-shaped match and trims sentence punctuation
   expect(sniffDOI("No identifier here")).toBeUndefined();
 });
 
+test("sniffDOI stops at URL query delimiters so a printed download URL cannot carry its token into the DOI", () => {
+  // betterleaks:allow -- synthetic test input, never sent
+  const printed = "Download: https://pub.example/get?doi=10.1234/paper&token=synthetic-secret";
+  expect(sniffDOI(printed)).toBe("10.1234/paper");
+  expect(extractPageDOI({ href: "https://pub.example/article", bodyText: printed })).toBe("10.1234/paper");
+  expect(extractMetaDOI([{ name: "citation_doi", content: "10.1234/paper&sid=x=y" }], "https://pub.example/p")).toBe("10.1234/paper");
+});
+
 test("classifyPage recognizes PDF paths, viewers, DOI URLs, and text fallback", () => {
   expect(classifyPage("https://papers.example/paper.PDF?download=1").kind).toBe("pdf");
   expect(isPDFURL("https://papers.example/paper.pdf?doi=10.1000/example")).toBe(true);

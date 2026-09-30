@@ -8,8 +8,11 @@ import {
 } from "./protocol";
 import type { DaemonConnectionStatus, PendingDeliveryStatus } from "./state";
 /** DOI-shaped identifiers are deliberately conservative: the daemon remains the
- * authority, while the popup only needs a useful first candidate. */
-export const DOI_PATTERN = /\b10\.\d{4,9}\/[^\s"'<>?#]+/;
+ * authority, while the popup only needs a useful first candidate. The text scan
+ * stops at the same URL query delimiters (`& =`) as `DOI_STRICT_RE`: body or meta
+ * text that prints `…?doi=10.1234/paper&token=…` must yield `10.1234/paper`, never
+ * a candidate carrying the query token. */
+export const DOI_PATTERN = /\b10\.\d{4,9}\/[^\s"'<>?#&=]+/;
 
 export type PageKind = "pdf" | "doi" | "none";
 
