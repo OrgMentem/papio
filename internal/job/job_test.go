@@ -868,6 +868,81 @@ func TestRepairParkWithActionLeavesLateLeaseUntouched(t *testing.T) {
 	}
 }
 
+// Maintenance snapshots the open actions before it repairs a park. When the
+// set changed since then, whether an action was opened or one was closed, the
+// repair must roll back whole: the job stays in its review state and the
+// actions stay exactly as the concurrent writer left them.
+func TestRepairParkWithActionRollsBackOnStaleActionSet(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stale   func(t *testing.T, js *Store, id string, snapshotID int64)
+		snapped bool
+	}{
+		{"action opened after snapshot", func(t *testing.T, js *Store, id string, _ int64) {
+			if _, err := js.OpenHumanAction(context.Background(), id, "manual_download", "opened concurrently", Access(false, "landing_page")); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"snapshot action closed since", func(t *testing.T, js *Store, _ string, snapshotID int64) {
+			if _, err := js.S.DB().ExecContext(context.Background(),
+				`UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ?`, store.Now(), snapshotID); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			js := testStore(t)
+			id, err := js.CreateRequest(ctx, "wr_repair_stale_actions", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := js.Transition(ctx, id, StateQueued, StateResolving, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := js.Transition(ctx, id, StateResolving, StateNeedsReview, nil); err != nil {
+				t.Fatal(err)
+			}
+			var snapshot []int64
+			var snapshotID int64
+			if tc.snapped {
+				snapshotID, err = js.OpenHumanAction(ctx, id, "verify_identity", "snapshotted", Access(false, "landing_page"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot = []int64{snapshotID}
+			}
+			tc.stale(t, js, id, snapshotID)
+			before, err := js.ListHumanActions(ctx, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = js.RepairParkWithAction(ctx, id, StateNeedsReview, StateAwaitingHuman, snapshot,
+				"manual_download", "download the requested PDF yourself",
+				map[string]any{"reason": "stranded_handoff_repair"},
+				Access(false, "landing_page"))
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("repair over a stale action set = %v, want ErrConflict", err)
+			}
+			row, err := js.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != StateNeedsReview {
+				t.Fatalf("state = %s, want needs_review (the job update must roll back)", row.State)
+			}
+			after, err := js.ListHumanActions(ctx, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprintf("%+v", after) != fmt.Sprintf("%+v", before) {
+				t.Fatalf("actions after rejected repair = %+v, want unchanged %+v", after, before)
+			}
+		})
+	}
+}
+
 func TestRepairParkWithActionRejectsBindingForNonIdentityAction(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)
