@@ -1581,6 +1581,44 @@ func TestAutomaticCandidateOfferWakeFloodPacesToOneClaimOwner(t *testing.T) {
 	}
 }
 
+// TestOutstandingMaterializationOffersSpendTheTransportBudget pins the shared
+// maxOutstandingOffers bound across polls. Automatic candidate offers sent on
+// an earlier poll are still in flight once their candidates leave the
+// scheduler's eligible page (claimed), so the next poll must count them
+// before admitting more automatic or legacy offers on top.
+func TestOutstandingMaterializationOffersSpendTheTransportBudget(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "offer-budget-shared")
+	var scheduled []job.BrowserCandidateDescriptor
+	b.scheduleEligibleCandidates = func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		return job.CandidateSchedulePage{Candidates: scheduled}, nil
+	}
+	automatic := func(name string) job.BrowserCandidateDescriptor {
+		jobID := park(t, jobs, name, handoffWork())
+		return schedulerDescriptor(t, jobs, explicitMaterializationCandidate(t, jobs, jobID, "domain-"+name), "eligible")
+	}
+	scheduled = []job.BrowserCandidateDescriptor{automatic("offer-budget-first-0"), automatic("offer-budget-first-1")}
+	first, _ := runSync(t, b)
+	inFlight := countType(first, protocol.MsgInstitutionalCandidateOffer) + countType(first, protocol.MsgJobOffer)
+	if inFlight != 2 {
+		t.Fatalf("first poll emitted %d offers, want the 2 automatic candidates: %v", inFlight, first)
+	}
+
+	// Both first-poll candidates were claimed, so the scheduler no longer
+	// returns them, but their surfaces are still being driven.
+	scheduled = []job.BrowserCandidateDescriptor{automatic("offer-budget-second-0"), automatic("offer-budget-second-1")}
+	for i := range 4 {
+		park(t, jobs, fmt.Sprintf("offer-budget-legacy-%d", i), handoffWork())
+	}
+	second, _ := runSync(t, b)
+	emitted := countType(second, protocol.MsgInstitutionalCandidateOffer) + countType(second, protocol.MsgJobOffer)
+	if inFlight+emitted > maxOutstandingOffers {
+		t.Fatalf("second poll emitted %d offers on top of %d outstanding candidate offers, want at most %d in flight: %v",
+			emitted, inFlight, maxOutstandingOffers, second)
+	}
+}
+
 // The claim-paced gate parks a candidate whose institution slot belongs to
 // another job, and that park must reach the scheduler. It did not: the legacy
 // loop picked the candidate up and offered it anyway, so the paper claimed,

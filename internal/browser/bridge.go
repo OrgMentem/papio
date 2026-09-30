@@ -8017,7 +8017,7 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 		rows[item.Row.ID] = item.Row
 	}
 
-	outstanding := outstandingOfferCount(b.offered, b.queuedOffers, handoff, rows, b.pendingDownloads)
+	outstanding := len(outstandingOffers(b.offered, b.materializationOffered, b.queuedOffers, handoff, rows, b.pendingDownloads))
 	available := maxOutstandingOffers - outstanding
 	if available < 0 {
 		available = 0
@@ -8116,10 +8116,10 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 	return nil
 }
 
-// outstandingOfferCount is how many handoff offers are IN FLIGHT — not how
-// many have been sent. maxOutstandingOffers bounds the browser surfaces papio
-// is driving concurrently, so a paper the extension has parked in its own
-// queue, or one waiting on a human, is not what that bound is for.
+// outstandingOffers names the handoff offers IN FLIGHT — not the offers that
+// have been sent. maxOutstandingOffers bounds the browser surfaces papio is
+// driving concurrently, so a paper the extension has parked in its own queue,
+// or one waiting on a human, is not what that bound is for.
 //
 // Counting sent offers instead deadlocked the operator's whole queue: four
 // papers with zero browser candidates held all four slots, answering "queued"
@@ -8128,29 +8128,42 @@ func (b *Bridge) reofferInstitutionalSiblings(ctx context.Context, sourceJobID s
 // still bounded twice over without them: the extension enforces its own
 // HANDOFF_DRIVE_LIMIT, and one sign-in per institution is arbitrated by the
 // authentication entry lease.
-func outstandingOfferCount(
+//
+// Legacy URL offers (offered) and claim-paced candidate offers
+// (materializationOffered) share the one budget, so both are counted. A
+// candidate offer drops out of the scheduler's eligible page once claimed,
+// and counting only legacy offers let every later poll spend the whole
+// budget again on top of surfaces still being driven.
+func outstandingOffers(
 	offered map[string]bool,
+	materializationOffered map[string]materializationOffer,
 	queued map[string]bool,
 	actions map[string]job.HumanAction,
 	rows map[string]job.Row,
 	settled map[browserDownloadKey]pendingBrowserDownload,
-) int {
-	count := 0
-	for jobID := range offered {
+) map[string]bool {
+	inFlight := map[string]bool{}
+	count := func(jobID string) {
 		action, ok := actions[jobID]
 		if !ok || action.Kind != handoffActionKind || hasSettledDownload(settled, jobID) {
-			continue
+			return
 		}
 		// The extension said it is holding this one, not driving it.
 		if queued[jobID] {
-			continue
+			return
 		}
 		row, ok := rows[jobID]
 		if ok && row.State == job.StateAwaitingHuman {
-			count++
+			inFlight[jobID] = true
 		}
 	}
-	return count
+	for jobID := range offered {
+		count(jobID)
+	}
+	for jobID := range materializationOffered {
+		count(jobID)
+	}
+	return inFlight
 }
 
 func hasSettledDownload(settled map[browserDownloadKey]pendingBrowserDownload, jobID string) bool {
@@ -10990,7 +11003,8 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		}
 		return candidateIDs[i] < candidateIDs[j]
 	})
-	outstanding := outstandingOfferCount(b.offered, b.queuedOffers, handoff, rows, b.pendingDownloads)
+	inFlight := outstandingOffers(b.offered, b.materializationOffered, b.queuedOffers, handoff, rows, b.pendingDownloads)
+	outstanding := len(inFlight)
 	slots := maxOutstandingOffers - outstanding
 	if slots < 0 {
 		slots = 0
@@ -11050,7 +11064,12 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 			}
 		}
 		automaticAdmitted, automaticParked = b.admitAutomaticMaterializationCandidates(ctx, automaticCandidates, handoff, automaticCap)
-		slots -= len(automaticAdmitted)
+		for id := range automaticAdmitted {
+			// A re-offer of a candidate already in flight was counted above.
+			if !inFlight[id] {
+				slots--
+			}
+		}
 		if slots < 0 {
 			slots = 0
 		}
