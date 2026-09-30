@@ -4,6 +4,7 @@ package delivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -213,6 +214,103 @@ func TestReconcileRejectsUnconfiguredReferenceField(t *testing.T) {
 	}
 	if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonReferenceField {
 		t.Fatalf("result = %+v, want NEEDS_HUMAN/reference_field_unconfigured_or_changed", result)
+	}
+}
+
+// A request that already names a provider reference is reconciled by one GET
+// of that transaction, never by the patron list, and each GET outcome maps to
+// its own disposition: a match is adopted, an unindexed reference is retried,
+// and anything that cannot be read or does not match goes to a human.
+func TestReconcileLooksUpAKnownProviderReferenceDirectly(t *testing.T) {
+	matching := illiad.Transaction{
+		TransactionNumber: 901, TransactionStatus: "Awaiting Request Processing", RequestType: "Article",
+		DOI: "10.1000/reconcile",
+	}
+	tests := []struct {
+		name        string
+		reference   string
+		client      *reconcileFakeClient
+		wantGets    int
+		disposition ReconciliationDisposition
+		reason      string
+		adopted     string
+	}{
+		{name: "match adopted", reference: "901", client: &reconcileFakeClient{transactions: []illiad.Transaction{matching}},
+			wantGets: 1, disposition: ReconciliationAdopted, adopted: "901"},
+		{name: "not indexed yet", reference: "901", client: &reconcileFakeClient{},
+			wantGets: 1, disposition: ReconciliationNotFoundYet, reason: "provider_reference_not_indexed"},
+		{name: "read failure", reference: "901", client: &reconcileFakeClient{err: errors.New("bounded response")},
+			wantGets: 1, disposition: ReconciliationNeedsHuman, reason: ReconciliationReasonReadFailed},
+		{name: "non-numeric reference", reference: "TN-901", client: &reconcileFakeClient{transactions: []illiad.Transaction{matching}},
+			wantGets: 0, disposition: ReconciliationNeedsHuman, reason: ReconciliationReasonReadFailed},
+		{name: "token mismatch", reference: "901", client: &reconcileFakeClient{transactions: []illiad.Transaction{{
+			TransactionNumber: 901, TransactionStatus: "Awaiting Request Processing", ItemInfo4: "someone-else",
+		}}}, wantGets: 1, disposition: ReconciliationNeedsHuman, reason: ReconciliationReasonIdentityMismatch},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := testService(t, time.Now())
+			ctx := context.Background()
+			req := newReconcileRequest(t, svc, fmt.Sprintf("job_reconcile_direct_%d", i))
+			if tc.client.transactions != nil && tc.client.transactions[0].ItemInfo4 == "" {
+				tc.client.transactions[0].ItemInfo4 = req.IdempotencyKey
+			}
+			known := *req
+			known.ProviderReference = tc.reference
+			result, err := svc.Reconcile(ctx, &known, reconcileDeps(tc.client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Disposition != tc.disposition || result.Reason != tc.reason || result.ProviderReference != tc.adopted {
+				t.Fatalf("result = %+v, want %s/%q reference %q", result, tc.disposition, tc.reason, tc.adopted)
+			}
+			if tc.client.gets != tc.wantGets || tc.client.lists != 0 {
+				t.Fatalf("provider calls = GET %d, patron-list %d, want GET %d, patron-list 0", tc.client.gets, tc.client.lists, tc.wantGets)
+			}
+			got, err := svc.Get(ctx, req.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantState, wantRef := StateOffered, ""
+			if tc.adopted != "" {
+				wantState, wantRef = StateSubmitted, tc.adopted
+			}
+			if got.State != wantState || got.ProviderReference != wantRef {
+				t.Fatalf("request = %s/%q, want %s/%q", got.State, got.ProviderReference, wantState, wantRef)
+			}
+		})
+	}
+}
+
+// A reconciliation that finds the transaction but loses the RecordSubmission
+// CAS to another writer must hand the request to a human and name the
+// reference it found, never overwrite the reference the winner recorded.
+func TestReconcileReportsCommitConflictWithoutOverwriting(t *testing.T) {
+	svc := testService(t, time.Now())
+	ctx := context.Background()
+	req := newReconcileRequest(t, svc, "job_reconcile_conflict")
+	won, err := svc.RecordSubmission(ctx, req.ID, "555", time.Now().Add(time.Hour))
+	if err != nil || !won {
+		t.Fatalf("seed submission = %v, %v; want won", won, err)
+	}
+	client := &reconcileFakeClient{transactions: []illiad.Transaction{{
+		TransactionNumber: 901, TransactionStatus: "Awaiting Request Processing", RequestType: "Article",
+		DOI: "10.1000/reconcile", ItemInfo4: req.IdempotencyKey,
+	}}}
+	// req is the stale offered snapshot read before the other writer won.
+	result, err := svc.Reconcile(ctx, req, reconcileDeps(client))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != ReconciliationNeedsHuman || result.Reason != ReconciliationReasonCommitConflict || result.ProviderReference != "901" {
+		t.Fatalf("result = %+v, want NEEDS_HUMAN/%s naming 901", result, ReconciliationReasonCommitConflict)
+	}
+	got, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateSubmitted || got.ProviderReference != "555" {
+		t.Fatalf("request = %s/%q, want the winner's submitted/555 preserved", got.State, got.ProviderReference)
 	}
 }
 
