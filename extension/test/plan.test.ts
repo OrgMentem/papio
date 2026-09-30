@@ -125,6 +125,24 @@ test("planExecution refuses an ambiguous action target instead of choosing the f
   });
 });
 
+test("planExecution matches textAny needles case-insensitively, as its readiness loop does", () => {
+  const spec: AdapterSpec = {
+    id: "text-case",
+    version: "1",
+    hosts: ["example.test"],
+    classify: [
+      { kind: "login", textAny: ["Sign In to Continue"] },
+      { kind: "article", all: ["a.pdf"] },
+    ],
+    download: { selector: "a.pdf", requireKind: "article", method: "href", workTarget: { kind: "opaque" } },
+  };
+  const doc = parseHTML(
+    '<html><body><p>Please SIGN IN TO CONTINUE.</p><a class="pdf" href="/paper.pdf">PDF</a></body></html>',
+    "https://example.test/article",
+  );
+  expect(planExecution(doc, spec, {}, { access_mode: "delegated" }).verdict.kind).toBe("login");
+});
+
 test("planExecution keeps href and meta URL extraction equivalent to live download semantics", () => {
   const hrefSpec: AdapterSpec = {
     id: "href",

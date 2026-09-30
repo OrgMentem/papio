@@ -464,7 +464,9 @@ export function planExecution(
         const bodyText = ruleText(rule.textSelector);
         let ok = false;
         for (const needle of rule.textAny as string[]) {
-          if (bodyText.indexOf(needle) !== -1) {
+          // Page text is lowercased, so the needle must be too — the readiness
+          // loop compares the same way, and the two must agree on a match.
+          if (bodyText.indexOf(needle.toLowerCase()) !== -1) {
             ok = true;
             break;
           }
