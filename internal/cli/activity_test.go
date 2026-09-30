@@ -3,9 +3,16 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/spf13/cobra"
+
+	"papio/internal/api"
+	"papio/internal/config"
 	"papio/internal/store"
 )
 
@@ -57,5 +64,55 @@ func TestCompactActivitySummaryStripsTerminalControlBytes(t *testing.T) {
 				t.Errorf("ESC/BEL survived in %q", got)
 			}
 		})
+	}
+}
+
+// TestActivityPagesPastTheNewestEvents: --limit stops at 200, so the cursor
+// is the only way to reach older events. The flag must reach the daemon, and
+// a truncated text page must name the exact invocation for the next page.
+func TestActivityPagesPastTheNewestEvents(t *testing.T) {
+	at := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	var gotParams map[string]any
+	newRoot := func(out, errOut *bytes.Buffer) *cobra.Command {
+		return NewInProcessRoot(out, errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+			if method != "activity.list" {
+				t.Fatalf("method = %q", method)
+			}
+			gotParams = params.(map[string]any)
+			*result.(*api.ActivityPage) = api.ActivityPage{Entries: []store.ActivityEntry{
+				{Seq: 41, At: at, JobID: "job_older", Kind: "job.state"},
+				{Seq: 40, At: at, JobID: "job_older", Kind: "job.state"},
+			}, Truncated: true}
+			return nil
+		})
+	}
+
+	var out, errOut bytes.Buffer
+	root := newRoot(&out, &errOut)
+	root.SetArgs([]string{"activity", "--limit", "2", "--before-seq", "42", "--job", "job_older"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("activity: %v (%s)", err, errOut.String())
+	}
+	if gotParams["before_seq"] != int64(42) || gotParams["job_id"] != "job_older" {
+		t.Fatalf("params = %#v, want before_seq 42 for job_older", gotParams)
+	}
+	if want := "truncated: showing 2 entries; older: papio activity --before-seq 40 --job job_older\n"; !strings.HasSuffix(out.String(), want) {
+		t.Fatalf("output = %q, want it to end with %q", out.String(), want)
+	}
+
+	var jsonOut, jsonErr bytes.Buffer
+	root = newRoot(&jsonOut, &jsonErr)
+	root.SetArgs([]string{"--json", "activity", "--limit", "2"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("activity --json: %v (%s)", err, jsonErr.String())
+	}
+	if strings.Contains(jsonOut.String(), "truncated: showing") {
+		t.Fatalf("--json output carries the text notice: %q", jsonOut.String())
+	}
+
+	root = newRoot(&bytes.Buffer{}, &bytes.Buffer{})
+	root.SetArgs([]string{"activity", "--before-seq", "-1"})
+	if err := root.ExecuteContext(context.Background()); err == nil {
+		t.Fatal("activity --before-seq -1: want an error")
 	}
 }

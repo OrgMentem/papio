@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -19,16 +20,20 @@ import (
 func newActivityCommand(opt *options) *cobra.Command {
 	var limit int
 	var jobID string
+	var beforeSeq int64
 	command := &cobra.Command{
 		Use:         "activity",
 		Short:       "Show recent daemon activity",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if beforeSeq < 0 {
+				return errors.New("--before-seq must be non-negative")
+			}
 			var page api.ActivityPage
 			if err := opt.call(cmd.Context(), "activity.list", map[string]any{
 				"limit":      limit,
-				"before_seq": int64(0),
+				"before_seq": beforeSeq,
 				"job_id":     jobID,
 			}, &page); err != nil {
 				if isUnknownMethod(err) {
@@ -49,12 +54,29 @@ func newActivityCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			return nil
+			return activityNextPageNotice(opt, page, jobID)
 		},
 	}
 	command.Flags().IntVar(&limit, "limit", 30, "maximum activity rows (1-200)")
 	command.Flags().StringVar(&jobID, "job", "", "filter activity to one job ID")
+	command.Flags().Int64Var(&beforeSeq, "before-seq", 0, "show only events older than this sequence number (the seq of the last row of the previous page); 0 starts at the newest")
 	return command
+}
+
+// activityNextPageNotice tells the text reader the page stopped short and
+// gives the exact invocation for the older events: --limit caps at 200, so
+// past that the cursor is the only way further back. JSON readers take the
+// cursor from the last entry's seq and the envelope's `truncated`.
+func activityNextPageNotice(opt *options, page api.ActivityPage, jobID string) error {
+	if !page.Truncated || len(page.Entries) == 0 {
+		return nil
+	}
+	next := fmt.Sprintf("papio activity --before-seq %d", page.Entries[len(page.Entries)-1].Seq)
+	if jobID != "" {
+		next += " --job " + jobID
+	}
+	_, err := fmt.Fprintf(opt.out, "truncated: showing %d entries; older: %s\n", len(page.Entries), next)
+	return err
 }
 
 func shortActivityJobID(id string) string {
