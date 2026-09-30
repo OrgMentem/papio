@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -157,6 +158,73 @@ func TestCheckAdoptionRootWarnsOutsideThisAccountsDownloadFolder(t *testing.T) {
 	}
 	if c := checks[0]; c.Status != Warn || !strings.Contains(c.Detail, elsewhere) {
 		t.Fatalf("check = %#v, want a Warn naming %q", c, elsewhere)
+	}
+}
+
+// TestCheckAdoptionRootPassesWhenParentDiffersOnlyByCase keeps a working root
+// out of the Warn branch on a case-insensitive filesystem. There `DOWNLOADS`
+// and `Downloads` are one folder, and a Warn would tell the operator to
+// re-point download_adoption_root away from the folder the browser uses.
+func TestCheckAdoptionRootPassesWhenParentDiffersOnlyByCase(t *testing.T) {
+	home := adoptionHome(t)
+	downloads := config.UserDownloadsDir()
+	folded := filepath.Join(filepath.Dir(downloads), strings.ToUpper(filepath.Base(downloads)))
+	if folded == downloads {
+		t.Skipf("download folder %q has no letter case to vary", downloads)
+	}
+	if runtime.GOOS != "windows" {
+		// Windows' Downloads may be an absolute registry value this test must
+		// not create; elsewhere it is under the isolated HOME.
+		if err := os.MkdirAll(downloads, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		a, aerr := os.Stat(downloads)
+		b, berr := os.Stat(folded)
+		if aerr != nil || berr != nil || !os.SameFile(a, b) {
+			t.Skip("case-sensitive filesystem: the case-varied path is a different folder")
+		}
+	}
+	root := filepath.Join(folded, config.AdoptionDirName)
+	adoptionListingFixture(t, root, t.TempDir())
+	cfg := config.Config{DataDir: filepath.Join(home, ".local", "share", "papio"), Browser: config.Browser{AdoptionRoot: root}}
+
+	checks := collectChecks(t, func(add func(string, string, string, string)) { checkAdoptionRoot(cfg, add) })
+	if len(checks) != 1 {
+		t.Fatalf("checks = %#v, want exactly one", checks)
+	}
+	if c := checks[0]; c.Status != Pass || !strings.Contains(c.Detail, root) {
+		t.Fatalf("check = %#v, want a Pass for %q, which is inside %q", c, root, downloads)
+	}
+}
+
+// TestCheckAdoptionRootWarnsForACaseVariantThatIsAnotherFolder is the other
+// side of the case-insensitive comparison: on a case-sensitive filesystem a
+// case-varied folder is a different folder, which no browser downloads into.
+func TestCheckAdoptionRootWarnsForACaseVariantThatIsAnotherFolder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows paths are case-insensitive")
+	}
+	home := adoptionHome(t)
+	downloads := config.UserDownloadsDir()
+	folded := filepath.Join(filepath.Dir(downloads), strings.ToUpper(filepath.Base(downloads)))
+	if err := os.MkdirAll(downloads, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(folded, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := os.Stat(downloads)
+	b, _ := os.Stat(folded)
+	if os.SameFile(a, b) {
+		t.Skip("case-insensitive filesystem: the case-varied path is the same folder")
+	}
+	root := filepath.Join(folded, config.AdoptionDirName)
+	adoptionListingFixture(t, root, t.TempDir())
+	cfg := config.Config{DataDir: filepath.Join(home, ".local", "share", "papio"), Browser: config.Browser{AdoptionRoot: root}}
+
+	checks := collectChecks(t, func(add func(string, string, string, string)) { checkAdoptionRoot(cfg, add) })
+	if len(checks) != 1 || checks[0].Status != Warn {
+		t.Fatalf("checks = %#v, want one Warn for %q outside %q", checks, root, downloads)
 	}
 }
 

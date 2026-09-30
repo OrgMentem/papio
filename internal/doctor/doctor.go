@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -1152,13 +1153,36 @@ func checkAdoptionRoot(cfg config.Config, add func(string, string, string, strin
 			fmt.Sprintf("grant the papio binary access to %s in System Settings \u2192 Privacy & Security \u2192 Files and Folders (or Full Disk Access) \u2014 every dev rebuild resets that consent \u2014 or move download_adoption_root to a different folder", root))
 	case err != nil && !errors.Is(err, os.ErrNotExist):
 		add("adoption_root", Fail, fmt.Sprintf("%s: %v", root, err), "check the adoption root's permissions and try again")
-	case filepath.Dir(filepath.Clean(root)) != config.UserDownloadsDir():
+	case !sameDirectory(filepath.Dir(filepath.Clean(root)), config.UserDownloadsDir()):
 		add("adoption_root", Warn,
 			fmt.Sprintf("%s is readable, but it is not inside this account's download folder (%s)", root, config.UserDownloadsDir()),
 			fmt.Sprintf("adoption only works if the browser's download folder is %s; otherwise clear download_adoption_root to use %s", filepath.Dir(filepath.Clean(root)), config.DefaultAdoptionRoot()))
 	default:
 		add("adoption_root", Pass, fmt.Sprintf("%s is readable and reachable by browser steering", root), "")
 	}
+}
+
+// sameDirectory reports whether two paths name one directory. Plain string
+// equality is wrong on a case-insensitive filesystem — Windows always, macOS
+// by default — where `C:\Users\x\Downloads` and `c:\users\x\downloads` are the
+// same folder, and treating them as different tells the operator to re-point
+// a working adoption root. Only paths that differ by case alone are in
+// question: Windows paths are then equal, and elsewhere the filesystem
+// decides, because macOS and Linux volumes can be either case-sensitive or not.
+func sameDirectory(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if a == b {
+		return true
+	}
+	if !strings.EqualFold(a, b) {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	return aerr == nil && berr == nil && os.SameFile(ai, bi)
 }
 
 // checkLegacyAdoptionRoot names the upgrade situation the adoption-root
