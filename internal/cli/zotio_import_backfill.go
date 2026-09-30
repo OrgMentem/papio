@@ -2,12 +2,20 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"papio/internal/zotio"
 )
+
+// errImportBackfillFailed is the exit status of an --apply run that recorded
+// failed imports. The receipt still prints — counts, per-job failures and the
+// cursor to resume from — but an automation that checks only the status used
+// to read a partly filed batch as complete. A dry run's expected_fail is a
+// prediction, not an outcome, and never fails the command.
+var errImportBackfillFailed = errors.New("import-backfill failed to import some papers")
 
 func newZotioImportBackfillCommand(opt *options) *cobra.Command {
 	var apply bool
@@ -48,7 +56,10 @@ Jobs submitted without policy.auto_import are excluded unless you pass
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result)
+				if err := opt.printJSON(result); err != nil {
+					return err
+				}
+				return importBackfillStatus(result)
 			}
 			mode := "dry-run"
 			if !result.DryRun {
@@ -104,7 +115,7 @@ Jobs submitted without policy.auto_import are excluded unless you pass
 					return err
 				}
 			}
-			return nil
+			return importBackfillStatus(result)
 		},
 	}
 	command.Flags().BoolVar(&apply, "apply", false, "apply imports to the configured Zotero library (default is dry-run)")
@@ -112,6 +123,13 @@ Jobs submitted without policy.auto_import are excluded unless you pass
 	command.Flags().IntVar(&limit, "limit", zotio.ImportBackfillLimitDefault, "maximum jobs per invocation (1-50)")
 	command.Flags().StringVar(&cursor, "cursor", "", "resume after the cursor returned by a previous invocation")
 	return command
+}
+
+func importBackfillStatus(result zotio.ImportBackfillResult) error {
+	if result.DryRun || result.Summary.Failed == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %d of %d selected", errImportBackfillFailed, result.Summary.Failed, result.Summary.Selected)
 }
 
 func writeImportBackfillSharedResolutionNotice(out interface{ Write([]byte) (int, error) }, result zotio.ImportBackfillResult) error {
