@@ -760,11 +760,12 @@ There is also a link check, because `zensical build` prints a broken link as an
   excluded from every early classification. A change here still needs **asynchronous**
   tests where those cases diverge — another rule wakes early, an article marker appears
   then disappears, and an article marker remains through the deadline.
-  `test/plan.test.ts:355` is the trap: a raw text scan from `planExecution` to end of file
+  `test/plan.test.ts`'s "planExecution body has no module-scope runtime dependencies"
+  is the trap: a raw text scan from `planExecution` to end of file
   forbidding `adapters`, `interpret`, `chrome`, `globalThis`, `window`, and
   `resolveDownloadURL` **by word, comments included**. So naming the deleted twin in a
   comment there fails the build, and reintroducing a second classifier fails it too.
-  `assessDrivenPage` (`extension/src/background.ts:932`) is a **different** classifier with
+  `assessDrivenPage` (`extension/src/background.ts`) is a **different** classifier with
   a different input contract — it produces `load_failure` before `planExecution` runs — and
   is deliberately untouched by any of this. Do not merge it in.
 - **`sanitizeFixture` strips URL query strings** (privacy). So classify selectors must key on
@@ -825,7 +826,7 @@ There is also a link check, because `zensical build` prints a broken link as an
   short-lived tokens by `openaire.ClientCredentials` (`internal/resolvers/openaire/auth.go`)
   and wired in `bootstrap.openAIRETokens`. Two consequences to preserve: the exchange
   runs against the AAI host, so it is deliberately outside the source's budget gate and
-  its Graph rate ceiling; and `config.applySourceTiers` raises pacing for client
+  its Graph rate ceiling; and `config.EffectiveSourcePolicy` raises pacing for client
   credentials but **never** for `api_key`, because pacing to 7,200/hour on a credential
   that can vanish mid-hour leaves papio at 120× a keyless ceiling.
 - **Before tuning any threshold against job history, plot both distributions first.**
