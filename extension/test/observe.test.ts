@@ -434,10 +434,17 @@ for (const reason of ["storage_unavailable", "injection_failed", "origin_changed
     expect(diagnostics).toEqual([{ reason }]);
     expect(fake.sent).toHaveLength(0);
     if (reason === "transport_unavailable") {
-      // Sending failed after reservation; a second attempt must still meet the quota.
-      await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
-        fixedNow("2026-09-20T10:01:00Z"), (diagnostic) => diagnostics.push(diagnostic));
-      expect(diagnostics[1]).toEqual({ reason: "shape_limit", retryAfterMs: 59 * 60_000 });
+      // The bridge never took the capture, so the reservation is released: the
+      // same page is neither shape-limited nor treated as a seen digest.
+      expect(fake.stored[RATE_KEY]).toEqual({ total: [], byShape: {}, digests: {} });
+      fake.api.sendPageCapture = async (payload, jobID) => {
+        fake.sent.push({ payload, jobID });
+        return true;
+      };
+      expect(await observeUnknown(fake.api, jobFor(host), host, verifiedHosts(host),
+        fixedNow("2026-09-20T10:01:00Z"), (diagnostic) => diagnostics.push(diagnostic))).toBe(true);
+      expect(diagnostics[1]).toEqual({ reason: "sent" });
+      expect(fake.sent).toHaveLength(1);
     }
   });
 }

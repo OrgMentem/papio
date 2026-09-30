@@ -280,6 +280,7 @@ export function observeUnknown(
 
     // Reserve quota before bridge emission so a worker restart during native
     // transport cannot turn one observation into multiple captures.
+    const beforeReservation = structuredClone(rates);
     rates.total.push(timestamp);
     const shapeRates = rates.byShape[shapeKey] ?? [];
     shapeRates.push(timestamp);
@@ -297,13 +298,22 @@ export function observeUnknown(
       if (await api.sendPageCapture(encoded.payload, job.job_id)) {
         captured = true;
         diagnostic = { reason: "sent" };
-      } else {
-        console.warn("papio: observed page capture was not sent; skipping");
-        refuse("transport_unavailable");
+        return;
       }
+      console.warn("papio: observed page capture was not sent; skipping");
     } catch (error) {
       console.warn("papio: observed page capture was not sent; skipping", error);
-      refuse("transport_unavailable");
+    }
+    refuse("transport_unavailable");
+    // The bridge reported no delivery, so release the reservation: a transient
+    // transport failure must not burn the day's and the shape's budget or mark
+    // the digest seen. Calls are serialized, so nothing else wrote the rate
+    // state since the reservation. A worker that dies mid-send never reaches
+    // this line and keeps the reservation, which is the fail-closed direction.
+    try {
+      await api.storage.local.set({ [RATE_STORAGE_KEY]: beforeReservation });
+    } catch (error) {
+      console.warn("papio: observed capture reservation could not be released", error);
     }
   });
   const completed = run.catch(() => { refuse("capture_failed"); });
