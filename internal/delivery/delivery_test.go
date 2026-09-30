@@ -983,6 +983,56 @@ func TestResumeRefusesTerminalRow(t *testing.T) {
 		t.Fatalf("Resume on an unknown id = %+v, %v, want (nil, nil)", row, err)
 	}
 }
+
+// TestResumeLosesToConcurrentOrphan proves Resume's write is a CAS on the
+// live states: when OrphanIfLive settles the row to unknown_outcome between
+// Resume's read and its write, Resume reports ErrRequestNotLive with the
+// orphaned row and leaves that row's poll bookkeeping untouched, rather than
+// resetting it and reporting a resume of a row nothing will poll.
+func TestResumeLosesToConcurrentOrphan(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	svc := testService(t, now)
+	ctx := context.Background()
+	testJob(t, svc, "job_resume_race")
+
+	req, err := svc.Create(ctx, CreateRequest{
+		JobID: "job_resume_race", InstitutionProfile: "campus", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/resume-race",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdateState(ctx, req.ID, StatePending); err != nil {
+		t.Fatal(err)
+	}
+	parked := store.FormatTime(now.Add(10 * 365 * 24 * time.Hour))
+	if _, err := svc.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET consecutive_poll_failures = 7, last_poll_error_class = 'contract_drift', next_check_at = ?
+		WHERE id = ?`, parked, req.ID); err != nil {
+		t.Fatal(err)
+	}
+	orphaned := false
+	svc.beforeResumeCAS = func() error {
+		if orphaned {
+			return nil
+		}
+		orphaned = true
+		return svc.OrphanIfLive(ctx, "job_resume_race", "job cancelled")
+	}
+
+	row, err := svc.Resume(ctx, req.ID)
+	if !errors.Is(err, ErrRequestNotLive) {
+		t.Fatalf("Resume after a concurrent orphan: err = %v, want ErrRequestNotLive", err)
+	}
+	if row == nil || row.State != StateUnknownOutcome {
+		t.Fatalf("Resume after a concurrent orphan returned %+v, want the unknown_outcome row", row)
+	}
+	if row.ConsecutivePollFailures != 7 || row.LastPollErrorClass != "contract_drift" || row.NextCheckAt != parked {
+		t.Fatalf("orphaned row bookkeeping = (%d, %q, %q), want untouched (7, contract_drift, %q)",
+			row.ConsecutivePollFailures, row.LastPollErrorClass, row.NextCheckAt, parked)
+	}
+}
 func TestListRecoverableOnlyOfferedWithoutProviderReference(t *testing.T) {
 	ctx := context.Background()
 	svc := testService(t, time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC))

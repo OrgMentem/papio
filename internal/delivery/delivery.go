@@ -99,6 +99,10 @@ type Service struct {
 	// lets a test settle the row to a terminal outcome in the window
 	// between read and write, proving the CAS does not clobber it.
 	beforeOrphanCAS func() error
+	// beforeResumeCAS is a test-only seam invoked in Resume after the
+	// liveness read but before the guarded bookkeeping write, so a test can
+	// settle or orphan the row inside that window.
+	beforeResumeCAS func() error
 }
 
 // New constructs a Service. now defaults to time.Now when nil.
@@ -667,25 +671,46 @@ func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID
 // row whose state is not live, so callers can report a structured refusal
 // instead of propagating a raw error. Returns (nil, nil) when no row with
 // this id exists.
+//
+// The write is a compare-and-swap on the live states, the same discipline
+// OrphanIfLive follows: a row settled or orphaned between the read and the
+// write is reported as not live rather than having its bookkeeping reset
+// and being reported as resumed.
 func (s *Service) Resume(ctx context.Context, id int64) (*Request, error) {
-	row, err := s.Get(ctx, id)
-	if err != nil {
-		return nil, err
+	for {
+		row, err := s.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if row == nil {
+			return nil, nil
+		}
+		if row.State != StateSubmitted && row.State != StatePending {
+			return row, ErrRequestNotLive
+		}
+		if s.beforeResumeCAS != nil {
+			if err := s.beforeResumeCAS(); err != nil {
+				return nil, err
+			}
+		}
+		now := store.FormatTime(s.now())
+		res, err := s.store.DB().ExecContext(ctx, `
+			UPDATE delivery_requests
+			SET consecutive_poll_failures = 0, last_poll_error_class = NULL, next_check_at = ?, updated_at = ?
+			WHERE id = ? AND state IN ('submitted','pending')`, now, now, id)
+		if err != nil {
+			return nil, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			return s.Get(ctx, id)
+		}
+		// The row left the live states after the read; re-read so the
+		// refusal names the state it is in now.
 	}
-	if row == nil {
-		return nil, nil
-	}
-	if row.State != StateSubmitted && row.State != StatePending {
-		return row, ErrRequestNotLive
-	}
-	now := store.FormatTime(s.now())
-	if _, err := s.store.DB().ExecContext(ctx, `
-		UPDATE delivery_requests
-		SET consecutive_poll_failures = 0, last_poll_error_class = NULL, next_check_at = ?, updated_at = ?
-		WHERE id = ?`, now, now, id); err != nil {
-		return nil, err
-	}
-	return s.Get(ctx, id)
 }
 
 // BranchDecision is the idempotency branch Decision 3B evaluates before the
