@@ -222,6 +222,80 @@ func TestPartialProjectionOmitsDenominatorAfterInactivity(t *testing.T) {
 	}
 }
 
+// A chunk whose domain submission succeeded but whose membership write failed
+// has crossed the domain boundary: the chunk and its members roll back, the
+// cohort is marked partial so no denominator is ever claimed, and a replay of
+// the same request re-submits idempotently and persists the members while
+// still withholding the total.
+func TestSubmitChunkMembershipFailureAfterSubmitMarksCohortPartial(t *testing.T) {
+	ctx := context.Background()
+	s := cohortStore(t)
+	cohorts := New(s)
+	manifest := keys(51)
+	first := ChunkRequest{RequestID: "request-1", CohortID: "cohort-1", Source: browserSource(), CohortTotal: 51, ChunkIndex: 0, CanonicalKeys: manifest[:50]}
+	if _, err := cohorts.SubmitChunk(ctx, first, func(context.Context, []string) ([]MemberOutcome, error) {
+		return outcomes(first.CanonicalKeys, "submitted", "job-"), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `CREATE TRIGGER fail_later_members BEFORE INSERT ON acquisition_batch_members WHEN NEW.ordinal >= 50 BEGIN SELECT RAISE(ABORT, 'injected membership failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.RequestID = "request-2"
+	second.ChunkIndex = 1
+	second.FinalChunk = true
+	second.CanonicalKeys = manifest[50:]
+	calls := 0
+	if _, err := cohorts.SubmitChunk(ctx, second, func(context.Context, []string) ([]MemberOutcome, error) {
+		calls++
+		return outcomes(second.CanonicalKeys, "submitted", "job-"), nil
+	}); err == nil || !strings.Contains(err.Error(), "persist cohort membership") {
+		t.Fatalf("membership failure error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("submit calls = %d, want the one that crossed the domain boundary", calls)
+	}
+	count := func(query string) int {
+		t.Helper()
+		var n int
+		if err := s.DB().QueryRowContext(ctx, query).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if chunks, members := count(`SELECT COUNT(*) FROM acquisition_batch_chunks`), count(`SELECT COUNT(*) FROM acquisition_batch_members`); chunks != 1 || members != 50 {
+		t.Fatalf("after failure chunks=%d members=%d, want the failed chunk rolled back (1, 50)", chunks, members)
+	}
+	var membership string
+	if err := s.DB().QueryRowContext(ctx, `SELECT membership_state FROM acquisition_batches WHERE cohort_id='cohort-1'`).Scan(&membership); err != nil {
+		t.Fatal(err)
+	}
+	if membership != "partial" {
+		t.Fatalf("membership_state = %q, want partial", membership)
+	}
+
+	if _, err := s.DB().ExecContext(ctx, `DROP TRIGGER fail_later_members`); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := cohorts.SubmitChunk(ctx, second, func(context.Context, []string) ([]MemberOutcome, error) {
+		calls++
+		return outcomes(second.CanonicalKeys, "joined", "job-"), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || replay.Joined != 1 || replay.Submitted != 0 {
+		t.Fatalf("replay = %+v calls=%d, want an idempotent re-submission reporting joined", replay, calls)
+	}
+	if replay.Membership != "partial" || replay.CohortTotal != nil {
+		t.Fatalf("replay membership=%q total=%v, want partial with no denominator", replay.Membership, replay.CohortTotal)
+	}
+	if chunks, members := count(`SELECT COUNT(*) FROM acquisition_batch_chunks`), count(`SELECT COUNT(*) FROM acquisition_batch_members`); chunks != 2 || members != 51 {
+		t.Fatalf("after replay chunks=%d members=%d, want 2 and 51", chunks, members)
+	}
+}
+
 // seedCohortJob writes the work_request/job pair a cohort member points at, so
 // Projection can classify a real row rather than reporting an incomplete view.
 func seedCohortJob(t *testing.T, s *store.Store, jobID, state, leaseOwner string, leaseExpires time.Time, now time.Time) {
