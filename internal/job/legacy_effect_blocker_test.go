@@ -469,6 +469,92 @@ func TestImportLegacyDriveEffectsRejectsNullAndDanglingJobsAtomically(t *testing
 	}
 }
 
+// Each malformed tuple must stop startup with the importer's own refusal, not
+// a blank-identity blocker and not a raw schema constraint error, and the
+// whole import must roll back.
+func TestImportLegacyDriveEffectsRefusesMalformedTuplesAtomically(t *testing.T) {
+	longDomain := strings.Repeat("d", 257)
+	tests := []struct {
+		name, kind, detail string
+	}{
+		{"generic blank attempt", "browser.provider_drive_epoch_started", `{"drive_attempt_id":"  ","ordinal":0,"strategy":"generic","revision":"1","safety_domain":"domain:x"}`},
+		{"generic blank strategy", "browser.provider_drive_epoch_started", `{"drive_attempt_id":"a","ordinal":0,"strategy":" ","revision":"1","safety_domain":"domain:x"}`},
+		{"generic blank revision", "browser.provider_drive_epoch_result", `{"drive_attempt_id":"a","ordinal":0,"strategy":"generic","revision":"","safety_domain":"domain:x"}`},
+		{"generic missing ordinal", "browser.provider_drive_epoch_started", `{"drive_attempt_id":"a","strategy":"generic","revision":"1","safety_domain":"domain:x"}`},
+		{"generic negative ordinal", "browser.provider_drive_epoch_started", `{"drive_attempt_id":"a","ordinal":-1,"strategy":"generic","revision":"1","safety_domain":"domain:x"}`},
+		{"generic overlong domain", "browser.provider_drive_epoch_started", `{"drive_attempt_id":"a","ordinal":0,"strategy":"generic","revision":"1","safety_domain":"` + longDomain + `"}`},
+		{"direct blank attempt", "browser.direct_route", `{"phase":"offered","drive_attempt_id":" ","ordinal":0,"route_revision":"1","safety_domain":"domain:x"}`},
+		{"direct blank revision", "browser.direct_route", `{"phase":"result","drive_attempt_id":"a","ordinal":0,"route_revision":" "}`},
+		{"direct missing ordinal", "browser.direct_route", `{"phase":"offered","drive_attempt_id":"a","route_revision":"1","safety_domain":"domain:x"}`},
+		{"direct negative ordinal", "browser.direct_route", `{"phase":"offered","drive_attempt_id":"a","ordinal":-2,"route_revision":"1","safety_domain":"domain:x"}`},
+		{"direct offered without domain", "browser.direct_route", `{"phase":"offered","drive_attempt_id":"a","ordinal":0,"route_revision":"1"}`},
+		{"direct offered overlong domain", "browser.direct_route", `{"phase":"offered","drive_attempt_id":"a","ordinal":0,"route_revision":"1","safety_domain":"` + longDomain + `"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			jobID := legacyBlockerJob(t, js, "legacy-malformed-tuple")
+			legacyStarted(t, js, jobID, "valid-attempt", 0, "generic", "1", "domain:valid")
+			if _, err := js.S.DB().ExecContext(ctx,
+				`INSERT INTO events(job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)`,
+				jobID, store.Now(), tt.kind, tt.detail); err != nil {
+				t.Fatal(err)
+			}
+			if err := js.ImportLegacyStartedEpochs(ctx); err == nil ||
+				!strings.Contains(err.Error(), "unclassifiable legacy") {
+				t.Fatalf("malformed tuple import error = %v, want precise refusal", err)
+			}
+			if count, err := js.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 0 {
+				t.Fatalf("malformed tuple import left %d blocker(s), err=%v; want rollback", count, err)
+			}
+		})
+	}
+}
+
+// An institutional claim whose candidate names no safety domain cannot become
+// a blocker: the importer refuses it by name and rolls back.
+func TestImportLegacyInstitutionalClaimRefusesBlankSafetyDomain(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	jobID := legacyBlockerJob(t, js, "legacy-institutional-blank-domain")
+	legacyStarted(t, js, jobID, "valid-attempt", 0, "generic", "1", "domain:valid")
+	now := store.Now()
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO institution_profiles
+		  (id, configured_name, revision, authority_digest, authentication_claim_id, created_at, updated_at)
+		VALUES ('profile-blank-domain', 'legacy profile', 1, 'digest', 'auth-claim', ?, ?)`,
+		now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO browser_candidates
+		  (id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision,
+		   route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id,
+		   adapter_revision, effect_contract_id, status, created_at, updated_at)
+		VALUES ('candidate-blank-domain', ?, 1, 'profile-blank-domain', 1, 1, 'institutional', 'doi',
+		        'pre-route', ' ', 'adapter-1', 'effect-1', 'claimed', ?, ?)`,
+		jobID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO materialization_claims
+		  (id, candidate_id, browser_holder_generation, materialization_kind, binding_id,
+		   phase, route_issuance_ordinal, effect_ordinal, created_at, updated_at)
+		VALUES ('claim-blank-domain', 'candidate-blank-domain', 1, 'browser_tab', 'binding-blank-domain',
+		        'route_issued', 2, 3, ?, ?)`,
+		now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.ImportLegacyStartedEpochs(ctx); err == nil ||
+		!strings.Contains(err.Error(), "unclassifiable legacy institutional effect") {
+		t.Fatalf("blank-domain institutional import error = %v, want precise refusal", err)
+	}
+	if count, err := js.UnresolvedLegacyEffectBlockerCount(ctx); err != nil || count != 0 {
+		t.Fatalf("blank-domain import left %d blocker(s), err=%v; want rollback", count, err)
+	}
+}
+
 func TestImportLegacyDriveEffectsRejectsReversedConflictingDomainsAtomically(t *testing.T) {
 	tests := []struct {
 		name, eventKind, firstDetail, secondDetail string
