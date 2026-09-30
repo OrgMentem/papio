@@ -1,7 +1,7 @@
 ---
 name: protocol-triad-lands-together
 description: "papio-browser/1 is validated in three places — protocol.go, protocol.ts, and browser-v1.schema.json must change in the same commit"
-condition: ['.*']
+question: "Does this edit change the papio-browser/1 wire format: add, remove, or rename a field or message type, change a field's type or disposition, or change validation?"
 scope:
   - "tool:edit(internal/protocol/protocol.go)"
   - "tool:write(internal/protocol/protocol.go)"
@@ -9,7 +9,6 @@ scope:
   - "tool:write(extension/src/protocol.ts)"
   - "tool:edit(protocol/browser-v1.schema.json)"
   - "tool:write(protocol/browser-v1.schema.json)"
-interruptMode: never
 ---
 
 The protocol is validated **twice** and documented once. A wire change needs all three, in the same commit:

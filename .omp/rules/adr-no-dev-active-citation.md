@@ -6,7 +6,7 @@ condition:
 scope:
   - "tool:write(dev/adr/*.md)"
   - "tool:edit(dev/adr/*.md)"
-interruptMode: always
+question: "Does this ADR edit put normative content (acceptance tests, invariants, or the decision itself) in a dev/active/ file, instead of a clearly marked non-normative pointer that the ADR does not need?"
 ---
 
 **An ADR must never depend on a `dev/active/` file for normative content.** `dev/` is tiered by **lifetime**: a file leaves `dev/active/` when its work ships (salvage anything normative into an ADR, then delete it — git history is the archive, there is deliberately no `archive/`). So an ADR citing an active plan is left pointing at nothing the moment the work lands.

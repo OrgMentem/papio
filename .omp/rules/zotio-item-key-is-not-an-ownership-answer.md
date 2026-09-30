@@ -7,7 +7,7 @@ condition:
 scope:
   - "tool:edit(internal/zotio/*.go)"
   - "tool:write(internal/zotio/*.go)"
-interruptMode: always
+question: "Does this edit skip, exclude, or short-circuit a job's ownership answer because the job already carries a ZotioItemKey?"
 ---
 
 **A job that already carries a `ZotioItemKey` must still get an ownership answer. Excluding it — "it names an item, so the existing-item route will settle it" — is the bug, and that exact reasoning was wrong in two files at once.**

@@ -7,7 +7,7 @@ condition:
 scope:
   - "tool:edit(internal/zotio/*.go)"
   - "tool:write(internal/zotio/*.go)"
-interruptMode: always
+question: "Does this edit decode a zotio record read directly into a Go slice, instead of through decodeRows or decodeFoundItems?"
 ---
 
 **zotio is migrating every record read from a bare JSON array onto its documented `{"meta":…,"results":[…]}` envelope, one command at a time. A read that decodes straight into a Go slice therefore breaks on a zotio upgrade, and it breaks SILENTLY.**

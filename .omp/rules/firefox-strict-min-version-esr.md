@@ -8,7 +8,7 @@ scope:
   - "tool:write(*.ts)"
   - "tool:edit(*.json)"
   - "tool:write(*.json)"
-interruptMode: always
+question: "Does this edit change the Firefox strict_min_version value away from 128.0?"
 ---
 
 **`strict_min_version` stays `128.0` on purpose.** Firefox 128 is the ESR that papio's institutional and library users run — the whole audience. The source of truth is `extension/build.ts` (around the `strict_min_version: "128.0"` literal); `extension/firefox/manifest.json` is generated from it, so never edit that copy (`rule://generated-files-not-hand-edited`).

@@ -9,7 +9,7 @@ condition:
 scope:
   - "tool:edit(internal/bundle/*.go)"
   - "tool:write(internal/bundle/*.go)"
-interruptMode: never
+question: "Does this edit change how provenance_digest is computed (the hash input, JSON encoding, or blanking of the digest field) or which fields it covers?"
 ---
 
 **ADR-0011 records this as unresolved, not settled.** `digest()` computes `sha256(json.Marshal(bundle with the digest field blanked))` (`internal/bundle/export.go:405-410`), so the value depends on **Go's** `encoding/json`: field order from struct declaration order, `omitempty` behaviour, and — the sharp edge — HTML escaping of `<`, `>` and `&`, which are routine characters in URLs. A consumer in another language computing "sha256 of the canonical JSON" gets a different digest for a bundle papio considers valid.

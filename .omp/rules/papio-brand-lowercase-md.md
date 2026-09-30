@@ -1,7 +1,7 @@
 ---
 name: papio-brand-lowercase-md
 description: "User docs use lowercase papio/zotio — italicize *papio* (never zotio) in markdown prose"
-condition: ["\\bPapio\\b", "\\bZotio\\b"]
+question: "Does this Markdown prose, outside code spans, URLs, paths, identifiers, env vars, image alt text, and quoted UI copy, capitalize papio or zotio, italicize zotio, or mention papio without italics?"
 scope: ["tool:write(*.md)", "tool:edit(*.md)"]
 ---
 
