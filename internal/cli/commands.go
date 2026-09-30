@@ -975,7 +975,9 @@ func newActionsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			if err := focusOrOpenActionURLs(cmd.Context(), urls, untrackedURLs, jobIDs, dryRun, opt.out, func(ctx context.Context, ids []string) (api.ActionsOpenResult, error) {
+			// planOut, not opt.out: the skipped-handoff shortfall is prose
+			// and must not precede the --json page on stdout.
+			if err := focusOrOpenActionURLs(cmd.Context(), urls, untrackedURLs, jobIDs, dryRun, planOut, func(ctx context.Context, ids []string) (api.ActionsOpenResult, error) {
 				var result api.ActionsOpenResult
 				if err := opt.call(ctx, "actions.open", map[string]any{"job_ids": ids}, &result); err != nil {
 					return api.ActionsOpenResult{}, err
