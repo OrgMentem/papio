@@ -31,6 +31,7 @@ import (
 	"papio/internal/ownership"
 	"papio/internal/pdf"
 	"papio/internal/protocol"
+	"papio/internal/store"
 	"papio/internal/store/storetest"
 	"papio/internal/triage"
 	"papio/internal/update"
@@ -368,6 +369,48 @@ func TestTriageDecideAcknowledgesRetractionNotice(t *testing.T) {
 	}
 	if outcome.Outcome != "conflict" {
 		t.Fatalf("vanished notice outcome = %+v, want conflict", outcome)
+	}
+}
+
+// A parked PDF grab advertises dismiss and carries no watch scope, so
+// triage.decide over RPC must dismiss it without demanding one, and the grab
+// must actually leave the inbox.
+func TestTriageDecideDismissesParkedPdfGrab(t *testing.T) {
+	system := testSystem(t)
+	ctx := context.Background()
+	now := store.FormatTime(time.Now())
+	if _, err := system.Store.DB().ExecContext(ctx, `
+		INSERT INTO pdf_grabs
+			(id, url_host, title, state, quarantine_path, job_id, outcome, detail,
+			 notified_at, created_at, updated_at, effect_request_id, bind_provenance)
+		VALUES ('grab_api_dismiss', 'grab.example', 'Reading copy', 'parked_no_identifier', '', NULL,
+			'', '', NULL, ?, ?, '', '')`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	router := Router(system)
+	itemID := triage.PdfGrabIDPrefix + "grab_api_dismiss"
+
+	var snapshot triage.Snapshot
+	if rpcErr := callMethod(t, router, "triage.snapshot", map[string]any{"limit": 100}, &snapshot); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(snapshot.Items) != 1 || snapshot.Items[0].Kind != triage.KindPdfGrab || snapshot.Items[0].PdfGrab == nil ||
+		snapshot.Items[0].PdfGrab.GrabID != "grab_api_dismiss" || !slices.Contains(snapshot.Items[0].Ops, "dismiss") {
+		t.Fatalf("snapshot = %+v, want the parked grab offering dismiss", snapshot.Items)
+	}
+
+	var outcome triageDecideResult
+	if rpcErr := callMethod(t, router, "triage.decide", map[string]any{"item_id": itemID, "op": "dismiss"}, &outcome); rpcErr != nil {
+		t.Fatalf("dismiss parked grab: %v", rpcErr)
+	}
+	if outcome.Outcome != "applied" {
+		t.Fatalf("dismiss outcome = %+v, want applied", outcome)
+	}
+	if rpcErr := callMethod(t, router, "triage.snapshot", map[string]any{"limit": 100}, &snapshot); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if len(snapshot.Items) != 0 {
+		t.Fatalf("snapshot after dismissal = %+v, want the grab gone", snapshot.Items)
 	}
 }
 
