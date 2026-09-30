@@ -418,4 +418,24 @@ func TestUnavailableRecheck(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("recheck without a positive window submits nothing", func(t *testing.T) {
+		svc, jobs := newService(t)
+		wr := request("wr_recheck_window_001", "10.1000/recheck-window-001")
+		oldID := seedUnavailable(t, svc, jobs, wr, job.TerminalReasonNoEntitlement, now.AddDate(0, 0, -windowDays-1))
+		for _, days := range []int{0, -1} {
+			retry := wr
+			retry.RequestID = fmt.Sprintf("wr_recheck_window_retry_%d", days+1)
+			if _, err := svc.SubmitWithOptions(context.Background(), retry, SubmitOptions{RecheckOf: oldID, RecheckWindowDays: days}); err == nil || !strings.Contains(err.Error(), "window must be positive") {
+				t.Fatalf("window %d error = %v, want a positive-window refusal", days, err)
+			}
+		}
+		var total int
+		if err := jobs.S.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM jobs`).Scan(&total); err != nil {
+			t.Fatal(err)
+		}
+		if total != 1 || len(recheckEvents(t, jobs, oldID)) != 0 {
+			t.Fatalf("jobs = %d, recheck events = %d; a refused recheck must create neither", total, len(recheckEvents(t, jobs, oldID)))
+		}
+	})
 }
