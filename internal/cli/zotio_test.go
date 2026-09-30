@@ -14,6 +14,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/config"
 	"papio/internal/ipc"
+	"papio/internal/zotio"
 )
 
 func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
@@ -88,5 +89,45 @@ func TestZotioApplyRendersSafeFailureDetail(t *testing.T) {
 	}
 	if strings.Contains(got, dataDir) || strings.Contains(got, "https://") {
 		t.Fatalf("apply error leaked private detail: %q", got)
+	}
+}
+
+// `zotio plan` printed only the plan id, confirmation hash, route and job, so
+// the operator pasted a hash into `zotio apply` for a mutation they were never
+// shown. Each plan must name the item it changes, the attachment and the
+// collection, and say where the full preview is.
+func TestZotioPlanShowsTheMutationItConfirms(t *testing.T) {
+	plans := []*zotio.Plan{
+		{ID: "zplan_a", JobID: "job_a", Route: "existing_item", ExpectedParentKey: "ABCD2345", AttachmentMode: "stored", ArtifactPath: "/data/a.pdf", Collection: "Reading\x1b]0;x\x07", ConfirmationSHA256: "sha-a"},
+		{ID: "zplan_b", JobID: "job_b", Route: "manifest_create", AttachmentMode: "linked-file", ArtifactPath: "/data/b.pdf", ConfirmationSHA256: "sha-b"},
+	}
+	var out bytes.Buffer
+	root := NewInProcessRoot(&out, &bytes.Buffer{}, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "zotio.plan" {
+			t.Fatalf("method = %q", method)
+		}
+		result.(*struct {
+			Plans []*zotio.Plan `json:"plans"`
+		}).Plans = plans
+		return nil
+	})
+	root.SetArgs([]string{"zotio", "plan", "job_a", "job_b"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"zplan_a  sha-a  existing_item  job_a\n",
+		"attach to existing item ABCD2345", "stored /data/a.pdf", "collection:   Reading]0;x\n",
+		"zplan_b  sha-b  manifest_create  job_b\n",
+		"create a new Zotero item", "linked-file /data/b.pdf", "collection:   none",
+		"papio --json zotio plan job_b",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plan output lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Fatalf("plan output passed terminal controls through: %q", got)
 	}
 }

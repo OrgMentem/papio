@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/store"
 	"papio/internal/zotio"
 )
 
@@ -42,7 +43,7 @@ func newZotioCommand(opt *options) *cobra.Command {
 				return opt.printJSON(result)
 			}
 			for _, prepared := range result.Plans {
-				if _, err := fmt.Fprintf(opt.out, "%s  %s  %s  %s\n", prepared.ID, prepared.ConfirmationSHA256, prepared.Route, prepared.JobID); err != nil {
+				if err := writeZotioPlan(opt, prepared); err != nil {
 					return err
 				}
 			}
@@ -88,4 +89,32 @@ func newZotioCommand(opt *options) *cobra.Command {
 	command.AddCommand(preflight)
 	command.AddCommand(tags)
 	return command
+}
+
+// writeZotioPlan prints one plan's confirmation line and then the mutation it
+// confirms. The hash used to be printed with only the route and job, so the
+// operator pasted it into `zotio apply` without seeing which item, attachment
+// or collection would change. The first line keeps its old shape for anything
+// that reads it; the full zotio preview stays in --json.
+func writeZotioPlan(opt *options, plan *zotio.Plan) error {
+	item := "create a new Zotero item"
+	switch plan.Route {
+	case "existing_item", "manifest_attach":
+		item = "attach to existing item " + plan.ExpectedParentKey
+	case "manifest_duplicate":
+		item = "duplicate of existing item " + plan.ExpectedParentKey
+	}
+	collection := "none"
+	if plan.Collection != "" {
+		// A collection name arrives with the acquisition request, so it is
+		// untrusted text on this human surface.
+		collection = store.StripTerminalControls(plan.Collection)
+		if plan.CollectionIsKey {
+			collection += " (collection key)"
+		}
+	}
+	_, err := fmt.Fprintf(opt.out, "%s  %s  %s  %s\n  item:         %s\n  attachment:   %s %s\n  collection:   %s\n  full preview: papio --json zotio plan %s\n",
+		plan.ID, plan.ConfirmationSHA256, plan.Route, plan.JobID,
+		item, plan.AttachmentMode, store.StripTerminalControls(plan.ArtifactPath), collection, plan.JobID)
+	return err
 }
