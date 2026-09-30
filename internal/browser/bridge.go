@@ -458,10 +458,16 @@ type Bridge struct {
 	// materializationScheduleCursor is daemon-side keyset state. It is only
 	// advanced after a scheduler query completes while this holder is still
 	// current; DB scheduling itself never runs under b.mu.
-	materializationScheduleCursor     job.CandidateScheduleCursor
-	scheduleCursorPending             job.CandidateScheduleCursor
-	materializationScheduleInFlight   bool
-	materializationScheduleVersion    uint64
+	materializationScheduleCursor   job.CandidateScheduleCursor
+	scheduleCursorPending           job.CandidateScheduleCursor
+	materializationScheduleInFlight bool
+	materializationScheduleVersion  uint64
+	// materializationScheduleLatch is the version the current in-flight
+	// scheduler query claimed the latch with. A plain version bump (a claim
+	// released or an entitled landing) invalidates that query's page but not
+	// its ownership of the latch, so only the query holding this exact token
+	// may clear materializationScheduleInFlight.
+	materializationScheduleLatch      uint64
 	scheduleHasMorePending            bool
 	scheduleEligibleCandidates        func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error)
 	materializationScheduleBlocked    bool
@@ -1251,6 +1257,7 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		b.materializationScheduleInFlight = true
 		b.materializationScheduleVersion++
 		scheduleVersion = b.materializationScheduleVersion
+		b.materializationScheduleLatch = scheduleVersion
 		scheduleRan = true
 		schedule := b.scheduleEligibleCandidates
 		if schedule == nil {
@@ -1261,10 +1268,15 @@ func (b *Bridge) Sync(ctx context.Context, sessionID string, goodbye bool, frame
 		b.mu.Unlock()
 		page, scheduleErr := schedule(ctx, maxOutstandingOffers, cursor)
 		b.mu.Lock()
+		if b.materializationScheduleInFlight && b.materializationScheduleLatch == scheduleVersion {
+			// Release the latch this query claimed even when its page is
+			// stale; a holder transition already reset it, and a later query
+			// holds its own token.
+			b.materializationScheduleInFlight = false
+		}
 		if b.materializationScheduleVersion != scheduleVersion {
 			return out, nil
 		}
-		b.materializationScheduleInFlight = false
 		if !b.arbitration.holderMatches(sessionID, scheduleEpoch) {
 			return out, nil
 		}

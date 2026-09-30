@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1250,6 +1251,64 @@ func TestAutomaticCandidateOfferParksDependentUntilEntitledLanding(t *testing.T)
 	}
 	if got := offer.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID; got != dependentCandidate {
 		t.Fatalf("resumed dependent offer candidate_id = %s, want %s", got, dependentCandidate)
+	}
+}
+
+// TestEntitledLandingDuringScheduleKeepsSchedulerRunning pins the in-flight
+// latch across a concurrent invalidation. An entitled_landing observation that
+// lands while the holder's scheduler query runs outside b.mu bumps the
+// schedule version; the stalled query must then drop its stale page without
+// leaving materializationScheduleInFlight set, or no later Sync from the same
+// holder ever schedules again and the resumed dependent is never offered.
+func TestEntitledLandingDuringScheduleKeepsSchedulerRunning(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	ctx := context.Background()
+	owner := parkInstitutional(t, jobs, "sched-latch-owner", handoffWork(), "")
+	dependent := parkInstitutional(t, jobs, "sched-latch-dependent", handoffWork(), "")
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "sched-latch-shared")
+	ownerCandidate := explicitMaterializationCandidate(t, jobs, owner, "domain-latch-owner")
+	explicitMaterializationCandidate(t, jobs, dependent, "domain-latch-dependent")
+	granted, _ := runSync(t, b, inFrame(t, protocol.MsgAuthenticationClaimRequest, owner,
+		protocol.AuthenticationClaimRequestPayload{
+			RequestID: "sched-latch-req", CandidateID: ownerCandidate,
+			MaterializationKind: "browser_tab", Trigger: "automatic",
+		}))
+	grant := authClaimResponse(t, granted)
+	if grant.Outcome != "open_new" {
+		t.Fatalf("owner grant outcome = %s, want open_new", grant.Outcome)
+	}
+	bindingID := bindCandidate(t, b, owner, ownerCandidate, "sched-latch", 4)
+	runSync(t, b, claimObservationFrame(t, owner, "sched-latch-obs-returned", "sched-latch-shared",
+		bindingID, grant.GateOccurrenceID, "sched-latch-observation-returned", b.arbitration.generation(), 0, "auth_returned"))
+
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	b.scheduleEligibleCandidates = func(sctx context.Context, limit int, cursor job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return jobs.ScheduleEligibleBrowserCandidates(sctx, limit, cursor)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = b.Sync(ctx, testSessionID, false, nil)
+	}()
+	<-started
+	landed, _ := runSync(t, b, claimObservationFrame(t, owner, "sched-latch-obs-landing", "sched-latch-shared",
+		bindingID, grant.GateOccurrenceID, "sched-latch-observation-landing", b.arbitration.generation(), 1, "entitled_landing"))
+	if ack := claimObservationAckPayload(t, landed); ack.Outcome != "applied" {
+		t.Fatalf("entitled_landing outcome = %+v, want applied", ack)
+	}
+	close(release)
+	<-done
+
+	before := calls.Load()
+	runSync(t, b)
+	if calls.Load() == before {
+		t.Fatalf("scheduler never ran again after an entitled_landing raced an in-flight schedule query (calls stayed %d)", before)
 	}
 }
 
