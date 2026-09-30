@@ -1571,7 +1571,7 @@ func (js *Store) ClaimNext(ctx context.Context, owner string, lease time.Duratio
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, nil // lost the race; caller loops
 	}
-	return js.Get(ctx, id)
+	return js.claimedRow(ctx, id, owner)
 }
 
 // Claim leases one specific runnable job using the same durable lease
@@ -1593,6 +1593,13 @@ func (js *Store) Claim(ctx context.Context, jobID, owner string, lease time.Dura
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, nil
 	}
+	return js.claimedRow(ctx, jobID, owner)
+}
+
+// claimedRow reads a job this owner has just leased. A failed read releases
+// the lease again: the caller never learns it holds the job, so nobody would
+// heartbeat or release it, and the job would sit unclaimable until expiry.
+func (js *Store) claimedRow(ctx context.Context, jobID, owner string) (*Row, error) {
 	row, err := js.Get(ctx, jobID)
 	if err != nil {
 		_, _ = js.S.DB().ExecContext(context.Background(),

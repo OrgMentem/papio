@@ -174,6 +174,32 @@ func TestClaimNextHonorsLeasesAndRetryAt(t *testing.T) {
 	}
 }
 
+// A claim whose post-claim read fails must not strand the lease: the caller
+// gets no row, so nothing would heartbeat or release it, and the job would be
+// unclaimable until the lease expired.
+func TestClaimNextReleasesLeaseWhenClaimedRowReadFails(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, err := js.CreateRequest(ctx, "wr_claim_read_failure", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A policy snapshot that no longer decodes fails Get after the lease write.
+	if _, err := js.S.DB().ExecContext(ctx, `UPDATE jobs SET policy_json = '[]' WHERE id = ?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := js.ClaimNext(ctx, "owner1", time.Hour); err == nil {
+		t.Fatalf("ClaimNext() = %+v, nil; want the row read error", got)
+	}
+	var owner, expires sql.NullString
+	if err := js.S.DB().QueryRowContext(ctx, `SELECT lease_owner, lease_expires_at FROM jobs WHERE id = ?`, id).Scan(&owner, &expires); err != nil {
+		t.Fatal(err)
+	}
+	if owner.Valid || expires.Valid {
+		t.Fatalf("lease after failed claim read = %q until %q; want released", owner.String, expires.String)
+	}
+}
+
 func TestRecoverStaleRewindsMidflightToResolving(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
