@@ -157,12 +157,15 @@ func TestRuntimeAgentLegacyAndReferencePrecedence(t *testing.T) {
 		envSet, enrolled       bool
 		wantKey, wantState     string
 		wantLegacy             bool
+		storeErr               error
 	}{
 		{name: "legacy saved", enrolled: true, stored: "old-key", wantKey: "old-key", wantState: "ready", wantLegacy: true},
 		{name: "legacy environment", enrolled: true, envSet: true, env: "env-key", wantKey: "env-key", wantState: "ready"},
 		{name: "legacy empty disables", enrolled: true, envSet: true, wantState: "not_configured"},
 		{name: "legacy invalid never falls back", enrolled: true, envSet: true, env: "bad\nkey", wantState: "invalid"},
 		{name: "legacy missing", enrolled: true, wantState: "missing", wantLegacy: true},
+		{name: "legacy locked store", enrolled: true, storeErr: errors.New("private store detail"), wantState: "unavailable", wantLegacy: true},
+		{name: "legacy bad stored key", enrolled: true, stored: "private\nkey", wantState: "invalid", wantLegacy: true},
 		{name: "not enrolled", stored: "old-key", wantState: "not_configured"},
 		{name: "explicit ref authoritative", ref: testRef(1), enrolled: true, envSet: true, env: "ignored-env", stored: "old-key", wantKey: "new-key", wantState: "ready"},
 		{name: "missing ref never falls back", ref: testRef(2), enrolled: true, envSet: true, env: "ignored-env", stored: "old-key", wantState: "missing"},
@@ -184,8 +187,14 @@ func TestRuntimeAgentLegacyAndReferencePrecedence(t *testing.T) {
 					return credential.Record{Kind: credential.KindCORE, APIKey: "wrong-kind"}, nil
 				}
 				return credential.Record{}, credential.ErrNotFound
-			}), func(context.Context, string) (string, error) {
+			}), func(_ context.Context, profile string) (string, error) {
 				legacyCalls++
+				if want, err := agentcredential.Profile(cfg.Path, cfg.DataDir); err != nil || profile != want {
+					t.Fatal("legacy key read from the wrong credential profile")
+				}
+				if tc.storeErr != nil {
+					return "", tc.storeErr
+				}
 				if tc.stored == "" {
 					return "", agentcredential.ErrNotFound
 				}

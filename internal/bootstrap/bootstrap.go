@@ -617,33 +617,6 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	return system, nil
 }
 
-// Read once before bootstrap can launch PDF workers, hooks or integrations.
-// Those children have no reason to inherit the acquisition inference key.
-func takeAcquisitionBackend(ctx context.Context, cfg config.Config) (acquisitionagent.Backend, error) {
-	return takeAcquisitionBackendWithStore(ctx, cfg, agentcredential.NewStore().Load)
-}
-
-func takeAcquisitionBackendWithStore(ctx context.Context, cfg config.Config, load func(context.Context, string) (string, error)) (acquisitionagent.Backend, error) {
-	env, err := runtimecredential.TakeEnvironment(cfg)
-	if err != nil {
-		return nil, err
-	}
-	resolved := runtimecredential.Resolve(ctx, cfg, credential.NewStore(), load, env)
-	if key := resolved.AgentKey(); key != "" {
-		backend, err := acquisitionagent.NewTypeSafe(key, nil)
-		if err != nil {
-			return nil, errors.New("invalid TypeSafe key for acquisition decisions")
-		}
-		return backend, nil
-	}
-	for _, status := range resolved.Statuses() {
-		if status.Target == "agent.typesafe" && status.State != "not_configured" {
-			return nil, errors.New("TypeSafe credential is " + status.State + "; check papio config credentials status")
-		}
-	}
-	return nil, nil
-}
-
 // hookShutdownGraceCap keeps daemon shutdown inside ordinary service-manager
 // deadlines. After this grace period, cancellation leaves five seconds for the
 // hook process tree to stop and its small outcome event to reach SQLite.
