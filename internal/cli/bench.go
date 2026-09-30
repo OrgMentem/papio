@@ -51,13 +51,7 @@ func newBenchCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			failed := 0
-			for _, w := range report.Works {
-				if w.Error != "" {
-					failed++
-				}
-			}
-			if failed > 0 {
+			if failed := benchFailedWorks(report); failed > 0 {
 				return fmt.Errorf("%w: %d of %d failed", errBenchWorksFailed, failed, len(report.Works))
 			}
 			return nil
@@ -85,9 +79,26 @@ func renderBenchReport(opt *options, report bench.Report) error {
 			return err
 		}
 	}
-	if _, err := fmt.Fprintf(opt.out, "\nincremental_autonomous_ready: %s\n", report.Headline()); err != nil {
+	unrun := ""
+	if failed := benchFailedWorks(report); failed > 0 {
+		// The headline counts a work that never ran as zero on both sides,
+		// so its denominator alone reads as if every work was measured.
+		unrun = fmt.Sprintf(" (%d could not run)", failed)
+	}
+	if _, err := fmt.Fprintf(opt.out, "\nincremental_autonomous_ready: %s%s\n", report.Headline(), unrun); err != nil {
 		return err
 	}
 	_, err := fmt.Fprintln(opt.out, "note: the baseline overlay disables semanticscholar, openaire, and crossref_metadata; crossref_metadata has no independent typed-relations toggle, so disabling it also turns off title-only metadata enrichment.")
 	return err
+}
+
+// benchFailedWorks counts the cohort works the hermetic run could not settle.
+func benchFailedWorks(report bench.Report) int {
+	failed := 0
+	for _, w := range report.Works {
+		if w.Error != "" {
+			failed++
+		}
+	}
+	return failed
 }
