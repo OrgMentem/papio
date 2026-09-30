@@ -1478,7 +1478,14 @@ func cancelJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 			return failure(err)
 		}
 	}
-	return marshal(map[string]any{"job_id": params.JobID, "cancelled": true})
+	// Cancel is an idempotent no-op on a job that already reached any
+	// terminal state, so "cancelled" reports the state the job is in now: a
+	// job that finished a moment earlier was not cancelled by this call.
+	row, err := system.Jobs.Get(ctx, params.JobID)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(map[string]any{"job_id": params.JobID, "cancelled": row.State == job.StateCancelled})
 }
 
 func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {

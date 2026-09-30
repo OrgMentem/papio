@@ -461,6 +461,47 @@ func TestRouterSubmitListGetAndCancel(t *testing.T) {
 	}
 }
 
+// jobs.cancel is an idempotent no-op on a terminal job, so its "cancelled"
+// flag must say whether the job is cancelled, not merely that the call ran: a
+// job that settled before the cancel arrived was not stopped by it.
+func TestJobsCancelReportsWhetherTheJobIsCancelled(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	type cancelResult struct {
+		JobID     string `json:"job_id"`
+		Cancelled bool   `json:"cancelled"`
+	}
+
+	settled := storeHandlerUnavailableJob(t, system, "wr_cancel_settled", job.TerminalReasonCandidatesExhausted, nil)
+	var result cancelResult
+	if rpcErr := callMethod(t, router, "jobs.cancel", map[string]string{"job_id": settled}, &result); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if result.JobID != settled || result.Cancelled {
+		t.Fatalf("cancel of an unavailable job = %+v, want cancelled=false", result)
+	}
+	if row, err := system.Jobs.Get(context.Background(), settled); err != nil || row.State != job.StateUnavailable {
+		t.Fatalf("settled job after cancel = %+v, %v; want still unavailable", row, err)
+	}
+
+	var submitted SubmitResult
+	if rpcErr := callMethod(t, router, "acquire.submit", protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_cancel_live",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/cancel-live"},
+	}, &submitted); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	for range 2 { // the repeat finds it already cancelled, which is still true
+		result = cancelResult{}
+		if rpcErr := callMethod(t, router, "jobs.cancel", map[string]string{"job_id": submitted.JobID}, &result); rpcErr != nil {
+			t.Fatal(rpcErr)
+		}
+		if result.JobID != submitted.JobID || !result.Cancelled {
+			t.Fatalf("cancel of a live job = %+v, want cancelled=true", result)
+		}
+	}
+}
+
 func TestRouterSubmitV2ReportsExistingAndHonorsForce(t *testing.T) {
 	system := testSystem(t)
 	router := Router(system)
