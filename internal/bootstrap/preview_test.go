@@ -13,12 +13,13 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/preview"
+	"papio/internal/store/storetest"
 )
 
 func TestSystemWiresAndClosesPreviewServer(t *testing.T) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 	system, err := New(context.Background(), cfg)

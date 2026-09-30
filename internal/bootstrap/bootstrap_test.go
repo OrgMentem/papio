@@ -37,7 +37,7 @@ import (
 func TestNewWiresCoreServices(t *testing.T) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 	system, err := New(context.Background(), cfg)
@@ -88,7 +88,7 @@ func TestNewImportsEveryUnresolvedLegacyBrowserEffectBeforeAdmission(t *testing.
 	ctx := context.Background()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 
@@ -217,7 +217,7 @@ func TestNewRejectsMalformedLegacyBrowserEffectBeforeBrowserConstruction(t *test
 	ctx := context.Background()
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 
@@ -232,10 +232,20 @@ func TestNewRejectsMalformedLegacyBrowserEffectBeforeBrowserConstruction(t *test
 		first.Close()
 		t.Fatal(err)
 	}
+	// A well-formed drive effect is imported first, so the later refusal of
+	// the malformed grab has a written blocker to roll back: an import that
+	// was not atomic would leave that blocker behind.
 	if err := first.Jobs.RecordEvent(ctx, jobID, "browser.provider_drive_epoch_started", map[string]any{
-		"drive_attempt_id": "legacy-bootstrap-malformed", "ordinal": int64(0),
-		"strategy": "generic", "revision": "1",
+		"drive_attempt_id": "legacy-bootstrap-wellformed", "ordinal": int64(0),
+		"strategy": "generic", "revision": "1", "safety_domain": "institution:generic",
 	}); err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	if _, err := first.Store.DB().ExecContext(ctx, `
+		INSERT INTO pdf_grabs(id, url_host, title, state, created_at, updated_at)
+		VALUES ('legacy-bootstrap-malformed-grab', ' ', 'legacy grab', 'awaiting_file',
+		        '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z')`); err != nil {
 		first.Close()
 		t.Fatal(err)
 	}
@@ -251,8 +261,14 @@ func TestNewRejectsMalformedLegacyBrowserEffectBeforeBrowserConstruction(t *test
 		t.Fatalf("malformed legacy state bootstrap = system=%v err=%v, want fatal startup error", restarted, err)
 	}
 	if !strings.Contains(err.Error(), "importing legacy browser effects") ||
-		!strings.Contains(err.Error(), "unclassifiable legacy provider drive effect") {
+		!strings.Contains(err.Error(), "unclassifiable legacy PDF grab") {
 		t.Fatalf("malformed bootstrap error = %v, want importer context", err)
+	}
+	// SQLite removes the WAL file when the last connection to the database
+	// closes, so a WAL file left behind means the failed startup leaked its
+	// store handle to the caller's process.
+	if _, err := os.Stat(filepath.Join(cfg.DataDir, "papio.db-wal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed startup left the database open: wal stat err=%v", err)
 	}
 	db, err := store.Open(ctx, cfg.DataDir)
 	if err != nil {

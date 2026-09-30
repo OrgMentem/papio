@@ -135,7 +135,7 @@ func TestOrdinaryGateStillRefusesOtherDiscoverySources(t *testing.T) {
 func TestOpenAlexEnricherClientIsObserved(t *testing.T) {
 	cfg := config.Default()
 	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = t.TempDir()
+	cfg.DataDir = storetest.DataDir(t)
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 	openAlex := cfg.Sources[config.SourceOpenAlex]
