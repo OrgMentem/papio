@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -777,6 +778,101 @@ func TestSubmissionCASConflictKeepsReceivedReferenceVisible(t *testing.T) {
 	}
 	if len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
 		t.Fatalf("actions = %+v, want one reconciliation action", actions)
+	}
+}
+
+// Reconciling an ambiguous submission can find the provider transaction after
+// another writer already recorded a different reference on the row. The
+// commit-conflict branch must keep both provider references visible, leave the
+// durable row untouched, and park the job on a document_delivery action.
+func TestReconcileAmbiguousSubmissionCommitConflictKeepsBothReferences(t *testing.T) {
+	var token atomic.Value
+	token.Store("")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("reconciliation issued %s %s; it must stay read-only", r.Method, r.URL.Path)
+			http.Error(w, "read-only", http.StatusMethodNotAllowed)
+			return
+		}
+		switch {
+		case strings.Contains(r.URL.Path, "/Users/ExternalUserId/"):
+			_, _ = w.Write([]byte(`{"UserName":"patron-1"}`))
+		case strings.Contains(r.URL.Path, "/Transaction/UserRequests/"):
+			_, _ = fmt.Fprintf(w, `[{"TransactionNumber":9301,"TransactionStatus":"Awaiting Request Processing","RequestType":"Article","ItemInfo4":%q}]`, token.Load().(string))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_reconcile_commit_conflict", "10.1000/reconcile-commit-conflict"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: profile.Digest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token.Store(req.IdempotencyKey)
+	// Another writer records its own provider reference first.
+	if won, err := deliverySvc.RecordSubmission(ctx, req.ID, "9300", time.Now().Add(time.Hour)); err != nil || !won {
+		t.Fatalf("competing RecordSubmission = %v, %v; want the first writer to win", won, err)
+	}
+
+	if err := svc.reconcileAmbiguousSubmission(ctx, row, job.StateResolving, svc.Config.Browser.DocumentDelivery, profile, req); err != nil {
+		t.Fatalf("reconcileAmbiguousSubmission: %v", err)
+	}
+	durable, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil || durable.ProviderReference != "9300" {
+		t.Fatalf("durable row = %+v, %v; want the first writer's reference kept", durable, err)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outcomeReason string
+	var received, recorded any
+	for _, event := range events {
+		detail, _ := event["detail"].(map[string]any)
+		switch event["kind"] {
+		case "delivery.reconciliation_outcome":
+			outcomeReason, _ = detail["reason"].(string)
+		case "delivery.submission_provider_conflict":
+			received, recorded = detail["received_provider_reference"], detail["durable_provider_reference"]
+		}
+	}
+	if outcomeReason != delivery.ReconciliationReasonCommitConflict {
+		t.Fatalf("reconciliation outcome reason = %q, want %q", outcomeReason, delivery.ReconciliationReasonCommitConflict)
+	}
+	if received != "9301" || recorded != "9300" {
+		t.Fatalf("conflict references received=%v durable=%v; want 9301 and 9300", received, recorded)
+	}
+	parked, err := jobs.Get(ctx, id)
+	if err != nil || parked.State != job.StateAwaitingHuman {
+		t.Fatalf("job after commit conflict = %+v, %v; want awaiting_human", parked, err)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("actions = %+v, %v; want one document_delivery action", actions, err)
 	}
 }
 func TestSubmitDeliveryAmbiguousFailureDoesNotRepost(t *testing.T) {
