@@ -81,10 +81,12 @@ export function summarizeAmoStatus(versions: AmoVersion[], manifestVersion: stri
   return { versionExists, reviewOpen: awaiting.length > 0, latestListed, lines };
 }
 
-export async function fetchAmoVersions(
-  env: Record<string, string | undefined>,
-  addonID: string,
-): Promise<unknown> {
+/** AMO pages its version list; a listing longer than this many pages is refused, not truncated. */
+export const AMO_MAX_VERSION_PAGES = 100;
+
+const AMO_ORIGIN = "https://addons.mozilla.org";
+
+function amoToken(env: Record<string, string | undefined>): string {
   const issued = Math.floor(Date.now() / 1000);
   const encode = (value: object): string => Buffer.from(JSON.stringify(value)).toString("base64url");
   // AMO refuses a token whose lifetime exceeds five minutes; this one outlives
@@ -96,14 +98,52 @@ export async function fetchAmoVersions(
     exp: issued + 60,
   })}`;
   const signature = createHmac("sha256", env.WEB_EXT_API_SECRET ?? "").update(claims).digest("base64url");
+  return `JWT ${claims}.${signature}`;
+}
 
-  const url = `https://addons.mozilla.org/api/v5/addons/addon/${addonID}/versions/?filter=all_with_unlisted&page_size=50`;
-  const response = await fetch(url, { headers: { Authorization: `JWT ${claims}.${signature}` } });
-  const text = await response.text();
-  // 404 = the add-on has no versions AMO will admit to yet (first submission).
-  if (response.status === 404) return { results: [] };
-  if (!response.ok) throw new Error(`AMO versions ${response.status}: ${text}`);
-  return JSON.parse(text);
+/**
+ * Read every version AMO holds for the add-on, following the listing's `next`
+ * links to the end. The duplicate-version gate is only sound over the whole
+ * listing, so anything that stops short of it — a malformed page, a `next`
+ * link off AMO, more than AMO_MAX_VERSION_PAGES pages, or fewer rows than the
+ * listing's own `count` — throws rather than answering from a prefix.
+ */
+export async function fetchAmoVersions(
+  env: Record<string, string | undefined>,
+  addonID: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<AmoVersion[]> {
+  const versions: AmoVersion[] = [];
+  let url: string | null =
+    `${AMO_ORIGIN}/api/v5/addons/addon/${addonID}/versions/?filter=all_with_unlisted&page_size=50`;
+  let expected: number | null = null;
+  for (let page = 1; url !== null; page++) {
+    if (page > AMO_MAX_VERSION_PAGES) {
+      throw new Error(`AMO versions: listing exceeds ${AMO_MAX_VERSION_PAGES} pages`);
+    }
+    const response = await fetchImpl(url, { headers: { Authorization: amoToken(env) } });
+    const text = await response.text();
+    // 404 = the add-on has no versions AMO will admit to yet (first submission).
+    if (response.status === 404 && page === 1) return [];
+    if (!response.ok) throw new Error(`AMO versions ${response.status}: ${text}`);
+    const body = record(JSON.parse(text));
+    if (body === null || !Array.isArray(body.results)) {
+      throw new Error(`AMO versions: page ${page} has no results list`);
+    }
+    if (typeof body.count === "number") expected ??= body.count;
+    versions.push(...parseAmoVersions(body));
+    if (body.next === null || body.next === undefined) {
+      url = null;
+    } else if (typeof body.next === "string" && new URL(body.next).origin === AMO_ORIGIN) {
+      url = body.next;
+    } else {
+      throw new Error(`AMO versions: page ${page} has an unusable next link`);
+    }
+  }
+  if (expected !== null && versions.length < expected) {
+    throw new Error(`AMO versions: read ${versions.length} of ${expected} versions`);
+  }
+  return versions;
 }
 
 if (import.meta.main) {
@@ -126,7 +166,7 @@ if (import.meta.main) {
 
   let status: AmoStatus;
   try {
-    status = summarizeAmoStatus(parseAmoVersions(await fetchAmoVersions(process.env, addonID)), version);
+    status = summarizeAmoStatus(await fetchAmoVersions(process.env, addonID), version);
   } catch (error) {
     console.error(`amo-status: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);

@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { summarizeItemStatus } from "../scripts/cws-status";
-import { parseAmoVersions, summarizeAmoStatus } from "../scripts/amo-status";
+import { AMO_MAX_VERSION_PAGES, fetchAmoVersions, parseAmoVersions, summarizeAmoStatus } from "../scripts/amo-status";
 
 describe("summarizeItemStatus (Chrome Web Store)", () => {
   test("a submitted revision awaiting review gates the submission", () => {
@@ -131,5 +131,67 @@ describe("parseAmoVersions", () => {
   test("a payload with no results is an empty list", () => {
     expect(parseAmoVersions({})).toEqual([]);
     expect(parseAmoVersions(null)).toEqual([]);
+  });
+});
+
+describe("fetchAmoVersions", () => {
+  const env = { WEB_EXT_API_KEY: "user:1", WEB_EXT_API_SECRET: "synthetic" }; // betterleaks:allow -- synthetic test input, never sent
+  const row = (version: string) => ({ version, channel: "unlisted", file: { status: "public" } });
+  const pageURL = (n: number) => `https://addons.mozilla.org/api/v5/addons/addon/x/versions/?page=${n}`;
+
+  const serve = (pages: Array<Record<string, unknown>>) => {
+    const requested: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      const index = requested.length - 1;
+      const page = pages[index];
+      if (page === undefined) return new Response("gone", { status: 500 });
+      return new Response(JSON.stringify(page), { status: 200 });
+    }) as typeof fetch;
+    return { fetchImpl, requested };
+  };
+
+  test("a version that only appears past the first page still gates the submission", async () => {
+    const { fetchImpl, requested } = serve([
+      { count: 3, next: pageURL(2), results: [row("0.9.0"), row("0.8.0")] },
+      { count: 3, next: null, results: [row("0.5.0")] },
+    ]);
+    const versions = await fetchAmoVersions(env, "x", fetchImpl);
+    expect(requested).toHaveLength(2);
+    expect(requested[1]).toBe(pageURL(2));
+    expect(summarizeAmoStatus(versions, "0.5.0").versionExists).toBe(true);
+  });
+
+  test("a listing shorter than its own count fails closed", async () => {
+    const { fetchImpl } = serve([{ count: 3, next: null, results: [row("0.9.0")] }]);
+    await expect(fetchAmoVersions(env, "x", fetchImpl)).rejects.toThrow("read 1 of 3");
+  });
+
+  test("a failing later page fails closed instead of answering from the first", async () => {
+    const { fetchImpl } = serve([{ count: 60, next: pageURL(2), results: [row("0.9.0")] }]);
+    await expect(fetchAmoVersions(env, "x", fetchImpl)).rejects.toThrow("AMO versions 500");
+  });
+
+  test("a next link off AMO is refused, so the credential never leaves AMO", async () => {
+    const { fetchImpl, requested } = serve([
+      { count: 2, next: "https://example.test/versions/?page=2", results: [row("0.9.0")] },
+    ]);
+    await expect(fetchAmoVersions(env, "x", fetchImpl)).rejects.toThrow("unusable next link");
+    expect(requested).toHaveLength(1);
+  });
+
+  test("a listing that never ends is refused", async () => {
+    const pages = Array.from({ length: AMO_MAX_VERSION_PAGES + 1 }, (_, i) => ({
+      next: pageURL(i + 2),
+      results: [row(`0.0.${i}`)],
+    }));
+    const { fetchImpl } = serve(pages);
+    await expect(fetchAmoVersions(env, "x", fetchImpl)).rejects.toThrow(`exceeds ${AMO_MAX_VERSION_PAGES} pages`);
+  });
+
+  test("a first submission (404) is an empty listing", async () => {
+    const fetchImpl = (async () => new Response("not found", { status: 404 })) as unknown as typeof fetch;
+    expect(await fetchAmoVersions(env, "x", fetchImpl)).toEqual([]);
   });
 });
