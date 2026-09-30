@@ -39,7 +39,13 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 		Use:   "add [query]",
 		Short: "Add a scheduled discovery watch",
 		Long: "Add a scheduled discovery watch. Backfill watches take no query. " +
-			"Alert-mode discovery watches report new works without acquiring them.",
+			"Alert-mode discovery watches report new works without acquiring them.\n\n" +
+			"By default (--mode acquire, --cadence daily) a discovery watch runs on its\n" +
+			"own schedule and submits up to --limit-per-run new works each run, and\n" +
+			"every job it submits asks for automatic Zotero import once it is ready,\n" +
+			"whatever zotio.auto_import says (zotio.auto_import_paused still pauses\n" +
+			"it). Use --mode alert to only report new works to the watch digest and\n" +
+			"acquire them on demand.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
 				return err
@@ -190,14 +196,31 @@ func newWatchDigestCommand(opt *options) *cobra.Command {
 }
 
 func newWatchDigestClearCommand(opt *options) *cobra.Command {
-	return &cobra.Command{
+	var all, dryRun bool
+	command := &cobra.Command{
 		Use:   "clear <id>",
 		Short: "Clear pending works from an alert watch digest",
-		Args:  cobra.ExactArgs(1),
+		Long: "Discard every pending work in an alert watch digest, including works\n" +
+			"`papio watch digest` did not show (it lists 100 by default). A cleared work\n" +
+			"is never reported again. Clearing requires --all; --dry-run counts the\n" +
+			"pending works without clearing them. To discard single works instead,\n" +
+			"use `papio inbox decide <item-id> --op dismiss`.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := parseWatchID(args[0])
 			if err != nil {
 				return err
+			}
+			if dryRun || !all {
+				pending, atLeast, err := watchPendingDigest(cmd, opt, id)
+				if err != nil {
+					return err
+				}
+				if !dryRun {
+					return fmt.Errorf("watch %d has %s pending digest work(s), including any `papio watch digest` did not show; nothing was cleared. Rerun with --all to clear every one of them", id, watchPendingCount(pending, atLeast))
+				}
+				result := watchDigestClearPreview{WatchID: id, DryRun: true, WouldClear: pending, Truncated: atLeast}
+				return opt.printResult(result, "Would clear %s pending digest work(s) from watch %d (dry run: nothing cleared)", watchPendingCount(pending, atLeast), id)
 			}
 			var result struct {
 				Cleared int `json:"cleared"`
@@ -208,15 +231,59 @@ func newWatchDigestClearCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "Cleared %d digest work(s)", result.Cleared)
 		},
 	}
+	command.Flags().BoolVar(&all, "all", false, "confirm clearing every pending work, including works the digest view did not show")
+	command.Flags().BoolVar(&dryRun, "dry-run", false, "count the pending works without clearing them")
+	return command
+}
+
+// watchDigestClearPreview is the `watch digest clear --dry-run` receipt.
+// Truncated means watch.digest returned a full page, so at least WouldClear
+// works are pending.
+type watchDigestClearPreview struct {
+	WatchID    int64 `json:"watch_id"`
+	DryRun     bool  `json:"dry_run"`
+	WouldClear int   `json:"would_clear"`
+	Truncated  bool  `json:"truncated"`
+}
+
+// watchPendingDigest counts a watch's pending digest works. watch.digest has
+// no total, so a full page means "at least this many".
+func watchPendingDigest(cmd *cobra.Command, opt *options, id int64) (count int, atLeast bool, err error) {
+	var digest api.WatchDigestResult
+	if err := opt.call(cmd.Context(), "watch.digest", map[string]any{"id": id, "limit": watch.DigestLimitMax}, &digest); err != nil {
+		return 0, false, err
+	}
+	return len(digest.Entries), len(digest.Entries) >= watch.DigestLimitMax, nil
+}
+
+func watchPendingCount(count int, atLeast bool) string {
+	if atLeast {
+		return fmt.Sprintf("%d or more", count)
+	}
+	return strconv.Itoa(count)
 }
 
 func newWatchRemoveCommand(opt *options) *cobra.Command {
-	return &cobra.Command{
+	var discardDigest bool
+	command := &cobra.Command{
 		Use: "remove <id>", Short: "Remove a scheduled discovery watch", Args: cobra.ExactArgs(1),
+		Long: "Remove a scheduled discovery watch. Jobs and Zotero items earlier runs\n" +
+			"created stay. The watch's digest is deleted with it, so removing a watch\n" +
+			"that still has pending (unreviewed) digest works is refused unless\n" +
+			"--discard-digest confirms that those works are discarded too.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := parseWatchID(args[0])
 			if err != nil {
 				return err
+			}
+			if !discardDigest {
+				pending, atLeast, err := watchPendingDigest(cmd, opt, id)
+				if err != nil {
+					return err
+				}
+				if pending > 0 {
+					return fmt.Errorf("watch %d has %s pending digest work(s) that removing it would delete; nothing was removed. Review them with `papio watch digest %d` or `papio export watch %d`, then rerun with --discard-digest", id, watchPendingCount(pending, atLeast), id, id)
+				}
 			}
 			var result struct {
 				ID      int64 `json:"id"`
@@ -228,6 +295,8 @@ func newWatchRemoveCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "Removed watch %d", result.ID)
 		},
 	}
+	command.Flags().BoolVar(&discardDigest, "discard-digest", false, "remove the watch even though pending digest works are deleted with it")
+	return command
 }
 
 func newWatchResumeCommand(opt *options) *cobra.Command {

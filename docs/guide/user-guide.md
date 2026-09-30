@@ -789,7 +789,9 @@ cause, force a run with `papio watch run <watch-id>`, and once that run
 succeeds, run `papio watch resume <watch-id>`. The watch keeps its id, query, and
 digest history, and its next scheduled run comes one cadence after the forced
 run. Resume refuses while the latest run is still a failure. Removing a watch
-does not remove jobs or Zotero items created by earlier runs.
+does not remove jobs or Zotero items created by earlier runs. It does delete the
+watch's digest, so `papio watch remove` refuses a watch that still has pending
+digest works until you add `--discard-digest`.
 
 ### How far a watch looks
 
@@ -837,11 +839,13 @@ papio watch add "appropriate reliance on AI" --cadence weekly --mode alert
 papio watch digest <watch-id>            # review what's new
 papio acquire --from-digest <watch-id>   # queue everything pending
 papio acquire --from-digest <watch-id> --keys 10.1000/example  # or just some
-papio watch digest clear <watch-id>      # discard the rest
+papio watch digest clear <watch-id> --all  # discard every pending work
 ```
 
 Acquired entries leave the digest automatically; cleared ones simply stop
-being pending (they will not be re-reported).
+being pending (they will not be re-reported). Clearing discards every pending
+work, including works `papio watch digest` did not show (it lists 100 by
+default), so it requires `--all`; `--dry-run` counts them first.
 
 Alert watches check ownership twice: when the run records new works, and again
 when `--from-digest` acquires them. Both checks use zotio when it is configured
