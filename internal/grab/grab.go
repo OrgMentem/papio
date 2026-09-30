@@ -998,6 +998,41 @@ func (s *Service) ByJobID(ctx context.Context, jobID string) (*Grab, error) {
 	return g, nil
 }
 
+// ListBoundWithQuarantine returns job_created grabs that still name a
+// quarantine copy and whose bound job is in one of jobStates, oldest first.
+// A bind commits before its validated bytes are staged into the job's
+// adoption directory, so a crash or staging failure in that window leaves the
+// only copy at QuarantinePath; the caller stats the path and re-stages it.
+// Filtering on the job's state keeps the scan bounded by live jobs rather
+// than by every grab ever bound.
+func (s *Service) ListBoundWithQuarantine(ctx context.Context, jobStates ...string) ([]*Grab, error) {
+	if len(jobStates) == 0 {
+		return nil, nil
+	}
+	args := []any{string(StateJobCreated), "job_created"}
+	for _, state := range jobStates {
+		args = append(args, state)
+	}
+	rows, err := s.store.DB().QueryContext(ctx, `
+		SELECT `+columns+` FROM pdf_grabs
+		WHERE state = ? AND outcome = ? AND quarantine_path != ''
+		AND job_id IN (SELECT id FROM jobs WHERE state IN (?`+strings.Repeat(", ?", len(jobStates)-1)+`))
+		ORDER BY updated_at ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing bound pdf grabs with quarantine copies: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []*Grab
+	for rows.Next() {
+		g, err := scanGrab(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
 func requireOneRow(res sql.Result, id string) error {
 	n, err := res.RowsAffected()
 	if err != nil {

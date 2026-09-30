@@ -323,3 +323,81 @@ func TestRecoverDeferredAutoBind(t *testing.T) {
 		}
 	})
 }
+
+// A bind commits before its validated bytes are staged, so a crash in that
+// window (or a failed mkdir/copy) leaves the only copy at the grab's
+// quarantine path while the row already says job_created, with no deferred
+// event naming it. The grab sweep must re-stage and ingest those bytes.
+func TestSweepGrabsRestagesCommittedBindQuarantineCopy(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := parkManualDownload(t, jobs, "wr_restage_quarantine",
+		deferredWork("10.1234/restage.quarantine.1", "Committed Bind Crashed Before Staging"))
+	quarantine := filepath.Join(cfg.DataDir, "quarantine", "grab-restage", "grab.pdf")
+	writeFixturePDF(t, quarantine)
+	bindGrab(t, b, id, "Restage Quarantine", quarantine)
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("SweepGrabs: %v", err)
+	}
+	requireRecovered(t, jobs, id)
+	if _, err := os.Stat(quarantine); !os.IsNotExist(err) {
+		t.Fatalf("quarantine copy %s survived recovery: %v", quarantine, err)
+	}
+	// A second tick finds nothing left to re-stage.
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("second SweepGrabs: %v", err)
+	}
+	if n := countDeferredAdoptions(t, jobs, id); n != 0 {
+		t.Fatalf("recovery recorded %d deferred adoptions, want 0", n)
+	}
+}
+
+// createGrabJob copies into the job's adoption directory before its terminal
+// CAS. A crash between the two leaves the grab quarantined with a copy
+// already staged; the retried bind must reuse that copy, not stage an
+// identical sibling that the single-file adoption scan reads as ambiguous.
+func TestCreateGrabJobRetryReusesCopyStagedBeforeCrash(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	const doi = "10.1234/restage.retry.1"
+	id := parkManualDownload(t, jobs, "wr_restage_retry", deferredWork(doi, "Grab Job Retried After Crash"))
+	quarantine := filepath.Join(cfg.DataDir, "quarantine", "grab-retry", "grab.pdf")
+	writeFixturePDF(t, quarantine)
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Retry After Crash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.grabs.MarkQuarantined(ctx, g.ID, quarantine); err != nil {
+		t.Fatal(err)
+	}
+	g, err = b.grabs.Get(ctx, g.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The crashed attempt's copy, staged before MarkJobCreated committed.
+	jobDir := filepath.Join(cfg.EffectiveAdoptionRoot(), id)
+	writeFixturePDF(t, filepath.Join(jobDir, "paper.pdf"))
+	// The adoption itself must defer so the staged directory stays visible,
+	// as it does whenever validation is not immediately available.
+	if err := jobs.Transition(ctx, id, job.StateAwaitingHuman, job.StateValidating, nil); err != nil {
+		t.Fatal(err)
+	}
+	landing := filepath.Join(cfg.EffectiveAdoptionRoot(), grabsDirName, g.ID)
+	if err := b.createGrabJob(ctx, g, doi, quarantine, landing, "paper.pdf", ""); err != nil {
+		t.Fatalf("createGrabJob retry: %v", err)
+	}
+	entries, err := os.ReadDir(jobDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.Type().IsRegular() {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) != 1 {
+		t.Fatalf("job adoption dir holds %v after the retried bind, want exactly the first copy", names)
+	}
+}
