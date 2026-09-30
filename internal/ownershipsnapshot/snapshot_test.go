@@ -667,6 +667,87 @@ func TestUnknownIdentityRejectsInFlightSameRevisionReplacement(t *testing.T) {
 	}
 }
 
+// With the platform's real file identity (inode on Darwin and Linux), a
+// same-size, same-mtime replacement that lands after a changed export was
+// read and re-checked, while papio parses it, must be caught by the final
+// identity comparison: the parsed bytes belong to a now-unlinked file, so the
+// prior snapshot turns stale and nonsuppressing, and only a retry publishes
+// the file now at the path.
+func TestKnownIdentityRejectsInFlightSameRevisionReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Go opens files without FILE_SHARE_DELETE, so Windows refuses the
+		// rename below with "Access is denied" while Lookup holds the file.
+		t.Skip("Windows cannot rename over a file another handle holds open")
+	}
+	dir := t.TempDir()
+	one := oneEntryBibTeX("10.1000/one")
+	two := oneEntryBibTeX("10.1000/two")
+	six := oneEntryBibTeX("10.1000/six")
+	if len(one) != len(two) || len(two) != len(six) {
+		t.Fatalf("fixture sizes differ: %d, %d and %d", len(one), len(two), len(six))
+	}
+	path := writeFile(t, dir, "refs.bib", one)
+	provider := newTestProvider(t, path, config.LibraryClaimPDFPresent, time.Now)
+	if current, err := provider.pathRevision(); err != nil || !current.fileID.known {
+		t.Skipf("no known file identity on %s (err %v)", runtime.GOOS, err)
+	}
+	oneQuery := doiQuery("10.1000/one")
+	twoQuery := doiQuery("10.1000/two")
+	sixQuery := doiQuery("10.1000/six")
+	if _, health := provider.Lookup(context.Background(), []ownership.Query{oneQuery}); !health.Complete {
+		t.Fatalf("initial health = %+v", health)
+	}
+
+	// The export changes (a new file, so no cache hit) ...
+	if err := os.Rename(writeFile(t, dir, "edit.bib", two), path); err != nil {
+		t.Fatal(err)
+	}
+	edited, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ... and is replaced again, at the same size and mtime, after papio has
+	// read it and re-checked its descriptor but before the final pathname
+	// check. An earlier replacement would change the unlinked file's ctime,
+	// which the descriptor re-check already catches; this one leaves only the
+	// pathname identity to separate the two revisions.
+	replacement := writeFile(t, dir, "replacement.bib", six)
+	if err := os.Chtimes(replacement, edited.ModTime(), edited.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	identityCalls := 0
+	provider.identity = func(file *os.File, info os.FileInfo) fileID {
+		id := fileIdentity(file, info)
+		identityCalls++
+		// Calls: 1 opened file, 2 its re-stat after the read, 3 the path.
+		if identityCalls == 2 {
+			if err := os.Rename(replacement, path); err != nil {
+				t.Errorf("replacing during parse: %v", err)
+			}
+		}
+		return id
+	}
+	claims, health := provider.Lookup(context.Background(), []ownership.Query{oneQuery, twoQuery, sixQuery})
+	if health.Complete || health.FailureCode != ownership.FailureUnreadable || !health.Stale {
+		t.Fatalf("health after in-flight replacement = %+v", health)
+	}
+	if len(claims[0]) != 1 || !claims[0][0].Stale || len(claims[1]) != 0 || len(claims[2]) != 0 {
+		t.Fatalf("claims after in-flight replacement = %+v", claims)
+	}
+	if decision := ownership.Decide(oneQuery, ownership.WorkResult{Claims: claims[0]}); decision.Suppress {
+		t.Fatal("a stale prior snapshot must never publish a fresh suppressing claim")
+	}
+	if identityCalls != 3 {
+		t.Fatalf("identity calls = %d, want 3: the final pathname check must have run", identityCalls)
+	}
+
+	provider.identity = fileIdentity
+	claims, health = provider.Lookup(context.Background(), []ownership.Query{oneQuery, twoQuery, sixQuery})
+	if !health.Complete || len(claims[0]) != 0 || len(claims[1]) != 0 || len(claims[2]) != 1 {
+		t.Fatalf("claims after replacement retry = %+v, health = %+v", claims, health)
+	}
+}
+
 func TestSourceRecordCountDrivesCollapseForProviderLifetime(t *testing.T) {
 	dir := t.TempDir()
 	path := writeFile(t, dir, "refs.bib", sourceRecordsWithOneDOI(40))
