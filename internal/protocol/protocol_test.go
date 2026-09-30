@@ -1942,11 +1942,10 @@ func TestProviderOutcomeHostSchemaAndValidatorAgree(t *testing.T) {
 // a purely numeric single-label host (reparsed as IPv4 by the WHATWG
 // parser) and a zero-padded port both pass Go and this schema pattern but
 // fail the TypeScript round-trip check, and neither is reachable from a
-// genuine producer. A third gap this test cannot observe at all:
-// SessionEvidencePayload.validate treats an explicit empty origin_hint as
-// an omitted optional field and never calls this function, so an empty
-// string decodes in Go a layer above where this pattern (and TypeScript)
-// reject it.
+// genuine producer. An explicit empty origin_hint never reaches this
+// function (validate treats "" as omitted); DecodeBrowserMessage rejects it
+// in the session_evidence branch, pinned by the corpus fixture
+// testdata/protocol/invalid/browser-session-evidence-origin-hint-empty.json.
 //
 // "https://123" (a bare numeric host — the multi-label requirement that
 // used to exclude it was dropped as a release-blocker fix; see

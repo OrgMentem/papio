@@ -716,7 +716,7 @@ func validateBareRoute(route string) error {
 // The three implementations agree exactly only over the DNS-shaped subset a
 // genuine producer emits: an https origin whose host is a lowercase RFC
 // 1035 label chain (one label or several, per the note above) and whose
-// port, if present, is 1-5 non-empty decimal digits. Three shapes are
+// port, if present, is 1-5 non-empty decimal digits. Two shapes are
 // known, accepted divergences outside that subset, none reachable from a
 // genuine producer because origin_hint is always derived via
 // `new URL(...)` on the browser side before it ever reaches the wire:
@@ -736,15 +736,15 @@ func validateBareRoute(route string) error {
 //     bound digit count, not leading zeros — accept them. Same
 //     reject-rather-than-normalize tradeoff as case above, just not worth
 //     a dedicated no-leading-zero rule.
-//   - An explicit empty origin_hint (`""`): this function rejects it, but
-//     SessionEvidencePayload.validate only calls it when the field is
-//     non-empty, treating "" the same as an omitted optional field — so an
-//     explicit `"origin_hint": ""` decodes in Go. The schema pattern
-//     (which always requires the "https://" prefix) and
-//     `new URL("")` in TypeScript both reject it outright. The gap is one
-//     layer up, in the caller's presence check, not in this function.
 //
-// A fourth shape — a port outside 1-5 digits, including the
+// An explicit empty origin_hint (`""`) used to be a third divergence: this
+// function rejects it, but SessionEvidencePayload.validate treats "" as the
+// omitted optional field (the emit side drops it via omitempty), so an
+// explicit `"origin_hint": ""` decoded in Go while the schema pattern and
+// `new URL("")` in TypeScript rejected it. DecodeBrowserMessage's
+// session_evidence branch now rejects a present-but-empty value itself.
+//
+// Another shape — a port outside 1-5 digits, including the
 // empty-after-colon form "https://library:" (net/url happily parses it
 // with Port() == "") — used to be a divergence in the dangerous direction:
 // Go accepted it because u.Hostname() silently discards the port, while
@@ -2937,6 +2937,12 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		}
 		if err == nil {
 			err = p.validate()
+		}
+		// validate() treats "" as the omitted optional field (the emit side
+		// drops it via omitempty), so an explicit empty origin_hint on the wire
+		// is caught here, matching the schema pattern and parseBrowserMessage.
+		if _, present := payloadFields["origin_hint"]; err == nil && present && p.OriginHint == "" {
+			err = fmt.Errorf("session_evidence.origin_hint must not be empty")
 		}
 		msg.Payload = p
 	case MsgDownloadStarted:
