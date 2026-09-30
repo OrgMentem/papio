@@ -724,9 +724,17 @@ file. The outcome is one of these:
 The job must still be open: `queued`, `resolving`, `fetching`, `retry_wait`,
 or `awaiting_human`. A paywalled job often waits in `retry_wait` between
 attempts; the command takes it from there. The command refuses a job that is
-validating or waiting for review. It also refuses a job that is waiting on a
-document-delivery request. Check that request with
+validating or waiting for review, and a `resolving` or `fetching` job that
+*papio* is working on at that moment. Try again when `papio jobs get <job-id>`
+shows the job waiting. The command also refuses a job that is waiting on a
+document-delivery request, in any state. Check that request with
 `papio delivery get <job-id>`, and settle or cancel it first.
+
+The command moves a `queued` or `retry_wait` job to `awaiting_human` before it
+reads the file. If it then fails before validation starts, it puts a
+`retry_wait` job back in `retry_wait`. A `queued` job cannot go back to
+`queued`, so it stays in `awaiting_human` with a `manual_download` action, and
+the error says that the job is parked awaiting a PDF. Supply the PDF again.
 
 A finished job (`ready`, `imported`, `unavailable`, `failed`, or `cancelled`)
 cannot take a PDF. Submit the work again, for example with

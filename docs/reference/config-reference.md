@@ -375,7 +375,7 @@ watches, and `papio acquire --from-digest`.
 | `path` | string | — | Required for `kind = "file"`, and must be empty for `kind = "command"`. The bibliographic export to read. `~` is expanded and the resulting path must be absolute. |
 | `format` | string | empty | `bibtex`, `ris`, `csl-json`, or `nbib`. Empty detects from the path (file sources) and content. |
 | `claim` | string | — | Required, **no default**: `pdf_present` (entries whose full text you hold, so a match may skip acquisition) or `record_present` (citations only — annotates `papio search` but never skips). |
-| `argv` | array of strings | — | Required for `kind = "command"`, rejected for `kind = "file"`. The program and its arguments, run directly with no shell. The first element is an absolute path (`~/` expands) or a bare program name, which *papio* looks up on `PATH` when it loads the config and then runs by its absolute path. A relative path such as `./export` is rejected. A shell string is not accepted: to use a pipeline, name the shell, for example `["/bin/sh", "-c", "papis export --all --format bibtex"]`. |
+| `argv` | array of strings | — | Required for `kind = "command"`, rejected for `kind = "file"`. The program and its arguments, run directly with no shell. The first element must be an absolute path; a leading `~/` expands when the command runs. *papio* never looks the program up on `PATH`, so a bare name such as `papis` or a relative path such as `./export` is rejected when the config loads. The daemon's `PATH` is often not your shell's, so a `PATH` lookup could fail in the daemon, or run a different program there, after `papio doctor` accepted it. A program that is missing when the command runs fails the read, and `papio doctor` reports that the command could not be started. A shell string is not accepted: to use a pipeline, name the shell, for example `["/bin/sh", "-c", "papis export --all --format bibtex"]`. The shell then finds `papis` on the daemon's `PATH`. |
 | `timeout_seconds` | integer seconds | `30` | `kind = "command"` only. Deadline for one run, 1 to 300. At the deadline *papio* stops the command and all the processes it started, and the read fails. |
 | `max_output_bytes` | integer bytes | `33554432` (32 MiB) | `kind = "command"` only. Largest standard output accepted, 1 to 134217728 (128 MiB). More output fails the read; *papio* never indexes a cut-off export. |
 | `refresh_seconds` | integer seconds | `300` | `kind = "command"` only. How long one successful run answers lookups before the command runs again, 10 to 86400. |
@@ -383,7 +383,9 @@ watches, and `papio acquire --from-digest`.
 A command source runs at most once per `refresh_seconds`, never once per
 paper. Lookups that arrive while it runs share that one run. The command
 inherits the daemon's environment. Its standard input is empty, and *papio*
-never reads or reports its standard error. The command must print only the
+never reads or reports its standard error. When the command exits, *papio*
+stops every process it started and left running, so do not start background
+work from it. The command must print only the
 records its `claim` covers. For `pdf_present`, print only the entries whose PDF
 you hold; *papio* does not filter the output by attachment fields. A run fails
 when the command exits non-zero, passes `timeout_seconds`, prints more than

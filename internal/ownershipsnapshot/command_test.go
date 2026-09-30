@@ -311,6 +311,7 @@ func TestNewProviderRejectsUnusableCommandSource(t *testing.T) {
 	}{
 		{"missing argv", config.LibrarySource{Name: "n", Kind: config.LibraryKindCommand, Claim: config.LibraryClaimPDFPresent}},
 		{"blank program", config.LibrarySource{Name: "n", Kind: config.LibraryKindCommand, Argv: []string{" "}, Claim: config.LibraryClaimPDFPresent}},
+		{"bare program name", config.LibrarySource{Name: "n", Kind: config.LibraryKindCommand, Argv: []string{"cat"}, Claim: config.LibraryClaimPDFPresent}},
 		{"path beside argv", config.LibrarySource{Name: "n", Kind: config.LibraryKindCommand, Argv: []string{"/bin/cat"}, Path: "/tmp/x.bib", Claim: config.LibraryClaimPDFPresent}},
 		{"timeout out of range", config.LibrarySource{Name: "n", Kind: config.LibraryKindCommand, Argv: []string{"/bin/cat"}, TimeoutSeconds: -1, Claim: config.LibraryClaimPDFPresent}},
 		{"missing claim", config.LibrarySource{Name: "n", Kind: config.LibraryKindCommand, Argv: []string{"/bin/cat"}}},

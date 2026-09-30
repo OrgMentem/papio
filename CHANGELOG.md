@@ -20,7 +20,12 @@ execution records kept during the initial build.
   PDF then passes the same checks as a browser download: a PDF of a different
   paper goes to identity review or is rejected, and never becomes ready. The
   command works on a job that is still open, including a paywalled job that
-  waits in `retry_wait` between attempts. It refuses a finished job, and tells
+  waits in `retry_wait` between attempts. It refuses a job that waits on a
+  live document-delivery request, in every state, and a job that *papio* is
+  working on at that moment. If the command fails after it moved a
+  `retry_wait` job, it puts the job back in `retry_wait`; a `queued` job
+  cannot go back, so it stays parked awaiting a PDF and the error says so. It
+  refuses a finished job, and tells
   you to submit the work again with `papio acquire` and supply the PDF to the
   new job. It prints the outcome (`accepted`, `needs_review`, or `rejected`)
   with the file's SHA-256. `papio stats producers` counts the paper as
@@ -37,7 +42,10 @@ execution records kept during the initial build.
   each run. A run that exits non-zero, times out, prints too much, or prints
   output that does not parse marks the source unreadable; it never makes your
   library look empty. For `claim = "pdf_present"`, the command must print only
-  the entries whose PDF you hold.
+  the entries whose PDF you hold. The first `argv` element must be an absolute
+  path (`~/` is allowed): *papio* never looks the program up on `PATH`, because
+  the daemon's `PATH` is often not your shell's. When the command exits,
+  *papio* stops any process it left running in the background.
 - **`papio watch resume <id>` puts a disabled watch back on its schedule.**
   After five consecutive failures a watch stops running on its own, and before
   this the only way to schedule it again was to recreate it, which gave it a new
@@ -130,7 +138,10 @@ execution records kept during the initial build.
   page limit with results left, or whose source failed or ran out of request
   budget, is not a clean success: `papio watch list` shows the reason after
   `last run:`, and `papio watch run` adds `discovery scan incomplete`. A
-  failed source keeps its stored position for the next run. This adds store
+  failed source keeps its stored position for the next run, and so does a
+  source whose deeper page held a paper that failed to submit: the next run
+  reads that page again. A digest entry found on a deeper page still gains
+  the identifiers that page carries, such as its DOI. This adds store
   migration 0058.
 - **Interrupted exports no longer damage an existing bundle.** Export refuses
   another job at the same destination. A failed ledger write restores the

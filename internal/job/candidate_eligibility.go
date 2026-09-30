@@ -86,18 +86,21 @@ func AdoptEligibleTx(ctx context.Context, tx *sql.Tx, jobID string) (bool, error
 // the same connection, so a concurrent DismissHumanAction commit cannot slip
 // between them. Reads inside go through tx only.
 func (js *Store) TransitionAwaitingToValidatingIfAdoptEligible(ctx context.Context, jobID string, candidateID int64) error {
-	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_browser_download", "browser")
+	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_browser_download", "browser", nil)
 }
 
 // TransitionAwaitingToValidatingForSuppliedPDF is the same guarded transition
-// for a main PDF the operator supplied from a local file. Only the recorded
-// reason and source differ, so the job's events never attribute those bytes
-// to the browser.
-func (js *Store) TransitionAwaitingToValidatingForSuppliedPDF(ctx context.Context, jobID string, candidateID int64) error {
-	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_supplied_pdf", CandidateSourceOperator)
+// for a main PDF the operator supplied from a local file. The recorded reason
+// and source differ, so the job's events never attribute those bytes to the
+// browser. guard runs inside the transaction after the eligibility check and
+// before the move; an error from it aborts the move and is returned as is. It
+// must read through tx only: the store has one connection, so any other read
+// DEADLOCKS.
+func (js *Store) TransitionAwaitingToValidatingForSuppliedPDF(ctx context.Context, jobID string, candidateID int64, guard func(context.Context, *sql.Tx) error) error {
+	return js.transitionAwaitingToValidating(ctx, jobID, candidateID, "adopt_supplied_pdf", CandidateSourceOperator, guard)
 }
 
-func (js *Store) transitionAwaitingToValidating(ctx context.Context, jobID string, candidateID int64, reason, source string) error {
+func (js *Store) transitionAwaitingToValidating(ctx context.Context, jobID string, candidateID int64, reason, source string, guard func(context.Context, *sql.Tx) error) error {
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -109,6 +112,11 @@ func (js *Store) transitionAwaitingToValidating(ctx context.Context, jobID strin
 	}
 	if !eligible {
 		return fmt.Errorf("%w: %s", ErrAdoptNotAwaiting, AdoptAwaitingDetail)
+	}
+	if guard != nil {
+		if err := guard(ctx, tx); err != nil {
+			return err
+		}
 	}
 	now := store.Now()
 	detail := map[string]any{"reason": reason, "source": source, "from": StateAwaitingHuman, "to": StateValidating}

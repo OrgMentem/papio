@@ -23,7 +23,7 @@ import (
 
 // adoptionStateError reports a job whose state has no legal edge onto the
 // human-adoption boundary: a terminal job, or one already validating, held
-// for review, or waiting to retry.
+// for review, or (for a browser download) waiting to retry.
 type adoptionStateError struct {
 	jobID string
 	state string
@@ -33,32 +33,29 @@ func (e *adoptionStateError) Error() string {
 	return fmt.Sprintf("job %s is not adoptable while in state %s", e.jobID, e.state)
 }
 
-// parkForAdoption moves a live job onto the existing human-adoption boundary.
-// queued has no direct edge to awaiting_human, so it first follows the legal
-// queued -> resolving edge; a scheduler race is retried from the durable
-// state it won. Parking from resolving/fetching opens a manual_download
-// action so the any-open-action adoption fence sees a genuine awaiting-human
-// action — the browser download or the operator's supply-pdf command is
-// itself the human gesture that justified the park. reason names that
-// gesture in the transition detail.
-//
-// fromRetryWait also admits retry_wait through its legal edge to resolving,
-// the way queued is handled. Only an explicit operator request passes it:
-// a job waiting to retry has no browser handoff open, so a browser download
-// that names it is still refused.
-func (s *Service) parkForAdoption(ctx context.Context, jobID, reason string, fromRetryWait bool) error {
+// parkForAdoption moves a live job onto the existing human-adoption boundary
+// for a browser download. queued has no direct edge to awaiting_human, so it
+// first follows the legal queued -> resolving edge; a scheduler race is
+// retried from the durable state it won. Parking from resolving/fetching
+// opens a manual_download action so the any-open-action adoption fence sees a
+// genuine awaiting-human action — the browser download is itself the human
+// gesture that justified the park. reason names that gesture in the
+// transition detail. A job waiting to retry has no browser handoff open, so a
+// download that names it is refused; the operator's supply-pdf command parks
+// through parkSuppliedPDFJob instead.
+func (s *Service) parkForAdoption(ctx context.Context, jobID, reason string) error {
 	for range 4 {
 		row, err := s.Jobs.Get(ctx, jobID)
 		if err != nil {
 			return err
 		}
-		switch {
-		case row.State == job.StateAwaitingHuman:
+		switch row.State {
+		case job.StateAwaitingHuman:
 			return nil
-		case row.State == job.StateQueued, row.State == job.StateRetryWait && fromRetryWait:
+		case job.StateQueued:
 			err = s.Jobs.Transition(ctx, jobID, row.State, job.StateResolving,
 				map[string]any{"reason": reason})
-		case row.State == job.StateResolving, row.State == job.StateFetching:
+		case job.StateResolving, job.StateFetching:
 			prev := row.State
 			err = s.Jobs.Transition(ctx, jobID, prev, job.StateAwaitingHuman,
 				map[string]any{"reason": reason})
@@ -160,7 +157,9 @@ func confineToAdoptionRoots(roots []string, resolved string) error {
 // manual_download action) when the file is rejected so the human can supply a
 // different one.
 func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
-	row, err := s.prepareMainAdoption(ctx, jobID, "browser_download_adoption", false)
+	row, err := s.prepareMainAdoption(ctx, jobID, func(ctx context.Context) error {
+		return s.parkForAdoption(ctx, jobID, "browser_download_adoption")
+	})
 	if err != nil {
 		return err
 	}
@@ -195,10 +194,9 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 }
 
 // prepareMainAdoption brings jobID onto the awaiting_human adoption boundary
-// for a main PDF and returns its row. parkReason names the human gesture that
-// supplied the file in the park's transition detail; fromRetryWait is passed
-// to parkForAdoption.
-func (s *Service) prepareMainAdoption(ctx context.Context, jobID, parkReason string, fromRetryWait bool) (*job.Row, error) {
+// for a main PDF and returns its row. park moves a job that is not yet
+// awaiting_human there; each origin owns which states it admits.
+func (s *Service) prepareMainAdoption(ctx context.Context, jobID string, park func(context.Context) error) (*job.Row, error) {
 	if s.Validate == nil {
 		return nil, fmt.Errorf("acquisition service is missing its validation dependency")
 	}
@@ -210,7 +208,7 @@ func (s *Service) prepareMainAdoption(ctx context.Context, jobID, parkReason str
 		return nil, err
 	}
 	if row.State != job.StateAwaitingHuman {
-		if err := s.parkForAdoption(ctx, jobID, parkReason, fromRetryWait); err != nil {
+		if err := park(ctx); err != nil {
 			return nil, err
 		}
 		row, err = s.Jobs.Get(ctx, jobID)
@@ -237,7 +235,8 @@ type mainPDFOrigin struct {
 	// copyInto copies the supplied bytes into the quarantine file dst while
 	// hashing them.
 	copyInto func(dst string) (sha string, size int64, err error)
-	// transition is the guarded awaiting_human -> validating move.
+	// transition is the guarded awaiting_human -> validating move. After it
+	// succeeds the validation path owns the job's outcome.
 	transition func(ctx context.Context, jobID string, candidateID int64) error
 	// rejected handles a file validation rejected. The job is in fetching;
 	// the handler must park it again and ask for a different file.
@@ -255,11 +254,14 @@ const (
 	AdoptionRejected = "rejected"
 )
 
-// adoptedMainPDF is what one main-PDF adoption did.
+// adoptedMainPDF is what one main-PDF adoption did. validating reports that
+// the job left awaiting_human for validation: an error returned before that
+// left the job parked where the caller put it.
 type adoptedMainPDF struct {
 	candidateID int64
 	sha256      string
 	outcome     string
+	validating  bool
 }
 
 // adoptMainPDF runs one human-supplied main PDF for a job parked at
@@ -348,6 +350,7 @@ func (s *Service) adoptMainPDF(ctx context.Context, row *job.Row, origin mainPDF
 		_ = os.Remove(temp)
 		return adopted, err
 	}
+	adopted.validating = true
 	replacementAccess := s.adoptionReplacementAccess(ctx, jobID)
 	s.resolveAdoptedHandoffActions(ctx, jobID)
 

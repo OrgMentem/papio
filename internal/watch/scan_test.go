@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/discovery"
+	"papio/internal/work"
 	"papio/internal/zotio"
 )
 
@@ -416,5 +417,57 @@ func TestPagedScanReportsAWorkOnce(t *testing.T) {
 	}
 	if got := h.pendingDOIs(t); strings.Join(got, ",") != "10.1000/b,10.1000/a" {
 		t.Fatalf("pending digest = %q; want a and b once each", got)
+	}
+}
+
+// A deeper page whose fresh works were only partly submitted is re-read next
+// run: the stored position stays at the token that fetched it.
+func TestPagedScanPartialSubmissionFailureKeepsPageToken(t *testing.T) {
+	owned := append(papers("owned", 0, 25), papers("more", 0, 25)...)
+	all := append(append(append([]discovery.DiscoveredWork(nil), owned[:25]...), discovered("10.1000/a", ""), discovered("10.1000/b", "")), owned[25:]...)
+	pager := &fakePager{order: []string{"openalex"}, results: map[string][]discovery.DiscoveredWork{"openalex": all}}
+	h := newPagedHarness(t, ModeAcquire, pager, ownedDOIs(owned))
+	h.submitter.failOnCall = map[int]error{2: errors.New("queue unavailable")}
+
+	result := h.run(t)
+	if result.Queued != 1 || result.Failed != 1 {
+		t.Fatalf("result = %+v; want one queued and one failed submission", result)
+	}
+	if coverage := h.coverage(t, "openalex"); coverage.NextToken != "reliance|25" || coverage.State != string(discovery.PageMore) {
+		t.Fatalf("coverage = %+v; want the token that fetched the page with the failed submission", coverage)
+	}
+}
+
+// A known work found on a deeper page refreshes its digest identity, so a
+// title-only entry gains the DOI the deeper page carries.
+func TestPagedScanDeeperKnownWorkGainsDOI(t *testing.T) {
+	ctx := context.Background()
+	handled := papers("seen", 0, 25)
+	deep := discovery.DiscoveredWork{Work: work.Work{DOI: "10.1000/deep", Title: "Deep Work", Authors: []string{"Ada"}, Year: 2025}}
+	pager := &fakePager{order: []string{"openalex"}, results: map[string][]discovery.DiscoveredWork{
+		"openalex": append(append([]discovery.DiscoveredWork(nil), handled...), deep),
+	}}
+	h := newPagedHarness(t, ModeAlert, pager, nil)
+	entries := make([]DigestEntry, 0, len(handled))
+	for _, work := range handled {
+		entries = append(entries, DigestEntry{WorkKey: work.Work.DOI, Title: work.Work.Title, DOI: work.Work.DOI})
+	}
+	if _, err := h.watches.RecordDigest(ctx, h.watch.ID, h.now, entries); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.watches.ClearDigest(ctx, h.watch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.watches.RecordDigest(ctx, h.watch.ID, h.now, []DigestEntry{{
+		WorkKey: "deep work", Title: "Deep Work", Authors: "Ada", Year: 2025,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if result := h.run(t); result.Reported != 0 {
+		t.Fatalf("result = %+v; want nothing reported", result)
+	}
+	if got := h.pendingDOIs(t); len(got) != 1 || got[0] != "10.1000/deep" {
+		t.Fatalf("pending digest DOIs = %q; want the title-only entry to gain its DOI", got)
 	}
 }

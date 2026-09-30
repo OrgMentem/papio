@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -57,8 +58,9 @@ type commandProvider struct {
 }
 
 // commandSettings resolves the argv and bounds shared by the provider and by
-// EnumerateLibraryRecords. A leading "~/" in argv[0] expands so a directly
-// constructed source behaves as Config.Load would make it.
+// EnumerateLibraryRecords. A leading "~/" in argv[0] expands here, at run time,
+// so config keeps argv as written. argv[0] must then be absolute: a bare name
+// would make exec search the daemon's PATH, which Config.Load rejects.
 func commandSettings(source config.LibrarySource) ([]string, config.LibraryCommandLimits, error) {
 	if len(source.Argv) == 0 || strings.TrimSpace(source.Argv[0]) == "" {
 		return nil, config.LibraryCommandLimits{}, fmt.Errorf("argv is required for kind %q", config.LibraryKindCommand)
@@ -72,6 +74,9 @@ func commandSettings(source config.LibrarySource) ([]string, config.LibraryComma
 	}
 	argv := slices.Clone(source.Argv)
 	argv[0] = expandHome(argv[0])
+	if !filepath.IsAbs(argv[0]) {
+		return nil, config.LibraryCommandLimits{}, fmt.Errorf("argv[0] %q must be an absolute path", source.Argv[0])
+	}
 	return argv, limits, nil
 }
 
@@ -216,10 +221,11 @@ func (p *commandProvider) servableLocked(now time.Time) *snapshot {
 // runCommand runs argv once, with no shell, and returns its complete stdout or
 // a bounded failure code. The command inherits the daemon environment; stdin
 // is the null device and stderr is discarded unread, because it can print
-// credentials. The whole process tree is killed at the timeout or as soon as
-// stdout passes maxBytes, and the child is waited for exactly once. Output
-// past the cap is a failed read, never a truncated one: a prefix of a library
-// would parse cleanly and look like a smaller library.
+// credentials. The whole process tree is killed at the timeout, as soon as
+// stdout passes maxBytes, and once the command has been waited for, so a
+// background descendant never outlives the run. The child is waited for
+// exactly once. Output past the cap is a failed read, never a truncated one:
+// a prefix of a library would parse cleanly and look like a smaller library.
 func runCommand(ctx context.Context, argv []string, timeout time.Duration, maxBytes int64) ([]byte, string) {
 	if len(argv) == 0 {
 		return nil, ownership.FailureNotConfigured
@@ -232,8 +238,8 @@ func runCommand(ctx context.Context, argv []string, timeout time.Duration, maxBy
 	stdout := &cappedOutput{limit: maxBytes, overflow: cancel}
 	cmd.Stdout = stdout
 	cmd.WaitDelay = commandWaitDelay
-	err := hook.RunConfined(cmd)
-	// RunConfined has returned, so the copy goroutine that wrote stdout is done.
+	err := hook.RunConfinedAndReap(cmd)
+	// The run has returned, so the copy goroutine that wrote stdout is done.
 	switch {
 	case stdout.exceeded:
 		return nil, ownership.FailureTruncated

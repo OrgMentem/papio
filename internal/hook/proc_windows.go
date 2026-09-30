@@ -128,6 +128,11 @@ func (g *procGuard) kill(cmd *exec.Cmd) error {
 	return cmd.Process.Kill()
 }
 
+// reap needs no work on Windows: close, which follows every run, releases the
+// only handle to the kill-on-close job, and that kills every process the
+// command left in it.
+func (*procGuard) reap(*exec.Cmd) {}
+
 // close releases the job handle on every exit path: clean exit, non-zero exit
 // and a failed start. The handle is the job's lifetime - leaking it keeps the
 // job alive for the life of the daemon, and closing it is what makes

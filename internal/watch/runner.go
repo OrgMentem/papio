@@ -476,13 +476,17 @@ type discoveryScan struct {
 	// fresh holds new works in scan order — unheld and, for an alert watch,
 	// never recorded in its digest — capped at the watch's per-run cap.
 	fresh []discoveredRequest
-	// known holds the first page's unheld works that the alert digest
-	// already has. Recording them again reports nothing; it only refreshes
-	// their stored identity (a title-only entry gaining its DOI).
+	// known holds scanned unheld works that the alert digest already has.
+	// Recording them again reports nothing; it only refreshes their stored
+	// identity (a title-only entry gaining its DOI).
 	known []discoveredRequest
 	// coverage is each scanned source's next position, persisted only
 	// after fresh has been handled so a failed run re-reads its pages.
 	coverage []SourceCoverage
+	// rereads holds, per source, the position that fetched a deeper page
+	// holding fresh works. It replaces that source's coverage when any
+	// submission fails, so the next run re-reads the page.
+	rereads  []SourceCoverage
 	failures []discovery.BackendFailure
 	// limits names each source whose deeper scan stopped with results left
 	// unread.
@@ -494,6 +498,26 @@ func (scan *discoveryScan) take(fresh []discoveredRequest, perRunCap int) int {
 	kept := min(max(perRunCap-len(scan.fresh), 0), len(fresh))
 	scan.fresh = append(scan.fresh, fresh[:kept]...)
 	return kept
+}
+
+// storedCoverage is the coverage to persist: with a failed submission, each
+// source whose deeper page supplied fresh works keeps the position that
+// fetched that page.
+func (scan *discoveryScan) storedCoverage(submissionFailed bool) []SourceCoverage {
+	if !submissionFailed || len(scan.rereads) == 0 {
+		return scan.coverage
+	}
+	stored := make([]SourceCoverage, 0, len(scan.coverage))
+	for _, entry := range scan.coverage {
+		for _, reread := range scan.rereads {
+			if reread.Source == entry.Source {
+				entry = reread
+				break
+			}
+		}
+		stored = append(stored, entry)
+	}
+	return stored
 }
 
 // detail names every reason the scan did not finish, or is empty when it did.
@@ -628,9 +652,13 @@ func (r *Runner) walkSource(ctx context.Context, pager PagedDiscovery, watch Wat
 		}
 		pages++
 		resumed = false
-		fresh, _, err := r.newWork(ctx, watch, result.Works, seen)
+		fresh, known, err := r.newWork(ctx, watch, result.Works, seen)
 		if err != nil {
 			return err
+		}
+		scan.known = append(scan.known, known...)
+		if len(fresh) > 0 {
+			scan.rereads = append(scan.rereads, SourceCoverage{Source: source, NextToken: token, State: string(discovery.PageMore)})
 		}
 		if kept := scan.take(fresh, watch.PerRunCap); kept < len(fresh) {
 			// New works beyond the per-run cap: the next run re-reads this
@@ -950,7 +978,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		// The scan position stays put, so the next run re-reads these pages.
 		return result, fmt.Errorf("all %d watch submissions failed", result.Failed)
 	}
-	if err := r.Store.SaveScanCoverage(ctx, watch.ID, runStart, scan.coverage); err != nil {
+	if err := r.Store.SaveScanCoverage(ctx, watch.ID, runStart, scan.storedCoverage(result.Failed > 0)); err != nil {
 		return result, err
 	}
 	detail := scan.detail()

@@ -229,10 +229,10 @@ func TestLibraryCommandSourceLoads(t *testing.T) {
 	}
 }
 
-// A bare program name is resolved once, at validation, so the daemon runs the
-// program the config was checked against rather than whatever its own PATH
-// finds later.
-func TestLibraryCommandBareProgramIsPinnedToAnAbsolutePath(t *testing.T) {
+// Validation must not depend on the loading process's PATH. The daemon's PATH
+// is not the PATH of the shell that ran doctor, so a bare name that one
+// process finds would fail to load, or name another program, in the other.
+func TestLibraryCommandBareProgramIsRejectedEvenWhenOnPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX program fixture")
 	}
@@ -243,12 +243,31 @@ func TestLibraryCommandBareProgramIsPinnedToAnAbsolutePath(t *testing.T) {
 	}
 	t.Setenv("PATH", bin)
 	body := "[[library.sources]]\nname = \"live\"\nkind = \"command\"\nargv = [\"export-holdings\", \"--all\"]\nclaim = \"record_present\"\n"
-	cfg, err := Load(writeConfig(t, body))
+	_, err := Load(writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "must be an absolute path") {
+		t.Fatalf("error = %v, want a bare program name rejected although it is on PATH", err)
+	}
+}
+
+// Load keeps argv exactly as written, so the library fingerprint hashes the
+// config's own text rather than something resolved from the loading process.
+func TestLibraryCommandArgvIsKeptAsWritten(t *testing.T) {
+	body := "[[library.sources]]\nname = \"live\"\nkind = \"command\"\nargv = [\"~/bin/export-holdings\", \"--all\"]\nclaim = \"record_present\"\n"
+	t.Setenv("HOME", t.TempDir())
+	first, err := Load(writeConfig(t, body))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Library.Sources[0].Argv; len(got) != 2 || got[0] != program || got[1] != "--all" {
-		t.Fatalf("argv = %q, want [%q --all]", got, program)
+	if got := first.Library.Sources[0].Argv; len(got) != 2 || got[0] != "~/bin/export-holdings" || got[1] != "--all" {
+		t.Fatalf("argv = %q, want it as written", got)
+	}
+	t.Setenv("HOME", t.TempDir())
+	second, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.LibraryFingerprint() != second.LibraryFingerprint() {
+		t.Fatal("the library fingerprint changed with the loading process's HOME")
 	}
 }
 
@@ -267,8 +286,8 @@ func TestLibraryCommandSourceValidationIsFailClosed(t *testing.T) {
 		{"empty argv", command + "argv = []\n", "argv is required"},
 		{"blank program", command + "argv = [\"\"]\n", "argv[0] must name a program"},
 		{"padded program", command + "argv = [\" sh\"]\n", "argv[0] must name a program"},
-		{"relative program path", command + "argv = [\"./export-holdings\"]\n", "must be an absolute path or a program name on PATH"},
-		{"program not on PATH", command + "argv = [\"papio-test-no-such-program\"]\n", "not found on PATH"},
+		{"relative program path", command + "argv = [\"./export-holdings\"]\n", "must be an absolute path"},
+		{"bare program name", command + "argv = [\"papio-test-no-such-program\"]\n", "must be an absolute path"},
 		{"NUL in an argument", command + argvTOML(t, program, "a\x00b") + "\n", "NUL"},
 		{"shell string instead of argv", command + "argv = \"papis export --all\"\n", "parsing config"},
 		{"path beside argv", withArgv + libraryPathTOML(t, filepath.Join(t.TempDir(), "a.bib")) + "\n", "path must be empty"},

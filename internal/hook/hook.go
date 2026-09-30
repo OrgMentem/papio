@@ -114,13 +114,32 @@ func runShell(ctx context.Context, command string, extra []string, timeout time.
 // a kill-on-close Job Object on Windows - and cmd.Cancel is set so a context
 // deadline kills the whole tree, not just the direct child: a command like
 // `worker & wait` must not outlive its timeout or hold an output pipe open.
+// A background descendant left running after cmd exits in time survives on
+// Unix; an on_ready hook may deliberately hand work off that way.
 // cmd must come from exec.CommandContext and must not be started yet; RunConfined
 // owns cmd.Cancel and the Unix process-group attribute.
 func RunConfined(cmd *exec.Cmd) error {
+	return runGuarded(cmd, false)
+}
+
+// RunConfinedAndReap is RunConfined for a command whose output is its whole
+// result, such as a library command source. Once Wait returns, on every path -
+// a clean exit, a non-zero exit, the deadline, or exec.ErrWaitDelay - it also
+// kills every process left in the tree, so a `worker & exit 0` descendant
+// cannot outlive the run.
+func RunConfinedAndReap(cmd *exec.Cmd) error {
+	return runGuarded(cmd, true)
+}
+
+func runGuarded(cmd *exec.Cmd, reap bool) error {
 	guard := newProcGuard(cmd)
 	defer guard.close()
 	cmd.Cancel = func() error { return guard.kill(cmd) }
-	return runConfined(cmd, guard)
+	err := runConfined(cmd, guard)
+	if reap {
+		guard.reap(cmd)
+	}
+	return err
 }
 
 // runConfined starts the shell, confines it before it can spawn a descendant,

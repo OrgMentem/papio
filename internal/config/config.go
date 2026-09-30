@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -580,9 +579,11 @@ type LibrarySource struct {
 	// abstraction must not carry, and CSL `note` is free text, not a contract.
 	Claim string `toml:"claim"`
 	// Argv is the program and arguments for kind = "command", run directly
-	// with no shell. argv[0] is an absolute path (a leading "~/" expands) or a
-	// bare program name, which validation resolves on PATH once and pins as an
-	// absolute path. A pipeline names its shell explicitly, e.g.
+	// with no shell. argv[0] must be an absolute path (a leading "~/" expands
+	// at run time). A bare program name is rejected rather than looked up on
+	// PATH: the daemon's PATH differs from the shell that ran doctor, so a
+	// lookup would make one config mean different programs. Argv is kept as
+	// written. A pipeline names its shell explicitly, e.g.
 	// ["/bin/sh", "-c", "…"], so the shell is visible in the config. The
 	// command must print only the records its claim covers: papio does not
 	// filter its output by attachment status.
@@ -1070,43 +1071,30 @@ func normalizeLibrarySourcePath(path string) string {
 	return path
 }
 
-// normalizeLibraryCommandArgv returns a command source's argv with argv[0]
-// pinned to an absolute program path. A bare program name is resolved on PATH
-// here, once, so the daemon runs exactly the program validation accepted rather
-// than whatever its own PATH finds later. A relative path is rejected: it would
-// depend on the daemon's working directory. Errors start with the field name.
-func normalizeLibraryCommandArgv(argv []string) ([]string, error) {
+// validateLibraryCommandArgv checks a command source's argv without changing
+// it, so LibraryFingerprint hashes argv exactly as written. argv[0] must be an
+// absolute path after "~/" expands. A bare program name is rejected rather than
+// resolved on PATH: validation must not depend on the loading process's PATH,
+// and the daemon's PATH is not the PATH of the shell that ran doctor. A
+// relative path is rejected because it would depend on the daemon's working
+// directory. Errors start with the field name.
+func validateLibraryCommandArgv(argv []string) error {
 	if len(argv) == 0 {
-		return nil, fmt.Errorf("argv is required for kind %q", LibraryKindCommand)
+		return fmt.Errorf("argv is required for kind %q", LibraryKindCommand)
 	}
 	for i, arg := range argv {
 		if strings.ContainsRune(arg, 0) {
-			return nil, fmt.Errorf("argv[%d] must not contain a NUL byte", i)
+			return fmt.Errorf("argv[%d] must not contain a NUL byte", i)
 		}
 	}
 	program := argv[0]
 	if program == "" || strings.TrimSpace(program) != program {
-		return nil, errors.New("argv[0] must name a program without surrounding whitespace")
+		return errors.New("argv[0] must name a program without surrounding whitespace")
 	}
-	program = normalizeLibrarySourcePath(program)
-	switch {
-	case filepath.IsAbs(program):
-	case strings.ContainsAny(program, `/\`):
-		return nil, fmt.Errorf("argv[0] %q must be an absolute path or a program name on PATH", argv[0])
-	default:
-		resolved, err := exec.LookPath(program)
-		if err != nil {
-			return nil, fmt.Errorf("argv[0] %q is not an absolute path and was not found on PATH: %w", argv[0], err)
-		}
-		resolved, err = filepath.Abs(resolved)
-		if err != nil {
-			return nil, fmt.Errorf("argv[0] %q: %w", argv[0], err)
-		}
-		program = resolved
+	if !filepath.IsAbs(expandHome(program)) {
+		return fmt.Errorf("argv[0] %q must be an absolute path (a leading \"~/\" is allowed); papio does not look programs up on PATH", program)
 	}
-	out := slices.Clone(argv)
-	out[0] = program
-	return out, nil
+	return nil
 }
 
 func (c *Config) validate() error {
@@ -1437,11 +1425,9 @@ func (c *Config) validateLibrary() error {
 			if source.Path != "" {
 				return fmt.Errorf("library.sources[%q].path must be empty for kind %q (the command's stdout is the export)", name, LibraryKindCommand)
 			}
-			argv, err := normalizeLibraryCommandArgv(source.Argv)
-			if err != nil {
+			if err := validateLibraryCommandArgv(source.Argv); err != nil {
 				return fmt.Errorf("library.sources[%q].%w", name, err)
 			}
-			c.Library.Sources[i].Argv = argv
 			if _, err := source.CommandLimits(); err != nil {
 				return fmt.Errorf("library.sources[%q].%w", name, err)
 			}

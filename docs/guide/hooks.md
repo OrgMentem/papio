@@ -171,10 +171,14 @@ refresh_seconds = 300
 ```
 
 `argv` is the program and its arguments. *papio* runs it directly, with no
-shell. To use a pipeline, name the shell yourself, for example
-`argv = ["/bin/sh", "-c", "papis export --all --format bibtex"]`. The same
-`claim` contract applies: for `pdf_present`, the command must print only the
-entries whose PDF you hold. *papio* does not filter the output for you.
+shell. The program must be an absolute path (`~/` is allowed); *papio* does not
+look it up on `PATH`, because the daemon's `PATH` is often not your shell's. To
+use a pipeline, name the shell yourself, for example
+`argv = ["/bin/sh", "-c", "papis export --all --format bibtex"]`. When the
+command exits, *papio* stops any process it left running in the background.
+The same `claim` contract applies: for `pdf_present`, the command must print
+only the entries whose PDF you hold. *papio* does not filter the output for
+you.
 
 *papio* runs the command at most once every `refresh_seconds` (default 300),
 not once for each paper, and lookups during a run share it. A run that exits

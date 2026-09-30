@@ -40,5 +40,17 @@ func (*procGuard) kill(cmd *exec.Cmd) error {
 	return nil
 }
 
+// reap kills whatever is left in the group after the leader was waited for,
+// such as a `worker &` descendant the leader did not wait for. The group
+// outlives its reaped leader while any member remains, and until it empties
+// its id cannot be reused as a pid, so the signal reaches only this run's
+// descendants. ESRCH means none remain.
+func (*procGuard) reap(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+}
+
 // close is a no-op: a process group holds no handle to release.
 func (*procGuard) close() {}

@@ -6,14 +6,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/delivery"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/resolver"
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -326,36 +331,232 @@ func TestSupplyPDFRefusesAJobHeldForReview(t *testing.T) {
 	}
 }
 
-// A job in retry_wait on a live document-delivery request would leave that
-// provider request behind if a supplied PDF finished it, so it is refused
-// until the operator settles the request.
-func TestSupplyPDFRefusesARetryWaitJobWithALiveDeliveryRequest(t *testing.T) {
+// pinDeliveryRequest pins jobID to a new document-delivery request in state.
+func pinDeliveryRequest(t *testing.T, jobs *job.Store, deliverySvc *delivery.Service, jobID string, state delivery.State) *delivery.Request {
+	t.Helper()
 	ctx := context.Background()
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	id := createLiveJob(t, jobs, "wr_supply_delivery",
-		[2]string{job.StateQueued, job.StateResolving}, [2]string{job.StateResolving, job.StateRetryWait})
-	row, err := jobs.Get(ctx, id)
+	row, err := jobs.Get(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request, err := deliverySvc.Create(ctx, delivery.CreateRequest{
-		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		JobID: jobID, InstitutionProfile: "default", Provider: "illiad",
 		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deliverySvc.UpdateState(ctx, request.ID, delivery.StateSubmitted); err != nil {
+	if state != delivery.StateOffered {
+		if err := deliverySvc.UpdateState(ctx, request.ID, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return request
+}
+
+func openActionIDs(t *testing.T, jobs *job.Store, jobID, kind string) []int64 {
+	t.Helper()
+	actions, err := jobs.ListHumanActionsForJob(context.Background(), jobID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("delivery pending"))
-	if _, err := svc.SupplyPDF(ctx, id, name); !errors.Is(err, ErrSuppliedPDFState) {
-		t.Fatalf("supply during a live delivery request = %v; want ErrSuppliedPDFState", err)
+	var ids []int64
+	for _, action := range actions {
+		if action.Action.Status == "open" && action.Action.Kind == kind {
+			ids = append(ids, action.Action.ID)
+		}
 	}
-	after, err := jobs.Get(ctx, id)
-	if err != nil || after.State != job.StateRetryWait {
-		t.Fatalf("job after refused supply = %+v, %v; want untouched retry_wait", after, err)
+	return ids
+}
+
+// failCandidateInsert makes the next candidate insert fail, which is the
+// first write a supply makes after it parks the job.
+func failCandidateInsert(t *testing.T, jobs *job.Store) {
+	t.Helper()
+	if _, err := jobs.S.DB().Exec(`CREATE TRIGGER supply_fail_candidate BEFORE INSERT ON candidates
+		BEGIN SELECT RAISE(ABORT, 'injected candidate failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = jobs.S.DB().Exec(`DROP TRIGGER IF EXISTS supply_fail_candidate`) })
+}
+
+// A job pinned to a live document-delivery request would leave that provider
+// request behind if a supplied PDF finished it. It is refused in every state
+// the command otherwise accepts, before the job moves or the staged file is
+// read.
+func TestSupplyPDFRefusesALiveDeliveryRequestInEveryState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state delivery.State
+		steps [][2]string
+		want  string
+	}{
+		{"queued", delivery.StateSubmitted, nil, job.StateQueued},
+		{"retry_wait", delivery.StateSubmitted, [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateRetryWait}}, job.StateRetryWait},
+		{"resolving", delivery.StatePending, [][2]string{{job.StateQueued, job.StateResolving}}, job.StateResolving},
+		{"fetching", delivery.StateSubmitted, [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateFetching}}, job.StateFetching},
+		{"awaiting_human", delivery.StatePending, [][2]string{{job.StateQueued, job.StateResolving}, {job.StateResolving, job.StateAwaitingHuman}}, job.StateAwaitingHuman},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, jobs, deliverySvc := newDeliveryTestService(t)
+			svc.Delivery = deliverySvc
+			id := createLiveJob(t, jobs, "wr_supply_delivery_"+tc.name, tc.steps...)
+			if tc.want == job.StateAwaitingHuman {
+				// A parked job carries the action that makes it adoptable, so
+				// only the delivery refusal stands between it and ready.
+				if _, err := jobs.OpenHumanAction(ctx, id, job.CandidateEligibleKind, "please download the paper", job.Access(false, "")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := openActionIDs(t, jobs, id, job.CandidateEligibleKind)
+			pinDeliveryRequest(t, jobs, deliverySvc, id, tc.state)
+			name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("delivery pending"))
+			if _, err := svc.SupplyPDF(ctx, id, name); !errors.Is(err, ErrSuppliedPDFState) {
+				t.Fatalf("supply during a live delivery request = %v; want ErrSuppliedPDFState", err)
+			}
+			after, err := jobs.Get(ctx, id)
+			if err != nil || after.State != tc.want || after.ArtifactSHA256 != "" {
+				t.Fatalf("job after refused supply = %+v, %v; want untouched %s", after, err, tc.want)
+			}
+			if open := openActionIDs(t, jobs, id, job.CandidateEligibleKind); !slices.Equal(open, before) {
+				t.Fatalf("open manual_download actions = %v; want %v, untouched", open, before)
+			}
+			dir, err := SuppliedPDFStagingDir(svc.Config.DataDir, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
+				t.Fatalf("staged file after refusal: %v; want it kept for a later supply", err)
+			}
+		})
+	}
+}
+
+// A request that goes live after the up-front check, as a delivery poll or a
+// submit for a job sharing the request would make it, is still refused: the
+// check runs again inside the awaiting_human -> validating transaction. A
+// job the supply took from retry_wait goes back there.
+func TestSupplyPDFRechecksTheDeliveryRequestWhenItEntersValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, jobs *job.Store) string
+		want  string
+	}{
+		{"awaiting_human", func(t *testing.T, jobs *job.Store) string {
+			return parkAwaitingHuman(t, jobs, "wr_supply_race_parked")
+		}, job.StateAwaitingHuman},
+		{"retry_wait", func(t *testing.T, jobs *job.Store) string {
+			return createLiveJob(t, jobs, "wr_supply_race_retry",
+				[2]string{job.StateQueued, job.StateResolving}, [2]string{job.StateResolving, job.StateRetryWait})
+		}, job.StateRetryWait},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, jobs, deliverySvc := newDeliveryTestService(t)
+			svc.Delivery = deliverySvc
+			id := tc.setup(t, jobs)
+			request := pinDeliveryRequest(t, jobs, deliverySvc, id, delivery.StateOffered)
+			// The request goes live between the park and the transition.
+			if _, err := jobs.S.DB().Exec(fmt.Sprintf(`CREATE TRIGGER supply_race_delivery AFTER INSERT ON candidates
+				BEGIN UPDATE delivery_requests SET state = 'submitted' WHERE id = %d; END`, request.ID)); err != nil {
+				t.Fatal(err)
+			}
+			name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("delivery raced"))
+			if _, err := svc.SupplyPDF(ctx, id, name); !errors.Is(err, ErrSuppliedPDFState) {
+				t.Fatalf("supply racing a delivery submit = %v; want ErrSuppliedPDFState", err)
+			}
+			after, err := jobs.Get(ctx, id)
+			if err != nil || after.State != tc.want || after.ArtifactSHA256 != "" {
+				t.Fatalf("job after raced supply = %+v, %v; want %s without an artifact", after, err, tc.want)
+			}
+		})
+	}
+}
+
+// A retry claim moves a job to resolving under the worker's lease and may
+// submit a delivery request in a later commit, which no check at park time
+// can see. A supply therefore refuses a job a worker holds.
+func TestSupplyPDFRefusesAJobAWorkerHolds(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := createLiveJob(t, jobs, "wr_supply_leased", [2]string{job.StateQueued, job.StateResolving})
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET lease_owner = 'worker', lease_expires_at = ? WHERE id = ?`,
+		store.FormatTime(time.Now().Add(time.Hour)), id); err != nil {
+		t.Fatal(err)
+	}
+	name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("leased"))
+	if _, err := svc.SupplyPDF(ctx, id, name); !errors.Is(err, ErrSuppliedPDFState) {
+		t.Fatalf("supply to a leased resolving job = %v; want ErrSuppliedPDFState", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateResolving || row.LeaseOwner != "worker" {
+		t.Fatalf("job after refused supply = %+v, %v; want resolving and still held by the worker", row, err)
+	}
+}
+
+// A supply that fails after it parked a retry_wait job, and before validation
+// took the job, puts the job back in retry_wait with its schedule. The action
+// the park opened closes; an action the job already had stays open.
+func TestSupplyPDFPutsARetryWaitJobBackWhenTheSupplyFailsAfterParking(t *testing.T) {
+	for _, priorAction := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prior_action_%t", priorAction), func(t *testing.T) {
+			ctx := context.Background()
+			svc, jobs := newTestService(t)
+			svc.Validate = passValidation()
+			id := createLiveJob(t, jobs, "wr_supply_unpark_retry", [2]string{job.StateQueued, job.StateResolving})
+			retryAt := time.Now().Add(3 * time.Hour)
+			if err := jobs.Transition(ctx, id, job.StateResolving, job.StateRetryWait, nil, job.WithRetryAt(retryAt)); err != nil {
+				t.Fatal(err)
+			}
+			var prior []int64
+			if priorAction {
+				if _, err := jobs.OpenHumanAction(ctx, id, job.CandidateEligibleKind, "please download the paper", job.Access(false, "")); err != nil {
+					t.Fatal(err)
+				}
+				prior = openActionIDs(t, jobs, id, job.CandidateEligibleKind)
+			}
+			failCandidateInsert(t, jobs)
+			name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("unpark"))
+			_, err := svc.SupplyPDF(ctx, id, name)
+			if err == nil || !strings.Contains(err.Error(), "injected candidate failure") {
+				t.Fatalf("supply = %v; want the candidate failure", err)
+			}
+			row, err := jobs.Get(ctx, id)
+			if err != nil || row.State != job.StateRetryWait || row.RetryAt != store.FormatTime(retryAt) {
+				t.Fatalf("job after failed supply = %+v, %v; want retry_wait at %s", row, err, store.FormatTime(retryAt))
+			}
+			if open := openActionIDs(t, jobs, id, job.CandidateEligibleKind); !slices.Equal(open, prior) {
+				t.Fatalf("open manual_download actions = %v; want %v", open, prior)
+			}
+		})
+	}
+}
+
+// queued has no legal edge back from awaiting_human, so a supply that fails
+// after parking a queued job leaves it parked with its manual_download action
+// and tells the operator so.
+func TestSupplyPDFReportsAQueuedJobItCouldNotPutBack(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := createLiveJob(t, jobs, "wr_supply_unpark_queued")
+	failCandidateInsert(t, jobs)
+	name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("unpark"))
+	_, err := svc.SupplyPDF(ctx, id, name)
+	if !errors.Is(err, ErrSuppliedPDFState) || !strings.Contains(err.Error(), "parked awaiting a PDF") {
+		t.Fatalf("supply = %v; want ErrSuppliedPDFState saying the job is parked awaiting a PDF", err)
+	}
+	if len(err.Error()) > 500 || strings.Contains(err.Error(), svc.Config.DataDir) {
+		t.Fatalf("operator error %q must fit the RPC message bound and carry no path", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateAwaitingHuman {
+		t.Fatalf("job after failed supply = %+v, %v; want awaiting_human", row, err)
+	}
+	if open := openActionIDs(t, jobs, id, job.CandidateEligibleKind); len(open) != 1 {
+		t.Fatalf("open manual_download actions = %v; want the park's one", open)
 	}
 }
 
