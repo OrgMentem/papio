@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -86,7 +87,7 @@ func (r Record) Validate() error {
 			return ErrInvalidRecord
 		}
 	case r.Kind == KindWebhook:
-		if r.APIKey != "" || r.ClientID != "" || r.ClientSecret != "" || !validWebhookURL(r.URL) || (r.Bearer != "" && !printable(r.Bearer)) {
+		if r.APIKey != "" || r.ClientID != "" || r.ClientSecret != "" || !ValidWebhookURL(r.URL) || (r.Bearer != "" && !printable(r.Bearer)) {
 			return ErrInvalidRecord
 		}
 	default:
@@ -116,12 +117,40 @@ func printable(value string) bool {
 	return true
 }
 
-func validWebhookURL(value string) bool {
+// ValidWebhookURL reports whether value is an acceptable webhook endpoint: an
+// absolute https URL, or plain http only to a loopback host (a local relay or
+// test receiver whose traffic never leaves the machine). A remote http
+// endpoint is refused because every delivery carries the notification body
+// and, when configured, the bearer secret; cleartext would expose both to
+// anyone on the path. Userinfo is refused so no credential hides in the URL.
+func ValidWebhookURL(value string) bool {
 	if !printable(value) || strings.ContainsFunc(value, unicode.IsSpace) {
 		return false
 	}
 	u, err := url.Parse(value)
-	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Hostname() != "" && u.User == nil
+	if err != nil || u.Hostname() == "" || u.User != nil {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		return LoopbackHost(u.Hostname())
+	default:
+		return false
+	}
+}
+
+// LoopbackHost reports whether host (a URL hostname, brackets removed) names
+// this machine exactly: "localhost" or a loopback IP literal. It never matches
+// by prefix, so "localhost.example.org" or "127.0.0.1.example.org" — names an
+// attacker can point anywhere — are not loopback.
+func LoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Zone() == "" && ip.Unmap().IsLoopback()
 }
 
 // wireRecord is deliberately separate from Record's redacting serializers.

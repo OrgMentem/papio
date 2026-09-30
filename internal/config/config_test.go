@@ -1318,6 +1318,45 @@ func TestInstitutionForMirrorsDefaultProfileDocumentDelivery(t *testing.T) {
 		}
 	}
 }
+
+// URLs that receive credentials or carry an OpenURL query are checked by
+// structure, not by textual prefix: each rejected case previously loaded.
+func TestCredentialAndResolverURLValidation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{name: "dev override on localhost", body: "[sources.core]\nbase_url_for_dev = \"http://localhost:8042/v3\"\n"},
+		{name: "dev override on 127.0.0.1", body: "[sources.core]\nbase_url_for_dev = \"http://127.0.0.1:8042/v3\"\n"},
+		{name: "dev override on ::1", body: "[sources.core]\nbase_url_for_dev = \"http://[::1]:8042/v3\"\n"},
+		{name: "dev override on a localhost-prefixed remote name", body: "[sources.core]\nbase_url_for_dev = \"http://localhost.attacker.example/v3\"\n", wantErr: "sources.core.base_url_for_dev must be an http URL on a loopback host"},
+		{name: "dev override on a 127.0.0.1-prefixed remote name", body: "[sources.core]\nbase_url_for_dev = \"http://127.0.0.1.attacker.example/v3\"\n", wantErr: "sources.core.base_url_for_dev must be an http URL on a loopback host"},
+		{name: "dev override hiding a remote host behind userinfo", body: "[sources.core]\nbase_url_for_dev = \"http://localhost@attacker.example/v3\"\n", wantErr: "sources.core.base_url_for_dev must be an http URL on a loopback host"},
+		{name: "https webhook with bearer", body: "[notify]\nwebhook_url = \"https://hooks.example.test/papio\"\nwebhook_secret = \"synthetic-bearer\"\n"},                                                                   // betterleaks:allow -- synthetic test input, never sent
+		{name: "loopback http webhook with bearer", body: "[notify]\nwebhook_url = \"http://127.0.0.1:9000/papio\"\nwebhook_secret = \"synthetic-bearer\"\n"},                                                                // betterleaks:allow -- synthetic test input, never sent
+		{name: "remote http webhook with bearer", body: "[notify]\nwebhook_url = \"http://hooks.example.test/papio\"\nwebhook_secret = \"synthetic-bearer\"\n", wantErr: "notify.webhook_url must be an absolute https URL"}, // betterleaks:allow -- synthetic test input, never sent
+		{name: "remote http webhook without bearer", body: "[notify]\nwebhook_url = \"http://hooks.example.test/papio\"\n", wantErr: "notify.webhook_url must be an absolute https URL"},
+		{name: "openurl base with query", body: "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl?sid=papio\"\n"},
+		{name: "openurl base with fragment", body: "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl#home\"\n", wantErr: "browser.openurl_base_url must not contain a fragment"},
+		{name: "openurl base with empty fragment", body: "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl#\"\n", wantErr: "browser.openurl_base_url must not contain a fragment"},
+		{name: "named openurl base with fragment", body: "[browser.resolvers.campus]\nopenurl_base_url = \"https://resolver.example.edu/openurl#home\"\n", wantErr: "browser.resolvers.campus.openurl_base_url must not contain a fragment"},
+		{name: "openurl base with userinfo", body: "[browser]\nopenurl_base_url = \"https://user:pw@resolver.example.edu/openurl\"\n", wantErr: "browser.openurl_base_url must not contain userinfo"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "access_mode = \"conservative\"\n"+test.body))
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("valid config rejected: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Load = %v, want an error containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
 func TestTimeoutFieldsRejectAboveCeiling(t *testing.T) {
 	// Save validates the config, reusing the same error strings Load would surface.
 	save := func(t *testing.T, cfg Config) error {

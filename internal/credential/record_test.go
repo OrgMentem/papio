@@ -55,6 +55,34 @@ func TestRecordRoundTripAndRedaction(t *testing.T) {
 	}
 }
 
+// A webhook record carries a bearer and private notification bodies, so a
+// remote endpoint must be https; plain http is only for an exact loopback host.
+func TestWebhookRecordRequiresHTTPSUnlessLoopback(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://hooks.example.test/papio",
+		"http://localhost:8042/hook",
+		"http://127.0.0.1:8042/hook",
+		"http://127.1.2.3/hook",
+		"http://[::1]:8042/hook",
+	} {
+		if err := (Record{Kind: KindWebhook, URL: endpoint, Bearer: "synthetic-bearer"}).Validate(); err != nil { // betterleaks:allow -- synthetic test input, never sent
+			t.Errorf("%s rejected: %v", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{
+		"http://hooks.example.test/papio",
+		"http://192.0.2.10/hook",
+		"http://localhost.attacker.example/hook",
+		"http://127.0.0.1.attacker.example/hook",
+		"http://[fe80::1%25en0]/hook",
+		"ftp://localhost/hook",
+	} {
+		if !sameSentinel((Record{Kind: KindWebhook, URL: endpoint, Bearer: "synthetic-bearer"}).Validate(), ErrInvalidRecord) { // betterleaks:allow -- synthetic test input, never sent
+			t.Errorf("%s accepted", endpoint)
+		}
+	}
+}
+
 func TestRecordKindValidation(t *testing.T) {
 	for _, valid := range validRecords() {
 		bad := valid

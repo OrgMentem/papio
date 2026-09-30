@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"papio/internal/bibparse"
+	"papio/internal/credential"
 	"papio/internal/routes"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -1245,8 +1246,8 @@ func (c *Config) validate() error {
 		if _, known := validSourceNames[name]; !known && !removedSourceNames[name] {
 			return fmt.Errorf("sources.%s is not a recognized source name (valid names: %s)", name, validSourceNamesList)
 		}
-		if s.BaseURLForDev != "" && !strings.HasPrefix(s.BaseURLForDev, "http://127.0.0.1") && !strings.HasPrefix(s.BaseURLForDev, "http://localhost") {
-			return fmt.Errorf("sources.%s.base_url_for_dev must be loopback", name)
+		if s.BaseURLForDev != "" && !loopbackDevURL(s.BaseURLForDev) {
+			return fmt.Errorf("sources.%s.base_url_for_dev must be an http URL on a loopback host (localhost, 127.0.0.1, or [::1])", name)
 		}
 		// A negative value does not throttle harder, it removes the throttle:
 		// takeToken treats rate <= 0 as unlimited and reserve treats a limit
@@ -1274,11 +1275,8 @@ func (c *Config) validate() error {
 	if err := validateNotify(c.Notify); err != nil {
 		return err
 	}
-	if c.Notify.WebhookURL != "" {
-		u, err := url.Parse(c.Notify.WebhookURL)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			return fmt.Errorf("notify.webhook_url must be an absolute http(s) URL")
-		}
+	if c.Notify.WebhookURL != "" && !credential.ValidWebhookURL(c.Notify.WebhookURL) {
+		return fmt.Errorf("notify.webhook_url must be an absolute https URL (plain http is accepted only for a loopback host)")
 	}
 	if c.Notify.WebhookSecret != "" && c.Notify.WebhookURL == "" {
 		return fmt.Errorf("notify.webhook_secret is set but notify.webhook_url is empty")
@@ -1484,12 +1482,33 @@ func validateLibKey(mode string, libraryID int64) error {
 	}
 }
 
+// validateOpenURLBase requires an absolute https URL that can carry an OpenURL
+// query. A fragment is refused because callers append the query to the base:
+// "…#home?url_ver=…" puts every parameter in client-side fragment data, so the
+// resolver receives none of them. Userinfo is refused because nothing in a
+// resolver or entityID URL legitimately carries a credential.
 func validateOpenURLBase(base string) error {
 	u, err := url.Parse(base)
 	if err != nil || u.Scheme != "https" || u.Host == "" || strings.TrimSpace(base) != base {
 		return fmt.Errorf("must be an absolute https URL")
 	}
+	if u.Fragment != "" || strings.Contains(base, "#") {
+		return fmt.Errorf("must not contain a fragment (#…); the OpenURL query is appended to the base")
+	}
+	if u.User != nil {
+		return fmt.Errorf("must not contain userinfo")
+	}
 	return nil
+}
+
+// loopbackDevURL reports whether raw is a plain-http URL whose host is exactly
+// loopback. The override receives the source's stored API credential, so a
+// textual prefix test is not enough: "http://localhost.attacker.example" and
+// "http://127.0.0.1.attacker.example" begin with a loopback spelling yet
+// resolve anywhere, and userinfo would let "http://localhost@evil" pass too.
+func loopbackDevURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "http" && u.User == nil && credential.LoopbackHost(u.Hostname())
 }
 
 var documentDeliveryHostRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
