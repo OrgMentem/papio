@@ -3,12 +3,27 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
 )
+
+// errNoPageCaptured is the exit status of a capture that stored nothing. The
+// daemon reports busy, timeout, not_permitted and nav_failed as routine
+// outcomes rather than RPC errors, which is right for the API; the command
+// still prints that outcome, and then fails so a script or agent that checks
+// only the exit status does not go on to read a fixture that was never saved.
+var errNoPageCaptured = errors.New("no page was captured")
+
+// adapterCaptureSucceeded is the one outcome that names a stored page: the
+// bridge rewrites a "captured" with no stored path into nav_failed, and the
+// path check keeps that promise here as well.
+func adapterCaptureSucceeded(result api.AdapterCaptureResult) bool {
+	return result.Outcome == "captured" && result.Path != ""
+}
 
 type adapterCaptureParams struct {
 	URL      string `json:"url"`
@@ -43,18 +58,19 @@ func newAdapterCaptureCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result)
-			}
-			if result.Path != "" {
-				_, err := fmt.Fprintf(opt.out, "%s\t%s\n", result.Outcome, result.Path)
+				if err := opt.printJSON(result); err != nil {
+					return err
+				}
+			} else if err := printAdapterCapture(opt, result); err != nil {
 				return err
 			}
-			if result.Detail != "" {
-				_, err := fmt.Fprintf(opt.out, "%s\t%s\n", result.Outcome, result.Detail)
-				return err
+			if !adapterCaptureSucceeded(result) {
+				if result.Outcome == "not_permitted" {
+					return fmt.Errorf("%w: %s — capture needs [captures] enabled = true in the config and a current extension listed by `papio browser sessions`", errNoPageCaptured, result.Outcome)
+				}
+				return fmt.Errorf("%w: %s", errNoPageCaptured, result.Outcome)
 			}
-			_, err := fmt.Fprintln(opt.out, result.Outcome)
-			return err
+			return nil
 		},
 	}
 	command.Flags().StringVar(&provider, "provider", "", "provider adapter id")
@@ -63,4 +79,17 @@ func newAdapterCaptureCommand(opt *options) *cobra.Command {
 	_ = command.MarkFlagRequired("provider")
 	_ = command.MarkFlagRequired("scenario")
 	return command
+}
+
+func printAdapterCapture(opt *options, result api.AdapterCaptureResult) error {
+	if result.Path != "" {
+		_, err := fmt.Fprintf(opt.out, "%s\t%s\n", result.Outcome, result.Path)
+		return err
+	}
+	if result.Detail != "" {
+		_, err := fmt.Fprintf(opt.out, "%s\t%s\n", result.Outcome, result.Detail)
+		return err
+	}
+	_, err := fmt.Fprintln(opt.out, result.Outcome)
+	return err
 }

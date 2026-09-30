@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -39,6 +40,10 @@ func TestAdapterCaptureCommandForwardsStructuredRequestAndPrintsPath(t *testing.
 	}
 }
 
+// A busy, timed-out, refused or failed capture stored no page. It is still a
+// structured outcome on stdout, but the command must exit non-zero: it used to
+// exit 0, so a script checking only the status went on to use a fixture that
+// was never saved.
 func TestAdapterCaptureCommandJSONIsStructured(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
@@ -46,8 +51,8 @@ func TestAdapterCaptureCommandJSONIsStructured(t *testing.T) {
 		return nil
 	})
 	root.SetArgs([]string{"--json", "adapter", "capture", "https://www.jstor.org/stable/123", "--provider", "jstor", "--scenario", "drift"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("adapter capture --json: %v (stderr: %s)", err, errOut.String())
+	if err := root.ExecuteContext(context.Background()); !errors.Is(err, errNoPageCaptured) || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("adapter capture --json on busy: err = %v, want errNoPageCaptured naming the outcome", err)
 	}
 	var result api.AdapterCaptureResult
 	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
@@ -55,6 +60,32 @@ func TestAdapterCaptureCommandJSONIsStructured(t *testing.T) {
 	}
 	if result.Outcome != "busy" || result.Detail != "capture already running" || result.RequestID != "capture-request-001" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestAdapterCaptureCommandFailsWhenNoPageWasStored(t *testing.T) {
+	for _, result := range []api.AdapterCaptureResult{
+		{Outcome: "timeout", Detail: "browser page capture timed out"},
+		{Outcome: "not_permitted", Detail: "page capture storage is disabled"},
+		{Outcome: "nav_failed", Detail: "capture content was not stored"},
+		{Outcome: "captured"},
+	} {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, got any) error {
+			*got.(*api.AdapterCaptureResult) = result
+			return nil
+		})
+		root.SetArgs([]string{"adapter", "capture", "https://www.jstor.org/stable/123", "--provider", "jstor", "--scenario", "drift"})
+		err := root.ExecuteContext(context.Background())
+		if !errors.Is(err, errNoPageCaptured) {
+			t.Fatalf("%s: err = %v, want errNoPageCaptured", result.Outcome, err)
+		}
+		if result.Outcome == "not_permitted" && !strings.Contains(err.Error(), "[captures] enabled = true") {
+			t.Fatalf("not_permitted: err = %v, want the remedy", err)
+		}
+		if !strings.HasPrefix(out.String(), result.Outcome) {
+			t.Fatalf("%s: stdout = %q, want the outcome still printed", result.Outcome, out.String())
+		}
 	}
 }
 
