@@ -282,6 +282,10 @@ func truncationNoticeUpTo(opt *options, truncated bool, rows int, noun string, m
 	return err
 }
 
+// errReviewChanged makes `actions resolve` exit nonzero when the daemon's
+// compare-and-swap found the review changed after it was listed.
+var errReviewChanged = errors.New("review changed since it was listed")
+
 // errRefileFailed makes `jobs refile` exit nonzero after printing a failed
 // hook run's result, the errDoctorFailed shape.
 var errRefileFailed = errors.New("filing hook failed")
@@ -811,10 +815,21 @@ func newActionsCommand(opt *options) *cobra.Command {
 	list.Flags().StringVar(&actionsConsumer, "consumer", "", "only actions whose job was submitted under this consumer name")
 
 	var accept, reject bool
+	var resolveRevision int64
+	var resolveSHA256 string
 	resolve := &cobra.Command{
 		Use:   "resolve <action-id>",
 		Short: "Accept or reject a parked identity or unsafe-PDF review",
-		Args:  cobra.ExactArgs(1),
+		Long: "Accept or reject a parked identity or unsafe-PDF review.\n\n" +
+			"The verdict applies only to the review you inspected. --revision is\n" +
+			"required for both verdicts, and --accept also needs --sha256, the\n" +
+			"quarantined file's digest; take both from `papio actions list --json`\n" +
+			"(revision, quarantine_sha256). If the action or its file changed since\n" +
+			"you listed it, nothing is applied and the command exits nonzero: list\n" +
+			"the action again and re-inspect the file before deciding.\n\n" +
+			"--reject cancels the job for an identity review; for an unsafe PDF it\n" +
+			"sends the job back to awaiting_human for a manual download.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if accept == reject {
 				return errors.New("exactly one of --accept or --reject is required")
@@ -823,19 +838,34 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if err != nil || actionID <= 0 {
 				return errors.New("action-id must be a positive integer")
 			}
-			verdict := "reject"
+			if resolveRevision <= 0 {
+				return errors.New("--revision is required; take it from `papio actions list --json`")
+			}
+			params := map[string]any{"action_id": actionID, "verdict": "reject", "expected_revision": resolveRevision}
 			if accept {
-				verdict = "accept"
+				digest := strings.ToLower(strings.TrimSpace(resolveSHA256))
+				if !validSHA256(digest) {
+					return errors.New("--accept requires --sha256, the 64-hex quarantine_sha256 of the file you inspected; take it from `papio actions list --json`")
+				}
+				params["verdict"] = "accept"
+				params["expected_sha256"] = digest
 			}
 			var result map[string]any
-			if err := opt.call(cmd.Context(), "actions.resolve",
-				map[string]any{"action_id": actionID, "verdict": verdict}, &result); err != nil {
+			if err := opt.call(cmd.Context(), "actions.resolve", params, &result); err != nil {
 				return err
+			}
+			if result["outcome"] == string(job.ReviewConflict) {
+				if err := opt.printResult(result, "action %d: not resolved — the review changed since you listed it; run `papio actions list --json`, re-inspect the quarantined file, and decide again", actionID); err != nil {
+					return err
+				}
+				return fmt.Errorf("%w: action %d", errReviewChanged, actionID)
 			}
 			return opt.printResult(result, "%s\t%s", result["job_id"], result["state"])
 		},
 	}
 	resolve.Flags().BoolVar(&accept, "accept", false, "accept the identity review")
+	resolve.Flags().Int64Var(&resolveRevision, "revision", 0, "revision the action had when you listed it")
+	resolve.Flags().StringVar(&resolveSHA256, "sha256", "", "quarantine_sha256 of the file you inspected (required with --accept)")
 
 	var revision int64
 	dismiss := &cobra.Command{

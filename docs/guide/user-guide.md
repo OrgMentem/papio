@@ -915,15 +915,20 @@ local `jobs failures` and `jobs incidents` output.
 ## 8. Resolve identity reviews deliberately
 
 A PDF can be well-formed yet still land in `needs_review` when *papio* isn't sure
-it's the paper you asked for. `papio actions list` shows the open
-`verify_identity` action and the path to the quarantined file. Open that file and
-check it before deciding:
+it's the paper you asked for. `papio actions list --json` shows the open
+`verify_identity` action with the path to the quarantined file
+(`quarantine_path`), its digest (`quarantine_sha256`), and the action's
+`revision`. Open that file and check it before deciding:
 
 ```sh
-papio actions resolve <action-id> --accept
+papio actions resolve <action-id> --accept --revision <revision> --sha256 <quarantine_sha256>
 # or
-papio actions resolve <action-id> --reject
+papio actions resolve <action-id> --reject --revision <revision>
 ```
+
+The revision and digest bind your verdict to the review you inspected. If the
+action or its file changed after you listed it, nothing is applied and the
+command exits nonzero; list it again and re-inspect the file.
 
 `--accept` states that you opened the quarantined PDF and confirmed it is the
 work you wanted. The daemon imports that same file — no second download — and

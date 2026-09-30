@@ -70,7 +70,7 @@ papio jobs list --state needs_review --json
 
 # 4. Resolve identity reviews after reading the quarantined file.
 papio actions list --json
-papio actions resolve <action-id> --accept        # or --reject
+papio actions resolve <action-id> --accept --revision <n> --sha256 <quarantine_sha256>   # or --reject --revision <n>
 
 # 5. File into Zotero: preview, read it, apply exactly that preview.
 papio zotio plan <job-id> --json
@@ -116,7 +116,8 @@ and may run `papio drive pause`; resuming the drive is the user's decision.
 
 Only resolve an open `verify_identity` action. The action detail names a local
 quarantine file precisely so it can be inspected before anyone answers.
-`papio actions resolve <action-id> --accept` asserts that the file **is** the
+`papio actions resolve <action-id> --accept --revision <n> --sha256 <digest>`
+asserts that the file with that digest **is** the
 requested work; the daemon then imports that same file and records the identity
 as `user_confirmed`. Nothing downstream can distinguish an agent's judgement
 from a person's in that record, so an agent inspects and reports — the accept or
