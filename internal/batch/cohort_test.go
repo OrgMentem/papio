@@ -145,6 +145,26 @@ func TestSubmitChunkSequenceAndDuplicateKey(t *testing.T) {
 	}); err == nil {
 		t.Fatal("out-of-sequence chunk accepted")
 	}
+	// A later chunk of the SAME cohort that repeats an already-persisted key
+	// would count one work twice in the denominator; it is refused before
+	// submission.
+	repeat := first
+	repeat.RequestID = "request-repeat"
+	repeat.ChunkIndex = 1
+	repeat.FinalChunk = true
+	repeat.CanonicalKeys = []string{manifest[0]}
+	calls := 0
+	_, repeatErr := cohorts.SubmitChunk(ctx, repeat, func(context.Context, []string) ([]MemberOutcome, error) {
+		calls++
+		return outcomes(repeat.CanonicalKeys, "joined", "job-"), nil
+	})
+	conflict := &ConflictError{}
+	if !errors.As(repeatErr, &conflict) || !strings.Contains(repeatErr.Error(), manifest[0]) {
+		t.Fatalf("same-cohort duplicate key error = %v, want ConflictError naming %s", repeatErr, manifest[0])
+	}
+	if calls != 0 {
+		t.Fatalf("duplicate chunk invoked submission %d times", calls)
+	}
 	second := first
 	second.RequestID = "request-2"
 	second.ChunkIndex = 1
