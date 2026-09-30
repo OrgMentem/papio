@@ -85,6 +85,45 @@ test("provider URL metas remain queryless selector evidence while token metas ar
   expect(residualLeak(out)).toBeNull();
 });
 
+test("URLs written into page text or plain attributes lose their queries", () => {
+  const out = sanitizeFixture(
+    `<p>Your link: https://s.example/pay?token=abcd1234#frag</p>` +
+      `<span title="Open https://s.example/doc?code=wxyz9876 now">copy</span>`,
+    META,
+  );
+  expect(out).toContain(`<p>Your link: https://s.example/pay</p>`);
+  expect(out).toContain(`title="Open https://s.example/doc now"`);
+  expect(out).not.toContain("abcd1234");
+  expect(out).not.toContain("wxyz9876");
+  expect(residualLeak(out)).toBeNull();
+  // The guard rejects a surviving short signed URL independently of the rewriter.
+  expect(residualLeak(`<p>https://s.example/pay?token=abcd1234</p>`)).toContain("query string");
+  expect(residualLeak(`<span title="https://s.example/doc?code=wxyz9876">x</span>`)).toContain("query string");
+});
+
+test("URL-bearing meta content loses its query whatever names the meta", () => {
+  const out = sanitizeFixture(
+    `<meta property="og:url" content="https://s.example/doc?code=abcd1234">` +
+      `<meta property="og:image" content="/cover.png?sig=wxyz9876">` +
+      `<meta http-equiv="refresh" content="0; url=/login?code=qrst5678">`,
+    META,
+  );
+  expect(out).toContain(`property="og:url" content="https://s.example/doc"`);
+  expect(out).toContain(`property="og:image" content="/cover.png"`);
+  expect(out).toContain(`http-equiv="refresh" content="0; url=/login"`);
+  expect(out).not.toContain("abcd1234");
+  expect(out).not.toContain("wxyz9876");
+  expect(out).not.toContain("qrst5678");
+  expect(residualLeak(out)).toBeNull();
+  expect(residualLeak(`<meta property="og:url" content="https://s.example/doc?code=abcd1234">`)).toContain(
+    "query string",
+  );
+  expect(residualLeak(`<meta property="og:image" content="/cover.png?sig=wxyz9876">`)).toContain("query string");
+  expect(residualLeak(`<meta http-equiv="refresh" content="0; url=/login?code=qrst5678">`)).toContain(
+    "query string",
+  );
+});
+
 test("input values and value attributes are blanked", () => {
   const out = sanitizeFixture(
     `<input type="password" name="pw" value="hunter2" autocomplete="current-password">`,
