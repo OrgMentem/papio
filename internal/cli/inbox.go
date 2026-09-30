@@ -61,10 +61,18 @@ func newInboxCommand(opt *options) *cobra.Command {
 	}
 	var op string
 	var watchScope string
+	var deleteGrab bool
 	decide := &cobra.Command{
 		Use:   "decide <item-id>",
 		Short: "Acquire or dismiss one triage inbox item",
-		Args:  cobra.ExactArgs(1),
+		Long: "Acquire or dismiss one triage inbox item.\n\n" +
+			"Dismissing a captured PDF grab (an item id starting with \"" + triage.PdfGrabIDPrefix + "\")\n" +
+			"permanently deletes the captured file and its grab record; `papio grabs\n" +
+			"suggest` and `papio grabs identify` cannot recover it afterwards. That\n" +
+			"dismissal is refused unless --delete-grab confirms it.\n\n" +
+			"A decision that did not apply (conflict or invalid) exits nonzero after\n" +
+			"printing its outcome.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if op != "acquire" && op != "dismiss" {
 				return fmt.Errorf("--op must be acquire or dismiss, got %q", op)
@@ -74,6 +82,12 @@ func newInboxCommand(opt *options) *cobra.Command {
 			// daemon needs to know whether one watch or every watch that surfaced
 			// this work is being answered.
 			if op == "dismiss" {
+				// Dismissing a grab is not a notification dismissal: the daemon
+				// deletes the only copy of the captured bytes. Make that an
+				// explicit, scriptable confirmation rather than a side effect.
+				if strings.HasPrefix(args[0], triage.PdfGrabIDPrefix) && !deleteGrab {
+					return fmt.Errorf("%s is a captured PDF grab: dismissing it permanently deletes the captured file and its grab record; nothing was changed. Rerun with --delete-grab to confirm, or file it with `papio grabs suggest %s`", args[0], strings.TrimPrefix(args[0], triage.PdfGrabIDPrefix))
+				}
 				scope, err := parseWatchScope(watchScope)
 				if err != nil {
 					return err
@@ -87,22 +101,22 @@ func newInboxCommand(opt *options) *cobra.Command {
 				}
 				return err
 			}
-			if opt.jsonOutput {
-				return opt.printJSON(result)
-			}
-			// The daemon reports conflict and already_applied as outcomes rather
-			// than errors, so never print a success line for a decision that did
-			// not apply.
-			if result.Detail != "" {
-				_, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", args[0], result.Outcome, result.Detail)
+			if err := printTriageDecision(opt, args[0], result); err != nil {
 				return err
 			}
-			_, err := fmt.Fprintf(opt.out, "%s\t%s\n", args[0], result.Outcome)
-			return err
+			// The outcome is already on stdout; the exit status must agree with
+			// it, so a decision that did not apply is a failed command.
+			switch triage.DecisionOutcome(result.Outcome) {
+			case triage.DecisionApplied, triage.DecisionAlreadyApplied:
+				return nil
+			default:
+				return fmt.Errorf("inbox decision for %s was not applied: %s", args[0], result.Outcome)
+			}
 		},
 	}
 	decide.Flags().StringVar(&op, "op", "", "acquire or dismiss")
 	decide.Flags().StringVar(&watchScope, "watch-scope", "all", "for dismiss: all, or a comma-separated list of watch IDs")
+	decide.Flags().BoolVar(&deleteGrab, "delete-grab", false, "confirm that dismissing a captured PDF grab permanently deletes its file")
 
 	command.AddCommand(counts, decide)
 	return command
@@ -114,6 +128,21 @@ func newInboxCommand(opt *options) *cobra.Command {
 type triageDecision struct {
 	Outcome string `json:"outcome"`
 	Detail  string `json:"detail,omitempty"`
+}
+
+func printTriageDecision(opt *options, itemID string, result triageDecision) error {
+	if opt.jsonOutput {
+		return opt.printJSON(result)
+	}
+	// The daemon reports conflict and already_applied as outcomes rather
+	// than errors, so never print a success line for a decision that did
+	// not apply.
+	if result.Detail != "" {
+		_, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", itemID, result.Outcome, result.Detail)
+		return err
+	}
+	_, err := fmt.Fprintf(opt.out, "%s\t%s\n", itemID, result.Outcome)
+	return err
 }
 
 // parseWatchScope converts the CLI's comma-separated form into the two shapes

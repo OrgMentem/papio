@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,5 +171,77 @@ func TestInboxRetractionRowStripsTerminalControlBytes(t *testing.T) {
 			}
 			assertInboxSanitizedRow(t, snapshot, tc.wantRow)
 		})
+	}
+}
+
+func TestInboxDecideDismissOfAPdfGrabRequiresDeleteGrab(t *testing.T) {
+	var calls []map[string]any
+	stub := func(_ context.Context, method string, params, result any) error {
+		if method != "triage.decide" {
+			t.Fatalf("method = %q, want triage.decide", method)
+		}
+		calls = append(calls, params.(map[string]any))
+		*result.(*triageDecision) = triageDecision{Outcome: string(triage.DecisionApplied)}
+		return nil
+	}
+	item := triage.PdfGrabIDPrefix + "grab-1"
+
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"inbox", "decide", item, "--op", "dismiss"})
+	if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "--delete-grab") {
+		t.Fatalf("dismiss of a pdf grab = %v, want a refusal naming --delete-grab", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("unconfirmed grab dismissal reached the daemon: %v", calls)
+	}
+
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"inbox", "decide", item, "--op", "dismiss", "--delete-grab"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("confirmed grab dismissal: %v", err)
+	}
+	if len(calls) != 1 || calls[0]["item_id"] != item || calls[0]["op"] != "dismiss" {
+		t.Fatalf("confirmed grab dismissal params = %v", calls)
+	}
+
+	// A watch hit is only a notification: dismissing it needs no confirmation.
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"inbox", "decide", "hit:1:10.1000/example", "--op", "dismiss"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("watch-hit dismissal: %v", err)
+	}
+}
+
+func TestInboxDecideExitStatusFollowsTheOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		outcome triage.DecisionOutcome
+		wantErr bool
+	}{
+		{outcome: triage.DecisionApplied},
+		{outcome: triage.DecisionAlreadyApplied},
+		{outcome: triage.DecisionConflict, wantErr: true},
+		{outcome: triage.DecisionInvalid, wantErr: true},
+	} {
+		for _, jsonOutput := range []bool{false, true} {
+			var out, errOut bytes.Buffer
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+				*result.(*triageDecision) = triageDecision{Outcome: string(tc.outcome), Detail: "why"}
+				return nil
+			})
+			args := []string{"inbox", "decide", "hit:1:10.1000/example", "--op", "acquire"}
+			if jsonOutput {
+				args = append([]string{"--json"}, args...)
+			}
+			root.SetArgs(args)
+			err := root.ExecuteContext(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("outcome %s (json=%v): err = %v, want error %v", tc.outcome, jsonOutput, err, tc.wantErr)
+			}
+			// The outcome is printed either way, so a script can still read why.
+			if !strings.Contains(out.String(), string(tc.outcome)) {
+				t.Fatalf("outcome %s (json=%v): stdout = %q, want the outcome printed", tc.outcome, jsonOutput, out.String())
+			}
+		}
 	}
 }
