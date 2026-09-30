@@ -87,13 +87,16 @@ func listActionsPage(ctx context.Context, opt *options, openOnly bool, limit int
 	if !isUnknownMethod(err) {
 		return nil, false, err
 	}
-	// actions.list is unbounded, so an older daemon returns the complete set and
-	// there is nothing to be truncated against.
+	// actions.list is unbounded, so an older daemon returns the complete set.
+	// Cut it to --limit client-side: listJobsPage's fallback can lean on
+	// Capped because jobs.list honours the limit itself, but here the rows past
+	// the limit arrive and must be dropped, with `truncated` saying so.
 	var actions []job.HumanAction
 	if err := opt.call(ctx, "actions.list", map[string]bool{"open_only": openOnly}, &actions); err != nil {
 		return nil, false, err
 	}
-	return actions, false, nil
+	rows, truncated := agentjson.Truncate(actions, limit)
+	return rows, truncated, nil
 }
 
 func isUnknownMethod(err error) bool {
