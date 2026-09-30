@@ -1470,13 +1470,15 @@ func cancelJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 		}
 		return badParams(err)
 	}
-	if err := system.App.CancelJob(ctx, params.JobID, "cancelled by user"); err != nil {
-		return failure(err)
+	cancelErr := system.App.CancelJob(ctx, params.JobID, "cancelled by user")
+	if cancelErr != nil && !errors.Is(cancelErr, app.ErrCompensationIncomplete) {
+		return failure(cancelErr)
 	}
-	if system.Captures != nil {
-		if err := system.Captures.ReleaseJob(ctx, params.JobID); err != nil {
-			return failure(err)
-		}
+	// The cancellation has committed even when its delivery compensation did
+	// not, so the job's capture lease is released on both paths.
+	releaseCaptureLeaseAfterCommit(ctx, system, params.JobID)
+	if cancelErr != nil {
+		return failure(cancelErr)
 	}
 	// Cancel is an idempotent no-op on a job that already reached any
 	// terminal state, so "cancelled" reports the state the job is in now: a
@@ -1498,15 +1500,50 @@ func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 		}
 		return badParams(err)
 	}
+	// Release the capture lease BEFORE the job becomes active again: once
+	// Retry commits, a new attempt can pin its own captures under the same
+	// job, and a late release would drop them. A lease is live only while its
+	// job awaits a human (the bridge's lease sweep applies the same rule),
+	// and Retry refuses that state, so a refused retry never costs a live
+	// lease. A release failure here leaves nothing committed and the retry
+	// can simply be repeated.
+	if system.Captures != nil {
+		row, err := system.Jobs.Get(ctx, params.JobID)
+		if err != nil {
+			return failure(err)
+		}
+		if row.State != job.StateAwaitingHuman {
+			if err := system.Captures.ReleaseJob(ctx, params.JobID); err != nil {
+				return failure(err)
+			}
+		}
+	}
 	if err := system.Jobs.Retry(ctx, params.JobID); err != nil {
 		return failure(err)
 	}
-	if system.Captures != nil {
-		if err := system.Captures.ReleaseJob(ctx, params.JobID); err != nil {
-			return failure(err)
-		}
-	}
 	return marshal(map[string]any{"job_id": params.JobID, "state": job.StateResolving})
+}
+
+// captureReleaseTimeout bounds the capture-lease release that follows a
+// committed job mutation.
+const captureReleaseTimeout = 10 * time.Second
+
+// releaseCaptureLeaseAfterCommit drops a job's provisional page-capture lease
+// once the job's own mutation has committed. That mutation stands whatever
+// happens here, so neither a caller that has gone away nor a release failure
+// may turn it into an RPC failure the operator cannot repeat past: the
+// release runs on a detached, bounded context and a failure is logged. A
+// stranded lease only keeps diagnostic captures out of retention, and the
+// bridge's lease sweep releases any lease whose job is not awaiting a human.
+func releaseCaptureLeaseAfterCommit(ctx context.Context, system *bootstrap.System, jobID string) {
+	if system.Captures == nil {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), captureReleaseTimeout)
+	defer cancel()
+	if err := system.Captures.ReleaseJob(releaseCtx, jobID); err != nil {
+		log.Printf("papio: releasing capture lease for %s after a committed change: %v", jobID, err)
+	}
 }
 
 func resolveAction(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
