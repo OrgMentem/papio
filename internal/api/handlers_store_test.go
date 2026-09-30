@@ -12,6 +12,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/store"
 	"papio/internal/watch"
 	"papio/internal/work"
 )
@@ -94,17 +95,33 @@ func TestStoreHandlerJobsFailuresGroupsTerminalJobs(t *testing.T) {
 	if group.Reason != string(job.TerminalReasonCandidatesExhausted) || group.Provider != "-" {
 		t.Fatalf("group = %+v, want reason %q and provider -", group, job.TerminalReasonCandidatesExhausted)
 	}
+	if got, err := time.Parse(time.RFC3339Nano, result.Since); err != nil || time.Since(got) < 23*time.Hour || time.Since(got) > 25*time.Hour {
+		t.Fatalf("since = %q (%v), want the resolved 24h window start", result.Since, err)
+	}
 
 	// A window that closes before the job was updated must exclude it: this
 	// proves `since` reached the query rather than being parsed and dropped.
+	future := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	var empty failuresResult
 	if rpcErr := callMethod(t, router, "jobs.failures", map[string]any{
-		"since": time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		"since": future.Format(time.RFC3339),
 	}, &empty); rpcErr != nil {
 		t.Fatalf("future since = %+v", rpcErr)
 	}
 	if len(empty.Failures) != 0 {
 		t.Fatalf("failures inside a future window = %+v, want none", empty.Failures)
+	}
+	if empty.Since != store.FormatTime(future) {
+		t.Fatalf("since = %q, want the window the client supplied, %q", empty.Since, store.FormatTime(future))
+	}
+
+	// No since means no window, so none is reported.
+	var unbounded failuresResult
+	if rpcErr := callMethod(t, router, "jobs.failures", map[string]any{}, &unbounded); rpcErr != nil {
+		t.Fatalf("unbounded = %+v", rpcErr)
+	}
+	if unbounded.Since != "" {
+		t.Fatalf("since = %q without a window, want empty", unbounded.Since)
 	}
 }
 

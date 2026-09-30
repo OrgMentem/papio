@@ -13,6 +13,7 @@ import (
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/store"
 )
 
 type failuresParams struct {
@@ -43,7 +44,11 @@ func listFailures(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if failures == nil {
 		failures = []job.FailureGroup{}
 	}
-	return marshal(failuresResult{Failures: failures})
+	result := failuresResult{Failures: failures}
+	if !since.IsZero() {
+		result.Since = store.FormatTime(since)
+	}
+	return marshal(result)
 }
 
 func parseFailuresSince(value string, now time.Time) (time.Time, error) {
