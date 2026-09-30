@@ -3123,9 +3123,70 @@ func TestRefileJob(t *testing.T) {
 	if _, err := unconfigured.RefileJob(ctx, "job_missing"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("missing refile error = %v", err)
 	}
+	// Only a settled acquisition has a PDF to file: live and terminal-without-
+	// artifact states refuse before any hook runs.
+	queuedID := createFilingStateJob(t, jobs, "wr_refile_queued", job.StateQueued)
 	resolvingID := createFilingStateJob(t, jobs, "wr_refile_resolving", job.StateResolving)
-	if _, err := svc.RefileJob(ctx, resolvingID); !errors.Is(err, job.ErrConflict) {
-		t.Fatalf("resolving refile error = %v", err)
+	cancelledID := createFilingStateJob(t, jobs, "wr_refile_cancelled", job.StateQueued)
+	if err := jobs.Cancel(ctx, cancelledID, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReadyHook.Exec = func(context.Context, string, []string) hook.Result {
+		t.Fatal("refile ran the hook for an unsettled job")
+		return hook.Result{}
+	}
+	for _, refused := range []string{queuedID, resolvingID, cancelledID} {
+		if _, err := svc.RefileJob(ctx, refused); !errors.Is(err, job.ErrConflict) {
+			t.Fatalf("refile of %s error = %v, want ErrConflict", refused, err)
+		}
+	}
+}
+
+// A refile whose hook times out, or whose artifact path cannot be derived,
+// reports that outcome and records it, so the paper stays on the unfiled list
+// with the attempt counted instead of vanishing or looking filed.
+func TestRefileJobRecordsTimeoutAndArtifactPathFailures(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(context.Context, string, []string) hook.Result {
+			return hook.Result{Ran: true, ExitCode: -1, Duration: 30 * time.Millisecond, Err: context.DeadlineExceeded}
+		},
+	}
+	timedOut := createFilingStateJob(t, jobs, "wr_refile_timeout", job.StateReady)
+	const sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET artifact_sha256 = ? WHERE id = ?`, sha, timedOut); err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.RefileJob(ctx, timedOut)
+	if err != nil || result.Status != "timeout" || result.ExitCode != -1 || result.DurationMS != 30 {
+		t.Fatalf("timed-out refile = %+v, %v", result, err)
+	}
+
+	noArtifact := createFilingStateJob(t, jobs, "wr_refile_no_artifact", job.StateReady)
+	svc.ReadyHook.Exec = func(context.Context, string, []string) hook.Result {
+		t.Fatal("hook ran without an artifact path")
+		return hook.Result{}
+	}
+	result, err = svc.RefileJob(ctx, noArtifact)
+	if err != nil || result.Status != "failed" || result.ExitCode != -1 {
+		t.Fatalf("artifact-path refile = %+v, %v", result, err)
+	}
+	if detail := waitForHookEvent(t, jobs, noArtifact); detail["status"] != "failed" || detail["reason"] != "artifact_path" || detail["trigger"] != "manual" {
+		t.Fatalf("artifact-path filing event = %#v", detail)
+	}
+
+	rows, _, err := svc.UnfiledJobs(ctx, UnfiledFailed, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := map[string]string{}
+	for _, row := range rows {
+		statuses[row.JobID] = row.LastStatus
+	}
+	if statuses[timedOut] != "timeout" || statuses[noArtifact] != "failed" || len(rows) != 2 {
+		t.Fatalf("unfiled after failed refiles = %+v", rows)
 	}
 }
 
