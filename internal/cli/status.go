@@ -25,6 +25,9 @@ type statusSnapshot struct {
 	GeneratedAt        string        `json:"generated_at"`
 	LibraryMissingPDFs *int          `json:"library_missing_pdfs,omitempty"`
 	Groups             []statusGroup `json:"groups"`
+	// IncompleteStates names the active states holding more jobs than one
+	// status read returns; the board shows the newest statusListLimit of each.
+	IncompleteStates []string `json:"incomplete_states,omitempty"`
 }
 
 type statusGroup struct {
@@ -106,9 +109,54 @@ func loadLibraryMissing(ctx context.Context, opt *options) *int {
 	return &result.Missing
 }
 
+// statusListLimit is the most rows one jobs.list read returns
+// (job.ListLimitMax).
+const statusListLimit = job.ListLimitMax
+
+// statusActiveStates are the non-terminal states the board shows regardless
+// of age.
+var statusActiveStates = []string{
+	job.StateQueued, job.StateResolving, job.StateFetching, job.StateValidating,
+	job.StateRetryWait, job.StateAwaitingHuman, job.StateNeedsReview,
+}
+
+// loadStatusRows reads the recent window and, separately, every active
+// state. One newest-first read is not enough: jobs.list orders by creation,
+// so 500 newer settled jobs push an older job that is still parked on a
+// human out of the page, and the board looked empty while it waited. The
+// per-state reads find it; a state holding more than one read returns is
+// reported rather than silently cut.
+func loadStatusRows(ctx context.Context, opt *options) ([]job.Row, []string, error) {
+	rows, _, err := listJobsPage(ctx, opt, map[string]any{"limit": statusListLimit}, statusListLimit)
+	if err != nil {
+		return nil, nil, err
+	}
+	seen := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		seen[row.ID] = true
+	}
+	var truncated []string
+	for _, state := range statusActiveStates {
+		active, more, err := listJobsPage(ctx, opt, map[string]any{"state": state, "limit": statusListLimit}, statusListLimit)
+		if err != nil {
+			return nil, nil, err
+		}
+		if more {
+			truncated = append(truncated, state)
+		}
+		for _, row := range active {
+			if !seen[row.ID] {
+				seen[row.ID] = true
+				rows = append(rows, row)
+			}
+		}
+	}
+	return rows, truncated, nil
+}
+
 func loadStatusSnapshot(ctx context.Context, opt *options, now time.Time) (statusSnapshot, error) {
-	var rows []job.Row
-	if err := opt.call(ctx, "jobs.list", map[string]any{"limit": 500}, &rows); err != nil {
+	rows, truncated, err := loadStatusRows(ctx, opt)
+	if err != nil {
 		return statusSnapshot{}, err
 	}
 
@@ -124,7 +172,9 @@ func loadStatusSnapshot(ctx context.Context, opt *options, now time.Time) (statu
 		details[row.ID] = detail
 	}
 	cfg, _ := opt.loadConfig() // best-effort; guidance degrades to generic without it
-	return buildStatusSnapshot(rows, details, now, cfg), nil
+	snapshot := buildStatusSnapshot(rows, details, now, cfg)
+	snapshot.IncompleteStates = truncated
+	return snapshot, nil
 }
 
 func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now time.Time, cfg config.Config) statusSnapshot {
@@ -380,6 +430,11 @@ func renderStatusRefresh(out io.Writer, snapshot statusSnapshot, terminal bool) 
 			line = fmt.Sprintf("Library: %d item(s) missing PDFs — papio acquire --from-zotio queues them (25 per run by default)\n", missing)
 		}
 		if _, err := fmt.Fprint(out, line); err != nil {
+			return err
+		}
+	}
+	for _, state := range snapshot.IncompleteStates {
+		if _, err := fmt.Fprintf(out, "truncated: more than %d %s jobs; showing the newest %d\n", statusListLimit, state, statusListLimit); err != nil {
 			return err
 		}
 	}
