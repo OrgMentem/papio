@@ -1795,6 +1795,143 @@ func TestOfferedDeliveryRecoveryStaleProfileSurfacesHumanAction(t *testing.T) {
 	}
 }
 
+// The hold's prompt and its resolving -> awaiting_human park commit together.
+// A failed park therefore leaves no stranded prompt and no hold marker, and
+// the next recovery pass parks the job instead of treating the marker as
+// proof that the hold happened.
+func TestOfferedDeliveryRecoveryRetriesAFailedHoldPark(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("stale gate profile must never submit")
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_park_fail", "10.1000/offered-recovery-park-fail"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: "stale-profile-digest",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID, "profile_class": "auto_capable",
+		"profile_digest": "stale-profile-digest", "decision": "submit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().ExecContext(ctx, `CREATE TRIGGER fail_hold_park BEFORE UPDATE OF state ON jobs
+		WHEN NEW.state = 'awaiting_human' BEGIN SELECT RAISE(ABORT, 'injected park failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := jobs.Get(ctx, id)
+	if err != nil || failed.State != job.StateResolving {
+		t.Fatalf("job after failed park = %+v, %v; want resolving", failed, err)
+	}
+	if actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id}); err != nil || len(actions) != 0 {
+		t.Fatalf("open actions after failed park = %+v, %v; want none stranded on a resolving job", actions, err)
+	}
+
+	if _, err := jobs.S.DB().ExecContext(ctx, `DROP TRIGGER fail_hold_park`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	held, err := jobs.Get(ctx, id)
+	if err != nil || held.State != job.StateAwaitingHuman {
+		t.Fatalf("job after retried hold = %+v, %v; want awaiting_human", held, err)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("open actions = %+v, %v; want one document_delivery action", actions, err)
+	}
+}
+
+// A job stranded by the pre-atomic hold — resolving, its document_delivery
+// prompt open and its hold marker recorded — is parked by the next pass.
+func TestOfferedDeliveryRecoveryParksAStrandedHold(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("stale gate profile must never submit")
+	}))
+	defer server.Close()
+
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_offered_recovery_stranded", "10.1000/offered-recovery-stranded"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: "stale-profile-digest",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.gate_evaluated", map[string]any{
+		"delivery_request_id": req.ID, "profile_class": "auto_capable",
+		"profile_digest": "stale-profile-digest", "decision": "submit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.OpenHumanAction(ctx, id, job.ActionKindDocumentDelivery, DeliveryReconciliationActionDetail(req), job.Access(false, "")); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.RecordEvent(ctx, id, "delivery.offered_recovery_hold", map[string]any{
+		"delivery_request_id": req.ID, "marker": "stale:" + profile.Digest(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	held, err := jobs.Get(ctx, id)
+	if err != nil || held.State != job.StateAwaitingHuman {
+		t.Fatalf("stranded job after recovery = %+v, %v; want awaiting_human", held, err)
+	}
+	actions, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(actions) != 1 || actions[0].Kind != job.ActionKindDocumentDelivery {
+		t.Fatalf("open actions = %+v, %v; want the one document_delivery action, refreshed", actions, err)
+	}
+}
+
 type preSendFailureRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f preSendFailureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {

@@ -250,7 +250,11 @@ func (r *OfferedDeliveryRecovery) holdForHuman(ctx context.Context, row *job.Row
 			break
 		}
 	}
-	if hasDeliveryAction {
+	// A resolving job under this pass's lease with the action already open was
+	// never parked: an earlier park failed after its action committed. It is
+	// parked now rather than treating the open action or the hold marker as
+	// proof that the hold happened.
+	if hasDeliveryAction && row.State != job.StateResolving {
 		if marker == "ambiguous provider outcome" {
 			return nil
 		}
@@ -280,24 +284,28 @@ func (r *OfferedDeliveryRecovery) holdForHuman(ctx context.Context, row *job.Row
 		}
 		row.State = job.StateResolving
 	}
-	if row.State != job.StateResolving && row.State != job.StateAwaitingHuman {
+	switch row.State {
+	case job.StateResolving:
+		// The prompt and the park commit together: split, a failed
+		// transition strands an open prompt on a job nobody is waiting on.
+		if err := r.svc.Jobs.ParkWithHumanAction(ctx, row.ID, job.StateResolving, job.StateAwaitingHuman,
+			job.ActionKindDocumentDelivery, DeliveryReconciliationActionDetail(request),
+			map[string]any{"reason": "offered_delivery_recovery_hold"}, job.Access(false, "")); err != nil {
+			return err
+		}
+		row.State = job.StateAwaitingHuman
+	case job.StateAwaitingHuman:
+		if _, err := r.svc.Jobs.OpenHumanAction(ctx, row.ID, job.ActionKindDocumentDelivery,
+			DeliveryReconciliationActionDetail(request), job.Access(false, "")); err != nil {
+			return err
+		}
+	default:
 		return nil
 	}
-	if _, err := r.svc.Jobs.OpenHumanAction(ctx, row.ID, job.ActionKindDocumentDelivery,
-		DeliveryReconciliationActionDetail(request), job.Access(false, "")); err != nil {
-		return err
-	}
-	if err := r.svc.Jobs.RecordEvent(ctx, row.ID, "delivery.offered_recovery_hold", map[string]any{
+	return r.svc.Jobs.RecordEvent(ctx, row.ID, "delivery.offered_recovery_hold", map[string]any{
 		"delivery_request_id": request.ID,
 		"marker":              marker,
-	}); err != nil {
-		return err
-	}
-	if row.State == job.StateResolving {
-		return r.svc.Jobs.Transition(ctx, row.ID, row.State, job.StateAwaitingHuman,
-			map[string]any{"reason": "offered_delivery_recovery_hold"})
-	}
-	return nil
+	})
 }
 
 func (r *OfferedDeliveryRecovery) attemptState(ctx context.Context, jobID string, requestID int64) (int, time.Time, error) {
