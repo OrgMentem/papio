@@ -164,6 +164,79 @@ func TestAdapterCapturesPurgeReportsRemovedCount(t *testing.T) {
 	}
 }
 
+func TestAdapterCapturesPurgeRequiresAnExplicitScope(t *testing.T) {
+	var purged []string
+	stub := func(_ context.Context, method string, params, result any) error {
+		if method != "adapter.captures.purge" {
+			t.Fatalf("RPC method = %q, want adapter.captures.purge", method)
+		}
+		purged = append(purged, params.(map[string]string)["host"])
+		*result.(*api.CapturePurgeResult) = api.CapturePurgeResult{Removed: 3}
+		return nil
+	}
+	for _, args := range [][]string{
+		{},
+		{"--host", "  "},
+		{"--all", "--host", "provider.example.com"},
+	} {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+		root.SetArgs(append([]string{"adapter", "captures", "purge"}, args...))
+		if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "--all") {
+			t.Fatalf("purge %v = %v, want a refusal asking for --host or --all", args, err)
+		}
+	}
+	if len(purged) != 0 {
+		t.Fatalf("refused purges reached the daemon with hosts %q", purged)
+	}
+
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"adapter", "captures", "purge", "--all"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("purge --all: %v", err)
+	}
+	if len(purged) != 1 || purged[0] != "" {
+		t.Fatalf("purge --all sent hosts %q, want one every-host purge", purged)
+	}
+}
+
+func TestAdapterCapturesPurgeDryRunCountsWithoutRemoving(t *testing.T) {
+	rows := []captures.Capture{
+		{Host: "provider.example.com", Scenario: "success"},
+		{Host: "Provider.Example.com", Scenario: "paywall"},
+		{Host: "other.example.org", Scenario: "success"},
+	}
+	stub := func(_ context.Context, method string, _ any, result any) error {
+		if method != "adapter.captures.list" {
+			t.Fatalf("dry run called %q; it must never purge", method)
+		}
+		*result.(*[]captures.Capture) = rows
+		return nil
+	}
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{args: []string{"--host", "provider.example.com"}, want: 2},
+		{args: []string{"--all"}, want: 3},
+	} {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+		root.SetArgs(append([]string{"--json", "adapter", "captures", "purge", "--dry-run"}, tc.args...))
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatalf("purge --dry-run %v: %v", tc.args, err)
+		}
+		var preview capturePurgePreview
+		if err := json.Unmarshal(out.Bytes(), &preview); err != nil {
+			t.Fatalf("decode preview: %v (%s)", err, out.String())
+		}
+		if !preview.DryRun || preview.WouldRemove != tc.want {
+			t.Fatalf("purge --dry-run %v = %+v, want dry_run with %d captures", tc.args, preview, tc.want)
+		}
+	}
+}
+
 func TestAdapterDiagnoseRedactsURLsInBothOutputModes(t *testing.T) {
 	for _, jsonOutput := range []bool{false, true} {
 		var out, errOut bytes.Buffer

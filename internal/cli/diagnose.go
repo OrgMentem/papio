@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -71,6 +72,15 @@ type diagnoseEvent struct {
 	Detail string `json:"detail"`
 }
 
+// capturePurgePreview is the `adapter captures purge --dry-run` receipt. The
+// live purge result (api.CapturePurgeResult) is a daemon wire type and stays
+// unwidened; the preview is computed CLI-side from adapter.captures.list.
+type capturePurgePreview struct {
+	DryRun      bool   `json:"dry_run"`
+	Host        string `json:"host,omitempty"`
+	WouldRemove int    `json:"would_remove"`
+}
+
 func newAdapterCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "adapter", Short: "Inspect provider and adapter interactions"}
 	diagnose := &cobra.Command{
@@ -117,11 +127,38 @@ func newAdapterCommand(opt *options) *cobra.Command {
 		},
 	}
 	var host string
+	var all, dryRun bool
 	purge := &cobra.Command{
 		Use:   "purge",
 		Short: "Remove stored diagnostic page captures",
-		Args:  cobra.NoArgs,
+		Long: "Remove stored diagnostic page captures for one host (--host) or for every\n" +
+			"host (--all). One of the two is required: a bare purge is refused.\n\n" +
+			"The removal includes captures pinned as incident evidence (the first\n" +
+			"decisive and latest capture of an open incident) and cannot be undone.\n" +
+			"Run with --dry-run first to see how many captures would be removed.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			host = strings.TrimSpace(host)
+			if all == (host != "") {
+				return errors.New("choose exactly one of --host <host> or --all: purge removes pinned incident evidence too, so its scope must be explicit")
+			}
+			if dryRun {
+				rows := make([]captures.Capture, 0)
+				if err := opt.call(cmd.Context(), "adapter.captures.list", struct{}{}, &rows); err != nil {
+					return err
+				}
+				matched := 0
+				for _, row := range rows {
+					if all || strings.EqualFold(strings.TrimSpace(row.Host), host) {
+						matched++
+					}
+				}
+				result := capturePurgePreview{DryRun: true, Host: host, WouldRemove: matched}
+				if all {
+					return opt.printResult(result, "Would purge %d captures for every host, including pinned incident evidence (dry run: nothing removed)", matched)
+				}
+				return opt.printResult(result, "Would purge %d captures for %s, including pinned incident evidence (dry run: nothing removed)", matched, host)
+			}
 			var result api.CapturePurgeResult
 			if err := opt.call(cmd.Context(), "adapter.captures.purge", map[string]string{"host": host}, &result); err != nil {
 				return err
@@ -130,6 +167,8 @@ func newAdapterCommand(opt *options) *cobra.Command {
 		},
 	}
 	purge.Flags().StringVar(&host, "host", "", "purge captures for one host")
+	purge.Flags().BoolVar(&all, "all", false, "purge captures for every host")
+	purge.Flags().BoolVar(&dryRun, "dry-run", false, "count the captures that would be removed without removing anything")
 	captureCommand.AddCommand(purge)
 	command.AddCommand(diagnose, newAdapterCaptureCommand(opt), captureCommand, newAdapterRepairCommand(opt))
 	return command
