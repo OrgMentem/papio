@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/config"
 	"papio/internal/job"
+	"papio/internal/watch"
 	"papio/internal/work"
 )
 
@@ -118,5 +122,115 @@ func TestExportLedgerIncludeDuplicatesKeepsScopeRows(t *testing.T) {
 	}
 	if len(items) != 2 {
 		t.Fatalf("items = %d, want both scope rows retained", len(items))
+	}
+}
+
+func TestExportOutputRefusesToReplaceAnExistingFileWithoutForce(t *testing.T) {
+	rows := []api.JobRow{exportTestRow("job-1", "10.1371/journal.pone.0262026", "The perils of plurality rule")}
+	stub := func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*api.JobsPageV3) = api.JobsPageV3{Jobs: rows}
+		return nil
+	}
+	path := filepath.Join(t.TempDir(), "refs.bib")
+	const curated = "@article{hand-curated, title = {Keep me}}\n"
+	if err := os.WriteFile(path, []byte(curated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"export", "ledger", "-o", path})
+	if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("export over an existing file = %v, want a refusal naming --force", err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != curated {
+		t.Fatalf("existing file after refusal = %q, %v; want it untouched", got, err)
+	}
+
+	out.Reset()
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"--json", "export", "ledger", "-o", path, "--force"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("export --force: %v", err)
+	}
+	if got, _ := os.ReadFile(path); !strings.Contains(string(got), "doi = {10.1371/journal.pone.0262026}") || strings.Contains(string(got), "hand-curated") {
+		t.Fatalf("file after --force = %q, want the export to replace it", got)
+	}
+	var receipt exportResult
+	if err := json.Unmarshal(out.Bytes(), &receipt); err != nil || !receipt.Replaced {
+		t.Fatalf("--force receipt = %+v, %v; want replaced reported", receipt, err)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(path)); len(entries) != 1 {
+		t.Fatalf("export dir holds %d entries, want only the export (no temp file left)", len(entries))
+	}
+}
+
+func TestExportWatchRefusesAFullDigestPage(t *testing.T) {
+	entries := make([]watch.DigestEntry, watch.DigestLimitMax)
+	for i := range entries {
+		entries[i] = watch.DigestEntry{WorkKey: fmt.Sprintf("doi:10.5555/%d", i), Title: "Pending work", DOI: fmt.Sprintf("10.5555/%d", i)}
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		if method != "watch.digest" {
+			t.Fatalf("method = %q", method)
+		}
+		*result.(*api.WatchDigestResult) = api.WatchDigestResult{WatchID: 7, Entries: entries}
+		return nil
+	})
+	path := filepath.Join(t.TempDir(), "watch.ris")
+	root.SetArgs([]string{"export", "watch", "7", "-o", path})
+	if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "nothing was written") {
+		t.Fatalf("export watch with a full digest page = %v, want a fail-closed refusal", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("export file stat = %v, want no file written", err)
+	}
+
+	// One entry short of the page cap is provably complete and exports.
+	entries = entries[:watch.DigestLimitMax-1]
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*api.WatchDigestResult) = api.WatchDigestResult{WatchID: 7, Entries: entries}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "export", "watch", "7", "-o", path})
+	out.Reset()
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("export watch below the cap: %v", err)
+	}
+	var result exportResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil || result.Records != watch.DigestLimitMax-1 {
+		t.Fatalf("receipt = %+v, %v; want every pending entry exported", result, err)
+	}
+}
+
+func TestExportLedgerRefusesATruncatedPageUnlessSinceIsCovered(t *testing.T) {
+	recent := exportTestRow("job-new", "10.5555/new", "Recent work")
+	recent.CreatedAt = "2026-09-30T00:00:00Z"
+	old := exportTestRow("job-old", "10.5555/old", "Old work")
+	old.CreatedAt = "2026-01-01T00:00:00Z"
+	run := func(rows []api.JobRow, args ...string) (string, error) {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+			*result.(*api.JobsPageV3) = api.JobsPageV3{Jobs: rows, Truncated: true}
+			return nil
+		})
+		path := filepath.Join(t.TempDir(), "ledger.ris")
+		root.SetArgs(append([]string{"export", "ledger", "-o", path}, args...))
+		err := root.ExecuteContext(context.Background())
+		payload, _ := os.ReadFile(path)
+		return string(payload), err
+	}
+
+	if payload, err := run([]api.JobRow{recent, old}); err == nil || payload != "" {
+		t.Fatalf("truncated ledger without --since = %q, %v; want a refusal and no file", payload, err)
+	}
+	// The newest-first page reaches past the cutoff, so every job after it
+	// is present even though the daemon truncated the page.
+	if payload, err := run([]api.JobRow{recent, old}, "--since", "2026-06-01T00:00:00Z"); err != nil || !strings.Contains(payload, "10.5555/new") || strings.Contains(payload, "10.5555/old") {
+		t.Fatalf("truncated ledger covering --since = %q, %v; want the recent work exported", payload, err)
+	}
+	if payload, err := run([]api.JobRow{recent}, "--since", "2026-06-01T00:00:00Z"); err == nil || payload != "" {
+		t.Fatalf("truncated ledger not reaching --since = %q, %v; want a refusal and no file", payload, err)
 	}
 }
