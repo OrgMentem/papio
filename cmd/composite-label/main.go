@@ -315,7 +315,21 @@ func open(path string) error {
 	default:
 		return errors.New("opening files is not wired up for " + runtime.GOOS)
 	}
-	return cmd.Start()
+	_, err := launch(cmd)
+	return err
+}
+
+// launch starts cmd without waiting for it and reaps it in the background.
+// Start alone leaves the exited opener as a zombie for the life of this
+// interactive loop, one per keypress. The returned channel yields the exit
+// result once the child has been reaped.
+func launch(cmd *exec.Cmd) (<-chan error, error) {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	return done, nil
 }
 
 func save(path string, review identitycorpus.CompositeReview) {
