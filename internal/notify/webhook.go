@@ -18,7 +18,17 @@ type HTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-var defaultWebhookClient = &http.Client{Timeout: notificationTimeout}
+// defaultWebhookClient never follows a redirect: a 3xx settles the delivery
+// as failed. Go replays a POST body on 307/308, so following one would let a
+// configured endpoint aim papio's POST at any destination it names —
+// including a loopback or private-network service only this machine can
+// reach — and a hop from https to http would carry the payload in cleartext.
+var defaultWebhookClient = &http.Client{
+	Timeout: notificationTimeout,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 // Webhook sends best-effort notifications to a remote HTTP endpoint.
 type Webhook struct {

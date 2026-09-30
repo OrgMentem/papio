@@ -357,3 +357,27 @@ func TestWebhookSendEventResultCarriesDeliveryKey(t *testing.T) {
 		t.Fatalf("payload = %v, want source and message", payload)
 	}
 }
+
+// A configured endpoint that answers 307 must not steer papio's POST (body
+// replayed) at another destination such as a loopback-only service; the
+// redirect settles the delivery as failed instead.
+func TestWebhookDoesNotFollowRedirects(t *testing.T) {
+	var proxied atomic.Int32
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxied.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer internal.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL+"/admin/action", http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	err := NewWebhook(redirector.URL, "").SendEventResult(context.Background(), Event{Message: "ready"})
+	if err == nil {
+		t.Fatal("redirected delivery = nil, want an error that settles failed")
+	}
+	if got := proxied.Load(); got != 0 {
+		t.Fatalf("redirect target received %d POSTs, want 0", got)
+	}
+}
