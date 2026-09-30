@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"papio/internal/api"
@@ -69,9 +70,11 @@ func TestJobsRefileHumanOutput(t *testing.T) {
 		status string
 		exit   int
 		want   string
+		failed bool
 	}{
 		{name: "success", status: "ok", exit: 0, want: "filed job_filing_01: ok (exit 0, 120ms)\n"},
-		{name: "hook failure", status: "failed", exit: 1, want: "refile failed: job_filing_01: failed (exit 1, 120ms)\n"},
+		{name: "hook failure", status: "failed", exit: 1, want: "refile failed: job_filing_01: failed (exit 1, 120ms)\n", failed: true},
+		{name: "hook timeout", status: "timeout", exit: -1, want: "refile failed: job_filing_01: timeout (exit -1, 120ms)\n", failed: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var out, errOut bytes.Buffer
@@ -88,8 +91,9 @@ func TestJobsRefileHumanOutput(t *testing.T) {
 				return nil
 			})
 			root.SetArgs([]string{"jobs", "refile", "job_filing_01"})
-			if err := root.ExecuteContext(context.Background()); err != nil {
-				t.Fatalf("jobs refile: %v (%s)", err, errOut.String())
+			err := root.ExecuteContext(context.Background())
+			if test.failed != errors.Is(err, errRefileFailed) || (!test.failed && err != nil) {
+				t.Fatalf("jobs refile: err = %v, want hook failure %v (%s)", err, test.failed, errOut.String())
 			}
 			if out.String() != test.want {
 				t.Fatalf("output = %q, want %q", out.String(), test.want)

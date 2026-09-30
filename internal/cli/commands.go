@@ -282,6 +282,10 @@ func truncationNoticeUpTo(opt *options, truncated bool, rows int, noun string, m
 	return err
 }
 
+// errRefileFailed makes `jobs refile` exit nonzero after printing a failed
+// hook run's result, the errDoctorFailed shape.
+var errRefileFailed = errors.New("filing hook failed")
+
 func daemonUpgradeRequired(method string) error {
 	return fmt.Errorf("%s is unavailable because the running daemon predates it; upgrade or restart the daemon from the same installation as this CLI", method)
 }
@@ -646,8 +650,14 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return fmt.Errorf("refile failed: %w", err)
 			}
 			if result.Status != "ok" {
-				return opt.printResult(result, "refile failed: %s: %s (exit %d, %dms)",
-					result.JobID, result.Status, result.ExitCode, result.DurationMS)
+				// The hook ran and failed: a routine outcome the daemon
+				// reports as a result, but the paper is still unfiled, so
+				// the exit status must not say otherwise.
+				if err := opt.printResult(result, "refile failed: %s: %s (exit %d, %dms)",
+					result.JobID, result.Status, result.ExitCode, result.DurationMS); err != nil {
+					return err
+				}
+				return fmt.Errorf("%w: %s: %s", errRefileFailed, result.JobID, result.Status)
 			}
 			return opt.printResult(result, "filed %s: ok (exit %d, %dms)",
 				result.JobID, result.ExitCode, result.DurationMS)
