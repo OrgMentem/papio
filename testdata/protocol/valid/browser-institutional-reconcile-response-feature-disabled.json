@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"institutional_reconcile_response","msg_id":"msg_inst_rec_001","seq":1,"payload":{"request_id":"request_inst_rec_001","outcome":"feature_disabled"}}

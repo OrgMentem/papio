@@ -2171,87 +2171,138 @@ func TestInstitutionalNavigatedLegacyDecoderIsExplicitAndPaired(t *testing.T) {
 	}
 }
 
+// expectDecodeError asserts that raw is rejected for the named reason, so a
+// negative case cannot pass because an unrelated required field is missing.
+func expectDecodeError(t *testing.T, raw []byte, want string) {
+	t.Helper()
+	_, err := DecodeBrowserMessage(raw)
+	if err == nil {
+		t.Fatalf("frame accepted; want error containing %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %v; want it to contain %q", err, want)
+	}
+}
+
+// institutionalFrame builds a browser frame; jobID "" omits job_id.
+func institutionalFrame(t *testing.T, typ, jobID string, payload any) []byte {
+	t.Helper()
+	env := map[string]any{"protocol": BrowserProtocolVersion, "type": typ, "msg_id": "msg_inst_004", "seq": 4, "payload": payload}
+	if jobID != "" {
+		env["job_id"] = jobID
+	}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// withFields returns a copy of base with each key set, or removed when the
+// value is nil.
+func withFields(base map[string]any, kv ...any) map[string]any {
+	out := make(map[string]any, len(base))
+	for k, v := range base {
+		out[k] = v
+	}
+	for i := 0; i < len(kv); i += 2 {
+		if kv[i+1] == nil {
+			delete(out, kv[i].(string))
+		} else {
+			out[kv[i].(string)] = kv[i+1]
+		}
+	}
+	return out
+}
+
 func TestInstitutionalMaterializationBoundsAndScope(t *testing.T) {
-	raw, _ := json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalClaimRequest, "msg_id": "msg_inst_004", "seq": 4, "payload": map[string]any{"candidate_id": "cand_001", "materialization_kind": "browser_tab"}})
-	if _, err := DecodeBrowserMessage(raw); err == nil {
-		t.Fatal("job-scoped institutional request without job_id accepted")
+	claim := map[string]any{"request_id": "req_inst_004", "candidate_id": "cand_001", "materialization_kind": "browser_tab"}
+	bind := map[string]any{"request_id": "req_inst_006", "claim_id": "claim_001", "binding_id": "bind_001", "tab_id": MaxBrowserInteger}
+	navigated := map[string]any{
+		"request_id": "req_inst_009", "claim_id": "claim_001", "binding_id": "bind_001",
+		"route_issuance_ordinal": 1, "effect_ordinal": 1, "institutional_request_id": "inst_req_001", "tab_id": 0,
 	}
-	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalReconcileRequest, "msg_id": "msg_inst_005", "seq": 5, "payload": map[string]any{"bindings": make([]any, 33)}})
-	if _, err := DecodeBrowserMessage(raw); err == nil {
-		t.Fatal("oversized reconcile bindings accepted")
+	bindings := func(n int) []any {
+		out := make([]any, n)
+		for i := range out {
+			out[i] = map[string]any{"binding_id": fmt.Sprintf("bind_%04d", i), "tab_id": i}
+		}
+		return out
 	}
-	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalBindRequest, "msg_id": "msg_inst_006", "seq": 6, "job_id": "job_inst_001", "payload": map[string]any{"claim_id": "claim_001", "binding_id": "bind_001", "tab_id": MaxBrowserInteger + 1}})
-	if _, err := DecodeBrowserMessage(raw); err == nil {
-		t.Fatal("oversized tab id accepted")
+	reconcile := map[string]any{"request_id": "req_inst_005", "bindings": bindings(32)}
+
+	// Every base is accepted, so each rejection below is caused by its one mutation.
+	for name, raw := range map[string][]byte{
+		"claim":     institutionalFrame(t, MsgInstitutionalClaimRequest, "job_inst_001", claim),
+		"bind":      institutionalFrame(t, MsgInstitutionalBindRequest, "job_inst_001", bind),
+		"navigated": institutionalFrame(t, MsgInstitutionalNavigatedRequest, "job_inst_001", navigated),
+		"reconcile": institutionalFrame(t, MsgInstitutionalReconcileRequest, "", reconcile),
+	} {
+		if _, err := DecodeBrowserMessage(raw); err != nil {
+			t.Fatalf("valid %s base rejected: %v", name, err)
+		}
 	}
-	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalBindRequest, "msg_id": "msg_inst_008", "seq": 8, "job_id": "job_inst_001", "payload": map[string]any{"claim_id": "claim_001", "binding_id": "bind_001", "tab_id": -1}})
-	if _, err := DecodeBrowserMessage(raw); err == nil {
-		t.Fatal("negative tab id accepted")
+
+	cases := []struct {
+		name string
+		raw  []byte
+		want string
+	}{
+		{"job-scoped request without job_id", institutionalFrame(t, MsgInstitutionalClaimRequest, "", claim), "requires a valid job_id"},
+		{"oversized reconcile bindings", institutionalFrame(t, MsgInstitutionalReconcileRequest, "", withFields(reconcile, "bindings", bindings(33))), "bindings capped at 32"},
+		{"oversized tab id", institutionalFrame(t, MsgInstitutionalBindRequest, "job_inst_001", withFields(bind, "tab_id", MaxBrowserInteger+1)), "institutional_bind_request.tab_id must be in range"},
+		{"negative tab id", institutionalFrame(t, MsgInstitutionalBindRequest, "job_inst_001", withFields(bind, "tab_id", -1)), "institutional_bind_request.tab_id must be in range"},
+		{"negative navigated tab id", institutionalFrame(t, MsgInstitutionalNavigatedRequest, "job_inst_001", withFields(navigated, "tab_id", -1)), "institutional_navigated_request.tab_id must be in range"},
+		{"negative reconcile tab id", institutionalFrame(t, MsgInstitutionalReconcileRequest, "", withFields(reconcile, "bindings", []any{map[string]any{"binding_id": "bind_001", "tab_id": -1}})), "institutional_reconcile_request.tab_id must be in range"},
+		{"session-scoped reconcile with job_id", institutionalFrame(t, MsgInstitutionalReconcileRequest, "job_inst_001", reconcile), "must not carry job_id"},
 	}
-	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalNavigatedRequest, "msg_id": "msg_inst_009", "seq": 9, "job_id": "job_inst_001", "payload": map[string]any{"claim_id": "claim_001", "binding_id": "bind_001", "route_issuance_ordinal": 1, "tab_id": -1}})
-	if _, err := DecodeBrowserMessage(raw); err == nil {
-		t.Fatal("negative navigated tab id accepted")
-	}
-	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalReconcileRequest, "msg_id": "msg_inst_010", "seq": 10, "payload": map[string]any{"bindings": []any{map[string]any{"binding_id": "bind_001", "tab_id": -1}}}})
-	if _, err := DecodeBrowserMessage(raw); err == nil {
-		t.Fatal("negative reconcile tab id accepted")
-	}
-	raw, _ = json.Marshal(map[string]any{"protocol": BrowserProtocolVersion, "type": MsgInstitutionalReconcileRequest, "msg_id": "msg_inst_007", "seq": 7, "job_id": "job_inst_001", "payload": map[string]any{"bindings": []any{}}})
-	if _, err := DecodeBrowserMessage(raw); err == nil {
-		t.Fatal("session-scoped reconcile with job_id accepted")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectDecodeError(t, tc.raw, tc.want)
+		})
 	}
 }
 
 func TestInstitutionalMaterializationClosedOutcomesAndOpaqueIDs(t *testing.T) {
-	frame := func(typ, jobID string, payload map[string]any) []byte {
-		t.Helper()
-		env := map[string]any{
-			"protocol": BrowserProtocolVersion,
-			"type":     typ,
-			"msg_id":   "msg_inst_011",
-			"seq":      11,
-			"payload":  payload,
-		}
-		if jobID != "" {
-			env["job_id"] = jobID
-		}
-		raw, err := json.Marshal(env)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return raw
-	}
-
 	t.Run("cross-family outcomes are rejected", func(t *testing.T) {
 		cases := []struct {
-			name, typ, jobID, outcome string
+			name, typ, what, jobID, outcome string
 		}{
-			{"claim rejects issued", MsgInstitutionalClaimResponse, "job_inst_001", "issued"},
-			{"bind rejects claimed", MsgInstitutionalBindResponse, "job_inst_001", "claimed"},
-			{"route rejects acknowledged", MsgInstitutionalRouteResponse, "job_inst_001", "acknowledged"},
-			{"navigated rejects bound", MsgInstitutionalNavigatedResponse, "job_inst_001", "bound"},
-			{"reconcile rejects busy", MsgInstitutionalReconcileResponse, "", "busy"},
+			{"claim rejects issued", MsgInstitutionalClaimResponse, "institutional_claim_response", "job_inst_001", "issued"},
+			{"bind rejects claimed", MsgInstitutionalBindResponse, "institutional_bind_response", "job_inst_001", "claimed"},
+			{"route rejects acknowledged", MsgInstitutionalRouteResponse, "institutional_route_response", "job_inst_001", "acknowledged"},
+			{"navigated rejects bound", MsgInstitutionalNavigatedResponse, "institutional_navigated_response", "job_inst_001", "bound"},
+			{"reconcile rejects busy", MsgInstitutionalReconcileResponse, "institutional_reconcile_response", "", "busy"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				if _, err := DecodeBrowserMessage(frame(tc.typ, tc.jobID, map[string]any{"outcome": tc.outcome})); err == nil {
-					t.Fatalf("accepted outcome %q for %s", tc.outcome, tc.typ)
+				// "error" is legal for every family, so the same frame with
+				// only the outcome changed is the accepted control.
+				payload := map[string]any{"request_id": "req_inst_011", "outcome": "error"}
+				if _, err := DecodeBrowserMessage(institutionalFrame(t, tc.typ, tc.jobID, payload)); err != nil {
+					t.Fatalf("control outcome rejected: %v", err)
 				}
+				expectDecodeError(t, institutionalFrame(t, tc.typ, tc.jobID, withFields(payload, "outcome", tc.outcome)),
+					fmt.Sprintf("invalid %s.outcome %q", tc.what, tc.outcome))
 			})
 		}
 	})
 
 	t.Run("opaque IDs require at least eight characters", func(t *testing.T) {
-		if _, err := DecodeBrowserMessage(frame(MsgInstitutionalClaimRequest, "job_inst_001", map[string]any{
-			"candidate_id": "short", "materialization_kind": "browser_tab",
-		})); err == nil {
-			t.Fatal("short candidate_id accepted")
+		claim := map[string]any{"request_id": "req_inst_012", "candidate_id": "cand_001", "materialization_kind": "browser_tab"}
+		bind := map[string]any{"request_id": "req_inst_013", "claim_id": "claim_001", "binding_id": "binding_01", "tab_id": 1}
+		for name, raw := range map[string][]byte{
+			"claim": institutionalFrame(t, MsgInstitutionalClaimRequest, "job_inst_001", claim),
+			"bind":  institutionalFrame(t, MsgInstitutionalBindRequest, "job_inst_001", bind),
+		} {
+			if _, err := DecodeBrowserMessage(raw); err != nil {
+				t.Fatalf("valid %s base rejected: %v", name, err)
+			}
 		}
-		if _, err := DecodeBrowserMessage(frame(MsgInstitutionalBindRequest, "job_inst_001", map[string]any{
-			"claim_id": "short", "binding_id": "binding_01", "tab_id": 1,
-		})); err == nil {
-			t.Fatal("short claim_id accepted")
-		}
+		expectDecodeError(t, institutionalFrame(t, MsgInstitutionalClaimRequest, "job_inst_001", withFields(claim, "candidate_id", "short")),
+			"institutional_claim_request.candidate_id must be a bounded opaque ID")
+		expectDecodeError(t, institutionalFrame(t, MsgInstitutionalBindRequest, "job_inst_001", withFields(bind, "claim_id", "short")),
+			"institutional_bind_request.claim_id must be a bounded opaque ID")
 	})
 
 	t.Run("success outcomes forbid detail", func(t *testing.T) {
@@ -2260,49 +2311,113 @@ func TestInstitutionalMaterializationClosedOutcomesAndOpaqueIDs(t *testing.T) {
 			payload          map[string]any
 		}{
 			{"claim", MsgInstitutionalClaimResponse, "job_inst_001", map[string]any{
-				"outcome": "claimed", "candidate_id": "cand_001", "claim_id": "claim_001",
-				"binding_id": "bind_001", "browser_holder_generation": 0,
-				"lease_until": "2026-08-11T12:00:00Z", "detail": "forbidden",
+				"request_id": "req_inst_014", "outcome": "claimed", "candidate_id": "cand_001", "claim_id": "claim_001",
+				"binding_id": "bind_001", "browser_holder_generation": 0, "lease_until": "2026-08-11T12:00:00Z",
 			}},
 			{"bind", MsgInstitutionalBindResponse, "job_inst_001", map[string]any{
-				"outcome": "bound", "claim_id": "claim_001", "binding_id": "bind_001", "detail": "forbidden",
+				"request_id": "req_inst_015", "outcome": "bound", "claim_id": "claim_001", "binding_id": "bind_001",
 			}},
 			{"route", MsgInstitutionalRouteResponse, "job_inst_001", map[string]any{
-				"outcome": "issued", "claim_id": "claim_001", "binding_id": "bind_001",
-				"route_issuance_ordinal": 1, "url": "https://resolver.example/route", "detail": "forbidden",
+				"request_id": "req_inst_016", "outcome": "issued", "claim_id": "claim_001", "binding_id": "bind_001",
+				"route_issuance_ordinal": 1, "effect_ordinal": 1, "institutional_request_id": "inst_req_001",
+				"url": "https://resolver.example/route",
 			}},
 			{"navigated", MsgInstitutionalNavigatedResponse, "job_inst_001", map[string]any{
-				"outcome": "acknowledged", "claim_id": "claim_001", "binding_id": "bind_001", "detail": "forbidden",
+				"request_id": "req_inst_017", "outcome": "acknowledged", "claim_id": "claim_001", "binding_id": "bind_001",
 			}},
 			{"reconcile", MsgInstitutionalReconcileResponse, "", map[string]any{
-				"outcome": "reconciled", "detail": "forbidden",
+				"request_id": "req_inst_018", "outcome": "reconciled",
+				"claims": []any{map[string]any{"claim_id": "claim_001", "binding_id": "bind_001", "candidate_id": "cand_001", "phase": "bound", "tab_id": 7}},
 			}},
 		}
 		for _, tc := range successes {
 			t.Run(tc.name, func(t *testing.T) {
-				if _, err := DecodeBrowserMessage(frame(tc.typ, tc.jobID, tc.payload)); err == nil {
-					t.Fatalf("%s success with detail accepted", tc.name)
+				if _, err := DecodeBrowserMessage(institutionalFrame(t, tc.typ, tc.jobID, tc.payload)); err != nil {
+					t.Fatalf("%s success without detail rejected: %v", tc.name, err)
 				}
+				expectDecodeError(t, institutionalFrame(t, tc.typ, tc.jobID, withFields(tc.payload, "detail", "forbidden")),
+					"must not carry detail")
 			})
 		}
 	})
 }
 
+func TestInstitutionalReconcileResponseDecodesClaimsAndBounds(t *testing.T) {
+	claim := func(i int) map[string]any {
+		return map[string]any{
+			"claim_id": fmt.Sprintf("claim_%04d", i), "binding_id": fmt.Sprintf("bind_%04d", i),
+			"candidate_id": fmt.Sprintf("cand_%04d", i), "phase": "navigated", "tab_id": i,
+		}
+	}
+	claims := func(n int) []any {
+		out := make([]any, n)
+		for i := range out {
+			out[i] = claim(i)
+		}
+		return out
+	}
+	reconciled := map[string]any{"request_id": "req_inst_020", "outcome": "reconciled", "claims": claims(32)}
+	frame := func(payload map[string]any) []byte {
+		return institutionalFrame(t, MsgInstitutionalReconcileResponse, "", payload)
+	}
+
+	msg, err := DecodeBrowserMessage(frame(reconciled))
+	if err != nil {
+		t.Fatalf("32-claim reconciled response rejected: %v", err)
+	}
+	got, ok := msg.Payload.(*InstitutionalReconcileResponsePayload)
+	if !ok || got.RequestID != "req_inst_020" || got.Outcome != "reconciled" || len(got.Claims) != 32 {
+		t.Fatalf("decoded payload = %#v", msg.Payload)
+	}
+	last := got.Claims[31]
+	if last.ClaimID != "claim_0031" || last.BindingID != "bind_0031" || last.CandidateID != "cand_0031" ||
+		last.Phase != "navigated" || last.TabID == nil || *last.TabID != 31 {
+		t.Fatalf("decoded claim = %#v", last)
+	}
+	tabless := withFields(claim(0), "tab_id", nil, "phase", "claimed")
+	msg, err = DecodeBrowserMessage(frame(withFields(reconciled, "claims", []any{tabless})))
+	if err != nil {
+		t.Fatalf("claim without tab_id rejected: %v", err)
+	}
+	if c := msg.Payload.(*InstitutionalReconcileResponsePayload).Claims[0]; c.TabID != nil || c.Phase != "claimed" {
+		t.Fatalf("decoded tab-less claim = %#v", c)
+	}
+	for _, outcome := range []string{"feature_disabled", "error"} {
+		msg, err := DecodeBrowserMessage(frame(map[string]any{"request_id": "req_inst_021", "outcome": outcome, "detail": "not now"}))
+		if err != nil {
+			t.Fatalf("%s response rejected: %v", outcome, err)
+		}
+		if p := msg.Payload.(*InstitutionalReconcileResponsePayload); p.Outcome != outcome || p.Detail != "not now" || p.Claims != nil {
+			t.Fatalf("decoded %s payload = %#v", outcome, p)
+		}
+	}
+
+	cases := []struct {
+		name    string
+		payload map[string]any
+		want    string
+	}{
+		{"33 claims", withFields(reconciled, "claims", claims(33)), "claims capped at 32"},
+		{"unknown phase", withFields(reconciled, "claims", []any{withFields(claim(0), "phase", "opened")}), `invalid institutional_reconcile_response.phase "opened"`},
+		{"negative tab id", withFields(reconciled, "claims", []any{withFields(claim(0), "tab_id", -1)}), "institutional_reconcile_response.tab_id must be in range"},
+		{"oversized tab id", withFields(reconciled, "claims", []any{withFields(claim(0), "tab_id", MaxBrowserInteger+1)}), "institutional_reconcile_response.tab_id must be in range"},
+		{"short claim id", withFields(reconciled, "claims", []any{withFields(claim(0), "claim_id", "short")}), "institutional_reconcile_response.claim_id must be a bounded opaque ID"},
+		{"claims on error", withFields(reconciled, "outcome", "error", "claims", claims(1)), "institutional_reconcile_response.error forbids claims"},
+		{"claims on feature_disabled", withFields(reconciled, "outcome", "feature_disabled", "claims", claims(1)), "institutional_reconcile_response.feature_disabled forbids claims"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectDecodeError(t, frame(tc.payload), tc.want)
+		})
+	}
+}
+
 func TestInstitutionalCandidateOfferRoundTripScopeAndBounds(t *testing.T) {
+	// frame omits job_id when jobID is "", so the missing-scope case tests an
+	// absent job_id rather than an explicit empty one.
 	frame := func(jobID string, payload map[string]any) []byte {
 		t.Helper()
-		raw, err := json.Marshal(map[string]any{
-			"protocol": BrowserProtocolVersion,
-			"type":     MsgInstitutionalCandidateOffer,
-			"msg_id":   "candidate-offer-001",
-			"seq":      1,
-			"job_id":   jobID,
-			"payload":  payload,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return raw
+		return institutionalFrame(t, MsgInstitutionalCandidateOffer, jobID, payload)
 	}
 	valid := map[string]any{
 		"candidate_id":         "candidate-001",
@@ -2339,46 +2454,32 @@ func TestInstitutionalCandidateOfferRoundTripScopeAndBounds(t *testing.T) {
 		t.Fatalf("round-trip rejected: %v", err)
 	}
 
-	t.Run("missing job scope", func(t *testing.T) {
-		if _, err := DecodeBrowserMessage(frame("", valid)); err == nil {
-			t.Fatal("candidate offer without job_id accepted")
-		}
-	})
-	t.Run("unknown URL field", func(t *testing.T) {
-		withURL := map[string]any{"candidate_id": "candidate-001", "materialization_kind": "browser_tab", "expires_at": valid["expires_at"], "url": "https://resolver.example"}
-		if _, err := DecodeBrowserMessage(frame("job-inst-001", withURL)); err == nil {
-			t.Fatal("candidate offer carrying URL accepted")
-		}
-	})
-	t.Run("invalid kind", func(t *testing.T) {
-		invalid := map[string]any{"candidate_id": "candidate-001", "materialization_kind": "direct_download", "expires_at": valid["expires_at"]}
-		if _, err := DecodeBrowserMessage(frame("job-inst-001", invalid)); err == nil {
-			t.Fatal("direct_download candidate offer accepted")
-		}
-	})
-	t.Run("invalid expiry", func(t *testing.T) {
-		invalid := map[string]any{"candidate_id": "candidate-001", "materialization_kind": "browser_tab", "expires_at": "not-a-time"}
-		if _, err := DecodeBrowserMessage(frame("job-inst-001", invalid)); err == nil {
-			t.Fatal("invalid expiry accepted")
-		}
-	})
-	t.Run("candidate ID bounds", func(t *testing.T) {
-		for _, candidateID := range []string{"short", strings.Repeat("x", 129)} {
-			invalid := map[string]any{"candidate_id": candidateID, "materialization_kind": "browser_tab", "expires_at": valid["expires_at"]}
-			if _, err := DecodeBrowserMessage(frame("job-inst-001", invalid)); err == nil {
-				t.Fatalf("candidate ID length %d accepted", len(candidateID))
-			}
-		}
-	})
-	t.Run("frame size cap", func(t *testing.T) {
-		oversized := frame("job-inst-001", map[string]any{
-			"candidate_id": "candidate-001", "materialization_kind": "browser_tab",
-			"expires_at": valid["expires_at"], "extra": strings.Repeat("x", MaxBrowserMessageBytes),
+	// Each negative case mutates exactly one field of the accepted offer above,
+	// so it reaches the check it names instead of failing on a missing
+	// required field such as provider_hosts.
+	cases := []struct {
+		name  string
+		jobID string
+		raw   map[string]any
+		want  string
+	}{
+		{"missing job scope", "", valid, "requires a valid job_id"},
+		{"missing provider_hosts", "job-inst-001", withFields(valid, "provider_hosts", nil), `field "provider_hosts" is required`},
+		{"unknown URL field", "job-inst-001", withFields(valid, "url", "https://resolver.example"), `unknown field "url"`},
+		{"invalid kind", "job-inst-001", withFields(valid, "materialization_kind", "direct_download"), "institutional_candidate_offer.materialization_kind"},
+		{"invalid expiry", "job-inst-001", withFields(valid, "expires_at", "not-a-time"), "institutional_candidate_offer.expires_at must be RFC3339"},
+		{"short candidate ID", "job-inst-001", withFields(valid, "candidate_id", "short"), "institutional_candidate_offer.candidate_id must be a bounded opaque ID"},
+		{"long candidate ID", "job-inst-001", withFields(valid, "candidate_id", strings.Repeat("x", 129)), "institutional_candidate_offer.candidate_id must be a bounded opaque ID"},
+		{"frame size cap", "job-inst-001", withFields(valid, "extra", strings.Repeat("x", MaxBrowserMessageBytes)), "exceeds cap"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectDecodeError(t, frame(tc.jobID, tc.raw), tc.want)
 		})
-		if _, err := DecodeBrowserMessage(oversized); err == nil {
-			t.Fatal("oversized candidate offer accepted")
-		}
-	})
+	}
+	if _, err := DecodeBrowserMessage(frame("job-inst-001", withFields(valid, "candidate_id", strings.Repeat("x", 128)))); err != nil {
+		t.Fatalf("128-char candidate ID rejected: %v", err)
+	}
 }
 func TestEffectPermitReconcilePayloadsRoundTripAndValidation(t *testing.T) {
 	ordinal := int64(4)
