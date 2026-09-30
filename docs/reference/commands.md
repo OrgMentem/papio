@@ -159,6 +159,18 @@ papio actions open [flags]
 
 Accept or reject a parked identity or unsafe-PDF review
 
+Accept or reject a parked identity or unsafe-PDF review.
+
+The verdict applies only to the review you inspected. --revision is
+required for both verdicts, and --accept also needs --sha256, the
+quarantined file's digest; take both from `papio actions list --json`
+(revision, quarantine_sha256). If the action or its file changed since
+you listed it, nothing is applied and the command exits nonzero: list
+the action again and re-inspect the file before deciding.
+
+--reject cancels the job for an identity review; for an unsafe PDF it
+sends the job back to awaiting_human for a manual download.
+
 ```
 papio actions resolve <action-id> [flags]
 ```
@@ -167,6 +179,8 @@ papio actions resolve <action-id> [flags]
 | --- | --- | --- | --- |
 | `--accept` | `bool` | `false` | accept the identity review |
 | `--reject` | `bool` | `false` | reject the identity review |
+| `--revision` | `int64` | `0` | revision the action had when you listed it |
+| `--sha256` | `string` |  | quarantine_sha256 of the file you inspected (required with --accept) |
 
 ### `papio actions retry-publisher`
 
@@ -199,6 +213,7 @@ papio activity [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--before-seq` | `int64` | `0` | show only events older than this sequence number (the seq of the last row of the previous page); 0 starts at the newest |
 | `--job` | `string` |  | filter activity to one job ID |
 | `--limit` | `int` | `30` | maximum activity rows (1-200) |
 
@@ -236,12 +251,21 @@ papio adapter captures
 
 Remove stored diagnostic page captures
 
+Remove stored diagnostic page captures for one host (--host) or for every
+host (--all). One of the two is required: a bare purge is refused.
+
+The removal includes captures pinned as incident evidence (the first
+decisive and latest capture of an open incident) and cannot be undone.
+Run with --dry-run first to see how many captures would be removed.
+
 ```
 papio adapter captures purge [flags]
 ```
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--all` | `bool` | `false` | purge captures for every host |
+| `--dry-run` | `bool` | `false` | count the captures that would be removed without removing anything |
 | `--host` | `string` |  | purge captures for one host |
 
 ### `papio adapter diagnose`
@@ -505,11 +529,17 @@ papio config credentials bind TARGET REFERENCE
 
 #### `papio config credentials delete`
 
-Delete a stored record without changing configurations that reference it
+Delete a stored record without changing configurations that reference it (requires --yes)
+
+Delete one stored credential record. Deletion cannot be undone, and a record can be shared: another configuration bound to it keeps a reference that no longer resolves, and its integration fails after the next restart. Papio cannot see other configurations. It refuses to delete a record this configuration binds (detach it first), and without --yes it only describes the deletion and exits nonzero.
 
 ```
-papio config credentials delete REFERENCE
+papio config credentials delete REFERENCE [flags]
 ```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--yes` | `bool` | `false` | delete the record; without it the command only describes the deletion |
 
 #### `papio config credentials detach`
 
@@ -652,11 +682,26 @@ papio delivery resume <request-id>
 
 ### `papio delivery submit`
 
-Run the document-delivery Branch/gate decision for a job
+Route a job to document delivery; may place a real ILL request with the provider (requires --confirm)
+
+Route a job to document delivery.
+
+This runs the document-delivery Branch/gate decision and acts on it. When
+the institution's gate allows automatic submission, papio places a real
+request with the provider — which can count against a request allowance
+or cost the institution money, and which papio cannot cancel through the
+provider. Otherwise it opens a prefill or reconciliation action.
+
+Without --confirm nothing is submitted: the command shows the job's
+recorded delivery request and compiled gate, if any, and exits nonzero.
 
 ```
-papio delivery submit <job-id>
+papio delivery submit <job-id> [flags]
 ```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--confirm` | `bool` | `false` | run the gate and, when it allows, place the provider request |
 
 ## `papio doctor`
 
@@ -714,6 +759,7 @@ papio export
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--force` | `bool` | `false` | replace the -o file when it already exists (without it, an existing file is refused) |
 | `--format` | `string` |  | citation format: csl-json, ris, or bibtex (default csl-json, inferred from -o's extension) |
 | `--include-duplicates` | `bool` | `false` | keep records whose canonical identity repeats instead of collapsing them |
 | `-o, --output` | `string` |  | write citations to this file instead of stdout (required with --json) |
@@ -789,12 +835,16 @@ unbind command, this listing — the rule version, how many candidates were on
 the table, and the evidence that made one of them the winner — is the only
 way to check an automatic filing after the fact.
 
+One page holds at most 200 binds. When more exist, the listing ends with the
+command for the next page: --before with the last grab id shown.
+
 ```
 papio grabs binds [flags]
 ```
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--before` | `string` |  | list only binds older than this grab id (the last grab of the previous page) |
 | `--limit` | `int` | `50` | maximum autonomous binds to list (default 50, max 200) |
 
 ### `papio grabs confirm`
@@ -820,6 +870,14 @@ papio grabs confirm <grab-id> [flags]
 ### `papio grabs identify`
 
 Bind an operator-supplied identifier to a captured PDF grab
+
+Bind an operator-supplied identifier to a captured PDF grab that parked
+without one, creating or joining the job for that work.
+
+When a ready job already holds the identifier, the outcome is already_owned
+and the capture is kept, still parked: nothing checks the typed identifier
+against the file, so it may be a different paper or version. Discard it
+with `papio inbox decide pdf_grab:<grab-id> --op dismiss --delete-grab`.
 
 ```
 papio grabs identify <grab-id> [flags]
@@ -877,12 +935,23 @@ papio inbox counts
 
 Acquire or dismiss one triage inbox item
 
+Acquire or dismiss one triage inbox item.
+
+Dismissing a captured PDF grab (an item id starting with "pdf_grab:")
+permanently deletes the captured file and its grab record; `papio grabs
+suggest` and `papio grabs identify` cannot recover it afterwards. That
+dismissal is refused unless --delete-grab confirms it.
+
+A decision that did not apply (conflict or invalid) exits nonzero after
+printing its outcome.
+
 ```
 papio inbox decide <item-id> [flags]
 ```
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--delete-grab` | `bool` | `false` | confirm that dismissing a captured PDF grab permanently deletes its file |
 | `--op` | `string` |  | acquire or dismiss |
 | `--watch-scope` | `string` | `all` | for dismiss: all, or a comma-separated list of watch IDs |
 
@@ -1307,6 +1376,13 @@ Add a scheduled discovery watch
 
 Add a scheduled discovery watch. Backfill watches take no query. Alert-mode discovery watches report new works without acquiring them.
 
+By default (--mode acquire, --cadence daily) a discovery watch runs on its
+own schedule and submits up to --limit-per-run new works each run, and
+every job it submits asks for automatic Zotero import once it is ready,
+whatever zotio.auto_import says (zotio.auto_import_paused still pauses
+it). Use --mode alert to only report new works to the watch digest and
+acquire them on demand.
+
 ```
 papio watch add [query] [flags]
 ```
@@ -1342,9 +1418,20 @@ papio watch digest <id> [flags]
 
 Clear pending works from an alert watch digest
 
+Discard every pending work in an alert watch digest, including works
+`papio watch digest` did not show (it lists 100 by default). A cleared work
+is never reported again. Clearing requires --all; --dry-run counts the
+pending works without clearing them. To discard single works instead,
+use `papio inbox decide <item-id> --op dismiss`.
+
 ```
-papio watch digest clear <id>
+papio watch digest clear <id> [flags]
 ```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--all` | `bool` | `false` | confirm clearing every pending work, including works the digest view did not show |
+| `--dry-run` | `bool` | `false` | count the pending works without clearing them |
 
 ### `papio watch list`
 
@@ -1358,9 +1445,18 @@ papio watch list
 
 Remove a scheduled discovery watch
 
+Remove a scheduled discovery watch. Jobs and Zotero items earlier runs
+created stay. The watch's digest is deleted with it, so removing a watch
+that still has pending (unreviewed) digest works is refused unless
+--discard-digest confirms that those works are discarded too.
+
 ```
-papio watch remove <id>
+papio watch remove <id> [flags]
 ```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--discard-digest` | `bool` | `false` | remove the watch even though pending digest works are deleted with it |
 
 ### `papio watch resume`
 

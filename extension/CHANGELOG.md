@@ -164,6 +164,23 @@ for the full pre-split extension history.
   from the sign-in. It reports a return only once per tab, so your real return
   was not reported. The extension now reports a return only after the tab has
   shown a sign-in page.
+- A DOI read from page text or a bibliographic meta tag now stops at `&` and
+  `=`, so a download link printed on the page can no longer add its query
+  token to the job's identifier.
+- When the native bridge fails to take an automatic page capture, the capture
+  no longer uses up that day's or that page shape's capture budget.
+- An adapter's allowed download path now matches only whole path segments, so
+  `/pdf` no longer admits a sibling path such as `/pdf-preview/…`.
+- Adapter text rules now match regardless of letter case, so the page
+  classification agrees with the readiness wait.
+- The in-page loss toast now ignores clicks that the host page's own script
+  generates. Only a real click or key press takes or dismisses the offer.
+- A stale loss-toast window no longer cancels the current offer, and a toast
+  window that is still loading is closed when a new toast replaces it.
+- Diagnostic page captures now remove query strings from links printed in page
+  text or plain attributes, from any URL-valued `<meta>` (including
+  `og:url`/`og:image`), and from `<meta http-equiv="refresh">` targets, and
+  the privacy check refuses a capture where one survives.
 
 ## [0.15.0] - 2026-09-23
 

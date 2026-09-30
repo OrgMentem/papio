@@ -77,6 +77,8 @@ execution records kept during the initial build.
   `native_viewer_download_v1`, and sends the message only when it sees that
   feature. The handshake still lists 32 features. An older extension sees no
   change, and a daemon older than this one never receives the message.
+- `papio activity --before-seq <seq>` pages back past the newest 200 events; a
+  truncated text page prints the command for the next page.
 
 ### Changed
 - **A new paper reaches its Zotero collection, with its DOI and abstract,
@@ -106,6 +108,8 @@ execution records kept during the initial build.
   collection in the same pass, and files it after the import as before. A
   `linked-file` import does not change: it goes through the Web API, which
   has the paper at once.
+- `papio watch add --help` now states the defaults: an acquire-mode watch runs
+  daily, submits up to the per-run cap, and auto-imports into Zotero.
 
 ### Removed
 - **The experimental macOS helper that saved a PDF from Firefox's viewer.**
@@ -450,6 +454,180 @@ execution records kept during the initial build.
   job. It waits until zotio shows the item, then attaches the PDF to it and
   files it after the import. If zotio shows more than one item for the paper,
   the import stops and asks you to delete the extra items in Zotero.
+- The daemon now rejects a `session_evidence` browser frame that carries an
+  explicit empty `origin_hint`. This matches the extension parser and the
+  published `papio-browser/1` schema, which already rejected it.
+- OpenURL resolver bases (and other https bases validated the same way) that
+  contain a `#` fragment or userinfo are now rejected at config load. Before,
+  a fragment silently swallowed the OpenURL query, so the resolver got no
+  citation.
+- Discovery requests that follow provider redirects now count every redirected
+  request against the source's budget and pacing, not only the first.
+- `papio doctor` no longer passes `pdf_worker` when the worker has an execute
+  bit that does not apply to the current user (for example a root-owned 0700
+  binary); it now asks the OS whether this user may execute it.
+- `papio doctor` no longer warns that the adoption root is outside the
+  download folder when its parent differs from the download folder only by
+  letter case on a case-insensitive filesystem (Windows, default macOS).
+- Retraction scanning of a file-based library source now refuses an export
+  larger than 32 MiB, like holdings lookups do, instead of reading it without
+  bound.
+- A bundle export that fails while it records the export no longer deletes the
+  PDF that the restored bundle.json still points to.
+- A failed capture pin update no longer drops the previous latest evidence
+  capture for an incident, and a failed pending-index write during startup
+  reconcile no longer leaves pins that the orphan sweep then deletes.
+- A job claim whose follow-up read fails now releases its lease at once,
+  instead of blocking the job until the lease expires.
+- `papio jobs cancel --json` now reports `cancelled: false` for a job that had
+  already finished, instead of claiming it was cancelled.
+- `papio jobs failures --json` again receives the resolved `--since` window
+  from the daemon.
+- The document-delivery reconciliation action now rejects a provider reference
+  sent with an operation other than confirm-exists, instead of silently
+  ignoring it.
+- Zotio plan, apply and tag-reconcile commands now report a missing Zotio
+  integration as a precondition failure instead of an internal daemon error.
+- Retrying, cancelling, or resolving a review no longer reports a failure (or
+  leaves a retried job stuck) when releasing the job's pinned page captures
+  fails after the change was recorded.
+- Resuming a document-delivery request no longer resets and reports as resumed
+  a request that was settled or orphaned at the same moment.
+- Browser and component adoption now refuse a landing file that is swapped for
+  a symlink after papio checks it, so bytes from outside the adoption
+  directory can no longer be quarantined.
+- A browser download or supplied PDF whose validation hits an internal error
+  now stays parked with an open manual-download action, instead of being
+  requeued by handoff repair and losing the supplied file.
+- Offered document-delivery recovery now opens its reconciliation prompt and
+  parks the job in one step. A job left resolving by an earlier failed park is
+  parked on the next pass instead of being skipped for good.
+- `papio batch` can retry a batch whose first run failed before any job was
+  recorded and before papio.db existed. Before this fix, the retry refused
+  every work as possibly already submitted.
+- `papio actions resolve` now binds the verdict to the review you inspected:
+  `--revision` is required, `--accept` also needs `--sha256` (the quarantined
+  file's digest from `actions list --json`), and a review that changed since
+  you listed it is refused with a nonzero exit.
+- `papio delivery submit` no longer places a provider request by default: it
+  needs `--confirm`, and without it only shows the recorded request and gate
+  and exits nonzero.
+- `papio config credentials delete` now needs `--yes`, describes the deletion
+  without it, and refuses a record the current configuration still binds.
+- `papio delivery cancel`, `papio delivery resume` and `papio jobs refile` now
+  exit nonzero when the request was not cancelled, not resumed, or the filing
+  hook failed; the result is still printed.
+- `papio status` no longer hides an active job behind 500 newer settled jobs,
+  and says when an active state holds more jobs than it can show.
+- `papio failures`, `papio jobs failures` and `papio jobs incidents` text
+  output now says when the list stopped at `--limit`.
+- `papio jobs incidents` against an older daemon now reports that the daemon
+  needs an upgrade instead of printing an empty incident list.
+- `papio actions list --limit` is honoured against an older daemon, and
+  `truncated` is reported correctly.
+- `papio actions open --json` keeps its skipped-handoff notice on stderr, so
+  stdout stays valid JSON.
+- `papio config credentials status` and `papio config agent status` now name
+  the config file and why it did not load (syntax position, unrecognized keys,
+  or a pointer to `papio doctor`), without echoing file contents.
+- The paced drive now measures a sign-in wait from the latest sign-in prompt.
+  A sign-in that came back and then asked again no longer counts as stalled
+  too early.
+- The paced drive no longer pauses itself when sign-ins stall at two different
+  libraries (resolver profiles). Papers through other libraries keep opening.
+- OpenAlex title enrichment now works for titles that contain commas or `|`.
+  Before, these titles split into extra search filters and missed their match.
+- The identity-review preview now serves the exact PDF bytes it verified. A
+  failed check on an old preview no longer revokes a newer preview for the
+  same review.
+- OpenAIRE registered-service tokens with a very large `expires_in` are now
+  cached for a bounded time. Before, papio requested a new token on every
+  call.
+- When `papio zotio tags reconcile` fails on some items, its error now says
+  how many tags it already added and removed.
+- `papio adapter capture` now exits non-zero when no page was captured (busy,
+  timeout, not_permitted, nav_failed). It still prints the outcome, and a
+  not_permitted outcome names the fix.
+- `papio bench` now exits non-zero when a cohort work could not run, and the
+  headline says how many works could not run.
+- `papio acquire --batch` refusals now name the JSONL field that carries an
+  identity flag. For --max-cost, --source, --deny-source, --access-mode,
+  --zotio-item-key and --force, they say batch JSONL has no such field,
+  instead of suggesting a key the decoder rejects.
+- `papio browser reload --json` now reports the reconnected session
+  (`holder_session_id`) and whether the reconnect was seen
+  (`reconnect_verified`). Before, it reported only the session that went away
+  during the reload.
+- `papio init` now exits non-zero when the daemon cannot start or doctor finds
+  a failing check. Its next step no longer names the removed `papio doctor
+  --start` flag.
+- `papio native-host install` and `uninstall` now list the browser
+  registrations they had already changed when a later browser fails.
+- `papio notify show --json` now includes the effective preset on each row.
+- The daily update notice no longer offers a papio release that the CLI
+  already runs when an older daemon is still running. A notice that failed to
+  print no longer hides the notice for a day.
+- `papio zotio plan` now shows the Zotero item, attachment and collection that
+  each confirmation hash approves, and how to see the full preview.
+- `papio zotio import-backfill --apply` now exits non-zero when some imports
+  failed. It still prints the receipt and the resume cursor.
+- MCP `papio_batch_wait` now rejects a fractional or non-numeric
+  `timeout_seconds`/`poll_seconds` with a tool error. Before, it truncated the
+  value to a shorter wait, or to the default when the value fell below one
+  second.
+- Automatic institutional candidate offers no longer stop for the rest of a
+  browser session when a sign-in lands or a claim is released while the daemon
+  is choosing the next candidates.
+- Browser offers now respect the shared limit on outstanding offers when
+  automatic institutional candidates are already in progress, instead of
+  stacking new offers on top of them.
+- A Send PDF capture that was bound to a paper but not yet copied into place
+  when the daemon stopped (or when copying failed) is now picked up and filed
+  on the next sweep, instead of staying stranded in quarantine.
+- Retrying a Send PDF capture after an interrupted filing no longer leaves two
+  identical copies in the paper's download folder.
+- A native browser download that papio accepted but could not copy into the
+  paper's folder is retried from papio's own copy on the next import, instead
+  of waiting until the reservation expires.
+- Staging files left in the downloads folder by a daemon stopped during a
+  native browser download are now cleaned up automatically.
+- `papio adapter captures purge` now requires `--host <host>` or `--all`,
+  warns that pinned incident evidence is removed too, and offers `--dry-run`
+  to count the captures first.
+- `papio export -o` no longer silently replaces an existing file: pass
+  `--force` to replace it. The write is atomic, and the `--json` receipt
+  reports `replaced`.
+- `papio export watch` and `papio export ledger` now fail without writing a
+  file when the daemon's page limit would make the export incomplete. Before,
+  they wrote a partial file and exited 0.
+- `papio inbox decide` on a captured PDF grab with `--op dismiss` now requires
+  `--delete-grab`, because the dismissal deletes the captured file. A decision
+  that did not apply (conflict or invalid) now exits nonzero.
+- `papio watch remove` refuses a watch that still has pending digest works
+  unless you pass `--discard-digest`. `papio watch digest clear` now requires
+  `--all`, and `--dry-run` shows how many pending works it would discard,
+  including works the digest view did not show.
+- `papio grabs identify` no longer deletes a captured PDF when a ready job
+  already holds the typed identifier. The capture stays parked, and you can
+  discard it from the inbox.
+- `papio grabs binds` now pages through every automatic filing with `--before
+  <grab-id>` and prints the next-page command. Operator confirms no longer
+  make a page look like the end of the list.
+- `papio grabs suggest --json` now includes the outcome, detail, and the
+  identifiers the PDF states about itself. `papio grabs confirm` exits nonzero
+  when the capture was not filed.
+
+### Security
+- A notification webhook (`notify.webhook_url` or a webhook credential record)
+  must now use `https`. Plain `http` is accepted only for a loopback host
+  (`localhost`, `127.0.0.1`, `[::1]`). papio no longer follows redirects from
+  the webhook endpoint, and a `3xx` counts as a failed delivery.
+- `sources.*.base_url_for_dev` is now checked by exact loopback host, not by
+  text prefix. Names like `localhost.example.org`, and URLs with userinfo, no
+  longer receive a source's API key.
+- Candidate URLs stored in the job database and resolver evidence now mask
+  token-shaped path segments, so a download grant signed into the URL path is
+  no longer persisted.
 
 ## [0.22.1] - 2026-09-23
 
