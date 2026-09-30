@@ -1293,7 +1293,29 @@ func TestSubmitRequiresExplicitAccessMode(t *testing.T) {
 	}
 }
 
+// Accepting an identity review confirms the bytes are the right work, never
+// which version they are (ADR-0007). A browser-adopted candidate that still
+// carries a version claim from before papio stopped synthesizing one must be
+// stored as unknown once the accepted bytes resume; a resolver candidate's
+// version came from its source and must survive unchanged.
 func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
+	for _, tc := range []struct {
+		source, wantVersion string
+	}{
+		{source: "fixture", wantVersion: resolver.VersionPublished},
+		{source: "browser", wantVersion: resolver.VersionUnknown},
+	} {
+		t.Run(tc.source, func(t *testing.T) {
+			testAcceptedIdentityReviewResumes(t, tc.source, tc.wantVersion)
+		})
+	}
+}
+
+// testAcceptedIdentityReviewResumes parks a fetched candidate for identity
+// review, relabels its stored source to candidateSource (a legacy
+// browser-adopted row cannot come from a resolver), accepts the review and
+// resumes it.
+func testAcceptedIdentityReviewResumes(t *testing.T, candidateSource, wantVersion string) {
 	svc, jobs := newTestService(t)
 	adapter := &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
 		Source: "fixture", URL: "https://example.test/review.pdf", Version: resolver.VersionPublished,
@@ -1328,6 +1350,14 @@ func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
 		actions[0].CandidateID <= 0 || actions[0].QuarantinePath == "" || len(actions[0].QuarantineSHA256) != 64 || actions[0].Revision != 1 {
 		t.Fatalf("review action = %+v, %v", actions, err)
 	}
+	if candidateSource != "fixture" {
+		if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE candidates SET source = ? WHERE id = ?`, candidateSource, actions[0].CandidateID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if parkedCandidate, err := jobs.GetCandidate(context.Background(), actions[0].CandidateID); err != nil || parkedCandidate.Version != resolver.VersionPublished || parkedCandidate.Source != candidateSource {
+		t.Fatalf("parked candidate = %+v, %v; want a %s row with a stored version claim before resume", parkedCandidate, err, candidateSource)
+	}
 	resolution, err := jobs.ResolveReviewCAS(context.Background(), job.ResolveReviewInput{
 		ActionID: actions[0].ID, Verdict: "accept", ExpectedRevision: actions[0].Revision,
 		ExpectedSHA256: actions[0].QuarantineSHA256,
@@ -1360,6 +1390,12 @@ func TestAcceptedIdentityReviewResumesAndRecordsOverride(t *testing.T) {
 	}
 	if !foundOverride {
 		t.Fatalf("events missing human_identity_override: %+v", events)
+	}
+	// Read the persisted row: the in-memory copy the resume validated is not
+	// what later readers see.
+	resumed, err := jobs.GetCandidate(context.Background(), actions[0].CandidateID)
+	if err != nil || resumed.Version != wantVersion {
+		t.Fatalf("resumed %s candidate = %+v, %v; want stored version %q", candidateSource, resumed, err, wantVersion)
 	}
 }
 
