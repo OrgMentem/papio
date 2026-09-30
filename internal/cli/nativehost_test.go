@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -335,6 +336,52 @@ func TestNativeHostInstallRequiresExtensionID(t *testing.T) {
 	}
 	if len(registration.installed) != 0 || len(registration.removed) != 0 {
 		t.Fatalf("invalid setup changed registration: %+v", registration)
+	}
+}
+
+// Install and uninstall change one browser at a time and do not roll back.
+// When a later browser failed, the error used to name only that failure, so
+// the operator could not tell that an earlier browser now launched this binary
+// (or no longer reached any host). The error must name what already changed.
+func TestNativeHostPartialFailureNamesChangedRegistrations(t *testing.T) {
+	extID := strings.Repeat("d", 32)
+	const firefoxID = "papio@orgmentem.com"
+	_, _, _ = writeTestConfig(t, extID, firefoxID)
+	manifestDir := t.TempDir()
+	firefoxManifestDir := t.TempDir()
+	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
+	firefoxManifestPath := filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")
+
+	registerNativeManifest = func(target browserTarget, _ string) error {
+		if target.id == "firefox" {
+			return errors.New("registry write denied")
+		}
+		return nil
+	}
+	_, _, err := runCLI(t, "native-host", "install", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
+	if err == nil || !strings.Contains(err.Error(), "registry write denied") {
+		t.Fatalf("install err = %v, want the Firefox failure", err)
+	}
+	for _, want := range []string{nativehost.ExecPath(), manifestPath, firefoxManifestPath + " (written, not registered)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("install err = %q, want it to name already changed %q", err, want)
+		}
+	}
+
+	deregisterNativeManifest = func(target browserTarget) error {
+		if target.id == "firefox" {
+			return errors.New("registry delete denied")
+		}
+		return nil
+	}
+	_, _, err = runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
+	if err == nil || !strings.Contains(err.Error(), "registry delete denied") {
+		t.Fatalf("uninstall err = %v, want the Firefox failure", err)
+	}
+	for _, want := range []string{manifestPath + " removed", firefoxManifestPath + " removed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("uninstall err = %q, want it to name already removed %q", err, want)
+		}
 	}
 }
 

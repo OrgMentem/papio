@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -176,22 +178,32 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 				return err
 			}
 			removed := make([]string, 0, len(targets)+2)
+			// Uninstall is not atomic across browsers. When one fails, the
+			// error names every manifest and registration already removed,
+			// so the operator can tell which browsers still reach the host.
+			var changed []string
 			for _, t := range targets {
 				path := filepath.Join(t.dir, nativeHostManifestName+".json")
 				if err := os.Remove(path); err != nil {
 					if !errors.Is(err, os.ErrNotExist) {
-						return err
+						return partialNativeHostError("uninstall", t.label, err, changed)
 					}
 				} else {
 					removed = append(removed, path)
+					changed = append(changed, t.label+" manifest "+path+" removed")
 				}
 				if err := deregisterNativeManifest(t); err != nil {
-					return err
+					return partialNativeHostError("uninstall", t.label, err, changed)
+				}
+				if runtime.GOOS == "windows" {
+					// Only Windows registers through HKCU; elsewhere the
+					// manifest file is the whole registration.
+					changed = append(changed, t.label+" registry key removed")
 				}
 			}
 			hostRemoved, err := nativehost.RemoveExecutable()
 			if err != nil {
-				return err
+				return partialNativeHostError("uninstall", "host executable", err, changed)
 			}
 			removed = append(removed, hostRemoved...)
 			chromeT, _ := findTarget(targets, "chrome")
@@ -307,10 +319,18 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 	if err != nil {
 		return nativeHostInstallResult{}, err
 	}
+	// Every step below changes a browser registration that stays changed when
+	// a later browser fails. The error names what was already done, so the
+	// operator knows which browsers now launch this binary and which kept
+	// their previous registration.
+	changed := []string{"host executable " + hostPath}
+	fail := func(label string, err error) (nativeHostInstallResult, error) {
+		return nativeHostInstallResult{}, partialNativeHostError("install", label, err, changed)
+	}
 
 	targets, err := selectManifestTargets(manifestDir, firefoxManifestDir)
 	if err != nil {
-		return nativeHostInstallResult{}, err
+		return fail("browser selection", err)
 	}
 	firefoxID := cfg.Browser.FirefoxExtensionID
 
@@ -337,18 +357,21 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 			continue
 		}
 		if err := os.MkdirAll(t.dir, 0o755); err != nil {
-			return nativeHostInstallResult{}, err
+			return fail(t.label, err)
 		}
 		path := filepath.Join(t.dir, nativeHostManifestName+".json")
 		if err := writeManifestAtomic(path, manifest); err != nil {
-			return nativeHostInstallResult{}, err
+			return fail(t.label, err)
 		}
 		if err := registerNativeManifest(t, path); err != nil {
-			return nativeHostInstallResult{}, err
+			changed = append(changed, t.label+" manifest "+path+" (written, not registered)")
+			return fail(t.label, err)
 		}
 		if err := verifyNativeHost(path); err != nil {
-			return nativeHostInstallResult{}, err
+			changed = append(changed, t.label+" manifest "+path+" (registered, failed verification)")
+			return fail(t.label, err)
 		}
+		changed = append(changed, t.label+" manifest "+path)
 		result.Installed = append(result.Installed, installedManifest{ID: t.id, Label: t.label, Path: path})
 		switch t.id {
 		case "chrome":
@@ -358,6 +381,19 @@ func installNativeHost(cfg config.Config, manifestDir, firefoxManifestDir string
 		}
 	}
 	return result, nil
+}
+
+// partialNativeHostError reports a native-host install or uninstall that
+// stopped partway, naming every registration change already made. Those
+// changes are not rolled back: restoring another binary's registration is not
+// something papio can do safely, and the operator can re-run the command once
+// the named browser's failure is fixed.
+func partialNativeHostError(action, at string, err error, changed []string) error {
+	if len(changed) == 0 {
+		return fmt.Errorf("native-host %s: %s: %w", action, at, err)
+	}
+	return fmt.Errorf("native-host %s stopped at %s: %w; already changed: %s. Run `papio native-host status` to see each browser's state, then re-run `papio native-host %s` once %s is fixed",
+		action, at, err, strings.Join(changed, "; "), action, at)
 }
 
 // writeManifestAtomic writes the manifest as a 0644 file via a same-dir temp
