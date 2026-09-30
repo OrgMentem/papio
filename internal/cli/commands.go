@@ -716,13 +716,11 @@ func newJobsCommand(opt *options) *cobra.Command {
 			var result jobsIncidentsResult
 			if err := opt.call(cmd.Context(), "jobs.incidents", map[string]any{"since": incidentsSince, "limit": effective}, &result); err != nil {
 				if isUnknownMethod(err) {
-					// Older daemons have no incident read model. Preserve the
-					// separate surface with an empty page rather than
-					// substituting legacy FailureGroup rows.
-					if opt.jsonOutput {
-						return printPage(opt, "incidents", []incident.Group{}, false)
-					}
-					return nil
+					// Older daemons have no incident read model. An empty
+					// page here reads as "no incidents happened", which the
+					// daemon never said; refuse like every other surface
+					// the running daemon predates.
+					return daemonUpgradeRequired("jobs.incidents")
 				}
 				return err
 			}

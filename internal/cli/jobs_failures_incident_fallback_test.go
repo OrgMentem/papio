@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"papio/internal/config"
@@ -12,40 +13,51 @@ import (
 	"papio/internal/job"
 )
 
-func TestJobsUnknownIncidentsMethodKeepsStableEmptySurface(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		args []string
-		// servesFailures says whether jobs.failures is a legal call for this
-		// argv; "jobs incidents" must never reach for the failures method.
-		servesFailures bool
-		want           string
-	}{
-		{name: "jobs failures keeps an empty incidents list beside its groups", args: []string{"--json", "jobs", "failures"}, servesFailures: true, want: `{"failures":[{"state":"failed","provider":"example.edu","reason":"timeout","count":1,"sample":"job_1"}],"incidents":[],"truncated":false}` + "\n"},
-		{name: "jobs incidents keeps its own separate empty surface", args: []string{"--json", "jobs", "incidents"}, want: `{"incidents":[],"truncated":false}` + "\n"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			var out, errOut bytes.Buffer
-			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
-				switch {
-				case method == "jobs.failures" && test.servesFailures:
-					*result.(*jobsFailuresResult) = jobsFailuresResult{Failures: []job.FailureGroup{{
-						State: job.StateFailed, Provider: "example.edu", Reason: "timeout", Count: 1, Sample: "job_1",
-					}}}
-				case method == "jobs.incidents":
-					return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
-				default:
-					t.Fatalf("method = %q", method)
-				}
-				return nil
-			})
-			root.SetArgs(test.args)
-			if err := root.ExecuteContext(context.Background()); err != nil {
-				t.Fatalf("%v: %v", test.args, err)
+func TestJobsFailuresUnknownIncidentsMethodKeepsFailureGroups(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		switch method {
+		case "jobs.failures":
+			*result.(*jobsFailuresResult) = jobsFailuresResult{Failures: []job.FailureGroup{{
+				State: job.StateFailed, Provider: "example.edu", Reason: "timeout", Count: 1, Sample: "job_1",
+			}}}
+		case "jobs.incidents":
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		default:
+			t.Fatalf("method = %q", method)
+		}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "jobs", "failures"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("jobs failures: %v", err)
+	}
+	const want = `{"failures":[{"state":"failed","provider":"example.edu","reason":"timeout","count":1,"sample":"job_1"}],"incidents":[],"truncated":false}` + "\n"
+	if out.String() != want {
+		t.Fatalf("output = %q, want %q", out.String(), want)
+	}
+}
+
+// TestJobsIncidentsRefusesDaemonWithoutIncidentModel: an older daemon never
+// computed incidents, so an empty page with exit 0 would read as "no incident
+// happened". The command must fail naming the missing method, print nothing
+// on stdout, and never fall back to the legacy failure groups.
+func TestJobsIncidentsRefusesDaemonWithoutIncidentModel(t *testing.T) {
+	for _, args := range [][]string{{"jobs", "incidents"}, {"--json", "jobs", "incidents"}} {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, _ any) error {
+			if method != "jobs.incidents" {
+				t.Fatalf("method = %q, want only jobs.incidents", method)
 			}
-			if out.String() != test.want {
-				t.Fatalf("output = %q, want %q", out.String(), test.want)
-			}
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
 		})
+		root.SetArgs(args)
+		err := root.ExecuteContext(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "jobs.incidents") || !strings.Contains(err.Error(), "daemon") {
+			t.Fatalf("%v: error = %v, want an upgrade refusal naming jobs.incidents", args, err)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("%v: stdout = %q, want nothing", args, out.String())
+		}
 	}
 }
