@@ -10,9 +10,12 @@ import (
 	"strings"
 )
 
-// URL strips userinfo, query, and fragment, keeping scheme://host/path. A
-// bearer-signed URL therefore loses its token before persistence. Unparseable
-// input collapses to a fixed placeholder rather than leaking raw bytes.
+// URL strips userinfo, query, and fragment, keeping scheme://host/path, and
+// masks every token-shaped run inside a path segment. A bearer-signed URL
+// therefore loses its token before persistence whether the provider put the
+// grant in the query or in the path (https://cdn.example/grant/<token>/x.pdf).
+// Unparseable input collapses to a fixed placeholder rather than leaking raw
+// bytes.
 func URL(raw string) string {
 	if raw == "" {
 		return ""
@@ -24,11 +27,57 @@ func URL(raw string) string {
 	u.User = nil
 	u.RawQuery = ""
 	u.Fragment = ""
-	if u.RawQuery == "" && strings.Contains(raw, "?") {
+	path := maskPathTokens(u.EscapedPath())
+	u.Path, u.RawPath, u.ForceQuery = "", "", false
+	out := u.String() + path
+	if strings.Contains(raw, "?") {
 		// Mark that something was removed so operators know evidence is partial.
-		return u.String() + "?<redacted>"
+		return out + "?<redacted>"
 	}
-	return u.String()
+	return out
+}
+
+// pathTokenRE matches a token-shaped run inside one path segment: 24 or more
+// contiguous URL-safe, base64, or percent-encoded characters. It mirrors the
+// extension's URL_TOKEN_RE (extension/src/capture.ts) with the padding and
+// escape bytes a Go-escaped path can carry. Long enough to catch signed
+// grants, session ids, JWT segments, and API keys; short enough identifiers
+// (PMC ids, arXiv ids, Elsevier PIIs, DOI suffixes split at dots) survive.
+var pathTokenRE = regexp.MustCompile(`[A-Za-z0-9+_=%~-]{24,}`)
+
+// semanticWordRE is one ordinary word of a hyphenated or camel-cased slug.
+var semanticWordRE = regexp.MustCompile(`^[A-Za-z]{2,16}$`)
+
+var camelBoundaryRE = regexp.MustCompile(`([a-z])([A-Z])`)
+
+// maskPathTokens replaces token-shaped runs in each path segment with
+// "<redacted>", keeping readable word slugs (download-full-text-article) as
+// the extension's isSemanticSelectorToken does. Segments are checked
+// independently: a slash is routing syntax, not part of a credential.
+func maskPathTokens(escapedPath string) string {
+	segments := strings.Split(escapedPath, "/")
+	for i, segment := range segments {
+		segments[i] = pathTokenRE.ReplaceAllStringFunc(segment, func(token string) string {
+			if semanticSlug(token) {
+				return token
+			}
+			return "<redacted>"
+		})
+	}
+	return strings.Join(segments, "/")
+}
+
+func semanticSlug(token string) bool {
+	words := strings.FieldsFunc(camelBoundaryRE.ReplaceAllString(token, "$1-$2"), func(r rune) bool { return r == '-' || r == '_' })
+	if len(words) < 2 {
+		return false
+	}
+	for _, word := range words {
+		if !semanticWordRE.MatchString(word) {
+			return false
+		}
+	}
+	return true
 }
 
 // Host reduces a URL to scheme://host for error messages about untrusted

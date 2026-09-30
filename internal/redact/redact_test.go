@@ -30,6 +30,27 @@ func TestURLStripsSecrets(t *testing.T) {
 	}
 }
 
+// A provider that signs the path instead of the query must not have its grant
+// persisted; ordinary scholarly identifiers and word slugs stay readable.
+func TestURLMasksPathTokens(t *testing.T) {
+	const grant = "eyJhbGciOiJIUzI1NiJ9aBcD3fGh1jKlMn0pQrStUv" // betterleaks:allow -- synthetic test input, never sent
+	for _, test := range []struct{ in, want string }{
+		{"https://cdn.example/grant/" + grant + "/paper.pdf", "https://cdn.example/grant/<redacted>/paper.pdf"},
+		{"https://cdn.example/dl/" + grant + ".pdf?x=1", "https://cdn.example/dl/<redacted>.pdf?<redacted>"},
+		{"https://cdn.example/s/0123456789abcdef0123456789abcdef", "https://cdn.example/s/<redacted>"},
+		{"https://www.sciencedirect.com/science/article/pii/S0092867420300015/pdfft", "https://www.sciencedirect.com/science/article/pii/S0092867420300015/pdfft"},
+		{"https://doi.org/10.1016/j.cell.2020.01.001", "https://doi.org/10.1016/j.cell.2020.01.001"},
+		{"https://arxiv.org/pdf/2301.01234v2", "https://arxiv.org/pdf/2301.01234v2"},
+		{"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/pdf/nihms-123456.pdf", "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567/pdf/nihms-123456.pdf"},
+		{"https://journal.example/doi/download-full-text-article/x", "https://journal.example/doi/download-full-text-article/x"},
+		{"https://journal.example/doi/10.1234/abc?", "https://journal.example/doi/10.1234/abc?<redacted>"},
+	} {
+		if got := URL(test.in); got != test.want {
+			t.Errorf("URL(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
 // unparseablePlaceholder is the fixed, source-independent value that Host must
 // return for every input it cannot reduce to a scheme and a host.
 const unparseablePlaceholder = "<unparseable-url>"
