@@ -9424,14 +9424,23 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 // before this directory was in scope. Those husks stay, and doctor's
 // adoption_root_legacy check tells the operator the folder is theirs to
 // remove.
+//
+// The effective root also carries native-download staging
+// (native_stage_<reservation>.tmp). A daemon killed between staging and
+// publication leaves a full PDF there that no reservation can ever claim, so
+// staging no live reservation owns is removed once it is older than any
+// reservation could be; it is never imported.
 func (b *Bridge) SweepTerminalAdoptions(ctx context.Context) error {
 	effective := b.cfg.EffectiveAdoptionRoot()
 	for _, root := range b.cfg.AdoptionRoots() {
 		collectible := job.Terminal
+		var liveStages map[string]bool
 		if root != effective {
 			collectible = artifactSafelyStored
+		} else {
+			liveStages = b.liveNativeStages()
 		}
-		if err := b.sweepTerminalAdoptionsIn(ctx, root, collectible); err != nil {
+		if err := b.sweepTerminalAdoptionsIn(ctx, root, collectible, liveStages); err != nil {
 			return err
 		}
 	}
@@ -9444,7 +9453,7 @@ func artifactSafelyStored(state string) bool {
 	return state == job.StateReady || state == job.StateImported
 }
 
-func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, collectible func(string) bool) error {
+func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, collectible func(string) bool, liveStages map[string]bool) error {
 	entries, err := b.readAdoptionDir(root)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
 		return nil // root not responding (TCC); latch already logged, skip this tick
@@ -9456,6 +9465,10 @@ func (b *Bridge) sweepTerminalAdoptionsIn(ctx context.Context, root string, coll
 		return err
 	}
 	for _, e := range entries {
+		if liveStages != nil && abandonedNativeStage(e, liveStages, b.now()) {
+			_ = os.Remove(filepath.Join(root, e.Name()))
+			continue
+		}
 		if !e.IsDir() || e.Name() == "rejected" || e.Name() == grabsDirName {
 			continue
 		}

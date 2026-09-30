@@ -357,8 +357,75 @@ func TestNativeDownloadCrashBoundary(t *testing.T) {
 				if result := nativeArm(t, b, id, p); result.Outcome != "refused" || result.Reason != "already_armed" {
 					t.Fatalf("crash allowed replay: %+v", result)
 				}
+				// The stage is never imported, but once no reservation could
+				// still own it the terminal sweep reclaims it. A fresh one
+				// (a live worker's, as far as the sweep can tell) stays.
+				stagePath := filepath.Join(source, "papio", staged.name)
+				fresh := filepath.Join(source, "papio", nativeStagePrefix+"native_fresh"+nativeStageSuffix)
+				if err := os.WriteFile(fresh, body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := restarted.SweepTerminalAdoptions(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(stagePath); err != nil {
+					t.Fatalf("young crash stage removed before any reservation could have expired: %v", err)
+				}
+				old := time.Now().Add(-agentAttemptDuration - time.Minute)
+				if err := os.Chtimes(stagePath, old, old); err != nil {
+					t.Fatal(err)
+				}
+				if err := restarted.SweepTerminalAdoptions(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(stagePath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("abandoned crash stage survived the terminal sweep: %v", err)
+				}
+				if _, err := os.Stat(fresh); err != nil {
+					t.Fatalf("fresh stage removed: %v", err)
+				}
+				if row, err := jobs.Get(context.Background(), id); err != nil || row.State != job.StateAwaitingHuman || row.ArtifactSHA256 != "" {
+					t.Fatalf("stage cleanup adopted bytes: %+v %v", row, err)
+				}
 			}
 		})
+	}
+}
+
+// A publish that fails after the one-shot admission must keep the admitted
+// staging, so a retried import of the same observation republishes those
+// exact bytes instead of parking the reservation as deferred until expiry.
+func TestNativeDownloadRetryRepublishesAfterPublishFailure(t *testing.T) {
+	b, jobs, id, source, p := nativeAttempt(t)
+	arm := nativeArm(t, b, id, p)
+	if arm.Outcome != "armed" {
+		t.Fatal(arm)
+	}
+	body := adoptionProbePDF(handoffWork().DOI)
+	path := filepath.Join(source, "retry.pdf")
+	writeAdoptionProbeFile(t, path, body)
+	// A non-directory at the job folder's name makes publish fail.
+	blocker := filepath.Join(b.cfg.EffectiveAdoptionRoot(), id)
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	obs := nativeObservation(p, arm, path, len(body))
+	if got := nativeImport(t, b, id, obs); got.Outcome != "deferred" {
+		t.Fatalf("failed publish result=%+v, want deferred", got)
+	}
+	if nativeEventCount(t, jobs, id, "browser.native_download_admitted") != 1 {
+		t.Fatal("admission not recorded before publish")
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	obs.RequestID = "native-import-retry"
+	if got := nativeImport(t, b, id, obs); got.Outcome != "ready" {
+		row, _ := jobs.Get(context.Background(), id)
+		t.Fatalf("retry after publish failure=%+v state=%+v, want ready", got, row)
+	}
+	if _, err := os.Stat(filepath.Join(source, "papio", nativeStagePrefix+arm.ReservationID+nativeStageSuffix)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging survived a successful republish: %v", err)
 	}
 }
 

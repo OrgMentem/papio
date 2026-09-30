@@ -177,7 +177,7 @@ func (r *nativeDownloadRoot) stage(ctx context.Context, observed, reservation st
 	if ctx.Err() != nil {
 		return nativeStagedFile{}, ctx.Err()
 	}
-	stageName := "native_stage_" + reservation + ".tmp"
+	stageName := nativeStagePrefix + reservation + nativeStageSuffix
 	out, err := r.landing.OpenFile(stageName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nativeStagedFile{}, errNativeSource

@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"papio/internal/job"
@@ -27,6 +29,10 @@ type nativeDownloadReservation struct {
 	outcome, reason string
 	busy            bool
 	rebindRequest   string // fingerprint of the still-current successful transfer
+	// staged is admitted staging kept after a failed publish. Admission is
+	// one-shot and the browser source is never reopened, so these bytes are
+	// the only copy a same-observation retry may republish.
+	staged nativeStageResult
 }
 
 func (b *Bridge) currentGenericDriveAuthority(ctx context.Context, sessionID, jobID, attemptID string, ordinal int64, strategy, revision string) (*job.EffectPermit, bool) {
@@ -145,6 +151,9 @@ func (b *Bridge) armNativeDownload(ctx context.Context, sessionID, jobID string,
 			delete(b.nativeDownloads, id)
 			if root != nil {
 				go root.close()
+			}
+			if r.staged.root != nil {
+				go cleanupNativeStage(r.staged)
 			}
 		}
 	}
@@ -336,14 +345,22 @@ func (b *Bridge) importNativeDownload(ctx context.Context, sessionID, jobID stri
 	if r.observation != "" {
 		if r.observation == fingerprint {
 			if !r.busy && r.outcome == "deferred" && r.digest != "" {
-				b.mu.Unlock()
-				outcome, reason := b.nativeImportOutcome(ctx, jobID, r.digest, false)
-				b.mu.Lock()
+				if r.staged.root != nil {
+					// A publish failed after admission. Republish the
+					// retained daemon-owned staging; never reopen the source.
+					staged := r.staged
+					r.staged = nativeStageResult{}
+					b.publishNativeStage(ctx, jobID, r, staged)
+				} else {
+					b.mu.Unlock()
+					outcome, reason := b.nativeImportOutcome(ctx, jobID, r.digest, false)
+					b.mu.Lock()
+					if outcome != "" {
+						r.outcome, r.reason = outcome, reason
+					}
+				}
 				if !b.nativeAvailable(sessionID) || r.record.HolderGeneration != b.arbitration.generation() {
 					return reply()
-				}
-				if outcome != "" {
-					r.outcome, r.reason = outcome, reason
 				}
 			}
 			result.Outcome = r.outcome
@@ -402,18 +419,50 @@ func (b *Bridge) importNativeDownload(ctx context.Context, sessionID, jobID stri
 	// This is the durable admission boundary. From here only daemon-created,
 	// exact digest-correlated staging bytes are used; never re-open the source.
 	r.digest = stage.file.digest
-	r.busy = true
 	r.outcome = "deferred"
 	r.reason = "validation_pending"
-	b.mu.Unlock()
 	publishing := stage
-	stage = nativeStageResult{} // the bounded worker owns cleanup on timeout
-	stage, err = boundedNativeIO(ctx, gate, 5*time.Second, func(ctx context.Context) (nativeStageResult, error) {
-		return publishing, publishing.root.publish(ctx, jobID, filename, publishing.file)
-	}, cleanupNativeStage)
-	if errors.Is(err, errNativeIOBusy) {
-		cleanupNativeStage(publishing)
+	stage = nativeStageResult{} // publishNativeStage owns it now
+	b.publishNativeStage(ctx, jobID, r, publishing)
+	result.Outcome = r.outcome
+	result.Reason = r.reason
+	return reply()
+}
+
+// publishNativeStage copies admitted staging into the job folder and ingests
+// it. Called under b.mu, which it releases for the filesystem work and holds
+// again on return. A publish that fails, times out or finds the IO gate busy
+// hands the staging back to r instead of deleting it, so the next import with
+// the same observation can republish it; only a successful publish, a
+// retirement or a settled outcome removes it.
+func (b *Bridge) publishNativeStage(ctx context.Context, jobID string, r *nativeDownloadReservation, staged nativeStageResult) {
+	r.busy = true
+	filename := r.record.ReservationID + ".pdf"
+	gate := b.nativeGate()
+	b.mu.Unlock()
+	retain := func(s nativeStageResult) {
+		if s.root == nil {
+			return
+		}
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.nativeDownloads[jobID] == r && r.staged.root == nil && r.outcome == "deferred" {
+			r.staged = s
+			return
+		}
+		go cleanupNativeStage(s)
 	}
+	kept, err := boundedNativeIO(ctx, gate, 5*time.Second, func(ctx context.Context) (nativeStageResult, error) {
+		if err := staged.root.publish(ctx, jobID, filename, staged.file); err != nil {
+			return staged, err
+		}
+		cleanupNativeStage(staged)
+		return nativeStageResult{}, nil
+	}, retain)
+	if errors.Is(err, errNativeIOBusy) {
+		kept = staged
+	}
+	retain(kept)
 	if err == nil {
 		_, err = b.ingestAdoptedFile(ctx, jobID, filename, nil, &r.record.Producer)
 	}
@@ -424,9 +473,10 @@ func (b *Bridge) importNativeDownload(ctx context.Context, sessionID, jobID stri
 		r.outcome = finalOutcome
 		r.reason = finalReason
 	}
-	result.Outcome = r.outcome
-	result.Reason = r.reason
-	return reply()
+	if r.outcome != "deferred" && r.staged.root != nil {
+		go cleanupNativeStage(r.staged)
+		r.staged = nativeStageResult{}
+	}
 }
 
 // A deferred receipt only reads daemon-owned evidence; it never reopens the
@@ -466,6 +516,44 @@ func (b *Bridge) retireNativeDownloads(sessionID string) {
 			if r.root != nil {
 				go r.root.close()
 			}
+			if r.staged.root != nil {
+				go cleanupNativeStage(r.staged)
+				r.staged = nativeStageResult{}
+			}
 		}
 	}
+}
+
+// nativeStagePrefix and nativeStageSuffix frame the root-level staging name
+// nativeDownloadRoot.stage writes for one reservation.
+const (
+	nativeStagePrefix = "native_stage_"
+	nativeStageSuffix = ".tmp"
+)
+
+// liveNativeStages names the staging files an in-memory reservation still
+// owns. Reservations never survive a restart, so after a crash every stage on
+// disk is absent from this set.
+func (b *Bridge) liveNativeStages() map[string]bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	live := make(map[string]bool, len(b.nativeDownloads))
+	for _, r := range b.nativeDownloads {
+		live[nativeStagePrefix+r.record.ReservationID+nativeStageSuffix] = true
+	}
+	return live
+}
+
+// abandonedNativeStage reports whether a root-level entry is staging no live
+// reservation owns and old enough that no retired worker can still be using
+// it. A reservation lives at most agentAttemptDuration, and every IO step on
+// its staging is bounded to seconds, so older unowned staging is a crash
+// leftover. It is never imported: admission cannot be replayed from it.
+func abandonedNativeStage(e os.DirEntry, live map[string]bool, now time.Time) bool {
+	name := e.Name()
+	if !strings.HasPrefix(name, nativeStagePrefix) || !strings.HasSuffix(name, nativeStageSuffix) || live[name] || !e.Type().IsRegular() {
+		return false
+	}
+	info, err := e.Info()
+	return err == nil && now.Sub(info.ModTime()) > agentAttemptDuration
 }
