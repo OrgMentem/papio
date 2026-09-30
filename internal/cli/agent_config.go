@@ -4,7 +4,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -54,7 +53,7 @@ func newAgentConfigCommandWithDependencies(opt *options, deps agentConfigDepende
 	status := &cobra.Command{Use: "status", Short: "Show agent configuration without revealing credentials", Args: credentialArgs(0, 0), Annotations: map[string]string{"mcp:read-only": "true"}, RunE: func(cmd *cobra.Command, _ []string) error {
 		cfg, err := opt.loadConfig()
 		if err != nil {
-			return errors.New("configuration could not be loaded")
+			return credentialConfigLoadError(opt, cfg, err)
 		}
 		depsForCall, err := prepareCredentialEnvironment(deps, cfg, "")
 		if err != nil {

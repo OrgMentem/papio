@@ -979,3 +979,43 @@ func TestCredentialConfigUnreadableJournalPathFailsClosed(t *testing.T) {
 		t.Fatalf("status with unreadable journal = %v, want the journal failure", err)
 	}
 }
+
+// TestCredentialStatusNamesWhyTheConfigurationDidNotLoad: a broken config
+// blocks the credential diagnostic itself, so the refusal must name the file
+// and the cause an operator can act on — the syntax position, the unknown
+// keys, or where the full message is — without echoing file text that can
+// hold a literal secret.
+func TestCredentialStatusNamesWhyTheConfigurationDidNotLoad(t *testing.T) {
+	const secret = "sk-synthetic-literal-0123456789" // betterleaks:allow -- synthetic test input, never sent
+	for _, tc := range []struct {
+		name     string
+		contents string
+		want     []string
+	}{
+		{name: "syntax", contents: "access_mode = \"delegated\"\nemail = " + secret + "\n", want: []string{"TOML syntax error at line 2"}},
+		{name: "unknown field", contents: "access_mode = \"delegated\"\nnot_a_papio_field = \"" + secret + "\"\n", want: []string{"not_a_papio_field", "update papio"}},
+		{name: "validation", contents: "access_mode = \"" + secret + "\"\n", want: []string{"failed validation", "papio doctor"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCredentialCLIFixture(t)
+			if err := os.WriteFile(f.path, []byte(tc.contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, run := range []func() error{
+				func() error { return f.run([]string{"status"}, "") },
+				func() error { return f.runAgent([]string{"status"}, "") },
+			} {
+				err := run()
+				if err == nil {
+					t.Fatal("status loaded a broken configuration")
+				}
+				for _, want := range append([]string{f.path}, tc.want...) {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("error = %q, want it to contain %q", err, want)
+					}
+				}
+				f.assertNoSecret(err, secret)
+			}
+		})
+	}
+}

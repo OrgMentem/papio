@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
 
+	toml "github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
@@ -129,7 +131,7 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 	status := &cobra.Command{Use: "status [TARGET]", Short: "Show selected credential sources without revealing values", Args: credentialArgs(0, 1), Annotations: map[string]string{"mcp:read-only": "true"}, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := opt.loadConfig()
 		if err != nil {
-			return errors.New("configuration could not be loaded")
+			return credentialConfigLoadError(opt, cfg, err)
 		}
 		depsForCall, err := prepareCredentialEnvironment(deps, cfg, "")
 		if err != nil {
@@ -182,7 +184,7 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 		}
 		cfg, err := opt.loadConfig()
 		if err != nil {
-			return errors.New("configuration could not be loaded before accessing the credential store")
+			return fmt.Errorf("before accessing the credential store: %w", credentialConfigLoadError(opt, cfg, err))
 		}
 		depsForCall, err := prepareCredentialEnvironment(deps, cfg, "")
 		if err != nil {
@@ -222,7 +224,7 @@ func loadCredentialMutation(opt *options, deps credentialConfigDependencies) (co
 	}
 	cfg, err := opt.loadConfig()
 	if err != nil {
-		return cfg, snapshot, errors.New("configuration could not be loaded")
+		return cfg, snapshot, credentialConfigLoadError(opt, cfg, err)
 	}
 	disk, err := deps.loadDiskConfig(path)
 	if err != nil {
@@ -236,6 +238,41 @@ func loadCredentialMutation(opt *options, deps credentialConfigDependencies) (co
 		return cfg, snapshot, err
 	}
 	return cfg, snapshot, nil
+}
+
+// credentialConfigLoadError names why the configuration did not load without
+// echoing text that can quote the file's contents. The credential commands
+// read files that may still hold literal secrets, so a go-toml message (which
+// can quote document tokens) or a validation message (which can quote a
+// configured value) is never passed through; what is kept is the path, the
+// syntax position, the unrecognized key names, or the file-system cause, and
+// otherwise a pointer to `papio doctor`, which reports the full message.
+func credentialConfigLoadError(opt *options, cfg config.Config, err error) error {
+	path := cfg.Path
+	if path == "" {
+		path = opt.configPath
+	}
+	if path == "" {
+		path = filepath.Join(config.Dir(), "config.toml")
+	}
+	var missing *toml.StrictMissingError
+	if errors.As(err, &missing) {
+		keys := make([]string, 0, len(missing.Errors))
+		for _, decodeErr := range missing.Errors {
+			keys = append(keys, strings.Join(decodeErr.Key(), "."))
+		}
+		return fmt.Errorf("configuration %s could not be loaded: it contains fields this papio build does not recognize (%s); update papio, or remove those fields", path, strings.Join(keys, ", "))
+	}
+	var decodeErr *toml.DecodeError
+	if errors.As(err, &decodeErr) {
+		row, column := decodeErr.Position()
+		return fmt.Errorf("configuration %s could not be loaded: TOML syntax error at line %d, column %d; fix the file and retry", path, row, column)
+	}
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return fmt.Errorf("configuration %s could not be read: %w", path, pathErr.Err)
+	}
+	return fmt.Errorf("configuration %s could not be loaded: a value failed validation; run `papio doctor` for the full message, which can quote configured values", path)
 }
 
 func credentialBinding(cfg config.Config, target string) (credential.Binding, error) {
