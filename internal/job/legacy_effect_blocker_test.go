@@ -555,6 +555,122 @@ func TestImportLegacyInstitutionalClaimRefusesBlankSafetyDomain(t *testing.T) {
 	}
 }
 
+// seedLegacyInstitutionalBlocker imports one institutional blocker for a
+// pre-permit claim whose route ordinal (2) differs from its effect ordinal (3),
+// so settlement must resolve the effect through the claim join.
+func seedLegacyInstitutionalBlocker(t *testing.T, js *Store, suffix string) (jobID, claimID, bindingID string) {
+	t.Helper()
+	ctx := context.Background()
+	jobID = legacyBlockerJob(t, js, "legacy-navigation-"+suffix)
+	claimID, bindingID = "claim-nav-"+suffix, "binding-nav-"+suffix
+	now := store.Now()
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT OR IGNORE INTO institution_profiles
+		  (id, configured_name, revision, authority_digest, authentication_claim_id, created_at, updated_at)
+		VALUES ('profile-nav', 'legacy navigation', 1, 'digest', 'auth-claim-nav', ?, ?)`,
+		now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO browser_candidates
+		  (id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision,
+		   route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id,
+		   adapter_revision, effect_contract_id, status, created_at, updated_at)
+		VALUES (?, ?, 1, 'profile-nav', 1, 1, 'institutional', 'doi', ?, ?,
+		        'adapter-1', ?, 'claimed', ?, ?)`,
+		"candidate-nav-"+suffix, jobID, "pre-route-"+suffix, "domain:nav-"+suffix, "effect-nav-"+suffix, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO materialization_claims
+		  (id, candidate_id, browser_holder_generation, materialization_kind, binding_id,
+		   phase, route_issuance_ordinal, effect_ordinal, created_at, updated_at)
+		VALUES (?, ?, 1, 'browser_tab', ?, 'route_issued', 2, 3, ?, ?)`,
+		claimID, "candidate-nav-"+suffix, bindingID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.ImportLegacyStartedEpochs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return jobID, claimID, bindingID
+}
+
+func legacyInstitutionalStatus(t *testing.T, js *Store, claimID string) string {
+	t.Helper()
+	var status string
+	if err := js.S.DB().QueryRowContext(context.Background(),
+		`SELECT status FROM legacy_effect_blockers WHERE effect_kind='institutional' AND claim_id=?`, claimID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
+// A pre-permit institutional navigation settles exactly its own imported
+// blocker through the claim's route ordinal, once; every other tuple, and a
+// current permit on the same claim, is refused as stale and leaves the
+// blocker unresolved.
+func TestSettleLegacyInstitutionalNavigation(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	jobID, claimID, bindingID := seedLegacyInstitutionalBlocker(t, js, "exact")
+	otherJob, otherClaim, otherBinding := seedLegacyInstitutionalBlocker(t, js, "other")
+
+	for _, tc := range []struct {
+		name                 string
+		job, claim, binding  string
+		routeIssuanceOrdinal int64
+	}{
+		{"blank job", "", claimID, bindingID, 2},
+		{"blank claim", jobID, " ", bindingID, 2},
+		{"blank binding", jobID, claimID, "", 2},
+		{"zero route ordinal", jobID, claimID, bindingID, 0},
+		{"route ordinal beyond 2^53-1", jobID, claimID, bindingID, 1 << 53},
+		{"effect ordinal instead of route ordinal", jobID, claimID, bindingID, 3},
+		{"another job's claim", otherJob, claimID, bindingID, 2},
+		{"another claim's binding", jobID, claimID, otherBinding, 2},
+	} {
+		if err := js.SettleLegacyInstitutionalNavigation(ctx, tc.job, tc.claim, tc.binding, tc.routeIssuanceOrdinal); !errors.Is(err, ErrEffectPermitStale) {
+			t.Fatalf("%s: settle = %v, want stale", tc.name, err)
+		}
+	}
+	if got := legacyInstitutionalStatus(t, js, claimID); got != string(LegacyEffectBlockerUnresolved) {
+		t.Fatalf("blocker after refused tuples = %s, want unresolved", got)
+	}
+
+	if err := js.SettleLegacyInstitutionalNavigation(ctx, jobID, claimID, bindingID, 2); err != nil {
+		t.Fatalf("settle exact navigation: %v", err)
+	}
+	if got := legacyInstitutionalStatus(t, js, claimID); got != string(LegacyEffectBlockerSettled) {
+		t.Fatalf("blocker after exact settlement = %s, want settled", got)
+	}
+	if got := legacyInstitutionalStatus(t, js, otherClaim); got != string(LegacyEffectBlockerUnresolved) {
+		t.Fatalf("unrelated blocker after exact settlement = %s, want unresolved", got)
+	}
+	// A replayed navigation finds no unresolved blocker left to settle.
+	if err := js.SettleLegacyInstitutionalNavigation(ctx, jobID, claimID, bindingID, 2); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("replayed settlement = %v, want stale", err)
+	}
+
+	// A current permit on the claim owns its effect; legacy cleanup must not
+	// settle the blocker underneath it.
+	now := store.Now()
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO effect_permits
+		  (id, job_id, job_attempt_revision, browser_holder_generation, safety_domain_id, effect_kind,
+		   claim_id, binding_id, effect_ordinal, institutional_request_id, status, lease_until, created_at, updated_at)
+		VALUES ('permit-nav-other', ?, 1, 1, 'domain:nav-other', 'institutional',
+		        ?, ?, 4, 'institutional-request-nav-other', 'held', ?, ?, ?)`,
+		otherJob, otherClaim, otherBinding, store.FormatTime(time.Now().Add(time.Minute)), now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.SettleLegacyInstitutionalNavigation(ctx, otherJob, otherClaim, otherBinding, 2); !errors.Is(err, ErrEffectPermitStale) {
+		t.Fatalf("settle under a current permit = %v, want stale", err)
+	}
+	if got := legacyInstitutionalStatus(t, js, otherClaim); got != string(LegacyEffectBlockerUnresolved) {
+		t.Fatalf("blocker under a current permit = %s, want unresolved", got)
+	}
+}
+
 func TestImportLegacyDriveEffectsRejectsReversedConflictingDomainsAtomically(t *testing.T) {
 	tests := []struct {
 		name, eventKind, firstDetail, secondDetail string
