@@ -498,23 +498,37 @@ export class ToastDelivery {
    * so this id outlives the window it named. A browser is free to reuse a
    * window id after that, and removing a recycled id would close one of the
    * researcher's own windows. So the id alone never authorizes a removal: the
-   * window must still be serving the toast page. */
+   * window must still be serving the toast page.
+   *
+   * A toast raised a moment ago may still be loading, with the toast page as
+   * its tab's `pendingUrl` rather than its `url`. That window is papio's, and
+   * refusing it would leave it on screen, untracked, beside its replacement. */
   private async closeToastWindow(): Promise<void> {
     const windowID = this.toastWindowID;
-    this.toastWindowID = undefined;
     const windows = this.deps.windows;
     if (windowID === undefined || windows === undefined) return;
     const toastURL = this.deps.runtimeGetURL?.(TOAST_PAGE_PATH);
     if (toastURL === undefined) return;
+    let tabs: TabInfo[];
     try {
-      const existing = await windows.get(windowID);
-      const tabs = existing.tabs ?? [];
-      // Exactly one tab, and it must be the toast page. A window the
-      // researcher has navigated or added a tab to is theirs, not papio's.
-      if (tabs.length !== 1 || tabs[0]?.url !== toastURL) return;
-      await windows.remove(windowID);
+      tabs = (await windows.get(windowID)).tabs ?? [];
     } catch {
       // Already gone, or unreadable: either way papio does not remove it.
+      if (this.toastWindowID === windowID) this.toastWindowID = undefined;
+      return;
+    }
+    // Exactly one tab, and it must be the toast page. A window the
+    // researcher has navigated or added a tab to is theirs, not papio's.
+    const tab = tabs.length === 1 ? tabs[0] : undefined;
+    if (tab?.url !== toastURL && tab?.pendingUrl !== toastURL) {
+      if (this.toastWindowID === windowID) this.toastWindowID = undefined;
+      return;
+    }
+    try {
+      await windows.remove(windowID);
+      if (this.toastWindowID === windowID) this.toastWindowID = undefined;
+    } catch {
+      // Still papio's toast: keep the id so the next replacement retries.
     }
   }
 
@@ -534,15 +548,18 @@ export class ToastDelivery {
    * itself closed, from worker memory. */
   async toastAction(jobID: string): Promise<boolean> {
     const payload = this.pendingToast;
-    this.pendingToast = undefined;
-    this.toastWindowID = undefined;
     // A reopen offer whose worker slept still deserves an answer: the batch is
     // gone with the worker, and reopenFiledPapers falls back to the history.
-    if (payload === undefined && jobID.startsWith(FILED_TOAST_PREFIX))
+    if (payload === undefined && jobID.startsWith(FILED_TOAST_PREFIX)) {
+      this.toastWindowID = undefined;
       return this.reopenFiledPapers(jobID);
-    // Ignore an id that is not the offer papio made. A stale window reloaded
-    // after a replacement would otherwise reopen the wrong paper.
+    }
+    // Ignore an id that is not the offer papio made, and leave that offer and
+    // its window alone: a stale window reloaded after a replacement would
+    // otherwise reopen the wrong paper, or strand the live offer.
     if (payload === undefined || payload.job_id !== jobID) return false;
+    this.pendingToast = undefined;
+    this.toastWindowID = undefined;
     if (payload.kind === "paper_filed") return this.reopenFiledPapers(jobID);
     const minted = await this.ctx.requestFreshHandoffLink(jobID);
     if (minted.ok !== true) return false;
@@ -556,10 +573,12 @@ export class ToastDelivery {
 
   /** Dismissed or expired. Both drop the offer and neither performs the
    * action; the recovery stays in the inbox, which is what keeps the eight
-   * seconds from being a deadline. */
+   * seconds from being a deadline. A report for any other job is a stale
+   * surface and leaves the live offer and its window untouched. */
   toastDismiss(jobID: string): void {
-    if (this.pendingToast?.job_id === jobID) this.pendingToast = undefined;
     if (this.filedBatch?.id === jobID) this.filedBatch = undefined;
+    if (this.pendingToast?.job_id !== jobID) return;
+    this.pendingToast = undefined;
     this.toastWindowID = undefined;
   }
 
