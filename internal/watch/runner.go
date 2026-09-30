@@ -28,6 +28,32 @@ type Discovery interface {
 	Search(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error)
 }
 
+// PagedDiscovery is a Discovery source that resumes each backend's search
+// from a stored continuation token. discovery.Multi implements it. The runner
+// type-asserts for it, as it does for discovery.PartialSearcher; a source
+// without it keeps the single-page scan.
+type PagedDiscovery interface {
+	SearchPages(context.Context, discovery.SearchParams, map[string]string) (discovery.MultiPage, error)
+}
+
+// The daemon's discovery source reaches the paged scan only by
+// type-assertion, so a signature drift would silently fall back to one page.
+var _ PagedDiscovery = (*discovery.Multi)(nil)
+
+// ScanPagesPerSource bounds the result pages one run reads from each
+// discovery source: the first page, where new papers appear, plus up to
+// ScanPagesPerSource-1 deeper pages when the first page held nothing new.
+// Every page is one budget-gated search request.
+const ScanPagesPerSource = 4
+
+// scanPageLimit is the result count every scan page asks for: the first page
+// (as min(per-run cap*3, scanPageLimit)) and each deeper page. It stays well
+// under discovery.MaxLimit because a full OpenAlex page of 50 works outgrows
+// the discovery client's 1 MiB response-body cap (defaultMaxBody in
+// internal/discovery/discovery.go), so every such page fails instead of
+// answering.
+const scanPageLimit = 25
+
 // OwnershipLookup is the Zotio deduplication surface used before submitting
 // acquisition work.
 type OwnershipLookup interface {
@@ -63,10 +89,11 @@ type RunResult struct {
 	ManifestID          string `json:"manifest_id,omitempty"`
 	ConsecutiveFailures int    `json:"consecutive_failures"`
 	Disabled            bool   `json:"disabled"`
-	// Degraded reports a run that processed healthy discovery results while
-	// one or more discovery backends failed. The cadence advances and the
-	// failed backends are named in the watch's persisted last_error; the run
-	// is deliberately not a clean success.
+	// Degraded reports a run whose discovery scan did not finish: one or
+	// more discovery backends failed, or the bounded deeper scan stopped
+	// with results left unread. The cadence advances and the reasons are
+	// named in the watch's persisted last_error; the run is deliberately
+	// not a clean success.
 	Degraded bool `json:"degraded,omitempty"`
 }
 
@@ -430,16 +457,295 @@ func (r *Runner) searchDiscovery(ctx context.Context, params discovery.SearchPar
 }
 
 // markDiscoveryRun advances the watch cadence after a scan that produced no
-// hard error. When every backend answered it is a clean success; when some
-// backends failed while others answered, the healthy results stand but the
-// run is recorded as degraded with the failed backends named, so a partial
-// scan — including a zero-result one — is never reported as complete.
-func (r *Runner) markDiscoveryRun(ctx context.Context, watch Watch, runStart time.Time, failures []discovery.BackendFailure, result *RunResult) error {
-	if len(failures) == 0 {
+// hard error. A scan that finished is a clean success. One that did not —
+// failed backends, or a deeper scan stopped with results left unread — keeps
+// its healthy results but is recorded as partial with every reason named, so
+// an incomplete scan, including a zero-result one, is never reported as
+// complete.
+func (r *Runner) markDiscoveryRun(ctx context.Context, watch Watch, runStart time.Time, detail string, result *RunResult) error {
+	if detail == "" {
 		return r.Store.MarkRun(ctx, watch.ID, runStart)
 	}
 	result.Degraded = true
-	return r.Store.MarkPartialRun(ctx, watch.ID, runStart, discovery.SummarizeFailures(failures))
+	return r.Store.MarkPartialRun(ctx, watch.ID, runStart, detail)
+}
+
+// discoveryScan is what one run's discovery scan found and what it left
+// unfinished.
+type discoveryScan struct {
+	// fresh holds new works in scan order — unheld and, for an alert watch,
+	// never recorded in its digest — capped at the watch's per-run cap.
+	fresh []discoveredRequest
+	// known holds the first page's unheld works that the alert digest
+	// already has. Recording them again reports nothing; it only refreshes
+	// their stored identity (a title-only entry gaining its DOI).
+	known []discoveredRequest
+	// coverage is each scanned source's next position, persisted only
+	// after fresh has been handled so a failed run re-reads its pages.
+	coverage []SourceCoverage
+	failures []discovery.BackendFailure
+	// limits names each source whose deeper scan stopped with results left
+	// unread.
+	limits []string
+}
+
+// take appends new works up to the per-run cap and reports how many it kept.
+func (scan *discoveryScan) take(fresh []discoveredRequest, perRunCap int) int {
+	kept := min(max(perRunCap-len(scan.fresh), 0), len(fresh))
+	scan.fresh = append(scan.fresh, fresh[:kept]...)
+	return kept
+}
+
+// detail names every reason the scan did not finish, or is empty when it did.
+func (scan *discoveryScan) detail() string {
+	parts := make([]string, 0, 1+len(scan.limits))
+	if summary := discovery.SummarizeFailures(scan.failures); summary != "" {
+		parts = append(parts, summary)
+	}
+	parts = append(parts, scan.limits...)
+	return strings.Join(parts, "; ")
+}
+
+// scanFirstPage is the scan for a discovery source that cannot page: one
+// search, classified once.
+func (r *Runner) scanFirstPage(ctx context.Context, watch Watch, params discovery.SearchParams) (*discoveryScan, error) {
+	works, failures, err := r.searchDiscovery(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("discovery search: %w", err)
+	}
+	scan := &discoveryScan{failures: failures}
+	fresh, known, err := r.newWork(ctx, watch, works, make(map[string]struct{}))
+	if err != nil {
+		return nil, err
+	}
+	scan.take(fresh, watch.PerRunCap)
+	scan.known = known
+	return scan, nil
+}
+
+// scanPages reads every source's first page, where new papers appear. Only
+// when that page holds nothing new does it walk deeper, one source at a time
+// in preference order, resuming each source's stored position, until a page
+// yields new work or the source has spent ScanPagesPerSource pages.
+//
+// Result order is not stable. Relevance-ranked backends (OpenAlex text
+// search, Semantic Scholar search) reorder as their corpus changes, so a
+// resumed walk can repeat or skip a work; arXiv's newest-first order only
+// repeats. The walk is a rolling sweep, not exact coverage: only a source
+// that reports exhausted counts as scanned to the end, and the next run then
+// restarts its walk after the first page.
+func (r *Runner) scanPages(ctx context.Context, pager PagedDiscovery, watch Watch, params discovery.SearchParams) (*discoveryScan, error) {
+	first, err := pager.SearchPages(ctx, params, nil)
+	if err != nil {
+		return nil, fmt.Errorf("discovery search: %w", err)
+	}
+	scan := &discoveryScan{}
+	seen := make(map[string]struct{})
+	fresh, known, err := r.newWork(ctx, watch, first.Works, seen)
+	if err != nil {
+		return nil, err
+	}
+	scan.take(fresh, watch.PerRunCap)
+	scan.known = known
+	deeper := len(fresh) == 0
+	walks := make([]discovery.SourcePage, 0, len(first.Sources))
+	for _, page := range first.Sources {
+		switch page.State {
+		case discovery.PageFailed:
+			// The stored position stays for the next run.
+			scan.failures = append(scan.failures, pageFailure(page))
+		case discovery.PageMore:
+			if deeper {
+				walks = append(walks, page)
+			}
+		default:
+			// The first page holds everything this source will return, so
+			// any stored deeper position is obsolete.
+			scan.coverage = append(scan.coverage, SourceCoverage{Source: page.Source, State: string(page.State)})
+			if note := stopNote(page.Source, page.State); deeper && note != "" {
+				scan.limits = append(scan.limits, note)
+			}
+		}
+	}
+	if len(walks) == 0 {
+		return scan, nil
+	}
+	stored, err := r.Store.ScanCoverage(ctx, watch.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, page := range walks {
+		if len(scan.fresh) > 0 {
+			// New work found: later sources keep their stored positions.
+			break
+		}
+		if err := r.walkSource(ctx, pager, watch, params, page, stored[page.Source].NextToken, seen, scan); err != nil {
+			return nil, err
+		}
+	}
+	return scan, nil
+}
+
+// walkSource reads up to ScanPagesPerSource-1 deeper pages from one source,
+// starting at its stored position or, without one, right after its first
+// page, and records where the next run resumes.
+func (r *Runner) walkSource(ctx context.Context, pager PagedDiscovery, watch Watch, params discovery.SearchParams, first discovery.SourcePage, stored string, seen map[string]struct{}, scan *discoveryScan) error {
+	source := first.Source
+	params.Source = source
+	params.Limit = scanPageLimit
+	token, resumed := first.Next, false
+	if stored != "" {
+		token, resumed = stored, true
+	}
+	for pages := 1; pages < ScanPagesPerSource; {
+		// With one source selected, a hard error means that source failed,
+		// and its failed page is still listed.
+		result, err := pager.SearchPages(ctx, params, map[string]string{source: token})
+		page, found := sourcePage(result, source)
+		if !found {
+			message := "search returned no page"
+			if err != nil {
+				message = discovery.SanitizeError(err)
+			}
+			scan.failures = append(scan.failures, discovery.BackendFailure{Source: source, Message: message, At: r.now()})
+			return nil
+		}
+		if page.State == discovery.PageFailed {
+			if resumed && errors.Is(page.Err, discovery.ErrInvalidPageToken) {
+				// The stored position belongs to another search (the watch's
+				// query or filters changed) or is unusable. Discard it and
+				// restart after the first page. It is not a source failure,
+				// and the rejected token cost no request.
+				log.Printf("papio: watch %d: discarding stored %s scan position (%s); restarting after the first page", watch.ID, source, pageFailure(page).Message)
+				token, resumed = first.Next, false
+				continue
+			}
+			// A failure or a budget refusal is not exhaustion: page.Next
+			// echoes the token, so the next run retries this position.
+			scan.failures = append(scan.failures, pageFailure(page))
+			scan.coverage = append(scan.coverage, SourceCoverage{Source: source, NextToken: page.Next, State: string(page.State)})
+			return nil
+		}
+		pages++
+		resumed = false
+		fresh, _, err := r.newWork(ctx, watch, result.Works, seen)
+		if err != nil {
+			return err
+		}
+		if kept := scan.take(fresh, watch.PerRunCap); kept < len(fresh) {
+			// New works beyond the per-run cap: the next run re-reads this
+			// page rather than skip past them.
+			scan.coverage = append(scan.coverage, SourceCoverage{Source: source, NextToken: token, State: string(discovery.PageMore)})
+			return nil
+		}
+		if page.State != discovery.PageMore {
+			scan.coverage = append(scan.coverage, SourceCoverage{Source: source, State: string(page.State)})
+			if note := stopNote(source, page.State); len(fresh) == 0 && note != "" {
+				scan.limits = append(scan.limits, note)
+			}
+			return nil
+		}
+		token = page.Next
+		if len(fresh) > 0 {
+			scan.coverage = append(scan.coverage, SourceCoverage{Source: source, NextToken: token, State: string(page.State)})
+			return nil
+		}
+	}
+	scan.coverage = append(scan.coverage, SourceCoverage{Source: source, NextToken: token, State: string(discovery.PageMore)})
+	scan.limits = append(scan.limits, fmt.Sprintf("%s: scan limit of %d pages reached with more results left; the next run continues", source, ScanPagesPerSource))
+	return nil
+}
+
+// sourcePage finds one source's page in a paged search result.
+func sourcePage(result discovery.MultiPage, source string) (discovery.SourcePage, bool) {
+	for _, page := range result.Sources {
+		if page.Source == source {
+			return page, true
+		}
+	}
+	return discovery.SourcePage{}, false
+}
+
+// pageFailure is the sanitized failure of a failed page.
+func pageFailure(page discovery.SourcePage) discovery.BackendFailure {
+	if page.Failure != nil {
+		return *page.Failure
+	}
+	return discovery.BackendFailure{Source: page.Source, Message: "search failed"}
+}
+
+// stopNote names a source whose results end before the scan could look at
+// all of them, or is empty for a source that reached its real end.
+func stopNote(source string, state discovery.PageState) string {
+	switch state {
+	case discovery.PageTruncated:
+		return source + ": later results lie past the source's result window and cannot be reached"
+	case discovery.PageUnsupported:
+		return source + ": cannot page past its first results"
+	}
+	return ""
+}
+
+// newWork classifies one page's works and returns the ones this watch has not
+// handled yet: fresh works are unheld by the ownership authority and, for an
+// alert watch, absent from its digest — including entries already cleared or
+// acquired, so a work met again on a later page or run is never reported
+// twice. known holds the unheld works an alert digest already has. seen
+// drops works an earlier page of the same run returned.
+func (r *Runner) newWork(ctx context.Context, watch Watch, works []discovery.DiscoveredWork, seen map[string]struct{}) (fresh, known []discoveredRequest, err error) {
+	requests := appendDiscoveredRequests(nil, seen, works)
+	if len(requests) == 0 {
+		return nil, nil, nil
+	}
+	requestWorks := make([]protocol.WorkRequest, len(requests))
+	for i, request := range requests {
+		requestWorks[i] = request.Work
+	}
+	// Classification fails the whole run before anything is recorded or
+	// submitted, so an unverifiable answer is retried on the next cadence
+	// instead of turning an unknown work into a new discovery.
+	unheld, err := r.classifyUnheld(ctx, requestWorks)
+	if err != nil {
+		return nil, nil, err
+	}
+	for i, request := range requests {
+		if unheld[i] {
+			fresh = append(fresh, request)
+		}
+	}
+	if watch.Mode != ModeAlert || len(fresh) == 0 {
+		return fresh, nil, nil
+	}
+	// A work the digest cannot record (a malformed DOI) is left unknown, so
+	// it fails the run only if the per-run cap actually selects it, exactly
+	// as when every run looked at one page.
+	entries := make([]DigestEntry, 0, len(fresh))
+	checked := make([]int, 0, len(fresh))
+	for i, request := range fresh {
+		built, err := digestEntriesForDiscovered([]discoveredRequest{request})
+		if err != nil {
+			continue
+		}
+		entries = append(entries, built[0])
+		checked = append(checked, i)
+	}
+	digested, err := r.Store.KnownDigestEntries(ctx, watch.ID, entries)
+	if err != nil {
+		return nil, nil, err
+	}
+	inDigest := make([]bool, len(fresh))
+	for j, i := range checked {
+		inDigest[i] = digested[j]
+	}
+	unreported := make([]discoveredRequest, 0, len(fresh))
+	for i, request := range fresh {
+		if inDigest[i] {
+			known = append(known, request)
+		} else {
+			unreported = append(unreported, request)
+		}
+	}
+	return unreported, known, nil
 }
 
 // countedNoun renders an exact quantity with a noun that agrees with it. Watch
@@ -557,58 +863,38 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	if r.Discovery == nil || (r.Lookup == nil && !r.holdingsEnabled()) || (watch.Mode == ModeAcquire && r.Submitter == nil) {
 		return result, errors.New("watch runner dependencies are not configured")
 	}
-	works, discoveryFailures, err := r.searchDiscovery(ctx, discovery.SearchParams{
-		Query: watch.Query, Limit: min(watch.PerRunCap*3, 25), Slim: true,
+	params := discovery.SearchParams{
+		Query: watch.Query, Limit: min(watch.PerRunCap*3, scanPageLimit), Slim: true,
 		YearFrom: watch.Filters.YearFrom, YearTo: watch.Filters.YearTo, OAOnly: watch.Filters.OAOnly,
 		Cites: watch.Filters.Cites, CitedBy: watch.Filters.CitedBy, RelatedTo: watch.Filters.RelatedTo,
-	})
-	if err != nil {
-		return result, fmt.Errorf("discovery search: %w", err)
 	}
-	requests := requestsForDiscoveredWithWork(works)
-	if len(requests) == 0 {
-		if watch.Mode == ModeAlert {
-			if err := r.deliverPendingDigestAlerts(ctx, watch, runStart); err != nil {
-				return result, err
-			}
-		}
-		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
+	var scan *discoveryScan
+	var err error
+	if pager, ok := r.Discovery.(PagedDiscovery); ok {
+		scan, err = r.scanPages(ctx, pager, watch, params)
+	} else {
+		scan, err = r.scanFirstPage(ctx, watch, params)
 	}
-	requestWorks := make([]protocol.WorkRequest, len(requests))
-	for i, request := range requests {
-		requestWorks[i] = request.Work
-	}
-	// Classification fails the whole run before anything is recorded or
-	// submitted, so an unverifiable answer is retried on the next cadence
-	// instead of turning an unknown work into a new discovery.
-	unheld, err := r.classifyUnheld(ctx, requestWorks)
 	if err != nil {
 		return result, err
 	}
-	queued := make([]discoveredRequest, 0, min(watch.PerRunCap, len(requests)))
-	for i, request := range requests {
-		if unheld[i] && len(queued) < watch.PerRunCap {
-			queued = append(queued, request)
-		}
-	}
-	if len(queued) == 0 {
-		if watch.Mode == ModeAlert {
-			if err := r.deliverPendingDigestAlerts(ctx, watch, runStart); err != nil {
+	if watch.Mode == ModeAlert {
+		if records := append(append([]discoveredRequest(nil), scan.fresh...), scan.known...); len(records) > 0 {
+			entries, err := digestEntriesForDiscovered(records)
+			if err != nil {
 				return result, err
 			}
+			reported, err := r.Store.RecordDigest(ctx, watch.ID, runStart, entries)
+			if err != nil {
+				return result, err
+			}
+			result.Reported = reported
 		}
-		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
-	}
-	if watch.Mode == ModeAlert {
-		entries, err := digestEntriesForDiscovered(queued)
-		if err != nil {
+		// The new works are durable digest entries now, so the scan
+		// position may move past them.
+		if err := r.Store.SaveScanCoverage(ctx, watch.ID, runStart, scan.coverage); err != nil {
 			return result, err
 		}
-		reported, err := r.Store.RecordDigest(ctx, watch.ID, runStart, entries)
-		if err != nil {
-			return result, err
-		}
-		result.Reported = reported
 		// Alert delivery is at-least-once: the digest rows above are durable,
 		// but a crash (or a notifier failure) between RecordDigest and the
 		// route below used to leave them permanently unannounced, because the
@@ -618,17 +904,23 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		// the receipt only after the route succeeds. A failed route returns
 		// before MarkRun so the run is recorded as a failure and the stranded
 		// entries are retried without rediscovery on the next cadence. The
-		// same catch-up runs when this scan finds nothing new (the early
-		// returns above), so a failed route is retried even when later scans
-		// report no hits or only owned work.
+		// same catch-up runs when this scan finds nothing new, so a failed
+		// route is retried even when later scans report no hits or only
+		// owned work.
 		if err := r.deliverPendingDigestAlerts(ctx, watch, runStart); err != nil {
 			return result, err
 		}
-		return result, r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result)
+		return result, r.markDiscoveryRun(ctx, watch, runStart, scan.detail(), result)
+	}
+	if len(scan.fresh) == 0 {
+		if err := r.Store.SaveScanCoverage(ctx, watch.ID, runStart, scan.coverage); err != nil {
+			return result, err
+		}
+		return result, r.markDiscoveryRun(ctx, watch, runStart, scan.detail(), result)
 	}
 
-	queuedWorks := make([]protocol.WorkRequest, len(queued))
-	for i, request := range queued {
+	queuedWorks := make([]protocol.WorkRequest, len(scan.fresh))
+	for i, request := range scan.fresh {
 		queuedWorks[i] = request.Work
 	}
 	manifest := batch.NewManifest(queuedWorks, "watch: "+watch.Label, watch.Collection, runStart)
@@ -655,14 +947,27 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		return result, err
 	}
 	if result.Failed == len(manifest.Works) {
+		// The scan position stays put, so the next run re-reads these pages.
 		return result, fmt.Errorf("all %d watch submissions failed", result.Failed)
 	}
-	if result.Failed > 0 {
+	if err := r.Store.SaveScanCoverage(ctx, watch.ID, runStart, scan.coverage); err != nil {
+		return result, err
+	}
+	detail := scan.detail()
+	switch {
+	case result.Failed > 0 && detail != "":
+		result.Degraded = true
+		if err := r.Store.MarkPartialRun(ctx, watch.ID, runStart, fmt.Sprintf("%d of %d watch submissions failed; %s", result.Failed, len(manifest.Works), detail)); err != nil {
+			return result, err
+		}
+	case result.Failed > 0:
 		if err := r.Store.MarkDegradedRun(ctx, watch.ID, runStart, result.Failed, len(manifest.Works)); err != nil {
 			return result, err
 		}
-	} else if err := r.markDiscoveryRun(ctx, watch, runStart, discoveryFailures, result); err != nil {
-		return result, err
+	default:
+		if err := r.markDiscoveryRun(ctx, watch, runStart, detail, result); err != nil {
+			return result, err
+		}
 	}
 	if result.Queued > 0 {
 		r.route(ctx, r.watchIntent(watch, runStart, notify.Event{
@@ -679,9 +984,11 @@ type discoveredRequest struct {
 	Discovered discovery.DiscoveredWork
 }
 
-func requestsForDiscoveredWithWork(works []discovery.DiscoveredWork) []discoveredRequest {
-	requests := make([]discoveredRequest, 0, len(works))
-	seen := make(map[string]struct{}, len(works))
+// appendDiscoveredRequests turns discovered works into work requests,
+// dropping works without a usable identity and any work whose DOI, arXiv ID,
+// or OpenAlex ID is already in seen, which it updates. Passing one seen set
+// across pages drops a work an earlier page returned.
+func appendDiscoveredRequests(requests []discoveredRequest, seen map[string]struct{}, works []discovery.DiscoveredWork) []discoveredRequest {
 	for _, discovered := range works {
 		doi := strings.TrimSpace(discovered.Work.DOI)
 		arXiv, err := work.NormalizeArXiv(discovered.Work.ArXiv)

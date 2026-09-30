@@ -14,6 +14,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/app"
 	"papio/internal/config"
+	"papio/internal/ipc"
 )
 
 func supplyPDFConfig(t *testing.T, limit int64) config.Config {
@@ -67,6 +68,37 @@ func TestSupplyPDFStagesTheFileAndSendsOnlyItsName(t *testing.T) {
 	}
 	if original, err := os.ReadFile(source); err != nil || !bytes.Equal(original, body) {
 		t.Fatalf("original file = %q, %v; want it unchanged", original, err)
+	}
+}
+
+// A finished job cannot take a PDF; the CLI turns the daemon's error class
+// into the remedy: submit the work again, then supply the PDF to the new job.
+func TestSupplyPDFNamesTheAcquireRemedyForAFinishedJob(t *testing.T) {
+	cfg := supplyPDFConfig(t, 1<<20)
+	source := filepath.Join(t.TempDir(), "paper.pdf")
+	if err := os.WriteFile(source, []byte("%PDF-1.7\nfinished job\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, cfg, func(context.Context, string, any, any) error {
+		return &ipc.RemoteError{
+			Code: "precondition_failed", Message: "the job is unavailable, which is final; it cannot take a supplied PDF",
+			Detail: &ipc.ErrorDetail{ErrorClass: api.SupplyPDFJobFinishedClass},
+		}
+	})
+	root.SetArgs([]string{"jobs", "supply-pdf", "job_01", source})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "submit the work again with `papio acquire`") ||
+		!strings.Contains(err.Error(), "papio jobs supply-pdf <new-job-id> "+source) ||
+		!strings.Contains(err.Error(), "unavailable, which is final") {
+		t.Fatalf("finished-job refusal = %v; want the acquire remedy and the daemon's reason", err)
+	}
+	stageDir, stageErr := app.SuppliedPDFStagingDir(cfg.DataDir, "job_01")
+	if stageErr != nil {
+		t.Fatal(stageErr)
+	}
+	if _, statErr := os.Lstat(stageDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("staging directory after a refusal: %v; want it removed", statErr)
 	}
 }
 

@@ -120,6 +120,14 @@ func newWatchListCommand(opt *options) *cobra.Command {
 				if filters != "" {
 					state += " | " + filters
 				}
+				// last_error carries the last run's failure, or why its
+				// discovery scan was incomplete (failed source, page limit
+				// reached). Backend failure text is sanitized upstream but
+				// still third-party, so it goes through the same terminal
+				// control stripping as digest rows.
+				if item.LastError != "" {
+					state += " | last run: " + store.StripTerminalControls(item.LastError)
+				}
 				if _, err := fmt.Fprintf(opt.out, "%d | %s | every %dh | %s\n", item.ID, item.Label, item.CadenceHours, state); err != nil {
 					return err
 				}
@@ -278,10 +286,14 @@ func newWatchRunCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "watch.run", watch.IDInput{ID: id}, &result); err != nil {
 				return err
 			}
-			if result.Reported > 0 {
-				return opt.printResult(result, "Watch %d reported %d new work(s) — papio watch digest %d", result.WatchID, result.Reported, result.WatchID)
+			incomplete := ""
+			if result.Degraded {
+				incomplete = "; discovery scan incomplete — see papio watch list"
 			}
-			return opt.printResult(result, "Watch %d queued %d paper(s)", result.WatchID, result.Queued)
+			if result.Reported > 0 {
+				return opt.printResult(result, "Watch %d reported %d new work(s) — papio watch digest %d%s", result.WatchID, result.Reported, result.WatchID, incomplete)
+			}
+			return opt.printResult(result, "Watch %d queued %d paper(s)%s", result.WatchID, result.Queued, incomplete)
 		},
 	}
 }

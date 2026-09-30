@@ -197,6 +197,11 @@ type SupplyPDFResult struct {
 	CandidateID int64  `json:"candidate_id"`
 }
 
+// SupplyPDFJobFinishedClass marks a jobs.supply_pdf refusal for a terminal
+// job. The CLI keys its remedy on it (submit the work again, then supply the
+// PDF to the new job), so it is part of the method's contract.
+const SupplyPDFJobFinishedClass = "supply_pdf_job_finished"
+
 // RedriveResult reports the new institutional handoff after one operator
 // request. ActionID is zero when the redrive returned the job to resolving
 // instead: a manual download the open-access route left, or a job whose
@@ -1391,7 +1396,14 @@ func supplyPDF(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	if err != nil {
 		// The name sentinel does not echo the wrapped error: confinement
 		// failures carry the staging path, which belongs in the daemon log.
+		var finished *app.SuppliedPDFJobFinishedError
 		switch {
+		case errors.As(err, &finished):
+			return nil, &ipc.RPCError{
+				Code:    "precondition_failed",
+				Message: "the job is " + finished.State + ", which is final; it cannot take a supplied PDF",
+				Detail:  &ipc.ErrorDetail{ErrorClass: SupplyPDFJobFinishedClass},
+			}
 		case errors.Is(err, app.ErrSuppliedPDFName):
 			log.Printf("rpc supply_pdf name rejected: %v", err)
 			return nil, &ipc.RPCError{Code: "invalid_argument", Message: "the name must be a regular file staged in the job's supply directory"}

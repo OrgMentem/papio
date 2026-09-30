@@ -1101,7 +1101,11 @@ data directory and runs the same checks as a browser download: the PDF must be r
 and must be the requested work. A PDF of a different work goes to identity review or is
 rejected; it never becomes ready unchecked. Your original file is not changed.
 
-The job must still be live: queued, resolving, fetching, or awaiting a human download.
+The job must still be open: queued, resolving, fetching, waiting to retry (retry_wait),
+or awaiting a human download. A finished job (ready, imported, unavailable, failed, or
+cancelled) cannot take a PDF: submit the work again with `papio acquire`, then supply the
+PDF to the new job id.
+
 Use add-component for supplements and appendices.
 
 ```

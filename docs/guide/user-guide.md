@@ -721,10 +721,19 @@ file. The outcome is one of these:
   active content. The job waits for your review action.
 - `rejected`: the PDF failed validation. The job waits for a different file.
 
-The job must still be open: `queued`, `resolving`, `fetching`, or
-`awaiting_human`. The command refuses a finished job (`ready`, `imported`,
-`unavailable`, `failed`, or `cancelled`), and a job that is validating or
-waiting for review. `papio stats producers` counts a supplied PDF as `manual`.
+The job must still be open: `queued`, `resolving`, `fetching`, `retry_wait`,
+or `awaiting_human`. A paywalled job often waits in `retry_wait` between
+attempts; the command takes it from there. The command refuses a job that is
+validating or waiting for review. It also refuses a job that is waiting on a
+document-delivery request. Check that request with
+`papio delivery get <job-id>`, and settle or cancel it first.
+
+A finished job (`ready`, `imported`, `unavailable`, `failed`, or `cancelled`)
+cannot take a PDF. Submit the work again, for example with
+`papio acquire --doi <doi>`, and then supply the PDF to the new job id. The
+command prints this remedy when it refuses a finished job.
+
+`papio stats producers` counts a supplied PDF as `manual`.
 
 Use `papio jobs add-component` for supplements and appendices. The MCP command
 tools do not offer `supply-pdf`, because it reads a file on this computer.
@@ -768,6 +777,41 @@ succeeds, run `papio watch resume <watch-id>`. The watch keeps its id, query, an
 digest history, and its next scheduled run comes one cadence after the forced
 run. Resume refuses while the latest run is still a failure. Removing a watch
 does not remove jobs or Zotero items created by earlier runs.
+
+### How far a watch looks
+
+Each run reads the first page of results, because new papers appear there.
+When that page holds nothing new, the run reads deeper pages, up to four pages
+of at most 25 results for each discovery source.
+A work is new when you do not already hold it and, for an alert watch, when it
+is not in the watch's digest. A digest entry you cleared or acquired still
+counts, so an alert watch never reports the same work twice. An acquire watch
+treats a paper as new until it is in your library, so a paper that is still
+being acquired keeps the run on the first page.
+
+The watch stores where each source's deeper scan stopped, and the next run
+continues from that position instead of reading the same pages again. When a
+source reports the end of its results, the next deeper scan starts again after
+the first page. A stored position that no longer fits the watch's search is
+discarded, and the scan starts again; this is not a failure.
+
+A run that could not look at every result is not a clean, empty success.
+`papio watch list` shows the reason after `last run:`, and `papio watch run`
+adds `discovery scan incomplete`:
+
+- `scan limit of 4 pages reached with more results left`: the next run
+  continues from the stored position.
+- `<source>: <error>`: the source failed, or its request budget is spent. The
+  source keeps its stored position, and the next run tries it again.
+- `later results lie past the source's result window`: arXiv and Semantic
+  Scholar search do not page past a fixed number of results.
+- `cannot page past its first results`: the source returns only one page.
+
+Result order is not fixed. OpenAlex and Semantic Scholar rank by relevance,
+and the ranking changes as their catalogues grow, so a deeper scan can repeat
+or miss a work. arXiv lists the newest papers first, so it can only repeat a
+work. The deeper scan is a rolling sweep, not proof that *papio* saw every
+match.
 
 ### Alert-only watches: report first, acquire on demand
 

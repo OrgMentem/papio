@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"papio/internal/artifact"
+	"papio/internal/delivery"
 	"papio/internal/job"
 )
 
@@ -29,11 +30,23 @@ var (
 	ErrSuppliedPDFName = errors.New("supplied PDF staging name rejected")
 	// ErrSuppliedPDFSize reports a staged file larger than fetch.max_bytes.
 	ErrSuppliedPDFSize = errors.New("supplied PDF is larger than fetch.max_bytes")
-	// ErrSuppliedPDFState reports a job that cannot take a main PDF: a
-	// terminal job, or one already validating, held for review, or waiting
-	// to retry.
+	// ErrSuppliedPDFState reports a live job that cannot take a main PDF
+	// now: one already validating or held for review, or one waiting on a
+	// live document-delivery request.
 	ErrSuppliedPDFState = errors.New("job cannot take a supplied PDF")
 )
+
+// SuppliedPDFJobFinishedError reports a terminal job. A finished job never
+// takes new bytes: the operator submits the work again and supplies the PDF
+// to the new job.
+type SuppliedPDFJobFinishedError struct {
+	JobID string
+	State string
+}
+
+func (e *SuppliedPDFJobFinishedError) Error() string {
+	return fmt.Sprintf("job %s is %s, which is final; it cannot take a supplied PDF", e.JobID, e.State)
+}
 
 // SupplyResult is what SupplyPDF did with one staged file. Outcome is one of
 // AdoptionAccepted, AdoptionNeedsReview, or AdoptionRejected.
@@ -74,6 +87,12 @@ func plainFileName(name string) bool {
 // is job.CandidateSourceOperator, so the producer record names the bytes
 // manual. The staged file is removed once the daemon has read it or refused
 // it; the operator's original file is never touched.
+//
+// Unlike a browser download, a supplied PDF is also accepted for a job in
+// retry_wait — where a paywalled job usually sits between attempts — by
+// following retry_wait -> resolving first. The exception is a job waiting on
+// a live document-delivery request: its provider request would be left
+// behind, so the operator settles that request first.
 func (s *Service) SupplyPDF(ctx context.Context, jobID, name string) (SupplyResult, error) {
 	if !plainFileName(name) {
 		return SupplyResult{}, fmt.Errorf("%w: %q is not a file name", ErrSuppliedPDFName, name)
@@ -87,7 +106,16 @@ func (s *Service) SupplyPDF(ctx context.Context, jobID, name string) (SupplyResu
 		return SupplyResult{}, err
 	}
 	if job.Terminal(row.State) {
-		return SupplyResult{}, fmt.Errorf("%w: job %s is %s, which is final", ErrSuppliedPDFState, jobID, row.State)
+		return SupplyResult{}, &SuppliedPDFJobFinishedError{JobID: jobID, State: row.State}
+	}
+	if row.State == job.StateRetryWait {
+		live, err := s.liveDeliveryRequest(ctx, jobID)
+		if err != nil {
+			return SupplyResult{}, err
+		}
+		if live {
+			return SupplyResult{}, fmt.Errorf("%w: job %s is waiting on a document-delivery request; check it with `papio delivery get %s` and settle or cancel it before you supply a PDF", ErrSuppliedPDFState, jobID, jobID)
+		}
 	}
 	staged, info, err := confineSuppliedPDF(stageDir, name)
 	if err != nil {
@@ -103,10 +131,14 @@ func (s *Service) SupplyPDF(ctx context.Context, jobID, name string) (SupplyResu
 	}
 	// The job is parked only after the staged file is confined, so a refused
 	// request leaves a live job where it was.
-	row, err = s.prepareMainAdoption(ctx, jobID, "operator_supplied_pdf")
+	row, err = s.prepareMainAdoption(ctx, jobID, "operator_supplied_pdf", true)
 	if err != nil {
 		var stateErr *adoptionStateError
 		if errors.As(err, &stateErr) {
+			// The job can finish between the check above and the park.
+			if job.Terminal(stateErr.state) {
+				return SupplyResult{}, &SuppliedPDFJobFinishedError{JobID: jobID, State: stateErr.state}
+			}
 			return SupplyResult{}, fmt.Errorf("%w: %w", ErrSuppliedPDFState, err)
 		}
 		return SupplyResult{}, err
@@ -122,6 +154,19 @@ func (s *Service) SupplyPDF(ctx context.Context, jobID, name string) (SupplyResu
 		rejected:   s.rejectSuppliedPDF,
 	})
 	return SupplyResult{CandidateID: adopted.candidateID, SHA256: adopted.sha256, Outcome: adopted.outcome}, err
+}
+
+// liveDeliveryRequest reports whether jobID is pinned to a document-delivery
+// request the provider may still fulfil (submitted or pending).
+func (s *Service) liveDeliveryRequest(ctx context.Context, jobID string) (bool, error) {
+	if s.Delivery == nil {
+		return false, nil
+	}
+	request, err := s.Delivery.GetByJobID(ctx, jobID)
+	if err != nil {
+		return false, fmt.Errorf("reading the job's document-delivery request: %w", err)
+	}
+	return request != nil && (request.State == delivery.StateSubmitted || request.State == delivery.StatePending), nil
 }
 
 // confineSuppliedPDF resolves name inside the job's staging directory. The

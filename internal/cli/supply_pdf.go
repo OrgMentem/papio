@@ -13,6 +13,7 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/app"
+	"papio/internal/ipc"
 	"papio/internal/job"
 )
 
@@ -28,7 +29,10 @@ func newJobsSupplyPDFCommand(opt *options) *cobra.Command {
 			"data directory and runs the same checks as a browser download: the PDF must be readable\n" +
 			"and must be the requested work. A PDF of a different work goes to identity review or is\n" +
 			"rejected; it never becomes ready unchecked. Your original file is not changed.\n\n" +
-			"The job must still be live: queued, resolving, fetching, or awaiting a human download.\n" +
+			"The job must still be open: queued, resolving, fetching, waiting to retry (retry_wait),\n" +
+			"or awaiting a human download. A finished job (ready, imported, unavailable, failed, or\n" +
+			"cancelled) cannot take a PDF: submit the work again with `papio acquire`, then supply the\n" +
+			"PDF to the new job id.\n\n" +
 			"Use add-component for supplements and appendices.",
 		Annotations: map[string]string{"mcp:hidden": "true"},
 		Args:        cobra.ExactArgs(2),
@@ -52,7 +56,7 @@ func newJobsSupplyPDFCommand(opt *options) *cobra.Command {
 				if isUnknownMethod(err) {
 					return daemonUpgradeRequired("jobs.supply_pdf")
 				}
-				return err
+				return supplyPDFError(args[0], args[1], err)
 			}
 			if opt.jsonOutput {
 				return opt.printJSON(result)
@@ -61,6 +65,19 @@ func newJobsSupplyPDFCommand(opt *options) *cobra.Command {
 			return err
 		},
 	}
+}
+
+// supplyPDFError turns a jobs.supply_pdf refusal into the next step the
+// operator must take. Other errors pass through unchanged.
+func supplyPDFError(jobID, path string, err error) error {
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) || remote.Detail == nil {
+		return err
+	}
+	if remote.Detail.ErrorClass == api.SupplyPDFJobFinishedClass {
+		return fmt.Errorf("job %s has finished, so it cannot take a PDF; submit the work again with `papio acquire` (for example `papio acquire --doi <doi>`), then run `papio jobs supply-pdf <new-job-id> %s`: %w", jobID, path, err)
+	}
+	return err
 }
 
 // stageSuppliedPDF checks the operator's local file and copies it into the

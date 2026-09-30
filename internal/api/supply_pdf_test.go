@@ -93,8 +93,9 @@ func TestSupplyPDFRPCRefusesATerminalJob(t *testing.T) {
 	}
 	stageSupplyFixture(t, system, id, "supplied.pdf")
 	rpcErr := callMethod(t, Router(system), "jobs.supply_pdf", map[string]string{"job_id": id, "name": "supplied.pdf"}, nil)
-	if rpcErr == nil || rpcErr.Code != "precondition_failed" || !strings.Contains(rpcErr.Message, job.StateCancelled) {
-		t.Fatalf("supply_pdf to a cancelled job = %+v; want precondition_failed naming the state", rpcErr)
+	if rpcErr == nil || rpcErr.Code != "precondition_failed" || !strings.Contains(rpcErr.Message, job.StateCancelled) ||
+		rpcErr.Detail == nil || rpcErr.Detail.ErrorClass != SupplyPDFJobFinishedClass {
+		t.Fatalf("supply_pdf to a cancelled job = %+v; want precondition_failed/%s naming the state", rpcErr, SupplyPDFJobFinishedClass)
 	}
 }
 

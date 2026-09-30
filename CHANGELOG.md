@@ -19,10 +19,13 @@ execution records kept during the initial build.
   directory, and the daemon reads only that copy, never a path it is given. The
   PDF then passes the same checks as a browser download: a PDF of a different
   paper goes to identity review or is rejected, and never becomes ready. The
-  command works on a job that is still open, refuses a finished one, and
-  prints the outcome (`accepted`, `needs_review`, or `rejected`) with the
-  file's SHA-256. `papio stats producers` counts the paper as `manual`. The
-  MCP command tools do not offer this command, because it reads a local file.
+  command works on a job that is still open, including a paywalled job that
+  waits in `retry_wait` between attempts. It refuses a finished job, and tells
+  you to submit the work again with `papio acquire` and supply the PDF to the
+  new job. It prints the outcome (`accepted`, `needs_review`, or `rejected`)
+  with the file's SHA-256. `papio stats producers` counts the paper as
+  `manual`. The MCP command tools do not offer this command, because it reads
+  a local file.
 - **A `[[library.sources]]` entry can now run a command instead of reading an
   export file.** With `kind = "command"` and an `argv` array, *papio* runs your
   program directly, with no shell, and reads its standard output as the
@@ -113,6 +116,22 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **A discovery watch no longer stops finding papers once its first page of
+  results is all known.** A watch used to read one page of at most 25 results,
+  drop the works you already had, and report the empty remainder as a
+  successful run, so a mature search could miss every later paper while each
+  run looked healthy. When the first page holds nothing new, a run now reads
+  deeper pages, up to 4 pages for each discovery source. The watch stores
+  where each source's deeper scan stopped, and the next run continues from
+  there. It starts again after the first page when the source reports the end
+  of its results, or when the stored position no longer fits the watch's
+  search. A work already in the digest, cleared, or acquired is never
+  reported again, and ownership checks work as before. A run that reached the
+  page limit with results left, or whose source failed or ran out of request
+  budget, is not a clean success: `papio watch list` shows the reason after
+  `last run:`, and `papio watch run` adds `discovery scan incomplete`. A
+  failed source keeps its stored position for the next run. This adds store
+  migration 0058.
 - **Interrupted exports no longer damage an existing bundle.** Export refuses
   another job at the same destination. A failed ledger write restores the
   earlier manifest. A retry can replace a truncated PDF only when its bytes

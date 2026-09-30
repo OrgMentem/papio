@@ -454,7 +454,7 @@ func discovered(doi, openAlex string) discovery.DiscoveredWork {
 }
 
 func TestOpenAlexOnlyDiscoveryRetainsIdentifier(t *testing.T) {
-	requestsWithWork := requestsForDiscoveredWithWork([]discovery.DiscoveredWork{
+	requestsWithWork := appendDiscoveredRequests(nil, make(map[string]struct{}), []discovery.DiscoveredWork{
 		discovered("", "https://openalex.org/W2741809807"),
 	})
 	if len(requestsWithWork) != 1 || requestsWithWork[0].Work.Identifiers == nil || requestsWithWork[0].Work.Identifiers.OpenAlex != "W2741809807" {

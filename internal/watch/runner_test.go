@@ -113,7 +113,7 @@ func TestRunnerAcquireDigestPreservesDiscoveryIdentifiers(t *testing.T) {
 		Work:       work.Work{DOI: "10.1000/identifiers", Title: "Identifier Work", Authors: []string{"Ada"}, Year: 2026},
 		OpenAlexID: "https://openalex.org/W2741809807",
 	}
-	requests := requestsForDiscoveredWithWork([]discovery.DiscoveredWork{discovered})
+	requests := appendDiscoveredRequests(nil, make(map[string]struct{}), []discovery.DiscoveredWork{discovered})
 	if len(requests) != 1 {
 		t.Fatalf("discovery requests = %+v, want one", requests)
 	}

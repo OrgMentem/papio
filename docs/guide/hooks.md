@@ -188,9 +188,11 @@ lists every limit.
     If zotio is configured, generic `library.sources` are ignored. Otherwise,
     if a configured source cannot be read, *papio* refuses to guess.
     `--batch` creates **no jobs** and tells you which source failed. Discovery
-    watches fail the run the same way: an acquire watch queues nothing, an
-    alert watch records no digest entries, and `papio acquire --from-digest`
-    creates no jobs. Before the fifth consecutive failure, each cadence
+    watches fail the run the same way, on the first page or on any deeper
+    page: an acquire watch queues nothing, an alert watch records no digest
+    entries, and `papio acquire --from-digest` creates no jobs. The watch also
+    keeps each source's stored scan position, so the next run reads the same
+    pages again. Before the fifth consecutive failure, each cadence
     attempts another run; a successful run resets the failure count. The fifth
     consecutive failure disables the watch. After fixing the source, force a
     run with `papio watch run <id>`; when it succeeds, `papio watch resume <id>`

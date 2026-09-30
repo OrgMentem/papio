@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"papio/internal/delivery"
 	"papio/internal/job"
 	"papio/internal/pdf"
 	"papio/internal/resolver"
@@ -92,6 +93,12 @@ func TestSupplyPDFPromotesAMatchingPDFWithOperatorProvenance(t *testing.T) {
 		{"parked", func(t *testing.T, jobs *job.Store) string { return parkAwaitingHuman(t, jobs, "wr_supply_parked") }},
 		// A live job is parked through the same legal edges browser adoption uses.
 		{"queued", func(t *testing.T, jobs *job.Store) string { return createLiveJob(t, jobs, "wr_supply_queued") }},
+		// A paywalled job usually waits here between attempts; supply follows
+		// retry_wait -> resolving first.
+		{"retry_wait", func(t *testing.T, jobs *job.Store) string {
+			return createLiveJob(t, jobs, "wr_supply_retry_wait",
+				[2]string{job.StateQueued, job.StateResolving}, [2]string{job.StateResolving, job.StateRetryWait})
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -280,39 +287,101 @@ func TestSupplyPDFRefusesASymlinkedStagingDirectory(t *testing.T) {
 	}
 }
 
-func TestSupplyPDFRefusesJobsThatCannotTakeAMainPDF(t *testing.T) {
+// A finished job never takes new bytes. The refusal is typed, so the RPC seam
+// can give it an error class the CLI turns into the acquire-again remedy.
+func TestSupplyPDFRefusesAFinishedJob(t *testing.T) {
 	ctx := context.Background()
-	for _, tc := range []struct {
-		name  string
-		setup func(t *testing.T, jobs *job.Store) string
-		state string
-	}{
-		{"cancelled", func(t *testing.T, jobs *job.Store) string {
-			id := createLiveJob(t, jobs, "wr_supply_cancelled", [2]string{job.StateQueued, job.StateResolving})
-			if err := jobs.Cancel(ctx, id, job.TerminalReasonBrowserCancelled); err != nil {
-				t.Fatal(err)
-			}
-			return id
-		}, job.StateCancelled},
-		{"needs review", func(t *testing.T, jobs *job.Store) string {
-			return createLiveJob(t, jobs, "wr_supply_review",
-				[2]string{job.StateQueued, job.StateResolving}, [2]string{job.StateResolving, job.StateFetching},
-				[2]string{job.StateFetching, job.StateNeedsReview})
-		}, job.StateNeedsReview},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			svc, jobs := newTestService(t)
-			svc.Validate = passValidation()
-			id := tc.setup(t, jobs)
-			name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("refused"))
-			if _, err := svc.SupplyPDF(ctx, id, name); !errors.Is(err, ErrSuppliedPDFState) {
-				t.Fatalf("supply to %s job = %v; want ErrSuppliedPDFState", tc.state, err)
-			}
-			row, err := jobs.Get(ctx, id)
-			if err != nil || row.State != tc.state || row.ArtifactSHA256 != "" {
-				t.Fatalf("job after refused supply = %+v, %v; want untouched %s", row, err, tc.state)
-			}
-		})
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := createLiveJob(t, jobs, "wr_supply_cancelled", [2]string{job.StateQueued, job.StateResolving})
+	if err := jobs.Cancel(ctx, id, job.TerminalReasonBrowserCancelled); err != nil {
+		t.Fatal(err)
+	}
+	name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("refused"))
+	_, err := svc.SupplyPDF(ctx, id, name)
+	var finished *SuppliedPDFJobFinishedError
+	if !errors.As(err, &finished) || finished.State != job.StateCancelled {
+		t.Fatalf("supply to a cancelled job = %v; want SuppliedPDFJobFinishedError naming cancelled", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateCancelled || row.ArtifactSHA256 != "" {
+		t.Fatalf("job after refused supply = %+v, %v; want untouched cancelled", row, err)
+	}
+}
+
+func TestSupplyPDFRefusesAJobHeldForReview(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := createLiveJob(t, jobs, "wr_supply_review",
+		[2]string{job.StateQueued, job.StateResolving}, [2]string{job.StateResolving, job.StateFetching},
+		[2]string{job.StateFetching, job.StateNeedsReview})
+	name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("refused"))
+	if _, err := svc.SupplyPDF(ctx, id, name); !errors.Is(err, ErrSuppliedPDFState) {
+		t.Fatalf("supply to a job held for review = %v; want ErrSuppliedPDFState", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateNeedsReview || row.ArtifactSHA256 != "" {
+		t.Fatalf("job after refused supply = %+v, %v; want untouched needs_review", row, err)
+	}
+}
+
+// A job in retry_wait on a live document-delivery request would leave that
+// provider request behind if a supplied PDF finished it, so it is refused
+// until the operator settles the request.
+func TestSupplyPDFRefusesARetryWaitJobWithALiveDeliveryRequest(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	id := createLiveJob(t, jobs, "wr_supply_delivery",
+		[2]string{job.StateQueued, job.StateResolving}, [2]string{job.StateResolving, job.StateRetryWait})
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deliverySvc.UpdateState(ctx, request.ID, delivery.StateSubmitted); err != nil {
+		t.Fatal(err)
+	}
+	name := stageSupplied(t, svc, id, "supplied.pdf", pdfBytes("delivery pending"))
+	if _, err := svc.SupplyPDF(ctx, id, name); !errors.Is(err, ErrSuppliedPDFState) {
+		t.Fatalf("supply during a live delivery request = %v; want ErrSuppliedPDFState", err)
+	}
+	after, err := jobs.Get(ctx, id)
+	if err != nil || after.State != job.StateRetryWait {
+		t.Fatalf("job after refused supply = %+v, %v; want untouched retry_wait", after, err)
+	}
+}
+
+// The retry_wait admission belongs to the operator's explicit request only:
+// a browser download that names a job waiting to retry is refused as before.
+func TestAdoptDownloadStillRefusesARetryWaitJob(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := createLiveJob(t, jobs, "wr_adopt_retry_wait",
+		[2]string{job.StateQueued, job.StateResolving}, [2]string{job.StateResolving, job.StateRetryWait})
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(path, pdfBytes("browser download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stateErr *adoptionStateError
+	if err := svc.AdoptDownload(ctx, id, path); !errors.As(err, &stateErr) || stateErr.state != job.StateRetryWait {
+		t.Fatalf("browser adoption of a retry_wait job = %v; want the adoption state refusal", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateRetryWait {
+		t.Fatalf("job after refused adoption = %+v, %v; want untouched retry_wait", row, err)
 	}
 }
 

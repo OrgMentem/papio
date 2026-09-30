@@ -226,6 +226,8 @@ func runCommand(ctx context.Context, argv []string, timeout time.Duration, maxBy
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// #nosec G204 -- argv is the operator's own library.sources command from
+	// their config, validated at load (no shell, absolute program path).
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	stdout := &cappedOutput{limit: maxBytes, overflow: cancel}
 	cmd.Stdout = stdout

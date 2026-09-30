@@ -232,17 +232,9 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 	firstSeenAt := store.FormatTime(at)
 	reported := 0
 	for _, entry := range entries {
-		entry.WorkKey = strings.TrimSpace(entry.WorkKey)
-		entry.TitleKey = strings.TrimSpace(entry.TitleKey)
-		entry.Title = strings.TrimSpace(entry.Title)
-		entry.Authors = strings.TrimSpace(entry.Authors)
-		entry.DOI = strings.TrimSpace(entry.DOI)
-		entry.Abstract = truncateDigestAbstract(entry.Abstract)
-		if entry.Authors == "" && len(entry.AuthorNames) > 0 {
-			entry.Authors = strings.Join(entry.AuthorNames, ", ")
-		}
-		if entry.WorkKey == "" || entry.Title == "" {
-			return 0, errors.New("watch digest entry requires work_key and title")
+		entry, err := normalizeDigestEntry(entry)
+		if err != nil {
+			return 0, err
 		}
 
 		existing, duplicates, err := findDigestIdentities(ctx, tx, watchID, entry)
@@ -353,6 +345,57 @@ func (s *Store) RecordDigest(ctx context.Context, watchID int64, at time.Time, e
 		return 0, fmt.Errorf("committing watch digest: %w", err)
 	}
 	return reported, nil
+}
+
+// normalizeDigestEntry trims an incoming digest entry the way it is stored,
+// so matching and recording see the same identity.
+func normalizeDigestEntry(entry DigestEntry) (DigestEntry, error) {
+	entry.WorkKey = strings.TrimSpace(entry.WorkKey)
+	entry.TitleKey = strings.TrimSpace(entry.TitleKey)
+	entry.Title = strings.TrimSpace(entry.Title)
+	entry.Authors = strings.TrimSpace(entry.Authors)
+	entry.DOI = strings.TrimSpace(entry.DOI)
+	entry.Abstract = truncateDigestAbstract(entry.Abstract)
+	if entry.Authors == "" && len(entry.AuthorNames) > 0 {
+		entry.Authors = strings.Join(entry.AuthorNames, ", ")
+	}
+	if entry.WorkKey == "" || entry.Title == "" {
+		return DigestEntry{}, errors.New("watch digest entry requires work_key and title")
+	}
+	return entry, nil
+}
+
+// KnownDigestEntries reports, aligned by index, which entries already belong
+// to a digest identity of the watch — pending, cleared, or acquired — under
+// the matching RecordDigest itself uses. An alert run checks it before its
+// per-run cap, so a work reported once never takes a slot from a new one and
+// is never reported again, however many pages or runs meet it later.
+func (s *Store) KnownDigestEntries(ctx context.Context, watchID int64, entries []DigestEntry) ([]bool, error) {
+	if s == nil || s.S == nil {
+		return nil, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return nil, errors.New("watch id must be positive")
+	}
+	known := make([]bool, len(entries))
+	if len(entries) == 0 {
+		return known, nil
+	}
+	identities, err := loadDigestIdentities(ctx, s.S.DB(), watchID)
+	if err != nil {
+		return nil, err
+	}
+	for i, entry := range entries {
+		entry, err := normalizeDigestEntry(entry)
+		if err != nil {
+			// RecordDigest refuses this entry. Reporting it unknown leaves
+			// that refusal to the run that actually records it.
+			continue
+		}
+		existing, _ := matchDigestIdentities(identities, entry)
+		known[i] = existing != nil
+	}
+	return known, nil
 }
 
 // Digest returns recent alert-watch discoveries, newest first.
@@ -827,45 +870,77 @@ type digestIdentity struct {
 	authorsJSON     string
 	firstSeenAt     string
 	consumed        bool
+	// identity is the row's matching view (work key, title, DOI, and decoded
+	// identifiers), decoded once when the row is loaded.
+	identity DigestEntry
+}
+
+// digestQuerier is the read surface *sql.DB and *sql.Tx share.
+type digestQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 func findDigestIdentities(ctx context.Context, tx *sql.Tx, watchID int64, entry DigestEntry) (*digestIdentity, []digestIdentity, error) {
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := loadDigestIdentities(ctx, tx, watchID)
+	if err != nil {
+		return nil, nil, err
+	}
+	existing, duplicates := matchDigestIdentities(rows, entry)
+	return existing, duplicates, nil
+}
+
+// loadDigestIdentities reads every digest identity of a watch, consumed or
+// not, oldest first — the order matchDigestIdentities relies on.
+func loadDigestIdentities(ctx context.Context, querier digestQuerier, watchID int64) ([]digestIdentity, error) {
+	rows, err := querier.QueryContext(ctx, `
 		SELECT id, work_key, title, doi, identifiers_json, authors, authors_json, first_seen_at, consumed
 		FROM watch_digest_entries
 		WHERE watch_id = ?
 		ORDER BY first_seen_at ASC, id ASC`, watchID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("finding watch digest identity: %w", err)
+		return nil, fmt.Errorf("finding watch digest identity: %w", err)
 	}
 	defer rows.Close()
-
-	want := digestIdentityAliases(entry)
-	wantStable := digestStableIdentityAliases(entry)
-	var stableMatches []digestIdentity
-	var exactMatch, match *digestIdentity
+	identities := make([]digestIdentity, 0)
 	for rows.Next() {
 		var row digestIdentity
 		if err := rows.Scan(
 			&row.id, &row.workKey, &row.title, &row.doi, &row.identifiersJSON, &row.authors,
 			&row.authorsJSON, &row.firstSeenAt, &row.consumed,
 		); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		existing := DigestEntry{
+		row.identity = DigestEntry{
 			WorkKey: row.workKey,
 			Title:   row.title,
 			DOI:     row.doi,
 		}
-		if err := decodeDigestIdentifiers(&existing, row.identifiersJSON); err != nil {
-			return nil, nil, err
+		if err := decodeDigestIdentifiers(&row.identity, row.identifiersJSON); err != nil {
+			return nil, err
 		}
-		existingAliases := digestIdentityAliases(existing)
+		identities = append(identities, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating watch digest identities: %w", err)
+	}
+	return identities, nil
+}
+
+// matchDigestIdentities picks the stored identity an entry belongs to, plus
+// any further stable-identifier matches RecordDigest merges into it. A nil
+// match means the entry is a new work for this watch.
+func matchDigestIdentities(rows []digestIdentity, entry DigestEntry) (*digestIdentity, []digestIdentity) {
+	want := digestIdentityAliases(entry)
+	wantStable := digestStableIdentityAliases(entry)
+	var stableMatches []digestIdentity
+	var exactMatch, match *digestIdentity
+	for _, row := range rows {
+		existingAliases := digestIdentityAliases(row.identity)
 		if !digestIdentitiesOverlap(want, existingAliases) {
 			continue
 		}
-		existingStable := digestStableIdentityAliases(existing)
-		if digestStableIdentifiersConflict(entry, existing) {
+		existingStable := digestStableIdentityAliases(row.identity)
+		if digestStableIdentifiersConflict(entry, row.identity) {
 			continue
 		}
 		if digestIdentitiesOverlap(wantStable, existingStable) {
@@ -887,16 +962,13 @@ func findDigestIdentities(ctx context.Context, tx *sql.Tx, watchID int64, entry 
 			match = &candidate
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("iterating watch digest identities: %w", err)
-	}
 	if len(stableMatches) > 0 {
-		return &stableMatches[0], stableMatches[1:], nil
+		return &stableMatches[0], stableMatches[1:]
 	}
 	if exactMatch != nil {
-		return exactMatch, nil, nil
+		return exactMatch, nil
 	}
-	return match, nil, nil
+	return match, nil
 }
 
 func digestStableIdentifiersConflict(left, right DigestEntry) bool {
@@ -1540,26 +1612,28 @@ func (s *Store) MarkDegradedRun(ctx context.Context, id int64, at time.Time, fai
 	return nil
 }
 
-// MarkPartialRun records a discovery scan that succeeded on some backends
-// while others failed. Like MarkDegradedRun it advances the cadence and
-// resets consecutive complete-run failures — the healthy results stand and
-// must not be rediscovered — but it names the failed backends in last_error
-// so a partial scan is never mistaken for a clean success. A persistently
-// dead backend keeps the watch degraded rather than disabling discoveries
-// that still work; callers pass discovery.SummarizeFailures output as detail.
+// MarkPartialRun records a discovery scan that did not finish: some backends
+// failed while others answered, or the bounded deeper scan stopped with
+// results left unread (page limit reached, a result window a backend will not
+// page past, a backend that cannot page). Like MarkDegradedRun it advances
+// the cadence and resets consecutive complete-run failures — the healthy
+// results stand and must not be rediscovered — but it names each reason in
+// last_error so an incomplete scan is never mistaken for a clean success. A
+// persistently dead backend keeps the watch degraded rather than disabling
+// discoveries that still work.
 func (s *Store) MarkPartialRun(ctx context.Context, id int64, at time.Time, detail string) error {
 	if s == nil || s.S == nil {
 		return errors.New("watch store is not configured")
 	}
 	if strings.TrimSpace(detail) == "" {
-		return errors.New("partial watch run requires failure detail")
+		return errors.New("partial watch run requires detail")
 	}
 	result, err := s.S.DB().ExecContext(ctx, `
 		UPDATE watches
 		SET last_run_at = ?, consecutive_failures = 0, last_error = ?
 		WHERE id = ?`,
 		store.FormatTime(at),
-		"discovery partially failed: "+storedError(errors.New(detail)), id)
+		"discovery scan incomplete: "+storedError(errors.New(detail)), id)
 	if err != nil {
 		return fmt.Errorf("recording partial watch run: %w", err)
 	}
@@ -1652,6 +1726,90 @@ func (s *Store) Resume(ctx context.Context, id int64) (*Watch, error) {
 		return nil, ErrWatchNotDisabled
 	}
 	return nil, ErrWatchRecoveryRunRequired
+}
+
+// SourceCoverage is one discovery source's deeper-scan position for a watch.
+// NextToken is the opaque discovery continuation the next run's deeper scan
+// resumes from; empty restarts it right after the first page. State is the
+// discovery.PageState the walk last stopped on. It is daemon-internal
+// scheduling state and never part of the watch IPC contract.
+type SourceCoverage struct {
+	Source    string
+	NextToken string
+	State     string
+	UpdatedAt string
+}
+
+// ScanCoverage returns the stored deeper-scan position of every source the
+// watch has scanned, keyed by source name. A source without a row has never
+// been scanned past its first page.
+func (s *Store) ScanCoverage(ctx context.Context, watchID int64) (map[string]SourceCoverage, error) {
+	if s == nil || s.S == nil {
+		return nil, errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return nil, errors.New("watch id must be positive")
+	}
+	rows, err := s.S.DB().QueryContext(ctx, `
+		SELECT source, next_token, state, updated_at
+		FROM watch_scan_coverage
+		WHERE watch_id = ?`, watchID)
+	if err != nil {
+		return nil, fmt.Errorf("reading watch scan coverage: %w", err)
+	}
+	defer rows.Close()
+	coverage := make(map[string]SourceCoverage)
+	for rows.Next() {
+		var row SourceCoverage
+		if err := rows.Scan(&row.Source, &row.NextToken, &row.State, &row.UpdatedAt); err != nil {
+			return nil, err
+		}
+		coverage[row.Source] = row
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating watch scan coverage: %w", err)
+	}
+	return coverage, nil
+}
+
+// SaveScanCoverage stores the deeper-scan position of each given source in
+// one transaction, so a run never keeps one source's advance while losing
+// another's. Sources not named keep their stored position.
+func (s *Store) SaveScanCoverage(ctx context.Context, watchID int64, at time.Time, coverage []SourceCoverage) error {
+	if s == nil || s.S == nil {
+		return errors.New("watch store is not configured")
+	}
+	if watchID <= 0 {
+		return errors.New("watch id must be positive")
+	}
+	if len(coverage) == 0 {
+		return nil
+	}
+	tx, err := s.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting watch scan coverage transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	updatedAt := store.FormatTime(at)
+	for _, row := range coverage {
+		source := strings.TrimSpace(row.Source)
+		state := strings.TrimSpace(row.State)
+		if source == "" || state == "" {
+			return errors.New("watch scan coverage requires source and state")
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO watch_scan_coverage (watch_id, source, next_token, state, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(watch_id, source) DO UPDATE SET
+				next_token = excluded.next_token, state = excluded.state, updated_at = excluded.updated_at`,
+			watchID, source, row.NextToken, state, updatedAt); err != nil {
+			return fmt.Errorf("saving watch scan coverage: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing watch scan coverage: %w", err)
+	}
+	return nil
 }
 
 const watchSelect = `

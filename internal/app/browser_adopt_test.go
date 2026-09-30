@@ -1877,7 +1877,7 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, jobs := newTestService(t)
 			id := createLiveJob(t, jobs, "wr_park_"+tc.name, tc.steps...)
-			if err := svc.parkForAdoption(ctx, id, "browser_download_adoption"); err != nil {
+			if err := svc.parkForAdoption(ctx, id, "browser_download_adoption", false); err != nil {
 				t.Fatalf("park from %s: %v", tc.name, err)
 			}
 			row, err := jobs.Get(ctx, id)
@@ -1899,7 +1899,7 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 			}
 			// Idempotent: a second report of the same download must not open a
 			// second action or move the job again.
-			if err := svc.parkForAdoption(ctx, id, "browser_download_adoption"); err != nil {
+			if err := svc.parkForAdoption(ctx, id, "browser_download_adoption", false); err != nil {
 				t.Fatalf("second park: %v", err)
 			}
 			actions, err := jobs.ListHumanActionsForJob(ctx, id)
@@ -1930,7 +1930,7 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 		if err := jobs.Cancel(ctx, id, job.TerminalReasonBrowserCancelled); err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.parkForAdoption(ctx, id, "browser_download_adoption"); err == nil {
+		if err := svc.parkForAdoption(ctx, id, "browser_download_adoption", false); err == nil {
 			t.Fatal("a terminal job was accepted for browser adoption")
 		}
 		row, err := jobs.Get(ctx, id)

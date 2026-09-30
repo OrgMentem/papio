@@ -41,19 +41,24 @@ func (e *adoptionStateError) Error() string {
 // action — the browser download or the operator's supply-pdf command is
 // itself the human gesture that justified the park. reason names that
 // gesture in the transition detail.
-func (s *Service) parkForAdoption(ctx context.Context, jobID, reason string) error {
+//
+// fromRetryWait also admits retry_wait through its legal edge to resolving,
+// the way queued is handled. Only an explicit operator request passes it:
+// a job waiting to retry has no browser handoff open, so a browser download
+// that names it is still refused.
+func (s *Service) parkForAdoption(ctx context.Context, jobID, reason string, fromRetryWait bool) error {
 	for range 4 {
 		row, err := s.Jobs.Get(ctx, jobID)
 		if err != nil {
 			return err
 		}
-		switch row.State {
-		case job.StateAwaitingHuman:
+		switch {
+		case row.State == job.StateAwaitingHuman:
 			return nil
-		case job.StateQueued:
-			err = s.Jobs.Transition(ctx, jobID, job.StateQueued, job.StateResolving,
+		case row.State == job.StateQueued, row.State == job.StateRetryWait && fromRetryWait:
+			err = s.Jobs.Transition(ctx, jobID, row.State, job.StateResolving,
 				map[string]any{"reason": reason})
-		case job.StateResolving, job.StateFetching:
+		case row.State == job.StateResolving, row.State == job.StateFetching:
 			prev := row.State
 			err = s.Jobs.Transition(ctx, jobID, prev, job.StateAwaitingHuman,
 				map[string]any{"reason": reason})
@@ -155,7 +160,7 @@ func confineToAdoptionRoots(roots []string, resolved string) error {
 // manual_download action) when the file is rejected so the human can supply a
 // different one.
 func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
-	row, err := s.prepareMainAdoption(ctx, jobID, "browser_download_adoption")
+	row, err := s.prepareMainAdoption(ctx, jobID, "browser_download_adoption", false)
 	if err != nil {
 		return err
 	}
@@ -191,8 +196,9 @@ func (s *Service) AdoptDownload(ctx context.Context, jobID, path string) error {
 
 // prepareMainAdoption brings jobID onto the awaiting_human adoption boundary
 // for a main PDF and returns its row. parkReason names the human gesture that
-// supplied the file in the park's transition detail.
-func (s *Service) prepareMainAdoption(ctx context.Context, jobID, parkReason string) (*job.Row, error) {
+// supplied the file in the park's transition detail; fromRetryWait is passed
+// to parkForAdoption.
+func (s *Service) prepareMainAdoption(ctx context.Context, jobID, parkReason string, fromRetryWait bool) (*job.Row, error) {
 	if s.Validate == nil {
 		return nil, fmt.Errorf("acquisition service is missing its validation dependency")
 	}
@@ -204,7 +210,7 @@ func (s *Service) prepareMainAdoption(ctx context.Context, jobID, parkReason str
 		return nil, err
 	}
 	if row.State != job.StateAwaitingHuman {
-		if err := s.parkForAdoption(ctx, jobID, parkReason); err != nil {
+		if err := s.parkForAdoption(ctx, jobID, parkReason, fromRetryWait); err != nil {
 			return nil, err
 		}
 		row, err = s.Jobs.Get(ctx, jobID)

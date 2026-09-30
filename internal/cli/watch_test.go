@@ -201,6 +201,38 @@ func TestWatchRunDisplaysReportedAlertWorks(t *testing.T) {
 	}
 }
 
+func TestWatchOutputShowsAnIncompleteScan(t *testing.T) {
+	execute := func(args ...string) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+			switch method {
+			case "watch.list":
+				*result.(*[]watch.Watch) = []watch.Watch{{
+					ID: 3, Label: "trust", CadenceHours: 24, Enabled: true,
+					LastError: "discovery scan incomplete: openalex: scan limit of 4 pages reached\x1b[31m",
+				}}
+			case "watch.run":
+				*result.(*watch.RunResult) = watch.RunResult{WatchID: 3, Degraded: true}
+			default:
+				t.Fatalf("method = %q", method)
+			}
+			return nil
+		})
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("%v: %v (%s)", args, err, stderr.String())
+		}
+		return stdout.String()
+	}
+	if got, want := execute("watch", "list"), "3 | trust | every 24h | enabled | last run: discovery scan incomplete: openalex: scan limit of 4 pages reached[31m\n"; got != want {
+		t.Fatalf("watch list = %q, want %q", got, want)
+	}
+	if got, want := execute("watch", "run", "3"), "Watch 3 queued 0 paper(s); discovery scan incomplete — see papio watch list\n"; got != want {
+		t.Fatalf("watch run = %q, want %q", got, want)
+	}
+}
+
 func TestWatchResumeReportsResumedWatch(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params any, result any) error {
