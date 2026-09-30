@@ -413,6 +413,45 @@ detections >10%.
 sessions — and until that evidence exists, "on-demand scanning is not an MVP
 compromise; it is the finished product" (r3).
 
+## Amendment 2026-10-01: measurement rows are per request, not per scan
+
+Decision 10's single row per scan is not what ships, and this amendment makes
+the shipped shape the decision. `page_bulk_runs` holds two kinds of row:
+
+- **Status rows**, one per `page_bulk_status_request`. They carry the funnel
+  the status call computed (`detected_raw`, `canonical_unique`, the
+  per-status counts, `rendered_record_count_hint`) and `opened_at`.
+  `detector_id`, `source_origin` and `batch_id` are empty.
+- **Submit rows**, one per `page_bulk_submit_request`. They carry
+  `detector_id`, `source_origin`, `selected`, `submitted`, `invalid`,
+  `batch_id`, `opened_at` and `submitted_at`. Their funnel columns hold the
+  schema default 0, which means *not observed*, never *observed zero*.
+
+Nothing links a status row to a submit row. A scan whose workspace never
+sends a status request writes no status row.
+
+**Justification.** A single row needs daemon-side scan state, and Decisions 4
+and 7 deliberately keep the daemon stateless about scans: the selection sheet
+lives in the extension, and `scan_id` is opaque correlation the daemon only
+echoes back. The status request also carries no origin or detector; origin
+stays extension-side until submit. Joining the two calls would mean either
+retaining scan state in the daemon or storing `scan_id` so rows can be joined
+later. Neither is adopted: the measurement does not justify weakening the
+stateless contract, and a separate row reports only what each call actually
+observed.
+
+**Consequences for the metrics.** Bulk leverage (median `submitted` over
+submit rows) and median submitted batch are exact. Useful scan rate is status
+rows with `eligible` ≥ 3 over all status rows. A Rescan reuses its `scan_id`
+but sends a new status request, so it counts as another scan. Submit
+conversion is an aggregate ratio — submit rows over useful status rows — not a
+per-scan link, so a submit from a scan with fewer than three eligible works
+still counts. The pilot gate's distinct site/page classes are counted from
+submit rows only, because only they carry an origin and detector. Read the
+expand and retreat thresholds against these aggregates. The rescan rate has
+no instrument in these rows, so the persistent-scanning reconsideration
+criterion cannot be met and persistent scanning stays out.
+
 ## Rejected alternatives
 
 **Persistent opt-in scanner** (the superseded draft's starting mechanism).
