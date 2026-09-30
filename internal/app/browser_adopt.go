@@ -543,12 +543,32 @@ func (s *Service) adoptionReplacementAccess(ctx context.Context, jobID string) j
 
 // copyHashed streams src into dst (created 0600) while computing its SHA-256 and
 // size. The download's own bytes never enter events or the database.
+//
+// Callers confine src with an Lstat-based check before calling, but that check
+// and this open are separate path lookups: a final component swapped for a
+// symlink in between would be followed by a plain open. copyHashed therefore
+// re-checks the name without following it and requires the opened descriptor
+// to be that same regular file, failing closed on any change.
 func copyHashed(src, dst string) (sha string, size int64, err error) {
+	checked, err := os.Lstat(src)
+	if err != nil {
+		return "", 0, err
+	}
+	if !checked.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("adoption source %s is no longer a regular file", src)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return "", 0, err
 	}
 	defer func() { _ = in.Close() }()
+	opened, err := in.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(checked, opened) {
+		return "", 0, fmt.Errorf("adoption source %s changed before it was read", src)
+	}
 	return writeHashed(in, dst)
 }
 

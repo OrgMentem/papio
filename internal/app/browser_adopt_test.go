@@ -1942,3 +1942,35 @@ func TestParkForBrowserAdoptionEntryPaths(t *testing.T) {
 		}
 	})
 }
+
+// A landing file that passed confinement can be swapped for a symlink before
+// the copy opens it. The copy must refuse the swapped name rather than follow
+// it and quarantine bytes from outside the adoption root.
+func TestCopyHashedRefusesConfinedFileSwappedForSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("outside the adoption root"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	landing := filepath.Join(root, "paper.pdf")
+	if err := os.WriteFile(landing, []byte("%PDF-1.4 landing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := confineToAdoptionRoots([]string{root}, landing); err != nil {
+		t.Fatalf("regular landing file was not confined: %v", err)
+	}
+	// The swap between confinement and copy.
+	if err := os.Remove(landing); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, landing); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "quarantine.tmp")
+	if sha, _, err := copyHashed(landing, dst); err == nil {
+		t.Fatalf("copyHashed followed a swapped symlink (sha %s)", sha)
+	}
+	if _, err := os.Lstat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused copy left a quarantine file: %v", err)
+	}
+}
