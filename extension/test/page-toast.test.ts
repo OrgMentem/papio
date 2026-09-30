@@ -38,6 +38,8 @@ interface Harness {
   fire(index: number): void;
   host(): HTMLElement | null;
   button(text: string): HTMLElement | undefined;
+  /** A researcher's click: `isTrusted` as the browser sets it for real input. */
+  press(text: string): void;
 }
 
 /** Drives the REAL injected function against a real DOM, with the page globals
@@ -88,6 +90,10 @@ function harness(injection?: Partial<ToastInjection>): Harness {
   };
   expect(renderPageToast(payload)).toBe(true);
   const host = (): HTMLElement | null => doc.getElementById(HOST_ID);
+  const button = (text: string): HTMLElement | undefined =>
+    [...(host()?.shadowRoot?.querySelectorAll("button") ?? [])].find(
+      (candidate) => candidate.textContent === text,
+    ) as HTMLElement | undefined;
   return {
     doc,
     sent,
@@ -98,10 +104,13 @@ function harness(injection?: Partial<ToastInjection>): Harness {
       timer.run();
     },
     host,
-    button: (text) =>
-      [...(host()?.shadowRoot?.querySelectorAll("button") ?? [])].find(
-        (button) => button.textContent === text,
-      ) as HTMLElement | undefined,
+    button,
+    press: (text) => {
+      // happy-dom's Event is the DOM Event at runtime; only its declared type differs.
+      const event = new window.Event("click") as unknown as Event;
+      Object.defineProperty(event, "isTrusted", { value: true });
+      button(text)?.dispatchEvent(event);
+    },
   };
 }
 
@@ -224,9 +233,7 @@ test("the toast removes itself BEFORE it reports the action", () => {
       },
     },
   });
-  h.button(TOAST_COPY.route_lost.action)?.dispatchEvent(
-    new (h.doc.defaultView as unknown as { Event: typeof Event }).Event("click"),
-  );
+  h.press(TOAST_COPY.route_lost.action);
   expect(hostPresentAtSend).toBe(false);
   expect(h.sent).toHaveLength(1);
   expect(h.sent[0]).toEqual({
@@ -240,8 +247,7 @@ test("a click and its own expiry cannot both report", () => {
   // The race the researcher creates by clicking at 7.9s. Two reports would ask
   // the daemon to reopen a paper and then tell it the offer lapsed.
   const h = harness();
-  const view = h.doc.defaultView as unknown as { Event: typeof Event };
-  h.button(TOAST_COPY.route_lost.action)?.dispatchEvent(new view.Event("click"));
+  h.press(TOAST_COPY.route_lost.action);
   // The expiry timer fires late, as it would in a real page.
   h.fire(0);
   expect(h.sent).toHaveLength(1);
@@ -298,10 +304,8 @@ test("two clicks on the action report once", () => {
   // double-clicking is the path that does reach it, and two reports would mint
   // two fresh routes and open the paper twice.
   const h = harness();
-  const view = h.doc.defaultView as unknown as { Event: typeof Event };
-  const action = h.button(TOAST_COPY.route_lost.action);
-  action?.dispatchEvent(new view.Event("click"));
-  action?.dispatchEvent(new view.Event("click"));
+  h.press(TOAST_COPY.route_lost.action);
+  h.press(TOAST_COPY.route_lost.action);
   expect(h.sent).toHaveLength(1);
 });
 
@@ -310,9 +314,8 @@ test("dismissing after acting reports once", () => {
   // and a dismissal after an accepted action would tell the daemon the offer
   // lapsed after it had already been taken.
   const h = harness();
-  const view = h.doc.defaultView as unknown as { Event: typeof Event };
-  h.button(TOAST_COPY.route_lost.action)?.dispatchEvent(new view.Event("click"));
-  h.button("Dismiss")?.dispatchEvent(new view.Event("click"));
+  h.press(TOAST_COPY.route_lost.action);
+  h.press("Dismiss");
   expect(h.sent).toHaveLength(1);
   expect(h.sent[0]?.["type"]).toBe(TOAST_PAGE_ACTION_MESSAGE);
 });
@@ -321,9 +324,22 @@ test("a queued expiry that beats clearTimeout still reports once", () => {
   // The genuine race: the 8s callback is already queued when the researcher
   // clicks, so `clearTimeout` cannot unqueue it. Only the flag stops it.
   const h = harness();
-  const view = h.doc.defaultView as unknown as { Event: typeof Event };
-  h.button(TOAST_COPY.route_lost.action)?.dispatchEvent(new view.Event("click"));
+  h.press(TOAST_COPY.route_lost.action);
   h.timers[0]?.run();
+  expect(h.sent).toHaveLength(1);
+  expect(h.sent[0]?.["type"]).toBe(TOAST_PAGE_ACTION_MESSAGE);
+});
+
+test("a click the host page scripts cannot take or dismiss the offer", () => {
+  // The shadow root is open and the host id is fixed, so the publisher's own
+  // script can reach both buttons. Its `.click()` is untrusted; honouring it
+  // would let the page open a fresh route, or hide the recovery, unseen.
+  const h = harness();
+  h.button(TOAST_COPY.route_lost.action)?.click();
+  h.button("Dismiss")?.click();
+  expect(h.sent).toEqual([]);
+  expect(h.host()).not.toBeNull();
+  h.press(TOAST_COPY.route_lost.action);
   expect(h.sent).toHaveLength(1);
   expect(h.sent[0]?.["type"]).toBe(TOAST_PAGE_ACTION_MESSAGE);
 });

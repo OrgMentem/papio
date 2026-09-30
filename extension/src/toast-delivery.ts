@@ -175,10 +175,16 @@ export function renderPageToast(injection: ToastInjection): boolean {
     if (reason !== undefined) payload["reason"] = reason;
     void chrome.runtime.sendMessage(payload).catch(() => undefined);
   };
-  action.addEventListener("click", () => settle(injection.action_message));
-  dismiss.addEventListener("click", () =>
-    settle(injection.dismiss_message, "dismissed"),
-  );
+  // Only a real activation settles. The shadow root is open and its host id is
+  // fixed, so the publisher's own script can reach both buttons and `.click()`
+  // them; that click is untrusted, and it must neither take the offer nor
+  // dismiss it unseen. Keyboard activation of a button is a trusted click too.
+  action.addEventListener("click", (event) => {
+    if (event.isTrusted) settle(injection.action_message);
+  });
+  dismiss.addEventListener("click", (event) => {
+    if (event.isTrusted) settle(injection.dismiss_message, "dismissed");
+  });
   // Expiry commits nothing, exactly as the window route's does: the recovery
   // stays in the inbox, so the eight seconds are a shortcut, not a deadline.
   timer = window.setTimeout(
