@@ -401,6 +401,10 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 	if err != nil {
 		return rollback(err, false)
 	}
+	// oldNamesArtifact records whether the bundle a failed record restores
+	// still points at this export's artifact path. Those bytes are then the
+	// restored document's own and must survive the rollback.
+	oldNamesArtifact := false
 	if bundleExisted {
 		existing, decodeErr := protocol.DecodeAcquisitionBundle(oldBundle)
 		if decodeErr != nil {
@@ -409,6 +413,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 		if existing.JobID != jobID {
 			return rollback(fmt.Errorf("%w: destination %s holds bundle for job %s, not %s", job.ErrConflict, destination, existing.JobID, jobID), false)
 		}
+		oldNamesArtifact = existing.Artifact.Path == b.Artifact.Path
 	}
 	if exportPreMaterializeHook != nil {
 		exportPreMaterializeHook()
@@ -432,7 +437,7 @@ func (e *Exporter) Export(ctx context.Context, jobID, destination string) (strin
 				if rerr := os.Rename(artifactBackup, artifactPath); rerr != nil {
 					cleanupErr = rerr
 				}
-			} else if artifactCreated {
+			} else if artifactCreated && !oldNamesArtifact {
 				if rmErr := os.Remove(artifactPath); rmErr != nil && !os.IsNotExist(rmErr) {
 					cleanupErr = rmErr
 				}

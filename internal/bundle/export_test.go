@@ -774,14 +774,7 @@ func TestExportReplacesSymlinkArtifact(t *testing.T) {
 	}
 	bundlePath, _, err := exporter.Export(ctx, id, destination)
 	if err != nil {
-		// materializeArtifact's Lstat branch is specified to either error
-		// or replace the symlink; both pin the fix over HashFile-follows-
-		// symlink. This implementation replaces, so an error would still be
-		// a correct pin, but we note it.
-		if info, lerr := os.Lstat(linkPath); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-			t.Fatalf("export errored but left symlink in place: %v", err)
-		}
-		return
+		t.Fatalf("export over symlinked artifact: %v", err)
 	}
 	info, err := os.Lstat(linkPath)
 	if err != nil {
@@ -1133,6 +1126,84 @@ func TestExportLedgerFailurePreservesHealedPartialArtifact(t *testing.T) {
 	var count int
 	if err := exporter.Jobs.S.DB().QueryRowContext(ctx, `SELECT count(*) FROM exports WHERE job_id = ?`, id).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("export ledger count = %d, %v; want one", count, err)
+	}
+}
+
+// A failed ledger record restores the previous bundle.json. When that bundle
+// names the same artifact path, the bytes this export just materialized are
+// the restored document's own artifact and must stay: the missing file or the
+// replaced symlink they stand in for cannot be put back.
+func TestExportLedgerFailureKeepsArtifactTheRestoredBundleNames(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		disturb func(t *testing.T, artifactPath string, body []byte)
+	}{
+		{"missing", func(t *testing.T, artifactPath string, _ []byte) {
+			if err := os.Remove(artifactPath); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink", func(t *testing.T, artifactPath string, body []byte) {
+			external := filepath.Join(t.TempDir(), "external.pdf")
+			if err := os.WriteFile(external, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(artifactPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(external, artifactPath); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter, id, sha := readyFixture(t)
+			ctx := context.Background()
+			destination := filepath.Join(t.TempDir(), "export")
+			bundlePath, _, err := exporter.Export(ctx, id, destination)
+			if err != nil {
+				t.Fatalf("initial export: %v", err)
+			}
+			beforeBundle, err := os.ReadFile(bundlePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			artifactPath := filepath.Join(destination, "artifacts", sha+".pdf")
+			body, err := os.ReadFile(artifactPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.disturb(t, artifactPath, body)
+			if _, err := exporter.Jobs.S.DB().ExecContext(ctx, `
+				CREATE TRIGGER reject_bundle_export_update
+				BEFORE UPDATE ON exports
+				WHEN NEW.kind = 'bundle'
+				BEGIN
+					SELECT RAISE(ABORT, 'injected ledger update failure');
+				END`); err != nil {
+				t.Fatalf("create failure trigger: %v", err)
+			}
+			if _, _, err := exporter.Export(ctx, id, destination); err == nil {
+				t.Fatal("export succeeded despite ledger failure")
+			}
+			afterBundle, err := os.ReadFile(bundlePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(afterBundle) != string(beforeBundle) {
+				t.Fatal("bundle.json was not restored after the failed export")
+			}
+			info, err := os.Lstat(artifactPath)
+			if err != nil {
+				t.Fatalf("restored bundle names %s, which the rollback deleted: %v", artifactPath, err)
+			}
+			if !info.Mode().IsRegular() {
+				t.Fatalf("artifact mode = %s, want an owned regular file", info.Mode())
+			}
+			if got, _, err := artifact.HashFile(artifactPath); err != nil || got != sha {
+				t.Fatalf("artifact hash = %q, %v; want %q", got, err, sha)
+			}
+		})
 	}
 }
 
