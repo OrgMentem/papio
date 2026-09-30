@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"papio/internal/api"
@@ -118,9 +119,13 @@ func TestDeliveryCancelReportsSupportAndReason(t *testing.T) {
 		name   string
 		result api.DeliveryCancelResult
 		want   string
+		// refused: the live provider request was not cancelled, so the
+		// command must exit nonzero after printing the reason.
+		refused bool
 	}{
 		{name: "cancelled", result: api.DeliveryCancelResult{Cancelled: true, Supported: true, State: "cancelled"}, want: "Cancelled delivery request for job_01"},
-		{name: "not supported", result: api.DeliveryCancelResult{Cancelled: false, Supported: false, State: "submitted", Reason: "no configured provider (illiad) supports API cancellation"}, want: "not cancelled (no configured provider (illiad) supports API cancellation)"},
+		{name: "already cancelled", result: api.DeliveryCancelResult{Cancelled: true, Supported: true, State: "cancelled", Reason: "already cancelled"}, want: "Cancelled delivery request for job_01"},
+		{name: "not supported", result: api.DeliveryCancelResult{Cancelled: false, Supported: false, State: "submitted", Reason: "no configured provider (illiad) supports API cancellation"}, want: "not cancelled (no configured provider (illiad) supports API cancellation)", refused: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -135,7 +140,11 @@ func TestDeliveryCancelReportsSupportAndReason(t *testing.T) {
 				return nil
 			})
 			root.SetArgs([]string{"delivery", "cancel", "job_01"})
-			if err := root.Execute(); err != nil {
+			err := root.Execute()
+			if test.refused != errors.Is(err, errDeliveryNotCancelled) {
+				t.Fatalf("delivery cancel: err = %v, want refusal %v", err, test.refused)
+			}
+			if !test.refused && err != nil {
 				t.Fatalf("delivery cancel: %v (%s)", err, stderr.String())
 			}
 			if got := stdout.String(); !bytes.Contains([]byte(got), []byte(test.want)) {
@@ -252,8 +261,8 @@ func TestDeliveryResumeReportsRefusalOnTerminalRow(t *testing.T) {
 		return nil
 	})
 	root.SetArgs([]string{"delivery", "resume", "7"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("delivery resume: %v (%s)", err, stderr.String())
+	if err := root.Execute(); !errors.Is(err, errDeliveryNotResumed) {
+		t.Fatalf("delivery resume: err = %v, want errDeliveryNotResumed", err)
 	}
 	if got := stdout.String(); got != "request 7: not resumed (state fulfilled is not live (submitted/pending); nothing to resume)\n" {
 		t.Fatalf("stdout = %q", got)
@@ -273,5 +282,27 @@ func TestDeliveryResumeRejectsNonPositiveArg(t *testing.T) {
 	root.SetArgs([]string{"delivery", "resume", "not-a-number"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("delivery resume not-a-number: want an error, got nil")
+	}
+}
+
+// TestDeliveryCancelRefusalKeepsJSONAndExitsNonzero: an agent reading --json
+// still gets the structured refusal, and the exit status no longer claims the
+// live provider request is gone.
+func TestDeliveryCancelRefusalKeepsJSONAndExitsNonzero(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, _ string, _, result any) error {
+		*result.(*api.DeliveryCancelResult) = api.DeliveryCancelResult{JobID: "job_01", State: "pending", Reason: "cancel directly with the institution"}
+		return nil
+	})
+	root.SetArgs([]string{"--json", "delivery", "cancel", "job_01"})
+	if err := root.Execute(); !errors.Is(err, errDeliveryNotCancelled) {
+		t.Fatalf("err = %v, want errDeliveryNotCancelled", err)
+	}
+	var decoded api.DeliveryCancelResult
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("--json output is not valid JSON: %v (%s)", err, stdout.Bytes())
+	}
+	if decoded.Cancelled || decoded.State != "pending" || decoded.Reason == "" {
+		t.Fatalf("decoded = %+v, want the daemon's refusal", decoded)
 	}
 }

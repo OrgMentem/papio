@@ -13,6 +13,15 @@ import (
 	"papio/internal/api"
 )
 
+// errDeliveryNotCancelled and errDeliveryNotResumed turn a daemon's
+// structured refusal into a nonzero exit after the result is printed, the
+// errDoctorFailed shape: the result stays on stdout (and in --json) and the
+// exit status stops claiming an operation that did not happen.
+var (
+	errDeliveryNotCancelled = errors.New("delivery request not cancelled")
+	errDeliveryNotResumed   = errors.New("delivery request not resumed")
+)
+
 // newDeliveryCommand is ADR-0017 Decision 1's new CLI surface for document
 // delivery / ILL: get, submit, and cancel where the provider supports it,
 // plus Decision 4's three reconciliation operations for a job stuck in
@@ -125,7 +134,14 @@ func newDeliveryCancelCommand(opt *options) *cobra.Command {
 			if result.Cancelled {
 				return opt.printResult(result, "Cancelled delivery request for %s", args[0])
 			}
-			return opt.printResult(result, "%s: not cancelled (%s)", args[0], result.Reason)
+			// A refusal is a routine structured outcome, so the daemon
+			// answers it as a result; the exit status still has to say the
+			// request was not cancelled, or a script treats a live, possibly
+			// chargeable provider request as gone.
+			if err := opt.printResult(result, "%s: not cancelled (%s)", args[0], result.Reason); err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: %s is %s", errDeliveryNotCancelled, args[0], result.State)
 		},
 	}
 }
@@ -209,7 +225,10 @@ func newDeliveryResumeCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if !result.Resumed {
-				return opt.printResult(result, "request %d: not resumed (%s)", requestID, result.Reason)
+				if err := opt.printResult(result, "request %d: not resumed (%s)", requestID, result.Reason); err != nil {
+					return err
+				}
+				return fmt.Errorf("%w: request %d is %s", errDeliveryNotResumed, requestID, result.State)
 			}
 			return opt.printResult(result, "request %d: resumed (state %s); run 'papio jobs retry <job-id>' to poll now", requestID, result.State)
 		},
