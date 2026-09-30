@@ -405,8 +405,9 @@ every name. The common cases:
   has not restarted since you added it. Run `papio daemon stop`; the next
   command starts it with the new setting.
 - `paused`: you paused it, or the sign-ins for two papers from different
-  providers did not come back. Sign in to your library in the browser; the
-  drive continues when any sign-in returns. Or run `papio drive resume`.
+  providers at the same library did not come back. Sign in to your library in
+  the browser; the drive continues when any sign-in returns. Or run
+  `papio drive resume`.
 - `holder_absent`: no browser is connected. Open the browser that has the
   extension; `papio browser sessions` shows which browser receives handoffs.
 - `no_eligible_job`: nothing parked can be opened now. The drive leaves a paper

@@ -555,11 +555,12 @@ The drive then works like this:
   every paper that has the same DOI prefix.
 - If the sign-in for one paper does not come back within 10 minutes, it leaves
   that paper, holds back every paper with the same DOI prefix for 6 hours, and
-  goes on to the next paper.
+  goes on to the next paper. A sign-in that comes back and then asks again
+  starts a new 10 minutes.
 - If this happens to the two most recent papers, and they come from different
-  providers, the drive pauses and sends you one notification. Sign in to your
-  library in the browser. The drive continues by itself when any sign-in comes
-  back, or when you run `papio drive resume`.
+  providers through the same library, the drive pauses and sends you one
+  notification. Sign in to your library in the browser. The drive continues by
+  itself when any sign-in comes back, or when you run `papio drive resume`.
 
 The drive never accepts publisher terms, never submits a document-delivery
 request, and never resolves an identity review. Those decisions stay with you.

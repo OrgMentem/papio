@@ -77,9 +77,15 @@ func newHarness(t *testing.T, enabled bool) *harness {
 // park creates one job parked awaiting_human on an open action of kind.
 func (h *harness) park(requestID, doi, kind string) string {
 	h.t.Helper()
+	return h.parkVia(requestID, doi, kind, "")
+}
+
+// parkVia parks a job whose policy routes it through a resolver profile.
+func (h *harness) parkVia(requestID, doi, kind, resolver string) string {
+	h.t.Helper()
 	ctx := context.Background()
 	id, err := h.jobs.CreateRequest(ctx, requestID, work.Work{DOI: doi}, "", "",
-		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalCLI)
+		job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20, Resolver: resolver}, nil, job.PrincipalCLI)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -369,6 +375,69 @@ func TestConsecutiveStallsOnDifferentProvidersPauseTheDriveOnce(t *testing.T) {
 				t.Fatalf("status = %+v with %d notices after %s, want resumed and still one notice", status, len(h.sink.intents), exit)
 			}
 		})
+	}
+}
+
+// Stalls through two resolver profiles are two institutions' sign-ins, not
+// one shared sign-in: each paper's route cools, the drive does not pause,
+// and a paper through a third profile still opens.
+func TestStallsAtDifferentInstitutionsDoNotPauseTheDrive(t *testing.T) {
+	h := newHarness(t, true)
+	h.pacer.Config.Browser.Resolvers = map[string]config.Institution{
+		"alpha": {OpenURLBase: "https://alpha.example.edu/openurl"},
+		"beta":  {OpenURLBase: "https://beta.example.edu/openurl"},
+		"gamma": {OpenURLBase: "https://gamma.example.edu/openurl"},
+	}
+	first := h.parkVia("wr_inst_a", "10.1111/a", "openurl_handoff", "alpha")
+	second := h.parkVia("wr_inst_b", "10.2222/b", "openurl_handoff", "beta")
+	third := h.parkVia("wr_inst_c", "10.3333/c", "openurl_handoff", "gamma")
+	h.run()
+	h.stallSignIn(first)
+	h.clock = h.clock.Add(11 * time.Minute)
+	h.run()
+	h.stallSignIn(second)
+	h.clock = h.clock.Add(11 * time.Minute)
+	h.run()
+	h.run()
+	if got := h.browser.openedJobs(); !slices.Equal(got, []string{first, second, third}) {
+		t.Fatalf("opened %v, want the third institution's paper opened after two unrelated stalls", got)
+	}
+	if status := h.status(); status.Paused || len(h.sink.intents) != 0 {
+		t.Fatalf("status = %+v with %d notices, want no shared sign-in pause", status, len(h.sink.intents))
+	}
+}
+
+// appendEventAt records a job event at a chosen time, as the bridge would
+// have recorded it then.
+func (h *harness) appendEventAt(jobID, kind string, at time.Time) {
+	h.t.Helper()
+	if _, err := h.jobs.S.DB().ExecContext(context.Background(),
+		"INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, '{}')",
+		jobID, store.FormatTime(at), kind); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// auth_pending toggles per tab: a sign-in that returned and then asked
+// again is a fresh sign-in, and its wait starts at the new auth_pending,
+// not at the first one.
+func TestAReturnedSignInRestartsTheSignInWait(t *testing.T) {
+	h := newHarness(t, true)
+	id := h.park("wr_rechallenge", "10.1000/rechallenge", "openurl_handoff")
+	h.run()
+	start := h.clock
+	h.appendEventAt(id, "browser.auth_pending", start.Add(time.Minute))
+	h.appendEventAt(id, "browser.auth_returned", start.Add(2*time.Minute))
+	h.appendEventAt(id, "browser.auth_pending", start.Add(9*time.Minute))
+	h.clock = start.Add(12 * time.Minute)
+	h.run()
+	if slices.Contains(h.eventKinds(id), SignInStalledEvent) {
+		t.Fatalf("events %v, want no stall three minutes into a fresh sign-in", h.eventKinds(id))
+	}
+	h.clock = start.Add(20 * time.Minute)
+	h.run()
+	if !slices.Contains(h.eventKinds(id), SignInStalledEvent) {
+		t.Fatalf("events %v, want a stall once the fresh sign-in outlived its wait", h.eventKinds(id))
 	}
 }
 

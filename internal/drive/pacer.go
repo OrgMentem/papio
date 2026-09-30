@@ -341,8 +341,9 @@ func (p *Pacer) recordStall(ctx context.Context, now time.Time, open job.EventRe
 
 // signInStalled reports whether a paced open is stuck at an institutional
 // sign-in: since the open, the browser reported auth_pending, never
-// auth_returned after it, and nothing else, and the first auth_pending is
-// older than sign_in_wait.
+// auth_returned after it, and nothing else, and the current uninterrupted
+// auth_pending interval is older than sign_in_wait. A sign-in that returned
+// ends its interval, so a later auth_pending starts a fresh wait.
 func (p *Pacer) signInStalled(ctx context.Context, now time.Time, open job.EventRecord) (bool, error) {
 	after, err := p.Jobs.JobEventsAfter(ctx, open.JobID, open.Seq)
 	if err != nil {
@@ -361,6 +362,7 @@ func (p *Pacer) signInStalled(ctx context.Context, now time.Time, open job.Event
 			returned = false
 		case event.Kind == "browser.auth_returned":
 			returned = true
+			firstPending = time.Time{}
 		}
 	}
 	if firstPending.IsZero() || returned || now.Sub(firstPending) < p.Config.Drive.EffectiveSignInWait() {
@@ -377,9 +379,11 @@ func (p *Pacer) signInStalled(ctx context.Context, now time.Time, open job.Event
 // not one provider route, needs a person. Every login gate the bridge opens
 // is keyed on the institution's authentication claim, whichever page asked,
 // so a gate cannot tell an IdP from a provider. The evidence is the drive's
-// own: its two most recent paced opens both stalled at the sign-in, on two
-// different DOI prefixes (one prefix is one provider, and its route is
-// already cooled). A sign-in that returned anywhere after the later stall,
+// own: its two most recent paced opens both stalled at the sign-in, through
+// the same resolver profile (one institution) and on two different DOI
+// prefixes (one prefix is one provider, and its route is already cooled).
+// Stalls through two profiles are two institutions' sign-ins, not one
+// shared sign-in. A sign-in that returned anywhere after the later stall,
 // or an operator resume after it, clears the evidence.
 func (p *Pacer) sharedSignInEvidence(ctx context.Context, opens []job.EventRecord) (*sharedSignIn, error) {
 	if len(opens) < 2 {
@@ -401,8 +405,11 @@ func (p *Pacer) sharedSignInEvidence(ctx context.Context, opens []job.EventRecor
 	if !latestOK || !earlierOK || latest.JobID == earlier.JobID {
 		return nil, nil
 	}
-	latestPrefix, earlierPrefix := p.jobDOIPrefix(ctx, latest.JobID), p.jobDOIPrefix(ctx, earlier.JobID)
-	if latestPrefix != "" && latestPrefix == earlierPrefix {
+	latestRoute, earlierRoute := p.jobRoute(ctx, latest.JobID), p.jobRoute(ctx, earlier.JobID)
+	if latestRoute.institution != earlierRoute.institution {
+		return nil, nil
+	}
+	if latestRoute.prefix != "" && latestRoute.prefix == earlierRoute.prefix {
 		return nil, nil
 	}
 	evidenceSeq := max(latestStall, earlierStall)
@@ -428,12 +435,24 @@ func (p *Pacer) sharedSignInEvidence(ctx context.Context, opens []job.EventRecor
 	return &sharedSignIn{jobs: []string{latest.JobID, earlier.JobID}}, nil
 }
 
-func (p *Pacer) jobDOIPrefix(ctx context.Context, jobID string) string {
+// pacedRoute names what a paced open went through: the institution (its
+// resolver profile, with "" and "default" the same default institution)
+// and the provider (its DOI prefix).
+type pacedRoute struct {
+	institution string
+	prefix      string
+}
+
+func (p *Pacer) jobRoute(ctx context.Context, jobID string) pacedRoute {
 	row, err := p.Jobs.Get(ctx, jobID)
 	if err != nil {
-		return ""
+		return pacedRoute{}
 	}
-	return doiPrefix(row.Work.DOI)
+	institution := row.Policy.Resolver
+	if institution == "default" {
+		institution = ""
+	}
+	return pacedRoute{institution: institution, prefix: doiPrefix(row.Work.DOI)}
 }
 
 func (p *Pacer) pauseForSignIn(ctx context.Context, now time.Time, shared sharedSignIn) error {
