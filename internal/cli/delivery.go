@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
+	"papio/internal/ipc"
 )
 
 // errDeliveryNotCancelled and errDeliveryNotResumed turn a daemon's
@@ -101,11 +102,23 @@ func printDeliveryDetail(opt *options, jobID string, detail api.DeliveryDetail) 
 }
 
 func newDeliverySubmitCommand(opt *options) *cobra.Command {
-	return &cobra.Command{
+	var confirm bool
+	command := &cobra.Command{
 		Use:   "submit <job-id>",
-		Short: "Run the document-delivery Branch/gate decision for a job",
-		Args:  cobra.ExactArgs(1),
+		Short: "Route a job to document delivery; may place a real ILL request with the provider (requires --confirm)",
+		Long: "Route a job to document delivery.\n\n" +
+			"This runs the document-delivery Branch/gate decision and acts on it. When\n" +
+			"the institution's gate allows automatic submission, papio places a real\n" +
+			"request with the provider — which can count against a request allowance\n" +
+			"or cost the institution money, and which papio cannot cancel through the\n" +
+			"provider. Otherwise it opens a prefill or reconciliation action.\n\n" +
+			"Without --confirm nothing is submitted: the command shows the job's\n" +
+			"recorded delivery request and compiled gate, if any, and exits nonzero.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if !confirm {
+				return previewDeliverySubmit(cmd, opt, args[0])
+			}
 			var result api.DeliverySubmitResult
 			if err := opt.call(cmd.Context(), "delivery.submit", map[string]string{"job_id": args[0]}, &result); err != nil {
 				return err
@@ -119,6 +132,41 @@ func newDeliverySubmitCommand(opt *options) *cobra.Command {
 			return opt.printResult(result, "%s: %s", args[0], result.Action)
 		},
 	}
+	command.Flags().BoolVar(&confirm, "confirm", false, "run the gate and, when it allows, place the provider request")
+	return command
+}
+
+// errDeliverySubmitUnconfirmed refuses `delivery submit` without --confirm:
+// the gate's submit verdict places an irreversible provider request, so the
+// command must never reach it by default.
+var errDeliverySubmitUnconfirmed = errors.New("delivery submit places a real provider request when the gate allows it, and papio cannot cancel that request; re-run with --confirm to proceed")
+
+// previewDeliverySubmit is the no-side-effect half of `delivery submit`: it
+// reads the job's existing delivery request and compiled gate (delivery.get)
+// so the operator sees where the job stands before confirming. A job with no
+// request yet has nothing recorded to show. --json prints nothing on stdout
+// here: a DeliveryDetail where a DeliverySubmitResult is expected would read
+// as a submission.
+func previewDeliverySubmit(cmd *cobra.Command, opt *options, jobID string) error {
+	if opt.jsonOutput {
+		return errDeliverySubmitUnconfirmed
+	}
+	var detail api.DeliveryDetail
+	err := opt.call(cmd.Context(), "delivery.get", map[string]string{"job_id": jobID}, &detail)
+	var remote *ipc.RemoteError
+	switch {
+	case err == nil:
+		if err := printDeliveryDetail(opt, jobID, detail); err != nil {
+			return err
+		}
+	case errors.As(err, &remote) && remote.Code == "not_found":
+		if _, err := fmt.Fprintf(opt.out, "%s: no delivery request recorded yet\n", jobID); err != nil {
+			return err
+		}
+	default:
+		return err
+	}
+	return errDeliverySubmitUnconfirmed
 }
 
 func newDeliveryCancelCommand(opt *options) *cobra.Command {

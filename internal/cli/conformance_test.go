@@ -146,7 +146,7 @@ var commandClassification = map[string]commandClass{
 	"papio jobs incidents":             {kind: kindEnvelope, rowKey: "incidents", rpcMethods: []string{"jobs.incidents"}},
 	"papio delivery":                   {kind: kindNone},
 	"papio delivery get":               {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.get"}},
-	"papio delivery submit":            {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.submit"}},
+	"papio delivery submit":            {kind: kindStructured, args: []string{"job_01", "--confirm"}, rpcMethods: []string{"delivery.submit"}},
 	"papio delivery cancel":            {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.cancel"}},
 	"papio delivery history":           {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.action"}},
 	"papio delivery confirm-exists":    {kind: kindStructured, args: []string{"job_01", "TN123"}, rpcMethods: []string{"delivery.action"}},

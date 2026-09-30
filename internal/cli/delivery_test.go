@@ -7,10 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/ipc"
 )
 
 func TestDeliveryGetRendersRowGateAndEvaluation(t *testing.T) {
@@ -103,7 +105,7 @@ func TestDeliverySubmitReportsActionAndBlockers(t *testing.T) {
 				*result.(*api.DeliverySubmitResult) = test.result
 				return nil
 			})
-			root.SetArgs([]string{"delivery", "submit", "job_01"})
+			root.SetArgs([]string{"delivery", "submit", "job_01", "--confirm"})
 			if err := root.Execute(); err != nil {
 				t.Fatalf("delivery submit: %v (%s)", err, stderr.String())
 			}
@@ -304,5 +306,61 @@ func TestDeliveryCancelRefusalKeepsJSONAndExitsNonzero(t *testing.T) {
 	}
 	if decoded.Cancelled || decoded.State != "pending" || decoded.Reason == "" {
 		t.Fatalf("decoded = %+v, want the daemon's refusal", decoded)
+	}
+}
+
+// TestDeliverySubmitWithoutConfirmNeverReachesTheProvider: the gate's submit
+// verdict places an irreversible provider request, so without --confirm the
+// command may only read. It shows what is recorded and exits nonzero.
+func TestDeliverySubmitWithoutConfirmNeverReachesTheProvider(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		args    []string
+		get     func(result any) error
+		want    string
+		getUsed bool
+	}{
+		{
+			name: "existing request", args: []string{"delivery", "submit", "job_01"}, getUsed: true,
+			get: func(result any) error {
+				*result.(*api.DeliveryDetail) = api.DeliveryDetail{
+					Request: &api.DeliveryRequest{JobID: "job_01", Provider: "illiad", State: "offered"},
+					Gate:    api.DeliveryGateSummary{Class: "auto_capable"},
+				}
+				return nil
+			},
+			want: "gate: auto_capable",
+		},
+		{
+			name: "no request yet", args: []string{"delivery", "submit", "job_01"}, getUsed: true,
+			get: func(any) error {
+				return &ipc.RemoteError{Code: "not_found", Message: "no delivery request for this job"}
+			},
+			want: "job_01: no delivery request recorded yet",
+		},
+		{name: "json", args: []string{"--json", "delivery", "submit", "job_01"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _, result any) error {
+				if method != "delivery.get" || !test.getUsed {
+					t.Fatalf("method = %q without --confirm", method)
+				}
+				return test.get(result)
+			})
+			root.SetArgs(test.args)
+			if err := root.Execute(); !errors.Is(err, errDeliverySubmitUnconfirmed) {
+				t.Fatalf("err = %v, want errDeliverySubmitUnconfirmed", err)
+			}
+			if test.want == "" {
+				if stdout.Len() != 0 {
+					t.Fatalf("stdout = %q, want nothing under --json", stdout.String())
+				}
+				return
+			}
+			if !strings.Contains(stdout.String(), test.want) {
+				t.Fatalf("stdout = %q, want it to contain %q", stdout.String(), test.want)
+			}
+		})
 	}
 }
