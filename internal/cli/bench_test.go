@@ -46,8 +46,8 @@ func TestBenchFailsWhenACohortWorkCouldNotRun(t *testing.T) {
 			t.Fatalf("json=%t: err = %v, want errBenchWorksFailed counting 1 of 1", jsonOutput, err)
 		}
 		if !jsonOutput {
-			if !strings.Contains(out.String(), "broken-fixture\terror: ") {
-				t.Fatalf("text report lost the error row:\n%s", out.String())
+			if !strings.Contains(out.String(), "broken-fixture\terror: ") || !strings.Contains(out.String(), "/ 1 works (1 could not run)") {
+				t.Fatalf("text report lost the error row or counted it as measured:\n%s", out.String())
 			}
 			continue
 		}
