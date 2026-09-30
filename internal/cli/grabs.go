@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"papio/internal/agentjson"
 	"papio/internal/api"
 )
 
@@ -19,7 +20,13 @@ func newGrabsCommand(opt *options) *cobra.Command {
 	identify := &cobra.Command{
 		Use:   "identify <grab-id>",
 		Short: "Bind an operator-supplied identifier to a captured PDF grab",
-		Args:  cobra.ExactArgs(1),
+		Long: "Bind an operator-supplied identifier to a captured PDF grab that parked\n" +
+			"without one, creating or joining the job for that work.\n\n" +
+			"When a ready job already holds the identifier, the outcome is already_owned\n" +
+			"and the capture is kept, still parked: nothing checks the typed identifier\n" +
+			"against the file, so it may be a different paper or version. Discard it\n" +
+			"with `papio inbox decide pdf_grab:<grab-id> --op dismiss --delete-grab`.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			kind, value, err := grabIdentifierFlags(doi, pmid, arxiv)
 			if err != nil {
@@ -34,11 +41,14 @@ func newGrabsCommand(opt *options) *cobra.Command {
 			if opt.jsonOutput {
 				return opt.printJSON(result)
 			}
+			fields := []string{result.GrabID, result.Outcome}
 			if result.JobID != "" {
-				_, err = fmt.Fprintf(opt.out, "%s\t%s\t%s\n", result.GrabID, result.Outcome, result.JobID)
-			} else {
-				_, err = fmt.Fprintf(opt.out, "%s\t%s\n", result.GrabID, result.Outcome)
+				fields = append(fields, result.JobID)
 			}
+			if result.Detail != "" {
+				fields = append(fields, result.Detail)
+			}
+			_, err = fmt.Fprintln(opt.out, strings.Join(fields, "\t"))
 			return err
 		},
 	}
@@ -87,6 +97,7 @@ type grabsBindsResult struct {
 // automatic filing turns out to be wrong.
 func newGrabsBindsCommand(opt *options) *cobra.Command {
 	var limit int
+	var before string
 	command := &cobra.Command{
 		Use:   "binds",
 		Short: "List captures papio filed automatically, without asking",
@@ -95,15 +106,27 @@ func newGrabsBindsCommand(opt *options) *cobra.Command {
 			"pending job; everything else still parks for a human. Because there is no\n" +
 			"unbind command, this listing — the rule version, how many candidates were on\n" +
 			"the table, and the evidence that made one of them the winner — is the only\n" +
-			"way to check an automatic filing after the fact.",
+			"way to check an automatic filing after the fact.\n\n" +
+			"One page holds at most 200 binds. When more exist, the listing ends with the\n" +
+			"command for the next page: --before with the last grab id shown.",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			before = strings.TrimSpace(before)
 			var result grabsBindsResult
-			if err := opt.call(cmd.Context(), "grabs.binds", map[string]any{"limit": limit}, &result); err != nil {
-				if isUnknownMethod(err) {
+			err := opt.call(cmd.Context(), "grabs.binds_v2", map[string]any{"limit": limit, "before": before}, &result)
+			if err != nil && isUnknownMethod(err) {
+				// An older daemon has no cursor: its first page is still an
+				// honest answer, a --before request is not.
+				if before != "" {
+					return daemonUpgradeRequired("grabs.binds_v2")
+				}
+				err = opt.call(cmd.Context(), "grabs.binds", map[string]any{"limit": limit}, &result)
+				if err != nil && isUnknownMethod(err) {
 					return daemonUpgradeRequired("grabs.binds")
 				}
+			}
+			if err != nil {
 				return err
 			}
 			if opt.jsonOutput {
@@ -121,10 +144,15 @@ func newGrabsBindsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
+			if result.Truncated && len(result.Binds) > 0 {
+				_, err := fmt.Fprintf(opt.out, "… older binds exist; next page: papio grabs binds --before %s\n", result.Binds[len(result.Binds)-1].GrabID)
+				return err
+			}
 			return nil
 		},
 	}
 	command.Flags().IntVar(&limit, "limit", 50, "maximum autonomous binds to list (default 50, max 200)")
+	command.Flags().StringVar(&before, "before", "", "list only binds older than this grab id (the last grab of the previous page)")
 	return command
 }
 
@@ -133,6 +161,19 @@ func shortBindID(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// grabSuggestJSON is `grabs suggest --json`: the daemon's whole
+// grabs.suggest result with its list fields always present, because the
+// daemon type omits empty lists and a consumer must be able to read
+// "outcome ok, no suggestions" without guessing at a missing key.
+type grabSuggestJSON struct {
+	GrabID              string                   `json:"grab_id"`
+	Outcome             string                   `json:"outcome"`
+	Detail              string                   `json:"detail,omitempty"`
+	DocumentIdentifiers []api.DocumentIdentifier `json:"document_identifiers"`
+	Suggestions         []api.GrabSuggestionRow  `json:"suggestions"`
+	Truncated           bool                     `json:"truncated"`
 }
 
 // newGrabsSuggestCommand answers "which of my pending papers is this?" for a
@@ -173,12 +214,21 @@ func newGrabsSuggestCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				// The envelope carries only the ranked list: document_identifiers
-				// and outcome/detail are the human-workflow shortcut described
-				// above, not something a scripted consumer of this row set needs —
-				// a caller that wants them can read grab.Grab's own quarantined
-				// bytes directly, the same source this command reads.
-				return printPage(opt, "suggestions", result.Suggestions, result.Truncated)
+				// A structured record, not a two-key envelope: the outcome is
+				// what separates "no pending job matched" from "the ranking
+				// could not be computed", and document_identifiers is the
+				// better next step when the file names itself. Suggestions and
+				// truncated keep their envelope spelling inside it.
+				identifiers, _ := agentjson.Truncate(result.DocumentIdentifiers, 0)
+				suggestions, _ := agentjson.Truncate(result.Suggestions, 0)
+				return opt.printJSON(grabSuggestJSON{
+					GrabID:              result.GrabID,
+					Outcome:             result.Outcome,
+					Detail:              result.Detail,
+					DocumentIdentifiers: identifiers,
+					Suggestions:         suggestions,
+					Truncated:           result.Truncated,
+				})
 			}
 			return printGrabSuggestions(opt, result)
 		},
@@ -281,14 +331,33 @@ func newGrabsConfirmCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result)
+				if err := opt.printJSON(result); err != nil {
+					return err
+				}
+			} else if err := printGrabConfirmResult(opt, result); err != nil {
+				return err
 			}
-			return printGrabConfirmResult(opt, result)
+			return grabConfirmOutcomeError(result)
 		},
 	}
 	command.Flags().StringVar(&jobID, "job", "", "pending job id to file this capture against")
 	_ = command.MarkFlagRequired("job")
 	return command
+}
+
+// grabConfirmOutcomeError makes the exit status agree with the printed
+// outcome: job_created is the only outcome that filed the capture, so every
+// other one — a refusal that changed nothing, or a failure that may have
+// bound the grab without adopting its bytes — is a failed command. The
+// structured result is already on stdout by the time this runs.
+func grabConfirmOutcomeError(result api.GrabConfirmResult) error {
+	if result.Outcome == "job_created" {
+		return nil
+	}
+	if result.Detail != "" {
+		return fmt.Errorf("grab %s was not filed: %s: %s", result.GrabID, result.Outcome, result.Detail)
+	}
+	return fmt.Errorf("grab %s was not filed: %s", result.GrabID, result.Outcome)
 }
 
 // printGrabConfirmResult renders grabs.confirm for a human, with
@@ -305,7 +374,10 @@ func printGrabConfirmResult(opt *options, result api.GrabConfirmResult) error {
 		_, err := fmt.Fprintf(opt.out, "%s: refused — %s; the pick was not applied, nothing changed\n", result.GrabID, detail)
 		return err
 	}
-	if result.JobID != "" {
+	// The daemon echoes the picked job on every outcome, so a job id alone
+	// does not mean the capture was filed; a non-success outcome prints its
+	// detail (e.g. "bound but bytes could not be adopted") instead.
+	if result.Outcome == "job_created" && result.JobID != "" {
 		_, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", result.GrabID, result.Outcome, result.JobID)
 		return err
 	}

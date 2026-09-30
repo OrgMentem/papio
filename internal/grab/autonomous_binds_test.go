@@ -3,6 +3,7 @@ package grab
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -151,5 +152,60 @@ func TestListAutonomousBindsExcludesOtherMethods(t *testing.T) {
 	}
 	if _, err := svc.ListAutonomousBinds(ctx, 10); err == nil {
 		t.Fatal("unparseable provenance returned no error, want the row surfaced as a defect")
+	}
+}
+
+// TestListAutonomousBindsBeforePagesEveryBind pins the audit's reachability:
+// walking pages by the last grab of each page visits every automatic bind
+// exactly once, and an operator confirm between them neither shows up nor
+// shortens a page into looking like the end of the audit.
+func TestListAutonomousBindsBeforePagesEveryBind(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	svc := New(s, nil)
+
+	var want []string
+	for i, at := range []string{"2026-08-20T00:00:00Z", "2026-08-19T00:00:00Z", "2026-08-19T00:00:00Z", "2026-08-18T00:00:00Z"} {
+		want = append(want, bindFixture(t, ctx, svc, s, "Auto "+string(rune('A'+i)), "job_0000000000000000000000030"+string(rune('1'+i)), at))
+	}
+	// Two binds share a timestamp: the id tiebreak must order them the way
+	// the cursor does, or one of them is skipped or repeated.
+	if want[1] < want[2] {
+		want[1], want[2] = want[2], want[1]
+	}
+	human := bindFixture(t, ctx, svc, s, "Operator Pick", "job_00000000000000000000000399", "2026-08-19T12:00:00Z")
+	if _, err := s.DB().ExecContext(ctx, `UPDATE pdf_grabs SET bind_provenance = ? WHERE id = ?`,
+		`{"method":"operator_confirm","rule":"operator/1","winner":"job_00000000000000000000000399"}`, human); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	before := ""
+	for page := range 10 {
+		rows, err := svc.ListAutonomousBindsBefore(ctx, before, 2)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if page == 0 && len(rows) != 2 {
+			t.Fatalf("first page = %d rows, want a full page of 2 despite the operator confirm", len(rows))
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, row := range rows {
+			got = append(got, row.GrabID)
+		}
+		before = rows[len(rows)-1].GrabID
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("paged binds = %v, want every automatic bind once, newest first: %v", got, want)
+	}
+
+	if _, err := svc.ListAutonomousBindsBefore(ctx, "grab_does_not_exist", 2); !errors.Is(err, ErrUnknownBindCursor) {
+		t.Fatalf("unknown cursor = %v, want ErrUnknownBindCursor", err)
 	}
 }

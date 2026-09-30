@@ -585,11 +585,46 @@ func (s *Service) MarkBoundToJobFenced(ctx context.Context, id, jobID, outcome s
 // an error instead of skipping the row (contrast BoundByRule, which counts
 // unreadable rows because a rule audit is not this audit's job).
 func (s *Service) ListAutonomousBinds(ctx context.Context, limit int) ([]BindRecord, error) {
-	rows, err := s.store.DB().QueryContext(ctx, `
+	return s.ListAutonomousBindsBefore(ctx, "", limit)
+}
+
+// ErrUnknownBindCursor reports a ListAutonomousBindsBefore cursor that names
+// no grab, so a caller can refuse it instead of restarting from the newest.
+var ErrUnknownBindCursor = errors.New("bind cursor names no pdf grab")
+
+// ListAutonomousBindsBefore is ListAutonomousBinds continued past one page:
+// with beforeGrabID set it returns only binds strictly older than that grab
+// in the same (updated_at DESC, id DESC) order, so passing the last grab of
+// one page reaches the next without skipping or repeating a row. An empty
+// beforeGrabID starts from the newest bind.
+func (s *Service) ListAutonomousBindsBefore(ctx context.Context, beforeGrabID string, limit int) ([]BindRecord, error) {
+	// The method filter runs in SQL, not only after the scan: operator
+	// confirms write provenance too, and filtering them out after LIMIT
+	// would return a short page that reads as the end of the audit while
+	// older automatic binds remain. A malformed provenance makes
+	// json_extract fail the query, which keeps that defect loud.
+	query := `
 		SELECT id, COALESCE(job_id, ''), updated_at, bind_provenance FROM pdf_grabs
 		WHERE bind_provenance IS NOT NULL AND bind_provenance != ''
+		  AND json_extract(bind_provenance, '$.method') = 'candidate_auto_bind'`
+	args := []any{}
+	if beforeGrabID != "" {
+		var cursorAt string
+		err := s.store.DB().QueryRowContext(ctx, `SELECT updated_at FROM pdf_grabs WHERE id = ?`, beforeGrabID).Scan(&cursorAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrUnknownBindCursor
+		}
+		if err != nil {
+			return nil, err
+		}
+		query += ` AND (updated_at < ? OR (updated_at = ? AND id < ?))`
+		args = append(args, cursorAt, cursorAt, beforeGrabID)
+	}
+	query += `
 		ORDER BY updated_at DESC, id DESC
-		LIMIT ?`, limit)
+		LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.store.DB().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

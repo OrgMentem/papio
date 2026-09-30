@@ -10863,6 +10863,57 @@ func TestSweepGrabsParksNoIdentifier(t *testing.T) {
 	}
 }
 
+// TestIdentifyGrabKeepsBytesWhenAReadyJobOwnsTheIdentifier pins that an
+// operator-typed identifier matching a ready job never deletes the capture:
+// nothing checks the typed identifier against the bytes, so the grab stays
+// parked with its file, and no duplicate job is created.
+func TestIdentifyGrabKeepsBytesWhenAReadyJobOwnsTheIdentifier(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	b.svc.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 1},
+			Text:       pdf.TextReport{Chars: 40, Excerpt: "No identifier printed anywhere on this page.\n"},
+		}, nil
+	}
+	ctx := context.Background()
+	readyID := bulkReadyJob(t, jobs, "wr_grab_owned", "10.1234/grab.owned")
+	g, err := b.grabs.Allocate(ctx, "pdf.example.org", "Mystery Paper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(cfg.EffectiveAdoptionRoot(), "grabs", g.ID)
+	writeFixturePDF(t, filepath.Join(dir, "main.pdf"))
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	parked, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || parked == nil || parked.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("grab before identify = %+v, err=%v; want parked", parked, err)
+	}
+
+	identified := b.IdentifyGrab(ctx, g.ID, "doi", "10.1234/grab.owned")
+	if identified.Outcome != "already_owned" || identified.JobID != readyID || identified.Detail == "" {
+		t.Fatalf("identify result = %+v, want already_owned naming ready job %s with a detail", identified, readyID)
+	}
+	if _, err := os.Stat(parked.QuarantinePath); err != nil {
+		t.Fatalf("captured bytes after already_owned: %v; want them kept", err)
+	}
+	after, err := b.grabs.Get(ctx, g.ID)
+	if err != nil || after == nil || after.State != grab.StateParkedNoIdentifier || after.JobID != "" {
+		t.Fatalf("grab after already_owned = %+v, err=%v; want it still parked", after, err)
+	}
+	var jobCount int
+	if err := jobs.S.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs j JOIN identifiers i ON i.work_request_id = j.work_request_id WHERE i.kind='doi' AND i.value=?`,
+		"10.1234/grab.owned").Scan(&jobCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobCount != 1 {
+		t.Fatalf("jobs for this DOI = %d, want exactly the ready one", jobCount)
+	}
+}
+
 // TestSweepGrabsFailsValidationForNonPDF pins the honest failed_validation
 // state for a settled file that is not a PDF at all.
 func TestSweepGrabsFailsValidationForNonPDF(t *testing.T) {

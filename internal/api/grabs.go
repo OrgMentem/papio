@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -52,6 +53,16 @@ type grabsBindsParams struct {
 	Limit int `json:"limit,omitempty"`
 }
 
+// grabsBindsV2Params is grabs.binds_v2: grabs.binds plus a keyset cursor.
+// Before names the last grab of the previous page. It is a new method
+// rather than a new grabs.binds field because params decode strictly, and a
+// cursor an older daemon rejected as unknown would be indistinguishable from
+// a malformed request; an unknown method is a clean "upgrade the daemon".
+type grabsBindsV2Params struct {
+	Limit  int    `json:"limit,omitempty"`
+	Before string `json:"before,omitempty"`
+}
+
 // GrabBindRow is one grabs.binds row: the grab, the job an automatic bind
 // filed it under, when that commit happened, and the full BindProvenance
 // that justified the decision, carried verbatim so an operator never has to
@@ -78,7 +89,21 @@ func listAutonomousBinds(ctx context.Context, raw json.RawMessage, system *boots
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
-	limit := params.Limit
+	return autonomousBindsPage(ctx, system, "", params.Limit)
+}
+
+// listAutonomousBindsV2 serves grabs.binds_v2: the same page as grabs.binds,
+// continued past the grab named by before, so every automatic filing stays
+// reachable however many there are.
+func listAutonomousBindsV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params grabsBindsV2Params
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	return autonomousBindsPage(ctx, system, strings.TrimSpace(params.Before), params.Limit)
+}
+
+func autonomousBindsPage(ctx context.Context, system *bootstrap.System, before string, limit int) ([]byte, *ipc.RPCError) {
 	switch {
 	case limit <= 0:
 		limit = grabsBindsDefaultLimit
@@ -88,7 +113,10 @@ func listAutonomousBinds(ctx context.Context, raw json.RawMessage, system *boots
 	if system == nil || system.Browser == nil {
 		return marshal(agentjson.Envelope("binds", []GrabBindRow{}, false))
 	}
-	records, err := system.Browser.AutonomousBinds(ctx, limit+1)
+	records, err := system.Browser.AutonomousBinds(ctx, before, limit+1)
+	if errors.Is(err, grab.ErrUnknownBindCursor) {
+		return badParams(fmt.Errorf("before %q names no pdf grab", before))
+	}
 	if err != nil {
 		return failure(err)
 	}

@@ -10498,19 +10498,15 @@ func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) Gra
 		return result
 	}
 	if readyJobID != "" {
-		if err := os.RemoveAll(filepath.Dir(g.QuarantinePath)); err != nil {
-			result.Outcome, result.Detail = "failed", "captured bytes could not be discarded after ready ownership"
-			return result
+		// The identifier is operator-typed and nothing here checks it against
+		// the captured bytes, so a ready job holding that identifier proves
+		// neither that these bytes are the same paper nor the same version.
+		// Deleting them would make a typo irreversible. The grab stays parked
+		// with its bytes; discarding it is the explicit inbox dismissal.
+		return GrabIdentifyResult{
+			GrabID: grabID, JobID: readyJobID, Outcome: "already_owned",
+			Detail: "a ready job already holds this identifier; the capture was kept and is still parked — dismiss it from the inbox to discard it",
 		}
-		if err := b.grabs.MarkIdentified(ctx, grabID); err != nil {
-			result.Outcome, result.Detail = "conflict", "pdf grab changed before identification"
-			return result
-		}
-		if err := b.grabs.MarkJobCreated(ctx, grabID, readyJobID, "already_owned"); err != nil {
-			result.Outcome, result.Detail = "failed", "pdf grab could not be finalized"
-			return result
-		}
-		return GrabIdentifyResult{GrabID: grabID, JobID: readyJobID, Outcome: "already_owned"}
 	}
 	mode, err := b.cfg.RequireAccessMode()
 	if err != nil {
@@ -10781,11 +10777,11 @@ func operatorConfirmProvenance(doc pdf.BindDocument, candidates []pdf.BindCandid
 // not configured) reports no binds rather than an error: an operator asking
 // what a machine has filed on an install with grabs off should see "none",
 // not a fault.
-func (b *Bridge) AutonomousBinds(ctx context.Context, limit int) ([]grab.BindRecord, error) {
+func (b *Bridge) AutonomousBinds(ctx context.Context, beforeGrabID string, limit int) ([]grab.BindRecord, error) {
 	if b == nil || b.grabs == nil {
 		return nil, nil
 	}
-	return b.grabs.ListAutonomousBinds(ctx, limit)
+	return b.grabs.ListAutonomousBindsBefore(ctx, beforeGrabID, limit)
 }
 
 // copyFile streams src into a freshly created dst. Unlike copyHashed
