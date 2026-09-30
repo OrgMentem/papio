@@ -1076,6 +1076,12 @@ func TestProfileEvidenceRejectsSupersededRevisionAndTombstone(t *testing.T) {
 	if err := js.RecordProfileEvidence(ctx, observation("delayed-old-revision", 1)); !errors.Is(err, ErrProfileEvidenceStale) {
 		t.Fatalf("superseded revision evidence = %v, want stale", err)
 	}
+	// A lost-response replay of the committed revision-1 frame is stale too:
+	// the fence runs before the idempotency lookup, so a caller never acts on
+	// evidence for a superseded identity just because its first write landed.
+	if err := js.RecordProfileEvidence(ctx, observation("live-revision", 1)); !errors.Is(err, ErrProfileEvidenceStale) {
+		t.Fatalf("replay after revision edit = %v, want stale", err)
+	}
 	if err := js.RecordProfileEvidence(ctx, observation("current-revision", 2)); err != nil {
 		t.Fatalf("current revision evidence: %v", err)
 	}

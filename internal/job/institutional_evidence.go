@@ -119,7 +119,10 @@ func (o ProfileEvidenceObservation) validate() error {
 // revision is an authority fence, not a historical annotation: an observation
 // whose revision is no longer the live revision of a non-tombstoned profile
 // was produced under a superseded identity and is rejected as stale rather
-// than promoted into the current revision.
+// than promoted into the current revision. The fence runs before the
+// idempotency lookup, so a replay of a row committed under a revision that
+// has since changed is stale too: callers treat stale as "do not act on
+// this", which is the only safe answer for a superseded identity.
 func (js *Store) RecordProfileEvidence(ctx context.Context, observation ProfileEvidenceObservation) error {
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
