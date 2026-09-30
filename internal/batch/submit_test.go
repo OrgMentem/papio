@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -584,6 +585,123 @@ func TestSubmitProvesAbsenceViaStoreThenSubmits(t *testing.T) {
 	}
 	if len(output.Submitted) != 1 || output.Submitted[0].JobID != "job-fresh" {
 		t.Fatalf("Submitted = %+v, want a fresh job after proven absence", output.Submitted)
+	}
+}
+
+// A first run that wrote its intent and then failed before the daemon
+// recorded any job, with no papio.db yet, leaves a jobless intent. The
+// missing store proves nothing was committed, so the retry must submit
+// instead of refusing the work forever.
+func TestSubmitRetriesJoblessIntentWhenStoreMissing(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	works := []protocol.WorkRequest{doiWork("retry-missing-store", "10.1000/retry-missing-store")}
+	if err := Write(dataDir, NewManifest(works, "", "", now)); err != nil {
+		t.Fatalf("Write intent manifest = %v", err)
+	}
+	caller := &goneJobBatchCaller{jobID: "job-fresh"}
+	output, err := Submit(context.Background(), caller, dataDir, []protocol.WorkRequest{doiWork("retry-missing-store", "10.1000/retry-missing-store")}, SubmitOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Submit = %v, want the jobless intent submitted", err)
+	}
+	if len(output.Submitted) != 1 || output.Submitted[0].JobID != "job-fresh" || output.Failed != 0 {
+		t.Fatalf("output = %+v, want one fresh submission", output)
+	}
+	manifest, err := Load(dataDir, output.BatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Works[0].JobID != "job-fresh" {
+		t.Fatalf("manifest = %+v, want the fresh job recorded", manifest.Works)
+	}
+}
+
+// flakyBatchCaller submits every work except refuseDOI, naming each job
+// "job-" plus its DOI suffix, and answers jobs.get from states — or fails
+// every state read when states is nil.
+type flakyBatchCaller struct {
+	baseBatchCaller
+	refuseDOI string
+	states    map[string]string
+	mu        sync.Mutex
+	submitted []string
+}
+
+func (c *flakyBatchCaller) Call(ctx context.Context, method string, params, result any) error {
+	switch method {
+	case "acquire.submit_v2":
+		doi := params.(submitParams).Request.Identifiers.DOI
+		if doi == c.refuseDOI {
+			return errors.New("daemon refused the submission")
+		}
+		c.mu.Lock()
+		c.submitted = append(c.submitted, doi)
+		c.mu.Unlock()
+		result.(*submitResult).JobID = "job-" + strings.TrimPrefix(doi, "10.1000/")
+		return nil
+	case "jobs.get":
+		id := params.(map[string]string)["job_id"]
+		state, ok := c.states[id]
+		if !ok {
+			return errors.New("daemon connection reset")
+		}
+		result.(*jobDetail).Job = json.RawMessage(`{"id":` + strconv.Quote(id) + `,"state":` + strconv.Quote(state) + `}`)
+		return nil
+	default:
+		return c.baseBatchCaller.Call(ctx, method, params, result)
+	}
+}
+
+// A state read that fails after a successful submission must not lose the
+// job: the work is reported as submitted in an unknown state, the error still
+// surfaces, and the manifest records the job beside a sibling whose
+// submission really failed. A retry reattaches to the recorded job instead of
+// submitting it again, and submits only the failed sibling.
+func TestSubmitStateLookupFailureKeepsSubmittedJob(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Date(2026, time.September, 26, 12, 0, 0, 0, time.UTC)
+	works := func() []protocol.WorkRequest {
+		return []protocol.WorkRequest{
+			doiWork("state-lookup", "10.1000/state-lookup"),
+			doiWork("refused", "10.1000/refused"),
+		}
+	}
+	first := &flakyBatchCaller{refuseDOI: "10.1000/refused"}
+	output, err := Submit(context.Background(), first, dataDir, works(), SubmitOptions{Now: now})
+	if err == nil || !strings.Contains(err.Error(), "getting state for job-state-lookup") {
+		t.Fatalf("Submit err = %v, want the state lookup failure", err)
+	}
+	if output == nil || output.Failed != 1 || len(output.Submitted) != 1 {
+		t.Fatalf("output = %+v, want one kept submission and one failure", output)
+	}
+	if got := output.Submitted[0]; got.JobID != "job-state-lookup" || got.State != "unknown" {
+		t.Fatalf("Submitted = %+v, want job-state-lookup in state unknown", got)
+	}
+	manifest, err := Load(dataDir, output.BatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byDOI := map[string]ManifestWork{}
+	for _, work := range manifest.Works {
+		byDOI[work.Work.Identifiers.DOI] = work
+	}
+	if kept := byDOI["10.1000/state-lookup"]; kept.JobID != "job-state-lookup" || kept.Status == "submission_failed" {
+		t.Fatalf("manifest kept work = %+v, want the submitted job recorded", kept)
+	}
+	if refused := byDOI["10.1000/refused"]; refused.JobID != "" || refused.Status != "submission_failed" {
+		t.Fatalf("manifest refused work = %+v, want submission_failed with no job", refused)
+	}
+
+	retry := &flakyBatchCaller{states: map[string]string{"job-state-lookup": "queued", "job-refused": "queued"}}
+	again, err := Submit(context.Background(), retry, dataDir, works(), SubmitOptions{Now: now})
+	if err != nil {
+		t.Fatalf("retry Submit = %v", err)
+	}
+	if len(retry.submitted) != 1 || retry.submitted[0] != "10.1000/refused" {
+		t.Fatalf("retry submitted %v, want only the previously refused work", retry.submitted)
+	}
+	if len(again.Submitted) != 2 || again.Failed != 0 {
+		t.Fatalf("retry output = %+v, want both works submitted", again)
 	}
 }
 

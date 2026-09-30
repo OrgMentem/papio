@@ -407,11 +407,13 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	// The store inspector closes the commit-before-reply window: a run
 	// killed after the daemon committed but before the reply reached
 	// recordJob leaves a jobless intent that no manifest entry can answer.
-	// A missing store means no daemon ever committed here, so lookups are
-	// simply absent. Any other open failure leaves the inspector nil, and
-	// the per-work rule below then refuses every work a prior run may
-	// have submitted instead of risking a duplicate provider effect.
+	// A missing store means no daemon ever committed here, so a jobless
+	// intent is positively unsubmitted and may be submitted. Any other open
+	// failure leaves the inspector nil, and the per-work rule below then
+	// refuses every work a prior run may have submitted instead of risking
+	// a duplicate provider effect.
 	inspector, err := openStoreInspector(dataDir)
+	storeAbsent := errors.Is(err, ErrBatchStoreNotFound)
 	if err != nil {
 		inspector = nil
 	}
@@ -515,10 +517,12 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 					adopt(jobID, state)
 					return
 				}
-			} else if priorWorks[request.RequestID] {
+			} else if priorWorks[request.RequestID] && !storeAbsent {
 				// A prior run wrote an intent for this request but no
-				// association, and the store cannot be read. Submitting
-				// could duplicate a committed-but-unreported job.
+				// association, and the existing store cannot be read.
+				// Submitting could duplicate a committed-but-unreported
+				// job. A missing store is instead proof that nothing was
+				// committed, so the work falls through to a fresh submit.
 				errs[index] = fmt.Errorf("cannot prove no prior submission for request %q; refusing to resubmit", request.RequestID)
 				return
 			}
