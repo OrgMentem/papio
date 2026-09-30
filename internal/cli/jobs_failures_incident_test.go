@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,5 +127,72 @@ func TestJobsIncidentsUseSeparateEnvelope(t *testing.T) {
 	const expected = `{"incidents":[{"fingerprint":"0123456789abcdef0123456789abcdef","safety_domain":"sage","host_family":"example.edu","outcome":"ui_changed","jobs":3,"first_seen":"2026-08-01T00:00:00Z","last_seen":"2026-08-01T01:00:00Z"}],"truncated":false}` + "\n"
 	if out.String() != expected {
 		t.Fatalf("output = %q, want %q", out.String(), expected)
+	}
+}
+
+// TestJobsFailuresAndIncidentsTextSayWhenTruncated: a text listing that stops
+// at --limit must say so, as the --json envelope does, or the operator reads
+// the first page of groups as every failing provider.
+func TestJobsFailuresAndIncidentsTextSayWhenTruncated(t *testing.T) {
+	first := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	failures := []job.FailureGroup{
+		{State: job.StateFailed, Provider: "a.example", Reason: "timeout", Count: 3, Sample: "job_a"},
+		{State: job.StateFailed, Provider: "b.example", Reason: "timeout", Count: 2, Sample: "job_b"},
+	}
+	incidents := []incident.Group{
+		{Fingerprint: "0123456789abcdef0123456789abcdef", SafetyDomain: "sage", HostFamily: "a.example", Outcome: "ui_changed", Jobs: 3, FirstSeen: first, LastSeen: first},
+		{Fingerprint: "fedcba9876543210fedcba9876543210", SafetyDomain: "sage", HostFamily: "b.example", Outcome: "ui_changed", Jobs: 1, FirstSeen: first, LastSeen: first},
+	}
+	serve := func(t *testing.T, failures []job.FailureGroup) func(context.Context, string, any, any) error {
+		return func(_ context.Context, method string, _ any, result any) error {
+			switch method {
+			case "jobs.failures":
+				*result.(*jobsFailuresResult) = jobsFailuresResult{Failures: failures}
+			case "jobs.incidents":
+				*result.(*jobsIncidentsResult) = jobsIncidentsResult{Incidents: incidents}
+			default:
+				t.Fatalf("method = %q", method)
+			}
+			return nil
+		}
+	}
+	for _, test := range []struct {
+		name     string
+		args     []string
+		failures []job.FailureGroup
+		want     []string
+		absent   []string
+	}{
+		{
+			name: "failures at the limit", args: []string{"jobs", "failures", "--limit", "2"}, failures: failures,
+			want: []string{"truncated: showing 2 failure groups; use --limit (max 200)", "truncated: showing 2 incident groups; use --limit (max 200)"},
+		},
+		{
+			name: "failures under the limit", args: []string{"jobs", "failures", "--limit", "3"}, failures: failures,
+			absent: []string{"truncated"},
+		},
+		{
+			name: "incidents at the limit", args: []string{"jobs", "incidents", "--limit", "2"},
+			want: []string{"truncated: showing 2 incident groups; use --limit (max 200)"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, serve(t, test.failures))
+			root.SetArgs(test.args)
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("%v: %v", test.args, err)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("output lacks %q:\n%s", want, out.String())
+				}
+			}
+			for _, absent := range test.absent {
+				if strings.Contains(out.String(), absent) {
+					t.Fatalf("output contains %q:\n%s", absent, out.String())
+				}
+			}
+		})
 	}
 }

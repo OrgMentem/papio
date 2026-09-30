@@ -267,11 +267,18 @@ func printDeliverySection(opt *options, delivery *api.DeliverySummary) error {
 // and the operator read the table as the whole queue. The page carries no
 // total, so the line gives none rather than paying a second query for one.
 func truncationNotice(opt *options, truncated bool, rows int, noun string) error {
+	return truncationNoticeUpTo(opt, truncated, rows, noun, job.ListLimitMax)
+}
+
+// truncationNoticeUpTo is truncationNotice for a command whose --limit caps at
+// max rather than job.ListLimitMax, so the remedy it names is one the flag
+// accepts.
+func truncationNoticeUpTo(opt *options, truncated bool, rows int, noun string, max int) error {
 	if !truncated || opt.jsonOutput {
 		return nil
 	}
 	_, err := fmt.Fprintf(opt.out, "truncated: showing %d %s; use --limit (max %d)\n",
-		rows, noun, job.ListLimitMax)
+		rows, noun, max)
 	return err
 }
 
@@ -688,6 +695,9 @@ func newJobsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
+			if err := truncationNoticeUpTo(opt, failureTruncated, len(failureRows), "failure groups", job.FailuresLimitMax); err != nil {
+				return err
+			}
 			for _, group := range incidentRows {
 				if _, err := fmt.Fprintf(opt.out, "%s | %s | %s | %s | %d | %s | %s\n",
 					group.Fingerprint, group.SafetyDomain, group.HostFamily, group.Outcome,
@@ -695,7 +705,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			return nil
+			return truncationNoticeUpTo(opt, incidentTruncated, len(incidentRows), "incident groups", job.FailuresLimitMax)
 		},
 	}
 	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since a duration or RFC3339 timestamp")
@@ -735,7 +745,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			return nil
+			return truncationNoticeUpTo(opt, truncated, len(rows), "incident groups", job.FailuresLimitMax)
 		},
 	}
 	incidents.Flags().StringVar(&incidentsSince, "since", "", "include incidents recorded since a duration or RFC3339 timestamp")
