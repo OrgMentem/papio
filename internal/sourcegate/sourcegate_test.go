@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"papio/internal/config"
+	"papio/internal/fetch"
 )
 
 type recorder struct {
@@ -99,5 +101,85 @@ func TestAMissingReserverIsAConstructionError(t *testing.T) {
 	}
 	if _, err := New(&recorder{}, "openalex", config.Source{Enabled: true}, 0, http.DefaultClient); err != nil {
 		t.Fatalf("New with both dependencies = %v, want success", err)
+	}
+}
+
+// hopRefuser admits the first `allow` reservations and refuses the rest.
+type hopRefuser struct {
+	calls int
+	allow int
+	err   error
+}
+
+func (r *hopRefuser) Acquire(context.Context, string, config.Source, float64) error {
+	r.calls++
+	if r.calls > r.allow {
+		return r.err
+	}
+	return nil
+}
+
+// A redirect is another physical request the provider counts, so a 302 -> 302
+// -> 200 chain through the production secure client needs three admissions,
+// and a refusal at a redirected hop stops that hop reaching the provider.
+func TestEveryRedirectHopIsAdmitted(t *testing.T) {
+	served := map[string]int{}
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		served[r.URL.Path]++
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/a":
+			http.Redirect(w, r, "/b", http.StatusFound)
+		case "/b":
+			http.Redirect(w, r, "/c", http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+	policy := fetch.DefaultPolicy()
+	policy.AllowHTTPLoopback = true
+	inner, err := fetch.NewSecureHTTPClient(policy, nil, http.DefaultTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	admitAll := &hopRefuser{allow: 100}
+	client, err := New(admitAll, "arxiv", config.Source{Enabled: true}, 0, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(request(t, server.URL+"/a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if admitAll.calls != 3 {
+		t.Fatalf("admissions for a two-redirect chain = %d, want 3 (one per physical request)", admitAll.calls)
+	}
+
+	refusal := errors.New("source arxiv is deferred")
+	refuseHop := &hopRefuser{allow: 1, err: refusal}
+	client, err = New(refuseHop, "arxiv", config.Source{Enabled: true}, 0, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	clear(served)
+	mu.Unlock()
+	resp, err = client.Do(request(t, server.URL+"/a"))
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatal("a refused redirect hop returned a response")
+	}
+	if !errors.Is(err, refusal) {
+		t.Fatalf("err = %v, want the hop's reservation error unwrapped", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if served["/a"] != 1 || served["/b"] != 0 || served["/c"] != 0 {
+		t.Fatalf("served = %v, want only /a once behind a refused redirect hop", served)
 	}
 }

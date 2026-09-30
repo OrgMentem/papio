@@ -52,6 +52,15 @@ func newSecureHTTPClient(policy Policy, resolver Resolver, transport http.RoundT
 // and ILLiad. Caller-supplied headers are removed on every redirect outside
 // the origin.
 func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
+	return c.DoAdmittingRedirects(request, nil)
+}
+
+// DoAdmittingRedirects is Do with a per-hop admission check: beforeRedirect
+// runs before every redirected request this client would issue, and its error
+// is returned unchanged with no further request sent. It lets a budget gate
+// that admitted the first request account for each physical request the
+// provider sees, instead of one per logical call. A nil beforeRedirect is Do.
+func (c *SecureHTTPClient) DoAdmittingRedirects(request *http.Request, beforeRedirect func(context.Context) error) (*http.Response, error) {
 	if c == nil || c.downloader == nil || request == nil || request.URL == nil {
 		closeRequestBody(request)
 		return nil, invalid("invalid request")
@@ -109,6 +118,12 @@ func (c *SecureHTTPClient) Do(request *http.Request) (*http.Response, error) {
 			}
 			current = next
 			redirects++
+			if beforeRedirect != nil {
+				if err := beforeRedirect(overall); err != nil {
+					cancelOverall()
+					return nil, err
+				}
+			}
 			continue
 		}
 		if resp.ContentLength > d.policy.MaxBytes {

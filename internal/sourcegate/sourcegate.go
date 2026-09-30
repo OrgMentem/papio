@@ -72,12 +72,28 @@ func New(reserve Reserver, source string, policy config.Source, costEach float64
 // Reserving per HTTP REQUEST rather than per logical call is deliberate: a
 // discovery search that resolves a seed DOI first issues two requests, and the
 // provider counts two. Accounting for one is the under-reporting this package
-// exists to end.
+// exists to end. The same holds for redirects: when inner follows them itself
+// (a redirect-following *fetch.SecureHTTPClient), each redirected hop is a
+// further physical request and is reserved before it is sent.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	if err := c.reserve.Acquire(req.Context(), c.source, c.policy, c.costEach); err != nil {
+	admit := func(ctx context.Context) error {
+		return c.reserve.Acquire(ctx, c.source, c.policy, c.costEach)
+	}
+	if err := admit(req.Context()); err != nil {
 		return nil, err
 	}
+	if hops, ok := c.inner.(redirectAdmitter); ok {
+		return hops.DoAdmittingRedirects(req, admit)
+	}
 	return c.inner.Do(req)
+}
+
+// redirectAdmitter is an inner client that follows redirects itself and can
+// run an admission check before each redirected hop. *fetch.SecureHTTPClient
+// implements it; keeping it an interface leaves sourcegate free of net-policy
+// code and testable with a fake.
+type redirectAdmitter interface {
+	DoAdmittingRedirects(req *http.Request, beforeRedirect func(context.Context) error) (*http.Response, error)
 }
 
 // Deferrer is the narrow capability NewObserver needs from a budget manager:
