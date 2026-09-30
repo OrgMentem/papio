@@ -27,11 +27,6 @@ type MacOS struct {
 	Exec ExecFunc
 }
 
-// NewMacOS constructs the production macOS notification sender.
-func NewMacOS() MacOS {
-	return MacOS{Exec: execCommand}
-}
-
 // Send displays message under the fixed papio title. It uses a five-second
 // deadline and deliberately ignores execution errors, including systems where
 // desktop notifications are unavailable.
