@@ -430,15 +430,42 @@ func validateBatchFlags(cmd *cobra.Command, args []string, fromZotio, wait bool)
 			"so resubmitting the same works on the same day reproduces them — see `papio batch report <batch-id>`")
 	}
 	for _, name := range []string{
-		"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year",
-		"zotio-item-key", "desired-version", "access-mode",
-		"max-cost", "source", "deny-source", "limit", "force",
+		"doi", "pmid", "arxiv", "isbn", "openalex", "title", "author", "year", "desired-version",
 	} {
 		if cmd.Flags().Changed(name) {
-			return fmt.Errorf("--batch cannot be combined with --%s; put per-work values in JSONL", name)
+			return fmt.Errorf("--batch cannot be combined with --%s; set %q on each work in the JSONL instead", name, batchWorkField(name))
+		}
+	}
+	if cmd.Flags().Changed("limit") {
+		return fmt.Errorf("--limit caps --from-zotio queueing and has no meaning with --batch")
+	}
+	// These are per-request policy, and a batch work carries only identity and
+	// metadata: the strict JSONL decoder (batch.ParseWork) rejects any other
+	// key. Telling the caller to "put per-work values in JSONL" sent them to an
+	// `unknown field` error, and the likeliest way out of that was to drop the
+	// cost cap or source restriction they meant to keep.
+	for _, name := range []string{
+		"zotio-item-key", "access-mode", "max-cost", "source", "deny-source", "force",
+	} {
+		if cmd.Flags().Changed(name) {
+			return fmt.Errorf("--batch cannot be combined with --%s, and batch JSONL has no field for it; "+
+				"submit each work that needs it on its own with `papio acquire <identifier> --%s`", name, name)
 		}
 	}
 	return nil
+}
+
+// batchWorkField names the JSONL work field that carries a one-work identity
+// or metadata flag, as batch.ParseWork decodes it.
+func batchWorkField(flag string) string {
+	switch flag {
+	case "author":
+		return "authors"
+	case "desired-version":
+		return "desired_version"
+	default:
+		return flag
+	}
 }
 
 func parseBatch(r io.Reader) ([]protocol.WorkRequest, error) {

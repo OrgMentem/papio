@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -439,6 +441,66 @@ func TestBatchWorkDecoderStillRejectsRequestID(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "request_id") {
 		t.Fatalf("error = %v, want it to name the unknown field", err)
+	}
+}
+
+// TestBatchFlagRefusalsNameAWorkingAlternative: every flag --batch refuses
+// used to say "put per-work values in JSONL", but the strict work decoder has
+// no field for per-request policy, so --max-cost or --source sent the caller
+// to `unknown field "max_cost"` and the likeliest recovery dropped the cap. A
+// refusal that names a JSONL field must name one parseBatch accepts; the rest
+// must not point at JSONL at all.
+func TestBatchFlagRefusalsNameAWorkingAlternative(t *testing.T) {
+	fieldRE := regexp.MustCompile(`set "([a-z_]+)" on each work in the JSONL`)
+	for _, tc := range []struct {
+		flag, value, jsonValue string
+	}{
+		{"doi", "10.1000/y", `"10.1000/y"`},
+		{"pmid", "12345", `"12345"`},
+		{"arxiv", "2301.08745", `"2301.08745"`},
+		{"isbn", "9780262033848", `"9780262033848"`},
+		{"openalex", "W2741809807", `"W2741809807"`},
+		{"title", "A title", `"A title"`},
+		{"author", "Ada Lovelace", `["Ada Lovelace"]`},
+		{"year", "2020", `2020`},
+		{"desired-version", "published", `"published"`},
+		{"zotio-item-key", "ABCD1234", ""},
+		{"access-mode", "conservative", ""},
+		{"max-cost", "2", ""},
+		{"source", "unpaywall", ""},
+		{"deny-source", "unpaywall", ""},
+		{"force", "true", ""},
+		{"limit", "5", ""},
+	} {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{AccessMode: config.ModeConservative},
+			func(_ context.Context, method string, _ any, _ any) error {
+				t.Fatalf("rejected batch reached the daemon (%q)", method)
+				return nil
+			})
+		root.SetArgs([]string{"acquire", "--batch", "-", "--" + tc.flag + "=" + tc.value})
+		err := root.ExecuteContext(context.Background())
+		if err == nil {
+			t.Fatalf("--batch --%s succeeded", tc.flag)
+		}
+		match := fieldRE.FindStringSubmatch(err.Error())
+		if tc.jsonValue == "" {
+			if match != nil || !strings.Contains(err.Error(), "no field") && !strings.Contains(err.Error(), "--from-zotio") {
+				t.Fatalf("--%s: error = %q, want it to say JSONL cannot carry the flag", tc.flag, err)
+			}
+			continue
+		}
+		if match == nil {
+			t.Fatalf("--%s: error = %q, want the JSONL field that carries it", tc.flag, err)
+		}
+		base := `"doi":"10.1000/batch-base"`
+		if match[1] == "doi" {
+			base = `"pmid":"999"`
+		}
+		line := fmt.Sprintf(`{%s,"%s":%s}`, base, match[1], tc.jsonValue)
+		if _, err := parseBatch(strings.NewReader(line)); err != nil {
+			t.Fatalf("--%s: suggested JSONL %s is rejected: %v", tc.flag, line, err)
+		}
 	}
 }
 
