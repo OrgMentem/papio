@@ -81,7 +81,7 @@ because no single CLI command supplies their MCP operation.
 | Tool | Parameters | Result and boundary |
 | --- | --- | --- |
 | `papio_acquire_batch` | `works` (required; 1–50 bare work objects or discovered-work envelopes); `auto_import` (optional, default `true`); `collection` (optional; defaults to `label`); `resolver` (optional); `label` (optional); `include_owned` (optional, default `false`) | Bulk-input equivalent of `acquire --batch`, whose stdin path is unavailable over MCP. Returns the batch manifest/routing result, including `batch_id`. |
-| `papio_batch_wait` | `batch_id` (required persisted batch ID or `latest`); `timeout_seconds` (optional, 1–600, default `300`); `poll_seconds` (optional, default `5`) | Read-only polling of one batch report. Returns `report` and `settled`. A human-review outcome is settled, not implicitly successful. |
+| `papio_batch_wait` | `batch_id` (required persisted batch ID or `latest`); `timeout_seconds` (optional, whole seconds 1–600, default `300`); `poll_seconds` (optional, whole seconds, default `5`); a fractional value is rejected | Read-only polling of one batch report. Returns `report` and `settled`. A human-review outcome is settled, not implicitly successful. |
 
 ## Hidden commands
 

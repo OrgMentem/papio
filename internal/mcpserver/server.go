@@ -113,8 +113,8 @@ func registerCompositeTools(s *server.MCPServer, system *bootstrap.System, deps 
 	s.AddTool(mcplib.NewTool("papio_batch_wait",
 		mcplib.WithDescription("Poll a batch report until every work has a settled outcome (including an explicit human-review outcome) or the bounded timeout expires. Does not submit, import, or resolve work."),
 		mcplib.WithString("batch_id", mcplib.Required(), mcplib.Description("Batch ID returned by papio_acquire_batch, or \"latest\".")),
-		mcplib.WithNumber("timeout_seconds", mcplib.Description("Maximum wait in seconds, 1 to 600; 0 or omitted defaults to 300.")),
-		mcplib.WithNumber("poll_seconds", mcplib.Description("Seconds between reports; defaults to 5.")),
+		mcplib.WithNumber("timeout_seconds", mcplib.Description("Maximum wait in whole seconds, 1 to 600; 0 or omitted defaults to 300.")),
+		mcplib.WithNumber("poll_seconds", mcplib.Description("Whole seconds between reports; defaults to 5.")),
 		mcplib.WithReadOnlyHintAnnotation(true),
 	), handleBatchWait(deps))
 }
