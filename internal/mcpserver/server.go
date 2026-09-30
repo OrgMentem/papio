@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -169,7 +170,15 @@ func handleBatchWait(deps toolDependencies) server.ToolHandlerFunc {
 		if batchID == "" {
 			return mcplib.NewToolResultError("batch_id is required"), nil
 		}
-		output, err := waitForBatch(ctx, deps, batchID, intArg(args, "timeout_seconds"), intArg(args, "poll_seconds"))
+		timeoutSeconds, err := wholeSecondsArg(args, "timeout_seconds")
+		if err != nil {
+			return mcplib.NewToolResultError(err.Error()), nil
+		}
+		pollSeconds, err := wholeSecondsArg(args, "poll_seconds")
+		if err != nil {
+			return mcplib.NewToolResultError(err.Error()), nil
+		}
+		output, err := waitForBatch(ctx, deps, batchID, timeoutSeconds, pollSeconds)
 		if err != nil {
 			return mcplib.NewToolResultError(err.Error()), nil
 		}
@@ -232,15 +241,22 @@ func waitForPoll(ctx context.Context, duration time.Duration) error {
 	}
 }
 
-func intArg(args map[string]any, key string) int {
-	switch value := args[key].(type) {
-	case float64:
-		return int(value)
-	case int:
-		return value
-	default:
-		return 0
+// wholeSecondsArg reads an optional whole-second argument. JSON numbers
+// arrive as float64, and converting 1.9 or 0.5 straight to int would wait a
+// different duration than the caller asked for — or, at zero, silently fall
+// back to the default — so anything but a finite whole number is refused.
+// Absent means 0, which each caller treats as its documented default.
+func wholeSecondsArg(args map[string]any, key string) (int, error) {
+	raw, present := args[key]
+	if !present || raw == nil {
+		return 0, nil
 	}
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value != math.Trunc(value) ||
+		value < math.MinInt32 || value > math.MaxInt32 {
+		return 0, fmt.Errorf("%s must be a whole number of seconds", key)
+	}
+	return int(value), nil
 }
 
 func jsonToolResult(value any) (*mcplib.CallToolResult, error) {

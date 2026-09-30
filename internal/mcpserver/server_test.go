@@ -245,6 +245,33 @@ func TestBatchWaitToolSettlesAndTimesOut(t *testing.T) {
 			t.Fatalf("RPC calls = %+v", fake.calls)
 		}
 	})
+
+	// JSON numbers arrive as float64; a fractional value must be refused, not
+	// truncated to a shorter wait (1.9 -> 1) or to zero, which silently means
+	// the default.
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+		want string
+	}{
+		{name: "fractional timeout", args: map[string]any{"timeout_seconds": 1.9}, want: "timeout_seconds must be a whole number of seconds"},
+		{name: "fractional poll", args: map[string]any{"poll_seconds": 0.5}, want: "poll_seconds must be a whole number of seconds"},
+		{name: "non-number timeout", args: map[string]any{"timeout_seconds": "10"}, want: "timeout_seconds must be a whole number of seconds"},
+		{name: "huge timeout", args: map[string]any{"timeout_seconds": 1e300}, want: "timeout_seconds must be a whole number of seconds"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeRPC{handler: func(method string, _ json.RawMessage) (any, error) {
+				t.Fatalf("invalid wait reached the daemon with %q", method)
+				return nil, nil
+			}}
+			c := newTestClient(t, nil, toolDependencies{caller: callerFunc(fake.Call), now: time.Now, wait: waitForPoll}, nil)
+			tc.args["batch_id"] = "batch-deadbeef"
+			res := callTool(t, c, "papio_batch_wait", tc.args)
+			if !res.IsError || !strings.Contains(resultText(res), tc.want) {
+				t.Fatalf("result = error=%v %q, want error %q", res.IsError, resultText(res), tc.want)
+			}
+		})
+	}
 }
 
 func TestJobsResourceEnvelope(t *testing.T) {
