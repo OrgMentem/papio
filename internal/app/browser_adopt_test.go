@@ -847,6 +847,54 @@ func TestAdoptDownloadRetainsPreparedPublicationOnPromotionError(t *testing.T) {
 	}
 }
 
+// An infrastructure error before validation concludes (here the attempt row
+// cannot be written) re-parks the job for another supply. Adoption already
+// closed the handoff that asked for the file, so the park must leave an open
+// action behind: an awaiting_human job with none is an orphan that handoff
+// repair sends back to resolving, discarding the landed download. Once the
+// store recovers, the same file adopts.
+func TestAdoptDownloadValidationInfrastructureErrorKeepsAnOpenAction(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_adopt_attempt_failure")
+	dir := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pdfPath := filepath.Join(dir, "paper.pdf")
+	if err := os.WriteFile(pdfPath, pdfBytes("attempt failure"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.S.DB().Exec(`CREATE TRIGGER adopt_fail_attempt BEFORE INSERT ON attempts
+		BEGIN SELECT RAISE(ABORT, 'injected attempt failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, pdfPath); err == nil || !strings.Contains(err.Error(), "injected attempt failure") {
+		t.Fatalf("adoption = %v; want the attempt failure", err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil || row.State != job.StateAwaitingHuman {
+		t.Fatalf("job after infrastructure error = %+v, %v; want awaiting_human", row, err)
+	}
+	if open := openActionIDs(t, jobs, id, "manual_download"); len(open) != 1 {
+		t.Fatalf("open manual_download actions = %v; want exactly one for the re-parked job", open)
+	}
+	if _, err := os.Stat(pdfPath); err != nil {
+		t.Fatalf("landed download was not kept for the next sweep: %v", err)
+	}
+
+	if _, err := jobs.S.DB().Exec(`DROP TRIGGER adopt_fail_attempt`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdoptDownload(ctx, id, pdfPath); err != nil {
+		t.Fatalf("adoption after recovery = %v", err)
+	}
+	if row, err := jobs.Get(ctx, id); err != nil || row.State != job.StateReady {
+		t.Fatalf("job after recovered adoption = %+v, %v; want ready", row, err)
+	}
+}
+
 func TestAdoptDownloadRecoversPreparedPublicationAfterFinalizationFailure(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)

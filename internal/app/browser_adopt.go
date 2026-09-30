@@ -377,10 +377,18 @@ func (s *Service) adoptMainPDF(ctx context.Context, row *job.Row, origin mainPDF
 		// awaiting_human (best-effort) so the file can be supplied again: a
 		// browser download stays in the adoption directory and the directory
 		// sweep re-drives it; a transient store error clears on a later tick.
+		// The handoff actions were already resolved above, so the park
+		// reopens a manual_download in the same transaction: an awaiting_human
+		// job with no open action is an orphaned park that handoff repair
+		// sends back to resolving, dropping the supplied file just the same.
 		// The original error is still returned so the caller reports it (the
 		// bridge records it as browser.adoption_deferred).
-		_ = s.park(context.WithoutCancel(ctx), jobID, job.StateValidating, job.StateAwaitingHuman,
-			map[string]any{"reason": "adoption_validation_error"})
+		parkCtx := context.WithoutCancel(ctx)
+		if parkErr := s.Jobs.ParkWithHumanAction(parkCtx, jobID, job.StateValidating, job.StateAwaitingHuman,
+			"manual_download", "the supplied PDF could not be validated because of an internal error; supply it again",
+			map[string]any{"reason": "adoption_validation_error"}, replacementAccess); parkErr == nil {
+			s.notifyParked(parkCtx, jobID, job.StateAwaitingHuman)
+		}
 		return adopted, err
 	}
 	switch {
