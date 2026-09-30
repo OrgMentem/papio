@@ -158,7 +158,7 @@ func (e *OpenAlexEnricher) searchURL(ctx context.Context, requested work.Work) (
 	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
 		return nil, errors.New("enrich: invalid configured OpenAlex endpoint")
 	}
-	filters := []string{"title.search:" + strings.TrimSpace(requested.Title)}
+	filters := []string{"title.search:" + openAlexFilterText(requested.Title)}
 	if requested.Year != 0 {
 		filters = append(filters, fmt.Sprintf("publication_year:%d", requested.Year))
 	}
@@ -175,6 +175,20 @@ func (e *OpenAlexEnricher) searchURL(ctx context.Context, requested work.Work) (
 	}
 	endpoint.RawQuery = query.Encode()
 	return endpoint, nil
+}
+
+// openAlexFilterText makes free text safe inside one OpenAlex filter value:
+// a comma separates filters and a pipe ORs values, so either inside a title
+// would split it into other clauses. title.search matches words, not
+// punctuation, so both become spaces; the candidates are still matched
+// against the full requested title afterwards.
+func openAlexFilterText(text string) string {
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if r == ',' || r == '|' {
+			return ' '
+		}
+		return r
+	}, text)), " ")
 }
 
 type openAlexSearchResponse struct {

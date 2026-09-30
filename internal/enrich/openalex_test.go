@@ -54,6 +54,30 @@ func TestOpenAlexEnrichMeasuredBookRescue(t *testing.T) {
 	}
 }
 
+// A comma separates OpenAlex filter clauses and a pipe ORs values, so a
+// title carrying either must still reach the wire as one title.search clause
+// beside its own publication_year clause, and the paper must still match.
+func TestOpenAlexEnrichTitleWithCommasStaysOneFilterClause(t *testing.T) {
+	requested := work.Work{Title: "Cats, Dogs, and Birds | a survey", Year: 2020, Authors: []string{"Jane Smith"}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clauses := strings.Split(r.URL.Query().Get("filter"), ",")
+		want := []string{"title.search:Cats Dogs and Birds a survey", "publication_year:2020"}
+		if len(clauses) != len(want) || clauses[0] != want[0] || clauses[1] != want[1] {
+			t.Errorf("filter clauses = %q, want %q", clauses, want)
+		}
+		_, _ = w.Write([]byte(`{"results":[{"id":"https://openalex.org/W4200000001","doi":"https://doi.org/10.1000/cats","ids":{"openalex":"https://openalex.org/W4200000001","doi":"https://doi.org/10.1000/cats"},"title":"Cats, Dogs, and Birds | a survey","publication_year":2020,"authorships":[{"author":{"display_name":"Jane Smith"}}],"open_access":{"is_oa":true},"locations":[{"is_oa":true,"landing_page_url":"https://example.org/cats"}]}]}`))
+	}))
+	defer server.Close()
+
+	enriched, matched, err := NewOpenAlexWithOptions(OpenAlexOptions{BaseURL: server.URL, ContactEmail: "reader@example.org"}).Enrich(context.Background(), requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matched || enriched.DOI != "10.1000/cats" {
+		t.Fatalf("matched = %v, DOI = %q, want the comma title enriched", matched, enriched.DOI)
+	}
+}
+
 // The keyed identity's own daily-quota signal can send this search to
 // OpenAlex's keyless tier. The key must then be absent from the wire, or the
 // request is metered against an identity that did not admit it — and a stale
