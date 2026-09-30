@@ -251,6 +251,24 @@ func (c *Checker) TryMarkNagged(now time.Time) bool {
 	return marked && err == nil
 }
 
+// ReleaseNagged undoes a TryMarkNagged(now) whose prompt could not be
+// displayed, so the next invocation shows it instead of a day of silence. It
+// clears the mark only while it is still exactly this caller's: a later mark
+// by another process is left alone, which keeps the one-prompt arbitration.
+func (c *Checker) ReleaseNagged(now time.Time) {
+	if c == nil {
+		return
+	}
+	now = now.UTC()
+	_, _ = c.updateCache(func(cached *cache) bool {
+		if !cached.LastNaggedAt.Equal(now) {
+			return false
+		}
+		cached.LastNaggedAt = time.Time{}
+		return true
+	})
+}
+
 // IsNewer compares the numeric major.minor.patch cores used by papio version
 // strings. Pre-release/build suffixes do not affect the daily update nudge.
 func IsNewer(latest, current string) bool {

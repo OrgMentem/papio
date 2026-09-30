@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -616,6 +617,82 @@ func TestCallHintIncludesCachedZotioUpdate(t *testing.T) {
 	want := "papio: updates available: papio 99.0.0 (you have " + api.Version + "), zotio 1.1.0 (you have 1.0.0) — run 'papio doctor' for details\n"
 	if got := stderr.String(); got != want {
 		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+}
+
+// An older daemon computes update_available against its own version, so after
+// the CLI is upgraded it still advertises the release the CLI already is. The
+// prompt said "papio X (you have X)" and used up the day's slot.
+func TestCallHintIgnoresUpdateTheCLIAlreadyHas(t *testing.T) {
+	dataDir := t.TempDir()
+	for _, tc := range []struct {
+		latest, want string
+	}{
+		{latest: api.Version},
+		{latest: "99.0.0", want: "papio: updates available: papio 99.0.0 (you have " + api.Version + ") — run 'papio doctor' for details\n"},
+	} {
+		opt, _, stderr := versionWarningTestOptions("0.0.1")
+		opt.configLoader = func(string) (config.Config, error) {
+			return config.Config{DataDir: dataDir, Updates: config.Updates{Check: true}}, nil
+		}
+		opt.rpcCall = func(_ context.Context, _ string, method string, _ any, result any) error {
+			if method == "ping" {
+				status := result.(*daemonPingResult)
+				status.UpdateAvailable = true
+				status.LatestVersion = tc.latest
+			}
+			return nil
+		}
+		if err := opt.call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+			t.Fatalf("latest %s: call: %v", tc.latest, err)
+		}
+		if got := stderr.String(); got != tc.want {
+			t.Fatalf("latest %s: stderr = %q, want %q", tc.latest, got, tc.want)
+		}
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("stderr closed") }
+
+// An update prompt that failed to write was never seen, but it used to take
+// the day's slot anyway, so the next healthy invocation stayed silent.
+func TestCallHintRetriesAfterAFailedWrite(t *testing.T) {
+	dataDir := t.TempDir()
+	newOptions := func(errOut io.Writer) *options {
+		opt, _, _ := versionWarningTestOptions(api.Version)
+		opt.errOut = errOut
+		opt.configLoader = func(string) (config.Config, error) {
+			return config.Config{DataDir: dataDir, Updates: config.Updates{Check: true}}, nil
+		}
+		opt.rpcCall = func(_ context.Context, _ string, method string, _ any, result any) error {
+			if method == "ping" {
+				status := result.(*daemonPingResult)
+				status.Version = api.Version
+				status.UpdateAvailable = true
+				status.LatestVersion = "99.0.0"
+			}
+			return nil
+		}
+		return opt
+	}
+	if err := newOptions(failingWriter{}).call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err == nil {
+		t.Fatal("call with an unwritable stderr succeeded")
+	}
+	var stderr bytes.Buffer
+	if err := newOptions(&stderr).call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "updates available: papio 99.0.0") {
+		t.Fatalf("second stderr = %q, want the prompt the first call failed to show", stderr.String())
+	}
+	var third bytes.Buffer
+	if err := newOptions(&third).call(context.Background(), "jobs.list", struct{}{}, &struct{}{}); err != nil {
+		t.Fatalf("third call: %v", err)
+	}
+	if third.String() != "" {
+		t.Fatalf("third stderr = %q, want the shown prompt to hold the day's slot", third.String())
 	}
 }
 

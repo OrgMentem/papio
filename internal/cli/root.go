@@ -265,7 +265,10 @@ func (o *options) warnAvailableUpdate(cfg config.Config, status daemonPingResult
 		return nil
 	}
 	updates := make([]string, 0, 2)
-	if status.UpdateAvailable && status.LatestVersion != "" {
+	// The daemon computed update_available against its own version, and a
+	// daemon older than this CLI keeps advertising the release this CLI
+	// already is. Compare against the CLI's version, the one the prompt names.
+	if status.UpdateAvailable && status.LatestVersion != "" && update.IsNewer(status.LatestVersion, api.Version) {
 		updates = append(updates, fmt.Sprintf("papio %s (you have %s)", status.LatestVersion, api.Version))
 	}
 	zotio := update.NewZotio(cfg.DataDir)
@@ -274,12 +277,21 @@ func (o *options) warnAvailableUpdate(cfg config.Config, status daemonPingResult
 			updates = append(updates, fmt.Sprintf("zotio %s (you have %s)", info.LatestVersion, installed))
 		}
 	}
-	if len(updates) == 0 || !update.New(cfg.DataDir).TryMarkNagged(time.Now()) {
+	if len(updates) == 0 {
+		return nil
+	}
+	checker := update.New(cfg.DataDir)
+	now := time.Now()
+	if !checker.TryMarkNagged(now) {
 		return nil
 	}
 	o.updateHintShown = true
-	_, err := fmt.Fprintf(o.errOut, "papio: updates available: %s — run 'papio doctor' for details\n", strings.Join(updates, ", "))
-	return err
+	if _, err := fmt.Fprintf(o.errOut, "papio: updates available: %s — run 'papio doctor' for details\n", strings.Join(updates, ", ")); err != nil {
+		// The prompt was never seen, so it must not use up the day's slot.
+		checker.ReleaseNagged(now)
+		return err
+	}
+	return nil
 }
 
 // printJSON writes one machine-readable payload.
