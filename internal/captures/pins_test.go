@@ -106,6 +106,44 @@ func TestPinIncidentReplacesLatestAtomically(t *testing.T) {
 	}
 }
 
+func TestPinIncidentKeepsPriorLatestWhenReplacementFails(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 3, MaxAge: 24 * time.Hour})
+	at := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	paths := make([]string, 0, 3)
+	for i, body := range []string{"first", "latest-1", "latest-2"} {
+		store.now = func() time.Time { return at.Add(time.Duration(i) * time.Minute) }
+		path, err := store.Store(ctx, "provider.example.edu", "observed", "adapter", "1", []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, path)
+	}
+	first, latest1, latest2 := paths[0], paths[1], paths[2]
+	if err := store.PinIncident(ctx, "incident-3", first, latest1); err != nil {
+		t.Fatal(err)
+	}
+	firstBefore, err := os.ReadFile(pinPath(first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A directory where the replacement's pin sidecar belongs fails its
+	// publication.
+	if err := os.Mkdir(pinPath(latest2), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PinIncident(ctx, "incident-3", first, latest2); err == nil {
+		t.Fatal("PinIncident() = nil error, want replacement pin write failure")
+	}
+	if pin, ok := readPin(latest1); !ok || pin.Fingerprint != "incident-3" || pin.Role != PinLatest {
+		t.Fatalf("prior latest marker after failed replacement = %#v, %v; want kept", pin, ok)
+	}
+	firstAfter, err := os.ReadFile(pinPath(first))
+	if err != nil || string(firstAfter) != string(firstBefore) {
+		t.Fatalf("first decisive marker after failed replacement = %q, %v; want %q", firstAfter, err, firstBefore)
+	}
+}
+
 func TestStoreSanitizedPinnedRetainsBeforeOutcomePrune(t *testing.T) {
 	ctx := context.Background()
 	store := New(t.TempDir(), Retention{MaxPerHost: 1, MaxAge: 24 * time.Hour})

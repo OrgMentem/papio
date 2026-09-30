@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -602,6 +603,9 @@ func (s *Store) Pin(ctx context.Context, path, fingerprint string, role PinRole)
 // incident. A capture may serve both roles when the paths are equal. The
 // replacement of a prior latest marker is performed while the store lock is
 // held, so retention cannot observe two latest captures for one incident.
+// It is all-or-nothing: the prior latest marker is displaced only after both
+// new markers are durable, and a failure puts back the sidecars this call
+// overwrote, so a caller that sees an error never loses its prior evidence.
 func (s *Store) PinIncident(ctx context.Context, fingerprint, firstPath, latestPath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -624,24 +628,70 @@ func (s *Store) PinIncident(ctx context.Context, fingerprint, firstPath, latestP
 	if err != nil {
 		return err
 	}
-	// Remove the old latest marker before publishing the new one. This is
-	// intentionally role-scoped: the first decisive capture is immutable.
-	if err := s.removeIncidentRoleLocked(ctx, fingerprint, PinLatest, latest.Path); err != nil {
-		return err
+	type pinTarget struct {
+		file captureFile
+		role PinRole
 	}
-	firstRole := PinFirstDecisive
-	if filepath.Clean(first.Path) == filepath.Clean(latest.Path) {
-		firstRole = PinFirstDecisive
-	}
-	if err := s.writePinLocked(first, fingerprint, "", firstRole); err != nil {
-		return err
-	}
+	targets := []pinTarget{{first, PinFirstDecisive}}
 	if filepath.Clean(latest.Path) != filepath.Clean(first.Path) {
-		if err := s.writePinLocked(latest, fingerprint, "", PinLatest); err != nil {
-			return err
+		targets = append(targets, pinTarget{latest, PinLatest})
+	}
+	var written []pinSnapshot
+	undo := func() {
+		for _, snapshot := range slices.Backward(written) {
+			snapshot.restore()
 		}
 	}
+	for _, target := range targets {
+		snapshot, err := snapshotPin(target.file)
+		if err != nil {
+			undo()
+			return err
+		}
+		if err := s.writePinLocked(target.file, fingerprint, "", target.role); err != nil {
+			undo()
+			return err
+		}
+		written = append(written, snapshot)
+	}
+	// The previous latest marker is displaced last. Demoting it before the
+	// writes above would leave the incident with no latest evidence whenever
+	// either of them failed. The first decisive capture is immutable, so the
+	// displacement is role-scoped.
+	if err := s.removeIncidentRoleLocked(ctx, fingerprint, PinLatest, latest.Path); err != nil {
+		undo()
+		return err
+	}
 	return nil
+}
+
+// pinSnapshot is a pin sidecar as it was before a write, so a failed
+// multi-marker publication can put it back byte for byte.
+type pinSnapshot struct {
+	file    captureFile
+	data    []byte
+	existed bool
+}
+
+func snapshotPin(file captureFile) (pinSnapshot, error) {
+	data, err := os.ReadFile(pinPath(file.Path))
+	if errors.Is(err, fs.ErrNotExist) {
+		return pinSnapshot{file: file}, nil
+	}
+	if err != nil {
+		return pinSnapshot{}, err
+	}
+	return pinSnapshot{file: file, data: data, existed: true}, nil
+}
+
+// restore is best-effort: it runs only on a path that already returns the
+// original error to the caller.
+func (p pinSnapshot) restore() {
+	if !p.existed {
+		_ = os.Remove(pinPath(p.file.Path))
+		return
+	}
+	_ = writeAtomically(filepath.Dir(p.file.Path), pinPath(p.file.Path), p.data)
 }
 
 func (s *Store) writePinLocked(file captureFile, fingerprint, jobID string, role PinRole) error {
