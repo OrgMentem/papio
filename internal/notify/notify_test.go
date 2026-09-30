@@ -266,24 +266,20 @@ func TestWindowsSenderUsesEscapedLiteral(t *testing.T) {
 	}
 }
 
-func TestLinuxSenderCancelsExecutionAfterFiveSeconds(t *testing.T) {
-	var execErr error
+func TestLinuxSenderBoundsExecutionToFiveSeconds(t *testing.T) {
+	var deadline time.Time
+	var hasDeadline bool
 	sender := Linux{
 		mechanism: linuxNotifySend,
 		Exec: func(ctx context.Context, _ string, _ ...string) error {
-			<-ctx.Done()
-			execErr = ctx.Err()
-			return execErr
+			deadline, hasDeadline = ctx.Deadline()
+			return errors.New("notifications unavailable")
 		},
 	}
 	before := time.Now()
 	sender.Send(context.Background(), "paper is ready")
-	elapsed := time.Since(before)
-	if !errors.Is(execErr, context.DeadlineExceeded) {
-		t.Fatalf("exec error = %v, want context deadline exceeded", execErr)
-	}
-	if elapsed < 4*time.Second || elapsed > 7*time.Second {
-		t.Fatalf("elapsed = %v, want roughly five seconds", elapsed)
+	if !hasDeadline || deadline.Before(before.Add(4*time.Second)) || deadline.After(before.Add(6*time.Second)) {
+		t.Fatalf("deadline = %v (set=%v), want roughly five seconds after %v", deadline, hasDeadline, before)
 	}
 }
 
