@@ -388,53 +388,48 @@ func TestZotioHandlerMutationsClassifyBackendFailureAsInternalNotNotFound(t *tes
 		t.Fatalf("zotio.apply for a missing plan = %#v, want internal with detail", rpcErr)
 	}
 
-	// import_backfill and tags.reconcile reach their service methods with a
-	// half-configured service and must classify identically.
+	// import_backfill reaches its service method with a half-configured
+	// service and must classify identically.
 	system.Zotio.Bundle = nil
 	rpcErr = callMethod(t, router, "zotio.import_backfill", map[string]any{"limit": 5}, nil)
 	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Detail == nil {
 		t.Fatalf("zotio.import_backfill backend failure = %#v, want internal with detail", rpcErr)
 	}
+	// A service missing its own dependencies is not configured, which is the
+	// operator's precondition rather than a daemon fault; the class survives.
 	system.Zotio.Store = nil
 	rpcErr = callMethod(t, router, "zotio.tags.reconcile", map[string]any{}, nil)
-	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Detail == nil {
-		t.Fatalf("zotio.tags.reconcile backend failure = %#v, want internal with detail", rpcErr)
+	if rpcErr == nil || rpcErr.Code != "precondition_failed" || rpcErr.Detail == nil || rpcErr.Detail.ErrorClass != "zotio_not_configured" {
+		t.Fatalf("zotio.tags.reconcile without its store = %#v, want precondition_failed with the not-configured class", rpcErr)
 	}
 }
 
-// TestZotioHandlerGuardsMissingZotioDependency records what each handler
-// actually does when the daemon runs without a Zotio integration — the state
-// of every user who sets zotio.executable to "" to switch the deep Zotero
-// integration off.
-//
-// Four handlers hold an explicit nil guard and answer precondition_failed.
-// zotio.plan, zotio.tags.reconcile, and zotio.apply hold NO guard: they call
-// straight through the nil *zotio.Service. That does not panic, because every
-// one of those service methods starts with its own `s == nil` check, but the
-// answer an unconfigured caller gets is `internal` — a daemon fault — rather
-// than the precondition_failed its four siblings return. This test pins the
-// observed behaviour, divergence included.
+// TestZotioHandlerGuardsMissingZotioDependency pins what each handler answers
+// when the daemon runs without a Zotio integration — the state of every user
+// who sets zotio.executable to "" to switch the deep Zotero integration off.
+// That is a precondition the operator controls, so every zotio.* method
+// answers precondition_failed, never `internal`: zotio.plan, zotio.tags.
+// reconcile and zotio.apply reach the nil service's own not-configured error
+// through zotioFailure, and it must not read as a daemon fault.
 func TestZotioHandlerGuardsMissingZotioDependency(t *testing.T) {
 	system := testSystem(t)
 	system.Zotio = nil
 	router := Router(system)
 	for _, tc := range []struct {
-		method   string
-		params   any
-		wantCode string
+		method string
+		params any
 	}{
-		{"zotio.queue", map[string]any{"limit": 5}, "precondition_failed"},
-		{"zotio.missing_count", map[string]any{}, "precondition_failed"},
-		{"zotio.lookup_works", map[string]any{"works": []map[string]string{{"doi": "10.1000/x"}}}, "precondition_failed"},
-		{"zotio.import_backfill", map[string]any{"limit": 5}, "precondition_failed"},
-		// No nil guard below this line.
-		{"zotio.plan", map[string]any{"job_ids": []string{"job_1"}}, "internal"},
-		{"zotio.tags.reconcile", map[string]any{}, "internal"},
-		{"zotio.apply", map[string]any{"plan_id": "zplan_0123456789abcdef0123456789", "confirmation_sha256": "d"}, "internal"},
+		{"zotio.queue", map[string]any{"limit": 5}},
+		{"zotio.missing_count", map[string]any{}},
+		{"zotio.lookup_works", map[string]any{"works": []map[string]string{{"doi": "10.1000/x"}}}},
+		{"zotio.import_backfill", map[string]any{"limit": 5}},
+		{"zotio.plan", map[string]any{"job_ids": []string{"job_1"}}},
+		{"zotio.tags.reconcile", map[string]any{}},
+		{"zotio.apply", map[string]any{"plan_id": "zplan_0123456789abcdef0123456789", "confirmation_sha256": "d"}},
 	} {
 		rpcErr := callMethod(t, router, tc.method, tc.params, nil)
-		if rpcErr == nil || rpcErr.Code != tc.wantCode {
-			t.Fatalf("%s without Zotio = %#v, want %s", tc.method, rpcErr, tc.wantCode)
+		if rpcErr == nil || rpcErr.Code != "precondition_failed" {
+			t.Fatalf("%s without Zotio = %#v, want precondition_failed", tc.method, rpcErr)
 		}
 	}
 }

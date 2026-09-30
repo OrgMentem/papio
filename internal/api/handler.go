@@ -2059,6 +2059,12 @@ func zotioFailure(err error) ([]byte, *ipc.RPCError) {
 		ErrorHint:       info.Hint,
 		ErrorHTTPStatus: info.HTTPStatus,
 	}
+	// A daemon running without the Zotio integration is a precondition the
+	// operator controls, not a daemon fault: answer it the way the guarded
+	// zotio.* handlers do rather than as "operation failed".
+	if info.Class == zotio.ErrorClassZotioNotConfigured {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "Zotio integration is not configured", Detail: detail}
+	}
 	return nil, &ipc.RPCError{Code: "internal", Message: "operation failed", Detail: detail}
 }
 
