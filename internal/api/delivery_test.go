@@ -269,6 +269,40 @@ func TestDeliveryActionConfirmRequestExistsMovesJobToRetryWait(t *testing.T) {
 	}
 }
 
+// A provider_reference names the transaction confirm_request_exists records,
+// so on any other operation it is refused, present-but-empty included, rather
+// than silently dropped while the operation runs on different input than the
+// caller sent.
+func TestDeliveryActionRefusesProviderReferenceOutsideConfirmExists(t *testing.T) {
+	system := deliveryTestSystem(t)
+	router := Router(system)
+	jobID := deliveryTestJob(t, system, "req_delivery_stray_ref", "10.1234/stray-ref")
+
+	if rpcErr := callMethod(t, router, "delivery.submit", map[string]any{"job_id": jobID}, nil); rpcErr != nil {
+		t.Fatalf("delivery.submit: %v", rpcErr)
+	}
+	before, err := system.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, params := range []map[string]any{
+		{"job_id": jobID, "operation": "confirm_request_absent", "provider_reference": "TN-42"},
+		{"job_id": jobID, "operation": "confirm_request_absent", "provider_reference": ""},
+		{"job_id": jobID, "operation": "open_request_history", "provider_reference": "TN-42"},
+	} {
+		if rpcErr := callMethod(t, router, "delivery.action", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("delivery.action %v = %#v, want invalid_argument", params, rpcErr)
+		}
+	}
+	after, err := system.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State {
+		t.Fatalf("job state = %q after refused actions, want unchanged %q", after.State, before.State)
+	}
+}
+
 func TestDeliveryActionConfirmRequestAbsentCancelsAndReRunsGate(t *testing.T) {
 	system := deliveryTestSystem(t)
 	router := Router(system)

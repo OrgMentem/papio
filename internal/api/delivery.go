@@ -314,9 +314,10 @@ const (
 )
 
 // DeliveryActionParams selects one Decision 4 operation for a job's open
-// document_delivery human action. ProviderReference is required only for
+// document_delivery human action. ProviderReference is required for
 // confirm_request_exists — the human is supplying the fact deterministic
-// reconciliation could not determine.
+// reconciliation could not determine — and must be absent for every other
+// operation, so a stale or mistyped field is refused rather than ignored.
 type DeliveryActionParams struct {
 	JobID             string `json:"job_id"`
 	Operation         string `json:"operation"`
@@ -340,6 +341,16 @@ func deliveryAction(ctx context.Context, raw json.RawMessage, system *bootstrap.
 			err = errors.New("job_id is required")
 		}
 		return badParams(err)
+	}
+	if params.Operation != deliveryOpConfirmRequestExists {
+		// Presence, not value: an explicit "" is refused too, the same rule
+		// the browser seam's delivery_reconcile_request decoder applies.
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err == nil {
+			if _, present := fields["provider_reference"]; present {
+				return badParams(fmt.Errorf("provider_reference is only valid for %s", deliveryOpConfirmRequestExists))
+			}
+		}
 	}
 	switch params.Operation {
 	case deliveryOpOpenRequestHistory:
