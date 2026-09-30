@@ -274,24 +274,42 @@ func TestBatchWaitToolSettlesAndTimesOut(t *testing.T) {
 	}
 }
 
-func TestJobsResourceEnvelope(t *testing.T) {
+// TestResourceEnvelope pins the list-resource contract once for every
+// resource: {"<key>": [...], "truncated": bool}, capped at resourceRowCap.
+func TestResourceEnvelope(t *testing.T) {
+	exports := func(filter string) func(context.Context, *bootstrap.System) (any, error) {
+		return func(ctx context.Context, system *bootstrap.System) (any, error) {
+			return exportsResource(ctx, system, filter)
+		}
+	}
+	seedExports := func(kind string) func(*testing.T, *bootstrap.System, int) {
+		return func(t *testing.T, system *bootstrap.System, count int) { seedResourceExports(t, system, count, kind) }
+	}
 	for _, tc := range []struct {
 		name      string
+		seed      func(*testing.T, *bootstrap.System, int)
+		read      func(context.Context, *bootstrap.System) (any, error)
+		key       string
 		count     int
 		truncated bool
 	}{
-		{name: "truncated", count: resourceRowCap + 1, truncated: true},
-		{name: "complete", count: 3, truncated: false},
+		{name: "jobs truncated", seed: seedResourceJobs, read: jobsResource, key: "jobs", count: resourceRowCap + 1, truncated: true},
+		{name: "jobs complete", seed: seedResourceJobs, read: jobsResource, key: "jobs", count: 3},
+		{name: "artifacts truncated", seed: seedResourceArtifacts, read: artifactsResource, key: "artifacts", count: resourceRowCap + 1, truncated: true},
+		{name: "artifacts complete", seed: seedResourceArtifacts, read: artifactsResource, key: "artifacts", count: 3},
+		{name: "exports truncated", seed: seedExports("zotio_apply"), read: exports(""), key: "exports", count: resourceRowCap + 1, truncated: true},
+		{name: "exports complete", seed: seedExports("zotio_apply"), read: exports(""), key: "exports", count: 3},
+		{name: "bundles complete", seed: seedExports("bundle"), read: exports("bundle"), key: "bundles", count: 3},
+		{name: "plans complete", seed: seedExports("zotio_plan"), read: exports("zotio_plan"), key: "plans", count: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			system := newResourceTestSystem(t)
-			seedResourceJobs(t, system, tc.count)
-
-			value, err := jobsResource(context.Background(), system)
+			tc.seed(t, system, tc.count)
+			value, err := tc.read(context.Background(), system)
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertResourcePage(t, value, "jobs", min(tc.count, resourceRowCap), tc.truncated)
+			assertResourcePage(t, value, tc.key, min(tc.count, resourceRowCap), tc.truncated)
 		})
 	}
 }
@@ -307,55 +325,6 @@ func TestJobsResourceEmptyEnvelopeUsesArray(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"jobs":[]`) {
 		t.Fatalf("jobs resource JSON = %s, want empty jobs array", data)
-	}
-}
-
-func TestArtifactsResourceEnvelope(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		count     int
-		truncated bool
-	}{
-		{name: "truncated", count: resourceRowCap + 1, truncated: true},
-		{name: "complete", count: 3, truncated: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			system := newResourceTestSystem(t)
-			seedResourceArtifacts(t, system, tc.count)
-
-			value, err := artifactsResource(context.Background(), system)
-			if err != nil {
-				t.Fatal(err)
-			}
-			assertResourcePage(t, value, "artifacts", min(tc.count, resourceRowCap), tc.truncated)
-		})
-	}
-}
-
-func TestExportsResourceEnvelope(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		count     int
-		kind      string
-		filter    string
-		key       string
-		truncated bool
-	}{
-		{name: "exports truncated", count: resourceRowCap + 1, kind: "zotio_apply", key: "exports", truncated: true},
-		{name: "exports complete", count: 3, kind: "zotio_apply", key: "exports", truncated: false},
-		{name: "bundles complete", count: 3, kind: "bundle", filter: "bundle", key: "bundles", truncated: false},
-		{name: "plans complete", count: 3, kind: "zotio_plan", filter: "zotio_plan", key: "plans", truncated: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			system := newResourceTestSystem(t)
-			seedResourceExports(t, system, tc.count, tc.kind)
-
-			value, err := exportsResource(context.Background(), system, tc.filter)
-			if err != nil {
-				t.Fatal(err)
-			}
-			assertResourcePage(t, value, tc.key, min(tc.count, resourceRowCap), tc.truncated)
-		})
 	}
 }
 
