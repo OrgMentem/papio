@@ -660,7 +660,8 @@ papers (see [See who produced each paper](#see-who-produced-each-paper)).
 To turn the agent off, run `papio config agent remove` and restart the
 background service. If you set `PAPIO_TYPESAFE_API_KEY` in the daemon's
 environment, remove it too. `remove` keeps the stored key; to delete it, run
-`papio config credentials delete REFERENCE`. The
+`papio config credentials delete REFERENCE --yes` (without `--yes` it only
+describes the deletion). The
 [agent section of the configuration reference](../reference/config-reference.md#agent-acquisition)
 covers Windows sign-in sessions and the Firefox download rules.
 

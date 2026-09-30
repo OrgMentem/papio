@@ -87,7 +87,7 @@ func newAgentConfigCommandWithDependencies(opt *options, deps agentConfigDepende
 			return err
 		}
 		restart := true
-		return opt.printResult(agentConfigResult{Backend: "none", Credential: "detached", Reference: result.Reference, EnvironmentOverride: agentEnvironmentStatus(deps, false), RestartRequired: &restart}, "Agent disabled in config; stored credentials are unchanged. Restart the daemon. Remove PAPIO_TYPESAFE_API_KEY from its launch environment too, if set. Use config credentials delete REFERENCE to explicitly delete a shared record.%s", retainedCredentialNotice(result.Reference))
+		return opt.printResult(agentConfigResult{Backend: "none", Credential: "detached", Reference: result.Reference, EnvironmentOverride: agentEnvironmentStatus(deps, false), RestartRequired: &restart}, "Agent disabled in config; stored credentials are unchanged. Restart the daemon. Remove PAPIO_TYPESAFE_API_KEY from its launch environment too, if set. Use config credentials delete REFERENCE --yes to explicitly delete a shared record.%s", retainedCredentialNotice(result.Reference))
 	}}
 	command.AddCommand(set, status, remove)
 	return command

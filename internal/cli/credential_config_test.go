@@ -242,7 +242,7 @@ func TestCredentialConfigFreshReferencesSharedBindAndDetach(t *testing.T) {
 	if second.reference("sources.openalex") != "" || first.store.deleted != 0 || first.store.records[original].APIKey != "private-key-one" {
 		t.Fatal("detach deleted a shared record")
 	}
-	if err := second.run([]string{"delete", original}, ""); err != nil {
+	if err := second.run([]string{"delete", original, "--yes"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := first.store.records[original]; ok || first.store.deleted != 1 {
@@ -663,7 +663,10 @@ func TestCredentialConfigScrubsEnvironmentBeforeStoreHelpers(t *testing.T) {
 			case "migrate":
 				err = f.run([]string{"migrate"}, "")
 			case "delete":
-				err = f.run([]string{"delete", ref}, "")
+				// Delete a record this configuration does not bind: a bound
+				// one is refused before the store is reached.
+				unbound, _ := credential.NewReference()
+				err = f.run([]string{"delete", unbound, "--yes"}, "")
 				check()
 			}
 			if err != nil {
@@ -820,7 +823,7 @@ func TestCredentialConfigInterruptedSetSurfacesOrphanForDelete(t *testing.T) {
 		t.Fatalf("status = %q, want the orphan surfaced as unbound", f.out.String())
 	}
 	f.assertNoSecret(nil, "original-private")
-	if err := f.run([]string{"delete", staged}, ""); err != nil {
+	if err := f.run([]string{"delete", staged, "--yes"}, ""); err != nil {
 		t.Fatalf("delete orphan = %v", err)
 	}
 	if err := f.run([]string{"status"}, ""); err != nil {
@@ -1018,4 +1021,50 @@ func TestCredentialStatusNamesWhyTheConfigurationDidNotLoad(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCredentialDeleteNeedsConfirmationAndRefusesABoundRecord: a stored
+// record can be shared, and deletion cannot be undone, so the command only
+// describes the deletion without --yes, and never deletes a record this
+// configuration still binds — even with --yes.
+func TestCredentialDeleteNeedsConfirmationAndRefusesABoundRecord(t *testing.T) {
+	f := newCredentialCLIFixture(t)
+	if err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "private-key-one"); err != nil {
+		t.Fatal(err)
+	}
+	bound := f.reference("sources.openalex")
+	for _, args := range [][]string{{"delete", bound}, {"delete", bound, "--yes"}} {
+		err := f.run(args, "")
+		if err == nil || !strings.Contains(err.Error(), "sources.openalex") || !strings.Contains(err.Error(), "detach") {
+			t.Fatalf("%v: err = %v, want a refusal naming the bound target and detach", args, err)
+		}
+	}
+	if f.store.deleted != 0 {
+		t.Fatalf("deleted = %d, want the bound record kept", f.store.deleted)
+	}
+
+	if err := f.run([]string{"detach", "sources.openalex"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	err := f.run([]string{"delete", bound}, "")
+	if !errors.Is(err, errCredentialDeleteUnconfirmed) {
+		t.Fatalf("delete without --yes: err = %v, want errCredentialDeleteUnconfirmed", err)
+	}
+	var preview credentialConfigResult
+	if err := json.Unmarshal(f.out.Bytes(), &preview); err != nil {
+		t.Fatalf("preview is not JSON: %v (%q)", err, f.out.String())
+	}
+	if preview.Outcome != "not_deleted" || preview.Reference != bound {
+		t.Fatalf("preview = %+v, want not_deleted for %s", preview, bound)
+	}
+	if f.store.deleted != 0 || f.store.records[bound].APIKey != "private-key-one" {
+		t.Fatal("delete without --yes removed the record")
+	}
+	if err := f.run([]string{"delete", bound, "--yes"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.store.records[bound]; ok || f.store.deleted != 1 {
+		t.Fatal("delete --yes did not delete exactly the requested record")
+	}
+	f.assertNoSecret(nil, "private-key-one")
 }

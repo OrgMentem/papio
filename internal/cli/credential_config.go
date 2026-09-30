@@ -177,29 +177,30 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 		}
 		return opt.printResult(result, "Credential detached from %s; stored records are unchanged. Restart the daemon.%s", result.Target, retainedCredentialNotice(result.Reference))
 	}}
-	del := &cobra.Command{Use: "delete REFERENCE", Short: "Delete a stored record without changing configurations that reference it", Args: credentialArgs(1, 1), RunE: func(cmd *cobra.Command, args []string) error {
-		ref := args[0]
-		if credential.ValidateReference(ref) != nil || !strings.HasPrefix(ref, "keyring:") {
-			return errors.New("delete requires a valid keyring reference; environment credentials cannot be deleted by Papio")
-		}
-		cfg, err := opt.loadConfig()
-		if err != nil {
-			return fmt.Errorf("before accessing the credential store: %w", credentialConfigLoadError(opt, cfg, err))
-		}
-		depsForCall, err := prepareCredentialEnvironment(deps, cfg, "")
-		if err != nil {
-			return err
-		}
-		if err := depsForCall.store.Delete(cmd.Context(), ref); err != nil && !errors.Is(err, credential.ErrNotFound) {
-			return sanitizedCredentialError(err)
-		}
-		// The record deletion is committed at this point. A journal failure
-		// must say so instead of failing as if nothing happened.
-		if err := clearPendingCredential(cfg.Path, ref); err != nil {
-			return fmt.Errorf("stored credential deleted (%s), but the pending credential journal could not be updated; inspect pending-credentials.json beside the configuration", ref)
-		}
-		return opt.printResult(credentialConfigResult{Reference: ref, Outcome: "deleted", RestartRequired: true}, "Stored credential deleted. Configurations that reference it are unchanged; restart affected daemons.")
-	}}
+	var confirmDelete bool
+	del := &cobra.Command{Use: "delete REFERENCE", Short: "Delete a stored record without changing configurations that reference it (requires --yes)", Args: credentialArgs(1, 1),
+		Long: "Delete one stored credential record. Deletion cannot be undone, and a record can be shared: another configuration bound to it keeps a reference that no longer resolves, and its integration fails after the next restart. Papio cannot see other configurations. It refuses to delete a record this configuration binds (detach it first), and without --yes it only describes the deletion and exits nonzero.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ref := args[0]
+			if credential.ValidateReference(ref) != nil || !strings.HasPrefix(ref, "keyring:") {
+				return errors.New("delete requires a valid keyring reference; environment credentials cannot be deleted by Papio")
+			}
+			cfg, err := opt.loadConfig()
+			if err != nil {
+				return fmt.Errorf("before accessing the credential store: %w", credentialConfigLoadError(opt, cfg, err))
+			}
+			if targets := credentialTargetsBoundTo(cfg, ref); len(targets) > 0 {
+				return fmt.Errorf("refusing to delete %s: this configuration binds it to %s; run 'papio config credentials detach TARGET' first if no profile needs it", ref, strings.Join(targets, ", "))
+			}
+			if !confirmDelete {
+				if err := opt.printResult(credentialConfigResult{Reference: ref, Outcome: "not_deleted"}, "Would delete stored credential %s. This configuration does not bind it; configurations that share it cannot be checked from here and would keep a reference that no longer resolves. Deletion cannot be undone.", ref); err != nil {
+					return err
+				}
+				return errCredentialDeleteUnconfirmed
+			}
+			return deleteCredentialRecord(cmd, opt, deps, cfg, ref)
+		}}
+	del.Flags().BoolVar(&confirmDelete, "yes", false, "delete the record; without it the command only describes the deletion")
 	migrate := &cobra.Command{Use: "migrate", Short: "Move this configuration's legacy secrets into verified OS records", Args: credentialArgs(0, 0), Long: "Migrate supported literal credentials and this profile's legacy TypeSafe key. New records are verified before one guarded config update. Existing vault entries are retained. Interrupted operations report staged references for inspection or explicit deletion. No plaintext backup is created. An active legacy TypeSafe environment override must be removed before migration.", RunE: func(cmd *cobra.Command, _ []string) error {
 		result, err := migrateCredentials(cmd.Context(), opt, deps)
 		if err != nil {
@@ -209,6 +210,38 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 	}}
 	command.AddCommand(set, bind, status, detach, del, migrate)
 	return command
+}
+
+// errCredentialDeleteUnconfirmed makes `credentials delete` without --yes exit
+// nonzero after describing the deletion, so a script never mistakes the
+// description for the deletion.
+var errCredentialDeleteUnconfirmed = errors.New("stored credential not deleted; re-run with --yes to delete it")
+
+// credentialTargetsBoundTo lists the targets in cfg bound to ref.
+func credentialTargetsBoundTo(cfg config.Config, ref string) []string {
+	var targets []string
+	for _, binding := range cfg.CredentialBindings() {
+		if binding.Reference == ref {
+			targets = append(targets, binding.Target)
+		}
+	}
+	return targets
+}
+
+func deleteCredentialRecord(cmd *cobra.Command, opt *options, deps credentialConfigDependencies, cfg config.Config, ref string) error {
+	depsForCall, err := prepareCredentialEnvironment(deps, cfg, "")
+	if err != nil {
+		return err
+	}
+	if err := depsForCall.store.Delete(cmd.Context(), ref); err != nil && !errors.Is(err, credential.ErrNotFound) {
+		return sanitizedCredentialError(err)
+	}
+	// The record deletion is committed at this point. A journal failure
+	// must say so instead of failing as if nothing happened.
+	if err := clearPendingCredential(cfg.Path, ref); err != nil {
+		return fmt.Errorf("stored credential deleted (%s), but the pending credential journal could not be updated; inspect pending-credentials.json beside the configuration", ref)
+	}
+	return opt.printResult(credentialConfigResult{Reference: ref, Outcome: "deleted", RestartRequired: true}, "Stored credential deleted. Configurations that reference it are unchanged; restart affected daemons.")
 }
 
 // Capture before loading the config or touching the vault. Check both bytes and
@@ -659,5 +692,5 @@ func retainedCredentialNotice(ref string) string {
 	if strings.HasPrefix(ref, "env:") {
 		return " Previous environment reference: " + ref + "; its value was not changed."
 	}
-	return " Retained credential: " + ref + ". Delete it explicitly only when no profile needs it."
+	return " Retained credential: " + ref + ". Delete it explicitly (config credentials delete REFERENCE --yes) only when no profile needs it."
 }

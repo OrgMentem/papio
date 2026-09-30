@@ -119,8 +119,9 @@ with the new setting. `papio config agent status` reports saved configuration,
 credential availability and the current command's environment override, without
 printing a key or claiming the running daemon reloaded. `papio config agent remove`
 detaches the key and disables enrollment without deleting the stored record;
-restart afterward. Use `papio config credentials delete REFERENCE` for explicit
-record deletion. If the OS store
+restart afterward. Use `papio config credentials delete REFERENCE --yes` for explicit
+record deletion; without `--yes` it only describes the deletion, and it refuses a
+record this configuration still binds. If the OS store
 is unavailable, agent inference is disabled with a daemon diagnostic, while
 ordinary acquisition remains available.
 
