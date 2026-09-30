@@ -986,15 +986,26 @@ func (s *Store) ReconcilePendingPins(ctx context.Context, activeJobIDs []string)
 			}
 		}
 	}
+	// The index is published before any pin, the same order pinPendingLocked
+	// uses: a failure between the two leaves an indexed lease without a pin,
+	// which retention already exempts and the next reconcile completes,
+	// rather than a pin with no index entry, which PendingJobs cannot see.
 	indexChanged := false
 	for fingerprint, jobID := range active {
-		if err := ctx.Err(); err != nil {
-			return reindexed, restored, err
-		}
 		if _, ok := index[fingerprint]; !ok && len(byFingerprint[fingerprint]) > 0 {
 			index[fingerprint] = jobID
 			indexChanged = true
 			reindexed++
+		}
+	}
+	if indexChanged {
+		if err := s.writePendingIndexLocked(index); err != nil {
+			return 0, 0, err
+		}
+	}
+	for fingerprint, jobID := range active {
+		if err := ctx.Err(); err != nil {
+			return reindexed, restored, err
 		}
 		// Restore every unpinned capture that still links to this lease, in
 		// timestamp order. A displaced intermediate lost its link when its
@@ -1060,11 +1071,6 @@ func (s *Store) ReconcilePendingPins(ctx context.Context, activeJobIDs []string)
 					return reindexed, restored, err
 				}
 			}
-		}
-	}
-	if indexChanged {
-		if err := s.writePendingIndexLocked(index); err != nil {
-			return 0, 0, err
 		}
 	}
 	return reindexed, restored, nil

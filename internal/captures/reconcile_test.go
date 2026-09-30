@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -88,6 +89,57 @@ func TestReconcileRestoresMissingPinForActiveLease(t *testing.T) {
 	}
 	if _, ok := readPin(dead); ok {
 		t.Fatal("dead pin was restored for an inactive lease")
+	}
+}
+
+// Both halves of a lease lost: no index entry and no pin, only the metadata
+// link. When the reconcile cannot publish the index, it must not restore the
+// pin either, because a pin without an index entry is invisible to
+// PendingJobs. The next reconcile, with the index writable, restores both.
+func TestReconcileRestoresNoPinWhenIndexPublishFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission bits")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows directory's mode bits do not stop file creation inside it")
+	}
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 1, MaxAge: 24 * time.Hour})
+	live, err := store.StoreSanitizedPinned(ctx, "job-live", "provider.example", "drift", "provider", "1", pendingLeaseFixture("provider.example", "drift", "live"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(pinPath(live)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(pendingIndexPath(store.root)); err != nil {
+		t.Fatal(err)
+	}
+	// The index lives in the store root; the pin lives in the host directory,
+	// which stays writable.
+	if err := os.Chmod(store.root, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(store.root, 0o700) })
+	if _, _, err := store.ReconcilePendingPins(ctx, []string{"job-live"}); err == nil {
+		t.Fatal("ReconcilePendingPins() = nil error, want index publish failure")
+	}
+	if pin, ok := readPin(live); ok {
+		t.Fatalf("pin restored without an index entry: %#v", pin)
+	}
+
+	if err := os.Chmod(store.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reindexed, restored, err := store.ReconcilePendingPins(ctx, []string{"job-live"})
+	if err != nil || reindexed != 1 || restored != 1 {
+		t.Fatalf("retry reconcile = %d reindexed, %d restored, %v; want 1, 1, nil", reindexed, restored, err)
+	}
+	if pending, err := store.PendingJobs(ctx); err != nil || len(pending) != 1 || pending[0] != "job-live" {
+		t.Fatalf("pending jobs after retry = %v, %v; want [job-live]", pending, err)
+	}
+	if pin, ok := readPin(live); !ok || pin.Role != PinFirstDecisive {
+		t.Fatalf("live pin after retry = %#v, %v; want first decisive", pin, ok)
 	}
 }
 
