@@ -74,6 +74,28 @@ func TestFailuresCommandRendersRequestedHumanTable(t *testing.T) {
 	}
 }
 
+// TestFailuresTextSaysWhenMoreGroupsExist: the daemon proved there are more
+// groups than --limit; the text table must say so rather than read as every
+// failing provider.
+func TestFailuresTextSaysWhenMoreGroupsExist(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*api.FailuresPage) = api.FailuresPage{Failures: []store.FailureSummary{{
+			Provider: "www.jstor.org", Reason: "login_required", Count: 2, ExampleJobID: "job_latest",
+		}}, Truncated: true}
+		return nil
+	})
+	root.SetArgs([]string{"failures", "--limit", "1"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("failures: %v (%s)", err, errOut.String())
+	}
+	want := "provider/host | reason | count | example job id\nwww.jstor.org | login_required | 2 | job_latest\n" +
+		"truncated: showing 1 failure groups; use --limit (max 200)\n"
+	if got := out.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
 func TestJobsShowIsExactGetAlias(t *testing.T) {
 	run := func(verb string) ([]byte, map[string]string) {
 		t.Helper()

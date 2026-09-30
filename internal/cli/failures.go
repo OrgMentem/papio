@@ -43,7 +43,7 @@ func newFailuresCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
-			return nil
+			return truncationNoticeUpTo(opt, page.Truncated, len(page.Failures), "failure groups", store.FailureSummaryLimitMax)
 		},
 	}
 	command.Flags().IntVar(&limit, "limit", store.FailureSummaryLimitDefault,
