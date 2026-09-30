@@ -84,7 +84,8 @@ function extractMetaURLMirror(
       const allowed = u.origin === page.origin ||
         (Array.isArray(rule.allowedDestinations) && rule.allowedDestinations.some((destination) => {
           if (destination.origin !== u.origin || destination.pathPrefix.length === 0) return false;
-          return u.pathname.startsWith(destination.pathPrefix);
+          return u.pathname === destination.pathPrefix ||
+            u.pathname.startsWith(destination.pathPrefix.endsWith("/") ? destination.pathPrefix : destination.pathPrefix + "/");
         }));
       if (!allowed) return null;
       const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;
@@ -332,7 +333,10 @@ const PINNED_RESOLVE_URL_SOURCE = `const resolveURL = (rule: DownloadRule, targe
         const allowed = u.origin === page.origin ||
           (Array.isArray(rule.allowedDestinations) && rule.allowedDestinations.some((destination) => {
             if (destination.origin !== u.origin || destination.pathPrefix.length === 0) return false;
-            return u.pathname.startsWith(destination.pathPrefix);
+            // A path prefix is a directory boundary: \`/pdf\` admits \`/pdf\` and
+            // \`/pdf/x\`, never the sibling \`/pdf-preview/x\`.
+            const prefix = destination.pathPrefix;
+            return u.pathname === prefix || u.pathname.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
           }));
         if (!allowed) return null;
         const isSelf = u.origin === page.origin && u.pathname === page.pathname && u.search === page.search;

@@ -2736,7 +2736,9 @@ export async function executePlannedPageEffect(
             destination.origin === resolved.origin &&
             typeof destination.pathPrefix === "string" &&
             destination.pathPrefix.length > 0 &&
-            resolved.pathname.startsWith(destination.pathPrefix),
+            (resolved.pathname === destination.pathPrefix ||
+              resolved.pathname.startsWith(destination.pathPrefix.endsWith("/")
+                ? destination.pathPrefix : `${destination.pathPrefix}/`)),
         ));
     if (!allowed) return { ok: false };
   } catch {

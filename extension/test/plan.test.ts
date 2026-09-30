@@ -762,6 +762,22 @@ test("page-derived foreign destinations require a declared origin and path", () 
   };
   const planned = planExecution(doc, declared, {}, { access_mode: "delegated" });
   expect("assisted" in planned ? null : planned.url).toBe("https://cdn.publisher.test/files/paper.pdf");
+  // A prefix without a trailing slash is still a path boundary: `/files`
+  // authorizes `/files` and `/files/...`, never the sibling `/files-preview/...`.
+  const unslashed = {
+    ...base,
+    download: { ...base.download!, allowedDestinations: [{ origin: "https://cdn.publisher.test", pathPrefix: "/files" }] },
+  };
+  const planUnslashed = (href: string) => planExecution(
+    parseHTML(`<a class="pdf" href="${href}">PDF</a>`, "https://publisher.test/article"),
+    unslashed, {}, { access_mode: "delegated" },
+  );
+  const inTree = planUnslashed("https://cdn.publisher.test/files/paper.pdf");
+  expect("assisted" in inTree ? null : inTree.url).toBe("https://cdn.publisher.test/files/paper.pdf");
+  const exact = planUnslashed("https://cdn.publisher.test/files");
+  expect("assisted" in exact ? null : exact.url).toBe("https://cdn.publisher.test/files");
+  expect(planUnslashed("https://cdn.publisher.test/files-preview/paper.pdf")).toHaveProperty("assisted");
+  expect(planUnslashed("https://cdn.publisher.test/filesx/paper.pdf")).toHaveProperty("assisted");
   const metaSpec: AdapterSpec = {
     id: "meta-destination",
     version: "1",
