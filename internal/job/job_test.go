@@ -879,7 +879,7 @@ func TestRepairParkWithActionRollsBackOnStaleActionSet(t *testing.T) {
 		snapped bool
 	}{
 		{"action opened after snapshot", func(t *testing.T, js *Store, id string, _ int64) {
-			if _, err := js.OpenHumanAction(context.Background(), id, "manual_download", "opened concurrently", Access(false, "landing_page")); err != nil {
+			if _, err := js.OpenHumanAction(context.Background(), id, "verify_identity", "opened concurrently", Access(false, "landing_page")); err != nil {
 				t.Fatal(err)
 			}
 		}, false},
@@ -917,6 +917,16 @@ func TestRepairParkWithActionRollsBackOnStaleActionSet(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			transitions := func() int {
+				t.Helper()
+				var n int
+				if err := js.S.DB().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'job.transition'`, id).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				return n
+			}
+			transitionsBefore := transitions()
 
 			err = js.RepairParkWithAction(ctx, id, StateNeedsReview, StateAwaitingHuman, snapshot,
 				"manual_download", "download the requested PDF yourself",
@@ -938,6 +948,9 @@ func TestRepairParkWithActionRollsBackOnStaleActionSet(t *testing.T) {
 			}
 			if fmt.Sprintf("%+v", after) != fmt.Sprintf("%+v", before) {
 				t.Fatalf("actions after rejected repair = %+v, want unchanged %+v", after, before)
+			}
+			if got := transitions(); got != transitionsBefore {
+				t.Fatalf("transition events after rejected repair = %d, want %d", got, transitionsBefore)
 			}
 		})
 	}
