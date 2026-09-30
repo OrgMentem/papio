@@ -28,7 +28,14 @@ func newNotifyShowCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return printPage(opt, "rows", result.Rows, false)
+				// The envelope is exactly {rows, truncated}, so the preset that
+				// produced this routing rides on each row; dropping it left
+				// --json unable to say which preset was in effect.
+				rows := make([]notifyShowRow, len(result.Rows))
+				for i, row := range result.Rows {
+					rows[i] = notifyShowRow{NotifyRouteRow: row, Preset: result.Preset}
+				}
+				return printPage(opt, "rows", rows, false)
 			}
 			if _, err := fmt.Fprintf(opt.out, "preset: %s\n", result.Preset); err != nil {
 				return err
@@ -42,6 +49,13 @@ func newNotifyShowCommand(opt *options) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// notifyShowRow is one `notify show --json` row: the daemon's route row plus
+// the effective preset, which is the same on every row.
+type notifyShowRow struct {
+	api.NotifyRouteRow
+	Preset string `json:"preset"`
 }
 
 func newNotifyPreviewCommand(opt *options) *cobra.Command {

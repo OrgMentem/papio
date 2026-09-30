@@ -40,13 +40,17 @@ func TestNotifyShowTextAndJSONEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	var envelope struct {
-		Rows      []api.NotifyRouteRow `json:"rows"`
-		Truncated bool                 `json:"truncated"`
+		Rows []struct {
+			api.NotifyRouteRow
+			Preset string `json:"preset"`
+		} `json:"rows"`
+		Truncated bool `json:"truncated"`
 	}
 	if err := json.Unmarshal(encoded.Bytes(), &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if len(envelope.Rows) != 1 || envelope.Truncated {
+	// The text form names the effective preset; --json used to drop it.
+	if len(envelope.Rows) != 1 || envelope.Truncated || envelope.Rows[0].Preset != "milestones" || envelope.Rows[0].Category != "request_outcome" {
 		t.Fatalf("envelope = %+v", envelope)
 	}
 }
