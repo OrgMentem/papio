@@ -2886,6 +2886,26 @@ func TestUnfiledJobs(t *testing.T) {
 	if err != nil || len(missingOnly) != 1 || missingOnly[0].JobID != missingID {
 		t.Fatalf("missing filter = %+v, %v", missingOnly, err)
 	}
+	if _, _, err := svc.UnfiledJobs(ctx, UnfiledFilter("pending"), 10); err == nil {
+		t.Fatal("unknown filter accepted")
+	}
+	// The attempt time is normalized to whole-second RFC 3339 UTC, not the
+	// store's nine-digit text.
+	if at, err := time.Parse(time.RFC3339, failed.LastAttemptAt); err != nil || at.Location() != time.UTC || at.Nanosecond() != 0 || strings.Contains(failed.LastAttemptAt, ".") {
+		t.Fatalf("last attempt at = %q, %v; want whole-second UTC", failed.LastAttemptAt, err)
+	}
+	// Live jobs have nothing to file yet and never appear.
+	createFilingStateJob(t, jobs, "wr_unfiled_live", job.StateResolving)
+	// A page smaller than the unfiled set reports truncation and keeps the
+	// newest-first prefix.
+	page, truncated, err := svc.UnfiledJobs(ctx, UnfiledAll, 1)
+	if err != nil || !truncated || len(page) != 1 || page[0].JobID != rows[0].JobID {
+		t.Fatalf("limit-1 page = %+v, truncated=%v, %v; want %s and truncated", page, truncated, err, rows[0].JobID)
+	}
+	full, truncated, err := svc.UnfiledJobs(ctx, UnfiledAll, 2)
+	if err != nil || truncated || len(full) != 2 {
+		t.Fatalf("exact-size page = %+v, truncated=%v, %v; want both rows untruncated", full, truncated, err)
+	}
 }
 
 func TestProcessReadyFiresOnReadyHookOnce(t *testing.T) {
