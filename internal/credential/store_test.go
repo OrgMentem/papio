@@ -248,12 +248,15 @@ func TestStoreDefaultDeadline(t *testing.T) {
 	release := make(chan struct{})
 	s := testStore(backend{save: func(string, string, string) error { <-release; return nil }})
 	defer close(release)
+	// The store's own deadline, not the caller's, must end the call; a short
+	// one keeps the test fast while the caller's context stays far longer.
+	s.timeout = 50 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	start := time.Now()
 	err := s.Save(ctx, testReference, validRecords()[0])
 	elapsed := time.Since(start)
-	if !errors.Is(err, ErrUncertain) || !errors.Is(err, context.DeadlineExceeded) || elapsed < 4*time.Second || elapsed > 7*time.Second {
+	if !errors.Is(err, ErrUncertain) || !errors.Is(err, context.DeadlineExceeded) || elapsed < s.timeout || elapsed > 4*time.Second {
 		t.Fatalf("default deadline: elapsed=%v err=%v", elapsed, err)
 	}
 	if !s.busy.Load() {
