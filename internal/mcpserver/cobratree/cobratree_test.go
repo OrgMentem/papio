@@ -61,14 +61,16 @@ func testFactory() RootFactory {
 		})
 
 		parent := &cobra.Command{Use: "parent", Short: "Parent group"}
+		var tag string
 		child := &cobra.Command{
 			Use:   "child <name>",
 			Short: "Child leaf",
 			RunE: func(_ *cobra.Command, args []string) error {
-				fmt.Fprintf(out, "child args=%v", args)
+				fmt.Fprintf(out, "child args=%v tag=%s", args, tag)
 				return nil
 			},
 		}
+		child.Flags().StringVar(&tag, "tag", "", "label for the run")
 		parent.AddCommand(child)
 
 		helpOnly := &cobra.Command{
