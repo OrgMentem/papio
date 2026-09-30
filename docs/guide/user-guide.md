@@ -259,7 +259,10 @@ unavailable, or retry-wait job.
 For a compact event-oriented view of the daemon's durable work, run
 [`papio activity`](../reference/commands.md). It is newest-first and bounded;
 `--limit` changes the number of rows, `--job <job-id>` narrows the view, and
-`--json` gives the same page envelope used by other list commands. The command
+`--json` gives the same page envelope used by other list commands. A page that
+stops short ends with the command for the older events: `--before-seq <seq>`
+shows only events older than that sequence number, so pass the `seq` of the
+last row you have. The command
 and the inbox activity panel read the same daemon events; the reference page is
 generated, so use it for the complete option list.
 
