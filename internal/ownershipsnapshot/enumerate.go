@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -44,9 +45,14 @@ func EnumerateLibraryRecords(ctx context.Context, source config.LibrarySource) (
 			return nil, fmt.Errorf("library source %q: %w", name, err)
 		}
 		defer func() { _ = file.Close() }()
-		data, err = readBounded(ctx, file)
+		data, err = readBounded(ctx, io.LimitReader(file, defaultMaxBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("library source %q: %w", name, err)
+		}
+		if int64(len(data)) > defaultMaxBytes {
+			// A prefix of an export is not a smaller library: parsing it would
+			// silently drop every record past the cap.
+			return nil, fmt.Errorf("library source %q: %s exceeds %d bytes", name, path, defaultMaxBytes)
 		}
 		pathHint = path
 	case config.LibraryKindCommand:
