@@ -3,12 +3,20 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"papio/internal/bench"
 )
+
+// errBenchWorksFailed is the exit status of a run in which some cohort work
+// could not be run at all (WorkResult.Error: a broken fixture, an unscripted
+// human action). The report still prints, but its headline counts such a work
+// as zero on both sides, so a CI gate reading only the status would otherwise
+// pass a benchmark that measured less than the cohort it was given.
+var errBenchWorksFailed = errors.New("bench could not run every cohort work")
 
 // newBenchCommand runs papio's hermetic comparative acquisition benchmark
 // (dev/post-build-followups.md item 4). Like the local native-host and
@@ -36,9 +44,23 @@ func newBenchCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return printPage(opt, "results", report.Works, false)
+				err = printPage(opt, "results", report.Works, false)
+			} else {
+				err = renderBenchReport(opt, report)
 			}
-			return renderBenchReport(opt, report)
+			if err != nil {
+				return err
+			}
+			failed := 0
+			for _, w := range report.Works {
+				if w.Error != "" {
+					failed++
+				}
+			}
+			if failed > 0 {
+				return fmt.Errorf("%w: %d of %d failed", errBenchWorksFailed, failed, len(report.Works))
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&cohortPath, "cohort", "", "path to a papio-bench-cohort/1 document")
