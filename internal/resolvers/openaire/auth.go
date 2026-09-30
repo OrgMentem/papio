@@ -42,6 +42,12 @@ const (
 	// failure this type exists to remove.
 	tokenFallbackTTL = 30 * time.Minute
 
+	// tokenMaxLifetime is the longest provider-reported lifetime taken at
+	// face value. OpenAIRE issues hour-long tokens; anything past a day is
+	// absurd, and a large enough expires_in would overflow time.Duration
+	// into an already-expired cache entry.
+	tokenMaxLifetime = 24 * time.Hour
+
 	maxTokenResponseBytes = int64(1 << 16)
 )
 
@@ -196,7 +202,7 @@ func (c *ClientCredentials) exchange(ctx context.Context) (string, time.Duration
 // missing, absurd, or already-elapsed lifetime falls back to a bounded default
 // rather than being trusted or treated as an error.
 func tokenTTL(expiresIn int64) time.Duration {
-	if expiresIn <= 0 {
+	if expiresIn <= 0 || expiresIn > int64(tokenMaxLifetime/time.Second) {
 		return tokenFallbackTTL
 	}
 	lifetime := time.Duration(expiresIn) * time.Second

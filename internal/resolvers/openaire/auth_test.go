@@ -175,6 +175,72 @@ func TestTokenTTLBoundsMissingExpiry(t *testing.T) {
 	}
 }
 
+// An expires_in so large that seconds overflow time.Duration must not become
+// an already-expired cache entry that re-exchanges on every request; it gets
+// the bounded fallback lifetime like any other absurd value.
+func TestClientCredentialsOverflowingExpiryStillCaches(t *testing.T) {
+	server := &tokenServer{body: `{"access_token":"tok","token_type":"Bearer","expires_in":9223372036854775807}`}
+	srv := server.start(t)
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	source := NewClientCredentials(ClientCredentialsOptions{
+		Client: srv.Client(), ClientID: "id", ClientSecret: "secret",
+		TokenURL: srv.URL, Now: func() time.Time { return now },
+	})
+	for range 2 {
+		if _, err := source.Token(context.Background()); err != nil {
+			t.Fatalf("Token: %v", err)
+		}
+	}
+	if server.exchanges != 1 {
+		t.Fatalf("exchanges = %d, want 1 (the token is cached)", server.exchanges)
+	}
+	now = now.Add(tokenFallbackTTL)
+	if _, err := source.Token(context.Background()); err != nil {
+		t.Fatalf("Token after fallback lifetime: %v", err)
+	}
+	if server.exchanges != 2 {
+		t.Fatalf("exchanges = %d, want 2 (the absurd lifetime is not trusted)", server.exchanges)
+	}
+}
+
+// A 200 whose body cannot be used is the auth server misbehaving, which a
+// retry can outlive; a token of a kind papio cannot send is a configuration
+// problem that retrying will not fix. Neither is cached.
+func TestClientCredentialsUnusableTokenResponses(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		temporary bool
+	}{
+		{name: "malformed JSON", body: `{"access_token":`, temporary: true},
+		{name: "missing access_token", body: `{"token_type":"Bearer","expires_in":3600}`, temporary: true},
+		{name: "blank access_token", body: `{"access_token":"  ","token_type":"Bearer","expires_in":3600}`, temporary: true},
+		{name: "unsupported token_type", body: `{"access_token":"tok","token_type":"mac","expires_in":3600}`, temporary: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &tokenServer{body: tc.body}
+			srv := server.start(t)
+			source := NewClientCredentials(ClientCredentialsOptions{
+				Client: srv.Client(), ClientID: "id", ClientSecret: "secret", TokenURL: srv.URL,
+			})
+			for attempt := range 2 {
+				token, err := source.Token(context.Background())
+				if err == nil {
+					t.Fatalf("attempt %d: Token = %q, want an error", attempt, token)
+				}
+				var temporary *resolver.TemporaryError
+				if got := errors.As(err, &temporary); got != tc.temporary {
+					t.Fatalf("attempt %d: temporary = %v, want %v (err %v)", attempt, got, tc.temporary, err)
+				}
+			}
+			if server.exchanges != 2 {
+				t.Fatalf("exchanges = %d, want 2 (a failed exchange caches nothing)", server.exchanges)
+			}
+		})
+	}
+}
+
 func TestResolveSendsExchangedBearer(t *testing.T) {
 	var seen string
 	graph := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
