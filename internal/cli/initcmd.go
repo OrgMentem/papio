@@ -221,14 +221,19 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 		browserInstalled = true
 	}
 
+	// A daemon that cannot start, or a doctor that finds a failing check,
+	// leaves the installation unable to acquire anything, so init prints its
+	// next step and then fails: a setup script that checks the exit status
+	// must not go on to acquisition. Warnings (an extension not connected
+	// yet, an optional integration) keep report.OK and still succeed.
 	report, err := deps.RunDoctor(cmd.Context(), opt)
 	if err != nil {
 		initLine(opt.out, false, "Daemon and doctor", fmt.Sprintf("%v", err))
 		if browserInstalled {
 			writeBrowserInstructions(opt.out, cfg)
 		}
-		fmt.Fprintln(opt.out, "\nNext: papio doctor --start")
-		return nil
+		fmt.Fprintf(opt.out, "\nNext: check the daemon log (%s), then re-run papio init\n", filepath.Join(cfg.DataDir, "daemon.log"))
+		return fmt.Errorf("init: daemon and doctor step failed: %w", err)
 	}
 	if report.OK {
 		initLine(opt.out, true, "Daemon and doctor", "daemon autostarted")
@@ -245,6 +250,9 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	// `papio doctor` for the rest.
 	writeInitDoctorSummary(opt.out, report)
 	fmt.Fprintln(opt.out, "\nNext: "+initNextAction(input, report))
+	if !report.OK {
+		return fmt.Errorf("init: %w", errDoctorFailed)
+	}
 	return nil
 }
 

@@ -194,6 +194,42 @@ func TestInitZotioWarningAndRequiredFailureExitContract(t *testing.T) {
 	}
 }
 
+// A daemon that cannot start, or a doctor with a failing check, leaves the
+// installation unable to acquire. Init used to print that and exit 0, so a
+// setup script went on to acquisition; it also named `papio doctor --start`,
+// a flag that no longer exists. A warning-only report still succeeds, because
+// a first run has no extension connected yet.
+func TestInitFailsWhenDaemonOrDoctorIsNotReady(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		report   doctor.Report
+		err      error
+		wantErr  bool
+		wantNext string
+	}{
+		{name: "daemon did not start", err: errors.New("daemon did not start"), wantErr: true, wantNext: "daemon.log"},
+		{name: "doctor failed", report: doctor.Report{OK: false, Checks: []doctor.Check{{Name: "pdf_worker", Status: doctor.Fail, Detail: "not runnable"}}}, wantErr: true, wantNext: "Next: papio doctor"},
+		{name: "warnings only", report: doctor.Report{OK: true, Checks: []doctor.Check{{Name: "extension", Status: doctor.Warn, Detail: "extension has not connected since daemon start"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := initHome(t)
+			deps := initTestDependencies(t, home)
+			deps.RunDoctor = func(context.Context, *options) (doctor.Report, error) { return tc.report, tc.err }
+			path := filepath.Join(home, ".config", "papio", "config.toml")
+			out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("init err = %v, want error %t\n%s", err, tc.wantErr, out)
+			}
+			if !strings.Contains(out, tc.wantNext) {
+				t.Fatalf("output lacks %q:\n%s", tc.wantNext, out)
+			}
+			if strings.Contains(out, "--start") {
+				t.Fatalf("output names a doctor flag that does not exist:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestRootRegistersInit(t *testing.T) {
 	root := NewRoot(io.Discard, io.Discard)
 	command, _, err := root.Find([]string{"init"})
