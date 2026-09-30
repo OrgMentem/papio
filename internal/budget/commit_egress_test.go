@@ -200,47 +200,6 @@ func TestBootstrapCapThenObserveCreditsUsedSeeds(t *testing.T) {
 	}
 }
 
-func TestUnmeteredCeilingStillCommits(t *testing.T) {
-	m, s := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0, DailyCreditLimit: 0})
-	ctx := context.Background()
-	for i := 0; i < 5; i++ {
-		if err := m.CommitEgress(ctx, openalexReq("key-a", 100)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	var committed int
-	day := utcDay(m.now())
-	if err := s.DB().QueryRowContext(ctx, `SELECT credits_committed FROM source_credit_fuse WHERE source = ? AND utc_day = ?`,
-		config.SourceOpenAlex, day).Scan(&committed); err != nil {
-		t.Fatal(err)
-	}
-	if committed != 500 {
-		t.Fatalf("committed = %d, want 500", committed)
-	}
-}
-
-func TestUnmeteredCeilingStillCommits_guardRequired(t *testing.T) {
-	// Guard exercise is vacuous here: unmetered path must still commit even
-	// through the normal CommitEgress; verify that disabling the debit limit
-	// does not change the outcome (still commits).
-	m, s := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0, DailyCreditLimit: 0})
-	ctx := context.Background()
-	for i := 0; i < 3; i++ {
-		if err := m.CommitEgress(ctx, openalexReq("key-a", 50)); err != nil {
-			t.Fatalf("unmetered commit %d: %v", i, err)
-		}
-	}
-	var committed int
-	day := utcDay(m.now())
-	if err := s.DB().QueryRowContext(ctx, `SELECT credits_committed FROM source_credit_fuse WHERE source = ? AND utc_day = ?`,
-		config.SourceOpenAlex, day).Scan(&committed); err != nil {
-		t.Fatal(err)
-	}
-	if committed != 150 {
-		t.Fatalf("committed = %d, want 150", committed)
-	}
-}
-
 func TestLatchQuotaRefusedAtCommit(t *testing.T) {
 	m, _ := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000})
 	until := m.now().UTC().Add(time.Hour)
@@ -415,7 +374,10 @@ func TestUnobservedDenominatorStillBoundsBootstrapThenColdStart_guardRequired(t 
 func TestDailyFractionZeroStillIncrementsCommitted(t *testing.T) {
 	m, s := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0, DailyCreditLimit: 100})
 	ctx := context.Background()
-	// Limit 100 should be ignored when fraction==0 (unmetered), but commits still happen.
+	// DailyCreditLimit is not part of the unmetered predicate (fraction==0 is),
+	// so committing past the 100 limit proves the ceiling is off while every
+	// request is still recorded. Disabling the debit guard cannot change an
+	// unmetered commit, so this contract has no _guardRequired complement.
 	for i := 0; i < 5; i++ {
 		if err := m.CommitEgress(ctx, openalexReq("key-a", 100)); err != nil {
 			t.Fatalf("unmetered commit %d: %v", i, err)
