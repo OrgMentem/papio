@@ -297,6 +297,59 @@ func TestBrowserReloadTargetsPendingSessionByPrefix(t *testing.T) {
 	}
 }
 
+// `browser reload --json` used to print the RPC result unchanged, whose
+// session_id is the session the reload went to — the one that disconnects as
+// it reloads — even after the command had watched the new session arrive. A
+// script that took it as the live session aimed its next command at a session
+// that no longer existed.
+func TestBrowserReloadJSONNamesTheReconnectedHolder(t *testing.T) {
+	for _, tc := range []struct {
+		timeout    string
+		wantHolder string
+		verified   bool
+	}{
+		{timeout: "--timeout=1s", wantHolder: "holder-new", verified: true},
+		{timeout: "--timeout=0"},
+	} {
+		var stdout, stderr bytes.Buffer
+		reads := 0
+		root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+			switch method {
+			case "browser.sessions":
+				reads++
+				sessions := []browser.SessionSummary{{ID: "holder-old", Holder: true}}
+				if reads > 1 {
+					sessions = []browser.SessionSummary{{ID: "holder-new", Holder: true}}
+				}
+				*result.(*browserSessionsResult) = browserSessionsResult{Sessions: sessions}
+				return nil
+			case "browser.dev_reload":
+				return json.Unmarshal([]byte(`{"session_id":"holder-old","reload_id":"reload-123"}`), result)
+			default:
+				t.Fatalf("unexpected method %q", method)
+				return nil
+			}
+		})
+		root.SetArgs([]string{"--json", "browser", "reload", tc.timeout})
+		if err := root.Execute(); err != nil {
+			t.Fatalf("%s: %v (%s)", tc.timeout, err, stderr.String())
+		}
+		var receipt struct {
+			SessionID         string `json:"session_id"`
+			ReloadID          string `json:"reload_id"`
+			HolderSessionID   string `json:"holder_session_id"`
+			ReconnectVerified bool   `json:"reconnect_verified"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &receipt); err != nil {
+			t.Fatalf("%s: decode %q: %v", tc.timeout, stdout.String(), err)
+		}
+		if receipt.SessionID != "holder-old" || receipt.ReloadID != "reload-123" ||
+			receipt.HolderSessionID != tc.wantHolder || receipt.ReconnectVerified != tc.verified {
+			t.Fatalf("%s: receipt = %+v, want holder %q verified %t", tc.timeout, receipt, tc.wantHolder, tc.verified)
+		}
+	}
+}
+
 type browserReloadErrorWriter struct {
 	err error
 }

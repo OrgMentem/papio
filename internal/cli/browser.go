@@ -167,8 +167,15 @@ func newBrowserCommand(opt *options) *cobra.Command {
 				return err
 			}
 			previous = result.SessionID
+			// The receipt is the CLI's own, not the RPC result: session_id is
+			// the session the reload went to, which disconnects as it reloads,
+			// so a script that took it for the live session aimed its next
+			// command at a session that no longer exists. holder_session_id is
+			// the reloaded extension's new session, and reconnect_verified
+			// says whether the command saw it arrive.
+			receipt := browserReloadReceipt{SessionID: result.SessionID, ReloadID: result.ReloadID}
 			if reloadTimeout == 0 {
-				return opt.printResult(result, "reload %s sent for browser session %s; not waiting for reconnect (--timeout=0)", result.ReloadID, shortSessionID(previous))
+				return opt.printResult(receipt, "reload %s sent for browser session %s; not waiting for reconnect (--timeout=0)", result.ReloadID, shortSessionID(previous))
 			}
 			deadline := time.Now().Add(reloadTimeout)
 			ticker := time.NewTicker(250 * time.Millisecond)
@@ -214,7 +221,9 @@ func newBrowserCommand(opt *options) *cobra.Command {
 							return fmt.Errorf("browser session %s reloaded, but browser %s reconnected during the same window, so the new holder %s cannot be attributed to the reload; run `papio browser sessions` and `papio browser use <id>` to put the session on the browser you are developing in", shortSessionID(previous), shortSessionID(id), shortSessionID(current))
 						}
 					}
-					return opt.printResult(result, "browser session %s reloaded; %s now holds the papio session", shortSessionID(previous), shortSessionID(current))
+					receipt.HolderSessionID = current
+					receipt.ReconnectVerified = true
+					return opt.printResult(receipt, "browser session %s reloaded; %s now holds the papio session", shortSessionID(previous), shortSessionID(current))
 				}
 				select {
 				case <-ctx.Done():
@@ -229,6 +238,17 @@ func newBrowserCommand(opt *options) *cobra.Command {
 
 	command.AddCommand(sessions, use, permit, reload)
 	return command
+}
+
+// browserReloadReceipt is `browser reload --json`. SessionID is the session
+// the reload was sent to — the pre-reload extension, gone once it reloads —
+// and HolderSessionID the new session that reconnected in its place, set only
+// when ReconnectVerified (never with --timeout=0, which does not wait).
+type browserReloadReceipt struct {
+	SessionID         string `json:"session_id"`
+	ReloadID          string `json:"reload_id"`
+	HolderSessionID   string `json:"holder_session_id,omitempty"`
+	ReconnectVerified bool   `json:"reconnect_verified"`
 }
 
 func shortSessionID(id string) string {
