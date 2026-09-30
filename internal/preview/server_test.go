@@ -541,6 +541,84 @@ func TestPDFRepeatGETRefusesFileTamperedAfterFirstVerify(t *testing.T) {
 	assertStatus(t, capabilityURL, http.StatusNotFound)
 }
 
+// A failed verification of an obsolete capability must not revoke the
+// capability Issue minted for the same action while it was hashing: the
+// replacement binds a different, valid file.
+func TestObsoletePreviewFailureKeepsItsReplacement(t *testing.T) {
+	server := New(&recordingResolver{})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	pdf := []byte("%PDF-1.7\nold bytes\n%%EOF\n")
+	oldPath, oldDigest := writePDF(t, pdf)
+	oldURL := issuePreview(t, server, oldPath, oldDigest, len(pdf), Citation{})
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	setVerify(server, func(path string, size int64, want string) ([]byte, time.Time, bool) {
+		if path == oldPath {
+			close(entered)
+			<-release
+		}
+		return verifyQuarantinedFile(path, size, want)
+	})
+	oldStatus := make(chan int, 1)
+	go func() {
+		response, err := http.Get(oldURL + "/file")
+		if err != nil {
+			oldStatus <- 0
+			return
+		}
+		_ = response.Body.Close()
+		oldStatus <- response.StatusCode
+	}()
+	<-entered
+
+	fresh := []byte("%PDF-1.7\nfresh bytes\n%%EOF\n")
+	freshPath, freshDigest := writePDF(t, fresh)
+	freshURL := issuePreview(t, server, freshPath, freshDigest, len(fresh), Citation{})
+	close(release)
+	if got := <-oldStatus; got != http.StatusGone {
+		t.Fatalf("obsolete GET = %d, want %d", got, http.StatusGone)
+	}
+
+	assertStatus(t, freshURL, http.StatusOK)
+	response, body := getResponse(t, freshURL+"/file")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || body != string(fresh) {
+		t.Fatalf("replacement GET = %d %q, want 200 with its own bytes", response.StatusCode, body)
+	}
+}
+
+// The bytes served are the bytes hashed: a same-length rewrite of the
+// quarantined file after the hash, before the response, is never served.
+func TestPDFServesTheHashedBytesWhenTheFileChangesAfterTheHash(t *testing.T) {
+	server := New(&recordingResolver{})
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+	pdf := []byte("%PDF-1.7\nhashed bytes\n%%EOF\n")
+	path, digest := writePDF(t, pdf)
+	capabilityURL := issuePreview(t, server, path, digest, len(pdf), Citation{})
+	swapped := append([]byte(nil), pdf...)
+	swapped[10] = 'X'
+	setVerify(server, func(path string, size int64, want string) ([]byte, time.Time, bool) {
+		content, modTime, ok := verifyQuarantinedFile(path, size, want)
+		if err := os.WriteFile(path, swapped, 0o600); err != nil {
+			t.Error(err)
+		}
+		return content, modTime, ok
+	})
+	response, body := getResponse(t, capabilityURL+"/file")
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || body != string(pdf) {
+		t.Fatalf("GET = %d %q, want 200 with the hashed bytes", response.StatusCode, body)
+	}
+}
+
+func setVerify(server *Server, verify func(path string, size int64, want string) ([]byte, time.Time, bool)) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	server.verify = verify
+}
+
 func TestPDFMissingRecordedHashFailsClosedWithClearError(t *testing.T) {
 	server := New(&recordingResolver{})
 	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })

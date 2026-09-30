@@ -5,6 +5,7 @@
 package preview
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -93,6 +94,9 @@ type Server struct {
 	resolver ReviewResolver
 	byToken  map[string]*capability
 	byAction map[int64]string
+	// verify reads and checks one capability's file; tests replace it to
+	// hold a verification open while the capability changes underneath it.
+	verify func(path string, size int64, want string) ([]byte, time.Time, bool)
 }
 
 // New constructs a preview server without opening a listening socket.
@@ -102,6 +106,7 @@ func New(resolver ReviewResolver) *Server {
 		resolver: resolver,
 		byToken:  make(map[string]*capability),
 		byAction: make(map[int64]string),
+		verify:   verifyQuarantinedFile,
 	}
 }
 
@@ -444,15 +449,24 @@ func (s *Server) servePDF(w http.ResponseWriter, r *http.Request, token string) 
 	// two operators reviewing at once would block each other for as long as
 	// the larger document takes to hash. path/size/sha256 are immutable once
 	// a capability is issued, so checking a snapshot of them is equivalent
-	// to checking under the lock, and the handle we serve from is the very
-	// one we hashed, so the bytes sent are the bytes verified.
-	actionID, path, size, want := entry.actionID, entry.path, entry.size, entry.sha256
+	// to checking under the lock, and the bytes served are the in-memory
+	// copy that was hashed, so the bytes sent are the bytes verified.
+	path, size, want := entry.path, entry.size, entry.sha256
+	verify := s.verify
 	s.mu.Unlock()
 
-	file, info, ok := verifyQuarantinedFile(path, size, want)
+	content, modTime, ok := verify(path, size, want)
 	if !ok {
+		// Revoke only the capability this request verified. Issue may have
+		// replaced it for the same action while this request was hashing,
+		// and the replacement binds a different file that it must still serve.
 		s.mu.Lock()
-		s.revokeLocked(actionID)
+		if current, live := s.byToken[token]; live && current == entry {
+			delete(s.byToken, token)
+			if s.byAction[entry.actionID] == token {
+				delete(s.byAction, entry.actionID)
+			}
+		}
 		s.mu.Unlock()
 		writePlainError(w, http.StatusGone, "quarantined file no longer matches its verified hash\n")
 		return
@@ -463,19 +477,17 @@ func (s *Server) servePDF(w http.ResponseWriter, r *http.Request, token string) 
 		// Revoked or swept while we were hashing; do not serve bytes for a
 		// capability that no longer exists.
 		s.mu.Unlock()
-		_ = file.Close()
 		writeNotFound(w)
 		return
 	}
 	entry.verified = true
 	s.mu.Unlock()
-	defer file.Close()
 
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Disposition", `inline; filename="preview.pdf"`)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	setPrivateHeaders(w)
-	http.ServeContent(w, r, "preview.pdf", info.ModTime(), file)
+	http.ServeContent(w, r, "preview.pdf", modTime, bytes.NewReader(content))
 }
 
 func (s *Server) host() string {
@@ -496,38 +508,35 @@ func (s *Server) sweepExpiredLocked(now time.Time) {
 	}
 }
 
-func (s *Server) revokeLocked(actionID int64) {
-	if token, ok := s.byAction[actionID]; ok {
-		delete(s.byToken, token)
-		delete(s.byAction, actionID)
-	}
-}
-
-// verifyQuarantinedFile re-reads the file and confirms it still matches the
-// size and digest the capability was issued against, returning a handle
-// rewound to the start so the caller serves exactly the bytes it just
-// hashed. It takes no lock and touches no server state: every input is
-// immutable for the life of a capability.
-func verifyQuarantinedFile(path string, size int64, want string) (*os.File, os.FileInfo, bool) {
+// verifyQuarantinedFile reads the file into memory and confirms it still
+// matches the size and digest the capability was issued against. The caller
+// serves that copy, never the file: the quarantined path is writable by the
+// process that produced it, so bytes read from disk after the hash could
+// differ from the bytes hashed. It takes no lock and touches no server
+// state: every input is immutable for the life of a capability.
+func verifyQuarantinedFile(path string, size int64, want string) ([]byte, time.Time, bool) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, false
+		return nil, time.Time{}, false
 	}
+	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != size {
-		_ = file.Close()
-		return nil, nil, false
+		return nil, time.Time{}, false
 	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil || hex.EncodeToString(hash.Sum(nil)) != want {
-		_ = file.Close()
-		return nil, nil, false
+	content := make([]byte, size)
+	if _, err := io.ReadFull(file, content); err != nil {
+		return nil, time.Time{}, false
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = file.Close()
-		return nil, nil, false
+	// A file that grew after the stat is not the file that was issued.
+	if n, _ := file.Read(make([]byte, 1)); n != 0 {
+		return nil, time.Time{}, false
 	}
-	return file, info, true
+	digest := sha256.Sum256(content)
+	if hex.EncodeToString(digest[:]) != want {
+		return nil, time.Time{}, false
+	}
+	return content, info.ModTime(), true
 }
 
 func validSHA256(value string) bool {
