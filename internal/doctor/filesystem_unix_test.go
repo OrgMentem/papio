@@ -6,6 +6,7 @@ package doctor
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -35,5 +36,28 @@ func TestUnixWorkerExecutableRequiresExecutePermission(t *testing.T) {
 		if err := checkWorkerExecutable(context.Background(), path); err == nil {
 			t.Fatalf("non-executable %q passed", path)
 		}
+	}
+}
+
+// An execute bit that does not apply to the current user is not runnable:
+// the owner class decides for the owner, so a file of ours with execute only
+// for group and other fails execve with EACCES. The same holds for a
+// root-owned 0700 worker seen by an ordinary user.
+func TestUnixWorkerExecutableRequiresExecuteForTheCurrentUser(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root may execute any file with an execute bit")
+	}
+	path := filepath.Join(t.TempDir(), "papio")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o611); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command(path).Run(); err == nil {
+		t.Fatal("fixture is executable by its owner; the test proves nothing")
+	}
+	if err := checkWorkerExecutable(context.Background(), path); err == nil {
+		t.Fatal("worker the current user cannot execute passed")
 	}
 }
