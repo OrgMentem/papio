@@ -202,7 +202,25 @@ func (s *Service) ReconcileTags(ctx context.Context) (*TagReconcileResult, error
 			reconcileErrs = append(reconcileErrs, fmt.Errorf("adding %s to %s: %w", want, key, runErr))
 		}
 	}
-	return result, errors.Join(reconcileErrs...)
+	return result, partialReconcileError(result, reconcileErrs)
+}
+
+// partialReconcileError keeps the changes a failed pass already made visible.
+// The RPC can only carry the error once any item fails, and its result shape
+// is fixed, so the counts ride in the error's hint ahead of the underlying
+// cause's own hint; the class stays the cause's class.
+func partialReconcileError(result *TagReconcileResult, errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	cause := errors.Join(errs...)
+	info := ErrorInfoFrom(cause)
+	hint := fmt.Sprintf("tags partly reconciled: %d added, %d removed, %d failed", result.Added, result.Removed, len(errs))
+	if info.Hint != "" {
+		hint += "; " + info.Hint
+	}
+	info.Hint = SanitizeErrorHint(hint)
+	return &ClassifiedError{cause: cause, info: info}
 }
 
 func reconcileNeedsRemote(keys []string, desired map[string]string, ledger map[string]tagLedgerState) bool {

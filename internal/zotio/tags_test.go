@@ -468,6 +468,33 @@ func TestReconcileTagsMissingKeyDoesNotBlockOtherItems(t *testing.T) {
 	}
 }
 
+// A pass that fails on one item has still changed others. The daemon can
+// only send the error, so the error the operator sees must say what the
+// pass already did, and keep the failing item's own class.
+func TestReconcileTagsPartialFailureReportsCompletedChanges(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{failKeys: map[string]error{"CCCCFAIL": WithErrorInfo(fmt.Errorf("Zotero HTTP 503"))}}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_AAAAOKAY", "AAAAOKAY", job.StateResolving, job.StateUnavailable)
+	createJob(t, jobs, "request_zotio_BBBBOKAY", "BBBBOKAY", job.StateResolving, job.StateUnavailable)
+	createJob(t, jobs, "request_zotio_CCCCFAIL", "CCCCFAIL", job.StateResolving, job.StateUnavailable)
+
+	result, err := service.ReconcileTags(ctx)
+	if err == nil {
+		t.Fatal("expected the failed item to be reported")
+	}
+	if result == nil || result.Added != 2 {
+		t.Fatalf("result = %+v, want the two completed adds", result)
+	}
+	info := ErrorInfoFrom(err)
+	if !strings.HasPrefix(info.Hint, "tags partly reconciled: 2 added, 0 removed, 1 failed") {
+		t.Fatalf("hint = %q, want the completed changes named", info.Hint)
+	}
+	if want := ErrorInfoFrom(cli.failKeys["CCCCFAIL"]).Class; info.Class != want || want == ErrorClassUnknown {
+		t.Fatalf("class = %q, want the failing item's class %q", info.Class, want)
+	}
+}
+
 func TestReconcileTagsPersistsAppliedOutcomeDespiteCommandError(t *testing.T) {
 	ctx := context.Background()
 	cli := &tagCLI{resultErrors: map[string]error{"PARTIAL1": fmt.Errorf("journal failed after mutation")}}
