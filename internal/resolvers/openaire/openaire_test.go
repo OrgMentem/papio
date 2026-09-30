@@ -203,7 +203,7 @@ func TestParseRetryAfterClampsHugeValues(t *testing.T) {
 	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
 
-func TestMalformedAndOversizedPayload(t *testing.T) {
+func TestMalformedPayload(t *testing.T) {
 	t.Run("malformed json", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`{"results": [`))
@@ -229,20 +229,17 @@ func TestMalformedAndOversizedPayload(t *testing.T) {
 			t.Fatal("want error for multiple JSON values")
 		}
 	})
-	t.Run("oversized bounded read", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte(`{"results": [{"mainTitle": "` + strings.Repeat("x", 512) + `"}]}`))
-		}))
-		defer server.Close()
+}
 
-		_, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL, MaxResponseBytes: 128}).
+func TestResolveOversizedBodyFailsClosed(t *testing.T) {
+	resolvertest.CheckOversizedBodyFailsClosed(t, `{"results": [{"mainTitle": "`+strings.Repeat("x", 512)+`"}]}`, func(t *testing.T, maxBytes int64, body string) error {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(server.Close)
+		_, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL, MaxResponseBytes: maxBytes}).
 			Resolve(context.Background(), work.Work{DOI: "10.1371/journal.pone.0262026"})
-		if err == nil || !strings.Contains(err.Error(), "size limit") {
-			t.Fatalf("Resolve = %v, want a size-limit rejection", err)
-		}
-		if _, temporary := resolver.Temporary(err); temporary {
-			t.Fatalf("an oversized body is malformed, not retryable: %v", err)
-		}
+		return err
 	})
 }
 

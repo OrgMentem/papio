@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"papio/internal/resolver"
+	"papio/internal/resolvers/resolvertest"
 	"papio/internal/work"
 )
 
@@ -123,13 +124,14 @@ func TestResolveNetworkFailureIsTemporary(t *testing.T) {
 	}
 }
 
-func TestResolveOversizedJSONFailsClosed(t *testing.T) {
-	r := NewWithOptions(Options{Client: clientFunc(func(*http.Request) (*http.Response, error) {
-		return responseFor(200, `{"is_oa":true,"padding":"`+strings.Repeat("x", 64)+`"}`, nil), nil
-	}), ContactEmail: "contact@example.org", MaxResponseBytes: 16})
-	if _, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"}); err == nil {
-		t.Fatal("oversized response was accepted")
-	}
+func TestResolveOversizedBodyFailsClosed(t *testing.T) {
+	resolvertest.CheckOversizedBodyFailsClosed(t, `{"is_oa":true,"padding":"`+strings.Repeat("x", 64)+`"}`, func(t *testing.T, maxBytes int64, body string) error {
+		r := NewWithOptions(Options{Client: clientFunc(func(*http.Request) (*http.Response, error) {
+			return responseFor(http.StatusOK, body, nil), nil
+		}), ContactEmail: "contact@example.org", MaxResponseBytes: maxBytes})
+		_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/example"})
+		return err
+	})
 }
 
 func TestResolveIncludesDiscoveredWork(t *testing.T) {

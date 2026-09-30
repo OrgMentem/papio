@@ -308,7 +308,7 @@ func TestNonOAAndEmptyAndMismatch(t *testing.T) {
 	}
 }
 
-func TestMalformedAndOversizedPayload(t *testing.T) {
+func TestMalformedPayload(t *testing.T) {
 	t.Run("malformed json", func(t *testing.T) {
 		srv := serveJSON(t, http.StatusOK, nil, `{"resultList": {`, nil)
 		r := newResolver(srv)
@@ -328,16 +328,14 @@ func TestMalformedAndOversizedPayload(t *testing.T) {
 			t.Fatal("want error for multiple JSON values")
 		}
 	})
-	t.Run("oversized bounded read", func(t *testing.T) {
-		srv := serveJSON(t, http.StatusOK, nil, oaResultJSON, nil)
-		r := NewWithOptions(Options{Client: srv.Client(), BaseURL: srv.URL, MaxResponseBytes: 64})
-		_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/xyz"})
-		if err == nil || !strings.Contains(err.Error(), "size limit") {
-			t.Fatalf("want size-limit error, got %v", err)
-		}
-		if _, temp := resolver.Temporary(err); temp {
-			t.Error("oversized payload must not be temporary")
-		}
+}
+
+func TestResolveOversizedBodyFailsClosed(t *testing.T) {
+	resolvertest.CheckOversizedBodyFailsClosed(t, oaResultJSON, func(t *testing.T, maxBytes int64, body string) error {
+		srv := serveJSON(t, http.StatusOK, nil, body, nil)
+		_, err := NewWithOptions(Options{Client: srv.Client(), BaseURL: srv.URL, MaxResponseBytes: maxBytes}).
+			Resolve(context.Background(), work.Work{DOI: "10.1000/xyz"})
+		return err
 	})
 }
 

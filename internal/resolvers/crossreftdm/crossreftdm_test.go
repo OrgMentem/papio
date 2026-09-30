@@ -90,16 +90,20 @@ func TestResolveDisabledNoLinkAndFailures(t *testing.T) {
 	}
 }
 
-func TestResolveRejectsMalformedOversizedAndCrossHostCredentialRedirect(t *testing.T) {
-	for name, body := range map[string]string{"malformed": "{", "oversized": `{"message":` + strings.Repeat("x", 200)} {
-		t.Run(name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
-			defer server.Close()
-			_, err := NewWithOptions(Options{Client: server.Client(), APIKey: "token", BaseURL: server.URL, MaxResponseBytes: 32}).Resolve(context.Background(), work.Work{DOI: "10.1000/test"})
-			if err == nil {
-				t.Fatal("expected decode failure")
-			}
-		})
+func TestResolveOversizedBodyFailsClosed(t *testing.T) {
+	resolvertest.CheckOversizedBodyFailsClosed(t, `{"message": {"DOI": "10.1000/test", "padding": "`+strings.Repeat("x", 200)+`"}}`, func(t *testing.T, maxBytes int64, body string) error {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		t.Cleanup(server.Close)
+		_, err := NewWithOptions(Options{Client: server.Client(), APIKey: "token", BaseURL: server.URL, MaxResponseBytes: maxBytes}).Resolve(context.Background(), work.Work{DOI: "10.1000/test"})
+		return err
+	})
+}
+
+func TestResolveRejectsMalformedAndCrossHostCredentialRedirect(t *testing.T) {
+	malformed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("{")) }))
+	defer malformed.Close()
+	if _, err := NewWithOptions(Options{Client: malformed.Client(), APIKey: "token", BaseURL: malformed.URL}).Resolve(context.Background(), work.Work{DOI: "10.1000/test"}); err == nil {
+		t.Fatal("expected decode failure")
 	}
 
 	var redirectedAuthorization, redirectedToken string

@@ -239,7 +239,7 @@ func TestNoArxivIdentitySkipsNetwork(t *testing.T) {
 	}
 }
 
-func TestMalformedAndOversizedPayload(t *testing.T) {
+func TestMalformedPayload(t *testing.T) {
 	t.Run("malformed xml", func(t *testing.T) {
 		srv := serveAtom(t, http.StatusOK, nil, "<feed><entry>unterminated", nil)
 		r := newResolver(srv)
@@ -251,20 +251,14 @@ func TestMalformedAndOversizedPayload(t *testing.T) {
 			t.Error("malformed payload must not be a temporary error")
 		}
 	})
-	t.Run("oversized bounded read", func(t *testing.T) {
-		big := atomEntryXML("2101.00001v1", strings.Repeat("A", 8192), "")
-		srv := serveAtom(t, http.StatusOK, nil, big, nil)
-		r := NewWithOptions(Options{Client: srv.Client(), BaseURL: srv.URL, MaxResponseBytes: 256})
-		_, err := r.Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
-		if err == nil {
-			t.Fatal("want error when response exceeds the size limit")
-		}
-		if !strings.Contains(err.Error(), "size limit") {
-			t.Errorf("error = %v, want a size-limit rejection", err)
-		}
-		if _, temp := resolver.Temporary(err); temp {
-			t.Error("oversized payload must not be a temporary error")
-		}
+}
+
+func TestResolveOversizedBodyFailsClosed(t *testing.T) {
+	resolvertest.CheckOversizedBodyFailsClosed(t, atomEntryXML("2101.00001v1", strings.Repeat("A", 8192), ""), func(t *testing.T, maxBytes int64, body string) error {
+		srv := serveAtom(t, http.StatusOK, nil, body, nil)
+		_, err := NewWithOptions(Options{Client: srv.Client(), BaseURL: srv.URL, MaxResponseBytes: maxBytes}).
+			Resolve(context.Background(), work.Work{ArXiv: "2101.00001"})
+		return err
 	})
 }
 

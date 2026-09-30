@@ -100,17 +100,22 @@ func TestResolveHTTPFailuresAndRetryAfter(t *testing.T) {
 	}
 }
 
-func TestResolveRejectsMalformedAndOversizedJSON(t *testing.T) {
-	for name, body := range map[string]string{"malformed": "{", "oversized": `{"results": ["` + strings.Repeat("x", 200) + `"]}`} {
-		t.Run(name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
-			defer server.Close()
-			_, err := NewWithOptions(Options{Client: server.Client(), APIKey: "key", BaseURL: server.URL, MaxResponseBytes: 32}).Resolve(context.Background(), work.Work{DOI: "10.1000/test"})
-			if err == nil {
-				t.Fatal("expected decode failure")
-			}
-		})
+func TestResolveRejectsMalformedJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("{")) }))
+	defer server.Close()
+	_, err := NewWithOptions(Options{Client: server.Client(), APIKey: "key", BaseURL: server.URL}).Resolve(context.Background(), work.Work{DOI: "10.1000/test"})
+	if err == nil {
+		t.Fatal("expected decode failure")
 	}
+}
+
+func TestResolveOversizedBodyFailsClosed(t *testing.T) {
+	resolvertest.CheckOversizedBodyFailsClosed(t, `{"results": [], "padding": "`+strings.Repeat("x", 200)+`"}`, func(t *testing.T, maxBytes int64, body string) error {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		t.Cleanup(server.Close)
+		_, err := NewWithOptions(Options{Client: server.Client(), APIKey: "key", BaseURL: server.URL, MaxResponseBytes: maxBytes}).Resolve(context.Background(), work.Work{DOI: "10.1000/test"})
+		return err
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

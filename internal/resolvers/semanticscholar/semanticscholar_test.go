@@ -273,7 +273,7 @@ func TestParseRetryAfterClampsHugeValues(t *testing.T) {
 	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
 
-func TestMalformedAndOversizedPayload(t *testing.T) {
+func TestMalformedPayload(t *testing.T) {
 	t.Run("malformed json", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`{"openAccessPdf": {`))
@@ -299,21 +299,17 @@ func TestMalformedAndOversizedPayload(t *testing.T) {
 			t.Fatal("want error for multiple JSON values")
 		}
 	})
-	t.Run("oversized bounded read", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte(`{"openAccessPdf": {"url": "https://example.org/p.pdf"}, "title": "` + strings.Repeat("x", 512) + `"}`))
-		}))
-		defer server.Close()
+}
 
-		_, err := NewWithOptions(Options{
-			Client: http.DefaultClient, BaseURL: server.URL, MaxResponseBytes: 128,
-		}).Resolve(context.Background(), work.Work{DOI: "10.5555/example"})
-		if err == nil || !strings.Contains(err.Error(), "size limit") {
-			t.Fatalf("Resolve = %v, want a size-limit rejection", err)
-		}
-		if _, temporary := resolver.Temporary(err); temporary {
-			t.Fatalf("an oversized body is a malformed response, not a retryable condition: %v", err)
-		}
+func TestResolveOversizedBodyFailsClosed(t *testing.T) {
+	resolvertest.CheckOversizedBodyFailsClosed(t, `{"openAccessPdf": {"url": "https://example.org/p.pdf"}, "title": "`+strings.Repeat("x", 512)+`"}`, func(t *testing.T, maxBytes int64, body string) error {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(server.Close)
+		_, err := NewWithOptions(Options{Client: http.DefaultClient, BaseURL: server.URL, MaxResponseBytes: maxBytes}).
+			Resolve(context.Background(), work.Work{DOI: "10.5555/example"})
+		return err
 	})
 }
 
