@@ -20,8 +20,8 @@ import (
 // newFixtureStore builds a fresh, fully-migrated papio store in a temp
 // directory — never the operator's real database. Measure is exercised
 // directly against the store's own writable *sql.DB: Measure only issues
-// SELECTs, so a second read-only connection buys nothing in a test and only
-// OpenReadOnly (exercised by the CLI, not here) needs to prove mode=ro works.
+// SELECTs, so a second read-only connection buys nothing in a test; the
+// mode=ro contract itself is pinned by store_test.go against OpenReadOnly.
 func newFixtureStore(t *testing.T) (*job.Store, *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
