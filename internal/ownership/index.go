@@ -1,7 +1,10 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 package ownership
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Entry is one holdings record reduced to what matching needs. Titles are
 // deliberately absent: they are never matched (ADR-0008).
@@ -101,15 +104,18 @@ func (i *Index) Claims(source string, query Query) []Claim {
 	if len(matches) == 0 {
 		return nil
 	}
+	positions := make([]int, 0, len(matches))
+	for position := range matches {
+		positions = append(positions, position)
+	}
+	// Index order keeps claim output deterministic; work stays O(matches).
+	sort.Ints(positions)
 	claims := make([]Claim, 0, len(matches))
-	for position, entry := range i.entries {
-		id, ok := matches[position]
-		if !ok {
-			continue
-		}
+	for _, position := range positions {
+		entry := i.entries[position]
 		claims = append(claims, Claim{
 			Source:          source,
-			Matched:         id,
+			Matched:         matches[position],
 			RecordPresent:   true,
 			Artifact:        entry.Artifact,
 			ArtifactVersion: entry.ArtifactVersion,
