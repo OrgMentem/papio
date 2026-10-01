@@ -137,6 +137,48 @@ func TestExecInstallFailureKeepsPreviousHost(t *testing.T) {
 	}
 }
 
+// TestExecInstallOverlappingInstallsKeepTheirOwnLinks interleaves a second
+// install between the first install's link step and its rename. A shared
+// temporary name let the second install delete the first one's link, so the
+// first reported failure (or published the other binary); each install must
+// publish only its own link and report success truthfully.
+func TestExecInstallOverlappingInstallsKeepTheirOwnLinks(t *testing.T) {
+	execTestDir(t)
+	first := fakeExe(t, "papio-first")
+	second := fakeExe(t, "papio-second")
+	t.Cleanup(func() { symlink = os.Symlink })
+	var secondErr error
+	symlink = func(target, link string) error {
+		if err := os.Symlink(target, link); err != nil {
+			return err
+		}
+		symlink = os.Symlink
+		_, secondErr = InstallExecutable(second)
+		return nil
+	}
+
+	if _, err := InstallExecutable(first); err != nil {
+		t.Fatalf("first InstallExecutable overlapped by a second install: %v", err)
+	}
+	if secondErr != nil {
+		t.Fatalf("overlapping second InstallExecutable: %v", secondErr)
+	}
+	got, err := os.Readlink(ExecPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != first {
+		t.Fatalf("host link = %q, want the last rename's own target %q", got, first)
+	}
+	entries, err := os.ReadDir(filepath.Dir(ExecPath()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("bin dir holds %d entries, want only the host link (no leftover staging)", len(entries))
+	}
+}
+
 // TestExecInstallOverwritesDanglingSymlink covers the recorded incident: a host
 // symlink left pointing at a vanished versioned brew path must be replaced, not
 // treated as already installed.
