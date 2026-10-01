@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -86,7 +87,12 @@ const pendingDigestCoalescable = `(notification_intents.desktop_state IN ('pendi
 // CategoryDecisionPending/PhaseReminder. A retry that routes the identical
 // total replaces the count and payload instead of adding them, so a crash
 // between Route and the producer's markers cannot inflate the digest
-// (2 -> 4). Growth in the same window replaces with the new total.
+// (2 -> 4). Growth in the same window replaces with the new total while the
+// latest generation's webhook leg is still pending. Once that leg is claimed
+// or settled its snapshot is immutable: a larger total for a pending webhook
+// opens a fresh generation (window +1ns, +2ns, ...) with its own delivery
+// key, and the previous generation's still-open desktop leg is superseded so
+// the desktop shows the grown total once.
 func (l *StoreLedger) UpsertPendingDigest(ctx context.Context, rec Record) (Record, error) {
 	if l == nil || l.ledger == nil || l.store == nil || l.store.DB() == nil {
 		return Record{}, fmt.Errorf("notification ledger is unavailable")
@@ -107,7 +113,6 @@ func (l *StoreLedger) UpsertPendingDigest(ctx context.Context, rec Record) (Reco
 	if webhookState == "" {
 		webhookState = "pending"
 	}
-	window := formatPendingTime(rec.Intent.WindowStart)
 	first := rec.FirstAt
 	if first.IsZero() {
 		first = rec.LastAt
@@ -120,7 +125,36 @@ func (l *StoreLedger) UpsertPendingDigest(ctx context.Context, rec Record) (Reco
 	if available.IsZero() {
 		available = last
 	}
-	_, err = l.store.DB().ExecContext(ctx, `
+	category, phase := string(rec.Intent.Category), string(rec.Intent.Phase)
+	tx, err := l.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return Record{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	latest, latestWindow, found, err := latestPendingGeneration(ctx, tx, category, rec.Intent.EventKind, rec.Intent.AggregateKey, phase, rec.Intent.WindowStart)
+	if err != nil {
+		return Record{}, err
+	}
+	window := rec.Intent.WindowStart
+	if found {
+		window = latestWindow
+		if webhookState == "pending" && latest.WebhookState != "pending" && count > latest.Count {
+			// The latest generation's webhook snapshot is claimed or settled:
+			// queue the grown total as a new generation instead of rewriting it.
+			window = latestWindow.Add(time.Nanosecond)
+			if latest.DesktopState == "pending" || latest.DesktopState == "held" {
+				desktopState = latest.DesktopState
+				if _, err := tx.ExecContext(ctx, `UPDATE notification_intents SET desktop_state='superseded' WHERE id=?`, latest.ID); err != nil {
+					return Record{}, err
+				}
+			} else {
+				// The desktop already delivered this window; the new
+				// generation exists only for the webhook leg.
+				desktopState = "superseded"
+			}
+		}
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO notification_intents
 		(category,event_kind,aggregate_key,phase,window_start,job_id,batch_id,scan_id,
 		 payload_json,first_at,last_at,count,available_at,desktop_state,webhook_state)
@@ -130,14 +164,39 @@ func (l *StoreLedger) UpsertPendingDigest(ctx context.Context, rec Record) (Reco
 			count=CASE WHEN `+pendingDigestCoalescable+` THEN excluded.count ELSE notification_intents.count END,
 			payload_json=CASE WHEN `+pendingDigestCoalescable+` THEN excluded.payload_json ELSE notification_intents.payload_json END,
 			available_at=CASE WHEN `+pendingDigestCoalescable+` THEN excluded.available_at ELSE notification_intents.available_at END`,
-		string(rec.Intent.Category), rec.Intent.EventKind, rec.Intent.AggregateKey, string(rec.Intent.Phase), window,
+		category, rec.Intent.EventKind, rec.Intent.AggregateKey, phase, formatPendingTime(window),
 		nullIfEmpty(rec.Intent.JobID), nullIfEmpty(rec.Intent.BatchID), nullIfEmpty(rec.Intent.ScanID), string(payload),
 		formatPendingTime(first), formatPendingTime(last), count,
 		formatPendingTime(available), desktopState, webhookState)
 	if err != nil {
 		return Record{}, err
 	}
-	return l.fetchPendingByIdentity(ctx, string(rec.Intent.Category), rec.Intent.EventKind, rec.Intent.AggregateKey, string(rec.Intent.Phase), window)
+	if err := tx.Commit(); err != nil {
+		return Record{}, err
+	}
+	return l.fetchPendingByIdentity(ctx, category, rec.Intent.EventKind, rec.Intent.AggregateKey, phase, formatPendingTime(window))
+}
+
+// latestPendingGeneration returns the newest generation row for a digest
+// identity. Generations are dense from the identity window in 1ns steps and
+// rows are never deleted, so the first missing window ends the scan.
+func latestPendingGeneration(ctx context.Context, tx *sql.Tx, category, eventKind, aggregate, phase string, identity time.Time) (store.NotificationRecord, time.Time, bool, error) {
+	var latest store.NotificationRecord
+	var latestWindow time.Time
+	found := false
+	for offset := time.Duration(0); ; offset++ {
+		window := identity.Add(offset)
+		row := tx.QueryRowContext(ctx, `SELECT id,category,event_kind,aggregate_key,phase,window_start,job_id,batch_id,scan_id,payload_json,first_at,last_at,available_at,count,desktop_state,webhook_state,desktop_reserved_at,desktop_attempted_at,webhook_attempted_at,desktop_sent_count,desktop_sent_payload_json FROM notification_intents WHERE category=? AND event_kind=? AND aggregate_key=? AND phase=? AND window_start=?`,
+			category, eventKind, aggregate, phase, formatPendingTime(window))
+		rec, err := scanPendingRow(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return latest, latestWindow, found, nil
+		}
+		if err != nil {
+			return store.NotificationRecord{}, time.Time{}, false, err
+		}
+		latest, latestWindow, found = rec, window, true
+	}
 }
 
 func nullIfEmpty(value string) any {

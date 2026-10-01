@@ -1573,6 +1573,65 @@ func TestStorePendingDigestRetryKeepsAbsoluteTotal(t *testing.T) {
 	}
 }
 
+// Reminder growth after the webhook leg claimed its snapshot must queue a new
+// webhook generation with its own delivery key, never rewrite the claimed row,
+// and leave exactly one desktop digest carrying the grown total.
+func TestStorePendingDigestGrowthAfterWebhookClaimOpensNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := NewStoreLedger(db)
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	reminder := func(count int, at time.Time) Record {
+		return Record{Intent: Intent{EventKind: "action.reminder", Category: CategoryDecisionPending, AggregateKey: "actions:pending",
+			Phase: PhaseReminder, WindowStart: now, HappenedAt: at, Message: "reminder",
+			Detail: Event{Kind: "action.reminder", Message: "reminder", Count: count}},
+			FirstAt: at, LastAt: at, AvailableAt: now.Add(time.Minute), Count: count, DesktopState: "pending", WebhookState: "pending"}
+	}
+	first, err := ledger.UpsertPendingDigest(ctx, reminder(2, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	if err := ledger.SetWebhookState(ctx, first.ID, "attempted", now); err != nil {
+		t.Fatal(err)
+	}
+	grown, err := ledger.UpsertPendingDigest(ctx, reminder(3, now.Add(time.Second)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grown.ID == first.ID || grown.WebhookState != "pending" || grown.Count != 3 {
+		t.Fatalf("grown digest = id %d webhook %q count %d, want a new pending generation with count 3 (claimed id %d)",
+			grown.ID, grown.WebhookState, grown.Count, first.ID)
+	}
+	claimedRow, err := ledger.GetByID(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimedRow.Count != 2 {
+		t.Fatalf("claimed snapshot count = %d, want immutable 2", claimedRow.Count)
+	}
+	again, err := ledger.UpsertPendingDigest(ctx, reminder(3, now.Add(2*time.Second)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != grown.ID {
+		t.Fatalf("identical total opened generation %d, want it to stay on %d", again.ID, grown.ID)
+	}
+	rows, err := ledger.DueDesktop(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Count != 3 {
+		t.Fatalf("due desktop digests = %+v, want one row with count 3", rows)
+	}
+}
+
 // A Route that lands after the winner's webhook claim must not rewrite the
 // claimed snapshot and must not be lost: the fake ledger mirrors the store
 // redirect below by queueing the late event as a fresh generation row with
