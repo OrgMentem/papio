@@ -207,10 +207,16 @@ func recordProfileEvidenceTx(ctx context.Context, q dbtx, observation *ProfileEv
 	return nil
 }
 
-// CurrentProfileEvidence projects the newest non-expired decisive observation
-// for the exact holder/profile fence. Unknown and inconclusive observations
-// are retained but never replace a decisive projection; when no decisive fact
-// exists, the newest non-decisive fact is returned so callers can fail closed.
+// CurrentProfileEvidence projects the current non-expired decisive observation
+// for the exact holder/profile fence. Among decisive facts, an explicit
+// sign-in transition (auth_returned or signed_out) outranks a warm_verified
+// probe regardless of receipt order, and receipt time decides only within a
+// rank: a later passive warm probe never revokes a signed_out wall, and never
+// displaces the auth_returned that ConvertAuthenticationEntryLeaseToHuman
+// requires. The authentication-lease revocation check orders the same way.
+// Unknown and inconclusive observations are retained but never replace a
+// decisive projection; when no decisive fact exists, the newest non-decisive
+// fact is returned so callers can fail closed.
 func (js *Store) CurrentProfileEvidence(ctx context.Context, profileID string, profileRevision, holderGeneration int64) (ProfileEvidenceObservation, bool, error) {
 	if profileID == "" || profileRevision < 1 || holderGeneration < 0 {
 		return ProfileEvidenceObservation{}, false, errors.New("current profile evidence requires exact fence")
