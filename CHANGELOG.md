@@ -616,6 +616,9 @@ execution records kept during the initial build.
 - `papio grabs suggest --json` now includes the outcome, detail, and the
   identifiers the PDF states about itself. `papio grabs confirm` exits nonzero
   when the capture was not filed.
+- `papio stats producers` no longer labels a browser download as a manual PDF
+  grab when the job was first filed from a grab whose file was not the one
+  accepted.
 
 ### Security
 - A notification webhook (`notify.webhook_url` or a webhook credential record)
