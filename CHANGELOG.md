@@ -619,6 +619,11 @@ execution records kept during the initial build.
 - `papio stats producers` no longer labels a browser download as a manual PDF
   grab when the job was first filed from a grab whose file was not the one
   accepted.
+- Webhook receivers now get a new decision-pending reminder when the pending
+  total grows after the first reminder was posted in the same window. The
+  desktop still shows the digest once, with the larger total.
+- Reinstalling the native messaging host replaces its symlink atomically. A
+  failed reinstall no longer leaves browsers without a host binary.
 
 ### Security
 - A notification webhook (`notify.webhook_url` or a webhook credential record)
