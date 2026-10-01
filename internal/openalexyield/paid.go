@@ -67,8 +67,21 @@ func searchShape(label string, perPage int) shape {
 // currently marked deprecated by OpenAlex but still live.
 func titleSearchShape(title string) url.Values {
 	v := url.Values{}
-	v.Set("filter", "title.search:"+title)
+	v.Set("filter", "title.search:"+filterText(title))
 	return v
+}
+
+// filterText neutralizes OpenAlex filter grammar in a free-text value: ','
+// separates filters and '|' ORs values, so both become spaces. It mirrors
+// internal/enrich's openAlexFilterText; this measurement package stays
+// independent of enrich rather than importing its internals.
+func filterText(text string) string {
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if r == ',' || r == '|' {
+			return ' '
+		}
+		return r
+	}, text)), " ")
 }
 
 // AllShapes are the three shapes compared, in the order item 0 lists them:

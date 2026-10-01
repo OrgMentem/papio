@@ -200,3 +200,10 @@ func TestSampleTitlesRejectsNonPositiveN(t *testing.T) {
 		t.Error("n=0: err = nil, want error")
 	}
 }
+
+func TestTitleSearchShapeNeutralizesFilterGrammar(t *testing.T) {
+	got := titleSearchShape("Cats, dogs | birds: a survey").Get("filter")
+	if want := "title.search:Cats dogs birds: a survey"; got != want {
+		t.Fatalf("filter = %q, want %q", got, want)
+	}
+}
