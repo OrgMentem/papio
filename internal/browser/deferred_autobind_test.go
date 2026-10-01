@@ -353,6 +353,38 @@ func TestSweepGrabsRestagesCommittedBindQuarantineCopy(t *testing.T) {
 	}
 }
 
+// A crash after staging but before ingestion (or before any deferred event is
+// recorded) strands the grab when the staged copy is reused: the job directory
+// holds the matching staged file plus one unrelated file, so the single-file
+// adoption scan rejects the directory as ambiguous and the filename-keyed
+// deferred recovery has no event naming the file. The sweep must ingest the
+// reused staged copy rather than treating it as proof another path owns it.
+func TestSweepGrabsIngestsReusedStagedCopyBesideUnrelatedFile(t *testing.T) {
+	b, jobs, cfg, _ := newBridge(t)
+	ctx := context.Background()
+	id := parkManualDownload(t, jobs, "wr_restage_reused",
+		deferredWork("10.1234/restage.reused.1", "Committed Bind Crashed After Staging"))
+	quarantine := filepath.Join(cfg.DataDir, "quarantine", "grab-reused", "grab.pdf")
+	writeFixturePDF(t, quarantine)
+	bindGrab(t, b, id, "Restage Reused", quarantine)
+
+	// The crashed attempt's staged copy plus one unrelated file: the scan
+	// sees an ambiguous directory, and no deferred event names either file.
+	jobDir := filepath.Join(cfg.EffectiveAdoptionRoot(), id)
+	writeFixturePDF(t, filepath.Join(jobDir, "paper.pdf"))
+	if err := os.WriteFile(filepath.Join(jobDir, "notes.txt"), []byte("operator notes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.SweepGrabs(ctx); err != nil {
+		t.Fatalf("SweepGrabs: %v", err)
+	}
+	requireRecovered(t, jobs, id)
+	if n := countDeferredAdoptions(t, jobs, id); n != 0 {
+		t.Fatalf("recovery recorded %d deferred adoptions, want 0", n)
+	}
+}
+
 // createGrabJob copies into the job's adoption directory before its terminal
 // CAS. A crash between the two leaves the grab quarantined with a copy
 // already staged; the retried bind must reuse that copy, not stage an

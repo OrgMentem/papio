@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1619,6 +1621,74 @@ func TestOutstandingMaterializationOffersSpendTheTransportBudget(t *testing.T) {
 	}
 }
 
+// TestFullOfferBudgetStillRefreshesInFlightCandidateOffers pins the other side
+// of that shared budget: the offers that fill it must still be serviced. Four
+// automatic candidate offers whose claims expired before binding come back
+// eligible while still counted in flight. Refusing to re-admit them for want of
+// budget left nothing able to refresh or retire them, and with the budget full
+// no other offer could ever be admitted either.
+func TestFullOfferBudgetStillRefreshesInFlightCandidateOffers(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	runSync(t, b, authClaimHello(t))
+	seedAuthenticationClaimProfile(t, jobs, "offer-budget-refresh")
+	var scheduled []job.BrowserCandidateDescriptor
+	b.scheduleEligibleCandidates = func(context.Context, int, job.CandidateScheduleCursor) (job.CandidateSchedulePage, error) {
+		return job.CandidateSchedulePage{Candidates: scheduled}, nil
+	}
+	automatic := func(name string) job.BrowserCandidateDescriptor {
+		jobID := park(t, jobs, name, handoffWork())
+		return schedulerDescriptor(t, jobs, explicitMaterializationCandidate(t, jobs, jobID, "domain-"+name), "eligible")
+	}
+	offers := func(msgs []*protocol.BrowserMessage) map[string]*protocol.InstitutionalCandidateOfferPayload {
+		byJob := map[string]*protocol.InstitutionalCandidateOfferPayload{}
+		for _, m := range msgs {
+			if m.Type == protocol.MsgInstitutionalCandidateOffer {
+				byJob[m.JobID] = m.Payload.(*protocol.InstitutionalCandidateOfferPayload)
+			}
+		}
+		return byJob
+	}
+
+	// Fill the budget over two polls: each poll admits at most half of it,
+	// and a claimed candidate leaves the scheduler's eligible page.
+	var filling []job.BrowserCandidateDescriptor
+	first := map[string]*protocol.InstitutionalCandidateOfferPayload{}
+	for round := range 2 {
+		scheduled = []job.BrowserCandidateDescriptor{
+			automatic(fmt.Sprintf("offer-refresh-%d-0", round)),
+			automatic(fmt.Sprintf("offer-refresh-%d-1", round)),
+		}
+		filling = append(filling, scheduled...)
+		msgs, _ := runSync(t, b)
+		maps.Copy(first, offers(msgs))
+	}
+	if len(first) != maxOutstandingOffers {
+		t.Fatalf("filling polls offered %d candidates, want %d to fill the budget", len(first), maxOutstandingOffers)
+	}
+
+	// Every claim expired before binding: the candidates are eligible again
+	// and the offers sent for them have expired. A new candidate competes.
+	future := b.now().Add(b.actionExpiry() + time.Second)
+	b.now = func() time.Time { return future }
+	newcomer := automatic("offer-refresh-newcomer")
+	scheduled = append(slices.Clone(filling), newcomer)
+	msgs, _ := runSync(t, b)
+	refreshed := offers(msgs)
+	for _, descriptor := range filling {
+		offer := refreshed[descriptor.JobID]
+		if offer == nil {
+			t.Fatalf("in-flight candidate %s was not re-offered once its claim expired with the budget full: %v", descriptor.JobID, msgs)
+		}
+		if offer.CandidateID != descriptor.CandidateID || offer.ExpiresAt == first[descriptor.JobID].ExpiresAt {
+			t.Fatalf("re-offer of %s = candidate %s expiring %s, want candidate %s with a refreshed expiry (was %s)",
+				descriptor.JobID, offer.CandidateID, offer.ExpiresAt, descriptor.CandidateID, first[descriptor.JobID].ExpiresAt)
+		}
+	}
+	if refreshed[newcomer.JobID] != nil || firstOfType(msgs, protocol.MsgJobOffer) != nil {
+		t.Fatalf("a full budget admitted a new offer on top of %d in flight: %v", maxOutstandingOffers, msgs)
+	}
+}
+
 // The claim-paced gate parks a candidate whose institution slot belongs to
 // another job, and that park must reach the scheduler. It did not: the legacy
 // loop picked the candidate up and offered it anyway, so the paper claimed,
@@ -1848,7 +1918,7 @@ func TestSlotArbitrationRunsWithNoOfferBudget(t *testing.T) {
 	// may have set either.
 	delete(b.focusPending, waiting)
 	delete(b.offered, waiting)
-	admitted, _ := b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, 0)
+	admitted, _ := b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, nil, 0)
 	b.mu.Unlock()
 	if len(admitted) != 0 {
 		t.Fatalf("a spent offer budget must admit nobody, got %v", admitted)
@@ -2286,7 +2356,7 @@ func TestAutomaticAdmissionCapsUnauthenticatedCandidates(t *testing.T) {
 			delete(b.focusPending, e.jobID)
 			delete(b.offered, e.jobID)
 		}
-		admitted, _ := b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, limit)
+		admitted, _ := b.admitAutomaticMaterializationCandidates(ctx, scheduled, handoff, nil, limit)
 		return admitted
 	}
 

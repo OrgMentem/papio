@@ -9992,12 +9992,20 @@ func (b *Bridge) beginGrabStaging(grabID string) func() {
 }
 
 // recoverCommittedGrabStaging re-drives committed grab binds whose validated
-// bytes never reached the bound job's adoption directory. attemptAutoBind and
-// ConfirmGrabCandidate commit the bind before staging, so a crash in that
-// window, or a failed mkdir or copy, leaves the only copy at the grab's
-// QuarantinePath with the row already job_created; nothing else reads it.
-// A copy already staged (created false) belongs to SweepAdoptions and the
-// filename-keyed deferred recovery, so only a fresh stage is ingested here.
+// bytes never reached ingestion in the bound job's adoption directory.
+// attemptAutoBind and ConfirmGrabCandidate commit the bind before staging, so
+// a crash in that window, or a failed mkdir or copy, leaves the only copy at
+// the grab's QuarantinePath with the row already job_created; nothing else
+// reads it. A reused copy (created false) is ingested exactly like a fresh
+// stage: the match is by digest, so the bytes are the grab's bytes, and a
+// crash between staging and ingestion strands them the same way a crash
+// before staging does. Treating a reused copy as proof another path owns the
+// file stranded such grabs: the two-file directory fails the single-file
+// adoption scan, and the filename-keyed deferred recovery has no event naming
+// the file. Ingestion itself stays idempotent — bytes that already won the
+// attempt replay through completedAdoption instead of adopting twice — and a
+// failed ingest records its own deferred event, which is what arms the
+// filename-keyed path for the next tick.
 func (b *Bridge) recoverCommittedGrabStaging(ctx context.Context) {
 	if b.grabs == nil || b.jobs == nil {
 		return
@@ -10018,12 +10026,9 @@ func (b *Bridge) recoverCommittedGrabStaging(ctx context.Context) {
 			continue
 		}
 		jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), g.JobID)
-		name, created, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filepath.Base(g.QuarantinePath))
+		name, _, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filepath.Base(g.QuarantinePath))
 		if err != nil {
 			log.Printf("papio: re-staging pdf grab %s for job %s: %v", g.ID, g.JobID, err)
-			continue
-		}
-		if !created {
 			continue
 		}
 		if _, err := b.ingestAdoptedFile(ctx, g.JobID, name, nil, nil); err != nil {
@@ -11171,7 +11176,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 				automaticCandidates = append(automaticCandidates, candidate)
 			}
 		}
-		automaticAdmitted, automaticParked = b.admitAutomaticMaterializationCandidates(ctx, automaticCandidates, handoff, automaticCap)
+		automaticAdmitted, automaticParked = b.admitAutomaticMaterializationCandidates(ctx, automaticCandidates, handoff, inFlight, automaticCap)
 		for id := range automaticAdmitted {
 			// A re-offer of a candidate already in flight was counted above.
 			if !inFlight[id] {
@@ -12121,8 +12126,14 @@ func (b *Bridge) claimBoundAutomaticMaterializationEnabled() bool {
 // drives for the same job and could retain the old tab while also creating
 // the institutional scaffold.
 //
-// limit bounds total admissions to the remaining maxOutstandingOffers
-// budget shared with legacy/direct-route offers. The caller holds b.mu.
+// limit bounds NEW admissions to the remaining maxOutstandingOffers budget
+// shared with legacy/direct-route offers. A descriptor whose job is already in
+// inFlight holds its slot from an earlier poll, so admitting it again spends
+// nothing and is never refused for want of budget. That re-admission is the
+// only route to serviceMaterializationCandidate, which refreshes and expires
+// the offer: refusing it once the budget filled left four expired-claim offers
+// counted forever with nothing able to retire them, blocking every automatic
+// and legacy admission behind them. The caller holds b.mu.
 // It returns both the candidates it admitted and the ones it deliberately
 // PARKED because their institution's sign-in slot is held by another job. The
 // parked set is load-bearing: without it the legacy loop below picks the
@@ -12136,7 +12147,7 @@ func (b *Bridge) claimBoundAutomaticMaterializationEnabled() bool {
 // is free"; it did not, because the park never reached the scheduler.
 func (b *Bridge) admitAutomaticMaterializationCandidates(
 	ctx context.Context, scheduled []job.BrowserCandidateDescriptor,
-	handoff map[string]job.HumanAction, limit int,
+	handoff map[string]job.HumanAction, inFlight map[string]bool, limit int,
 ) (map[string]bool, map[string]bool) {
 	admitted := map[string]bool{}
 	parked := map[string]bool{}
@@ -12157,8 +12168,15 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 	// Never reserve a slot this poll cannot also offer - that would mint the
 	// very phantom this function exists to retire.
 	claimSlotUsed := map[string]bool{}
+	fresh := 0
+	admit := func(jobID string) {
+		if !admitted[jobID] && !inFlight[jobID] {
+			fresh++
+		}
+		admitted[jobID] = true
+	}
 	for _, descriptor := range scheduled {
-		canAdmit := len(admitted) < limit
+		canAdmit := inFlight[descriptor.JobID] || fresh < limit
 		if descriptor.JobID == "" || b.focusPending[descriptor.JobID] || b.offered[descriptor.JobID] {
 			continue
 		}
@@ -12173,7 +12191,7 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 			if !canAdmit {
 				continue
 			}
-			admitted[descriptor.JobID] = true
+			admit(descriptor.JobID)
 			continue
 		}
 		profile, err := b.jobs.GetInstitutionProfile(ctx, descriptor.InstitutionProfileID)
@@ -12265,7 +12283,7 @@ func (b *Bridge) admitAutomaticMaterializationCandidates(
 		if !canAdmit {
 			continue
 		}
-		admitted[descriptor.JobID] = true
+		admit(descriptor.JobID)
 	}
 	return admitted, parked
 }
