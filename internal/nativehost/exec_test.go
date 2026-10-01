@@ -114,6 +114,29 @@ func TestExecInstallOverwritesExistingSymlink(t *testing.T) {
 	}
 }
 
+// TestExecInstallFailureKeepsPreviousHost pins that a failed reinstall never
+// leaves browsers without a host: the old link survives a failed link step.
+func TestExecInstallFailureKeepsPreviousHost(t *testing.T) {
+	execTestDir(t)
+	oldTarget := fakeExe(t, "papio-old")
+	if _, err := InstallExecutable(oldTarget); err != nil {
+		t.Fatalf("first InstallExecutable: %v", err)
+	}
+	t.Cleanup(func() { symlink = os.Symlink })
+	symlink = func(string, string) error { return os.ErrPermission }
+
+	if _, err := InstallExecutable(fakeExe(t, "papio-new")); err == nil {
+		t.Fatal("InstallExecutable with failing symlink succeeded")
+	}
+	got, err := os.Readlink(ExecPath())
+	if err != nil {
+		t.Fatalf("previous host link lost after failed reinstall: %v", err)
+	}
+	if got != oldTarget {
+		t.Fatalf("host link = %q, want previous %q", got, oldTarget)
+	}
+}
+
 // TestExecInstallOverwritesDanglingSymlink covers the recorded incident: a host
 // symlink left pointing at a vanished versioned brew path must be replaced, not
 // treated as already installed.

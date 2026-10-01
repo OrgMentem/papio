@@ -20,18 +20,28 @@ func ExecPath() string {
 	return filepath.Join(config.Dir(), "bin", ExecName)
 }
 
+// symlink is os.Symlink, swappable so tests can fail the link step.
+var symlink = os.Symlink
+
 // InstallExecutable points the fixed-name host executable at realExe and returns
 // the path browsers should launch. On Unix this is a symlink into config/bin, so
-// it always tracks the current binary without a copy to refresh.
+// it always tracks the current binary without a copy to refresh. The new link is
+// built beside the old one and renamed over it, so a failed install leaves the
+// previous host in place instead of no host at all.
 func InstallExecutable(realExe string) (string, error) {
 	path := ExecPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	tmp := path + ".tmp"
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if err := os.Symlink(realExe, path); err != nil {
+	if err := symlink(realExe, tmp); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return "", err
 	}
 	return path, nil
