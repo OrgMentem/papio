@@ -270,9 +270,10 @@ func TestDeliveryActionConfirmRequestExistsMovesJobToRetryWait(t *testing.T) {
 }
 
 // A provider_reference names the transaction confirm_request_exists records,
-// so on any other operation it is refused, present-but-empty included, rather
-// than silently dropped while the operation runs on different input than the
-// caller sent.
+// so on any other operation it is refused, present-but-empty or null
+// included, rather than silently dropped while the operation runs on
+// different input than the caller sent. The params decoder matches field
+// names case-insensitively, so any spelling it would accept is refused too.
 func TestDeliveryActionRefusesProviderReferenceOutsideConfirmExists(t *testing.T) {
 	system := deliveryTestSystem(t)
 	router := Router(system)
@@ -289,6 +290,9 @@ func TestDeliveryActionRefusesProviderReferenceOutsideConfirmExists(t *testing.T
 		{"job_id": jobID, "operation": "confirm_request_absent", "provider_reference": "TN-42"},
 		{"job_id": jobID, "operation": "confirm_request_absent", "provider_reference": ""},
 		{"job_id": jobID, "operation": "open_request_history", "provider_reference": "TN-42"},
+		{"job_id": jobID, "operation": "confirm_request_absent", "provider_reference": nil},
+		{"job_id": jobID, "operation": "confirm_request_absent", "PROVIDER_REFERENCE": "TN-42"},
+		{"job_id": jobID, "operation": "open_request_history", "Provider_Reference": ""},
 	} {
 		if rpcErr := callMethod(t, router, "delivery.action", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
 			t.Fatalf("delivery.action %v = %#v, want invalid_argument", params, rpcErr)

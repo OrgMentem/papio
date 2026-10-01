@@ -67,6 +67,50 @@ func TestJobsRetryReleasesTheCaptureLeaseBeforeTheJobTurnsActive(t *testing.T) {
 	}
 }
 
+// A refused retry commits nothing, so its pre-release must not touch the
+// capture lease: the reviewed sequence reads a job whose capture is live,
+// parks it awaiting_human with the same job ID, and only then has Retry
+// refuse the state, which would drop the parked lease's evidence protection.
+func TestJobsRetryRefusedOnNonRetryableStatePreservesTheCaptureLease(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	ctx := context.Background()
+	var submitted SubmitResult
+	if rpcErr := callMethod(t, router, "acquire.submit", protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_retry_refused_lease",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/retry-refused-lease"},
+	}, &submitted); rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	jobID := submitted.JobID
+	if err := system.Jobs.Transition(ctx, jobID, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.Captures.StoreSanitizedPinned(ctx, jobID, "provider.example", "drift", "provider", "1",
+		[]byte("<!-- papio-fixture provider=\"provider\" scenario=\"drift\" origin=\"https://provider.example/\" captured=\"2026-08-10T00:00:00Z\" -->\nretry-refused")); err != nil {
+		t.Fatal(err)
+	}
+	if rpcErr := callMethod(t, router, "jobs.retry", map[string]string{"job_id": jobID}, nil); rpcErr == nil || rpcErr.Code != "conflict" {
+		t.Fatalf("jobs.retry on a resolving job = %#v, want a conflict refusal", rpcErr)
+	}
+	pending, err := system.Captures.PendingJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := false
+	for _, id := range pending {
+		if id == jobID {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Fatalf("pending capture leases = %v after the refused retry, want the lease for %q still listed", pending, jobID)
+	}
+	if row, err := system.Jobs.Get(ctx, jobID); err != nil || row.State != job.StateResolving {
+		t.Fatalf("job after the refused retry = %+v, %v; want still resolving", row, err)
+	}
+}
+
 // Cancel and review resolution commit before the capture lease is released,
 // and neither can be repeated to reach the release again, so a release
 // failure must not turn the committed change into an RPC failure.

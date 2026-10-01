@@ -343,12 +343,18 @@ func deliveryAction(ctx context.Context, raw json.RawMessage, system *bootstrap.
 		return badParams(err)
 	}
 	if params.Operation != deliveryOpConfirmRequestExists {
-		// Presence, not value: an explicit "" is refused too, the same rule
-		// the browser seam's delivery_reconcile_request decoder applies.
+		// Presence, not value: an explicit "" or null is refused too, the
+		// same rule the browser seam's delivery_reconcile_request decoder
+		// applies. The params decoder (encoding/json) matches field names
+		// case-insensitively, so the check must too: an uppercase
+		// PROVIDER_REFERENCE would otherwise fill the field, pass a
+		// literal-key guard, and run on different input than the caller sent.
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &fields); err == nil {
-			if _, present := fields["provider_reference"]; present {
-				return badParams(fmt.Errorf("provider_reference is only valid for %s", deliveryOpConfirmRequestExists))
+			for key := range fields {
+				if strings.EqualFold(key, "provider_reference") {
+					return badParams(fmt.Errorf("provider_reference is only valid for %s", deliveryOpConfirmRequestExists))
+				}
 			}
 		}
 	}

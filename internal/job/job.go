@@ -1662,6 +1662,19 @@ func (js *Store) Cancel(ctx context.Context, jobID string, reason TerminalReason
 	}
 }
 
+// CheckRetryable reports whether a job in the given state may be retried: the
+// same rule Retry enforces inside its transaction, exposed so callers that
+// act before the retry (such as capture-lease cleanup) can refuse the same
+// states Retry itself would refuse, instead of acting on a wider set.
+func CheckRetryable(state string) error {
+	switch state {
+	case StateRetryWait, StateFailed, StateUnavailable:
+		return nil
+	default:
+		return fmt.Errorf("%w: %s cannot be retried", ErrConflict, state)
+	}
+}
+
 // Retry explicitly reopens a retry-wait, failed, or unavailable job at the
 // durable resolving boundary. Ready, cancelled, active, and human-parked jobs
 // require their dedicated command instead of silently changing meaning.
@@ -1675,10 +1688,8 @@ func (js *Store) Retry(ctx context.Context, jobID string) error {
 	if err := tx.QueryRowContext(ctx, `SELECT state FROM jobs WHERE id = ?`, jobID).Scan(&from); err != nil {
 		return err
 	}
-	switch from {
-	case StateRetryWait, StateFailed, StateUnavailable:
-	default:
-		return fmt.Errorf("%w: %s cannot be retried", ErrConflict, from)
+	if err := CheckRetryable(from); err != nil {
+		return err
 	}
 	now := store.Now()
 	result, err := tx.ExecContext(ctx,

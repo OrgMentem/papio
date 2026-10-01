@@ -1505,20 +1505,22 @@ func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	// Release the capture lease BEFORE the job becomes active again: once
 	// Retry commits, a new attempt can pin its own captures under the same
-	// job, and a late release would drop them. A lease is live only while its
-	// job awaits a human (the bridge's lease sweep applies the same rule),
-	// and Retry refuses that state, so a refused retry never costs a live
-	// lease. A release failure here leaves nothing committed and the retry
-	// can simply be repeated.
+	// job, and a late release would drop them. A refused retry commits
+	// nothing, so the same retryability rule Retry enforces gates the
+	// release: a job Retry would refuse keeps its lease even when it has no
+	// stale lease to drop (for example a job parked awaiting_human with a
+	// pinned capture after this read). A release failure here leaves nothing
+	// committed and the retry can simply be repeated.
 	if system.Captures != nil {
 		row, err := system.Jobs.Get(ctx, params.JobID)
 		if err != nil {
 			return failure(err)
 		}
-		if row.State != job.StateAwaitingHuman {
-			if err := system.Captures.ReleaseJob(ctx, params.JobID); err != nil {
-				return failure(err)
-			}
+		if err := job.CheckRetryable(row.State); err != nil {
+			return failure(err)
+		}
+		if err := system.Captures.ReleaseJob(ctx, params.JobID); err != nil {
+			return failure(err)
 		}
 	}
 	if err := system.Jobs.Retry(ctx, params.JobID); err != nil {
