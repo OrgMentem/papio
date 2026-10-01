@@ -124,6 +124,25 @@ test("URL-bearing meta content loses its query whatever names the meta", () => {
   );
 });
 
+test("a URL-named meta loses the query of a bare relative URL", () => {
+  const out = sanitizeFixture(
+    `<meta name="citation_pdf_url" content="download.pdf?token=abcd1234">` +
+      `<meta property="og:image" content="cover.png#sig=wxyz9876">` +
+      `<meta name="citation_title" content="Rates? Yes">`,
+    META,
+  );
+  expect(out).toContain(`name="citation_pdf_url" content="download.pdf"`);
+  expect(out).toContain(`property="og:image" content="cover.png"`);
+  // A meta whose label names no URL keeps its text: "?" there is prose.
+  expect(out).toContain(`name="citation_title" content="Rates? Yes"`);
+  expect(out).not.toContain("abcd1234");
+  expect(out).not.toContain("wxyz9876");
+  expect(residualLeak(out)).toBeNull();
+  expect(residualLeak(`<meta name="citation_pdf_url" content="download.pdf?token=abcd1234">`)).toContain(
+    "query string",
+  );
+});
+
 test("input values and value attributes are blanked", () => {
   const out = sanitizeFixture(
     `<input type="password" name="pw" value="hunter2" autocomplete="current-password">`,

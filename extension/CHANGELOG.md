@@ -179,8 +179,9 @@ for the full pre-split extension history.
   window that is still loading is closed when a new toast replaces it.
 - Diagnostic page captures now remove query strings from links printed in page
   text or plain attributes, from any URL-valued `<meta>` (including
-  `og:url`/`og:image`), and from `<meta http-equiv="refresh">` targets, and
-  the privacy check refuses a capture where one survives.
+  `og:url`/`og:image` and a relative `citation_pdf_url` such as
+  `download.pdf?…`), and from `<meta http-equiv="refresh">` targets, and the
+  privacy check refuses a capture where one survives.
 
 ## [0.15.0] - 2026-09-23
 

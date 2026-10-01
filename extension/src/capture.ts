@@ -288,10 +288,23 @@ function hasTokenContent(attrs: ParsedAttr[]): boolean {
 /** Meta content that is itself a URL (`citation_pdf_url`, `og:url`,
  * `og:image`, …) is selector evidence, but its path/query can carry record or
  * session identifiers and must be scrubbed like href/src, whichever of
- * `name`/`property`/`itemprop` labels it. */
+ * `name`/`property`/`itemprop` labels it. A meta is URL-valued when its content
+ * is shaped like an absolute or root-relative URL, or when its label names a
+ * URL — the planner resolves a bare relative `citation_pdf_url` against the
+ * page, so `download.pdf?token=…` is a URL too. */
+const URL_META_LABEL_RE = /(?:^|[_:.-])(?:url|image|video|audio)$/;
+
 function urlMeta(attrs: ParsedAttr[]): boolean {
   const content = attrs.find((a) => a.name.toLowerCase() === "content")?.value;
-  return content !== undefined && /^(?:https?:\/\/|\/)/i.test(content);
+  if (content === undefined) return false;
+  if (/^(?:https?:\/\/|\/)/i.test(content)) return true;
+  return attrs.some((a) => {
+    const lname = a.name.toLowerCase();
+    return (
+      (lname === "name" || lname === "property" || lname === "itemprop") &&
+      URL_META_LABEL_RE.test(a.value.trim().toLowerCase())
+    );
+  });
 }
 
 /** Rewrite a single start tag: strip URL query/fragment, blank form values,
