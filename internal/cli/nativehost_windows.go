@@ -96,19 +96,20 @@ func registerManifest(t browserTarget, manifestPath string) error {
 }
 
 // deregisterManifest removes the browser's native-messaging registry key,
-// treating an already-absent key as success.
-func deregisterManifest(t browserTarget) error {
+// treating an already-absent key as success. It reports whether it removed a
+// key, so callers only claim a removal that happened.
+func deregisterManifest(t browserTarget) (bool, error) {
 	keyPath := manifestRegistryPath(t.id)
 	if keyPath == "" {
-		return nil
+		return false, nil
 	}
 	if err := registry.DeleteKey(registry.CURRENT_USER, keyPath); err != nil {
 		if errors.Is(err, registry.ErrNotExist) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("delete native-host registry key: %w", err)
+		return false, fmt.Errorf("delete native-host registry key: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // manifestRegistryPath maps a browser id to its HKCU native-messaging key.

@@ -130,3 +130,30 @@ func TestGrabsBindsNamesTheNextPageAndFallsBackOnOlderDaemons(t *testing.T) {
 		t.Fatalf("--before on an older daemon = %v, want the upgrade-required error", err)
 	}
 }
+
+// A truncated legacy page has no cursor to continue from: printing a
+// next-page command would point at a --before the same daemon rejects, so the
+// command must print the upgrade requirement instead.
+func TestGrabsBindsTruncatedLegacyPageRequiresUpgrade(t *testing.T) {
+	page := grabsBindsResult{Binds: []api.GrabBindRow{
+		{GrabID: "grab_0000000000000000000000newest", JobID: "job-1"},
+		{GrabID: "grab_0000000000000000000000oldest", JobID: "job-2"},
+	}, Truncated: true}
+	oldDaemon := func(_ context.Context, method string, _ any, result any) error {
+		if method == "grabs.binds_v2" {
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		}
+		*result.(*grabsBindsResult) = page
+		return nil
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, oldDaemon)
+	root.SetArgs([]string{"grabs", "binds"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "grabs.binds_v2") {
+		t.Fatalf("truncated legacy page err = %v, want the upgrade-required error", err)
+	}
+	if strings.Contains(out.String(), "next page") {
+		t.Fatalf("truncated legacy page stdout = %q, want no next-page command", out.String())
+	}
+}

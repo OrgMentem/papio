@@ -114,6 +114,7 @@ func newGrabsBindsCommand(opt *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			before = strings.TrimSpace(before)
 			var result grabsBindsResult
+			legacy := false
 			err := opt.call(cmd.Context(), "grabs.binds_v2", map[string]any{"limit": limit, "before": before}, &result)
 			if err != nil && isUnknownMethod(err) {
 				// An older daemon has no cursor: its first page is still an
@@ -121,6 +122,7 @@ func newGrabsBindsCommand(opt *options) *cobra.Command {
 				if before != "" {
 					return daemonUpgradeRequired("grabs.binds_v2")
 				}
+				legacy = true
 				err = opt.call(cmd.Context(), "grabs.binds", map[string]any{"limit": limit}, &result)
 				if err != nil && isUnknownMethod(err) {
 					return daemonUpgradeRequired("grabs.binds")
@@ -145,6 +147,11 @@ func newGrabsBindsCommand(opt *options) *cobra.Command {
 				}
 			}
 			if result.Truncated && len(result.Binds) > 0 {
+				if legacy {
+					// The legacy page has no cursor, so --before against this
+					// daemon is an upgrade-required error, not a next page.
+					return daemonUpgradeRequired("grabs.binds_v2")
+				}
 				_, err := fmt.Fprintf(opt.out, "… older binds exist; next page: papio grabs binds --before %s\n", result.Binds[len(result.Binds)-1].GrabID)
 				return err
 			}

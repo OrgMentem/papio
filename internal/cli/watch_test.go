@@ -488,6 +488,37 @@ func watchDigestStub(t *testing.T, pending int, mutated *[]string) func(context.
 				entries[i] = watch.DigestEntry{WorkKey: fmt.Sprintf("doi:10.5555/%d", i)}
 			}
 			*result.(*api.WatchDigestResult) = api.WatchDigestResult{WatchID: 7, Entries: entries}
+		case "watch.remove_v2", "watch.remove", "watch.digest_clear":
+			*mutated = append(*mutated, method)
+		default:
+			t.Fatalf("unexpected method %q", method)
+		}
+		return nil
+	}
+}
+
+// watchRemoveV2Stub serves watch.remove_v2 the way the new daemon does:
+// pending entries refuse unless the caller confirms the discard. watch.digest
+// reports `pending` entries; every reached mutation is recorded.
+func watchRemoveV2Stub(t *testing.T, pending int, mutated *[]string) func(context.Context, string, any, any) error {
+	t.Helper()
+	return func(_ context.Context, method string, params any, result any) error {
+		switch method {
+		case "watch.digest":
+			entries := make([]watch.DigestEntry, pending)
+			for i := range entries {
+				entries[i] = watch.DigestEntry{WorkKey: fmt.Sprintf("doi:10.5555/%d", i)}
+			}
+			*result.(*api.WatchDigestResult) = api.WatchDigestResult{WatchID: 7, Entries: entries}
+		case "watch.remove_v2":
+			var discard bool
+			if v2, ok := params.(api.WatchRemoveV2Params); ok {
+				discard = v2.DiscardDigest
+			}
+			if pending > 0 && !discard {
+				return &ipc.RemoteError{Code: "precondition_failed", Message: "watch has pending digest works", Detail: &ipc.ErrorDetail{ErrorClass: api.WatchRemoveDigestPendingClass}}
+			}
+			*mutated = append(*mutated, method)
 		case "watch.remove", "watch.digest_clear":
 			*mutated = append(*mutated, method)
 		default:
@@ -500,7 +531,7 @@ func watchDigestStub(t *testing.T, pending int, mutated *[]string) func(context.
 func TestWatchRemoveRefusesToDeletePendingDigestWorks(t *testing.T) {
 	var mutated []string
 	var out, errOut bytes.Buffer
-	root := NewInProcessRoot(&out, &errOut, config.Config{}, watchDigestStub(t, 3, &mutated))
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, watchRemoveV2Stub(t, 3, &mutated))
 	root.SetArgs([]string{"watch", "remove", "7"})
 	if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "3 pending") || !strings.Contains(err.Error(), "--discard-digest") {
 		t.Fatalf("remove with pending digest = %v, want a refusal naming the count and --discard-digest", err)
@@ -509,19 +540,58 @@ func TestWatchRemoveRefusesToDeletePendingDigestWorks(t *testing.T) {
 		t.Fatalf("refused remove reached %v", mutated)
 	}
 
-	root = NewInProcessRoot(&out, &errOut, config.Config{}, watchDigestStub(t, 3, &mutated))
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, watchRemoveV2Stub(t, 3, &mutated))
 	root.SetArgs([]string{"watch", "remove", "7", "--discard-digest"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("remove --discard-digest: %v", err)
 	}
 	// A watch with nothing pending loses nothing, so it needs no confirmation.
-	root = NewInProcessRoot(&out, &errOut, config.Config{}, watchDigestStub(t, 0, &mutated))
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, watchRemoveV2Stub(t, 0, &mutated))
 	root.SetArgs([]string{"watch", "remove", "7"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("remove with an empty digest: %v", err)
 	}
-	if len(mutated) != 2 || mutated[0] != "watch.remove" || mutated[1] != "watch.remove" {
-		t.Fatalf("mutations = %v, want two removals", mutated)
+	if len(mutated) != 2 || mutated[0] != "watch.remove_v2" || mutated[1] != "watch.remove_v2" {
+		t.Fatalf("mutations = %v, want two atomic removals", mutated)
+	}
+}
+
+// An older daemon answers watch.remove_v2 with unknown_method, and the CLI
+// must fall back to today's two-step guard instead of failing the remove.
+func TestWatchRemoveFallsBackOnOlderDaemons(t *testing.T) {
+	var mutated []string
+	var out, errOut bytes.Buffer
+	oldDaemon := func(_ context.Context, method string, _ any, result any) error {
+		if method == "watch.remove_v2" {
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		}
+		return watchDigestStub(t, 0, &mutated)(context.Background(), method, nil, result)
+	}
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, oldDaemon)
+	root.SetArgs([]string{"watch", "remove", "7"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("remove on an older daemon: %v", err)
+	}
+	if len(mutated) != 1 || mutated[0] != "watch.remove" {
+		t.Fatalf("mutations = %v, want the legacy watch.remove fallback", mutated)
+	}
+
+	// The fallback still guards: pending digest works refuse without
+	// --discard-digest, and nothing is removed.
+	mutated = nil
+	guarded := func(_ context.Context, method string, params any, result any) error {
+		if method == "watch.remove_v2" {
+			return &ipc.RemoteError{Code: "unknown_method", Message: "unknown method"}
+		}
+		return watchDigestStub(t, 2, &mutated)(context.Background(), method, params, result)
+	}
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, guarded)
+	root.SetArgs([]string{"watch", "remove", "7"})
+	if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "2 pending") {
+		t.Fatalf("fallback remove with pending digest = %v, want the pending refusal", err)
+	}
+	if len(mutated) != 0 {
+		t.Fatalf("refused fallback remove reached %v", mutated)
 	}
 }
 

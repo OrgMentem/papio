@@ -111,7 +111,8 @@ func dirExists(path string) bool {
 
 // registerManifest and deregisterManifest are no-ops on Unix: browsers discover
 // the host from the manifest file's location in their NativeMessagingHosts
-// directory, not through a registry.
+// directory, not through a registry. Deregistration therefore never removes a
+// key and reports false, so callers do not claim one.
 func registerManifest(browserTarget, string) error { return nil }
 
-func deregisterManifest(browserTarget) error { return nil }
+func deregisterManifest(browserTarget) (bool, error) { return false, nil }

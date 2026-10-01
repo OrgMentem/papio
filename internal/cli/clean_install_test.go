@@ -39,8 +39,8 @@ func TestMain(m *testing.M) {
 	registerNativeManifest = func(browserTarget, string) error {
 		return errors.New("test must inject native-host registration")
 	}
-	deregisterNativeManifest = func(browserTarget) error {
-		return errors.New("test must inject native-host deregistration")
+	deregisterNativeManifest = func(browserTarget) (bool, error) {
+		return false, errors.New("test must inject native-host deregistration")
 	}
 	os.Exit(m.Run())
 }

@@ -276,27 +276,62 @@ func newWatchRemoveCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if !discardDigest {
-				pending, atLeast, err := watchPendingDigest(cmd, opt, id)
-				if err != nil {
-					return err
-				}
-				if pending > 0 {
-					return fmt.Errorf("watch %d has %s pending digest work(s) that removing it would delete; nothing was removed. Review them with `papio watch digest %d` or `papio export watch %d`, then rerun with --discard-digest", id, watchPendingCount(pending, atLeast), id, id)
-				}
-			}
+			// Prefer the atomic remove: the daemon checks pending digest works
+			// and deletes in one transaction, so an alert run recording between
+			// the CLI's check and the delete cannot lose works. An older
+			// daemon has no such method and falls back to the two-step guard.
 			var result struct {
 				ID      int64 `json:"id"`
 				Removed bool  `json:"removed"`
 			}
-			if err := opt.call(cmd.Context(), "watch.remove", watch.IDInput{ID: id}, &result); err != nil {
-				return err
+			err = opt.call(cmd.Context(), "watch.remove_v2", api.WatchRemoveV2Params{ID: id, DiscardDigest: discardDigest}, &result)
+			if err != nil {
+				if !isUnknownMethod(err) {
+					return watchRemoveError(cmd, opt, id, err)
+				}
+				if !discardDigest {
+					pending, atLeast, err := watchPendingDigest(cmd, opt, id)
+					if err != nil {
+						return err
+					}
+					if pending > 0 {
+						return fmt.Errorf("watch %d has %s pending digest work(s) that removing it would delete; nothing was removed. Review them with `papio watch digest %d` or `papio export watch %d`, then rerun with --discard-digest", id, watchPendingCount(pending, atLeast), id, id)
+					}
+				}
+				if err := opt.call(cmd.Context(), "watch.remove", watch.IDInput{ID: id}, &result); err != nil {
+					return err
+				}
 			}
 			return opt.printResult(result, "Removed watch %d", result.ID)
 		},
 	}
 	command.Flags().BoolVar(&discardDigest, "discard-digest", false, "remove the watch even though pending digest works are deleted with it")
 	return command
+}
+
+// watchRemoveError turns a watch.remove_v2 refusal into the next step the
+// user must take. Other errors pass through unchanged.
+func watchRemoveError(cmd *cobra.Command, opt *options, id int64, err error) error {
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) {
+		return err
+	}
+	class := ""
+	if remote.Detail != nil {
+		class = remote.Detail.ErrorClass
+	}
+	if class != api.WatchRemoveDigestPendingClass {
+		return err
+	}
+	// The daemon counted pending works atomically with the refused delete, so
+	// re-read the digest for the review guidance without a second guard: the
+	// count in the refusal is authoritative, this read only names the remedy.
+	pending, atLeast, derr := watchPendingDigest(cmd, opt, id)
+	count := watchPendingCount(pending, atLeast)
+	if derr != nil || pending == 0 {
+		count = "pending"
+	}
+	return fmt.Errorf("watch %d has %s pending digest work(s) that removing it would delete; nothing was removed. Review them with `papio watch digest %d` or `papio export watch %d`, then rerun with --discard-digest: %w", id, count, id, id, err)
 }
 
 func newWatchResumeCommand(opt *options) *cobra.Command {

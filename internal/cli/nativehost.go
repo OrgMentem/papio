@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -27,9 +26,12 @@ const (
 
 // Keep OS registration separate from manifest publication so fixture installs
 // can exercise the complete file path without changing the user's registry.
+// removeHostExecutable is nativehost.RemoveExecutable, swappable so uninstall
+// tests can fail the executable step without touching the real install.
 var (
 	registerNativeManifest   = registerManifest
 	deregisterNativeManifest = deregisterManifest
+	removeHostExecutable     = nativehost.RemoveExecutable
 )
 
 // browserFamily determines a browser's native-messaging manifest format and how
@@ -192,16 +194,20 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 					removed = append(removed, path)
 					changed = append(changed, t.label+" manifest "+path+" removed")
 				}
-				if err := deregisterNativeManifest(t); err != nil {
+				removedKey, err := deregisterNativeManifest(t)
+				if err != nil {
 					return partialNativeHostError("uninstall", t.label, err, changed)
 				}
-				if runtime.GOOS == "windows" {
+				if removedKey {
 					// Only Windows registers through HKCU; elsewhere the
 					// manifest file is the whole registration.
 					changed = append(changed, t.label+" registry key removed")
 				}
 			}
-			hostRemoved, err := nativehost.RemoveExecutable()
+			hostRemoved, err := removeHostExecutable()
+			for _, path := range hostRemoved {
+				changed = append(changed, "host executable "+path+" removed")
+			}
 			if err != nil {
 				return partialNativeHostError("uninstall", "host executable", err, changed)
 			}

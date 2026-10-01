@@ -1514,6 +1514,54 @@ func (s *Store) Remove(ctx context.Context, id int64) error {
 	return nil
 }
 
+// ErrWatchDigestPending refuses a watch removal that would delete unreviewed
+// digest works. The caller must confirm the discard (or clear the digest)
+// and retry: removal without that confirmation would silently drop works an
+// alert run recorded between the caller's check and the delete.
+var ErrWatchDigestPending = errors.New("watch has pending digest works; rerun with confirmation that those works are discarded too")
+
+// RemoveIfNoPendingDigest deletes a watch only when it holds no pending
+// (unconsumed) digest works, checking and deleting in one transaction so a
+// concurrent alert run cannot record new works in between. When discard is
+// false and pending works exist, the watch stays and the returned error wraps
+// ErrWatchDigestPending with the pending count. When discard is true, pending
+// works are deleted with the watch, exactly as Remove does.
+func (s *Store) RemoveIfNoPendingDigest(ctx context.Context, id int64, discard bool) error {
+	if s == nil || s.S == nil {
+		return errors.New("watch store is not configured")
+	}
+	if id <= 0 {
+		return errors.New("watch id must be positive")
+	}
+	tx, err := s.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting watch remove transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var pending int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM watch_digest_entries WHERE watch_id = ? AND consumed = 0`, id).Scan(&pending); err != nil {
+		return fmt.Errorf("counting pending watch digest: %w", err)
+	}
+	if pending > 0 && !discard {
+		return fmt.Errorf("%w: %d pending digest work(s)", ErrWatchDigestPending, pending)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM watches WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("removing watch: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing watch remove: %w", err)
+	}
+	return nil
+}
+
 // Due returns enabled watches whose previous attempt is at least one cadence
 // old. A newly created watch is immediately due.
 func (s *Store) Due(ctx context.Context, now time.Time) ([]Watch, error) {

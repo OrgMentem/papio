@@ -331,3 +331,60 @@ func TestExportBundleV2ReturnsPopulatedBundleAndWritesFile(t *testing.T) {
 		t.Fatalf("bundle.export returned a body: %+v", v1.Bundle)
 	}
 }
+
+// TestWatchRemoveV2RefusesPendingDigestAtomically covers watch.remove_v2 end
+// to end: the parameter gate, the missing-watch mapping, the structured
+// refusal when pending digest works exist without discard_digest (the watch
+// stays), and removal with discard or an empty digest.
+func TestWatchRemoveV2RefusesPendingDigestAtomically(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	created, err := system.Watches.Create(context.Background(), watch.CreateInput{
+		Query: "remove v2 coverage", CadenceHours: 24, PerRunCap: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, params := range []map[string]any{
+		{},
+		{"id": 0},
+		{"id": -1},
+		{"id": created.ID, "discard_digest": "yes"},
+		{"id": created.ID, "unexpected": true},
+		{"id": "not-a-number"},
+	} {
+		if rpcErr := callMethod(t, router, "watch.remove_v2", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("watch.remove_v2 %v = %#v, want invalid_argument", params, rpcErr)
+		}
+	}
+	var missing WatchRemoveResult
+	if rpcErr := callMethod(t, router, "watch.remove_v2", map[string]any{"id": created.ID + 4242}, &missing); rpcErr == nil || rpcErr.Code != "not_found" {
+		t.Fatalf("watch.remove_v2 missing watch = %#v, want not_found", rpcErr)
+	}
+
+	if _, err := system.Watches.RecordDigest(context.Background(), created.ID, time.Now(), []watch.DigestEntry{
+		{WorkKey: "10.1000/remove-v2-one", Title: "Remove V2 One", DOI: "10.1000/remove-v2-one"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var refused WatchRemoveResult
+	rpcErr := callMethod(t, router, "watch.remove_v2", map[string]any{"id": created.ID}, &refused)
+	if rpcErr == nil || rpcErr.Code != "precondition_failed" {
+		t.Fatalf("watch.remove_v2 with pending digest = %#v, want precondition_failed", rpcErr)
+	}
+	if rpcErr.Detail == nil || rpcErr.Detail.ErrorClass != WatchRemoveDigestPendingClass {
+		t.Fatalf("watch.remove_v2 detail = %#v, want %s class", rpcErr.Detail, WatchRemoveDigestPendingClass)
+	}
+	if _, err := system.Watches.Get(context.Background(), created.ID); err != nil {
+		t.Fatalf("refused remove deleted the watch: %v", err)
+	}
+
+	var removed WatchRemoveResult
+	if rpcErr := callMethod(t, router, "watch.remove_v2", map[string]any{"id": created.ID, "discard_digest": true}, &removed); rpcErr != nil {
+		t.Fatalf("watch.remove_v2 with discard = %#v", rpcErr)
+	}
+	if !removed.Removed || removed.ID != created.ID {
+		t.Fatalf("removed = %+v, want the watch id marked removed", removed)
+	}
+}

@@ -305,6 +305,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"watch.remove": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return removeWatch(ctx, raw, system)
 		},
+		"watch.remove_v2": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return removeWatchV2(ctx, raw, system)
+		},
 		"watch.resume": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return resumeWatch(ctx, raw, system)
 		},

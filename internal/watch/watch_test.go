@@ -278,6 +278,59 @@ func TestStoreCRUD(t *testing.T) {
 	}
 }
 
+// A pending digest entry recorded before the atomic remove must block it
+// without --discard-digest (the watch stays), while discard removes both.
+// This is the store half of the watch-remove race: the check and the delete
+// share one transaction, so works recorded between a CLI-side check and the
+// delete are refused instead of cascade-deleted.
+func TestRemoveIfNoPendingDigestBlocksOnPendingEntries(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	created := createWatch(t, watches, testWatchInput("atomic remove"))
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, created.ID, now, []DigestEntry{{
+		WorkKey: "10.1000/atomic-remove", Title: "Atomic Remove", DOI: "10.1000/atomic-remove",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := watches.RemoveIfNoPendingDigest(ctx, created.ID, false); !errors.Is(err, ErrWatchDigestPending) {
+		t.Fatalf("remove with pending digest = %v, want ErrWatchDigestPending", err)
+	}
+	if _, err := watches.Get(ctx, created.ID); err != nil {
+		t.Fatalf("refused remove deleted the watch: %v", err)
+	}
+	if digest, err := watches.Digest(ctx, created.ID, 100); err != nil || len(digest) != 1 {
+		t.Fatalf("Digest() after refused remove = %+v, %v; want the pending entry", digest, err)
+	}
+	// A watch with nothing pending removes exactly like Remove.
+	cleared, err := watches.ClearDigest(ctx, created.ID)
+	if err != nil || cleared != 1 {
+		t.Fatalf("ClearDigest() = %d, %v; want 1, nil", cleared, err)
+	}
+	if err := watches.RemoveIfNoPendingDigest(ctx, created.ID, false); err != nil {
+		t.Fatalf("remove with empty digest: %v", err)
+	}
+	if _, err := watches.Get(ctx, created.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("get removed watch error = %v, want sql.ErrNoRows", err)
+	}
+	// Discard removes the watch and its pending entries together.
+	discard := createWatch(t, watches, testWatchInput("atomic remove discard"))
+	if _, err := watches.RecordDigest(ctx, discard.ID, now, []DigestEntry{{
+		WorkKey: "10.1000/atomic-discard", Title: "Atomic Discard", DOI: "10.1000/atomic-discard",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := watches.RemoveIfNoPendingDigest(ctx, discard.ID, true); err != nil {
+		t.Fatalf("remove with discard: %v", err)
+	}
+	if _, err := watches.Get(ctx, discard.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("get discarded watch error = %v, want sql.ErrNoRows", err)
+	}
+	if err := watches.RemoveIfNoPendingDigest(ctx, discard.ID+9999, true); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("remove absent watch error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestDueSelectsEnabledExpiredWatches(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)

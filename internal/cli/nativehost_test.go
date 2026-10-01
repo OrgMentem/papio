@@ -64,9 +64,9 @@ func writeTestConfig(t *testing.T, extensionID, firefoxExtensionID string) (stri
 		registration.installed = append(registration.installed, nativeRegistrationCall{target.id, path})
 		return nil
 	}
-	deregisterNativeManifest = func(target browserTarget) error {
+	deregisterNativeManifest = func(target browserTarget) (bool, error) {
 		registration.removed = append(registration.removed, target.id)
-		return nil
+		return true, nil
 	}
 	configDir := config.Dir()
 	cfg := config.Default()
@@ -368,11 +368,11 @@ func TestNativeHostPartialFailureNamesChangedRegistrations(t *testing.T) {
 		}
 	}
 
-	deregisterNativeManifest = func(target browserTarget) error {
+	deregisterNativeManifest = func(target browserTarget) (bool, error) {
 		if target.id == "firefox" {
-			return errors.New("registry delete denied")
+			return false, errors.New("registry delete denied")
 		}
-		return nil
+		return true, nil
 	}
 	_, _, err = runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
 	if err == nil || !strings.Contains(err.Error(), "registry delete denied") {
@@ -382,6 +382,78 @@ func TestNativeHostPartialFailureNamesChangedRegistrations(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("uninstall err = %q, want it to name already removed %q", err, want)
 		}
+	}
+}
+
+// When the host executable step removes one path and then fails on the next
+// (the Windows two-path removal), the partial-failure error must name the
+// executable path already deleted, alongside the manifests removed before it.
+func TestNativeHostUninstallFailureNamesRemovedExecutable(t *testing.T) {
+	extID := strings.Repeat("e", 32)
+	const firefoxID = "papio@orgmentem.com"
+	_, _, _ = writeTestConfig(t, extID, firefoxID)
+	manifestDir := t.TempDir()
+	firefoxManifestDir := t.TempDir()
+	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
+	firefoxManifestPath := filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")
+	for _, path := range []string{manifestPath, firefoxManifestPath} {
+		if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previousRemove := removeHostExecutable
+	t.Cleanup(func() { removeHostExecutable = previousRemove })
+	removeHostExecutable = func() ([]string, error) {
+		return []string{nativehost.ExecPath()}, errors.New("target file locked")
+	}
+	_, _, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
+	if err == nil || !strings.Contains(err.Error(), "target file locked") {
+		t.Fatalf("uninstall err = %v, want the executable failure", err)
+	}
+	for _, want := range []string{
+		manifestPath + " removed",
+		firefoxManifestPath + " removed",
+		"host executable " + nativehost.ExecPath() + " removed",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("uninstall err = %q, want it to name already removed %q", err, want)
+		}
+	}
+}
+
+// A deregistration that removed no key must not be reported as a removal. On
+// Windows an already-absent registry key is success without deletion, so a
+// later browser's failure must not claim that key as removed.
+func TestNativeHostUninstallOmitsUnremovedRegistryKey(t *testing.T) {
+	extID := strings.Repeat("f", 32)
+	const firefoxID = "papio@orgmentem.com"
+	_, _, _ = writeTestConfig(t, extID, firefoxID)
+	manifestDir := t.TempDir()
+	firefoxManifestDir := t.TempDir()
+	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
+	firefoxManifestPath := filepath.Join(firefoxManifestDir, nativeHostManifestName+".json")
+	for _, path := range []string{manifestPath, firefoxManifestPath} {
+		if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deregisterNativeManifest = func(target browserTarget) (bool, error) {
+		if target.id == "firefox" {
+			return false, errors.New("registry delete denied")
+		}
+		// Chrome's key was already absent: success, nothing removed.
+		return false, nil
+	}
+	_, _, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
+	if err == nil || !strings.Contains(err.Error(), "registry delete denied") {
+		t.Fatalf("uninstall err = %v, want the Firefox failure", err)
+	}
+	if !strings.Contains(err.Error(), manifestPath+" removed") {
+		t.Fatalf("uninstall err = %q, want it to name the removed Chrome manifest", err)
+	}
+	if strings.Contains(err.Error(), "registry key removed") {
+		t.Fatalf("uninstall err = %q, claims a registry removal that did not happen", err)
 	}
 }
 

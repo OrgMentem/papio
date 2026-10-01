@@ -113,7 +113,7 @@ var commandClassification = map[string]commandClass{
 	// to reach its --json path.
 	"papio watch digest":               {kind: kindEnvelope, rowKey: "entries", args: []string{"1"}, rpcMethods: []string{"watch.digest"}},
 	"papio watch digest clear":         {kind: kindStructured, rpcMethods: []string{"watch.digest", "watch.digest_clear"}},
-	"papio watch remove":               {kind: kindStructured, rpcMethods: []string{"watch.digest", "watch.remove"}},
+	"papio watch remove":               {kind: kindStructured, rpcMethods: []string{"watch.remove_v2", "watch.digest", "watch.remove"}},
 	"papio watch resume":               {kind: kindStructured, rpcMethods: []string{"watch.resume"}},
 	"papio watch run":                  {kind: kindStructured, rpcMethods: []string{"watch.run"}},
 	"papio export":                     {kind: kindNone},
