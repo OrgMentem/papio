@@ -495,6 +495,31 @@ func TestReconcileTagsPartialFailureReportsCompletedChanges(t *testing.T) {
 	}
 }
 
+// A remote add that succeeded is a completed change even when recording it
+// as owned fails afterwards: the hint must not report "0 added" while the
+// tag is already in Zotero.
+func TestReconcileTagsCountsAppliedAddWhoseLedgerWriteFails(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_AAAALEDG", "AAAALEDG", job.StateResolving, job.StateUnavailable)
+	if _, err := service.Store.DB().ExecContext(ctx,
+		`CREATE TRIGGER fail_owned_tag BEFORE UPDATE ON zotio_tag_state WHEN NEW.status = 'owned' BEGIN SELECT RAISE(ABORT, 'fail owned'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.ReconcileTags(ctx)
+	if err == nil {
+		t.Fatal("expected the failed ledger write to be reported")
+	}
+	if result == nil || result.Added != 1 {
+		t.Fatalf("result = %+v, want the applied remote add counted", result)
+	}
+	if hint := ErrorInfoFrom(err).Hint; !strings.HasPrefix(hint, "tags partly reconciled: 1 added, 0 removed, 1 failed") {
+		t.Fatalf("hint = %q, want the applied add named", hint)
+	}
+}
+
 func TestReconcileTagsPersistsAppliedOutcomeDespiteCommandError(t *testing.T) {
 	ctx := context.Background()
 	cli := &tagCLI{resultErrors: map[string]error{"PARTIAL1": fmt.Errorf("journal failed after mutation")}}

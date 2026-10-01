@@ -175,11 +175,13 @@ func (s *Service) ReconcileTags(ctx context.Context) (*TagReconcileResult, error
 		outcome, reason, runErr := s.mutateTagWithReason(ctx, true, key, want)
 		switch outcome {
 		case "applied":
+			// The remote tag exists now, whatever the ledger write does next,
+			// so the partial-failure hint must count it.
+			result.Added++
 			if err := s.upsertTagState(ctx, key, want, tagStatusOwned); err != nil {
 				reconcileErrs = append(reconcileErrs, err)
 				continue
 			}
-			result.Added++
 		case "no_op":
 			status := tagStatusForeign
 			// A pending retry seeing the requested automatic type is recovery
