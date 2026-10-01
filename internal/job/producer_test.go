@@ -223,6 +223,29 @@ func TestPDFGrabAdoptionRecordsManualFile(t *testing.T) {
 	}
 }
 
+func TestPDFGrabDoesNotOutrankDownloadNamingThePromotedBytes(t *testing.T) {
+	js := testStore(t)
+	sha := strings.Repeat("8", 64)
+	// The job was filed from a grab whose bytes did not become the paper; a
+	// later generic drive downloaded the bytes that were promoted. The grab
+	// row stays job_created forever, but the digest names the drive.
+	jobID, candidateID := producerJob(t, js, "wr_producer_grab_then_drive", "browser", []producerFixtureEvent{
+		{"browser.provider_drive_epoch_started", map[string]any{"drive_attempt_id": "drive-after-grab", "ordinal": 0, "revision": "1", "strategy": "generic"}},
+		{"browser.download_complete", map[string]any{"filename": "paper.pdf", "producer": genericTuple("drive-after-grab"), "sha256": sha}},
+	})
+	now := store.Now()
+	if _, err := js.S.DB().ExecContext(context.Background(), `INSERT INTO pdf_grabs
+		(id, url_host, title, state, job_id, created_at, updated_at)
+		VALUES ('grab_superseded', 'pdf.example.test', 'paper', 'job_created', ?, ?, ?)`, jobID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	got := promoteForProducer(t, js, jobID, candidateID, sha)
+	assertProducer(t, got, ProducerAdapter)
+	if got.Basis != "download_digest" || got.EffectKind != "generic_drive" {
+		t.Fatalf("record = %+v, want the drive that downloaded the promoted digest", got)
+	}
+}
+
 func TestDownloadAfterAdapterGaveUpRecordsManual(t *testing.T) {
 	js := testStore(t)
 	// The adapter reported ui_changed on the delivering visit; no drive or

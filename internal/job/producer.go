@@ -270,13 +270,26 @@ func deriveArtifactProducer(in producerInputs) ArtifactProducerRecord {
 		record.Producer, record.Basis = ProducerManual, "operator_supplied"
 	case in.source != "browser":
 		record.Producer, record.Basis = ProducerDaemonFetch, "resolver_candidate"
-	case in.grabbed:
+	case in.grabbed && !digestNamesDownload(in.events, in.sha):
+		// A grab row stays job_created after its bytes lose, so it only
+		// names the producer when no download record names these exact bytes.
 		record.Producer, record.Basis = ProducerManual, "pdf_grab"
 	default:
 		classifyBrowserDownload(&record, in, window)
 	}
 	record.OpenedBy, record.Interventions = interventionsFor(record.Producer, window)
 	return record
+}
+
+// digestNamesDownload reports whether any browser.download_complete carrying
+// an effect tuple names the promoted digest. Such a record is the exact
+// artifact-to-effect correlation, even when two tuples make it ambiguous.
+func digestNamesDownload(events []producerEvent, sha string) bool {
+	if sha == "" {
+		return false
+	}
+	_, basis := boundArtifactProducer(events, nil, sha)
+	return basis != "no_download_record"
 }
 
 func classifyBrowserDownload(record *ArtifactProducerRecord, in producerInputs, window []producerEvent) {
