@@ -624,6 +624,22 @@ execution records kept during the initial build.
   desktop still shows the digest once, with the larger total.
 - Reinstalling the native messaging host replaces its symlink atomically. A
   failed reinstall no longer leaves browsers without a host binary.
+- Native-host uninstall no longer claims registry removals that never
+  happened, and its partial-failure report now names host files it already
+  deleted before the failure.
+- `papio watch remove` no longer loses pending works that arrive while the
+  remove runs: the daemon refuses the remove unless `--discard-digest` is
+  given, so re-run with that flag when you mean to discard them.
+- `papio grabs binds` against an older daemon no longer prints a next-page
+  command when paging is unavailable; it says the daemon needs an upgrade.
+- Browser candidate offers now refresh instead of stalling once the offer
+  budget fills with expired claims.
+- A downloaded PDF whose staged copy survived a crash beside another file is
+  now recovered instead of left stranded.
+- `papio jobs.retry` no longer drops a parked job's page-capture evidence
+  when the retry is refused.
+- Delivery inspection no longer accepts a differently cased
+  `provider_reference` on operations that must not receive one.
 
 ### Security
 - A notification webhook (`notify.webhook_url` or a webhook credential record)
