@@ -484,9 +484,12 @@ func TestEffectPermitInstitutionalRequestReplayCAS(t *testing.T) {
 	if _, err := js.S.DB().ExecContext(ctx, `UPDATE materialization_claims SET lease_until=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), claim.ID); err != nil {
 		t.Fatal(err)
 	}
+	// A lost response leaves the permit held; the exact replay must hand the
+	// same authorization back as Acquired so a caller re-drives it, while the
+	// settled replay below stays Duplicate.
 	second, outcome, err := js.AcquireInstitutionalEffectPermit(ctx, in)
-	if err != nil || outcome != EffectPermitDuplicate || second.ID != first.ID {
-		t.Fatalf("institutional replay=%+v outcome=%v err=%v", second, outcome, err)
+	if err != nil || outcome != EffectPermitAcquired || second.ID != first.ID || second.Status != Held {
+		t.Fatalf("institutional held replay=%+v outcome=%v err=%v, want acquired", second, outcome, err)
 	}
 	var effectOrdinal, routeOrdinal, authorizationEvents int
 	var phase string

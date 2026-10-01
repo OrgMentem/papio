@@ -1287,6 +1287,7 @@ func (js *Store) AcquireInstitutionalEffectPermit(ctx context.Context, in Instit
 			p.EffectOrdinal == nil || *p.EffectOrdinal != in.ExpectedEffectOrdinal+1 {
 			return nil, EffectPermitStaleOutcome, ErrEffectPermitStale
 		}
+		outcome := EffectPermitDuplicate
 		if p.Status == Held {
 			current, currentErr := institutionalEffectPermitReplayCurrent(ctx, tx, p, in)
 			if currentErr != nil {
@@ -1295,11 +1296,15 @@ func (js *Store) AcquireInstitutionalEffectPermit(ctx context.Context, in Instit
 			if !current {
 				return nil, EffectPermitStaleOutcome, ErrEffectPermitStale
 			}
+			// A current held replay is the same authorization delivery, as in
+			// AcquireEffectPermit: the first commit may have landed while its
+			// response was lost.
+			outcome = EffectPermitAcquired
 		}
 		if e = tx.Commit(); e != nil {
 			return nil, EffectPermitStaleOutcome, e
 		}
-		return p, EffectPermitDuplicate, nil
+		return p, outcome, nil
 	} else if !errors.Is(e, sql.ErrNoRows) {
 		return nil, EffectPermitStaleOutcome, e
 	}
