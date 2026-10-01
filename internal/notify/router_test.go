@@ -787,12 +787,21 @@ func itoaNotify(n int64) string {
 	return s
 }
 
-type recordingEventSender struct{ events []Event }
+// recordingEventSender is safe for concurrent Route calls: distinct delivery
+// keys may POST in parallel.
+type recordingEventSender struct {
+	mu     sync.Mutex
+	events []Event
+}
 
 func (s *recordingEventSender) Send(_ context.Context, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, Event{Message: message})
 }
 func (s *recordingEventSender) SendEvent(_ context.Context, event Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, event)
 }
 
