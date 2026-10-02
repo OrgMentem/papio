@@ -15137,8 +15137,42 @@ func TestUngovernedArtifactHashesAndSettlesExactProducer(t *testing.T) {
 	if fence.governed || fence.digest != digest {
 		t.Fatalf("ungoverned fence = %+v, want digest %q", fence, digest)
 	}
+	// Polling reads this queue under the session lock while adoption commits
+	// outside it. Keep that read active through producer settlement.
+	stopPolling := make(chan struct{})
+	pollingDone := make(chan struct{})
+	pollingStarted := make(chan struct{})
+	observed := 0
+	go func() {
+		defer close(pollingDone)
+		close(pollingStarted)
+		for {
+			select {
+			case <-stopPolling:
+				return
+			default:
+				b.mu.Lock()
+				if b.reofferPending[id] {
+					observed++
+				}
+				b.mu.Unlock()
+			}
+		}
+	}()
+	<-pollingStarted
+	defer func() {
+		close(stopPolling)
+		<-pollingDone
+		t.Logf("concurrent reoffer reads observing the queued job: %d", observed)
+	}()
 	if err := b.commitArtifact(ctx, id, filename, fence, producer); err != nil {
 		t.Fatal(err)
+	}
+	b.mu.Lock()
+	queued := b.reofferPending[id]
+	b.mu.Unlock()
+	if !queued {
+		t.Fatal("settled producer did not queue a reoffer")
 	}
 	permit, err := jobs.GetEffectPermitByIdentity(ctx, job.EffectPermitIdentity{
 		JobID: id, Kind: job.GenericDrive, DriveAttemptID: attempt,

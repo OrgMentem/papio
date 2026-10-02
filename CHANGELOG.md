@@ -128,6 +128,13 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **A background adoption no longer crashes the daemon while a browser
+  polls.** A file adopted by a sweep, or adopted after the browser session
+  lock was released, queued its job for a priority re-offer without the lock
+  that the poll loop holds while it reads the same queue. Go ends a process
+  that reads and writes one map at the same time, so an adoption that landed
+  during a poll could stop the daemon. The queue write now takes the session
+  lock.
 - **A discovery watch no longer stops finding papers once its first page of
   results is all known.** A watch used to read one page of at most 25 results,
   drop the works you already had, and report the empty remainder as a

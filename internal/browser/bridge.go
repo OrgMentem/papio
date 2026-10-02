@@ -397,7 +397,8 @@ type Bridge struct {
 	// A replayed auth return must not make the same holder open duplicate tabs.
 	authReleased map[int64]bool
 	// reofferPending prioritizes jobs released by the institutional-session
-	// sweep when poll turns them back into job_offer frames.
+	// sweep when poll turns them back into job_offer frames. Adoption commits
+	// outside b.mu, so every write goes through queueReoffer.
 	reofferPending map[string]bool
 	// driveOutcomeDue holds, per job, the deadline for the provider outcome
 	// that must follow a generic drive result with no daemon successor. See
@@ -7128,6 +7129,17 @@ func (b *Bridge) persistArtifactCorrelation(ctx context.Context, jobID, filename
 	})
 }
 
+// queueReoffer marks a job for priority re-offer at the next poll. Adoption
+// settles artifacts from the sweeper and from adoptOutsideSessionLock, both of
+// which run without b.mu, while poll reads and prunes the same map under it.
+// A plain map write from those paths crashed the daemon with a concurrent map
+// access, so every commit-side write takes the session lock here.
+func (b *Bridge) queueReoffer(jobID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reofferPending[jobID] = true
+}
+
 // commitArtifact records the winner for bytes that have just passed validation,
 // and settles only the exact effect producer. The winner and occupancy release
 // share one SQLite transaction; a restart can recover the producer from the
@@ -7148,7 +7160,7 @@ func (b *Bridge) commitArtifact(
 			if err != nil {
 				log.Printf("papio: settling exact ungoverned artifact producer: %v", err)
 			} else if settled {
-				b.reofferPending[jobID] = true
+				b.queueReoffer(jobID)
 			}
 		}
 		return nil
@@ -7187,14 +7199,14 @@ func (b *Bridge) commitArtifact(
 				log.Printf("papio: recording superseded artifact: %v", eventErr)
 			}
 		case settled:
-			b.reofferPending[jobID] = true
+			b.queueReoffer(jobID)
 		}
 	} else if producer != nil {
 		settled, err := b.jobs.SettleArtifactProducer(ctx, jobID, *producer)
 		if err != nil {
 			log.Printf("papio: settling exact artifact producer: %v", err)
 		} else if settled {
-			b.reofferPending[jobID] = true
+			b.queueReoffer(jobID)
 		}
 	}
 	if fence.claim == nil || fence.candidate == nil {
