@@ -116,10 +116,32 @@ func TestRunnerAcquireManifestWriteFailureResumesDurableSubmissions(t *testing.T
 	// live job to itself rather than creating a second one.
 	works := pager.results["openalex"]
 	pager.results["openalex"] = []discovery.DiscoveredWork{works[2], works[1], works[0]}
+	retryCalls := 0
 	restarted := &Runner{
 		Store: h.watches, Discovery: pager, Lookup: h.runner.Lookup,
-		Submitter: h.submitter, DataDir: h.runner.DataDir,
-		Now: func() time.Time { return h.now.Add(time.Hour) },
+		Submitter: manifestSubmitterFunc(func(ctx context.Context, request protocol.WorkRequest, auto *bool) (string, error) {
+			// The rewritten manifest must carry the durable JobID before the
+			// retry submits anything, or an interrupted retry loses the job.
+			if retryCalls == 0 {
+				manifest, err := batch.Load(h.runner.DataDir, first.ManifestID)
+				if err != nil {
+					t.Fatalf("retry manifest before submission: %v", err)
+				}
+				carried := ""
+				for _, entry := range manifest.Works {
+					if entry.RequestID == firstRequestID {
+						carried = entry.JobID
+					}
+				}
+				if carried != durable.Works[0].JobID {
+					t.Fatalf("retry manifest carried %q for %q, want the durable job %q", carried, firstRequestID, durable.Works[0].JobID)
+				}
+			}
+			retryCalls++
+			return h.submitter.SubmitWithAutoImport(ctx, request, auto)
+		}),
+		DataDir: h.runner.DataDir,
+		Now:     func() time.Time { return h.now.Add(time.Hour) },
 	}
 	second, err := restarted.Run(ctx, h.watch.ID)
 	if err != nil || second.Queued != 3 || second.Failed != 0 || second.ManifestID != first.ManifestID {
