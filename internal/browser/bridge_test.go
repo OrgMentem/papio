@@ -15169,6 +15169,7 @@ func TestUngovernedArtifactHashesAndSettlesExactProducer(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.mu.Lock()
+	b.drainQueuedReoffers()
 	queued := b.reofferPending[id]
 	b.mu.Unlock()
 	if !queued {
@@ -15180,6 +15181,31 @@ func TestUngovernedArtifactHashesAndSettlesExactProducer(t *testing.T) {
 	})
 	if err != nil || permit == nil || permit.Status != job.Settled {
 		t.Fatalf("ungoverned artifact permit=%+v err=%v", permit, err)
+	}
+}
+
+// TestQueuedReofferDoesNotNeedTheSessionLock pins the second half of the
+// adoption contract: a grab confirmation reaches commitArtifact while Sync
+// still holds b.mu, so queueing a re-offer must never take that lock.
+func TestQueuedReofferDoesNotNeedTheSessionLock(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	done := make(chan struct{})
+	b.mu.Lock()
+	go func() {
+		defer close(done)
+		b.queueReoffer("locked-session-job")
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		b.mu.Unlock()
+		t.Fatal("queueing a reoffer blocked on the session lock")
+	}
+	b.drainQueuedReoffers()
+	queued := b.reofferPending["locked-session-job"]
+	b.mu.Unlock()
+	if !queued {
+		t.Fatal("drained queue did not carry the job")
 	}
 }
 

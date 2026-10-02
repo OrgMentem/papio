@@ -397,9 +397,13 @@ type Bridge struct {
 	// A replayed auth return must not make the same holder open duplicate tabs.
 	authReleased map[int64]bool
 	// reofferPending prioritizes jobs released by the institutional-session
-	// sweep when poll turns them back into job_offer frames. Adoption commits
-	// outside b.mu, so every write goes through queueReoffer.
+	// sweep when poll turns them back into job_offer frames. It is read and
+	// pruned under b.mu; commit-side additions arrive through reofferQueued.
 	reofferPending map[string]bool
+	// reofferQueued stages re-offer additions made by artifact commits, which
+	// run both with and without b.mu held. See queueReoffer.
+	reofferQueued  map[string]bool
+	reofferQueueMu sync.Mutex
 	// driveOutcomeDue holds, per job, the deadline for the provider outcome
 	// that must follow a generic drive result with no daemon successor. See
 	// retireSilentProviderDrives.
@@ -722,6 +726,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		cancelAnnounced:        map[string]bool{},
 		authReleased:           map[int64]bool{},
 		reofferPending:         map[string]bool{},
+		reofferQueued:          map[string]bool{},
 		driveOutcomeDue:        map[string]driveOutcomeWait{},
 		directRouteAttempts:    map[string]string{},
 		effectPermitReconciles: map[string]pendingEffectPermitReconcile{},
@@ -976,6 +981,7 @@ func (b *Bridge) applyPromotion(transition arbitrationTransition, reason string)
 	b.cancelAnnounced = map[string]bool{}
 	b.authReleased = map[int64]bool{}
 	b.reofferPending = map[string]bool{}
+	b.discardQueuedReoffers()
 	b.materializationOffered = map[string]materializationOffer{}
 	b.materializationTracked = map[string]bool{}
 	b.reofferRanThisSync = map[string]bool{}
@@ -4681,6 +4687,7 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	b.materializationTracked = map[string]bool{}
 	b.authReleased = map[int64]bool{}
 	b.reofferPending = map[string]bool{}
+	b.discardQueuedReoffers()
 	b.reofferSourceJobID = map[string]string{}
 	b.lastPacedHeld = 0
 	if b.jobs != nil {
@@ -7130,14 +7137,36 @@ func (b *Bridge) persistArtifactCorrelation(ctx context.Context, jobID, filename
 }
 
 // queueReoffer marks a job for priority re-offer at the next poll. Adoption
-// settles artifacts from the sweeper and from adoptOutsideSessionLock, both of
-// which run without b.mu, while poll reads and prunes the same map under it.
-// A plain map write from those paths crashed the daemon with a concurrent map
-// access, so every commit-side write takes the session lock here.
+// reaches commitArtifact both while Sync holds b.mu (a grab confirmation, for
+// example) and without it (the adoption sweeper, adoptOutsideSessionLock), so
+// neither taking b.mu here nor writing reofferPending directly is safe: the
+// first deadlocks the session, the second is a concurrent map access that ends
+// the process. Commit-side additions land in their own small queue instead,
+// and poll folds them into reofferPending under b.mu before it reads it.
 func (b *Bridge) queueReoffer(jobID string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.reofferPending[jobID] = true
+	b.reofferQueueMu.Lock()
+	defer b.reofferQueueMu.Unlock()
+	b.reofferQueued[jobID] = true
+}
+
+// drainQueuedReoffers folds commit-side additions into reofferPending. The
+// caller holds b.mu.
+func (b *Bridge) drainQueuedReoffers() {
+	b.reofferQueueMu.Lock()
+	defer b.reofferQueueMu.Unlock()
+	for id := range b.reofferQueued {
+		b.reofferPending[id] = true
+		delete(b.reofferQueued, id)
+	}
+}
+
+// discardQueuedReoffers drops commit-side additions that a session reset has
+// made meaningless, so a stale job cannot reappear after reofferPending is
+// cleared. The caller holds b.mu.
+func (b *Bridge) discardQueuedReoffers() {
+	b.reofferQueueMu.Lock()
+	defer b.reofferQueueMu.Unlock()
+	clear(b.reofferQueued)
 }
 
 // commitArtifact records the winner for bytes that have just passed validation,
@@ -10876,6 +10905,8 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	// only on the success path keeps the retirement gate honest by
 	// construction rather than by remembering to roll back at each return.
 	announced := map[string]bool{}
+	// Fold in re-offers queued by artifact commits that ran outside b.mu.
+	b.drainQueuedReoffers()
 	defer func() {
 		if err != nil {
 			return
