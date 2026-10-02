@@ -251,8 +251,9 @@ func (o *Observer) observe(req *http.Request, resp *http.Response) {
 	}
 	identity := budget.IdentityFor(served)
 	h := parseOpenAlexRateLimit(resp)
-	o.observeCreditSignals(req, identity, h)
+	// Close the quota gate before any blocking credit-observation write.
 	o.observeQuotaFloor(req, served, identity, h)
+	o.observeCreditSignals(req, identity, h)
 }
 
 // observeCreditSignals records fuse inputs from the provider. Permission-reducing
