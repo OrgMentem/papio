@@ -968,10 +968,7 @@ func TestDeadlineExceededApplyIsAmbiguousAndDistinctFromDefinitiveFailure(t *tes
 		t.Fatal(err)
 	}
 	plan2 := plans2[0]
-	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
-	defer cancel()
-	time.Sleep(time.Millisecond)
-	if _, err := service2.Apply(ctx, plan2.ID, plan2.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := service2.Apply(context.Background(), plan2.ID, plan2.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline apply err = %v, want DeadlineExceeded", err)
 	}
 	var ambRaw string

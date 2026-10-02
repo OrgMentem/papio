@@ -11,6 +11,16 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- Added confirmed archive/restore commands for validated acquisitions.
+  Archive retains artifact and identity evidence, excludes jobs from ready
+  views and import backfill, and clears uncollected warnings without a fake
+  export. Durable external filing reservations prevent conflicting archival.
+- Added an opt-in `[filing].folder` destination with per-job receipts,
+  destination-specific idempotency, inspection, and safe automatic retry.
+  Arbitrary `on_ready` scripts remain best-effort.
+- Added operational watch edits that preserve identity, history, and pending
+  digest entries. Added explicitly selected non-Zotero backfill sources with
+  fail-closed ownership reads and once-only submission receipts.
 - **`papio jobs supply-pdf <job-id> <path>` gives a job the PDF you already
   have.** An emailed copy, an interlibrary loan file, or an earlier download
   no longer needs a trip through the browser's **Send PDF to papio**. The
