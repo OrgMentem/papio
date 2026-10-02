@@ -366,6 +366,13 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 	if err != nil {
 		return nil, err
 	}
+	disposition, err := s.Bundle.Jobs.Disposition(ctx, plan.JobID)
+	if err != nil {
+		return nil, err
+	}
+	if disposition.Disposition == job.DispositionArchived {
+		return nil, fmt.Errorf("%w: acquisition is archived; restore it before filing", job.ErrConflict)
+	}
 	if confirmation != plan.ConfirmationSHA256 {
 		return nil, fmt.Errorf("confirmation SHA-256 does not match plan %s", plan.ID)
 	}
@@ -690,6 +697,13 @@ func (s *Service) planAndApplyOnce(ctx context.Context, jobID string) (*Plan, *A
 func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (status, parentKey string, skip bool, err error) {
 	if s == nil || s.CLI == nil || s.Bundle == nil {
 		return "", "", false, nil
+	}
+	disposition, dispositionErr := s.Bundle.Jobs.Disposition(ctx, jobID)
+	if dispositionErr != nil {
+		return "", "", false, dispositionErr
+	}
+	if disposition.Disposition == job.DispositionArchived {
+		return "", "", false, job.ErrConflict
 	}
 	row, err := s.Bundle.Jobs.Get(ctx, jobID)
 	if err != nil {
@@ -1227,7 +1241,8 @@ func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, erro
 	leaseExpiry := now.Add(-applyClaimLease).Unix()
 	result, err := s.Store.DB().ExecContext(ctx, `
 		INSERT INTO exports (job_id, kind, idempotency_key, result_json, created_at)
-		VALUES (?, 'zotio_apply', ?, json_object('status', 'in_progress', 'claimed_at', ?), ?)
+		SELECT ?, 'zotio_apply', ?, json_object('status', 'in_progress', 'claimed_at', ?), ?
+		FROM jobs WHERE id = ? AND acquisition_disposition = 'active'
 		ON CONFLICT(idempotency_key) DO UPDATE SET
 			job_id = excluded.job_id,
 			kind = excluded.kind,
@@ -1242,7 +1257,7 @@ func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, erro
 				AND CAST(json_extract(exports.result_json, '$.claimed_at') AS INTEGER) <= ?
 			)
 		)`,
-		jobID, key, now.Unix(), store.Now(), leaseExpiry)
+		jobID, key, now.Unix(), store.Now(), jobID, leaseExpiry)
 	if err != nil {
 		return false, err
 	}

@@ -39,6 +39,7 @@ import (
 	"papio/internal/ownershipsnapshot"
 	"papio/internal/pdf"
 	"papio/internal/preview"
+	"papio/internal/publicationwatch"
 	"papio/internal/pulse"
 	"papio/internal/resolver"
 	"papio/internal/resolvers/arxiv"
@@ -67,26 +68,27 @@ import (
 // System owns the process-wide concrete services used by the daemon and RPC
 // handlers. Closing it closes the single SQLite connection.
 type System struct {
-	Config        config.Config
-	Credentials   *runtimecredential.Runtime
-	Store         *store.Store
-	Jobs          *job.Store
-	Artifacts     *artifact.Store
-	Captures      *captures.Store
-	Budgets       *budget.Manager
-	App           *app.Service
-	Notify        *notify.Router
-	Pulse         *pulse.Service
-	Scheduler     *daemon.Scheduler
-	Bundle        *bundle.Exporter
-	Browser       *browser.Bridge
-	Preview       *preview.Server
-	PDFCapability pdf.Capability
-	WorkerBinary  string
-	Discovery     discovery.Source
-	Watches       *watch.Store
-	WatchRunner   *watch.Runner
-	Zotio         *zotio.Service
+	Config             config.Config
+	Credentials        *runtimecredential.Runtime
+	Store              *store.Store
+	Jobs               *job.Store
+	Artifacts          *artifact.Store
+	Captures           *captures.Store
+	Budgets            *budget.Manager
+	App                *app.Service
+	Notify             *notify.Router
+	Pulse              *pulse.Service
+	Scheduler          *daemon.Scheduler
+	Bundle             *bundle.Exporter
+	Browser            *browser.Bridge
+	Preview            *preview.Server
+	PDFCapability      pdf.Capability
+	WorkerBinary       string
+	Discovery          discovery.Source
+	Watches            *watch.Store
+	WatchRunner        *watch.Runner
+	PublicationWatches *publicationwatch.Service
+	Zotio              *zotio.Service
 	// Holdings answers ownership for users without zotio; empty when zotio owns
 	// the answer or no generic source is configured.
 	Holdings    *ownership.Registry
@@ -406,6 +408,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	})
 	service.Notifier = router
 	service.Resolvers = entries
+	var publicationRelations publicationwatch.Relations
 	if credentials.SourcePolicy(config.SourceCrossrefMetadata).Enabled {
 		crossrefEnricher := enrich.NewWithOptions(enrich.Options{
 			Client: metadataClient, ContactEmail: cfg.Email,
@@ -414,6 +417,14 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		service.Enricher = crossrefEnricher
 		service.MetadataEnrichers = append(service.MetadataEnrichers, app.MetadataEnricherEntry{
 			Name: config.SourceCrossrefMetadata, Enricher: crossrefEnricher,
+		})
+		gated, err := sourcegate.New(budgets, config.SourceCrossrefMetadata, credentials.SourcePolicy(config.SourceCrossrefMetadata), 0, metadataClient)
+		if err != nil {
+			return nil, err
+		}
+		publicationRelations = enrich.NewWithOptions(enrich.Options{
+			Client: gated, ContactEmail: cfg.Email,
+			BaseURL: cfg.Sources[config.SourceCrossrefMetadata].BaseURLForDev,
 		})
 	}
 	if credentials.SourcePolicy(config.SourceOpenAlex).Enabled {
@@ -519,6 +530,8 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		holdings = ownership.NewRegistry(providers...)
 	}
 	watches := watch.NewStore(db)
+	service.ManagedFilingFolder = cfg.Filing.Folder
+	publicationWatches := publicationwatch.NewService(db, publicationRelations, service, router)
 	service.ReadyHook = &hook.Runner{
 		Command: cfg.Hooks.OnReady,
 		Timeout: time.Duration(cfg.Hooks.TimeoutSeconds) * time.Second,
@@ -526,7 +539,8 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	watchRunner := &watch.Runner{
 		Store: watches, Discovery: discoveryClient, Lookup: zotioService, Submitter: service,
 		Backfill: zotioService, Notifier: router, DataDir: cfg.DataDir,
-		Holdings: holdings,
+		Holdings:       holdings,
+		LibrarySources: cfg.Library.Sources,
 	}
 	var retractions *retraction.Sentinel
 	if policy := credentials.SourcePolicy(config.SourceRetractionWatch); policy.Enabled {
@@ -556,6 +570,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	// [drive] enabled = true; Browser is attached once the bridge exists below.
 	pacer := &drive.Pacer{Jobs: jobs, Config: cfg, Notifier: router}
 	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.UnavailableRechecker(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), pacer, retractions, router}
+	maintenance = append(maintenance, service.ManagedFilingRetrier(), publicationWatches)
 	if reconciler := zotioService.TagReconciler(); reconciler != nil {
 		maintenance = append(maintenance, reconciler)
 	}
@@ -601,17 +616,18 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	system := &System{
 		Config: cfg, Credentials: credentials, Store: db, Jobs: jobs, Artifacts: artifacts, Captures: captureStore, Budgets: budgets,
 		App: service, Notify: router, Pulse: pulseService, Scheduler: scheduler, Watches: watches, WatchRunner: watchRunner,
-		Bundle:        bundleExporter,
-		Browser:       bridge,
-		Drive:         pacer,
-		Preview:       previewServer,
-		Discovery:     discoveryClient,
-		Zotio:         zotioService,
-		Holdings:      holdings,
-		Updates:       updates,
-		Retractions:   retractions,
-		Triage:        triageService,
-		PDFCapability: capability, WorkerBinary: executable,
+		PublicationWatches: publicationWatches,
+		Bundle:             bundleExporter,
+		Browser:            bridge,
+		Drive:              pacer,
+		Preview:            previewServer,
+		Discovery:          discoveryClient,
+		Zotio:              zotioService,
+		Holdings:           holdings,
+		Updates:            updates,
+		Retractions:        retractions,
+		Triage:             triageService,
+		PDFCapability:      capability, WorkerBinary: executable,
 	}
 	failed = false
 	return system, nil

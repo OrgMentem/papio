@@ -33,15 +33,17 @@ func TestParseBibTeX(t *testing.T) {
 			input: "\ufeff" + strings.ReplaceAll(bibTeXFixture, "\n", "\r\n"),
 			want: []Record{
 				{
-					DOI:     "10.1000/example.1",
-					Title:   "An Overview of evidence-a study",
-					Authors: []string{"Garcia, Jose", "Research and Development, Ada", "Smith, John"},
-					Year:    2024,
+					SourceKey: "garcia2024",
+					DOI:       "10.1000/example.1",
+					Title:     "An Overview of evidence-a study",
+					Authors:   []string{"Garcia, Jose", "Research and Development, Ada", "Smith, John"},
+					Year:      2024,
 				},
 				{
-					Title:   "Quoted title - result",
-					Authors: []string{"Doe, Jane", "Roe, Richard"},
-					Year:    2023,
+					SourceKey: "doe2023",
+					Title:     "Quoted title - result",
+					Authors:   []string{"Doe, Jane", "Roe, Richard"},
+					Year:      2023,
 				},
 			},
 		},
@@ -50,7 +52,7 @@ func TestParseBibTeX(t *testing.T) {
 			input: `@misc{untitled,
   title = {A title without an identifier},
 }`,
-			want: []Record{{Title: "A title without an identifier"}},
+			want: []Record{{SourceKey: "untitled", Title: "A title without an identifier"}},
 		},
 		{
 			name: "skips BibTeX meta entries",
@@ -61,7 +63,7 @@ func TestParseBibTeX(t *testing.T) {
   title = {Kept record},
   doi = doi:10.5555/kept,
 }`,
-			want: []Record{{DOI: "10.5555/kept", Title: "Kept record"}},
+			want: []Record{{SourceKey: "kept", DOI: "10.5555/kept", Title: "Kept record"}},
 		},
 		{
 			name: "accepts punctuated citation key and nested values",
@@ -70,8 +72,9 @@ func TestParseBibTeX(t *testing.T) {
   title = "Quoted = value, with {braces}",
 }`,
 			want: []Record{{
-				DOI:   "10.1000/x=y, nested value",
-				Title: "Quoted = value, with braces",
+				SourceKey: "smith:2024/alpha",
+				DOI:       "10.1000/x=y, nested value",
+				Title:     "Quoted = value, with braces",
 			}},
 		},
 		{

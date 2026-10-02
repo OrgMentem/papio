@@ -27,11 +27,14 @@ type Caller interface {
 
 // SubmitOptions selects the standard batch acquisition policy.
 type SubmitOptions struct {
-	AutoImport   *bool
-	Collection   string
-	Label        string
-	Resolver     string
-	IncludeOwned bool
+	// IdentityScope binds a durable campaign to its own retry identity.
+	// Empty retains the ordinary same-day batch identity.
+	IdentityScope string
+	AutoImport    *bool
+	Collection    string
+	Label         string
+	Resolver      string
+	IncludeOwned  bool
 	// Holdings routes ownership through the generic holdings providers
 	// (library.lookup_works) instead of zotio. The caller decides, because only it
 	// knows whether zotio is configured; mixing the two is out of scope
@@ -343,6 +346,9 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	if len(requests) == 0 {
 		return nil, fmt.Errorf("batch contains no works")
 	}
+	if options.IdentityScope != "" && options.Consumer != "" {
+		return nil, errors.New("scoped campaigns do not accept a consumer override")
+	}
 	if len(requests) > 50 {
 		return nil, fmt.Errorf("batch exceeds maximum of 50 works")
 	}
@@ -366,6 +372,16 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 		seen[key] = i
 	}
 	manifest := NewManifest(requests, options.Label, options.Collection, options.Now)
+	if len(options.IdentityScope) > 128 {
+		return nil, errors.New("batch identity scope exceeds 128 bytes")
+	}
+	if options.IdentityScope != "" {
+		manifest.ID = ScopedID(requests, options.Now, options.IdentityScope)
+		for i := range manifest.Works {
+			manifest.Works[i].RequestID = RequestID(manifest.ID, requests[i])
+			manifest.Works[i].Work.RequestID = manifest.Works[i].RequestID
+		}
+	}
 	for i := range requests {
 		requests[i].RequestID = manifest.Works[i].RequestID
 	}
@@ -526,7 +542,13 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 				errs[index] = fmt.Errorf("cannot prove no prior submission for request %q; refusing to resubmit", request.RequestID)
 				return
 			}
-			submitted, err := submitOne(ctx, caller, request, options.AutoImport, options.Consumer)
+			var submitted submitResult
+			var err error
+			if options.IdentityScope != "" {
+				err = caller.Call(ctx, "acquire.submit_once_v1", submitParams{Request: request, AutoImport: options.AutoImport}, &submitted)
+			} else {
+				submitted, err = submitOne(ctx, caller, request, options.AutoImport, options.Consumer)
+			}
 			if err != nil {
 				errs[index] = err
 				return

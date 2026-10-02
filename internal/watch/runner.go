@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"papio/internal/batch"
+	"papio/internal/config"
 	"papio/internal/discovery"
 	"papio/internal/notify"
 	"papio/internal/ownership"
@@ -111,9 +112,11 @@ type Runner struct {
 	Holdings  HoldingsLookup
 	Submitter Submitter
 	Backfill  BackfillQueue
-	Notifier  notify.Sink
-	DataDir   string
-	Now       func() time.Time
+	// LibrarySources declares the explicit feeds available for generic backfill.
+	LibrarySources []config.LibrarySource
+	Notifier       notify.Sink
+	DataDir        string
+	Now            func() time.Time
 
 	mu sync.Mutex
 }
@@ -854,6 +857,13 @@ func (r *Runner) alertIntent(watch Watch, pending []DigestEntry, runStart time.T
 func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Time) (*RunResult, error) {
 	result := &RunResult{WatchID: watch.ID}
 	if watch.Kind == KindBackfill {
+		sourceName, err := r.Store.genericBackfillSource(ctx, watch.ID)
+		if err != nil {
+			return result, err
+		}
+		if sourceName != "" {
+			return r.executeGenericBackfill(ctx, watch, sourceName, runStart)
+		}
 		if r.Backfill == nil {
 			return result, errors.New("watch runner backfill dependency is not configured")
 		}
