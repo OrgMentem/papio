@@ -133,8 +133,22 @@ execution records kept during the initial build.
   lock was released, queued its job for a priority re-offer without the lock
   that the poll loop holds while it reads the same queue. Go ends a process
   that reads and writes one map at the same time, so an adoption that landed
-  during a poll could stop the daemon. The queue write now takes the session
-  lock.
+  during a poll could stop the daemon. Those additions now go through a
+  separate queue that the poll folds in under the session lock.
+- **A discovery watch records its batch before it submits any job.** The
+  watch used to write the batch file only after every submission, so an
+  interrupted run left jobs with no record on disk, a run report that named a
+  missing batch, and no saved scan position. The watch now writes the batch
+  first and after each submission.
+- **A low OpenAlex quota closes the gate before *papio* records anything.**
+  *papio* used to store the credit numbers from the response first, and a
+  slow or failing write let another request reach OpenAlex after the
+  provider had already reported the shortage.
+- **An interrupted migration no longer reports a second rollback failure.**
+  SQLite can end the transaction itself when startup is interrupted. The
+  later rollback then says there is no transaction, which read as a damaged
+  database. *papio* now treats that answer as the rollback it is, and still
+  reports every other rollback failure.
 - **A discovery watch no longer stops finding papers once its first page of
   results is all known.** A watch used to read one page of at most 25 results,
   drop the works you already had, and report the empty remainder as a
