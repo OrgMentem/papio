@@ -353,6 +353,16 @@ var exportPreMaterializeHook func()
 // through a staged publish; any other mismatch is refused so unrelated caller
 // data is never replaced.
 func (e *Exporter) Export(ctx context.Context, jobID, destination string) (string, *protocol.AcquisitionBundle, error) {
+	if e.Jobs == nil {
+		return "", nil, errors.New("bundle exporter missing job store")
+	}
+	disposition, err := e.Jobs.Disposition(ctx, jobID)
+	if err != nil {
+		return "", nil, err
+	}
+	if disposition.Disposition == job.DispositionArchived {
+		return "", nil, fmt.Errorf("%w: acquisition is archived; restore it before export", job.ErrConflict)
+	}
 	b, art, err := e.Document(ctx, jobID)
 	if err != nil {
 		return "", nil, err

@@ -91,6 +91,8 @@ type risRecord struct {
 func (record *risRecord) add(tag, value string) {
 	record.last = risNone
 	switch tag {
+	case "ID":
+		record.record.SourceKey = value
 	case "DO":
 		record.record.DOI = value
 		record.last = risDOI
