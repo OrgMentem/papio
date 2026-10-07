@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"papio/internal/bootstrap"
 	"papio/internal/discovery"
@@ -55,6 +56,10 @@ func searchUnowned(ctx context.Context, raw json.RawMessage, system *bootstrap.S
 		request := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(works))}
 		for i, item := range works {
 			request.Works[i] = zotio.LookupWorkFrom(item.Work)
+			identity := request.Works[i]
+			if strings.TrimSpace(identity.DOI) == "" && strings.TrimSpace(identity.ArXiv) == "" && strings.TrimSpace(identity.PMID) == "" && identity.ISBN == "" {
+				return incomplete
+			}
 		}
 		result, err := system.Zotio.LookupWorks(ctx, request)
 		if err != nil || result == nil || len(result.Works) != len(works) || result.StalenessWarning != "" {

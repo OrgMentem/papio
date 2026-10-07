@@ -76,8 +76,8 @@ continuation chain. It returns `continuation`, `partial`, `pages`, and `scanned`
 in JSON output. Resume with the same query, filters, and limit using
 `--continuation <token>`. A budget limit or unsupported paging does not imply
 exhaustion. Incomplete ownership evidence fails the request instead of calling
-the results unowned. Generic holdings require a supported exact identifier;
-use ordinary search for title-only results.
+the results unowned. Zotio and generic holdings require a supported exact
+identifier; use ordinary search for title-only results.
 
 ### Grow from a seed paper
 
@@ -147,8 +147,8 @@ and unsuccessful records. Each row carries the source digest, format, ordinal,
 and original BibTeX key, RIS ID, or CSL id when present. Duplicate source
 records can share one job without losing their separate source identities.
 Citation fields follow the supported parser subset; this is not lossless
-vendor reimport. Campaign receipts retain acknowledged jobs across restart
-and terminal states.
+vendor reimport. Campaign receipts retain acknowledged jobs across restart,
+terminal states, and changes to library ownership after submission.
 
 
 ```sh

@@ -138,6 +138,10 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- Campaign retries retain existing job receipts when the library now holds
+  the acquired PDF, keeping reports and active-work limits correct.
+- New-only Zotio searches reject works without a supported exact identifier
+  instead of reporting unchecked works as unowned.
 - **A background adoption no longer crashes the daemon while a browser
   polls.** A file adopted by a sweep, or adopted after the browser session
   lock was released, queued its job for a priority re-offer without the lock

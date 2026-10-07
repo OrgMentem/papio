@@ -448,11 +448,68 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 		}
 		return nil
 	}
-	classified, err := classifyBatchOwnership(ctx, caller, requests, options)
-	if err != nil {
-		return nil, err
+	// Recover submissions before consulting current holdings. A newly filed PDF
+	// must not turn an interrupted campaign's job receipt into skipped_owned.
+	type recovery struct {
+		jobID string
+		state string
+		err   error
 	}
-	ownership := *classified
+	recovered := make(map[string]recovery, len(requests))
+	ownership := zotio.LookupWorksResult{Works: make([]zotio.WorkOwnership, len(requests))}
+	var unsubmitted []protocol.WorkRequest
+	for i, request := range requests {
+		ownership.Works[i].Status = zotio.OwnershipNotOwned
+		priorID := priorJobs[request.RequestID]
+		// Keep even an unconfirmed receipt through other works' incremental writes.
+		manifest.Works[i].JobID = priorID
+		var found recovery
+		if priorID != "" {
+			var detail jobDetail
+			if err := caller.Call(ctx, "jobs.get", map[string]string{"job_id": priorID}, &detail); err == nil {
+				if state, ok := detail.state(); ok {
+					found.jobID, found.state = priorID, state
+				}
+			}
+		}
+		if found.jobID == "" {
+			switch {
+			case inspector != nil:
+				lookup := inspector.jobForRequest
+				if options.IdentityScope != "" {
+					lookup = inspector.jobForScopedRequest
+				}
+				jobID, state, exists, err := lookup(ctx, request.RequestID)
+				if err != nil {
+					found.err = fmt.Errorf("verifying prior submission for request %q: %w", request.RequestID, err)
+				} else if exists {
+					found.jobID, found.state = jobID, state
+				} else {
+					manifest.Works[i].JobID = ""
+				}
+			case priorID != "" || (priorWorks[request.RequestID] && !storeAbsent):
+				found.err = fmt.Errorf("cannot prove no prior submission for request %q; refusing to resubmit", request.RequestID)
+			}
+		}
+		if found.jobID != "" || found.err != nil {
+			recovered[request.RequestID] = found
+			if found.jobID != "" {
+				manifest.Works[i].JobID = found.jobID
+			}
+			continue
+		}
+		unsubmitted = append(unsubmitted, request)
+	}
+	if len(unsubmitted) != 0 {
+		classified, err := classifyBatchOwnership(ctx, caller, unsubmitted, options)
+		if err != nil {
+			return nil, err
+		}
+		ownership.StalenessWarning = classified.StalenessWarning
+		for i, request := range unsubmitted {
+			ownership.Works[manifestIndices[request.RequestID]] = classified.Works[i]
+		}
+	}
 	output := &SubmitOutput{BatchID: manifest.ID, Submitted: make([]Submission, 0, len(requests)), StalenessWarning: ownership.StalenessWarning}
 	for i, classification := range ownership.Works {
 		switch classification.Status {
@@ -497,49 +554,12 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 					errs[index] = err
 				}
 			}
-			// A previous interrupted run may already own this work:
-			// reattach to its job whatever its state instead of
-			// submitting again.
-			if priorID := priorJobs[request.RequestID]; priorID != "" {
-				var detail jobDetail
-				if err := caller.Call(ctx, "jobs.get", map[string]string{"job_id": priorID}, &detail); err == nil {
-					if state, ok := detail.state(); ok {
-						adopt(priorID, state)
-						return
-					}
-				}
-				// The recorded job is unconfirmed. Only a positive
-				// absence proof from the store permits a fresh submit.
-				if inspector == nil {
-					errs[index] = fmt.Errorf("cannot prove no prior submission for request %q; refusing to resubmit", request.RequestID)
+			if found, ok := recovered[request.RequestID]; ok {
+				if found.err != nil {
+					errs[index] = found.err
 					return
 				}
-				jobID, state, found, err := inspector.jobForRequest(ctx, request.RequestID)
-				if err != nil {
-					errs[index] = fmt.Errorf("verifying prior submission for request %q: %w", request.RequestID, err)
-					return
-				}
-				if found {
-					adopt(jobID, state)
-					return
-				}
-			} else if inspector != nil {
-				jobID, state, found, err := inspector.jobForRequest(ctx, request.RequestID)
-				if err != nil {
-					errs[index] = fmt.Errorf("verifying prior submission for request %q: %w", request.RequestID, err)
-					return
-				}
-				if found {
-					adopt(jobID, state)
-					return
-				}
-			} else if priorWorks[request.RequestID] && !storeAbsent {
-				// A prior run wrote an intent for this request but no
-				// association, and the existing store cannot be read.
-				// Submitting could duplicate a committed-but-unreported
-				// job. A missing store is instead proof that nothing was
-				// committed, so the work falls through to a fresh submit.
-				errs[index] = fmt.Errorf("cannot prove no prior submission for request %q; refusing to resubmit", request.RequestID)
+				adopt(found.jobID, found.state)
 				return
 			}
 			var submitted submitResult

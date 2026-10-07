@@ -77,3 +77,19 @@ func (s *storeInspector) jobForRequest(ctx context.Context, requestID string) (j
 	}
 	return id, st, true, nil
 }
+
+// jobForScopedRequest includes convergence onto another request's job. A lost
+// submit_once reply leaves that association only in submission_receipts.
+func (s *storeInspector) jobForScopedRequest(ctx context.Context, requestID string) (jobID, state string, found bool, err error) {
+	err = s.db.QueryRowContext(ctx, `
+		SELECT j.id, j.state FROM submission_receipts r
+		LEFT JOIN jobs j ON j.id = r.job_id
+		WHERE r.request_id = ?`, requestID).Scan(&jobID, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.jobForRequest(ctx, requestID)
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("looking up the submission receipt for request %s: %w", requestID, err)
+	}
+	return jobID, state, true, nil
+}
