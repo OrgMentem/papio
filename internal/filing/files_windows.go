@@ -4,8 +4,9 @@
 package filing
 
 import (
-	"golang.org/x/sys/windows"
 	"os"
+
+	"golang.org/x/sys/windows"
 )
 
 func openRegular(path string) (*os.File, error) {
