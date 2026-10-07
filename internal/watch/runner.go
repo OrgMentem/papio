@@ -952,27 +952,53 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		queuedWorks[i] = request.Work
 	}
 	manifest := batch.NewManifest(queuedWorks, "watch: "+watch.Label, watch.Collection, runStart)
-	result.ManifestID = manifest.ID
 	for i := range manifest.Works {
 		requestID := batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), manifest.Works[i].Work)
 		manifest.Works[i].RequestID = requestID
 		manifest.Works[i].Work.RequestID = requestID
 	}
+	// Carry forward JobIDs a previous attempt made durable for this batch, so
+	// a manifest rewritten after a failure never drops a job that exists.
+	if existing, loadErr := batch.Load(r.DataDir, manifest.ID); loadErr == nil {
+		existingByRequest := make(map[string]string, len(existing.Works))
+		for _, entry := range existing.Works {
+			if entry.JobID != "" {
+				existingByRequest[entry.RequestID] = entry.JobID
+			}
+		}
+		for i := range manifest.Works {
+			manifest.Works[i].JobID = existingByRequest[manifest.Works[i].RequestID]
+		}
+	} else if !errors.Is(loadErr, batch.ErrManifestNotFound) {
+		return result, loadErr
+	}
+	// Persist the manifest before the first submission: a job created without
+	// a durable record is one the watch can neither report nor recover.
+	if err := batch.Write(r.DataDir, manifest); err != nil {
+		return result, err
+	}
+	result.ManifestID = manifest.ID
 	autoImport := true
 	for i := range manifest.Works {
+		// A recorded JobID is never a reason to skip submission. The request
+		// ID reconciles a still-live job to itself, while a job that reached
+		// a terminal state must be replaced — which only submission can do.
+		// A JobID carried from an earlier manifest is a record, not evidence
+		// that the job is still live, so a failed submission stays a failure.
 		request := manifest.Works[i].Work
 		jobID, err := r.Submitter.SubmitWithAutoImport(ctx, request, &autoImport)
 		if err != nil {
 			manifest.Works[i].Status = "submission_failed"
 			manifest.Works[i].Error = "submit"
 			result.Failed++
-			continue
+		} else {
+			manifest.Works[i].JobID = jobID
+			result.Queued++
 		}
-		manifest.Works[i].JobID = jobID
-		result.Queued++
-	}
-	if err := batch.Write(r.DataDir, manifest); err != nil {
-		return result, err
+		// A later submission or write failure must not erase earlier JobIDs.
+		if err := batch.Write(r.DataDir, manifest); err != nil {
+			return result, err
+		}
 	}
 	if result.Failed == len(manifest.Works) {
 		// The scan position stays put, so the next run re-reads these pages.
