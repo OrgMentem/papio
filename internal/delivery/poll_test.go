@@ -607,6 +607,71 @@ func TestPoll404ReconciliationRecoversViaUserRequests(t *testing.T) {
 	}
 }
 
+func TestPoll404ReconciliationReadFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		listing     http.HandlerFunc
+		wantSettled bool
+		wantState   State
+	}{
+		{name: "temporary listing outage remains retryable", listing: statusOnly(http.StatusServiceUnavailable), wantState: StateSubmitted},
+		{name: "invalid listing requires human reconciliation", listing: invalidJSON, wantSettled: true, wantState: StateUnknownOutcome},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, clock := testServiceClock(t)
+			ctx := context.Background()
+			req := newLiveRequest(t, svc, "404-reconcile-read-failure", *clock)
+			lastSuccess := store.FormatTime(clock.Add(-time.Hour))
+			if _, err := svc.store.DB().ExecContext(ctx,
+				"UPDATE delivery_requests SET last_successful_poll_at = ? WHERE id = ?", lastSuccess, req.ID); err != nil {
+				t.Fatal(err)
+			}
+			req, err := svc.Get(ctx, req.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasPrefix(r.URL.Path, "/Users/ExternalUserId/"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"UserName":"patron1"}`))
+				case strings.HasPrefix(r.URL.Path, "/Transaction/UserRequests/"):
+					tc.listing(w, r)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			result, err := svc.Poll(ctx, req, PollDeps{
+				Client:    illiad.New(srv.Client(), srv.URL, "key"),
+				PatronRef: "patron1", ReferenceField: "ItemInfo4", StatusPollMinutes: 60,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Settled != tc.wantSettled || result.State != tc.wantState {
+				t.Fatalf("result = %+v, want settled = %v, state = %s", result, tc.wantSettled, tc.wantState)
+			}
+			got, err := svc.Get(ctx, req.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != tc.wantState || got.ProviderReference != "555" || got.LastSuccessfulPollAt != lastSuccess {
+				t.Fatalf("request = %+v, want state %s with the original reference and successful-poll evidence", got, tc.wantState)
+			}
+			if tc.wantSettled {
+				if got.NextCheckAt != "" || !result.NextCheckAt.IsZero() {
+					t.Fatalf("settled request still polls: request = %+v, result = %+v", got, result)
+				}
+			} else {
+				if got.LastPollErrorClass != PollErrorClassTransient || got.ConsecutivePollFailures != 1 || !result.NextCheckAt.After(*clock) {
+					t.Fatalf("temporary read failure did not schedule a transient retry: request = %+v, result = %+v", got, result)
+				}
+			}
+		})
+	}
+}
+
 func TestPoll404UnreconciledSettlesUnknownOutcomeOnlyAfterDelayedRecheck(t *testing.T) {
 	svc, clock := testServiceClock(t)
 	ctx := context.Background()

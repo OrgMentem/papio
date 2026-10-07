@@ -166,6 +166,32 @@ const maxVersionSiblings = 3
 // relation-less DOI is (nil, nil); rate limits and upstream faults are
 // *resolver.TemporaryError like every other source client.
 func (e *Enricher) VersionSiblings(ctx context.Context, doi string) ([]string, error) {
+	relations, err := e.versionRelations(ctx, doi, versionRelationTypes, false)
+	if err != nil || len(relations) == 0 {
+		return nil, err
+	}
+	siblings := make([]string, len(relations))
+	for i, relation := range relations {
+		siblings[i] = relation.TargetDOI
+	}
+	return siblings, nil
+}
+
+// PublicationRelation preserves the registrant's direction and relation type.
+type PublicationRelation struct {
+	SourceDOI string `json:"source_doi"`
+	TargetDOI string `json:"target_doi"`
+	Type      string `json:"type"`
+	Provider  string `json:"provider"`
+}
+
+// PublicationRelations returns only explicit publication edges, never generic
+// version siblings. The injected HTTP client retains the source budget gate.
+func (e *Enricher) PublicationRelations(ctx context.Context, doi string) ([]PublicationRelation, error) {
+	return e.versionRelations(ctx, doi, []string{"is-preprint-of"}, true)
+}
+
+func (e *Enricher) versionRelations(ctx context.Context, doi string, types []string, verifySource bool) ([]PublicationRelation, error) {
 	if e == nil || e.client == nil {
 		return nil, errors.New("enrich: HTTP client is not configured")
 	}
@@ -231,9 +257,15 @@ func (e *Enricher) VersionSiblings(ctx context.Context, doi string) ([]string, e
 	if err := decodeBoundedJSON(resp.Body, e.maxBody, &payload); err != nil {
 		return nil, fmt.Errorf("enrich: invalid Crossref response: %w", err)
 	}
+	if verifySource {
+		source, err := work.NormalizeDOI(payload.Message.DOI)
+		if err != nil || source != normalized {
+			return nil, errors.New("enrich: publication relation source DOI does not match the requested work")
+		}
+	}
 	seen := map[string]bool{normalized: true}
-	siblings := make([]string, 0, maxVersionSiblings)
-	for _, relationType := range versionRelationTypes {
+	siblings := make([]PublicationRelation, 0, maxVersionSiblings)
+	for _, relationType := range types {
 		for _, target := range payload.Message.Relation[relationType] {
 			if !strings.EqualFold(strings.TrimSpace(target.IDType), "doi") {
 				continue
@@ -243,7 +275,7 @@ func (e *Enricher) VersionSiblings(ctx context.Context, doi string) ([]string, e
 				continue
 			}
 			seen[sibling] = true
-			siblings = append(siblings, sibling)
+			siblings = append(siblings, PublicationRelation{SourceDOI: normalized, TargetDOI: sibling, Type: relationType, Provider: "crossref"})
 			if len(siblings) == maxVersionSiblings {
 				return siblings, nil
 			}
@@ -257,6 +289,7 @@ func (e *Enricher) VersionSiblings(ctx context.Context, doi string) ([]string, e
 
 type relationResponse struct {
 	Message struct {
+		DOI      string                      `json:"DOI"`
 		Relation map[string][]relationTarget `json:"relation"`
 	} `json:"message"`
 }

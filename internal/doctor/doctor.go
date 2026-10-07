@@ -565,6 +565,10 @@ func checkRetraction(cfg config.Config, add func(string, string, string, string)
 // checkFiling reports failed or absent on_ready outcomes only when the hook is
 // the configured library hand-off. Zotio keeps its separate delivery lifecycle.
 func checkFiling(ctx context.Context, cfg config.Config, db *store.Store, add func(string, string, string, string)) {
+	if strings.TrimSpace(cfg.Filing.Folder) != "" {
+		checkManagedFiling(ctx, cfg, db, add)
+		return
+	}
 	if strings.TrimSpace(cfg.Hooks.OnReady) == "" {
 		add("filing", Skip, "no on_ready hook configured", "")
 		return
@@ -587,6 +591,7 @@ func checkFiling(ctx context.Context, cfg config.Config, db *store.Store, add fu
 			WHERE newest.job_id = j.id AND newest.kind = 'hook.on_ready'
 		)
 		WHERE j.state IN ('ready', 'imported')
+		  AND j.acquisition_disposition = 'active'
 		  AND (e.seq IS NULL OR COALESCE(json_extract(e.detail_json, '$.status'), '') <> 'ok')`).Scan(&count)
 	switch {
 	case err != nil:
@@ -629,6 +634,8 @@ func uncollectedAcquisitions(ctx context.Context, db *store.Store) (int, time.Du
 		FROM jobs j
 		JOIN job_artifacts ja ON ja.job_id = j.id
 		WHERE j.state = 'ready'
+		  AND j.acquisition_disposition = 'active'
+		  AND NOT EXISTS (SELECT 1 FROM managed_filings f WHERE f.job_id = j.id AND f.state = 'filed')
 		  AND j.updated_at < ?
 		  AND NOT EXISTS (SELECT 1 FROM exports e WHERE e.job_id = j.id)`,
 		store.FormatTime(time.Now().Add(-uncollectedGracePeriod)))
@@ -723,6 +730,7 @@ func undeliveredZoteroImports(ctx context.Context, db *store.Store) (int, time.D
 		FROM jobs j
 		JOIN job_artifacts ja ON ja.job_id = j.id
 		WHERE j.state = 'ready'
+		  AND j.acquisition_disposition = 'active'
 		  AND ja.identity_result IN ('pass', 'user_confirmed')
 		  AND json_extract(j.policy_json, '$.auto_import') = 1
 		  AND NOT EXISTS (
@@ -766,6 +774,7 @@ func zoteroDesktopWaitingImports(ctx context.Context, db *store.Store) (n int, w
 			FROM jobs j
 			JOIN events e ON e.job_id = j.id
 			WHERE j.state = 'ready'
+			  AND j.acquisition_disposition = 'active'
 			  AND json_extract(j.policy_json, '$.auto_import') = 1
 			  AND e.kind = 'zotio.auto_import'
 			  AND json_extract(e.detail_json, '$.status') IN ('waiting', 'queued')

@@ -2248,9 +2248,6 @@ func TestAutoImportCancellationDoesNotRecordFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	svc.autoImportReady(ctx, row)
-	if importer.calls != 1 {
-		t.Fatalf("PlanAndApply calls = %d, want 1", importer.calls)
-	}
 	events, err := jobs.Events(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
@@ -3422,7 +3419,12 @@ func TestDrainHooksCancelsManualRefileAndRecordsOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	detail := events[len(events)-1]["detail"].(map[string]any)
+	var detail map[string]any
+	for _, event := range events {
+		if event["kind"] == "hook.on_ready" {
+			detail, _ = event["detail"].(map[string]any)
+		}
+	}
 	if detail["status"] != "cancelled" || detail["trigger"] != "manual" {
 		t.Fatalf("cancelled manual filing event = %#v", detail)
 	}

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,6 +292,77 @@ func TestObserverSkipsCreditObservationWithoutObserver(t *testing.T) {
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		t.Fatal(err)
+	}
+}
+
+type blockingLimitCredit struct {
+	entered chan struct{}
+	release chan struct{}
+	blocked atomic.Bool
+	err     error
+}
+
+func (c *blockingLimitCredit) ObserveLimit(_ context.Context, _ string, _ string, _ int, primary bool) error {
+	if primary && c.blocked.CompareAndSwap(false, true) {
+		close(c.entered)
+		<-c.release
+	}
+	return c.err
+}
+
+func (*blockingLimitCredit) ObserveCreditsUsed(context.Context, string, int) error {
+	return nil
+}
+
+func (*blockingLimitCredit) ObservePrepaidRemaining(context.Context, string, float64) error {
+	return nil
+}
+
+func TestObserverLatchesQuotaBeforeCreditPersistence(t *testing.T) {
+	for _, creditErr := range []error{nil, errors.New("credit storage unavailable")} {
+		name := "successful credit write"
+		if creditErr != nil {
+			name = "failed credit write"
+		}
+		t.Run(name, func(t *testing.T) {
+			credit := &blockingLimitCredit{
+				entered: make(chan struct{}), release: make(chan struct{}), err: creditErr,
+			}
+			observer, _, inner := testObserverWithCredit(t, credit, map[string]string{
+				"X-RateLimit-Limit":     "10000",
+				"X-RateLimit-Remaining": "100",
+				"X-RateLimit-Reset":     "3600",
+			})
+			firstRequest := bearerRequest(t)
+			done := make(chan error, 1)
+			go func() { done <- doAndClose(observer, firstRequest) }()
+			defer func() {
+				close(credit.release)
+				if err := <-done; err != nil {
+					t.Errorf("already-served response = %v, want success", err)
+				}
+			}()
+			select {
+			case <-credit.entered:
+			case <-time.After(quotaDeferTimeout):
+				t.Fatal("credit observation did not start")
+			}
+
+			err := doAndClose(observer, bearerRequest(t))
+			var latched *ErrQuotaLatched
+			if !errors.As(err, &latched) {
+				t.Fatalf("same-identity request during credit write = %v, want ErrQuotaLatched", err)
+			}
+			if !latched.Until.Equal(observerNow.Add(time.Hour)) || inner.calls != 1 {
+				t.Fatalf("latch = %+v, wire calls = %d; want provider reset and no second request", latched, inner.calls)
+			}
+			if err := doAndClose(observer, observerRequest(t, "https://api.openalex.org/works")); err != nil {
+				t.Fatalf("anonymous request during keyed credit write = %v, want success", err)
+			}
+			if inner.calls != 2 {
+				t.Fatalf("wire calls = %d, want only the original and anonymous requests", inner.calls)
+			}
+		})
 	}
 }
 
