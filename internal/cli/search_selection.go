@@ -12,11 +12,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/spf13/cobra"
 	"papio/internal/batch"
 	"papio/internal/discovery"
 	"papio/internal/protocol"
 	"papio/internal/zotio"
+
+	"github.com/spf13/cobra"
 )
 
 type searchSnapshot struct {

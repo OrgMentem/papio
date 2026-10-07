@@ -378,7 +378,7 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	if options.IdentityScope != "" {
 		manifest.ID = ScopedID(requests, options.Now, options.IdentityScope)
 		for i := range manifest.Works {
-			manifest.Works[i].RequestID = RequestID(manifest.ID, requests[i])
+			manifest.Works[i].RequestID = RequestID(manifest.ID, manifest.Works[i].Work)
 			manifest.Works[i].Work.RequestID = manifest.Works[i].RequestID
 		}
 	}

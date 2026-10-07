@@ -153,7 +153,11 @@ func TestAbortMigrationAfterSQLiteRollback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer tx.Rollback()
+			defer func() {
+				if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+					t.Errorf("cleanup rollback: %v", err)
+				}
+			}()
 			if _, err := tx.Exec(`
 				CREATE TABLE gated (x);
 				CREATE TRIGGER abort_insert BEFORE INSERT ON gated

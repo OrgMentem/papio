@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"papio/internal/api"
 	"papio/internal/batch"
 	"papio/internal/bibparse"
@@ -24,6 +23,8 @@ import (
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/store"
+
+	"github.com/spf13/cobra"
 )
 
 const campaignCeiling = 200
