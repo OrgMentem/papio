@@ -219,7 +219,7 @@ func WorkerMain(in io.Reader, out io.Writer) error { return RunStructuralWorker(
 // rewrite leaves no destination file behind.
 func sanitizeWithPDFCPU(req workerRequest) StructuralReport {
 	conf := model.NewDefaultConfiguration()
-	if err := api.RemoveAttachmentsFile(req.Path, req.SanitizeTo, nil, conf); err != nil {
+	if err := api.RemoveAttachmentsFile(context.Background(), req.Path, req.SanitizeTo, nil, conf); err != nil {
 		_ = os.Remove(req.SanitizeTo)
 		// Same discipline as inspectWithPDFCPU: name the category, never the
 		// upstream text, which embeds the absolute quarantine path.
@@ -242,7 +242,7 @@ func inspectWithPDFCPU(req workerRequest) StructuralReport {
 	defer func() { _ = f.Close() }()
 
 	conf := model.NewDefaultConfiguration()
-	info, infoErr := api.PDFInfo(f, req.Path, nil, false, conf)
+	info, infoErr := api.PDFInfo(context.Background(), f, req.Path, nil, false, conf)
 	if infoErr != nil {
 		encrypted := strings.Contains(strings.ToLower(infoErr.Error()), "encrypt") || strings.Contains(strings.ToLower(infoErr.Error()), "password")
 		reason := "pdfcpu inspection: " + infoErr.Error()
@@ -270,7 +270,7 @@ func inspectWithPDFCPU(req workerRequest) StructuralReport {
 		report.Reason = "rewind PDF: " + err.Error()
 		return report
 	}
-	ctx, err := api.ReadContext(f, conf)
+	ctx, err := api.ReadContext(context.Background(), f, conf)
 	if err != nil {
 		report.Reason = "pdfcpu context: " + err.Error()
 		return report
@@ -289,7 +289,7 @@ func inspectWithPDFCPU(req workerRequest) StructuralReport {
 		report.Reason = "rewind PDF: " + err.Error()
 		return report
 	}
-	if err := api.Validate(f, conf); err != nil {
+	if err := api.Validate(context.Background(), f, conf, nil); err != nil {
 		report.Reason = "pdfcpu validation: " + err.Error()
 		return report
 	}
