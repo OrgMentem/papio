@@ -5,8 +5,8 @@
   // .forgejo/workflows/renovate.yml), NOT by GitHub Actions — so scans cost no
   // GitHub minutes. Detection-only: one PR per update, each gated by ci.yml.
   // Dependency surfaces: Go modules, GitHub Actions (SHA-pinned), the browser
-  // extension's npm/bun devDependencies, and the betterleaks curl pin in ci.yml
-  // (the only one a custom manager can track).
+  // extension's npm/bun devDependencies, and two custom-manager pins: the
+  // betterleaks curl pin in ci.yml and govulncheck's Go toolchain in vuln.yml.
   extends: [
     "config:recommended",
     ":dependencyDashboard",
@@ -45,6 +45,15 @@
       addLabels: ["review-carefully"],
     },
     {
+      // pdfcpu minors break its api.* signatures (v0.16 added a parameter to
+      // six calls internal/pdf uses), so it gets its own PR instead of
+      // blocking the routine Go batch.
+      matchManagers: ["gomod"],
+      matchDepNames: ["github.com/pdfcpu/pdfcpu"],
+      groupName: "pdfcpu",
+      addLabels: ["review-carefully"],
+    },
+    {
       // betterleaks bumps: CI's secrets job WILL fail until BL_SHA256 is
       // updated by hand (Renovate cannot compute a release-asset checksum).
       matchDepNames: ["betterleaks/betterleaks"],
@@ -65,6 +74,16 @@
       depNameTemplate: "betterleaks/betterleaks",
       datasourceTemplate: "github-releases",
       extractVersionTemplate: "^v(?<version>.+)$",
+    },
+    {
+      // govulncheck-action's toolchain pin. The github-actions manager reads
+      // setup-go's `go-version` but not `go-version-input`, so vuln.yml once sat
+      // three patches behind and failed on fixed stdlib CVEs.
+      customType: "regex",
+      managerFilePatterns: ["/^\\.github/workflows/vuln\\.yml$/"],
+      matchStrings: ["go-version-input: '(?<currentValue>[^']+)'"],
+      depNameTemplate: "go",
+      datasourceTemplate: "golang-version",
     },
   ],
 }
