@@ -460,7 +460,7 @@ type CreateResult struct {
 // one transaction. Resubmitting the same requestID returns its existing live
 // job; terminal attempts permit a new job.
 func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, principal Principal) (string, error) {
-	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, Attribution{Principal: principal}, false, false, "", 0)
+	result, err := js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, Attribution{Principal: principal}, false, false, "", 0, false)
 	if err != nil {
 		return "", err
 	}
@@ -478,17 +478,17 @@ func (js *Store) CreateRequest(ctx context.Context, requestID string, w work.Wor
 // this acquisition, and rewriting the row would hand one consumer another's
 // work.
 func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force bool) (CreateResult, error) {
-	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, force, true, "", 0)
+	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, force, true, "", 0, false)
 }
 
 // CreateRecheckRequestForWork creates a replacement job and records the old
 // unavailable job's re-check event in the same transaction. The event is the
 // durable idempotency key, so neither write can survive without the other.
 func (js *Store) CreateRecheckRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, recheckOf string, windowDays int) (CreateResult, error) {
-	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, false, true, recheckOf, windowDays)
+	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, false, true, recheckOf, windowDays, false)
 }
 
-func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force, deduplicateWork bool, recheckOf string, recheckWindowDays int) (CreateResult, error) {
+func (js *Store) createRequest(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, force, deduplicateWork bool, recheckOf string, recheckWindowDays int, once bool) (CreateResult, error) {
 	if who.Principal == "" {
 		who.Principal = PrincipalUnknown
 	}
@@ -502,6 +502,25 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		return CreateResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	fingerprint := ""
+	if once {
+		fingerprint = onceFingerprint(w, pol, zotioKey, collection)
+		// Reserve the writer before reading the receipt or choosing a live job.
+		if _, err := tx.ExecContext(ctx, `UPDATE submission_receipts SET fingerprint=fingerprint WHERE request_id=?`, requestID); err != nil {
+			return CreateResult{}, err
+		}
+		var existing, storedFingerprint string
+		err := tx.QueryRowContext(ctx, `SELECT job_id,fingerprint FROM submission_receipts WHERE request_id=?`, requestID).Scan(&existing, &storedFingerprint)
+		if err == nil {
+			if storedFingerprint != fingerprint {
+				return CreateResult{}, errors.New("once-only request identity or filing intent changed")
+			}
+			return CreateResult{JobID: existing, Existing: true}, tx.Commit()
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return CreateResult{}, err
+		}
+	}
 
 	if recheckOf != "" {
 		var state string
@@ -529,12 +548,32 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 			return CreateResult{}, err
 		}
 		if existing != "" {
+			if once {
+				compatible, err := compatibleOncePolicy(ctx, tx, existing, pol, zotioKey, collection)
+				if err != nil {
+					return CreateResult{}, err
+				}
+				if !compatible {
+					return CreateResult{}, errors.New("once-only request conflicts with an existing acquisition policy")
+				}
+				return commitOnceReceipt(ctx, tx, requestID, fingerprint, existing, true)
+			}
 			return CreateResult{JobID: existing, Existing: true}, nil
 		}
 		if deduplicateWork {
 			existing, err = liveJobForCanonicalWork(ctx, tx, w)
 			if err != nil {
 				return CreateResult{}, err
+			}
+			if once && existing != "" {
+				compatible, err := compatibleOncePolicy(ctx, tx, existing, pol, zotioKey, collection)
+				if err != nil {
+					return CreateResult{}, err
+				}
+				if compatible {
+					return commitOnceReceipt(ctx, tx, requestID, fingerprint, existing, true)
+				}
+				existing = ""
 			}
 			if existing != "" {
 				return CreateResult{JobID: existing, Existing: true}, nil
@@ -636,6 +675,9 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 				return CreateResult{}, err
 			}
 		}
+	}
+	if once {
+		return commitOnceReceipt(ctx, tx, requestID, fingerprint, jobID, false)
 	}
 	if err := tx.Commit(); err != nil {
 		return CreateResult{}, err
@@ -1045,7 +1087,7 @@ func (js *Store) transition(ctx context.Context, jobID, from, to string, detail 
 		        selected_candidate_id = COALESCE(?, selected_candidate_id),
 		        lease_owner = CASE WHEN ? THEN NULL ELSE lease_owner END,
 		        lease_expires_at = CASE WHEN ? THEN NULL ELSE lease_expires_at END
-		 WHERE id = ? AND state = ?`,
+		 WHERE id = ? AND state = ? AND acquisition_disposition = 'active'`,
 		to, now, nullable(cfg.retryAt), nullable(cfg.terminalReason), nullable(cfg.artifactSHA), cfg.candidateID,
 		releaseLease, releaseLease, jobID, from)
 	if err != nil {
@@ -2058,6 +2100,9 @@ func (js *Store) listJobs(ctx context.Context, state, consumer string, limit int
 	if state != "" {
 		where = append(where, `state = ?`)
 		args = append(args, state)
+		if state == StateReady {
+			where = append(where, `acquisition_disposition = 'active'`)
+		}
 	}
 	if consumer != "" {
 		where = append(where, `consumer = ?`)
@@ -2144,6 +2189,7 @@ func (js *Store) listOldestAfter(ctx context.Context, states []string, limit int
 		args = append(args, state)
 	}
 	q := `SELECT id FROM jobs WHERE state IN (` + placeholders + `)`
+	q += ` AND acquisition_disposition = 'active'`
 	if after.createdAt != "" {
 		q += ` AND (created_at > ? OR (created_at = ? AND id > ?))`
 		args = append(args, after.createdAt, after.createdAt, after.id)

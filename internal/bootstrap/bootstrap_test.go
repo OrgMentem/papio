@@ -536,7 +536,7 @@ func TestSystemCloseCancelsHookAndPersistsOutcome(t *testing.T) {
 	cfg.Zotio.Executable = ""
 	cfg.Zotio.AutoEnrich = false
 	cfg.Hooks.OnReady = "configured"
-	cfg.Hooks.TimeoutSeconds = 5
+	cfg.Hooks.TimeoutSeconds = 1
 	system, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)

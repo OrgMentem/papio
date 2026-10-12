@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"papio/internal/agentjson"
+	"papio/internal/job"
 )
 
 const (
@@ -326,6 +327,7 @@ func (s *Service) listImportBackfillCandidates(ctx context.Context, includeNotRe
 		SELECT j.id, j.created_at
 		FROM jobs j
 		WHERE j.state = 'ready'
+		  AND j.acquisition_disposition = 'active'
 		  AND EXISTS (
 			SELECT 1
 			FROM job_artifacts ja
@@ -389,6 +391,7 @@ func (s *Service) countImportBackfillExcluded(ctx context.Context, includeNotReq
 		SELECT COUNT(*)
 		FROM jobs j
 		WHERE j.state = 'ready'
+		  AND j.acquisition_disposition = 'active'
 		  AND EXISTS (
 			SELECT 1
 			FROM job_artifacts ja
@@ -415,6 +418,13 @@ func (s *Service) classifyImportBackfillJob(ctx context.Context, jobID string, o
 	row, err := s.Bundle.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return importBackfillExpectedFail, "", "", err
+	}
+	disposition, dispositionErr := s.Bundle.Jobs.Disposition(ctx, jobID)
+	if dispositionErr != nil {
+		return importBackfillExpectedFail, "", "", dispositionErr
+	}
+	if disposition.Disposition == job.DispositionArchived {
+		return importBackfillExpectedFail, "archived", "", nil
 	}
 	if ownershipKnown {
 		if parentKey = ownedParents[jobID]; parentKey != "" {

@@ -465,6 +465,81 @@ func TestReserveCostIsDurableAndAtomic(t *testing.T) {
 	}
 }
 
+func TestReleaseReservedCostReversesAReservation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		release    float64
+		failEvent  bool
+		wantError  bool
+		wantSpent  float64
+		wantEvents int
+	}{
+		{name: "matched reservation", release: 0.5, wantSpent: 0.25, wantEvents: 1},
+		{name: "unreserved cost", release: 1, wantError: true, wantSpent: 0.75},
+		{name: "zero cost", wantSpent: 0.75},
+		{name: "negative cost", release: -0.5, wantSpent: 0.75},
+		{name: "event failure rolls back refund", release: 0.5, failEvent: true, wantError: true, wantSpent: 0.75},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			js := testStore(t)
+			ctx := context.Background()
+			id, err := js.CreateRequest(ctx, "wr_cost_release", testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cost := range []float64{0.25, 0.5} {
+				if err := js.ReserveCost(ctx, id, "paid", cost, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.failEvent {
+				if _, err := js.S.DB().ExecContext(ctx, `
+					CREATE TRIGGER reject_cost_release BEFORE INSERT ON events
+					WHEN NEW.kind = 'job.cost_released'
+					BEGIN SELECT RAISE(ABORT, 'release event rejected'); END;`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := js.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = js.ReleaseReservedCost(ctx, id, "paid", tc.release)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("release error = %v, want error = %v", err, tc.wantError)
+			}
+			row, err := js.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.SpentUSD != tc.wantSpent {
+				t.Fatalf("spent = %v, want %v", row.SpentUSD, tc.wantSpent)
+			}
+			events, err := js.Events(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != len(before)+tc.wantEvents {
+				t.Fatalf("event count changed by %d, want only %d release events", len(events)-len(before), tc.wantEvents)
+			}
+			released := 0
+			for _, event := range events {
+				if event["kind"] != "job.cost_released" {
+					continue
+				}
+				released++
+				detail, ok := event["detail"].(map[string]any)
+				if !ok || detail["source"] != "paid" || detail["cost_usd"] != tc.release {
+					t.Fatalf("release event = %+v, want paid source and cost %v", event, tc.release)
+				}
+			}
+			if released != tc.wantEvents {
+				t.Fatalf("release events = %d, want %d", released, tc.wantEvents)
+			}
+		})
+	}
+}
+
 func TestCancelIsIdempotentAndNeverOverwritesTerminalResult(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()

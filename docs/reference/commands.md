@@ -465,6 +465,67 @@ papio bundle export <job-id> [flags]
 | --- | --- | --- | --- |
 | `-o, --output` | `string` |  | destination directory |
 
+## `papio campaign`
+
+Stage a selected citation export in bounded acquisition chunks
+
+```
+papio campaign
+```
+
+### `papio campaign import`
+
+Preview and persist up to 200 source records without submitting jobs
+
+```
+papio campaign import <file> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--collection` | `string` |  | destination collection; automatic Zotero import stays off |
+| `--resolver` | `string` |  | institution resolver profile |
+
+### `papio campaign pause`
+
+Prevent further staged submission
+
+```
+papio campaign pause <id>
+```
+
+### `papio campaign preview`
+
+Classify all campaign works without submitting
+
+```
+papio campaign preview <id>
+```
+
+### `papio campaign report`
+
+Return one outcome for every original source record
+
+```
+papio campaign report <id>
+```
+
+### `papio campaign resume`
+
+Allow staged submission without submitting yet
+
+```
+papio campaign resume <id>
+```
+
+### `papio campaign run`
+
+Submit at most one chunk within the 50-active-work window
+
+```
+papio campaign run <id>
+```
+
 ## `papio config`
 
 Manage papio configuration
@@ -999,6 +1060,18 @@ papio jobs add-component <job-id> <path> [flags]
 | --- | --- | --- | --- |
 | `--role` | `string` |  | component role: supplement or appendix |
 
+### `papio jobs archive`
+
+Archive a validated acquisition without deleting its artifact
+
+```
+papio jobs archive <job-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--confirm` | `bool` | `false` | confirm the archive decision; do not delete retained artifacts |
+
 ### `papio jobs cancel`
 
 Cancel a nonterminal job
@@ -1013,6 +1086,14 @@ Explain why one job needs attention and what can happen next
 
 ```
 papio jobs diagnose <job-id>
+```
+
+### `papio jobs disposition`
+
+Inspect acquisition disposition and retained artifact
+
+```
+papio jobs disposition <job-id>
 ```
 
 ### `papio jobs failures`
@@ -1031,6 +1112,50 @@ papio jobs failures [flags]
 | --- | --- | --- | --- |
 | `--limit` | `int` | `50` | maximum groups (1-200) |
 | `--since` | `string` |  | include jobs updated since a duration or RFC3339 timestamp |
+
+### `papio jobs filing`
+
+Inspect and retry durable managed folder filing
+
+```
+papio jobs filing
+```
+
+#### `papio jobs filing inspect`
+
+Inspect managed destination receipts and retry state
+
+```
+papio jobs filing inspect <job-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `100` | maximum receipts (1-500) |
+
+#### `papio jobs filing list`
+
+Inspect managed destination receipts and retry state
+
+```
+papio jobs filing list [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `100` | maximum receipts (1-500) |
+
+#### `papio jobs filing retry`
+
+Safely replay a journaled managed folder destination
+
+```
+papio jobs filing retry <job-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--destination` | `string` |  | journaled folder destination; default is the configured folder |
 
 ### `papio jobs get`
 
@@ -1138,6 +1263,14 @@ Return an orphaned awaiting-human job with no open actions to resolving
 
 ```
 papio jobs repair-awaiting-human <job-id>
+```
+
+### `papio jobs restore`
+
+Restore an archived acquisition to the actionable ready view
+
+```
+papio jobs restore <job-id>
 ```
 
 ### `papio jobs retry`
@@ -1305,11 +1438,45 @@ papio search [query] [flags]
 | --- | --- | --- | --- |
 | `--cited-by` | `string` |  | DOI to find papers it cites (backward references; OpenAlex cited_by: filter) |
 | `--cites` | `string` |  | DOI to find papers citing it (forward citations; OpenAlex cites: filter) |
+| `--continuation` | `string` |  | resume a new-only search with its exact query and filters |
 | `--limit` | `int` | `20` | maximum results (1-50) |
-| `--new-only` | `bool` | `false` | omit works already in your library; filters after --limit and may return fewer results |
+| `--new-only` | `bool` | `false` | page until the requested unowned count or a disclosed scan budget |
 | `--oa-only` | `bool` | `false` | return only open-access works |
 | `--related-to` | `string` |  | DOI to find OpenAlex-related papers (related_to: filter) |
 | `--source` | `string` |  | discovery backend: arxiv, openalex, or semanticscholar (default: all configured) |
+| `--year-from` | `int` | `0` | minimum publication year |
+| `--year-to` | `int` | `0` | maximum publication year |
+
+### `papio search acquire`
+
+Preview selected search keys; submit only with --confirm
+
+```
+papio search acquire <snapshot> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--collection` | `string` |  | destination collection |
+| `--confirm` | `bool` | `false` | submit exactly the selected works after current ownership classification |
+| `--keys` | `stringSlice` | `[]` | comma-separated exact keys from the search snapshot |
+| `--label` | `string` | `search selection` | batch label |
+| `--resolver` | `string` |  | institution resolver profile |
+
+### `papio search save`
+
+Save a bounded search result set for explicit selection
+
+```
+papio search save <snapshot> <query> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--limit` | `int` | `20` | maximum selected search candidates (1-50) |
+| `--new-only` | `bool` | `false` | fill the bounded snapshot with unowned results |
+| `--oa-only` | `bool` | `false` | open-access results only |
+| `--source` | `string` |  | configured discovery backend |
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
 
@@ -1402,6 +1569,29 @@ papio watch add [query] [flags]
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
 
+### `papio watch backfill`
+
+Manage explicit non-Zotero library backfill
+
+```
+papio watch backfill
+```
+
+#### `papio watch backfill add`
+
+Schedule missing PDFs from a declared record_present source
+
+```
+papio watch backfill add [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--cadence` | `string` | `daily` | daily, weekly, or Nh |
+| `--label` | `string` |  | human label |
+| `--limit-per-run` | `int` | `10` | maximum new papers per run (1-50) |
+| `--source` | `string` |  | configured record_present library source name (required) |
+
 ### `papio watch digest`
 
 Show recently reported works from an alert watch
@@ -1433,12 +1623,94 @@ papio watch digest clear <id> [flags]
 | `--all` | `bool` | `false` | confirm clearing every pending work, including works the digest view did not show |
 | `--dry-run` | `bool` | `false` | count the pending works without clearing them |
 
+### `papio watch edit`
+
+Change operational watch settings without resetting history
+
+```
+papio watch edit <id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--cadence` | `string` |  | daily, weekly, or Nh |
+| `--collection` | `string` |  | destination collection |
+| `--label` | `string` |  | human label |
+| `--limit-per-run` | `int` | `0` | maximum papers per run (1-50) |
+| `--oa-only` | `bool` | `false` | return only open-access works |
+| `--year-from` | `int` | `0` | minimum publication year (0 clears) |
+| `--year-to` | `int` | `0` | maximum publication year (0 clears) |
+
 ### `papio watch list`
 
 List scheduled discovery watches
 
 ```
 papio watch list
+```
+
+### `papio watch publication`
+
+Monitor acquired preprints without replacing their PDFs
+
+```
+papio watch publication
+```
+
+#### `papio watch publication acquire`
+
+Explicitly acquire a published manifestation and keep the original
+
+```
+papio watch publication acquire <notice-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--confirm` | `bool` | `false` | approve acquisition of this exact published manifestation |
+
+#### `papio watch publication add`
+
+Opt in an acquired preprint or accepted manuscript
+
+```
+papio watch publication add <job-id> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--cadence` | `string` | `weekly` | daily, weekly, or Nh |
+
+#### `papio watch publication list`
+
+List publication watches
+
+```
+papio watch publication list
+```
+
+#### `papio watch publication notices`
+
+List verified publication notices
+
+```
+papio watch publication notices <id>
+```
+
+#### `papio watch publication pause`
+
+Stop scheduled checks and keep notice history
+
+```
+papio watch publication pause <id>
+```
+
+#### `papio watch publication run`
+
+Check typed publication relations now
+
+```
+papio watch publication run <id>
 ```
 
 ### `papio watch remove`

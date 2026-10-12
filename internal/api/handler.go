@@ -281,11 +281,59 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"acquire.submit_v3": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return submitV3(ctx, raw, system)
 		},
+		"acquire.submit_once_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return submitOnce(ctx, raw, system)
+		},
 		"acquire.report": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return acquireReport(ctx, raw, system)
 		},
 		"discovery.search": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return searchDiscovery(ctx, raw, system)
+		},
+		"discovery.search_unowned_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return searchUnowned(ctx, raw, system)
+		},
+		"watch.edit_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return editWatch(ctx, raw, system)
+		},
+		"jobs.archive": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return acquisitionDisposition(ctx, raw, system, "archive")
+		},
+		"jobs.restore": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return acquisitionDisposition(ctx, raw, system, "restore")
+		},
+		"jobs.disposition": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return acquisitionDisposition(ctx, raw, system, "inspect")
+		},
+		"watch.backfill_add_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return addGenericBackfill(ctx, raw, system)
+		},
+		"publication.watch_add_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return addPublicationWatch(ctx, raw, system)
+		},
+		"publication.watch_list_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return listPublicationWatches(ctx, raw, system)
+		},
+		"publication.notices_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return publicationNotices(ctx, raw, system)
+		},
+		"publication.watch_run_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return runPublicationWatch(ctx, raw, system)
+		},
+		"publication.watch_pause_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return pausePublicationWatch(ctx, raw, system)
+		},
+		"publication.acquire_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return acquirePublicationNotice(ctx, raw, system)
+		},
+		"managed_filing.list": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return managedFilings(ctx, raw, system, false)
+		},
+		"managed_filing.inspect": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return managedFilings(ctx, raw, system, true)
+		},
+		"managed_filing.retry": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return retryManagedFiling(ctx, raw, system)
 		},
 		"watch.add": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return addWatch(ctx, raw, system)

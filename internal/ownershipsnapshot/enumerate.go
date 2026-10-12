@@ -25,6 +25,22 @@ type LibraryRecord struct {
 // snapshot provider. A command that fails, times out, or overflows its output
 // cap is an error, never an empty library.
 func EnumerateLibraryRecords(ctx context.Context, source config.LibrarySource) ([]LibraryRecord, error) {
+	records, err := EnumerateBibliographicRecords(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LibraryRecord, 0, len(records))
+	for _, record := range records {
+		if strings.TrimSpace(record.DOI) != "" {
+			out = append(out, LibraryRecord{DOI: record.DOI, Title: record.Title})
+		}
+	}
+	return out, nil
+}
+
+// EnumerateBibliographicRecords returns the complete parsed feed, including
+// records without identifiers. It never infers PDF presence from file fields.
+func EnumerateBibliographicRecords(ctx context.Context, source config.LibrarySource) ([]bibparse.Record, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -81,11 +97,5 @@ func EnumerateLibraryRecords(ctx context.Context, source config.LibrarySource) (
 	if err != nil && !errors.Is(err, bibparse.ErrNoEntries) {
 		return nil, fmt.Errorf("library source %q: %w", name, err)
 	}
-	out := make([]LibraryRecord, 0, len(records))
-	for _, record := range records {
-		if strings.TrimSpace(record.DOI) != "" {
-			out = append(out, LibraryRecord{DOI: record.DOI, Title: record.Title})
-		}
-	}
-	return out, nil
+	return records, nil
 }

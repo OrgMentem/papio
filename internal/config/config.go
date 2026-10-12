@@ -808,6 +808,11 @@ type Agent struct {
 	CredentialRef string `toml:"credential_ref,omitempty"`
 }
 
+// Filing enables the durable, replay-safe folder destination. Empty disables it.
+type Filing struct {
+	Folder string `toml:"folder"`
+}
+
 // Config is the loaded, validated configuration.
 type Config struct {
 	AccessMode string            `toml:"access_mode"`
@@ -820,6 +825,7 @@ type Config struct {
 	Zotio      Zotio             `toml:"zotio"`
 	Notify     Notify            `toml:"notify"`
 	Hooks      Hooks             `toml:"hooks"`
+	Filing     Filing            `toml:"filing"`
 	Library    Library           `toml:"library"`
 	Retraction Retraction        `toml:"retraction"`
 	Updates    Updates           `toml:"updates"`
@@ -1099,6 +1105,9 @@ func validateLibraryCommandArgv(argv []string) error {
 }
 
 func (c *Config) validate() error {
+	if c.Filing.Folder != "" && (!filepath.IsAbs(c.Filing.Folder) || strings.TrimSpace(c.Filing.Folder) != c.Filing.Folder) {
+		return errors.New("filing.folder must be an absolute path without surrounding whitespace")
+	}
 	if err := c.validateCredentialReferences(); err != nil {
 		return err
 	}

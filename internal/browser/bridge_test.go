@@ -15137,8 +15137,43 @@ func TestUngovernedArtifactHashesAndSettlesExactProducer(t *testing.T) {
 	if fence.governed || fence.digest != digest {
 		t.Fatalf("ungoverned fence = %+v, want digest %q", fence, digest)
 	}
+	// Polling reads this queue under the session lock while adoption commits
+	// outside it. Keep that read active through producer settlement.
+	stopPolling := make(chan struct{})
+	pollingDone := make(chan struct{})
+	pollingStarted := make(chan struct{})
+	observed := 0
+	go func() {
+		defer close(pollingDone)
+		close(pollingStarted)
+		for {
+			select {
+			case <-stopPolling:
+				return
+			default:
+				b.mu.Lock()
+				if b.reofferPending[id] {
+					observed++
+				}
+				b.mu.Unlock()
+			}
+		}
+	}()
+	<-pollingStarted
+	defer func() {
+		close(stopPolling)
+		<-pollingDone
+		t.Logf("concurrent reoffer reads observing the queued job: %d", observed)
+	}()
 	if err := b.commitArtifact(ctx, id, filename, fence, producer); err != nil {
 		t.Fatal(err)
+	}
+	b.mu.Lock()
+	b.drainQueuedReoffers()
+	queued := b.reofferPending[id]
+	b.mu.Unlock()
+	if !queued {
+		t.Fatal("settled producer did not queue a reoffer")
 	}
 	permit, err := jobs.GetEffectPermitByIdentity(ctx, job.EffectPermitIdentity{
 		JobID: id, Kind: job.GenericDrive, DriveAttemptID: attempt,
@@ -15146,6 +15181,31 @@ func TestUngovernedArtifactHashesAndSettlesExactProducer(t *testing.T) {
 	})
 	if err != nil || permit == nil || permit.Status != job.Settled {
 		t.Fatalf("ungoverned artifact permit=%+v err=%v", permit, err)
+	}
+}
+
+// TestQueuedReofferDoesNotNeedTheSessionLock pins the second half of the
+// adoption contract: a grab confirmation reaches commitArtifact while Sync
+// still holds b.mu, so queueing a re-offer must never take that lock.
+func TestQueuedReofferDoesNotNeedTheSessionLock(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	done := make(chan struct{})
+	b.mu.Lock()
+	go func() {
+		defer close(done)
+		b.queueReoffer("locked-session-job")
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		b.mu.Unlock()
+		t.Fatal("queueing a reoffer blocked on the session lock")
+	}
+	b.drainQueuedReoffers()
+	queued := b.reofferPending["locked-session-job"]
+	b.mu.Unlock()
+	if !queued {
+		t.Fatal("drained queue did not carry the job")
 	}
 }
 

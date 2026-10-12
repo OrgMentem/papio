@@ -140,6 +140,103 @@ func TestProcessParksMonthlyBudgetNotNoLegalCandidates(t *testing.T) {
 	}
 }
 
+func TestFetchCandidatesRefundsReservationWhenMonthlyBudgetCloses(t *testing.T) {
+	svc, jobs := newTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
+	svc.Now = func() time.Time { return now }
+	svc.Budgets = budget.New(jobs.S, budget.WithNow(svc.Now))
+	svc.Resolvers = nil
+	svc.MetadataEnrichers = nil
+	svc.Discovery = nil
+	fetches := 0
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		fetches++
+		return fetch.Result{}, errors.New("monthly budget must prevent the fetch")
+	}
+	policy := config.Source{Enabled: true, MaxCostUSD: 1}
+	svc.Config.Sources["fixture"] = policy
+	// The candidate is already resolved when another request spends the
+	// monthly headroom. The job reservation still succeeds, but Acquire fails.
+	if err := svc.Budgets.Acquire(ctx, "fixture", policy, 0.75); err != nil {
+		t.Fatal(err)
+	}
+	jobPolicy := testPolicy()
+	limit := 1.0
+	jobPolicy.MaxCostUSD = &limit
+	id, err := jobs.CreateRequest(ctx, "wr_cost_compensation", work.Work{DOI: "10.1000/paid"}, "", "", jobPolicy, nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.ReserveCost(ctx, id, "earlier", 0.25, nil); err != nil {
+		t.Fatal(err)
+	}
+	const url = "https://example.test/paid.pdf"
+	const key = "paid_pdf"
+	if _, err := jobs.InsertCandidates(ctx, id, []job.Candidate{{
+		Source: "fixture", URLRedacted: url, URLKey: key, Direct: true, CostUSD: 0.5,
+		Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range [][2]string{
+		{job.StateQueued, job.StateResolving},
+		{job.StateResolving, job.StateFetching},
+	} {
+		if err := jobs.Transition(ctx, id, edge[0], edge[1], nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.fetchCandidates(ctx, row, map[string]resolver.Candidate{
+		key: {Source: "fixture", URL: url, Direct: true, AccessBasis: resolver.AccessOpen},
+	}, retryPlan{}); err != nil {
+		t.Fatal(err)
+	}
+	row, err = jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.StateRetryWait || row.SpentUSD != 0.25 || fetches != 0 {
+		t.Fatalf("job = %+v, fetches = %d; want retry_wait, prior spend 0.25, no fetch", row, fetches)
+	}
+	retryAt, err := time.Parse(time.RFC3339Nano, row.RetryAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC); !retryAt.Equal(want) {
+		t.Fatalf("retry_at = %v, want month boundary %v", retryAt, want)
+	}
+	var status string
+	if err := jobs.S.DB().QueryRowContext(ctx, "SELECT status FROM candidates WHERE job_id = ? AND url_key = ?", id, key).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "retryable" {
+		t.Fatalf("candidate status = %q, want retryable", status)
+	}
+	events, err := jobs.Events(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := 0
+	for _, event := range events {
+		if event["kind"] != "job.cost_released" {
+			continue
+		}
+		released++
+		detail, ok := event["detail"].(map[string]any)
+		if !ok || detail["source"] != "fixture" || detail["cost_usd"] != 0.5 {
+			t.Fatalf("release event = %+v, want fixture source and cost 0.5", event)
+		}
+	}
+	if released != 1 {
+		t.Fatalf("release events = %d, want exactly one compensated reservation", released)
+	}
+}
+
 type lookupCreditDayExceeded struct{ until time.Time }
 
 func (l lookupCreditDayExceeded) LookupWork(context.Context, string) (discovery.DiscoveredWork, error) {

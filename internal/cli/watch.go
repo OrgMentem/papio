@@ -13,6 +13,7 @@ import (
 	"papio/internal/agentjson"
 	"papio/internal/api"
 	"papio/internal/ipc"
+	"papio/internal/publicationwatch"
 	"papio/internal/store"
 	"papio/internal/watch"
 )
@@ -21,11 +22,14 @@ func newWatchCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "watch", Short: "Manage scheduled discovery watchlists"}
 	command.AddCommand(
 		newWatchAddCommand(opt),
+		newWatchEditCommand(opt),
 		newWatchListCommand(opt),
 		newWatchDigestCommand(opt),
 		newWatchRemoveCommand(opt),
 		newWatchResumeCommand(opt),
 		newWatchRunCommand(opt),
+		newWatchBackfillCommand(opt),
+		newWatchPublicationCommand(opt),
 	)
 	return command
 }
@@ -103,6 +107,62 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
 	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")
 	flags.StringVar(&relatedTo, "related-to", "", "DOI to find OpenAlex-related papers (related_to: filter)")
+	return command
+}
+
+func newWatchEditCommand(opt *options) *cobra.Command {
+	var label, collection, cadence string
+	var cap, yearFrom, yearTo int
+	var oaOnly bool
+	command := &cobra.Command{
+		Use: "edit <id>", Short: "Change operational watch settings without resetting history", Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			input := watch.EditInput{ID: id}
+			flags := cmd.Flags()
+			if flags.Changed("label") {
+				input.Label = &label
+			}
+			if flags.Changed("collection") {
+				input.Collection = &collection
+			}
+			if flags.Changed("limit-per-run") {
+				input.PerRunCap = &cap
+			}
+			if flags.Changed("year-from") {
+				input.YearFrom = &yearFrom
+			}
+			if flags.Changed("year-to") {
+				input.YearTo = &yearTo
+			}
+			if flags.Changed("oa-only") {
+				input.OAOnly = &oaOnly
+			}
+			if flags.Changed("cadence") {
+				hours, err := parseWatchCadence(cadence)
+				if err != nil {
+					return err
+				}
+				input.CadenceHours = &hours
+			}
+			var updated watch.Watch
+			if err := opt.call(cmd.Context(), "watch.edit_v1", input, &updated); err != nil {
+				return err
+			}
+			return opt.printResult(updated, "Updated watch %d: %s", updated.ID, updated.Label)
+		},
+	}
+	flags := command.Flags()
+	flags.StringVar(&label, "label", "", "human label")
+	flags.StringVar(&collection, "collection", "", "destination collection")
+	flags.StringVar(&cadence, "cadence", "", "daily, weekly, or Nh")
+	flags.IntVar(&cap, "limit-per-run", 0, "maximum papers per run (1-50)")
+	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year (0 clears)")
+	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year (0 clears)")
+	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
 	return command
 }
 
@@ -446,4 +506,145 @@ func parseWatchID(value string) (int64, error) {
 		return 0, fmt.Errorf("watch id must be a positive integer")
 	}
 	return id, nil
+}
+
+func newWatchBackfillCommand(opt *options) *cobra.Command {
+	var source, label, cadence string
+	var cap int
+	command := &cobra.Command{
+		Use: "backfill", Short: "Manage explicit non-Zotero library backfill",
+	}
+	add := &cobra.Command{
+		Use: "add", Short: "Schedule missing PDFs from a declared record_present source", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			hours, err := parseWatchCadence(cadence)
+			if err != nil {
+				return err
+			}
+			var created watch.GenericBackfillWatch
+			if err := opt.call(cmd.Context(), "watch.backfill_add_v1", watch.GenericBackfillInput{SourceName: source, Label: label, CadenceHours: hours, PerRunCap: cap}, &created); err != nil {
+				return err
+			}
+			return opt.printResult(created, "Added backfill watch %d from %s", created.Watch.ID, created.SourceName)
+		},
+	}
+	add.Flags().StringVar(&source, "source", "", "configured record_present library source name (required)")
+	add.Flags().StringVar(&label, "label", "", "human label")
+	add.Flags().StringVar(&cadence, "cadence", "daily", "daily, weekly, or Nh")
+	add.Flags().IntVar(&cap, "limit-per-run", watch.DefaultPerRunCap, "maximum new papers per run (1-50)")
+	command.AddCommand(add)
+	return command
+}
+
+func newWatchPublicationCommand(opt *options) *cobra.Command {
+	command := &cobra.Command{Use: "publication", Short: "Monitor acquired preprints without replacing their PDFs"}
+	var cadence string
+	add := &cobra.Command{Use: "add <job-id>", Short: "Opt in an acquired preprint or accepted manuscript", Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hours, err := parseWatchCadence(cadence)
+			if err != nil {
+				return err
+			}
+			var result publicationwatch.Watch
+			if err := opt.call(cmd.Context(), "publication.watch_add_v1", publicationwatch.AddInput{JobID: args[0], CadenceHours: hours}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "Added publication watch %d for %s", result.ID, result.SourceDOI)
+		},
+	}
+	add.Flags().StringVar(&cadence, "cadence", "weekly", "daily, weekly, or Nh")
+	list := &cobra.Command{Use: "list", Short: "List publication watches", Args: cobra.NoArgs, Annotations: map[string]string{"mcp:read-only": "true"},
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			var result []publicationwatch.Watch
+			if err := opt.call(cmd.Context(), "publication.watch_list_v1", struct{}{}, &result); err != nil {
+				return err
+			}
+			if opt.jsonOutput {
+				return printPage(opt, "watches", result, false)
+			}
+			for _, item := range result {
+				state := "enabled"
+				if !item.Enabled {
+					state = "paused"
+				}
+				if item.LastError != "" {
+					state += " | " + store.StripTerminalControls(item.LastError)
+				}
+				if _, err := fmt.Fprintf(opt.out, "%d | %s | %s | every %dh | %s\n", item.ID, store.StripTerminalControls(item.SourceDOI), item.ArtifactVersion, item.CadenceHours, state); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	notices := &cobra.Command{Use: "notices <id>", Short: "List verified publication notices", Args: cobra.ExactArgs(1), Annotations: map[string]string{"mcp:read-only": "true"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			var result []publicationwatch.Notice
+			if err := opt.call(cmd.Context(), "publication.notices_v1", watch.IDInput{ID: id}, &result); err != nil {
+				return err
+			}
+			if opt.jsonOutput {
+				return printPage(opt, "notices", result, false)
+			}
+			for _, n := range result {
+				if _, err := fmt.Fprintf(opt.out, "%d | %s -> %s | %s (%s) | job: %s\n", n.ID, store.StripTerminalControls(n.SourceDOI), store.StripTerminalControls(n.TargetDOI), n.RelationType, store.StripTerminalControls(n.Provider), store.StripTerminalControls(n.AcquiredJobID)); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	run := &cobra.Command{Use: "run <id>", Short: "Check typed publication relations now", Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			var result publicationwatch.RunResult
+			if err := opt.call(cmd.Context(), "publication.watch_run_v1", watch.IDInput{ID: id}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "Publication watch %d: %d new notices", result.WatchID, result.NewNotices)
+		},
+	}
+	pause := &cobra.Command{Use: "pause <id>", Short: "Stop scheduled checks and keep notice history", Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			var result struct {
+				ID     int64 `json:"id"`
+				Paused bool  `json:"paused"`
+			}
+			if err := opt.call(cmd.Context(), "publication.watch_pause_v1", watch.IDInput{ID: id}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "Paused publication watch %d", result.ID)
+		},
+	}
+	var confirm bool
+	acquire := &cobra.Command{Use: "acquire <notice-id>", Short: "Explicitly acquire a published manifestation and keep the original", Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseWatchID(args[0])
+			if err != nil {
+				return err
+			}
+			if !confirm {
+				return errors.New("publication acquisition requires --confirm; the original PDF remains unchanged")
+			}
+			var result publicationwatch.Acquisition
+			if err := opt.call(cmd.Context(), "publication.acquire_v1", map[string]any{"notice_id": id}, &result); err != nil {
+				return err
+			}
+			return opt.printResult(result, "Queued publication job %s; original artifact %s stays unchanged", result.JobID, result.OriginalSHA256)
+		},
+	}
+	acquire.Flags().BoolVar(&confirm, "confirm", false, "approve acquisition of this exact published manifestation")
+	command.AddCommand(add, list, notices, run, pause, acquire)
+	return command
 }

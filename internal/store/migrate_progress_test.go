@@ -8,7 +8,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"path/filepath"
-	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -96,13 +95,9 @@ func TestOpenTraceReportsOnlyPendingMigrations(t *testing.T) {
 	}
 }
 
-// TestInterruptedMigrationReportsItsRollback reproduces a daemon whose startup
-// context ends while a migration is running, as a signal ends it. database/sql
-// rolls the transaction back as soon as the context ends, so the explicit
-// rollback that follows finds the transaction already done. That is the
-// rollback having happened, and the log must say so, not report a second
-// failure ("rollback also failed: sql: transaction has already been committed
-// or rolled back") that reads as a damaged database.
+// TestInterruptedMigrationReportsItsRollback checks the database after startup
+// cancellation and preserves the interruption as the error's cause, without
+// adding a redundant rollback error from database/sql or SQLite.
 func TestInterruptedMigrationReportsItsRollback(t *testing.T) {
 	useGatedMigration(t)
 	dataDir := t.TempDir()
@@ -123,14 +118,12 @@ func TestInterruptedMigrationReportsItsRollback(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Open error = %v, want context.Canceled", err)
 	}
-	if strings.Contains(err.Error(), "rollback also failed") {
-		t.Fatalf("Open error = %q: the migration was rolled back, so the rollback must not be reported as failing", err)
-	}
-	if !strings.Contains(err.Error(), "rolled back") {
-		t.Fatalf("Open error = %q, want it to say the migration was rolled back", err)
+	var rollbackErr *sqlite.Error
+	if errors.Is(err, sql.ErrTxDone) || errors.As(err, &rollbackErr) {
+		t.Fatalf("Open error = %v, want only the interruption, not a redundant rollback error", err)
 	}
 
-	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "papio.db"))
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "papio.db")+"?mode=ro&_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,5 +137,58 @@ func TestInterruptedMigrationReportsItsRollback(t *testing.T) {
 	}
 	if version != 0 || tables != 0 {
 		t.Fatalf("after the interrupted migration user_version = %d and gated tables = %d, want both 0", version, tables)
+	}
+}
+
+func TestAbortMigrationAfterSQLiteRollback(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded, errors.New("migration failed")} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "papio.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			tx, err := db.BeginTx(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+					t.Errorf("cleanup rollback: %v", err)
+				}
+			}()
+			if _, err := tx.Exec(`
+				CREATE TABLE gated (x);
+				CREATE TRIGGER abort_insert BEFORE INSERT ON gated
+				BEGIN SELECT RAISE(ROLLBACK, 'forced rollback'); END;
+				PRAGMA user_version = 1;`); err != nil {
+				t.Fatal(err)
+			}
+			// RAISE(ROLLBACK) ends SQLite's transaction without telling
+			// database/sql, just as a statement interrupt can do.
+			if _, err := tx.Exec("INSERT INTO gated VALUES (1)"); err == nil {
+				t.Fatal("trigger did not roll the transaction back")
+			}
+			err = abortMigration(tx, "applying fixture", cause)
+			if !errors.Is(err, cause) {
+				t.Fatalf("abort error = %v, want original cause %v", err, cause)
+			}
+			var rollbackErr *sqlite.Error
+			interrupted := errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded)
+			if errors.As(err, &rollbackErr) == interrupted {
+				t.Fatalf("abort error = %v: redundant rollback must be ignored only after interruption", err)
+			}
+			var version, tables int
+			if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name = 'gated'").Scan(&tables); err != nil {
+				t.Fatal(err)
+			}
+			if version != 0 || tables != 0 {
+				t.Fatalf("after SQLite rollback user_version = %d, gated tables = %d, want both 0", version, tables)
+			}
+		})
 	}
 }

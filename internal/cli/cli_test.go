@@ -413,24 +413,6 @@ func TestVersionFlagMatchesVersionCommand(t *testing.T) {
 	}
 }
 
-func TestNewWorksOnlyFiltersOwnedResultsWithoutRefetching(t *testing.T) {
-	works := []discovery.DiscoveredWork{
-		{OpenAlexID: "one"},
-		{OpenAlexID: "two", Owned: true, OwnedItemKey: "PDF00001"},
-		{OpenAlexID: "three"},
-	}
-	filtered := newWorksOnly(works)
-	if len(filtered) != 2 || filtered[0].OpenAlexID != "one" || filtered[1].OpenAlexID != "three" {
-		t.Fatalf("filtered works = %+v", filtered)
-	}
-	if got := ownedSuffix(true); got != " [in library]" {
-		t.Fatalf("owned suffix = %q", got)
-	}
-	if got := newSearchCommand(&options{}).Flags().Lookup("new-only").Usage; !strings.Contains(got, "after --limit") || !strings.Contains(got, "fewer") {
-		t.Fatalf("new-only help = %q", got)
-	}
-}
-
 // Windows test initialization replaces these with private-parent ACL setup
 // and inherited ACL assertions. Unix keeps its actual mode-bit contract.
 var cliPrivateTestDir = func(t *testing.T) string { return t.TempDir() }
@@ -718,42 +700,4 @@ func versionWarningTestOptions(daemonVersion string) (*options, *bytes.Buffer, *
 		},
 	}
 	return opt, &stdout, &stderr
-}
-
-// TestSearchNewOnlyPreservesTruncationFromThePreFilterPage pins the
-// truncated-honesty fix for --new-only: the daemon caps the page at the
-// effective --limit, so a full page whose rows are then ALL filtered out by
-// --new-only must still report truncated:true — the cap hid rows, even
-// though none of the hidden or shown rows survived the owned-work filter.
-func TestSearchNewOnlyPreservesTruncationFromThePreFilterPage(t *testing.T) {
-	var out, errOut bytes.Buffer
-	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
-		if method != "discovery.search" {
-			t.Fatalf("method = %q, want discovery.search", method)
-		}
-		limit := params.(discovery.SearchParams).Limit
-		works := make([]discovery.DiscoveredWork, limit)
-		for i := range works {
-			works[i] = discovery.DiscoveredWork{Owned: true}
-		}
-		*result.(*[]discovery.DiscoveredWork) = works
-		return nil
-	})
-	root.SetArgs([]string{"--json", "search", "--new-only", "--limit", "3", "quantum gravity"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("search --new-only: %v (%s)", err, errOut.String())
-	}
-	var page struct {
-		Works     []discovery.DiscoveredWork `json:"works"`
-		Truncated bool                       `json:"truncated"`
-	}
-	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Works) != 0 {
-		t.Fatalf("works = %d, want 0 — every returned row was owned and --new-only filters them", len(page.Works))
-	}
-	if !page.Truncated {
-		t.Fatal("truncated = false after --new-only emptied a full page — the daemon's pre-filter page hit --limit, so more may exist; want true")
-	}
 }

@@ -75,6 +75,7 @@ func parseBibTeXEntry(entry string) (record Record, err error) {
 	if equals := bibTeXTopLevelEquals(entry, 0); equals >= 0 && equals < comma {
 		return Record{}, errors.New("field assignment before citation key comma")
 	}
+	record.SourceKey = strings.TrimSpace(entry[:comma])
 
 	// The eprint metadata is resolved on every successful exit, since the parse
 	// loop returns from several points and declarations may follow `eprint`.

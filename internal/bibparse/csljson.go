@@ -9,6 +9,7 @@ import (
 )
 
 type cslJSONItem struct {
+	ID     json.RawMessage `json:"id"`
 	DOI    string          `json:"DOI"`
 	PMID   json.RawMessage `json:"PMID"`
 	Title  string          `json:"title"`
@@ -55,11 +56,12 @@ func parseCSLJSON(data []byte) ([]Record, error) {
 	records := make([]Record, 0, len(items))
 	for _, item := range items {
 		record := Record{
-			DOI:     strings.TrimPrefix(item.DOI, "https://doi.org/"),
-			PMID:    cslJSONValue(item.PMID),
-			Title:   item.Title,
-			Authors: cslJSONAuthors(item.Author),
-			Year:    cslJSONYear(item.Issued.DateParts),
+			SourceKey: cslJSONValue(item.ID),
+			DOI:       strings.TrimPrefix(item.DOI, "https://doi.org/"),
+			PMID:      cslJSONValue(item.PMID),
+			Title:     item.Title,
+			Authors:   cslJSONAuthors(item.Author),
+			Year:      cslJSONYear(item.Issued.DateParts),
 		}
 		records = append(records, record)
 	}

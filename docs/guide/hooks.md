@@ -33,6 +33,43 @@ Contract:
 - **Concurrency.** Concurrent ready jobs may run hooks concurrently; if your
   command needs serialization, own it (e.g. `flock`).
 
+## Managed folder filing
+
+Set an absolute destination to enable durable folder filing:
+
+```toml
+[filing]
+folder = "/absolute/path/to/papers"
+```
+
+The daemon records a destination-specific receipt for each validated job.
+It retries transient folder failures after restart without repeating arbitrary
+`on_ready` scripts. The final filename derives from the filing receipt key.
+Existing files must match the expected artifact hash; a different file or a
+symbolic link causes a conflict instead of an overwrite.
+
+```sh
+papio jobs filing list --json
+papio jobs filing inspect <job-id> --json
+papio jobs filing retry <job-id>
+```
+
+Automatic retries use only the current configured destination. Historical
+receipts remain inspectable after a configuration change.
+Use `retry --destination <absolute-path>` to select a journaled destination
+explicitly. Empty `filing.folder` disables managed filing.
+
+### Archive and hook execution
+
+Archiving an acquisition prevents new hook execution. A running hook holds a
+durable reservation until its command returns. The diagnostic events are
+`hook.filing_reserved` and `hook.filing_released`, joined by `reservation_id`.
+A crash or a failed release leaves the reservation unresolved, so archive
+fails closed. There is no automatic reconciliation for that reservation.
+The reservation covers command execution, not background descendants that a
+best-effort script leaves running after its shell exits.
+
+
 ## Environment variables
 
 | Variable | Value | Always set? |

@@ -71,9 +71,13 @@ zotio or a configured `library.sources` authority:
 papio search "appropriate reliance on AI" --limit 20 --new-only --json
 ```
 
-Ownership filtering happens after OpenAlex applies `--limit`, so a `--new-only`
-search can return fewer rows than its limit. Without zotio or a configured
-library source, ownership cannot be classified and results remain unowned.
+New-only search reads up to ten pages per call and up to 5,000 rows across a
+continuation chain. It returns `continuation`, `partial`, `pages`, and `scanned`
+in JSON output. Resume with the same query, filters, and limit using
+`--continuation <token>`. A budget limit or unsupported paging does not imply
+exhaustion. Incomplete ownership evidence fails the request instead of calling
+the results unowned. Zotio and generic holdings require a supported exact
+identifier; use ordinary search for title-only results.
 
 ### Grow from a seed paper
 
@@ -102,6 +106,50 @@ only live jobs. A settled work creates a new job unless zotio or a
 run without re-acquiring it, use `papio batch report latest` or pass its batch
 ID. To filter already-held works before submission, configure zotio or
 `library.sources` ownership.
+
+### Acquire exact search keys
+
+```sh
+papio search save selected.json "appropriate reliance on AI" --limit 20
+papio search acquire selected.json --keys <first-key>,<second-key>
+papio search acquire selected.json --keys <first-key>,<second-key> --confirm
+```
+
+`search` remains read-only. `search save` writes a new bounded snapshot with
+stable result keys and refuses to overwrite an existing file. Select 1–50
+exact keys. The preview shows the selected metadata, current ownership,
+count, and configured cost policy. Only `--confirm` submits the selected set
+through batch acquisition; automatic Zotero import remains off.
+
+### Stage a larger selected bibliography
+
+```sh
+papio campaign import screening.json
+papio campaign preview <campaign-id>
+papio campaign run <campaign-id>
+papio campaign pause <campaign-id>
+papio campaign resume <campaign-id>
+papio campaign report <campaign-id> --json
+```
+
+`screening.json` is a CSL-JSON array. Campaign import also accepts RIS,
+BibTeX, and MEDLINE/NBIB citation exports; it does not accept native JSONL.
+
+Import accepts 1–200 source records and stores the selected set and ownership
+configuration before submission. Each `run` submits at most one chunk of 50
+canonical works. A 50-active-work window prevents advancing while prior
+nonterminal work fills the window. Pause prevents new staged submission;
+it does not cancel existing jobs. Resume enables submission but does not
+submit until the next `run`.
+
+The report retains one row per original record, including owned, invalid,
+and unsuccessful records. Each row carries the source digest, format, ordinal,
+and original BibTeX key, RIS ID, or CSL id when present. Duplicate source
+records can share one job without losing their separate source identities.
+Citation fields follow the supported parser subset; this is not lossless
+vendor reimport. Campaign receipts retain acknowledged jobs across restart,
+terminal states, and changes to library ownership after submission.
+
 
 ```sh
 papio acquire --batch works.jsonl --auto-import \
@@ -767,6 +815,27 @@ existing-item-attached, acquired (validated but not imported, the normal outcome
 without `--auto-import`), import-failed, awaiting-human, needs-review, failed,
 skipped-owned, and in-progress.
 
+### Archive an acquisition you do not intend to file
+
+```sh
+papio jobs archive <job-id> --confirm
+papio jobs disposition <job-id>
+papio jobs get <job-id>
+papio jobs restore <job-id>
+```
+
+Archive applies only to a validated `ready` acquisition. It records an audit
+event and removes the job from actionable ready views and uncollected warnings.
+The PDF, identity evidence, and cached-artifact references remain intact.
+Restore makes the job actionable again; neither command deletes PDF bytes.
+Import backfill excludes archived jobs.
+
+Archive refuses jobs with a Zotero apply receipt, including a failed receipt,
+because an external mutation can report failure after committing. It also
+refuses an acquisition while a hook execution reservation remains unresolved.
+See the [hook execution limits](hooks.md#archive-and-hook-execution).
+
+
 ## 7. Turn a successful search into a watchlist
 
 A watch repeats discovery, ownership filtering, capped submission,
@@ -792,6 +861,35 @@ run. Resume refuses while the latest run is still a failure. Removing a watch
 does not remove jobs or Zotero items created by earlier runs. It does delete the
 watch's digest, so `papio watch remove` refuses a watch that still has pending
 digest works until you add `--discard-digest`.
+
+### Change settings without resetting history
+
+```sh
+papio watch edit <watch-id> --cadence weekly --limit-per-run 10 \
+  --collection "Revised reading"
+```
+
+Edit changes the label, cadence, per-run limit, collection, and OA/year filters.
+It keeps the watch id, digest, and previous run history. Query, citation seed,
+and alert/acquire mode do not change through edit; create a new watch for those
+changes. Editing an alert does not turn it into automatic acquisition.
+
+### Backfill a non-Zotero citation source
+
+```sh
+papio watch backfill add --source citations --cadence daily --limit-per-run 10
+papio watch run <watch-id>
+```
+
+Name a configured `record_present` library source explicitly. The watch reads
+the source before submitting jobs, excludes positive `pdf_present` claims, and
+records durable once-only submission receipts. A malformed or incomplete
+ownership feed prevents submission. A BibTeX `file` field never proves PDF
+ownership. The Zotero backfill path remains separate.
+
+Use the [managed folder destination](hooks.md#managed-folder-filing) or an
+existing best-effort hook for non-Zotero filing.
+
 
 ### How far a watch looks
 

@@ -75,13 +75,15 @@ const (
 //     apart. The field remains because acquisition metadata may carry an ISBN
 //     from other input paths.
 type Record struct {
-	DOI     string
-	PMID    string
-	ArXiv   string
-	ISBN    string
-	Title   string
-	Authors []string
-	Year    int
+	// SourceKey is the external record key, never an acquisition identifier.
+	SourceKey string
+	DOI       string
+	PMID      string
+	ArXiv     string
+	ISBN      string
+	Title     string
+	Authors   []string
+	Year      int
 }
 
 // HasIdentifier reports whether a record carries any identifier papio can match

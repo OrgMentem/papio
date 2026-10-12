@@ -72,3 +72,56 @@ func refileJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	}
 	return marshal(result)
 }
+
+// ManagedFilingsPage is a new read model; hook result shapes stay unchanged.
+type ManagedFilingsPage struct {
+	Filings   []app.ManagedFiling `json:"filings"`
+	Truncated bool                `json:"truncated"`
+}
+
+func managedFilings(ctx context.Context, raw json.RawMessage, system *bootstrap.System, inspect bool) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id,omitempty"`
+		Limit int    `json:"limit,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	params.JobID = strings.TrimSpace(params.JobID)
+	if inspect && params.JobID == "" {
+		return badParams(errors.New("job_id is required"))
+	}
+	if system == nil || system.App == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "application service is not configured"}
+	}
+	rows, truncated, err := system.App.ManagedFilings(ctx, params.JobID, params.Limit)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(ManagedFilingsPage{Filings: rows, Truncated: truncated})
+}
+
+func retryManagedFiling(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID       string `json:"job_id"`
+		Destination string `json:"destination,omitempty"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	params.JobID = strings.TrimSpace(params.JobID)
+	if params.JobID == "" {
+		return badParams(errors.New("job_id is required"))
+	}
+	if system == nil || system.App == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "application service is not configured"}
+	}
+	result, err := system.App.RetryManagedJob(ctx, params.JobID, params.Destination)
+	if errors.Is(err, app.ErrManagedFilingNotConfigured) {
+		return badParams(err)
+	}
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(result)
+}

@@ -11,6 +11,16 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- Added confirmed archive/restore commands for validated acquisitions.
+  Archive retains artifact and identity evidence, excludes jobs from ready
+  views and import backfill, and clears uncollected warnings without a fake
+  export. Durable external filing reservations prevent conflicting archival.
+- Added an opt-in `[filing].folder` destination with per-job receipts,
+  destination-specific idempotency, inspection, and safe automatic retry.
+  Arbitrary `on_ready` scripts remain best-effort.
+- Added operational watch edits that preserve identity, history, and pending
+  digest entries. Added explicitly selected non-Zotero backfill sources with
+  fail-closed ownership reads and once-only submission receipts.
 - **`papio jobs supply-pdf <job-id> <path>` gives a job the PDF you already
   have.** An emailed copy, an interlibrary loan file, or an earlier download
   no longer needs a trip through the browser's **Send PDF to papio**. The
@@ -128,6 +138,31 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- Campaign retries retain existing job receipts when the library now holds
+  the acquired PDF, keeping reports and active-work limits correct.
+- New-only Zotio searches reject works without a supported exact identifier
+  instead of reporting unchecked works as unowned.
+- **A background adoption no longer crashes the daemon while a browser
+  polls.** A file adopted by a sweep, or adopted after the browser session
+  lock was released, queued its job for a priority re-offer without the lock
+  that the poll loop holds while it reads the same queue. Go ends a process
+  that reads and writes one map at the same time, so an adoption that landed
+  during a poll could stop the daemon. Those additions now go through a
+  separate queue that the poll folds in under the session lock.
+- **A discovery watch records its batch before it submits any job.** The
+  watch used to write the batch file only after every submission, so an
+  interrupted run left jobs with no record on disk, a run report that named a
+  missing batch, and no saved scan position. The watch now writes the batch
+  first and after each submission.
+- **A low OpenAlex quota closes the gate before *papio* records anything.**
+  *papio* used to store the credit numbers from the response first, and a
+  slow or failing write let another request reach OpenAlex after the
+  provider had already reported the shortage.
+- **An interrupted migration no longer reports a second rollback failure.**
+  SQLite can end the transaction itself when startup is interrupted. The
+  later rollback then says there is no transaction, which read as a damaged
+  database. *papio* now treats that answer as the rollback it is, and still
+  reports every other rollback failure.
 - **A discovery watch no longer stops finding papers once its first page of
   results is all known.** A watch used to read one page of at most 25 results,
   drop the works you already had, and report the empty remainder as a

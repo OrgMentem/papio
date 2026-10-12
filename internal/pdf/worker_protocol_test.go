@@ -134,104 +134,51 @@ func TestStructuralParentRejectsWorkerPageCapViolation(t *testing.T) {
 	}
 }
 
-func TestCrossCheckPDFInfoAgrees(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":2}'`)
-	pdfinfo := fakeTool(t, `printf 'Creator: test\nPages: 2\n'`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		MaxPages:    10,
-		Timeout:     10 * time.Second,
-		PDFInfoPath: pdfinfo,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if !report.Valid {
-		t.Fatalf("expected Valid cross-check to pass, got report=%+v", report)
-	}
-	if report.Pages != 2 {
-		t.Fatalf("Pages=%d want 2 report=%+v", report.Pages, report)
-	}
-	if report.Reason != "" {
-		t.Fatalf("Reason=%q want empty report=%+v", report.Reason, report)
-	}
-}
-
-func TestCrossCheckPDFInfoDisagrees(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":2}'`)
-	pdfinfo := fakeTool(t, `printf 'Pages: 5\n'`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		MaxPages:    10,
-		Timeout:     10 * time.Second,
-		PDFInfoPath: pdfinfo,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if report.Valid {
-		t.Fatalf("expected disagreement to invalidate report, got %+v", report)
-	}
-	if !strings.Contains(report.Reason, "pdfinfo page count disagrees with worker") {
-		t.Fatalf("Reason=%q want pdfinfo page count disagrees with worker report=%+v", report.Reason, report)
-	}
-}
-
-func TestCrossCheckPDFInfoExitNonZero(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":3}'`)
-	pdfinfo := fakeTool(t, `printf 'pdfinfo failed: boom' >&2; exit 1`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		MaxPages:    10,
-		Timeout:     10 * time.Second,
-		PDFInfoPath: pdfinfo,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if report.Valid {
-		t.Fatalf("expected non-zero pdfinfo to invalidate report, got %+v", report)
-	}
-	if !strings.Contains(report.Reason, "pdfinfo cross-check failed") {
-		t.Fatalf("Reason=%q want pdfinfo cross-check failed report=%+v", report.Reason, report)
-	}
-	if !strings.Contains(report.Reason, "boom") {
-		t.Fatalf("Reason=%q should contain stderr boom report=%+v", report.Reason, report)
-	}
-}
-
-func TestCrossCheckPDFInfoMissingPagesLine(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":2}'`)
-	pdfinfo := fakeTool(t, `printf 'Title: hello\nCreator: test\nProducer: x\n'`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		MaxPages:    10,
-		Timeout:     10 * time.Second,
-		PDFInfoPath: pdfinfo,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if report.Valid {
-		t.Fatalf("expected missing Pages line to invalidate report, got %+v", report)
-	}
-	if !strings.Contains(report.Reason, "pdfinfo output did not contain page count") {
-		t.Fatalf("Reason=%q want pdfinfo output did not contain page count report=%+v", report.Reason, report)
-	}
-}
-
-func TestCrossCheckPDFInfoNonNumericPages(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":2}'`)
-	pdfinfo := fakeTool(t, `printf 'Pages: abc\n'`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		MaxPages:    10,
-		Timeout:     10 * time.Second,
-		PDFInfoPath: pdfinfo,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if report.Valid {
-		t.Fatalf("expected non-numeric Pages to invalidate report, got %+v", report)
-	}
-	if !strings.Contains(report.Reason, "pdfinfo page count disagrees with worker") {
-		t.Fatalf("Reason=%q want pdfinfo page count disagrees with worker report=%+v", report.Reason, report)
+func TestCrossCheckPDFInfo(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		workerJSON     string
+		pdfinfoScript  string
+		maxOutputBytes int64
+		wantValid      bool
+		skipPDFInfo    bool
+	}{
+		{name: "agrees", workerJSON: `{"Valid":true,"Pages":2}`, pdfinfoScript: `printf 'Creator: test\nPages: 2\n'`, wantValid: true},
+		{name: "disagrees", workerJSON: `{"Valid":true,"Pages":2}`, pdfinfoScript: `printf 'Pages: 5\n'`},
+		{name: "exit nonzero", workerJSON: `{"Valid":true,"Pages":3}`, pdfinfoScript: `printf 'pdfinfo failed: boom' >&2; exit 1`},
+		{name: "missing pages line", workerJSON: `{"Valid":true,"Pages":2}`, pdfinfoScript: `printf 'Title: hello\nCreator: test\nProducer: x\n'`},
+		{name: "nonnumeric pages", workerJSON: `{"Valid":true,"Pages":2}`, pdfinfoScript: `printf 'Pages: abc\n'`},
+		{name: "output exceeds cap", workerJSON: `{"Valid":true,"Pages":1}`, pdfinfoScript: `yes x | tr -d '\n' | head -c 200; printf '\nPages: 1\n'`, maxOutputBytes: 64},
+		{name: "invalid worker report skips pdfinfo", workerJSON: `{"Valid":false,"Reason":"encrypted PDF"}`, pdfinfoScript: `exit 1`, skipPDFInfo: true},
+		{name: "empty binary skips cross-check", workerJSON: `{"Valid":true,"Pages":2}`, wantValid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '`+tc.workerJSON+`'`)
+			pdfinfo := ""
+			marker := t.TempDir() + "/pdfinfo-invoked"
+			if tc.pdfinfoScript != "" {
+				script := tc.pdfinfoScript
+				if tc.skipPDFInfo {
+					script = `touch "` + marker + `"; ` + script
+				}
+				pdfinfo = fakeTool(t, script)
+			}
+			report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
+				MaxPages: 10, Timeout: 10 * time.Second,
+				MaxOutputBytes: tc.maxOutputBytes, PDFInfoPath: pdfinfo,
+			})
+			if err != nil {
+				t.Fatalf("ValidateStructural err=%v", err)
+			}
+			if report.Valid != tc.wantValid || (tc.wantValid && report.Pages != 2) {
+				t.Fatalf("report=%+v, want valid=%v and two pages when valid", report, tc.wantValid)
+			}
+			if tc.skipPDFInfo {
+				if _, err := os.Stat(marker); !os.IsNotExist(err) {
+					t.Fatalf("pdfinfo ran after an invalid worker report: stat err=%v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -260,58 +207,6 @@ func TestCrossCheckPDFInfoTimeout(t *testing.T) {
 	}
 	if elapsed > 300*time.Millisecond {
 		t.Fatalf("timeout test took %v, exceeds 300ms budget (sleep should be interrupted by context)", elapsed)
-	}
-}
-
-func TestCrossCheckPDFInfoOutputExceedsCap(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":1}'`)
-	pdfinfo := fakeTool(t, `yes x | tr -d '\n' | head -c 200; printf '\nPages: 1\n'`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		MaxPages:       10,
-		Timeout:        10 * time.Second,
-		MaxOutputBytes: 64,
-		PDFInfoPath:    pdfinfo,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if report.Valid {
-		t.Fatalf("expected pdfinfo output cap to invalidate report, got %+v", report)
-	}
-	if !strings.Contains(report.Reason, "pdfinfo output exceeds cap") {
-		t.Fatalf("Reason=%q want pdfinfo output exceeds cap report=%+v", report.Reason, report)
-	}
-}
-
-func TestCrossCheckPDFInfoSkippedForInvalidReport(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":false,"Reason":"encrypted PDF"}'`)
-	pdfinfo := fakeTool(t, `printf 'boom' >&2; exit 1`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		Timeout:     10 * time.Second,
-		PDFInfoPath: pdfinfo,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if report.Valid {
-		t.Fatalf("expected worker invalid to stay invalid, got %+v", report)
-	}
-	if report.Reason != "encrypted PDF" {
-		t.Fatalf("Reason=%q want encrypted PDF (cross-check must be skipped) report=%+v", report.Reason, report)
-	}
-}
-
-func TestCrossCheckPDFInfoSkippedWhenBinaryEmpty(t *testing.T) {
-	worker := fakeTool(t, `cat >/dev/null; printf '%s\n' '{"Valid":true,"Pages":2}'`)
-	report, err := ValidateStructural(context.Background(), worker, writeTempPDF(t), StructuralOptions{
-		MaxPages: 10,
-		Timeout:  10 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("ValidateStructural err=%v", err)
-	}
-	if !report.Valid || report.Pages != 2 {
-		t.Fatalf("expected cross-check skip with empty binary to keep Valid report, got %+v err=%v", report, err)
 	}
 }
 

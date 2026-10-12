@@ -18,7 +18,7 @@ import (
 func newSearchCommand(opt *options) *cobra.Command {
 	var limit, yearFrom, yearTo int
 	var oaOnly, newOnly bool
-	var cites, citedBy, relatedTo, source string
+	var cites, citedBy, relatedTo, source, continuation string
 	command := &cobra.Command{
 		Use:         "search [query]",
 		Short:       "Search configured discovery backends for scholarly works",
@@ -45,17 +45,27 @@ func newSearchCommand(opt *options) *cobra.Command {
 				Cites: cites, CitedBy: citedBy, RelatedTo: relatedTo, Source: source,
 			}
 			var works []discovery.DiscoveredWork
-			if err := opt.call(cmd.Context(), "discovery.search", params, &works); err != nil {
-				return sourceRequiresCurrentDaemon(source, err)
+			if continuation != "" && !newOnly {
+				return fmt.Errorf("--continuation requires --new-only")
 			}
-			// truncated reflects the pre-filter fetched page against the
-			// daemon's own effective limit: --new-only removing owned rows
-			// below must not turn a capped page into a falsely-complete one.
-			_, truncated := agentjson.Capped(works, effective)
+			var scan *discovery.UnownedResult
+			var truncated bool
 			if newOnly {
-				works = newWorksOnly(works)
+				scan = &discovery.UnownedResult{}
+				if err := opt.call(cmd.Context(), "discovery.search_unowned_v1", discovery.UnownedRequest{Search: params, Continuation: continuation}, scan); err != nil {
+					return err
+				}
+				works, truncated = scan.Works, scan.Truncated
+			} else {
+				if err := opt.call(cmd.Context(), "discovery.search", params, &works); err != nil {
+					return sourceRequiresCurrentDaemon(source, err)
+				}
+				_, truncated = agentjson.Capped(works, effective)
 			}
 			if opt.jsonOutput {
+				if scan != nil {
+					return opt.printJSON(scan)
+				}
 				return printPage(opt, "works", works, truncated)
 			}
 			var anyConfident, anyTitleJudged bool
@@ -106,6 +116,21 @@ func newSearchCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
+			if scan != nil {
+				if _, err := fmt.Fprintf(opt.out, "Scanned %d rows in %d pages (page budget %d; total scan ceiling %d); partial=%t\n", scan.Scanned, scan.Pages, scan.PageBudget, scan.ScanCeiling, scan.Partial); err != nil {
+					return err
+				}
+				if scan.Continuation != "" {
+					if _, err := fmt.Fprintf(opt.out, "Continuation: %s\n", scan.Continuation); err != nil {
+						return err
+					}
+				}
+				if scan.Detail != "" {
+					if _, err := fmt.Fprintln(opt.out, scan.Detail); err != nil {
+						return err
+					}
+				}
+			}
 			return nil
 		},
 	}
@@ -115,10 +140,12 @@ func newSearchCommand(opt *options) *cobra.Command {
 	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year")
 	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
 	flags.StringVar(&source, "source", "", "discovery backend: arxiv, openalex, or semanticscholar (default: all configured)")
-	flags.BoolVar(&newOnly, "new-only", false, "omit works already in your library; filters after --limit and may return fewer results")
+	flags.BoolVar(&newOnly, "new-only", false, "page until the requested unowned count or a disclosed scan budget")
+	flags.StringVar(&continuation, "continuation", "", "resume a new-only search with its exact query and filters")
 	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
 	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")
 	flags.StringVar(&relatedTo, "related-to", "", "DOI to find OpenAlex-related papers (related_to: filter)")
+	command.AddCommand(newSearchAcquireCommand(opt), newSearchSaveCommand(opt))
 	return command
 }
 
@@ -178,16 +205,6 @@ func matchMarker(kind string) string {
 	default:
 		return "—"
 	}
-}
-
-func newWorksOnly(works []discovery.DiscoveredWork) []discovery.DiscoveredWork {
-	filtered := make([]discovery.DiscoveredWork, 0, len(works))
-	for _, discovered := range works {
-		if !discovered.Owned {
-			filtered = append(filtered, discovered)
-		}
-	}
-	return filtered
 }
 
 func ownedSuffix(owned bool) string {

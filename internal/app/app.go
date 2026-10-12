@@ -167,6 +167,8 @@ type Service struct {
 	// ReadyHook, when non-nil with a command, runs the user's on_ready hook
 	// once per ready transition. Nil disables it.
 	ReadyHook *hook.Runner
+	// ManagedFilingFolder enables the replay-safe folder destination.
+	ManagedFilingFolder string
 	// hookWG tracks automatic and manual on_ready runs so shutdown can drain
 	// them before the store closes (DrainHooks).
 	hookWG sync.WaitGroup
@@ -209,6 +211,7 @@ func (s *Service) institutionFor(name string) (config.Institution, bool) {
 // SubmitOptions keeps explicit retry intent at the application boundary so
 // callers cannot accidentally create parallel live acquisition attempts.
 type SubmitOptions struct {
+	once       bool
 	AutoImport *bool
 	Force      bool
 	// RecheckOf marks daemon maintenance that replaces one unavailable job.
@@ -306,6 +309,13 @@ func (s *Service) SubmitWithAutoImport(ctx context.Context, wr protocol.WorkRequ
 	return result.JobID, nil
 }
 
+// SubmitOnceWithAutoImport retains the chosen job across terminal states and
+// lost replies. It is for durable watches and campaigns, not ordinary retries.
+func (s *Service) SubmitOnceWithAutoImport(ctx context.Context, wr protocol.WorkRequest, autoImport *bool) (string, error) {
+	result, err := s.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, wr, SubmitOptions{AutoImport: autoImport, once: true})
+	return result.JobID, err
+}
+
 // SubmitWithOptions returns Existing when an in-flight job already owns the
 // canonical work. Force deliberately creates a fresh request instead.
 func (s *Service) SubmitWithOptions(ctx context.Context, wr protocol.WorkRequest, options SubmitOptions) (SubmitResult, error) {
@@ -369,6 +379,9 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 		}
 		created, err = s.Jobs.CreateRecheckRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
 			job.Attribution{Principal: principal, Consumer: consumer}, options.RecheckOf, options.RecheckWindowDays)
+	} else if options.once {
+		created, err = s.Jobs.CreateOnceRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
+			job.Attribution{Principal: principal, Consumer: consumer})
 	} else {
 		created, err = s.Jobs.CreateRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
 			job.Attribution{Principal: principal, Consumer: consumer}, options.Force)
@@ -4044,7 +4057,10 @@ func (s *Service) RecoverPreparedPublications(ctx context.Context) error {
 	if err := s.reconcilePreparedPublications(ctx, ""); err != nil {
 		return err
 	}
-	return s.recoverMissingReadyHookForSettled(ctx)
+	if err := s.recoverMissingReadyHookForSettled(ctx); err != nil {
+		return err
+	}
+	return s.RetryManagedFiling(ctx)
 }
 
 // removeQuarantineBytes removes bytes only when no remaining publication owns
@@ -4326,6 +4342,10 @@ const (
 // at a time and skips a job whose import another call settled or just tried
 // since its caller looked. A skipped job records nothing and spends nothing.
 func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutcome {
+	disposition, dispositionErr := s.Jobs.Disposition(ctx, row.ID)
+	if dispositionErr != nil || disposition.Disposition == job.DispositionArchived {
+		return importNotAttempted
+	}
 	if s.Config.Zotio.AutoImportPaused || !row.Policy.AutoImport {
 		// A pause leaves no import outcome: the ready job remains eligible
 		// for the retry sweep when automatic imports resume.
@@ -4424,6 +4444,13 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutco
 // secret-free. The durable audit trail is status, exit code, duration, and
 // whether the ready transition or an operator triggered the run.
 func (s *Service) runReadyHook(ctx context.Context, row *job.Row, sha string) {
+	disposition, err := s.Jobs.Disposition(ctx, row.ID)
+	if err != nil || disposition.Disposition == job.DispositionArchived {
+		return
+	}
+	if err := s.queueManagedFiling(ctx, row.ID); err != nil {
+		log.Printf("papio: queueing managed filing for job %s: %v", row.ID, err)
+	}
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return
 	}
@@ -4508,6 +4535,7 @@ func (s *Service) recoverMissingReadyHookForSettled(ctx context.Context) error {
 		SELECT j.id
 		FROM jobs j
 		WHERE j.state IN ('ready', 'imported')
+		  AND j.acquisition_disposition = 'active'
 		  AND NOT EXISTS (
 			SELECT 1 FROM events e
 			WHERE e.job_id = j.id
@@ -4553,6 +4581,13 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 	row, err := s.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return RefileResult{}, err
+	}
+	disposition, err := s.Jobs.Disposition(ctx, jobID)
+	if err != nil {
+		return RefileResult{}, err
+	}
+	if disposition.Disposition == job.DispositionArchived {
+		return RefileResult{}, job.ErrConflict
 	}
 	if row.State != job.StateReady && row.State != job.StateImported {
 		return RefileResult{}, job.ErrConflict
@@ -4634,6 +4669,29 @@ func (s *Service) CancelHooks() {
 func (s *Service) executeReadyHook(ctx context.Context, row *job.Row, sha, trigger string) (RefileResult, error) {
 	eventCtx := context.WithoutCancel(ctx)
 	out := RefileResult{JobID: row.ID, ExitCode: -1}
+	// Reserve against Archive in one SQLite statement before any external
+	// execution. A process crash leaves the reservation unresolved, fail-closed.
+	reservation := job.NewID("hook")
+	reserved, err := s.Jobs.S.DB().ExecContext(eventCtx, `
+		INSERT INTO events(job_id, at, kind, detail_json)
+		SELECT id, ?, 'hook.filing_reserved', json_object('reservation_id', ?)
+		FROM jobs WHERE id = ? AND acquisition_disposition = 'active'`,
+		store.Now(), reservation, row.ID)
+	if err != nil {
+		return out, err
+	}
+	count, err := reserved.RowsAffected()
+	if err != nil {
+		return out, err
+	}
+	if count != 1 {
+		return out, job.ErrConflict
+	}
+	defer func() {
+		if err := s.Jobs.RecordEvent(eventCtx, row.ID, "hook.filing_released", map[string]any{"reservation_id": reservation}); err != nil {
+			log.Printf("papio: releasing hook filing reservation for %s: %v", row.ID, err)
+		}
+	}()
 	detail := map[string]any{"trigger": trigger}
 	pdfPath, err := s.Artifacts.ArtifactPath(sha)
 	if err == nil && !filepath.IsAbs(pdfPath) {
@@ -4724,6 +4782,7 @@ func (s *Service) UnfiledJobs(ctx context.Context, filter UnfiledFilter, limit i
 		  ON doi.work_request_id = j.work_request_id AND doi.kind = 'doi'
 		LEFT JOIN hook_events h ON h.job_id = j.id AND h.newest = 1
 		WHERE j.state IN ('ready', 'imported')
+		  AND j.acquisition_disposition = 'active'
 		  AND (h.job_id IS NULL OR COALESCE(json_extract(h.detail_json, '$.status'), '') <> 'ok')
 		  AND (? = 'all'
 		       OR (? = 'missing' AND h.job_id IS NULL)

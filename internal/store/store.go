@@ -23,7 +23,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 //go:embed migrations/*.sql
@@ -245,15 +246,23 @@ func (s *Store) migrate(ctx context.Context, migrationCeiling int) error {
 //
 // database/sql rolls a transaction back by itself as soon as its context
 // ends, so after a cancelled startup the explicit Rollback finds the
-// transaction done and returns sql.ErrTxDone. That is the rollback having
-// happened: no path here commits before rolling back. Any other rollback error
-// is a second fault on top of err that leaves the schema state ambiguous, so
-// it must not be swallowed behind the original error.
+// transaction done and returns sql.ErrTxDone. SQLite can also end the
+// transaction on interrupt before database/sql marks it done, in which case
+// Rollback reports SQLITE_ERROR with "no transaction is active". Both mean
+// rollback already happened after an interrupted startup. Any other rollback
+// error leaves the schema state ambiguous and must remain visible.
 func abortMigration(tx *sql.Tx, step string, err error) error {
+	interrupted := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 	if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-		return fmt.Errorf("%s: %w (rollback also failed: %w)", step, err, rbErr)
+		var sqliteErr *sqlite.Error
+		alreadyRolledBack := interrupted && errors.As(rbErr, &sqliteErr) &&
+			sqliteErr.Code() == sqlite3.SQLITE_ERROR &&
+			strings.Contains(sqliteErr.Error(), "cannot rollback - no transaction is active")
+		if !alreadyRolledBack {
+			return fmt.Errorf("%s: %w (rollback also failed: %w)", step, err, rbErr)
+		}
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if interrupted {
 		return fmt.Errorf("%s: interrupted and rolled back; the next start applies it again: %w", step, err)
 	}
 	return fmt.Errorf("%s: %w", step, err)
