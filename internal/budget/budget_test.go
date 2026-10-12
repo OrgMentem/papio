@@ -189,15 +189,17 @@ func TestReserveRefusesAGateThatLandedDuringTheRaceWindow(t *testing.T) {
 // gate": an EXPIRED gate is still cleared inside reserve's own transaction
 // and the reservation still proceeds, exactly as before the race fix.
 func TestReserveStillClearsAnExpiredGate(t *testing.T) {
+	clock := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
 	m := testManager(t)
+	m.now = func() time.Time { return clock }
 	ctx := context.Background()
 	p := config.Source{Enabled: true, MaxCostUSD: 10}
 	identity := identityFor(p)
 
-	if err := m.Defer(ctx, "openalex", p, time.Now().UTC().Add(10*time.Millisecond)); err != nil {
+	if err := m.Defer(ctx, "openalex", p, clock.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Millisecond)
+	clock = clock.Add(2 * time.Minute)
 
 	if err := m.reserve(ctx, "openalex", identity, p.MaxCostUSD, 0.10); err != nil {
 		t.Fatalf("reserve on an expired gate = %v, want it cleared and the reservation to proceed", err)

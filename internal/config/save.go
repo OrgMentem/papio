@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -87,58 +88,48 @@ func readSnapshot(path string) (Snapshot, error) {
 // Save validates and atomically publishes a config, serialized with all other
 // Papio config writers. Temporary/final file modes retain their prior behavior.
 // Use SaveIfUnchanged for a read-modify-write operation such as migration.
+// It backs up an existing file like SaveWithBackup, discarding the report.
 func Save(cfg Config, path string) error {
-	return save(cfg, path, nil, nil)
+	_, err := saveBackup(cfg, path, nil, nil)
+	return err
+}
+
+// SaveWithBackup is Save that also reports the backup path ("" when none).
+func SaveWithBackup(cfg Config, path string) (string, error) {
+	return saveBackup(cfg, path, nil, nil)
 }
 
 // SaveIfUnchanged publishes only if current bytes/existence still match the
-// snapshot. No plaintext backup is created, and failed publication keeps the
-// prior config. An external edit observed while staging is checked again just
-// before rename; external programs are not required to honor Papio's lock.
+// snapshot. Failed publication keeps the prior config. An external edit
+// observed while staging is checked again just before rename; external
+// programs are not required to honor Papio's lock.
+//
+// The save re-encodes the config from the struct, so comments and layout in an
+// existing file are lost. Before replacing an existing file whose bytes differ,
+// the previous bytes are written to BackupPath(path) (mode 0600, replacing any
+// older backup) through a temp file and rename. If that backup cannot be
+// written, the save fails and the config is untouched. The backup is
+// plaintext: it may hold literal legacy secrets. Mode 0600 matches the
+// original file, so it adds no exposure to other local users, but it is a
+// second copy that the user must delete when they migrate secrets. A fresh
+// file, or an unchanged one, creates no backup.
 func SaveIfUnchanged(cfg Config, path string, snapshot Snapshot) error {
-	return save(cfg, path, &snapshot, nil)
+	_, err := saveBackup(cfg, path, &snapshot, nil)
+	return err
 }
 
-// beforePublish is an internal test seam for interruption and edit oracles.
-func save(cfg Config, path string, expected *Snapshot, beforePublish func() error) error {
-	cfg = cfg.clone()
-	if _, err := cfg.RequireAccessMode(); err != nil {
-		return err
-	}
-	if err := cfg.validate(); err != nil {
-		return err
-	}
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("encoding config: %w", err)
-	}
-	path, err = configTarget(path)
-	if err != nil {
-		return err
-	}
-	if expected != nil && (expected.path == "" || expected.path != path) {
-		return ErrConfigChanged
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
-	}
-	lock, err := lockConfig(filepath.Join(dir, "."+filepath.Base(path)+".lock"))
-	if err != nil {
-		return err
-	}
-	defer lock.Close() // OS releases the lock even if the process exits.
-	initial, err := readSnapshot(path)
-	if err != nil {
-		return err
-	}
-	if expected != nil && initial != *expected {
-		return ErrConfigChanged
-	}
-	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+// SaveIfUnchangedWithBackup is SaveIfUnchanged that also reports the backup
+// path ("" when none was written).
+func SaveIfUnchangedWithBackup(cfg Config, path string, snapshot Snapshot) (string, error) {
+	return saveBackup(cfg, path, &snapshot, nil)
+}
+
+// BackupPath is where a save keeps the previous bytes of the config at path.
+func BackupPath(path string) string { return path + ".bak" }
+
+// writeBackup atomically writes old to dest with mode 0600.
+func writeBackup(dir, dest string, old []byte) error {
+	tmp, err := os.CreateTemp(dir, ".config-bak-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -148,7 +139,7 @@ func save(cfg Config, path string, expected *Snapshot, beforePublish func() erro
 		_ = tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(data); err != nil {
+	if _, err := tmp.Write(old); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -159,28 +150,108 @@ func save(cfg Config, path string, expected *Snapshot, beforePublish func() erro
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	return os.Rename(name, dest)
+}
+
+// beforePublish is an internal test seam for interruption and edit oracles.
+func save(cfg Config, path string, expected *Snapshot, beforePublish func() error) error {
+	_, err := saveBackup(cfg, path, expected, beforePublish)
+	return err
+}
+
+func saveBackup(cfg Config, path string, expected *Snapshot, beforePublish func() error) (string, error) {
+	cfg = cfg.clone()
+	if _, err := cfg.RequireAccessMode(); err != nil {
+		return "", err
+	}
+	if err := cfg.validate(); err != nil {
+		return "", err
+	}
+	data, err := toml.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("encoding config: %w", err)
+	}
+	path, err = configTarget(path)
+	if err != nil {
+		return "", err
+	}
+	if expected != nil && (expected.path == "" || expected.path != path) {
+		return "", ErrConfigChanged
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
+	lock, err := lockConfig(filepath.Join(dir, "."+filepath.Base(path)+".lock"))
+	if err != nil {
+		return "", err
+	}
+	defer lock.Close() // OS releases the lock even if the process exits.
+	initial, err := readSnapshot(path)
+	if err != nil {
+		return "", err
+	}
+	if expected != nil && initial != *expected {
+		return "", ErrConfigChanged
+	}
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
 	if beforePublish != nil {
 		if err := beforePublish(); err != nil {
-			return err
+			return "", err
 		}
 	}
 	current, err := readSnapshot(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if current != initial {
-		return ErrConfigChanged
+		return "", ErrConfigChanged
+	}
+	backup := ""
+	if old, err := os.ReadFile(path); err == nil {
+		if !bytes.Equal(old, data) {
+			dest := BackupPath(path)
+			if err := writeBackup(dir, dest, old); err != nil {
+				return "", fmt.Errorf("saving previous config to %s: %w", dest, err)
+			}
+			backup = dest
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
 	}
 	if err := os.Rename(name, path); err != nil {
-		return err
+		return backup, err
 	}
 	// The temporary file's data is durable, but the rename lives in the
 	// directory. Until the directory is flushed a power loss can restore the
 	// old config after this function has reported success.
 	if err := syncConfigDir(dir); err != nil {
-		return fmt.Errorf("%w: %w", ErrPublicationUncertain, err)
+		return backup, fmt.Errorf("%w: %w", ErrPublicationUncertain, err)
 	}
-	return nil
+	return backup, nil
 }
 
 // configTarget folds relative paths and symlinked parent-directory aliases onto

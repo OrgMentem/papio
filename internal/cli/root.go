@@ -461,6 +461,15 @@ func newVersionCommand(opt *options) *cobra.Command {
 	}
 }
 
+// backupNotice describes a config backup for result messages, using the path
+// the operator typed rather than the symlink-resolved one; "" when none.
+func backupNotice(path, backup, sep string) string {
+	if backup == "" {
+		return ""
+	}
+	return sep + "previous version saved to " + config.BackupPath(path) + " (comments are not preserved)"
+}
+
 func newConfigCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "config", Short: "Manage papio configuration", Annotations: map[string]string{"mcp:hidden": "true"}}
 	var mode, email, dataDir string
@@ -468,7 +477,7 @@ func newConfigCommand(opt *options) *cobra.Command {
 	initCommand := &cobra.Command{
 		Use:   "init",
 		Short: "Write explicit first-run configuration",
-		Long:  "Write a new configuration with defaults and the given access mode. With --force it replaces an existing file: every other setting, including data_dir, institutions, sources, hooks and credential bindings, is reset to defaults, and no backup is kept. To change only the access mode, use 'papio config set-access-mode'.",
+		Long:  "Write a new configuration with defaults and the given access mode. With --force it replaces an existing file: every other setting, including data_dir, institutions, sources, hooks and credential bindings, is reset to defaults. The previous file is saved to config.toml.bak (mode 0600, replacing any older backup); it may hold plaintext secrets. To change only the access mode, use 'papio config set-access-mode'.",
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
 			path := opt.configPath
@@ -490,12 +499,13 @@ func newConfigCommand(opt *options) *cobra.Command {
 			if dataDir != "" {
 				cfg.DataDir = dataDir
 			}
-			if err := config.Save(cfg, path); err != nil {
+			backup, err := config.SaveWithBackup(cfg, path)
+			if err != nil {
 				return err
 			}
 			if replacing {
-				return opt.printResult(map[string]string{"config_path": path, "access_mode": mode, "replaced": "true"},
-					"Replaced %s (access_mode=%s); data_dir, institutions, sources, hooks and credential bindings were reset to defaults", path, mode)
+				return opt.printResult(map[string]string{"config_path": path, "access_mode": mode, "replaced": "true", "backup_path": backup},
+					"Replaced %s (access_mode=%s); data_dir, institutions, sources, hooks and credential bindings were reset to defaults%s", path, mode, backupNotice(path, backup, "; "))
 			}
 			return opt.printResult(map[string]string{"config_path": path, "access_mode": mode}, "Wrote %s (access_mode=%s)", path, mode)
 		},
@@ -532,11 +542,12 @@ func newConfigCommand(opt *options) *cobra.Command {
 				return err
 			}
 			cfg.AccessMode = args[0]
-			if err := config.SaveIfUnchanged(cfg, path, snapshot); err != nil {
+			backup, err := config.SaveIfUnchangedWithBackup(cfg, path, snapshot)
+			if err != nil {
 				return err
 			}
-			return opt.printResult(map[string]any{"config_path": path, "access_mode": args[0], "restart_required": true},
-				"access_mode is now %s in %s. Run 'papio daemon stop'; the next papio command starts the daemon with this mode.", args[0], path)
+			return opt.printResult(map[string]any{"config_path": path, "access_mode": args[0], "restart_required": true, "backup_path": backup},
+				"access_mode is now %s in %s%s. Run 'papio daemon stop'; the next papio command starts the daemon with this mode.", args[0], path, backupNotice(path, backup, "; "))
 		},
 	}
 	command.AddCommand(initCommand, setAccessMode, newAgentConfigCommand(opt), newCredentialConfigCommand(opt), newAcknowledgeClosureCommand(opt))

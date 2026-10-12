@@ -59,6 +59,83 @@ func TestSaveIfUnchangedRejectsStaleEdits(t *testing.T) {
 	}
 }
 
+func TestSaveBacksUpPreviousBytesBeforeReplacing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := credentialConfig()
+	backup, err := SaveWithBackup(cfg, path)
+	if err != nil || backup != "" {
+		t.Fatalf("fresh save backup = %q, %v; want none", backup, err)
+	}
+	if _, err := os.Stat(BackupPath(path)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh save created a backup: %v", err)
+	}
+	old := []byte("# keep this comment\n" + string(mustRead(t, path)))
+	if err := os.WriteFile(path, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(BackupPath(path), []byte("older"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := ReadSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBackup, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBackup = BackupPath(filepath.Join(wantBackup, "config.toml"))
+	backup, err = SaveIfUnchangedWithBackup(cfg, path, snapshot)
+	if err != nil || backup != wantBackup {
+		t.Fatalf("backup = %q, %v; want %q", backup, err, wantBackup)
+	}
+	if got := mustRead(t, backup); !bytes.Equal(got, old) {
+		t.Fatalf("backup = %q, want old bytes %q", got, old)
+	}
+	if info, err := os.Stat(backup); err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode = %v, %v; want 0600", info, err)
+	}
+	if bytes.Contains(mustRead(t, path), []byte("keep this comment")) {
+		t.Fatal("saved config kept the comment; the test premise is wrong")
+	}
+	// Saving identical bytes again writes no new backup and keeps the old one.
+	backup, err = SaveWithBackup(cfg, path)
+	if err != nil || backup != "" {
+		t.Fatalf("no-op save backup = %q, %v; want none", backup, err)
+	}
+}
+
+func TestSaveFailsWhenBackupCannotBeWritten(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := credentialConfig()
+	if err := Save(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	old := append(mustRead(t, path), []byte("# edit\n")...)
+	if err := os.WriteFile(path, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A directory at the backup path makes the rename onto it fail.
+	if err := os.MkdirAll(filepath.Join(BackupPath(path), "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveWithBackup(cfg, path); err == nil {
+		t.Fatal("save succeeded without a backup")
+	}
+	if got := mustRead(t, path); !bytes.Equal(got, old) {
+		t.Fatal("failed backup still replaced the config")
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func TestSavePublicationInterruptionPreservesPriorBytes(t *testing.T) {
 	for _, existing := range []bool{false, true} {
 		t.Run(map[bool]string{true: "existing", false: "absent"}[existing], func(t *testing.T) {

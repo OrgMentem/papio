@@ -52,6 +52,14 @@ func TestWindowsConfigPublicationSharingDenialPreservesPriorFile(t *testing.T) {
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatal("failed publication changed prior file")
 	}
+	// The backup is complete before the rename the open handle refuses, so
+	// it must hold the prior bytes; only staging files are forbidden.
+	if backup, err := os.ReadFile(BackupPath(path)); err != nil || !bytes.Equal(backup, before) {
+		t.Fatalf("backup = %q, %v; want the prior bytes", backup, err)
+	}
+	if err := os.Rename(BackupPath(path), BackupPath(path)+"-checked"); err != nil {
+		t.Fatal(err)
+	}
 	assertNoConfigTemporaryFiles(t, filepath.Dir(path))
 	if err := windows.CloseHandle(handle); err != nil {
 		t.Fatal(err)

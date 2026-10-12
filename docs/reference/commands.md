@@ -637,7 +637,7 @@ papio config credentials detach TARGET
 
 Move this configuration's legacy secrets into verified OS records
 
-Migrate supported literal credentials and this profile's legacy TypeSafe key. New records are verified before one guarded config update. Existing vault entries are retained. Interrupted operations report staged references for inspection or explicit deletion. No plaintext backup is created. An active legacy TypeSafe environment override must be removed before migration.
+Migrate supported literal credentials and this profile's legacy TypeSafe key. New records are verified before one guarded config update. Existing vault entries are retained. Interrupted operations report staged references for inspection or explicit deletion. The previous config is saved to config.toml.bak (mode 0600) and may still hold the literal secrets; delete it once you have checked the result. An active legacy TypeSafe environment override must be removed before migration.
 
 ```
 papio config credentials migrate
@@ -669,7 +669,7 @@ papio config credentials status [TARGET]
 
 Write explicit first-run configuration
 
-Write a new configuration with defaults and the given access mode. With --force it replaces an existing file: every other setting, including data_dir, institutions, sources, hooks and credential bindings, is reset to defaults, and no backup is kept. To change only the access mode, use 'papio config set-access-mode'.
+Write a new configuration with defaults and the given access mode. With --force it replaces an existing file: every other setting, including data_dir, institutions, sources, hooks and credential bindings, is reset to defaults. The previous file is saved to config.toml.bak (mode 0600, replacing any older backup); it may hold plaintext secrets. To change only the access mode, use 'papio config set-access-mode'.
 
 ```
 papio config init [flags]

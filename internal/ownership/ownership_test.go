@@ -140,6 +140,9 @@ func TestQueryFor(t *testing.T) {
 	if doubledSlash.Identifiers[0].Value != "10.48612//monograph-2025-2" {
 		t.Fatalf("doubled slash = %+v, want the repeated slash preserved", doubledSlash)
 	}
+	if len(singleSlash.Identifiers) != 1 || singleSlash.Identifiers[0] != (Identifier{KindDOI, "10.48612/monograph-2025-2"}) {
+		t.Fatalf("single slash = %+v, want the DOI kept verbatim", singleSlash)
+	}
 	if reflect.DeepEqual(doubledSlash, singleSlash) {
 		t.Fatalf("doubled and single slash queries collided: %+v", doubledSlash)
 	}

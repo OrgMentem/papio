@@ -108,6 +108,12 @@ execution records kept during the initial build.
   existing request.
 
 ### Changed
+- **Rewriting `config.toml` now keeps the previous file as `config.toml.bak`.**
+  `papio init`, `config init --force`, `config set-access-mode` and the
+  `config credentials` and `config agent` commands rebuild the file from its
+  settings, which drops your comments. Before, the old file was gone; now its
+  bytes are saved beside it with mode 0600, and `init`, `config init` and
+  `set-access-mode` name the backup in their output.
 - **A new paper reaches its Zotero collection, with its DOI and abstract,
   when Zotero desktop saves it.** Before, *papio* filed the paper and filled a
   missing DOI and abstract after the import, through the Zotero Web API. The

@@ -16,6 +16,7 @@ package storetest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -43,6 +44,20 @@ func DataDir(t *testing.T) string {
 		t.Fatalf("storetest: seeding %s: %v", dir, err)
 	}
 	return dir
+}
+
+// Seed writes the migrated papio.db into dir, which must already exist. It is
+// DataDir for callers with no *testing.T in hand — a TestMain, or a hook that
+// a package's production code exposes to its tests.
+func Seed(dir string) error {
+	once.Do(build)
+	if buildErr != nil {
+		return fmt.Errorf("storetest: building migrated template: %w", buildErr)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "papio.db"), template, 0o600); err != nil {
+		return fmt.Errorf("storetest: seeding %s: %w", dir, err)
+	}
+	return nil
 }
 
 // build runs the real migrations once and keeps the resulting file in memory.

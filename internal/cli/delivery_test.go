@@ -155,78 +155,78 @@ func TestDeliveryCancelReportsSupportAndReason(t *testing.T) {
 	}
 }
 
-func TestDeliveryHistoryCallsOpenRequestHistoryOperation(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params, result any) error {
-		if method != "delivery.action" {
-			t.Fatalf("method = %q, want delivery.action", method)
-		}
-		p := params.(map[string]string)
-		if p["job_id"] != "job_01" || p["operation"] != "open_request_history" {
-			t.Fatalf("params = %#v, want job_id=job_01 operation=open_request_history", p)
-		}
-		*result.(*api.DeliveryActionResult) = api.DeliveryActionResult{
-			JobID: "job_01", Operation: "open_request_history",
-			Detail: &api.DeliveryDetail{
-				Request: &api.DeliveryRequest{JobID: "job_01", Provider: "illiad", State: "unknown_outcome"},
-				Gate:    api.DeliveryGateSummary{Class: "auto_capable"},
+func TestDeliveryActionOperations(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		operation    string
+		providerRef  string // expected provider_reference param; "" means it must be absent
+		result       api.DeliveryActionResult
+		wantExact    string // exact stdout, when set
+		wantContains string // stdout substring, when wantExact is empty
+	}{
+		{
+			name:      "history opens the request history",
+			args:      []string{"delivery", "history", "job_01"},
+			operation: "open_request_history",
+			result: api.DeliveryActionResult{
+				JobID: "job_01", Operation: "open_request_history",
+				Detail: &api.DeliveryDetail{
+					Request: &api.DeliveryRequest{JobID: "job_01", Provider: "illiad", State: "unknown_outcome"},
+					Gate:    api.DeliveryGateSummary{Class: "auto_capable"},
+				},
 			},
-		}
-		return nil
-	})
-	root.SetArgs([]string{"delivery", "history", "job_01"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("delivery history: %v (%s)", err, stderr.String())
+			wantContains: "unknown_outcome",
+		},
+		{
+			name:        "confirm-exists sends the provider reference",
+			args:        []string{"delivery", "confirm-exists", "job_01", "TN-42"},
+			operation:   "confirm_request_exists",
+			providerRef: "TN-42",
+			result:      api.DeliveryActionResult{JobID: "job_01", Operation: "confirm_request_exists", JobState: "retry_wait"},
+			wantExact:   "job_01: confirmed pending with reference TN-42; job is now retry_wait\n",
+		},
+		{
+			name:      "confirm-absent reports the job state without a reference",
+			args:      []string{"delivery", "confirm-absent", "job_01"},
+			operation: "confirm_request_absent",
+			result:    api.DeliveryActionResult{JobID: "job_01", Operation: "confirm_request_absent", JobState: "awaiting_human"},
+			wantExact: "job_01: closed the stale request; job is now awaiting_human\n",
+		},
 	}
-	if got := stdout.String(); !bytes.Contains([]byte(got), []byte("unknown_outcome")) {
-		t.Fatalf("stdout = %q, want it to mention unknown_outcome", got)
-	}
-}
-
-func TestDeliveryConfirmExistsSendsProviderReference(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params, result any) error {
-		if method != "delivery.action" {
-			t.Fatalf("method = %q, want delivery.action", method)
-		}
-		p := params.(map[string]string)
-		if p["job_id"] != "job_01" || p["operation"] != "confirm_request_exists" || p["provider_reference"] != "TN-42" {
-			t.Fatalf("params = %#v", p)
-		}
-		*result.(*api.DeliveryActionResult) = api.DeliveryActionResult{JobID: "job_01", Operation: "confirm_request_exists", JobState: "retry_wait"}
-		return nil
-	})
-	root.SetArgs([]string{"delivery", "confirm-exists", "job_01", "TN-42"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("delivery confirm-exists: %v (%s)", err, stderr.String())
-	}
-	if got := stdout.String(); got != "job_01: confirmed pending with reference TN-42; job is now retry_wait\n" {
-		t.Fatalf("stdout = %q", got)
-	}
-}
-
-func TestDeliveryConfirmAbsentReportsJobState(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params, result any) error {
-		if method != "delivery.action" {
-			t.Fatalf("method = %q, want delivery.action", method)
-		}
-		p := params.(map[string]string)
-		if p["job_id"] != "job_01" || p["operation"] != "confirm_request_absent" {
-			t.Fatalf("params = %#v", p)
-		}
-		if _, hasRef := p["provider_reference"]; hasRef {
-			t.Fatalf("confirm-absent must not send provider_reference: %#v", p)
-		}
-		*result.(*api.DeliveryActionResult) = api.DeliveryActionResult{JobID: "job_01", Operation: "confirm_request_absent", JobState: "awaiting_human"}
-		return nil
-	})
-	root.SetArgs([]string{"delivery", "confirm-absent", "job_01"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("delivery confirm-absent: %v (%s)", err, stderr.String())
-	}
-	if got := stdout.String(); got != "job_01: closed the stale request; job is now awaiting_human\n" {
-		t.Fatalf("stdout = %q", got)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params, result any) error {
+				if method != "delivery.action" {
+					t.Fatalf("method = %q, want delivery.action", method)
+				}
+				p := params.(map[string]string)
+				if p["job_id"] != "job_01" || p["operation"] != test.operation {
+					t.Fatalf("params = %#v, want job_id=job_01 operation=%s", p, test.operation)
+				}
+				ref, hasRef := p["provider_reference"]
+				if test.providerRef == "" && hasRef {
+					t.Fatalf("%s must not send provider_reference: %#v", test.operation, p)
+				}
+				if test.providerRef != "" && ref != test.providerRef {
+					t.Fatalf("provider_reference = %q, want %q", ref, test.providerRef)
+				}
+				*result.(*api.DeliveryActionResult) = test.result
+				return nil
+			})
+			root.SetArgs(test.args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("%v: %v (%s)", test.args, err, stderr.String())
+			}
+			got := stdout.String()
+			if test.wantExact != "" && got != test.wantExact {
+				t.Fatalf("stdout = %q, want %q", got, test.wantExact)
+			}
+			if test.wantContains != "" && !bytes.Contains([]byte(got), []byte(test.wantContains)) {
+				t.Fatalf("stdout = %q, want it to contain %q", got, test.wantContains)
+			}
+		})
 	}
 }
 

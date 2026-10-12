@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,18 +126,71 @@ func TestStoreHandlerJobsFailuresGroupsTerminalJobs(t *testing.T) {
 	}
 }
 
-func TestStoreHandlerJobsFailuresRejectsBadParams(t *testing.T) {
+// TestStoreHandlerRejectsBadParams pins invalid_argument for the store-backed
+// methods whose bad-params check has one shape: every listed params value must
+// be refused. Methods with distinct logic keep their own tests.
+func TestStoreHandlerRejectsBadParams(t *testing.T) {
 	router := Router(testSystem(t))
-	for _, params := range []map[string]any{
-		{"limit": -1},
-		{"since": "not-a-duration"},
-		{"since": "-3h"},
-		{"limit": "ten"},
-		{"window": "24h"},
+	for _, tc := range []struct {
+		method string
+		params []map[string]any
+	}{
+		{"jobs.failures", []map[string]any{
+			{"limit": -1},
+			{"since": "not-a-duration"},
+			{"since": "-3h"},
+			{"limit": "ten"},
+			{"window": "24h"},
+		}},
+		{"jobs.incidents", []map[string]any{
+			{"limit": -1},
+			{"since": "yesterday"},
+			{"since": "-1h"},
+			{"limit": []int{1}},
+			{"scope": "all"},
+		}},
+		{"watch.digest", []map[string]any{
+			{"id": 0},
+			{"id": -1},
+			{},
+			{"id": "seven"},
+			{"watch_id": 1},
+		}},
+		{"failures.list_v1", []map[string]any{
+			{"limit": "twenty"},
+			{"by_provider": "yes"},
+			{"provider": "example.com"},
+		}},
+		{"stats.page_bulk", []map[string]any{
+			{"limit": 1},
+			{"origin_class": ""},
+		}},
+		{"browser.effect_permit.resolve", []map[string]any{
+			{},
+			{"permit_id": "permit_store", "reason": ""},
+			{"permit_id": "permit_store", "reason": "   "},
+			{"permit_id": "   ", "reason": "operator override"},
+			{"reason": "operator override"},
+			{"permit_id": "permit_store", "reason": "operator override", "force": true},
+		}},
+		{"work.pulse_v1", []map[string]any{
+			{},
+			{"request_id": "", "schema_versions": []int{1}},
+			{"request_id": strings.Repeat("x", 65), "schema_versions": []int{1}},
+			{"request_id": "pulse_store_bad", "schema_versions": []int{}},
+			{"request_id": "pulse_store_bad", "schema_versions": []int{2}},
+			{"request_id": "pulse_store_bad", "schema_versions": []int{1, 1}},
+			{"request_id": "pulse_store_bad", "schema_versions": 1},
+			{"request_id": "pulse_store_bad", "schema_versions": []int{1}, "detail": true},
+		}},
 	} {
-		if rpcErr := callMethod(t, router, "jobs.failures", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
-			t.Fatalf("jobs.failures %v = %+v, want invalid_argument", params, rpcErr)
-		}
+		t.Run(tc.method, func(t *testing.T) {
+			for _, params := range tc.params {
+				if rpcErr := callMethod(t, router, tc.method, params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+					t.Fatalf("%s %v = %+v, want invalid_argument", tc.method, params, rpcErr)
+				}
+			}
+		})
 	}
 }
 
@@ -193,21 +247,6 @@ func TestStoreHandlerJobsIncidentsReturnsMatchingEventDerivedGroup(t *testing.T)
 	}
 }
 
-func TestStoreHandlerJobsIncidentsRejectsBadParams(t *testing.T) {
-	router := Router(testSystem(t))
-	for _, params := range []map[string]any{
-		{"limit": -1},
-		{"since": "yesterday"},
-		{"since": "-1h"},
-		{"limit": []int{1}},
-		{"scope": "all"},
-	} {
-		if rpcErr := callMethod(t, router, "jobs.incidents", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
-			t.Fatalf("jobs.incidents %v = %+v, want invalid_argument", params, rpcErr)
-		}
-	}
-}
-
 func TestStoreHandlerWatchDigestReturnsRecordedEntries(t *testing.T) {
 	system := testSystem(t)
 	ctx := context.Background()
@@ -238,21 +277,6 @@ func TestStoreHandlerWatchDigestReturnsRecordedEntries(t *testing.T) {
 	rpcErr := callMethod(t, router, "watch.digest", map[string]any{"id": watched.ID + 4242}, nil)
 	if rpcErr == nil || rpcErr.Code != "not_found" {
 		t.Fatalf("unknown watch digest = %+v, want not_found", rpcErr)
-	}
-}
-
-func TestStoreHandlerWatchDigestRejectsBadParams(t *testing.T) {
-	router := Router(testSystem(t))
-	for _, params := range []map[string]any{
-		{"id": 0},
-		{"id": -1},
-		{},
-		{"id": "seven"},
-		{"watch_id": 1},
-	} {
-		if rpcErr := callMethod(t, router, "watch.digest", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
-			t.Fatalf("watch.digest %v = %+v, want invalid_argument", params, rpcErr)
-		}
 	}
 }
 
@@ -314,29 +338,27 @@ func TestStoreHandlerFailuresListV1AggregatesAndTruncates(t *testing.T) {
 	}
 }
 
-func TestStoreHandlerFailuresListV1RejectsBadParams(t *testing.T) {
-	router := Router(testSystem(t))
-	for _, params := range []map[string]any{
-		{"limit": "twenty"},
-		{"by_provider": "yes"},
-		{"provider": "example.com"},
-	} {
-		if rpcErr := callMethod(t, router, "failures.list_v1", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
-			t.Fatalf("failures.list_v1 %v = %+v, want invalid_argument", params, rpcErr)
-		}
-	}
-}
-
-func TestStoreHandlerFailuresListV1WithoutStoreFailsPrecondition(t *testing.T) {
-	system := testSystem(t)
-	// Hand the store back before testSystem's cleanup: System.Close skips a nil
-	// Store, and Windows cannot remove a TempDir that holds an open database.
+// detachStore hands the store back before testSystem's cleanup: System.Close
+// skips a nil Store, and Windows cannot remove a TempDir that holds an open
+// database.
+func detachStore(t *testing.T, system *bootstrap.System) {
+	t.Helper()
 	detached := system.Store
 	system.Store = nil
 	t.Cleanup(func() { system.Store = detached })
-	rpcErr := callMethod(t, Router(system), "failures.list_v1", map[string]any{}, nil)
-	if rpcErr == nil || rpcErr.Code != "precondition_failed" {
-		t.Fatalf("failures.list_v1 without a store = %+v, want precondition_failed", rpcErr)
+}
+
+func TestStoreHandlerWithoutStoreFailsPrecondition(t *testing.T) {
+	system := testSystem(t)
+	detachStore(t, system)
+	router := Router(system)
+	for _, method := range []string{"failures.list_v1", "stats.page_bulk"} {
+		t.Run(method, func(t *testing.T) {
+			rpcErr := callMethod(t, router, method, map[string]any{}, nil)
+			if rpcErr == nil || rpcErr.Code != "precondition_failed" {
+				t.Fatalf("%s without a store = %+v, want precondition_failed", method, rpcErr)
+			}
+		})
 	}
 }
 
@@ -377,31 +399,6 @@ func TestStoreHandlerPageBulkStatsReportsFunnel(t *testing.T) {
 	}
 	if row.IdentifierYield == nil || *row.IdentifierYield != 0.25 {
 		t.Fatalf("identifier yield = %v, want 0.25", row.IdentifierYield)
-	}
-}
-
-func TestStoreHandlerPageBulkStatsRejectsBadParams(t *testing.T) {
-	router := Router(testSystem(t))
-	for _, params := range []map[string]any{
-		{"limit": 1},
-		{"origin_class": ""},
-	} {
-		if rpcErr := callMethod(t, router, "stats.page_bulk", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
-			t.Fatalf("stats.page_bulk %v = %+v, want invalid_argument", params, rpcErr)
-		}
-	}
-}
-
-func TestStoreHandlerPageBulkStatsWithoutStoreFailsPrecondition(t *testing.T) {
-	system := testSystem(t)
-	// Hand the store back before testSystem's cleanup: System.Close skips a nil
-	// Store, and Windows cannot remove a TempDir that holds an open database.
-	detached := system.Store
-	system.Store = nil
-	t.Cleanup(func() { system.Store = detached })
-	rpcErr := callMethod(t, Router(system), "stats.page_bulk", map[string]any{}, nil)
-	if rpcErr == nil || rpcErr.Code != "precondition_failed" {
-		t.Fatalf("stats.page_bulk without a store = %+v, want precondition_failed", rpcErr)
 	}
 }
 
@@ -463,22 +460,6 @@ func TestStoreHandlerResolveEffectPermitSettlesUnknownCompletion(t *testing.T) {
 		"permit_id": "permit_store_missing", "reason": "override a permit that does not exist",
 	}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("missing permit resolve = %+v, want invalid_argument", rpcErr)
-	}
-}
-
-func TestStoreHandlerResolveEffectPermitRejectsBadParams(t *testing.T) {
-	router := Router(testSystem(t))
-	for _, params := range []map[string]any{
-		{},
-		{"permit_id": "permit_store", "reason": ""},
-		{"permit_id": "permit_store", "reason": "   "},
-		{"permit_id": "   ", "reason": "operator override"},
-		{"reason": "operator override"},
-		{"permit_id": "permit_store", "reason": "operator override", "force": true},
-	} {
-		if rpcErr := callMethod(t, router, "browser.effect_permit.resolve", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
-			t.Fatalf("browser.effect_permit.resolve %v = %+v, want invalid_argument", params, rpcErr)
-		}
 	}
 }
 
@@ -589,25 +570,18 @@ func TestStoreHandlerWorkPulseReadsSnapshot(t *testing.T) {
 	}
 }
 
-func TestStoreHandlerWorkPulseRejectsBadParams(t *testing.T) {
-	router := Router(testSystem(t))
-	longID := ""
-	for len(longID) <= 64 {
-		longID += "x"
+// A request_id of exactly 64 bytes is the longest the handler accepts: the
+// boundary witness that keeps the `> 64` guard from tightening unnoticed.
+func TestStoreHandlerWorkPulseAcceptsMaxLengthRequestID(t *testing.T) {
+	requestID := strings.Repeat("x", 64)
+	var result PulseResult
+	if rpcErr := callMethod(t, Router(testSystem(t)), "work.pulse_v1", map[string]any{
+		"request_id": requestID, "schema_versions": []int{1},
+	}, &result); rpcErr != nil {
+		t.Fatalf("work.pulse_v1 with a 64-byte request_id = %+v", rpcErr)
 	}
-	for _, params := range []map[string]any{
-		{},
-		{"request_id": "", "schema_versions": []int{1}},
-		{"request_id": longID, "schema_versions": []int{1}},
-		{"request_id": "pulse_store_bad", "schema_versions": []int{}},
-		{"request_id": "pulse_store_bad", "schema_versions": []int{2}},
-		{"request_id": "pulse_store_bad", "schema_versions": []int{1, 1}},
-		{"request_id": "pulse_store_bad", "schema_versions": 1},
-		{"request_id": "pulse_store_bad", "schema_versions": []int{1}, "detail": true},
-	} {
-		if rpcErr := callMethod(t, router, "work.pulse_v1", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
-			t.Fatalf("work.pulse_v1 %v = %+v, want invalid_argument", params, rpcErr)
-		}
+	if result.RequestID != requestID {
+		t.Fatalf("request_id = %q, want the 64-byte id echoed", result.RequestID)
 	}
 }
 
@@ -628,42 +602,32 @@ func TestStoreHandlerWorkPulseWithoutServiceIsUnavailable(t *testing.T) {
 // as a platform capability refusal or a transport failure.
 const notifyUnavailableMessage = "notification router is unavailable; restart the papio daemon"
 
-func TestStoreHandlerNotifyUnavailableShow(t *testing.T) {
+func TestStoreHandlerNotifyUnavailable(t *testing.T) {
 	system := testSystem(t)
 	system.Notify = nil
-	var result NotifyShowResult
-	rpcErr := callMethod(t, Router(system), "notify.show_v1", struct{}{}, &result)
-	if rpcErr == nil || rpcErr.Code != "unavailable" || rpcErr.Message != notifyUnavailableMessage {
-		t.Fatalf("notify.show_v1 without a notify router = %+v, want the shared unavailable error", rpcErr)
-	}
-	if len(result.Rows) != 0 || result.Preset != "" {
-		t.Fatalf("notify.show_v1 result = %+v, want no routing table on the guarded path", result)
-	}
-}
-
-func TestStoreHandlerNotifyUnavailablePreview(t *testing.T) {
-	system := testSystem(t)
-	system.Notify = nil
-	// The category is deliberately unknown: the guard runs before category
-	// decoding, so a `invalid_argument` here would prove the router reached
-	// past the shared helper instead of returning from it.
-	rpcErr := callMethod(t, Router(system), "notify.preview_v1", map[string]any{
-		"category": "not_a_real_category", "count": 7,
-	}, nil)
-	if rpcErr == nil || rpcErr.Code != "unavailable" || rpcErr.Message != notifyUnavailableMessage {
-		t.Fatalf("notify.preview_v1 without a notify router = %+v, want the shared unavailable error", rpcErr)
-	}
-}
-
-func TestStoreHandlerNotifyUnavailableTest(t *testing.T) {
-	system := testSystem(t)
-	system.Notify = nil
-	// Same reasoning as preview, and it also pins the guard ahead of the
-	// platform capability probe, whose unavailable message differs.
-	rpcErr := callMethod(t, Router(system), "notify.test_v1", map[string]any{
-		"category": "not_a_real_category",
-	}, nil)
-	if rpcErr == nil || rpcErr.Code != "unavailable" || rpcErr.Message != notifyUnavailableMessage {
-		t.Fatalf("notify.test_v1 without a notify router = %+v, want the shared unavailable error", rpcErr)
+	router := Router(system)
+	for _, tc := range []struct {
+		method string
+		params any
+	}{
+		{"notify.show_v1", struct{}{}},
+		// The category is deliberately unknown: the guard runs before category
+		// decoding, so a `invalid_argument` here would prove the router reached
+		// past the shared helper instead of returning from it.
+		{"notify.preview_v1", map[string]any{"category": "not_a_real_category", "count": 7}},
+		// Same reasoning as preview, and it also pins the guard ahead of the
+		// platform capability probe, whose unavailable message differs.
+		{"notify.test_v1", map[string]any{"category": "not_a_real_category"}},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			var result NotifyShowResult
+			rpcErr := callMethod(t, router, tc.method, tc.params, &result)
+			if rpcErr == nil || rpcErr.Code != "unavailable" || rpcErr.Message != notifyUnavailableMessage {
+				t.Fatalf("%s without a notify router = %+v, want the shared unavailable error", tc.method, rpcErr)
+			}
+			if len(result.Rows) != 0 || result.Preset != "" {
+				t.Fatalf("%s result = %+v, want no routing table on the guarded path", tc.method, result)
+			}
+		})
 	}
 }

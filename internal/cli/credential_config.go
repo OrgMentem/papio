@@ -206,7 +206,7 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 			return deleteCredentialRecord(cmd, opt, deps, cfg, ref)
 		}}
 	del.Flags().BoolVar(&confirmDelete, "yes", false, "delete the record; without it the command only describes the deletion")
-	migrate := &cobra.Command{Use: "migrate", Short: "Move this configuration's legacy secrets into verified OS records", Args: credentialArgs(0, 0), Long: "Migrate supported literal credentials and this profile's legacy TypeSafe key. New records are verified before one guarded config update. Existing vault entries are retained. Interrupted operations report staged references for inspection or explicit deletion. No plaintext backup is created. An active legacy TypeSafe environment override must be removed before migration.", RunE: func(cmd *cobra.Command, _ []string) error {
+	migrate := &cobra.Command{Use: "migrate", Short: "Move this configuration's legacy secrets into verified OS records", Args: credentialArgs(0, 0), Long: "Migrate supported literal credentials and this profile's legacy TypeSafe key. New records are verified before one guarded config update. Existing vault entries are retained. Interrupted operations report staged references for inspection or explicit deletion. The previous config is saved to config.toml.bak (mode 0600) and may still hold the literal secrets; delete it once you have checked the result. An active legacy TypeSafe environment override must be removed before migration.", RunE: func(cmd *cobra.Command, _ []string) error {
 		result, err := migrateCredentials(cmd.Context(), opt, deps)
 		if err != nil {
 			return err

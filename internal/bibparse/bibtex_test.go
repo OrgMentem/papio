@@ -169,9 +169,27 @@ func TestParseBibTeXEmptySourceSentinel(t *testing.T) {
 func TestParseBibTeXEprintArchiveMetadata(t *testing.T) {
 	tests := []struct {
 		name   string
+		pre    string
 		fields string
 		want   string
 	}{
+		{
+			name: "single archiveprefix arxiv",
+			fields: `
+  archiveprefix = {arXiv},`,
+			want: "2401.00001",
+		},
+		{
+			name: "single eprinttype arxiv",
+			fields: `
+  eprinttype = {arxiv},`,
+			want: "2401.00001",
+		},
+		{
+			name: "archiveprefix may precede eprint",
+			pre:  "\n  archiveprefix = {arXiv},",
+			want: "2401.00001",
+		},
 		{
 			name: "bare eprint is assumed arxiv",
 			want: "2401.00001",
@@ -255,11 +273,36 @@ func TestParseBibTeXEprintArchiveMetadata(t *testing.T) {
 			fields: `
   eprinttype = {JSTOR},`,
 		},
+		{
+			name: "empty archiveprefix is ignored",
+			fields: `
+  archiveprefix = {},`,
+			want: "2401.00001",
+		},
+		{
+			name: "empty eprinttype is ignored",
+			fields: `
+  eprinttype = {},`,
+			want: "2401.00001",
+		},
+		{
+			name: "explicit arxiv field wins over bare eprint",
+			fields: `
+  arxiv = {2401.99999},`,
+			want: "2401.99999",
+		},
+		{
+			name: "explicit arxiv field wins over foreign eprint",
+			fields: `
+  arxiv = {2401.99999},
+  eprinttype = {jstor},`,
+			want: "2401.99999",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			input := "@article{a,\n  eprint = {2401.00001}," + tt.fields + "\n}"
+			input := "@article{a," + tt.pre + "\n  eprint = {2401.00001}," + tt.fields + "\n}"
 			records, err := parseBibTeX([]byte(input))
 			if err != nil {
 				t.Fatalf("parseBibTeX() error = %v", err)
@@ -271,5 +314,18 @@ func TestParseBibTeXEprintArchiveMetadata(t *testing.T) {
 				t.Errorf("ArXiv = %q, want %q", records[0].ArXiv, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseBibTeXPMIDField(t *testing.T) {
+	records, err := parseBibTeX([]byte("@article{a,\n title = {T},\n pmid = {12345678},\n}\n"))
+	if err != nil {
+		t.Fatalf("parseBibTeX() error = %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("len(records) = %d, want 1", len(records))
+	}
+	if records[0].PMID != "12345678" {
+		t.Errorf("PMID = %q, want %q", records[0].PMID, "12345678")
 	}
 }

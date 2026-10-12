@@ -16686,7 +16686,7 @@ func TestRequestDevReloadRejectsOldExtensionVersionAndDoesNotLatch(t *testing.T)
 	}
 }
 
-func TestRequestDevReloadHappyPathEmitsOnNextSync(t *testing.T) {
+func TestDevReloadLatchIsOneShotStopsReloadLoop(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	runSyncAs(t, b, sessA, helloAs("0.15.0"))
 	sid, reloadID, err := b.RequestDevReload("")
@@ -16700,32 +16700,19 @@ func TestRequestDevReloadHappyPathEmitsOnNextSync(t *testing.T) {
 		t.Fatal("reload_id is empty")
 	}
 	msgs, _ := runSyncAs(t, b, sessA)
-	got := firstOfType(msgs, protocol.MsgDevReload)
-	if got == nil {
-		t.Fatalf("next Sync did not emit dev_reload, got %v", msgs)
+	first := firstOfType(msgs, protocol.MsgDevReload)
+	if first == nil {
+		t.Fatalf("first Sync after latch did not emit dev_reload, got %v", msgs)
 	}
-	payload, ok := got.Payload.(*protocol.DevReloadPayload)
+	firstPayload, ok := first.Payload.(*protocol.DevReloadPayload)
 	if !ok {
-		t.Fatalf("payload type = %T, want *DevReloadPayload", got.Payload)
+		t.Fatalf("payload type = %T, want *DevReloadPayload", first.Payload)
 	}
-	if payload.ReloadID != reloadID {
-		t.Fatalf("reload_id = %q, want %q", payload.ReloadID, reloadID)
+	if firstPayload.ReloadID != reloadID {
+		t.Fatalf("reload_id = %q, want %q", firstPayload.ReloadID, reloadID)
 	}
-	if got.JobID != "" {
-		t.Fatalf("dev_reload job_id = %q, want empty (job-free)", got.JobID)
-	}
-}
-
-func TestDevReloadLatchIsOneShotStopsReloadLoop(t *testing.T) {
-	b, _, _, _ := newBridge(t)
-	runSyncAs(t, b, sessA, helloAs("0.15.0"))
-	_, reloadID, err := b.RequestDevReload("")
-	if err != nil {
-		t.Fatalf("RequestDevReload: %v", err)
-	}
-	msgs, _ := runSyncAs(t, b, sessA)
-	if firstOfType(msgs, protocol.MsgDevReload) == nil {
-		t.Fatalf("first Sync after latch did not emit dev_reload")
+	if first.JobID != "" {
+		t.Fatalf("dev_reload job_id = %q, want empty (job-free)", first.JobID)
 	}
 	msgs, _ = runSyncAs(t, b, sessA)
 	if second := firstOfType(msgs, protocol.MsgDevReload); second != nil {

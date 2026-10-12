@@ -79,8 +79,10 @@ changes with `papio daemon stop`; the next ordinary command starts it again.
 It validates the inventory, creates and verifies fresh records, rejects observed
 concurrent config edits, then publishes one atomic config update. A failed save
 leaves the original config in place and reports any staged references for cleanup.
-It leaves the old TypeSafe record intact and creates no plaintext backup. An
-active legacy TypeSafe environment override must be removed before migration.
+It leaves the old TypeSafe record intact and saves the previous config to
+`config.toml.bak` (mode 0600), which can still hold the literal secrets; delete it
+after you check the result. An active legacy TypeSafe environment override must be
+removed before migration.
 Install a compatible daemon and native host first: older strict config parsers
 cannot read the new reference fields.
 

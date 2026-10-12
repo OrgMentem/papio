@@ -175,7 +175,8 @@ credential command.
 Legacy TOML secrets remain supported until you run
 `papio config credentials migrate`. Migration verifies new records before
 replacing config, refuses observed concurrent edits, leaves old TypeSafe records
-intact and creates no plaintext backup. Existing user backups are not rewritten.
+intact and saves the previous config to `config.toml.bak` (mode 0600). That file
+can still hold the literal secrets, so delete it after you check the result.
 Credential status reports local availability without printing values; it does not
 claim the provider has authenticated them. Browser passwords, cookies and SSO
 remain browser-owned; Zotero credentials remain zotio-owned.

@@ -205,12 +205,25 @@ type overlayService struct {
 	jobs *job.Store
 }
 
+// seedOverlayDir prepares a fresh overlay data directory before store.Open
+// sees it. Production leaves it nil, so Open runs the real migrations on an
+// empty directory. Tests assign a function that drops in an already-migrated
+// database (see main_test.go), because migrations dominate the cost of Run
+// under -race; production code cannot import internal/store/storetest.
+var seedOverlayDir func(dir string) error
+
 func newOverlayService(ctx context.Context, current bool, rig *sourceRig) (*overlayService, func(), error) {
 	dir, err := os.MkdirTemp("", "papio-bench-*")
 	if err != nil {
 		return nil, nil, fmt.Errorf("bench: temp data dir: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
+	if seedOverlayDir != nil {
+		if err := seedOverlayDir(dir); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("bench: seeding ephemeral store: %w", err)
+		}
+	}
 	db, err := store.Open(ctx, dir)
 	if err != nil {
 		cleanup()

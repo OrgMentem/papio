@@ -181,7 +181,8 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}
 	writeDeliveryGateVerdicts(opt.out, cfg)
-	if err := config.Save(cfg, path); err != nil {
+	backup, err := config.SaveWithBackup(cfg, path)
+	if err != nil {
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}
 	cfg, err = config.Load(path)
@@ -191,7 +192,7 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	if !input.nonInteractive {
 		fmt.Fprintln(opt.out)
 	}
-	initLine(opt.out, true, "Configuration", "wrote "+cfg.Path)
+	initLine(opt.out, true, "Configuration", "wrote "+cfg.Path+backupNotice(path, backup, "; "))
 
 	system, err := deps.Bootstrap(cmd.Context(), cfg)
 	if err != nil {
