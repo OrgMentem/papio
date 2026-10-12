@@ -229,6 +229,7 @@ func TestZotioHandlerRejectsUndecodableParams(t *testing.T) {
 		{"zotio.plan", map[string]any{"job_ids": "job_1"}},
 		{"zotio.import_backfill", map[string]any{"apply": "yes"}},
 		{"zotio.tags.reconcile", map[string]any{"unexpected": true}},
+		{"zotio.tags.retractions", map[string]any{"apply": "yes"}},
 		{"zotio.apply", map[string]any{"plan_id": 1}},
 	} {
 		rpcErr := callMethod(t, router, tc.method, tc.params, nil)
@@ -425,6 +426,7 @@ func TestZotioHandlerGuardsMissingZotioDependency(t *testing.T) {
 		{"zotio.import_backfill", map[string]any{"limit": 5}},
 		{"zotio.plan", map[string]any{"job_ids": []string{"job_1"}}},
 		{"zotio.tags.reconcile", map[string]any{}},
+		{"zotio.tags.retractions", map[string]any{}},
 		{"zotio.apply", map[string]any{"plan_id": "zplan_0123456789abcdef0123456789", "confirmation_sha256": "d"}},
 	} {
 		rpcErr := callMethod(t, router, tc.method, tc.params, nil)

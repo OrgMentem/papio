@@ -511,8 +511,11 @@ type Bridge struct {
 	// the flag, and logs the recovery, the moment it finally returns.
 	// presence carries only focused surface leases; it is bounded and
 	// holder-independent because pending sessions may report their own focus.
-	presence              map[string]presenceLease
-	presenceOrder         []string
+	presence      map[string]presenceLease
+	presenceOrder []string
+	// adapterControl is the daemon's canonical signed adapter control (nil
+	// disables it). See adapter_control.go.
+	adapterControl        AdapterControlSource
 	adoptionScanSuspended bool
 	// grabStageMu guards grabStaging and makes stageGrabCopy's
 	// look-then-copy atomic in-process. grabStaging names grabs whose bind is
@@ -792,9 +795,11 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 	// offering manual downloads on its own, and nothing here changes what a
 	// plain session-live tick does.
 	focusable := make(map[string]string, len(actions))
+	focusableAction := make(map[string]job.HumanAction, len(actions))
 	for _, action := range actions {
 		if action.Kind == handoffActionKind || action.Kind == manualDownloadActionKind {
 			focusable[action.JobID] = action.Kind
+			focusableAction[action.JobID] = action
 		}
 	}
 	for _, jobID := range jobIDs {
@@ -828,7 +833,13 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		// Materialization is papio driving the provider page. A manual
 		// download is the opposite instruction — the human fetches the file —
 		// so it takes the plain offer path below and never pins a candidate.
-		if kind == handoffActionKind && b.institutionalMaterializationAvailable() {
+		// A job signed control suspends is opened for the human as an assisted
+		// offer, so it pins no materialization candidate (automatic authority).
+		controlReason, controlErr := b.actionControlSuppression(ctx, *row, focusableAction[jobID])
+		if controlErr != nil {
+			return queued, true, controlErr
+		}
+		if kind == handoffActionKind && b.institutionalMaterializationAvailable() && controlReason == "" {
 			epoch := b.arbitration.generation()
 			b.mu.Unlock()
 			// An operator asking again for a paper whose attempt already
@@ -1520,6 +1531,12 @@ func (b *Bridge) helloAck(role, peerVersion string, peerFeatures []string) (json
 		DaemonVersion:   b.Version,
 		Features:        features,
 		ResolverOrigins: b.cfg.ResolverOrigins(),
+	}
+	// Version-gated, never a feature: the list is full and an older strict
+	// hello_ack parser rejects the field. Pending sessions get it too, since
+	// each session applies control against its own bundle.
+	if b.adapterControl != nil && compareVersion(peerVersion, AdapterControlMinExtensionVersion) >= 0 {
+		payload.AdapterControl = true
 	}
 	if compareVersion(peerVersion, SessionRolesMinExtensionVersion) >= 0 {
 		payload.Role = role
@@ -2296,6 +2313,15 @@ func (b *Bridge) institutionalRoute(ctx context.Context, jobID string, p *protoc
 	}
 	if !b.effectPermitAvailable() {
 		result.Outcome, result.Detail = "feature_disabled", "durable effect permits are unavailable"
+		return b.frameInstitutionalRoute(jobID, result)
+	}
+	// candidate.SafetyDomainID is a keyed MAC for the permit fence, never a
+	// public domain a signed document can name. Check the public
+	// `institution:<host>` domain (the same one automatic offers use) and the
+	// resolved route host, so a suspended domain or a suspended adapter's host
+	// cannot obtain a navigation permit through an already bound claim.
+	if reason := b.controlSuppression(actionSafetyDomain(b.cfg, *row, *action), "", []string{resolverHost(routeURL)}); reason != "" {
+		result.Outcome, result.Detail = "not_eligible", controlRefusalDetail(reason)
 		return b.frameInstitutionalRoute(jobID, result)
 	}
 	permit, acquireOutcome, acquireErr := b.jobs.AcquireInstitutionalEffectPermit(ctx, job.InstitutionalEffectPermitAcquireInput{
@@ -3278,7 +3304,8 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 			protocol.MsgTermsEffectResultRequest,
 			protocol.MsgStatsRequest, protocol.MsgActivityRequest, protocol.MsgTriageDecide,
 			protocol.MsgHumanActionResolve, protocol.MsgDeliveryReconcileRequest,
-			protocol.MsgReviewPreviewRequest:
+			protocol.MsgReviewPreviewRequest,
+			protocol.MsgAdapterControlRequest, protocol.MsgAdapterControlApplyResult:
 			// A frame is holder-independent when the human initiated it in
 			// this browser, it starts no browser-side effect — no tab opened,
 			// focused, grouped or closed; no offer, handoff, cancel or focus
@@ -3322,6 +3349,11 @@ func (b *Bridge) handle(ctx context.Context, sessionID string, msg *protocol.Bro
 		return b.importNativeDownload(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.NativeDownloadImportRequestV1Payload))
 	case protocol.MsgAgentDecideRequestV1:
 		return b.agentDecide(ctx, sessionID, msg.JobID, msg.Payload.(*protocol.AgentDecideRequestV1Payload))
+	case protocol.MsgAdapterControlRequest:
+		return b.adapterControlRequest(sessionID, msg.Payload.(*protocol.AdapterControlRequestPayload))
+	case protocol.MsgAdapterControlApplyResult:
+		b.adapterControlApplied(session, msg.Payload.(*protocol.AdapterControlApplyResultPayload))
+		return nil, nil
 	case protocol.MsgSurfacePresence:
 		return b.surfacePresence(ctx, msg.Payload.(*protocol.SurfacePresencePayload))
 	case protocol.MsgWorkPulseRequest:
@@ -3858,6 +3890,8 @@ func (b *Bridge) providerDriveEpochStart(ctx context.Context, jobID string, p *p
 						outcome, detail = "error", "provider drive epoch authorization is unavailable"
 					} else if !authorized {
 						outcome, detail = "stale", "drive epoch job is no longer awaiting this handoff"
+					} else if reason := b.controlSuppression(domain, "", nil); reason != "" {
+						outcome, detail = "unsupported", controlRefusalDetail(reason)
 					} else {
 						attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 						if attemptErr != nil {
@@ -4152,6 +4186,8 @@ func (b *Bridge) termsEffectStart(ctx context.Context, jobID string, p *protocol
 				} else {
 					outcome, detail = "error", "terms effect safety domain is unavailable"
 				}
+			} else if reason := b.controlSuppression(domain, p.AdapterID+"@"+p.AdapterVersion, nil); reason != "" {
+				outcome, detail = "unsupported", controlRefusalDetail(reason)
 			} else {
 				key, keyErr := b.jobs.InstitutionAuthorityKey(ctx)
 				if keyErr != nil {
@@ -11607,7 +11643,7 @@ jobLoop:
 				delete(b.focusPending, id)
 				continue
 			}
-			latched, latchErr := b.browserOfferLatched(ctx, *row, handoff[id])
+			latched, latchErr := b.offerLatched(ctx, *row, handoff[id], false)
 			if latchErr != nil {
 				log.Printf("papio: reading focused browser safety latch for %s: %v", id, latchErr)
 				continue
@@ -11616,10 +11652,18 @@ jobLoop:
 				delete(b.focusPending, id)
 				continue
 			}
+			// Signed control withholds automatic authority, not the operator's
+			// own open: a suspended job still gets the URL-bearing offer, as an
+			// assisted one, and never a materialization candidate.
+			controlReason, controlErr := b.actionControlSuppression(ctx, *row, handoff[id])
+			if controlErr != nil {
+				log.Printf("papio: reading signed control for focused job %s: %v", id, controlErr)
+				continue
+			}
 			// Only institutional handoffs have materialization candidates. A manual
 			// download needs the URL-bearing offer and focus below, even when
 			// the holder supports materialization.
-			if handoff[id].Kind == handoffActionKind && b.institutionalMaterializationAvailable() {
+			if handoff[id].Kind == handoffActionKind && b.institutionalMaterializationAvailable() && controlReason == "" {
 				frame, err := b.serviceMaterializationCandidate(ctx, id, row, handoff[id], accessMode, scheduledByJob, scheduledRawByJob)
 				if err != nil {
 					return nil, err
@@ -11654,7 +11698,7 @@ jobLoop:
 				}
 				continue
 			}
-			if !b.offered[id] && b.providerDriveEpochAvailable() {
+			if !b.offered[id] && b.providerDriveEpochAvailable() && controlReason == "" {
 				events, epochErr := b.jobs.Events(ctx, id)
 				if epochErr != nil {
 					log.Printf("papio: reading focused provider epoch for %s: %v", id, epochErr)
@@ -12732,6 +12776,20 @@ func (b *Bridge) browserOfferLatched(
 	action job.HumanAction,
 	override ...string,
 ) (bool, error) {
+	return b.offerLatched(ctx, row, action, true, override...)
+}
+
+// offerLatched is browserOfferLatched with signed adapter control optional.
+// The explicit-open path passes withControl=false: control only withholds
+// AUTOMATIC authority, so an operator's own `papio actions open` must still
+// reach the human, as an assisted offer (see offerAtURL).
+func (b *Bridge) offerLatched(
+	ctx context.Context,
+	row job.Row,
+	action job.HumanAction,
+	withControl bool,
+	override ...string,
+) (bool, error) {
 	events, err := b.jobs.Events(ctx, row.ID)
 	if err != nil {
 		return true, err
@@ -12747,6 +12805,15 @@ func (b *Bridge) browserOfferLatched(
 	if len(override) > 1 && override[1] != "" {
 		landingHost = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(override[1]), "."))
 		offerHosts = append(offerHosts, landingHost)
+	}
+	// Signed adapter control sits above every per-job latch: a suspended
+	// revision or safety domain, or a session that has not applied the current
+	// control, is offered nothing automatic. The job stays open for the human.
+	// This is the one gate behind all four automatic offer sites.
+	if withControl {
+		if reason := b.controlSuppression(domain, "", append(offerHosts[:len(offerHosts):len(offerHosts)], landingHost)); reason != "" {
+			return true, nil
+		}
 	}
 	if domain == "" {
 		return false, nil
@@ -12809,6 +12876,23 @@ func (b *Bridge) browserOfferLatched(
 		}
 	}
 	return false, nil
+}
+
+// actionControlSuppression reports why signed adapter control forbids
+// automatic authority for this handoff, or "" when it permits it. Callers hold
+// b.mu. An explicit human open uses it to degrade to an assisted offer rather
+// than to drop the open.
+func (b *Bridge) actionControlSuppression(ctx context.Context, row job.Row, action job.HumanAction) (string, error) {
+	if b.adapterControl == nil {
+		return "", nil
+	}
+	events, err := b.jobs.Events(ctx, row.ID)
+	if err != nil {
+		return "", err
+	}
+	hosts := b.browserOfferHosts(row, action, events)
+	hosts = append(hosts[:len(hosts):len(hosts)], strings.ToLower(strings.TrimSpace(resolverHost(b.handoffURL(row, action)))))
+	return b.controlSuppression(actionSafetyDomain(b.cfg, row, action), "", hosts), nil
 }
 
 func (b *Bridge) browserOfferHosts(row job.Row, action job.HumanAction, events []map[string]any, directURL ...string) []string {
@@ -12995,7 +13079,21 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 		// adapter's delegated click path from racing the human.
 		payload.AccessMode = config.ModeAssisted
 	}
-	attempt, ordinal, err := b.providerDriveEpochForOffer(row, action, events, forceNewEpoch)
+	// Signed control withholds every automatic authority: the offer degrades
+	// to assisted (the extension parks it for the human) and grants no
+	// generic drive epoch. This is the last gate behind offerLatched.
+	controlHeld := false
+	if b.adapterControl != nil {
+		hosts := append(hosts[:len(hosts):len(hosts)], strings.ToLower(strings.TrimSpace(resolverHost(offerURL))))
+		controlHeld = b.controlSuppression(actionSafetyDomain(b.cfg, row, action), "", hosts) != ""
+	}
+	if controlHeld {
+		payload.AccessMode = config.ModeAssisted
+	}
+	attempt, ordinal, err := "", (*int64)(nil), error(nil)
+	if !controlHeld {
+		attempt, ordinal, err = b.providerDriveEpochForOffer(row, action, events, forceNewEpoch)
+	}
 	if err != nil {
 		return nil, err
 	}

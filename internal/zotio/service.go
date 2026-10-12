@@ -49,6 +49,11 @@ type Service struct {
 	// ExceptionTags enables the reconciled exception-tag ledger on linked
 	// Zotero items (config zotio.exception_tags).
 	ExceptionTags bool
+	// RetractionTags enables the reconciled papio:retracted tag (config
+	// zotio.retraction_tags); Retractions supplies the verified retraction
+	// DOIs and may be nil when the retraction source is disabled.
+	RetractionTags bool
+	Retractions    RetractedDOISource
 	// UnavailableRecheck is how long an unavailable outcome parks an item
 	// before QueueMissingPDF re-checks it. Zero disables the cool-down.
 	UnavailableRecheck time.Duration

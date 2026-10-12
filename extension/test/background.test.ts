@@ -85,6 +85,18 @@ import {
 import type { TabChangeInfo, TabInfo } from "../src/browser-types";
 import type { SurfaceCloseDisposition } from "../src/surface-lifecycle";
 import type { NativeRequestResult } from "../src/correlation";
+import {
+  suspensionsDigest,
+  type AdapterControlStorage,
+} from "../src/control";
+import {
+  FakeControlStorage,
+  currentResponse,
+  noneResponse,
+  persistedControl,
+  unavailableResponse,
+} from "./control-fakes";
+import type { AdapterControlResponsePayload } from "../src/protocol";
 import { routeResolverService } from "../src/resolver";
 import { VIEWER_DOWNLOAD_RULE_IDS, type ViewerDownloadRule } from "../src/viewer-download-rule";
 import type { StreamFilterLike, ViewerCaptureWebRequest, ViewerHeadersDetails } from "../src/viewer-stream-capture";
@@ -759,6 +771,9 @@ function makeHarness(
     tabGroups?: boolean;
     handoffSurface?: "in-window" | "work-window" | "tab-group";
     inPageToast?: boolean;
+    /** Durable home of the signed-control fence. Absent keeps it in memory,
+     * which is a fresh install. */
+    adapterControl?: AdapterControlStorage;
   },
 ): Harness {
   const port = new FakePort();
@@ -955,6 +970,9 @@ function makeHarness(
       onAlarm: alarms.onAlarm,
     },
     webNavigation,
+    ...(opts?.adapterControl !== undefined
+      ? { adapterControl: opts.adapterControl }
+      : {}),
   };
   return {
     bridge: new Bridge(deps),
@@ -1533,6 +1551,7 @@ function helloAck(
     resolver_origins?: string[];
     role?: BrowserSessionRole;
     browser_holder_generation?: number;
+    adapter_control?: boolean;
   } = {},
 ): unknown {
   return {
@@ -27761,4 +27780,1050 @@ test("a browser-resumed job download blocks a new local download claim", async (
   });
   expect(await internals.claimDownloadInitiated(jobID)).toBe(true);
   expect(internals.store.activeJobs[0]?.download_initiated).toBe(true);
+});
+
+// --- Signed adapter control (src/control.ts) --------------------------------
+
+const ALPHA_HOST = "alpha.example.org";
+const BETA_HOST = "beta.example.org";
+const ALPHA: AdapterSpec = {
+  id: "alpha",
+  version: "1.0.0",
+  hosts: [`www.${ALPHA_HOST}`, ALPHA_HOST],
+  classify: [],
+};
+const BETA: AdapterSpec = {
+  id: "beta",
+  version: "2.1.0",
+  hosts: [BETA_HOST],
+  classify: [],
+};
+const CONTROL_URLS = {
+  runtimeID: "papio-test-id",
+  inboxURL: "chrome-extension://papio-test-id/inbox.html",
+  popupURL: "chrome-extension://papio-test-id/popup.html",
+  historyURL: "chrome-extension://papio-test-id/history.html",
+  optionsURL: "chrome-extension://papio-test-id/options.html",
+  pageBulkURL: "chrome-extension://papio-test-id/page-bulk.html",
+  toastURL: "chrome-extension://papio-test-id/toast.html",
+};
+
+/** A delegated job already driving `host` in tab `tabID`, parked at a terms
+ * gate: `redrivePendingTermsGates` clears that flag only for a job
+ * hasDelegatedAuthority admits, which makes the flag a pure observation of
+ * that one gate (the classifier's own guard runs after it). */
+function controlJob(
+  jobID: string,
+  tabID: number,
+  host: string,
+  extra: Partial<ActiveJob> = {},
+): ActiveJob {
+  return {
+    job_id: jobID,
+    tab_id: tabID,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_900_000_000_000,
+    status: "accepted",
+    provider_hosts: [host],
+    access_mode: "delegated",
+    needs_terms_consent: true,
+    ...extra,
+  };
+}
+
+function controlHarness(
+  jobs: ActiveJob[],
+  storage?: AdapterControlStorage,
+): Harness {
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: jobs },
+    storage === undefined ? undefined : { adapterControl: storage },
+  );
+  h.deps.adapterSpecs = [ALPHA, BETA];
+  h.deps.permissions.contains = async () => true;
+  h.deps.settings.getTermsConsent = async () => "accept";
+  for (const job of jobs)
+    h.tabs.seed({ id: job.tab_id, url: `https://${job.provider_hosts[0]}/stable/1` });
+  return h;
+}
+
+function controlFrames(h: Harness, type: string): BrowserMessage[] {
+  return h.frames().filter((frame) => frame.type === type);
+}
+
+async function replyControl(
+  h: Harness,
+  request: BrowserMessage,
+  payload: AdapterControlResponsePayload,
+): Promise<void> {
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "adapter_control_response",
+    msg_id: "control_reply_001",
+    seq: 1,
+    payload: { ...payload, request_id: request.payload["request_id"] },
+  });
+}
+
+/** Answer the next adapter_control_request and wait for the extension's
+ * apply_result: the point at which the answer has been resolved. */
+async function resolveControl(
+  h: Harness,
+  payload: AdapterControlResponsePayload,
+  afterPosted = 0,
+): Promise<BrowserMessage> {
+  const request = await h.port.waitForFrame("adapter_control_request", afterPosted);
+  await replyControl(h, request, payload);
+  return h.port.waitForFrame("adapter_control_apply_result", afterPosted);
+}
+
+function termsFlags(h: Harness): Record<string, boolean | undefined> {
+  return Object.fromEntries(
+    h.backend.store.activeJobs.map((job) => [job.job_id, job.needs_terms_consent]),
+  );
+}
+
+/** start() itself re-drives terms gates on a fresh install, which clears the
+ * flag before any control answer exists. Re-arm it once the worker is up, so
+ * the flag observes only the redrive that follows. */
+async function armTermsGates(h: Harness): Promise<void> {
+  const internals = h.bridge as unknown as {
+    update(fn: (store: StoreShape) => StoreShape): Promise<void>;
+  };
+  await internals.update((store) => ({
+    ...store,
+    activeJobs: store.activeJobs.map((job) => ({ ...job, needs_terms_consent: true })),
+  }));
+}
+
+async function controlNotice(h: Harness): Promise<unknown> {
+  const reply = (await handleInboxRuntimeMessage(
+    h.bridge,
+    { type: "papio.session.state" },
+    { id: CONTROL_URLS.runtimeID, url: CONTROL_URLS.popupURL },
+    CONTROL_URLS,
+  )) as Record<string, unknown>;
+  return reply["adapterControl"];
+}
+
+test("a suspended adapter revision withholds autonomous effects from its jobs while a sibling adapter's job still runs", async () => {
+  const h = controlHarness(
+    [
+      // Not yet classified: only its provider host ties it to the adapter.
+      controlJob("job_ctl_alpha_host", 40, ALPHA_HOST),
+      // Classified onto the adapter, now offered from an unrelated host.
+      controlJob("job_ctl_alpha_id", 41, "elsewhere.example.net", { adapter_id: "alpha" }),
+      controlJob("job_ctl_beta_job", 42, BETA_HOST, { adapter_id: "beta" }),
+    ],
+    new FakeControlStorage(),
+  );
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+
+  const applied = await resolveControl(
+    h,
+    await currentResponse(1, ["alpha@1.0.0"], ["publisher:alpha.example.org"]),
+  );
+  // The hosts are derived from the extension's OWN registry, sorted.
+  expect(applied.payload).toEqual({
+    request_id: expect.any(String),
+    control_sequence: 1,
+    outcome: "applied",
+    suspended_hosts: [ALPHA_HOST, `www.${ALPHA_HOST}`],
+  });
+  expect(applied.job_id).toBeUndefined();
+  expect(await controlNotice(h)).toEqual({ kind: "suspended", adapters: ["alpha"] });
+
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+
+  expect(termsFlags(h)).toEqual({
+    job_ctl_alpha_host: true,
+    job_ctl_alpha_id: true,
+    job_ctl_beta_job: false,
+  });
+});
+
+test("with daemon state none every delegated job still runs, and the apply_result names no hosts", async () => {
+  const h = controlHarness(
+    [
+      controlJob("job_ctl_alpha_host", 40, ALPHA_HOST),
+      controlJob("job_ctl_beta_job", 42, BETA_HOST, { adapter_id: "beta" }),
+    ],
+    new FakeControlStorage(),
+  );
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+
+  const applied = await resolveControl(h, await noneResponse());
+  expect(applied.payload).toMatchObject({
+    control_sequence: 0,
+    outcome: "applied",
+    suspended_hosts: [],
+  });
+  expect(await controlNotice(h)).toBeUndefined();
+
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+
+  expect(termsFlags(h)).toEqual({ job_ctl_alpha_host: false, job_ctl_beta_job: false });
+});
+
+test("a suspended revision's landing is neither classified nor reported as drift, while a sibling's still is", async () => {
+  const h = controlHarness(
+    [
+      controlJob("job_ctl_alpha_land", 40, ALPHA_HOST, { needs_terms_consent: false }),
+      controlJob("job_ctl_beta_land", 42, BETA_HOST, { needs_terms_consent: false }),
+    ],
+    new FakeControlStorage(),
+  );
+  const planned = new Set<number>();
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution) {
+      planned.add(injection.target.tabId);
+      return plannerResult(injection, { kind: "unknown" });
+    }
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(h, await currentResponse(1, ["alpha@1.0.0"]));
+  const posted = h.port.posted.length;
+
+  await h.tabs.completeNavigation(40, `https://${ALPHA_HOST}/stable/2`);
+  await h.tabs.completeNavigation(42, `https://${BETA_HOST}/stable/2`);
+
+  // The sibling is classified; the suspended adapter's page is not even read.
+  expect([...planned]).toEqual([42]);
+  const alpha = h.backend.store.activeJobs.find((job) => job.job_id === "job_ctl_alpha_land");
+  // Parked for the human, with nothing latched: no unknown streak, no
+  // download claim, no outcome frame about it.
+  expect(alpha).toMatchObject({ tab_id: 40, status: "accepted" });
+  expect(alpha?.download_initiated).toBeUndefined();
+  expect(alpha?.unknown_count).toBeUndefined();
+  expect(alpha?.last_unknown_ms).toBeUndefined();
+  expect(
+    h.port.posted
+      .slice(posted)
+      .map(parseBrowserMessage)
+      .filter((frame) => frame.job_id === "job_ctl_alpha_land"),
+  ).toEqual([]);
+});
+
+test("a daemon answering below the persisted sequence is rolled_back and no positive effect runs", async () => {
+  const storage = await persistedControl(5, ["alpha@1.0.0"]);
+  const h = controlHarness(
+    [
+      controlJob("job_ctl_alpha_host", 40, ALPHA_HOST),
+      controlJob("job_ctl_beta_job", 42, BETA_HOST, { adapter_id: "beta" }),
+    ],
+    storage,
+  );
+  const planned = new Set<number>();
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === assessDrivenPage) return [{ result: { kind: "normal" } }];
+    if (injection.func === planExecution) planned.add(injection.target.tabId);
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  const request = await h.port.waitForFrame("adapter_control_request");
+  // The request echoes exactly what was persisted.
+  expect(request.payload).toEqual({
+    request_id: expect.any(String),
+    last_control_sequence: 5,
+    last_suspensions_digest: await suspensionsDigest(["alpha@1.0.0"], []),
+  });
+  // A daemon offer racing the answer is held, not acted on.
+  await h.port.inbound(jobOfferForHosts("job_ctl_racing_offer", [BETA_HOST]));
+  expect(controlFrames(h, "job_accept")).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+
+  await replyControl(h, request, await currentResponse(3, ["alpha@1.0.0"]));
+  const result = await h.port.waitForFrame("adapter_control_apply_result");
+
+  // The sequence echoed is the PERSISTED one; nothing was applied or written.
+  expect(result.payload).toEqual({
+    request_id: request.payload["request_id"],
+    control_sequence: 5,
+    outcome: "rolled_back",
+    suspended_hosts: [],
+  });
+  expect(storage.saves).toEqual([]);
+  expect(await controlNotice(h)).toEqual({ kind: "paused" });
+
+  // The held offer is parked for the human, never driven.
+  const accepted = await h.port.waitForFrame("job_accept");
+  expect(accepted.job_id).toBe("job_ctl_racing_offer");
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === "job_ctl_racing_offer")).toMatchObject({
+    tab_id: -1,
+    engagement_required: true,
+  });
+  expect(h.tabs.created).toEqual([]);
+
+  // No positive effect for the existing jobs either: not the terms re-drive,
+  // not the classifier, on ANY adapter.
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toMatchObject({ job_ctl_alpha_host: true, job_ctl_beta_job: true });
+  await h.tabs.completeNavigation(42, `https://${BETA_HOST}/stable/2`);
+  expect([...planned]).toEqual([]);
+});
+
+test("after a worker restart a persisted sequence blocks effects until a response applies", async () => {
+  const storage = new FakeControlStorage();
+  let h = controlHarness(
+    [
+      controlJob("job_ctl_alpha_host", 40, ALPHA_HOST),
+      controlJob("job_ctl_beta_job", 42, BETA_HOST, { adapter_id: "beta" }),
+    ],
+    storage,
+  );
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(h, await currentResponse(4));
+  expect(storage.value).toEqual({
+    last_sequence: 4,
+    last_verified_suspensions_digest: await suspensionsDigest([], []),
+  });
+
+  // The worker dies and a new one comes up over the same durable storage.
+  h = restartWorker(h);
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  const request = await h.port.waitForFrame("adapter_control_request");
+  expect(request.payload["last_control_sequence"]).toBe(4);
+
+  // Unresolved with a persisted sequence: effects are blocked, even though
+  // this daemon has not said anything wrong.
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toEqual({ job_ctl_alpha_host: true, job_ctl_beta_job: true });
+  // And daemon work arriving now waits for the answer instead of racing it.
+  await h.port.inbound(jobOfferForHosts("job_ctl_held_offer", [BETA_HOST]));
+  expect(controlFrames(h, "job_accept")).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+
+  await replyControl(h, request, await currentResponse(4));
+  const applied = await h.port.waitForFrame("adapter_control_apply_result");
+  expect(applied.payload).toMatchObject({ control_sequence: 4, outcome: "applied" });
+
+  // Applied: the held offer is now driven normally, and effects run.
+  const accepted = await h.port.waitForFrame("job_accept");
+  expect(accepted.job_id).toBe("job_ctl_held_offer");
+  expect(h.tabs.created).toHaveLength(1);
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toMatchObject({ job_ctl_alpha_host: false, job_ctl_beta_job: false });
+});
+
+test("a daemon without the capability flag leaves a fresh install untouched and blocks a persisted one", async () => {
+  const fresh = controlHarness([controlJob("job_ctl_beta_job", 42, BETA_HOST)]);
+  await fresh.bridge.start();
+  await fresh.port.inbound(helloAck());
+  await armTermsGates(fresh);
+  await fresh.bridge.requestTermsConsent("accept");
+  expect(termsFlags(fresh)).toEqual({ job_ctl_beta_job: false });
+
+  const persisted = controlHarness(
+    [controlJob("job_ctl_beta_job", 42, BETA_HOST)],
+    await persistedControl(2),
+  );
+  await persisted.bridge.start();
+  await persisted.port.inbound(helloAck());
+  await armTermsGates(persisted);
+  await persisted.bridge.requestTermsConsent("accept");
+  expect(termsFlags(persisted)).toEqual({ job_ctl_beta_job: true });
+  expect(await controlNotice(persisted)).toEqual({ kind: "paused" });
+  // An offer is parked at once: there is no answer coming to wait for.
+  await persisted.port.inbound(jobOfferForHosts("job_ctl_old_daemon", [BETA_HOST]));
+  expect(controlFrames(persisted, "job_accept")).toHaveLength(1);
+  expect(persisted.tabs.created).toEqual([]);
+});
+
+test("adapter_control_request is sent after hello_ack only when it advertises adapter_control, and again on every keepalive tick", async () => {
+  // Never when absent: not at hello_ack, not on a tick, not even directly.
+  const old = controlHarness([]);
+  await old.bridge.start();
+  expect(old.frames().map((frame) => frame.type)).toEqual(["hello"]);
+  await old.port.inbound(helloAck());
+  old.clock.now += 61_000;
+  await old.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  expect(old.frames().filter((frame) => frame.type.startsWith("adapter_control_"))).toEqual([]);
+  const direct = old.bridge as unknown as { send(type: string, payload: object): boolean };
+  expect(direct.send("adapter_control_request", { request_id: "request-direct-001", last_control_sequence: 0 })).toBe(false);
+  expect(
+    direct.send("adapter_control_apply_result", {
+      request_id: "request-direct-001",
+      control_sequence: 0,
+      outcome: "applied",
+      suspended_hosts: [],
+    }),
+  ).toBe(false);
+  expect(old.frames().filter((frame) => frame.type.startsWith("adapter_control_"))).toEqual([]);
+
+  // When advertised: nothing before hello_ack, one request right after it.
+  const storage = new FakeControlStorage();
+  const h = controlHarness([controlJob("job_ctl_alpha_host", 40, ALPHA_HOST)], storage);
+  await h.bridge.start();
+  expect(controlFrames(h, "adapter_control_request")).toEqual([]);
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  const first = await h.port.waitForFrame("adapter_control_request");
+  expect(first.payload).toEqual({ request_id: expect.any(String), last_control_sequence: 0 });
+  expect(first.job_id).toBeUndefined();
+
+  // A tick while that request is still unanswered does not stack another.
+  h.clock.now += 61_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  expect(controlFrames(h, "adapter_control_request")).toHaveLength(1);
+
+  await replyControl(h, first, await currentResponse(1, ["alpha@1.0.0"]));
+  await h.port.waitForFrame("adapter_control_apply_result");
+
+  // The next tick asks again, echoing the fence it now holds.
+  const posted = h.port.posted.length;
+  h.clock.now += 61_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  const second = await h.port.waitForFrame("adapter_control_request", posted);
+  expect(second.payload).toEqual({
+    request_id: expect.any(String),
+    last_control_sequence: 1,
+    last_suspensions_digest: await suspensionsDigest(["alpha@1.0.0"], []),
+  });
+  expect(second.payload["request_id"]).not.toBe(first.payload["request_id"]);
+
+  // A newly published sequence that lifts the suspension takes effect at once.
+  await replyControl(h, second, await currentResponse(2));
+  const lifted = await h.port.waitForFrame("adapter_control_apply_result", posted);
+  expect(lifted.payload).toMatchObject({ control_sequence: 2, outcome: "applied", suspended_hosts: [] });
+  expect(storage.value).toMatchObject({ last_sequence: 2 });
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toEqual({ job_ctl_alpha_host: false });
+});
+
+test("every packaged adapter's hosts fit one apply_result even if all are suspended", () => {
+  // A suspension of the whole registry must stay reportable: a frame the
+  // parser refuses is never sent, and the daemon would then never learn which
+  // hosts to withhold.
+  const hosts = new Set<string>();
+  for (const spec of adapters) for (const host of spec.hosts) hosts.add(host.toLowerCase());
+  expect(hosts.size).toBeLessThanOrEqual(64);
+  expect(() =>
+    parseBrowserMessage({
+      protocol: "papio-browser/1",
+      type: "adapter_control_apply_result",
+      msg_id: "all-suspended-001",
+      seq: 1,
+      payload: {
+        request_id: "request-all-001",
+        control_sequence: 1,
+        outcome: "applied",
+        suspended_hosts: [...hosts].sort(),
+      },
+    }),
+  ).not.toThrow();
+});
+
+test("a direct route is refused while control is unconfirmed or names its adapter, and runs otherwise", async () => {
+  const ACM: AdapterSpec = { id: "acm", version: "0.2.0", hosts: ["dl.acm.org"], classify: [] };
+  const directURL = "https://dl.acm.org/doi/pdf/10.1145/3630106.3658942";
+  const directGet = async (h: Harness): Promise<void> => {
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "provider_direct_get_request",
+      msg_id: "direct_control_0001",
+      job_id: "job_direct_control",
+      seq: 2,
+      payload: {
+        drive_attempt_id: "direct-control-attempt",
+        ordinal: 0,
+        route_revision: "acm-doi-pdf/1",
+        expected_identifier: "doi:10.1145/3630106.3658942",
+        url: directURL,
+        allowed_origin: "https://dl.acm.org",
+        path_family: "/doi/pdf/{doi}",
+        terms_policy: "none",
+      },
+    });
+  };
+  const start = async (storage: AdapterControlStorage | undefined, answer: AdapterControlResponsePayload): Promise<Harness> => {
+    const h = makeHarness(undefined, storage === undefined ? undefined : { adapterControl: storage });
+    h.deps.adapterSpecs = [ACM];
+    await h.bridge.start();
+    await h.port.inbound(
+      helloAck({ features: ["provider_direct_get_v1", "effect_permit_v1"], adapter_control: true }),
+    );
+    await resolveControl(h, answer);
+    return h;
+  };
+
+  // Control confirmed and nothing suspended: the route runs.
+  const open = await start(undefined, await noneResponse());
+  await directGet(open);
+  expect(open.downloads.started).toHaveLength(1);
+
+  // The route's own adapter revision is suspended: it is refused, silently,
+  // exactly as a job without delegated authority is.
+  const suspended = await start(undefined, await currentResponse(1, ["acm@0.2.0"]));
+  await directGet(suspended);
+  expect(suspended.downloads.started).toEqual([]);
+  expect(controlFrames(suspended, "provider_direct_get_result")).toEqual([]);
+
+  // A different revision of that adapter is not the one named.
+  const otherRevision = await start(undefined, await currentResponse(1, ["acm@0.1.0"]));
+  await directGet(otherRevision);
+  expect(otherRevision.downloads.started).toHaveLength(1);
+
+  // Control unconfirmed (a rollback below the persisted sequence): refused,
+  // though no adapter is named.
+  const failed = await start(await persistedControl(5), await currentResponse(2));
+  await directGet(failed);
+  expect(failed.downloads.started).toEqual([]);
+  expect(controlFrames(failed, "provider_direct_get_result")).toEqual([]);
+});
+
+test("a queued handoff is not released while control is unconfirmed, and is once control applies again", async () => {
+  const storage = new FakeControlStorage();
+  const h = makeHarness(undefined, { adapterControl: storage });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(h, await noneResponse());
+  await h.port.inbound(jobOffer("job_ctl_queue_active"));
+  await h.port.inbound(jobOffer("job_ctl_queue_waiting"));
+  const fallback = h.timers.find((timer) => timer.ms === 45_000);
+  expect(fallback).toBeDefined();
+  const internals = h.bridge as unknown as { releaseHandoffDrive(jobID: string): void };
+
+  // Control stops being confirmable: the next tick asks and is told so.
+  let posted = h.port.posted.length;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  const failed = await resolveControl(h, await unavailableResponse(), posted);
+  expect(failed.payload).toMatchObject({ outcome: "unavailable", suspended_hosts: [] });
+
+  // The first effect settles and the durable fallback fires: it must not open
+  // a second tab while control is unconfirmed.
+  internals.releaseHandoffDrive("job_ctl_queue_active");
+  await fallback?.fn();
+  await settle();
+  expect(h.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_ctl_queue_waiting")?.status,
+  ).toBe("queued");
+
+  // The daemon confirms again: the same queued job is released, no re-offer.
+  posted = h.port.posted.length;
+  h.clock.now += 61_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  const restored = await resolveControl(h, await noneResponse(), posted);
+  expect(restored.payload).toMatchObject({ outcome: "applied" });
+  await settle();
+  expect(h.tabs.created).toEqual([
+    { url: OPENURL, active: true },
+    { url: OPENURL, active: false },
+  ]);
+  expect(
+    h.backend.store.activeJobs.find((job) => job.job_id === "job_ctl_queue_waiting")?.status,
+  ).toBe("accepted");
+});
+
+test("an autonomous drive-queue entry waits for a pending control answer, and parks for the human once control fails", async () => {
+  const driveJob = (): ActiveJob => ({
+    job_id: "job_ctl_drive_queue",
+    tab_id: -1,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_900_000_000_000,
+    status: "accepted",
+    provider_hosts: [BETA_HOST],
+    access_mode: "delegated",
+  });
+  const queue = (h: Harness) =>
+    h.bridge as unknown as {
+      handoffDriveQueue: Array<{ jobID: string }>;
+      enqueueHandoffDrive(request: { jobID: string; purpose: "handoff" }): void;
+      drainHandoffDriveQueue(): Promise<void>;
+    };
+
+  // Pending: the persisted sequence is known, the daemon has not answered. The
+  // entry stays queued untouched, then opens once control applies.
+  const waiting = makeHarness(
+    { ...emptyStore(), activeJobs: [driveJob()] },
+    { adapterControl: await persistedControl(2) },
+  );
+  seedOfferURLs(waiting, { job_ctl_drive_queue: OPENURL });
+  await waiting.bridge.start();
+  await waiting.port.inbound(helloAck({ adapter_control: true }));
+  const request = await waiting.port.waitForFrame("adapter_control_request");
+  queue(waiting).enqueueHandoffDrive({ jobID: "job_ctl_drive_queue", purpose: "handoff" });
+  await queue(waiting).drainHandoffDriveQueue();
+  expect(queue(waiting).handoffDriveQueue.map((entry) => entry.jobID)).toEqual(["job_ctl_drive_queue"]);
+  expect(waiting.tabs.created).toEqual([]);
+  expect(waiting.backend.store.activeJobs[0]?.engagement_required).toBeUndefined();
+  await replyControl(waiting, request, await currentResponse(2));
+  await waiting.port.waitForFrame("adapter_control_apply_result");
+  await settle();
+  expect(waiting.tabs.created).toEqual([{ url: OPENURL, active: true }]);
+
+  // Failed: the same entry is dequeued and parked for the human, never opened.
+  const failed = makeHarness(
+    { ...emptyStore(), activeJobs: [driveJob()] },
+    { adapterControl: await persistedControl(5) },
+  );
+  seedOfferURLs(failed, { job_ctl_drive_queue: OPENURL });
+  await failed.bridge.start();
+  await failed.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(failed, await currentResponse(1));
+  queue(failed).enqueueHandoffDrive({ jobID: "job_ctl_drive_queue", purpose: "handoff" });
+  await queue(failed).drainHandoffDriveQueue();
+  expect(queue(failed).handoffDriveQueue).toEqual([]);
+  expect(failed.tabs.created).toEqual([]);
+  expect(failed.backend.store.activeJobs[0]).toMatchObject({ status: "queued", engagement_required: true });
+});
+
+test("the adapter_control gate is the hello_ack flag alone: a lookalike feature never opens it", async () => {
+  const h = controlHarness([]);
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["hello_ack:adapter_control", "adapter_control"] }));
+  const result = await h.bridge.requestCorrelated("adapter_control_request", {
+    last_control_sequence: 0,
+  });
+  expect(result).toMatchObject({ kind: "response", code: "feature_unavailable" });
+  expect(controlFrames(h, "adapter_control_request")).toEqual([]);
+});
+
+// --- Signed adapter control: review follow-ups -------------------------------
+
+/** One keepalive wake: asks control again, exactly as the real alarm does. */
+async function controlTick(h: Harness): Promise<number> {
+  const posted = h.port.posted.length;
+  h.clock.now += 61_000;
+  await h.alarms.onAlarm.emit({ name: "papio-keepalive" });
+  return posted;
+}
+
+test("institutional materialization builds no scaffold while control withholds the job, and resumes when control permits", async () => {
+  const MATERIALIZATION = ["institutional_materialization_v1", "effect_permit_v1"];
+  const PROV: AdapterSpec = { id: "prov", version: "1.0.0", hosts: [PROVIDER_HOST], classify: [] };
+  const flush = async () => {
+    for (let i = 0; i < 40; i += 1) await Promise.resolve();
+  };
+
+  // A persisted sequence the daemon then fails to confirm (state none).
+  const h = makeHarness(undefined, { adapterControl: await persistedControl(3) });
+  h.deps.adapterSpecs = [PROV];
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: MATERIALIZATION, adapter_control: true }));
+  const first = await h.port.waitForFrame("adapter_control_request");
+  // Unresolved: the offer is accepted as a notification but nothing is built.
+  await h.port.inbound(candidateOffer("job_ctl_mat_blocked"));
+  await flush();
+  expect(controlFrames(h, "institutional_claim_request")).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+  await replyControl(h, first, await noneResponse());
+  await h.port.waitForFrame("adapter_control_apply_result");
+  await flush();
+  expect(controlFrames(h, "institutional_claim_request")).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+
+  // Control confirms again: the SAME pending candidate proceeds, no re-offer.
+  const posted = await controlTick(h);
+  const second = await h.port.waitForFrame("adapter_control_request", posted);
+  await replyControl(h, second, await currentResponse(3));
+  const claim = await h.port.waitForFrame("institutional_claim_request");
+  expect(claim.job_id).toBe("job_ctl_mat_blocked");
+
+  // A suspended adapter's candidate is held the same way, then released when
+  // a higher sequence lifts the suspension.
+  const s = makeHarness(undefined, { adapterControl: new FakeControlStorage() });
+  s.deps.adapterSpecs = [PROV];
+  await s.bridge.start();
+  await s.port.inbound(helloAck({ features: MATERIALIZATION, adapter_control: true }));
+  await resolveControl(s, await currentResponse(1, ["prov@1.0.0"]));
+  await s.port.inbound(candidateOffer("job_ctl_mat_suspended"));
+  await flush();
+  expect(controlFrames(s, "institutional_claim_request")).toEqual([]);
+  const sPosted = await controlTick(s);
+  const lift = await s.port.waitForFrame("adapter_control_request", sPosted);
+  await replyControl(s, lift, await currentResponse(2));
+  const resumed = await s.port.waitForFrame("institutional_claim_request");
+  expect(resumed.job_id).toBe("job_ctl_mat_suspended");
+});
+
+test("autonomous drains and tab opens check the job's own adapter suspension, not only global control", async () => {
+  const queuedJob = (jobID: string, host: string): ActiveJob => ({
+    job_id: jobID,
+    tab_id: -1,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_900_000_000_000,
+    status: "accepted",
+    provider_hosts: [host],
+    access_mode: "delegated",
+  });
+  const queue = (h: Harness) =>
+    h.bridge as unknown as {
+      enqueueHandoffDrive(request: { jobID: string; purpose: "handoff" }): void;
+      drainHandoffDriveQueue(): Promise<void>;
+      openManagedTab(options: { url: string; jobId: string; purpose: "handoff" }): Promise<number | undefined>;
+      releaseHandoffDrive(jobID: string): void;
+    };
+
+  // (a) the drive-queue drain: control applied, one adapter suspended.
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: [queuedJob("job_ctl_dq_alpha", ALPHA_HOST), queuedJob("job_ctl_dq_beta", BETA_HOST)] },
+    { adapterControl: new FakeControlStorage() },
+  );
+  h.deps.adapterSpecs = [ALPHA, BETA];
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(h, await currentResponse(1, ["alpha@1.0.0"]));
+  // Seeded after start(): its own restart recovery would otherwise open both.
+  seedOfferURLs(h, { job_ctl_dq_alpha: OPENURL, job_ctl_dq_beta: OPENURL });
+  queue(h).enqueueHandoffDrive({ jobID: "job_ctl_dq_alpha", purpose: "handoff" });
+  queue(h).enqueueHandoffDrive({ jobID: "job_ctl_dq_beta", purpose: "handoff" });
+  await queue(h).drainHandoffDriveQueue();
+  const byID = (id: string) => h.backend.store.activeJobs.find((job) => job.job_id === id);
+  expect(byID("job_ctl_dq_alpha")).toMatchObject({ tab_id: -1, status: "queued", engagement_required: true });
+  expect(byID("job_ctl_dq_beta")?.tab_id).toBeGreaterThanOrEqual(0);
+  expect(h.tabs.created).toHaveLength(1);
+
+  // (b) a direct tab open with purpose "handoff" for the suspended job.
+  expect(await queue(h).openManagedTab({ url: OPENURL, jobId: "job_ctl_dq_alpha", purpose: "handoff" })).toBeUndefined();
+  expect(h.tabs.created).toHaveLength(1);
+
+  // (c) the queued-handoff release (45 s fallback) after a SUSPENSION that
+  // arrives while the job already waits: control still applies, but not to it.
+  const w = makeHarness(undefined, { adapterControl: new FakeControlStorage() });
+  w.deps.adapterSpecs = [ALPHA, BETA];
+  await w.bridge.start();
+  await w.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(w, await noneResponse());
+  await w.port.inbound(jobOfferForHosts("job_ctl_q_active", [BETA_HOST]));
+  await w.port.inbound(jobOfferForHosts("job_ctl_q_alpha", [ALPHA_HOST]));
+  const fallback = w.timers.find((timer) => timer.ms === 45_000);
+  expect(fallback).toBeDefined();
+  expect(w.tabs.created).toHaveLength(1);
+  const posted = await controlTick(w);
+  const request = await w.port.waitForFrame("adapter_control_request", posted);
+  await replyControl(w, request, await currentResponse(1, ["alpha@1.0.0"]));
+  await w.port.waitForFrame("adapter_control_apply_result", posted);
+  queue(w).releaseHandoffDrive("job_ctl_q_active");
+  await fallback?.fn();
+  await settle();
+  expect(w.tabs.created).toHaveLength(1);
+  expect(w.backend.store.activeJobs.find((job) => job.job_id === "job_ctl_q_alpha")?.status).toBe("queued");
+  // The opportunistic re-drain (no forced marker) must not pick it either,
+  // even with release evidence (the path that admits queued work on its own).
+  (w.bridge as unknown as { openAccessLandingObserved: boolean }).openAccessLandingObserved = true;
+  await (w.bridge as unknown as { releaseQueuedHandoffs(): Promise<void> }).releaseQueuedHandoffs();
+  await settle();
+  expect(w.tabs.created).toHaveLength(1);
+  expect(w.backend.store.activeJobs.find((job) => job.job_id === "job_ctl_q_alpha")?.status).toBe("queued");
+});
+
+test("a control change resyncs the viewer download rules, including a suspension while control stays applied", async () => {
+  const SDX: AdapterSpec = { id: "sdx", version: "1.0.0", hosts: ["www.sciencedirect.com"], classify: [] };
+  const build = async () => {
+    const job = (jobID: string, tabID: number): ActiveJob => ({
+      job_id: jobID, tab_id: tabID, offered_at: 1_700_000_000_000, expires_at: 1_800_000_000_000,
+      status: "auth_pending", provider_hosts: ["www.sciencedirect.com"], access_mode: "delegated",
+      download_initiated: true, expected: { doi: `10.1234/${jobID}` },
+    });
+    const h = makeHarness(
+      { ...emptyStore(), activeJobs: [job("job_ctl_rule_a", 100)] },
+      { adapterControl: new FakeControlStorage() },
+    );
+    const rules = new FakeSessionRules();
+    h.deps.declarativeNetRequest = rules;
+    h.deps.adapterSpecs = [SDX];
+    h.deps.permissions.contains = async ({ origins }) => origins[0] === "https://pdf.sciencedirectassets.com/*";
+    h.tabs.seed({ id: 100, url: "https://www.sciencedirect.com/science/article/pii/A" });
+    await h.bridge.start();
+    await h.port.onMessage.emit(
+      helloAck({ daemon_version: CURRENT_DAEMON, features: ["native_viewer_download_v1"], adapter_control: true }),
+    );
+    await resolveControl(h, await noneResponse());
+    await settle();
+    expect(rules.armedTabs()).toEqual([100]);
+    return { h, rules };
+  };
+
+  // A suspension: control stays "applied" throughout, so nothing else moves.
+  const suspended = await build();
+  let posted = await controlTick(suspended.h);
+  let request = await suspended.h.port.waitForFrame("adapter_control_request", posted);
+  await replyControl(suspended.h, request, await currentResponse(1, ["sdx@1.0.0"]));
+  await suspended.h.port.waitForFrame("adapter_control_apply_result", posted);
+  await settle();
+  expect(suspended.rules.armedTabs()).toEqual([]);
+
+  // A failed validation: every rule goes, whatever the adapter.
+  const failed = await build();
+  posted = await controlTick(failed.h);
+  request = await failed.h.port.waitForFrame("adapter_control_request", posted);
+  await replyControl(failed.h, request, await unavailableResponse());
+  await failed.h.port.waitForFrame("adapter_control_apply_result", posted);
+  await settle();
+  expect(failed.rules.armedTabs()).toEqual([]);
+});
+
+test("a refresh that times out closes the gate until a valid response applies", async () => {
+  const h = controlHarness([controlJob("job_ctl_to_beta", 42, BETA_HOST)], new FakeControlStorage());
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(h, await currentResponse(3));
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toEqual({ job_ctl_to_beta: false });
+
+  // The next refresh is never answered; its timeout fires.
+  const timersBefore = h.timers.length;
+  const posted = await controlTick(h);
+  await h.port.waitForFrame("adapter_control_request", posted);
+  const timeout = h.timers.slice(timersBefore).find((timer) => timer.ms === 15_000);
+  expect(timeout).toBeDefined();
+  await timeout!.fn();
+  await settle();
+
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toEqual({ job_ctl_to_beta: true });
+  expect(await controlNotice(h)).toEqual({ kind: "paused" });
+
+  // A valid answer reopens it.
+  const again = await controlTick(h);
+  const retry = await h.port.waitForFrame("adapter_control_request", again);
+  await replyControl(h, retry, await currentResponse(3));
+  await h.port.waitForFrame("adapter_control_apply_result", again);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toEqual({ job_ctl_to_beta: false });
+});
+
+test("losing the native port invalidates applied control at once, for an unplanned or a deliberate disconnect", async () => {
+  for (const mode of ["unplanned", "deliberate"] as const) {
+    const h = controlHarness([controlJob("job_ctl_dc_beta", 42, BETA_HOST)], new FakeControlStorage());
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ adapter_control: true }));
+    await resolveControl(h, await currentResponse(3));
+    await armTermsGates(h);
+    await h.bridge.requestTermsConsent("accept");
+    expect(termsFlags(h), mode).toEqual({ job_ctl_dc_beta: false });
+
+    if (mode === "unplanned") await h.port.emitDisconnect();
+    else (h.bridge as unknown as { disconnect(): void }).disconnect();
+    // No reconnect has happened (backoff timers are not fired).
+    await armTermsGates(h);
+    await h.bridge.requestTermsConsent("accept");
+    expect(termsFlags(h), mode).toEqual({ job_ctl_dc_beta: true });
+  }
+});
+
+test("a delayed resolver redrive does not navigate once control withholds the job", async () => {
+  const retryJob = (jobID: string, tabID: number, host: string): ActiveJob => ({
+    job_id: jobID,
+    tab_id: tabID,
+    offered_at: 1_700_000_000_000,
+    expires_at: 1_900_000_000_000,
+    status: "awaiting_download",
+    provider_hosts: [host],
+    access_mode: "delegated",
+  });
+  const h = controlHarness(
+    [retryJob("job_ctl_rd_alpha", 40, ALPHA_HOST), retryJob("job_ctl_rd_beta", 42, BETA_HOST)],
+    new FakeControlStorage(),
+  );
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(h, await noneResponse());
+  seedOfferURLs(h, { job_ctl_rd_alpha: OPENURL, job_ctl_rd_beta: OPENURL });
+  const internals = h.bridge as unknown as {
+    scheduleResolverRedriveRetry(jobID: string, tabID: number): void;
+  };
+  const before = h.timers.length;
+  internals.scheduleResolverRedriveRetry("job_ctl_rd_alpha", 40);
+  internals.scheduleResolverRedriveRetry("job_ctl_rd_beta", 42);
+  const timers = h.timers.slice(before).filter((timer) => timer.ms === 2_500);
+  expect(timers).toHaveLength(2);
+
+  // Control suspends alpha AFTER the timers were set.
+  const posted = await controlTick(h);
+  const request = await h.port.waitForFrame("adapter_control_request", posted);
+  await replyControl(h, request, await currentResponse(1, ["alpha@1.0.0"]));
+  await h.port.waitForFrame("adapter_control_apply_result", posted);
+  for (const timer of timers) await timer.fn();
+  await settle();
+  expect(h.tabs.updates.map((update) => update.id)).toEqual([42]);
+});
+
+test("pending terms gates resume once control applies after a restart", async () => {
+  const storage = await persistedControl(2);
+  const h = controlHarness([controlJob("job_ctl_terms_beta", 42, BETA_HOST)], storage);
+  await h.bridge.start();
+  // Startup recovery ran while control was unresolved and skipped the job.
+  expect(termsFlags(h)).toEqual({ job_ctl_terms_beta: true });
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  const request = await h.port.waitForFrame("adapter_control_request");
+  expect(termsFlags(h)).toEqual({ job_ctl_terms_beta: true });
+  await replyControl(h, request, await currentResponse(2));
+  await h.port.waitForFrame("adapter_control_apply_result");
+  await settle();
+  // No consent click, no tab event: the recovery repeated by itself.
+  expect(termsFlags(h)).toEqual({ job_ctl_terms_beta: false });
+});
+
+// --- Signed adapter control: second review follow-ups ------------------------
+
+function handoffFocus(jobID: string): unknown {
+  return {
+    protocol: "papio-browser/1",
+    type: "handoff_focus",
+    msg_id: `focus_${jobID}`.slice(0, 60),
+    seq: 9,
+    job_id: jobID,
+    payload: {},
+  };
+}
+
+test("an explicit open of a suspended job opens its tab, while the autonomous drain for it still does not", async () => {
+  const PROV: AdapterSpec = { id: "prov", version: "1.0.0", hosts: [PROVIDER_HOST], classify: [] };
+  for (const mode of ["assisted", "delegated"] as const) {
+    const jobID = `job_ctl_open_${mode}`;
+    const h = makeHarness(undefined, { adapterControl: new FakeControlStorage() });
+    h.deps.adapterSpecs = [PROV];
+    await h.bridge.start();
+    await h.port.inbound(helloAck({ adapter_control: true }));
+    await resolveControl(h, await currentResponse(1, ["prov@1.0.0"]));
+    await h.port.inbound(jobOffer(jobID, OPENURL, mode));
+    expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID), mode).toMatchObject({
+      tab_id: -1,
+      engagement_required: true,
+    });
+    // The autonomous drain never opens it, even with release evidence.
+    (h.bridge as unknown as { openAccessLandingObserved: boolean }).openAccessLandingObserved = true;
+    await (h.bridge as unknown as { releaseQueuedHandoffs(): Promise<void> }).releaseQueuedHandoffs();
+    expect(h.tabs.created, mode).toEqual([]);
+    // The human's explicit open does.
+    await h.port.inbound(handoffFocus(jobID));
+    for (let i = 0; i < 50 && h.tabs.created.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.tabs.created, mode).toEqual([{ url: OPENURL, active: true }]);
+    expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id, mode).toBeGreaterThanOrEqual(0);
+  }
+});
+
+test("an explicit open that arrives while the control request is unresolved is held with its offer and opens once control settles", async () => {
+  for (const settleBy of ["answer", "timeout"] as const) {
+    const h = makeHarness(undefined, { adapterControl: await persistedControl(2) });
+    await h.bridge.start();
+    const timersBefore = h.timers.length;
+    await h.port.inbound(helloAck({ adapter_control: true }));
+    const request = await h.port.waitForFrame("adapter_control_request");
+    await h.port.inbound(jobOffer("job_ctl_held_open", OPENURL, "assisted"));
+    await h.port.inbound(handoffFocus("job_ctl_held_open"));
+    await settle();
+    expect(h.tabs.created, settleBy).toEqual([]);
+
+    if (settleBy === "answer") {
+      await replyControl(h, request, await currentResponse(2));
+    } else {
+      const timeout = h.timers.slice(timersBefore).find((timer) => timer.ms === 15_000);
+      expect(timeout).toBeDefined();
+      await timeout!.fn();
+    }
+    for (let i = 0; i < 50 && h.tabs.created.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.tabs.created, settleBy).toEqual([{ url: OPENURL, active: true }]);
+    expect(
+      h.backend.store.activeJobs.find((job) => job.job_id === "job_ctl_held_open")?.tab_id,
+      settleBy,
+    ).toBeGreaterThanOrEqual(0);
+  }
+});
+
+test("control closing between the navigating apply and tabs.update leaves navigation resumable: it happens once, and navigated follows it", async () => {
+  const ids = { jobID: "job_ctl_nav_resume", candidateID: "cand_ctl_nav_resume", claimID: "claim_ctl_nav_resume", bindingID: "bind_ctl_nav_resume" };
+  const routeURL = `https://${PROVIDER_HOST}/stable/ctl-nav-resume`;
+  const h = makeHarness(undefined, { adapterControl: await persistedControl(2) });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["institutional_materialization_v1", "effect_permit_v1", AUTH_CLAIM],
+    browser_holder_generation: 1,
+    adapter_control: true,
+  }));
+  await resolveControl(h, await currentResponse(2));
+
+  // Control closes right after the navigating phase is persisted.
+  const internals = h.bridge as unknown as {
+    applyMaterialization(jobID: string, event: { type: string }): Promise<void>;
+    control: { invalidate(epoch: number): void };
+    controlEpoch: number;
+  };
+  const original = internals.applyMaterialization.bind(h.bridge);
+  let closed = false;
+  internals.applyMaterialization = async (jobID, event) => {
+    await original(jobID, event);
+    if (event.type === "navigating" && !closed) {
+      closed = true;
+      internals.control.invalidate(internals.controlEpoch);
+    }
+  };
+
+  const routeFrames = () => controlFrames(h, "institutional_route_request");
+  const answerRoute = async (route: BrowserMessage) => {
+    await h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "institutional_route_response",
+      msg_id: `route_response_${route.payload["request_id"]}`.slice(0, 60),
+      job_id: ids.jobID,
+      seq: 5,
+      payload: {
+        request_id: route.payload["request_id"],
+        outcome: "issued",
+        claim_id: ids.claimID,
+        binding_id: ids.bindingID,
+        route_issuance_ordinal: 1,
+        effect_ordinal: (route.payload["expected_effect_ordinal"] as number) + 1,
+        institutional_request_id: route.payload["institutional_request_id"],
+        url: routeURL,
+      },
+    });
+  };
+  const framesBefore = h.port.posted.length;
+  await h.port.inbound(claimSurfaceOffer(ids, [PROVIDER_HOST]));
+  const claim = await h.port.waitForFrame("institutional_claim_request", framesBefore);
+  const claimReply = institutionalClaimResponse(ids.jobID, ids.candidateID, ids.claimID, ids.bindingID) as {
+    payload: Record<string, unknown>;
+  };
+  claimReply.payload["request_id"] = claim.payload["request_id"];
+  await h.port.inbound(claimReply);
+  const bind = await h.port.waitForFrame("institutional_bind_request", framesBefore);
+  const bindReply = institutionalBindResponse(ids.jobID, ids.claimID, ids.bindingID) as {
+    payload: Record<string, unknown>;
+  };
+  bindReply.payload["request_id"] = bind.payload["request_id"];
+  bindReply.payload["authentication_claim_id"] = `auth_${ids.claimID}`;
+  bindReply.payload["gate_occurrence_id"] = `occ_${ids.claimID}`;
+  await h.port.inbound(bindReply);
+  await answerRoute(await h.port.waitForFrame("institutional_route_request", framesBefore));
+  await settle();
+
+  // Control closed before the navigation: nothing navigated, nothing reported.
+  expect(closed).toBe(true);
+  const navigations = () => h.tabs.updates.filter((update) => update.properties.url === routeURL);
+  expect(navigations()).toHaveLength(0);
+  expect(controlFrames(h, "institutional_navigated_request")).toEqual([]);
+
+  // Control reopens: the route is requested again (permit replay), and the
+  // provider page is navigated exactly once BEFORE navigated is reported.
+  const posted = await controlTick(h);
+  const refresh = await h.port.waitForFrame("adapter_control_request", posted);
+  await replyControl(h, refresh, await currentResponse(2));
+  await h.port.waitForFrame("adapter_control_apply_result", posted);
+  await settle();
+  expect(routeFrames()).toHaveLength(2);
+  await answerRoute(routeFrames()[1]!);
+  await settle();
+  expect(navigations()).toHaveLength(1);
+  const navigated = await h.port.waitForFrame("institutional_navigated_request", framesBefore);
+  expect(navigated.job_id).toBe(ids.jobID);
+  expect(navigations()).toHaveLength(1);
 });

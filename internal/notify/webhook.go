@@ -5,7 +5,6 @@ package notify
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +33,10 @@ var defaultWebhookClient = &http.Client{
 type Webhook struct {
 	URL    string
 	Secret string
+	// Format is the request shape: one of the config.WebhookFormat*
+	// constants. Empty means config.WebhookFormatJSON. An unknown value
+	// fails every send, so a mistyped format never posts in the wrong shape.
+	Format string
 	Client HTTPClient
 	Now    func() time.Time
 }
@@ -77,24 +80,16 @@ func (w *Webhook) SendEventResult(ctx context.Context, event Event) error {
 	if w.Now != nil {
 		now = w.Now
 	}
-	payload, err := json.Marshal(struct {
-		Source string `json:"source"`
-		Event
-		SentAt string `json:"sent_at"`
-	}{
-		Source: "papio",
-		Event:  event,
-		SentAt: now().UTC().Format(time.RFC3339),
-	})
+	body, header, err := w.render(event, now())
 	if err != nil {
 		return err
 	}
 
-	request, err := http.NewRequestWithContext(bounded, http.MethodPost, w.URL, bytes.NewReader(payload))
+	request, err := http.NewRequestWithContext(bounded, http.MethodPost, w.URL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Content-Type", "application/json")
+	request.Header = header
 	if w.Secret != "" {
 		request.Header.Set("Authorization", "Bearer "+w.Secret)
 	}

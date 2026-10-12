@@ -32,6 +32,28 @@ func Dial(ctx context.Context, path string) (net.Conn, error) {
 	return dialSocket(ctx, path)
 }
 
+// ErrDaemonUnreachable matches, through errors.Is, every failure to reach the
+// daemon: a refused or missing socket, or an autostart that did not produce a
+// listening daemon.
+var ErrDaemonUnreachable = errors.New("daemon unreachable")
+
+type unreachableError struct{ err error }
+
+func (e *unreachableError) Error() string { return e.err.Error() }
+func (e *unreachableError) Unwrap() error { return e.err }
+func (e *unreachableError) Is(target error) bool {
+	return target == ErrDaemonUnreachable
+}
+
+// Unreachable marks err as a failure to reach the daemon without changing its
+// message. A nil err stays nil.
+func Unreachable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &unreachableError{err: err}
+}
+
 // RemoteError is a classified error returned by the daemon.
 type RemoteError struct {
 	Code    string
@@ -74,7 +96,7 @@ func (c *Client) CallRaw(ctx context.Context, id, method string, params json.Raw
 	}
 	conn, err := c.Dial(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("dial ipc daemon: %w", err)
+		return nil, Unreachable(fmt.Errorf("dial ipc daemon: %w", err))
 	}
 	defer func() { _ = conn.Close() }()
 	closeWriter, ok := conn.(interface{ CloseWrite() error })

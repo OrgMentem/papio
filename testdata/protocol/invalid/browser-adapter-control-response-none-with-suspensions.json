@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"adapter_control_response","msg_id":"adapter-control-0001","seq":1,"payload":{"request_id":"request-control-0001","state":"none","control_sequence":0,"suspensions_digest":"d9ada45fb9029f57dacec82802fed8b4472457d678544901e1f283057552b028","suspended_revisions":["sciencedirect@0.3.0"],"suspended_safety_domains":[]}}

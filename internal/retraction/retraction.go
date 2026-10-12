@@ -253,7 +253,8 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		findings = append(findings, finding)
 	}
 	sort.Slice(findings, func(i, j int) bool { return findings[i].DOI < findings[j].DOI })
-	if len(findings) > maxNotices {
+	truncated := len(findings) > maxNotices
+	if truncated {
 		findings = findings[:maxNotices]
 	}
 	notices := make(map[string]Finding, len(findings))
@@ -309,7 +310,7 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	if repairScanID == "" {
 		repairScanID = scanID
 	}
-	nextCache := cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices, Notified: nextNotified}
+	nextCache := cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices, Notified: nextNotified, Truncated: truncated}
 	if lastFetchErr != nil {
 		nextCache.LastFetchError = boundedFetchError(lastFetchErr)
 		nextCache.LastFetchErrorAt = now
@@ -1096,6 +1097,9 @@ type cache struct {
 	// every old notice. The key is always present in newly written caches,
 	// which distinguishes "none delivered yet" from a pre-tracking cache.
 	Notified map[string]bool `json:"notified"`
+	// Truncated marks a sweep whose findings exceeded maxNotices, so Notices
+	// is not the complete set and must never authorise removing a tag.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 func (s *Sentinel) cachePath() string {

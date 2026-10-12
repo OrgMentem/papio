@@ -1328,6 +1328,11 @@ func TestCredentialAndResolverURLValidation(t *testing.T) {
 		{name: "loopback http webhook with bearer", body: "[notify]\nwebhook_url = \"http://127.0.0.1:9000/papio\"\nwebhook_secret = \"synthetic-bearer\"\n"},                                                                // betterleaks:allow -- synthetic test input, never sent
 		{name: "remote http webhook with bearer", body: "[notify]\nwebhook_url = \"http://hooks.example.test/papio\"\nwebhook_secret = \"synthetic-bearer\"\n", wantErr: "notify.webhook_url must be an absolute https URL"}, // betterleaks:allow -- synthetic test input, never sent
 		{name: "remote http webhook without bearer", body: "[notify]\nwebhook_url = \"http://hooks.example.test/papio\"\n", wantErr: "notify.webhook_url must be an absolute https URL"},
+		{name: "webhook format json", body: "[notify]\nwebhook_url = \"https://hooks.example.test/papio\"\nwebhook_format = \"json\"\n"},
+		{name: "webhook format ntfy", body: "[notify]\nwebhook_url = \"https://ntfy.example.test/papio\"\nwebhook_format = \"ntfy\"\n"},
+		{name: "webhook format slack", body: "[notify]\nwebhook_url = \"https://hooks.slack.test/services/T/B/X\"\nwebhook_format = \"slack\"\n"},
+		{name: "webhook format unknown", body: "[notify]\nwebhook_url = \"https://hooks.example.test/papio\"\nwebhook_format = \"matrix\"\n", wantErr: "notify.webhook_format must be"},
+		{name: "webhook format wrong case", body: "[notify]\nwebhook_url = \"https://hooks.example.test/papio\"\nwebhook_format = \"Slack\"\n", wantErr: "notify.webhook_format must be"},
 		{name: "openurl base with query", body: "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl?sid=papio\"\n"},
 		{name: "openurl base with fragment", body: "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl#home\"\n", wantErr: "browser.openurl_base_url must not contain a fragment"},
 		{name: "openurl base with empty fragment", body: "[browser]\nopenurl_base_url = \"https://resolver.example.edu/openurl#\"\n", wantErr: "browser.openurl_base_url must not contain a fragment"},

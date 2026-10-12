@@ -74,6 +74,7 @@ import {
   INSTITUTIONAL_AUTHENTICATION_CLAIM_FEATURE,
   type AuthenticationClaimResponsePayload,
   type ClaimObservationPayload,
+  type AdapterControlResponsePayload,
   type ClaimObservationAckPayload,
   type ViewerCapturePayload,
 } from "./protocol";
@@ -206,6 +207,13 @@ import type {
 } from "./keepalive";
 import { routeResolverService, type ResolverRoute } from "./resolver";
 import { detectAuthFailure } from "./authfail";
+import {
+  ADAPTER_CONTROL_GATE,
+  ADAPTER_CONTROL_STORAGE_KEY,
+  AdapterControl,
+  type AdapterControlNotice,
+  type AdapterControlStorage,
+} from "./control";
 import type { TabChangeInfo, TabGroupInfo, TabInfo, WindowInfo } from "./browser-types";
 import { MATERIALIZE_PAGE_PATH, POPUP_PAGE_PATH } from "./page-paths";
 import {
@@ -999,6 +1007,9 @@ export interface OpenManagedTabOptions {
   /** Legacy in-window visibility for a new handoff; work-window placement
    * still follows its adapter-driven visibility rules. */
   surfaceFallback?: boolean;
+  /** The human asked for this open (inbox/CLI). Signed adapter control
+   * withholds autonomous opens only; an explicit one is the human's. */
+  explicit?: boolean;
   /** Set false when the caller just surfaced the tab (e.g. stale-page
    * recovery) and only needs managed URL reuse/navigation. */
   focusExisting?: boolean;
@@ -1426,6 +1437,10 @@ export interface BridgeDeps {
    * False gates queued-handoff releases and the autonomous-auth surface
    * gate: a wake after sleep must not navigate work into a dead network. */
   online?: () => boolean;
+  /** Durable home of the signed-control fence (chrome.storage.local, its own
+   * key). Optional: absent keeps the fence in memory only, which behaves
+   * exactly like a fresh install until a higher sequence arrives. */
+  adapterControl?: AdapterControlStorage;
 }
 
 interface GenericDownloadAttempt {
@@ -3189,6 +3204,7 @@ export class Bridge {
   >();
   private readonly correlation: NativeRequestCorrelation;
   constructor(private readonly deps: BridgeDeps) {
+    this.control = new AdapterControl(deps.adapterControl);
     this.correlation = new NativeRequestCorrelation({
       randomUUID: deps.randomUUID,
       setTimeout: deps.setTimeout,
@@ -3207,7 +3223,11 @@ export class Bridge {
               message: "Could not establish a current daemon session",
             },
       supportsFeature: (feature) =>
-        (this.store.daemonFeatures ?? []).includes(feature),
+        // The adapter_control gate is the hello_ack flag, never the feature
+        // list: a daemon cannot spoof it by advertising a lookalike feature.
+        feature === ADAPTER_CONTROL_GATE
+          ? this.adapterControlAdvertised()
+          : (this.store.daemonFeatures ?? []).includes(feature),
       send: (type, payload, jobID) => this.send(type, payload, jobID),
       reconnect: () => this.reconnectForHello(),
     });
@@ -3352,6 +3372,23 @@ export class Bridge {
    * arrived five seconds late in a browser that was merely not the holder. */
   private helloDeniedGeneration = -1;
   private helloRequestID: string | undefined;
+  /** Signed adapter control (control.ts): the fail-closed state machine behind
+   * `hasDelegatedAuthority`. Its persisted fence survives a worker restart;
+   * everything else here is per native connection. */
+  private readonly control: AdapterControl;
+  /** `control`'s epoch for the CURRENT native connection. */
+  private controlEpoch = 0;
+  /** Port generation whose hello_ack carried `adapter_control: true`. The
+   * adapter_control frames are sent only while this equals `portGeneration`:
+   * an older daemon rejects an unknown frame type as a fatal protocol error. */
+  private adapterControlGeneration = -1;
+  /** Epoch whose adapter_control_request is still awaiting its reply. */
+  private controlRequestEpoch = -1;
+  /** Daemon frames that must not act on unconfirmed control, kept in arrival
+   * order and replayed the moment control resolves (see holdForControl). */
+  private readonly heldForControl: unknown[] = [];
+  /** Materializations deferred because control withheld their job. */
+  private readonly materializationsHeldForControl = new Set<string>();
   private readonly helloWaiters = new Set<(acknowledged: boolean) => void>();
   private readonly agentHelloWaits = new Set<string>();
   /** Best-effort display cache only, refreshed from daemon counts or snapshots. */
@@ -3383,9 +3420,183 @@ export class Bridge {
   }
   /** Only the daemon's exact delegated mode authorizes unattended browser
    * effects. Legacy/missing and assisted jobs remain parked until the operator
-   * explicitly opens them. */
+   * explicitly opens them.
+   *
+   * Signed adapter control (control.ts) narrows this further: it withholds
+   * every autonomous effect while control cannot be confirmed (fail closed),
+   * and from a job on a suspended packaged adapter revision. A suspension
+   * names an exact `id@version`, so a job counts as on it when its recorded
+   * `adapter_id` is that adapter or any of its provider hosts is one the
+   * adapter serves — a job not yet classified has no `adapter_id`. */
   private hasDelegatedAuthority(job: ActiveJob | undefined): boolean {
-    return job?.access_mode === "delegated";
+    return job?.access_mode === "delegated" && !this.controlWithholds(job);
+  }
+
+  /** Signed adapter control withholds every autonomous effect from `job`:
+   * control is unconfirmed (fail closed) or the job's adapter is suspended.
+   * Callers that are not gated by access_mode (queue drains, materialization,
+   * delayed navigation) ask this directly. */
+  private controlWithholds(job: ActiveJob | undefined): boolean {
+    if (this.control.blocksPositiveEffects()) return true;
+    if (job === undefined) return false;
+    return this.control
+      .suspendedAdapters(this.deps.adapterSpecs)
+      .some(
+        (spec) =>
+          spec.id === job.adapter_id ||
+          job.provider_hosts.some((host) => adapterSupportsHost(host, spec)),
+      );
+  }
+
+  /** Institutional materialization (scaffold tab, claim, navigation) is an
+   * autonomous effect. While control withholds the job, remember it so
+   * `onControlChanged` re-schedules it once control permits; nothing is lost. */
+  private materializationHeldByControl(jobID: string): boolean {
+    if (!this.controlWithholds(findByJob(this.store, jobID))) return false;
+    this.materializationsHeldForControl.add(jobID);
+    return true;
+  }
+
+  /** The current port's hello_ack said this daemon speaks adapter_control. */
+  private adapterControlAdvertised(): boolean {
+    return (
+      this.port !== null && this.adapterControlGeneration === this.portGeneration
+    );
+  }
+
+  /** True while the one reply that decides whether control permits effects is
+   * still on the wire. Only then are daemon frames held, and the hold ends
+   * with the request (reply, transport failure, or timeout), so a daemon that
+   * never answers cannot hang the offers behind it. */
+  private controlResolutionPending(): boolean {
+    return (
+      this.controlRequestEpoch === this.controlEpoch &&
+      this.control.currentPhase() === "unresolved" &&
+      this.control.blocksPositiveEffects()
+    );
+  }
+
+  /** A worker restart reconnects and the daemon immediately re-offers live
+   * work, which would otherwise race the control reply and be parked for the
+   * human on EVERY reconnect once any sequence has been published. Hold the
+   * frames that start autonomous work, in arrival order, until control
+   * resolves; `releaseHeldForControl` then replays them against the verdict.
+   * Never awaited: the reply that releases them arrives on this same chain. */
+  private holdForControl(msg: BrowserMessage, raw: unknown): boolean {
+    if (
+      (msg.type !== "job_offer" &&
+        msg.type !== "handoff_focus" &&
+        msg.type !== "cancel" &&
+        msg.type !== "provider_direct_get_request") ||
+      !this.controlResolutionPending()
+    ) {
+      return false;
+    }
+    this.heldForControl.push(raw);
+    return true;
+  }
+
+  private releaseHeldForControl(): void {
+    const held = this.heldForControl.splice(0);
+    const port = this.port;
+    if (port === null) return;
+    for (const raw of held) void this.enqueueInbound(raw, port).catch(() => {});
+  }
+
+  /** Ask the daemon for canonical signed control and apply its answer. Called
+   * `void` from the hello_ack handler and from every keepalive tick: the
+   * reply arrives through the inbound chain, so awaiting it from inside a
+   * handler would deadlock (AGENTS.md). Every failure leaves the phase
+   * unresolved, which fails closed once a sequence has been seen. */
+  private async requestAdapterControl(): Promise<void> {
+    const epoch = this.controlEpoch;
+    if (!this.adapterControlAdvertised() || this.controlRequestEpoch === epoch)
+      return;
+    this.controlRequestEpoch = epoch;
+    let resolved = false;
+    try {
+      await this.ready;
+      const result = await this.requestCorrelated(
+        "adapter_control_request",
+        this.control.requestFields(),
+      );
+      if (
+        result.kind !== "response" ||
+        result.payload === undefined ||
+        epoch !== this.controlEpoch
+      )
+        return;
+      const wasBlocked = this.control.blocksPositiveEffects();
+      const response = result.payload as unknown as AdapterControlResponsePayload;
+      const resolution = await this.control.resolve(response, epoch);
+      if (!resolution.current) return;
+      resolved = true;
+      this.send("adapter_control_apply_result", {
+        request_id: response.request_id,
+        control_sequence: resolution.control_sequence,
+        outcome: resolution.outcome,
+        suspended_hosts:
+          resolution.outcome === "applied"
+            ? this.control.suspendedHosts(this.deps.adapterSpecs)
+            : [],
+      });
+      this.onControlChanged(wasBlocked);
+    } catch (e) {
+      console.error("papio: adapter control request failed", e);
+    } finally {
+      // A timeout, transport error or unusable reply means this connection can
+      // no longer vouch for what it applied earlier: close the gate BEFORE any
+      // held work is released, and keep it closed until a valid response
+      // applies (control.ts: unresolved blocks once a sequence has been seen).
+      if (!resolved && epoch === this.controlEpoch) {
+        this.control.invalidate(epoch);
+        this.onControlChanged(false);
+      }
+      if (this.controlRequestEpoch === epoch) this.controlRequestEpoch = -1;
+      if (epoch === this.controlEpoch) this.releaseHeldForControl();
+    }
+  }
+
+  /** Every current control change (apply, failure, suspension change, lost
+   * connection) re-evaluates what control permits. Viewer download rules are
+   * session rules installed in the browser, so they must be resynced here, not
+   * left until an unrelated store update. */
+  private onControlChanged(wasBlocked: boolean): void {
+    void this.viewerRules.syncViewerDownloadRules();
+    const permits = !this.control.blocksPositiveEffects();
+    if (permits) {
+      for (const jobID of [...this.materializationsHeldForControl]) {
+        this.materializationsHeldForControl.delete(jobID);
+        void this.scheduleMaterialization(jobID, true);
+      }
+    }
+    if (!wasBlocked) return;
+    // Work held behind the unresolved phase re-drains now: it opens if control
+    // applied, and parks for the human if it did not. Terms gates skipped while
+    // unresolved (startup runs before the answer) are recovered too. Both are
+    // off the inbound chain.
+    void this.releaseQueuedHandoffs().catch((e: unknown) => {
+      console.error("papio: re-draining handoffs after control failed", e);
+    });
+    if (permits)
+      void this.redrivePendingTermsGates().catch((e: unknown) => {
+        console.error("papio: terms recovery after control failed", e);
+      });
+  }
+
+  /** Plain-language control state for the popup; undefined when nothing is
+   * unusual. While the daemon is unreachable its own card speaks, so this
+   * stays silent rather than echoing it. */
+  adapterControlNotice(): AdapterControlNotice | undefined {
+    if (!this.hasCurrentHello()) return undefined;
+    if (this.control.blocksPositiveEffects())
+      return this.controlResolutionPending() ? undefined : { kind: "paused" };
+    const adapters = this.control
+      .suspendedAdapters(this.deps.adapterSpecs)
+      .map((spec) => spec.id);
+    return adapters.length === 0
+      ? undefined
+      : { kind: "suspended", adapters: [...new Set(adapters)].sort() };
   }
 
   queuedAuthJobs(): number {
@@ -4201,6 +4412,15 @@ export class Bridge {
       options.jobId !== undefined &&
       (options.purpose === "redrive" || options.purpose === "reoffer") &&
       !this.hasDelegatedAuthority(job)
+    ) {
+      return undefined;
+    }
+    // A queued "handoff" opens a tab for a job that may not be classified yet;
+    // signed control still withholds it (blocked, or its adapter suspended).
+    if (
+      options.purpose === "handoff" &&
+      options.explicit !== true &&
+      this.controlWithholds(job)
     ) {
       return undefined;
     }
@@ -5453,6 +5673,27 @@ export class Bridge {
       }
       if (this.handoffDriveQueue[0] !== request) continue;
       if (this.port !== port || this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) return;
+      // Signed adapter control (control.ts): an autonomous drive opens or
+      // navigates a tab, which is an effect; the operator's own open is the
+      // human's and is never held. While the reply that decides control is
+      // still on the wire the queue is left as it is (resolution re-drains
+      // it); once control has failed, park for the human exactly as the
+      // closed-gate case below does.
+      if (
+        request.operator !== true &&
+        request.purpose !== "inbox-open" &&
+        this.controlWithholds(job)
+      ) {
+        if (this.controlResolutionPending()) return;
+        dequeue();
+        await this.update((s) =>
+          patchJob(s, request.jobID, {
+            status: "queued",
+            engagement_required: true,
+          }),
+        );
+        continue;
+      }
       if (
         tabID === undefined &&
         job.requires_auth === true &&
@@ -5571,6 +5812,7 @@ export class Bridge {
               url,
               jobId: request.jobID,
               purpose: request.purpose,
+              ...(request.operator === true ? { explicit: true } : {}),
               ...(request.surfaceFallback !== undefined
                 ? { surfaceFallback: request.surfaceFallback }
                 : {}),
@@ -5987,6 +6229,9 @@ export class Bridge {
         // from storage now, not whenever the next mutation happens to run.
         this.persistPdfGrabCorrelations();
       }
+      // The fence must be known before any job can ask hasDelegatedAuthority:
+      // an unread fence blocks positive effects.
+      await this.control.load();
       this.hydrated = true;
       await this.update((current) => current);
     });
@@ -9017,6 +9262,7 @@ export class Bridge {
     if (this.cancelledMaterializationJobs.has(jobID)) return;
     let correlation = this.materializationCorrelation(jobID);
     if (correlation === undefined || correlation.phase === "navigated") return;
+    if (this.materializationHeldByControl(jobID)) return;
     if (
       !MATERIALIZATION_RFC3339_PATTERN.test(correlation.candidate_expires_at) ||
       Date.parse(correlation.candidate_expires_at) <= this.deps.now()
@@ -9124,6 +9370,7 @@ export class Bridge {
       correlation.phase === "claimed" ||
       (correlation.phase === "bound" && correlation.tab_id < 0)
     ) {
+      if (this.materializationHeldByControl(jobID)) return;
       const scaffold = await this.materializeScaffold(jobID, correlation);
       if (!scaffold.reliable) {
         await this.retryMaterializationAfterResponseLoss(jobID, "bind");
@@ -9415,6 +9662,7 @@ export class Bridge {
     const navigationBindingID = correlation.binding_id;
     const navigationOrdinal = correlation.route_issuance_ordinal;
     if (navigationOrdinal === undefined) return;
+    if (this.materializationHeldByControl(jobID)) return;
     await this.applyMaterialization(jobID, { type: "navigating" });
     const currentTabID = correlation.tab_id;
     const beforeUpdate = this.materializationCorrelation(jobID);
@@ -9426,6 +9674,17 @@ export class Bridge {
       beforeUpdate?.tab_id !== currentTabID
     )
       return;
+    // Control can change during the awaits above; check again at the last
+    // moment before the tab is navigated.
+    if (this.materializationHeldByControl(jobID)) {
+      // `navigating` is already persisted but the tab was never navigated. The
+      // navigation-recovery branch would report it navigated while the tab
+      // still shows the scaffold, so step back to the resumable pre-route
+      // phase (retry_route keeps the permit identity and marks the issued
+      // ordinal for replay); the resumed run re-requests the route.
+      await this.applyMaterialization(jobID, { type: "retry_route" });
+      return;
+    }
     const activeDrive = findByJob(this.store, jobID);
     if (
       activeDrive?.tab_id === currentTabID &&
@@ -9540,6 +9799,9 @@ export class Bridge {
     // a real browser tab to bind, and a pending session that cannot claim would
     // leave that tab orphaned with nothing to attach it to.
     if (!this.holderRole()) return;
+    // Signed adapter control: scaffold, claim and navigation are autonomous
+    // effects. Remember the job; onControlChanged re-schedules it.
+    if (this.materializationHeldByControl(jobID)) return;
     // Slice 0 containment, on the one pipeline the nine legacy paths' shared
     // gate never reached. institutionalAuthGateOpen()'s last clause is
     // `online`; this path checked only holdership, so a woken worker with no
@@ -12646,6 +12908,10 @@ export class Bridge {
       this.connect();
       return;
     }
+    // Re-ask for signed adapter control on every connected tick, so a newly
+    // published (or withdrawn) sequence reaches this session within a minute
+    // of the daemon accepting it. Not awaited: nothing below depends on it.
+    void this.requestAdapterControl();
     // Queued releases run only against a live network, and only after the
     // probe above has been kicked off — release-then-probe was the wake
     // ordering that drove tabs into dead networks.
@@ -12724,6 +12990,12 @@ export class Bridge {
     this.helloDeniedGeneration = -1;
     this.helloSentGeneration = -1;
     this.helloRequestID = undefined;
+    // A new connection starts with control unresolved: only the persisted
+    // fence carries over, never what the last port learned about suspensions.
+    this.controlEpoch = this.control.beginConnection();
+    this.adapterControlGeneration = -1;
+    this.controlRequestEpoch = -1;
+    this.heldForControl.length = 0;
     this.triagePendingCount = undefined;
     this.triageActionsRequiresAuth = undefined;
     this.triageActionsRequiresAuthAt = undefined;
@@ -12787,11 +13059,24 @@ export class Bridge {
     }
   }
 
+  /** The native port is gone: whatever control it applied can no longer be
+   * vouched for, and a persisted sequence must block effects NOW (reconnect
+   * backoff, or a deliberate disconnect, can last indefinitely) rather than at
+   * the next connect(). The new epoch also voids any in-flight request. */
+  private dropControlConnection(): void {
+    this.controlEpoch = this.control.beginConnection();
+    this.adapterControlGeneration = -1;
+    this.controlRequestEpoch = -1;
+    this.heldForControl.length = 0;
+    this.onControlChanged(false);
+  }
+
   private async onPortDisconnect(port: NativePort): Promise<void> {
     // A stale port may report its close after recovery opened a replacement.
     if (this.port !== port) return;
     for (const pending of this.agentNavigations.values()) pending.stop();
     this.port = null;
+    this.dropControlConnection();
     this.failPendingMaterializationRequests();
     this.failPageAcquireWaiters(
       "The daemon disconnected before acknowledging this page",
@@ -12820,6 +13105,7 @@ export class Bridge {
     this.closingDeliberately = true;
     const port = this.port;
     this.port = null;
+    this.dropControlConnection();
     this.failPendingMaterializationRequests();
     this.failPageAcquireWaiters(
       "The daemon disconnected before acknowledging this page",
@@ -14429,6 +14715,10 @@ export class Bridge {
         ? (_job: ActiveJob) => true
         : (job: ActiveJob) => jobOrigin(job) === originScope;
     await this.drainHandoffDriveQueue();
+    // Signed adapter control (control.ts): releasing a queued handoff opens a
+    // tab, which is an effect. The operator's own action (forceProvider) is
+    // the human's, and still runs.
+    if (!forceProvider && this.control.blocksPositiveEffects()) return;
     const anyQueuedEligible = this.store.activeJobs.some(
       (job) =>
         matchesOrigin(job) &&
@@ -14481,6 +14771,12 @@ export class Bridge {
           // different resolver profile; leave it for its own unscoped drain.
           if (!matchesOrigin(forcedJob)) continue;
           const candidate = forcedJob;
+          if (!forceProvider && this.controlWithholds(candidate)) {
+            // Signed adapter control: a suspended adapter's queued job is not
+            // released by a timer; the operator's own open still is.
+            this.pendingForcedReleases.delete(jobID);
+            continue;
+          }
           if (candidate.engagement_required === true && !forceProvider) {
             // Timer-driven forced release never admits engagement-gated work.
             // The marker is permanently ineligible under this drain mode.
@@ -14522,6 +14818,7 @@ export class Bridge {
               matchesOrigin(job) &&
               job.status === "queued" &&
               job.engagement_required !== true &&
+              (forceProvider || !this.controlWithholds(job)) &&
               (job.requires_auth !== true ||
                 this.institutionalAuthGateOpen()) &&
               this.hasHandoffReleaseEvidence(
@@ -14577,6 +14874,7 @@ export class Bridge {
               url,
               jobId: queued.job_id,
               purpose: "handoff",
+              ...(forceProvider ? { explicit: true } : {}),
               surfaceFallback: forceSurface,
             });
           } catch (e) {
@@ -14935,6 +15233,14 @@ export class Bridge {
   ): boolean {
     const port = this.port;
     if (!port) return false;
+    // The adapter_control frames exist only for a daemon whose hello_ack said
+    // it speaks them; an older daemon treats the unknown type as fatal.
+    if (
+      (type === "adapter_control_request" ||
+        type === "adapter_control_apply_result") &&
+      !this.adapterControlAdvertised()
+    )
+      return false;
     const env: Record<string, unknown> = {
       protocol: BROWSER_PROTOCOL_VERSION,
       type,
@@ -15106,6 +15412,17 @@ export class Bridge {
       );
       return;
     }
+    // Signed adapter control (control.ts): a direct route is an autonomous
+    // download that may have no prior job, so it never reaches the
+    // hasDelegatedAuthority check below. Refuse it here, silently, exactly as
+    // that check does.
+    if (
+      this.control.blocksPositiveEffects() ||
+      this.control
+        .suspendedAdapters(this.deps.adapterSpecs)
+        .some((spec) => adapterSupportsHost(target.hostname, spec))
+    )
+      return;
     const prior = findByJob(this.store, jobID);
     if (prior !== undefined && !this.hasDelegatedAuthority(prior)) return;
     const priorEpoch = prior?.drive_epoch;
@@ -15510,6 +15827,7 @@ export class Bridge {
       return;
     }
     await this.ready;
+    if (this.holdForControl(msg, raw)) return;
     if (msg.type === "effect_permit_reconcile_request") {
       await this.onEffectPermitReconcileRequest(msg);
       return;
@@ -15613,6 +15931,13 @@ export class Bridge {
         // the session it had just slotted, so its silence means holder.
         this.helloRole = msg.payload.role === "pending" ? "pending" : "holder";
         this.helloAckGeneration = this.portGeneration;
+        // Only a hello_ack that says so makes the adapter_control frames legal
+        // on this port. Absence (an older daemon, or one that predates
+        // 0.16.0) is "daemon_without_control": a fresh install is unaffected,
+        // an extension that has already seen a sequence fails closed.
+        if (msg.payload.adapter_control === true)
+          this.adapterControlGeneration = this.portGeneration;
+        else this.control.markUnsupported(this.controlEpoch);
         // A claim can seat this session after it was refused; the ack arrives
         // on the same port, so the refusal must stop shortcutting requests.
         this.helloDeniedGeneration = -1;
@@ -15717,6 +16042,9 @@ export class Bridge {
             void this.retryPendingGrabStatuses();
           }, 0);
         }
+        // Not awaited, for the same reason as every reconciliation above: the
+        // reply can only arrive through this serialized chain.
+        void this.requestAdapterControl();
         return;
       }
       case "page_acquire_ack": {
@@ -16015,8 +16343,19 @@ export class Bridge {
       this.sendJobAccept(jobID);
       return;
     }
+    // Signed adapter control (control.ts) parks an offer exactly as a
+    // non-delegated one: tabless, accepted, waiting for the human. The stored
+    // access_mode stays what the daemon offered, so the job is delegated
+    // again the moment control permits it.
+    const parkedByControl =
+      this.control.blocksPositiveEffects() ||
+      this.control
+        .suspendedAdapters(this.deps.adapterSpecs)
+        .some((spec) =>
+          providerHosts.some((host) => adapterSupportsHost(host, spec)),
+        );
     const authorityMode = effectiveAccessMode;
-    if (authorityMode !== "delegated") {
+    if (authorityMode !== "delegated" || parkedByControl) {
       const now = this.deps.now();
       const expiresMs = Date.parse(expiresAt);
       const parked: ActiveJob = {
@@ -17203,6 +17542,9 @@ export class Bridge {
         ? undefined
         : this.offerURLs.get(jobID);
       if (job === undefined || job.status !== "awaiting_download") return;
+      // Signed adapter control may have failed or suspended this job's adapter
+      // since the timer was set; re-check right before any navigation.
+      if (!this.hasDelegatedAuthority(job)) return;
       if (openurl === undefined) {
         try {
           const tab = await this.deps.tabs.get(tabID);
@@ -18287,6 +18629,11 @@ export class Bridge {
   ): Promise<PageVerdict | undefined> {
     const job = findByJob(this.store, jobID);
     if (!job) return undefined;
+    // Signed adapter control (control.ts), fail closed: while control cannot
+    // be confirmed the job is left exactly as it is, parked for the human.
+    // Checked before the adapter lookup so the generic and agent paths are
+    // held too.
+    if (this.control.blocksPositiveEffects()) return undefined;
     if (disposition === "apply") {
       if (this.agentLoops.has(jobID)) return undefined;
       const latch = (job as ActiveJob & AgentJobState).agent_fallback_attempt;
@@ -18302,6 +18649,11 @@ export class Bridge {
     const spec = this.deps.adapterSpecs.find((candidate) =>
       adapterSupportsHost(host, candidate),
     );
+    // Signed adapter control (control.ts): a suspended revision runs no
+    // classification and no effect. The job stays assisted, parked for the
+    // human, with no drift/ui_changed outcome reported and nothing latched:
+    // the page is not broken, papio is deliberately not touching it.
+    if (spec !== undefined && this.control.isSuspended(spec)) return undefined;
     // An unsupported landing after sign-in still needs a coverage diagnosis.
     // It proves neither authentication nor permission to execute an effect.
     const missingAdapterAfterAuth =
@@ -23182,6 +23534,9 @@ export async function handleInboxRuntimeMessage(
       ok: true,
       state: await bridge.sessionStateSnapshot(),
       origins: bridge.sessionOriginStates(),
+      ...(bridge.adapterControlNotice() === undefined
+        ? {}
+        : { adapterControl: bridge.adapterControlNotice() }),
     };
   }
   if (type === "papio.session.probe") {
@@ -23196,6 +23551,9 @@ export async function handleInboxRuntimeMessage(
       ok: true,
       state: await bridge.sessionStateWithProbe(),
       origins: bridge.sessionOriginStates(),
+      ...(bridge.adapterControlNotice() === undefined
+        ? {}
+        : { adapterControl: bridge.adapterControlNotice() }),
     };
   }
   if (type === "papio.session.signin") {
@@ -23750,6 +24108,19 @@ function realDeps(): BridgeDeps {
       get: async () => {
         const got = await chrome.storage.local.get(PAGE_CAPTURE_CONSENT_KEY);
         return got[PAGE_CAPTURE_CONSENT_KEY] === true;
+      },
+    },
+    // The signed-control fence (control.ts): its own chrome.storage.local key,
+    // not the managed-state object and not the session backend a browser
+    // restart wipes. A failed read must throw so the fence reads as unknown
+    // (fail closed) rather than as a fresh install.
+    adapterControl: {
+      load: async () => {
+        const got = await chrome.storage.local.get(ADAPTER_CONTROL_STORAGE_KEY);
+        return got[ADAPTER_CONTROL_STORAGE_KEY];
+      },
+      save: async (value) => {
+        await chrome.storage.local.set({ [ADAPTER_CONTROL_STORAGE_KEY]: value });
       },
     },
     tabLedger: {

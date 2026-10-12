@@ -196,6 +196,10 @@ type daemonDown struct {
 	held   bool
 }
 
+// Is makes errors.Is(err, ipc.ErrDaemonUnreachable) true: --json reports
+// daemon_unreachable for a daemon control command that found no daemon.
+func (d daemonDown) Is(target error) bool { return target == ipc.ErrDaemonUnreachable }
+
 func (d daemonDown) Error() string {
 	if !d.held {
 		return fmt.Sprintf("daemon is not running (nothing is listening on %s)", d.socket)

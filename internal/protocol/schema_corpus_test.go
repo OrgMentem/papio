@@ -47,6 +47,7 @@ var schemaRuntimeOnly = map[string]string{
 	"browser-job-offer-invalid-date.json":                        "expected-completion timestamp is validated as a real RFC 3339 instant; JSON Schema format is annotation-only by default",
 	"browser-triage-snapshot-counts-pending-mismatch-v3.json":    "counts must agree with the item array they summarise; a cross-field arithmetic invariant",
 	"browser-claim-observation-ack-applied-bad-lease-until.json": "lease_until is validated as a real RFC 3339 instant; JSON Schema format is annotation-only by default",
+	"browser-adapter-control-response-unsorted.json":             "suspension lists must be sorted so the digest is canonical; JSON Schema has no ordering vocabulary",
 }
 
 func repoPath(t *testing.T, parts ...string) string {

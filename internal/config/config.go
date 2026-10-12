@@ -475,6 +475,12 @@ type Zotio struct {
 	// linked items in the user's personal library. Off by default because it
 	// mutates the user's library beyond attaching requested PDFs.
 	ExceptionTags bool `toml:"exception_tags"`
+	// RetractionTags enables the reconciled `papio:retracted` automatic tag
+	// on personal-library items whose DOI exactly matches a current verified
+	// retraction notice from the retraction sentinel. Corrections and
+	// expressions of concern are never tagged. Off by default because it
+	// mutates the user's library; needs the retraction_watch source.
+	RetractionTags bool `toml:"retraction_tags"`
 	// UnavailableRecheckDays is how long an unavailable outcome parks an item
 	// before backfill re-checks it (OA availability drifts upward). Range
 	// 1..365, default 14.
@@ -503,6 +509,23 @@ type NotifyCategory struct {
 	WindowSeconds int    `toml:"window_seconds"`
 }
 
+// Webhook formats accepted by Notify.WebhookFormat. An empty value means
+// WebhookFormatJSON so existing configs keep their exact request shape.
+const (
+	WebhookFormatJSON  = "json"
+	WebhookFormatNtfy  = "ntfy"
+	WebhookFormatSlack = "slack"
+)
+
+// EffectiveWebhookFormat returns the webhook format in force: the configured
+// value, or WebhookFormatJSON when none is set.
+func (n Notify) EffectiveWebhookFormat() string {
+	if n.WebhookFormat == "" {
+		return WebhookFormatJSON
+	}
+	return n.WebhookFormat
+}
+
 // Notify configures daemon-owned notification routing. Desktop delivery is
 // best effort; webhook delivery is an independent automation channel.
 type Notify struct {
@@ -520,7 +543,12 @@ type Notify struct {
 	// addition to (not instead of) the local desktop channel.
 	WebhookURL string `toml:"webhook_url"`
 	// WebhookSecret, when set, is sent as "Authorization: Bearer <secret>".
-	WebhookSecret        string `toml:"webhook_secret"`
+	WebhookSecret string `toml:"webhook_secret"`
+	// WebhookFormat selects the request shape the webhook receives: "json"
+	// (the default when empty), "ntfy", or "slack". It applies to
+	// webhook_url and to a webhook credential record alike, since neither
+	// carries a format of its own.
+	WebhookFormat        string `toml:"webhook_format,omitempty"`
 	WebhookCredentialRef string `toml:"webhook_credential_ref,omitempty"`
 }
 
@@ -679,6 +707,11 @@ type Discovery struct {
 // Updates configures the optional daily release check.
 type Updates struct {
 	Check bool `toml:"check"`
+	// ControlURL overrides where the daemon fetches the signed adapter control
+	// document when Check is on. Empty means the raw file in the papio
+	// repository (adaptercontrol.DefaultURL). It must be https, or http to a
+	// loopback host.
+	ControlURL string `toml:"control_url"`
 }
 
 // Actions configures how long an open human action may wait before listings
@@ -1085,6 +1118,28 @@ func normalizeLibrarySourcePath(path string) string {
 // and the daemon's PATH is not the PATH of the shell that ran doctor. A
 // relative path is rejected because it would depend on the daemon's working
 // directory. Errors start with the field name.
+// validateControlURL accepts an empty value (the default) or an https URL, or
+// an http URL to a loopback host, which lets a test server stand in for the
+// repository. The signed document is verified regardless of transport.
+func validateControlURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return fmt.Errorf("updates.control_url %q is not a plain URL", raw)
+	}
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if ip := net.ParseIP(parsed.Hostname()); parsed.Hostname() == "localhost" || (ip != nil && ip.IsLoopback()) {
+			return nil
+		}
+	}
+	return fmt.Errorf("updates.control_url %q must use https (http is allowed only for a loopback host)", raw)
+}
+
 func validateLibraryCommandArgv(argv []string) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("argv is required for kind %q", LibraryKindCommand)
@@ -1232,6 +1287,9 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("retraction.scope must be acquired or library")
 	}
+	if err := validateControlURL(c.Updates.ControlURL); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Zotio.Executable) == "" && c.Zotio.AutoImport {
 		return fmt.Errorf("zotio.auto_import requires zotio.executable")
 	}
@@ -1246,6 +1304,9 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.Zotio.Executable) == "" && c.Zotio.ExceptionTags {
 		return fmt.Errorf("zotio.exception_tags requires zotio.executable")
+	}
+	if strings.TrimSpace(c.Zotio.Executable) == "" && c.Zotio.RetractionTags {
+		return fmt.Errorf("zotio.retraction_tags requires zotio.executable")
 	}
 	for name, s := range c.Sources {
 		// A misspelled or reserved-but-unimplemented [sources.*] name is
@@ -1286,6 +1347,11 @@ func (c *Config) validate() error {
 	}
 	if c.Notify.WebhookURL != "" && !credential.ValidWebhookURL(c.Notify.WebhookURL) {
 		return fmt.Errorf("notify.webhook_url must be an absolute https URL (plain http is accepted only for a loopback host)")
+	}
+	switch c.Notify.WebhookFormat {
+	case "", WebhookFormatJSON, WebhookFormatNtfy, WebhookFormatSlack:
+	default:
+		return fmt.Errorf("notify.webhook_format must be %q, %q, or %q", WebhookFormatJSON, WebhookFormatNtfy, WebhookFormatSlack)
 	}
 	if c.Notify.WebhookSecret != "" && c.Notify.WebhookURL == "" {
 		return fmt.Errorf("notify.webhook_secret is set but notify.webhook_url is empty")

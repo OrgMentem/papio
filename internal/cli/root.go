@@ -73,6 +73,7 @@ func newRoot(opt *options) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return &usageError{err: err} })
 	root.SetVersionTemplate("papio {{.Version}}\n")
 	root.SetOut(opt.out)
 	root.SetErr(opt.errOut)
@@ -193,7 +194,7 @@ func (o *options) call(ctx context.Context, method string, params, result any) e
 	starter.Args = []string{"--config", cfg.Path, "daemon", "--socket", socket}
 	ensureResult, err := starter.EnsureWithResult(ctx)
 	if err != nil {
-		return err
+		return ipc.Unreachable(err)
 	}
 	if ensureResult.Started {
 		o.daemonVersionChecked = true

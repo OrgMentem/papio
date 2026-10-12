@@ -25,6 +25,9 @@ type browserSession struct {
 	needsAck                    bool
 	demotedNotice               bool
 	pendingDevReload            string
+	// control is what this session reported about signed adapter control. A
+	// new hello builds a new session, so it starts unresolved.
+	control sessionControl
 }
 
 // sessionArbitration owns the browser holder state machine. Bridge serializes

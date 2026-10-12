@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"papio/internal/acquisitionagent"
+	"papio/internal/adaptercontrol"
 	"papio/internal/agentcredential"
 	"papio/internal/app"
 	"papio/internal/artifact"
@@ -91,10 +92,14 @@ type System struct {
 	Zotio              *zotio.Service
 	// Holdings answers ownership for users without zotio; empty when zotio owns
 	// the answer or no generic source is configured.
-	Holdings    *ownership.Registry
-	Updates     *update.Checker
-	Retractions *retraction.Sentinel
-	Triage      *triage.Service
+	Holdings *ownership.Registry
+	Updates  *update.Checker
+	// AdapterControl holds the canonical signed adapter control (ADR-0021
+	// Decision 4). It is always present: persisted suspensions apply even
+	// while the update check that fetches new documents is off.
+	AdapterControl *adaptercontrol.Service
+	Retractions    *retraction.Sentinel
+	Triage         *triage.Service
 	// Drive is the paced drive; it runs as a maintenance runner and serves
 	// drive.status / drive.pause / drive.resume.
 	Drive *drive.Pacer
@@ -334,7 +339,9 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	}
 	var webhook notify.Sender
 	if endpoint, bearer := credentials.Webhook(); endpoint != "" {
-		webhook = notify.NewWebhook(endpoint, bearer)
+		sender := notify.NewWebhook(endpoint, bearer)
+		sender.Format = cfg.Notify.EffectiveWebhookFormat()
+		webhook = sender
 	}
 	revalidate := func(ctx context.Context, row notify.Record) (bool, error) {
 		dbh := db.DB()
@@ -478,6 +485,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Bundle:    bundleExporter, Store: db, DataDir: cfg.DataDir,
 		AttachmentMode: cfg.Zotio.AttachmentMode, AutoEnrich: cfg.Zotio.AutoEnrich,
 		ExceptionTags:      cfg.Zotio.ExceptionTags,
+		RetractionTags:     cfg.Zotio.RetractionTags,
 		UnavailableRecheck: time.Duration(cfg.Zotio.UnavailableRecheckDays) * 24 * time.Hour,
 	}
 	// The budgeted lookup enrichDOIWork uses also gives a new Zotero item the
@@ -566,12 +574,25 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	if retractions != nil {
 		triageService.RegisterSource(retractions)
 	}
+	if retractions != nil {
+		zotioService.Retractions = retractions
+	}
 	// The paced drive (ADR-0009, amended 2026-09-23). It opens nothing unless
 	// [drive] enabled = true; Browser is attached once the bridge exists below.
 	pacer := &drive.Pacer{Jobs: jobs, Config: cfg, Notifier: router}
 	maintenance := daemon.MaintenanceRunners{watchRunner, service.ImportRetrier(), service.UnavailableRechecker(), service.HandoffRepairer(), service.OfferedDeliveryRecovery(), service.ActionReminder(), pacer, retractions, router}
 	maintenance = append(maintenance, service.ManagedFilingRetrier(), publicationWatches)
+	controlService, controlRunner, err := openAdapterControl(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if controlRunner != nil {
+		maintenance = append(maintenance, controlRunner)
+	}
 	if reconciler := zotioService.TagReconciler(); reconciler != nil {
+		maintenance = append(maintenance, reconciler)
+	}
+	if reconciler := zotioService.RetractionTagReconciler(); reconciler != nil {
 		maintenance = append(maintenance, reconciler)
 	}
 	// A paused config stops every automatic Zotero write, and the follow-up
@@ -606,6 +627,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 	// Only a resolved, explicitly configured backend reaches the browser.
 	// Credential values remain in the daemon; they never enter browser IPC.
 	bridge.SetAcquisitionBackend(agentBackend)
+	bridge.SetAdapterControl(controlService)
 	router.SetPresence(bridge.PresenceProvider())
 	pacer.Browser = bridge
 
@@ -625,6 +647,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		Zotio:              zotioService,
 		Holdings:           holdings,
 		Updates:            updates,
+		AdapterControl:     controlService,
 		Retractions:        retractions,
 		Triage:             triageService,
 		PDFCapability:      capability, WorkerBinary: executable,
@@ -687,6 +710,21 @@ func (s *System) DoctorReport(ctx context.Context) doctor.Report {
 		report = doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery)
 	} else {
 		report = doctor.Run(ctx, s.Config, s.Store, s.PDFCapability, s.WorkerBinary, s.Discovery, s.Credentials)
+	}
+	if s.AdapterControl != nil {
+		input := doctor.AdapterControlInput{
+			Snapshot: s.AdapterControl.Snapshot(), Status: s.AdapterControl.Status(),
+			HasKey: s.AdapterControl.HasKey(), FetchURL: s.AdapterControl.FetchURL(),
+		}
+		if s.Browser != nil {
+			input.Sessions = s.Browser.AdapterControlSessions()
+		}
+		for _, check := range doctor.AdapterControlChecks(input) {
+			report.Checks = append(report.Checks, check)
+			if check.Status == doctor.Fail {
+				report.OK = false
+			}
+		}
 	}
 	if s.Scheduler != nil {
 		failures := s.Scheduler.MaintenanceFailures()
@@ -875,4 +913,25 @@ func selectSourcePolicies(cfg config.Config, views []sourcePolicies) sourcePolic
 		return views[0]
 	}
 	return &cfg
+}
+
+// openAdapterControl loads the persisted signed adapter control and, when the
+// update check is on and this build embeds a control key, returns the runner
+// that fetches new documents on that check's cadence. A malformed embedded key
+// is a build defect and stops the daemon rather than silently disabling safety.
+func openAdapterControl(cfg config.Config) (*adaptercontrol.Service, *adaptercontrol.Runner, error) {
+	key, err := adaptercontrol.TrustedKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	service := adaptercontrol.Open(cfg.DataDir, key)
+	if !cfg.Updates.Check || !service.HasKey() {
+		return service, nil, nil
+	}
+	endpoint := cfg.Updates.ControlURL
+	if endpoint == "" {
+		endpoint = adaptercontrol.DefaultURL
+	}
+	service.SetFetchURL(endpoint)
+	return service, &adaptercontrol.Runner{Service: service, URL: endpoint}, nil
 }

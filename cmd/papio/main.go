@@ -48,9 +48,8 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	root := cli.NewRoot(os.Stdout, os.Stderr)
-	if err := root.ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "papio:", err)
-		os.Exit(1)
+	if code := cli.RunProcess(ctx); code != 0 {
+		cancel()
+		os.Exit(code)
 	}
 }

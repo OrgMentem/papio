@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"adapter_control_apply_result","msg_id":"adapter-control-0001","seq":1,"payload":{"request_id":"request-control-0001","control_sequence":3,"outcome":"ignored","suspended_hosts":[]}}

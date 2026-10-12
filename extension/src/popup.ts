@@ -45,6 +45,7 @@ import {
   type KeepaliveSnapshot,
 } from "./keepalive";
 import { renderPapio } from "./dom";
+import type { AdapterControlNotice } from "./control";
 import { formatShare, parseStatsReply, type AcquisitionStats } from "./stats";
 import { deliveryOriginsForHost, providerViewerPDFURL } from "./adapters/types";
 
@@ -108,6 +109,32 @@ export function renderDaemonStatus(
       line = "papio daemon isn't reachable";
       action = "run: papio daemon status";
       break;
+  }
+  card.hidden = line.length === 0;
+  renderPapio(message, line);
+  hint.textContent = action;
+}
+
+/** Plain-language diagnosis of signed adapter control (control.ts), shown under
+ * the daemon card. `paused` is the fail-closed state; `suspended` names the
+ * packaged adapters papio is deliberately not driving. Hidden when control has
+ * nothing to say, which includes every fresh install. */
+export function renderAdapterControlNotice(
+  doc: Document,
+  notice: AdapterControlNotice | undefined,
+): void {
+  const card = doc.getElementById("adapter-control-status");
+  const message = doc.getElementById("adapter-control-status-message");
+  const hint = doc.getElementById("adapter-control-status-hint");
+  if (!card || !message || !hint) return;
+  let line = "";
+  let action = "";
+  if (notice?.kind === "paused") {
+    line = "Automation paused: papio could not confirm its safety settings";
+    action = "papers still arrive for you to open — update papio and restart the daemon to resume";
+  } else if (notice?.kind === "suspended") {
+    line = `Automatic download is paused for: ${notice.adapters.join(", ")} (suspended by papio — assisted mode)`;
+    action = "open these papers yourself; papio resumes them when the suspension is lifted";
   }
   card.hidden = line.length === 0;
   renderPapio(message, line);
@@ -866,6 +893,8 @@ export type PopupSessionState = KeepaliveSnapshot & {
   releasedAuthJobsAt?: number | null;
   /** One independently probed state for every configured resolver origin. */
   origins?: KeepaliveOriginSnapshot[];
+  /** Signed adapter control diagnosis; absent when there is nothing to say. */
+  adapterControl?: AdapterControlNotice;
   /** Browser-local bindings between authentication demand and resolver origin. */
   authDemand?: SessionAuthDemand[];
   /** Present on current workers; absent preserves older-worker fallback. */
@@ -988,6 +1017,23 @@ function isSessionState(value: unknown): value is PopupSessionState {
   );
 }
 
+/** Control notice decoration on a session reply. Anything malformed is simply
+ * not shown: it is a diagnosis, never an input to a decision. */
+function isAdapterControlNotice(value: unknown): value is AdapterControlNotice {
+  if (typeof value !== "object" || value === null) return false;
+  const notice = value as Record<string, unknown>;
+  if (notice["kind"] === "paused") return Object.keys(notice).length === 1;
+  return (
+    notice["kind"] === "suspended" &&
+    Object.keys(notice).length === 2 &&
+    Array.isArray(notice["adapters"]) &&
+    notice["adapters"].length > 0 &&
+    notice["adapters"].every(
+      (id) => typeof id === "string" && /^[a-z0-9][a-z0-9_.-]{0,63}$/.test(id),
+    )
+  );
+}
+
 /** Shared reply validation for both the snapshot-only and probing session
  * messages — the background replies with the identical `{ state, origins }`
  * envelope either way. */
@@ -1023,8 +1069,12 @@ function parseSessionReply(response: unknown): PopupSessionState | undefined {
         const { authDemand: _ignored, ...withoutDemand } = state;
         return withoutDemand as PopupSessionState;
       })();
-  if (envelopeOrigins === undefined) return normalizedState;
-  return { ...normalizedState, origins: envelopeOrigins };
+  const adapterControl = envelope["adapterControl"];
+  const withControl = isAdapterControlNotice(adapterControl)
+    ? { ...normalizedState, adapterControl }
+    : normalizedState;
+  if (envelopeOrigins === undefined) return withControl;
+  return { ...withControl, origins: envelopeOrigins };
 }
 
 /** Pure snapshot read — never triggers a probe or content-script injection. */
@@ -4482,6 +4532,7 @@ export async function refresh(): Promise<void> {
     store,
   );
   renderInstitutionSession(document, session, openInstitutionSignIn, store.activeJobs);
+  renderAdapterControlNotice(document, session?.adapterControl);
   scheduleSessionProbeRetry(session, store.activeJobs);
   renderLeftoverTabs(document, orphanCount);
   renderNeedsAttention(

@@ -45,6 +45,11 @@ not reports). A list-shaped payload is always
 command summaries, with or without `query`; the commands returning a single record —
 `jobs get`, `doctor`, `status`, `batch report`, `zotio plan`, `inbox` —
 return that object directly, with no `truncated` key.
+A failing command exits `1` and, with `--json`, prints one line on stderr:
+`{"error":{"code":...,"message":...}}`. The `code` is the daemon's code (such as
+`not_found`), `daemon_unreachable`, `invalid_argument`, or `error`; the
+[JSON output contract](../reference/commands.md#json-output-contract) lists the
+optional fields.
 The MCP resources return the identical envelope, so one parser serves both
 surfaces. The generated
 [JSON output contract](../reference/commands.md#json-output-contract) is

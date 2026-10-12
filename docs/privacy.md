@@ -47,6 +47,7 @@ column lists anything else sent.
 | `api.openaire.eu` | your API token, if set | Resolving | **On** |
 | Publisher and repository hosts | — | Downloading the PDF | **On** |
 | `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **On** if you ran `papio init` (it enables `updates.check` unless you decline or pass `--check-updates=false`); the config key itself defaults to `false`. `updates.check = false` disables it |
+| `raw.githubusercontent.com` | **nothing** | Once a day, fetching the signed adapter control file that can suspend a broken browser adapter | Follows `updates.check`, and only in a build that embeds the *papio* control key. `updates.check = false` disables it |
 | Your webhook URL | job event and message | Job state changes | Off |
 
 ### Important details
@@ -56,12 +57,26 @@ it. Unpaywall and OpenAlex require an email address. Crossref and DOI lookup use
 when configured. Leaving it empty prevents Unpaywall and OpenAlex lookups.
 
 **Retraction checks.** Retraction checks download the Retraction Watch dataset and match the DOIs of papers *papio* acquired (or, with `retraction.scope = "library"`, your wider library) locally on your machine; the request carries no library DOIs, only your configured `email` as a `mailto` parameter when one is set. Disable them with
-`[sources.retraction_watch] enabled = false`.
+`[sources.retraction_watch] enabled = false`. With `zotio.retraction_tags = true`, a verified retraction is also written into your own Zotero library as the `papio:retracted` tag; that step looks up each retracted DOI through your local zotio and sends nothing to a third party.
 
 **Update checks.** The `updates.check` key defaults to `false`, but `papio init` enables it unless you decline the prompt or pass `--check-updates=false`. When enabled, update checks make an unauthenticated request to the public
 GitHub releases page. GitHub receives your IP address, as it would for any web
 request, but *papio* does not send your identifiers or usage information. Disable
 the check with `updates.check = false`.
+
+**Adapter control.** With the update check on, the daemon also fetches one small
+signed file from `raw.githubusercontent.com` once a day (change the address with
+`updates.control_url`). The request is an anonymous `GET`, like the release check:
+the host receives your IP address and nothing else, and *papio* sends no identifier,
+count, or usage information. The file can only name packaged adapter revisions and
+safety domains to *suspend*; it carries no host, selector, path, or URL for the
+browser to act on. The daemon accepts it only when an Ed25519 signature verifies
+against the *papio* control key built into the binary, and it never accepts an older
+file than the one it holds. A suspended adapter stops downloading by itself and the
+paper waits for you in the inbox; `papio doctor` names the suspension. A missing file
+(HTTP 404) means nothing is published. The browser extension makes no request of its
+own and keeps only the last accepted sequence number and a digest in its local
+storage.
 
 **Document delivery.** Document delivery is disabled unless you configure it. When
 enabled, *papio* contacts only the institution's configured delivery service and

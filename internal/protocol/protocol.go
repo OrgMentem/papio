@@ -949,6 +949,14 @@ const (
 	// chrome.management.getSelf() reports installType "development", so a
 	// store-installed copy can never be restarted by this frame.
 	MsgDevReload = "dev_reload"
+	// Signed adapter control (adapter_control.go). Three job-free frames: the
+	// extension asks for canonical control, the daemon answers with its
+	// verified suspension set, and the extension reports what it applied. They
+	// are gated by HelloAckPayload.AdapterControl, never by a feature flag (the
+	// list is full at its cap of 32).
+	MsgAdapterControlRequest     = "adapter_control_request"
+	MsgAdapterControlResponse    = "adapter_control_response"
+	MsgAdapterControlApplyResult = "adapter_control_apply_result"
 )
 
 // EffectPermitFeature negotiates durable reconciliation before an irreversible
@@ -1310,6 +1318,13 @@ type HelloAckPayload struct {
 	// generation — the daemon's own fence in surface_close_request and every
 	// other generation-carrying request still rejects a wrong value as stale.
 	BrowserHolderGeneration *int64 `json:"browser_holder_generation,omitempty"`
+	// AdapterControl tells an extension that this daemon answers
+	// adapter_control_request. It is a field on an existing strict frame, so
+	// the bridge emits it only to extensions at or above
+	// AdapterControlMinExtensionVersion; an older extension would reject the
+	// whole ack. The feature list is full at its fail-closed cap of 32, so a
+	// capability flag is the only negotiation channel left.
+	AdapterControl bool `json:"adapter_control,omitempty"`
 }
 
 // PageAcquirePayload asks the daemon to queue the paper identified on the
@@ -2649,7 +2664,8 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			return nil, fmt.Errorf("browser message: type %q requires a valid job_id", env.Type)
 		}
 	}
-	if (env.Type == MsgInstitutionalReconcileRequest || env.Type == MsgInstitutionalReconcileResponse || env.Type == MsgDevReload) && env.JobID != "" {
+	if (env.Type == MsgInstitutionalReconcileRequest || env.Type == MsgInstitutionalReconcileResponse || env.Type == MsgDevReload ||
+		env.Type == MsgAdapterControlRequest || env.Type == MsgAdapterControlResponse || env.Type == MsgAdapterControlApplyResult) && env.JobID != "" {
 		return nil, fmt.Errorf("browser message: type %q must not carry job_id", env.Type)
 	}
 
@@ -2771,7 +2787,7 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 		msg.Payload = p
 	case MsgHelloAck:
 		p := &HelloAckPayload{}
-		err = browserRejectNullFields(payloadFields, "daemon_version", "features", "resolver_origins", "role", "browser_holder_generation")
+		err = browserRejectNullFields(payloadFields, "daemon_version", "features", "resolver_origins", "role", "browser_holder_generation", "adapter_control")
 		var features []json.RawMessage
 		if raw, ok := payloadFields["features"]; ok && err == nil {
 			err = strictDecode(raw, &features)
@@ -3805,6 +3821,30 @@ func decodeBrowserMessage(data []byte, allowLegacyInstitutionalNavigation bool) 
 			if _, present := payloadFields["disposition"]; present {
 				err = p.validate()
 			}
+		}
+		msg.Payload = p
+	case MsgAdapterControlRequest:
+		p := &AdapterControlRequestPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "adapter_control_request",
+			[]string{"request_id", "last_control_sequence"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgAdapterControlResponse:
+		p := &AdapterControlResponsePayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "adapter_control_response",
+			[]string{"request_id", "state", "control_sequence", "suspensions_digest", "suspended_revisions", "suspended_safety_domains"}, p)
+		if err == nil {
+			err = p.validate()
+		}
+		msg.Payload = p
+	case MsgAdapterControlApplyResult:
+		p := &AdapterControlApplyResultPayload{}
+		err = decodeTriagePayload(env.Payload, payloadFields, "adapter_control_apply_result",
+			[]string{"request_id", "control_sequence", "outcome", "suspended_hosts"}, p)
+		if err == nil {
+			err = p.validate()
 		}
 		msg.Payload = p
 	case MsgDevReload:

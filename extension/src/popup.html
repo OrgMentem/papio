@@ -1048,6 +1048,12 @@
       <div id="daemon-status-message" class="daemon-status-message"></div>
       <div id="daemon-status-hint" class="daemon-status-hint"></div>
     </div>
+    <!-- Signed adapter control (src/control.ts): hidden until papio has
+         something to say, which excludes every fresh install. -->
+    <div id="adapter-control-status" class="daemon-status" role="status" aria-live="polite" hidden>
+      <div id="adapter-control-status-message" class="daemon-status-message"></div>
+      <div id="adapter-control-status-hint" class="daemon-status-hint"></div>
+    </div>
     <div id="open-inbox-status" class="capture-status"></div>
     <!-- Hidden and empty until renderWorkPulse has real state: a default line
          here is painted before the first read returns, so every popup opened

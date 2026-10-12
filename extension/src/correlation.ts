@@ -9,6 +9,7 @@ import {
   type BrowserMessage,
   type BrowserMessageType,
 } from "./protocol";
+import { ADAPTER_CONTROL_GATE } from "./control";
 import { PDF_GRAB_FEATURE, PDF_GRAB_SUGGEST_FEATURE } from "./deliver";
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -242,6 +243,16 @@ const REQUEST_POLICIES = {
     responseType: "provider_drive_epoch_start_result",
     feature: "provider_drive_epoch_v1",
     operation: "mutation",
+    transport: "single_attempt",
+  },
+  // Not a daemon feature string: the gate is the hello_ack `adapter_control`
+  // flag (control.ts), resolved by background.ts's `supportsFeature`. A single
+  // attempt, because a retry would reconnect a port whose hello already
+  // answered; the keepalive tick and the next hello_ack are the retries.
+  adapter_control_request: {
+    responseType: "adapter_control_response",
+    feature: ADAPTER_CONTROL_GATE,
+    operation: "read",
     transport: "single_attempt",
   },
 } as const satisfies Partial<Record<BrowserMessageType, RequestPolicy>>;

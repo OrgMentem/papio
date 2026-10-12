@@ -84,6 +84,7 @@ func newZotioCommand(opt *options) *cobra.Command {
 		},
 	}
 	tags.AddCommand(reconcile)
+	tags.AddCommand(newZotioTagsRetractionsCommand(opt))
 
 	command.AddCommand(plan, apply, newZotioImportBackfillCommand(opt))
 	command.AddCommand(preflight)

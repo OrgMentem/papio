@@ -15,6 +15,8 @@ This is the same envelope the MCP resources (`papio://jobs` and friends) already
 
 Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio batch report`, `papio zotio plan`, `papio inbox` — return that object directly; they are not list envelopes and carry no `truncated` key.
 
+A failing command in `--json` mode prints one line on stderr, `{"error":{"code":"not_found","message":"..."}}`, and exits `1`. `code` is the daemon's error code when the daemon refused the request, `daemon_unreachable` when no daemon answered, `invalid_argument` for a bad flag or argument count, and `error` otherwise; `class`, `hint`, and `http_status` appear when the daemon supplied them. A command that already printed its structured result to stdout and then exits `1` (for example `papio doctor` with a failing check) keeps the plain `papio: <message>` stderr line instead, so read its stdout. Without `--json`, stderr is always the plain `papio: <message>` line.
+
 ## Global flags
 
 These flags are available on every command. `--version` is not one of them: it is a root-only flag, so run `papio --version`, not `papio <subcommand> --version`.
@@ -1469,11 +1471,17 @@ papio notify show
 
 ### `papio notify test`
 
-Send one local notification test
+Send one local or webhook notification test
+
+Send one test notification for a category. By default the test goes to the local desktop channel. With --webhook it is posted once to the configured webhook in its configured notify.webhook_format, bypasses the ledger, and reports whether the endpoint answered with a 2xx status.
 
 ```
-papio notify test <category>
+papio notify test <category> [flags]
 ```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--webhook` | `bool` | `false` | send the test through the configured webhook instead of the desktop |
 
 ## `papio pulse`
 
@@ -1883,4 +1891,18 @@ Converge papio:needs-action / papio:unavailable tags with current job states
 ```
 papio zotio tags reconcile
 ```
+
+#### `papio zotio tags retractions`
+
+Preview or apply the papio:retracted tag on items with a verified retraction notice
+
+Previews by default: lists the Zotero items whose DOI exactly matches a current verified retraction notice and the papio-owned tags no longer warranted. --apply writes the automatic papio:retracted tag and removes only papio-owned ones. Corrections and expressions of concern are never tagged, a manual tag is never changed, and acknowledging the inbox alert does not remove the tag. With zotio.retraction_tags off, --apply only removes papio-owned tags.
+
+```
+papio zotio tags retractions [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--apply` | `bool` | `false` | Write the changes instead of only previewing them |
 

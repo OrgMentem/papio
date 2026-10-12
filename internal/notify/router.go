@@ -592,6 +592,40 @@ func (r *Router) Test(ctx context.Context, category Category) (string, error) {
 	return message, nil
 }
 
+// WebhookFormat reports the request format of the configured webhook, or ""
+// when no webhook is configured. Operator surfaces use it to show which shape
+// the receiver gets.
+func (r *Router) WebhookFormat() string {
+	if r == nil {
+		return ""
+	}
+	if sender, ok := r.webhook.(interface{ FormatName() string }); ok {
+		return sender.FormatName()
+	}
+	return ""
+}
+
+// ErrWebhookNotConfigured reports a webhook test with no webhook configured.
+var ErrWebhookNotConfigured = errors.New("no notification webhook is configured")
+
+// TestWebhook posts one explicit test event through the webhook leg without
+// creating a durable intent, so the receiver sees the same request shape a
+// real notification has. Unlike the desktop test it learns the outcome: a
+// transport error or non-2xx answer is returned.
+func (r *Router) TestWebhook(ctx context.Context, category Category) (string, error) {
+	if r == nil || r.webhook == nil {
+		return "", ErrWebhookNotConfigured
+	}
+	message, err := r.Preview(category, 1)
+	if err != nil {
+		return "", err
+	}
+	if err := r.deliverWebhook(ctx, Event{Kind: string(category), Message: message, Count: 1}); err != nil {
+		return message, err
+	}
+	return message, nil
+}
+
 // Table returns the router's effective category policy for read-only surfaces.
 func (r *Router) Table() []RouteRow {
 	if r == nil {

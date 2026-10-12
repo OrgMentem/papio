@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"adapter_control_request","msg_id":"adapter-control-0001","seq":1,"payload":{"request_id":"request-control-0001","last_control_sequence":0,"last_suspensions_digest":"d9ada45fb9029f57dacec82802fed8b4472457d678544901e1f283057552b028"}}

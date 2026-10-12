@@ -572,6 +572,7 @@ func applyInitConfig(cmd *cobra.Command, out io.Writer, cfg *config.Config, exis
 				cfg.Zotio.Executable = ""
 				cfg.Zotio.AutoImport = false
 				cfg.Zotio.ExceptionTags = false
+				cfg.Zotio.RetractionTags = false
 			} else {
 				cfg.Zotio.Executable = value
 			}

@@ -362,6 +362,17 @@ not retry the POST. If *papio* stops during a send, the result can be unknown.
 The receiver can use the key to detect repeat requests. Check the inbox and
 Activity for the durable outcome when a notification does not arrive.
 
+By default a webhook receives a JSON body. To post to a chat app, set
+`notify.webhook_format` to `ntfy` (an ntfy topic URL such as
+`https://ntfy.sh/your-topic`, with an optional bearer) or `slack` (a Slack
+incoming-webhook URL). The format renders the message, the event name, and the
+count in the target's own shape; the
+[configuration reference](../reference/config-reference.md#notify) lists the
+exact fields. `papio notify show` and `papio notify preview` print the format
+from your configuration file. `papio notify test request_outcome --webhook` posts one test
+notification in that format and reports whether the endpoint answered with a
+2xx status.
+
 ### Read the pulse for a batch
 
 For a one-shot daemon reading, run:
@@ -1001,6 +1012,26 @@ papio zotio tags reconcile
 ```
 
 The pass removes only automatic tags owned by papio.
+
+### Mark retracted papers in Zotero
+
+With `zotio.retraction_tags = true`, a Zotero item whose DOI exactly matches a
+current retraction notice gets the automatic tag `papio:retracted`. Corrections
+and expressions of concern are never tagged. Preview before you write:
+
+```sh
+papio zotio tags retractions            # preview only
+papio zotio tags retractions --apply    # write the tag
+```
+
+The preview works while the option is off, so you can review the effect before
+you enable it. With the option on, the daemon repeats the pass when the notice
+set changes and at most once a day. Acknowledging the inbox notice does not
+remove the tag. When a notice is withdrawn, or when you turn the option off and
+run `papio zotio tags retractions --apply`, *papio* removes only the tag it
+owns. A manual tag with the same name stays as it is. Items outside the
+retraction check's scope get no notice and no tag; set
+`retraction.scope = "library"` to cover your whole library.
 
 ### Triage failures
 

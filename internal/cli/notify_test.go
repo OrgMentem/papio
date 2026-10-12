@@ -99,3 +99,66 @@ func TestNotifyPreviewAndTestCommands(t *testing.T) {
 		t.Fatalf("methods = %v", methods)
 	}
 }
+
+// `notify test --webhook` must call the new webhook method (never widening
+// notify.test_v1), even where no desktop sender exists, and show/preview read
+// the format from the CLI's own config, so no daemon result grows a field.
+func TestNotifyWebhookFormatCommands(t *testing.T) {
+	var methods []string
+	stub := func(_ context.Context, method string, params any, result any) error {
+		methods = append(methods, method)
+		switch method {
+		case "notify.show_v1":
+			*result.(*api.NotifyShowResult) = api.NotifyShowResult{Preset: "milestones", Rows: []api.NotifyRouteRow{{Category: "request_outcome"}}}
+		case "notify.preview_v1":
+			*result.(*api.NotifyPreviewResult) = api.NotifyPreviewResult{Message: "preview copy"}
+		case "notify.webhook_test_v1":
+			if params.(api.NotifyWebhookTestParams).Category != "request_outcome" {
+				t.Errorf("params = %+v", params)
+			}
+			*result.(*api.NotifyWebhookTestResult) = api.NotifyWebhookTestResult{Message: "test copy", Format: "ntfy", Acknowledged: true, Detail: "posted to the configured webhook as ntfy"}
+		}
+		return nil
+	}
+	configured := config.Config{Notify: config.Notify{WebhookURL: "https://ntfy.example.test/topic", WebhookFormat: config.WebhookFormatNtfy}}
+	run := func(cfg config.Config, args ...string) string {
+		t.Helper()
+		var out bytes.Buffer
+		root := NewInProcessRoot(&out, &bytes.Buffer{}, cfg, stub)
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	if got := run(configured, "notify", "show"); !strings.Contains(got, "webhook_format: ntfy") {
+		t.Fatalf("show = %q", got)
+	}
+	if got := run(configured, "notify", "show", "--json"); !strings.Contains(got, `"webhook_format":"ntfy"`) {
+		t.Fatalf("show --json = %q", got)
+	}
+	if got := run(configured, "notify", "preview", "request_outcome"); !strings.Contains(got, "preview copy") || !strings.Contains(got, "webhook_format: ntfy") {
+		t.Fatalf("preview = %q", got)
+	}
+	if got := run(configured, "notify", "preview", "request_outcome", "--json"); !strings.Contains(got, `"webhook_format":"ntfy"`) || !strings.Contains(got, `"message":"preview copy"`) {
+		t.Fatalf("preview --json = %q", got)
+	}
+	// A webhook record is configured by reference; the default format is json.
+	byRecord := config.Config{Notify: config.Notify{WebhookCredentialRef: "env:PAPIO_WEBHOOK"}}
+	if got := run(byRecord, "notify", "show"); !strings.Contains(got, "webhook_format: json") {
+		t.Fatalf("show with a webhook record = %q", got)
+	}
+	// No webhook: nothing to report.
+	for _, args := range [][]string{{"notify", "show"}, {"notify", "preview", "request_outcome"}} {
+		if got := run(config.Config{}, args...); strings.Contains(got, "webhook_format") {
+			t.Fatalf("%v without a webhook = %q", args, got)
+		}
+	}
+	methods = nil
+	if got := run(configured, "notify", "test", "request_outcome", "--webhook"); !strings.Contains(got, "posted to the configured webhook as ntfy") {
+		t.Fatalf("test = %q", got)
+	}
+	if strings.Join(methods, ",") != "notify.webhook_test_v1" {
+		t.Fatalf("methods = %v, want only notify.webhook_test_v1", methods)
+	}
+}

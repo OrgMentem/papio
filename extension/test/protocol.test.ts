@@ -4266,3 +4266,408 @@ test("dev_reload frame with a job_id throws", () => {
     }),
   ).toThrow(ProtocolError);
 });
+
+// --- Signed adapter control (src/control.ts; internal/protocol/adapter_control.go)
+
+const CONTROL_DIGEST = "d9ada45fb9029f57dacec82802fed8b4472457d678544901e1f283057552b028";
+const EMPTY_CONTROL_DIGEST =
+  "efcac454b135229c85b492666dc43af4fdfe5e58afe2e7937b31e404ce1d2f27";
+
+type ControlType =
+  | "adapter_control_request"
+  | "adapter_control_response"
+  | "adapter_control_apply_result";
+
+const controlFrames: Record<ControlType, Record<string, unknown>[]> = {
+  adapter_control_request: [
+    { request_id: "control-req-001", last_control_sequence: 0 },
+    {
+      request_id: "control-req-002",
+      last_control_sequence: 7,
+      last_suspensions_digest: CONTROL_DIGEST,
+    },
+  ],
+  adapter_control_response: [
+    {
+      request_id: "control-req-001",
+      state: "none",
+      control_sequence: 0,
+      suspensions_digest: EMPTY_CONTROL_DIGEST,
+      suspended_revisions: [],
+      suspended_safety_domains: [],
+    },
+    {
+      request_id: "control-req-001",
+      state: "unavailable",
+      control_sequence: 0,
+      suspensions_digest: EMPTY_CONTROL_DIGEST,
+      suspended_revisions: [],
+      suspended_safety_domains: [],
+    },
+    {
+      request_id: "control-req-002",
+      state: "current",
+      control_sequence: 7,
+      suspensions_digest: CONTROL_DIGEST,
+      suspended_revisions: ["sciencedirect@0.3.0"],
+      suspended_safety_domains: ["publisher:www.sciencedirect.com"],
+    },
+    {
+      // A higher sequence that lifts everything is still "current".
+      request_id: "control-req-003",
+      state: "current",
+      control_sequence: 8,
+      suspensions_digest: EMPTY_CONTROL_DIGEST,
+      suspended_revisions: [],
+      suspended_safety_domains: [],
+    },
+  ],
+  adapter_control_apply_result: [
+    {
+      request_id: "control-req-002",
+      control_sequence: 7,
+      outcome: "applied",
+      suspended_hosts: ["sciencedirect.com", "www.sciencedirect.com"],
+    },
+    {
+      request_id: "control-req-002",
+      control_sequence: 9,
+      outcome: "rolled_back",
+      suspended_hosts: [],
+    },
+  ],
+};
+
+const controlResponse = (overrides: Record<string, unknown> = {}) => ({
+  ...controlFrames.adapter_control_response[2]!,
+  ...overrides,
+});
+const controlApply = (overrides: Record<string, unknown> = {}) => ({
+  ...controlFrames.adapter_control_apply_result[0]!,
+  ...overrides,
+});
+const padded = (index: number) => String(index).padStart(3, "0");
+
+test("adapter control frames round-trip with every field intact", () => {
+  for (const type of Object.keys(controlFrames) as ControlType[]) {
+    for (const payload of controlFrames[type]) {
+      const parsed = parseBrowserMessage(protocolFrame(type, payload));
+      expect(parsed.type).toBe(type);
+      expect(parsed.payload).toEqual(payload);
+      expect(parsed.job_id).toBeUndefined();
+      // Through the byte parser too: the wire form, not just the object form.
+      expect(
+        parseBrowserMessageBytes(JSON.stringify(protocolFrame(type, payload))).payload,
+      ).toEqual(payload);
+    }
+  }
+});
+
+test("adapter control frames are job-free and strict about unknown fields", () => {
+  for (const type of Object.keys(controlFrames) as ControlType[]) {
+    const payload = controlFrames[type][controlFrames[type].length - 1]!;
+    expect(
+      () => parseBrowserMessage({ ...protocolFrame(type, payload), job_id: "job-control-001" }),
+      `${type} with job_id`,
+    ).toThrow(ProtocolError);
+    expect(
+      () => parseBrowserMessage(protocolFrame(type, { ...payload, selector: "a.pdf" })),
+      `${type} with an unknown field`,
+    ).toThrow(ProtocolError);
+    for (const key of Object.keys(payload).filter((k) => k !== "last_suspensions_digest")) {
+      const { [key]: _omitted, ...without } = payload;
+      expect(
+        () => parseBrowserMessage(protocolFrame(type, without)),
+        `${type} without ${key}`,
+      ).toThrow(ProtocolError);
+      expect(
+        () => parseBrowserMessage(protocolFrame(type, { ...payload, [key]: null })),
+        `${type} with null ${key}`,
+      ).toThrow(ProtocolError);
+    }
+  }
+});
+
+test("adapter control request ids, sequences and the sequence-0 digest rule are enforced", () => {
+  const request = (overrides: Record<string, unknown>) =>
+    protocolFrame("adapter_control_request", {
+      request_id: "control-req-001",
+      last_control_sequence: 0,
+      ...overrides,
+    });
+  expect(parseBrowserMessage(request({})).payload["last_control_sequence"]).toBe(0);
+  expect(
+    parseBrowserMessage(request({ last_control_sequence: Number.MAX_SAFE_INTEGER })).payload[
+      "last_control_sequence"
+    ],
+  ).toBe(Number.MAX_SAFE_INTEGER);
+  for (const bad of [
+    { request_id: "short" },
+    { request_id: "x".repeat(129) },
+    { request_id: "has space 001" },
+    { request_id: 12345678 },
+    { last_control_sequence: -1 },
+    { last_control_sequence: 1.5 },
+    { last_control_sequence: Number.MAX_SAFE_INTEGER + 1 },
+    { last_control_sequence: "1" },
+    // The digest names a persisted sequence; at 0 there is none to name.
+    { last_suspensions_digest: CONTROL_DIGEST },
+    { last_control_sequence: 3, last_suspensions_digest: CONTROL_DIGEST.toUpperCase() },
+    { last_control_sequence: 3, last_suspensions_digest: CONTROL_DIGEST.slice(1) },
+    { last_control_sequence: 3, last_suspensions_digest: `${CONTROL_DIGEST}0` },
+    { last_control_sequence: 3, last_suspensions_digest: "" },
+    { last_control_sequence: 3, last_suspensions_digest: null },
+  ]) {
+    expect(() => parseBrowserMessage(request(bad)), JSON.stringify(bad)).toThrow(ProtocolError);
+  }
+  expect(
+    parseBrowserMessage(request({ request_id: "x".repeat(128) })).payload["request_id"],
+  ).toBe("x".repeat(128));
+});
+
+test("adapter control responses reject state and sequence inconsistencies", () => {
+  const none = controlFrames.adapter_control_response[0]!;
+  for (const bad of [
+    // none and unavailable carry no sequence and no suspensions.
+    { ...none, control_sequence: 1 },
+    { ...none, suspended_revisions: ["sciencedirect@0.3.0"] },
+    { ...none, suspended_safety_domains: ["publisher:www.sciencedirect.com"] },
+    { ...none, state: "unavailable", control_sequence: 4 },
+    { ...none, state: "unavailable", suspended_revisions: ["sciencedirect@0.3.0"] },
+    // current is a published sequence.
+    { ...controlResponse(), control_sequence: 0 },
+    { ...controlResponse(), state: "published" },
+    { ...controlResponse(), state: "CURRENT" },
+    { ...controlResponse(), control_sequence: -1 },
+    { ...controlResponse(), control_sequence: Number.MAX_SAFE_INTEGER + 1 },
+    { ...controlResponse(), control_sequence: 1.5 },
+  ]) {
+    expect(
+      () => parseBrowserMessage(protocolFrame("adapter_control_response", bad)),
+      JSON.stringify(bad),
+    ).toThrow(ProtocolError);
+  }
+});
+
+test("adapter control responses reject malformed digests, revisions and safety domains", () => {
+  for (const digest of [
+    CONTROL_DIGEST.toUpperCase(),
+    CONTROL_DIGEST.slice(0, 63),
+    `${CONTROL_DIGEST}0`,
+    "g".repeat(64),
+    "",
+    null,
+  ]) {
+    expect(
+      () =>
+        parseBrowserMessage(
+          protocolFrame("adapter_control_response", controlResponse({ suspensions_digest: digest })),
+        ),
+      `digest ${String(digest)}`,
+    ).toThrow(ProtocolError);
+  }
+  for (const revision of [
+    "sciencedirect",
+    "sciencedirect@",
+    "sciencedirect@1.0",
+    "sciencedirect@1.0.0.0",
+    "sciencedirect@v1.0.0",
+    "sciencedirect@1.0.0-rc1",
+    "ScienceDirect@1.0.0",
+    "-sciencedirect@1.0.0",
+    "@1.0.0",
+    `${"a".repeat(65)}@1.0.0`,
+    "science direct@1.0.0",
+    "sciencedirect@1.0.0\n",
+    7,
+    null,
+  ]) {
+    expect(
+      () =>
+        parseBrowserMessage(
+          protocolFrame("adapter_control_response", controlResponse({ suspended_revisions: [revision] })),
+        ),
+      `revision ${String(revision)}`,
+    ).toThrow(ProtocolError);
+  }
+  for (const domain of [
+    "www.sciencedirect.com",
+    "publisher:",
+    ":www.sciencedirect.com",
+    "Publisher:www.sciencedirect.com",
+    "publisher:WWW.sciencedirect.com",
+    "1publisher:www.sciencedirect.com",
+    "publisher:www sciencedirect.com",
+    `${"p".repeat(33)}:www.sciencedirect.com`,
+    `publisher:${"a".repeat(254)}`,
+    "publisher:a\n",
+    7,
+    null,
+  ]) {
+    expect(
+      () =>
+        parseBrowserMessage(
+          protocolFrame("adapter_control_response", controlResponse({ suspended_safety_domains: [domain] })),
+        ),
+      `domain ${String(domain)}`,
+    ).toThrow(ProtocolError);
+  }
+  for (const field of ["suspended_revisions", "suspended_safety_domains"]) {
+    for (const notAList of ["a@1.0.0", null, {}, 3]) {
+      expect(() =>
+        parseBrowserMessage(protocolFrame("adapter_control_response", controlResponse({ [field]: notAList }))),
+      ).toThrow(ProtocolError);
+    }
+  }
+});
+
+test("adapter control apply results reject malformed outcomes and host shapes", () => {
+  for (const outcome of ["APPLIED", "failed", "", "ok", null, 1]) {
+    expect(
+      () => parseBrowserMessage(protocolFrame("adapter_control_apply_result", controlApply({ outcome }))),
+      `outcome ${String(outcome)}`,
+    ).toThrow(ProtocolError);
+  }
+  for (const host of [
+    "ScienceDirect.com",
+    "sciencedirect.com.",
+    ".sciencedirect.com",
+    "-sciencedirect.com",
+    "sciencedirect-.com",
+    "science_direct.com",
+    "science direct.com",
+    "sciencedirect.com/path",
+    "sciencedirect.com:443",
+    "https://sciencedirect.com",
+    "a..b.com",
+    `${"a".repeat(64)}.com`,
+    "a.b.c.d.e.f.g.h.i.j.k",
+    "",
+    "sciencedirect.com\n",
+    7,
+    null,
+  ]) {
+    expect(
+      () =>
+        parseBrowserMessage(
+          protocolFrame("adapter_control_apply_result", controlApply({ suspended_hosts: [host] })),
+        ),
+      `host ${String(host)}`,
+    ).toThrow(ProtocolError);
+  }
+  // Only an applied outcome can name suspended hosts.
+  for (const outcome of ["missing", "rolled_back", "digest_mismatch", "unavailable"]) {
+    expect(parseBrowserMessage(protocolFrame("adapter_control_apply_result", controlApply({ outcome, suspended_hosts: [] }))).payload["outcome"]).toBe(outcome);
+    expect(
+      () =>
+        parseBrowserMessage(
+          protocolFrame("adapter_control_apply_result", controlApply({ outcome, suspended_hosts: ["sciencedirect.com"] })),
+        ),
+      outcome,
+    ).toThrow(ProtocolError);
+  }
+});
+
+test("adapter control lists must be sorted and unique", () => {
+  const response = (key: string, values: string[]) =>
+    protocolFrame("adapter_control_response", controlResponse({ [key]: values }));
+  const sorted = ["alpha@1.0.0", "beta@1.0.0"];
+  expect(parseBrowserMessage(response("suspended_revisions", sorted)).payload["suspended_revisions"]).toEqual(sorted);
+  for (const [key, ordered, bad] of [
+    ["suspended_revisions", sorted, ["beta@1.0.0", "alpha@1.0.0"]],
+    ["suspended_revisions", sorted, ["alpha@1.0.0", "alpha@1.0.0"]],
+    // Byte-wise: 1.10.0 sorts before 1.2.0, so numeric ordering is wrong.
+    ["suspended_revisions", ["alpha@1.10.0", "alpha@1.2.0"], ["alpha@1.2.0", "alpha@1.10.0"]],
+    ["suspended_safety_domains", ["kind:a", "kind:b"], ["kind:b", "kind:a"]],
+    ["suspended_safety_domains", ["kind:a", "kind:b"], ["kind:a", "kind:a"]],
+  ] as const) {
+    expect(() => parseBrowserMessage(response(key, [...ordered]))).not.toThrow();
+    expect(() => parseBrowserMessage(response(key, [...bad])), `${key} ${bad.join(",")}`).toThrow(
+      ProtocolError,
+    );
+  }
+  expect(() =>
+    parseBrowserMessage(
+      protocolFrame("adapter_control_apply_result", controlApply({ suspended_hosts: ["b.example.org", "a.example.org"] })),
+    ),
+  ).toThrow(ProtocolError);
+  expect(() =>
+    parseBrowserMessage(
+      protocolFrame("adapter_control_apply_result", controlApply({ suspended_hosts: ["a.example.org", "a.example.org"] })),
+    ),
+  ).toThrow(ProtocolError);
+});
+
+test("adapter control lists are capped at 64 entries", () => {
+  const revisions = (count: number) =>
+    Array.from({ length: count }, (_, index) => `adapter${padded(index)}@1.0.0`);
+  const domains = (count: number) =>
+    Array.from({ length: count }, (_, index) => `kind:domain${padded(index)}`);
+  const hosts = (count: number) =>
+    Array.from({ length: count }, (_, index) => `host${padded(index)}.example.org`);
+
+  expect(
+    parseBrowserMessage(
+      protocolFrame("adapter_control_response", controlResponse({ suspended_revisions: revisions(64) })),
+    ).payload["suspended_revisions"],
+  ).toHaveLength(64);
+  expect(() =>
+    parseBrowserMessage(
+      protocolFrame("adapter_control_response", controlResponse({ suspended_revisions: revisions(65) })),
+    ),
+  ).toThrow(ProtocolError);
+  expect(
+    parseBrowserMessage(
+      protocolFrame("adapter_control_response", controlResponse({ suspended_safety_domains: domains(64) })),
+    ).payload["suspended_safety_domains"],
+  ).toHaveLength(64);
+  expect(() =>
+    parseBrowserMessage(
+      protocolFrame("adapter_control_response", controlResponse({ suspended_safety_domains: domains(65) })),
+    ),
+  ).toThrow(ProtocolError);
+  expect(
+    parseBrowserMessage(
+      protocolFrame("adapter_control_apply_result", controlApply({ suspended_hosts: hosts(64) })),
+    ).payload["suspended_hosts"],
+  ).toHaveLength(64);
+  expect(() =>
+    parseBrowserMessage(
+      protocolFrame("adapter_control_apply_result", controlApply({ suspended_hosts: hosts(65) })),
+    ),
+  ).toThrow(ProtocolError);
+});
+
+test("hello_ack carries the adapter_control capability flag and stays strict", () => {
+  const ack = (payload: Record<string, unknown>) => protocolFrame("hello_ack", payload);
+  expect(parseBrowserMessage(ack({ adapter_control: true })).payload).toEqual({
+    adapter_control: true,
+  });
+  expect(
+    parseBrowserMessage(
+      ack({ daemon_version: "0.30.0", features: ["browser_handoff"], role: "holder", adapter_control: true }),
+    ).payload["adapter_control"],
+  ).toBe(true);
+  // Absence is the whole of "daemon_without_control".
+  expect(parseBrowserMessage(ack({})).payload).toEqual({});
+  for (const bad of [null, "true", 1, 0, {}, []]) {
+    expect(() => parseBrowserMessage(ack({ adapter_control: bad })), String(bad)).toThrow(ProtocolError);
+  }
+  // Neighbouring and misspelt flags are still unknown fields.
+  for (const unknown of ["adapter_controls", "adapter-control", "control", "ADAPTER_CONTROL"]) {
+    expect(() => parseBrowserMessage(ack({ [unknown]: true })), unknown).toThrow(ProtocolError);
+  }
+});
+
+test("the shared adapter control corpus fixtures parse and fail exactly as the Go side does", () => {
+  const read = (dir: string) =>
+    readdirSync(join(corpusRoot, dir))
+      .filter((name) => /^browser-(adapter-control|hello-ack-adapter-control)/u.test(name))
+      .map((name) => [name, readFileSync(join(corpusRoot, dir, name), "utf8")] as const);
+  const valid = read("valid");
+  const invalid = read("invalid");
+  expect(valid.length).toBeGreaterThanOrEqual(8);
+  expect(invalid.length).toBeGreaterThanOrEqual(10);
+  for (const [name, text] of valid) expect(() => parseBrowserMessageBytes(text), name).not.toThrow();
+  for (const [name, text] of invalid) expect(() => parseBrowserMessageBytes(text), name).toThrow(ProtocolError);
+});

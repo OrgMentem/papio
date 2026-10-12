@@ -340,8 +340,13 @@ and prompts, not reports, and print prose regardless.
   `inbox` return the object directly.
 - **Same shape over MCP** — the `papio://…` resources return the identical envelope, so one
   parser serves both surfaces.
-- **Exit status** — `0` on success; non-zero with a message on stderr otherwise. JSON goes
-  to stdout.
+- **Exit status** — `0` on success; `1` otherwise. JSON goes to stdout. With `--json` a
+  failure prints one line on stderr: `{"error":{"code":...,"message":...}}`, plus `class`,
+  `hint`, `http_status` when the daemon supplied them. `code` is the daemon's code
+  (`not_found`, `refused`, ...), `daemon_unreachable` when no daemon answered,
+  `invalid_argument` for a bad flag or argument count, else `error`. Commands that print
+  their result and then exit `1` (for example `doctor`) keep a plain `papio: <message>`
+  line instead; read their stdout. Without `--json` stderr is always the plain line.
 - **Non-interactive** — nothing prompts once you supply the input, but input is
   positional as well as flagged (`jobs get <id>`, `search "<query>"`); read the command's
   help rather than assuming flags. Avoid `status --follow` (it never returns) and `init`

@@ -1,0 +1,1 @@
+{"protocol":"papio-browser/1","type":"hello_ack","msg_id":"adapter-control-0001","seq":1,"payload":{"daemon_version":"0.23.0","adapter_control":true}}

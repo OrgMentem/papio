@@ -11,6 +11,28 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **Webhooks can post to ntfy and Slack.** Set `notify.webhook_format` to
+  `ntfy` (plain-text body with Title, Tags and Priority headers; Bearer auth
+  works) or `slack` (an incoming-webhook `{"text": ...}` body). `json` stays the
+  default, and an unknown value is rejected. `papio notify test <category>
+  --webhook` posts one test notification in that format.
+- **Retracted papers can carry a `papio:retracted` tag in Zotero.** Turn on
+  `zotio.retraction_tags`, or preview and apply once with `papio zotio tags
+  retractions [--apply]`. Only items whose DOI exactly matches a retraction
+  notice are tagged; corrections and expressions of concern are not, a manual
+  tag of the same name is never touched, and acknowledging the inbox alert
+  keeps the tag. Turning the option off removes only tags *papio* added.
+- **With `--json`, a failed command prints a structured error on stderr:**
+  `{"error":{"code":...,"message":...}}`, with `class`, `hint` and
+  `http_status` when the daemon gave them. `code` is the daemon's code (for
+  example `not_found`), `daemon_unreachable`, `invalid_argument`, or `error`.
+  The exit code is still 1, and output without `--json` is unchanged.
+- **Signed adapter suspension.** The daemon can fetch a signed control document
+  (`updates.control_url`, only while update checks are on) that suspends exact
+  packaged adapter revisions or safety domains. A suspended adapter falls back
+  to assisted operation; the document can never add behaviour. `papio doctor`
+  reports the control state. Nothing is fetched until a release embeds the
+  control public key.
 - Added confirmed archive/restore commands for validated acquisitions.
   Archive retains artifact and identity evidence, excludes jobs from ready
   views and import backfill, and clears uncollected warnings without a fake

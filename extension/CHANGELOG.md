@@ -17,6 +17,11 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+- **The extension honours a signed adapter suspension from the daemon.** A
+  suspended adapter revision stops automatic effects and falls back to
+  assisted operation, and the popup says why. Once the extension has applied
+  a suspension, it runs nothing automatic while the daemon's control state is
+  missing or older than what it has seen. Needs a daemon with adapter control.
 - **The article agent can take the one PDF link on a page that names no
   DOI.** Aggregator record pages (ProQuest, EBSCO, Informit) and some
   publisher pages state no DOI at all, so the agent stopped there. Now, on

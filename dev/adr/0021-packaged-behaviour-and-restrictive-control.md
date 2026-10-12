@@ -72,13 +72,30 @@ the sole distribution channel.
    the maintainer queue in front of it is removed.
 4. **Signed control is restrictive-only in its first version.** One online
    *papio* control key signs a monotonic-sequence document that may suspend
-   or revoke exact packaged revision IDs and safety domains — nothing that
-   names hosts, selectors, paths, methods, text, or thresholds. The daemon
-   holds canonical verified control; the extension persists only
-   `{last_sequence, revoked_ids}` and executes no positive effect when daemon
-   state is missing or rolled back. Compromise of the key can only reduce
-   automation. Positive activation of packaged-but-inactive revisions is
-   deferred behind a reviewer-visible policy pilot on both stores.
+   exact packaged revision IDs and safety domains, and a higher sequence
+   replaces the whole set, which lifts a suspension. It names nothing else:
+   no hosts, selectors, paths, methods, text, or thresholds. Permanent
+   revocation waits for an offline root. The daemon holds canonical verified
+   control; the extension persists only
+   `{last_sequence, last_verified_suspensions_digest}` and executes no
+   positive effect when daemon state is missing or rolled back below that
+   sequence. Compromise of the key can only reduce automation. Positive
+   activation of packaged-but-inactive revisions is deferred behind a
+   reviewer-visible policy pilot on both stores.
+
+   Shipped shape: Ed25519, with the public key embedded in the daemon
+   (`internal/adaptercontrol/trust.go`) and the private key held by the
+   maintainer's `cmd/papio-control` tool, never in the repository. The signed
+   file is `control/adapter-control.json`, fetched by the daemon over HTTPS
+   on the update check's cadence and only while that check is on. A 404 means
+   nothing is published and is not a failure; a document that fails
+   verification, replays, or carries an older sequence is refused and never
+   relaxes held state. The extension is gated by version, not by a feature
+   flag (the `hello_ack` feature list is full at its cap of 32): the daemon
+   adds `adapter_control` to `hello_ack` for extensions at or above 0.16.0.
+   A suspended revision, or any browser that has not applied the sequence the
+   daemon holds, gets no automatic offer or effect permit and falls back to
+   assisted operation.
 5. **Existing transmissions get declared before any reporting ships.**
    Mozilla treats data sent to native applications as transmission requiring
    declaration and consent; classifying the extension's current

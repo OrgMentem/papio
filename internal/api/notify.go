@@ -148,3 +148,47 @@ func notifyTest(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 	}
 	return marshal(NotifyTestResult{Category: string(category), Message: message, Attempted: true, DeliveryAcknowledged: false, Detail: "sent to the configured local platform channel; the platform provides no delivery acknowledgement"})
 }
+
+// NotifyWebhookTestParams is the request of notify.webhook_test_v1. It is a
+// separate method so notify.test_v1 keeps its exact params and result for
+// older CLI binaries.
+type NotifyWebhookTestParams struct {
+	Category string `json:"category"`
+}
+
+// NotifyWebhookTestResult reports one explicit webhook test. Unlike the
+// desktop test, the daemon learns the endpoint's answer, so Acknowledged is
+// true only after a 2xx status.
+type NotifyWebhookTestResult struct {
+	Category     string `json:"category"`
+	Message      string `json:"message"`
+	Format       string `json:"format"`
+	Acknowledged bool   `json:"acknowledged"`
+	Detail       string `json:"detail"`
+}
+
+// notifyWebhookTest posts one test event through the webhook leg. The error
+// from the sender is not echoed: a transport error carries the endpoint URL,
+// whose path or query can be a secret.
+func notifyWebhookTest(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params NotifyWebhookTestParams
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if system == nil || system.Notify == nil {
+		return notifyUnavailable()
+	}
+	category, rpcErr := decodeNotifyCategory(params.Category)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	message, err := system.Notify.TestWebhook(ctx, category)
+	switch {
+	case errors.Is(err, notify.ErrWebhookNotConfigured):
+		return nil, &ipc.RPCError{Code: "unavailable", Message: err.Error() + "; set notify.webhook_url or a webhook credential"}
+	case err != nil:
+		return nil, &ipc.RPCError{Code: "unavailable", Message: "the webhook endpoint did not accept the test notification (transport error or non-2xx answer)"}
+	}
+	format := system.Notify.WebhookFormat()
+	return marshal(NotifyWebhookTestResult{Category: string(category), Message: message, Format: format, Acknowledged: true, Detail: "posted to the configured webhook as " + format + "; the endpoint answered with a 2xx status"})
+}

@@ -26,6 +26,7 @@ import {
   renderNeedsAttention,
   grantProviderAccess,
   renderDaemonStatus,
+  renderAdapterControlNotice,
   renderPageContext,
   renderPageAcquire,
   renderImpactSummary,
@@ -3602,6 +3603,81 @@ test("malformed demand metadata falls back to the legacy session state", async (
   expect(state).toBeDefined();
   expect(state?.authDemand).toBeUndefined();
   expect(state?.resolverOrigin).toBe("https://resolver.example.edu");
+});
+test("signed adapter control is diagnosed in plain language and hidden when there is nothing to say", async () => {
+  const doc = popupDocument();
+  const card = doc.getElementById("adapter-control-status");
+  expect(card?.hidden).toBe(true);
+
+  renderAdapterControlNotice(doc, undefined);
+  expect(card?.hidden).toBe(true);
+
+  renderAdapterControlNotice(doc, { kind: "paused" });
+  expect(card?.hidden).toBe(false);
+  expect(doc.getElementById("adapter-control-status-message")?.textContent).toBe(
+    "Automation paused: papio could not confirm its safety settings",
+  );
+
+  renderAdapterControlNotice(doc, { kind: "suspended", adapters: ["sciencedirect", "jstor"] });
+  expect(card?.hidden).toBe(false);
+  expect(doc.getElementById("adapter-control-status-message")?.textContent).toBe(
+    "Automatic download is paused for: sciencedirect, jstor (suspended by papio — assisted mode)",
+  );
+  expect(doc.getElementById("adapter-control-status-hint")?.textContent).toContain("open these papers yourself");
+  // The daemon card is a different story and is left alone.
+  expect(doc.getElementById("daemon-status")?.hidden).toBe(true);
+
+  renderAdapterControlNotice(doc, undefined);
+  expect(card?.hidden).toBe(true);
+  expect(doc.getElementById("adapter-control-status-message")?.textContent).toBe("");
+});
+
+test("a session reply carries a well-formed control notice and drops a malformed one without losing the session", async () => {
+  const reply = (adapterControl: unknown) => ({ ...sessionReplyFixture(), adapterControl });
+  const ask = async (adapterControl: unknown) => {
+    Object.assign(globalThis, {
+      chrome: { runtime: { sendMessage: async () => reply(adapterControl) } },
+    });
+    return requestSessionState();
+  };
+
+  expect((await ask({ kind: "paused" }))?.adapterControl).toEqual({ kind: "paused" });
+  expect((await ask({ kind: "suspended", adapters: ["sciencedirect"] }))?.adapterControl).toEqual({
+    kind: "suspended",
+    adapters: ["sciencedirect"],
+  });
+  for (const malformed of [
+    { kind: "paused", extra: true },
+    { kind: "suspended", adapters: [] },
+    { kind: "suspended", adapters: ["<b>x</b>"] },
+    { kind: "suspended", adapters: [7] },
+    { kind: "suspended", adapters: ["alpha"], extra: true },
+    { kind: "unknown" },
+    "paused",
+    null,
+  ]) {
+    const state = await ask(malformed);
+    // A diagnosis, never a decision input: dropped, session intact.
+    expect(state, JSON.stringify(malformed)).toBeDefined();
+    expect(state?.adapterControl, JSON.stringify(malformed)).toBeUndefined();
+    expect(state?.resolverOrigin).toBe("https://resolver.example.edu");
+  }
+});
+
+test("the popup paints the control notice from the session reply on refresh", async () => {
+  const paused = await popupRefreshHarness(() => ({
+    ...sessionReplyFixture(),
+    adapterControl: { kind: "paused" },
+  }));
+  await paused.refresh();
+  expect(paused.document.getElementById("adapter-control-status")?.hidden).toBe(false);
+  expect(paused.document.getElementById("adapter-control-status-message")?.textContent).toBe(
+    "Automation paused: papio could not confirm its safety settings",
+  );
+
+  const quiet = await popupRefreshHarness();
+  await quiet.refresh();
+  expect(quiet.document.getElementById("adapter-control-status")?.hidden).toBe(true);
 });
 test("rejects malformed core and per-origin session origins", async () => {
   const malformedOrigins = [

@@ -384,6 +384,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"notify.test_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return notifyTest(ctx, raw, system)
 		},
+		"notify.webhook_test_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return notifyWebhookTest(ctx, raw, system)
+		},
 		"stats.page_bulk": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return pageBulkStats(ctx, raw, system)
 		},
@@ -560,6 +563,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		},
 		"zotio.tags.reconcile": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return zotioTagsReconcile(ctx, raw, system)
+		},
+		"zotio.tags.retractions": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return zotioTagsRetractions(ctx, raw, system)
 		},
 		"browser.sync": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return browserSync(ctx, raw, system)
@@ -1980,6 +1986,20 @@ func zotioTagsReconcile(ctx context.Context, raw json.RawMessage, system *bootst
 		return badParams(err)
 	}
 	result, err := system.Zotio.ReconcileTags(ctx)
+	if err != nil {
+		return zotioFailure(err)
+	}
+	return marshal(result)
+}
+
+func zotioTagsRetractions(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		Apply bool `json:"apply"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	result, err := system.Zotio.ReconcileRetractionTags(ctx, params.Apply)
 	if err != nil {
 		return zotioFailure(err)
 	}

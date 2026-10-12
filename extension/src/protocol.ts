@@ -117,6 +117,11 @@ export type BrowserMessageType =
   | "surface_close_response"
   // daemon-to-extension development-mode reload command
   | "dev_reload"
+  // Signed adapter control (ADR-0021 Decision 4): three job-free frames,
+  // sent only after a hello_ack that carried `adapter_control: true`.
+  | "adapter_control_request"
+  | "adapter_control_response"
+  | "adapter_control_apply_result"
   | "authentication_claim_request"
   | "authentication_claim_response"
   | "claim_observation"
@@ -155,6 +160,12 @@ export interface HelloAckPayload {
    * it connects, without waiting on an unrelated claim/materialization round
    * trip to first learn the generation. */
   browser_holder_generation?: number;
+  /** Capability flag, present only as `true`: this daemon answers
+   * `adapter_control_request`. It is a field rather than a feature-list entry
+   * because the daemon's list is full at its cap, and the extension must not
+   * send the three adapter-control frames to a daemon that omits it (an older
+   * daemon rejects an unknown frame type as fatal). */
+  adapter_control?: boolean;
 }
 
 export interface PageAcquirePayload {
@@ -1344,6 +1355,45 @@ export interface DevReloadPayload {
   reload_id: string;
 }
 
+/** Extension-to-daemon: asks for the daemon's canonical signed adapter
+ * control. Carries only what the extension persisted. The digest is omitted
+ * when the sequence is 0. */
+export interface AdapterControlRequestPayload {
+  request_id: string;
+  last_control_sequence: number;
+  last_suspensions_digest?: string;
+}
+
+export type AdapterControlState = "none" | "current" | "unavailable";
+
+/** Daemon-to-extension: the verified, restrictive-only control for this
+ * session. "none" and "unavailable" carry sequence 0 and empty lists. */
+export interface AdapterControlResponsePayload {
+  request_id: string;
+  state: AdapterControlState;
+  control_sequence: number;
+  suspensions_digest: string;
+  suspended_revisions: string[];
+  suspended_safety_domains: string[];
+}
+
+export type AdapterControlOutcome =
+  | "applied"
+  | "missing"
+  | "rolled_back"
+  | "digest_mismatch"
+  | "unavailable";
+
+/** Extension-to-daemon, one way: what this session did with the response.
+ * `suspended_hosts` is derived from the extension's own packaged adapters and
+ * is empty unless the outcome is "applied". */
+export interface AdapterControlApplyResultPayload {
+  request_id: string;
+  control_sequence: number;
+  outcome: AdapterControlOutcome;
+  suspended_hosts: string[];
+}
+
 export interface InstitutionalBindingPair {
   binding_id: string;
   tab_id: number;
@@ -1633,6 +1683,9 @@ const MSG_TYPES: Record<BrowserMessageType, true> = {
   surface_close_request: true,
   surface_close_response: true,
   dev_reload: true,
+  adapter_control_request: true,
+  adapter_control_response: true,
+  adapter_control_apply_result: true,
   authentication_claim_request: true,
   authentication_claim_response: true,
   claim_observation: true,
@@ -1702,6 +1755,19 @@ const MSG_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const WIRE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const CLIENT_FEATURE_RE = /^[a-z0-9_]+$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+// Signed adapter control (mirrors internal/protocol/adapter_control.go: one
+// constant per bound and one grammar per ID).
+export const MAX_ADAPTER_CONTROL_REVISIONS = 64;
+export const MAX_ADAPTER_CONTROL_DOMAINS = 64;
+export const MAX_ADAPTER_CONTROL_HOSTS = 64;
+const ADAPTER_CONTROL_REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+const ADAPTER_CONTROL_DIGEST_RE = /^[0-9a-f]{64}$/;
+const ADAPTER_REVISION_ID_RE =
+  /^[a-z0-9][a-z0-9_.-]{0,63}@[0-9]+\.[0-9]+\.[0-9]+$/;
+const ADAPTER_SAFETY_DOMAIN_ID_RE =
+  /^[a-z][a-z0-9_]{0,31}:[a-z0-9._-]{1,253}$/;
+const ADAPTER_CONTROL_HOST_RE =
+  /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?){0,8}$/;
 const ZOTERO_KEY_RE = /^[A-Za-z0-9]{1,32}$/;
 // HELLO_ACK_FEATURES_ACCEPT_CAP is the extension's accept-side bound on
 // hello_ack.features — deliberately wider than the 32-feature bound every
@@ -2721,6 +2787,51 @@ function triageResult(p: Record<string, unknown>, what: string): void {
     fail(`${what}.outcome is invalid`);
   if ("detail" in p) triageText(p, "detail", what, 1000);
 }
+function adapterControlRequestID(
+  obj: Record<string, unknown>,
+  what: string,
+): string {
+  const value = str(obj, "request_id", what, 128);
+  if (!ADAPTER_CONTROL_REQUEST_ID_RE.test(value))
+    fail(`${what}.request_id must match the request_id charset (8..128 chars)`);
+  return value;
+}
+
+function adapterControlDigest(
+  obj: Record<string, unknown>,
+  key: string,
+  what: string,
+): string {
+  const value = str(obj, key, what, 64);
+  if (!ADAPTER_CONTROL_DIGEST_RE.test(value))
+    fail(`${what}.${key} must be 64 lowercase hex characters`);
+  return value;
+}
+
+/** A bounded, sorted, unique list of IDs matching one grammar. Order is plain
+ * code-unit order; every accepted ID is ASCII, so it equals Go's byte order. */
+function adapterControlIDList(
+  obj: Record<string, unknown>,
+  key: string,
+  what: string,
+  max: number,
+  pattern: RegExp,
+): string[] {
+  const value = obj[key];
+  if (!Array.isArray(value)) fail(`${what}.${key} must be an array`);
+  if (value.length > max) fail(`${what}.${key} exceeds ${max} entries`);
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !pattern.test(entry))
+      fail(`${what}.${key} entries must be valid IDs`);
+    const previous = out[out.length - 1];
+    if (previous !== undefined && previous >= entry)
+      fail(`${what}.${key} must be sorted and unique`);
+    out.push(entry);
+  }
+  return out;
+}
+
 function institutionalID(
   obj: Record<string, unknown>,
   key: string,
@@ -2836,7 +2947,10 @@ export function parseBrowserMessageWithLegacyInstitutionalNavigation(
   if (
     (type === "institutional_reconcile_request" ||
       type === "institutional_reconcile_response" ||
-      type === "dev_reload") &&
+      type === "dev_reload" ||
+      type === "adapter_control_request" ||
+      type === "adapter_control_response" ||
+      type === "adapter_control_apply_result") &&
     jobID !== undefined
   ) {
     fail(`type ${type} must not carry job_id`);
@@ -4462,6 +4576,7 @@ function validatePayload(
         resolver_origins: "optional",
         role: "optional",
         browser_holder_generation: "optional",
+        adapter_control: "optional",
       });
       if ("daemon_version" in p) str(p, "daemon_version", "hello_ack", 50);
       if ("features" in p) {
@@ -4530,6 +4645,10 @@ function validatePayload(
             "hello_ack.browser_holder_generation must not accompany a pending role",
           );
       }
+      // A bare capability flag. The daemon emits it only as `true`, and only
+      // to extensions that know it; the extension acts on `=== true` alone.
+      if ("adapter_control" in p && typeof p["adapter_control"] !== "boolean")
+        fail("hello_ack.adapter_control must be a boolean");
       break;
     }
     case "triage_snapshot_request": {
@@ -6662,6 +6781,92 @@ function validatePayload(
         reload_id: "required",
       });
       institutionalID(p, "reload_id", type);
+      break;
+    }
+    case "adapter_control_request": {
+      requireFields<AdapterControlRequestPayload>(p, type, {
+        request_id: "required",
+        last_control_sequence: "required",
+        last_suspensions_digest: "optional",
+      });
+      adapterControlRequestID(p, type);
+      const sequence = int(p, "last_control_sequence", type, 0);
+      if ("last_suspensions_digest" in p) {
+        adapterControlDigest(p, "last_suspensions_digest", type);
+        // A digest names a persisted sequence; at sequence 0 nothing was
+        // ever persisted, so the field is omitted, never empty.
+        if (sequence === 0)
+          fail(`${type}.last_suspensions_digest requires a non-zero sequence`);
+      }
+      break;
+    }
+    case "adapter_control_response": {
+      requireFields<AdapterControlResponsePayload>(p, type, {
+        request_id: "required",
+        state: "required",
+        control_sequence: "required",
+        suspensions_digest: "required",
+        suspended_revisions: "required",
+        suspended_safety_domains: "required",
+      });
+      adapterControlRequestID(p, type);
+      const state = str(p, "state", type, 16);
+      if (state !== "none" && state !== "current" && state !== "unavailable")
+        fail(`${type}.state is invalid`);
+      const sequence = int(p, "control_sequence", type, 0);
+      adapterControlDigest(p, "suspensions_digest", type);
+      const revisions = adapterControlIDList(
+        p,
+        "suspended_revisions",
+        type,
+        MAX_ADAPTER_CONTROL_REVISIONS,
+        ADAPTER_REVISION_ID_RE,
+      );
+      const domains = adapterControlIDList(
+        p,
+        "suspended_safety_domains",
+        type,
+        MAX_ADAPTER_CONTROL_DOMAINS,
+        ADAPTER_SAFETY_DOMAIN_ID_RE,
+      );
+      if (state === "current") {
+        if (sequence < 1) fail(`${type}.current requires control_sequence >= 1`);
+      } else if (
+        sequence !== 0 ||
+        revisions.length !== 0 ||
+        domains.length !== 0
+      ) {
+        fail(`${type}.${state} forbids a sequence or suspensions`);
+      }
+      break;
+    }
+    case "adapter_control_apply_result": {
+      requireFields<AdapterControlApplyResultPayload>(p, type, {
+        request_id: "required",
+        control_sequence: "required",
+        outcome: "required",
+        suspended_hosts: "required",
+      });
+      adapterControlRequestID(p, type);
+      int(p, "control_sequence", type, 0);
+      const outcome = str(p, "outcome", type, 20);
+      if (
+        outcome !== "applied" &&
+        outcome !== "missing" &&
+        outcome !== "rolled_back" &&
+        outcome !== "digest_mismatch" &&
+        outcome !== "unavailable"
+      )
+        fail(`${type}.outcome is invalid`);
+      const hosts = adapterControlIDList(
+        p,
+        "suspended_hosts",
+        type,
+        MAX_ADAPTER_CONTROL_HOSTS,
+        ADAPTER_CONTROL_HOST_RE,
+      );
+      if (outcome !== "applied" && hosts.length !== 0)
+        fail(`${type}.${outcome} forbids suspended_hosts`);
       break;
     }
     case "authentication_claim_request": {

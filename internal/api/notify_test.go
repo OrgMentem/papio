@@ -5,6 +5,9 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -152,5 +155,86 @@ func TestNotifyMethodsRejectUnknownCategoryAndUnavailableSender(t *testing.T) {
 	_, rpcErr = notifyTest(context.Background(), []byte(`{"category":"request_outcome"}`), system)
 	if rpcErr == nil || rpcErr.Code != "unavailable" || !strings.Contains(rpcErr.Message, "desktop notification") {
 		t.Fatalf("test error = %#v", rpcErr)
+	}
+}
+
+func TestNotifyWebhookTestMethod(t *testing.T) {
+	type seen struct{ title, body string }
+	requests := make(chan seen, 2)
+	status := http.StatusNoContent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- seen{title: r.Header.Get("Title"), body: string(body)}
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.Notify.WebhookFormat = config.WebhookFormatNtfy
+	policy, _ := notify.ResolvePolicy(cfg.Notify)
+	sender := notify.NewWebhook(server.URL+"/private-topic-token", "")
+	sender.Format = cfg.Notify.EffectiveWebhookFormat()
+	system := &bootstrap.System{Config: cfg, Notify: notify.NewRouter(notify.RouterOptions{Policy: policy, Webhook: sender})}
+
+	// The existing results keep their exact field set: an older CLI decodes
+	// them with DisallowUnknownFields, so a configured webhook must not add
+	// a field to either.
+	assertKeys := func(name string, raw []byte, want ...string) {
+		t.Helper()
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil {
+			t.Fatal(err)
+		}
+		if len(object) != len(want) {
+			t.Fatalf("%s keys = %v, want exactly %v", name, object, want)
+		}
+		for _, key := range want {
+			if _, ok := object[key]; !ok {
+				t.Fatalf("%s keys = %v, want %v", name, object, want)
+			}
+		}
+	}
+	showRaw, rpcErr := notifyShow(context.Background(), []byte(`{}`), system)
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	assertKeys("show", showRaw, "preset", "rows")
+	previewRaw, rpcErr := notifyPreview(context.Background(), []byte(`{"category":"request_outcome"}`), system)
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	assertKeys("preview", previewRaw, "category", "count", "message")
+	if len(requests) != 0 {
+		t.Fatal("show/preview sent a request")
+	}
+
+	testRaw, rpcErr := notifyWebhookTest(context.Background(), []byte(`{"category":"request_outcome"}`), system)
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	var result NotifyWebhookTestResult
+	if err := json.Unmarshal(testRaw, &result); err != nil || !result.Acknowledged || result.Format != "ntfy" {
+		t.Fatalf("test = %+v err=%v", result, err)
+	}
+	got := <-requests
+	if got.title != "papio: request_outcome" || got.body != result.Message {
+		t.Fatalf("request = %+v, want ntfy title and the previewed message", got)
+	}
+
+	// A refused delivery is reported without echoing the endpoint URL, whose
+	// path can be a secret.
+	status = http.StatusInternalServerError
+	_, rpcErr = notifyWebhookTest(context.Background(), []byte(`{"category":"request_outcome"}`), system)
+	if rpcErr == nil || rpcErr.Code != "unavailable" || strings.Contains(rpcErr.Message, "private-topic-token") {
+		t.Fatalf("failed webhook test = %+v", rpcErr)
+	}
+
+	// No webhook configured: a typed unavailable error, never the desktop path.
+	_, rpcErr = notifyWebhookTest(context.Background(), []byte(`{"category":"request_outcome"}`), testNotifySystem(&notifyTestSender{}))
+	if rpcErr == nil || rpcErr.Code != "unavailable" || !strings.Contains(rpcErr.Message, "no notification webhook") {
+		t.Fatalf("unconfigured webhook test = %+v", rpcErr)
+	}
+	if _, rpcErr = notifyWebhookTest(context.Background(), []byte(`{"category":"bogus"}`), system); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("unknown category = %+v, want invalid_argument", rpcErr)
 	}
 }

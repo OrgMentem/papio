@@ -314,7 +314,7 @@ func (s *Service) keepMissingPDFs(ctx context.Context, desired map[string]string
 }
 
 func (s *Service) tagLedger(ctx context.Context) (map[string]tagLedgerState, error) {
-	rows, err := s.Store.DB().QueryContext(ctx, `SELECT item_key, tag, status FROM zotio_tag_state`)
+	rows, err := s.Store.DB().QueryContext(ctx, `SELECT item_key, tag, status FROM zotio_tag_state WHERE item_key NOT LIKE ?`, retractionLedgerPrefix+"%")
 	if err != nil {
 		return nil, fmt.Errorf("reading tag ledger: %w", err)
 	}
@@ -420,7 +420,7 @@ func (s *Service) TagReconciler() *TagReconciler {
 	}
 	if !s.ExceptionTags {
 		var exists int
-		err := s.Store.DB().QueryRow(`SELECT 1 FROM zotio_tag_state LIMIT 1`).Scan(&exists)
+		err := s.Store.DB().QueryRow(`SELECT 1 FROM zotio_tag_state WHERE item_key NOT LIKE ? LIMIT 1`, retractionLedgerPrefix+"%").Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}

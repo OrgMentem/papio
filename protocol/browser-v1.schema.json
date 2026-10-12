@@ -111,7 +111,10 @@
         "authentication_claim_response",
         "claim_observation",
         "claim_observation_ack",
-        "dev_reload"
+        "dev_reload",
+        "adapter_control_request",
+        "adapter_control_response",
+        "adapter_control_apply_result"
       ]
     },
     "msg_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$" },
@@ -2207,7 +2210,14 @@
     {
       "if": {
         "properties": {
-          "type": { "const": "dev_reload" }
+          "type": {
+            "enum": [
+              "dev_reload",
+              "adapter_control_request",
+              "adapter_control_response",
+              "adapter_control_apply_result"
+            ]
+          }
         }
       },
       "then": { "not": { "required": ["job_id"] } }
@@ -2328,7 +2338,11 @@
                 "minimum": 0,
                 "maximum": 9007199254740991
               },
-              "role": { "enum": ["holder", "pending"] }
+              "role": { "enum": ["holder", "pending"] },
+              "adapter_control": {
+                "description": "Capability flag: this daemon answers adapter_control_request. Emitted only to extensions at or above 0.16.0 (the strict hello_ack of older extensions rejects the field); the feature list is full at its cap of 32, so this flag is the negotiation channel.",
+                "type": "boolean"
+              }
             },
             "allOf": [
               {
@@ -7611,6 +7625,156 @@
         "required": [
           "job_id"
         ]
+      }
+    }
+  ,
+    {
+      "if": { "properties": { "type": { "const": "adapter_control_request" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "last_control_sequence"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "last_control_sequence": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "last_suspensions_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "if": {
+              "properties": { "last_control_sequence": { "const": 0 } },
+              "required": ["last_control_sequence"]
+            },
+            "then": { "not": { "required": ["last_suspensions_digest"] } }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "adapter_control_response" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "state",
+              "control_sequence",
+              "suspensions_digest",
+              "suspended_revisions",
+              "suspended_safety_domains"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "state": { "enum": ["none", "current", "unavailable"] },
+              "control_sequence": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "suspensions_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "suspended_revisions": {
+                "description": "Exact packaged adapter revision IDs, sorted and unique (the validators enforce order; JSON Schema cannot).",
+                "type": "array",
+                "maxItems": 64,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}@[0-9]+\\.[0-9]+\\.[0-9]+$"
+                }
+              },
+              "suspended_safety_domains": {
+                "description": "Daemon-minted safety-domain IDs matched exactly, sorted and unique.",
+                "type": "array",
+                "maxItems": 64,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{0,31}:[a-z0-9._-]{1,253}$"
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "state": { "const": "current" } },
+                  "required": ["state"]
+                },
+                "then": {
+                  "properties": { "control_sequence": { "minimum": 1 } }
+                },
+                "else": {
+                  "properties": {
+                    "control_sequence": { "const": 0 },
+                    "suspended_revisions": { "maxItems": 0 },
+                    "suspended_safety_domains": { "maxItems": 0 }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "adapter_control_apply_result" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["request_id", "control_sequence", "outcome", "suspended_hosts"],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{8,128}$"
+              },
+              "control_sequence": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "outcome": {
+                "enum": ["applied", "missing", "rolled_back", "digest_mismatch", "unavailable"]
+              },
+              "suspended_hosts": {
+                "description": "Hostnames of the extension's own packaged adapters whose revision is suspended; sorted and unique (validators enforce order). Empty unless outcome is applied.",
+                "type": "array",
+                "maxItems": 64,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?){0,8}$"
+                }
+              }
+            },
+            "if": {
+              "properties": { "outcome": { "const": "applied" } },
+              "required": ["outcome"]
+            },
+            "else": {
+              "properties": { "suspended_hosts": { "maxItems": 0 } }
+            }
+          }
+        }
       }
     }
   ]
