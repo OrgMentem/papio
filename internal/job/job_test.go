@@ -638,7 +638,7 @@ func TestReadyTransitionResolvesOpenHumanActions(t *testing.T) {
 // bridge.go opens on a TCC-blocked adoption root: it must resolve on the
 // job's next terminal transition exactly like any other non-advisory
 // action, since downloads_access_required is deliberately absent from
-// informationalActionKind's exemption.
+// InformationalActionKind's exemption.
 func TestReadyTransitionResolvesDownloadsAccessRequiredAction(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
@@ -1617,7 +1617,7 @@ func TestResolveReviewRejectClosesEveryNonAdvisoryActionAtomically(t *testing.T)
 		"/Users/example/Downloads/papio", Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := js.OpenHumanAction(ctx, id, informationalActionKind,
+	if _, err := js.OpenHumanAction(ctx, id, InformationalActionKind,
 		"conservative OpenURL was not opened", Access(false, "")); err != nil {
 		t.Fatal(err)
 	}
@@ -1641,8 +1641,8 @@ func TestResolveReviewRejectClosesEveryNonAdvisoryActionAtomically(t *testing.T)
 	if status[ActionKindDownloadsAccessRequired] != "cancelled" {
 		t.Fatalf("downloads_access_required status = %q, want cancelled; actions = %+v", status[ActionKindDownloadsAccessRequired], actions)
 	}
-	if status[informationalActionKind] != "open" {
-		t.Fatalf("advisory openurl_available status = %q, want open; actions = %+v", status[informationalActionKind], actions)
+	if status[InformationalActionKind] != "open" {
+		t.Fatalf("advisory openurl_available status = %q, want open; actions = %+v", status[InformationalActionKind], actions)
 	}
 }
 

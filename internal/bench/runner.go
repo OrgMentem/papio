@@ -56,15 +56,6 @@ var baselineDisabledSources = map[string]bool{
 	config.SourceCrossrefMetadata: true,
 }
 
-// informationalActionKind mirrors job.go's unexported constant of the same
-// name and value ("openurl_available"): the conservative-mode advisory that
-// records "institutional access exists but was not opened" without
-// requiring a human gesture (dev/post-build-followups.md item 1). It is
-// duplicated, not imported, because job.go keeps it private; run() excludes
-// it from the human-episode count for the same reason job.go's own
-// dismissal/sweep logic treats it as non-blocking.
-const informationalActionKind = "openurl_available"
-
 // overlayConfig builds the hermetic config for one overlay run. AccessMode
 // is delegated so an exhausted resolve attempt opens a real (not merely
 // advisory) human action when an institutional OpenURL base is configured —
@@ -301,7 +292,7 @@ func (o *overlayService) run(ctx context.Context, w Work, wf WorkFixture, overla
 	}
 	episodes, route := 0, "direct"
 	for _, a := range actions {
-		if a.Action.Kind == informationalActionKind {
+		if a.Action.Kind == job.InformationalActionKind {
 			continue
 		}
 		episodes++

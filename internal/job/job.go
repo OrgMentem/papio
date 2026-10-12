@@ -675,7 +675,7 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
 				  WHERE job_id = ? AND kind = ? AND status = 'open'`,
-				now, oldID, informationalActionKind); err != nil {
+				now, oldID, InformationalActionKind); err != nil {
 				return CreateResult{}, err
 			}
 			// The durable trace that this verdict was withdrawn, and by what.
@@ -1154,7 +1154,7 @@ func closeTerminalHumanActions(ctx context.Context, tx *sql.Tx, jobID, to, now s
 	_, err := tx.ExecContext(ctx,
 		`UPDATE human_actions SET status = ?, resolved_at = ?
 		 WHERE job_id = ? AND status = 'open' AND kind != ?`,
-		actionStatus, now, jobID, informationalActionKind)
+		actionStatus, now, jobID, InformationalActionKind)
 	return err
 }
 
@@ -1783,7 +1783,7 @@ func (js *Store) Retry(ctx context.Context, jobID string) error {
 	cancelled, err := tx.ExecContext(ctx,
 		`UPDATE human_actions SET status = 'cancelled', resolved_at = ?
 		  WHERE job_id = ? AND kind = ? AND status = 'open'`,
-		now, jobID, informationalActionKind)
+		now, jobID, InformationalActionKind)
 	if err != nil {
 		return err
 	}
@@ -1874,11 +1874,11 @@ func (js *Store) RecoverStale(ctx context.Context) ([]string, error) {
 	return recovered, nil
 }
 
-// informationalActionKind marks the one advisory action that legitimately
+// InformationalActionKind marks the one advisory action that legitimately
 // stays open on a terminal job: conservative mode records that an
 // institutional OpenURL exists without opening it, and that trace must
 // survive both the terminal transition and the startup sweep.
-const informationalActionKind = "openurl_available"
+const InformationalActionKind = "openurl_available"
 
 // CloseStaleHumanActions cancels open non-advisory actions for jobs that have
 // already reached a terminal state. It repairs rows left by older daemon
@@ -1892,7 +1892,7 @@ func (js *Store) CloseStaleHumanActions(ctx context.Context) error {
 		       SELECT 1 FROM jobs
 		       WHERE jobs.id = human_actions.job_id
 		         AND jobs.state IN ('ready', 'imported', 'unavailable', 'failed', 'cancelled')
-		   )`, store.Now(), informationalActionKind)
+		   )`, store.Now(), InformationalActionKind)
 	return err
 }
 

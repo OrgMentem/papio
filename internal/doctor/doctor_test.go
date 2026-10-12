@@ -373,7 +373,7 @@ func TestRunReportsActionsThatHaveGoneQuiet(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	seed := func(id, jobID, createdAt, status string) {
+	seed := func(id, jobID, kind, createdAt, status string) {
 		t.Helper()
 		if _, err := db.DB().ExecContext(ctx, `
 			INSERT INTO work_requests (id, created_at) VALUES (?, ?)`, "wr_"+jobID, createdAt); err != nil {
@@ -386,20 +386,23 @@ func TestRunReportsActionsThatHaveGoneQuiet(t *testing.T) {
 		}
 		if _, err := db.DB().ExecContext(ctx, `
 			INSERT INTO human_actions (job_id, kind, status, detail, created_at, revision)
-			VALUES (?, 'openurl_handoff', ?, 'handoff', ?, 1)`, jobID, status, createdAt); err != nil {
+			VALUES (?, ?, ?, 'handoff', ?, 1)`, jobID, kind, status, createdAt); err != nil {
 			t.Fatal(err)
 		}
 	}
 	stamp := func(age time.Duration) string {
 		return time.Now().UTC().Add(-age).Format(time.RFC3339Nano)
 	}
-	seed("quiet", "job_quiet", stamp(job.QuiesceAfter+24*time.Hour), "open")
-	seed("live", "job_live", stamp(time.Hour), "open")
-	seed("done", "job_done", stamp(job.QuiesceAfter+24*time.Hour), "resolved")
+	seed("quiet", "job_quiet", "openurl_handoff", stamp(job.QuiesceAfter+24*time.Hour), "open")
+	seed("live", "job_live", "openurl_handoff", stamp(time.Hour), "open")
+	seed("done", "job_done", "openurl_handoff", stamp(job.QuiesceAfter+24*time.Hour), "resolved")
+	// The conservative-mode advisory stays open on a terminal job by design;
+	// it is a record, not a request, so it must not count as waiting.
+	seed("advisory", "job_advisory", job.InformationalActionKind, stamp(job.QuiesceAfter+24*time.Hour), "open")
 
 	detail := checkDoctorDetail(t, ctx, db, "quiesced_actions", Warn)
 	if !strings.Contains(detail, "1 human action(s)") {
-		t.Fatalf("detail = %q; want exactly the one quiet action — a live one and a resolved one are not waiting", detail)
+		t.Fatalf("detail = %q; want exactly the one quiet action — a live one, a resolved one and an advisory are not waiting", detail)
 	}
 }
 

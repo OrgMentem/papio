@@ -1042,13 +1042,15 @@ func unresolvedLegacyEffectBlockerIDs(ctx context.Context, db *store.Store, limi
 // quiescedActions counts open human actions that have aged past
 // job.QuiesceAfter, and how long the oldest has waited. These are the actions
 // papio has stopped offering and stopped reminding about; they remain the
-// user's to finish, so doctor is where they resurface.
+// user's to finish, so doctor is where they resurface. The conservative-mode
+// advisory is left out: it stays open on a terminal job only to record that a
+// route was not opened, so it waits on nobody.
 func quiescedActions(ctx context.Context, db *store.Store) (int, time.Duration, error) {
 	row := db.DB().QueryRowContext(ctx, `
 		SELECT COUNT(*), COALESCE(MIN(created_at), '')
 		FROM human_actions
-		WHERE status = 'open' AND created_at < ?`,
-		store.FormatTime(time.Now().Add(-job.QuiesceAfter)))
+		WHERE status = 'open' AND kind != ? AND created_at < ?`,
+		job.InformationalActionKind, store.FormatTime(time.Now().Add(-job.QuiesceAfter)))
 	var n int
 	var oldest string
 	if err := row.Scan(&n, &oldest); err != nil {

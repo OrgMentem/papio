@@ -155,6 +155,9 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- `papio doctor` no longer counts conservative-mode advisories
+  (`openurl_available`) as actions waiting on you. They stay open on a finished
+  job only to record that an institutional route was not opened.
 - **`papio jobs add-component` accepts a supplement from any path.** It copies
   the file into the data directory, like `jobs supply-pdf`, and leaves your
   original in place. Before, it accepted only a file in the job's adoption
