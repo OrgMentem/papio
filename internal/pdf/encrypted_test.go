@@ -14,7 +14,7 @@ import (
 func TestStructuralWorkerRejectsEncryptedPDF(t *testing.T) {
 	plain := writePDFWithPages(t, 1)
 	encrypted := filepath.Join(t.TempDir(), "encrypted.pdf")
-	if err := api.EncryptFile(plain, encrypted, model.NewAESConfiguration("user", "owner", 128)); err != nil {
+	if err := api.EncryptFile(t.Context(), plain, encrypted, model.NewAESConfiguration("user", "owner", 128)); err != nil {
 		t.Fatal(err)
 	}
 	req, err := json.Marshal(workerRequest{Path: encrypted, MaxPages: 10})

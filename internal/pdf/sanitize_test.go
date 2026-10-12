@@ -23,7 +23,7 @@ func attachedPDF(t *testing.T) string {
 		t.Fatal(err)
 	}
 	attached := filepath.Join(dir, "attached.pdf")
-	if err := api.AddAttachmentsFile(plain, attached, []string{payload}, false, model.NewDefaultConfiguration()); err != nil {
+	if err := api.AddAttachmentsFile(t.Context(), plain, attached, []string{payload}, false, model.NewDefaultConfiguration()); err != nil {
 		t.Fatal(err)
 	}
 	return attached
