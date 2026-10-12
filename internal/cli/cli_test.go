@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
 	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/credential"
 	"papio/internal/daemon"
 	"papio/internal/discovery"
 	"papio/internal/ipc"
@@ -449,6 +451,135 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 	cfg, err := config.Load(path)
 	if err != nil || cfg.AccessMode != config.ModeDelegated || cfg.Email != "reader@example.test" {
 		t.Fatalf("loaded config = %+v, %v", cfg, err)
+	}
+}
+
+// TestConfigSetAccessModeKeepsEverythingElse pins the non-destructive way to
+// change access_mode. config init --force is the other way and resets the whole
+// file, so an operator who only wants a new mode must not need it.
+func TestConfigSetAccessModeKeepsEverythingElse(t *testing.T) {
+	home := cliPrivateTestDir(t)
+	isolateCLIProfile(t, home)
+	path := filepath.Join(home, "config", "config.toml")
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.Email = "reader@example.test"
+	cfg.DataDir = filepath.Join(home, "custom-data")
+	ref, err := credential.NewReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = cfg.WithCredentialReference("agent.typesafe", ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	root := NewRoot(&stdout, &stderr)
+	root.SetArgs([]string{"--config", path, "config", "set-access-mode", "assisted"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("set-access-mode: %v (%s)", err, stderr.String())
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessMode != config.ModeAssisted || got.Email != cfg.Email || got.DataDir != cfg.DataDir {
+		t.Fatalf("config after set-access-mode = mode %q email %q data_dir %q; want assisted, %q, %q", got.AccessMode, got.Email, got.DataDir, cfg.Email, cfg.DataDir)
+	}
+	if !reflect.DeepEqual(got.CredentialBindings(), cfg.CredentialBindings()) {
+		t.Fatalf("set-access-mode changed credential bindings: %+v, want %+v", got.CredentialBindings(), cfg.CredentialBindings())
+	}
+	if !strings.Contains(stdout.String(), "papio daemon stop") {
+		t.Fatalf("output %q does not name the step that applies the mode", stdout.String())
+	}
+
+	for _, args := range [][]string{
+		{"--config", path, "config", "set-access-mode", "reckless"},
+		{"--config", filepath.Join(home, "config", "absent.toml"), "config", "set-access-mode", "assisted"},
+	} {
+		root := NewRoot(&bytes.Buffer{}, &bytes.Buffer{})
+		root.SetArgs(args)
+		if err := root.Execute(); err == nil {
+			t.Fatalf("%v succeeded, want an error", args)
+		}
+	}
+	if kept, err := config.Load(path); err != nil || kept.AccessMode != config.ModeAssisted {
+		t.Fatalf("a refused set-access-mode changed the config: %+v, %v", kept, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "config", "absent.toml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("set-access-mode created a missing config: %v", err)
+	}
+}
+
+// TestConfigInitForceSaysWhatItReplaced pins that the destructive path no
+// longer looks like a first-run write, and that its refusal points at the
+// non-destructive command.
+func TestConfigInitForceSaysWhatItReplaced(t *testing.T) {
+	home := cliPrivateTestDir(t)
+	isolateCLIProfile(t, home)
+	path := filepath.Join(home, "config", "config.toml")
+	run := func(args ...string) (string, error) {
+		var stdout bytes.Buffer
+		root := NewRoot(&stdout, &bytes.Buffer{})
+		root.SetArgs(append([]string{"--config", path}, args...))
+		err := root.Execute()
+		return stdout.String(), err
+	}
+	if _, err := run("config", "init", "--access-mode", "conservative"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := run("config", "init", "--access-mode", "assisted")
+	if err == nil || !strings.Contains(err.Error(), "reset every other setting") || !strings.Contains(err.Error(), "papio config set-access-mode assisted") {
+		t.Fatalf("refusal = %v, want it to say --force resets everything and to name set-access-mode", err)
+	}
+	out, err := run("config", "init", "--access-mode", "assisted", "--force")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Replaced "+path) || !strings.Contains(out, "credential bindings were reset to defaults") {
+		t.Fatalf("--force output = %q, want it to say the file was replaced and what was reset", out)
+	}
+}
+
+// TestExplicitMissingConfigFailsInsteadOfFallingBackToDefaults pins that a
+// mistyped --config never reaches the default profile's daemon: every RPC
+// command derives its socket from the loaded data_dir, so silent defaults
+// would run the command against the wrong profile.
+func TestExplicitMissingConfigFailsInsteadOfFallingBackToDefaults(t *testing.T) {
+	isolateCLIProfile(t, t.TempDir())
+	missing := filepath.Join(t.TempDir(), "work.toml")
+	var out, errOut bytes.Buffer
+	root := newRoot(&options{
+		out:    &out,
+		errOut: &errOut,
+		newAutostarter: func(string) *daemon.Autostarter {
+			t.Error("a missing explicit --config started a daemon")
+			return &daemon.Autostarter{}
+		},
+		rpcCall: func(context.Context, string, string, any, any) error {
+			t.Error("a missing explicit --config reached a daemon")
+			return nil
+		},
+	})
+	root.SetArgs([]string{"--config", missing, "jobs", "list"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "config file "+missing+" does not exist") || !strings.Contains(err.Error(), "papio init --config "+missing) {
+		t.Fatalf("jobs list with a missing --config = %v, want an error naming %s and how to create it", err, missing)
+	}
+}
+
+// TestMissingDefaultConfigStillYieldsDefaults pins the first-run path: with no
+// --config, or the default path spelled out, a missing file means defaults.
+func TestMissingDefaultConfigStillYieldsDefaults(t *testing.T) {
+	isolateCLIProfile(t, t.TempDir())
+	for _, path := range []string{"", filepath.Join(config.Dir(), "config.toml")} {
+		cfg, err := (&options{configPath: path}).loadConfig()
+		if err != nil || cfg.AccessMode != "" {
+			t.Fatalf("loadConfig(%q) = %+v, %v; want defaults with the access mode unset", path, cfg, err)
+		}
 	}
 }
 

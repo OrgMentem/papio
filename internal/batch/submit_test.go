@@ -251,6 +251,34 @@ func TestParseWorkAcceptsDiscoveredWorkEnvelope(t *testing.T) {
 	}
 }
 
+// An ISBN-only work is the one place the JSONL envelope accepts an ISBN as its
+// sole identity: it normalizes, stays the only identifier, and keys the
+// request id so the same book under different metadata is one request.
+func TestParseWorkNormalizesISBNAndKeysRequestIDOnIt(t *testing.T) {
+	request, err := ParseWork([]byte(`{"isbn":" 978-0-306-40615-7 ","title":"The Structure Of Scientific Revolutions","authors":["Kuhn, Thomas S."],"year":1962}`))
+	if err != nil {
+		t.Fatalf("ParseWork: %v", err)
+	}
+	ids := request.Identifiers
+	if ids == nil {
+		t.Fatal("an ISBN-only work must still carry identifiers")
+	}
+	if ids.ISBN != "9780306406157" {
+		t.Fatalf("ISBN = %q, want 9780306406157", ids.ISBN)
+	}
+	if ids.DOI != "" || ids.PMID != "" || ids.ArXiv != "" || ids.OpenAlex != "" {
+		t.Fatalf("only the ISBN may be set: %+v", ids)
+	}
+
+	same, err := ParseWork([]byte(`{"isbn":"9780306406157","title":"A Different Cataloguing Entirely","authors":["Someone Else"],"year":2001}`))
+	if err != nil {
+		t.Fatalf("ParseWork: %v", err)
+	}
+	if same.RequestID != request.RequestID {
+		t.Fatalf("request id %q != %q: identity must key on the normalized ISBN", same.RequestID, request.RequestID)
+	}
+}
+
 func TestBatchRequestIDSeparatesLegacyPrefixCollision(t *testing.T) {
 	const first = "10.1000/collision-11784"
 	const second = "10.1000/collision-77155"
@@ -778,5 +806,63 @@ func TestSubmitCorruptManifestAbortsBeforeSubmit(t *testing.T) {
 	}
 	if caller.called("acquire.submit_v2") {
 		t.Fatal("a batch with an unreadable manifest must not submit")
+	}
+}
+
+// zotioHoldingCaller is a Zotero stand-in that holds exactly one item,
+// reachable only by one identifier scheme. It answers per request: a work is
+// owned only when the lookup carries that scheme's value, so a request builder
+// that drops the scheme reads as not owned.
+type zotioHoldingCaller struct {
+	baseBatchCaller
+	owned func(zotio.LookupWork) bool
+}
+
+func (c zotioHoldingCaller) Call(ctx context.Context, method string, params, result any) error {
+	if method == "acquire.submit_v2" {
+		result.(*submitResult).JobID = "job-zotio-holding"
+		return nil
+	}
+	if method != "zotio.lookup_works" {
+		return c.baseBatchCaller.Call(ctx, method, params, result)
+	}
+	request := params.(zotio.LookupWorksRequest)
+	out := result.(*zotio.LookupWorksResult)
+	out.Works = make([]zotio.WorkOwnership, len(request.Works))
+	for i, lookup := range request.Works {
+		out.Works[i].Status = zotio.OwnershipNotOwned
+		if c.owned(lookup) {
+			out.Works[i].Status = zotio.OwnershipOwnedWithPDF
+		}
+	}
+	return nil
+}
+
+func TestSubmitZotioOwnershipLookupCarriesPMIDAndISBN(t *testing.T) {
+	tests := []struct {
+		name        string
+		identifiers protocol.Identifiers
+		owned       func(zotio.LookupWork) bool
+	}{
+		{"PMID", protocol.Identifiers{PMID: "123456"}, func(w zotio.LookupWork) bool { return w.PMID == "123456" }},
+		{"ISBN", protocol.Identifiers{ISBN: "9780306406157"}, func(w zotio.LookupWork) bool { return w.ISBN == "9780306406157" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ids := tt.identifiers
+			request := protocol.WorkRequest{
+				SchemaVersion:  protocol.WorkRequestSchemaVersion,
+				RequestID:      "zotio-lookup-" + tt.name,
+				Identifiers:    &ids,
+				DesiredVersion: "any",
+			}
+			output, err := Submit(context.Background(), zotioHoldingCaller{owned: tt.owned}, t.TempDir(), []protocol.WorkRequest{request}, SubmitOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(output.SkippedOwned) != 1 || len(output.Submitted) != 0 {
+				t.Fatalf("a work held in Zotero by its %s must be skipped as owned: skipped=%+v submitted=%+v", tt.name, output.SkippedOwned, output.Submitted)
+			}
+		})
 	}
 }

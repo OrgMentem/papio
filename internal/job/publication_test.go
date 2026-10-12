@@ -650,3 +650,41 @@ func TestFinalizePublicationAfterRestartPreservesCancellation(t *testing.T) {
 		t.Fatalf("terminal recovery journal = %+v, %v; want none", prepared, err)
 	}
 }
+
+// A replayed publication ID is idempotent only for the identical work; any
+// field that changes what would be published must be refused as a conflict.
+func TestPreparePublicationReplayRefusesDifferentWork(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	jobID, candidateID := validatingPublicationJob(t, js, "wr_publication_replay")
+	sha := "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	base := publicationInput("publication_replay", jobID, &candidateID, PublicationRoleMain, sha)
+	base.FromState, base.ToState = StateValidating, StateReady
+	base.TransitionDetail = map[string]any{"source": "test"}
+	if err := js.PreparePublication(ctx, base); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if err := js.PreparePublication(ctx, base); err != nil {
+		t.Fatalf("identical replay: %v", err)
+	}
+	other := candidateID + 1000
+	lease := "other-worker"
+	for name, mutate := range map[string]func(*PublicationInput){
+		"quarantine path": func(in *PublicationInput) { in.QuarantinePath = "/quarantine/elsewhere.tmp" },
+		"candidate":       func(in *PublicationInput) { in.CandidateID = &other },
+		"no candidate":    func(in *PublicationInput) { in.CandidateID = nil },
+		"lease owner":     func(in *PublicationInput) { in.LeaseOwner = &lease },
+		"target state":    func(in *PublicationInput) { in.ToState = StateNeedsReview },
+		"transition detail": func(in *PublicationInput) {
+			in.TransitionDetail = map[string]any{"source": "different"}
+		},
+		"artifact size": func(in *PublicationInput) { in.Artifact.SizeBytes++ },
+		"artifact path": func(in *PublicationInput) { in.Artifact.Path = "/artifacts/other.pdf" },
+	} {
+		replay := base
+		mutate(&replay)
+		if err := js.PreparePublication(ctx, replay); !errors.Is(err, ErrConflict) {
+			t.Errorf("%s: replay with different work = %v, want ErrConflict", name, err)
+		}
+	}
+}

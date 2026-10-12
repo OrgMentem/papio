@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"papio/internal/protocol"
 	"papio/internal/work"
 )
 
@@ -85,6 +86,16 @@ func LookupWorkFrom(w work.Work) LookupWork {
 		lw.ISBN = isbn
 	}
 	return lw
+}
+
+// LookupWorkFromIdentifiers is LookupWorkFrom for a request's identifier set.
+// Batch submission and watch classification ask the ownership question about
+// protocol work requests; both must send every identifier the request carries.
+func LookupWorkFromIdentifiers(ids *protocol.Identifiers) LookupWork {
+	if ids == nil {
+		return LookupWork{}
+	}
+	return LookupWorkFrom(work.Work{DOI: ids.DOI, ArXiv: ids.ArXiv, PMID: ids.PMID, ISBN: ids.ISBN})
 }
 
 func hasNewItemRoutingIdentifier(w work.Work) bool {

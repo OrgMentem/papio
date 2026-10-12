@@ -258,23 +258,6 @@ func NormalizeHostFamily(raw string) string {
 	return raw
 }
 
-// InputFromEvents returns the first immutable provider-outcome shape. It is
-// retained as a compatibility helper, but deliberately does not project later
-// events into an earlier incident.
-func InputFromEvents(events []map[string]any) FingerprintInput {
-	for index, event := range events {
-		if kind, _ := event["kind"].(string); kind != "browser.provider_outcome" {
-			continue
-		}
-		detail, _ := event["detail"].(map[string]any)
-		if strings.TrimSpace(stringDetail(detail, "outcome")) == "" {
-			continue
-		}
-		return decisiveInput(events, index)
-	}
-	return unknownInput()
-}
-
 func unique(values []string) []string {
 	if len(values) < 2 {
 		return values
@@ -339,14 +322,6 @@ func eventEpoch(event map[string]any) string {
 func stringDetail(detail map[string]any, key string) string {
 	value, _ := detail[key].(string)
 	return value
-}
-
-func unknownInput() FingerprintInput {
-	return FingerprintInput{
-		SafetyDomain: "unknown",
-		HostFamily:   "unknown",
-		OutcomeKind:  "unknown",
-	}
 }
 
 func decisiveInput(events []map[string]any, index int) FingerprintInput {

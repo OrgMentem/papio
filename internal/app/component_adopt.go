@@ -26,6 +26,14 @@ var ErrComponentRole = errors.New("unsupported component role")
 var (
 	// ErrComponentPrecondition reports a job that cannot take a component yet.
 	ErrComponentPrecondition = errors.New("job cannot take a component")
+	// ErrComponentNoAdoptionRoot reports that the job's browser adoption
+	// directory does not exist. The daemon removes it for a finished job, so
+	// this is not the same fact as a job without a main artifact.
+	ErrComponentNoAdoptionRoot = errors.New("job has no adoption directory")
+	// ErrComponentStagedName reports a staged name that is not a plain file name,
+	// or a staged file that is missing, a symlink, or not a regular file inside
+	// the job's component staging directory.
+	ErrComponentStagedName = errors.New("component staging name rejected")
 	// ErrComponentPath reports a source outside the job's adoption root, or one
 	// that is not a regular file.
 	ErrComponentPath = errors.New("component path rejected")
@@ -62,22 +70,9 @@ var componentBeforePrepareForTest func(string) error
 // papio reports which components it holds; whether they make a source complete
 // enough to support a negative finding is the consumer's judgement.
 func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) error {
-	switch role {
-	case job.ComponentSupplement, job.ComponentAppendix:
-	case job.ComponentHTMLFullText:
-		return fmt.Errorf("%w: %s requires sanitized storage papio does not have yet", ErrComponentRole, role)
-	default:
-		return fmt.Errorf("%w: %q", ErrComponentRole, role)
-	}
-	if s.Validate == nil {
-		return errors.New("acquisition service is missing its validation dependency")
-	}
-	row, err := s.Jobs.Get(ctx, jobID)
+	row, err := s.componentJob(ctx, jobID, role)
 	if err != nil {
 		return err
-	}
-	if row.ArtifactSHA256 == "" {
-		return fmt.Errorf("%w: job %s holds no main artifact to attach a %s to", ErrComponentPrecondition, jobID, role)
 	}
 
 	// Same confinement as main adoption: ancestor symlinks resolve so mounts
@@ -91,7 +86,7 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 	roots, err := s.resolveAdoptionRoots(jobID)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("%w: job %s has no adoption root to attach a %s from", ErrComponentPrecondition, jobID, role)
+			return fmt.Errorf("%w: job %s has no adoption directory to attach a %s from", ErrComponentNoAdoptionRoot, jobID, role)
 		}
 		return fmt.Errorf("adoption root unavailable: %w", err)
 	}
@@ -110,6 +105,71 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 		return fmt.Errorf("%w: %w", ErrComponentPath, err)
 	}
 
+	return s.adoptComponentFile(ctx, row, resolved, role, -1)
+}
+
+// AdoptStagedComponent files a supplement or appendix the operator staged with
+// `papio jobs add-component`. name is a file name inside
+// ComponentStagingDir(jobID); any other shape is refused before the filesystem
+// is touched, so a caller of the RPC makes the daemon read nothing but a file in
+// that daemon-owned directory. The browser adoption root is not involved: the
+// daemon sweeps that directory for finished jobs, which is exactly the state a
+// component is added in, so a file placed there would not survive. The staged
+// copy is removed once the daemon has read or refused it; the operator's
+// original file is never touched.
+func (s *Service) AdoptStagedComponent(ctx context.Context, jobID, name, role string) error {
+	if !plainFileName(name) {
+		return fmt.Errorf("%w: %q is not a file name", ErrComponentStagedName, name)
+	}
+	stageDir, err := ComponentStagingDir(s.Config.DataDir, jobID)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrComponentStagedName, err)
+	}
+	row, err := s.componentJob(ctx, jobID, role)
+	if err != nil {
+		return err
+	}
+	staged, info, err := confineStagedFile(stageDir, name, ErrComponentStagedName)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.Remove(staged)
+		_ = os.Remove(stageDir) // only when no other staged file remains
+	}()
+	if limit := s.Config.Fetch.MaxBytes; info.Size() > limit {
+		return fmt.Errorf("%w: the file is %d bytes, larger than the fetch.max_bytes limit of %d bytes", ErrComponentRejected, info.Size(), limit)
+	}
+	return s.adoptComponentFile(ctx, row, staged, role, s.Config.Fetch.MaxBytes)
+}
+
+// componentJob checks the role and returns the job, which must already hold its
+// main artifact, for both component entry points.
+func (s *Service) componentJob(ctx context.Context, jobID, role string) (*job.Row, error) {
+	switch role {
+	case job.ComponentSupplement, job.ComponentAppendix:
+	case job.ComponentHTMLFullText:
+		return nil, fmt.Errorf("%w: %s requires sanitized storage papio does not have yet", ErrComponentRole, role)
+	default:
+		return nil, fmt.Errorf("%w: %q", ErrComponentRole, role)
+	}
+	if s.Validate == nil {
+		return nil, errors.New("acquisition service is missing its validation dependency")
+	}
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if row.ArtifactSHA256 == "" {
+		return nil, fmt.Errorf("%w: job %s holds no main artifact to attach a %s to", ErrComponentPrecondition, jobID, role)
+	}
+	return row, nil
+}
+
+// adoptComponentFile copies the confined regular file resolved into
+// quarantine, validates it, and publishes it as one of the job's components.
+func (s *Service) adoptComponentFile(ctx context.Context, row *job.Row, resolved, role string, limit int64) error {
+	jobID := row.ID
 	stageID := job.NewID("component-stage")
 	qdir, err := s.Artifacts.QuarantineDir(stageID)
 	if err != nil {
@@ -122,7 +182,7 @@ func (s *Service) AdoptComponent(ctx context.Context, jobID, path, role string) 
 		}
 	}()
 	temp := filepath.Join(qdir, job.NewID("component")+".tmp")
-	sha, size, err := copyHashed(resolved, temp)
+	sha, size, err := copyHashedBounded(resolved, temp, limit)
 	if err != nil {
 		return err
 	}

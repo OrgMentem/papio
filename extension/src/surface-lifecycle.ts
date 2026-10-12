@@ -384,7 +384,11 @@ export class SurfaceLifecycle {
       (unledgeredContainer && this.tabLedgerCache?.[String(tabID)] !== undefined)
     )
       return false;
-    await this.deps.tabs.remove(tabID).catch(() => undefined);
+    try {
+      await this.deps.tabs.remove(tabID);
+    } catch {
+      return false;
+    }
     return true;
   }
 
@@ -519,7 +523,10 @@ export class SurfaceLifecycle {
           raw = (await this.deps.tabLedger?.load()) ?? {};
         } catch {
           if (required) throw new Error("keepalive birth ledger unavailable");
-          raw = {};
+          // A failed read is not proof the ledger is empty. Run against a
+          // throwaway empty ledger and neither cache nor persist it, so the
+          // durable claim records survive and the next access reloads.
+          return (await transaction({})).value;
         }
         const migrated = await migrateTabLedger(
           raw,

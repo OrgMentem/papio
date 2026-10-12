@@ -210,6 +210,51 @@ func deliverySubmit(ctx context.Context, raw json.RawMessage, system *bootstrap.
 	})
 }
 
+// DeliveryPreviewResult is delivery.preview's result: what delivery.submit
+// would do for the job, computed without doing it. It deliberately shares no
+// field name with DeliverySubmitResult (Verdict, not Action), and always
+// carries Preview=true, so a caller that decodes it as a submission reads
+// nothing that looks like a request that was placed.
+//
+// Verdict is the gate decision (submit, prefill, or enrich_then_prefill) and
+// is set only when Branch is evaluate_gate; every other Branch acts on the
+// existing Request. Configured is false, with everything else empty, when the
+// job's institution profile has no document_delivery configured.
+type DeliveryPreviewResult struct {
+	Preview    bool             `json:"preview"`
+	Configured bool             `json:"configured"`
+	Provider   string           `json:"provider,omitempty"`
+	Branch     string           `json:"branch,omitempty"`
+	Verdict    string           `json:"verdict,omitempty"`
+	GateClass  string           `json:"gate_class,omitempty"`
+	Blockers   []string         `json:"blockers,omitempty"`
+	Request    *DeliveryRequest `json:"request,omitempty"`
+}
+
+func deliveryPreview(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	jobID, rpcErr := requireJobID(raw)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if system == nil || system.App == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "document delivery is not configured"}
+	}
+	preview, err := system.App.PreviewDelivery(ctx, jobID)
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(DeliveryPreviewResult{
+		Preview:    true,
+		Configured: preview.Configured,
+		Provider:   preview.Provider,
+		Branch:     string(preview.Branch),
+		Verdict:    string(preview.Decision.Action),
+		GateClass:  preview.GateClass,
+		Blockers:   preview.Decision.Blockers,
+		Request:    deliveryRequestRow(preview.Request),
+	})
+}
+
 // DeliveryCancelResult reports whether delivery.cancel actually cancelled a
 // request. V1 ships no provider adapter with a remote cancel capability —
 // illiad, the only source-controlled API integration Decision 3A allows to

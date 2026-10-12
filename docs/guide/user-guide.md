@@ -796,8 +796,11 @@ command prints this remedy when it refuses a finished job.
 
 `papio stats producers` counts a supplied PDF as `manual`.
 
-Use `papio jobs add-component` for supplements and appendices. The MCP command
-tools do not offer `supply-pdf`, because it reads a file on this computer.
+Use `papio jobs add-component <job-id> <path> --role supplement` (or `appendix`)
+for supplements and appendices. The job must be ready or imported. The file can
+be anywhere on this computer: papio copies it into its data directory and leaves
+your original in place. The MCP command tools do not offer `supply-pdf` or
+`add-component`, because they read a file on this computer.
 
 ## 6. Read the batch outcome
 

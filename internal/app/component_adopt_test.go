@@ -386,7 +386,11 @@ func TestAdoptComponentClassifiesAdoptionRootAndCallerPathFailures(t *testing.T)
 		path := filepath.Join(svc.Config.EffectiveAdoptionRoot(), id, "supplement.pdf")
 
 		err := svc.AdoptComponent(context.Background(), id, path, job.ComponentSupplement)
-		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentPrecondition)
+		assertComponentRefusal(t, svc, jobs, id, err, ErrComponentNoAdoptionRoot)
+		// The job holds its main artifact, so claiming it does not is false.
+		if errors.Is(err, ErrComponentPrecondition) {
+			t.Fatalf("missing adoption dir reported as a missing main artifact: %v", err)
+		}
 	})
 
 	t.Run("missing caller directory", func(t *testing.T) {
@@ -555,4 +559,114 @@ func TestAdoptComponentLeavesOperationalRootFailureUnclassified(t *testing.T) {
 	restore()
 	assertComponentCount(t, jobs, id, 1)
 	assertNoComponentTemp(t, svc, id)
+}
+
+func stageComponent(t *testing.T, svc *Service, id, name string, body []byte) string {
+	t.Helper()
+	dir, err := ComponentStagingDir(svc.Config.DataDir, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// A finished job's adoption directory is swept away, so a component the
+// operator supplies must not depend on it: a staged file is accepted for a
+// ready job that has no adoption directory, and the staged copy is consumed.
+func TestAdoptStagedComponentFilesASupplementForAReadyJobWithoutAnAdoptionDirectory(t *testing.T) {
+	svc, jobs, id := readyComponentService(t, "wr_component_staged")
+	staged := stageComponent(t, svc, id, "supp.pdf", pdfBytes("staged supplement"))
+	if _, err := os.Stat(filepath.Join(svc.Config.EffectiveAdoptionRoot(), id)); !os.IsNotExist(err) {
+		t.Fatalf("precondition: adoption dir exists for %s: %v", id, err)
+	}
+
+	if err := svc.AdoptStagedComponent(context.Background(), id, "supp.pdf", job.ComponentSupplement); err != nil {
+		t.Fatalf("adopt staged supplement: %v", err)
+	}
+	components, err := jobs.Components(context.Background(), id)
+	if err != nil || len(components) != 2 || components[1].Role != job.ComponentSupplement {
+		t.Fatalf("components = %+v, %v; want main plus supplement", components, err)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("staged copy remains after adoption: %v", err)
+	}
+	assertNoComponentTemp(t, svc, id)
+}
+
+func TestAdoptStagedComponentRefusesWhatIsNotAStagedRegularFile(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		stage func(t *testing.T, svc *Service, id string) string
+	}{
+		{"path separator", func(*testing.T, *Service, string) string { return "../supp.pdf" }},
+		{"nothing staged", func(*testing.T, *Service, string) string { return "supp.pdf" }},
+		{"symlink", func(t *testing.T, svc *Service, id string) string {
+			target := filepath.Join(t.TempDir(), "elsewhere.pdf")
+			if err := os.WriteFile(target, pdfBytes("elsewhere"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			link := stageComponent(t, svc, id, "link.pdf", nil)
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			return "link.pdf"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs, id := readyComponentService(t, "wr_component_staged_refused_"+strings.ReplaceAll(tc.name, " ", "_"))
+			name := tc.stage(t, svc, id)
+			err := svc.AdoptStagedComponent(ctx, id, name, job.ComponentSupplement)
+			assertComponentRefusal(t, svc, jobs, id, err, ErrComponentStagedName)
+		})
+	}
+}
+
+func TestAdoptStagedComponentRefusesAFileOverTheFetchLimit(t *testing.T) {
+	svc, jobs, id := readyComponentService(t, "wr_component_staged_big")
+	body := pdfBytes("staged supplement")
+	svc.Config.Fetch.MaxBytes = int64(len(body)) - 1
+	stageComponent(t, svc, id, "supp.pdf", body)
+
+	err := svc.AdoptStagedComponent(context.Background(), id, "supp.pdf", job.ComponentSupplement)
+	assertComponentRefusal(t, svc, jobs, id, err, ErrComponentRejected)
+}
+
+// The size check in AdoptStagedComponent reads the file once; the copy must
+// enforce the bound itself, because a file can grow between the two. Handing
+// the copy a limit below the file's size reproduces that state.
+func TestAdoptComponentFileStopsAStagedFileThatGrewPastTheLimit(t *testing.T) {
+	svc, jobs, id := readyComponentService(t, "wr_component_staged_grew")
+	body := pdfBytes("staged supplement")
+	staged := stageComponent(t, svc, id, "supp.pdf", body)
+	row, err := jobs.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = svc.adoptComponentFile(context.Background(), row, staged, job.ComponentSupplement, int64(len(body))-1)
+	assertComponentRefusal(t, svc, jobs, id, err, ErrComponentRejected)
+}
+
+func TestAdoptStagedComponentRequiresAMainArtifact(t *testing.T) {
+	svc, jobs := newTestService(t)
+	svc.Validate = passValidation()
+	id := parkAwaitingHuman(t, jobs, "wr_component_staged_no_main")
+	stageComponent(t, svc, id, "supp.pdf", pdfBytes("orphan supplement"))
+
+	err := svc.AdoptStagedComponent(context.Background(), id, "supp.pdf", job.ComponentSupplement)
+	if !errors.Is(err, ErrComponentPrecondition) {
+		t.Fatalf("adopt staged component without main artifact = %v, want ErrComponentPrecondition", err)
+	}
+	assertComponentCount(t, jobs, id, 0)
 }

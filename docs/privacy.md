@@ -34,18 +34,19 @@ column lists anything else sent.
 | `api.typesafe.ai` | your TypeSafe key; article DOI, bounded article title, sanitized visible control labels/roles/disabled states, opaque IDs and observation revision | Optional agent acquisition decisions | Off — requires explicit `papio config agent set` enrollment or `PAPIO_TYPESAFE_API_KEY` in the daemon environment |
 | `api.unpaywall.org` | your `email` (required by their terms) | Resolving a DOI | **On** |
 | `api.crossref.org` | your `email`, if set | Adding metadata to a title-only request; checking a DOI's registered version relations when other candidates are exhausted | **On** |
-| `api.labs.crossref.org` | your `email`, if configured | Daily retraction checks for papers already in your library | **On** |
+| `api.labs.crossref.org` | your `email`, if configured | Daily retraction checks for papers *papio* acquired (and your wider library when `retraction.scope = "library"`) | **On** |
 | `www.ebi.ac.uk` (Europe PMC) | — | Resolving a DOI, PMID, or title | **On** |
 | `export.arxiv.org` | — | Resolving an arXiv ID or DOI, and `papio search` when configured | **On** |
 | `doi.org` | your `email`, in the User-Agent | Confirming that a DOI exists before an institutional handoff | **On** |
 | Your institution's configured delivery API (`document_delivery.base_url` — ILLiad in v1) | your `api_key`, `patron_ref`, and the request's bibliographic identifiers | Submitting or polling one of your document-delivery requests | Off — requires configuration |
-| `api.openalex.org` | your `email`, your API key | Resolving and `papio search` | Off |
+| `api.openalex.org` | your `email`, your API key | `papio search` and watches (the default discovery backend) | **On** |
+| `api.openalex.org` | your `email`, your API key | Resolving | Off — requires `[sources.openalex] enabled = true` |
 | `api.core.ac.uk` | your API key | Resolving | Off |
 | `api.crossref.org` (TDM) | your subscriber token | Resolving | Off |
 | `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv ID, or PMID, and `papio search` when configured | **On** |
 | `api.openaire.eu` | your API token, if set | Resolving | **On** |
 | Publisher and repository hosts | — | Downloading the PDF | **On** |
-| `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **Off** by default (`updates.check` defaults to `false`; guided init may enable it), `updates.check = false` disables it |
+| `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **On** if you ran `papio init` (it enables `updates.check` unless you decline or pass `--check-updates=false`); the config key itself defaults to `false`. `updates.check = false` disables it |
 | Your webhook URL | job event and message | Job state changes | Off |
 
 ### Important details
@@ -54,10 +55,10 @@ column lists anything else sent.
 it. Unpaywall and OpenAlex require an email address. Crossref and DOI lookup use it
 when configured. Leaving it empty prevents Unpaywall and OpenAlex lookups.
 
-**Retraction checks.** Retraction checks download the Retraction Watch dataset and match the DOIs of papers already in your library locally on your machine; the request carries no library DOIs, only your configured `email` as a `mailto` parameter when one is set. Disable them with
+**Retraction checks.** Retraction checks download the Retraction Watch dataset and match the DOIs of papers *papio* acquired (or, with `retraction.scope = "library"`, your wider library) locally on your machine; the request carries no library DOIs, only your configured `email` as a `mailto` parameter when one is set. Disable them with
 `[sources.retraction_watch] enabled = false`.
 
-**Update checks.** Update checks are off by default and, when enabled, make an unauthenticated request to the public
+**Update checks.** The `updates.check` key defaults to `false`, but `papio init` enables it unless you decline the prompt or pass `--check-updates=false`. When enabled, update checks make an unauthenticated request to the public
 GitHub releases page. GitHub receives your IP address, as it would for any web
 request, but *papio* does not send your identifiers or usage information. Disable
 the check with `updates.check = false`.
@@ -121,7 +122,7 @@ IPv4 and IPv6 addresses; some provider error pages print your IP address. A
 capture whose sidecar records `sanitizer_version` `1` predates the address rule
 and may still contain your IP address. Captures are retained
 for 14 days and up to 10 per host by default; both limits are configurable in
-`[captures]`. Run `papio adapter captures purge` to remove every capture, or
+`[captures]`. Run `papio adapter captures purge --all` to remove every capture, or
 `papio adapter captures purge --host <host>` to remove captures for one host.
 
 **Bug reports.** The data directory may also contain `papio.db` (request history,

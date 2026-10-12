@@ -26,12 +26,17 @@ import (
 	"papio/internal/ownership"
 )
 
-// refreshWaitBound caps how long one Lookup waits for an in-flight filesystem
-// refresh before answering from the last known index. The worker keeps its
-// single attempt running to publish for the next lookup; the waiter must not
-// hold maintenance behind a stalled file. Tests override it; production keeps
-// it generous enough for a cold 32 MiB parse on slow storage.
+// refreshWaitBound caps one filesystem refresh. The refresh runs under a
+// deadline of this length, owned by the provider rather than by any waiter,
+// and every Lookup that waits on it leaves no later than the stall latch that
+// follows it. Tests override it; production keeps it generous enough for a
+// cold 32 MiB parse on slow storage.
 var refreshWaitBound = 10 * time.Second
+
+// refreshStallGrace is how long past its deadline a refresh may take to
+// notice cancellation before the provider latches it as stalled. A read stuck
+// in a syscall never notices; a cooperative one returns well inside the grace.
+var refreshStallGrace = 250 * time.Millisecond
 
 // defaultMaxBytes caps one snapshot read. A bibliographic export of a large
 // personal library is a few megabytes; anything past this is more likely a
@@ -79,6 +84,7 @@ func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.P
 		return nil, fmt.Errorf("library source %q: path is required", name)
 	}
 	empty := &snapshot{index: ownership.BuildIndex(nil)}
+	owner, cancel := context.WithCancel(context.Background())
 	return &fileProvider{
 		name:     name,
 		path:     path,
@@ -89,6 +95,8 @@ func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.P
 		current:  empty,
 		read:     readBounded,
 		identity: fileIdentity,
+		owner:    owner,
+		cancel:   cancel,
 	}, nil
 }
 
@@ -194,14 +202,23 @@ type fileProvider struct {
 	// identity is per-provider so tests can exercise the metadata-less fallback
 	// on every platform without changing global filesystem behavior.
 	identity func(*os.File, os.FileInfo) fileID
+
+	// owner bounds every refresh; Close cancels it. closed stops new refreshes.
+	owner  context.Context
+	cancel context.CancelFunc
+	closed bool
 }
 
 // pendingRefresh is one filesystem refresh shared by every Lookup that
-// arrives while it runs. Waiters leave on their own context or on
-// refreshWaitBound; the worker always runs its single attempt to completion
-// so the next lookup answers from a published result.
+// arrives while it runs. The refresh has a deadline of refreshWaitBound that
+// no waiter owns. A refresh still running a grace period past it is stalled:
+// stalled closes, every waiter leaves, and later lookups answer at once from
+// the previous index instead of waiting on the same blocked read. The slot
+// stays occupied until the read returns, so a stuck file never spawns a second
+// reader; the worker publishes whatever it finally returns.
 type pendingRefresh struct {
 	done     chan struct{}
+	stalled  chan struct{}
 	snap     *snapshot
 	complete bool
 	failure  string
@@ -209,12 +226,31 @@ type pendingRefresh struct {
 
 func (p *fileProvider) Name() string { return p.name }
 
+// Close cancels the in-flight refresh and stops new ones. A refresh stuck in a
+// syscall cannot be interrupted, so Close waits only for one that is not
+// stalled, and never starts a replacement reader.
+func (p *fileProvider) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	pend := p.pending
+	p.mu.Unlock()
+	p.cancel()
+	if pend == nil {
+		return nil
+	}
+	select {
+	case <-pend.done:
+	case <-pend.stalled:
+	}
+	return nil
+}
+
 // Lookup refreshes the index when the file has changed, then answers from it.
 // A failed refresh preserves the last immutable index as annotation, but marks
 // its claims stale so uncertainty never suppresses an acquisition. A refresh
-// stuck on a stalled file never holds the caller past its context or
-// refreshWaitBound: the waiter keeps the previous index as incomplete while
-// the single worker finishes for the next lookup.
+// stuck on a stalled file never holds the caller past its context or the stall
+// latch: the waiter keeps the previous index as incomplete, and until the
+// blocked read returns every later lookup does the same without waiting.
 func (p *fileProvider) Lookup(ctx context.Context, queries []ownership.Query) ([][]ownership.Claim, ownership.SourceHealth) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -222,32 +258,46 @@ func (p *fileProvider) Lookup(ctx context.Context, queries []ownership.Query) ([
 	if ctx.Err() != nil {
 		return p.answer(p.currentSnapshot(), false, ownership.FailureTimeout, queries)
 	}
-	pend := p.startRefresh(ctx)
-	timer := time.NewTimer(refreshWaitBound)
-	defer timer.Stop()
+	pend := p.startRefresh()
+	if pend == nil {
+		return p.answer(p.currentSnapshot(), false, ownership.FailureTimeout, queries)
+	}
+	select {
+	case <-pend.done:
+		return p.answer(pend.snap, pend.complete, pend.failure, queries)
+	default:
+	}
 	select {
 	case <-pend.done:
 		return p.answer(pend.snap, pend.complete, pend.failure, queries)
 	case <-ctx.Done():
 		return p.answer(p.currentSnapshot(), false, ownership.FailureTimeout, queries)
-	case <-timer.C:
+	case <-pend.stalled:
 		return p.answer(p.currentSnapshot(), false, ownership.FailureTimeout, queries)
 	}
 }
 
-// startRefresh attaches to the in-flight refresh or starts its single worker.
-// The worker runs detached from any one waiter's cancellation so an abandoned
-// wait cannot cancel the attempt a later lookup is already sharing.
-func (p *fileProvider) startRefresh(ctx context.Context) *pendingRefresh {
+// startRefresh attaches to the in-flight refresh or starts its single worker,
+// and returns nil once the provider is closed. The worker runs under the
+// provider's context, not any waiter's, so an abandoned wait cannot cancel the
+// attempt a later lookup is already sharing.
+func (p *fileProvider) startRefresh() *pendingRefresh {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
 	if p.pending != nil {
 		return p.pending
 	}
-	pend := &pendingRefresh{done: make(chan struct{})}
+	pend := &pendingRefresh{done: make(chan struct{}), stalled: make(chan struct{})}
 	p.pending = pend
+	runCtx, cancel := context.WithTimeout(p.owner, refreshWaitBound)
+	latch := time.AfterFunc(refreshWaitBound+refreshStallGrace, func() { close(pend.stalled) })
 	go func() {
-		snap, complete, failure := p.refreshSnapshot(context.WithoutCancel(ctx))
+		snap, complete, failure := p.refreshSnapshot(runCtx)
+		cancel()
+		latch.Stop()
 		p.mu.Lock()
 		pend.snap, pend.complete, pend.failure = snap, complete, failure
 		p.pending = nil

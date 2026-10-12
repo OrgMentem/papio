@@ -106,12 +106,12 @@ func TestInboxWatchHitRowStripsTerminalControlBytes(t *testing.T) {
 		{
 			name:    "escape and osc sequence in title",
 			title:   "Evil\x1b]0;pwned\x07 Title\u009b31m",
-			wantRow: "2000000\twatch hit\tEvil]0;pwned Title31m\t[Reading]\n",
+			wantRow: "hit:1:10.1000/example\twatch hit\tEvil]0;pwned Title31m\t[Reading]\n",
 		},
 		{
 			name:    "printable non-ASCII survives byte-for-byte",
 			title:   "Café Über 日本語のタイトル",
-			wantRow: "2000000\twatch hit\tCafé Über 日本語のタイトル\t[Reading]\n",
+			wantRow: "hit:1:10.1000/example\twatch hit\tCafé Über 日本語のタイトル\t[Reading]\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -150,12 +150,12 @@ func TestInboxRetractionRowStripsTerminalControlBytes(t *testing.T) {
 		{
 			name:    "escape and osc sequence in doi",
 			doi:     "10.1000/evil\x1b]0;pwned\x07DOI\u009b31m",
-			wantRow: "3000000\tretraction\t10.1000/evil]0;pwnedDOI31m\n",
+			wantRow: "retraction:1:10.1000/evil]0;pwnedDOI31m\tretraction\t10.1000/evil]0;pwnedDOI31m\n",
 		},
 		{
 			name:    "printable non-ASCII survives byte-for-byte",
 			doi:     "10.1000/日本語のDOI",
-			wantRow: "3000000\tretraction\t10.1000/日本語のDOI\n",
+			wantRow: "retraction:1:10.1000/日本語のDOI\tretraction\t10.1000/日本語のDOI\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -171,6 +171,95 @@ func TestInboxRetractionRowStripsTerminalControlBytes(t *testing.T) {
 			}
 			assertInboxSanitizedRow(t, snapshot, tc.wantRow)
 		})
+	}
+}
+
+// The id in the first column is the exact argument `papio inbox decide`
+// takes. Rank, grab ids without their prefix, and a missing id left the
+// operator re-running with --json to find it.
+func TestInboxTextRowsLeadWithTheItemIDDecideAccepts(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	snapshot := triage.Snapshot{
+		Schema: triage.SchemaVersion, GeneratedAt: now.Format(time.RFC3339),
+		Counts: triage.Counts{PendingTotal: 4},
+		Items: []triage.Item{
+			{Kind: triage.KindHumanAction, ID: "action:12", Rank: 1_000_001, Title: "Handoff", Facts: []triage.Fact{}, Ops: []string{"dismiss"},
+				HumanAction: &triage.HumanAction{ActionID: 12, JobID: "job_abc", ActionKind: "manual_download"}},
+			{Kind: triage.KindWatchHit, ID: "hit:3:10.1000/x", Rank: 2_000_001, Title: "A hit", Facts: []triage.Fact{}, Ops: []string{"acquire", "dismiss"},
+				WatchHit: &triage.WatchHit{Work: triage.Work{DOI: "10.1000/x", Title: "A hit"}, Watches: []triage.Watch{{ID: 3, Label: "Reading"}}, FirstSeenAt: now.Format(time.RFC3339)}},
+			{Kind: triage.KindRetraction, ID: "retraction:10.1000/r", Rank: 3_000_001, Title: "Retracted", Facts: []triage.Fact{}, Ops: []string{"dismiss"},
+				Retraction: &triage.Retraction{DOI: "10.1000/r", Nature: "retraction", NoticedAt: now}},
+			{Kind: triage.KindPdfGrab, ID: triage.PdfGrabIDPrefix + "grab-9", Rank: 4_000_001, Title: "scan.pdf", Facts: []triage.Fact{}, Ops: []string{"dismiss"},
+				PdfGrab: &triage.PdfGrab{GrabID: "grab-9", State: "parked_no_identifier"}},
+		},
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*triage.Snapshot) = snapshot
+		return nil
+	})
+	root.SetArgs([]string{"inbox"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("inbox: %v (%s)", err, errOut.String())
+	}
+	rows := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(rows) != len(snapshot.Items) {
+		t.Fatalf("rows = %q, want one per item", rows)
+	}
+	for i, item := range snapshot.Items {
+		if first, _, _ := strings.Cut(rows[i], "\t"); first != item.ID {
+			t.Errorf("row %d = %q: first column %q, want the item id %q", i, rows[i], first, item.ID)
+		}
+	}
+}
+
+// A page the daemon truncated must end with a command the operator can run:
+// the cursor is accepted back by --cursor, and the next page starts where this
+// one stopped.
+func TestInboxCursorFlagPagesAndNoticeNamesTheNextCommand(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	row := func(id string) triage.Item {
+		return triage.Item{Kind: triage.KindRetraction, ID: id, Rank: 3_000_001, Title: "R", Facts: []triage.Fact{}, Ops: []string{"dismiss"},
+			Retraction: &triage.Retraction{DOI: "10.1000/r", Nature: "retraction", NoticedAt: now}}
+	}
+	var requests []triage.SnapshotRequest
+	stub := func(_ context.Context, method string, params, result any) error {
+		request := params.(triage.SnapshotRequest)
+		requests = append(requests, request)
+		page := triage.Snapshot{Schema: triage.SchemaVersion, GeneratedAt: now.Format(time.RFC3339)}
+		if request.Cursor == "" {
+			page.Items, page.Cursor, page.HasMore = []triage.Item{row("retraction:first")}, "tok_page2", true
+		} else {
+			page.Items = []triage.Item{row("retraction:second")}
+		}
+		*result.(*triage.Snapshot) = page
+		return nil
+	}
+
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"inbox", "--limit", "1"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("first page: %v (%s)", err, errOut.String())
+	}
+	if !strings.HasPrefix(out.String(), "retraction:first\t") || !strings.HasSuffix(out.String(), "papio inbox --cursor tok_page2 --limit 1\n") {
+		t.Fatalf("first page = %q, want its row and a runnable next-page command", out.String())
+	}
+	if strings.Contains(out.String(), "--json") {
+		t.Fatalf("first page = %q: must not send the operator to --json for a cursor", out.String())
+	}
+
+	out.Reset()
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, stub)
+	root.SetArgs([]string{"inbox", "--cursor", "tok_page2", "--limit", "1"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("second page: %v (%s)", err, errOut.String())
+	}
+	if want := (triage.SnapshotRequest{Limit: 1, Cursor: "tok_page2"}); requests[len(requests)-1] != want {
+		t.Fatalf("second request = %+v, want %+v", requests[len(requests)-1], want)
+	}
+	if strings.Contains(out.String(), "retraction:first") || !strings.HasPrefix(out.String(), "retraction:second\t") || strings.Contains(out.String(), "--cursor") {
+		t.Fatalf("second page = %q, want only the next row and no further notice", out.String())
 	}
 }
 

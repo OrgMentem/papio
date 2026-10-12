@@ -199,12 +199,11 @@ func TestParseRequestIDsFollowTheIdentifier(t *testing.T) {
 	}
 }
 
-// No parser fills Record.ISBN, so the ISBN branch of convert — normalization
-// plus title/authors/year propagation — is only reachable directly. ISBN-only
-// acquisition metadata arrives from other input paths and must still normalize.
-func TestConvertNormalizesISBNAndPropagatesMetadata(t *testing.T) {
+// convert trims record text, drops blank authors and carries year through the
+// same pipeline JSONL uses.
+func TestConvertTrimsAndPropagatesMetadata(t *testing.T) {
 	request, err := convert(Record{
-		ISBN:    " 978-0-306-40615-7 ",
+		DOI:     " 10.1000/Example ",
 		Title:   "  The Structure Of Scientific Revolutions  ",
 		Authors: []string{"  Kuhn, Thomas S.  ", "   ", ""},
 		Year:    1962,
@@ -212,15 +211,8 @@ func TestConvertNormalizesISBNAndPropagatesMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
-	ids := request.Identifiers
-	if ids == nil {
-		t.Fatal("an ISBN-only record must still carry identifiers")
-	}
-	if ids.ISBN != "9780306406157" {
-		t.Fatalf("ISBN = %q, want 9780306406157", ids.ISBN)
-	}
-	if ids.DOI != "" || ids.PMID != "" || ids.ArXiv != "" || ids.OpenAlex != "" {
-		t.Fatalf("only the ISBN may be set: %+v", ids)
+	if request.Identifiers == nil || request.Identifiers.DOI != "10.1000/example" {
+		t.Fatalf("identifiers = %+v, want the normalized DOI", request.Identifiers)
 	}
 	if request.Title != "The Structure Of Scientific Revolutions" {
 		t.Fatalf("Title = %q, want the trimmed title", request.Title)
@@ -230,14 +222,5 @@ func TestConvertNormalizesISBNAndPropagatesMetadata(t *testing.T) {
 	}
 	if request.Year != 1962 {
 		t.Fatalf("Year = %d, want 1962", request.Year)
-	}
-
-	// The same book under different metadata is the same acquisition request.
-	same, err := convert(Record{ISBN: "9780306406157", Title: "A Different Cataloguing Entirely", Authors: []string{"Someone Else"}, Year: 2001})
-	if err != nil {
-		t.Fatalf("convert: %v", err)
-	}
-	if same.RequestID != request.RequestID {
-		t.Fatalf("request id %q != %q: identity must key on the normalized ISBN", same.RequestID, request.RequestID)
 	}
 }

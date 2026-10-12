@@ -163,6 +163,73 @@ func TestPinIncidentKeepsPriorMarkersWhenReplacementFails(t *testing.T) {
 	}
 }
 
+// TestPinIncidentRestoresDisplacedMarkersWhenDisplacementFailsMidway pins the
+// all-or-nothing contract of the displacement step: when removing a LATER
+// prior latest marker fails after an EARLIER one was already removed, the
+// removed marker is republished, so the incident never ends up with no latest
+// evidence and the caller's error leaves every prior marker as it was.
+func TestPinIncidentRestoresDisplacedMarkersWhenDisplacementFailsMidway(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission bits")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("a Windows directory's mode bits do not stop file removal inside it")
+	}
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 4, MaxAge: 24 * time.Hour})
+	at := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	capture := func(minute int, host, body string) string {
+		t.Helper()
+		store.now = func() time.Time { return at.Add(time.Duration(minute) * time.Minute) }
+		path, err := store.Store(ctx, host, "observed", "adapter", "1", []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// Hosts are visited in directory order, so the marker on host "a" is
+	// removed before the one on host "b" fails.
+	priorA := capture(0, "a.example.edu", "prior-a")
+	priorB := capture(1, "b.example.edu", "prior-b")
+	first := capture(2, "a.example.edu", "first")
+	latest := capture(3, "a.example.edu", "latest")
+	for _, path := range []string{priorA, priorB} {
+		if err := store.Pin(ctx, path, "incident-4", PinLatest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := map[string][]byte{}
+	for _, path := range []string{priorA, priorB} {
+		data, err := os.ReadFile(pinPath(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[path] = data
+	}
+
+	// A read-only host directory lets the sidecar still be read and found
+	// but not removed.
+	blockedDir := filepath.Dir(priorB)
+	if err := os.Chmod(blockedDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blockedDir, 0o700) })
+	if err := store.PinIncident(ctx, "incident-4", first, latest); err == nil {
+		t.Fatal("PinIncident() = nil error, want displacement failure")
+	}
+	for path, want := range before {
+		got, err := os.ReadFile(pinPath(path))
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("prior latest marker on %s after failed displacement = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	for _, path := range []string{first, latest} {
+		if pin, ok := readPin(path); ok {
+			t.Fatalf("failed displacement left a new marker on %s: %#v", path, pin)
+		}
+	}
+}
+
 func TestStoreSanitizedPinnedRetainsBeforeOutcomePrune(t *testing.T) {
 	ctx := context.Background()
 	store := New(t.TempDir(), Retention{MaxPerHost: 1, MaxAge: 24 * time.Hour})

@@ -1376,6 +1376,136 @@ func TestSubmitDeliveryMatchesAutomaticRoute(t *testing.T) {
 		t.Fatalf("posted DOI = %v", postedBody["DOI"])
 	}
 }
+
+// TestPreviewDeliveryNamesTheVerdictSubmitWouldActOn pins the dry run behind
+// `papio delivery submit` without --confirm: for a job with no request yet it
+// reports the exact verdict --confirm would act on (a real provider request
+// for an auto_capable gate, a prefill action otherwise) and leaves no trace:
+// no provider call, no delivery_requests row, no gate event, no job change.
+func TestPreviewDeliveryNamesTheVerdictSubmitWouldActOn(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		_, _ = w.Write([]byte(`{"TransactionNumber": 1, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+
+	for _, test := range []struct {
+		name       string
+		dd         *config.DocumentDelivery
+		wantAction delivery.Action
+		wantClass  string
+		blockers   bool
+	}{
+		{name: "auto capable", dd: autoCapableDocumentDelivery(server.URL), wantAction: delivery.ActionSubmit, wantClass: "auto_capable"},
+		{name: "prefill only", dd: &config.DocumentDelivery{Kind: "openurl", BaseURL: "https://ill.example.edu/request-form"}, wantAction: delivery.ActionPrefill, wantClass: "prefill_only", blockers: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			svc, jobs, deliverySvc := newDeliveryTestService(t)
+			svc.Delivery = deliverySvc
+			svc.IlliadHTTPClient = server.Client()
+			svc.Config.Browser.DocumentDelivery = test.dd
+			svc.Resolvers = deliveryTestResolvers()
+			ctx := context.Background()
+			if test.wantClass == "auto_capable" {
+				if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			id, err := svc.Submit(ctx, deliveryWorkRequest("wr_preview_"+strings.ReplaceAll(test.name, " ", "_"), "10.1000/preview-"+strings.ReplaceAll(test.name, " ", "-")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := jobs.ClaimNext(ctx, "w", time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+				t.Fatal(err)
+			}
+			before, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			posts = 0
+
+			preview, err := svc.PreviewDelivery(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !preview.Configured || preview.Branch != delivery.BranchEvaluateGate || preview.Decision.Action != test.wantAction || preview.GateClass != test.wantClass || preview.Request != nil {
+				t.Fatalf("preview = %+v, want configured evaluate_gate %s on a %s gate with no request", preview, test.wantAction, test.wantClass)
+			}
+			if test.blockers && len(preview.Decision.Blockers) == 0 {
+				t.Fatalf("preview = %+v, want the prefill blockers named", preview)
+			}
+			if posts != 0 {
+				t.Fatalf("preview made %d provider calls", posts)
+			}
+			if row, err := deliverySvc.GetByJobID(ctx, id); err != nil || row != nil {
+				t.Fatalf("preview left a delivery request: %+v, %v", row, err)
+			}
+			if n := gateEventCount(t, jobs, id); n != 0 {
+				t.Fatalf("preview recorded %d gate events", n)
+			}
+			after, err := jobs.Get(ctx, id)
+			if err != nil || after.State != before.State || after.UpdatedAt != before.UpdatedAt {
+				t.Fatalf("preview changed the job: before %+v after %+v, %v", before, after, err)
+			}
+		})
+	}
+}
+
+// TestPreviewDeliveryAppliesSubmitGuardsToExistingOfferedRequest pins that the
+// dry run does not promise a provider request that submitDeliveryRequest would
+// refuse: an offered row bound to a different gate profile digest only opens
+// reconciliation on --confirm.
+func TestPreviewDeliveryAppliesSubmitGuardsToExistingOfferedRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"TransactionNumber": 1, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	ctx := context.Background()
+	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_preview_stale_digest", "10.1000/preview-stale-digest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimNext(ctx, "w", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: deliveryRequestClass(row.Work), WorkIdentity: row.Work.Describe(),
+		GateProfileDigest: "stale-digest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := svc.PreviewDelivery(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Decision.Action == delivery.ActionSubmit || preview.Branch == delivery.BranchEvaluateGate {
+		t.Fatalf("preview = %+v, must not promise a submit for a request bound to a stale profile digest", preview)
+	}
+	if preview.Request == nil {
+		t.Fatalf("preview = %+v, want the governing request named", preview)
+	}
+}
 func TestSubmitDeliveryUsesPinnedRequestAfterIdentityPromotion(t *testing.T) {
 	svc, jobs, deliverySvc := newDeliveryTestService(t)
 	svc.Delivery = deliverySvc
@@ -3582,4 +3712,189 @@ func TestReassignmentKeepsEarlierReconciliationAttempts(t *testing.T) {
 	if posts.Load() != 0 {
 		t.Fatalf("provider POSTs = %d, want no second submission", posts.Load())
 	}
+}
+
+// A fulfilled-delivery retrieval handoff opens its prompt and parks in one
+// transaction: a refused park must leave no open action on the resolving job.
+func TestRouteFulfilledDeliveryLeavesNoActionWhenParkFails(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	dd := autoCapableDocumentDelivery("https://illiad.example.edu/ILLiadWebPlatform")
+	dd.PatronWebBaseURL = "https://illiadweb.example.edu/illiad/illiad.dll"
+	svc.Config.Browser.DocumentDelivery = dd
+
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_fulfilled_atomic_001", "10.1000/fulfilled-atomic-001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := &delivery.Request{ID: 77, JobID: id, Provider: "illiad", ProviderReference: "482910", State: delivery.StateFulfilled}
+	if _, err := jobs.S.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_fulfilled_park
+		BEFORE UPDATE OF state ON jobs
+		WHEN NEW.state = 'awaiting_human'
+		BEGIN SELECT RAISE(ABORT, 'injected park failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.routeFulfilledDelivery(ctx, row, job.StateResolving, existing); err == nil {
+		t.Fatal("routeFulfilledDelivery succeeded despite the injected park failure")
+	}
+	open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("failed park left a stale prompt: %+v", open)
+	}
+}
+
+func TestDocumentDeliveryRetrievalHandoffURLRejectsMalformedDetail(t *testing.T) {
+	const marker = DocumentDeliveryRetrievalHandoffDetail
+	for name, detail := range map[string]string{
+		"empty":           "",
+		"missing prefix":  "https://illiadweb.example.edu/x",
+		"marker only":     marker,
+		"empty url":       marker + "\n",
+		"non https":       marker + "\nhttp://illiadweb.example.edu/x",
+		"javascript":      marker + "\njavascript:alert(1)",
+		"trailing lf":     marker + "\nhttps://illiadweb.example.edu/x\n",
+		"embedded cr":     marker + "\nhttps://illiadweb.example.edu/x\rY",
+		"extra line":      marker + "\nhttps://a.example.edu/x\nhttps://b.example.edu/y",
+		"marker no break": marker + " https://illiadweb.example.edu/x",
+	} {
+		if got, ok := DocumentDeliveryRetrievalHandoffURL(detail); ok || got != "" {
+			t.Errorf("%s: DocumentDeliveryRetrievalHandoffURL = %q, %t, want rejection", name, got, ok)
+		}
+	}
+	if got, ok := DocumentDeliveryRetrievalHandoffURL(marker + "\nhttps://illiadweb.example.edu/x"); !ok || got != "https://illiadweb.example.edu/x" {
+		t.Errorf("valid detail = %q, %t", got, ok)
+	}
+}
+
+// holdForHuman is idempotent for a job already parked on a delivery prompt,
+// and re-opens the prompt for a job parked without one. A repeated recovery
+// pass must never stack a second prompt or a second hold marker.
+func TestOfferedDeliveryRecoveryHoldForHumanIsIdempotentAndReopensMissingPrompt(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	recovery := svc.OfferedDeliveryRecovery()
+
+	setup := func(t *testing.T, requestID, doi string) (*job.Row, *delivery.Request) {
+		t.Helper()
+		id, err := svc.Submit(ctx, deliveryWorkRequest(requestID, doi))
+		if err != nil {
+			t.Fatal(err)
+		}
+		row, err := jobs.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+			JobID: id, InstitutionProfile: "default", Provider: "illiad",
+			RequestClass: "digital_journal_article", WorkIdentity: row.Work.Describe(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row, req
+	}
+	holdEvents := func(t *testing.T, id string) int {
+		t.Helper()
+		events, err := jobs.Events(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range events {
+			if e["kind"] == "delivery.offered_recovery_hold" {
+				n++
+			}
+		}
+		return n
+	}
+	openDeliveryActions := func(t *testing.T, id string) int {
+		t.Helper()
+		open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, a := range open {
+			if a.Kind == job.ActionKindDocumentDelivery {
+				n++
+			}
+		}
+		return n
+	}
+
+	for _, marker := range []string{"ambiguous provider outcome", "provider kind changed"} {
+		t.Run("already parked with prompt: "+marker, func(t *testing.T) {
+			row, req := setup(t, "wr_hold_idem_"+strings.ReplaceAll(marker, " ", "_"), "10.1000/hold-idem-"+strings.ReplaceAll(marker, " ", "-"))
+			if err := jobs.Transition(ctx, row.ID, job.StateQueued, job.StateResolving, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.ParkWithHumanAction(ctx, row.ID, job.StateResolving, job.StateAwaitingHuman,
+				job.ActionKindDocumentDelivery, DeliveryReconciliationActionDetail(req),
+				map[string]any{"reason": "test_setup"}, job.Access(false, "")); err != nil {
+				t.Fatal(err)
+			}
+			parked, err := jobs.Get(ctx, row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := recovery.holdForHuman(ctx, parked, req, marker); err != nil {
+				t.Fatal(err)
+			}
+			if n := openDeliveryActions(t, row.ID); n != 1 {
+				t.Fatalf("open delivery actions = %d, want the original one only", n)
+			}
+			if n := holdEvents(t, row.ID); n != 0 {
+				t.Fatalf("hold events = %d, want none for an already-held job", n)
+			}
+		})
+	}
+
+	t.Run("parked without prompt reopens it once", func(t *testing.T) {
+		row, req := setup(t, "wr_hold_reopen", "10.1000/hold-reopen")
+		if err := jobs.Transition(ctx, row.ID, job.StateQueued, job.StateResolving, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := jobs.Transition(ctx, row.ID, job.StateResolving, job.StateAwaitingHuman, map[string]any{"reason": "test_setup"}); err != nil {
+			t.Fatal(err)
+		}
+		parked, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := recovery.holdForHuman(ctx, parked, req, "provider kind changed"); err != nil {
+			t.Fatal(err)
+		}
+		if n := openDeliveryActions(t, row.ID); n != 1 {
+			t.Fatalf("open delivery actions = %d, want 1 reopened prompt", n)
+		}
+		if n := holdEvents(t, row.ID); n != 1 {
+			t.Fatalf("hold events = %d, want 1", n)
+		}
+		again, err := jobs.Get(ctx, row.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := recovery.holdForHuman(ctx, again, req, "provider kind changed"); err != nil {
+			t.Fatal(err)
+		}
+		if n := openDeliveryActions(t, row.ID); n != 1 {
+			t.Fatalf("second hold stacked prompts: %d", n)
+		}
+		if n := holdEvents(t, row.ID); n != 1 {
+			t.Fatalf("second hold stacked markers: %d", n)
+		}
+	})
 }

@@ -273,12 +273,18 @@ func cleanBibTeXValue(value string) string {
 				continue
 			}
 			pos++
-			if isBibTeXLetter(value[pos]) {
-				for pos+1 < len(value) && isBibTeXLetter(value[pos+1]) {
-					pos++
+			switch value[pos] {
+			case '_', '&', '%', '$', '#':
+				// LaTeX-escaped punctuation is a literal character.
+				cleaned.WriteByte(value[pos])
+			default:
+				// A control word or accent marker: drop the command and keep its argument.
+				if isBibTeXLetter(value[pos]) {
+					for pos+1 < len(value) && isBibTeXLetter(value[pos+1]) {
+						pos++
+					}
 				}
 			}
-			continue
 		default:
 			cleaned.WriteByte(value[pos])
 		}

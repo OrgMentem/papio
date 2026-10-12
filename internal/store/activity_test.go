@@ -10,7 +10,7 @@ import (
 
 func TestRecentEventsOrderingCursorJoinAndClamp(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

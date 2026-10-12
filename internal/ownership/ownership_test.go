@@ -296,6 +296,57 @@ func TestRegistryNames(t *testing.T) {
 	}
 }
 
+// Lookup on a registry with no providers must answer every query, in order,
+// with no claims and a complete result: "no libraries configured" is a
+// successful check of nothing, never an error and never a short slice.
+func TestRegistryLookupWithoutProvidersAnswersEveryQuery(t *testing.T) {
+	first := Identifier{KindDOI, "10.1234/first"}
+	second := Identifier{KindDOI, "10.1234/second"}
+	queries := []Query{{Identifiers: []Identifier{first}}, {Identifiers: []Identifier{second}}}
+
+	var nilRegistry *Registry
+	for name, registry := range map[string]*Registry{"empty": NewRegistry(), "nil": nilRegistry} {
+		t.Run(name, func(t *testing.T) {
+			result := registry.Lookup(context.Background(), queries)
+			if len(result.Works) != len(queries) {
+				t.Fatalf("works = %d, want one per query (%d)", len(result.Works), len(queries))
+			}
+			if len(result.Sources) != 0 || !result.Complete() {
+				t.Fatalf("sources = %+v, want none and a complete result", result.Sources)
+			}
+			for i, work := range result.Works {
+				if len(work.Claims) != 0 || Decide(queries[i], work).Suppress {
+					t.Fatalf("work %d = %+v, want no claims and no suppression", i, work)
+				}
+			}
+		})
+	}
+}
+
+// A configured registry delegates to its providers and keeps each claim on the
+// query it answers.
+func TestRegistryLookupDelegatesToProvidersPerQuery(t *testing.T) {
+	first := Identifier{KindDOI, "10.1234/first"}
+	second := Identifier{KindDOI, "10.1234/second"}
+	queries := []Query{{Identifiers: []Identifier{first}}, {Identifiers: []Identifier{second}}}
+	holdsSecond := stubProvider{
+		name:   "papis",
+		claims: [][]Claim{nil, {{Source: "papis", Matched: second, RecordPresent: true, Artifact: ArtifactPresent}}},
+		health: SourceHealth{Complete: true, EntryCount: 1},
+	}
+
+	result := NewRegistry(holdsSecond).Lookup(context.Background(), queries)
+	if len(result.Works) != 2 || len(result.Sources) != 1 || result.Sources[0].Name != "papis" {
+		t.Fatalf("result = %+v, want two works from the one configured source", result)
+	}
+	if got := Decide(queries[0], result.Works[0]); got.Suppress {
+		t.Fatalf("first query decision = %+v, want no suppression", got)
+	}
+	if got := Decide(queries[1], result.Works[1]); !got.Suppress || got.Source != "papis" {
+		t.Fatalf("second query decision = %+v, want suppression from papis", got)
+	}
+}
+
 func TestAggregateUnionsPositiveClaims(t *testing.T) {
 	doi := Identifier{KindDOI, "10.1234/abc"}
 	queries := []Query{{Identifiers: []Identifier{doi}}}

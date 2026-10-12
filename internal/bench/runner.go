@@ -433,20 +433,38 @@ func (r Report) Headline() string {
 // returns a top-level error only when the hermetic infrastructure itself
 // (the ephemeral stores, the fixture transport) could not be built.
 func Run(ctx context.Context, cohort Cohort, fixtures FixtureSet) (Report, error) {
-	rig := newSourceRig(overlaySources)
-	defer rig.close()
-
-	baseline, closeBaseline, err := newOverlayService(ctx, false, rig)
-	if err != nil {
-		return Report{}, fmt.Errorf("bench: baseline overlay: %w", err)
+	// The rig and both overlay services are built when the first work with a
+	// fixture needs them, not up front: each overlay opens and migrates its own
+	// store, and a cohort whose works all lack fixtures runs none of them.
+	var (
+		rig               *sourceRig
+		baseline, current *overlayService
+		cleanups          []func()
+	)
+	defer func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}()
+	ensureOverlays := func() error {
+		if rig != nil {
+			return nil
+		}
+		built := newSourceRig(overlaySources)
+		cleanups = append(cleanups, built.close)
+		var closeBaseline, closeCurrent func()
+		var err error
+		if baseline, closeBaseline, err = newOverlayService(ctx, false, built); err != nil {
+			return fmt.Errorf("bench: baseline overlay: %w", err)
+		}
+		cleanups = append(cleanups, closeBaseline)
+		if current, closeCurrent, err = newOverlayService(ctx, true, built); err != nil {
+			return fmt.Errorf("bench: current overlay: %w", err)
+		}
+		cleanups = append(cleanups, closeCurrent)
+		rig = built
+		return nil
 	}
-	defer closeBaseline()
-
-	current, closeCurrent, err := newOverlayService(ctx, true, rig)
-	if err != nil {
-		return Report{}, fmt.Errorf("bench: current overlay: %w", err)
-	}
-	defer closeCurrent()
 
 	report := Report{CohortID: cohort.ID, Works: make([]WorkResult, 0, len(cohort.Works))}
 	for _, w := range cohort.Works {
@@ -458,6 +476,9 @@ func Run(ctx context.Context, cohort Cohort, fixtures FixtureSet) (Report, error
 		case !ok:
 			result.BaselineClass, result.CurrentClass = ClassFixtureMissing, ClassFixtureMissing
 		default:
+			if err := ensureOverlays(); err != nil {
+				return Report{}, err
+			}
 			rig.setWork(wf)
 			base, baseErr := baseline.run(ctx, w, wf, "baseline")
 			cur, curErr := current.run(ctx, w, wf, "current")

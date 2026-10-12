@@ -12,7 +12,6 @@ import (
 
 	"papio/internal/api"
 	"papio/internal/config"
-	"papio/internal/ipc"
 )
 
 func TestDeliveryGetRendersRowGateAndEvaluation(t *testing.T) {
@@ -25,7 +24,7 @@ func TestDeliveryGetRendersRowGateAndEvaluation(t *testing.T) {
 			t.Fatalf("job_id = %q, want job_01", got)
 		}
 		*result.(*api.DeliveryDetail) = api.DeliveryDetail{
-			Request: &api.DeliveryRequest{JobID: "job_01", Provider: "illiad", RequestClass: "digital_journal_article", State: "pending", ProviderReference: "TN-9", NextCheckAt: "2026-08-08T00:00:00Z"},
+			Request: &api.DeliveryRequest{ID: 42, JobID: "job_01", Provider: "illiad", RequestClass: "digital_journal_article", State: "pending", ProviderReference: "TN-9", NextCheckAt: "2026-08-08T00:00:00Z"},
 			Gate:    api.DeliveryGateSummary{Class: "auto_capable"},
 			LastEvaluation: &api.DeliveryGateEvent{
 				ProfileClass: "auto_capable", Decision: "submit",
@@ -38,7 +37,7 @@ func TestDeliveryGetRendersRowGateAndEvaluation(t *testing.T) {
 		t.Fatalf("delivery get: %v (%s)", err, stderr.String())
 	}
 	got := stdout.String()
-	for _, want := range []string{"job_01", "illiad", "pending", "gate: auto_capable", "last evaluated: submit", "provider reference: TN-9", "next check: 2026-08-08T00:00:00Z"} {
+	for _, want := range []string{"job_01", "illiad", "pending", "request id: 42", "gate: auto_capable", "last evaluated: submit", "provider reference: TN-9", "next check: 2026-08-08T00:00:00Z"} {
 		if !bytes.Contains([]byte(got), []byte(want)) {
 			t.Fatalf("stdout = %q, want it to contain %q", got, want)
 		}
@@ -277,13 +276,19 @@ func TestDeliveryResumeRejectsNonPositiveArg(t *testing.T) {
 		t.Fatal("delivery.resume must not be called with an invalid request-id")
 		return nil
 	})
-	root.SetArgs([]string{"delivery", "resume", "0"})
-	if err := root.Execute(); err == nil {
-		t.Fatal("delivery resume 0: want an error, got nil")
-	}
-	root.SetArgs([]string{"delivery", "resume", "not-a-number"})
-	if err := root.Execute(); err == nil {
-		t.Fatal("delivery resume not-a-number: want an error, got nil")
+	// A job id is the natural mistake: the refusal must echo what was typed,
+	// say resume wants a request id instead, and say where to find it.
+	for _, arg := range []string{"0", "not-a-number", "job_abc123"} {
+		root.SetArgs([]string{"delivery", "resume", arg})
+		err := root.Execute()
+		if err == nil {
+			t.Fatalf("delivery resume %s: want an error, got nil", arg)
+		}
+		for _, want := range []string{`"` + arg + `"`, "request id", "not a job id", "papio delivery get <job-id>"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("delivery resume %s: err = %q, want it to contain %q", arg, err, want)
+			}
+		}
 	}
 }
 
@@ -311,55 +316,65 @@ func TestDeliveryCancelRefusalKeepsJSONAndExitsNonzero(t *testing.T) {
 
 // TestDeliverySubmitWithoutConfirmNeverReachesTheProvider: the gate's submit
 // verdict places an irreversible provider request, so without --confirm the
-// command may only read. It shows what is recorded and exits nonzero.
+// command may only ask the daemon for a read-only preview. It says what
+// --confirm would do, including for a job that has no request yet, and exits
+// nonzero.
 func TestDeliverySubmitWithoutConfirmNeverReachesTheProvider(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		args    []string
-		get     func(result any) error
-		want    string
-		getUsed bool
+		preview api.DeliveryPreviewResult
+		want    []string
 	}{
 		{
-			name: "existing request", args: []string{"delivery", "submit", "job_01"}, getUsed: true,
-			get: func(result any) error {
-				*result.(*api.DeliveryDetail) = api.DeliveryDetail{
-					Request: &api.DeliveryRequest{JobID: "job_01", Provider: "illiad", State: "offered"},
-					Gate:    api.DeliveryGateSummary{Class: "auto_capable"},
-				}
-				return nil
-			},
-			want: "gate: auto_capable",
+			name: "fresh job, auto capable gate", args: []string{"delivery", "submit", "job_01"},
+			preview: api.DeliveryPreviewResult{Preview: true, Configured: true, Provider: "illiad", Branch: "evaluate_gate", Verdict: "submit", GateClass: "auto_capable"},
+			want:    []string{"job_01: --confirm would place a real provider request with illiad (gate auto_capable)"},
 		},
 		{
-			name: "no request yet", args: []string{"delivery", "submit", "job_01"}, getUsed: true,
-			get: func(any) error {
-				return &ipc.RemoteError{Code: "not_found", Message: "no delivery request for this job"}
-			},
-			want: "job_01: no delivery request recorded yet",
+			name: "fresh job, prefill only gate", args: []string{"delivery", "submit", "job_01"},
+			preview: api.DeliveryPreviewResult{Preview: true, Configured: true, Provider: "openurl", Branch: "evaluate_gate", Verdict: "prefill", GateClass: "prefill_only", Blockers: []string{"provider_not_auto_capable"}},
+			want:    []string{"would open a prefill action", "no provider request", "gate prefill_only: provider_not_auto_capable"},
 		},
-		{name: "json", args: []string{"--json", "delivery", "submit", "job_01"}},
+		{
+			name: "existing live request", args: []string{"delivery", "submit", "job_01"},
+			preview: api.DeliveryPreviewResult{Preview: true, Configured: true, Provider: "illiad", Branch: "join_poll", Request: &api.DeliveryRequest{ID: 7, Provider: "illiad", State: "pending"}},
+			want:    []string{"no new provider request", "request 7", "state pending"},
+		},
+		{
+			name: "no route configured", args: []string{"delivery", "submit", "job_01"},
+			preview: api.DeliveryPreviewResult{Preview: true},
+			want:    []string{"no document-delivery route is configured", "would do nothing"},
+		},
+		{
+			name: "json", args: []string{"--json", "delivery", "submit", "job_01"},
+			preview: api.DeliveryPreviewResult{Preview: true, Configured: true, Provider: "illiad", Branch: "evaluate_gate", Verdict: "submit", GateClass: "auto_capable"},
+			want:    []string{`"preview":true`, `"verdict":"submit"`},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, _, result any) error {
-				if method != "delivery.get" || !test.getUsed {
-					t.Fatalf("method = %q without --confirm", method)
+			root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, method string, params, result any) error {
+				if method != "delivery.preview" {
+					t.Fatalf("method = %q without --confirm, want delivery.preview", method)
 				}
-				return test.get(result)
+				if got := params.(map[string]string)["job_id"]; got != "job_01" {
+					t.Fatalf("job_id = %q, want job_01", got)
+				}
+				*result.(*api.DeliveryPreviewResult) = test.preview
+				return nil
 			})
 			root.SetArgs(test.args)
 			if err := root.Execute(); !errors.Is(err, errDeliverySubmitUnconfirmed) {
 				t.Fatalf("err = %v, want errDeliverySubmitUnconfirmed", err)
 			}
-			if test.want == "" {
-				if stdout.Len() != 0 {
-					t.Fatalf("stdout = %q, want nothing under --json", stdout.String())
+			for _, want := range test.want {
+				if !strings.Contains(stdout.String(), want) {
+					t.Fatalf("stdout = %q, want it to contain %q", stdout.String(), want)
 				}
-				return
 			}
-			if !strings.Contains(stdout.String(), test.want) {
-				t.Fatalf("stdout = %q, want it to contain %q", stdout.String(), test.want)
+			if strings.Contains(stdout.String(), `"action"`) {
+				t.Fatalf("stdout = %q: a preview must not carry the submit result's action field", stdout.String())
 			}
 		})
 	}

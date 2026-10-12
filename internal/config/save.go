@@ -17,7 +17,15 @@ var (
 	ErrConfigChanged = errors.New("configuration changed; reload it before saving")
 	// ErrConfigBusy means another Papio writer holds the publication lock.
 	ErrConfigBusy = errors.New("configuration is being saved by another process; retry")
+	// ErrPublicationUncertain means the new file replaced the old one but its
+	// directory entry could not be flushed to stable storage. The new content
+	// is visible now and a power loss may still bring the old content back.
+	// Callers that hold recovery state for the new content must keep it.
+	ErrPublicationUncertain = errors.New("configuration was replaced, but could not be confirmed on stable storage")
 )
+
+// syncConfigDir is the seam for the directory flush after the rename.
+var syncConfigDir = SyncDir
 
 // Snapshot is a content fingerprint for a particular config path. It contains
 // no plaintext secrets. Only ReadSnapshot can produce a usable snapshot.
@@ -163,7 +171,16 @@ func save(cfg Config, path string, expected *Snapshot, beforePublish func() erro
 	if current != initial {
 		return ErrConfigChanged
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	// The temporary file's data is durable, but the rename lives in the
+	// directory. Until the directory is flushed a power loss can restore the
+	// old config after this function has reported success.
+	if err := syncConfigDir(dir); err != nil {
+		return fmt.Errorf("%w: %w", ErrPublicationUncertain, err)
+	}
+	return nil
 }
 
 // configTarget folds relative paths and symlinked parent-directory aliases onto

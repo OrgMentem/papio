@@ -102,6 +102,45 @@ func TestDeliveryGetNoRequestYetIsNotFound(t *testing.T) {
 	}
 }
 
+// delivery.preview is the read-only half of delivery.submit: for a job with no
+// request yet it names the verdict --confirm would act on, and it leaves the
+// job and the delivery tables exactly as it found them.
+func TestDeliveryPreviewReportsVerdictWithoutRoutingTheJob(t *testing.T) {
+	system := deliveryTestSystem(t)
+	router := Router(system)
+	jobID := deliveryTestJob(t, system, "req_delivery_preview", "10.1234/preview")
+	before, err := system.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var preview DeliveryPreviewResult
+	if rpcErr := callMethod(t, router, "delivery.preview", map[string]any{"job_id": jobID}, &preview); rpcErr != nil {
+		t.Fatalf("delivery.preview: %v", rpcErr)
+	}
+	if !preview.Preview || !preview.Configured || preview.Branch != "evaluate_gate" || preview.Verdict != "prefill" || preview.GateClass != "prefill_only" || preview.Provider != "openurl" || preview.Request != nil {
+		t.Fatalf("preview = %+v, want a configured evaluate_gate prefill verdict on a prefill_only gate with no request", preview)
+	}
+	if len(preview.Blockers) == 0 {
+		t.Fatalf("preview = %+v, want the prefill blockers named", preview)
+	}
+
+	if rpcErr := callMethod(t, router, "delivery.get", map[string]any{"job_id": jobID}, nil); rpcErr == nil || rpcErr.Code != "not_found" {
+		t.Fatalf("delivery.get after preview = %#v, want not_found: preview must not create the request", rpcErr)
+	}
+	after, err := system.Jobs.Get(context.Background(), jobID)
+	if err != nil || after.State != before.State {
+		t.Fatalf("job after preview = %+v, %v; want state %s unchanged", after, err, before.State)
+	}
+
+	if rpcErr := callMethod(t, router, "delivery.preview", map[string]any{"job_id": "job_does_not_exist"}, nil); rpcErr == nil || rpcErr.Code != "not_found" {
+		t.Fatalf("unknown job = %#v, want not_found", rpcErr)
+	}
+	if rpcErr := callMethod(t, router, "delivery.preview", map[string]any{"job_id": jobID, "extra": 1}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("unknown field = %#v, want invalid_argument (strict decode)", rpcErr)
+	}
+}
+
 func TestDeliverySubmitPrefillOnlyThenGetExplainsGate(t *testing.T) {
 	system := deliveryTestSystem(t)
 	router := Router(system)

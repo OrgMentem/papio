@@ -57,6 +57,10 @@ type planCLI struct {
 	applyArgs  []string
 	enrichArgs []string
 	callOrder  []string
+	// desktopDown makes DesktopStatus report a closed desktop; parentGone
+	// makes GetItem report a deleted item.
+	desktopDown bool
+	parentGone  bool
 }
 
 func (c *planCLI) Preflight(context.Context) (*PreflightResult, error) {
@@ -68,8 +72,20 @@ func (c *planCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, er
 	}
 	return nil, fmt.Errorf("unexpected MissingPDF")
 }
-func (c *planCLI) GetItem(context.Context, string) (*Item, error) {
-	return nil, fmt.Errorf("unexpected GetItem")
+func (c *planCLI) GetItem(_ context.Context, key string) (*Item, error) {
+	if c.parentGone {
+		return nil, fmt.Errorf("Zotio item %s not found", key)
+	}
+	return &Item{Key: key}, nil
+}
+
+// DesktopStatus answers the optional presence capability: a desktop that
+// answers, unless the test closes it.
+func (c *planCLI) DesktopStatus(context.Context) (DesktopStatus, error) {
+	if c.desktopDown {
+		return DesktopStatus{State: "stopped"}, nil
+	}
+	return DesktopStatus{Running: true, ConnectorReachable: true, State: "ready"}, nil
 }
 func (c *planCLI) Sync(context.Context) error {
 	c.syncCalls++
@@ -291,24 +307,6 @@ func TestClaimApplyReservesInProgressStatus(t *testing.T) {
 	}
 }
 
-func TestClaimApplyReclaimsExpiredReservation(t *testing.T) {
-	service, jobID := readyPlanService(t, "AB12CD34", &planCLI{})
-	key := "zotio_apply:claim-expired"
-	if claimed, err := service.claimApply(context.Background(), key, jobID); err != nil || !claimed {
-		t.Fatalf("initial claim = %t, %v", claimed, err)
-	}
-	service.Now = func() time.Time {
-		return time.Date(2026, 7, 14, 12, 16, 0, 0, time.UTC)
-	}
-	claimed, err := service.claimApply(context.Background(), key, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !claimed {
-		t.Fatal("expired in-progress reservation was not reclaimed")
-	}
-}
-
 // A cancelled apply is AMBIGUOUS: the Zotio child may have mutated Zotero
 // before the context died, so it is not a definitive failure. The plan is
 // retained and the ambiguous reservation blocks a silent retry that would
@@ -364,8 +362,8 @@ func TestCancelledApplyFinalizesClaimAndReplans(t *testing.T) {
 	// Re-applying the same plan must replay the ambiguous error, not re-issue
 	// the mutation. A new PlanJobs for the same job converges on the same
 	// retained plan, so it is also blocked.
-	if _, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256); !errors.Is(err, context.Canceled) {
-		t.Fatalf("replayed ambiguous apply err = %v, want context.Canceled", err)
+	if _, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256); !isUnconfirmed(err) {
+		t.Fatalf("replayed ambiguous apply err = %v, want an unconfirmed-apply error", err)
 	}
 	if cli.applyCalls != 1 {
 		t.Fatalf("ambiguous replay re-issued Zotio mutation: applyCalls=%d want 1", cli.applyCalls)
@@ -377,8 +375,8 @@ func TestCancelledApplyFinalizesClaimAndReplans(t *testing.T) {
 	if replanned[0].ID != plan.ID {
 		t.Fatalf("ambiguous apply should retain its plan: got %s want %s", replanned[0].ID, plan.ID)
 	}
-	if _, err := service.Apply(context.Background(), replanned[0].ID, replanned[0].ConfirmationSHA256); !errors.Is(err, context.Canceled) {
-		t.Fatalf("replanned ambiguous apply err = %v, want context.Canceled", err)
+	if _, err := service.Apply(context.Background(), replanned[0].ID, replanned[0].ConfirmationSHA256); !isUnconfirmed(err) {
+		t.Fatalf("replanned ambiguous apply err = %v, want an unconfirmed-apply error", err)
 	}
 	if cli.applyCalls != 1 {
 		t.Fatalf("replanned ambiguous should not have re-issued: applyCalls=%d", cli.applyCalls)
@@ -985,8 +983,8 @@ func TestDeadlineExceededApplyIsAmbiguousAndDistinctFromDefinitiveFailure(t *tes
 	if _, err := os.Stat(filepath.Join(service2.DataDir, "zotio", "plans", plan2.ID+".json")); err != nil {
 		t.Fatalf("ambiguous apply deleted its plan: %v", err)
 	}
-	if _, err := service2.Apply(context.Background(), plan2.ID, plan2.ConfirmationSHA256); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("ambiguous replay err = %v, want DeadlineExceeded", err)
+	if _, err := service2.Apply(context.Background(), plan2.ID, plan2.ConfirmationSHA256); !isUnconfirmed(err) {
+		t.Fatalf("ambiguous replay err = %v, want an unconfirmed-apply error", err)
 	}
 	if deadlineCLI.applyCalls != 1 {
 		t.Fatalf("ambiguous replay re-issued mutation: applyCalls=%d want 1", deadlineCLI.applyCalls)

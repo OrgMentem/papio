@@ -102,6 +102,9 @@ func listJobsV3(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
 	}
+	if rpcErr := checkJobState(params.State); rpcErr != nil {
+		return nil, rpcErr
+	}
 	rows, truncated, err := system.Jobs.ListPageFor(ctx, params.State, strings.TrimSpace(params.Consumer), params.Limit)
 	if err != nil {
 		return failure(err)
@@ -187,7 +190,7 @@ func getJobV2(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	jobRow, events, actions, err := jobDetailParts(ctx, system, jobID)
 	if err != nil {
-		return failure(err)
+		return jobFailure(err, jobID)
 	}
 	return marshal(JobDetailV2{Job: jobRow, Events: events, Actions: actions})
 }

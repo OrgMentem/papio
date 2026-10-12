@@ -56,7 +56,7 @@ func getJobV3(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	jobRow, events, actions, err := jobDetailParts(ctx, system, jobID)
 	if err != nil {
-		return failure(err)
+		return jobFailure(err, jobID)
 	}
 	detail := JobDetailV3{Job: jobRow, Events: events, Actions: actions}
 	if system.App != nil && system.App.Delivery != nil {

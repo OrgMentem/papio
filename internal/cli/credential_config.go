@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
@@ -23,6 +22,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/credential"
 	"papio/internal/runtimecredential"
+	"papio/internal/store"
 )
 
 type credentialConfigStore interface {
@@ -76,6 +76,11 @@ func credentialArgs(min, max int) cobra.PositionalArgs {
 	}
 }
 
+// daemonStopStep names the one step that applies a configuration or credential
+// change to a running daemon. papio has no restart command: stopping the
+// daemon makes the next command autostart one that reads the new settings.
+const daemonStopStep = "Run 'papio daemon stop'; the next papio command starts the daemon with this change."
+
 func newCredentialConfigCommand(opt *options) *cobra.Command {
 	return newCredentialConfigCommandWithDependencies(opt, defaultCredentialConfigDependencies())
 }
@@ -84,13 +89,13 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 	command := &cobra.Command{Use: "credentials", Short: "Manage integration credentials in the OS store or environment", Annotations: map[string]string{"mcp:hidden": "true"}}
 	var stdin bool
 	set := &cobra.Command{Use: "set TARGET", Short: "Save a new credential and bind this configuration to it", Args: credentialArgs(1, 1),
-		Long: "Create a fresh OS credential record for one integration. Supply a single API key at the hidden prompt or with --key-stdin. For sources.openaire and notify.webhook, use --key-stdin with a version-1 typed JSON credential record. TypeSafe setup enrolls this profile in cloud article decisions. Restart the daemon after changes.",
+		Long: "Create a fresh OS credential record for one integration. Supply a single API key at the hidden prompt or with --key-stdin. For sources.openaire and notify.webhook, use --key-stdin with a version-1 typed JSON credential record. TypeSafe setup enrolls this profile in cloud article decisions. The running daemon keeps the old credential until it is stopped: run 'papio daemon stop' after changes, and the next papio command starts the daemon with them.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			result, err := setCredential(cmd, opt, deps, args[0], stdin)
 			if err != nil {
 				return err
 			}
-			return opt.printResult(result, "Credential saved and bound to %s (%s). Restart the daemon to use it.%s", result.Target, result.Reference, retainedCredentialNotice(result.PreviousReference))
+			return opt.printResult(result, "Credential saved and bound to %s (%s). "+daemonStopStep+"%s", result.Target, result.Reference, retainedCredentialNotice(result.PreviousReference))
 		},
 	}
 	set.Flags().BoolVar(&stdin, "key-stdin", false, "read a key or typed JSON record from standard input")
@@ -121,12 +126,12 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 			return errors.New("credential reference is not valid for this integration")
 		}
 		if err := deps.saveConfig(next, cfg.Path, snapshot); err != nil {
-			return errors.New("configuration changed or could not be saved; binding was not published")
+			return configSaveError(err, "binding was not published")
 		}
 		if _, err := requireCredential(cmd.Context(), deps, binding); err != nil {
 			return fmt.Errorf("binding saved (%s), but credential resolution could not be verified; inspect credentials status before restarting.%s", args[1], retainedCredentialNotice(previousReference))
 		}
-		return opt.printResult(credentialConfigResult{Target: binding.Target, Reference: args[1], PreviousReference: previousReference, Outcome: "bound", RestartRequired: true}, "Credential bound to %s (%s). Restart the daemon to use it.%s", binding.Target, args[1], retainedCredentialNotice(previousReference))
+		return opt.printResult(credentialConfigResult{Target: binding.Target, Reference: args[1], PreviousReference: previousReference, Outcome: "bound", RestartRequired: true}, "Credential bound to %s (%s). "+daemonStopStep+"%s", binding.Target, args[1], retainedCredentialNotice(previousReference))
 	}}
 	status := &cobra.Command{Use: "status [TARGET]", Short: "Show selected credential sources without revealing values", Args: credentialArgs(0, 1), Annotations: map[string]string{"mcp:read-only": "true"}, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := opt.loadConfig()
@@ -150,23 +155,23 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 		if err != nil {
 			return err
 		}
+		unchecked := 0
 		for _, orphan := range orphans {
 			if len(args) == 1 && orphan.Target != args[0] {
 				continue
 			}
+			if orphan.State == "unavailable" {
+				unchecked++
+			}
 			rows = append(rows, orphan)
 		}
-		if opt.jsonOutput {
-			return printPage(opt, "credentials", rows, false)
+		if err := printCredentialStatus(opt, rows); err != nil {
+			return err
 		}
-		for _, row := range rows {
-			selection := row.Source
-			if row.Reference != "" {
-				selection += "; reference: " + row.Reference
-			}
-			if _, err := fmt.Fprintf(opt.out, "%s: %s (%s)\n", row.Target, row.State, selection); err != nil {
-				return err
-			}
+		if unchecked > 0 {
+			// The journal says a write may have committed, so a clean exit
+			// would report that no orphan exists when none was checked.
+			return fmt.Errorf("the credential store is unavailable, so %d journaled reference(s) could not be checked; the rows above keep their references. Retry when the store is back", unchecked)
 		}
 		return nil
 	}}
@@ -175,7 +180,7 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 		if err != nil {
 			return err
 		}
-		return opt.printResult(result, "Credential detached from %s; stored records are unchanged. Restart the daemon.%s", result.Target, retainedCredentialNotice(result.Reference))
+		return opt.printResult(result, "Credential detached from %s; stored records are unchanged. "+daemonStopStep+"%s", result.Target, retainedCredentialNotice(result.Reference))
 	}}
 	var confirmDelete bool
 	del := &cobra.Command{Use: "delete REFERENCE", Short: "Delete a stored record without changing configurations that reference it (requires --yes)", Args: credentialArgs(1, 1),
@@ -206,7 +211,7 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 		if err != nil {
 			return err
 		}
-		return opt.printResult(result, "Migrated %d credential binding(s). Legacy vault entries are unchanged. Restart the daemon.", len(result.Credentials))
+		return opt.printResult(result, "Migrated %d credential binding(s). Legacy vault entries are unchanged. "+daemonStopStep, len(result.Credentials))
 	}}
 	command.AddCommand(set, bind, status, detach, del, migrate)
 	return command
@@ -239,9 +244,9 @@ func deleteCredentialRecord(cmd *cobra.Command, opt *options, deps credentialCon
 	// The record deletion is committed at this point. A journal failure
 	// must say so instead of failing as if nothing happened.
 	if err := clearPendingCredential(cfg.Path, ref); err != nil {
-		return fmt.Errorf("stored credential deleted (%s), but the pending credential journal could not be updated; inspect pending-credentials.json beside the configuration", ref)
+		return fmt.Errorf("stored credential deleted (%s), but the pending credential journal could not be updated; inspect %s", ref, pendingCredentialPath(cfg.Path))
 	}
-	return opt.printResult(credentialConfigResult{Reference: ref, Outcome: "deleted", RestartRequired: true}, "Stored credential deleted. Configurations that reference it are unchanged; restart affected daemons.")
+	return opt.printResult(credentialConfigResult{Reference: ref, Outcome: "deleted", RestartRequired: true}, "Stored credential deleted. Configurations that reference it are unchanged. For each affected profile, run 'papio daemon stop'; its next papio command starts the daemon without the record.")
 }
 
 // Capture before loading the config or touching the vault. Check both bytes and
@@ -287,6 +292,10 @@ func credentialConfigLoadError(opt *options, cfg config.Config, err error) error
 	}
 	if path == "" {
 		path = filepath.Join(config.Dir(), "config.toml")
+	}
+	var absent *errConfigMissing
+	if errors.As(err, &absent) {
+		return err
 	}
 	var missing *toml.StrictMissingError
 	if errors.As(err, &missing) {
@@ -399,13 +408,15 @@ func setCredential(cmd *cobra.Command, opt *options, deps credentialConfigDepend
 		result.EnvironmentOverride = agentEnvironmentStatus(deps, true)
 	}
 	if err := deps.saveConfig(next, cfg.Path, snapshot); err != nil {
-		return credentialConfigResult{}, stagedCredentialError(errors.New("configuration changed or could not be saved; original configuration was not replaced"), []credentialConfigResult{result})
+		// An uncertain publication keeps the journal entry too: it is the only
+		// record of the reference if the old configuration comes back.
+		return credentialConfigResult{}, stagedCredentialError(configSaveError(err, "original configuration was not replaced"), []credentialConfigResult{result})
 	}
 	// The binding now owns the reference; the journal entry served its
 	// purpose. Verification below only reads. The save is committed, so a
 	// journal failure must say the configuration was saved.
 	if err := clearPendingCredential(cfg.Path, ref); err != nil {
-		return credentialConfigResult{}, fmt.Errorf("configuration saved (%s), but the pending credential journal could not be updated; inspect pending-credentials.json beside the configuration before restarting.%s", ref, retainedCredentialNotice(result.PreviousReference))
+		return credentialConfigResult{}, fmt.Errorf("configuration saved (%s), but the pending credential journal could not be updated; inspect %s before restarting.%s", ref, pendingCredentialPath(cfg.Path), retainedCredentialNotice(result.PreviousReference))
 	}
 	binding.Reference = ref
 	binding.Legacy = credential.Record{}
@@ -433,9 +444,36 @@ func detachCredential(opt *options, deps credentialConfigDependencies, target st
 		next.Agent = nil
 	}
 	if err := deps.saveConfig(next, cfg.Path, snapshot); err != nil {
-		return credentialConfigResult{}, errors.New("configuration changed or could not be saved; credential was not detached")
+		return credentialConfigResult{}, configSaveError(err, "credential was not detached")
 	}
 	return credentialConfigResult{Target: target, Reference: binding.Reference, Outcome: "detached", RestartRequired: true}, nil
+}
+
+// configSaveError explains a refused configuration save without echoing the
+// cause. A save that replaced the file but could not confirm it on stable
+// storage must not claim that nothing changed: the new binding is visible now
+// and a power loss may still restore the old file.
+func configSaveError(err error, unchanged string) error {
+	if errors.Is(err, config.ErrPublicationUncertain) {
+		return errors.New("configuration was replaced, but could not be confirmed on stable storage; check it with 'papio config credentials status' and repeat the command if the binding is missing")
+	}
+	return errors.New("configuration changed or could not be saved; " + unchanged)
+}
+
+func printCredentialStatus(opt *options, rows []credentialStatusRow) error {
+	if opt.jsonOutput {
+		return printPage(opt, "credentials", rows, false)
+	}
+	for _, row := range rows {
+		selection := row.Source
+		if row.Reference != "" {
+			selection += "; reference: " + row.Reference
+		}
+		if _, err := fmt.Fprintf(opt.out, "%s: %s (%s)\n", row.Target, row.State, selection); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func credentialKindAllowed(kind credential.Kind, allowed []credential.Kind) bool {
@@ -483,7 +521,14 @@ func stagedCredentialError(cause error, staged []credentialConfigResult) error {
 // trusted: an unreadable file, an empty file, undecodable JSON, or an entry
 // with an invalid reference. Callers fail closed on it. A missing file is
 // the only clean first run and is not an error.
-var errPendingCredentialJournal = errors.New("pending credential journal is unreadable or corrupt; inspect pending-credentials.json beside the configuration before retrying")
+var errPendingCredentialJournal = errors.New("pending credential journal is unreadable or corrupt")
+
+// pendingJournalError wraps the sentinel with the file an operator must look
+// at. The journal is a hidden file named after the configuration, so a generic
+// description of where it lives does not lead anyone to it.
+func pendingJournalError(configPath string) error {
+	return fmt.Errorf("%w; inspect %s before retrying", errPendingCredentialJournal, pendingCredentialPath(configPath))
+}
 
 // pendingCredential journals an OS-store write that is not yet bound to
 // configuration, so an interrupted set or migrate cannot strand an
@@ -517,18 +562,18 @@ func readPendingCredentials(configPath string) ([]pendingCredential, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
-		return nil, errPendingCredentialJournal
+		return nil, pendingJournalError(configPath)
 	}
 	if len(data) == 0 {
-		return nil, errPendingCredentialJournal
+		return nil, pendingJournalError(configPath)
 	}
 	var entries []pendingCredential
 	if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, errPendingCredentialJournal
+		return nil, pendingJournalError(configPath)
 	}
 	for _, entry := range entries {
 		if credential.ValidateReference(entry.Reference) != nil || !strings.HasPrefix(entry.Reference, "keyring:") {
-			return nil, errPendingCredentialJournal
+			return nil, pendingJournalError(configPath)
 		}
 	}
 	return entries, nil
@@ -558,16 +603,30 @@ func writePendingCredentials(configPath string, entries []pendingCredential) err
 		_ = temporary.Close()
 		return err
 	}
+	// The journal is the only record of a reference the vault may already
+	// hold, so a success here must survive power loss: flush the file's data
+	// before the rename and the directory entry after it.
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, pendingCredentialPath(configPath))
+	if err := os.Rename(temporaryPath, pendingCredentialPath(configPath)); err != nil {
+		return err
+	}
+	return syncJournalDir(dir)
 }
+
+// syncJournalDir is the seam for the directory flush that makes a journal
+// rename durable.
+var syncJournalDir = config.SyncDir
 
 func updatePendingCredentials(configPath string, update func([]pendingCredential) ([]pendingCredential, bool)) error {
 	path := pendingCredentialPath(configPath)
 	if path == "" {
-		return errPendingCredentialJournal
+		return pendingJournalError(configPath)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -595,7 +654,7 @@ func journalPendingCredential(configPath, ref, target string) error {
 				return entries, false
 			}
 		}
-		return append(entries, pendingCredential{Reference: ref, Target: target, CreatedAt: time.Now().UTC().Format(time.RFC3339)}), true
+		return append(entries, pendingCredential{Reference: ref, Target: target, CreatedAt: store.Now()}), true
 	})
 }
 
@@ -634,14 +693,25 @@ func unboundPendingCredentials(ctx context.Context, cfg config.Config, deps cred
 		if owned[entry.Reference] {
 			continue
 		}
+		// Only a confirmed absence drops the entry. The journal is the one
+		// durable evidence that a write may have committed, so a store that
+		// cannot answer must not make the reference disappear.
+		state := "unbound"
 		if _, err := deps.store.Load(ctx, entry.Reference); err != nil {
-			continue
+			switch {
+			case errors.Is(err, credential.ErrNotFound):
+				continue
+			case errors.Is(err, credential.ErrInvalidRecord):
+				state = "invalid"
+			default:
+				state = "unavailable"
+			}
 		}
 		target := entry.Target
 		if target == "" {
 			target = "(unbound)"
 		}
-		rows = append(rows, credentialStatusRow{Target: target, Reference: entry.Reference, Source: "keyring", State: "unbound"})
+		rows = append(rows, credentialStatusRow{Target: target, Reference: entry.Reference, Source: "keyring", State: state})
 	}
 	return rows, nil
 }

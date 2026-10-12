@@ -1172,3 +1172,28 @@ func TestLivePollHealthWithoutAnchorIsNotUnobservable(t *testing.T) {
 		t.Fatalf("1 consecutive failure reported Degraded")
 	}
 }
+
+// Stored timestamps are fixed-width text that sorts like time (store.TimeLayout).
+// RFC3339Nano trims trailing zeros, so a value written in that form would
+// parse here but mis-sort against its neighbours in SQL.
+func TestPollSuccessWritesFixedWidthTimestamps(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	ctx := context.Background()
+	req := newLiveRequest(t, svc, "fixedwidth1", *clock)
+	client := sequencedIlliadServer(t, nil, txnResponse("Awaiting Request Processing", 555))
+	if _, err := svc.Poll(ctx, req, PollDeps{Client: client, StatusPollMinutes: 60}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"last_successful_poll_at": got.LastSuccessfulPollAt,
+		"next_check_at":           got.NextCheckAt,
+	} {
+		if _, err := time.Parse(store.TimeLayout, value); err != nil {
+			t.Errorf("%s = %q is not fixed-width store.TimeLayout text: %v", name, value, err)
+		}
+	}
+}

@@ -368,6 +368,30 @@ test("owned keepalive writes birth before navigation and fails closed when its d
   expect(h.tabs.list()).toEqual([]);
 });
 
+test("a transient ledger read failure never overwrites the durable ledger with an empty one", async () => {
+  const h = makeHarness();
+  const record = fakeBirthRecord({ tab_hint: 41 });
+  let stored: Record<string, unknown> = { "41": record };
+  let failReads = true;
+  h.deps.tabLedger = {
+    load: async () => {
+      if (failReads) throw new Error("storage read failed");
+      return { ...stored };
+    },
+    save: async (entries) => {
+      stored = { ...entries };
+    },
+  };
+  await h.bridge.start();
+  const surfaces = (h.bridge as unknown as {
+    surfaces: { snapshotTabLedger(required?: boolean): Promise<Record<string, unknown>> };
+  }).surfaces;
+  await surfaces.snapshotTabLedger();
+  expect(Object.keys(stored)).toEqual(["41"]);
+  failReads = false;
+  expect(Object.keys(await surfaces.snapshotTabLedger())).toEqual(["41"]);
+});
+
 test("owned keepalive retires a failed first navigation and retries without an abandoned blank", async () => {
   const h = makeHarness();
   const ledger = installManagedTabLedger(h, {});
@@ -23612,7 +23636,7 @@ test("restart replays a pre-permit navigating correlation with cleanup-only shap
   });
   h.tabs.seed({
     id: 905,
-    url: "https://resolver.example.edu/open",
+    url: "chrome-extension://test/dist/materialize.html#bind_0001_abcdef",
     active: false,
     windowId: 500,
   });
@@ -23655,6 +23679,8 @@ test("restart replays a pre-permit navigating correlation with cleanup-only shap
     },
   });
   await run;
+  expect(h.tabs.snapshot(905)).toBeUndefined();
+  expect(h.backend.store.materializations?.["job_mat_legacy_restart"]).toBeUndefined();
 });
 
 test("cancelling materialization removes scaffold, retry timer, and correlation", async () => {
@@ -25196,8 +25222,10 @@ test("Slice 2b: a failed remove leaves the tombstone; startup replay completes i
       browser_holder_generation: 1,
     }),
   );
-  await closing;
-  // closeOwnedTab swallows the remove failure; the tab and its tombstone survive.
+  const closeResult = await closing;
+  // A rejected remove is not a close: no closed result, so no Reopen offer.
+  expect(closeResult.closed).toBe(false);
+  // The tab and its tombstone survive.
   expect(h.tabs.snapshot(tabID)).toBeDefined();
   expect(closeInternals(h).tabLedgerCache[String(tabID)]?.pending_close).toBeDefined();
 

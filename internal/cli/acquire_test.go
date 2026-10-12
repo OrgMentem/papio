@@ -288,47 +288,53 @@ func TestAcquireWaitUsesCurrentOpenActionGuidance(t *testing.T) {
 	}
 }
 
-func TestAcquireReportsExistingInFlightJob(t *testing.T) {
-	var out, errOut bytes.Buffer
-	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
-		if method != "acquire.submit_v2" {
-			return fmt.Errorf("unexpected method %q", method)
-		}
-		got, ok := params.(acquireSubmitV2Params)
-		if !ok || got.Force {
-			t.Fatalf("submit params = %#v, want non-forced v2 request", params)
-		}
-		*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_existing", Existing: true}
-		return nil
-	})
-	root.SetArgs([]string{"acquire", "--doi", "10.1000/existing"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("acquire: %v (%s)", err, errOut.String())
-	}
-	if got := out.String(); !strings.Contains(got, "Matched existing in-flight job job_existing") {
-		t.Fatalf("output = %q, want visible existing-job result", got)
-	}
-}
-
-func TestAcquireForceRequestsFreshJob(t *testing.T) {
-	var out, errOut bytes.Buffer
-	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
-		if method != "acquire.submit_v2" {
-			return fmt.Errorf("unexpected method %q", method)
-		}
-		got, ok := params.(acquireSubmitV2Params)
-		if !ok || !got.Force {
-			t.Fatalf("submit params = %#v, want forced v2 request", params)
-		}
-		*result.(*api.SubmitV2Result) = api.SubmitV2Result{JobID: "job_fresh"}
-		return nil
-	})
-	root.SetArgs([]string{"acquire", "--doi", "10.1000/force", "--force"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("acquire --force: %v (%s)", err, errOut.String())
-	}
-	if got := out.String(); got != "Queued job_fresh\n" {
-		t.Fatalf("output = %q, want fresh queue result", got)
+// The v2 submit shape is the contract: --force maps to Force, and the daemon's
+// Existing marker is what the operator sees. One row per observable shape.
+func TestAcquireSubmitV2RequestShape(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		extraArgs []string
+		wantForce bool
+		reply     api.SubmitV2Result
+		wantOut   string
+		exactOut  bool
+	}{
+		{
+			name:    "an existing in-flight job is reported, not requeued",
+			reply:   api.SubmitV2Result{JobID: "job_existing", Existing: true},
+			wantOut: "Matched existing in-flight job job_existing",
+		},
+		{
+			name:      "--force requests a fresh job",
+			extraArgs: []string{"--force"},
+			wantForce: true,
+			reply:     api.SubmitV2Result{JobID: "job_fresh"},
+			wantOut:   "Queued job_fresh\n",
+			exactOut:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params, result any) error {
+				if method != "acquire.submit_v2" {
+					return fmt.Errorf("unexpected method %q", method)
+				}
+				got, ok := params.(acquireSubmitV2Params)
+				if !ok || got.Force != tc.wantForce {
+					t.Fatalf("submit params = %#v, want a v2 request with Force = %t", params, tc.wantForce)
+				}
+				*result.(*api.SubmitV2Result) = tc.reply
+				return nil
+			})
+			root.SetArgs(append([]string{"acquire", "--doi", "10.1000/shape"}, tc.extraArgs...))
+			if err := root.ExecuteContext(context.Background()); err != nil {
+				t.Fatalf("acquire: %v (%s)", err, errOut.String())
+			}
+			got := out.String()
+			if tc.exactOut && got != tc.wantOut || !tc.exactOut && !strings.Contains(got, tc.wantOut) {
+				t.Fatalf("output = %q, want %q", got, tc.wantOut)
+			}
+		})
 	}
 }
 

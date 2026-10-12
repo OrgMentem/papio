@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -210,26 +211,27 @@ func (s CreditStatus) Exhausted() bool {
 	return s.DriftReason != "" || (!s.Unmetered && s.Committed >= s.Limit)
 }
 
-// CreditStatus reads one source's fuse state for the current UTC day.
+// CreditStatus reads one source's fuse state: the counters for the current UTC
+// day, and any sticky closure from any day, which only an acknowledgement ends.
 func (m *Manager) CreditStatus(ctx context.Context, source string) (CreditStatus, error) {
 	day := utcDay(m.now().UTC())
 	status := CreditStatus{Source: source, Day: day}
 	var row fuseRow
-	var reason sql.NullString
-	err := m.db.QueryRowContext(ctx, `SELECT credits_committed, denominator, drift_closed_at, drift_reason
+	err := m.db.QueryRowContext(ctx, `SELECT credits_committed, denominator
 		FROM source_credit_fuse WHERE source = ? AND utc_day = ?`, source, day).
-		Scan(&row.committed, &row.denominator, &row.driftClosed, &reason)
+		Scan(&row.committed, &row.denominator)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		// No row is a fact, not a miss: nothing has been spent today.
 	case err != nil:
 		return CreditStatus{}, err
 	}
-	if row.driftClosed.Valid && row.driftClosed.String != "" {
-		status.DriftReason = reason.String
-		if status.DriftReason == "" {
-			status.DriftReason = "cost schedule changed"
-		}
+	reason, closed, err := stickyClosure(ctx, m.db, source)
+	if err != nil {
+		return CreditStatus{}, err
+	}
+	if closed {
+		status.DriftReason = reason
 	}
 	status.Committed = row.committed
 	if row.denominator.Valid {
@@ -332,10 +334,44 @@ func (m *Manager) driftLatched(source string) (bool, string) {
 	return ok, entry.reason
 }
 
+// clearDriftLatch drops the in-process latch and reports whether one was set.
+func (m *Manager) clearDriftLatch(source string) bool {
+	m.latchMu.Lock()
+	defer m.latchMu.Unlock()
+	_, ok := m.driftLatches[source]
+	delete(m.driftLatches, source)
+	return ok
+}
+
 type fuseRow struct {
 	committed   int
 	denominator sql.NullInt64
-	driftClosed sql.NullString
+}
+
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// stickyClosure reports whether the source is closed until acknowledged, from
+// the newest durable closure on ANY UTC day. A closure is source-wide and has
+// no timed reopen (ADR-0024 §8); the fuse row it is recorded on is keyed by
+// day only because the counters beside it are, so reading just today's row
+// would let a restart after UTC midnight forget it.
+func stickyClosure(ctx context.Context, q rowQuerier, source string) (reason string, closed bool, err error) {
+	var stored sql.NullString
+	err = q.QueryRowContext(ctx, `SELECT drift_reason FROM source_credit_fuse
+		WHERE source = ? AND drift_closed_at IS NOT NULL AND drift_closed_at != ''
+		ORDER BY drift_closed_at DESC LIMIT 1`, source).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if stored.String == "" {
+		return "cost schedule changed", true, nil
+	}
+	return stored.String, true, nil
 }
 
 func (m *Manager) allowanceFor(row fuseRow, policy CreditPolicy) (limit int, unmetered bool) {
@@ -401,17 +437,19 @@ func (m *Manager) CommitEgress(ctx context.Context, req EgressRequest) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	row, err := m.readFuseRow(ctx, tx, req.Source, day)
-	if err != nil {
+	if _, closed, err := stickyClosure(ctx, tx, req.Source); err != nil {
 		return err
-	}
-	if row.driftClosed.Valid && row.driftClosed.String != "" {
+	} else if closed {
 		return &ErrExceeded{
 			Source:   req.Source,
 			Identity: req.Identity,
 			Kind:     KindCredits,
 			Window:   WindowSticky,
 		}
+	}
+	row, err := m.readFuseRow(ctx, tx, req.Source, day)
+	if err != nil {
+		return err
 	}
 
 	if egressTestHooks.enforceEgressGates {
@@ -542,9 +580,9 @@ func (m *Manager) otherWorkWaiting(ctx context.Context, exceptJobID string) bool
 
 func (m *Manager) readFuseRow(ctx context.Context, tx *sql.Tx, source, day string) (fuseRow, error) {
 	var row fuseRow
-	err := tx.QueryRowContext(ctx, `SELECT credits_committed, denominator, drift_closed_at
+	err := tx.QueryRowContext(ctx, `SELECT credits_committed, denominator
 		FROM source_credit_fuse WHERE source = ? AND utc_day = ?`, source, day).
-		Scan(&row.committed, &row.denominator, &row.driftClosed)
+		Scan(&row.committed, &row.denominator)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fuseRow{}, nil
 	}
@@ -705,6 +743,60 @@ func (m *Manager) DriftClose(ctx context.Context, source, reason string) error {
 			drift_reason = COALESCE(drift_reason, excluded.drift_reason)`,
 		source, day, store.FormatTime(m.now()), reason)
 	return err
+}
+
+// AcknowledgeClosure ends a sticky closure (ADR-0024 §8), which has no timed
+// reopen: only this explicit operator acknowledgement does. It clears the
+// closure on every UTC day row, because DriftClose and the prepaid observation
+// record it on the day's row but stickyClosure reads it from any day, and it
+// clears this Manager's in-process latch. cleared reports whether the source
+// was closed, durably or only in memory.
+//
+// The prepaid baseline of each cleared row is dropped with it. That baseline is
+// the "starting observation" a later balance is compared against, so keeping it
+// would close the source again at the next observation made the same UTC day.
+// Dropping it makes the next observed balance the new baseline, which is the
+// new schedule the operator acknowledged.
+//
+// The caller owns the audit trail: nothing durable records who acknowledged.
+func (m *Manager) AcknowledgeClosure(ctx context.Context, source string) (cleared bool, err error) {
+	if source == "" {
+		return false, errors.New("source name is required")
+	}
+	if !slices.Contains(config.SourceNames(), source) {
+		return false, fmt.Errorf("unknown source %q", source)
+	}
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `UPDATE source_credit_fuse
+		SET drift_closed_at = NULL, drift_reason = NULL, prepaid_baseline_usd = NULL
+		WHERE source = ? AND drift_closed_at IS NOT NULL`, source)
+	if err != nil {
+		return false, err
+	}
+	// A closure whose durable write failed lives only in the latch; the row
+	// that holds the baseline it compared against is still open, so the UPDATE
+	// above skipped it. Drop that baseline too or the next observation of the
+	// same balance would close the source again.
+	if latched, _ := m.driftLatched(source); latched {
+		if _, err := tx.ExecContext(ctx, `UPDATE source_credit_fuse
+			SET prepaid_baseline_usd = NULL WHERE source = ?`, source); err != nil {
+			return false, err
+		}
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	// After the commit: a failed transaction must leave the in-process latch
+	// closed, matching the closure that is still durable.
+	return m.clearDriftLatch(source) || rows > 0, nil
 }
 
 // EgressTestDisableGates turns off CommitEgress gate checks for mutation tests

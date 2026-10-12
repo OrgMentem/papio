@@ -119,3 +119,74 @@ func TestSupplyPDFRPCReportsTheOutcome(t *testing.T) {
 		t.Fatalf("supply_pdf result = %+v; want accepted and ready", result)
 	}
 }
+
+// The remaining refusals each carry their own class to the CLI: an oversize
+// file is the caller's argument, while a job that cannot take the file now is
+// a precondition they can settle and retry.
+func TestSupplyPDFRPCClassifiesSizeStateAndNotAwaitingRefusals(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a file over fetch.max_bytes is invalid_argument", func(t *testing.T) {
+		system := testSystem(t)
+		system.App.Config.Fetch.MaxBytes = 64
+		id := parkedSupplyJob(t, system, "wr_supply_rpc_size")
+		stageSupplyFixture(t, system, id, "supplied.pdf")
+		rpcErr := callMethod(t, Router(system), "jobs.supply_pdf", map[string]string{"job_id": id, "name": "supplied.pdf"}, nil)
+		if rpcErr == nil || rpcErr.Code != "invalid_argument" || !strings.Contains(rpcErr.Message, "limit 64") {
+			t.Fatalf("supply_pdf over the size limit = %+v; want invalid_argument naming the limit", rpcErr)
+		}
+		row, err := system.Jobs.Get(ctx, id)
+		if err != nil || row.State != job.StateAwaitingHuman {
+			t.Fatalf("job after refused supply = %+v, %v; want awaiting_human", row, err)
+		}
+	})
+
+	t.Run("a job already validating is precondition_failed", func(t *testing.T) {
+		system := testSystem(t)
+		id, err := system.Jobs.CreateRequest(ctx, "wr_supply_rpc_state", work.Work{DOI: "10.1000/wr_supply_rpc_state", Title: "Supplied work"}, "", "",
+			job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalCLI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, step := range [][2]string{
+			{job.StateQueued, job.StateResolving},
+			{job.StateResolving, job.StateFetching},
+			{job.StateFetching, job.StateValidating},
+		} {
+			if err := system.Jobs.Transition(ctx, id, step[0], step[1], nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stageSupplyFixture(t, system, id, "supplied.pdf")
+		rpcErr := callMethod(t, Router(system), "jobs.supply_pdf", map[string]string{"job_id": id, "name": "supplied.pdf"}, nil)
+		if rpcErr == nil || rpcErr.Code != "precondition_failed" || rpcErr.Detail != nil {
+			t.Fatalf("supply_pdf to a validating job = %+v; want a plain precondition_failed", rpcErr)
+		}
+	})
+
+	t.Run("a parked job with no open action is not waiting for a PDF", func(t *testing.T) {
+		system := testSystem(t)
+		system.App.Validate = func(context.Context, string, string, work.Work) (pdf.ValidationReport, error) {
+			return pdf.ValidationReport{
+				Payload:    pdf.PayloadReport{OK: true},
+				Structural: pdf.StructuralReport{Valid: true, Pages: 2},
+				Text:       pdf.TextReport{Chars: 2000},
+				Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass, Evidence: []string{"doi match"}},
+			}, nil
+		}
+		id := parkedSupplyJob(t, system, "wr_supply_rpc_not_awaiting")
+		open, err := system.Jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+		if err != nil || len(open) == 0 {
+			t.Fatalf("open actions = %+v, %v; want the parking action", open, err)
+		}
+		for _, action := range open {
+			if err := system.Jobs.ResolveHumanAction(ctx, action.ID, "resolved"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stageSupplyFixture(t, system, id, "supplied.pdf")
+		rpcErr := callMethod(t, Router(system), "jobs.supply_pdf", map[string]string{"job_id": id, "name": "supplied.pdf"}, nil)
+		if rpcErr == nil || rpcErr.Code != "precondition_failed" || !strings.Contains(rpcErr.Message, "not waiting for a PDF") {
+			t.Fatalf("supply_pdf with no open action = %+v; want precondition_failed saying the job is not waiting for a PDF", rpcErr)
+		}
+	})
+}

@@ -1,7 +1,11 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 package ownership
 
-import "context"
+import (
+	"context"
+	"errors"
+	"io"
+)
 
 // Registry is the daemon's configured set of holdings providers, shared by
 // search, batch submission, and watches so they read one cache rather than each
@@ -47,6 +51,21 @@ func (r *Registry) Names() []string {
 		names = append(names, provider.Name())
 	}
 	return names
+}
+
+// Close stops every provider that holds background work, such as a running
+// library exporter. It is safe on a nil or empty Registry.
+func (r *Registry) Close() error {
+	if r == nil {
+		return nil
+	}
+	var errs []error
+	for _, provider := range r.providers {
+		if closer, ok := provider.(io.Closer); ok {
+			errs = append(errs, closer.Close())
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Lookup aggregates every provider's claims for the given queries.

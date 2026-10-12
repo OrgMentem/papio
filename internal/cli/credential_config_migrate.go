@@ -143,14 +143,14 @@ func migrateCredentials(ctx context.Context, opt *options, deps credentialConfig
 		}
 	}
 	if err := deps.saveConfig(next, cfg.Path, snapshot); err != nil {
-		return result, stagedCredentialError(errors.New("configuration changed or could not be saved; original configuration was not replaced"), result.Credentials)
+		return result, stagedCredentialError(configSaveError(err, "original configuration was not replaced"), result.Credentials)
 	}
 
 	// The bindings now own every staged reference. The save is committed, so
 	// a journal failure must say the configuration was saved.
 	for _, staged := range result.Credentials {
 		if err := clearPendingCredential(cfg.Path, staged.Reference); err != nil {
-			return result, errors.New("configuration saved, but the pending credential journal could not be updated; old vault entries are unchanged; inspect pending-credentials.json beside the configuration before restarting")
+			return result, fmt.Errorf("configuration saved, but the pending credential journal could not be updated; old vault entries are unchanged; inspect %s before restarting", pendingCredentialPath(cfg.Path))
 		}
 	}
 	for i, entry := range inventory {

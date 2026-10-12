@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"papio/internal/agentcredential"
 	"papio/internal/cli"
 	"papio/internal/nativehost"
 	"papio/internal/pdf"
@@ -32,6 +33,18 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == agentcredential.HelperArgument {
+		if err := agentcredential.RunHelper(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "credential helper:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// A hung OS credential call cannot be cancelled in process. Running each
+	// call in a helper process lets the deadline kill it and free the gate.
+	if executable, err := os.Executable(); err == nil {
+		agentcredential.UseHelperProcess(executable)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

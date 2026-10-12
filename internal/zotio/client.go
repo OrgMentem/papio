@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"papio/internal/config"
+	"papio/internal/hook"
 )
 
 const (
@@ -103,6 +104,8 @@ type Client struct {
 	Executable string
 	Timeout    time.Duration
 	Exec       ExecFunc
+	// waitDelay overrides runWaitDelay; tests shorten it.
+	waitDelay time.Duration
 	// desktopPresence caches whether this zotio advertises
 	// DesktopPresenceCapabilities (see desktop.go).
 	desktopPresence atomic.Int32
@@ -410,12 +413,33 @@ func (c *Client) RunJSON(ctx context.Context, args ...string) (json.RawMessage, 
 	return json.RawMessage(bytes.TrimSpace(out)), runErr
 }
 
+// runWaitDelay bounds how long run waits on zotio's output pipes after the
+// command ends or the deadline kills it. A descendant that inherited stdout or
+// stderr holds those pipes open past its parent; without a bound the deadline
+// and parent cancellation never return.
+const runWaitDelay = 5 * time.Second
+
+// definiteFailure marks a failure that proves zotio never reached a point
+// where it could have changed Zotero: it was not configured or could not
+// start, or it ran to its own non-zero exit. Any other failure of a mutating
+// run (a signal, an output cap, unreadable output) leaves the outcome unknown,
+// and Apply must treat it as ambiguous instead of a refusal.
+type definiteFailure struct{ err error }
+
+func (e *definiteFailure) Error() string { return e.err.Error() }
+func (e *definiteFailure) Unwrap() error { return e.err }
+
+func isDefiniteFailure(err error) bool {
+	var definite *definiteFailure
+	return errors.As(err, &definite)
+}
+
 func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	if c.Exec != nil {
 		return c.Exec(ctx, args...)
 	}
 	if strings.TrimSpace(c.Executable) == "" {
-		return nil, errors.New("zotio executable is not configured")
+		return nil, &definiteFailure{errors.New("zotio executable is not configured")}
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
@@ -426,7 +450,7 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 
 	path, err := exec.LookPath(c.Executable)
 	if err != nil {
-		return nil, fmt.Errorf("locating %q: %w", c.Executable, err)
+		return nil, &definiteFailure{fmt.Errorf("locating %q: %w", c.Executable, err)}
 	}
 	cmd := exec.CommandContext(ctx, path, args...)
 	// papio's Zotio boundary is intentionally personal-library scoped. Group
@@ -438,7 +462,11 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	stderr.max = maxStderrBytes
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err = cmd.Run()
+	cmd.WaitDelay = c.pipeWaitDelay()
+	// The deadline and parent cancellation kill the whole process tree, and
+	// the tree is reaped once zotio is waited for, so a launcher's descendant
+	// cannot keep the pipes open or outlive the command.
+	err = hook.RunConfinedAndReap(cmd)
 	// context.Canceled (parent/daemon shutdown) and context.DeadlineExceeded
 	// (real timeout) both surface through ctx.Err(); they must not collapse into
 	// one retryable "timed out" outcome. Preserve stdout on either path so
@@ -453,17 +481,36 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	if stdout.overflow {
 		return nil, fmt.Errorf("zotio stdout exceeds %d bytes", maxStdoutBytes)
 	}
-	if stderr.overflow {
-		return nil, fmt.Errorf("zotio stderr exceeds %d bytes", maxStderrBytes)
+	// A descendant held stderr past zotio's own successful exit. zotio's
+	// result is stdout, which its own exit already closed; the stalled
+	// descendant was reaped above.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
 	}
+	// Stderr is only diagnostics, and boundedBuffer already keeps its first
+	// maxStderrBytes: a chatty command must not discard the stdout result of a
+	// mutation that succeeded.
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = err.Error()
 		}
-		return stdout.Bytes(), fmt.Errorf("zotio %s: %s", commandName(args), detail)
+		failure := fmt.Errorf("zotio %s: %s", commandName(args), detail)
+		var exit *exec.ExitError
+		if cmd.Process == nil || (errors.As(err, &exit) && exit.ExitCode() >= 0) {
+			failure = &definiteFailure{failure}
+		}
+		return stdout.Bytes(), failure
 	}
 	return stdout.Bytes(), nil
+}
+
+// pipeWaitDelay is how long run waits on output pipes after zotio ends.
+func (c *Client) pipeWaitDelay() time.Duration {
+	if c.waitDelay > 0 {
+		return c.waitDelay
+	}
+	return runWaitDelay
 }
 
 func withoutEnv(environ []string, name string) []string {

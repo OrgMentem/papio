@@ -50,20 +50,6 @@ func TestDecodeCohortRejectsUnknownRequestField(t *testing.T) {
 	}
 }
 
-func TestDecodeCohortRejectsWrongSchemaVersion(t *testing.T) {
-	doc := `{"schema_version": "papio-bench-cohort/2", "id": "x", "works": [{"key": "a", "request": {"doi": "10.1000/a"}, "expected_class": "autonomous_ready"}]}`
-	if _, err := DecodeCohort(strings.NewReader(doc)); err == nil {
-		t.Fatal("DecodeCohort with the wrong schema_version succeeded, want an error")
-	}
-}
-
-func TestDecodeCohortRejectsEmptyID(t *testing.T) {
-	doc := `{"schema_version": "papio-bench-cohort/1", "id": "", "works": [{"key": "a", "request": {"doi": "10.1000/a"}, "expected_class": "autonomous_ready"}]}`
-	if _, err := DecodeCohort(strings.NewReader(doc)); err == nil {
-		t.Fatal("DecodeCohort with an empty id succeeded, want an error")
-	}
-}
-
 func TestDecodeCohortRejections(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -91,6 +77,14 @@ func TestDecodeCohortRejections(t *testing.T) {
 			doc: `{"schema_version": "papio-bench-cohort/1", "id": "x", "works": [
 		{"key": "a", "request": {"doi": "10.1000/a"}, "expected_class": "probably_fine"}
 	]}`,
+		},
+		{
+			name: "wrong schema version",
+			doc:  `{"schema_version": "papio-bench-cohort/2", "id": "x", "works": [{"key": "a", "request": {"doi": "10.1000/a"}, "expected_class": "autonomous_ready"}]}`,
+		},
+		{
+			name: "empty cohort id",
+			doc:  `{"schema_version": "papio-bench-cohort/1", "id": "", "works": [{"key": "a", "request": {"doi": "10.1000/a"}, "expected_class": "autonomous_ready"}]}`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

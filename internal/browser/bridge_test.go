@@ -2124,6 +2124,37 @@ func TestHumanActionResolveDismissClosesStaleNonReviewAction(t *testing.T) {
 	}
 }
 
+// A dismissal that lost the race to another dismissal (or any other close of
+// the action) is a conflict the inbox answers by refreshing, not an error.
+func TestHumanActionResolveDismissOfAlreadyClosedActionIsConflict(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss_twice", work.Work{DOI: "10.1000/dismiss2", Title: "Dismiss me twice"}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionID, err := jobs.OpenHumanAction(context.Background(), id, "manual_download", "a resolver returned a landing page", job.Access(false, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSync(t, b, hello())
+	dismiss := func(requestID string) *protocol.HumanActionResolveResultPayload {
+		t.Helper()
+		msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHumanActionResolve, "",
+			protocol.HumanActionResolvePayload{RequestID: requestID, ActionID: actionID, Verdict: "dismiss", ExpectedRevision: 1}))
+		result := firstOfType(msgs, protocol.MsgHumanActionResolveResult)
+		if result == nil {
+			t.Fatalf("human action resolve response missing: %v", msgs)
+		}
+		return result.Payload.(*protocol.HumanActionResolveResultPayload)
+	}
+	if first := dismiss("request-dismiss-first"); first.Outcome != "applied" {
+		t.Fatalf("first dismiss = %+v, want applied", first)
+	}
+	if second := dismiss("request-dismiss-second"); second.Outcome != "conflict" {
+		t.Fatalf("second dismiss of the closed action = %+v, want conflict", second)
+	}
+}
+
 func TestHumanActionResolveDismissCancelsAwaitingHandoff(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id, err := jobs.CreateRequest(context.Background(), "wr_browser_dismiss_awaiting", work.Work{DOI: "10.1000/dismiss", Title: "Dismiss me"}, "", "", job.Policy{AccessMode: config.ModeDelegated, DesiredVersion: "any", FetchMaxBytes: 1 << 20}, nil, job.PrincipalUnknown)
@@ -7240,10 +7271,9 @@ func TestProviderFreeTextIsRedactedBeforeItIsDurable(t *testing.T) {
 }
 
 // An offered direct-route tuple remains in flight until its exact permit is
-// settled. An elapsed offer lease is diagnostic only: it cannot authorize a
-// replay, because at-most-once permit semantics must not mint a second
-// attempt. Reconciliation or an explicit break-glass action resolves a lost
-// completion.
+// settled. Elapsed time cannot authorize a replay, because at-most-once
+// permit semantics must not mint a second attempt. Reconciliation or an
+// explicit break-glass action resolves a lost completion.
 func TestUnacknowledgedDirectRouteOfferRemainsInFlightWithoutReplay(t *testing.T) {
 	candidates := []routes.Candidate{{RouteRevision: "rev-1"}}
 	issued := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
@@ -7255,12 +7285,9 @@ func TestUnacknowledgedDirectRouteOfferRemainsInFlightWithoutReplay(t *testing.T
 			"drive_attempt_id": "attempt-1", "phase": "offered",
 		},
 	}}
-	if _, inFlight, _ := directRouteProgress(events, candidates, issued.Add(time.Minute)); !inFlight {
-		t.Fatal("a fresh offer must still count as in flight")
-	}
-	_, inFlight, retainedAttempt := directRouteProgress(events, candidates, issued.Add(directRouteOfferLease+time.Second))
+	_, inFlight, retainedAttempt := directRouteProgress(events, candidates)
 	if !inFlight {
-		t.Fatal("an unacknowledged offer must remain in flight after its diagnostic lease")
+		t.Fatal("an unacknowledged offer must remain in flight")
 	}
 	if retainedAttempt != "attempt-1" {
 		t.Fatalf("in-flight projection lost its diagnostic identity: %q", retainedAttempt)
@@ -8357,14 +8384,13 @@ func TestPersistedProviderOutcomeDetailIsRedacted(t *testing.T) {
 	}
 }
 
-// The offer lease must never touch a tuple that was answered. Applying it to
-// the in-flight latch itself un-terminated answered tuples: ten minutes after
-// a login/terms result the identical candidate became re-drivable, and a
-// not_pdf result stopped advancing the ordinal.
-func TestDirectRouteLeaseDoesNotResurrectAnsweredTuples(t *testing.T) {
+// An answered tuple keeps its terminal projection: a login/terms result stays
+// in flight with no pending attempt, and a not_pdf result advances the
+// ordinal. Projection depends on the event history alone, never on elapsed
+// time.
+func TestDirectRouteAnsweredTuplesKeepTheirProjection(t *testing.T) {
 	candidates := []routes.Candidate{{RouteRevision: "rev-1"}, {RouteRevision: "rev-2"}}
 	issued := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
-	longAfter := issued.Add(directRouteOfferLease + time.Hour)
 	offer := map[string]any{
 		"kind": "browser.direct_route", "at": issued.Format(time.RFC3339Nano),
 		"detail": map[string]any{
@@ -8382,13 +8408,13 @@ func TestDirectRouteLeaseDoesNotResurrectAnsweredTuples(t *testing.T) {
 		}
 	}
 	// A terminal non-advancing result stays terminal forever.
-	next, inFlight, pending := directRouteProgress([]map[string]any{offer, result("login")}, candidates, longAfter)
+	next, inFlight, pending := directRouteProgress([]map[string]any{offer, result("login")}, candidates)
 	if next != 0 || !inFlight || pending != "" {
 		t.Fatalf("answered login tuple = (next=%d inFlight=%v pending=%q); want it to stay terminal at ordinal 0",
 			next, inFlight, pending)
 	}
 	// An advancing result keeps its advance.
-	next, inFlight, _ = directRouteProgress([]map[string]any{offer, result("not_pdf")}, candidates, longAfter)
+	next, inFlight, _ = directRouteProgress([]map[string]any{offer, result("not_pdf")}, candidates)
 	if next != 1 || inFlight {
 		t.Fatalf("answered not_pdf tuple = (next=%d inFlight=%v); want ordinal 1 and not in flight", next, inFlight)
 	}
@@ -8410,14 +8436,9 @@ func TestStalledDriveEpochIsSupersededByTheNextOffer(t *testing.T) {
 	if frames, err := b.providerDriveEpochStart(ctx, id, start); err != nil || permitOutcome(t, frames) != "started" {
 		t.Fatalf("start err=%v", err)
 	}
-	// Lease expiry is not authorization.
-	if b.driveEpochStalled(id, attempt, 0) {
-		t.Fatal("a just-started epoch must not be reported as stalled")
-	}
-	b.now = func() time.Time { return time.Now().UTC().Add(providerDriveEpochLease + time.Minute) }
-	if b.driveEpochStalled(id, attempt, 0) {
-		t.Fatal("elapsed time must not report a stalled effect")
-	}
+	// Elapsed time is not authorization: the poll and re-offer below must
+	// leave the started permit exactly as it was.
+	b.now = func() time.Time { return time.Now().UTC().Add(11 * time.Minute) }
 	row, err := jobs.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -10498,12 +10519,6 @@ func pdfGrabRefusalCases() []pdfGrabRefusalCase {
 			runSyncAs(t, b, outdated, helloWithFeatures(t, "0.4.0", pdfGrabV1Feature, effectPermitFeature))
 			return pdfGrabVia(t, b, outdated, "pdf-outdated-0001", "pdf.example.org")
 		}},
-		{"daemon without pdf_grab_v1", grabReasonDaemonUnsupported, func(t *testing.T) *protocol.PdfGrabResultPayload {
-			b, _, _, _ := newBridge(t)
-			grabCapableHello(t, b)
-			b.Features = slices.DeleteFunc(slices.Clone(b.Features), func(f string) bool { return f == pdfGrabV1Feature })
-			return pdfGrabVia(t, b, testSessionID, "pdf-daemon-old-0001", "pdf.example.org")
-		}},
 		{"grab storage not configured", grabReasonNotConfigured, func(t *testing.T) *protocol.PdfGrabResultPayload {
 			b, _, _, _ := newBridge(t)
 			grabCapableHello(t, b)
@@ -10568,7 +10583,7 @@ func TestPdfGrabRefusalsCarryTheirOwnReason(t *testing.T) {
 		seen[tc.reason] = true
 	}
 	for _, reason := range []string{
-		grabReasonNoSession, grabReasonExtensionOutdated, grabReasonDaemonUnsupported,
+		grabReasonNoSession, grabReasonExtensionOutdated,
 		grabReasonBusy, grabReasonNotConfigured, grabReasonAdoptionUnhealthy,
 		grabReasonTabUnusable, grabReasonInternal,
 	} {
@@ -14741,9 +14756,6 @@ func TestProviderDriveEffectPermitStartDuplicateAndAgeDoNotSupersede(t *testing.
 	}
 	advance := settableClock(b)
 	advance(11 * time.Minute)
-	if b.driveEpochStalled(id, "permit-start-attempt", 0) {
-		t.Fatal("elapsed time reported a stalled effect")
-	}
 	row, err := jobs.Get(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)

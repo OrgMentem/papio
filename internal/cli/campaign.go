@@ -39,6 +39,42 @@ type campaignRecord struct {
 	WorkIndex int             `json:"work_index"`
 	Error     string          `json:"error,omitempty"`
 }
+
+// legacyCampaignCitation is the citation shape stored by manifests written
+// before ISBN left bibparse.Record. The ISBN key is tolerated and dropped.
+type legacyCampaignCitation struct {
+	SourceKey string
+	DOI       string
+	PMID      string
+	ArXiv     string
+	Title     string
+	Authors   []string
+	Year      int
+	ISBN      *string
+}
+
+// UnmarshalJSON decodes strictly, tolerating only the legacy citation ISBN key.
+func (r *campaignRecord) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Ordinal   int                    `json:"ordinal"`
+		SourceKey string                 `json:"source_key,omitempty"`
+		Citation  legacyCampaignCitation `json:"citation"`
+		WorkIndex int                    `json:"work_index"`
+		Error     string                 `json:"error,omitempty"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	c := raw.Citation
+	*r = campaignRecord{
+		Ordinal: raw.Ordinal, SourceKey: raw.SourceKey, WorkIndex: raw.WorkIndex, Error: raw.Error,
+		Citation: bibparse.Record{SourceKey: c.SourceKey, DOI: c.DOI, PMID: c.PMID, ArXiv: c.ArXiv, Title: c.Title, Authors: c.Authors, Year: c.Year},
+	}
+	return nil
+}
+
 type campaignChunk struct {
 	Start   int    `json:"start"`
 	End     int    `json:"end"`
@@ -97,7 +133,7 @@ func newCampaignCommand(opt *options) *cobra.Command {
 			if len(source.SourceKey) > 1024 {
 				return fmt.Errorf("source key at record %d exceeds 1024 bytes", i+1)
 			}
-			encoded, _ := json.Marshal(map[string]any{"doi": record.DOI, "pmid": record.PMID, "arxiv": record.ArXiv, "isbn": record.ISBN, "title": record.Title, "authors": record.Authors, "year": record.Year})
+			encoded, _ := json.Marshal(map[string]any{"doi": record.DOI, "pmid": record.PMID, "arxiv": record.ArXiv, "title": record.Title, "authors": record.Authors, "year": record.Year})
 			request, err := batch.ParseWork(encoded)
 			if err != nil {
 				source.Error = err.Error()

@@ -76,7 +76,6 @@ func convert(record Record) (protocol.WorkRequest, error) {
 		"doi":   record.DOI,
 		"pmid":  record.PMID,
 		"arxiv": record.ArXiv,
-		"isbn":  record.ISBN,
 		"title": record.Title,
 	} {
 		if value = strings.TrimSpace(value); value != "" {

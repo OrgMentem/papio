@@ -156,15 +156,13 @@ func mergeObservedInMemory(base, observed work.Work) work.Work {
 	return fillMissing(base, observed)
 }
 
-// insufficientIdentitySettlementDetail names what additional authority would
-// settle a title-only sparse anchor.
+// insufficientIdentitySettlementDetail names the recovery route for a
+// title-only sparse anchor: a richer resubmission (ADR-0025 Decision 6).
 func insufficientIdentitySettlementDetail() map[string]any {
 	return map[string]any{
 		"reason": "insufficient_identity_evidence",
 		"settlement": []string{
-			"a second resolver agreeing on the same work",
-			"a matching identifier from another registry",
-			"human confirmation of identity",
+			"resubmit with an identifier, a year, or authors",
 		},
 	}
 }

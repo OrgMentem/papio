@@ -89,6 +89,23 @@ execution records kept during the initial build.
   change, and a daemon older than this one never receives the message.
 - `papio activity --before-seq <seq>` pages back past the newest 200 events; a
   truncated text page prints the command for the next page.
+- **`papio config acknowledge-closure <source> --confirm` reopens a source
+  that a cost-drift or prepaid-balance closure shut.** Such a closure now stays
+  in force across UTC midnight and daemon restarts until you acknowledge it, as
+  ADR-0024 requires; before, a restart after midnight forgot it. `papio doctor`
+  names the command. The MCP command tools do not offer it, because it reopens
+  paid egress.
+- `papio config set-access-mode <mode>` changes `access_mode` and keeps every
+  other setting. `papio config init --force` still replaces the whole file, and
+  now says so.
+- `papio inbox --cursor <token>` pages past the first page; a truncated page
+  prints the next command. Each row now starts with the id that
+  `papio inbox decide` takes.
+- `papio jobs refile --dry-run` prints the `on_ready` command a refile would
+  run, and runs nothing.
+- `papio delivery submit` without `--confirm` now says whether `--confirm`
+  would place a real provider request, open a prefill action, or reuse an
+  existing request.
 
 ### Changed
 - **A new paper reaches its Zotero collection, with its DOI and abstract,
@@ -138,6 +155,61 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **`papio jobs add-component` accepts a supplement from any path.** It copies
+  the file into the data directory, like `jobs supply-pdf`, and leaves your
+  original in place. Before, it accepted only a file in the job's adoption
+  directory, which the daemon deletes for a ready job, and then reported a
+  false "no main artifact". The MCP command tools no longer offer it, because
+  it reads a local file.
+- **A zotio import that times out, is interrupted, or ends with no readable
+  result no longer creates a second Zotero item.** *papio* now checks the
+  library: it files the paper, attaches the PDF to the item the interrupted save
+  created, or retries once. It retries a create only when Zotero desktop is
+  running, because an empty web library does not prove that desktop has no copy.
+  A result it still cannot confirm, including a parent item that is gone, fails
+  with `zotio_apply_unconfirmed` instead of replaying the old timeout. zotio
+  commands also stop at their deadline when a helper process keeps their output
+  open.
+- Confirming a parked PDF capture against a job that leaves the pool during the
+  confirm no longer strands the capture; it stays parked for another job.
+- Batch submissions and watches recognise works already in Zotero by PMID or
+  ISBN, not only by DOI or arXiv id.
+- BibTeX values keep escaped `\_`, `\&`, `\%`, `\$` and `\#`, so a DOI such as
+  `10.1000/a\_b` is no longer corrupted.
+- Opening a human action and parking its job now commit together on the
+  exhausted-candidate and fulfilled-delivery paths, so a failed park no longer
+  leaves an open action on a job that is not waiting.
+- Stopping the daemon while a library export command hangs now kills that
+  command. A library file read that stalls no longer delays every ownership
+  lookup.
+- `--config <path>` naming a missing file now fails instead of silently using
+  the defaults and the default daemon.
+- `papio daemon status` and `papio daemon stop` say whether the daemon is
+  stopped, starting, or upgrading its database; `daemon stop` succeeds when no
+  daemon runs, and fails when it cannot reach the socket (for example, a
+  permission error) rather than reporting that nothing runs.
+- Configuration saves and the pending-credential journal are flushed to disk
+  before they report success. `papio config credentials status` keeps journaled
+  references when the OS credential store is unavailable, and a hung OS
+  credential call no longer blocks credential access until a restart.
+- `papio actions list` shows each action's revision. `papio jobs list --state`
+  rejects an unknown state and accepts `awaiting-human`. `papio bundle export
+  -o <relative dir>` writes where you ran it. `papio jobs cancel`,
+  `papio grabs identify` and `papio jobs repair-awaiting-human` exit nonzero
+  when they changed nothing. An unknown job id is named in the error.
+- `papio inbox decide` on an action id or an unknown id says what to run
+  instead of reporting a conflict. `papio delivery get` shows the request id
+  that `papio delivery resume` needs, and `delivery resume` explains a job id
+  given in its place.
+- Dismissing an inbox action that something else already closed reports a
+  conflict instead of an error.
+- A terminal `insufficient_identity_evidence` job now names the one recovery
+  ADR-0025 allows: resubmit with an identifier, a year, or authors.
+- The paid OpenAlex comparison (`cmd/openalexyield`) counts credits only for
+  answered requests and exits nonzero when a request failed.
+- The privacy page now matches the defaults: `papio search` uses OpenAlex,
+  `papio init` enables update checks, retraction checks cover *papio*-acquired
+  works, and purging every capture needs `--all`.
 - Campaign retries retain existing job receipts when the library now holds
   the acquired PDF, keeping reports and active-work limits correct.
 - New-only Zotio searches reject works without a supported exact identifier
@@ -687,6 +759,8 @@ execution records kept during the initial build.
 - Candidate URLs stored in the job database and resolver evidence now mask
   token-shaped path segments, so a download grant signed into the URL path is
   no longer persisted.
+- Updated `golang.org/x/net` to v0.60.0 (GO-2026-6603, GO-2026-6610,
+  GO-2026-6611, GO-2026-6612, GO-2026-6617; none was reachable from *papio*).
 
 ## [0.22.1] - 2026-09-23
 

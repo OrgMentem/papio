@@ -101,7 +101,12 @@ func newExportCommand(opt *options) *cobra.Command {
 			for _, id := range args {
 				detail, err := jobDetail(cmd.Context(), opt, id)
 				if err != nil {
-					return err
+					// With several ids, the operator must be able to tell which one
+					// failed; a daemon that already names the id says so itself.
+					if strings.Contains(err.Error(), id) {
+						return err
+					}
+					return fmt.Errorf("job %q: %w", id, err)
 				}
 				if detail.Job == nil {
 					return fmt.Errorf("job %q: daemon returned no job row", id)

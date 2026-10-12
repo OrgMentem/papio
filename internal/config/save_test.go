@@ -113,6 +113,67 @@ func TestSaveDetectsExternalEditDuringStaging(t *testing.T) {
 	assertNoConfigTemporaryFiles(t, filepath.Dir(path))
 }
 
+// TestSaveFlushesTheDirectoryAfterTheRename pins the crash barrier: a save may
+// not report success until the rename itself is on stable storage, because the
+// credential commands clear their recovery journal on that success.
+func TestSaveFlushesTheDirectoryAfterTheRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := credentialConfig()
+	if err := Save(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Email = "replacement@example.test"
+
+	t.Run("flushes after the new file is in place", func(t *testing.T) {
+		var flushed []string
+		restore := syncConfigDir
+		t.Cleanup(func() { syncConfigDir = restore })
+		syncConfigDir = func(dir string) error {
+			got, err := os.ReadFile(path)
+			if err != nil || !bytes.Contains(got, []byte("replacement@example.test")) {
+				t.Errorf("directory flushed before the rename published the new config: %q, %v", got, err)
+			}
+			flushed = append(flushed, dir)
+			return nil
+		}
+		if err := Save(cfg, path); err != nil {
+			t.Fatal(err)
+		}
+		if len(flushed) != 1 {
+			t.Fatalf("flushed directories = %v, want exactly the config directory", flushed)
+		}
+		flushedInfo, err := os.Stat(flushed[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		configInfo, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(flushedInfo, configInfo) {
+			t.Fatalf("flushed %s, want the config directory %s", flushed[0], filepath.Dir(path))
+		}
+	})
+
+	t.Run("a failed flush is an uncertain publication, not success", func(t *testing.T) {
+		restore := syncConfigDir
+		t.Cleanup(func() { syncConfigDir = restore })
+		flushFailure := errors.New("flush failed")
+		syncConfigDir = func(string) error { return flushFailure }
+		snapshot, err := ReadSnapshot(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = SaveIfUnchanged(cfg, path, snapshot)
+		if !errors.Is(err, ErrPublicationUncertain) || !errors.Is(err, flushFailure) {
+			t.Fatalf("SaveIfUnchanged = %v, want ErrPublicationUncertain wrapping the flush failure", err)
+		}
+		if got, _ := os.ReadFile(path); !bytes.Contains(got, []byte("replacement@example.test")) {
+			t.Fatalf("an uncertain publication must still leave the new config visible, got %q", got)
+		}
+	})
+}
+
 func assertNoConfigTemporaryFiles(t *testing.T, dir string) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)

@@ -157,7 +157,26 @@ func configureCommandGroups(command *cobra.Command) {
 	}
 }
 
+// errConfigMissing is an explicit --config path that names no file.
+type errConfigMissing struct{ path string }
+
+func (e *errConfigMissing) Error() string {
+	return fmt.Sprintf("config file %s does not exist; run 'papio init --config %s' to create it, or omit --config to use %s", e.path, e.path, defaultConfigPath())
+}
+
+func defaultConfigPath() string { return filepath.Join(config.Dir(), "config.toml") }
+
+// loadConfig loads the configuration for a command. A missing file means
+// defaults only at the default path, where first-run setup relies on it. An
+// explicit --config that names no file is a typo or a moved profile, and
+// defaults there would run the command against the default profile's daemon.
+// init and config init never come here; they create the file.
 func (o *options) loadConfig() (config.Config, error) {
+	if o.configPath != "" && filepath.Clean(o.configPath) != defaultConfigPath() {
+		if _, err := os.Stat(o.configPath); errors.Is(err, os.ErrNotExist) {
+			return config.Config{}, &errConfigMissing{path: o.configPath}
+		}
+	}
 	if o.configLoader != nil {
 		return o.configLoader(o.configPath)
 	}
@@ -449,18 +468,21 @@ func newConfigCommand(opt *options) *cobra.Command {
 	initCommand := &cobra.Command{
 		Use:   "init",
 		Short: "Write explicit first-run configuration",
+		Long:  "Write a new configuration with defaults and the given access mode. With --force it replaces an existing file: every other setting, including data_dir, institutions, sources, hooks and credential bindings, is reset to defaults, and no backup is kept. To change only the access mode, use 'papio config set-access-mode'.",
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
 			path := opt.configPath
 			if path == "" {
-				path = filepath.Join(config.Dir(), "config.toml")
+				path = defaultConfigPath()
 			}
-			if !force {
-				if _, err := os.Lstat(path); err == nil {
-					return fmt.Errorf("config already exists at %s (use --force to replace it)", path)
-				} else if !errors.Is(err, os.ErrNotExist) {
-					return err
+			replacing := false
+			if _, err := os.Lstat(path); err == nil {
+				if !force {
+					return fmt.Errorf("config already exists at %s (use --force to replace it and reset every other setting; to change only the access mode, run 'papio config set-access-mode %s')", path, mode)
 				}
+				replacing = true
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
 			}
 			cfg := config.Default()
 			cfg.AccessMode = mode
@@ -471,14 +493,52 @@ func newConfigCommand(opt *options) *cobra.Command {
 			if err := config.Save(cfg, path); err != nil {
 				return err
 			}
+			if replacing {
+				return opt.printResult(map[string]string{"config_path": path, "access_mode": mode, "replaced": "true"},
+					"Replaced %s (access_mode=%s); data_dir, institutions, sources, hooks and credential bindings were reset to defaults", path, mode)
+			}
 			return opt.printResult(map[string]string{"config_path": path, "access_mode": mode}, "Wrote %s (access_mode=%s)", path, mode)
 		},
 	}
 	initCommand.Flags().StringVar(&mode, "access-mode", "", "required: conservative, assisted, or delegated")
 	initCommand.Flags().StringVar(&email, "email", "", "contact email for polite APIs")
 	initCommand.Flags().StringVar(&dataDir, "data-dir", "", "artifact and database directory")
-	initCommand.Flags().BoolVar(&force, "force", false, "replace an existing config")
+	initCommand.Flags().BoolVar(&force, "force", false, "replace an existing config and reset every other setting")
 	_ = initCommand.MarkFlagRequired("access-mode")
-	command.AddCommand(initCommand, newAgentConfigCommand(opt), newCredentialConfigCommand(opt))
+	setAccessMode := &cobra.Command{
+		Use:   "set-access-mode MODE",
+		Short: "Change access_mode in the existing config and keep every other setting",
+		Long:  "Set access_mode to conservative, assisted, or delegated in the existing configuration. Every other setting is kept. A running daemon keeps its old mode until it restarts.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			path := opt.configPath
+			if path == "" {
+				path = defaultConfigPath()
+			}
+			if _, err := os.Stat(path); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("config file %s does not exist; run 'papio init' to create it", path)
+				}
+				return err
+			}
+			// The snapshot comes first, so the save refuses if the file changes
+			// between this read and the write.
+			snapshot, err := config.ReadSnapshot(path)
+			if err != nil {
+				return err
+			}
+			cfg, err := opt.loadConfig()
+			if err != nil {
+				return err
+			}
+			cfg.AccessMode = args[0]
+			if err := config.SaveIfUnchanged(cfg, path, snapshot); err != nil {
+				return err
+			}
+			return opt.printResult(map[string]any{"config_path": path, "access_mode": args[0], "restart_required": true},
+				"access_mode is now %s in %s. Run 'papio daemon stop'; the next papio command starts the daemon with this mode.", args[0], path)
+		},
+	}
+	command.AddCommand(initCommand, setAccessMode, newAgentConfigCommand(opt), newCredentialConfigCommand(opt), newAcknowledgeClosureCommand(opt))
 	return command
 }

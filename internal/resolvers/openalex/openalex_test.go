@@ -235,24 +235,6 @@ func TestResolveTitleSelectsMatchingSecondResult(t *testing.T) {
 	}
 }
 
-func TestSameAuthorRejectsDistinctUTF8Initials(t *testing.T) {
-	if sameAuthor("Émile Smith", "Östen Smith") {
-		t.Fatal("sameAuthor accepted distinct non-ASCII initials")
-	}
-}
-
-func TestSameAuthorMatchesMononyms(t *testing.T) {
-	if !sameAuthor("Madonna", "Madonna") {
-		t.Fatal("sameAuthor rejected identical mononyms")
-	}
-	if sameAuthor("Madonna", "Prince") {
-		t.Fatal("sameAuthor accepted distinct mononyms")
-	}
-	if sameAuthor("Madonna", "John Smith") {
-		t.Fatal("sameAuthor accepted mononym against full name")
-	}
-}
-
 // Sibling matching is deliberately surname-only (see sharesAuthorSurname); a
 // mononym contributes its name as a surname so a mononym-authored work can
 // sibling-match on its sole author. The exact-title and ±3-year gates in

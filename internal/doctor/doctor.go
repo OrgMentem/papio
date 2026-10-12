@@ -1530,7 +1530,7 @@ func checkCreditSpend(ctx context.Context, cfg config.Config, db *store.Store, a
 		case status.DriftReason != "":
 			add(name, Warn,
 				fmt.Sprintf("%s egress is closed: %s", source, status.DriftReason),
-				"the provider's prices no longer match the schedule papio committed against; acknowledge the new schedule to reopen egress")
+				"check the provider's prices and your account balance, then run 'papio config acknowledge-closure "+source+" --confirm' to reopen egress")
 		case status.Exhausted():
 			add(name, Warn,
 				fmt.Sprintf("%s has spent today's allowance: %d of %d credits, from %s (%s)", source, status.Committed, status.Limit, basis, identity),

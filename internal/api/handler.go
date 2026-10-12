@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -389,6 +390,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"stats.producers_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return producerStats(ctx, raw, system)
 		},
+		"budget.acknowledge_closure_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return acknowledgeClosure(ctx, raw, system)
+		},
 		"triage.decide": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return triageDecide(ctx, raw, system)
 		},
@@ -413,11 +417,17 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"jobs.refile": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return refileJob(ctx, raw, system)
 		},
+		"jobs.refile_preview": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return refilePreview(ctx, raw, system)
+		},
 		"jobs.receipt": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return jobReceipt(ctx, raw, system)
 		},
 		"jobs.add_component": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return addComponent(ctx, raw, system)
+		},
+		"jobs.add_component_staged": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return addStagedComponent(ctx, raw, system)
 		},
 		"jobs.supply_pdf": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return supplyPDF(ctx, raw, system)
@@ -575,6 +585,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"delivery.submit": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return deliverySubmit(ctx, raw, system)
 		},
+		"delivery.preview": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return deliveryPreview(ctx, raw, system)
+		},
 		"delivery.cancel": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return deliveryCancel(ctx, raw, system)
 		},
@@ -594,6 +607,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 			time.AfterFunc(25*time.Millisecond, shutdown)
 			return marshal(map[string]bool{"stopping": true})
 		}
+	}
+	for name, handler := range methods {
+		methods[name] = nameUnknownJob(handler, system)
 	}
 	return ipc.Router{Methods: methods}
 }
@@ -1139,6 +1155,16 @@ func runWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	return marshal(result)
 }
+
+// checkJobState refuses a state filter that names no job state. An unknown
+// value matches no rows, so without this a typo reads as an empty queue.
+func checkJobState(state string) *ipc.RPCError {
+	if state == "" || job.ValidState(state) {
+		return nil
+	}
+	return &ipc.RPCError{Code: "invalid_argument", Message: "unknown job state " + strconv.Quote(state) + "; valid states: " + strings.Join(job.States, ", ")}
+}
+
 func listJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params struct {
 		State string `json:"state,omitempty"`
@@ -1146,6 +1172,9 @@ func listJobs(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
+	}
+	if rpcErr := checkJobState(params.State); rpcErr != nil {
+		return nil, rpcErr
 	}
 	rows, err := system.Jobs.List(ctx, params.State, params.Limit)
 	if err != nil {
@@ -1226,6 +1255,9 @@ func listJobsV2(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 	}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
+	}
+	if rpcErr := checkJobState(params.State); rpcErr != nil {
+		return nil, rpcErr
 	}
 	rows, truncated, err := system.Jobs.ListPage(ctx, params.State, params.Limit)
 	if err != nil {
@@ -1401,25 +1433,70 @@ func addComponent(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "acquisition service is not configured"}
 	}
 	if err := system.App.AdoptComponent(ctx, params.JobID, params.Path, params.Role); err != nil {
-		// Every case below is an ordinary operator mistake, not a daemon fault, so
-		// it must say what to change. The path sentinel deliberately does NOT echo
-		// the wrapped error: confinement failures carry the caller's filesystem
-		// path, and the daemon log is the place for that, not an RPC message.
-		switch {
-		case errors.Is(err, app.ErrComponentRole):
-			return badParams(err)
-		case errors.Is(err, app.ErrComponentPrecondition):
-			log.Printf("rpc add_component precondition: %v", err)
-			return nil, &ipc.RPCError{Code: "precondition_failed", Message: "the job holds no main artifact to attach a component to"}
-		case errors.Is(err, app.ErrComponentPath):
-			log.Printf("rpc add_component path rejected: %v", err)
-			return nil, &ipc.RPCError{Code: "invalid_argument", Message: "the file must be a regular file inside the job's adoption root"}
-		case errors.Is(err, app.ErrComponentRejected):
-			return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "component rejected")}
-		}
-		return failure(err)
+		return nil, componentFailure(err)
 	}
-	components, err := system.Jobs.Components(ctx, params.JobID)
+	return componentsResult(ctx, params.JobID, system)
+}
+
+// addStagedComponent files a supplement or appendix the operator staged with
+// `papio jobs add-component`. The params name the job and one file name inside
+// the daemon-owned staging directory for that job, never a filesystem path, so
+// a caller cannot make the daemon read an arbitrary file, and the file does not
+// have to live in the browser adoption directory the daemon sweeps for a
+// finished job. It is a separate method so jobs.add_component keeps the exact
+// params ADR-0009 ratified.
+func addStagedComponent(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+		Name  string `json:"name"`
+		Role  string `json:"role"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	if strings.TrimSpace(params.JobID) == "" || strings.TrimSpace(params.Name) == "" || strings.TrimSpace(params.Role) == "" {
+		return badParams(errors.New("job_id, name, and role are required"))
+	}
+	if system == nil || system.App == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "acquisition service is not configured"}
+	}
+	if err := system.App.AdoptStagedComponent(ctx, params.JobID, params.Name, params.Role); err != nil {
+		return nil, componentFailure(err)
+	}
+	return componentsResult(ctx, params.JobID, system)
+}
+
+// componentFailure classifies an AdoptComponent or AdoptStagedComponent error.
+// Every sentinel is an ordinary operator mistake, not a daemon fault, so it
+// must say what to change. The path sentinel deliberately does NOT echo the
+// wrapped error: confinement failures carry the caller's filesystem path, and
+// the daemon log is the place for that, not an RPC message.
+func componentFailure(err error) *ipc.RPCError {
+	switch {
+	case errors.Is(err, app.ErrComponentRole):
+		_, rpcErr := badParams(err)
+		return rpcErr
+	case errors.Is(err, app.ErrComponentPrecondition):
+		log.Printf("rpc add_component precondition: %v", err)
+		return &ipc.RPCError{Code: "precondition_failed", Message: "the job holds no main artifact to attach a component to"}
+	case errors.Is(err, app.ErrComponentNoAdoptionRoot):
+		log.Printf("rpc add_component adoption directory: %v", err)
+		return &ipc.RPCError{Code: "precondition_failed", Message: "the job has no adoption directory; the daemon removes it for a finished job, so use `papio jobs add-component`, which stages the file itself"}
+	case errors.Is(err, app.ErrComponentStagedName):
+		log.Printf("rpc add_component staged name rejected: %v", err)
+		return &ipc.RPCError{Code: "invalid_argument", Message: "the name must be a regular file staged in the job's component staging directory"}
+	case errors.Is(err, app.ErrComponentPath):
+		log.Printf("rpc add_component path rejected: %v", err)
+		return &ipc.RPCError{Code: "invalid_argument", Message: "the file must be a regular file inside the job's adoption root"}
+	case errors.Is(err, app.ErrComponentRejected):
+		return &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "component rejected")}
+	}
+	_, rpcErr := failure(err)
+	return rpcErr
+}
+
+func componentsResult(ctx context.Context, jobID string, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	components, err := system.Jobs.Components(ctx, jobID)
 	if err != nil {
 		return failure(err)
 	}
@@ -1492,15 +1569,15 @@ func getJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 	}
 	row, err := system.Jobs.Get(ctx, params.JobID)
 	if err != nil {
-		return failure(err)
+		return jobFailure(err, params.JobID)
 	}
 	events, err := system.Jobs.Events(ctx, params.JobID)
 	if err != nil {
-		return failure(err)
+		return jobFailure(err, params.JobID)
 	}
 	attributedActions, err := system.Jobs.ListHumanActionsForJob(ctx, params.JobID)
 	if err != nil {
-		return failure(err)
+		return jobFailure(err, params.JobID)
 	}
 	// One job-scoped read: the legacy global read was O(total actions) per
 	// single-job request, and `papio status` calls this once per row. The
@@ -1526,7 +1603,7 @@ func cancelJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	}
 	cancelErr := system.App.CancelJob(ctx, params.JobID, "cancelled by user")
 	if cancelErr != nil && !errors.Is(cancelErr, app.ErrCompensationIncomplete) {
-		return failure(cancelErr)
+		return jobFailure(cancelErr, params.JobID)
 	}
 	// The cancellation has committed even when its delivery compensation did
 	// not, so the job's capture lease is released on both paths.
@@ -1539,7 +1616,7 @@ func cancelJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	// job that finished a moment earlier was not cancelled by this call.
 	row, err := system.Jobs.Get(ctx, params.JobID)
 	if err != nil {
-		return failure(err)
+		return jobFailure(err, params.JobID)
 	}
 	return marshal(map[string]any{"job_id": params.JobID, "cancelled": row.State == job.StateCancelled})
 }
@@ -1565,7 +1642,7 @@ func retryJob(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	if system.Captures != nil {
 		row, err := system.Jobs.Get(ctx, params.JobID)
 		if err != nil {
-			return failure(err)
+			return jobFailure(err, params.JobID)
 		}
 		if err := job.CheckRetryable(row.State); err != nil {
 			return failure(err)
@@ -1838,6 +1915,12 @@ func exportBundleFile(ctx context.Context, raw json.RawMessage, system *bootstra
 		}
 		_, rpcErr := badParams(err)
 		return "", nil, rpcErr
+	}
+	// The daemon's working directory is whatever its launcher had, not the
+	// caller's, so a relative destination would land somewhere the caller never
+	// named and then be reported as if it were theirs.
+	if !filepath.IsAbs(params.OutputDir) {
+		return "", nil, &ipc.RPCError{Code: "invalid_argument", Message: "output_dir must be an absolute path"}
 	}
 	path, result, err := system.Bundle.Export(ctx, params.JobID, params.OutputDir)
 	if err != nil {
@@ -2125,6 +2208,40 @@ func marshal(value any) ([]byte, *ipc.RPCError) {
 
 func badParams(err error) ([]byte, *ipc.RPCError) {
 	return nil, &ipc.RPCError{Code: "invalid_argument", Message: safeMessage(err, "invalid parameters")}
+}
+
+// jobFailure is failure for a handler that was asked about one job id: an
+// unknown id names itself and the command that lists the real ones, instead of
+// the bare "record not found" failure gives for any missing row.
+func jobFailure(err error, jobID string) ([]byte, *ipc.RPCError) {
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, &ipc.RPCError{Code: "not_found", Message: "job " + strconv.Quote(jobID) + " not found; run `papio jobs list` to see job ids"}
+	}
+	return failure(err)
+}
+
+// nameUnknownJob gives every job-scoped method the jobFailure wording. A method
+// whose params carry a job_id and that failed with the bare "record not found"
+// is answered with the job named, but only after the job row is confirmed
+// absent: the missing row may be another record (a delivery request, an
+// artifact) belonging to a job that exists.
+func nameUnknownJob(handler ipc.MethodHandler, system *bootstrap.System) ipc.MethodHandler {
+	return func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+		result, rpcErr := handler(ctx, raw)
+		if rpcErr == nil || rpcErr.Code != "not_found" || rpcErr.Message != "record not found" || system == nil || system.Jobs == nil {
+			return result, rpcErr
+		}
+		var params struct {
+			JobID string `json:"job_id"`
+		}
+		if json.Unmarshal(raw, &params) != nil || strings.TrimSpace(params.JobID) == "" {
+			return result, rpcErr
+		}
+		if _, err := system.Jobs.Get(ctx, params.JobID); errors.Is(err, sql.ErrNoRows) {
+			return jobFailure(err, params.JobID)
+		}
+		return result, rpcErr
+	}
 }
 
 func failure(err error) ([]byte, *ipc.RPCError) {

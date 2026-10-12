@@ -69,18 +69,17 @@ const (
 //   - ArXiv: BibTeX/BibLaTeX only, via `eprint` + `archiveprefix`/`eprinttype`.
 //     RIS has no standardized arXiv tag and CSL-JSON has no arXiv field; both
 //     are left empty rather than scraped out of a free-text note.
-//   - ISBN: populated by no parser. ADR-0008 excludes ISBN from ownership
-//     matching entirely — an edited volume shares one ISBN with every chapter
-//     in it, so an ISBN match cannot tell twenty distinct chapter requests
-//     apart. The field remains because acquisition metadata may carry an ISBN
-//     from other input paths.
+//   - ISBN: not carried. ADR-0008 excludes ISBN from ownership matching — an
+//     edited volume shares one ISBN with every chapter in it, so an ISBN cannot
+//     tell twenty distinct chapter requests apart — and an acquisition request
+//     keyed on it would collapse those chapters into one. RIS `SN`, BibTeX
+//     `isbn` and CSL-JSON `ISBN` are therefore dropped at parse time.
 type Record struct {
 	// SourceKey is the external record key, never an acquisition identifier.
 	SourceKey string
 	DOI       string
 	PMID      string
 	ArXiv     string
-	ISBN      string
 	Title     string
 	Authors   []string
 	Year      int

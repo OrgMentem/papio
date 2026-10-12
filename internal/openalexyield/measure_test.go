@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"strings"
 	"testing"
 	"time"
 
@@ -345,5 +346,69 @@ func TestMeasureSinceWindowExcludesOlderEvidence(t *testing.T) {
 	}
 	if all.SiblingHopSearches != 1 {
 		t.Errorf("unwindowed SiblingHopSearches = %d, want 1", all.SiblingHopSearches)
+	}
+}
+
+func TestFreeReportRender(t *testing.T) {
+	cases := []struct {
+		name       string
+		report     FreeReport
+		wantLines  []string
+		wantAbsent []string
+	}{
+		{
+			name: "all history without credits reports yield as n/a",
+			report: FreeReport{
+				TotalAcceptedArtifacts: 3,
+				UnattributableAccepted: 3,
+			},
+			wantLines: []string{
+				"window: all history",
+				"numerator (sibling-hop-attributed accepted artifacts): 0",
+				"denominator (title.search credits spent):              0",
+				"yield: n/a — zero title.search credits spent in this window",
+				"  accepted artifacts in window:                    3",
+			},
+			wantAbsent: []string{"yield (lower bound):", "note: the primary OpenAlex resolver"},
+		},
+		{
+			name: "bounded window with credits reports a percentage and the exclusion note",
+			report: FreeReport{
+				Since: "2026-08-01T00:00:00Z", Until: "2026-08-15T00:00:00Z",
+				SiblingHopSearches: 2, EnrichmentSearches: 1, TitleSearchCredits: 3 * CreditsPerTitleSearch,
+				SiblingHopAttributedWins: 1, TotalAcceptedArtifacts: 4,
+				ExcludedPrimaryResolveWins: 2, UnattributableAccepted: 1,
+				YieldLowerBound: 1.0 / 30, HasCredits: true,
+			},
+			wantLines: []string{
+				"window: 2026-08-01T00:00:00Z .. 2026-08-15T00:00:00Z",
+				"denominator (title.search credits spent):              30",
+				"yield (lower bound):                                    3.333%",
+				"  sibling-hop searches:  2 (20 credits)",
+				"  enrichment searches:   1 (10 credits)",
+				"  excluded primary-resolve title-search wins:      2 (real wins; cost is not isolable in the ledger — see below)",
+				"to infer which from adjacent job state, so those 2 win(s) are excluded from",
+			},
+			wantAbsent: []string{"window: all history", "yield: n/a"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.report.Render()
+			lines := make(map[string]bool)
+			for _, line := range strings.Split(got, "\n") {
+				lines[line] = true
+			}
+			for _, want := range tc.wantLines {
+				if !lines[want] {
+					t.Errorf("Render() has no line %q:\n%s", want, got)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("Render() contains %q, want it absent:\n%s", absent, got)
+				}
+			}
+		})
 	}
 }

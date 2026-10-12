@@ -2094,6 +2094,17 @@ func (s *Service) park(ctx context.Context, jobID, from, to string, detail map[s
 	return nil
 }
 
+// parkWithAction opens a human action and parks the job in one store
+// transaction, then routes the notice. A failed transition leaves no open
+// action behind.
+func (s *Service) parkWithAction(ctx context.Context, jobID, from, actionKind, actionDetail string, detail map[string]any, access job.AccessClassification) error {
+	if err := s.Jobs.ParkWithHumanAction(ctx, jobID, from, job.StateAwaitingHuman, actionKind, actionDetail, detail, access); err != nil {
+		return err
+	}
+	s.notifyParked(ctx, jobID, job.StateAwaitingHuman)
+	return nil
+}
+
 // notifyParked routes the "work waiting for you" notice for a job that has
 // just landed in a human-attention state. It is separate from park because a
 // caller that parks and opens its action in one store transaction still owes
@@ -2366,17 +2377,14 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 	switch mode {
 	case config.ModeAssisted, config.ModeDelegated:
 		if oaBrowserURL != "" {
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL), job.Access(false, "anti_bot")); err != nil {
-				return err
-			}
-			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
+			return s.parkWithAction(ctx, row.ID, from, "openurl_handoff", OABrowserHandoffActionDetail(oaBrowserURL),
 				job.WithCutoverDecision(
 					map[string]any{"reason": "open_access_browser_handoff"},
 					job.InstitutionCutoverDecision{
 						Blocker:                job.InstitutionCutoverBlockerLiveSourceRemaining,
 						CanaryReadyRouteExists: false,
 					},
-				))
+				), job.Access(false, "anti_bot"))
 		}
 		institutionalExhausted := s.institutionalRouteExhausted(ctx, row.ID)
 		base, hasBase := s.Config.OpenURLBaseFor(row.Policy.Resolver)
@@ -2420,14 +2428,11 @@ func (s *Service) exhaustedCandidates(ctx context.Context, row *job.Row, from, r
 				}
 				detail = job.PublisherFirstHandoffDetail
 			}
-			if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", detail, job.Access(true, "paywall")); err != nil {
-				return err
-			}
-			return s.park(ctx, row.ID, from, job.StateAwaitingHuman,
+			return s.parkWithAction(ctx, row.ID, from, "openurl_handoff", detail,
 				job.WithCutoverDecision(
 					map[string]any{"reason": "institutional_handoff"},
 					decision,
-				))
+				), job.Access(true, "paywall"))
 		default:
 			// institutionalExhausted, or no institutional OpenURL route was
 			// ever configured for this profile: the plain-OpenURL handoff has
@@ -2574,6 +2579,120 @@ func (s *Service) SubmitDelivery(ctx context.Context, jobID string) (DeliveryRou
 		return DeliveryRouteResult{}, err
 	}
 	return s.deliveryRoute(ctx, row, row.State)
+}
+
+// DeliveryPreview is what SubmitDelivery would do for a job, computed without
+// doing it. Decision and GateClass are set only when Branch is
+// BranchEvaluateGate: every other branch acts on an existing Request and
+// never reaches the gate.
+type DeliveryPreview struct {
+	// Configured is false when s.Delivery is nil or the job's institution
+	// profile has no document_delivery block: SubmitDelivery would do nothing.
+	Configured bool
+	Provider   string
+	Branch     delivery.BranchDecision
+	Decision   delivery.Decision
+	GateClass  string
+	// Request is the existing delivery request that would govern the job, if
+	// any. It may belong to another job that shares the idempotency key.
+	Request *delivery.Request
+}
+
+// PreviewDelivery runs the read-only half of deliveryRoute: the idempotency
+// branch and, for a fresh key, the gate verdict. It must stay free of every
+// write deliveryRoute makes — binding the job to a shared request, appending
+// the gate event, creating the row, calling the provider, and moving the job —
+// so that an operator can see whether `delivery submit --confirm` would lodge
+// a real provider request before confirming.
+func (s *Service) PreviewDelivery(ctx context.Context, jobID string) (DeliveryPreview, error) {
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return DeliveryPreview{}, err
+	}
+	inst, dd, ok := s.deliveryConfigured(row)
+	if !ok {
+		return DeliveryPreview{}, nil
+	}
+	profileName := deliveryProfileName(row.Policy.Resolver)
+	preview := DeliveryPreview{Configured: true, Provider: dd.Kind}
+	branch, existing, err := s.Delivery.BranchForJob(ctx, row.ID)
+	if err != nil {
+		return preview, err
+	}
+	requestClass := deliveryRequestClass(row.Work)
+	if existing != nil {
+		profileName = existing.InstitutionProfile
+		preview.Provider = existing.Provider
+		requestClass = existing.RequestClass
+	} else {
+		key := delivery.IdempotencyKey(profileName, row.Work.Describe(), dd.Kind, requestClass)
+		branch, existing, err = s.Delivery.Branch(ctx, key)
+		if err != nil {
+			return preview, err
+		}
+	}
+	preview.Branch, preview.Request = branch, existing
+	if branch != delivery.BranchEvaluateGate {
+		return preview, nil
+	}
+	profile, err := s.Delivery.ResolveGateProfile(ctx, profileName, inst)
+	if err != nil {
+		return preview, err
+	}
+	submittedThisMonth, err := s.Delivery.SubmittedThisMonth(ctx, profileName, dd.Kind)
+	if err != nil {
+		return preview, err
+	}
+	preview.GateClass = string(profile.Class)
+	preview.Decision = delivery.EvaluateGate(profile, delivery.GateRequest{
+		EffectiveAccessMode: s.Config.EffectiveAccessMode(row.Policy.AccessMode),
+		RequestClass:        requestClass,
+		HasRequiredFields:   deliveryHasRequiredFields(row.Work),
+		SubmittedThisMonth:  submittedThisMonth,
+	})
+	if existing != nil && preview.Decision.Action == delivery.ActionSubmit {
+		// submitDeliveryRequest re-submits against an existing offered row
+		// only when its guards pass; otherwise it opens reconciliation and
+		// places no request. Report that instead of a submit verdict.
+		blocked, err := s.existingRequestBlocksSubmit(ctx, row.ID, existing, profile.Digest())
+		if err != nil {
+			return preview, err
+		}
+		if blocked {
+			preview.Branch = delivery.BranchReconcile
+			preview.GateClass = ""
+			preview.Decision = delivery.Decision{}
+		}
+	}
+	return preview, nil
+}
+
+// offeredRequestUsable reports whether an existing request is still an
+// offered row that never reached the provider, the only shape a submit may
+// retry against.
+func offeredRequestUsable(existing *delivery.Request) bool {
+	return existing != nil && existing.State == delivery.StateOffered && existing.ProviderReference == ""
+}
+
+// existingRequestBlocksSubmit is the read-only form of the guards
+// submitDeliveryRequest applies to a duplicate idempotency key: profile
+// binding, then the prior submission outcome (the current owner's for the
+// same job, the old owner's for a row another job offered). It reports true
+// when submit would open reconciliation instead of placing a request.
+func (s *Service) existingRequestBlocksSubmit(ctx context.Context, jobID string, existing *delivery.Request, digest string) (bool, error) {
+	if !offeredRequestUsable(existing) || existing.GateProfileDigest != digest {
+		return true, nil
+	}
+	class, classified, err := s.submissionFailureClass(ctx, existing.JobID, existing.ID)
+	if err != nil {
+		return false, err
+	}
+	if existing.JobID != jobID {
+		// Re-owned rows may POST unless the old owner classified an outcome
+		// other than pre-send.
+		return classified && class != illiad.FailurePreSend, nil
+	}
+	return !classified || class != illiad.FailurePreSend, nil
 }
 
 // DeliveryReconciliationOperation is the operator verdict applied to an open
@@ -3070,7 +3189,7 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 			return nil, err
 		}
 		duplicate = true
-		if created == nil || created.State != delivery.StateOffered || created.ProviderReference != "" {
+		if !offeredRequestUsable(created) {
 			// A live or otherwise-resolved request already occupies this
 			// idempotency key. Never open a second live request.
 			return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
@@ -3079,10 +3198,10 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 		// submission against it instead of reconciling a request that was
 		// never actually created.
 	}
-	if created == nil || created.GateProfileDigest != profile.Digest() {
-		if created == nil {
-			return created, fmt.Errorf("delivery: missing offered request before submission")
-		}
+	if created == nil {
+		return created, fmt.Errorf("delivery: missing offered request before submission")
+	}
+	if created.GateProfileDigest != profile.Digest() {
 		return created, s.openDeliveryReconciliationAction(ctx, row, from, created)
 	}
 	if duplicate {
@@ -3573,11 +3692,9 @@ func (s *Service) routeFulfilledDelivery(ctx context.Context, row *job.Row, from
 	if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.retrieval_enqueued", eventDetail); err != nil {
 		return err
 	}
-	if _, err := s.Jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff",
-		DocumentDeliveryRetrievalHandoffDetail+"\n"+retrievalURL, job.Access(false, "")); err != nil {
-		return err
-	}
-	return s.park(ctx, row.ID, from, job.StateAwaitingHuman, deliveryCutoverDetail(ctx, map[string]any{"reason": "document_delivery_retrieval"}))
+	return s.parkWithAction(ctx, row.ID, from, "openurl_handoff",
+		DocumentDeliveryRetrievalHandoffDetail+"\n"+retrievalURL,
+		deliveryCutoverDetail(ctx, map[string]any{"reason": "document_delivery_retrieval"}), job.Access(false, ""))
 }
 
 // DocumentDeliveryRetrievalHandoffDetail identifies an openurl_handoff
@@ -4575,25 +4692,75 @@ func (s *Service) recoverMissingReadyHookForSettled(ctx context.Context) error {
 	return nil
 }
 
-// RefileJob synchronously reruns the configured on_ready hook for a settled
-// acquisition. It changes no job state and records the manual attempt.
-func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, error) {
+// RefilePreview is what `papio jobs refile` would run for one job: the command
+// is the daemon's configured on_ready hook, run through the system shell.
+type RefilePreview struct {
+	JobID   string `json:"job_id"`
+	State   string `json:"state"`
+	Command string `json:"command"`
+}
+
+// refilePreflight returns the job RefileJob would run the hook for, or the
+// refusal it would give, before anything executes.
+func (s *Service) refilePreflight(ctx context.Context, jobID string) (*job.Row, error) {
 	row, err := s.Jobs.Get(ctx, jobID)
 	if err != nil {
-		return RefileResult{}, err
+		return nil, err
 	}
 	disposition, err := s.Jobs.Disposition(ctx, jobID)
 	if err != nil {
-		return RefileResult{}, err
+		return nil, err
 	}
 	if disposition.Disposition == job.DispositionArchived {
-		return RefileResult{}, job.ErrConflict
+		return nil, job.ErrConflict
 	}
 	if row.State != job.StateReady && row.State != job.StateImported {
-		return RefileResult{}, job.ErrConflict
+		return nil, job.ErrConflict
 	}
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
-		return RefileResult{}, ErrReadyHookNotConfigured
+		return nil, ErrReadyHookNotConfigured
+	}
+	return row, nil
+}
+
+// refuseFiledPaper returns a conflict when the newest on_ready run for jobID
+// succeeded: there is nothing left to refile.
+func (s *Service) refuseFiledPaper(ctx context.Context, jobID string) error {
+	var latestStatus string
+	err := s.Jobs.S.DB().QueryRowContext(ctx, `
+		SELECT COALESCE(json_extract(detail_json, '$.status'), '')
+		FROM events
+		WHERE job_id = ? AND kind = 'hook.on_ready'
+		ORDER BY seq DESC
+		LIMIT 1`, jobID).Scan(&latestStatus)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if latestStatus == "ok" {
+		return fmt.Errorf("paper is already filed; run `papio jobs unfiled` to list jobs that need filing: %w", job.ErrConflict)
+	}
+	return nil
+}
+
+// PreviewRefile reports the command RefileJob would run, applying the same
+// refusals up to the point of execution. It runs nothing and records nothing.
+func (s *Service) PreviewRefile(ctx context.Context, jobID string) (RefilePreview, error) {
+	row, err := s.refilePreflight(ctx, jobID)
+	if err != nil {
+		return RefilePreview{}, err
+	}
+	if err := s.refuseFiledPaper(ctx, row.ID); err != nil {
+		return RefilePreview{}, err
+	}
+	return RefilePreview{JobID: row.ID, State: row.State, Command: s.ReadyHook.Command}, nil
+}
+
+// RefileJob synchronously reruns the configured on_ready hook for a settled
+// acquisition. It changes no job state and records the manual attempt.
+func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, error) {
+	row, err := s.refilePreflight(ctx, jobID)
+	if err != nil {
+		return RefileResult{}, err
 	}
 	if !s.beginReadyHook(row.ID) {
 		return RefileResult{}, job.ErrConflict
@@ -4601,18 +4768,8 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 	s.hookWG.Add(1)
 	defer s.hookWG.Done()
 	defer s.endReadyHook(row.ID)
-	var latestStatus string
-	err = s.Jobs.S.DB().QueryRowContext(ctx, `
-		SELECT COALESCE(json_extract(detail_json, '$.status'), '')
-		FROM events
-		WHERE job_id = ? AND kind = 'hook.on_ready'
-		ORDER BY seq DESC
-		LIMIT 1`, row.ID).Scan(&latestStatus)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := s.refuseFiledPaper(ctx, row.ID); err != nil {
 		return RefileResult{}, err
-	}
-	if latestStatus == "ok" {
-		return RefileResult{}, fmt.Errorf("paper is already filed; run `papio jobs unfiled` to list jobs that need filing: %w", job.ErrConflict)
 	}
 	execCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(s.readyHookContext(), cancel)

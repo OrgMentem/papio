@@ -5,13 +5,14 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 )
 
 func TestNotificationLedgerUpsertCoalescesAndReservesOnce(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +55,7 @@ func TestNotificationLedgerUpsertCoalescesAndReservesOnce(t *testing.T) {
 
 func TestNotificationLedgerTerminalReplayIsImmutable(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +98,7 @@ func TestNotificationLedgerTerminalReplayIsImmutable(t *testing.T) {
 // desktop snapshot preserves exactly what the desktop already delivered.
 func TestNotificationLedgerCoalescesForPendingWebhookAfterDesktopDelivery(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +162,7 @@ func TestNotificationLedgerCoalescesForPendingWebhookAfterDesktopDelivery(t *tes
 // fall back to the live count and payload.
 func TestNotificationLedgerUndeliveredDesktopLegKeepsNoSnapshot(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +202,7 @@ func TestNotificationLedgerUndeliveredDesktopLegKeepsNoSnapshot(t *testing.T) {
 // cannot pull a superseded row back into the drain.
 func TestNotificationLedgerSetDesktopStateRefusesTerminalRows(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +239,7 @@ func TestNotificationLedgerSetDesktopStateRefusesTerminalRows(t *testing.T) {
 
 func TestRecordSystemEventIsJobless(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +258,7 @@ func TestRecordSystemEventIsJobless(t *testing.T) {
 
 func TestNotificationTimeParseErrorSurfaces(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +382,7 @@ func notificationPhaseCount(t *testing.T, db *Store, aggregateKey, phase string)
 
 func TestNotificationLedgerSupersedeCheckpointsRetiresOnlyLiveCheckpoints(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +441,7 @@ func TestNotificationLedgerSupersedeCheckpointsRetiresOnlyLiveCheckpoints(t *tes
 
 func TestNotificationLedgerSupersedeAndUpsertCheckpointIsAtomic(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +522,7 @@ func TestNotificationLedgerSupersedeAndUpsertCheckpointIsAtomic(t *testing.T) {
 
 func TestNotificationLedgerWebhookStateAndDesktopAvailabilityRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +604,7 @@ func TestNotificationLedgerWebhookStateAndDesktopAvailabilityRoundTrip(t *testin
 // leaves the due set, and failures settle visibly as failed with a stamp.
 func TestNotificationLedgerClaimWebhookIsAtMostOnce(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +662,7 @@ func TestNotificationLedgerClaimWebhookIsAtMostOnce(t *testing.T) {
 // failure path uses, so both outcomes stay distinguishable from pending.
 func TestNotificationLedgerClaimWebhookSuccessStampsAttempt(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,7 +692,7 @@ func TestNotificationLedgerClaimWebhookSuccessStampsAttempt(t *testing.T) {
 // into the row, because only the webhook snapshot is immutable.
 func TestNotificationLedgerPostClaimMergeRedirectsToNewGeneration(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +729,7 @@ func TestNotificationLedgerPostClaimMergeRedirectsToNewGeneration(t *testing.T) 
 // the redirect fires on the webhook leg alone.
 func TestNotificationLedgerPostClaimMergeRedirectsWithHeldDesktop(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -762,7 +763,7 @@ func TestNotificationLedgerPostClaimMergeRedirectsWithHeldDesktop(t *testing.T) 
 // generation instead of being suppressed as a replay.
 func TestNotificationLedgerIdenticalPayloadWithLaterTimeOpensNewGeneration(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +795,7 @@ func TestNotificationLedgerIdenticalPayloadWithLaterTimeOpensNewGeneration(t *te
 // delivery and the key POSTs once.
 func TestNotificationLedgerSettledRetryReturnsSameGeneration(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -836,7 +837,7 @@ func TestNotificationLedgerSettledRetryReturnsSameGeneration(t *testing.T) {
 // a +2ns duplicate.
 func TestNotificationLedgerRedirectedGenerationRetryMatchesOwnGeneration(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,5 +884,74 @@ func TestNotificationLedgerRedirectedGenerationRetryMatchesOwnGeneration(t *test
 	}
 	if n != 2 {
 		t.Fatalf("ledger rows = %d, want the two settled generations", n)
+	}
+}
+
+// Coalescing two webhook events must keep what each one carried: nested
+// per-event maps accumulate key by key, an entry both sides mention is merged
+// rather than replaced, and the count is the merged total. The plain desktop
+// upsert merges in SQL (json_patch); the generation path merges in Go, so both
+// must agree or the webhook digest differs from the desktop one.
+func TestNotificationLedgerWebhookMergeKeepsNestedEventDetailFromBothEvents(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, seededDataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	firstPayload := `{"count":1,"message":"first","events":{"a":{"doi":"10.1/a","state":"opened"}}}`
+	secondPayload := `{"count":1,"message":"second","events":{"a":{"state":"done"},"b":{"doi":"10.1/b"}}}`
+	record := func(key string, last time.Time, payload string) NotificationRecord {
+		return NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: key, Phase: "opened", WindowStart: now, FirstAt: now, LastAt: last, AvailableAt: last, Count: 1, PayloadJSON: payload}
+	}
+
+	var generation, desktop NotificationRecord
+	for i, payload := range []string{firstPayload, secondPayload} {
+		last := now.Add(time.Duration(i) * time.Minute)
+		if generation, err = ledger.UpsertWebhookGeneration(ctx, record("decision:nested-webhook", last, payload)); err != nil {
+			t.Fatal(err)
+		}
+		if desktop, err = ledger.Upsert(ctx, record("decision:nested-desktop", last, payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	want := map[string]any{
+		"count":   float64(2),
+		"message": "second",
+		"events": map[string]any{
+			"a": map[string]any{"doi": "10.1/a", "state": "done"},
+			"b": map[string]any{"doi": "10.1/b"},
+		},
+	}
+	for name, row := range map[string]NotificationRecord{"webhook generation": generation, "desktop upsert": desktop} {
+		var got map[string]any
+		if err := json.Unmarshal([]byte(row.PayloadJSON), &got); err != nil {
+			t.Fatalf("%s payload %q: %v", name, row.PayloadJSON, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s payload = %s, want %v", name, row.PayloadJSON, want)
+		}
+		if row.Count != 2 {
+			t.Fatalf("%s count = %d, want 2", name, row.Count)
+		}
+	}
+}
+
+// A stored payload that is not a JSON object cannot be patched key by key, so
+// the incoming payload replaces it instead of the merge failing or dropping the
+// new event.
+func TestMergeWebhookPayloadFallsBackToIncomingWhenEitherSideIsNotAnObject(t *testing.T) {
+	for name, tc := range map[string]struct{ stored, incoming string }{
+		"stored array":    {`["x"]`, `{"count":1,"message":"b"}`},
+		"stored scalar":   {`7`, `{"count":1,"message":"b"}`},
+		"incoming array":  {`{"count":1,"message":"a"}`, `["y"]`},
+		"incoming scalar": {`{"count":1,"message":"a"}`, `"y"`},
+	} {
+		if got := mergeWebhookPayload(tc.stored, tc.incoming, 2); got != tc.incoming {
+			t.Fatalf("%s: merged = %q, want the incoming payload %q", name, got, tc.incoming)
+		}
 	}
 }

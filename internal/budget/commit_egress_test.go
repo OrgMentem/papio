@@ -172,6 +172,60 @@ func TestDriftCloseSurvivesManagerRestart(t *testing.T) {
 	}
 }
 
+// A drift or prepaid closure is source-wide and survives until acknowledged
+// (ADR-0024 §8). It must outlive both UTC midnight and a daemon restart, and
+// CreditStatus must keep reporting it.
+func TestStickyClosureSurvivesMidnightAndRestart(t *testing.T) {
+	policy := CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000}
+	closers := map[string]func(context.Context, *Manager) error{
+		"drift": func(ctx context.Context, m *Manager) error {
+			return m.DriftClose(ctx, config.SourceOpenAlex, "cost drift")
+		},
+		"prepaid": func(ctx context.Context, m *Manager) error {
+			if err := m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, 1.0); err != nil {
+				return err
+			}
+			return m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, 0.5)
+		},
+	}
+	for name, closeSource := range closers {
+		t.Run(name, func(t *testing.T) {
+			m, s := testCreditManager(t, policy)
+			clock := m.now()
+			newManager := func() *Manager {
+				return New(s, WithNow(func() time.Time { return clock }), WithCreditPolicy(func(string) CreditPolicy { return policy }))
+			}
+			original := newManager()
+			ctx := context.Background()
+			if err := closeSource(ctx, original); err != nil {
+				t.Fatal(err)
+			}
+			clock = clock.Add(24 * time.Hour)
+			assertClosed := func(label string, mgr *Manager) {
+				t.Helper()
+				err := mgr.CommitEgress(ctx, openalexReq("key-a", 1))
+				var exceeded *ErrExceeded
+				if !errors.As(err, &exceeded) || exceeded.Window != WindowSticky || !exceeded.Until.IsZero() {
+					t.Fatalf("%s: CommitEgress = %v, want sticky ErrExceeded with zero Until", label, err)
+				}
+				status, err := mgr.CreditStatus(ctx, config.SourceOpenAlex)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status.DriftReason == "" || !status.Exhausted() {
+					t.Fatalf("%s: CreditStatus = %+v, want the closure reported", label, status)
+				}
+				if status.Committed != 0 {
+					t.Fatalf("%s: committed = %d, want no debit admitted", label, status.Committed)
+				}
+			}
+			assertClosed("original manager across midnight", original)
+			// A new Manager has no latch: it is a daemon restarted after midnight.
+			assertClosed("restarted manager after midnight", newManager())
+		})
+	}
+}
+
 func TestBootstrapCapThenObserveCreditsUsedSeeds(t *testing.T) {
 	m, s := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 10_000})
 	ctx := context.Background()
@@ -224,6 +278,135 @@ func TestPrepaidDropTriggersDriftClose(t *testing.T) {
 	var exceeded *ErrExceeded
 	if !errors.As(err, &exceeded) || exceeded.Window != WindowSticky {
 		t.Fatalf("CommitEgress = %v, want sticky refusal after prepaid drop", err)
+	}
+}
+
+// An acknowledgement is the only thing that ends a sticky closure, whichever
+// day recorded it and whichever Manager (a restarted daemon) reads it.
+func TestAcknowledgeClosureReopensStickyClosure(t *testing.T) {
+	policy := CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000}
+	closers := map[string]func(context.Context, *Manager) error{
+		"drift": func(ctx context.Context, m *Manager) error {
+			return m.DriftClose(ctx, config.SourceOpenAlex, "cost drift")
+		},
+		"prepaid": func(ctx context.Context, m *Manager) error {
+			if err := m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, 1.0); err != nil {
+				return err
+			}
+			return m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, 0.5)
+		},
+	}
+	for name, closeSource := range closers {
+		t.Run(name, func(t *testing.T) {
+			m, s := testCreditManager(t, policy)
+			clock := m.now()
+			newManager := func() *Manager {
+				return New(s, WithNow(func() time.Time { return clock }), WithCreditPolicy(func(string) CreditPolicy { return policy }))
+			}
+			original := newManager()
+			ctx := context.Background()
+			if err := closeSource(ctx, original); err != nil {
+				t.Fatal(err)
+			}
+			clock = clock.Add(48 * time.Hour)
+			if err := original.CommitEgress(ctx, openalexReq("key-a", 1)); err == nil {
+				t.Fatal("closure did not survive to D+2")
+			}
+
+			cleared, err := original.AcknowledgeClosure(ctx, config.SourceOpenAlex)
+			if err != nil || !cleared {
+				t.Fatalf("AcknowledgeClosure = %v, %v; want cleared", cleared, err)
+			}
+			restarted := newManager()
+			for label, mgr := range map[string]*Manager{"original": original, "restarted": restarted} {
+				if err := mgr.CommitEgress(ctx, openalexReq("key-a", 1)); err != nil {
+					t.Fatalf("%s: CommitEgress after acknowledgement = %v", label, err)
+				}
+				status, err := mgr.CreditStatus(ctx, config.SourceOpenAlex)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status.DriftReason != "" {
+					t.Fatalf("%s: CreditStatus still reports %q", label, status.DriftReason)
+				}
+			}
+			var closedRows int
+			if err := s.DB().QueryRowContext(ctx, `SELECT count(*) FROM source_credit_fuse
+				WHERE source = ? AND drift_closed_at IS NOT NULL`, config.SourceOpenAlex).Scan(&closedRows); err != nil {
+				t.Fatal(err)
+			}
+			if closedRows != 0 {
+				t.Fatalf("%d rows still carry a closure", closedRows)
+			}
+
+			cleared, err = restarted.AcknowledgeClosure(ctx, config.SourceOpenAlex)
+			if err != nil || cleared {
+				t.Fatalf("second AcknowledgeClosure = %v, %v; want cleared=false for an open source", cleared, err)
+			}
+		})
+	}
+}
+
+// The prepaid baseline is dropped with the closure. Kept, it would close the
+// source again at the next observation of the same UTC day.
+func TestAcknowledgeClosureRebasesPrepaidBaseline(t *testing.T) {
+	m, _ := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000})
+	ctx := context.Background()
+	for _, remaining := range []float64{1.0, 0.5} {
+		if err := m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, remaining); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cleared, err := m.AcknowledgeClosure(ctx, config.SourceOpenAlex); err != nil || !cleared {
+		t.Fatalf("AcknowledgeClosure = %v, %v", cleared, err)
+	}
+	for _, remaining := range []float64{0.5, 0.5} {
+		if err := m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, remaining); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.CommitEgress(ctx, openalexReq("key-a", 1)); err != nil {
+			t.Fatalf("after observing %v: %v", remaining, err)
+		}
+	}
+}
+
+func TestAcknowledgeClosureRejectsBadSourcesAndClearsAMemoryOnlyLatch(t *testing.T) {
+	m, _ := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000})
+	ctx := context.Background()
+	for _, source := range []string{"", "nonesuch"} {
+		if _, err := m.AcknowledgeClosure(ctx, source); err == nil {
+			t.Fatalf("AcknowledgeClosure(%q) succeeded, want an error", source)
+		}
+	}
+	m.setDriftLatch(config.SourceOpenAlex, "persist failed")
+	cleared, err := m.AcknowledgeClosure(ctx, config.SourceOpenAlex)
+	if err != nil || !cleared {
+		t.Fatalf("AcknowledgeClosure = %v, %v; want the in-process latch reported cleared", cleared, err)
+	}
+	if err := m.CommitEgress(ctx, openalexReq("key-a", 1)); err != nil {
+		t.Fatalf("CommitEgress after clearing the latch = %v", err)
+	}
+}
+
+// A closure whose durable write failed leaves the baseline row open. The
+// acknowledgement must drop that baseline so the same balance does not close
+// the source again.
+func TestAcknowledgeClosureRebasesBaselineOfMemoryOnlyClosure(t *testing.T) {
+	m, _ := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000})
+	ctx := context.Background()
+	if err := m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, 1.0); err != nil {
+		t.Fatal(err)
+	}
+	// State after a failed closure commit: latch set, row still open.
+	m.setDriftLatch(config.SourceOpenAlex, "prepaid balance below starting observation")
+	if cleared, err := m.AcknowledgeClosure(ctx, config.SourceOpenAlex); err != nil || !cleared {
+		t.Fatalf("AcknowledgeClosure = %v, %v", cleared, err)
+	}
+	if err := m.ObservePrepaidRemaining(ctx, config.SourceOpenAlex, 0.5); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CommitEgress(ctx, openalexReq("key-a", 1)); err != nil {
+		t.Fatalf("CommitEgress after acknowledging a memory-only closure = %v, want open", err)
 	}
 }
 

@@ -58,6 +58,16 @@ func TestParseRIS(t *testing.T) {
 			want: []Record{{Title: "A title continued here"}},
 		},
 		{
+			name: "DOI continuation",
+			data: "TY  - JOUR\nTI  - Wrapped DOI\nDO  - 10.1000/long\n  suffix\nER  - \n",
+			want: []Record{{DOI: "10.1000/long suffix", Title: "Wrapped DOI"}},
+		},
+		{
+			name: "author continuation extends the last author only",
+			data: "TY  - JOUR\nTI  - Wrapped author\nAU  - Smith, Ada\nAU  - Jones, Ben\n  Quincy\nER  - \n",
+			want: []Record{{Title: "Wrapped author", Authors: []string{"Smith, Ada", "Jones, Ben Quincy"}}},
+		},
+		{
 			name: "BOM and CRLF",
 			data: "\ufeff\r\nTY  - JOUR\r\nTI  - Windows title\r\nAU  - Roe, Richard\r\nPY  - 2022\r\nER  - \r\n\r\n",
 			want: []Record{{Title: "Windows title", Authors: []string{"Roe, Richard"}, Year: 2022}},

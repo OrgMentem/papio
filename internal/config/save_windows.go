@@ -11,6 +11,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// SyncDir is a no-op on Windows: a directory cannot be flushed through a
+// handle, and NTFS journals a rename's metadata.
+func SyncDir(string) error { return nil }
+
 func normalizeConfigTarget(path string) string { return strings.ToLower(path) }
 
 func lockConfig(path string) (*os.File, error) {

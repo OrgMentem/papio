@@ -122,7 +122,7 @@ ADR-0010 also makes the daemon-wide `access_mode` a ceiling: a per-request `acce
 
 **Context:** Without a configured Zotero integration, *papio* had no de-duplication: search couldn't mark a result already held, batch acquisition re-fetched owned papers, and backfill watches were impossible.
 
-**Decision:** ADR-0008 introduces a pluggable holdings-provider model that emits positive evidence only — "this record or PDF is present" — and never a negative "not owned" claim; a source failure or incomplete read yields `unknown`, not a skip. Sources are declared file exports (for example a BibTeX export of papers already holding a PDF), with command-driven sources planned rather than supported, their claims are unioned across sources, and a generic source can never route into zotio's Zotero-attachment flow, which stays its own concept.
+**Decision:** ADR-0008 introduces a pluggable holdings-provider model that emits positive evidence only — "this record or PDF is present" — and never a negative "not owned" claim; a source failure or incomplete read yields `unknown`, not a skip. Sources are declared file exports (for example a BibTeX export of papers already holding a PDF) or commands that print an export, with a PDF-folder scanner planned rather than supported; their claims are unioned across sources, and a generic source can never route into zotio's Zotero-attachment flow, which stays its own concept.
 
 **Why:** A false "owned" verdict silently withholds a paper the user asked for, while a false negative just costs one redundant download. The design biases hard toward the cheaper mistake, the same asymmetry provenance decisions use elsewhere.
 

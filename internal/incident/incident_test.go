@@ -60,12 +60,13 @@ func TestLoadOrCreateKeyCreatesOnce(t *testing.T) {
 	}
 }
 
-func TestInputFromEventsUsesNamesAndNormalizesHost(t *testing.T) {
-	input := InputFromEvents([]map[string]any{
+func TestDecisiveInputUsesNamesAndNormalizesHost(t *testing.T) {
+	events := []map[string]any{
 		{"kind": "browser.page_capture", "detail": map[string]any{"host": "https://www.example.edu/article/10.1000/secret", "adapter_id": "adapter"}},
 		{"kind": "browser.provider_outcome", "detail": map[string]any{"host": "provider.example.edu", "outcome": "ui_changed", "selector_value": "private"}},
 		{"kind": "job.latch", "detail": map[string]any{"kind": "drift", "safety_domain": "adapter"}},
-	})
+	}
+	input := decisiveInput(events, 1)
 	if input.HostFamily != "example.edu" || input.SafetyDomain != "adapter" || input.OutcomeKind != "ui_changed" {
 		t.Fatalf("input = %#v", input)
 	}

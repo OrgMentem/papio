@@ -16,7 +16,8 @@ import (
 // command. Each exception must explain why it cannot carry a domain fact or
 // transition that belongs on the CLI surface.
 var rpcOnlyInfrastructure = map[string]string{
-	"browser.sync": "The native-messaging host uses this extension handshake to publish browser session state; browser sessions and browser use expose the resulting user-visible state.",
+	"browser.sync":       "The native-messaging host uses this extension handshake to publish browser session state; browser sessions and browser use expose the resulting user-visible state.",
+	"jobs.add_component": "ADR-0009 ratified this path-in-adoption-root form for an external consumer, so its params are frozen. `papio jobs add-component` files the same component through jobs.add_component_staged, which reads a copy the CLI staged under the data directory instead of a path the caller names.",
 }
 
 func TestEveryDomainRPCIsReachableFromCLI(t *testing.T) {

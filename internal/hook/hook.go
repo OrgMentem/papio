@@ -183,17 +183,17 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 
 func (t *tailBuffer) String() string { return t.buf.String() }
 
-// capUTF8 repairs invalid UTF-8 first, then truncates to at most limit bytes
-// on a rune boundary — replacement runes are three bytes each, so repairing
-// after truncation could exceed the cap.
+// capUTF8 repairs invalid UTF-8 first, then keeps the final at most limit
+// bytes, starting on a rune boundary — replacement runes are three bytes
+// each, so repairing after truncation could exceed the cap.
 func capUTF8(s string, limit int) string {
 	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= limit {
 		return s
 	}
-	cut := limit
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
+	start := len(s) - limit
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
 	}
-	return s[:cut]
+	return s[start:]
 }

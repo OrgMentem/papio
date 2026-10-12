@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestEmptyCommandDoesNotRun(t *testing.T) {
@@ -45,10 +46,15 @@ func TestStderrTailBounded(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell test")
 	}
-	r := &Runner{Command: "yes A 2>/dev/null | head -c 4000 >&2; exit 0", Timeout: 10 * time.Second}
+	// Distinguishable head and tail: the tail is what a failing command
+	// prints last, so it is the window that must survive.
+	r := &Runner{Command: "yes A 2>/dev/null | head -c 4000 >&2; printf END >&2; exit 0", Timeout: 10 * time.Second}
 	result := r.Run(context.Background(), nil)
 	if len(result.StderrTail) > stderrTailLimit {
 		t.Fatalf("stderr tail = %d bytes, want <= %d", len(result.StderrTail), stderrTailLimit)
+	}
+	if !strings.HasSuffix(result.StderrTail, "END") {
+		t.Fatalf("stderr tail ends %q, want the final bytes END", result.StderrTail[len(result.StderrTail)-8:])
 	}
 }
 
@@ -118,23 +124,6 @@ func TestInjectableExecReceivesSortedEnv(t *testing.T) {
 	}
 }
 
-func TestTimeoutKillsWholeProcessTree(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX process-group test")
-	}
-	// A background child holding stderr must not keep Run blocked past the
-	// deadline, and must be killed with the group.
-	r := &Runner{Command: "sleep 30 & wait", Timeout: 100 * time.Millisecond}
-	start := time.Now()
-	result := r.Run(context.Background(), nil)
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("Run blocked %v; descendant held the pipes past WaitDelay", elapsed)
-	}
-	if result.Err == nil || result.ExitCode != -1 {
-		t.Fatalf("result = %+v, want deadline error with exit -1", result)
-	}
-}
-
 func TestTimeoutKillsWindowsJobTree(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows Job Object test: no job object to confine the tree on this platform")
@@ -177,17 +166,21 @@ func TestTimeoutKillsWindowsJobTree(t *testing.T) {
 	}
 }
 
-func TestCapUTF8BoundsAfterRepair(t *testing.T) {
+func TestCapUTF8KeepsTailBoundedAfterRepair(t *testing.T) {
 	// Alternating invalid/valid bytes: each invalid byte becomes a 3-byte
 	// replacement rune, so repairing 500 raw bytes can exceed 500. The cap
-	// must apply after repair, on a rune boundary.
-	raw := strings.Repeat("\xffA", stderrTailLimit)
+	// must apply after repair, keep the final bytes, and start on a rune
+	// boundary.
+	raw := strings.Repeat("\xffA", stderrTailLimit) + "END"
 	capped := capUTF8(raw, stderrTailLimit)
 	if len(capped) > stderrTailLimit {
 		t.Fatalf("capped length = %d, want <= %d", len(capped), stderrTailLimit)
 	}
-	if !strings.HasPrefix(capped, "\uFFFDA") {
-		t.Fatalf("capped prefix = %q, want replacement-rune repair", capped[:6])
+	if !strings.HasSuffix(capped, "AEND") {
+		t.Fatalf("capped suffix = %q, want the final bytes kept", capped[len(capped)-6:])
+	}
+	if !utf8.ValidString(capped) {
+		t.Fatalf("capped = %q, want valid UTF-8 starting on a rune boundary", capped)
 	}
 	if capUTF8("short", stderrTailLimit) != "short" {
 		t.Fatal("short valid input must pass through")

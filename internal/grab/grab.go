@@ -124,6 +124,11 @@ var ErrBusy = errors.New("pdf grab busy")
 // (eligibility changed between decision and commit). Bridge parks the grab.
 var ErrFenceRejected = errors.New("candidate auto-bind fence rejected")
 
+// ErrStateChanged marks a state transition whose compare-and-swap matched no
+// row: the grab moved on (or never existed) between the caller's read and the
+// transition. Callers that can say so to a human report a conflict.
+var ErrStateChanged = errors.New("grab state changed")
+
 func isUniqueConstraintError(err error) bool {
 	if err == nil {
 		return false
@@ -497,6 +502,10 @@ type BindRecord struct {
 // at one connection, which this transaction already holds, so a pool read
 // there deadlocks.
 //
+// A grab parked as parked_no_identifier binds directly: the human-confirm path
+// (Bridge.ConfirmGrabCandidate) has no earlier transition to roll back when
+// the fence rejects, so a rejected bind leaves the grab parked and retryable.
+//
 // The binding method is never encoded in the wire outcome — outcome remains
 // the caller-supplied value (e.g. "job_created") so the extension's closed
 // outcome vocabulary is unchanged. The method lives only in the provenance
@@ -540,9 +549,9 @@ func (s *Service) MarkBoundToJobFenced(ctx context.Context, id, jobID, outcome s
 	// still caller-supplied — the binding method lives only in provenance.
 	res, err := tx.ExecContext(ctx, `
 		UPDATE pdf_grabs SET state = ?, job_id = ?, outcome = ?, bind_provenance = ?, updated_at = ?
-		WHERE id = ? AND state IN (?, ?, ?)`,
+		WHERE id = ? AND state IN (?, ?, ?, ?)`,
 		string(StateJobCreated), jobID, outcome, provVal, now, id,
-		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified))
+		string(StateAwaitingFile), string(StateQuarantined), string(StateIdentified), string(StateParkedNoIdentifier))
 	if err != nil {
 		return err
 	}
@@ -1074,7 +1083,7 @@ func requireOneRow(res sql.Result, id string) error {
 		return err
 	}
 	if n != 1 {
-		return fmt.Errorf("grab: %s changed underneath its own transition (or does not exist)", id)
+		return fmt.Errorf("%w: grab: %s changed underneath its own transition (or does not exist)", ErrStateChanged, id)
 	}
 	return nil
 }

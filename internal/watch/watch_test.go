@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -865,5 +866,39 @@ func TestRunnerCountsFailuresAndAutoDisables(t *testing.T) {
 	}
 	if len(notifier.messages) != 1 || notifier.messages[0] != "watch broken disabled after 5 consecutive failures" {
 		t.Fatalf("failure notifications = %+v", notifier.messages)
+	}
+}
+
+// zoteroHolding is a Zotero stand-in that owns one item per identifier
+// scheme. It answers per request, so a lookup that drops a scheme reads as
+// not owned.
+type zoteroHolding struct {
+	pmid, isbn string
+}
+
+func (f zoteroHolding) LookupWorks(_ context.Context, request zotio.LookupWorksRequest) (*zotio.LookupWorksResult, error) {
+	result := &zotio.LookupWorksResult{Works: make([]zotio.WorkOwnership, len(request.Works))}
+	for i, lookup := range request.Works {
+		result.Works[i].Status = zotio.OwnershipNotOwned
+		if (lookup.PMID != "" && lookup.PMID == f.pmid) || (lookup.ISBN != "" && lookup.ISBN == f.isbn) {
+			result.Works[i].Status = zotio.OwnershipOwnedWithPDF
+		}
+	}
+	return result, nil
+}
+
+func TestUnownedByZotioRecognizesPMIDAndISBNHeldWorks(t *testing.T) {
+	runner := &Runner{Lookup: zoteroHolding{pmid: "123456", isbn: "9780306406157"}}
+	works := []protocol.WorkRequest{
+		{Identifiers: &protocol.Identifiers{PMID: "123456"}},
+		{Identifiers: &protocol.Identifiers{ISBN: "978-0-306-40615-7"}},
+		{Identifiers: &protocol.Identifiers{PMID: "654321"}},
+	}
+	unowned, err := runner.unownedByZotio(context.Background(), works)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []bool{false, false, true}; !reflect.DeepEqual(unowned, want) {
+		t.Fatalf("unowned = %v, want %v: a work held in Zotero by PMID or ISBN is not new", unowned, want)
 	}
 }

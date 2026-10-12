@@ -41,13 +41,13 @@ func newAgentConfigCommand(opt *options) *cobra.Command {
 func newAgentConfigCommandWithDependencies(opt *options, deps agentConfigDependencies) *cobra.Command {
 	command := &cobra.Command{Use: "agent", Short: "Configure optional article-agent decisions", Annotations: map[string]string{"mcp:hidden": "true"}}
 	var stdin bool
-	set := &cobra.Command{Use: "set", Short: "Enable TypeSafe/Jev with a key saved in the OS credential store", Args: credentialArgs(0, 0), Long: "Enable cloud article decisions for this configuration profile. This sends article DOIs, bounded titles and sanitized control descriptions to TypeSafe. The key is stored as a shared-service typed credential with an explicit reference. Input is hidden; use --key-stdin for a secret-manager pipe. Restart the daemon after changing this setting.", RunE: func(cmd *cobra.Command, _ []string) error {
+	set := &cobra.Command{Use: "set", Short: "Enable TypeSafe/Jev with a key saved in the OS credential store", Args: credentialArgs(0, 0), Long: "Enable cloud article decisions for this configuration profile. This sends article DOIs, bounded titles and sanitized control descriptions to TypeSafe. The key is stored as a shared-service typed credential with an explicit reference. Input is hidden; use --key-stdin for a secret-manager pipe. The running daemon keeps the old setting until it is stopped: run 'papio daemon stop' after changing it, and the next papio command starts the daemon with it.", RunE: func(cmd *cobra.Command, _ []string) error {
 		result, err := setCredential(cmd, opt, deps, "agent.typesafe", stdin)
 		if err != nil {
 			return err
 		}
 		restart := true
-		return opt.printResult(agentConfigResult{Backend: "typesafe", Credential: "stored", EnvironmentOverride: result.EnvironmentOverride, Reference: result.Reference, PreviousReference: result.PreviousReference, RestartRequired: &restart}, "TypeSafe key saved and bound to this profile (%s). Restart the daemon. This explicit reference takes precedence over PAPIO_TYPESAFE_API_KEY.%s", result.Reference, retainedCredentialNotice(result.PreviousReference))
+		return opt.printResult(agentConfigResult{Backend: "typesafe", Credential: "stored", EnvironmentOverride: result.EnvironmentOverride, Reference: result.Reference, PreviousReference: result.PreviousReference, RestartRequired: &restart}, "TypeSafe key saved and bound to this profile (%s). "+daemonStopStep+" This explicit reference takes precedence over PAPIO_TYPESAFE_API_KEY.%s", result.Reference, retainedCredentialNotice(result.PreviousReference))
 	}}
 	set.Flags().BoolVar(&stdin, "key-stdin", false, "read the API key from standard input instead of a hidden terminal prompt")
 	status := &cobra.Command{Use: "status", Short: "Show agent configuration without revealing credentials", Args: credentialArgs(0, 0), Annotations: map[string]string{"mcp:read-only": "true"}, RunE: func(cmd *cobra.Command, _ []string) error {
@@ -79,7 +79,7 @@ func newAgentConfigCommandWithDependencies(opt *options, deps agentConfigDepende
 		}
 		result.Reference = binding.Reference
 		result.EnvironmentOverride = agentEnvironmentStatus(depsForCall, binding.Reference != "")
-		return opt.printResult(result, "Agent backend: %s; credential: %s; environment override: %s. This reports configuration, not the running daemon; restart after changes.", result.Backend, result.Credential, result.EnvironmentOverride)
+		return opt.printResult(result, "Agent backend: %s; credential: %s; environment override: %s. This reports configuration, not the running daemon; run 'papio daemon stop' to apply changes.", result.Backend, result.Credential, result.EnvironmentOverride)
 	}}
 	remove := &cobra.Command{Use: "remove", Short: "Disable the configured agent while preserving stored credentials", Args: credentialArgs(0, 0), RunE: func(cmd *cobra.Command, _ []string) error {
 		result, err := detachCredential(opt, deps, "agent.typesafe")
@@ -87,7 +87,7 @@ func newAgentConfigCommandWithDependencies(opt *options, deps agentConfigDepende
 			return err
 		}
 		restart := true
-		return opt.printResult(agentConfigResult{Backend: "none", Credential: "detached", Reference: result.Reference, EnvironmentOverride: agentEnvironmentStatus(deps, false), RestartRequired: &restart}, "Agent disabled in config; stored credentials are unchanged. Restart the daemon. Remove PAPIO_TYPESAFE_API_KEY from its launch environment too, if set. Use config credentials delete REFERENCE --yes to explicitly delete a shared record.%s", retainedCredentialNotice(result.Reference))
+		return opt.printResult(agentConfigResult{Backend: "none", Credential: "detached", Reference: result.Reference, EnvironmentOverride: agentEnvironmentStatus(deps, false), RestartRequired: &restart}, "Agent disabled in config; stored credentials are unchanged. "+daemonStopStep+" Remove PAPIO_TYPESAFE_API_KEY from its launch environment too, if set. Use config credentials delete REFERENCE --yes to explicitly delete a shared record.%s", retainedCredentialNotice(result.Reference))
 	}}
 	command.AddCommand(set, status, remove)
 	return command

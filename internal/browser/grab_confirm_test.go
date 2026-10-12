@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"papio/internal/grab"
+	"papio/internal/job"
 	"papio/internal/pdf"
+	"papio/internal/work"
 )
 
 func TestConfirmBindsThePickedJob(t *testing.T) {
@@ -54,6 +56,50 @@ func TestConfirmBindsThePickedJob(t *testing.T) {
 	// Confirming twice must not double-file: the grab has left the parked state.
 	if again := b.ConfirmGrabCandidate(ctx, grabID, preprintJob); again.Outcome != "wrong_state" {
 		t.Fatalf("second confirm outcome = %q, want wrong_state", again.Outcome)
+	}
+}
+
+// TestConfirmFenceRejectionKeepsGrabRetryable pins that a pick whose job
+// leaves the candidate pool between the preflight read and the bind commit is
+// reported as a conflict WITHOUT stranding the grab: it stays parked, so the
+// operator can ask grabs.suggest again and confirm a different job.
+func TestConfirmFenceRejectionKeepsGrabRetryable(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, cfg, _ := newBridge(t)
+	vor, preprint := versionPair()
+	vorJob := parkManualDownload(t, jobs, "wr_fence_vor", vor)
+	preprintJob := parkManualDownload(t, jobs, "wr_fence_pre", preprint)
+	excerpt := exoticExcerpt(vor)
+	grabID := parkedGrabWithPool(t, b, cfg.EffectiveAdoptionRoot(), excerpt, "Fence Retry")
+
+	// Validate runs after the preflight pool read and before the bind
+	// transaction, so cancelling the picked job from inside it is exactly the
+	// "job left the pool mid-confirm" race.
+	inner := b.svc.Validate
+	cancelled := false
+	b.svc.Validate = func(c context.Context, path, mime string, w work.Work) (pdf.ValidationReport, error) {
+		if !cancelled {
+			cancelled = true
+			if err := jobs.Transition(c, preprintJob, job.StateAwaitingHuman, job.StateCancelled, map[string]any{"reason": "test_cancel"}); err != nil {
+				t.Fatalf("cancel picked job: %v", err)
+			}
+		}
+		return inner(c, path, mime, w)
+	}
+
+	res := b.ConfirmGrabCandidate(ctx, grabID, preprintJob)
+	if res.Outcome != "conflict" {
+		t.Fatalf("outcome = %q detail = %q, want conflict", res.Outcome, res.Detail)
+	}
+	got, err := b.grabs.Get(ctx, grabID)
+	if err != nil || got == nil {
+		t.Fatalf("Get: %v %v", got, err)
+	}
+	if got.State != grab.StateParkedNoIdentifier {
+		t.Fatalf("state after rejected fence = %q, want parked_no_identifier so the grab stays retryable", got.State)
+	}
+	if retry := b.ConfirmGrabCandidate(ctx, grabID, vorJob); retry.Outcome != "job_created" {
+		t.Fatalf("retry outcome = %q detail = %q, want job_created", retry.Outcome, retry.Detail)
 	}
 }
 

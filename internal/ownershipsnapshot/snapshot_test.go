@@ -839,9 +839,9 @@ func TestCancelledLookupReturnsWhileRefreshIsBlocked(t *testing.T) {
 	}
 }
 
-// A read stuck past open must not hold maintenance: the timed-out waiter
-// reports the previous index as incomplete while the single worker publishes
-// for the next lookup, and a stuck file never spawns a second reader.
+// A read that honors cancellation stops at the refresh deadline and clears
+// the slot: the waiters report the previous index as incomplete, one reader
+// ran meanwhile, and the next lookup starts a fresh refresh that succeeds.
 func TestStalledReadReleasesWaiterAndKeepsOneReader(t *testing.T) {
 	oldBound := refreshWaitBound
 	refreshWaitBound = 50 * time.Millisecond
@@ -903,5 +903,122 @@ func TestStalledReadReleasesWaiterAndKeepsOneReader(t *testing.T) {
 	_, health := provider.Lookup(context.Background(), queries)
 	if !health.Complete {
 		t.Fatalf("health after the worker publishes = %+v, want complete", health)
+	}
+}
+
+// stalledFileProvider returns a provider holding one good index whose next
+// refresh blocks in a read that ignores cancellation, as a read stuck in a
+// syscall does. readsStarted receives one value per blocked read.
+func stalledFileProvider(t *testing.T) (provider *fileProvider, release chan struct{}, readsStarted chan struct{}) {
+	t.Helper()
+	oldBound, oldGrace := refreshWaitBound, refreshStallGrace
+	refreshWaitBound, refreshStallGrace = 300*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { refreshWaitBound, refreshStallGrace = oldBound, oldGrace })
+	path := writeFile(t, t.TempDir(), "refs.bib", oneEntryBibTeX("10.1000/one"))
+	provider = newTestProvider(t, path, config.LibraryClaimPDFPresent, time.Now)
+	if _, health := provider.Lookup(context.Background(), []ownership.Query{doiQuery("10.1000/one")}); !health.Complete {
+		t.Fatalf("initial health = %+v", health)
+	}
+	if err := os.WriteFile(path, []byte(oneEntryBibTeX("10.1000/two")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	release = make(chan struct{})
+	readsStarted = make(chan struct{}, 8)
+	provider.read = func(_ context.Context, reader io.Reader) ([]byte, error) {
+		readsStarted <- struct{}{}
+		<-release
+		return readBounded(context.Background(), reader)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	return provider, release, readsStarted
+}
+
+// A read that never observes cancellation must not keep every lookup waiting:
+// the first lookup returns at the refresh bound, later ones answer incomplete
+// at once without a second reader, and once the read finally returns the
+// provider recovers.
+func TestUninterruptibleReadLatchesTimeoutWithoutSecondReader(t *testing.T) {
+	provider, release, readsStarted := stalledFileProvider(t)
+	query := doiQuery("10.1000/two")
+
+	// The context deadline only keeps a regression from hanging the test; a
+	// healthy lookup returns at the refresh bound, well before it.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, health := provider.Lookup(ctx, []ownership.Query{query})
+	if elapsed := time.Since(start); elapsed < refreshWaitBound || elapsed > 2*time.Second {
+		t.Fatalf("first lookup took %v, want about the %v refresh bound", elapsed, refreshWaitBound)
+	}
+	if health.Complete || health.FailureCode != ownership.FailureTimeout || !health.Stale {
+		t.Fatalf("first health = %+v, want incomplete timeout", health)
+	}
+
+	for range 3 {
+		start = time.Now()
+		claims, health := provider.Lookup(ctx, []ownership.Query{query})
+		if elapsed := time.Since(start); elapsed > refreshWaitBound/2 {
+			t.Fatalf("lookup against a latched stall took %v, want it immediate", elapsed)
+		}
+		if health.Complete || health.FailureCode != ownership.FailureTimeout || !health.Stale {
+			t.Fatalf("latched health = %+v, want incomplete timeout", health)
+		}
+		if decision := ownership.Decide(doiQuery("10.1000/one"), ownership.WorkResult{Claims: claims[0]}); decision.Suppress {
+			t.Fatal("a stalled source must not suppress acquisition")
+		}
+	}
+	if got := len(readsStarted); got != 1 {
+		t.Fatalf("readers started while one read is stuck = %d, want 1", got)
+	}
+
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		claims, health := provider.Lookup(context.Background(), []ownership.Query{query})
+		if health.Complete {
+			if len(claims[0]) != 1 {
+				t.Fatalf("recovered claims = %+v, want the refreshed entry", claims)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider did not recover after the read returned: %+v", health)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Shutdown cannot interrupt a stuck read, so it must neither wait for it nor
+// let a later lookup start a replacement reader.
+func TestCloseDoesNotWaitForAStalledReadOrRestartIt(t *testing.T) {
+	provider, _, readsStarted := stalledFileProvider(t)
+	query := doiQuery("10.1000/two")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, health := provider.Lookup(ctx, []ownership.Query{query}); health.FailureCode != ownership.FailureTimeout || ctx.Err() != nil {
+		t.Fatalf("stalled health = %+v", health)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- provider.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close waited for a read that cannot be interrupted")
+	}
+	if _, health := provider.Lookup(context.Background(), []ownership.Query{query}); health.Complete || health.FailureCode != ownership.FailureTimeout {
+		t.Fatalf("health after Close = %+v, want incomplete timeout", health)
+	}
+	if got := len(readsStarted); got != 1 {
+		t.Fatalf("readers started = %d, want the single stuck one", got)
 	}
 }

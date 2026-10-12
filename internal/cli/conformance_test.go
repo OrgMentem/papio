@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -76,6 +78,10 @@ type commandClass struct {
 	rowKey     string
 	args       []string
 	rpcMethods []string
+	// stagedPDF makes the invocation run against a config with a data
+	// directory and add "job_01 <temp PDF> --role supplement" arguments, for a
+	// command that reads a local file before it reaches the daemon.
+	stagedPDF bool
 }
 
 // commandClassification names how every runnable command in the tree emits
@@ -90,6 +96,7 @@ var commandClassification = map[string]commandClass{
 	"papio init":                       {kind: kindNone},
 	"papio config":                     {kind: kindNone},
 	"papio config init":                {kind: kindStructured},
+	"papio config set-access-mode":     {kind: kindStructured},
 	"papio config agent":               {kind: kindNone},
 	"papio config agent set":           {kind: kindStructured},
 	"papio config agent status":        {kind: kindStructured},
@@ -101,6 +108,7 @@ var commandClassification = map[string]commandClass{
 	"papio config credentials detach":  {kind: kindStructured},
 	"papio config credentials delete":  {kind: kindStructured},
 	"papio config credentials migrate": {kind: kindStructured},
+	"papio config acknowledge-closure": {kind: kindStructured, args: []string{"openalex", "--confirm"}, rpcMethods: []string{"budget.acknowledge_closure_v1"}},
 	"papio acquire":                    {kind: kindStructured, rpcMethods: []string{"watch.digest_acquire", "zotio.queue", "acquire.submit_v3", "acquire.submit_v2", "acquire.submit", "jobs.get_v2", "jobs.get", "zotio.lookup_works", "library.lookup_works"}},
 	"papio batch":                      {kind: kindNone},
 	"papio batch report":               {kind: kindStructured, rpcMethods: []string{"acquire.report"}},
@@ -157,12 +165,12 @@ var commandClassification = map[string]commandClass{
 	"papio failures":                   {kind: kindEnvelope, rowKey: "failures", rpcMethods: []string{"failures.list_v1"}},
 	"papio jobs list":                  {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.list_v3", "jobs.list_v2", "jobs.list"}},
 	"papio jobs unfiled":               {kind: kindEnvelope, rowKey: "jobs", rpcMethods: []string{"jobs.unfiled"}},
-	"papio jobs refile":                {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"jobs.refile"}},
+	"papio jobs refile":                {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"jobs.refile", "jobs.refile_preview"}},
 	"papio jobs get":                   {kind: kindStructured, rpcMethods: []string{"jobs.get_v3", "jobs.get_v2", "jobs.get"}},
 	"papio jobs show":                  {kind: kindStructured, rpcMethods: []string{"jobs.get_v3", "jobs.get_v2", "jobs.get"}},
 	"papio jobs diagnose":              {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"jobs.diagnose_v2", "jobs.diagnose_v1"}},
 	"papio jobs receipt":               {kind: kindStructured, rpcMethods: []string{"jobs.receipt"}},
-	"papio jobs add-component":         {kind: kindEnvelope, rowKey: "components", args: []string{"job_01", "/tmp/papio-conformance-supplement.pdf", "--role", "supplement"}, rpcMethods: []string{"jobs.add_component"}},
+	"papio jobs add-component":         {kind: kindEnvelope, rowKey: "components", stagedPDF: true, rpcMethods: []string{"jobs.add_component_staged"}},
 	"papio jobs supply-pdf":            {kind: kindStructured, rpcMethods: []string{"jobs.supply_pdf"}},
 	"papio jobs repair-awaiting-human": {kind: kindStructured, rpcMethods: []string{"jobs.repair_awaiting_human"}},
 	"papio jobs cancel":                {kind: kindStructured, rpcMethods: []string{"jobs.cancel", "jobs.get"}},
@@ -172,7 +180,7 @@ var commandClassification = map[string]commandClass{
 	"papio jobs incidents":             {kind: kindEnvelope, rowKey: "incidents", rpcMethods: []string{"jobs.incidents"}},
 	"papio delivery":                   {kind: kindNone},
 	"papio delivery get":               {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.get"}},
-	"papio delivery submit":            {kind: kindStructured, args: []string{"job_01", "--confirm"}, rpcMethods: []string{"delivery.submit"}},
+	"papio delivery submit":            {kind: kindStructured, args: []string{"job_01", "--confirm"}, rpcMethods: []string{"delivery.submit", "delivery.preview"}},
 	"papio delivery cancel":            {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.cancel"}},
 	"papio delivery history":           {kind: kindStructured, args: []string{"job_01"}, rpcMethods: []string{"delivery.action"}},
 	"papio delivery confirm-exists":    {kind: kindStructured, args: []string{"job_01", "TN123"}, rpcMethods: []string{"delivery.action"}},
@@ -282,8 +290,18 @@ func TestJSONCommandTreeConformsToItsClassification(t *testing.T) {
 func assertJSONEnvelopeCommand(t *testing.T, path string, args []string, class commandClass) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	root := NewInProcessRoot(&out, &errOut, config.Config{}, nilRPC)
-	root.SetArgs(append([]string{"--json"}, append(args, class.args...)...))
+	cfg := config.Config{}
+	extra := class.args
+	if class.stagedPDF {
+		cfg = supplyPDFConfig(t, 1<<20)
+		source := filepath.Join(t.TempDir(), "supp.pdf")
+		if err := os.WriteFile(source, []byte("%PDF-1.7\nconformance\n%%EOF"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		extra = append([]string{"job_01", source, "--role", "supplement"}, extra...)
+	}
+	root := NewInProcessRoot(&out, &errOut, cfg, nilRPC)
+	root.SetArgs(append([]string{"--json"}, append(args, extra...)...))
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("%s: %v (stderr: %s)", path, err, errOut.String())
 	}

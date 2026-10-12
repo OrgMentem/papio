@@ -73,6 +73,34 @@ func refileJob(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 	return marshal(result)
 }
 
+// refilePreview serves jobs.refile_preview: the command `jobs refile` would run
+// for a job, under the same refusals, without running it. It is a new method
+// rather than a field on jobs.refile's result because that envelope is decoded
+// fail-closed.
+func refilePreview(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
+	var params struct {
+		JobID string `json:"job_id"`
+	}
+	if err := ipc.DecodeParams(raw, &params); err != nil {
+		return badParams(err)
+	}
+	params.JobID = strings.TrimSpace(params.JobID)
+	if params.JobID == "" {
+		return badParams(errors.New("job_id is required"))
+	}
+	if system == nil || system.App == nil {
+		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "application service is not configured"}
+	}
+	preview, err := system.App.PreviewRefile(ctx, params.JobID)
+	if errors.Is(err, app.ErrReadyHookNotConfigured) {
+		return badParams(app.ErrReadyHookNotConfigured)
+	}
+	if err != nil {
+		return failure(err)
+	}
+	return marshal(preview)
+}
+
 // ManagedFilingsPage is a new read model; hook result shapes stay unchanged.
 type ManagedFilingsPage struct {
 	Filings   []app.ManagedFiling `json:"filings"`

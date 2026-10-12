@@ -5,7 +5,10 @@
 
 package work
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalizeDOI(t *testing.T) {
 	cases := []struct {
@@ -81,6 +84,74 @@ func TestArXivFromDOI(t *testing.T) {
 	}
 	if got := ArXivFromDOI("10.1002/example"); got != "" {
 		t.Errorf("ArXivFromDOI non-arxiv = %q, want empty", got)
+	}
+	// A DataCite arXiv prefix with an unusable suffix must not yield a
+	// partial identifier.
+	for _, doi := range []string{"10.48550/arxiv.invalid", "10.48550/arxiv.", "10.48550/arxiv.2301.874"} {
+		if got := ArXivFromDOI(doi); got != "" {
+			t.Errorf("ArXivFromDOI(%q) = %q, want empty", doi, got)
+		}
+	}
+}
+
+func TestNormalizeISBN(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string // "" means error expected
+	}{
+		{"hyphenated ISBN-13", "978-0-123-45678-9", "9780123456789"},
+		{"spaced and padded ISBN-13", "  978 0 306 40615 7 ", "9780306406157"},
+		{"bare ISBN-10", "0306406152", "0306406152"},
+		{"ISBN-10 with lowercase x", "0-306-40615-x", "030640615X"},
+		{"ISBN-10 with uppercase X", "0-8044-2957-X", "080442957X"},
+		{"12 digits rejected", "978012345678", ""},
+		{"11 digits rejected", "03064061521", ""},
+		{"X before the check position rejected", "03064061X5", ""},
+		{"X in an ISBN-13 rejected", "978030640615X", ""},
+		{"letters rejected", "isbn-not-a-number", ""},
+		{"empty rejected", "", ""},
+		{"blank rejected", "  - ", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NormalizeISBN(c.in)
+			if c.want == "" {
+				if err == nil {
+					t.Fatalf("NormalizeISBN(%q) = %q, want error", c.in, got)
+				}
+				return
+			}
+			if err != nil || got != c.want {
+				t.Fatalf("NormalizeISBN(%q) = %q, %v; want %q", c.in, got, err, c.want)
+			}
+		})
+	}
+}
+
+func TestDescribe(t *testing.T) {
+	cases := []struct {
+		name string
+		work Work
+		want string
+	}{
+		{"DOI outranks everything", Work{DOI: "10.1000/a", ArXiv: "2301.08745", PMID: "1", OpenAlex: "W1234", ISBN: "9780306406157", Title: "T"}, "doi:10.1000/a"},
+		{"arXiv outranks PMID", Work{ArXiv: "2301.08745", PMID: "1", OpenAlex: "W1234", ISBN: "9780306406157", Title: "T"}, "arxiv:2301.08745"},
+		{"PMID outranks OpenAlex", Work{PMID: "1", OpenAlex: "W1234", ISBN: "9780306406157", Title: "T"}, "pmid:1"},
+		{"OpenAlex outranks ISBN", Work{OpenAlex: "W1234", ISBN: "9780306406157", Title: "T"}, "openalex:W1234"},
+		{"ISBN outranks title", Work{ISBN: "9780306406157", Title: "T"}, "isbn:9780306406157"},
+		{"short title", Work{Title: "A short title"}, "title:A short title"},
+		{"60-byte title is not truncated", Work{Title: strings.Repeat("a", 60)}, "title:" + strings.Repeat("a", 60)},
+		{"61-byte title is truncated with an ellipsis", Work{Title: strings.Repeat("a", 61)}, "title:" + strings.Repeat("a", 60) + "…"},
+		{"empty work", Work{}, "<empty work>"},
+		{"authors and year alone are not an identity", Work{Authors: []string{"Ada"}, Year: 2024}, "<empty work>"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.work.Describe(); got != c.want {
+				t.Fatalf("Describe() = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 

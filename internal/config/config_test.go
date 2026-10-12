@@ -223,79 +223,75 @@ func TestLoadToleratesAndDropsRemovedOpenAlexContentSource(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsMisspelledSourceName(t *testing.T) {
+func loadConfigText(t *testing.T, text string) (Config, error) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.unpaywal]\nenabled=true\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("misspelled source name accepted")
-	}
-	if !strings.Contains(err.Error(), "sources.unpaywal") || !strings.Contains(err.Error(), "not a recognized source name") {
-		t.Fatalf("misspelled source rejection error = %q", err)
+	return Load(path)
+}
+
+func TestLoadRejects(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		toml string
+		// Substrings the error must contain, and ones it must not.
+		contains, omits []string
+		// unknownFields means the error wraps the strict decoder's report.
+		unknownFields bool
+	}{
+		{name: "misspelled source name", toml: "access_mode='conservative'\n[sources.unpaywal]\nenabled=true\n",
+			contains: []string{"sources.unpaywal", "not a recognized source name"}},
+		{name: "unknown browser field", toml: "access_mode='conservative'\n[browser]\nbogus_option=true\n",
+			contains: []string{"browser.bogus_option", "update papio"}, unknownFields: true},
+		{name: "invalid TOML keeps the generic parse error", toml: "access_mode='conservative'\n[broken\n",
+			contains: []string{"parsing config"}, omits: []string{"update papio"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadConfigText(t, test.toml)
+			if err == nil {
+				t.Fatal("config accepted")
+			}
+			for _, want := range test.contains {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+			for _, unwanted := range test.omits {
+				if strings.Contains(err.Error(), unwanted) {
+					t.Errorf("error %q contains %q", err, unwanted)
+				}
+			}
+			var missing *toml.StrictMissingError
+			if test.unknownFields && !errors.As(err, &missing) {
+				t.Errorf("error = %v, want wrapped StrictMissingError", err)
+			}
+		})
 	}
 }
 
-func TestLoadAcceptsSemanticScholarSourceForAPIKey(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.semanticscholar]\napi_key='shh'\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("discovery-only semanticscholar source rejected: %v", err)
-	}
-	if got := cfg.SourcePolicy(SourceSemanticScholar); got.APIKey != "shh" {
-		t.Fatalf("semanticscholar policy = %+v", got)
-	}
-}
-
-func TestLoadAcceptsValidSourceKnob(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[sources.unpaywall]\nenabled=true\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("valid sources.unpaywall config rejected: %v", err)
-	}
-	if got := cfg.SourcePolicy(SourceUnpaywall); !got.Enabled {
-		t.Fatalf("unpaywall policy = %+v", got)
-	}
-}
-
-func TestLoadExplainsUnknownBrowserField(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[browser]\nbogus_option=true\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("unknown browser config field accepted")
-	}
-	if !strings.Contains(err.Error(), "browser.bogus_option") || !strings.Contains(err.Error(), "update papio") {
-		t.Fatalf("unknown browser config error = %q", err)
-	}
-	var missing *toml.StrictMissingError
-	if !errors.As(err, &missing) {
-		t.Fatalf("unknown browser config error = %v, want wrapped StrictMissingError", err)
-	}
-}
-
-func TestLoadKeepsGenericParseErrorForInvalidTOML(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte("access_mode='conservative'\n[broken\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("invalid TOML accepted")
-	}
-	if !strings.Contains(err.Error(), "parsing config") || strings.Contains(err.Error(), "update papio") {
-		t.Fatalf("invalid TOML error = %q", err)
+func TestLoadAcceptsSourcePolicy(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		toml   string
+		source string
+		ok     func(Source) bool
+	}{
+		{name: "semanticscholar api key", toml: "access_mode='conservative'\n[sources.semanticscholar]\napi_key='shh'\n",
+			source: SourceSemanticScholar, ok: func(p Source) bool { return p.APIKey == "shh" }},
+		{name: "unpaywall enabled", toml: "access_mode='conservative'\n[sources.unpaywall]\nenabled=true\n",
+			source: SourceUnpaywall, ok: func(p Source) bool { return p.Enabled }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := loadConfigText(t, test.toml)
+			if err != nil {
+				t.Fatalf("valid config rejected: %v", err)
+			}
+			if got := cfg.SourcePolicy(test.source); !test.ok(got) {
+				t.Fatalf("%s policy = %+v", test.source, got)
+			}
+		})
 	}
 }
 
@@ -743,43 +739,38 @@ func TestBrowserResolverStringShorthandLoads(t *testing.T) {
 }
 
 func TestResolverOrigins(t *testing.T) {
-	cfg := Config{Browser: Browser{
-		OpenURLBase: "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE",
-		Resolvers: map[string]Institution{
-			"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
-			"dupe":      {OpenURLBase: "https://example.primo.exlibrisgroup.com/other/openurl"},
-			"blank":     {OpenURLBase: ""},
-		},
-	}}
-	got := cfg.ResolverOrigins()
-	want := []string{"https://example.primo.exlibrisgroup.com", "https://onesearch.library.example-institute.edu"}
-	if len(got) != len(want) {
-		t.Fatalf("ResolverOrigins() = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("ResolverOrigins()[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
-		}
-	}
-}
-
-func TestResolverOriginsCanonicalize(t *testing.T) {
-	cfg := Config{Browser: Browser{
-		OpenURLBase: "https://MixedCase.Example.EDU:443/openurl",
-		Resolvers: map[string]Institution{
-			"ported":  {OpenURLBase: "https://library.example.edu:8443/openurl"},
-			"badport": {OpenURLBase: "https://bad.example.edu:99999/openurl"},
-		},
-	}}
-	got := cfg.ResolverOrigins()
-	want := []string{"https://library.example.edu:8443", "https://mixedcase.example.edu"}
-	if len(got) != len(want) {
-		t.Fatalf("ResolverOrigins() = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("ResolverOrigins()[%d] = %q, want %q (all=%v)", i, got[i], want[i], got)
-		}
+	for _, test := range []struct {
+		name      string
+		openURL   string
+		resolvers map[string]Institution
+		want      []string
+	}{
+		{name: "dedupes and skips blank", openURL: "https://example.primo.exlibrisgroup.com/nde/openurl?vid=61EXL_INST:61EXL_NDE",
+			resolvers: map[string]Institution{
+				"institute": {OpenURLBase: "https://onesearch.library.example-institute.edu/discovery/openurl?vid=61INS_INST:INS"},
+				"dupe":      {OpenURLBase: "https://example.primo.exlibrisgroup.com/other/openurl"},
+				"blank":     {OpenURLBase: ""},
+			},
+			want: []string{"https://example.primo.exlibrisgroup.com", "https://onesearch.library.example-institute.edu"}},
+		{name: "canonicalizes host case and ports", openURL: "https://MixedCase.Example.EDU:443/openurl",
+			resolvers: map[string]Institution{
+				"ported":  {OpenURLBase: "https://library.example.edu:8443/openurl"},
+				"badport": {OpenURLBase: "https://bad.example.edu:99999/openurl"},
+			},
+			want: []string{"https://library.example.edu:8443", "https://mixedcase.example.edu"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{Browser: Browser{OpenURLBase: test.openURL, Resolvers: test.resolvers}}
+			got := cfg.ResolverOrigins()
+			if len(got) != len(test.want) {
+				t.Fatalf("ResolverOrigins() = %v, want %v", got, test.want)
+			}
+			for i := range test.want {
+				if got[i] != test.want[i] {
+					t.Fatalf("ResolverOrigins()[%d] = %q, want %q (all=%v)", i, got[i], test.want[i], got)
+				}
+			}
+		})
 	}
 }
 

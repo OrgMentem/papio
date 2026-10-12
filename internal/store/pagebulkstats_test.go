@@ -10,7 +10,7 @@ import (
 
 func TestPageBulkStatsEmptyTableReportsZeroesAndNoDenominator(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestPageBulkStatsEmptyTableReportsZeroesAndNoDenominator(t *testing.T) {
 
 func TestPageBulkStatsAggregatesScanAndSubmitRowsHonestly(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -78,6 +78,20 @@ func SuppliedPDFStagingDir(dataDir, jobID string) (string, error) {
 	return filepath.Join(dataDir, suppliedPDFDirName, jobID), nil
 }
 
+// componentStagingDirName is the data-directory child that holds supplements
+// and appendices the operator staged with `papio jobs add-component`, one
+// subdirectory per job.
+const componentStagingDirName = "components-staged"
+
+// ComponentStagingDir returns <dataDir>/components-staged/<jobID>, the only
+// directory AdoptStagedComponent reads from. It does not create the directory.
+func ComponentStagingDir(dataDir, jobID string) (string, error) {
+	if !plainFileName(jobID) {
+		return "", fmt.Errorf("invalid job id %q", jobID)
+	}
+	return filepath.Join(dataDir, componentStagingDirName, jobID), nil
+}
+
 // plainFileName reports whether name is one path element that stays where it
 // is joined: not empty, not a dot segment, no separator of either platform,
 // and no volume or reserved name.
@@ -408,16 +422,22 @@ func suppliedPDFFailureSummary(cause error) string {
 // planted in their place could otherwise point the daemon at a file elsewhere
 // on disk. The file itself must be a regular file, not a symlink.
 func confineSuppliedPDF(stageDir, name string) (string, os.FileInfo, error) {
+	return confineStagedFile(stageDir, name, ErrSuppliedPDFName)
+}
+
+// confineStagedFile is confineSuppliedPDF for any daemon-owned staging
+// directory: refusals wrap sentinel, so each entry point reports its own class.
+func confineStagedFile(stageDir, name string, sentinel error) (string, os.FileInfo, error) {
 	for _, dir := range []string{filepath.Dir(stageDir), stageDir} {
 		info, err := os.Lstat(dir)
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", nil, fmt.Errorf("%w: nothing is staged for this job", ErrSuppliedPDFName)
+			return "", nil, fmt.Errorf("%w: nothing is staged for this job", sentinel)
 		}
 		if err != nil {
 			return "", nil, fmt.Errorf("reading the supplied PDF staging directory: %w", err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return "", nil, fmt.Errorf("%w: %s is not a directory", ErrSuppliedPDFName, dir)
+			return "", nil, fmt.Errorf("%w: %s is not a directory", sentinel, dir)
 		}
 	}
 	// Ancestors of the data directory may be symlinks (/var -> /private/var);
@@ -428,11 +448,11 @@ func confineSuppliedPDF(stageDir, name string) (string, os.FileInfo, error) {
 	}
 	path := filepath.Join(realDir, name)
 	if err := artifact.ConfineRegularFile(realDir, path); err != nil {
-		return "", nil, fmt.Errorf("%w: %w", ErrSuppliedPDFName, err)
+		return "", nil, fmt.Errorf("%w: %w", sentinel, err)
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
-		return "", nil, fmt.Errorf("%w: %w", ErrSuppliedPDFName, err)
+		return "", nil, fmt.Errorf("%w: %w", sentinel, err)
 	}
 	return path, info, nil
 }

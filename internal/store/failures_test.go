@@ -9,7 +9,7 @@ import (
 
 func TestFailureSummariesUseLatestDecisiveEventsAndSwitchGrouping(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestFailureSummariesUseLatestDecisiveEventsAndSwitchGrouping(t *testing.T) 
 
 func TestFailureSummariesExampleJobIDIsChronologicalNotLexical(t *testing.T) {
 	ctx := context.Background()
-	db, err := Open(ctx, t.TempDir())
+	db, err := Open(ctx, seededDataDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

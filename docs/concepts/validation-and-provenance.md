@@ -53,9 +53,9 @@ Evidence that is semantically or identity-ambiguous parks the job in
 then resolve that specific action deliberately:
 
 ```sh
-papio actions resolve <action-id> --accept
+papio actions resolve <action-id> --revision <revision> --sha256 <quarantine_sha256> --accept
 # or
-papio actions resolve <action-id> --reject
+papio actions resolve <action-id> --revision <revision> --reject
 ```
 
 `--accept` states that you verified the quarantined PDF is the requested work.

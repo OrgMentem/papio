@@ -792,6 +792,48 @@ func createProjectionAction(t *testing.T, jobs *job.Store, requestID, kind, deta
 	return id
 }
 
+// cloneProjectionActions grows a fixture to total rows by copying the given
+// template jobs (each already built through createProjectionAction) with four
+// set-based INSERT...SELECT statements per template in one transaction. Row i
+// copies templates[i%len], so two templates alternate. Tests that only assert
+// aggregate wire bounds over many rows use it instead of paying three store
+// transactions per row under -race. Each clone keeps the template's job
+// state, request and open human action.
+func cloneProjectionActions(t *testing.T, jobs *job.Store, prefix string, total int, templates ...string) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := jobs.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	const rows = `WITH RECURSIVE n(i) AS (SELECT ?2 UNION ALL SELECT i + ?3 FROM n WHERE i + ?3 < ?4) `
+	for k, template := range templates {
+		args := []any{template, len(templates) + k, len(templates), total, prefix}
+		for _, stmt := range []string{
+			rows + `INSERT INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd, submitted_fields)
+			  SELECT printf('%s-request-%04d', ?5, n.i), w.created_at, w.requester, w.zotio_item_key, w.collection_key, w.title, w.authors_json, w.year, w.desired_version, w.max_cost_usd, w.submitted_fields
+			  FROM n, jobs j JOIN work_requests w ON w.id = j.work_request_id WHERE j.id = ?1`,
+			rows + `INSERT INTO identifiers (work_request_id, kind, value, raw, provenance)
+			  SELECT printf('%s-request-%04d', ?5, n.i), x.kind, x.value || printf('-%04d', n.i), x.raw, x.provenance
+			  FROM n, jobs j JOIN identifiers x ON x.work_request_id = j.work_request_id WHERE j.id = ?1`,
+			rows + `INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at)
+			  SELECT printf('%s-%s-%04d', ?5, ?1, n.i), printf('%s-request-%04d', ?5, n.i), j.state, j.policy_json, j.created_at, j.updated_at
+			  FROM n, jobs j WHERE j.id = ?1`,
+			rows + `INSERT INTO human_actions (job_id, kind, status, detail, created_at, expires_at, requires_auth, blocked_by, diagnosis)
+			  SELECT printf('%s-%s-%04d', ?5, ?1, n.i), h.kind, h.status, h.detail, h.created_at, h.expires_at, h.requires_auth, h.blocked_by, h.diagnosis
+			  FROM n, human_actions h WHERE h.job_id = ?1`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+				t.Fatalf("clone %s: %v", template, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func createGate(t *testing.T, jobs *job.Store, id, scope, owner string, dependent []string) {
 	t.Helper()
 	members := append([]string{owner}, dependent...)
@@ -1168,9 +1210,8 @@ func TestTurnsIncludePdfGrabsAndRespectBounds(t *testing.T) {
 	}
 
 	tooManyService, _, tooManyJobs := triageTestService(t)
-	for i := range 1025 {
-		createProjectionAction(t, tooManyJobs, fmt.Sprintf("turn-limit-%04d", i), "manual_download", "normal", job.Access(false, "landing_page"))
-	}
+	turnLimit := createProjectionAction(t, tooManyJobs, "turn-limit-template", "manual_download", "normal", job.Access(false, "landing_page"))
+	cloneProjectionActions(t, tooManyJobs, "turn-limit", 1025, turnLimit)
 	tooMany, err := tooManyService.Counts(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1183,13 +1224,9 @@ func TestTurnsIncludePdfGrabsAndRespectBounds(t *testing.T) {
 	// collapses them into one block per family; the 128-run wire bound is
 	// still enforced against the run count itself, exercised below.
 	manyRunsService, _, manyRunsJobs := triageTestService(t)
-	for i := range 129 {
-		kind := "manual_download"
-		if i%2 == 1 {
-			kind = "verify_identity"
-		}
-		createProjectionAction(t, manyRunsJobs, fmt.Sprintf("run-limit-%04d", i), kind, "normal", job.Access(false, "landing_page"))
-	}
+	runLimitManual := createProjectionAction(t, manyRunsJobs, "run-limit-manual", "manual_download", "normal", job.Access(false, "landing_page"))
+	runLimitVerify := createProjectionAction(t, manyRunsJobs, "run-limit-verify", "verify_identity", "normal", job.Access(false, "landing_page"))
+	cloneProjectionActions(t, manyRunsJobs, "run-limit", 129, runLimitManual, runLimitVerify)
 	manyRuns, err := manyRunsService.Counts(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1653,6 +1690,49 @@ func (s *dismissingGrabSource) DismissPdfGrab(_ context.Context, grabID string) 
 	}
 	s.discarded = true
 	return true, nil
+}
+
+// TestDecideRejectsIDsItCannotRouteInsteadOfReportingConflict pins that
+// "conflict" keeps its meaning (an item someone else already answered). An
+// open human action is listed by the inbox but decided through the actions
+// commands; an id that names no inbox item at all is a typo, not a race.
+func TestDecideRejectsIDsItCannotRouteInsteadOfReportingConflict(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	ctx := context.Background()
+	createProjectionAction(t, jobs, "decide-action", "manual_download", "normal", job.Access(false, "landing_page"))
+	snapshot, err := service.Snapshot(ctx, SnapshotRequest{Limit: 10})
+	if err != nil || len(snapshot.Items) != 1 || snapshot.Items[0].Kind != KindHumanAction {
+		t.Fatalf("seeded snapshot = %+v, %v; want one human action", snapshot.Items, err)
+	}
+	actionID := snapshot.Items[0].ID
+	number := strings.TrimPrefix(actionID, "action:")
+
+	for _, op := range []DecisionOperation{DecisionDismiss, DecisionAcquire} {
+		result, err := service.Decide(ctx, DecisionInput{ItemID: actionID, Operation: op, Scope: WatchScope{All: true}}, &watch.Runner{})
+		if err != nil || result.Outcome != DecisionInvalid {
+			t.Fatalf("%s on an open action = %+v, %v; want invalid", op, result, err)
+		}
+		for _, want := range []string{"papio actions dismiss", "resolve " + number, "--revision"} {
+			if !strings.Contains(result.Detail, want) {
+				t.Fatalf("%s on an open action detail = %q, want it to name %q", op, result.Detail, want)
+			}
+		}
+	}
+	after, err := service.Snapshot(ctx, SnapshotRequest{Limit: 10})
+	if err != nil || len(after.Items) != 1 {
+		t.Fatalf("the refused decision changed the inbox: %+v, %v", after.Items, err)
+	}
+
+	unknown, err := service.Decide(ctx, DecisionInput{ItemID: "nope", Operation: DecisionDismiss, Scope: WatchScope{All: true}}, &watch.Runner{})
+	if err != nil || unknown.Outcome != DecisionInvalid || !strings.Contains(unknown.Detail, "no inbox item nope") || !strings.Contains(unknown.Detail, "papio inbox") {
+		t.Fatalf("unknown id = %+v, %v; want invalid naming the id and pointing at papio inbox", unknown, err)
+	}
+
+	// A watch hit that was listed and is gone now is the real race.
+	gone, err := service.Decide(ctx, DecisionInput{ItemID: "hit:1:10.1000/gone", Operation: DecisionDismiss, Scope: WatchScope{All: true}}, &watch.Runner{})
+	if err != nil || gone.Outcome != DecisionConflict {
+		t.Fatalf("answered watch hit = %+v, %v; want conflict", gone, err)
+	}
 }
 func TestDecideOwnsWatchScopeSelection(t *testing.T) {
 	service, watches, _ := triageTestService(t)

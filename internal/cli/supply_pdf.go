@@ -94,6 +94,12 @@ func stageSuppliedPDF(dataDir string, limit int64, jobID, source string) (string
 	if err != nil {
 		return "", "", err
 	}
+	return stageLocalPDF(stageDir, limit, source)
+}
+
+// stageLocalPDF copies the PDF at source into stageDir under a fresh name and
+// returns the staged path and that name. stageSuppliedPDF documents the checks.
+func stageLocalPDF(stageDir string, limit int64, source string) (string, string, error) {
 	info, err := os.Lstat(source)
 	if err != nil {
 		return "", "", err

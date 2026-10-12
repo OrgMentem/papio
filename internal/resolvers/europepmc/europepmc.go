@@ -18,11 +18,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"papio/internal/redact"
 	"papio/internal/resolver"
+	"papio/internal/resolvers/authormatch"
 	"papio/internal/work"
 )
 
@@ -382,7 +381,7 @@ func matchesTitleSearch(recordTitle string, recordAuthors []string, recordYear i
 	if requested.Year != 0 && recordYear != requested.Year {
 		return false
 	}
-	return sameAuthorLists(recordAuthors, requested.Authors)
+	return authormatch.SameLists(recordAuthors, requested.Authors)
 }
 
 func authorNames(value string) []string {
@@ -398,77 +397,6 @@ func authorNames(value string) []string {
 func publicationYear(value string) int {
 	year, _ := strconv.Atoi(strings.TrimSpace(value))
 	return year
-}
-
-func sameAuthorLists(recordAuthors, requestedAuthors []string) bool {
-	if len(requestedAuthors) == 0 {
-		return true
-	}
-	if len(recordAuthors) != len(requestedAuthors) {
-		return false
-	}
-	matched := make([]bool, len(recordAuthors))
-	for _, requestedAuthor := range requestedAuthors {
-		found := false
-		for i, recordAuthor := range recordAuthors {
-			if !matched[i] && sameAuthor(recordAuthor, requestedAuthor) {
-				matched[i], found = true, true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
-}
-
-func sameAuthor(left, right string) bool {
-	leftSurname, leftInitial, leftOK := canonicalAuthor(left)
-	rightSurname, rightInitial, rightOK := canonicalAuthor(right)
-	return leftOK && rightOK && leftSurname == rightSurname && leftInitial == rightInitial
-}
-
-func canonicalAuthor(value string) (string, rune, bool) {
-	value = strings.TrimSpace(value)
-	if comma := strings.IndexRune(value, ','); comma >= 0 {
-		surname := normalizeTitle(value[:comma])
-		givenNames := strings.Fields(normalizeTitle(value[comma+1:]))
-		if surname == "" || len(givenNames) == 0 {
-			return "", 0, false
-		}
-		initial, ok := firstAuthorRune(givenNames[0])
-		return surname, initial, ok
-	}
-
-	parts := strings.Fields(normalizeTitle(value))
-	switch len(parts) {
-	case 0:
-		return "", 0, false
-	case 1:
-		// Mononymous authors ("Madonna") carry no separate initial; match on
-		// the bare name so a valid single-name author cannot sink the list.
-		return parts[0], 0, true
-	}
-	if isAuthorInitial(parts[len(parts)-1]) {
-		initial, ok := firstAuthorRune(parts[len(parts)-1])
-		return strings.Join(parts[:len(parts)-1], " "), initial, ok
-	}
-	initial, ok := firstAuthorRune(parts[0])
-	return parts[len(parts)-1], initial, ok
-}
-
-func isAuthorInitial(value string) bool {
-	value = strings.Trim(value, ".")
-	_, size := utf8.DecodeRuneInString(value)
-	return size > 0 && size == len(value)
-}
-
-func firstAuthorRune(value string) (rune, bool) {
-	for _, r := range value {
-		return unicode.ToLower(r), true
-	}
-	return 0, false
 }
 
 func reuseLicense(value string) string {

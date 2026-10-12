@@ -62,6 +62,16 @@ transaction:
 3. It performs the legal job transition when the role is `main`.
 4. It removes the prepared journal row.
 
+*Amended — terminal-job recovery.* The lease recheck and the `main` transition
+apply to finalization of a live job. When recovery finalizes a prepared
+publication whose job is already terminal (for example cancelled), it keeps the
+writer fence but skips the lease check and the `main` state transition
+(`internal/job/publication.go`, the `terminal` branches). The terminal state is
+preserved, the job lease is cleared, and candidate acceptance, the acquisition
+edge, and journal removal still complete so the prepared publication is not
+stranded. `internal/job/publication_test.go` pins this with the cancellation
+regression.
+
 A component publication records its acquisition edge and removes its journal
 row. It does not transition the main job state. The finalizer must reject a
 candidate that does not belong to the journal job.

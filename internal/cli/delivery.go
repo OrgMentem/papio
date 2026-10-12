@@ -11,7 +11,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"papio/internal/api"
-	"papio/internal/ipc"
 )
 
 // errDeliveryNotCancelled and errDeliveryNotResumed turn a daemon's
@@ -75,6 +74,10 @@ func printDeliveryDetail(opt *options, jobID string, detail api.DeliveryDetail) 
 	if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\t%s\n", jobID, req.Provider, req.RequestClass, req.State); err != nil {
 		return err
 	}
+	// `delivery resume` takes this id, not the job id.
+	if _, err := fmt.Fprintf(opt.out, "  request id: %d\n", req.ID); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(opt.out, "  gate: %s\n", detail.Gate.Class); err != nil {
 		return err
 	}
@@ -112,8 +115,9 @@ func newDeliverySubmitCommand(opt *options) *cobra.Command {
 			"request with the provider — which can count against a request allowance\n" +
 			"or cost the institution money, and which papio cannot cancel through the\n" +
 			"provider. Otherwise it opens a prefill or reconciliation action.\n\n" +
-			"Without --confirm nothing is submitted: the command shows the job's\n" +
-			"recorded delivery request and compiled gate, if any, and exits nonzero.",
+			"Without --confirm nothing is submitted: the command reports what\n" +
+			"--confirm would do for this job (a real provider request, a prefill\n" +
+			"action, or the handling of an existing request) and exits nonzero.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !confirm {
@@ -142,31 +146,50 @@ func newDeliverySubmitCommand(opt *options) *cobra.Command {
 var errDeliverySubmitUnconfirmed = errors.New("delivery submit places a real provider request when the gate allows it, and papio cannot cancel that request; re-run with --confirm to proceed")
 
 // previewDeliverySubmit is the no-side-effect half of `delivery submit`: it
-// reads the job's existing delivery request and compiled gate (delivery.get)
-// so the operator sees where the job stands before confirming. A job with no
-// request yet has nothing recorded to show. --json prints nothing on stdout
-// here: a DeliveryDetail where a DeliverySubmitResult is expected would read
-// as a submission.
+// asks the daemon what --confirm would do (delivery.preview) so the operator
+// knows before confirming whether a real provider request would be placed,
+// including for a job that has no request yet. Under --json the verdict is
+// printed as a DeliveryPreviewResult, which shares no field name with
+// DeliverySubmitResult, so it cannot be read as a submission.
 func previewDeliverySubmit(cmd *cobra.Command, opt *options, jobID string) error {
-	if opt.jsonOutput {
-		return errDeliverySubmitUnconfirmed
+	var preview api.DeliveryPreviewResult
+	if err := opt.call(cmd.Context(), "delivery.preview", map[string]string{"job_id": jobID}, &preview); err != nil {
+		if isUnknownMethod(err) {
+			return daemonUpgradeRequired("delivery.preview")
+		}
+		return err
 	}
-	var detail api.DeliveryDetail
-	err := opt.call(cmd.Context(), "delivery.get", map[string]string{"job_id": jobID}, &detail)
-	var remote *ipc.RemoteError
-	switch {
-	case err == nil:
-		if err := printDeliveryDetail(opt, jobID, detail); err != nil {
+	if opt.jsonOutput {
+		if err := opt.printJSON(preview); err != nil {
 			return err
 		}
-	case errors.As(err, &remote) && remote.Code == "not_found":
-		if _, err := fmt.Fprintf(opt.out, "%s: no delivery request recorded yet\n", jobID); err != nil {
-			return err
-		}
-	default:
+	} else if _, err := fmt.Fprintf(opt.out, "%s: %s\n", jobID, describeDeliveryPreview(preview)); err != nil {
 		return err
 	}
 	return errDeliverySubmitUnconfirmed
+}
+
+// describeDeliveryPreview says in one line what `delivery submit --confirm`
+// would do. The wording separates the one irreversible outcome, a real
+// provider request, from every outcome that places none.
+func describeDeliveryPreview(preview api.DeliveryPreviewResult) string {
+	if !preview.Configured {
+		return "no document-delivery route is configured for this job's institution profile; --confirm would do nothing"
+	}
+	if preview.Branch == "evaluate_gate" {
+		gate := "gate " + preview.GateClass
+		if len(preview.Blockers) > 0 {
+			gate += ": " + strings.Join(preview.Blockers, ", ")
+		}
+		if preview.Verdict == "submit" {
+			return fmt.Sprintf("--confirm would place a real provider request with %s (%s)", preview.Provider, gate)
+		}
+		return fmt.Sprintf("--confirm would open a prefill action and place no provider request (%s)", gate)
+	}
+	if req := preview.Request; req != nil {
+		return fmt.Sprintf("--confirm would place no new provider request: request %d (%s, state %s) already governs this job (branch %s)", req.ID, req.Provider, req.State, preview.Branch)
+	}
+	return fmt.Sprintf("--confirm would place no new provider request (branch %s)", preview.Branch)
 }
 
 func newDeliveryCancelCommand(opt *options) *cobra.Command {
@@ -266,7 +289,7 @@ func newDeliveryResumeCommand(opt *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			requestID, err := strconv.ParseInt(args[0], 10, 64)
 			if err != nil || requestID <= 0 {
-				return errors.New("request-id must be a positive integer")
+				return fmt.Errorf("%q is not a delivery request id: delivery resume takes the numeric request id (delivery_requests.id), not a job id; find it on the \"request id\" line of `papio delivery get <job-id>`", args[0])
 			}
 			var result api.DeliveryResumeResult
 			if err := opt.call(cmd.Context(), "delivery.resume", map[string]any{"request_id": requestID}, &result); err != nil {

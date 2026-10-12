@@ -39,7 +39,10 @@ func newGrabsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result)
+				if err := opt.printJSON(result); err != nil {
+					return err
+				}
+				return grabIdentifyOutcomeError(result)
 			}
 			fields := []string{result.GrabID, result.Outcome}
 			if result.JobID != "" {
@@ -48,8 +51,10 @@ func newGrabsCommand(opt *options) *cobra.Command {
 			if result.Detail != "" {
 				fields = append(fields, result.Detail)
 			}
-			_, err = fmt.Fprintln(opt.out, strings.Join(fields, "\t"))
-			return err
+			if _, err = fmt.Fprintln(opt.out, strings.Join(fields, "\t")); err != nil {
+				return err
+			}
+			return grabIdentifyOutcomeError(result)
 		},
 	}
 	identify.Flags().StringVar(&doi, "doi", "", "identify by DOI")
@@ -60,6 +65,21 @@ func newGrabsCommand(opt *options) *cobra.Command {
 	command.AddCommand(newGrabsSuggestCommand(opt))
 	command.AddCommand(newGrabsConfirmCommand(opt))
 	return command
+}
+
+// grabIdentifyOutcomeError is grabConfirmOutcomeError for `grabs identify`:
+// job_created is the only outcome that filed the capture. A malformed
+// identifier, an unknown grab, already_owned (the capture is kept and still
+// parked) and a failed bind are all commands that did not do what was asked,
+// so a script that loops over parked captures must see them in the exit status.
+func grabIdentifyOutcomeError(result api.GrabIdentifyResult) error {
+	if result.Outcome == "job_created" {
+		return nil
+	}
+	if result.Detail != "" {
+		return fmt.Errorf("grab %s was not identified: %s: %s", result.GrabID, result.Outcome, result.Detail)
+	}
+	return fmt.Errorf("grab %s was not identified: %s", result.GrabID, result.Outcome)
 }
 
 func grabIdentifierFlags(doi, pmid, arxiv string) (string, string, error) {

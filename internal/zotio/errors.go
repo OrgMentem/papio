@@ -26,6 +26,7 @@ const (
 	ErrorClassMirrorSyncFailed         = "mirror_sync_failed"
 	ErrorClassZotioExecTimeout         = "zotio_exec_timeout"
 	ErrorClassZotioCanceled            = "zotio_canceled"
+	ErrorClassZotioApplyUnconfirmed    = "zotio_apply_unconfirmed"
 	ErrorClassZotioNotConfigured       = "zotio_not_configured"
 	ErrorClassPlanConfirmationMismatch = "plan_confirmation_mismatch"
 	ErrorClassReservationConflict      = "reservation_conflict"
@@ -293,6 +294,7 @@ func IsErrorClass(class string) bool {
 		ErrorClassMirrorSyncFailed,
 		ErrorClassZotioExecTimeout,
 		ErrorClassZotioCanceled,
+		ErrorClassZotioApplyUnconfirmed,
 		ErrorClassZotioNotConfigured,
 		ErrorClassPlanConfirmationMismatch,
 		ErrorClassReservationConflict,

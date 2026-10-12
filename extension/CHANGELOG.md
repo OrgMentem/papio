@@ -68,6 +68,12 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **A failed storage read no longer erases which tabs *papio* owns.** When
+  the first read of the tab ledger failed, the extension treated the ledger as
+  empty and saved that over the stored one, so it forgot its claims and
+  tombstones. It now keeps the stored ledger and reads it again next time.
+- When the browser refuses to close a tab, the extension no longer reports the
+  paper as closed or offers to reopen a tab that is still open.
 - **Closing an old sign-in tab after an extension restart releases its claim.**
   Earlier builds marked a tab as operator-owned when you only activated it.
   If you closed that tab while the extension was asleep, restart recovery

@@ -636,9 +636,7 @@ func classifyBatchOwnership(ctx context.Context, caller Caller, requests []proto
 	}
 	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(requests))}
 	for i, request := range requests {
-		if request.Identifiers != nil {
-			lookupRequest.Works[i] = zotio.LookupWork{DOI: request.Identifiers.DOI, ArXiv: request.Identifiers.ArXiv}
-		}
+		lookupRequest.Works[i] = zotio.LookupWorkFromIdentifiers(request.Identifiers)
 	}
 	var result zotio.LookupWorksResult
 	if err := caller.Call(ctx, "zotio.lookup_works", lookupRequest, &result); err != nil {

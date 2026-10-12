@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,17 @@ const (
 	StateFailed        = "failed"
 	StateCancelled     = "cancelled"
 )
+
+// States lists every job state, in lifecycle order.
+var States = []string{
+	StateQueued, StateResolving, StateFetching, StateValidating, StateReady, StateImported,
+	StateAwaitingHuman, StateRetryWait, StateNeedsReview, StateUnavailable, StateFailed, StateCancelled,
+}
+
+// ValidState reports whether state is one of States.
+func ValidState(state string) bool {
+	return slices.Contains(States, state)
+}
 
 // RetryReason names a StateRetryWait reason that other packages must
 // recognise by identity rather than by matching an ad hoc event-detail
@@ -1713,8 +1725,23 @@ func CheckRetryable(state string) error {
 	case StateRetryWait, StateFailed, StateUnavailable:
 		return nil
 	default:
-		return fmt.Errorf("%w: %s cannot be retried", ErrConflict, state)
+		return fmt.Errorf("%w: %s cannot be retried%s", ErrConflict, state, retryRemedy(state))
 	}
+}
+
+// retryRemedy names the command that does apply to a state retry refuses, so
+// the refusal is a next step rather than a dead end. Other states add nothing:
+// a live job is already moving, and a settled one has nothing to reopen.
+func retryRemedy(state string) string {
+	switch state {
+	case StateCancelled:
+		return "; submit the work again with `papio acquire`"
+	case StateAwaitingHuman:
+		return "; open its handoff with `papio actions open`, or use `papio jobs redrive`"
+	case StateNeedsReview:
+		return "; resolve its review with `papio actions resolve`"
+	}
+	return ""
 }
 
 // Retry explicitly reopens a retry-wait, failed, or unavailable job at the
@@ -2432,13 +2459,6 @@ func (js *Store) ApplyBrowserDeliveryContextToCandidate(ctx context.Context, job
 	}
 	n, err := res.RowsAffected()
 	return n == 1, err
-}
-
-// ApplyBrowserDeliveryContext is retained for callers compiled against the
-// pre-binding API, but deliberately fails closed: without the candidate ID it
-// cannot prove which download produced a browser row.
-func (js *Store) ApplyBrowserDeliveryContext(ctx context.Context, jobID, route, sessionEvidence, landingRedacted string) (bool, error) {
-	return false, nil
 }
 
 // ResetCandidates makes interrupted and retryable candidates runnable for a

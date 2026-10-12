@@ -18,7 +18,7 @@ func publisherRetryCommand(opt *options) *cobra.Command {
 		Long: "Retry a failed browser route through the paper's DOI in your browser.\n\n" +
 			"If the DOI retry has already failed, this command re-offers the original\n" +
 			"institutional route only when the refusing adapter has since been upgraded.\n" +
-			"Use the action id and revision from 'papio actions list --json'. The failed\n" +
+			"Use the action id and revision from the revision column of 'papio actions list'. The failed\n" +
 			"action and its evidence remain in the job history. Each route can be retried\n" +
 			"once. Pending sign-ins, challenges, terms, downloads, and unresolved browser\n" +
 			"effects must be handled first. Neither retry establishes entitlement.",
@@ -29,7 +29,7 @@ func publisherRetryCommand(opt *options) *cobra.Command {
 				return errors.New("action-id must be a positive integer")
 			}
 			if revision <= 0 {
-				return errors.New("--revision is required; take it from 'papio actions list --json'")
+				return errors.New("--revision is required; take it from the revision column of 'papio actions list'")
 			}
 			var result api.SubmitResult
 			if err := opt.call(cmd.Context(), "actions.retry_publisher", map[string]any{"action_id": id, "expected_revision": revision}, &result); err != nil {

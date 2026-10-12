@@ -9,6 +9,21 @@ import (
 	"syscall"
 )
 
+// SyncDir flushes dir's entries to stable storage, so a rename or create in it
+// survives power loss. A filesystem that cannot sync a directory has nothing to
+// flush and reports success.
+func SyncDir(dir string) error {
+	file, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := file.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOTSUP) {
+		return err
+	}
+	return nil
+}
+
 func normalizeConfigTarget(path string) string { return path }
 
 func lockConfig(path string) (*os.File, error) {

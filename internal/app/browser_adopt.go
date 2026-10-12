@@ -558,6 +558,14 @@ func (s *Service) adoptionReplacementAccess(ctx context.Context, jobID string) j
 // re-checks the name without following it and requires the opened descriptor
 // to be that same regular file, failing closed on any change.
 func copyHashed(src, dst string) (sha string, size int64, err error) {
+	return copyHashedBounded(src, dst, -1)
+}
+
+// copyHashedBounded is copyHashed that also stops reading past limit bytes and
+// fails with ErrComponentRejected when the source holds more, so a file that
+// grows after a size check cannot exceed the bound. A negative limit is
+// unbounded.
+func copyHashedBounded(src, dst string, limit int64) (sha string, size int64, err error) {
 	checked, err := os.Lstat(src)
 	if err != nil {
 		return "", 0, err
@@ -577,7 +585,18 @@ func copyHashed(src, dst string) (sha string, size int64, err error) {
 	if !opened.Mode().IsRegular() || !os.SameFile(checked, opened) {
 		return "", 0, fmt.Errorf("adoption source %s changed before it was read", src)
 	}
-	return writeHashed(in, dst)
+	if limit < 0 {
+		return writeHashed(in, dst)
+	}
+	sha, size, err = writeHashed(io.LimitReader(in, limit+1), dst)
+	if err != nil {
+		return "", 0, err
+	}
+	if size > limit {
+		_ = os.Remove(dst)
+		return "", 0, fmt.Errorf("%w: the file grew past the fetch.max_bytes limit of %d bytes", ErrComponentRejected, limit)
+	}
+	return sha, size, nil
 }
 
 // writeHashed streams r into dst (created 0600, never an existing file) while

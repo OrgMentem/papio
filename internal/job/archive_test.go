@@ -102,3 +102,49 @@ func TestArchiveRetainsIdentityArtifactsAndRestoresActionableReady(t *testing.T)
 		t.Fatalf("audit counts = %d, %d", archivedEvents, restoredEvents)
 	}
 }
+
+func TestAddComponentRoleGateAndUpsert(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, err := js.CreateRequest(ctx, "wr_components", testWork(), "", "", testPolicy(), nil, PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("b", 64)
+	if err := js.UpsertArtifact(ctx, Artifact{SHA256: sha, SizeBytes: 100, MIME: "application/pdf", IdentityResult: "pass", Path: "/fixture/supp.pdf"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{ComponentMain, "bogus", ""} {
+		if err := js.AddComponent(ctx, id, sha, role, 0, "pass"); !errors.Is(err, ErrConflict) {
+			t.Fatalf("AddComponent(role %q) = %v, want ErrConflict", role, err)
+		}
+	}
+	if got, err := js.Components(ctx, id); err != nil || len(got) != 0 {
+		t.Fatalf("rejected roles recorded components: %+v, %v", got, err)
+	}
+	for _, role := range []string{ComponentHTMLFullText, ComponentSupplement, ComponentAppendix} {
+		if err := js.AddComponent(ctx, id, sha, role, 0, "pass"); err != nil {
+			t.Fatalf("AddComponent(%s): %v", role, err)
+		}
+	}
+	// Replay with new identity updates in place rather than duplicating.
+	if err := js.AddComponent(ctx, id, sha, ComponentSupplement, 0, "mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := js.Components(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("components = %+v, want 3 (one per role)", got)
+	}
+	for _, c := range got {
+		want := "pass"
+		if c.Role == ComponentSupplement {
+			want = "mismatch"
+		}
+		if c.IdentityResult != want {
+			t.Fatalf("component %s identity = %q, want %q", c.Role, c.IdentityResult, want)
+		}
+	}
+}

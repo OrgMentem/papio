@@ -50,6 +50,11 @@ const (
 	// RetractionIDPrefix opens the item ID of every retraction notice; the rest
 	// of the ID is the normalized DOI of the work the notice concerns.
 	RetractionIDPrefix = KindRetraction + ":"
+
+	// HumanActionIDPrefix and WatchHitIDPrefix open the item IDs of human
+	// actions ("action:<id>") and watch hits ("hit:<id>:<work key>").
+	HumanActionIDPrefix = "action:"
+	WatchHitIDPrefix    = "hit:"
 )
 
 // PdfGrab carries the durable pre-identity grab state. It deliberately has no
@@ -475,6 +480,18 @@ func (s *Service) Decide(ctx context.Context, input DecisionInput, runner *watch
 		default:
 			return DecisionResult{Outcome: DecisionConflict}, nil
 		}
+	}
+
+	if strings.HasPrefix(input.ItemID, HumanActionIDPrefix) {
+		// An open human action is listed by the inbox but decided through the
+		// actions commands, which carry the revision guard this entry point has
+		// no way to receive. Reporting it as a conflict told the operator
+		// another client had already handled it.
+		number := strings.TrimPrefix(input.ItemID, HumanActionIDPrefix)
+		return DecisionResult{Outcome: DecisionInvalid, Detail: fmt.Sprintf("human actions are decided with 'papio actions dismiss|resolve %s --revision <rev>' (take the revision from the revision column of 'papio actions list')", number)}, nil
+	}
+	if !strings.HasPrefix(input.ItemID, WatchHitIDPrefix) {
+		return DecisionResult{Outcome: DecisionInvalid, Detail: fmt.Sprintf("no inbox item %s; run 'papio inbox' for current ids", input.ItemID)}, nil
 	}
 
 	hit, err := s.FindWatchHit(ctx, input.ItemID)
@@ -1536,7 +1553,7 @@ func watchHitItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 		}
 		first := hit.Watches[0]
 		item := Item{
-			Kind: KindWatchHit, ID: fmt.Sprintf("hit:%d:%s", first.ID, first.WorkKey),
+			Kind: KindWatchHit, ID: fmt.Sprintf("%s%d:%s", WatchHitIDPrefix, first.ID, first.WorkKey),
 			Title: hit.Work.Title, Facts: watchFacts(hit.Work), Links: canonicalLinks(hit.Work.DOI, hit.arXiv, hit.openAlex),
 			Ops: []string{"acquire", "dismiss"}, WatchHit: hit,
 		}
@@ -1725,7 +1742,7 @@ func humanActionItems(ctx context.Context, tx *sql.Tx) ([]Item, error) {
 			}
 		}
 		items = append(items, Item{
-			Kind: KindHumanAction, ID: fmt.Sprintf("action:%d", r.action.ActionID), Title: title,
+			Kind: KindHumanAction, ID: fmt.Sprintf("%s%d", HumanActionIDPrefix, r.action.ActionID), Title: title,
 			Facts: facts, Links: links, Ops: ops, HumanAction: &r.action,
 		})
 	}
@@ -1838,7 +1855,7 @@ func normalizeOps(ops []string) []string {
 func assignRanks(items []Item, base int) {
 	sort.Slice(items, func(i, j int) bool {
 		left, right := items[i].ID, items[j].ID
-		const prefix = "action:"
+		const prefix = HumanActionIDPrefix
 		if strings.HasPrefix(left, prefix) && strings.HasPrefix(right, prefix) {
 			li, le := strconv.ParseInt(strings.TrimPrefix(left, prefix), 10, 64)
 			ri, re := strconv.ParseInt(strings.TrimPrefix(right, prefix), 10, 64)

@@ -201,10 +201,14 @@ type searchResponse struct {
 	} `json:"results"`
 }
 
-// ShapeResult tallies one shape's outcome across the sample.
+// ShapeResult tallies one shape's outcome across the sample. Requests counts
+// attempts; Succeeded counts those that returned a usable answer; Credits
+// counts only requests the provider answered with 200 OK, so a request that
+// failed before it was sent is never reported as spent.
 type ShapeResult struct {
 	Shape             string
 	Requests          int
+	Succeeded         int
 	Credits           int
 	ExactTitleMatches int
 	Errors            int
@@ -215,6 +219,24 @@ type ShapeResult struct {
 type ComparisonReport struct {
 	Plan    ComparisonPlan
 	Results []ShapeResult
+}
+
+// ErrIncompleteComparison is returned by Run, alongside the partial report,
+// when any planned request failed or was never attempted (for example because
+// the context was canceled). Its measurements must not be read as a finished
+// comparison.
+var ErrIncompleteComparison = errors.New("openalexyield: paid comparison incomplete")
+
+// Incomplete reports whether any planned request failed or was not attempted.
+func (r ComparisonReport) Incomplete() bool {
+	requests := 0
+	for _, res := range r.Results {
+		if res.Errors > 0 {
+			return true
+		}
+		requests += res.Requests
+	}
+	return requests < r.Plan.TotalCalls
 }
 
 // exactNormalizedTitleMatch reports whether any result's own title matches
@@ -242,7 +264,9 @@ func normalizeYieldTitle(value string) string {
 
 // Run executes the opt-in, credit-spending three-shape comparison. It refuses
 // outright — no request, no credit spent — unless cfg.Confirm is true and
-// cfg.Sample is within bounds.
+// cfg.Sample is within bounds. If any request fails, or ctx ends before every
+// planned request was attempted, it returns the partial report together with
+// ErrIncompleteComparison.
 func Run(ctx context.Context, cfg ComparisonConfig, titles []TitleSample) (ComparisonReport, error) {
 	if !cfg.Confirm {
 		return ComparisonReport{}, ErrConfirmationRequired
@@ -270,29 +294,57 @@ func Run(ctx context.Context, cfg ComparisonConfig, titles []TitleSample) (Compa
 
 	plan := Plan(len(titles))
 	report := ComparisonReport{Plan: plan}
+calls:
 	for _, s := range AllShapes {
 		result := ShapeResult{Shape: s.label}
 		for _, t := range titles {
-			resp, err := runOneCall(ctx, cfg, base, s, t.Title)
+			if ctx.Err() != nil {
+				report.Results = append(report.Results, result)
+				break calls
+			}
+			resp, answered, err := runOneCall(ctx, cfg, base, s, t.Title)
 			result.Requests++
-			result.Credits += CreditsPerTitleSearch
+			if answered {
+				result.Credits += CreditsPerTitleSearch
+			}
 			if err != nil {
 				result.Errors++
 				continue
 			}
+			result.Succeeded++
 			if exactNormalizedTitleMatch(resp, t.Title) {
 				result.ExactTitleMatches++
 			}
 		}
 		report.Results = append(report.Results, result)
 	}
+	if report.Incomplete() {
+		err := fmt.Errorf("%w: %s", ErrIncompleteComparison, report.incompleteDetail())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = fmt.Errorf("%w (%w)", err, ctxErr)
+		}
+		return report, err
+	}
 	return report, nil
 }
 
-func runOneCall(ctx context.Context, cfg ComparisonConfig, base string, s shape, title string) (searchResponse, error) {
+func (r ComparisonReport) incompleteDetail() string {
+	requests, succeeded := 0, 0
+	for _, res := range r.Results {
+		requests += res.Requests
+		succeeded += res.Succeeded
+	}
+	return fmt.Sprintf("%d of %d planned requests succeeded (%d failed, %d not attempted)",
+		succeeded, r.Plan.TotalCalls, requests-succeeded, r.Plan.TotalCalls-requests)
+}
+
+// runOneCall issues one request. answered is true only when the provider
+// replied 200 OK, the one outcome that is billed; it stays true when the body
+// then fails to decode, because the credits were still spent.
+func runOneCall(ctx context.Context, cfg ComparisonConfig, base string, s shape, title string) (out searchResponse, answered bool, err error) {
 	u, err := url.Parse(base)
 	if err != nil {
-		return searchResponse{}, fmt.Errorf("invalid base URL %q: %w", base, err)
+		return searchResponse{}, false, fmt.Errorf("invalid base URL %q: %w", base, err)
 	}
 	query := s.query(title)
 	query.Set("mailto", cfg.ContactEmail)
@@ -303,37 +355,40 @@ func runOneCall(ctx context.Context, cfg ComparisonConfig, base string, s shape,
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return searchResponse{}, err
+		return searchResponse{}, false, err
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := cfg.Client.Do(req)
 	if err != nil {
-		return searchResponse{}, err
+		return searchResponse{}, false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return searchResponse{}, fmt.Errorf("openalex: unexpected status %d", resp.StatusCode)
+		return searchResponse{}, false, fmt.Errorf("openalex: unexpected status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return searchResponse{}, err
+		return searchResponse{}, true, err
 	}
-	var out searchResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return searchResponse{}, fmt.Errorf("openalex: invalid response: %w", err)
+		return searchResponse{}, true, fmt.Errorf("openalex: invalid response: %w", err)
 	}
-	return out, nil
+	return out, true, nil
 }
 
-// Render renders the executed comparison as aligned plain text.
+// Render renders the comparison as aligned plain text. An incomplete
+// comparison says so first, so partial numbers cannot pass for a finished run.
 func (r ComparisonReport) Render() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "openalex-yield paid comparison — %d titles sampled, %d total credits spent\n\n",
+	if r.Incomplete() {
+		fmt.Fprintf(&b, "INCOMPLETE: %s; the figures below are partial\n", r.incompleteDetail())
+	}
+	fmt.Fprintf(&b, "openalex-yield paid comparison — %d titles sampled, %d credits charged (200 OK responses only)\n\n",
 		r.Plan.SampleSize, r.totalCreditsSpent())
-	fmt.Fprintf(&b, "shape\trequests\tcredits\texact-title matches\terrors\n")
+	fmt.Fprintf(&b, "shape\trequests\tsucceeded\tcredits\texact-title matches\terrors\n")
 	for _, res := range r.Results {
-		fmt.Fprintf(&b, "%s\t%d\t%d\t%d\t%d\n", res.Shape, res.Requests, res.Credits, res.ExactTitleMatches, res.Errors)
+		fmt.Fprintf(&b, "%s\t%d\t%d\t%d\t%d\t%d\n", res.Shape, res.Requests, res.Succeeded, res.Credits, res.ExactTitleMatches, res.Errors)
 	}
 	return b.String()
 }

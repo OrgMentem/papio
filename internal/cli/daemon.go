@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -151,7 +153,17 @@ func newDaemonCommand(opt *options) *cobra.Command {
 					_, _ = fmt.Fprintf(opt.errOut, "papio: waiting for the daemon (pid %d) to finish stopping\n", pid)
 				}
 			}); err != nil {
-				return err
+				down, unreachable := daemonDownState(opt, socket, err)
+				switch {
+				case !unreachable:
+					return err
+				case down.held:
+					return fmt.Errorf("%w; run 'papio daemon stop' again when it finishes", down)
+				}
+				// Nothing to stop. A deploy script that stops the daemon before
+				// it replaces the binary must not fail on a machine where the
+				// daemon is already down.
+				return opt.printResult(map[string]bool{"stopping": false}, "Daemon not running")
 			}
 			return opt.printResult(result, "Daemon stopped")
 		},
@@ -163,6 +175,9 @@ func newDaemonCommand(opt *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var result daemonPingResult
 			if err := callExisting(cmd.Context(), "ping", &result); err != nil {
+				if down, unreachable := daemonDownState(opt, socket, err); unreachable {
+					return down
+				}
 				return err
 			}
 			return opt.printResult(result, "Daemon %s (%s)", result.Status, result.Version)
@@ -170,6 +185,56 @@ func newDaemonCommand(opt *options) *cobra.Command {
 	}
 	command.AddCommand(stop, status)
 	return command
+}
+
+// daemonDown says why a daemon control command could not reach the daemon's
+// socket: no daemon runs, or one holds the data directory and has not opened
+// its socket yet, for example while it migrates the database.
+type daemonDown struct {
+	socket string
+	status daemon.Status
+	held   bool
+}
+
+func (d daemonDown) Error() string {
+	if !d.held {
+		return fmt.Sprintf("daemon is not running (nothing is listening on %s)", d.socket)
+	}
+	who := ""
+	if d.status.PID > 0 {
+		who = fmt.Sprintf(" (pid %d)", d.status.PID)
+	}
+	return fmt.Sprintf("daemon is %s%s; it is not accepting commands yet", d.status.Activity(), who)
+}
+
+// daemonDownState classifies err from a call to the daemon's socket. It
+// reports false for any failure but a failed dial, which still says the daemon
+// answered or that the caller gave up. socketFlag is the --socket override, or
+// empty for the configured data directory's socket.
+func daemonDownState(opt *options, socketFlag string, err error) (daemonDown, bool) {
+	var op *net.OpError
+	if !errors.As(err, &op) || op.Op != "dial" || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return daemonDown{}, false
+	}
+	// Only a missing socket or a refused connection says no daemon listens.
+	// EACCES and the like mean a daemon may run that this process cannot reach.
+	if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
+		return daemonDown{}, false
+	}
+	cfg, loadErr := opt.loadConfig()
+	if loadErr != nil {
+		return daemonDown{}, false
+	}
+	down := daemonDown{socket: socketFlag}
+	if down.socket == "" {
+		down.socket = filepath.Join(cfg.DataDir, "papio.sock")
+	}
+	down.status, down.held = daemon.ReadInstance(cfg.DataDir)
+	// An instance that serves another socket says nothing about this one.
+	if down.held && down.status.Socket != "" && down.status.Socket != down.socket {
+		down.held = false
+	}
+	return down, true
 }
 
 // daemonInstanceHeld explains a daemon process that exits because another

@@ -392,16 +392,24 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		return nil, fmt.Errorf("cached Zotio plan %s references an unresolved manifest; replan required", plan.ID)
 	}
 	idempotencyKey := "zotio_apply:" + plan.ID + ":" + confirmation
-	if existing, err := s.recordedApply(ledgerCtx, idempotencyKey); err != nil {
+	if err := s.expireStaleClaim(ledgerCtx, idempotencyKey, plan); err != nil {
 		return nil, err
-	} else if existing != nil {
-		if existing.Status == "ambiguous" {
-			return nil, s.ambiguousReplayError(existing, plan.ID)
+	}
+	existing, err := s.recordedApply(ledgerCtx, idempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil && existing.Status == "ambiguous" {
+		// Settled to a result, or nil once the row is reopened for a fresh run.
+		if existing, err = s.settleAmbiguousApply(ctx, plan, idempotencyKey, existing); err != nil {
+			return nil, err
 		}
+	}
+	if existing != nil {
 		if err := s.completeFollowUps(ctx, plan, existing); err != nil {
 			log.Printf("papio: completing Zotio follow-ups of job %s: %v", plan.JobID, err)
 		}
-		if err := s.markImported(ctx, existing); err != nil {
+		if err := s.markImported(ledgerCtx, existing); err != nil {
 			return nil, err
 		}
 		return existing, nil
@@ -432,12 +440,12 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		}
 		if result != nil {
 			if result.Status == "ambiguous" {
-				return nil, s.ambiguousReplayError(result, plan.ID)
+				return nil, unconfirmedApplyError(plan.ID, result, "")
 			}
 			if err := s.completeFollowUps(ctx, plan, result); err != nil {
 				log.Printf("papio: completing Zotio follow-ups of job %s: %v", plan.JobID, err)
 			}
-			if err := s.markImported(ctx, result); err != nil {
+			if err := s.markImported(ledgerCtx, result); err != nil {
 				return nil, err
 			}
 			return result, nil
@@ -461,6 +469,13 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		if evidence := committedCreateEvidence(out); plan.Route == "manifest_create" && evidence != nil {
 			return nil, s.recordCommittedCreate(ctx, idempotencyKey, plan, out, evidence, applyErr)
 		}
+		if len(out) == 0 && !isDefiniteFailure(commandErr) {
+			// No result came back and zotio did not stop of its own accord (a
+			// signal, an output cap, unreadable output): Zotero may already
+			// hold the mutation. Dropping the plan would let the next pass
+			// create the item again.
+			return nil, s.recordAmbiguousApply(ctx, idempotencyKey, plan, out, applyErr)
+		}
 		failure := s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 		if plan.CollectionKey != "" && desktopTargetMissing(out) {
 			// zotio refused before saving anything, and the plan is gone, so
@@ -480,6 +495,11 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		}
 		if evidence := committedCreateEvidence(out); plan.Route == "manifest_create" && evidence != nil {
 			return nil, s.recordCommittedCreate(ctx, idempotencyKey, plan, out, evidence, applyErr)
+		}
+		if _, known := mutationFailure(out); !known {
+			// Not an apply envelope at all, so it says nothing about what
+			// the mutation did.
+			return nil, s.recordAmbiguousApply(ctx, idempotencyKey, plan, out, applyErr)
 		}
 		return nil, s.recordFailedApplyAndInvalidatePlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
@@ -519,10 +539,12 @@ func (s *Service) Apply(ctx context.Context, planID, confirmation string) (*Appl
 		applyErr := errors.New("Zotio apply succeeded without returning an attachment key")
 		return nil, s.recordFailedApplyKeepingPlan(ctx, idempotencyKey, plan, out, applyErr)
 	}
-	if err := s.recordApply(ctx, idempotencyKey, result); err != nil {
+	// The write to Zotero has happened; neither the record nor the job's
+	// transition may be lost to a cancelled caller.
+	if err := s.recordApply(ledgerCtx, idempotencyKey, result); err != nil {
 		return nil, err
 	}
-	if err := s.markImported(ctx, result); err != nil {
+	if err := s.markImported(ledgerCtx, result); err != nil {
 		return nil, err
 	}
 	// The import is durable; a follow-up recording failure stays unmarked
@@ -664,6 +686,10 @@ func (s *Service) PlanAndApply(ctx context.Context, jobID string) (status, paren
 		// Zotero desktop could not see the policy collection, so zotio saved
 		// nothing. Apply has dropped that plan and recorded the filing as
 		// deferred, so this plan leaves the collection to the follow-up.
+		plan, result, err = s.planAndApplyOnce(ctx, jobID)
+	} else if errors.Is(err, errReplanRequired) {
+		// Reconciliation found the item an interrupted create saved and
+		// dropped that create plan; this plan attaches to the item.
 		plan, result, err = s.planAndApplyOnce(ctx, jobID)
 	}
 	if plan == nil {
@@ -1145,32 +1171,7 @@ func (s *Service) recordAmbiguousApply(ctx context.Context, key string, plan *Pl
 	// completes and the verification either records success or reopens retry.
 	return WithErrorInfo(applyErr, zotio)
 }
-func (s *Service) ambiguousReplayError(result *ApplyResult, planID string) error {
-	// The durable ambiguous record holds only the redacted hint (e.g.
-	// "Zotio command canceled" / "Zotio command timed out"). Rebuild an error
-	// that preserves the original context sentinel so callers remain able to
-	// detect ambiguous/cancellable failures with errors.Is(..., context.Canceled)
-	// or errors.Is(..., context.DeadlineExceeded) across the replay path.
-	// Declared without a value: every arm below assigns one, and seeding it with
-	// context.Canceled hid that from the reader and from the linter.
-	var sentinel error
-	switch {
-	case strings.Contains(result.Error, "timed out"):
-		sentinel = context.DeadlineExceeded
-	case strings.Contains(result.Error, "canceled") || result.Error == "":
-		sentinel = context.Canceled
-	default:
-		// Fall back to a generic ambiguous sentinel that ClassifyError will
-		// map back onto the same class the first write recorded, even for
-		// cancellation flavours that the hint text does not fully capture.
-		sentinel = context.Canceled
-	}
-	base := fmt.Errorf("applying Zotio mutation: %s", result.Error)
-	if strings.TrimSpace(result.Error) == "" {
-		base = fmt.Errorf("Zotio apply is ambiguous: reconciliation required before retry for plan %s", planID)
-	}
-	return WithErrorInfo(fmt.Errorf("%w: %w", sentinel, base), result.Zotio)
-}
+
 func (s *Service) invalidatePlan(ctx context.Context, plan *Plan) error {
 	planPath := filepath.Join(s.DataDir, "zotio", "plans", plan.ID+".json")
 	manifestPath := plan.ManifestPath
@@ -1222,10 +1223,10 @@ func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, 
 		return nil, fmt.Errorf("decoding recorded Zotio apply: %w", err)
 	}
 	if result.Status == "ambiguous" {
-		// An ambiguous apply (timeout/cancellation) may have mutated Zotero.
-		// Surface it as a finished outcome so Apply replays the error rather
-		// than silently reissuing the mutation. It remains non-reclaimable by
-		// claimApply until explicitly reconciled or expired.
+		// An ambiguous apply (timeout, cancellation, unreadable result, or an
+		// expired claim) may have mutated Zotero. Surface it as an outcome so
+		// Apply reconciles it (reconcile.go) rather than reissuing the
+		// mutation; claimApply never reclaims it.
 		return &result, nil
 	}
 	if result.Status == "in_progress" || result.Status == "failed" {
@@ -1238,7 +1239,10 @@ func (s *Service) recordedApply(ctx context.Context, key string) (*ApplyResult, 
 
 func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, error) {
 	now := s.now().UTC()
-	leaseExpiry := now.Add(-applyClaimLease).Unix()
+	// Only a recorded failure or a legacy reservation without a status is
+	// reclaimable. An in-progress claim is never reclaimed, however old: its
+	// owner may have mutated Zotero before it died, so expireStaleClaim turns
+	// an expired one into an ambiguous apply that reconciliation settles.
 	result, err := s.Store.DB().ExecContext(ctx, `
 		INSERT INTO exports (job_id, kind, idempotency_key, result_json, created_at)
 		SELECT ?, 'zotio_apply', ?, json_object('status', 'in_progress', 'claimed_at', ?), ?
@@ -1252,12 +1256,8 @@ func (s *Service) claimApply(ctx context.Context, key, jobID string) (bool, erro
 		WHERE exports.kind = 'zotio_apply' AND (
 			exports.result_json IS NULL
 			OR json_extract(exports.result_json, '$.status') = 'failed'
-			OR (
-				json_extract(exports.result_json, '$.status') = 'in_progress'
-				AND CAST(json_extract(exports.result_json, '$.claimed_at') AS INTEGER) <= ?
-			)
 		)`,
-		jobID, key, now.Unix(), store.Now(), jobID, leaseExpiry)
+		jobID, key, now.Unix(), store.Now(), jobID)
 	if err != nil {
 		return false, err
 	}

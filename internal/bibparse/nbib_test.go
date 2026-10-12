@@ -96,6 +96,29 @@ func TestParseNBIB(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "records without a blank separator split at each PMID",
+			data: "PMID- 1\nTI  - Paper A\nFAU - Alpha, A\nLID - 10.1000/a [doi]\nPMID- 2\nTI  - Paper B\nFAU - Beta, B\nLID - 10.1000/b [doi]\n",
+			want: []Record{
+				{PMID: "1", DOI: "10.1000/a", Title: "Paper A", Authors: []string{"Alpha, A"}},
+				{PMID: "2", DOI: "10.1000/b", Title: "Paper B", Authors: []string{"Beta, B"}},
+			},
+		},
+		{
+			name: "LID wrapped before the tag",
+			data: "PMID- 5\nLID - 10.1000/x\n      [doi]\nTI  - Wrapped LID\n",
+			want: []Record{{PMID: "5", DOI: "10.1000/x", Title: "Wrapped LID"}},
+		},
+		{
+			name: "FAU and AU continuations extend the last author",
+			data: "PMID- 6\nFAU - Doe, Jane\nFAU - Smith, John\n      Quincy\nAU  - Doe J\n",
+			want: []Record{{PMID: "6", Authors: []string{"Doe, Jane", "Smith, John Quincy"}}},
+		},
+		{
+			name: "AU continuation without FAU",
+			data: "PMID- 7\nAU  - Public, Jane\nAU  - Reader, John\n      Quincy\n",
+			want: []Record{{PMID: "7", Authors: []string{"Public, Jane", "Reader, John Quincy"}}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -117,5 +140,26 @@ func TestParseNBIBEmptyInput(t *testing.T) {
 		if err == nil || err.Error() != "nbib: no records found" {
 			t.Errorf("parseNBIB(%q) error = %v, want nbib: no records found", data, err)
 		}
+	}
+}
+
+func TestParseNBIBRejectsMalformedInput(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{"leading continuation", "      orphan\nPMID- 1\nTI  - ok\n", "continuation without a field"},
+		{"continuation after record boundary", "PMID- 1\n\n      orphan\nTI  - ok\n", "continuation without a field"},
+		{"line without a tag", "PMID- 1\nnot a tag line\n", "malformed line"},
+		{"tag longer than four characters", "PMID- 1\nTOOLONG- x\n", "malformed line"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseNBIB([]byte(tt.data))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("parseNBIB(%q) error = %v, want substring %q", tt.data, err, tt.want)
+			}
+		})
 	}
 }

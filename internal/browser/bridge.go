@@ -210,8 +210,9 @@ const (
 	// grabReasonExtensionOutdated: the session lacks pdf_grab_v1 or the
 	// effect-permit capability, or is below MinExtensionVersion.
 	grabReasonExtensionOutdated = "extension_outdated"
-	// grabReasonDaemonUnsupported: this daemon does not advertise pdf_grab_v1.
-	grabReasonDaemonUnsupported = "daemon_unsupported"
+	// There is no daemon-side "daemon_unsupported": NewBridge always
+	// advertises pdf_grab_v1. The wire enum keeps that reason for the
+	// extension, which raises it locally when an older daemon omits the feature.
 	// grabReasonBusy: the single effect lane is occupied by another effect.
 	grabReasonBusy = "busy"
 	// grabReasonNotConfigured: grab storage is not configured.
@@ -5539,20 +5540,10 @@ func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.Human
 		return b.humanActionResolveResult(request.RequestID, "error", "jobs are not configured")
 	}
 	if request.Verdict == "dismiss" {
-		var dismissedKind string
-		actions, listErr := b.jobs.ListHumanActions(ctx, true)
-		if listErr != nil {
-			return b.humanActionResolveResult(request.RequestID, "error", listErr.Error())
-		}
-		for _, action := range actions {
-			if action.ID == request.ActionID {
-				dismissedKind = action.Kind
-				break
-			}
-		}
-		if dismissedKind == "" {
-			return b.humanActionResolveResult(request.RequestID, "error", "human action not found")
-		}
+		// No pre-listing of open actions: an action that another dismissal or
+		// resolution already closed must reach dismissAction's compare-and-swap,
+		// which reports it as job.ErrConflict and so as a "conflict" outcome
+		// the inbox answers by refreshing, not as an "error".
 		_, err := b.dismissAction(ctx, request.ActionID, request.ExpectedRevision)
 		if err != nil {
 			if errors.Is(err, job.ErrConflict) {
@@ -6517,9 +6508,6 @@ func (b *Bridge) pdfGrab(ctx context.Context, sessionID string, request *protoco
 	}
 	if b.grabs == nil {
 		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonNotConfigured, "papio is not set up to save PDFs")
-	}
-	if !slices.Contains(b.Features, pdfGrabV1Feature) {
-		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonDaemonUnsupported, "this papio cannot save PDFs")
 	}
 	if b.adoptionLatchUnhealthy() {
 		return b.pdfGrabRefusal(request.RequestID, "", "unavailable", grabReasonAdoptionUnhealthy,
@@ -10713,21 +10701,19 @@ func (b *Bridge) ConfirmGrabCandidate(ctx context.Context, grabID, jobID string)
 		}
 		return operatorConfirmProvenance(doc, freshCandidates, winnerIdx), nil
 	}
-	// A parked grab is in parked_no_identifier, which MarkBoundToJobFenced's
-	// CAS does not accept — it binds from awaiting_file, quarantined or
-	// identified, the states an unparked settlement passes through. Identifying
-	// the grab first is exactly what IdentifyGrab does for the same reason, and
-	// the ordering is the same: this transition says "a human has answered the
-	// identity question", which is true the moment the pick clears the veto,
-	// and the fenced bind below is what makes the answer durable.
-	if err := b.grabs.MarkIdentified(ctx, grabID); err != nil {
-		result.Outcome, result.Detail = "conflict", "pdf grab changed before the pick was applied"
-		return result
-	}
+	// A parked grab is in parked_no_identifier, which MarkBoundToJobFenced
+	// binds from directly, in the same transaction as the fence. There is
+	// deliberately no separate parked_no_identifier -> identified step first:
+	// a fence rejection would roll back the bind but leave that earlier
+	// commit behind, stranding the grab in a state no verb accepts.
 	defer b.beginGrabStaging(grabID)()
 	if err := b.grabs.MarkBoundToJobFenced(ctx, grabID, jobID, "job_created", decide); err != nil {
 		if errors.Is(err, grab.ErrFenceRejected) {
 			result.Outcome, result.Detail = "conflict", "job left the candidate pool before the bind committed"
+			return result
+		}
+		if errors.Is(err, grab.ErrStateChanged) {
+			result.Outcome, result.Detail = "conflict", "pdf grab changed before the pick was applied"
 			return result
 		}
 		result.Outcome, result.Detail = "failed", "pdf grab could not be finalized"
@@ -11330,7 +11316,7 @@ jobLoop:
 				if eventErr != nil {
 					log.Printf("papio: reading direct-route history for %s: %v", id, eventErr)
 				} else {
-					ordinal, inFlight, pendingAttempt := directRouteProgress(events, candidates, b.now())
+					ordinal, inFlight, pendingAttempt := directRouteProgress(events, candidates)
 					if inFlight || directRouteSucceeded(events) {
 						continue
 					}
@@ -12467,13 +12453,13 @@ func (b *Bridge) leaseHolderCanConvert(ctx context.Context, ownerJobID string) b
 	return candidate != nil
 }
 func (b *Bridge) providerDirectGetAvailable() bool {
-	if b == nil || b.arbitration.holderSession() == nil || !slices.Contains(b.Features, providerDirectGetV1Feature) {
+	if b == nil || b.arbitration.holderSession() == nil {
 		return false
 	}
 	return compareVersion(b.arbitration.holderSession().ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
 }
 func (b *Bridge) effectPermitAvailable() bool {
-	if b == nil || b.arbitration.holderSession() == nil || !slices.Contains(b.Features, effectPermitFeature) {
+	if b == nil || b.arbitration.holderSession() == nil {
 		return false
 	}
 	return slices.Contains(b.arbitration.holderSession().Features, effectPermitFeature)
@@ -12497,7 +12483,7 @@ func (b *Bridge) effectPermitWorkerLive(permit *job.EffectPermit) bool {
 }
 
 func (b *Bridge) providerDriveEpochAvailable() bool {
-	if b == nil || b.arbitration.holderSession() == nil || !slices.Contains(b.Features, providerDriveEpochV1Feature) || !b.effectPermitAvailable() {
+	if b == nil || b.arbitration.holderSession() == nil || !b.effectPermitAvailable() {
 		return false
 	}
 	return compareVersion(b.arbitration.holderSession().ExtensionVersion, ProviderDirectGetMinExtensionVersion) >= 0
@@ -12657,11 +12643,7 @@ func directRouteAttemptKey(jobID string, ordinal int, revision string) string {
 	return jobID + "\x00" + strconv.Itoa(ordinal) + "\x00" + revision
 }
 
-// directRouteOfferLease is retained for compatibility with projection tests.
-// It is not an authorization lease and never permits a repeat.
-const directRouteOfferLease = 10 * time.Minute
-
-func directRouteProgress(events []map[string]any, candidates []routes.Candidate, _ time.Time) (next int, inFlight bool, pendingAttempt string) {
+func directRouteProgress(events []map[string]any, candidates []routes.Candidate) (next int, inFlight bool, pendingAttempt string) {
 	attempt := ""
 	revision := ""
 	ordinal := -1
@@ -12706,8 +12688,8 @@ func directRouteProgress(events []map[string]any, candidates []routes.Candidate,
 		}
 	}
 	if inFlight && !answered {
-		// An elapsed offer lease is diagnostic only. It never authorizes a
-		// repeat; the exact permit remains the at-most-once authority.
+		// Elapsed time never authorizes a repeat; the exact permit remains
+		// the at-most-once authority.
 		return next, true, attempt
 	}
 	return next, inFlight, ""
@@ -12936,16 +12918,6 @@ func providerDriveEpochSuppressed(events []map[string]any, domain string) bool {
 		}
 	}
 	return current != "" && (started || result || successor)
-}
-
-// providerDriveEpochLease is retained only as a diagnostic age threshold.
-// Lease expiry never changes permit status or authorizes a successor.
-const providerDriveEpochLease = 10 * time.Minute
-
-// driveEpochStalled is retained as a compatibility query for older callers.
-// It is deliberately inert: elapsed time never releases a permit or mints a successor.
-func (b *Bridge) driveEpochStalled(jobID, attempt string, ordinal int64) bool {
-	return false
 }
 
 // latestProviderDriveEpoch derives the generic tuple from durable events.
@@ -13193,7 +13165,7 @@ func (b *Bridge) providerDirectGetResultForSession(ctx context.Context, jobID st
 				attempt, attemptErr := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 				if attemptErr == nil && currentHolder && permit.JobAttemptRevision == attempt &&
 					permit.BrowserHolderGeneration == int64(b.arbitration.generation()) {
-					ordinal, inFlight, _ := directRouteProgress(events, candidates, b.now())
+					ordinal, inFlight, _ := directRouteProgress(events, candidates)
 					current = inFlight && int64(ordinal) == p.Ordinal &&
 						candidate.RouteRevision == p.RouteRevision
 					if current {

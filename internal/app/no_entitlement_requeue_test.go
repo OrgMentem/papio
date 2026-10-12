@@ -121,3 +121,47 @@ func TestExhaustedCandidatesSkipsProvenEmptyInstitutionalRoute(t *testing.T) {
 		}
 	})
 }
+
+// An exhaustion handoff opens its prompt and parks the job in one store
+// transaction: a refused park must leave no open action on the resolving job.
+func TestExhaustedCandidatesHandoffLeavesNoActionWhenParkFails(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		oaURL string
+	}{
+		{"open access browser handoff", "https://oa.example.org/alternate.pdf"},
+		{"institutional handoff", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, jobs := newTestService(t)
+			svc.Config.AccessMode = config.ModeDelegated
+			svc.Config.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+			row := resolvingExhaustionJob(t, svc, jobs, "request_atomic_exhaustion")
+			if _, err := jobs.S.DB().ExecContext(ctx, `
+				CREATE TRIGGER reject_exhaustion_park
+				BEFORE UPDATE OF state ON jobs
+				WHEN NEW.state = 'awaiting_human'
+				BEGIN SELECT RAISE(ABORT, 'injected park failure'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.exhaustedCandidates(ctx, row, job.StateResolving, "no_legal_candidates", "no legal candidates", tc.oaURL); err == nil {
+				t.Fatal("exhaustedCandidates succeeded despite the injected park failure")
+			}
+			persisted, err := jobs.Get(ctx, row.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.State != job.StateResolving {
+				t.Fatalf("state = %s, want resolving", persisted.State)
+			}
+			open, err := jobs.ListOpenHumanActionsForJobs(ctx, []string{row.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(open) != 0 {
+				t.Fatalf("failed park left a stale prompt: %+v", open)
+			}
+		})
+	}
+}

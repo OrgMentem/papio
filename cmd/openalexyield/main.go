@@ -128,9 +128,11 @@ func runPaid(ctx context.Context, storePath string, sample int, confirm bool, em
 	report, err := openalexyield.Run(ctx, openalexyield.ComparisonConfig{
 		Confirm: confirm, Sample: sample, Client: client, ContactEmail: email, APIKey: apiKey,
 	}, titles)
-	if err != nil {
+	// An incomplete run still carries real, charged measurements: print them,
+	// marked incomplete by Render, then fail so the exit status is nonzero.
+	if err != nil && !errors.Is(err, openalexyield.ErrIncompleteComparison) {
 		return err
 	}
 	fmt.Println(report.Render())
-	return nil
+	return err
 }

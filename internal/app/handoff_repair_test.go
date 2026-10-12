@@ -11,6 +11,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/job"
+	"papio/internal/store"
 )
 
 // leaseAwaitingHuman keeps the package-local test seam while the job store
@@ -472,6 +473,39 @@ func TestHandoffRepairerLeavesLateAdoptionLeaseUntouched(t *testing.T) {
 	t.Fatalf("late adoption lease let repair close action %d: %+v", actionID, open)
 }
 
+// seedNewerMaintenancePage fills one full ListOldest page (job.ListLimitMax
+// jobs) with awaiting_human jobs that each hold an open institutional handoff
+// action and are all newer than now, so a consumer that only reads the first
+// page never reaches an older park. The filler jobs are moved to awaiting_human
+// directly: only their state, age and open action matter to a page-reach test,
+// and the per-job transitions dominated its -race time. A non-zero
+// actionCreatedAt also stamps each filler action's age.
+func seedNewerMaintenancePage(t *testing.T, svc *Service, jobs *job.Store, prefix string, now, actionCreatedAt time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	for i := range job.ListLimitMax {
+		id, err := svc.Submit(ctx, doiRequestFor(fmt.Sprintf("%s_%03d", prefix, i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET state = ?, created_at = ? WHERE id = ?`,
+			job.StateAwaitingHuman, store.FormatTime(now.Add(time.Duration(i+1)*time.Second)), id); err != nil {
+			t.Fatal(err)
+		}
+		actionID, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
+			job.Access(true, "paywall"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !actionCreatedAt.IsZero() {
+			if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE human_actions SET created_at = ? WHERE id = ?`,
+				store.FormatTime(actionCreatedAt), actionID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
 func TestHandoffRepairerReachesOldestParkBeyondMaintenancePage(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
@@ -482,17 +516,7 @@ func TestHandoffRepairerReachesOldestParkBeyondMaintenancePage(t *testing.T) {
 		now.Add(-48*time.Hour).Format(time.RFC3339Nano), oldest.ID); err != nil {
 		t.Fatal(err)
 	}
-	for i := range job.ListLimitMax {
-		row := parkedHandoffJob(t, svc, jobs, fmt.Sprintf("request_newer_handoff_%03d", i))
-		if _, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-			job.Access(true, "paywall")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
-			now.Add(time.Duration(i+1)*time.Second).Format(time.RFC3339Nano), row.ID); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedNewerMaintenancePage(t, svc, jobs, "request_newer_handoff", now, time.Time{})
 
 	if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
 		t.Fatal(err)

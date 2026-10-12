@@ -14,6 +14,182 @@ func TestRouteTableValidates(t *testing.T) {
 	}
 }
 
+// Validate is the release guard for the compiled-in table: an edited seed row
+// must fail it, and the failure must name the row so the author can find it.
+// Each case starts from a good row and breaks exactly one thing. The table is
+// package state, so these cases run serially and restore it.
+func TestValidateRejectsMalformedSeedRows(t *testing.T) {
+	good := func(identifier string) routeTemplate {
+		for _, route := range routeTable {
+			if route.identifier == identifier && route.query != "pii={pii}" {
+				return route
+			}
+		}
+		t.Fatalf("no shipped %s route", identifier)
+		return routeTemplate{}
+	}
+	goodDOI, goodPII := good(identifierDOI), good(identifierPII)
+	var goodQueryPII routeTemplate
+	for _, route := range routeTable {
+		if route.query == "pii={pii}" {
+			goodQueryPII = route
+		}
+	}
+	if goodQueryPII.routeRevision == "" {
+		t.Fatal("no shipped route with a pii query slot")
+	}
+
+	tests := []struct {
+		name   string
+		rows   func() []routeTemplate
+		wantIn string
+	}{
+		{"revision without a slash", func() []routeTemplate {
+			r := goodDOI
+			r.routeRevision = "wiley-doi-pdfdirect"
+			return []routeTemplate{r}
+		}, "wiley-doi-pdfdirect"},
+		{"duplicate revision", func() []routeTemplate { return []routeTemplate{goodDOI, goodDOI} }, goodDOI.routeRevision},
+		{"revision names another provider", func() []routeTemplate {
+			r := goodDOI
+			r.provider = "other-provider"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"revision with extra segments", func() []routeTemplate {
+			r := goodDOI
+			r.routeRevision = r.provider + "/1/2"
+			return []routeTemplate{r}
+		}, goodDOI.provider + "/1/2"},
+		{"revision number not numeric", func() []routeTemplate {
+			r := goodDOI
+			r.routeRevision = r.provider + "/x"
+			return []routeTemplate{r}
+		}, goodDOI.provider + "/x"},
+		{"revision number zero", func() []routeTemplate {
+			r := goodDOI
+			r.routeRevision = r.provider + "/0"
+			return []routeTemplate{r}
+		}, goodDOI.provider + "/0"},
+		{"missing origin", func() []routeTemplate {
+			r := goodDOI
+			r.origin = ""
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"missing identifier kind", func() []routeTemplate {
+			r := goodDOI
+			r.identifier = ""
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"missing path family", func() []routeTemplate {
+			r := goodDOI
+			r.pathFamily = ""
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"http origin", func() []routeTemplate {
+			r := goodDOI
+			r.origin = "http://onlinelibrary.wiley.com"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"origin with a path", func() []routeTemplate {
+			r := goodDOI
+			r.origin += "/doi"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"origin with credentials", func() []routeTemplate {
+			r := goodDOI
+			r.origin = "https://user@onlinelibrary.wiley.com"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"origin without a host", func() []routeTemplate {
+			r := goodDOI
+			r.origin = "https://"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"two identifier slots", func() []routeTemplate {
+			r := goodDOI
+			r.pathFamily += "/{doi}"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"no identifier slot", func() []routeTemplate {
+			r := goodDOI
+			r.pathFamily = r.pathPrefix
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"stray brace beside the slot", func() []routeTemplate {
+			r := goodDOI
+			r.pathFamily += "{x}"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"unsupported query on a path slot", func() []routeTemplate {
+			r := goodDOI
+			r.query = "download=false"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"query slot on a DOI route", func() []routeTemplate {
+			r := goodDOI
+			r.pathFamily, r.pathPrefix, r.pathSuffix = "/doi/pdf", "/doi/pdf", ""
+			r.query = "doi={doi}"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"unsupported query slot spelling", func() []routeTemplate {
+			r := goodQueryPII
+			r.query = "id={pii}"
+			return []routeTemplate{r}
+		}, goodQueryPII.routeRevision},
+		{"query-slot path family differs from its compiler", func() []routeTemplate {
+			r := goodQueryPII
+			r.pathFamily = "/action/other"
+			return []routeTemplate{r}
+		}, goodQueryPII.routeRevision},
+		{"path family differs from prefix, slot, and suffix", func() []routeTemplate {
+			r := goodPII
+			r.pathSuffix = "/other"
+			return []routeTemplate{r}
+		}, goodPII.routeRevision},
+		{"path prefix without a leading slash", func() []routeTemplate {
+			r := goodDOI
+			r.pathPrefix = "doi/pdfdirect/"
+			r.pathFamily = "doi/pdfdirect/{doi}"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"path suffix with a query mark", func() []routeTemplate {
+			r := goodDOI
+			r.pathSuffix = "?x"
+			r.pathFamily = r.pathPrefix + "{doi}?x"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+		{"identifier kind with no expansion", func() []routeTemplate {
+			r := goodDOI
+			r.identifier = "isbn"
+			r.pathFamily = r.pathPrefix + "{isbn}"
+			return []routeTemplate{r}
+		}, goodDOI.routeRevision},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			saved := routeTable
+			t.Cleanup(func() { routeTable = saved })
+			routeTable = tc.rows()
+			err := Validate()
+			if err == nil {
+				t.Fatal("Validate accepted a malformed seed row")
+			}
+			if !strings.Contains(err.Error(), tc.wantIn) {
+				t.Fatalf("Validate error %q does not name the row %q", err, tc.wantIn)
+			}
+		})
+	}
+
+	t.Run("empty table", func(t *testing.T) {
+		saved := routeTable
+		t.Cleanup(func() { routeTable = saved })
+		routeTable = nil
+		if err := Validate(); err == nil || !strings.Contains(err.Error(), "empty") {
+			t.Fatalf("Validate on an empty table = %v, want an empty-table error", err)
+		}
+	})
+}
+
 func TestCandidatesForDOIEncodingMatrix(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -92,6 +92,10 @@ func probeLibrarySources(ctx context.Context, cfg config.Config) ([]doctor.Libra
 		// A lookup with no queries still refreshes the index and reports health,
 		// which is exactly the diagnostic we want and costs no matching.
 		_, health := provider.Lookup(ctx, nil)
+		// The probe is throwaway: stop an exporter a timed-out lookup left running.
+		if closer, ok := provider.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		statuses = append(statuses, doctor.LibrarySourceStatus{
 			Name:        health.Name,
 			Complete:    health.Complete,

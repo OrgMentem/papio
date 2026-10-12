@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -81,29 +82,48 @@ func (r *UnavailableRecheck) runDue(ctx context.Context) error {
 			return nil
 		}
 		row, err := r.svc.Jobs.Get(ctx, id)
-		if err != nil || row.State != job.StateUnavailable || job.RecheckExempt(row.TerminalReason) {
+		if err != nil {
+			log.Printf("papio: unavailable recheck: load job %s: %v", id, err)
+			continue
+		}
+		if row.State != job.StateUnavailable || job.RecheckExempt(row.TerminalReason) {
 			continue
 		}
 		updatedAt, err := time.Parse(time.RFC3339Nano, row.UpdatedAt)
-		if err != nil || !updatedAt.Before(now().UTC().Add(-time.Duration(days)*24*time.Hour)) {
+		if err != nil {
+			log.Printf("papio: unavailable recheck: job %s updated_at %q: %v", id, row.UpdatedAt, err)
+			continue
+		}
+		if !updatedAt.Before(now().UTC().Add(-time.Duration(days) * 24 * time.Hour)) {
 			continue
 		}
 		blocked, err := r.sameWorkAlreadyActiveOrDelivered(ctx, row)
-		if err != nil || blocked {
+		if err != nil {
+			log.Printf("papio: unavailable recheck: same-work probe for job %s: %v", id, err)
+			continue
+		}
+		if blocked {
 			continue
 		}
 		already, err := r.alreadyRechecked(ctx, row.ID)
-		if err != nil || already {
+		if err != nil {
+			log.Printf("papio: unavailable recheck: prior-recheck probe for job %s: %v", id, err)
+			continue
+		}
+		if already {
 			continue
 		}
 
 		request := unavailableWorkRequest(row)
 		autoImport := row.Policy.AutoImport
-		_, _ = r.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, request, SubmitOptions{
+		if _, err := r.svc.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, request, SubmitOptions{
 			AutoImport:        &autoImport,
 			RecheckOf:         row.ID,
 			RecheckWindowDays: days,
-		})
+		}); err != nil {
+			// Best-effort: the job stays due and the next pass retries it.
+			log.Printf("papio: unavailable recheck: resubmit job %s: %v", id, err)
+		}
 	}
 	return nil
 }

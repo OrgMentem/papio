@@ -1223,11 +1223,7 @@ func (r *Runner) classifyUnheld(ctx context.Context, works []protocol.WorkReques
 func (r *Runner) unownedByZotio(ctx context.Context, works []protocol.WorkRequest) ([]bool, error) {
 	lookupRequest := zotio.LookupWorksRequest{Works: make([]zotio.LookupWork, len(works))}
 	for i, request := range works {
-		if request.Identifiers != nil {
-			lookupRequest.Works[i] = zotio.LookupWork{
-				DOI: request.Identifiers.DOI, ArXiv: request.Identifiers.ArXiv,
-			}
-		}
+		lookupRequest.Works[i] = zotio.LookupWorkFromIdentifiers(request.Identifiers)
 	}
 	owned, err := r.Lookup.LookupWorks(ctx, lookupRequest)
 	if err != nil {

@@ -900,7 +900,7 @@ func TestCredentialConfigCorruptJournalFailsClosed(t *testing.T) {
 				t.Fatalf("readPendingCredentials = %v, want the journal sentinel", err)
 			}
 			err = f.run([]string{"status"}, "")
-			if err == nil || !strings.Contains(err.Error(), "pending-credentials.json") {
+			if err == nil || !strings.Contains(err.Error(), "inspect "+journalPath+" before retrying") {
 				t.Fatalf("status with corrupt journal = %v, want the journal failure, not a clean report", err)
 			}
 			f.assertNoSecret(err, "original-private")
@@ -978,7 +978,7 @@ func TestCredentialConfigUnreadableJournalPathFailsClosed(t *testing.T) {
 	if f.store.saved != 0 {
 		t.Fatal("set with unreadable journal wrote to the vault")
 	}
-	if err := f.run([]string{"status"}, ""); err == nil || !strings.Contains(err.Error(), "pending-credentials.json") {
+	if err := f.run([]string{"status"}, ""); err == nil || !strings.Contains(err.Error(), "inspect "+pendingCredentialPath(f.path)+" before retrying") {
 		t.Fatalf("status with unreadable journal = %v, want the journal failure", err)
 	}
 }
@@ -1067,4 +1067,201 @@ func TestCredentialDeleteNeedsConfirmationAndRefusesABoundRecord(t *testing.T) {
 		t.Fatal("delete --yes did not delete exactly the requested record")
 	}
 	f.assertNoSecret(nil, "private-key-one")
+}
+
+// swapJournalDirSync replaces the journal's directory-flush seam for one test.
+func swapJournalDirSync(t *testing.T, flush func(string) error) {
+	t.Helper()
+	previous := syncJournalDir
+	t.Cleanup(func() { syncJournalDir = previous })
+	syncJournalDir = flush
+}
+
+// The journal is the only record of a reference the vault may already hold, so
+// its rename must be on stable storage before the vault is touched, and a
+// barrier that fails must stop the command before any vault write.
+func TestCredentialConfigSetJournalsDurablyBeforeTheVault(t *testing.T) {
+	t.Run("flushed before the vault write", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		var flushed []string
+		swapJournalDirSync(t, func(dir string) error { flushed = append(flushed, dir); return nil })
+		f.store.onSave = func(ref string, _ credential.Record) error {
+			if len(flushed) == 0 {
+				t.Error("the vault was written before the journal's directory entry was flushed")
+			}
+			if entries, err := readPendingCredentials(f.path); err != nil || len(entries) != 1 || entries[0].Reference != ref {
+				t.Errorf("journal at vault write = %+v, %v; want the reference about to be stored", entries, err)
+			}
+			return nil
+		}
+		if err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private"); err != nil {
+			t.Fatal(err)
+		}
+		if want := filepath.Dir(pendingCredentialPath(f.path)); len(flushed) == 0 || flushed[0] != want {
+			t.Fatalf("flushed directories = %v, want the journal directory %s first", flushed, want)
+		}
+	})
+	t.Run("a failed barrier fails closed", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		swapJournalDirSync(t, func(string) error { return errors.New("flush failed") })
+		err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private")
+		if err == nil || !strings.Contains(err.Error(), "no credential was stored") {
+			t.Fatalf("set with a failed journal flush = %v, want a refusal before the vault", err)
+		}
+		if f.store.saved != 0 {
+			t.Fatal("set wrote to the vault although the journal was not durable")
+		}
+	})
+}
+
+// A save that replaced the file but could not flush it is not a committed
+// binding: the journal entry must survive, and the message must not claim
+// that the original configuration is intact.
+func TestCredentialConfigUncertainPublicationKeepsTheJournal(t *testing.T) {
+	uncertain := func(cfg config.Config, path string, snapshot config.Snapshot) error {
+		if err := config.SaveIfUnchanged(cfg, path, snapshot); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: flush failed", config.ErrPublicationUncertain)
+	}
+	t.Run("set", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		f.deps.saveConfig = uncertain
+		err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private")
+		if err == nil || !strings.Contains(err.Error(), "could not be confirmed on stable storage") || strings.Contains(err.Error(), "was not replaced") {
+			t.Fatalf("set with an uncertain publication = %v, want the uncertainty named and no claim that the file is unchanged", err)
+		}
+		var staged string
+		for ref := range f.store.records {
+			staged = ref
+		}
+		if entries, readErr := readPendingCredentials(f.path); readErr != nil || len(entries) != 1 || entries[0].Reference != staged {
+			t.Fatalf("journal = %+v, %v; want the staged reference %q kept", entries, readErr, staged)
+		}
+		if !strings.Contains(err.Error(), staged) {
+			t.Fatalf("error %q does not name the staged reference %s", err, staged)
+		}
+	})
+	t.Run("detach", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		f.deps.saveConfig = uncertain
+		err := f.run([]string{"detach", "sources.openalex"}, "")
+		if err == nil || !strings.Contains(err.Error(), "could not be confirmed on stable storage") || strings.Contains(err.Error(), "was not detached") {
+			t.Fatalf("detach with an uncertain publication = %v, want the uncertainty named", err)
+		}
+	})
+}
+
+// Status must not turn an unreachable OS store into proof that a journaled
+// reference holds nothing: the journal is the only evidence of the write.
+func TestCredentialConfigStatusKeepsJournaledReferencesWhenTheStoreIsDown(t *testing.T) {
+	const ref = "keyring:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, cause := range []error{credential.ErrUnavailable, credential.ErrBusy, context.DeadlineExceeded} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			f := newCredentialCLIFixture(t)
+			f.opt.jsonOutput = false
+			if err := journalPendingCredential(f.path, ref, "sources.openalex"); err != nil {
+				t.Fatal(err)
+			}
+			f.store.onLoad = func(string) (credential.Record, error) { return credential.Record{}, cause }
+			err := f.run([]string{"status"}, "")
+			if err == nil {
+				t.Fatal("status exited cleanly although a journaled reference could not be checked")
+			}
+			if !strings.Contains(f.out.String(), ref) || !strings.Contains(f.out.String(), "unavailable") {
+				t.Fatalf("status output = %q, want the journaled reference %s with an unavailable state", f.out.String(), ref)
+			}
+		})
+	}
+	t.Run("confirmed absence is dropped", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		f.opt.jsonOutput = false
+		if err := journalPendingCredential(f.path, ref, "sources.openalex"); err != nil {
+			t.Fatal(err)
+		}
+		f.store.onLoad = func(string) (credential.Record, error) { return credential.Record{}, credential.ErrNotFound }
+		if err := f.run([]string{"status"}, ""); err != nil {
+			t.Fatalf("status with a never-dispatched journal entry = %v, want success", err)
+		}
+		if strings.Contains(f.out.String(), ref) {
+			t.Fatalf("status output = %q, want the absent reference dropped", f.out.String())
+		}
+	})
+}
+
+// The journal is a hidden file named after the configuration. Every message
+// that sends the operator to it must print the path the code uses.
+func TestCredentialConfigJournalFailuresNameTheRealFile(t *testing.T) {
+	corrupt := func(f *credentialCLIFixture) {
+		if err := os.WriteFile(pendingCredentialPath(f.path), []byte("garbage"), 0o600); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	// Corrupt the journal once the config is published, so only the journal
+	// clear that follows the commit fails.
+	corruptAfterSave := func(f *credentialCLIFixture) {
+		f.deps.saveConfig = func(cfg config.Config, path string, snapshot config.Snapshot) error {
+			if err := config.SaveIfUnchanged(cfg, path, snapshot); err != nil {
+				return err
+			}
+			corrupt(f)
+			return nil
+		}
+	}
+	t.Run("set", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		corruptAfterSave(f)
+		err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private")
+		if err == nil || !strings.Contains(err.Error(), "inspect "+pendingCredentialPath(f.path)) {
+			t.Fatalf("set = %v, want the journal path %s", err, pendingCredentialPath(f.path))
+		}
+	})
+	t.Run("delete", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		corrupt(f)
+		err := f.run([]string{"delete", "keyring:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--yes"}, "")
+		if err == nil || !strings.Contains(err.Error(), "inspect "+pendingCredentialPath(f.path)) {
+			t.Fatalf("delete = %v, want the journal path %s", err, pendingCredentialPath(f.path))
+		}
+	})
+	t.Run("migrate", func(t *testing.T) {
+		f := newCredentialCLIFixture(t)
+		cfg := f.config()
+		source := cfg.Sources[config.SourceOpenAlex]
+		source.APIKey = "alex-private"
+		cfg.Sources[config.SourceOpenAlex] = source
+		f.write(cfg)
+		corruptAfterSave(f)
+		err := f.run([]string{"migrate"}, "")
+		if err == nil || !strings.Contains(err.Error(), "inspect "+pendingCredentialPath(f.path)) {
+			t.Fatalf("migrate = %v, want the journal path %s", err, pendingCredentialPath(f.path))
+		}
+	})
+}
+
+// papio has no restart command. The next step an operator is told to take must
+// be a command that exists, and the one that applies the change.
+func TestCredentialConfigNamesTheDaemonStopStep(t *testing.T) {
+	f := newCredentialCLIFixture(t)
+	f.opt.jsonOutput = false
+	if err := f.run([]string{"set", "sources.openalex", "--key-stdin"}, "original-private"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.out.String(); !strings.Contains(got, "papio daemon stop") || strings.Contains(strings.ToLower(got), "restart the daemon") {
+		t.Fatalf("set output = %q, want the 'papio daemon stop' step and no restart command", got)
+	}
+	if err := f.run([]string{"detach", "sources.openalex"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.out.String(); !strings.Contains(got, "papio daemon stop") {
+		t.Fatalf("detach output = %q, want the 'papio daemon stop' step", got)
+	}
+	var agent bytes.Buffer
+	f.opt.out = &agent
+	if err := f.runAgent([]string{"remove"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := agent.String(); !strings.Contains(got, "papio daemon stop") {
+		t.Fatalf("agent remove output = %q, want the 'papio daemon stop' step", got)
+	}
 }

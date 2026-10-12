@@ -431,7 +431,7 @@ func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*Sy
 		openAlexEnricher := enrich.NewOpenAlexWithOptions(enrich.OpenAlexOptions{
 			// Same daily budget as the resolver and discovery paths, so the
 			// enricher's own responses must feed the header-derived floor too.
-			Client:       mustOpenAlexClient(budgets, cfg, metadataClient, credentials),
+			Client:       mustOpenAlexClient(budgets, cfg, credentials),
 			ContactEmail: cfg.Email,
 			APIKey:       credentials.SourcePolicy(config.SourceOpenAlex).APIKey,
 			BaseURL:      cfg.Sources[config.SourceOpenAlex].BaseURLForDev,
@@ -649,6 +649,9 @@ func (s *System) Close() error {
 	if s.Browser != nil {
 		s.Browser.CloseAcquisitionBackend()
 	}
+	// A library exporter still running at shutdown would outlive the daemon, so
+	// stop it before the store closes.
+	holdingsErr := s.Holdings.Close()
 	var previewErr error
 	if s.Preview != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -668,12 +671,12 @@ func (s *System) Close() error {
 		}
 	}
 	if hookErr != nil {
-		return errors.Join(previewErr, hookErr)
+		return errors.Join(holdingsErr, previewErr, hookErr)
 	}
 	if s.Store == nil {
-		return previewErr
+		return errors.Join(holdingsErr, previewErr)
 	}
-	return errors.Join(previewErr, s.Store.Close())
+	return errors.Join(holdingsErr, previewErr, s.Store.Close())
 }
 
 // DoctorReport runs readiness checks against this live system without exposing
@@ -719,7 +722,7 @@ func metadataDisableKeepAlives(cfg config.Config, views ...sourcePolicies) bool 
 // mustOpenAlexClient is the OpenAlex metadata HTTP stack: replay-bounded
 // transport, no in-client redirect following, and quota-header observation.
 // Admission still happens at app.go AcquireAny sites — not in sourcegate.Client.
-func mustOpenAlexClient(budgets *budget.Manager, cfg config.Config, _ *fetch.SecureHTTPClient, views ...sourcePolicies) sourcegate.HTTPClient {
+func mustOpenAlexClient(budgets *budget.Manager, cfg config.Config, views ...sourcePolicies) sourcegate.HTTPClient {
 	source := selectSourcePolicies(cfg, views)
 	policy := source.SourcePolicy(config.SourceOpenAlex)
 	transport := fetch.MetadataTransport(policy.DisableKeepAlives())
@@ -755,7 +758,7 @@ func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.S
 		{Adapter: arxiv.NewWithOptions(arxiv.Options{Client: client, BaseURL: cfg.Sources[config.SourceArXiv].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceArXiv)},
 		{Adapter: europepmc.NewWithOptions(europepmc.Options{Client: client, BaseURL: cfg.Sources[config.SourceEuropePMC].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceEuropePMC)},
 		{Adapter: unpaywall.NewWithOptions(unpaywall.Options{Client: client, ContactEmail: cfg.Email, BaseURL: cfg.Sources[config.SourceUnpaywall].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceUnpaywall)},
-		{Adapter: openalex.NewWithOptions(openalex.Options{Client: mustOpenAlexClient(budgets, cfg, client, source), ContactEmail: cfg.Email, APIKey: source.SourcePolicy(config.SourceOpenAlex).APIKey, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev, SiblingTitleSearch: cfg.Sources[config.SourceOpenAlex].SiblingTitleSearch}), Policy: source.SourcePolicy(config.SourceOpenAlex)},
+		{Adapter: openalex.NewWithOptions(openalex.Options{Client: mustOpenAlexClient(budgets, cfg, source), ContactEmail: cfg.Email, APIKey: source.SourcePolicy(config.SourceOpenAlex).APIKey, BaseURL: cfg.Sources[config.SourceOpenAlex].BaseURLForDev, SiblingTitleSearch: cfg.Sources[config.SourceOpenAlex].SiblingTitleSearch}), Policy: source.SourcePolicy(config.SourceOpenAlex)},
 		{Adapter: semanticscholar.NewWithOptions(semanticscholar.Options{Client: client, APIKey: source.SourcePolicy(config.SourceSemanticScholar).APIKey, BaseURL: cfg.Sources[config.SourceSemanticScholar].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceSemanticScholar)},
 		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: source.SourcePolicy(config.SourceCORE).APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceCORE)},
 		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: source.SourcePolicy(config.SourceCrossrefTDM).APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceCrossrefTDM)},
@@ -832,7 +835,7 @@ func discoverySources(cfg config.Config, budgets *budget.Manager, client sourceg
 			// sourcegate.Client's construction-time policy is removed so it cannot
 			// pre-empt the keyed identity CommitEgress derives from the request.
 			// Identity-agnostic pacing sits outside the guarded stack.
-			stack := mustOpenAlexClient(budgets, cfg, nil, source)
+			stack := mustOpenAlexClient(budgets, cfg, source)
 			gated, err = sourcegate.NewPacingOnly(budgets, name, discoveryPolicy(cfg, name, source), 0, stack)
 		} else {
 			gated, err = sourcegate.New(budgets, name, discoveryPolicy(cfg, name, source), 0, client)

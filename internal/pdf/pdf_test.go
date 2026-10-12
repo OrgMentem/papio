@@ -469,13 +469,21 @@ func writeTempPDF(t *testing.T) string {
 	return p
 }
 
+// fakeTool returns an executable that runs body with /bin/sh. The path is a
+// symlink to one shared dispatcher (see fakeToolShim) with the body beside it,
+// because every distinct executable file pays a first-exec scan on macOS
+// (~0.2s here) while re-executing one already-scanned file costs milliseconds.
 func fakeTool(t *testing.T, body string) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake tools are POSIX shell scripts, which Windows cannot execute")
 	}
+	shim := fakeToolShim(t)
 	p := filepath.Join(t.TempDir(), "tool")
-	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+	if err := os.WriteFile(p+".body", []byte(body+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(shim, p); err != nil {
 		t.Fatal(err)
 	}
 	return p

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -170,6 +172,18 @@ func listAttributedActionsPage(ctx context.Context, opt *options, openOnly bool,
 	return out, truncated, nil
 }
 
+// parseJobStateFilter turns the --state value into a job state. Case and
+// hyphens are forgiven (`awaiting-human` is the spelling every other flag
+// trains), but a value that names no state is an error: an unknown state
+// matches no rows, and an empty list reads as a clear queue.
+func parseJobStateFilter(value string) (string, error) {
+	state := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "-", "_")
+	if state == "" || job.ValidState(state) {
+		return state, nil
+	}
+	return "", fmt.Errorf("unknown job state %q; valid states: %s", value, strings.Join(job.States, ", "))
+}
+
 // jobDetailV3 prefers jobs.get_v3, which adds the delivery-request section
 // (ADR-0017 Decision 5) on top of jobs.get_v2's attribution and staleness. It
 // falls back through jobDetail (jobs.get_v2, then jobs.get) for an older
@@ -290,6 +304,15 @@ var errReviewChanged = errors.New("review changed since it was listed")
 // hook run's result, the errDoctorFailed shape.
 var errRefileFailed = errors.New("filing hook failed")
 
+// errNotRepaired makes `jobs repair-awaiting-human` exit nonzero after printing
+// a refused repair, which changed nothing.
+var errNotRepaired = errors.New("job not repaired")
+
+// errJobNotCancelled makes `jobs cancel` exit nonzero after printing that the
+// job was already finished, so a script that checks only the exit status does
+// not read a no-op as a stop.
+var errJobNotCancelled = errors.New("job not cancelled")
+
 func daemonUpgradeRequired(method string) error {
 	return fmt.Errorf("%s is unavailable because the running daemon predates it; upgrade or restart the daemon from the same installation as this CLI", method)
 }
@@ -362,30 +385,64 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result)
-			}
-			if result.State == "" {
-				_, err := fmt.Fprintf(opt.out, "%s\t%s\n", result.JobID, result.Outcome)
+				if err := opt.printJSON(result); err != nil {
+					return err
+				}
+			} else if result.State == "" {
+				if _, err := fmt.Fprintf(opt.out, "%s\t%s\n", result.JobID, result.Outcome); err != nil {
+					return err
+				}
+			} else if _, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", result.JobID, result.Outcome, result.State); err != nil {
 				return err
 			}
-			_, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", result.JobID, result.Outcome, result.State)
-			return err
+			// A refused repair (not_parked, has_open_actions, conflict) changed
+			// nothing; the exit status has to say so, as for `jobs refile`.
+			if !result.Repaired {
+				return fmt.Errorf("%w: %s: %s", errNotRepaired, result.JobID, result.Outcome)
+			}
+			return nil
 		},
 	}
 
 	var componentRole string
 	addComponent := &cobra.Command{
 		Use:   "add-component <job-id> <path>",
-		Short: "Add a supplement or appendix to a job",
-		Args:  cobra.ExactArgs(2),
+		Short: "Add a supplement or appendix PDF from any path to a job",
+		Long: "Add a supplement or appendix to a job that already holds its main PDF (ready or imported).\n" +
+			"The file can be anywhere on this computer. papio copies it into its data directory and runs\n" +
+			"the same payload and structure checks as a main PDF; a supplement is not checked against\n" +
+			"the requested work. Your original file is not changed.\n\n" +
+			"Use supply-pdf for a job's main file.",
+		// The command reads a file on this computer, so an agent that read a
+		// poisoned page must not be able to name one.
+		Annotations: map[string]string{"mcp:hidden": "true"},
+		Args:        cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := opt.loadConfig()
+			if err != nil {
+				return err
+			}
+			stageDir, err := app.ComponentStagingDir(cfg.DataDir, args[0])
+			if err != nil {
+				return err
+			}
+			staged, name, err := stageLocalPDF(stageDir, cfg.Fetch.MaxBytes, args[1])
+			if err != nil {
+				return err
+			}
+			// The daemon removes the staged copy once it has read or refused it.
+			// This covers a call that never reached it.
+			defer func() {
+				_ = os.Remove(staged)
+				_ = os.Remove(stageDir)
+			}()
 			var result struct {
 				Components []job.Component `json:"components"`
 				Truncated  bool            `json:"truncated"`
 			}
-			if err := opt.call(cmd.Context(), "jobs.add_component", map[string]string{"job_id": args[0], "path": args[1], "role": componentRole}, &result); err != nil {
+			if err := opt.call(cmd.Context(), "jobs.add_component_staged", map[string]string{"job_id": args[0], "name": name, "role": componentRole}, &result); err != nil {
 				if isUnknownMethod(err) {
-					return daemonUpgradeRequired("jobs.add_component")
+					return daemonUpgradeRequired("jobs.add_component_staged")
 				}
 				return err
 			}
@@ -414,7 +471,11 @@ func newJobsCommand(opt *options) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			effective := effectiveLimit(limit, job.ListLimitMax, job.ListLimitDefault)
 			consumer := strings.TrimSpace(jobsConsumer)
-			params := map[string]any{"state": state, "limit": effective}
+			wantState, err := parseJobStateFilter(state)
+			if err != nil {
+				return err
+			}
+			params := map[string]any{"state": wantState, "limit": effective}
 			if consumer != "" {
 				params["consumer"] = consumer
 			}
@@ -446,7 +507,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 			return truncationNotice(opt, truncated, len(rows), "jobs")
 		},
 	}
-	list.Flags().StringVar(&state, "state", "", "filter by exact job state")
+	list.Flags().StringVar(&state, "state", "", "only jobs in this state: "+strings.Join(job.States, ", "))
 	list.Flags().IntVar(&limit, "limit", 100, "maximum rows (1-500)")
 	list.Flags().StringVar(&jobsConsumer, "consumer", "", "only jobs submitted under this consumer name")
 
@@ -524,7 +585,10 @@ func newJobsCommand(opt *options) *cobra.Command {
 				return opt.printResult(result, "Cancel requested for %s", args[0])
 			}
 			if after.Job.State != string(job.StateCancelled) {
-				return opt.printResult(result, "%s was already %s; nothing to cancel", args[0], after.Job.State)
+				if err := opt.printResult(result, "%s was already %s; nothing to cancel", args[0], after.Job.State); err != nil {
+					return err
+				}
+				return fmt.Errorf("%w: %s is already %s", errJobNotCancelled, args[0], after.Job.State)
 			}
 			return opt.printResult(result, "Cancelled %s", args[0])
 		},
@@ -566,7 +630,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 			"Redrive accepts nothing on the provider: the extension's own terms\n" +
 			"consent setting decides again when the handoff is driven, and without\n" +
 			"consent the job parks on terms again.\n\n" +
-			"Use the action revision from `papio actions list --json`. For a job\n" +
+			"Use the revision column of `papio actions list`. For a job\n" +
 			"whose action is already resolved and has no open action, use --revision 0.\n" +
 			"This runs once per observed browser outcome. It does not open a tab.",
 		Args: cobra.ExactArgs(1),
@@ -641,11 +705,28 @@ func newJobsCommand(opt *options) *cobra.Command {
 	unfiled.Flags().StringVar(&filingFilter, "filter", "all", "filing filter: failed, missing, or all")
 	unfiled.Flags().IntVar(&filingLimit, "limit", job.ListLimitDefault, "maximum rows (1-500)")
 
+	var refileDryRun bool
 	refile := &cobra.Command{
 		Use:   "refile <job-id>",
 		Short: "Run the configured on-ready filing hook again",
-		Args:  cobra.ExactArgs(1),
+		Long: "Run the [hooks] on_ready command from your configuration again for a ready or\n" +
+			"imported job. The command runs through your shell with the daemon's\n" +
+			"environment, and whatever it files is written to your library, so check the\n" +
+			"job id first.\n\n" +
+			"--dry-run prints the command that would run, and the refusals that would stop\n" +
+			"it, without running anything.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if refileDryRun {
+				var preview app.RefilePreview
+				if err := opt.call(cmd.Context(), "jobs.refile_preview", map[string]string{"job_id": args[0]}, &preview); err != nil {
+					if isUnknownMethod(err) {
+						return daemonUpgradeRequired("jobs.refile_preview")
+					}
+					return fmt.Errorf("refile dry run: %w", err)
+				}
+				return opt.printResult(preview, "would run for %s (%s): %s", preview.JobID, preview.State, store.StripTerminalControls(preview.Command))
+			}
 			var result app.RefileResult
 			if err := opt.call(cmd.Context(), "jobs.refile", map[string]string{"job_id": args[0]}, &result); err != nil {
 				if isUnknownMethod(err) {
@@ -667,6 +748,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 				result.JobID, result.ExitCode, result.DurationMS)
 		},
 	}
+	refile.Flags().BoolVar(&refileDryRun, "dry-run", false, "print the hook command that would run, without running it")
 	var failuresSince string
 	var failuresLimit int
 	failures := &cobra.Command{
@@ -800,7 +882,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return printPage(opt, "actions", actions, truncated)
 			}
 			for _, action := range actions {
-				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s%s%s%s\n", action.ID, action.JobID, action.Kind, action.Status,
+				if _, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\t%s\t%d%s%s%s\n", action.ID, action.JobID, action.Kind, action.Status, action.Revision,
 					consumerHint(action.Consumer), accessHint(action.HumanAction), staleHint(action)); err != nil {
 					return err
 				}
@@ -825,8 +907,9 @@ func newActionsCommand(opt *options) *cobra.Command {
 		Long: "Accept or reject a parked identity or unsafe-PDF review.\n\n" +
 			"The verdict applies only to the review you inspected. --revision is\n" +
 			"required for both verdicts, and --accept also needs --sha256, the\n" +
-			"quarantined file's digest; take both from `papio actions list --json`\n" +
-			"(revision, quarantine_sha256). If the action or its file changed since\n" +
+			"quarantined file's digest; take the revision from the revision column of\n" +
+			"`papio actions list` and the digest from `papio actions list --json`\n" +
+			"(quarantine_sha256). If the action or its file changed since\n" +
 			"you listed it, nothing is applied and the command exits nonzero: list\n" +
 			"the action again and re-inspect the file before deciding.\n\n" +
 			"--reject cancels the job for an identity review; for an unsafe PDF it\n" +
@@ -841,7 +924,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return errors.New("action-id must be a positive integer")
 			}
 			if resolveRevision <= 0 {
-				return errors.New("--revision is required; take it from `papio actions list --json`")
+				return errors.New("--revision is required; take it from the revision column of `papio actions list`")
 			}
 			params := map[string]any{"action_id": actionID, "verdict": "reject", "expected_revision": resolveRevision}
 			if accept {
@@ -885,7 +968,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 			"verify_identity or unsafe_pdf action), dismissing it also cancels the\n" +
 			"job. Otherwise the job is left untouched.\n\n" +
 			"--revision guards against dismissing an action that changed after you\n" +
-			"listed it; take it from `papio actions list --json`.",
+			"listed it; take it from the revision column of `papio actions list`.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			actionID, err := strconv.ParseInt(args[0], 10, 64)
@@ -893,7 +976,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return errors.New("action-id must be a positive integer")
 			}
 			if revision <= 0 {
-				return errors.New("--revision is required; take it from `papio actions list --json`")
+				return errors.New("--revision is required; take it from the revision column of `papio actions list`")
 			}
 			var result map[string]any
 			if err := opt.call(cmd.Context(), "actions.dismiss",
@@ -1438,7 +1521,14 @@ func newBundleCommand(opt *options) *cobra.Command {
 			if strings.TrimSpace(outputDir) == "" {
 				return errors.New("--output is required")
 			}
-			result, err := exportBundleResult(cmd.Context(), opt, args[0], outputDir)
+			// The daemon is a separate process with its own working directory,
+			// so a relative destination must be resolved here, where the
+			// operator's directory is.
+			destination, err := filepath.Abs(outputDir)
+			if err != nil {
+				return fmt.Errorf("resolving --output: %w", err)
+			}
+			result, err := exportBundleResult(cmd.Context(), opt, args[0], destination)
 			if err != nil {
 				return err
 			}

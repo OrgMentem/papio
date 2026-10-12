@@ -115,7 +115,6 @@ func TestHasIdentifier(t *testing.T) {
 		{"doi", Record{DOI: "10.1/a"}, true},
 		{"pmid", Record{PMID: "1"}, true},
 		{"arxiv", Record{ArXiv: "2401.1"}, true},
-		{"isbn alone is not matchable", Record{ISBN: "9780262035613"}, false},
 		{"title alone is not matchable", Record{Title: "T"}, false},
 		{"whitespace only", Record{DOI: "  "}, false},
 	}

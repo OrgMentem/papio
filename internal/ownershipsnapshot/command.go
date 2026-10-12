@@ -55,6 +55,12 @@ type commandProvider struct {
 	failure  string
 	failedAt time.Time
 	runs     int
+
+	// owner bounds every run. Close cancels it, which kills the command's
+	// process tree; no lookup's context can, because the run is shared.
+	owner  context.Context
+	cancel context.CancelFunc
+	closed bool
 }
 
 // commandSettings resolves the argv and bounds shared by the provider and by
@@ -85,6 +91,7 @@ func newCommandProvider(name string, source config.LibrarySource, artifact strin
 	if err != nil {
 		return nil, fmt.Errorf("library source %q: %w", name, err)
 	}
+	owner, cancel := context.WithCancel(context.Background())
 	return &commandProvider{
 		name:     name,
 		argv:     argv,
@@ -92,7 +99,32 @@ func newCommandProvider(name string, source config.LibrarySource, artifact strin
 		artifact: artifact,
 		limits:   limits,
 		now:      now,
+		owner:    owner,
+		cancel:   cancel,
 	}, nil
+}
+
+// Close stops the provider: it kills a running command's process tree, waits
+// for that run to finish, and makes later lookups answer without starting
+// another. The wait is bounded by the pipe wait a killed command can still
+// cost, so shutdown stays inside service-manager deadlines.
+func (p *commandProvider) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	pend := p.pending
+	p.mu.Unlock()
+	p.cancel()
+	if pend == nil {
+		return nil
+	}
+	timer := time.NewTimer(commandWaitDelay + time.Second)
+	defer timer.Stop()
+	select {
+	case <-pend.done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("library source %q: command did not stop after shutdown", p.name)
+	}
 }
 
 func (p *commandProvider) Name() string { return p.name }
@@ -110,7 +142,7 @@ func (p *commandProvider) Lookup(ctx context.Context, queries []ownership.Query)
 	if ctx.Err() != nil {
 		return answerFrom(p.name, p.servable(), false, ownership.FailureTimeout, queries)
 	}
-	pend, snap, failure := p.begin(ctx)
+	pend, snap, failure := p.begin()
 	if pend == nil {
 		return answerFrom(p.name, snap, failure == "", failure, queries)
 	}
@@ -131,9 +163,12 @@ func (p *commandProvider) Lookup(ctx context.Context, queries []ownership.Query)
 // begin decides, under one lock, whether this lookup can answer without
 // running the command. It returns a pending run to wait on, or the snapshot and
 // failure code to answer with now.
-func (p *commandProvider) begin(ctx context.Context) (*pendingRefresh, *snapshot, string) {
+func (p *commandProvider) begin() (*pendingRefresh, *snapshot, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, p.servableLocked(p.now()), ownership.FailureTimeout
+	}
 	now := p.now()
 	if p.current != nil {
 		// A clock that moved backwards makes the age negative; rerunning is
@@ -155,11 +190,11 @@ func (p *commandProvider) begin(ctx context.Context) (*pendingRefresh, *snapshot
 	p.pending = pend
 	p.runs++
 	previous := p.current
-	// The run is detached from this waiter's cancellation so an abandoned wait
-	// cannot cancel the run later lookups are already sharing; the command's
-	// own timeout still bounds it.
+	// The run belongs to the provider, not to this waiter: an abandoned wait
+	// cannot cancel the run later lookups are already sharing, while Close and
+	// the command's own timeout still bound it.
 	go func() {
-		snap, failure := p.run(context.WithoutCancel(ctx), previous)
+		snap, failure := p.run(p.owner, previous)
 		p.mu.Lock()
 		if failure == "" {
 			p.current, p.failure, p.failedAt = snap, "", time.Time{}

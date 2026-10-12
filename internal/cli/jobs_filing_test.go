@@ -101,3 +101,26 @@ func TestJobsRefileHumanOutput(t *testing.T) {
 		})
 	}
 }
+
+// --dry-run asks the daemon for the command and never calls jobs.refile.
+func TestJobsRefileDryRunPrintsTheHookWithoutRunningIt(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, params any, result any) error {
+		if method != "jobs.refile_preview" {
+			t.Fatalf("method = %q, want jobs.refile_preview; a dry run must not call jobs.refile", method)
+		}
+		if got := params.(map[string]string)["job_id"]; got != "job_filing_01" {
+			t.Fatalf("job_id = %q", got)
+		}
+		*result.(*app.RefilePreview) = app.RefilePreview{JobID: "job_filing_01", State: job.StateReady, Command: "file-it --library main"}
+		return nil
+	})
+	root.SetArgs([]string{"jobs", "refile", "job_filing_01", "--dry-run"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("jobs refile --dry-run: %v (%s)", err, errOut.String())
+	}
+	const want = "would run for job_filing_01 (ready): file-it --library main\n"
+	if out.String() != want {
+		t.Fatalf("output = %q, want %q", out.String(), want)
+	}
+}

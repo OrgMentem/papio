@@ -4,7 +4,6 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -305,13 +304,7 @@ func TestActionReminderReachesOldestJobBeyondMaintenancePage(t *testing.T) {
 		now.Add(-48*time.Hour).Format(time.RFC3339Nano), oldestJobID); err != nil {
 		t.Fatal(err)
 	}
-	for i := range job.ListLimitMax {
-		_, jobID := openReminderAction(t, svc, jobs, fmt.Sprintf("wr_reminder_new_%03d", i), now.Add(-time.Minute), true)
-		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
-			now.Add(time.Duration(i+1)*time.Second).Format(time.RFC3339Nano), jobID); err != nil {
-			t.Fatal(err)
-		}
-	}
+	seedNewerMaintenancePage(t, svc, jobs, "wr_reminder_new", now, now.Add(-time.Minute))
 
 	if err := svc.ActionReminder().RunDue(ctx); err != nil {
 		t.Fatal(err)

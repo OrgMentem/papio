@@ -15,6 +15,7 @@ import (
 
 func newInboxCommand(opt *options) *cobra.Command {
 	var limit int
+	var cursor string
 	command := &cobra.Command{
 		Use:         "inbox",
 		Short:       "Show the triage inbox",
@@ -22,7 +23,7 @@ func newInboxCommand(opt *options) *cobra.Command {
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var snapshot triage.Snapshot
-			if err := opt.call(cmd.Context(), "triage.snapshot", triage.SnapshotRequest{Limit: limit}, &snapshot); err != nil {
+			if err := opt.call(cmd.Context(), "triage.snapshot", triage.SnapshotRequest{Limit: limit, Cursor: cursor}, &snapshot); err != nil {
 				return err
 			}
 			if opt.jsonOutput {
@@ -34,13 +35,18 @@ func newInboxCommand(opt *options) *cobra.Command {
 				}
 			}
 			if snapshot.HasMore {
-				_, err := fmt.Fprintf(opt.out, "… more items available; use --json for the cursor\n")
+				next := "papio inbox --cursor " + snapshot.Cursor
+				if limit > 0 {
+					next += " --limit " + strconv.Itoa(limit)
+				}
+				_, err := fmt.Fprintf(opt.out, "… more items: %s\n", next)
 				return err
 			}
 			return nil
 		},
 	}
 	command.Flags().IntVar(&limit, "limit", 0, "maximum items (default 50, maximum 100)")
+	command.Flags().StringVar(&cursor, "cursor", "", "continue from the cursor printed after the previous page")
 
 	counts := &cobra.Command{
 		Use:         "counts",
@@ -65,7 +71,8 @@ func newInboxCommand(opt *options) *cobra.Command {
 	decide := &cobra.Command{
 		Use:   "decide <item-id>",
 		Short: "Acquire or dismiss one triage inbox item",
-		Long: "Acquire or dismiss one triage inbox item.\n\n" +
+		Long: "Acquire or dismiss one triage inbox item. <item-id> is the first column\n" +
+			"of `papio inbox` (also `id` in `papio inbox --json`).\n\n" +
 			"Dismissing a captured PDF grab (an item id starting with \"" + triage.PdfGrabIDPrefix + "\")\n" +
 			"permanently deletes the captured file and its grab record; `papio grabs\n" +
 			"suggest` and `papio grabs identify` cannot recover it afterwards. That\n" +
@@ -176,10 +183,10 @@ func printInboxItem(opt *options, item triage.Item) error {
 		// control bytes. Route it through the same StripTerminalControls choke
 		// point as the watch digest row, or an attacker-registered title
 		// injects ANSI/OSC escapes into `papio inbox`.
-		_, err := fmt.Fprintf(opt.out, "%d\twatch hit\t%s\t[%s]\n", item.Rank, store.StripTerminalControls(item.Title), strings.Join(labels, ", "))
+		_, err := fmt.Fprintf(opt.out, "%s\twatch hit\t%s\t[%s]\n", store.StripTerminalControls(item.ID), store.StripTerminalControls(item.Title), strings.Join(labels, ", "))
 		return err
 	case triage.KindHumanAction:
-		_, err := fmt.Fprintf(opt.out, "%d\taction\t%s\t%s\n", item.Rank, item.HumanAction.ActionKind, item.HumanAction.JobID)
+		_, err := fmt.Fprintf(opt.out, "%s\taction\t%s\t%s\n", item.ID, item.HumanAction.ActionKind, item.HumanAction.JobID)
 		return err
 	case triage.KindRetraction:
 		// item.Retraction.DOI is third-party bibliographic metadata from a
@@ -190,7 +197,7 @@ func printInboxItem(opt *options, item triage.Item) error {
 		// intact. Route it through StripTerminalControls like the watch-hit
 		// row above, or a poisoned retraction notice DOI injects ANSI/OSC
 		// escapes into `papio inbox`.
-		_, err := fmt.Fprintf(opt.out, "%d\t%s\t%s\n", item.Rank, item.Retraction.Nature, store.StripTerminalControls(item.Retraction.DOI))
+		_, err := fmt.Fprintf(opt.out, "%s\t%s\t%s\n", store.StripTerminalControls(item.ID), item.Retraction.Nature, store.StripTerminalControls(item.Retraction.DOI))
 		return err
 	case triage.KindPdfGrab:
 		// item.Title is the grab's label, which is derived from the captured
@@ -198,8 +205,8 @@ func printInboxItem(opt *options, item triage.Item) error {
 		// and retraction rows above document, so it takes the same choke point.
 		// Printing a bare error for this kind made ONE parked grab fail the
 		// whole `papio inbox` render, hiding every other pending item.
-		_, err := fmt.Fprintf(opt.out, "%d\tpdf grab\t%s\t%s\t%s\n", item.Rank,
-			item.PdfGrab.GrabID, item.PdfGrab.State, store.StripTerminalControls(item.Title))
+		_, err := fmt.Fprintf(opt.out, "%s\tpdf grab\t%s\t%s\n", store.StripTerminalControls(item.ID),
+			item.PdfGrab.State, store.StripTerminalControls(item.Title))
 		return err
 	default:
 		return fmt.Errorf("unsupported triage item kind %q", item.Kind)

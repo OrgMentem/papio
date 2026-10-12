@@ -3139,6 +3139,45 @@ func TestRefileJob(t *testing.T) {
 	}
 }
 
+// PreviewRefile names the command a refile would run, runs nothing, and
+// refuses exactly where RefileJob refuses, so a dry run never promises a refile
+// that would be turned away.
+func TestPreviewRefileNamesTheHookWithoutRunningIt(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.ReadyHook = &hook.Runner{
+		Command: "file-it --library main",
+		Exec: func(context.Context, string, []string) hook.Result {
+			t.Fatal("a preview ran the hook")
+			return hook.Result{}
+		},
+	}
+	readyID := createFilingStateJob(t, jobs, "wr_preview_ready", job.StateReady)
+	preview, err := svc.PreviewRefile(ctx, readyID)
+	if err != nil || preview != (RefilePreview{JobID: readyID, State: job.StateReady, Command: "file-it --library main"}) {
+		t.Fatalf("preview = %+v, %v", preview, err)
+	}
+
+	queuedID := createFilingStateJob(t, jobs, "wr_preview_queued", job.StateQueued)
+	if _, err := svc.PreviewRefile(ctx, queuedID); !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("preview of an unsettled job = %v, want ErrConflict", err)
+	}
+	if _, err := svc.PreviewRefile(ctx, "job_missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("preview of a missing job = %v, want sql.ErrNoRows", err)
+	}
+	if err := jobs.RecordEvent(ctx, readyID, "hook.on_ready", map[string]any{"status": "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PreviewRefile(ctx, readyID); !errors.Is(err, job.ErrConflict) || !strings.Contains(err.Error(), "already filed") {
+		t.Fatalf("preview of a filed paper = %v, want the already-filed conflict", err)
+	}
+	unconfigured, unconfiguredJobs := newTestService(t)
+	unconfiguredID := createFilingStateJob(t, unconfiguredJobs, "wr_preview_unconfigured", job.StateReady)
+	if _, err := unconfigured.PreviewRefile(ctx, unconfiguredID); !errors.Is(err, ErrReadyHookNotConfigured) {
+		t.Fatalf("preview without a hook = %v, want ErrReadyHookNotConfigured", err)
+	}
+}
+
 // A refile whose hook times out, or whose artifact path cannot be derived,
 // reports that outcome and records it, so the paper stays on the unfiled list
 // with the attempt counted instead of vanishing or looking filed.
@@ -4813,4 +4852,38 @@ func TestReconcileRedundantPublicationPreservesSharedQuarantineOwnership(t *test
 			t.Fatalf("remaining publication = %+v, %v; want one durable owner", prepared, err)
 		}
 	})
+}
+
+// A browser OA hint keeps the open-access route alive only until the OA route
+// itself reports no entitlement: the later of the two events decides.
+func TestOpenAccessRouteRemainsFollowsHintAndFallbackOrder(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id, err := svc.Submit(ctx, doiRequest("wr_oa_route_remains"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remains := func(want bool, why string) {
+		t.Helper()
+		got, err := svc.OpenAccessRouteRemains(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s: OpenAccessRouteRemains = %t, want %t", why, got, want)
+		}
+	}
+	record := func(kind string) {
+		t.Helper()
+		if err := jobs.RecordEvent(ctx, id, kind, map[string]any{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	remains(false, "no hint, no candidates")
+	record(oaBrowserHintEventKind)
+	remains(true, "hint with no fallback")
+	record(oaHandoffFallbackEventKind)
+	remains(false, "fallback after the hint spent the OA route")
+	record(oaBrowserHintEventKind)
+	remains(true, "a fresh hint after the fallback")
 }

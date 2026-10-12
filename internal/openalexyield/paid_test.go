@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -205,5 +206,172 @@ func TestTitleSearchShapeNeutralizesFilterGrammar(t *testing.T) {
 	got := titleSearchShape("Cats, dogs | birds: a survey").Get("filter")
 	if want := "title.search:Cats dogs birds: a survey"; got != want {
 		t.Fatalf("filter = %q, want %q", got, want)
+	}
+}
+
+// funcClient adapts a function to HTTPClient, so a test can choose the outcome
+// of each request by its query shape.
+type funcClient func(*http.Request) (*http.Response, error)
+
+func (f funcClient) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+func okEmptyResponse() *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"results":[]}`))}
+}
+
+func TestRunReportsFailedRequestsAsIncompleteAndUncharged(t *testing.T) {
+	// A DNS-style failure happens before anything is sent: nothing is charged.
+	client := funcClient(func(*http.Request) (*http.Response, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "api.openalex.org", IsNotFound: true}
+	})
+	report, err := Run(context.Background(), ComparisonConfig{
+		Confirm: true, Sample: 2, Client: client, ContactEmail: "ops@example.org",
+	}, []TitleSample{{Title: "A"}, {Title: "B"}})
+	if !errors.Is(err, ErrIncompleteComparison) {
+		t.Fatalf("err = %v, want ErrIncompleteComparison", err)
+	}
+	if !report.Incomplete() {
+		t.Fatal("report.Incomplete() = false, want true")
+	}
+	for i, res := range report.Results {
+		if res.Requests != 2 || res.Errors != 2 || res.Succeeded != 0 || res.Credits != 0 {
+			t.Errorf("shape %d = %+v, want 2 attempts, 2 errors, nothing succeeded, no credits", i, res)
+		}
+	}
+	if out := report.Render(); !strings.HasPrefix(out, "INCOMPLETE:") {
+		t.Errorf("Render() does not lead with INCOMPLETE:\n%s", out)
+	}
+}
+
+func TestRunSeparatesAttemptsFromChargesInAMixedRun(t *testing.T) {
+	// Shape 1 (per_page=100) fails before sending; the other two are answered.
+	client := funcClient(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Query().Get("per_page") == "100" {
+			return nil, errors.New("connection refused")
+		}
+		return okEmptyResponse(), nil
+	})
+	report, err := Run(context.Background(), ComparisonConfig{
+		Confirm: true, Sample: 1, Client: client, ContactEmail: "ops@example.org",
+	}, []TitleSample{{Title: "A"}})
+	if !errors.Is(err, ErrIncompleteComparison) {
+		t.Fatalf("err = %v, want ErrIncompleteComparison", err)
+	}
+	want := []ShapeResult{
+		{Shape: AllShapes[0].label, Requests: 1, Succeeded: 1, Credits: CreditsPerTitleSearch},
+		{Shape: AllShapes[1].label, Requests: 1, Errors: 1},
+		{Shape: AllShapes[2].label, Requests: 1, Succeeded: 1, Credits: CreditsPerTitleSearch},
+	}
+	if len(report.Results) != len(want) {
+		t.Fatalf("Results = %+v, want %d entries", report.Results, len(want))
+	}
+	for i := range want {
+		if report.Results[i] != want[i] {
+			t.Errorf("shape %d = %+v, want %+v", i, report.Results[i], want[i])
+		}
+	}
+}
+
+func TestRunChargesAnsweredRequestWhoseBodyIsUnreadable(t *testing.T) {
+	// The provider answered 200, so the credits are spent even though the
+	// body is unusable; the run is still incomplete.
+	client := funcClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`not json`))}, nil
+	})
+	report, err := Run(context.Background(), ComparisonConfig{
+		Confirm: true, Sample: 1, Client: client, ContactEmail: "ops@example.org",
+	}, []TitleSample{{Title: "A"}})
+	if !errors.Is(err, ErrIncompleteComparison) {
+		t.Fatalf("err = %v, want ErrIncompleteComparison", err)
+	}
+	for i, res := range report.Results {
+		if res.Credits != CreditsPerTitleSearch || res.Succeeded != 0 || res.Errors != 1 {
+			t.Errorf("shape %d = %+v, want charged but failed", i, res)
+		}
+	}
+}
+
+func TestRunStopsAndReportsIncompleteWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	client := funcClient(func(req *http.Request) (*http.Response, error) {
+		calls++
+		cancel()
+		return nil, req.Context().Err()
+	})
+	report, err := Run(ctx, ComparisonConfig{
+		Confirm: true, Sample: 2, Client: client, ContactEmail: "ops@example.org",
+	}, []TitleSample{{Title: "A"}, {Title: "B"}})
+	if !errors.Is(err, ErrIncompleteComparison) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want ErrIncompleteComparison wrapping context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("client.calls = %d, want 1: no request may follow cancellation", calls)
+	}
+	if !report.Incomplete() {
+		t.Fatal("report.Incomplete() = false, want true")
+	}
+}
+
+func TestComparisonReportRender(t *testing.T) {
+	cases := []struct {
+		name   string
+		report ComparisonReport
+		want   string
+	}{
+		{
+			name: "complete run with several shapes",
+			report: ComparisonReport{
+				Plan: ComparisonPlan{SampleSize: 2, TotalCalls: 4},
+				Results: []ShapeResult{
+					{Shape: "search", Requests: 2, Succeeded: 2, Credits: 20, ExactTitleMatches: 1},
+					{Shape: "title.search", Requests: 2, Succeeded: 2, Credits: 20, ExactTitleMatches: 2},
+				},
+			},
+			want: "openalex-yield paid comparison — 2 titles sampled, 40 credits charged (200 OK responses only)\n\n" +
+				"shape\trequests\tsucceeded\tcredits\texact-title matches\terrors\n" +
+				"search\t2\t2\t20\t1\t0\n" +
+				"title.search\t2\t2\t20\t2\t0\n",
+		},
+		{
+			name:   "no results is a run that attempted nothing",
+			report: ComparisonReport{Plan: ComparisonPlan{SampleSize: 3, TotalCalls: 9}},
+			want: "INCOMPLETE: 0 of 9 planned requests succeeded (0 failed, 9 not attempted); the figures below are partial\n" +
+				"openalex-yield paid comparison — 3 titles sampled, 0 credits charged (200 OK responses only)\n\n" +
+				"shape\trequests\tsucceeded\tcredits\texact-title matches\terrors\n",
+		},
+		{
+			name: "failed request marks the table incomplete",
+			report: ComparisonReport{
+				Plan:    ComparisonPlan{SampleSize: 1, TotalCalls: 1},
+				Results: []ShapeResult{{Shape: "search", Requests: 1, Errors: 1}},
+			},
+			want: "INCOMPLETE: 0 of 1 planned requests succeeded (1 failed, 0 not attempted); the figures below are partial\n" +
+				"openalex-yield paid comparison — 1 titles sampled, 0 credits charged (200 OK responses only)\n\n" +
+				"shape\trequests\tsucceeded\tcredits\texact-title matches\terrors\n" +
+				"search\t1\t0\t0\t0\t1\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.report.Render(); got != tc.want {
+				t.Fatalf("Render() =\n%q\nwant\n%q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestComparisonPlanRenderStatesTheCostBeforeAnySpend(t *testing.T) {
+	got := Plan(4).Render()
+	for _, want := range []string{
+		"NOT YET RUN",
+		"sample size:   4 titles",
+		"total calls:   12 (3 shapes x 4 titles)",
+		"TOTAL CREDITS TO SPEND: 120",
+		"--confirm-spend",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Plan(4).Render() lacks %q:\n%s", want, got)
+		}
 	}
 }

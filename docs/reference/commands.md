@@ -90,7 +90,7 @@ verify_identity or unsafe_pdf action), dismissing it also cancels the
 job. Otherwise the job is left untouched.
 
 --revision guards against dismissing an action that changed after you
-listed it; take it from `papio actions list --json`.
+listed it; take it from the revision column of `papio actions list`.
 
 ```
 papio actions dismiss <action-id> [flags]
@@ -163,8 +163,9 @@ Accept or reject a parked identity or unsafe-PDF review.
 
 The verdict applies only to the review you inspected. --revision is
 required for both verdicts, and --accept also needs --sha256, the
-quarantined file's digest; take both from `papio actions list --json`
-(revision, quarantine_sha256). If the action or its file changed since
+quarantined file's digest; take the revision from the revision column of
+`papio actions list` and the digest from `papio actions list --json`
+(quarantine_sha256). If the action or its file changed since
 you listed it, nothing is applied and the command exits nonzero: list
 the action again and re-inspect the file before deciding.
 
@@ -190,7 +191,7 @@ Retry a failed browser route through the paper's DOI in your browser.
 
 If the DOI retry has already failed, this command re-offers the original
 institutional route only when the refusing adapter has since been upgraded.
-Use the action id and revision from 'papio actions list --json'. The failed
+Use the action id and revision from the revision column of 'papio actions list'. The failed
 action and its evidence remain in the job history. Each route can be retried
 once. Pending sign-ins, challenges, terms, downloads, and unresolved browser
 effects must be handled first. Neither retry establishes entitlement.
@@ -534,6 +535,28 @@ Manage papio configuration
 papio config
 ```
 
+### `papio config acknowledge-closure`
+
+Reopen paid egress for a source that closed on price or balance drift (requires --confirm)
+
+A source's paid egress closes, and stays closed with no timed reopen, when the
+provider's prices stop matching the schedule papio committed against or when
+its prepaid balance falls below the starting observation. 'papio doctor' names
+the closed source and the reason.
+
+This command acknowledges the closure after you have checked the provider's
+account, and reopens egress. The next response from the provider sets the new
+balance baseline. Without --confirm nothing changes. It exits nonzero when the
+source was not closed.
+
+```
+papio config acknowledge-closure SOURCE [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--confirm` | `bool` | `false` | reopen paid egress for the source |
+
 ### `papio config agent`
 
 Configure optional article-agent decisions
@@ -554,7 +577,7 @@ papio config agent remove
 
 Enable TypeSafe/Jev with a key saved in the OS credential store
 
-Enable cloud article decisions for this configuration profile. This sends article DOIs, bounded titles and sanitized control descriptions to TypeSafe. The key is stored as a shared-service typed credential with an explicit reference. Input is hidden; use --key-stdin for a secret-manager pipe. Restart the daemon after changing this setting.
+Enable cloud article decisions for this configuration profile. This sends article DOIs, bounded titles and sanitized control descriptions to TypeSafe. The key is stored as a shared-service typed credential with an explicit reference. Input is hidden; use --key-stdin for a secret-manager pipe. The running daemon keeps the old setting until it is stopped: run 'papio daemon stop' after changing it, and the next papio command starts the daemon with it.
 
 ```
 papio config agent set [flags]
@@ -624,7 +647,7 @@ papio config credentials migrate
 
 Save a new credential and bind this configuration to it
 
-Create a fresh OS credential record for one integration. Supply a single API key at the hidden prompt or with --key-stdin. For sources.openaire and notify.webhook, use --key-stdin with a version-1 typed JSON credential record. TypeSafe setup enrolls this profile in cloud article decisions. Restart the daemon after changes.
+Create a fresh OS credential record for one integration. Supply a single API key at the hidden prompt or with --key-stdin. For sources.openaire and notify.webhook, use --key-stdin with a version-1 typed JSON credential record. TypeSafe setup enrolls this profile in cloud article decisions. The running daemon keeps the old credential until it is stopped: run 'papio daemon stop' after changes, and the next papio command starts the daemon with them.
 
 ```
 papio config credentials set TARGET [flags]
@@ -646,6 +669,8 @@ papio config credentials status [TARGET]
 
 Write explicit first-run configuration
 
+Write a new configuration with defaults and the given access mode. With --force it replaces an existing file: every other setting, including data_dir, institutions, sources, hooks and credential bindings, is reset to defaults, and no backup is kept. To change only the access mode, use 'papio config set-access-mode'.
+
 ```
 papio config init [flags]
 ```
@@ -655,7 +680,17 @@ papio config init [flags]
 | `--access-mode` | `string` |  | required: conservative, assisted, or delegated |
 | `--data-dir` | `string` |  | artifact and database directory |
 | `--email` | `string` |  | contact email for polite APIs |
-| `--force` | `bool` | `false` | replace an existing config |
+| `--force` | `bool` | `false` | replace an existing config and reset every other setting |
+
+### `papio config set-access-mode`
+
+Change access_mode in the existing config and keep every other setting
+
+Set access_mode to conservative, assisted, or delegated in the existing configuration. Every other setting is kept. A running daemon keeps its old mode until it restarts.
+
+```
+papio config set-access-mode MODE
+```
 
 ## `papio daemon`
 
@@ -753,8 +788,9 @@ request with the provider — which can count against a request allowance
 or cost the institution money, and which papio cannot cancel through the
 provider. Otherwise it opens a prefill or reconciliation action.
 
-Without --confirm nothing is submitted: the command shows the job's
-recorded delivery request and compiled gate, if any, and exits nonzero.
+Without --confirm nothing is submitted: the command reports what
+--confirm would do for this job (a real provider request, a prefill
+action, or the handling of an existing request) and exits nonzero.
 
 ```
 papio delivery submit <job-id> [flags]
@@ -982,6 +1018,7 @@ papio inbox [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--cursor` | `string` |  | continue from the cursor printed after the previous page |
 | `--limit` | `int` | `0` | maximum items (default 50, maximum 100) |
 
 ### `papio inbox counts`
@@ -996,7 +1033,8 @@ papio inbox counts
 
 Acquire or dismiss one triage inbox item
 
-Acquire or dismiss one triage inbox item.
+Acquire or dismiss one triage inbox item. <item-id> is the first column
+of `papio inbox` (also `id` in `papio inbox --json`).
 
 Dismissing a captured PDF grab (an item id starting with "pdf_grab:")
 permanently deletes the captured file and its grab record; `papio grabs
@@ -1050,7 +1088,14 @@ papio jobs
 
 ### `papio jobs add-component`
 
-Add a supplement or appendix to a job
+Add a supplement or appendix PDF from any path to a job
+
+Add a supplement or appendix to a job that already holds its main PDF (ready or imported).
+The file can be anywhere on this computer. papio copies it into its data directory and runs
+the same payload and structure checks as a main PDF; a supplement is not checked against
+the requested work. Your original file is not changed.
+
+Use supply-pdf for a job's main file.
 
 ```
 papio jobs add-component <job-id> <path> [flags]
@@ -1198,7 +1243,7 @@ papio jobs list [flags]
 | --- | --- | --- | --- |
 | `--consumer` | `string` |  | only jobs submitted under this consumer name |
 | `--limit` | `int` | `100` | maximum rows (1-500) |
-| `--state` | `string` |  | filter by exact job state |
+| `--state` | `string` |  | only jobs in this state: queued, resolving, fetching, validating, ready, imported, awaiting_human, retry_wait, needs_review, unavailable, failed, cancelled |
 
 ### `papio jobs receipt`
 
@@ -1237,7 +1282,7 @@ Redrive accepts nothing on the provider: the extension's own terms
 consent setting decides again when the handoff is driven, and without
 consent the job parks on terms again.
 
-Use the action revision from `papio actions list --json`. For a job
+Use the revision column of `papio actions list`. For a job
 whose action is already resolved and has no open action, use --revision 0.
 This runs once per observed browser outcome. It does not open a tab.
 
@@ -1253,9 +1298,21 @@ papio jobs redrive <job-id> [flags]
 
 Run the configured on-ready filing hook again
 
+Run the [hooks] on_ready command from your configuration again for a ready or
+imported job. The command runs through your shell with the daemon's
+environment, and whatever it files is written to your library, so check the
+job id first.
+
+--dry-run prints the command that would run, and the refusals that would stop
+it, without running anything.
+
 ```
-papio jobs refile <job-id>
+papio jobs refile <job-id> [flags]
 ```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--dry-run` | `bool` | `false` | print the hook command that would run, without running it |
 
 ### `papio jobs repair-awaiting-human`
 

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"papio/internal/config"
 	"papio/internal/daemon"
 )
@@ -78,5 +80,120 @@ func TestDaemonOnAnotherSocketLeavesTheStoreToItsOwner(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "papio.db")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("the daemon on another socket opened the store: stat papio.db = %v", err)
+	}
+}
+
+// shortSocketDir returns a directory whose socket path fits sun_path, which
+// t.TempDir does not for a descriptively named test on macOS.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "papio-cli-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func daemonControlRoot(dataDir string) (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
+	var out, errOut bytes.Buffer
+	root := newRoot(&options{
+		out:          &out,
+		errOut:       &errOut,
+		configLoader: func(string) (config.Config, error) { return config.Config{DataDir: dataDir}, nil },
+	})
+	return root, &out, &errOut
+}
+
+// TestDaemonStatusNamesWhyTheSocketIsUnreachable pins what an operator reads
+// while no daemon runs and while one holds the data directory but has not
+// opened its socket: a raw dial error looks the same in both cases.
+func TestDaemonStatusNamesWhyTheSocketIsUnreachable(t *testing.T) {
+	t.Run("no daemon", func(t *testing.T) {
+		dataDir := shortSocketDir(t)
+		root, _, _ := daemonControlRoot(dataDir)
+		root.SetArgs([]string{"daemon", "status"})
+		err := root.ExecuteContext(context.Background())
+		want := fmt.Sprintf("daemon is not running (nothing is listening on %s)", filepath.Join(dataDir, "papio.sock"))
+		if err == nil || err.Error() != want {
+			t.Fatalf("daemon status error = %v, want %q", err, want)
+		}
+	})
+	t.Run("daemon upgrading the database", func(t *testing.T) {
+		dataDir := shortSocketDir(t)
+		owner, err := daemon.AcquireInstance(dataDir, filepath.Join(dataDir, "papio.sock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer owner.Release()
+		owner.StoreTrace().Migrating(55, 56)
+		root, _, _ := daemonControlRoot(dataDir)
+		root.SetArgs([]string{"daemon", "status"})
+		err = root.ExecuteContext(context.Background())
+		want := fmt.Sprintf("daemon is upgrading the database (pid %d); it is not accepting commands yet", os.Getpid())
+		if err == nil || err.Error() != want {
+			t.Fatalf("daemon status error = %v, want %q", err, want)
+		}
+	})
+}
+
+// TestDaemonStopReportsAnAlreadyStoppedDaemonAsSuccess pins that a deploy
+// script can run daemon stop on a machine where the daemon is already down,
+// and that a daemon still upgrading its database is a failure that says so.
+func TestDaemonStopReportsAnAlreadyStoppedDaemonAsSuccess(t *testing.T) {
+	t.Run("no daemon", func(t *testing.T) {
+		root, out, _ := daemonControlRoot(shortSocketDir(t))
+		root.SetArgs([]string{"daemon", "stop"})
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatalf("daemon stop with no daemon: %v", err)
+		}
+		if got := out.String(); got != "Daemon not running\n" {
+			t.Fatalf("daemon stop output = %q, want %q", got, "Daemon not running\n")
+		}
+	})
+	t.Run("daemon upgrading the database", func(t *testing.T) {
+		dataDir := shortSocketDir(t)
+		owner, err := daemon.AcquireInstance(dataDir, filepath.Join(dataDir, "papio.sock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer owner.Release()
+		owner.StoreTrace().Migrating(55, 56)
+		root, _, _ := daemonControlRoot(dataDir)
+		root.SetArgs([]string{"daemon", "stop"})
+		err = root.ExecuteContext(context.Background())
+		want := fmt.Sprintf("daemon is upgrading the database (pid %d); it is not accepting commands yet; run 'papio daemon stop' again when it finishes", os.Getpid())
+		if err == nil || err.Error() != want {
+			t.Fatalf("daemon stop error = %v, want %q", err, want)
+		}
+	})
+}
+
+// TestDaemonControlSurfacesUnreachableSocketErrors pins that a dial error that
+// is not "no socket" or "refused" (here EACCES) is an error, not an absent daemon.
+func TestDaemonControlSurfacesUnreachableSocketErrors(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dataDir := shortSocketDir(t)
+	locked := filepath.Join(dataDir, "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	socket := filepath.Join(locked, "papio.sock")
+	for _, sub := range []string{"stop", "status"} {
+		root, out, _ := daemonControlRoot(dataDir)
+		root.SetArgs([]string{"daemon", sub, "--socket", socket})
+		err := root.ExecuteContext(context.Background())
+		if err == nil {
+			t.Fatalf("daemon %s succeeded with output %q, want the dial error", sub, out.String())
+		}
+		if !errors.Is(err, fs.ErrPermission) {
+			t.Fatalf("daemon %s error = %v, want a permission error", sub, err)
+		}
 	}
 }

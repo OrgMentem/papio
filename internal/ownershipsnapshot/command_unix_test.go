@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/config"
 	"papio/internal/ownership"
 )
 
@@ -72,4 +73,89 @@ func processGone(pid int, wait time.Duration) bool {
 	}
 	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
 	return err == nil && strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
+
+// waitForPID polls until the script has written its pid file.
+func waitForPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if data, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s was not written", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The shared run belongs to the provider, so no lookup's cancellation reaches
+// the exporter, but shutting the provider down must. Without that, a daemon
+// stopped during a hung export exits and leaves the exporter's process tree
+// running, and the restarted daemon starts a second copy.
+func TestCommandSourceCloseKillsAHungExporterProcessTree(t *testing.T) {
+	dir := t.TempDir()
+	script := `echo $$ > "$1/shell"; sleep 60 & echo $! > "$1/child"; wait`
+	provider, err := NewProvider(config.LibrarySource{
+		Name:   "papis-live",
+		Kind:   config.LibraryKindCommand,
+		Argv:   []string{"/bin/sh", "-c", script, "sh", dir},
+		Format: "bibtex",
+		Claim:  config.LibraryClaimPDFPresent,
+	}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandProvider := provider.(*commandProvider)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	lookupDone := make(chan ownership.SourceHealth, 1)
+	go func() {
+		_, health := commandProvider.Lookup(ctx, []ownership.Query{doiQuery("10.1000/one")})
+		lookupDone <- health
+	}()
+	shell := waitForPID(t, filepath.Join(dir, "shell"))
+	child := waitForPID(t, filepath.Join(dir, "child"))
+	t.Cleanup(func() {
+		_ = syscall.Kill(shell, syscall.SIGKILL)
+		_ = syscall.Kill(child, syscall.SIGKILL)
+	})
+
+	cancel()
+	if health := <-lookupDone; health.Complete || health.FailureCode != ownership.FailureTimeout {
+		t.Fatalf("cancelled lookup health = %+v, want incomplete timeout", health)
+	}
+	if processGone(shell, 200*time.Millisecond) {
+		t.Fatal("cancelling one lookup killed the run that later lookups share")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- commandProvider.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(commandWaitDelay + 5*time.Second):
+		t.Fatal("Close did not return")
+	}
+	for name, pid := range map[string]int{"exporter shell": shell, "exporter child": child} {
+		if !processGone(pid, 5*time.Second) {
+			t.Fatalf("%s (pid %d) outlived Close", name, pid)
+		}
+	}
+
+	// A lookup after shutdown must not start a second exporter.
+	if err := os.Remove(filepath.Join(dir, "shell")); err != nil {
+		t.Fatal(err)
+	}
+	if _, health := commandProvider.Lookup(context.Background(), []ownership.Query{doiQuery("10.1000/one")}); health.Complete {
+		t.Fatalf("health after Close = %+v, want incomplete", health)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "shell")); err == nil {
+		t.Fatal("a lookup after Close started a second exporter")
+	}
 }

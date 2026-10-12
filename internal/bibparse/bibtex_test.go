@@ -78,6 +78,18 @@ func TestParseBibTeX(t *testing.T) {
 			}},
 		},
 		{
+			name: "keeps LaTeX-escaped punctuation as literal characters",
+			input: `@article{escaped,
+  doi = {10.1000/a\_b},
+  title = {Tom \& Jerry: 50\% of \$5 and \#1},
+}`,
+			want: []Record{{
+				SourceKey: "escaped",
+				DOI:       "10.1000/a_b",
+				Title:     "Tom & Jerry: 50% of $5 and #1",
+			}},
+		},
+		{
 			name:    "rejects field assignment before citation-key comma",
 			input:   "@article{key doi={10.1000/x}, title={T}}",
 			wantErr: "bibtex: entry at byte 0: field assignment before citation key comma",
