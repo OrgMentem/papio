@@ -3439,6 +3439,8 @@ export class Bridge {
   private controlWithholds(job: ActiveJob | undefined): boolean {
     if (this.control.blocksPositiveEffects()) return true;
     if (job === undefined) return false;
+    if (job.provider_hosts.some((host) => this.control.isHostDomainSuspended(host)))
+      return true;
     return this.control
       .suspendedAdapters(this.deps.adapterSpecs)
       .some(
@@ -3488,7 +3490,7 @@ export class Bridge {
         msg.type !== "handoff_focus" &&
         msg.type !== "cancel" &&
         msg.type !== "provider_direct_get_request") ||
-      !this.controlResolutionPending()
+      (!this.controlResolutionPending() && this.heldForControl.length === 0)
     ) {
       return false;
     }
@@ -12351,6 +12353,14 @@ export class Bridge {
       acknowledged: false,
     };
     await this.storeTermsEffect(correlation);
+    // The permit wait can outlast a control change: re-check immediately
+    // before the click and report the acquired permit as not dispatched.
+    if (!this.hasDelegatedAuthority(findByJob(this.store, jobID))) {
+      correlation = { ...correlation, result_outcome: "not_dispatched" };
+      await this.storeTermsEffect(correlation);
+      const acknowledged = await this.reportTermsEffectResult(correlation);
+      return acknowledged ? "not_dispatched" : "occupied";
+    }
     let accepted: boolean;
     try {
       const results = await this.deps.scripting.executeScript({

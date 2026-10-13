@@ -204,7 +204,7 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		return nil
 	}
 
-	corpus, err := s.corpusWorks(ctx)
+	corpus, libraryIncomplete, err := s.corpusWorks(ctx)
 	if err != nil {
 		return err
 	}
@@ -253,8 +253,8 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		findings = append(findings, finding)
 	}
 	sort.Slice(findings, func(i, j int) bool { return findings[i].DOI < findings[j].DOI })
-	truncated := len(findings) > maxNotices
-	if truncated {
+	truncated := libraryIncomplete || len(findings) > maxNotices
+	if len(findings) > maxNotices {
 		findings = findings[:maxNotices]
 	}
 	notices := make(map[string]Finding, len(findings))
@@ -660,21 +660,28 @@ func (s *Sentinel) readyWorks(ctx context.Context) ([]readyWork, error) {
 	sort.Slice(works, func(i, j int) bool { return works[i].DOI < works[j].DOI })
 	return works, nil
 }
-func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, error) {
+
+// libraryTruncationReporter is implemented by library listers that can report
+// an incomplete enumeration.
+type libraryTruncationReporter interface {
+	libraryTruncated() bool
+}
+
+func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, bool, error) {
 	ready, err := s.readyWorks(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	corpus := make(map[string]readyWork, len(ready))
 	for _, item := range ready {
 		corpus[item.DOI] = item
 	}
 	if s.scope != config.RetractionScopeLibrary || s.libraryDOIs == nil {
-		return corpus, nil
+		return corpus, false, nil
 	}
 	dois, err := s.libraryDOIs.LibraryDOIs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("retraction: enumerate library DOIs: %w", err)
+		return nil, false, fmt.Errorf("retraction: enumerate library DOIs: %w", err)
 	}
 	titles, _ := s.libraryDOIs.(libraryDOITitleProvider)
 	for _, raw := range dois {
@@ -690,7 +697,11 @@ func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, error
 			corpus[doi] = readyWork{DOI: doi, Title: title}
 		}
 	}
-	return corpus, nil
+	incomplete := false
+	if reporter, ok := s.libraryDOIs.(libraryTruncationReporter); ok {
+		incomplete = reporter.libraryTruncated()
+	}
+	return corpus, incomplete, nil
 }
 
 type update struct {

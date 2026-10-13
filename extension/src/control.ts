@@ -209,6 +209,7 @@ export class AdapterControl {
   private persisted: PersistedAdapterControl | undefined;
   private phase: AdapterControlPhase = "unresolved";
   private revisions: ReadonlySet<string> = new Set();
+  private domains: ReadonlySet<string> = new Set();
   private epoch = 0;
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -238,6 +239,7 @@ export class AdapterControl {
     this.epoch += 1;
     this.phase = "unresolved";
     this.revisions = new Set();
+    this.domains = new Set();
     return this.epoch;
   }
 
@@ -246,6 +248,7 @@ export class AdapterControl {
     if (epoch !== this.epoch) return;
     this.phase = "unsupported";
     this.revisions = new Set();
+    this.domains = new Set();
   }
 
   /** The current connection can no longer vouch for what it applied (a
@@ -256,6 +259,7 @@ export class AdapterControl {
     if (epoch !== this.epoch || this.phase === "failed") return;
     this.phase = "unresolved";
     this.revisions = new Set();
+    this.domains = new Set();
   }
 
   currentPhase(): AdapterControlPhase {
@@ -298,6 +302,19 @@ export class AdapterControl {
   ): T[] {
     if (this.phase !== "applied" || this.revisions.size === 0) return [];
     return specs.filter((spec) => this.isSuspended(spec));
+  }
+
+  /** True when the applied control suspends a safety domain (`kind:host`)
+   * whose host is `host` or a parent of it. Domains suspend generic drives
+   * that have no packaged adapter revision. */
+  isHostDomainSuspended(host: string): boolean {
+    if (this.phase !== "applied" || this.domains.size === 0) return false;
+    const h = host.toLowerCase();
+    for (const domain of this.domains) {
+      const d = domain.slice(domain.indexOf(":") + 1);
+      if (h === d || h.endsWith(`.${d}`)) return true;
+    }
+    return false;
   }
 
   /** Lowercase, sorted, unique hostnames of the suspended packaged adapters:
@@ -360,6 +377,7 @@ export class AdapterControl {
     if (current) {
       this.phase = "applied";
       this.revisions = new Set(response.suspended_revisions);
+      this.domains = new Set(response.suspended_safety_domains);
     }
     return { outcome: "applied", control_sequence: decision.sequence, current };
   }
@@ -377,6 +395,7 @@ export class AdapterControl {
     if (current) {
       this.phase = "failed";
       this.revisions = new Set();
+      this.domains = new Set();
     }
     return {
       outcome,

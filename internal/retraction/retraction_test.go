@@ -223,6 +223,43 @@ func TestLibraryScopeProducesFindingAndTriageItemWithoutJob(t *testing.T) {
 	}
 }
 
+func TestZotioPageBoundMarksCacheTruncated(t *testing.T) {
+	ctx := context.Background()
+	client := &zotio.Client{Exec: func(_ context.Context, args ...string) ([]byte, error) {
+		start, err := strconv.Atoi(args[len(args)-1])
+		if err != nil {
+			return nil, err
+		}
+		rows := make([]map[string]any, 0, zotioPageSize)
+		for i := range zotioPageSize {
+			rows = append(rows, map[string]any{"data": map[string]any{"DOI": fmt.Sprintf("10.1234/z-%04d", start+i)}})
+		}
+		return json.Marshal(map[string]any{"results": rows})
+	}}
+	catalog := NewLibraryCatalog(nil, client)
+	catalog.maxPages = 2
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRetractionDataset(t, w, csvNotice{
+			title: "T", noticeDOI: "10.2000/notice", workDOI: "10.1234/z-0001", nature: "Expression of concern",
+		})
+	}))
+	defer server.Close()
+	sentinel := New(Options{
+		Store: testStore(t), Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+		Client: server.Client(), BaseURL: server.URL, DataDir: t.TempDir(),
+		Scope: config.RetractionScopeLibrary, LibraryDOIs: catalog,
+	})
+	if err := sentinel.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sentinel.mu.Lock()
+	cached, ok := sentinel.readCache()
+	sentinel.mu.Unlock()
+	if !ok || !cached.Truncated {
+		t.Fatalf("cache truncated = %v (ok %v), want true after page bound", cached.Truncated, ok)
+	}
+}
+
 func TestLibraryScopeAcquiredNeverEnumeratesLibrary(t *testing.T) {
 	library := &fakeLibraryDOIs{dois: []string{"10.1234/not-called"}}
 	sentinel := New(Options{

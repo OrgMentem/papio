@@ -30,8 +30,11 @@ type LibraryCatalog struct {
 	sources []config.LibrarySource
 	zotio   *zotio.Client
 
-	mu     sync.RWMutex
-	titles map[string]string
+	maxPages int // test seam; 0 means maxZotioPages
+	mu       sync.RWMutex
+	titles   map[string]string
+	// truncated reports that the last enumeration hit the page bound.
+	truncated bool
 }
 
 // NewLibraryCatalog constructs the production library DOI dependency.
@@ -44,6 +47,9 @@ func (c *LibraryCatalog) LibraryDOIs(ctx context.Context) ([]string, error) {
 	if c == nil {
 		return nil, nil
 	}
+	c.mu.Lock()
+	c.truncated = false
+	c.mu.Unlock()
 	byDOI := make(map[string]string)
 	for _, source := range c.sources {
 		if err := enumerateFileSource(ctx, source, byDOI); err != nil {
@@ -84,7 +90,11 @@ func enumerateFileSource(ctx context.Context, source config.LibrarySource, byDOI
 }
 
 func (c *LibraryCatalog) enumerateZotio(ctx context.Context, byDOI map[string]string) error {
-	for page := range maxZotioPages {
+	pages := c.maxPages
+	if pages <= 0 {
+		pages = maxZotioPages
+	}
+	for page := range pages {
 		start := page * zotioPageSize
 		raw, err := c.zotio.RunJSON(ctx, "--agent", "items", "list", "--limit", strconv.Itoa(zotioPageSize), "--start", strconv.Itoa(start))
 		if err != nil {
@@ -101,8 +111,17 @@ func (c *LibraryCatalog) enumerateZotio(ctx context.Context, byDOI map[string]st
 			return nil
 		}
 	}
-	log.Printf("papio: Zotero library enumeration reached the %d-page safety bound; retraction scope is truncated", maxZotioPages)
+	log.Printf("papio: Zotero library enumeration reached the %d-page safety bound; retraction scope is truncated", pages)
+	c.mu.Lock()
+	c.truncated = true
+	c.mu.Unlock()
 	return nil
+}
+
+func (c *LibraryCatalog) libraryTruncated() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.truncated
 }
 
 type zotioListItem struct {

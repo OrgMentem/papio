@@ -1025,12 +1025,14 @@ papio zotio tags retractions --apply    # write the tag
 ```
 
 The preview works while the option is off, so you can review the effect before
-you enable it. With the option on, the daemon repeats the pass when the notice
-set changes and at most once a day. Acknowledging the inbox notice does not
-remove the tag. When a notice is withdrawn, or when you turn the option off and
-run `papio zotio tags retractions --apply`, *papio* removes only the tag it
-owns. A manual tag with the same name stays as it is. Items outside the
-retraction check's scope get no notice and no tag; set
+you enable it. To add tags, turn on the option and run `papio daemon stop` so
+the daemon reloads the setting. With the option on, the daemon repeats the pass
+when the notice set changes and at most once a day. Acknowledging the inbox
+notice does not remove the tag. When a notice is withdrawn, or when you turn
+the option off, run `papio daemon stop` before
+`papio zotio tags retractions --apply`. With the option off, `--apply` only
+removes the tag *papio* owns. A manual tag with the same name stays as it is.
+Items outside the retraction check's scope get no notice and no tag; set
 `retraction.scope = "library"` to cover your whole library.
 
 ### Triage failures

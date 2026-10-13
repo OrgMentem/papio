@@ -57,6 +57,9 @@ func (b *Bridge) currentGenericDriveAuthority(ctx context.Context, sessionID, jo
 	if current != tuple || !started || applied || superseded || domain != permit.SafetyDomainID {
 		return nil, false
 	}
+	if b.controlSuppression(domain, revision, nil) != "" {
+		return nil, false
+	}
 	authorized, err := b.providerDriveEpochAuthorized(ctx, jobID, domain)
 	return permit, err == nil && authorized
 }

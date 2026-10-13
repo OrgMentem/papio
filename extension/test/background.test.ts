@@ -28827,3 +28827,159 @@ test("control closing between the navigating apply and tabs.update leaves naviga
   expect(navigated.job_id).toBe(ids.jobID);
   expect(navigations()).toHaveLength(1);
 });
+
+// --- Signed adapter control: ordering and permit-wait re-check ---------------
+
+test("a held job_offer replays before a cancel that arrives while control is being applied", async () => {
+  const h = makeHarness(undefined, { adapterControl: await persistedControl(2) });
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  const request = await h.port.waitForFrame("adapter_control_request");
+  await h.port.inbound(jobOffer("job_ctl_held_cancel", OPENURL, "assisted"));
+  // The cancel arrives after control resolved but before the held frames replay.
+  const internals = h.bridge as unknown as {
+    control: { resolve(response: unknown, epoch: number): Promise<unknown> };
+  };
+  const original = internals.control.resolve.bind(internals.control);
+  let cancelled: Promise<void> | undefined;
+  internals.control.resolve = async (response, epoch) => {
+    const result = await original(response, epoch);
+    cancelled = h.port.inbound({
+      protocol: "papio-browser/1",
+      type: "cancel",
+      msg_id: "cancel-held-after",
+      seq: 9,
+      job_id: "job_ctl_held_cancel",
+      payload: {},
+    });
+    await settle();
+    return result;
+  };
+  await replyControl(h, request, await currentResponse(2));
+  await h.port.waitForFrame("adapter_control_apply_result");
+  await cancelled;
+  await settle();
+  expect(h.backend.store.activeJobs.map((job) => job.job_id)).toEqual([]);
+  expect(h.tabs.created).toEqual([]);
+});
+
+test("a terms click is not dispatched when control suspends the adapter during the permit wait", async () => {
+  const TERMS_HOST = "terms.example.org";
+  const spec: AdapterSpec = {
+    id: "termsctl",
+    version: "1.0.0",
+    hosts: [TERMS_HOST],
+    classify: [{ kind: "terms", all: ["div.terms-modal"] }],
+    workEvidence: { kind: "title", selector: "h1" },
+    termsAccept: {
+      modalSelector: "div.terms-modal",
+      control: "button.accept",
+      textAny: ["accept and download"],
+    },
+  };
+  const win = new Window({ url: `https://${TERMS_HOST}/stable/1` });
+  const title = win.document.createElement("h1");
+  title.textContent = "Terms Paper";
+  win.document.body.appendChild(title);
+  const modal = win.document.createElement("div");
+  modal.className = "terms-modal";
+  const accept = win.document.createElement("button");
+  accept.className = "accept";
+  accept.textContent = "Accept and download";
+  modal.appendChild(accept);
+  win.document.body.appendChild(modal);
+  const plan = planExecution(
+    win.document as unknown as Document,
+    spec,
+    { title: "Terms Paper" },
+    { access_mode: "delegated" },
+  );
+  if ("assisted" in plan) throw new Error(`invalid terms plan: ${plan.assisted}`);
+
+  const job = controlJob("job_ctl_terms_permit", 42, TERMS_HOST, {
+    needs_terms_consent: false,
+    expected: { title: "Terms Paper" },
+  });
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: [job] },
+    { adapterControl: new FakeControlStorage() },
+  );
+  h.deps.adapterSpecs = [spec];
+  h.tabs.seed({ id: 42, url: `https://${TERMS_HOST}/stable/1` });
+  let clicks = 0;
+  h.deps.scripting.executeScript = async (injection) => {
+    if (injection.func === planExecution) return [{ result: plan }];
+    if (injection.func === executePlannedPageEffect) {
+      clicks += 1;
+      return [{ result: { ok: true } }];
+    }
+    return [];
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: ["effect_permit_v1"],
+    role: "holder",
+    browser_holder_generation: 1,
+    adapter_control: true,
+  }));
+  await resolveControl(h, await currentResponse(1));
+
+  const internals = h.bridge as unknown as {
+    acceptTerms(jobID: string, spec: AdapterSpec): Promise<string>;
+  };
+  const accepted = internals.acceptTerms(job.job_id, spec);
+  const start = await h.port.waitForFrame("terms_effect_start_request");
+
+  // Control suspends the adapter while the permit reply is outstanding.
+  const posted = await controlTick(h);
+  const request = await h.port.waitForFrame("adapter_control_request", posted);
+  await replyControl(h, request, await currentResponse(2, ["termsctl@1.0.0"]));
+  await h.port.waitForFrame("adapter_control_apply_result", posted);
+
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "terms_effect_start_result",
+    msg_id: "terms_start_result_01",
+    job_id: job.job_id,
+    seq: 3,
+    payload: {
+      request_id: start.payload["request_id"],
+      outcome: "started",
+      permit_id: "permit_ctl_terms_0001",
+      terms_occurrence_id: "occurrence_ctl_terms_0001",
+    },
+  });
+  const result = await h.port.waitForFrame("terms_effect_result_request");
+  expect(result.payload["outcome"]).toBe("not_dispatched");
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "terms_effect_result",
+    msg_id: "terms_result_000001",
+    job_id: job.job_id,
+    seq: 4,
+    payload: {
+      request_id: result.payload["request_id"],
+      permit_id: "permit_ctl_terms_0001",
+      terms_occurrence_id: "occurrence_ctl_terms_0001",
+      outcome: "applied",
+    },
+  });
+  expect(await accepted).toBe("not_dispatched");
+  expect(clicks).toBe(0);
+});
+
+test("a suspended safety domain withholds autonomous effects from a job on that host, like a revision", async () => {
+  const h = controlHarness(
+    [
+      controlJob("job_ctl_domain_gen", 40, "generic.example.net"),
+      controlJob("job_ctl_domain_beta", 42, BETA_HOST, { adapter_id: "beta" }),
+    ],
+    new FakeControlStorage(),
+  );
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ adapter_control: true }));
+  await resolveControl(h, await currentResponse(1, [], ["generic:example.net"]));
+  await armTermsGates(h);
+  await h.bridge.requestTermsConsent("accept");
+  expect(termsFlags(h)).toEqual({ job_ctl_domain_gen: true, job_ctl_domain_beta: false });
+});
