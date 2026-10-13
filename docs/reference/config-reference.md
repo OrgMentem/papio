@@ -527,6 +527,15 @@ unknown `[notify]` fields.
 | --- | --- | --- | --- |
 | `sources` | string array | empty (= `["openalex"]`) | Discovery backends for `papio search` and watches, in merge-preference order. Valid entries: `arxiv`, `openalex`, `semanticscholar` (each at most once). Results merge with DOI-then-title deduplication; earlier backends win ties. arXiv supports text and submitted-year searches but not citation snowballs. Per-backend credentials bind through `sources.<name>.credential_ref` (optional for Semantic Scholar, which works keyless at public rate limits); arXiv needs no credential. |
 
+## `[open_books]`
+
+Configures the `open_books` source, which finds an open-access copy of a book from its ISBN. `[sources.open_books]` carries its `enabled`, `rate_per_sec` and `burst`; this table carries where it looks. The source acts only on a work whose sole strong identifier is the ISBN (`papio acquire --isbn …`): a request that also has a DOI, PMID, arXiv ID or OpenAlex ID is fetched by those, and the ISBN alone is still not a fetchable identifier for any other source. A repository record is a candidate only when its own ISBN field lists the requested ISBN, it carries an open licence statement (or the repository is open access by definition), and its ORIGINAL bundle holds exactly one PDF. See [ISBN-only requests](../guide/user-guide.md#isbn-only-requests).
+
+| Key | Type | Default | Effect and constraints |
+| --- | --- | --- | --- |
+| `dspace_servers` | string array | `["https://iris.who.int/server"]` | DSpace 7 REST roots to search, in order, at most 8 (the server's `dspace.server.url`; *papio* appends `/api`). Each must be an `https` URL with no credentials, query or fragment (plain `http` only for a loopback host), and none may repeat. An empty list searches no DSpace server. The default is the World Health Organization's IRIS. Listing a repository that also holds restricted items is safe: an item without an open licence statement is never a candidate. |
+| `oapen` | boolean | `false` | Also search the [OAPEN Library](https://library.oapen.org), whose books are open access by definition. Off by default: its REST API refuses some networks (HTTP 403), and this lookup has not been verified against the live service. When on, a refusal is recorded against the source and the job carries on. |
+
 ## `[actions]`
 
 | Key | Type | Default | Effect and constraints |
@@ -600,7 +609,7 @@ separately from *papio*'s general strict-unknown-field rejection: the map
 itself decodes freely, and `validate()` rejects an unrecognized key at load
 with the list below. The valid names are `arxiv`, `europepmc`, `unpaywall`,
 `openalex`, `core`, `crossref_tdm`, `crossref_metadata`, `retraction_watch`,
-`semanticscholar`, and `openaire`. One further name, `openalex_content`, is
+`semanticscholar`, `openaire`, and `open_books`. One further name, `openalex_content`, is
 a removed key: an earlier *papio* release wrote it into `Default()` and no
 adapter for it ever shipped, so a config carrying it loads normally and
 drops the key silently rather than breaking on upgrade — it is not a valid
@@ -641,6 +650,7 @@ raises the effective pacing; a short-lived personal token does not. Each named s
 | `crossref_metadata` | `true` | 1 | 1 |
 | `retraction_watch` | `true` | 1 | 1 |
 | `semanticscholar` | `true` | 1 | 1 |
+| `open_books` | `true` | 0.5 | 1 |
 
 `openaire`'s `rate_per_sec` looks oddly precise because it is pinned to a documented
 ceiling: OpenAIRE allows **60 requests per hour** to unauthenticated callers, and

@@ -640,7 +640,7 @@ func TestDeferredConclusiveMismatchIsRefetchableAfterRecovery(t *testing.T) {
 	accepted, parked, deferred, err := svc.validateFetchCandidate(ctx, row, candidate, fetch.Result{
 		TempPath: path, SHA256: digest, SizeBytes: int64(len(body)),
 		SniffedMIME: "application/pdf", ContentType: "application/pdf",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("validateFetchCandidate: %v", err)
 	}

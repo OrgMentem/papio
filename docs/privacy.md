@@ -45,6 +45,8 @@ column lists anything else sent.
 | `api.crossref.org` (TDM) | your subscriber token | Resolving | Off |
 | `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv ID, or PMID, and `papio search` when configured | **On** |
 | `api.openaire.eu` | your API token, if set | Resolving | **On** |
+| `iris.who.int`, and any host you list in `open_books.dspace_servers` | the ISBN; your `email`, in the User-Agent | Resolving a request whose only identifier is an ISBN | **On** (`iris.who.int` only) |
+| `library.oapen.org` | the ISBN; your `email`, in the User-Agent | Resolving a request whose only identifier is an ISBN | **Off**; `open_books.oapen = true` enables it |
 | Publisher and repository hosts | — | Downloading the PDF | **On** |
 | `api.github.com` | **nothing** | Once a day, checking for a new *papio* or zotio release | **On** if you ran `papio init` (it enables `updates.check` unless you decline or pass `--check-updates=false`); the config key itself defaults to `false`. `updates.check = false` disables it |
 | `raw.githubusercontent.com` | **nothing** | Once a day, fetching the signed adapter control file that can suspend a broken browser adapter | Follows `updates.check`, and only in a build that embeds the *papio* control key. `updates.check = false` disables it |

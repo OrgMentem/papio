@@ -250,3 +250,100 @@ func TestHasFetchableIdentifierExcludesISBNOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestISBNsInReadsCataloguedValues(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"9789240114487 (electronic version)", []string{"9789240114487"}},
+		{"978-92-4-011448-7 (print)", []string{"9789240114487"}},
+		{"ISBN 978-92-4-011448-7", []string{"9789240114487"}},
+		{"ISBN-13: 9789240114487; ISBN-10: 9240114483", []string{"9789240114487", "9240114483"}},
+		{"9789240114487 9789240114494", []string{"9789240114487", "9789240114494"}},
+		{"978 92 4 011448 7", []string{"9789240114487"}},
+		{"0-306-40615-2", []string{"0306406152"}},
+		{"080442957x", []string{"080442957X"}},
+		{"9789240114487, 9789240114487", []string{"9789240114487"}},
+		{"not an isbn", nil},
+		{"12345", nil},
+		{"", nil},
+	}
+	for _, tc := range cases {
+		got := ISBNsIn(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("ISBNsIn(%q) = %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("ISBNsIn(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		}
+	}
+}
+
+func TestSameISBN(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"9789240114487", "978-92-4-011448-7", true},
+		{"9780306406157", "0-306-40615-2", true}, // ISBN-13 and its ISBN-10
+		{"0306406152", "9780306406157", true},
+		{"080442957x", "080442957X", true},
+		{"9789240114487", "9789240114494", false},
+		{"9780306406157", "0306406153", false}, // ISBN-10 with a wrong check digit converts to nothing
+		{"9780306406158", "0306406152", false}, // ISBN-13 with a wrong check digit
+		{"9789240114487", "", false},
+		{"", "", false},
+		{"nope", "nope", false},
+	}
+	for _, tc := range cases {
+		if got := SameISBN(tc.a, tc.b); got != tc.want {
+			t.Errorf("SameISBN(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestISBN13RejectsBadCheckDigits(t *testing.T) {
+	for in, want := range map[string]string{
+		"9780306406157": "9780306406157",
+		"0306406152":    "9780306406157",
+		"080442957X":    "9780804429573",
+	} {
+		if got, ok := ISBN13(in); !ok || got != want {
+			t.Errorf("ISBN13(%q) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{"9780306406158", "0306406153", "123", "97803064061X7", "03064061X2"} {
+		if got, ok := ISBN13(in); ok {
+			t.Errorf("ISBN13(%q) = %q; a bad check digit or shape must not convert", in, got)
+		}
+	}
+}
+
+func TestOpenBooksEligibleIsISBNOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		w    Work
+		want bool
+	}{
+		{"isbn only", Work{ISBN: "9789240114487"}, true},
+		{"isbn with title metadata", Work{ISBN: "9789240114487", Title: "A book", Year: 2025}, true},
+		{"isbn and doi (a chapter)", Work{ISBN: "9789240114487", DOI: "10.1000/x"}, false},
+		{"isbn and pmid", Work{ISBN: "9789240114487", PMID: "1"}, false},
+		{"isbn and arxiv", Work{ISBN: "9789240114487", ArXiv: "2301.08745"}, false},
+		{"isbn and openalex", Work{ISBN: "9789240114487", OpenAlex: "W2741809807"}, false},
+		{"no isbn", Work{Title: "A book"}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.w.OpenBooksEligible(); got != tc.want {
+			t.Errorf("%s: OpenBooksEligible = %v, want %v", tc.name, got, tc.want)
+		}
+		// Eligibility must never make an ISBN a general fetchable identifier.
+		if tc.w.HasFetchableIdentifier() && tc.w.DOI == "" && tc.w.PMID == "" && tc.w.ArXiv == "" && tc.w.OpenAlex == "" {
+			t.Errorf("%s: ISBN became fetchable", tc.name)
+		}
+	}
+}

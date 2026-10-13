@@ -49,6 +49,7 @@ import (
 	"papio/internal/resolvers/europepmc"
 	"papio/internal/resolvers/openaire"
 	"papio/internal/resolvers/openalex"
+	"papio/internal/resolvers/openbooks"
 	"papio/internal/resolvers/semanticscholar"
 	"papio/internal/resolvers/unpaywall"
 	"papio/internal/retraction"
@@ -801,6 +802,7 @@ func resolverEntries(cfg config.Config, budgets *budget.Manager, client *fetch.S
 		{Adapter: coreresolver.NewWithOptions(coreresolver.Options{Client: client, APIKey: source.SourcePolicy(config.SourceCORE).APIKey, BaseURL: cfg.Sources[config.SourceCORE].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceCORE)},
 		{Adapter: crossreftdm.NewWithOptions(crossreftdm.Options{Client: client, APIKey: source.SourcePolicy(config.SourceCrossrefTDM).APIKey, BaseURL: cfg.Sources[config.SourceCrossrefTDM].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceCrossrefTDM)},
 		{Adapter: openaire.NewWithOptions(openaire.Options{Client: client, Tokens: openAIRETokens(cfg, client, source), APIKey: source.SourcePolicy(config.SourceOpenAIRE).APIKey, BaseURL: cfg.Sources[config.SourceOpenAIRE].BaseURLForDev}), Policy: source.SourcePolicy(config.SourceOpenAIRE)},
+		{Adapter: openbooks.NewWithOptions(openbooks.Options{Client: client, DSpaceServers: cfg.OpenBooks.DSpaceServers, OAPEN: cfg.OpenBooks.OAPEN, OAPENBaseURL: cfg.Sources[config.SourceOpenBooks].BaseURLForDev, ContactEmail: cfg.Email}), Policy: source.SourcePolicy(config.SourceOpenBooks)},
 	}
 }
 

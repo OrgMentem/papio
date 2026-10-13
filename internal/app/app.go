@@ -924,6 +924,8 @@ func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map
 		}
 		derived := seed.parent
 		derived.URL = pdfURL
+		// The binding is about the parent's file. This is a different one.
+		derived.ISBNBinding = nil
 		derived.Landing = ""
 		derived.Direct = true
 		derived.ExpectedMIME = "application/pdf"
@@ -1977,7 +1979,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			return err
 		}
 
-		accepted, parked, candidateReview, err := s.validateFetchCandidate(ctx, row, stored, result)
+		accepted, parked, candidateReview, err := s.validateFetchCandidate(ctx, row, stored, result, candidate.BoundISBN())
 		if candidateReview != nil {
 			if deferredReview == nil {
 				// NextPendingCandidate is ordered by rank and durable ID. Keep
@@ -2338,9 +2340,12 @@ func (s *Service) publisherFirstAdapter(ctx context.Context, row *job.Row) (stri
 // parked job does not become a request per job per tick.
 func (s *Service) handoffGate(ctx context.Context, w work.Work, resolverName string) (ok bool, reason string, terminal job.TerminalReason) {
 	if !w.HasFetchableIdentifier() {
-		// ISBN is deliberately not a fetchable identifier: the resolver can
-		// locate a catalogue or ebook record, but papio cannot automatically
-		// fetch and validate a book PDF. It is nevertheless actionable in the
+		// ISBN is deliberately not a fetchable identifier: the institutional
+		// resolver can locate a catalogue or ebook record, but papio cannot
+		// automatically fetch and validate a book PDF from it. The one
+		// exception, an open-access copy found by the open_books source, never
+		// reaches this gate: it is a candidate, fetched and validated before
+		// the pass is exhausted. An ISBN is nevertheless actionable in the
 		// human-assisted institutional flow when that profile has a usable
 		// OpenURL destination.
 		if w.ISBN != "" {
@@ -3891,7 +3896,7 @@ func (s *Service) materializeDeferredIdentityReview(ctx context.Context, jobID s
 }
 
 func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, leaseOwners ...*string) (accepted, parked bool, err error) {
-	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
+	return s.validateCandidateWithConclusiveReview(ctx, row, stored, result, nil,
 		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
 			markErr := s.Jobs.MarkCandidate(ctx, review.binding.CandidateID, "skipped")
 			reviewErr := s.openConclusiveIdentityReview(ctx, row.ID, job.StateValidating, review)
@@ -3901,11 +3906,12 @@ func (s *Service) validateCandidate(ctx context.Context, row *job.Row, stored *j
 
 // validateFetchCandidate is the only validator entry point allowed to defer a
 // conclusive mismatch. Its caller owns the remaining candidate queue and must
-// materialize the returned review before any non-success exit.
+// materialize the returned review before any non-success exit. binding is the
+// live candidate's repository ISBN binding, nil for any source that has none.
 func (s *Service) validateFetchCandidate(
-	ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result,
+	ctx context.Context, row *job.Row, stored *job.Candidate, result fetch.Result, binding *resolver.ISBNBinding,
 ) (accepted, parked bool, deferred *conclusiveIdentityReview, err error) {
-	accepted, parked, err = s.validateCandidateWithConclusiveReview(ctx, row, stored, result,
+	accepted, parked, err = s.validateCandidateWithConclusiveReview(ctx, row, stored, result, binding,
 		func(ctx context.Context, row *job.Row, review *conclusiveIdentityReview) (bool, error) {
 			// Keep the candidate in its durable fetching status until this pass
 			// either binds the review or discards it for a later outcome.
@@ -3923,6 +3929,7 @@ func (s *Service) validateCandidateWithConclusiveReview(
 	row *job.Row,
 	stored *job.Candidate,
 	result fetch.Result,
+	binding *resolver.ISBNBinding,
 	onConclusiveReview conclusiveIdentityReviewHandler,
 	leaseOwners ...*string,
 ) (accepted, parked bool, err error) {
@@ -3972,13 +3979,18 @@ func (s *Service) validateCandidateWithConclusiveReview(
 		s.notifyParked(ctx, row.ID, job.StateNeedsReview)
 		return false, true, nil
 	}
+	// A repository-bound candidate (open_books) is judged against its record's
+	// title and printed ISBN; the generic report above could only park it.
+	report = s.applyISBNBinding(report, anchor, row, binding)
 	// An embedded file is the only active-content marker on most quarantined
 	// papers, because publisher PDFs routinely bundle one supplementary
 	// attachment. Strip it and re-validate the rewrite: that removes the risk
 	// instead of asking a human to accept it, and the review below still fires
 	// whenever the rewrite fails or the file carries anything else.
 	if sanitized, sanitizedReport, ok := s.sanitizeEmbeddedFiles(ctx, row, stored, result, report); ok {
-		result, report = sanitized, sanitizedReport
+		// The rewrite is what will be adopted, so the repository binding is
+		// applied to ITS text, not carried over from the original's.
+		result, report = sanitized, s.applyISBNBinding(sanitizedReport, anchor, row, binding)
 		// A review bound the sanitized rewrite when the first pass made one.
 		operatorAccepted = operatorAccepted || (acceptedSHA256 != "" && strings.EqualFold(acceptedSHA256, result.SHA256))
 	}

@@ -7,6 +7,7 @@ package work
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -31,13 +32,26 @@ func (w Work) HasIdentifier() bool {
 // HasFetchableIdentifier reports whether this work carries an identifier some
 // acquisition route can actually resolve to full text.
 //
-// ISBN is deliberately excluded even though HasIdentifier counts it. No
-// automatic resolver consumes an ISBN as a full-text key — an institutional
-// OpenURL built from it reaches a catalogue record or DRM'd ebook reader, not
-// a PDF papio can automatically validate. Explicit human-assisted institutional
-// handoff may still use ISBN book metadata without changing this predicate.
+// ISBN is deliberately excluded even though HasIdentifier counts it. An ISBN
+// names an edition, and the only editions papio can fetch are the rare open
+// ones: just the open_books resolver consumes it, and only for a work whose
+// sole strong identifier is the ISBN (OpenBooksEligible). An institutional
+// OpenURL built from an ISBN reaches a catalogue record or DRM'd ebook reader,
+// not a PDF papio can automatically validate. Explicit human-assisted
+// institutional handoff may still use ISBN book metadata without changing
+// this predicate.
 func (w Work) HasFetchableIdentifier() bool {
 	return w.DOI != "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != ""
+}
+
+// OpenBooksEligible reports whether the open-book ISBN resolver may act on this
+// work: an ISBN is present and no other strong identifier is. An ISBN names a
+// whole edition, and a chapter that also has a DOI must be fetched as the
+// chapter (ownership treats ISBN as non-identifying for the same reason,
+// ADR-0008), so a work that carries any fetchable identifier is never looked up
+// by its ISBN.
+func (w Work) OpenBooksEligible() bool {
+	return w.ISBN != "" && !w.HasFetchableIdentifier()
 }
 
 // Describe renders a short human label for logs/CLI (never secret-bearing).
@@ -173,6 +187,114 @@ func NormalizeISBN(raw string) (string, error) {
 		return "", fmt.Errorf("invalid ISBN %q", raw)
 	}
 	return s, nil
+}
+
+var (
+	isbnParentheticalRE = regexp.MustCompile(`\([^)]*\)`)
+	isbnLabelRE         = regexp.MustCompile(`(?i)\bisbn(?:-1[03])?:?`)
+	isbnListSeparatorRE = regexp.MustCompile(`[;,/|\n]+`)
+)
+
+// ISBNsIn lists every ISBN a free-text catalogue value names, in order of
+// appearance, each in NormalizeISBN form. Repository records carry the field
+// as written by a cataloguer: "9789240114487 (electronic version)", an
+// "ISBN 978-92-4-011448-7" label, or two editions in one value. A parenthetical
+// qualifier, an ISBN label, and list separators are read past; anything that
+// does not normalize is dropped rather than guessed at.
+func ISBNsIn(value string) []string {
+	cleaned := isbnParentheticalRE.ReplaceAllString(value, " ")
+	cleaned = isbnLabelRE.ReplaceAllString(cleaned, " ")
+	var out []string
+	add := func(raw string) {
+		normalized, err := NormalizeISBN(raw)
+		if err == nil && !slices.Contains(out, normalized) {
+			out = append(out, normalized)
+		}
+	}
+	for _, part := range isbnListSeparatorRE.Split(cleaned, -1) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// A hyphenated or spaced ISBN ("978 92 4 011448 7") is one value; two
+		// bare ISBNs in one value are not, so try the whole part first.
+		if normalized, err := NormalizeISBN(part); err == nil {
+			add(normalized)
+			continue
+		}
+		for _, field := range strings.Fields(part) {
+			add(field)
+		}
+	}
+	return out
+}
+
+// SameISBN reports whether two ISBNs name the same edition: equal after
+// NormalizeISBN, or an ISBN-10 and an ISBN-13 whose check digits are valid and
+// which convert to the same 978-prefixed ISBN-13. A value that does not
+// normalize is never the same as anything, including itself.
+func SameISBN(a, b string) bool {
+	na, errA := NormalizeISBN(a)
+	nb, errB := NormalizeISBN(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	if na == nb {
+		return true
+	}
+	ca, okA := ISBN13(na)
+	cb, okB := ISBN13(nb)
+	return okA && okB && ca == cb
+}
+
+// ISBN13 converts a normalized ISBN to its ISBN-13 form. It reports false when
+// the check digit is wrong, because converting an unchecked ISBN-10 would mint
+// a valid-looking ISBN-13 for a number nobody assigned.
+func ISBN13(normalized string) (string, bool) {
+	switch len(normalized) {
+	case 13:
+		for i := range 13 {
+			if normalized[i] < '0' || normalized[i] > '9' {
+				return "", false
+			}
+		}
+		if isbn13CheckDigit(normalized[:12]) != normalized[12] {
+			return "", false
+		}
+		return normalized, true
+	case 10:
+		sum := 0
+		for i := range 10 {
+			digit := int(normalized[i] - '0')
+			switch {
+			case normalized[i] == 'X' && i == 9:
+				digit = 10
+			case normalized[i] < '0' || normalized[i] > '9':
+				return "", false
+			}
+			sum += (10 - i) * digit
+		}
+		if sum%11 != 0 {
+			return "", false
+		}
+		body := "978" + normalized[:9]
+		return body + string(isbn13CheckDigit(body)), true
+	default:
+		return "", false
+	}
+}
+
+// isbn13CheckDigit computes the check digit for a twelve-digit ISBN-13 body.
+func isbn13CheckDigit(body string) byte {
+	sum := 0
+	for i := range 12 {
+		weight := 1
+		if i%2 == 1 {
+			weight = 3
+		}
+		sum += weight * int(body[i]-'0')
+	}
+	return byte('0' + (10-sum%10)%10)
 }
 
 // NormalizeOpenAlex validates a work id (W…). It accepts the "openalex:"

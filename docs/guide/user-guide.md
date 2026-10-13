@@ -1168,8 +1168,8 @@ or retrying the same identifier-less request cannot make it fetchable, so
 re-submit a manual request with `papio acquire --doi <doi>`; for a Zotero item,
 apply `zotio --yes items enrich --missing-doi` and re-run
 `papio acquire --from-zotio`. An ISBN alone is carried into the institutional
-link so a monograph is described as a book, but it is not enough to fetch full
-text.
+link so a monograph is described as a book; it is not a fetchable identifier,
+and the only source that reads it is the open-book lookup described next.
 
 A DOI that **does not exist** is treated the same way. Before opening an
 institutional handoff for a work whose only identifier is a DOI, *papio* asks
@@ -1181,3 +1181,34 @@ with a handoff that could never be completed. An unregistered DOI now settles
 `unavailable` with the reason `doi_not_registered`; correct the DOI and
 re-submit. If the registry itself is unreachable the handoff is offered as
 before, because an outage must not terminate fetchable work.
+
+### ISBN-only requests
+
+`papio acquire --isbn <isbn>` (with no DOI, PMID, arXiv or OpenAlex id) asks
+the `open_books` source for an open-access copy. It searches the DSpace 7
+repositories in `[open_books] dspace_servers` (the World Health Organization's
+IRIS by default) and, when `open_books.oapen = true`, the OAPEN Library. It makes no request at all for a work
+that also has another identifier, because an ISBN names a whole edition and a
+book chapter must be fetched as the chapter.
+
+A repository record becomes a candidate only when all of these hold:
+
+- the record's own ISBN field lists the ISBN you asked for (a search also
+  returns documents that merely mention the number, and *papio* discards them);
+- the record carries an open licence statement, or the repository is open
+  access by definition (OAPEN);
+- the record holds exactly one PDF in its ORIGINAL bundle. A record with several
+  PDFs, or with none, is refused rather than guessed at.
+
+Most ISBNs are commercial books with no open copy anywhere, and for those the
+lookup finds nothing: the job ends as described above. When a copy is found,
+*papio* still checks the file. You gave no title to compare, so the
+repository's title is used. The file is accepted without review only when its
+front matter prints the ISBN and also prints the complete title, every word
+including short words and numbers, as its own lines (not inside a sentence and
+not under a "references" or "see also" heading). A file that does not is
+parked for review (`needs_review`), never accepted on the repository's word
+alone, so a different edition of the same title is parked.
+A title or authors you supplied are never replaced: a title you gave is
+the title the file must carry, and authors you gave keep the normal review rules
+in force.

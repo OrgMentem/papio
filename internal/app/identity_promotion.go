@@ -5,6 +5,7 @@ import (
 	"context"
 
 	"papio/internal/job"
+	"papio/internal/pdf"
 	"papio/internal/resolver"
 	"papio/internal/work"
 )
@@ -178,6 +179,59 @@ func validationTarget(anchor job.SubmittedIdentity, row *job.Row) work.Work {
 		return work.Work{}
 	}
 	return row.Work
+}
+
+// applyISBNBinding re-judges the identity of a file fetched under a repository's
+// ISBN binding (resolver.ISBNBinding). The generic validator compared the file
+// with an ISBN-only anchor that names no title, which can only park a book; this
+// compares it with the repository record's title and requires the document to
+// print the bound ISBN too (pdf.MatchISBNBoundIdentity).
+//
+// It changes nothing unless every precondition holds: the candidate carries a
+// binding, validation reached the identity stage, the requester's ISBN is the
+// bound one, and the requester names no other strong identifier. The binding is
+// in-memory evidence of one fetch, so a candidate reached any other way (a
+// browser adoption, a reused review) is validated exactly as before.
+//
+// Only what the requester SUBMITTED is the requester's claim. The title, authors
+// and year columns of an attested job's work request are also where an
+// exact-echo candidate's metadata is promoted to (FillWorkMetadata), and this
+// source's records are promoted that way, so the record's own title and creators
+// would otherwise read back as if the requester had asked for them. A title the
+// requester did supply is never replaced by the record's, and authors the
+// requester supplied keep the article rules in force.
+func (s *Service) applyISBNBinding(report pdf.ValidationReport, anchor job.SubmittedIdentity, row *job.Row, binding *resolver.ISBNBinding) pdf.ValidationReport {
+	// Only a Review is ever re-judged. A generic Pass is kept exactly as it was,
+	// and a Reject stays a Reject: this can resolve a parked book, never
+	// overturn a verdict the article rules reached on their own.
+	if binding == nil || report.Identity.Result != pdf.IdentityReview ||
+		!report.Payload.OK || !report.Structural.Valid || report.Text.NeedsReview {
+		return report
+	}
+	target := validationTarget(anchor, row)
+	if !target.OpenBooksEligible() || !work.SameISBN(target.ISBN, binding.ISBN) {
+		return report
+	}
+	if anchor.Attested {
+		if !anchor.Fields["title"] {
+			target.Title = ""
+		}
+		if !anchor.Fields["authors"] {
+			target.Authors = nil
+		}
+		if !anchor.Fields["year"] {
+			target.Year = 0
+		}
+	}
+	if target.Title == "" {
+		target.Title = binding.Title
+	}
+	// Adopt the bound judgement only when it upgrades the review to a Pass; any
+	// other outcome leaves the generic Review (and its evidence) in place.
+	if decision := pdf.MatchISBNBoundIdentity(report.Text.Excerpt, target, binding.ISBN, s.Config.PDF.TitleMatchThreshold); decision.Result == pdf.IdentityPass {
+		report.Identity = decision
+	}
+	return report
 }
 
 // sameWorkIdentity compares identity-bearing fields only.

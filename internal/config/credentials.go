@@ -229,6 +229,7 @@ func (c Config) clone() Config {
 		c.Library.Sources[i].Argv = slices.Clone(c.Library.Sources[i].Argv)
 	}
 	c.Discovery.Sources = slices.Clone(c.Discovery.Sources)
+	c.OpenBooks.DSpaceServers = slices.Clone(c.OpenBooks.DSpaceServers)
 	c.IgnoredKeys = slices.Clone(c.IgnoredKeys)
 	if c.Agent != nil {
 		agent := *c.Agent

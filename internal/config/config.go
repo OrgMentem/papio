@@ -53,6 +53,7 @@ const (
 	SourceCrossrefMetadata = "crossref_metadata"
 	SourceRetractionWatch  = "retraction_watch"
 	SourceOpenAIRE         = "openaire"
+	SourceOpenBooks        = "open_books"
 )
 
 // SourceRole is one job papio wires a source into, carried as a bit set in a
@@ -129,6 +130,14 @@ var sourceCatalog = []sourceCatalogEntry{
 	// EffectiveSourcePolicy raises this row only when client credentials move
 	// the source to the authenticated tier.
 	{Name: SourceOpenAIRE, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: OpenAIREKeylessRatePerSec, Burst: 1}},
+	// open_books is the one source keyed on an ISBN, and only for a work whose
+	// sole strong identifier is that ISBN (work.Work.OpenBooksEligible), so it
+	// never runs for a DOI, PMID, arXiv or OpenAlex request. It reads public
+	// open-access repositories with no credential, and ships on because an
+	// ISBN-only work otherwise has no automatic route at all. Pacing is
+	// deliberately slow: a lookup costs up to three requests per repository
+	// and the repositories are small public services, not commercial APIs.
+	{Name: SourceOpenBooks, Roles: RoleAcquisitionResolver, Default: Source{Enabled: true, RatePerSec: 0.5, Burst: 1}},
 }
 
 // validSourceNames indexes sourceCatalog by name for validate(), which runs
@@ -704,6 +713,56 @@ type Discovery struct {
 	Sources []string `toml:"sources"`
 }
 
+// DefaultDSpaceServer is the one DSpace 7 repository the open_books source
+// searches unless the operator lists others: the World Health Organization's
+// IRIS, whose publications are openly licensed (CC BY-NC-SA 3.0 IGO) and which
+// holds ISBN-identified books no other open source indexes. It is the REST
+// root (the host's dspace.server.url); the source appends "/api".
+const DefaultDSpaceServer = "https://iris.who.int/server"
+
+// MaxDSpaceServers bounds dspace_servers: a lookup asks each server in turn,
+// so the list is the multiplier on the requests one ISBN costs.
+const MaxDSpaceServers = 8
+
+// OpenBooks configures the open_books acquisition source (sources.open_books
+// carries its enablement and pacing). It reads open-access book repositories
+// by ISBN: the DSpace 7 servers listed here, and the OAPEN Library.
+type OpenBooks struct {
+	// DSpaceServers are DSpace 7 REST roots, each https (http only for a
+	// loopback host) with no credentials, query or fragment. Only a record
+	// whose own ISBN field equals the requested ISBN and that carries an
+	// open licence statement is ever a candidate, so listing a repository
+	// that also holds restricted items is safe.
+	DSpaceServers []string `toml:"dspace_servers"`
+	// OAPEN turns the OAPEN Library lookup on or off. Every OAPEN book is
+	// open access by definition. It is off by default: its REST API refused
+	// the network it was built on (HTTP 403), so the lookup has never been
+	// verified against the live service.
+	OAPEN bool `toml:"oapen"`
+}
+
+func validateOpenBooks(o OpenBooks) error {
+	if len(o.DSpaceServers) > MaxDSpaceServers {
+		return fmt.Errorf("open_books.dspace_servers lists %d servers, maximum %d", len(o.DSpaceServers), MaxDSpaceServers)
+	}
+	seen := make(map[string]bool, len(o.DSpaceServers))
+	for _, raw := range o.DSpaceServers {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+			return fmt.Errorf("open_books.dspace_servers entry %q is not a plain URL (no credentials, query or fragment)", raw)
+		}
+		if parsed.Scheme != "https" && !loopbackDevURL(raw) {
+			return fmt.Errorf("open_books.dspace_servers entry %q must use https (http is allowed only for a loopback host)", raw)
+		}
+		key := strings.ToLower(parsed.Scheme + "://" + parsed.Host + strings.TrimRight(parsed.Path, "/"))
+		if seen[key] {
+			return fmt.Errorf("open_books.dspace_servers lists %q twice", raw)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
 // Updates configures the optional daily release check.
 type Updates struct {
 	Check bool `toml:"check"`
@@ -863,6 +922,7 @@ type Config struct {
 	Retraction Retraction        `toml:"retraction"`
 	Updates    Updates           `toml:"updates"`
 	Discovery  Discovery         `toml:"discovery"`
+	OpenBooks  OpenBooks         `toml:"open_books"`
 	Actions    Actions           `toml:"actions"`
 	Drive      Drive             `toml:"drive"`
 	Agent      *Agent            `toml:"agent,omitempty"`
@@ -966,8 +1026,9 @@ func Default() Config {
 			CompletionQuietMinutes: 10, CompletionMaxHoldMinutes: 120,
 			StallAfterMinutes: 30,
 		},
-		Hooks:   Hooks{TimeoutSeconds: 120},
-		Sources: defaultSources(),
+		Hooks:     Hooks{TimeoutSeconds: 120},
+		OpenBooks: OpenBooks{DSpaceServers: []string{DefaultDSpaceServer}},
+		Sources:   defaultSources(),
 	}
 }
 
@@ -1358,6 +1419,9 @@ func (c *Config) validate() error {
 	}
 	if c.Hooks.OnReady != "" && (c.Hooks.TimeoutSeconds < 5 || c.Hooks.TimeoutSeconds > 600) {
 		return fmt.Errorf("hooks.timeout_seconds must be in 5..600")
+	}
+	if err := validateOpenBooks(c.OpenBooks); err != nil {
+		return err
 	}
 	if err := c.validateLibrary(); err != nil {
 		return err

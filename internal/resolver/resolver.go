@@ -74,6 +74,34 @@ type Candidate struct {
 	// submitted canonical work. The zero value (AuthoritySearch) is fail-closed:
 	// an untagged or search-derived candidate never promotes identity.
 	Authority EvidenceAuthority
+	// ISBNBinding is set only by a source whose own catalogue record for this
+	// file lists the requested ISBN (open_books). It is in-memory evidence
+	// for PDF validation, never persisted and never an identifier: it lets a
+	// whole-book file be judged against the record's title when the requester
+	// gave an ISBN and no title. Nil for every other source.
+	ISBNBinding *ISBNBinding
+}
+
+// ISBNBinding is a repository's statement that its record for ONE file lists
+// ISBN. The ISBN is the requested one (the source compares before it emits a
+// candidate), Title is the record's own title, and URL is the file the record
+// holds. The statement is about those bytes and no others: a candidate derived
+// from this one (a different URL) does not inherit it, see BoundISBN.
+type ISBNBinding struct {
+	ISBN  string
+	Title string
+	URL   string
+}
+
+// BoundISBN returns the candidate's ISBN binding only while it still describes
+// the candidate's own URL. A copy of the candidate that points somewhere else
+// (landing-page recovery swaps in a citation_pdf_url) carries a binding about a
+// file it no longer names, and gets none.
+func (c Candidate) BoundISBN() *ISBNBinding {
+	if c.ISBNBinding == nil || c.ISBNBinding.URL == "" || c.ISBNBinding.URL != c.URL {
+		return nil
+	}
+	return c.ISBNBinding
 }
 
 // Key is a stable dedupe key for the candidate URL (hash, not the URL itself).
@@ -294,6 +322,9 @@ func ValidateCandidate(c Candidate) error {
 	}
 	if math.IsNaN(c.CostUSD) || math.IsInf(c.CostUSD, 0) || c.CostUSD < 0 {
 		return fmt.Errorf("candidate %s: negative cost", c.Source)
+	}
+	if b := c.ISBNBinding; b != nil && (strings.TrimSpace(b.ISBN) == "" || strings.TrimSpace(b.Title) == "" || b.URL != c.URL) {
+		return fmt.Errorf("candidate %s: ISBN binding needs an ISBN and a title, and must name the candidate's own URL", c.Source)
 	}
 	return nil
 }

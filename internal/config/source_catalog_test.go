@@ -27,6 +27,7 @@ var shippedSourceDefaults = map[string]Source{
 	SourceCrossrefMetadata: {Enabled: true, RatePerSec: 1, Burst: 1},
 	SourceRetractionWatch:  {Enabled: true, RatePerSec: 1, Burst: 1},
 	SourceOpenAIRE:         {Enabled: true, RatePerSec: OpenAIREKeylessRatePerSec, Burst: 1},
+	SourceOpenBooks:        {Enabled: true, RatePerSec: 0.5, Burst: 1},
 }
 
 // shippedSourceRoles is the role declaration papio has shipped, written out
@@ -45,6 +46,7 @@ var shippedSourceRoles = map[string]SourceRole{
 	SourceCrossrefMetadata: RoleMetadataEnricher,
 	SourceRetractionWatch:  RoleRetractionSource,
 	SourceOpenAIRE:         RoleAcquisitionResolver,
+	SourceOpenBooks:        RoleAcquisitionResolver,
 }
 
 func TestDefaultSourcesAreTheShippedBaseline(t *testing.T) {
@@ -105,6 +107,7 @@ func TestAcquisitionRoleOrderIsResolverPrecedence(t *testing.T) {
 		SourceCORE,
 		SourceCrossrefTDM,
 		SourceOpenAIRE,
+		SourceOpenBooks,
 	}
 	if got := SourcesInRole(RoleAcquisitionResolver); !reflect.DeepEqual(got, want) {
 		t.Fatalf("acquisition order = %v, want %v", got, want)

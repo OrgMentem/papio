@@ -11,6 +11,29 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **`papio acquire --isbn` can fetch an open-access book.** A new `open_books`
+  source looks an ISBN up in the open repositories that list it: the DSpace 7
+  servers in `open_books.dspace_servers` (the World Health Organization's IRIS
+  by default) and the OAPEN Library (`open_books.oapen`). It acts only on a work
+  whose sole strong identifier is the ISBN, so a chapter with a DOI is still
+  fetched as the chapter. A record is a candidate only when its own ISBN field
+  lists the requested ISBN, it carries an open licence (or the repository is
+  open access by definition), and its ORIGINAL bundle holds exactly one PDF;
+  a repository search also returns documents that merely mention the number,
+  and a record with several PDFs is refused. The source ships on at
+  0.5 requests/second, and sends the ISBN and your `email` (in the
+  User-Agent) to the repositories. Switch it off with
+  `[sources.open_books] enabled = false`. The new `[open_books]` config table
+  is strict-mode: deploy the binary and the config together. The OAPEN lookup
+  is off by default (`open_books.oapen = true` enables it): OAPEN's REST API
+  refuses some networks (HTTP 403), and the lookup is not yet verified live.
+- **A fetched book is checked against the repository's record, not just the
+  ISBN.** An ISBN-only request has no title for the PDF validator to compare, so
+  a book that was found still parked for review. Now the file is accepted only
+  when its front matter prints the bound ISBN and prints the complete title of
+  the record as its own lines, and parked for review otherwise, so a different
+  edition of the same title is parked. A title or authors you supplied are never
+  replaced.
 - **Webhooks can post to ntfy and Slack.** Set `notify.webhook_format` to
   `ntfy` (plain-text body with Title, Tags and Priority headers; Bearer auth
   works) or `slack` (an incoming-webhook `{"text": ...}` body). `json` stays the
