@@ -84,9 +84,30 @@ func validActionURL(value string) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != ""
 }
 
-// PublisherHandoffURL is derived only from a job's validated DOI. A failed
-// resolver's page or diagnostic cannot supply a replacement navigation URL.
-func PublisherHandoffURL(action job.HumanAction, row job.Row) (string, bool) {
+// OpenAthensRedirectorHost is the OpenAthens link redirector. Its path names
+// the institution's tenant domain and its url query names the destination.
+const OpenAthensRedirectorHost = "go.openathens.net"
+
+// OpenAthensRedirectorURL wraps a DOI landing URL in the institution's
+// OpenAthens redirector: https://go.openathens.net/redirector/<domain>?url=<target>.
+// Only a valid tenant domain builds a URL; the domain is spliced into the path,
+// so it is checked here as well as at config load.
+func OpenAthensRedirectorURL(domain, target string) (string, bool) {
+	if config.ValidateOpenAthensDomain(domain) != nil {
+		return "", false
+	}
+	return "https://" + OpenAthensRedirectorHost + "/redirector/" + domain + "?url=" + url.QueryEscape(target), true
+}
+
+// PublisherHandoffURL is derived only from a job's validated DOI and the
+// institution's configuration. A failed resolver's page or diagnostic cannot
+// supply a replacement navigation URL. With an OpenAthens domain configured
+// the DOI is wrapped in that institution's redirector, a superset of the
+// plain DOI link (the redirector answers with the publisher's own sign-in for
+// the institution and then the article, or the plain DOI where it has no
+// setup). One derivation serves every use of the action — offer, open and
+// safety domain — so they cannot disagree.
+func PublisherHandoffURL(action job.HumanAction, row job.Row, inst config.Institution) (string, bool) {
 	if !job.IsPublisherHandoff(action) {
 		return "", false
 	}
@@ -95,6 +116,11 @@ func PublisherHandoffURL(action job.HumanAction, row job.Row) (string, bool) {
 		return "", false
 	}
 	u := url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}
+	if inst.OpenAthensDomain != "" {
+		if redirected, ok := OpenAthensRedirectorURL(inst.OpenAthensDomain, u.String()); ok {
+			return redirected, true
+		}
+	}
 	return u.String(), true
 }
 
@@ -103,7 +129,10 @@ func PublisherHandoffURL(action job.HumanAction, row job.Row) (string, bool) {
 // constructs a route from the current job and institution profile.
 func ResolveHumanActionURL(action job.HumanAction, row job.Row, instFor func(string) (config.Institution, bool)) (string, bool) {
 	if job.IsPublisherHandoff(action) {
-		return PublisherHandoffURL(action, row)
+		// The profile may lack an OpenURL base yet still name an OpenAthens
+		// domain, so the lookup's availability flag is not consulted.
+		inst, _ := instFor(row.Policy.Resolver)
+		return PublisherHandoffURL(action, row, inst)
 	}
 	if direct, ok := OABrowserHandoffURL(action.Detail); ok {
 		return direct, true

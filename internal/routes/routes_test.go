@@ -4,6 +4,8 @@ package routes
 
 import (
 	"net/url"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -512,9 +514,75 @@ func TestPublisherFirstAdapterMatchesOnlyTheRegistrantPrefix(t *testing.T) {
 		{"10.1176", ""},
 		{"", ""},
 	} {
-		got, ok := PublisherFirstAdapter(tc.doi)
+		got, ok := PublisherFirstAdapter(tc.doi, false)
 		if got != tc.adapter || ok != (tc.adapter != "") {
 			t.Errorf("PublisherFirstAdapter(%q) = %q, %v; want %q", tc.doi, got, ok, tc.adapter)
+		}
+	}
+}
+
+// With an OpenAthens domain the packaged-adapter prefixes join the DOI-first
+// set; without one they stay with the institutional resolver. A prefix with no
+// packaged adapter (10.1287 INFORMS, 10.1007 Springer's measured plain-DOI
+// answer) is never offered first, because the one DOI attempt would be wasted.
+func TestPublisherFirstAdapterOpenAthensAddsPackagedAdapterPrefixes(t *testing.T) {
+	for _, tc := range []struct {
+		doi, adapter string
+	}{
+		{"10.1016/j.jval.2022.04.1227", "sciencedirect"},
+		{"10.1080/0144929x.2019.1578828", "tandfonline"},
+		{"10.1177/0018720814547570", "sage"},
+		{"10.1037/xge0001234", "psycnet"},
+		{"10.1002/example", "wiley"},
+		{"10.1111/example", "wiley"},
+		{"10.1093/example", "oup"},
+		{"10.1017/example", "cambridge"},
+		{"10.1038/example", "nature"},
+		{"https://doi.org/10.1016/j.jval.2022.04.1227", "sciencedirect"},
+		{"10.1176/appi.ajp.2010.09111680", "psychiatryonline"},
+		{"10.1021/acs.jcim.6c00481", "acs"},
+		{"10.1287/isre.2024.0857", ""},
+		{"10.1007/s11121-020-01111-w", ""},
+		{"10.10160/example", ""},
+		{"10.1016", ""},
+		{"", ""},
+	} {
+		got, ok := PublisherFirstAdapter(tc.doi, true)
+		if got != tc.adapter || ok != (tc.adapter != "") {
+			t.Errorf("PublisherFirstAdapter(%q, true) = %q, %v; want %q", tc.doi, got, ok, tc.adapter)
+		}
+		// Without a domain only the three unconditional prefixes match.
+		want := ""
+		switch tc.adapter {
+		case "psychiatryonline", "acs", "science":
+			want = tc.adapter
+		}
+		got, ok = PublisherFirstAdapter(tc.doi, false)
+		if got != want || ok != (want != "") {
+			t.Errorf("PublisherFirstAdapter(%q, false) = %q, %v; want %q", tc.doi, got, ok, want)
+		}
+	}
+}
+
+// Every adapter a DOI-first prefix names must exist in the packaged extension
+// registry: a typo would offer the DOI first to a page no adapter drives.
+func TestPublisherFirstTablesNameRealExtensionAdapters(t *testing.T) {
+	raw, err := os.ReadFile("../../extension/src/adapters/types.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := map[string]bool{}
+	for _, m := range regexp.MustCompile(`(?m)^\s+id: "([a-z0-9-]+)",$`).FindAllStringSubmatch(string(raw), -1) {
+		known[m[1]] = true
+	}
+	if !known["acs"] || !known["nature"] {
+		t.Fatalf("adapter registry scan found %d ids and missed known ones; the pattern is stale", len(known))
+	}
+	for _, table := range [][]struct{ doiPrefix, adapterID string }{publisherFirstTable, openAthensFirstTable} {
+		for _, row := range table {
+			if !known[row.adapterID] {
+				t.Errorf("prefix %s names adapter %q, which the extension does not package", row.doiPrefix, row.adapterID)
+			}
 		}
 	}
 }

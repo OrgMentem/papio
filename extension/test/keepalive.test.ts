@@ -12,6 +12,8 @@ import {
   chromeKeepaliveAPI,
   collectResolverMarkers,
   isAuthenticationURL,
+  isNonLandingURL,
+  isOpenAthensRedirectorURL,
   isEbookCentralSignInRefusalURL,
   keepaliveModeFromStorage,
   KeepaliveManager,
@@ -1674,7 +1676,6 @@ test("Ebook Central's sign-in refusal page is not an authentication page", () =>
   expect(isEbookCentralSignInRefusalURL("https://ebookcentral.proquest.com/auth/lib/EXAMPLE/message.action?code=UNAUTHORIZED")).toBe(true);
   for (const signIn of [
     "https://ebookcentral.proquest.com/auth/lib/example/login.action?returnURL=https%3A%2F%2Febookcentral.proquest.com%2Flib%2Fexample%2Fdetail.action%3FdocID%3D1",
-    "https://go.openathens.net/redirector/example.edu?url=http%3A%2F%2Febookcentral.proquest.com%2Flib%2Fexample%2Fdetail.action%3FdocID%3D1",
     "https://connect.openathens.net/ebrary.com/00000000-0000-0000-0000-000000000000/login?entity=https%3A%2F%2Fidp.example.edu%2Fentity",
     "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=e1s1",
   ]) {
@@ -1689,6 +1690,52 @@ test("Ebook Central's sign-in refusal page is not an authentication page", () =>
     "https://ebookcentral.proquest.com/lib/example/detail.action?docID=1",
   ])
     expect(isEbookCentralSignInRefusalURL(other)).toBe(false);
+});
+
+// `go.openathens.net/redirector/<domain>` is the OpenAthens link redirector.
+// The daemon opens an institution's DOI handoffs there when it has an
+// `openathens_domain`. The URL answers with a server redirect (measured
+// 2026-10-14: 302 to the publisher's own single-sign-on start, or to the plain
+// DOI), so it is a hop. Treated as a wall it would charge the job's sign-in
+// budget, report `auth_pending` and pull the tab to the front before the
+// redirect ran. Everything else on OpenAthens, and every IdP page, stays a wall.
+test("the OpenAthens redirector is a hop, not a sign-in wall", () => {
+  const redirect = (domain: string, doi = "10.1016%2Fj.jval.2022.04.1227") =>
+    `https://go.openathens.net/redirector/${domain}?url=https%3A%2F%2Fdoi.org%2F${doi}`;
+  expect(isOpenAthensRedirectorURL(redirect("example.edu"))).toBe(true);
+  expect(isAuthenticationURL(redirect("example.edu"))).toBe(false);
+  // A tenant domain that spells a login word is still only a tenant domain.
+  expect(isAuthenticationURL(redirect("associates.example.edu"))).toBe(false);
+  expect(isAuthenticationURL(redirect("auth-university.example.edu"))).toBe(false);
+  for (const wall of [
+    "https://login.openathens.net/auth/example.edu/ABC123",
+    "https://connect.openathens.net/example.edu/00000000-0000-0000-0000-000000000000/login?entity=https%3A%2F%2Fidp.example.edu%2Fentity",
+    "https://go.openathens.net/",
+    "https://go.openathens.net/redirector",
+    "https://go.openathens.net/redirector/",
+    "https://go.openathens.net/login",
+    "https://go.openathens.net/auth/example.edu",
+    "https://sp.openathens.net/redirector/example.edu",
+    "https://go.openathens.net.example.org/redirector/example.edu",
+    "https://go.openathens.net:8443/redirector/example.edu",
+    "https://user@go.openathens.net/redirector/example.edu",
+    "http://go.openathens.net/redirector/example.edu",
+    "https://go.openathens.net./redirector/example.edu",
+    "https://idp.example.edu/idp/profile/SAML2/Redirect/SSO?execution=e1s1",
+  ]) {
+    expect(isOpenAthensRedirectorURL(wall)).toBe(false);
+    expect(isAuthenticationURL(wall)).toBe(true);
+  }
+});
+
+// The redirector is exempt from the wall reading, but it is not a place a
+// handoff has arrived: a landing check must still refuse it.
+test("the OpenAthens redirector is neither a wall nor a landing", () => {
+  const redirector = "https://go.openathens.net/redirector/example.edu?url=https%3A%2F%2Fdoi.org%2F10.1000%2Fx";
+  expect(isAuthenticationURL(redirector)).toBe(false);
+  expect(isNonLandingURL(redirector)).toBe(true);
+  expect(isNonLandingURL("https://idp.example.edu/saml/return")).toBe(true);
+  expect(isNonLandingURL("https://www.example-publisher.com/doi/full/10.1000/x")).toBe(false);
 });
 
 test("resolver marker classifier prioritizes sign-out and handles Primo-shaped account markup", () => {

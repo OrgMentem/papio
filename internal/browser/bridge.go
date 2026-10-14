@@ -1675,6 +1675,23 @@ func resolverOrigin(base string) string {
 	return origin
 }
 
+// profileAuthorityDigest is the keyed digest of everything that fixes one
+// institution profile's routing authority; a change bumps the profile revision
+// and so retires evidence and route suppressions earned under the old value.
+// The OpenAthens domain joins it only when set: appending an empty value would
+// change every existing profile's digest, and so bump every revision once on
+// upgrade, for a field those profiles do not use.
+func profileAuthorityDigest(key []byte, name string, inst config.Institution) string {
+	values := []string{
+		name, inst.OpenURLBase, inst.ShibbolethEntityID, inst.ProquestAccountID,
+		inst.LibKeyMode, strconv.FormatInt(inst.LibKeyLibraryID, 10),
+	}
+	if inst.OpenAthensDomain != "" {
+		values = append(values, "openathens_domain", inst.OpenAthensDomain)
+	}
+	return materializationMAC(key, "profile_authority", values...)
+}
+
 func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byte) error {
 	specs := make([]job.InstitutionProfileSpec, 0, len(b.cfg.ResolverNames()))
 	for _, name := range b.cfg.ResolverNames() {
@@ -1684,10 +1701,8 @@ func (b *Bridge) reconcileMaterializationProfiles(ctx context.Context, key []byt
 		}
 		name = resolverProfileKey(name)
 		specs = append(specs, job.InstitutionProfileSpec{
-			ConfiguredName: name,
-			AuthorityDigest: materializationMAC(key, "profile_authority", name,
-				inst.OpenURLBase, inst.ShibbolethEntityID, inst.ProquestAccountID,
-				inst.LibKeyMode, strconv.FormatInt(inst.LibKeyLibraryID, 10)),
+			ConfiguredName:  name,
+			AuthorityDigest: profileAuthorityDigest(key, name, inst),
 			AuthenticationClaimID: materializationMAC(key, "authentication_claim",
 				authenticationEntryIdentity(&b.cfg, name, inst)),
 		})
@@ -8778,8 +8793,9 @@ func (b *Bridge) parkProviderBindingForHuman(ctx context.Context, jobID, outcome
 }
 
 func (b *Bridge) handoffURL(row job.Row, action job.HumanAction) string {
+	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
 	if job.IsPublisherHandoff(action) {
-		target, _ := app.PublisherHandoffURL(action, row)
+		target, _ := app.PublisherHandoffURL(action, row, inst)
 		return target
 	}
 	if target, ok := app.OABrowserHandoffURL(action.Detail); ok {
@@ -8788,13 +8804,21 @@ func (b *Bridge) handoffURL(row job.Row, action job.HumanAction) string {
 	if target, ok := app.DocumentDeliveryRetrievalHandoffURL(action.Detail); ok {
 		return target
 	}
-	inst, _ := b.cfg.InstitutionFor(row.Policy.Resolver)
 	return RouteURL(inst, row.Work)
 }
 
+// publisherSafetyDomain is the one provider fence for every DOI browser route.
+// It names the route class, not the transport: a plain doi.org link and the
+// institution's OpenAthens redirector (app.PublisherHandoffURL) are the same
+// DOI route, so a job's offer, its effect permits and its candidate
+// (candidateSafetyDomain) agree on one value whichever URL carried it, and a
+// config change between two of them cannot split the fence.
+const publisherSafetyDomain = "publisher:doi.org"
+
 func actionSafetyDomain(cfg config.Config, row job.Row, action job.HumanAction) string {
-	if target, ok := app.PublisherHandoffURL(action, row); ok {
-		return hostSafetyDomain("publisher", target)
+	publisherInst, _ := cfg.InstitutionFor(row.Policy.Resolver)
+	if _, ok := app.PublisherHandoffURL(action, row, publisherInst); ok {
+		return publisherSafetyDomain
 	}
 	if target, ok := app.OABrowserHandoffURL(action.Detail); ok {
 		return hostSafetyDomain("oa", target)
@@ -13557,7 +13581,7 @@ func (b *Bridge) candidateSafetyDomain(ctx context.Context, key []byte, profileI
 			continue
 		}
 		if job.IsPublisherHandoff(action) {
-			return "publisher:doi.org", nil
+			return publisherSafetyDomain, nil
 		}
 		url, ok := app.OABrowserHandoffURL(action.Detail)
 		if !ok {

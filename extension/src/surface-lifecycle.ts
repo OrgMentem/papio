@@ -10,7 +10,7 @@
 
 import type { TabGroupInfo, TabInfo, WindowInfo } from "./browser-types";
 import type { NativeRequestResult } from "./correlation";
-import { isAuthenticationURL, type KeepaliveOwnership } from "./keepalive";
+import { isAuthenticationURL, isNonLandingURL, type KeepaliveOwnership } from "./keepalive";
 import {
   isSurfaceBirthRecord,
   migrateTabLedger,
@@ -129,7 +129,7 @@ function surfaceShowedPaper(purpose: string, url: string): boolean {
   } catch {
     return false;
   }
-  return !isAuthenticationURL(url);
+  return !isNonLandingURL(url);
 }
 /** A close transaction's outcome. `removedURL` is set only when papio itself
  * removed the tab, never when the tab was already gone, so a caller that

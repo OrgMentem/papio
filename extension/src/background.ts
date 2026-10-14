@@ -196,6 +196,7 @@ import {
   DEFAULT_RELOAD_SETTLE_MS,
   initKeepalive,
   isAuthenticationURL,
+  isNonLandingURL,
   isEbookCentralSignInRefusalURL,
 } from "./keepalive";
 import type {
@@ -3630,7 +3631,7 @@ export class Bridge {
   }
 
   private resolverOriginHint(rawURL: string | undefined): string | undefined {
-    if (rawURL === undefined || isAuthenticationURL(rawURL)) return undefined;
+    if (rawURL === undefined || isNonLandingURL(rawURL)) return undefined;
     try {
       const parsed = new URL(rawURL);
       const origin = `${parsed.protocol}//${parsed.host}`;
@@ -4770,7 +4771,7 @@ export class Bridge {
       try {
         const tab = await this.deps.tabs.get(entry.tab_id);
         stillUnsuccessful =
-          typeof tab.url !== "string" || isAuthenticationURL(tab.url);
+          typeof tab.url !== "string" || isNonLandingURL(tab.url);
       } catch {
         // Tab gone while this worker was dead: no further event will ever
         // arrive for it. Keep the conservative default so a genuine dead
@@ -14301,7 +14302,7 @@ export class Bridge {
     job: ActiveJob,
     rawURL: string,
   ): boolean {
-    if (job.requires_auth !== true || isAuthenticationURL(rawURL)) return false;
+    if (job.requires_auth !== true || isNonLandingURL(rawURL)) return false;
     try {
       const landing = new URL(rawURL);
       const offered = this.offerURLs.get(job.job_id);
@@ -14594,7 +14595,7 @@ export class Bridge {
             this.deps.now(),
           ));
         if (institutionalSession) return;
-        if (typeof tab.url === "string" && !isAuthenticationURL(tab.url)) {
+        if (typeof tab.url === "string" && !isNonLandingURL(tab.url)) {
           await this.recordOpenAccessLanding(job);
           return;
         }
@@ -17322,7 +17323,7 @@ export class Bridge {
       );
     }
     const successfulLanding =
-      change.status === "complete" && !isAuthenticationURL(url);
+      change.status === "complete" && !isNonLandingURL(url);
     // Navigation-error precedence (dev/adr/0028-surface-lifecycle-ownership.md
     // Slice 1): a
     // failed top-frame load lands here as an unsuccessful document, same as
@@ -18691,7 +18692,7 @@ export class Bridge {
       if (
         live?.url === undefined ||
         live.status === "loading" ||
-        isAuthenticationURL(live.url)
+        isNonLandingURL(live.url)
       )
         return;
       try {
@@ -19305,7 +19306,7 @@ export class Bridge {
     } catch {
       return;
     }
-    if (tab.url === undefined || isAuthenticationURL(tab.url)) return;
+    if (tab.url === undefined || isNonLandingURL(tab.url)) return;
     let host: string;
     try {
       host = new URL(tab.url).hostname;
@@ -19345,7 +19346,7 @@ export class Bridge {
     }
     if (
       currentTab.url === undefined ||
-      isAuthenticationURL(currentTab.url)
+      isNonLandingURL(currentTab.url)
     )
       return false;
     let captured = false;
@@ -19654,7 +19655,7 @@ export class Bridge {
       const tab = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
       if (!authorized()) return false;
       if (tab?.url === undefined || tab.status === "loading") { exitDetail = domDetail("page_binding_failed"); return false; }
-      if (isAuthenticationURL(tab.url)) { exitDetail = domDetail("credentials_required"); return false; }
+      if (isNonLandingURL(tab.url)) { exitDetail = domDetail("credentials_required"); return false; }
       const url = new URL(tab.url);
       if (url.protocol !== "https:" || url.username || url.password) { exitDetail = domDetail("page_binding_failed"); return false; }
       if (entryURL === undefined) entryURL = tab.url;
@@ -19705,7 +19706,7 @@ export class Bridge {
         while (this.deps.now() < until && authorized(true) && navigationAvailable() && !pending.invalid) {
           const tab = await this.deps.tabs.get(job.tab_id).catch(() => undefined);
           if (!authorized(true) || pending.invalid || tab?.id !== job.tab_id || !tab.url ||
-            (tab.url !== pending.sourceURL && tab.url !== pending.destination) || isAuthenticationURL(tab.url)) return false;
+            (tab.url !== pending.sourceURL && tab.url !== pending.destination) || isNonLandingURL(tab.url)) return false;
           const permitted = await this.deps.permissions.contains({ origins: [`https://${new URL(tab.url).hostname}/*`] }).catch(() => false);
           if (!permitted || !authorized(true) || pending.invalid) return false;
           if (tab.status === "loading") { await pause(); continue; }
@@ -19991,7 +19992,7 @@ export class Bridge {
           if (prepared.effect === "navigate") {
             const target = prepared.destination && new URL(prepared.destination);
             if (!target || target.protocol !== "https:" || target.username || target.password || target.origin !== new URL(entryURL!).origin ||
-              isAuthenticationURL(target.href) || visitedURLs.has(target.href)) return;
+              isNonLandingURL(target.href) || visitedURLs.has(target.href)) return;
             destination = target.href;
           }
         }

@@ -11,6 +11,25 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **An OpenAthens domain sends DOI handoffs through your library's redirector.**
+  Set `openathens_domain` (for example `example.edu`: the segment after
+  `go.openathens.net/redirector/` on your library's links) under `[browser]`, or
+  under `[browser.resolvers.<name>]` for one profile. For a DOI whose publisher
+  has a packaged adapter (Elsevier, Taylor & Francis, SAGE, APA, Wiley, Oxford,
+  Cambridge and Nature prefixes, and the three prefixes that were already
+  DOI-first), *papio* now offers
+  `https://go.openathens.net/redirector/<domain>?url=https://doi.org/<doi>` before
+  the institution's OpenURL route. The redirector signs in to the publisher with
+  your identity provider and opens the article, so it works when the library's
+  discovery page renders nothing in a background tab. If that route ends without
+  a PDF (no entitlement, a page *papio* cannot drive, or a missing identity), the
+  job moves to the OpenURL route in a new attempt, once. The URL is built only
+  from the configured domain and the job's validated DOI. A bad domain (a URL,
+  a port, uppercase, a single label) is rejected when the config loads. An
+  explicit `papio actions retry-publisher` uses the redirector too. The new key is
+  strict-mode: deploy the binary before you add it to your config. Papers whose
+  DOI prefix has no packaged adapter, and a DOI the redirector only passes
+  through (measured for 10.1007 and 10.1287), keep the OpenURL route first.
 - **`papio acquire --isbn` can fetch an open-access book.** A new `open_books`
   source looks an ISBN up in the open repositories that list it: the DSpace 7
   servers in `open_books.dspace_servers` (the World Health Organization's IRIS

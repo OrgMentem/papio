@@ -17,6 +17,22 @@ for the full pre-split extension history.
 ## [Unreleased]
 
 ### Added
+- **A handoff at the OpenAthens redirector is a redirect, not a sign-in
+  page.** For an institution whose daemon config sets `openathens_domain`,
+  *papio* opens the paper's DOI through
+  `go.openathens.net/redirector/<domain>`. The redirector answers with a
+  server redirect to the publisher's own sign-in start and then the article.
+  The extension used to read that address as an authentication page, because
+  its host contains `openathens`, and so would not learn it as a resolver and
+  would flag it as a wall in every check that reads the address.
+  `go.openathens.net` under `/redirector/` (https, default port, no userinfo) is
+  now a hop. `login.openathens.net`, `connect.openathens.net`, every other
+  `openathens.net` host and every identity-provider page remain sign-in pages.
+  An extension that predates this change keeps the old reading. Measured with
+  such a build: a handoff offered at the redirector, whose provider hosts name
+  the redirector (the daemon always does this), still opens, charges no
+  sign-in and reports no `auth_pending`, because the page is on the offer's own
+  provider host.
 - **The extension honours a signed adapter suspension from the daemon.** A
   suspended adapter revision stops automatic effects and falls back to
   assisted operation, and the popup says why. Once the extension has applied

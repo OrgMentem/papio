@@ -254,6 +254,31 @@ const AUTH_HOST_SEGMENTS: Record<string, true> = {
   openathens: true,
 };
 
+/** The OpenAthens link redirector for one institution:
+ * `https://go.openathens.net/redirector/<domain>?url=<destination>`. It answers
+ * with a server redirect (to the publisher's own single-sign-on start and then
+ * the article, or to the plain destination), so the URL is a hop, never a page
+ * a person signs in on. The daemon opens its handoffs at this URL for an
+ * institution with an `openathens_domain`. Exact host, https, default port and
+ * the `/redirector/` path only: `login.openathens.net`, `connect.openathens.net`
+ * and every identity-provider page stay sign-in walls. */
+export function isOpenAthensRedirectorURL(rawURL: string): boolean {
+  try {
+    const url = new URL(rawURL);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "go.openathens.net" &&
+      url.port === "" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.pathname.startsWith("/redirector/") &&
+      url.pathname.length > "/redirector/".length
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Shared conservative detector for login/IdP routes. */
 export function isAuthenticationURL(rawURL: string): boolean {
   try {
@@ -261,6 +286,9 @@ export function isAuthenticationURL(rawURL: string): boolean {
     // Duo's tenant-hosted push prompt has no login/auth path segment. It
     // remains a sign-in step, never a provider landing or capture target.
     if (/^api-[a-z0-9]+\.duosecurity\.com$/i.test(url.hostname)) return true;
+    // A redirect hop is not a sign-in step, whatever its tenant domain spells:
+    // a domain such as "associates.example" would otherwise match LOGIN_ROUTE.
+    if (isOpenAthensRedirectorURL(rawURL)) return false;
     if (isEbookCentralSignInRefusalURL(rawURL)) return false;
     const hostnameHasAuthSegment = url.hostname
       .toLowerCase()
@@ -270,6 +298,16 @@ export function isAuthenticationURL(rawURL: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** A URL that is not where a handoff has arrived: a sign-in page, or the
+ * OpenAthens redirector, which is an intermediate hop that is neither a wall
+ * nor a landing. A load that fails at the redirector must still read as a dead
+ * end, and the redirector must never count as session evidence, a capture
+ * target or a page the agent may read. Every check that takes "not an
+ * authentication page" as proof of arrival uses this instead. */
+export function isNonLandingURL(rawURL: string): boolean {
+  return isAuthenticationURL(rawURL) || isOpenAthensRedirectorURL(rawURL);
 }
 
 const EBOOK_CENTRAL_HOST = "ebookcentral.proquest.com";
@@ -1417,7 +1455,7 @@ export class KeepaliveManager {
    * only — it never contributes to configured-origin membership once
    * hello_ack has landed; see originCandidates(). */
   learnResolver(openURL: string): void {
-    if (isAuthenticationURL(openURL)) return;
+    if (isNonLandingURL(openURL)) return;
     try {
       const resolver = new URL(openURL);
       if (resolver.protocol !== "https:") return;
@@ -2286,7 +2324,7 @@ export class KeepaliveManager {
 
   private resolverFromLatestOffer(): URL | undefined {
     const openurl = this.options.latestOpenURL();
-    if (openurl === undefined || isAuthenticationURL(openurl)) return undefined;
+    if (openurl === undefined || isNonLandingURL(openurl)) return undefined;
     try {
       const url = new URL(openurl);
       if (url.protocol !== "https:") return undefined;

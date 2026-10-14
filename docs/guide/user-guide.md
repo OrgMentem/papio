@@ -535,6 +535,37 @@ forward, and flags a single sign-in request. Sign in normally there; once you're
 back, the extension resumes. This keeps you to one login per research session —
 it does not automate your credentials.
 
+### Use your library's OpenAthens link
+
+Some libraries show a resolver page that stays empty in a background tab. If your
+library uses OpenAthens, you can skip that page for papers from publishers *papio*
+has an adapter for. *papio* then opens the paper's DOI through your library's
+OpenAthens redirector. The redirector signs in to the publisher with your
+institution and opens the article.
+
+1. Find your OpenAthens domain. Open a link from your library that goes to a
+   publisher. Look for `go.openathens.net/redirector/<domain>` in the address or in
+   the link itself. The `<domain>` part is the value you need, for example
+   `example.edu`. Your library's help page can also tell you.
+2. Add it to your config. Use the lowercase name only. Do not add `https://`, a
+   slash, a port or a query.
+
+   ```toml
+   [browser]
+   openurl_base_url = "https://example.primo.exlibrisgroup.com/nde/openurl"
+   openathens_domain = "example.edu"
+   ```
+
+   For a named profile, put the same key under `[browser.resolvers.<name>]`.
+3. Update *papio* to a version that knows the key before you save the config. An
+   older *papio* rejects the whole config file when it sees an unknown key.
+
+*papio* offers the redirector link first. If that route ends without a PDF, for
+example because your library has no access or the page changed, *papio* moves the
+paper to your library's OpenURL route. It offers the redirector once for each paper.
+The redirector does not sign you in by itself. If OpenAthens asks you to sign in,
+sign in normally in the tab.
+
 ### Watch the institution session
 
 The popup's **Institution session** card reports the browser-local resolver

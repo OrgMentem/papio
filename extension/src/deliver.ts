@@ -1,6 +1,6 @@
 // Copyright 2026 OrgMentem. Licensed under MIT. See LICENSE.
 
-import { isAuthenticationURL } from "./keepalive";
+import { isNonLandingURL } from "./keepalive";
 import {
   EFFECT_PERMIT_FEATURE,
   PDF_GRAB_REFUSAL_REASONS,
@@ -549,7 +549,7 @@ export function sanitizePageHost(value: string): string | undefined {
   } catch {
     return undefined;
   }
-  if (url.protocol !== "https:" || isAuthenticationURL(url.href)) return undefined;
+  if (url.protocol !== "https:" || isNonLandingURL(url.href)) return undefined;
   const host = url.hostname.toLowerCase();
   if (
     host.length < 3 ||

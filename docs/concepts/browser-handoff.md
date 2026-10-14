@@ -250,12 +250,13 @@ commits any pending dismissals.
 | `openurl_base_url` | Default institution's HTTPS OpenURL resolver base. |
 | `shibboleth_entity_id` | Optional default IdP entity ID for skipping a provider's WAYF selector. |
 | `proquest_account_id` | Optional default ProQuest account ID for the `accountid` append. |
+| `openathens_domain` | Optional default OpenAthens organisation domain (`go.openathens.net/redirector/<domain>`); sends the DOI browser route through the institution's redirector, with the OpenURL route as fallback. |
 | `download_adoption_root` | Root containing the per-job adopted downloads; when empty, *papio* uses `<your download folder>/papio`. It must be a `papio` directory inside the browser's own download directory — steering cannot reach anywhere else. |
 | `action_expiry_seconds` | Browser-offer expiry and the first human-action reminder threshold; later reminders back off per action. |
 
 `[browser.resolvers.<name>]` profiles replace the default institution for a
 selected job. They carry their own `openurl_base_url` and optional
-`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, `libkey_library_id`,
+`shibboleth_entity_id`, `proquest_account_id`, `openathens_domain`, `libkey_mode`, `libkey_library_id`,
 and `document_delivery`; they never inherit a default identity.
 
 ## Permissions and data boundary
@@ -324,9 +325,20 @@ provider's login jump straight to your institution's sign-in page instead of
 stopping at a “Where are you from?” chooser. A ProQuest account ID causes *papio* to append `?accountid=` to
 the resolver link, which can unlock the institution's ProQuest route.
 
+An `openathens_domain` changes the first route for a DOI. *papio* builds
+`https://go.openathens.net/redirector/<domain>?url=https://doi.org/<doi>` from the
+configured domain and the job's validated DOI, never from a page, and offers it
+before the OpenURL route when the publisher behind the DOI has a packaged
+adapter. The redirector is a server redirect: it signs in to the publisher with
+your institution's identity provider and then opens the article. The extension
+treats that URL as a hop, not a sign-in page; `login.openathens.net`,
+`connect.openathens.net` and identity-provider pages remain sign-in pages. When the
+redirector route ends without a PDF, *papio* moves the job to the OpenURL route in
+a new attempt. An explicit `papio actions retry-publisher` uses the redirector too.
+
 For multiple libraries, define `[browser.resolvers.<name>]` profiles. Every
 named profile carries its own `openurl_base_url` and optional
-`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, `libkey_library_id`,
+`shibboleth_entity_id`, `proquest_account_id`, `openathens_domain`, `libkey_mode`, `libkey_library_id`,
 and `document_delivery`. A named profile never inherits
 the default profile's login identity, so a job stays with the institution that
 was selected for it. The complete key constraints and profile syntax are in the

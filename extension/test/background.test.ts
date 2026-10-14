@@ -2905,6 +2905,35 @@ test("closing a filed paper's sign-in surface raises no toast", async () => {
   expect(internals.toastPending()).toBeUndefined();
 });
 
+// The OpenAthens redirector is an intermediate hop, not a paper: a filed job's
+// ordinary surface that sits at the redirector when it closes must not be
+// offered back, or Reopen would deliver a redirect instead of the paper.
+test("closing a filed paper's surface at the OpenAthens redirector raises no toast", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabIDs } = await seedFiledContent(h, {
+    jobIDs: ["job_filed_redirector"],
+    workWindow: { state: "minimized", focused: false },
+  });
+  h.tabs.patch(tabIDs[0]!, {
+    url: "https://go.openathens.net/redirector/example.edu?url=https%3A%2F%2Fdoi.org%2F10.1000%2Fx",
+    status: "complete",
+  });
+  const internals = h.bridge as unknown as {
+    noteFiledJob: (jobID: string) => void;
+    toastPending(): unknown;
+  };
+  internals.noteFiledJob("job_filed_redirector");
+
+  const from = h.port.posted.length;
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  await answerCloseRequests(h, from, 1, "unclaimed");
+  expect(await reconciling).toEqual({ closed: 1 });
+  expect(h.timers.filter((timer) => timer.ms === 1_500)).toHaveLength(0);
+  expect(internals.toastPending()).toBeUndefined();
+});
+
 // Measured live 2026-09-23: about twenty-four tabs in papio's group against two
 // ledger records. Primo's full-text link and ScienceDirect's "View PDF" open
 // children of papio's tab, Chrome groups them with it, and papio never recorded
@@ -3789,11 +3818,16 @@ test("an Ebook Central sign-in refusal after OpenAthens reports rate_limited, no
   const driveTimeout = h.timers.find((timer) => timer.ms === 180_000);
   expect(driveTimeout).toBeDefined();
 
-  // The resolver hands the tab to the institution's OpenAthens redirector.
+  // The resolver hands the tab to the institution's OpenAthens redirector. The
+  // redirector is a server redirect, not a sign-in page: it spends no sign-in.
   await h.tabs.userNavigate(
     tabID,
     "https://go.openathens.net/redirector/example.edu?url=http%3A%2F%2Febookcentral.proquest.com%2Flib%2Fexample%2Fdetail.action%3FdocID%3D1",
   );
+  expect(findByJob(h.backend.store, jobID)?.status).not.toBe("auth_pending");
+  expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
+  // With no OpenAthens session, the redirect ends on OpenAthens' sign-in page.
+  await h.tabs.userNavigate(tabID, "https://login.openathens.net/auth/example.edu/ABC123");
   expect(findByJob(h.backend.store, jobID)?.status).toBe("auth_pending");
   const afterSignInStarted = h.frames().length;
 
@@ -28982,4 +29016,111 @@ test("a suspended safety domain withholds autonomous effects from a job on that 
   await armTermsGates(h);
   await h.bridge.requestTermsConsent("accept");
   expect(termsFlags(h)).toEqual({ job_ctl_domain_gen: true, job_ctl_domain_beta: false });
+});
+
+// The daemon opens an institution's DOI handoff at its OpenAthens redirector
+// (`openathens_domain`). The redirector answers with a server redirect, so a
+// tab sitting at that URL is a hop: it must spend no sign-in, report no
+// `auth_pending` and not pull the tab forward. Offers carry the redirector as
+// their own provider host, exactly as a plain `doi.org` offer carries doi.org.
+test("a handoff offered at the OpenAthens redirector is not treated as a sign-in wall", async () => {
+  const jobID = "job_openathens_redirector";
+  const redirector =
+    "https://go.openathens.net/redirector/example.edu?url=https%3A%2F%2Fdoi.org%2F10.1016%2Fj.jval.2022.04.1227";
+  const h = makeHarness();
+  const offer = jobOfferForHosts(jobID, ["go.openathens.net"], redirector) as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["requires_auth"] = true;
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: [] }));
+  await h.port.inbound(offer);
+  const opened = await h.bridge.openHandoff(jobID);
+  expect(opened.ok).toBe(true);
+  const tabID = findByJob(h.backend.store, jobID)!.tab_id;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+
+  await h.tabs.userNavigate(tabID, redirector);
+  await h.tabs.completeNavigation(tabID, redirector);
+  expect(findByJob(h.backend.store, jobID)?.status).not.toBe("auth_pending");
+  expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
+  expect(h.backend.store.authAttempts?.[jobID]).toBeUndefined();
+
+  // The redirect ends on the institution's sign-in page: that one is a wall.
+  await h.tabs.userNavigate(tabID, "https://login.openathens.net/auth/example.edu/ABC123");
+  expect(findByJob(h.backend.store, jobID)?.status).toBe("auth_pending");
+});
+
+// A load that fails at the OpenAthens redirector is a dead end, not a landing.
+// The redirector is exempt from the sign-in-wall reading, but it is an
+// intermediate hop: if its document settles after a failed top-frame load, the
+// navigation_error marker must still reach the daemon, and a restart must keep
+// the durable marker, exactly as for a failed load that settles on a sign-in page.
+const REDIRECTOR_DEAD_END =
+  "https://go.openathens.net/redirector/example.edu?url=https%3A%2F%2Fdoi.org%2F10.1016%2Fj.jval.2022.04.1227";
+
+test("navigation_error survives the document settling on the OpenAthens redirector", async () => {
+  const jobID = "job_claim_naverr_redirector";
+  const candidateID = "cand_naverr_redir01";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?naverr=redirector`,
+  );
+
+  const framesBeforeError = h.port.posted.length;
+  await h.webNavigation.emitError(tabID);
+  await h.tabs.completeNavigation(tabID, REDIRECTOR_DEAD_END);
+
+  expect(h.frames().some((frame) => frame.type === "auth_pending")).toBe(false);
+  const observation = await h.port.waitForFrame(
+    "claim_observation",
+    framesBeforeError,
+  );
+  expect(observation.payload["event_kind"]).toBe("navigation_error");
+});
+
+test("a navigation_error marker is kept across a restart when the tab sits on the OpenAthens redirector", async () => {
+  const jobID = "job_scenario5_teardown_redirector";
+  const candidateID = "cand_scenario5_redir";
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: [coldClaimJob(jobID)] },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?s5td=redirector`,
+  );
+
+  // The worker dies after the top-frame error, before the document settles.
+  await h.webNavigation.emitError(tabID);
+  h.tabs.patch(tabID, { url: REDIRECTOR_DEAD_END, status: "complete" });
+
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+
+  expect(restarted.frames().some((f) => f.type === "auth_pending")).toBe(false);
+  const observation = await restarted.port.waitForFrame("claim_observation");
+  expect(observation.payload["event_kind"]).toBe("navigation_error");
+  expect(observation.job_id).toBe(jobID);
 });

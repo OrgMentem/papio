@@ -106,11 +106,43 @@ var publisherFirstTable = []struct {
 	{doiPrefix: "10.1126", adapterID: "science"},
 }
 
+// openAthensFirstTable names DOI registrant prefixes whose publisher page a
+// packaged extension adapter drives and which are offered first only when the
+// institution has an OpenAthens domain. The route is the OpenAthens redirector
+// (go.openathens.net/redirector/<domain>?url=https://doi.org/<doi>), which
+// answers with the publisher's own single-sign-on start for the institution
+// and then the article page, so an entitled paper reaches its page without
+// the library's discovery layer. A prefix belongs here only when the adapter's
+// hosts are where the redirector lands: a destination with no packaged adapter
+// would spend the one DOI offer on a page papio cannot drive, so it is left
+// to the institutional resolver. Measured 2026-10-14 against a live tenant:
+// 10.1016 (Elsevier, through ScienceDirect), 10.1080, 10.1177, 10.1037,
+// 10.1002, 10.1093, 10.1017 and 10.1038 each answered 302 to that publisher's
+// SSO start for the tenant's identity provider. 10.1111 shares Wiley's host
+// with 10.1002 and is covered by the same adapter. 10.1007 and 10.1287 were
+// measured and answered the plain DOI (the redirector had no SSO setup for
+// them), so they have no gain over the resolver and stay out.
+var openAthensFirstTable = []struct {
+	doiPrefix string
+	adapterID string
+}{
+	{doiPrefix: "10.1016", adapterID: "sciencedirect"},
+	{doiPrefix: "10.1080", adapterID: "tandfonline"},
+	{doiPrefix: "10.1177", adapterID: "sage"},
+	{doiPrefix: "10.1037", adapterID: "psycnet"},
+	{doiPrefix: "10.1002", adapterID: "wiley"},
+	{doiPrefix: "10.1111", adapterID: "wiley"},
+	{doiPrefix: "10.1093", adapterID: "oup"},
+	{doiPrefix: "10.1017", adapterID: "cambridge"},
+	{doiPrefix: "10.1038", adapterID: "nature"},
+}
+
 // PublisherFirstAdapter reports the packaged adapter that drives doi's
 // publisher landing page when the DOI route must be offered before the
-// institution's resolver. Only the registrant prefix is matched; a malformed
-// DOI never matches.
-func PublisherFirstAdapter(doi string) (string, bool) {
+// institution's resolver. openAthens says the institution has an OpenAthens
+// domain, which adds the openAthensFirstTable prefixes. Only the registrant
+// prefix is matched; a malformed DOI never matches.
+func PublisherFirstAdapter(doi string, openAthens bool) (string, bool) {
 	canonical, ok := canonicalDOI(doi)
 	if !ok {
 		return "", false
@@ -122,6 +154,13 @@ func PublisherFirstAdapter(doi string) (string, bool) {
 	for _, route := range publisherFirstTable {
 		if prefix == route.doiPrefix {
 			return route.adapterID, true
+		}
+	}
+	if openAthens {
+		for _, route := range openAthensFirstTable {
+			if prefix == route.doiPrefix {
+				return route.adapterID, true
+			}
 		}
 	}
 	return "", false

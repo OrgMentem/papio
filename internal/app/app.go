@@ -2296,9 +2296,13 @@ const PublisherFirstEventKind = "handoff.publisher_first"
 
 // publisherFirstAdapter reports the packaged adapter that should receive this
 // job's DOI before the institution's resolver, when the job has not already
-// had that offer.
+// had that offer. An institution with an OpenAthens domain also gets its DOI
+// offered first for the prefixes in routes.PublisherFirstAdapter's OpenAthens
+// table: the offer is then the institution's redirector (PublisherHandoffURL).
 func (s *Service) publisherFirstAdapter(ctx context.Context, row *job.Row) (string, bool) {
-	adapterID, ok := routes.PublisherFirstAdapter(row.Work.DOI)
+	inst, _ := s.Config.InstitutionFor(row.Policy.Resolver)
+	openAthens := inst.OpenAthensDomain != "" && config.ValidateOpenAthensDomain(inst.OpenAthensDomain) == nil
+	adapterID, ok := routes.PublisherFirstAdapter(row.Work.DOI, openAthens)
 	if !ok {
 		return "", false
 	}

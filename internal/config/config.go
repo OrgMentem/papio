@@ -302,6 +302,12 @@ type Browser struct {
 	// ProquestAccountID is the institution's ProQuest account id used to unlock
 	// ProQuest's OpenURL link-resolver; empty disables.
 	ProquestAccountID string `toml:"proquest_account_id,omitempty"`
+	// OpenAthensDomain is the default institution's OpenAthens organisation
+	// domain, the `<domain>` in `go.openathens.net/redirector/<domain>`. When
+	// set, papio sends the DOI browser route through that redirector, which
+	// signs in to the publisher with the institution's identity provider; empty
+	// disables it. A bare lowercase DNS name, never a URL.
+	OpenAthensDomain string `toml:"openathens_domain,omitempty"`
 	// LibKeyMode selects the default institution's LibKey routing: "" or
 	// "off" disables it; "link" routes DOI/PMID handoffs through the
 	// documented keyless LibKey.io institution link ahead of the bare
@@ -370,6 +376,9 @@ type Institution struct {
 	// ProquestAccountID unlocks this institution's ProQuest link-resolver;
 	// empty disables the accountid append for this profile.
 	ProquestAccountID string `toml:"proquest_account_id,omitempty"`
+	// OpenAthensDomain is this profile's OpenAthens organisation domain; empty
+	// disables the OpenAthens redirector route for this profile.
+	OpenAthensDomain string `toml:"openathens_domain,omitempty"`
 	// LibKeyMode selects this profile's LibKey routing: "" or "off"
 	// disables it; "link" routes DOI/PMID handoffs through the keyless
 	// LibKey.io institution link ahead of the bare OpenURL resolver
@@ -1268,6 +1277,11 @@ func (c *Config) validate() error {
 	if c.Browser.ProquestAccountID != "" && (len(c.Browser.ProquestAccountID) > 64 || !proquestAccountIDRE.MatchString(c.Browser.ProquestAccountID)) {
 		return fmt.Errorf("browser.proquest_account_id must be digits (max 64)")
 	}
+	if c.Browser.OpenAthensDomain != "" {
+		if err := ValidateOpenAthensDomain(c.Browser.OpenAthensDomain); err != nil {
+			return fmt.Errorf("browser.openathens_domain %w", err)
+		}
+	}
 	if err := validateLibKey(c.Browser.LibKeyMode, c.Browser.LibKeyLibraryID); err != nil {
 		return fmt.Errorf("browser.%w", err)
 	}
@@ -1307,6 +1321,11 @@ func (c *Config) validate() error {
 		}
 		if inst.ProquestAccountID != "" && (len(inst.ProquestAccountID) > 64 || !proquestAccountIDRE.MatchString(inst.ProquestAccountID)) {
 			return fmt.Errorf("browser.resolvers.%s.proquest_account_id must be digits (max 64)", name)
+		}
+		if inst.OpenAthensDomain != "" {
+			if err := ValidateOpenAthensDomain(inst.OpenAthensDomain); err != nil {
+				return fmt.Errorf("browser.resolvers.%s.openathens_domain %w", name, err)
+			}
 		}
 		if err := validateLibKey(inst.LibKeyMode, inst.LibKeyLibraryID); err != nil {
 			return fmt.Errorf("browser.resolvers.%s.%w", name, err)
@@ -1597,6 +1616,23 @@ var firefoxExtensionIDRE = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+
 
 var resolverNameRE = regexp.MustCompile(`^[a-z0-9]+$`)
 var proquestAccountIDRE = regexp.MustCompile(`^[0-9]+$`)
+
+// openAthensDomainRE matches a bare lowercase DNS name of at least two labels:
+// letters, digits and hyphens, no label starting or ending with a hyphen.
+var openAthensDomainRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+// ValidateOpenAthensDomain checks an OpenAthens organisation domain, the
+// `<domain>` in `go.openathens.net/redirector/<domain>`. It is spliced into a
+// URL path, so it must be a bare lowercase DNS name: no scheme, slash, port,
+// query, userinfo, whitespace or percent escape. The error reads as the tail of
+// a "browser.openathens_domain " message. The URL builder calls this too, so a
+// value that bypassed config loading still cannot reach a URL.
+func ValidateOpenAthensDomain(domain string) error {
+	if len(domain) > 253 || !openAthensDomainRE.MatchString(domain) {
+		return fmt.Errorf("must be a bare lowercase DNS name such as example.edu (letters, digits, hyphens and dots; no scheme, slash, port or query)")
+	}
+	return nil
+}
 
 // validateLibKey rejects unusable LibKey routing config instead of letting it
 // sit silently dead (the [sources.unpaywal] lesson: config that parses cleanly
@@ -2044,6 +2080,7 @@ func (c *Config) InstitutionFor(name string) (Institution, bool) {
 			OpenURLBase:        c.Browser.OpenURLBase,
 			ShibbolethEntityID: c.Browser.ShibbolethEntityID,
 			ProquestAccountID:  c.Browser.ProquestAccountID,
+			OpenAthensDomain:   c.Browser.OpenAthensDomain,
 			LibKeyMode:         c.Browser.LibKeyMode,
 			LibKeyLibraryID:    c.Browser.LibKeyLibraryID,
 			DocumentDelivery:   c.Browser.DocumentDelivery,

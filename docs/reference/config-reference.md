@@ -210,6 +210,7 @@ the configuration change.
 | `openurl_base_url` | string URL | empty | Legacy/default institutional OpenURL resolver base. It must use `https://` and must not contain a `#` fragment or userinfo (named profiles follow the same rule); an empty value prevents default-profile institutional routing. Existing query parameters are preserved when *papio* adds citation metadata. Prefer the institution's direct-link-enabled endpoint so a single electronic service bypasses the resolver menu. |
 | `shibboleth_entity_id` | string URL | empty | Default institution's Shibboleth IdP entityID (`https://`). When set, a provider login wall is auto-routed to this IdP (skipping the WAYF selector). Empty disables federated login-routing for the default profile. |
 | `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, *papio* appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
+| `openathens_domain` | string domain | empty | Default institution's OpenAthens organisation domain: the `<domain>` in `go.openathens.net/redirector/<domain>`, such as `example.edu`. It must be a bare lowercase DNS name of at least two labels (letters, digits, hyphens and dots; no scheme, slash, port or query) and is rejected at load otherwise. When set, *papio* sends the DOI browser route through `https://go.openathens.net/redirector/<domain>?url=https://doi.org/<doi>`. That redirector signs in to the publisher with your institution's identity provider and then opens the article, so a paper whose publisher has a packaged adapter reaches its page without the library's discovery layer. *papio* offers it first and falls back to the `openurl_base_url` route when it parks without a PDF. Empty disables it. Built only from this value and the job's validated DOI — never from a page. Because config is strict-mode, deploy the binary that knows this key before you add it. See [Use your library's OpenAthens link](../guide/user-guide.md#use-your-librarys-openathens-link). |
 | `libkey_mode` | string | empty | LibKey routing for the default institution: empty or `off` disables it; `link` routes DOI/PMID handoffs through the keyless `libkey.io/libraries/<id>/<doi-or-pmid>` institution link ahead of the bare OpenURL resolver, falling back to OpenURL for works without a DOI or PMID and whenever LibKey is unavailable. `api` is reserved and rejected (not implemented). Requires `libkey_library_id` when set to `link`. |
 | `libkey_library_id` | integer | `0` | The institution's numeric Third Iron library id — the number in its BrowZine/LibKey.io URL (`…/libraries/<id>/…`). Required (positive) when `libkey_mode = "link"`; setting it without `link` mode is rejected rather than left silently dead. |
 | `default_resolver` | string | empty | Named `[browser.resolvers.<name>]` profile used when a request omits `resolver` (e.g. `papio acquire` without `--resolver`). Empty preserves the historical default institution. Must name a configured profile — the implicit `default` profile (when `openurl_base_url` is set) or a `[browser.resolvers.<name>]` key; an unconfigured name is rejected at load. |
@@ -235,7 +236,7 @@ Named resolver profiles are per-institution tables keyed by a lowercase
 alphanumeric name; `default` is reserved for the implicit top-level
 institution and is rejected at load if used as a profile key. Each carries
 its own OpenURL base and, optionally, the same `shibboleth_entity_id`,
-`proquest_account_id`, `libkey_mode`, and `libkey_library_id` fields as the
+`proquest_account_id`, `openathens_domain`, `libkey_mode`, and `libkey_library_id` fields as the
 default `[browser]` institution — so a multi-institution user routes each
 job's login to the right library instead of inheriting the default's
 identity:
@@ -245,6 +246,7 @@ identity:
 openurl_base_url = "https://library.example.edu/discovery/openurl?institution=EXAMPLE"
 shibboleth_entity_id = "https://idp.example.edu/idp/shibboleth"  # optional
 proquest_account_id = "12345"                                     # optional
+openathens_domain = "example.edu"                                 # optional
 libkey_mode = "link"                                              # optional
 libkey_library_id = 1234                                          # required for link mode
 ```
@@ -280,7 +282,7 @@ acquisition candidate falls back to the profile's plain OpenURL route, the
 same behavior as before this table existed. The identical table nests under
 `[browser.resolvers.<name>.document_delivery]` for a named institution
 profile, alongside that profile's own `openurl_base_url`,
-`shibboleth_entity_id`, `proquest_account_id`, `libkey_mode`, and
+`shibboleth_entity_id`, `proquest_account_id`, `openathens_domain`, `libkey_mode`, and
 `libkey_library_id`.
 
 | Key | Type | Default | Effect and constraints |

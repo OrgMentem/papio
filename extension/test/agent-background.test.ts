@@ -1902,9 +1902,9 @@ for (const change of ["referrer", "old-time", "future-time", "extension", "holde
   });
 
 // Measured 2026-09-23 on job_6137e775227b19bb52eb79bf5d: the drive went through
-// the OpenAthens redirector (a genuine sign-in hop, so auth_pending), landed on
+// OpenAthens' sign-in (a genuine sign-in hop, so auth_pending), landed on
 // this SAGE Research Methods chapter, and stopped with "page or authority became
-// stale" 66 ms after its capture. No start reached the daemon. Two sibling UNE
+// stale" 66 ms after its capture. No start reached the daemon. Two sibling
 // jobs with the same resolver-only provider key were active, and all drives
 // share one effect slot. A busy sibling is contention, not a stale attempt.
 const sageURL = "https://methods.sagepub.com/book/edvol/researching-childrens-experience/chpt/researching-child-developmental-psychology";
@@ -1922,7 +1922,7 @@ for (const holder of ["effect slot", "provider lease"] as const)
       await h.tabs.onUpdated.emit(tabID, { status: "complete" }, h.tabs.snapshot(tabID)!);
       await flush();
     };
-    await navigate("https://go.openathens.net/redirector/une.edu.au?url=https%3A%2F%2Fdoi.org%2F10.4135%2F9781849209823.n2");
+    await navigate("https://login.openathens.net/auth/example.edu/ABC123");
     expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
     const providerKey = "unknown-provider";
     if (holder === "effect slot") Reflect.set(h.bridge, "effectGovernorOwner", { jobID: "job_sibling", token: "sibling" });
