@@ -121,7 +121,7 @@ func Verify(envelopeBytes []byte, key ed25519.PublicKey) (*Verified, error) {
 	}
 	var envelope Envelope
 	if err := decodeStrict(envelopeBytes, &envelope); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrEnvelope, err)
+		return nil, fmt.Errorf("%w: %w", ErrEnvelope, err)
 	}
 	if envelope.Schema != EnvelopeSchema {
 		return nil, fmt.Errorf("%w: schema %q, want %q", ErrEnvelope, envelope.Schema, EnvelopeSchema)
@@ -154,7 +154,7 @@ func Verify(envelopeBytes []byte, key ed25519.PublicKey) (*Verified, error) {
 func parsePayload(payload []byte) (*Verified, error) {
 	var doc Document
 	if err := decodeStrict(payload, &doc); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDocument, err)
+		return nil, fmt.Errorf("%w: %w", ErrDocument, err)
 	}
 	if doc.Schema != DocumentSchema {
 		return nil, fmt.Errorf("%w: schema %q, want %q", ErrDocument, doc.Schema, DocumentSchema)
@@ -173,7 +173,7 @@ func parsePayload(payload []byte) (*Verified, error) {
 		return nil, fmt.Errorf("%w: both suspension lists are required", ErrDocument)
 	}
 	if err := protocol.ValidateSuspensionSets("document", doc.SuspendedRevisions, doc.SuspendedSafetyDomains); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDocument, err)
+		return nil, fmt.Errorf("%w: %w", ErrDocument, err)
 	}
 	return &Verified{
 		Document: doc,
