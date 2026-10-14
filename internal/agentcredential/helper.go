@@ -164,10 +164,10 @@ func serveHelper(in io.Reader, out io.Writer, b backend) error {
 	default:
 		return errors.New("credential helper request has an unknown operation")
 	}
-	switch sanitize(err) {
-	case nil:
+	switch err = sanitize(err); {
+	case err == nil:
 		resp.Status = statusOK
-	case ErrNotFound:
+	case errors.Is(err, ErrNotFound):
 		resp.Status, resp.Key = statusNotFound, ""
 	default:
 		resp.Status, resp.Key = statusUnavailable, ""

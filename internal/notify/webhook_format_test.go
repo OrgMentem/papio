@@ -4,6 +4,7 @@ package notify
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -191,7 +192,7 @@ func TestRouterTestWebhookUsesConfiguredFormat(t *testing.T) {
 	}
 
 	none := NewRouter(RouterOptions{})
-	if _, err := none.TestWebhook(context.Background(), CategoryRequestOutcome); err != ErrWebhookNotConfigured {
+	if _, err := none.TestWebhook(context.Background(), CategoryRequestOutcome); !errors.Is(err, ErrWebhookNotConfigured) {
 		t.Fatalf("TestWebhook without webhook = %v, want ErrWebhookNotConfigured", err)
 	}
 	if none.WebhookFormat() != "" {

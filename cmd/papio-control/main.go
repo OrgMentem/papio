@@ -155,7 +155,7 @@ func sign(args []string, stdout, stderr io.Writer, now func() time.Time) error {
 		return fmt.Errorf("signed envelope does not verify: %w", err)
 	}
 	if *out != "" {
-		return os.WriteFile(*out, envelope, 0o644)
+		return os.WriteFile(*out, envelope, 0o644) //nolint:gosec // G306: a signed envelope is published to every daemon; it holds no secret.
 	}
 	_, err = stdout.Write(envelope)
 	return err
