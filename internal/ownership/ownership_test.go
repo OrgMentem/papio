@@ -597,25 +597,44 @@ func TestSatisfiesEntityRejectsKnownMismatches(t *testing.T) {
 	}
 }
 
-func TestIndexClaimsPrefersDOIRegardlessOfQueryOrder(t *testing.T) {
+// TestIndexClaimsPrefersStrongestIdentifierRegardlessOfQueryOrder pins the
+// rank DOI > PMID > arXiv for the identifier a claim reports as Matched.
+// Decide refuses an arXiv match for a published request, so recording the
+// arXiv id when a stronger one also matched would re-acquire a held work.
+// Same-rank matches must also be order-independent.
+func TestIndexClaimsPrefersStrongestIdentifierRegardlessOfQueryOrder(t *testing.T) {
 	doi := Identifier{KindDOI, "10.1234/abc"}
+	otherDOI := Identifier{KindDOI, "10.1234/xyz"}
+	pmid := Identifier{KindPMID, "12345"}
 	arxiv := Identifier{KindArXiv, "2401.00001"}
-	index := BuildIndex([]Entry{{
-		Identifiers:     []Identifier{doi, arxiv},
-		Artifact:        ArtifactPresent,
-		ArtifactVersion: VersionPublished,
-	}})
-	for _, identifiers := range [][]Identifier{{doi, arxiv}, {arxiv, doi}} {
-		query := Query{Identifiers: identifiers, DesiredVersion: VersionPublished}
-		claims := index.Claims("refs", query)
-		if len(claims) != 1 {
-			t.Fatalf("claims = %d, want one claim: %+v", len(claims), claims)
-		}
-		if got := claims[0].Matched; got != doi {
-			t.Fatalf("Matched = %+v, want DOI %+v", got, doi)
-		}
-		if decision := Decide(query, WorkResult{Claims: claims}); !decision.Suppress {
-			t.Fatalf("DOI match must suppress a published request: %+v", decision)
-		}
+	for _, tc := range []struct {
+		name         string
+		weak, strong Identifier
+	}{
+		{"doi over arxiv", arxiv, doi},
+		{"doi over pmid", pmid, doi},
+		{"pmid over arxiv", arxiv, pmid},
+		{"same rank picks the smaller key", otherDOI, doi},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			index := BuildIndex([]Entry{{
+				Identifiers:     []Identifier{tc.weak, tc.strong},
+				Artifact:        ArtifactPresent,
+				ArtifactVersion: VersionPublished,
+			}})
+			for _, identifiers := range [][]Identifier{{tc.weak, tc.strong}, {tc.strong, tc.weak}} {
+				query := Query{Identifiers: identifiers, DesiredVersion: VersionPublished}
+				claims := index.Claims("refs", query)
+				if len(claims) != 1 {
+					t.Fatalf("claims = %d, want one claim: %+v", len(claims), claims)
+				}
+				if got := claims[0].Matched; got != tc.strong {
+					t.Fatalf("query %v: Matched = %+v, want %+v", identifiers, got, tc.strong)
+				}
+				if decision := Decide(query, WorkResult{Claims: claims}); !decision.Suppress {
+					t.Fatalf("query %v: a %s match must suppress a published request: %+v", identifiers, claims[0].Matched.Kind, decision)
+				}
+			}
+		})
 	}
 }

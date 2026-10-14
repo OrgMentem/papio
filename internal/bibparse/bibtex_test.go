@@ -151,6 +151,12 @@ func TestParseBibTeXEmptySourceSentinel(t *testing.T) {
 			wantErr:       "bibtex: entry at byte 0: missing comma after citation key",
 			wantNoEntries: false,
 		},
+		{
+			name:          "metadata-only input is not an empty source",
+			input:         "@comment{ignored}\n@string{j = \"Journal\"}\n@preamble{\"x\"}",
+			wantErr:       "bibtex: no entries found",
+			wantNoEntries: false,
+		},
 	}
 
 	for _, tt := range tests {

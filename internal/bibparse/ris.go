@@ -1,13 +1,15 @@
 package bibparse
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
 
 // parseRIS extracts acquisition identity from RIS tagged records.
 func parseRIS(data []byte) ([]Record, error) {
-	lines := strings.Split(strings.TrimPrefix(string(data), "\ufeff"), "\n")
+	input := strings.TrimPrefix(string(data), "\ufeff")
+	lines := strings.Split(input, "\n")
 	var records []Record
 	var current risRecord
 	inRecord := false
@@ -64,7 +66,13 @@ func parseRIS(data []byte) ([]Record, error) {
 	finish()
 
 	if len(records) == 0 {
-		return nil, errRISNoRecords
+		// Only blank input is a complete empty source. Lines outside a TY…ER
+		// record are skipped above, so non-empty input with no record is
+		// content papio cannot read, never proof that a library is empty.
+		if strings.TrimSpace(input) == "" {
+			return nil, errRISNoRecords
+		}
+		return nil, errors.New("ris: no records found")
 	}
 	return records, nil
 }

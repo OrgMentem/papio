@@ -347,3 +347,201 @@ func TestEnumerateLibraryRecordsRunsCommandSource(t *testing.T) {
 		t.Fatalf("records = %+v, want an error from a failing command", records)
 	}
 }
+
+func (f *commandFixture) waitForRun() {
+	f.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for f.runs() == 0 {
+		if time.Now().After(deadline) {
+			f.t.Fatal("the command never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestCommandProviderCloseIdleReturnsNil(t *testing.T) {
+	fixture := newCommandFixture(t)
+	provider := fixture.provider(newFakeClock(), nil)
+	if err := provider.Close(); err != nil {
+		t.Fatalf("Close on an idle provider: %v", err)
+	}
+	if got := fixture.runs(); got != 0 {
+		t.Fatalf("runs = %d, want 0", got)
+	}
+}
+
+func TestCommandProviderLookupAfterCloseFailsClosed(t *testing.T) {
+	fixture := newCommandFixture(t)
+	provider := fixture.provider(newFakeClock(), nil)
+	queries := []ownership.Query{doiQuery("10.1000/one")}
+	// A fresh cached result must not outlive Close.
+	if _, health := provider.Lookup(context.Background(), queries); !health.Complete {
+		t.Fatalf("warm-up health = %+v, want complete", health)
+	}
+	if err := provider.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, health := provider.Lookup(context.Background(), queries)
+	if health.Complete || health.FailureCode != ownership.FailureTimeout {
+		t.Fatalf("health = %+v, want incomplete timeout", health)
+	}
+	if got := fixture.runs(); got != 1 {
+		t.Fatalf("a lookup after Close started the command: runs = %d, want 1", got)
+	}
+}
+
+// Close must cancel a running command and wait for it, well inside the pipe
+// wait a stuck command could cost, and leave no live child behind.
+func TestCommandProviderCloseCancelsRunningCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fixture")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ticker.sh")
+	body := "#!/bin/sh\nwhile :; do echo t >> \"$(dirname \"$0\")/ticks\"; sleep 0.01; done\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := NewProvider(config.LibrarySource{
+		Name:   "papis-live",
+		Kind:   config.LibraryKindCommand,
+		Argv:   []string{"/bin/sh", script},
+		Format: "bibtex",
+		Claim:  config.LibraryClaimPDFPresent,
+	}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := provider.(*commandProvider)
+
+	lookupDone := make(chan ownership.SourceHealth, 1)
+	go func() {
+		_, health := cp.Lookup(context.Background(), []ownership.Query{doiQuery("10.1000/one")})
+		lookupDone <- health
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "ticks")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the command never started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- cp.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(commandWaitDelay):
+		t.Fatal("Close did not return promptly")
+	}
+	select {
+	case health := <-lookupDone:
+		if health.Complete {
+			t.Fatalf("health = %+v, want incomplete after Close", health)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pending lookup never returned")
+	}
+
+	// The child is gone when its tick file stops growing.
+	ticks := filepath.Join(dir, "ticks")
+	before, err := os.Stat(ticks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	after, err := os.Stat(ticks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatal("the command kept running after Close")
+	}
+}
+
+func TestCommandProviderLookupWithCancelledContextDoesNotStartRun(t *testing.T) {
+	fixture := newCommandFixture(t)
+	provider := fixture.provider(newFakeClock(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	defer func() {
+		provider.mu.Lock()
+		defer provider.mu.Unlock()
+		if provider.runs != 0 || provider.pending != nil {
+			t.Errorf("a cancelled lookup registered a run: runs = %d", provider.runs)
+		}
+	}()
+
+	claims, health := provider.Lookup(ctx, []ownership.Query{doiQuery("10.1000/one")})
+	if health.Complete || health.FailureCode != ownership.FailureTimeout {
+		t.Fatalf("health = %+v, want incomplete timeout", health)
+	}
+	if len(claims) != 1 || len(claims[0]) != 0 {
+		t.Fatalf("claims = %+v, want none", claims)
+	}
+	if got := fixture.runs(); got != 0 {
+		t.Fatalf("runs = %d, want 0 for a cancelled lookup", got)
+	}
+}
+
+// One caller giving up must not cancel the shared run or starve the others.
+func TestCommandProviderCancelledWaiterReturnsWhileSharedRunFinishes(t *testing.T) {
+	fixture := newCommandFixture(t)
+	fixture.setMode("wait")
+	provider := fixture.provider(newFakeClock(), nil)
+	t.Cleanup(func() { _ = provider.Close() })
+	queries := []ownership.Query{doiQuery("10.1000/one")}
+
+	type result struct {
+		claims [][]ownership.Claim
+		health ownership.SourceHealth
+	}
+	live := make(chan result, 1)
+	go func() {
+		claims, health := provider.Lookup(context.Background(), queries)
+		live <- result{claims, health}
+	}()
+	fixture.waitForRun()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelled := make(chan result, 1)
+	go func() {
+		claims, health := provider.Lookup(ctx, queries)
+		cancelled <- result{claims, health}
+	}()
+	// Give the lookup time to block on the pending run before cancelling it.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case got := <-cancelled:
+		if got.health.Complete || got.health.FailureCode != ownership.FailureTimeout {
+			t.Fatalf("cancelled health = %+v, want incomplete timeout", got.health)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled lookup did not return while the run was pending")
+	}
+	select {
+	case got := <-live:
+		t.Fatalf("live lookup returned before the command finished: %+v", got.health)
+	default:
+	}
+
+	writeFile(t, fixture.dir, "release", "")
+	select {
+	case got := <-live:
+		if !got.health.Complete || len(got.claims[0]) != 1 {
+			t.Fatalf("live lookup = %+v / %+v, want the shared run's complete result", got.health, got.claims)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the live lookup never received the shared run's result")
+	}
+	if got := fixture.runs(); got != 1 {
+		t.Fatalf("runs = %d, want 1 shared run", got)
+	}
+}

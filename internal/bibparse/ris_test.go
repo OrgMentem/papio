@@ -1,6 +1,7 @@
 package bibparse
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -121,12 +122,28 @@ func TestParseRIS(t *testing.T) {
 	}
 }
 
-func TestParseRISEmpty(t *testing.T) {
-	_, err := parseRIS([]byte("\ufeff\r\n \r\n"))
-	if err == nil {
-		t.Fatal("parseRIS() error = nil, want no records error")
+// TestParseRISEmptySourceSentinel pins which inputs are a complete empty
+// source: holdings snapshots read ErrNoEntries as "this library holds
+// nothing", so non-empty input without a record must stay an ordinary error.
+func TestParseRISEmptySourceSentinel(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		wantNoEntries bool
+	}{
+		{name: "blank input is a complete empty source", input: "\ufeff\r\n \r\n", wantNoEntries: true},
+		{name: "text without a TY record is not an empty source", input: "@article{key, title = {BibTeX}}\n"},
+		{name: "tags outside a record are not an empty source", input: "TI  - Orphan title\nDO  - 10.1000/orphan\n"},
 	}
-	if err.Error() != "ris: no records found" {
-		t.Errorf("parseRIS() error = %q, want %q", err, "ris: no records found")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseRIS([]byte(tt.input))
+			if err == nil || err.Error() != "ris: no records found" {
+				t.Fatalf("parseRIS() error = %v, want %q", err, "ris: no records found")
+			}
+			if got := errors.Is(err, ErrNoEntries); got != tt.wantNoEntries {
+				t.Errorf("errors.Is(err, ErrNoEntries) = %t, want %t", got, tt.wantNoEntries)
+			}
+		})
 	}
 }

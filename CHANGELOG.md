@@ -210,6 +210,12 @@ execution records kept during the initial build.
 - `papio doctor` no longer counts conservative-mode advisories
   (`openurl_available`) as actions waiting on you. They stay open on a finished
   job only to record that an institutional route was not opened.
+- **A RIS holdings file with no record no longer reads as an empty library.**
+  A library source configured as `ris` that held no `TY`…`ER` record (a BibTeX
+  export, say) was taken as a complete, empty library, so every work looked
+  unheld. Only a blank file is an empty library now; other content without a
+  record is a parse failure, so the source's answer is incomplete and skips
+  nothing.
 - **`papio jobs add-component` accepts a supplement from any path.** It copies
   the file into the data directory, like `jobs supply-pdf`, and leaves your
   original in place. Before, it accepted only a file in the job's adoption

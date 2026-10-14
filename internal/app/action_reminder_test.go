@@ -4,6 +4,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -126,27 +127,14 @@ func TestActionReminderManualDownloadNamesManualStep(t *testing.T) {
 // inherited access classification turning a manual replacement into an
 // openable handoff in a reminder.
 func TestActionReminderNamesOpenOnlyForOpenableActions(t *testing.T) {
-	kinds := []string{
-		"openurl_handoff",
-		"manual_download",
-		"verify_identity",
-		"human_auth_required",
-		"terms_acceptance_required",
-		"openurl_available",
-		"downloads_access_required",
-	}
-	for _, kind := range kinds {
+	for _, kind := range humanActionNextSteps {
 		for _, requiresAuth := range []bool{false, true} {
-			authName := "false"
-			if requiresAuth {
-				authName = "true"
-			}
-			t.Run(kind+"/requires_auth="+authName, func(t *testing.T) {
-				action := job.HumanAction{Kind: kind, RequiresAuth: requiresAuth}
+			t.Run(fmt.Sprintf("%s/requires_auth=%t", kind.kind, requiresAuth), func(t *testing.T) {
+				action := job.HumanAction{Kind: kind.kind, RequiresAuth: requiresAuth}
 				message := (actionReminderBatch{
 					jobs: map[string]struct{}{"job": {}}, oldestAge: time.Hour,
 				}).message(reminderBatchIndex(action))
-				if got, want := strings.Contains(message, actionsOpenCommand), HumanActionNextStepFor(action).Command == actionsOpenCommand; got != want {
+				if got, want := strings.Contains(message, actionsOpenCommand), kind.command == actionsOpenCommand; got != want {
 					t.Fatalf("reminder names %q = %t, want %t: %q", actionsOpenCommand, got, want, message)
 				}
 			})

@@ -1044,6 +1044,34 @@ func (fakeDiscoverySourceNoHealth) Search(context.Context, discovery.SearchParam
 	return nil, nil
 }
 
+// readyDiscoveryReport runs doctor against a profile that is OK with a nil
+// discovery source (same shape as TestRunReadyProfilePassesWithoutLeakingSecrets).
+func readyDiscoveryReport(t *testing.T, source discovery.Source) Report {
+	t.Helper()
+	ctx := context.Background()
+	data := storetest.DataDir(t)
+	if err := os.Chmod(data, 0o700); err != nil {
+		t.Fatalf("chmod data_dir: %v", err)
+	}
+	db, err := store.Open(ctx, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = data
+	cfg.Email = "researcher@example.test"
+	cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg.Path, []byte("access_mode='conservative'"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tool := executable(t)
+	return Run(ctx, cfg, db, pdf.Capability{
+		PDFCPU: true, PDFInfo: tool, PDFToText: tool, PDFToPPM: tool, Tesseract: tool,
+	}, tool, source)
+}
+
 func TestRunReportsDiscoveryBackendFailure(t *testing.T) {
 	cfg := config.Default()
 	cfg.DataDir = t.TempDir()
@@ -1066,8 +1094,24 @@ func TestRunReportsDiscoveryBackendFailure(t *testing.T) {
 	if got.Remediation == "" {
 		t.Fatalf("discovery check = %#v, want a remediation", got)
 	}
-	if report.OK {
-		t.Fatalf("a Warn-only report must still be OK: %+v", report)
+
+	// A discovery Warn must not flip an otherwise-OK report.
+	healthy := readyDiscoveryReport(t, fakeDiscoveryHealth{})
+	if !healthy.OK {
+		t.Fatalf("baseline with healthy discovery must be OK: %+v", healthy)
+	}
+	warned := readyDiscoveryReport(t, source)
+	if !warned.OK {
+		t.Fatalf("a discovery Warn must leave an otherwise-OK report OK: %+v", warned)
+	}
+	var warnedDiscovery Check
+	for _, c := range warned.Checks {
+		if c.Name == "discovery" {
+			warnedDiscovery = c
+		}
+	}
+	if warnedDiscovery.Status != Warn {
+		t.Fatalf("discovery check in ready profile = %#v, want Warn", warnedDiscovery)
 	}
 
 	multiple := fakeDiscoveryHealth{failures: []discovery.BackendFailure{
@@ -1086,18 +1130,30 @@ func TestRunReportsDiscoveryBackendFailure(t *testing.T) {
 }
 
 func TestRunReportsDiscoveryHealthyWhenNoFailures(t *testing.T) {
-	cfg := config.Default()
-	cfg.DataDir = t.TempDir()
-	cfg.Discovery.Sources = []string{config.SourceOpenAlex, config.SourceSemanticScholar}
-	report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", fakeDiscoveryHealth{})
-	var got Check
-	for _, c := range report.Checks {
-		if c.Name == "discovery" {
-			got = c
-		}
-	}
-	if got.Status != Pass || got.Detail != "2 discovery backend(s) configured; all healthy" {
-		t.Fatalf("discovery check = %#v, want Pass naming 2 backends", got)
+	for _, tc := range []struct {
+		name    string
+		sources []string
+		want    string
+	}{
+		{"nil sources count as one backend", nil, "1 discovery backend(s) configured; all healthy"},
+		{"empty sources count as one backend", []string{}, "1 discovery backend(s) configured; all healthy"},
+		{"two sources", []string{config.SourceOpenAlex, config.SourceSemanticScholar}, "2 discovery backend(s) configured; all healthy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.DataDir = t.TempDir()
+			cfg.Discovery.Sources = tc.sources
+			report := Run(context.Background(), cfg, nil, pdf.Capability{}, "", fakeDiscoveryHealth{})
+			var got Check
+			for _, c := range report.Checks {
+				if c.Name == "discovery" {
+					got = c
+				}
+			}
+			if got.Status != Pass || got.Detail != tc.want {
+				t.Fatalf("discovery check = %#v, want Pass %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1518,6 +1574,94 @@ func TestRunDocumentDeliveryPollHealth(t *testing.T) {
 		}
 		if !strings.Contains(health.Remediation, "papio jobs retry") {
 			t.Fatalf("remediation = %q, want it to also name 'papio jobs retry <job-id>' — resume alone does not force an immediate poll", health.Remediation)
+		}
+	})
+
+	// seedLive creates a submitted delivery request and applies the given
+	// poll-health column assignments (e.g. "consecutive_poll_failures = 3").
+	seedLive := func(t *testing.T, db *store.Store, cfg config.Config, job, set string, args ...any) {
+		t.Helper()
+		svc := delivery.New(db, &cfg, nil)
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO work_requests (id, created_at) VALUES (?, ?)`, "wr_"+job, store.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx,
+			`INSERT INTO jobs (id, work_request_id, state, policy_json, created_at, updated_at) VALUES (?, ?, 'queued', '{}', ?, ?)`,
+			job, "wr_"+job, store.Now(), store.Now()); err != nil {
+			t.Fatal(err)
+		}
+		created, err := svc.Create(ctx, delivery.CreateRequest{
+			JobID: job, InstitutionProfile: "default", Provider: "illiad",
+			RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/" + job, GateProfileDigest: "d",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.UpdateState(ctx, created.ID, delivery.StateSubmitted); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB().ExecContext(ctx,
+			`UPDATE delivery_requests SET `+set+` WHERE id = ?`, append(args, created.ID)...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openDB := func(t *testing.T) (*store.Store, config.Config) {
+		t.Helper()
+		data := storetest.DataDir(t)
+		db, err := store.Open(ctx, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return db, documentDeliveryTestConfig(data)
+	}
+	fresh := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+	stale := func() string { return time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano) }
+
+	t.Run("credential rejection fails and names the api_key", func(t *testing.T) {
+		db, cfg := openDB(t)
+		seedLive(t, db, cfg, "poll_cred", `consecutive_poll_failures = 1, last_poll_error_class = ?`, delivery.PollErrorClassCredential)
+		health, ok := find(run(cfg, db), "document_delivery:default:poll_health")
+		if !ok || health.Status != Fail {
+			t.Fatalf("poll_health = %+v, want Fail for a credential rejection", health)
+		}
+		if !strings.Contains(health.Detail, "rejected as unauthorized (401/403)") {
+			t.Fatalf("detail = %q, want the unauthorized (401/403) explanation", health.Detail)
+		}
+		if !strings.Contains(health.Remediation, "verify document_delivery.api_key") {
+			t.Fatalf("remediation = %q, want it to name document_delivery.api_key", health.Remediation)
+		}
+	})
+
+	t.Run("unobservable request warns and wins over degraded in the detail", func(t *testing.T) {
+		db, cfg := openDB(t)
+		seedLive(t, db, cfg, "poll_blind", `last_successful_poll_at = ?`, stale())
+		seedLive(t, db, cfg, "poll_flaky", `consecutive_poll_failures = 3, last_poll_error_class = 'transient_transport', last_successful_poll_at = ?`, fresh())
+		health, ok := find(run(cfg, db), "document_delivery:default:poll_health")
+		if !ok || health.Status != Warn {
+			t.Fatalf("poll_health = %+v, want Warn", health)
+		}
+		if !strings.Contains(health.Detail, "papio cannot observe 1 of 2 live request(s)") {
+			t.Fatalf("detail = %q, want the unobservable count to win over degraded", health.Detail)
+		}
+		if !strings.Contains(health.Remediation, "network/API reachability") {
+			t.Fatalf("remediation = %q, want the reachability remedy", health.Remediation)
+		}
+	})
+
+	t.Run("live requests polling normally pass", func(t *testing.T) {
+		db, cfg := openDB(t)
+		seedLive(t, db, cfg, "poll_ok", `last_successful_poll_at = ?`, fresh())
+		health, ok := find(run(cfg, db), "document_delivery:default:poll_health")
+		if !ok || health.Status != Pass {
+			t.Fatalf("poll_health = %+v, want Pass", health)
+		}
+		if health.Detail != "1 live request(s) polling normally" {
+			t.Fatalf("detail = %q, want the polling-normally detail", health.Detail)
+		}
+		if health.Remediation != "" {
+			t.Fatalf("remediation = %q, want none for a healthy line", health.Remediation)
 		}
 	})
 }

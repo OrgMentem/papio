@@ -143,10 +143,13 @@ func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 		"openurl_handoff",
 		"manual_download",
 		"verify_identity",
+		"unsafe_pdf",
+		"validation_error",
 		"human_auth_required",
 		"terms_acceptance_required",
 		"openurl_available",
-		"downloads_access_required",
+		job.ActionKindDownloadsAccessRequired,
+		job.ActionKindDocumentDelivery,
 	}
 	// Keep the two actions that are supposed to open a browser route explicit.
 	// Deriving the expectation solely from next.Command would make this
@@ -166,11 +169,7 @@ func TestActionGuidanceCommandsApplyToEveryActionKind(t *testing.T) {
 
 	for _, kind := range kinds {
 		for _, requiresAuth := range []bool{false, true} {
-			authName := "false"
-			if requiresAuth {
-				authName = "true"
-			}
-			t.Run(kind+"/requires_auth="+authName, func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/requires_auth=%t", kind, requiresAuth), func(t *testing.T) {
 				action := job.HumanAction{Kind: kind, RequiresAuth: requiresAuth}
 				next := app.HumanActionNextStepFor(action)
 				hintAction := action
