@@ -409,3 +409,63 @@ func consumeCloseAuthorizationsTx(ctx context.Context, q dbtx, bindingIDs []stri
 	}
 	return nil
 }
+
+// OperatorClosedSurfaceJobs names the jobs among jobIDs whose most recent
+// materialization surface was closed by the operator and not replaced since.
+// The caller uses it to keep the daemon from re-offering a sign-in the human
+// just dismissed; only an explicit open, which mints a newer claim, ends it.
+//
+// "Operator closed" is read from two facts the daemon already records, not a
+// new column. The newest claim for the job (any of its candidates, newest
+// created_at then id) is `abandoned`, and the journal holds an applied
+// owner_closed for that claim's binding. The extension reports owner_closed
+// only for a removal papio did not cause, and that contract is the whole
+// discriminator. Close authorizations are deliberately NOT consulted: the
+// daemon never learns that an authorized close executed (the token is consumed
+// by the owner_closed reducer itself and by every terminal claim transition),
+// so an issued, expired or unused token says nothing about who removed the tab,
+// and counting one let a stale scaffold_idle token defeat a genuine operator
+// close. The cost of the other error is bounded: a papio close misreported as
+// owner_closed leaves the action open for an explicit open.
+//
+// A lease-timeout or reconcile abandon writes no owner_closed row, so those
+// retirements keep their automatic re-offer.
+func (js *Store) OperatorClosedSurfaceJobs(ctx context.Context, jobIDs []string) (map[string]bool, error) {
+	var closed map[string]bool
+	for _, jobID := range jobIDs {
+		if strings.TrimSpace(jobID) == "" {
+			continue
+		}
+		var phase, bindingID string
+		err := js.S.DB().QueryRowContext(ctx, `
+			SELECT m.phase, COALESCE(m.binding_id,'')
+			  FROM materialization_claims m
+			  JOIN browser_candidates c ON c.id = m.candidate_id
+			 WHERE c.job_id = ?
+			 ORDER BY m.created_at DESC, m.id DESC
+			 LIMIT 1`, jobID).Scan(&phase, &bindingID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if phase != "abandoned" || bindingID == "" {
+			continue
+		}
+		var operator bool
+		if err := js.S.DB().QueryRowContext(ctx, `
+			SELECT EXISTS (SELECT 1 FROM claim_observation_journal
+			                WHERE binding_id = ? AND event_kind = 'owner_closed')`,
+			bindingID).Scan(&operator); err != nil {
+			return nil, err
+		}
+		if operator {
+			if closed == nil {
+				closed = map[string]bool{}
+			}
+			closed[jobID] = true
+		}
+	}
+	return closed, nil
+}

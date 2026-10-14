@@ -122,7 +122,9 @@ Reaffirmed rules, restated so they survive without the plans that held them:
 - papio does not retain content (amended 2026-09-23, see "Amendment
   2026-09-23" below). A filed, terminal or superseded paper's tab closes
   through the close transaction; only a pinned or moved-out tab is kept, and
-  the tab in front of the operator waits for a later pass.
+  the tab in front of the operator waits for a later pass (*withdrawn
+  2026-10-14*: a close executes immediately or not at all, see "Amendment
+  2026-10-14" below).
 - The forbidden pattern is an unrelated await between check and act, not the one
   authoritative freshness read. No shadow state is reconstructed.
 - The work window is never closed directly. Chrome discards it when its last tab
@@ -168,7 +170,9 @@ These are the invariants the shipped implementation enforces.
 - **Operator cession is causal.** Only pinning a tab or moving it out of
   papio's container cedes it (amended 2026-09-23: activation and a touch
   during a close defer the close instead, so papio's focus tokens are gone).
-  Ambiguity about whether the operator is looking means defer, not cede.
+  Ambiguity about whether the operator is looking means defer, not cede
+  (*withdrawn 2026-10-14*: see "Amendment 2026-10-14" below; ambiguity now
+  means the close does not happen).
 - **Every dead end has a daemon-side disposition.** A navigation error is
   observed before authentication detection, charges no authentication attempt
   and applies no cooldown. Classify exhaustion is reported by the extension with
@@ -212,7 +216,8 @@ link, retry). A cold parked surface closes even on a PDF; the inbox and
 operator pinned or moved out of papio's container is ceded and never closed.
 The tab the operator is looking at right now (the active tab of a focused,
 non-minimized window, or a tab touched during the close) is deferred, never
-ceded, and a later pass closes it. Activating a tab no longer cedes it. Before
+ceded, and a later pass closes it (*withdrawn 2026-10-14*, see "Amendment
+2026-10-14" below). Activating a tab no longer cedes it. Before
 a new or reused surface is recorded for a job, papio retires the job's other
 owned surfaces as `surface_superseded`. When papio closes the tabs of papers it
 filed, one toast per batch offers to reopen them from URLs held in worker
@@ -259,6 +264,105 @@ tab of a binding whose own claim is settled or abandoned, because such a
 binding drives nothing; an unsettled effect permit on that claim still vetoes.
 No enum or wire field changed.
 
+## Amendment 2026-10-14: a sign-in surface is governed by evidence, not by clocks
+
+Measured 2026-10-14 on one handoff job: the operator was mid-sign-in, away in
+an authenticator, and the tab vanished with no message. Two minutes later the
+daemon offered a new tab by itself. Three clocks caused it, and every one of
+them judged the operator instead of observing the sign-in:
+
+- the extension's three-minute handoff drive timeout started when the tab
+  opened, and at expiry detached the job and asked to close the surface as
+  `handoff_parked`;
+- the daemon authorized that close, because only an in-flight provider effect
+  vetoed `handoff_parked` (`internal/browser/bridge.go:surfaceClose`);
+- the close was deferred while the operator was looking at the tab, which left
+  a tombstone, and the five-minute reconcile pass closed it as soon as the
+  operator looked at another application.
+
+The daemon already modelled a bound sign-in as human-paced: the entry lease is
+extended by login, MFA and challenge observations, not by a deadline
+(`internal/job/institutional_evidence.go:AuthenticationEntryBindDeadline`
+bounds only a reservation that never bound). The extension contradicted it.
+
+**Decision.** A sign-in surface has no timer. It lives until evidence ends it:
+the operator closes it, the operator takes it over, the sign-in completes, or
+the operator's own `action_expiry_seconds` passes. The evidence is of four
+kinds, none of which is elapsed time since the tab opened.
+
+- *Presence*: the browser's idle state (active, idle, locked). It gates opening
+  and staleness, never closing.
+- *Attention*: tab activation, window focus, last access. It tells the
+  extension whether the operator is looking. It never decides a close.
+- *Progress*: committed navigations in the sign-in tab. An MFA push approved on
+  a phone moves the tab with no input on the computer, so progress does not
+  depend on presence.
+- *Intent*: the tab removed by something other than papio, or the operator
+  navigating the tab to an unrelated host.
+
+Consequences, by owner:
+
+1. **The drive timeout measures the provider drive only.** It never applies to
+   a tab on an authentication or non-landing URL, and it starts at
+   `auth_returned`, the first provider landing.
+2. **Opening is presence-gated.** A requires-auth offer does not create a tab
+   while the browser is idle or has no non-minimized window. It stays pending,
+   durably, and opens on the transition back to active or on an explicit open.
+3. **Staleness is handled on return, in place.** If the operator returns after
+   a long absence (default 15 minutes, a documented constant) and the tab is
+   still on an authentication host with no navigation since the absence began,
+   the extension re-issues the route in the same tab through the existing
+   retry-route path. It never closes the tab or opens a second one.
+4. **The reconcile pass never closes a sign-in surface that is attended, away
+   or pending.** It repairs ledger and tab inconsistency after a worker
+   restart and nothing else.
+5. **The "defer the close while the operator is looking" rule is withdrawn.**
+   The 2026-09-23 amendments above made a close that met an attended tab leave
+   a tombstone for a later pass. A close that must wait for the operator to
+   look away is the wrong close: it fires at the moment the operator steps away
+   to finish a sign-in. A close now executes immediately or does not happen.
+   This withdraws the deferral for every surface; the content-closing rule of
+   2026-09-23 otherwise stands, and its guards remain pinned or moved-out
+   cession.
+6. **An operator who closes a sign-in tab gets no automatic replacement.** The
+   daemon keeps the action open. Only an explicit open (`papio actions open`,
+   the popup) or a sibling's entitled sign-in mints the next surface. When
+   papio retires a surface the operator used (the action expired), a toast says
+   why.
+
+**Daemon side, defence in depth.**
+
+- `surfaceClose` refuses `handoff_parked` with the structured outcome
+  `not_eligible`, never a raw error, while the binding's claim is `bound`,
+  `route_issued` or `navigated` and the authentication entry lease names that
+  binding in state `reserved` or `human` inside its deadline
+  (`internal/job/institutional_evidence.go:LiveAuthenticationEntryLeaseForBinding`,
+  read-only, so asking never retires a lease). An old extension that still
+  carries the timer therefore cannot close a live sign-in. An in-flight
+  provider effect still vetoes first, exactly as before. Pinned by
+  `internal/browser/surface_signin_presence_test.go:TestSurfaceCloseHandoffParkedRefusedWhileSignInLeaseLive`.
+- The poll no longer re-offers a requires-auth handoff whose surface the
+  operator closed (`internal/browser/bridge.go:operatorClosedSignIns`, built on
+  `internal/job/claim_observations.go:OperatorClosedSurfaceJobs`). "Operator
+  closed" needs no wire field or column. The job's newest materialization claim
+  is `abandoned`, and the journal holds an applied `owner_closed` for its
+  binding. The extension reports `owner_closed` only for a removal papio did
+  not cause, and that contract is the whole discriminator. Close
+  authorizations are not consulted: the daemon never learns that an authorized
+  close executed, so an unused or expired token says nothing about who removed
+  the tab. Applying `owner_closed` also retires the closed surface's own offer
+  from `materializationOffered`, since a lingering offer would read as a new
+  outstanding offer and lift the hold. An explicit open
+  (`focusPending`), an offer already outstanding, and a sibling's entitled
+  sign-in (`reofferPending`) lift the hold. A lease timeout or reconcile abandon
+  writes no `owner_closed`, so those retirements keep the automatic re-offer
+  after `internal/browser/bridge.go:retiredSlotIsCold`. Pinned by
+  `internal/browser/surface_signin_presence_test.go:TestOperatorClosedSignInIsNotAutomaticallyReoffered`
+  and `TestUnusedCloseAuthorizationDoesNotDefeatAnOperatorClose`.
+
+No enum, frame or schema field changed. The extension needs no new
+observation: `owner_closed` and `claim_abandoned` carry the distinction.
+
 ## Acceptance scenarios
 
 These are the scenarios that verify this decision. They are stated here, not in
@@ -286,11 +390,21 @@ a plan, so they cannot vanish.
    restart.
 6. **Operator-active parked tab.** It is never renavigated, and it is not
    closed while it is in front of the operator. Once it is not, and cold, it
-   closes (amended 2026-09-23). Pinning cedes it, and that survives a worker
+   closes (amended 2026-09-23; the deferral was withdrawn 2026-10-14, and a
+   sign-in surface is never closed this way).
+   Pinning cedes it, and that survives a worker
    restart.
 7. **Firefox below version 139.** Group identity degrades to the work window
    without silently becoming work-window ownership. A full event-page teardown
    occurs between every protocol step.
+8. **Operator mid-sign-in, away from the browser** (amended 2026-10-14). The
+   sign-in tab survives any absence. A navigation committed while the browser
+   is idle (an approved MFA push) leads to `auth_returned` and the provider
+   drive, with no close at any point. After a long absence the same tab is
+   renavigated to a fresh route, and one tab exists throughout. An operator
+   close leaves the action open and mints no tab until presence and an
+   explicit open. A worker restart restores the sign-in with no close. The
+   daemon refuses `handoff_parked` while the sign-in lease is live.
 
 Live-only behaviour is deliberately not covered by any suite. Synthesized
 activation is refused by extension gesture tracking, so a handoff smoke run

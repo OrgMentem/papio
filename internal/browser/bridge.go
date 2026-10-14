@@ -1733,6 +1733,28 @@ func (b *Bridge) termsPendingJobs(ctx context.Context, ids []string) (map[string
 	return pending, nil
 }
 
+// operatorClosedSignIns names the requires_auth handoff jobs among ids whose
+// sign-in surface the operator closed and that nothing has since reopened.
+// Three things lift the hold, because each is the operator or fresh evidence
+// speaking: an explicit open (focusPending), an offer already outstanding
+// (inFlight, which an explicit open or a pre-restart grant produced and which
+// must keep being serviced), and a sibling's entitled sign-in (reofferPending,
+// which has already passed the evidence gate). A read failure withholds
+// nothing.
+func (b *Bridge) operatorClosedSignIns(ctx context.Context, ids []string, handoff map[string]job.HumanAction, inFlight map[string]bool) (map[string]bool, error) {
+	candidates := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if action, ok := handoff[id]; ok && action.RequiresAuth &&
+			!b.focusPending[id] && !b.reofferPending[id] && !inFlight[id] {
+			candidates = append(candidates, id)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	return b.jobs.OperatorClosedSurfaceJobs(ctx, candidates)
+}
+
 func (b *Bridge) openHandoffForJob(ctx context.Context, jobID string) (*job.HumanAction, error) {
 	if b.openHandoffForJobFn != nil {
 		return b.openHandoffForJobFn(ctx, jobID)
@@ -2690,9 +2712,10 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 	case "handoff_parked":
 		// The browser is asserting a fact only it can know: it has parked this
 		// handoff and is driving nothing through the surface. papio's own stake
-		// in a surface is an in-flight provider effect, and nothing else - so
-		// that permit is the only legitimate veto here, exactly as it is for
-		// scaffold_idle. The job keeps its open handoff action either way: the
+		// in a surface is an in-flight provider effect and a live sign-in
+		// lease on this binding (checked below) - so those are the only
+		// vetoes here; the permit alone is the veto for scaffold_idle. The job
+		// keeps its open handoff action either way: the
 		// paper is still waiting for the operator, it just no longer holds a
 		// browser tab hostage while it waits. `papio actions open` and the
 		// inbox mint a fresh surface the moment the operator wants one.
@@ -2709,6 +2732,29 @@ func (b *Bridge) surfaceClose(ctx context.Context, p *protocol.SurfaceCloseReque
 		eligible = permit == nil || permit.ClaimID != claim.ID
 		if !eligible {
 			result.Detail = "the binding's provider effect is still in flight"
+			break
+		}
+		// A sign-in the operator is working through is not parked, whatever
+		// the browser believes. The entry lease is the daemon's own record of
+		// that: reserved or human, naming this binding, inside its human-paced
+		// renewal window (a bound sign-in is extended by §4.5 renewals on
+		// login_started/mfa/challenge). An extension timer that fired three
+		// minutes after the tab opened closed a tab mid-sign-in this way
+		// (measured 2026-10-14), so the claim is refused here and an old
+		// extension cannot do it either. The phase set is every phase in
+		// which a bound surface can be on the sign-in route; `parked` is the
+		// daemon's own release of the slot and `claimed` has no binding yet.
+		switch claim.Phase {
+		case "bound", "route_issued", "navigated":
+			_, live, leaseErr := b.jobs.LiveAuthenticationEntryLeaseForBinding(ctx, claim.BindingID)
+			if leaseErr != nil {
+				result.Outcome, result.Detail = "error", "authentication entry state is unavailable"
+				return frame()
+			}
+			if live {
+				eligible = false
+				result.Detail = "a sign-in is in progress on this surface"
+			}
 		}
 	case "scaffold_idle":
 		if claim.Phase == "claimed" || claim.Phase == "bound" {
@@ -3176,6 +3222,17 @@ func (b *Bridge) claimObservation(ctx context.Context, jobID string, p *protocol
 		}
 		if err := b.jobs.RecordEvent(ctx, owner, "browser.surface_closed", nil); err != nil {
 			log.Printf("papio: recording browser.surface_closed for %s: %v", owner, err)
+		}
+		// The closed surface's own offer is tracked in materializationOffered
+		// and counted by outstandingOffers. Left there, it reads as a fresh
+		// outstanding offer: it lifts the operator-closed hold and, once the
+		// entry slot goes cold, automatic admission re-offers. Retire it with
+		// the surface it created. Only an owner_closed that really abandoned a
+		// live claim does this, so a late report for an older binding never
+		// drops a newer offer.
+		if p.EventKind == "owner_closed" {
+			b.clearMaterializationOffer(owner)
+			b.materializationScheduleVersion++
 		}
 	}
 	return b.claimObservationAck(jobID, protocol.ClaimObservationAckPayload{
@@ -11220,6 +11277,14 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	if termsErr != nil {
 		log.Printf("papio: reading open terms actions for browser offers: %v", termsErr)
 	}
+	// A sign-in surface the OPERATOR closed is an answer, not a fault: the
+	// action stays open and only an explicit open mints the next surface.
+	// Re-offering it on a clock put a tab back in front of someone who had just
+	// dismissed it (measured 2026-10-14, two minutes after the tab vanished).
+	operatorClosed, closedErr := b.operatorClosedSignIns(ctx, candidateIDs, handoff, inFlight)
+	if closedErr != nil {
+		log.Printf("papio: reading operator-closed sign-in surfaces for browser offers: %v", closedErr)
+	}
 	// Slice 4 (dev/adr/0028-surface-lifecycle-ownership.md): claim-paced automatic
 	// candidate offers ride the same maxOutstandingOffers transport budget
 	// as legacy/direct-route offers, so their admission is computed and
@@ -11261,7 +11326,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 		automaticCandidates := make([]job.BrowserCandidateDescriptor, 0, len(scheduled))
 		for _, candidate := range scheduled {
 			if b.focusPending[candidate.JobID] ||
-				(!termsPending[candidate.JobID] && (!deferReoffers || !b.reofferPending[candidate.JobID])) {
+				(!termsPending[candidate.JobID] && !operatorClosed[candidate.JobID] && (!deferReoffers || !b.reofferPending[candidate.JobID])) {
 				automaticCandidates = append(automaticCandidates, candidate)
 			}
 		}
@@ -11280,7 +11345,7 @@ func (b *Bridge) poll(ctx context.Context, scheduled []job.BrowserCandidateDescr
 	heldIDs := make(map[string]bool)
 jobLoop:
 	for _, id := range candidateIDs {
-		if (deferReoffers && b.reofferPending[id] || termsPending[id]) && !b.focusPending[id] {
+		if (deferReoffers && b.reofferPending[id] || termsPending[id] || operatorClosed[id]) && !b.focusPending[id] {
 			continue
 		}
 		if hasSettledDownload(b.pendingDownloads, id) || b.offered[id] {

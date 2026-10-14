@@ -226,6 +226,16 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **The daemon no longer lets a sign-in tab be parked or re-offered under the
+  operator.** The browser extension could ask to park a handoff three minutes
+  after its tab opened, even while you were still signing in (away in an
+  authenticator, say), and the daemon authorized the close. It now refuses a
+  `handoff_parked` close while the sign-in it is tracking on that tab is live,
+  so an older extension cannot close a live sign-in either. Separately, when you
+  close a sign-in tab yourself, *papio* keeps the action open and no longer
+  opens a replacement tab on its own two minutes later; `papio actions open` (or
+  the popup) opens the next one. A sign-in that ended some other way, such as a
+  lapsed lease, is still re-offered as before. See ADR-0028.
 - `papio doctor` no longer counts conservative-mode advisories
   (`openurl_available`) as actions waiting on you. They stay open on a finished
   job only to record that an institutional route was not opened.

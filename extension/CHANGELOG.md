@@ -16,6 +16,36 @@ for the full pre-split extension history.
 
 ## [Unreleased]
 
+### Changed
+- **A sign-in tab is no longer closed on a clock.** The three-minute drive
+  timeout used to start when the tab opened, park the paper, detach the job and
+  ask to close the tab; the five-minute reconcile pass then removed it as soon
+  as you looked at another app, in the middle of an authenticator prompt
+  (measured 2026-10-14). The model is now event-driven. A sign-in surface goes
+  offered, open, attended, away and, on `auth_returned`, hands over to the
+  provider drive. The drive timeout never applies while the tab shows sign-in,
+  and restarts at `auth_returned`, so it measures the provider and not the
+  sign-in. The reconcile pass never closes a sign-in tab you have not closed or
+  taken over. A close that waited for you to look away is gone: a close runs
+  now or not at all, and activating another tab retires nothing.
+- **A new sign-in tab opens only when you are there.** A daemon offer for a
+  sign-in creates no tab while the browser is idle or locked, or every window
+  is minimized. It waits, durably across worker restarts, and opens when you
+  become active or a window gains focus (or when you open it yourself).
+- **A tab you close stays closed.** After you close a sign-in tab, *papio*
+  reports it and does not open another until you ask (`papio actions open`, the
+  popup). Typing an unrelated address into a sign-in tab hands the tab to you.
+- **Back after a long absence, the same tab is refreshed.** If you return to a
+  sign-in tab untouched for 15 minutes (`SIGNIN_STALE_AFTER_MS`, above the
+  measured 603 s p99 return latency) and nothing navigated while you were away,
+  *papio* navigates that tab to a fresh route minted by the daemon. Nothing
+  closes and no second tab opens. A push approved on a phone navigates the tab
+  and counts as progress whether you are present or not.
+- When *papio* retires a sign-in tab you were using because the daemon ended
+  its request, a toast now says why.
+- The `idle` permission (no install warning; Chrome and Firefox), feature
+  detected along with `tab.lastAccessed`. Without them presence is unknown, no
+  offer is held back and no sign-in is ever closed except on the evidence above.
 ### Added
 - **A handoff at the OpenAthens redirector is a redirect, not a sign-in
   page.** For an institution whose daemon config sets `openathens_domain`,

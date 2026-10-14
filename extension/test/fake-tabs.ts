@@ -33,7 +33,14 @@ export class FakeEmitter<A extends unknown[]> {
 
 export class FakeWebNavigation {
   readonly onBeforeNavigate = new FakeEmitter<[{ tabId: number; frameId: number; url?: string }]>();
-  readonly onCommitted = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
+  readonly onCommitted = new FakeEmitter<[{
+    tabId: number;
+    frameId: number;
+    url?: string;
+    documentId?: string;
+    transitionType?: string;
+    transitionQualifiers?: string[];
+  }]>();
   readonly onHistoryStateUpdated = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
   readonly onReferenceFragmentUpdated = new FakeEmitter<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>();
   /** chrome.webNavigation.onTabReplaced delivers `{tabId, replacedTabId}`.

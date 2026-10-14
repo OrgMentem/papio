@@ -271,6 +271,10 @@ extension uses to gather handoff tabs when tab-group mode is active; and
 notices if that tab later navigates somewhere else and lets the choice lapse
 instead of filing the next document under it. `webNavigation` reports that a
 navigation happened and the address it went to; it reads no page content.
+`idle` reports only whether you are at the computer (active, idle or locked), with
+no install warning: *papio* waits to open a new sign-in tab until you are back,
+and uses it to notice you returned to a sign-in tab left for a long time. It never
+closes a sign-in tab because you were away.
 On Chrome, `declarativeNetRequestWithHostAccess` lets *papio* set
 `Content-Disposition: attachment` on a signed PDF viewer response, such as a
 ScienceDirect `pdf.sciencedirectassets.com` link, so that response downloads

@@ -92,7 +92,9 @@ export type CedeReason =
   /** The reconcile pass found the tab pinned, or outside papio's container. */
   | "pinned_or_moved_out"
   /** Scaffold rediscovery found a pinned duplicate. */
-  | "duplicate_operator_owned";
+  | "duplicate_operator_owned"
+  /** The operator typed an unrelated address into a sign-in tab. */
+  | "operator_navigated";
 /** Cession reasons earlier builds recorded for acts that no longer cede.
  * Activating a papio tab, or touching it while papio closes it, now only
  * defers the close (operator decision, 2026-09-23): the tab papio opened for
@@ -233,6 +235,9 @@ export interface SurfaceLifecycleContext {
     kind: "surface_close_request",
     payload: Record<string, unknown>,
   ): Promise<NativeRequestResult>;
+  /** A sign-in surface that is still the operator's to finish: no close
+   * path may retire it on its own authority. */
+  signInHoldsTab(tabID: number): Promise<boolean>;
   /** Report a vanished claim surface from its durable record alone. */
   enqueueRestartRecoveredObservation(
     entry: {
@@ -1025,10 +1030,15 @@ export class SurfaceLifecycle {
         );
         continue;
       }
+      // A sign-in surface the operator has not closed or taken over is never
+      // retired here. This pass repairs the ledger against the tabs after a
+      // worker restart; it is not a verdict that a sign-in nobody is looking
+      // at this minute has been abandoned (live 2026-10-14: it closed one
+      // the operator was completing in their authenticator).
+      if (await this.ctx.signInHoldsTab(tabID)) continue;
       if (await this.operatorIsViewing(tab)) {
-        // The operator is looking at it right now. Deferred, never ceded:
-        // onTabActivated retires it the moment another tab takes the
-        // foreground, and the next pass covers a window switch.
+        // The operator is looking at it right now. Not closed now, and no
+        // tombstone is left to close it later.
         continue;
       }
       // Two different facts, two different dispositions. The paper being GONE
@@ -1311,6 +1321,15 @@ export class SurfaceLifecycle {
     const record = ledger[String(tabID)];
     if (record === undefined || surfaceIsCeded(record))
       return { closed: false };
+    // handoff_parked says the browser has parked this paper, and a sign-in
+    // the operator is working is not parked: it is waiting for them. The
+    // daemon refuses the same assertion while the entry lease is live; this
+    // is the browser's own half, so an old daemon cannot be what saves it.
+    if (
+      disposition === "handoff_parked" &&
+      (await this.ctx.signInHoldsTab(tabID))
+    )
+      return { closed: false };
     const result = await this.inLifecycleChain(() =>
       this.closeAuthorizedRecord(tabID, record, disposition, gateOccurrenceID),
     );
@@ -1468,20 +1487,64 @@ export class SurfaceLifecycle {
       return { closed: false };
     }
     if (await this.operatorIsViewing(tab)) {
-      // Deferred, not ceded: the tombstone stays replayable, so the surface
-      // retires once it is no longer in front of the operator. Ceding here
-      // burned the one-use authorization AND detached the binding, which is
-      // how an explicitly opened sign-in tab became permanently unretirable
+      // Not now, and therefore not later: a close that has to wait for the
+      // operator to look away is the wrong close. The tombstone used to stay
+      // replayable so the surface retired once it left the foreground, which
+      // is how a sign-in the operator had stepped away from (into their
+      // authenticator) was closed at the next reconcile tick (live
+      // 2026-10-14). The one-use authorization simply goes unused. Not ceded
+      // either: ceding burned the authorization AND detached the binding,
+      // which made an explicitly opened sign-in tab permanently unretirable
       // (live 2026-08-20).
+      await this.clearCloseTombstone(tabID, bindingID);
       return { closed: false };
     }
+    const epochBefore = this.tabTouchEpoch.get(tabID) ?? 0;
     const removed = await this.closeOwnedTab(
       tabID,
       authority === "unclaimed" ? "unclaimed-close" : "authorized-close",
     );
+    if (!removed && authority === "authorized") {
+      // closeOwnedTab refuses when the operator touched or is looking at the
+      // tab by its own second check. That is the same "not now" as the check
+      // above, and it gets the same answer: no tombstone survives to replay a
+      // close later, so a close the operator then makes is the operator's and
+      // reports owner_closed.
+      let operatorTouched = (this.tabTouchEpoch.get(tabID) ?? 0) !== epochBefore;
+      if (!operatorTouched) {
+        try {
+          operatorTouched = await this.operatorIsViewing(
+            await this.deps.tabs.get(tabID),
+          );
+        } catch {
+          // Gone or unreadable: nothing to defer.
+        }
+      }
+      if (operatorTouched) await this.clearCloseTombstone(tabID, bindingID);
+    }
     return removed
       ? { closed: true, ...(tab.url === undefined ? {} : { removedURL: tab.url }) }
       : { closed: false };
+  }
+
+  /** Drop the pending-close tombstone for this binding. A no-op when the
+   * record is gone or names another binding. */
+  private async clearCloseTombstone(
+    tabID: number,
+    bindingID: string,
+  ): Promise<void> {
+    await this.runTabLedgerTransaction((ledger) => {
+      const current = ledger[String(tabID)];
+      if (
+        current?.binding_id !== bindingID ||
+        current.pending_close === undefined
+      )
+        return { value: undefined, changed: false };
+      const next: SurfaceBirthRecord = { ...current };
+      delete next.pending_close;
+      ledger[String(tabID)] = next;
+      return { value: undefined, changed: true };
+    });
   }
 
   /** Startup replay: a failed remove or a worker death between tombstone

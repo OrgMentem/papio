@@ -21,7 +21,11 @@
  * park and an in-flight delivery detach are absent: neither lost anything, so
  * neither has a recovery to offer. `paper_filed` is papio's own act, not a
  * loss: papio closed the tabs of papers it filed, and Reopen gives them back. */
-export type ToastKind = "route_lost" | "institution_claim_lost" | "paper_filed";
+export type ToastKind =
+  | "route_lost"
+  | "institution_claim_lost"
+  | "paper_filed"
+  | "sign_in_ended";
 
 export interface ToastPayload {
   readonly kind: ToastKind;
@@ -57,6 +61,17 @@ export const TOAST_COPY: Readonly<Record<ToastKind, ToastCopy>> = {
   paper_filed: {
     message: "papio filed the paper and closed its tab.",
     action: "Reopen",
+  },
+  // papio retires a sign-in tab only because the daemon ended the request it
+  // was open for (the operator's own action lifetime ran out, or the request
+  // was cancelled). Saying so is what separates this from a tab that simply
+  // vanished, which is what an unexplained close looked like (live
+  // 2026-10-14). The action asks the daemon for a new sign-in; it is the same
+  // call as institution_claim_lost's, and it answers "no" when the request
+  // really is over.
+  sign_in_ended: {
+    message: "papio closed your sign-in tab because the request for that paper ended.",
+    action: "Open a new sign-in tab",
   },
 };
 

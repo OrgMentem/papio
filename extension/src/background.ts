@@ -228,6 +228,12 @@ import {
   type SurfaceLedgerStorage,
 } from "./surface-lifecycle";
 import { ToastDelivery } from "./toast-delivery";
+import {
+  SignInLifecycle,
+  type PresenceState,
+  type SignInReissueFence,
+  type SignInSurfaceStorage,
+} from "./signin-surface";
 
 export const NATIVE_HOST = "com.orgmentem.papio";
 const CHROME_PDF_VIEWER_HOST = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
@@ -1001,6 +1007,7 @@ export type ManagedTabPurpose =
   | "claim-scaffold";
 const BROWSER_EPOCH_LOCAL_KEY = "papio_browser_epoch_v1";
 const BROWSER_EPOCH_SESSION_KEY = "papio_browser_epoch_session_v1";
+const SIGNIN_SURFACES_SESSION_KEY = "papio_signin_surfaces_v1";
 export interface OpenManagedTabOptions {
   url: string;
   jobId?: string;
@@ -1204,7 +1211,20 @@ export interface BridgeDeps {
   };
   webNavigation?: {
     onBeforeNavigate?: Listenable<[{ tabId: number; frameId: number; url?: string }]>;
-    onCommitted?: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
+    onCommitted?: Listenable<
+      [
+        {
+          tabId: number;
+          frameId: number;
+          url?: string;
+          documentId?: string;
+          /** `typed` with a `from_address_bar` qualifier is the operator
+           * typing an address, the one navigation papio reads as intent. */
+          transitionType?: string;
+          transitionQualifiers?: string[];
+        },
+      ]
+    >;
     onHistoryStateUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     onReferenceFragmentUpdated: Listenable<[{ tabId: number; frameId: number; url?: string; documentId?: string }]>;
     /** chrome.webNavigation.onTabReplaced delivers `{tabId, replacedTabId}`
@@ -1271,6 +1291,18 @@ export interface BridgeDeps {
     /** Closes a window papio itself opened. Only the toast uses it: the work
      * window is the researcher's to close. */
     remove(windowID: number): Promise<unknown>;
+    /** Every normal window, minimized or not. Absent means papio cannot tell
+     * whether any window is on screen, and never holds an offer back for it. */
+    getAll?(): Promise<WindowInfo[]>;
+    /** A window gained focus (`-1` when none has it). */
+    onFocusChanged?: Listenable<[number]>;
+  };
+  /** chrome.idle (`idle` permission; Firefox has it too). Presence: the
+   * operator is at the computer or is not. Absent means presence is unknown,
+   * and unknown never holds a sign-in back or ends one. */
+  idle?: {
+    queryState(detectionIntervalSeconds: number): Promise<PresenceState>;
+    onStateChanged: Listenable<[PresenceState]>;
   };
   tabGroups?: {
     get(groupID: number): Promise<TabGroupInfo>;
@@ -1376,6 +1408,10 @@ export interface BridgeDeps {
    * Optional: absent classifies every start as a browser restart, the
    * fail-closed default. */
   epoch?: BrowserEpochStorage;
+  /** Durable sign-in surface records (chrome.storage.session): phase, away
+   * time and last navigation per surface, restored on worker start. Optional:
+   * absent keeps them in worker memory only. */
+  signInSurfaces?: SignInSurfaceStorage;
   /** Ephemeral scan snapshots (chrome.storage.session): never chrome.storage
    * local/sync, never persisted, never sent to the daemon (ADR-0019
    * Decision 4). Optional so callers that never exercise page-bulk scanning
@@ -2881,6 +2917,24 @@ export class Bridge {
   /** The owned-surface lifecycle: birth-record ledger, close transaction,
    * restart classification, and owned-surface reconcile. */
   private readonly surfaces: SurfaceLifecycle;
+  /** What papio does with the tab an operator signs in on: presence-gated
+   * opening, staleness repair in place, and the rule that nothing closes a
+   * sign-in on a clock. See signin-surface.ts. */
+  private readonly signIn: SignInLifecycle;
+  /** Sign-in routes waiting for the effect governor: job id -> tab id. */
+  private readonly pendingSignInReissues = new Map<
+    string,
+    { tabID: number; fence: SignInReissueFence }
+  >();
+  /** Jobs whose drive slot a sign-in surface yielded and has not yet taken
+   * back. Worker memory only: a restart re-registers drives from the store. */
+  private readonly signInYieldedDrives = new Set<string>();
+  /** Sign-in re-issues deferred because signed adapter control withheld their
+   * job; onControlChanged replays them (the fence is re-checked then). */
+  private readonly signInReissuesHeldForControl = new Map<
+    string,
+    { tabID: number; fence: SignInReissueFence }
+  >();
   /** ADR-0023's seventh surface and the filed-paper reopen batch. */
   private readonly toasts: ToastDelivery;
   /** Which handoff tabs are armed for a signed viewer; Chrome's rules. */
@@ -2901,10 +2955,6 @@ export class Bridge {
    * count stops being a wall, rather than turning every tab event into a
    * storage scan. */
   private readonly lastBadgedAuthWallTabs = new Set<number>();
-  /** Last tab observed active per window. An activation makes the previous
-   * tab in that window inactive, which is the event-driven moment a retained
-   * surface becomes retirable. */
-  private readonly lastActiveTabByWindow = new Map<number, number>();
   /** Most recently observed daemon browser-holder-generation fence, tapped
    * from any response that carries one. Undefined until the daemon has told
    * this session a generation at least once — closeOwnedSurface refuses
@@ -3289,8 +3339,15 @@ export class Bridge {
       focusManagedTab: (tabID) => this.focusManagedTab(tabID),
       liveDocumentEpoch: (tabID) => this.liveDocumentEpoch(tabID),
       requestCorrelated: (kind, payload) => this.requestCorrelated(kind, payload),
+      signInHoldsTab: (tabID) => this.signIn.holdsTab(tabID),
       enqueueRestartRecoveredObservation: (entry, eventKind) =>
         this.enqueueRestartRecoveredObservation(entry, eventKind),
+    });
+    this.signIn = new SignInLifecycle(deps, {
+      jobExists: (jobID) => findByJob(this.store, jobID) !== undefined,
+      reissueRoute: (jobID, tabID, fence) =>
+        this.signInEvent(this.reissueSignInRoute(jobID, tabID, fence)),
+      wakeOffer: (jobID) => void this.scheduleMaterialization(jobID, true),
     });
     this.workerEpoch = deps.randomUUID().replace(/-/g, "");
     this.pageBulkRecovery =
@@ -3571,6 +3628,10 @@ export class Bridge {
       for (const jobID of [...this.materializationsHeldForControl]) {
         this.materializationsHeldForControl.delete(jobID);
         void this.scheduleMaterialization(jobID, true);
+      }
+      for (const [jobID, held] of [...this.signInReissuesHeldForControl]) {
+        this.signInReissuesHeldForControl.delete(jobID);
+        this.signInEvent(this.reissueSignInRoute(jobID, held.tabID, held.fence));
       }
     }
     if (!wasBlocked) return;
@@ -4640,6 +4701,241 @@ export class Bridge {
     return this.surfaces.reconcileOwnedTabs();
   }
 
+  /** Run a sign-in lifecycle step off every chain. These are browser events,
+   * not inbound frames, and nothing here may be awaited by a handler that is:
+   * a step can wait on a correlated daemon reply. */
+  private signInEvent(work: Promise<unknown>): void {
+    work.catch((error: unknown) => {
+      console.error("papio: sign-in lifecycle step failed", error);
+    });
+  }
+
+  /** chrome.idle changed. The listener is registered in the worker's first
+   * turn, so the transition itself wakes a sleeping worker. */
+  private async onPresenceChanged(state: PresenceState): Promise<void> {
+    await this.ready;
+    await this.surfaceReady;
+    await this.signIn.presenceChanged(state);
+  }
+
+  /** A top-frame navigation in a tab: progress for a sign-in surface, and,
+   * when the operator typed the address, possibly intent. Typing an address
+   * that is not sign-in, not this paper's provider and not the library is
+   * the operator taking the tab over: papio stops tracking it and cedes it,
+   * and never closes it. */
+  private async onSignInNavigation(
+    tabID: number,
+    url: string | undefined,
+    typed: boolean,
+  ): Promise<void> {
+    await this.ready;
+    const record = await this.signIn.tabNavigated(tabID);
+    if (record === undefined || !typed || url === undefined) return;
+    const job = findByJob(this.store, record.job_id);
+    if (job === undefined || isNonLandingURL(url)) return;
+    let host: string;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      return;
+    }
+    const related =
+      hostMatches(host, job.provider_hosts) ||
+      this.deps.adapterSpecs.some((spec) => adapterSupportsHost(host, spec)) ||
+      (this.store.resolverOrigins ?? []).some((origin) => {
+        try {
+          return new URL(origin).hostname === host;
+        } catch {
+          return false;
+        }
+      });
+    if (related) return;
+    // The operator took the tab. papio stops tracking it, detaches the job
+    // from it (so no tab event finds the job through this tab again), frees
+    // its drive slot, and reports the claim abandoned exactly as an operator
+    // close would. The tab itself is ceded and never touched.
+    await this.signIn.release(record.job_id);
+    const bindingID =
+      record.binding_id ?? this.surfaces.tabLedgerCache?.[String(tabID)]?.binding_id;
+    const durableClaim = this.surfaces.tabLedgerCache?.[String(tabID)]?.claim;
+    const grant = this.claimGrants.get(job.job_id);
+    if (bindingID !== undefined && grant !== undefined) {
+      this.enqueueClaimObservation(job.job_id, bindingID, "owner_closed");
+      void this.surfaces.requestCloseAuthorization(
+        bindingID,
+        "claim_abandoned",
+        grant.gateOccurrenceID,
+      );
+    } else if (bindingID !== undefined && durableClaim !== undefined) {
+      this.enqueueRestartRecoveredObservation(
+        {
+          job_id: job.job_id,
+          authentication_claim_id: durableClaim.authentication_claim_id,
+          binding_id: bindingID,
+          browser_holder_generation: durableClaim.browser_holder_generation,
+          gate_occurrence_id: durableClaim.gate_occurrence_id,
+        },
+        "owner_closed",
+      );
+      void this.surfaces.requestCloseAuthorization(
+        bindingID,
+        "claim_abandoned",
+        durableClaim.gate_occurrence_id,
+      );
+    }
+    this.clearClaimGrant(job.job_id);
+    this.releaseHandoffDrive(job.job_id);
+    await this.update((s) =>
+      findByJob(s, job.job_id)?.tab_id === tabID
+        ? patchJob(s, job.job_id, { tab_id: -1 })
+        : s,
+    );
+    await this.retireLostMaterializationSurface(tabID, bindingID);
+    await this.surfaces.cedeOwnedTab(tabID, bindingID, "operator_navigated");
+    await this.drainHandoffDriveQueue();
+  }
+
+  /** Whether `tabID` is showing sign-in: an authentication host or the
+   * OpenAthens redirector. An unreadable tab proves nothing and is not. */
+  private async tabIsSignInSurface(tabID: number): Promise<boolean> {
+    try {
+      const tab = await this.deps.tabs.get(tabID);
+      return typeof tab.url === "string" && isNonLandingURL(tab.url);
+    } catch {
+      return false;
+    }
+  }
+
+  /** auth_returned: the sign-in is over and the provider drive starts here.
+   * The drive epoch and its three-minute bound measure the provider, so the
+   * bound restarts now instead of having run since the tab opened. */
+  private noteSignInReturned(jobID: string): void {
+    this.signInEvent(this.signIn.release(jobID));
+    const drive = this.handoffDrives.get(jobID);
+    if (drive !== undefined) {
+      this.armHandoffDriveTimeout(jobID, drive.tabID);
+      return;
+    }
+    // The slot was yielded during the wait. Take it back, or queue for it:
+    // registerHandoffDrive arms the bound when the slot is granted.
+    if (this.signInYieldedDrives.delete(jobID))
+      this.signInEvent(this.resumeHandoffAfterManual(jobID));
+  }
+
+  /** A sign-in surface waits for a human, not for papio, so it does not hold
+   * the provider drive slot while it waits: an unrelated queued paper
+   * proceeds. The surface, the job and the authentication claim stay;
+   * auth_returned takes a slot again (noteSignInReturned). */
+  private async yieldDriveForSignIn(jobID: string): Promise<void> {
+    if (!this.handoffDrives.has(jobID)) return;
+    this.signInYieldedDrives.add(jobID);
+    this.releaseHandoffDrive(jobID);
+    await this.signIn.markYielded(jobID);
+    await this.drainHandoffDriveQueue();
+    await this.releaseQueuedHandoffs();
+  }
+
+  /** The operator came back to a sign-in tab whose form is presumed dead
+   * (signin-surface.ts SIGNIN_STALE_AFTER_MS). Navigate THIS tab to a fresh
+   * route: nothing closes and no second tab opens. The daemon mints it as it
+   * does for `papio actions open`; the claim's own route cannot be re-issued
+   * here, because the navigation that put the tab on its sign-in page already
+   * settled that effect permit. */
+  private async signInReissueAllowed(
+    jobID: string,
+    tabID: number,
+    fence: SignInReissueFence,
+  ): Promise<boolean> {
+    if (!this.holderRole()) return false;
+    const job = findByJob(this.store, jobID);
+    if (job === undefined || job.tab_id !== tabID) return false;
+    if (this.controlWithholds(job)) {
+      // Signed control withholds every autonomous navigation. Not lost: the
+      // control recovery replays it, and the fence is checked again then.
+      this.signInReissuesHeldForControl.set(jobID, { tabID, fence });
+      return false;
+    }
+    if (job.access_mode !== "delegated") return false;
+    return this.signIn.reissueFenceHolds(jobID, tabID, fence);
+  }
+
+  /** Whether `tab` is selected in a focused, on-screen window. Unknown reads
+   * as in front: the operator may be there. */
+  private async tabInFrontOfOperator(tab: TabInfo): Promise<boolean> {
+    if (tab.active !== true) return false;
+    const windows = this.deps.windows;
+    if (windows === undefined || tab.windowId === undefined) return true;
+    try {
+      const win = await windows.get(tab.windowId);
+      if (win.state === "minimized") return false;
+      return win.focused !== false;
+    } catch {
+      return true;
+    }
+  }
+
+  private async reissueSignInRoute(
+    jobID: string,
+    tabID: number,
+    fence: SignInReissueFence,
+  ): Promise<void> {
+    await this.ready;
+    await this.surfaceReady;
+    if (!(await this.signInReissueAllowed(jobID, tabID, fence))) return;
+    try {
+      // Before any daemon round trip: a tab already in front of the operator
+      // is never re-issued (see the check before navigation below).
+      if (await this.tabInFrontOfOperator(await this.deps.tabs.get(tabID)))
+        return;
+    } catch {
+      return;
+    }
+    const effectToken = this.claimEffectGovernor(`signin-reissue:${jobID}`);
+    if (effectToken === undefined) {
+      this.pendingSignInReissues.set(jobID, { tabID, fence });
+      return;
+    }
+    try {
+      // Re-checked after the governor wait: control, holdership and the fence
+      // may all have changed while another effect held the slot.
+      if (!(await this.signInReissueAllowed(jobID, tabID, fence))) return;
+      const minted = await this.requestFreshHandoffLink(jobID);
+      if (!minted.ok || this.deps.tabs.update === undefined) return;
+      // Immediately before the navigation, after the daemon round trip: the
+      // operator may have signed in or looked at the form, the tab may have
+      // moved, control may have changed. Any of those and the route is unwanted.
+      if (!(await this.signInReissueAllowed(jobID, tabID, fence))) return;
+      const tab = await this.deps.tabs.get(tabID);
+      if (typeof tab.url !== "string" || !isAuthenticationURL(tab.url)) return;
+      // Fresh evidence the form is still stale, checked at navigation time:
+      // the tab is NOT selected in a focused, on-screen window. Typing into a
+      // tab that is already selected produces no activation and no
+      // navigation, so the fence's event counters cannot see it, and a
+      // reload would overwrite what the operator is entering. A tab in front
+      // of the operator is theirs to refresh; this repair is for the tab they
+      // are not looking at (same shape as drainPendingAuthReloads).
+      if (await this.tabInFrontOfOperator(tab)) return;
+      if (!(await this.signInReissueAllowed(jobID, tabID, fence))) return;
+      await this.deps.tabs.update(tabID, { url: minted.url });
+    } catch {
+      // The tab or the daemon went away. The form stays as it was.
+    } finally {
+      this.releaseEffectGovernor(`signin-reissue:${jobID}`, effectToken, false);
+      this.wakeEffectGovernor();
+    }
+  }
+
+  private drainPendingSignInReissues(): void {
+    if (this.effectGovernorOwner !== undefined) return;
+    const next = this.pendingSignInReissues.entries().next();
+    if (next.done) return;
+    const [jobID, pending] = next.value;
+    this.pendingSignInReissues.delete(jobID);
+    this.signInEvent(
+      this.reissueSignInRoute(jobID, pending.tabID, pending.fence),
+    );
+  }
+
   /** How often the keepalive wake may run the surface-repair pass. One pass is
    * a ledger walk plus a tabs.get per record, so it is rate-limited rather
    * than run on every one-minute wake; the interval only has to be short
@@ -4699,6 +4995,7 @@ export class Bridge {
       await this.surfaces.replayPendingCloseTombstones();
       await this.reconcileNavigationErrorMarkers();
     });
+    await this.signIn.restore();
     // §4.5 corrective: a restarted worker must replay any outstanding
     // claim_observation before any lease-renewing action runs, but
     // draining it INSIDE the barrier above deadlocked the inbound FIFO —
@@ -5538,13 +5835,32 @@ export class Bridge {
     // same tab, or any other caller. clearParkedMarker above documents why
     // this must happen at intent, not just here at success.
     this.clearParkedMarker(jobID);
+    this.handoffDrives.set(jobID, { tabID, token: {} });
+    this.armHandoffDriveTimeout(jobID, tabID);
+  }
+
+  /** Start the provider-drive bound for `jobID`. Called when the drive is
+   * registered and again at auth_returned, so a sign-in that took the
+   * operator twenty minutes is not charged against the provider's three.
+   *
+   * The bound never applies to a sign-in surface. When it fires on a tab
+   * showing sign-in (an authentication host, or the OpenAthens redirector)
+   * nothing is parked, detached or closed: the drive is exempt until
+   * auth_returned arms it again. It used to park the paper, detach the job
+   * and ask to close the tab three minutes after it opened, and the reconcile
+   * pass then removed a sign-in the operator was completing in their
+   * authenticator (live 2026-10-14). */
+  private armHandoffDriveTimeout(jobID: string, tabID: number): void {
     const token = {};
-    this.handoffDrives.set(jobID, { tabID, token });
     this.handoffDriveTimeouts.set(jobID, token);
     this.deps.setTimeout(async () => {
       if (this.handoffDriveTimeouts.get(jobID) !== token) return;
       if (this.agentLoops.has(jobID)) return; // The bounded article loop owns this drive until it settles.
       this.handoffDriveTimeouts.delete(jobID);
+      if (await this.tabIsSignInSurface(tabID)) {
+        await this.yieldDriveForSignIn(jobID);
+        return;
+      }
       const current = findByJob(this.store, jobID);
       if (current !== undefined && current.tab_id === tabID) {
         // The drive is spent, but the paper may still be live in a child tab
@@ -5553,48 +5869,15 @@ export class Bridge {
         // outlasted this timeout by 80 minutes. Re-queueing the job then
         // disarmed the child (arming needs the job's status), and closing
         // this tab detached the job from the capture: the PDF that rendered
-        // after the check was never saved. The sign-in branch below wins
-        // over parking: auth_pending is what opens the login gate and
-        // reserves the institution slot.
-        // `auth_pending` asserts that this paper's surface reached a login page
-        // - signInBlockerCount's contract, and what the daemon acts on: it
-        // records auth-return profile evidence, opens a HumanGateLogin, and
-        // RESERVES the institution's single sign-in slot. A drive that merely
-        // ran out of time knows nothing about a login, so asserting one
-        // fabricates all three.
+        // after the check was never saved.
         //
-        // `requires_auth` describes the offered route, not the page after
-        // navigation. Only a live authentication URL proves this is a sign-in
-        // surface. Page controls do not: measured 2026-09-23 16:15 on an
-        // open-access ScienceDirect article with a visible "View PDF", the
-        // publisher's permanent header "Sign in" (a personal-account link,
-        // shown to entitled readers too) read as a wall and parked the paper
-        // as auth_pending, which reopened the institution's login gate. An
-        // unreadable page proves nothing either.
-        //
-        // Measured live 2026-08-23: an open-access ChemRxiv preprint, offered
-        // with requires_auth false and serving a plain citation_pdf_url behind
-        // no wall at all, reported auth_pending every three minutes for two
-        // days. It held the library's sign-in slot while 22 papers queued
-        // behind it, and the toolbar badge counted it as blocked on that
-        // sign-in. Measured 2026-09-23: entitled ACS and Ebook Central IP-denial
-        // pages likewise reported auth_pending from requires_auth alone.
-        let signInSurface = false;
-        try {
-          const tab = await this.deps.tabs.get(tabID);
-          signInSurface = typeof tab.url === "string" && isAuthenticationURL(tab.url);
-        } catch {
-          // An unreadable or closed tab cannot establish a sign-in surface.
-        }
-        if (signInSurface) {
-          await this.update((s) =>
-            patchJob(s, jobID, {
-              status: "auth_pending",
-              auth_started_ms: this.deps.now(),
-            }),
-          );
-          this.send("auth_pending", {}, jobID);
-        } else if (await this.liveViewerChild(jobID)) {
+        // A sign-in surface never reaches this point: the guard above exempts
+        // it from the clock. Nothing below may assert a login either, because
+        // a drive that merely ran out of time knows nothing about one
+        // (measured 2026-08-23 and 2026-09-23: open-access and IP-denied
+        // pages reported auth_pending from requires_auth alone and held the
+        // library's one sign-in slot while papers queued behind it).
+        if (await this.liveViewerChild(jobID)) {
           // Not a sign-in surface, and the operator is still working the
           // paper in an armed viewer child. Release the spent drive slot;
           // the surface and the job's status stay the operator's.
@@ -6275,6 +6558,7 @@ export class Bridge {
       await this.applyMaterialization(jobID, { type: "clear" });
     }
     const governorQueuedAtRestart: string[] = [];
+    const signInAtRestart = await this.signIn.snapshot();
     for (const job of this.store.activeJobs) {
       if (!this.hasDelegatedAuthority(job)) {
         // Legacy and assisted jobs are durable records only. A worker restart
@@ -6323,6 +6607,14 @@ export class Bridge {
         // capacity for every other queued job across a slow institutional
         // SSO. The tab-update listener still recovers it the moment the
         // operator finishes authenticating in that same tab.
+        continue;
+      }
+      if (signInAtRestart[job.job_id]?.yielded === true) {
+        // A sign-in waiting on the operator yielded its slot before this
+        // worker slept. The wait is a person's, so restart must not turn it
+        // back into a drive that holds the only slot and starts a provider
+        // clock. The slot is taken back (or queued for) at auth_returned.
+        this.signInYieldedDrives.add(job.job_id);
         continue;
       }
       if (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT) {
@@ -6770,7 +7062,14 @@ export class Bridge {
     try {
       type NavListener = {
         addListener: (
-          cb: (d: { tabId: number; frameId: number; documentId?: string; url?: string }) => void,
+          cb: (d: {
+            tabId: number;
+            frameId: number;
+            documentId?: string;
+            url?: string;
+            transitionType?: string;
+            transitionQualifiers?: string[];
+          }) => void,
         ) => void;
       };
       type NavAPI = {
@@ -6819,6 +7118,16 @@ export class Bridge {
           if (pending.verifying || pending.acquiringPDF || (d.url !== undefined && d.url !== pending.sourceURL && d.url !== pending.destination)) pending.stop();
         }
         observeNavigation(d);
+        // Progress for a sign-in surface; an address typed into the tab for an
+        // unrelated site is the operator taking it over.
+        this.signInEvent(
+          this.onSignInNavigation(
+            d.tabId,
+            d.url,
+            d.transitionType === "typed" &&
+              (d.transitionQualifiers ?? []).includes("from_address_bar"),
+          ),
+        );
         // A committed top-frame navigation replaces the document the manual
         // continuation was granted against, so the continuation dies with it.
         const pi = this.store.pendingDelivery?.page_identity;
@@ -7800,6 +8109,7 @@ export class Bridge {
     }
     this.beginProviderDrive(jobID);
     this.registerHandoffDrive(jobID, tabID);
+    this.signInEvent(this.signIn.surfaceOpened(jobID, tabID));
     try {
       await this.focusManagedTab(tabID);
     } catch {
@@ -7883,6 +8193,26 @@ export class Bridge {
       job = findByJob(this.store, jobID);
     }
     job = await this.detachClosedHandoffTab(jobID);
+    // The operator asked for this surface by name, which lifts the presence
+    // gate and the closed marker for it. A held daemon offer for the job runs
+    // now rather than waiting for the next presence change. With no job in the
+    // browser (the operator's own close removes it, and the daemon's explicit
+    // open sends its focus frame with the candidate offer), only a marker that
+    // is already waiting is lifted.
+    if (
+      job === undefined ||
+      job.requires_auth === true ||
+      job.claim_identity_known === true
+    ) {
+      if (
+        await this.signIn.markExplicit(
+          jobID,
+          job === undefined || job.tab_id < 0,
+          job !== undefined,
+        )
+      )
+        void this.scheduleMaterialization(jobID, true);
+    }
     if (job !== undefined && job.tab_id >= 0) {
       return (await this.focusExistingHandoff(jobID, job.tab_id))
         ? { ok: true, opened: true }
@@ -9457,6 +9787,7 @@ export class Bridge {
       // Ownership is already recorded, so mirror the identity onto the
       // scaffold's durable record now rather than waiting for a drive.
       await this.surfaces.persistClaimIdentity(jobID, tabID);
+      await this.signIn.surfaceOpened(jobID, tabID, bindBindingID);
     }
     correlation = this.materializationCorrelation(jobID);
     if (
@@ -9688,6 +10019,9 @@ export class Bridge {
       await this.applyMaterialization(jobID, { type: "retry_route" });
       return;
     }
+    // Idempotent for a tab already announced; covers a run that resumed past
+    // the bind after a worker restart.
+    await this.signIn.surfaceOpened(jobID, currentTabID, navigationBindingID);
     const activeDrive = findByJob(this.store, jobID);
     if (
       activeDrive?.tab_id === currentTabID &&
@@ -9848,6 +10182,21 @@ export class Bridge {
     }
     // A refusal or holder change can arrive while alarms.get is pending.
     if (!this.holderRole() || this.institutionalBindBackoffs.has(jobID)) return;
+    // Opening is presence-gated. A daemon offer for a sign-in that arrives
+    // while the operator is away (browser idle or locked, or every window
+    // minimized) creates no tab: the job waits, durably, and the next active
+    // transition runs it. A surface the operator closed stays closed until
+    // they open it by name. Nothing here is a clock.
+    const gated = this.materializationCorrelation(jobID);
+    if (
+      gated !== undefined &&
+      gated.tab_id < 0 &&
+      findByJob(this.store, jobID)?.requires_auth !== false &&
+      (await this.signIn.offerGate(jobID)) !== "open"
+    ) {
+      await this.signIn.holdOffer(jobID);
+      return;
+    }
     if (this.materializationRuns.has(jobID)) {
       this.materializationReruns.add(jobID);
       return;
@@ -12558,6 +12907,8 @@ export class Bridge {
     this.deps.tabs.onUpdated.addListener((tabID, change, tab) => {
       this.viewerRules.noteViewerRuleChild(tabID, tab.openerTabId);
       this.surfaces.touchTab(tabID);
+      if (change.url !== undefined)
+        this.signInEvent(this.onSignInNavigation(tabID, change.url, false));
       // Ledgered before classification, so a child papio's paper opened is
       // papio's surface from its first event, never an unowned stray.
       if (tab.openerTabId === undefined)
@@ -12574,7 +12925,16 @@ export class Bridge {
     });
     this.deps.tabs.onActivated.addListener(({ tabId }) => {
       this.surfaces.touchTab(tabId);
+      this.signInEvent(this.signIn.tabActivated(tabId));
       return this.onTabActivated(tabId);
+    });
+    // Presence and attention. Registered in the worker's first turn, so a
+    // transition wakes a sleeping worker rather than being missed.
+    this.deps.idle?.onStateChanged.addListener((state) => {
+      this.signInEvent(this.onPresenceChanged(state));
+    });
+    this.deps.windows?.onFocusChanged?.addListener((windowID) => {
+      this.signInEvent(this.signIn.windowFocused(windowID));
     });
     if (this.isFirefox()) {
       // Firefox's blocking listener must be registered in the event page's
@@ -13350,6 +13710,7 @@ export class Bridge {
     closeDisposition: SurfaceCloseDisposition = "job_inactive",
   ): Promise<void> {
     this.destroyDeliveryChoicesForJob(jobID);
+    const signInSurface = await this.signIn.forgetJob(jobID);
     const job = findByJob(this.store, jobID);
     const materialization = this.materializationCorrelation(jobID);
     const tabID = job?.tab_id;
@@ -13418,8 +13779,24 @@ export class Bridge {
     // inactive; every non-authorized outcome leaves the surface alone.
     const closeTabID =
       tabID !== undefined && tabID >= 0 ? tabID : materializationTabID;
-    if (closeTabID !== undefined && closeTabID >= 0)
-      void this.closeOwnedSurface(closeTabID, closeDisposition);
+    if (closeTabID !== undefined && closeTabID >= 0) {
+      const closing = this.closeOwnedSurface(closeTabID, closeDisposition);
+      // The operator was using this sign-in and papio is retiring it because
+      // its request ended. Say so: a tab that vanishes with no message reads
+      // as a defect, which is what the operator reported on 2026-10-14.
+      void closing
+        .then((result) => {
+          if (result.closed && signInSurface.operatorUsed)
+            return this.toasts.raiseToast({
+              kind: "sign_in_ended",
+              job_id: jobID,
+            });
+          return undefined;
+        })
+        .catch((error: unknown) => {
+          console.error("papio: sign-in retirement toast failed", error);
+        });
+    }
     // Every other surface of this paper - a provider's child tab, an earlier
     // attempt's tab - goes with it under the same disposition.
     await this.surfaces.retireSupersededSurfaces(
@@ -13950,6 +14327,7 @@ export class Bridge {
     if (this.drainingHandoffDriveQueue || this.drainingQueuedHandoffs) return;
     this.effectGovernorWakePending = false;
     void this.drainPendingFreshHandoffs();
+    this.drainPendingSignInReissues();
     void this.drainPendingAuthReloads();
     void this.drainPendingSessionSignIns();
     void this.drainHandoffDriveQueue();
@@ -14383,8 +14761,10 @@ export class Bridge {
     if (
       job.status === "auth_pending" ||
       this.hasLatchedObservation(job.job_id, job.tab_id, "wall_observed")
-    )
+    ) {
       void this.emitClaimObservation(job.job_id, job.tab_id, "auth_returned", true);
+      this.noteSignInReturned(job.job_id);
+    }
     await this.keepaliveManager?.noteInstitutionalLanding(
       origin,
       "tracked_auth_return",
@@ -16979,9 +17359,13 @@ export class Bridge {
           continue;
         void this.closeOwnedSurface(tabID, "job_inactive");
       }
+      await this.signIn.release(jobID);
       return;
     }
     await this.removeJobWithOffer(jobID);
+    // The daemon ended this request: nothing is left for a closed marker to
+    // hold back.
+    await this.signIn.release(jobID);
   }
 
   /** The daemon acknowledges download_complete only after it has attempted
@@ -17346,6 +17730,11 @@ export class Bridge {
       return;
     }
     if (successfulLanding) {
+      // A sign-in surface yielded its drive slot for the human wait; the
+      // landing on the provider takes a slot back (or queues for one) whatever
+      // path reports the return.
+      if (this.signInYieldedDrives.delete(job.job_id))
+        await this.resumeHandoffAfterManual(job.job_id);
       this.navigationErrors.delete(tabID);
       this.clearNavigationErrorMarker(tabID);
       const institutionalSession = await this.recordInstitutionalSession(
@@ -17458,18 +17847,22 @@ export class Bridge {
         await this.maybeClassify(job.job_id, host);
         return;
       }
-      if (job.status !== "auth_pending" && isAuthenticationURL(url)) {
-        // Only an authentication route starts a sign-in wait. Loading an
-        // unregistered provider is ordinary navigation, not an IdP visit.
-        await this.update((s) =>
-          patchJob(s, job.job_id, {
-            status: "auth_pending",
-            auth_started_ms: this.deps.now(),
-          }),
-        );
-        this.send("auth_pending", {}, job.job_id);
-        await this.noteAuthAttempt(job.job_id, tabID);
-        await this.surfaceWorkTab(tabID);
+      if (isAuthenticationURL(url)) {
+        if (job.status !== "auth_pending") {
+          // Only an authentication route starts a sign-in wait. Loading an
+          // unregistered provider is ordinary navigation, not an IdP visit.
+          await this.update((s) =>
+            patchJob(s, job.job_id, {
+              status: "auth_pending",
+              auth_started_ms: this.deps.now(),
+            }),
+          );
+          this.send("auth_pending", {}, job.job_id);
+          await this.noteAuthAttempt(job.job_id, tabID);
+          await this.surfaceWorkTab(tabID);
+        }
+        // The wait is the operator's: free the drive slot for other work.
+        await this.yieldDriveForSignIn(job.job_id);
       }
       return;
     }
@@ -17638,6 +18031,7 @@ export class Bridge {
     // eight minutes after its drive timed out and was never driven. A job
     // whose drive is still live is unchanged.
     await this.resumeHandoffAfterManual(jobID);
+    this.noteSignInReturned(jobID);
     const authReturnedOriginHint = this.jobInstitutionOrigin(job);
     this.emitSessionEvidence("auth_returned", authReturnedOriginHint);
     await this.recollapseHandoffGroup(tabID);
@@ -21348,50 +21742,12 @@ export class Bridge {
     }
     this.keepaliveManager?.noteResolverActivated(tabID, tab.url);
     // Activation is not takeover. Looking at a tab papio opened for a paper
-    // defers its close while it is in front; it does not make the tab the
-    // operator's (operator decision, 2026-09-23). Only pinning it or moving
-    // it out of papio's container cedes it.
-    if (tab.windowId === undefined) return;
-    const previous = this.lastActiveTabByWindow.get(tab.windowId);
-    this.lastActiveTabByWindow.set(tab.windowId, tabID);
-    if (previous !== undefined && previous !== tabID) {
-      // The surface that just lost the foreground is the event-driven moment
-      // a deferred owned tab becomes retirable.
-      await this.retireDeactivatedSurface(previous);
-    }
-  }
-
-  /** Retire one owned surface that no live job still drives, now that it is
-   * no longer the foreground tab. Same predicate and dispositions as
-   * reconcileOwnedTabs; the daemon still authorizes (or refuses) the close,
-   * one use per attempt. A parked paper's own tab is left to the reconcile
-   * pass, which alone knows whether it has gone cold. */
-  private async retireDeactivatedSurface(tabID: number): Promise<void> {
-    const ledger = await this.surfaces.snapshotTabLedger();
-    const record = ledger[String(tabID)];
-    if (
-      record === undefined ||
-      surfaceIsCeded(record) ||
-      record.job_id === undefined ||
-      record.browser_epoch !== this.surfaces.browserEpoch
-    )
-      return;
-    const owner = findByJob(this.store, record.job_id);
-    // A live paper's own tab and its provider children are left to the
-    // reconcile pass, which alone knows whether they have gone cold.
-    if (
-      owner?.tab_id === tabID ||
-      (owner !== undefined && record.purpose === PROVIDER_CHILD_PURPOSE)
-    )
-      return;
-    await this.closeOwnedSurface(
-      tabID,
-      owner === undefined
-        ? "job_inactive"
-        : owner.tab_id >= 0
-          ? "surface_superseded"
-          : "handoff_parked",
-    );
+    // does not make the tab the operator's (operator decision, 2026-09-23);
+    // only pinning it or moving it out of papio's container cedes it. It also
+    // no longer decides when a close may run: a close that has to wait for
+    // the operator to look away is the wrong close, so nothing retires a tab
+    // "the moment another tab takes the foreground". For a sign-in surface
+    // the activation is attention, recorded by the listener.
   }
 
   private async onTabRemoved(tabID: number): Promise<void> {
@@ -21440,6 +21796,14 @@ export class Bridge {
     // Consumed exactly once, whatever happens below: this worker removed the
     // tab itself as housekeeping, so the removal is not the operator giving up.
     const deliberate = this.deliberateRemovals.delete(tabID);
+    // Operator close or papio's own removal: the first says the sign-in is
+    // abandoned and must not be reopened on its own, the second only ends it.
+    // Started, not awaited: the lifecycle chain orders it before anything
+    // enqueued after it, and an await here only delays the ledger and job
+    // cleanup below.
+    this.signInEvent(
+      this.signIn.tabRemoved(tabID, authorizedClose || deliberate),
+    );
     const ownerBindingID = ledgerRecord?.binding_id;
     const ledgerJobID = ledgerRecord?.job_id;
     // Read before forgetLedgeredTab erases the record: after a worker
@@ -21455,7 +21819,10 @@ export class Bridge {
       // close still retires that binding. A claim_abandoned tombstone already
       // has its owner_closed counterpart in the outbox.
       if (
-        pendingClose?.disposition !== "claim_abandoned" &&
+        // Any papio-authorized close (whatever its disposition) is papio's own
+        // removal: the daemon reads an applied owner_closed as the operator
+        // giving up, so it must never be reported for one.
+        pendingClose === undefined &&
         !deliberate &&
         ledgerRecord?.content !== true &&
         ledgerJobID !== undefined &&
@@ -23998,6 +24365,33 @@ function realDeps(): BridgeDeps {
               },
             ) => chrome.windows.update(windowID, props),
             remove: (windowID: number) => chrome.windows.remove(windowID),
+            getAll: () =>
+              chrome.windows.getAll({
+                windowTypes: ["normal"],
+              }) as Promise<WindowInfo[]>,
+            ...(chrome.windows.onFocusChanged !== undefined
+              ? {
+                  onFocusChanged: {
+                    addListener: (cb: (windowID: number) => void) =>
+                      chrome.windows.onFocusChanged.addListener(cb),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+    // chrome.idle needs the `idle` permission (no install warning). Detected,
+    // not assumed: without it presence is unknown and gates nothing.
+    ...(typeof chrome.idle !== "undefined" &&
+    typeof chrome.idle.queryState === "function"
+      ? {
+          idle: {
+            queryState: (detectionIntervalSeconds: number) =>
+              chrome.idle.queryState(detectionIntervalSeconds) as Promise<PresenceState>,
+            onStateChanged: {
+              addListener: (cb: (state: PresenceState) => void) =>
+                chrome.idle.onStateChanged.addListener(cb),
+            },
           },
         }
       : {}),
@@ -24141,6 +24535,17 @@ function realDeps(): BridgeDeps {
       },
       save: async (entries) => {
         await chrome.storage.local.set({ [MANAGED_TAB_LEDGER_KEY]: entries });
+      },
+    },
+    signInSurfaces: {
+      load: async () => {
+        const got = await chrome.storage.session.get(SIGNIN_SURFACES_SESSION_KEY);
+        return got[SIGNIN_SURFACES_SESSION_KEY];
+      },
+      save: async (records) => {
+        await chrome.storage.session.set({
+          [SIGNIN_SURFACES_SESSION_KEY]: records,
+        });
       },
     },
     epoch: {

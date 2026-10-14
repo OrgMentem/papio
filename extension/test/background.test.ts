@@ -83,6 +83,7 @@ import {
   type PdfGrabCorrelation,
 } from "../src/background";
 import type { TabChangeInfo, TabInfo } from "../src/browser-types";
+import type { PresenceState, SignInLifecycle } from "../src/signin-surface";
 import type { SurfaceCloseDisposition } from "../src/surface-lifecycle";
 import type { NativeRequestResult } from "../src/correlation";
 import {
@@ -646,6 +647,16 @@ class FakeWindows {
     }
     this.live.delete(windowID);
   }
+  /** The operator's own browser window. The harness never creates it (tabs
+   * default into window 1), so `getAll` reports it beside the work window. */
+  userWindowState: "normal" | "minimized" = "normal";
+  readonly onFocusChanged = new FakeEmitter<[number]>();
+  async getAll(): Promise<{ id: number; state: string }[]> {
+    return [
+      { id: 1, state: this.userWindowState },
+      ...[...this.live.values()].map((win) => ({ id: win.id, state: win.state })),
+    ];
+  }
   /** Simulate the user closing the work window. */
   close(windowID: number): void {
     this.live.delete(windowID);
@@ -723,6 +734,22 @@ class FakeAlarms {
   }
 }
 
+/** chrome.idle: the operator at the computer, or not. */
+class FakeIdle {
+  readonly onStateChanged = new FakeEmitter<[PresenceState]>();
+  state: PresenceState = "active";
+  async queryState(): Promise<PresenceState> {
+    return this.state;
+  }
+  /** The browser's transition: the state changes and the event is delivered. */
+  async set(state: PresenceState): Promise<void> {
+    this.state = state;
+    await this.onStateChanged.emit(state);
+    // The listener's work runs off the event, as the worker's does.
+    await settle();
+  }
+}
+
 interface Harness {
   bridge: Bridge;
   deps: BridgeDeps;
@@ -733,6 +760,7 @@ interface Harness {
   downloads: FakeDownloads;
   action: FakeAction;
   windows?: FakeWindows;
+  idle?: FakeIdle;
   tabGroups?: FakeTabGroups;
   webNavigation: FakeWebNavigation;
   clock: { now: number };
@@ -749,6 +777,9 @@ interface Harness {
   alarms: FakeAlarms;
   postedStrings(): string[];
   pageBulkScans: { current: PageBulkScanStore };
+  /** chrome.storage.session's sign-in surface table; survives a worker
+   * restart exactly as the real tier does. */
+  signInRecords: { current: unknown };
   sessionStorage: { clear(): void };
   detachBridgeListeners(): void;
 }
@@ -771,6 +802,9 @@ function makeHarness(
     tabGroups?: boolean;
     handoffSurface?: "in-window" | "work-window" | "tab-group";
     inPageToast?: boolean;
+    /** chrome.idle is present, starting active. Absent is the browser
+     * without the API: presence unknown, nothing gated. */
+    idle?: boolean;
     /** Durable home of the signed-control fence. Absent keeps it in memory,
      * which is a fresh install. */
     adapterControl?: AdapterControlStorage;
@@ -788,6 +822,8 @@ function makeHarness(
   if (opts?.firefox === true)
     Reflect.deleteProperty(downloads, "onDeterminingFilename");
   const windows = opts?.windows === true ? new FakeWindows(tabs) : undefined;
+  const idle = opts?.idle === true ? new FakeIdle() : undefined;
+  const signInRecords: { current: unknown } = { current: undefined };
   const tabGroups = opts?.tabGroups === true ? new FakeTabGroups() : undefined;
   if (tabGroups !== undefined) {
     tabs.group = async ({ tabIds, groupId, createProperties }) => {
@@ -852,6 +888,8 @@ function makeHarness(
     webNavigation.onReferenceFragmentUpdated.snapshot(),
     webNavigation.onTabReplaced.snapshot(),
     webNavigation.onErrorOccurred.snapshot(),
+    idle?.onStateChanged.snapshot(),
+    windows?.onFocusChanged.snapshot(),
     alarms.onAlarm.snapshot(),
   ].filter((restore): restore is () => void => restore !== undefined);
   const detachBridgeListeners = (): void => {
@@ -962,6 +1000,13 @@ function makeHarness(
       get: async () => opts?.captureConsent === true,
     },
     ...(windows !== undefined ? { windows } : {}),
+    ...(idle !== undefined ? { idle } : {}),
+    signInSurfaces: {
+      load: async () => signInRecords.current,
+      save: async (records) => {
+        signInRecords.current = JSON.parse(JSON.stringify(records)) as unknown;
+      },
+    },
     ...(tabGroups !== undefined ? { tabGroups } : {}),
     action,
     alarms: {
@@ -985,6 +1030,8 @@ function makeHarness(
     action,
     webNavigation,
     ...(windows !== undefined ? { windows } : {}),
+    ...(idle !== undefined ? { idle } : {}),
+    signInRecords,
     ...(tabGroups !== undefined ? { tabGroups } : {}),
     clock,
     timers,
@@ -3738,8 +3785,12 @@ test("a timed-out auth-required article showing a Sign in control still parks wi
   expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(false);
 });
 
-test("a timed-out open-access offer on an IdP URL reports auth_pending", async () => {
-  const jobID = "job_open_access_idp_timeout";
+// The three-minute drive bound never applies to a sign-in surface. It used to
+// send auth_pending for a tab found on an IdP URL, park the paper, detach the
+// job and ask to close the tab - three minutes after it opened, whether or not
+// the operator was in the middle of signing in (live 2026-10-14).
+test("a drive timeout on a sign-in surface parks, detaches and closes nothing", async () => {
+  const jobID = "job_idp_timeout_exempt";
   const h = makeHarness();
   const offer = jobOffer(jobID) as { payload: Record<string, unknown> };
   offer.payload["requires_auth"] = false;
@@ -3756,8 +3807,18 @@ test("a timed-out open-access offer on an IdP URL reports auth_pending", async (
   h.clock.now += 180_000;
   await driveTimeout!.fn();
 
-  expect(findByJob(h.backend.store, jobID)?.status).toBe("auth_pending");
-  expect(h.frames().slice(beforeTimeout).some((frame) => frame.type === "auth_pending")).toBe(true);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "accepted",
+    tab_id: tabID,
+  });
+  expect(h.frames().slice(beforeTimeout)).toEqual([]);
+  expect(h.tabs.removed).not.toContain(tabID);
+  // The sign-in waits for the operator, not for papio: it yields the drive
+  // slot. The bound is armed again when the slot is taken back at auth_returned.
+  const internals = h.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+  };
+  expect(internals.handoffDrives.has(jobID)).toBe(false);
 });
 
 test("an unreadable auth-required article parks without a sign-in claim", async () => {
@@ -5263,7 +5324,7 @@ test("a parked auth_pending claim closes from its birth record after worker rest
   ).toBe(false);
 });
 
-test("a timed-out institutional IdP tab reports owner_closed for its navigated binding", async () => {
+test("an institutional IdP tab is never closed by the drive timeout, and reports owner_closed only when the operator closes it", async () => {
   const jobID = "job_claim_idp_timeout_close";
   const candidateID = "cand_idp_timeout_close";
   const bindingID = "bind_idp_timeout_close";
@@ -5341,8 +5402,8 @@ test("a timed-out institutional IdP tab reports owner_closed for its navigated b
     status: "auth_pending",
   });
   // The operator brings the IdP tab forward to sign in. Looking at the tab
-  // defers papio's own close; it no longer cedes the tab, and it never erases
-  // the claim owner's identity for a later real close.
+  // never cedes it, and never erases the claim owner's identity for a later
+  // real close.
   await h.tabs.userActivate(tabID);
   const activatedRecord = ledger.current()[String(tabID)] as SurfaceBirthRecord;
   expect(activatedRecord.ceded).toBeUndefined();
@@ -5351,23 +5412,12 @@ test("a timed-out institutional IdP tab reports owner_closed for its navigated b
   expect(timeout).toBeDefined();
   h.clock.now += 180_000;
   const timeoutFramesBefore = h.port.posted.length;
-  const timingOut = timeout!.fn();
-  // The drive timeout asks to close its parked surface. The daemon may say
-  // yes; the tab is still in front of the operator, so the close waits.
-  const parkClose = await h.port.waitForFrame("surface_close_request", timeoutFramesBefore);
-  expect(parkClose.payload["disposition"]).toBe("handoff_parked");
-  await h.port.inbound(
-    nativeResult("surface_close_response", {
-      request_id: parkClose.payload["request_id"],
-      outcome: "authorized",
-      close_authorization_id: "auth-idp-timeout",
-      nonce: "nonce-idp-timeout",
-      browser_holder_generation: 1,
-    }),
-  );
-  await timingOut;
-  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id).toBe(-1);
-  expect(h.frames().filter((frame) => frame.type === "auth_pending")).toHaveLength(2);
+  await timeout!.fn();
+  // The drive bound does not apply to a sign-in surface: no close request, no
+  // second auth_pending, and the job keeps its tab.
+  expect(h.port.posted.length).toBe(timeoutFramesBefore);
+  expect(h.backend.store.activeJobs.find((job) => job.job_id === jobID)?.tab_id).toBe(tabID);
+  expect(h.frames().filter((frame) => frame.type === "auth_pending")).toHaveLength(1);
   expect(h.tabs.snapshot(tabID)?.url).toBe(idpURL);
   const closeAt = h.port.posted.length;
   await h.tabs.userClose(tabID);
@@ -5526,94 +5576,264 @@ test("auth_returned is reported once, for the landing after the sign-in wall and
   expect(h.frames().filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
 });
 
-/** The production sequence measured live 2026-09-24 on job_da3d17eefe and
- * job_111cef1876: an automatic institutional surface reached the institution
- * sign-in page, nobody attended it, the three-minute drive timeout parked the
- * paper and papio closed the tab, and the owner_closed report abandoned the
- * claim. Returns the job's state and the dead tab. A `resolverOrigin` names
- * the institution, so its landings count as institutional sessions. */
-async function timedOutSignInSurface(
+const CLAIM_SURFACE_FEATURES = [
+  "institutional_materialization_v1",
+  "effect_permit_v1",
+  "handoff_link_v1",
+  AUTH_CLAIM,
+  "surface_close_v1",
+];
+
+/** An institutional sign-in surface standing on the institution's sign-in
+ * page: the route navigated, the wall was seen and reported. A
+ * `resolver.example.edu` landing after it counts as the institution session. */
+async function signInAtIdP(
+  h: Harness,
+  ids: ClaimSurfaceIDs,
+): Promise<{ tabID: number; acked: Set<string> }> {
+  await h.port.inbound(helloAck({
+    features: CLAIM_SURFACE_FEATURES,
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  const tabID = await navigatedClaimSurface(
+    h,
+    ids,
+    `https://${PROVIDER_HOST}/stable/sign-in`,
+    ["resolver.example.edu", PROVIDER_HOST],
+  );
+  await h.tabs.completeNavigation(tabID, "https://idp.example.edu/sso");
+  const acked = new Set<string>();
+  expect(await ackClaimObservations(h, acked)).toContain("wall_observed");
+  // papio's work window sits in the background unless a test brings it forward.
+  const workWindow = h.windows?.live.get(h.backend.store.workWindowID ?? -1);
+  if (workWindow !== undefined) workWindow.focused = false;
+  return { tabID, acked };
+}
+
+/** The sequence measured live 2026-09-24 on job_da3d17eefe and job_111cef1876,
+ * as it ends now: an automatic institutional surface reached the institution
+ * sign-in page and the OPERATOR closed the tab. papio reports owner_closed and
+ * abandons the claim, and the paper stays open and tabless until the operator
+ * opens it. (It used to end with papio closing the tab itself three minutes
+ * in, whether or not anyone had given up on it: the defect of 2026-10-14.)
+ * Returns the dead tab. A `resolverOrigin` names the institution, so its
+ * landings count as institutional sessions. */
+async function operatorClosedSignInSurface(
   h: Harness,
   ids: ClaimSurfaceIDs,
   resolverOrigin?: string,
 ): Promise<{ tabID: number; acked: Set<string> }> {
   await h.port.inbound(helloAck({
-    features: [
-      "institutional_materialization_v1",
-      "effect_permit_v1",
-      "handoff_link_v1",
-      AUTH_CLAIM,
-      "surface_close_v1",
-    ],
+    features: CLAIM_SURFACE_FEATURES,
     ...(resolverOrigin !== undefined ? { resolver_origins: [resolverOrigin] } : {}),
     browser_holder_generation: 1,
   }));
   const providerHosts = resolverOrigin !== undefined
     ? [new URL(resolverOrigin).hostname, PROVIDER_HOST]
     : [PROVIDER_HOST];
-  const tabID = await navigatedClaimSurface(h, ids, `https://${PROVIDER_HOST}/stable/timed-out`, providerHosts);
+  const tabID = await navigatedClaimSurface(h, ids, `https://${PROVIDER_HOST}/stable/closed`, providerHosts);
   await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
   const acked = new Set<string>();
   await ackClaimObservations(h, acked);
-  // Nobody is looking at the sign-in page: the operator is in another window.
-  const workWindow = h.windows?.live.get(h.backend.store.workWindowID ?? -1);
-  expect(workWindow).toBeDefined();
-  workWindow!.focused = false;
-  const timeout = h.timers.find((timer) => timer.ms === 180_000);
-  expect(timeout).toBeDefined();
-  h.clock.now += 180_000;
-  const framesBefore = h.port.posted.length;
-  const timingOut = timeout!.fn();
-  const parkClose = await h.port.waitForFrame("surface_close_request", framesBefore);
-  expect(parkClose.payload["disposition"]).toBe("handoff_parked");
-  await h.port.inbound(
-    nativeResult("surface_close_response", {
-      request_id: parkClose.payload["request_id"],
-      outcome: "authorized",
-      close_authorization_id: `auth-${ids.bindingID}`,
-      nonce: `nonce-${ids.bindingID}`,
-      browser_holder_generation: 1,
-    }),
-  );
-  await timingOut;
-  for (let i = 0; i < 40; i += 1) await Promise.resolve();
-  expect(h.tabs.removed).toContain(tabID);
+  await h.tabs.userClose(tabID);
   expect(await ackClaimObservations(h, acked)).toContain("owner_closed");
   return { tabID, acked };
 }
 
-// Measured live 2026-09-24: after the sequence above the daemon offered the
-// same candidate again (the paced drive at 12:29Z, `papio actions open` at
-// 12:55Z and 13:07Z), and nothing happened: no claim, no tab, no event. The
-// extension still held the dead binding as a `navigated` correlation, so every
-// offer read as a lease refresh, and the first one copied the closed tab's id
-// back onto the job.
-test("a closed sign-in surface is rebuilt when the daemon offers its candidate again", async () => {
+function surfaceCloseRequests(h: Harness): BrowserMessage[] {
+  return h.frames().filter((frame) => frame.type === "surface_close_request");
+}
+
+// (a) Measured live 2026-10-14: the operator was in their authenticator app,
+// the three-minute drive timer parked the paper and the next reconcile tick
+// closed the tab. A push approved on a phone navigates the tab with no input
+// on this computer, so progress cannot depend on presence.
+test("a sign-in the operator walks away from is never closed, and a push approved while idle reaches the provider", async () => {
   const ids = {
-    jobID: "job_surface_timed_out_reoffer",
-    candidateID: "cand_surface_timed_out_reoffer",
-    claimID: "claim_surface_timed_out_reoffer",
-    bindingID: "bind_surface_timed_out_reoffer",
+    jobID: "job_signin_away_push",
+    candidateID: "cand_signin_away_push",
+    claimID: "claim_signin_away_push",
+    bindingID: "bind_signin_away_push",
   };
-  const h = makeHarness(undefined, { windows: true });
+  const h = makeHarness(undefined, { windows: true, idle: true });
   installManagedTabLedger(h, {});
   await h.bridge.start();
-  const { tabID } = await timedOutSignInSurface(h, ids);
+  const { tabID, acked } = await signInAtIdP(h, ids);
+  const internals = h.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  const armedBefore = h.timers.filter((timer) => timer.ms === 180_000).length;
 
+  // The operator leaves for another app: focus goes, then the browser idles.
+  h.windows!.live.get(h.backend.store.workWindowID ?? -1)!.focused = false;
+  await h.idle!.set("idle");
+  h.clock.now += 20 * 60_000;
+  // Both clocks that used to close the tab run out. The timer's close would
+  // wait on the daemon's answer, so it is not awaited: a request appearing is
+  // the failure being tested for.
+  for (const timer of h.timers.filter((entry) => entry.ms === 180_000)) void timer.fn();
+  expect(await h.bridge.reconcileOwnedTabs()).toEqual({ closed: 0 });
+  await settle();
+  expect(surfaceCloseRequests(h)).toEqual([]);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+  expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({
+    tab_id: tabID,
+    status: "auth_pending",
+  });
+
+  // The push is approved on the phone: the tab navigates with nobody here.
+  const signedIn = `https://${PROVIDER_HOST}/stable/sign-in?approved=1`;
+  await h.webNavigation.onCommitted.emit({ tabId: tabID, frameId: 0, url: signedIn });
+  await h.tabs.completeNavigation(tabID, signedIn);
+  expect(await ackClaimObservations(h, acked)).toContain("auth_returned");
+  expect(h.frames().filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
+
+  // The drive timer measures the provider from here, not the sign-in.
+  expect(internals.handoffDrives.has(ids.jobID)).toBe(true);
+  expect(h.timers.filter((timer) => timer.ms === 180_000).length).toBeGreaterThan(armedBefore);
+  expect(JSON.stringify(h.signInRecords.current)).not.toContain(ids.jobID);
+  expect(surfaceCloseRequests(h)).toEqual([]);
+  expect(h.tabs.removed).not.toContain(tabID);
+});
+
+// (b) The form behind a tab nobody touched for forty minutes is dead. The
+// repair is one reload of the SAME tab on a fresh route: no close, no second
+// tab.
+test("a sign-in left for forty minutes is re-issued in the same tab when the operator returns", async () => {
+  const ids = {
+    jobID: "job_signin_stale_return",
+    candidateID: "cand_signin_stale_return",
+    claimID: "claim_signin_stale_return",
+    bindingID: "bind_signin_stale_return",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID } = await signInAtIdP(h, ids);
+  const tabsBefore = h.tabs.list().map((tab) => tab.id).sort();
+
+  await h.idle!.set("idle");
+  h.clock.now += 40 * 60_000;
+  const framesBefore = h.port.posted.length;
+  await h.idle!.set("active");
+  const link = await h.port.waitForFrame("handoff_link_request", framesBefore);
+  expect(link.payload["job_id"]).toBe(ids.jobID);
+  const fresh = `https://${PROVIDER_HOST}/fresh?stale-return=1`;
+  await h.port.inbound(
+    nativeResult("handoff_link_result", {
+      request_id: link.payload["request_id"],
+      outcome: "opened",
+      url: fresh,
+    }),
+  );
+  await settle();
+
+  expect(h.tabs.navigations[h.tabs.navigations.length - 1]).toEqual({ tabID, url: fresh });
+  expect(h.tabs.list().map((tab) => tab.id).sort()).toEqual(tabsBefore);
+  expect(h.tabs.removed).not.toContain(tabID);
+  expect(surfaceCloseRequests(h)).toEqual([]);
+});
+
+test("an absence shorter than the staleness bound, or one that saw progress, repairs nothing", async () => {
+  for (const scenario of ["short", "progress"] as const) {
+    const ids = {
+      jobID: `job_signin_fresh_${scenario}`,
+      candidateID: `cand_signin_fresh_${scenario}`,
+      claimID: `claim_signin_fresh_${scenario}`,
+      bindingID: `bind_signin_fresh_${scenario}`,
+    };
+    const h = makeHarness(undefined, { windows: true, idle: true });
+    installManagedTabLedger(h, {});
+    await h.bridge.start();
+    const { tabID } = await signInAtIdP(h, ids);
+    await h.idle!.set("idle");
+    if (scenario === "progress") {
+      // The MFA step moved the tab while the operator was away.
+      h.clock.now += 20 * 60_000;
+      const mfa = "https://idp.example.edu/mfa";
+      await h.tabs.userNavigate(tabID, mfa);
+      await h.webNavigation.onCommitted.emit({ tabId: tabID, frameId: 0, url: mfa });
+      h.clock.now += 20 * 60_000;
+    } else {
+      h.clock.now += 5 * 60_000;
+    }
+    const framesBefore = h.port.posted.length;
+    await h.idle!.set("active");
+    await settle();
+    expect(
+      h.frames().slice(framesBefore).filter((frame) => frame.type === "handoff_link_request"),
+    ).toEqual([]);
+    expect(h.tabs.snapshot(tabID)).toBeDefined();
+  }
+});
+
+// (c) Closing the tab is the operator giving up. papio reports it, and then
+// keeps its hands off: nothing re-opens a tab until the operator both is at
+// the computer and asks for one.
+test("a sign-in the operator closed stays closed until they open it", async () => {
+  const ids = {
+    jobID: "job_signin_operator_closed",
+    candidateID: "cand_signin_operator_closed",
+    claimID: "claim_signin_operator_closed",
+    bindingID: "bind_signin_operator_closed",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await operatorClosedSignInSurface(h, ids);
+  // The lease is released (owner_closed, reported above) and the browser
+  // forgets the paper; the daemon's action is still open. What remains is the
+  // marker that the operator closed it.
+  expect(findByJob(h.backend.store, ids.jobID)).toBeUndefined();
+  expect(h.signInRecords.current).toMatchObject({
+    [ids.jobID]: { phase: "closed", tab_id: -1 },
+  });
+  expect(surfaceCloseRequests(h).map((frame) => frame.payload["disposition"])).toEqual([
+    "claim_abandoned",
+  ]);
+
+  // The daemon offers the candidate again. The operator is at the computer;
+  // that is not enough, with presence cycling or not.
+  const tabsBefore = h.tabs.created.length;
   const offeredAt = h.port.posted.length;
   await h.port.inbound(claimSurfaceOffer(ids, [PROVIDER_HOST], "2030-06-01T00:00:00Z"));
+  await settle();
+  await h.idle!.set("idle");
+  await h.idle!.set("active");
+  await settle();
+  expect(
+    h.frames().slice(offeredAt).filter((frame) => frame.type === "institutional_claim_request"),
+  ).toEqual([]);
+  expect(h.tabs.created.length).toBe(tabsBefore);
+
+  // The operator opens it by name (`papio actions open`: the daemon sends its
+  // focus frame beside the candidate offer): the held offer runs and builds
+  // exactly one surface.
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "handoff_focus",
+    msg_id: "focus_signin_operator_closed",
+    job_id: ids.jobID,
+    seq: 8,
+    payload: {},
+  });
   const claim = await h.port.waitForFrame("institutional_claim_request", offeredAt);
   expect(claim.payload["candidate_id"]).toBe(ids.candidateID);
-  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).not.toBe(tabID);
+  const claimReply = institutionalClaimResponse(
+    ids.jobID, ids.candidateID, ids.claimID, ids.bindingID,
+  ) as { payload: Record<string, unknown> };
+  claimReply.payload["request_id"] = claim.payload["request_id"];
+  await h.port.inbound(claimReply);
+  await h.port.waitForFrame("institutional_bind_request", offeredAt);
+  expect(h.tabs.created.length).toBe(tabsBefore + 1);
 });
 
 // Measured live 2026-09-24 in Firefox, whose profile had no library session:
-// the paper above stayed `auth_pending` after the timeout closed its sign-in
-// tab, and `papio actions open` rebuilt the surface through the daemon's
-// candidate offer. The rebuilt tab's first resolver landing, before the
-// sign-in page loaded, was reported as a return from sign-in: auth_returned
-// timed from the closed tab's wall, a claim observation that closed that
-// wall's gate occurrence, and session evidence that re-offered a sibling as
+// the paper above stayed `auth_pending` after its sign-in tab closed, and
+// `papio actions open` rebuilt the surface through the daemon's candidate
+// offer. The rebuilt tab's first resolver landing, before the sign-in page
+// loaded, was reported as a return from sign-in: auth_returned timed from the
+// closed tab's wall, a claim observation that closed that wall's gate
+// occurrence, and session evidence that re-offered a sibling as
 // "institutional_session_live". The daemon then refused the rebuilt tab's own
 // wall_observed and login_started, so the sign-in nobody had done looked done.
 test("a rebuilt sign-in surface reports no return for its landing before the wall", async () => {
@@ -5626,11 +5846,12 @@ test("a rebuilt sign-in surface reports no return for its landing before the wal
   const h = makeHarness(undefined, { windows: true });
   installManagedTabLedger(h, {});
   await h.bridge.start();
-  const { acked } = await timedOutSignInSurface(h, ids, "https://resolver.example.edu");
-  expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({
-    status: "auth_pending",
-    tab_id: -1,
-  });
+  const { acked } = await operatorClosedSignInSurface(h, ids, "https://resolver.example.edu");
+  expect(findByJob(h.backend.store, ids.jobID)).toBeUndefined();
+  // The operator opens it by name (the daemon's handoff_focus lands here), so
+  // the daemon's next candidate offer is allowed to build the surface.
+  const internals = h.bridge as unknown as { signIn: SignInLifecycle };
+  await internals.signIn.markExplicit(ids.jobID, true);
 
   const resolverURL = "https://resolver.example.edu/openurl?rebuilt=1";
   const rebuiltAt = h.port.posted.length;
@@ -5652,50 +5873,485 @@ test("a rebuilt sign-in surface reports no return for its landing before the wal
   expect(h.frames().slice(rebuiltAt).filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
 });
 
-// The same live state, seen from the popup: eight papers listed under Focus,
-// none with a tab, and a real click on Focus changed nothing.
-test("the operator's Open on a paper whose sign-in surface timed out asks for a fresh surface", async () => {
+// (d) MV3 sleeps the worker ~30s after the last event and a human signing in
+// takes minutes, so the common case is a worker that died mid-sign-in.
+test("a worker restart mid-sign-in restores the surface, closes nothing, and still repairs a stale form", async () => {
   const ids = {
-    jobID: "job_surface_timed_out_open",
-    candidateID: "cand_surface_timed_out_open",
-    claimID: "claim_surface_timed_out_open",
-    bindingID: "bind_surface_timed_out_open",
+    jobID: "job_signin_worker_restart",
+    candidateID: "cand_signin_worker_restart",
+    claimID: "claim_signin_worker_restart",
+    bindingID: "bind_signin_worker_restart",
   };
-  const h = makeHarness(undefined, { windows: true });
+  const h = makeHarness(undefined, { windows: true, idle: true });
   installManagedTabLedger(h, {});
   await h.bridge.start();
-  await timedOutSignInSurface(h, ids);
-  expect(findByJob(h.backend.store, ids.jobID)).toMatchObject({
-    status: "auth_pending",
-    tab_id: -1,
+  const { tabID } = await signInAtIdP(h, ids);
+  await h.idle!.set("idle");
+  expect(h.signInRecords.current).toMatchObject({
+    [ids.jobID]: { phase: "away", tab_id: tabID },
   });
 
-  const framesBefore = h.port.posted.length;
-  const opening = h.bridge.openHandoff(ids.jobID);
-  const consult = await h.port.waitForFrame("authentication_claim_request", framesBefore);
-  expect(consult.payload["candidate_id"]).toBe(ids.candidateID);
-  expect(consult.payload["trigger"]).toBe("explicit");
-  await h.port.inbound(
-    claimResponse(ids.jobID, consult.payload["request_id"], {
-      outcome: "open_new",
-      authentication_claim_id: `auth_${ids.claimID}`,
-      browser_holder_generation: 1,
-      gate_occurrence_id: `occ_reopen_${ids.claimID}`,
-      lease_until: "2030-01-01T00:00:00Z",
-    }),
-  );
-  const link = await h.port.waitForFrame("handoff_link_request", framesBefore);
-  await h.port.inbound(
+  const restarted = restartWorker(h);
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck({
+    features: CLAIM_SURFACE_FEATURES,
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  await settle();
+  expect(restarted.signInRecords.current).toMatchObject({
+    [ids.jobID]: { phase: "away", tab_id: tabID },
+  });
+
+  // Every close path of the new worker runs and none takes the tab.
+  restarted.clock.now += 40 * 60_000;
+  for (const timer of restarted.timers.filter((entry) => entry.ms === 180_000)) void timer.fn();
+  expect(await restarted.bridge.reconcileOwnedTabs()).toEqual({ closed: 0 });
+  await settle();
+  expect(restarted.tabs.snapshot(tabID)).toBeDefined();
+  expect(surfaceCloseRequests(restarted)).toEqual([]);
+
+  // The return arrives at the NEW worker and repairs the form in place.
+  const framesBefore = restarted.port.posted.length;
+  await restarted.idle!.set("active");
+  const link = await restarted.port.waitForFrame("handoff_link_request", framesBefore);
+  const fresh = `https://${PROVIDER_HOST}/fresh?after-restart=1`;
+  await restarted.port.inbound(
     nativeResult("handoff_link_result", {
       request_id: link.payload["request_id"],
       outcome: "opened",
-      url: `https://${PROVIDER_HOST}/fresh?reopen=1`,
+      url: fresh,
     }),
   );
-  expect(await opening).toEqual({ ok: true, opened: true });
-  const reopened = findByJob(h.backend.store, ids.jobID);
-  expect(reopened?.tab_id).toBeGreaterThanOrEqual(0);
-  expect(h.tabs.snapshot(reopened?.tab_id ?? -1)?.url).toBe(`https://${PROVIDER_HOST}/fresh?reopen=1`);
+  await settle();
+  expect(restarted.tabs.navigations[restarted.tabs.navigations.length - 1]).toEqual({ tabID, url: fresh });
+  expect(surfaceCloseRequests(restarted)).toEqual([]);
+});
+
+// (e) Opening is presence-gated, durably: an offer that arrives while the
+// operator is away creates no tab, and the active transition runs it.
+test("an offer for a sign-in waits while the operator is away and opens on the active transition", async () => {
+  const ids = {
+    jobID: "job_signin_offer_gated",
+    candidateID: "cand_signin_offer_gated",
+    claimID: "claim_signin_offer_gated",
+    bindingID: "bind_signin_offer_gated",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: CLAIM_SURFACE_FEATURES,
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  await h.idle!.set("idle");
+  const tabsBefore = h.tabs.created.length;
+  const offeredAt = h.port.posted.length;
+  await h.port.inbound(claimSurfaceOffer(ids, [PROVIDER_HOST]));
+  await settle();
+  expect(
+    h.frames().slice(offeredAt).filter((frame) => frame.type === "institutional_claim_request"),
+  ).toEqual([]);
+  expect(h.tabs.created.length).toBe(tabsBefore);
+  expect(h.signInRecords.current).toMatchObject({ [ids.jobID]: { phase: "offered", tab_id: -1 } });
+
+  // Locking is still away; only the active transition opens it.
+  await h.idle!.set("locked");
+  await settle();
+  expect(h.tabs.created.length).toBe(tabsBefore);
+  await h.idle!.set("active");
+  const claim = await h.port.waitForFrame("institutional_claim_request", offeredAt);
+  expect(claim.payload["candidate_id"]).toBe(ids.candidateID);
+});
+
+test("an offer waits while every browser window is minimized and opens when one is back", async () => {
+  const ids = {
+    jobID: "job_signin_offer_minimized",
+    candidateID: "cand_signin_offer_minimized",
+    claimID: "claim_signin_offer_minimized",
+    bindingID: "bind_signin_offer_minimized",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({
+    features: CLAIM_SURFACE_FEATURES,
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  h.windows!.userWindowState = "minimized";
+  const offeredAt = h.port.posted.length;
+  await h.port.inbound(claimSurfaceOffer(ids, [PROVIDER_HOST]));
+  await settle();
+  expect(
+    h.frames().slice(offeredAt).filter((frame) => frame.type === "institutional_claim_request"),
+  ).toEqual([]);
+
+  h.windows!.userWindowState = "normal";
+  await h.windows!.onFocusChanged.emit(1);
+  const claim = await h.port.waitForFrame("institutional_claim_request", offeredAt);
+  expect(claim.payload["candidate_id"]).toBe(ids.candidateID);
+});
+
+// Rule 5: a tab that vanishes with no message reads as a defect.
+test("papio says why when the daemon ends a sign-in request the operator was using", async () => {
+  const ids = {
+    jobID: "job_signin_request_ended",
+    candidateID: "cand_signin_request_ended",
+    claimID: "claim_signin_request_ended",
+    bindingID: "bind_signin_request_ended",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID } = await signInAtIdP(h, ids);
+  // The operator looked at it, then looked away.
+  await h.tabs.userActivate(tabID);
+  expect(h.signInRecords.current).toMatchObject({ [ids.jobID]: { attended: true } });
+  h.windows!.live.get(h.backend.store.workWindowID ?? -1)!.focused = false;
+  await h.tabs.update(tabID, { active: false });
+
+  const framesBefore = h.port.posted.length;
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "cancel",
+    msg_id: "cancel_request_ended",
+    job_id: ids.jobID,
+    seq: 9,
+    payload: {},
+  });
+  const close = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(close.payload["disposition"]).toBe("job_inactive");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: close.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-request-ended",
+      nonce: "nonce-request-ended",
+      browser_holder_generation: 1,
+    }),
+  );
+  await settle();
+  expect(h.tabs.removed).toContain(tabID);
+  const internals = h.bridge as unknown as {
+    toastPending(): { kind: string; job_id: string } | undefined;
+  };
+  expect(internals.toastPending()).toEqual({ kind: "sign_in_ended", job_id: ids.jobID });
+  expect(h.signInRecords.current).toEqual({});
+});
+
+// Intent: an address the operator types into the sign-in tab for somewhere
+// unrelated takes the tab out of papio's hands. It is ceded, never closed.
+test("an address typed into a sign-in tab for an unrelated site takes the tab over", async () => {
+  const ids = {
+    jobID: "job_signin_typed_away",
+    candidateID: "cand_signin_typed_away",
+    claimID: "claim_signin_typed_away",
+    bindingID: "bind_signin_typed_away",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, acked } = await signInAtIdP(h, ids);
+
+  // Typing the institution's own sign-in address is still sign-in.
+  await h.webNavigation.onCommitted.emit({
+    tabId: tabID,
+    frameId: 0,
+    url: "https://idp.example.edu/other",
+    transitionType: "typed",
+    transitionQualifiers: ["from_address_bar"],
+  });
+  await settle();
+  expect(h.signInRecords.current).toMatchObject({ [ids.jobID]: { tab_id: tabID } });
+  expect((ledger.current()[String(tabID)] as SurfaceBirthRecord).ceded).toBeUndefined();
+
+  await h.webNavigation.onCommitted.emit({
+    tabId: tabID,
+    frameId: 0,
+    url: "https://news.example.org/story",
+    transitionType: "typed",
+    transitionQualifiers: ["from_address_bar"],
+  });
+  await settle();
+  expect(h.signInRecords.current).toEqual({});
+  expect(ledger.current()[String(tabID)]).toMatchObject({
+    ceded: true,
+    ceded_reason: "operator_navigated",
+  });
+  expect(h.tabs.removed).not.toContain(tabID);
+  // The job is detached from the ceded tab and its drive slot is free, so no
+  // later tab event finds the job through this tab.
+  const internals = h.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(-1);
+  expect(internals.handoffDrives.has(ids.jobID)).toBe(false);
+  // The claim is reported abandoned the way an operator close reports it.
+  expect(await ackClaimObservations(h, acked)).toContain("owner_closed");
+  expect(surfaceCloseRequests(h).map((frame) => frame.payload["disposition"])).toContain(
+    "claim_abandoned",
+  );
+  // An unrelated PDF the operator typed their way to is not this job's viewer.
+  await h.tabs.completeNavigation(tabID, "https://news.example.org/paper.pdf");
+  await settle();
+  expect(h.downloads.started).toEqual([]);
+  expect(h.frames().filter((frame) => frame.type === "provider_outcome")).toEqual([]);
+  expect(h.tabs.removed).not.toContain(tabID);
+});
+
+// The daemon reads an applied owner_closed as the operator giving up and then
+// holds its re-offers, so papio must never report one for a removal it caused.
+test("owner_closed is reported for an operator close and never for a papio-authorized close", async () => {
+  const operator = {
+    jobID: "job_owner_closed_operator",
+    candidateID: "cand_owner_closed_operator",
+    claimID: "claim_owner_closed_operator",
+    bindingID: "bind_owner_closed_operator",
+  };
+  const hOperator = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(hOperator, {});
+  await hOperator.bridge.start();
+  await operatorClosedSignInSurface(hOperator, operator); // asserts owner_closed
+
+  const ids = {
+    jobID: "job_owner_closed_papio",
+    candidateID: "cand_owner_closed_papio",
+    claimID: "claim_owner_closed_papio",
+    bindingID: "bind_owner_closed_papio",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, acked } = await signInAtIdP(h, ids);
+  h.windows!.live.get(h.backend.store.workWindowID ?? -1)!.focused = false;
+  await h.tabs.update(tabID, { active: false });
+  const framesBefore = h.port.posted.length;
+  await h.port.inbound({
+    protocol: "papio-browser/1",
+    type: "cancel",
+    msg_id: "cancel_owner_closed_papio",
+    job_id: ids.jobID,
+    seq: 9,
+    payload: {},
+  });
+  const close = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(close.payload["disposition"]).toBe("job_inactive");
+  await h.port.inbound(
+    nativeResult("surface_close_response", {
+      request_id: close.payload["request_id"],
+      outcome: "authorized",
+      close_authorization_id: "auth-owner-closed-papio",
+      nonce: "nonce-owner-closed-papio",
+      browser_holder_generation: 1,
+    }),
+  );
+  await settle();
+  expect(h.tabs.removed).toContain(tabID);
+  expect(await ackClaimObservations(h, acked)).not.toContain("owner_closed");
+  expect(
+    h.frames().filter(
+      (frame) =>
+        frame.type === "claim_observation" &&
+        frame.payload["event_kind"] === "owner_closed",
+    ),
+  ).toEqual([]);
+});
+
+// The re-issue waits on the governor and a daemon round trip. Anything that
+// happens to the surface meanwhile cancels it.
+test("a delayed sign-in re-issue is abandoned when the operator looks at the tab or the tab moves", async () => {
+  for (const interference of ["attention", "progress", "closed"] as const) {
+    const ids = {
+      jobID: `job_signin_fence_${interference}`,
+      candidateID: `cand_signin_fence_${interference}`,
+      claimID: `claim_signin_fence_${interference}`,
+      bindingID: `bind_signin_fence_${interference}`,
+    };
+    const h = makeHarness(undefined, { windows: true, idle: true });
+    installManagedTabLedger(h, {});
+    await h.bridge.start();
+    const { tabID } = await signInAtIdP(h, ids);
+    await h.idle!.set("idle");
+    h.clock.now += 40 * 60_000;
+    const framesBefore = h.port.posted.length;
+    await h.idle!.set("active");
+    const link = await h.port.waitForFrame("handoff_link_request", framesBefore);
+    // The route is still on its way when the surface changes.
+    if (interference === "attention") {
+      await h.tabs.onActivated.emit({ tabId: tabID, windowId: 1 });
+    } else if (interference === "progress") {
+      const mfa = "https://idp.example.edu/mfa";
+      await h.tabs.userNavigate(tabID, mfa);
+      await h.webNavigation.onCommitted.emit({ tabId: tabID, frameId: 0, url: mfa });
+    } else {
+      await h.tabs.userClose(tabID);
+    }
+    await settle();
+    const navigationsBefore = h.tabs.navigations.length;
+    await h.port.inbound(
+      nativeResult("handoff_link_result", {
+        request_id: link.payload["request_id"],
+        outcome: "opened",
+        url: `https://${PROVIDER_HOST}/fresh?fence=${interference}`,
+      }),
+    );
+    await settle();
+    expect(h.tabs.navigations.slice(navigationsBefore)).toEqual([]);
+  }
+});
+
+// Signed adapter control withholds every autonomous navigation, a re-issue
+// included. It is held for control's own recovery, not dropped and not run.
+test("a sign-in re-issue withheld by adapter control is held and replayed when control permits", async () => {
+  const ids = {
+    jobID: "job_signin_reissue_control",
+    candidateID: "cand_signin_reissue_control",
+    claimID: "claim_signin_reissue_control",
+    bindingID: "bind_signin_reissue_control",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID } = await signInAtIdP(h, ids);
+  const internals = h.bridge as unknown as {
+    controlWithholds: (job: unknown) => boolean;
+    onControlChanged: (wasBlocked: boolean) => void;
+  };
+  const original = internals.controlWithholds;
+  internals.controlWithholds = () => true;
+  await h.idle!.set("idle");
+  h.clock.now += 40 * 60_000;
+  const framesBefore = h.port.posted.length;
+  await h.idle!.set("active");
+  await settle();
+  expect(
+    h.frames().slice(framesBefore).filter((frame) => frame.type === "handoff_link_request"),
+  ).toEqual([]);
+  expect(h.tabs.navigations.filter((nav) => nav.tabID === tabID && nav.url.includes("fresh"))).toEqual([]);
+
+  internals.controlWithholds = original;
+  internals.onControlChanged(false);
+  const link = await h.port.waitForFrame("handoff_link_request", framesBefore);
+  expect(link.payload["job_id"]).toBe(ids.jobID);
+});
+
+// A sign-in waits for a human, not for papio: it must not hold the one
+// provider drive slot while it waits.
+test("a sign-in waiting for the operator yields the drive slot to an unrelated paper and takes one back on return", async () => {
+  const ids = {
+    jobID: "job_signin_yields_slot",
+    candidateID: "cand_signin_yields_slot",
+    claimID: "claim_signin_yields_slot",
+    bindingID: "bind_signin_yields_slot",
+  };
+  // Recent release evidence for the institution lets an unrelated paper's
+  // handoff open as soon as a drive slot is free.
+  const h = makeHarness(
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+    },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, acked } = await signInAtIdP(h, ids);
+  const internals = h.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+    queuedDriveJobIDs: Set<string>;
+  };
+  expect(internals.handoffDrives.has(ids.jobID)).toBe(false);
+
+  await h.port.inbound(jobOffer("job_unrelated_paper"));
+  await settle();
+  expect(findByJob(h.backend.store, "job_unrelated_paper")?.tab_id).toBeGreaterThanOrEqual(0);
+  expect(internals.handoffDrives.has("job_unrelated_paper")).toBe(true);
+
+  // The sign-in returns while the slot is busy: it queues, and keeps its tab.
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/sign-in?yield=1`);
+  expect(await ackClaimObservations(h, acked)).toContain("auth_returned");
+  await settle();
+  expect(internals.queuedDriveJobIDs.has(ids.jobID)).toBe(true);
+  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(tabID);
+});
+
+// The yield is durable: the startup scan used to re-register the retained
+// sign-in tab as a drive and spend the only slot on a person's wait.
+test("a worker restart mid-sign-in leaves the drive slot free for an unrelated paper", async () => {
+  const ids = {
+    jobID: "job_signin_restart_slot",
+    candidateID: "cand_signin_restart_slot",
+    claimID: "claim_signin_restart_slot",
+    bindingID: "bind_signin_restart_slot",
+  };
+  const h = makeHarness(
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
+    },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID } = await signInAtIdP(h, ids);
+  expect(h.signInRecords.current).toMatchObject({ [ids.jobID]: { yielded: true } });
+
+  const restarted = restartWorker(h);
+  const timersBefore = restarted.timers.filter((timer) => timer.ms === 180_000).length;
+  await restarted.bridge.start();
+  await restarted.port.inbound(helloAck({
+    features: CLAIM_SURFACE_FEATURES,
+    resolver_origins: ["https://resolver.example.edu"],
+    browser_holder_generation: 1,
+  }));
+  await settle();
+  const internals = restarted.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+    queuedDriveJobIDs: Set<string>;
+  };
+  // Immediately after startup: no drive for the human wait, no provider clock.
+  expect(internals.handoffDrives.size).toBe(0);
+  expect(restarted.timers.filter((timer) => timer.ms === 180_000).length).toBe(timersBefore);
+
+  await restarted.port.inbound(jobOffer("job_unrelated_after_restart"));
+  await settle();
+  expect(findByJob(restarted.backend.store, "job_unrelated_after_restart")?.tab_id)
+    .toBeGreaterThanOrEqual(0);
+
+  // The return still takes a slot back, queueing while the slot is busy.
+  await restarted.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/sign-in?restart=1`);
+  await settle();
+  expect(restarted.frames().filter((frame) => frame.type === "auth_returned")).toHaveLength(1);
+  expect(internals.queuedDriveJobIDs.has(ids.jobID)).toBe(true);
+});
+
+// Typing into a tab that is already selected produces no activation and no
+// navigation, so the re-issue must look at the tab itself.
+test("a returning operator typing into the selected sign-in tab is never re-issued over", async () => {
+  const ids = {
+    jobID: "job_signin_typing_return",
+    candidateID: "cand_signin_typing_return",
+    claimID: "claim_signin_typing_return",
+    bindingID: "bind_signin_typing_return",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID } = await signInAtIdP(h, ids);
+  await h.idle!.set("idle");
+  h.clock.now += 40 * 60_000;
+  // The operator is back with the sign-in tab selected in a focused window.
+  h.windows!.live.get(h.backend.store.workWindowID ?? -1)!.focused = true;
+  h.windows!.live.get(h.backend.store.workWindowID ?? -1)!.state = "normal";
+  h.tabs.patch(tabID, { active: true });
+  const framesBefore = h.port.posted.length;
+  const navigationsBefore = h.tabs.navigations.length;
+  await h.idle!.set("active");
+  await settle();
+  expect(
+    h.frames().slice(framesBefore).filter((frame) => frame.type === "handoff_link_request"),
+  ).toEqual([]);
+  expect(h.tabs.navigations.slice(navigationsBefore)).toEqual([]);
 });
 
 // A paper can also hold the id of a tab that no longer exists: the offer
@@ -11194,21 +11850,10 @@ async function signInOutlivesDrive(opts: { firefox: boolean; rules?: FakeSession
   expect(timeout).toBeDefined();
   h.clock.now += 180_000;
   const framesBefore = h.port.posted.length;
-  const timingOut = timeout!.fn();
-  const parkClose = await h.port.waitForFrame("surface_close_request", framesBefore);
-  expect(parkClose.payload["disposition"]).toBe("handoff_parked");
-  await h.port.inbound(nativeResult("surface_close_response", {
-    request_id: parkClose.payload["request_id"],
-    outcome: "authorized",
-    close_authorization_id: "close_signin_outlived",
-    nonce: "nonce_signin_outlived",
-    browser_holder_generation: 1,
-  }));
-  await timingOut;
-  expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(-1);
-
-  await h.port.inbound(claimSurfaceOffer(ids, providerHosts, "2030-01-02T00:00:00Z"));
-  await settle();
+  await timeout!.fn();
+  // The drive bound does not apply to the sign-in: nothing is parked, closed
+  // or detached, and the operator finishes in the same tab.
+  expect(h.port.posted.length).toBe(framesBefore);
   expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(tabID);
 
   await h.tabs.completeNavigation(tabID, articleURL);
@@ -17485,62 +18130,6 @@ test("handoff governor keeps one drive, drains FIFO on settle and timeout", asyn
   expect(parked?.engagement_required).toBe(true);
 });
 
-test("a drive timing out on an authentication page leaves the tab open and frees the governor slot", async () => {
-  // papio-63955092613c7e9c: closing the tab here would destroy whatever the
-  // operator has already done on a slow institutional login — a half-filled
-  // IdP form, entered credentials, or an in-flight 2FA challenge — at the
-  // 3-minute mark with no warning. parkHandoffForManual's own contract is to
-  // leave that page for the operator; only the governor slot is freed.
-  const h = makeHarness({
-    ...emptyStore(),
-    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
-  });
-  await h.bridge.start();
-  const jobIDs = Array.from(
-    { length: 3 },
-    (_, index) => `job_auth_timeout_${index}`,
-  );
-  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
-
-  expect(h.tabs.list().length).toBe(1);
-  expect(
-    h.backend.store.activeJobs.filter((job) => job.tab_id < 0),
-  ).toHaveLength(2);
-  const first = h.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[0],
-  );
-  const firstTabID = first?.tab_id ?? -1;
-  expect(firstTabID).toBeGreaterThanOrEqual(0);
-
-  // The operator is mid-login on the resolver's IdP when the governor timer fires.
-  const idpURL = "https://idp.example.edu/sso";
-  h.tabs.seed({ id: firstTabID, url: idpURL });
-
-  const authTimeouts = h.timers.filter((t) => t.ms === 180_000);
-  expect(authTimeouts).toHaveLength(1);
-
-  h.clock.now += 180_000;
-  await authTimeouts[0]?.fn();
-
-  expect(h.tabs.removed).not.toContain(firstTabID);
-  expect(h.tabs.snapshot(firstTabID) !== undefined).toBe(true);
-  const after = h.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[0],
-  );
-  expect(after?.status).toBe("auth_pending");
-  expect(after?.tab_id).toBe(-1);
-  expect(
-    h.frames().filter((frame) => frame.type === "auth_pending"),
-  ).toHaveLength(1);
-
-  // The next FIFO job now drives after the parked job frees its slot.
-  expect(h.tabs.created).toHaveLength(2);
-  const second = h.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[1],
-  );
-  expect(second?.tab_id).toBeGreaterThanOrEqual(0);
-});
-
 // A timeout is a fact about papio's own clock, never about the page. This test
 // used to assert the opposite - that a drive spent on an ordinary provider page
 // reports `auth_pending`, with its own comment noting no IdP navigation had
@@ -17814,152 +18403,6 @@ test("a hydrated queued handoff without its worker-local offer URL is left for t
   await h.port.inbound(jobOffer(jobID));
   expect(h.frames().filter((frame) => frame.type === "job_reject")).toEqual([]);
   expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
-});
-
-test("a timeout-detached auth job survives restart without re-consuming its governor slot", async () => {
-  const first = makeHarness({
-    ...emptyStore(),
-    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
-  });
-  await first.bridge.start();
-  const jobIDs = Array.from(
-    { length: 3 },
-    (_, index) => `job_park_restart_${index}`,
-  );
-  for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
-
-  const parkedTabID =
-    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])
-      ?.tab_id ?? -1;
-  expect(parkedTabID).toBeGreaterThanOrEqual(0);
-  const activeTabID =
-    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])
-      ?.tab_id ?? -1;
-  expect(activeTabID).toBe(-1);
-  first.tabs.seed({ id: parkedTabID, url: "https://idp.example.edu/sso" });
-  await first.tabs.userActivate(parkedTabID);
-  const authTimeouts = first.timers.filter((t) => t.ms === 180_000);
-  expect(authTimeouts).toHaveLength(1);
-  first.clock.now += 180_000;
-  await authTimeouts[0]?.fn();
-
-  const parkedAfterTimeout = first.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[0],
-  );
-  expect(parkedAfterTimeout?.status).toBe("auth_pending");
-  expect(parkedAfterTimeout?.tab_id).toBe(-1);
-  expect(parkedAfterTimeout?.parked_with_tab).toBeUndefined();
-  expect(first.tabs.snapshot(parkedTabID) !== undefined).toBe(true);
-  expect(
-    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1])
-      ?.tab_id,
-  ).toBeGreaterThanOrEqual(0);
-
-  const survivingTabs = first.backend.store.activeJobs
-    .filter((job) => job.tab_id >= 0)
-    .map((job) => [job.job_id, job.tab_id] as const);
-  expect(survivingTabs).toHaveLength(1);
-  const restarted = makeHarness(
-    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
-  );
-  for (const [, tabID] of survivingTabs)
-    restarted.tabs.seed({ id: tabID, url: OPENURL });
-  await restarted.bridge.start();
-  const restartedInternal = restarted.bridge as unknown as {
-    handoffDrives: Map<string, { tabID: number }>;
-  };
-  const restartedParked = restarted.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[0],
-  );
-  expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(false);
-  expect(restartedParked?.tab_id).toBe(-1);
-  expect(restartedParked?.status).toBe("auth_pending");
-  expect(restartedParked?.parked_with_tab).toBeUndefined();
-  expect(restartedInternal.handoffDrives.has(jobIDs[1]!)).toBe(true);
-  expect(restartedInternal.handoffDrives.has(jobIDs[2]!)).toBe(false);
-  expect(restartedInternal.handoffDrives.size).toBe(1);
-  expect(restarted.timers.filter((t) => t.ms === 180_000)).toHaveLength(1);
-});
-
-test("a timeout-detached job does not re-associate an operator tab", async () => {
-  const h = makeHarness({
-    ...emptyStore(),
-    lastAuthReturnedAt: 1_700_000_000_000,
-  });
-  await h.bridge.start();
-  const jobIDs = ["job_park_clear_0", "job_park_clear_1"];
-  for (const jobID of jobIDs) await h.port.inbound(jobOffer(jobID));
-
-  const detachedTabID =
-    h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])
-      ?.tab_id ?? -1;
-  expect(detachedTabID).toBeGreaterThanOrEqual(0);
-  h.tabs.seed({ id: detachedTabID, url: "https://idp.example.edu/sso" });
-  const timeout = h.timers.find((t) => t.ms === 180_000);
-  h.clock.now += 180_000;
-  await timeout?.fn();
-  const detached = h.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[0],
-  );
-  expect(detached?.status).toBe("auth_pending");
-  expect(detached?.tab_id).toBe(-1);
-  expect(detached?.parked_with_tab).toBeUndefined();
-  expect(h.tabs.snapshot(detachedTabID) !== undefined).toBe(true);
-
-  const providerURL = `https://${PROVIDER_HOST}/stable/returned`;
-  await h.tabs.userNavigate(detachedTabID, providerURL);
-  const unchanged = h.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[0],
-  );
-  expect(unchanged?.status).toBe("auth_pending");
-  expect(unchanged?.tab_id).toBe(-1);
-});
-test("a timeout-detached job stays outside the governor until a fresh drive", async () => {
-  const first = makeHarness({
-    ...emptyStore(),
-    authEvidenceByOrigin: { "https://resolver.example.edu": 1_700_000_000_000 },
-  });
-  await first.bridge.start();
-  const jobIDs = Array.from(
-    { length: 3 },
-    (_, index) => `job_resume_capacity_${index}`,
-  );
-  for (const jobID of jobIDs) await first.port.inbound(jobOffer(jobID));
-
-  const detachedTabID =
-    first.backend.store.activeJobs.find((job) => job.job_id === jobIDs[0])
-      ?.tab_id ?? -1;
-  expect(detachedTabID).toBeGreaterThanOrEqual(0);
-  first.tabs.seed({ id: detachedTabID, url: "https://idp.example.edu/sso" });
-  const authTimeouts = first.timers.filter((t) => t.ms === 180_000);
-
-  expect(authTimeouts).toHaveLength(1);
-  first.clock.now += 180_000;
-  await authTimeouts[0]?.fn();
-
-  const beforeResume = first.bridge as unknown as {
-    handoffDrives: Map<string, unknown>;
-  };
-  expect(beforeResume.handoffDrives.size).toBe(1);
-  expect(beforeResume.handoffDrives.has(jobIDs[0]!)).toBe(false);
-  const resumed = await first.bridge.resumeHandoffAfterManual(jobIDs[0]!);
-  expect(resumed).toBe(false);
-  const detached = first.backend.store.activeJobs.find(
-    (job) => job.job_id === jobIDs[0],
-  );
-  expect(detached?.tab_id).toBe(-1);
-  expect(detached?.status).toBe("auth_pending");
-  expect(detached?.parked_with_tab).toBeUndefined();
-  expect(first.tabs.snapshot(detachedTabID) !== undefined).toBe(true);
-
-  const restarted = makeHarness(
-    JSON.parse(JSON.stringify(first.backend.store)) as StoreShape,
-  );
-  await restarted.bridge.start();
-  const restartedInternal = restarted.bridge as unknown as {
-    handoffDrives: Map<string, unknown>;
-  };
-  expect(restartedInternal.handoffDrives.has(jobIDs[0]!)).toBe(false);
 });
 
 // isDirectFileOffer is a URL-SHAPE heuristic, and an institutional handoff's
@@ -19292,50 +19735,6 @@ test("startup reconciliation retains an active orphan rather than ceding or clos
   // unknown cause is ambiguous and ambiguity retains. Ceding here made every
   // tab papio opened permanently unretirable.
   expect(internals.tabLedgerCache[String(tabID)]?.ceded).toBeUndefined();
-});
-
-// The retry that makes retaining safe: a surface retained because it was the
-// foreground tab retires the moment it stops being one. Without it, "retain
-// instead of cede" would simply postpone the litter forever, since nothing
-// else revisits an owned tab between worker starts.
-test("an owned surface papio focused retires when the operator moves to another tab", async () => {
-  const h = makeHarness(undefined, { windows: true });
-  await h.bridge.start();
-  const { tabID, bindingID } = await seedOwnedScaffold(h);
-  const internals = h.bridge as unknown as {
-    tabLedgerCache: Record<string, SurfaceBirthRecord>;
-    focusOwnedTab: (tabID: number) => Promise<void>;
-  };
-  internals.tabLedgerCache[String(tabID)] = {
-    ...internals.tabLedgerCache[String(tabID)]!,
-    binding_id: bindingID,
-    job_id: "job_focused_then_left_0001",
-  };
-  await internals.focusOwnedTab(tabID);
-  expect(internals.tabLedgerCache[String(tabID)]?.ceded).toBeUndefined();
-
-  const otherTabID = await h.tabs.create({
-    url: "https://example.edu/reading",
-    active: false,
-  });
-  const framesBefore = h.port.posted.length;
-  const switching = h.tabs.userActivate(otherTabID.id ?? -1);
-  const request = await h.port.waitForFrame("surface_close_request", framesBefore);
-  expect(request.payload).toMatchObject({
-    binding_id: bindingID,
-    disposition: "job_inactive",
-  });
-  await h.port.inbound(
-    nativeResult("surface_close_response", {
-      request_id: request.payload["request_id"],
-      outcome: "authorized",
-      close_authorization_id: "auth-deactivated",
-      nonce: "nonce-deactivated",
-      browser_holder_generation: 1,
-    }),
-  );
-  await switching;
-  expect(h.tabs.removed).toContain(tabID);
 });
 
 test("created broker tabs are ledgered durably and forgotten once they close", async () => {
@@ -24989,20 +25388,17 @@ test("a durable cancel retires a ledger-only surface after browser-local job sta
       browser_holder_generation: 1,
     }),
   );
-  const observation = await h.port.waitForFrame("claim_observation");
-  expect(observation.job_id).toBe(jobID);
-  expect(observation.payload).toMatchObject({
-    binding_id: bindingID,
-    event_kind: "owner_closed",
-  });
-  await h.port.inbound(
-    observationAck(jobID, observation.payload["request_id"], {
-      outcome: "applied",
-      gate_occurrence_id: "gate-occ-ledger-only-0001",
-      browser_holder_generation: 1,
-      lease_until: "2026-08-20T04:30:00Z",
-    }),
-  );
+  // The daemon retired the request and papio's own authorized close removed
+  // the tab. The daemon reads an applied owner_closed as the operator giving
+  // up and then holds its re-offers, so no owner_closed is reported for it.
+  await settle();
+  expect(
+    h.frames().filter(
+      (frame) =>
+        frame.type === "claim_observation" &&
+        frame.payload["event_kind"] === "owner_closed",
+    ),
+  ).toEqual([]);
   expect(h.tabs.removed).toContain(tabID);
   expect(h.tabs.snapshot(tabID)).toBeUndefined();
   expect(h.frames().some((f) => f.type === "provider_outcome")).toBe(false);
@@ -25050,15 +25446,17 @@ test("Slice 2b: an operator activation defers papio's close and cedes nothing", 
       }),
     );
   };
-  // In front of the operator: deferred, and the tombstone stays replayable.
+  // In front of the operator: refused now, and no tombstone is left to close
+  // it later. A close that has to wait for the operator to look away is the
+  // wrong close.
   let framesBefore = h.frames().length;
   const deferred = closeInternals(h).closeOwnedSurface(tabID, "scaffold_idle");
   await authorize(framesBefore, 1);
   await expect(deferred).resolves.toEqual({ closed: false });
   expect(h.tabs.removed).not.toContain(tabID);
-  expect(closeInternals(h).tabLedgerCache[String(tabID)]?.pending_close).toBeDefined();
+  expect(closeInternals(h).tabLedgerCache[String(tabID)]?.pending_close).toBeUndefined();
 
-  // The operator looks elsewhere; the next attempt closes it.
+  // The operator looks elsewhere; a fresh attempt closes it.
   const other = await h.tabs.create({ url: "https://example.org/", active: false, windowId: 1 });
   await h.tabs.userActivate(other.id!);
   framesBefore = h.frames().length;
@@ -25114,7 +25512,28 @@ test("Review round finding 3: an operator activation landing inside the close wi
   const record = closeInternals(h).tabLedgerCache[String(tabID)];
   expect(record?.ceded).toBeUndefined();
   expect(record?.binding_id).toBe(bindingID);
-  expect(record?.pending_close).toBeDefined();
+  // No deferred close survives: nothing can replay a close the operator has
+  // just shown they do not want.
+  expect(record?.pending_close).toBeUndefined();
+
+  // So a close the operator makes afterwards is the operator's, and says so.
+  closeInternals(h).tabLedgerCache[String(tabID)] = {
+    ...record!,
+    job_id: "job_toctou_0001",
+    claim: {
+      authentication_claim_id: "auth-claim-toctou-0001",
+      gate_occurrence_id: "gate-occ-toctou-0001",
+      browser_holder_generation: 1,
+    },
+  };
+  await h.port.inbound(helloAck({
+    features: ["surface_close_v1", "institutional_authentication_claim_v1"],
+    browser_holder_generation: 1,
+  }));
+  const framesBefore = h.port.posted.length;
+  await h.tabs.userClose(tabID);
+  const observation = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(observation.payload["event_kind"]).toBe("owner_closed");
 });
 
 test("Scenario 6: papio's own focus_owner activation leaves no cession trace, and an activation an older build recorded as cession no longer holds the tab", async () => {

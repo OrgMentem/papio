@@ -1311,6 +1311,37 @@ func (js *Store) GetAuthenticationEntryLease(ctx context.Context, authentication
 	return getAuthenticationEntryLeaseTx(ctx, js.S.DB(), authenticationClaimID)
 }
 
+// LiveAuthenticationEntryLeaseForBinding returns the entry lease a surface
+// currently occupies: state reserved or human, owner_binding_id exactly this
+// binding, and not past its deadline. It reports false when the binding holds
+// no live sign-in slot.
+//
+// It is strictly read-only. GetAuthenticationEntryLease retires a lapsed
+// reservation as a side effect, which a close-authorization check must not do:
+// answering "may this tab close" is a question, not a lease transition. A
+// reserved lease past its deadline is reported as not live; an in-flight
+// provider effect on that binding is vetoed by the effect permit check, not
+// here. Binding ids are minted per claim and globally unique, so the binding
+// alone is an exact fence.
+func (js *Store) LiveAuthenticationEntryLeaseForBinding(ctx context.Context, bindingID string) (*AuthenticationEntryLease, bool, error) {
+	if strings.TrimSpace(bindingID) == "" {
+		return nil, false, errors.New("binding is required")
+	}
+	row := js.S.DB().QueryRowContext(ctx, authenticationEntryLeaseSelect+
+		` WHERE owner_binding_id=? AND state IN ('reserved','human')`, bindingID)
+	l, err := scanAuthenticationEntryLease(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if l.LeaseUntil != "" && l.LeaseUntil <= store.Now() {
+		return nil, false, nil
+	}
+	return &l, true, nil
+}
+
 // institutionalEffectInFlightTx reports whether a surface still holds an
 // unresolved institutional effect permit, which vetoes every replacement of
 // the entry lease that surface occupies. `settled` means the provider effect

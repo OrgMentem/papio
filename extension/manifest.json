@@ -24,6 +24,7 @@
     "alarms",
     "tabGroups",
     "webNavigation",
+    "idle",
     "declarativeNetRequestWithHostAccess"
   ],
   "host_permissions": [
