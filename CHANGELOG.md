@@ -179,6 +179,12 @@ execution records kept during the initial build.
   existing request.
 
 ### Changed
+- **The daemon can advertise up to 64 browser features, up from 32.** The
+  list was full, so new extension capabilities had to replace an old feature
+  name or add a separate `hello_ack` field. An extension from 0.15.0 already
+  accepts 64 features. An older extension receives only the first 32, the list
+  it was built against, so it keeps connecting. Nothing is advertised beyond 32
+  yet; this makes room for the next feature.
 - **Rewriting `config.toml` now keeps the previous file as `config.toml.bak`.**
   `papio init`, `config init --force`, `config set-access-mode` and the
   `config credentials` and `config agent` commands rebuild the file from its

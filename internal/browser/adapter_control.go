@@ -15,10 +15,10 @@ import (
 
 // AdapterControlMinExtensionVersion is the first extension whose strict
 // hello_ack parser accepts adapter_control and that speaks the
-// adapter_control_* frames. The hello_ack feature list is full at its
-// fail-closed cap of 32, so a capability flag gated by version, the same
-// mechanism as SessionRolesMinExtensionVersion, is the negotiation channel:
-// released 0.15.x rejects the whole ack if the field is present.
+// adapter_control_* frames. It shipped while the hello_ack feature list was
+// full at 32, so it is a capability flag gated by version, the same mechanism
+// as SessionRolesMinExtensionVersion: released 0.15.x rejects the whole ack if
+// the field is present.
 const AdapterControlMinExtensionVersion = "0.16.0"
 
 // AdapterControlSource is the daemon's canonical verified control.

@@ -197,6 +197,37 @@ func TestReleased014StaysPendingBehindA015Holder(t *testing.T) {
 	}
 }
 
+// TestHelloAckSendsLegacyPeersOnlyTheFirst32Features pins the stage-2 raise of
+// the hello_ack feature cap. A 33rd and 34th feature reach a 0.15.0 holder,
+// whose parser accepts 64. A released 0.14.0 parser rejects the whole ack above
+// 32, so it must get exactly the first 32, which pass its pinned rule.
+func TestHelloAckSendsLegacyPeersOnlyTheFirst32Features(t *testing.T) {
+	b, _, _, _ := newBridge(t)
+	if len(b.Features) != protocol.LegacyHelloAckFeatures {
+		t.Fatalf("baseline has %d features, want %d", len(b.Features), protocol.LegacyHelloAckFeatures)
+	}
+	base := slices.Clone(b.Features)
+	b.Features = append(slices.Clone(base), "test_feature_33_v1", "test_feature_34_v1")
+
+	msgs, _ := runSyncAs(t, b, sessA, helloAs("0.15.0"))
+	ack := firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil || !slices.Equal(ack.Payload.(*protocol.HelloAckPayload).Features, b.Features) {
+		t.Fatalf("0.15.0 hello_ack = %+v, want all %d features", msgs, len(b.Features))
+	}
+
+	if _, err := b.Sync(context.Background(), sessA, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	msgs, raw := runSyncAs(t, b, sessB, inFrame(t, protocol.MsgHello, "", map[string]any{"extension_version": "0.14.0"}))
+	for _, frame := range raw {
+		requireExt014Accepts(t, frame)
+	}
+	ack = firstOfType(msgs, protocol.MsgHelloAck)
+	if ack == nil || !slices.Equal(ack.Payload.(*protocol.HelloAckPayload).Features, base) {
+		t.Fatalf("0.14.0 hello_ack = %+v, want exactly the first 32 features", msgs)
+	}
+}
+
 // requireExt014Accepts pins the ext-v0.14.0 inbound rule for the only frame
 // types a denied or promoted session receives: the envelope
 // (extension/src/protocol.ts:2247-2301), error (:3714-3726), and hello_ack

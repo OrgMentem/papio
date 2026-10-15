@@ -953,7 +953,7 @@ const (
 	// extension asks for canonical control, the daemon answers with its
 	// verified suspension set, and the extension reports what it applied. They
 	// are gated by HelloAckPayload.AdapterControl, never by a feature flag (the
-	// list is full at its cap of 32).
+	// list was full at 32 when they shipped).
 	MsgAdapterControlRequest     = "adapter_control_request"
 	MsgAdapterControlResponse    = "adapter_control_response"
 	MsgAdapterControlApplyResult = "adapter_control_apply_result"
@@ -1292,6 +1292,18 @@ type HelloPayload struct {
 	Browser          string            `json:"browser,omitempty"`
 }
 
+// MaxHelloAckFeatures bounds hello_ack.features on both emit and decode. It
+// matches the accept cap that extensions from 0.15.0 enforce
+// (HELLO_ACK_FEATURES_ACCEPT_CAP in extension/src/protocol.ts) and the
+// schema's maxItems.
+const MaxHelloAckFeatures = 64
+
+// LegacyHelloAckFeatures is the hello_ack.features bound that every
+// extension below 0.15.0 enforces: a longer list makes it reject the whole
+// ack. The bridge sends such a peer only the first LegacyHelloAckFeatures
+// entries.
+const LegacyHelloAckFeatures = 32
+
 // HelloAckPayload announces the daemon version, supported bridge features and
 // the acknowledged session's role. Every field is optional so extensions stay
 // compatible with older daemons that acknowledge hello with an empty object.
@@ -1322,8 +1334,9 @@ type HelloAckPayload struct {
 	// adapter_control_request. It is a field on an existing strict frame, so
 	// the bridge emits it only to extensions at or above
 	// AdapterControlMinExtensionVersion; an older extension would reject the
-	// whole ack. The feature list is full at its fail-closed cap of 32, so a
-	// capability flag is the only negotiation channel left.
+	// whole ack. It was added while the feature list was full at 32; new
+	// boolean capabilities belong in Features now that it holds up to
+	// MaxHelloAckFeatures.
 	AdapterControl bool `json:"adapter_control,omitempty"`
 }
 
@@ -4915,8 +4928,8 @@ func (p *HelloAckPayload) validate() error {
 	if browserTextLen(p.DaemonVersion) > 50 {
 		return fmt.Errorf("hello_ack.daemon_version exceeds 50 chars")
 	}
-	if len(p.Features) > 32 {
-		return fmt.Errorf("hello_ack.features capped at 32")
+	if len(p.Features) > MaxHelloAckFeatures {
+		return fmt.Errorf("hello_ack.features capped at %d", MaxHelloAckFeatures)
 	}
 	for _, feature := range p.Features {
 		if feature == "" || browserTextLen(feature) > 64 {

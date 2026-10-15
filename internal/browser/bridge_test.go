@@ -1164,10 +1164,10 @@ func TestHelloAckAnnouncesDaemonVersion(t *testing.T) {
 	if payload.DaemonVersion != "0.1.0-test" {
 		t.Fatalf("daemon_version = %q, want 0.1.0-test", payload.DaemonVersion)
 	}
-	// This is the fail-closed 32-feature cap, exactly saturated
-	// (dev/active/claim-observation-protocol.md §1): institutionalAuthenticationClaimFeature
-	// is the 32nd and last slot. No feature may be added after it without
-	// retiring or consolidating an existing one first.
+	// The 32 features every extension receives. A later feature is appended
+	// after institutionalAuthenticationClaimFeature and reaches only
+	// extensions from WideHelloAckMinExtensionVersion (see
+	// TestHelloAckSendsLegacyPeersOnlyTheFirst32Features).
 	if !slices.Equal(payload.Features, []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, protocol.EffectPermitFeature, institutionalMaterializationFeature,
 		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature, surfaceCloseFeature,
@@ -17487,7 +17487,7 @@ func TestNativeViewerCapabilityKeepsOldPeersAndFeatureCap(t *testing.T) {
 // A peer that sends viewer_capture records learns that this daemon accepts
 // them from native_viewer_download_v2, which takes v1's slot: an older daemon
 // never advertises v2, so it never receives a frame it would reject, and the
-// emitted list stays at the 32-feature cap.
+// emitted list does not grow.
 func TestNativeViewerDownloadV2TakesV1SlotAndRecordsViewerCapture(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
 	id := park(t, jobs, "wr_viewer_capture_record", handoffWork())

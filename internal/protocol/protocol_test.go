@@ -179,8 +179,18 @@ func TestHelloAckPayloadRoundTripAndBounds(t *testing.T) {
 	if _, err := DecodeBrowserMessage(frame(map[string]any{"daemon_version": strings.Repeat("v", 51)})); err == nil {
 		t.Fatal("hello_ack accepted daemon_version longer than 50 chars")
 	}
-	if _, err := DecodeBrowserMessage(frame(map[string]any{"features": make([]string, 33)})); err == nil {
-		t.Fatal("hello_ack accepted more than 32 features")
+	features := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("feature_%02d_v1", i)
+		}
+		return out
+	}
+	if _, err := DecodeBrowserMessage(frame(HelloAckPayload{Features: features(MaxHelloAckFeatures)})); err != nil {
+		t.Fatalf("hello_ack rejected %d features: %v", MaxHelloAckFeatures, err)
+	}
+	if _, err := DecodeBrowserMessage(frame(HelloAckPayload{Features: features(MaxHelloAckFeatures + 1)})); err == nil || !strings.Contains(err.Error(), "hello_ack.features capped at 64") {
+		t.Fatalf("hello_ack with %d features: err = %v, want the 64 cap", MaxHelloAckFeatures+1, err)
 	}
 	if _, err := DecodeBrowserMessage(frame(map[string]any{"features": []any{nil}})); err == nil {
 		t.Fatal("hello_ack accepted null feature entry")

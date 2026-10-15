@@ -1770,15 +1770,11 @@ const ADAPTER_CONTROL_HOST_RE =
   /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?){0,8}$/;
 const ZOTERO_KEY_RE = /^[A-Za-z0-9]{1,32}$/;
 // HELLO_ACK_FEATURES_ACCEPT_CAP is the extension's accept-side bound on
-// hello_ack.features — deliberately wider than the 32-feature bound every
-// daemon still emits (internal/browser/bridge.go's `required` literal,
-// pinned exactly by bridge_test.go's TestHelloAckAnnouncesDaemonVersion).
-// This is stage 1 of a two-stage mixed-version migration: ship an extension
-// that tolerates a larger advertised set (unknown entries are simply never
-// matched by any `slices.Contains` check) before any daemon is allowed to
-// emit past 32. Raising the daemon's emitted cap is stage 2 and must not
-// happen until this accept-side change has been live for a full release.
-// See AGENTS.md's fail-closed-feature-bound note.
+// hello_ack.features, equal to the daemon's protocol.MaxHelloAckFeatures.
+// It was stage 1 of a two-stage mixed-version migration (shipped in 0.15.0;
+// unknown entries are never matched by any feature check). Stage 2 raised
+// the daemon's emitted cap to 64; the daemon still sends an extension below
+// 0.15.0 only the first 32. See AGENTS.md's fail-closed-feature-bound note.
 const HELLO_ACK_FEATURES_ACCEPT_CAP = 64;
 const utf8ByteLength = (value: string): number =>
   new TextEncoder().encode(value).byteLength;

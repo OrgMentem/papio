@@ -64,7 +64,7 @@ const (
 	nativeViewerDownloadFeature = "native_viewer_download_v1"
 	// nativeViewerDownloadV2Feature is v1 plus the viewer_capture record: the
 	// daemon accepts that message and attributes the bytes it names. It takes
-	// v1's slot for a peer that advertises both, so the 32-feature cap holds.
+	// v1's slot for a peer that advertises both, so the list does not grow.
 	nativeViewerDownloadV2Feature = "native_viewer_download_v2"
 	// manualDownloadActionKind is focusable and offerable, but never driven:
 	// the offer hands the institution's route to the human, who fetches the
@@ -122,13 +122,9 @@ const (
 	surfaceCloseFeature = protocol.SurfaceCloseFeature
 	// institutionalAuthenticationClaimFeature gates the full claim-request
 	// and claim-observation family (authentication_claim_request/response,
-	// claim_observation/claim_observation_ack). This is the 32nd and last
-	// advertised feature before the fail-closed 32-feature cap
-	// (protocol.go's hello.features/hello_ack.features bound, pinned by
-	// protocol_test.go) — no further protocol feature may be added without
-	// retiring or consolidating an existing one first (helloAck now replaces
-	// the redundant snapshot-v2 hint only for native-viewer-capable peers)
-	// (dev/active/claim-observation-protocol.md §1).
+	// claim_observation/claim_observation_ack). It is the 32nd feature, the
+	// last that every extension can receive: see WideHelloAckMinExtensionVersion
+	// for features after it.
 	institutionalAuthenticationClaimFeature = protocol.InstitutionalAuthenticationClaimFeature
 	// pdfGrabSuggestV1Feature gates the inbox's operator candidate picker:
 	// the pdf_grab_suggest_request/response ranked "which pending job is
@@ -151,6 +147,13 @@ const (
 	// its next popup refresh. It also has no pending role: it must hear only
 	// session_busy on a denied hello, the v0.21 wire it shipped against.
 	SessionRolesMinExtensionVersion = "0.15.0"
+	// WideHelloAckMinExtensionVersion is the first extension that accepts
+	// more than protocol.LegacyHelloAckFeatures hello_ack features (up to
+	// protocol.MaxHelloAckFeatures). helloAck sends an older or unversioned
+	// peer only the first LegacyHelloAckFeatures entries of its list, so a
+	// feature after the 32nd reaches 0.15.0+ only and MUST be appended after
+	// institutionalAuthenticationClaimFeature, never inserted before it.
+	WideHelloAckMinExtensionVersion = "0.15.0"
 	// pageBulkConsumer is the sole daemon-assigned consumer for every job
 	// created through page_bulk_submit_request (ADR-0019 Decision 6). The
 	// extension never supplies it.
@@ -697,9 +700,9 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 	required := []string{
 		pageAcquireFeature, triageSnapshotFeature, triageSnapshotSchema2Feature, triageMutationsFeature, reviewPreviewFeature, statsFeature, pageCaptureFeature, pageCaptureRequestFeature, activityFeedFeature, triageCountsSchema2Feature, sessionEvidenceFeature, deliveryContextFeature, pageCaptureTermsFeature, pageBulkAcquireFeature, triageSnapshotSchema3Feature, triageSnapshotSchema4Feature, pdfGrabV1Feature, handoffLinkV1Feature, providerDirectGetV1Feature, providerDriveEpochV1Feature, effectPermitFeature, institutionalMaterializationFeature,
 		surfacePresenceFeature, workPulseFeature, activityPageV2Feature, pageBulkCohortV2Feature, triageCountsSchema3Feature, triageSnapshotSchema5Feature, sessionRolesFeature, pdfGrabSuggestV1Feature, surfaceCloseFeature,
-		// institutionalAuthenticationClaimFeature is the 32nd and final slot
-		// under the fail-closed cap (see its own doc comment); do not add
-		// another feature after it without retiring one first.
+		// institutionalAuthenticationClaimFeature is the 32nd slot: every
+		// extension sees it. Append later features after it; extensions
+		// below WideHelloAckMinExtensionVersion do not receive them.
 		institutionalAuthenticationClaimFeature,
 	}
 	var grabs *grab.Service
@@ -1492,8 +1495,8 @@ func (b *Bridge) finishReloadRelease(departed *browserSession) {
 func (b *Bridge) helloAck(role, peerVersion string, peerFeatures []string) (json.RawMessage, error) {
 	features := slices.Clone(b.Features)
 	// A peer requesting native-viewer outcomes also supports snapshot v3+.
-	// Replace its redundant v2 hint rather than exceed the strict 32-feature
-	// wire cap. Older peers receive the unchanged capability list.
+	// Replace its redundant v2 hint. Older peers receive the unchanged
+	// capability list.
 	if slices.Contains(peerFeatures, nativeViewerDownloadFeature) && slices.Contains(features, triageSnapshotSchema3Feature) {
 		if i := slices.Index(features, triageSnapshotSchema2Feature); i >= 0 {
 			features[i] = nativeViewerDownloadFeature
@@ -1507,32 +1510,39 @@ func (b *Bridge) helloAck(role, peerVersion string, peerFeatures []string) (json
 		}
 	}
 	// Agent peers implement snapshot v5. Reuse its superseded v3 hint;
-	// older peers keep their exact list and the emitted cap stays at 32.
+	// older peers keep their exact list.
 	if b.agentBackend != nil && !b.agentClosed && slices.Contains(peerFeatures, agentFallbackFeature) && slices.Contains(features, triageSnapshotSchema5Feature) {
 		if i := slices.Index(features, triageSnapshotSchema3Feature); i >= 0 {
 			features[i] = agentFallbackFeature
 		}
 	}
 	// Only a peer advertising native import can receive this capability.
-	// Snapshot v5 subsumes v4; preserve old peers and the strict 32-slot cap.
+	// Snapshot v5 subsumes v4; old peers keep their list.
 	if slices.Contains(peerFeatures, protocol.NativeClickAdoptionFeature) && slices.Contains(features, triageSnapshotSchema5Feature) {
 		if i := slices.Index(features, triageSnapshotSchema4Feature); i >= 0 {
 			features[i] = protocol.NativeClickAdoptionFeature
 		}
 	}
 	// Navigation depends on both the decision loop and native reservation transfer.
-	// Counts v3 subsumes v2; old peers retain their original 32-slot list.
+	// Counts v3 subsumes v2; old peers keep their original list.
 	if slices.Contains(peerFeatures, protocol.AgentNavigationFeature) && slices.Contains(features, agentFallbackFeature) && slices.Contains(features, protocol.NativeClickAdoptionFeature) && slices.Contains(features, triageCountsSchema3Feature) {
 		if i := slices.Index(features, triageCountsSchema2Feature); i >= 0 {
 			features[i] = protocol.AgentNavigationFeature
 		}
+	}
+	// A pre-0.15.0 extension rejects the whole ack above 32 features. The
+	// first 32 entries are the list such a peer was built against, and it
+	// ignores the names of features it does not implement anyway.
+	if compareVersion(peerVersion, WideHelloAckMinExtensionVersion) < 0 && len(features) > protocol.LegacyHelloAckFeatures {
+		features = features[:protocol.LegacyHelloAckFeatures]
 	}
 	payload := protocol.HelloAckPayload{
 		DaemonVersion:   b.Version,
 		Features:        features,
 		ResolverOrigins: b.cfg.ResolverOrigins(),
 	}
-	// Version-gated, never a feature: the list is full and an older strict
+	// Version-gated field, added while the feature list was full; a new
+	// boolean capability belongs in features instead. An older strict
 	// hello_ack parser rejects the field. Pending sessions get it too, since
 	// each session applies control against its own bundle.
 	if b.adapterControl != nil && compareVersion(peerVersion, AdapterControlMinExtensionVersion) >= 0 {

@@ -76,7 +76,7 @@ func TestHelloAckAdvertisesAdapterControlOnlyToExtensionsThatParseIt(t *testing.
 		t.Fatal("a bridge without adapter control advertised it")
 	}
 	if got := len(ackFor("0.16.0", true).Features); got != 32 {
-		t.Fatalf("feature list length = %d, want exactly 32 (the fail-closed cap)", got)
+		t.Fatalf("feature list length = %d, want exactly 32 (adapter_control adds a field, not a feature)", got)
 	}
 }
 
