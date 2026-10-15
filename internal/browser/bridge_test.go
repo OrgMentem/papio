@@ -3048,6 +3048,141 @@ func TestExplicitOpenFocusesTheNavigatedSurface(t *testing.T) {
 	}
 }
 
+// TestExplicitOpenOfATablessCandidateSendsFocus replays `papio actions open
+// --job job_bf6324ab…` on 2026-10-15 (07:49:27 and 07:49:51 UTC). The paper's
+// sign-in tab had been closed by the operator, so its claim was abandoned and
+// no surface was bound. The explicit-focus loop serviced the candidate offer
+// and withheld handoff_focus, because the offer alone used to build the
+// surface. Since the presence-aware lifecycle the extension holds a bare
+// candidate offer for a sign-in the operator closed, or while the operator is
+// away, and only handoff_focus is "asked for by name": both opens recorded
+// handoff.opened and nothing was built. An explicit open must send the focus
+// frame after the candidate offer whether or not a surface is bound, and must
+// not send it again on the next poll.
+func TestExplicitOpenOfATablessCandidateSendsFocus(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	jobID := parkInstitutional(t, jobs, "explicit-open-tabless", handoffWork(), "")
+	runSync(t, b, materializationHello(t))
+	candidateID := explicitMaterializationCandidate(t, jobs, jobID, "domain-explicit-open-tabless")
+
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	opened, _ := runSync(t, b)
+	offerAt, focusAt := -1, -1
+	for i, msg := range opened {
+		if msg.JobID != jobID {
+			continue
+		}
+		switch msg.Type {
+		case protocol.MsgInstitutionalCandidateOffer:
+			if offerAt < 0 {
+				offerAt = i
+			}
+			if got := msg.Payload.(*protocol.InstitutionalCandidateOfferPayload).CandidateID; got != candidateID {
+				t.Fatalf("candidate offer = %q, want %q", got, candidateID)
+			}
+		case protocol.MsgHandoffFocus:
+			focusAt = i
+		}
+	}
+	if offerAt < 0 {
+		t.Fatalf("explicit open of a tabless candidate sent no candidate offer: %v", opened)
+	}
+	if focusAt < 0 {
+		t.Fatalf("explicit open of a tabless candidate sent no handoff_focus: %v", opened)
+	}
+	if focusAt < offerAt {
+		t.Fatalf("handoff_focus (%d) preceded the candidate offer (%d) it lifts the gate for: %v", focusAt, offerAt, opened)
+	}
+	if countType(opened, protocol.MsgJobOffer) != 0 {
+		t.Fatalf("explicit open of a candidate fell back to a URL-bearing offer: %v", opened)
+	}
+	again, _ := runSync(t, b)
+	if firstOfType(again, protocol.MsgHandoffFocus) != nil {
+		t.Fatalf("one open focused the candidate twice: %v", again)
+	}
+	// The request stays owed until the claim binds: the candidate keeps the
+	// explicit path's re-offer, which is what lets a held sign-in slot release
+	// it the moment the slot frees.
+	if offersForJob(again, jobID) != 1 {
+		t.Fatalf("an unbound focused candidate left the explicit path: %v", again)
+	}
+	// The operator asks again (the live case ran `papio actions open` twice):
+	// the extension is told again, once.
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("second focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	asked, _ := runSync(t, b)
+	if got := countType(asked, protocol.MsgHandoffFocus); got != 1 {
+		t.Fatalf("asking again sent %d handoff_focus frames, want 1: %v", got, asked)
+	}
+	if firstOfType(mustSync(t, b), protocol.MsgHandoffFocus) != nil {
+		t.Fatal("the second ask focused the candidate twice")
+	}
+}
+
+// TestFocusForATablessCandidateFollowsTheReplacementHolder pins the holder
+// change that the focusPending comment promises. The first holder received a
+// tabless candidate offer and its focus; it went stale, and the extension that
+// replaced it is a new instance with no explicit-open marker, whose presence
+// gate or stored closed marker would hold a bare re-sent offer for good. The
+// replacement must receive the candidate offer AND, after it, one focus frame
+// without the operator asking again.
+func TestFocusForATablessCandidateFollowsTheReplacementHolder(t *testing.T) {
+	ctx := context.Background()
+	b, jobs, _, _ := newBridge(t)
+	advance := settableClock(b)
+	jobID := parkInstitutional(t, jobs, "focus-follows-holder", handoffWork(), "")
+	capable := func() json.RawMessage {
+		return helloWithFeatures(t, "0.14.0", institutionalMaterializationFeature, effectPermitFeature)
+	}
+	runSyncAs(t, b, sessA, capable())
+	explicitMaterializationCandidate(t, jobs, jobID, "domain-focus-follows-holder")
+	if queued, live, err := b.FocusHandoffs(ctx, []string{jobID}); err != nil || !live || queued != 1 {
+		t.Fatalf("focus queue = queued %d live %v err %v, want one live request", queued, live, err)
+	}
+	first := mustSyncAs(t, b, sessA)
+	if offersForJob(first, jobID) != 1 || countType(first, protocol.MsgHandoffFocus) != 1 {
+		t.Fatalf("first holder did not receive the offer and its focus: %v", first)
+	}
+
+	advance(sessionStaleAfter + time.Second)
+	var replaced []*protocol.BrowserMessage
+	frames := []json.RawMessage{capable()}
+	for poll := 0; poll < 6 && offersForJob(replaced, jobID) == 0; poll++ {
+		replaced = append(replaced, mustSyncAs(t, b, sessB, frames...)...)
+		frames = nil
+	}
+	offerAt, focusAt := -1, -1
+	for i, msg := range replaced {
+		if msg.JobID != jobID {
+			continue
+		}
+		switch msg.Type {
+		case protocol.MsgInstitutionalCandidateOffer:
+			if offerAt < 0 {
+				offerAt = i
+			}
+		case protocol.MsgHandoffFocus:
+			focusAt = i
+		}
+	}
+	if offerAt < 0 {
+		t.Fatalf("replacement holder never received the candidate offer: %v", replaced)
+	}
+	if focusAt < 0 {
+		t.Fatalf("replacement holder received the candidate offer without its focus: %v", replaced)
+	}
+	if focusAt < offerAt {
+		t.Fatalf("replacement holder's focus (%d) preceded its candidate offer (%d): %v", focusAt, offerAt, replaced)
+	}
+	if got := countType(replaced, protocol.MsgHandoffFocus); got != 1 {
+		t.Fatalf("replacement holder received %d focus frames, want 1: %v", got, replaced)
+	}
+}
+
 // TestFocusedOfferSurvivesACancelledSiblingOnTheSameDomain pins the operator's own
 // request against delay by a corpse, through the whole chain: the real scheduler,
 // the bridge's one-candidate-per-safety-domain admission, and the offer frame.

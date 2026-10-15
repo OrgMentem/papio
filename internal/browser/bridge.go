@@ -462,8 +462,18 @@ type Bridge struct {
 	// change whose stale-claim reconciliation could not be committed.
 	materializationAuthorityUncertain bool
 	// Focus requests survive a holder change so the replacement holder can
-	// receive its offer before it is asked to surface the handoff.
+	// receive its offer before it is asked to surface the handoff. A focused
+	// institutional candidate with no surface yet stays here, on the explicit
+	// path, until its claim binds: that is what re-offers it the moment a held
+	// sign-in slot frees, where the automatic path waits for a cold slot.
 	focusPending map[string]bool
+	// focusSent records which owed focus requests have already put their one
+	// handoff_focus frame on the wire beside the candidate offer. The frame is
+	// the operator's "asked for by name" to the extension; sending it every
+	// poll for as long as the request stays owed would run the extension's
+	// explicit-open path several times a second. A new FocusHandoffs request
+	// clears it, so asking again sends it again.
+	focusSent map[string]bool
 	// materializationScheduleCursor is daemon-side keyset state. It is only
 	// advanced after a scheduler query completes while this holder is still
 	// current; DB scheduling itself never runs under b.mu.
@@ -743,6 +753,7 @@ func NewBridge(jobs *job.Store, svc *app.Service, triageService *triage.Service,
 		pendingDownloads:       map[browserDownloadKey]pendingBrowserDownload{},
 		deliveryContexts:       map[browserDownloadKey]pendingDeliveryContext{},
 		focusPending:           map[string]bool{},
+		focusSent:              map[string]bool{},
 		pendingCaptures:        map[string]*pendingPageCapture{},
 		materializationOffered: map[string]materializationOffer{},
 		presence:               map[string]presenceLease{},
@@ -861,6 +872,7 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 			if b.arbitration.generation() != epoch || b.arbitration.holderSession() == nil || b.arbitration.holderSession().ID != holderID {
 				if b.arbitration.holderSession() != nil && b.arbitration.holderSession().ID != legacySessionID && b.institutionalMaterializationAvailable() {
 					b.focusPending[row.ID] = true
+					delete(b.focusSent, row.ID)
 					b.materializationTracked[row.ID] = false
 					queued++
 					continue
@@ -877,8 +889,9 @@ func (b *Bridge) FocusHandoffs(ctx context.Context, jobIDs []string) (queued int
 		// An explicit Open drives the paper even when its own terms step is
 		// open: the operator is asking for a fresh look at a step papio parked,
 		// and the focusPending checks in the offer loops are the path that
-		// serves it.
+		// serves it. Asking again owes the extension a fresh focus frame.
 		b.focusPending[jobID] = true
+		delete(b.focusSent, jobID)
 		queued++
 	}
 	return queued, true, nil
@@ -999,6 +1012,11 @@ func (b *Bridge) applyPromotion(transition arbitrationTransition, reason string)
 	b.discardQueuedReoffers()
 	b.materializationOffered = map[string]materializationOffer{}
 	b.materializationTracked = map[string]bool{}
+	// A focus request survives the holder change (focusPending); the frame it
+	// owes does not: the replacement holder is a new extension instance with
+	// no explicit-open marker, and its presence gate or a stored closed marker
+	// would hold the re-sent candidate offer for good without the focus.
+	b.focusSent = map[string]bool{}
 	b.reofferRanThisSync = map[string]bool{}
 	b.effectPermitReconciles = map[string]pendingEffectPermitReconcile{}
 	b.materializationScheduleCursor = job.CandidateScheduleCursor{}
@@ -1958,6 +1976,7 @@ func (b *Bridge) clearMaterializationOffer(jobID string) {
 	}
 	delete(b.materializationOffered, jobID)
 	delete(b.focusPending, jobID)
+	delete(b.focusSent, jobID)
 }
 func (b *Bridge) clearMaterializationTracking(jobID string) {
 	b.clearMaterializationOffer(jobID)
@@ -4804,6 +4823,8 @@ func (b *Bridge) handleHello(sessionID string, p *protocol.HelloPayload) ([]json
 	b.cancelSent = map[string]bool{}
 	b.cancelAnnounced = map[string]bool{}
 	b.materializationTracked = map[string]bool{}
+	// The owed focus frame goes to this new holder too; see applyPromotion.
+	b.focusSent = map[string]bool{}
 	b.authReleased = map[int64]bool{}
 	b.reofferPending = map[string]bool{}
 	b.discardQueuedReoffers()
@@ -11770,26 +11791,43 @@ jobLoop:
 				if frame != nil {
 					out = append(out, frame)
 				}
-				// A claim that has already navigated its surface has nothing
-				// left for the candidate offer to do: the extension reads a
-				// same-candidate offer as a lease refresh, so the operator's
-				// Open changed nothing on screen. Measured live 2026-09-24:
-				// two `papio actions open` for job_cb931061ba recorded
-				// handoff.opened while its claim sat on tab 9105, and no tab
-				// moved. handoff_focus raises the job's own tab (it navigates
-				// nothing when the job holds a tab), and the offer above goes
-				// first so a job detached from that tab is handed it back. A
-				// claim with no surface yet keeps the offer alone: that offer
-				// is what builds the surface.
-				if surfaced, surfaceErr := b.materializationSurfaceBound(ctx, id); surfaceErr != nil {
+				// The focus frame is the operator's "asked for by name", and it
+				// goes AFTER the candidate offer. For a claim that has already
+				// navigated its surface the offer is only a lease refresh (the
+				// extension reads a same-candidate offer as one), and the focus
+				// raises the tab the claim drove and settles the request:
+				// measured live 2026-09-24, two `papio actions open` for
+				// job_cb931061ba recorded handoff.opened while its claim sat on
+				// tab 9105, and no tab moved. For a candidate with no surface the
+				// focus is what lets the offer build one: since the
+				// presence-aware sign-in lifecycle the extension holds a bare
+				// offer for a sign-in the operator closed, or while the operator
+				// is away, and only the focus frame lifts that hold. Measured
+				// live 2026-10-15, two `papio actions open` for job_bf6324ab
+				// recorded handoff.opened against an abandoned claim and built
+				// nothing, because the focus was withheld "until a surface is
+				// bound". That frame goes once per request (focusSent) while the
+				// request itself stays owed until the claim binds, so the
+				// candidate keeps the explicit path's re-offer. A candidate the
+				// scheduler did not hand us this poll (nil frame, no surface)
+				// sends nothing and keeps the request owed.
+				surfaced, surfaceErr := b.materializationSurfaceBound(ctx, id)
+				if surfaceErr != nil {
 					log.Printf("papio: reading the focused materialization surface for %s: %v", id, surfaceErr)
-				} else if surfaced {
+				}
+				sendFocus := surfaced || (frame != nil && !b.focusSent[id])
+				if sendFocus {
 					focusFrame, frameErr := b.frame(protocol.MsgHandoffFocus, id, protocol.EmptyPayload{})
 					if frameErr != nil {
 						return nil, frameErr
 					}
 					out = append(out, focusFrame)
-					delete(b.focusPending, id)
+					if surfaced {
+						delete(b.focusPending, id)
+						delete(b.focusSent, id)
+					} else {
+						b.focusSent[id] = true
+					}
 					focused++
 					if focused >= maxFocusFramesPerPoll {
 						break
@@ -12001,8 +12039,8 @@ jobLoop:
 
 // materializationSurfaceBound reports whether jobID's current attempt holds a
 // live claim, under the current holder generation, that has already navigated
-// a browser tab. Only such a claim has a surface an explicit Open can raise
-// instead of build. The caller holds b.mu.
+// a browser tab. An explicit Open raises such a surface with a focus frame even
+// in a poll that refreshed no candidate offer. The caller holds b.mu.
 func (b *Bridge) materializationSurfaceBound(ctx context.Context, jobID string) (bool, error) {
 	attempt, err := b.jobs.MaterializationAttemptRevision(ctx, jobID)
 	if err != nil {

@@ -449,6 +449,15 @@ execution records kept during the initial build.
   opens a replacement tab on its own two minutes later; `papio actions open` (or
   the popup) opens the next one. A sign-in that ended some other way, such as a
   lapsed lease, is still re-offered as before. See ADR-0028.
+- **`papio actions open --job <id>` opens a sign-in tab you closed, or one held
+  while you were away.** The extension now opens a sign-in surface only when you
+  are at the computer, and keeps one you closed shut until you ask for it by
+  name. The daemon's part of "by name" is the `handoff_focus` frame beside the
+  candidate offer, and it withheld that frame until a surface was already bound,
+  so an explicit open of a closed or held sign-in recorded `handoff.opened` and
+  built nothing (measured live 2026-10-15, twice on one Elsevier paper). The
+  frame now goes out once per `actions open`, after the offer; asking again
+  sends it again. A paper whose tab is still open is raised as before.
 - `papio doctor` no longer counts conservative-mode advisories
   (`openurl_available`) as actions waiting on you. They stay open on a finished
   job only to record that an institutional route was not opened.
