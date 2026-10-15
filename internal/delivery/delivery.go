@@ -60,7 +60,7 @@ type Request struct {
 	State              State
 	ProviderReference  string
 	GateProfileDigest  string
-	SubmittedAt        string // RFC3339Nano, "" when unset
+	SubmittedAt        string // RFC3339Nano, "" when unset; on an offered row, the POST-attempt marker (see ReserveSubmissionAttempt)
 	LastCheckedAt      string
 	NextCheckAt        string
 	CreatedAt          string
@@ -646,6 +646,49 @@ func (s *Service) ReassignOfferedRequest(ctx context.Context, id int64, newJobID
 		return false, err
 	}
 	return true, nil
+}
+
+// ReserveSubmissionAttempt durably records that a provider POST for row id is
+// about to be sent, and is the gate that POST must pass. It stamps the
+// submitted_at attempt marker only while the row is still `offered` with no
+// provider reference AND its owning job is still `resolving` — the exact
+// predicate RecordSubmission applies after the POST. The caller MUST NOT POST
+// when it returns false: the request was cancelled, resolved, or lost its
+// resolving owner, and a POST would create a provider request papio can
+// neither record nor track.
+//
+// The marker is what lets cancel and orphan checks treat an offered row as
+// possibly live without reading the owning job's event stream, and what makes
+// an attempt whose response never arrived count toward the monthly cap.
+func (s *Service) ReserveSubmissionAttempt(ctx context.Context, id int64) (bool, error) {
+	now := store.FormatTime(s.now())
+	res, err := s.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET submitted_at = COALESCE(submitted_at, ?), updated_at = ?
+		WHERE id = ? AND state = ? AND provider_reference = ''
+		  AND EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = delivery_requests.job_id
+			  AND jobs.state = 'resolving'
+		  )`, now, now, id, string(StateOffered))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// ReleaseSubmissionAttempt clears the attempt marker after a failure proven to
+// have happened before any byte of the POST left the process. Never call it
+// for an ambiguous outcome. It only touches a row that is still offered with
+// no provider reference.
+func (s *Service) ReleaseSubmissionAttempt(ctx context.Context, id int64) error {
+	_, err := s.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET submitted_at = NULL, updated_at = ?
+		WHERE id = ? AND state = ? AND provider_reference = ''`,
+		store.FormatTime(s.now()), id, string(StateOffered))
+	return err
 }
 
 // Resume clears a live (submitted/pending) request's poll-failure

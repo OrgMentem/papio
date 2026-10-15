@@ -238,6 +238,15 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **`papio delivery submit` no longer places an ILLiad request it cannot track.**
+  The command sent the request whatever state the job was in. For a job that
+  had settled `unavailable`, `failed` or `cancelled`, ILLiad accepted the
+  request, *papio* could not record it, and its only reminder was cancelled at
+  the next daemon start, so the library fulfilled a request *papio* had
+  forgotten. It now claims a queued or waiting job the way the scheduler does,
+  accepts a job that is already resolving, and refuses every other state with a
+  conflict error before anything is sent. The send itself is now reserved in
+  one step that needs the request to be offered and its job to be resolving.
 - **A 2xx ILLiad create response with no transaction number is no longer
   recorded as request `0`.** An empty or `null` body (a proxy, or a changed API)
   used to commit a `submitted` request with provider reference `0`, polled

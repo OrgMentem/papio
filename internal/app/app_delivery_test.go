@@ -712,8 +712,13 @@ func TestSubmissionPersistenceFailureAfterProviderSuccessDoesNotResubmit(t *test
 
 func TestSubmissionCASConflictKeepsReceivedReferenceVisible(t *testing.T) {
 	var posts atomic.Int32
+	// The job is cancelled while the provider POST is in flight — after the
+	// attempt was reserved, before the response is recorded. Cancelling before
+	// the POST would (correctly) stop it from being sent at all.
+	var cancelDuringPost func()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		posts.Add(1)
+		cancelDuringPost()
 		_, _ = w.Write([]byte(`{"TransactionNumber": 9201, "TransactionStatus": "Awaiting Request Processing"}`))
 	}))
 	defer server.Close()
@@ -742,10 +747,16 @@ func TestSubmissionCASConflictKeepsReceivedReferenceVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := jobs.Cancel(ctx, id, job.TerminalReasonCancelledByUser); err != nil {
+	// submitToProvider reserves its attempt only for a resolving job.
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, map[string]any{"reason": "test_setup"}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := svc.submitToProvider(ctx, row, row.State, svc.Config.Browser.DocumentDelivery, req.IdempotencyKey, profile, req)
+	cancelDuringPost = func() {
+		if err := jobs.Cancel(ctx, id, job.TerminalReasonCancelledByUser); err != nil {
+			t.Error(err)
+		}
+	}
+	got, err := svc.submitToProvider(ctx, row, job.StateResolving, svc.Config.Browser.DocumentDelivery, req.IdempotencyKey, profile, req)
 	if err != nil {
 		t.Fatalf("submitToProvider CAS conflict: %v", err)
 	}

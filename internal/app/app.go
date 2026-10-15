@@ -2582,10 +2582,52 @@ func deliveryCutoverDetail(ctx context.Context, detail map[string]any) map[strin
 // job.ErrConflict if jobID's current state cannot reach the resulting state
 // (e.g. a job already mid-poll for the same live request) — callers should
 // check delivery.get's row state first.
+//
+// It places a real provider request, so it first checks that the job can own
+// one. A resolving job is already caller-owned (the reconciliation path
+// repairs a parked job into resolving before it calls this). A queued or
+// retry_wait job is claimed under a lease and moved to resolving the way
+// Process does, so no worker can drive it at the same time. Every other state
+// (terminal, awaiting_human, mid-fetch) is refused with job.ErrConflict before
+// any request row exists or any POST is sent: the post-POST record would not
+// match such a job, leaving a provider request papio cannot track.
 func (s *Service) SubmitDelivery(ctx context.Context, jobID string) (DeliveryRouteResult, error) {
 	row, err := s.Jobs.Get(ctx, jobID)
 	if err != nil {
 		return DeliveryRouteResult{}, err
+	}
+	if _, _, configured := s.deliveryConfigured(row); !configured {
+		// Nothing would be placed: answer "not configured" without claiming
+		// or moving the job, whatever state it is in.
+		return DeliveryRouteResult{}, nil
+	}
+	switch row.State {
+	case job.StateResolving:
+		// Caller-owned: see the doc comment above.
+	case job.StateQueued, job.StateRetryWait:
+		owner := deliverySubmitOwnerPrefix + "-" + jobID
+		claimed, err := s.Jobs.Claim(ctx, jobID, owner, deliverySubmitLease)
+		if err != nil {
+			return DeliveryRouteResult{}, err
+		}
+		if claimed == nil {
+			return DeliveryRouteResult{}, fmt.Errorf("%w: job %s is %s but cannot be claimed now (leased by a worker, or its retry is not due yet); retry the submit later",
+				job.ErrConflict, jobID, row.State)
+		}
+		// Release on every exit: a route failure leaves the job resolving, and
+		// the scheduler must be able to recover it rather than wait out the lease.
+		defer func() { _ = s.Jobs.Release(context.WithoutCancel(ctx), jobID, owner) }()
+		if err := s.Jobs.Transition(ctx, jobID, claimed.State, job.StateResolving,
+			map[string]any{"reason": "manual_delivery_submit"}); err != nil {
+			return DeliveryRouteResult{}, err
+		}
+		row, err = s.Jobs.Get(ctx, jobID)
+		if err != nil {
+			return DeliveryRouteResult{}, err
+		}
+	default:
+		return DeliveryRouteResult{}, fmt.Errorf("%w: job %s is %s; a document-delivery request can only be submitted for a queued, retry_wait or resolving job",
+			job.ErrConflict, jobID, row.State)
 	}
 	return s.deliveryRoute(ctx, row, row.State)
 }
@@ -2714,6 +2756,13 @@ const (
 )
 
 const deliveryCompensationTimeout = 2 * time.Second
+
+const (
+	// deliverySubmitOwnerPrefix and deliverySubmitLease name the lease
+	// SubmitDelivery takes on a queued or retry_wait job it moves to resolving.
+	deliverySubmitOwnerPrefix = "delivery-submit"
+	deliverySubmitLease       = 2 * time.Minute
+)
 
 var (
 	ErrDeliveryNotConfigured          = errors.New("delivery: document delivery is not configured")
@@ -3312,12 +3361,31 @@ func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from,
 func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from string, dd *config.DocumentDelivery, key string, profile delivery.GateProfile, created *delivery.Request) (*delivery.Request, error) {
 	traced := newTracedSubmissionClient(s.illiadHTTPClient())
 	client := illiad.New(traced, dd.BaseURL, dd.APIKey)
+	// Reserve the attempt before the irreversible provider request: one
+	// compare-and-swap that needs the row still offered and its owning job
+	// still resolving — the condition RecordSubmission applies afterwards — and
+	// that leaves the durable "a POST may have been sent" marker cancel and the
+	// monthly cap read. Without a winning reservation nothing is sent: a POST
+	// here would create a provider request papio could not record or track.
+	reserved, err := s.Delivery.ReserveSubmissionAttempt(ctx, created.ID)
+	if err != nil {
+		return created, err
+	}
+	if !reserved {
+		return created, fmt.Errorf("%w: delivery request %d can no longer be submitted for job %s: the request was cancelled or resolved, or the job is no longer resolving; nothing was sent to the provider",
+			job.ErrConflict, created.ID, row.ID)
+	}
 	// Commit an ambiguous classification before the irreversible provider
 	// request. Only a proven pre-send failure below can narrow it.
 	if err := s.Jobs.RecordEvent(ctx, row.ID, "delivery.submission_failure_classified", map[string]any{
 		"delivery_request_id": created.ID,
 		"class":               string(illiad.FailureAmbiguous),
 	}); err != nil {
+		// Nothing was sent: take the reservation back so the marker does not
+		// claim a possibly-live request that never existed.
+		if releaseErr := s.Delivery.ReleaseSubmissionAttempt(context.WithoutCancel(ctx), created.ID); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
 		return created, err
 	}
 	txn, err := client.CreateTransaction(ctx, illiadTransactionRequest(row.Work, dd.PatronRef, key))
@@ -3334,6 +3402,11 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 		}
 		if class != illiad.FailurePreSend {
 			return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
+		}
+		// Proven pre-send: no provider request exists, so the attempt no longer
+		// counts toward the cap or marks the row possibly live.
+		if err := s.Delivery.ReleaseSubmissionAttempt(ctx, created.ID); err != nil {
+			return created, err
 		}
 		return created, s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, deliveryRetryCutoverDetail(ctx, map[string]any{
 			"reason":              "resolver_temporarily_unavailable",
