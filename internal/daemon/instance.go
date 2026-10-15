@@ -25,6 +25,10 @@ const (
 	// PhaseStarting covers the steps from process start to the socket that
 	// are not store work.
 	PhaseStarting Phase = "starting"
+	// PhaseCredentials means the daemon is reading credentials from the OS
+	// keychain. The read can wait on an access prompt, which only a person
+	// can answer.
+	PhaseCredentials Phase = "credentials"
 	// PhaseUpgrading means the daemon is applying store migrations. One
 	// migration can rewrite every row of a table and run for minutes.
 	PhaseUpgrading Phase = "upgrading"
@@ -40,17 +44,22 @@ const (
 
 // phaseOrder is the one direction a daemon moves through its phases.
 var phaseOrder = map[Phase]int{
-	PhaseStarting:  0,
-	PhaseUpgrading: 1,
-	PhaseChecking:  2,
-	PhaseRunning:   3,
-	PhaseStopping:  4,
+	PhaseStarting:    0,
+	PhaseCredentials: 1,
+	PhaseUpgrading:   2,
+	PhaseChecking:    3,
+	PhaseRunning:     4,
+	PhaseStopping:    5,
 }
 
-// storeWork reports whether the phase is store work that runs as long as the
-// database needs. No start deadline may interrupt it: a migration that is
-// stopped part way is rolled back, and the next start begins it again.
-func (p Phase) storeWork() bool { return p == PhaseUpgrading || p == PhaseChecking }
+// storeWork reports whether the phase is startup work that runs as long as the
+// database or the keychain needs. No start deadline may interrupt it: a
+// migration that is stopped part way is rolled back, and the next start begins
+// it again; a keychain read that is killed waits on the same prompt on the
+// next start.
+func (p Phase) storeWork() bool {
+	return p == PhaseCredentials || p == PhaseUpgrading || p == PhaseChecking
+}
 
 // Status is what a daemon process records about itself while it holds its
 // instance.
@@ -67,6 +76,8 @@ type Status struct {
 // Activity names what the daemon is doing, for a person.
 func (s Status) Activity() string {
 	switch s.Phase {
+	case PhaseCredentials:
+		return "reading credentials from the OS keychain"
 	case PhaseUpgrading:
 		if s.FromSchema == 0 {
 			return "creating the database"
@@ -87,7 +98,7 @@ func (s Status) Activity() string {
 // this status.
 func (s Status) Waiting() string {
 	switch s.Phase {
-	case PhaseUpgrading, PhaseChecking:
+	case PhaseCredentials, PhaseUpgrading, PhaseChecking:
 		return s.Activity() + "; this can take a minute"
 	case PhaseStopping:
 		return "waiting for the previous daemon to stop"

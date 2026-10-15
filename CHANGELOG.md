@@ -311,6 +311,9 @@ execution records kept during the initial build.
   prompts, `on_ready` and managed filing. It also counted works already in
   flight as `N new papers queued` and let them use the per-run cap. The watch
   now submits once per work and skips works it already submitted before the cap.
+- **A slow OS keychain read no longer gets the autostarted daemon killed.** The
+  daemon now reports a `credentials` phase while it reads credentials, and
+  commands wait through it instead of ending the daemon after the start deadline.
 - **Adding an `on_ready` hook no longer runs it for every past paper.** Startup
   recovery fires the hook only for jobs that became ready after the hook was
   first configured.

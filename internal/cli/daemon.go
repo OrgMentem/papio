@@ -54,6 +54,9 @@ func newDaemonCommand(opt *options) *cobra.Command {
 			}
 			// Deferred first, so it runs last: the claim outlives the store.
 			defer instance.Release()
+			// Bootstrap reads credentials from the OS keychain before it opens
+			// the store; that read can wait on an access prompt, so say so.
+			instance.SetPhase(daemon.PhaseCredentials)
 			system, err := bootstrap.NewWithVersion(store.WithOpenTrace(cmd.Context(), instance.StoreTrace()), cfg, api.Version)
 			if err != nil {
 				return err

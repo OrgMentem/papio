@@ -113,6 +113,9 @@ type startWait struct {
 	announced Phase
 	// checkingSince is when this wait first saw the daemon checking.
 	checkingSince time.Time
+	// credentialsSince is when this wait first saw the daemon reading
+	// credentials.
+	credentialsSince time.Time
 }
 
 // errWaitExpired reports that MaxWait has passed.
@@ -230,6 +233,11 @@ func (w *startWait) worthAnnouncing(phase Phase) bool {
 	switch phase {
 	case PhaseUpgrading, PhaseStopping:
 		return true
+	case PhaseCredentials:
+		if w.credentialsSince.IsZero() {
+			w.credentialsSince = time.Now()
+		}
+		return time.Since(w.credentialsSince) >= w.cfg.checkingNotice
 	case PhaseChecking:
 		if w.announced == PhaseUpgrading {
 			return true
