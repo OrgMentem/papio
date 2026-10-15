@@ -118,6 +118,10 @@ func newAdapterRepairCommand(opt *options) *cobra.Command {
 		Short: "Scaffold a reviewed adapter repair workspace",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			repoRoot, err := findAdapterRepairRepoRoot()
+			if err != nil {
+				return err
+			}
 			capture, err := resolveAdapterRepairCapture(cmd.Context(), opt, args[0], provider, scenario)
 			if err != nil {
 				return err
@@ -128,10 +132,6 @@ func newAdapterRepairCommand(opt *options) *cobra.Command {
 					return err
 				}
 				capture.Recovery = &recovery
-			}
-			repoRoot, err := findAdapterRepairRepoRoot()
-			if err != nil {
-				return err
 			}
 			result, err := scaffoldAdapterRepair(cmd.Context(), capture, adapterRepairDeps{
 				Now:      time.Now,
@@ -354,7 +354,7 @@ func findAdapterRepairRepoRoot() (string, error) {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return cwd, nil
+			return "", fmt.Errorf("adapter repair must run inside a papio source checkout (no extension/tools/adapter-try.ts above %s)", cwd)
 		}
 	}
 }
@@ -375,7 +375,7 @@ func validateRepairCapture(capture adapterRepairCapture) error {
 	}
 	return validateDaemonCaptureRow(capture)
 }
-func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, deps adapterRepairDeps) (adapterRepairResult, error) {
+func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, deps adapterRepairDeps) (_ adapterRepairResult, retErr error) {
 	if err := validateRepairCapture(capture); err != nil {
 		return adapterRepairResult{}, err
 	}
@@ -394,7 +394,15 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 		deps.Run = execAdapterRepairRunner{}
 	}
 	if deps.RepoRoot == "" {
-		deps.RepoRoot, _ = findAdapterRepairRepoRoot()
+		root, err := findAdapterRepairRepoRoot()
+		if err != nil {
+			return adapterRepairResult{}, err
+		}
+		deps.RepoRoot = root
+	}
+	raw, err := os.ReadFile(capture.Path)
+	if err != nil {
+		return adapterRepairResult{}, fmt.Errorf("read capture: %w", err)
 	}
 	now := deps.Now().UTC()
 	repairRoot := filepath.Join(deps.RepoRoot, "dev", "scratch", "repair")
@@ -406,11 +414,13 @@ func scaffoldAdapterRepair(ctx context.Context, capture adapterRepairCapture, de
 	if err != nil {
 		return adapterRepairResult{}, fmt.Errorf("create repair workspace: %w", err)
 	}
+	// A failed scaffold must not leave a half-written workspace behind.
+	defer func() {
+		if retErr != nil {
+			_ = os.RemoveAll(workspace)
+		}
+	}()
 
-	raw, err := os.ReadFile(capture.Path)
-	if err != nil {
-		return adapterRepairResult{}, fmt.Errorf("read capture: %w", err)
-	}
 	// The capture was already verified against its daemon hash, metadata, and
 	// canonical sanitizer provenance above. Emit those exact bytes; prepending
 	// or rewriting a header would make the certified plan differ from the

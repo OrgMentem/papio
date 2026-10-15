@@ -400,3 +400,14 @@ func completeAdapterRepairOutput(t *testing.T, root string) string {
 	}
 	return string(data)
 }
+
+func TestFindAdapterRepairRepoRootRefusesOutsideACheckout(t *testing.T) {
+	t.Chdir(t.TempDir())
+	root, err := findAdapterRepairRepoRoot()
+	if err == nil || !strings.Contains(err.Error(), "must run inside a papio source checkout") {
+		t.Fatalf("findAdapterRepairRepoRoot = %q, %v; want a source-checkout error", root, err)
+	}
+	if entries, _ := os.ReadDir("."); len(entries) != 0 {
+		t.Fatalf("working directory gained %d entries, want none", len(entries))
+	}
+}

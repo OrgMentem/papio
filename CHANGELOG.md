@@ -305,6 +305,11 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **`papio adapter repair` outside a *papio* source checkout now fails instead
+  of writing a `dev/scratch` tree.** It created the workspace in the current
+  directory and exited 0 with `No applicable repair patch`. It now stops before
+  creating anything with `adapter repair must run inside a papio source
+  checkout`, and removes a workspace whose scaffold step fails.
 - **One corrupt capture sidecar no longer breaks `papio adapter captures` and
   `captures purge --all`.** A truncated `.json` sidecar made both fail with
   `internal: operation failed`, so the cleanup command could not clean up.
