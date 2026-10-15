@@ -77,7 +77,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 					}
 				}
 				for _, name := range []string{
-					"wait", "auto-import", "collection", "desired-version", "access-mode", "resolver", "max-cost", "source", "deny-source", "limit", "include-owned", "label", "force",
+					"wait", "auto-import", "collection", "desired-version", "access-mode", "resolver", "max-cost", "source", "deny-source", "limit", "include-owned", "label", "force", "consumer",
 				} {
 					if cmd.Flags().Changed(name) {
 						return fmt.Errorf("--%s is not supported with --from-digest", name)
@@ -118,6 +118,9 @@ func newAcquireCommand(opt *options) *cobra.Command {
 				}
 				if cmd.Flags().Changed("force") {
 					return fmt.Errorf("--force is not supported with --from-zotio")
+				}
+				if cmd.Flags().Changed("consumer") {
+					return fmt.Errorf("--consumer is not supported with --from-zotio")
 				}
 				options := zotio.QueueOptions{
 					Collection:         strings.TrimSpace(collection),
@@ -214,7 +217,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.BoolVar(&wait, "wait", false, "wait for a terminal or human-action state")
 	flags.BoolVar(&fromZotio, "from-zotio", false, "queue zotio items missing an attached PDF")
 	flags.IntVar(&queueLimit, "limit", 25, "maximum zotio items to queue")
-	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch")
+	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch; queued works are set to import into Zotero automatically when ready")
 	flags.StringArrayVar(&digestKeys, "keys", nil, "digest work key to queue (repeatable)")
 	flags.StringVar(&batchPath, "batch", "", "submit works from a JSONL, RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB file (or - for standard input)")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")

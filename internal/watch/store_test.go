@@ -430,8 +430,8 @@ func TestCadenceHoursBound(t *testing.T) {
 		wantErr string
 	}{
 		{name: "maximum accepted", cadence: MaxCadenceHours},
-		{name: "one above maximum", cadence: MaxCadenceHours + 1, wantErr: "cadence_hours must be 1-"},
-		{name: "math.MaxInt64", cadence: math.MaxInt64, wantErr: "cadence_hours must be 1-"},
+		{name: "one above maximum", cadence: MaxCadenceHours + 1, wantErr: "--cadence must be 1-"},
+		{name: "math.MaxInt64", cadence: math.MaxInt64, wantErr: "--cadence must be 1-"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			watches := testStore(t)

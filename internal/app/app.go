@@ -322,10 +322,20 @@ func (s *Service) SubmitWithOptions(ctx context.Context, wr protocol.WorkRequest
 	return s.SubmitWithOptionsAs(ctx, job.PrincipalUnknown, wr, options)
 }
 
+// InvalidRequestError marks a submit refusal caused by the request itself: a
+// failed validation, an unknown resolver profile, a bad consumer label or a bad
+// recheck window. Its text names the problem and holds no secrets, so the API
+// reports it as invalid_argument with the message. Every other submit failure
+// (a store error, for instance) stays a plain error.
+type InvalidRequestError struct{ Err error }
+
+func (e *InvalidRequestError) Error() string { return e.Err.Error() }
+func (e *InvalidRequestError) Unwrap() error { return e.Err }
+
 // SubmitWithOptionsAs is SubmitWithOptions with explicit durable provenance.
 func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Principal, wr protocol.WorkRequest, options SubmitOptions) (SubmitResult, error) {
 	if err := wr.Validate(); err != nil {
-		return SubmitResult{}, err
+		return SubmitResult{}, &InvalidRequestError{Err: err}
 	}
 	mode, err := s.Config.RequireAccessMode()
 	if err != nil {
@@ -337,7 +347,7 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 	mode = s.Config.NarrowAccessMode(mode, wr.AccessModeOverride)
 	w, raw, err := canonicalWork(wr)
 	if err != nil {
-		return SubmitResult{}, err
+		return SubmitResult{}, &InvalidRequestError{Err: err}
 	}
 	resolverName := strings.TrimSpace(wr.Resolver)
 	if resolverName == "" {
@@ -347,9 +357,9 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 		if _, ok := s.Config.OpenURLBaseFor(resolverName); !ok {
 			names := s.Config.ResolverNames()
 			if len(names) == 0 {
-				return SubmitResult{}, fmt.Errorf("unknown resolver %q (configured profiles: none)", resolverName)
+				return SubmitResult{}, &InvalidRequestError{Err: fmt.Errorf("unknown resolver %q (configured profiles: none)", resolverName)}
 			}
-			return SubmitResult{}, fmt.Errorf("unknown resolver %q (configured profiles: %s)", resolverName, strings.Join(names, ", "))
+			return SubmitResult{}, &InvalidRequestError{Err: fmt.Errorf("unknown resolver %q (configured profiles: %s)", resolverName, strings.Join(names, ", "))}
 		}
 	}
 	desired := wr.DesiredVersion
@@ -370,12 +380,12 @@ func (s *Service) SubmitWithOptionsAs(ctx context.Context, principal job.Princip
 	}
 	consumer, err := validConsumer(options.Consumer)
 	if err != nil {
-		return SubmitResult{}, err
+		return SubmitResult{}, &InvalidRequestError{Err: err}
 	}
 	var created job.CreateResult
 	if options.RecheckOf != "" {
 		if options.RecheckWindowDays <= 0 {
-			return SubmitResult{}, errors.New("unavailable recheck window must be positive")
+			return SubmitResult{}, &InvalidRequestError{Err: errors.New("unavailable recheck window must be positive")}
 		}
 		created, err = s.Jobs.CreateRecheckRequestForWork(ctx, wr.RequestID, w, wr.ZotioItemKey, wr.Collection, pol, raw,
 			job.Attribution{Principal: principal, Consumer: consumer}, options.RecheckOf, options.RecheckWindowDays)

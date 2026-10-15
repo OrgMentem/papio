@@ -27,10 +27,10 @@ func (s *Store) Edit(ctx context.Context, input EditInput) (*Watch, error) {
 		return nil, errors.New("watch store is not configured")
 	}
 	if input.ID <= 0 {
-		return nil, errors.New("watch id must be positive")
+		return nil, invalidInput("watch id must be positive")
 	}
 	if input.Label == nil && input.Collection == nil && input.CadenceHours == nil && input.PerRunCap == nil && input.YearFrom == nil && input.YearTo == nil && input.OAOnly == nil {
-		return nil, errors.New("at least one operational setting is required")
+		return nil, invalidInput("at least one of --label, --collection, --cadence, --limit-per-run, --year-from, --year-to or --oa-only is required")
 	}
 	tx, err := s.S.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -53,7 +53,7 @@ func (s *Store) Edit(ctx context.Context, input EditInput) (*Watch, error) {
 	}
 	if input.PerRunCap != nil {
 		if *input.PerRunCap == 0 {
-			return nil, errors.New("watch per_run_cap must be 1-50")
+			return nil, invalidInput("--limit-per-run must be 1-%d", MaxPerRunCap)
 		}
 		next.PerRunCap = *input.PerRunCap
 	}
@@ -85,4 +85,18 @@ func (s *Store) Edit(ctx context.Context, input EditInput) (*Watch, error) {
 		return nil, err
 	}
 	return updated, nil
+}
+
+// ErrInvalidInput marks a refusal caused by the caller's own input. The API
+// layer reports it as invalid_argument with the message, instead of as an
+// internal fault.
+var ErrInvalidInput = errors.New("invalid watch input")
+
+type invalidInputError struct{ message string }
+
+func (e *invalidInputError) Error() string        { return e.message }
+func (e *invalidInputError) Is(target error) bool { return target == ErrInvalidInput }
+
+func invalidInput(format string, args ...any) error {
+	return &invalidInputError{message: fmt.Sprintf(format, args...)}
 }

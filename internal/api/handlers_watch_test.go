@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,16 +76,17 @@ func TestWatchRunHandlerReportsInternalForBackendFailure(t *testing.T) {
 	router := Router(system)
 
 	for _, tc := range []struct {
-		name string
-		id   int64
+		name    string
+		id      int64
+		message string
 	}{
-		{name: "backend failure", id: watchID},
-		{name: "missing watch row", id: watchID + 10_000},
+		{name: "backend failure", id: watchID, message: "watch execution failed"},
+		{name: "missing watch row", id: watchID + 10_000, message: "watch 10001 not found; run `papio watch list` to see watch ids"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rpcErr := callMethod(t, router, "watch.run", map[string]any{"id": tc.id}, nil)
-			if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != "watch execution failed" {
-				t.Fatalf("watch.run = %#v, want internal/watch execution failed", rpcErr)
+			if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != tc.message {
+				t.Fatalf("watch.run = %#v, want internal/%q", rpcErr, tc.message)
 			}
 			if rpcErr.Detail == nil || rpcErr.Detail.ErrorClass != "watch_execution_failed" {
 				t.Fatalf("watch.run detail = %#v, want watch_execution_failed class", rpcErr.Detail)
@@ -390,5 +392,57 @@ func TestWatchRemoveV2RefusesPendingDigestAtomically(t *testing.T) {
 	}
 	if !removed.Removed || removed.ID != created.ID {
 		t.Fatalf("removed = %+v, want the watch id marked removed", removed)
+	}
+}
+
+func TestWatchEditAndBackfillReportInputMistakesAsInvalidArgument(t *testing.T) {
+	system := testSystem(t)
+	created, err := system.Watches.Create(context.Background(), watch.CreateInput{Query: "edit coverage", CadenceHours: 24, PerRunCap: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := Router(system)
+	two, ninetynine, year2025, year2020 := 2, 99, 2025, 2020
+	for _, tc := range []struct {
+		name   string
+		method string
+		params any
+		code   string
+		want   string
+	}{
+		{name: "no setting", method: "watch.edit_v1", params: watch.EditInput{ID: created.ID}, code: "invalid_argument", want: "--limit-per-run"},
+		{name: "cap range", method: "watch.edit_v1", params: watch.EditInput{ID: created.ID, PerRunCap: &ninetynine}, code: "invalid_argument", want: "--limit-per-run must be 1-"},
+		{name: "year order", method: "watch.edit_v1", params: watch.EditInput{ID: created.ID, YearFrom: &year2025, YearTo: &year2020}, code: "invalid_argument", want: "--year-from cannot exceed --year-to"},
+		{name: "missing watch", method: "watch.edit_v1", params: watch.EditInput{ID: created.ID + 100, PerRunCap: &two}, code: "not_found", want: "watch 101 not found"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rpcErr := callMethod(t, router, tc.method, tc.params, nil)
+			if rpcErr == nil || rpcErr.Code != tc.code || !strings.Contains(rpcErr.Message, tc.want) {
+				t.Fatalf("%s = %#v, want %s containing %q", tc.method, rpcErr, tc.code, tc.want)
+			}
+		})
+	}
+}
+
+func TestWatchRunNamesAllSubmissionsFailedCause(t *testing.T) {
+	cause := &watch.AllSubmissionsFailedError{Count: 5, Cause: errors.New("resolver offline")}
+	_, rpcErr := watchFailure(cause)
+	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != "all 5 watch submissions failed: resolver offline" {
+		t.Fatalf("watchFailure() = %#v", rpcErr)
+	}
+	if rpcErr.Detail == nil || rpcErr.Detail.ErrorHint != "" {
+		t.Fatalf("detail = %#v, want no hint repeating the message", rpcErr.Detail)
+	}
+}
+
+func TestSubmitNamesWhyTheRequestWasRefused(t *testing.T) {
+	router := Router(testSystem(t))
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_api_resolver_01",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/submit-message"}, Resolver: "instutute",
+	}
+	rpcErr := callMethod(t, router, "acquire.submit_v2", map[string]any{"request": request}, nil)
+	if rpcErr == nil || rpcErr.Code != "invalid_argument" || !strings.Contains(rpcErr.Message, `unknown resolver "instutute"`) {
+		t.Fatalf("acquire.submit_v2 = %#v, want invalid_argument naming the unknown resolver", rpcErr)
 	}
 }

@@ -767,6 +767,17 @@ func submitV3(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	})
 }
 
+// submitFailure keeps the message of a refusal caused by the request itself and
+// leaves every other failure to failure, which logs it and reports it as
+// internal rather than as the caller's mistake.
+func submitFailure(err error) ([]byte, *ipc.RPCError) {
+	var invalid *app.InvalidRequestError
+	if errors.As(err, &invalid) {
+		return badParams(invalid)
+	}
+	return failure(err)
+}
+
 func submitted(ctx context.Context, system *bootstrap.System, request protocol.WorkRequest, options app.SubmitOptions) ([]byte, *ipc.RPCError) {
 	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), request, options)
 	if err != nil {
@@ -774,7 +785,7 @@ func submitted(ctx context.Context, system *bootstrap.System, request protocol.W
 		if errors.As(err, &unset) {
 			return nil, &ipc.RPCError{Code: "configuration_required", Message: unset.Error()}
 		}
-		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "invalid acquisition request"}
+		return submitFailure(err)
 	}
 	return marshal(SubmitV2Result{JobID: result.JobID, Existing: result.Existing})
 }
@@ -802,7 +813,7 @@ func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 		if errors.As(err, &unset) {
 			return nil, &ipc.RPCError{Code: "configuration_required", Message: unset.Error()}
 		}
-		return nil, &ipc.RPCError{Code: "invalid_argument", Message: "invalid acquisition request"}
+		return submitFailure(err)
 	}
 	return marshal(SubmitResult{JobID: submitted.JobID})
 }
@@ -1157,6 +1168,14 @@ func runWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System
 	}
 	result, err := system.WatchRunner.Run(ctx, params.ID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Still internal with the watch class: the run path has no
+			// not_found contract. The message names the id and the next step.
+			return nil, &ipc.RPCError{
+				Code: "internal", Message: "watch " + strconv.FormatInt(params.ID, 10) + " not found; run `papio watch list` to see watch ids",
+				Detail: &ipc.ErrorDetail{ErrorClass: "watch_execution_failed"},
+			}
+		}
 		return watchFailure(err)
 	}
 	return marshal(result)
@@ -2328,8 +2347,19 @@ func watchFailure(err error) ([]byte, *ipc.RPCError) {
 		info.Class = "watch_execution_failed"
 		info.Hint = watchErrorHint(err)
 	}
+	message := "watch execution failed"
+	var allFailed *watch.AllSubmissionsFailedError
+	if errors.As(err, &allFailed) {
+		// The message already names the first cause, so a hint would only
+		// repeat it.
+		message = safeMessage(allFailed, message)
+		info.Hint = ""
+	} else if info.Hint == message {
+		// An unclassified failure has nothing to add to the message.
+		info.Hint = ""
+	}
 	return nil, &ipc.RPCError{
-		Code: "internal", Message: "watch execution failed",
+		Code: "internal", Message: message,
 		Detail: &ipc.ErrorDetail{
 			ErrorClass:      info.Class,
 			ErrorHint:       info.Hint,

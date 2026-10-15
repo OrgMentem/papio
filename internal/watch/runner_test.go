@@ -1253,3 +1253,37 @@ func TestRunnerAlertIdentityIsStableAcrossRetryForTheSamePendingSet(t *testing.T
 		t.Fatalf("new alert count = %d; want only the newly pending work", fresh.Detail.Count)
 	}
 }
+
+func TestRunnerAcquireDigestPartialFailureNamesQueuedCount(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "partial", Collection: "Reading", CadenceHours: 24, PerRunCap: 5,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	var discovered []discovery.DiscoveredWork
+	var lookups []zotio.WorkOwnership
+	for _, doi := range []string{"10.1000/partial-a", "10.1000/partial-b"} {
+		discovered = append(discovered, discovery.DiscoveredWork{Work: work.Work{DOI: doi, Title: doi, Year: 2026}})
+		lookups = append(lookups, zotio.WorkOwnership{Status: zotio.OwnershipNotOwned})
+	}
+	runner := &Runner{
+		Store:     watches,
+		Discovery: &fakeDiscovery{works: discovered},
+		Lookup:    &fakeLookup{result: &zotio.LookupWorksResult{Works: lookups}},
+		DataDir:   t.TempDir(),
+		Now:       func() time.Time { return now },
+	}
+	if _, err := runner.Run(ctx, watched.ID); err != nil {
+		t.Fatal(err)
+	}
+	runner.Submitter = &fakeSubmitter{failOnCall: map[int]error{2: errors.New("resolver offline")}}
+	queued, err := runner.AcquireDigest(ctx, watched.ID, nil)
+	var partial *DigestPartialError
+	if !errors.As(err, &partial) || queued != 1 || partial.Queued != 1 || partial.Total != 2 {
+		t.Fatalf("AcquireDigest() = %d, %v; want a partial failure with 1 of 2 queued", queued, err)
+	}
+	if want := "queued 1 of 2 digest works before failing: resolver offline; the queued works left the digest — see papio jobs list"; err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+}

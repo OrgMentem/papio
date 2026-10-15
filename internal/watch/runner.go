@@ -101,6 +101,39 @@ type RunResult struct {
 	Degraded bool `json:"degraded,omitempty"`
 }
 
+// AllSubmissionsFailedError is the run failure when every submission of a
+// watch run failed. Its message names the first cause, so the operator sees
+// why without reading the daemon log.
+type AllSubmissionsFailedError struct {
+	Count int
+	Cause error
+}
+
+func (e *AllSubmissionsFailedError) Error() string {
+	return fmt.Sprintf("all %d watch submissions failed: %s", e.Count, storedError(e.Cause))
+}
+
+func (e *AllSubmissionsFailedError) Unwrap() error { return e.Cause }
+
+// DigestPartialError is the failure of a digest acquisition that stopped part
+// way. Queued works already exist as jobs and have left the digest, so the
+// message says so: the operator must not read the failure as "nothing happened"
+// and retry. The count lives in the message because the IPC result must not
+// grow a field.
+type DigestPartialError struct {
+	Queued, Total int
+	Cause         error
+}
+
+func (e *DigestPartialError) Error() string {
+	if e.Queued == 0 {
+		return fmt.Sprintf("no digest works were queued: %s", storedError(e.Cause))
+	}
+	return fmt.Sprintf("queued %d of %d digest works before failing: %s; the queued works left the digest — see papio jobs list", e.Queued, e.Total, storedError(e.Cause))
+}
+
+func (e *DigestPartialError) Unwrap() error { return e.Cause }
+
 // Runner composes the existing discovery, ownership, acquisition batch, and
 // desktop notification services for a single watch execution at a time.
 // Ownership comes from generic holdings when they are enabled (the daemon only
@@ -257,17 +290,18 @@ func (r *Runner) acquireDigestWithEntriesLocked(ctx context.Context, watchID int
 		jobID, submitErr := r.Submitter.SubmitWithAutoImport(ctx, manifest.Works[i].Work, &autoImport)
 		if submitErr != nil {
 			manifest.Works[i].Status = "submission_failed"
-			manifest.Works[i].Error = "submit"
+			manifest.Works[i].Error = storedError(submitErr)
 			manifest.Works = manifest.Works[:i+1]
+			total := len(eligibleEntries)
 			if writeErr := batch.Write(r.DataDir, manifest); writeErr != nil {
-				return queued, fmt.Errorf("%w (writing digest manifest: %w)", submitErr, writeErr)
+				return queued, &DigestPartialError{Queued: queued, Total: total, Cause: fmt.Errorf("%w (writing digest manifest: %w)", submitErr, writeErr)}
 			}
 			for _, entry := range succeeded {
 				if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
-					return queued, err
+					return queued, &DigestPartialError{Queued: queued, Total: total, Cause: err}
 				}
 			}
-			return queued, submitErr
+			return queued, &DigestPartialError{Queued: queued, Total: total, Cause: submitErr}
 		}
 		manifest.Works[i].JobID = jobID
 		queued++
@@ -1013,6 +1047,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	}
 	result.ManifestID = manifest.ID
 	autoImport := true
+	var firstSubmitErr error
 	for i := range manifest.Works {
 		// A recorded JobID is never a reason to skip submission: the request
 		// ID reconciles to the one job this watch owns for the work, and a
@@ -1023,7 +1058,10 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		jobID, err := r.Submitter.SubmitOnceWithAutoImport(ctx, request, &autoImport)
 		if err != nil {
 			manifest.Works[i].Status = "submission_failed"
-			manifest.Works[i].Error = "submit"
+			manifest.Works[i].Error = storedError(err)
+			if firstSubmitErr == nil {
+				firstSubmitErr = err
+			}
 			result.Failed++
 		} else {
 			manifest.Works[i].JobID = jobID
@@ -1036,7 +1074,7 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	}
 	if result.Failed == len(manifest.Works) {
 		// The scan position stays put, so the next run re-reads these pages.
-		return result, fmt.Errorf("all %d watch submissions failed", result.Failed)
+		return result, &AllSubmissionsFailedError{Count: result.Failed, Cause: firstSubmitErr}
 	}
 	if err := r.Store.SaveScanCoverage(ctx, watch.ID, runStart, scan.storedCoverage(result.Failed > 0)); err != nil {
 		return result, err

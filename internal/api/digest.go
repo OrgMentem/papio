@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strconv"
 
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
@@ -39,8 +40,21 @@ func acquireWatchDigest(ctx context.Context, raw json.RawMessage, system *bootst
 	}
 	queued, err := system.WatchRunner.AcquireDigest(ctx, params.ID, params.Keys)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, watch.ErrDigestEntryNotFound) {
-			return nil, &ipc.RPCError{Code: "not_found", Message: "watch digest entry not found"}
+		var partial *watch.DigestPartialError
+		if errors.As(err, &partial) {
+			// The count of works that already left the digest is the one
+			// fact the operator needs, and the message is the only place it
+			// can travel without widening the result.
+			_, rpcErr := watchFailure(err)
+			rpcErr.Message = safeMessage(partial, rpcErr.Message)
+			rpcErr.Detail.ErrorHint = ""
+			return nil, rpcErr
+		}
+		switch {
+		case errors.Is(err, watch.ErrDigestEntryNotFound):
+			return nil, &ipc.RPCError{Code: "not_found", Message: safeMessage(err, "watch digest entry not found") + " is not pending in watch " + strconv.FormatInt(params.ID, 10)}
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, &ipc.RPCError{Code: "not_found", Message: "watch " + strconv.FormatInt(params.ID, 10) + " not found; run `papio watch list` to see watch ids"}
 		}
 		return watchFailure(err)
 	}

@@ -4,13 +4,25 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 
 	"papio/internal/bootstrap"
 	"papio/internal/ipc"
 	"papio/internal/publicationwatch"
 	"papio/internal/watch"
 )
+
+// watchInputFailure reports a refusal of the caller's own input as
+// invalid_argument with its message and leaves every other error to failure.
+func watchInputFailure(err error) ([]byte, *ipc.RPCError) {
+	if errors.Is(err, watch.ErrInvalidInput) {
+		return badParams(err)
+	}
+	return failure(err)
+}
 
 func editWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var input watch.EditInput
@@ -21,8 +33,11 @@ func editWatch(ctx context.Context, raw json.RawMessage, system *bootstrap.Syste
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "watchlists are not configured"}
 	}
 	updated, err := system.Watches.Edit(ctx, input)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, &ipc.RPCError{Code: "not_found", Message: fmt.Sprintf("watch %d not found; run `papio watch list` to see watch ids", input.ID)}
+	}
 	if err != nil {
-		return failure(err)
+		return watchInputFailure(err)
 	}
 	return marshal(updated)
 }
@@ -37,7 +52,7 @@ func addGenericBackfill(ctx context.Context, raw json.RawMessage, system *bootst
 	}
 	created, err := system.WatchRunner.AddGenericBackfill(ctx, input)
 	if err != nil {
-		return failure(err)
+		return watchInputFailure(err)
 	}
 	return marshal(created)
 }

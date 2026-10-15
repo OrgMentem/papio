@@ -259,6 +259,35 @@ execution records kept during the initial build.
 - **`papio activity` and `papio grabs binds` print full ids.** The 12-character
   ids matched no other command. `activity --job` refuses an id that names no
   job, and events older than a day show their date.
+- **`papio watch run` shows failed submissions and exits nonzero.** A run where
+  some papers failed to submit printed `queued N paper(s)` and exited 0. It now
+  adds `; N submission(s) failed — see papio watch list` and exits nonzero. The
+  manifest keeps each submit error instead of the word `submit`. A run where every
+  submission fails names the first cause, and `papio watch run 9999` says
+  `watch 9999 not found` instead of `watch execution failed`.
+- **`papio watch edit` and `papio watch backfill add` name your input mistake.**
+  A missing setting, an out-of-range `--limit-per-run`, or `--year-from` above
+  `--year-to` printed `internal: operation failed`. They now report
+  `invalid_argument` and name the flag. An unknown watch id says `watch <id> not
+  found`, and `--source` is required on `watch backfill add`.
+- **`papio acquire` says why a request was refused.** An unknown `--resolver`, a
+  bad `--consumer` label or an invalid work printed `invalid acquisition
+  request`, and a store failure got the same label. The first group now keeps its
+  message (with the configured resolver profiles); store failures are `internal`
+  and logged.
+- **`papio acquire --from-digest` reports a partial failure.** The error now says
+  `queued N of M digest works before failing: <cause>` and that the queued works
+  left the digest. An unknown watch id and a key that is not pending give separate
+  messages. The help says queued works import into Zotero automatically, and
+  `--consumer` is refused with `--from-digest` and `--from-zotio` instead of being
+  dropped.
+- **`papio watch add` no longer offers `--related-to`.** Every watch refused it.
+  `--cites` and `--cited-by` are now refused locally when combined with each
+  other or with a query.
+- **`papio acquire --batch` names the right input record.** A failed work was
+  numbered by its place after owned works were filtered out. The message now uses
+  the input position and the DOI or title, and ends with `N works failed — see
+  papio batch report <batch-id>` when several fail.
 - **`papio delivery submit` no longer places an ILLiad request it cannot track.**
   The command sent the request whatever state the job was in. For a job that
   had settled `unavailable`, `failed` or `cancelled`, ILLiad accepted the

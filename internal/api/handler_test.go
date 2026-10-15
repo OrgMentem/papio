@@ -1310,14 +1310,15 @@ func TestRouterWatchDigestAcquireClassifiesMissingResources(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		params map[string]any
+		want   string
 	}{
-		{name: "watch", params: map[string]any{"id": created.ID + 1}},
-		{name: "key", params: map[string]any{"id": created.ID, "keys": []string{"missing"}}},
+		{name: "watch", params: map[string]any{"id": created.ID + 1}, want: "not found"},
+		{name: "key", params: map[string]any{"id": created.ID, "keys": []string{"missing"}}, want: `"missing" is not pending in watch`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rpcErr := callMethod(t, router, "watch.digest_acquire", tc.params, nil)
-			if rpcErr == nil || rpcErr.Code != "not_found" {
-				t.Fatalf("watch.digest_acquire error = %#v, want not_found", rpcErr)
+			if rpcErr == nil || rpcErr.Code != "not_found" || !strings.Contains(rpcErr.Message, tc.want) {
+				t.Fatalf("watch.digest_acquire error = %#v, want not_found containing %q", rpcErr, tc.want)
 			}
 		})
 	}

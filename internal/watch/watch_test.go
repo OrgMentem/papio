@@ -833,7 +833,7 @@ func TestRunnerFailsWhenEverySubmissionFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.ConsecutiveFailures != 1 || stored.LastError != "all 1 watch submissions failed" {
+	if stored.ConsecutiveFailures != 1 || stored.LastError != "all 1 watch submissions failed: submit failed" {
 		t.Fatalf("all-failed watch state = %+v", stored)
 	}
 }

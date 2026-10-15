@@ -43,9 +43,28 @@ func TestWatchCommandExposesRequestedFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"label", "collection", "kind", "mode", "cadence", "limit-per-run", "year-from", "year-to", "oa-only", "cites", "cited-by", "related-to"} {
+	for _, name := range []string{"label", "collection", "kind", "mode", "cadence", "limit-per-run", "year-from", "year-to", "oa-only", "cites", "cited-by"} {
 		if add.Flags().Lookup(name) == nil {
 			t.Fatalf("watch add missing --%s", name)
+		}
+	}
+	if add.Flags().Lookup("related-to") != nil {
+		t.Fatal("watch add still registers --related-to, which every watch refuses")
+	}
+}
+
+func TestWatchAddRefusesConflictingSnowballInputsLocally(t *testing.T) {
+	for _, args := range [][]string{
+		{"watch", "add", "--cites", "10.1000/a", "--cited-by", "10.1000/b"},
+		{"watch", "add", "retrieval", "--cites", "10.1000/a"},
+	} {
+		var stdout, stderr bytes.Buffer
+		root := NewRoot(&stdout, &stderr)
+		root.SetArgs(args)
+		root.SetOut(&stdout)
+		root.SetErr(&stderr)
+		if err := root.Execute(); err == nil {
+			t.Fatalf("%v error = %v, want a local refusal", args, err)
 		}
 	}
 }

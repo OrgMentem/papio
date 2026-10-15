@@ -47,7 +47,7 @@ papio acquire [identifier] [flags]
 | `--desired-version` | `string` | `any` | published, accepted, preprint, or any |
 | `--doi` | `string` |  | DOI |
 | `--force` | `bool` | `false` | create a fresh job even when this work is already in flight |
-| `--from-digest` | `int64` | `0` | queue pending entries from an alert watch |
+| `--from-digest` | `int64` | `0` | queue pending entries from an alert watch; queued works are set to import into Zotero automatically when ready |
 | `--from-zotio` | `bool` | `false` | queue zotio items missing an attached PDF |
 | `--include-owned` | `bool` | `false` | with --batch, submit works already carrying a PDF in zotio |
 | `--isbn` | `string` |  | ISBN |
@@ -1622,15 +1622,14 @@ papio watch add [query] [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--cadence` | `string` | `daily` | daily, weekly, or Nh |
-| `--cited-by` | `string` |  | DOI to find papers it cites (backward references; OpenAlex cited_by: filter) |
-| `--cites` | `string` |  | DOI to find papers citing it (forward citations; OpenAlex cites: filter) |
+| `--cited-by` | `string` |  | DOI to find papers it cites (backward references; OpenAlex cited_by: filter); replaces the query and excludes --cites |
+| `--cites` | `string` |  | DOI to find papers citing it (forward citations; OpenAlex cites: filter); replaces the query and excludes --cited-by |
 | `--collection` | `string` |  | zotio collection for queued papers |
 | `--kind` | `string` | `discovery` | watch kind: discovery or backfill |
 | `--label` | `string` |  | human label (defaults to query) |
 | `--limit-per-run` | `int` | `10` | maximum new papers queued per run (1-50) |
 | `--mode` | `string` | `acquire` | discovery mode: acquire or alert |
 | `--oa-only` | `bool` | `false` | return only open-access works |
-| `--related-to` | `string` |  | DOI to find OpenAlex-related papers (related_to: filter) |
 | `--year-from` | `int` | `0` | minimum publication year |
 | `--year-to` | `int` | `0` | maximum publication year |
 

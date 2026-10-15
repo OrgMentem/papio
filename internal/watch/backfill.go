@@ -44,11 +44,11 @@ func (r *Runner) recordSource(name string) (config.LibrarySource, error) {
 			continue
 		}
 		if source.Claim != config.LibraryClaimRecordPresent {
-			return config.LibrarySource{}, errors.New("backfill source must explicitly declare record_present")
+			return config.LibrarySource{}, invalidInput("backfill source must explicitly declare record_present")
 		}
 		return source, nil
 	}
-	return config.LibrarySource{}, fmt.Errorf("backfill library source %q is not configured", name)
+	return config.LibrarySource{}, invalidInput("backfill library source %q is not configured", name)
 }
 
 func (r *Runner) AddGenericBackfill(ctx context.Context, input GenericBackfillInput) (*GenericBackfillWatch, error) {
@@ -57,7 +57,7 @@ func (r *Runner) AddGenericBackfill(ctx context.Context, input GenericBackfillIn
 	}
 	input.SourceName = strings.TrimSpace(input.SourceName)
 	if len(input.SourceName) < 1 || len(input.SourceName) > 128 {
-		return nil, errors.New("source_name must contain 1-128 bytes")
+		return nil, invalidInput("--source is required and must contain 1-128 bytes")
 	}
 	if _, err := r.recordSource(input.SourceName); err != nil {
 		return nil, err

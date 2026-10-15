@@ -36,7 +36,7 @@ func newWatchCommand(opt *options) *cobra.Command {
 
 func newWatchAddCommand(opt *options) *cobra.Command {
 	var label, collection, cadence, kind, mode string
-	var cites, citedBy, relatedTo string
+	var cites, citedBy string
 	var perRunCap, yearFrom, yearTo int
 	var oaOnly bool
 	command := &cobra.Command{
@@ -62,8 +62,12 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 			case watch.KindDiscovery:
 				if (len(args) == 0 || strings.TrimSpace(args[0]) == "") &&
 					strings.TrimSpace(cites) == "" &&
-					strings.TrimSpace(citedBy) == "" && strings.TrimSpace(relatedTo) == "" {
+					strings.TrimSpace(citedBy) == "" {
 					return fmt.Errorf("query is required unless a citation snowball DOI is supplied")
+				}
+				if len(args) == 1 && strings.TrimSpace(args[0]) != "" &&
+					(strings.TrimSpace(cites) != "" || strings.TrimSpace(citedBy) != "") {
+					return fmt.Errorf("a query cannot be combined with --cites or --cited-by")
 				}
 			default:
 				return fmt.Errorf("unknown watch kind %q", kind)
@@ -83,7 +87,7 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 				Label: label, Kind: kind, Mode: mode, Query: query, Collection: collection,
 				Filters: watch.Filters{
 					YearFrom: yearFrom, YearTo: yearTo, OAOnly: oaOnly,
-					Cites: cites, CitedBy: citedBy, RelatedTo: relatedTo,
+					Cites: cites, CitedBy: citedBy,
 				},
 				CadenceHours: cadenceHours, PerRunCap: perRunCap,
 			}
@@ -104,9 +108,9 @@ func newWatchAddCommand(opt *options) *cobra.Command {
 	flags.IntVar(&yearFrom, "year-from", 0, "minimum publication year")
 	flags.IntVar(&yearTo, "year-to", 0, "maximum publication year")
 	flags.BoolVar(&oaOnly, "oa-only", false, "return only open-access works")
-	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter)")
-	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter)")
-	flags.StringVar(&relatedTo, "related-to", "", "DOI to find OpenAlex-related papers (related_to: filter)")
+	flags.StringVar(&cites, "cites", "", "DOI to find papers citing it (forward citations; OpenAlex cites: filter); replaces the query and excludes --cited-by")
+	flags.StringVar(&citedBy, "cited-by", "", "DOI to find papers it cites (backward references; OpenAlex cited_by: filter); replaces the query and excludes --cites")
+	command.MarkFlagsMutuallyExclusive("cites", "cited-by")
 	return command
 }
 
@@ -450,14 +454,28 @@ func newWatchRunCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "watch.run", watch.IDInput{ID: id}, &result); err != nil {
 				return err
 			}
-			incomplete := ""
+			suffix := ""
 			if result.Degraded {
-				incomplete = "; discovery scan incomplete — see papio watch list"
+				suffix = "; discovery scan incomplete — see papio watch list"
 			}
+			if result.Failed > 0 {
+				suffix += fmt.Sprintf("; %d submission(s) failed — see papio watch list", result.Failed)
+			}
+			var printErr error
 			if result.Reported > 0 {
-				return opt.printResult(result, "Watch %d reported %d new work(s) — papio watch digest %d%s", result.WatchID, result.Reported, result.WatchID, incomplete)
+				printErr = opt.printResult(result, "Watch %d reported %d new work(s) — papio watch digest %d%s", result.WatchID, result.Reported, result.WatchID, suffix)
+			} else {
+				printErr = opt.printResult(result, "Watch %d queued %d paper(s)%s", result.WatchID, result.Queued, suffix)
 			}
-			return opt.printResult(result, "Watch %d queued %d paper(s)%s", result.WatchID, result.Queued, incomplete)
+			if printErr != nil {
+				return printErr
+			}
+			if result.Failed > 0 {
+				// The result is already printed; the error makes the exit status
+				// nonzero so a script does not read a partial run as success.
+				return fmt.Errorf("watch %d: %d submission(s) failed", result.WatchID, result.Failed)
+			}
+			return nil
 		},
 	}
 }
@@ -532,6 +550,7 @@ func newWatchBackfillCommand(opt *options) *cobra.Command {
 	add.Flags().StringVar(&label, "label", "", "human label")
 	add.Flags().StringVar(&cadence, "cadence", "daily", "daily, weekly, or Nh")
 	add.Flags().IntVar(&cap, "limit-per-run", watch.DefaultPerRunCap, "maximum new papers per run (1-50)")
+	_ = add.MarkFlagRequired("source")
 	command.AddCommand(add)
 	return command
 }

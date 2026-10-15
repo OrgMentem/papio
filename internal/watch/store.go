@@ -1931,7 +1931,7 @@ func normalizeCitationSnowballFilters(filters *Filters) error {
 		}
 		doi, err := work.NormalizeDOI(*seed.value)
 		if err != nil {
-			return fmt.Errorf("watch invalid DOI for %s: %w", seed.name, err)
+			return invalidInput("watch invalid DOI for %s: %v", seed.name, err)
 		}
 		*seed.value = doi
 	}
@@ -1962,28 +1962,28 @@ func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 		input.Mode = ModeAcquire
 	}
 	if input.Kind != KindDiscovery && input.Kind != KindBackfill {
-		return CreateInput{}, fmt.Errorf("unknown watch kind %q", input.Kind)
+		return CreateInput{}, invalidInput("unknown watch kind %q", input.Kind)
 	}
 	if input.Mode != ModeAcquire && input.Mode != ModeAlert {
-		return CreateInput{}, fmt.Errorf("unknown watch mode %q", input.Mode)
+		return CreateInput{}, invalidInput("unknown watch mode %q", input.Mode)
 	}
 	if input.CadenceHours <= 0 {
-		return CreateInput{}, errors.New("watch cadence_hours must be positive")
+		return CreateInput{}, invalidInput("--cadence must be at least 1 hour")
 	}
 	if input.CadenceHours > MaxCadenceHours {
-		return CreateInput{}, fmt.Errorf("watch cadence_hours must be 1-%d", MaxCadenceHours)
+		return CreateInput{}, invalidInput("--cadence must be 1-%d hours", MaxCadenceHours)
 	}
 	if input.PerRunCap == 0 {
 		input.PerRunCap = DefaultPerRunCap
 	}
 	if input.PerRunCap < 1 || input.PerRunCap > MaxPerRunCap {
-		return CreateInput{}, fmt.Errorf("watch per_run_cap must be 1-%d", MaxPerRunCap)
+		return CreateInput{}, invalidInput("--limit-per-run must be 1-%d", MaxPerRunCap)
 	}
 	if input.Filters.YearFrom < 0 || input.Filters.YearTo < 0 {
-		return CreateInput{}, errors.New("watch years must be positive")
+		return CreateInput{}, invalidInput("--year-from and --year-to cannot be negative")
 	}
 	if input.Filters.YearFrom > 0 && input.Filters.YearTo > 0 && input.Filters.YearFrom > input.Filters.YearTo {
-		return CreateInput{}, errors.New("watch year_from cannot exceed year_to")
+		return CreateInput{}, invalidInput("--year-from cannot exceed --year-to")
 	}
 	if err := normalizeCitationSnowballFilters(&input.Filters); err != nil {
 		return CreateInput{}, err
@@ -1992,19 +1992,19 @@ func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 	case KindDiscovery:
 		snowballCount := input.Filters.citationSnowballCount()
 		if input.Query == "" && snowballCount == 0 {
-			return CreateInput{}, errors.New("watch query is required unless a citation snowball DOI is supplied")
+			return CreateInput{}, invalidInput("watch query is required unless a citation snowball DOI is supplied")
 		}
 		// Watches do not select a single discovery source, so they must use the
 		// common Semantic Scholar/OpenAlex snowball subset to avoid failing every
 		// scheduled tick when Semantic Scholar is configured.
 		if snowballCount > 1 {
-			return CreateInput{}, errors.New("watch supports exactly one citation snowball DOI because configured discovery sources may include Semantic Scholar")
+			return CreateInput{}, invalidInput("watch supports exactly one citation snowball DOI because configured discovery sources may include Semantic Scholar")
 		}
 		if input.Filters.RelatedTo != "" {
-			return CreateInput{}, errors.New("watch related_to is unsupported because configured discovery sources may include Semantic Scholar")
+			return CreateInput{}, invalidInput("watch related_to is unsupported because configured discovery sources may include Semantic Scholar")
 		}
 		if input.Query != "" && snowballCount != 0 {
-			return CreateInput{}, errors.New("watch query cannot be combined with a citation snowball because configured discovery sources may include Semantic Scholar")
+			return CreateInput{}, invalidInput("watch query cannot be combined with a citation snowball because configured discovery sources may include Semantic Scholar")
 		}
 		if input.Label == "" {
 			if input.Query != "" {
@@ -2022,13 +2022,13 @@ func normalizeCreateInput(input CreateInput) (CreateInput, error) {
 		}
 	case KindBackfill:
 		if input.Query != "" {
-			return CreateInput{}, errors.New("backfill watch does not accept a query")
+			return CreateInput{}, invalidInput("backfill watch does not accept a query")
 		}
 		if input.Filters != (Filters{}) {
-			return CreateInput{}, errors.New("backfill watch does not accept filters")
+			return CreateInput{}, invalidInput("backfill watch does not accept filters")
 		}
 		if input.Mode != ModeAcquire {
-			return CreateInput{}, errors.New("backfill watch mode must be acquire")
+			return CreateInput{}, invalidInput("backfill watch mode must be acquire")
 		}
 		if input.Label == "" {
 			input.Label = "backfill"
