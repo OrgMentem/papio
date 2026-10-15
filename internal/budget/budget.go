@@ -507,6 +507,9 @@ func (m *Manager) takeToken(ctx context.Context, source, identity string, rate f
 func (m *Manager) reserve(ctx context.Context, source, identity string, limit, cost float64) error {
 	now := m.now().UTC()
 	month := now.Format("2006-01")
+	if err := m.repairSkewedGates(ctx, source); err != nil {
+		return err
+	}
 
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -645,6 +648,21 @@ func clampGate(gate, now time.Time) time.Time {
 	return gate
 }
 
+// repairSkewedGates rewrites every stored gate of source (ordinary, quota and
+// pacing rows) that lies beyond MaxDeferHorizon to the horizon, once. Clamping
+// only at read time would hand every reader a fresh now+24h, so a gate written
+// under a clock 30 days ahead would never open until its original deadline.
+// Persisting the clamp pins the deadline, and the gate opens when the corrected
+// clock reaches it. It runs before the caller's transaction because the
+// database is single-connection and a refusal rolls its transaction back.
+func (m *Manager) repairSkewedGates(ctx context.Context, source string) error {
+	horizon := store.FormatTime(m.now().UTC().Add(MaxDeferHorizon))
+	_, err := m.db.ExecContext(ctx, `UPDATE source_budgets SET next_allowed_at = ?
+		WHERE source IN (?, ?, ?) AND next_allowed_at IS NOT NULL AND next_allowed_at > ?`,
+		horizon, source, QuotaSourceName(source), PacingSourceName(source), horizon)
+	return err
+}
+
 // Defer persists a server-requested next allowed time (usually Retry-After)
 // against the quota identity in policy, so a gate earned under one credential
 // never gates another. It never shortens an existing later gate, and never
@@ -672,6 +690,9 @@ func (m *Manager) Snapshot(ctx context.Context, source string, policy config.Sou
 	var out Snapshot
 	out.Source = source
 	out.Identity = identityFor(policy)
+	if err := m.repairSkewedGates(ctx, source); err != nil {
+		return out, err
+	}
 	var next sql.NullString
 	err := m.db.QueryRowContext(ctx, `SELECT COALESCE(window_start,''), requests_in_window, spent_usd, next_allowed_at
 		FROM source_budgets WHERE source = ? AND identity = ?`, source, out.Identity).Scan(&out.WindowStart, &out.RequestsInWindow, &out.SpentUSD, &next)

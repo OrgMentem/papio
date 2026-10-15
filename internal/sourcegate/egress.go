@@ -124,6 +124,7 @@ func (g *GuardedClient) Do(req *http.Request) (*http.Response, error) {
 		Identity: identity,
 		Credits:  credits,
 		JobID:    budget.JobIDFrom(req.Context()),
+		Receipt:  &budget.EgressReceipt{},
 	}
 	if err := g.authority.CommitEgress(req.Context(), egress); err != nil {
 		return nil, err

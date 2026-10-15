@@ -92,6 +92,15 @@ type EgressRequest struct {
 	Identity string
 	Credits  int
 	JobID    string
+	// Receipt, when non-nil, is filled by a successful CommitEgress with the
+	// UTC day it charged, so RefundEgress can credit back that same day even
+	// if midnight passed in between.
+	Receipt *EgressReceipt
+}
+
+// EgressReceipt records where CommitEgress charged a request.
+type EgressReceipt struct {
+	Day string
 }
 
 type quotaLatch struct {
@@ -420,6 +429,9 @@ func (m *Manager) CommitEgress(ctx context.Context, req EgressRequest) error {
 			Window:   WindowSticky,
 		}
 	}
+	if err := m.repairSkewedGates(ctx, req.Source); err != nil {
+		return err
+	}
 	now := m.now().UTC()
 	day := utcDay(now)
 	policy := m.creditPolicyFor(req.Source)
@@ -498,7 +510,13 @@ func (m *Manager) CommitEgress(ctx context.Context, req EgressRequest) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if req.Receipt != nil {
+		req.Receipt.Day = day
+	}
+	return nil
 }
 
 func creditExceeded(req EgressRequest, committed, attempt, limit int, now time.Time) *ErrExceeded {
@@ -636,13 +654,15 @@ func (m *Manager) checkNextAllowed(ctx context.Context, tx *sql.Tx, displaySourc
 // otherwise exhaust the cold-start cap before any response taught the fuse the
 // real allowance, closing the source until 00:00 UTC. The refund never lowers
 // the counter below the provider's own credits-used seed, and never below zero.
-// It targets the current UTC day; a refund straddling midnight is bounded by
-// the request's own cost.
+// It credits the UTC day recorded in req.Receipt by the CommitEgress that
+// charged it, never the current day, so a refund after midnight cannot remove
+// credits another request spent. Without a receipt there is no known debit to
+// reverse, and nothing is refunded.
 func (m *Manager) RefundEgress(ctx context.Context, req EgressRequest) error {
-	if req.Source == "" || req.Credits < 1 {
+	if req.Source == "" || req.Credits < 1 || req.Receipt == nil || req.Receipt.Day == "" {
 		return nil
 	}
-	day := utcDay(m.now().UTC())
+	day := req.Receipt.Day
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
