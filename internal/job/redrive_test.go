@@ -222,8 +222,19 @@ func TestRedriveRefusesUnsafeOrStaleRequests(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := js.RedriveInstitutionalHandoff(ctx, id, revision, route, redriveOAHandoff, fileGone, "institutional handoff detail"); !errors.Is(err, ErrConflict) {
-				t.Fatalf("redrive=%v; want ErrConflict", err)
+			_, redriveErr := js.RedriveInstitutionalHandoff(ctx, id, revision, route, redriveOAHandoff, fileGone, "institutional handoff detail")
+			if !errors.Is(redriveErr, ErrConflict) {
+				t.Fatalf("redrive=%v; want ErrConflict", redriveErr)
+			}
+			switch scenario {
+			case "lease":
+				if !strings.Contains(redriveErr.Error(), "is being worked") {
+					t.Fatalf("lease refusal = %q; want it to name the lease", redriveErr)
+				}
+			case "held_effect", "unknown_effect":
+				if !strings.Contains(redriveErr.Error(), "another browser effect is in progress") || strings.Contains(redriveErr.Error(), id) {
+					t.Fatalf("permit refusal = %q; want another job's effect, not this job", redriveErr)
+				}
 			}
 			var status string
 			if err := js.S.DB().QueryRowContext(ctx, `SELECT status FROM human_actions WHERE id=?`, action).Scan(&status); err != nil {

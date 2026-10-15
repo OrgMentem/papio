@@ -100,8 +100,31 @@ func (js *Store) redriveInstitutionalHandoff(ctx context.Context, jobID string, 
 	if state != StateAwaitingHuman && !rejected && !unquarantined {
 		return 0, fmt.Errorf("%w: job is %s, not awaiting_human, needs_review on an adopted file, or unavailable after browser_rejected", ErrConflict, state)
 	}
-	if leased != 0 || won != 0 || blocked != 0 {
-		return 0, fmt.Errorf("%w: job has a lease, artifact, or unresolved effect permit", ErrConflict)
+	if won != 0 {
+		return 0, fmt.Errorf("%w: job %s already has an artifact; nothing to redrive", ErrConflict, jobID)
+	}
+	if leased != 0 {
+		return 0, fmt.Errorf("%w: job %s is being worked; retry after it settles", ErrConflict, jobID)
+	}
+	if blocked != 0 {
+		// The permit and blocker tables are global: the holder is usually
+		// another job, and saying "this job holds" would send the operator
+		// looking for a permit that is not there.
+		var holder string
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(job_id,'') FROM (
+			SELECT job_id FROM effect_permits WHERE status IN ('held','unknown_completion')
+			UNION ALL
+			SELECT job_id FROM legacy_effect_blockers WHERE status='unresolved') LIMIT 1`).Scan(&holder); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
+		switch holder {
+		case jobID:
+			return 0, fmt.Errorf("%w: job %s holds an unresolved browser-effect permit; it must be resolved before a redrive", ErrConflict, jobID)
+		case "":
+			return 0, fmt.Errorf("%w: a browser effect is in progress or unresolved; retry when it settles", ErrConflict)
+		default:
+			return 0, fmt.Errorf("%w: another browser effect is in progress (job %s); retry when it settles", ErrConflict, holder)
+		}
 	}
 	base, configured := openURLBaseFor(resolver)
 	if !configured || base == "" || (doi == "" && pmid == "" && isbn == "") {

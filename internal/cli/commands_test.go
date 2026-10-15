@@ -942,13 +942,31 @@ func TestFocusReportsHandoffsTheDaemonWouldNotOpen(t *testing.T) {
 		[]string{"https://a.test", "https://b.test"}, nil,
 		[]string{"job_aaaaaaaaaaaaaaaaaaaaaaaaaa", "job_bbbbbbbbbbbbbbbbbbbbbbbbbb"},
 		false, &out, focus, run)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, errHandoffsSkipped) {
+		t.Fatalf("err = %v; want errHandoffsSkipped so scripts see the shortfall", err)
 	}
 	if len(opened) != 0 {
 		t.Fatalf("opened %v; a skipped handoff must not be launched in the OS browser", opened)
 	}
+	if !strings.Contains(out.String(), "job_aaaaaaaaaaaaaaaaaaaaaaaaaa") || !strings.Contains(out.String(), "opened 1 handoffs") {
+		t.Fatalf("output %q does not name the offered jobs or confirm what opened", out.String())
+	}
 	if !strings.Contains(out.String(), "1 of 2 handoffs were not opened") {
 		t.Fatalf("output %q does not report the skipped handoff", out.String())
+	}
+}
+
+func TestOpenActionURLsNamesTheTabsNotOpenedAfterLauncherFailure(t *testing.T) {
+	calls := 0
+	err := openActionURLs(context.Background(), []string{"https://a.test", "https://b.test", "https://c.test"}, false, &bytes.Buffer{},
+		func(context.Context, string, ...string) error {
+			calls++
+			if calls == 2 {
+				return errors.New("launcher failed")
+			}
+			return nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "opened 1 of 3") || !strings.Contains(err.Error(), "not opened: https://b.test https://c.test") {
+		t.Fatalf("partial launcher failure = %v; want opened count and the remaining urls", err)
 	}
 }

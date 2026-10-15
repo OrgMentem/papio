@@ -148,3 +148,20 @@ func TestAddComponentRoleGateAndUpsert(t *testing.T) {
 		}
 	}
 }
+
+func TestArchiveRefusalsNameTheirCause(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	id, err := js.CreateRequest(ctx, "wr_archive_msg", testWork(), "", "", testPolicy(), nil, PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = js.Archive(ctx, id, true)
+	if !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), id+" is queued") || !strings.Contains(err.Error(), "archiving needs a ready job") {
+		t.Fatalf("queued archive = %v; want the state named", err)
+	}
+	_, err = js.Restore(ctx, id)
+	if !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "restoring needs a ready job") {
+		t.Fatalf("queued restore = %v; want restoring named", err)
+	}
+}

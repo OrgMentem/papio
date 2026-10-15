@@ -1204,7 +1204,15 @@ func listActivity(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if system == nil || system.Store == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "store is not configured"}
 	}
-	entries, truncated, err := system.Store.RecentEventsPage(params.Limit, params.BeforeSeq, strings.TrimSpace(params.JobID))
+	jobID := strings.TrimSpace(params.JobID)
+	if jobID != "" && system.Jobs != nil {
+		// An id that names no job would otherwise return an empty page,
+		// indistinguishable from a real job with no events.
+		if _, err := system.Jobs.Get(ctx, jobID); err != nil {
+			return jobFailure(err, jobID)
+		}
+	}
+	entries, truncated, err := system.Store.RecentEventsPage(params.Limit, params.BeforeSeq, jobID)
 	if err != nil {
 		return failure(err)
 	}
@@ -2266,7 +2274,15 @@ func nameUnknownJob(handler ipc.MethodHandler, system *bootstrap.System) ipc.Met
 
 func failure(err error) ([]byte, *ipc.RPCError) {
 	var actionKind *job.ErrHumanActionKind
+	var notCancelled *job.ErrDismissNotCancelled
 	switch {
+	case errors.Is(err, job.ErrHumanActionNotFound):
+		return nil, &ipc.RPCError{Code: "not_found", Message: safeMessage(err, "no such review action")}
+	case errors.As(err, &notCancelled):
+		// The action close committed; the cause is database detail, so the
+		// reply is the fixed template and the chain goes to the daemon log.
+		log.Printf("rpc dismiss cancel failed: %v", err)
+		return nil, &ipc.RPCError{Code: "internal", Message: safeMessage(notCancelled, "the action was dismissed, but its job was not cancelled")}
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, &ipc.RPCError{Code: "not_found", Message: "record not found"}
 	case errors.Is(err, job.ErrConflict):

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	"papio/internal/bootstrap"
@@ -180,6 +181,14 @@ func resolveActionCAS(ctx context.Context, raw json.RawMessage, system *bootstra
 		releaseCaptureLeaseAfterCommit(ctx, system, resolution.JobID)
 		if system.Preview != nil {
 			system.Preview.Revoke(params.ActionID)
+		}
+	}
+	if resolution.Outcome == job.ReviewConflict {
+		switch resolution.Cause {
+		case job.ReviewCauseNoAction:
+			return nil, &ipc.RPCError{Code: "not_found", Message: fmt.Sprintf("no review action %d; run `papio actions list`", params.ActionID)}
+		case job.ReviewCauseDigestMismatch:
+			return nil, &ipc.RPCError{Code: "invalid_argument", Message: "--sha256 does not match the quarantined file (use the quarantine_sha256 from `papio actions list --json`)"}
 		}
 	}
 	return marshal(struct {

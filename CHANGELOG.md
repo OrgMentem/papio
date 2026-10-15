@@ -238,6 +238,27 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **Refusals from `jobs refile`, `jobs archive`, `jobs restore`, `jobs filing
+  retry`, `jobs redrive` and publisher retry now say why.** Each printed
+  `conflict: job state conflict` (or `not_found: record not found` for a
+  mistyped `--destination`), whatever the cause. They now name the job, its
+  state, and the next step (`papio jobs restore`, wait for the running hook, or
+  "already imported"). A redrive blocked by another job's browser effect names
+  that job instead of claiming this one holds a permit.
+- **`papio actions dismiss` says what it did.** It reads the job back and prints
+  whether the dismissal cancelled it. A missing action id is `not_found`, and a
+  cancel that fails after the action closed says the action is already
+  dismissed and points at `papio jobs cancel`.
+- **`papio actions resolve` no longer says "the review changed" for a typo.** A
+  missing action id is `not_found`, and a `--sha256` that does not match the
+  quarantined file is `invalid_argument`.
+- **`papio actions open` reports what it opened.** It exits nonzero when some
+  tracked handoffs were not opened, prints an `opened N handoffs` line, and
+  after a launcher failure names the URLs that were not opened so a retry does
+  not duplicate tabs.
+- **`papio activity` and `papio grabs binds` print full ids.** The 12-character
+  ids matched no other command. `activity --job` refuses an id that names no
+  job, and events older than a day show their date.
 - **`papio delivery submit` no longer places an ILLiad request it cannot track.**
   The command sent the request whatever state the job was in. For a job that
   had settled `unavailable`, `failed` or `cancelled`, ILLiad accepted the

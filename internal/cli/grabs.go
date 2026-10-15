@@ -161,7 +161,7 @@ func newGrabsBindsCommand(opt *options) *cobra.Command {
 				}
 				if _, err := fmt.Fprintf(opt.out, "%s | grab %s | job %s | %s | %d candidates | %s\n",
 					bind.BoundAt.Format(time.RFC3339Nano),
-					shortBindID(bind.GrabID), shortBindID(bind.JobID),
+					bind.GrabID, bind.JobID,
 					bind.Provenance.Rule, bind.Provenance.CandidatesConsidered, evidence); err != nil {
 					return err
 				}
@@ -181,13 +181,6 @@ func newGrabsBindsCommand(opt *options) *cobra.Command {
 	command.Flags().IntVar(&limit, "limit", 50, "maximum autonomous binds to list (default 50, max 200)")
 	command.Flags().StringVar(&before, "before", "", "list only binds older than this grab id (the last grab of the previous page)")
 	return command
-}
-
-func shortBindID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
 }
 
 // grabSuggestJSON is `grabs suggest --json`: the daemon's whole

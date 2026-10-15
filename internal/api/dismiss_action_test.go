@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"papio/internal/bootstrap"
@@ -227,5 +228,24 @@ func TestExportBundleReportsMissingJobAndUnreadyJob(t *testing.T) {
 		if rpcErr := callMethod(t, router, "bundle.export", params, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
 			t.Fatalf("export %v = %+v, want invalid_argument", params, rpcErr)
 		}
+	}
+}
+
+func TestDismissActionMissingIDIsNotFound(t *testing.T) {
+	system := testSystem(t)
+	rpcErr := callMethod(t, Router(system), "actions.dismiss", map[string]any{"action_id": 999, "expected_revision": 1}, nil)
+	if rpcErr == nil || rpcErr.Code != "not_found" || !strings.Contains(rpcErr.Message, "no review action 999") {
+		t.Fatalf("missing dismiss = %+v, want not_found naming the action", rpcErr)
+	}
+}
+
+func TestResolveActionSeparatesMissingActionAndWrongDigest(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	rpcErr := callMethod(t, router, "actions.resolve", map[string]any{
+		"action_id": 999, "verdict": "accept", "expected_revision": 1, "expected_sha256": strings.Repeat("a", 64),
+	}, nil)
+	if rpcErr == nil || rpcErr.Code != "not_found" || !strings.Contains(rpcErr.Message, "no review action 999") {
+		t.Fatalf("missing resolve = %+v, want not_found", rpcErr)
 	}
 }

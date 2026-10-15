@@ -5,8 +5,11 @@ package app
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -212,5 +215,14 @@ func TestManagedFolderChangeDoesNotRetryHistoricalDestination(t *testing.T) {
 	deliberate, err := svc.RetryManagedJob(ctx, id, oldFolder)
 	if err != nil || deliberate.State != "filed" || deliberate.Destination != oldFolder {
 		t.Fatalf("explicit historical retry = %+v, %v", deliberate, err)
+	}
+	// A mistyped destination is a refusal that names the typo, not a vanished job.
+	typo := filepath.Join(t.TempDir(), "typo")
+	_, err = svc.RetryManagedJob(ctx, id, typo)
+	if errors.Is(err, sql.ErrNoRows) || !errors.Is(err, job.ErrConflict) || !strings.Contains(err.Error(), "no journaled filing for "+id+" at "+typo) {
+		t.Fatalf("typo destination retry = %v; want a conflict naming the destination", err)
+	}
+	if _, err := svc.RetryManagedJob(ctx, "job_missing", ""); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing job retry = %v; want not-found to stay", err)
 	}
 }

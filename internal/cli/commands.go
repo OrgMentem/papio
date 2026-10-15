@@ -723,7 +723,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 					if isUnknownMethod(err) {
 						return daemonUpgradeRequired("jobs.refile_preview")
 					}
-					return fmt.Errorf("refile dry run: %w", err)
+					return refileRefusal("refile dry run", err)
 				}
 				return opt.printResult(preview, "would run for %s (%s): %s", preview.JobID, preview.State, store.StripTerminalControls(preview.Command))
 			}
@@ -732,7 +732,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 				if isUnknownMethod(err) {
 					return daemonUpgradeRequired("jobs.refile")
 				}
-				return fmt.Errorf("refile failed: %w", err)
+				return refileRefusal("refile failed", err)
 			}
 			if result.Status != "ok" {
 				// The hook ran and failed: a routine outcome the daemon
@@ -983,7 +983,18 @@ func newActionsCommand(opt *options) *cobra.Command {
 				map[string]any{"action_id": actionID, "expected_revision": revision}, &result); err != nil {
 				return err
 			}
-			return opt.printResult(result, "dismissed action %d on %s", actionID, result["job_id"])
+			// The result carries only the job id and its shape is fixed for
+			// older CLIs, so read the job back to say whether the dismissal
+			// also cancelled it, as `jobs cancel` does.
+			jobID, _ := result["job_id"].(string)
+			after := &api.JobDetail{}
+			if jobID == "" || opt.call(cmd.Context(), "jobs.get", map[string]string{"job_id": jobID}, after) != nil || after.Job == nil {
+				return opt.printResult(result, "dismissed action %d on %s", actionID, result["job_id"])
+			}
+			if after.Job.State == string(job.StateCancelled) {
+				return opt.printResult(result, "dismissed action %d; %s cancelled (it was its last open action)", actionID, jobID)
+			}
+			return opt.printResult(result, "dismissed action %d; %s left %s", actionID, jobID, after.Job.State)
 		},
 	}
 	dismiss.Flags().Int64Var(&revision, "revision", 0, "revision the action had when you listed it")
@@ -1090,6 +1101,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 					return err
 				}
 			}
+			var skippedErr error
 			// planOut, not opt.out: the skipped-handoff shortfall is prose
 			// and must not precede the --json page on stdout.
 			if err := focusOrOpenActionURLs(cmd.Context(), urls, untrackedURLs, jobIDs, dryRun, planOut, func(ctx context.Context, ids []string) (api.ActionsOpenResult, error) {
@@ -1098,8 +1110,10 @@ func newActionsCommand(opt *options) *cobra.Command {
 					return api.ActionsOpenResult{}, err
 				}
 				return result, nil
-			}, commandExec); err != nil {
+			}, commandExec); err != nil && !errors.Is(err, errHandoffsSkipped) {
 				return err
+			} else if err != nil {
+				skippedErr = err
 			}
 			if dryRun {
 				if err := printRediscovery(planOut, rediscoverIDs, true); err != nil {
@@ -1107,9 +1121,13 @@ func newActionsCommand(opt *options) *cobra.Command {
 				}
 			}
 			if opt.jsonOutput {
-				return printPage(opt, "urls", urls, truncated)
+				// The page lists the plan; the nonzero exit below is how a
+				// script learns that some tracked handoffs were not opened.
+				if err := printPage(opt, "urls", urls, truncated); err != nil {
+					return err
+				}
 			}
-			return nil
+			return skippedErr
 		},
 	}
 	open.Flags().IntVar(&limit, "limit", 0, "maximum actions to open (default all)")
@@ -1322,6 +1340,11 @@ func actionURL(action job.HumanAction, row job.Row, instFor func(string) (config
 
 type focusHandoffs func(context.Context, []string) (api.ActionsOpenResult, error)
 
+// errHandoffsSkipped makes `actions open` exit nonzero when the daemon could
+// not offer some tracked handoffs, so a script does not read a partial open as
+// complete.
+var errHandoffsSkipped = errors.New("some handoffs were not opened")
+
 var errNoConnectedBrowserSession = errors.New("no connected browser extension session - open Chrome with the papio extension enabled; check papio doctor")
 
 func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []string, dryRun bool, out io.Writer, focus focusHandoffs, run commandRunner) error {
@@ -1329,7 +1352,7 @@ func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []st
 		return openActionURLs(ctx, urls, true, out, run)
 	}
 	if len(jobIDs) == 0 {
-		return openActionURLs(ctx, urls, false, out, run)
+		return openActionURLsReported(ctx, urls, out, run)
 	}
 	result, err := focus(ctx, jobIDs)
 	if err == nil && result.SessionLive {
@@ -1342,14 +1365,28 @@ func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []st
 		// whose download already settled, and one held by a safety latch. Naming
 		// access mode as the reason sent a reader chasing a consumed
 		// authorization that did not exist.
-		if skipped := len(jobIDs) - result.Queued; skipped > 0 {
+		skipped := len(jobIDs) - result.Queued
+		if skipped > 0 {
+			// The daemon reports only a count, so the message names the
+			// offered jobs the shortfall came from rather than guessing which.
 			if _, err := fmt.Fprintf(out,
-				"%d of %d handoffs were not opened: papio holds no institutional handoff it can offer for them right now - see papio jobs show <id> and papio doctor\n",
-				skipped, len(jobIDs)); err != nil {
+				"%d of %d handoffs were not opened: papio holds no institutional handoff it can offer for them right now (the daemon does not say which of %s) - see papio jobs show <id> and papio doctor\n",
+				skipped, len(jobIDs), strings.Join(jobIDs, ", ")); err != nil {
 				return err
 			}
 		}
-		return openActionURLs(ctx, untrackedURLs, false, out, run)
+		if result.Queued > 0 {
+			if _, err := fmt.Fprintf(out, "opened %d handoffs\n", result.Queued); err != nil {
+				return err
+			}
+		}
+		if err := openActionURLsReported(ctx, untrackedURLs, out, run); err != nil {
+			return err
+		}
+		if skipped > 0 {
+			return fmt.Errorf("%w: %d of %d", errHandoffsSkipped, skipped, len(jobIDs))
+		}
+		return nil
 	}
 	if err == nil {
 		return errNoConnectedBrowserSession
@@ -1362,11 +1399,24 @@ func focusOrOpenActionURLs(ctx context.Context, urls, untrackedURLs, jobIDs []st
 		// A newer CLI can meet an older daemon that predates this additive RPC;
 		// fall back rather than making that ordinary skew strand the handoff.
 	}
-	return openActionURLs(ctx, urls, false, out, run)
+	return openActionURLsReported(ctx, urls, out, run)
+}
+
+// openActionURLsReported opens urls and prints a one-line confirmation, so a
+// successful run is not indistinguishable from one that opened nothing.
+func openActionURLsReported(ctx context.Context, urls []string, out io.Writer, run commandRunner) error {
+	if err := openActionURLs(ctx, urls, false, out, run); err != nil {
+		return err
+	}
+	if len(urls) == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(out, "opened %d handoffs\n", len(urls))
+	return err
 }
 
 func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writer, run commandRunner) error {
-	for _, target := range urls {
+	for i, target := range urls {
 		if dryRun {
 			if _, err := fmt.Fprintln(out, target); err != nil {
 				return err
@@ -1378,7 +1428,10 @@ func openActionURLs(ctx context.Context, urls []string, dryRun bool, out io.Writ
 		err := run(bounded, name, args...)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("browser handoff could not open — open your browser with the papio extension enabled (papio doctor), then retry: %w", err)
+			// Retrying the whole command would reopen the tabs that did open,
+			// duplicating institutional sessions; name the rest instead.
+			return fmt.Errorf("browser handoff could not open (opened %d of %d; not opened: %s) — open your browser with the papio extension enabled (papio doctor), then open only those: %w",
+				i, len(urls), strings.Join(urls[i:], " "), err)
 		}
 	}
 	return nil
@@ -1586,4 +1639,15 @@ func exportBundleResult(ctx context.Context, opt *options, jobID, outputDir stri
 		return api.BundleResult{}, err
 	}
 	return legacy, nil
+}
+
+// refileRefusal prefixes a refile error with what failed, except for a
+// conflict refusal: the daemon message already names the job, the cause and
+// the next step, so a prefix would only repeat it.
+func refileRefusal(prefix string, err error) error {
+	var remote *ipc.RemoteError
+	if errors.As(err, &remote) && remote.Code == "conflict" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"papio/internal/store"
 )
@@ -56,7 +57,11 @@ func (js *Store) setDisposition(ctx context.Context, jobID, disposition string) 
 		return result, err
 	}
 	if result.State != StateReady {
-		return result, ErrConflict
+		verb := "archiving"
+		if disposition == DispositionActive {
+			verb = "restoring"
+		}
+		return result, fmt.Errorf("job %s is %s; %s needs a ready job: %w", jobID, result.State, verb, ErrConflict)
 	}
 	if disposition == DispositionArchived {
 		var hookRunning bool
@@ -74,7 +79,7 @@ func (js *Store) setDisposition(ctx context.Context, jobID, disposition string) 
 			return result, err
 		}
 		if hookRunning {
-			return result, ErrConflict
+			return result, fmt.Errorf("a filing hook is already running for %s; wait for it to finish, then archive again: %w", jobID, ErrConflict)
 		}
 		// An external mutation can outlive its lease or report failure after
 		// committing. Any apply receipt therefore prevents archival.
@@ -85,14 +90,14 @@ func (js *Store) setDisposition(ctx context.Context, jobID, disposition string) 
 			return result, err
 		}
 		if filing {
-			return result, ErrConflict
+			return result, fmt.Errorf("job %s was imported into Zotero; archiving is refused once a library apply exists: %w", jobID, ErrConflict)
 		}
 		var validated bool
 		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM job_artifacts WHERE job_id = ? AND artifact_sha256 = ? AND role = 'main' AND identity_result IN ('pass', 'user_confirmed'))`, jobID, result.ArtifactSHA256).Scan(&validated); err != nil {
 			return result, err
 		}
 		if !validated {
-			return result, ErrConflict
+			return result, fmt.Errorf("job %s has no identity-validated artifact; archiving is refused: %w", jobID, ErrConflict)
 		}
 	}
 	if result.Disposition == disposition {

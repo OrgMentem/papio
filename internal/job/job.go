@@ -280,6 +280,25 @@ var allowed = map[string]map[string]bool{
 // transition is not allowed).
 var ErrConflict = errors.New("job state conflict")
 
+// ErrHumanActionNotFound reports a human action id that names no row. It is a
+// missing record, not a job-state conflict.
+var ErrHumanActionNotFound = errors.New("no such review action")
+
+// ErrDismissNotCancelled reports a dismissal whose action close committed but
+// whose follow-up cancellation of the parked job failed. Retrying the dismiss
+// cannot help (the action is already closed); the job needs `papio jobs cancel`.
+type ErrDismissNotCancelled struct {
+	ActionID int64
+	JobID    string
+	Cause    error
+}
+
+func (e *ErrDismissNotCancelled) Error() string {
+	return fmt.Sprintf("action %d is dismissed, but job %s was not cancelled; run `papio jobs cancel %s`", e.ActionID, e.JobID, e.JobID)
+}
+
+func (e *ErrDismissNotCancelled) Unwrap() error { return e.Cause }
+
 // ErrHumanActionKind reports an action that cannot be resolved by the requested
 // human workflow.
 type ErrHumanActionKind struct {
@@ -3044,7 +3063,24 @@ type ReviewResolution struct {
 	Outcome ReviewOutcome
 	JobID   string
 	State   string
+	// Cause refines a ReviewConflict for in-process callers that can say more
+	// than "changed". It never crosses the wire: the outcome string is fixed.
+	Cause ReviewConflictCause
 }
+
+// ReviewConflictCause says why a review resolution reported ReviewConflict
+// when the cause is a caller mistake rather than a real change.
+type ReviewConflictCause string
+
+const (
+	// ReviewCauseChanged is the zero value: the revision or state really moved.
+	ReviewCauseChanged ReviewConflictCause = ""
+	// ReviewCauseNoAction means the action id names no row.
+	ReviewCauseNoAction ReviewConflictCause = "no_action"
+	// ReviewCauseDigestMismatch means the open action is unchanged but the
+	// supplied digest is not its quarantined file's digest.
+	ReviewCauseDigestMismatch ReviewConflictCause = "digest_mismatch"
+)
 
 // ResolveReview preserves the legacy action-resolution API for CLI callers
 // that predate review bindings. New callers must use ResolveReviewCAS.
@@ -3097,7 +3133,7 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 		if legacy {
 			return ReviewResolution{}, err
 		}
-		return ReviewResolution{Outcome: ReviewConflict}, nil
+		return ReviewResolution{Outcome: ReviewConflict, Cause: ReviewCauseNoAction}, nil
 	}
 	if err != nil {
 		return ReviewResolution{}, normalizeReviewBusy(err)
@@ -3139,6 +3175,9 @@ func (js *Store) resolveReview(ctx context.Context, input ResolveReviewInput, le
 	}
 	if from != StateNeedsReview {
 		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID, State: from}, nil
+	}
+	if !legacy && input.Verdict == "accept" && action.QuarantineSHA256 != input.ExpectedSHA256 {
+		return ReviewResolution{Outcome: ReviewConflict, JobID: action.JobID, Cause: ReviewCauseDigestMismatch}, nil
 	}
 
 	now := store.Now()
@@ -3293,7 +3332,7 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 		JOIN jobs ON jobs.id = human_actions.job_id
 		WHERE human_actions.id = ?`, actionID).Scan(&jobID, &actionKind, &state); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("%w: human action %d does not exist", ErrConflict, actionID)
+			return "", fmt.Errorf("no review action %d; run `papio actions list`: %w", actionID, ErrHumanActionNotFound)
 		}
 		return "", normalizeReviewBusy(err)
 	}
@@ -3328,7 +3367,9 @@ func (js *Store) DismissHumanAction(ctx context.Context, actionID, expectedRevis
 		return "", normalizeReviewBusy(err)
 	}
 	if !otherActionOpen && dismissalCancelsParkedJob(actionKind, state) {
-		return jobID, js.Cancel(ctx, jobID, TerminalReasonUserDismissed)
+		if err := js.Cancel(ctx, jobID, TerminalReasonUserDismissed); err != nil {
+			return jobID, &ErrDismissNotCancelled{ActionID: actionID, JobID: jobID, Cause: err}
+		}
 	}
 	return jobID, nil
 }

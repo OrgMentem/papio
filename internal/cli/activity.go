@@ -45,12 +45,14 @@ func newActivityCommand(opt *options) *cobra.Command {
 				return printPage(opt, "entries", page.Entries, page.Truncated)
 			}
 			for _, entry := range page.Entries {
-				shortID := "-"
+				// Full id: it is the value --job, jobs show and every other
+				// command accept, and a truncated copy matches none of them.
+				jobID := "-"
 				if entry.JobID != "" {
-					shortID = shortActivityJobID(entry.JobID)
+					jobID = entry.JobID
 				}
 				if _, err := fmt.Fprintf(opt.out, "%s  %s  %s  %s\n",
-					formatActivityAt(entry.At), shortID, store.ActivityText(entry.Kind, entry.Detail), compactActivitySummary(entry)); err != nil {
+					formatActivityAt(entry.At), jobID, store.ActivityText(entry.Kind, entry.Detail), compactActivitySummary(entry)); err != nil {
 					return err
 				}
 			}
@@ -79,13 +81,6 @@ func activityNextPageNotice(opt *options, page api.ActivityPage, jobID string) e
 	return err
 }
 
-func shortActivityJobID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
-	}
-	return id
-}
-
 func formatActivityAt(at time.Time) string {
 	age := time.Since(at)
 	if age >= 0 && age < 24*time.Hour {
@@ -98,7 +93,7 @@ func formatActivityAt(at time.Time) string {
 			return fmt.Sprintf("%dh ago", int(age.Hours()))
 		}
 	}
-	return at.Local().Format("15:04:05")
+	return at.Local().Format("2006-01-02 15:04")
 }
 
 // compactActivitySummary names the job on the human line: title when known,

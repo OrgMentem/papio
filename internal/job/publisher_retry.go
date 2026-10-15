@@ -120,7 +120,7 @@ func (js *Store) RetryPublisherHandoff(ctx context.Context, actionID, revision i
 		actionID, now, now, HumanGateLogin, HumanGateMFA, HumanGateCaptchaOrSecurity, HumanGateTermsRequired).
 		Scan(&jobID, &doi, &requiresAuth, &actionDetail, &publisherRetried)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("%w: publisher retry requires one DOI route failure, no pending gate or effect, and no earlier publisher retry", ErrConflict)
+		return "", publisherRetryRefusal(ctx, tx, actionID, now)
 	}
 	if err != nil {
 		return "", err
@@ -265,4 +265,38 @@ func adapterVersionNewer(previous, current string) bool {
 		}
 	}
 	return false
+}
+
+// publisherRetryRefusal names the most actionable reason the eligibility query
+// matched no row, so the operator can tell "wait and retry" from "never
+// eligible". It falls back to the full condition list when none of the cheap
+// checks explains the refusal.
+func publisherRetryRefusal(ctx context.Context, tx *sql.Tx, actionID int64, now string) error {
+	const generic = "publisher retry requires one DOI route failure, no pending gate or effect, and no earlier publisher retry"
+	var jobID, state string
+	var leased, retried bool
+	err := tx.QueryRowContext(ctx, `SELECT j.id, j.state,
+		(j.lease_owner IS NOT NULL AND (j.lease_expires_at IS NULL OR j.lease_expires_at >= ?)),
+		EXISTS (SELECT 1 FROM events e WHERE e.job_id=j.id AND e.kind='browser.publisher_retry_requested')
+		FROM human_actions a JOIN jobs j ON j.id=a.job_id WHERE a.id=?`, now, actionID).Scan(&jobID, &state, &leased, &retried)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrConflict, generic)
+	}
+	switch {
+	case state != StateAwaitingHuman:
+		return fmt.Errorf("%w: job %s is %s; publisher retry needs awaiting_human", ErrConflict, jobID, state)
+	case leased:
+		return fmt.Errorf("%w: job %s is being worked; retry after it settles", ErrConflict, jobID)
+	case retried:
+		return fmt.Errorf("%w: job %s already had a publisher retry; it is not offered twice", ErrConflict, jobID)
+	}
+	var holder string
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(job_id,'') FROM (
+		SELECT job_id FROM effect_permits WHERE status IN ('held','unknown_completion')
+		UNION ALL
+		SELECT job_id FROM legacy_effect_blockers WHERE status='unresolved') LIMIT 1`).Scan(&holder)
+	if err == nil && holder != "" && holder != jobID {
+		return fmt.Errorf("%w: another browser effect is in progress (job %s); retry when it settles", ErrConflict, holder)
+	}
+	return fmt.Errorf("%w: %s", ErrConflict, generic)
 }

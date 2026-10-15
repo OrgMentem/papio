@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"papio/internal/api"
 	"papio/internal/config"
+	"papio/internal/job"
 )
 
 const reviewedSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -98,5 +100,34 @@ func TestActionsResolveConflictExitsNonzero(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "not resolved") {
 		t.Fatalf("stdout = %q, want the conflict explained", out.String())
+	}
+}
+
+// TestActionsDismissReportsWhetherTheJobWasCancelled: the dismiss result
+// carries only the job id, so the CLI reads the job back to say which happened.
+func TestActionsDismissReportsWhetherTheJobWasCancelled(t *testing.T) {
+	for _, state := range []string{"cancelled", "unavailable"} {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+			switch method {
+			case "actions.dismiss":
+				*result.(*map[string]any) = map[string]any{"job_id": "job_x", "action_id": float64(12)}
+			case "jobs.get":
+				detail := result.(*api.JobDetail)
+				detail.Job = &job.Row{ID: "job_x", State: state}
+			}
+			return nil
+		})
+		root.SetArgs([]string{"actions", "dismiss", "12", "--revision", "1"})
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		want := "dismissed action 12; job_x left " + state
+		if state == "cancelled" {
+			want = "dismissed action 12; job_x cancelled (it was its last open action)"
+		}
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("state %s: stdout = %q, want %q", state, out.String(), want)
+		}
 	}
 }

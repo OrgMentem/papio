@@ -4927,10 +4927,10 @@ func (s *Service) refilePreflight(ctx context.Context, jobID string) (*job.Row, 
 		return nil, err
 	}
 	if disposition.Disposition == job.DispositionArchived {
-		return nil, job.ErrConflict
+		return nil, fmt.Errorf("job %s is archived; run `papio jobs restore %s` first: %w", jobID, jobID, job.ErrConflict)
 	}
 	if row.State != job.StateReady && row.State != job.StateImported {
-		return nil, job.ErrConflict
+		return nil, fmt.Errorf("job %s is %s; refile needs ready or imported: %w", jobID, row.State, job.ErrConflict)
 	}
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return nil, ErrReadyHookNotConfigured
@@ -4978,7 +4978,7 @@ func (s *Service) RefileJob(ctx context.Context, jobID string) (RefileResult, er
 		return RefileResult{}, err
 	}
 	if !s.beginReadyHook(row.ID) {
-		return RefileResult{}, job.ErrConflict
+		return RefileResult{}, fmt.Errorf("a filing hook is already running for %s; wait for it to finish: %w", row.ID, job.ErrConflict)
 	}
 	s.hookWG.Add(1)
 	defer s.hookWG.Done()

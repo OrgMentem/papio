@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1552,13 +1553,6 @@ func TestDismissHumanActionWrongRevisionConflicts(t *testing.T) {
 	}
 }
 
-func TestDismissHumanActionMissingActionConflicts(t *testing.T) {
-	js := testStore(t)
-	if _, err := js.DismissHumanAction(context.Background(), 999999, 1); !errors.Is(err, ErrConflict) {
-		t.Fatalf("missing action dismiss error = %v, want ErrConflict", err)
-	}
-}
-
 // Regression: this is the exact production bug — a verify_identity action
 // created before quarantine bindings were mandatory has an empty
 // quarantine_path/quarantine_sha256, so it can never preview or be accepted,
@@ -2078,5 +2072,53 @@ func TestEnrichmentRecordsADuplicateItCannotHaveCaughtAtSubmit(t *testing.T) {
 		t.Fatal(err)
 	} else if self == identified.JobID {
 		t.Fatal("a job was recorded as a duplicate of itself")
+	}
+}
+
+func TestDismissHumanActionMissingIDIsNotFoundNotConflict(t *testing.T) {
+	js := testStore(t)
+	_, err := js.DismissHumanAction(context.Background(), 999, 1)
+	if !errors.Is(err, ErrHumanActionNotFound) || errors.Is(err, ErrConflict) {
+		t.Fatalf("missing action dismiss = %v; want ErrHumanActionNotFound only", err)
+	}
+}
+
+func TestDismissHumanActionNamesCancelFailureAfterCommit(t *testing.T) {
+	js := testStore(t)
+	ctx := context.Background()
+	id, _, actionID := parkIdentityReview(t, js, "wr_dismiss_cancel_fail")
+	// Cancel is refused once the job is terminal; make it so between the
+	// action close and the cancel by failing the job's transition guard.
+	if _, err := js.S.DB().ExecContext(ctx, `CREATE TRIGGER block_cancel BEFORE UPDATE OF state ON jobs WHEN NEW.state = 'cancelled' BEGIN SELECT RAISE(ABORT, 'blocked'); END`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := js.DismissHumanAction(ctx, actionID, 1)
+	var notCancelled *ErrDismissNotCancelled
+	if !errors.As(err, &notCancelled) || notCancelled.JobID != id || !strings.Contains(err.Error(), "papio jobs cancel "+id) {
+		t.Fatalf("dismiss error = %v; want ErrDismissNotCancelled naming the next step", err)
+	}
+	actions, listErr := js.ListHumanActions(ctx, false)
+	if listErr != nil || len(actions) != 1 || actions[0].Status != "cancelled" {
+		t.Fatalf("action after failed cancel = %+v, %v; want it closed", actions, listErr)
+	}
+}
+
+func TestResolveReviewCASDistinguishesMissingActionAndWrongDigest(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	js := testStore(t)
+	ctx := context.Background()
+	_, _, actionID := parkIdentityReview(t, js, "wr_review_cause")
+	missing, err := js.ResolveReviewCAS(ctx, ResolveReviewInput{ActionID: actionID + 100, Verdict: "accept", ExpectedRevision: 1, ExpectedSHA256: sha})
+	if err != nil || missing.Outcome != ReviewConflict || missing.Cause != ReviewCauseNoAction {
+		t.Fatalf("missing action = %+v, %v", missing, err)
+	}
+	wrong, err := js.ResolveReviewCAS(ctx, ResolveReviewInput{ActionID: actionID, Verdict: "accept", ExpectedRevision: 1, ExpectedSHA256: other})
+	if err != nil || wrong.Outcome != ReviewConflict || wrong.Cause != ReviewCauseDigestMismatch {
+		t.Fatalf("wrong digest = %+v, %v", wrong, err)
+	}
+	stale, err := js.ResolveReviewCAS(ctx, ResolveReviewInput{ActionID: actionID, Verdict: "accept", ExpectedRevision: 2, ExpectedSHA256: sha})
+	if err != nil || stale.Outcome != ReviewConflict || stale.Cause != ReviewCauseChanged {
+		t.Fatalf("stale revision = %+v, %v; want a plain change", stale, err)
 	}
 }

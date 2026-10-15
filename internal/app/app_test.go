@@ -3134,8 +3134,9 @@ func TestRefileJob(t *testing.T) {
 		return hook.Result{}
 	}
 	for _, refused := range []string{queuedID, resolvingID, cancelledID} {
-		if _, err := svc.RefileJob(ctx, refused); !errors.Is(err, job.ErrConflict) {
-			t.Fatalf("refile of %s error = %v, want ErrConflict", refused, err)
+		_, err := svc.RefileJob(ctx, refused)
+		if !errors.Is(err, job.ErrConflict) || !strings.Contains(err.Error(), "refile needs ready or imported") || !strings.Contains(err.Error(), refused) {
+			t.Fatalf("refile of %s error = %v, want ErrConflict naming the state", refused, err)
 		}
 	}
 }

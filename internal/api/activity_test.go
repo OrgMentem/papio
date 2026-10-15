@@ -47,3 +47,11 @@ func TestActivityListJoinsJobsAndReportsTruncation(t *testing.T) {
 		t.Fatalf("entry = %+v, want newest detail", entry)
 	}
 }
+
+func TestListActivityRefusesUnknownJob(t *testing.T) {
+	system := testSystem(t)
+	rpcErr := callMethod(t, Router(system), "activity.list", map[string]any{"job_id": "job_missing"}, nil)
+	if rpcErr == nil || rpcErr.Code != "not_found" {
+		t.Fatalf("unknown job activity = %+v, want not_found", rpcErr)
+	}
+}

@@ -4,8 +4,10 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"path/filepath"
 	"strings"
@@ -181,7 +183,42 @@ func (s *Service) RetryManagedJob(ctx context.Context, jobID, destination string
 			return ManagedFiling{}, err
 		}
 	}
-	return s.fileManaged(ctx, jobID, destination, true)
+	filed, err := s.fileManaged(ctx, jobID, destination, true)
+	if errors.Is(err, sql.ErrNoRows) {
+		return filed, s.managedRefusal(ctx, jobID, destination, configured)
+	}
+	return filed, err
+}
+
+// managedRefusal explains why a retry found no journaled filing. The bare
+// sql.ErrNoRows reads as "no such job" to the operator, so each cause that is
+// really a refusal gets its own message; a job that does not exist keeps the
+// not-found classification.
+func (s *Service) managedRefusal(ctx context.Context, jobID, destination, configured string) error {
+	row, err := s.Jobs.Get(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	disposition, err := s.Jobs.Disposition(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	switch {
+	case disposition.Disposition == job.DispositionArchived:
+		return fmt.Errorf("job %s is archived; run `papio jobs restore %s` first: %w", jobID, jobID, job.ErrConflict)
+	case row.State != job.StateReady && row.State != job.StateImported:
+		return fmt.Errorf("job %s is %s; managed filing needs ready or imported: %w", jobID, row.State, job.ErrConflict)
+	case row.ArtifactSHA256 == "":
+		return fmt.Errorf("job %s has no artifact to file: %w", jobID, job.ErrConflict)
+	}
+	var validated bool
+	if err := s.Jobs.S.DB().QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM job_artifacts WHERE job_id = ? AND artifact_sha256 = ? AND role = 'main' AND identity_result IN ('pass', 'user_confirmed'))`, jobID, row.ArtifactSHA256).Scan(&validated); err != nil {
+		return err
+	}
+	if !validated {
+		return fmt.Errorf("job %s has no identity-validated artifact: %w", jobID, job.ErrConflict)
+	}
+	return fmt.Errorf("no journaled filing for %s at %s (configured destination is %s): %w", jobID, destination, configured, job.ErrConflict)
 }
 
 func (s *Service) fileManaged(ctx context.Context, jobID, destination string, force bool) (ManagedFiling, error) {
@@ -198,7 +235,7 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 		return f, err
 	}
 	if f.Disposition != job.DispositionActive {
-		return f, job.ErrConflict
+		return f, fmt.Errorf("job %s is archived; run `papio jobs restore %s` first: %w", jobID, jobID, job.ErrConflict)
 	}
 	if f.State == "filed" {
 		if err := tx.Commit(); err != nil {

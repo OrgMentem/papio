@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -40,8 +41,8 @@ func TestActionsOpenJSONKeepsSkippedHandoffNoticeOffStdout(t *testing.T) {
 		return nil
 	})
 	root.SetArgs([]string{"--json", "actions", "open"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("actions open: %v (%s)", err, errOut.String())
+	if err := root.ExecuteContext(context.Background()); !errors.Is(err, errHandoffsSkipped) {
+		t.Fatalf("actions open: %v (%s); want errHandoffsSkipped after the page", err, errOut.String())
 	}
 	decoder := json.NewDecoder(bytes.NewReader(out.Bytes()))
 	var page struct {
