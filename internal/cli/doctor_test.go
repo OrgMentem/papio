@@ -226,7 +226,7 @@ func TestDoctorConfigFailureSkipsDaemon(t *testing.T) {
 	daemonCalled := false
 	deps := testDoctorDependencies(t, config.Config{}, doctor.DaemonStatus{})
 	deps.LoadConfig = func() (config.Config, error) {
-		return config.Config{}, errors.New("parsing config: unknown field \"browser.new_field\"")
+		return config.Config{}, &config.ErrUnknownFields{Path: "config.toml", Fields: []string{"browser.new_field"}}
 	}
 	deps.DaemonStatus = func(context.Context, config.Config) (doctor.DaemonStatus, error) {
 		daemonCalled = true
@@ -236,7 +236,7 @@ func TestDoctorConfigFailureSkipsDaemon(t *testing.T) {
 	if report.OK || daemonCalled {
 		t.Fatalf("report/daemon call = %#v / %t", report, daemonCalled)
 	}
-	if got := report.Checks[0]; got.Status != doctor.Fail || got.Remediation != "update papio or remove the unrecognized field" {
+	if got := report.Checks[0]; got.Status != doctor.Fail || !strings.Contains(got.Remediation, "update papio") {
 		t.Fatalf("config check = %#v", got)
 	}
 	if got := report.Checks[1]; got.Name != "daemon" || got.Status != doctor.Skip {
@@ -298,5 +298,17 @@ func TestDoctorDaemonStatusAcceptsUpdateFields(t *testing.T) {
 	}
 	if status.Version != "0.9.1" || status.UpdateAvailable == nil || !*status.UpdateAvailable || status.LatestVersion != "0.9.2" {
 		t.Fatalf("status = %+v", status)
+	}
+}
+
+// A syntax error must not send the operator to update papio.
+func TestDoctorConfigSyntaxErrorDoesNotSuggestUpdate(t *testing.T) {
+	deps := testDoctorDependencies(t, config.Config{}, doctor.DaemonStatus{})
+	deps.LoadConfig = func() (config.Config, error) {
+		return config.Config{}, errors.New("parsing config config.toml at line 2, column 1: expected newline")
+	}
+	report := doctor.RunIntegration(context.Background(), deps)
+	if got := report.Checks[0]; got.Status != doctor.Fail || strings.Contains(got.Remediation, "update papio") {
+		t.Fatalf("config check = %#v", got)
 	}
 }

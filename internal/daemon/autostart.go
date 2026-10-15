@@ -173,7 +173,7 @@ func (w *startWait) run(ctx context.Context) (EnsureResult, error) {
 		status, held := w.observe()
 		child.noteStoreWork(status, held)
 		if held && status.Phase == PhaseRunning && status.Socket != "" && filepath.Clean(status.Socket) != filepath.Clean(w.cfg.SocketPath) {
-			return result, fmt.Errorf("the daemon (pid %d) for %s serves %s, not %s; stop it with 'papio daemon stop' or use its socket", status.PID, w.cfg.DataDir, status.Socket, w.cfg.SocketPath)
+			return result, fmt.Errorf("the daemon (pid %d) for %s serves %s, not %s; stop it with 'papio daemon stop --socket %s' or use its socket", status.PID, w.cfg.DataDir, status.Socket, w.cfg.SocketPath, status.Socket)
 		}
 		switch {
 		case child != nil && !child.exited():

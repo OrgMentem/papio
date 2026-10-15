@@ -165,6 +165,15 @@ func (e *errConfigMissing) Error() string {
 	return fmt.Sprintf("config file %s does not exist; run 'papio init --config %s' to create it, or omit --config to use %s", e.path, e.path, defaultConfigPath())
 }
 
+// configFlag returns " --config PATH" for a non-default profile, so a command
+// suggested to the operator acts on the profile they named.
+func (o *options) configFlag() string {
+	if o.configPath != "" && filepath.Clean(o.configPath) != defaultConfigPath() {
+		return " --config " + o.configPath
+	}
+	return ""
+}
+
 func defaultConfigPath() string { return filepath.Join(config.Dir(), "config.toml") }
 
 // loadConfig loads the configuration for a command. A missing file means
@@ -488,7 +497,7 @@ func newConfigCommand(opt *options) *cobra.Command {
 			replacing := false
 			if _, err := os.Lstat(path); err == nil {
 				if !force {
-					return fmt.Errorf("config already exists at %s (use --force to replace it and reset every other setting; to change only the access mode, run 'papio config set-access-mode %s')", path, mode)
+					return fmt.Errorf("config already exists at %s (use --force to replace it and reset every other setting; to change only the access mode, run 'papio%s config set-access-mode %s')", path, opt.configFlag(), mode)
 				}
 				replacing = true
 			} else if !errors.Is(err, os.ErrNotExist) {
@@ -505,10 +514,10 @@ func newConfigCommand(opt *options) *cobra.Command {
 				return err
 			}
 			if replacing {
-				return opt.printResult(map[string]string{"config_path": path, "access_mode": mode, "replaced": "true", "backup_path": backup},
-					"Replaced %s (access_mode=%s); data_dir, institutions, sources, hooks and credential bindings were reset to defaults%s", path, mode, backupNotice(path, backup, "; "))
+				return opt.printResult(map[string]any{"config_path": path, "access_mode": mode, "replaced": "true", "backup_path": backup, "restart_required": true},
+					"Replaced %s (access_mode=%s); data_dir, institutions, sources, hooks and credential bindings were reset to defaults%s. "+daemonStopStep, path, mode, backupNotice(path, backup, "; "))
 			}
-			return opt.printResult(map[string]string{"config_path": path, "access_mode": mode}, "Wrote %s (access_mode=%s)", path, mode)
+			return opt.printResult(map[string]any{"config_path": path, "access_mode": mode, "restart_required": true}, "Wrote %s (access_mode=%s). "+daemonStopStep, path, mode)
 		},
 	}
 	initCommand.Flags().StringVar(&mode, "access-mode", "", "required: conservative, assisted, or delegated")
@@ -528,7 +537,7 @@ func newConfigCommand(opt *options) *cobra.Command {
 			}
 			if _, err := os.Stat(path); err != nil {
 				if errors.Is(err, os.ErrNotExist) {
-					return fmt.Errorf("config file %s does not exist; run 'papio init' to create it", path)
+					return fmt.Errorf("config file %s does not exist; run 'papio init%s' to create it", path, opt.configFlag())
 				}
 				return err
 			}

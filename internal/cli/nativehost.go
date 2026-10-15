@@ -94,6 +94,15 @@ func selectManifestTargets(chromeOverride, firefoxOverride string) ([]browserTar
 	return []browserTarget{chrome, firefox}, nil
 }
 
+// pathLines lists paths one per line under a heading line break.
+func pathLines(paths []string) string {
+	out := ""
+	for _, p := range paths {
+		out += "\n  " + p
+	}
+	return out
+}
+
 func findTarget(targets []browserTarget, id string) (browserTarget, bool) {
 	for _, t := range targets {
 		if t.id == id {
@@ -134,6 +143,7 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 		Annotations: map[string]string{"mcp:hidden": "true"},
 	}
 	var manifestDir, firefoxManifestDir string
+	var removeHost, dryRun bool
 
 	install := &cobra.Command{
 		Use:   "install",
@@ -179,6 +189,37 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			overridden := manifestDir != "" || firefoxManifestDir != ""
+			if overridden {
+				// An override names the directories to clean. Acting on the
+				// other browser's real registration would disconnect it.
+				kept := targets[:0:0]
+				for _, t := range targets {
+					if (t.id == "chrome" && manifestDir != "") || (t.id == "firefox" && firefoxManifestDir != "") {
+						kept = append(kept, t)
+					}
+				}
+				targets = kept
+			}
+			// The shared host executable serves every installed browser, so an
+			// override removes it only on request.
+			withHost := !overridden || removeHost
+			if dryRun {
+				would := []string{}
+				for _, t := range targets {
+					path := filepath.Join(t.dir, nativeHostManifestName+".json")
+					if _, err := os.Lstat(path); err == nil {
+						would = append(would, path)
+					}
+				}
+				if withHost {
+					if _, err := os.Lstat(nativehost.ExecPath()); err == nil {
+						would = append(would, nativehost.ExecPath())
+					}
+				}
+				return opt.printResult(map[string]any{"dry_run": true, "would_remove": would},
+					"Dry run: would remove %d native host artifact(s)%s", len(would), pathLines(would))
+			}
 			removed := make([]string, 0, len(targets)+2)
 			// Uninstall is not atomic across browsers. When one fails, the
 			// error names every manifest and registration already removed,
@@ -204,7 +245,10 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 					changed = append(changed, t.label+" registry key removed")
 				}
 			}
-			hostRemoved, err := removeHostExecutable()
+			var hostRemoved []string
+			if withHost {
+				hostRemoved, err = removeHostExecutable()
+			}
 			for _, path := range hostRemoved {
 				changed = append(changed, "host executable "+path+" removed")
 			}
@@ -214,16 +258,24 @@ func newNativeHostCommand(opt *options) *cobra.Command {
 			removed = append(removed, hostRemoved...)
 			chromeT, _ := findTarget(targets, "chrome")
 			firefoxT, _ := findTarget(targets, "firefox")
-			return opt.printResult(map[string]any{
-				"manifest_path":         filepath.Join(chromeT.dir, nativeHostManifestName+".json"),
-				"firefox_manifest_path": filepath.Join(firefoxT.dir, nativeHostManifestName+".json"),
-				"symlink_path":          nativehost.ExecPath(),
-				"removed":               removed,
-			}, "Removed %d native host artifact(s)", len(removed))
+			result := map[string]any{
+				"symlink_path": nativehost.ExecPath(),
+				"removed":      removed,
+			}
+			if chromeT.dir != "" {
+				result["manifest_path"] = filepath.Join(chromeT.dir, nativeHostManifestName+".json")
+			}
+			if firefoxT.dir != "" {
+				result["firefox_manifest_path"] = filepath.Join(firefoxT.dir, nativeHostManifestName+".json")
+			}
+			return opt.printResult(result, "Removed %d native host artifact(s)%s", len(removed), pathLines(removed))
 		},
 	}
-	uninstall.Flags().StringVar(&manifestDir, "manifest-dir", "", "override the Chrome native-messaging manifest directory")
-	uninstall.Flags().StringVar(&firefoxManifestDir, "firefox-manifest-dir", "", "override the Firefox native-messaging manifest directory")
+	uninstall.Long = "Remove the native-messaging manifests of every known browser (Chrome, Edge, Vivaldi, Brave, Opera, Chromium, Firefox) and the shared host executable. With --manifest-dir or --firefox-manifest-dir, act only on the named directories (Chrome manifest, Firefox manifest) and keep the host executable unless --remove-host is given."
+	uninstall.Flags().StringVar(&manifestDir, "manifest-dir", "", "remove only the Chrome manifest in this directory; other browsers and the host executable stay")
+	uninstall.Flags().StringVar(&firefoxManifestDir, "firefox-manifest-dir", "", "remove only the Firefox manifest in this directory; other browsers and the host executable stay")
+	uninstall.Flags().BoolVar(&removeHost, "remove-host", false, "with a directory override, also remove the shared host executable that every browser uses")
+	uninstall.Flags().BoolVar(&dryRun, "dry-run", false, "list what would be removed without removing it")
 
 	status := &cobra.Command{
 		Use:   "status",

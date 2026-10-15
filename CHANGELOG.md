@@ -288,6 +288,23 @@ execution records kept during the initial build.
   numbered by its place after owned works were filtered out. The message now uses
   the input position and the DOI or title, and ends with `N works failed — see
   papio batch report <batch-id>` when several fail.
+- **Setup and credential commands no longer mislead.** `config init` and
+  `config set-access-mode` suggest follow-up commands with `--config PATH` for a
+  non-default profile. `config init` reports `restart_required` and the
+  `papio daemon stop` step, and the "access_mode is not set" error names the
+  commands to run. `config credentials migrate` names the `.bak` file that still
+  holds the plaintext secrets (`backup_path` in JSON). `config credentials
+  delete` of a reference with no record reports `not_found` and exits nonzero.
+- **`papio native-host uninstall --manifest-dir` stays inside the named
+  directory.** It no longer removes the other browser's registration or the
+  shared host executable unless `--remove-host` is given. It lists each removed
+  path, and `--dry-run` lists what would go.
+- **`papio daemon stop` no longer says "Daemon not running" when a daemon on
+  another socket holds the data directory.** It names the socket and exits
+  nonzero; the autostart error gives the exact `daemon stop --socket` command.
+- **Config parse errors point at the real problem.** A TOML syntax or type error
+  gives its line and column instead of "unknown fields are rejected", and
+  `papio doctor` suggests updating papio only for unrecognized fields.
 - **`papio delivery submit` no longer places an ILLiad request it cannot track.**
   The command sent the request whatever state the job was in. For a job that
   had settled `unavailable`, `failed` or `cancelled`, ILLiad accepted the

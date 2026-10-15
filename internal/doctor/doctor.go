@@ -73,7 +73,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store, capability pdf
 	}
 
 	if _, err := cfg.RequireAccessMode(); err != nil {
-		add("access_mode", Fail, "no explicit access mode is configured", "set access_mode to conservative, assisted, or delegated")
+		add("access_mode", Fail, "no explicit access mode is configured", "run 'papio init' (or 'papio config init --access-mode MODE'), then 'papio daemon stop'")
 	} else {
 		add("access_mode", Pass, "explicit access mode configured", "")
 	}
@@ -1951,8 +1951,9 @@ func RunIntegration(ctx context.Context, deps IntegrationDependencies) Report {
 	cfg, err := deps.LoadConfig()
 	if err != nil {
 		remediation := "correct the configuration error above"
-		if strings.Contains(strings.ToLower(err.Error()), "unknown field") {
-			remediation = "update papio or remove the unrecognized field"
+		var unknown *config.ErrUnknownFields
+		if errors.As(err, &unknown) {
+			remediation = "update papio if the config came from a newer version, or correct the misspelled field"
 		}
 		add("config", Fail, err.Error(), remediation)
 		skipRemaining("skipped: configuration did not parse")

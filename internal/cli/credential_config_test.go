@@ -1265,3 +1265,22 @@ func TestCredentialConfigNamesTheDaemonStopStep(t *testing.T) {
 		t.Fatalf("agent remove output = %q, want the 'papio daemon stop' step", got)
 	}
 }
+
+// A delete aimed at a reference with no record must not report a deletion.
+func TestCredentialConfigDeleteMissingRecordIsNotFound(t *testing.T) {
+	ref, err := credential.NewReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newCredentialCLIFixture(t)
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	f.write(cfg)
+	f.store.err = credential.ErrNotFound
+	if err := f.run([]string{"delete", ref, "--yes"}, ""); err == nil || !strings.Contains(err.Error(), "nothing was deleted") {
+		t.Fatalf("delete of a missing record = %v, want a nothing-was-deleted failure", err)
+	}
+	if !strings.Contains(f.out.String(), `"not_found"`) || strings.Contains(f.out.String(), `"deleted"`) {
+		t.Fatalf("delete output = %q, want outcome not_found", f.out.String())
+	}
+}

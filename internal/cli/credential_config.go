@@ -198,6 +198,9 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 				return fmt.Errorf("refusing to delete %s: this configuration binds it to %s; run 'papio config credentials detach TARGET' first if no profile needs it", ref, strings.Join(targets, ", "))
 			}
 			if !confirmDelete {
+				if _, loadErr := deps.store.Load(cmd.Context(), ref); errors.Is(loadErr, credential.ErrNotFound) {
+					return errNoStoredCredential(opt, ref)
+				}
 				if err := opt.printResult(credentialConfigResult{Reference: ref, Outcome: "not_deleted"}, "Would delete stored credential %s. This configuration does not bind it; configurations that share it cannot be checked from here and would keep a reference that no longer resolves. Deletion cannot be undone.", ref); err != nil {
 					return err
 				}
@@ -211,7 +214,11 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 		if err != nil {
 			return err
 		}
-		return opt.printResult(result, "Migrated %d credential binding(s). Legacy vault entries are unchanged. "+daemonStopStep, len(result.Credentials))
+		backupNote := ""
+		if result.BackupPath != "" {
+			backupNote = fmt.Sprintf(" The previous config, which still holds the plaintext secrets, was saved to %s; delete it once you have checked the result.", result.BackupPath)
+		}
+		return opt.printResult(result, "Migrated %d credential binding(s). Legacy vault entries are unchanged. "+daemonStopStep+"%s", len(result.Credentials), backupNote)
 	}}
 	command.AddCommand(set, bind, status, detach, del, migrate)
 	return command
@@ -221,6 +228,15 @@ func newCredentialConfigCommandWithDependencies(opt *options, deps credentialCon
 // nonzero after describing the deletion, so a script never mistakes the
 // description for the deletion.
 var errCredentialDeleteUnconfirmed = errors.New("stored credential not deleted; re-run with --yes to delete it")
+
+// errNoStoredCredential reports a delete aimed at a reference with no record,
+// so a mistyped reference never reads as a revoked secret.
+func errNoStoredCredential(opt *options, ref string) error {
+	if err := opt.printResult(credentialConfigResult{Reference: ref, Outcome: "not_found"}, "No stored credential %s; nothing was deleted (list references with 'papio config credentials status').", ref); err != nil {
+		return err
+	}
+	return fmt.Errorf("no stored credential %s; nothing was deleted (list references with 'papio config credentials status')", ref)
+}
 
 // credentialTargetsBoundTo lists the targets in cfg bound to ref.
 func credentialTargetsBoundTo(cfg config.Config, ref string) []string {
@@ -238,13 +254,23 @@ func deleteCredentialRecord(cmd *cobra.Command, opt *options, deps credentialCon
 	if err != nil {
 		return err
 	}
-	if err := depsForCall.store.Delete(cmd.Context(), ref); err != nil && !errors.Is(err, credential.ErrNotFound) {
-		return sanitizedCredentialError(err)
+	notFound := false
+	if err := depsForCall.store.Delete(cmd.Context(), ref); err != nil {
+		if !errors.Is(err, credential.ErrNotFound) {
+			return sanitizedCredentialError(err)
+		}
+		notFound = true
 	}
 	// The record deletion is committed at this point. A journal failure
 	// must say so instead of failing as if nothing happened.
 	if err := clearPendingCredential(cfg.Path, ref); err != nil {
+		if notFound {
+			return fmt.Errorf("no stored credential %s; nothing was deleted, but the pending credential journal could not be updated; inspect %s", ref, pendingCredentialPath(cfg.Path))
+		}
 		return fmt.Errorf("stored credential deleted (%s), but the pending credential journal could not be updated; inspect %s", ref, pendingCredentialPath(cfg.Path))
+	}
+	if notFound {
+		return errNoStoredCredential(opt, ref)
 	}
 	return opt.printResult(credentialConfigResult{Reference: ref, Outcome: "deleted", RestartRequired: true}, "Stored credential deleted. Configurations that reference it are unchanged. For each affected profile, run 'papio daemon stop'; its next papio command starts the daemon without the record.")
 }
@@ -297,13 +323,9 @@ func credentialConfigLoadError(opt *options, cfg config.Config, err error) error
 	if errors.As(err, &absent) {
 		return err
 	}
-	var missing *toml.StrictMissingError
-	if errors.As(err, &missing) {
-		keys := make([]string, 0, len(missing.Errors))
-		for _, decodeErr := range missing.Errors {
-			keys = append(keys, strings.Join(decodeErr.Key(), "."))
-		}
-		return fmt.Errorf("configuration %s could not be loaded: it contains fields this papio build does not recognize (%s); update papio, or remove those fields", path, strings.Join(keys, ", "))
+	var unknown *config.ErrUnknownFields
+	if errors.As(err, &unknown) {
+		return fmt.Errorf("configuration %s could not be loaded: it contains fields this papio build does not recognize (%s); update papio, or correct those fields", path, strings.Join(unknown.Fields, ", "))
 	}
 	var decodeErr *toml.DecodeError
 	if errors.As(err, &decodeErr) {

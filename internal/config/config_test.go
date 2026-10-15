@@ -15,8 +15,6 @@ import (
 	"time"
 
 	"papio/internal/routes"
-
-	toml "github.com/pelletier/go-toml/v2"
 )
 
 func TestSaveLoadRoundTripAndPermissions(t *testing.T) {
@@ -238,7 +236,7 @@ func TestLoadRejects(t *testing.T) {
 		toml string
 		// Substrings the error must contain, and ones it must not.
 		contains, omits []string
-		// unknownFields means the error wraps the strict decoder's report.
+		// unknownFields means the error is an *ErrUnknownFields.
 		unknownFields bool
 	}{
 		{name: "misspelled source name", toml: "access_mode='conservative'\n[sources.unpaywal]\nenabled=true\n",
@@ -246,7 +244,7 @@ func TestLoadRejects(t *testing.T) {
 		{name: "unknown browser field", toml: "access_mode='conservative'\n[browser]\nbogus_option=true\n",
 			contains: []string{"browser.bogus_option", "update papio"}, unknownFields: true},
 		{name: "invalid TOML keeps the generic parse error", toml: "access_mode='conservative'\n[broken\n",
-			contains: []string{"parsing config"}, omits: []string{"update papio"}},
+			contains: []string{"parsing config", "line 2"}, omits: []string{"update papio", "unknown fields are rejected"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := loadConfigText(t, test.toml)
@@ -263,9 +261,9 @@ func TestLoadRejects(t *testing.T) {
 					t.Errorf("error %q contains %q", err, unwanted)
 				}
 			}
-			var missing *toml.StrictMissingError
-			if test.unknownFields && !errors.As(err, &missing) {
-				t.Errorf("error = %v, want wrapped StrictMissingError", err)
+			var unknown *ErrUnknownFields
+			if errors.As(err, &unknown) != test.unknownFields {
+				t.Errorf("error = %v, ErrUnknownFields match = %v, want %v", err, !test.unknownFields, test.unknownFields)
 			}
 		})
 	}

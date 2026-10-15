@@ -54,6 +54,9 @@ type credentialMigrationResult struct {
 	Outcome         string                   `json:"outcome"`
 	Credentials     []credentialConfigResult `json:"credentials"`
 	RestartRequired bool                     `json:"restart_required"`
+	// BackupPath is the previous config, which still holds the plaintext
+	// secrets the migration moved; "" when the save wrote no backup.
+	BackupPath string `json:"backup_path,omitempty"`
 }
 
 type credentialMigrationEntry struct {
@@ -144,6 +147,9 @@ func migrateCredentials(ctx context.Context, opt *options, deps credentialConfig
 	}
 	if err := deps.saveConfig(next, cfg.Path, snapshot); err != nil {
 		return result, stagedCredentialError(configSaveError(err, "original configuration was not replaced"), result.Credentials)
+	}
+	if info, err := os.Lstat(config.BackupPath(cfg.Path)); err == nil && info.Mode().IsRegular() {
+		result.BackupPath = config.BackupPath(cfg.Path)
 	}
 
 	// The bindings now own every staged reference. The save is committed, so

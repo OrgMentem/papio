@@ -259,7 +259,7 @@ func TestNativeHostStatusAndUninstall(t *testing.T) {
 	}
 
 	// Uninstall removes both manifests and the symlink.
-	if _, stderr, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir); err != nil {
+	if _, stderr, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir, "--remove-host"); err != nil {
 		t.Fatalf("uninstall: %v (%s)", err, stderr)
 	}
 	for _, path := range []string{manifestPath, firefoxManifestPath, symlinkPath} {
@@ -406,7 +406,7 @@ func TestNativeHostUninstallFailureNamesRemovedExecutable(t *testing.T) {
 	removeHostExecutable = func() ([]string, error) {
 		return []string{nativehost.ExecPath()}, errors.New("target file locked")
 	}
-	_, _, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir)
+	_, _, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--firefox-manifest-dir", firefoxManifestDir, "--remove-host")
 	if err == nil || !strings.Contains(err.Error(), "target file locked") {
 		t.Fatalf("uninstall err = %v, want the executable failure", err)
 	}
@@ -454,6 +454,50 @@ func TestNativeHostUninstallOmitsUnremovedRegistryKey(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "registry key removed") {
 		t.Fatalf("uninstall err = %q, claims a registry removal that did not happen", err)
+	}
+}
+
+// A directory override must clean only that directory: the other browser's
+// registration and the shared host executable stay unless --remove-host says so.
+func TestNativeHostUninstallOverrideKeepsOtherBrowsersAndHost(t *testing.T) {
+	_, _, registration := writeTestConfig(t, strings.Repeat("d", 32), "papio@orgmentem.com")
+	manifestDir := t.TempDir()
+	manifestPath := filepath.Join(manifestDir, nativeHostManifestName+".json")
+	if err := os.WriteFile(manifestPath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	host := nativehost.ExecPath()
+	if err := os.MkdirAll(filepath.Dir(host), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(host, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, err := runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir, "--dry-run")
+	if err != nil {
+		t.Fatalf("dry run: %v (%s)", err, stderr)
+	}
+	if !strings.Contains(out, manifestPath) || strings.Contains(out, host) {
+		t.Fatalf("dry run output = %q, want only the overridden manifest", out)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("dry run removed the manifest: %v", err)
+	}
+	if len(registration.removed) != 0 {
+		t.Fatalf("dry run deregistered %v", registration.removed)
+	}
+	out, stderr, err = runCLI(t, "native-host", "uninstall", "--manifest-dir", manifestDir)
+	if err != nil {
+		t.Fatalf("uninstall: %v (%s)", err, stderr)
+	}
+	if !strings.Contains(out, manifestPath) {
+		t.Fatalf("output = %q, want the removed path named", out)
+	}
+	if _, err := os.Lstat(host); err != nil {
+		t.Fatalf("host executable was removed by a directory override: %v", err)
+	}
+	if !slices.Equal(registration.removed, []string{"chrome"}) {
+		t.Fatalf("deregistered %v, want only chrome", registration.removed)
 	}
 }
 

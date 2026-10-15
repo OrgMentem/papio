@@ -440,11 +440,11 @@ func TestConfigInitWritesPrivateStructuredConfig(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("config init: %v (%s)", err, stderr.String())
 	}
-	var output map[string]string
+	var output map[string]any
 	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
 		t.Fatalf("JSON output: %v (%q)", err, stdout.String())
 	}
-	if output["access_mode"] != "delegated" || output["config_path"] != path {
+	if output["access_mode"] != "delegated" || output["config_path"] != path || output["restart_required"] != true {
 		t.Fatalf("output = %v", output)
 	}
 	assertCLIConfigPermissions(t, path)
@@ -532,7 +532,7 @@ func TestConfigInitForceSaysWhatItReplaced(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := run("config", "init", "--access-mode", "assisted")
-	if err == nil || !strings.Contains(err.Error(), "reset every other setting") || !strings.Contains(err.Error(), "papio config set-access-mode assisted") {
+	if err == nil || !strings.Contains(err.Error(), "reset every other setting") || !strings.Contains(err.Error(), "papio --config "+path+" config set-access-mode assisted") {
 		t.Fatalf("refusal = %v, want it to say --force resets everything and to name set-access-mode", err)
 	}
 	out, err := run("config", "init", "--access-mode", "assisted", "--force")

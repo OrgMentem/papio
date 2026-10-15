@@ -1432,14 +1432,18 @@ papio native-host status [flags]
 
 Remove native-messaging host manifests and the host executable
 
+Remove the native-messaging manifests of every known browser (Chrome, Edge, Vivaldi, Brave, Opera, Chromium, Firefox) and the shared host executable. With --manifest-dir or --firefox-manifest-dir, act only on the named directories (Chrome manifest, Firefox manifest) and keep the host executable unless --remove-host is given.
+
 ```
 papio native-host uninstall [flags]
 ```
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--firefox-manifest-dir` | `string` |  | override the Firefox native-messaging manifest directory |
-| `--manifest-dir` | `string` |  | override the Chrome native-messaging manifest directory |
+| `--dry-run` | `bool` | `false` | list what would be removed without removing it |
+| `--firefox-manifest-dir` | `string` |  | remove only the Firefox manifest in this directory; other browsers and the host executable stay |
+| `--manifest-dir` | `string` |  | remove only the Chrome manifest in this directory; other browsers and the host executable stay |
+| `--remove-host` | `bool` | `false` | with a directory override, also remove the shared host executable that every browser uses |
 
 ## `papio notify`
 

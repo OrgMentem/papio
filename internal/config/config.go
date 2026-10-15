@@ -1100,7 +1100,18 @@ func EffectiveSourcePolicy(name string, s Source) Source {
 type ErrAccessModeUnset struct{ Path string }
 
 func (e *ErrAccessModeUnset) Error() string {
-	return fmt.Sprintf("access_mode is not set in %s: choose conservative, assisted, or delegated (explicit first-run decision; no silent automation default)", e.Path)
+	return fmt.Sprintf("access_mode is not set in %s: choose conservative, assisted, or delegated (explicit first-run decision; no silent automation default). Run 'papio init' (or 'papio config init --access-mode MODE'), then 'papio daemon stop' so the next command starts the daemon with the new config", e.Path)
+}
+
+// ErrUnknownFields is returned by Load when the file is valid TOML but names
+// fields this build does not know. Fields lists their dotted keys.
+type ErrUnknownFields struct {
+	Path   string
+	Fields []string
+}
+
+func (e *ErrUnknownFields) Error() string {
+	return fmt.Sprintf("config %s contains fields this papio build does not recognize (%s). If the config was written for a newer papio, update papio; if a field name is a typo, correct it", e.Path, strings.Join(e.Fields, ", "))
 }
 
 // Load reads path (or the default location when path is empty), layering the
@@ -1123,7 +1134,12 @@ func Load(path string) (Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		var missing *toml.StrictMissingError
 		if !errors.As(err, &missing) {
-			return cfg, fmt.Errorf("parsing config %s (unknown fields are rejected): %w", path, err)
+			var decodeErr *toml.DecodeError
+			if errors.As(err, &decodeErr) {
+				row, column := decodeErr.Position()
+				return cfg, fmt.Errorf("parsing config %s at line %d, column %d: %w", path, row, column, err)
+			}
+			return cfg, fmt.Errorf("parsing config %s: %w", path, err)
 		}
 		var fields, ignored []string
 		for _, decodeErr := range missing.Errors {
@@ -1135,7 +1151,7 @@ func Load(path string) (Config, error) {
 			}
 		}
 		if len(fields) > 0 {
-			return cfg, fmt.Errorf("config %s contains fields this papio build does not recognize (%s). This usually means the config was written for a newer papio — update papio, or remove those fields: %w", path, strings.Join(fields, ", "), err)
+			return cfg, &ErrUnknownFields{Path: path, Fields: fields}
 		}
 		// Only removed keys were unknown, so a lenient decode reads exactly
 		// what a strict one would have read, without them.

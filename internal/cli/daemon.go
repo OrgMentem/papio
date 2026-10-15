@@ -162,6 +162,8 @@ func newDaemonCommand(opt *options) *cobra.Command {
 					return err
 				case down.held:
 					return fmt.Errorf("%w; run 'papio daemon stop' again when it finishes", down)
+				case down.elsewhere:
+					return fmt.Errorf("no daemon answers on %s, but a daemon (pid %d) holds this data directory and serves %s; stop it with 'papio daemon stop --socket %s'", down.socket, down.status.PID, down.status.Socket, down.status.Socket)
 				}
 				// Nothing to stop. A deploy script that stops the daemon before
 				// it replaces the binary must not fail on a machine where the
@@ -197,6 +199,9 @@ type daemonDown struct {
 	socket string
 	status daemon.Status
 	held   bool
+	// elsewhere is set when a daemon holds the data directory but serves
+	// another socket; status describes it.
+	elsewhere bool
 }
 
 // Is makes errors.Is(err, ipc.ErrDaemonUnreachable) true: --json reports
@@ -240,6 +245,7 @@ func daemonDownState(opt *options, socketFlag string, err error) (daemonDown, bo
 	// An instance that serves another socket says nothing about this one.
 	if down.held && down.status.Socket != "" && down.status.Socket != down.socket {
 		down.held = false
+		down.elsewhere = true
 	}
 	return down, true
 }
