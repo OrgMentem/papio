@@ -80,6 +80,29 @@ func cancelledApply(t *testing.T, service *Service, cli *planCLI, jobID string) 
 	return plan
 }
 
+// The settle window measures from the interrupted attempt's claim, not from
+// the expiry pass: the lease alone outlasts it, so the first pass after expiry
+// reconciles instead of reporting unconfirmed for another settle window.
+func TestExpiredApplyClaimSettlesFromClaimTime(t *testing.T) {
+	cli := &planCLI{preview: reconcilePreview, apply: reconcileAttached}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := plans[0]
+	ctx := context.Background()
+	if claimed, err := service.claimApply(ctx, applyKey(plan), jobID); err != nil || !claimed {
+		t.Fatalf("initial claim = %t, %v", claimed, err)
+	}
+	advance(service, applyClaimLease+time.Minute)
+	cli.missing = func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "AB12CD34"}}, nil }
+	applied, err := service.Apply(ctx, plan.ID, plan.ConfirmationSHA256)
+	if err != nil || applied.Status != "applied" || cli.applyCalls != 1 {
+		t.Fatalf("first apply after expiry = %+v, %v applyCalls = %d, want one applied run", applied, err, cli.applyCalls)
+	}
+}
+
 func advance(service *Service, d time.Duration) {
 	base := service.Now()
 	service.Now = func() time.Time { return base.Add(d) }
@@ -106,9 +129,8 @@ func TestExpiredApplyClaimIsReconciledNotRerun(t *testing.T) {
 		t.Fatalf("claim of an expired reservation = %t, %v; want it never reclaimed", claimed, err)
 	}
 
-	// The queue still lists the item as missing its PDF, so the earlier
-	// attempt left no trace; but the claim only just expired into ambiguity.
-	cli.missing = func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "AB12CD34"}}, nil }
+	// An unreadable queue cannot show what the dead owner did, so the
+	// expired claim stays ambiguous and the mutation does not re-run.
 	if _, err := service.Apply(ctx, plan.ID, plan.ConfirmationSHA256); !isUnconfirmed(err) {
 		t.Fatalf("apply of an expired claim err = %v, want unconfirmed", err)
 	}
@@ -119,9 +141,8 @@ func TestExpiredApplyClaimIsReconciledNotRerun(t *testing.T) {
 		t.Fatalf("expired claim status = %q, want ambiguous", status)
 	}
 
-	// Past the settle window, an unreadable queue still blocks the re-run.
-	advance(service, applyClaimLease+ambiguousSettleWindow+time.Minute)
-	cli.missing = nil
+	// Time passing does not make an unreadable queue evidence.
+	advance(service, ambiguousSettleWindow+time.Minute)
 	if _, err := service.Apply(ctx, plan.ID, plan.ConfirmationSHA256); !isUnconfirmed(err) || cli.applyCalls != 0 {
 		t.Fatalf("apply with an unreadable library err = %v applyCalls = %d, want unconfirmed and no run", err, cli.applyCalls)
 	}

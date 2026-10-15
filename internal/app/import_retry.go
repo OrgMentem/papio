@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"papio/internal/job"
+	"papio/internal/zotio"
 )
 
 // maxImportAttempts bounds how many times the import-retry pass re-drives one
@@ -26,6 +27,23 @@ const maxImportAttempts = 5
 // maxImportAttempts in four minutes, so the paper stayed unfiled after Zotero
 // opened. The last delay spans an operator's night.
 var importRetryDelays = []time.Duration{time.Minute, 10 * time.Minute, time.Hour, 12 * time.Hour}
+
+// interruptedApplyRetryDelay spaces the retries of a job whose earlier apply
+// was interrupted (a daemon killed mid-apply). Zotio refuses to repeat the
+// mutation until the claim lease expires and the outcome settles, so a faster
+// retry only records the same refusal.
+const interruptedApplyRetryDelay = 5 * time.Minute
+
+// importErrorIsInterruptedApply reports whether an error outcome only says an
+// earlier apply of the same plan is still unsettled: the claim is held
+// (reservation_conflict) or its outcome is unconfirmed
+// (zotio_apply_unconfirmed). Neither is a failed attempt, so neither spends the
+// attempt budget; otherwise one daemon restart inside an apply exhausted most
+// of maxImportAttempts before the claim lease could expire.
+func importErrorIsInterruptedApply(detail map[string]any) bool {
+	class, _ := detail["error_class"].(string)
+	return class == zotio.ErrorClassReservationConflict || class == zotio.ErrorClassZotioApplyUnconfirmed
+}
 
 // readyImportScanLimit bounds one retry pass to the newest ready jobs, matching
 // the daemon's other newest-first scans. A failed import ages out of the window
@@ -294,7 +312,9 @@ func settledImport(events []map[string]any) (status, parentKey, attachmentKey st
 // skipped outcome retries: the inline import never recorded a result (a dropped
 // event insert) or ran before Zotio was configured. A waiting outcome retries
 // and spends no attempt: the import waited for a closed Zotero desktop. So
-// does a queued one: it waited, and Zotero desktop now accepts saves.
+// does a queued one: it waited, and Zotero desktop now accepts saves. An error
+// that only reports an earlier interrupted apply (importErrorIsInterruptedApply)
+// spends no attempt either.
 func importNeedsRetry(events []map[string]any) bool {
 	var status string
 	errorCount := 0
@@ -304,7 +324,7 @@ func importNeedsRetry(events []map[string]any) bool {
 		}
 		detail, _ := event["detail"].(map[string]any)
 		status, _ = detail["status"].(string)
-		if status == "error" {
+		if status == "error" && !importErrorIsInterruptedApply(detail) {
 			errorCount++
 		}
 	}
@@ -322,14 +342,26 @@ func importNeedsRetry(events []map[string]any) bool {
 func importRetryDue(events []map[string]any, now time.Time) bool {
 	failures := 0
 	var lastFailure string
+	var lastInterrupted string
 	for _, event := range events {
 		if kind, _ := event["kind"].(string); kind != "zotio.auto_import" {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
-		if status, _ := detail["status"].(string); status == "error" {
+		status, _ := detail["status"].(string)
+		switch {
+		case status == "error" && importErrorIsInterruptedApply(detail):
+			lastInterrupted, _ = event["at"].(string)
+		case status == "error":
 			failures++
 			lastFailure, _ = event["at"].(string)
+		default:
+			lastInterrupted = ""
+		}
+	}
+	if lastInterrupted != "" {
+		if at, err := time.Parse(time.RFC3339Nano, lastInterrupted); err == nil && now.Before(at.Add(interruptedApplyRetryDelay)) {
+			return false
 		}
 	}
 	if failures == 0 {

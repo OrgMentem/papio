@@ -3,6 +3,7 @@ package zotio
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,12 +76,26 @@ func unconfirmedApplyError(planID string, recorded *ApplyResult, detail string) 
 // re-run would repeat it.
 func (s *Service) expireStaleClaim(ctx context.Context, key string, plan *Plan) error {
 	now := s.now().UTC()
+	// The mutation may have run any time after the claim, so the settle window
+	// measures from the claim, not from this expiry pass: the lease alone
+	// already outlasts the window.
+	var claimedAt sql.NullInt64
+	if err := s.Store.DB().QueryRowContext(ctx,
+		`SELECT CAST(json_extract(result_json, '$.claimed_at') AS INTEGER) FROM exports
+		 WHERE kind = 'zotio_apply' AND idempotency_key = ?
+		   AND json_extract(result_json, '$.status') = 'in_progress'`, key).Scan(&claimedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	appliedAt := now
+	if claimedAt.Valid && claimedAt.Int64 > 0 && claimedAt.Int64 < now.Unix() {
+		appliedAt = time.Unix(claimedAt.Int64, 0).UTC()
+	}
 	raw, err := json.Marshal(&ApplyResult{
 		PlanID:    plan.ID,
 		JobID:     plan.JobID,
 		Status:    "ambiguous",
 		ParentKey: plan.ExpectedParentKey,
-		AppliedAt: now.Format(time.RFC3339),
+		AppliedAt: appliedAt.Format(time.RFC3339),
 		Error:     interruptedApplyHint,
 	})
 	if err != nil {

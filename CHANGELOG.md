@@ -268,6 +268,13 @@ execution records kept during the initial build.
   used to commit a `submitted` request with provider reference `0`, polled
   forever, while the real request went unmatched. It is now handled like any
   other unknown outcome: *papio* looks the request up by its token.
+- **A daemon restart during a Zotero apply no longer burns the job's import attempts.**
+  While the interrupted apply's claim was held, each retry recorded a
+  reservation conflict or unconfirmed-apply error that counted toward the five
+  attempts, so one real attempt was left half a day later. Those outcomes now
+  spend no attempt and retry every five minutes, and the settle window measures
+  from the interrupted claim, so the first pass after the lease expires re-checks
+  Zotero and files the paper.
 - **A paper whose Zotero item you deleted or merged away is no longer filed as "already in the library".**
   Auto-import read an item that was absent from Zotero's missing-PDF list as one
   that already holds a PDF, but a deleted parent is absent from that list too.

@@ -688,3 +688,42 @@ func TestInlineImportAndRetryPassNeverImportOneJobAtOnce(t *testing.T) {
 		t.Fatalf("connector saves = %d, want 1", importer.calls)
 	}
 }
+
+func autoImportErrorEvent(at time.Time, class string) map[string]any {
+	return map[string]any{
+		"kind": "zotio.auto_import",
+		"at":   at.UTC().Format(time.RFC3339Nano),
+		"detail": map[string]any{
+			"status": "error", "error_class": class,
+		},
+	}
+}
+
+// A daemon killed mid-apply leaves a claim that refuses every retry until its
+// lease expires. Those refusals are not failed attempts: counting them left a
+// single real attempt of the budget.
+func TestInterruptedApplyRefusalsSpendNoImportAttempts(t *testing.T) {
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	var events []map[string]any
+	for range maxImportAttempts * 2 {
+		events = append(events, autoImportErrorEvent(now, zotio.ErrorClassReservationConflict))
+		events = append(events, autoImportErrorEvent(now, zotio.ErrorClassZotioApplyUnconfirmed))
+	}
+	if !importNeedsRetry(events) {
+		t.Fatal("interrupted-apply refusals exhausted the import budget")
+	}
+	if importRetryDue(events, now.Add(time.Minute)) {
+		t.Fatal("retry is due before the interrupted-apply delay")
+	}
+	if !importRetryDue(events, now.Add(interruptedApplyRetryDelay)) {
+		t.Fatal("retry is not due after the interrupted-apply delay")
+	}
+	// A genuine failure still counts.
+	real := []map[string]any{}
+	for range maxImportAttempts {
+		real = append(real, autoImportErrorEvent(now, "unknown"))
+	}
+	if importNeedsRetry(real) {
+		t.Fatal("genuine failures no longer exhaust the budget")
+	}
+}
