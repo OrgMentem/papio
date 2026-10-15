@@ -63,7 +63,6 @@ import (
 	"papio/internal/zotio"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -133,20 +132,22 @@ const autoImportMinInterval = 10 * time.Second
 // mirror, and paces successive imports. The exports ledger makes the one retry
 // safe to replay.
 type serialAutoImporter struct {
-	importer    app.AutoImporter
-	mu          sync.Mutex
+	importer app.AutoImporter
+	// slot is the one-import-at-a-time semaphore; a channel so waiting honors ctx.
+	slot        chan struct{}
+	deadline    time.Duration
 	backoff     time.Duration
 	minInterval time.Duration
-	// lastApplyAt guards the interval; it is read and written only under mu.
+	// lastApplyAt guards the interval; it is read and written only while holding slot.
 	lastApplyAt time.Time
 }
 
 func newSerialAutoImporter(importer app.AutoImporter, minInterval time.Duration) *serialAutoImporter {
-	return &serialAutoImporter{importer: importer, backoff: autoImportRetryBackoff, minInterval: minInterval}
+	return &serialAutoImporter{importer: importer, slot: make(chan struct{}, 1), backoff: autoImportRetryBackoff, deadline: autoImportDeadline, minInterval: minInterval}
 }
 
 // applyPaced runs one import, waiting out any remaining interval first. The
-// caller holds mu, so the wait also holds the serialization slot: a queued
+// caller holds the slot, so the wait also holds the serialization slot: a queued
 // sibling must not slip in and issue the very work this pause exists to space.
 func (s *serialAutoImporter) applyPaced(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
 	if !s.lastApplyAt.IsZero() && s.minInterval > 0 {
@@ -163,28 +164,55 @@ func (s *serialAutoImporter) applyPaced(ctx context.Context, jobID string) (stat
 	return s.importer.PlanAndApply(ctx, jobID)
 }
 
+// autoImportDeadline bounds one attempt of one import, slot wait included.
+// zotio gives each subprocess its own timeout and one import runs several, so
+// without an overall bound a wedged Zotero desktop (a measured state, see
+// autoImportMinInterval) holds an acquisition worker for minutes per call.
+const autoImportDeadline = 5 * time.Minute
+
+// acquire takes the single import slot, or reports why ctx ended first. Unlike
+// a sync.Mutex it does not park a worker past its deadline.
+func (s *serialAutoImporter) acquire(ctx context.Context) error {
+	select {
+	case s.slot <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *serialAutoImporter) release() { <-s.slot }
+
+// attempt runs one paced import under the slot and the overall deadline. The
+// deadline covers the wait for the slot. timedOut reports that the deadline,
+// not the caller, ended the attempt.
+func (s *serialAutoImporter) attempt(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, timedOut bool, err error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, s.deadline)
+	defer cancel()
+	if err := s.acquire(attemptCtx); err != nil {
+		return "failed", "", "", ctx.Err() == nil, err
+	}
+	defer s.release()
+	status, parentKey, attachmentKey, err = s.applyPaced(attemptCtx, jobID)
+	return status, parentKey, attachmentKey, err != nil && ctx.Err() == nil && attemptCtx.Err() != nil, err
+}
+
 func (s *serialAutoImporter) PlanAndApply(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
-	s.mu.Lock()
-	status, parentKey, attachmentKey, err = s.applyPaced(ctx, jobID)
-	s.mu.Unlock()
+	status, parentKey, attachmentKey, timedOut, err := s.attempt(ctx, jobID)
 	if err == nil {
 		return status, parentKey, attachmentKey, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return status, parentKey, attachmentKey, zotio.WithErrorInfo(err)
 	}
+	if timedOut {
+		// A second try would pay the same timeout again with the worker held.
+		return "failed", parentKey, attachmentKey, zotio.WithErrorInfo(err)
+	}
 	if err := waitAutoImportRetry(ctx, s.backoff); err != nil {
 		return "failed", "", "", zotio.WithErrorInfo(err)
 	}
-	if err := ctx.Err(); err != nil {
-		return "failed", "", "", zotio.WithErrorInfo(err)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return "failed", "", "", zotio.WithErrorInfo(err)
-	}
-	status, parentKey, attachmentKey, err = s.applyPaced(ctx, jobID)
+	status, parentKey, attachmentKey, _, err = s.attempt(ctx, jobID)
 	if err != nil && ctx.Err() != nil {
 		return "failed", "", "", zotio.WithErrorInfo(ctx.Err())
 	}

@@ -268,6 +268,11 @@ execution records kept during the initial build.
   used to commit a `submitted` request with provider reference `0`, polled
   forever, while the real request went unmatched. It is now handled like any
   other unknown outcome: *papio* looks the request up by its token.
+- **A wedged Zotero desktop no longer stalls acquisition and maintenance for minutes per call.**
+  One import attempt now has a five-minute overall deadline, covering the wait
+  for the single import slot, and a timed-out import is not retried inline. Each
+  maintenance runner has a ten-minute bound, so a stuck import pass no longer
+  holds the notification router and the drive pacer behind it.
 - **A daemon restart during a Zotero apply no longer burns the job's import attempts.**
   While the interrupted apply's claim was held, each retry recorded a
   reservation conflict or unconfirmed-apply error that counted toward the five

@@ -690,3 +690,26 @@ func TestZoteroWaitingNoticeIsSupersededOnceNoPaperWaits(t *testing.T) {
 		t.Fatalf("notice for a condition no paper waits on = %q, want superseded", got)
 	}
 }
+
+// A wedged Zotero must not hold a worker beyond the import deadline, and a
+// timeout is not retried: the retry would pay the same wait again.
+func TestSerialAutoImporterBoundsAWedgedImport(t *testing.T) {
+	var calls atomic.Int32
+	importer := autoImporterFunc(func(ctx context.Context, _ string) (string, string, string, error) {
+		calls.Add(1)
+		<-ctx.Done()
+		return "failed", "", "", ctx.Err()
+	})
+	serial := newSerialAutoImporter(importer, 0)
+	serial.deadline = 50 * time.Millisecond
+	started := time.Now()
+	if _, _, _, err := serial.PlanAndApply(context.Background(), "job"); err == nil {
+		t.Fatal("wedged import returned no error")
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("wedged import held the caller for %v", elapsed)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("importer calls = %d, want 1 (a timeout is not retried)", n)
+	}
+}

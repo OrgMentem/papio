@@ -61,6 +61,18 @@ type MaintenanceRunner interface {
 // maintenance errors are best-effort and never stop acquisition workers.
 type MaintenanceRunners []MaintenanceRunner
 
+// maintenanceRunnerDeadline bounds one runner's pass. Runners share one
+// goroutine, so a runner stuck on a wedged dependency (a hung Zotero desktop)
+// would otherwise hold every runner after it, including notification delivery.
+// A runner that honors its context stops at the bound; the next tick resumes it.
+var maintenanceRunnerDeadline = 10 * time.Minute
+
+func runBounded(ctx context.Context, r MaintenanceRunner) error {
+	ctx, cancel := context.WithTimeout(ctx, maintenanceRunnerDeadline)
+	defer cancel()
+	return r.RunDue(ctx)
+}
+
 // RunDue runs each non-nil runner once and returns the first error, if any.
 func (rs MaintenanceRunners) RunDue(ctx context.Context) error {
 	names := rs.runnerNames()
@@ -73,7 +85,7 @@ func (rs MaintenanceRunners) RunDue(ctx context.Context) error {
 		}
 		name := names[i]
 		ordered = append(ordered, name)
-		errs[name] = r.RunDue(ctx)
+		errs[name] = runBounded(ctx, r)
 		i++
 	}
 	for _, name := range ordered {
@@ -96,7 +108,7 @@ func (rs MaintenanceRunners) RunDueAll(ctx context.Context) map[string]error {
 		if r == nil {
 			continue
 		}
-		errs[names[i]] = r.RunDue(ctx)
+		errs[names[i]] = runBounded(ctx, r)
 		i++
 	}
 	return errs

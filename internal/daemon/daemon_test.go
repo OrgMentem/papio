@@ -973,3 +973,33 @@ func TestMaintenanceRunnersReportEveryOutcomeByName(t *testing.T) {
 		t.Fatalf("outcomes = %v, want the repeated runner disambiguated", errs)
 	}
 }
+
+type blockingRunner struct{}
+
+func (blockingRunner) RunDue(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A runner stuck on a wedged dependency must not hold the runners after it.
+func TestMaintenanceRunnerDeadlineFreesLaterRunners(t *testing.T) {
+	prev := maintenanceRunnerDeadline
+	maintenanceRunnerDeadline = 50 * time.Millisecond
+	t.Cleanup(func() { maintenanceRunnerDeadline = prev })
+	after := &fakeMaintenance{calls: make(chan struct{}, 1)}
+	done := make(chan map[string]error, 1)
+	go func() { done <- MaintenanceRunners{blockingRunner{}, after}.RunDueAll(context.Background()) }()
+	select {
+	case errs := <-done:
+		if !errors.Is(errs["daemon.blockingRunner"], context.DeadlineExceeded) {
+			t.Fatalf("blocking runner outcome = %v, want deadline exceeded", errs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a blocked runner held the runners after it")
+	}
+	select {
+	case <-after.calls:
+	default:
+		t.Fatal("the runner after the blocked one never ran")
+	}
+}
