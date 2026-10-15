@@ -554,14 +554,16 @@ func (s *Store) Purge(ctx context.Context, host string) (removed int, err error)
 	defer s.mu.Unlock()
 
 	if host == "" {
-		all, err := s.list(ctx)
+		// Count with scanHost, not list: purge is the cleanup for a capture
+		// whose metadata sidecar is unreadable, so it must not parse metadata.
+		count, err := s.countAll(ctx)
 		if err != nil {
 			return 0, err
 		}
 		if err := os.RemoveAll(s.root); err != nil {
 			return 0, fmt.Errorf("purging captures: %w", err)
 		}
-		return len(all), nil
+		return count, nil
 	}
 	hostDir := filepath.Join(s.root, hostDirName(host))
 	files, err := scanHost(ctx, hostDir, host)
@@ -1300,6 +1302,36 @@ func (s *Store) releaseIncidentLocked(ctx context.Context, fingerprint string) e
 	return nil
 }
 
+// countAll counts the stored captures of every host without reading metadata.
+func (s *Store) countAll(ctx context.Context) (int, error) {
+	entries, err := os.ReadDir(s.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("reading capture directory: %w", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return 0, fmt.Errorf("reading capture host: %w", err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		files, err := scanHost(ctx, filepath.Join(s.root, entry.Name()), entry.Name())
+		if err != nil {
+			return 0, err
+		}
+		count += len(files)
+	}
+	return count, nil
+}
+
 func (s *Store) list(ctx context.Context) ([]Capture, error) {
 	entries, err := os.ReadDir(s.root)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -1328,7 +1360,9 @@ func (s *Store) list(ctx context.Context) ([]Capture, error) {
 		for _, file := range files {
 			metadata, err := readMetadata(file.metadataPath)
 			if err != nil {
-				return nil, err
+				// One unreadable sidecar must not hide every other capture
+				// or block `purge`; the capture stays on disk, unlisted.
+				continue
 			}
 			// Recover verbatim host from metadata when available; legacy
 			// captures written before host was stored fall back to the
@@ -1558,11 +1592,11 @@ func readMetadata(path string) (captureMetadata, error) {
 		return captureMetadata{}, nil
 	}
 	if err != nil {
-		return captureMetadata{}, fmt.Errorf("reading capture metadata: %w", err)
+		return captureMetadata{}, fmt.Errorf("reading capture metadata %q: %w", path, err)
 	}
 	var metadata captureMetadata
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return captureMetadata{}, fmt.Errorf("decoding capture metadata: %w", err)
+		return captureMetadata{}, fmt.Errorf("decoding capture metadata %q: %w", path, err)
 	}
 	return metadata, nil
 }

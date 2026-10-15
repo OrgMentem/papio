@@ -159,7 +159,7 @@ func TestAdapterCapturesPurgeReportsRemovedCount(t *testing.T) {
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("adapter captures purge: %v", err)
 	}
-	if got, want := out.String(), "Purged 2 captures\n"; got != want {
+	if got, want := out.String(), "Purged 2 captures for provider.example.com\n"; got != want {
 		t.Fatalf("purge output = %q, want %q", got, want)
 	}
 }

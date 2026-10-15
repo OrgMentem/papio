@@ -163,7 +163,13 @@ func newAdapterCommand(opt *options) *cobra.Command {
 			if err := opt.call(cmd.Context(), "adapter.captures.purge", map[string]string{"host": host}, &result); err != nil {
 				return err
 			}
-			return opt.printResult(result, "Purged %d captures", result.Removed)
+			if result.Removed == 0 && host != "" {
+				return opt.printResult(result, "no captures stored for %s; nothing removed", host)
+			}
+			if host != "" {
+				return opt.printResult(result, "Purged %d captures for %s", result.Removed, host)
+			}
+			return opt.printResult(result, "Purged %d captures for every host", result.Removed)
 		},
 	}
 	purge.Flags().StringVar(&host, "host", "", "purge captures for one host")

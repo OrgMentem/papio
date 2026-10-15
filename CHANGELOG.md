@@ -305,6 +305,13 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **One corrupt capture sidecar no longer breaks `papio adapter captures` and
+  `captures purge --all`.** A truncated `.json` sidecar made both fail with
+  `internal: operation failed`, so the cleanup command could not clean up.
+  The listing now skips a capture whose metadata is unreadable, `purge --all`
+  counts files without parsing metadata, and a metadata error names the
+  sidecar path. The purge receipt now names the host, and says
+  `no captures stored for <host>` when there was nothing to remove.
 - **A mistyped campaign id now says which campaign was not found.**
   `papio campaign preview|run|pause|resume|report` failed with a bare
   `no such file or directory` (and left a stray `.lock` file) for an unknown id,

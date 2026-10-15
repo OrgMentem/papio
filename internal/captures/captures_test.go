@@ -729,3 +729,33 @@ func TestPendingJobsAndReleaseJobRejectCorruptIndex(t *testing.T) {
 		t.Fatalf("ReleaseJob error = %v; want a decode error", err)
 	}
 }
+
+func TestCorruptSidecarDoesNotBlockListOrPurgeAll(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	store := New(dataDir, Retention{MaxPerHost: 10, MaxAge: 14 * 24 * time.Hour})
+	var bad string
+	for _, host := range []string{"sagepub.com", "wiley.com"} {
+		path, err := store.Store(ctx, host, "observed", "", "", []byte(host))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if host == "wiley.com" {
+			bad = metadataPath(path)
+		}
+	}
+	if err := os.WriteFile(bad, []byte("{truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readMetadata(bad); err == nil || !strings.Contains(err.Error(), bad) {
+		t.Fatalf("readMetadata error = %v, want it to name %s", err, bad)
+	}
+	rows, err := store.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Host != "sagepub.com" {
+		t.Fatalf("list = %+v, %v; want only the readable capture", rows, err)
+	}
+	removed, err := store.Purge(ctx, "")
+	if err != nil || removed != 2 {
+		t.Fatalf("purge all = (%d, %v), want (2, nil) despite the corrupt sidecar", removed, err)
+	}
+}
