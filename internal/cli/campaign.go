@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -164,7 +166,18 @@ func newCampaignCommand(opt *options) *cobra.Command {
 	}}
 	create.Flags().StringVar(&collection, "collection", "", "destination collection; automatic Zotero import stays off")
 	create.Flags().StringVar(&resolver, "resolver", "", "institution resolver profile")
-	command.AddCommand(create)
+	list := &cobra.Command{Use: "list", Short: "List staged campaigns: id, creation time, works, acknowledged chunks and paused state", Args: cobra.NoArgs, Annotations: map[string]string{"mcp:read-only": "true"}, RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := opt.loadConfig()
+		if err != nil {
+			return err
+		}
+		rows, err := listCampaigns(cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		return printPage(opt, "campaigns", rows, false)
+	}}
+	command.AddCommand(create, list)
 	for _, verb := range []string{"preview", "run", "pause", "resume", "report"} {
 		verb := verb
 		annotations := map[string]string{}
@@ -179,6 +192,11 @@ func newCampaignCommand(opt *options) *cobra.Command {
 			path, err := campaignPath(cfg.DataDir, args[0])
 			if err != nil {
 				return err
+			}
+			// Check existence before the lock, which would create a stray
+			// <id>.json.lock (or fail with a bare errno) for a mistyped id.
+			if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("campaign %q not found in %s; ids look like campaign_… (run `papio campaign list` to see them)", args[0], filepath.Dir(path))
 			}
 			// Reuse the platform advisory lock used by other durable CLI journals.
 			unlock, err := lockPendingCredentials(path + ".lock")
@@ -298,10 +316,53 @@ func campaignPreview(ctx context.Context, opt *options, cfg config.Config, manif
 }
 func campaignPath(dataDir, id string) (string, error) {
 	if !campaignIDPattern.MatchString(id) {
-		return "", errors.New("invalid campaign id")
+		return "", fmt.Errorf("invalid campaign id %q; ids look like campaign_… (run `papio campaign list` to see them)", id)
 	}
 	return filepath.Join(dataDir, "campaigns", id+".json"), nil
 }
+
+// campaignSummary is one row of `papio campaign list`. Error is set, and the
+// counts are zero, for a manifest that does not load.
+type campaignSummary struct {
+	ID                 string `json:"id"`
+	CreatedAt          string `json:"created_at,omitempty"`
+	Records            int    `json:"records"`
+	Works              int    `json:"works"`
+	Chunks             int    `json:"chunks"`
+	ChunksAcknowledged int    `json:"chunks_acknowledged"`
+	Paused             bool   `json:"paused"`
+	Error              string `json:"error,omitempty"`
+}
+
+func listCampaigns(dataDir string) ([]campaignSummary, error) {
+	entries, err := os.ReadDir(filepath.Join(dataDir, "campaigns"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	rows := []campaignSummary{}
+	for _, entry := range entries {
+		id, ok := strings.CutSuffix(entry.Name(), ".json")
+		if !ok || entry.IsDir() || !campaignIDPattern.MatchString(id) {
+			continue
+		}
+		path, _ := campaignPath(dataDir, id)
+		manifest, err := loadCampaign(path, id)
+		if err != nil {
+			rows = append(rows, campaignSummary{ID: id, Error: err.Error()})
+			continue
+		}
+		row := campaignSummary{ID: id, CreatedAt: manifest.CreatedAt, Records: len(manifest.Records), Works: len(manifest.Works), Chunks: len(manifest.Chunks), Paused: manifest.Paused}
+		for _, chunk := range manifest.Chunks {
+			if chunk.State == "acknowledged" {
+				row.ChunksAcknowledged++
+			}
+		}
+		rows = append(rows, row)
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].CreatedAt > rows[j].CreatedAt })
+	return rows, nil
+}
+
 func writeCampaign(dataDir string, manifest *campaignManifest) error {
 	path, err := campaignPath(dataDir, manifest.ID)
 	if err != nil {

@@ -489,6 +489,14 @@ papio campaign import <file> [flags]
 | `--collection` | `string` |  | destination collection; automatic Zotero import stays off |
 | `--resolver` | `string` |  | institution resolver profile |
 
+### `papio campaign list`
+
+List staged campaigns: id, creation time, works, acknowledged chunks and paused state
+
+```
+papio campaign list
+```
+
 ### `papio campaign pause`
 
 Prevent further staged submission

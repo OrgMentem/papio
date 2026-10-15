@@ -117,6 +117,7 @@ var commandClassification = map[string]commandClass{
 	"papio search save":                {kind: kindStructured, rpcMethods: []string{"discovery.search", "discovery.search_unowned_v1"}},
 	"papio campaign":                   {kind: kindNone},
 	"papio campaign import":            {kind: kindStructured, rpcMethods: []string{"zotio.lookup_works", "library.lookup_works"}},
+	"papio campaign list":              {kind: kindEnvelope, rowKey: "campaigns"},
 	"papio campaign preview":           {kind: kindStructured, rpcMethods: []string{"zotio.lookup_works", "library.lookup_works"}},
 	"papio campaign run":               {kind: kindStructured, rpcMethods: []string{"acquire.submit_once_v1", "zotio.lookup_works", "library.lookup_works", "jobs.get"}},
 	"papio campaign pause":             {kind: kindStructured},

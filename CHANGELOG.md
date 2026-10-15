@@ -305,6 +305,13 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **A mistyped campaign id now says which campaign was not found.**
+  `papio campaign preview|run|pause|resume|report` failed with a bare
+  `no such file or directory` (and left a stray `.lock` file) for an unknown id,
+  and `invalid campaign id` did not quote the input. They now report
+  `campaign "<id>" not found in <data_dir>/campaigns`. The new read-only
+  `papio campaign list` shows each stored campaign's id, creation time, works,
+  acknowledged chunks and paused state.
 - **`papio export ledger` now includes papers already imported into Zotero.**
   The default exported only `ready` jobs, but Zotero auto-import moves a
   delivered job to `imported`, so most acquisitions were left out with no
