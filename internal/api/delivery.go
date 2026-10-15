@@ -301,9 +301,34 @@ func deliveryCancel(ctx context.Context, raw json.RawMessage, system *bootstrap.
 		if row.State != delivery.StateOffered && row.State != delivery.StateDeclined {
 			return marshal(deliveryNotCancellable(jobID, row))
 		}
-		applied, err := svc.UpdateStateFrom(ctx, row.ID, row.State, delivery.StateCancelled)
-		if err != nil {
-			return failure(err)
+		var applied bool
+		if row.State == delivery.StateOffered {
+			// An offered row is not always "never submitted": an ambiguous
+			// provider POST (a timeout, a 5xx, a lost response) leaves it offered
+			// with no reference while the institution may be processing the
+			// request. Cancelling that locally would stop papio reconciling it.
+			unknown, err := system.App.DeliverySubmissionOutcomeUnknown(ctx, row)
+			if err != nil {
+				return failure(err)
+			}
+			if unknown {
+				return marshal(DeliveryCancelResult{
+					JobID: jobID, Supported: true, Cancelled: false, State: string(row.State),
+					Reason: "a submission attempt's outcome is unknown; reconcile first (the request may already exist at the institution)",
+				})
+			}
+			// CancelUnattempted carries the attempt-marker predicate in the
+			// UPDATE itself, so a POST reserved after the read above cannot be
+			// cancelled over.
+			applied, err = svc.CancelUnattempted(ctx, row.ID)
+			if err != nil {
+				return failure(err)
+			}
+		} else {
+			applied, err = svc.UpdateStateFrom(ctx, row.ID, row.State, delivery.StateCancelled)
+			if err != nil {
+				return failure(err)
+			}
 		}
 		if applied {
 			return marshal(DeliveryCancelResult{JobID: jobID, Supported: true, Cancelled: true, State: string(delivery.StateCancelled)})

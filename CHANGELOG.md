@@ -247,6 +247,14 @@ execution records kept during the initial build.
   accepts a job that is already resolving, and refuses every other state with a
   conflict error before anything is sent. The send itself is now reserved in
   one step that needs the request to be offered and its job to be resolving.
+- **Cancelling after an unknown ILLiad outcome no longer drops a request the
+  library may hold.** After a timeout, a 5xx or a lost response, the request
+  stays `offered` with no reference while the institution may be processing it.
+  `papio delivery cancel` refused nothing and said `cancelled: true`; cancelling
+  the job or dismissing its action left the row alone, so *papio* stopped
+  reconciling it. `papio delivery cancel` now refuses such a request, and
+  cancelling the job or dismissing its action marks it `unknown_outcome` so it
+  can still be reconciled.
 - **A 2xx ILLiad create response with no transaction number is no longer
   recorded as request `0`.** An empty or `null` body (a proxy, or a changed API)
   used to commit a `submitted` request with provider reference `0`, polled

@@ -2718,6 +2718,36 @@ func (s *Service) PreviewDelivery(ctx context.Context, jobID string) (DeliveryPr
 	return preview, nil
 }
 
+// offeredSubmissionOutcome reports whether a provider POST may already have
+// reached the institution for an offered row that holds no provider reference.
+// unknown is true when the row carries the attempt marker or its owning job's
+// latest failure classification is anything but proven pre-send. ambiguous is
+// true only for the classification that token reconciliation can resolve.
+// Rows that are not offered-without-reference are never unknown here: their
+// state already routes them.
+func (s *Service) offeredSubmissionOutcome(ctx context.Context, req *delivery.Request) (unknown, ambiguous bool, err error) {
+	if !offeredRequestUsable(req) {
+		return false, false, nil
+	}
+	class, classified, err := s.submissionFailureClass(ctx, req.JobID, req.ID)
+	if err != nil {
+		return false, false, err
+	}
+	ambiguous = classified && class == illiad.FailureAmbiguous
+	unknown = req.SubmittedAt != "" || (classified && class != illiad.FailurePreSend)
+	return unknown, ambiguous, nil
+}
+
+// DeliverySubmissionOutcomeUnknown reports whether a provider POST may already
+// have reached the institution for req even though papio holds no provider
+// reference. It is the question every local cancellation of an offered row has
+// to answer: a "yes" means the request may be live, so cancelling it locally
+// would stop papio reconciling a request the institution may fulfil.
+func (s *Service) DeliverySubmissionOutcomeUnknown(ctx context.Context, req *delivery.Request) (bool, error) {
+	unknown, _, err := s.offeredSubmissionOutcome(ctx, req)
+	return unknown, err
+}
+
 // offeredRequestUsable reports whether an existing request is still an
 // offered row that never reached the provider, the only shape a submit may
 // retry against.
@@ -2989,10 +3019,35 @@ func (s *Service) CancelJob(ctx context.Context, jobID string, reason job.Termin
 	}
 	orphanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCompensationTimeout)
 	defer cancel()
-	if err := s.Delivery.OrphanIfLive(orphanCtx, jobID, "job_cancelled"); err != nil {
+	if err := s.orphanDeliveryIfLive(orphanCtx, jobID, "job_cancelled"); err != nil {
 		return fmt.Errorf("%w: job %s is cancelled, but its live delivery request was not orphaned; re-run the cancel or resolve the request by hand: %w", ErrCompensationIncomplete, jobID, err)
 	}
 	return nil
+}
+
+// orphanDeliveryIfLive is delivery.Service.OrphanIfLive plus the one fact
+// that service cannot see: an offered row whose owning job recorded an
+// ambiguous (or any not-proven-pre-send) submission outcome, left by a daemon
+// that predates the row's attempt marker. The marker is backfilled first so
+// the single orphan CAS covers it; such a row is possibly live at the
+// institution and must not be dropped as "never submitted".
+func (s *Service) orphanDeliveryIfLive(ctx context.Context, jobID, cause string) error {
+	req, err := s.Delivery.GetByJobID(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if offeredRequestUsable(req) && req.SubmittedAt == "" {
+		unknown, _, err := s.offeredSubmissionOutcome(ctx, req)
+		if err != nil {
+			return err
+		}
+		if unknown {
+			if err := s.Delivery.MarkSubmissionAttempted(ctx, req.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return s.Delivery.OrphanIfLive(ctx, jobID, cause)
 }
 
 // DismissAction dismisses a human action exactly as
@@ -3010,7 +3065,7 @@ func (s *Service) DismissAction(ctx context.Context, actionID, expectedRevision 
 	}
 	orphanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCompensationTimeout)
 	defer cancel()
-	if err := s.Delivery.OrphanIfLive(orphanCtx, jobID, "action_dismissed"); err != nil {
+	if err := s.orphanDeliveryIfLive(orphanCtx, jobID, "action_dismissed"); err != nil {
 		return jobID, fmt.Errorf("%w: action %d is dismissed, but the live delivery request it was driving was not orphaned; resolve the request by hand: %w", ErrCompensationIncomplete, actionID, err)
 	}
 	return jobID, nil

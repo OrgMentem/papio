@@ -978,14 +978,56 @@ func (s *Service) AppendGateEvent(ctx context.Context, jobID string, evt GateEva
 
 const eventKindOrphaned = "delivery.orphaned"
 
+// MarkSubmissionAttempted stamps the attempt marker on an offered row without
+// the resolving-owner predicate. It backfills rows an earlier daemon left with
+// an ambiguous submission outcome but no marker, so the same cancel and orphan
+// checks cover them.
+func (s *Service) MarkSubmissionAttempted(ctx context.Context, id int64) error {
+	now := store.FormatTime(s.now())
+	_, err := s.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET submitted_at = COALESCE(submitted_at, ?), updated_at = ?
+		WHERE id = ? AND state = ? AND provider_reference = ''`,
+		now, now, id, string(StateOffered))
+	return err
+}
+
+// CancelUnattempted cancels an offered row only while no provider POST was
+// ever reserved for it. applied=false means the row moved or carries the
+// attempt marker; the caller MUST re-read and answer for the state it finds,
+// never report a cancellation. Unlike UpdateStateFrom, the attempt-marker
+// predicate shares the UPDATE, so it cannot overwrite a row whose POST
+// reservation committed after the caller's read.
+func (s *Service) CancelUnattempted(ctx context.Context, id int64) (bool, error) {
+	res, err := s.store.DB().ExecContext(ctx, `
+		UPDATE delivery_requests
+		SET state = ?, updated_at = ?
+		WHERE id = ? AND state = ? AND provider_reference = '' AND submitted_at IS NULL`,
+		string(StateCancelled), store.FormatTime(s.now()), id, string(StateOffered))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// SubmissionMayBeLive reports whether a provider POST may have been sent for
+// an offered row that holds no provider reference.
+func (r *Request) SubmissionMayBeLive() bool {
+	return r != nil && r.State == StateOffered && r.ProviderReference == "" && r.SubmittedAt != ""
+}
+
 // OrphanIfLive reconciles jobID's delivery_requests row when the job that
 // was driving it is cancelled, or its document_delivery action is
 // dismissed: papio stops polling that job entirely, so a row still
 // submitted/pending would otherwise look like it is still being watched
 // when nothing will ever check on it again. Only a genuinely live row is
-// touched — offered (no vendor request exists yet), fulfilled, declined,
-// cancelled, and already-unknown_outcome rows need no compensation, and a
-// job with no delivery row at all is a no-op. The request itself is
+// touched — an offered row that never had a POST reserved (no vendor request
+// exists yet), fulfilled, declined, cancelled, and already-unknown_outcome
+// rows need no compensation, and a job with no delivery row at all is a
+// no-op. An offered row carrying the submission-attempt marker is live for
+// this purpose: its POST may have reached the provider with the response
+// lost, so it becomes unknown_outcome like a submitted row. The request itself is
 // untouched at the provider; this only marks papio's own record honestly,
 // so reconciliation (`papio delivery get`/confirm-exists/confirm-absent)
 // is the way an operator picks it back up, exactly as an automatic poll
@@ -994,7 +1036,8 @@ const eventKindOrphaned = "delivery.orphaned"
 // The orphan write is a compare-and-swap following the same discipline
 // persistPollSuccess documents in poll.go ("the UPDATE only applies WHERE
 // state/next_check_at still match what this call originally read"): the
-// UPDATE only applies WHERE state IN ('submitted','pending'). The orphaned
+// UPDATE only applies WHERE state IN ('submitted','pending') or the row is an
+// attempted offered row. The orphaned
 // event appends inside the same transaction, so a lost CAS (zero rows
 // affected — the poller already settled the row between the read and this
 // write) leaves no duplicate event behind and returns nil as a successful
@@ -1004,7 +1047,7 @@ func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 	if err != nil || req == nil {
 		return err
 	}
-	if req.State != StateSubmitted && req.State != StatePending {
+	if req.State != StateSubmitted && req.State != StatePending && !req.SubmissionMayBeLive() {
 		return nil
 	}
 	if s.beforeOrphanCAS != nil {
@@ -1019,7 +1062,9 @@ func (s *Service) OrphanIfLive(ctx context.Context, jobID, cause string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.ExecContext(ctx,
-		`UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ? AND state IN ('submitted','pending')`,
+		`UPDATE delivery_requests SET state = ?, updated_at = ?
+		 WHERE id = ? AND (state IN ('submitted','pending')
+		                   OR (state = 'offered' AND provider_reference = '' AND submitted_at IS NOT NULL))`,
 		string(StateUnknownOutcome), now, req.ID)
 	if err != nil {
 		return err

@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -232,6 +233,62 @@ func TestDeliveryCancelOfferedRowSucceedsLocally(t *testing.T) {
 	}
 	if !again.Cancelled || again.Reason == "" {
 		t.Fatalf("second cancel = %#v, want an idempotent cancelled result with a reason", again)
+	}
+}
+
+// TestDeliveryCancelRefusesAnOfferedRowAProviderPostMayHaveReached proves an
+// offered row is not always "never submitted": after an ambiguous POST it holds
+// no reference while the institution may hold the request, and cancelling it
+// locally would stop papio reconciling it. Both the durable attempt marker and
+// the ambiguous classification an earlier daemon recorded must refuse.
+func TestDeliveryCancelRefusesAnOfferedRowAProviderPostMayHaveReached(t *testing.T) {
+	cases := []struct {
+		name string
+		mark func(t *testing.T, system *bootstrap.System, jobID string, row *delivery.Request)
+	}{
+		{"attempt marker", func(t *testing.T, system *bootstrap.System, jobID string, row *delivery.Request) {
+			if err := system.App.Delivery.MarkSubmissionAttempted(context.Background(), row.ID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"ambiguous classification without a marker", func(t *testing.T, system *bootstrap.System, jobID string, row *delivery.Request) {
+			if err := system.Jobs.RecordEvent(context.Background(), jobID, "delivery.submission_failure_classified", map[string]any{
+				"delivery_request_id": row.ID,
+				"class":               "ambiguous",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			system := deliveryTestSystem(t)
+			router := Router(system)
+			jobID := deliveryTestJob(t, system, "req_delivery_cancel_ambiguous_"+strconv.Itoa(i), "10.1234/cancel-ambiguous-"+strconv.Itoa(i))
+			if rpcErr := callMethod(t, router, "delivery.submit", map[string]any{"job_id": jobID}, nil); rpcErr != nil {
+				t.Fatalf("delivery.submit: %v", rpcErr)
+			}
+			row, err := system.App.Delivery.GetByJobID(context.Background(), jobID)
+			if err != nil || row == nil {
+				t.Fatalf("GetByJobID: row=%#v err=%v", row, err)
+			}
+			if row.State != delivery.StateOffered {
+				t.Fatalf("setup: row state = %q, want offered", row.State)
+			}
+			tc.mark(t, system, jobID, row)
+
+			var result DeliveryCancelResult
+			if rpcErr := callMethod(t, router, "delivery.cancel", map[string]any{"job_id": jobID}, &result); rpcErr != nil {
+				t.Fatalf("delivery.cancel: %v", rpcErr)
+			}
+			if result.Cancelled || result.State != "offered" || result.Reason == "" {
+				t.Fatalf("cancel result = %#v, want a refusal that leaves the row offered", result)
+			}
+			after, err := system.App.Delivery.Get(context.Background(), row.ID)
+			if err != nil || after == nil || after.State != delivery.StateOffered {
+				t.Fatalf("row after refused cancel = %#v, %v, want offered", after, err)
+			}
+		})
 	}
 }
 
