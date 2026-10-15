@@ -311,6 +311,10 @@ execution records kept during the initial build.
   prompts, `on_ready` and managed filing. It also counted works already in
   flight as `N new papers queued` and let them use the per-run cap. The watch
   now submits once per work and skips works it already submitted before the cap.
+- **Adding an `on_ready` hook no longer runs it for every past paper.** Startup
+  recovery fires the hook only for jobs that became ready after the hook was
+  first configured.
+- **A killed daemon no longer leaves Retraction Watch temp files behind.** The
   next daily run removes stale `.retraction-watch-*` and `.retraction-cache-*`
   files, and the dataset is synced to disk before it replaces the last one.
 - **The daemon no longer lets a sign-in tab be parked or re-offered under the

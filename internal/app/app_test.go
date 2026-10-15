@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3542,6 +3543,10 @@ func TestRecoverPreparedPublicationsDispatchesMissingReadyHook(t *testing.T) {
 			return hook.Result{Ran: true, ExitCode: 0, Duration: 3 * time.Millisecond}
 		},
 	}
+	// The first startup with a hook configured records the hook epoch.
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatal(err)
+	}
 	id := createFilingStateJob(t, jobs, "wr_ready_hook_startup", job.StateReady)
 	seedReadyArtifact(t, svc, jobs, id, "%PDF-1.4\nstartup\n%%EOF")
 	if err := svc.RecoverPreparedPublications(ctx); err != nil {
@@ -3552,6 +3557,32 @@ func TestRecoverPreparedPublicationsDispatchesMissingReadyHook(t *testing.T) {
 	}
 	if outcomes := waitForHookEvents(t, jobs, id, 1); outcomes[0]["trigger"] != "ready" {
 		t.Fatalf("startup filing event = %#v", outcomes[0])
+	}
+}
+
+// Jobs that settled before an on_ready hook was first configured must not
+// fire it when startup recovery first sees the command.
+func TestRecoverPreparedPublicationsSkipsJobsReadyBeforeHookEpoch(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	id := createFilingStateJob(t, jobs, "wr_ready_hook_historical", job.StateReady)
+	seedReadyArtifact(t, svc, jobs, id, "%PDF-1.4\nhistorical\n%%EOF")
+	var ran atomic.Int32
+	svc.ReadyHook = &hook.Runner{
+		Command: "configured",
+		Exec: func(_ context.Context, _ string, _ []string) hook.Result {
+			ran.Add(1)
+			return hook.Result{Ran: true}
+		},
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !svc.DrainHooks(5 * time.Second) {
+		t.Fatal("hooks did not drain")
+	}
+	if ran.Load() != 0 {
+		t.Fatalf("historical job fired the hook %d times", ran.Load())
 	}
 }
 

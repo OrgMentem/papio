@@ -4847,11 +4847,26 @@ func (s *Service) recoverMissingReadyHookForSettled(ctx context.Context) error {
 	if s.ReadyHook == nil || strings.TrimSpace(s.ReadyHook.Command) == "" {
 		return nil
 	}
+	// Jobs that settled before a hook was ever configured were never owed a
+	// dispatch: recovery reads only jobs whose latest ready transition is newer
+	// than the instant this store first saw a non-empty on_ready command. The
+	// insert is one statement, so two daemons cannot write two epochs.
+	if _, err := s.Jobs.S.DB().ExecContext(ctx, `
+		INSERT INTO events (job_id, at, kind, detail_json)
+		SELECT NULL, ?, 'hook.on_ready_epoch', '{}'
+		WHERE NOT EXISTS (SELECT 1 FROM events WHERE kind = 'hook.on_ready_epoch')`,
+		store.Now()); err != nil {
+		return err
+	}
 	rows, err := s.Jobs.S.DB().QueryContext(ctx, `
 		SELECT j.id
 		FROM jobs j
 		WHERE j.state IN ('ready', 'imported')
 		  AND j.acquisition_disposition = 'active'
+		  AND COALESCE((SELECT t.at FROM events t
+			WHERE t.job_id = j.id AND t.kind = 'job.transition'
+			ORDER BY t.seq DESC LIMIT 1), '') >
+			(SELECT MIN(x.at) FROM events x WHERE x.kind = 'hook.on_ready_epoch')
 		  AND NOT EXISTS (
 			SELECT 1 FROM events e
 			WHERE e.job_id = j.id
