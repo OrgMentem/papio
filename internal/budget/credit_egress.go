@@ -623,10 +623,44 @@ func (m *Manager) checkNextAllowed(ctx context.Context, tx *sql.Tx, displaySourc
 	if err != nil {
 		return fmt.Errorf("source %s (%s) has invalid next_allowed_at: %w", rowSource, identity, err)
 	}
+	gate = clampGate(gate, now)
 	if gate.After(now) {
 		return &ErrDeferred{Source: displaySource, Identity: identity, Until: gate, Quota: quota}
 	}
 	return nil
+}
+
+// RefundEgress credits back a CommitEgress whose request provably never reached
+// the provider (a dial, DNS or TLS-handshake failure). The provider counted
+// nothing, so the day's allowance must not shrink: a run of such failures could
+// otherwise exhaust the cold-start cap before any response taught the fuse the
+// real allowance, closing the source until 00:00 UTC. The refund never lowers
+// the counter below the provider's own credits-used seed, and never below zero.
+// It targets the current UTC day; a refund straddling midnight is bounded by
+// the request's own cost.
+func (m *Manager) RefundEgress(ctx context.Context, req EgressRequest) error {
+	if req.Source == "" || req.Credits < 1 {
+		return nil
+	}
+	day := utcDay(m.now().UTC())
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE source_credit_fuse
+		SET credits_committed = MAX(credits_committed - ?, COALESCE(credits_used_seed, 0), 0)
+		WHERE source = ? AND utc_day = ?`, req.Credits, req.Source, day); err != nil {
+		return err
+	}
+	if req.JobID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE job_credit_share
+			SET credits_committed = MAX(credits_committed - ?, 0)
+			WHERE job_id = ? AND source = ? AND utc_day = ?`, req.Credits, req.JobID, req.Source, day); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (m *Manager) debitCredits(ctx context.Context, tx *sql.Tx, source, day string, credits, limit int, unmetered bool) (int64, error) {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"papio/internal/budget"
 	"papio/internal/resolver"
 	"papio/internal/work"
 )
@@ -93,6 +94,12 @@ func (e *OpenAlexEnricher) Enrich(ctx context.Context, requested work.Work) (wor
 				return requested, false, &resolver.TemporaryError{Err: errors.New("enrich: OpenAlex request deadline exceeded")}
 			}
 			return requested, false, requestCtx.Err()
+		}
+		// A local credit refusal is not a transport failure: keep its type so
+		// the caller parks on its reset instead of retrying on a timer.
+		var exceeded *budget.ErrExceeded
+		if errors.As(err, &exceeded) {
+			return requested, false, &resolver.TemporaryError{Err: fmt.Errorf("enrich: OpenAlex request refused: %w", exceeded)}
 		}
 		return requested, false, &resolver.TemporaryError{Err: errors.New("enrich: OpenAlex request failed")}
 	}

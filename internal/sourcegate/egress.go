@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptrace"
+	"sync/atomic"
 	"time"
 
 	"papio/internal/budget"
@@ -38,6 +40,12 @@ func OpenAlexCreditCost(req *http.Request) int {
 // the wire.
 type EgressAuthority interface {
 	CommitEgress(ctx context.Context, req budget.EgressRequest) error
+}
+
+// EgressRefunder is the optional capability to credit back a commit whose
+// request never reached the provider. Implemented by budget.Manager.
+type EgressRefunder interface {
+	RefundEgress(ctx context.Context, req budget.EgressRequest) error
 }
 
 // QuotaFloorController records durable quota floors and the process-local latch
@@ -111,16 +119,28 @@ func (g *GuardedClient) Do(req *http.Request) (*http.Response, error) {
 	if credits < 1 {
 		credits = 1
 	}
-	if err := g.authority.CommitEgress(req.Context(), budget.EgressRequest{
+	egress := budget.EgressRequest{
 		Source:   g.source,
 		Identity: identity,
 		Credits:  credits,
 		JobID:    budget.JobIDFrom(req.Context()),
-	}); err != nil {
+	}
+	if err := g.authority.CommitEgress(req.Context(), egress); err != nil {
 		return nil, err
 	}
-	ctx := context.WithValue(req.Context(), egressCommitted{}, struct{}{})
-	return g.inner.Do(req.WithContext(ctx))
+	// A transport failure with no response and no request write (dial, DNS,
+	// TLS handshake) reached nothing: the provider counted no credits, so the
+	// commit is credited back. Any write, even a failed one, stays charged.
+	var wrote atomic.Bool
+	trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) }}
+	ctx := context.WithValue(httptrace.WithClientTrace(req.Context(), trace), egressCommitted{}, struct{}{})
+	resp, err := g.inner.Do(req.WithContext(ctx))
+	if err != nil && resp == nil && !wrote.Load() {
+		if refunder, ok := g.authority.(EgressRefunder); ok {
+			_ = refunder.RefundEgress(context.WithoutCancel(req.Context()), egress)
+		}
+	}
+	return resp, err
 }
 
 // RequireEgressCommit is the innermost tripwire on an OpenAlex stack. It fails

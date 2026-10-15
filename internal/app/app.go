@@ -756,6 +756,10 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 				return nil, plan, ctx.Err()
 			}
+			if plan.observeWireRefusal(err) {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				continue
+			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
 				if s.Budgets != nil {
@@ -1154,6 +1158,10 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 			// a plain failure let a 429 here settle the whole job unavailable,
 			// because the hop runs at the exhaustion boundary where a missing
 			// retry time is the difference between parking and giving up.
+			if plan.observeWireRefusal(err) {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				continue
+			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
 				if s.Budgets != nil {
@@ -1302,6 +1310,10 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 			s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 			return nil, plan
 		}
+		if plan.observeWireRefusal(err) {
+			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+			return nil, plan
+		}
 		if delay, temporary := resolver.Temporary(err); temporary {
 			sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
 			if s.Budgets != nil {
@@ -1359,6 +1371,10 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 						s.settleCancelledAttempt(ctx, attempt, "failed", safeType(ctx.Err()))
 					}
 					return all, plan
+				}
+				if plan.observeWireRefusal(err) {
+					outcome, detail = "budget_blocked", safeType(err)
+					break
 				}
 				if delay, temporary := resolver.Temporary(err); temporary {
 					sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
@@ -1505,6 +1521,10 @@ func (s *Service) enrichPMIDWork(ctx context.Context, row *job.Row, anchor job.S
 				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 				return plan, ctx.Err()
 			}
+			if plan.observeWireRefusal(err) {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				continue
+			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
 				if s.Budgets != nil {
@@ -1613,6 +1633,10 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 			if ctx.Err() != nil {
 				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
 				return plan, ctx.Err()
+			}
+			if plan.observeWireRefusal(err) {
+				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				continue
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)

@@ -5,6 +5,7 @@ package sourcegate
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"testing"
@@ -212,5 +213,42 @@ func TestGuardedClientAttributesEgressToTheContextJob(t *testing.T) {
 	}
 	if authority.last.JobID != "" {
 		t.Fatalf("JobID = %q, want empty for an unattributed request", authority.last.JobID)
+	}
+}
+
+type failingHTTP struct{ err error }
+
+func (f *failingHTTP) Do(*http.Request) (*http.Response, error) { return nil, f.err }
+
+// A transport failure before any write reaches nothing, so it must not spend
+// the day's allowance: otherwise an outage closes OpenAlex before any response
+// can teach the fuse the real limit.
+func TestGuardedRefundsCommitWhenNothingWasWritten(t *testing.T) {
+	m := testGuardedBudget(t)
+	keyed := config.Source{Enabled: true, APIKey: "private-key"}
+	dead := MustGuarded(m, config.SourceOpenAlex, keyed, OpenAlexCreditCost,
+		&failingHTTP{err: &net.OpError{Op: "dial", Err: errors.New("network is unreachable")}})
+	for i := 0; i < 3*budget.ColdStartCreditCap/10; i++ {
+		resp, err := dead.Do(guardedRequest(t, "https://api.openalex.org/works?search=x"))
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		var exceeded *budget.ErrExceeded
+		if errors.As(err, &exceeded) {
+			t.Fatalf("request %d refused by the fuse after failed dials: %v", i, err)
+		}
+		if err == nil {
+			t.Fatalf("request %d unexpectedly succeeded", i)
+		}
+	}
+	inner := &countingHTTP{}
+	live := MustGuarded(m, config.SourceOpenAlex, keyed, OpenAlexCreditCost, inner)
+	resp, err := live.Do(guardedRequest(t, "https://api.openalex.org/works?search=x"))
+	if err != nil {
+		t.Fatalf("request after the outage: %v", err)
+	}
+	_ = resp.Body.Close()
+	if inner.calls != 1 {
+		t.Fatalf("inner calls = %d, want 1", inner.calls)
 	}
 }

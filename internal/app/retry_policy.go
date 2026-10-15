@@ -47,6 +47,22 @@ func (p *retryPlan) observeOpenAccessCandidate() { p.openAccessCandidates++ }
 
 func (p *retryPlan) observeSourceCalled() { p.sourcesCalled++ }
 
+// observeWireRefusal folds in a local credit refusal (*budget.ErrExceeded) that
+// surfaced from an adapter after observeSourceCalled ran. The refusal happens
+// before any request leaves the machine, so it must not count as a source call
+// or a temporary failure: it parks on the refusal's own reset instead.
+func (p *retryPlan) observeWireRefusal(err error) bool {
+	var exceeded *budget.ErrExceeded
+	if !errors.As(err, &exceeded) {
+		return false
+	}
+	if p.sourcesCalled > 0 {
+		p.sourcesCalled--
+	}
+	p.recordExceeded(exceeded)
+	return true
+}
+
 // observeResolverTemporary records a retryable resolver or sibling request and
 // returns its wake time so the caller can defer the same budget identity.
 func (p *retryPlan) observeResolverTemporary(now time.Time, delay, fallback time.Duration) time.Time {
@@ -250,6 +266,11 @@ func laterTime(current, candidate time.Time) time.Time {
 func earlierRetry(current time.Time, now time.Time, delay, fallback time.Duration) time.Time {
 	if delay <= 0 {
 		delay = fallback
+	}
+	// The job's wake time obeys the same horizon as the source gate it waits
+	// on: a malformed or far-future Retry-After must not park a job for years.
+	if delay > budget.MaxDeferHorizon {
+		delay = budget.MaxDeferHorizon
 	}
 	candidate := now.UTC().Add(delay)
 	if current.IsZero() || candidate.Before(current) {

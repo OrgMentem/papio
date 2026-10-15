@@ -284,6 +284,27 @@ execution records kept during the initial build.
   Auto-import read an item that was absent from Zotero's missing-PDF list as one
   that already holds a PDF, but a deleted parent is absent from that list too.
   The job now plans the import normally and reports the missing parent.
+- **OpenAlex credits for requests that never left the machine are credited
+  back.** *papio* debited the day's credits before each request, so a network
+  outage (a refused dial, a DNS or TLS-handshake failure) before the first
+  response used up the cold-start allowance. OpenAlex then stayed closed until
+  00:00 UTC although the provider had counted nothing. A request that failed
+  before any write is now credited back.
+- **A job that hits the OpenAlex credit allowance waits for the reset instead
+  of ending as a provider outage.** The refusal came from *papio*, not from
+  OpenAlex, but the job counted it as a temporary source failure, retried every
+  30 seconds, and ended terminally a few minutes later. It now parks until the
+  allowance resets, and an enrichment lookup behaves the same way.
+- **A source gate written while the clock ran ahead no longer outlasts the
+  correction.** After a forward clock jump that coincided with a provider 429,
+  jobs stayed parked for up to a day beyond the real time, and only editing
+  `papio.db` cleared the gate. *papio* now limits a stored gate to 24 hours
+  from the current time when it reads it, and a fresh deferral replaces a gate
+  that lies further out.
+- **A huge `Retry-After` no longer parks a job for years.** The source gate
+  was already limited to 24 hours, but the job's own retry time was not, so a
+  malformed header left the job waiting months. The job's retry time now has
+  the same 24-hour limit.
 - **The daemon no longer lets a sign-in tab be parked or re-offered under the
   operator.** The browser extension could ask to park a handoff three minutes
   after its tab opened, even while you were still signing in (away in an

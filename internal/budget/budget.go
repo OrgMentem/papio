@@ -541,6 +541,7 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 		if err != nil {
 			return fmt.Errorf("source %s (%s) has invalid next_allowed_at: %w", source, identity, err)
 		}
+		gate = clampGate(gate, now)
 		if gate.After(now) {
 			return &ErrDeferred{Source: source, Identity: identity, Until: gate}
 		}
@@ -568,6 +569,7 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 			// Fail closed: an unreadable pacing gate is not an absent one.
 			return fmt.Errorf("source %s has invalid pacing next_allowed_at: %w", source, err)
 		}
+		gate = clampGate(gate, now)
 		if gate.After(now) {
 			return &ErrDeferred{Source: source, Identity: identity, Until: gate}
 		}
@@ -595,6 +597,7 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 			// Fail closed: an unparseable floor is not an absent one.
 			return fmt.Errorf("source %s (%s) has invalid quota next_allowed_at: %w", source, identity, err)
 		}
+		gate = clampGate(gate, now)
 		if gate.After(now) {
 			return &ErrDeferred{Source: source, Identity: identity, Until: gate, Quota: true}
 		}
@@ -630,21 +633,36 @@ func (m *Manager) reserve(ctx context.Context, source, identity string, limit, c
 // source until someone notices.
 const MaxDeferHorizon = 24 * time.Hour
 
+// clampGate re-applies MaxDeferHorizon when a stored gate is read. Defer clamps
+// at write time against the clock it saw, so a gate written while the wall clock
+// ran ahead lies beyond the horizon of the corrected clock. Such a value is
+// provably not from a sane clock, and a clock correction must be enough to
+// repair it: nothing else clears a source gate.
+func clampGate(gate, now time.Time) time.Time {
+	if horizon := now.UTC().Add(MaxDeferHorizon); gate.After(horizon) {
+		return horizon
+	}
+	return gate
+}
+
 // Defer persists a server-requested next allowed time (usually Retry-After)
 // against the quota identity in policy, so a gate earned under one credential
 // never gates another. It never shortens an existing later gate, and never
 // honours one beyond MaxDeferHorizon.
 func (m *Manager) Defer(ctx context.Context, source string, policy config.Source, until time.Time) error {
 	until = until.UTC()
-	if horizon := m.now().UTC().Add(MaxDeferHorizon); until.After(horizon) {
+	horizon := m.now().UTC().Add(MaxDeferHorizon)
+	if until.After(horizon) {
 		until = horizon
 	}
+	// A stored gate beyond the horizon was written under a skewed clock; it is
+	// replaced rather than preserved.
 	_, err := m.db.ExecContext(ctx, `INSERT INTO source_budgets(source, identity, window_start, next_allowed_at)
 		VALUES(?, ?, ?, ?)
 		ON CONFLICT(source, identity) DO UPDATE SET next_allowed_at =
-		CASE WHEN next_allowed_at IS NULL OR next_allowed_at < excluded.next_allowed_at
+		CASE WHEN next_allowed_at IS NULL OR next_allowed_at < excluded.next_allowed_at OR next_allowed_at > ?
 		     THEN excluded.next_allowed_at ELSE next_allowed_at END`,
-		source, identityFor(policy), m.now().UTC().Format("2006-01"), store.FormatTime(until))
+		source, identityFor(policy), m.now().UTC().Format("2006-01"), store.FormatTime(until), store.FormatTime(horizon))
 	return err
 }
 
@@ -668,6 +686,7 @@ func (m *Manager) Snapshot(ctx context.Context, source string, policy config.Sou
 		if err != nil {
 			return out, fmt.Errorf("source %s (%s) has invalid next_allowed_at: %w", source, out.Identity, err)
 		}
+		t = clampGate(t, m.now())
 		out.NextAllowedAt = &t
 	}
 	return out, nil
