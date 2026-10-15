@@ -3340,6 +3340,15 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 			"delivery_request_id": created.ID,
 		}), job.WithRetryAt(s.Now().Add(s.RetryDelay)))
 	}
+	if txn.TransactionNumber <= 0 {
+		// A 2xx without a usable TransactionNumber (an empty or null body from a
+		// proxy or a changed API) proves nothing about the request: the provider
+		// may well have created it. Recording reference "0" would track a
+		// transaction that does not exist and hide the real one, so treat it
+		// exactly like any other ambiguous outcome — the classification recorded
+		// above stands — and find the request by papio's idempotency token.
+		return created, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, created)
+	}
 	providerRef := strconv.Itoa(txn.TransactionNumber)
 	nextCheck := delivery.NextCheck(s.Now(), 0, profile.StatusPollMinutes)
 	won, err := s.Delivery.RecordSubmission(ctx, created.ID, providerRef, nextCheck)

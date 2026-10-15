@@ -238,6 +238,11 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **A 2xx ILLiad create response with no transaction number is no longer
+  recorded as request `0`.** An empty or `null` body (a proxy, or a changed API)
+  used to commit a `submitted` request with provider reference `0`, polled
+  forever, while the real request went unmatched. It is now handled like any
+  other unknown outcome: *papio* looks the request up by its token.
 - **The daemon no longer lets a sign-in tab be parked or re-offered under the
   operator.** The browser extension could ask to park a handoff three minutes
   after its tab opened, even while you were still signing in (away in an
