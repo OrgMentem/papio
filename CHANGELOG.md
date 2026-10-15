@@ -255,6 +255,14 @@ execution records kept during the initial build.
   reconciling it. `papio delivery cancel` now refuses such a request, and
   cancelling the job or dismissing its action marks it `unknown_outcome` so it
   can still be reconciled.
+- **Re-checking the gate after an unknown ILLiad outcome no longer tells you to
+  submit the request by hand.** When the monthly cap filled up, or
+  `submit_policy` moved to `prefill_only`, a request ILLiad might already hold
+  got a prefill action that asked you to place the same request yourself, which
+  creates a duplicate at the library. *papio* now reconciles such a request by
+  its token first. An attempt whose response never arrived also counts toward
+  `monthly_request_cap`, so a slow provider can no longer walk past the cap, and
+  a request you confirm exists counts too.
 - **A 2xx ILLiad create response with no transaction number is no longer
   recorded as request `0`.** An empty or `null` body (a proxy, or a changed API)
   used to commit a `submitted` request with provider reference `0`, polled

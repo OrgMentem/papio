@@ -401,10 +401,18 @@ func (s *Service) ListRecoverableAfter(ctx context.Context, afterID int64, limit
 	return out, nil
 }
 
-// UpdateState transitions a row's state unconditionally. Entering
-// StateSubmitted stamps submitted_at the first time only (COALESCE), so a
-// later re-observation of the same live request never resets the
-// cap-counting anchor.
+// stampsSubmittedAt reports whether entering state makes the request live at
+// the provider. Pending counts as well as submitted: confirm-exists adopts a
+// request the operator saw at the institution straight into pending, and that
+// request must count toward the monthly cap like any other.
+func stampsSubmittedAt(state State) bool {
+	return state == StateSubmitted || state == StatePending
+}
+
+// UpdateState transitions a row's state unconditionally. Entering a live
+// state (submitted or pending) stamps submitted_at the first time only
+// (COALESCE), so a later re-observation of the same live request never resets
+// the cap-counting anchor.
 //
 // It is UNCONDITIONAL: the UPDATE is keyed by id alone. That makes it wrong
 // for any transition decided from a prior read, because the row can move
@@ -418,7 +426,7 @@ func (s *Service) UpdateState(ctx context.Context, id int64, state State) error 
 		return fmt.Errorf("delivery: invalid state %q", state)
 	}
 	now := store.FormatTime(s.now())
-	if state == StateSubmitted {
+	if stampsSubmittedAt(state) {
 		_, err := s.store.DB().ExecContext(ctx, `
 			UPDATE delivery_requests
 			SET state = ?, updated_at = ?, submitted_at = COALESCE(submitted_at, ?)
@@ -450,7 +458,7 @@ func (s *Service) UpdateStateFrom(ctx context.Context, id int64, from, to State)
 	now := store.FormatTime(s.now())
 	query := `UPDATE delivery_requests SET state = ?, updated_at = ? WHERE id = ? AND state = ?`
 	args := []any{string(to), now, id, string(from)}
-	if to == StateSubmitted {
+	if stampsSubmittedAt(to) {
 		query = `
 			UPDATE delivery_requests
 			SET state = ?, updated_at = ?, submitted_at = COALESCE(submitted_at, ?)
@@ -493,7 +501,7 @@ func (s *Service) UpdateStateTx(ctx context.Context, tx *sql.Tx, id int64, state
 		return fmt.Errorf("delivery: invalid state %q", state)
 	}
 	now := store.FormatTime(s.now())
-	if state == StateSubmitted {
+	if stampsSubmittedAt(state) {
 		_, err := tx.ExecContext(ctx, `
 			UPDATE delivery_requests
 			SET state = ?, updated_at = ?, submitted_at = COALESCE(submitted_at, ?)

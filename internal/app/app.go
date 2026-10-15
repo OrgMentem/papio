@@ -3203,6 +3203,28 @@ func (s *Service) deliveryRoute(ctx context.Context, row *job.Row, from string) 
 			HasRequiredFields:   deliveryHasRequiredFields(row.Work),
 			SubmittedThisMonth:  submittedThisMonth,
 		})
+		if existing != nil && decision.Action != delivery.ActionSubmit {
+			// An offered row a POST may already have reached is not "never
+			// placed", whatever the gate now says (the monthly cap filled up, an
+			// operator moved submit_policy to prefill_only). A prefill action
+			// would tell the human to place the same request by hand and
+			// duplicate it at the institution, so it goes to token reconciliation
+			// or the reconciliation action instead. A submit verdict needs no
+			// check here: submitDeliveryRequest applies the same guard. Checked
+			// before the gate event is appended, because the recovery loop reads
+			// the last gate decision and a prefill decision would end it.
+			unknown, ambiguous, err := s.offeredSubmissionOutcome(ctx, existing)
+			if err != nil {
+				return DeliveryRouteResult{Configured: true, Branch: branch, Decision: decision}, err
+			}
+			if unknown {
+				result := DeliveryRouteResult{Configured: true, Branch: delivery.BranchReconcile, Decision: decision, Request: existing}
+				if ambiguous && existing.JobID == row.ID {
+					return result, s.reconcileAmbiguousSubmission(ctx, row, from, dd, profile, existing)
+				}
+				return result, s.openDeliveryReconciliationAction(ctx, row, from, existing)
+			}
+		}
 		if err := s.Delivery.AppendGateEvent(ctx, row.ID, delivery.GateEvaluated{
 			ProfileClass:       profile.Class,
 			ProfileDigest:      profile.Digest(),
