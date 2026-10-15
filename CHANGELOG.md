@@ -305,6 +305,11 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **`papio export ledger` now includes papers already imported into Zotero.**
+  The default exported only `ready` jobs, but Zotero auto-import moves a
+  delivered job to `imported`, so most acquisitions were left out with no
+  notice. The new default `--state acquired` covers both `ready` and
+  `imported`. `--state ready` and `--state any` still work.
 - **`papio delivery submit` no longer places an ILLiad request it cannot track.**
   The command sent the request whatever state the job was in. For a job that
   had settled `unavailable`, `failed` or `cancelled`, ILLiad accepted the

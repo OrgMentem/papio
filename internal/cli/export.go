@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -164,28 +165,52 @@ func newExportCommand(opt *options) *cobra.Command {
 	var state, since, consumer string
 	ledgerCommand := &cobra.Command{
 		Use:   "ledger",
-		Short: "Export one record per canonical work (ready acquisitions by default)",
+		Short: "Export one record per canonical work (validated acquisitions by default)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cutoff, err := parseSinceInstant(since)
 			if err != nil {
 				return err
 			}
-			params := map[string]any{"limit": job.ListLimitMax}
-			if state == "ready" {
-				params["state"] = job.StateReady
-			} else if state != "any" {
-				return fmt.Errorf("--state must be \"ready\" or \"any\", got %q", state)
+			var states []string
+			switch state {
+			case "acquired":
+				// zotio auto-import moves a delivered job from ready to
+				// imported, so a validated acquisition is in either state.
+				states = []string{job.StateReady, job.StateImported}
+			case "ready":
+				states = []string{job.StateReady}
+			case "any":
+				states = []string{""}
+			default:
+				return fmt.Errorf("--state must be \"acquired\", \"ready\" or \"any\", got %q", state)
 			}
-			if consumer != "" {
-				params["consumer"] = consumer
+			var rows []api.JobRow
+			seen := map[string]bool{}
+			for _, want := range states {
+				params := map[string]any{"limit": job.ListLimitMax}
+				if want != "" {
+					params["state"] = want
+				}
+				if consumer != "" {
+					params["consumer"] = consumer
+				}
+				page, truncated, err := listAttributedJobsPage(cmd.Context(), opt, params, consumer, job.ListLimitMax)
+				if err != nil {
+					return err
+				}
+				if truncated && ledgerPageMissesCutoff(page, cutoff) {
+					return fmt.Errorf("the ledger has more than %d matching jobs, the most one export can read; nothing was written. Narrow it with --since or --consumer", job.ListLimitMax)
+				}
+				for _, row := range page {
+					if !seen[row.ID] {
+						seen[row.ID] = true
+						rows = append(rows, row)
+					}
+				}
 			}
-			rows, truncated, err := listAttributedJobsPage(cmd.Context(), opt, params, consumer, job.ListLimitMax)
-			if err != nil {
-				return err
-			}
-			if truncated && ledgerPageMissesCutoff(rows, cutoff) {
-				return fmt.Errorf("the ledger has more than %d matching jobs, the most one export can read; nothing was written. Narrow it with --since or --consumer", job.ListLimitMax)
+			if len(states) > 1 {
+				sort.SliceStable(rows, func(i, j int) bool { return rows[i].CreatedAt > rows[j].CreatedAt })
 			}
 			records := make([]cite.Record, 0, len(rows))
 			for _, row := range rows {
@@ -200,7 +225,7 @@ func newExportCommand(opt *options) *cobra.Command {
 			return emit(cmd, records)
 		},
 	}
-	ledgerCommand.Flags().StringVar(&state, "state", "ready", "which works to export: ready (validated acquisitions) or any (every job)")
+	ledgerCommand.Flags().StringVar(&state, "state", "acquired", "which works to export: acquired (ready or imported; validated acquisitions), ready (not yet imported) or any (every job)")
 	ledgerCommand.Flags().StringVar(&since, "since", "", "only works submitted after this instant (RFC3339) or within this duration (Go form, e.g. 720h)")
 	ledgerCommand.Flags().StringVar(&consumer, "consumer", "", "only works submitted by this consumer")
 

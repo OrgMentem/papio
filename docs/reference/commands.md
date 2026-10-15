@@ -881,7 +881,7 @@ papio export job <job-id>...
 
 ### `papio export ledger`
 
-Export one record per canonical work (ready acquisitions by default)
+Export one record per canonical work (validated acquisitions by default)
 
 ```
 papio export ledger [flags]
@@ -891,7 +891,7 @@ papio export ledger [flags]
 | --- | --- | --- | --- |
 | `--consumer` | `string` |  | only works submitted by this consumer |
 | `--since` | `string` |  | only works submitted after this instant (RFC3339) or within this duration (Go form, e.g. 720h) |
-| `--state` | `string` | `ready` | which works to export: ready (validated acquisitions) or any (every job) |
+| `--state` | `string` | `acquired` | which works to export: acquired (ready or imported; validated acquisitions), ready (not yet imported) or any (every job) |
 
 ### `papio export watch`
 

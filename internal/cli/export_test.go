@@ -62,10 +62,18 @@ func TestExportLedgerJSONRequiresOutputAndReportsCollapse(t *testing.T) {
 		if method != "jobs.list_v3" {
 			t.Fatalf("method = %q", method)
 		}
-		if state := params.(map[string]any)["state"]; state != job.StateReady {
-			t.Fatalf("state param = %v, want the ready default", state)
+		state := params.(map[string]any)["state"]
+		switch state {
+		case job.StateReady:
+			*result.(*api.JobsPageV3) = api.JobsPageV3{Jobs: rows}
+		case job.StateImported:
+			// The imported job reached Zotero; the default must export it too.
+			imported := exportTestRow("job-4", "10.5555/imported", "Imported work")
+			imported.State = job.StateImported
+			*result.(*api.JobsPageV3) = api.JobsPageV3{Jobs: []api.JobRow{imported}}
+		default:
+			t.Fatalf("state param = %v, want ready then imported", state)
 		}
-		*result.(*api.JobsPageV3) = api.JobsPageV3{Jobs: rows}
 		return nil
 	}
 
@@ -90,14 +98,14 @@ func TestExportLedgerJSONRequiresOutputAndReportsCollapse(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
 		t.Fatalf("result JSON: %v (%s)", err, out.String())
 	}
-	if result.Format != "ris" || result.Records != 2 || result.DuplicatesCollapsed != 1 || result.SHA256 == "" || result.Output != path {
+	if result.Format != "ris" || result.Records != 3 || result.DuplicatesCollapsed != 1 || result.SHA256 == "" || result.Output != path {
 		t.Fatalf("result = %+v, want format inferred from .ris, one duplicate collapsed", result)
 	}
 	payload, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(payload); !strings.Contains(got, "TI  - The perils of plurality rule\r\n") || strings.Contains(got, "Same work, second job") {
+	if got := string(payload); !strings.Contains(got, "TI  - The perils of plurality rule\r\n") || strings.Contains(got, "Same work, second job") || !strings.Contains(got, "Imported work") {
 		t.Fatalf("file = %q, want the first occurrence kept and the duplicate collapsed", got)
 	}
 }
