@@ -305,6 +305,11 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **`papio zotio import-backfill` now names the papers it would import, expect
+  to fail, or failed.** In text mode it printed only counts, so the dry run did
+  not show which papers it would write to your library and an `--apply` run did
+  not show which ones failed. It now lists one `<job_id>  <reason>` line per
+  job, capped at 20 with a `… N more, use --json` tail.
 - **`papio browser sessions` and `browser reload` no longer say a browser never
   connected.** With nothing connected, `sessions` said `no browser has connected
   since daemon start`, although the list only holds live sessions, so a browser

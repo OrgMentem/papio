@@ -4,6 +4,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/spf13/cobra"
 
@@ -99,6 +100,16 @@ Jobs submitted without policy.auto_import are excluded unless you pass
 					return err
 				}
 			}
+			if result.DryRun {
+				if err := writeImportBackfillItems(opt.out, "would import", result.WouldImport); err != nil {
+					return err
+				}
+				if err := writeImportBackfillItems(opt.out, "expected to fail", result.ExpectedFail); err != nil {
+					return err
+				}
+			} else if err := writeImportBackfillItems(opt.out, "failed", result.Failed); err != nil {
+				return err
+			}
 			if err := writeImportBackfillSharedResolutionNotice(opt.out, result); err != nil {
 				return err
 			}
@@ -123,6 +134,35 @@ Jobs submitted without policy.auto_import are excluded unless you pass
 	command.Flags().IntVar(&limit, "limit", zotio.ImportBackfillLimitDefault, "maximum jobs per invocation (1-50)")
 	command.Flags().StringVar(&cursor, "cursor", "", "resume after the cursor returned by a previous invocation")
 	return command
+}
+
+// importBackfillItemCap bounds the per-job lines of the human receipt; the
+// rest is in --json.
+const importBackfillItemCap = 20
+
+// writeImportBackfillItems prints one `<job_id>  <reason>` line per job. The
+// result carries no title, so the job id is what `papio jobs get` takes next.
+func writeImportBackfillItems(out io.Writer, label string, items []zotio.ImportBackfillItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(out, "%s:\n", label); err != nil {
+		return err
+	}
+	for i, item := range items {
+		if i == importBackfillItemCap {
+			_, err := fmt.Fprintf(out, "  … %d more, use --json\n", len(items)-i)
+			return err
+		}
+		reason := item.Error
+		if reason == "" {
+			reason = item.Reason
+		}
+		if _, err := fmt.Fprintf(out, "  %s  %s\n", item.JobID, reason); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func importBackfillStatus(result zotio.ImportBackfillResult) error {

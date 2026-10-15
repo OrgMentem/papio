@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -67,5 +68,37 @@ func TestZotioImportBackfillExitStatusFollowsAppliedFailures(t *testing.T) {
 				t.Fatalf("%s: text receipt = %q, want it printed with the cursor", tc.name, out.String())
 			}
 		}
+	}
+}
+
+func TestZotioImportBackfillHumanReceiptNamesFailedAndPredictedJobs(t *testing.T) {
+	items := func(prefix string, n int) []zotio.ImportBackfillItem {
+		out := make([]zotio.ImportBackfillItem, n)
+		for i := range out {
+			out[i] = zotio.ImportBackfillItem{JobID: fmt.Sprintf("%s_%02d", prefix, i), Reason: "bundle validation failed"}
+		}
+		return out
+	}
+	run := func(result zotio.ImportBackfillResult, args ...string) string {
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, got any) error {
+			*got.(*zotio.ImportBackfillResult) = result
+			return nil
+		})
+		root.SetArgs(append([]string{"zotio", "import-backfill"}, args...))
+		_ = root.ExecuteContext(context.Background())
+		return out.String()
+	}
+	dry := run(zotio.ImportBackfillResult{DryRun: true, Summary: zotio.ImportBackfillSummary{Selected: 25, WouldImport: 22, ExpectedFail: 3},
+		WouldImport: items("w", 22), ExpectedFail: []zotio.ImportBackfillItem{{JobID: "job_bad", Reason: "empty title"}}})
+	for _, want := range []string{"selected=25", "job_bad  empty title", "w_00", "… 2 more, use --json"} {
+		if !strings.Contains(dry, want) {
+			t.Fatalf("dry-run receipt = %q, want %q", dry, want)
+		}
+	}
+	applied := run(zotio.ImportBackfillResult{Summary: zotio.ImportBackfillSummary{Selected: 3, Failed: 1},
+		Failed: []zotio.ImportBackfillItem{{JobID: "job_x", Error: "zotero refused the item"}}}, "--apply")
+	if !strings.Contains(applied, "job_x  zotero refused the item") {
+		t.Fatalf("apply receipt = %q, want the failed job named", applied)
 	}
 }
