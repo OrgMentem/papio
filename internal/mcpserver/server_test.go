@@ -46,7 +46,7 @@ func TestServerExposesExactToolSurface(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	sort.Strings(names)
-	want := []string{"papio_acquire_batch", "papio_batch_wait", "papio_command_run", "papio_command_search"}
+	want := []string{"papio_acquire_batch", "papio_batch_wait", "papio_changes", "papio_command_run", "papio_command_search"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", names, want)
 	}

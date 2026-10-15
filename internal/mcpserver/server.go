@@ -5,11 +5,12 @@
 // The command surface derives from the CLI command tree (see
 // internal/mcpserver/cobratree): papio_command_search + papio_command_run
 // collapse the whole tree behind a facade so the CLI stays the single source of
-// truth and no typed tool layer drifts from it. Two composite tools remain
+// truth and no typed tool layer drifts from it. Three composite tools remain
 // hand-written because they have no single-command equivalent:
 // papio_acquire_batch (bulk work input — the stdin path of `acquire --batch`,
-// which MCP cannot supply) and papio_batch_wait (a bounded polling loop).
-// Read-only JSON resources round out the surface.
+// which MCP cannot supply), papio_batch_wait (a bounded polling loop), and
+// papio_changes (a seq cursor over the durable events table). Read-only JSON
+// resources round out the surface.
 package mcpserver
 
 import (
@@ -34,7 +35,7 @@ import (
 	"papio/internal/protocol"
 )
 
-const serverInstructions = "Acquire papers into durable papio jobs. Discover and run CLI commands with papio_command_search then papio_command_run (output is JSON). Submit many works at once with papio_acquire_batch, then await outcomes with papio_batch_wait. To import items and attachments into Zotero, run `zotio plan <job-id>` via papio_command_run, then `zotio apply <plan-id>` with the plan's confirm-sha256 flag. `zotio tags reconcile` is a separate tag write without a preview."
+const serverInstructions = "Acquire papers into durable papio jobs. Discover and run CLI commands with papio_command_search then papio_command_run (output is JSON). Submit many works at once with papio_acquire_batch, then await outcomes with papio_batch_wait, or follow each job event incrementally with papio_changes by passing the previous next_seq as after_seq. To import items and attachments into Zotero, run `zotio plan <job-id>` via papio_command_run, then `zotio apply <plan-id>` with the plan's confirm-sha256 flag. `zotio tags reconcile` is a separate tag write without a preview."
 
 const (
 	defaultBatchWaitTimeoutSeconds = 300
@@ -117,6 +118,8 @@ func registerCompositeTools(s *server.MCPServer, system *bootstrap.System, deps 
 		mcplib.WithNumber("poll_seconds", mcplib.Description("Whole seconds between reports; defaults to 5.")),
 		mcplib.WithReadOnlyHintAnnotation(true),
 	), handleBatchWait(deps))
+
+	registerChangesTool(s, system)
 }
 
 func handleAcquireBatch(system *bootstrap.System, deps toolDependencies) server.ToolHandlerFunc {

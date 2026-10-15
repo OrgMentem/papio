@@ -384,8 +384,8 @@ claude mcp add papio -- papio mcp
 ```
 
 It exposes a command facade derived from the CLI — `papio_command_search` to discover
-commands, `papio_command_run` to run one — plus `papio_acquire_batch` and
-`papio_batch_wait`, and the read resources `papio://jobs`, `papio://artifacts`,
+commands, `papio_command_run` to run one — plus `papio_acquire_batch`,
+`papio_batch_wait`, `papio_changes` (a cursor over job events), and the read resources `papio://jobs`, `papio://artifacts`,
 `papio://bundles`, `papio://zotio/plans`, `papio://exports`. Every safety rule above
 holds identically there. Full reference:
 <https://orgmentem.github.io/papio/reference/mcp-tools/>.

@@ -11,6 +11,12 @@ execution records kept during the initial build.
 ## [Unreleased]
 
 ### Added
+- **MCP agents can follow a long acquisition through `papio_changes`.** The
+  new read-only tool returns the durable job events after a cursor, oldest
+  first, with `next_seq` and `truncated`. Pass `next_seq` back as `after_seq`
+  and each event arrives once, also across a reconnect or a daemon restart. You
+  can scope it to one `batch_id` (or `latest`) or one `job_id`. An agent no
+  longer has to fetch the full batch report again to see what changed.
 - **An OpenAthens domain sends DOI handoffs through your library's redirector.**
   Set `openathens_domain` (for example `example.edu`: the segment after
   `go.openathens.net/redirector/` on your library's links) under `[browser]`, or
