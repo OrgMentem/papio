@@ -607,10 +607,13 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 			output.Failed++
 			manifestWork.Status, manifestWork.Error = "submission_failed", "submit"
 			if firstErr == nil {
+				// Name the work by its position in the operator's input, not
+				// its place among the works left after ownership filtering.
+				label := batchWorkLabel(manifestWorkIndex+1, requests[index])
 				if errs[index] == nil {
-					firstErr = fmt.Errorf("submitting batch work %d failed without a daemon error", index+1)
+					firstErr = fmt.Errorf("submitting %s failed without a daemon error", label)
 				} else {
-					firstErr = fmt.Errorf("submitting batch work %d: %w", index+1, errs[index])
+					firstErr = fmt.Errorf("submitting %s: %w", label, errs[index])
 				}
 			}
 			continue
@@ -624,7 +627,23 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	if err := Write(dataDir, manifest); err != nil {
 		return nil, err
 	}
+	if output.Failed > 1 && firstErr != nil {
+		firstErr = fmt.Errorf("%w; %d works failed — see papio batch report %s", firstErr, output.Failed, manifest.ID)
+	}
 	return output, firstErr
+}
+
+// batchWorkLabel names a batch work by its 1-based input position and, when it
+// has one, its DOI or title, so the operator can find the record in the file.
+func batchWorkLabel(position int, request protocol.WorkRequest) string {
+	switch {
+	case request.Identifiers != nil && strings.TrimSpace(request.Identifiers.DOI) != "":
+		return fmt.Sprintf("batch work %d (%s)", position, strings.TrimSpace(request.Identifiers.DOI))
+	case strings.TrimSpace(request.Title) != "":
+		return fmt.Sprintf("batch work %d (%q)", position, strings.TrimSpace(request.Title))
+	default:
+		return fmt.Sprintf("batch work %d", position)
+	}
 }
 
 // classifyBatchOwnership resolves ownership for a batch through whichever

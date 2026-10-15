@@ -866,3 +866,50 @@ func TestSubmitZotioOwnershipLookupCarriesPMIDAndISBN(t *testing.T) {
 		})
 	}
 }
+
+// failingDOICaller reports the first work as owned with a PDF and refuses to
+// submit one DOI, so the failure sits at a different place in the input than in
+// the list of works left after ownership filtering.
+type failingDOICaller struct {
+	baseBatchCaller
+	failDOIs map[string]bool
+}
+
+func (c failingDOICaller) Call(ctx context.Context, method string, params, result any) error {
+	switch method {
+	case "zotio.lookup_works":
+		if err := c.baseBatchCaller.Call(ctx, method, params, result); err != nil {
+			return err
+		}
+		result.(*zotio.LookupWorksResult).Works[0] = zotio.WorkOwnership{Status: zotio.OwnershipOwnedWithPDF, ItemKey: "OWNED001"}
+		return nil
+	case "acquire.submit_v2":
+		request := params.(submitParams).Request
+		if c.failDOIs[request.Identifiers.DOI] {
+			return fmt.Errorf("resolver refused %s", request.Identifiers.DOI)
+		}
+		result.(*submitResult).JobID = "job-" + request.RequestID
+		return nil
+	default:
+		return c.baseBatchCaller.Call(ctx, method, params, result)
+	}
+}
+
+func TestSubmitNamesFailingWorkByInputPosition(t *testing.T) {
+	works := []protocol.WorkRequest{
+		doiWork("r1", "10.1000/owned"),
+		doiWork("r2", "10.1000/fine"),
+		doiWork("r3", "10.1000/bad"),
+		doiWork("r4", "10.1000/worse"),
+	}
+	caller := failingDOICaller{failDOIs: map[string]bool{"10.1000/bad": true, "10.1000/worse": true}}
+	output, err := Submit(context.Background(), caller, t.TempDir(), works, SubmitOptions{})
+	if err == nil {
+		t.Fatal("Submit() error = nil, want the first failure")
+	}
+	for _, want := range []string{"batch work 3 (10.1000/bad)", "2 works failed — see papio batch report " + output.BatchID} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Submit() error = %q, want it to contain %q", err, want)
+		}
+	}
+}
