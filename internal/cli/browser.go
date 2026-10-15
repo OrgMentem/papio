@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ func newBrowserCommand(opt *options) *cobra.Command {
 
 	sessions := &cobra.Command{
 		Use:         "sessions",
-		Short:       "List browser sessions connected since daemon start",
+		Short:       "List currently connected browser sessions",
 		Annotations: map[string]string{"mcp:read-only": "true"},
 		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -37,7 +38,11 @@ func newBrowserCommand(opt *options) *cobra.Command {
 				return opt.printJSON(result)
 			}
 			if len(result.Sessions) == 0 {
-				_, err := fmt.Fprintln(opt.out, "no browser has connected since daemon start")
+				log := "<data_dir>/native-host.log"
+				if cfg, err := opt.loadConfig(); err == nil && cfg.DataDir != "" {
+					log = filepath.Join(cfg.DataDir, "native-host.log")
+				}
+				_, err := fmt.Fprintf(opt.out, "no browser is connected now; if one was, check %s, `papio native-host status` and `papio doctor`\n", log)
 				return err
 			}
 			for _, session := range result.Sessions {
@@ -153,7 +158,14 @@ func newBrowserCommand(opt *options) *cobra.Command {
 				}
 			}
 			if previous == "" && reloadSession == "" {
-				return errors.New("no browser session holds the bridge")
+				if len(before.Sessions) == 0 {
+					return errors.New("no browser extension is connected to the daemon")
+				}
+				ids := make([]string, 0, len(before.Sessions))
+				for _, s := range before.Sessions {
+					ids = append(ids, shortSessionID(s.ID))
+				}
+				return fmt.Errorf("no connected browser session is the current holder; pending sessions: %s; pick one with --session <id>", strings.Join(ids, ", "))
 			}
 			var result struct {
 				SessionID string `json:"session_id"`

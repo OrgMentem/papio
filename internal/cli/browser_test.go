@@ -157,7 +157,7 @@ func TestBrowserReloadAttributesObservedHolder(t *testing.T) {
 		{
 			name:            "no holder",
 			before:          []browser.SessionSummary{{ID: "sibling-old"}},
-			wantErrContains: "no browser session holds",
+			wantErrContains: "no connected browser session is the current holder",
 		},
 		{
 			name:       "initial session observation failure",
@@ -407,5 +407,35 @@ func TestBrowserReloadPropagatesOutputFailure(t *testing.T) {
 				t.Fatalf("error = %v, want %v", err, outputErr)
 			}
 		})
+	}
+}
+
+func TestBrowserSessionsEmptyPointsAtTheNativeHostLog(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{DataDir: "/data/papio"}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*browserSessionsResult) = browserSessionsResult{}
+		return nil
+	})
+	root.SetArgs([]string{"browser", "sessions"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("sessions: %v", err)
+	}
+	for _, want := range []string{"no browser is connected now", "/data/papio/native-host.log", "papio native-host status", "papio doctor"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+}
+
+func TestBrowserReloadWithOnlyPendingSessionsSuggestsSession(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*browserSessionsResult) = browserSessionsResult{Sessions: []browser.SessionSummary{{ID: "bbbb2222bbbb2222"}}}
+		return nil
+	})
+	root.SetArgs([]string{"browser", "reload"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "bbbb2222bbbb") || !strings.Contains(err.Error(), "--session") {
+		t.Fatalf("err = %v, want the pending session and --session hint", err)
 	}
 }

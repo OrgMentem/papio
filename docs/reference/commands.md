@@ -422,7 +422,7 @@ papio browser reload [flags]
 
 ### `papio browser sessions`
 
-List browser sessions connected since daemon start
+List currently connected browser sessions
 
 ```
 papio browser sessions

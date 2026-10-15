@@ -305,6 +305,14 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **`papio browser sessions` and `browser reload` no longer say a browser never
+  connected.** With nothing connected, `sessions` said `no browser has connected
+  since daemon start`, although the list only holds live sessions, so a browser
+  that connected and then died produced the same message. It now says `no
+  browser is connected now` and points at `<data_dir>/native-host.log`,
+  `papio native-host status` and `papio doctor`. `reload` now says `no browser
+  extension is connected to the daemon`, or lists the pending sessions and
+  suggests `--session <id>`.
 - **`papio adapter capture` now gives the remedy that matches why a capture was
   refused.** Every `not_permitted` outcome told you to set `[captures] enabled =
   true`, even when captures were already on and the real cause was a missing
