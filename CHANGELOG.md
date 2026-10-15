@@ -268,6 +268,10 @@ execution records kept during the initial build.
   used to commit a `submitted` request with provider reference `0`, polled
   forever, while the real request went unmatched. It is now handled like any
   other unknown outcome: *papio* looks the request up by its token.
+- **A paper whose Zotero item you deleted or merged away is no longer filed as "already in the library".**
+  Auto-import read an item that was absent from Zotero's missing-PDF list as one
+  that already holds a PDF, but a deleted parent is absent from that list too.
+  The job now plans the import normally and reports the missing parent.
 - **The daemon no longer lets a sign-in tab be parked or re-offered under the
   operator.** The browser extension could ask to park a handoff three minutes
   after its tab opened, even while you were still signing in (away in an

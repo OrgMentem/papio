@@ -531,7 +531,7 @@ func (s *Service) markKeyedItemsHoldingPDF(ctx context.Context, keyedJobs, owned
 	for _, key := range keyedJobs {
 		keys = append(keys, key)
 	}
-	holding, known := s.itemsHoldingPDF(ctx, keys)
+	holding, known := s.itemsConfirmedHoldingPDF(ctx, keys)
 	if !known {
 		return false
 	}

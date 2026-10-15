@@ -745,7 +745,7 @@ func (s *Service) skipOwnedReadyImport(ctx context.Context, jobID string) (statu
 	// byte-equal to the job's artifact SHA-256 — were re-attached and refused
 	// on every pass, indefinitely, because ready is terminal.
 	if key := strings.TrimSpace(row.ZotioItemKey); key != "" {
-		holding, known := s.itemsHoldingPDF(ctx, []string{key})
+		holding, known := s.itemsConfirmedHoldingPDF(ctx, []string{key})
 		if !known || !holding[key] {
 			return "", "", false, nil
 		}

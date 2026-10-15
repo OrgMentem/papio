@@ -630,6 +630,38 @@ func TestPlanAndApplySkipsKeyedItemHoldingPDF(t *testing.T) {
 	}
 }
 
+// A keyed job whose Zotero parent was deleted or merged away is absent from
+// the missing-PDF queue like an item that holds its PDF. It must not be filed
+// as a duplicate on that inference.
+func TestPlanAndApplyDoesNotSkipKeyedItemWhoseParentIsGone(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	created := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+	seedImportBackfillJob(t, ctx, db, "job_keyed_gone", created, true, "pass", "")
+	seedItemKey(t, ctx, db, "job_keyed_gone", "ITEMGONE1")
+
+	cli := &queueCLI{missing: []MissingPDFItem{{Key: "OTHERKEY"}}}
+	cli.parentGone = true
+	service := importBackfillService(t, dataDir, db, cli)
+	status, _, _, _ := service.PlanAndApply(ctx, "job_keyed_gone")
+	if status == "duplicate" {
+		t.Fatal("status = duplicate for a deleted parent item")
+	}
+	row, err := (&job.Store{S: db}).Get(ctx, "job_keyed_gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State == job.StateImported {
+		t.Fatal("job imported although its parent item no longer exists")
+	}
+}
+
 // TestValidateImportBackfillCursorRejections covers the user-facing
 // `papio zotio import-backfill --cursor` guard directly. The selection test
 // reaches only the happy continuation, so the two distinct rejections and the

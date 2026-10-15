@@ -286,6 +286,28 @@ func (s *Service) itemsHoldingPDF(ctx context.Context, keys []string) (map[strin
 	return holding, true
 }
 
+// itemsConfirmedHoldingPDF narrows itemsHoldingPDF to items that still exist.
+// The missing-PDF queue lists only existing items, so a parent the operator
+// deleted or merged away is absent from it exactly like one that holds a PDF.
+// A key whose item zotio cannot read is dropped: the caller then plans the
+// import normally, and the plan surfaces the missing parent instead of the job
+// being filed as already in the library.
+func (s *Service) itemsConfirmedHoldingPDF(ctx context.Context, keys []string) (map[string]bool, bool) {
+	holding, known := s.itemsHoldingPDF(ctx, keys)
+	if !known {
+		return nil, false
+	}
+	for key, holds := range holding {
+		if !holds {
+			continue
+		}
+		if _, err := s.CLI.GetItem(ctx, key); err != nil {
+			delete(holding, key)
+		}
+	}
+	return holding, true
+}
+
 type lookupIdentifier struct {
 	kind  string
 	value string
