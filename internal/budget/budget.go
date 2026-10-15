@@ -653,12 +653,15 @@ func clampGate(gate, now time.Time) time.Time {
 // only at read time would hand every reader a fresh now+24h, so a gate written
 // under a clock 30 days ahead would never open until its original deadline.
 // Persisting the clamp pins the deadline, and the gate opens when the corrected
-// clock reaches it. It runs before the caller's transaction because the
-// database is single-connection and a refusal rolls its transaction back.
+// clock reaches it. A value that is not a timestamp is left alone so readers
+// keep refusing it rather than this turning it into a valid deadline. It runs
+// before the caller's transaction because the database is single-connection
+// and a refusal rolls its transaction back.
 func (m *Manager) repairSkewedGates(ctx context.Context, source string) error {
 	horizon := store.FormatTime(m.now().UTC().Add(MaxDeferHorizon))
 	_, err := m.db.ExecContext(ctx, `UPDATE source_budgets SET next_allowed_at = ?
-		WHERE source IN (?, ?, ?) AND next_allowed_at IS NOT NULL AND next_allowed_at > ?`,
+		WHERE source IN (?, ?, ?) AND next_allowed_at IS NOT NULL AND next_allowed_at > ?
+		AND julianday(next_allowed_at) IS NOT NULL`,
 		horizon, source, QuotaSourceName(source), PacingSourceName(source), horizon)
 	return err
 }
