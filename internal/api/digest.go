@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 
 	"papio/internal/bootstrap"
@@ -46,7 +47,7 @@ func acquireWatchDigest(ctx context.Context, raw json.RawMessage, system *bootst
 			// fact the operator needs, and the message is the only place it
 			// can travel without widening the result.
 			_, rpcErr := watchFailure(err)
-			rpcErr.Message = safeMessage(partial, rpcErr.Message)
+			rpcErr.Message = partialDigestMessage(partial)
 			rpcErr.Detail.ErrorHint = ""
 			return nil, rpcErr
 		}
@@ -79,4 +80,13 @@ func clearWatchDigest(ctx context.Context, raw json.RawMessage, system *bootstra
 		return failure(err)
 	}
 	return marshal(WatchDigestClearResult{Cleared: cleared})
+}
+
+// partialDigestMessage keeps the counts that matter after a partial failure
+// and names the cause only when submitCauseSuffix deems it safe.
+func partialDigestMessage(partial *watch.DigestPartialError) string {
+	if partial.Queued == 0 {
+		return "no digest works were queued" + submitCauseSuffix(partial.Cause)
+	}
+	return fmt.Sprintf("queued %d of %d digest works before failing%s; the queued works left the digest — see papio jobs list", partial.Queued, partial.Total, submitCauseSuffix(partial.Cause))
 }

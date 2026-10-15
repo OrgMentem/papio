@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/url"
@@ -2350,9 +2351,9 @@ func watchFailure(err error) ([]byte, *ipc.RPCError) {
 	message := "watch execution failed"
 	var allFailed *watch.AllSubmissionsFailedError
 	if errors.As(err, &allFailed) {
-		// The message already names the first cause, so a hint would only
-		// repeat it.
-		message = safeMessage(allFailed, message)
+		// The counts and a safe cause name what failed, so a hint would only
+		// repeat them. The full error is in the daemon log above.
+		message = fmt.Sprintf("all %d watch submissions failed%s", allFailed.Count, submitCauseSuffix(allFailed.Cause))
 		info.Hint = ""
 	} else if info.Hint == message {
 		// An unclassified failure has nothing to add to the message.
@@ -2365,6 +2366,23 @@ func watchFailure(err error) ([]byte, *ipc.RPCError) {
 			ErrorHint:       info.Hint,
 			ErrorHTTPStatus: info.HTTPStatus,
 		},
+	}
+}
+
+// submitCauseSuffix names why a submission failed, but only for refusals whose
+// text is safe to send: a request the caller got wrong, or an unset access
+// mode. Any other cause (a store or transaction error, for instance) may carry
+// database detail, so the suffix points at the daemon log instead.
+func submitCauseSuffix(cause error) string {
+	var invalid *app.InvalidRequestError
+	var unset *config.ErrAccessModeUnset
+	switch {
+	case errors.As(cause, &invalid):
+		return ": " + safeMessage(invalid, "invalid request")
+	case errors.As(cause, &unset):
+		return ": " + safeMessage(unset, "access mode is not configured")
+	default:
+		return "; see the daemon log for the cause"
 	}
 }
 

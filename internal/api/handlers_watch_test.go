@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/bootstrap"
 	"papio/internal/discovery"
 	"papio/internal/protocol"
@@ -424,14 +425,32 @@ func TestWatchEditAndBackfillReportInputMistakesAsInvalidArgument(t *testing.T) 
 	}
 }
 
-func TestWatchRunNamesAllSubmissionsFailedCause(t *testing.T) {
-	cause := &watch.AllSubmissionsFailedError{Count: 5, Cause: errors.New("resolver offline")}
-	_, rpcErr := watchFailure(cause)
-	if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != "all 5 watch submissions failed: resolver offline" {
-		t.Fatalf("watchFailure() = %#v", rpcErr)
+func TestWatchSubmissionFailuresKeepCountsAndHideUnsafeCauses(t *testing.T) {
+	leak := errors.New("job: create request: SQL logic error: no such table: secrets (1)")
+	safe := &app.InvalidRequestError{Err: errors.New(`unknown resolver "x" (configured profiles: a)`)}
+	for _, tc := range []struct {
+		name  string
+		cause error
+		want  string
+	}{
+		{name: "safe", cause: safe, want: `all 5 watch submissions failed: unknown resolver "x" (configured profiles: a)`},
+		{name: "store error", cause: leak, want: "all 5 watch submissions failed; see the daemon log for the cause"},
+	} {
+		t.Run("run "+tc.name, func(t *testing.T) {
+			_, rpcErr := watchFailure(&watch.AllSubmissionsFailedError{Count: 5, Cause: tc.cause})
+			if rpcErr == nil || rpcErr.Code != "internal" || rpcErr.Message != tc.want {
+				t.Fatalf("watchFailure() = %#v, want message %q", rpcErr, tc.want)
+			}
+			if rpcErr.Detail == nil || rpcErr.Detail.ErrorHint != "" {
+				t.Fatalf("detail = %#v, want no hint repeating the message", rpcErr.Detail)
+			}
+		})
 	}
-	if rpcErr.Detail == nil || rpcErr.Detail.ErrorHint != "" {
-		t.Fatalf("detail = %#v, want no hint repeating the message", rpcErr.Detail)
+	if got := partialDigestMessage(&watch.DigestPartialError{Queued: 1, Total: 2, Cause: leak}); strings.Contains(got, "SQL") || !strings.Contains(got, "queued 1 of 2 digest works before failing; see the daemon log for the cause") {
+		t.Fatalf("partialDigestMessage() = %q", got)
+	}
+	if got := partialDigestMessage(&watch.DigestPartialError{Queued: 0, Total: 2, Cause: safe}); got != `no digest works were queued: unknown resolver "x" (configured profiles: a)` {
+		t.Fatalf("partialDigestMessage(safe) = %q", got)
 	}
 }
 
