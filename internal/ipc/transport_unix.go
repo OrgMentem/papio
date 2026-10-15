@@ -6,6 +6,8 @@ package ipc
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -25,20 +27,35 @@ func listenSocket(path string) (net.Listener, func() error, error) {
 	if err := prepareSocket(path); err != nil {
 		return nil, nil, err
 	}
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	// Bind inside a fresh owner-only directory and restrict the socket there,
+	// then link it into place: the published path never exists with the
+	// process umask's permissions, so no other local user can connect in the
+	// window between bind and chmod, whatever the parent directory allows.
+	staging, err := makeStagingDir(filepath.Dir(path))
 	if err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return nil, nil, ErrSocketInUse
-		}
+		return nil, nil, err
+	}
+	defer func() { _ = os.RemoveAll(staging) }()
+	staged := filepath.Join(staging, "s")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: staged, Net: "unix"})
+	if err != nil {
 		return nil, nil, fmt.Errorf("listen ipc socket: %w", err)
 	}
 	// net.UnixListener otherwise unlinks its path on Close, which could remove
 	// a replacement file created after the daemon started.
 	listener.SetUnlinkOnClose(false)
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := os.Chmod(staged, 0o600); err != nil {
 		_ = listener.Close()
-		_ = os.Remove(path)
 		return nil, nil, fmt.Errorf("restrict ipc socket permissions: %w", err)
+	}
+	// link, unlike rename, refuses an existing path, so a daemon that won the
+	// race since prepareSocket keeps its socket.
+	if err := os.Link(staged, path); err != nil {
+		_ = listener.Close()
+		if errors.Is(err, os.ErrExist) {
+			return nil, nil, ErrSocketInUse
+		}
+		return nil, nil, fmt.Errorf("publish ipc socket: %w", err)
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -47,6 +64,34 @@ func listenSocket(path string) (net.Listener, func() error, error) {
 		return nil, nil, fmt.Errorf("inspect created ipc socket: %w", err)
 	}
 	return listener, func() error { return removeSocketIfSame(path, info) }, nil
+}
+
+// makeStagingDir creates an owner-only directory beside the socket path. Its
+// name is deliberately tiny: the staged socket "<dir>/.sXXXX/s" must fit
+// sun_path (104 bytes on macOS) wherever the published "<dir>/papio.sock" does,
+// and MkdirTemp's ten-digit suffix would make it longer.
+func makeStagingDir(dir string) (string, error) {
+	var suffix [2]byte
+	for range 16 {
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", fmt.Errorf("create ipc staging directory: %w", err)
+		}
+		staging := filepath.Join(dir, ".s"+hex.EncodeToString(suffix[:]))
+		err := os.Mkdir(staging, 0o700)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("create ipc staging directory: %w", err)
+		}
+		// Mkdir honours the umask, which can only remove bits; chmod pins 0700.
+		if err := os.Chmod(staging, 0o700); err != nil {
+			_ = os.Remove(staging)
+			return "", fmt.Errorf("restrict ipc staging directory: %w", err)
+		}
+		return staging, nil
+	}
+	return "", fmt.Errorf("create ipc staging directory: no free name in %s", dir)
 }
 
 // dialSocket connects to the daemon's Unix-domain socket.

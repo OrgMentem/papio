@@ -89,6 +89,7 @@ func TestCappedFlagsAFullPageAsPossiblyIncomplete(t *testing.T) {
 		{name: "short page is complete", rows: []int{1, 2}, limit: 5},
 		{name: "full page may hide more", rows: []int{1, 2, 3}, limit: 3, wantTruncated: true},
 		{name: "no limit never truncates", rows: []int{1, 2, 3}, limit: 0},
+		{name: "nil rows normalize to empty", rows: nil, limit: 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rows, truncated := Capped(tc.rows, tc.limit)
@@ -97,6 +98,9 @@ func TestCappedFlagsAFullPageAsPossiblyIncomplete(t *testing.T) {
 			}
 			if len(rows) != len(tc.rows) {
 				t.Fatalf("Capped must not drop rows: got %d, want %d", len(rows), len(tc.rows))
+			}
+			if rows == nil {
+				t.Fatal("Capped returned nil rows; they marshal as null, not []")
 			}
 		})
 	}
