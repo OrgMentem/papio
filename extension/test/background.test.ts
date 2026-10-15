@@ -6275,6 +6275,164 @@ test("a sign-in waiting for the operator yields the drive slot to an unrelated p
   expect(findByJob(h.backend.store, ids.jobID)?.tab_id).toBe(tabID);
 });
 
+const SIGNIN_IN_PROGRESS = "a sign-in is in progress on this surface";
+
+/** Live defect (job_bf6324ab): the IdP session was warm, so auth_returned came
+ * five seconds after the wall and the tab landed on a provider interstitial
+ * that is not entitled. Three minutes later the drive timer asked the daemon to
+ * park the surface; the daemon refused because its entry lease is still live. */
+async function refusedParkAfterWarmReturn(h: Harness, ids: ClaimSurfaceIDs) {
+  const { tabID, acked } = await signInAtIdP(h, ids);
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/interstitial`);
+  expect(await ackClaimObservations(h, acked)).toContain("auth_returned");
+  await settle();
+  const timeout = h.timers.filter((timer) => timer.ms === 180_000).at(-1);
+  expect(timeout).toBeDefined();
+  h.clock.now += 180_000;
+  const framesBefore = h.port.posted.length;
+  const timingOut = timeout!.fn();
+  const request = await h.port.waitForFrame("surface_close_request", framesBefore);
+  expect(request.payload["disposition"]).toBe("handoff_parked");
+  await h.port.inbound(nativeResult("surface_close_response", {
+    request_id: request.payload["request_id"],
+    outcome: "not_eligible",
+    detail: SIGNIN_IN_PROGRESS,
+  }));
+  await timingOut;
+  await settle();
+  return { tabID, acked };
+}
+
+test("a park the daemon refuses because a sign-in is in progress re-enters the tab as a sign-in and is never asked again", async () => {
+  const ids = {
+    jobID: "job_signin_refused_park",
+    candidateID: "cand_signin_refused_park",
+    claimID: "claim_signin_refused_park",
+    bindingID: "bind_signin_refused_park",
+  };
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID } = await refusedParkAfterWarmReturn(h, ids);
+  const internals = h.bridge as unknown as { handoffDrives: Map<string, unknown> };
+
+  expect(h.signInRecords.current).toMatchObject({
+    [ids.jobID]: { tab_id: tabID, yielded: true, daemon_held: true },
+  });
+  expect(JSON.stringify(h.signInRecords.current)).not.toContain("http");
+  const job = findByJob(h.backend.store, ids.jobID);
+  expect(job).toMatchObject({ tab_id: tabID, status: "auth_pending" });
+  expect(job?.engagement_required).not.toBe(true);
+  expect(internals.handoffDrives.size).toBe(0);
+  expect(h.tabs.snapshot(tabID)).toBeDefined();
+
+  // Two reconcile passes, the second long after the first: no second close.
+  const closesBefore = surfaceCloseRequests(h).length;
+  await h.bridge.reconcileOwnedTabs();
+  h.clock.now += 40 * 60_000;
+  await h.bridge.reconcileOwnedTabs();
+  await settle();
+  // Nor from any other path that asserts handoff_parked for this binding: the
+  // tab stands on a provider page, so only the daemon's word holds it.
+  const closing = h.bridge as unknown as {
+    closeOwnedSurface(tabID: number, disposition: SurfaceCloseDisposition): Promise<{ closed: boolean }>;
+  };
+  expect(await closing.closeOwnedSurface(tabID, "handoff_parked")).toMatchObject({ closed: false });
+  await settle();
+  expect(surfaceCloseRequests(h)).toHaveLength(closesBefore);
+  expect(h.tabs.removed).not.toContain(tabID);
+});
+
+test("after a refused park, the next provider landing arms the drive timer again as a normal drive", async () => {
+  const ids = {
+    jobID: "job_signin_refused_landing",
+    candidateID: "cand_signin_refused_landing",
+    claimID: "claim_signin_refused_landing",
+    bindingID: "bind_signin_refused_landing",
+  };
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, acked } = await refusedParkAfterWarmReturn(h, ids);
+  const internals = h.bridge as unknown as { handoffDrives: Map<string, unknown> };
+  const timersBefore = h.timers.filter((timer) => timer.ms === 180_000).length;
+  expect(internals.handoffDrives.has(ids.jobID)).toBe(false);
+
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/entitled`);
+  await ackClaimObservations(h, acked);
+  await settle();
+  expect(h.frames().filter((frame) => frame.type === "auth_returned").length).toBeGreaterThanOrEqual(2);
+  expect(internals.handoffDrives.has(ids.jobID)).toBe(true);
+  expect(h.timers.filter((timer) => timer.ms === 180_000).length).toBeGreaterThan(timersBefore);
+  expect(JSON.stringify(h.signInRecords.current)).not.toContain(ids.jobID);
+});
+
+test("an operator close racing the in-flight park request is not undone by the daemon's late refusal", async () => {
+  const ids = {
+    jobID: "job_signin_refused_race",
+    candidateID: "cand_signin_refused_race",
+    claimID: "claim_signin_refused_race",
+    bindingID: "bind_signin_refused_race",
+  };
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, acked } = await signInAtIdP(h, ids);
+  await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/interstitial`);
+  await ackClaimObservations(h, acked);
+  await settle();
+  const timeout = h.timers.filter((timer) => timer.ms === 180_000).at(-1);
+  h.clock.now += 180_000;
+  const framesBefore = h.port.posted.length;
+  const timingOut = timeout!.fn();
+  const request = await h.port.waitForFrame("surface_close_request", framesBefore);
+
+  // The operator closes the tab while the request is on the wire. A record
+  // exists for the tab by then (the surface was re-announced after the check),
+  // so the close writes the durable `closed` marker.
+  await (h.bridge as unknown as { signIn: SignInLifecycle }).signIn.surfaceOpened(
+    ids.jobID, tabID, ids.bindingID,
+  );
+  await h.tabs.userClose(tabID);
+  await settle();
+  expect(h.signInRecords.current).toMatchObject({ [ids.jobID]: { phase: "closed" } });
+  await h.port.inbound(nativeResult("surface_close_response", {
+    request_id: request.payload["request_id"],
+    outcome: "not_eligible",
+    detail: SIGNIN_IN_PROGRESS,
+  }));
+  await timingOut;
+  await settle();
+
+  const records = h.signInRecords.current as Record<string, Record<string, unknown>>;
+  expect(records[ids.jobID]?.["phase"]).toBe("closed");
+  expect(records[ids.jobID]?.["daemon_held"]).toBeUndefined();
+  expect(JSON.stringify(records)).not.toContain("daemon_held");
+  const internals = h.bridge as unknown as {
+    handoffDrives: Map<string, unknown>;
+    signIn: SignInLifecycle;
+  };
+  expect(internals.handoffDrives.size).toBe(0);
+  // The closed marker still demands an explicit open.
+  expect(await internals.signIn.offerGate(ids.jobID)).toBe("closed");
+});
+
+test("an operator close after a refused park reports owner_closed", async () => {
+  const ids = {
+    jobID: "job_signin_refused_closed",
+    candidateID: "cand_signin_refused_closed",
+    claimID: "claim_signin_refused_closed",
+    bindingID: "bind_signin_refused_closed",
+  };
+  const h = makeHarness(undefined, { windows: true });
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, acked } = await refusedParkAfterWarmReturn(h, ids);
+  await h.tabs.userClose(tabID);
+  expect(await ackClaimObservations(h, acked)).toContain("owner_closed");
+  expect(h.signInRecords.current).toMatchObject({ [ids.jobID]: { phase: "closed" } });
+});
+
 // The yield is durable: the startup scan used to re-register the retained
 // sign-in tab as a drive and spend the only slot on a person's wait.
 test("a worker restart mid-sign-in leaves the drive slot free for an unrelated paper", async () => {

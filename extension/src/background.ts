@@ -3340,6 +3340,8 @@ export class Bridge {
       liveDocumentEpoch: (tabID) => this.liveDocumentEpoch(tabID),
       requestCorrelated: (kind, payload) => this.requestCorrelated(kind, payload),
       signInHoldsTab: (tabID) => this.signIn.holdsTab(tabID),
+      signInHeld: (tabID, record, daemonRefused) =>
+        this.onSignInHeld(tabID, record, daemonRefused),
       enqueueRestartRecoveredObservation: (entry, eventKind) =>
         this.enqueueRestartRecoveredObservation(entry, eventKind),
     });
@@ -4660,13 +4662,67 @@ export class Bridge {
     this.surfaces.browserEpoch = epoch;
   }
 
+  /** A park was refused or skipped because a sign-in holds this tab. When the
+   * daemon said so, the tab re-enters the sign-in lifecycle (slot yielded
+   * durably, no URL kept). Either way the job returns to its sign-in wait:
+   * the park path may already have detached it and marked it for engagement,
+   * which would assert something the daemon just contradicted. */
+  private async onSignInHeld(
+    tabID: number,
+    record: SurfaceBirthRecord,
+    daemonRefused: boolean,
+  ): Promise<void> {
+    const jobID = record.job_id;
+    if (jobID === undefined) return;
+    const owned = (): boolean => {
+      const job = findByJob(this.store, jobID);
+      return (
+        job !== undefined &&
+        (job.tab_id === tabID || job.tab_id < 0) &&
+        this.surfaces.tabLedgerCache?.[String(tabID)]?.binding_id ===
+          record.binding_id
+      );
+    };
+    // The operator may have closed the tab while the close request was in
+    // flight (onTabRemoved forgets the ledger record and writes the `closed`
+    // marker): verify the job and the binding still own the tab BEFORE any
+    // write, so a late refusal cannot undo that.
+    if (!owned()) return;
+    if (daemonRefused) {
+      if (!(await this.signIn.reenter(jobID, tabID, record.binding_id))) return;
+      // Closed between the check and the write: onTabRemoved's own
+      // lifecycle step (queued behind this one) turns the record into the
+      // `closed` marker; nothing here touches the job or the slot.
+      if (!owned()) return;
+      this.signInYieldedDrives.add(jobID);
+      this.releaseHandoffDrive(jobID);
+    }
+    const job = findByJob(this.store, jobID);
+    if (job === undefined || !owned()) return;
+    if (
+      job.tab_id === tabID &&
+      job.engagement_required !== true &&
+      job.status === "auth_pending"
+    )
+      return;
+    await this.update((s) =>
+      patchJob(s, jobID, {
+        tab_id: tabID,
+        status: "auth_pending",
+        engagement_required: false,
+        parked_with_tab: false,
+      }),
+    );
+    await this.drainHandoffDriveQueue();
+  }
+
   /** Every Bridge close of an owned surface goes through this method, so a
    * test can substitute it and observe the disposition asserted. */
   private closeOwnedSurface(
     tabID: number,
     disposition: SurfaceCloseDisposition,
     gateOccurrenceID?: string,
-  ): Promise<{ closed: boolean }> {
+  ): Promise<{ closed: boolean; signInInProgress?: true }> {
     return this.surfaces.closeOwnedSurface(tabID, disposition, gateOccurrenceID);
   }
 
@@ -5918,7 +5974,18 @@ export class Bridge {
       // one tab per drive. Claimless handoffs short-circuit to `unclaimed`
       // before the phase switch, so this is strictly wider: nothing that
       // closed before stops closing.
-      await this.closeOwnedSurface(tabID, "handoff_parked");
+      const closed = await this.closeOwnedSurface(tabID, "handoff_parked");
+      // The daemon (or the sign-in record) says a sign-in holds this tab:
+      // signInHeld already restored the job and yielded the slot. Nothing is
+      // parked and no further close is requested.
+      if (closed.signInInProgress === true) {
+        // Idempotent when signInHeld already yielded it; when the operator
+        // closed the tab meanwhile signInHeld rightly did nothing, and this
+        // drive must not keep the slot for a tab that is gone.
+        this.releaseHandoffDrive(jobID);
+        await this.drainHandoffDriveQueue();
+        return;
+      }
       await this.parkHandoffForManual(jobID);
     }, HANDOFF_DRIVE_TIMEOUT_MS);
   }

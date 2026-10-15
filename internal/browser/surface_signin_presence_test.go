@@ -81,7 +81,9 @@ func TestSurfaceCloseHandoffParkedRefusedWhileSignInLeaseLive(t *testing.T) {
 	refused := func(label, id string) {
 		t.Helper()
 		got := handoffParkedAnswer(t, b, bindingID, id)
-		if got.Outcome != "not_eligible" || !strings.Contains(got.Detail, "sign-in is in progress") ||
+		// extension/src/signin-surface.ts (SIGN_IN_IN_PROGRESS_DETAIL) compares this
+		// detail EXACTLY to recognise the refusal, so the literal is pinned whole.
+		if got.Outcome != "not_eligible" || got.Detail != "a sign-in is in progress on this surface" ||
 			got.CloseAuthorizationID != "" || got.Nonce != "" {
 			t.Fatalf("%s: handoff_parked = %+v, want a structured not_eligible naming the live sign-in and no token", label, got)
 		}

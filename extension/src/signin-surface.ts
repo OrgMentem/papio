@@ -55,6 +55,12 @@ import { isTabAbsenceRejection } from "./surface-lifecycle";
  * sign-in, so the bound errs toward reloading. */
 export const SIGNIN_STALE_AFTER_MS = 15 * 60_000;
 
+/** The daemon's refusal detail for a handoff_parked close while a sign-in is in
+ * progress on the surface (internal/browser/bridge.go surface-close
+ * eligibility). Compared EXACTLY; the Go test pins the same literal. */
+export const SIGN_IN_IN_PROGRESS_DETAIL =
+  "a sign-in is in progress on this surface";
+
 /** chrome.idle reports "idle" after this many seconds without input.
  * Chrome's minimum is 15 and its default 60. A person reading a page
  * without touching the keyboard for a minute is not interrupted by anything
@@ -95,6 +101,9 @@ export interface SignInSurfaceRecord {
   activity_at?: number;
   /** The drive slot was yielded for the human wait (see markYielded). */
   yielded?: true;
+  /** The daemon refused a park because a sign-in is in progress here, so the
+   * tab is held whatever page it stands on (see reenter). */
+  daemon_held?: true;
 }
 
 /** Durable home of the records: chrome.storage.session in production. */
@@ -140,7 +149,8 @@ export function parseSignInSurfaces(
       (r["binding_id"] !== undefined && typeof r["binding_id"] !== "string") ||
       (r["explicit_open"] !== undefined && r["explicit_open"] !== true) ||
       (r["activity_at"] !== undefined && !finiteNumber(r["activity_at"])) ||
-      (r["yielded"] !== undefined && r["yielded"] !== true)
+      (r["yielded"] !== undefined && r["yielded"] !== true) ||
+      (r["daemon_held"] !== undefined && r["daemon_held"] !== true)
     )
       continue;
     out[key] = value as SignInSurfaceRecord;
@@ -292,6 +302,10 @@ export class SignInLifecycle {
       );
       if (record === undefined) return false;
       try {
+        // The daemon said a sign-in is in progress here (its entry lease is
+        // live): that is authoritative over where the tab happens to stand,
+        // e.g. an interstitial on the provider's own host.
+        if (record.daemon_held === true) return true;
         const tab = await this.deps.tabs.get(tabID);
         if (
           typeof tab.url === "string" &&
@@ -610,6 +624,49 @@ export class SignInLifecycle {
     await this.serialize((records) => {
       const record = records[jobID];
       if (record !== undefined && record.tab_id >= 0) record.yielded = true;
+    });
+  }
+
+  /** The daemon refused a park because a sign-in is in progress on this
+   * tab. Re-enter the tab into the lifecycle, whatever the record said (it may
+   * have been released at a landing the daemon does not count as the end of the
+   * sign-in), with the slot yielded and no URL kept. Phase follows the
+   * operator's presence now. */
+  async reenter(
+    jobID: string,
+    tabID: number,
+    bindingID?: string,
+  ): Promise<boolean> {
+    const state = await this.presence();
+    let inFront = false;
+    try {
+      inFront = (await this.deps.tabs.get(tabID)).active === true;
+    } catch (error) {
+      // A tab proven gone is the operator's close racing the refusal: the
+      // `closed` marker onTabRemoved wrote stands, and nothing re-enters.
+      if (isTabAbsenceRejection(error)) return false;
+    }
+    return this.serialize((records) => {
+      const now = this.deps.now();
+      const existing = records[jobID];
+      // The operator closing the tab while the close request was in flight
+      // already recorded that; a late refusal never overwrites it.
+      if (existing?.phase === "closed") return false;
+      const away = state !== undefined && state !== "active";
+      const binding = bindingID ?? existing?.binding_id;
+      records[jobID] = {
+        job_id: jobID,
+        tab_id: tabID,
+        ...(binding === undefined ? {} : { binding_id: binding }),
+        phase: away ? "away" : inFront ? "attended" : "open",
+        ...(away ? { away_at: now } : {}),
+        opened_at: existing?.opened_at ?? now,
+        attended: existing?.attended === true || inFront,
+        last_navigation_at: existing?.last_navigation_at ?? now,
+        yielded: true,
+        daemon_held: true,
+      };
+      return true;
     });
   }
 

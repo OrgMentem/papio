@@ -41,6 +41,15 @@ for the full pre-split extension history.
   *papio* navigates that tab to a fresh route minted by the daemon. Nothing
   closes and no second tab opens. A push approved on a phone navigates the tab
   and counts as progress whether you are present or not.
+- **The daemon's word that a sign-in is in progress holds the tab.** A sign-in
+  that returned quickly (a warm identity-provider session) can land on a
+  provider page that is not yet entitled, such as a one-click "Access through
+  your institution" step. When the drive timeout then asked to park that tab
+  and the daemon refused ("a sign-in is in progress on this surface"), *papio*
+  re-asked every five minutes for hours and marked the paper as needing you.
+  The refusal now puts the tab back into the sign-in lifecycle: the paper
+  returns to its sign-in wait, the drive slot is yielded (durably), nothing
+  asks again, and the next provider landing or your own close ends it as usual.
 - When *papio* retires a sign-in tab you were using because the daemon ended
   its request, a toast now says why.
 - The `idle` permission (no install warning; Chrome and Firefox), feature

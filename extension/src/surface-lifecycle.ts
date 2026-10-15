@@ -18,6 +18,7 @@ import {
   type SurfaceBirthRecord,
 } from "./ledger";
 import { MATERIALIZE_PAGE_PATH } from "./page-paths";
+import { SIGN_IN_IN_PROGRESS_DETAIL } from "./signin-surface";
 import {
   findByJob,
   findByTab,
@@ -140,7 +141,11 @@ function surfaceShowedPaper(purpose: string, url: string): boolean {
 interface SurfaceCloseResult {
   closed: boolean;
   removedURL?: string;
+  /** The daemon refused a handoff_parked close because a sign-in is in
+   * progress on the surface. Authoritative: the surface is a sign-in. */
+  signInInProgress?: true;
 }
+
 /** True only when a `tabs.get` rejection PROVES the tab is gone.
  *
  * Every other rejection — an invalidated extension context, a torn-down
@@ -238,6 +243,14 @@ export interface SurfaceLifecycleContext {
   /** A sign-in surface that is still the operator's to finish: no close
    * path may retire it on its own authority. */
   signInHoldsTab(tabID: number): Promise<boolean>;
+  /** A handoff_parked close was refused or skipped because a sign-in holds
+   * this surface. `daemonRefused` says the daemon, not papio's own record,
+   * said so: the surface is then (re)entered into the sign-in lifecycle. */
+  signInHeld(
+    tabID: number,
+    record: SurfaceBirthRecord,
+    daemonRefused: boolean,
+  ): Promise<void>;
   /** Report a vanished claim surface from its durable record alone. */
   enqueueRestartRecoveredObservation(
     entry: {
@@ -1315,7 +1328,7 @@ export class SurfaceLifecycle {
     tabID: number,
     disposition: SurfaceCloseDisposition,
     gateOccurrenceID?: string,
-  ): Promise<{ closed: boolean }> {
+  ): Promise<{ closed: boolean; signInInProgress?: true }> {
     await this.ctx.surfaceReady();
     const ledger = await this.snapshotTabLedger();
     const record = ledger[String(tabID)];
@@ -1328,11 +1341,19 @@ export class SurfaceLifecycle {
     if (
       disposition === "handoff_parked" &&
       (await this.ctx.signInHoldsTab(tabID))
-    )
-      return { closed: false };
+    ) {
+      await this.ctx.signInHeld(tabID, record, false);
+      return { closed: false, signInInProgress: true };
+    }
     const result = await this.inLifecycleChain(() =>
       this.closeAuthorizedRecord(tabID, record, disposition, gateOccurrenceID),
     );
+    if (result.signInInProgress === true) {
+      // The daemon's refusal is authoritative: this tab is a sign-in surface.
+      // Re-enter it into the sign-in lifecycle so nothing asks again.
+      await this.ctx.signInHeld(tabID, record, true);
+      return { closed: false, signInInProgress: true };
+    }
     // Whatever path closed it - adoption, a terminal cancel, a later pass
     // once the operator looked away - a tab that showed a paper papio just
     // filed is offered back once.
@@ -1366,7 +1387,7 @@ export class SurfaceLifecycle {
         nonce: string;
         generation: number;
       }
-    | { authorized: false; unclaimed?: true }
+    | { authorized: false; unclaimed?: true; signInInProgress?: true }
   > {
     const generation = this.ctx.holderGeneration();
     if (generation === undefined) return { authorized: false };
@@ -1391,6 +1412,12 @@ export class SurfaceLifecycle {
     // handoff tabs, still subject to every guard below.
     if (result.payload["outcome"] === "unclaimed")
       return { authorized: false, unclaimed: true };
+    if (
+      disposition === "handoff_parked" &&
+      result.payload["outcome"] === "not_eligible" &&
+      result.payload["detail"] === SIGN_IN_IN_PROGRESS_DETAIL
+    )
+      return { authorized: false, signInInProgress: true };
     if (result.payload["outcome"] !== "authorized") return { authorized: false };
     const authorizationID = result.payload["close_authorization_id"];
     const nonce = result.payload["nonce"];
@@ -1431,6 +1458,8 @@ export class SurfaceLifecycle {
       // time before the daemon could say which kind of "no" it meant.
       if (authorization.unclaimed === true)
         return this.retireOwnedSurface(tabID, record.binding_id, "unclaimed");
+      if (authorization.signInInProgress === true)
+        return { closed: false, signInInProgress: true };
       return { closed: false };
     }
     const bindingID = record.binding_id;
