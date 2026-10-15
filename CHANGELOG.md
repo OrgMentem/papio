@@ -305,6 +305,10 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **`papio bench --fixtures <dir>` now fails when the directory does not
+  exist.** A mistyped path made every work read `fixture_missing` and the
+  command exited 0, so a CI gate passed a benchmark that measured nothing. The
+  default sibling `fixtures` directory behaves as before.
 - **`papio adapter repair` outside a *papio* source checkout now fails instead
   of writing a `dev/scratch` tree.** It created the workspace in the current
   directory and exited 0 with `No applicable repair patch`. It now stops before

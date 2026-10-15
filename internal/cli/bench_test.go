@@ -70,3 +70,16 @@ func TestBenchSucceedsWhenAFixtureIsMissing(t *testing.T) {
 		t.Fatalf("bench: %v\n%s", err, out.String())
 	}
 }
+
+// A mistyped --fixtures would otherwise turn every work into fixture_missing
+// and exit 0, so the benchmark would pass having measured nothing.
+func TestBenchRefusesAMissingExplicitFixturesDirectory(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewRoot(&out, &errOut)
+	missing := filepath.Join(t.TempDir(), "no-such-fixtures")
+	root.SetArgs([]string{"bench", "--cohort", "testdata/bench-conformance-cohort.json", "--fixtures", missing})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "fixtures directory") || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("bench --fixtures <missing> = %v, want a fixtures directory error", err)
+	}
+}

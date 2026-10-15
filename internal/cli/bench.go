@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -38,6 +39,11 @@ func newBenchCommand(opt *options) *cobra.Command {
 			dir := fixturesDir
 			if dir == "" {
 				dir = bench.FixturesDirFor(cohortPath)
+			} else if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+				// An explicit --fixtures that is missing would read as
+				// fixture_missing for every work, which is a clean class,
+				// so a CI gate would pass a benchmark that measured nothing.
+				return fmt.Errorf("fixtures directory %q does not exist or is not a directory", dir)
 			}
 			report, err := bench.Run(cmd.Context(), cohort, bench.DirFixtureSet{Dir: dir})
 			if err != nil {
