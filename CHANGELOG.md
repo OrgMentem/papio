@@ -305,6 +305,17 @@ execution records kept during the initial build.
 - **Config parse errors point at the real problem.** A TOML syntax or type error
   gives its line and column instead of "unknown fields are rejected", and
   `papio doctor` suggests updating papio only for unrecognized fields.
+- **`papio adapter capture` now gives the remedy that matches why a capture was
+  refused.** Every `not_permitted` outcome told you to set `[captures] enabled =
+  true`, even when captures were already on and the real cause was a missing
+  provider host grant, missing capture consent in the extension, or an extension
+  too old to correlate. The error now includes the daemon's detail and the
+  fitting fix.
+- **`papio adapter capture --provider` rejects ids that `adapter repair` cannot
+  use.** A capture recorded as `Wiley` succeeded, but repair refused it and its
+  `--provider` hint could not help. Capture now requires a lowercase adapter id
+  such as `wiley`, and repair tells you to recapture when a stored provider is
+  not a valid adapter id.
 - **`papio bench --fixtures <dir>` now fails when the directory does not
   exist.** A mistyped path made every work read `fixture_missing` and the
   command exited 0, so a CI gate passed a benchmark that measured nothing. The

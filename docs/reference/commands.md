@@ -238,7 +238,7 @@ papio adapter capture <url> [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--provider` | `string` |  | provider adapter id |
+| `--provider` | `string` |  | provider adapter id: lowercase, such as wiley or sage |
 | `--scenario` | `string` |  | fixture scenario |
 | `--settle-ms` | `int64` | `0` | milliseconds to settle after page load (0-10000) |
 

@@ -249,7 +249,7 @@ type Receipt struct {
 // browser conditions are outcomes, not RPC failures.
 type AdapterCaptureResult = browser.CaptureResult
 
-var adapterCaptureProviderRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+var adapterCaptureProviderRE = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 
 // Router returns the complete Phase 1 local RPC surface.
 func Router(system *bootstrap.System) ipc.Router {
@@ -1056,7 +1056,7 @@ func adapterCapture(ctx context.Context, raw json.RawMessage, system *bootstrap.
 		return badParams(errors.New("url must be a bounded https URL"))
 	}
 	if !adapterCaptureProviderRE.MatchString(params.Provider) {
-		return badParams(errors.New("provider must use letters, digits, underscore, or hyphen (max 64)"))
+		return badParams(errors.New("provider must be an adapter id such as wiley or sage: lowercase, starting with a letter, then letters, digits, underscore, or hyphen (max 64)"))
 	}
 	switch params.Scenario {
 	case "success", "login-return", "no-entitlement", "drift", "terms":

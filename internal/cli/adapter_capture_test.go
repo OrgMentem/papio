@@ -89,6 +89,24 @@ func TestAdapterCaptureCommandFailsWhenNoPageWasStored(t *testing.T) {
 	}
 }
 
+func TestNotPermittedRemedyFollowsTheDetail(t *testing.T) {
+	for detail, want := range map[string]string{
+		"page capture storage is disabled":                                  "[captures] enabled = true",
+		"provider host permission is not granted":                           "extension options page",
+		"page capture transmission requires consent in settings":            "capture consent",
+		"browser extension 0.3.0 cannot correlate a capture; update to 1.0": "update the papio extension",
+		"no compatible browser session is connected":                        "papio browser sessions",
+	} {
+		got := notPermittedRemedy(detail)
+		if !strings.Contains(got, detail) || !strings.Contains(got, want) {
+			t.Errorf("remedy(%q) = %q, want the detail and %q", detail, got, want)
+		}
+		if detail != "page capture storage is disabled" && strings.Contains(got, "[captures] enabled") {
+			t.Errorf("remedy(%q) = %q, must not suggest the config edit", detail, got)
+		}
+	}
+}
+
 // Two papio binaries on one machine is documented as routine, so a new CLI
 // meeting an older daemon is an ordinary outcome. Every other versioned
 // command renders the actionable upgrade message; this one used to surface the

@@ -213,6 +213,9 @@ func resolveAdapterRepairCapture(ctx context.Context, opt *options, input, provi
 	if row.SanitizerProvenance != captures.SanitizerProvenance || row.SanitizerVersion != captures.SanitizerVersion {
 		return adapterRepairCapture{}, errors.New("stored capture has missing or unsupported sanitizer provenance")
 	}
+	if stored := strings.TrimSpace(row.AdapterID); stored != "" && !adapterRepairSegmentRE.MatchString(stored) {
+		return adapterRepairCapture{}, fmt.Errorf("capture was recorded with provider %q, which is not a valid adapter id; recapture with `papio adapter capture <url> --provider <adapter-id>`", stored)
+	}
 	provider := strings.TrimSpace(providerFlag)
 	if provider != "" && provider != strings.TrimSpace(row.AdapterID) {
 		return adapterRepairCapture{}, errors.New("provider override conflicts with daemon capture metadata")

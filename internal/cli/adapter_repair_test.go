@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"papio/internal/captures"
+	"papio/internal/config"
 )
 
 type adapterRepairRunnerFunc func(context.Context, string, string, ...string) (string, error)
@@ -409,5 +411,37 @@ func TestFindAdapterRepairRepoRootRefusesOutsideACheckout(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir("."); len(entries) != 0 {
 		t.Fatalf("working directory gained %d entries, want none", len(entries))
+	}
+}
+
+// A capture recorded with an uppercase provider can never be repaired, and
+// --provider cannot override the stored id, so the error must say to recapture.
+func TestResolveAdapterRepairCaptureExplainsAnInvalidStoredProvider(t *testing.T) {
+	row := captures.Capture{
+		Path: "/data/captures/host/capture.html", Host: "onlinelibrary.wiley.com", AdapterID: "Wiley",
+		SHA256:              strings.Repeat("a", 64),
+		SanitizerProvenance: captures.SanitizerProvenance, SanitizerVersion: captures.SanitizerVersion,
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, _ string, _ any, result any) error {
+		*result.(*[]captures.Capture) = []captures.Capture{row}
+		return nil
+	})
+	root.SetArgs([]string{"adapter", "repair", "capture.html", "--provider", "wiley", "--scenario", "success"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), `provider "Wiley"`) || !strings.Contains(err.Error(), "recapture") {
+		t.Fatalf("err = %v, want a recapture instruction naming the stored provider", err)
+	}
+}
+
+func TestAdapterCaptureRefusesANonAdapterProvider(t *testing.T) {
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(context.Context, string, any, any) error {
+		t.Fatal("an invalid provider must be refused before the daemon call")
+		return nil
+	})
+	root.SetArgs([]string{"adapter", "capture", "https://www.wiley.com/x", "--provider", "Wiley", "--scenario", "success"})
+	if err := root.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "adapter id such as wiley") {
+		t.Fatalf("err = %v, want the adapter id refusal", err)
 	}
 }
