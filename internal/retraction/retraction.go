@@ -188,6 +188,10 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	s.sweepMu.Lock()
 	defer s.sweepMu.Unlock()
 
+	// A daemon killed mid-download or mid-parse leaves its temp file behind;
+	// reclaim any from earlier attempts before starting this one.
+	s.sweepStaleTemps(time.Now())
+
 	now := s.now().UTC()
 	s.mu.Lock()
 	cached, ok := s.readCache()
@@ -739,6 +743,24 @@ func (s *Sentinel) lookup(ctx context.Context, corpus map[string]readyWork) (map
 	return updates, sourceErr, nil
 }
 
+// sweepStaleTemps removes dataset and cache temp files that an earlier,
+// interrupted attempt left in the data directory.
+func (s *Sentinel) sweepStaleTemps(start time.Time) {
+	for _, pattern := range []string{".retraction-watch-*", ".retraction-cache-*"} {
+		matches, err := filepath.Glob(filepath.Join(s.dataDir, pattern))
+		if err != nil {
+			continue
+		}
+		for _, path := range matches {
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || !info.ModTime().Before(start) {
+				continue
+			}
+			_ = os.Remove(path)
+		}
+	}
+}
+
 func (s *Sentinel) downloadDataset(ctx context.Context) (string, error) {
 	endpoint, err := url.Parse(s.baseURL)
 	if err != nil {
@@ -810,6 +832,9 @@ func (s *Sentinel) downloadDataset(ctx context.Context) (string, error) {
 	}
 	if written > s.maxBody {
 		return "", fmt.Errorf("retraction: Retraction Watch response exceeds %d-byte limit", s.maxBody)
+	}
+	if err := tmp.Sync(); err != nil {
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
 		return "", err

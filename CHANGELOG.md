@@ -311,6 +311,8 @@ execution records kept during the initial build.
   prompts, `on_ready` and managed filing. It also counted works already in
   flight as `N new papers queued` and let them use the per-run cap. The watch
   now submits once per work and skips works it already submitted before the cap.
+  next daily run removes stale `.retraction-watch-*` and `.retraction-cache-*`
+  files, and the dataset is synced to disk before it replaces the last one.
 - **The daemon no longer lets a sign-in tab be parked or re-offered under the
   operator.** The browser extension could ask to park a handoff three minutes
   after its tab opened, even while you were still signing in (away in an

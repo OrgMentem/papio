@@ -1472,3 +1472,31 @@ func TestSnapshotItemsSurfacesCorruptCache(t *testing.T) {
 		})
 	}
 }
+
+func TestRunDueSweepsStaleTemps(t *testing.T) {
+	jobs := testStore(t)
+	dir := t.TempDir()
+	stale := []string{
+		filepath.Join(dir, ".retraction-watch-123"),
+		filepath.Join(dir, ".retraction-cache-456"),
+	}
+	keep := filepath.Join(dir, "unrelated")
+	for _, path := range append([]string{keep}, stale...) {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sentinel := New(Options{
+		Store: jobs, Budgets: &recordingBudget{err: errors.New("budget exhausted")},
+		Policy: config.Source{Enabled: true}, DataDir: dir,
+	})
+	_ = sentinel.RunDue(context.Background())
+	for _, path := range stale {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale temp %s survived: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatal(err)
+	}
+}
