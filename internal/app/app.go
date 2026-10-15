@@ -4865,6 +4865,7 @@ func (s *Service) recoverMissingReadyHookForSettled(ctx context.Context) error {
 		  AND j.acquisition_disposition = 'active'
 		  AND COALESCE((SELECT t.at FROM events t
 			WHERE t.job_id = j.id AND t.kind = 'job.transition'
+			  AND json_extract(t.detail_json, '$.to') = 'ready'
 			ORDER BY t.seq DESC LIMIT 1), '') >
 			(SELECT MIN(x.at) FROM events x WHERE x.kind = 'hook.on_ready_epoch')
 		  AND NOT EXISTS (

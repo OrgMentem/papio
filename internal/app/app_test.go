@@ -3584,6 +3584,20 @@ func TestRecoverPreparedPublicationsSkipsJobsReadyBeforeHookEpoch(t *testing.T) 
 	if ran.Load() != 0 {
 		t.Fatalf("historical job fired the hook %d times", ran.Load())
 	}
+	// A later transition (ready -> imported) must not make the job look newer
+	// than the epoch: only the transition into ready counts.
+	if err := jobs.Transition(ctx, id, job.StateReady, job.StateImported, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !svc.DrainHooks(5 * time.Second) {
+		t.Fatal("hooks did not drain")
+	}
+	if ran.Load() != 0 {
+		t.Fatalf("historical job moved to imported fired the hook %d times", ran.Load())
+	}
 }
 
 // waitForHookEvents waits for at least want hook.on_ready events, then
