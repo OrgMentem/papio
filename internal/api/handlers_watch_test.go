@@ -39,6 +39,10 @@ func (s stubWatchBackend) SubmitWithAutoImport(context.Context, protocol.WorkReq
 	return "", errors.New("stub submitter must not be reached")
 }
 
+func (s stubWatchBackend) SubmitOnceWithAutoImport(context.Context, protocol.WorkRequest, *bool) (string, error) {
+	return "", errors.New("stub submitter must not be reached")
+}
+
 // watchRunnerFixture returns a system whose WatchRunner is a real runner over
 // the test's store with stubbed backends, plus one discovery watch to address.
 func watchRunnerFixture(t *testing.T, searchErr error) (system *bootstrap.System, watchID int64) {

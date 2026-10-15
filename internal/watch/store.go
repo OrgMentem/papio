@@ -398,6 +398,27 @@ func (s *Store) KnownDigestEntries(ctx context.Context, watchID int64, entries [
 	return known, nil
 }
 
+// SubmittedRequests returns the subset of request IDs that already hold a
+// once-only submission receipt, meaning a job was created for them.
+func (s *Store) SubmittedRequests(ctx context.Context, requestIDs []string) (map[string]struct{}, error) {
+	if s == nil || s.S == nil {
+		return nil, errors.New("watch store is not configured")
+	}
+	found := make(map[string]struct{})
+	for _, id := range requestIDs {
+		var jobID string
+		err := s.S.DB().QueryRowContext(ctx, `SELECT job_id FROM submission_receipts WHERE request_id=?`, id).Scan(&jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		found[id] = struct{}{}
+	}
+	return found, nil
+}
+
 // Digest returns recent alert-watch discoveries, newest first.
 func (s *Store) Digest(ctx context.Context, watchID int64, limit int) ([]DigestEntry, error) {
 	if s == nil || s.S == nil {

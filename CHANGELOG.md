@@ -305,6 +305,12 @@ execution records kept during the initial build.
   was already limited to 24 hours, but the job's own retry time was not, so a
   malformed header left the job waiting months. The job's retry time now has
   the same 24-hour limit.
+- **Acquire watches no longer re-queue works they already submitted.** A
+  discovery watch in acquire mode opened a fresh job each cadence for works
+  whose earlier job was ready, unavailable or failed, repeating sign-in
+  prompts, `on_ready` and managed filing. It also counted works already in
+  flight as `N new papers queued` and let them use the per-run cap. The watch
+  now submits once per work and skips works it already submitted before the cap.
 - **The daemon no longer lets a sign-in tab be parked or re-offered under the
   operator.** The browser extension could ask to park a handoff three minutes
   after its tab opened, even while you were still signing in (away in an

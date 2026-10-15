@@ -20,6 +20,10 @@ func (f manifestSubmitterFunc) SubmitWithAutoImport(ctx context.Context, request
 	return f(ctx, request, auto)
 }
 
+func (f manifestSubmitterFunc) SubmitOnceWithAutoImport(ctx context.Context, request protocol.WorkRequest, auto *bool) (string, error) {
+	return f(ctx, request, auto)
+}
+
 func TestRunnerAcquireInitialManifestFailureDoesNotSubmit(t *testing.T) {
 	ctx := context.Background()
 	pager := &fakePager{order: []string{"openalex"}, results: map[string][]discovery.DiscoveredWork{

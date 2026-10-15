@@ -72,6 +72,9 @@ type HoldingsLookup interface {
 // auto-import override retains the configured Zotio auto-import policy.
 type Submitter interface {
 	SubmitWithAutoImport(context.Context, protocol.WorkRequest, *bool) (string, error)
+	// SubmitOnceWithAutoImport keeps one job per request ID across terminal
+	// states, so a recurring watch never re-acquires a work it already queued.
+	SubmitOnceWithAutoImport(context.Context, protocol.WorkRequest, *bool) (string, error)
 }
 
 // BackfillQueue queues Zotio items missing PDFs through its idempotent path.
@@ -744,6 +747,27 @@ func (r *Runner) newWork(ctx context.Context, watch Watch, works []discovery.Dis
 			fresh = append(fresh, request)
 		}
 	}
+	if watch.Mode == ModeAcquire && len(fresh) > 0 {
+		// A work this watch already submitted owns a job (live, ready, or
+		// terminal) that the once-only submission will not replace. Drop it
+		// before the per-run cap so it neither takes a slot nor is announced
+		// as newly queued.
+		ids := make([]string, len(fresh))
+		for i, request := range fresh {
+			ids[i] = batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), request.Work)
+		}
+		submitted, err := r.Store.SubmittedRequests(ctx, ids)
+		if err != nil {
+			return nil, nil, err
+		}
+		kept := fresh[:0:0]
+		for i, request := range fresh {
+			if _, done := submitted[ids[i]]; !done {
+				kept = append(kept, request)
+			}
+		}
+		fresh = kept
+	}
 	if watch.Mode != ModeAlert || len(fresh) == 0 {
 		return fresh, nil, nil
 	}
@@ -990,13 +1014,13 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	result.ManifestID = manifest.ID
 	autoImport := true
 	for i := range manifest.Works {
-		// A recorded JobID is never a reason to skip submission. The request
-		// ID reconciles a still-live job to itself, while a job that reached
-		// a terminal state must be replaced — which only submission can do.
-		// A JobID carried from an earlier manifest is a record, not evidence
-		// that the job is still live, so a failed submission stays a failure.
+		// A recorded JobID is never a reason to skip submission: the request
+		// ID reconciles to the one job this watch owns for the work, and a
+		// failed submission stays a failure. The once-only path never replaces
+		// a job that reached a terminal state, so later cadences cannot
+		// re-run acquisition for a work the watch already queued.
 		request := manifest.Works[i].Work
-		jobID, err := r.Submitter.SubmitWithAutoImport(ctx, request, &autoImport)
+		jobID, err := r.Submitter.SubmitOnceWithAutoImport(ctx, request, &autoImport)
 		if err != nil {
 			manifest.Works[i].Status = "submission_failed"
 			manifest.Works[i].Error = "submit"

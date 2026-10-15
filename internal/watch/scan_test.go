@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"papio/internal/discovery"
+	"papio/internal/store"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
@@ -469,5 +470,38 @@ func TestPagedScanDeeperKnownWorkGainsDOI(t *testing.T) {
 	}
 	if got := h.pendingDOIs(t); len(got) != 1 || got[0] != "10.1000/deep" {
 		t.Fatalf("pending digest DOIs = %q; want the title-only entry to gain its DOI", got)
+	}
+}
+
+func TestAcquireWatchSkipsWorksWithSubmissionReceipt(t *testing.T) {
+	pager := &fakePager{order: []string{"openalex"}, results: map[string][]discovery.DiscoveredWork{
+		"openalex": papers("receipt", 0, 2),
+	}}
+	h := newPagedHarness(t, ModeAcquire, pager, nil)
+	if got := h.run(t).Queued; got != 2 {
+		t.Fatalf("first run queued = %d, want 2", got)
+	}
+	// The real submitter records a once-only receipt per request ID.
+	settled := h.submitter.calls[0].RequestID
+	if _, err := h.watches.S.DB().ExecContext(context.Background(), `INSERT INTO work_requests(id,created_at) VALUES(?,?)`, settled, store.FormatTime(h.now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.watches.S.DB().ExecContext(context.Background(), `INSERT INTO jobs(id,work_request_id,state,policy_json,created_at,updated_at) VALUES(?,?,?,?,?,?)`,
+		"job-settled", settled, "ready", `{}`, store.FormatTime(h.now), store.FormatTime(h.now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.watches.S.DB().ExecContext(context.Background(),
+		`INSERT INTO submission_receipts(request_id,fingerprint,job_id,created_at) VALUES(?,?,?,?)`,
+		settled, "fp", "job-settled", store.FormatTime(h.now)); err != nil {
+		t.Fatal(err)
+	}
+	before := len(h.submitter.calls)
+	if got := h.run(t).Queued; got != 1 {
+		t.Fatalf("second run queued = %d, want 1 (settled work excluded)", got)
+	}
+	for _, call := range h.submitter.calls[before:] {
+		if call.RequestID == settled {
+			t.Fatalf("settled request %s was resubmitted", settled)
+		}
 	}
 }

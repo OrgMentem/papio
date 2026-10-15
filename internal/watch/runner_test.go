@@ -561,6 +561,10 @@ func (c *countingSubmitterWithCount) SubmitWithAutoImport(ctx context.Context, r
 	return c.inner.SubmitWithAutoImport(ctx, request, auto)
 }
 
+func (c *countingSubmitterWithCount) SubmitOnceWithAutoImport(ctx context.Context, request protocol.WorkRequest, auto *bool) (string, error) {
+	return c.SubmitWithAutoImport(ctx, request, auto)
+}
+
 func TestTriageConsumeDigestsAtomicOnConflict(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)
