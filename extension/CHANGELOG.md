@@ -32,9 +32,12 @@ for the full pre-split extension history.
   sign-in creates no tab while the browser is idle or locked, or every window
   is minimized. It waits, durably across worker restarts, and opens when you
   become active or a window gains focus (or when you open it yourself).
-- **A tab you close stays closed.** After you close a sign-in tab, *papio*
-  reports it and does not open another until you ask (`papio actions open`, the
-  popup). Typing an unrelated address into a sign-in tab hands the tab to you.
+- **A tab you close stays closed, and the paper stays open.** After you close a
+  sign-in tab, *papio* reports it and does not open another until you ask
+  (`papio actions open`, the popup). It no longer reports the close as a
+  cancellation: the daemon moved the paper to `cancelled` on that report
+  (measured 2026-10-20), so there was nothing left to open by name. Typing an
+  unrelated address into a sign-in tab hands the tab to you.
 - **Back after a long absence, the same tab is refreshed.** If you return to a
   sign-in tab untouched for 15 minutes (`SIGNIN_STALE_AFTER_MS`, above the
   measured 603 s p99 return latency) and nothing navigated while you were away,

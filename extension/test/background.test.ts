@@ -5790,6 +5790,16 @@ test("a sign-in the operator closed stays closed until they open it", async () =
   expect(surfaceCloseRequests(h).map((frame) => frame.payload["disposition"])).toEqual([
     "claim_abandoned",
   ]);
+  // "The daemon keeps the action open" (ADR-0028 §6) is only true if the
+  // browser never reports the close as a cancellation: the real daemon moves
+  // a job awaiting_human -> cancelled on `provider_outcome: cancelled`, and
+  // then there is nothing left to open by name. Measured live 2026-10-20.
+  expect(
+    h.frames().filter(
+      (frame) =>
+        frame.type === "provider_outcome" && frame.job_id === ids.jobID,
+    ),
+  ).toEqual([]);
 
   // The daemon offers the candidate again. The operator is at the computer;
   // that is not enough, with presence cycling or not.

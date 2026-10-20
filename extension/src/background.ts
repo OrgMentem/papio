@@ -21865,12 +21865,12 @@ export class Bridge {
     const deliberate = this.deliberateRemovals.delete(tabID);
     // Operator close or papio's own removal: the first says the sign-in is
     // abandoned and must not be reopened on its own, the second only ends it.
-    // Started, not awaited: the lifecycle chain orders it before anything
-    // enqueued after it, and an await here only delays the ledger and job
-    // cleanup below.
-    this.signInEvent(
-      this.signIn.tabRemoved(tabID, authorizedClose || deliberate),
-    );
+    // Started, not awaited here: the lifecycle chain orders it before anything
+    // enqueued after it, and an await would only delay the ledger and job
+    // cleanup below. The result is read once, at the very end, where it
+    // decides whether the loss is a cancellation at all.
+    const heldSignIn = this.signIn.tabRemoved(tabID, authorizedClose || deliberate);
+    this.signInEvent(heldSignIn);
     const ownerBindingID = ledgerRecord?.binding_id;
     const ledgerJobID = ledgerRecord?.job_id;
     // Read before forgetLedgeredTab erases the record: after a worker
@@ -22037,7 +22037,18 @@ export class Bridge {
       await this.removeJobWithOffer(job.job_id);
       return;
     }
-    this.send("provider_outcome", { outcome: "cancelled" }, job.job_id);
+    // ADR-0028 §6: a sign-in tab the operator closes is not a cancellation.
+    // The daemon keeps the action open and `papio actions open` (or the popup)
+    // mints the next surface; the `closed` marker tabRemoved wrote above is
+    // what holds the daemon's next offer back. The record ends at
+    // auth_returned, so "it held a sign-in" is exactly "the sign-in was not
+    // over". Measured live 2026-10-20: the close sent `cancelled` and the
+    // daemon moved the job awaiting_human -> cancelled, so there was no action
+    // left to open by name. The browser still forgets the paper either way.
+    const wasSignIn = (await heldSignIn.catch(() => undefined)) !== undefined;
+    if (!wasSignIn) {
+      this.send("provider_outcome", { outcome: "cancelled" }, job.job_id);
+    }
     this.downloads.delete(job.job_id);
     this.completedDownloadTabs.delete(job.job_id);
     await this.removeJobWithOffer(job.job_id);
