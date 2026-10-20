@@ -4,7 +4,9 @@
 # trains you to --no-verify, which loses the whole layer.
 set -eu
 
-go vet ./...
+# dev/scratch/ is gitignored throwaway (AGENTS.md) and may hold half-written
+# Go that `./...` would vet, then fail on. Vet what is actually tracked.
+go vet $(go list -e ./... 2>/dev/null | grep -v '/dev/scratch/')
 
 # Cross-artifact compatibility floors (daemon<->extension version agreement,
 # manifest.json == package.json). This exact desync has broken CI before.
