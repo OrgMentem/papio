@@ -101,6 +101,19 @@ func ParseWork(data json.RawMessage) (protocol.WorkRequest, error) {
 	if envelope == nil {
 		return protocol.WorkRequest{}, fmt.Errorf("work must be a JSON object")
 	}
+	if raw, ok := envelope["schema_version"]; ok {
+		var version string
+		if err := json.Unmarshal(raw, &version); err != nil || version != protocol.WorkRequestSchemaVersion {
+			return protocol.WorkRequest{}, fmt.Errorf("schema_version %s is not %q", raw, protocol.WorkRequestSchemaVersion)
+		}
+		// A ratified work-request/1 document keeps the caller's request_id; the
+		// strict decode and Validate are the same ones the IPC path applies.
+		request, err := protocol.DecodeWorkRequest(data)
+		if err != nil {
+			return protocol.WorkRequest{}, err
+		}
+		return *request, nil
+	}
 	if _, ok := envelope["work"]; ok {
 		var discovered discoveredWorkEnvelope
 		dec := json.NewDecoder(bytes.NewReader(data))
@@ -134,6 +147,21 @@ func ParseWork(data json.RawMessage) (protocol.WorkRequest, error) {
 		return protocol.WorkRequest{}, err
 	}
 	return request, nil
+}
+
+// CheckRequestIDs refuses a request set in which one request_id names two
+// different works: the id is the caller's idempotency identity, so reusing it
+// for another work is a conflict, not a duplicate.
+func CheckRequestIDs(requests []protocol.WorkRequest) error {
+	seen := make(map[string]string, len(requests))
+	for _, request := range requests {
+		identity := workIdentity(request)
+		if prev, ok := seen[request.RequestID]; ok && prev != identity {
+			return fmt.Errorf("request_id %q names two different works (%s and %s)", request.RequestID, prev, identity)
+		}
+		seen[request.RequestID] = identity
+	}
+	return nil
 }
 
 func identifiers(input workInput) (*protocol.Identifiers, error) {
@@ -362,6 +390,9 @@ func Submit(ctx context.Context, caller Caller, dataDir string, requests []proto
 	}
 	if strings.TrimSpace(options.Collection) == "" {
 		options.Collection = strings.TrimSpace(options.Label)
+	}
+	if err := CheckRequestIDs(requests); err != nil {
+		return nil, err
 	}
 	seen := make(map[string]int, len(requests))
 	for i, req := range requests {

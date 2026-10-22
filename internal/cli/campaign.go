@@ -99,6 +99,24 @@ type campaignManifest struct {
 	Chunks             []campaignChunk        `json:"chunks"`
 }
 
+// campaignIdentifierRecords reads a one-identifier-per-line file. A campaign
+// record carries only DOI, PMID and arXiv, so ISBN and OpenAlex lines are
+// refused rather than silently dropped.
+func campaignIdentifierRecords(data []byte) ([]bibparse.Record, error) {
+	listed, err := parseIdentifierLines(data)
+	if err != nil {
+		return nil, err
+	}
+	records := make([]bibparse.Record, 0, len(listed))
+	for _, item := range listed {
+		if item.ids.ISBN != "" || item.ids.OpenAlex != "" {
+			return nil, fmt.Errorf("identifier list line %d: campaign import accepts only DOI, arXiv and PMID identifiers, not %q", item.line, item.text)
+		}
+		records = append(records, bibparse.Record{SourceKey: item.text, DOI: item.ids.DOI, PMID: item.ids.PMID, ArXiv: item.ids.ArXiv})
+	}
+	return records, nil
+}
+
 func newCampaignCommand(opt *options) *cobra.Command {
 	command := &cobra.Command{Use: "campaign", Short: "Stage a selected citation export in bounded acquisition chunks"}
 	var collection, resolver string
@@ -116,7 +134,12 @@ func newCampaignCommand(opt *options) *cobra.Command {
 			return errors.New("campaign input exceeds 8 MiB")
 		}
 		format := bibparse.Detect(args[0], data)
-		records, err := bibparse.ParseRecords(format, data)
+		var records []bibparse.Record
+		if format == bibparse.FormatJSONL && isIdentifierList(data) {
+			records, err = campaignIdentifierRecords(data)
+		} else {
+			records, err = bibparse.ParseRecords(format, data)
+		}
 		if err != nil {
 			return err
 		}

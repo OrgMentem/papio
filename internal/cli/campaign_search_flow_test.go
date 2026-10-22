@@ -202,3 +202,35 @@ func TestSearchSaveRefusesExistingSnapshotBeforeSearching(t *testing.T) {
 		t.Fatalf("existing file = %q, want it untouched", got)
 	}
 }
+
+func TestCampaignImportIdentifierList(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = t.TempDir()
+	cfg.Zotio.Executable = "zotio"
+	write := func(body string) string {
+		path := filepath.Join(t.TempDir(), "ids.txt")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	out, err := runFlow(t, cfg, &flowDaemon{}, "campaign", "import", write("# list\n10.1000/alpha\narXiv:2601.12345\n\nPMID:12345678\n"))
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	var imported struct {
+		Manifest campaignManifest `json:"manifest"`
+	}
+	if err := json.Unmarshal([]byte(out), &imported); err != nil {
+		t.Fatalf("output %q: %v", out, err)
+	}
+	if len(imported.Manifest.Works) != 3 {
+		t.Fatalf("works = %d, want 3", len(imported.Manifest.Works))
+	}
+	for _, body := range []string{"10.1000/alpha\nisbn:9780306406157\n", "10.1000/alpha\nW123456789\n"} {
+		_, err := runFlow(t, cfg, &flowDaemon{}, "campaign", "import", write(body))
+		if err == nil || !strings.Contains(err.Error(), "line 2") || !strings.Contains(err.Error(), "DOI, arXiv and PMID") {
+			t.Fatalf("import %q: err = %v, want line 2 refusal", body, err)
+		}
+	}
+}

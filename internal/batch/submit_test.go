@@ -913,3 +913,47 @@ func TestSubmitNamesFailingWorkByInputPosition(t *testing.T) {
 		}
 	}
 }
+
+const workRequestDoc = `{"schema_version":"work-request/1","request_id":"caller-req-0001","identifiers":{"doi":"10.1000/example"},"resolver":"library"}`
+
+func TestParseWorkAcceptsWorkRequestAndKeepsRequestID(t *testing.T) {
+	for i := 0; i < 2; i++ {
+		request, err := ParseWork([]byte(workRequestDoc))
+		if err != nil {
+			t.Fatalf("ParseWork work-request/1 (call %d): %v", i+1, err)
+		}
+		if request.RequestID != "caller-req-0001" || request.Resolver != "library" || request.Identifiers.DOI != "10.1000/example" {
+			t.Fatalf("request = %#v", request)
+		}
+	}
+}
+
+func TestParseWorkRejectsInvalidWorkRequest(t *testing.T) {
+	for _, data := range []string{
+		`{"schema_version":"work-request/2","request_id":"caller-req-0001","identifiers":{"doi":"10.1000/example"}}`,
+		`{"schema_version":"work-request/1","request_id":"short","identifiers":{"doi":"10.1000/example"}}`,
+		`{"schema_version":"work-request/1","request_id":"caller-req-0001","doi":"10.1000/example"}`,
+		`{"schema_version":"work-request/1","request_id":"caller-req-0001"}`,
+	} {
+		if _, err := ParseWork([]byte(data)); err == nil {
+			t.Fatalf("ParseWork(%s) succeeded", data)
+		}
+	}
+}
+
+func TestCheckRequestIDsRejectsConflictingWork(t *testing.T) {
+	a, err := ParseWork([]byte(workRequestDoc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseWork([]byte(strings.Replace(workRequestDoc, "10.1000/example", "10.1000/other", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckRequestIDs([]protocol.WorkRequest{a, a}); err != nil {
+		t.Fatalf("same work under same request_id rejected: %v", err)
+	}
+	if err := CheckRequestIDs([]protocol.WorkRequest{a, b}); err == nil {
+		t.Fatal("one request_id for two works accepted")
+	}
+}

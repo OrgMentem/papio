@@ -37,6 +37,7 @@
     "collection": { "type": "string", "maxLength": 200 },
     "desired_version": { "enum": ["published", "accepted", "preprint", "any"] },
     "access_mode_override": { "enum": ["conservative", "assisted", "delegated"] },
+    "resolver": { "type": "string", "description": "Name of the configured resolver profile to use for this request." },
     "max_cost_usd": { "type": "number", "minimum": 0 },
     "sources_allow": { "type": "array", "items": { "type": "string", "maxLength": 100 }, "maxItems": 50 },
     "sources_deny": { "type": "array", "items": { "type": "string", "maxLength": 100 }, "maxItems": 50 }

@@ -40,7 +40,7 @@ papio acquire [identifier] [flags]
 | `--arxiv` | `string` |  | arXiv ID |
 | `--author` | `stringSlice` | `[]` | author (repeatable) |
 | `--auto-import` | `bool` | `false` | plan and apply zotio import automatically when ready |
-| `--batch` | `string` |  | submit works from a JSONL, RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB file (or - for standard input) |
+| `--batch` | `string` |  | submit works from a JSONL, RIS, BibTeX, CSL-JSON, MEDLINE/NBIB, or one-identifier-per-line file (or - for standard input) |
 | `--collection` | `string` |  | target Zotero collection name (key when used with --from-zotio) |
 | `--consumer` | `string` |  | name the submitting consumer, for per-consumer accounting on a shared daemon |
 | `--deny-source` | `stringSlice` | `[]` | deny this source (repeatable) |

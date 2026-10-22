@@ -134,8 +134,9 @@ One line each; run `papio <command> --help` for the full flag set.
 - **`acquire <identifier>`** — One work. Prefer explicit `--doi`/`--pmid`/`--arxiv`/`--isbn`/
   `--openalex`, or `--title` + repeatable `--author` + `--year`. `--wait` blocks until
   terminal or human action; `--label` records query context.
-- **`acquire --batch <file>`** — Up to 50 works from JSONL, RIS, BibTeX, CSL-JSON, or
-  MEDLINE/NBIB (`-` reads stdin). The reliable way to ingest a discovery interface's own
+- **`acquire --batch <file>`** — Up to 50 works from JSONL, RIS, BibTeX, CSL-JSON,
+  MEDLINE/NBIB, or a plain list with one DOI, arXiv id, or PMID per line (`#` comments
+  allowed; `-` reads stdin). The reliable way to ingest a discovery interface's own
   export.
 - **`acquire --from-zotio`** — Queue Zotero items that have no attached PDF (`--limit`).
   It refuses `--auto-import`, `--wait`, `--force`, `--resolver`, and every one-work

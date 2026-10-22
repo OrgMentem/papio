@@ -219,7 +219,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.IntVar(&queueLimit, "limit", 25, "maximum zotio items to queue")
 	flags.Int64Var(&fromDigest, "from-digest", 0, "queue pending entries from an alert watch; queued works are set to import into Zotero automatically when ready")
 	flags.StringArrayVar(&digestKeys, "keys", nil, "digest work key to queue (repeatable)")
-	flags.StringVar(&batchPath, "batch", "", "submit works from a JSONL, RIS, BibTeX, CSL-JSON, or MEDLINE/NBIB file (or - for standard input)")
+	flags.StringVar(&batchPath, "batch", "", "submit works from a JSONL, RIS, BibTeX, CSL-JSON, MEDLINE/NBIB, or one-identifier-per-line file (or - for standard input)")
 	flags.BoolVar(&includeOwned, "include-owned", false, "with --batch, submit works already carrying a PDF in zotio")
 	flags.StringVar(&label, "label", "", "query context; also the default target collection when --collection is unset")
 	flags.BoolVar(&autoImport, "auto-import", false, "plan and apply zotio import automatically when ready")
@@ -516,6 +516,9 @@ func parseBatchInput(path string, reader io.Reader) ([]protocol.WorkRequest, err
 	}
 	format := ingest.Detect(path, data)
 	if format == ingest.FormatJSONL {
+		if isIdentifierList(data) {
+			return parseIdentifierList(data)
+		}
 		return parseBatch(bytes.NewReader(data))
 	}
 	requests, err := ingest.Parse(format, data)
@@ -527,6 +530,34 @@ func parseBatchInput(path string, reader io.Reader) ([]protocol.WorkRequest, err
 	}
 	if len(requests) == 0 {
 		return nil, fmt.Errorf("batch contains no works")
+	}
+	return requests, nil
+}
+
+// parseIdentifierList turns a one-identifier-per-line file into work requests
+// through the same batch.ParseWork canonicalization as every other format.
+func parseIdentifierList(data []byte) ([]protocol.WorkRequest, error) {
+	listed, err := parseIdentifierLines(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(listed) == 0 {
+		return nil, fmt.Errorf("batch contains no works")
+	}
+	if len(listed) > 50 {
+		return nil, fmt.Errorf("batch exceeds maximum of 50 works")
+	}
+	requests := make([]protocol.WorkRequest, 0, len(listed))
+	for _, item := range listed {
+		encoded, err := json.Marshal(item.ids)
+		if err != nil {
+			return nil, err
+		}
+		request, err := parseBatchWork(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("identifier list line %d: %w", item.line, err)
+		}
+		requests = append(requests, request)
 	}
 	return requests, nil
 }

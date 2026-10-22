@@ -366,3 +366,54 @@ func TestAcquireSubmitFallsBackToLegacyDaemon(t *testing.T) {
 		t.Fatalf("legacy forced request ID = %q, want fresh id distinct from %q", fallbackID, requestedID)
 	}
 }
+
+const identifierListFixture = "# reading list\n10.1000/Alpha\n\nhttps://doi.org/10.1000/Beta\narXiv:2601.12345v2\n  PMID: 12345678  \nhttps://pubmed.ncbi.nlm.nih.gov/87654321/\n"
+
+func TestParseBatchInputIdentifierList(t *testing.T) {
+	requests, err := parseBatchInput("dois.txt", strings.NewReader(identifierListFixture))
+	if err != nil {
+		t.Fatalf("parseBatchInput: %v", err)
+	}
+	if len(requests) != 5 {
+		t.Fatalf("requests = %d, want 5", len(requests))
+	}
+	want := []protocol.Identifiers{{DOI: "10.1000/alpha"}, {DOI: "10.1000/beta"}, {ArXiv: "2601.12345v2"}, {PMID: "12345678"}, {PMID: "87654321"}}
+	for i, request := range requests {
+		if request.Identifiers == nil || *request.Identifiers != want[i] {
+			t.Fatalf("request %d identifiers = %#v, want %#v", i, request.Identifiers, want[i])
+		}
+	}
+}
+
+func TestParseBatchInputIdentifierListRefusesWholeFile(t *testing.T) {
+	for name, input := range map[string]string{
+		"bare ten digits": "10.1000/ok\n1234567890\n",
+		"unparseable":     "10.1000/ok\n10.1000/also-ok\nnot an identifier\n",
+	} {
+		_, err := parseBatchInput("list.txt", strings.NewReader(input))
+		lines := strings.Count(strings.TrimSpace(input), "\n") + 1
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("line %d", lines)) {
+			t.Fatalf("%s: error = %v, want line %d", name, err, lines)
+		}
+	}
+}
+
+func TestParseBatchInputIdentifierListRefusesMoreThanFifty(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 51; i++ {
+		fmt.Fprintf(&b, "10.1000/item%d\n", i)
+	}
+	if _, err := parseBatchInput("list.txt", strings.NewReader(b.String())); err == nil || !strings.Contains(err.Error(), "maximum of 50") {
+		t.Fatalf("error = %v, want batch size rejection", err)
+	}
+}
+
+func TestParseBatchInputJSONLStillJSONLWhenFirstByteIsBrace(t *testing.T) {
+	requests, err := parseBatchInput("works.txt", strings.NewReader(batchJSONLFixture))
+	if err != nil || len(requests) != 2 {
+		t.Fatalf("requests = %d, err = %v; want the 2 JSONL works", len(requests), err)
+	}
+	if _, err := parseBatchInput("works.txt", strings.NewReader("{\"doi\":\"10.1000/ok\"}\n10.1000/bare\n")); err == nil || !strings.Contains(err.Error(), "batch line 2") {
+		t.Fatalf("error = %v, want JSONL line error", err)
+	}
+}

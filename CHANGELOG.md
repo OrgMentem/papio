@@ -16,6 +16,7 @@ execution records kept during the initial build.
 - **A DOI or OpenAthens handoff now names your library to the browser.** The offer for a DOI route (`https://doi.org/…` or the OpenAthens redirector) already listed the publisher hosts. It now also lists your library's resolver host, last, as the LibKey route already did. The extension uses it to find the library whose live session may release the paper; without it a fresh publisher-first paper was accepted as queued with no tab. No new field crosses the native-messaging wire.
 
 ### Added
+- **`papio acquire --batch` and `papio campaign import` read a plain list of identifiers.** Put one DOI, `doi.org` URL, `arXiv:` id, `PMID:` id or PubMed URL on each line. Blank lines and `#` comment lines are skipped. One line that cannot be read refuses the whole file and names the line number; a bare ten-digit line stays an error. `campaign import` refuses ISBN and OpenAlex lines. Batch input also accepts a `work-request/1` document and keeps its `request_id`, and `protocol/work-request-v1.schema.json` now lists the `resolver` field.
 - **MCP agents can follow a long acquisition through `papio_changes`.** The
   new read-only tool returns the durable job events after a cursor, oldest
   first, with `next_seq` and `truncated`. Pass `next_seq` back as `after_seq`
