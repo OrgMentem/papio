@@ -252,7 +252,7 @@ func (r *Runner) submitDigestEntriesLocked(ctx context.Context, watchID int64, e
 		}
 	}
 	for _, entry := range consumedEntries {
-		if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+		if err := consume(ctx, watchID, entry); err != nil {
 			return 0, err
 		}
 	}
