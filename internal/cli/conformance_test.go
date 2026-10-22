@@ -226,6 +226,7 @@ var commandClassification = map[string]commandClass{
 	"papio artifacts get":              {kind: kindStructured, rpcMethods: []string{"artifacts.get"}},
 	"papio artifacts locate":           {kind: kindStructured, rpcMethods: []string{"artifacts.locate"}},
 	"papio artifacts validation":       {kind: kindStructured, rpcMethods: []string{"artifacts.validation"}},
+	"papio artifacts text":             {kind: kindStructured, rpcMethods: []string{"artifacts.text_v1"}},
 	"papio bundle":                     {kind: kindNone},
 	"papio bundle export":              {kind: kindStructured, rpcMethods: []string{"bundle.export_v2", "bundle.export"}},
 	"papio bundle document":            {kind: kindStructured, rpcMethods: []string{"bundle.document"}},

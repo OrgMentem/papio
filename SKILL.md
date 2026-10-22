@@ -188,6 +188,9 @@ retryable and a removed watch takes its schedule with it. Confirm before either.
   parse, text extraction, identity decision, kept *and* rejected candidates.
 - **`artifacts get <job-id>` / `artifacts locate <job-id>`** — The validated artifact row,
   and where its bytes are on disk.
+- **`artifacts text <job-id> [--pages 2-3] [--max-bytes N]`** — The paper's extracted text
+  (Poppler `pdftotext`, no OCR), at most 128 KiB per call; page through it with `--pages`
+  when `truncated` is true. Only `ready` or `imported` jobs qualify.
 - **`adapter diagnose <job-id>`** — Sanitized support report for a provider interaction.
 - **`stats`** — Lifetime totals by access basis.
 

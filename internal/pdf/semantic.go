@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -196,6 +197,125 @@ func runTextTool(parent context.Context, timeout time.Duration, limit int64, bin
 		return "", err
 	}
 	return stdout.String(), nil
+}
+
+// MaxTextBytes is the most extracted text one page-range read returns. It is
+// sized from JSON's worst case, not from the typical page: the text is
+// untrusted, and a byte that escapes (a control character, an invalid UTF-8
+// byte, <, > or &) costs up to six bytes on the wire. 128 KiB of such bytes is
+// 768 KiB, which leaves headroom for the envelope under ipc.MaxResultBytes
+// (1 MiB). A page of prose is a few KiB, so one read still spans dozens of
+// pages; the page range is the paging mechanism.
+const MaxTextBytes = 128 << 10
+
+// pageTextToolLimit bounds what pdftotext may emit for one read before the
+// output is cut to the requested byte cap. It is the memory bound; the byte
+// cap is the response bound.
+const pageTextToolLimit = 8 << 20
+
+var (
+	// ErrToolUnavailable means pdftotext is not installed. It is a missing
+	// capability, never an empty extraction.
+	ErrToolUnavailable = errors.New("pdftotext is not installed")
+	// ErrInvalidPageRange means the requested pages are not inside the document.
+	ErrInvalidPageRange = errors.New("invalid page range")
+	// ErrTextTooLarge means pdftotext produced more than the tool limit; a
+	// narrower page range avoids it.
+	ErrTextTooLarge = errors.New("extracted text is too large; request a narrower page range")
+)
+
+// PageTextRequest selects pages and a byte cap for ExtractPageText. Zero
+// FirstPage means page 1, zero LastPage means "to the end", and zero MaxBytes
+// means MaxTextBytes. PagesTotal is the document's page count when known (0
+// when unknown); it validates and clamps the range.
+type PageTextRequest struct {
+	FirstPage  int
+	LastPage   int
+	PagesTotal int
+	MaxBytes   int
+}
+
+// PageText is one bounded page-range read. OCR is never used.
+type PageText struct {
+	Text       string
+	FirstPage  int
+	LastPage   int
+	PagesTotal int
+	Chars      int64
+	Truncated  bool
+}
+
+// ExtractPageText runs pdftotext over a page range through runTextTool, so it
+// keeps the same timeout and process-tree kill as validation. When the text
+// exceeds the byte cap it is cut on a rune boundary, Truncated is set, and
+// LastPage names the page the cut fell in so the caller can resume there.
+func ExtractPageText(ctx context.Context, path string, cap Capability, opt SemanticOptions, req PageTextRequest) (PageText, error) {
+	if cap.PDFToText == "" {
+		return PageText{}, ErrToolUnavailable
+	}
+	opt = normalizedSemanticOptions(opt)
+	first, last := req.FirstPage, req.LastPage
+	if first < 0 || last < 0 || (last != 0 && first > last) {
+		return PageText{}, fmt.Errorf("%w: pages %d-%d", ErrInvalidPageRange, first, last)
+	}
+	if first == 0 {
+		first = 1
+	}
+	if req.PagesTotal > 0 {
+		if first > req.PagesTotal {
+			return PageText{}, fmt.Errorf("%w: page %d is past the last page (%d)", ErrInvalidPageRange, first, req.PagesTotal)
+		}
+		if last == 0 || last > req.PagesTotal {
+			last = req.PagesTotal
+		}
+	}
+	maxBytes := req.MaxBytes
+	if maxBytes <= 0 || maxBytes > MaxTextBytes {
+		maxBytes = MaxTextBytes
+	}
+	args := []string{}
+	if first > 1 || last != 0 {
+		args = append(args, "-f", strconv.Itoa(first))
+	}
+	if last != 0 {
+		args = append(args, "-l", strconv.Itoa(last))
+	}
+	args = append(args, path, "-")
+	text, err := runTextTool(ctx, opt.Timeout, max(opt.MaxOutputBytes, pageTextToolLimit), cap.PDFToText, args...)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, context.DeadlineExceeded) {
+			return PageText{}, ctxErr
+		}
+		if strings.HasPrefix(err.Error(), "tool output exceeds") {
+			return PageText{}, ErrTextTooLarge
+		}
+		return PageText{}, err
+	}
+	result := PageText{FirstPage: first, PagesTotal: req.PagesTotal}
+	if len(text) > maxBytes {
+		cut := maxBytes
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut]
+		result.Truncated = true
+		result.LastPage = first + strings.Count(text, "\f")
+	} else {
+		pages := strings.Count(text, "\f")
+		if text != "" && !strings.HasSuffix(text, "\f") {
+			pages++
+		}
+		result.LastPage = last
+		if result.LastPage == 0 {
+			result.LastPage = first + max(pages, 1) - 1
+		}
+		if result.PagesTotal == 0 && first == 1 && req.LastPage == 0 {
+			result.PagesTotal = result.LastPage
+		}
+	}
+	result.Text = text
+	result.Chars = int64(utf8.RuneCountInString(text))
+	return result, nil
 }
 
 func textReport(text string, ocr bool, opt SemanticOptions) TextReport {

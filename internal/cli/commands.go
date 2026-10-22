@@ -25,6 +25,7 @@ import (
 	"papio/internal/incident"
 	"papio/internal/ipc"
 	"papio/internal/job"
+	"papio/internal/pdf"
 	"papio/internal/store"
 	"papio/internal/work"
 )
@@ -1557,10 +1558,124 @@ func newArtifactsCommand(opt *options) *cobra.Command {
 			return nil
 		},
 	}
+	var textPages string
+	var textMaxBytes int
+	var textSHA bool
+	text := &cobra.Command{
+		Use:         "text <job-id-or-sha256>",
+		Short:       "Print the extracted text of a validated artifact, one page range at a time",
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		Long: "Print the text of a validated artifact, extracted by the daemon's bounded\n" +
+			"pdftotext (the same tool, timeout and process-tree kill validation uses).\n" +
+			"No OCR runs: ocr_used is always false, so a scanned PDF yields little or no text.\n\n" +
+			"Only the artifact of a job in state ready or imported is served. A job in any\n" +
+			"other state, a quarantined file, a hash held only by jobs that are not ready or\n" +
+			"imported, and an unknown hash are each refused with a distinct error.\n\n" +
+			"One read returns at most 131072 bytes (128 KiB) of text, a limit chosen so the\n" +
+			"JSON-escaped result always fits the daemon's 1 MiB result cap. --max-bytes may\n" +
+			"lower that limit, never raise it. Page ranges are the paging mechanism: when\n" +
+			"truncated is true, read on from last_page with --pages <last_page>-<end>.\n\n" +
+			"  --pages 2-3     pages 2 and 3\n" +
+			"  --pages 5       page 5 only\n" +
+			"  --sha256        treat the argument as an artifact hash, not a job id\n\n" +
+			"--json prints {text, first_page, last_page, pages_total, chars, truncated,\n" +
+			"ocr_used}. Without --json the text is printed with terminal control characters\n" +
+			"removed (the text comes from an untrusted file); --json keeps it byte-exact.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			params := map[string]any{"job_id": args[0]}
+			if textSHA {
+				params = map[string]any{"sha256": args[0]}
+			}
+			resumeEnd := 0
+			if cmd.Flags().Changed("pages") {
+				first, last, err := parsePageRange(textPages)
+				if err != nil {
+					return err
+				}
+				params["first_page"], params["last_page"] = first, last
+				resumeEnd = last
+			}
+			if cmd.Flags().Changed("max-bytes") {
+				if textMaxBytes < 1 || textMaxBytes > pdf.MaxTextBytes {
+					return fmt.Errorf("--max-bytes must be between 1 and %d", pdf.MaxTextBytes)
+				}
+				params["max_bytes"] = textMaxBytes
+			}
+			var result api.ArtifactTextResult
+			if err := opt.call(cmd.Context(), "artifacts.text_v1", params, &result); err != nil {
+				if isUnknownMethod(err) {
+					return daemonUpgradeRequired("artifacts.text_v1")
+				}
+				return err
+			}
+			if opt.jsonOutput {
+				return opt.printJSON(result)
+			}
+			if _, err := io.WriteString(opt.out, printableText(result.Text)); err != nil {
+				return err
+			}
+			if result.Truncated {
+				if resumeEnd == 0 {
+					resumeEnd = result.PagesTotal
+				}
+				resume := strconv.Itoa(result.LastPage)
+				if resumeEnd > result.LastPage {
+					resume += "-" + strconv.Itoa(resumeEnd)
+				}
+				_, err := fmt.Fprintf(opt.errOut,
+					"text truncated at the %d-byte limit inside page %d of %d; continue with --pages %s\n",
+					pdf.MaxTextBytes, result.LastPage, result.PagesTotal, resume)
+				return err
+			}
+			return nil
+		},
+	}
+	text.Flags().StringVar(&textPages, "pages", "", "page range to read, a-b or a (default: the whole document, up to the byte limit)")
+	text.Flags().IntVar(&textMaxBytes, "max-bytes", pdf.MaxTextBytes, "lower the per-read byte limit (never above 131072)")
+	text.Flags().BoolVar(&textSHA, "sha256", false, "interpret argument as an artifact hash")
 	command.AddCommand(locate)
 	command.AddCommand(get)
 	command.AddCommand(validation)
+	command.AddCommand(text)
 	return command
+}
+
+// parsePageRange reads --pages: "a-b" or a single page "a", both 1-based.
+func parsePageRange(value string) (first, last int, err error) {
+	bad := fmt.Errorf("--pages %q: want a page number or a range like 2-3 (1-based, first <= last)", value)
+	from, to, isRange := strings.Cut(value, "-")
+	first, err = strconv.Atoi(from)
+	if err != nil || first < 1 {
+		return 0, 0, bad
+	}
+	if !isRange {
+		return first, first, nil
+	}
+	last, err = strconv.Atoi(to)
+	if err != nil || last < first {
+		return 0, 0, bad
+	}
+	return first, last, nil
+}
+
+// printableText prepares untrusted extracted text for a terminal. Line
+// structure survives: store.StripTerminalControls removes newlines and tabs
+// along with the real controls, so it runs per line, and a page break becomes
+// a blank line rather than vanishing into the next page's first word.
+func printableText(text string) string {
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(text, "\f", "\n\n"), "\n")
+	for i, line := range lines {
+		lines[i] = store.StripTerminalControls(line)
+	}
+	out := strings.Join(lines, "\n")
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	return out
 }
 
 func newBundleCommand(opt *options) *cobra.Command {

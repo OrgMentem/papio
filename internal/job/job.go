@@ -2667,6 +2667,44 @@ func (js *Store) GetArtifact(ctx context.Context, sha string) (*Artifact, error)
 	return &a, nil
 }
 
+// ArtifactHolderStates lists the distinct states of every job that holds the
+// artifact with this hash, as its main artifact or as any component. The
+// result is sorted and empty when no job holds it.
+func (js *Store) ArtifactHolderStates(ctx context.Context, sha string) ([]string, error) {
+	rows, err := js.S.DB().QueryContext(ctx, `
+		SELECT DISTINCT state FROM (
+			SELECT j.state AS state FROM jobs j WHERE j.artifact_sha256 = ?
+			UNION
+			SELECT j.state AS state FROM job_artifacts ja JOIN jobs j ON j.id = ja.job_id WHERE ja.artifact_sha256 = ?
+		) ORDER BY state`, sha, sha)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var states []string
+	for rows.Next() {
+		var state string
+		if err := rows.Scan(&state); err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	return states, rows.Err()
+}
+
+// IsQuarantinedSHA reports whether a human action holds a file with this hash
+// in quarantine. A quarantined file is untrusted bytes awaiting review, not an
+// artifact.
+func (js *Store) IsQuarantinedSHA(ctx context.Context, sha string) (bool, error) {
+	var one int
+	err := js.S.DB().QueryRowContext(ctx,
+		`SELECT 1 FROM human_actions WHERE quarantine_sha256 = ? LIMIT 1`, sha).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // CandidateForArtifact returns the accepted candidate provenance for one job's
 // artifact. The job's own selection wins, but only when it is genuinely
 // accepted; otherwise a content-hash scan recovers the acquisition that did

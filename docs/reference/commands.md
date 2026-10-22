@@ -321,6 +321,41 @@ Print where one job's validated artifact bytes live
 papio artifacts locate <job-id>
 ```
 
+### `papio artifacts text`
+
+Print the extracted text of a validated artifact, one page range at a time
+
+Print the text of a validated artifact, extracted by the daemon's bounded
+pdftotext (the same tool, timeout and process-tree kill validation uses).
+No OCR runs: ocr_used is always false, so a scanned PDF yields little or no text.
+
+Only the artifact of a job in state ready or imported is served. A job in any
+other state, a quarantined file, a hash held only by jobs that are not ready or
+imported, and an unknown hash are each refused with a distinct error.
+
+One read returns at most 131072 bytes (128 KiB) of text, a limit chosen so the
+JSON-escaped result always fits the daemon's 1 MiB result cap. --max-bytes may
+lower that limit, never raise it. Page ranges are the paging mechanism: when
+truncated is true, read on from last_page with --pages <last_page>-<end>.
+
+  --pages 2-3     pages 2 and 3
+  --pages 5       page 5 only
+  --sha256        treat the argument as an artifact hash, not a job id
+
+--json prints {text, first_page, last_page, pages_total, chars, truncated,
+ocr_used}. Without --json the text is printed with terminal control characters
+removed (the text comes from an untrusted file); --json keeps it byte-exact.
+
+```
+papio artifacts text <job-id-or-sha256> [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--max-bytes` | `int` | `131072` | lower the per-read byte limit (never above 131072) |
+| `--pages` | `string` |  | page range to read, a-b or a (default: the whole document, up to the byte limit) |
+| `--sha256` | `bool` | `false` | interpret argument as an artifact hash |
+
 ### `papio artifacts validation`
 
 Print the full validation report for every candidate a job validated

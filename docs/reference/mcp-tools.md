@@ -44,6 +44,27 @@ per-method MCP tools exist.
 For an accepted main component, the bundle is the canonical provenance document;
 the receipt is the canonical job outcome and component inventory for every state.
 
+### Reading a paper's text
+
+`papio_command_run` with `"name": "artifacts text"` returns the extracted text of a
+validated artifact, so an agent does not have to parse the PDF itself. It is
+read-only. The argument is a job id, or an artifact hash with the `sha256` flag.
+The result is `{text, first_page, last_page, pages_total, chars, truncated,
+ocr_used}`.
+
+- One call returns at most 131072 bytes (128 KiB) of text. That limit is
+  chosen so the JSON-escaped result always fits the daemon's 1 MiB result cap.
+  The `max-bytes` flag can lower it, never raise it.
+- Page ranges are the paging mechanism. Pass `"pages": "2-3"` (or `"5"`). When
+  `truncated` is `true`, read on from `last_page`.
+- `ocr_used` is always `false`. A scanned PDF with no text layer returns little
+  or no text; *papio* does not run OCR for this command.
+- Only the artifact of a job in state `ready` or `imported` is served. A job in
+  any other state, a quarantined file, a hash held only by jobs that are not
+  ready or imported, and an unknown hash are each refused with a distinct
+  `error_class`. A daemon host without `pdftotext` (Poppler) answers
+  `artifact_text_tool_unavailable`, never an empty success.
+
 For example, applying a zotio plan uses the command facade rather than a
 standalone zotio tool:
 

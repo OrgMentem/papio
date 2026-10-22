@@ -526,6 +526,9 @@ func RouterWithShutdown(system *bootstrap.System, shutdown context.CancelFunc) i
 		"artifacts.validation": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return validationReports(ctx, raw, system)
 		},
+		"artifacts.text_v1": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
+			return artifactText(ctx, raw, system)
+		},
 		"bundle.document": func(ctx context.Context, raw json.RawMessage) ([]byte, *ipc.RPCError) {
 			return bundleDocument(ctx, raw, system)
 		},
