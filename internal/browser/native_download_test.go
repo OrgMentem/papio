@@ -429,6 +429,60 @@ func TestNativeDownloadRetryRepublishesAfterPublishFailure(t *testing.T) {
 	}
 }
 
+// A publish that links the file but finishes after its budget expired reports
+// a timeout. The admission is already durable and the bytes are already in the
+// job folder, so the next import of the same observation must still ingest
+// them rather than park the reservation as deferred until it expires. The
+// directory poll cannot rescue it here: an unrelated file in the job folder
+// makes a scan ambiguous, so only the import's own republish can finish.
+func TestNativeDownloadRetryIngestsPublishThatFinishesAfterTimeout(t *testing.T) {
+	b, jobs, id, source, p := nativeAttempt(t)
+	arm := nativeArm(t, b, id, p)
+	if arm.Outcome != "armed" {
+		t.Fatal(arm)
+	}
+	body := adoptionProbePDF(handoffWork().DOI)
+	path := filepath.Join(source, "late.pdf")
+	writeAdoptionProbeFile(t, path, body)
+
+	budget, publish := nativeIOBudget, publishNativeFile
+	t.Cleanup(func() { nativeIOBudget, publishNativeFile = budget, publish })
+	nativeIOBudget = 100 * time.Millisecond
+	var slow atomic.Bool
+	slow.Store(true)
+	publishNativeFile = func(r *nativeDownloadRoot, ctx context.Context, jobID, filename string, f nativeStagedFile) error {
+		err := publish(r, ctx, jobID, filename, f)
+		if err == nil && slow.Load() {
+			if err := os.WriteFile(filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID, "unrelated.pdf"), body, 0o600); err != nil {
+				t.Error(err)
+			}
+			<-ctx.Done() // link done; finish only after the caller gave up
+		}
+		return err
+	}
+	obs := nativeObservation(p, arm, path, len(body))
+	if got := nativeImport(t, b, id, obs); got.Outcome != "deferred" {
+		t.Fatalf("timed-out publish result=%+v, want deferred", got)
+	}
+	slow.Store(false)
+	// The late worker releases the gate once it has handed back its result.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(b.nativeGate()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("late publish worker never finished")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	obs.RequestID = "native-import-after-timeout"
+	if got := nativeImport(t, b, id, obs); got.Outcome != "ready" {
+		row, _ := jobs.Get(context.Background(), id)
+		t.Fatalf("retry after late publish=%+v state=%+v, want ready", got, row)
+	}
+	if _, err := os.Stat(filepath.Join(source, "papio", nativeStagePrefix+arm.ReservationID+nativeStageSuffix)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging survived ingest: %v", err)
+	}
+}
+
 // Successes share one bridge, holder and clock window. Each must leave room for
 // new work without discarding duplicate receipts before capacity is needed.
 func TestNativeDownloadTerminalReceiptCapacity(t *testing.T) {

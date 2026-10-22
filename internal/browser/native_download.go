@@ -90,6 +90,14 @@ func (b *Bridge) nativeAuthority(ctx context.Context, sessionID, jobID string, p
 	return b.currentGenericDriveAuthority(ctx, sessionID, jobID, p.DriveAttemptID, *p.Ordinal, p.Strategy, p.Revision)
 }
 
+// nativeIOBudget bounds one stage or publish worker. publishNativeFile is the
+// publish step; both are variables only so tests can drive a publish that
+// completes after its budget expired.
+var (
+	nativeIOBudget    = 5 * time.Second
+	publishNativeFile = (*nativeDownloadRoot).publish
+)
+
 // boundedNativeIO is single-flight for the lifetime of the underlying syscall,
 // not merely for the caller's wait. A timed-out worker can clean up its result,
 // but never admits source bytes. Only previously admitted staging may be
@@ -313,6 +321,9 @@ func (b *Bridge) rebindNativeDownload(ctx context.Context, sessionID, jobID stri
 type nativeStageResult struct {
 	root *nativeDownloadRoot
 	file nativeStagedFile
+	// published marks staging whose bytes already sit in the job folder, so a
+	// republish only has to ingest them.
+	published bool
 }
 
 func cleanupNativeStage(r nativeStageResult) {
@@ -387,13 +398,13 @@ func (b *Bridge) importNativeDownload(ctx context.Context, sessionID, jobID stri
 	r.root = nil // worker exclusively owns the handles until it returns
 	gate, maxBytes := b.nativeGate(), b.cfg.Fetch.MaxBytes
 	b.mu.Unlock()
-	stage, err := boundedNativeIO(ctx, gate, 5*time.Second, func(ctx context.Context) (nativeStageResult, error) {
+	stage, err := boundedNativeIO(ctx, gate, nativeIOBudget, func(ctx context.Context) (nativeStageResult, error) {
 		f, e := root.stage(ctx, p.SourcePath, r.record.ReservationID, p.SizeBytes, maxBytes)
 		if e != nil {
 			root.close()
 			return nativeStageResult{}, e
 		}
-		return nativeStageResult{root, f}, nil
+		return nativeStageResult{root: root, file: f}, nil
 	}, cleanupNativeStage)
 	b.mu.Lock()
 	r.busy = false
@@ -455,21 +466,34 @@ func (b *Bridge) publishNativeStage(ctx context.Context, jobID string, r *native
 		}
 		go cleanupNativeStage(s)
 	}
-	kept, err := boundedNativeIO(ctx, gate, 5*time.Second, func(ctx context.Context) (nativeStageResult, error) {
-		if err := staged.root.publish(ctx, jobID, filename, staged.file); err != nil {
-			return staged, err
+	kept := staged
+	var err error
+	if !staged.published {
+		// The worker keeps the staging after a successful link: a caller
+		// that timed out cannot tell success from failure, so the staging
+		// must survive in either case until an ingest settles the receipt.
+		// retain also owns the result of a worker that finishes late.
+		kept, err = boundedNativeIO(ctx, gate, nativeIOBudget, func(ctx context.Context) (nativeStageResult, error) {
+			if err := publishNativeFile(staged.root, ctx, jobID, filename, staged.file); err != nil {
+				return staged, err
+			}
+			published := staged
+			published.published = true
+			return published, nil
+		}, retain)
+		if errors.Is(err, errNativeIOBusy) {
+			kept = staged
 		}
-		cleanupNativeStage(staged)
-		return nativeStageResult{}, nil
-	}, retain)
-	if errors.Is(err, errNativeIOBusy) {
-		kept = staged
 	}
-	retain(kept)
 	if err == nil {
 		_, err = b.ingestAdoptedFile(ctx, jobID, filename, nil, &r.record.Producer)
 	}
 	finalOutcome, finalReason := b.nativeImportOutcome(ctx, jobID, r.digest, err == nil)
+	if finalOutcome != "" {
+		cleanupNativeStage(kept)
+	} else {
+		retain(kept)
+	}
 	b.mu.Lock()
 	r.busy = false
 	if finalOutcome != "" {

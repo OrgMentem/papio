@@ -3328,42 +3328,39 @@ func TestExplicitOpenCandidateRecoveryStopsAfterOutcome(t *testing.T) {
 	}
 }
 
+// An open recorded while no browser holds the session is recovered by the
+// first sync of a fresh daemon, but only when the operator's CLI or the paced
+// drive issued it (ADR-0009, amended 2026-09-23): a restart between the pacer's
+// open and the browser's answer must not drop the paper the pacer waits on, and
+// an agent-issued open must not gain durable restart recovery.
 func TestExplicitOpenWithoutHolderRecoversCandidateOnFirstSync(t *testing.T) {
-	b, jobs, cfg, _ := newBridge(t)
-	ctx := context.Background()
-	id := parkInstitutional(t, jobs, "durable-open-offline", handoffWork(), "")
-	if queued, live, err := b.FocusHandoffs(ctx, []string{id}); err != nil || live || queued != 0 {
-		t.Fatalf("offline open = queued %d live %v err %v", queued, live, err)
-	}
-	if err := jobs.RecordEvent(ctx, id, "handoff.opened", map[string]any{"principal": "cli"}); err != nil {
-		t.Fatal(err)
-	}
-	fresh := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
-	msgs, _ := runSync(t, fresh, materializationHello(t))
-	offer := firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer)
-	if offer == nil || offer.JobID != id {
-		t.Fatalf("offline explicit open was not offered on the first sync: %v", msgs)
-	}
-}
-
-// The paced drive's open is an explicit open too (ADR-0009, amended
-// 2026-09-23): a daemon restart between the pacer's open and the browser's
-// answer must not drop the paper the pacer is waiting on.
-func TestPacedOpenRecoversAfterDaemonRestart(t *testing.T) {
-	b, jobs, cfg, _ := newBridge(t)
-	ctx := context.Background()
-	id := parkInstitutional(t, jobs, "durable-paced-open", handoffWork(), "")
-	if queued, live, err := b.FocusHandoffs(ctx, []string{id}); err != nil || live || queued != 0 {
-		t.Fatalf("offline open = queued %d live %v err %v", queued, live, err)
-	}
-	if err := jobs.RecordEvent(ctx, id, "handoff.opened", map[string]any{"principal": job.PacerPrincipal}); err != nil {
-		t.Fatal(err)
-	}
-	fresh := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
-	msgs, _ := runSync(t, fresh, materializationHello(t))
-	offer := firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer)
-	if offer == nil || offer.JobID != id {
-		t.Fatalf("paced open was not offered after a restart: %v", msgs)
+	for _, tc := range []struct {
+		principal string
+		offered   bool
+	}{
+		{"cli", true},
+		{job.PacerPrincipal, true},
+		{string(job.PrincipalMCP), false},
+	} {
+		t.Run(tc.principal, func(t *testing.T) {
+			b, jobs, cfg, _ := newBridge(t)
+			ctx := context.Background()
+			id := parkInstitutional(t, jobs, "durable-open-offline-"+tc.principal, handoffWork(), "")
+			if queued, live, err := b.FocusHandoffs(ctx, []string{id}); err != nil || live || queued != 0 {
+				t.Fatalf("offline open = queued %d live %v err %v", queued, live, err)
+			}
+			if err := jobs.RecordEvent(ctx, id, "handoff.opened", map[string]any{"principal": tc.principal}); err != nil {
+				t.Fatal(err)
+			}
+			fresh := NewBridge(jobs, b.svc, b.triage, b.watchRunner, b.preview, b.captureStore, b.holdings, b.zotio, cfg, b.Version)
+			// Isolate explicit recovery from the separate automatic claim scheduler.
+			fresh.Features = []string{institutionalMaterializationFeature, effectPermitFeature}
+			msgs, _ := runSync(t, fresh, materializationHello(t))
+			offer := firstOfType(msgs, protocol.MsgInstitutionalCandidateOffer)
+			if got := offer != nil && offer.JobID == id; got != tc.offered {
+				t.Fatalf("candidate offer after restart for principal %q = %v, want %v; frames: %v", tc.principal, got, tc.offered, msgs)
+			}
+		})
 	}
 }
 
@@ -15356,20 +15353,42 @@ func TestQueuedReofferDoesNotNeedTheSessionLock(t *testing.T) {
 	}
 }
 
-func TestEffectPermitReconcileOutboundExactIdentity(t *testing.T) {
-	b, jobs, _, _ := newBridge(t)
+// startedGenericPermit parks a job under a holder that can drive generic
+// permits, starts the ordinal-0 generic drive epoch and returns the held permit
+// it minted. A start outcome other than "started" fails with that outcome.
+func startedGenericPermit(t *testing.T, b *Bridge, jobs *job.Store, name string) (string, *job.EffectPermit) {
+	t.Helper()
 	effectPermitHolder(t, b)
-	id := park(t, jobs, "reconcile-outbound", handoffWork())
-	attempt := "reconcile-attempt-0001"
-	domain := "domain-reconcile"
-	effectPermitOffer(t, jobs, id, attempt, domain)
-	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
+	id := park(t, jobs, name, handoffWork())
+	attempt := name + "-attempt"
+	effectPermitOffer(t, jobs, id, attempt, "domain-"+name)
+	frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	if err != nil {
 		t.Fatalf("start err=%v", err)
+	}
+	if got := permitOutcome(t, frames); got != "started" {
+		t.Fatalf("start outcome=%q, want started", got)
 	}
 	permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
 	if err != nil || permit == nil {
-		t.Fatal(err)
+		t.Fatalf("permit=%+v err=%v", permit, err)
 	}
+	return id, permit
+}
+
+// noDispatchReconcileResponse is the browser's answer that nothing was
+// dispatched, downloaded, acknowledged or left open for the permit.
+func noDispatchReconcileResponse(t *testing.T, jobID, requestID, permitID, outcome string) json.RawMessage {
+	t.Helper()
+	return inFrame(t, protocol.MsgEffectPermitReconcileResponse, jobID, map[string]any{
+		"request_id": requestID, "permit_id": permitID, "outcome": outcome,
+		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
+	})
+}
+
+func TestEffectPermitReconcileOutboundExactIdentity(t *testing.T) {
+	b, jobs, _, _ := newBridge(t)
+	_, permit := startedGenericPermit(t, b, jobs, "reconcile-outbound")
 	msgs, _ := runSyncAs(t, b, b.arbitration.holderSession().ID)
 	req := firstOfType(msgs, protocol.MsgEffectPermitReconcileRequest)
 	if req == nil {
@@ -15379,7 +15398,7 @@ func TestEffectPermitReconcileOutboundExactIdentity(t *testing.T) {
 	if !ok {
 		t.Fatalf("payload type %T", req.Payload)
 	}
-	if payload.PermitID != permit.ID || payload.EffectKind != string(job.EffectKindGenericDrive) || payload.DriveAttemptID != attempt || payload.Ordinal == nil || *payload.Ordinal != 0 || payload.Strategy != "generic" || payload.Revision != "1" {
+	if payload.PermitID != permit.ID || payload.EffectKind != string(job.EffectKindGenericDrive) || payload.DriveAttemptID != permit.DriveAttemptID || payload.Ordinal == nil || *payload.Ordinal != 0 || payload.Strategy != "generic" || payload.Revision != "1" {
 		t.Fatalf("reconcile request identity mismatch: %+v vs permit %+v", payload, permit)
 	}
 	// No sensitive fields.
@@ -15409,21 +15428,10 @@ func nextEffectPermitReconcileRequest(t *testing.T, b *Bridge) *protocol.EffectP
 
 func TestEffectPermitReconcileNoDispatchBecomesUnknown(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	effectPermitHolder(t, b)
-	id := park(t, jobs, "reconcile-unknown", handoffWork())
-	attempt := "reconcile-unknown-attempt"
-	effectPermitOffer(t, jobs, id, attempt, "domain-unknown")
-	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
-		t.Fatal(err)
-	}
-	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	id, permit := startedGenericPermit(t, b, jobs, "reconcile-unknown")
 	request := nextEffectPermitReconcileRequest(t, b)
 	// no-dispatch observation -> unknown_completion
-	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
-
-		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
-		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
-	})
+	resp := noDispatchReconcileResponse(t, id, request.RequestID, permit.ID, "recorded")
 	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if got.Status != job.EffectPermitUnknownCompletion {
@@ -15432,14 +15440,7 @@ func TestEffectPermitReconcileNoDispatchBecomesUnknown(t *testing.T) {
 }
 func TestEffectPermitReconcileReplySurvivesInterveningPolls(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	effectPermitHolder(t, b)
-	id := park(t, jobs, "reconcile-unknown", handoffWork())
-	attempt := "reconcile-unknown-attempt"
-	effectPermitOffer(t, jobs, id, attempt, "domain-unknown")
-	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
-		t.Fatal(err)
-	}
-	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	id, permit := startedGenericPermit(t, b, jobs, "reconcile-unknown")
 	request := nextEffectPermitReconcileRequest(t, b)
 	// Ordinary polls may overtake a slow browser response. They must not
 	// invalidate the sole request the browser is already answering.
@@ -15450,11 +15451,7 @@ func TestEffectPermitReconcileReplySurvivesInterveningPolls(t *testing.T) {
 		t.Fatalf("pending requests=%d", len(b.effectPermitReconciles))
 	}
 	// no-dispatch observation -> unknown_completion
-	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
-
-		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
-		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
-	})
+	resp := noDispatchReconcileResponse(t, id, request.RequestID, permit.ID, "recorded")
 	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if got.Status != job.EffectPermitUnknownCompletion {
@@ -15463,31 +15460,13 @@ func TestEffectPermitReconcileReplySurvivesInterveningPolls(t *testing.T) {
 }
 func TestEffectPermitReconcileReplacementHolderClassifiesHistoricalPermit(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	effectPermitHolder(t, b)
-	id := park(t, jobs, "reconcile-replacement-holder", handoffWork())
-	attempt := "reconcile-replacement-attempt"
-	effectPermitOffer(t, jobs, id, attempt, "domain-replacement-holder")
-	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{
-		DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1",
-	}); err != nil || permitOutcome(t, frames) != "started" {
-		t.Fatalf("start err=%v frames=%v", err, frames)
-	}
-	permit, err := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{
-		JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt,
-		Ordinal: 0, Strategy: "generic", Revision: "1",
-	})
-	if err != nil || permit == nil {
-		t.Fatalf("permit=%+v err=%v", permit, err)
-	}
+	id, permit := startedGenericPermit(t, b, jobs, "reconcile-replacement-holder")
 	request := nextEffectPermitReconcileRequest(t, b)
 	// A replacement holder answers the request after its generation changes.
 	// The bridge correlates the current request, while the store classifies
 	// the historical permit using its stored generation.
 	b.arbitration.setGenerationForTest(77)
-	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
-		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "recorded",
-		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
-	})
+	resp := noDispatchReconcileResponse(t, id, request.RequestID, permit.ID, "recorded")
 	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 	got, err := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if err != nil || got == nil || got.Status != job.EffectPermitUnknownCompletion {
@@ -15497,14 +15476,7 @@ func TestEffectPermitReconcileReplacementHolderClassifiesHistoricalPermit(t *tes
 
 func TestEffectPermitReconcileDispatchedRemainsHeld(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	effectPermitHolder(t, b)
-	id := park(t, jobs, "reconcile-held-dispatched", handoffWork())
-	attempt := "reconcile-held-attempt"
-	effectPermitOffer(t, jobs, id, attempt, "domain-held")
-	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
-		t.Fatal(err)
-	}
-	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	id, permit := startedGenericPermit(t, b, jobs, "reconcile-held-dispatched")
 	for _, obs := range []map[string]any{
 		{"outcome": "recorded", "dispatched": true, "download_present": false, "acknowledged": false, "tab_present": false},
 		{"outcome": "recorded", "dispatched": false, "download_present": true, "acknowledged": false, "tab_present": false},
@@ -15527,19 +15499,9 @@ func TestEffectPermitReconcileDispatchedRemainsHeld(t *testing.T) {
 
 func TestEffectPermitReconcileNonTermsSettledProofDoesNotRelease(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	effectPermitHolder(t, b)
-	id := park(t, jobs, "reconcile-settled", handoffWork())
-	attempt := "reconcile-settled-attempt"
-	effectPermitOffer(t, jobs, id, attempt, "domain-settled")
-	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
-		t.Fatal(err)
-	}
-	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	id, permit := startedGenericPermit(t, b, jobs, "reconcile-settled")
 	request := nextEffectPermitReconcileRequest(t, b)
-	resp := inFrame(t, protocol.MsgEffectPermitReconcileResponse, id, map[string]any{
-		"request_id": request.RequestID, "permit_id": permit.ID, "outcome": "settled",
-		"dispatched": false, "download_present": false, "acknowledged": false, "tab_present": false,
-	})
+	resp := noDispatchReconcileResponse(t, id, request.RequestID, permit.ID, "settled")
 	runSyncAs(t, b, b.arbitration.holderSession().ID, resp)
 	got, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	if got.Status != job.EffectPermitHeld {
@@ -15549,14 +15511,7 @@ func TestEffectPermitReconcileNonTermsSettledProofDoesNotRelease(t *testing.T) {
 
 func TestEffectPermitReconcileStaleOrWrongIDNoMutation(t *testing.T) {
 	b, jobs, _, _ := newBridge(t)
-	effectPermitHolder(t, b)
-	id := park(t, jobs, "reconcile-stale", handoffWork())
-	attempt := "reconcile-stale-attempt"
-	effectPermitOffer(t, jobs, id, attempt, "domain-stale")
-	if frames, err := b.providerDriveEpochStart(context.Background(), id, &protocol.ProviderDriveEpochStartRequestPayload{DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"}); err != nil || permitOutcome(t, frames) != "started" {
-		t.Fatal(err)
-	}
-	permit, _ := jobs.GetEffectPermitByIdentity(context.Background(), job.EffectPermitIdentity{JobID: id, Kind: job.EffectKindGenericDrive, DriveAttemptID: attempt, Ordinal: 0, Strategy: "generic", Revision: "1"})
+	id, permit := startedGenericPermit(t, b, jobs, "reconcile-stale")
 	before, _ := jobs.GetEffectPermit(context.Background(), permit.ID)
 	request := nextEffectPermitReconcileRequest(t, b)
 	// stale outcome must not mutate

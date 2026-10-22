@@ -23,6 +23,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/pdf"
+	"papio/internal/protocol"
 	"papio/internal/work"
 )
 
@@ -67,7 +68,12 @@ func adoptionTestFileInfo(t *testing.T, path string) os.FileInfo {
 // A real, one-page PDF with an uncompressed text stream, large enough for the
 // production payload gate. No personal library or external tool is needed.
 func adoptionProbePDF(doi string) []byte {
-	text := "BT /F1 12 Tf 50 700 Td (An Institutional Paper DOI: " + doi + ") Tj ET\n"
+	return adoptionProbeTextPDF("An Institutional Paper DOI: " + doi)
+}
+
+// adoptionProbeTextPDF is a valid one-page PDF whose plain text layer is line.
+func adoptionProbeTextPDF(line string) []byte {
+	text := "BT /F1 12 Tf 50 700 Td (" + line + ") Tj ET\n"
 	objects := []string{
 		"<< /Type /Catalog /Pages 2 0 R >>",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -277,6 +283,82 @@ func TestAdoptionProbeWrongWorkStillNeedsReview(t *testing.T) {
 	}
 	if len(actions) != 1 || actions[0].Kind != "verify_identity" {
 		t.Fatalf("wrong work did not receive identity review: %+v", actions)
+	}
+}
+
+// An identity rejection of an adopted file trips the handoff domain the job was
+// last offered into, so the same wrong paper is not offered again. A file that
+// is rejected for another reason, or a job never offered into a domain, trips
+// nothing. Both adoption routes record the latch.
+func TestAdoptionWrongWorkLatchesOfferedDomain(t *testing.T) {
+	const domain = "institution:wrong-work.example.edu"
+	for _, route := range []string{"sweep", "download_complete"} {
+		for _, tc := range []struct {
+			name    string
+			body    []byte
+			domain  string
+			state   string
+			latched bool
+		}{
+			{"wrong work in offered domain", adoptionProbeTextPDF("Notes on Pruning Orchard Trees"), domain, job.StateAwaitingHuman, true},
+			{"wrong work without offered domain", adoptionProbeTextPDF("Notes on Pruning Orchard Trees"), "", job.StateAwaitingHuman, false},
+			{"truncated PDF in offered domain", []byte("%PDF-1.4\n"), domain, job.StateAwaitingHuman, false},
+		} {
+			t.Run(route+"/"+tc.name, func(t *testing.T) {
+				b, jobs, cfg, _ := newBridge(t)
+				b.svc.Validate = adoptionProbeValidate
+				ctx := context.Background()
+				runSync(t, b, hello())
+				id := park(t, jobs, "wr_latch_adoption", handoffWork())
+				offer := map[string]any{"requires_auth": false}
+				if tc.domain != "" {
+					offer["safety_domain"] = tc.domain
+				}
+				if err := jobs.RecordEvent(ctx, id, "browser.handoff_offered", offer); err != nil {
+					t.Fatal(err)
+				}
+				writeAdoptionProbeFile(t, filepath.Join(cfg.EffectiveAdoptionRoot(), id, "paper.pdf"), tc.body)
+				if route == "sweep" {
+					if err := b.SweepAdoptions(ctx); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					runSync(t, b, inFrame(t, protocol.MsgDownloadComplete, id, map[string]any{
+						"download_id": 7, "filename": "paper.pdf", "size_bytes": len(tc.body),
+					}))
+				}
+				row, err := jobs.Get(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if row.State != tc.state {
+					ev, _ := jobs.Events(ctx, id)
+					for _, e := range ev {
+						t.Logf("EV %v", e)
+					}
+					t.Fatalf("state=%+v err=%v, want %s", row, err, tc.state)
+				}
+				var want []map[string]any
+				if tc.latched {
+					want = []map[string]any{{"kind": "no_positive_effects", "safety_domain": domain}}
+				}
+				var got []map[string]any
+				for _, event := range latchEvents(t, jobs, id) {
+					detail, _ := event["detail"].(map[string]any)
+					got = append(got, detail)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("latch events = %v, want %v", got, want)
+				}
+				// A later adoption cycle must not stack a duplicate latch.
+				if err := b.recordAdoptionConclusiveLatch(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+				if n := len(latchEvents(t, jobs, id)); n != len(want) {
+					t.Fatalf("latch events after repeat = %d, want %d", n, len(want))
+				}
+			})
+		}
 	}
 }
 
