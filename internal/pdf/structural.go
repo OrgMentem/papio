@@ -481,14 +481,10 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	if b.limit <= 0 {
 		b.limit = 1
 	}
-	remaining := b.limit + 1 - int64(b.Len())
-	if remaining <= 0 {
-		b.exceeded = true
-		return original, nil
-	}
+	remaining := b.limit - int64(b.Len())
 	if int64(len(p)) > remaining {
 		b.exceeded = true
-		p = p[:remaining]
+		p = p[:max(remaining, 0)]
 	}
 	_, _ = b.Buffer.Write(p)
 	return original, nil

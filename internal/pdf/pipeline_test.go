@@ -340,7 +340,7 @@ func TestValidatePipelineTextToolFailureBecomesReview(t *testing.T) {
 func TestValidatePipelineMetadataContextErrorPropagates(t *testing.T) {
 	worker, workerRan := structuralTool(t, `{"Valid":true,"Pages":1}`)
 	text, textRan := textTool(t, pipelineDocument("Deterministic validation of scholarly article identity.\n"))
-	info, crossRan, metaRan := pipelineInfoTool(t, 1, pipelinePacket, "sleep 30")
+	info, crossRan, metaRan := pipelineInfoTool(t, 1, pipelinePacket, "exec sleep 30")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

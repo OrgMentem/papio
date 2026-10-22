@@ -1402,3 +1402,28 @@ func TestIdentityParksATitleQuotedOrDashedInsideACitingSentence(t *testing.T) {
 		t.Fatalf("evidence = %v, want the printed-title park named", dashed.Evidence)
 	}
 }
+
+// identityBylineBytes is measured, not chosen: over 1560 mismatched pairs 2 KiB
+// admitted none and 4 KiB admitted two. The window is therefore pinned from
+// above as well: evidence printed past it, still inside page one, stays unread.
+func TestIdentityBylineWindowUpperBound(t *testing.T) {
+	target := work.Work{
+		DOI: "10.1234/cal.7", Year: 2025,
+		Title:   "Sensor Network Calibration Under Adverse Weather",
+		Authors: []string{"Priya Natarajan"},
+	}
+	header := "Sensor Network Calibration Under Adverse Weather\nPriya Natarajan\n2025\n"
+	// Roughly 2.1 KiB of neutral prose puts the next line past the byline window
+	// and well inside the 4 KiB page-one window.
+	padding := strings.Repeat("Field measurements were logged across the deployment window. ", 38)
+
+	text := header + padding + "\nErratum: Sensor Network Calibration Under Adverse Weather\n"
+	offset := strings.Index(text, "Erratum:")
+	if offset < identityBylineBytes || offset >= identityPageOneBytes {
+		t.Fatalf("fixture drifted: marker sits at byte %d, want inside [%d, %d) — past the byline window and inside page one", offset, identityBylineBytes, identityPageOneBytes)
+	}
+	got := MatchIdentity(text+"doi:10.1234/cal.7\n", target)
+	if strings.Contains(strings.Join(got.Evidence, " "), "marks a correction") {
+		t.Fatalf("evidence = %v, want a marker past the byline window ignored", got.Evidence)
+	}
+}

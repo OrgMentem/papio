@@ -66,3 +66,31 @@ func writePDFWithPages(t *testing.T, pages int) string {
 	}
 	return path
 }
+
+// The cap is inclusive: exactly limit bytes fit, one more byte is an overflow.
+func TestCappedBufferExceededBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		writes   []int
+		exceeded bool
+		kept     int
+	}{
+		{"under", []int{3}, false, 3},
+		{"exactly limit", []int{4}, false, 4},
+		{"limit plus one", []int{5}, true, 4},
+		{"split to limit", []int{2, 2}, false, 4},
+		{"split past limit", []int{4, 1}, true, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := cappedBuffer{limit: 4}
+			for _, n := range tc.writes {
+				if got, err := b.Write(make([]byte, n)); err != nil || got != n {
+					t.Fatalf("Write(%d) = %d, %v", n, got, err)
+				}
+			}
+			if b.exceeded != tc.exceeded || b.Len() != tc.kept {
+				t.Fatalf("exceeded=%v len=%d, want %v %d", b.exceeded, b.Len(), tc.exceeded, tc.kept)
+			}
+		})
+	}
+}
