@@ -11,6 +11,7 @@ import (
 
 	"papio/internal/job"
 	"papio/internal/notify"
+	"papio/internal/store"
 )
 
 // errReminderRouteCrash stands in for a kill between the pass's Route and its
@@ -36,7 +37,7 @@ func openReminderActionKind(t *testing.T, svc *Service, jobs *job.Store, request
 		t.Fatal(err)
 	}
 	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE human_actions SET created_at = ? WHERE id = ?`,
-		createdAt.UTC().Format(time.RFC3339Nano), actionID); err != nil {
+		store.FormatTime(createdAt), actionID); err != nil {
 		t.Fatal(err)
 	}
 	return actionID, row.ID
@@ -286,19 +287,20 @@ func TestActionReminderNamesOnlyActionsRecordedThisPass(t *testing.T) {
 func TestActionReminderReachesOldestJobBeyondMaintenancePage(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	svc, jobs, sink := newReminderTestService(t, &now)
+	seedNewerMaintenancePage(t, svc, jobs, "wr_reminder_new", now)
 	_, oldestJobID := openReminderAction(t, svc, jobs, "wr_reminder_oldest_page", now.Add(-8*time.Hour), true)
 	ctx := context.Background()
 	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
-		now.Add(-48*time.Hour).Format(time.RFC3339Nano), oldestJobID); err != nil {
+		store.FormatTime(now.Add(-48*time.Hour)), oldestJobID); err != nil {
 		t.Fatal(err)
 	}
-	seedNewerMaintenancePage(t, svc, jobs, "wr_reminder_new", now, now.Add(-time.Minute))
 
 	if err := svc.ActionReminder().RunDue(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.reminders) != 1 {
-		t.Fatalf("reminders = %q, want the oldest action beyond a newest-first page", sink.reminders)
+	want := "1 paper has been waiting 8h for your institution sign-in — run: papio actions open"
+	if len(sink.reminders) != 1 || sink.reminders[0] != want {
+		t.Fatalf("reminders = %q, want only the oldest action beyond a newer full page", sink.reminders)
 	}
 }
 

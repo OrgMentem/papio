@@ -76,7 +76,7 @@ func TestProbeRevivalSkipsStaleRows(t *testing.T) {
 	h.svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{current, busy}}, Policy: config.Source{Enabled: true}}}
 	h.now = h.now.Add(8 * 24 * time.Hour)
 	h.fetched = nil
-	if _, err := h.jobs.S.DB().Exec(`UPDATE jobs SET retry_at = ? WHERE id = ?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), row.ID); err != nil {
+	if _, err := h.jobs.S.DB().Exec(`UPDATE jobs SET retry_at = ? WHERE id = ?`, store.FormatTime(time.Now().Add(-time.Minute)), row.ID); err != nil {
 		t.Fatal(err)
 	}
 	h.process(row.ID)

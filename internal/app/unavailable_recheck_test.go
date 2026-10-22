@@ -11,6 +11,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/job"
 	"papio/internal/protocol"
+	"papio/internal/store"
 )
 
 func TestUnavailableRecheck(t *testing.T) {
@@ -42,7 +43,7 @@ func TestUnavailableRecheck(t *testing.T) {
 		if err := jobs.Transition(context.Background(), id, job.StateResolving, job.StateUnavailable, nil, job.WithTerminalReason(reason)); err != nil {
 			t.Fatalf("terminalize %s: %v", id, err)
 		}
-		if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE jobs SET updated_at = ? WHERE id = ?`, updatedAt.Format(time.RFC3339Nano), id); err != nil {
+		if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE jobs SET updated_at = ? WHERE id = ?`, store.FormatTime(updatedAt), id); err != nil {
 			t.Fatalf("backdate %s: %v", id, err)
 		}
 		return id

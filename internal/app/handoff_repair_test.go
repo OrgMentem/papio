@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -43,7 +44,7 @@ func strandedNeedsReviewJob(t *testing.T, svc *Service, jobs *job.Store, request
 func setHandoffRepairUpdatedAt(t *testing.T, jobs *job.Store, jobID string, at time.Time) {
 	t.Helper()
 	if _, err := jobs.S.DB().ExecContext(context.Background(), `UPDATE jobs SET updated_at = ? WHERE id = ?`,
-		at.UTC().Format(time.RFC3339Nano), jobID); err != nil {
+		store.FormatTime(at), jobID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -276,7 +277,7 @@ func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
 				}
 				if _, err := jobs.S.DB().ExecContext(ctx,
 					`UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ?`,
-					now.Add(-time.Second).Format(time.RFC3339Nano), olderHandoffID); err != nil {
+					store.FormatTime(now.Add(-time.Second)), olderHandoffID); err != nil {
 					t.Fatal(err)
 				}
 				handoffID, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
@@ -286,7 +287,7 @@ func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
 				}
 				if _, err := jobs.S.DB().ExecContext(ctx,
 					`UPDATE human_actions SET status = 'resolved', resolved_at = ? WHERE id = ?`,
-					now.Format(time.RFC3339Nano), handoffID); err != nil {
+					store.FormatTime(now), handoffID); err != nil {
 					t.Fatal(err)
 				}
 				if err := jobs.Transition(ctx, row.ID, job.StateResolving, job.StateNeedsReview,
@@ -375,7 +376,7 @@ func TestHandoffRepairerHealsStrandedNeedsReview(t *testing.T) {
 		setHandoffRepairUpdatedAt(t, jobs, row.ID, now.Add(-strandedNeedsReviewMinAge-time.Second))
 		if _, err := jobs.S.DB().ExecContext(ctx,
 			`UPDATE jobs SET lease_owner = ?, lease_expires_at = ? WHERE id = ?`,
-			"adopt-in-progress", now.Add(time.Minute).Format(time.RFC3339Nano), row.ID); err != nil {
+			"adopt-in-progress", store.FormatTime(now.Add(time.Minute)), row.ID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -475,34 +476,81 @@ func TestHandoffRepairerLeavesLateAdoptionLeaseUntouched(t *testing.T) {
 
 // seedNewerMaintenancePage fills one full ListOldest page (job.ListLimitMax
 // jobs) with awaiting_human jobs that each hold an open institutional handoff
-// action and are all newer than now, so a consumer that only reads the first
-// page never reaches an older park. The filler jobs are moved to awaiting_human
-// directly: only their state, age and open action matter to a page-reach test,
-// and the per-job transitions dominated its -race time. A non-zero
-// actionCreatedAt also stamps each filler action's age.
-func seedNewerMaintenancePage(t *testing.T, svc *Service, jobs *job.Store, prefix string, now, actionCreatedAt time.Time) {
+// action, opened a minute before now so none is due, and are all newer than
+// now, so a consumer that only reads the first page never reaches an older
+// park. Callers create that older park afterwards, so insertion order cannot
+// stand in for age. Filler 0 is submitted and given its action through the
+// real store paths; fillers 1..N-1 are set-based copies of its rows, each with
+// its own request, job id, DOI and age: 500 service-level submissions
+// dominated the -race time of every test that needs the page.
+func seedNewerMaintenancePage(t *testing.T, svc *Service, jobs *job.Store, prefix string, now time.Time) {
 	t.Helper()
 	ctx := context.Background()
-	for i := range job.ListLimitMax {
-		id, err := svc.Submit(ctx, doiRequestFor(fmt.Sprintf("%s_%03d", prefix, i)))
-		if err != nil {
+	seedID, err := svc.Submit(ctx, doiRequestFor(prefix+"_000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ages := make([]string, job.ListLimitMax-1)
+	for i := range ages {
+		ages[i] = store.FormatTime(now.Add(time.Duration(i+2) * time.Second))
+	}
+	clones, _ := json.Marshal(ages) // a []string always marshals
+	tx, err := jobs.S.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, created_at = ? WHERE id = ?`,
+		job.StateAwaitingHuman, store.FormatTime(now.Add(time.Second)), seedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.OpenHumanActionTx(ctx, tx, seedID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
+		store.FormatTime(now.Add(-time.Minute)), job.Access(true, "paywall")); err != nil {
+		t.Fatal(err)
+	}
+	// Clone n suffixes every seed key with _NNN and takes its job age from
+	// ages; every other column the production inserts write is the seed's.
+	const clone = `(SELECT printf('_%03d', key + 1) AS n, value AS created_at FROM json_each(?)) c JOIN jobs j ON j.id = ?`
+	for _, stmt := range []string{
+		`INSERT INTO work_requests (id, created_at, requester, zotio_item_key, collection_key, title, authors_json, year, desired_version, max_cost_usd, submitted_fields)
+		 SELECT w.id || c.n, w.created_at, w.requester, w.zotio_item_key, w.collection_key, w.title, w.authors_json, w.year, w.desired_version, w.max_cost_usd, w.submitted_fields
+		 FROM ` + clone + ` JOIN work_requests w ON w.id = j.work_request_id`,
+		`INSERT INTO identifiers (work_request_id, kind, value, raw, provenance)
+		 SELECT i.work_request_id || c.n, i.kind, i.value || c.n, i.raw || c.n, i.provenance
+		 FROM ` + clone + ` JOIN identifiers i ON i.work_request_id = j.work_request_id`,
+		`INSERT INTO jobs (id, work_request_id, state, policy_json, consumer, created_at, updated_at)
+		 SELECT j.id || c.n, j.work_request_id || c.n, j.state, j.policy_json, j.consumer, c.created_at, j.updated_at
+		 FROM ` + clone,
+		`INSERT INTO human_actions (job_id, kind, status, detail, requires_auth, blocked_by, diagnosis, candidate_id, quarantine_path, quarantine_sha256, revision, created_at)
+		 SELECT h.job_id || c.n, h.kind, h.status, h.detail, h.requires_auth, h.blocked_by, h.diagnosis, h.candidate_id, h.quarantine_path, h.quarantine_sha256, h.revision, h.created_at
+		 FROM ` + clone + ` JOIN human_actions h ON h.job_id = j.id`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, string(clones), seedID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET state = ?, created_at = ? WHERE id = ?`,
-			job.StateAwaitingHuman, store.FormatTime(now.Add(time.Duration(i+1)*time.Second)), id); err != nil {
-			t.Fatal(err)
-		}
-		actionID, err := jobs.OpenHumanAction(ctx, id, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
-			job.Access(true, "paywall"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !actionCreatedAt.IsZero() {
-			if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE human_actions SET created_at = ? WHERE id = ?`,
-				store.FormatTime(actionCreatedAt), actionID); err != nil {
-				t.Fatal(err)
-			}
-		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Read the page back through the consumers' own path, on a fresh Store so
+	// the caller's ListOldest cursor stays at the start: a short page here
+	// means some filler no longer passes ListOldest or ListOpenHumanActions,
+	// and the page-reach tests would pass whatever the ordering.
+	page, err := (&job.Store{S: jobs.S}).ListOldest(ctx, []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(page))
+	for _, row := range page {
+		ids = append(ids, row.ID)
+	}
+	open, err := jobs.ListOpenHumanActionsForJobs(ctx, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != job.ListLimitMax || len(open) != job.ListLimitMax {
+		t.Fatalf("seeded page holds %d listed jobs with %d open actions, want a full page of %d each",
+			len(page), len(open), job.ListLimitMax)
 	}
 }
 
@@ -510,13 +558,13 @@ func TestHandoffRepairerReachesOldestParkBeyondMaintenancePage(t *testing.T) {
 	ctx := context.Background()
 	svc, jobs := newTestService(t)
 	svc.Config.AccessMode = config.ModeDelegated
-	oldest := parkedHandoffJob(t, svc, jobs, "request_oldest_orphan")
 	now := time.Now().UTC()
+	seedNewerMaintenancePage(t, svc, jobs, "request_newer_handoff", now)
+	oldest := parkedHandoffJob(t, svc, jobs, "request_oldest_orphan")
 	if _, err := jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`,
-		now.Add(-48*time.Hour).Format(time.RFC3339Nano), oldest.ID); err != nil {
+		store.FormatTime(now.Add(-48*time.Hour)), oldest.ID); err != nil {
 		t.Fatal(err)
 	}
-	seedNewerMaintenancePage(t, svc, jobs, "request_newer_handoff", now, time.Time{})
 
 	if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
 		t.Fatal(err)

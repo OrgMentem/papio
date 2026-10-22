@@ -20,6 +20,7 @@ import (
 	"papio/internal/protocol"
 	"papio/internal/resolver"
 	"papio/internal/sourcegate"
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -1044,7 +1045,7 @@ func TestUnreadableSiblingMarkerFailsClosed(t *testing.T) {
 	}
 	if _, err := jobs.S.DB().ExecContext(ctx,
 		`INSERT INTO events (job_id, at, kind, detail_json) VALUES (?, ?, ?, ?)`,
-		id, svc.Now().UTC().Format(time.RFC3339Nano), siblingSearchEventKind, `{"basis":`,
+		id, store.FormatTime(svc.Now()), siblingSearchEventKind, `{"basis":`,
 	); err != nil {
 		t.Fatal(err)
 	}
