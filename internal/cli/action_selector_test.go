@@ -81,34 +81,27 @@ func dryRunURLs(t *testing.T, out *bytes.Buffer) []string {
 	return page.URLs
 }
 
-// TestActionsOpenSelectorOpensOnlyTheNamedJob is the whole point of the
+// TestActionsOpenSelectorOpensOnlyTheNamedRow is the whole point of the
 // selector: a consumer that ranked the queue by its own criteria must be able to
 // open the row it chose, not the head of the queue.
-func TestActionsOpenSelectorOpensOnlyTheNamedJob(t *testing.T) {
+func TestActionsOpenSelectorOpensOnlyTheNamedRow(t *testing.T) {
 	_, _, urls := handoffQueue()
-	var out, errOut bytes.Buffer
-	root := handoffRoot(t, &out, &errOut, nil)
-	root.SetArgs([]string{"--json", "actions", "open", "--dry-run", "--job", "job_b"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("actions open --job job_b: %v (%s)", err, errOut.String())
-	}
-	got := dryRunURLs(t, &out)
-	if len(got) != 1 || got[0] != urls[1] {
-		t.Fatalf("selected URLs = %v, want exactly job_b's %q — head-of-queue leakage", got, urls[1])
-	}
-}
-
-func TestActionsOpenSelectorOpensOnlyTheNamedAction(t *testing.T) {
-	_, _, urls := handoffQueue()
-	var out, errOut bytes.Buffer
-	root := handoffRoot(t, &out, &errOut, nil)
-	root.SetArgs([]string{"--json", "actions", "open", "--dry-run", "--action", "1"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("actions open --action 1: %v (%s)", err, errOut.String())
-	}
-	got := dryRunURLs(t, &out)
-	if len(got) != 1 || got[0] != urls[2] {
-		t.Fatalf("selected URLs = %v, want exactly action 1's %q", got, urls[2])
+	for _, tc := range []struct {
+		selector []string
+		want     string
+	}{
+		{[]string{"--job", "job_b"}, urls[1]},
+		{[]string{"--action", "1"}, urls[2]},
+	} {
+		var out, errOut bytes.Buffer
+		root := handoffRoot(t, &out, &errOut, nil)
+		root.SetArgs(append([]string{"--json", "actions", "open", "--dry-run"}, tc.selector...))
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatalf("actions open %v: %v (%s)", tc.selector, err, errOut.String())
+		}
+		if got := dryRunURLs(t, &out); len(got) != 1 || got[0] != tc.want {
+			t.Fatalf("%v: selected URLs = %v, want exactly %q — head-of-queue leakage", tc.selector, got, tc.want)
+		}
 	}
 }
 
