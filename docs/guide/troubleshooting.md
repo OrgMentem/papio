@@ -301,8 +301,10 @@ Use the report reason to choose the next step:
   institution session.
 - `oa_browser`: an open-access URL needs the browser after *papio*'s own download
   did not complete it.
-- `terms`: the user must read and decide on publisher terms; *papio* does not
-  accept them.
+- `terms`: the user must read and decide on publisher terms. Without recorded
+  auto-accept consent, *papio* does not accept them. With explicit persistent
+  consent and a supported accept rule, *papio* can accept them on your behalf;
+  see the [terms row of the user guide](user-guide.md).
 - `needs_review`: inspect the quarantine path in the open `verify_identity`
   action, then explicitly accept or reject it with `papio actions resolve`.
 - `no_identifier`: no DOI, PMID, or arXiv id could be confirmed, so the job

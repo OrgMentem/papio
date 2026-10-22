@@ -204,8 +204,9 @@ quarantined and must pass three gates before it becomes a trusted PDF
 - **Identity** — the document's own metadata and text match the requested work;
   ambiguity parks the job in `needs_review` with the quarantine path exposed
   for human inspection (`papio actions list` → accept/reject).
-- **Text** — an OCR fallback (Tesseract) makes the PDF
-  searchable before import.
+- **Text** — when the PDF has too little text, an OCR fallback (Tesseract)
+  extracts evidence for the identity check. It does not change the stored PDF or
+  make it searchable.
 
 What survives is a **permanent acquisition bundle**:
 the validated PDF plus a record of where it came from, how it was
@@ -278,8 +279,9 @@ configuration, background service, jobs, and zotio boundary as the CLI:
   execute one (JSON output). Set `PAPIO_MCP_SURFACE=mirror` to expose one
   `papio_<command>` tool apiece instead
   ([full reference](https://orgmentem.github.io/papio/reference/mcp-tools/)).
-- **Two composite tools** with no single-command equivalent — `papio_acquire_batch`
-  (bulk work input) and `papio_batch_wait` (polls until settled or timeout).
+- **Three composite tools** with no single-command equivalent: `papio_acquire_batch`
+  (bulk work input), `papio_batch_wait` (polls until settled or timeout), and
+  `papio_changes` (pages durable job events).
 - **Read resources** — `papio://jobs`, `papio://artifacts`, `papio://bundles`,
   `papio://zotio/plans`, `papio://exports` — expose recent saved state
   without creating jobs or mutating anything.

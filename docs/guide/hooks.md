@@ -122,8 +122,12 @@ on_ready = 'cp "$PAPIO_PDF" "$HOME/Papers/"'
 `config.toml`. With it empty, the deep Zotero integration (auto-import,
 `papio zotio …` commands) is disabled, ownership lookup treats every work as
 new unless you configure a library source (below), and `papio doctor` reports
-zotio as `not configured (optional)` instead of failing. Hooks are then the only
-automatic hand-off — *papio* acquires and validates; your hook files.
+zotio as `not configured (optional)` instead of failing. Without it, two
+automatic hand-offs remain, and they differ. The opt-in
+[managed folder destination](#managed-folder-filing) keeps a durable receipt and
+retries after restart. A hook is a best-effort script that you write, and *papio*
+does not retry it as filing. *papio* acquires and validates; the folder or your
+hook files.
 
 ### Finding and repairing failed filings
 

@@ -1107,8 +1107,10 @@ records the result as `user_confirmed`, not as an automatic match. If the
 quarantined file has since been removed or altered, the candidate is fetched
 again instead. `--reject` records that it is not
 the right work and cancels the review. Resolution
-applies only to an open `verify_identity` action; it does not waive explicit
-wrong-work, encrypted, or active-content rejection.
+applies only to an open `verify_identity` action. It does not waive an
+encrypted or active-content rejection, or a wrong-work rejection other than a
+conflicting front-matter DOI. For that one case, `--accept` on the exact digest
+you reviewed overrides the rejection and records `user_confirmed`.
 
 ## See your acquisition history and impact
 

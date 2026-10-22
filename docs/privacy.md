@@ -44,7 +44,8 @@ column lists anything else sent.
 | `api.core.ac.uk` | your API key | Resolving | Off |
 | `api.crossref.org` (TDM) | your subscriber token | Resolving | Off |
 | `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv ID, or PMID, and `papio search` when configured | **On** |
-| `api.openaire.eu` | your API token, if set | Resolving | **On** |
+| `api.openaire.eu` | your personal access token, or the access token exchanged from your client credentials, if set | Resolving | **On** |
+| `aai.openaire.eu` | your OpenAIRE `client_id` and `client_secret` (HTTP Basic), sent only to this token endpoint | Exchanging them for a short-lived access token that `api.openaire.eu` then receives | Off — active only when an `openaire_client` credential (`papio config credentials set sources.openaire`) is configured |
 | `iris.who.int`, and any host you list in `open_books.dspace_servers` | the ISBN; your `email`, in the User-Agent | Resolving a request whose only identifier is an ISBN | **On** (`iris.who.int` only) |
 | `library.oapen.org` | the ISBN; your `email`, in the User-Agent | Resolving a request whose only identifier is an ISBN | **Off**; `open_books.oapen = true` enables it |
 | Publisher and repository hosts | — | Downloading the PDF | **On** |

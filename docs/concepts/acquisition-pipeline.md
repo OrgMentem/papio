@@ -44,8 +44,9 @@ invalid one.
 4. OpenAlex work locations, with account-keyed capacity when `sources.openalex` credentials are configured.
 5. CORE and other identifier-native repositories with configured API keys/terms.
 6. Crossref full-text/TDM links only when the specific publisher/API credential and use are configured; a link is metadata, not entitlement.
-7. Open-access sibling versions: when the requested identifier itself yields
-   no legal candidate, OpenAlex is searched for the same work under another
+7. Open-access sibling versions (off by default; set
+   `sibling_title_search = true` under `[sources.openalex]`; each search costs 10 credits, see the [config reference](../reference/config-reference.md)): when the requested
+   identifier itself yields no legal candidate, OpenAlex is searched for the same work under another
    DOI (a preprint or repository copy) with strict title, year, and author
    matching — a paywalled paper with a free SSRN or arXiv copy is fetched
    from there instead of parking.

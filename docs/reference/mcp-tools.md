@@ -8,7 +8,7 @@ papio mcp
 
 The MCP command surface derives from the *papio* CLI command tree, which is
 the single source of truth. The default surface is a compact command facade:
-two command tools, two composite tools, and read resources. All tool results
+two command tools, three composite tools, and read resources. All tool results
 are JSON; object keys below are JSON keys.
 
 ## Read resources
@@ -38,7 +38,7 @@ The default command surface contains these two tools:
 | `papio_command_run` | `name` (required exact, space-separated command path, such as `"status"` or `"zotio apply"`); `flags` (optional object of command-local flags by name); `args` (optional string of positional arguments only) | Executes the command in-process against the same daemon, jobs, and zotio boundary as the CLI, and returns JSON. The server injects `--json`. Raw flag tokens in `args` are rejected. Inherited global `--config` and `--json` flags are never exposed and are rejected. |
 
 The facade therefore reaches `papio jobs receipt`, `papio jobs
-repair-awaiting-human`, `papio jobs add-component`, and `papio inbox decide` for
+repair-awaiting-human`, and `papio inbox decide` for
 MCP consumers through `papio_command_search` and `papio_command_run`; no
 per-method MCP tools exist.
 For an accepted main component, the bundle is the canonical provenance document;
@@ -88,7 +88,7 @@ because no single CLI command supplies their MCP operation.
 
 Commands annotated `mcp:hidden`, and their whole subtrees, are excluded from
 both surfaces. The excluded commands are `init`, `config`, `daemon`,
-`native-host`, `mcp`, `browser reload`, `drive resume`, and `jobs supply-pdf`
-(it reads a file on the local disk). Commands annotated `mcp:read-only` report
+`native-host`, `mcp`, `browser reload`, `drive resume`, `jobs supply-pdf`, and
+`jobs add-component` (both read a file on the local disk). Commands annotated `mcp:read-only` report
 `read_only: true` through `papio_command_search`.
 

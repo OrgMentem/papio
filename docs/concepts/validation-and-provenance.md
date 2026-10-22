@@ -23,7 +23,9 @@ not accepted merely because a server returned PDF-like bytes.
    either one.
 2. **Identity gate.** Extracted evidence is compared with the requested work,
    including title, author, year, and DOI evidence. A conflicting DOI or clearly
-   different title or author is an explicit wrong-work rejection. *papio* does not
+   different title or author is an explicit wrong-work rejection. Only when the
+   sole objection is a conflicting front-matter DOI can you accept those exact
+   bytes through the review below (`--accept`); any other rejection stands. *papio* does not
    accept the first plausible URL or substitute one work for another.
 3. **Text gate.** *papio* uses Poppler's text extraction (capped by the `[pdf]` config) for the
    semantic evidence. When text is absent or too sparse, it renders only the
@@ -63,8 +65,10 @@ The daemon promotes that same quarantined file — its identity result recorded 
 `user_confirmed`, not as a machine pass — without downloading it again; only if
 the file has since disappeared or changed is the candidate refetched.
 `--reject` records that it is not the
-requested work and cancels the review. Neither option can override an explicit
-wrong-work, encrypted, or active-content rejection.
+requested work and cancels the review. Neither option can override an
+encrypted or active-content rejection, or a wrong-work rejection other than a
+conflicting front-matter DOI (which an `--accept` bound to the reviewed digest overrides and records as
+`user_confirmed`).
 
 ## From accepted PDF to bundle
 

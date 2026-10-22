@@ -15,7 +15,7 @@ PDF. See [Browser handoff](../concepts/browser-handoff.md) for the browser-side 
 | --- | --- |
 | `conservative` | Uses OA repositories and enabled licensed APIs only. *papio* can emit institutional or document-delivery actions, but does not open them. |
 | `assisted` | Opens OpenURL in the user's ordinary browser. You log in and download the file; *papio* then adopts and validates the selected file. |
-| `delegated` | Opens OpenURL; login, MFA, and CAPTCHA remain human actions. After you return to a granted provider host, a verified adapter may navigate and initiate the one requested download on your behalf. Unknown or changed UI falls back to assisted behavior. |
+| `delegated` | Opens OpenURL; login, MFA, and CAPTCHA remain human actions. After you return to a granted provider host, a verified adapter may navigate and initiate the one requested download on your behalf. Unknown or changed UI falls back to assisted behavior, unless you opted in to the TypeSafe article agent (see [Privacy](../privacy.md#agent-acquisition) and [agent configuration](../reference/config-reference.md)). With it, the agent may select a visible control on an already bound article with matching DOI metadata, within the site access you granted. |
 
 A fulfilled document-delivery request's retrieval page (the provider's own "View
 PDF" page) opens under this same per-mode rule as any other institutional
@@ -64,8 +64,10 @@ journal issue; only OA and API sources process batches, and each batch is capped
   or step. Saved job state lives in *papio*'s local database, not in the
   restartable, disposable extension.
 - **Uncertainty stops automation.** Unknown provider, page, or protocol states
-  fail closed to `action_required` or `needs_review`; *papio* does not use a generic
-  "click the likely download button" fallback.
+  fail closed to `action_required` or `needs_review`. The only exception is the
+  opt-in article agent: in `delegated` mode, with a TypeSafe key saved, it may pick
+  a control on an unknown page. Without that key, *papio* has no generic "click the
+  likely download button" fallback.
 - **The link to the browser carries neither files nor secrets.** The browser downloads
   into the folder *papio* set aside for that job, and the connector reports only a short
   description and a path. *papio* rejects paths outside that folder. Persisted URLs
