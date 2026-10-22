@@ -631,6 +631,58 @@ func TestTriageAcquireDigestsAtomicOnConflict(t *testing.T) {
 	}
 }
 
+func TestAcquireDigestsLaterSubmitFailureLeavesEveryEntryPendingAndRetries(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	w1 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "w1", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	w2 := createWatch(t, watches, CreateInput{Kind: KindDiscovery, Mode: ModeAlert, Query: "w2", Collection: "Reading", CadenceHours: 24, PerRunCap: 5})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := watches.RecordDigest(ctx, w1.ID, now, []DigestEntry{{WorkKey: "10.1000/a", Title: "A", DOI: "10.1000/a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := watches.RecordDigest(ctx, w2.ID, now, []DigestEntry{{WorkKey: "10.1000/a", Title: "A", DOI: "10.1000/a"}}); err != nil {
+		t.Fatal(err)
+	}
+	submitter := &fakeSubmitter{failOnCall: map[int]error{2: errors.New("resolver offline")}}
+	runner := &Runner{
+		Store: watches, Lookup: &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}},
+		Submitter: submitter, DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	targets := []DigestTarget{{WatchID: w1.ID, WorkKey: "10.1000/a"}, {WatchID: w2.ID, WorkKey: "10.1000/a"}}
+	err := runner.AcquireDigests(ctx, targets)
+	if err == nil || !strings.Contains(err.Error(), "resolver offline") {
+		t.Fatalf("AcquireDigests() error = %v, want the submit failure", err)
+	}
+	var partial *DigestPartialError
+	if errors.As(err, &partial) {
+		t.Fatalf("AcquireDigests() error = %v; a multi-target failure consumed nothing, so it must not claim queued works left the digest", err)
+	}
+	for _, id := range []int64{w1.ID, w2.ID} {
+		entries, err := watches.Digest(ctx, id, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("watch %d digest after failed acquire = %+v, want its entry still pending", id, entries)
+		}
+	}
+
+	// The same target list now retries as a unit.
+	submitter.failOnCall = nil
+	if err := runner.AcquireDigests(ctx, targets); err != nil {
+		t.Fatalf("retry AcquireDigests() = %v", err)
+	}
+	for _, id := range []int64{w1.ID, w2.ID} {
+		entries, err := watches.Digest(ctx, id, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("watch %d digest after retry = %+v, want consumed", id, entries)
+		}
+	}
+}
+
 func contains(s, substr string) bool { return strings.Contains(s, substr) }
 func TestRunDueExecutesOnlyDueWatches(t *testing.T) {
 	ctx := context.Background()

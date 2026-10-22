@@ -199,9 +199,22 @@ func (r *Runner) acquireDigestLocked(ctx context.Context, watchID int64, keys []
 	return r.acquireDigestWithEntriesLocked(ctx, watchID, entries)
 }
 
+// digestConsumer removes one acquired (or already held) entry from a watch's
+// digest. Single-watch acquisition consumes immediately; multi-watch
+// acquisition records the entry so every watch commits in one transaction.
+type digestConsumer func(ctx context.Context, watchID int64, entry DigestEntry) error
+
 // acquireDigestWithEntriesLocked is the work of AcquireDigest but operating on
 // pre-resolved entries. Caller must hold r.mu.
 func (r *Runner) acquireDigestWithEntriesLocked(ctx context.Context, watchID int64, entries []DigestEntry) (int, error) {
+	return r.submitDigestEntriesLocked(ctx, watchID, entries, func(ctx context.Context, watchID int64, entry DigestEntry) error {
+		return r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey)
+	})
+}
+
+// submitDigestEntriesLocked classifies, submits, and hands every settled entry
+// to consume. Caller must hold r.mu.
+func (r *Runner) submitDigestEntriesLocked(ctx context.Context, watchID int64, entries []DigestEntry, consume digestConsumer) (int, error) {
 	if len(entries) == 0 {
 		return 0, nil
 	}
@@ -297,7 +310,7 @@ func (r *Runner) acquireDigestWithEntriesLocked(ctx context.Context, watchID int
 				return queued, &DigestPartialError{Queued: queued, Total: total, Cause: fmt.Errorf("%w (writing digest manifest: %w)", submitErr, writeErr)}
 			}
 			for _, entry := range succeeded {
-				if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+				if err := consume(ctx, watchID, entry); err != nil {
 					return queued, &DigestPartialError{Queued: queued, Total: total, Cause: err}
 				}
 			}
@@ -311,7 +324,7 @@ func (r *Runner) acquireDigestWithEntriesLocked(ctx context.Context, watchID int
 		}
 	}
 	for _, entry := range succeeded {
-		if err := r.Store.consumeDigestEntry(ctx, watchID, entry.WorkKey); err != nil {
+		if err := consume(ctx, watchID, entry); err != nil {
 			return queued, err
 		}
 	}
@@ -324,10 +337,17 @@ type DigestTarget struct {
 	WorkKey string
 }
 
-// AcquireDigests acquires one digest entry per target atomically with respect to
-// conflict reporting: if any target is missing (ErrDigestEntryNotFound / sql.ErrNoRows)
-// no target's entry is consumed. It holds one mutex across the whole operation so
-// the API's multi-watch decide either applies everywhere or nowhere.
+// AcquireDigests acquires one digest entry per target. If any target is missing
+// (ErrDigestEntryNotFound / sql.ErrNoRows) no submission happens and no entry
+// is consumed. It holds one mutex across the whole operation so the API's
+// multi-watch decide either applies everywhere or nowhere.
+//
+// A multi-target acquire submits every target first and consumes all entries in
+// one transaction afterwards, like ConsumeDigests. A submit failure on a later
+// target therefore leaves every digest entry pending, so the caller can retry
+// the same target list: submissions already made reuse their jobs through the
+// deterministic request IDs and the resumable manifest. A single target keeps
+// the per-work partial semantics of AcquireDigest (DigestPartialError).
 func (r *Runner) AcquireDigests(ctx context.Context, targets []DigestTarget) error {
 	if r == nil || r.Store == nil || (r.Lookup == nil && !r.holdingsEnabled()) || r.Submitter == nil {
 		return errors.New("watch runner dependencies are not configured")
@@ -348,12 +368,30 @@ func (r *Runner) AcquireDigests(ctx context.Context, targets []DigestTarget) err
 		}
 		validated[i] = entries
 	}
+	if len(targets) == 1 {
+		_, err := r.acquireDigestWithEntriesLocked(ctx, targets[0].WatchID, validated[0])
+		return err
+	}
+	var consumeEntries []DigestEntry
+	var consumeWatchIDs []int64
+	record := func(_ context.Context, watchID int64, entry DigestEntry) error {
+		consumeEntries = append(consumeEntries, entry)
+		consumeWatchIDs = append(consumeWatchIDs, watchID)
+		return nil
+	}
 	for i, t := range targets {
-		if _, err := r.acquireDigestWithEntriesLocked(ctx, t.WatchID, validated[i]); err != nil {
+		if _, err := r.submitDigestEntriesLocked(ctx, t.WatchID, validated[i], record); err != nil {
+			// Nothing was consumed, so the partial counts a single-watch
+			// acquire reports ("the queued works left the digest") would be
+			// false here; the entries stay pending for a retry.
+			var partial *DigestPartialError
+			if errors.As(err, &partial) {
+				return partial.Cause
+			}
 			return err
 		}
 	}
-	return nil
+	return r.Store.consumeDigestEntriesTx(ctx, consumeEntries, consumeWatchIDs)
 }
 
 // ConsumeDigests consumes one digest entry per target atomically: a conflict on
