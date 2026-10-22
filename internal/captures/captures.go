@@ -769,12 +769,21 @@ func (s *Store) findIncidentRoleLocked(ctx context.Context, fingerprint string, 
 // latest capture to a partially applied displacement. A displaced pending-lease
 // capture also drops its metadata lease link, so retention treats it as
 // ordinary evidence again instead of keeping every intermediate capture for an
-// active job forever. The link clear is best-effort: the pins are already
-// displaced, so a metadata write failure only leaks retention, never evidence.
+// active job forever. The link is cleared BEFORE the pin is removed and a
+// failure aborts: an unpinned capture that still carries its link is exactly
+// what ReconcilePendingPins reads as a crash victim, and it would re-pin the
+// displaced capture as latest and demote the real latest. A pin with its link
+// already gone is harmless (the pin protects the capture), so a crash between
+// the two steps loses nothing.
 func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string, role PinRole, keepPath string) error {
 	displaced, err := s.findIncidentRoleLocked(ctx, fingerprint, role, keepPath)
 	if err != nil {
 		return err
+	}
+	for _, marker := range displaced {
+		if err := s.clearPendingLinkLocked(marker.file, fingerprint); err != nil {
+			return err
+		}
 	}
 	for i, marker := range displaced {
 		if err := os.Remove(pinPath(marker.file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -782,30 +791,32 @@ func (s *Store) removeIncidentRoleLocked(ctx context.Context, fingerprint string
 			return err
 		}
 	}
-	for _, marker := range displaced {
-		s.clearPendingLinkLocked(marker.file, fingerprint)
-	}
 	return nil
 }
 
+// writeLinkClear publishes capture metadata whose lease link was cleared. It
+// is a var only so tests can fail that one write.
+var writeLinkClear = writeAtomically
+
 // clearPendingLinkLocked drops the metadata lease link when a capture stops
-// being first/latest evidence for its fingerprint. Best-effort: callers have
-// already displaced the pin, so a failure only delays eviction. Callers hold
-// s.mu.
-func (s *Store) clearPendingLinkLocked(file captureFile, fingerprint string) {
+// being first/latest evidence for its fingerprint. Callers clear it before
+// they displace the pin (see removeIncidentRoleLocked) and must stop on error.
+// An unreadable sidecar carries no link ReconcilePendingPins would act on, so
+// it is not an error. Callers hold s.mu.
+func (s *Store) clearPendingLinkLocked(file captureFile, fingerprint string) error {
 	metadata, err := readMetadata(file.metadataPath)
 	if err != nil || strings.TrimSpace(metadata.PendingJobID) == "" {
-		return
+		return nil
 	}
 	if pendingFingerprint(metadata.PendingJobID) != fingerprint {
-		return
+		return nil
 	}
 	metadata.PendingJobID = ""
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
-		return
+		return fmt.Errorf("encoding capture metadata: %w", err)
 	}
-	_ = writeAtomically(filepath.Dir(file.metadataPath), file.metadataPath, encoded)
+	return writeLinkClear(filepath.Dir(file.metadataPath), file.metadataPath, encoded)
 }
 
 func (s *Store) restorePinsLocked(displaced []displacedPin) {
@@ -887,14 +898,17 @@ func (s *Store) ReleaseOrphanPendingPins(ctx context.Context) (int, error) {
 			if _, ok := index[pin.Fingerprint]; ok {
 				continue
 			}
+			// The file stays ordinary: drop its lease link too, so a later
+			// retry with the same job ID cannot resurrect it through
+			// ReconcilePendingPins. The link goes first: an unpinned capture
+			// that still links to an active job reads as a crash victim.
+			if err := s.clearPendingLinkLocked(file, pin.Fingerprint); err != nil {
+				return removed, err
+			}
 			if err := os.Remove(pinPath(file.Path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return removed, err
 			}
 			removed++
-			// The file stays ordinary: drop its lease link too, so a later
-			// retry with the same job ID cannot resurrect it through
-			// ReconcilePendingPins. Best-effort like displacement clearing.
-			s.clearPendingLinkLocked(file, pin.Fingerprint)
 		}
 	}
 	return removed, nil

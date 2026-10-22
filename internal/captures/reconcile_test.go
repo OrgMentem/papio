@@ -5,6 +5,7 @@ package captures
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -560,4 +561,80 @@ func readPinForJob(t *testing.T, store *Store, jobID string) (capturePin, bool) 
 		}
 	}
 	return capturePin{}, false
+}
+
+// failLinkClear makes every lease-link write fail, standing in for a crash or
+// I/O error in the window between displacing a pin and clearing its link.
+func failLinkClear(t *testing.T) {
+	t.Helper()
+	original := writeLinkClear
+	writeLinkClear = func(string, string, []byte) error { return errors.New("injected link-clear failure") }
+	t.Cleanup(func() { writeLinkClear = original })
+}
+
+// A displaced capture must never be left unpinned while still linked to its
+// active job: ReconcilePendingPins reads that as an interrupted pin write and
+// re-pins it as latest, demoting the real latest.
+func TestFailedLinkClearKeepsDisplacedLatestPinnedAndReconcileLeavesRealLatest(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 10, MaxAge: 24 * time.Hour})
+	at := time.Date(2026, time.August, 10, 0, 0, 0, 0, time.UTC)
+	capture := func(minute int, body string) (string, error) {
+		store.now = func() time.Time { return at.Add(time.Duration(minute) * time.Minute) }
+		return store.StoreSanitizedPinned(ctx, "job-displace", "provider.example", "drift", "provider", "1", pendingLeaseFixture("provider.example", "drift", body))
+	}
+	first, err := capture(0, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := capture(1, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failLinkClear(t)
+	if third, err := capture(2, "third"); err == nil {
+		t.Fatalf("a capture whose displacement could not clear the old link was accepted: %s", third)
+	}
+	// Nothing changed: the old latest keeps its pin and link, and no capture
+	// was left half-published.
+	if pin, ok := readPin(second); !ok || pin.Role != PinLatest {
+		t.Fatalf("second pin = %#v, %v; want it still latest", pin, ok)
+	}
+	if metadata, err := readMetadata(metadataPath(second)); err != nil || metadata.PendingJobID != "job-displace" {
+		t.Fatalf("second link = %#v, %v; want it intact", metadata, err)
+	}
+
+	_, restored, err := store.ReconcilePendingPins(ctx, []string{"job-displace"})
+	if err != nil || restored != 0 {
+		t.Fatalf("reconcile restored %d, %v; want 0 after a refused displacement", restored, err)
+	}
+	if pin, ok := readPin(first); !ok || pin.Role != PinFirstDecisive {
+		t.Fatalf("first pin = %#v, %v", pin, ok)
+	}
+	if pin, ok := readPin(second); !ok || pin.Role != PinLatest {
+		t.Fatalf("second pin after reconcile = %#v, %v; want latest", pin, ok)
+	}
+}
+
+func TestOrphanCollectionKeepsPinWhenLinkClearFails(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir(), Retention{MaxPerHost: 10, MaxAge: 24 * time.Hour})
+	orphan, err := store.StoreSanitizedPinned(ctx, "job-gone", "provider.example", "drift", "provider", "1", pendingLeaseFixture("provider.example", "drift", "orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pendingIndexPath(store.root), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	failLinkClear(t)
+	if removed, err := store.ReleaseOrphanPendingPins(ctx); err == nil || removed != 0 {
+		t.Fatalf("ReleaseOrphanPendingPins = %d, %v; want the link-clear failure", removed, err)
+	}
+	// The pin is still there, so the next pass retries; a pin removed first
+	// would leave an unpinned capture linked to a job that may come back.
+	if _, ok := readPin(orphan); !ok {
+		t.Fatal("orphan pin was removed before its link was cleared")
+	}
 }
