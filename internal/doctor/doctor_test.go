@@ -1702,103 +1702,60 @@ func findDataDirCheck(checks []Check) (Check, bool) {
 	return Check{}, false
 }
 
-func TestCheckDataDirReportsInsecurePermissionsAndLeavesMode(t *testing.T) {
+func TestCheckDataDir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX mode contract; Windows ACLs are tested separately")
 	}
-	dir := filepath.Join(t.TempDir(), "data")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.Chmod(dir, 0o755); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	cfg := config.Default()
-	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = dir
-	cfg.Email = "a@b.test"
-	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: executable(t)}, executable(t), nil)
-	c, ok := findDataDirCheck(report.Checks)
-	if !ok {
-		t.Fatalf("data_dir check missing: %+v", report.Checks)
-	}
-	if c.Status != Fail {
-		t.Fatalf("data_dir = %+v, want Fail for 0755", c)
-	}
-	if !strings.Contains(c.Remediation, "chmod 0700 "+dir) {
-		t.Fatalf("remediation = %q, want %q", c.Remediation, "chmod 0700 "+dir)
-	}
-	info, err := os.Stat(dir)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o755 {
-		t.Fatalf("mode after check = %04o, want 0755 unchanged", perm)
-	}
-}
-
-func TestCheckDataDirPassesWhenPrivate(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX mode contract; Windows ACLs are tested separately")
-	}
-	dir := filepath.Join(t.TempDir(), "data")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	cfg := config.Default()
-	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = dir
-	cfg.Email = "a@b.test"
-	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: executable(t)}, executable(t), nil)
-	c, ok := findDataDirCheck(report.Checks)
-	if !ok {
-		t.Fatalf("data_dir check missing: %+v", report.Checks)
-	}
-	if c.Status != Pass {
-		t.Fatalf("data_dir = %+v, want Pass for 0700", c)
-	}
-	info, err := os.Stat(dir)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("mode after check = %04o, want 0700", perm)
-	}
-}
-
-func TestCheckDataDirCreatesAbsentDirectory(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX mode contract; Windows ACLs are tested separately")
-	}
-	parent := t.TempDir()
-	dir := filepath.Join(parent, "absent", "nested")
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("dir should be absent before check: %v", err)
-	}
-	cfg := config.Default()
-	cfg.AccessMode = config.ModeConservative
-	cfg.DataDir = dir
-	cfg.Email = "a@b.test"
-	report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: executable(t)}, executable(t), nil)
-	c, ok := findDataDirCheck(report.Checks)
-	if !ok {
-		t.Fatalf("data_dir check missing: %+v", report.Checks)
-	}
-	if c.Status != Pass {
-		t.Fatalf("data_dir = %+v, want Pass for absent dir (created 0700)", c)
-	}
-	info, err := os.Stat(dir)
-	if err != nil {
-		t.Fatalf("stat after create: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("mode after create = %04o, want 0700", perm)
-	}
-	if c.Remediation != "" {
-		t.Fatalf("remediation on Pass should be empty, got %q", c.Remediation)
+	for _, tc := range []struct {
+		name     string
+		create   bool
+		initial  os.FileMode
+		want     string
+		wantPerm os.FileMode
+		wantFix  bool // remediation must name chmod 0700; otherwise it must be empty
+	}{
+		{name: "insecure 0755 fails and is left unchanged", create: true, initial: 0o755, want: Fail, wantPerm: 0o755, wantFix: true},
+		{name: "private 0700 passes", create: true, initial: 0o700, want: Pass, wantPerm: 0o700},
+		{name: "absent directory is created 0700", want: Pass, wantPerm: 0o700},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "absent", "nested")
+			if tc.create {
+				if err := os.MkdirAll(dir, tc.initial); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				if err := os.Chmod(dir, tc.initial); err != nil {
+					t.Fatalf("chmod: %v", err)
+				}
+			} else if _, err := os.Stat(dir); !os.IsNotExist(err) {
+				t.Fatalf("dir should be absent before check: %v", err)
+			}
+			cfg := config.Default()
+			cfg.AccessMode = config.ModeConservative
+			cfg.DataDir = dir
+			cfg.Email = "a@b.test"
+			report := Run(context.Background(), cfg, nil, pdf.Capability{PDFToText: executable(t)}, executable(t), nil)
+			c, ok := findDataDirCheck(report.Checks)
+			if !ok {
+				t.Fatalf("data_dir check missing: %+v", report.Checks)
+			}
+			if c.Status != tc.want {
+				t.Fatalf("data_dir = %+v, want %v", c, tc.want)
+			}
+			if tc.wantFix && !strings.Contains(c.Remediation, "chmod 0700 "+dir) {
+				t.Fatalf("remediation = %q, want %q", c.Remediation, "chmod 0700 "+dir)
+			}
+			if !tc.wantFix && c.Remediation != "" {
+				t.Fatalf("remediation on Pass should be empty, got %q", c.Remediation)
+			}
+			info, err := os.Stat(dir)
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			if perm := info.Mode().Perm(); perm != tc.wantPerm {
+				t.Fatalf("mode after check = %04o, want %04o", perm, tc.wantPerm)
+			}
+		})
 	}
 }
 

@@ -703,55 +703,62 @@ func TestDeliveryResumeWireContract(t *testing.T) {
 		}
 	}
 
-	// The live arm: a submitted row parked far in the future by a
-	// contract-drift poll failure, which is exactly the state this method
-	// exists to recover from.
-	liveJob := deliveryTestJob(t, system, "req_delivery_resume_live", "10.1234/resume-live")
-	if rpcErr := callMethod(t, router, "delivery.submit", map[string]any{"job_id": liveJob}, nil); rpcErr != nil {
-		t.Fatalf("delivery.submit: %v", rpcErr)
-	}
-	live, err := system.App.Delivery.GetByJobID(ctx, liveJob)
-	if err != nil || live == nil {
-		t.Fatalf("GetByJobID: row=%#v err=%v", live, err)
-	}
-	if err := system.App.Delivery.UpdateState(ctx, live.ID, delivery.StateSubmitted); err != nil {
-		t.Fatal(err)
-	}
-	farFuture := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := system.Store.DB().ExecContext(ctx, `
-		UPDATE delivery_requests
-		SET consecutive_poll_failures = 9, last_poll_error_class = 'contract_drift', next_check_at = ?
-		WHERE id = ?`, farFuture, live.ID); err != nil {
-		t.Fatal(err)
-	}
+	// The live arms: StateSubmitted and StatePending (the state a provider
+	// moves a request into after acknowledging it) are the only live states.
+	// Each is parked far in the future by a contract-drift poll failure, which
+	// is exactly the state this method exists to recover from. Seeding the
+	// bookkeeping matters: without it "resumed=true" is satisfied by an
+	// implementation that clears nothing.
+	var live *delivery.Request
+	for _, state := range []delivery.State{delivery.StateSubmitted, delivery.StatePending} {
+		jobID := deliveryTestJob(t, system, "req_delivery_resume_live_"+string(state), "10.1234/resume-live-"+string(state))
+		if rpcErr := callMethod(t, router, "delivery.submit", map[string]any{"job_id": jobID}, nil); rpcErr != nil {
+			t.Fatalf("delivery.submit for %s: %v", state, rpcErr)
+		}
+		row, err := system.App.Delivery.GetByJobID(ctx, jobID)
+		if err != nil || row == nil {
+			t.Fatalf("GetByJobID %s: row=%#v err=%v", state, row, err)
+		}
+		live = row
+		if err := system.App.Delivery.UpdateState(ctx, row.ID, state); err != nil {
+			t.Fatal(err)
+		}
+		farFuture := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339Nano)
+		if _, err := system.Store.DB().ExecContext(ctx, `
+			UPDATE delivery_requests
+			SET consecutive_poll_failures = 9, last_poll_error_class = 'contract_drift', next_check_at = ?
+			WHERE id = ?`, farFuture, row.ID); err != nil {
+			t.Fatal(err)
+		}
 
-	var resumed DeliveryResumeResult
-	if rpcErr := callMethod(t, router, "delivery.resume", map[string]any{"request_id": live.ID}, &resumed); rpcErr != nil {
-		t.Fatalf("delivery.resume on a live submitted row: %v", rpcErr)
-	}
-	if !resumed.Resumed || resumed.RequestID != live.ID || resumed.State != string(delivery.StateSubmitted) || resumed.Reason != "" {
-		t.Fatalf("resume of a live submitted row = %#v, want resumed=true, state=submitted, no reason", resumed)
-	}
-	after, err := system.App.Delivery.Get(ctx, live.ID)
-	if err != nil || after == nil {
-		t.Fatalf("Get after resume: row=%#v err=%v", after, err)
-	}
-	if after.ConsecutivePollFailures != 0 || after.LastPollErrorClass != "" {
-		t.Fatalf("after resume: consecutive_poll_failures=%d last_poll_error_class=%q, want 0 and cleared",
-			after.ConsecutivePollFailures, after.LastPollErrorClass)
-	}
-	// Due, not merely "different". A mutant that rescheduled the row to
-	// another future instant would satisfy an inequality while polling stayed
-	// disabled, which is the exact stall this method exists to clear.
-	dueBy, err := time.Parse(time.RFC3339Nano, after.NextCheckAt)
-	if err != nil {
-		t.Fatalf("next_check_at %q is unparseable: %v", after.NextCheckAt, err)
-	}
-	if dueBy.After(time.Now().UTC()) {
-		t.Fatalf("next_check_at = %s, want a due schedule: a still-future check means the poll loop remains parked and nothing was resumed", after.NextCheckAt)
-	}
-	if after.State != delivery.StateSubmitted {
-		t.Fatalf("resume changed the row state to %s; it only clears poll bookkeeping", after.State)
+		var resumed DeliveryResumeResult
+		if rpcErr := callMethod(t, router, "delivery.resume", map[string]any{"request_id": row.ID}, &resumed); rpcErr != nil {
+			t.Fatalf("delivery.resume on a live %s row: %v", state, rpcErr)
+		}
+		if !resumed.Resumed || resumed.RequestID != row.ID || resumed.State != string(state) || resumed.Reason != "" {
+			t.Fatalf("resume of a live %s row = %#v, want resumed=true, state=%s, no reason", state, resumed, state)
+		}
+		after, err := system.App.Delivery.Get(ctx, row.ID)
+		if err != nil || after == nil {
+			t.Fatalf("Get after %s resume: row=%#v err=%v", state, after, err)
+		}
+		if after.ConsecutivePollFailures != 0 || after.LastPollErrorClass != "" {
+			t.Fatalf("after %s resume: consecutive_poll_failures=%d last_poll_error_class=%q, want 0 and cleared",
+				state, after.ConsecutivePollFailures, after.LastPollErrorClass)
+		}
+		// Due, not merely "different". A mutant that rescheduled the row to
+		// another future instant would satisfy an inequality while polling
+		// stayed disabled, which is the exact stall this method exists to clear.
+		dueBy, err := time.Parse(time.RFC3339Nano, after.NextCheckAt)
+		if err != nil {
+			t.Fatalf("next_check_at %q is unparseable: %v", after.NextCheckAt, err)
+		}
+		if dueBy.After(time.Now().UTC()) {
+			t.Fatalf("%s next_check_at = %s, want a due schedule: a still-future check means the poll loop remains parked", state, after.NextCheckAt)
+		}
+		if after.State != state {
+			t.Fatalf("resume changed the %s row state to %s; it only clears poll bookkeeping", state, after.State)
+		}
 	}
 
 	// StateSubmitted and StatePending are the only live states
@@ -790,57 +797,6 @@ func TestDeliveryResumeWireContract(t *testing.T) {
 		if !strings.Contains(refused.Reason, "not live") {
 			t.Fatalf("resume of a %s row Reason = %q, want it to name the not-live state", state, refused.Reason)
 		}
-	}
-
-	// StatePending is the second live state, and it is the one a provider
-	// moves a request into after acknowledging it. Resuming it must succeed
-	// exactly like submitted, or half the live contract is unprotected.
-	pendingJob := deliveryTestJob(t, system, "req_delivery_resume_pending", "10.1234/resume-pending")
-	if rpcErr := callMethod(t, router, "delivery.submit", map[string]any{"job_id": pendingJob}, nil); rpcErr != nil {
-		t.Fatalf("delivery.submit for the pending arm: %v", rpcErr)
-	}
-	pendingRow, err := system.App.Delivery.GetByJobID(ctx, pendingJob)
-	if err != nil || pendingRow == nil {
-		t.Fatalf("GetByJobID pending: row=%#v err=%v", pendingRow, err)
-	}
-	if err := system.App.Delivery.UpdateState(ctx, pendingRow.ID, delivery.StatePending); err != nil {
-		t.Fatal(err)
-	}
-	// Seed the same parked bookkeeping the submitted arm uses. Without it the
-	// row starts with zero failures, no error class and an empty next check,
-	// so "resumed=true" is satisfied by an implementation that clears nothing
-	// — and the comment above claims pending resumes exactly like submitted.
-	pendingFuture := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := system.Store.DB().ExecContext(ctx, `
-		UPDATE delivery_requests
-		SET consecutive_poll_failures = 4, last_poll_error_class = 'contract_drift', next_check_at = ?
-		WHERE id = ?`, pendingFuture, pendingRow.ID); err != nil {
-		t.Fatal(err)
-	}
-	var resumedPending DeliveryResumeResult
-	if rpcErr := callMethod(t, router, "delivery.resume", map[string]any{"request_id": pendingRow.ID}, &resumedPending); rpcErr != nil {
-		t.Fatalf("delivery.resume on a live pending row: %v", rpcErr)
-	}
-	if !resumedPending.Resumed || resumedPending.RequestID != pendingRow.ID || resumedPending.State != string(delivery.StatePending) || resumedPending.Reason != "" {
-		t.Fatalf("resume of a live pending row = %#v, want resumed=true, state=pending, no reason", resumedPending)
-	}
-	afterPending, err := system.App.Delivery.Get(ctx, pendingRow.ID)
-	if err != nil || afterPending == nil {
-		t.Fatalf("Get after pending resume: row=%#v err=%v", afterPending, err)
-	}
-	if afterPending.ConsecutivePollFailures != 0 || afterPending.LastPollErrorClass != "" {
-		t.Fatalf("after pending resume: consecutive_poll_failures=%d last_poll_error_class=%q, want 0 and cleared",
-			afterPending.ConsecutivePollFailures, afterPending.LastPollErrorClass)
-	}
-	pendingDueBy, err := time.Parse(time.RFC3339Nano, afterPending.NextCheckAt)
-	if err != nil {
-		t.Fatalf("next_check_at %q is unparseable: %v", afterPending.NextCheckAt, err)
-	}
-	if pendingDueBy.After(time.Now().UTC()) {
-		t.Fatalf("next_check_at = %s, want a due schedule: a still-future check leaves the pending row parked", afterPending.NextCheckAt)
-	}
-	if afterPending.State != delivery.StatePending {
-		t.Fatalf("resume changed the pending row state to %s; it must only clear poll bookkeeping", afterPending.State)
 	}
 
 	if rpcErr := callMethod(t, router, "delivery.resume", map[string]any{"request_id": live.ID + 1_000_000}, nil); rpcErr == nil || rpcErr.Code != "not_found" {

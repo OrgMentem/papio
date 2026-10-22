@@ -314,49 +314,33 @@ func TestResolveOversizedBodyFailsClosed(t *testing.T) {
 }
 
 func TestRetryClasses(t *testing.T) {
-	t.Run("429 with Retry-After", func(t *testing.T) {
-		srv := serveJSON(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "5"}, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/xyz"})
-		d, temp := resolver.Temporary(err)
-		if !temp {
-			t.Fatalf("429 must be temporary; err=%v", err)
-		}
-		if d.Seconds() != 5 {
-			t.Errorf("RetryAfter = %v, want 5s", d)
-		}
-	})
-	t.Run("500 temporary", func(t *testing.T) {
-		srv := serveJSON(t, http.StatusInternalServerError, nil, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/xyz"})
-		if _, temp := resolver.Temporary(err); !temp {
-			t.Fatalf("500 must be temporary; err=%v", err)
-		}
-	})
-	t.Run("408 temporary", func(t *testing.T) {
-		srv := serveJSON(t, http.StatusRequestTimeout, map[string]string{"Retry-After": "5"}, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/xyz"})
-		d, temp := resolver.Temporary(err)
-		if !temp {
-			t.Fatalf("408 must be temporary; err=%v", err)
-		}
-		if d.Seconds() != 5 {
-			t.Errorf("RetryAfter = %v, want 5s", d)
-		}
-	})
-	t.Run("403 permanent", func(t *testing.T) {
-		srv := serveJSON(t, http.StatusForbidden, nil, "", nil)
-		r := newResolver(srv)
-		_, err := r.Resolve(context.Background(), work.Work{DOI: "10.1000/xyz"})
-		if err == nil {
-			t.Fatal("403 must produce an error")
-		}
-		if _, temp := resolver.Temporary(err); temp {
-			t.Error("403 must not be temporary")
-		}
-	})
+	for _, tc := range []struct {
+		name      string
+		status    int
+		header    map[string]string
+		wantTemp  bool
+		wantRetry float64 // seconds; 0 = not asserted
+	}{
+		{"429 with Retry-After", http.StatusTooManyRequests, map[string]string{"Retry-After": "5"}, true, 5},
+		{"500 temporary", http.StatusInternalServerError, nil, true, 0},
+		{"408 temporary", http.StatusRequestTimeout, map[string]string{"Retry-After": "5"}, true, 5},
+		{"403 permanent", http.StatusForbidden, nil, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := serveJSON(t, tc.status, tc.header, "", nil)
+			_, err := newResolver(srv).Resolve(context.Background(), work.Work{DOI: "10.1000/xyz"})
+			if err == nil {
+				t.Fatalf("%d must produce an error", tc.status)
+			}
+			d, temp := resolver.Temporary(err)
+			if temp != tc.wantTemp {
+				t.Fatalf("%d temporary = %v, want %v; err=%v", tc.status, temp, tc.wantTemp, err)
+			}
+			if tc.wantRetry != 0 && d.Seconds() != tc.wantRetry {
+				t.Errorf("RetryAfter = %v, want %vs", d, tc.wantRetry)
+			}
+		})
+	}
 	t.Run("network failure temporary", func(t *testing.T) {
 		srv := serveJSON(t, http.StatusOK, nil, oaResultJSON, nil)
 		client := srv.Client()
