@@ -903,11 +903,31 @@ func TestPlanJobsConcurrentSameJobConverge(t *testing.T) {
 }
 
 func TestApplyInFlightReservationConflictIsRetryable(t *testing.T) {
-	// Apply's in-flight reservation branch must surface an explicit retryable
-	// conflict instead of (nil,nil): the error wraps job.ErrConflict and
-	// classifies as a reservation conflict so outer retry logic backs off
-	// rather than synthesizing a spurious failure over an in-flight mutation.
-	err := WithErrorInfo(fmt.Errorf("Zotio apply reservation for plan %s is in progress: %w", "zplan_deadbeefdeadbeefdeadbeef01", job.ErrConflict))
+	// A second Apply that finds another worker's reservation without a recorded
+	// result must surface an explicit retryable conflict instead of (nil,nil):
+	// the error wraps job.ErrConflict and classifies as a reservation conflict
+	// so outer retry logic backs off rather than synthesizing a spurious failure
+	// over an in-flight mutation. The write must not run a second time.
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	plans, err := service.PlanJobs(context.Background(), []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := plans[0]
+	// Take the reservation without recording a result: the state another
+	// worker is in while its Zotero write is still running.
+	claimed, err := service.claimApply(context.Background(), "zotio_apply:"+plan.ID+":"+plan.ConfirmationSHA256, jobID)
+	if err != nil || !claimed {
+		t.Fatalf("claimApply = %v, %v", claimed, err)
+	}
+	result, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256)
+	if result != nil {
+		t.Fatalf("result = %+v, want nil", result)
+	}
 	if err == nil {
 		t.Fatal("expected non-nil retryable conflict error")
 	}
@@ -919,6 +939,9 @@ func TestApplyInFlightReservationConflictIsRetryable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "reservation for plan") || !strings.Contains(err.Error(), "is in progress") {
 		t.Fatalf("message = %q", err.Error())
+	}
+	if cli.applyCalls != 0 {
+		t.Fatalf("applyCalls = %d, want 0", cli.applyCalls)
 	}
 }
 

@@ -374,8 +374,15 @@ func (i Identifier) Key() string { return i.Kind + ":" + i.Value }
 // ownership through the version-preserving form would stop v2 matching v1 and
 // silently break holdings deduplication.
 func normalizeDOI(value string) string {
+	value = strings.TrimSpace(value)
 	lower := strings.ToLower(value)
-	for _, prefix := range []string{"https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:"} {
+	// Every URL/label spelling the acquisition normalizer strips, so a library
+	// that writes a DOI as http://dx.doi.org/... still matches. Only the prefix
+	// is shared; the two normalizers still differ on the version axis.
+	for _, prefix := range []string{
+		"https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/",
+		"doi.org/", "dx.doi.org/", "doi:", "doi ",
+	} {
 		if strings.HasPrefix(lower, prefix) {
 			value = value[len(prefix):]
 			break

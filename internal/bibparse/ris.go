@@ -133,7 +133,15 @@ func (record *risRecord) appendContinuation(content string) {
 }
 
 func risTag(line string) (tag, value string, ok bool) {
-	if len(line) < 6 || line[2:6] != "  - " {
+	// The trailing space after the hyphen is optional on an empty value:
+	// editors and exporters routinely strip it, leaving "ER  -".
+	if len(line) < 5 || line[2:5] != "  -" {
+		return "", "", false
+	}
+	if len(line) == 5 {
+		return line[:2], "", true
+	}
+	if line[5] != ' ' {
 		return "", "", false
 	}
 	return line[:2], line[6:], true

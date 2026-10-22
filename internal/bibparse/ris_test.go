@@ -64,6 +64,16 @@ func TestParseRIS(t *testing.T) {
 			want: []Record{{DOI: "10.1000/long suffix", Title: "Wrapped DOI"}},
 		},
 		{
+			name: "terminator without trailing space after a DOI",
+			data: "TY  - JOUR\nTI  - Stripped\nDO  - 10.1000/x\nER  -\nTY  - JOUR\nTI  - Next\nER  -",
+			want: []Record{{DOI: "10.1000/x", Title: "Stripped"}, {Title: "Next"}},
+		},
+		{
+			name: "empty tag without trailing space does not continue the previous field",
+			data: "TY  - JOUR\nTI  - Title\nN1  -\n  note continuation\nAB  -\nER  - \n",
+			want: []Record{{Title: "Title"}},
+		},
+		{
 			name: "author continuation extends the last author only",
 			data: "TY  - JOUR\nTI  - Wrapped author\nAU  - Smith, Ada\nAU  - Jones, Ben\n  Quincy\nER  - \n",
 			want: []Record{{Title: "Wrapped author", Authors: []string{"Smith, Ada", "Jones, Ben Quincy"}}},
