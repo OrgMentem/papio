@@ -153,10 +153,13 @@ func TestPublishRefusesReplayTargetChangedAfterStage(t *testing.T) {
 	sha := hex.EncodeToString(sum[:])
 	for name, mutate := range map[string]func(t *testing.T, target string, original os.FileInfo){
 		"new inode, same bytes": func(t *testing.T, target string, original os.FileInfo) {
-			if err := os.Remove(target); err != nil {
+			// Write the replacement while the original still holds its inode,
+			// so the filesystem cannot hand the same inode back.
+			replacement := target + ".new"
+			if err := os.WriteFile(replacement, body, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(target, body, 0o600); err != nil {
+			if err := os.Rename(replacement, target); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.Chtimes(target, original.ModTime(), original.ModTime()); err != nil {

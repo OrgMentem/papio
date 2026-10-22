@@ -20,7 +20,7 @@ import (
 // non-empty state also inserts a receipt for that destination.
 func seedManagedFilingJob(t *testing.T, ctx context.Context, db *store.Store, id, destination, state string) {
 	t.Helper()
-	at := time.Now().UTC().Format(time.RFC3339Nano)
+	at := store.FormatTime(time.Now())
 	sha := id + "sha"
 	for _, stmt := range []struct {
 		query string

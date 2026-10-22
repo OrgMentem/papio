@@ -318,8 +318,8 @@ func TestReadUnknownEffectPermitExposesExactOccupancy(t *testing.T) {
 			ordinal, strategy, revision, status, lease_until, created_at, updated_at
 		) VALUES (?, ?, 1, 1, 'domain', 'generic_drive', 0, 'drive-attempt', 0,
 			'generic', '1', 'unknown_completion', ?, ?, ?)`,
-		"permit_pulse_unknown", jobID, now.Add(-time.Minute).Format(time.RFC3339Nano),
-		now.Add(-time.Minute).Format(time.RFC3339Nano), now.Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+		"permit_pulse_unknown", jobID, store.FormatTime(now.Add(-time.Minute)),
+		store.FormatTime(now.Add(-time.Minute)), store.FormatTime(now.Add(-time.Minute))); err != nil {
 		t.Fatal(err)
 	}
 	snap, err := (&Service{Jobs: js, EffectLimit: 1, Now: func() time.Time { return now }}).Read(ctx)
@@ -349,7 +349,7 @@ func TestReadLegacyEffectBlockerRefusesAdmissionWithoutOccupyingCapacity(t *test
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
-	since := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	since := store.FormatTime(now.Add(-2 * time.Hour))
 	if _, err := js.S.DB().ExecContext(ctx, `
 		INSERT INTO legacy_effect_blockers
 		  (id, effect_kind, job_id, safety_domain_id, drive_attempt_id, ordinal,
@@ -379,8 +379,8 @@ func TestReadLegacyEffectBlockerRefusesAdmissionWithoutOccupyingCapacity(t *test
 		blocker.Revision != "r1" || blocker.Recovery != "exact_result_or_correlated_winner" {
 		t.Fatalf("legacy blocker projection = %+v", blocker)
 	}
-	if blocker.Since != since {
-		t.Fatalf("legacy blocker since = %q, want %q", blocker.Since, since)
+	if want := now.Add(-2 * time.Hour).Format(time.RFC3339Nano); blocker.Since != want {
+		t.Fatalf("legacy blocker since = %q, want %q", blocker.Since, want)
 	}
 	encoded, _ := json.Marshal(snap)
 	if strings.Contains(string(encoded), "must-not-leak") {
@@ -488,8 +488,8 @@ func TestReadActiveClaimMakesProjectionIncompleteUnlessLeaseLapsed(t *testing.T)
 		wantComplete bool
 	}{
 		{"live claim without lease", "bound", "", false},
-		{"live claim with future lease", "navigated", now.Add(time.Hour).Format(time.RFC3339Nano), false},
-		{"lapsed lease", "navigated", now.Add(-time.Hour).Format(time.RFC3339Nano), true},
+		{"live claim with future lease", "navigated", store.FormatTime(now.Add(time.Hour)), false},
+		{"lapsed lease", "navigated", store.FormatTime(now.Add(-time.Hour)), true},
 		{"settled claim", "settled", "", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -543,13 +543,13 @@ func TestReadDeliverySchedulesNameNextPollAndDueWithoutWorkerIsIncomplete(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
-			created := now.Format(time.RFC3339Nano)
+			created := store.FormatTime(now)
 			if _, err := js.S.DB().ExecContext(ctx, `
 				INSERT INTO delivery_requests
 				  (job_id, institution_profile, provider, request_class, work_identity, idempotency_key,
 				   state, next_check_at, created_at, updated_at)
 				VALUES (?, 'profile', 'ill.example/path?x=1', 'article', 'doi:10.1000/pulse', 'idem-1',
-				        'pending', ?, ?, ?)`, id, test.nextCheck.Format(time.RFC3339Nano), created, created); err != nil {
+				        'pending', ?, ?, ?)`, id, store.FormatTime(test.nextCheck), created, created); err != nil {
 				t.Fatal(err)
 			}
 			snap, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx)
@@ -610,7 +610,7 @@ func insertPulseCohort(t *testing.T, js *job.Store, id, label, membership string
 			(id, cohort_id, source_kind, source_label, expected_total, created_at, updated_at, closed_at, membership_state)
 		VALUES (?, ?, 'cli', ?, ?, ?, ?, NULLIF(?, ''), ?)`,
 		id, "cohort_"+id, label, len(members),
-		created.UTC().Format(time.RFC3339Nano), updated.UTC().Format(time.RFC3339Nano), closed, membership); err != nil {
+		store.FormatTime(created), store.FormatTime(updated), closed, membership); err != nil {
 		t.Fatal(err)
 	}
 	for i, m := range members {
@@ -618,7 +618,7 @@ func insertPulseCohort(t *testing.T, js *job.Store, id, label, membership string
 			INSERT INTO acquisition_batch_members
 				(batch_id, ordinal, canonical_key, job_id, submission_outcome, created_at)
 			VALUES (?, ?, ?, NULLIF(?, ''), ?, ?)`,
-			id, i, m.key, m.jobID, m.outcome, created.UTC().Format(time.RFC3339Nano)); err != nil {
+			id, i, m.key, m.jobID, m.outcome, store.FormatTime(created)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -668,7 +668,7 @@ func TestReadLatestBatchCompleteProjectsCohortCounts(t *testing.T) {
 		}
 		if _, err := js.S.DB().ExecContext(ctx,
 			`UPDATE jobs SET lease_owner = 'worker-1', lease_expires_at = ? WHERE id = ?`,
-			expires.Format(time.RFC3339Nano), id); err != nil {
+			store.FormatTime(expires), id); err != nil {
 			t.Fatal(err)
 		}
 	}
