@@ -79,7 +79,7 @@ func open(ctx context.Context, dir string, migrationCeiling int) (*Store, error)
 		return nil, fmt.Errorf("creating data dir: %w", err)
 	}
 	path := filepath.Join(dir, "papio.db")
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+	dsn := FileDSN(path, "_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening %s: %w", path, err)

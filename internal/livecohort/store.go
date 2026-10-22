@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"papio/internal/store"
+
 	_ "modernc.org/sqlite" // read-only store access for the candidate column
 )
 
@@ -35,7 +37,7 @@ func OpenStoreInspector(dataDir string) (*StoreInspector, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("papio store %s: %w", path, err)
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", store.FileDSN(path, "mode=ro&_pragma=busy_timeout(5000)"))
 	if err != nil {
 		return nil, fmt.Errorf("opening papio store %s read-only: %w", path, err)
 	}

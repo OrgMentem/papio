@@ -35,6 +35,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/pdf"
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -221,7 +222,7 @@ func load(ctx context.Context, zoteroDir, cacheDir string, workers int, allAttac
 	// writer.
 	defer os.RemoveAll(copyDir)
 
-	dsn := "file:" + filepath.Join(copyDir, "zotero.sqlite") + "?mode=ro&_pragma=busy_timeout(5000)"
+	dsn := store.FileDSN(filepath.Join(copyDir, "zotero.sqlite"), "mode=ro&_pragma=busy_timeout(5000)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening snapshot zotero.sqlite: %w", err)
@@ -402,7 +403,7 @@ func snapshotZoteroDatabase(ctx context.Context, zoteroDir string) (string, erro
 // closed. See dev/identity-corpus.md for the operator-facing version of
 // this fact.
 func vacuumIntoSnapshot(ctx context.Context, zoteroDir, scratchPath string) error {
-	liveDSN := "file:" + filepath.Join(zoteroDir, "zotero.sqlite") + "?mode=ro&_pragma=busy_timeout(5000)"
+	liveDSN := store.FileDSN(filepath.Join(zoteroDir, "zotero.sqlite"), "mode=ro&_pragma=busy_timeout(5000)")
 	live, err := sql.Open("sqlite", liveDSN)
 	if err != nil {
 		return fmt.Errorf("opening live zotero.sqlite read-only: %w", err)
@@ -558,7 +559,7 @@ func copyFile(ctx context.Context, src, dst string) (err error) {
 // line of defense on top of copyZoteroDatabaseFallback's own stat-based
 // consistency check.
 func verifySnapshot(ctx context.Context, path string) error {
-	dsn := "file:" + path + "?mode=ro&_pragma=busy_timeout(5000)"
+	dsn := store.FileDSN(path, "mode=ro&_pragma=busy_timeout(5000)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("opening zotero.sqlite snapshot for verification: %w", err)

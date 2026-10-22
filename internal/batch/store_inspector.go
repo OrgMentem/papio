@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"papio/internal/store"
+
 	_ "modernc.org/sqlite" // read-only store access for the submit retry path
 )
 
@@ -44,7 +46,7 @@ func openStoreInspector(dataDir string) (*storeInspector, error) {
 		}
 		return nil, fmt.Errorf("statting batch store: %w", err)
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", store.FileDSN(path, "mode=ro&_pragma=busy_timeout(5000)"))
 	if err != nil {
 		return nil, fmt.Errorf("opening batch store read-only: %w", err)
 	}

@@ -17,6 +17,7 @@ import (
 	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/pdf"
+	"papio/internal/store"
 	"papio/internal/work"
 )
 
@@ -87,7 +88,7 @@ func OpenBacklogEligibility(dataDir string) (*BacklogEligibility, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("papio store %s: %w", path, err)
 	}
-	dsn := "file:" + path + "?mode=ro&_pragma=busy_timeout(5000)"
+	dsn := store.FileDSN(path, "mode=ro&_pragma=busy_timeout(5000)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening papio store %s read-only: %w", path, err)

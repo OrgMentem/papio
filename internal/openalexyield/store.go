@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"fmt"
 
+	"papio/internal/store"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -18,7 +20,7 @@ import (
 // os.MkdirAll and never runs a migration: a measurement tool has no business
 // creating or upgrading the database it only reads.
 func OpenReadOnly(path string) (*sql.DB, error) {
-	dsn := "file:" + path + "?mode=ro&_pragma=busy_timeout(5000)"
+	dsn := store.FileDSN(path, "mode=ro&_pragma=busy_timeout(5000)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening papio store %s read-only: %w", path, err)

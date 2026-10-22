@@ -179,11 +179,18 @@ func saveBackup(cfg Config, path string, expected *Snapshot, beforePublish func(
 		return "", ErrConfigChanged
 	}
 	dir := filepath.Dir(path)
+	_, statErr := os.Stat(dir)
+	created := errors.Is(statErr, os.ErrNotExist)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", err
+	// Tighten only what papio owns: a directory it just created, or its own
+	// default config directory. A user-supplied --config path may live in $HOME,
+	// the working directory or a shared directory, whose mode is not ours to change.
+	if created || isDefaultConfigDir(dir) {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", err
+		}
 	}
 	lock, err := lockConfig(filepath.Join(dir, "."+filepath.Base(path)+".lock"))
 	if err != nil {
@@ -252,6 +259,20 @@ func saveBackup(cfg Config, path string, expected *Snapshot, beforePublish func(
 		return backup, fmt.Errorf("%w: %w", ErrPublicationUncertain, err)
 	}
 	return backup, nil
+}
+
+// isDefaultConfigDir reports whether dir is the papio config directory
+// returned by Dir, comparing by file identity so symlinked spellings match.
+func isDefaultConfigDir(dir string) bool {
+	want, err := os.Stat(Dir())
+	if err != nil {
+		return false
+	}
+	got, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(want, got)
 }
 
 // configTarget folds relative paths and symlinked parent-directory aliases onto

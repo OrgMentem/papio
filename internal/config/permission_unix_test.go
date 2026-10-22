@@ -29,3 +29,53 @@ func assertSavedConfigPermissions(t *testing.T, path string) {
 		}
 	}
 }
+
+// A user-supplied --config path often sits in $HOME, the working directory or a
+// shared directory. Saving must not strip that directory's mode.
+func TestSaveLeavesPreexistingForeignDirectoryMode(t *testing.T) {
+	t.Setenv("PAPIO_CONFIG_DIR", filepath.Join(t.TempDir(), "papio-default"))
+	shared := t.TempDir()
+	if err := os.Chmod(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(shared, "papio.toml")
+	if err := Save(credentialConfig(), path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("foreign directory mode = %04o, want 0755", got)
+	}
+	file, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := file.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config file mode = %04o, want 0600", got)
+	}
+}
+
+// papio's own default config directory is still hardened to 0700.
+func TestSaveTightensPreexistingDefaultConfigDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "papio-default")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PAPIO_CONFIG_DIR", dir)
+	if err := Save(credentialConfig(), filepath.Join(dir, "config.toml")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("default config dir mode = %04o, want 0700", got)
+	}
+}
