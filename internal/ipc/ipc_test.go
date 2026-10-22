@@ -669,3 +669,18 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+func TestRejectDuplicateKeysCaseVariants(t *testing.T) {
+	for _, raw := range []string{
+		`{"method":"a","METHOD":"b"}`,
+		`{"params":{"url":"a","URL":"b"}}`,
+		`[{"Id":1,"iD":2}]`,
+	} {
+		if err := rejectDuplicateKeys([]byte(raw)); err == nil {
+			t.Errorf("%s: expected duplicate error", raw)
+		}
+	}
+	if err := rejectDuplicateKeys([]byte(`{"a":{"x":1},"b":{"X":2}}`)); err != nil {
+		t.Errorf("distinct objects rejected: %v", err)
+	}
+}

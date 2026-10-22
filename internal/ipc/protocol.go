@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -253,10 +254,13 @@ func rejectDuplicateKeys(raw []byte) error {
 				if !ok {
 					return errors.New("object member is not a string")
 				}
-				if _, exists := seen[key]; exists {
+				// encoding/json matches struct fields case-insensitively, so
+				// case variants of one name are the same member.
+				folded := strings.ToLower(strings.ToUpper(key))
+				if _, exists := seen[folded]; exists {
 					return fmt.Errorf("duplicate object member %q", key)
 				}
-				seen[key] = struct{}{}
+				seen[folded] = struct{}{}
 				if err := readValue(); err != nil {
 					return err
 				}

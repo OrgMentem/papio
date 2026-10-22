@@ -12,7 +12,12 @@ import (
 	"papio/internal/work"
 )
 
-var doiPattern = regexp.MustCompile(`(?i)\b10\.\d{4,9}/[-._;()/:a-z0-9]+`)
+// Legacy Wiley/SICI DOIs embed a <page::id> group and '#'. The group is
+// accepted only when complete, starting with a digit and containing a colon,
+// so markup such as "<sup>1</sup>" or "</a>" is not captured; '#' only when
+// followed by an alphanumeric. '[' is excluded so "[1]" reference markers
+// stay outside the DOI.
+var doiPattern = regexp.MustCompile(`(?i)\b10\.\d{4,9}/(?:[-._;()/:a-z0-9]|<[0-9][-._;()/:a-z0-9]*:[-._;()/:a-z0-9]*>|#[a-z0-9])+`)
 
 // doiContinuationPattern matches the leading DOI-body run of the line that
 // follows a DOI cut off at a line break. pdftotext wraps a long DOI mid-token

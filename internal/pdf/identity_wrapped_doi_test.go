@@ -3,6 +3,7 @@
 package pdf
 
 import (
+	"strings"
 	"testing"
 
 	"papio/internal/work"
@@ -78,5 +79,27 @@ func TestWrappedDOIDoesNotFuseAcrossABlankLine(t *testing.T) {
 func TestFrontMatterDOIsOmitsBothHalvesOfAWrappedDOI(t *testing.T) {
 	if got := FrontMatterDOIs("Citation: ... https://doi.org/10.1371/journal.\npone.0187342\n"); len(got) != 0 {
 		t.Fatalf("FrontMatterDOIs = %v, want nothing publishable from a wrapped DOI", got)
+	}
+}
+
+func TestDocumentDOIsKeepsSICIPunctuation(t *testing.T) {
+	const sici = "10.1002/(SICI)1097-4636(199706)35:4<525::AID-JBM14>3.0.CO;2-E"
+	matchable, conclusive := documentDOIs("DOI: " + sici + "\nAbstract text")
+	want := strings.ToLower(sici)
+	if len(matchable) != 1 || matchable[0] != want || len(conclusive) != 1 || conclusive[0] != want {
+		t.Fatalf("matchable=%v conclusive=%v, want only %q", matchable, conclusive, want)
+	}
+	m, _ := documentDOIs("<a>10.1000/abc.def</a> x")
+	if len(m) != 1 || m[0] != "10.1000/abc.def" {
+		t.Fatalf("closing markup captured: %v", m)
+	}
+}
+
+func TestDocumentDOIsStopsBeforeReferenceMarkersAndMarkup(t *testing.T) {
+	for _, text := range []string{"DOI: 10.1000/example[1] cited", "10.1000/example<sup>1</sup> cited", "10.1000/example</b>"} {
+		m, _ := documentDOIs(text)
+		if len(m) != 1 || m[0] != "10.1000/example" {
+			t.Fatalf("%q -> %v, want 10.1000/example", text, m)
+		}
 	}
 }
