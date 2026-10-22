@@ -1445,7 +1445,9 @@ export interface BridgeDeps {
   /** Durable claim_observation outbox (chrome.storage.session): survives an
    * MV3 worker restart within the same browser session, dies with it
    * (`dev/active/claim-observation-protocol.md` §2.2, plan's storage-tier
-   * design). Replayed before any lease-renewing action after a restart. */
+   * design). Replayed before any lease-renewing action after a restart.
+   * `get` MUST reject when storage cannot be read: an empty record means the
+   * queue is empty, and the next write replaces what is stored. */
   claimObservationOutbox?: {
     get(): Promise<Record<string, ClaimObservationOutboxEntry>>;
     set(value: Record<string, ClaimObservationOutboxEntry>): Promise<void>;
@@ -3026,6 +3028,15 @@ export class Bridge {
   /** Chrome storage writes have no ordering guarantee; serialize snapshots so
    * a late older write cannot resurrect a deleted observation. */
   private claimObservationOutboxSaveChain: Promise<void> = Promise.resolve();
+  /** Whether the durable outbox has been READ successfully this worker
+   * lifetime. A failed read is "unknown", never "empty": writing a snapshot
+   * of the in-memory map before the stored backlog has been merged in would
+   * replace every unacknowledged observation still in storage. */
+  private claimObservationOutboxLoaded = false;
+  private claimObservationOutboxLoad: Promise<boolean> | undefined;
+  /** A write was refused while the outbox was unreadable, so entries queued
+   * since then exist in memory only. The next successful write clears it. */
+  private claimObservationOutboxUnwritten = false;
 
   /** Resolves once managed-state load, ledger migration, group/window
    * adoption, and close-tombstone replay have all completed (Slice 2b's
@@ -5085,21 +5096,44 @@ export class Bridge {
   /** Load the durable claim_observation outbox (chrome.storage.session) into
    * worker memory. Defensive: a foreign write, a stale schema, or a
    * hand-edited value is dropped rather than trusted, matching the other
-   * `deps.*Correlations`-style hydration paths in this file. */
-  private async hydrateClaimObservationOutbox(): Promise<void> {
+   * `deps.*Correlations`-style hydration paths in this file.
+   *
+   * Resolves whether the outbox is now known. A failed read resolves false and
+   * leaves the outbox unloaded, so the next drain and the next write retry it:
+   * treating the failure as an empty queue let the next write replace the
+   * unacknowledged observations still in storage. Entries queued before a
+   * late load succeeds are kept; the stored backlog merges in beside them. */
+  private hydrateClaimObservationOutbox(): Promise<boolean> {
+    if (this.claimObservationOutboxLoaded) return Promise.resolve(true);
+    this.claimObservationOutboxLoad ??= this.loadClaimObservationOutbox().finally(
+      () => {
+        this.claimObservationOutboxLoad = undefined;
+      },
+    );
+    return this.claimObservationOutboxLoad;
+  }
+
+  private async loadClaimObservationOutbox(): Promise<boolean> {
     const outbox = this.deps.claimObservationOutbox;
-    if (outbox === undefined) return;
+    if (outbox === undefined) {
+      this.claimObservationOutboxLoaded = true;
+      return true;
+    }
     let stored: unknown;
     try {
       stored = await outbox.get();
     } catch {
-      return;
+      return false;
     }
-    if (!isClaimObservationOutboxRecord(stored)) return;
-    for (const [observationID, entry] of Object.entries(stored)) {
-      if (!isClaimObservationOutboxEntry(observationID, entry)) continue;
-      this.claimObservationOutboxEntries.set(observationID, entry);
+    if (isClaimObservationOutboxRecord(stored)) {
+      for (const [observationID, entry] of Object.entries(stored)) {
+        if (!isClaimObservationOutboxEntry(observationID, entry)) continue;
+        if (!this.claimObservationOutboxEntries.has(observationID))
+          this.claimObservationOutboxEntries.set(observationID, entry);
+      }
     }
+    this.claimObservationOutboxLoaded = true;
+    return true;
   }
 
   /** Restart-safety half of oracle finding 5: hydrate every durable
@@ -5190,7 +5224,27 @@ export class Bridge {
       ClaimObservationPayload["event_kind"],
       "navigation_error" | "owner_closed"
     >,
-  ): void {
+  ): Promise<boolean> {
+    // owner_closed is idempotent at the daemon (a replay changes nothing), so a
+    // retry of a report whose write failed re-persists the entry it already
+    // queued rather than stacking a second observation beside it.
+    const queued =
+      eventKind === "owner_closed"
+        ? [...this.claimObservationOutboxEntries.values()].find(
+            (existing) =>
+              existing.event_kind === eventKind &&
+              existing.job_id === entry.job_id &&
+              existing.authentication_claim_id ===
+                entry.authentication_claim_id &&
+              existing.binding_id === entry.binding_id &&
+              existing.gate_occurrence_id === entry.gate_occurrence_id,
+          )
+        : undefined;
+    if (queued !== undefined) {
+      const durable = this.commitClaimObservationOutbox();
+      this.scheduleObservationOutboxDrain();
+      return durable;
+    }
     let ordinal = 0;
     for (const existing of this.claimObservationOutboxEntries.values()) {
       if (
@@ -5214,11 +5268,14 @@ export class Bridge {
       observationEntry.observation_id,
       observationEntry,
     );
-    this.persistClaimObservationOutbox();
+    // Resolves whether the entry reached storage. A caller that is about to
+    // erase the durable record this report came from MUST wait for it.
+    const durable = this.commitClaimObservationOutbox();
     // Same tail as enqueueClaimObservation: persisting alone leaves the
     // observation sitting until some unrelated event happens to drain it,
     // and owner_closed is the frame that frees the institution's login slot.
     this.scheduleObservationOutboxDrain();
+    return durable;
   }
 
   /** Best-effort local guess for lastKnownBrowserHolderGeneration, scanned
@@ -8624,6 +8681,16 @@ export class Bridge {
     // explicit non-native message), so awaiting it here cannot deadlock
     // the FIFO it itself depends on.
     await this.outboxReplayed;
+    // A backlog the worker could not read has not been replayed either. Read it
+    // again now rather than negotiate a claim ahead of observations the daemon
+    // has not seen; if storage is still unreadable, refuse: the paper parks for
+    // the operator, and an explicit open reaches here again.
+    if (!this.claimObservationOutboxLoaded) {
+      if (!(await this.hydrateClaimObservationOutbox()))
+        return { kind: "refuse" };
+      this.scheduleObservationOutboxDrain();
+      await this.outboxReplayed;
+    }
     const result = await this.requestCorrelated("authentication_claim_request", { candidate_id: candidateID, materialization_kind: "browser_tab", trigger }, { jobID: jobID });
     if (result.kind !== "response" || result.payload === undefined)
       return { kind: "refuse" };
@@ -8896,18 +8963,48 @@ export class Bridge {
     );
   }
 
-  /** Persist the mutation-time snapshot after all earlier snapshots settle.
-   * Callers that require durability may await the returned promise; the
-   * best-effort mutation sites intentionally ignore a failed storage write. */
-  private persistClaimObservationOutbox(): Promise<void> {
+  /** Persist the outbox after all earlier snapshots settle. Callers that
+   * require durability use `commitClaimObservationOutbox`; the best-effort
+   * mutation sites intentionally ignore a failed storage write. */
+  private async persistClaimObservationOutbox(): Promise<void> {
+    await this.commitClaimObservationOutbox();
+  }
+
+  /** Persist the mutation-time snapshot after all earlier snapshots settle and
+   * resolve whether it reached storage; never rejects.
+   *
+   * A snapshot REPLACES the stored queue, so none is written until the stored
+   * backlog has been read and merged in: a worker whose first read failed
+   * would otherwise erase every unacknowledged observation with its next
+   * write. Until then the entries stay in memory only and this resolves false;
+   * the snapshot is taken at write time in that case, after the merge. */
+  private commitClaimObservationOutbox(): Promise<boolean> {
     const outbox = this.deps.claimObservationOutbox;
-    if (outbox === undefined) return Promise.resolve();
-    const snapshot = Object.fromEntries(this.claimObservationOutboxEntries);
-    const save = this.claimObservationOutboxSaveChain.then(() =>
-      outbox.set(snapshot),
+    if (outbox === undefined) return Promise.resolve(true);
+    const snapshot = this.claimObservationOutboxLoaded
+      ? Object.fromEntries(this.claimObservationOutboxEntries)
+      : undefined;
+    const save = this.claimObservationOutboxSaveChain.then(
+      async (): Promise<boolean> => {
+        let value = snapshot;
+        if (value === undefined) {
+          if (!(await this.hydrateClaimObservationOutbox())) {
+            this.claimObservationOutboxUnwritten = true;
+            return false;
+          }
+          value = Object.fromEntries(this.claimObservationOutboxEntries);
+        }
+        try {
+          await outbox.set(value);
+          this.claimObservationOutboxUnwritten = false;
+          return true;
+        } catch {
+          return false;
+        }
+      },
     );
-    this.claimObservationOutboxSaveChain = save.catch(() => {});
-    return save.catch(() => {});
+    this.claimObservationOutboxSaveChain = save.then(() => undefined);
+    return save;
   }
 
   /** §2.2/§5: append one claim_observation to the durable outbox and
@@ -8915,15 +9012,20 @@ export class Bridge {
    * this and moves on, satisfying AGENTS.md's "never await a correlated
    * request inside an inbound-frame handler" for every emission site
    * below, since none of them are on the critical path of the frame that
-   * triggered them. */
+   * triggered them.
+   *
+   * The returned promise resolves whether the entry reached storage (false
+   * when nothing could be queued at all). Only a caller about to erase the
+   * durable record the observation reports from needs it. */
   private enqueueClaimObservation(
     jobID: string,
     bindingID: string,
     eventKind: ClaimObservationPayload["event_kind"],
-  ): void {
+  ): Promise<boolean> {
     const grant = this.claimGrants.get(jobID);
     const generation = this.lastKnownBrowserHolderGeneration;
-    if (grant === undefined || generation === undefined) return;
+    if (grant === undefined || generation === undefined)
+      return Promise.resolve(false);
     const ordinal = grant.nextOrdinal;
     grant.nextOrdinal += 1;
     const entry: ClaimObservationOutboxEntry = {
@@ -8937,8 +9039,9 @@ export class Bridge {
       event_kind: eventKind,
     };
     this.claimObservationOutboxEntries.set(entry.observation_id, entry);
-    this.persistClaimObservationOutbox();
+    const durable = this.commitClaimObservationOutbox();
     this.scheduleObservationOutboxDrain();
+    return durable;
   }
 
   /** Derive the SAME identity `observation_id` is built from (minus
@@ -9042,8 +9145,19 @@ export class Bridge {
   /** §5's per-poll batch cap (32), reused here as a per-batch cap; loops
    * batches until the outbox is empty or a full pass makes no progress
    * (offline, feature withdrawn, or every request timed out) — retried by
-   * the next enqueue, hello_ack, or reconnect instead of busy-looping. */
+   * the next enqueue, hello_ack, or reconnect instead of busy-looping.
+   *
+   * An outbox whose stored backlog could not be read is not drained at all:
+   * sending only what this worker queued would put fresh observations ahead
+   * of the unread ones. The read is retried here, and entries queued while it
+   * was failing (never written, see `commitClaimObservationOutbox`) are
+   * persisted once it succeeds. */
   private async drainObservationOutboxLoop(): Promise<void> {
+    if (!this.claimObservationOutboxLoaded) {
+      if (!(await this.hydrateClaimObservationOutbox())) return;
+      if (this.claimObservationOutboxUnwritten)
+        void this.persistClaimObservationOutbox();
+    }
     for (;;) {
       const before = this.claimObservationOutboxEntries.size;
       if (before === 0) return;
@@ -21833,6 +21947,29 @@ export class Bridge {
     // the activation is attention, recorded by the listener.
   }
 
+  /** Erase a closed tab's birth record, but only after the owner_closed it
+   * justified is durable. The record is the one thing a restarted worker can
+   * rebuild the report from, and enqueueing writes the outbox on a separate
+   * storage chain from this ledger, so erasing at enqueue time left a window
+   * in which neither survived a worker death. A report that could not be
+   * stored keeps its record: the next reconcile finds the tab absent and
+   * reports again, and the daemon applies a replayed owner_closed as a no-op.
+   * `undefined` means no report was made, so there is nothing to wait for.
+   * Started, not awaited: the wait is a storage write, and the callers'
+   * remaining cleanup does not depend on it. */
+  private forgetLedgeredTabOnceReported(
+    tabID: number,
+    reported: Promise<boolean> | undefined,
+  ): void {
+    if (reported === undefined) {
+      void this.surfaces.forgetLedgeredTab(tabID);
+      return;
+    }
+    void reported.then((durable) => {
+      if (durable) return this.surfaces.forgetLedgeredTab(tabID);
+    });
+  }
+
   private async onTabRemoved(tabID: number): Promise<void> {
     const authReturnInterrupted = this.authReturnsInFlight.delete(tabID);
     for (const pending of this.agentNavigations.values()) {
@@ -21896,6 +22033,7 @@ export class Bridge {
     const durableClaim = ledgerRecord?.claim;
     const job = findByTab(this.store, tabID);
     if (!job) {
+      let ownerClosedReported: Promise<boolean> | undefined;
       // job_inactive and the drive timeout can detach browser-local job state
       // before the tab closes. Ceding a sign-in tab stops papio from closing
       // it, but does not erase its claim ownership: the operator's physical
@@ -21913,7 +22051,7 @@ export class Bridge {
         durableClaim !== undefined
       ) {
         institutionalClaimAbandoned = true;
-        this.enqueueRestartRecoveredObservation(
+        ownerClosedReported = this.enqueueRestartRecoveredObservation(
           {
             job_id: ledgerJobID,
             authentication_claim_id: durableClaim.authentication_claim_id,
@@ -21924,15 +22062,19 @@ export class Bridge {
           "owner_closed",
         );
       }
-      // The observation MUST be enqueued before this deletion: after an
-      // extension update this birth record is the only durable proof of the
-      // claim, and a worker crash between the two must not lose the report.
-      void this.surfaces.forgetLedgeredTab(tabID);
+      // The birth record is erased only once the observation is DURABLE: after
+      // an extension update this record is the only durable proof of the
+      // claim. Enqueueing alone is not enough, since the outbox is written on
+      // its own storage chain and a worker crash between the two writes would
+      // lose the report.
+      this.forgetLedgeredTabOnceReported(tabID, ownerClosedReported);
       if (!deliberate) await this.retireLostMaterializationSurface(tabID, ownerBindingID);
       if (wasBadgedAuthWall) await this.syncConnectionBadge();
       return;
     }
-    void this.surfaces.forgetLedgeredTab(tabID);
+    // Erasing the record waits for the owner_closed below to be durable; see
+    // forgetLedgeredTabOnceReported.
+    let ownerClosedReported: Promise<boolean> | undefined;
     // Slice 3 owner_closed: the owning surface closed without success — a
     // deliberate daemon-authorized close (surface_close_request already told
     // the daemon under its own disposition) and a job that already reached
@@ -21947,7 +22089,11 @@ export class Bridge {
       const grant = this.claimGrants.get(job.job_id);
       if (grant !== undefined) {
         institutionalClaimAbandoned = true;
-        this.enqueueClaimObservation(job.job_id, ownerBindingID, "owner_closed");
+        ownerClosedReported = this.enqueueClaimObservation(
+          job.job_id,
+          ownerBindingID,
+          "owner_closed",
+        );
         // §2.2.1's owner_closed reducer counterpart: authorize the now-gone
         // surface's abandonment. The tab is already gone, so there is nothing
         // to tombstone locally — either outcome (authorized or not_eligible)
@@ -21964,7 +22110,7 @@ export class Bridge {
         // and every sibling parks tablessly in the meantime — the stranded
         // sign-in this whole effort exists to prevent.
         institutionalClaimAbandoned = true;
-        this.enqueueRestartRecoveredObservation(
+        ownerClosedReported = this.enqueueRestartRecoveredObservation(
           {
             job_id: job.job_id,
             authentication_claim_id: durableClaim.authentication_claim_id,
@@ -21981,6 +22127,7 @@ export class Bridge {
         );
       }
     }
+    this.forgetLedgeredTabOnceReported(tabID, ownerClosedReported);
     this.clearClaimGrant(job.job_id);
     if (!deliberate) await this.retireLostMaterializationSurface(tabID, ownerBindingID);
     if (authorizedClose || deliberate) {
@@ -24744,17 +24891,16 @@ function realDeps(): BridgeDeps {
       },
     },
     claimObservationOutbox: {
+      // A storage failure rejects. Resolving `{}` here made a failed read
+      // indistinguishable from an empty queue, and the next write then
+      // replaced the unacknowledged backlog still in storage.
       async get() {
-        try {
-          const got = await chrome.storage.session.get(
-            CLAIM_OBSERVATION_OUTBOX_STORAGE_KEY,
-          );
-          const stored = got[CLAIM_OBSERVATION_OUTBOX_STORAGE_KEY];
-          if (typeof stored !== "object" || stored === null) return {};
-          return stored as Record<string, ClaimObservationOutboxEntry>;
-        } catch {
-          return {};
-        }
+        const got = await chrome.storage.session.get(
+          CLAIM_OBSERVATION_OUTBOX_STORAGE_KEY,
+        );
+        const stored = got[CLAIM_OBSERVATION_OUTBOX_STORAGE_KEY];
+        if (typeof stored !== "object" || stored === null) return {};
+        return stored as Record<string, ClaimObservationOutboxEntry>;
       },
       async set(value) {
         await chrome.storage.session.set({

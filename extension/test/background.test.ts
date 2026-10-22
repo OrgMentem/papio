@@ -7262,6 +7262,173 @@ test("claim-observation outbox hydration keeps valid entries beside malformed st
   );
 });
 
+// Storage read failure is "unknown", never "empty". The real dep used to
+// swallow the rejection into `{}` and hydrate treated that as a successful
+// empty load, so the next enqueue persisted a full snapshot of
+// (empty + new) over the unacknowledged backlog still sitting in
+// chrome.storage.session.
+test("a transient outbox read failure never lets a later write erase the queued backlog", async () => {
+  const queued: ClaimObservationOutboxEntry = {
+    observation_id: "obs_unread_backlog",
+    job_id: "job_unread_backlog",
+    authentication_claim_id: "claim_unread_backlog",
+    binding_id: "binding_unread_backlog",
+    browser_holder_generation: 1,
+    gate_occurrence_id: "occ_unread_backlog",
+    event_ordinal: 0,
+    event_kind: "wall_observed",
+  };
+  const h = makeHarness();
+  h.claimObservationOutbox.current = { [queued.observation_id]: queued };
+  const storageGet = h.deps.claimObservationOutbox!.get;
+  // Every read fails until the test lets storage recover.
+  let readable = false;
+  h.deps.claimObservationOutbox!.get = async () => {
+    if (!readable) throw new Error("storage temporarily unavailable");
+    return storageGet();
+  };
+  const internals = h.bridge as unknown as {
+    claimGrants: Map<
+      string,
+      {
+        authenticationClaimID: string;
+        gateOccurrenceID: string;
+        nextOrdinal: number;
+      }
+    >;
+    lastKnownBrowserHolderGeneration: number | undefined;
+    enqueueClaimObservation(
+      jobID: string,
+      bindingID: string,
+      eventKind: ClaimObservationOutboxEntry["event_kind"],
+    ): Promise<boolean>;
+  };
+  await h.bridge.start();
+
+  internals.claimGrants.set("job_unread_fresh", {
+    authenticationClaimID: "claim_unread_fresh",
+    gateOccurrenceID: "occ_unread_fresh",
+    nextOrdinal: 0,
+  });
+  internals.lastKnownBrowserHolderGeneration = 1;
+  // The write cannot be made safe while the backlog is unreadable, so it is
+  // refused instead of replacing the backlog.
+  const stored = await internals.enqueueClaimObservation(
+    "job_unread_fresh",
+    "binding_unread_fresh",
+    "wall_observed",
+  );
+  expect(h.claimObservationOutbox.current[queued.observation_id]).toEqual(
+    queued,
+  );
+  expect(stored).toBe(false);
+
+  // Reads recover: the next drain loads the backlog, replays it under its
+  // original observation_id, and persists it beside the fresh entry.
+  readable = true;
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  const replay = await h.port.waitForFrame("claim_observation");
+  expect(replay.payload["observation_id"]).toBe(queued.observation_id);
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(
+    Object.values(h.claimObservationOutbox.current)
+      .map((entry) => entry.job_id)
+      .sort(),
+  ).toEqual(["job_unread_backlog", "job_unread_fresh"]);
+});
+
+// Refusing the write is not enough: the daemon arbitrates a new claim against
+// the observations it has applied, so a sign-in negotiation must not run ahead
+// of a backlog this worker has not been able to read, let alone replay.
+test("a claim consult is refused while the outbox backlog is unreadable, and waits for its replay once readable", async () => {
+  const jobID = "job_unread_consult";
+  const candidateID = "cand_unread_consult";
+  const queued: ClaimObservationOutboxEntry = {
+    observation_id: "obs_unread_consult_backlog",
+    job_id: "job_unread_consult_old",
+    authentication_claim_id: "claim_unread_consult_old",
+    binding_id: "binding_unread_consult_old",
+    browser_holder_generation: 1,
+    gate_occurrence_id: "occ_unread_consult_old",
+    event_ordinal: 0,
+    event_kind: "wall_observed",
+  };
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  installManagedTabLedger(h, {});
+  h.claimObservationOutbox.current = { [queued.observation_id]: queued };
+  const storageGet = h.deps.claimObservationOutbox!.get;
+  let readable = false;
+  h.deps.claimObservationOutbox!.get = async () => {
+    if (!readable) throw new Error("storage temporarily unavailable");
+    return storageGet();
+  };
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobID, candidateID);
+  const internals = h.bridge as unknown as {
+    openFreshHandoff(
+      jobID: string,
+      job: ActiveJob,
+      trigger: "automatic" | "explicit",
+    ): Promise<unknown>;
+  };
+  const job = h.backend.store.activeJobs.find((j) => j.job_id === jobID)!;
+
+  const refused = internals.openFreshHandoff(jobID, job, "automatic");
+  // Asserted before awaiting: a consult that negotiated anyway would wait on a
+  // daemon reply that never comes, and this test would hang instead of failing.
+  for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  expect(
+    h.frames().filter((frame) => frame.type === "authentication_claim_request"),
+  ).toHaveLength(0);
+  await expect(refused).resolves.toMatchObject({
+    ok: false,
+    error: { code: "handoff_unavailable" },
+  });
+  expect(h.claimObservationOutbox.current[queued.observation_id]).toEqual(
+    queued,
+  );
+
+  readable = true;
+  const framesBefore = h.port.posted.length;
+  const opening = internals.openFreshHandoff(
+    jobID,
+    h.backend.store.activeJobs.find((j) => j.job_id === jobID)!,
+    "automatic",
+  );
+  const replay = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(replay.payload["observation_id"]).toBe(queued.observation_id);
+  // The negotiation is still held behind the replay's unacknowledged frame.
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(
+    h.frames().filter((frame) => frame.type === "authentication_claim_request"),
+  ).toHaveLength(0);
+  await h.port.inbound(
+    observationAck(queued.job_id, replay.payload["request_id"], {
+      outcome: "duplicate",
+      gate_occurrence_id: queued.gate_occurrence_id,
+      browser_holder_generation: 1,
+    }),
+  );
+  const claimRequest = await h.port.waitForFrame(
+    "authentication_claim_request",
+    framesBefore,
+  );
+  await h.port.inbound(
+    claimResponse(jobID, claimRequest.payload["request_id"], {
+      outcome: "park",
+      authentication_claim_id: `claim_${candidateID}`,
+      browser_holder_generation: 1,
+      gate_occurrence_id: `occ_${candidateID}`,
+      dependent_count: 0,
+    }),
+  );
+  await opening;
+});
+
 test("Slice 3: two concurrent automatic drives for the same job produce exactly one consult", async () => {
   const jobID = "job_claim_mint_latch";
   const candidateID = "cand_mint_latch01";
@@ -26765,6 +26932,230 @@ test("startup reconciliation reports a vanished owned surface instead of pruning
   expect(observation.job_id).toBe("job_vanished_0001");
   // Reported once, then forgotten: a second pass must not re-report.
   expect(Object.keys(ledger.current())).not.toContain(String(tabID));
+});
+
+// Enqueue order is not persistence order: the outbox and the birth ledger are
+// two storage chains. The record is the only durable proof of the claim after a
+// worker death, so it may be erased only once the owner_closed it justifies is
+// itself durable.
+test("a vanished surface's birth record survives until its owner_closed is durable", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    browserEpoch: string | undefined;
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  const record = fakeBirthRecord({
+    binding_id: bindingID,
+    tab_hint: tabID,
+    browser_epoch: internals.browserEpoch ?? "test-epoch",
+    job_id: "job_vanished_durable",
+    claim: {
+      authentication_claim_id: "auth-vanished-durable",
+      browser_holder_generation: 1,
+      gate_occurrence_id: "gate-vanished-durable",
+    },
+  });
+  internals.tabLedgerCache = { [String(tabID)]: record };
+  await h.deps.tabLedger?.save({ [String(tabID)]: record });
+  await h.port.inbound(
+    helloAck({
+      features: ["surface_close_v1", "institutional_authentication_claim_v1"],
+    }),
+  );
+  const storageSet = h.deps.claimObservationOutbox!.set;
+  const writes: { commit(): void }[] = [];
+  h.deps.claimObservationOutbox!.set = (value) => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    writes.push({ commit: () => void storageSet(value).then(resolve) });
+    return promise;
+  };
+  h.tabs.forget(tabID);
+
+  const reconciling = h.bridge.reconcileOwnedTabs();
+  await settle();
+  // The write is queued but not committed; the worker could die right here.
+  expect(writes.length).toBeGreaterThan(0);
+  expect(Object.keys(ledger.current())).toContain(String(tabID));
+  expect(Object.keys(h.claimObservationOutbox.current)).toEqual([]);
+
+  for (const write of writes) write.commit();
+  await reconciling;
+  expect(Object.keys(ledger.current())).not.toContain(String(tabID));
+  expect(
+    Object.values(h.claimObservationOutbox.current).map(
+      (entry) => entry.event_kind,
+    ),
+  ).toEqual(["owner_closed"]);
+});
+
+test("a vanished surface's birth record is retained when its owner_closed cannot be stored, and the retry queues one report", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    browserEpoch: string | undefined;
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  const record = fakeBirthRecord({
+    binding_id: bindingID,
+    tab_hint: tabID,
+    browser_epoch: internals.browserEpoch ?? "test-epoch",
+    job_id: "job_vanished_rejected",
+    claim: {
+      authentication_claim_id: "auth-vanished-rejected",
+      browser_holder_generation: 1,
+      gate_occurrence_id: "gate-vanished-rejected",
+    },
+  });
+  internals.tabLedgerCache = { [String(tabID)]: record };
+  await h.deps.tabLedger?.save({ [String(tabID)]: record });
+  await h.port.inbound(
+    helloAck({
+      features: ["surface_close_v1", "institutional_authentication_claim_v1"],
+    }),
+  );
+  const storageSet = h.deps.claimObservationOutbox!.set;
+  h.deps.claimObservationOutbox!.set = async () => {
+    throw new Error("storage quota exceeded");
+  };
+  h.tabs.forget(tabID);
+
+  await h.bridge.reconcileOwnedTabs();
+  expect(Object.keys(ledger.current())).toContain(String(tabID));
+
+  // Storage recovers: the next pass reports from the retained record and only
+  // then forgets it. The report the failed write left queued in memory is the
+  // same report, not a second one.
+  h.deps.claimObservationOutbox!.set = storageSet;
+  await h.bridge.reconcileOwnedTabs();
+  expect(Object.keys(ledger.current())).not.toContain(String(tabID));
+  expect(
+    Object.values(h.claimObservationOutbox.current).map(
+      (entry) => entry.event_kind,
+    ),
+  ).toEqual(["owner_closed"]);
+});
+
+// onTabRemoved had the same transfer in both of its branches: the record was
+// erased on the ledger chain while the owner_closed was only queued on the
+// outbox chain.
+test("a closed tab with no job keeps its birth record when its owner_closed cannot be stored", async () => {
+  const jobID = "job_claim_close_unstored";
+  const candidateID = "cand_close_unstored";
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?close=unstored`,
+  );
+
+  // An extension update clears the session-backed job and grant but leaves the
+  // birth certificate: the closing listener reports from the record alone.
+  const updated = simulateExtensionUpdate(h);
+  await updated.bridge.start();
+  await updated.port.inbound(
+    helloAck({ features: [AUTH_CLAIM], browser_holder_generation: 1 }),
+  );
+  expectLedgerRetains(ledger.current(), tabID);
+  updated.deps.claimObservationOutbox!.set = async () => {
+    throw new Error("storage quota exceeded");
+  };
+
+  await updated.tabs.userClose(tabID);
+  await settle();
+  expectLedgerRetains(ledger.current(), tabID);
+});
+
+test("a closed tab that still has its job keeps its birth record when its owner_closed cannot be stored", async () => {
+  const jobID = "job_bind_close_unstored";
+  const h = makeHarness();
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM],
+      browser_holder_generation: 5,
+    }),
+  );
+  await h.port.inbound(jobOffer(jobID));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  expect(tabID).toBeGreaterThanOrEqual(0);
+  const internals = h.bridge as unknown as {
+    registerClaimGrantFromBind(
+      jobID: string,
+      payload: Record<string, unknown>,
+    ): void;
+    persistClaimIdentity(jobID: string, tabID: number): Promise<void>;
+  };
+  internals.registerClaimGrantFromBind(jobID, {
+    outcome: "bound",
+    claim_id: "claim-bind-unstored",
+    binding_id: "binding-bind-unstored",
+    authentication_claim_id: "claim-auth-unstored",
+    gate_occurrence_id: "gate-occ-unstored",
+  });
+  await internals.persistClaimIdentity(jobID, tabID);
+  expectLedgerRetains(ledger.current(), tabID);
+  h.deps.claimObservationOutbox!.set = async () => {
+    throw new Error("storage quota exceeded");
+  };
+
+  await h.tabs.onRemoved.emit(tabID, { isWindowClosing: false });
+  await settle();
+  expectLedgerRetains(ledger.current(), tabID);
+});
+
+test("a vanished surface's birth record is erased only once its owner_closed is durable", async () => {
+  const h = makeHarness(undefined, { windows: true });
+  const ledger = installManagedTabLedger(h, {});
+  await h.bridge.start();
+  const { tabID, bindingID } = await seedOwnedScaffold(h);
+  const internals = h.bridge as unknown as {
+    browserEpoch: string | undefined;
+    tabLedgerCache: Record<string, SurfaceBirthRecord>;
+  };
+  const record = fakeBirthRecord({
+    binding_id: bindingID,
+    tab_hint: tabID,
+    browser_epoch: internals.browserEpoch ?? "test-epoch",
+    job_id: "job_vanished_erased",
+    claim: {
+      authentication_claim_id: "auth-vanished-erased",
+      browser_holder_generation: 1,
+      gate_occurrence_id: "gate-vanished-erased",
+    },
+  });
+  internals.tabLedgerCache = { [String(tabID)]: record };
+  await h.deps.tabLedger?.save({ [String(tabID)]: record });
+  await h.port.inbound(
+    helloAck({
+      features: ["surface_close_v1", "institutional_authentication_claim_v1"],
+    }),
+  );
+  h.tabs.forget(tabID);
+
+  const reconciled = h.bridge.reconcileOwnedTabs();
+  await settle();
+  // The report has been made durably and the record holding it erased.
+  expect(Object.keys(ledger.current())).not.toContain(String(tabID));
+  expect(
+    Object.values(h.claimObservationOutbox.current).map(
+      (entry) => entry.event_kind,
+    ),
+  ).toEqual(["owner_closed"]);
+  await reconciled;
 });
 
 // An older build ceded a tab the operator merely activated, and activation no

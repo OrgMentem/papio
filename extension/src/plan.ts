@@ -445,6 +445,17 @@ export function planExecution(
       return "";
     }
   };
+  // A selector the DOM rejects matches nothing. The readiness loop below reads
+  // the same rule selectors under the same rule, and the two must agree: a
+  // SyntaxError here escapes the deferred finish timer and leaves the plan
+  // promise pending forever.
+  const selectorPresent = (selector: string): boolean => {
+    try {
+      return root.querySelector(selector) !== null;
+    } catch {
+      return false;
+    }
+  };
 
   const classify = (
     allowDeferred: boolean,
@@ -463,7 +474,7 @@ export function planExecution(
       if (hasAll) {
         let ok = true;
         for (const selector of rule.all as string[]) {
-          if (root.querySelector(selector) === null) {
+          if (!selectorPresent(selector)) {
             ok = false;
             break;
           }
@@ -473,7 +484,7 @@ export function planExecution(
       if (hasAny) {
         let ok = false;
         for (const selector of rule.any as string[]) {
-          if (root.querySelector(selector) !== null) {
+          if (selectorPresent(selector)) {
             ok = true;
             break;
           }
@@ -1276,7 +1287,14 @@ export function planExecution(
     observer?.disconnect();
     clearTimeout(timer);
     clearTimeout(readyTimer);
-    deferred.resolve(buildPlan(allowDeferred));
+    // `settled` is already true, so a throw out of this timer callback would
+    // leave the promise pending forever for the injected caller. Reject it:
+    // the caller already treats a rejected plan as a plan it could not make.
+    try {
+      deferred.resolve(buildPlan(allowDeferred));
+    } catch (error) {
+      deferred.reject(error);
+    }
   };
   const settleWindowMs = Math.min(50, boundedMs);
   const scheduleWhenReady = (): void => {

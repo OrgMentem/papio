@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Window } from "happy-dom";
 
 import { adapters, type AdapterSpec, type PageVerdict } from "../src/adapters/types";
-import { planExecution, planGeneric, type ExpectedWork } from "../src/plan";
+import { planExecution, planGeneric, type ExpectedWork, type PlanResult } from "../src/plan";
 import { captureOrigin, parseHTML, verdictOf } from "./harness";
 
 function fixtureHTML(provider: string, scenario: string): string {
@@ -141,6 +141,117 @@ test("planExecution matches textAny needles case-insensitively, as its readiness
     "https://example.test/article",
   );
   expect(planExecution(doc, spec, {}, { access_mode: "delegated" }).verdict.kind).toBe("login");
+});
+
+test("planExecution treats a classify selector the DOM rejects as a non-match", () => {
+  const spec: AdapterSpec = {
+    id: "invalid-selector",
+    version: "1",
+    hosts: ["example.test"],
+    classify: [
+      // `all` needs every selector, so one the DOM rejects fails the rule.
+      { kind: "no_entitlement", all: [".article", "a[href"] },
+      // `any` needs one, so a rejected alternative is skipped, not fatal.
+      { kind: "login", any: ["div[unterminated", ".login"] },
+      { kind: "article", all: [".article"] },
+    ],
+  };
+  const login = parseHTML(
+    '<main class="article"></main><div class="login">Sign in</div>',
+    "https://example.test/article",
+  );
+  expect(planExecution(login, spec, {}, {}).verdict.kind).toBe("login");
+  const article = parseHTML('<main class="article"></main>', "https://example.test/article");
+  expect(planExecution(article, spec, {}, {}).verdict.kind).toBe("article");
+});
+
+type LiveSettlement =
+  | { state: "pending" }
+  | { state: "resolved"; plan: PlanResult }
+  | { state: "rejected"; error: unknown };
+
+/** Start a live (document-less) plan against a happy-dom page under fake
+ * timers, run its settle period, and report whether the promise settled. */
+async function settleLivePlan(
+  html: string,
+  spec: AdapterSpec,
+  expected: ExpectedWork,
+  settleMs: number,
+): Promise<LiveSettlement> {
+  const win = new Window({ url: "https://example.test/article" });
+  win.document.write(html);
+  vi.useFakeTimers();
+  const prior = {
+    document: Reflect.get(globalThis, "document"),
+    MutationObserver: Reflect.get(globalThis, "MutationObserver"),
+  };
+  Object.assign(globalThis, {
+    document: win.document,
+    MutationObserver: win.MutationObserver,
+  });
+  try {
+    let settlement: LiveSettlement = { state: "pending" };
+    void Promise.resolve(planExecution(null, spec, expected, { access_mode: "delegated" })).then(
+      (plan) => {
+        settlement = { state: "resolved", plan };
+      },
+      (error: unknown) => {
+        settlement = { state: "rejected", error };
+      },
+    );
+    vi.advanceTimersByTime(settleMs);
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    return settlement;
+  } finally {
+    Object.assign(globalThis, prior);
+    vi.useRealTimers();
+  }
+}
+
+test("planExecution live settling resolves when a deadline-deferred classify selector is invalid", async () => {
+  // The readiness loop skips a deadline-deferred rule, so the deadline's own
+  // classification is the first place its selector is evaluated.
+  const settlement = await settleLivePlan(
+    '<main class="article"></main>',
+    {
+      id: "settle-invalid-selector",
+      version: "1",
+      hosts: ["example.test"],
+      settleTimeoutMs: 40,
+      classify: [
+        { kind: "login", all: ["section[deferred-unterminated"], deferUntilDeadline: true },
+        { kind: "article", all: [".article"] },
+      ],
+    },
+    {},
+    60,
+  );
+  expect(settlement.state).toBe("resolved");
+  if (settlement.state === "resolved") expect(settlement.plan.verdict.kind).toBe("article");
+});
+
+test("planExecution live settling rejects instead of hanging when the plan cannot be built", async () => {
+  // The classifier never reads the requested work for a login rule, so this
+  // throws only inside the deferred finish, after the settle flag is set.
+  const unreadable: ExpectedWork = {
+    get doi(): string {
+      throw new Error("requested work unreadable");
+    },
+  };
+  const settlement = await settleLivePlan(
+    '<div class="login">Sign in</div>',
+    {
+      id: "settle-unbuildable",
+      version: "1",
+      hosts: ["example.test"],
+      settleTimeoutMs: 40,
+      classify: [{ kind: "login", all: [".login"] }],
+    },
+    unreadable,
+    60,
+  );
+  expect(settlement.state).toBe("rejected");
+  if (settlement.state === "rejected") expect(String(settlement.error)).toContain("requested work unreadable");
 });
 
 test("planExecution keeps href and meta URL extraction equivalent to live download semantics", () => {

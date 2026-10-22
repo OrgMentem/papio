@@ -135,6 +135,26 @@ for the full pre-split extension history.
   the first read of the tab ledger failed, the extension treated the ledger as
   empty and saved that over the stored one, so it forgot its claims and
   tombstones. It now keeps the stored ledger and reads it again next time.
+- **A failed storage read no longer erases the sign-in reports still waiting
+  for the daemon.** The extension queues each report of a closed sign-in tab, a
+  navigation error or a sign-in wall in session storage until the daemon
+  acknowledges it. When the first read of that queue failed, the extension
+  treated it as empty, and the next report replaced the stored queue with
+  itself, so an unacknowledged report vanished. It now writes nothing until it
+  has read the stored queue, sends nothing ahead of it, and refuses to ask the
+  daemon for a new sign-in claim while the queue cannot be read.
+- **A closed sign-in tab's record is kept until its report is stored.** After
+  the extension noticed that a tab it owned was gone, it deleted the record of
+  the tab before the "owner closed" report had been written. If the worker
+  stopped between the two writes, the daemon never learned that you closed the
+  tab, and the paper could be offered a new sign-in tab on its own. The record
+  now stays until the report is stored, and a report that cannot be stored is
+  made again on the next check. The daemon treats the repeat as a no-op.
+- **A page rule with an invalid selector no longer hangs the page check.** A
+  packaged adapter rule whose selector the browser rejects now counts as not
+  matching, in the same way the page-ready check already treated it. If the
+  page check fails for any other reason, the extension now reports that failure
+  instead of waiting for a result that never comes, so the job stays assisted.
 - When the browser refuses to close a tab, the extension no longer reports the
   paper as closed or offers to reopen a tab that is still open.
 - **A page whose `citation_pdf_url` is `http://` now offers the `https://`

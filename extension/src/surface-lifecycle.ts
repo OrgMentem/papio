@@ -251,7 +251,9 @@ export interface SurfaceLifecycleContext {
     record: SurfaceBirthRecord,
     daemonRefused: boolean,
   ): Promise<void>;
-  /** Report a vanished claim surface from its durable record alone. */
+  /** Report a vanished claim surface from its durable record alone. Resolves
+   * whether the report reached durable storage: the caller may erase the
+   * record it reported from only once it did. */
   enqueueRestartRecoveredObservation(
     entry: {
       job_id: string;
@@ -261,7 +263,7 @@ export interface SurfaceLifecycleContext {
       gate_occurrence_id: string;
     },
     eventKind: "owner_closed",
-  ): void;
+  ): Promise<boolean>;
 }
 
 export class SurfaceLifecycle {
@@ -857,8 +859,15 @@ export class SurfaceLifecycle {
           // during an extension reload and the library stayed occupied.
           //
           // Report the same restart-recovered owner_closed that onTabRemoved
-          // reports from this record. The enqueue only touches the observation
-          // outbox and schedules its drain, so it is safe inside this ledger
+          // reports from this record, and erase the record only once that
+          // report is DURABLE. Enqueueing is not persisting: the outbox and
+          // this ledger are two storage chains, so a worker death between
+          // the ledger write and the outbox write lost the only proof the
+          // surface ever existed. A report that cannot be stored keeps its
+          // record and is made again on the next pass; the daemon applies a
+          // replayed owner_closed as a no-op. The wait touches only the
+          // outbox's own write chain and storage, never the ledger or a
+          // native acknowledgement, so it cannot stall behind this
           // transaction.
           // Deliberately NOT gated on browser_epoch equality, unlike every
           // live-tab path below. Epoch equality exists to protect TAB-ID
@@ -879,7 +888,7 @@ export class SurfaceLifecycle {
             entry.binding_id !== undefined &&
             entry.claim !== undefined
           ) {
-            this.ctx.enqueueRestartRecoveredObservation(
+            const reported = await this.ctx.enqueueRestartRecoveredObservation(
               {
                 job_id: entry.job_id,
                 authentication_claim_id: entry.claim.authentication_claim_id,
@@ -890,6 +899,7 @@ export class SurfaceLifecycle {
               },
               "owner_closed",
             );
+            if (!reported) continue;
           }
           delete ledger[key];
           changed = true;
