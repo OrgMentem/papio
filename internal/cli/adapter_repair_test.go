@@ -86,12 +86,7 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 	row, fixture := storeAdapterRepairTestCapture(t, root, true)
 
 	var runnerPath string
-	result, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
-		Path: row.Path, Provider: row.AdapterID, Scenario: row.Scenario,
-		Host: row.Host, Captured: row.Timestamp, AdapterVersion: row.AdapterVersion,
-		SHA256: row.SHA256, SanitizerProvenance: row.SanitizerProvenance,
-		SanitizerVersion: row.SanitizerVersion, IndependentEvidence: row.IndependentEvidence,
-	}, adapterRepairDeps{
+	result, err := scaffoldAdapterRepair(context.Background(), captureFromRow(row), adapterRepairDeps{
 		RepoRoot: root,
 		Now:      func() time.Time { return time.Date(2026, 8, 10, 2, 3, 4, 0, time.UTC) },
 		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, args ...string) (string, error) {
@@ -201,113 +196,102 @@ func TestScaffoldAdapterRepairWritesApplicablePatches(t *testing.T) {
 	}
 }
 
-func TestScaffoldAdapterRepairOmitsTypesPatchWithoutCompleteCandidate(t *testing.T) {
-	root := t.TempDir()
-	writeAdapterRepairTestRepo(t, root)
-	row, _ := storeAdapterRepairTestCapture(t, root, true)
-
-	result, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
+// captureFromRow is the adapterRepairCapture a scaffold run is given for a
+// stored capture row.
+func captureFromRow(row captures.Capture) adapterRepairCapture {
+	return adapterRepairCapture{
 		Path: row.Path, Provider: row.AdapterID, Scenario: row.Scenario,
 		Host: row.Host, Captured: row.Timestamp, AdapterVersion: row.AdapterVersion,
 		SHA256: row.SHA256, SanitizerProvenance: row.SanitizerProvenance,
 		SanitizerVersion: row.SanitizerVersion, IndependentEvidence: row.IndependentEvidence,
-	}, adapterRepairDeps{
-		RepoRoot: root,
-		Now:      func() time.Time { return time.Date(2026, 8, 10, 3, 4, 5, 0, time.UTC) },
-		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, _ ...string) (string, error) {
-			if tool == "tools/adapter-repair.ts" {
+	}
+}
+
+// TestScaffoldAdapterRepairRefusesPatch: each row is one reason the scaffold
+// must not emit a patch it cannot stand behind, and the report must say why.
+func TestScaffoldAdapterRepairRefusesPatch(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		scenario    string
+		independent bool
+		now         time.Time
+		repairOut   func(t *testing.T, root string) (string, error)
+		tryOut      string
+		absent      []string
+		absentWhy   string
+		reportWants []string
+		reportWhy   string
+	}{
+		{
+			name: "no complete candidate", scenario: "success", independent: true,
+			now: time.Date(2026, 8, 10, 3, 4, 5, 0, time.UTC),
+			repairOut: func(*testing.T, string) (string, error) {
 				return `{"provider":"jstor","scenario":"success","rule_kind":"article","rule_index":0,"candidates":[]}`, nil
-			}
-			return "adapter-try found no matching selector", nil
-		}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, statErr := os.Stat(filepath.Join(result.Workspace, "types.ts.patch")); !os.IsNotExist(statErr) {
-		t.Fatalf("types.ts.patch exists without a complete candidate: %v", statErr)
-	}
-	report, err := os.ReadFile(result.Report)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(report), "No selector candidate passed classifier matching") ||
-		!strings.Contains(string(report), "No types.ts.patch was emitted") {
-		t.Fatalf("report omits the no-candidate reason: %s", report)
-	}
-}
-
-func TestScaffoldAdapterRepairKeepsRevisionLockedWithoutIndependentEvidence(t *testing.T) {
-	root := t.TempDir()
-	writeAdapterRepairTestRepo(t, root)
-	row, _ := storeAdapterRepairTestCapture(t, root, false)
-
-	result, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
-		Path: row.Path, Provider: row.AdapterID, Scenario: row.Scenario,
-		Host: row.Host, Captured: row.Timestamp, AdapterVersion: row.AdapterVersion,
-		SHA256: row.SHA256, SanitizerProvenance: row.SanitizerProvenance,
-		SanitizerVersion: row.SanitizerVersion, IndependentEvidence: row.IndependentEvidence,
-	}, adapterRepairDeps{
-		RepoRoot: root,
-		Now:      func() time.Time { return time.Date(2026, 8, 10, 4, 5, 6, 0, time.UTC) },
-		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, _ ...string) (string, error) {
-			if tool == "tools/adapter-repair.ts" {
+			},
+			tryOut:      "adapter-try found no matching selector",
+			absent:      []string{"types.ts.patch"},
+			absentWhy:   "types.ts.patch exists without a complete candidate",
+			reportWants: []string{"No selector candidate passed classifier matching", "No types.ts.patch was emitted"},
+			reportWhy:   "report omits the no-candidate reason",
+		},
+		{
+			name: "no independent evidence", scenario: "success", independent: false,
+			now: time.Date(2026, 8, 10, 4, 5, 6, 0, time.UTC),
+			repairOut: func(t *testing.T, root string) (string, error) {
 				return completeAdapterRepairOutput(t, root), nil
-			}
-			return "adapter-try found a missing selector", nil
-		}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, statErr := os.Stat(filepath.Join(result.Workspace, "types.ts.patch")); !os.IsNotExist(statErr) {
-		t.Fatalf("types.ts.patch bypassed the independent-evidence gate: %v", statErr)
-	}
-	report, err := os.ReadFile(result.Report)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(report), "revision promotion is locked") ||
-		!strings.Contains(string(report), "Independent evidence is absent") {
-		t.Fatalf("report does not explain the independent-evidence gate: %s", report)
-	}
-}
-
-func TestScaffoldAdapterRepairStopsWhenAdapterLacksScenarioRule(t *testing.T) {
-	root := t.TempDir()
-	writeAdapterRepairTestRepo(t, root)
-	row, _ := storeAdapterRepairScenarioCapture(t, root, "no-entitlement", true)
-
-	result, err := scaffoldAdapterRepair(context.Background(), adapterRepairCapture{
-		Path: row.Path, Provider: row.AdapterID, Scenario: row.Scenario,
-		Host: row.Host, Captured: row.Timestamp, AdapterVersion: row.AdapterVersion,
-		SHA256: row.SHA256, SanitizerProvenance: row.SanitizerProvenance,
-		SanitizerVersion: row.SanitizerVersion, IndependentEvidence: row.IndependentEvidence,
-	}, adapterRepairDeps{
-		RepoRoot: root,
-		Now:      func() time.Time { return time.Date(2026, 8, 10, 5, 6, 7, 0, time.UTC) },
-		Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, _ ...string) (string, error) {
-			if tool == "tools/adapter-repair.ts" {
+			},
+			tryOut:      "adapter-try found a missing selector",
+			absent:      []string{"types.ts.patch"},
+			absentWhy:   "types.ts.patch bypassed the independent-evidence gate",
+			reportWants: []string{"revision promotion is locked", "Independent evidence is absent"},
+			reportWhy:   "report does not explain the independent-evidence gate",
+		},
+		{
+			name: "adapter lacks the scenario rule", scenario: "no-entitlement", independent: true,
+			now: time.Date(2026, 8, 10, 5, 6, 7, 0, time.UTC),
+			repairOut: func(*testing.T, string) (string, error) {
 				return "", errors.New("adapter jstor has no no_entitlement rule")
+			},
+			tryOut:      "adapter-try classified the page as unknown",
+			absent:      []string{"adapters.test.ts.patch", "types.ts.patch"},
+			absentWhy:   "patch exists for an unsupported adapter scenario",
+			reportWants: []string{"Patch generation stopped", "adapter jstor has no no_entitlement rule"},
+			reportWhy:   "report omits the unsupported-rule reason",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeAdapterRepairTestRepo(t, root)
+			row, _ := storeAdapterRepairScenarioCapture(t, root, test.scenario, test.independent)
+
+			result, err := scaffoldAdapterRepair(context.Background(), captureFromRow(row), adapterRepairDeps{
+				RepoRoot: root,
+				Now:      func() time.Time { return test.now },
+				Run: adapterRepairRunnerFunc(func(_ context.Context, _ string, tool string, _ ...string) (string, error) {
+					if tool == "tools/adapter-repair.ts" {
+						return test.repairOut(t, root)
+					}
+					return test.tryOut, nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			return "adapter-try classified the page as unknown", nil
-		}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"adapters.test.ts.patch", "types.ts.patch"} {
-		if _, statErr := os.Stat(filepath.Join(result.Workspace, name)); !os.IsNotExist(statErr) {
-			t.Fatalf("%s exists for an unsupported adapter scenario: %v", name, statErr)
-		}
-	}
-	report, err := os.ReadFile(result.Report)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(report), "Patch generation stopped") ||
-		!strings.Contains(string(report), "adapter jstor has no no_entitlement rule") {
-		t.Fatalf("report omits the unsupported-rule reason: %s", report)
+			for _, name := range test.absent {
+				if _, statErr := os.Stat(filepath.Join(result.Workspace, name)); !os.IsNotExist(statErr) {
+					t.Fatalf("%s: %s: %v", test.absentWhy, name, statErr)
+				}
+			}
+			report, err := os.ReadFile(result.Report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range test.reportWants {
+				if !strings.Contains(string(report), want) {
+					t.Fatalf("%s: %s", test.reportWhy, report)
+				}
+			}
+		})
 	}
 }
 

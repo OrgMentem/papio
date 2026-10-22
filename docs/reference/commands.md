@@ -57,7 +57,7 @@ papio acquire [identifier] [flags]
 | `--max-cost` | `float64` | `0` | maximum paid-source cost in USD |
 | `--openalex` | `string` |  | OpenAlex work ID |
 | `--pmid` | `string` |  | PubMed ID |
-| `--request-id` | `string` |  | stable idempotency key |
+| `--request-id` | `string` |  | convergence key: resubmitting it returns the same still-live job; once that job finishes, the same key queues a fresh attempt |
 | `--resolver` | `string` |  | named institutional OpenURL resolver profile |
 | `--source` | `stringSlice` | `[]` | allow only this source (repeatable) |
 | `--title` | `string` |  | work title |
@@ -740,7 +740,16 @@ papio delivery
 
 ### `papio delivery cancel`
 
-Cancel a document-delivery request, where the provider supports it
+Cancel a document-delivery request that has not reached the provider
+
+Cancel a document-delivery request that has not reached the provider.
+
+papio cancels a request locally while it is still offered or declined. It
+cannot cancel a request that is already live at the provider: no provider
+adapter supports API cancellation, so cancel that one directly with the
+institution. For a request in unknown_outcome, check with the provider and
+then use 'papio delivery confirm-absent'. A refused cancellation exits
+nonzero.
 
 ```
 papio delivery cancel <job-id>
@@ -898,7 +907,7 @@ papio export ledger [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--consumer` | `string` |  | only works submitted by this consumer |
-| `--since` | `string` |  | only works submitted after this instant (RFC3339) or within this duration (Go form, e.g. 720h) |
+| `--since` | `string` |  | only works submitted after this instant (RFC3339) or within this duration (e.g. 24h, 7d) |
 | `--state` | `string` | `acquired` | which works to export: acquired (ready or imported; validated acquisitions), ready (not yet imported) or any (every job) |
 
 ### `papio export watch`
@@ -1166,7 +1175,7 @@ papio jobs failures [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--limit` | `int` | `50` | maximum groups (1-200) |
-| `--since` | `string` |  | include jobs updated since a duration or RFC3339 timestamp |
+| `--since` | `string` |  | include jobs updated since an RFC3339 timestamp or within this duration (e.g. 24h, 7d) |
 
 ### `papio jobs filing`
 
@@ -1239,7 +1248,7 @@ papio jobs incidents [flags]
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--limit` | `int` | `50` | maximum groups (1-200) |
-| `--since` | `string` |  | include incidents recorded since a duration or RFC3339 timestamp |
+| `--since` | `string` |  | include incidents recorded since an RFC3339 timestamp or within this duration (e.g. 24h, 7d) |
 
 ### `papio jobs list`
 
@@ -1583,7 +1592,7 @@ papio stats producers [flags]
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--since` | `string` | `24h` | count promotions since this RFC3339 instant or within this Go duration (e.g. 24h) |
+| `--since` | `string` | `24h` | count promotions since this RFC3339 instant or within this duration (e.g. 24h, 7d) |
 | `--until` | `string` |  | count promotions before this RFC3339 instant (default now) |
 
 ## `papio status`

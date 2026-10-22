@@ -226,7 +226,7 @@ func newExportCommand(opt *options) *cobra.Command {
 		},
 	}
 	ledgerCommand.Flags().StringVar(&state, "state", "acquired", "which works to export: acquired (ready or imported; validated acquisitions), ready (not yet imported) or any (every job)")
-	ledgerCommand.Flags().StringVar(&since, "since", "", "only works submitted after this instant (RFC3339) or within this duration (Go form, e.g. 720h)")
+	ledgerCommand.Flags().StringVar(&since, "since", "", "only works submitted after this instant (RFC3339) or within this duration (e.g. 24h, 7d)")
 	ledgerCommand.Flags().StringVar(&consumer, "consumer", "", "only works submitted by this consumer")
 
 	command.AddCommand(jobCommand, batchCommand, watchCommand, ledgerCommand)
@@ -314,21 +314,15 @@ func ledgerPageMissesCutoff(rows []api.JobRow, cutoff time.Time) bool {
 	return true
 }
 
+// parseSinceInstant resolves a --since value through api.ParseSince, the one
+// grammar the daemon's jobs.failures/jobs.incidents also use: a Go duration, a
+// whole number of days ("7d"), or an RFC3339 instant.
 func parseSinceInstant(since string) (time.Time, error) {
-	since = strings.TrimSpace(since)
-	if since == "" {
-		return time.Time{}, nil
+	at, err := api.ParseSince(since, time.Now())
+	if err != nil {
+		return time.Time{}, fmt.Errorf("--since must be an RFC3339 instant or a non-negative duration such as 24h or 7d, got %q", strings.TrimSpace(since))
 	}
-	if d, err := time.ParseDuration(since); err == nil {
-		if d < 0 {
-			return time.Time{}, fmt.Errorf("--since duration must be positive")
-		}
-		return time.Now().Add(-d), nil
-	}
-	if at, err := time.Parse(time.RFC3339, since); err == nil {
-		return at, nil
-	}
-	return time.Time{}, fmt.Errorf("--since must be an RFC3339 instant or a Go duration, got %q", since)
+	return at, nil
 }
 
 func recordFromWorkRequest(request protocol.WorkRequest) cite.Record {

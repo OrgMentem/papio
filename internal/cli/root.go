@@ -184,7 +184,9 @@ func defaultConfigPath() string { return filepath.Join(config.Dir(), "config.tom
 func (o *options) loadConfig() (config.Config, error) {
 	if o.configPath != "" && filepath.Clean(o.configPath) != defaultConfigPath() {
 		if _, err := os.Stat(o.configPath); errors.Is(err, os.ErrNotExist) {
-			return config.Config{}, &errConfigMissing{path: o.configPath}
+			// A mistyped path is an argument mistake, so --json reports
+			// invalid_argument rather than the generic code. The message is unchanged.
+			return config.Config{}, &usageError{err: &errConfigMissing{path: o.configPath}}
 		}
 	}
 	if o.configLoader != nil {
@@ -245,9 +247,30 @@ func (o *options) autostarter(socket string) *daemon.Autostarter {
 
 func (o *options) socketCall(ctx context.Context, socket, method string, params, result any) error {
 	if o.rpcCall != nil {
-		return o.rpcCall(ctx, socket, method, params, result)
+		return pointAtDaemonLog(o.rpcCall(ctx, socket, method, params, result), socket)
 	}
-	return callSocket(ctx, socket, method, params, result)
+	return pointAtDaemonLog(callSocket(ctx, socket, method, params, result), socket)
+}
+
+// daemonBareFailure is the fixed message the daemon sends for an error it did
+// not classify (internal/api failure's default arm). The cause stays out of the
+// wire message because it can carry paths or SQL; it goes to the daemon log.
+const daemonBareFailure = "operation failed"
+
+// pointAtDaemonLog tells the operator where the cause of an unclassified daemon
+// failure is. The daemon cannot name its own log: the wire message is a fixed
+// template and the IPC Response is fail-closed, so nothing is added to it. The
+// CLI knows the socket, and the autostarted daemon logs to daemon.log beside
+// it. A failure with detail (a Zotio class, a watch hint) already says more
+// and is left alone.
+func pointAtDaemonLog(err error, socket string) error {
+	var remote *ipc.RemoteError
+	if !errors.As(err, &remote) || remote == nil || remote.Code != "internal" || remote.Message != daemonBareFailure || remote.Detail != nil {
+		return err
+	}
+	amended := *remote
+	amended.Message = daemonBareFailure + "; the cause is in the daemon log (" + filepath.Join(filepath.Dir(socket), "daemon.log") + ")"
+	return &amended
 }
 
 func callSocket(ctx context.Context, socket, method string, params, result any) error {

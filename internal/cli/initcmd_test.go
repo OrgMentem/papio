@@ -18,6 +18,7 @@ import (
 	"papio/internal/doctor"
 	"papio/internal/institution"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 type initTestCloser struct{}
@@ -50,7 +51,30 @@ func isolatedInitConfigLoader(t *testing.T, home string) func(string) (config.Co
 	}
 }
 
+// initTestDependencies seeds an already-migrated database before bootstrap, so
+// the tests about verdict text, prompts and routing do not each re-run the full
+// migration chain (~1.7s under -race; AGENTS.md "store-per-test"). Only the test
+// that is about migration uses initMigratingTestDependencies.
 func initTestDependencies(t *testing.T, home string) initDependencies {
+	t.Helper()
+	deps := initMigratingTestDependencies(t, home)
+	deps.Bootstrap = func(ctx context.Context, cfg config.Config) (io.Closer, error) {
+		if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+			return nil, err
+		}
+		// A rerun finds the database its first init made; keep it.
+		if _, err := os.Stat(filepath.Join(cfg.DataDir, "papio.db")); errors.Is(err, os.ErrNotExist) {
+			if err := storetest.Seed(cfg.DataDir); err != nil {
+				return nil, err
+			}
+		}
+		return bootstrap.New(ctx, cfg)
+	}
+	return deps
+}
+
+// initMigratingTestDependencies bootstraps a fresh data dir, so real migrations run.
+func initMigratingTestDependencies(t *testing.T, home string) initDependencies {
 	t.Helper()
 	return initDependencies{
 		LoadConfig: isolatedInitConfigLoader(t, home),
@@ -85,7 +109,7 @@ func runInitForTest(t *testing.T, path string, deps initDependencies, args ...st
 func TestInitFreshWritesConfigAndAppliesMigrations(t *testing.T) {
 	home := initHome(t)
 	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t, home)
+	deps := initMigratingTestDependencies(t, home)
 
 	out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser")
 	if err != nil {

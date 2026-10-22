@@ -67,12 +67,21 @@ type credentialConfigResult struct {
 	EnvironmentOverride string `json:"environment_override,omitempty"`
 }
 
+// credentialArgs validates a credential subcommand's positional count. Only the
+// `set` verbs (credentials set, agent set) take a secret, so only their refusal
+// warns about putting one in the argument list; the other subcommands take a
+// target or a reference, and their refusal shows the usage line. No message
+// echoes an argument, which might be the secret. The error is a usageError, so
+// --json reports invalid_argument like every other argument mistake.
 func credentialArgs(min, max int) cobra.PositionalArgs {
-	return func(_ *cobra.Command, args []string) error {
-		if len(args) < min || len(args) > max {
-			return errors.New("incorrect arguments; credentials must be supplied at the hidden prompt or through --key-stdin, never as arguments")
+	return func(cmd *cobra.Command, args []string) error {
+		if len(args) >= min && len(args) <= max {
+			return nil
 		}
-		return nil
+		if cmd.Name() == "set" {
+			return &usageError{err: errors.New("incorrect arguments; credentials must be supplied at the hidden prompt or through --key-stdin, never as arguments")}
+		}
+		return &usageError{err: fmt.Errorf("incorrect arguments; usage: %s", cmd.UseLine())}
 	}
 }
 

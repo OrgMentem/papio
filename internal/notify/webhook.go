@@ -110,10 +110,20 @@ func (w *Webhook) SendEventResult(ctx context.Context, event Event) error {
 		return fmt.Errorf("webhook: no response from endpoint")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("webhook: unexpected status %s", response.Status)
+		return &WebhookStatusError{StatusCode: response.StatusCode, Status: response.Status}
 	}
 	return nil
 }
+
+// WebhookStatusError is a webhook endpoint's non-2xx answer. The status code
+// carries no secret, so operator surfaces may show it; unlike a transport error
+// it never quotes the endpoint URL.
+type WebhookStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *WebhookStatusError) Error() string { return "webhook: unexpected status " + e.Status }
 
 // WebhookDeliveryKey returns the stable per-row delivery key the router
 // attaches to every ledger-backed webhook POST. The key is the durable row

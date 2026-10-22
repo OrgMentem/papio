@@ -33,7 +33,7 @@ func listFailures(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if params.Limit < 0 {
 		return badParams(errors.New("limit must not be negative"))
 	}
-	since, err := parseFailuresSince(params.Since, time.Now().UTC())
+	since, err := ParseSince(params.Since, time.Now().UTC())
 	if err != nil {
 		return badParams(err)
 	}
@@ -51,7 +51,12 @@ func listFailures(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	return marshal(result)
 }
 
-func parseFailuresSince(value string, now time.Time) (time.Time, error) {
+// ParseSince is the one parser for every --since lookback: a Go duration
+// ("24h"), a whole number of days ("7d", which time.ParseDuration lacks), or an
+// RFC3339 instant. The daemon's jobs.failures/jobs.incidents and the CLI's
+// export ledger and stats producers all use it, so a form that works on one
+// command works on all of them. An empty value is the zero time (no cutoff).
+func ParseSince(value string, now time.Time) (time.Time, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return time.Time{}, nil
@@ -59,19 +64,21 @@ func parseFailuresSince(value string, now time.Time) (time.Time, error) {
 	if strings.HasSuffix(value, "d") {
 		days, err := strconv.ParseInt(strings.TrimSuffix(value, "d"), 10, 64)
 		if err != nil || days < 0 || days > int64(time.Duration(1<<63-1)/(24*time.Hour)) {
-			return time.Time{}, errors.New("since must be a non-negative duration or RFC3339 timestamp")
+			return time.Time{}, errSinceForm
 		}
 		return now.Add(-time.Duration(days) * 24 * time.Hour), nil
 	}
 	if duration, err := time.ParseDuration(value); err == nil {
 		if duration < 0 {
-			return time.Time{}, errors.New("since must be a non-negative duration or RFC3339 timestamp")
+			return time.Time{}, errSinceForm
 		}
 		return now.Add(-duration), nil
 	}
 	timestamp, err := time.Parse(time.RFC3339, value)
 	if err != nil {
-		return time.Time{}, errors.New("since must be a non-negative duration or RFC3339 timestamp")
+		return time.Time{}, errSinceForm
 	}
 	return timestamp.UTC(), nil
 }
+
+var errSinceForm = errors.New("since must be a non-negative duration (such as 24h or 7d) or RFC3339 timestamp")

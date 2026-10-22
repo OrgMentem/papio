@@ -804,7 +804,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 			return truncationNoticeUpTo(opt, incidentTruncated, len(incidentRows), "incident groups", job.FailuresLimitMax)
 		},
 	}
-	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since a duration or RFC3339 timestamp")
+	failures.Flags().StringVar(&failuresSince, "since", "", "include jobs updated since an RFC3339 timestamp or within this duration (e.g. 24h, 7d)")
 	failures.Flags().IntVar(&failuresLimit, "limit", 50, "maximum groups (1-200)")
 	var incidentsSince string
 	var incidentsLimit int
@@ -844,7 +844,7 @@ func newJobsCommand(opt *options) *cobra.Command {
 			return truncationNoticeUpTo(opt, truncated, len(rows), "incident groups", job.FailuresLimitMax)
 		},
 	}
-	incidents.Flags().StringVar(&incidentsSince, "since", "", "include incidents recorded since a duration or RFC3339 timestamp")
+	incidents.Flags().StringVar(&incidentsSince, "since", "", "include incidents recorded since an RFC3339 timestamp or within this duration (e.g. 24h, 7d)")
 	incidents.Flags().IntVar(&incidentsLimit, "limit", 50, "maximum groups (1-200)")
 
 	diagnose := newJobsDiagnoseCommand(opt)

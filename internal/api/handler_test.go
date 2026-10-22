@@ -1354,16 +1354,16 @@ func TestZotioFailureCarriesOnlySafeTaxonomyDetail(t *testing.T) {
 	}
 }
 
-func TestParseFailuresSinceRejectsNegativeLookbacks(t *testing.T) {
+func TestParseSinceRejectsNegativeLookbacks(t *testing.T) {
 	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
 	for _, value := range []string{"-1", "-1d", "-1h"} {
 		t.Run(value, func(t *testing.T) {
-			_, err := parseFailuresSince(value, now)
+			_, err := ParseSince(value, now)
 			if err == nil {
-				t.Fatalf("parseFailuresSince(%q) succeeded", value)
+				t.Fatalf("ParseSince(%q) succeeded", value)
 			}
-			if err.Error() != "since must be a non-negative duration or RFC3339 timestamp" {
-				t.Fatalf("parseFailuresSince(%q) error = %q", value, err)
+			if err.Error() != "since must be a non-negative duration (such as 24h or 7d) or RFC3339 timestamp" {
+				t.Fatalf("ParseSince(%q) error = %q", value, err)
 			}
 		})
 	}

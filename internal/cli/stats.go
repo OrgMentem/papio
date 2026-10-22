@@ -105,7 +105,7 @@ func newStatsProducersCommand(opt *options) *cobra.Command {
 			return nil
 		},
 	}
-	command.Flags().StringVar(&since, "since", "24h", "count promotions since this RFC3339 instant or within this Go duration (e.g. 24h)")
+	command.Flags().StringVar(&since, "since", "24h", "count promotions since this RFC3339 instant or within this duration (e.g. 24h, 7d)")
 	command.Flags().StringVar(&until, "until", "", "count promotions before this RFC3339 instant (default now)")
 	return command
 }

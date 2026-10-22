@@ -4,10 +4,15 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"strings"
+	"syscall"
 	"time"
 
 	"papio/internal/bootstrap"
@@ -168,8 +173,9 @@ type NotifyWebhookTestResult struct {
 }
 
 // notifyWebhookTest posts one test event through the webhook leg. The error
-// from the sender is not echoed: a transport error carries the endpoint URL,
-// whose path or query can be a secret.
+// from the sender is never echoed: a transport error carries the endpoint URL,
+// whose path or query can be a secret. What is reported instead is URL-free: the
+// HTTP status the endpoint answered with, or the category of transport failure.
 func notifyWebhookTest(ctx context.Context, raw json.RawMessage, system *bootstrap.System) ([]byte, *ipc.RPCError) {
 	var params NotifyWebhookTestParams
 	if err := ipc.DecodeParams(raw, &params); err != nil {
@@ -187,8 +193,62 @@ func notifyWebhookTest(ctx context.Context, raw json.RawMessage, system *bootstr
 	case errors.Is(err, notify.ErrWebhookNotConfigured):
 		return nil, &ipc.RPCError{Code: "unavailable", Message: err.Error() + "; set notify.webhook_url or a webhook credential"}
 	case err != nil:
-		return nil, &ipc.RPCError{Code: "unavailable", Message: "the webhook endpoint did not accept the test notification (transport error or non-2xx answer)"}
+		return webhookTestFailure(err)
 	}
 	format := system.Notify.WebhookFormat()
 	return marshal(NotifyWebhookTestResult{Category: string(category), Message: message, Format: format, Acknowledged: true, Detail: "posted to the configured webhook as " + format + "; the endpoint answered with a 2xx status"})
+}
+
+// webhookTestFailure answers a failed webhook test with a cause the operator
+// can act on and the endpoint URL cannot leak through. A non-2xx answer carries
+// the HTTP status (also in Detail.ErrorHTTPStatus, so --json reports it as
+// http_status); a transport failure carries a URL-free category. Only the
+// classified cause reaches the daemon log, never the raw error.
+func webhookTestFailure(err error) ([]byte, *ipc.RPCError) {
+	var status *notify.WebhookStatusError
+	if errors.As(err, &status) {
+		log.Printf("rpc notify webhook test: the endpoint answered HTTP %d", status.StatusCode)
+		message := fmt.Sprintf("the webhook endpoint answered HTTP %d", status.StatusCode)
+		switch status.StatusCode {
+		case 401, 403:
+			message += "; check the webhook credential"
+		case 404:
+			message += "; check the path of notify.webhook_url"
+		case 413, 415:
+			message += "; check notify.webhook_format"
+		}
+		return nil, &ipc.RPCError{Code: "unavailable", Message: message, Detail: &ipc.ErrorDetail{ErrorHTTPStatus: status.StatusCode}}
+	}
+	cause := webhookTransportCause(err)
+	log.Printf("rpc notify webhook test: transport failure: %s", cause)
+	return nil, &ipc.RPCError{Code: "unavailable", Message: "the webhook endpoint could not be reached: " + cause}
+}
+
+// webhookTransportCause names a transport failure without the URL that the
+// underlying error quotes.
+func webhookTransportCause(err error) string {
+	var (
+		dns        *net.DNSError
+		unknownCA  x509.UnknownAuthorityError
+		hostname   x509.HostnameError
+		invalid    x509.CertificateInvalidError
+		verify     *tls.CertificateVerificationError
+		recordSize tls.RecordHeaderError
+		alert      tls.AlertError
+		netErr     net.Error
+	)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "the request was cancelled"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "the request timed out"
+	case errors.As(err, &dns):
+		return "DNS lookup failed"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection refused"
+	case errors.As(err, &unknownCA), errors.As(err, &hostname), errors.As(err, &invalid), errors.As(err, &verify), errors.As(err, &recordSize), errors.As(err, &alert):
+		return "TLS handshake failed"
+	default:
+		return "transport error"
+	}
 }

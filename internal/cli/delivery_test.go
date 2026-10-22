@@ -325,11 +325,15 @@ func TestDeliverySubmitWithoutConfirmNeverReachesTheProvider(t *testing.T) {
 		args    []string
 		preview api.DeliveryPreviewResult
 		want    []string
+		// warns: the refusal says --confirm places a real provider request.
+		// Only the preview verdict that would place one may say so.
+		warns bool
 	}{
 		{
 			name: "fresh job, auto capable gate", args: []string{"delivery", "submit", "job_01"},
 			preview: api.DeliveryPreviewResult{Preview: true, Configured: true, Provider: "illiad", Branch: "evaluate_gate", Verdict: "submit", GateClass: "auto_capable"},
 			want:    []string{"job_01: --confirm would place a real provider request with illiad (gate auto_capable)"},
+			warns:   true,
 		},
 		{
 			name: "fresh job, prefill only gate", args: []string{"delivery", "submit", "job_01"},
@@ -350,6 +354,7 @@ func TestDeliverySubmitWithoutConfirmNeverReachesTheProvider(t *testing.T) {
 			name: "json", args: []string{"--json", "delivery", "submit", "job_01"},
 			preview: api.DeliveryPreviewResult{Preview: true, Configured: true, Provider: "illiad", Branch: "evaluate_gate", Verdict: "submit", GateClass: "auto_capable"},
 			want:    []string{`"preview":true`, `"verdict":"submit"`},
+			warns:   true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -365,8 +370,17 @@ func TestDeliverySubmitWithoutConfirmNeverReachesTheProvider(t *testing.T) {
 				return nil
 			})
 			root.SetArgs(test.args)
-			if err := root.Execute(); !errors.Is(err, errDeliverySubmitUnconfirmed) {
+			err := root.Execute()
+			if !errors.Is(err, errDeliverySubmitUnconfirmed) {
 				t.Fatalf("err = %v, want errDeliverySubmitUnconfirmed", err)
+			}
+			if got := strings.Contains(err.Error(), "places a real provider request"); got != test.warns {
+				t.Fatalf("err = %q: warns of a real provider request = %t, want %t", err, got, test.warns)
+			}
+			// An unconfigured route has nothing for --confirm to do, so the
+			// refusal must not send the operator back to it.
+			if unconfigured := !test.preview.Configured; unconfigured == strings.Contains(err.Error(), "--confirm") {
+				t.Fatalf("err = %q: names --confirm = %t for an unconfigured route = %t", err, !unconfigured, unconfigured)
 			}
 			for _, want := range test.want {
 				if !strings.Contains(stdout.String(), want) {

@@ -23,7 +23,8 @@ var (
 )
 
 // newDeliveryCommand is ADR-0017 Decision 1's new CLI surface for document
-// delivery / ILL: get, submit, and cancel where the provider supports it,
+// delivery / ILL: get, submit, and a local cancel of a request that never
+// reached a provider (no provider adapter can cancel a live one),
 // plus Decision 4's three reconciliation operations for a job stuck in
 // unknown_outcome (history, confirm-exists, confirm-absent), plus resume
 // for a live request whose poll failed (e.g. a contract-drift park). Per
@@ -140,10 +141,27 @@ func newDeliverySubmitCommand(opt *options) *cobra.Command {
 	return command
 }
 
-// errDeliverySubmitUnconfirmed refuses `delivery submit` without --confirm:
-// the gate's submit verdict places an irreversible provider request, so the
-// command must never reach it by default.
-var errDeliverySubmitUnconfirmed = errors.New("delivery submit places a real provider request when the gate allows it, and papio cannot cancel that request; re-run with --confirm to proceed")
+// errDeliverySubmitUnconfirmed is the sentinel for `delivery submit` without
+// --confirm. The gate's submit verdict places an irreversible provider
+// request, so the command must never reach it by default; the wrapping error
+// (see deliverySubmitUnconfirmed) warns of that only when the preview says
+// --confirm would actually place one.
+var errDeliverySubmitUnconfirmed = errors.New("delivery submit not confirmed")
+
+// deliverySubmitUnconfirmed builds the refusal for the preview verdict. Only
+// the outcome that places a real provider request carries the warning that
+// papio cannot cancel it; a prefill, an existing request, or an unconfigured
+// route must not tell the operator a request is about to be placed, and an
+// unconfigured route must not send them to --confirm, which would do nothing.
+func deliverySubmitUnconfirmed(preview api.DeliveryPreviewResult) error {
+	switch {
+	case !preview.Configured:
+		return fmt.Errorf("%w: no document-delivery route is configured; nothing to submit", errDeliverySubmitUnconfirmed)
+	case preview.Branch == "evaluate_gate" && preview.Verdict == "submit":
+		return fmt.Errorf("%w: --confirm places a real provider request, and papio cannot cancel that request; re-run with --confirm to proceed", errDeliverySubmitUnconfirmed)
+	}
+	return fmt.Errorf("%w: preview only; nothing was submitted; re-run with --confirm to act on it", errDeliverySubmitUnconfirmed)
+}
 
 // previewDeliverySubmit is the no-side-effect half of `delivery submit`: it
 // asks the daemon what --confirm would do (delivery.preview) so the operator
@@ -166,7 +184,7 @@ func previewDeliverySubmit(cmd *cobra.Command, opt *options, jobID string) error
 	} else if _, err := fmt.Fprintf(opt.out, "%s: %s\n", jobID, describeDeliveryPreview(preview)); err != nil {
 		return err
 	}
-	return errDeliverySubmitUnconfirmed
+	return deliverySubmitUnconfirmed(preview)
 }
 
 // describeDeliveryPreview says in one line what `delivery submit --confirm`
@@ -195,8 +213,15 @@ func describeDeliveryPreview(preview api.DeliveryPreviewResult) string {
 func newDeliveryCancelCommand(opt *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "cancel <job-id>",
-		Short: "Cancel a document-delivery request, where the provider supports it",
-		Args:  cobra.ExactArgs(1),
+		Short: "Cancel a document-delivery request that has not reached the provider",
+		Long: "Cancel a document-delivery request that has not reached the provider.\n\n" +
+			"papio cancels a request locally while it is still offered or declined. It\n" +
+			"cannot cancel a request that is already live at the provider: no provider\n" +
+			"adapter supports API cancellation, so cancel that one directly with the\n" +
+			"institution. For a request in unknown_outcome, check with the provider and\n" +
+			"then use 'papio delivery confirm-absent'. A refused cancellation exits\n" +
+			"nonzero.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var result api.DeliveryCancelResult
 			if err := opt.call(cmd.Context(), "delivery.cancel", map[string]string{"job_id": args[0]}, &result); err != nil {

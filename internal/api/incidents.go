@@ -30,7 +30,7 @@ func listJobIncidents(ctx context.Context, raw json.RawMessage, system *bootstra
 	if params.Limit < 0 {
 		return badParams(errors.New("limit must not be negative"))
 	}
-	since, err := parseFailuresSince(params.Since, time.Now().UTC())
+	since, err := ParseSince(params.Since, time.Now().UTC())
 	if err != nil {
 		return badParams(err)
 	}
