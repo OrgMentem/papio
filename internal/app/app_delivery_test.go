@@ -69,6 +69,22 @@ func newDeliveryTestService(t *testing.T) (*Service, *job.Store, *delivery.Servi
 	return svc, svc.Jobs, deliverySvc
 }
 
+// newAutoCapableDeliveryService wires a delivery test service to an ILLiad
+// test server with the auto-capable profile, the fixture resolvers, and a
+// recorded live acceptance.
+func newAutoCapableDeliveryService(t *testing.T, server *httptest.Server) (*Service, *job.Store, *delivery.Service) {
+	t.Helper()
+	svc, jobs, deliverySvc := newDeliveryTestService(t)
+	svc.Delivery = deliverySvc
+	svc.IlliadHTTPClient = server.Client()
+	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
+	svc.Resolvers = deliveryTestResolvers()
+	if err := deliverySvc.RecordLiveAcceptance(context.Background(), "default", "illiad"); err != nil {
+		t.Fatal(err)
+	}
+	return svc, jobs, deliverySvc
+}
+
 // deliveryWorkRequest is a DOI+title work: it carries deliveryHasRequiredFields'
 // citation minimum (DOI or PMID plus title) and deliveryRequestClass's DOI/PMID
 // signal, so a fully auto-capable profile reaches the submit verdict.
@@ -308,15 +324,8 @@ func TestExhaustedCandidatesAutoCapableProfileSubmitsAndParksPending(t *testing.
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 
 	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_auto_capable_001", "10.1000/auto-capable-001"))
 	if err != nil {
@@ -452,15 +461,8 @@ func TestExhaustedCandidatesReevaluationJoinsExistingPoll(t *testing.T) {
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 
 	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_join_poll_001", "10.1000/join-poll-001"))
 	if err != nil {
@@ -943,15 +945,8 @@ func TestSubmitDeliveryRequestDuplicateLiveRowRoutesToReconciliation(t *testing.
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 
 	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_dup_live_001", "10.1000/dup-live-001"))
 	if err != nil {
@@ -1035,15 +1030,8 @@ func TestCancelJobOrphansLiveDeliveryRequest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 
 	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_cancel_live_001", "10.1000/cancel-live-001"))
 	if err != nil {
@@ -1340,15 +1328,8 @@ func TestSubmitDeliveryMatchesAutomaticRoute(t *testing.T) {
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, _ := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 
 	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_submit_delivery_001", "10.1000/submit-delivery-001"))
 	if err != nil {
@@ -1475,15 +1456,8 @@ func TestPreviewDeliveryAppliesSubmitGuardsToExistingOfferedRequest(t *testing.T
 		_, _ = w.Write([]byte(`{"TransactionNumber": 1, "TransactionStatus": "Awaiting Request Processing"}`))
 	}))
 	defer server.Close()
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_preview_stale_digest", "10.1000/preview-stale-digest"))
 	if err != nil {
 		t.Fatal(err)
@@ -3386,15 +3360,8 @@ func TestReassignAfterAmbiguousAttemptReconcilesWithoutSecondPost(t *testing.T) 
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 	const doi = "10.1000/reassign-ambiguous"
 	_, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_amb_old", doi, "ambiguous")
 	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_amb_new", doi)
@@ -3437,75 +3404,46 @@ func TestReassignAfterAmbiguousAttemptReconcilesWithoutSecondPost(t *testing.T) 
 	}
 }
 
-// TestReassignAfterProvenPreSendStillSubmitsOnce proves the guard stays
-// narrow: when the old owner's outcome is proven pre-send (no POST could
-// have landed), the re-owned row still submits exactly once.
-func TestReassignAfterProvenPreSendStillSubmitsOnce(t *testing.T) {
-	var posts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		posts.Add(1)
-		_, _ = w.Write([]byte(`{"TransactionNumber": 7702, "TransactionStatus": "Awaiting Request Processing"}`))
-	}))
-	defer server.Close()
+// TestReassignNonAmbiguousPriorStillSubmitsOnce proves the guard stays
+// narrow: a non-ambiguous prior classification still submits exactly once.
+// "pre_send" is a proven pre-send outcome (no POST could have landed);
+// the empty classification is a row no owner ever attempted.
+func TestReassignNonAmbiguousPriorStillSubmitsOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		doi            string
+		oldID, newID   string
+		classification string
+		txn            string
+		wantMsg        string
+	}{
+		{"proven_pre_send", "10.1000/reassign-presend", "wr_reassign_pre_old", "wr_reassign_pre_new", "pre_send", "7702", "a proven pre-send row"},
+		{"never_attempted", "10.1000/reassign-unattempted", "wr_reassign_unatt_old", "wr_reassign_unatt_new", "", "7703", "a never-attempted row"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				posts.Add(1)
+				_, _ = w.Write([]byte(`{"TransactionNumber": ` + tc.txn + `, "TransactionStatus": "Awaiting Request Processing"}`))
+			}))
+			defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
-	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
-	const doi = "10.1000/reassign-presend"
-	_, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_pre_old", doi, "pre_send")
-	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_pre_new", doi)
+			svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
+			ctx := context.Background()
+			_, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, tc.oldID, tc.doi, tc.classification)
+			newID := processNewDeliveryJob(t, svc, jobs, tc.newID, tc.doi)
 
-	if posts.Load() != 1 {
-		t.Fatalf("provider POSTs = %d, want exactly 1 for a proven pre-send row", posts.Load())
-	}
-	got, err := deliverySvc.Get(ctx, staged.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != delivery.StateSubmitted || got.ProviderReference != "7702" || got.JobID != newID {
-		t.Fatalf("row = %+v, want submitted/7702 owned by %q", got, newID)
-	}
-}
-
-// TestReassignUnattemptedOfferedRowStillSubmitsOnce pins the other carve-out:
-// a row no owner ever attempted (no classification on the old job) still
-// submits exactly once after reassignment.
-func TestReassignUnattemptedOfferedRowStillSubmitsOnce(t *testing.T) {
-	var posts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		posts.Add(1)
-		_, _ = w.Write([]byte(`{"TransactionNumber": 7703, "TransactionStatus": "Awaiting Request Processing"}`))
-	}))
-	defer server.Close()
-
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
-	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
-	const doi = "10.1000/reassign-unattempted"
-	_, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_unatt_old", doi, "")
-	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_unatt_new", doi)
-
-	if posts.Load() != 1 {
-		t.Fatalf("provider POSTs = %d, want exactly 1 for a never-attempted row", posts.Load())
-	}
-	got, err := deliverySvc.Get(ctx, staged.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.State != delivery.StateSubmitted || got.ProviderReference != "7703" || got.JobID != newID {
-		t.Fatalf("row = %+v, want submitted/7703 owned by %q", got, newID)
+			if posts.Load() != 1 {
+				t.Fatalf("provider POSTs = %d, want exactly 1 for %s", posts.Load(), tc.wantMsg)
+			}
+			got, err := deliverySvc.Get(ctx, staged.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != delivery.StateSubmitted || got.ProviderReference != tc.txn || got.JobID != newID {
+				t.Fatalf("row = %+v, want submitted/%s owned by %q", got, tc.txn, newID)
+			}
+		})
 	}
 }
 
@@ -3534,15 +3472,8 @@ func TestReassignedAmbiguousStaysBoundedAcrossRetries(t *testing.T) {
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 	const doi = "10.1000/reassign-ambiguous-bounded"
 	oldID, staged := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_bound_old", doi, "ambiguous")
 	newID := processNewDeliveryJob(t, svc, jobs, "wr_reassign_bound_new", doi)
@@ -3692,15 +3623,8 @@ func TestReassignmentKeepsEarlierReconciliationAttempts(t *testing.T) {
 	}))
 	defer server.Close()
 
-	svc, jobs, deliverySvc := newDeliveryTestService(t)
-	svc.Delivery = deliverySvc
-	svc.IlliadHTTPClient = server.Client()
-	svc.Config.Browser.DocumentDelivery = autoCapableDocumentDelivery(server.URL)
-	svc.Resolvers = deliveryTestResolvers()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
 	ctx := context.Background()
-	if err := deliverySvc.RecordLiveAcceptance(ctx, "default", "illiad"); err != nil {
-		t.Fatal(err)
-	}
 	const doi = "10.1000/reassign-prior-reconciliation"
 	oldID, offered := seedReassignedOfferedRow(t, svc, jobs, deliverySvc, "wr_reassign_prior_old", doi, "ambiguous")
 	for attempt := 1; attempt <= 2; attempt++ {
