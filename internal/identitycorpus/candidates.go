@@ -592,6 +592,23 @@ func sortedUnique(in []string) []string {
 	return kept
 }
 
+// sharesClass reports whether other's own equivalence class intersects class.
+// Testing only other's key is not enough: the universe keeps one representative
+// per identifier class, and an adjudicated class is not symmetrized, so the
+// representative can sit outside the target's class while another member of its
+// class is inside it — the same work offered back as a distractor.
+func (b *builder) sharesClass(other Document, class []string) bool {
+	if inClass(other.Key, class) {
+		return true
+	}
+	for _, k := range b.classes.class[other.Key] {
+		if inClass(k, class) {
+			return true
+		}
+	}
+	return false
+}
+
 func inClass(key string, class []string) bool {
 	for _, k := range class {
 		if k == key {
@@ -829,7 +846,7 @@ func (b *builder) buildPool(base Document, arm Arm, n int, absent bool) (Pool, b
 	filter := armFilter(arm)
 	pool := make([]Document, 0, len(b.universe))
 	for _, other := range b.universe {
-		if inClass(other.Key, class) {
+		if b.sharesClass(other, class) {
 			continue
 		}
 		if filter(base, other) {
@@ -961,6 +978,11 @@ func (b *builder) buildConjunctionPool(base Document, n int, absent bool) (Pool,
 	if len(pdf.FrontMatterDOIs(text)) != 0 {
 		return Pool{}, false
 	}
+	// The other half of the geometry: both identifiers must sit inside the page-one
+	// window gate 5 reads, or the arm would measure a document the rule cannot see.
+	if _, _, pageOne := pdf.IdentityWindows(text); !strings.Contains(pageOne, cited) || !strings.Contains(pageOne, ownDOI) {
+		return Pool{}, false
+	}
 
 	class := b.classes.class[base.Key]
 	cands := []pdf.BindCandidate{candidateOf(base)}
@@ -981,7 +1003,7 @@ func (b *builder) buildConjunctionPool(base Document, n int, absent bool) (Pool,
 
 	pool := make([]Document, 0, len(b.universe))
 	for _, other := range b.universe {
-		if inClass(other.Key, class) {
+		if b.sharesClass(other, class) {
 			continue
 		}
 		pool = append(pool, other)
@@ -1479,6 +1501,17 @@ func (r CandidateReport) untestedGates() []string {
 	return out
 }
 
+// wrongTotal is the exact wrong-bind count. WrongBinds is capped at
+// maxListedTrials, so its length understates a badly regressed run; the
+// per-cell Counts stay exact.
+func (r CandidateReport) wrongTotal() int {
+	n := 0
+	for _, res := range r.Results {
+		n += res.Counts.Wrong
+	}
+	return n
+}
+
 // Render renders the report as aligned plain text with no ANSI colour, so it
 // reads the same in a terminal, a log file or a pasted issue. Wrong binds come
 // first: they are the cardinal failure, and a reader who stops after the first
@@ -1502,7 +1535,7 @@ func (r CandidateReport) Render() string {
 	if len(r.WrongBinds) == 0 {
 		fmt.Fprintf(w, "none in this run — read the per-cell table below before reading that as safety: a cell marked NOT REPRESENTATIVE did not measure its axis\n")
 	} else {
-		fmt.Fprintf(w, "%d wrong binds\n", len(r.WrongBinds))
+		fmt.Fprintf(w, "%d wrong binds\n", r.wrongTotal())
 		fmt.Fprintf(w, "doc key\tarm\tN\ttarget\tchosen key\tterminal gate\tevidence\n")
 		shown := r.WrongBinds
 		if len(shown) > maxRenderedTrials {
@@ -1513,8 +1546,8 @@ func (r CandidateReport) Render() string {
 				t.DocKey, t.Arm, t.PoolSize, targetLabel(t.TargetAbsent),
 				t.ChosenKey, t.TerminalGate, strings.Join(t.Evidence, "; "))
 		}
-		if len(r.WrongBinds) > maxRenderedTrials {
-			fmt.Fprintf(w, "… %d more not shown (capped at %d captured)\n", len(r.WrongBinds)-maxRenderedTrials, maxListedTrials)
+		if more := r.wrongTotal() - len(shown); more > 0 {
+			fmt.Fprintf(w, "… %d more not shown (capped at %d captured)\n", more, maxListedTrials)
 		}
 		if r.hasArm(ArmConjunction) {
 			fmt.Fprintf(w, "reading a conjunction row: its measured bytes are a SYNTHESIZED expansion, not the library document named in the doc key — that key records which document the composite was derived from, because the document is the sampling unit. A chosen key equal to the doc key there is the arm's designed failure (the rule bound the work the document merely CITES), not a bind of the document's own paper.\n")

@@ -2,6 +2,7 @@
 package identitycorpus
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -124,5 +125,55 @@ func TestMeasureCandidateSetsMarkerGateCoverage(t *testing.T) {
 	if strings.Contains(rendered, "no trial in this run reached correction-marker") ||
 		strings.Contains(rendered, "no trial in this run reached non-article-marker") {
 		t.Error("Render still reports marker gates as untested after synthesis arms ran")
+	}
+}
+
+// Report.Render is what a developer reads before and after touching identity.go
+// thresholds, so the headline numbers must come from the right fields.
+func TestReportRenderNamesWrongAcceptsAndPassRate(t *testing.T) {
+	// The output-cap sentence keys off a literal that the classifier must keep
+	// producing; derive the bucket label from the classifier, not a retyped string.
+	capLabel := classifyExtractionFailure([]string{"pdftotext output exceeds 100 bytes"})
+
+	pairs := func(n int) []PairResult {
+		out := make([]PairResult, n)
+		for i := range out {
+			out[i] = PairResult{DocKey: fmt.Sprintf("DOC%04d", i), MetaKey: fmt.Sprintf("META%04d", i), Result: pdf.IdentityPass}
+		}
+		return out
+	}
+	base := Report{
+		Documents:       10,
+		Correct:         Counts{Pass: 3, Review: 1, Reject: 0},
+		Mismatch:        Counts{Pass: 2, Review: 5, Reject: 7},
+		WrongAccepts:    pairs(2),
+		SkipsByReason:   []OffsetBucket{{Label: capLabel, Count: 4}},
+		CorrectParks:    nil,
+		MetadataRecords: 10,
+	}
+
+	rendered := base.Render()
+	for _, want := range []string{
+		"WRONG ACCEPTS  2\n",
+		"75.0%",
+		"DOC0000", "META0001",
+		"output cap alone accounts for 4 of the skips above",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("Render missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "more not shown") {
+		t.Errorf("two wrong accepts must not print a truncation note:\n%s", rendered)
+	}
+
+	capped := base
+	capped.WrongAccepts = pairs(maxRenderedPairs + 5)
+	got := capped.Render()
+	if !strings.Contains(got, "… 5 more not shown") {
+		t.Errorf("Render lacks the truncation note for %d listed pairs:\n%s", maxRenderedPairs+5, got)
+	}
+	if strings.Contains(got, fmt.Sprintf("DOC%04d", maxRenderedPairs)) {
+		t.Errorf("Render printed past maxRenderedPairs:\n%s", got)
 	}
 }

@@ -503,7 +503,7 @@ func (b *builder) buildMarkerGatePool(base Document, text, gateLabel string, arm
 
 	pool := make([]Document, 0, len(b.universe))
 	for _, other := range b.universe {
-		if inClass(other.Key, class) {
+		if b.sharesClass(other, class) {
 			continue
 		}
 		pool = append(pool, other)

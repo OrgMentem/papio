@@ -628,3 +628,93 @@ func TestCandidateArmsAndPoolSizes(t *testing.T) {
 		t.Errorf("AllArms = %v", got)
 	}
 }
+
+// An adjudicated class is not symmetrized, so the universe's representative of
+// the target's same-work sibling can sit outside the target's class while one of
+// its own members is inside it. Offering it as a distractor would score a bind of
+// the same work as the cardinal failure.
+func TestBuildPoolExcludesDistractorWhoseClassOverlapsTarget(t *testing.T) {
+	// A is adjudicated to [A, B]. B shares a DOI with C (C < B), so the identifier
+	// class {B, C} is represented in the universe by C, which is not in A's class.
+	a := synthDoc("DOCA", "Alpha Study Of Graphs", []string{"Ann Alpha"}, 2020, "10.5555/test.a")
+	bDoc := synthDoc("DOCB", "Alpha Study Of Graphs", []string{"Ann Alpha"}, 2020, "10.5555/test.shared")
+	c := synthDoc("DOCC", "Alpha Study Of Graphs", []string{"Ann Alpha"}, 2020, "10.5555/test.shared")
+	c.Key = "DOBC" // sorts before DOCB so it becomes the class representative
+	d := synthDoc("DOCD", "Unrelated Thermal Drift", []string{"Dee Delta"}, 2015, "10.5555/test.d")
+	docs := []Document{a, c, bDoc, d}
+
+	classes := buildEquivalenceClasses(docs, map[string][]string{"DOCA": {"DOCB"}})
+	byKey := map[string]Document{}
+	for _, doc := range docs {
+		byKey[doc.Key] = doc
+	}
+	b := &builder{seed: 7, classes: classes, universe: candidateUniverse(docs, classes), byKey: byKey, admitted: documentKeySet(docs)}
+	var haveRep bool
+	for _, u := range b.universe {
+		if u.Key == "DOBC" {
+			haveRep = true
+		}
+	}
+	if !haveRep || inClass("DOBC", classes.class["DOCA"]) {
+		t.Fatalf("fixture precondition: DOBC must represent {DOCB, DOBC} and sit outside A's class; universe=%v class=%v", b.universe, classes.class["DOCA"])
+	}
+
+	for _, arm := range []Arm{ArmRandom, ArmSameAuthor} {
+		pool, ok := b.buildPool(a, arm, 1, true)
+		if arm == ArmSameAuthor {
+			// Only the same-work representative shares the author; excluding it
+			// leaves nothing to draw, so the cell must be skipped, not padded.
+			if ok {
+				t.Errorf("%s: pool built from %v, want the same-work distractor excluded", arm, pool.Candidates)
+			}
+			continue
+		}
+		if !ok {
+			t.Fatalf("%s: pool not built", arm)
+		}
+		for _, cand := range pool.Candidates {
+			if cand.Key == "DOBC" {
+				t.Errorf("%s: same-work distractor DOBC offered in %v", arm, pool.Candidates)
+			}
+		}
+	}
+}
+
+// The wrong-bind headline is the cardinal count and must stay exact when the
+// captured listing is capped.
+func TestCandidateRenderWrongBindHeadlineIsUncapped(t *testing.T) {
+	total := maxListedTrials + 37
+	trials := make([]Trial, maxListedTrials)
+	for i := range trials {
+		trials[i] = Trial{DocKey: fmt.Sprintf("DOC%04d", i), Arm: ArmRandom, PoolSize: 2, ChosenKey: "X"}
+	}
+	r := CandidateReport{
+		WrongBinds: trials,
+		Results:    []ArmResult{{Arm: ArmRandom, PoolSize: 2, Counts: ArmCounts{Wrong: total}}},
+	}
+	got := r.Render()
+	if !strings.Contains(got, fmt.Sprintf("%d wrong binds\n", total)) {
+		t.Errorf("headline does not state the exact count %d:\n%s", total, got)
+	}
+	if want := fmt.Sprintf("… %d more not shown", total-maxRenderedTrials); !strings.Contains(got, want) {
+		t.Errorf("truncation note lacks %q:\n%s", want, got)
+	}
+}
+
+// A header long enough to push both identifier lines past page one's 4 KiB cap
+// would measure a document gate 5 cannot read; the pool must not be built.
+func TestBuildConjunctionPoolRefusesGeometryPastPageOne(t *testing.T) {
+	alpha, _, beta, gamma := fixtureDocs()
+	b := testBuilder([]Document{alpha, beta, gamma})
+	if _, ok := b.buildConjunctionPool(alpha, 3, true); !ok {
+		t.Fatal("precondition: the ordinary fixture must build")
+	}
+	long := alpha
+	long.Work.Authors = make([]string, 400)
+	for i := range long.Work.Authors {
+		long.Work.Authors[i] = fmt.Sprintf("Collaborator Number%03d", i)
+	}
+	if _, ok := b.buildConjunctionPool(long, 3, true); ok {
+		t.Fatal("conjunction pool built from a header that pushes the identifiers past 4 KiB")
+	}
+}
