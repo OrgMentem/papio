@@ -59,10 +59,21 @@ func newJobsSupplyPDFCommand(opt *options) *cobra.Command {
 				return supplyPDFError(args[0], args[1], err)
 			}
 			if opt.jsonOutput {
-				return opt.printJSON(result)
+				err = opt.printJSON(result)
+			} else {
+				_, err = fmt.Fprintf(opt.out, "%s\t%s\t%s\t%s\n", result.JobID, result.Outcome, result.State, result.SHA256)
 			}
-			_, err = fmt.Fprintf(opt.out, "%s\t%s\t%s\t%s\n", result.JobID, result.Outcome, result.State, result.SHA256)
-			return err
+			if err != nil {
+				return err
+			}
+			// A rejected PDF changed nothing and the job still waits for a
+			// file, so the exit status must say it was not accepted. The result
+			// is already on stdout. needs_review is a held-for-human outcome,
+			// not a validation failure, and stays exit 0.
+			if result.Outcome == app.AdoptionRejected {
+				return fmt.Errorf("job %s did not accept %s: the PDF was rejected by validation; the job still waits for a different file", result.JobID, args[1])
+			}
+			return nil
 		},
 	}
 }

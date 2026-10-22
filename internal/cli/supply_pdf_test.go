@@ -153,3 +153,34 @@ func TestSupplyPDFRefusesInputBeforeCallingTheDaemon(t *testing.T) {
 		})
 	}
 }
+
+// A rejected PDF changed nothing, so the exit status must say so while the
+// result still reaches stdout; needs_review is a hold, not a failure.
+func TestSupplyPDFExitStatusFollowsTheOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		outcome string
+		wantErr bool
+	}{
+		{outcome: app.AdoptionAccepted},
+		{outcome: app.AdoptionRejected, wantErr: true},
+	} {
+		cfg := supplyPDFConfig(t, 1<<20)
+		source := filepath.Join(t.TempDir(), "a.pdf")
+		if err := os.WriteFile(source, []byte("%PDF-1.7\nx"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var out, errOut bytes.Buffer
+		root := NewInProcessRoot(&out, &errOut, cfg, func(_ context.Context, _ string, _ any, result any) error {
+			*result.(*api.SupplyPDFResult) = api.SupplyPDFResult{JobID: "job_01", Outcome: tc.outcome, State: "retry_wait", SHA256: "abc"}
+			return nil
+		})
+		root.SetArgs([]string{"jobs", "supply-pdf", "job_01", source})
+		err := root.ExecuteContext(context.Background())
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: err = %v, want error %v", tc.outcome, err, tc.wantErr)
+		}
+		if !strings.Contains(out.String(), tc.outcome) {
+			t.Fatalf("%s: stdout = %q", tc.outcome, out.String())
+		}
+	}
+}

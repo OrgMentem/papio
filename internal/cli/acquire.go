@@ -205,7 +205,7 @@ func newAcquireCommand(opt *options) *cobra.Command {
 	flags.StringVar(&title, "title", "", "work title")
 	flags.StringSliceVar(&authors, "author", nil, "author (repeatable)")
 	flags.IntVar(&year, "year", 0, "publication year")
-	flags.StringVar(&requestID, "request-id", "", "stable idempotency key")
+	flags.StringVar(&requestID, "request-id", "", "convergence key: resubmitting it returns the same still-live job; once that job finishes, the same key queues a fresh attempt")
 	flags.StringVar(&zotioKey, "zotio-item-key", "", "existing Zotero item key")
 	flags.StringVar(&collection, "collection", "", "target Zotero collection name (key when used with --from-zotio)")
 	flags.StringVar(&desiredVersion, "desired-version", "any", "published, accepted, preprint, or any")

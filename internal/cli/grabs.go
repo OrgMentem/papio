@@ -241,20 +241,38 @@ func newGrabsSuggestCommand(opt *options) *cobra.Command {
 				// truncated keep their envelope spelling inside it.
 				identifiers, _ := agentjson.Truncate(result.DocumentIdentifiers, 0)
 				suggestions, _ := agentjson.Truncate(result.Suggestions, 0)
-				return opt.printJSON(grabSuggestJSON{
+				if err := opt.printJSON(grabSuggestJSON{
 					GrabID:              result.GrabID,
 					Outcome:             result.Outcome,
 					Detail:              result.Detail,
 					DocumentIdentifiers: identifiers,
 					Suggestions:         suggestions,
 					Truncated:           result.Truncated,
-				})
+				}); err != nil {
+					return err
+				}
+			} else if err := printGrabSuggestions(opt, result); err != nil {
+				return err
 			}
-			return printGrabSuggestions(opt, result)
+			return grabSuggestOutcomeError(result)
 		},
 	}
 	command.Flags().IntVar(&limit, "limit", 5, "maximum ranked suggestions to return (default 5, max 25)")
 	return command
+}
+
+// grabSuggestOutcomeError makes the exit status agree with the printed
+// outcome: "ok" is the only outcome that computed a ranking (possibly empty),
+// so an unknown grab, a wrong state, or an unavailable ranking is a failed
+// command. The structured result is already on stdout by the time this runs.
+func grabSuggestOutcomeError(result api.GrabSuggestResult) error {
+	if result.Outcome == "ok" {
+		return nil
+	}
+	if result.Detail != "" {
+		return fmt.Errorf("grab %s has no suggestions: %s: %s", result.GrabID, result.Outcome, result.Detail)
+	}
+	return fmt.Errorf("grab %s has no suggestions: %s", result.GrabID, result.Outcome)
 }
 
 // printGrabSuggestions renders grabs.suggest for a human. Document

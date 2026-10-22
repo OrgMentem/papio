@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -60,15 +62,23 @@ func writeSearchSnapshot(path string, params discovery.SearchParams, works []dis
 	if err != nil {
 		return err
 	}
+	// O_EXCL created the file, so it is ours to remove: a partial or empty
+	// snapshot would otherwise block a retry and fail readSearchSnapshot.
 	if _, err := file.Write(append(data, '\n')); err != nil {
 		file.Close()
+		os.Remove(path)
 		return err
 	}
 	if err := file.Sync(); err != nil {
 		file.Close()
+		os.Remove(path)
 		return err
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		os.Remove(path)
+		return err
+	}
+	return nil
 }
 func readSearchSnapshot(path string) (searchSnapshot, error) {
 	var snapshot searchSnapshot
@@ -197,6 +207,13 @@ func newSearchSaveCommand(opt *options) *cobra.Command {
 			params.Query = strings.TrimSpace(args[1])
 			if params.Query == "" {
 				return fmt.Errorf("query is required")
+			}
+			// Fail before the (possibly paid) discovery call: writeSearchSnapshot
+			// refuses an existing path with O_EXCL, but only after the search.
+			if _, err := os.Lstat(args[0]); err == nil {
+				return fmt.Errorf("snapshot %s already exists; choose a new path", args[0])
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				return err
 			}
 			params.Limit = effectiveLimitFloored(params.Limit, discovery.MaxLimit, discovery.DefaultLimit)
 			var works []discovery.DiscoveredWork

@@ -157,3 +157,39 @@ func TestGrabsBindsTruncatedLegacyPageRequiresUpgrade(t *testing.T) {
 		t.Fatalf("truncated legacy page stdout = %q, want no next-page command", out.String())
 	}
 }
+
+func TestGrabsSuggestExitStatusFollowsTheOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		outcome string
+		wantErr bool
+	}{
+		{outcome: "ok"},
+		{outcome: "unknown_grab", wantErr: true},
+		{outcome: "wrong_state", wantErr: true},
+		{outcome: "unavailable", wantErr: true},
+		{outcome: "failed", wantErr: true},
+	} {
+		for _, jsonOutput := range []bool{false, true} {
+			var out, errOut bytes.Buffer
+			root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+				if method != "grabs.suggest" {
+					t.Fatalf("method = %q", method)
+				}
+				*result.(*api.GrabSuggestResult) = api.GrabSuggestResult{GrabID: "grab-1", Outcome: tc.outcome, Detail: "detail"}
+				return nil
+			})
+			args := []string{"grabs", "suggest", "grab-1"}
+			if jsonOutput {
+				args = append([]string{"--json"}, args...)
+			}
+			root.SetArgs(args)
+			err := root.ExecuteContext(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("%s (json=%v): err = %v, want error %v", tc.outcome, jsonOutput, err, tc.wantErr)
+			}
+			if out.Len() == 0 {
+				t.Fatalf("%s (json=%v): result must still reach stdout", tc.outcome, jsonOutput)
+			}
+		}
+	}
+}
