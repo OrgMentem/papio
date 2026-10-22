@@ -91,7 +91,7 @@ func TestManagedFolderTransientFailureRestartAndExactlyOneArtifactPerJob(t *test
 	svc.ManagedFilingFolder = folder
 	now = now.Add(2 * time.Minute)
 	svc.Now = func() time.Time { return now }
-	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+	if err := svc.RetryManagedFiling(ctx); err != nil {
 		t.Fatal(err)
 	}
 	for i, id := range ids {
@@ -143,7 +143,7 @@ func TestManagedFolderRecoversPublishBeforeReceiptAndRejectsArchived(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := staged.Publish(); err != nil {
+	if err := staged.Publish(ctx); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(staged.Cleanup)
@@ -224,5 +224,38 @@ func TestManagedFolderChangeDoesNotRetryHistoricalDestination(t *testing.T) {
 	}
 	if _, err := svc.RetryManagedJob(ctx, "job_missing", ""); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("missing job retry = %v; want not-found to stay", err)
+	}
+}
+
+// Mandatory scheduler startup must not depend on the optional folder: its I/O
+// can stall in the kernel, and nothing queued runs until startup recovery
+// returns. The maintenance pass does the filing instead.
+func TestStartupRecoveryNeverEntersTheManagedFolder(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newTestService(t)
+	folder := filepath.Join(t.TempDir(), "collection")
+	svc.ManagedFilingFolder = folder
+	id := readyManagedFixture(t, svc, "wr_startup_filing", "%PDF-1.4\nstartup filing\n%%EOF")
+	if err := svc.queueManagedFiling(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.RecoverPreparedPublications(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(folder); !os.IsNotExist(err) {
+		t.Fatalf("startup recovery touched the managed folder: %v", err)
+	}
+	rows, _, err := svc.ManagedFilings(ctx, id, 10)
+	if err != nil || len(rows) != 1 || rows[0].State != "pending" || rows[0].Attempts != 0 {
+		t.Fatalf("receipt after startup recovery = %+v, %v; want untouched pending", rows, err)
+	}
+
+	if err := svc.ManagedFilingRetrier().RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err = svc.ManagedFilings(ctx, id, 10)
+	if err != nil || len(rows) != 1 || rows[0].State != "filed" {
+		t.Fatalf("receipt after the maintenance pass = %+v, %v; want filed", rows, err)
 	}
 }

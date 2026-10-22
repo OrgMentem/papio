@@ -251,6 +251,11 @@ There is also a link check, because `zensical build` prints a broken link as an
   it). Diagnose live hangs with `kill -QUIT <pid>` — the dump lands in
   `<data-dir>/daemon.log`; a goroutine parked in `os.ReadDir` under
   `scanAdoptionDir`'s call stack is this footgun.
+  The managed filing folder (`[filing] folder`) is the same class of dependency: its
+  I/O (`internal/filing`) runs single-flight under a no-progress deadline, a stalled
+  call latches (`filing.Stalled()`) so retries fail fast, and an abandoned `Publish`
+  undoes a late link. Never call `RetryManagedFiling` from mandatory scheduler startup
+  (`RecoverPreparedPublications`); the maintenance pass owns it.
 - **A long-running local dev `papio.db` can hold rows that predate a later validation.**
   `job.WithHumanActionBinding` (quarantine_path/sha256 non-empty) only applies to actions
   created *through* that code path going forward — pre-existing rows from before the guard
@@ -673,11 +678,16 @@ There is also a link check, because `zensical build` prints a broken link as an
   death (and a browser restart), so claim identity lives there and `onTabRemoved`
   falls back to it. When adding a new observation or effect, ask which side of that
   boundary its identity lives on; `navigation_error`'s durable-marker path and
-  `enqueueRestartRecoveredObservation` are the shape to copy. Note the daemon makes
-  this safe on purpose: `claim_observation_apply.go`'s `owner_closed` case deliberately
-  omits the lease-generation equality check that `wall_observed`/`auth_returned`/
-  `entitled_landing` enforce, so a restart-recovered loss report is applied rather than
-  rejected as stale — do not "fix" that asymmetry into symmetry.
+  `enqueueRestartRecoveredObservation` are the shape to copy. Note the generation fence
+  that makes this safe: `claim_observation_apply.go` rejects a frame as stale only when
+  `FrameGeneration != Generation` (the daemon's current holder epoch), and the extension
+  stamps every drained observation with `lastKnownBrowserHolderGeneration` from the
+  fresh `hello_ack` (`background.ts` `drainObservationOutboxBatch`), so a
+  restart-recovered `owner_closed` is applied rather than rejected. The lease's own
+  `BrowserHolderGeneration` is compared on NO path (removed in 2d4eec3d: a browser
+  reconnect between arbitration and sign-in bumps the epoch, and requiring equality
+  rejected every later observation for that login) — do not re-add it to
+  `wall_observed`/`auth_returned`/`entitled_landing`.
 - **A live smoke run is not optional for this subsystem, and synthetic input cannot do
   it.** Both defects above passed a green 1,211-test suite and were found in one pass
   against a real browser. But an OS-level accessibility `press()` on the popup's own

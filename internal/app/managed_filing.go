@@ -103,6 +103,8 @@ func (s *Service) ManagedFilings(ctx context.Context, jobID string, limit int) (
 
 // RetryManagedFiling performs bounded automatic recovery. Only this folder
 // adapter participates; arbitrary on_ready commands retain their one-shot rules.
+// The maintenance pass runs it, never mandatory scheduler startup: the
+// destination is optional and its I/O may stall (internal/filing bounds that).
 func (s *Service) RetryManagedFiling(ctx context.Context) error {
 	destination, err := s.managedDestination()
 	if err != nil {
@@ -157,6 +159,11 @@ func (s *Service) RetryManagedFiling(ctx context.Context) error {
 		return err
 	}
 	for _, t := range targets {
+		// A wedged destination fails every attempt fast. Stop here rather than
+		// spend each due receipt's retry budget on a folder that cannot answer.
+		if filing.Stalled() {
+			return nil
+		}
 		if _, err := s.fileManaged(ctx, t.jobID, t.destination, false); err != nil && !errors.Is(err, job.ErrConflict) {
 			return err
 		}
@@ -241,7 +248,7 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 		if err := tx.Commit(); err != nil {
 			return f, err
 		}
-		s.cleanupManagedStages(f)
+		s.cleanupManagedStages(ctx, f)
 		return f, nil
 	}
 	now := store.FormatTime(s.Now())
@@ -289,7 +296,7 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 	}
 	f = current
 	if stageErr == nil {
-		stageErr = staged.Publish()
+		stageErr = staged.Publish(ctx)
 	}
 	f.UpdatedAt = store.FormatTime(s.Now())
 	if stageErr == nil {
@@ -317,13 +324,13 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 		return f, err
 	}
 	if f.State == "filed" {
-		s.cleanupManagedStages(f)
+		s.cleanupManagedStages(ctx, f)
 	}
 	return f, nil
 }
 
-func (s *Service) cleanupManagedStages(f ManagedFiling) {
-	if err := filing.CleanupStages(f.Destination, f.IdempotencyKey); err != nil {
+func (s *Service) cleanupManagedStages(ctx context.Context, f ManagedFiling) {
+	if err := filing.CleanupStages(ctx, f.Destination, f.IdempotencyKey); err != nil {
 		log.Printf("papio: cleaning managed filing stages for job %s: %v", f.JobID, err)
 	}
 }

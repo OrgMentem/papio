@@ -4538,10 +4538,9 @@ func (s *Service) RecoverPreparedPublications(ctx context.Context) error {
 	if err := s.reconcilePreparedPublications(ctx, ""); err != nil {
 		return err
 	}
-	if err := s.recoverMissingReadyHookForSettled(ctx); err != nil {
-		return err
-	}
-	return s.RetryManagedFiling(ctx)
+	// Managed filing is deliberately absent: its destination is optional
+	// external I/O that can stall, and the first maintenance pass retries it.
+	return s.recoverMissingReadyHookForSettled(ctx)
 }
 
 // removeQuarantineBytes removes bytes only when no remaining publication owns
