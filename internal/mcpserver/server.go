@@ -35,7 +35,7 @@ import (
 	"papio/internal/protocol"
 )
 
-const serverInstructions = "Acquire papers into durable papio jobs. Discover and run CLI commands with papio_command_search then papio_command_run (output is JSON). Submit many works at once with papio_acquire_batch, then await outcomes with papio_batch_wait, or follow each job event incrementally with papio_changes by passing the previous next_seq as after_seq. To import items and attachments into Zotero, run `zotio plan <job-id>` via papio_command_run, then `zotio apply <plan-id>` with the plan's confirm-sha256 flag. `zotio tags reconcile` is a separate tag write without a preview."
+const serverInstructions = "Acquire papers into durable papio jobs. Discover and run CLI commands with papio_command_search then papio_command_run (output is JSON). Submit many works at once with papio_acquire_batch, then await outcomes with papio_batch_wait, or follow each job event incrementally with papio_changes by passing the previous next_seq as after_seq. To import items and attachments into Zotero, run `zotio plan <job-id>` via papio_command_run, then `zotio apply <plan-id>` with the plan's confirm-sha256 flag."
 
 const (
 	defaultBatchWaitTimeoutSeconds = 300

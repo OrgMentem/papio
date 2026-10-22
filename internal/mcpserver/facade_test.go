@@ -107,7 +107,7 @@ func TestFacadeSearchHidesLifecycleAndMarksReadOnly(t *testing.T) {
 	}
 	// Lifecycle/setup/system commands are hidden, along with their subtrees,
 	// and so are jobs supply-pdf and jobs add-component: they read a local file the caller names.
-	for _, hidden := range []string{"daemon", "daemon stop", "mcp", "config", "config init", "config agent", "config agent set", "config agent status", "config agent remove", "config acknowledge-closure", "init", "native-host", "native-host install", "browser reload", "drive resume", "jobs supply-pdf", "jobs add-component"} {
+	for _, hidden := range []string{"daemon", "daemon stop", "mcp", "config", "config init", "config agent", "config agent set", "config agent status", "config agent remove", "config acknowledge-closure", "init", "native-host", "native-host install", "browser reload", "drive resume", "jobs supply-pdf", "jobs add-component", "zotio tags reconcile"} {
 		if present[hidden] {
 			t.Errorf("facade should hide %q", hidden)
 		}

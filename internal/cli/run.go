@@ -146,8 +146,33 @@ func reportError(errOut io.Writer, err error, jsonMode, wroteResult bool) {
 	}
 }
 
+// Process exit statuses. Scripts branch on these without parsing stderr; the
+// --json error codes are unchanged. Any other failure exits exitFailure.
+const (
+	exitFailure           = 1
+	exitUsage             = 2
+	exitDaemonUnreachable = 3
+)
+
+// exitCode maps err to the process exit status. It follows classifyError's
+// precedence, so a daemon's own error code never changes the status: only a
+// bad invocation (exit 2) and an unanswered daemon (exit 3) differ from 1.
+func exitCode(err error) int {
+	var remote *ipc.RemoteError
+	switch {
+	case errors.As(err, &remote) && remote != nil:
+		return exitFailure
+	case errors.Is(err, ipc.ErrDaemonUnreachable):
+		return exitDaemonUnreachable
+	case isUsageError(err):
+		return exitUsage
+	}
+	return exitFailure
+}
+
 // Run executes the papio command line with args and returns the process exit
-// status (0 or 1).
+// status: 0 on success, 2 for a usage error, 3 when no daemon answered, and 1
+// for any other failure.
 func Run(ctx context.Context, args []string, out, errOut io.Writer) int {
 	counted := &countingWriter{w: out}
 	root := NewRoot(counted, errOut)
@@ -157,7 +182,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) int {
 		return 0
 	}
 	reportError(errOut, err, jsonRequested(root, args), counted.n.Load() > 0)
-	return 1
+	return exitCode(err)
 }
 
 // RunProcess runs the command line of this process.

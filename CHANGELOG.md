@@ -10,6 +10,10 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Changed
+- **`zotio tags reconcile` is now hidden from MCP.** It writes Zotero tags immediately with no preview, so it stays a terminal-only command. The daemon already runs the same pass automatically.
+- **`papio` exit statuses now tell a usage error and an unreachable daemon apart.** A bad flag, a wrong argument count, or a missing `--config` file exits `2`. A command that finds no running daemon exits `3`. Every other failure, including an error the daemon returns, still exits `1`. The `--json` error codes and the output text do not change. `papio --help` lists the statuses.
+
 ### Added
 - **MCP agents can follow a long acquisition through `papio_changes`.** The
   new read-only tool returns the durable job events after a cursor, oldest

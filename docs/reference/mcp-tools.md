@@ -59,7 +59,7 @@ standalone zotio tool:
 
 `zotio plan` previews an item or attachment mutation and prints a confirmation SHA-256 for each
 plan. `zotio apply` requires the exact plan ID and that digest, and it is the only
-item and attachment import path. `zotio tags reconcile` is the separate tag-write path, which converges papio's own `papio:needs-action` and `papio:unavailable` tags with no preview step.
+item and attachment import path. `zotio tags reconcile` writes tags with no preview, so it is a terminal-only command hidden from MCP; the daemon already runs the same pass automatically.
 
 ## Mirror surface
 
@@ -88,7 +88,7 @@ because no single CLI command supplies their MCP operation.
 
 Commands annotated `mcp:hidden`, and their whole subtrees, are excluded from
 both surfaces. The excluded commands are `init`, `config`, `daemon`,
-`native-host`, `mcp`, `browser reload`, `drive resume`, `jobs supply-pdf`, and
-`jobs add-component` (both read a file on the local disk). Commands annotated `mcp:read-only` report
+`native-host`, `mcp`, `browser reload`, `drive resume`, `zotio tags reconcile`, `jobs supply-pdf`, and
+`jobs add-component` (the last two read a file on the local disk). Commands annotated `mcp:read-only` report
 `read_only: true` through `papio_command_search`.
 

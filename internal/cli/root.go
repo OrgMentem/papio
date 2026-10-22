@@ -69,6 +69,7 @@ func newRoot(opt *options) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "papio",
 		Short:         "Legitimate paper-acquisition broker",
+		Long:          "Legitimate paper-acquisition broker.\n\nExit status: 0 on success, 2 for a usage error (a bad flag, argument count, or --config path), 3 when no daemon answered, and 1 for any other failure.",
 		Version:       api.Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,

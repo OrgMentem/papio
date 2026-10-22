@@ -15,7 +15,7 @@ This is the same envelope the MCP resources (`papio://jobs` and friends) already
 
 Commands that return a single structured record — `papio jobs get`, `papio doctor`, `papio status`, `papio batch report`, `papio zotio plan`, `papio inbox` — return that object directly; they are not list envelopes and carry no `truncated` key.
 
-A failing command in `--json` mode prints one line on stderr, `{"error":{"code":"not_found","message":"..."}}`, and exits `1`. `code` is the daemon's error code when the daemon refused the request, `daemon_unreachable` when no daemon answered, `invalid_argument` for a bad flag or argument count, and `error` otherwise; `class`, `hint`, and `http_status` appear when the daemon supplied them. A command that already printed its structured result to stdout and then exits `1` (for example `papio doctor` with a failing check) keeps the plain `papio: <message>` stderr line instead, so read its stdout. Without `--json`, stderr is always the plain `papio: <message>` line.
+A failing command in `--json` mode prints one line on stderr, `{"error":{"code":"not_found","message":"..."}}`, and exits with the status below. `code` is the daemon's error code when the daemon refused the request, `daemon_unreachable` when no daemon answered, `invalid_argument` for a bad flag or argument count, and `error` otherwise; `class`, `hint`, and `http_status` appear when the daemon supplied them. Exit status: `0` on success, `2` for a usage error (a bad flag, argument count, or `--config` path; `--json` code `invalid_argument`), `3` when no daemon answered (`daemon_unreachable`), and `1` for every other failure, including an error the daemon returned. A command that already printed its structured result to stdout and then exits `1` (for example `papio doctor` with a failing check) keeps the plain `papio: <message>` stderr line instead, so read its stdout. Without `--json`, stderr is always the plain `papio: <message>` line.
 
 ## Global flags
 
@@ -1907,6 +1907,8 @@ papio zotio tags
 #### `papio zotio tags reconcile`
 
 Converge papio:needs-action / papio:unavailable tags with current job states
+
+Run now the papio-owned tag pass that the daemon runs automatically. It writes to Zotero immediately, with no preview.
 
 ```
 papio zotio tags reconcile

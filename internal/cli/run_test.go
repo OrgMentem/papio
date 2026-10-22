@@ -68,18 +68,43 @@ func TestReportErrorPlainWhenNotJSONOrResultAlreadyPrinted(t *testing.T) {
 	}
 }
 
+func TestExitCode(t *testing.T) {
+	remote := &ipc.RemoteError{Code: "invalid_argument", Message: "the daemon refused"}
+	dial := ipc.Unreachable(errors.New("dial ipc daemon: connect: no such file"))
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"usage error", &usageError{err: errors.New("unknown flag: --bogus")}, 2},
+		{"cobra args", errors.New("accepts 1 arg(s), received 0"), 2},
+		{"wrapped usage", fmt.Errorf("wrapped: %w", &usageError{err: errors.New("bad")}), 2},
+		{"unreachable", dial, 3},
+		{"daemon down", daemonDown{socket: "/tmp/x.sock"}, 3},
+		{"daemon error keeps 1 even with a usage-like code", remote, 1},
+		{"other", errors.New("boom"), 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := exitCode(tc.err); got != tc.want {
+				t.Fatalf("exitCode = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunBadFlagIsInvalidArgument(t *testing.T) {
 	var out, errOut bytes.Buffer
 	// --bogus precedes --json: the argument scan must still find --json.
-	if code := Run(context.Background(), []string{"--bogus", "--json", "version"}, &out, &errOut); code != 1 {
-		t.Fatalf("exit = %d, want 1", code)
+	if code := Run(context.Background(), []string{"--bogus", "--json", "version"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
 	}
 	if got := decodeJSONError(t, errOut.String()); got["code"] != "invalid_argument" {
 		t.Fatalf("error = %v, want invalid_argument", got)
 	}
 	errOut.Reset()
-	if code := Run(context.Background(), []string{"--json", "jobs", "get"}, &out, &errOut); code != 1 {
-		t.Fatalf("exit = %d, want 1", code)
+	if code := Run(context.Background(), []string{"--json", "jobs", "get"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
 	}
 	if got := decodeJSONError(t, errOut.String()); got["code"] != "invalid_argument" {
 		t.Fatalf("missing arg error = %v, want invalid_argument", got)
@@ -88,8 +113,8 @@ func TestRunBadFlagIsInvalidArgument(t *testing.T) {
 
 func TestRunNonJSONFailureUnchanged(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := Run(context.Background(), []string{"--bogus", "version"}, &out, &errOut); code != 1 {
-		t.Fatalf("exit = %d, want 1", code)
+	if code := Run(context.Background(), []string{"--bogus", "version"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
 	}
 	if errOut.String() != "papio: unknown flag: --bogus\n" {
 		t.Fatalf("stderr = %q, want the plain line", errOut.String())
@@ -133,8 +158,8 @@ func TestDaemonDownIsUnreachable(t *testing.T) {
 
 func TestRunLastJSONFlagWins(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := Run(context.Background(), []string{"--json", "--json=false", "jobs", "get"}, &out, &errOut); code != 1 {
-		t.Fatalf("exit = %d, want 1", code)
+	if code := Run(context.Background(), []string{"--json", "--json=false", "jobs", "get"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
 	}
 	if errOut.String() != "papio: accepts 1 arg(s), received 0\n" {
 		t.Fatalf("stderr = %q, want the plain line", errOut.String())

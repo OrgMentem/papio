@@ -15,8 +15,8 @@ import (
 func TestRunMissingExplicitConfigIsInvalidArgumentUnderJSON(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent.toml")
 	var out, errOut bytes.Buffer
-	if code := Run(context.Background(), []string{"--json", "--config", missing, "jobs", "list"}, &out, &errOut); code != 1 {
-		t.Fatalf("exit = %d, want 1", code)
+	if code := Run(context.Background(), []string{"--json", "--config", missing, "jobs", "list"}, &out, &errOut); code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
 	}
 	got := decodeJSONError(t, errOut.String())
 	if got["code"] != "invalid_argument" {

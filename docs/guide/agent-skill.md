@@ -45,7 +45,8 @@ not reports). A list-shaped payload is always
 command summaries, with or without `query`; the commands returning a single record —
 `jobs get`, `doctor`, `status`, `batch report`, `zotio plan`, `inbox` —
 return that object directly, with no `truncated` key.
-A failing command exits `1` and, with `--json`, prints one line on stderr:
+A failing command exits `2` for a usage error, `3` when no daemon answered, and `1`
+otherwise, and, with `--json`, prints one line on stderr:
 `{"error":{"code":...,"message":...}}`. A command that already printed its
 result on stdout (such as `doctor` or `jobs cancel`) instead prints a plain
 `papio: <error>` line on stderr. Read that command's stdout first; it holds

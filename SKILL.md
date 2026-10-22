@@ -77,9 +77,9 @@ Non-obvious facts that defy reasonable assumptions — read before running comma
 - **`zotio apply` is the only path that creates Zotero items or attachments, and it needs
   the exact digest** printed by `papio zotio plan`. Do not recompute, truncate, or reuse
   another plan's digest; a mismatch is a safe failure — make a new plan and read it.
-  `zotio tags reconcile` is the one other Zotero write: it converges papio's own
-  `papio:needs-action` / `papio:unavailable` tags with no preview, so run it only when
-  the user asks.
+  `papio zotio tags reconcile` (terminal only, not exposed over MCP) is the one other Zotero
+  write: it converges papio's own `papio:needs-action` / `papio:unavailable` tags with no
+  preview. The daemon already runs this pass automatically, so run it only when the user asks.
 - **A bare ten-digit argument is refused on purpose.** `papio acquire <arg>` guesses the
   scheme, and ten digits is simultaneously a valid ISBN-10 and a valid PMID. Pass
   `--pmid` or `--isbn` instead of arguing with the guesser. Every other entry point
@@ -194,7 +194,7 @@ retryable and a removed watch takes its schedule with it. Confirm before either.
 
 - **`zotio plan <job-id>...`** → **`zotio apply <plan-id> --confirm-sha256 <digest>`** — The
   preview-first Zotero write. `zotio preflight` checks the configured zotio;
-  `zotio tags reconcile` converges the `papio:needs-action` / `papio:unavailable` ledger.
+  `papio zotio tags reconcile` (terminal only) converges the `papio:needs-action` / `papio:unavailable` ledger.
 - **`bundle document <job-id>` / `bundle export <job-id> -o <dir>`** — The validated
   acquisition bundle, printed or written idempotently.
 - **`export ledger|job|batch|watch`** — Normalized citations as CSL-JSON, RIS, or BibTeX
@@ -340,7 +340,9 @@ and prompts, not reports, and print prose regardless.
   `inbox` return the object directly.
 - **Same shape over MCP** — the `papio://…` resources return the identical envelope, so one
   parser serves both surfaces.
-- **Exit status** — `0` on success; `1` otherwise. JSON goes to stdout. With `--json` a
+- **Exit status** — `0` on success; `2` for a usage error (bad flag, argument count, or
+  `--config` path); `3` when no daemon answered; `1` for every other failure. JSON goes to
+  stdout. With `--json` a
   failure prints one line on stderr: `{"error":{"code":...,"message":...}}`, plus `class`,
   `hint`, `http_status` when the daemon supplied them. `code` is the daemon's code
   (`not_found`, `refused`, ...), `daemon_unreachable` when no daemon answered,

@@ -72,9 +72,11 @@ func newZotioCommand(opt *options) *cobra.Command {
 		Short: "Manage the exception-tag ledger on linked Zotero items",
 	}
 	reconcile := &cobra.Command{
-		Use:   "reconcile",
-		Short: "Converge papio:needs-action / papio:unavailable tags with current job states",
-		Args:  cobra.NoArgs,
+		Use:         "reconcile",
+		Short:       "Converge papio:needs-action / papio:unavailable tags with current job states",
+		Long:        "Run now the papio-owned tag pass that the daemon runs automatically. It writes to Zotero immediately, with no preview.",
+		Args:        cobra.NoArgs,
+		Annotations: map[string]string{"mcp:hidden": "true"},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var result zotio.TagReconcileResult
 			if err := opt.call(cmd.Context(), "zotio.tags.reconcile", struct{}{}, &result); err != nil {
