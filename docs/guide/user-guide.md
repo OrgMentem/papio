@@ -275,6 +275,20 @@ identifiers from the page itself, which is the common case for a search
 portal's own results list — the export already carries identifiers a visual
 scan cannot recover.
 
+### Export a search or a campaign for screening tools
+
+`papio export search <snapshot-file>` writes the rows of a snapshot saved by
+`papio search save` as CSL-JSON, RIS, or BibTeX. Add `--keys k1,k2` to export
+only the named snapshot rows; an unknown key is an error.
+`papio export campaign <campaign-id>` writes every distinct work staged in a
+campaign. Source records that failed to parse have no work, so the command
+skips them and reports how many (on stderr, and as `skipped_source_records`
+in the `--json` receipt).
+
+Both commands read local files only: no daemon call, no job, and no file is
+written except the one named by `-o`. `--format`, `-o`, `--force`, `--json` and
+`--include-duplicates` work as for `papio export ledger`.
+
 ## 4. Follow the work instead of guessing
 
 `status` groups your jobs into working, awaiting-human, needs-review, ready,

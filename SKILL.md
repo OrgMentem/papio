@@ -201,8 +201,9 @@ retryable and a removed watch takes its schedule with it. Confirm before either.
   `papio zotio tags reconcile` (terminal only) converges the `papio:needs-action` / `papio:unavailable` ledger.
 - **`bundle document <job-id>` / `bundle export <job-id> -o <dir>`** — The validated
   acquisition bundle, printed or written idempotently.
-- **`export ledger|job|batch|watch`** — Normalized citations as CSL-JSON, RIS, or BibTeX
-  (`--format`, `-o`; `-o` is required with `--json`).
+- **`export ledger|job|batch|watch|search|campaign`** — Normalized citations as CSL-JSON, RIS, or BibTeX
+  (`--format`, `-o`; `-o` is required with `--json`). `export search <snapshot> [--keys k1,k2]` and
+  `export campaign <campaign-id>` read a saved search snapshot or a staged campaign with no daemon call.
 - **`batch report <batch-id|latest> [--markdown]`** — Manifest joined with live outcomes:
   imported, browser-fetched-then-imported, existing-item-attached, acquired (ready, not
   imported), import-failed, awaiting-human, needs-review, failed, skipped-owned,

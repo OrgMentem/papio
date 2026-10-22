@@ -12,9 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/api"
+	"papio/internal/batch"
 	"papio/internal/config"
+	"papio/internal/discovery"
 	"papio/internal/job"
 	"papio/internal/protocol"
 	"papio/internal/watch"
@@ -254,5 +257,187 @@ func TestRecordFromWorkRequestKeepsISBNAndOpenAlexIdentity(t *testing.T) {
 	oaB := recordFromWorkRequest(protocol.WorkRequest{Identifiers: &protocol.Identifiers{OpenAlex: "W2"}})
 	if oaA.Identity() == oaB.Identity() {
 		t.Fatalf("distinct OpenAlex-only requests share identity %q", oaA.Identity())
+	}
+}
+
+func exportSnapshotFixture(t *testing.T, dois ...string) string {
+	t.Helper()
+	hits := make([]discovery.DiscoveredWork, 0, len(dois))
+	for i, doi := range dois {
+		hits = append(hits, discovery.DiscoveredWork{Work: work.Work{
+			Title: fmt.Sprintf("Snapshot work %d", i+1), Authors: []string{"Joshua Holzer"}, Year: 2020 + i, DOI: doi,
+		}})
+	}
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := writeSearchSnapshot(path, discovery.SearchParams{Query: "plurality", Limit: 10}, hits); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func runExport(t *testing.T, cfg config.Config, args ...string) (string, string, error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, cfg, func(_ context.Context, method string, _ any, _ any) error {
+		t.Fatalf("export must not call the daemon, called %q", method)
+		return nil
+	})
+	root.SetArgs(args)
+	err := root.ExecuteContext(context.Background())
+	return out.String(), errOut.String(), err
+}
+
+func TestExportSearchEmitsOneRISRecordPerRow(t *testing.T) {
+	path := exportSnapshotFixture(t, "10.1000/aaa", "10.1000/bbb", "10.1000/ccc")
+	out, _, err := runExport(t, config.Config{}, "export", "search", path, "--format", "ris")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(out, "TY  - "); got != 3 {
+		t.Fatalf("RIS records = %d, want 3\n%s", got, out)
+	}
+	for _, doi := range []string{"10.1000/aaa", "10.1000/bbb", "10.1000/ccc"} {
+		if !strings.Contains(out, "DO  - "+doi) {
+			t.Fatalf("RIS lacks DOI %s\n%s", doi, out)
+		}
+	}
+}
+
+func TestExportSearchKeysSelectRowsAndRejectUnknown(t *testing.T) {
+	path := exportSnapshotFixture(t, "10.1000/aaa", "10.1000/bbb")
+	snapshot, err := readSearchSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := runExport(t, config.Config{}, "export", "search", path, "--format", "ris", "--keys", snapshot.Rows[1].Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(out, "TY  - ") != 1 || !strings.Contains(out, "10.1000/bbb") || strings.Contains(out, "10.1000/aaa") {
+		t.Fatalf("--keys output = %q, want only the second row", out)
+	}
+	if _, _, err := runExport(t, config.Config{}, "export", "search", path, "--keys", snapshot.Rows[0].Key+",nosuchkey"); err == nil || !strings.Contains(err.Error(), "nosuchkey") {
+		t.Fatalf("unknown key error = %v, want it to name the key", err)
+	}
+}
+
+func TestExportSearchCollapsesDuplicatesUnlessIncluded(t *testing.T) {
+	// Two distinct snapshot rows (different titles) share one DOI.
+	hits := []discovery.DiscoveredWork{
+		{Work: work.Work{Title: "First copy", Authors: []string{"Joshua Holzer"}, Year: 2022, DOI: "10.1000/dup"}},
+		{Work: work.Work{Title: "Second copy", Authors: []string{"Joshua Holzer"}, Year: 2022, DOI: "10.1000/dup"}},
+	}
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := writeSearchSnapshot(path, discovery.SearchParams{Query: "q", Limit: 10}, hits); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := runExport(t, config.Config{}, "export", "search", path, "--format", "ris")
+	if err != nil || strings.Count(out, "TY  - ") != 1 {
+		t.Fatalf("collapsed export = %q, %v; want one record", out, err)
+	}
+	out, _, err = runExport(t, config.Config{}, "export", "search", path, "--format", "ris", "--include-duplicates")
+	if err != nil || strings.Count(out, "TY  - ") != 2 {
+		t.Fatalf("--include-duplicates export = %q, %v; want two records", out, err)
+	}
+}
+
+func TestExportSearchOutputForceAndJSON(t *testing.T) {
+	snap := exportSnapshotFixture(t, "10.1000/aaa")
+	target := filepath.Join(t.TempDir(), "refs.ris")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runExport(t, config.Config{}, "export", "search", snap, "-o", target); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("overwrite without --force = %v", err)
+	}
+	if _, _, err := runExport(t, config.Config{}, "export", "search", snap); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runExport(t, config.Config{}, "--json", "export", "search", snap); err == nil || !strings.Contains(err.Error(), "-o") {
+		t.Fatalf("--json without -o = %v", err)
+	}
+	out, _, err := runExport(t, config.Config{}, "--json", "export", "search", snap, "-o", target, "--force")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt exportResult
+	if err := json.Unmarshal([]byte(out), &receipt); err != nil || !receipt.Replaced || receipt.Records != 1 || receipt.Format != "ris" {
+		t.Fatalf("receipt = %+v, %v", receipt, err)
+	}
+	if got, _ := os.ReadFile(target); !strings.Contains(string(got), "DO  - 10.1000/aaa") {
+		t.Fatalf("file = %q", got)
+	}
+}
+
+func TestExportSearchUnknownSnapshotErrors(t *testing.T) {
+	if _, _, err := runExport(t, config.Config{}, "export", "search", filepath.Join(t.TempDir(), "missing.json")); err == nil {
+		t.Fatal("want an error for a missing snapshot")
+	}
+}
+
+func exportCampaignFixture(t *testing.T) (config.Config, string) {
+	t.Helper()
+	cfg := config.Config{DataDir: t.TempDir()}
+	var works []protocol.WorkRequest
+	for _, doi := range []string{"10.1000/aaa", "10.1000/bbb"} {
+		request, err := batch.ParseWork(json.RawMessage(fmt.Sprintf(`{"doi":%q,"title":"Work %s","authors":["Joshua Holzer"],"year":2021}`, doi, doi)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		works = append(works, request)
+	}
+	created := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	id := "campaign_export01"
+	manifest := &campaignManifest{
+		Version: 1, ID: id, CreatedAt: created.Format(time.RFC3339Nano),
+		Records: []campaignRecord{
+			{Ordinal: 1, WorkIndex: 0},
+			{Ordinal: 2, WorkIndex: -1, Error: "no usable identifier or title"},
+			{Ordinal: 3, WorkIndex: 1},
+			{Ordinal: 4, WorkIndex: -1, Error: "unparseable"},
+		},
+		Works:  works,
+		Chunks: []campaignChunk{{Start: 0, End: 2, BatchID: batch.ScopedID(works, created, id), State: "pending"}},
+	}
+	if err := writeCampaign(cfg.DataDir, manifest); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, id
+}
+
+func TestExportCampaignEmitsDistinctWorksAndReportsSkipped(t *testing.T) {
+	cfg, id := exportCampaignFixture(t)
+	out, errOut, err := runExport(t, cfg, "export", "campaign", id, "--format", "bibtex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(out, "@article{")+strings.Count(out, "@misc{") != 2 || !strings.Contains(out, "doi = {10.1000/aaa}") || !strings.Contains(out, "doi = {10.1000/bbb}") {
+		t.Fatalf("bibtex = %q, want both works", out)
+	}
+	if !strings.Contains(errOut, "skipped 2") {
+		t.Fatalf("stderr = %q, want a skipped-2 note", errOut)
+	}
+
+	target := filepath.Join(t.TempDir(), "c.bib")
+	jsonOut, _, err := runExport(t, cfg, "--json", "export", "campaign", id, "-o", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt struct {
+		Records int `json:"records"`
+		Skipped int `json:"skipped_source_records"`
+	}
+	if err := json.Unmarshal([]byte(jsonOut), &receipt); err != nil || receipt.Records != 2 || receipt.Skipped != 2 {
+		t.Fatalf("receipt = %+v, %v (%s)", receipt, err, jsonOut)
+	}
+}
+
+func TestExportCampaignUnknownOrInvalidIDErrors(t *testing.T) {
+	cfg, _ := exportCampaignFixture(t)
+	if _, _, err := runExport(t, cfg, "export", "campaign", "campaign_nope"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("unknown id = %v, want a not-found error", err)
+	}
+	if _, _, err := runExport(t, cfg, "export", "campaign", "../etc/passwd"); err == nil || !strings.Contains(err.Error(), "invalid campaign id") {
+		t.Fatalf("bad id = %v, want an invalid-id error", err)
 	}
 }

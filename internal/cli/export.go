@@ -37,6 +37,9 @@ type exportResult struct {
 	// Replaced is true when --force replaced a file that already existed at
 	// Output; without --force an existing file is refused, never replaced.
 	Replaced bool `json:"replaced"`
+	// SkippedSources counts campaign source records that failed to parse and
+	// so have no work to export; omitted for every other export command.
+	SkippedSources int `json:"skipped_source_records,omitempty"`
 }
 
 // newExportCommand exports normalized citation records — never a raw
@@ -45,6 +48,9 @@ type exportResult struct {
 func newExportCommand(opt *options) *cobra.Command {
 	var format, output string
 	var includeDuplicates, force bool
+	// skippedSources counts campaign source records that never became a
+	// work; only `export campaign` sets it, and the --json receipt reports it.
+	var skippedSources int
 	command := &cobra.Command{
 		Use:   "export",
 		Short: "Export normalized citation records (CSL-JSON, RIS, BibTeX)",
@@ -86,6 +92,7 @@ func newExportCommand(opt *options) *cobra.Command {
 			SHA256:              hex.EncodeToString(sum[:]),
 			Output:              output,
 			Replaced:            replaced,
+			SkippedSources:      skippedSources,
 		}
 		if replaced {
 			return opt.printResult(result, "Exported %d record(s) to %s, replacing the existing file", len(records), output)
@@ -229,7 +236,86 @@ func newExportCommand(opt *options) *cobra.Command {
 	ledgerCommand.Flags().StringVar(&since, "since", "", "only works submitted after this instant (RFC3339) or within this duration (e.g. 24h, 7d)")
 	ledgerCommand.Flags().StringVar(&consumer, "consumer", "", "only works submitted by this consumer")
 
-	command.AddCommand(jobCommand, batchCommand, watchCommand, ledgerCommand)
+	var keys []string
+	searchCommand := &cobra.Command{
+		Use:         "search <snapshot-file> [--keys k1,k2]",
+		Short:       "Export the rows of a saved search snapshot (read-only: no daemon call)",
+		Args:        cobra.ExactArgs(1),
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			snapshot, err := readSearchSnapshot(args[0])
+			if err != nil {
+				return err
+			}
+			rows := snapshot.Rows
+			if len(keys) > 0 {
+				known := make(map[string]bool, len(rows))
+				for _, row := range rows {
+					known[row.Key] = true
+				}
+				wanted := make(map[string]bool, len(keys))
+				for _, key := range keys {
+					if !known[key] {
+						return fmt.Errorf("snapshot key %q is not in %s", key, args[0])
+					}
+					wanted[key] = true
+				}
+				selected := make([]searchSnapshotRow, 0, len(wanted))
+				for _, row := range rows {
+					if wanted[row.Key] {
+						selected = append(selected, row)
+					}
+				}
+				rows = selected
+			}
+			records := make([]cite.Record, 0, len(rows))
+			for _, row := range rows {
+				records = append(records, cite.FromWork(row.Hit.Work))
+			}
+			return emit(cmd, records)
+		},
+	}
+	searchCommand.Flags().StringSliceVar(&keys, "keys", nil, "export only these snapshot row keys (comma-separated; an unknown key is an error)")
+
+	campaignCommand := &cobra.Command{
+		Use:         "campaign <campaign-id>",
+		Short:       "Export every distinct work staged in a campaign (read-only: no daemon call); unparseable source records are skipped and counted",
+		Args:        cobra.ExactArgs(1),
+		Annotations: map[string]string{"mcp:read-only": "true"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := opt.loadConfig()
+			if err != nil {
+				return err
+			}
+			path, err := campaignPath(cfg.DataDir, args[0])
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("campaign %q not found in %s; ids look like campaign_… (run `papio campaign list` to see them)", args[0], filepath.Dir(path))
+			}
+			manifest, err := loadCampaign(path, args[0])
+			if err != nil {
+				return err
+			}
+			skippedSources = 0
+			for _, record := range manifest.Records {
+				if record.WorkIndex < 0 || record.Error != "" {
+					skippedSources++
+				}
+			}
+			if skippedSources > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "skipped %d source record(s) that failed to parse\n", skippedSources)
+			}
+			records := make([]cite.Record, 0, len(manifest.Works))
+			for _, request := range manifest.Works {
+				records = append(records, recordFromWorkRequest(request))
+			}
+			return emit(cmd, records)
+		},
+	}
+
+	command.AddCommand(jobCommand, batchCommand, watchCommand, ledgerCommand, searchCommand, campaignCommand)
 	return command
 }
 

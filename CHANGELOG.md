@@ -10,6 +10,9 @@ execution records kept during the initial build.
 
 ## [Unreleased]
 
+### Added
+- **`papio export search <snapshot-file> [--keys k1,k2]` and `papio export campaign <campaign-id>`.** Search results saved with `papio search save` and the works staged in a campaign can now leave *papio* as CSL-JSON, RIS, or BibTeX. Both commands read local files only (no daemon call, no job) and share `--format`, `-o`, `--force`, `--json` and `--include-duplicates` with the other export commands. `--keys` selects snapshot rows and rejects an unknown key. `export campaign` skips source records that failed to parse and reports the count on stderr and as `skipped_source_records` in the `--json` receipt.
+
 ### Changed
 - **`zotio tags reconcile` is now hidden from MCP.** It writes Zotero tags immediately with no preview, so it stays a terminal-only command. The daemon already runs the same pass automatically.
 - **`papio` exit statuses now tell a usage error and an unreachable daemon apart.** A bad flag, a wrong argument count, or a missing `--config` file exits `2`. A command that finds no running daemon exits `3`. Every other failure, including an error the daemon returns, still exits `1`. The `--json` error codes and the output text do not change. `papio --help` lists the statuses.

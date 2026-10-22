@@ -923,6 +923,14 @@ Export every work in the batch manifest in manifest order, including skipped and
 papio export batch <batch-id>
 ```
 
+### `papio export campaign`
+
+Export every distinct work staged in a campaign (read-only: no daemon call); unparseable source records are skipped and counted
+
+```
+papio export campaign <campaign-id>
+```
+
 ### `papio export job`
 
 Export the named jobs in argument order (any state: citation metadata stays useful when retrieval failed)
@@ -944,6 +952,18 @@ papio export ledger [flags]
 | `--consumer` | `string` |  | only works submitted by this consumer |
 | `--since` | `string` |  | only works submitted after this instant (RFC3339) or within this duration (e.g. 24h, 7d) |
 | `--state` | `string` | `acquired` | which works to export: acquired (ready or imported; validated acquisitions), ready (not yet imported) or any (every job) |
+
+### `papio export search`
+
+Export the rows of a saved search snapshot (read-only: no daemon call)
+
+```
+papio export search <snapshot-file> [--keys k1,k2] [flags]
+```
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--keys` | `stringSlice` | `[]` | export only these snapshot row keys (comma-separated; an unknown key is an error) |
 
 ### `papio export watch`
 

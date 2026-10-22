@@ -149,6 +149,8 @@ var commandClassification = map[string]commandClass{
 	"papio export batch":               {kind: kindStructured, args: []string{"batch_20260807", "-o", "/tmp/papio-conformance-export.json"}, rpcMethods: []string{"acquire.report"}},
 	"papio export watch":               {kind: kindStructured, args: []string{"1", "-o", "/tmp/papio-conformance-export.json"}, rpcMethods: []string{"watch.digest"}},
 	"papio export ledger":              {kind: kindStructured, args: []string{"-o", "/tmp/papio-conformance-export.json"}, rpcMethods: []string{"jobs.list_v3", "jobs.list_v2", "jobs.list"}},
+	"papio export search":              {kind: kindStructured, args: []string{"snapshot.json", "-o", "/tmp/papio-conformance-export.json"}},
+	"papio export campaign":            {kind: kindStructured, args: []string{"campaign_01", "-o", "/tmp/papio-conformance-export.json"}},
 	"papio jobs":                       {kind: kindNone},
 	"papio jobs archive":               {kind: kindStructured, rpcMethods: []string{"jobs.archive"}},
 	"papio jobs restore":               {kind: kindStructured, rpcMethods: []string{"jobs.restore"}},
