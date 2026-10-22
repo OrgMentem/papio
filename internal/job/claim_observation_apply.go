@@ -90,6 +90,14 @@ func (js *Store) ApplyClaimObservation(ctx context.Context, in ApplyClaimObserva
 	if err != nil {
 		return ApplyClaimObservationResult{}, err
 	}
+	// Only an applied observation commits. fail() reports every refusal and
+	// error as (result, nil) so the ack can carry the outcome; committing
+	// those would persist the side effects (claim abandon, lease renewal,
+	// entitlement, evidence) that ran before a later step failed, without
+	// the journal row that makes a retry idempotent.
+	if result.Outcome != "applied" {
+		return result, nil
+	}
 	if err := tx.Commit(); err != nil {
 		return ApplyClaimObservationResult{}, err
 	}
@@ -100,6 +108,9 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	result := ApplyClaimObservationResult{GateOccurrenceID: in.GateOccurrenceID}
 	fail := func(outcome, detail string) (ApplyClaimObservationResult, error) {
 		result.Outcome, result.Detail = outcome, detail
+		// Nothing this call did persists (see ApplyClaimObservation), so the
+		// ack must not report any side effect it had already set.
+		result.LeaseUntil, result.EntitledLanding, result.SurfaceLost = "", false, false
 		return result, nil
 	}
 
@@ -124,11 +135,9 @@ func applyClaimObservationTx(ctx context.Context, tx *sql.Tx, in ApplyClaimObser
 	// delayed auth_returned — renew or promote the current cycle's lease.
 	// Answer stale instead: never applied, never journaled.
 	//
-	// The unordered kinds are exempt, and for the same reason the lease
-	// generation check inside the switch already exempts owner_closed: a
-	// physical-loss report renews and promotes nothing, and every effect it
-	// authorizes is fenced on its own binding id. See
-	// claimObservationIsOrdered.
+	// The unordered kinds are exempt: a physical-loss report (owner_closed)
+	// renews and promotes nothing, and every effect it authorizes is fenced
+	// on its own binding id. See claimObservationIsOrdered.
 	ordered := claimObservationIsOrdered(in.EventKind)
 	if ordered && occFound && in.GateOccurrenceID != "" && in.GateOccurrenceID != currentOccurrenceID {
 		return fail("stale", "gate occurrence has rolled over; adopt the current occurrence id")

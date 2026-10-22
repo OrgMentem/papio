@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -893,6 +894,54 @@ func TestAwaitingHumanResumeEdgesForBrowserBridge(t *testing.T) {
 	}
 }
 
+// The state graph's terminality is a contract, not an emergent property of the
+// table: a regression that gave a terminal state an outbound edge would reopen
+// a ready, cancelled, failed or unavailable job. ready's only edge is imported
+// (a completed Zotero export), and imported is itself fully terminal.
+func TestTerminalStatesHaveNoOutboundEdgesExceptImport(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	states := []string{
+		StateQueued, StateResolving, StateFetching, StateValidating, StateReady, StateImported,
+		StateAwaitingHuman, StateRetryWait, StateNeedsReview, StateUnavailable, StateFailed, StateCancelled,
+	}
+	for _, from := range states {
+		if !Terminal(from) {
+			continue
+		}
+		t.Run(from, func(t *testing.T) {
+			for to := range allowed[from] {
+				if from == StateReady && to == StateImported {
+					continue
+				}
+				t.Errorf("terminal state %s has an outbound edge to %s", from, to)
+			}
+			id, err := js.CreateRequest(ctx, "wr_terminal_"+from, testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := js.S.DB().ExecContext(ctx, `UPDATE jobs SET state = ? WHERE id = ?`, from, id); err != nil {
+				t.Fatal(err)
+			}
+			for _, to := range states {
+				if from == StateReady && to == StateImported {
+					continue
+				}
+				if err := js.Transition(ctx, id, from, to, nil); !errors.Is(err, ErrConflict) {
+					t.Errorf("Transition(%s -> %s) = %v, want ErrConflict", from, to, err)
+				}
+			}
+			row, err := js.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != from {
+				t.Fatalf("refused transitions moved the job to %s, want %s", row.State, from)
+			}
+		})
+	}
+}
+
 func TestRepairParkWithActionLeavesLateLeaseUntouched(t *testing.T) {
 	ctx := context.Background()
 	js := testStore(t)
@@ -1696,44 +1745,70 @@ func TestEffectiveListLimitNeverReturnsFewerForMore(t *testing.T) {
 		prev = got
 	}
 }
+
+// ListOldest pages by (created_at, id) ascending. The fixture inserts jobs in
+// the REVERSE of created_at order so insertion/rowid order cannot pass for
+// created_at order, and two jobs share a created_at across the page boundary so
+// only the (created_at = ? AND id > ?) tie-break reaches the second of them.
 func TestListOldestRotatesPastPriorMaintenancePage(t *testing.T) {
 	js := testStore(t)
 	ctx := context.Background()
 	const pageSize = 2
-	ids := make([]string, 0, pageSize+1)
 	start := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
-	for i := range pageSize + 1 {
+	// Insertion order index -> created_at. Job ids are generated, so the
+	// expected order is computed from the (created_at, id) pairs themselves.
+	createdAts := []time.Time{
+		start.Add(4 * time.Second),
+		start.Add(3 * time.Second),
+		start.Add(2 * time.Second), // tied with the next
+		start.Add(2 * time.Second),
+		start,
+	}
+	type seeded struct{ id, createdAt string }
+	rows := make([]seeded, 0, len(createdAts))
+	for i, at := range createdAts {
 		id, err := js.CreateRequest(ctx, NewID("wr_list_oldest"), testWork(), "", "", testPolicy(), nil, PrincipalUnknown)
 		if err != nil {
 			t.Fatal(err)
 		}
+		createdAt := store.FormatTime(at)
 		if _, err := js.S.DB().ExecContext(ctx,
 			`UPDATE jobs SET state = ?, created_at = ? WHERE id = ?`,
-			StateAwaitingHuman, start.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano), id); err != nil {
-			t.Fatal(err)
+			StateAwaitingHuman, createdAt, id); err != nil {
+			t.Fatalf("seed job %d: %v", i, err)
 		}
-		ids = append(ids, id)
+		rows = append(rows, seeded{id: id, createdAt: createdAt})
+	}
+	slices.SortFunc(rows, func(a, b seeded) int {
+		if c := strings.Compare(a.createdAt, b.createdAt); c != 0 {
+			return c
+		}
+		return strings.Compare(a.id, b.id)
+	})
+	order := make([]string, 0, len(rows))
+	for _, r := range rows {
+		order = append(order, r.id)
+	}
+	if rows[1].createdAt != rows[2].createdAt {
+		t.Fatalf("fixture lost its created_at tie across the page boundary: %+v", rows)
 	}
 
-	first, err := js.ListOldest(ctx, []string{StateAwaitingHuman}, pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, row := range first {
-		if row.ID == ids[pageSize] {
-			t.Fatalf("first page included later job %q: %+v", ids[pageSize], first)
+	// Pages walk created_at ASC, id ASC without skipping or repeating the
+	// tied pair, then wrap to the oldest page.
+	wantPages := [][]string{order[0:2], order[2:4], order[4:5], order[0:2]}
+	for i, want := range wantPages {
+		page, err := js.ListOldest(ctx, []string{StateAwaitingHuman}, pageSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]string, 0, len(page))
+		for _, row := range page {
+			got = append(got, row.ID)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("page %d = %v, want %v", i+1, got, want)
 		}
 	}
-	second, err := js.ListOldest(ctx, []string{StateAwaitingHuman}, pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, row := range second {
-		if row.ID == ids[pageSize] {
-			return
-		}
-	}
-	t.Fatalf("later job %q was not reached after the first page: %+v", ids[pageSize], second)
 }
 
 func TestAttemptedTiers(t *testing.T) {
