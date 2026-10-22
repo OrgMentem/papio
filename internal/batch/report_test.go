@@ -289,6 +289,78 @@ func TestBuildReportClassifiesSeededJobsEventsAndActions(t *testing.T) {
 	}
 }
 
+func importedTransitionEvent(parent, attachment string) map[string]any {
+	return map[string]any{"kind": "job.transition", "detail": map[string]any{
+		"from": job.StateReady, "to": job.StateImported, "parent_key": parent, "attachment_key": attachment,
+	}}
+}
+
+func TestBuildReportClassifiesJobsInImportedState(t *testing.T) {
+	// A job already in StateImported carries its Zotero keys on the latest
+	// ready->imported transition, not on a zotio.auto_import event.
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion, ID: "batch-imported", CreatedAt: "2026-07-15T12:00:00Z", Collection: "Reading",
+		Works: []ManifestWork{
+			manifestWork("wr-direct", "job-direct", "submitted", "Direct import"),
+			manifestWork("wr-browser-download", "job-browser-download", "submitted", "Browser download import"),
+			manifestWork("wr-browser-source", "job-browser-source", "submitted", "Browser source import"),
+			manifestWork("wr-reimport", "job-reimport", "submitted", "Re-imported paper"),
+			manifestWork("wr-nokeys", "job-nokeys", "submitted", "Imported without keys"),
+		},
+	}
+	jobs := fakeJobs{
+		rows: map[string]*job.Row{
+			"job-direct":           reportRow("job-direct", job.StateImported, ""),
+			"job-browser-download": reportRow("job-browser-download", job.StateImported, ""),
+			"job-browser-source":   reportRow("job-browser-source", job.StateImported, ""),
+			"job-reimport":         reportRow("job-reimport", job.StateImported, ""),
+			"job-nokeys":           reportRow("job-nokeys", job.StateImported, ""),
+		},
+		events: map[string][]map[string]any{
+			"job-direct": {importedTransitionEvent("PD123", "AD456")},
+			"job-browser-download": {
+				{"kind": "browser.download_complete", "detail": map[string]any{}},
+				importedTransitionEvent("PB123", "AB456"),
+			},
+			"job-browser-source": {
+				{"kind": "state.transition", "detail": map[string]any{"source": "browser"}},
+				importedTransitionEvent("PS123", "AS456"),
+			},
+			"job-reimport": {
+				importedTransitionEvent("POLD1", "AOLD2"),
+				{"kind": "zotio.auto_import", "detail": map[string]any{"status": "error", "error_class": "network"}},
+				{"kind": "job.transition", "detail": map[string]any{"from": job.StateReady, "to": job.StateAwaitingHuman}},
+				importedTransitionEvent("PNEW1", "ANEW2"),
+				{"kind": "job.transition", "detail": map[string]any{"from": job.StateImported, "to": job.StateReady}},
+			},
+			"job-nokeys": {{"kind": "job.transition", "detail": map[string]any{"from": job.StateReady, "to": job.StateImported}}},
+		},
+	}
+	report, err := BuildReport(context.Background(), manifest, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []struct{ outcome, parent, attachment string }{
+		{OutcomeImported, "PD123", "AD456"},
+		{OutcomeBrowserFetchedThenImported, "PB123", "AB456"},
+		{OutcomeBrowserFetchedThenImported, "PS123", "AS456"},
+		{OutcomeImported, "PNEW1", "ANEW2"},
+		{OutcomeImported, "", ""},
+	}
+	for i, expected := range want {
+		got := report.Works[i]
+		if got.Outcome != expected.outcome || got.ParentKey != expected.parent || got.AttachmentKey != expected.attachment || got.Collection != "Reading" {
+			t.Fatalf("work %d = %+v, want outcome=%s parent=%s attachment=%s", i, got, expected.outcome, expected.parent, expected.attachment)
+		}
+	}
+	if report.Summary.Outcomes[OutcomeImported] != 3 || report.Summary.Outcomes[OutcomeBrowserFetchedThenImported] != 2 || report.Summary.Outcomes[OutcomeInProgress] != 0 || report.Summary.Total != len(want) {
+		t.Fatalf("summary = %+v", report.Summary)
+	}
+	if !report.Settled() {
+		t.Fatalf("imported-state report is not settled: %+v", report.Summary)
+	}
+}
+
 func TestMarkdownSnapshot(t *testing.T) {
 	report := &Report{
 		BatchID: "batch-deadbeef", Label: "weekly", Summary: ReportSummary{Total: 3, Outcomes: map[string]int{
