@@ -3,10 +3,12 @@
 package artifact
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -157,7 +159,13 @@ func TestPromoteConcurrentlyConvergesForSameHash(t *testing.T) {
 	}
 }
 
-func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
+var stagedFixtureBody = []byte("%PDF-1.4 fixture body")
+
+// stagedFixture returns a store holding one quarantined fixture PDF and its
+// SHA-256. It does only the staging: each test injects its own failure and
+// makes its own assertions.
+func stagedFixture(t *testing.T) (s *Store, temp, sha string) {
+	t.Helper()
 	s, err := New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -166,15 +174,19 @@ func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := []byte("%PDF-1.4 fixture body")
-	temp := filepath.Join(q, "download.tmp")
-	if err := os.WriteFile(temp, body, 0o600); err != nil {
+	temp = filepath.Join(q, "download.tmp")
+	if err := os.WriteFile(temp, stagedFixtureBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sha, _, err := HashFile(temp)
+	sha, _, err = HashFile(temp)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return s, temp, sha
+}
+
+func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
+	s, temp, sha := stagedFixture(t)
 
 	originalLink := linkFile
 	linkFile = func(oldname, newname string) error {
@@ -196,8 +208,8 @@ func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
 		t.Fatalf("fallback temp remains: %v", err)
 	}
 
-	duplicate := filepath.Join(q, "duplicate.tmp")
-	if err := os.WriteFile(duplicate, body, 0o600); err != nil {
+	duplicate := filepath.Join(filepath.Dir(temp), "duplicate.tmp")
+	if err := os.WriteFile(duplicate, stagedFixtureBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	duplicateDest, created, err := s.Promote(duplicate, sha)
@@ -216,23 +228,7 @@ func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
 }
 
 func TestPromoteSucceedsWhenTempCleanupFails(t *testing.T) {
-	s, err := New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	q, err := s.QuarantineDir("job_x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := []byte("%PDF-1.4 fixture body")
-	temp := filepath.Join(q, "download.tmp")
-	if err := os.WriteFile(temp, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sha, _, err := HashFile(temp)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s, temp, sha := stagedFixture(t)
 
 	origRemove := removeFile
 	removeFile = func(name string) error {
@@ -268,23 +264,7 @@ func TestPromoteSucceedsWhenTempCleanupFails(t *testing.T) {
 }
 
 func TestPromotePrePublicationFailureLeavesNoDestination(t *testing.T) {
-	s, err := New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	q, err := s.QuarantineDir("job_x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := []byte("%PDF-1.4 fixture body")
-	temp := filepath.Join(q, "download.tmp")
-	if err := os.WriteFile(temp, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sha, _, err := HashFile(temp)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s, temp, sha := stagedFixture(t)
 	destPath, err := s.ArtifactPath(sha)
 	if err != nil {
 		t.Fatal(err)
@@ -307,22 +287,7 @@ func TestPromotePrePublicationFailureLeavesNoDestination(t *testing.T) {
 }
 
 func TestPromoteLinkFailureDoesNotClaimCreation(t *testing.T) {
-	s, err := New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	q, err := s.QuarantineDir("job_x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	temp := filepath.Join(q, "download.tmp")
-	if err := os.WriteFile(temp, []byte("%PDF-1.4 fixture body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	sha, _, err := HashFile(temp)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s, temp, sha := stagedFixture(t)
 	dest, err := s.ArtifactPath(sha)
 	if err != nil {
 		t.Fatal(err)
@@ -344,6 +309,55 @@ func TestPromoteLinkFailureDoesNotClaimCreation(t *testing.T) {
 	}
 }
 
+// An existing destination is reused only when its bytes are the expected
+// artifact. The incoming quarantine bytes are good here, so the refusal comes
+// from validateExisting, not from Promote's quarantine hash check.
+func TestPromoteRefusesCorruptExistingDestination(t *testing.T) {
+	hardLinks := func(oldname, newname string) error { return os.Link(oldname, newname) }
+	noHardLinks := func(oldname, newname string) error {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EOPNOTSUPP}
+	}
+	for _, link := range []struct {
+		name string
+		fn   func(string, string) error
+	}{{"hard links", hardLinks}, {"no hard links", noHardLinks}} {
+		for _, dest := range []struct {
+			name string
+			body []byte
+		}{{"empty", nil}, {"wrong content", []byte("%PDF-1.4 corrupted destination")}} {
+			t.Run(link.name+"/"+dest.name, func(t *testing.T) {
+				s, temp, sha := stagedFixture(t)
+				destPath, err := s.ArtifactPath(sha)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(destPath, dest.body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				originalLink := linkFile
+				linkFile = link.fn
+				t.Cleanup(func() { linkFile = originalLink })
+
+				got, created, err := s.Promote(temp, sha)
+				if err == nil || !strings.Contains(err.Error(), "existing artifact") {
+					t.Fatalf("Promote over corrupt destination = %q, %v; want a corruption error", got, err)
+				}
+				if created || got != "" {
+					t.Fatalf("Promote reported path %q created=%v for a refused destination", got, created)
+				}
+				after, err := os.ReadFile(destPath)
+				if err != nil || !bytes.Equal(after, dest.body) {
+					t.Fatalf("destination changed: %q, %v", after, err)
+				}
+				kept, err := os.ReadFile(temp)
+				if err != nil || !bytes.Equal(kept, stagedFixtureBody) {
+					t.Fatalf("valid quarantine source lost: %q, %v", kept, err)
+				}
+			})
+		}
+	}
+}
+
 func TestConfineRegularFile(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "a.pdf")
@@ -351,8 +365,20 @@ func TestConfineRegularFile(t *testing.T) {
 	if err := ConfineRegularFile(root, inside); err != nil {
 		t.Fatalf("regular file inside root rejected: %v", err)
 	}
-	if err := ConfineRegularFile(root, filepath.Join(root, "..", "escape.pdf")); err == nil {
-		t.Fatal("escaping path accepted")
+	// The escaping files must exist: a missing path errors out of Lstat
+	// whether or not the containment check is there.
+	sibling := t.TempDir()
+	outside := filepath.Join(sibling, "escape.pdf")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"absolute outside": outside,
+		"dot-dot spelling": filepath.Join(root, "..", filepath.Base(sibling), "escape.pdf"),
+	} {
+		if err := ConfineRegularFile(root, path); err == nil || !strings.Contains(err.Error(), "escapes root") {
+			t.Fatalf("%s: err = %v, want an \"escapes root\" refusal", name, err)
+		}
 	}
 	link := filepath.Join(root, "link.pdf")
 	if err := os.Symlink(inside, link); err == nil {

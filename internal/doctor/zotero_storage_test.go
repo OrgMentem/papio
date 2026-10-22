@@ -16,6 +16,19 @@ import (
 	"papio/internal/store/storetest"
 )
 
+// openZoteroStorageTest opens a fresh store for one test and closes it when
+// the test ends.
+func openZoteroStorageTest(t *testing.T) (context.Context, *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return ctx, db
+}
+
 func seedFailedZotioApply(t *testing.T, ctx context.Context, db *store.Store, jobID, createdAt string, zotioEnvelope map[string]any) {
 	t.Helper()
 	seedFailedZotioApplyError(t, ctx, db, jobID, createdAt, "Zotero file storage refused upload (HTTP 413)", zotioEnvelope)
@@ -59,12 +72,7 @@ func zoteroFileStorageRefusedCheck(t *testing.T, ctx context.Context, db *store.
 }
 
 func TestRunWarnsOnRecentZoteroFileStorageRefusedApplies(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	first := time.Now().UTC().Add(-36 * time.Hour)
 	seedFailedZotioApply(t, ctx, db, "job_refused_1", first.Format(time.RFC3339Nano), map[string]any{
@@ -101,12 +109,7 @@ func TestRunWarnsOnRecentZoteroFileStorageRefusedApplies(t *testing.T) {
 // server to inspect it when Zotero's plan is full wastes the one thing the
 // upstream response already settled.
 func TestRunReportsZoteroQuotaWhenZoteroExplainedIt(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	first := time.Now().UTC().Add(-24 * time.Hour)
 	seedFailedZotioApply(t, ctx, db, "job_quota_1", first.Format(time.RFC3339Nano), map[string]any{
@@ -139,12 +142,7 @@ func TestRunReportsZoteroQuotaWhenZoteroExplainedIt(t *testing.T) {
 }
 
 func TestRunPassesWhenFileStorageRefusedFailuresAreOld(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	old := time.Now().UTC().Add(-10 * 24 * time.Hour).Format(time.RFC3339Nano)
 	seedFailedZotioApply(t, ctx, db, "job_refused_old", old, map[string]any{
@@ -158,12 +156,7 @@ func TestRunPassesWhenFileStorageRefusedFailuresAreOld(t *testing.T) {
 }
 
 func TestRunPassesWhenNoFileStorageRefusedFailures(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	recent := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
 	result, err := json.Marshal(map[string]any{
@@ -190,12 +183,7 @@ func TestRunPassesWhenNoFileStorageRefusedFailures(t *testing.T) {
 // present tense made a plan the operator had already cleared look like a live
 // blocker, and sent a diagnosis of genuinely live refusals down the wrong path.
 func TestZoteroFileStorageRefusedDatesTheQuotaReading(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	stale := time.Now().UTC().Add(-5 * 24 * time.Hour)
 	seedFailedZotioApply(t, ctx, db, "job_quota_old", stale.Format(time.RFC3339Nano), map[string]any{
@@ -238,12 +226,7 @@ const routingRefusalError = `zotio: attachments add refused: {"outcome":"precond
 	`but a stored attachment uploaded through the Zotero Web API always lands in Zotero's own cloud storage"}`
 
 func TestZoteroFileStorageRefusedNamesTheRoutingRefusal(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	seedFailedZotioApplyError(t, ctx, db, "job_routing", time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano),
 		routingRefusalError, map[string]any{"ok": false})
@@ -297,12 +280,7 @@ func seedJobState(t *testing.T, ctx context.Context, db *store.Store, jobID, sta
 // check still named one paper as having no route to the file store two days
 // after papio confirmed that paper's item already carried a PDF.
 func TestZoteroFileStorageRefusedIgnoresSettledPapers(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	recent := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
 	seedFailedZotioApplyError(t, ctx, db, "job_settled", recent, routingRefusalError, map[string]any{"ok": false})
@@ -335,12 +313,7 @@ func TestZoteroFileStorageRefusedIgnoresSettledPapers(t *testing.T) {
 // five days earlier were the headline and the single routing refusal from that
 // morning was a footnote whose remediation addressed the resolved cause.
 func TestZoteroFileStorageRefusedReportsBothCauses(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	stale := time.Now().UTC().Add(-5 * 24 * time.Hour)
 	seedFailedZotioApply(t, ctx, db, "job_quota_stale", stale.Format(time.RFC3339Nano), map[string]any{
@@ -374,12 +347,7 @@ func TestZoteroFileStorageRefusedReportsBothCauses(t *testing.T) {
 // check still headlined it and led its remediation with "free space in
 // Zotero", advice for a plan the operator had already cleared to 20 MB.
 func TestZoteroFileStorageRefusedLeadsWithTheLiveCause(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.Open(ctx, storetest.DataDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	ctx, db := openZoteroStorageTest(t)
 
 	stale := time.Now().UTC().Add(-5 * 24 * time.Hour)
 	for i := range 10 {
