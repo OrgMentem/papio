@@ -3,6 +3,7 @@ package browser
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -133,5 +134,127 @@ func TestPublisherFirstFailureFallsBackToInstitutionalRoute(t *testing.T) {
 				t.Fatalf("resolver failure action=%+v err=%v, want an institutional manual download", last, err)
 			}
 		})
+	}
+}
+
+// A publisher-route offer sits on a publisher or redirector host and names no
+// institution, so the extension could not bind it to the institution whose
+// session evidence may release it, and parked a fresh publisher-first offer
+// queued with no tab although the session was live (papio-d5e6cb6750e74b8f).
+// The offer keeps its job's resolver host beside the route, last: the first
+// host names the route and is where the extension attributes an unattributed
+// challenge. A resolver-route offer already names its own host and gains no
+// second copy.
+func TestPublisherRouteOfferKeepsItsJobsResolverHostLast(t *testing.T) {
+	const otherResolverHost = "other-openurl.example.edu"
+	for _, tc := range []struct {
+		name       string
+		openAthens string
+		profile    string
+		publisher  bool
+		wantFirst  string
+		wantLast   string
+	}{
+		{name: "plain DOI route", publisher: true, wantFirst: "doi.org", wantLast: "openurl.example.edu"},
+		{name: "OpenAthens redirector route", openAthens: "example.edu", publisher: true, wantFirst: "go.openathens.net", wantLast: "openurl.example.edu"},
+		{name: "named resolver profile", profile: "other", publisher: true, wantFirst: "doi.org", wantLast: otherResolverHost},
+		{name: "resolver route", publisher: false, wantFirst: "openurl.example.edu", wantLast: "openurl.example.edu"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, jobs, _, _ := newBridgeWithHoldingsAndZotio(t, nil, nil, func(c *config.Config) {
+				c.Browser.OpenAthensDomain = tc.openAthens
+				c.Browser.Resolvers = map[string]config.Institution{
+					"other": {OpenURLBase: "https://" + otherResolverHost + "/resolve"},
+				}
+			})
+			ctx := context.Background()
+			w := work.Work{DOI: "10.1176/appi.ajp.2010.09111680", Title: "Personalized Medicine for Depression", Authors: []string{"Simon, Gregory E."}, Year: 2010}
+			id := parkInstitutional(t, jobs, "publisher-host-"+strings.ReplaceAll(tc.name, " ", "-"), w, tc.profile)
+			if tc.publisher {
+				if err := jobs.RecordEvent(ctx, id, app.PublisherFirstEventKind, map[string]any{"adapter_id": "psychiatryonline"}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := jobs.OpenHumanAction(ctx, id, handoffActionKind, job.PublisherFirstHandoffDetail, job.Access(true, "paywall")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runSync(t, b, helloWithFeatures(t, "0.21.0", institutionalMaterializationFeature, effectPermitFeature, "provider_drive_epoch_v1"))
+			action, err := b.openHandoffForJob(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := job.IsPublisherHandoff(*action); got != tc.publisher {
+				t.Fatalf("action %+v publisher route = %v, want %v", action, got, tc.publisher)
+			}
+			raw, err := b.offer(*row, *action, config.ModeDelegated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := protocol.DecodeBrowserMessage(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hosts := msg.Payload.(*protocol.JobOfferPayload).ProviderHosts
+			if len(hosts) == 0 || hosts[0] != tc.wantFirst || hosts[len(hosts)-1] != tc.wantLast {
+				t.Fatalf("offer provider hosts = %v, want route host %q first and resolver host %q last", hosts, tc.wantFirst, tc.wantLast)
+			}
+			count := 0
+			for _, host := range hosts {
+				if host == tc.wantLast {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("offer provider hosts = %v carry the resolver host %d times, want once", hosts, count)
+			}
+		})
+	}
+}
+
+// The resolver host rides only where the frame stays valid: the protocol
+// accepts 1..20 provider hosts of [a-z0-9.-], and an offer that cannot take the
+// binding goes out without it rather than failing validation.
+func TestPublisherRouteInstitutionHostNeverBreaksTheFrame(t *testing.T) {
+	publisher := job.HumanAction{Kind: handoffActionKind, Detail: job.PublisherFirstHandoffDetail}
+	resolver := job.HumanAction{Kind: handoffActionKind, Detail: app.InstitutionalOpenURLHandoffDetail}
+	inst := config.Institution{OpenURLBase: "https://Openurl.Example.edu/resolve"}
+	full := make([]string, maxOfferProviderHosts)
+	for i := range full {
+		full[i] = "host" + string(rune('a'+i)) + ".example.org"
+	}
+	for _, tc := range []struct {
+		name   string
+		hosts  []string
+		action job.HumanAction
+		inst   config.Institution
+		want   []string
+	}{
+		{"binds last, lowercased", []string{"doi.org", "www.jstor.org"}, publisher, inst, []string{"doi.org", "www.jstor.org", "openurl.example.edu"}},
+		{"already present", []string{"doi.org", "openurl.example.edu"}, publisher, inst, []string{"doi.org", "openurl.example.edu"}},
+		{"no room", full, publisher, inst, full},
+		{"host outside the protocol grammar", []string{"doi.org"}, publisher, config.Institution{OpenURLBase: "https://open_url.example.edu/resolve"}, []string{"doi.org"}},
+		{"no resolver configured", []string{"doi.org"}, publisher, config.Institution{}, []string{"doi.org"}},
+		{"resolver route unchanged", []string{"openurl.example.edu"}, resolver, inst, []string{"openurl.example.edu"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := withPublisherRouteInstitutionHost(tc.hosts, tc.action, tc.inst)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("hosts = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// The offer's host list is shared with the control-suppression check, so
+	// the helper must never write through spare capacity in the caller's slice.
+	spare := append(make([]string, 0, 8), "doi.org", "www.jstor.org")
+	if got := withPublisherRouteInstitutionHost(spare, publisher, inst); len(got) != 3 {
+		t.Fatalf("hosts = %v, want the resolver host appended", got)
+	}
+	if leaked := spare[:3][2]; leaked != "" {
+		t.Fatalf("the caller's slice gained %q in its spare capacity", leaked)
 	}
 }

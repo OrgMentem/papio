@@ -13082,6 +13082,36 @@ func (b *Bridge) browserOfferHosts(row job.Row, action job.HumanAction, events [
 	return hosts
 }
 
+// withPublisherRouteInstitutionHost keeps the job's resolver host beside a
+// publisher-route offer. The DOI link and its OpenAthens redirector sit on a
+// publisher or redirector host and name no institution, so the extension could
+// not tell which institution's session evidence may release the offer: it
+// parked a fresh publisher-first offer queued with no tab although the
+// session was live (papio-d5e6cb6750e74b8f). The extension binds an offer to
+// the one configured resolver origin its provider hosts match, which is how
+// the LibKey route already stays bound (browserOfferHosts). The host goes
+// last: the first host names the route, and the extension attributes an
+// unattributed challenge to it. The frame must stay valid (protocol
+// validateJobContext: 1..20 hosts, lowercase [a-z0-9.-]{3,253}); an offer that
+// has no room or a host outside that grammar goes out without the binding, as
+// it did before, rather than failing validation.
+func withPublisherRouteInstitutionHost(hosts []string, action job.HumanAction, inst config.Institution) []string {
+	if !job.IsPublisherHandoff(action) || len(hosts) >= maxOfferProviderHosts {
+		return hosts
+	}
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(resolverHost(inst.OpenURLBase))), ".")
+	if host == "" || !offerHostGrammar.MatchString(host) || slices.Contains(hosts, host) {
+		return hosts
+	}
+	return append(hosts[:len(hosts):len(hosts)], host)
+}
+
+// maxOfferProviderHosts and offerHostGrammar mirror the protocol's
+// provider_hosts validation, which rejects a frame outside them.
+const maxOfferProviderHosts = 20
+
+var offerHostGrammar = regexp.MustCompile(`^[a-z0-9.-]{3,253}$`)
+
 func browserOfferHostMatches(offerHosts []string, latchHost string) bool {
 	if latchHost == "" {
 		return false
@@ -13246,6 +13276,7 @@ func (b *Bridge) offerAtURL(row job.Row, action job.HumanAction, accessMode, dir
 	// institution on a provider login wall and unlock ProQuest's link-resolver.
 	payload.LoginEntityID = inst.ShibbolethEntityID
 	payload.ProquestAccountID = inst.ProquestAccountID
+	payload.ProviderHosts = withPublisherRouteInstitutionHost(payload.ProviderHosts, action, inst)
 	return b.frame(protocol.MsgJobOffer, row.ID, payload)
 }
 
