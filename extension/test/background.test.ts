@@ -6871,6 +6871,430 @@ test("a rejected auth_returned observation still classifies the bound tab's prov
   expect(h.backend.store.activeJobs[0]?.unknown_count).toBe(unknownBefore + 1);
 });
 
+// A gate that rolled over refuses every observation still stamped with the
+// old occurrence as `stale`, and the ack names the occurrence the daemon holds
+// now. Adopting that id only helps the NEXT observation, and entitled_landing
+// has none: it fires from the one `article` verdict a settled tab never
+// repeats, while the wall and the return that would carry the adoption are
+// latched for the occurrence the extension used to hold. The refused landing
+// was the only evidence the daemon was going to hear, so the lease never
+// recorded the entitlement its dependents wait on.
+//
+// auth_returned is refused by the same fence and is deliberately NOT re-sent:
+// that fence exists so an old-cycle return cannot promote the current cycle's
+// lease, and relabelling the return would defeat it. A landing promotes
+// nothing - the daemon still requires a lease that is already `human` for
+// this job - so saying it again under the adopted occurrence is bounded by
+// the daemon's own lease check.
+
+/** A daemon double for one job's claim observations, applying only the fence
+ * these tests exercise (claim_observation_apply.go): an ordered frame stamped
+ * with a superseded occurrence is `stale`, and EVERY ack names the occurrence
+ * the daemon holds now. `refuseCurrent` answers `stale` for another reason
+ * (the holder-generation fence), which names no new occurrence. */
+interface ClaimDaemonDouble {
+  occurrence: string;
+  applied: Record<string, unknown>[];
+  refused: Record<string, unknown>[];
+  answer(frame: BrowserMessage, refuseCurrent?: boolean): Promise<void>;
+}
+
+function claimDaemonDouble(
+  h: Harness,
+  jobID: string,
+  occurrence: string,
+): ClaimDaemonDouble {
+  const double = {
+    occurrence,
+    applied: [] as Record<string, unknown>[],
+    refused: [] as Record<string, unknown>[],
+    async answer(frame: BrowserMessage, refuseCurrent = false): Promise<void> {
+      const payload = frame.payload as Record<string, unknown>;
+      const stale =
+        refuseCurrent || payload["gate_occurrence_id"] !== double.occurrence;
+      (stale ? double.refused : double.applied).push(payload);
+      await h.port.inbound(
+        observationAck(jobID, payload["request_id"], {
+          outcome: stale ? "stale" : "applied",
+          ...(stale
+            ? {
+                detail:
+                  "gate occurrence has rolled over; adopt the current occurrence id",
+              }
+            : {}),
+          gate_occurrence_id: double.occurrence,
+          browser_holder_generation: 1,
+        }),
+      );
+    },
+  };
+  return double;
+}
+
+function claimObservationFrames(h: Harness, kind?: string): BrowserMessage[] {
+  return h
+    .frames()
+    .filter(
+      (frame) =>
+        frame.type === "claim_observation" &&
+        (kind === undefined || frame.payload["event_kind"] === kind),
+    );
+}
+
+/** An open claim whose surface has met the sign-in wall, the daemon having
+ * applied that first observation under the occurrence the extension holds. */
+async function claimOnSignInWall(label: string) {
+  const jobID = `job_claim_${label}`;
+  const candidateID = `cand_${label}`;
+  const h = makeHarness({
+    ...emptyStore(),
+    activeJobs: [coldClaimJob(jobID)],
+  });
+  installManagedTabLedger(h, {});
+  useUnknownProviderClassifier(h, () => false);
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?${label}=1`,
+  );
+  const daemon = claimDaemonDouble(h, jobID, `occ_${candidateID}`);
+  const internals = h.bridge as unknown as {
+    emitClaimObservation(
+      jobID: string,
+      tabID: number,
+      eventKind: string,
+      latch?: boolean,
+    ): Promise<void>;
+  };
+  const framesBefore = h.port.posted.length;
+  await h.tabs.userNavigate(tabID, "https://idp.example.edu/sso");
+  expect(h.backend.store.activeJobs[0]?.status).toBe("auth_pending");
+  // Reported directly: the fake navigation does not reach the wall handler's
+  // emission, and the occurrence stamped on it is what these tests pin.
+  await internals.emitClaimObservation(jobID, tabID, "wall_observed", true);
+  const wall = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(wall.payload["event_kind"]).toBe("wall_observed");
+  await daemon.answer(wall);
+  return {
+    h,
+    jobID,
+    tabID,
+    daemon,
+    original: `occ_${candidateID}`,
+    emit: (kind: string) =>
+      internals.emitClaimObservation(jobID, tabID, kind, true),
+  };
+}
+
+/** Walk the sign-in twice around a gate rollover: the first sign-in applies
+ * under the occurrence the extension holds, the gate then rolls over without
+ * the extension hearing, and the second walk's wall and return are both
+ * latched, so nothing reaches the daemon. Returns the first thing that does:
+ * the landing, still stamped with the old occurrence. */
+async function signInTwiceThenLand(label: string, rolledTo: string) {
+  const claim = await claimOnSignInWall(label);
+  const { h, daemon, emit } = claim;
+  let framesBefore = h.port.posted.length;
+  await emit("auth_returned");
+  await daemon.answer(await h.port.waitForFrame("claim_observation", framesBefore));
+
+  daemon.occurrence = rolledTo;
+
+  const sentBefore = claimObservationFrames(h).length;
+  await emit("wall_observed");
+  await emit("auth_returned");
+  await settle();
+  expect(claimObservationFrames(h)).toHaveLength(sentBefore);
+
+  framesBefore = h.port.posted.length;
+  await emit("entitled_landing");
+  const landing = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(landing.payload["event_kind"]).toBe("entitled_landing");
+  expect(landing.payload["gate_occurrence_id"]).toBe(claim.original);
+  return { ...claim, landing };
+}
+
+test("Slice 3: an entitled_landing refused stale after the gate rolled over is re-sent once under the adopted occurrence and applied once", async () => {
+  const rolled = "occ_landing_rolled_b";
+  const { h, daemon, landing, original, jobID, emit } = await signInTwiceThenLand(
+    "landing_rolled",
+    rolled,
+  );
+
+  // The daemon refuses it (the gate has rolled over) and names the new one.
+  await daemon.answer(landing);
+  await settle();
+
+  const landings = claimObservationFrames(h, "entitled_landing");
+  expect(landings).toHaveLength(2);
+  const resent = landings[1]!;
+  expect(resent.job_id).toBe(jobID);
+  expect(resent.payload["gate_occurrence_id"]).toBe(rolled);
+  expect(resent.payload["observation_id"]).not.toBe(
+    landing.payload["observation_id"],
+  );
+  expect(resent.payload["authentication_claim_id"]).toBe(
+    landing.payload["authentication_claim_id"],
+  );
+  expect(resent.payload["binding_id"]).toBe(landing.payload["binding_id"]);
+  expect(resent.payload["event_ordinal"] as number).toBeGreaterThan(
+    landing.payload["event_ordinal"] as number,
+  );
+
+  await daemon.answer(resent);
+  await settle();
+
+  // Applied exactly once, under the occurrence the daemon holds; the refused
+  // original is the only other landing it ever heard.
+  const appliedLandings = daemon.applied.filter(
+    (payload) => payload["event_kind"] === "entitled_landing",
+  );
+  expect(appliedLandings).toHaveLength(1);
+  expect(appliedLandings[0]!["gate_occurrence_id"]).toBe(rolled);
+  expect(claimObservationFrames(h, "entitled_landing")).toHaveLength(2);
+  expect(original).not.toBe(rolled);
+  expect(h.claimObservationOutbox.current).toEqual({});
+
+  // The adopted occurrence's own latch is now set: nothing re-fires it.
+  await emit("entitled_landing");
+  await settle();
+  expect(claimObservationFrames(h, "entitled_landing")).toHaveLength(2);
+});
+
+test("Slice 3: a re-sent entitled_landing the daemon refuses again is not re-sent in turn", async () => {
+  const { h, daemon, landing } = await signInTwiceThenLand(
+    "landing_loop",
+    "occ_landing_loop_b",
+  );
+  await daemon.answer(landing);
+  await settle();
+  const resent = claimObservationFrames(h, "entitled_landing")[1]!;
+  expect(resent.payload["gate_occurrence_id"]).toBe("occ_landing_loop_b");
+
+  // Refused again, this time by a fence that names no new occurrence.
+  await daemon.answer(resent, true);
+  await settle();
+
+  expect(claimObservationFrames(h, "entitled_landing")).toHaveLength(2);
+  expect(h.claimObservationOutbox.current).toEqual({});
+});
+
+test("Slice 3: a landing the classifier already queued under the adopted occurrence is not duplicated by the re-send", async () => {
+  const rolled = "occ_landing_race_b";
+  const { h, daemon, emit, original } = await claimOnSignInWall("landing_race");
+  daemon.occurrence = rolled;
+
+  // Both are queued under the occurrence the extension still holds.
+  let framesBefore = h.port.posted.length;
+  await Promise.all([emit("login_started"), emit("entitled_landing")]);
+  const loginStarted = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(loginStarted.payload["event_kind"]).toBe("login_started");
+
+  // The first refusal adopts the new occurrence while the landing is in flight.
+  framesBefore = h.port.posted.length;
+  await daemon.answer(loginStarted);
+  const landingA = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(landingA.payload["event_kind"]).toBe("entitled_landing");
+  expect(landingA.payload["gate_occurrence_id"]).toBe(original);
+
+  // The tab's own verdict reports the landing again, now under the adopted
+  // occurrence, ahead of the refusal of the one still in flight.
+  const racing = emit("entitled_landing");
+  await daemon.answer(landingA);
+  await racing;
+  await settle();
+
+  const landings = claimObservationFrames(h, "entitled_landing");
+  expect(landings).toHaveLength(2);
+  expect(landings[1]!.payload["gate_occurrence_id"]).toBe(rolled);
+  await daemon.answer(landings[1]!);
+  await settle();
+
+  expect(claimObservationFrames(h, "entitled_landing")).toHaveLength(2);
+  expect(
+    daemon.applied.filter((payload) => payload["event_kind"] === "entitled_landing"),
+  ).toHaveLength(1);
+  expect(h.claimObservationOutbox.current).toEqual({});
+});
+
+function seededClaimObservation(
+  overrides: Partial<ClaimObservationOutboxEntry>,
+): ClaimObservationOutboxEntry {
+  return {
+    observation_id: "obs_stale_seed_a",
+    job_id: "job_stale_seeded",
+    authentication_claim_id: "claim_stale_seeded",
+    binding_id: "binding_stale_seeded",
+    browser_holder_generation: 1,
+    gate_occurrence_id: "occ_a_old",
+    event_ordinal: 5,
+    event_kind: "entitled_landing",
+    ...overrides,
+  };
+}
+
+/** A worker that died with these observations unacked: no claim grant, no
+ * latch, only the durable outbox. `written` collects every snapshot the
+ * worker stores, i.e. every state a later crash could restart from. */
+async function replayDurableOutbox(
+  entries: ClaimObservationOutboxEntry[],
+  written?: Record<string, ClaimObservationOutboxEntry>[],
+) {
+  const h = makeHarness();
+  h.claimObservationOutbox.current = Object.fromEntries(
+    entries.map((entry) => [entry.observation_id, entry]),
+  );
+  if (written !== undefined) {
+    const store = h.deps.claimObservationOutbox!.set;
+    h.deps.claimObservationOutbox!.set = async (value) => {
+      written.push({ ...value });
+      await store(value);
+    };
+  }
+  await h.bridge.start();
+  await h.port.inbound(helloAck({ features: ["handoff_link_v1", AUTH_CLAIM] }));
+  return h;
+}
+
+/** Answer claim_observation frames one at a time until none is outstanding. */
+async function answerUntilQuiet(
+  h: Harness,
+  daemon: ClaimDaemonDouble,
+): Promise<void> {
+  let answered = 0;
+  for (;;) {
+    await settle();
+    const frames = claimObservationFrames(h);
+    if (frames.length === answered) return;
+    const next = frames[answered]!;
+    answered += 1;
+    await daemon.answer(next);
+  }
+}
+
+test("Slice 3: no stored outbox snapshot holds a refused landing beside its re-send, so a crash replays exactly one landing even when the adopted occurrence sorts first", async () => {
+  // "occ_a_new" sorts before "occ_z_old": a replay of both entries would send
+  // the re-send first and then refuse the old one again with no latch left.
+  const refused = seededClaimObservation({ gate_occurrence_id: "occ_z_old" });
+  const written: Record<string, ClaimObservationOutboxEntry>[] = [];
+  const h = await replayDurableOutbox([refused], written);
+  const daemon = claimDaemonDouble(h, refused.job_id, "occ_a_new");
+  await h.port.waitForFrame("claim_observation");
+  await answerUntilQuiet(h, daemon);
+  expect(daemon.applied).toHaveLength(1);
+
+  expect(written.length).toBeGreaterThan(1);
+
+  // Every state the worker stored is a place it could have died: each replays
+  // to exactly one landing, one frame per stored entry and nothing more.
+  for (const snapshot of written) {
+    const restarted = await replayDurableOutbox(Object.values(snapshot));
+    const again = claimDaemonDouble(restarted, refused.job_id, "occ_a_new");
+    await answerUntilQuiet(restarted, again);
+    expect(claimObservationFrames(restarted, "entitled_landing")).toHaveLength(
+      Object.keys(snapshot).length,
+    );
+    expect(again.applied.length).toBeLessThanOrEqual(1);
+  }
+
+  // The refused entry never shares a stored snapshot with its replacement.
+  for (const snapshot of written) {
+    expect(Object.keys(snapshot)).not.toContain(refused.observation_id);
+  }
+});
+
+test("Slice 3: a replayed entitled_landing refused stale is re-sent from its own durable identity once the worker's claim grant is gone", async () => {
+  const stored = seededClaimObservation({});
+  const h = await replayDurableOutbox([stored]);
+  const daemon = claimDaemonDouble(h, stored.job_id, "occ_b_new");
+  const replay = await h.port.waitForFrame("claim_observation");
+  expect(replay.payload["observation_id"]).toBe(stored.observation_id);
+
+  await daemon.answer(replay);
+  await settle();
+
+  const landings = claimObservationFrames(h, "entitled_landing");
+  expect(landings).toHaveLength(2);
+  const resent = landings[1]!;
+  expect(resent.job_id).toBe(stored.job_id);
+  expect(resent.payload["observation_id"]).not.toBe(stored.observation_id);
+  expect(resent.payload["gate_occurrence_id"]).toBe("occ_b_new");
+  expect(resent.payload["authentication_claim_id"]).toBe(stored.authentication_claim_id);
+  expect(resent.payload["binding_id"]).toBe(stored.binding_id);
+  expect(resent.payload["event_ordinal"]).toBe(stored.event_ordinal + 1);
+  // Durable before it is answered: a second worker death replays it.
+  expect(Object.values(h.claimObservationOutbox.current)).toEqual([
+    expect.objectContaining({
+      observation_id: resent.payload["observation_id"],
+      gate_occurrence_id: "occ_b_new",
+    }),
+  ]);
+
+  await daemon.answer(resent);
+  await settle();
+  expect(daemon.applied).toHaveLength(1);
+  expect(h.claimObservationOutbox.current).toEqual({});
+});
+
+test("Slice 3: a replayed landing refused stale is not re-sent when one is already queued under the adopted occurrence", async () => {
+  const refused = seededClaimObservation({});
+  const queued = seededClaimObservation({
+    observation_id: "obs_stale_seed_b",
+    gate_occurrence_id: "occ_b_new",
+    event_ordinal: 6,
+  });
+  const h = await replayDurableOutbox([refused, queued]);
+  const daemon = claimDaemonDouble(h, refused.job_id, "occ_b_new");
+  const first = await h.port.waitForFrame("claim_observation");
+  expect(first.payload["observation_id"]).toBe(refused.observation_id);
+
+  const framesBefore = h.port.posted.length;
+  await daemon.answer(first);
+  const second = await h.port.waitForFrame("claim_observation", framesBefore);
+  expect(second.payload["observation_id"]).toBe(queued.observation_id);
+  await daemon.answer(second);
+  await settle();
+
+  expect(claimObservationFrames(h, "entitled_landing")).toHaveLength(2);
+  expect(daemon.applied).toHaveLength(1);
+  expect(h.claimObservationOutbox.current).toEqual({});
+});
+
+test("Slice 3: a landing refused stale by a fence that names no new occurrence is not re-sent", async () => {
+  const stored = seededClaimObservation({ gate_occurrence_id: "occ_b_new" });
+  const h = await replayDurableOutbox([stored]);
+  const daemon = claimDaemonDouble(h, stored.job_id, "occ_b_new");
+  const replay = await h.port.waitForFrame("claim_observation");
+
+  await daemon.answer(replay, true);
+  await settle();
+
+  expect(claimObservationFrames(h)).toHaveLength(1);
+  expect(h.claimObservationOutbox.current).toEqual({});
+});
+
+test("Slice 3: an auth_returned refused stale after the gate rolled over is not re-sent under the adopted occurrence", async () => {
+  const stored = seededClaimObservation({
+    observation_id: "obs_stale_seed_return",
+    event_kind: "auth_returned",
+    event_ordinal: 1,
+  });
+  const h = await replayDurableOutbox([stored]);
+  const daemon = claimDaemonDouble(h, stored.job_id, "occ_b_new");
+  const replay = await h.port.waitForFrame("claim_observation");
+
+  await daemon.answer(replay);
+  await settle();
+
+  expect(claimObservationFrames(h)).toHaveLength(1);
+  expect(daemon.applied).toEqual([]);
+  expect(h.claimObservationOutbox.current).toEqual({});
+});
+
 test("Slice 3: a claim_observation outbox entry replays before any lease-renewing action after a restart, and a duplicate ack clears it without local mutation", async () => {
   const jobA = "job_claim_replay_owner";
   const jobB = "job_claim_replay_cold";
@@ -18740,6 +19164,418 @@ test("a same-URL re-offer of a governor-queued institutional handoff keeps its U
   expect(h.tabs.created[1]?.url).toBe(OPENURL);
   const driven = h.backend.store.activeJobs.find((job) => job.job_id === jobIDs[1]);
   expect(driven?.tab_id).toBeGreaterThanOrEqual(0);
+});
+
+// Live 2026-10-20 (papio-d5e6cb6750e74b8f): a requires-auth offer whose URL is
+// not on the institution's resolver origin (publisher-first DOI route, its
+// OpenAthens redirector, a LibKey link) was accepted `queued` with no tab
+// although the institution's session evidence was fresh. onJobOffer keyed the
+// evidence on the offer URL's own origin (`https://doi.org`), while every
+// writer and the queued drain key it on the job's configured institution.
+const DOI_ROUTE_URL = "https://doi.org/10.1234/example";
+const EVIDENCED_ORIGIN = "https://resolver.example.edu";
+
+async function offerRequiringAuth(
+  h: Harness,
+  jobID: string,
+  providerHosts: string[],
+  url: string,
+): Promise<void> {
+  const offer = jobOfferForHosts(jobID, providerHosts, url) as {
+    payload: Record<string, unknown>;
+  };
+  offer.payload["requires_auth"] = true;
+  await h.port.inbound(offer);
+}
+
+async function evidencedInstitutionHarness(
+  evidencedOrigin: string,
+  boundOrigin: string | undefined,
+  jobID: string,
+  opts?: Parameters<typeof makeHarness>[1],
+): Promise<Harness> {
+  const h = makeHarness(
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: { [evidencedOrigin]: 1_700_000_000_000 },
+      activeJobs:
+        boundOrigin === undefined
+          ? []
+          : [
+              {
+                job_id: jobID,
+                tab_id: -1,
+                offered_at: 1_700_000_000_000,
+                expires_at: 1_900_000_000_000,
+                status: "queued",
+                provider_hosts: ["doi.org", PROVIDER_HOST],
+                access_mode: "delegated",
+                requires_auth: true,
+                institution_origin: boundOrigin,
+              },
+            ],
+    },
+    opts,
+  );
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: ["handoff_link_v1", AUTH_CLAIM],
+      resolver_origins: [EVIDENCED_ORIGIN, "https://other.example.edu"],
+    }),
+  );
+  return h;
+}
+
+test("a DOI-route offer for a job bound to an evidenced institution opens a tab, not a queued park", async () => {
+  const jobID = "job_doi_route_bound";
+  const h = await evidencedInstitutionHarness(
+    EVIDENCED_ORIGIN,
+    EVIDENCED_ORIGIN,
+    jobID,
+  );
+
+  await offerRequiringAuth(h, jobID, ["doi.org", PROVIDER_HOST], DOI_ROUTE_URL);
+
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([DOI_ROUTE_URL]);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "accepted",
+  });
+  expect(findByJob(h.backend.store, jobID)?.tab_id).toBeGreaterThanOrEqual(0);
+  expect(h.frames().find((f) => f.type === "job_accept")?.payload).toEqual({});
+});
+
+test("a LibKey-style offer whose provider hosts name the evidenced institution opens a tab", async () => {
+  const jobID = "job_libkey_route";
+  const url = "https://libkey.io/libraries/1234/10.1234/example";
+  const h = await evidencedInstitutionHarness(
+    EVIDENCED_ORIGIN,
+    undefined,
+    jobID,
+  );
+
+  await offerRequiringAuth(
+    h,
+    jobID,
+    ["libkey.io", "resolver.example.edu"],
+    url,
+  );
+
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([url]);
+  expect(h.frames().find((f) => f.type === "job_accept")?.payload).toEqual({});
+});
+
+test("evidence for another institution never releases a DOI-route offer bound to this one", async () => {
+  const jobID = "job_doi_route_other_evidence";
+  const h = await evidencedInstitutionHarness(
+    "https://other.example.edu",
+    EVIDENCED_ORIGIN,
+    jobID,
+  );
+
+  await offerRequiringAuth(h, jobID, ["doi.org", PROVIDER_HOST], DOI_ROUTE_URL);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+  expect(h.frames().find((f) => f.type === "job_accept")?.payload).toEqual({
+    disposition: "queued",
+  });
+});
+
+// The live shape (2026-10-20): a FRESH publisher-first offer names the route
+// host and, since the daemon keeps the job's resolver host beside a publisher
+// route, that resolver host. The resolver host binds the offer to its
+// institution; it must not make the resolver a challenge host of the route.
+test("a fresh publisher-first offer binds to the institution through the resolver host the daemon keeps beside the route", async () => {
+  const jobID = "job_publisher_first_fresh";
+  const h = await evidencedInstitutionHarness(
+    EVIDENCED_ORIGIN,
+    undefined,
+    jobID,
+  );
+
+  await offerRequiringAuth(
+    h,
+    jobID,
+    ["doi.org", PROVIDER_HOST, "resolver.example.edu"],
+    DOI_ROUTE_URL,
+  );
+
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([DOI_ROUTE_URL]);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "accepted",
+    institution_origin: EVIDENCED_ORIGIN,
+  });
+  expect(h.frames().find((f) => f.type === "job_accept")?.payload).toEqual({});
+});
+
+test("a challenge cooldown on the resolver does not hold a publisher route, but one on the route does", async () => {
+  const cooling = async (
+    jobID: string,
+    cooldownHost: string,
+    providerHosts: string[],
+    url: string,
+  ): Promise<Harness> => {
+    const h = await evidencedInstitutionHarness(
+      EVIDENCED_ORIGIN,
+      undefined,
+      jobID,
+    );
+    h.backend.store.challengeCooldowns = {
+      [cooldownHost]: 1_700_000_000_000 + 3_600_000,
+    };
+    await offerRequiringAuth(h, jobID, providerHosts, url);
+    return h;
+  };
+  const publisherHosts = ["doi.org", PROVIDER_HOST, "resolver.example.edu"];
+
+  // The resolver is cooling (registrable host example.edu): the DOI route
+  // never visits it, so the offer opens.
+  const resolverCooling = await cooling(
+    "job_publisher_resolver_cooling",
+    "example.edu",
+    publisherHosts,
+    DOI_ROUTE_URL,
+  );
+  expect(resolverCooling.tabs.created.map((tab) => tab.url)).toEqual([
+    DOI_ROUTE_URL,
+  ]);
+
+  // The route itself is cooling: held, exactly as before.
+  const routeCooling = await cooling(
+    "job_publisher_route_cooling",
+    "doi.org",
+    publisherHosts,
+    DOI_ROUTE_URL,
+  );
+  expect(routeCooling.tabs.created).toEqual([]);
+
+  // A resolver route names its own host first, so a resolver cooldown still
+  // holds it.
+  const resolverRoute = await cooling(
+    "job_resolver_route_cooling",
+    "example.edu",
+    ["resolver.example.edu", PROVIDER_HOST],
+    OPENURL,
+  );
+  expect(resolverRoute.tabs.created).toEqual([]);
+});
+
+// ADR-0028 amendment 2026-10-14, item 2: opening is presence-gated. The
+// gate that decided whether an autonomous sign-in surface may open read only
+// the network, so an offer or an evidence release created a tab in a browser
+// nobody was looking at; only the materialization pipeline asked presence.
+const OPEN_AUTH_OFFER_HOSTS = ["resolver.example.edu", PROVIDER_HOST];
+
+test("an evidenced requires-auth offer that arrives while the browser is idle opens no tab until the operator is back", async () => {
+  const jobID = "job_presence_idle_offer";
+  const h = await evidencedInstitutionHarness(
+    EVIDENCED_ORIGIN,
+    undefined,
+    jobID,
+    { windows: true, idle: true },
+  );
+  await h.idle!.set("idle");
+
+  await offerRequiringAuth(h, jobID, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+  expect(findByJob(h.backend.store, jobID)?.engagement_required).not.toBe(true);
+  expect(h.frames().find((f) => f.type === "job_accept")?.payload).toEqual({
+    disposition: "queued",
+  });
+
+  // The held offer is durable and opens on the transition back to active.
+  await h.idle!.set("active");
+  await settle();
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "accepted",
+  });
+  expect(findByJob(h.backend.store, jobID)?.tab_id).toBeGreaterThanOrEqual(0);
+});
+
+test("an evidenced requires-auth offer waits while every window is minimized and opens when one is focused", async () => {
+  const jobID = "job_presence_minimized_offer";
+  const h = await evidencedInstitutionHarness(
+    EVIDENCED_ORIGIN,
+    undefined,
+    jobID,
+    { windows: true, idle: true },
+  );
+  h.windows!.userWindowState = "minimized";
+
+  await offerRequiringAuth(h, jobID, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+  expect(h.tabs.created).toEqual([]);
+
+  h.windows!.userWindowState = "normal";
+  await h.windows!.onFocusChanged.emit(1);
+  await settle();
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
+});
+
+test("session evidence that arrives while the browser is idle does not release a queued sign-in", async () => {
+  const jobID = "job_presence_idle_evidence";
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  await h.bridge.start();
+  // A legacy (non-fresh-link) daemon: an offer without evidence waits queued,
+  // with its URL kept, for the evidence that releases it.
+  await h.port.inbound(
+    helloAck({
+      features: [AUTH_CLAIM],
+      resolver_origins: [EVIDENCED_ORIGIN],
+    }),
+  );
+  await offerRequiringAuth(h, jobID, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+  expect(h.tabs.created).toEqual([]);
+  await h.idle!.set("idle");
+
+  await h.bridge.recordFreshSessionEvidence(freshEvidence(h, EVIDENCED_ORIGIN));
+  await settle();
+  expect(h.tabs.created).toEqual([]);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+
+  await h.idle!.set("active");
+  await settle();
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
+});
+
+test("the operator's explicit open still opens a held sign-in while the browser is idle", async () => {
+  const jobID = "job_presence_explicit_open";
+  const h = await evidencedInstitutionHarness(
+    EVIDENCED_ORIGIN,
+    undefined,
+    jobID,
+    { windows: true, idle: true },
+  );
+  await h.idle!.set("idle");
+  await offerRequiringAuth(h, jobID, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+  expect(h.tabs.created).toEqual([]);
+
+  const reply = await h.bridge.openHandoff(jobID);
+
+  expect(reply).toMatchObject({ ok: true, opened: true });
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
+});
+
+test("a requires-auth offer for a job whose sign-in tab is gone waits for the operator instead of recreating it while the browser is idle", async () => {
+  const jobID = "job_presence_dead_tab";
+  const h = makeHarness(
+    {
+      ...emptyStore(),
+      authEvidenceByOrigin: { [EVIDENCED_ORIGIN]: 1_700_000_000_000 },
+      activeJobs: [
+        {
+          job_id: jobID,
+          tab_id: 4242,
+          offered_at: 1_700_000_000_000,
+          expires_at: 1_900_000_000_000,
+          status: "accepted",
+          provider_hosts: OPEN_AUTH_OFFER_HOSTS,
+          access_mode: "delegated",
+          requires_auth: true,
+          institution_origin: EVIDENCED_ORIGIN,
+        },
+      ],
+    },
+    { windows: true, idle: true },
+  );
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: [AUTH_CLAIM],
+      resolver_origins: [EVIDENCED_ORIGIN],
+    }),
+  );
+  await h.idle!.set("idle");
+  h.tabs.created.length = 0;
+
+  await offerRequiringAuth(h, jobID, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+
+  expect(h.tabs.created).toEqual([]);
+  expect(findByJob(h.backend.store, jobID)).toMatchObject({
+    status: "queued",
+    tab_id: -1,
+  });
+  await h.idle!.set("active");
+  await settle();
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
+});
+
+test("the 45 second fallback does not open a sign-in tab while the browser is idle, and a later sweep does once the operator is back", async () => {
+  const jobID = "job_presence_fallback";
+  const h = makeHarness(undefined, { windows: true, idle: true });
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({
+      features: [AUTH_CLAIM],
+      resolver_origins: [EVIDENCED_ORIGIN],
+    }),
+  );
+  await h.idle!.set("idle");
+  await offerRequiringAuth(h, jobID, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+  expect(h.tabs.created).toEqual([]);
+  const fallback = h.timers.find((timer) => timer.ms === 45_000);
+  expect(fallback).toBeDefined();
+  h.clock.now += 46_000;
+
+  await fallback!.fn();
+  await settle();
+
+  expect(h.tabs.created).toEqual([]);
+  const held = findByJob(h.backend.store, jobID);
+  expect(held).toMatchObject({ status: "queued", tab_id: -1 });
+  expect(held?.engagement_required).not.toBe(true);
+
+  await h.idle!.set("active");
+  await settle();
+  // Test seam: the periodic sweep is private; the keepalive wake drives it.
+  const internals = h.bridge as unknown as {
+    releaseExpiredQueuedHandoffs(): Promise<void>;
+  };
+  await internals.releaseExpiredQueuedHandoffs();
+  expect(h.tabs.created.map((tab) => tab.url)).toEqual([OPENURL]);
+});
+
+test("a sign-in waiting in the drive queue is not opened by a freed slot while the browser is idle", async () => {
+  const [first, second] = ["job_presence_queue_a", "job_presence_queue_b"] as [
+    string,
+    string,
+  ];
+  const h = await evidencedInstitutionHarness(
+    EVIDENCED_ORIGIN,
+    undefined,
+    first,
+    { windows: true, idle: true },
+  );
+  await offerRequiringAuth(h, first, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+  await offerRequiringAuth(h, second, OPEN_AUTH_OFFER_HOSTS, OPENURL);
+  expect(h.tabs.created).toHaveLength(1);
+  expect(findByJob(h.backend.store, second)).toMatchObject({
+    status: "accepted",
+    tab_id: -1,
+  });
+
+  await h.idle!.set("idle");
+  await h.bridge.requestCancel(first);
+  await settle();
+  expect(h.tabs.created).toHaveLength(1);
+  expect(findByJob(h.backend.store, second)?.tab_id).toBe(-1);
+
+  await h.idle!.set("active");
+  await settle();
+  expect(h.tabs.created).toHaveLength(2);
+  expect(findByJob(h.backend.store, second)?.tab_id).toBeGreaterThanOrEqual(0);
 });
 
 test("a hydrated queued handoff without its worker-local offer URL is left for the daemon's re-offer, never rejected", async () => {

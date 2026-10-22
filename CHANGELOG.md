@@ -13,6 +13,7 @@ execution records kept during the initial build.
 ### Changed
 - **`zotio tags reconcile` is now hidden from MCP.** It writes Zotero tags immediately with no preview, so it stays a terminal-only command. The daemon already runs the same pass automatically.
 - **`papio` exit statuses now tell a usage error and an unreachable daemon apart.** A bad flag, a wrong argument count, or a missing `--config` file exits `2`. A command that finds no running daemon exits `3`. Every other failure, including an error the daemon returns, still exits `1`. The `--json` error codes and the output text do not change. `papio --help` lists the statuses.
+- **A DOI or OpenAthens handoff now names your library to the browser.** The offer for a DOI route (`https://doi.org/…` or the OpenAthens redirector) already listed the publisher hosts. It now also lists your library's resolver host, last, as the LibKey route already did. The extension uses it to find the library whose live session may release the paper; without it a fresh publisher-first paper was accepted as queued with no tab. No new field crosses the native-messaging wire.
 
 ### Added
 - **MCP agents can follow a long acquisition through `papio_changes`.** The

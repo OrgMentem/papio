@@ -131,6 +131,38 @@ for the full pre-split extension history.
   helper set up, nothing changes except that the helper is never used.
 
 ### Fixed
+- **A paper whose route is not on your library's own address now opens its
+  sign-in tab once your session is live.** A DOI link, its OpenAthens
+  redirector or a LibKey link sits on a publisher or link-service host, and the
+  extension looked for session evidence under that host. Nothing records
+  evidence there, so a paper offered while you were signed in was accepted as
+  queued with no tab until you opened it yourself (measured 2026-10-20). The
+  extension now looks under the library the job belongs to, as the queue and
+  the evidence writers already did: the library bound to the job, or the
+  configured library named in the offer's provider hosts. Evidence for another
+  library still releases nothing. A challenge cooldown on your library's own
+  host no longer holds a paper whose route never visits it.
+- **A sign-in tab no longer opens while you are away.** The check that let an
+  automatic sign-in tab open read only the network, so a paper offered, an
+  evidence release, a freed drive slot or the 45-second fallback could create a
+  tab in a browser that was idle, locked, or had every window minimized. Only
+  the institutional pipeline asked whether you were there. Every one of these
+  now reads presence the same way: the paper waits queued, with its link, kept
+  across worker restarts, and opens when you become active, a window gains
+  focus, or you open it yourself. Nothing parks it for you to act on.
+- **An entitled landing refused because the sign-in gate had rolled over is
+  sent again.** If you signed out and back in at the library while a paper's
+  sign-in tab was open, the daemon refused the extension's report that the tab
+  had reached entitled content, because it carried the previous sign-in's id.
+  The refusal names the current id and the extension adopted it, but the
+  report is sent only once per sign-in, so nothing carried the landing to the
+  daemon and the institution never recorded the entitlement the paper's
+  siblings wait on. The extension now sends that one landing once more under
+  the current id, from the queued report itself, so it also works after the
+  worker slept. It never repeats a landing already queued or sent under that
+  id, and a refusal that names no new id is not retried. A refused
+  `auth_returned` is not sent again: the daemon refuses an old sign-in's return
+  on purpose, so it cannot promote the current one.
 - **A failed storage read no longer erases which tabs *papio* owns.** When
   the first read of the tab ledger failed, the extension treated the ledger as
   empty and saved that over the stored one, so it forgot its claims and

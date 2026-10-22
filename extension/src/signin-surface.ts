@@ -322,6 +322,27 @@ export class SignInLifecycle {
     });
   }
 
+  /** Is the operator at the browser: active, with a window an operator could
+   * be looking at? The one presence reading every requires-auth opening
+   * shares. Unknown (no idle API, an unreadable window list) reads as present:
+   * only a positive "idle, locked or every window minimized" holds anything. */
+  async operatorPresent(): Promise<boolean> {
+    const state = await this.presence();
+    if (state !== undefined && state !== "active") return false;
+    if (state !== undefined && !(await this.hasVisibleWindow())) return false;
+    return true;
+  }
+
+  /** The presence half of offerGate, for an opening that is not a
+   * materialization: an operator's explicit open for this job lifts it once.
+   * A closed marker is deliberately not consulted here; whether the operator
+   * closed a legacy tab is the caller's own rule. */
+  async presenceGate(jobID: string): Promise<"open" | "presence"> {
+    const record = await this.get(jobID);
+    if (record?.explicit_open === true) return "open";
+    return (await this.operatorPresent()) ? "open" : "presence";
+  }
+
   /** May a daemon offer for this job create a tab now? Opening is
    * presence-gated: an offer that arrives while the operator is away, or
    * while every browser window is minimized, waits and opens when they are
@@ -330,10 +351,7 @@ export class SignInLifecycle {
     const record = await this.get(jobID);
     if (record?.explicit_open === true) return "open";
     if (record?.phase === "closed") return "closed";
-    const state = await this.presence();
-    if (state !== undefined && state !== "active") return "presence";
-    if (state !== undefined && !(await this.hasVisibleWindow())) return "presence";
-    return "open";
+    return (await this.operatorPresent()) ? "open" : "presence";
   }
 
   /** An offer is waiting for the operator. Durable, so a worker death does

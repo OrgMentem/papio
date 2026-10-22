@@ -278,7 +278,7 @@ handler").
 | `request_id` | string | required |
 | `outcome` | enum | required — `"applied" \| "duplicate" \| "stale" \| "rejected" \| "error"` |
 | `detail` | string (≤1000) | optional; **forbidden** on `applied`/`duplicate` |
-| `gate_occurrence_id` | string | required always — the daemon's **current** occurrence id, which may differ from the request's when the gate rolled over (a fresh sign-out reopened it — the 2026-08-12 amendment's "gate id carries the frame's `msg_id`" behavior); the extension must adopt this value for its next observation |
+| `gate_occurrence_id` | string | required always — the daemon's **current** occurrence id, which may differ from the request's when the gate rolled over (a fresh sign-out reopened it — the 2026-08-12 amendment's "gate id carries the frame's `msg_id`" behavior); the extension must adopt this value for its next observation. A `stale` ack to an `entitled_landing` that names a different occurrence is the one refusal the extension answers by re-sending: once, as a new observation under the adopted occurrence (a landing promotes nothing, and the daemon still requires an already-`human` lease). `auth_returned` is not re-sent — the occurrence fence exists so an old cycle's return cannot promote the current cycle's lease |
 | `browser_holder_generation` | int64 | required always — current fence |
 | `lease_until` | RFC3339 string | required on `applied` for `wall_observed`/`login_started`/`mfa`/`challenge`; forbidden otherwise — realizes "renewed only by current wall/MFA/challenge observations, never worker-local timers" (plan line 324-326) |
 

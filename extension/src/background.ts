@@ -1132,6 +1132,19 @@ export interface ClaimObservationOutboxEntry {
   event_kind: ClaimObservationPayload["event_kind"];
 }
 
+/** The identity `observation_id` is built from, minus the ordinal. The latch
+ * that keeps a one-per-occurrence observation from firing twice is keyed by
+ * it, and a re-send built from a durable outbox entry (no live claim grant)
+ * must land on the very same key an ordinary emission would have used. */
+function claimObservationLatchKey(
+  authenticationClaimID: string,
+  bindingID: string,
+  gateOccurrenceID: string,
+  eventKind: ClaimObservationPayload["event_kind"],
+): string {
+  return `${authenticationClaimID}:${bindingID}:${gateOccurrenceID}:${eventKind}`;
+}
+
 /** Durable evidence of a top-frame webNavigation.onErrorOccurred, keyed by
  * tab id (chrome.storage.session, oracle finding 5): the worker-local
  * `navigationErrors` Map is the only OTHER record of this, so a worker
@@ -1209,7 +1222,7 @@ export interface BridgeDeps {
       active?: boolean;
       lastFocusedWindow?: boolean;
     }): Promise<TabInfo[]>;
-    onRemoved: Listenable<[number, { isWindowClosing: boolean }]>;
+    onRemoved: Listenable<[number]>;
     /** ADR-0013 privileges the focused tab: an activation with no matching
      * navigation event is still evidence the operator is looking at that
      * origin's resolver page. */
@@ -3376,7 +3389,10 @@ export class Bridge {
       jobExists: (jobID) => findByJob(this.store, jobID) !== undefined,
       reissueRoute: (jobID, tabID, fence) =>
         this.signInEvent(this.reissueSignInRoute(jobID, tabID, fence)),
-      wakeOffer: (jobID) => void this.scheduleMaterialization(jobID, true),
+      wakeOffer: (jobID) => {
+        void this.scheduleMaterialization(jobID, true);
+        void this.releaseHeldHandoffs();
+      },
     });
     this.workerEpoch = deps.randomUUID().replace(/-/g, "");
     this.pageBulkRecovery =
@@ -3780,6 +3796,29 @@ export class Bridge {
       offered,
       job.provider_hosts ?? [],
     );
+  }
+
+  /** The origin whose session evidence may release a daemon offer: the job's
+   * configured institution, derived the way jobInstitutionOrigin derives it
+   * for the evidence writers (recordInstitutionalSession) and for the queued
+   * drain. It is never the offer URL's own origin. A DOI route, its OpenAthens
+   * redirector and a LibKey link sit on a publisher or link-service host, so
+   * keying on that origin looked up evidence nothing writes and parked an
+   * evidenced offer tabless (papio-d5e6cb6750e74b8f). `institutionOrigin` is
+   * what this offer itself resolved to; the persisted binding covers an offer
+   * that names no institution of its own. */
+  private offerEvidenceOrigin(
+    openurl: string,
+    institutionOrigin: string | undefined,
+    existing: ActiveJob | undefined,
+  ): string | undefined {
+    const known = this.knownResolverOrigins();
+    // Older daemons advertise no configured-origin set. Preserve their prior
+    // exact-offer fallback; a current non-empty set remains authoritative.
+    if (known.length === 0) return this.resolverOriginHint(openurl);
+    if (institutionOrigin !== undefined) return institutionOrigin;
+    const stored = existing?.institution_origin;
+    return stored !== undefined && known.includes(stored) ? stored : undefined;
   }
 
   knownResolverOrigins(): readonly string[] {
@@ -6067,6 +6106,7 @@ export class Bridge {
     await this.surfaceReady;
     const port = this.port;
     if (port === null) return;
+    let heldForOperator = 0;
     while (
       this.port === port &&
       this.handoffDrives.size < HANDOFF_DRIVE_LIMIT &&
@@ -6140,6 +6180,19 @@ export class Bridge {
               engagement_required: true,
             }),
           );
+          continue;
+        }
+        if ((await this.signIn.presenceGate(request.jobID)) !== "open") {
+          // ADR-0028 amendment 2026-10-14 item 2: a sign-in surface is not
+          // created while the operator is away. The entry keeps its place in
+          // line (behind whatever else is waiting, so an OA paper is not
+          // stalled by it) and is held durably; the return wakes this drain.
+          await this.signIn.holdOffer(request.jobID);
+          if (!dequeue()) continue;
+          this.handoffDriveQueue.push(request);
+          this.queuedDriveJobIDs.add(request.jobID);
+          heldForOperator += 1;
+          if (heldForOperator >= this.handoffDriveQueue.length) return;
           continue;
         }
         const candidateID = this.materializationCorrelation(
@@ -8629,7 +8682,14 @@ export class Bridge {
    * engagement_required and waits for the operator's explicit open (inbox
    * click, popup retry). When the gate is open the daemon has advertised
    * the claim feature and the autonomous requires_auth path may create its
-   * sign-in surface. */
+   * sign-in surface.
+   *
+   * This is containment only. It reads the daemon and the network, never the
+   * operator: whether anyone is there to see a new tab is a separate reading,
+   * SignInLifecycle.presenceGate (offerGate's own presence half), taken at
+   * every site that opens one (ADR-0028 amendment 2026-10-14, item 2). A
+   * closed gate parks for the operator's explicit open; an absent operator
+   * only holds the work until they are back. */
   private institutionalAuthGateOpen(): boolean {
     return (
       this.hasCurrentHello() &&
@@ -9059,7 +9119,12 @@ export class Bridge {
   ): string | undefined {
     const grant = this.claimGrants.get(jobID);
     if (grant === undefined) return undefined;
-    return `${grant.authenticationClaimID}:${bindingID}:${grant.gateOccurrenceID}:${eventKind}`;
+    return claimObservationLatchKey(
+      grant.authenticationClaimID,
+      bindingID,
+      grant.gateOccurrenceID,
+      eventKind,
+    );
   }
 
   /** Whether `eventKind` was already latched for `jobID`'s CURRENT gate
@@ -9075,6 +9140,22 @@ export class Bridge {
     if (bindingID === undefined) return false;
     const key = this.observationSuppressionKey(jobID, bindingID, eventKind);
     return key !== undefined && this.claimObservationLatch.has(key);
+  }
+
+  /** Check-and-set `key` in the at-most-once latch and index it under `jobID`
+   * so clearClaimGrant retires it with the grant. False when it was already
+   * latched. Fully synchronous: the one thing that keeps two overlapping
+   * callers for the same identity from both passing. */
+  private latchClaimObservation(jobID: string, key: string): boolean {
+    if (this.claimObservationLatch.has(key)) return false;
+    this.claimObservationLatch.add(key);
+    let keys = this.claimObservationLatchKeysByJob.get(jobID);
+    if (keys === undefined) {
+      keys = new Set<string>();
+      this.claimObservationLatchKeysByJob.set(jobID, keys);
+    }
+    keys.add(key);
+    return true;
   }
 
   /** Resolve a claim-owned tab's binding id from the birth-certificate
@@ -9097,14 +9178,7 @@ export class Bridge {
       if (bindingID === undefined) return;
       const key = this.observationSuppressionKey(jobID, bindingID, eventKind);
       if (key === undefined) return;
-      if (this.claimObservationLatch.has(key)) return;
-      this.claimObservationLatch.add(key);
-      let keys = this.claimObservationLatchKeysByJob.get(jobID);
-      if (keys === undefined) {
-        keys = new Set<string>();
-        this.claimObservationLatchKeysByJob.set(jobID, keys);
-      }
-      keys.add(key);
+      if (!this.latchClaimObservation(jobID, key)) return;
     }
     // §4.5: never emit a fresh lease-renewing observation ahead of any
     // unacked backlog from a prior worker lifetime — this call is never
@@ -9270,6 +9344,15 @@ export class Bridge {
         }
       }
       if (
+        ack.outcome === "stale" &&
+        entry.event_kind === "entitled_landing" &&
+        typeof ack.gate_occurrence_id === "string"
+      ) {
+        // Before the classify below: it can report the same landing itself,
+        // and this is what puts the adopted occurrence's latch in its way.
+        this.resendEntitledLandingAfterRollover(entry, ack.gate_occurrence_id);
+      }
+      if (
         (ack.outcome === "rejected" || ack.outcome === "stale") &&
         (entry.event_kind === "auth_returned" ||
           entry.event_kind === "entitled_landing")
@@ -9287,6 +9370,96 @@ export class Bridge {
       this.claimObservationOutboxEntries.delete(entry.observation_id);
       this.persistClaimObservationOutbox();
     }
+  }
+
+  /** A `stale` ack to an `entitled_landing` whose occurrence differs from the
+   * one it was stamped with means the gate rolled over, and the ack's
+   * occurrence has just been adopted onto the live grants above. Adoption only
+   * helps the NEXT observation, and a landing has none: it fires from the one
+   * `article` verdict a settled tab never repeats, and the wall and return
+   * that would carry the adoption are latched for the occurrence this grant
+   * used to hold. The refused landing was then the only entitlement evidence
+   * the daemon was ever going to hear, so its lease never recorded the
+   * entitlement the dependents wait on. Say it once more under the adopted
+   * occurrence, with a new observation_id (the daemon journals the old one)
+   * and an ordinal past everything this surface sent.
+   *
+   * Only the landing, deliberately. `auth_returned` is refused by the same
+   * fence, but the fence exists so a return from an old cycle cannot promote
+   * the current cycle's lease, and relabelling it would defeat that. A landing
+   * promotes nothing: the daemon still requires a lease that is already `human`
+   * for this job before it records entitlement.
+   *
+   * Built from the durable entry alone. `claimGrants` is worker memory and is
+   * gone after a restart replays this entry; the ordinal falls back to the
+   * entry's own, and the grant's counter is advanced only when it exists.
+   *
+   * At most once per adopted occurrence, and never when no occurrence was
+   * adopted: a refusal that names the entry's own occurrence is another fence
+   * (holder generation, ordinal) with nothing to re-send under, which is also
+   * what ends a re-send that is refused in turn. The latch is the ordinary
+   * landing's own, so a landing the classifier already emitted under the
+   * adopted occurrence is not doubled; a worker that died in between loses the
+   * latch, so a landing still queued in the durable outbox is checked too. */
+  private resendEntitledLandingAfterRollover(
+    entry: ClaimObservationOutboxEntry,
+    adoptedOccurrence: string,
+  ): void {
+    if (adoptedOccurrence === entry.gate_occurrence_id) return;
+    const latchKey = claimObservationLatchKey(
+      entry.authentication_claim_id,
+      entry.binding_id,
+      adoptedOccurrence,
+      "entitled_landing",
+    );
+    if (!this.latchClaimObservation(entry.job_id, latchKey)) return;
+    const queued = [...this.claimObservationOutboxEntries.values()];
+    if (
+      queued.some(
+        (other) =>
+          other.observation_id !== entry.observation_id &&
+          other.event_kind === "entitled_landing" &&
+          other.authentication_claim_id === entry.authentication_claim_id &&
+          other.binding_id === entry.binding_id &&
+          other.gate_occurrence_id === adoptedOccurrence,
+      )
+    )
+      return;
+    const grant = this.claimGrants.get(entry.job_id);
+    const own =
+      grant?.authenticationClaimID === entry.authentication_claim_id
+        ? grant
+        : undefined;
+    let ordinal = Math.max(entry.event_ordinal + 1, own?.nextOrdinal ?? 0);
+    for (const other of queued) {
+      if (
+        other.gate_occurrence_id === adoptedOccurrence &&
+        other.binding_id === entry.binding_id &&
+        other.event_ordinal >= ordinal
+      )
+        ordinal = other.event_ordinal + 1;
+    }
+    if (own !== undefined) own.nextOrdinal = ordinal + 1;
+    const resent: ClaimObservationOutboxEntry = {
+      observation_id: this.deps.randomUUID(),
+      job_id: entry.job_id,
+      authentication_claim_id: entry.authentication_claim_id,
+      binding_id: entry.binding_id,
+      browser_holder_generation: entry.browser_holder_generation,
+      gate_occurrence_id: adoptedOccurrence,
+      event_ordinal: ordinal,
+      event_kind: "entitled_landing",
+    };
+    // ONE mutation: no stored snapshot may hold the refused entry beside its
+    // replacement. A replay of both has no latch, and when the adopted
+    // occurrence sorts first the replacement is sent and removed before the
+    // refused entry is refused again, which would mint a second landing.
+    this.claimObservationOutboxEntries.delete(entry.observation_id);
+    this.claimObservationOutboxEntries.set(resent.observation_id, resent);
+    this.persistClaimObservationOutbox();
+    // The running drain stops when a pass leaves the queue no shorter, and
+    // this swaps the refused entry for its re-send: the rerun is what sends it.
+    this.scheduleObservationOutboxDrain();
   }
 
   /** Re-assess the bound tab after the daemon declined a drive-evidence
@@ -14166,10 +14339,30 @@ export class Bridge {
   private providerKeyForJob(job: ActiveJob): string {
     return this.providerKeyForHosts(job.provider_hosts);
   }
+  /** The registrable hosts a challenge cooldown is keyed on. The first
+   * provider host names the route (the daemon appends the offer's own host
+   * first). A configured resolver's host further down the list is the offer's
+   * institution binding, which the daemon keeps beside a publisher or LibKey
+   * route so the offer can find its session evidence; it is not a provider
+   * that route visits, so it neither blocks the offer through a cooldown on
+   * the resolver nor takes a challenge attributed to the route. A resolver
+   * route names its own host first and keeps it. */
   private challengeHostsFor(providerHosts: readonly string[]): string[] {
+    const resolverHosts = new Set<string>();
+    for (const origin of this.knownResolverOrigins()) {
+      try {
+        resolverHosts.add(new URL(origin).hostname.toLowerCase());
+      } catch {
+        // knownResolverOrigins already validates; refuse malformed residue.
+      }
+    }
     return [
       ...new Set(
         providerHosts
+          .filter(
+            (host, index) =>
+              index === 0 || !resolverHosts.has(host.trim().toLowerCase()),
+          )
           .map((host) => registrableProviderHost(host))
           .filter((host): host is string => host !== undefined),
       ),
@@ -15275,6 +15468,40 @@ export class Bridge {
     await this.drainQueuedHandoffs(undefined, fallbackJobID, forceProvider);
   }
 
+  /** Whether an autonomous sign-in surface may open now: the containment gate
+   * and an operator who is there, read the way offerGate reads presence. When
+   * only the operator is missing, every queued sign-in this scope could have
+   * released is held durably so the transition back to active wakes it
+   * (ADR-0028 amendment 2026-10-14, item 2). */
+  private async signInMayOpenNow(
+    inScope: (job: ActiveJob) => boolean,
+  ): Promise<boolean> {
+    if (!this.institutionalAuthGateOpen()) return false;
+    const waiting = this.store.activeJobs.filter(
+      (job) =>
+        job.status === "queued" &&
+        job.requires_auth === true &&
+        job.engagement_required !== true &&
+        inScope(job),
+    );
+    if (waiting.length === 0) return true;
+    if (await this.signIn.operatorPresent()) return true;
+    for (const job of waiting) await this.signIn.holdOffer(job.job_id);
+    return false;
+  }
+
+  /** The operator is back: run every held offer's drain. Evidence, presence
+   * and the drive slot are all re-checked there; a wake only asks. */
+  private async releaseHeldHandoffs(): Promise<void> {
+    try {
+      await this.ready;
+      await this.surfaceReady;
+      await this.releaseQueuedHandoffs();
+    } catch (error) {
+      console.error("papio: held handoff release failed", error);
+    }
+  }
+
   private async drainQueuedHandoffs(
     originScope: string | undefined,
     fallbackJobID: string | undefined,
@@ -15385,6 +15612,20 @@ export class Bridge {
             );
             continue;
           }
+          if (
+            candidate.requires_auth === true &&
+            !forceProvider &&
+            (await this.signIn.presenceGate(jobID)) !== "open"
+          ) {
+            // ADR-0028 amendment 2026-10-14 item 2: no sign-in tab while the
+            // operator is away. The job stays queued and is held durably;
+            // the return wakes a drain, and the periodic expiry sweep forces
+            // it again. Nothing here parks it for engagement: the operator
+            // did not decline anything.
+            this.pendingForcedReleases.delete(jobID);
+            await this.signIn.holdOffer(jobID);
+            continue;
+          }
           if (this.challengeCooldownActiveForHosts(candidate.provider_hosts)) {
             forcedTemporarilyBlocked = true;
             continue;
@@ -15400,6 +15641,10 @@ export class Bridge {
         // An explicit request has priority over opportunistic work. If its
         // exact job is temporarily blocked, retain the marker and wait rather
         // than substituting another queued job.
+        const authMayOpen =
+          selected === undefined && !forcedTemporarilyBlocked
+            ? await this.signInMayOpenNow(matchesOrigin)
+            : false;
         if (selected === undefined && !forcedTemporarilyBlocked) {
           selected = this.store.activeJobs.find(
             (job) =>
@@ -15407,8 +15652,7 @@ export class Bridge {
               job.status === "queued" &&
               job.engagement_required !== true &&
               (forceProvider || !this.controlWithholds(job)) &&
-              (job.requires_auth !== true ||
-                this.institutionalAuthGateOpen()) &&
+              (job.requires_auth !== true || authMayOpen) &&
               this.hasHandoffReleaseEvidence(
                 jobOrigin(job),
                 job.requires_auth,
@@ -16972,7 +17216,11 @@ export class Bridge {
       return;
     }
     const freshLinks = this.supportsFreshHandoffLinks();
-    const offerOrigin = this.resolverOriginHint(openurl);
+    const offerOrigin = this.offerEvidenceOrigin(
+      openurl,
+      institutionOrigin,
+      existing,
+    );
     const hasReleaseEvidence = this.hasHandoffReleaseEvidence(
       offerOrigin,
       requiresAuth,
@@ -17151,6 +17399,28 @@ export class Bridge {
               },
               openurl,
             );
+            this.sendJobAccept(jobID);
+            return;
+          }
+          if (
+            requiresAuth === true &&
+            (await this.signIn.presenceGate(jobID)) !== "open"
+          ) {
+            // ADR-0028 amendment 2026-10-14 item 2: the recreated sign-in tab
+            // waits for the operator, queued with its URL and held durably.
+            await this.upsertJobWithOffer(
+              {
+                ...existing,
+                tab_id: -1,
+                status: "queued",
+                offered_at: this.deps.now(),
+                provider_hosts: providerHosts,
+                parked_with_tab: false,
+              },
+              openurl,
+            );
+            await this.signIn.holdOffer(jobID);
+            this.scheduleQueuedHandoffRelease(jobID);
             this.sendJobAccept(jobID);
             return;
           }
@@ -17399,15 +17669,26 @@ export class Bridge {
       return;
     }
 
+    // ADR-0028 amendment 2026-10-14, item 2: opening is presence-gated. A
+    // requires-auth offer that arrives while the operator is away (browser
+    // idle or locked, every window minimized) creates no tab, evidence or not.
+    // It waits queued, with its URL, held durably: the transition back to
+    // active (or a focused window) wakes the drain, and the operator's own
+    // open lifts the hold. Nothing parks it for engagement; nobody declined.
+    const holdForOperator =
+      requiresAuth === true &&
+      (await this.signIn.presenceGate(jobID)) !== "open";
     const governorQueued =
       !providerParked &&
       !challengeCooldown &&
+      !holdForOperator &&
       hasReleaseEvidence &&
       (this.handoffDrives.size >= HANDOFF_DRIVE_LIMIT ||
         this.handoffDriveQueue.length > 0);
     const queueHandoff =
       providerParked ||
       challengeCooldown ||
+      holdForOperator ||
       governorQueued ||
       (!hasReleaseEvidence &&
         (requiresAuth === true ||
@@ -17428,6 +17709,7 @@ export class Bridge {
         this.sendJobAccept(jobID);
         await this.drainHandoffDriveQueue();
       } else {
+        if (holdForOperator) await this.signIn.holdOffer(jobID);
         this.scheduleQueuedHandoffRelease(jobID);
         if (!providerParked && !challengeCooldown)
           this.sendJobAccept(jobID);
@@ -21970,6 +22252,7 @@ export class Bridge {
     });
   }
 
+  // A quit or window close counts as an operator close per ADR-0028: the browser cannot distinguish them.
   private async onTabRemoved(tabID: number): Promise<void> {
     const authReturnInterrupted = this.authReturnsInFlight.delete(tabID);
     for (const pending of this.agentNavigations.values()) {
