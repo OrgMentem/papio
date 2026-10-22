@@ -336,6 +336,7 @@ func recordFromWorkRequest(request protocol.WorkRequest) cite.Record {
 		w.PMID = request.Identifiers.PMID
 		w.ArXiv = request.Identifiers.ArXiv
 		w.ISBN = request.Identifiers.ISBN
+		w.OpenAlex = request.Identifiers.OpenAlex
 	}
 	return cite.FromWork(w)
 }

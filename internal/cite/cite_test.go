@@ -40,6 +40,38 @@ func TestFromWorkExportsOnlyKnownValues(t *testing.T) {
 	}
 }
 
+func TestIdentityDistinguishesISBNAndOpenAlexOnlyRecords(t *testing.T) {
+	a := FromWork(work.Work{ISBN: "9780306406157"})
+	b := FromWork(work.Work{ISBN: "9780131103627"})
+	if a.Identity() == b.Identity() {
+		t.Fatalf("distinct ISBN-only records share identity %q", a.Identity())
+	}
+	if got := a.Identity(); got != "isbn:9780306406157" {
+		t.Fatalf("ISBN identity = %q", got)
+	}
+	oa := FromWork(work.Work{OpenAlex: "W1"})
+	ob := FromWork(work.Work{OpenAlex: "W2"})
+	if oa.Identity() == ob.Identity() {
+		t.Fatalf("distinct OpenAlex-only records share identity %q", oa.Identity())
+	}
+	kept, collapsed := Dedupe([]Record{a, b, oa, ob, a})
+	if len(kept) != 4 || collapsed != 1 {
+		t.Fatalf("Dedupe kept %d collapsed %d, want 4 and 1", len(kept), collapsed)
+	}
+}
+
+func TestBibTeXEmitsDOIAndEprintVerbatim(t *testing.T) {
+	out := string(BibTeX([]Record{{DOI: "10.1007/978-3-319-24574-4_28", ArXiv: "hep-th/9901001_v#1"}}))
+	for _, want := range []string{"doi = {10.1007/978-3-319-24574-4_28}", "eprint = {hep-th/9901001_v#1}"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("BibTeX missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `\`) {
+		t.Fatalf("verbatim fields were escaped:\n%s", out)
+	}
+}
+
 func TestIdentityFallsBackDOIThenPMIDThenArXivThenMeta(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -219,5 +251,23 @@ func TestBibTeXZeroFieldEntryStaysWellFormed(t *testing.T) {
 	}
 	if !strings.Contains(out, "@article{anon-nd-untitled-") {
 		t.Fatalf("zero-field entry = %q, want a stable key", out)
+	}
+}
+
+func TestIdentityPrefersOpenAlexOverSharedISBNAndCanonicalizesISBN(t *testing.T) {
+	a := Record{ISBN: "9780306406157", OpenAlex: "W1"}
+	b := Record{ISBN: "9780306406157", OpenAlex: "W2"}
+	if a.Identity() == b.Identity() {
+		t.Fatalf("chapters sharing a volume ISBN collapsed: %q", a.Identity())
+	}
+	if x, y := (Record{ISBN: "0-306-40615-2"}).Identity(), (Record{ISBN: "978-0-306-40615-7"}).Identity(); x != y {
+		t.Fatalf("ISBN-10 %q and ISBN-13 %q differ", x, y)
+	}
+}
+
+func TestBibTeXVerbatimFieldKeepsEntryWellFormedWithUnbalancedBrace(t *testing.T) {
+	out := string(BibTeX([]Record{{DOI: "10.1000/a}b"}}))
+	if strings.Contains(out, "doi = {10.1000/a}b}") {
+		t.Fatalf("unbalanced brace closed the field early:\n%s", out)
 	}
 }

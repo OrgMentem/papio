@@ -33,6 +33,7 @@ type Record struct {
 	PMID      string
 	ArXiv     string
 	ISBN      string
+	OpenAlex  string // identity only; no projection emits it
 	Abstract  string
 }
 
@@ -53,6 +54,7 @@ func FromWork(w work.Work) Record {
 		PMID:      strings.TrimSpace(w.PMID),
 		ArXiv:     strings.TrimSpace(w.ArXiv),
 		ISBN:      strings.TrimSpace(w.ISBN),
+		OpenAlex:  strings.TrimSpace(w.OpenAlex),
 	}
 }
 
@@ -67,7 +69,7 @@ func (r Record) itemType() string {
 }
 
 // Identity is the canonical duplicate identity for one record: DOI, then
-// PMID, then arXiv id, then normalized title + first author + year. Records
+// PMID, then arXiv id, then ISBN, then OpenAlex id, then normalized title + first author + year. Records
 // with equal identities describe the same work for export purposes.
 func (r Record) Identity() string {
 	if r.DOI != "" {
@@ -78,6 +80,19 @@ func (r Record) Identity() string {
 	}
 	if r.ArXiv != "" {
 		return "arxiv:" + strings.ToLower(r.ArXiv)
+	}
+	// OpenAlex precedes ISBN: chapters of one volume share its ISBN.
+	if r.OpenAlex != "" {
+		return "openalex:" + strings.ToUpper(r.OpenAlex)
+	}
+	if r.ISBN != "" {
+		if n, err := work.NormalizeISBN(r.ISBN); err == nil {
+			if isbn13, ok := work.ISBN13(n); ok {
+				n = isbn13
+			}
+			return "isbn:" + n
+		}
+		return "isbn:" + strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(r.ISBN))
 	}
 	first := ""
 	if len(r.Authors) > 0 {
@@ -248,9 +263,11 @@ func BibTeX(records []Record) []byte {
 			add("journal", r.Container)
 			add("isbn", r.ISBN)
 		}
-		add("doi", r.DOI)
+		// doi and eprint are verbatim fields in biblatex/biber: escaping
+		// would put a backslash into values such as 10.1007/x_28.
+		addRaw("doi", verbatimBibTeX(r.DOI))
 		if r.ArXiv != "" {
-			add("eprint", r.ArXiv)
+			addRaw("eprint", verbatimBibTeX(r.ArXiv))
 			add("archiveprefix", "arXiv")
 		}
 		add("pmid", r.PMID)
@@ -313,6 +330,27 @@ func bibTeXAuthors(authors []string) string {
 		names = append(names, "{"+escaped+"}")
 	}
 	return strings.Join(names, " and ")
+}
+
+// verbatimBibTeX keeps a verbatim field's bytes, falling back to full escaping
+// only when its braces are unbalanced and would close the field early.
+func verbatimBibTeX(value string) string {
+	depth := 0
+	for _, r := range value {
+		switch r {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth < 0 {
+				return escapeBibTeX(value)
+			}
+		}
+	}
+	if depth != 0 {
+		return escapeBibTeX(value)
+	}
+	return singleLine(value)
 }
 
 func escapeBibTeX(value string) string {

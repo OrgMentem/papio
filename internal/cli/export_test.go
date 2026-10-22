@@ -16,6 +16,7 @@ import (
 	"papio/internal/api"
 	"papio/internal/config"
 	"papio/internal/job"
+	"papio/internal/protocol"
 	"papio/internal/watch"
 	"papio/internal/work"
 )
@@ -240,5 +241,18 @@ func TestExportLedgerRefusesATruncatedPageUnlessSinceIsCovered(t *testing.T) {
 	}
 	if payload, err := run([]api.JobRow{recent}, "--since", "2026-06-01T00:00:00Z"); err == nil || payload != "" {
 		t.Fatalf("truncated ledger not reaching --since = %q, %v; want a refusal and no file", payload, err)
+	}
+}
+
+func TestRecordFromWorkRequestKeepsISBNAndOpenAlexIdentity(t *testing.T) {
+	isbnA := recordFromWorkRequest(protocol.WorkRequest{Identifiers: &protocol.Identifiers{ISBN: "9780306406157"}})
+	isbnB := recordFromWorkRequest(protocol.WorkRequest{Identifiers: &protocol.Identifiers{ISBN: "9780131103627"}})
+	if isbnA.Identity() == isbnB.Identity() {
+		t.Fatalf("distinct ISBN-only requests share identity %q", isbnA.Identity())
+	}
+	oaA := recordFromWorkRequest(protocol.WorkRequest{Identifiers: &protocol.Identifiers{OpenAlex: "W1"}})
+	oaB := recordFromWorkRequest(protocol.WorkRequest{Identifiers: &protocol.Identifiers{OpenAlex: "W2"}})
+	if oaA.Identity() == oaB.Identity() {
+		t.Fatalf("distinct OpenAlex-only requests share identity %q", oaA.Identity())
 	}
 }
