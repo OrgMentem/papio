@@ -22,11 +22,18 @@ import (
 type fakeBrowser struct {
 	live   bool
 	opened [][]string
+	// openAnswer, when set, replaces the answer to an open (never to the
+	// holder probe), so a holder can look live to the probe and gone to the
+	// open that follows it.
+	openAnswer func() (int, bool, error)
 }
 
 func (f *fakeBrowser) FocusHandoffs(_ context.Context, jobIDs []string) (int, bool, error) {
 	if len(jobIDs) > 0 {
 		f.opened = append(f.opened, append([]string(nil), jobIDs...))
+		if f.openAnswer != nil {
+			return f.openAnswer()
+		}
 	}
 	if !f.live {
 		return 0, false, nil
@@ -534,6 +541,89 @@ func TestOperatorPauseHoldsUntilResume(t *testing.T) {
 	h.run()
 	if got := h.browser.openedJobs(); !slices.Equal(got, []string{id}) {
 		t.Fatalf("opened %v after resume", got)
+	}
+}
+
+// declinedReason returns the reason recorded on jobID's drive.open_declined
+// event, or "" when it has none.
+func (h *harness) declinedReason(jobID string) string {
+	h.t.Helper()
+	events, err := h.jobs.Events(context.Background(), jobID)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	for _, event := range events {
+		if event["kind"] == OpenDeclinedEvent {
+			reason, _ := event["detail"].(map[string]any)["reason"].(string)
+			return reason
+		}
+	}
+	return ""
+}
+
+// A paced open the browser cannot honour must settle at once. Losing the
+// decline event leaves Status reporting a paper with no surface as in flight,
+// and nothing else opens for the whole settle window.
+func TestPacerDeclinedOpenSettlesAndNextPaperOpensImmediately(t *testing.T) {
+	boom := fmt.Errorf("bridge exploded")
+	for _, test := range []struct {
+		name       string
+		answer     func() (int, bool, error)
+		wantReason string
+		wantErr    bool
+	}{
+		{"holder_absent", func() (int, bool, error) { return 0, false, nil }, "holder_absent", false},
+		{"not_offerable", func() (int, bool, error) { return 0, true, nil }, "not_offerable", false},
+		{"error", func() (int, bool, error) { return 0, false, boom }, "error", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t, true)
+			first := h.park("wr_decl_first", "10.1000/decl-first", "openurl_handoff")
+			second := h.park("wr_decl_second", "10.1000/decl-second", "openurl_handoff")
+			h.browser.openAnswer = test.answer
+			err := h.pacer.RunDue(context.Background())
+			if test.wantErr != (err != nil) {
+				t.Fatalf("RunDue error = %v, want error: %v", err, test.wantErr)
+			}
+			if got := h.declinedReason(first); got != test.wantReason {
+				t.Fatalf("declined reason = %q, want %q (events %v)", got, test.wantReason, h.eventKinds(first))
+			}
+			if status := h.status(); status.InFlight != nil || slices.Contains(status.Blockers, BlockInFlight) {
+				t.Fatalf("status = %+v, a declined open must not stay in flight", status)
+			}
+			h.browser.openAnswer = nil
+			h.run()
+			if got := h.browser.openedJobs(); !slices.Equal(got, []string{first, second}) {
+				t.Fatalf("opened %v, want the second paper opened on the very next pass", got)
+			}
+		})
+	}
+}
+
+// A redrive the store refuses is a race with the browser or the operator, not
+// a pacer failure: the open settles as declined and the pass returns nil.
+func TestPacerRefusedRedriveDeclinesWithoutFailingThePass(t *testing.T) {
+	h := newHarness(t, true)
+	ctx := context.Background()
+	id := h.park("wr_refused", "10.1000/refused", "manual_download")
+	action, err := h.jobs.ListOpenHumanActionsForJobs(ctx, []string{id})
+	if err != nil || len(action) != 1 {
+		t.Fatalf("open actions = %+v, %v", action, err)
+	}
+	// A live lease is the store's "being worked" conflict.
+	if _, err := h.jobs.S.DB().ExecContext(ctx, `UPDATE jobs SET lease_owner='worker', lease_expires_at=? WHERE id=?`,
+		store.FormatTime(h.clock.Add(time.Hour)), id); err != nil {
+		t.Fatal(err)
+	}
+	err = h.pacer.open(ctx, h.clock, Candidate{JobID: id, ActionID: action[0].ID, Action: manualDownloadKind, Reason: "redrive_manual_download", revision: action[0].Revision})
+	if err != nil {
+		t.Fatalf("open returned %v, want nil for a refused redrive", err)
+	}
+	if got := h.declinedReason(id); got != "redrive_refused" {
+		t.Fatalf("declined reason = %q, want redrive_refused", got)
+	}
+	if len(h.browser.opened) != 0 {
+		t.Fatalf("opened %v after a refused redrive", h.browser.opened)
 	}
 }
 

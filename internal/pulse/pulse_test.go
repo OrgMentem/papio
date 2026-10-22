@@ -442,6 +442,160 @@ func TestPrimaryLabelUnknownIncompleteClaim(t *testing.T) {
 	}
 }
 
+// seedPulseClaim attaches one materialization claim to a job through the raw
+// tables the projection reads.
+func seedPulseClaim(t *testing.T, js *job.Store, jobID, phase, leaseUntil string) {
+	t.Helper()
+	ctx := context.Background()
+	created := "2026-08-12T00:00:00Z"
+	var lease any
+	if leaseUntil != "" {
+		lease = leaseUntil
+	}
+	for _, stmt := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT OR IGNORE INTO institution_profiles
+		  (id, configured_name, revision, authority_digest, authentication_claim_id, created_at, updated_at)
+		  VALUES ('pulse-profile', 'pulse profile', 1, 'digest', 'auth-claim', ?, ?)`, []any{created, created}},
+		{`INSERT INTO browser_candidates
+		  (id, job_id, job_attempt_revision, institution_profile_id, institution_profile_revision,
+		   route_revision, route_class, identifier_strategy, pre_route_safety_key, safety_domain_id,
+		   adapter_revision, effect_contract_id, status, created_at, updated_at)
+		  VALUES ('pulse-cand', ?, 1, 'pulse-profile', 1, 1, 'institutional', 'doi',
+		          'pre-route', 'institution:institutional', 'adapter-1', 'effect-1', 'claimed', ?, ?)`, []any{jobID, created, created}},
+		{`INSERT INTO materialization_claims
+		  (id, candidate_id, browser_holder_generation, materialization_kind, binding_id,
+		   phase, lease_until, created_at, updated_at)
+		  VALUES ('pulse-claim', 'pulse-cand', 1, 'browser_tab', 'pulse-binding', ?, ?, ?, ?)`, []any{phase, lease, created, created}},
+	} {
+		if _, err := js.S.DB().ExecContext(ctx, stmt.query, stmt.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// An institutional claim is not an activity signal: a workerless queued job
+// holding a live claim is unclassifiable, so the projection must say so rather
+// than call it continuing. A claim whose lease has lapsed no longer holds the
+// job, which is plain continuing work again.
+func TestReadActiveClaimMakesProjectionIncompleteUnlessLeaseLapsed(t *testing.T) {
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name         string
+		phase, lease string
+		wantComplete bool
+	}{
+		{"live claim without lease", "bound", "", false},
+		{"live claim with future lease", "navigated", now.Add(time.Hour).Format(time.RFC3339Nano), false},
+		{"lapsed lease", "navigated", now.Add(-time.Hour).Format(time.RFC3339Nano), true},
+		{"settled claim", "settled", "", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			js := pulseJobs(t)
+			id, err := js.CreateRequest(ctx, "wr_pulse_claim", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedPulseClaim(t, js, id, test.phase, test.lease)
+			snap, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snap.ProjectionComplete == nil || *snap.ProjectionComplete != test.wantComplete {
+				t.Fatalf("projection_complete = %v, want %v", snap.ProjectionComplete, test.wantComplete)
+			}
+			if test.wantComplete {
+				if snap.Continuing == nil || *snap.Continuing != 1 {
+					t.Fatalf("continuing = %v, want 1", snap.Continuing)
+				}
+			} else {
+				if snap.Continuing != nil || snap.NonterminalTotal != nil {
+					t.Fatalf("incomplete projection reported continuing %v / total %v", snap.Continuing, snap.NonterminalTotal)
+				}
+				if got := PrimaryLabel(snap); got != "Unknown" {
+					t.Fatalf("label = %q, want Unknown", got)
+				}
+			}
+		})
+	}
+}
+
+// A pending document-delivery request names the next time papio will poll its
+// provider; a poll already due with no worker is not provably stalled, so the
+// projection goes incomplete instead.
+func TestReadDeliverySchedulesNameNextPollAndDueWithoutWorkerIsIncomplete(t *testing.T) {
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name         string
+		nextCheck    time.Time
+		wantComplete bool
+	}{
+		{"future poll", now.Add(time.Hour), true},
+		{"due poll without worker", now.Add(-time.Minute), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			js := pulseJobs(t)
+			id, err := js.CreateRequest(ctx, "wr_pulse_delivery", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created := now.Format(time.RFC3339Nano)
+			if _, err := js.S.DB().ExecContext(ctx, `
+				INSERT INTO delivery_requests
+				  (job_id, institution_profile, provider, request_class, work_identity, idempotency_key,
+				   state, next_check_at, created_at, updated_at)
+				VALUES (?, 'profile', 'ill.example/path?x=1', 'article', 'doi:10.1000/pulse', 'idem-1',
+				        'pending', ?, ?, ?)`, id, test.nextCheck.Format(time.RFC3339Nano), created, created); err != nil {
+				t.Fatal(err)
+			}
+			snap, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snap.ProjectionComplete == nil || *snap.ProjectionComplete != test.wantComplete {
+				t.Fatalf("projection_complete = %v, want %v", snap.ProjectionComplete, test.wantComplete)
+			}
+			if !test.wantComplete {
+				if snap.NextAction != nil {
+					t.Fatalf("due poll produced next_action %+v", snap.NextAction)
+				}
+				return
+			}
+			next := snap.NextAction
+			if next == nil || next.Kind != "delivery_poll" || next.At != stamp(test.nextCheck) || next.Source != "ill.example" {
+				t.Fatalf("next_action = %+v, want delivery_poll at %s from ill.example", next, stamp(test.nextCheck))
+			}
+		})
+	}
+}
+
+// A delivery schedule the projection cannot parse is an error, never a
+// complete-looking snapshot that silently omits the poll.
+func TestReadMalformedDeliveryNextCheckIsAnError(t *testing.T) {
+	ctx := context.Background()
+	js := pulseJobs(t)
+	id, err := js.CreateRequest(ctx, "wr_pulse_delivery_bad", pulseWork(), "", "", pulsePolicy(), nil, job.PrincipalCLI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.S.DB().ExecContext(ctx, `
+		INSERT INTO delivery_requests
+		  (job_id, institution_profile, provider, request_class, work_identity, idempotency_key,
+		   state, next_check_at, created_at, updated_at)
+		VALUES (?, 'profile', 'ill.example', 'article', 'doi:10.1000/pulse', 'idem-bad',
+		        'pending', 'not-a-time', '2026-08-12T12:00:00Z', '2026-08-12T12:00:00Z')`, id); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	if _, err := (&Service{Jobs: js, Now: func() time.Time { return now }}).Read(ctx); err == nil {
+		t.Fatal("Read accepted a malformed delivery next_check_at")
+	}
+}
+
 type pulseCohortMember struct{ key, jobID, outcome string }
 
 // insertPulseCohort seeds one acquisition batch exactly as the cohort tables

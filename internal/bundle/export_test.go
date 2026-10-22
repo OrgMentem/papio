@@ -374,6 +374,31 @@ func TestExportRejectsNonReadyAndCorruptExistingTarget(t *testing.T) {
 	}
 }
 
+// An archived acquisition must not be exported: the refusal is a conflict the
+// caller can resolve by restoring, it writes nothing, and restoring makes the
+// same export succeed.
+func TestExportRefusesArchivedAcquisitionAsConflict(t *testing.T) {
+	exporter, id, _ := readyFixture(t)
+	ctx := context.Background()
+	if _, err := exporter.Jobs.Archive(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	_, _, err := exporter.Export(ctx, id, dest)
+	if !errors.Is(err, job.ErrConflict) {
+		t.Fatalf("export of archived job err = %v, want job.ErrConflict", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dest, "bundle.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("bundle.json written for archived job: %v", statErr)
+	}
+	if _, err := exporter.Jobs.Restore(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := exporter.Export(ctx, id, dest); err != nil {
+		t.Fatalf("export after restore: %v", err)
+	}
+}
+
 // readyJobSharingArtifact adds a second acquisition that reached the same bytes
 // under different terms. Content addressing makes the artifact row shared, so the
 // bundle must still report THIS job's licence and access basis.

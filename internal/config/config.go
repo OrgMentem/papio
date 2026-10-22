@@ -1420,6 +1420,12 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+	if n := len(c.resolverOriginList()); n > MaxResolverOrigins {
+		// hello_ack carries at most MaxResolverOrigins origins. Truncating
+		// would leave the origins that sort last configured but without an
+		// extension host permission, so their handoffs could never be steered.
+		return fmt.Errorf("browser resolvers name %d distinct https origins, maximum %d (the extension is granted host permission for each)", n, MaxResolverOrigins)
+	}
 	if defaultResolver := strings.TrimSpace(c.Browser.DefaultResolver); defaultResolver != "" {
 		if _, ok := c.InstitutionFor(defaultResolver); !ok {
 			names := c.ResolverNames()
@@ -2205,6 +2211,18 @@ func (c *Config) ResolverNames() []string {
 // host_permission. Institution identity therefore lives only in the user's
 // config, never in extension code.
 func (c *Config) ResolverOrigins() []string {
+	origins := c.resolverOriginList()
+	// Defensive only: validate rejects configs beyond the protocol cap.
+	if len(origins) > MaxResolverOrigins {
+		origins = origins[:MaxResolverOrigins]
+	}
+	return origins
+}
+
+// MaxResolverOrigins is the hello_ack.resolver_origins protocol cap.
+const MaxResolverOrigins = 32
+
+func (c *Config) resolverOriginList() []string {
 	seen := make(map[string]struct{})
 	origins := make([]string, 0, len(c.Browser.Resolvers)+1)
 	add := func(base string) {
@@ -2239,10 +2257,6 @@ func (c *Config) ResolverOrigins() []string {
 		add(inst.OpenURLBase)
 	}
 	slices.Sort(origins)
-	// Match the protocol cap so every accepted config yields a valid hello_ack.
-	if len(origins) > 32 {
-		origins = origins[:32]
-	}
 	return origins
 }
 

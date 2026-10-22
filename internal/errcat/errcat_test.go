@@ -35,6 +35,7 @@ func TestExplainCategoriesAndGuidance(t *testing.T) {
 		{name: "doi not registered", state: "unavailable", reason: "doi_not_registered", wantCategory: "doi_not_registered", wantGuidance: []string{"DOI NOT FOUND", "Signing in will not help", "Check the DOI against the article's own page", "`papio acquire --doi <doi>`"}},
 		{name: "insufficient identity evidence", state: "needs_review", reason: "insufficient_identity_evidence", wantCategory: "insufficient_identity_evidence", wantGuidance: []string{"will not file a PDF on search evidence alone", "Re-submit with a DOI, PMID, or arXiv id", "human review"}},
 		{name: "document delivery pending", state: "awaiting_human", reason: "document_delivery_pending", wantCategory: "document_delivery_pending", wantGuidance: []string{"document-delivery request is lodged", "polling the provider", "No action needed"}},
+		{name: "browser rejected", state: "failed", reason: "browser_rejected", wantCategory: "browser_rejected", wantGuidance: []string{"dropped this handoff", "papio jobs redrive <job-id> --revision 0"}},
 		{name: "candidate temporarily unavailable", state: "retry_wait", reason: "candidate_temporarily_unavailable", wantCategory: "retrying", wantGuidance: []string{"temporarily unavailable", "retry automatically", "No action needed"}},
 		{name: "acquisition inputs temporarily unavailable", state: "retry_wait", reason: "acquisition_inputs_temporarily_unavailable", wantCategory: "retrying", wantGuidance: []string{"temporarily unavailable", "retry automatically", "No action needed"}},
 		{
@@ -340,5 +341,25 @@ func TestExplainZotioImportErrorFileStorageRefused(t *testing.T) {
 	}
 	if _, ok := ExplainZotioImportError("zotero_http_4xx"); ok {
 		t.Fatal("unknown class should not match")
+	}
+}
+
+func TestExplainZotioImportErrorConnectorRefused(t *testing.T) {
+	got, ok := ExplainZotioImportError("zotero_connector_refused")
+	if !ok {
+		t.Fatal("ExplainZotioImportError returned false for zotero_connector_refused")
+	}
+	if got.Category != "zotero_connector_refused" {
+		t.Fatalf("category = %q, want zotero_connector_refused", got.Category)
+	}
+	for _, want := range []string{
+		"PDF is safe",
+		"Zotero must be running",
+		"http://127.0.0.1:23119/api/users/0/items?limit=1",
+		"retries this filing on its own",
+	} {
+		if !strings.Contains(got.Guidance, want) {
+			t.Fatalf("guidance missing %q: %q", want, got.Guidance)
+		}
 	}
 }

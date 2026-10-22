@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"papio/internal/config"
 	"papio/internal/enrich"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/protocol"
 	"papio/internal/store"
 	"papio/internal/store/storetest"
@@ -201,6 +204,106 @@ func TestPublicationDirectionalNoticeRestartAndExplicitAcquisitionPreserveOrigin
 	var currentSHA string
 	if err := reopened.DB().QueryRowContext(ctx, `SELECT artifact_sha256 FROM jobs WHERE id=?`, id).Scan(&currentSHA); err != nil || currentSHA != sha {
 		t.Fatalf("original acquisition changed: %q, %v", currentSHA, err)
+	}
+}
+
+type recordingSink struct {
+	intents []notify.Intent
+	err     error
+}
+
+func (r *recordingSink) Route(_ context.Context, in notify.Intent) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.intents = append(r.intents, in)
+	return nil
+}
+
+// A durable notice becomes exactly one notification: it is routed once under
+// publication-notice:<id>, never again on later runs, never re-routed when a
+// crash left a router row but no notified_at, and a Route failure fails the
+// run before the watch records a successful pass.
+func TestPublicationNoticeDeliveryRoutesOnceAndSurvivesCrashWindow(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	id, _, _ := acquiredFixture(t, db, "preprint")
+	relations := &fixtureRelations{edges: []enrich.PublicationRelation{
+		{SourceDOI: "10.1000/preprint", TargetDOI: "10.1000/published", Type: "is-preprint-of", Provider: "fixture"},
+	}}
+	sink := &recordingSink{err: errors.New("router down")}
+	s := NewService(db, relations, nil, sink)
+	w, err := s.Add(ctx, AddInput{JobID: id, CadenceHours: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastError := func() string {
+		var v string
+		if err := db.DB().QueryRowContext(ctx, `SELECT COALESCE(last_error,'') FROM publication_watches WHERE id=?`, w.ID).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	notifiedAt := func(noticeID int64) string {
+		var v string
+		if err := db.DB().QueryRowContext(ctx, `SELECT COALESCE(notified_at,'') FROM publication_notices WHERE id=?`, noticeID).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	// (d) A failing router fails the run, and the watch records why.
+	if _, err := s.Run(ctx, w.ID); err == nil {
+		t.Fatal("Run swallowed the Route error")
+	}
+	if got := lastError(); !strings.Contains(got, "router down") {
+		t.Fatalf("last_error = %q after a failed delivery, want the Route error", got)
+	}
+	notices, err := s.Notices(ctx, w.ID)
+	if err != nil || len(notices) != 1 {
+		t.Fatalf("notices = %+v, %v", notices, err)
+	}
+	noticeID := notices[0].ID
+	if got := notifiedAt(noticeID); got != "" {
+		t.Fatalf("notified_at = %q after a failed Route", got)
+	}
+
+	// (a) The retry routes exactly once, with the aggregate key, and stamps notified_at.
+	sink.err = nil
+	if _, err := s.Run(ctx, w.ID); err != nil {
+		t.Fatal(err)
+	}
+	wantKey := fmt.Sprintf("publication-notice:%d", noticeID)
+	if len(sink.intents) != 1 || sink.intents[0].AggregateKey != wantKey || sink.intents[0].EventKind != "publication.available" {
+		t.Fatalf("routed intents = %+v, want one publication.available under %s", sink.intents, wantKey)
+	}
+	if notifiedAt(noticeID) == "" || lastError() != "" {
+		t.Fatalf("notified_at %q / last_error %q after a successful delivery", notifiedAt(noticeID), lastError())
+	}
+
+	// (b) A further run does not route again.
+	if _, err := s.Run(ctx, w.ID); err != nil || len(sink.intents) != 1 {
+		t.Fatalf("second run routed again: %d intents, %v", len(sink.intents), err)
+	}
+
+	// (c) Crash window: the router row exists but notified_at was never
+	// stamped. Delivery must re-stamp without routing a second notification.
+	if _, err := db.DB().ExecContext(ctx, `UPDATE publication_notices SET notified_at=NULL WHERE id=?`, noticeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `INSERT INTO notification_intents
+		(category, event_kind, aggregate_key, phase, window_start, payload_json, first_at, last_at, count, available_at, desktop_state, webhook_state)
+		VALUES ('integrity_notice','publication.available',?,'scan','2026-08-01T00:00:00Z','{}','2026-08-01T00:00:00Z','2026-08-01T00:00:00Z',1,'2026-08-01T00:00:00Z','pending','pending')`, wantKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Run(ctx, w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.intents) != 1 {
+		t.Fatalf("crash-window run re-routed: %d intents, want 1", len(sink.intents))
+	}
+	if notifiedAt(noticeID) == "" {
+		t.Fatal("crash-window run did not re-stamp notified_at")
 	}
 }
 

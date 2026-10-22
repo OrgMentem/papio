@@ -100,6 +100,46 @@ func TestFailureSummariesExampleJobIDIsChronologicalNotLexical(t *testing.T) {
 	}
 }
 
+// A page that holds exactly `limit` groups is complete, and jobs settled in
+// one clock reading must give a deterministic example: the greatest id wins,
+// whatever order SQLite returns the rows in.
+func TestFailureSummariesTruncationBoundaryAndEqualTimestampTieBreak(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, seededDataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Inserted in ascending id order so first-row-wins and "smallest id wins"
+	// both pick job_x_a, which the greatest-id rule must override.
+	insertFailureTestJob(t, ctx, db, "job_x_a", "unavailable", "2026-08-01T00:00:01Z", "jstor", "https://www.jstor.org/stable/1")
+	insertFailureTestEvent(t, ctx, db, "job_x_a", "job.transition", `{"reason":"no_entitlement"}`)
+	insertFailureTestJob(t, ctx, db, "job_x_b", "unavailable", "2026-08-01T00:00:01Z", "jstor", "https://www.jstor.org/stable/2")
+	insertFailureTestEvent(t, ctx, db, "job_x_b", "job.transition", `{"reason":"no_entitlement"}`)
+	insertFailureTestJob(t, ctx, db, "job_y", "unavailable", "2026-08-01T00:00:02Z", "jstor", "https://www.jstor.org/stable/3")
+	insertFailureTestEvent(t, ctx, db, "job_y", "job.transition", `{"reason":"adapter_timeout"}`)
+
+	atLimit, truncated, err := db.FailureSummaries(ctx, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated || len(atLimit) != 2 {
+		t.Fatalf("page of exactly the limit = %+v, truncated=%v, want two groups and truncated=false", atLimit, truncated)
+	}
+	if got := atLimit[0]; got.Reason != "no_entitlement" || got.Count != 2 || got.ExampleJobID != "job_x_b" {
+		t.Fatalf("tied group = %+v, want example job_x_b", got)
+	}
+
+	short, truncated, err := db.FailureSummaries(ctx, 1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || len(short) != 1 {
+		t.Fatalf("page below the group count = %+v, truncated=%v, want one group and truncated=true", short, truncated)
+	}
+}
+
 // insertFailureTestJob seeds one job in the operator failure cohort: a work
 // request, the job itself, and the selected candidate that supplies the
 // provider host the read model groups by.

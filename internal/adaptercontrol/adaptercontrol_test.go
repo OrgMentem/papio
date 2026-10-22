@@ -347,6 +347,15 @@ func TestRunnerDistinguishesNoControlFromAFailure(t *testing.T) {
 	if held.Sequence != 4 || !held.RevisionSuspended("sciencedirect@0.3.0") {
 		t.Fatalf("held = %+v: the suspension must survive every failure", held)
 	}
+	// A different signed document at the sequence already held is a fork, not
+	// a replay: reported as a conflict and never applied.
+	body.Store(signed(t, 4, []string{"wiley@0.1.0"}, nil))
+	if got := step(); got.LastOutcome != adaptercontrol.OutcomeRejectedConflict {
+		t.Fatalf("fork => %+v", got)
+	}
+	if held := service.Snapshot(); held.Sequence != 4 || held.RevisionSuspended("wiley@0.1.0") {
+		t.Fatalf("held = %+v: a fork must not replace the document held", held)
+	}
 	// A higher sequence lifts it.
 	body.Store(signed(t, 5, nil, nil))
 	if got := step(); got.LastOutcome != adaptercontrol.OutcomePublished || service.Snapshot().RevisionSuspended("sciencedirect@0.3.0") {

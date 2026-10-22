@@ -4,6 +4,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -1436,6 +1437,108 @@ func TestDriveIsOffByDefaultAndPacedWhenEnabled(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "drive.max_opens_per_hour must be in 0..60") {
 		t.Fatalf("Load with 61 opens an hour = %v, want the bound", err)
+	}
+}
+
+func TestDriveBoundsRejectNegativeAndOversizedValues(t *testing.T) {
+	for _, test := range []struct {
+		field string
+		max   int
+	}{
+		{"max_opens_per_hour", 60},
+		{"job_backoff_hours", 168},
+		{"sign_in_wait_minutes", 1440},
+		{"settle_minutes", 1440},
+	} {
+		for _, value := range []int{-1, test.max + 1} {
+			t.Run(fmt.Sprintf("%s=%d", test.field, value), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "config.toml")
+				body := fmt.Sprintf("access_mode = \"delegated\"\n[drive]\nenabled = true\n%s = %d\n", test.field, value)
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				want := fmt.Sprintf("drive.%s must be in 0..%d", test.field, test.max)
+				if _, err := Load(path); err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("Load = %v, want %q", err, want)
+				}
+			})
+		}
+		t.Run(fmt.Sprintf("%s at its maximum loads", test.field), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			body := fmt.Sprintf("access_mode = \"delegated\"\n[drive]\nenabled = true\n%s = %d\n", test.field, test.max)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err != nil {
+				t.Fatalf("Load at the documented maximum: %v", err)
+			}
+		})
+	}
+}
+
+func TestFilingFolderMustBeAbsoluteAndUntrimmed(t *testing.T) {
+	abs := t.TempDir()
+	for _, test := range []struct {
+		name, folder string
+		wantErr      bool
+	}{
+		{"empty disables filing", "", false},
+		{"absolute loads", abs, false},
+		{"relative rejected", "relative/dir", true},
+		{"leading space rejected", " " + abs, true},
+		{"trailing space rejected", abs + " ", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			body := fmt.Sprintf("access_mode = \"delegated\"\n[filing]\nfolder = %q\n", test.folder)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "filing.folder must be an absolute path") {
+					t.Fatalf("Load = %v, want the filing.folder rule", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Filing.Folder != test.folder {
+				t.Fatalf("filing.folder = %q, want %q", cfg.Filing.Folder, test.folder)
+			}
+		})
+	}
+}
+
+// hello_ack carries at most 32 resolver origins. A config naming more must be
+// refused at load: truncating would leave the last-sorted institutions
+// configured but without the extension host permission their handoffs need.
+func TestResolverOriginsBeyondProtocolCapAreRejected(t *testing.T) {
+	body := func(n int) string {
+		var b strings.Builder
+		b.WriteString("access_mode = \"delegated\"\n")
+		for i := range n {
+			fmt.Fprintf(&b, "[browser.resolvers.inst%02d]\nopenurl_base_url = \"https://lib%02d.example.edu/openurl\"\n", i, i)
+		}
+		return b.String()
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(body(32)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("32 origins rejected: %v", err)
+	}
+	if got := len(cfg.ResolverOrigins()); got != 32 {
+		t.Fatalf("ResolverOrigins = %d, want 32", got)
+	}
+	if err := os.WriteFile(path, []byte(body(33)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "33 distinct https origins, maximum 32") {
+		t.Fatalf("Load with 33 origins = %v, want the cap", err)
 	}
 }
 
