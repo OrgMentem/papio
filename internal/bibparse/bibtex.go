@@ -170,7 +170,7 @@ type bibTeXEprint struct {
 func applyBibTeXField(record *Record, eprint *bibTeXEprint, field, value string) {
 	switch field {
 	case "doi":
-		record.DOI = normalizeBibTeXDOI(cleanBibTeXValue(value))
+		record.DOI = normalizeBibTeXDOI(unescapeBibTeXDOI(value))
 	case "pmid":
 		record.PMID = cleanBibTeXValue(value)
 	case "arxiv":
@@ -207,6 +207,22 @@ func resolveBibTeXEprint(record *Record, eprint bibTeXEprint) {
 		return
 	}
 	record.ArXiv = eprint.id
+}
+
+// unescapeBibTeXDOI undoes only backslash-escaped TeX punctuation. A DOI is an
+// opaque identifier, so dashes, braces, and whitespace stay verbatim.
+func unescapeBibTeXDOI(value string) string {
+	if !strings.Contains(value, `\`) {
+		return strings.TrimSpace(value)
+	}
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' && i+1 < len(value) && strings.IndexByte(`_&%$#{}`, value[i+1]) >= 0 {
+			i++
+		}
+		b.WriteByte(value[i])
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func normalizeBibTeXDOI(value string) string {

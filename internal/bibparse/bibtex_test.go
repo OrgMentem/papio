@@ -73,9 +73,17 @@ func TestParseBibTeX(t *testing.T) {
 }`,
 			want: []Record{{
 				SourceKey: "smith:2024/alpha",
-				DOI:       "10.1000/x=y, nested value",
+				DOI:       "10.1000/x=y, nested {value}",
 				Title:     "Quoted = value, with braces",
 			}},
+		},
+		{
+			name: "keeps DOI dashes and braces verbatim",
+			input: `@article{dashes,
+  doi = {10.1000/a--b---c{d}},
+  title = {T},
+}`,
+			want: []Record{{SourceKey: "dashes", DOI: "10.1000/a--b---c{d}", Title: "T"}},
 		},
 		{
 			name: "keeps LaTeX-escaped punctuation as literal characters",

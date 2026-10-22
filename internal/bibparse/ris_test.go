@@ -108,6 +108,11 @@ func TestParseRIS(t *testing.T) {
 			data:    "TY  - JOUR\nTI  - First\nER  - \nTY  - JOUR\nTI  - Truncated\n",
 			wantErr: "unterminated",
 		},
+		{
+			name:    "unterminated record before next TY",
+			data:    "TY  - JOUR\nTI  - Truncated\nTY  - JOUR\nTI  - Second\nDO  - 10.1000/x\nER  - \n",
+			wantErr: "unterminated",
+		},
 	}
 
 	for _, test := range tests {

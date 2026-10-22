@@ -36,6 +36,9 @@ func parseRIS(data []byte) ([]Record, error) {
 		if tag, value, ok := risTag(line); ok {
 			switch tag {
 			case "TY":
+				if inRecord && !terminated {
+					return nil, fmt.Errorf("ris: unterminated record: missing ER terminator")
+				}
 				finish()
 				inRecord = true
 				terminated = false
