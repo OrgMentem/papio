@@ -252,3 +252,60 @@ func TestGuardedRefundsCommitWhenNothingWasWritten(t *testing.T) {
 		t.Fatalf("inner calls = %d, want 1", inner.calls)
 	}
 }
+
+// failingDeferFloor is the real budget.Manager (so the process-local latch is the
+// production one) whose durable floor write always fails.
+type failingDeferFloor struct{ *budget.Manager }
+
+func (failingDeferFloor) Defer(context.Context, string, config.Source, time.Time) error {
+	return errors.New("database is locked")
+}
+
+// A latched request must be refused before the credit commit, not after it:
+// otherwise every refused attempt debits the day's allowance for a request
+// that never reaches the wire. CommitEgress consults the same process-local
+// latch the Observer sets, inside the committing transaction, before debiting.
+func TestWrapOpenAlexLatchedRequestDebitsNoCredits(t *testing.T) {
+	m := testGuardedBudget(t)
+	keyed := config.Source{Enabled: true, APIKey: "private-key"}
+	inner := &headerClient{status: http.StatusOK, headers: map[string]string{
+		"X-RateLimit-Limit": "10000", "X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "3600",
+	}}
+	stack, err := WrapOpenAlex(m, failingDeferFloor{m}, config.SourceOpenAlex, keyed, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The response that carries the low-quota news is served and charged; the
+	// durable floor write fails, so only the process-local latch holds.
+	if err := doAndClose(stack, guardedRequest(t, "https://api.openalex.org/works/W1?api_key=private-key")); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	before, err := m.CreditStatus(context.Background(), config.SourceOpenAlex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Committed < 1 {
+		t.Fatalf("committed = %d after one served request, want a debit", before.Committed)
+	}
+
+	for i := range 3 {
+		resp, err := stack.Do(guardedRequest(t, "https://api.openalex.org/works?search=x&api_key=private-key"))
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		var deferred *budget.ErrDeferred
+		if !errors.As(err, &deferred) || !deferred.Quota {
+			t.Fatalf("latched request %d = %v, want a quota *budget.ErrDeferred", i, err)
+		}
+	}
+	after, err := m.CreditStatus(context.Background(), config.SourceOpenAlex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Committed != before.Committed {
+		t.Fatalf("committed = %d, want %d: latched requests must not debit credits", after.Committed, before.Committed)
+	}
+	if inner.calls != 1 {
+		t.Fatalf("inner calls = %d, want only the first request on the wire", inner.calls)
+	}
+}

@@ -265,6 +265,50 @@ func TestLatchQuotaRefusedAtCommit(t *testing.T) {
 	}
 }
 
+// A process-local quota latch lifts at the provider's reset, not at process
+// exit: a stale past instant read as "still latched" would close egress for the
+// identity until the daemon restarts. This pins the real Manager's expiry; the
+// sourcegate observer tests only exercise a fake floor's own copy of it.
+func TestQuotaLatchExpiresAtItsReset(t *testing.T) {
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	now := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	m := New(s, WithNow(func() time.Time { return now }), WithCreditPolicy(func(string) CreditPolicy {
+		return CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000}
+	}))
+	until := now.Add(time.Hour)
+	m.LatchQuota(config.SourceOpenAlex, "key-a", until)
+
+	got, latched := m.QuotaLatchedUntil(config.SourceOpenAlex, "key-a")
+	if !latched || !got.Equal(until) {
+		t.Fatalf("QuotaLatchedUntil = %v, %v, want latched until %v", got, latched, until)
+	}
+	now = until.Add(-time.Nanosecond)
+	if _, latched := m.QuotaLatchedUntil(config.SourceOpenAlex, "key-a"); !latched {
+		t.Fatal("latch lifted a nanosecond before the provider's reset")
+	}
+	// The reset instant itself is no longer latched: expiry is !until.After(now).
+	now = until
+	if _, latched := m.QuotaLatchedUntil(config.SourceOpenAlex, "key-a"); latched {
+		t.Fatal("latch still held at the provider's reset instant")
+	}
+	m.latchMu.Lock()
+	_, kept := m.quotaLatches[latchKey(config.SourceOpenAlex, "key-a")]
+	m.latchMu.Unlock()
+	if kept {
+		t.Fatal("expired latch entry was not deleted")
+	}
+
+	// An expired latch does not refuse a commit.
+	now = until.Add(time.Hour)
+	if err := m.CommitEgress(context.Background(), openalexReq("key-a", 1)); err != nil {
+		t.Fatalf("CommitEgress after the latch expired = %v, want admitted", err)
+	}
+}
+
 func TestPrepaidDropTriggersDriftClose(t *testing.T) {
 	m, _ := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000})
 	ctx := context.Background()

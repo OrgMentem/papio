@@ -497,6 +497,59 @@ func TestSnapshotCursorPaginationAndCounts(t *testing.T) {
 	}
 }
 
+// A request that omits schema (the CLI and HTTP API) is served the full item
+// list, grabs included, so its pending total must count them too: the page and
+// the total used to disagree, the total silently treating the same request as
+// schema 3.
+func TestUnversionedSnapshotCountsPdfGrabsItListsInPendingTotal(t *testing.T) {
+	service, _, jobs := triageTestService(t)
+	createTriageAction(t, jobs, "wr_triage_unversioned_grab")
+	service.RegisterSource(staticSource{items: []Item{
+		{
+			Kind: KindPdfGrab, ID: PdfGrabIDPrefix + "grab_unversioned_1", Title: "Reading copy",
+			Ops:     []string{"provide_identifier", "dismiss"},
+			PdfGrab: &PdfGrab{GrabID: "grab_unversioned_1", State: "parked_no_identifier"},
+		},
+		{
+			Kind: KindPdfGrab, ID: PdfGrabIDPrefix + "grab_unversioned_2", Title: "Reading copy two",
+			Ops:     []string{"provide_identifier", "dismiss"},
+			PdfGrab: &PdfGrab{GrabID: "grab_unversioned_2", State: "parked_no_identifier"},
+		},
+	}})
+
+	all, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grabs := 0
+	for _, item := range all.Items {
+		if item.Kind == KindPdfGrab {
+			grabs++
+		}
+	}
+	if grabs != 2 || len(all.Items) != 3 || all.Counts.PendingTotal != len(all.Items) {
+		t.Fatalf("unversioned snapshot listed %d grabs among %d items with pending_total %d; the total must count every listed item", grabs, len(all.Items), all.Counts.PendingTotal)
+	}
+
+	// Paginated, the total stays the global one on every page.
+	first, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Counts.PendingTotal != 3 || !first.HasMore {
+		t.Fatalf("first unversioned page = %+v, want pending_total 3 with more pages", first)
+	}
+
+	// Schema 3 stays legacy end-to-end: no grabs listed, none counted.
+	legacy, err := service.Snapshot(context.Background(), SnapshotRequest{Limit: 100, Schema: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Items) != 1 || legacy.Counts.PendingTotal != 1 {
+		t.Fatalf("schema 3 snapshot = %d items, pending_total %d; want 1 and 1", len(legacy.Items), legacy.Counts.PendingTotal)
+	}
+}
+
 func TestLegacySnapshotPaginationSkipsPdfGrabBeforeLimit(t *testing.T) {
 	service, _, jobs := triageTestService(t)
 	createTriageAction(t, jobs, "wr_triage_legacy_grab")
@@ -1690,6 +1743,135 @@ func (s *dismissingGrabSource) DismissPdfGrab(_ context.Context, grabID string) 
 	}
 	s.discarded = true
 	return true, nil
+}
+
+// scriptedGrabDismisser owns one grab id and answers every other id with
+// sql.ErrNoRows, like the real source. It counts calls so a test can tell
+// whether triage consulted it, and fails with err when one is set.
+type scriptedGrabDismisser struct {
+	owns    string
+	applied bool
+	err     error
+	calls   int
+}
+
+func (s *scriptedGrabDismisser) SnapshotItems(context.Context, *sql.Tx) ([]Item, error) {
+	return nil, nil
+}
+
+func (s *scriptedGrabDismisser) DismissPdfGrab(_ context.Context, grabID string) (bool, error) {
+	s.calls++
+	if s.err != nil {
+		return false, s.err
+	}
+	if grabID != s.owns {
+		return false, sql.ErrNoRows
+	}
+	return s.applied, nil
+}
+
+// TestDecideDismissPdfGrabAcrossSources covers dismissPdfGrab's source walk at
+// service level: a dismisser that does not own the grab is skipped, a source
+// that cannot dismiss grabs is not an owner, an already-answered grab is a
+// conflict rather than applied, and an unexpected source error propagates and
+// stops the walk instead of reading as "gone" or reaching a later source.
+func TestDecideDismissPdfGrabAcrossSources(t *testing.T) {
+	ctx := context.Background()
+	item := PdfGrabIDPrefix + "grab_walk"
+	dismiss := DecisionInput{ItemID: item, Operation: DecisionDismiss}
+	boom := errors.New("grab store unavailable")
+
+	for _, test := range []struct {
+		name        string
+		build       func() []ItemSource
+		wantOutcome DecisionOutcome
+		wantDetail  string
+		wantErr     error
+		wantCalls   []int
+	}{
+		{
+			name: "foreign dismisser is skipped for the owner registered after it",
+			build: func() []ItemSource {
+				return []ItemSource{
+					&scriptedGrabDismisser{owns: "grab_elsewhere", applied: true},
+					&scriptedGrabDismisser{owns: "grab_walk", applied: true},
+				}
+			},
+			wantOutcome: DecisionApplied,
+			wantCalls:   []int{1, 1},
+		},
+		{
+			name: "sources that cannot dismiss grabs are not owners",
+			build: func() []ItemSource {
+				return []ItemSource{staticSource{}}
+			},
+			wantOutcome: DecisionInvalid,
+			wantDetail:  "pdf grabs are not configured",
+		},
+		{
+			name: "a non-dismisser beside a dismisser does not hide the owner",
+			build: func() []ItemSource {
+				return []ItemSource{staticSource{}, &scriptedGrabDismisser{owns: "grab_walk", applied: true}}
+			},
+			wantOutcome: DecisionApplied,
+			wantCalls:   []int{0, 1},
+		},
+		{
+			name: "every dismisser disowning the grab is a conflict",
+			build: func() []ItemSource {
+				return []ItemSource{
+					&scriptedGrabDismisser{owns: "grab_a"},
+					&scriptedGrabDismisser{owns: "grab_b"},
+				}
+			},
+			wantOutcome: DecisionConflict,
+			wantCalls:   []int{1, 1},
+		},
+		{
+			name: "an owner reporting nothing applied is a conflict",
+			build: func() []ItemSource {
+				return []ItemSource{&scriptedGrabDismisser{owns: "grab_walk", applied: false}}
+			},
+			wantOutcome: DecisionConflict,
+			wantCalls:   []int{1},
+		},
+		{
+			name: "a source error propagates and stops the walk",
+			build: func() []ItemSource {
+				return []ItemSource{
+					&scriptedGrabDismisser{err: boom},
+					&scriptedGrabDismisser{owns: "grab_walk", applied: true},
+				}
+			},
+			wantErr:   boom,
+			wantCalls: []int{1, 0},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, watches, _ := triageTestService(t)
+			sources := test.build()
+			for _, source := range sources {
+				service.RegisterSource(source)
+			}
+			result, err := service.Decide(ctx, dismiss, &watch.Runner{Store: watches})
+			if test.wantErr != nil {
+				if !errors.Is(err, test.wantErr) {
+					t.Fatalf("Decide = %+v, %v; want the source error propagated", result, err)
+				}
+			} else if err != nil || result.Outcome != test.wantOutcome || result.Detail != test.wantDetail {
+				t.Fatalf("Decide = %+v, %v; want outcome %q detail %q", result, err, test.wantOutcome, test.wantDetail)
+			}
+			for i, want := range test.wantCalls {
+				dismisser, ok := sources[i].(*scriptedGrabDismisser)
+				if !ok {
+					continue // a source that cannot dismiss has no call count
+				}
+				if dismisser.calls != want {
+					t.Fatalf("dismisser %d consulted %d times, want %d", i, dismisser.calls, want)
+				}
+			}
+		})
+	}
 }
 
 // TestDecideRejectsIDsItCannotRouteInsteadOfReportingConflict pins that

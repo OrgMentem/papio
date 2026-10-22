@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/budget"
 	"papio/internal/config"
 )
 
@@ -138,6 +139,47 @@ func TestObserverIgnoresHealthyRemaining(t *testing.T) {
 	}
 	if len(floor.calls) != 0 {
 		t.Fatalf("Defer calls = %#v, want none with the budget healthy", floor.calls)
+	}
+}
+
+// The floor is 1/20th of the reported budget, but never below one credit: a
+// small limit (floor 0 by integer division) must still gate when one credit
+// remains, and must not gate while two do.
+func TestObserverFloorBoundaryAndMinimumClamp(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		limit     string
+		remaining string
+		gated     bool
+	}{
+		{name: "at the 5% floor", limit: "10000", remaining: "500", gated: true},
+		{name: "just above the 5% floor", limit: "10000", remaining: "501", gated: false},
+		{name: "clamped floor of one, one left", limit: "10", remaining: "1", gated: true},
+		{name: "clamped floor of one, two left", limit: "10", remaining: "2", gated: false},
+		{name: "integer division truncates to zero, one left", limit: "19", remaining: "1", gated: true},
+		{name: "integer division truncates to zero, two left", limit: "19", remaining: "2", gated: false},
+		{name: "exactly one credit of floor, one left", limit: "20", remaining: "1", gated: true},
+		{name: "exactly one credit of floor, two left", limit: "20", remaining: "2", gated: false},
+		{name: "nothing left of a tiny budget", limit: "1", remaining: "0", gated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
+				"X-RateLimit-Limit": test.limit, "X-RateLimit-Remaining": test.remaining, "X-RateLimit-Reset": "3600",
+			})
+			if err := doAndClose(observer, observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+				t.Fatal(err)
+			}
+			_, latched := floor.QuotaLatchedUntil("openalex", budget.IdentityFor(config.Source{Enabled: true, APIKey: "private-key"}))
+			if test.gated {
+				if len(floor.calls) != 1 || !latched {
+					t.Fatalf("Defer calls = %#v, latched = %v, want one deferral and a latch", floor.calls, latched)
+				}
+				return
+			}
+			if len(floor.calls) != 0 || latched {
+				t.Fatalf("Defer calls = %#v, latched = %v, want no gate above the floor", floor.calls, latched)
+			}
+		})
 	}
 }
 

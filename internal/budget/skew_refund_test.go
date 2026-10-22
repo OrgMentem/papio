@@ -5,6 +5,7 @@ package budget
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,5 +156,61 @@ func TestSkewedGateOpensOnceTheCorrectedClockReachesTheHorizon(t *testing.T) {
 	now = base.Add(MaxDeferHorizon + time.Minute)
 	if err := m.Acquire(ctx, "skewed", p, 0); err != nil {
 		t.Fatalf("Acquire after the horizon passed = %v, want the gate open", err)
+	}
+}
+
+// A gate that cannot be parsed is a gate papio cannot prove open, so every
+// reader must refuse it rather than treat it as absent, and repairSkewedGates
+// must not rewrite it into a valid deadline. A non-timestamp such as
+// "not-a-time" sorts after every digit, so without the julianday guard the
+// skew repair would turn it into now+MaxDeferHorizon and the source would
+// reopen a day later with the corruption laundered away.
+func TestUnparseableGateFailsClosedEverywhere(t *testing.T) {
+	const corrupt = "not-a-time"
+	policy := config.Source{Enabled: true, APIKey: "key-a"}
+	identity := identityFor(policy)
+	for _, row := range []struct {
+		name     string
+		source   string
+		identity string
+	}{
+		{name: "ordinary row", source: config.SourceOpenAlex, identity: identity},
+		{name: "source-wide pacing row", source: PacingSourceName(config.SourceOpenAlex), identity: pacingIdentity()},
+		{name: "provider quota floor row", source: QuotaSourceName(config.SourceOpenAlex), identity: identity},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			m, s := testCreditManager(t, CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 1000})
+			ctx := context.Background()
+			if _, err := s.DB().ExecContext(ctx, `INSERT INTO source_budgets(source, identity, window_start, next_allowed_at)
+				VALUES(?, ?, ?, ?)`, row.source, row.identity, "2026-08", corrupt); err != nil {
+				t.Fatal(err)
+			}
+			refused := func(op string, err error) {
+				t.Helper()
+				var deferred *ErrDeferred
+				var exceeded *ErrExceeded
+				if err == nil || errors.As(err, &deferred) || errors.As(err, &exceeded) ||
+					!strings.Contains(err.Error(), "invalid") || !strings.Contains(err.Error(), "next_allowed_at") {
+					t.Fatalf("%s = %v, want an invalid-next_allowed_at error: an unparseable gate is not an absent one", op, err)
+				}
+			}
+			refused("reserve", m.reserve(ctx, config.SourceOpenAlex, identity, 0, 0))
+			refused("Acquire", m.Acquire(ctx, config.SourceOpenAlex, policy, 0))
+			refused("CommitEgress", m.CommitEgress(ctx, openalexReq(identity, 1)))
+			_, err := m.Snapshot(ctx, row.source, config.Source{Enabled: true, APIKey: policy.APIKey})
+			if row.source == PacingSourceName(config.SourceOpenAlex) {
+				_, err = m.Snapshot(ctx, row.source, config.Source{})
+			}
+			refused("Snapshot", err)
+
+			var stored string
+			if err := s.DB().QueryRowContext(ctx, `SELECT next_allowed_at FROM source_budgets WHERE source = ? AND identity = ?`,
+				row.source, row.identity).Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored != corrupt {
+				t.Fatalf("stored gate = %q, want %q left alone: the skew repair must not launder a non-timestamp into a deadline", stored, corrupt)
+			}
+		})
 	}
 }

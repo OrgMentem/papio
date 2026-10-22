@@ -623,7 +623,16 @@ func (s *Service) dismissPdfGrab(ctx context.Context, itemID string) (bool, erro
 // (the caller must restart from the head). Retrying with an obsolete
 // offset-only cursor (minted by a pre-fix daemon) is also rejected.
 func (s *Service) Snapshot(ctx context.Context, request SnapshotRequest) (Snapshot, error) {
-	all, counts, unsupported, generatedAt, err := s.collect(ctx, request.Schema)
+	// An unversioned request (the CLI and HTTP API omit schema) is served the
+	// full item list, grabs included, so its pending total counts them too.
+	// Passing the raw 0 made collect treat the same request as schema 3 for the
+	// count while the page below kept the grabs. Schemas 1-3 stay legacy
+	// end-to-end: no grabs on the page and none in the total.
+	countSchema := request.Schema
+	if countSchema == 0 {
+		countSchema = 4
+	}
+	all, counts, unsupported, generatedAt, err := s.collect(ctx, countSchema)
 	if err != nil {
 		return Snapshot{}, err
 	}
