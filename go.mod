@@ -3,8 +3,8 @@ module papio
 go 1.26.0
 
 require (
-	github.com/Microsoft/go-winio v0.6.3
-	github.com/mark3labs/mcp-go v1.2.1
+	github.com/Microsoft/go-winio v0.6.4
+	github.com/mark3labs/mcp-go v1.3.0
 	github.com/mattn/go-isatty v0.0.24
 	github.com/pdfcpu/pdfcpu v0.16.2
 	github.com/pelletier/go-toml/v2 v2.4.3
@@ -14,7 +14,7 @@ require (
 	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.60.1
+	modernc.org/sqlite v1.61.0
 )
 
 require (
@@ -26,13 +26,13 @@ require (
 
 require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
-	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hhrutter/tiff v1.0.7 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.30 // indirect
-	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/spf13/cast v1.7.1 // indirect
@@ -41,7 +41,7 @@ require (
 	golang.org/x/image v0.46.0 // indirect
 	golang.org/x/net v0.61.0
 	golang.org/x/text v0.43.0 // indirect
-	modernc.org/libc v1.77.1 // indirect
+	modernc.org/libc v1.79.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
