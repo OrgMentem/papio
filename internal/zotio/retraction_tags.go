@@ -303,6 +303,7 @@ type RetractionTagReconciler struct {
 	lastPass   time.Time
 	lastErr    string
 	lastErrLog time.Time
+	retry      tagReconcileRetry
 }
 
 // RetractionTagReconciler returns nil when the option is off and no ledger
@@ -317,15 +318,27 @@ func (s *Service) RetractionTagReconciler() *RetractionTagReconciler {
 	return &RetractionTagReconciler{service: s}
 }
 
+// MaintenanceFailure reports the last failed pass until reconciliation
+// succeeds. The scheduler reads it after RunDue on the maintenance goroutine.
+func (r *RetractionTagReconciler) MaintenanceFailure() error {
+	if r == nil {
+		return nil
+	}
+	return r.retry.err
+}
+
 func (r *RetractionTagReconciler) RunDue(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
 	s := r.service
+	if !r.retry.due(s.now()) {
+		return nil
+	}
 	signature := "off"
 	if s.RetractionTags {
 		if s.Retractions == nil {
-			return nil
+			return r.fail(fmt.Errorf("retraction notices are not available: enable the retraction_watch source"))
 		}
 		dois, err := s.Retractions.RetractedDOIs(ctx)
 		if err != nil {
@@ -334,19 +347,23 @@ func (r *RetractionTagReconciler) RunDue(ctx context.Context) error {
 		sum := sha256.Sum256([]byte(strings.Join(dois, "\n")))
 		signature = "on:" + hex.EncodeToString(sum[:])
 	} else if !s.hasRetractionLedger(ctx) {
+		r.retry, r.lastErr = tagReconcileRetry{}, ""
 		return nil
 	}
 	if signature == r.signature && s.now().Sub(r.lastPass) < retractionRescanEvery {
+		r.retry, r.lastErr = tagReconcileRetry{}, ""
 		return nil
 	}
 	if _, err := s.ReconcileRetractionTags(ctx, true); err != nil {
 		return r.fail(err)
 	}
 	r.signature, r.lastPass, r.lastErr = signature, s.now(), ""
+	r.retry = tagReconcileRetry{}
 	return nil
 }
 
 func (r *RetractionTagReconciler) fail(err error) error {
+	r.retry.fail(r.service.now(), err)
 	if msg := err.Error(); msg != r.lastErr || time.Since(r.lastErrLog) >= tagErrorLogInterval {
 		log.Printf("zotio retraction tag reconcile: %v", err)
 		r.lastErr = msg

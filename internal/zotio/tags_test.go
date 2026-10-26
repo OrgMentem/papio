@@ -615,6 +615,15 @@ func TestTagReconcilerDisabledOnlyWhileCleanupRemains(t *testing.T) {
 	}
 }
 
+func tagMaintenanceFailure(t *testing.T, runner any) error {
+	t.Helper()
+	health, ok := runner.(interface{ MaintenanceFailure() error })
+	if !ok {
+		t.Fatal("reconciler does not expose maintenance health")
+	}
+	return health.MaintenanceFailure()
+}
+
 // RunDue is the daemon's maintenance seam. A nil reconciler (the disabled,
 // nothing-to-clean case) is a no-op; a reconcile failure propagates to the
 // scheduler; and the log line is throttled so a persistently broken zotio
@@ -635,6 +644,8 @@ func TestTagReconcilerRunDuePropagatesAndThrottlesErrors(t *testing.T) {
 
 	cli := &tagCLI{version: "0.12.0"}
 	service, jobs := tagTestService(t, cli)
+	now := time.Now()
+	service.Now = func() time.Time { return now }
 	createJob(t, jobs, "request_zotio_RUNDUE01", "RUNDUE01", job.StateResolving, job.StateUnavailable)
 	reconciler := service.TagReconciler()
 	if reconciler == nil {
@@ -648,14 +659,18 @@ func TestTagReconcilerRunDuePropagatesAndThrottlesErrors(t *testing.T) {
 	if got := lines(); got != 1 {
 		t.Fatalf("log lines after the first failure = %d, want 1", got)
 	}
-	if reconciler.RunDue(ctx) == nil {
-		t.Fatal("the second pass must still fail")
+	if err := reconciler.RunDue(ctx); err != nil {
+		t.Fatalf("backoff pass returned a new error: %v", err)
+	}
+	if err := tagMaintenanceFailure(t, reconciler); err == nil {
+		t.Fatal("backoff pass cleared the maintenance failure")
 	}
 	if got := lines(); got != 1 {
 		t.Fatalf("the repeated identical error logged %d times, want 1 (throttle broken)", got)
 	}
 
 	cli.version = "0.11.0"
+	now = now.Add(24 * time.Hour)
 	if reconciler.RunDue(ctx) == nil {
 		t.Fatal("the third pass must still fail")
 	}
@@ -664,6 +679,7 @@ func TestTagReconcilerRunDuePropagatesAndThrottlesErrors(t *testing.T) {
 	}
 
 	reconciler.lastErrLog = time.Now().Add(-2 * tagErrorLogInterval)
+	now = now.Add(24 * time.Hour)
 	if reconciler.RunDue(ctx) == nil {
 		t.Fatal("the fourth pass must still fail")
 	}
@@ -672,6 +688,7 @@ func TestTagReconcilerRunDuePropagatesAndThrottlesErrors(t *testing.T) {
 	}
 
 	cli.version = tagsMinimumZotioVersion
+	now = now.Add(24 * time.Hour)
 	if err := reconciler.RunDue(ctx); err != nil {
 		t.Fatalf("recovered pass: %v", err)
 	}
@@ -680,5 +697,61 @@ func TestTagReconcilerRunDuePropagatesAndThrottlesErrors(t *testing.T) {
 	}
 	if got := tagStateRows(t, service)["RUNDUE01"]; got != TagUnavailable {
 		t.Fatalf("tag for RUNDUE01 = %q, want %q — the recovered pass must actually reconcile", got, TagUnavailable)
+	}
+}
+
+func TestTagReconcilerBacksOffFailedWrites(t *testing.T) {
+	ctx := context.Background()
+	cli := &tagCLI{failKeys: map[string]error{"RUNDUE01": WithErrorInfo(fmt.Errorf("Zotero HTTP 403"))}}
+	service, jobs := tagTestService(t, cli)
+	createJob(t, jobs, "request_zotio_RUNDUE01", "RUNDUE01", job.StateResolving, job.StateUnavailable)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	service.Now = func() time.Time { return now }
+	reconciler := service.TagReconciler()
+	assertFailure := func() {
+		t.Helper()
+		if err := reconciler.RunDue(ctx); err == nil || ErrorInfoFrom(err).Class != ErrorClassZoteroHTTP4xx {
+			t.Fatalf("RunDue = %v, want the tag write failure to remain visible", err)
+		}
+	}
+	assertFailure()
+	attempts := 1
+	for _, delay := range []time.Duration{
+		5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 40 * time.Minute,
+		80 * time.Minute, 160 * time.Minute, 320 * time.Minute, 6 * time.Hour, 6 * time.Hour,
+	} {
+		failedAt := now
+		for _, elapsed := range []time.Duration{time.Minute, delay - time.Nanosecond} {
+			now = failedAt.Add(elapsed)
+			if err := reconciler.RunDue(ctx); err != nil {
+				t.Fatalf("backoff pass returned a new error: %v", err)
+			}
+			if err := tagMaintenanceFailure(t, reconciler); err == nil || ErrorInfoFrom(err).Class != ErrorClassZoteroHTTP4xx {
+				t.Fatalf("backoff health = %v, want the tag write failure", err)
+			}
+			if cli.preflights != attempts || len(cli.calls) != attempts {
+				t.Fatalf("retry during %s delay: preflights %d, mutations %d; want %d", delay, cli.preflights, len(cli.calls), attempts)
+			}
+		}
+		now = failedAt.Add(delay)
+		assertFailure()
+		attempts++
+		if cli.preflights != attempts || len(cli.calls) != attempts {
+			t.Fatalf("due retry: preflights %d, mutations %d; want %d", cli.preflights, len(cli.calls), attempts)
+		}
+	}
+	if _, status := tagStateStatus(t, service, "RUNDUE01"); status != tagStatusPending {
+		t.Fatalf("failed write status = %q, want pending", status)
+	}
+	delete(cli.failKeys, "RUNDUE01")
+	now = now.Add(6 * time.Hour)
+	if err := reconciler.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tagMaintenanceFailure(t, reconciler); err != nil {
+		t.Fatalf("recovered maintenance health = %v, want no failure", err)
+	}
+	if tag, status := tagStateStatus(t, service, "RUNDUE01"); tag != TagUnavailable || status != tagStatusOwned {
+		t.Fatalf("recovered write = %q, %q; want an owned unavailable tag", tag, status)
 	}
 }

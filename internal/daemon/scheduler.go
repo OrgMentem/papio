@@ -54,6 +54,23 @@ type MaintenanceRunner interface {
 	RunDue(context.Context) error
 }
 
+// maintenanceHealth lets a runner retain a failure across quiet backoff
+// passes. The scheduler reads it only after RunDue returns; a nil RunDue error
+// alone then means no new failure, not necessarily recovery.
+type maintenanceHealth interface {
+	MaintenanceFailure() error
+}
+
+func maintenanceFailure(r MaintenanceRunner, err error) error {
+	if err != nil {
+		return err
+	}
+	if health, ok := r.(maintenanceHealth); ok {
+		return health.MaintenanceFailure()
+	}
+	return nil
+}
+
 // MaintenanceRunners runs several maintenance runners in order on each pass, so
 // one daemon composes independent periodic tasks (watchlists, import retry)
 // behind the scheduler's single Maintenance seam. Every runner runs even if an
@@ -344,8 +361,11 @@ func (s *Scheduler) maintenance(ctx context.Context) {
 func (s *Scheduler) runMaintenancePass(ctx context.Context) {
 	multi, ok := s.Config.Maintenance.(MaintenanceRunners)
 	if !ok {
-		if err := s.Config.Maintenance.RunDue(ctx); err != nil {
+		err := s.Config.Maintenance.RunDue(ctx)
+		if err != nil {
 			log.Printf("papio: maintenance failed: %v", err)
+		}
+		if err := maintenanceFailure(s.Config.Maintenance, err); err != nil {
 			s.setMaintenanceFailure("maintenance", err)
 		} else {
 			s.clearMaintenanceFailures()
@@ -354,10 +374,20 @@ func (s *Scheduler) runMaintenancePass(ctx context.Context) {
 	}
 	errs := multi.RunDueAll(ctx)
 	failed := false
-	for _, name := range multi.runnerNames() {
-		if err := errs[name]; err != nil {
-			failed = true
+	names := multi.runnerNames()
+	i := 0
+	for _, runner := range multi {
+		if runner == nil {
+			continue
+		}
+		name := names[i]
+		i++
+		err := errs[name]
+		if err != nil {
 			log.Printf("papio: maintenance %s failed: %v", name, err)
+		}
+		if err := maintenanceFailure(runner, err); err != nil {
+			failed = true
 			s.setMaintenanceFailure(name, err)
 		} else {
 			s.clearMaintenanceFailure(name)

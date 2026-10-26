@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +19,7 @@ import (
 	"papio/internal/store"
 	"papio/internal/store/storetest"
 	"papio/internal/work"
+	"papio/internal/zotio"
 )
 
 type fakeLeaseStore struct {
@@ -954,6 +957,62 @@ func TestMaintenanceFailuresNameFailingRunnersUntilACleanPass(t *testing.T) {
 	}
 	if status := healthy.MaintenanceStatus(); status != "" {
 		t.Fatalf("status after a clean pass = %q, want empty", status)
+	}
+}
+
+func TestMaintenanceRetainsDeferredRetractionFailureWithoutLogging(t *testing.T) {
+	for _, multi := range []bool{false, true} {
+		name := "single"
+		if multi {
+			name = "multiple"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, err := store.Open(context.Background(), storetest.DataDir(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+			service := &zotio.Service{
+				Store: db, CLI: &zotio.Client{}, RetractionTags: true,
+				Now: func() time.Time { return now },
+			}
+			runner := service.RetractionTagReconciler()
+			var maintenance MaintenanceRunner = runner
+			if multi {
+				maintenance = MaintenanceRunners{nil, runner}
+			}
+			scheduler := &Scheduler{Config: SchedulerConfig{Maintenance: maintenance}}
+			var logs bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&logs)
+			t.Cleanup(func() { log.SetOutput(previous) })
+			scheduler.runMaintenancePass(context.Background())
+			if !strings.Contains(scheduler.MaintenanceStatus(), "enable the retraction_watch source") {
+				t.Fatalf("initial maintenance status = %q, want the missing-source failure", scheduler.MaintenanceStatus())
+			}
+			if got := strings.Count(logs.String(), "papio: maintenance"); got != 1 {
+				t.Fatalf("initial scheduler error logs = %d, want one", got)
+			}
+			logged := logs.String()
+			now = now.Add(time.Minute)
+			if err := runner.RunDue(context.Background()); err != nil {
+				t.Fatalf("backoff pass returned a new error: %v", err)
+			}
+			scheduler.runMaintenancePass(context.Background())
+			if !strings.Contains(scheduler.MaintenanceStatus(), "enable the retraction_watch source") || len(scheduler.MaintenanceFailures()) != 1 {
+				t.Fatalf("backoff maintenance health = %q, want the retained failure", scheduler.MaintenanceStatus())
+			}
+			if logs.String() != logged {
+				t.Fatalf("backoff pass added log output: %s", logs.String()[len(logged):])
+			}
+			service.RetractionTags = false
+			now = now.Add(5 * time.Minute)
+			scheduler.runMaintenancePass(context.Background())
+			if status := scheduler.MaintenanceStatus(); status != "" || len(scheduler.MaintenanceFailures()) != 0 {
+				t.Fatalf("recovered maintenance health = %q, want no failure", status)
+			}
+		})
 	}
 }
 

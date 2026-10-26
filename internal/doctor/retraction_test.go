@@ -31,6 +31,21 @@ func TestDoctorRetractionCheckStatuses(t *testing.T) {
 			wantStatus: Pass,
 		},
 		{
+			name: "future successful sweep",
+			status: &retractionCacheStatus{
+				Version: retractionCacheVersion, CheckedAt: now.Add(30 * 24 * time.Hour),
+			},
+			wantStatus: Warn,
+		},
+		{
+			name: "future fetch attempt",
+			status: &retractionCacheStatus{
+				Version: retractionCacheVersion, CheckedAt: now.Add(-time.Hour),
+				LastFetchErrorAt: now.Add(30 * 24 * time.Hour),
+			},
+			wantStatus: Warn,
+		},
+		{
 			name: "latest fetch failed",
 			status: &retractionCacheStatus{
 				Version: retractionCacheVersion, CheckedAt: now.Add(-time.Hour),
