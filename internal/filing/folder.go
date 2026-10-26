@@ -17,7 +17,8 @@ var ErrArtifact = errors.New("artifact_invalid")
 var ErrDestinationConflict = errors.New("destination_conflict")
 
 // Staged holds verified destination-local bytes and a verified existing target.
-// Stage does all large copies and hashing before the database writer fence.
+// All filesystem operations, including Publish and Undo, run outside database
+// writer transactions.
 type Staged struct {
 	Path     string
 	Target   string
@@ -55,10 +56,17 @@ func stage(ctx context.Context, w *watch, source, destination, key, sha string) 
 		}
 		f, err := openRegular(s.Target)
 		if err != nil {
-			return nil, ErrDestinationConflict
+			if errors.Is(err, ErrArtifact) || errors.Is(err, os.ErrNotExist) {
+				return nil, ErrDestinationConflict
+			}
+			return nil, err
 		}
 		opened, err := f.Stat()
-		if err != nil || !os.SameFile(info, opened) {
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if !os.SameFile(info, opened) {
 			_ = f.Close()
 			return nil, ErrDestinationConflict
 		}
@@ -79,7 +87,10 @@ func stage(ctx context.Context, w *watch, source, destination, key, sha string) 
 	w.touch()
 	input, err := openRegular(source)
 	if err != nil {
-		return nil, ErrArtifact
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrArtifact
+		}
+		return nil, err
 	}
 	defer func() { _ = input.Close() }()
 	output, err := os.CreateTemp(destination, ".papio-"+key+"-*.partial")
@@ -115,18 +126,15 @@ func stage(ctx context.Context, w *watch, source, destination, key, sha string) 
 	return s, nil
 }
 
-// Publish does no copy or hash. The caller holds its short database writer fence.
+// Publish does no copy or hash. The caller must not hold a database writer.
 // A different target is never overwritten. A replay checks the verified inode.
-// Like Stage it fails with ErrDestinationStalled rather than hold that fence
-// across a wedged destination. If the abandoned link completes later, it is
-// undone: a caller that was told the publish failed must not find the file.
+// Like Stage it fails with ErrDestinationStalled on a wedged destination.
+// If an abandoned link completes later, it is undone.
 func (s *Staged) Publish(ctx context.Context) error {
 	_, err := run(ctx, func(_ context.Context, w *watch) (struct{}, error) {
 		return struct{}{}, s.publish(w)
 	}, func(_ struct{}, _ error) {
-		if s.linked {
-			_ = os.Remove(s.Target)
-		}
+		_ = s.undo()
 		s.remove()
 	})
 	return err
@@ -136,7 +144,13 @@ func (s *Staged) publish(w *watch) error {
 	if s.Existing != nil {
 		beforeIO("verify")
 		current, err := os.Lstat(s.Target)
-		if err != nil || !current.Mode().IsRegular() || !os.SameFile(current, s.Existing) || current.Size() != s.Existing.Size() || !current.ModTime().Equal(s.Existing.ModTime()) {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return ErrDestinationConflict
+			}
+			return err
+		}
+		if !current.Mode().IsRegular() || !os.SameFile(current, s.Existing) || current.Size() != s.Existing.Size() || !current.ModTime().Equal(s.Existing.ModTime()) {
 			return ErrDestinationConflict
 		}
 	} else {

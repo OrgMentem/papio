@@ -106,6 +106,12 @@ func (s *Service) ManagedFilings(ctx context.Context, jobID string, limit int) (
 // The maintenance pass runs it, never mandatory scheduler startup: the
 // destination is optional and its I/O may stall (internal/filing bounds that).
 func (s *Service) RetryManagedFiling(ctx context.Context) error {
+	// Archive may commit during publication, including just before a crash.
+	// Recover its unreceipted links even if the configured folder has changed
+	// or filing has since been disabled.
+	if err := s.recoverArchivedManagedFilings(ctx); err != nil {
+		return err
+	}
 	destination, err := s.managedDestination()
 	if err != nil {
 		if errors.Is(err, ErrManagedFilingNotConfigured) {
@@ -171,6 +177,60 @@ func (s *Service) RetryManagedFiling(ctx context.Context) error {
 	return nil
 }
 
+func (s *Service) recoverArchivedManagedFilings(ctx context.Context) error {
+	select {
+	case managedFilingGate <- struct{}{}:
+		defer func() { <-managedFilingGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	rows, err := s.Jobs.S.DB().QueryContext(ctx, `SELECT `+managedFilingColumns+` FROM managed_filings f JOIN jobs j ON j.id = f.job_id WHERE j.acquisition_disposition = 'archived' AND f.attempts > 0 AND (f.state = 'pending' OR (f.state = 'failed' AND f.retry_at <> '')) ORDER BY f.updated_at, f.job_id LIMIT 3`)
+	if err != nil {
+		return err
+	}
+	var pending []ManagedFiling
+	for rows.Next() {
+		f, err := scanManagedFiling(rows)
+		if err != nil {
+			_ = rows.Close()
+			return err
+		}
+		pending = append(pending, f)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, f := range pending {
+		if filing.Stalled() {
+			return nil
+		}
+		// No database transaction spans destination I/O. Keep the attempt
+		// recoverable until both the link and staged leftovers are gone.
+		undoErr := filing.UndoPublished(ctx, f.Destination, f.IdempotencyKey, f.ArtifactSHA256)
+		if undoErr == nil {
+			undoErr = filing.CleanupStages(ctx, f.Destination, f.IdempotencyKey)
+		}
+		state, code := "failed", "archived"
+		if undoErr != nil {
+			state, code = "pending", "destination_unavailable"
+			if errors.Is(undoErr, filing.ErrDestinationConflict) {
+				code = "destination_conflict"
+			}
+			log.Printf("papio: recovering archived managed filing for job %s: %v", f.JobID, undoErr)
+		}
+		// A concurrent restore leaves the journal available for active replay.
+		// The filing gate prevents another publisher from receipting the link
+		// while this compensation runs.
+		if _, err := s.Jobs.S.DB().ExecContext(ctx, `UPDATE managed_filings SET state = ?, error_code = ?, retry_at = '', receipt_path = '', updated_at = ? WHERE job_id = ? AND destination = ? AND state <> 'filed' AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = managed_filings.job_id AND j.acquisition_disposition = 'archived')`, state, code, store.FormatTime(s.Now()), f.JobID, f.Destination); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RetryManagedJob makes an explicit safe replay of one journaled folder target.
 func (s *Service) RetryManagedJob(ctx context.Context, jobID, destination string) (ManagedFiling, error) {
 	configured, err := s.managedDestination()
@@ -228,7 +288,17 @@ func (s *Service) managedRefusal(ctx context.Context, jobID, destination, config
 	return fmt.Errorf("no journaled filing for %s at %s (configured destination is %s): %w", jobID, destination, configured, job.ErrConflict)
 }
 
+// Keep publication and compensation single-flight without holding a database
+// writer. Otherwise a concurrent replay could receipt a link we must undo.
+var managedFilingGate = make(chan struct{}, 1)
+
 func (s *Service) fileManaged(ctx context.Context, jobID, destination string, force bool) (ManagedFiling, error) {
+	select {
+	case managedFilingGate <- struct{}{}:
+		defer func() { <-managedFilingGate }()
+	case <-ctx.Done():
+		return ManagedFiling{}, ctx.Err()
+	}
 	tx, err := s.Jobs.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return ManagedFiling{}, err
@@ -275,12 +345,28 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 		defer staged.Cleanup()
 	}
 	stageErr := err
+	if stageErr == nil {
+		stageErr = staged.Publish(ctx)
+	}
+	// The committed pending attempt journals the publish-before-receipt gap.
+	// A crash replays the deterministic target; a live refusal or database
+	// failure compensates only the link this attempt created.
+	keepPublished := false
+	if staged != nil {
+		defer func() {
+			if !keepPublished {
+				if err := staged.Undo(); err != nil {
+					log.Printf("papio: undoing managed filing for job %s: %v", jobID, err)
+				}
+			}
+		}()
+	}
 	tx, err = s.Jobs.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return f, err
 	}
 	defer func(tx *sql.Tx) { _ = tx.Rollback() }(tx)
-	// The short writer fence serializes the publish/receipt with archive.
+	// Serialize the receipt with archive, but never filesystem I/O.
 	if _, err = tx.ExecContext(ctx, `UPDATE jobs SET acquisition_disposition = acquisition_disposition WHERE id = ?`, jobID); err != nil {
 		return f, err
 	}
@@ -292,12 +378,11 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 		return current, job.ErrConflict
 	}
 	if current.State == "filed" {
-		return current, tx.Commit()
+		err := tx.Commit()
+		keepPublished = err == nil
+		return current, err
 	}
 	f = current
-	if stageErr == nil {
-		stageErr = staged.Publish(ctx)
-	}
 	f.UpdatedAt = store.FormatTime(s.Now())
 	if stageErr == nil {
 		f.State, f.RetryAt, f.ErrorCode, f.ReceiptPath = "filed", "", "", staged.Target
@@ -324,6 +409,7 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 		return f, err
 	}
 	if f.State == "filed" {
+		keepPublished = true
 		s.cleanupManagedStages(ctx, f)
 	}
 	return f, nil
