@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -79,7 +80,7 @@ func TestBenchRefusesAMissingExplicitFixturesDirectory(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-fixtures")
 	root.SetArgs([]string{"bench", "--cohort", "testdata/bench-conformance-cohort.json", "--fixtures", missing})
 	err := root.ExecuteContext(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "fixtures directory") || !strings.Contains(err.Error(), missing) {
+	if err == nil || !strings.Contains(err.Error(), "fixtures directory") || !strings.Contains(err.Error(), strconv.Quote(missing)) {
 		t.Fatalf("bench --fixtures <missing> = %v, want a fixtures directory error", err)
 	}
 }

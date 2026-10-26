@@ -134,6 +134,23 @@ jobs:
         env:
           RACE: ${{ matrix.os == 'ubuntu-latest' && '-race' || '' }}
 
+  # The //go:build windows suites (named-pipe owner-only DACL, privacy ACLs,
+  # native-host install rollback) never compile on the ubuntu/macos test legs
+  # above, so a widened DACL or a broken rollback ships with every check
+  # green. This leg runs those suites on a real Windows host. No -race: the
+  # race detector needs gcc, which the Windows image does not provide. No
+  # poppler either: these packages carry no pdftotext dependency (doctor, app
+  # and cli tests inject stub binaries, never the real extractor).
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.3'
+      - name: Test Windows-only suites
+        run: go test ./internal/ipc ./internal/doctor ./internal/nativehost ./internal/incident ./internal/config ./internal/app ./internal/cli
+
   # Platform-specific files (named-pipe IPC, registry native host, flock vs
   # LockFileEx) are never compiled on the ubuntu test runner. Cross-compile and
   # vet every target so a Windows- or macOS-only break fails CI, not a release.

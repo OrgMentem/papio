@@ -6,7 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
+	"io/fs"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -228,13 +228,13 @@ func (d daemonDown) Error() string {
 // answered or that the caller gave up. socketFlag is the --socket override, or
 // empty for the configured data directory's socket.
 func daemonDownState(opt *options, socketFlag string, err error) (daemonDown, bool) {
-	var op *net.OpError
-	if !errors.As(err, &op) || op.Op != "dial" || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if !errors.Is(err, ipc.ErrDaemonUnreachable) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return daemonDown{}, false
 	}
-	// Only a missing socket or a refused connection says no daemon listens.
+	// Only a missing socket/pipe or a refused connection says no daemon listens.
+	// ErrNotExist also matches Windows' ERROR_FILE_NOT_FOUND.
 	// EACCES and the like mean a daemon may run that this process cannot reach.
-	if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED) {
+	if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
 		return daemonDown{}, false
 	}
 	cfg, loadErr := opt.loadConfig()

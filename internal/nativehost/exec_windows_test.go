@@ -74,8 +74,12 @@ func TestWindowsExecutableInstallAndReplace(t *testing.T) {
 		if target, ok := ExecTarget(); target != source || !ok {
 			t.Fatalf("ExecTarget() = %q, %v; want %q, true", target, ok, source)
 		}
-		if target, err := resolveDaemonExecutable(); target != source || err != nil {
-			t.Fatalf("resolveDaemonExecutable() = %q, %v; want %q", target, err, source)
+		resolvedSource, err := filepath.EvalSymlinks(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target, err := resolveDaemonExecutable(); !strings.EqualFold(target, resolvedSource) || err != nil {
+			t.Fatalf("resolveDaemonExecutable() = %q, %v; want %q", target, err, resolvedSource)
 		}
 		assertWindowsExecClean(t)
 	}
