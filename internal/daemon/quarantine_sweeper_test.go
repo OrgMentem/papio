@@ -85,6 +85,12 @@ func TestSchedulerSweepsOnlyTerminalQuarantine(t *testing.T) {
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- scheduler.Run(runCtx) }()
+	stop := func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("scheduler shutdown: %v", err)
+		}
+	}
 
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -93,24 +99,18 @@ func TestSchedulerSweepsOnlyTerminalQuarantine(t *testing.T) {
 			break
 		}
 		if err != nil {
-			cancel()
-			<-done
+			stop()
 			t.Fatalf("stat terminal quarantine: %v", err)
 		}
 		if time.Now().After(deadline) {
-			cancel()
-			<-done
+			stop()
 			t.Fatal("scheduler did not sweep terminal quarantine")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if _, err := os.Stat(reviewPDF); err != nil {
-		cancel()
-		<-done
+		stop()
 		t.Fatalf("scheduler removed needs-review quarantine: %v", err)
 	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("scheduler shutdown: %v", err)
-	}
+	stop()
 }

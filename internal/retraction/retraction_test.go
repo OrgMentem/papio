@@ -933,9 +933,9 @@ func TestSnapshotItemsDoesNotWaitForSweepLookup(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		close(release)
-		<-sweepDone
+		sweepErr := <-sweepDone
 		<-snapshotDone
-		t.Fatal("snapshot waited for lookup")
+		t.Fatalf("snapshot waited for lookup (sweep: %v)", sweepErr)
 	}
 	close(release)
 	if err := <-sweepDone; err != nil {

@@ -94,8 +94,12 @@ func newDaemonCommand(opt *options) *cobra.Command {
 			instance.SetPhase(daemon.PhaseRunning)
 			schedulerDone := make(chan error, 1)
 			go func() { schedulerDone <- system.Scheduler.Run(runCtx) }()
-			sweeperDone := make(chan error, 1)
-			go func() { sweeperDone <- system.Browser.RunSweeper(runCtx, 2*time.Second) }()
+			// RunSweeper returns nil on every path; the channel only reports exit.
+			sweeperDone := make(chan struct{})
+			go func() {
+				defer close(sweeperDone)
+				_ = system.Browser.RunSweeper(runCtx, 2*time.Second)
+			}()
 			var serverErr, schedulerErr error
 			select {
 			case serverErr = <-serverDone:
