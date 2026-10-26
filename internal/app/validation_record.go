@@ -54,7 +54,7 @@ func validationVerdict(report pdf.ValidationReport, activeContent, needsIdentity
 // The job's validation transition already decided using validationTarget (the
 // submitted anchor when attested); this record is additional evidence only.
 //
-// A failure here is dropped on purpose, the way FinishAttempt's is: the verdict
+// A failure here is dropped on purpose: the verdict
 // itself already lives durably in the job's state, its attempt row, and its
 // event stream. This record is additional evidence for a consumer that has to
 // justify a rights or quality decision, and losing it must not fail an

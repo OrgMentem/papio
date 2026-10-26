@@ -2310,6 +2310,26 @@ func validateCandidateEnums(c Candidate) error {
 // InsertCandidates stores ranked candidates (redacted URLs only), deduplicated
 // per job by url_key. Returns the number inserted.
 func (js *Store) InsertCandidates(ctx context.Context, jobID string, cands []Candidate) (int, error) {
+	return js.insertCandidates(ctx, jobID, cands, "", nil)
+}
+
+// InsertCandidatesWithEvent commits newly inserted candidates and their
+// provenance event together. A deduplicated insertion emits no event.
+func (js *Store) InsertCandidatesWithEvent(ctx context.Context, jobID string, cands []Candidate, kind string, detail map[string]any) (int, error) {
+	if jobID == "" || kind == "" {
+		return 0, errors.New("candidate event requires job ID and kind")
+	}
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		return 0, fmt.Errorf("marshaling candidate event: %w", err)
+	}
+	return js.insertCandidates(ctx, jobID, cands, kind, encoded)
+}
+
+func (js *Store) insertCandidates(ctx context.Context, jobID string, cands []Candidate, kind string, detail []byte) (int, error) {
 	tx, err := js.S.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -2334,6 +2354,13 @@ func (js *Store) InsertCandidates(ctx context.Context, jobID string, cands []Can
 		}
 		if n, _ := res.RowsAffected(); n == 1 {
 			inserted++
+		}
+	}
+	if inserted > 0 && kind != "" {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, ?, ?)`,
+			jobID, now, kind, string(detail)); err != nil {
+			return 0, fmt.Errorf("recording candidate event: %w", err)
 		}
 	}
 	return inserted, tx.Commit()

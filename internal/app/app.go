@@ -761,7 +761,9 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 			var err error
 			chosen, err = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), entry.EstimatedCost)
 			if err != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err)); finishErr != nil {
+					return nil, plan, finishErr
+				}
 				if plan.observeBudgetRefusal(err) {
 					continue
 				}
@@ -776,17 +778,25 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 				return nil, plan, ctx.Err()
 			}
 			if plan.observeWireRefusal(err) {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err)); finishErr != nil {
+					return nil, plan, finishErr
+				}
 				continue
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
-				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err)); finishErr != nil {
+					return nil, plan, finishErr
 				}
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+				if s.Budgets != nil {
+					if err := s.Budgets.Defer(ctx, name, chosen, sourceRetry); err != nil {
+						return nil, plan, err
+					}
+				}
 			} else {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err)); finishErr != nil {
+					return nil, plan, finishErr
+				}
 			}
 			continue
 		}
@@ -801,9 +811,12 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 			all = append(all, c)
 			valid++
 		}
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("candidates=%d", valid))
+		if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("candidates=%d", valid)); err != nil {
+			return nil, plan, err
+		}
 	}
 
+	var searchedBasis string
 	if len(all) == 0 && strings.TrimSpace(row.Work.DOI) != "" {
 		// A pending ordinary TEMPORARY retry means the primary sources get
 		// their next attempt before the ten-credit fuzzy search is worth
@@ -825,9 +838,13 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 			exhausted = false
 		}
 		atBoundary := plan.atSiblingSearchBoundary(exhausted)
-		siblings, siblingPlan := s.resolveSiblings(ctx, row, atBoundary)
+		siblings, siblingPlan, basis, err := s.resolveSiblings(ctx, row, atBoundary)
+		if err != nil {
+			return nil, plan, err
+		}
 		all = append(all, siblings...)
 		plan.merge(siblingPlan)
+		searchedBasis = basis
 	}
 
 	ranked, evidence := resolver.Rank(row.Policy.DesiredVersion, all)
@@ -858,6 +875,9 @@ func (s *Service) resolve(ctx context.Context, row *job.Row) (map[string]resolve
 	persisted, live := candidateRows(row, ranked, evidence)
 	if _, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted); err != nil {
 		return nil, plan, err
+	}
+	if searchedBasis != "" {
+		s.recordSiblingSearch(ctx, row.ID, searchedBasis)
 	}
 	return live, plan, nil
 }
@@ -909,9 +929,10 @@ func rankEvidenceWithUpgrades(rankEvidence string, c resolver.Candidate) string 
 // the derived candidate is the same observation reached a second way, not a
 // new one.
 type landingSeed struct {
-	landingURL string
-	parent     resolver.Candidate
-	parentKey  string
+	landingURL  string
+	parent      resolver.Candidate
+	parentKey   string
+	candidateID int64 // nonzero while a failed parent still needs settlement
 }
 
 // landingDerivedEventKind durably records that a landing page produced a
@@ -986,7 +1007,9 @@ func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map
 		derived.RequestHeaders = nil
 		persisted, derivedLive := candidateRows(row, []resolver.Candidate{derived},
 			[]string{"derived=citation_pdf_url url_key=" + seed.parentKey})
-		n, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted)
+		n, err := s.Jobs.InsertCandidatesWithEvent(ctx, row.ID, persisted, landingDerivedEventKind, map[string]any{
+			"derived": "citation_pdf_url", "parent_url_key": seed.parentKey, "url_key": persisted[0].URLKey,
+		})
 		if err != nil {
 			return inserted, err
 		}
@@ -1004,12 +1027,17 @@ func (s *Service) expandLandingSeeds(ctx context.Context, row *job.Row, live map
 		if n == 0 {
 			continue
 		}
-		if err := s.Jobs.RecordEvent(ctx, row.ID, landingDerivedEventKind, map[string]any{
-			"derived": "citation_pdf_url", "parent_url_key": seed.parentKey, "url_key": persisted[0].URLKey,
-		}); err != nil {
-			return inserted, err
-		}
 		inserted = true
+	}
+	// A newly failed parent stays fetching until its landing recovery commits
+	// or finishes without a derivation. Recovery resets interrupted fetching
+	// rows to pending, so cancellation or a failed transaction can try again.
+	for _, seed := range seeds {
+		if seed.candidateID != 0 {
+			if err := s.Jobs.MarkCandidate(ctx, seed.candidateID, "invalid"); err != nil {
+				return inserted, err
+			}
+		}
 	}
 	return inserted, nil
 }
@@ -1107,27 +1135,36 @@ func (s *Service) rederivableLandingSeeds(ctx context.Context, row *job.Row, liv
 // url_key, so a repeated hop (later Process re-entry, or hop candidates
 // themselves failing) inserts zero and the exhaustion verdict stands — no
 // loop is possible.
-func (s *Service) siblingHop(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan *retryPlan) bool {
+func (s *Service) siblingHop(ctx context.Context, row *job.Row, live map[string]resolver.Candidate, plan *retryPlan) (bool, error) {
 	if strings.TrimSpace(row.Work.DOI) == "" {
-		return false
+		return false, nil
 	}
 	// This hop only ever runs at the fetch-exhaustion boundary — its caller
 	// resolves endsHere before calling — so necessity is already established.
-	cands, siblingPlan := s.resolveSiblings(ctx, row, true)
+	cands, siblingPlan, searchedBasis, err := s.resolveSiblings(ctx, row, true)
+	if err != nil {
+		return false, err
+	}
 	plan.merge(siblingPlan)
 	if len(cands) == 0 {
-		return false
+		return false, nil
 	}
 	ranked, evidence := resolver.Rank(row.Policy.DesiredVersion, cands)
 	persisted, hopLive := candidateRows(row, ranked, evidence)
 	inserted, err := s.Jobs.InsertCandidates(ctx, row.ID, persisted)
-	if err != nil || inserted == 0 {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if searchedBasis != "" {
+		s.recordSiblingSearch(ctx, row.ID, searchedBasis)
+	}
+	if inserted == 0 {
+		return false, nil
 	}
 	for key, c := range hopLive {
 		live[key] = c
 	}
-	return true
+	return true, nil
 }
 
 // SiblingResolver is the optional adapter capability behind the C3 version
@@ -1154,11 +1191,15 @@ type VersionRelations interface {
 // skipped: typed edges were asserted by the registrant, strict title/author
 // matching happened in the fuzzy adapter, and PDF semantic-identity
 // validation against row.Work remains the acceptance gate either way.
-// Errors never fail resolution — the hop must not make an acquisition worse.
-func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary bool) ([]resolver.Candidate, retryPlan) {
-	typed, plan := s.typedSiblings(ctx, row)
+// Provider failures remain optional; persistence failures abort the pass.
+// A nonempty search basis must be recorded only after its candidates persist.
+func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary bool) ([]resolver.Candidate, retryPlan, string, error) {
+	typed, plan, err := s.typedSiblings(ctx, row)
+	if err != nil {
+		return nil, plan, "", err
+	}
 	if len(typed) > 0 {
-		return typed, plan
+		return typed, plan, "", nil
 	}
 	// Everything below is the fuzzy title search, and it is the most expensive
 	// request papio makes: OpenAlex prices a singleton entity GET at one credit
@@ -1179,12 +1220,13 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 	// question changes. A transport failure records nothing, so it stays
 	// retryable.
 	if !atBoundary {
-		return nil, plan
+		return nil, plan, "", nil
 	}
 	basis := siblingSearchBasis(row.Work)
 	if s.siblingSearchRecorded(ctx, row.ID, basis) {
-		return nil, plan
+		return nil, plan, "", nil
 	}
+	searched := false
 	for _, entry := range s.Resolvers {
 		sibling, ok := entry.Adapter.(SiblingResolver)
 		if !ok {
@@ -1198,16 +1240,20 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 		// sibling pass is a resolve-stage attempt distinguished by its detail.
 		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
 		if err != nil {
-			return nil, plan
+			return nil, plan, "", err
 		}
 		chosen := entry.Policy
 		if s.Budgets != nil {
 			var acquireErr error
 			chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), entry.EstimatedCost)
 			if acquireErr != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
-				plan.observeBudgetRefusal(acquireErr)
-				continue
+				if err := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr)); err != nil {
+					return nil, plan, "", err
+				}
+				if plan.observeBudgetRefusal(acquireErr) {
+					continue
+				}
+				return nil, plan, "", acquireErr
 			}
 		}
 		cands, err := sibling.ResolveSiblings(anonymousIfFallback(ctx, entry.Policy, chosen), row.Work)
@@ -1216,7 +1262,9 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 		// nothing to search on. Charging that would spend a retry attempt on
 		// a pass where this source cost nothing.
 		if errors.Is(err, resolver.ErrNoSearchBasis) {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_search_basis")
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_search_basis"); err != nil {
+				return nil, plan, "", err
+			}
 			continue
 		}
 		plan.observeSourceCalled()
@@ -1227,25 +1275,33 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 			// unfinished work. Abort the hop rather than trying the next source.
 			if ctx.Err() != nil {
 				s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
-				return nil, plan
+				return nil, plan, "", ctx.Err()
 			}
 			// A rate-limited sibling lookup is not a verdict. Recording it as
 			// a plain failure let a 429 here settle the whole job unavailable,
 			// because the hop runs at the exhaustion boundary where a missing
 			// retry time is the difference between parking and giving up.
 			if plan.observeWireRefusal(err) {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err)); finishErr != nil {
+					return nil, plan, "", finishErr
+				}
 				continue
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
-				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err)); finishErr != nil {
+					return nil, plan, "", finishErr
 				}
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+				if s.Budgets != nil {
+					if err := s.Budgets.Defer(ctx, name, chosen, sourceRetry); err != nil {
+						return nil, plan, "", err
+					}
+				}
 				continue
 			}
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+			if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err)); finishErr != nil {
+				return nil, plan, "", finishErr
+			}
 			continue
 		}
 		valid := make([]resolver.Candidate, 0, len(cands))
@@ -1255,17 +1311,23 @@ func (s *Service) resolveSiblings(ctx context.Context, row *job.Row, atBoundary 
 			}
 			valid = append(valid, c)
 		}
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("sibling_candidates=%d", len(valid)))
-		// The provider answered, so this basis is now known-searched whatever
-		// it returned. Recorded before the candidate check so a zero-result
-		// search — the expensive common case — is the one that gets
-		// suppressed next pass.
-		s.recordSiblingSearch(ctx, row.ID, basis)
-		if len(valid) > 0 {
-			return valid, plan
+		if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("sibling_candidates=%d", len(valid))); err != nil {
+			return nil, plan, "", err
 		}
+		if len(valid) > 0 {
+			// A failed candidate insert must leave this search repeatable.
+			// The caller records the basis after that insert succeeds.
+			return valid, plan, basis, nil
+		}
+		searched = true
 	}
-	return nil, plan
+	if searched {
+		// No source produced candidates, so there is no dependent insert.
+		// Defer this marker until all sources finish: an earlier empty source
+		// must not suppress a later source whose candidate insert fails.
+		s.recordSiblingSearch(ctx, row.ID, basis)
+	}
+	return nil, plan, "", nil
 }
 
 // siblingSearchEventKind durably records that one fuzzy sibling search already
@@ -1351,58 +1413,71 @@ func (s *Service) recordSiblingSearch(ctx context.Context, jobID, basis string) 
 // would hand the operator the wrong work's sign-in. Budget, retry, and
 // attempt bookkeeping mirror the fuzzy loop exactly — a 429 here is a park,
 // never an unavailable verdict.
-func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.Candidate, retryPlan) {
+func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.Candidate, retryPlan, error) {
 	var plan retryPlan
 	relations, ok := s.Enricher.(VersionRelations)
 	if !ok || strings.TrimSpace(row.Work.DOI) == "" {
-		return nil, plan
+		return nil, plan, nil
 	}
 	name := config.SourceCrossrefMetadata
 	policy := s.sourcePolicy(name)
 	if !policy.Enabled || !row.Policy.SourceAllowed(name) {
-		return nil, plan
+		return nil, plan, nil
 	}
 	attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", name)
 	if err != nil {
-		return nil, plan
+		return nil, plan, err
 	}
 	chosen := policy
 	if s.Budgets != nil {
 		var acquireErr error
 		chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, policy), 0)
 		if acquireErr != nil {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
-			plan.observeBudgetRefusal(acquireErr)
-			return nil, plan
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr)); err != nil {
+				return nil, plan, err
+			}
+			if plan.observeBudgetRefusal(acquireErr) {
+				return nil, plan, nil
+			}
+			return nil, plan, acquireErr
 		}
 	}
 	plan.observeSourceCalled()
 	sibs, err := relations.VersionSiblings(ctx, row.Work.DOI)
 	if err != nil {
-		// See resolveSecondary: a dead context makes FinishAttempt a no-op, so
-		// the attempt row must be settled through settleCancelledAttempt.
+		// A dead context refuses FinishAttempt, so settle on a live context.
 		if ctx.Err() != nil {
 			s.settleCancelledAttempt(ctx, attempt, "cancelled", "context_cancelled")
-			return nil, plan
+			return nil, plan, ctx.Err()
 		}
 		if plan.observeWireRefusal(err) {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
-			return nil, plan
+			if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err)); finishErr != nil {
+				return nil, plan, finishErr
+			}
+			return nil, plan, nil
 		}
 		if delay, temporary := resolver.Temporary(err); temporary {
 			sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
-			if s.Budgets != nil {
-				_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
+			if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err)); finishErr != nil {
+				return nil, plan, finishErr
 			}
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
-			return nil, plan
+			if s.Budgets != nil {
+				if err := s.Budgets.Defer(ctx, name, chosen, sourceRetry); err != nil {
+					return nil, plan, err
+				}
+			}
+			return nil, plan, nil
 		}
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
-		return nil, plan
+		if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err)); finishErr != nil {
+			return nil, plan, finishErr
+		}
+		return nil, plan, nil
 	}
-	_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("version_siblings=%d", len(sibs)))
+	if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, fmt.Sprintf("version_siblings=%d", len(sibs))); err != nil {
+		return nil, plan, err
+	}
 	if len(sibs) == 0 {
-		return nil, plan
+		return nil, plan, nil
 	}
 
 	var all []resolver.Candidate
@@ -1416,9 +1491,10 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 		}
 		attempt, err := s.Jobs.StartAttempt(ctx, row.ID, 0, "resolve", rname)
 		if err != nil {
-			return all, plan
+			return nil, plan, err
 		}
 		outcome, detail, valid := "success", "", 0
+		var persistenceErr error
 		for _, sib := range sibs {
 			// One Acquire per Resolve: the budget manager reserves one
 			// request and one estimated-cost unit atomically, so acquiring
@@ -1429,7 +1505,9 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 				var acquireErr error
 				sibChosen, acquireErr = s.Budgets.AcquireAny(ctx, rname, acquirePolicies(rname, entry.Policy), entry.EstimatedCost)
 				if acquireErr != nil {
-					plan.observeBudgetRefusal(acquireErr)
+					if !plan.observeBudgetRefusal(acquireErr) {
+						persistenceErr = acquireErr
+					}
 					if valid == 0 {
 						outcome, detail = "budget_blocked", safeType(acquireErr)
 					}
@@ -1445,7 +1523,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 					} else {
 						s.settleCancelledAttempt(ctx, attempt, "failed", safeType(ctx.Err()))
 					}
-					return all, plan
+					return nil, plan, ctx.Err()
 				}
 				if plan.observeWireRefusal(err) {
 					outcome, detail = "budget_blocked", safeType(err)
@@ -1454,7 +1532,7 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 				if delay, temporary := resolver.Temporary(err); temporary {
 					sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
 					if s.Budgets != nil {
-						_ = s.Budgets.Defer(ctx, rname, sibChosen, sourceRetry)
+						persistenceErr = s.Budgets.Defer(ctx, rname, sibChosen, sourceRetry)
 					}
 					outcome, detail = "retryable", safeType(err)
 				} else {
@@ -1490,9 +1568,14 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 		if valid > 0 || outcome == "success" {
 			outcome, detail = "success", fmt.Sprintf("typed_sibling_candidates=%d", valid)
 		}
-		_ = s.Jobs.FinishAttempt(ctx, attempt, outcome, 0, detail)
+		if err := s.Jobs.FinishAttempt(ctx, attempt, outcome, 0, detail); err != nil {
+			return nil, plan, errors.Join(err, persistenceErr)
+		}
+		if persistenceErr != nil {
+			return nil, plan, persistenceErr
+		}
 	}
-	return all, plan
+	return all, plan, nil
 }
 
 // enrichDOIWork fills a DOI-only work's bibliography from the discovery
@@ -1548,7 +1631,7 @@ func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) (retryPlan, e
 // info:pmid, which the browser route could not verify. The lookup is keyed on
 // the identifier, so the record is exact-echo evidence and may fill strong
 // identifiers the anchor left open (enrichmentPersistWork); the PMID stays the
-// submitted anchor. Budgeted and charged like enrich; it never fails the job.
+// submitted anchor. Provider failures are optional; persistence failures abort.
 // A record without a DOI fills bibliography only, and the lookup then repeats
 // on later passes alongside the same source's resolver query.
 func (s *Service) enrichPMIDWork(ctx context.Context, row *job.Row, anchor job.SubmittedIdentity) (retryPlan, error) {
@@ -1578,7 +1661,9 @@ func (s *Service) enrichPMIDWork(ctx context.Context, row *job.Row, anchor job.S
 			var acquireErr error
 			chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, entry.Policy), 0)
 			if acquireErr != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
+				if err := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr)); err != nil {
+					return plan, err
+				}
 				if plan.observeBudgetRefusal(acquireErr) {
 					continue
 				}
@@ -1587,7 +1672,9 @@ func (s *Service) enrichPMIDWork(ctx context.Context, row *job.Row, anchor job.S
 		}
 		enriched, matched, err := lookup.LookupPMID(anonymousIfFallback(ctx, entry.Policy, chosen), pmid)
 		if errors.Is(err, resolver.ErrNotApplicable) {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "not_applicable")
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "not_applicable"); err != nil {
+				return plan, err
+			}
 			continue
 		}
 		plan.observeSourceCalled()
@@ -1597,30 +1684,45 @@ func (s *Service) enrichPMIDWork(ctx context.Context, row *job.Row, anchor job.S
 				return plan, ctx.Err()
 			}
 			if plan.observeWireRefusal(err) {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err)); finishErr != nil {
+					return plan, finishErr
+				}
 				continue
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
-				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err)); finishErr != nil {
+					return plan, finishErr
 				}
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+				if s.Budgets != nil {
+					if err := s.Budgets.Defer(ctx, name, chosen, sourceRetry); err != nil {
+						return plan, err
+					}
+				}
 			} else {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err)); finishErr != nil {
+					return plan, finishErr
+				}
 			}
 			continue
 		}
 		// The adapter's echo is re-checked here: only the queried PMID's own
 		// record may lend this work a DOI.
 		if !matched || enriched.PMID != pmid {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match")
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match"); err != nil {
+				return plan, err
+			}
 			continue
 		}
 		persistable, hasWrite, accepted := enrichmentPersistWork(anchor, enriched, resolver.AuthorityExactEcho)
 		if !accepted {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected"); err != nil {
+				return plan, err
+			}
 			continue
+		}
+		if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched"); err != nil {
+			return plan, err
 		}
 		if hasWrite {
 			updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, persistable)
@@ -1629,7 +1731,6 @@ func (s *Service) enrichPMIDWork(ctx context.Context, row *job.Row, anchor job.S
 			}
 			row.Work = updated.Work
 		}
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
 		if row.Work.DOI != "" {
 			// First moment this job has a canonical DOI to dedup on.
 			_, _ = s.Jobs.RecordDuplicateWork(ctx, row.ID, row.Work)
@@ -1687,7 +1788,9 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 			var acquireErr error
 			chosen, acquireErr = s.Budgets.AcquireAny(ctx, name, acquirePolicies(name, policy), 0)
 			if acquireErr != nil {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr))
+				if err := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(acquireErr)); err != nil {
+					return plan, err
+				}
 				// An optional source that is spent or gated must not prevent a
 				// later metadata source from attempting this same pass.
 				if plan.observeBudgetRefusal(acquireErr) {
@@ -1700,7 +1803,9 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 		if errors.Is(err, resolver.ErrNotApplicable) {
 			// The enricher declined before making any request: nothing was
 			// spent, so nothing is charged. Same silent skip as a no-op.
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "not_applicable")
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "not_applicable"); err != nil {
+				return plan, err
+			}
 			continue
 		}
 		plan.observeSourceCalled()
@@ -1710,24 +1815,34 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 				return plan, ctx.Err()
 			}
 			if plan.observeWireRefusal(err) {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "budget_blocked", 0, safeType(err)); finishErr != nil {
+					return plan, finishErr
+				}
 				continue
 			}
 			if delay, temporary := resolver.Temporary(err); temporary {
 				sourceRetry := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
-				if s.Budgets != nil {
-					_ = s.Budgets.Defer(ctx, name, chosen, sourceRetry)
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err)); finishErr != nil {
+					return plan, finishErr
 				}
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "retryable", 0, safeType(err))
+				if s.Budgets != nil {
+					if err := s.Budgets.Defer(ctx, name, chosen, sourceRetry); err != nil {
+						return plan, err
+					}
+				}
 			} else {
-				_ = s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err))
+				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err)); finishErr != nil {
+					return plan, finishErr
+				}
 			}
 			// Metadata enrichment is optional: one source's failure degrades
 			// to the next source instead of failing or short-circuiting resolve.
 			continue
 		}
 		if !matched {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match")
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "no_confident_match"); err != nil {
+				return plan, err
+			}
 			continue
 		}
 		// Item 5: an enricher match is SEARCH evidence. It may create
@@ -1741,8 +1856,13 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 		// write to gaps the anchor left open.
 		persistable, hasWrite, accepted := enrichmentPersistWork(anchor, enriched, resolver.AuthoritySearch)
 		if !accepted {
-			_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected")
+			if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_conflict_rejected"); err != nil {
+				return plan, err
+			}
 			continue
+		}
+		if err := s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched"); err != nil {
+			return plan, err
 		}
 		if hasWrite {
 			updated, err := s.Jobs.FillWorkMetadata(ctx, row.ID, persistable)
@@ -1755,7 +1875,6 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 		// search-derived identifier to look for candidates, which is what
 		// search evidence is licensed to do. It is deliberately not written.
 		row.Work = mergeObservedInMemory(row.Work, enriched)
-		_ = s.Jobs.FinishAttempt(ctx, attempt, "success", 0, "metadata_enriched")
 		// Enrichment has just given this job a strong identifier, which is the
 		// first moment papio can know it duplicates a job it is already running:
 		// submit-time dedup correctly matched nothing, because a title-only
@@ -1977,8 +2096,14 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			if !hopTried {
 				hopTried = true
 				endsHere := manual || plan.temporary().IsZero() || s.retryBudgetExhausted(ctx, row.ID)
-				if endsHere && s.siblingHop(ctx, row, live, &plan) {
-					continue
+				if endsHere {
+					ok, err := s.siblingHop(ctx, row, live, &plan)
+					if err != nil {
+						return err
+					}
+					if ok {
+						continue
+					}
 				}
 			}
 			break
@@ -2208,9 +2333,6 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 					return err
 				}
 			default:
-				if err := s.Jobs.MarkCandidate(ctx, stored.ID, "invalid"); err != nil {
-					return err
-				}
 				// The candidate is dead, but its own landing page (Landing on
 				// this live candidate, LandingRedacted on the persisted row) may
 				// still advertise a working PDF via citation_pdf_url — worth a
@@ -2220,11 +2342,13 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 				// since Unpaywall and OpenAlex, per the verified incident, can
 				// both return the SAME dead link and therefore the same landing
 				// page.
-				if candidate.AccessBasis == resolver.AccessOpen && candidate.Landing != "" && !seenLanding[candidate.Landing] {
+				if s.LandingReader != nil && candidate.AccessBasis == resolver.AccessOpen && candidate.Landing != "" && !seenLanding[candidate.Landing] {
 					seenLanding[candidate.Landing] = true
 					landingSeeds = append(landingSeeds, landingSeed{
-						landingURL: candidate.Landing, parent: candidate, parentKey: stored.URLKey,
+						landingURL: candidate.Landing, parent: candidate, parentKey: stored.URLKey, candidateID: stored.ID,
 					})
+				} else if err := s.Jobs.MarkCandidate(ctx, stored.ID, "invalid"); err != nil {
+					return err
 				}
 			}
 			continue
