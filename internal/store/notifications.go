@@ -236,6 +236,16 @@ func (l *NotificationLedger) upsertWebhookGenerationOnce(ctx context.Context, re
 		}
 		return ok(row)
 	}
+	// A pending row the router deferred after a failed POST (a retry stamp
+	// in webhook_attempted_at) returns unchanged for the router's own
+	// byte-identical retry, so a producer that re-routes the same event
+	// while the drain owns the retry does not inflate the count.
+	if current.WebhookState == "pending" && !current.WebhookAttemptedAt.IsZero() && isPureReplay(current, rec) {
+		if err := tx.Rollback(); err != nil {
+			return NotificationRecord{}, false, err
+		}
+		return ok(current)
+	}
 	if current.WebhookState == "" || current.WebhookState == "pending" {
 		merged, err := mergeGenerationRow(ctx, tx, current.ID, rec)
 		if err != nil {
@@ -639,14 +649,22 @@ func (l *NotificationLedger) SetDesktopState(ctx context.Context, id int64, stat
 // after the claim redirects to a fresh generation row with its own key
 // (see Upsert), so the second POST never reuses the first key. The caller
 // POSTs only when the claim applies, then settles with SetWebhookState to
-// attempted (endpoint accepted, any 2xx) or failed (transport error or
-// non-2xx, terminal best-effort loss). A crash between claim and settle
-// leaves sending, which never becomes due again: the notification may be
-// lost but is never duplicated. Local state cannot give exactly-once across
-// a lost HTTP response, so sending rows stay terminal and the stable
-// per-row delivery key lets receivers correlate.
-func (l *NotificationLedger) ClaimWebhook(ctx context.Context, id int64) (bool, error) {
-	result, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state='sending' WHERE id=? AND webhook_state='pending'`, id)
+// attempted (endpoint accepted, any 2xx) or failed (an ambiguous or
+// payload-rejecting outcome, or a retry window that expired). A provable
+// non-delivery (dial, DNS, or certificate failure, 429/503) is not failed:
+// DeferWebhook requeues the row as pending with a retry time so a later
+// drain retries it under the same delivery key. A deferred row is not
+// claimable before its retry time, so a caller holding an older due snapshot
+// cannot POST inside the backoff. A crash between claim and settle leaves
+// sending, which never becomes due again: the notification may be lost but
+// is never duplicated. Local state cannot give exactly-once across a lost
+// HTTP response, so sending rows stay terminal and the stable per-row
+// delivery key lets receivers correlate.
+func (l *NotificationLedger) ClaimWebhook(ctx context.Context, id int64, now time.Time) (bool, error) {
+	result, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state='sending'
+		WHERE id=? AND webhook_state='pending'
+		  AND (webhook_attempted_at IS NULL OR webhook_attempted_at = '' OR webhook_attempted_at <= ?)`,
+		id, formatNotificationTime(now))
 	if err != nil {
 		return false, err
 	}
@@ -660,6 +678,9 @@ func (l *NotificationLedger) ClaimWebhook(ctx context.Context, id int64) (bool, 
 // SetWebhookState settles the webhook leg. Terminal attempt states
 // (attempted, delivered, failed) stamp webhook_attempted_at so the failure
 // stays visible next to the success; other transitions leave it untouched.
+// The router uses the "pending" transition only to release a claim it won on
+// a context that died before any POST went out. It runs on a detached
+// context so a daemon shutdown still records it.
 func (l *NotificationLedger) SetWebhookState(ctx context.Context, id int64, state string, now time.Time) error {
 	switch state {
 	case "attempted", "delivered", "failed":
@@ -669,6 +690,33 @@ func (l *NotificationLedger) SetWebhookState(ctx context.Context, id int64, stat
 		_, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents SET webhook_state=? WHERE id=?`, state, id)
 		return err
 	}
+}
+
+// DeferWebhook requeues a claimed webhook leg as pending with a retry time,
+// so a later drain retries the same row under its stable delivery key, and
+// records the first failure time once. Both values are webhook-owned:
+// available_at belongs to the desktop leg too, and quiet hours or reminder
+// upserts move it. On a pending row webhook_attempted_at holds the retry
+// time: DueWebhook and ClaimWebhook skip the row until it passes, and the
+// router reads a non-empty stamp on a pending row as "deferred". The retry
+// window is bounded: once window has elapsed since the first failure the row
+// stays in sending and DeferWebhook reports false, so the caller settles it
+// failed. Only the claim holder's sending row moves: settled, skipped, or
+// already-pending rows are left alone.
+func (l *NotificationLedger) DeferWebhook(ctx context.Context, id int64, failedAt, retryAt time.Time, window time.Duration) (bool, error) {
+	result, err := l.s.db.ExecContext(ctx, `UPDATE notification_intents
+		SET webhook_state='pending', webhook_attempted_at=?, webhook_first_failed_at=COALESCE(NULLIF(webhook_first_failed_at, ''), ?)
+		WHERE id=? AND webhook_state='sending'
+		  AND (webhook_first_failed_at IS NULL OR webhook_first_failed_at = '' OR webhook_first_failed_at > ?)`,
+		formatNotificationTime(retryAt), formatNotificationTime(failedAt), id, formatNotificationTime(failedAt.Add(-window)))
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return changed == 1, nil
 }
 
 func (l *NotificationLedger) SupersedeCheckpoints(ctx context.Context, aggregateKey string, now time.Time) (int, error) {
@@ -748,16 +796,22 @@ func (l *NotificationLedger) SupersedeAndUpsertCheckpoint(ctx context.Context, a
 	return l.getByIdentity(ctx, rec.Category, rec.EventKind, rec.AggregateKey, rec.Phase, rec.WindowStart)
 }
 
-// DueWebhook returns pending digest legs whose shared availability window has
-// elapsed. Claimed (sending), delivered, failed, and skipped legs are never
-// due again, which is what makes the webhook leg at-most-once per row.
+// DueWebhook returns pending webhook legs that are due: a first attempt once
+// the shared availability window has elapsed, a deferred retry once its
+// webhook-owned retry time has passed, whatever quiet hours or a reminder
+// upsert did to available_at since. Claimed (sending), delivered, failed,
+// and skipped legs are never due again, which is what makes the webhook leg
+// at-most-once per row.
 func (l *NotificationLedger) DueWebhook(ctx context.Context, now time.Time, limit int) ([]NotificationRecord, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	at := formatNotificationTime(now)
 	rows, err := l.s.db.QueryContext(ctx, `SELECT `+notificationColumns+`
-		FROM notification_intents WHERE webhook_state='pending' AND available_at <= ?
-		ORDER BY available_at,id LIMIT ?`, formatNotificationTime(now), limit)
+		FROM notification_intents WHERE webhook_state='pending'
+		  AND (((webhook_attempted_at IS NULL OR webhook_attempted_at = '') AND available_at <= ?)
+		    OR (webhook_attempted_at <> '' AND webhook_attempted_at <= ?))
+		ORDER BY available_at,id LIMIT ?`, at, at, limit)
 	if err != nil {
 		return nil, err
 	}

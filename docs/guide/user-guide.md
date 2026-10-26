@@ -376,11 +376,18 @@ for the preset table and per-category overrides.
 
 Webhooks are a separate automation channel. Human quiet hours and the desktop
 rate limit do not delay them. Each category can set its own webhook mode.
-*papio* attempts each webhook once and sends a stable delivery key with it.
-If the endpoint fails, *papio* records a failed attempt in Activity; it does
-not retry the POST. If *papio* stops during a send, the result can be unknown.
-The receiver can use the key to detect repeat requests. Check the inbox and
-Activity for the durable outcome when a notification does not arrive.
+*papio* sends a stable delivery key with each webhook. If the request cannot
+reach the endpoint (the connection is refused, DNS fails, or the TLS
+certificate is rejected), or the endpoint answers 429 or 503, *papio* tries the
+same notification again with the same key. Each retry waits at least 5
+minutes, and retries stop 24 hours after the first failed attempt. Other
+failures, such as a 4xx answer or a connection that breaks after the request
+went out, are not retried, because the endpoint may already have the
+notification. *papio*
+records each failed attempt and its cause in Activity. If *papio* stops during
+a send, the result can be unknown. The receiver can use the key to detect
+repeat requests. Check the inbox and Activity for the durable outcome when a
+notification does not arrive.
 
 By default a webhook receives a JSON body. To post to a chat app, set
 `notify.webhook_format` to `ntfy` (an ntfy topic URL such as

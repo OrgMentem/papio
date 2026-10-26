@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,9 +19,11 @@ import (
 	"papio/internal/config"
 	"papio/internal/discovery"
 	"papio/internal/job"
+	"papio/internal/notify"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/store"
+	"papio/internal/store/storetest"
 	"papio/internal/work"
 	"papio/internal/zotio"
 )
@@ -1233,6 +1236,61 @@ func TestRunnerAlertRetriesUnalertedDigestAfterRouteFailure(t *testing.T) {
 	if len(fixed.intents) != 1 {
 		t.Fatalf("notifications = %+v; want no duplicate alert", fixed.messages)
 	}
+}
+
+// A failed webhook POST is not reported as alerted: the runner routes the
+// alert through the real notify router against a refusing endpoint, the
+// route fails, and the digest entry keeps no alert receipt for the next run.
+func TestRunnerAlertWithholdsReceiptOnWebhookFailure(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	watched := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "webhook outage", Collection: "Reading", CadenceHours: 24, PerRunCap: 2,
+	})
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	discoveryFake := &fakeDiscovery{works: []discovery.DiscoveredWork{{
+		Work: work.Work{DOI: "10.1000/outage", Title: "Outage Work", Authors: []string{"Ada"}, Year: 2026},
+	}}}
+	lookup := &fakeLookup{result: &zotio.LookupWorksResult{Works: []zotio.WorkOwnership{{Status: zotio.OwnershipNotOwned}}}}
+	storeDB, err := store.Open(ctx, storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := storeDB.Close(); err != nil {
+			t.Errorf("close notify store: %v", err)
+		}
+	})
+	policy, err := notify.ResolvePolicy(config.Default().Notify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialRefused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	webhook := &failingWebhookSender{err: dialRefused}
+	notifier := notify.NewRouter(notify.RouterOptions{Ledger: notify.NewStoreLedger(storeDB), Policy: policy, Webhook: webhook, Now: func() time.Time { return now }})
+	runner := &Runner{
+		Store: watches, Discovery: discoveryFake, Lookup: lookup, Notifier: notifier,
+		DataDir: t.TempDir(), Now: func() time.Time { return now },
+	}
+	if _, err := runner.Run(ctx, watched.ID); err == nil || !strings.Contains(err.Error(), "routing watch alert") {
+		t.Fatalf("Run() error = %v; want the webhook alert routing failure", err)
+	}
+	if unalerted, err := watches.UnalertedDigestEntries(ctx, watched.ID); err != nil || len(unalerted) != 1 {
+		t.Fatalf("unalerted entries = %+v, %v; want the stranded discovery", unalerted, err)
+	}
+}
+
+// failingWebhookSender reports one delivery failure through the result
+// interface the router settles on, so the test exercises the production
+// failure path instead of a fake Route error.
+type failingWebhookSender struct {
+	err error
+}
+
+func (s *failingWebhookSender) Send(_ context.Context, _ string) {}
+
+func (s *failingWebhookSender) SendEventResult(_ context.Context, _ notify.Event) error {
+	return s.err
 }
 
 // A retry after a delivered alert whose receipt was lost must present the
