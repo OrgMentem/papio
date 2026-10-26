@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -392,6 +393,49 @@ func TestClientReturnsCancellationFromCloseWrite(t *testing.T) {
 	_, err := client.CallRaw(ctx, "request_01", "jobs.get", json.RawMessage(`{}`))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("CallRaw error = %v, want context.Canceled", err)
+	}
+}
+
+// TestClientCancellationPropagatesToHandler pins papio-1af1e6d: cancelling
+// the caller's context closes the connection, and the server cancels the
+// handler that is still running instead of letting it mutate state with no
+// waiter.
+func TestClientCancellationPropagatesToHandler(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("disconnect detection needs the unix poll watcher; the Windows watcher is a no-op")
+	}
+	entered := make(chan struct{})
+	handlerDone := make(chan struct{})
+	socket, _ := startTestServer(t, HandlerFunc(func(ctx context.Context, _ Request) ([]byte, *RPCError) {
+		close(entered)
+		<-ctx.Done()
+		close(handlerDone)
+		return nil, &RPCError{Code: "cancelled", Message: "cancelled"}
+	}))
+	callCtx, cancelCall := context.WithCancel(context.Background())
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := NewSocketClient(socket).CallRaw(callCtx, "request_01", "jobs.get", json.RawMessage(`{}`))
+		callDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancelCall()
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler context was not cancelled after client cancellation")
+	}
+	select {
+	case err := <-callDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("CallRaw error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CallRaw did not return after cancellation")
 	}
 }
 

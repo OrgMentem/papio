@@ -1984,6 +1984,12 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 		if deferredReview == nil {
 			return
 		}
+		if errors.Is(context.Cause(ctx), job.ErrLeaseLost) {
+			// Our lease moved on while we fetched; another worker owns the
+			// job now. Neither materialize (it would park the winner's job)
+			// nor discard (it would touch shared candidate rows): abandon.
+			return
+		}
 		if conflict && err == nil {
 			err = s.discardDeferredIdentityReview(context.WithoutCancel(ctx), deferredReview)
 			return
@@ -2404,6 +2410,9 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			// quarantine directory after a ready or parked result.
 			review := deferredReview
 			deferredReview = nil
+			if errors.Is(context.Cause(ctx), job.ErrLeaseLost) {
+				return nil
+			}
 			if err := s.discardDeferredIdentityReview(context.WithoutCancel(ctx), review); err != nil {
 				return err
 			}
@@ -2416,6 +2425,11 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 	// Materialize it before this pass can release its lease or clean quarantine
 	// on a later Process call.
 	if deferredReview != nil {
+		if errors.Is(context.Cause(ctx), job.ErrLeaseLost) {
+			// Abandoned mid-queue: the job may belong to another worker now,
+			// so do not materialize against it.
+			return ctx.Err()
+		}
 		review := deferredReview
 		deferredReview = nil
 		return s.materializeDeferredIdentityReview(context.WithoutCancel(ctx), row.ID, review)

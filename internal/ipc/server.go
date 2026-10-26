@@ -218,7 +218,19 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		}
 		return
 	}
-	result, rpcErr := s.Handler.Handle(ctx, req)
+	// One request-scoped context per connection. Server shutdown cancels it
+	// through the parent; a peer that goes away mid-request cancels it
+	// through the disconnect watcher (the client closes its connection on
+	// cancellation). Handlers that honor their context therefore stop
+	// mutating state once nobody waits for their result. Work that must
+	// durably outlive the caller belongs in an explicit detached method,
+	// not behind a silently ignored cancellation. Where the platform offers
+	// no passive disconnect signal the watcher is a no-op and handlers keep
+	// the server context.
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go watchConnClose(reqCtx, conn, cancel)
+	result, rpcErr := s.Handler.Handle(reqCtx, req)
 
 	res := Response{Protocol: ProtocolVersion, ID: req.ID}
 	if rpcErr != nil {

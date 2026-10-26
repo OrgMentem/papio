@@ -865,3 +865,126 @@ func TestBoundDOIsWithNilRow(t *testing.T) {
 		t.Fatalf("BoundDOIs with empty work = %v, want 2", got)
 	}
 }
+
+// TestLeaseLossAbandonsDeferredReviewWithoutParking pins the app half of the
+// lease-loss contract: when the processor's context carries the lease-lost
+// cause, a deferred review must neither materialize (it would park the
+// winner's job) nor discard (it would touch shared candidate rows). The job
+// stays fetching and the attempt simply ends.
+func TestLeaseLossAbandonsDeferredReviewWithoutParking(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	const (
+		wrongURL = "https://example.test/lease-lost-first.pdf"
+		nextURL  = "https://example.test/lease-lost-next.pdf"
+	)
+	svc.Resolvers = []ResolverEntry{{
+		Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{
+			conclusiveQueueCandidate(wrongURL, 1),
+			conclusiveQueueCandidate(nextURL, 0.8),
+		}},
+		Policy: svc.Config.Sources["fixture"],
+	}}
+	callCtx, cancelCause := context.WithCancelCause(ctx)
+	svc.Fetch = func(fetchCtx context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
+		if candidate.URL != wrongURL {
+			// The lease moves on while the second fetch runs.
+			cancelCause(job.ErrLeaseLost)
+			return fetch.Result{}, fetchCtx.Err()
+		}
+		body := pdfBytes(candidate.URL)
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			return fetch.Result{}, err
+		}
+		sum := sha256.Sum256(body)
+		return fetch.Result{
+			TempPath: path, SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(body)),
+			SniffedMIME: "application/pdf", ContentType: "application/pdf", HTTPStatus: 200,
+		}, nil
+	}
+	svc.Validate = func(_ context.Context, _ string, _ string, target work.Work) (pdf.ValidationReport, error) {
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 8},
+			Text:       pdf.TextReport{Chars: 2000, Excerpt: foreignDOIFrontMatter("10.9999/lease-lost", target)},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+		}, nil
+	}
+	id, err := svc.Submit(ctx, vetoTitleOnlyRequest("wr_lease_lost_deferred"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(callCtx, row); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Process error = %v, want context cancellation", err)
+	}
+	current, err := jobs.Get(ctx, id)
+	if err != nil || current.State != job.StateFetching {
+		t.Fatalf("abandoned job = %+v, %v; want still fetching (no winner to park)", current, err)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil || len(actions) != 0 {
+		t.Fatalf("abandoned job left open actions: %+v, %v", actions, err)
+	}
+}
+
+// TestLeaseLossDuringValidationDoesNotMaterializeDeferredReview covers the
+// explicit review path: the lease moves on while the conclusive mismatch is
+// being validated. A plain cancellation there still materializes the review
+// (TestDeferredConclusiveMismatchParksSafely/cancelled_after_validation);
+// a lease-lost cancellation must not, because the job belongs to another
+// worker by then.
+func TestLeaseLossDuringValidationDoesNotMaterializeDeferredReview(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	const wrongURL = "https://example.test/lease-lost-validate.pdf"
+	svc.Resolvers = []ResolverEntry{{
+		Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{
+			conclusiveQueueCandidate(wrongURL, 1),
+		}},
+		Policy: svc.Config.Sources["fixture"],
+	}}
+	callCtx, cancelCause := context.WithCancelCause(ctx)
+	svc.Fetch = func(_ context.Context, candidate resolver.Candidate, path string) (fetch.Result, error) {
+		body := pdfBytes(candidate.URL)
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			return fetch.Result{}, err
+		}
+		sum := sha256.Sum256(body)
+		return fetch.Result{
+			TempPath: path, SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(body)),
+			SniffedMIME: "application/pdf", ContentType: "application/pdf", HTTPStatus: 200,
+		}, nil
+	}
+	svc.Validate = func(_ context.Context, _ string, _ string, target work.Work) (pdf.ValidationReport, error) {
+		cancelCause(job.ErrLeaseLost)
+		return pdf.ValidationReport{
+			Payload:    pdf.PayloadReport{OK: true},
+			Structural: pdf.StructuralReport{Valid: true, Pages: 8},
+			Text:       pdf.TextReport{Chars: 2000, Excerpt: foreignDOIFrontMatter("10.9999/lease-lost-validate", target)},
+			Identity:   pdf.IdentityDecision{Result: pdf.IdentityPass},
+		}, nil
+	}
+	id, err := svc.Submit(ctx, vetoTitleOnlyRequest("wr_lease_lost_validate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "worker", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(callCtx, row); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Process error = %v, want context cancellation", err)
+	}
+	current, err := jobs.Get(ctx, id)
+	if err != nil || current.State == job.StateNeedsReview {
+		t.Fatalf("lease-lost job = %+v, %v; must not be parked for review", current, err)
+	}
+	actions, err := jobs.ListHumanActions(ctx, true)
+	if err != nil || len(actions) != 0 {
+		t.Fatalf("lease-lost job left open actions: %+v, %v", actions, err)
+	}
+}
