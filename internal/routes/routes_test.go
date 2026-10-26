@@ -499,6 +499,74 @@ func TestValidateCandidateRejectsAdversarialManualCandidates(t *testing.T) {
 	}
 }
 
+// The query-route branch (Cell pii={pii}) needs its own adversarial rows:
+// the path-placeholder cases above never enter it, so disabling its path,
+// query and canonical-URL checks used to pass the suite while letting a Cell
+// candidate carry a foreign host, an outside path or extra query data.
+func TestValidateCandidateRejectsCellQueryDeviations(t *testing.T) {
+	cands := CandidatesForIdentifiers(map[string]string{"pii": "S240584401730308X"}, "")
+	var cell *Candidate
+	for i := range cands {
+		if cands[i].RouteRevision == "cell-pii-showpdf/1" {
+			cell = &cands[i]
+			break
+		}
+	}
+	if cell == nil {
+		t.Fatalf("cell candidate missing in %+v", cands)
+	}
+	base := *cell
+	if err := ValidateCandidate(base); err != nil {
+		t.Fatalf("unedited Cell candidate rejected: %v", err)
+	}
+	for _, tt := range []struct {
+		name string
+		edit func(Candidate) Candidate
+	}{
+		{
+			name: "foreign host keeps path and query",
+			edit: func(c Candidate) Candidate {
+				c.URL = strings.Replace(c.URL, "https://www.cell.com/", "https://evil.example/", 1)
+				return c
+			},
+		},
+		{
+			name: "path outside the family",
+			edit: func(c Candidate) Candidate {
+				c.URL = strings.Replace(c.URL, "/action/showPdf?", "/action/download?", 1)
+				return c
+			},
+		},
+		{
+			name: "extra query parameter",
+			edit: func(c Candidate) Candidate {
+				c.URL += "&download=true"
+				return c
+			},
+		},
+		{
+			name: "duplicated pii",
+			edit: func(c Candidate) Candidate {
+				c.URL += "&pii=S240584401730308X"
+				return c
+			},
+		},
+		{
+			name: "non-canonical identifier case",
+			edit: func(c Candidate) Candidate {
+				c.URL = strings.Replace(c.URL, "S240584401730308X", "s240584401730308x", 1)
+				return c
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateCandidate(tt.edit(base)); err == nil {
+				t.Fatal("ValidateCandidate accepted a malformed Cell query candidate")
+			}
+		})
+	}
+}
+
 func TestPublisherFirstAdapterMatchesOnlyTheRegistrantPrefix(t *testing.T) {
 	for _, tc := range []struct {
 		doi, adapter string
