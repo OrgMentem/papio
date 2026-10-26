@@ -323,6 +323,28 @@ test("a DOI that breaks URL structure is percent-encoded before it reaches the h
   );
 });
 
+test("a DOI with a dot segment renders as text, never as a doi.org link", async () => {
+  const snap = snapshot({
+    items: [
+      paper({ localId: "id-1", identifier: { kind: "doi", value: "10.1234/../10.5555/x" } }),
+      paper({ localId: "id-2", identifier: { kind: "doi", value: "10.1234/%2E%2E/10.5555/x" } }),
+      paper({ localId: "id-3", identifier: { kind: "doi", value: "10.48612//monograph-2025-2" } }),
+    ],
+  });
+  const page = await pageBulkDocument(
+    "scan-1",
+    standardReply(snap, [eligibleStatus("id-1"), eligibleStatus("id-2"), eligibleStatus("id-3")]),
+  );
+  for (const localId of ["id-1", "id-2"]) {
+    expect(row(page.document, localId)?.querySelector("a.pb-row-link")).toBeNull();
+  }
+  expect(row(page.document, "id-1")?.querySelector(".pb-row-identifier")?.textContent).toBe("DOI: 10.1234/../10.5555/x");
+  // Slash runs stay significant and keep their link.
+  expect(row(page.document, "id-3")?.querySelector("a.pb-row-link")?.getAttribute("href")).toBe(
+    "https://doi.org/10.48612//monograph-2025-2",
+  );
+});
+
 test("a label that already repeats its identifier shows it once, on the link", async () => {
   const snap = snapshot({
     items: [

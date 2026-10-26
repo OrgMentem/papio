@@ -154,7 +154,7 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 		app.OpenURL(instituteBase, rows[4].Work), oaURL, app.OpenURL(base, rows[1].Work),
 		app.OpenURL(base, rows[3].Work),
 	}
-	targets, dropped := actionHandoffTargets(actions, rows, instFor, 0)
+	targets, dropped, droppedNoURL := actionHandoffTargets(actions, rows, instFor, 0)
 	got := make([]string, 0, len(targets))
 	for _, target := range targets {
 		got = append(got, target.URL)
@@ -162,16 +162,16 @@ func TestActionURLsSelectAwaitingActionsMostRecentAndDryRun(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("URLs = %#v, want %#v", got, want)
 	}
-	if dropped != 0 {
-		t.Fatalf("dropped = %d, want 0 — every action's job id is present in rows", dropped)
+	if dropped != 0 || droppedNoURL != 0 {
+		t.Fatalf("dropped = %d, noURL = %d, want 0, 0 — every action's job id is present in rows with a buildable URL", dropped, droppedNoURL)
 	}
-	limitedTargets, limitedDropped := actionHandoffTargets(actions, rows, instFor, 1)
+	limitedTargets, limitedDropped, limitedNoURL := actionHandoffTargets(actions, rows, instFor, 1)
 	limited := make([]string, 0, len(limitedTargets))
 	for _, target := range limitedTargets {
 		limited = append(limited, target.URL)
 	}
-	if !reflect.DeepEqual(limited, want[:1]) || limitedDropped != 0 {
-		t.Fatalf("limited URLs = %#v, dropped = %d, want %#v, 0", limited, limitedDropped, want[:1])
+	if !reflect.DeepEqual(limited, want[:1]) || limitedDropped != 0 || limitedNoURL != 0 {
+		t.Fatalf("limited URLs = %#v, dropped = %d, noURL = %d, want %#v, 0, 0", limited, limitedDropped, limitedNoURL, want[:1])
 	}
 
 	var out bytes.Buffer
@@ -917,6 +917,98 @@ func TestActionsOpenFoldsMissingJobIntoTruncated(t *testing.T) {
 	}
 	if len(page.URLs) != 0 || !page.Truncated {
 		t.Fatalf("missing job page = %s, want empty URLs and truncated:true", out.String())
+	}
+}
+
+// An action papio itself cannot build a URL for is counted as skipped and
+// marks the page truncated, instead of silently vanishing from a mixed queue.
+func TestActionsOpenCountsURLLessHandoffsAsSkipped(t *testing.T) {
+	oaURL := "https://oa.example.test/paper.pdf"
+	actions := []job.HumanAction{
+		{ID: 2, JobID: "job_dotty", Kind: "openurl_handoff", Status: "open", Detail: job.PublisherHandoffDetail},
+		{ID: 1, JobID: "job_oa", Kind: "openurl_handoff", Status: "open", Detail: app.OABrowserHandoffActionDetail(oaURL)},
+	}
+	rows := []job.Row{
+		{ID: "job_dotty", State: job.StateAwaitingHuman, Work: work.Work{DOI: "10.1234/../10.5555/x"}},
+		{ID: "job_oa", State: job.StateAwaitingHuman, Work: work.Work{DOI: "10.1000/oa"}},
+	}
+	stubInstFor := func(string) (config.Institution, bool) { return config.Institution{}, false }
+	targets, dropped, droppedNoURL := actionHandoffTargets(actions, rows, stubInstFor, 0)
+	if len(targets) != 1 || dropped != 0 || droppedNoURL != 1 {
+		t.Fatalf("targets = %d, dropped = %d, noURL = %d; want 1, 0, 1", len(targets), dropped, droppedNoURL)
+	}
+	if targets[0].JobID != "job_oa" || targets[0].URL != oaURL {
+		t.Fatalf("targets = %+v, want only the openable OA handoff", targets)
+	}
+	serve := func(_ context.Context, method string, params any, result any) error {
+		switch method {
+		case "actions.list":
+			*result.(*[]job.HumanAction) = actions
+		case "jobs.list_v2":
+			*result.(*api.JobsPage) = api.JobsPage{Jobs: rows}
+		default:
+			t.Fatalf("unexpected method %q", method)
+		}
+		return nil
+	}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(ctx context.Context, method string, params any, result any) error {
+		return serve(ctx, method, params, result)
+	})
+	root.SetArgs([]string{"--json", "actions", "open", "--dry-run"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var page struct {
+		URLs      []string `json:"urls"`
+		Truncated bool     `json:"truncated"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.URLs) != 1 || page.URLs[0] != oaURL || !page.Truncated {
+		t.Fatalf("mixed page = %s, want one URL with truncated:true", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	root = NewInProcessRoot(&out, &errOut, config.Config{}, func(ctx context.Context, method string, params any, result any) error {
+		return serve(ctx, method, params, result)
+	})
+	root.SetArgs([]string{"actions", "open", "--dry-run"})
+	err := root.ExecuteContext(context.Background())
+	if !errors.Is(err, errHandoffsSkipped) {
+		t.Fatalf("err = %v, want errHandoffsSkipped for the URL-less handoff", err)
+	}
+	if !strings.Contains(out.String(), oaURL) || !strings.Contains(out.String(), "1 handoff(s) had no openable URL and were skipped") {
+		t.Fatalf("output = %q, want the openable URL and the skipped-handoff notice", out.String())
+	}
+}
+
+// When every selected handoff is URL-less the early "none openable" exit still
+// prints its pointer, but must exit nonzero: a script must not read a handoff
+// papio could not open as an empty queue.
+func TestActionsOpenSingleURLLessHandoffExitsSkipped(t *testing.T) {
+	action := job.HumanAction{ID: 2, JobID: "job_dotty", Kind: "openurl_handoff", Status: "open", Detail: job.PublisherHandoffDetail}
+	row := job.Row{ID: "job_dotty", State: job.StateAwaitingHuman, Work: work.Work{DOI: "10.1234/../10.5555/x"}}
+	var out, errOut bytes.Buffer
+	root := NewInProcessRoot(&out, &errOut, config.Config{}, func(_ context.Context, method string, _ any, result any) error {
+		switch method {
+		case "actions.list":
+			*result.(*[]job.HumanAction) = []job.HumanAction{action}
+		case "jobs.get":
+			*result.(*api.JobDetail) = api.JobDetail{Job: &row}
+		default:
+			t.Fatalf("unexpected method %q: a URL-less handoff must reach no daemon mutation", method)
+		}
+		return nil
+	})
+	root.SetArgs([]string{"actions", "open", "--job", row.ID})
+	err := root.ExecuteContext(context.Background())
+	if !errors.Is(err, errHandoffsSkipped) {
+		t.Fatalf("err = %v, want errHandoffsSkipped for a single URL-less handoff", err)
+	}
+	if !strings.Contains(out.String(), "none openable from here") {
+		t.Fatalf("output = %q, want the none-openable pointer", out.String())
 	}
 }
 

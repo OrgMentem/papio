@@ -2046,3 +2046,21 @@ func TestDecideAcknowledgesRetractionThroughItsSource(t *testing.T) {
 		t.Fatalf("source error = %v, want it propagated", err)
 	}
 }
+
+func TestCanonicalLinksOmitsDotSegmentDOI(t *testing.T) {
+	links := canonicalLinks("10.1234/../10.5555/x", "2301.08745", "W2741809807")
+	for _, link := range links {
+		if link.Rel == "doi" {
+			t.Fatalf("links = %+v, want no DOI link for a dot-segment DOI", links)
+		}
+	}
+	if len(links) != 2 {
+		t.Fatalf("links = %+v, want the arXiv and OpenAlex links kept", links)
+	}
+	if got := canonicalDOIURL("10.48612//monograph-2025-2"); got != "https://doi.org/10.48612//monograph-2025-2" {
+		t.Fatalf("slash-run DOI link = %q, want the literal path", got)
+	}
+	if got := canonicalDOIURL("10.1234/./x"); got != "" {
+		t.Fatalf("dot-segment DOI link = %q, want none", got)
+	}
+}

@@ -122,6 +122,24 @@ func NormalizeDOI(raw string) (string, error) {
 	return s, nil
 }
 
+// HasDotSegment reports whether a DOI names a "." or ".." path segment.
+// Browsers follow the WHATWG URL Standard, which treats those segments —
+// including their percent-encoded spellings — as navigation, so linking one
+// would steer the handoff to a different registered DOI. Refusing the route
+// is the only safe shape; slash runs and case stay significant and pass
+// through everywhere else. It takes the DOI as stored or normalized; both
+// spellings expose the same segments.
+func HasDotSegment(doi string) bool {
+	for _, segment := range strings.Split(doi, "/") {
+		switch strings.ToLower(segment) {
+		case ".", "%2e",
+			"..", ".%2e", "%2e.", "%2e%2e":
+			return true
+		}
+	}
+	return false
+}
+
 // NormalizeArXiv canonicalizes an arXiv ID: accepts arXiv:/arxiv: prefixes,
 // abs//pdf URLs, old and new styles; strips a trailing ".pdf" and preserves an
 // explicit version suffix.

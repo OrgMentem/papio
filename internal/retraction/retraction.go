@@ -555,13 +555,19 @@ func (s *Sentinel) SnapshotItems(ctx context.Context, tx *sql.Tx) ([]triage.Item
 		if title == "" {
 			title = "Library update notice"
 		}
+		links := []triage.Link{}
+		ops := []string{"dismiss"}
+		if !work.HasDotSegment(finding.DOI) {
+			links = append(links, triage.Link{Rel: "doi", URL: "https://doi.org/" + finding.DOI})
+			ops = append(ops, "open")
+		}
 		items = append(items, triage.Item{
 			Kind:  triage.KindRetraction,
 			ID:    triage.RetractionIDPrefix + finding.DOI,
 			Title: title,
 			Facts: []triage.Fact{{Label: "Nature", Text: string(finding.Nature)}},
-			Links: []triage.Link{{Rel: "doi", URL: "https://doi.org/" + finding.DOI}},
-			Ops:   []string{"dismiss", "open"},
+			Links: links,
+			Ops:   ops,
 			Retraction: &triage.Retraction{
 				DOI: finding.DOI, Nature: string(finding.Nature), NoticedAt: finding.NoticedAt,
 				NoticeDOI: finding.NoticeDOI,

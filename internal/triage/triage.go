@@ -1616,8 +1616,8 @@ func canonicalIdentifiers(rowDOI string, identifiers protocol.Identifiers) (doi,
 
 func canonicalLinks(doi, arxiv, openalex string) []Link {
 	links := make([]Link, 0, 3)
-	if doi != "" {
-		links = append(links, Link{Rel: "doi", URL: canonicalDOIURL(doi)})
+	if doiURL := canonicalDOIURL(doi); doiURL != "" {
+		links = append(links, Link{Rel: "doi", URL: doiURL})
 	}
 	if arxiv != "" {
 		links = append(links, Link{Rel: "arxiv", URL: "https://arxiv.org/abs/" + arxiv})
@@ -1628,7 +1628,14 @@ func canonicalLinks(doi, arxiv, openalex string) []Link {
 	return links
 }
 
+// canonicalDOIURL builds the browser-facing DOI link, or "" when the DOI
+// names a "." or ".." path segment: browsers would resolve that link to a
+// different registered DOI, so the item carries no DOI link and loses its
+// "open" op like a linkless item does.
 func canonicalDOIURL(doi string) string {
+	if doi == "" || work.HasDotSegment(doi) {
+		return ""
+	}
 	return (&url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}).String()
 }
 

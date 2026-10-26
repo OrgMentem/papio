@@ -1773,3 +1773,29 @@ func TestTruncatedLibraryExportKeepsNoticesAndAcks(t *testing.T) {
 		t.Fatalf("events after restored sweep = %d, want no re-notification of an acknowledged notice", len(notifier.events))
 	}
 }
+
+func TestSnapshotOmitsLinkForDotSegmentDOI(t *testing.T) {
+	ctx := context.Background()
+	jobs := testStore(t)
+	sentinel := New(Options{Store: jobs, DataDir: t.TempDir()})
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	finding := Finding{DOI: "10.1234/../10.5555/x", Nature: NatureRetraction, NoticeDOI: "10.2000/notice", NoticedAt: now}
+	sentinel.mu.Lock()
+	err := sentinel.writeCache(cache{
+		Version: cacheVersion, CheckedAt: now, Notices: map[string]Finding{findingKey(finding): finding},
+	})
+	sentinel.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := sentinel.SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items = %#v, err = %v", items, err)
+	}
+	if len(items[0].Links) != 0 {
+		t.Fatalf("links = %+v, want none for a dot-segment DOI", items[0].Links)
+	}
+	if slices.Contains(items[0].Ops, "open") {
+		t.Fatalf("ops = %+v, want no open op without a link", items[0].Ops)
+	}
+}

@@ -1797,7 +1797,7 @@ func TestListOldestRotatesPastPriorMaintenancePage(t *testing.T) {
 	// tied pair, then wrap to the oldest page.
 	wantPages := [][]string{order[0:2], order[2:4], order[4:5], order[0:2]}
 	for i, want := range wantPages {
-		page, err := js.ListOldest(ctx, []string{StateAwaitingHuman}, pageSize)
+		page, err := js.ListOldest(ctx, "test", []string{StateAwaitingHuman}, pageSize)
 		if err != nil {
 			t.Fatal(err)
 		}

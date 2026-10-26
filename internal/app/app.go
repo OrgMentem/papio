@@ -2767,9 +2767,21 @@ func (s *Service) publisherFirstAdapter(ctx context.Context, row *job.Row) (stri
 // is actually about to be created or repaired. A probe failure fails open,
 // like institutionalRouteExhausted: during a registry outage another handoff
 // is far cheaper than terminating a job that was perfectly fetchable. The
-// registry client memoizes, so the once-a-minute repair sweep over every
-// parked job does not become a request per job per tick.
+// registry client memoizes answers, so the once-a-minute repair sweep over
+// every parked job does not become a request per job per tick. A repair
+// sweep additionally stops probing after the first probe failure in a pass
+// (see handoffGateWithProbe): a black-holed registry must not cost one
+// timeout per DOI-only park.
 func (s *Service) handoffGate(ctx context.Context, w work.Work, resolverName string) (ok bool, reason string, terminal job.TerminalReason) {
+	ok, _, reason, terminal = s.handoffGateWithProbe(ctx, w, resolverName, true)
+	return ok, reason, terminal
+}
+
+// handoffGateWithProbe is handoffGate with a probe budget: when allowProbe is
+// false a DOI-only work is treated as unknown (fail open) without touching
+// the registry. It reports whether the registry probe failed so a caller
+// sweeping many parks can stop probing after the first transport error.
+func (s *Service) handoffGateWithProbe(ctx context.Context, w work.Work, resolverName string, allowProbe bool) (ok bool, probeFailed bool, reason string, terminal job.TerminalReason) {
 	if !w.HasFetchableIdentifier() {
 		// ISBN is deliberately not a fetchable identifier: the institutional
 		// resolver can locate a catalogue or ebook record, but papio cannot
@@ -2781,19 +2793,25 @@ func (s *Service) handoffGate(ctx context.Context, w work.Work, resolverName str
 		// OpenURL destination.
 		if w.ISBN != "" {
 			if base, configured := s.Config.OpenURLBaseFor(resolverName); configured && base != "" {
-				return true, "", ""
+				return true, false, "", ""
 			}
 		}
-		return false, "no_identifier", job.TerminalReasonNoIdentifier
+		return false, false, "no_identifier", job.TerminalReasonNoIdentifier
 	}
 	if s.DOIRegistry == nil || w.DOI == "" || w.PMID != "" || w.ArXiv != "" || w.OpenAlex != "" {
-		return true, "", ""
+		return true, false, "", ""
+	}
+	if !allowProbe {
+		return true, false, "", ""
 	}
 	registered, err := s.DOIRegistry.Registered(ctx, w.DOI)
-	if err != nil || registered {
-		return true, "", ""
+	if err != nil {
+		return true, true, "", ""
 	}
-	return false, "doi_not_registered", job.TerminalReasonDOINotRegistered
+	if registered {
+		return true, false, "", ""
+	}
+	return false, false, "doi_not_registered", job.TerminalReasonDOINotRegistered
 }
 
 // exhaustedCandidates handles the terminal "no direct candidate" boundary —
