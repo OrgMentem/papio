@@ -202,6 +202,79 @@ func doiWork(requestID, doi string) protocol.WorkRequest {
 	}
 }
 
+// scopedConflictCaller answers a scoped submit_once call with a typed
+// conflict naming the live job, the way the daemon answers when the same
+// canonical work is already in flight under another filing intent.
+type scopedConflictCaller struct {
+	baseBatchCaller
+	liveJob string
+}
+
+func (c scopedConflictCaller) Call(ctx context.Context, method string, params, result any) error {
+	if method == "acquire.submit_once_v1" {
+		return &ipc.RemoteError{Code: "conflict", Message: "once-only request conflict: once-only filing intent differs (collection) from live job " + c.liveJob + " for the same work"}
+	}
+	return c.baseBatchCaller.Call(ctx, method, params, result)
+}
+
+// TestScopedSubmitRecordsFilingIntentConflict pins the campaign refusal path:
+// a scoped batch whose work is already in flight under another filing intent
+// records the work as submission_failed with the conflict text naming the
+// live job — not a crash, not a silent join, not a second job — and, because
+// the refusal is a terminal per-work outcome rather than a chunk error,
+// Submit itself reports no error so the campaign chunk is acknowledged.
+func TestScopedSubmitRecordsFilingIntentConflict(t *testing.T) {
+	caller := scopedConflictCaller{liveJob: "job_live_123"}
+	dataDir := t.TempDir()
+	works := []protocol.WorkRequest{doiWork("r1", "10.1000/conflict")}
+	output, err := Submit(context.Background(), caller, dataDir, works, SubmitOptions{IdentityScope: "campaign_x", Label: "campaign_x", Now: time.Now()})
+	if err != nil {
+		t.Fatalf("Submit err = %v; a once-only filing-intent conflict is a recorded outcome, not a chunk error", err)
+	}
+	if output == nil || output.Failed != 1 || len(output.Submitted) != 0 {
+		t.Fatalf("output = %+v, want one visible failure and no submission", output)
+	}
+	manifest, err := Load(dataDir, output.BatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Works) != 1 || manifest.Works[0].Status != "submission_failed" {
+		t.Fatalf("manifest = %+v, want one submission_failed work", manifest.Works)
+	}
+	if !strings.Contains(manifest.Works[0].Error, "job_live_123") {
+		t.Fatalf("manifest error = %q, want it to name the live job", manifest.Works[0].Error)
+	}
+	if manifest.Works[0].JobID != "" {
+		t.Fatalf("manifest work = %+v, want no job recorded for the refusal", manifest.Works[0])
+	}
+}
+
+// plainFailureCaller answers a scoped submit_once call with an ordinary
+// daemon failure, which carries no once-only marker.
+type plainFailureCaller struct {
+	baseBatchCaller
+	msg string
+}
+
+func (c plainFailureCaller) Call(ctx context.Context, method string, params, result any) error {
+	if method == "acquire.submit_once_v1" {
+		return errors.New(c.msg)
+	}
+	return c.baseBatchCaller.Call(ctx, method, params, result)
+}
+
+// TestScopedSubmitKeepsRetryBehaviourForOtherFailures pins the other half of
+// the refusal rule: an ordinary daemon failure is still a chunk error, so a
+// campaign chunk with no acquirable outcome keeps retrying.
+func TestScopedSubmitKeepsRetryBehaviourForOtherFailures(t *testing.T) {
+	caller := plainFailureCaller{msg: "daemon refused the submission"}
+	dataDir := t.TempDir()
+	works := []protocol.WorkRequest{doiWork("r1", "10.1000/refused")}
+	if _, err := Submit(context.Background(), caller, dataDir, works, SubmitOptions{IdentityScope: "campaign_x", Label: "campaign_x", Now: time.Now()}); err == nil {
+		t.Fatal("Submit err = nil for an ordinary daemon refusal; want the chunk error")
+	}
+}
+
 // An unset collection falls back to the batch's label so imported papers are
 // filed under the search that produced them instead of landing loose in the
 // library root; an explicit collection always wins.

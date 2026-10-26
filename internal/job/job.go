@@ -544,7 +544,7 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 		err := tx.QueryRowContext(ctx, `SELECT job_id,fingerprint FROM submission_receipts WHERE request_id=?`, requestID).Scan(&existing, &storedFingerprint)
 		if err == nil {
 			if storedFingerprint != fingerprint {
-				return CreateResult{}, errors.New("once-only request identity or filing intent changed")
+				return CreateResult{}, fmt.Errorf("%w: once-only request identity or filing intent changed", ErrOnceConflict)
 			}
 			return CreateResult{JobID: existing, Existing: true}, tx.Commit()
 		}
@@ -585,7 +585,7 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 					return CreateResult{}, err
 				}
 				if !compatible {
-					return CreateResult{}, errors.New("once-only request conflicts with an existing acquisition policy")
+					return CreateResult{}, fmt.Errorf("%w: once-only request conflicts with existing live job %s", ErrOnceConflict, existing)
 				}
 				return commitOnceReceipt(ctx, tx, requestID, fingerprint, existing, true)
 			}
@@ -597,6 +597,9 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 				return CreateResult{}, err
 			}
 			if once && existing != "" {
+				if err := checkOnceCanonicalWork(ctx, tx, existing, pol, zotioKey, collection); err != nil {
+					return CreateResult{}, err
+				}
 				compatible, err := compatibleOncePolicy(ctx, tx, existing, pol, zotioKey, collection)
 				if err != nil {
 					return CreateResult{}, err

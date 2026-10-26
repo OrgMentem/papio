@@ -779,17 +779,30 @@ func submitFailure(err error) ([]byte, *ipc.RPCError) {
 	if errors.As(err, &invalid) {
 		return badParams(invalid)
 	}
+	if errors.Is(err, job.ErrConflict) || errors.Is(err, job.ErrOnceConflict) {
+		return nil, &ipc.RPCError{Code: "conflict", Message: safeMessage(err, "state conflict")}
+	}
 	return failure(err)
+}
+
+// submitRPCError maps an acquisition submit error onto the caller-facing RPC
+// code shared by submit_v2, submit_v3, and submit_once_v1: an unset access
+// mode is configuration_required, a request the caller got wrong is
+// invalid_argument, and a once-only conflict is conflict. Everything else is
+// the daemon's fault and stays internal.
+func submitRPCError(err error) *ipc.RPCError {
+	var unset *config.ErrAccessModeUnset
+	if errors.As(err, &unset) {
+		return &ipc.RPCError{Code: "configuration_required", Message: unset.Error()}
+	}
+	_, rpcErr := submitFailure(err)
+	return rpcErr
 }
 
 func submitted(ctx context.Context, system *bootstrap.System, request protocol.WorkRequest, options app.SubmitOptions) ([]byte, *ipc.RPCError) {
 	result, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), request, options)
 	if err != nil {
-		var unset *config.ErrAccessModeUnset
-		if errors.As(err, &unset) {
-			return nil, &ipc.RPCError{Code: "configuration_required", Message: unset.Error()}
-		}
-		return submitFailure(err)
+		return nil, submitRPCError(err)
 	}
 	return marshal(SubmitV2Result{JobID: result.JobID, Existing: result.Existing})
 }
@@ -813,11 +826,7 @@ func submit(ctx context.Context, raw json.RawMessage, system *bootstrap.System) 
 	}
 	submitted, err := system.App.SubmitWithOptionsAs(ctx, PrincipalFrom(ctx), request, app.SubmitOptions{AutoImport: autoImport})
 	if err != nil {
-		var unset *config.ErrAccessModeUnset
-		if errors.As(err, &unset) {
-			return nil, &ipc.RPCError{Code: "configuration_required", Message: unset.Error()}
-		}
-		return submitFailure(err)
+		return nil, submitRPCError(err)
 	}
 	return marshal(SubmitResult{JobID: submitted.JobID})
 }

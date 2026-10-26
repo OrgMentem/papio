@@ -22,7 +22,7 @@ func submitOnce(ctx context.Context, raw json.RawMessage, system *bootstrap.Syst
 	}
 	id, err := system.App.SubmitOnceWithAutoImport(ctx, input.Request, input.AutoImport)
 	if err != nil {
-		return failure(err)
+		return nil, submitRPCError(err)
 	}
 	return marshal(map[string]string{"job_id": id})
 }

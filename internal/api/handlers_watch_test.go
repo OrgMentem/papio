@@ -465,3 +465,92 @@ func TestSubmitNamesWhyTheRequestWasRefused(t *testing.T) {
 		t.Fatalf("acquire.submit_v2 = %#v, want invalid_argument naming the unknown resolver", rpcErr)
 	}
 }
+
+// TestSubmitOnceSharesTheSubmitErrorContract pins the submit-once path to the
+// same caller-facing codes as submit_v2: a bad resolver is invalid_argument
+// with the actionable message, and the route stays internal-free.
+func TestSubmitOnceSharesTheSubmitErrorContract(t *testing.T) {
+	router := Router(testSystem(t))
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_api_once_bad_resolver_01",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/submit-once-message"}, Resolver: "instutute",
+	}
+	rpcErr := callMethod(t, router, "acquire.submit_once_v1", map[string]any{"request": request}, nil)
+	if rpcErr == nil || rpcErr.Code != "invalid_argument" || !strings.Contains(rpcErr.Message, `unknown resolver "instutute"`) {
+		t.Fatalf("acquire.submit_once_v1 = %#v, want invalid_argument naming the unknown resolver", rpcErr)
+	}
+}
+
+// TestSubmitOnceReportsRefusalsAsConflicts pins the once-only conflict code:
+// replaying a durable request with changed work is a caller conflict, not a
+// daemon internal, and the message names the clash instead of hiding it.
+func TestSubmitOnceReportsRefusalsAsConflicts(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	first := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_api_once_conflict_01",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/submit-once-conflict"},
+	}
+	var out map[string]string
+	if rpcErr := callMethod(t, router, "acquire.submit_once_v1", map[string]any{"request": first}, &out); rpcErr != nil {
+		t.Fatalf("first submit_once_v1 = %#v", rpcErr)
+	}
+	changed := first
+	changed.Identifiers = &protocol.Identifiers{DOI: "10.1000/submit-once-other"}
+	rpcErr := callMethod(t, router, "acquire.submit_once_v1", map[string]any{"request": changed}, nil)
+	if rpcErr == nil || rpcErr.Code != "conflict" {
+		t.Fatalf("changed replay = %#v, want conflict", rpcErr)
+	}
+	if !strings.Contains(rpcErr.Message, "once-only request conflict") {
+		t.Fatalf("conflict message = %q, want the once-only conflict named", rpcErr.Message)
+	}
+}
+
+// TestSubmitOnceRefusesDuplicateWorkWithDifferentFilingIntent pins the
+// campaign refusal: work already in flight under another filing intent is a
+// visible conflict naming the live job, not a silent join and not a second
+// job. The store holds one live job and no receipt for the refused request.
+func TestSubmitOnceRefusesDuplicateWorkWithDifferentFilingIntent(t *testing.T) {
+	system := testSystem(t)
+	router := Router(system)
+	plain := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_api_once_plain_01",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/submit-once-dup"},
+	}
+	var first SubmitV2Result
+	if rpcErr := callMethod(t, router, "acquire.submit_v2", map[string]any{"request": plain}, &first); rpcErr != nil {
+		t.Fatalf("submit_v2 = %#v", rpcErr)
+	}
+	campaign := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_api_once_campaign_01",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/submit-once-dup"}, Collection: "campaign_x",
+	}
+	rpcErr := callMethod(t, router, "acquire.submit_once_v1", map[string]any{"request": campaign}, nil)
+	if rpcErr == nil || rpcErr.Code != "conflict" {
+		t.Fatalf("campaign once-only = %#v, want conflict", rpcErr)
+	}
+	if !strings.Contains(rpcErr.Message, first.JobID) || !strings.Contains(rpcErr.Message, "filing intent differs") {
+		t.Fatalf("conflict message = %q, want live job %q and the differing intent", rpcErr.Message, first.JobID)
+	}
+	var live int
+	if err := system.Store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM jobs WHERE state NOT IN ('cancelled','failed','ready','imported','unavailable')`).Scan(&live); err != nil || live != 1 {
+		t.Fatalf("live jobs = %d, %v; want one live job, no duplicate", live, err)
+	}
+}
+
+// TestSubmitOnceRequiresAccessMode pins the shared helper's other branch: an
+// unset access mode is configuration_required, not internal, on the once path.
+func TestSubmitOnceRequiresAccessMode(t *testing.T) {
+	system := testSystem(t)
+	system.Config.AccessMode = ""
+	system.App.Config.AccessMode = ""
+	router := Router(system)
+	request := protocol.WorkRequest{
+		SchemaVersion: protocol.WorkRequestSchemaVersion, RequestID: "request_api_once_no_mode_01",
+		Identifiers: &protocol.Identifiers{DOI: "10.1000/submit-once-no-mode"},
+	}
+	rpcErr := callMethod(t, router, "acquire.submit_once_v1", map[string]any{"request": request}, nil)
+	if rpcErr == nil || rpcErr.Code != "configuration_required" {
+		t.Fatalf("acquire.submit_once_v1 without access mode = %#v, want configuration_required", rpcErr)
+	}
+}
