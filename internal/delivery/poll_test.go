@@ -1229,3 +1229,81 @@ func TestPollSuccessWritesFixedWidthTimestamps(t *testing.T) {
 		}
 	}
 }
+
+func TestPoll404BeforeFirstSuccessHasBoundedPropagationRetries(t *testing.T) {
+	for _, recovered := range []bool{false, true} {
+		name := "absent"
+		if recovered {
+			name = "recovered"
+		}
+		t.Run(name, func(t *testing.T) {
+			svc, clock := testServiceClock(t)
+			ctx := context.Background()
+			req := newLiveRequest(t, svc, "404-bounded-"+name, *clock)
+			listing := []illiad.Transaction{}
+			if recovered {
+				listing = append(listing, illiad.Transaction{
+					TransactionNumber: 999, TransactionStatus: illiadStatusAwaitingUnfilled,
+					ItemInfo4: req.IdempotencyKey,
+				})
+			}
+			client := sequencedIlliadServer(t, listing, statusOnly(http.StatusNotFound))
+			deps := PollDeps{Client: client, PatronRef: "patron1", ReferenceField: "ItemInfo4", StatusPollMinutes: 60}
+			var previousDelay time.Duration
+			for attempt := range 3 {
+				result, err := svc.Poll(ctx, req, deps)
+				if err != nil {
+					t.Fatal(err)
+				}
+				delay := result.NextCheckAt.Sub(*clock)
+				if result.Settled || delay <= previousDelay {
+					t.Fatalf("propagation attempt %d: %+v, delay %s must exceed %s", attempt, result, delay, previousDelay)
+				}
+				previousDelay = delay
+				req, err = svc.Get(ctx, req.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				*clock = result.NextCheckAt
+			}
+			result, err := svc.Poll(ctx, req, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err = svc.Get(ctx, req.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered {
+				if req.State != StatePending || req.ProviderReference != "999" || req.LastSuccessfulPollAt == "" {
+					t.Fatalf("reconciled request = %+v, want observed replacement transaction", req)
+				}
+				return
+			}
+			if result.Settled || req.LastPollErrorClass != PollErrorClassNotFoundReconciling {
+				t.Fatalf("missing request = %+v, want one delayed reconciliation check", req)
+			}
+			*clock = result.NextCheckAt
+			result, err = svc.Poll(ctx, req, deps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err = svc.Get(ctx, req.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Settled || req.State != StateUnknownOutcome || req.NextCheckAt != "" {
+				t.Fatalf("missing request = %+v, result = %+v; want settled unknown_outcome without another poll", req, result)
+			}
+			var settlements int
+			if err := svc.store.DB().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = ?`,
+				req.JobID, eventKindPollSettled).Scan(&settlements); err != nil {
+				t.Fatal(err)
+			}
+			if settlements != 1 {
+				t.Fatalf("settlement events = %d, want one operator-visible outcome", settlements)
+			}
+		})
+	}
+}

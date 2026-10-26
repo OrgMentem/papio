@@ -3961,3 +3961,143 @@ func TestOfferedDeliveryRecoveryHoldForHumanIsIdempotentAndReopensMissingPrompt(
 		}
 	})
 }
+
+func TestDeliveryRecoveryOrphansRequestsAfterCancellationCrash(t *testing.T) {
+	for _, dismiss := range []bool{false, true} {
+		for _, state := range []delivery.State{delivery.StateSubmitted, delivery.StatePending, delivery.StateOffered} {
+			t.Run(fmt.Sprintf("dismiss=%t/state=%s", dismiss, state), func(t *testing.T) {
+				svc, jobs, deliverySvc := newDeliveryTestService(t)
+				ctx := context.Background()
+				id, err := svc.Submit(ctx, deliveryWorkRequest("wr_orphan_crash", "10.1000/orphan-crash"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+					t.Fatal(err)
+				}
+				req, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+					JobID: id, InstitutionProfile: "default", Provider: "illiad",
+					RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/orphan-crash",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state == delivery.StateOffered {
+					if won, err := deliverySvc.ReserveSubmissionAttempt(ctx, req.ID); err != nil || !won {
+						t.Fatalf("reserve = %v, %v", won, err)
+					}
+				} else if err := deliverySvc.UpdateState(ctx, req.ID, state); err != nil {
+					t.Fatal(err)
+				}
+				// Commit only the job-store mutation, as a crash before the
+				// app's separate orphan compensation would leave it.
+				if dismiss {
+					if _, err := jobs.OpenHumanAction(ctx, id, job.ActionKindDocumentDelivery,
+						"reconcile delivery", job.Access(false, "")); err != nil {
+						t.Fatal(err)
+					}
+					if err := jobs.Transition(ctx, id, job.StateResolving, job.StateAwaitingHuman, nil); err != nil {
+						t.Fatal(err)
+					}
+					actions, err := jobs.ListHumanActions(ctx, true)
+					if err != nil || len(actions) != 1 {
+						t.Fatalf("actions = %+v, %v", actions, err)
+					}
+					if _, err := jobs.DismissHumanAction(ctx, actions[0].ID, actions[0].Revision); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := jobs.Cancel(ctx, id, job.TerminalReasonUserDismissed); err != nil {
+					t.Fatal(err)
+				}
+				fresh := New(svc.Config, &job.Store{S: jobs.S}, svc.Artifacts, nil)
+				fresh.Delivery = delivery.New(jobs.S, &fresh.Config, nil)
+				for range 2 {
+					if err := fresh.OfferedDeliveryRecovery().RunDue(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				got, err := fresh.Delivery.Get(ctx, req.ID)
+				if err != nil || got == nil || got.State != delivery.StateUnknownOutcome {
+					t.Fatalf("recovered request = %+v, %v; want unknown_outcome", got, err)
+				}
+				var events int
+				if err := jobs.S.DB().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'delivery.orphaned'`, id).Scan(&events); err != nil {
+					t.Fatal(err)
+				}
+				if events != 1 {
+					t.Fatalf("orphan events = %d, want exactly one after repeated recovery", events)
+				}
+			})
+		}
+	}
+}
+
+func TestConcurrentDeliverySubmissionReservesOnlyOneProviderPost(t *testing.T) {
+	var posts atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if posts.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		_, _ = w.Write([]byte(`{"TransactionNumber": 8802, "TransactionStatus": "Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+	defer close(release)
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_exclusive_submit", "10.1000/exclusive-submit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, nil); err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := deliverySvc.ResolveGateProfileFor(ctx, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", profile.Digest())
+	dd := svc.Config.Browser.DocumentDelivery
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := svc.submitToProvider(ctx, row, job.StateResolving, dd, req.IdempotencyKey, profile, req)
+		firstDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("first submission did not reach the provider")
+	}
+	// Both callers already passed the pre-send classification check. Hold
+	// the first POST open while the second tries the same durable gate.
+	if _, err := svc.submitToProvider(ctx, row, job.StateResolving, dd, req.IdempotencyKey, profile, req); err != nil {
+		t.Fatal(err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("provider POSTs = %d, want exactly one", posts.Load())
+	}
+	current, err := jobs.Get(ctx, id)
+	if err != nil || current.State != job.StateResolving {
+		t.Fatalf("owner during POST = %+v, %v; losing caller must preserve resolving", current, err)
+	}
+	release <- struct{}{}
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	stored, err := deliverySvc.Get(ctx, req.ID)
+	if err != nil || stored.State != delivery.StateSubmitted || stored.ProviderReference != "8802" {
+		t.Fatalf("submitted request = %+v, %v; want one durable provider reference", stored, err)
+	}
+	current, err = jobs.Get(ctx, id)
+	if err != nil || current.State != job.StateRetryWait {
+		t.Fatalf("job after POST = %+v, %v; want polling retry_wait", current, err)
+	}
+}

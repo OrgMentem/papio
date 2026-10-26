@@ -646,6 +646,7 @@ func TestOrphanIfLiveMarksSubmittedRowUnknownOutcome(t *testing.T) {
 	svc := testService(t, time.Now())
 	ctx := context.Background()
 	testJob(t, svc, "job_live")
+	setJobState(t, svc, "job_live", "cancelled")
 
 	req, err := svc.Create(ctx, CreateRequest{
 		JobID: "job_live", InstitutionProfile: "campus", Provider: "illiad",
@@ -760,6 +761,7 @@ func TestOrphanIfLiveDoesNotClobberTerminalOutcome(t *testing.T) {
 
 	// Race: submitted -> fulfilled between read and CAS.
 	testJob(t, svc, "job_race_fulfilled")
+	setJobState(t, svc, "job_race_fulfilled", "cancelled")
 	req, err := svc.Create(ctx, CreateRequest{
 		JobID: "job_race_fulfilled", InstitutionProfile: "campus", Provider: "illiad",
 		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/race-fulfilled",
@@ -798,6 +800,7 @@ func TestOrphanIfLiveDoesNotClobberTerminalOutcome(t *testing.T) {
 
 	// Race: pending -> declined between read and CAS.
 	testJob(t, svc, "job_race_declined")
+	setJobState(t, svc, "job_race_declined", "cancelled")
 	req2, err := svc.Create(ctx, CreateRequest{
 		JobID: "job_race_declined", InstitutionProfile: "campus", Provider: "illiad",
 		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/race-declined",
@@ -835,6 +838,7 @@ func TestOrphanIfLiveDoesNotClobberTerminalOutcome(t *testing.T) {
 
 	// Normal path unchanged: genuinely live rows are still orphaned exactly once.
 	testJob(t, svc, "job_race_normal")
+	setJobState(t, svc, "job_race_normal", "cancelled")
 	req3, err := svc.Create(ctx, CreateRequest{
 		JobID: "job_race_normal", InstitutionProfile: "campus", Provider: "illiad",
 		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1/race-normal",
@@ -1018,6 +1022,7 @@ func TestResumeLosesToConcurrentOrphan(t *testing.T) {
 			return nil
 		}
 		orphaned = true
+		setJobState(t, svc, "job_resume_race", "cancelled")
 		return svc.OrphanIfLive(ctx, "job_resume_race", "job cancelled")
 	}
 
