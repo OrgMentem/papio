@@ -451,8 +451,9 @@ quiet for screen readers.
 
 ### Desktop capability and acknowledgement
 
-Desktop notifications are daemon-owned and best-effort. The supported sender
-is macOS-only today; other platforms report the capability as unavailable
+Desktop notifications are daemon-owned and best-effort. The supported senders are
+macOS (osascript), Linux (notify-send or gdbus), and Windows (PowerShell toast);
+a platform whose helper binary is missing reports the capability as unavailable
 instead of pretending that a notification was shown. The operating system
 does not provide *papio* with a delivery or visibility acknowledgement, so
 the Activity audit language says **attempted**, never **delivered**. A desktop
@@ -460,7 +461,7 @@ notification is never the only record of an outcome: use the inbox, Activity,
 or the corresponding CLI command to recover it.
 
 When an inbox row says **manual download**, open the provider's PDF in the
-ordinary browser and use the popup's **Send PDF to papio** action. The activity
+ordinary browser and use the popup's **Send this PDF to papio** action. The activity
 panel then makes the download and adoption steps visible while validation runs.
 If you already have the PDF as a file, use `papio jobs supply-pdf` instead (see
 [Supply a PDF you already have](#supply-a-pdf-you-already-have)).
@@ -779,7 +780,7 @@ covers Windows sign-in sessions and the Firefox download rules.
 ### Send a PDF already open in the browser
 
 If a handoff or a provider page has reached a PDF, open the popup and choose
-**Send PDF to papio**. The popup recognizes a direct PDF URL and the built-in
+**Send this PDF to papio**. The popup recognizes a direct PDF URL and the built-in
 Chrome or Firefox PDF viewer, then queues the DOI or associates the current tab
 with its existing job. The extension starts a browser-managed download named
 `papio/<job-id>/paper.pdf`. That name is *relative*: Chrome's download
@@ -788,8 +789,8 @@ so the file lands at `<your browser download folder>/papio/<job-id>/`. The
 daemon's adoption root is the matching `papio` folder — by default
 `<your download folder>/papio`, which `papio init` creates for you — and it
 adopts the file from that job-scoped location, running the same validation
-used for a directly fetched PDF. The popup reports **Sending PDF to papio**
-and then **papio adopted (validating)**; the inbox and `papio activity` show
+used for a directly fetched PDF. The popup reports **Sending PDF to papio…**
+and then **papio adopted PDF (validating)**; the inbox and `papio activity` show
 the later outcome.
 
 You only need `download_adoption_root` if your browser downloads somewhere
@@ -803,13 +804,13 @@ The download path is deliberate: do not rename a file into another job's
 directory. If validation rejects the PDF, the job remains actionable so you can
 provide a different file. If the current tab is only a DOI or provider landing
 page, use the header's **+** (**Acquire this page**) or the browser handoff
-first; **Send PDF to papio** is for a PDF page.
+first; **Send this PDF to papio** is for a PDF page.
 
 Firefox does not expose Chrome's `downloads.onDeterminingFilename` hook. The
-popup's direct **Send PDF to papio** download still uses its job-scoped
+popup's direct **Send this PDF to papio** download still uses its job-scoped
 filename, but a provider button that starts its own click download cannot be
 rerouted automatically and remains human-assisted. When that happens, wait
-until the PDF is open and use **Send PDF to papio** rather than assuming an
+until the PDF is open and use **Send this PDF to papio** rather than assuming an
 unrelated file in `Downloads` will be adopted.
 
 ### Supply a PDF you already have
@@ -825,7 +826,7 @@ The command refuses a directory, a symbolic link, a file that does not begin
 with `%PDF-`, and a file larger than `[fetch] max_bytes`. It copies the file
 into `<data_dir>/supplied/<job-id>/`, and the daemon reads the copy only from
 there. Your original file does not change. The daemon then runs the same
-checks as **Send PDF to papio**: the PDF must be readable, and it must be the
+checks as **Send this PDF to papio**: the PDF must be readable, and it must be the
 paper that the job asked for. A PDF of a different paper never becomes ready.
 
 The command prints the job, the outcome, the job state, and the SHA-256 of the
@@ -1161,8 +1162,8 @@ papio stats producers --since 168h    # the last 7 days
 papio stats producers --since 2026-09-01T00:00:00Z --until 2026-10-01T00:00:00Z
 ```
 
-`--since` takes an RFC 3339 time or a Go duration in hours, minutes, or
-seconds, such as `168h` (a value like `7d` is not accepted). `--until` takes an
+`--since` takes an RFC 3339 time, a Go duration such as `168h`, or a whole
+number of days such as `7d`. `--until` takes an
 RFC 3339 time and defaults to now. Add `--json` for the full breakdown, which
 also counts who opened each handoff.
 

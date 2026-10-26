@@ -286,7 +286,9 @@ one canary-readiness flag are written transactionally with the decisive
 transition, while diagnosis v2 adds detail without changing diagnosis v1.
 Automatic first-route behavior requires exact provider/profile/route readiness;
 source-gate bypass requires its own canary; and effect concurrency four waits
-for broad-at-one evidence. Phase −1 is complete and Phase 0 is current.
+for broad-at-one evidence. Phases 0 through 3 are complete and Phase 4 is
+current: automatic first-route, source-gate bypass, and effect concurrency
+greater than one remain disabled.
 
 **Why:** This preserves ADR-0003's holder boundary, ADR-0013's browser-local
 facts, ADR-0016's daemon-side institutional routing, ADR-0018's fresh-evidence
@@ -397,8 +399,10 @@ transport with keep-alives disabled, pinned ALPN, and no automatic redirect
 following, so one admission cannot become several physical requests; each redirect
 hop re-enters the authority under a re-derived identity and carries alias evidence
 so a provider entity merge verifies instead of being rejected. Identity is read
-from the outgoing request and the credential travels as an `Authorization` bearer
-token rather than a query parameter. The fuse is a stop rather than a ledger: one
+from the outgoing request; the acquisition resolver sends the credential as an
+`Authorization` bearer token rather than a query parameter, while search,
+watches, and metadata enrichment still carry `api_key` as a query parameter.
+The fuse is a stop rather than a ledger: one
 source-wide `credits_committed` counter per UTC day, charged at a conservative
 shape cost, never refunded in-window, atomic across first-write and update, with
 availability as the safe failure mode. Its ceiling is a fraction of the
