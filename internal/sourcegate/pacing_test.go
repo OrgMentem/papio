@@ -7,8 +7,12 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
+	"papio/internal/budget"
 	"papio/internal/config"
+	"papio/internal/store"
+	"papio/internal/store/storetest"
 )
 
 // pacingReserver records the full admission tuple, because the pacing client's
@@ -58,11 +62,12 @@ func TestPacingOnlyRefusesIncompleteWiring(t *testing.T) {
 	}
 }
 
-// The pacing client is identity-agnostic on purpose: OpenAlex discovery derives
-// its admission identity at the wire. A construction-time api_key surviving
-// into the pacing config would attribute one caller's paced egress to another
-// caller's key, so the constructor must strip it while keeping the rate knobs.
-func TestPacingOnlyStripsPolicyAPIKey(t *testing.T) {
+// Discovery always presents the configured key (it has no anonymous fallback),
+// and CommitEgress enforces the wire identity again. Pacing must therefore
+// admit under that same keyed identity: stripping it admitted keyed discovery
+// under "anonymous", so an anonymous gate refused keyed requests for up to a
+// day while the key stayed healthy.
+func TestPacingOnlyPreservesPolicyAPIKey(t *testing.T) {
 	reserve := &pacingReserver{}
 	policy := config.Source{Enabled: true, APIKey: "private-key", RatePerSec: 4, Burst: 7}
 	inner := &recordingHTTP{}
@@ -81,8 +86,8 @@ func TestPacingOnlyStripsPolicyAPIKey(t *testing.T) {
 		t.Fatalf("reservations = %d, want 1", len(reserve.policies))
 	}
 	got := reserve.policies[0]
-	if got.APIKey != "" {
-		t.Fatalf("reserved policy APIKey = %q, want it stripped", got.APIKey)
+	if got.APIKey != "private-key" {
+		t.Fatalf("reserved policy APIKey = %q, want the configured key so anonymous gates do not bind keyed discovery", got.APIKey)
 	}
 	if got.RatePerSec != policy.RatePerSec || got.Burst != policy.Burst || !got.Enabled {
 		t.Fatalf("reserved policy = %+v, want rate %v burst %d enabled", got, policy.RatePerSec, policy.Burst)
@@ -94,10 +99,7 @@ func TestPacingOnlyStripsPolicyAPIKey(t *testing.T) {
 		t.Fatalf("reserved cost = %v, want 2.5", reserve.costs[0])
 	}
 
-	// The forwarded request must keep its credential: stripping is scoped to
-	// the admission policy, never to the wire. Asserting on `policy` instead
-	// would prove nothing, since NewPacingOnly takes it BY VALUE and cannot
-	// mutate the caller's copy whatever it does to the request.
+	// The forwarded request must keep its credential.
 	if inner.calls != 1 || inner.last == nil {
 		t.Fatalf("inner calls = %d, last = %v, want exactly one forwarded request", inner.calls, inner.last)
 	}
@@ -131,5 +133,44 @@ func TestPacingRefusalProducesZeroInnerRequests(t *testing.T) {
 	}
 	if len(reserve.sources) != 1 {
 		t.Fatalf("reservations = %d, want 1", len(reserve.sources))
+	}
+}
+
+// A long anonymous gate must not refuse keyed discovery. Pacing under the
+// anonymous identity bound the keyless fallback's deferral to every OpenAlex
+// discovery search, even though the requests carry the healthy key and the
+// real keyed identity is enforced again at the wire by CommitEgress.
+func TestKeyedDiscoverySurvivesAnonymousGate(t *testing.T) {
+	s, err := store.Open(context.Background(), storetest.DataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	m := budget.New(s, budget.WithCreditPolicy(func(string) budget.CreditPolicy {
+		return budget.CreditPolicy{DailyCreditFraction: 0.5, DailyCreditLimit: 10_000}
+	}))
+	ctx := context.Background()
+	keyed := config.Source{Enabled: true, APIKey: "private-key"}
+	anon := config.Source{Enabled: true}
+	inner := &recordingHTTP{}
+	stack, err := WrapOpenAlex(m, m, config.SourceOpenAlex, keyed, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gated, err := NewPacingOnly(m, config.SourceOpenAlex, keyed, 0, stack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Defer(ctx, budget.QuotaSourceName(config.SourceOpenAlex), anon, time.Now().UTC().Add(20*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	req := request(t, "https://api.openalex.org/works/W1?api_key=private-key")
+	resp, err := gated.Do(req)
+	if err != nil {
+		t.Fatalf("keyed discovery behind an anonymous gate = %v, want the request sent", err)
+	}
+	_ = resp.Body.Close()
+	if inner.calls != 1 {
+		t.Fatalf("inner calls = %d, want 1 keyed request reaching the wire", inner.calls)
 	}
 }

@@ -257,13 +257,40 @@ func (o *Observer) observe(req *http.Request, resp *http.Response) {
 }
 
 // observeCreditSignals records fuse inputs from the provider. Permission-reducing
-// observations (prepaid draw-down, which closes egress stickily inside
-// budget.ObservePrepaidRemaining) latch process-local closure before durable
-// writes; informational observations (denominator capture, credits-used seed)
-// log persistence failures and leave egress permission unchanged.
+// observations (pricing drift via DriftClose, prepaid draw-down inside
+// budget.ObservePrepaidRemaining) run before informational ones (denominator
+// capture, credits-used seed) and never share their blocking writes: a slow
+// informational write must not hold the deadline of the step that stops
+// spending. DriftClose gets its own timeout and latches process-local closure
+// before its durable write; informational observations log persistence
+// failures and leave egress permission unchanged.
 func (o *Observer) observeCreditSignals(req *http.Request, identity string, h openAlexRateLimit) {
 	if o.credit == nil {
 		return
+	}
+	// ADR-0024 §8: the provider reports the cost of this request. When it
+	// exceeds the shape cost GuardedClient committed, the pricing schedule
+	// drifted and every further request undercharges. Close egress durably
+	// until an operator acknowledges a new schedule. Pricing is a property
+	// of the operation, so the closure is source-wide, never per identity.
+	// This runs first, on its own timeout, so a stalled informational write
+	// can neither delay nor starve the permission-reducing step.
+	if h.creditsUsedOK && h.creditsUsed >= 0 {
+		if committed := OpenAlexCreditCost(req); h.creditsUsed > committed {
+			if closer, ok := o.credit.(interface {
+				DriftClose(context.Context, string, string) error
+			}); ok {
+				reason := fmt.Sprintf("observed credits-used %d exceeds committed shape cost %d", h.creditsUsed, committed)
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), quotaDeferTimeout)
+				err := closer.DriftClose(ctx, o.source, reason)
+				cancel()
+				if err != nil {
+					log.Printf("papio: %s could not record pricing drift (%s): %v", o.source, reason, err)
+				} else {
+					log.Printf("papio: %s pricing drift (%s); egress closed until acknowledged", o.source, reason)
+				}
+			}
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), quotaDeferTimeout)
 	defer cancel()

@@ -245,6 +245,126 @@ func TestFailedStartupRebuildCountsNothingTwice(t *testing.T) {
 	}
 }
 
+// A live fetch observation during a failed startup rebuild must not
+// double-count when the rebuild later succeeds. The live row is already
+// committed (FinishAttempt before observeFetchAttempt, the production order),
+// so the next clean rebuild reads it; folding it live too counts one wall
+// twice and suppresses a host that never earned it.
+func TestFailedStartupRebuildWithLiveObservationCountsOnce(t *testing.T) {
+	h := newSuppressionHarness(t)
+	cfg := config.DefaultHostSuppression()
+	cfg.MinWallSpanHours = 0
+	h.svc.EnableHostSuppression(cfg)
+	h.seedWalls(walledHost, 1)
+	scans := 0
+	realScan := scanSuppressionRow
+	scanSuppressionRow = func(rows *sql.Rows, dest ...any) error {
+		scans++
+		if scans == 1 {
+			return errors.New("injected scan failure")
+		}
+		return realScan(rows, dest...)
+	}
+	t.Cleanup(func() { scanSuppressionRow = realScan })
+	if h.svc.hostSuppression(context.Background()) == nil {
+		t.Fatal("tracker is nil")
+	}
+	if scans != 1 {
+		t.Fatalf("first rebuild scanned %d rows, want the injected failure on the first", scans)
+	}
+	// Production order for a fetch that completes during the outage: commit
+	// the row, then fold it. The rebuild already failed, so the fold must
+	// wait for the retry rather than counting immediately.
+	detail := "*fetch.Error(http-403) host=" + walledHost + " final=" + walledHost
+	h.seed("invalid", detail, h.now.Add(-time.Minute))
+	var committed int64
+	if err := h.jobs.S.DB().QueryRow(`SELECT MAX(id) FROM attempts`).Scan(&committed); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.observeFetchAttempt(context.Background(), committed, "invalid", detail)
+	h.fetchWith(map[string]int{walledHost: http.StatusForbidden})
+	h.run("wr_rebuild_live_once", h.candidate("https://"+walledHost+"/p.pdf", resolver.AccessLicensedAPI))
+	if len(h.fetched) != 1 {
+		t.Fatalf("after a failed rebuild, one live wall, and a clean rebuild of two rows: fetched %v, want a normal fetch (two walls, not three)", h.fetched)
+	}
+}
+
+// A rebuild that lands between FinishAttempt and observeFetchAttempt must not
+// double-count: the committed row is counted by the rebuild under the same
+// mutex that guards the counted set, so the live fold for that attempt id is
+// the same row and is skipped. Two walls stay two walls however the calls
+// interleave; without the set the loaded flag alone folds it again and
+// the host suppresses on three.
+func TestRebuildBetweenFinishAndObserveCountsOnce(t *testing.T) {
+	h := newSuppressionHarness(t)
+	cfg := config.DefaultHostSuppression()
+	cfg.MinWallSpanHours = 0
+	h.svc.EnableHostSuppression(cfg)
+	h.seedWalls(walledHost, 1)
+	detail := "*fetch.Error(http-403) host=" + walledHost + " final=" + walledHost
+	// Stands in for FinishAttempt: commit the second wall.
+	h.seed("invalid", detail, h.now.Add(-time.Minute))
+	var committed int64
+	if err := h.jobs.S.DB().QueryRow(`SELECT MAX(id) FROM attempts`).Scan(&committed); err != nil {
+		t.Fatal(err)
+	}
+	// Another worker's rebuild lands here, between the commit and the fold.
+	if h.svc.hostSuppression(context.Background()) == nil {
+		t.Fatal("tracker is nil")
+	}
+	h.svc.observeFetchAttempt(context.Background(), committed, "invalid", detail)
+	h.fetchWith(map[string]int{walledHost: http.StatusForbidden})
+	h.run("wr_rebuild_race_once", h.candidate("https://"+walledHost+"/p.pdf", resolver.AccessLicensedAPI))
+	if len(h.fetched) != 1 {
+		t.Fatalf("after a rebuild between commit and fold of two rows: fetched %v, want a normal fetch (two walls, not three)", h.fetched)
+	}
+}
+
+// Attempts FINISH out of order: 10 starts before 11 while 11 finishes first.
+// A maximum-id watermark at 11 would silently drop 10 when it finishes later.
+// The counted set keeps the actual ids, so each row counts exactly once: 11
+// is skipped live (the rebuild counted it) and 10 is folded live (nothing
+// counted it). The threshold is 2 so a dropped wall fetches (one wall, not
+// two) while the correct two suppress.
+func TestOutOfOrderFinishesCountExactlyOnce(t *testing.T) {
+	h := newSuppressionHarness(t)
+	cfg := config.DefaultHostSuppression()
+	cfg.MinWallSpanHours = 0
+	cfg.FailureThreshold = 2
+	h.svc.EnableHostSuppression(cfg)
+	ctx := context.Background()
+	detail := "*fetch.Error(http-403) host=" + walledHost + " final=" + walledHost
+	first, err := h.jobs.StartAttempt(ctx, "job_seed", 0, "fetch", "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.jobs.StartAttempt(ctx, "job_seed", 0, "fetch", "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second <= first {
+		t.Fatalf("attempt ids out of order: first=%d second=%d", first, second)
+	}
+	// 11 finishes first, then a rebuild counts it before its live fold.
+	if err := h.jobs.FinishAttempt(ctx, second, "invalid", http.StatusForbidden, detail); err != nil {
+		t.Fatal(err)
+	}
+	if h.svc.hostSuppression(ctx) == nil {
+		t.Fatal("tracker is nil")
+	}
+	h.svc.observeFetchAttempt(ctx, second, "invalid", detail)
+	// 10 finishes later; nothing counted it, so the live fold must count it.
+	if err := h.jobs.FinishAttempt(ctx, first, "invalid", http.StatusForbidden, detail); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.observeFetchAttempt(ctx, first, "invalid", detail)
+	h.fetchWith(map[string]int{walledHost: http.StatusForbidden})
+	h.run("wr_out_of_order_once", h.candidate("https://"+walledHost+"/p.pdf", resolver.AccessLicensedAPI))
+	if len(h.fetched) != 0 {
+		t.Fatalf("after out-of-order finishes of two walls: fetched %v, want no request (two walls suppress at threshold 2)", h.fetched)
+	}
+}
+
 // A redirect into a host inside its 429 backoff is deferred on the hop, not
 // sent: the job waits out the cooldown and nothing is recorded as a wall.
 func TestRedirectIntoARateLimitedHostWaitsOutTheBackoff(t *testing.T) {

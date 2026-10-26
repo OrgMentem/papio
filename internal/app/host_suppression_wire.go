@@ -29,9 +29,13 @@ import (
 func (s *Service) EnableHostSuppression(cfg config.HostSuppression) {
 	if !cfg.Enabled {
 		s.suppression = nil
+		s.suppressionLoaded = false
+		s.suppressionCounted = nil
 		return
 	}
 	s.suppression = hostsuppress.New(cfg)
+	s.suppressionLoaded = false
+	s.suppressionCounted = nil
 }
 
 // scanSuppressionRow reads one startup-rebuild row. It is a variable only so
@@ -42,8 +46,13 @@ var scanSuppressionRow = func(rows *sql.Rows, dest ...any) error { return rows.S
 // hostSuppression returns the live tracker, running the bounded startup
 // rebuild once (R6): one query over fetch-stage rows inside the window, fed
 // through the same Observe path live attempts use. Unknown-kind legacy rows
-// never count. A failed rebuild leaves the tracker empty (suppresses
-// nothing, the safe direction) and is retried on the next pass.
+// never count. A failed rebuild leaves the tracker empty and live attempts
+// unfolded (both suppress nothing, the safe direction); the next pass retries
+// rebuild, which then counts every committed row exactly once. The rebuild
+// records the SET of finished attempt ids it counted; a live fold for an id
+// in that set is the same committed row and is skipped. Ids, not a maximum,
+// are tracked because attempts FINISH out of order: 10 can start before 11
+// while 11 finishes first, and a watermark at 11 would drop 10 silently.
 func (s *Service) hostSuppression(ctx context.Context) *hostsuppress.Tracker {
 	t := s.suppression
 	if t == nil {
@@ -51,16 +60,28 @@ func (s *Service) hostSuppression(ctx context.Context) *hostsuppress.Tracker {
 	}
 	s.suppressionMu.Lock()
 	defer s.suppressionMu.Unlock()
-	if s.suppressionLoaded {
-		return t
+	s.rebuildSuppressionLocked(ctx)
+	return t
+}
+
+// rebuildSuppressionLocked runs the one-time startup rebuild. The caller must
+// hold suppressionMu, which it does across the query as before, so a live
+// fold under the same mutex cannot interleave between the read and the set
+// write. The set stays bounded: one entry per finished fetch attempt inside
+// the rebuild window, shrinking as live folds consume their own ids, and the
+// rebuild never runs again.
+func (s *Service) rebuildSuppressionLocked(ctx context.Context) {
+	t := s.suppression
+	if t == nil || s.suppressionLoaded {
+		return
 	}
 	since := s.Now().UTC().Add(-t.Window())
 	rows, err := s.Jobs.S.DB().QueryContext(ctx,
-		`SELECT COALESCE(outcome,''), COALESCE(detail,''), ended_at FROM attempts
+		`SELECT id, COALESCE(outcome,''), COALESCE(detail,''), ended_at FROM attempts
 		  WHERE stage = 'fetch' AND ended_at IS NOT NULL AND ended_at >= ?
 		  ORDER BY ended_at ASC, id ASC`, store.FormatTime(since))
 	if err != nil {
-		return t
+		return
 	}
 	// Collect the whole window before observing any of it. A scan or
 	// iteration error part-way through must leave the tracker untouched:
@@ -68,34 +89,63 @@ func (s *Service) hostSuppression(ctx context.Context) *hostsuppress.Tracker {
 	// folded in would then count twice, so duplicated historical 403s could
 	// suppress a host that never earned it.
 	var history []hostsuppress.Row
+	var ids []int64
 	for rows.Next() {
+		var id int64
 		var outcome, detail, ended string
-		if err := scanSuppressionRow(rows, &outcome, &detail, &ended); err != nil {
+		if err := scanSuppressionRow(rows, &id, &outcome, &detail, &ended); err != nil {
 			_ = rows.Close()
-			return t
+			return
 		}
 		at, err := time.Parse(time.RFC3339Nano, ended)
 		if err != nil {
 			continue
 		}
 		history = append(history, hostsuppress.Row{Outcome: outcome, Detail: detail, At: at.UTC()})
+		ids = append(ids, id)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return t
+		return
 	}
 	for _, row := range history {
 		t.Observe(row)
 	}
+	counted := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		counted[id] = struct{}{}
+	}
+	s.suppressionCounted = counted
 	s.suppressionLoaded = true
-	return t
 }
 
 // observeFetchAttempt folds a just-recorded fetch attempt into the live
-// rule, from the same outcome and detail the store now holds.
-func (s *Service) observeFetchAttempt(ctx context.Context, outcome, detail string) {
-	if t := s.hostSuppression(ctx); t != nil {
-		t.Observe(hostsuppress.Row{Outcome: outcome, Detail: detail, At: s.Now().UTC()})
+// rule, from the same outcome and detail the store now holds. attemptID is
+// the FinishAttempt row the call just committed, in production order. The
+// check and the fold hold suppressionMu with the rebuild, so a rebuild that
+// counted the row between the commit and this call recorded the id first and
+// the fold is skipped: one committed row counts once. While the rebuild
+// has not loaded, nothing is folded live; the committed row is already
+// visible to the next successful rebuild.
+func (s *Service) observeFetchAttempt(ctx context.Context, attemptID int64, outcome, detail string) {
+	t := s.suppression
+	if t == nil {
+		return
 	}
+	s.suppressionMu.Lock()
+	defer s.suppressionMu.Unlock()
+	if !s.suppressionLoaded {
+		s.rebuildSuppressionLocked(ctx)
+		if !s.suppressionLoaded {
+			return
+		}
+	}
+	if attemptID != 0 {
+		if _, dup := s.suppressionCounted[attemptID]; dup {
+			delete(s.suppressionCounted, attemptID)
+			return
+		}
+	}
+	t.Observe(hostsuppress.Row{Outcome: outcome, Detail: detail, At: s.Now().UTC()})
 }
 
 // probePass is one fetch attempt's probe state, carried into the

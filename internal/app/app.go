@@ -196,10 +196,14 @@ type Service struct {
 	// suppression is the host-aware daemon fetch suppression rule
 	// (ADR-0031). Nil disables it: fetchCandidates fetches everything.
 	// EnableHostSuppression wires it; suppressionMu guards the one-time
-	// startup rebuild (suppressionLoaded).
-	suppression       *hostsuppress.Tracker
-	suppressionMu     sync.Mutex
-	suppressionLoaded bool
+	// startup rebuild (suppressionLoaded) and the SET of finished attempt
+	// ids it counted (suppressionCounted). A live fold for an id in that set
+	// is the same committed row and is skipped, so each row counts once even
+	// when attempts finish out of order.
+	suppression        *hostsuppress.Tracker
+	suppressionMu      sync.Mutex
+	suppressionLoaded  bool
+	suppressionCounted map[int64]struct{}
 }
 
 func (s *Service) sourcePolicy(name string) config.Source {
@@ -2185,7 +2189,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			if err := s.Jobs.FinishAttempt(ctx, attempt, class, status, detail); err != nil {
 				return err
 			}
-			s.observeFetchAttempt(ctx, class, detail)
+			s.observeFetchAttempt(ctx, attempt, class, detail)
 			s.observeRateLimit(ctx, err)
 			if oaBrowserURL == "" && isOABrowserBlocked(candidate, err) {
 				oaBrowserURL = candidate.URL
@@ -2237,7 +2241,7 @@ func (s *Service) fetchCandidates(ctx context.Context, row *job.Row, live map[st
 			_ = os.Remove(result.TempPath)
 			return err
 		}
-		s.observeFetchAttempt(ctx, "success", successDetail)
+		s.observeFetchAttempt(ctx, attempt, "success", successDetail)
 		if err := s.Jobs.Transition(ctx, row.ID, job.StateFetching, job.StateValidating,
 			map[string]any{"candidate_id": stored.ID, "source": stored.Source}, job.WithCandidate(stored.ID)); err != nil {
 			_ = os.Remove(result.TempPath)

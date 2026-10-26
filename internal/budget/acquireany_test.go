@@ -214,18 +214,38 @@ func TestAcquireAnyFallsBackWhenTheFloorLandsAfterItsPreCheck(t *testing.T) {
 	keyed, anon := keyedAndAnon()
 	ctx := context.Background()
 
-	// Gate the keyed identity's quota row. AcquireAny's pre-check sees it too,
-	// so to isolate the Acquire-side path the test asserts the observable
-	// outcome both share: the keyless identity is admitted, not parked.
-	if err := m.Defer(ctx, QuotaSourceName("openalex"), keyed, time.Now().UTC().Add(6*time.Hour)); err != nil {
-		t.Fatal(err)
+	// The floor lands between AcquireAny's pre-check and its Acquire attempt:
+	// the hook commits it after quotaGate passes, so only the post-pre-check
+	// arm (budget.go AcquireAny) can keep the fallback alive. Deleting that
+	// arm parks the job with the keyless tier untouched.
+	acquireAnyAfterPreCheck = func(ctx context.Context, source string, policy config.Source) {
+		if policy.APIKey == keyed.APIKey {
+			_ = m.Defer(ctx, QuotaSourceName(source), policy, time.Now().UTC().Add(6*time.Hour))
+		}
 	}
+	t.Cleanup(func() { acquireAnyAfterPreCheck = nil })
 	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
 	if err != nil {
 		t.Fatalf("AcquireAny = %v, want the keyless identity admitted", err)
 	}
 	if chosen.APIKey != "" {
 		t.Fatalf("chosen = %+v, want the keyless identity", chosen)
+	}
+	// The keyed identity must not have been given a real admission attempt:
+	// the floor landed before its egress, so nothing may be reserved there.
+	keyedSnap, err := m.Snapshot(ctx, "openalex", keyed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyedSnap.RequestsInWindow != 0 {
+		t.Fatalf("keyed reservations = %d, want 0: the floor landed before keyed egress", keyedSnap.RequestsInWindow)
+	}
+	anonSnap, err := m.Snapshot(ctx, "openalex", anon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anonSnap.RequestsInWindow != 1 {
+		t.Fatalf("anonymous reservations = %d, want the admitted call metered here", anonSnap.RequestsInWindow)
 	}
 }
 

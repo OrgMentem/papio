@@ -313,7 +313,13 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 	if err := m.takeToken(ctx, source, identity, policy.RatePerSec, policy.Burst); err != nil {
 		return err
 	}
-	return m.reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost)
+	if err := m.reserve(ctx, source, identity, policy.MaxCostUSD, estimatedCost); err != nil {
+		// The token was spent for a request that never left the machine. Hand
+		// it back so a refused admission does not drain the rate limiter.
+		m.refundToken(policy.RatePerSec, policy.Burst, source)
+		return err
+	}
+	return nil
 }
 
 // AcquireAny admits the first policy, in order, whose own provider-reported
@@ -343,6 +349,12 @@ func (m *Manager) Acquire(ctx context.Context, source string, policy config.Sour
 // and parked instead of trying the keyless identity that was sitting there
 // unspent. A quota refusal from the attempted policy therefore advances
 // exactly as the pre-check would have, and only the last identity parks.
+// acquireAnyAfterPreCheck runs between AcquireAny's quota pre-check and its
+// Acquire attempt. Tests set it to commit a quota floor in that window, so the
+// post-pre-check fallback arm is exercised deterministically instead of via a
+// goroutine race. Nil in production.
+var acquireAnyAfterPreCheck func(ctx context.Context, source string, policy config.Source)
+
 func (m *Manager) AcquireAny(ctx context.Context, source string, policies []config.Source, estimatedCost float64) (config.Source, error) {
 	if len(policies) == 0 {
 		return config.Source{}, errors.New("no policies supplied")
@@ -378,6 +390,9 @@ func (m *Manager) AcquireAny(ctx context.Context, source string, policies []conf
 				continue
 			}
 			return policy, &ErrDeferred{Source: source, Identity: identityFor(policy), Until: *until, Quota: true}
+		}
+		if acquireAnyAfterPreCheck != nil {
+			acquireAnyAfterPreCheck(ctx, source, policy)
 		}
 		err = m.Acquire(ctx, source, policy, estimatedCost)
 		var deferred *ErrDeferred
@@ -500,6 +515,35 @@ func (m *Manager) takeToken(ctx context.Context, source, identity string, rate f
 		}
 		if err := sleepContext(ctx, wait); err != nil {
 			return err
+		}
+	}
+}
+
+// refundToken hands back a token takeToken spent for a reservation reserve
+// then refused. The bucket is process-local and advisory, so the refund is
+// capped at burst and never fails: losing it only costs availability.
+func (m *Manager) refundToken(rate float64, burst int, source string) {
+	if rate <= 0 {
+		return
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	m.mu.Lock()
+	b := m.limiters[source]
+	m.mu.Unlock()
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.rate != rate || b.burst != float64(burst) {
+		return
+	}
+	if b.tokens < b.burst {
+		b.tokens++
+		if b.tokens > b.burst {
+			b.tokens = b.burst
 		}
 	}
 }
