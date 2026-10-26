@@ -449,7 +449,9 @@ function isRowCheckable(row: RowState): boolean {
 // rel="noopener noreferrer"). Only the identifier's own value is
 // interpolated, and it is percent-encoded first: these values were lifted
 // off a page papio does not control, so they never reach the URL's
-// structure.
+// structure. A DOI naming a "." or ".." segment has no link at all: every
+// browser resolves those segments (including percent-encoded spellings), so
+// the row would open a different registered DOI.
 const IDENTIFIER_URL: Record<DetectedPaper["identifier"]["kind"], (encoded: string) => string> = {
   doi: (encoded) => `https://doi.org/${encoded}`,
   arxiv: (encoded) => `https://arxiv.org/abs/${encoded}`,
@@ -457,9 +459,26 @@ const IDENTIFIER_URL: Record<DetectedPaper["identifier"]["kind"], (encoded: stri
   openalex: (encoded) => `https://openalex.org/works/${encoded}`,
 };
 
+function hasDotSegment(value: string): boolean {
+  return value.split("/").some((segment) => {
+    switch (segment.toLowerCase()) {
+      case ".":
+      case "%2e":
+      case "..":
+      case ".%2e":
+      case "%2e.":
+      case "%2e%2e":
+        return true;
+      default:
+        return false;
+    }
+  });
+}
+
 function identifierURL(identifier: DetectedPaper["identifier"]): string | null {
   const value = identifier.value.trim();
   if (value === "") return null;
+  if (identifier.kind === "doi" && hasDotSegment(value)) return null;
   // encodeURI keeps a DOI suffix's meaningful slashes; the two structural
   // characters it leaves alone would still cut the path short, so escape
   // those by hand.

@@ -86,7 +86,7 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 		return nil
 	}
 	s := r.svc
-	rows, err := s.Jobs.ListOldest(ctx, []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
+	rows, err := s.Jobs.ListOldest(ctx, "handoff-repair", []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
 	if err != nil {
 		return err
 	}
@@ -112,6 +112,10 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	// A black-holed registry fails every probe with a transport error, so the
+	// first failure spends this pass's whole probe budget: the rest of the
+	// page keeps the fail-open "unknown" verdict without another request.
+	registryDown := false
 	for i := range rows {
 		row := &rows[i]
 		open := openByJob[row.ID]
@@ -140,7 +144,10 @@ func (r *HandoffRepairer) RunDue(ctx context.Context) error {
 		}
 		// After allInstitutionalHandoffs, so the registry is never probed for a
 		// park this rule would skip anyway.
-		routeable, _, _ := s.handoffGate(ctx, row.Work, row.Policy.Resolver)
+		routeable, probeFailed, _, _ := s.handoffGateWithProbe(ctx, row.Work, row.Policy.Resolver, !registryDown)
+		if probeFailed {
+			registryDown = true
+		}
 		repair := "proven_empty_route_repair"
 		switch {
 		case !routeable:
@@ -181,7 +188,7 @@ func (r *HandoffRepairer) RepairAdapterUpgrade(
 		return nil
 	}
 	s := r.svc
-	rows, err := s.Jobs.ListOldest(ctx, []string{job.StateAwaitingHuman}, job.ListLimitMax)
+	rows, err := s.Jobs.ListOldest(ctx, "adapter-upgrade", []string{job.StateAwaitingHuman}, job.ListLimitMax)
 	if err != nil {
 		return err
 	}

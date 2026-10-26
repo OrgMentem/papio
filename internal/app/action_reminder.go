@@ -54,7 +54,7 @@ func (r *ActionReminder) RunDue(ctx context.Context) error {
 		return nil
 	}
 	s := r.svc
-	rows, err := s.Jobs.ListOldest(ctx, []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
+	rows, err := s.Jobs.ListOldest(ctx, "action-reminder", []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
 	if err != nil {
 		return err
 	}

@@ -1050,7 +1050,7 @@ func newActionsCommand(opt *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			targets, droppedForMissingJob := actionHandoffTargets(actions, rows, cfg.InstitutionFor, limit)
+			targets, droppedForMissingJob, droppedForNoURL := actionHandoffTargets(actions, rows, cfg.InstitutionFor, limit)
 			rediscover, err := manualDownloadsToRediscover(cmd.Context(), opt, targets)
 			if err != nil {
 				return err
@@ -1074,10 +1074,15 @@ func newActionsCommand(opt *options) *cobra.Command {
 				}
 			}
 			urls, urlsTruncated := agentjson.Capped(urls, limit)
-			truncated := urlsTruncated || droppedForMissingJob > 0
+			truncated := urlsTruncated || droppedForMissingJob > 0 || droppedForNoURL > 0
 			if len(urls) == 0 && len(rediscoverIDs) == 0 && len(actions) > 0 && !opt.jsonOutput {
 				if _, err := fmt.Fprintf(opt.out, "%s, none openable from here — run 'papio actions list' for details\n", selector.describe(len(actions))); err != nil {
 					return err
+				}
+				if droppedForNoURL > 0 {
+					// Handoffs papio could not build a URL for are a shortfall,
+					// not an empty queue: exit nonzero like the mixed case.
+					return fmt.Errorf("%w: %d had no openable URL", errHandoffsSkipped, droppedForNoURL)
 				}
 				return nil
 			}
@@ -1115,6 +1120,15 @@ func newActionsCommand(opt *options) *cobra.Command {
 				return err
 			} else if err != nil {
 				skippedErr = err
+			}
+			// Actions papio itself could not build a URL for never reach the
+			// daemon, so count them as skipped here like the daemon-side
+			// shortfall above. planOut, not opt.out, for the same reason.
+			if droppedForNoURL > 0 {
+				if _, err := fmt.Fprintf(planOut, "%d handoff(s) had no openable URL and were skipped - run 'papio actions list' for details\n", droppedForNoURL); err != nil {
+					return err
+				}
+				skippedErr = errHandoffsSkipped
 			}
 			if dryRun {
 				if err := printRediscovery(planOut, rediscoverIDs, true); err != nil {
@@ -1243,8 +1257,13 @@ func browserFocusableActionKind(kind string) bool {
 }
 
 // actionHandoffTargets retains newest-first action order. Missing job rows
-// still mark an incomplete view; a known but no longer openable row does not.
-func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor func(string) (config.Institution, bool), limit int) (targets []actionHandoffTarget, droppedForMissingJob int) {
+// still mark an incomplete view; a known but no longer openable row does not,
+// and neither does an action with no route from this configuration (an
+// unconfigured resolver profile, no identifier to link). An action whose URL
+// papio refused because the job's DOI names a dot segment is different: the
+// route exists but would open another work, so it is counted as skipped and
+// reported rather than silently dropped from the queue.
+func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor func(string) (config.Institution, bool), limit int) (targets []actionHandoffTarget, droppedForMissingJob, droppedForNoURL int) {
 	jobs := make(map[string]job.Row, len(rows))
 	for _, row := range rows {
 		jobs[row.ID] = row
@@ -1265,6 +1284,9 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 		}
 		target, ok := actionURL(action, row, instFor)
 		if !ok {
+			if work.HasDotSegment(row.Work.DOI) {
+				droppedForNoURL++
+			}
 			continue
 		}
 		targets = append(targets, actionHandoffTarget{JobID: action.JobID, Kind: action.Kind, URL: target, Tracked: browserFocusableActionKind(action.Kind)})
@@ -1272,7 +1294,7 @@ func actionHandoffTargets(actions []job.HumanAction, rows []job.Row, instFor fun
 			break
 		}
 	}
-	return targets, droppedForMissingJob
+	return targets, droppedForMissingJob, droppedForNoURL
 }
 
 // manualDownloadsToRediscover asks the daemon which manual-download targets
@@ -1325,7 +1347,10 @@ func actionURL(action job.HumanAction, row job.Row, instFor func(string) (config
 	if action.Kind == "openurl_available" {
 		// Match the inbox's untracked manual Open: a canonical work link,
 		// without reviving the terminal job or minting an institutional offer.
-		if doi, err := work.NormalizeDOI(row.Work.DOI); err == nil {
+		// A DOI naming a dot segment has no canonical link — browsers would
+		// resolve it to a different DOI — so it falls through to the arXiv
+		// and OpenAlex links like a missing DOI does.
+		if doi, err := work.NormalizeDOI(row.Work.DOI); err == nil && !work.HasDotSegment(doi) {
 			return (&url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}).String(), true
 		}
 		if arxiv, err := work.NormalizeArXiv(row.Work.ArXiv); err == nil {

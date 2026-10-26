@@ -224,9 +224,9 @@ func TestActionsOpenAdvisoryCannotMintAuthority(t *testing.T) {
 						action.Status = "resolved"
 					}
 					row := job.Row{ID: action.JobID, State: state, Work: work.Work{DOI: "10.48612//monograph-2025-2"}, Policy: job.Policy{AccessMode: config.ModeConservative}}
-					targets, dropped := actionHandoffTargets([]job.HumanAction{action}, []job.Row{row}, nil, 0)
-					if dropped != 0 {
-						t.Fatal("known terminal job marked missing")
+					targets, dropped, droppedNoURL := actionHandoffTargets([]job.HumanAction{action}, []job.Row{row}, nil, 0)
+					if dropped != 0 || droppedNoURL != 0 {
+						t.Fatal("known terminal job marked missing or URL-less")
 					}
 					if closed || kind != "openurl_available" || state != job.StateUnavailable {
 						if len(targets) != 0 {
@@ -266,6 +266,9 @@ func TestActionsOpenAdvisoryCanonicalLink(t *testing.T) {
 		want string
 	}{
 		{work.Work{DOI: "10.1000/paper?part#section"}, "https://doi.org/10.1000/paper%3Fpart%23section"},
+		{work.Work{DOI: "10.1234/../10.5555/x"}, ""},
+		{work.Work{DOI: "10.1234/%2E%2E/10.5555/x"}, ""},
+		{work.Work{DOI: "10.1234/../x", ArXiv: "2301.08745v2"}, "https://arxiv.org/abs/2301.08745v2"},
 		{work.Work{ArXiv: "2301.08745v2"}, "https://arxiv.org/abs/2301.08745v2"},
 		{work.Work{OpenAlex: "W2741809807"}, "https://openalex.org/W2741809807"},
 		{work.Work{Title: "No canonical link"}, ""},

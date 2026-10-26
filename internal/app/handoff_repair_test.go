@@ -434,7 +434,7 @@ func TestHandoffRepairerLeavesLateAdoptionLeaseUntouched(t *testing.T) {
 	}
 
 	// Capture the exact maintenance snapshot before the adopter wins its CAS.
-	rows, err := jobs.ListOldest(ctx, []string{job.StateAwaitingHuman}, job.ListLimitMax)
+	rows, err := jobs.ListOldest(ctx, "handoff-repair", []string{job.StateAwaitingHuman}, job.ListLimitMax)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,11 +532,11 @@ func seedNewerMaintenancePage(t *testing.T, svc *Service, jobs *job.Store, prefi
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	// Read the page back through the consumers' own path, on a fresh Store so
-	// the caller's ListOldest cursor stays at the start: a short page here
-	// means some filler no longer passes ListOldest or ListOpenHumanActions,
-	// and the page-reach tests would pass whatever the ordering.
-	page, err := (&job.Store{S: jobs.S}).ListOldest(ctx, []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
+	// Verify the seeded page through the consumers' own path: a short page
+	// here means some filler no longer passes ListOldest or
+	// ListOpenHumanActions, and the page-reach tests would pass whatever the
+	// ordering.
+	page, err := (&job.Store{S: jobs.S}).ListOldest(ctx, "handoff-repair", []string{job.StateAwaitingHuman, job.StateNeedsReview}, job.ListLimitMax)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -782,5 +782,68 @@ func TestHandoffRepairerRepairsAdapterUpgradeParks(t *testing.T) {
 				t.Fatalf("open actions = %+v, want one %s", open, tc.kind)
 			}
 		})
+	}
+}
+
+// blockingDOIRegistry never answers before the pass context ends, like a
+// black-holed doi.org, and counts how many parks paid that wait.
+type blockingDOIRegistry struct{ calls int }
+
+func (b *blockingDOIRegistry) Registered(ctx context.Context, _ string) (bool, error) {
+	b.calls++
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func TestHandoffRepairerProbesTheRegistryOncePerPass(t *testing.T) {
+	ctx := context.Background()
+	svc, jobs := newTestService(t)
+	svc.Config.AccessMode = config.ModeDelegated
+	const parks = 25
+	for i := range parks {
+		row := parkedHandoffJob(t, svc, jobs, fmt.Sprintf("request_blackhole_%03d", i))
+		if _, err := jobs.OpenHumanAction(ctx, row.ID, "openurl_handoff", InstitutionalOpenURLHandoffDetail,
+			job.Access(true, "paywall")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	registry := &blockingDOIRegistry{}
+	svc.DOIRegistry = registry
+	passCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := svc.HandoffRepairer().RunDue(passCtx); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if registry.calls != 1 {
+		t.Fatalf("registry calls = %d, want 1: after the first transport error the rest of the pass keeps the fail-open verdict without another request", registry.calls)
+	}
+}
+
+func TestHandoffRepairerAndReminderWalkTheFullSetIndependently(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	svc, jobs, _ := newReminderTestService(t, &now)
+	// The orphan is the newest park, so it sits on the second maintenance
+	// page behind one full page of older parks.
+	orphan := parkedHandoffJob(t, svc, jobs, "request_shared_cursor_orphan")
+	created, err := time.Parse(time.RFC3339Nano, orphan.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedNewerMaintenancePage(t, svc, jobs, "request_shared_cursor_fill", created.Add(-time.Duration(job.ListLimitMax+1)*time.Second))
+	for range 2 {
+		if err := svc.HandoffRepairer().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.ActionReminder().RunDue(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	persisted, err := jobs.Get(ctx, orphan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != job.StateResolving {
+		t.Fatalf("newest orphan state = %q, want %q: the reminder pass must not pin the repairer to the oldest page", persisted.State, job.StateResolving)
 	}
 }

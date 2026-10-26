@@ -49,7 +49,10 @@ func OpenURL(base string, w work.Work) string {
 
 const libKeyHost = "libkey.io"
 
-// LibKeyURL builds the keyless LibKey.io institution link for one work.
+// LibKeyURL builds the keyless LibKey.io institution link for one work. A
+// DOI naming a dot segment has no LibKey link: browsers would resolve it to
+// a different DOI, so the route is refused and callers fall back to the
+// OpenURL route, which carries the DOI as a query value, never a path.
 func LibKeyURL(inst config.Institution, w work.Work) string {
 	if inst.LibKeyMode != "link" || inst.LibKeyLibraryID <= 0 {
 		return ""
@@ -57,6 +60,9 @@ func LibKeyURL(inst config.Institution, w work.Work) string {
 	id := ""
 	switch {
 	case w.DOI != "":
+		if work.HasDotSegment(w.DOI) {
+			return ""
+		}
 		id = w.DOI
 	case w.PMID != "":
 		id = w.PMID
@@ -101,8 +107,11 @@ func OpenAthensRedirectorURL(domain, target string) (string, bool) {
 
 // PublisherHandoffURL is derived only from a job's validated DOI and the
 // institution's configuration. A failed resolver's page or diagnostic cannot
-// supply a replacement navigation URL. With an OpenAthens domain configured
-// the DOI is wrapped in that institution's redirector, a superset of the
+// supply a replacement navigation URL. A DOI naming a dot segment has no
+// publisher route at all — browsers would resolve it to a different DOI —
+// the same refusal as a missing DOI, so every caller takes its existing
+// no-handoff path. With an OpenAthens domain configured the DOI is wrapped
+// in that institution's redirector, a superset of the
 // plain DOI link (the redirector answers with the publisher's own sign-in for
 // the institution and then the article, or the plain DOI where it has no
 // setup). One derivation serves every use of the action — offer, open and
@@ -113,6 +122,9 @@ func PublisherHandoffURL(action job.HumanAction, row job.Row, inst config.Instit
 	}
 	doi, err := work.NormalizeDOI(row.Work.DOI)
 	if err != nil {
+		return "", false
+	}
+	if work.HasDotSegment(doi) {
 		return "", false
 	}
 	u := url.URL{Scheme: "https", Host: "doi.org", Path: "/" + doi}

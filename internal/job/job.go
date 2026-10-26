@@ -2394,15 +2394,18 @@ func (js *Store) listJobs(ctx context.Context, state, consumer string, limit int
 }
 
 // ListOldest returns the next bounded maintenance page in stable oldest-first
-// order. It resumes after the prior page for the same state set and wraps only
-// after reaching the end, so permanently parked jobs cannot hide every newer
-// repair or reminder.
-func (js *Store) ListOldest(ctx context.Context, states []string, limit int) ([]Row, error) {
+// order. It resumes after the prior page for the same consumer and state set
+// and wraps only after reaching the end, so permanently parked jobs cannot
+// hide every newer repair or reminder. The consumer names the maintenance
+// runner reading the page: runners sharing one store must pass distinct
+// consumers, or they advance one shared cursor and each only ever sees
+// alternate pages.
+func (js *Store) ListOldest(ctx context.Context, consumer string, states []string, limit int) ([]Row, error) {
 	if len(states) == 0 {
 		return nil, nil
 	}
 	limit = EffectiveListLimit(limit)
-	key := strings.Join(states, "\x00")
+	key := consumer + "\x00" + strings.Join(states, "\x00")
 	js.oldestMu.Lock()
 	defer js.oldestMu.Unlock()
 	if js.oldestCursors == nil {
