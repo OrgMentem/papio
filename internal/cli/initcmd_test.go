@@ -791,82 +791,67 @@ func TestInitConfiguresAndClearsLibKeyLinkRouting(t *testing.T) {
 	}
 }
 
-func TestInitPrintsAutoCapableShapedVerdictForCleanIlliadProfile(t *testing.T) {
-	home := initHome(t)
-	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t, home)
-	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser"); err != nil {
-		t.Fatalf("first init: %v\n%s", err, out)
+func TestInitPrintsDocumentDeliveryVerdict(t *testing.T) {
+	rows := []struct {
+		name       string
+		legalBasis string
+		want       []string
+		absent     []string
+	}{
+		{
+			name:       "clean illiad profile is auto-capable",
+			legalBasis: "institution_policy",
+			want:       []string{"AUTO-CAPABLE for digital_journal_article", "no recorded live acceptance"},
+			absent:     []string{"PREFILL ONLY"},
+		},
+		{
+			name:       "copyright_act_s49 profile is prefill-only",
+			legalBasis: "copyright_act_s49",
+			want:       []string{"PREFILL ONLY", "your institution requires a copyright declaration on every digital-copy request"},
+		},
 	}
-	cfg, err := config.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
-	cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
-		Kind:              "illiad",
-		SubmitPolicy:      "auto_if_unconditional",
-		RequestClasses:    []string{"digital_journal_article"},
-		LegalBasis:        "institution_policy",
-		PatronAttestation: "not_required",
-		PatronFeePolicy:   "zero_standard",
-		APIKey:            "issued-by-institution",
-		PatronRef:         "patron-ref-123",
-	}
-	if err := config.Save(cfg, path); err != nil {
-		t.Fatalf("save document delivery config: %v", err)
-	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			home := initHome(t)
+			path := filepath.Join(home, ".config", "papio", "config.toml")
+			deps := initTestDependencies(t, home)
+			if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser"); err != nil {
+				t.Fatalf("first init: %v\n%s", err, out)
+			}
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
+			cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
+				Kind:              "illiad",
+				SubmitPolicy:      "auto_if_unconditional",
+				RequestClasses:    []string{"digital_journal_article"},
+				LegalBasis:        row.legalBasis,
+				PatronAttestation: "not_required",
+				PatronFeePolicy:   "zero_standard",
+				APIKey:            "issued-by-institution",
+				PatronRef:         "patron-ref-123",
+			}
+			if err := config.Save(cfg, path); err != nil {
+				t.Fatalf("save document delivery config: %v", err)
+			}
 
-	out, err := runInitForTest(t, path, deps, "--non-interactive", "--skip-browser")
-	if err != nil {
-		t.Fatalf("rerun init: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "AUTO-CAPABLE for digital_journal_article") {
-		t.Fatalf("init output missing AUTO-CAPABLE-shaped verdict:\n%s", out)
-	}
-	if !strings.Contains(out, "no recorded live acceptance") {
-		t.Fatalf("init output missing the no-live-acceptance wording:\n%s", out)
-	}
-	if strings.Contains(out, "PREFILL ONLY") {
-		t.Fatalf("a structurally clean illiad profile should not print PREFILL ONLY:\n%s", out)
-	}
-}
-
-func TestInitPrintsPrefillOnlyVerdictForCopyrightActS49Profile(t *testing.T) {
-	home := initHome(t)
-	path := filepath.Join(home, ".config", "papio", "config.toml")
-	deps := initTestDependencies(t, home)
-	if out, err := runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser"); err != nil {
-		t.Fatalf("first init: %v\n%s", err, out)
-	}
-	cfg, err := config.Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.Browser.OpenURLBase = "https://resolver.example.edu/openurl"
-	cfg.Browser.DocumentDelivery = &config.DocumentDelivery{
-		Kind:              "illiad",
-		SubmitPolicy:      "auto_if_unconditional",
-		RequestClasses:    []string{"digital_journal_article"},
-		LegalBasis:        "copyright_act_s49",
-		PatronAttestation: "not_required",
-		PatronFeePolicy:   "zero_standard",
-		APIKey:            "issued-by-institution",
-		PatronRef:         "patron-ref-123",
-	}
-	if err := config.Save(cfg, path); err != nil {
-		t.Fatalf("save document delivery config: %v", err)
-	}
-
-	out, err := runInitForTest(t, path, deps, "--non-interactive", "--skip-browser")
-	if err != nil {
-		t.Fatalf("rerun init: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "PREFILL ONLY") {
-		t.Fatalf("init output missing PREFILL ONLY verdict:\n%s", out)
-	}
-	if !strings.Contains(out, "your institution requires a copyright declaration on every digital-copy request") {
-		t.Fatalf("init output missing the copyright_act_s49 blocker text:\n%s", out)
+			out, err := runInitForTest(t, path, deps, "--non-interactive", "--skip-browser")
+			if err != nil {
+				t.Fatalf("rerun init: %v\n%s", err, out)
+			}
+			for _, want := range row.want {
+				if !strings.Contains(out, want) {
+					t.Fatalf("init output missing %q:\n%s", want, out)
+				}
+			}
+			for _, absent := range row.absent {
+				if strings.Contains(out, absent) {
+					t.Fatalf("init output must not contain %q:\n%s", absent, out)
+				}
+			}
+		})
 	}
 }
 

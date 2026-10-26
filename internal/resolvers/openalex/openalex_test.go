@@ -302,3 +302,7 @@ func TestLoopbackEndpointAllowsMissingAPIKey(t *testing.T) {
 		t.Fatalf("loopback resolver rejected missing key: %v", err)
 	}
 }
+
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
+}

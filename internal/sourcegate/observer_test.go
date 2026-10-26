@@ -228,6 +228,21 @@ func TestObserverAnonymousIdentity(t *testing.T) {
 	}
 }
 
+func TestObserverMissingRemainingDoesNotGate(t *testing.T) {
+	observer, floor, _ := testObserver(t, http.StatusOK, map[string]string{
+		"X-RateLimit-Limit": "100000", "X-RateLimit-Reset": "3600",
+	})
+	if err := doAndClose(observer, observerRequest(t, "https://api.openalex.org/works?api_key=private-key")); err != nil {
+		t.Fatal(err)
+	}
+	if len(floor.calls) != 0 {
+		t.Fatalf("Defer calls = %#v, want none without a remaining balance", floor.calls)
+	}
+	if len(floor.latches) != 0 {
+		t.Fatalf("quota latches = %#v, want none without a remaining balance", floor.latches)
+	}
+}
+
 func TestObserverRejectsMalformedReset(t *testing.T) {
 	for _, reset := range []string{"-5", "10000000", "soon"} {
 		t.Run(reset, func(t *testing.T) {

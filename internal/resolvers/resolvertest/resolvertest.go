@@ -2,6 +2,7 @@
 package resolvertest
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 // CheckParseRetryAfterClampsHugeValues pins the overflow-safe Retry-After
 // parsing: a header large enough to overflow the nanosecond multiply must clamp
 // to the max duration rather than wrap to a garbage (possibly negative) value.
-// Canonical table reproduced from arxiv/europepmc/core/crossreftdm.
+// It also checks HTTP-date delays and expired deadlines.
 func CheckParseRetryAfterClampsHugeValues(t *testing.T, parse func(string, time.Time) time.Duration) {
 	t.Helper()
 	const maxDuration = time.Duration(1<<63 - 1)
@@ -27,6 +28,7 @@ func CheckParseRetryAfterClampsHugeValues(t *testing.T, parse func(string, time.
 		{"normal seconds", "5", 5 * time.Second},
 		{"overflow multiply clamps to max", "99999999999", maxDuration},
 		{"beyond int64 range falls through", "9999999999999999999", 0},
+		{"past HTTP-date", now.Add(-time.Hour).UTC().Format(http.TimeFormat), 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -39,6 +41,19 @@ func CheckParseRetryAfterClampsHugeValues(t *testing.T, parse func(string, time.
 			}
 		})
 	}
+	t.Run("future HTTP-date", func(t *testing.T) {
+		now := time.Now()
+		deadline := now.Add(2 * time.Hour).UTC().Truncate(time.Second)
+		value := deadline.Format(http.TimeFormat)
+		got := parse(value, now)
+		// Some parsers use the supplied now; others read the clock again.
+		// Bound both without a scheduler-dependent timing tolerance.
+		minimum := time.Until(deadline)
+		maximum := deadline.Sub(now)
+		if got <= 0 || got < minimum || got > maximum {
+			t.Fatalf("parseRetryAfter(%q) = %v, want between %v and %v", value, got, minimum, maximum)
+		}
+	})
 }
 
 // oversizedMarker is the wording every resolver's bounded read uses when a

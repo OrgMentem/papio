@@ -191,6 +191,52 @@ func TestStoreSanitizedRecordsHashAndProvenance(t *testing.T) {
 	}
 }
 
+func TestIsSanitizedFixtureRejectsMalformedHeaders(t *testing.T) {
+	const header = "<!-- papio-fixture provider=\"sage\" scenario=\"observed\" origin=\"https://sage.example/\" captured=\"2026-08-10T00:00:00Z\" -->\n<html>safe</html>"
+	for _, test := range []struct {
+		name, old, replacement string
+		valid                  bool
+	}{
+		{"valid", "", "", true},
+		{"query", "https://sage.example/", "https://sage.example/?token=secret", false},
+		{"fragment", "https://sage.example/", "https://sage.example/#secret", false},
+		{"scheme", "https://sage.example/", "ftp://sage.example/", false},
+		{"timestamp", "2026-08-10T00:00:00Z", "yesterday", false},
+		{"scenario", "observed", "not-a-scenario", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			html := []byte(strings.Replace(header, test.old, test.replacement, 1))
+			if got := IsSanitizedFixture(html); got != test.valid {
+				t.Errorf("IsSanitizedFixture = %v, want %v", got, test.valid)
+			}
+			ctx := context.Background()
+			store := New(t.TempDir(), Retention{MaxPerHost: 2, MaxAge: 24 * time.Hour})
+			path, err := store.StoreSanitized(ctx, "sage.example", "observed", "sage", "1", html)
+			if test.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := os.ReadFile(path); err != nil || string(got) != string(html) {
+					t.Fatalf("stored fixture = %q, %v", got, err)
+				}
+			} else if err == nil || path != "" {
+				t.Errorf("invalid header stored: path=%q err=%v", path, err)
+			}
+			rows, err := store.List(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if test.valid {
+				want = 1
+			}
+			if len(rows) != want {
+				t.Fatalf("stored captures = %d, want %d", len(rows), want)
+			}
+		})
+	}
+}
+
 // An older extension sanitizer left the reader's IP address on Elsevier's
 // refusal page. The trusted ingress masks it anyway, so a version 2 capture
 // never carries one, and the stamp says which rule the bytes passed.
@@ -356,6 +402,33 @@ func TestStoreHostCannotEscapeCapturesDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(dataDir), "outside")); !os.IsNotExist(err) {
 		t.Fatalf("host traversal created an outside path: %v", err)
+	}
+}
+
+func TestPurgeDotHostsPreservesData(t *testing.T) {
+	for _, host := range []string{"..", ".", " .. "} {
+		t.Run(host, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			store := New(dataDir, Retention{MaxPerHost: 10, MaxAge: 24 * time.Hour})
+			sentinel := filepath.Join(dataDir, "papio.db")
+			if err := os.WriteFile(sentinel, []byte("sentinel"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			path, err := store.Store(ctx, "sagepub.com", "observed", "", "", []byte("fixture"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := store.Purge(ctx, host); err != nil || removed != 0 {
+				t.Fatalf("Purge(%q) = %d, %v", host, removed, err)
+			}
+			if got, err := os.ReadFile(sentinel); err != nil || string(got) != "sentinel" {
+				t.Errorf("data sentinel = %q, %v", got, err)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != "fixture" {
+				t.Errorf("unrelated capture = %q, %v", got, err)
+			}
+		})
 	}
 }
 

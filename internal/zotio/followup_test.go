@@ -621,3 +621,57 @@ func crashVictimJob(t *testing.T, service *Service, collection string) string {
 	}
 	return jobID
 }
+
+// The follow-up repair rebuilds filing from the same policy fields PlanJobs
+// reads. A crash between the import and its follow-ups on a queue job with
+// a key-shaped policy collection must not file the parent into a collection
+// named like the key: the repair derives CollectionIsKey the same way the
+// plan did. The mirror case pins that a key-shaped name stays a name.
+func TestFollowUpRepairDerivesCollectionIsKeyFromItemKey(t *testing.T) {
+	for name, tc := range map[string]struct {
+		zotioKey   string
+		collection string
+		wantFiled  bool
+	}{
+		"queue job skips its collection key": {zotioKey: "AB12CD34", collection: "ZX98YU76", wantFiled: false},
+		"direct job files a key-shaped name": {zotioKey: "", collection: "PAPERS24", wantFiled: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service, cli, _ := connectorImportService(t, nil, nil, "")
+			jobID := crashVictimJob(t, service, tc.collection)
+			if tc.zotioKey != "" {
+				row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := service.Store.DB().Exec(`UPDATE work_requests SET zotio_item_key = ? WHERE id = ?`, tc.zotioKey, row.WorkRequestID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			crashAfterRecordingImport(t, service, cli, jobID)
+			markFollowUpsCompleteAt(t, service, "job_earlier_import", time.Now().Add(-30*24*time.Hour))
+			cli.collectionCalls = 0
+
+			runFollowUps(t, service, time.Now())
+			if tc.wantFiled {
+				if cli.collectionCalls != 1 {
+					t.Fatalf("collection calls = %d, want 1: a key-shaped name must be filed", cli.collectionCalls)
+				}
+				filing, _ := latestZotioEvent(t, service, jobID, "zotio.collection_filing")
+				if filing["status"] != "applied" || filing["collection"] != tc.collection {
+					t.Fatalf("repaired filing event = %#v, want the name applied", filing)
+				}
+			} else {
+				if cli.collectionCalls != 0 {
+					t.Fatalf("collection calls = %d, want 0: a queue collection key is not a name", cli.collectionCalls)
+				}
+				if countZotioEvents(t, service, jobID, "zotio.collection_filing") != 0 {
+					t.Fatalf("a skipped queue key recorded a filing event for %s", tc.collection)
+				}
+			}
+			if _, at := latestZotioEvent(t, service, jobID, followUpsComplete); at.IsZero() {
+				t.Fatal("repaired job carries no completion marker")
+			}
+		})
+	}
+}

@@ -130,6 +130,18 @@ func TestBibTeXEscapesReservedCharactersAndJoinsAuthors(t *testing.T) {
 	if !strings.Contains(out, "@article{holzer-2022-") {
 		t.Fatalf("BibTeX entry type or key wrong:\n%s", out)
 	}
+	if !strings.Contains(out, "year = {2022}") {
+		t.Fatalf("BibTeX output missing year:\n%s", out)
+	}
+	if !strings.Contains(out, "journal = {PLOS ONE}") {
+		t.Fatalf("BibTeX output missing journal:\n%s", out)
+	}
+	second := article()
+	second.Title = "Second work"
+	two := string(BibTeX([]Record{r, second}))
+	if !strings.Contains(two, "}\n\n@") {
+		t.Fatalf("BibTeX entries missing blank-line separator:\n%s", two)
+	}
 }
 
 // A BibTeX parser reads a top-level " and " inside the author value as the
@@ -148,12 +160,15 @@ func TestBibTeXProtectsLiteralAndInsideOneAuthorName(t *testing.T) {
 }
 
 func TestRISUsesRegistryTagsAndCRLF(t *testing.T) {
-	out := string(RIS([]Record{article()}))
+	r := article()
+	r.ArXiv = "2401.12345"
+	out := string(RIS([]Record{r}))
 	for _, want := range []string{
 		"TY  - JOUR\r\n", "TI  - The perils of plurality rule\r\n",
 		"AU  - Joshua Holzer\r\n", "AU  - Ada Lovelace\r\n",
 		"PY  - 2022\r\n", "T2  - PLOS ONE\r\n",
 		"DO  - 10.1371/journal.pone.0262026\r\n", "AN  - PMID:35051190\r\n",
+		"C1  - arXiv:2401.12345\r\n",
 		"ER  - \r\n",
 	} {
 		if !strings.Contains(out, want) {
@@ -193,11 +208,13 @@ func TestCSLJSONCarriesLiteralAuthorsAndStandardPMID(t *testing.T) {
 		t.Fatal(err)
 	}
 	var items []struct {
-		Type   string              `json:"type"`
-		Author []map[string]string `json:"author"`
-		PMID   string              `json:"PMID"`
-		Custom map[string]string   `json:"custom"`
-		Issued struct {
+		Type           string              `json:"type"`
+		Title          string              `json:"title"`
+		ContainerTitle string              `json:"container-title"`
+		Author         []map[string]string `json:"author"`
+		PMID           string              `json:"PMID"`
+		Custom         map[string]string   `json:"custom"`
+		Issued         struct {
 			DateParts [][]int `json:"date-parts"`
 		} `json:"issued"`
 	}
@@ -207,6 +224,12 @@ func TestCSLJSONCarriesLiteralAuthorsAndStandardPMID(t *testing.T) {
 	item := items[0]
 	if item.Type != "article-journal" || len(item.Author) != 2 || item.Author[0]["literal"] != "Joshua Holzer" {
 		t.Fatalf("item = %+v: authors must be literal names, never split into family/given by guesswork", item)
+	}
+	if item.Title != "The perils of plurality rule" {
+		t.Fatalf("title = %q, want the work title", item.Title)
+	}
+	if item.ContainerTitle != "PLOS ONE" {
+		t.Fatalf("container-title = %q, want the journal", item.ContainerTitle)
 	}
 	if item.PMID != "35051190" {
 		t.Fatalf("PMID = %q: PMID is a standard CSL 1.0.2 variable, not a custom extension", item.PMID)

@@ -190,4 +190,14 @@ func TestIPAddressesMasksAddressesButNotDOIsVersionsOrTimes(t *testing.T) {
 	if got := IPAddresses(article, "TOKEN"); got != article {
 		t.Fatalf("non-address text changed:\n got %q\nwant %q", got, article)
 	}
+	for _, test := range []struct{ in, want string }{
+		{"Your IP address is 203.0.113.42.", "Your IP address is TOKEN."},
+		{"from 198.51.100.7. Contact support.", "from TOKEN. Contact support."},
+		{"(203.0.113.9)", "(TOKEN)"},
+		{"addr=203.0.113.9;", "addr=TOKEN;"},
+	} {
+		if got := IPAddresses(test.in, "TOKEN"); got != test.want {
+			t.Errorf("IPAddresses(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
 }

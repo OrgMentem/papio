@@ -155,6 +155,46 @@ func TestRedirectorsNeverSuppress(t *testing.T) {
 	}
 }
 
+func TestExcludedWalledHostNeverSuppresses(t *testing.T) {
+	for _, excluded := range []bool{false, true} {
+		cfg := testConfig()
+		cfg.MinWallSpanHours = 2
+		want := Skip
+		if excluded {
+			cfg.ExcludedHosts = []string{" Walled.Example "}
+			want = Fetch
+		}
+		tr := New(cfg)
+		for i := range 3 {
+			tr.Observe(wall("walled.example", t0.Add(time.Duration(i)*time.Hour)))
+		}
+		if got := tr.Decide("walled.example", t0.Add(3*time.Hour)); got != want {
+			t.Fatalf("excluded=%v: decision = %v, want %v", excluded, got, want)
+		}
+	}
+}
+
+func TestMixedRedirectorStillSuppresses(t *testing.T) {
+	tr := New(testConfig())
+	tr.Observe(Row{Outcome: "invalid", Detail: "*fetch.Error(http-403) host=pub.example final=www.pub.example", At: t0})
+	for i := range 3 {
+		tr.Observe(wall("pub.example", t0.Add(time.Duration(i)*time.Hour)))
+	}
+	if got := tr.Decide("pub.example", t0.Add(3*time.Hour)); got != Skip {
+		t.Fatalf("redirector with its own walls = %v, want Skip", got)
+	}
+}
+
+func TestResponderlessWallsStillSuppress(t *testing.T) {
+	tr := New(testConfig())
+	for i := range 3 {
+		tr.Observe(Row{Outcome: "invalid", Detail: "*fetch.Error(challenge) host=pub.example", At: t0.Add(time.Duration(i) * time.Hour)})
+	}
+	if got := tr.Decide("pub.example", t0.Add(3*time.Hour)); got != Skip {
+		t.Fatalf("host with responder-less walls = %v, want Skip", got)
+	}
+}
+
 func TestRateLimitsBackOffAndNeverSuppress(t *testing.T) {
 	tr := New(testConfig())
 	for i := 0; i < 10; i++ {

@@ -142,7 +142,7 @@ it finds:
 | Stage | Source / tooling | Handles credentials? |
 |---|---|---|
 | **Discovery** | OpenAlex (read-only) | No |
-| **Download — open** | arXiv · Europe PMC · Unpaywall · OpenAlex · CORE · Crossref TDM | No (API keys only where configured) |
+| **Download — open** | arXiv · Europe PMC · Unpaywall · OpenAlex · Semantic Scholar · OpenAIRE · Open Books (IRIS; OAPEN opt-in) · CORE and Crossref TDM with a key | No (API keys only where configured) |
 | **Download — institutional** | OpenURL handoff in your ordinary browser session | No — login/2FA/CAPTCHA stay human |
 | **Validation** | Local PDF structure + identity + OCR (Poppler, Tesseract) | No |
 | **Library filing** | `zotio` — preview (`plan`) then confirmed `apply` for Zotero · best-effort `on_ready` handoff for papis, a folder, or your own script; hook failures never fail or retry the job | No — `papio` never stores Zotero credentials |
