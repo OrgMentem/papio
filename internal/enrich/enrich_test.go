@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"papio/internal/resolver"
+	"papio/internal/resolvers/resolvertest"
 	"papio/internal/work"
 )
 
@@ -322,4 +323,8 @@ func TestVersionSiblingsRejectsDotSegmentDOIs(t *testing.T) {
 	if siblings != nil || err != nil {
 		t.Fatalf("VersionSiblings = (%v, %v), want (nil, nil)", siblings, err)
 	}
+}
+
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }

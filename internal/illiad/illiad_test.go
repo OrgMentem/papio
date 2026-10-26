@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"papio/internal/resolvers/resolvertest"
 )
 
 func TestCreateTransactionHappyPath(t *testing.T) {
@@ -316,6 +318,7 @@ func TestFailureErrorPreservesCauseAndClassification(t *testing.T) {
 }
 
 func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 	for _, value := range []string{"9223372037", "9999999999", "922337203685477581"} {
 		if got := parseRetryAfter(value, time.Now()); got < 0 {
 			t.Fatalf("parseRetryAfter(%q) = %v, want a non-negative clamped duration: a negative wait inverts Retry-After into an immediate retry storm", value, got)

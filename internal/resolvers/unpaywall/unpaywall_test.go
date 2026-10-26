@@ -176,3 +176,7 @@ func TestResolveRequiresMatchingDOI(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
+}
