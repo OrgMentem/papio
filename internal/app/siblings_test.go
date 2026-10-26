@@ -361,7 +361,10 @@ func TestTypedSiblingsKeepOpenAccessCandidatesOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cands, _ := svc.typedSiblings(context.Background(), row)
+	cands, _, err := svc.typedSiblings(context.Background(), row)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cands) != 0 {
 		t.Fatalf("typed candidates = %#v, want none: an institutional route for a different DOI signs the operator into the wrong work", cands)
 	}
@@ -380,7 +383,10 @@ func TestTypedRelationsRateLimitParksInsteadOfSettling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cands, plan := svc.typedSiblings(context.Background(), row)
+	cands, plan, err := svc.typedSiblings(context.Background(), row)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cands) != 0 {
 		t.Fatalf("typed candidates = %#v, want none on a rate limit", cands)
 	}
@@ -454,7 +460,10 @@ func TestTypedSiblingsChargeTheBudgetPerLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _ = svc.typedSiblings(context.Background(), row); adapter.calls != 2 {
+	if _, _, err := svc.typedSiblings(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.calls != 2 {
 		t.Fatalf("resolver lookups = %d, want 2: the budget must be charged per request, not once per fan-out", adapter.calls)
 	}
 }

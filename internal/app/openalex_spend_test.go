@@ -828,7 +828,10 @@ func TestSiblingNoSearchBasisUncharged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, plan := svc.resolveSiblings(ctx, row, true)
+	_, plan, _, err := svc.resolveSiblings(ctx, row, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if sibling.siblings != 1 {
 		t.Fatalf("sibling calls = %d, want one", sibling.siblings)
 	}
@@ -930,13 +933,17 @@ func TestFuzzySiblingSearchWaitsForTheBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, plan := svc.resolveSiblings(ctx, row, false); !plan.empty() {
+	if _, plan, _, err := svc.resolveSiblings(ctx, row, false); err != nil {
+		t.Fatal(err)
+	} else if !plan.empty() {
 		t.Fatalf("plan = %+v, want no observation away from the boundary", plan)
 	}
 	if sibling.siblings != 0 {
 		t.Fatalf("sibling calls = %d, want none while an ordinary retry remains", sibling.siblings)
 	}
-	if _, plan := svc.resolveSiblings(ctx, row, true); plan.kind() != retryKindTemporary {
+	if _, plan, _, err := svc.resolveSiblings(ctx, row, true); err != nil {
+		t.Fatal(err)
+	} else if plan.kind() != retryKindTemporary {
 		t.Fatalf("plan kind = %q, want chargeable temporary at the boundary", plan.kind())
 	}
 	if sibling.siblings != 1 {
@@ -961,7 +968,9 @@ func TestFuzzySiblingSearchRunsOncePerBasis(t *testing.T) {
 		t.Fatal(err)
 	}
 	for pass := range 3 {
-		if _, plan := svc.resolveSiblings(ctx, row, true); pass > 0 && !plan.empty() {
+		if _, plan, _, err := svc.resolveSiblings(ctx, row, true); err != nil {
+			t.Fatal(err)
+		} else if pass > 0 && !plan.empty() {
 			t.Fatalf("pass %d plan = %+v, want no observation for a basis already searched", pass, plan)
 		}
 	}
@@ -971,7 +980,9 @@ func TestFuzzySiblingSearchRunsOncePerBasis(t *testing.T) {
 
 	enriched := *row
 	enriched.Work.Title = "a materially different title"
-	if _, plan := svc.resolveSiblings(ctx, &enriched, true); plan.kind() != retryKindTemporary {
+	if _, plan, _, err := svc.resolveSiblings(ctx, &enriched, true); err != nil {
+		t.Fatal(err)
+	} else if plan.kind() != retryKindTemporary {
 		t.Fatalf("plan kind = %q, want a chargeable observation for a new basis", plan.kind())
 	}
 	if sibling.siblings != 2 {
@@ -993,8 +1004,11 @@ func TestFailedFuzzySiblingSearchStaysRetryable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.resolveSiblings(ctx, row, true)
-	svc.resolveSiblings(ctx, row, true)
+	for range 2 {
+		if _, _, _, err := svc.resolveSiblings(ctx, row, true); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if sibling.siblings != 2 {
 		t.Fatalf("sibling calls = %d, want 2: a failed search suppresses nothing", sibling.siblings)
 	}
@@ -1067,7 +1081,9 @@ func TestUnreadableSiblingMarkerFailsClosed(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, plan := svc.resolveSiblings(ctx, row, true); !plan.empty() {
+	if _, plan, _, err := svc.resolveSiblings(ctx, row, true); err != nil {
+		t.Fatal(err)
+	} else if !plan.empty() {
 		t.Fatalf("plan = %+v, want no observation: an illegible marker must not buy another search", plan)
 	}
 	if sibling.siblings != 0 {
