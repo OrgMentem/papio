@@ -1048,3 +1048,47 @@ test("reopening a workspace pulls settled grab state and never renders Ready to 
   });
   expect(row(page.document, item.localId)?.textContent).toContain("Identifying");
 });
+
+test("a stale generation-1 grabStatus reply that resolves after a rescan never overwrites the fresh generation-2 grab", async () => {
+  const grabItem = (grabID: string, label: string) =>
+    ({
+      ...paper({ kind: "pdf_grab", url: "https://resolver.example.edu/content/paper.pdf", title: label }),
+      grab_id: grabID,
+    }) as DetectedPaper & { grab_id: string };
+  const initial = snapshot({ documentGeneration: 1, items: [grabItem("grab-old-0001", "Old paper")] });
+  const rescanned = snapshot({ documentGeneration: 2, items: [grabItem("grab-new-0002", "New paper")] });
+  const { promise: staleGrabReply, resolve: resolveStaleGrab } = Promise.withResolvers<unknown>();
+  let grabAttempts = 0;
+  const page = await pageBulkDocument("scan-1", (message) => {
+    if (message.type === "papio.pageBulk.load") return { ok: true, snapshot: initial };
+    if (message.type === "papio.pageBulk.rescan") return { ok: true, snapshot: rescanned };
+    if (message.type === "papio.pageBulk.grabStatus") {
+      grabAttempts += 1;
+      if (grabAttempts === 1) {
+        expect(message.request).toEqual({ grab_id: "grab-old-0001" });
+        return staleGrabReply;
+      }
+      expect(message.request).toEqual({ grab_id: "grab-new-0002" });
+      return { ok: true, grab_id: "grab-new-0002", state: "identified", outcome: "identified" };
+    }
+    if (message.type === "papio.pageBulk.status") return { ok: true, items: [], truncated: false };
+    return { ok: false, error: { code: "unexpected", message: `unexpected message ${message.type}` } };
+  });
+
+  expect(grabAttempts).toBe(1);
+
+  (page.document.getElementById("rescan-btn") as HTMLButtonElement).click();
+  await settle();
+
+  expect(grabAttempts).toBe(2);
+  expect(row(page.document, "id-1")?.textContent).toContain("Identifying");
+
+  // The generation-1 grab reply resolves late, reporting a different grab as
+  // failed. Applied wrongly it would mark the current grab failed; dropped, the
+  // fresh generation-2 reply keeps the new grab identifying.
+  resolveStaleGrab({ ok: true, grab_id: "grab-old-0001", state: "failed_validation", outcome: "failed" });
+  await settle();
+
+  expect(row(page.document, "id-1")?.textContent).toContain("Identifying");
+  expect(row(page.document, "id-1")?.textContent).not.toContain("Grab failed");
+});
