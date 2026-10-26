@@ -381,3 +381,42 @@ func TestRetractionTagReconcilerBacksOffFailedWrites(t *testing.T) {
 		t.Fatalf("recovered write status = %q, want owned", status)
 	}
 }
+
+// A crash between zotio applying the retraction tag and papio recording
+// ownership leaves a pending ledger row over a tag zotio now reports. The
+// next pass must reclaim it as owned, not foreign: a foreign record survives
+// a later withdrawal and leaves a false retracted flag on the paper forever.
+func TestRetractionTagsRecoversOwnedTagAfterCrash(t *testing.T) {
+	ctx := context.Background()
+	cli := newRetractionCLI()
+	cli.addItem("RECOVER1", "10.1234/recovered")
+	cli.setTag("RECOVER1", TagRetracted, "automatic")
+	source := &fakeRetractions{dois: []string{"10.1234/recovered"}}
+	service := retractionService(t, cli, source)
+	if _, err := service.Store.DB().Exec(
+		`INSERT INTO zotio_tag_state (item_key, tag, status, updated_at) VALUES (?, ?, ?, ?)`,
+		retractionLedgerPrefix+"RECOVER1", TagRetracted, tagStatusPending, time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.ReconcileRetractionTags(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Added != 0 || result.Preserved != 0 {
+		t.Fatalf("recovery pass = %+v, want a no-op add with no preserved count", result)
+	}
+	if _, status := tagStateStatus(t, service, retractionLedgerPrefix+"RECOVER1"); status != tagStatusOwned {
+		t.Fatalf("recovered status = %q, want owned", status)
+	}
+
+	source.dois = nil
+	result, err = service.ReconcileRetractionTags(ctx, true)
+	if err != nil || result.Removed != 1 {
+		t.Fatalf("withdrawal cleanup = %+v, %v; want the recovered tag removed", result, err)
+	}
+	if got := cli.tagType("RECOVER1", TagRetracted); got != "" {
+		t.Fatalf("withdrawn tag still present: %q", got)
+	}
+}

@@ -715,6 +715,124 @@ func TestFileCollectionFilesKeyShapedNameWithoutItemKey(t *testing.T) {
 		t.Fatalf("collection calls = %d, want 1", cli.collectionCalls)
 	}
 }
+func setPolicyCollection(t *testing.T, service *Service, jobID, collection string) {
+	t.Helper()
+	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.Policy.Collection = collection
+	policyJSON, err := json.Marshal(row.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Store.DB().Exec(`UPDATE jobs SET policy_json = ? WHERE id = ?`, string(policyJSON), jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A missing-PDF queue job carries a Zotero collection key while a direct
+// acquisition's key-shaped collection is a name. PlanJobs derives which one
+// it is from the job's item key so fileCollection files the name and skips
+// the key; both directions are pinned here because dropping either half of
+// the rule files into the wrong place while the suite stays green.
+func TestPlanJobsDerivesCollectionIsKeyFromItemKey(t *testing.T) {
+	ctx := context.Background()
+	preview := `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`
+	apply := `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`
+	manifest := `{"schema_version":2,"entries":[{"path":"paper.pdf","classification":"new","action":"create","identifier_type":"doi","identifier":"10.1002/example","status":"resolved","item":{"itemType":"journalArticle","title":"Example Paper","DOI":"10.1002/example"}}]}`
+
+	t.Run("queue job treats a key-shaped collection as a key", func(t *testing.T) {
+		cli := &planCLI{preview: preview, apply: apply}
+		service, jobID := readyPlanService(t, "AB12CD34", cli)
+		setPolicyCollection(t, service, jobID, "ZX98YU76")
+		plans, err := service.PlanJobs(ctx, []string{jobID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plans) != 1 || !plans[0].CollectionIsKey {
+			t.Fatalf("CollectionIsKey = %+v, want true for a queue job", plans)
+		}
+		if _, err := service.fileCollection(ctx, plans[0], &ApplyResult{ParentKey: "AB12CD34"}); err != nil {
+			t.Fatal(err)
+		}
+		if cli.collectionCalls != 0 {
+			t.Fatalf("collection calls = %d, want 0: a queue key is not a name", cli.collectionCalls)
+		}
+	})
+
+	t.Run("direct acquisition files a key-shaped collection name", func(t *testing.T) {
+		cli := &planCLI{preview: preview, manifest: manifest}
+		service, jobID := readyPlanService(t, "", cli)
+		setPolicyCollection(t, service, jobID, "PAPERS24")
+		plans, err := service.PlanJobs(ctx, []string{jobID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plans) != 1 || plans[0].CollectionIsKey {
+			t.Fatalf("CollectionIsKey = %+v, want false without an item key", plans)
+		}
+		if _, err := service.fileCollection(ctx, plans[0], &ApplyResult{ParentKey: "PA12RE34"}); err != nil {
+			t.Fatal(err)
+		}
+		if cli.collectionCalls != 1 {
+			t.Fatalf("collection calls = %d, want 1: a name must be filed", cli.collectionCalls)
+		}
+	})
+}
+
+// Apply refuses a plan whose acquisition was archived after planning: the
+// cached plan must not file a PDF for an acquisition the operator shelved.
+func TestApplyRefusesArchivedAcquisition(t *testing.T) {
+	ctx := context.Background()
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	plans, err := service.PlanJobs(ctx, []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Bundle.Jobs.Archive(ctx, jobID, true); err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Apply(ctx, plans[0].ID, plans[0].ConfirmationSHA256)
+	if !errors.Is(err, job.ErrConflict) || !strings.Contains(err.Error(), "acquisition is archived; restore it before filing") {
+		t.Fatalf("archived apply = %v, want the archived-acquisition refusal", err)
+	}
+	if cli.applyCalls != 0 {
+		t.Fatalf("apply calls = %d, want 0: an archived acquisition files nothing", cli.applyCalls)
+	}
+}
+
+// Apply re-verifies the artifact bytes the plan was confirmed against: a
+// replaced or corrupted artifact must stop the apply before any Zotero write.
+func TestApplyRefusesChangedArtifact(t *testing.T) {
+	ctx := context.Background()
+	cli := &planCLI{
+		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
+		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	plans, err := service.PlanJobs(ctx, []string{jobID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(plans[0].ArtifactPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plans[0].ArtifactPath, []byte("replaced after planning"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Apply(ctx, plans[0].ID, plans[0].ConfirmationSHA256)
+	if err == nil || !strings.Contains(err.Error(), "verifying planned artifact") {
+		t.Fatalf("changed-artifact apply = %v, want an artifact verification failure", err)
+	}
+	if cli.applyCalls != 0 {
+		t.Fatalf("apply calls = %d, want 0: a changed artifact files nothing", cli.applyCalls)
+	}
+}
 
 func enablePlanAutoImport(t *testing.T, service *Service, jobID, collection string) {
 	t.Helper()
