@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -113,6 +114,14 @@ func (r *UnavailableRecheck) runDue(ctx context.Context) error {
 		if already {
 			continue
 		}
+		refused, err := r.refusalStillApplies(ctx, row)
+		if err != nil {
+			log.Printf("papio: unavailable recheck: prior-refusal probe for job %s: %v", id, err)
+			continue
+		}
+		if refused {
+			continue
+		}
 
 		request := unavailableWorkRequest(row)
 		autoImport := row.Policy.AutoImport
@@ -121,7 +130,24 @@ func (r *UnavailableRecheck) runDue(ctx context.Context) error {
 			RecheckOf:         row.ID,
 			RecheckWindowDays: days,
 		}); err != nil {
-			// Best-effort: the job stays due and the next pass retries it.
+			// Preserve invalid snapshots in history without repeating the
+			// submission until its missing profile returns or a new outcome
+			// supersedes the refusal.
+			var invalid *InvalidRequestError
+			if errors.As(err, &invalid) {
+				resolverName := strings.TrimSpace(request.Resolver)
+				if resolverName == "" {
+					resolverName = strings.TrimSpace(r.svc.Config.Browser.DefaultResolver)
+				}
+				_, configured := r.svc.Config.OpenURLBaseFor(resolverName)
+				if recordErr := r.svc.Jobs.RecordEvent(ctx, row.ID, "unavailable.recheck_refused", map[string]any{
+					"reason": invalid.Error(), "resolver": resolverName, "window_days": days,
+					"resolver_missing": resolverName != "" && !configured,
+				}); recordErr != nil {
+					log.Printf("papio: unavailable recheck: record refusal for job %s: %v", id, recordErr)
+				}
+			}
+			// Other failures stay due so a later pass can retry them.
 			log.Printf("papio: unavailable recheck: resubmit job %s: %v", id, err)
 		}
 	}
@@ -207,6 +233,39 @@ func (r *UnavailableRecheck) alreadyRechecked(ctx context.Context, jobID string)
 			SELECT 1 FROM events WHERE job_id = ? AND kind = 'unavailable.recheck'
 		)`, jobID).Scan(&exists)
 	return exists, err
+}
+
+// refusalStillApplies keeps invalid snapshots quiet only within their current
+// unavailable outcome. A restored resolver makes the same snapshot valid again.
+func (r *UnavailableRecheck) refusalStillApplies(ctx context.Context, row *job.Row) (bool, error) {
+	events, err := r.svc.Jobs.Events(ctx, row.ID)
+	if err != nil {
+		return false, err
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		detail, _ := event["detail"].(map[string]any)
+		if event["kind"] == "job.transition" && detail["to"] == job.StateUnavailable {
+			return false, nil
+		}
+		if event["kind"] != "unavailable.recheck_refused" {
+			continue
+		}
+		if missing, _ := detail["resolver_missing"].(bool); missing {
+			refusedResolver, _ := detail["resolver"].(string)
+			resolverName := strings.TrimSpace(row.Policy.Resolver)
+			if resolverName == "" {
+				resolverName = strings.TrimSpace(r.svc.Config.Browser.DefaultResolver)
+			}
+			if resolverName != refusedResolver {
+				return false, nil
+			}
+			_, configured := r.svc.Config.OpenURLBaseFor(resolverName)
+			return !configured, nil
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func unavailableWorkRequest(row *job.Row) protocol.WorkRequest {

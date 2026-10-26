@@ -8,6 +8,7 @@ import (
 
 	"papio/internal/budget"
 	"papio/internal/job"
+	"papio/internal/sourcegate"
 )
 
 // retryKind labels why a pass ended without a verdict. It is recorded on the
@@ -47,19 +48,17 @@ func (p *retryPlan) observeOpenAccessCandidate() { p.openAccessCandidates++ }
 
 func (p *retryPlan) observeSourceCalled() { p.sourcesCalled++ }
 
-// observeWireRefusal folds in a local credit refusal (*budget.ErrExceeded) that
-// surfaced from an adapter after observeSourceCalled ran. The refusal happens
-// before any request leaves the machine, so it must not count as a source call
-// or a temporary failure: it parks on the refusal's own reset instead.
+// observeWireRefusal folds in a local credit or quota refusal that surfaced
+// from an adapter after observeSourceCalled ran. The refusal happens before
+// any request leaves the machine, so it must not count as a source call or a
+// temporary failure: it parks on the refusal's own reset instead.
 func (p *retryPlan) observeWireRefusal(err error) bool {
-	var exceeded *budget.ErrExceeded
-	if !errors.As(err, &exceeded) {
+	if !p.observeBudgetRefusal(err) {
 		return false
 	}
 	if p.sourcesCalled > 0 {
 		p.sourcesCalled--
 	}
-	p.recordExceeded(exceeded)
 	return true
 }
 
@@ -92,6 +91,11 @@ func (p *retryPlan) observeBudgetRefusal(err error) bool {
 	var deferred *budget.ErrDeferred
 	if errors.As(err, &deferred) {
 		p.recordDeferral(deferred)
+		return true
+	}
+	var latched *sourcegate.ErrQuotaLatched
+	if errors.As(err, &latched) {
+		p.recordDeferral(&budget.ErrDeferred{Until: latched.Until})
 		return true
 	}
 	return false

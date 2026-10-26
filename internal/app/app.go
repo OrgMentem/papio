@@ -2312,15 +2312,31 @@ func (s *Service) parkForRetry(ctx context.Context, row *job.Row, from string, p
 	return s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, detail, job.WithRetryAt(schedule.at))
 }
 
+// resetsRetryBudget recognizes the marker written only by job.Store.Retry.
+// Browser retry reasons do not identify operator intent: the pacer uses them too.
+func resetsRetryBudget(event map[string]any) bool {
+	if event["kind"] != "job.retry_requested" {
+		return false
+	}
+	detail, _ := event["detail"].(map[string]any)
+	reset, _ := detail["retry_budget_reset"].(bool)
+	return reset
+}
+
 // alreadyWaitedPastExhaustion reports whether this job has already spent its
-// one post-exhaustion wait on a pending gate.
+// one post-exhaustion wait on a pending gate since its latest explicit retry.
 func (s *Service) alreadyWaitedPastExhaustion(ctx context.Context, jobID string) bool {
 	events, err := s.Jobs.Events(ctx, jobID)
 	if err != nil {
 		return true // fail closed: prefer settling to looping
 	}
-	for _, event := range events {
-		if kind, _ := event["kind"].(string); kind != "job.transition" {
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		kind, _ := event["kind"].(string)
+		if resetsRetryBudget(event) {
+			break
+		}
+		if kind != "job.transition" {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
@@ -2418,9 +2434,9 @@ func (s *Service) notifyParked(ctx context.Context, jobID, to string) {
 const maxRetryAttempts = 8
 
 // retryBudgetExhausted reports whether a job has already spent its bounded
-// attempts. It counts durable transition events into retry_wait but skips
-// parks that made no request at all — retryKindSourceGate (a durable gate
-// held the source back) and retryKindAdvisory (this process's own token
+// attempts since its latest explicit retry. It counts durable transition events
+// into retry_wait but skips parks that made no request at all — retryKindSourceGate
+// (a durable gate held the source back) and retryKindAdvisory (this process's own token
 // bucket did). Charging either would settle a job "temporary source failures
 // did not clear" about sources papio never called. Events written before
 // those discriminators existed carry no retry_kind and are counted, which
@@ -2460,8 +2476,13 @@ func (s *Service) retryBudgetExhaustedProven(ctx context.Context, jobID string) 
 		return false, err
 	}
 	n := 0
-	for _, event := range events {
-		if kind, _ := event["kind"].(string); kind != "job.transition" {
+	for i := len(events) - 1; i >= 0; i-- {
+		event := events[i]
+		kind, _ := event["kind"].(string)
+		if resetsRetryBudget(event) {
+			break
+		}
+		if kind != "job.transition" {
 			continue
 		}
 		detail, ok := event["detail"].(map[string]any)

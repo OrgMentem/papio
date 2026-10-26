@@ -512,9 +512,9 @@ func (js *Store) CreateRequestForWork(ctx context.Context, requestID string, w w
 	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, force, true, "", 0, false)
 }
 
-// CreateRecheckRequestForWork creates a replacement job and records the old
-// unavailable job's re-check event in the same transaction. The event is the
-// durable idempotency key, so neither write can survive without the other.
+// CreateRecheckRequestForWork creates a replacement job, cancels the old job's
+// advisory, and records its re-check event in the same transaction. The event
+// is the durable idempotency key, so neither write can survive without the other.
 func (js *Store) CreateRecheckRequestForWork(ctx context.Context, requestID string, w work.Work, zotioKey, collection string, pol Policy, rawIDs map[string]string, who Attribution, recheckOf string, windowDays int) (CreateResult, error) {
 	return js.createRequest(ctx, requestID, w, zotioKey, collection, pol, rawIDs, who, false, true, recheckOf, windowDays, false)
 }
@@ -678,17 +678,20 @@ func (js *Store) createRequest(ctx context.Context, requestID string, w work.Wor
 			return CreateResult{}, err
 		}
 	}
-	if force && deduplicateWork {
-		// A force submission is the operator withdrawing a verdict this work
-		// already received. Retry out of unavailable cancels the conservative
+	if deduplicateWork && (force || recheckOf != "") {
+		// A force submission or maintenance recheck withdraws a verdict this
+		// work already received. Retry out of unavailable cancels the conservative
 		// advisory for the same reason (see Retry): left open it outlives its
 		// own remedy and keeps advising an action that has now been taken —
 		// here on a fresh job rather than the same one. Without this, every
 		// resubmission double-counts the work's institutional opportunity
 		// against a job that no longer represents it.
-		superseded, err := supersededJobsForCanonicalWork(ctx, tx, w)
-		if err != nil {
-			return CreateResult{}, err
+		superseded := []string{recheckOf}
+		if force {
+			superseded, err = supersededJobsForCanonicalWork(ctx, tx, w)
+			if err != nil {
+				return CreateResult{}, err
+			}
 		}
 		for _, oldID := range superseded {
 			if _, err := tx.ExecContext(ctx,
@@ -1832,7 +1835,11 @@ func (js *Store) Retry(ctx context.Context, jobID string) error {
 		  WHERE job_id = ? AND status IN ('fetching','retryable')`, jobID); err != nil {
 		return err
 	}
-	detail, _ := json.Marshal(map[string]any{"from": from, "to": StateResolving, "reason": "explicit_retry"})
+	// Only jobs retry grants a fresh acquisition budget. Browser redrives
+	// share retry reasons with automatic paths, so reason alone is not authority.
+	detail, _ := json.Marshal(map[string]any{
+		"from": from, "to": StateResolving, "reason": "explicit_retry", "retry_budget_reset": true,
+	})
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO events(job_id, at, kind, detail_json) VALUES(?, ?, 'job.retry_requested', ?)`,
 		jobID, now, string(detail)); err != nil {
