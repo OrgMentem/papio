@@ -4,10 +4,13 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	"papio/internal/app"
 	"papio/internal/delivery"
 	"papio/internal/job"
 )
@@ -111,6 +114,36 @@ func TestCancelReportsThatTheCancellationCommittedWhenCompensationFails(t *testi
 						t.Fatal("a human action is still open: the dismissal did not commit")
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestFailureCompensationIncompleteTakesPrecedenceOverCause(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{name: "record_not_found", cause: sql.ErrNoRows},
+		{name: "conflict", cause: job.ErrConflict},
+		{name: "action_not_found", cause: job.ErrHumanActionNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := fmt.Errorf("%w: %w", app.ErrCompensationIncomplete,
+				errors.Join(tc.cause, errors.New("private restore failure")))
+			result, rpcErr := failure(err)
+			if rpcErr == nil {
+				t.Fatal("compensation failure returned no error")
+			}
+			if result != nil {
+				t.Fatalf("result = %q, want no success result", result)
+			}
+			if rpcErr.Code != "internal" {
+				t.Fatalf("code = %q, want internal for incomplete compensation", rpcErr.Code)
+			}
+			const wantMessage = "the request was recorded, but releasing its document-delivery request failed; the recorded change stands, so resolve the delivery request by hand rather than repeating this command"
+			if rpcErr.Message != wantMessage {
+				t.Fatalf("message = %q, want %q", rpcErr.Message, wantMessage)
 			}
 		})
 	}
