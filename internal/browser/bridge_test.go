@@ -2188,6 +2188,63 @@ func TestHumanActionResolveDismissCancelsAwaitingHandoff(t *testing.T) {
 	}
 }
 
+// TestHumanActionResolveDismissReportsAppliedWhenCompensationFails pins the
+// bridge half of the compensation precedence: the dismissal committed and
+// only the follow-up orphan of the job's live delivery request failed, so
+// the recorded change stands and the inbox must report "applied" — exactly
+// as the API failure() arm reports its fixed template instead of
+// "operation failed". Reporting "conflict" would invite a redismiss that
+// conflicts against the action this very attempt resolved; reporting
+// "error" would print a failure the operator answers by retrying a verb
+// that already committed. Reordering the bridge checks so ErrConflict wins
+// over app.ErrCompensationIncomplete fails this test.
+func TestHumanActionResolveDismissReportsAppliedWhenCompensationFails(t *testing.T) {
+	b, jobs := newDeliveryBridge(t)
+	ctx := context.Background()
+	id := parkDocumentDelivery(t, jobs, b.svc, "wr_browser_dismiss_comp", handoffWork(), "illiad", "submitted", "TN-COMP-1")
+	actions, err := jobs.ListHumanActionsForJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("open actions = %d, want 1", len(actions))
+	}
+	actionID := actions[0].Action.ID
+	revision := actions[0].Action.Revision
+
+	// The injected orphan failure deliberately wraps job.ErrConflict: the
+	// compensation wrapper therefore matches BOTH sentinels, which is
+	// exactly the case the precedence decides. Old code (conflict first)
+	// reports "conflict" here and fails this test; sentinel-first reports
+	// "applied".
+	b.svc.Delivery.SetBeforeOrphanCASForTest(func() error {
+		return fmt.Errorf("injected: the delivery row could not be orphaned: %w", job.ErrConflict)
+	})
+	t.Cleanup(func() { b.svc.Delivery.SetBeforeOrphanCASForTest(nil) })
+	runSync(t, b, hello())
+	msgs, _ := runSync(t, b, inFrame(t, protocol.MsgHumanActionResolve, "",
+		protocol.HumanActionResolvePayload{RequestID: "request-dismiss-comp-001", ActionID: actionID, Verdict: "dismiss", ExpectedRevision: revision}))
+	result := firstOfType(msgs, protocol.MsgHumanActionResolveResult)
+	if result == nil {
+		t.Fatalf("human action resolve response missing: %v", msgs)
+	}
+	payload := result.Payload.(*protocol.HumanActionResolveResultPayload)
+	if payload.RequestID != "request-dismiss-comp-001" || payload.Outcome != "applied" {
+		t.Fatalf("dismiss with failed compensation = %+v, want applied", payload)
+	}
+	// The dismissal really did commit: that is what makes any other outcome
+	// a lie the inbox acts on.
+	open, err := jobs.ListHumanActions(ctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range open {
+		if action.ID == actionID {
+			t.Fatalf("dismissed action %d still open despite applied outcome", actionID)
+		}
+	}
+}
+
 func TestHelloAckAdvertisesResolverOrigins(t *testing.T) {
 	b, _, _, _ := newBridge(t)
 	msgs, _ := runSync(t, b, hello())

@@ -53,7 +53,12 @@ func artifactText(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		SHA256    string `json:"sha256,omitempty"`
 		FirstPage int    `json:"first_page,omitempty"`
 		LastPage  int    `json:"last_page,omitempty"`
-		MaxBytes  int    `json:"max_bytes,omitempty"`
+		// MaxBytes is a pointer so an explicitly sent zero stays
+		// distinguishable from an omitted cap: zero means "no cap was
+		// named" on the wire, and the CLI rejects --max-bytes 0, so the
+		// RPC must reject an explicit 0 the same way rather than silently
+		// serving the default.
+		MaxBytes *int `json:"max_bytes,omitempty"`
 	}
 	if err := ipc.DecodeParams(raw, &params); err != nil {
 		return badParams(err)
@@ -64,8 +69,12 @@ func artifactText(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 	if params.FirstPage < 0 || params.LastPage < 0 || (params.LastPage != 0 && params.FirstPage > params.LastPage) {
 		return badParams(fmt.Errorf("invalid page range %d-%d", params.FirstPage, params.LastPage))
 	}
-	if params.MaxBytes < 0 || params.MaxBytes > pdf.MaxTextBytes {
+	if params.MaxBytes != nil && (*params.MaxBytes < 1 || *params.MaxBytes > pdf.MaxTextBytes) {
 		return badParams(fmt.Errorf("max_bytes must be between 1 and %d", pdf.MaxTextBytes))
+	}
+	maxBytes := 0
+	if params.MaxBytes != nil {
+		maxBytes = *params.MaxBytes
 	}
 	if system == nil || system.Jobs == nil {
 		return nil, &ipc.RPCError{Code: "precondition_failed", Message: "job store is not configured"}
@@ -85,7 +94,7 @@ func artifactText(ctx context.Context, raw json.RawMessage, system *bootstrap.Sy
 		return nil, textRefusal("precondition_failed", ArtifactTextNotEligibleClass, "artifact is not a PDF; text extraction needs a PDF")
 	}
 	result, err := pdf.ExtractPageText(ctx, artifact.Path, system.PDFCapability, pdf.DefaultSemanticOptions(), pdf.PageTextRequest{
-		FirstPage: params.FirstPage, LastPage: params.LastPage, PagesTotal: artifact.PageCount, MaxBytes: params.MaxBytes,
+		FirstPage: params.FirstPage, LastPage: params.LastPage, PagesTotal: artifact.PageCount, MaxBytes: maxBytes,
 	})
 	switch {
 	case errors.Is(err, pdf.ErrToolUnavailable):

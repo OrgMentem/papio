@@ -5685,21 +5685,32 @@ func (b *Bridge) humanActionResolve(ctx context.Context, request *protocol.Human
 		// the inbox answers by refreshing, not as an "error".
 		_, err := b.dismissAction(ctx, request.ActionID, request.ExpectedRevision)
 		if err != nil {
+			if errors.Is(err, app.ErrCompensationIncomplete) {
+				// The dismissal COMMITTED and only releasing the job's
+				// document-delivery request failed. The recorded change
+				// stands — retrying the dismissal would conflict against
+				// the action this very attempt resolved — so report
+				// "applied", exactly as the API failure() arm reports the
+				// fixed template instead of "operation failed". The
+				// stranded delivery request is an operator concern with an
+				// operator surface — the daemon log names it and `papio
+				// delivery` resolves it — not a property of this item.
+				// This check MUST come before the conflict check: the
+				// compensation wrapper carries the action's job id while a
+				// conflicting close carries none, but a wrapped cause can
+				// still match ErrConflict, and the API handler fixed the
+				// same precedence for the same reason (failure() checks
+				// the compensation sentinel first).
+				log.Printf("papio: %v", err)
+				if b.preview != nil {
+					b.preview.Revoke(request.ActionID)
+				}
+				return b.humanActionResolveResult(request.RequestID, "applied", "")
+			}
 			if errors.Is(err, job.ErrConflict) {
 				return b.humanActionResolveResult(request.RequestID, "conflict", "")
 			}
-			if !errors.Is(err, app.ErrCompensationIncomplete) {
-				return b.humanActionResolveResult(request.RequestID, "error", err.Error())
-			}
-			// The dismissal COMMITTED and only releasing the job's
-			// document-delivery request failed. Reporting "error" here would be
-			// a lie the inbox acts on: it prints the detail as a failure, the
-			// operator dismisses again, and the second attempt conflicts
-			// against the action its own first attempt resolved. Report what
-			// the store says. The stranded delivery request is an operator
-			// concern with an operator surface — the daemon log names it and
-			// `papio delivery` resolves it — not a property of this item.
-			log.Printf("papio: %v", err)
+			return b.humanActionResolveResult(request.RequestID, "error", err.Error())
 		}
 		if b.preview != nil {
 			b.preview.Revoke(request.ActionID)

@@ -262,7 +262,13 @@ func runInProcess(ctx context.Context, factory RootFactory, path []string, flags
 	finalArgs = append(finalArgs, "--json")
 	finalArgs = append(finalArgs, cliArgsFromMCP(flags)...)
 	if strings.TrimSpace(argsStr) != "" {
-		finalArgs = append(finalArgs, splitShellArgs(argsStr)...)
+		// Both handlers validate args first, so a split error here is
+		// unreachable; refuse rather than guess if it ever happens.
+		tokens, err := splitShellArgs(argsStr)
+		if err != nil {
+			return mcplib.NewToolResultError(err.Error())
+		}
+		finalArgs = append(finalArgs, tokens...)
 	}
 	root.SetArgs(finalArgs)
 	if err := root.ExecuteContext(ctx); err != nil {
@@ -312,8 +318,11 @@ func cliArgsFromMCP(flags map[string]any) []string {
 }
 
 // splitShellArgs whitespace-splits with double- and single-quoted token
-// preservation and backslash escapes.
-func splitShellArgs(s string) []string {
+// preservation and backslash escapes. An unterminated quote or a trailing
+// escape is a parse error, not a token boundary: silently dropping the quote
+// would turn malformed agent input into a different command than the caller
+// encoded, with no error to tell them apart.
+func splitShellArgs(s string) ([]string, error) {
 	var tokens []string
 	var cur []rune
 	inSingle := false
@@ -348,12 +357,15 @@ func splitShellArgs(s string) []string {
 		}
 	}
 	if escaped {
-		cur = append(cur, '\\')
+		return nil, fmt.Errorf("args ends in an unfinished escape")
+	}
+	if inSingle || inDouble {
+		return nil, fmt.Errorf("args has an unterminated quote")
 	}
 	if hasToken {
 		tokens = append(tokens, string(cur))
 	}
-	return tokens
+	return tokens, nil
 }
 
 // --- Validation ---
@@ -370,9 +382,13 @@ func validateFlags(flags map[string]any, allowed map[string]struct{}) error {
 }
 
 // validateArgs rejects raw flag tokens smuggled through the positional args
-// string.
+// string, and malformed quoting the splitter cannot tokenize safely.
 func validateArgs(argsStr string) error {
-	for _, token := range splitShellArgs(argsStr) {
+	tokens, err := splitShellArgs(argsStr)
+	if err != nil {
+		return err
+	}
+	for _, token := range tokens {
 		if strings.HasPrefix(token, "-") {
 			return fmt.Errorf("args accepts positional arguments only; raw flag %q is not allowed", token)
 		}

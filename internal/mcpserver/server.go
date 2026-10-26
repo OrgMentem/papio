@@ -159,7 +159,25 @@ func handleAcquireBatch(system *bootstrap.System, deps toolDependencies) server.
 			AutoImport: &autoImport, Collection: collection, Resolver: resolver, Label: label, IncludeOwned: includeOwned, Now: deps.now(),
 		})
 		if err != nil {
-			return mcplib.NewToolResultError(err.Error()), nil
+			if output == nil {
+				return mcplib.NewToolResultError(err.Error()), nil
+			}
+			// Submit reports partial failures through (output, firstErr):
+			// the jobs in output.Submitted were created and the manifest
+			// names them. Dropping output here would hide the batch id and
+			// every created job, leaving the caller unable to wait on or
+			// report the in-flight work. Return the payload with the error
+			// flag set, the same way the CLI prints the output before its
+			// error, so the batch id and submitted job ids stay visible.
+			data, marshalErr := json.Marshal(output)
+			if marshalErr != nil {
+				return mcplib.NewToolResultError(err.Error()), nil
+			}
+			return &mcplib.CallToolResult{
+				Content:           []mcplib.Content{mcplib.TextContent{Type: "text", Text: string(data) + "\n" + err.Error()}},
+				StructuredContent: output,
+				IsError:           true,
+			}, nil
 		}
 		return jsonToolResult(output)
 	}
