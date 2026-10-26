@@ -104,3 +104,51 @@ func TestSubmitDeliveryRefusesAQueuedJobAWorkerHolds(t *testing.T) {
 		t.Fatalf("provider POSTs = %d, want 0", p.posts.Load())
 	}
 }
+
+func TestSubmitToProviderLostReservationDoesNotStopWorker(t *testing.T) {
+	for _, cancelOwner := range []bool{false, true} {
+		name := "request_cancelled"
+		if cancelOwner {
+			name = "owner_cancelled"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := newAmbiguousProvider(t, http.StatusOK, `{"TransactionNumber":4242}`)
+			svc, jobs, deliverySvc := newAmbiguousDeliveryService(t, p)
+			ctx := context.Background()
+			id, err := svc.Submit(ctx, deliveryWorkRequest("wr_lost_reservation", "10.1000/lost-reservation"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := jobs.Transition(ctx, id, job.StateQueued, job.StateResolving, map[string]any{"reason": "test_setup"}); err != nil {
+				t.Fatal(err)
+			}
+			row, err := jobs.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := seedOfferedRecovery(t, jobs, deliverySvc, id, "default", "illiad", "digest")
+			wantState := job.StateRetryWait
+			if cancelOwner {
+				if err := jobs.Transition(ctx, id, job.StateResolving, job.StateCancelled, map[string]any{"reason": "test_cancel"}); err != nil {
+					t.Fatal(err)
+				}
+				wantState = job.StateCancelled
+			} else {
+				if err := deliverySvc.UpdateState(ctx, request.ID, delivery.StateCancelled); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := svc.submitToProvider(ctx, row, job.StateResolving, svc.Config.Browser.DocumentDelivery,
+				request.IdempotencyKey, delivery.GateProfile{}, request); err != nil {
+				t.Fatalf("lost submission reservation: %v", err)
+			}
+			if p.posts.Load() != 0 {
+				t.Fatalf("provider POSTs = %d, want none after losing reservation", p.posts.Load())
+			}
+			got, err := jobs.Get(ctx, id)
+			if err != nil || got.State != wantState {
+				t.Fatalf("job = %+v, %v; want %s", got, err, wantState)
+			}
+		})
+	}
+}

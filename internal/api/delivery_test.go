@@ -330,9 +330,18 @@ func TestDeliveryActionConfirmRequestExistsMovesJobToRetryWait(t *testing.T) {
 		map[string]any{"job_id": jobID, "operation": "confirm_request_exists"}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
 		t.Fatalf("confirm_request_exists without provider_reference = %#v, want invalid_argument", rpcErr)
 	}
+	for _, reference := range []string{"TN-42", "0", "-42", "999999999999999999999999999999"} {
+		if rpcErr := callMethod(t, router, "delivery.action",
+			map[string]any{"job_id": jobID, "operation": "confirm_request_exists", "provider_reference": reference}, nil); rpcErr == nil || rpcErr.Code != "invalid_argument" {
+			t.Fatalf("confirm_request_exists with reference %q = %#v, want invalid_argument", reference, rpcErr)
+		}
+	}
+	if row, err := system.Jobs.Get(context.Background(), jobID); err != nil || row.State != job.StateAwaitingHuman {
+		t.Fatalf("job after invalid references = %+v, %v; want awaiting_human", row, err)
+	}
 
 	var result DeliveryActionResult
-	params := map[string]any{"job_id": jobID, "operation": "confirm_request_exists", "provider_reference": "TN-42"}
+	params := map[string]any{"job_id": jobID, "operation": "confirm_request_exists", "provider_reference": "42"}
 	if rpcErr := callMethod(t, router, "delivery.action", params, &result); rpcErr != nil {
 		t.Fatalf("confirm_request_exists: %v", rpcErr)
 	}
@@ -342,8 +351,8 @@ func TestDeliveryActionConfirmRequestExistsMovesJobToRetryWait(t *testing.T) {
 	if result.Detail == nil || result.Detail.Request == nil || result.Detail.Request.State != "pending" {
 		t.Fatalf("Detail.Request = %#v, want state pending", result.Detail)
 	}
-	if result.Detail.Request.ProviderReference != "TN-42" {
-		t.Fatalf("ProviderReference = %q, want TN-42", result.Detail.Request.ProviderReference)
+	if result.Detail.Request.ProviderReference != "42" {
+		t.Fatalf("ProviderReference = %q, want 42", result.Detail.Request.ProviderReference)
 	}
 
 	row, err := system.Jobs.Get(context.Background(), jobID)
@@ -549,7 +558,7 @@ func TestDeliveryConfirmRequestExistsAtomicityPerInjectionPoint(t *testing.T) {
 			case "transition":
 				job.SetBeforeTransitionTxForTest(tc.inject)
 			}
-			params := map[string]any{"job_id": jobID, "operation": "confirm_request_exists", "provider_reference": "TN-ATOMIC"}
+			params := map[string]any{"job_id": jobID, "operation": "confirm_request_exists", "provider_reference": "4242"}
 			var result DeliveryActionResult
 			rpcErr := callMethod(t, router, "delivery.action", params, &result)
 			if rpcErr == nil {

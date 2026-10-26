@@ -518,10 +518,14 @@ func (s *Service) RecordPollTx(ctx context.Context, tx *sql.Tx, id int64, provid
 	}
 	now := store.Now()
 	next := store.FormatTime(nextCheckAt)
+	// A corrected reference must release its reconciliation park, including
+	// an early wake before the next provider check can clear poll failures.
 	_, err := tx.ExecContext(ctx, `
 		UPDATE delivery_requests
-		SET provider_reference = ?, last_checked_at = ?, next_check_at = ?, updated_at = ?
-		WHERE id = ?`, providerReference, now, next, now, id)
+		SET provider_reference = ?, last_checked_at = ?, next_check_at = ?, updated_at = ?,
+		    consecutive_poll_failures = CASE WHEN last_poll_error_class = ? THEN 0 ELSE consecutive_poll_failures END,
+		    last_poll_error_class = CASE WHEN last_poll_error_class = ? THEN '' ELSE last_poll_error_class END
+		WHERE id = ?`, providerReference, now, next, now, PollErrorClassInvalidReference, PollErrorClassInvalidReference, id)
 	return err
 }
 
