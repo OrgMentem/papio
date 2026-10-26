@@ -281,6 +281,270 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **`papio doctor` reports when missing adapter control blocks browser
+  automation.** It no longer reports a passing check when the browser refuses
+  automation, or advises deleting the control file. It also shows the age of
+  the last successful fetch.
+- **Unavailable adapter control retries every five minutes.** An unverifiable
+  document or network failure no longer waits for the daily check. Restarting
+  the daemon preserves the retry delay; a successful fetch restores daily
+  checks.
+- **The text API rejects an explicit zero byte limit.** `artifacts.text_v1`
+  now returns `invalid_argument` for `max_bytes: 0`, matching the CLI. Omitting
+  the limit still selects the default.
+- **`papio_acquire_batch` keeps the batch and job ids after a partial
+  failure.** Its MCP error result now includes the output for jobs it created,
+  so an agent can follow them without submitting the batch again.
+- **MCP command execution rejects unfinished quotes and trailing escapes.**
+  These malformed arguments now fail before any command runs.
+- **Dismissing a browser action reports when the dismissal already took
+  effect.** If only the later undo step fails, the result now says `applied`
+  instead of reporting a conflict as though nothing changed.
+- **Failed acquisition bookkeeping no longer silently loses work.** *papio*
+  reports failed writes of attempt outcomes, budget waits and related-paper
+  candidates before advancing the job. Failed related-paper searches and
+  landing-page candidate writes remain recoverable.
+- **Bibliography imports accept comment headers and string dates.** BibTeX
+  and RIS detection now skips export headers, and an email address outside a
+  BibTeX entry no longer breaks parsing. CSL-JSON accepts string `issued`
+  dates using their leading four-digit year, and an unsupported date shape
+  no longer rejects the whole file; malformed BibTeX entries still fail.
+- **Confirming a grabbed PDF no longer blocks browser communication on a
+  slow downloads folder.** A staging timeout keeps the job binding and
+  quarantine copy for recovery, and further bindings wait while the folder
+  remains unhealthy. Confirmation checks for intervening changes before
+  ingestion and recognises a grab that recovery already ingested.
+- **Repeated doctor checks stay bounded when a downloads folder stops
+  responding.** A timed-out directory read no longer starts another blocked
+  read on every check. This also applies to the legacy download folder.
+- **CLI startup and daemon stop no longer wait indefinitely on browser
+  activity.** The version check no longer waits behind browser operations,
+  and `papio daemon stop` skips that check. Version checks and stop requests
+  time out after two seconds, with advice to inspect the daemon log and use
+  `SIGQUIT`.
+- **RIS and BibTeX exports preserve word boundaries and stray braces.**
+  Newlines and tabs now become spaces instead of joining adjacent words.
+  BibTeX text safely represents unmatched braces, and DOI or eprint fields
+  encode unmatched braces without changing balanced values.
+- **Interrupted page-bulk submissions retain a recoverable batch.** A
+  failure after creating jobs now leaves the batch `partial`; replay with the
+  same request id completes its membership and returns the total. Older
+  cached replies gain missing totals, but replay after a job finishes can
+  still create a new job.
+- **Page-bulk configuration errors no longer mark papers invalid.** The
+  current submission path keeps the failed chunk available for replay after
+  you fix the access mode, resolver or missing service. Invalid paper input
+  still counts as `invalid`; the older submission path keeps its previous
+  counting.
+- **`papio campaign report` no longer claims an interrupted submission
+  created a job.** An in-flight work with no job now reports `failed` with
+  `missing_job`, matching the batch report.
+- **A slow credential read no longer blocks credential loading for the
+  daemon's lifetime.** Loading waits for a busy keyring within one 30-second
+  deadline, and a cancelled helper does not start another keyring call.
+  Doctor distinguishes stored credentials from loaded credentials and names
+  the required daemon restart.
+- **`papio init` preserves concurrent credential changes.** If a credential
+  bind, set or migration changes the configuration while init runs, init
+  reports a conflict instead of overwriting that change.
+- **Cancelled jobs no longer leave live delivery requests without an
+  outcome.** Maintenance marks an orphaned request `unknown_outcome` and
+  records it once. A request reassigned to a live job stays untouched.
+- **Manual and automatic delivery submission no longer send the same
+  request twice.** Only one caller can reserve the request, and the other
+  leaves the active submission's state intact.
+- **A delivery request missing from its first status check no longer retries
+  forever.** After three increasingly delayed retries, *papio* reconciles
+  the request. If it remains absent, the request becomes `unknown_outcome`.
+- **A broken title-lookup response no longer ends a job as
+  `no_identifier`.** When Crossref or OpenAlex stops sending the response,
+  an identifier-free job takes the bounded retry path. A complete but invalid
+  JSON response remains an error.
+- **Publication watches report DOIs that Crossref does not know.** A 404,
+  including for an arXiv or DataCite DOI, now appears in the watch's
+  `last_error` as an unsupported source. Acquisition's related-paper lookup
+  still treats it as no result.
+- **Citation-metadata outages now delay import instead of dropping
+  metadata.** Lookup failures and budget refusals queue
+  `citation_metadata_unavailable` without spending an import attempt, with
+  delays of one minute, ten minutes, one hour and then twelve hours.
+  Status, batch reports and activity name the outage and retry time; a
+  discovery 404 still allows import.
+- **Grabbed PDFs survive failed saves and interrupted adoption.** *papio*
+  keeps the quarantine copy until ingestion succeeds and records outcomes
+  before moving or deleting files. Recovery also finds quarantined grabs
+  whose original download folder has gone, and reports individual failures
+  without skipping the remaining grabs.
+- **Dismissing a grab no longer deletes a PDF already bound to a job.** A
+  stale dismissal now reports a conflict and keeps the bound grab. Cleanup
+  runs without blocking database writes, and failed cleanup remains available
+  for recovery while the dismissed grab stays hidden.
+- **Rejecting a supplied PDF always keeps its replacement action with the
+  parked job.** The same applies to an adopted download. A failed save no
+  longer leaves the job parked without the action to supply a different file.
+- **DOIs with dot segments no longer open a different paper.** *papio* omits
+  browser links whose DOI contains `.` or `..` path segments, including
+  encoded spellings, because browsers change their destination.
+  `papio actions open` counts these handoffs as skipped, prints a notice and
+  exits nonzero, with `truncated: true` in JSON.
+- **An unreachable doi.org no longer delays every handoff in a repair
+  pass.** After the first connection failure, the rest of the pass proceeds
+  without another registry request. The next pass tries again.
+- **Handoff repair and action reminders now visit every pending item.**
+  Their progress no longer interferes, so neither skips alternate pages of
+  work.
+- **Daemon shutdown waits for admitted filing hooks and refuses new ones.**
+  A hook could previously start after shutdown had finished waiting.
+  Refiling after shutdown begins now reports a "daemon is shutting down"
+  conflict.
+- **An abandoned filing hook no longer blocks archiving forever.** Startup
+  releases reservations whose owner has gone, and expires sufficiently old
+  reservations whose ownership it cannot establish. Fresh reservations and
+  those held by the current daemon stay intact.
+- **A successful hook can leave a background child running.** A hook that
+  exits zero now records `ok` even if its child keeps an output pipe open.
+  Timeouts and cancellation still report their own errors.
+- **Laptop sleep no longer lets two workers run the same locally held
+  job.** An expired clock-based lease no longer makes an active job available
+  to another worker. Losing a lease stops that worker's processing instead
+  of stopping the daemon, though a review write already in progress can
+  still finish.
+- **Long non-ASCII titles no longer corrupt job event details.** Title
+  shortening now preserves whole characters and valid JSON. Unavailable
+  rechecks also tolerate older corrupt event details.
+- **Closing a CLI connection cancels its daemon request on macOS and
+  Linux.** The daemon no longer continues the request merely because it did
+  not notice the disconnect. Behaviour on Windows is unchanged.
+- **Incomplete library exports no longer erase retraction notices and
+  acknowledgements.** *papio* rejects interrupted or changing reads and warns
+  when a library becomes empty or more than ten times smaller. A genuine
+  reduction needs complete reads with the same count for at least 72 hours;
+  restored exports, changed counts and failed reads restart that window.
+  Holdings checks retain their last good count across daemon restarts.
+- **A stalled library export no longer blocks other maintenance.** Reads
+  have a bounded wait, and further reads of a still-blocked path fail quickly
+  instead of starting more work.
+- **Holdings exports detect comment headers without an explicit format.**
+  A blank export counts as an empty library, and detection skips `%`
+  comments. Input that would only match JSONL now reports "cannot detect
+  format" instead of guessing.
+- **A stalled managed folder no longer blocks database writes.** Filing
+  records its pending attempt before accessing the folder. If archiving or a
+  failed receipt interrupts filing, *papio* undoes the new link; maintenance
+  also recovers interrupted cleanup for archived jobs without removing a
+  replacement file.
+- **Temporary managed-folder errors now retry instead of reporting a
+  permanent conflict.** Transient file-open or status failures report
+  `destination_unavailable` with a retry time. A definitely invalid artifact
+  or a different existing destination still fails permanently.
+- **Failed webhooks retry only when delivery is known not to have
+  succeeded.** Connection, DNS and certificate failures, plus HTTP 429 or 503,
+  retry after at least five minutes for up to 24 hours from the first
+  failure, including immediate notifications. Other HTTP errors and
+  interrupted sends remain `failed` to avoid duplicates, and alert watches
+  no longer mark a failed delivery as alerted.
+- **Stopping the daemon no longer leaves unsent webhooks stuck in
+  `sending`.** A graceful stop returns a claimed but unsent notification to
+  `pending`, or records `failed` if cancellation interrupts its send.
+  A hard kill during a send still leaves an ambiguous `sending` record.
+- **Artifact recovery keeps files when their state is uncertain.**
+  Permission and I/O errors no longer count as missing files or stop startup,
+  and a failed save keeps the quarantine copy. Affected runnable jobs wait
+  without spending retry budget, with increasing delays up to one hour;
+  maintenance retries recovery while other rows continue.
+- **Losing the retraction cache no longer repeats acknowledged alerts.**
+  Notifications now check acknowledgements in the database even when
+  `retraction-cache.json` is missing. A power loss can still lose the most
+  recent acknowledgement.
+- **Retraction checks recover after the clock moves backwards.** A
+  future-dated cache no longer counts as fresh, so *papio* fetches again and
+  applies normal retry delays on failure. Doctor warns about the timestamp.
+- **Retraction tagging reports a disabled source without removing existing
+  tags.** Enabling `zotio.retraction_tags` while disabling `retraction_watch`
+  now produces an actionable maintenance error.
+- **Failed Zotero tag writes no longer retry and log every minute.**
+  Repeated failures increase the delay from five minutes to six hours.
+  Health stays degraded without repeated log messages until tagging
+  recovers.
+- **`papio jobs retry` gives the job a fresh retry budget.** An explicit
+  retry now resets temporary-failure accounting and the final source-gate
+  wait. Automatic publisher retries and fallback routes keep their existing
+  budget.
+- **OpenAlex quota waits retain the provider's reset time.** A quota refusal
+  during a request now records `budget_blocked` instead of losing its quota
+  information inside a temporary error.
+- **Unavailable rechecks wait quietly for a removed resolver profile.**
+  *papio* records one refusal instead of failing on every pass and resumes
+  when the profile returns. A new unavailable outcome replaces the old
+  refusal.
+- **A replacement job clears the old job's OpenURL advisory.** An
+  unavailable recheck now cancels the superseded job's `openurl_available`
+  action when it records the replacement.
+- **OpenAlex search filters now reserve ten credits.** Plain filters still
+  cost one credit. If a response reports a higher cost than *papio* reserved,
+  *papio* blocks further requests rather than continuing with an
+  underestimated cost.
+- **OpenAlex discovery with an API key no longer waits on anonymous access
+  restrictions.** Discovery now keeps the configured key when applying
+  request pacing.
+- **Refused requests no longer consume a pacing allowance.** A refused
+  budget reservation returns its rate-limit allowance, so it does not delay
+  later permitted requests unnecessarily.
+- **Host suppression no longer counts the same attempt twice.** Rebuilding
+  history and observing new outcomes now count each completed attempt once,
+  even when they overlap or outcomes arrive out of order.
+- **Once-only submissions report request errors instead of internal
+  failures.** The API returns `invalid_argument` for an unknown resolver,
+  `configuration_required` for an unset access mode, and `conflict` with
+  the cause for a once-only refusal.
+- **Campaign submission no longer creates a second live job for a
+  conflicting filing destination.** With the same filing intent, it reuses
+  the live job; a different collection, auto-import choice or library item
+  reports `submission_failed` naming that job, and the campaign continues.
+  Version or resolver mismatches keep their previous behaviour.
+- **Interrupted source responses now retry instead of ending acquisition.**
+  Timeouts, resets and truncated response bodies take the temporary-error
+  path across resolvers, and interrupted ILLiad status responses keep normal
+  polling. Complete but malformed responses still report response errors.
+- **Temporary landing-page failures no longer lose the PDF lookup.**
+  Server errors, HTTP 429 or 408, timeouts and truncated bodies on the first
+  lookup now retry on a later pass. The wait respects `Retry-After`.
+- **A failed PDF host no longer delays the discovery service's API.**
+  Download failures now leave the source API's request gate alone. The
+  affected job still waits before retrying.
+- **Removing a running watch stops further submissions.** Discovery,
+  backfill and digest acquisition now check for removal before each new
+  submission.
+- **Watch timeouts no longer disappear from the failure record.** *papio*
+  records failures even after the maintenance deadline and starts no more
+  watches in that expired pass.
+- **A new arXiv version no longer resubmits a work already acquired by a
+  watch.** The watch recognises earlier submission receipts across versions.
+  A new acquisition still keeps its requested version.
+- **Watches resume after the clock moves backwards.** A future
+  `last_run_at` no longer suppresses ordinary or publication watches.
+- **Search skips services that do not support the requested capability.**
+  Unsupported searches no longer mark those services as failing. The search
+  still reports an error if no service supports the request.
+- **An unverifiable Zotero import no longer waits forever on an older
+  zotio.** If zotio cannot report desktop presence, *papio* keeps the result
+  ambiguous for up to 24 hours without repeating the save. It then spends
+  the retry budget toward `import_failed` with instructions to check Zotero
+  and upgrade zotio; an upgraded zotio can reconcile normally.
+- **Zotero attachment filenames now work on Windows.** Invalid filename
+  characters become hyphens, and reserved device names gain an underscore
+  prefix.
+- **A failed Zotero ownership check no longer triggers a blind import.**
+  Item and identifier lookup failures now defer import with a retryable
+  error instead of assuming the paper or PDF is absent. Only a definite
+  not-found response allows planning to continue.
+- **Large Zotero ownership checks respect the 50-key limit.** *papio*
+  splits both identifier and keyed-item checks into groups of at most 50.
+  An import-backfill dry run now reports a failed lookup instead of saying
+  Zotero is not configured.
+- **Archiving a job while auto-import waits now prevents the import.**
+  Auto-import checks archive status again when it claims the job, so an
+  earlier ready-state check cannot import an already archived paper.
 - **Cancelling a job while it downloads no longer stops the daemon.** A cancel
   does not interrupt a download in flight, so when the download then succeeded
   the job's state check failed and the error stopped the scheduler and the
