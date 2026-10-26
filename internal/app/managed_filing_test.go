@@ -65,8 +65,8 @@ func TestManagedFolderSecondBeginTxFailureReturnsError(t *testing.T) {
 		t.Fatalf("filing after failed second transaction = %+v", got)
 	}
 
-	// The first transaction must commit the attempt even though publication
-	// cannot start, so reopening the store still exposes pending work.
+	// The first transaction commits the attempt before publication. Failure
+	// to record the receipt leaves pending work and compensates the new link.
 	reopened, err := store.Open(ctx, svc.Config.DataDir)
 	if err != nil {
 		t.Fatal(err)
