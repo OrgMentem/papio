@@ -259,6 +259,22 @@ const HANDOFF_DRIVE_TIMEOUT_MS = 3 * 60_000;
 // schedule so a slow render still reaches a decisive verdict.
 const CLASSIFY_RETRY_MS = 2_500;
 const MAX_CLASSIFY_RETRIES = 8;
+/** Bound for one page-side adapter effect while it owns the single global
+ * effect governor. A provider API endpoint that accepts the connection and
+ * then hangs would otherwise hold the slot until the browser's own network
+ * timeout (potentially minutes), stalling every other handoff, sign-in
+ * reissue and grab. Past this bound the worker abandons the attempt, records
+ * a timeout decline and frees the slot for the next effect, mirroring the
+ * agent path's never-returning-injection guard. Deliberately not the 60s
+ * provider drain lease: the two expiries must never alias in logs or timer
+ * buckets. */
+export const EFFECT_EXECUTION_TIMEOUT_MS = 120_000;
+/** Bound for the single fetch an api-method page effect performs with the
+ * page's session cookies. Fires inside the injected page function via
+ * AbortController, so a hanging provider endpoint resolves the effect as
+ * refused instead of holding the renderer (and, through it, the worker's
+ * effect governor) indefinitely. */
+export const PAGE_API_FETCH_TIMEOUT_MS = 30_000;
 function unknownGraceMs(spec?: AdapterSpec): number {
   const configured = spec?.unknownGraceMs;
   return configured !== undefined && Number.isFinite(configured)
@@ -2114,9 +2130,36 @@ export async function resolveDownloadURL(
   let target = built;
   if (jsonField) {
     try {
-      const r = await fetch(built, { credentials: "include" });
-      if (!r.ok) return null;
-      const data = (await r.json()) as Record<string, unknown>;
+      // Same bound as the api-method page effect below: a provider endpoint
+      // that accepts the connection and then hangs must resolve as a
+      // refusal, never hold the injection (and its caller) indefinitely.
+      const fetchController = new AbortController();
+      const fetchTimer = setTimeout(() => fetchController.abort(), PAGE_API_FETCH_TIMEOUT_MS);
+      // The signal covers the body read as well as the headers: a hung body
+      // would otherwise stall response.json() past the bound.
+      const { promise: bodyAborted, reject: rejectBodyAborted } =
+        Promise.withResolvers<never>();
+      // The body race below may already have settled via fetch itself (a
+      // headers hang rejects fetch first); keep this sibling rejection
+      // handled either way.
+      bodyAborted.catch(() => {});
+      if (fetchController.signal.aborted) {
+        rejectBodyAborted(new DOMException("The operation was aborted.", "AbortError"));
+      } else {
+        fetchController.signal.addEventListener(
+          "abort",
+          () => rejectBodyAborted(new DOMException("The operation was aborted.", "AbortError")),
+          { once: true },
+        );
+      }
+      let r: Response;
+      let data: Record<string, unknown>;
+      try {
+        r = await fetch(built, { credentials: "include", signal: fetchController.signal });
+        data = (await Promise.race([r.json(), bodyAborted])) as Record<string, unknown>;
+      } finally {
+        clearTimeout(fetchTimer);
+      }
       const raw = data[jsonField];
       if (typeof raw !== "string") return null;
       target = raw;
@@ -2746,9 +2789,34 @@ export async function executePlannedPageEffect(
         route.pathname !== endpoint.pathname
       )
         return { ok: false };
-      const response = await fetch(endpoint.href, { credentials: "include" });
-      if (!response.ok) return { ok: false };
-      const data: unknown = await response.json();
+      const fetchController = new AbortController();
+      const fetchTimer = setTimeout(() => fetchController.abort(), PAGE_API_FETCH_TIMEOUT_MS);
+      // The signal covers the body read as well as the headers: a hung body
+      // would otherwise stall response.json() past the bound.
+      const { promise: bodyAborted, reject: rejectBodyAborted } =
+        Promise.withResolvers<never>();
+      // The body race below may already have settled via fetch itself (a
+      // headers hang rejects fetch first); keep this sibling rejection
+      // handled either way.
+      bodyAborted.catch(() => {});
+      if (fetchController.signal.aborted) {
+        rejectBodyAborted(new DOMException("The operation was aborted.", "AbortError"));
+      } else {
+        fetchController.signal.addEventListener(
+          "abort",
+          () => rejectBodyAborted(new DOMException("The operation was aborted.", "AbortError")),
+          { once: true },
+        );
+      }
+      let response: Response;
+      let data: unknown;
+      try {
+        response = await fetch(endpoint.href, { credentials: "include", signal: fetchController.signal });
+        if (!response.ok) return { ok: false };
+        data = await Promise.race([response.json(), bodyAborted]);
+      } finally {
+        clearTimeout(fetchTimer);
+      }
       if (data === null || typeof data !== "object" || Array.isArray(data))
         return { ok: false };
       const raw = (data as Record<string, unknown>)[api.result_field];
@@ -3050,6 +3118,12 @@ export class Bridge {
   /** A write was refused while the outbox was unreadable, so entries queued
    * since then exist in memory only. The next successful write clears it. */
   private claimObservationOutboxUnwritten = false;
+  /** Whether the durable navigation-error markers have been READ
+   * successfully this worker lifetime. Mirrors the outbox contract above: a
+   * failed read is "unknown", never "empty", and no writer runs until the
+   * first completed hydration merges the stored backlog in. */
+  private navigationErrorMarkersLoaded = false;
+  private navigationErrorMarkersLoad: Promise<boolean> | undefined;
 
   /** Resolves once managed-state load, ledger migration, group/window
    * adoption, and close-tombstone replay have all completed (Slice 2b's
@@ -3245,8 +3319,16 @@ export class Bridge {
   private readonly providerDrainLeaseOwners = new Map<string, string>();
   /** Browser-local governor for irreversible provider effects. It is separate
    * from handoffDrives: a tab may be classified before it starts its effect,
-   * while tabless provider-direct work has no tab to register. */
+   * while tabless provider-direct work has no tab to register. Every claim
+   * arms a bounded lease (EFFECT_EXECUTION_TIMEOUT_MS): the holder's
+   * executeScript round trips through an injected function, so a hung page
+   * fetch cannot hold the slot forever. Only the matching token releases the
+   * slot early; expiry releases it for the next waiter and wakes the queue. */
   private effectGovernorOwner: { jobID: string; token: string } | undefined;
+  /** Token identifying the governor lease timer currently armed for
+   * effectGovernorOwner. Compared on fire so a stale timer from a released
+   * slot cannot evict a later owner. */
+  private effectGovernorLeaseToken: object | undefined;
   /** Release wakeups defer while a provider tab effect still needs to publish
    * its managed-tab/drive consequence. */
   private effectGovernorWakePending = false;
@@ -5188,30 +5270,78 @@ export class Bridge {
    * has since landed successfully on its own is simply discarded. Either
    * way navigationErrors itself is restored first, so the generic
    * auth-wall detector's exclusion still applies to any LATE onUpdated
-   * event Chrome does still deliver for that tab. */
-  private async reconcileNavigationErrorMarkers(): Promise<void> {
-    if (this.deps.navigationErrorMarkers === undefined) return;
-    let stored: Record<string, NavigationErrorMarkerEntry>;
+   * event Chrome does still deliver for that tab.
+   *
+   * Reads never mask storage failure, and writes never run on an
+   * unhydrated map: the reconciler first awaits the shared
+   * hydrateNavigationErrorMarkers load, so a second onNavigationError that
+   * lands mid-reconcile merges with the stored backlog instead of being
+   * wiped by reconcile's own trailing clear — and a failed get leaves
+   * storage untouched so its markers survive for the next attempt. */
+  private hydrateNavigationErrorMarkers(): Promise<boolean> {
+    // Every call reads fresh storage and merges it into the live map:
+    // markers are only ever added (by a previous worker lifetime or a
+    // concurrent error), so a re-read can never lose a live entry, while a
+    // cached "loaded" snapshot would miss a backlog stored after bootstrap.
+    // Concurrent callers share one in-flight read; a failed read resolves
+    // false and leaves both memory and storage untouched.
+    this.navigationErrorMarkersLoad ??= this.loadNavigationErrorMarkers().finally(
+      () => {
+        this.navigationErrorMarkersLoad = undefined;
+      },
+    );
+    return this.navigationErrorMarkersLoad;
+  }
+
+  private async loadNavigationErrorMarkers(): Promise<boolean> {
+    const markers = this.deps.navigationErrorMarkers;
+    if (markers === undefined) {
+      this.navigationErrorMarkersLoaded = true;
+      return true;
+    }
+    let stored: unknown;
     try {
-      stored = await this.deps.navigationErrorMarkers.get();
+      stored = await markers.get();
     } catch {
+      return false;
+    }
+    if (typeof stored === "object" && stored !== null) {
+      for (const [key, entry] of Object.entries(stored as Record<string, NavigationErrorMarkerEntry>)) {
+        if (
+          typeof entry !== "object" ||
+          entry === null ||
+          typeof entry.tab_id !== "number" ||
+          typeof entry.binding_id !== "string" ||
+          typeof entry.at !== "number" ||
+          String(entry.tab_id) !== key
+        ) {
+          continue;
+        }
+        this.navigationErrorMarkerEntries.set(entry.tab_id, entry);
+      }
+    }
+    this.navigationErrorMarkersLoaded = true;
+    return true;
+  }
+
+  private async reconcileNavigationErrorMarkers(): Promise<void> {
+    if (this.deps.navigationErrorMarkers === undefined) {
+      this.navigationErrorMarkersLoaded = true;
       return;
     }
-    const retained: [number, NavigationErrorMarkerEntry][] = [];
-    for (const [key, entry] of Object.entries(stored)) {
-      if (
-        typeof entry !== "object" ||
-        entry === null ||
-        typeof entry.tab_id !== "number" ||
-        typeof entry.binding_id !== "string" ||
-        typeof entry.at !== "number" ||
-        String(entry.tab_id) !== key
-      ) {
-        continue;
-      }
+    const readable = await this.hydrateNavigationErrorMarkers();
+    if (!readable) return;
+    // Any onNavigationError that landed before this reconcile completed is
+    // already merged into the map above (both gate on the same hydration),
+    // so iterating that map — not a storage snapshot plus a trailing clear
+    // — cannot wipe a concurrent add.
+    const pending = [...this.navigationErrorMarkerEntries.entries()] as [number, NavigationErrorMarkerEntry][];
+    this.navigationErrorMarkerEntries.clear();
+    const failed: Array<[number, NavigationErrorMarkerEntry]> = [];
+    for (const [tabID, entry] of pending) {
       let stillUnsuccessful = true;
       try {
-        const tab = await this.deps.tabs.get(entry.tab_id);
+        const tab = await this.deps.tabs.get(tabID);
         stillUnsuccessful =
           typeof tab.url !== "string" || isNonLandingURL(tab.url);
       } catch {
@@ -5220,26 +5350,31 @@ export class Bridge {
         // end still reaches the daemon instead of silently leaking.
       }
       if (!stillUnsuccessful) continue; // Recovered on its own; discard.
-      this.navigationErrors.set(entry.tab_id, entry.at);
+      this.navigationErrors.set(tabID, entry.at);
       if (
         typeof entry.job_id === "string" &&
         typeof entry.authentication_claim_id === "string" &&
         typeof entry.gate_occurrence_id === "string" &&
         typeof entry.browser_holder_generation === "number"
       ) {
-        this.enqueueRestartRecoveredObservation(
+        const durable = this.enqueueRestartRecoveredObservation(
           entry as Required<NavigationErrorMarkerEntry>,
           "navigation_error",
         );
+        // Erase the marker only once its outbox enqueue is durable: dropping
+        // it here would let a lost claim_observation outbox write silently
+        // lose the dead-end report, so the entry survives until its copy
+        // reaches storage.
+        const storedDurable = await durable;
+        if (storedDurable) continue;
+        failed.push([tabID, entry]);
       } else {
-        // Occurrence unknown at error time: nothing here can synthesize
-        // one. Keep it queued for the normal document-settle path once a
-        // fresh consult (if any) re-establishes a grant for this job.
-        retained.push([entry.tab_id, entry]);
+        // Occurrence unknown at error time: nothing here can synthesize one.
+        // Keep it for the normal document-settle path and the next pass.
+        failed.push([tabID, entry]);
       }
     }
-    this.navigationErrorMarkerEntries.clear();
-    for (const [tabID, entry] of retained) {
+    for (const [tabID, entry] of failed) {
       this.navigationErrorMarkerEntries.set(tabID, entry);
     }
     this.persistNavigationErrorMarkers();
@@ -7383,6 +7518,12 @@ export class Bridge {
       this.surfaces.tabLedgerCache?.[String(d.tabId)] !== undefined;
     if (!managed) return;
     this.navigationErrors.set(d.tabId, this.deps.now());
+    // Gate every durable write on a completed hydration: persisting a
+    // full snapshot of a not-yet-hydrated in-memory map would overwrite
+    // markers the previous worker left stored. If the read fails the error
+    // stays worker-local only (navigationErrors above) until a reread
+    // merges the backlog in.
+    if (!(await this.hydrateNavigationErrorMarkers())) return;
     const bindingID = this.surfaces.tabLedgerCache?.[String(d.tabId)]?.binding_id;
     if (bindingID === undefined) return;
     const job = findByTab(this.store, d.tabId);
@@ -7410,6 +7551,9 @@ export class Bridge {
   }
   private persistNavigationErrorMarkers(): void {
     if (this.deps.navigationErrorMarkers === undefined) return;
+    // Never persist an unhydrated map: an empty in-memory snapshot would
+    // replace the stored backlog (the "failed read → {}" overwrite).
+    if (!this.navigationErrorMarkersLoaded) return;
     const record: Record<string, NavigationErrorMarkerEntry> = {};
     for (const [tabID, entry] of this.navigationErrorMarkerEntries) {
       record[String(tabID)] = entry;
@@ -14702,13 +14846,29 @@ export class Bridge {
       request as Parameters<typeof this.requestPdfGrab>[0],
     );
   }
-  /** Reserve the single browser-local effect slot. A caller must hold this
-   * through the observable initiation consequence (not merely planning). */
+  /** Reserve the single browser-local effect slot under a bounded lease. A
+   * caller must hold this through the observable initiation consequence (not
+   * merely planning). The lease fires once after EFFECT_EXECUTION_TIMEOUT_MS
+   * and releases the slot for the next waiter even when the holder's
+   * executeScript never settles; an on-time release disarms its own timer via
+   * effectGovernorLeaseToken. */
   private claimEffectGovernor(jobID: string): string | undefined {
     const current = this.effectGovernorOwner;
     if (current !== undefined) return undefined;
     const token = this.deps.randomUUID();
     this.effectGovernorOwner = { jobID, token };
+    const lease = {};
+    this.effectGovernorLeaseToken = lease;
+    this.deps.setTimeout(() => {
+      if (this.effectGovernorLeaseToken !== lease) return;
+      const held = this.effectGovernorOwner;
+      if (held === undefined || held.jobID !== jobID || held.token !== token) return;
+      console.error(`papio: effect governor lease expired for ${jobID}; releasing the slot`);
+      this.effectGovernorOwner = undefined;
+      this.effectGovernorLeaseToken = undefined;
+      this.effectGovernorWakePending = true;
+      this.wakeEffectGovernor();
+    }, EFFECT_EXECUTION_TIMEOUT_MS);
     return token;
   }
 
@@ -14823,6 +14983,7 @@ export class Bridge {
     const current = this.effectGovernorOwner;
     if (current?.jobID !== jobID || current.token !== token) return;
     this.effectGovernorOwner = undefined;
+    this.effectGovernorLeaseToken = undefined;
     this.effectGovernorWakePending = true;
     if (wake) this.wakeEffectGovernor();
   }
@@ -21939,11 +22100,40 @@ export class Bridge {
                 return;
               }
             }
-            const result = await this.deps.scripting.executeScript({
+            const effectAttempt = this.deps.scripting.executeScript({
               target: { tabId: job.tab_id },
               func: executePlannedPageEffect,
               args: [freshPlan, dl],
             });
+            let effectSettled = false;
+            let effectTimedOut = false;
+            const { promise: effectTimeout, resolve: resolveEffectTimeout } =
+              Promise.withResolvers<undefined>();
+            this.deps.setTimeout(() => {
+              // The attempt already won: this stale timer must not log a
+              // false timeout (BridgeDeps.setTimeout returns void, so it
+              // cannot be disarmed any other way).
+              if (effectSettled) return;
+              effectSettled = true;
+              effectTimedOut = true;
+              declineDownload(`the page-side effect timed out after ${EFFECT_EXECUTION_TIMEOUT_MS} ms`);
+              resolveEffectTimeout(undefined);
+            }, EFFECT_EXECUTION_TIMEOUT_MS);
+            const result = await Promise.race([effectAttempt, effectTimeout]);
+            effectSettled = true;
+            // A timed-out attempt keeps running under the governor lease: its
+            // late reply must not start a download after the slot moved on.
+            // A click attempt that timed out held the download_initiated
+            // latch: reset it like the refuse/catch paths so a retry is not
+            // declined as "another path already claimed".
+            if (result === undefined || effectTimedOut) {
+              if (claimedDownload) {
+                await this.update((s) =>
+                  patchJob(s, jobID, { download_initiated: false }),
+                );
+              }
+              return;
+            }
             const effect = result[0]?.result as
               { ok?: boolean; url?: string; why?: string } | undefined;
             if (effect?.ok !== true) {
@@ -25192,17 +25382,16 @@ function realDeps(): BridgeDeps {
       },
     },
     navigationErrorMarkers: {
+      // A storage failure rejects. Resolving `{}` here made a failed read
+      // indistinguishable from an empty queue, and the next write then
+      // replaced the unacknowledged markers still in storage.
       async get() {
-        try {
-          const got = await chrome.storage.session.get(
-            NAVIGATION_ERROR_MARKER_STORAGE_KEY,
-          );
-          const stored = got[NAVIGATION_ERROR_MARKER_STORAGE_KEY];
-          if (typeof stored !== "object" || stored === null) return {};
-          return stored as Record<string, NavigationErrorMarkerEntry>;
-        } catch {
-          return {};
-        }
+        const got = await chrome.storage.session.get(
+          NAVIGATION_ERROR_MARKER_STORAGE_KEY,
+        );
+        const stored = got[NAVIGATION_ERROR_MARKER_STORAGE_KEY];
+        if (typeof stored !== "object" || stored === null) return {};
+        return stored as Record<string, NavigationErrorMarkerEntry>;
       },
       async set(value) {
         await chrome.storage.session.set({

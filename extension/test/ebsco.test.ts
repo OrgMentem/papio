@@ -115,6 +115,31 @@ test("EBSCO viewer API accepts only the packaged content-file destination", asyn
   } finally { Object.assign(globalThis, previous); }
 });
 
+test.skipIf(!fixtureExists("ebsco", "viewer-current"))(
+  "EBSCO api fetch carries an abort signal so a hanging provider cannot hold the effect",
+  async () => {
+    const href = "https://research.ebsco.com/c/example/viewer/pdf/record?route=details";
+    const doc = fixture("viewer-current");
+    doc.defaultView!.location.href = href;
+    const result = planExecution(doc, spec, { title: "Example scholarly article", doi: "10.1000/example-paper" }, { access_mode: "delegated" });
+    if ("assisted" in result) throw new Error(result.assisted);
+    const planned = JSON.parse(JSON.stringify(result, (_key, value) => value === null ? undefined : value)) as Plan;
+    const seen: unknown[] = [];
+    const previous = { document: globalThis.document, location: globalThis.location, fetch: globalThis.fetch };
+    Object.assign(globalThis, { document: doc, location: new URL(href) });
+    globalThis.fetch = Object.assign(async (...args: unknown[]) => {
+      seen.push(args[1]);
+      return Response.json({ url: "https://content.ebscohost.com/cds/retrieve?test-only=1" });
+    }, { preconnect: previous.fetch.preconnect });
+    try {
+      const effect = await executePlannedPageEffect(planned, spec.download!);
+      expect(effect.ok).toBe(true);
+      expect(seen).toHaveLength(1);
+      expect((seen[0] as { signal?: unknown } | undefined)?.signal).toBeInstanceOf(AbortSignal);
+    } finally { Object.assign(globalThis, previous); }
+  },
+);
+
 test("EBSCO refuses missing or mismatched DOI metadata even when the title matches", () => {
   for (const doi of [null, "10.1000/another-paper"]) {
     const doc = fixture("viewer-current");

@@ -11814,6 +11814,197 @@ test("Firefox adapter API downloads remain filename-controlled and report normal
   ).toBe(true);
 });
 
+// Mirror of background.ts's EFFECT_EXECUTION_TIMEOUT_MS (120_000), written
+// literally so these tests still run — and fail on behavior — when the
+// production constant is reverted away.
+const EFFECT_LEASE_TIMEOUT_MS = 120_000;
+
+test("a hung api-method page effect releases the governor after its timeout", async () => {
+  const h = makeHarness();
+  const apiAdapter: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    download: {
+      selector: "meta[name='citation_pdf_url']",
+      requireKind: "article",
+      method: "api",
+      urlTemplate: `https://${PROVIDER_HOST}/api/article`,
+      jsonField: "pdf_url",
+    },
+  };
+  h.deps.adapterSpecs.push(apiAdapter);
+  h.deps.permissions.contains = async () => true;
+  const { promise: effectStarted, resolve: signalEffectStarted } =
+    Promise.withResolvers<void>();
+  h.deps.scripting.executeScript = (async (injection: Parameters<BridgeDeps["scripting"]["executeScript"]>[0]) => {
+    if (injection.func === planExecution) return plannerResult(injection, { kind: "article" });
+    if (injection.func === executePlannedPageEffect) {
+      signalEffectStarted();
+      return new Promise<never>(() => {});
+    }
+    return [];
+  }) as typeof h.deps.scripting.executeScript;
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_effect_timeout_first"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  const navigating = h.tabs.completeNavigation(tabID, articleURL);
+  // Wait for the hung injection to be dispatched: the stale timer a prior
+  // flow left behind must not stand in for this attempt's own bound.
+  await effectStarted;
+  for (let i = 0; i < 200 && h.timers.filter((timer) => timer.ms === EFFECT_LEASE_TIMEOUT_MS).length < 2; i += 1) {
+    await Promise.resolve();
+  }
+  const timeout = h.timers
+    .filter((timer) => timer.ms === EFFECT_LEASE_TIMEOUT_MS)
+    .at(-1);
+  expect(timeout).toBeDefined();
+  h.clock.now += EFFECT_LEASE_TIMEOUT_MS;
+  await timeout!.fn();
+  await navigating;
+  // The hung attempt declines with a timeout and frees the slot: no download
+  // is claimed or started for the abandoned effect.
+  expect(h.downloads.started).toHaveLength(0);
+  expect(
+    Reflect.get(h.bridge, "effectGovernorOwner"),
+  ).toBeUndefined();
+  expect(
+    Reflect.get(h.bridge, "effectGovernorLeaseToken"),
+  ).toBeUndefined();
+});
+
+test("a successful page effect never logs a timeout once its bound fires", async () => {
+  const errors: unknown[][] = [];
+  const prevError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args);
+  };
+  try {
+    const h = makeHarness();
+    const apiAdapter: AdapterSpec = {
+      ...PROVIDER_ADAPTER,
+      download: {
+        selector: "meta[name='citation_pdf_url']",
+        requireKind: "article",
+        method: "api",
+        urlTemplate: `https://${PROVIDER_HOST}/api/article`,
+        jsonField: "pdf_url",
+      },
+    };
+    h.deps.adapterSpecs.push(apiAdapter);
+    h.deps.permissions.contains = async () => true;
+    h.deps.scripting.executeScript = (async (injection: Parameters<BridgeDeps["scripting"]["executeScript"]>[0]) => {
+      if (injection.func === planExecution) return plannerResult(injection, { kind: "article" });
+      if (injection.func === executePlannedPageEffect) return plannedEffectResult(injection);
+      return [];
+    }) as typeof h.deps.scripting.executeScript;
+    await h.bridge.start();
+    await h.port.inbound(jobOffer("job_effect_success_no_timeout"));
+    const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+    await h.tabs.completeNavigation(tabID, `https://${PROVIDER_HOST}/stable/article`);
+    // The effect succeeded and started the download.
+    expect(h.downloads.started).toHaveLength(1);
+    // Fire this attempt's own effect bound after the fact: the settled
+    // attempt must not record a false timeout.
+    const timeout = h.timers
+      .filter((timer) => timer.ms === EFFECT_LEASE_TIMEOUT_MS)
+      .at(-1);
+    expect(timeout).toBeDefined();
+    h.clock.now += EFFECT_LEASE_TIMEOUT_MS;
+    await timeout!.fn();
+    expect(
+      errors.some((args) => args.map(String).join(" ").includes("timed out")),
+    ).toBe(false);
+    expect(h.downloads.started).toHaveLength(1);
+    expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
+  } finally {
+    console.error = prevError;
+  }
+});
+
+test("a hung click effect resets its latch so the retry proceeds", async () => {
+  const h = makeHarness();
+  const clickAdapter: AdapterSpec = {
+    ...PROVIDER_ADAPTER,
+    download: {
+      selector: "a.download",
+      requireKind: "article",
+      method: "click",
+    },
+  };
+  h.deps.adapterSpecs.push(clickAdapter);
+  h.deps.permissions.contains = async () => true;
+  let effectCalls = 0;
+  const { promise: effectStarted, resolve: signalEffectStarted } =
+    Promise.withResolvers<void>();
+  h.deps.scripting.executeScript = (async (injection: Parameters<BridgeDeps["scripting"]["executeScript"]>[0]) => {
+    if (injection.func === planExecution) return plannerResult(injection, { kind: "article" });
+    if (injection.func === executePlannedPageEffect) {
+      effectCalls += 1;
+      if (effectCalls === 1) {
+        signalEffectStarted();
+        return new Promise<never>(() => {});
+      }
+      return [{ result: { ok: true } }];
+    }
+    return [];
+  }) as typeof h.deps.scripting.executeScript;
+  await h.bridge.start();
+  await h.port.inbound(jobOffer("job_effect_click_timeout"));
+  const tabID = h.backend.store.activeJobs[0]?.tab_id ?? -1;
+  const articleURL = `https://${PROVIDER_HOST}/stable/article`;
+  const navigating = h.tabs.completeNavigation(tabID, articleURL);
+  await effectStarted;
+  for (let i = 0; i < 200 && h.timers.filter((timer) => timer.ms === EFFECT_LEASE_TIMEOUT_MS).length < 2; i += 1) {
+    await Promise.resolve();
+  }
+  const timeout = h.timers
+    .filter((timer) => timer.ms === EFFECT_LEASE_TIMEOUT_MS)
+    .at(-1);
+  expect(timeout).toBeDefined();
+  h.clock.now += EFFECT_LEASE_TIMEOUT_MS;
+  await timeout!.fn();
+  await navigating;
+  // The abandoned click attempt released its download_initiated latch.
+  expect(findByJob(h.backend.store, "job_effect_click_timeout")?.download_initiated).toBe(false);
+  expect(Reflect.get(h.bridge, "effectGovernorOwner")).toBeUndefined();
+  // The retry re-enters the effect instead of being declined as already
+  // claimed by another path.
+  await h.tabs.completeNavigation(tabID, articleURL);
+  expect(effectCalls).toBe(2);
+  expect(findByJob(h.backend.store, "job_effect_click_timeout")?.download_initiated).toBe(true);
+});
+
+test("a hung effect governor lease frees the slot for the next waiter", async () => {
+  const h = makeHarness();
+  const internals = h.bridge as unknown as {
+    claimEffectGovernor(jobID: string): string | undefined;
+    releaseEffectGovernor(jobID: string, token: string, wake?: boolean): void;
+    effectGovernorOwner: { jobID: string; token: string } | undefined;
+  };
+  // Model a provider fetch that accepted the connection and then hung: the
+  // slot stays owned with no settling injection to release it.
+  const token = internals.claimEffectGovernor("job_effect_lease_first");
+  expect(token).toBeDefined();
+  // A sibling effect cannot claim the slot while it is held.
+  expect(internals.claimEffectGovernor("job_effect_lease_queued")).toBeUndefined();
+  const lease = h.timers
+    .filter((timer) => timer.ms === EFFECT_LEASE_TIMEOUT_MS)
+    .at(-1);
+  expect(lease).toBeDefined();
+  h.clock.now += EFFECT_LEASE_TIMEOUT_MS;
+  await lease!.fn();
+  // The lease expiry released the slot and woke the queue: the next waiter
+  // claims it without any release from the hung holder.
+  expect(internals.effectGovernorOwner).toBeUndefined();
+  const queued = internals.claimEffectGovernor("job_effect_lease_queued");
+  expect(queued).toBeDefined();
+  expect(internals.effectGovernorOwner).toMatchObject({
+    jobID: "job_effect_lease_queued",
+  });
+  internals.releaseEffectGovernor("job_effect_lease_queued", queued!);
+  expect(internals.effectGovernorOwner).toBeUndefined();
+});
+
 test("a cross-origin api download with a content-disposition rename steers into papio/<job>/ by ID", async () => {
   // Regression for the EBSCO shape (research.ebsco.com -> content.ebscohost.com):
   // the provider redirect changes origin before onDeterminingFilename, the item
@@ -30978,4 +31169,235 @@ test("a navigation_error marker is kept across a restart when the tab sits on th
   const observation = await restarted.port.waitForFrame("claim_observation");
   expect(observation.payload["event_kind"]).toBe("navigation_error");
   expect(observation.job_id).toBe(jobID);
+});
+
+test("a failed marker read never overwrites stored markers", async () => {
+  const jobID = "job_naverr_failed_read";
+  const candidateID = "cand_naverr_failed_read";
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: [coldClaimJob(jobID)] },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  // A marker the previous worker left stored. Storage stays unreadable for
+  // this whole worker lifetime, so no write may run: persisting a snapshot
+  // of the never-hydrated in-memory map would replace this marker with a
+  // live-only record.
+  const stored = {
+    tab_id: 7001,
+    binding_id: "bind_naverr_failed_read",
+    at: h.clock.now,
+  };
+  h.navigationErrorMarkers.current = { [String(stored.tab_id)]: stored };
+  h.tabs.seed({ id: stored.tab_id, url: `https://${PROVIDER_HOST}/stale`, status: "complete" });
+  h.deps.navigationErrorMarkers!.get = async (): Promise<
+    Record<string, NavigationErrorMarkerEntry>
+  > => {
+    throw new Error("storage unavailable");
+  };
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?naverr=failedread`,
+  );
+  let sets = 0;
+  h.deps.navigationErrorMarkers!.set = async (
+    _value: Record<string, NavigationErrorMarkerEntry>,
+  ): Promise<void> => {
+    sets += 1;
+  };
+  const internals = h.bridge as unknown as {
+    navigationErrors: Map<number, number>;
+  };
+  // A live error arrives while storage is still unreadable: the worker-local
+  // exclusion still applies, but nothing durable may be written.
+  await h.webNavigation.emitError(tabID);
+  expect(internals.navigationErrors.has(tabID)).toBe(true);
+  expect(sets).toBe(0);
+  expect(h.navigationErrorMarkers.current).toEqual({
+    [String(stored.tab_id)]: stored,
+  });
+});
+
+test("markers from concurrent errors both survive reconcile", async () => {
+  const jobA = "job_naverr_race_a";
+  const jobB = "job_naverr_race_b";
+  const candidateA = "cand_naverr_race_a";
+  const candidateB = "cand_naverr_race_b";
+  const h = makeHarness(
+    {
+      ...emptyStore(),
+      activeJobs: [coldClaimJob(jobA), coldClaimJob(jobB)],
+    },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+  await seedClaimCandidate(h, jobA, candidateA);
+  await seedClaimCandidate(h, jobB, candidateB);
+  const tabA = await openClaimWithNewSurface(
+    h,
+    jobA,
+    candidateA,
+    `https://${PROVIDER_HOST}/fresh?naverr=race-a`,
+  );
+  const tabB = await openClaimWithNewSurface(
+    h,
+    jobB,
+    candidateB,
+    `https://${PROVIDER_HOST}/fresh?naverr=race-b`,
+  );
+  const storedA = {
+    tab_id: tabA,
+    binding_id: "bind_naverr_race_a",
+    at: h.clock.now,
+  };
+  h.navigationErrorMarkers.current = { [String(tabA)]: storedA };
+  const internals = h.bridge as unknown as {
+    reconcileNavigationErrorMarkers(): Promise<void>;
+    deps: BridgeDeps;
+    navigationErrorMarkerEntries: Map<number, NavigationErrorMarkerEntry>;
+  };
+  // Reconcile reads storage once and then awaits one tabs.get per entry: a
+  // navigation error that lands during that await must not be wiped by the
+  // trailing persist.
+  const { promise: releaseTabsGet, resolve: resolveTabsGet } =
+    Promise.withResolvers<void>();
+  const realTabsGet = internals.deps.tabs.get.bind(internals.deps.tabs);
+  let blocked = false;
+  internals.deps.tabs.get = (async (tabID: number) => {
+    if (!blocked) {
+      blocked = true;
+      await releaseTabsGet;
+    }
+    return realTabsGet(tabID);
+  }) as typeof internals.deps.tabs.get;
+  const reconciling = internals.reconcileNavigationErrorMarkers();
+  for (let i = 0; i < 50 && !blocked; i += 1) await Promise.resolve();
+  await h.webNavigation.emitError(tabB);
+  resolveTabsGet();
+  await reconciling;
+  internals.deps.tabs.get = realTabsGet;
+  const durable = h.navigationErrorMarkers.current;
+  expect(durable[String(tabA)]).toMatchObject({ tab_id: tabA });
+  expect(durable[String(tabB)]).toMatchObject({ tab_id: tabB });
+});
+
+test("a marker survives reconcile while its outbox enqueue is not durable", async () => {
+  const jobID = "job_naverr_outbox_loss";
+  const candidateID = "cand_naverr_outbox_loss";
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: [coldClaimJob(jobID)] },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+  await seedClaimCandidate(h, jobID, candidateID);
+  const claimID = `claim_${candidateID}`;
+  const gateID = `occ_${candidateID}`;
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?naverr=outbox-loss`,
+  );
+  const marker = {
+    tab_id: tabID,
+    binding_id: "bind_naverr_outbox_loss",
+    at: h.clock.now,
+    job_id: jobID,
+    authentication_claim_id: claimID,
+    gate_occurrence_id: gateID,
+    browser_holder_generation: 1,
+  };
+  h.navigationErrorMarkers.current = { [String(tabID)]: marker };
+  // The tab still shows the failed document, so reconcile promotes the
+  // marker into the claim_observation outbox instead of discarding it.
+  h.tabs.patch(tabID, { url: "https://idp.example.edu/sso", status: "complete" });
+  h.deps.claimObservationOutbox!.set = async (
+    _value: Record<string, ClaimObservationOutboxEntry>,
+  ): Promise<void> => {
+    throw new Error("outbox storage unavailable");
+  };
+  const internals = h.bridge as unknown as {
+    reconcileNavigationErrorMarkers(): Promise<void>;
+    claimObservationOutboxEntries: Map<string, ClaimObservationOutboxEntry>;
+  };
+  await internals.reconcileNavigationErrorMarkers();
+  // The report has been folded into the in-memory outbox, but the storage
+  // write failed: the marker must stay until the copy lands durably.
+  expect(Object.values(h.claimObservationOutbox.current)).toHaveLength(0);
+  expect(internals.claimObservationOutboxEntries.size).toBe(1);
+  expect(h.navigationErrorMarkers.current[String(tabID)]).toMatchObject({
+    tab_id: tabID,
+  });
+});
+
+test("a worker emitError before hydrate completes does not erase the stored marker", async () => {
+  const jobID = "job_naverr_pre_hydrate";
+  const candidateID = "cand_naverr_pre_hydrate";
+  const h = makeHarness(
+    { ...emptyStore(), activeJobs: [coldClaimJob(jobID)] },
+    { windows: true },
+  );
+  installManagedTabLedger(h, {});
+  await h.bridge.start();
+  await h.port.inbound(
+    helloAck({ features: ["handoff_link_v1", AUTH_CLAIM, "surface_close_v1"] }),
+  );
+  await seedClaimCandidate(h, jobID, candidateID);
+  const tabID = await openClaimWithNewSurface(
+    h,
+    jobID,
+    candidateID,
+    `https://${PROVIDER_HOST}/fresh?naverr=pre-hydrate`,
+  );
+  // A live error that arrives while the first hydration is still in flight
+  // (a blocked storage get) must join the loaded map instead of replacing
+  // the stored backlog with a live-only snapshot.
+  const stored = {
+    tab_id: 7001,
+    binding_id: "bind_naverr_pre_hydrate",
+    at: h.clock.now,
+  };
+  const { promise: releaseGet, resolve: resolveGet } =
+    Promise.withResolvers<void>();
+  let firstGet = true;
+  const markerDeps = h.deps.navigationErrorMarkers;
+  if (markerDeps === undefined) throw new Error("navigationErrorMarkers dep missing");
+  const realMarkerGet = markerDeps.get.bind(markerDeps);
+  markerDeps.get = (async (): Promise<Record<string, NavigationErrorMarkerEntry>> => {
+    if (firstGet) {
+      firstGet = false;
+      await releaseGet;
+      return { [String(stored.tab_id)]: stored };
+    }
+    return realMarkerGet();
+  }) as typeof markerDeps.get;
+  h.tabs.seed({ id: stored.tab_id, url: `https://${PROVIDER_HOST}/stale`, status: "complete" });
+  const internals = h.bridge as unknown as {
+    hydrateNavigationErrorMarkers(): Promise<boolean>;
+    onNavigationError(d: { tabId: number; frameId: number }): Promise<void>;
+  };
+  const hydrating = internals.hydrateNavigationErrorMarkers();
+  const emitting = internals.onNavigationError({ tabId: tabID, frameId: 0 });
+  resolveGet();
+  await Promise.all([hydrating, emitting]);
+  const durable = h.navigationErrorMarkers.current;
+  expect(durable[String(tabID)]).toMatchObject({ tab_id: tabID });
+  expect(durable[String(stored.tab_id)]).toMatchObject({
+    tab_id: stored.tab_id,
+  });
 });
