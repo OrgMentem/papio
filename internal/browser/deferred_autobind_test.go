@@ -19,8 +19,11 @@ import (
 // worker-death class AGENTS.md records). Its whole reason to exist is that a
 // recoverable paper must never stay orphaned, so every case here asserts the
 // end state that proves recovery happened — the job holds a promoted
-// artifact — rather than merely that the call returned nil. The function
-// swallows every error by design, so "no error" is worthless as a signal.
+// artifact — rather than merely that the call returned nil. Operational
+// failures (store outages, MkdirAll/move/copy errors, a failed defer write)
+// return an error so the sweep reports the tick as failed instead of silent;
+// only "nothing to recover" (missing or terminal job, no deferred filename,
+// no staged file) or a durable successful recovery returns nil.
 
 func deferredWork(doi, title string) work.Work {
 	return work.Work{DOI: doi, Title: title, Authors: []string{"Lovelace, Ada"}, Year: 2026}
@@ -311,8 +314,8 @@ func TestRecoverDeferredAutoBind(t *testing.T) {
 		recordDeferredAdoption(t, jobs, id, "paper.pdf")
 		b.svc.Validate = nil
 
-		if err := b.recoverDeferredAutoBind(ctx, g.ID, id); err != nil {
-			t.Fatalf("recoverDeferredAutoBind: %v", err)
+		if err := b.recoverDeferredAutoBind(ctx, g.ID, id); err == nil {
+			t.Fatal("recovery hid the missing validation dependency")
 		}
 		requireNotAdopted(t, jobs, id)
 		if got := countDeferredAdoptions(t, jobs, id); got != 2 {

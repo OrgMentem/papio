@@ -425,22 +425,27 @@ func (s *Service) rejectAdoptedDownload(ctx context.Context, jobID, path string,
 		// re-reject the same file every tick. Park in needs_review instead — the
 		// adoption sweep never scans it — with an action telling the user to
 		// remove the file and redrive, which reopens the park only once no
-		// file remains, so the loop cannot spin.
-		if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
+		// file remains, so the loop cannot spin. The action and the park still
+		// commit in one transaction, for the same stale-prompt reason as the
+		// quarantined branch below.
+		if err := s.Jobs.ParkWithHumanAction(ctx, jobID, job.StateFetching, job.StateNeedsReview,
+			"manual_download",
 			fmt.Sprintf("the adopted download failed validation and could not be quarantined; remove the file from the adoption directory, then run 'papio jobs redrive %s --revision 1'", jobID),
+			withSuppressionDetail(ctx, map[string]any{"reason": "adopted_download_rejected_unquarantined"}),
 			replacementAccess, job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
 			return err
 		}
-		return s.park(ctx, jobID, job.StateFetching, job.StateNeedsReview,
-			map[string]any{"reason": "adopted_download_rejected_unquarantined"})
+		s.notifyParked(ctx, jobID, job.StateNeedsReview)
+		return nil
 	}
-	if _, err := s.Jobs.OpenHumanAction(ctx, jobID, "manual_download",
-		"the adopted download failed validation; please supply a different file",
+	if err := s.Jobs.ParkWithHumanAction(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
+		"manual_download", "the adopted download failed validation; please supply a different file",
+		withSuppressionDetail(ctx, map[string]any{"reason": "adopted_download_rejected"}),
 		replacementAccess, job.WithHumanActionDiagnosis(job.DiagnosisReasonAdoptedPDFInvalid)); err != nil {
 		return err
 	}
-	return s.park(ctx, jobID, job.StateFetching, job.StateAwaitingHuman,
-		map[string]any{"reason": "adopted_download_rejected"})
+	s.notifyParked(ctx, jobID, job.StateAwaitingHuman)
+	return nil
 }
 
 type adoptionCandidateResultKey struct{}

@@ -650,30 +650,20 @@ type parkedGrabItemSource struct {
 	grabs *grab.Service
 }
 
-// DismissPdfGrab discards one parked grab and its quarantine directory. It
-// lives on the item source so triage.Service.Decide serves the browser, the
-// CLI and MCP from one implementation: an earlier private copy on Bridge left
-// triage.decide over RPC answering "conflict" for the dismiss operation the
-// items themselves advertise.
+// DismissPdfGrab claims a parked grab before removing its quarantine directory.
+// The durable claim excludes binding without holding the database connection
+// during cleanup. The sweep retries unfinished claims after errors or a crash.
 func (source parkedGrabItemSource) DismissPdfGrab(ctx context.Context, grabID string) (bool, error) {
 	if source.grabs == nil || grabID == "" {
 		return false, sql.ErrNoRows
 	}
-	g, err := source.grabs.Get(ctx, grabID)
-	if err != nil {
-		return false, err
-	}
-	if g == nil {
-		return false, sql.ErrNoRows
-	}
-	quarantinePath := g.QuarantinePath
-	if err := source.grabs.Delete(ctx, grabID); err != nil {
-		return false, err
-	}
-	if quarantinePath != "" {
-		if err := os.RemoveAll(filepath.Dir(quarantinePath)); err != nil {
-			log.Printf("papio: removing dismissed grab quarantine %s: %v", filepath.Dir(quarantinePath), err)
+	if err := source.grabs.DeleteParked(ctx, grabID, func(quarantinePath string) error {
+		if quarantinePath == "" {
+			return nil
 		}
+		return os.RemoveAll(filepath.Dir(quarantinePath))
+	}); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -6770,7 +6760,7 @@ func (b *Bridge) pdfGrabStatus(ctx context.Context, request *protocol.PdfGrabSta
 			log.Printf("papio: pdf grab status lookup failed: %v", err)
 			result.Outcome = "unavailable"
 			result.Detail = "could not read grab status"
-		} else if g == nil {
+		} else if g == nil || g.State == grab.StateDismissing {
 			result.Outcome = "not_found"
 		} else {
 			result.State = string(g.State)
@@ -6849,7 +6839,7 @@ func (b *Bridge) pdfGrabAbandonWith(ctx context.Context, request *protocol.PdfGr
 			result.State = ""
 			result.Outcome = "unavailable"
 			result.Detail = "could not inspect grab"
-		} else if g == nil {
+		} else if g == nil || g.State == grab.StateDismissing {
 			result.State = ""
 			result.Outcome = "not_found"
 		} else if g.State == grab.StateAbandoned && (expectedRequestID == "" || g.EffectRequestID == expectedRequestID) {
@@ -9387,12 +9377,22 @@ func (b *Bridge) preserveDeferredAdoption(jobID, filename, stagedPath string) er
 	return b.moveGrabFile(stagedPath, dest)
 }
 
+// recoverDeferredAutoBind is the sweep-time second chance for an auto-bind
+// whose bytes were committed to a job but never ingested. It returns nil only
+// when there is nothing to recover (missing job, terminal job, no deferred
+// filename, no staged file) or when recovery succeeded. Operational failures
+// (store reads, MkdirAll, move/copy staging, a failed defer write) and any
+// ingestion failure that could not be recorded durably are returned so the
+// sweep reports the tick as failed instead of silent.
 func (b *Bridge) recoverDeferredAutoBind(ctx context.Context, grabID, jobID string) error {
 	if b.jobs == nil {
 		return nil
 	}
 	row, err := b.jobs.Get(ctx, jobID)
-	if err != nil || row == nil {
+	if err != nil {
+		return err
+	}
+	if row == nil {
 		return nil
 	}
 	if job.Terminal(row.State) {
@@ -9401,7 +9401,7 @@ func (b *Bridge) recoverDeferredAutoBind(ctx context.Context, grabID, jobID stri
 	// Find the latest deferred filename for this job.
 	events, err := b.jobs.Events(ctx, jobID)
 	if err != nil {
-		return nil
+		return err
 	}
 	var target string
 	for i := len(events) - 1; i >= 0; i-- {
@@ -9426,20 +9426,30 @@ func (b *Bridge) recoverDeferredAutoBind(ctx context.Context, grabID, jobID stri
 	var staged string
 	for _, d := range dirs {
 		candidate := filepath.Join(d, target)
-		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+		info, err := os.Stat(candidate)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err == nil && info.Mode().IsRegular() && info.Size() > 0 {
 			staged = candidate
 			break
 		}
-		if matches, _ := filepath.Glob(filepath.Join(d, target+"*")); len(matches) > 0 {
-			for _, m := range matches {
-				if info, err := os.Stat(m); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
-					staged = m
-					break
-				}
+		matches, err := filepath.Glob(filepath.Join(d, target+"*"))
+		if err != nil {
+			return err
+		}
+		for _, m := range matches {
+			info, err := os.Stat(m)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
 			}
-			if staged != "" {
+			if err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+				staged = m
 				break
 			}
+		}
+		if staged != "" {
+			break
 		}
 	}
 	if staged == "" {
@@ -9450,19 +9460,21 @@ func (b *Bridge) recoverDeferredAutoBind(ctx context.Context, grabID, jobID stri
 	adoptDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), jobID)
 	if filepath.Dir(staged) != adoptDir {
 		if err := os.MkdirAll(adoptDir, 0o700); err != nil {
-			return nil
+			return err
 		}
 		dest := uniqueAdoptionDest(adoptDir, target)
-		if err := b.moveGrabFile(staged, dest); err != nil {
-			if err := b.copyGrabFile(staged, dest); err != nil {
-				return nil
+		if moveErr := b.moveGrabFile(staged, dest); moveErr != nil {
+			if copyErr := b.copyGrabFile(staged, dest); copyErr != nil {
+				return errors.Join(moveErr, copyErr)
 			}
 		}
 		target = filepath.Base(dest)
 	}
 	if _, err := b.ingestAdoptedFile(ctx, jobID, target, nil, nil); err != nil {
-		_ = b.recordAdoptionDeferred(ctx, jobID, target, err)
-		return nil
+		if evErr := b.recordAdoptionDeferred(ctx, jobID, target, err); evErr != nil {
+			return errors.Join(err, evErr)
+		}
+		return err
 	}
 	// Clean up grab staging if still present; grab row already job_created.
 	if grabRow, _ := b.grabs.Get(ctx, grabID); grabRow != nil {
@@ -9540,17 +9552,18 @@ func settledFileName(entries []os.DirEntry) (string, bool) {
 // It walks every root in cfg.AdoptionRoots, not just the effective one, so an
 // install that was adopting into the superseded <data_dir>/adoptions root
 // before the default moved under the browser's download directory keeps
-// draining. A per-root error is fatal to the tick the same way it always was.
+// draining. Errors remain observable without blocking unrelated downloads.
 func (b *Bridge) SweepAdoptions(ctx context.Context) error {
 	// An orphaned effect permit settles here from what its job's directories
 	// show, or names the PDF the scan below must attribute to it.
 	orphan := b.recoverOrphanedEffectPermit(ctx)
+	var sweepErrs []error
 	for _, root := range b.cfg.AdoptionRoots() {
 		if err := b.sweepAdoptionsIn(ctx, root, orphan); err != nil {
-			return err
+			sweepErrs = append(sweepErrs, err)
 		}
 	}
-	return nil
+	return errors.Join(sweepErrs...)
 }
 
 // sweepAdoptableState is the set of job states whose adoption directory the
@@ -9574,13 +9587,18 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 		}
 		return err
 	}
+	var itemErrs []error
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "rejected" || e.Name() == grabsDirName {
 			continue
 		}
 		jobID := e.Name()
 		row, err := b.jobs.Get(ctx, jobID)
-		if err != nil || row == nil {
+		if err != nil {
+			itemErrs = append(itemErrs, err)
+			continue
+		}
+		if row == nil {
 			continue
 		}
 		if !sweepAdoptableState(row.State) {
@@ -9592,8 +9610,15 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 			// alongside a deferred auto-bind staging). Try the filename-keyed
 			// deferred recovery, which names the exact file the committed claim
 			// meant to adopt and bypasses the single-file heuristic.
-			if g, _ := b.grabs.ByJobID(ctx, jobID); g != nil && g.State == grab.StateJobCreated {
-				_ = b.recoverDeferredAutoBind(ctx, g.ID, jobID)
+			g, err := b.grabs.ByJobID(ctx, jobID)
+			if err != nil {
+				itemErrs = append(itemErrs, err)
+				continue
+			}
+			if g != nil && g.State == grab.StateJobCreated {
+				if err := b.recoverDeferredAutoBind(ctx, g.ID, jobID); err != nil {
+					itemErrs = append(itemErrs, err)
+				}
 			}
 			continue
 		}
@@ -9607,18 +9632,18 @@ func (b *Bridge) sweepAdoptionsIn(ctx context.Context, root string, orphan *job.
 				// refuse the same bytes every tick, so the job is latched out
 				// of the sweep rather than deferred.
 				if latchErr := b.recordAdoptionConclusiveLatch(ctx, jobID); latchErr != nil {
-					return latchErr
+					itemErrs = append(itemErrs, latchErr)
 				}
 				continue
 			}
 			if evErr := b.recordAdoptionDeferred(ctx, jobID, name, err); evErr != nil {
-				return evErr
+				itemErrs = append(itemErrs, errors.Join(err, evErr))
 			}
 		} else if latchErr := b.recordAdoptionConclusiveLatch(ctx, jobID); latchErr != nil {
-			return latchErr
+			itemErrs = append(itemErrs, latchErr)
 		}
 	}
-	return nil
+	return errors.Join(itemErrs...)
 }
 
 // SweepTerminalAdoptions removes the per-job adoption landing directory of any
@@ -9743,9 +9768,44 @@ func (b *Bridge) SweepGrabs(ctx context.Context) error {
 	if !b.adoptionLatchUnhealthy() {
 		b.recoverCommittedGrabStaging(ctx)
 	}
-	for _, base := range b.cfg.AdoptionRoots() {
-		if err := b.sweepGrabsIn(ctx, filepath.Join(base, grabsDirName)); err != nil {
-			return err
+	roots := b.cfg.AdoptionRoots()
+	processed := make(map[string]bool)
+	var sweepErrs []error
+	for _, base := range roots {
+		if err := b.sweepGrabsIn(ctx, filepath.Join(base, grabsDirName), processed); err != nil {
+			sweepErrs = append(sweepErrs, err)
+		}
+	}
+	// Old crashes may leave only the quarantine copy. Dismissal claims also
+	// survive independently of landing directories and must always be retried.
+	pending, err := b.grabs.PendingRecovery(ctx)
+	if err != nil {
+		sweepErrs = append(sweepErrs, err)
+	}
+	source := parkedGrabItemSource{store: b.jobs.S, grabs: b.grabs}
+	for _, g := range pending {
+		if g.State == grab.StateDismissing {
+			if _, err := source.DismissPdfGrab(ctx, g.ID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				sweepErrs = append(sweepErrs, err)
+			}
+			continue
+		}
+		if processed[g.ID] || b.adoptionLatchUnhealthy() || g.QuarantinePath == "" {
+			continue
+		}
+		info, err := os.Stat(g.QuarantinePath)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			sweepErrs = append(sweepErrs, err)
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		if err := b.processSettledGrab(ctx, g, "", ""); err != nil {
+			sweepErrs = append(sweepErrs, err)
 		}
 	}
 	// Run the stale backstop only after scanning/processing landing files so
@@ -9753,10 +9813,10 @@ func (b *Bridge) SweepGrabs(ctx context.Context) error {
 	if err := b.grabs.AbandonStaleAwaiting(ctx, time.Now().Add(-staleAwaitingGrabBudget)); err != nil {
 		log.Printf("papio: stale PDF grab sweep failed: %v", err)
 	}
-	return nil
+	return errors.Join(sweepErrs...)
 }
 
-func (b *Bridge) sweepGrabsIn(ctx context.Context, root string) error {
+func (b *Bridge) sweepGrabsIn(ctx context.Context, root string, processed map[string]bool) error {
 	entries, err := b.readAdoptionDir(root)
 	if errors.Is(err, ErrAdoptionScanTimeout) {
 		return nil // root not responding (TCC); latch already logged, skip this tick
@@ -9787,19 +9847,13 @@ func (b *Bridge) sweepGrabsIn(ctx context.Context, root string) error {
 		if g.State != grab.StateAwaitingFile && g.State != grab.StateQuarantined {
 			continue // already terminal; nothing left to do here
 		}
-		var name string
-		if g.State == grab.StateAwaitingFile {
-			var ok bool
-			name, ok = b.settledFileIn(filepath.Join(root, id))
-			if !ok {
-				continue
-			}
-		} else if g.State == grab.StateQuarantined {
-			// Retry: validated bytes are in temp, not in the landing dir.
-			// Leave name empty — processSettledGrab stages temp directly.
-			name = ""
+		dir := filepath.Join(root, id)
+		name, ok := b.settledFileIn(dir)
+		if !ok && g.State == grab.StateAwaitingFile {
+			continue
 		}
-		if err := b.processSettledGrab(ctx, g, filepath.Join(root, id), name); err != nil {
+		processed[g.ID] = true
+		if err := b.processSettledGrab(ctx, g, dir, name); err != nil {
 			log.Printf("papio: pdf grab %s processing failed: %v", id, err)
 		}
 	}
@@ -9815,7 +9869,7 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 		return errors.New("acquisition service is not configured")
 	}
 	path := ""
-	if name != "" {
+	if name != "" && dir != "" {
 		path = filepath.Join(dir, name)
 	}
 	temp := g.QuarantinePath
@@ -9844,13 +9898,16 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 	}
 	active := report.Structural.Encrypted || report.Structural.HasJavaScript || report.Structural.HasEmbeddedFiles
 	// Encrypted/JS/embedded publisher PDFs are held for review after a job
-	// exists (validateCandidate parks unsafe_pdf). Deleting them here as
-	// invalid_pdf made Send PDF's grab fallback unusable for the SAGE/T&F
-	// files that motivated that park.
+	// exists (validateCandidate parks unsafe_pdf). Keep their captured bytes.
 	if !active && (!report.Payload.OK || !report.Structural.Valid) {
+		if err := b.grabs.MarkFailedValidation(ctx, g.ID, "the captured file is not a valid PDF"); err != nil {
+			return err
+		}
 		_ = os.Remove(temp)
-		_ = os.RemoveAll(dir)
-		return b.grabs.MarkFailedValidation(ctx, g.ID, "the captured file is not a valid PDF")
+		if dir != "" {
+			_ = os.RemoveAll(dir)
+		}
+		return nil
 	}
 	// No target work.Work exists yet, so only the front-matter DOI pattern
 	// applies — corroboratingIdentifier's arXiv/PMID markers compare against
@@ -9922,8 +9979,13 @@ func (b *Bridge) processSettledGrab(ctx context.Context, g *grab.Grab, dir, name
 			autoBindOutcome = grab.AutoBindOutcomeAbstained()
 		}
 		snap := grab.NewEligibilityPoolSnapshot(candidates, grab.SnapshotPhasePreBind, autoBindDecisionEnabled, autoBindAttempted, autoBindOutcome)
-		_ = os.RemoveAll(dir)
-		return b.grabs.MarkParkedNoIdentifierWithEligibilitySnapshot(ctx, g.ID, snap)
+		if err := b.grabs.MarkParkedNoIdentifierWithEligibilitySnapshot(ctx, g.ID, snap); err != nil {
+			return err
+		}
+		if dir != "" {
+			_ = os.RemoveAll(dir)
+		}
+		return nil
 	}
 	var mismatch error
 	for _, doi := range dois {
@@ -10064,7 +10126,9 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 	}
 	boundName, _, err := b.stageGrabCopy(temp, jobDir, fallbackName)
 	if err != nil {
-		_ = b.recordAdoptionDeferred(ctx, winner.Key, fallbackName, err)
+		if evErr := b.recordAdoptionDeferred(ctx, winner.Key, fallbackName, err); evErr != nil {
+			return true, evErr
+		}
 		return true, nil
 	}
 	dest := filepath.Join(jobDir, boundName)
@@ -10083,7 +10147,9 @@ func (b *Bridge) attemptAutoBind(ctx context.Context, g *grab.Grab, dir, name, t
 		return true, nil
 	}
 	_ = os.Remove(temp)
-	_ = os.RemoveAll(dir)
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
 	return true, nil
 }
 
@@ -10207,10 +10273,10 @@ func (b *Bridge) beginGrabStaging(grabID string) func() {
 	}
 }
 
-// recoverCommittedGrabStaging re-drives committed grab binds whose validated
+// recoverCommittedGrabStaging re-drives committed grab binds whose captured
 // bytes never reached ingestion in the bound job's adoption directory.
-// attemptAutoBind and ConfirmGrabCandidate commit the bind before staging, so
-// a crash in that window, or a failed mkdir or copy, leaves the only copy at
+// attemptAutoBind, IdentifyGrab and ConfirmGrabCandidate commit before staging.
+// A crash in that window, or a failed mkdir or copy, leaves the only copy at
 // the grab's QuarantinePath with the row already job_created; nothing else
 // reads it. A reused copy (created false) is ingested exactly like a fresh
 // stage: the match is by digest, so the bytes are the grab's bytes, and a
@@ -10282,7 +10348,9 @@ func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantin
 				return err
 			}
 			_ = os.Remove(quarantinePath)
-			_ = os.RemoveAll(landingDir)
+			if landingDir != "" {
+				_ = os.RemoveAll(landingDir)
+			}
 			return nil
 		case pdf.IdentityReview:
 			// An erratum/comment can print the ready paper's DOI. Do not
@@ -10306,9 +10374,12 @@ func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantin
 	// the next sweep stage these bytes again; stageGrabCopy reuses the first
 	// copy rather than minting an identical sibling the scan cannot adopt.
 	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), result.JobID)
-	src := filepath.Join(landingDir, filename)
-	if _, err := os.Stat(src); err != nil {
-		src = quarantinePath
+	src := quarantinePath
+	if landingDir != "" && filename != "" {
+		landing := filepath.Join(landingDir, filename)
+		if info, err := os.Stat(landing); err == nil && info.Mode().IsRegular() {
+			src = landing
+		}
 	}
 	boundName, created, err := b.stageGrabCopy(src, jobDir, filename)
 	if err != nil {
@@ -10321,7 +10392,9 @@ func (b *Bridge) createGrabJob(ctx context.Context, g *grab.Grab, doi, quarantin
 		return err
 	}
 	_ = os.Remove(quarantinePath)
-	_ = os.RemoveAll(landingDir)
+	if landingDir != "" {
+		_ = os.RemoveAll(landingDir)
+	}
 	if _, err := b.ingestAdoptedFile(ctx, result.JobID, boundName, nil, nil); err != nil {
 		if evErr := b.recordAdoptionDeferred(ctx, result.JobID, boundName, err); evErr != nil {
 			return evErr
@@ -10747,30 +10820,44 @@ func (b *Bridge) IdentifyGrab(ctx context.Context, grabID, kind, raw string) Gra
 		result.Outcome, result.Detail = "failed", "quarantined file name is invalid"
 		return result
 	}
+	// Commit ownership before exposing bytes to adoption. Keep quarantine
+	// until ingestion succeeds, so recoverCommittedGrabStaging can retry a
+	// crash or staging failure after the commit.
+	defer b.beginGrabStaging(grabID)()
+	if err := b.grabs.MarkJobCreated(ctx, grabID, created.JobID, "job_created"); err != nil {
+		if errors.Is(err, grab.ErrStateChanged) {
+			result.Outcome, result.Detail = "conflict", "pdf grab changed before identification"
+		} else {
+			result.Outcome, result.Detail = "failed", "pdf grab could not be finalized"
+		}
+		return result
+	}
 	jobDir := filepath.Join(b.cfg.EffectiveAdoptionRoot(), created.JobID)
-	if err := os.MkdirAll(jobDir, 0o700); err != nil {
-		result.Outcome, result.Detail = "failed", "job adoption directory could not be created"
+	boundName, _, err := b.stageGrabCopy(g.QuarantinePath, jobDir, filename)
+	if err != nil {
+		if evErr := b.recordAdoptionDeferred(ctx, created.JobID, filename, err); evErr != nil {
+			result.Outcome, result.Detail = "failed", "pdf grab bound but bytes could not be staged"
+			return result
+		}
+		result.Outcome = "job_created"
 		return result
 	}
-	if err := b.moveGrabFile(g.QuarantinePath, filepath.Join(jobDir, filename)); err != nil {
-		result.Outcome, result.Detail = "failed", "quarantined file could not be bound to the job"
-		return result
-	}
-	_ = os.Remove(filepath.Dir(g.QuarantinePath))
 	// A grab can join an already-live job, including one holding a live
 	// institutional claim with a route already issued, so these bytes owe the
 	// same winner decision as any other browser-delivered file.
-	if _, err := b.ingestAdoptedFile(ctx, created.JobID, filename, nil, nil); err != nil {
-		_ = b.recordAdoptionDeferred(ctx, created.JobID, filename, err)
-	}
-	if err := b.grabs.MarkIdentified(ctx, grabID); err != nil {
-		result.Outcome, result.Detail = "conflict", "pdf grab changed before identification"
+	if _, err := b.ingestAdoptedFile(ctx, created.JobID, boundName, nil, nil); err != nil {
+		if evErr := b.recordAdoptionDeferred(ctx, created.JobID, boundName, err); evErr != nil {
+			result.Outcome, result.Detail = "failed", "pdf grab bound but bytes could not be adopted"
+			return result
+		}
+		if row, getErr := b.jobs.Get(ctx, created.JobID); getErr == nil && row != nil && job.Terminal(row.State) {
+			_ = b.preserveDeferredAdoption(created.JobID, boundName, filepath.Join(jobDir, boundName))
+		}
+		result.Outcome = "job_created"
 		return result
 	}
-	if err := b.grabs.MarkJobCreated(ctx, grabID, created.JobID, "job_created"); err != nil {
-		result.Outcome, result.Detail = "failed", "pdf grab could not be finalized"
-		return result
-	}
+	_ = os.Remove(g.QuarantinePath)
+	_ = os.Remove(filepath.Dir(g.QuarantinePath))
 	result.Outcome = "job_created"
 	return result
 }
