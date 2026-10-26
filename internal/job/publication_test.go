@@ -290,6 +290,56 @@ func TestDiscardPublicationPreservesSharedDigest(t *testing.T) {
 	}
 }
 
+// TestDiscardPublicationSharedJournalRowRetainsArtifact pins the recovery path
+// where two jobs prepare identical bytes and neither has finalized: discarding
+// the first journal row must keep the artifact row because the second journal
+// row still owns the digest, and the survivor must still finalize. A lone row
+// discards fully, which also covers the last-reference artifact delete.
+func TestDiscardPublicationSharedJournalRowRetainsArtifact(t *testing.T) {
+	ctx := context.Background()
+	js := testStore(t)
+	firstID, _ := validatingPublicationJob(t, js, "wr_publication_shared_row_first")
+	secondID, _ := validatingPublicationJob(t, js, "wr_publication_shared_row_second")
+	sha := "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	first := publicationInput("publication_shared_row_first", firstID, nil, PublicationRoleSupplement, sha)
+	second := publicationInput("publication_shared_row_second", secondID, nil, PublicationRoleSupplement, sha)
+	if err := js.PreparePublication(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := js.PreparePublication(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := js.DiscardPublication(ctx, first.ID)
+	if err != nil || deleted {
+		t.Fatalf("shared discard = deleted=%t, err=%v; want retained", deleted, err)
+	}
+	if prepared, err := js.PreparedPublications(ctx, firstID); err != nil || len(prepared) != 0 {
+		t.Fatalf("first prepared = %+v, %v; want none", prepared, err)
+	}
+	artifact, err := js.GetArtifact(ctx, sha)
+	if err != nil || artifact == nil {
+		t.Fatalf("shared artifact = %+v, %v; want kept", artifact, err)
+	}
+	if _, err := js.FinalizePublication(ctx, second.ID, func() (PromotionResult, error) {
+		return PromotionResult{Path: second.Artifact.Path, Created: true}, nil
+	}); err != nil {
+		t.Fatalf("survivor finalize: %v", err)
+	}
+	loneID, _ := validatingPublicationJob(t, js, "wr_publication_shared_row_lone")
+	loneSHA := "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc"
+	lone := publicationInput("publication_shared_row_lone", loneID, nil, PublicationRoleSupplement, loneSHA)
+	if err := js.PreparePublication(ctx, lone); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err = js.DiscardPublication(ctx, lone.ID)
+	if err != nil || !deleted {
+		t.Fatalf("lone discard = deleted=%t, err=%v; want removed", deleted, err)
+	}
+	if artifact, err := js.GetArtifact(ctx, loneSHA); err != nil || artifact != nil {
+		t.Fatalf("lone artifact = %+v, %v; want gone", artifact, err)
+	}
+}
+
 func TestPreparedPublicationSurvivesRestartAndFinalCommitFailure(t *testing.T) {
 	ctx := context.Background()
 	dataDir := storetest.DataDir(t)

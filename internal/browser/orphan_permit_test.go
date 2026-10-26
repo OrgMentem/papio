@@ -269,3 +269,31 @@ func TestOrphanedDirectPermitWithoutProofIsNotTouched(t *testing.T) {
 		})
 	}
 }
+
+// TestOrphanedDirectPermitPDFOnTerminalJobSettlesWithJobState pins the late-PDF
+// path: the job finished before its download landed, so the sweep settles the
+// orphaned permit as effect_completed_job_terminal and never adopts the bytes.
+func TestOrphanedDirectPermitPDFOnTerminalJobSettlesWithJobState(t *testing.T) {
+	ctx := context.Background()
+	f := newOrphanPermitFixture(t, "terminal", true, true)
+	if err := f.jobs.Cancel(ctx, f.jobID, job.TerminalReasonCancelledByUser); err != nil {
+		t.Fatal(err)
+	}
+	writeFixturePDF(t, f.jobFile("paper.pdf"))
+	f.sweep(t)
+	f.assertLaneFree(t)
+	detail := orphanResolution(t, f.jobs, f.jobID)
+	if detail["rule"] != string(job.OrphanPermitEffectCompletedJobTerminal) ||
+		detail["job_state"] != job.StateCancelled || detail["permit_id"] != f.permitID ||
+		detail["filename"] != "paper.pdf" || detail["pdf"] != true ||
+		len(stringDetail(detail, "sha256")) != 64 {
+		t.Fatalf("resolution evidence = %#v", detail)
+	}
+	row, err := f.jobs.Get(ctx, f.jobID)
+	if err != nil || row.State != job.StateCancelled || row.ArtifactSHA256 != "" {
+		t.Fatalf("terminal job after settlement = %+v err=%v, want cancelled without artifact", row, err)
+	}
+	if _, err := os.Stat(f.jobFile("paper.pdf")); err != nil {
+		t.Fatalf("terminal PDF was consumed: %v", err)
+	}
+}
