@@ -2,10 +2,13 @@
 package pdf
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"papio/internal/work"
 )
@@ -29,6 +32,14 @@ const realPacket = `<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
  </rdf:RDF>
 </x:xmpmeta>
 <?xpacket end='w'?>`
+
+func TestExtractMetadataReportsToolTimeout(t *testing.T) {
+	tool := fakeTool(t, "exec sleep 30")
+	fields, err := ExtractMetadata(context.Background(), "paper.pdf", Capability{PDFInfo: tool}, SemanticOptions{Timeout: 50 * time.Millisecond})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fields=%+v err=%v, want a timeout rather than absent metadata", fields, err)
+	}
+}
 
 func fieldValues(t *testing.T, fields MetadataFields, name string) []string {
 	t.Helper()

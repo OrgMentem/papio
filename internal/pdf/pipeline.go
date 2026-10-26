@@ -78,7 +78,14 @@ func Validate(ctx context.Context, in ValidationInput, opt ValidationOptions) (V
 	// (see metadata.go). It is never required: absence yields empty fields and
 	// no error, so a file no publisher produced validates exactly as before.
 	metadata, err := ExtractMetadata(ctx, in.Path, in.Capability, opt.Semantic)
-	if err != nil {
+	// Validation can proceed on text alone when only the metadata tool times
+	// out. ExtractMetadata still reports that timeout to measurement callers,
+	// which must not cache incomplete evidence. Parent cancellation remains
+	// fatal regardless of which extraction stage observes it.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return report, ctxErr
+	}
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		return report, err
 	}
 	report.Metadata = metadata

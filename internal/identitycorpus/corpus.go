@@ -1408,8 +1408,9 @@ const cacheTempPattern = "identity-corpus-*.tmp"
 // text, for the same reason: a warm cache from before that extraction
 // existed would otherwise go on serving entries with no Metadata forever,
 // silently reading as "this document carries no embedded metadata" for
-// every document it ever touched.
-const cacheFormatVersion = 3
+// every document it ever touched. Version 4 discards entries whose missing
+// metadata may have come from a cancelled or timed-out extraction.
+const cacheFormatVersion = 4
 
 // cacheEntry is one cached extraction. It holds the flags as well as the text
 // because a cache hit used to reconstruct only Text and Chars, leaving OCRUsed
@@ -1531,6 +1532,9 @@ func classifyExtractionFailure(evidence []string) string {
 // corrupt, or scanned with no usable text layer, and one such file must not
 // cost the harness the rest.
 func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts pdf.SemanticOptions, cacheDir string) (Document, Skip, bool) {
+	if err := ctx.Err(); err != nil {
+		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: classifyExtractionFailure([]string{err.Error()})}, false
+	}
 	base := Document{Key: p.cand.attachmentKey, ParentKey: p.cand.parentKey, Path: p.path, Work: p.work, Secondary: p.cand.secondary}
 
 	// The cache key folds in size and modification time, not just the
@@ -1568,14 +1572,15 @@ func extractOne(ctx context.Context, p prepared, capability pdf.Capability, opts
 		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: classifyExtractionFailure(report.Evidence)}, false
 	}
 
-	// Embedded metadata is corroborating evidence for an otherwise-admitted
-	// document, never an admission criterion of its own: a read failure
-	// here must degrade to "no metadata evidence" — exactly how a document
-	// that genuinely carries none already behaves — and must never turn a
-	// good text extraction into a Skip.
+	// Genuine metadata absence does not exclude a document. Interrupted
+	// extraction is different: it supplies neither complete evidence for
+	// this measurement nor a result that a later run may safely reuse.
 	metadata, err := pdf.ExtractMetadata(ctx, p.path, capability, opts)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
 	if err != nil {
-		metadata = nil
+		return Document{}, Skip{Key: p.cand.attachmentKey, Reason: "metadata extraction failed: " + err.Error()}, false
 	}
 
 	if cachePath != "" {

@@ -29,7 +29,8 @@ func parseBibTeX(data []byte) ([]Record, error) {
 			typeEnd++
 		}
 		if typeEnd == typeStart {
-			return nil, fmt.Errorf("bibtex: entry at byte %d: missing entry type", at)
+			offset = at + 1
+			continue
 		}
 
 		open := typeEnd
@@ -37,7 +38,14 @@ func parseBibTeX(data []byte) ([]Record, error) {
 			open++
 		}
 		if open == len(input) || input[open] != '{' {
-			return nil, fmt.Errorf("bibtex: entry at byte %d: expected opening brace", at)
+			// Inter-entry text is ignored, including email addresses and
+			// other stray @ characters. Parenthesized entries remain
+			// unsupported rather than silently dropping a real record.
+			if open < len(input) && input[open] == '(' {
+				return nil, fmt.Errorf("bibtex: entry at byte %d: expected opening brace", at)
+			}
+			offset = at + 1
+			continue
 		}
 
 		entry, next, err := bibTeXBraced(input, open)
