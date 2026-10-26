@@ -262,11 +262,17 @@ func New(ctx context.Context, cfg config.Config) (*System, error) {
 }
 
 func NewWithVersion(ctx context.Context, cfg config.Config, version string) (*System, error) {
-	env, err := runtimecredential.TakeEnvironment(cfg)
+	environment, err := runtimecredential.TakeEnvironment(cfg)
 	if err != nil {
 		return nil, err
 	}
-	credentials := runtimecredential.Resolve(ctx, cfg, credential.NewStore(), agentcredential.NewStore().Load, env)
+	return NewWithEnvironment(ctx, cfg, version, environment)
+}
+
+// NewWithEnvironment reuses an explicitly owned environment snapshot when a
+// caller constructs another system for the same profile and credential bindings.
+func NewWithEnvironment(ctx context.Context, cfg config.Config, version string, environment *runtimecredential.EnvironmentSnapshot) (*System, error) {
+	credentials := runtimecredential.Resolve(ctx, cfg, credential.NewStore(), agentcredential.NewStore().Load, environment.Lookup(cfg))
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

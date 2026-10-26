@@ -410,3 +410,25 @@ func assertCredentialDiagnosticsPrivate(t *testing.T, report Report, secrets ...
 		}
 	}
 }
+
+func TestUnavailableCredentialRemediationRequiresDaemonRestart(t *testing.T) {
+	cfg := config.Default()
+	p := cfg.Sources[config.SourceCORE]
+	p.Enabled, p.CredentialRef = true, doctorCredentialRef
+	cfg.Sources[config.SourceCORE] = p
+	view := runtimecredential.Resolve(context.Background(), cfg, doctorCredentialReader(func(context.Context, string) (credential.Record, error) {
+		return credential.Record{}, credential.ErrUnavailable
+	}), nil, nil)
+	report := credentialChecks(cfg, view)
+	for _, check := range report.Checks {
+		if check.Name != "credential:sources.core" {
+			continue
+		}
+		if check.Status != Fail || !strings.Contains(check.Remediation, "restart the daemon") ||
+			!strings.Contains(check.Remediation, "not the running daemon") {
+			t.Fatalf("unavailable credential remediation: %+v", check)
+		}
+		return
+	}
+	t.Fatal("missing required credential diagnostic")
+}

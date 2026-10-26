@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 
 	"papio/internal/agentcredential"
 	"papio/internal/config"
@@ -17,6 +18,24 @@ import (
 )
 
 const legacyAgentEnv = "PAPIO_TYPESAFE_API_KEY"
+
+var ErrEnvironmentAlreadyConsumed = errors.New("environment credential already consumed")
+
+type EnvironmentAlreadyConsumedError struct {
+	Name string
+}
+
+func (e *EnvironmentAlreadyConsumedError) Error() string {
+	return "environment credential " + e.Name + " already consumed; reuse the EnvironmentSnapshot"
+}
+
+func (*EnvironmentAlreadyConsumedError) Unwrap() error { return ErrEnvironmentAlreadyConsumed }
+
+// Keep only names here. Credential values belong exclusively to their snapshots.
+var consumedEnvironment = struct {
+	sync.Mutex
+	names map[string]bool
+}{names: make(map[string]bool)}
 
 type LegacyLoader func(context.Context, string) (string, error)
 type LookupEnv func(string) (string, bool)
@@ -32,28 +51,77 @@ func (r *Runtime) String() string               { return "Papio runtime credenti
 func (r *Runtime) GoString() string             { return r.String() }
 func (r *Runtime) MarshalJSON() ([]byte, error) { return json.Marshal(r.Statuses()) }
 
+// EnvironmentSnapshot owns one profile's captured environment. Reuse it
+// explicitly for repeated initialization; a fresh capture reads only the OS
+// environment and never inherits an earlier capture.
+type EnvironmentSnapshot struct {
+	path     string
+	dataDir  string
+	bindings map[string]string
+	values   map[string]string
+}
+
+func (*EnvironmentSnapshot) String() string     { return "Papio environment snapshot (redacted)" }
+func (s *EnvironmentSnapshot) GoString() string { return s.String() }
+
+func (*EnvironmentSnapshot) MarshalJSON() ([]byte, error) { return []byte("{}"), nil }
+
+// Lookup returns the captured values only for the original profile and binding
+// set. A changed profile or target must capture its own environment.
+func (s *EnvironmentSnapshot) Lookup(cfg config.Config) LookupEnv {
+	missing := func(string) (string, bool) { return "", false }
+	if s == nil || s.path != cfg.Path || s.dataDir != cfg.DataDir {
+		return missing
+	}
+	bindings := cfg.CredentialBindings()
+	if len(bindings) != len(s.bindings) {
+		return missing
+	}
+	for _, binding := range bindings {
+		if ref, ok := s.bindings[binding.Target]; !ok || ref != binding.Reference {
+			return missing
+		}
+	}
+	return func(name string) (string, bool) { value, ok := s.values[name]; return value, ok }
+}
+
 // TakeEnvironment snapshots all explicitly selected variables before removing
 // any, since several bindings may use the same variable. It runs before the
-// first vault access: even a platform vault helper must not inherit these keys.
-func TakeEnvironment(cfg config.Config) (LookupEnv, error) {
+// first vault access so helpers cannot inherit these keys. Callers that need
+// another resolution must explicitly reuse the returned snapshot.
+// A missing variable consumed by this process is an error, not an absent key.
+func TakeEnvironment(cfg config.Config) (*EnvironmentSnapshot, error) {
+	consumedEnvironment.Lock()
+	defer consumedEnvironment.Unlock()
+	snapshot := &EnvironmentSnapshot{
+		path: cfg.Path, dataDir: cfg.DataDir,
+		bindings: make(map[string]string),
+		values:   make(map[string]string),
+	}
 	names := map[string]bool{legacyAgentEnv: true}
 	for _, binding := range cfg.CredentialBindings() {
+		snapshot.bindings[binding.Target] = binding.Reference
 		if name, ok := credential.EnvironmentName(binding.Reference); ok {
 			names[name] = true
 		}
 	}
-	values := make(map[string]string, len(names))
 	for name := range names {
 		if value, ok := os.LookupEnv(name); ok {
-			values[name] = value
+			snapshot.values[name] = value
+			delete(consumedEnvironment.names, name)
+		} else if consumedEnvironment.names[name] {
+			return nil, &EnvironmentAlreadyConsumedError{Name: name}
 		}
 	}
 	for name := range names {
 		if err := os.Unsetenv(name); err != nil {
 			return nil, errors.New("could not isolate integration credentials from child processes")
 		}
+		if value := snapshot.values[name]; value != "" {
+			consumedEnvironment.names[name] = true
+		}
 	}
-	return func(name string) (string, bool) { value, ok := values[name]; return value, ok }, nil
+	return snapshot, nil
 }
 
 // Resolve reads only the records explicitly bound to this profile. Legacy

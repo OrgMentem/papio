@@ -40,6 +40,7 @@ func TestNewWiresCoreServices(t *testing.T) {
 	cfg.DataDir = storetest.DataDir(t)
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	system, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -92,6 +93,7 @@ func TestNewImportsEveryUnresolvedLegacyBrowserEffectBeforeAdmission(t *testing.
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	first, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +223,7 @@ func TestNewRejectsMalformedLegacyBrowserEffectBeforeBrowserConstruction(t *test
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	first, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -537,6 +540,7 @@ func TestSystemCloseCancelsHookAndPersistsOutcome(t *testing.T) {
 	cfg.Zotio.AutoEnrich = false
 	cfg.Hooks.OnReady = "configured"
 	cfg.Hooks.TimeoutSeconds = 1
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	system, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -633,6 +637,7 @@ func TestZoteroWaitingNoticeIsSupersededOnceNoPaperWaits(t *testing.T) {
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
 	cfg.Notify.Enabled = false // no platform sender: the drain must not post a real notification
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	system, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)

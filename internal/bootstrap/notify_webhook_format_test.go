@@ -35,6 +35,7 @@ func TestNotifyWebhookFormatReachesRoutedDelivery(t *testing.T) {
 	cfg.Notify.Enabled = false
 	cfg.Notify.WebhookURL = server.URL
 	cfg.Notify.WebhookFormat = config.WebhookFormatSlack
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	system, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)

@@ -133,6 +133,9 @@ func (s *Store) dispatch(ctx context.Context, op, profile, key string) (string, 
 			return value, err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	switch op {
 	case opLoad:
 		value, err := s.backend.load(s.service, profile)

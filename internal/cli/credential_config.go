@@ -756,10 +756,11 @@ func takeCredentialCommandEnvironment(cfg config.Config, extraRef string) (runti
 	if extra {
 		value, present = os.LookupEnv(name)
 	}
-	lookup, err := runtimecredential.TakeEnvironment(cfg)
+	environment, err := runtimecredential.TakeEnvironment(cfg)
 	if err != nil {
 		return nil, err
 	}
+	lookup := environment.Lookup(cfg)
 	if extra {
 		if err := os.Unsetenv(name); err != nil {
 			return nil, errors.New("could not isolate integration credentials from child processes")
@@ -780,6 +781,10 @@ func prepareCredentialEnvironment(deps credentialConfigDependencies, cfg config.
 	}
 	lookup, err := deps.prepareEnv(cfg, extraRef)
 	if err != nil {
+		var consumed *runtimecredential.EnvironmentAlreadyConsumedError
+		if errors.As(err, &consumed) {
+			return deps, consumed
+		}
 		return deps, errors.New("could not isolate integration credentials from child processes")
 	}
 	deps.lookupEnv = lookup

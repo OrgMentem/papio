@@ -35,6 +35,7 @@ func allSourcesEnabled(t *testing.T) config.Config {
 
 func newSystemForRoles(t *testing.T, cfg config.Config) *System {
 	t.Helper()
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	system, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)

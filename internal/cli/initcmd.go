@@ -173,6 +173,10 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 	if loadConfig == nil {
 		loadConfig = initConfig
 	}
+	snapshot, err := config.ReadSnapshot(path)
+	if err != nil {
+		return initRequiredFailure(opt.out, "Configuration", err)
+	}
 	cfg, exists, err := loadConfig(path)
 	if err != nil {
 		return initRequiredFailure(opt.out, "Configuration", err)
@@ -181,7 +185,7 @@ func runInit(cmd *cobra.Command, opt *options, deps initDependencies, input init
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}
 	writeDeliveryGateVerdicts(opt.out, cfg)
-	backup, err := config.SaveWithBackup(cfg, path)
+	backup, err := config.SaveIfUnchangedWithBackup(cfg, path, snapshot)
 	if err != nil {
 		return initRequiredFailure(opt.out, "Configuration", err)
 	}

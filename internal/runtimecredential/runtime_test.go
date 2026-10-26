@@ -228,7 +228,7 @@ func TestRuntimeConsumesAllSelectedEnvironmentBeforeVaultAccess(t *testing.T) {
 			}
 		}
 		return credential.Record{}, errors.New("raw private error")
-	}), nil, env)
+	}), nil, env.Lookup(cfg))
 	if calls != 1 {
 		t.Fatal("vault binding not attempted")
 	}
@@ -239,5 +239,148 @@ func TestRuntimeConsumesAllSelectedEnvironmentBeforeVaultAccess(t *testing.T) {
 	}
 	if os.Getenv("PAPIO_CREDENTIAL_UNSELECTED") != "unrelated" {
 		t.Fatal("unselected environment changed")
+	}
+}
+
+func TestEnvironmentSnapshotExplicitReusePreservesResolvedCredentials(t *testing.T) {
+	const name = "PAPIO_CREDENTIAL_TEST_REPEATED"
+	cfg := config.Default()
+	bindSource(&cfg, config.SourceOpenAlex, "env:"+name)
+	t.Setenv(name, "synthetic-repeated-key")
+	t.Setenv(legacyAgentEnv, "")
+	snapshot, err := TakeEnvironment(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		r := Resolve(context.Background(), cfg, nil, nil, snapshot.Lookup(cfg))
+		if r.SourcePolicy(config.SourceOpenAlex).APIKey != "synthetic-repeated-key" {
+			t.Fatal("explicit snapshot reuse lost the selected credential")
+		}
+		if statusFor(t, r, "sources.openalex").State != "ready" {
+			t.Fatal("explicit snapshot reuse changed credential readiness")
+		}
+	}
+	if _, ok := os.LookupEnv(name); ok {
+		t.Fatal("snapshot reuse restored the credential to the child environment")
+	}
+}
+
+func TestEnvironmentSnapshotRejectsDifferentProfileOrTarget(t *testing.T) {
+	const name = "PAPIO_CREDENTIAL_TEST_SCOPED"
+	for _, change := range []string{"profile", "data directory", "target", "additional target"} {
+		t.Run(change, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Path = filepath.Join(t.TempDir(), "config.toml")
+			bindSource(&cfg, config.SourceOpenAlex, "env:"+name)
+			t.Setenv(name, "synthetic-scoped-key")
+			t.Setenv(legacyAgentEnv, "")
+			snapshot, err := TakeEnvironment(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			other := config.Default()
+			other.Path, other.DataDir = cfg.Path, cfg.DataDir
+			source := config.SourceOpenAlex
+			if change == "target" || change == "additional target" {
+				source = config.SourceSemanticScholar
+			}
+			bindSource(&other, source, "env:"+name)
+			switch change {
+			case "profile":
+				other.Path = filepath.Join(t.TempDir(), "config.toml")
+			case "data directory":
+				other.DataDir = t.TempDir()
+			case "additional target":
+				bindSource(&other, config.SourceOpenAlex, "env:"+name)
+			}
+			t.Setenv(legacyAgentEnv, "")
+			if _, err := TakeEnvironment(other); !errors.Is(err, ErrEnvironmentAlreadyConsumed) {
+				t.Fatalf("fresh capture reused a consumed variable: %v", err)
+			}
+			r := Resolve(context.Background(), other, nil, nil, snapshot.Lookup(other))
+			if r.SourcePolicy(source).APIKey != "" || statusFor(t, r, "sources."+source).State != "missing" {
+				t.Fatal("a different profile or target inherited the captured credential")
+			}
+		})
+	}
+}
+
+func TestTakeEnvironmentRejectsConsumedNamesAndAcceptsResetValues(t *testing.T) {
+	const name = "PAPIO_CREDENTIAL_TEST_REMOVED"
+	cfg := config.Default()
+	bindSource(&cfg, config.SourceOpenAlex, "env:"+name)
+	t.Setenv(name, "synthetic-removed-key")
+	t.Setenv(legacyAgentEnv, "")
+	snapshot, err := TakeEnvironment(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(legacyAgentEnv, "")
+	_, err = TakeEnvironment(cfg)
+	var consumed *EnvironmentAlreadyConsumedError
+	if !errors.Is(err, ErrEnvironmentAlreadyConsumed) || !errors.As(err, &consumed) || consumed.Name != name {
+		t.Fatalf("repeated capture did not identify the consumed variable: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reuse the EnvironmentSnapshot") {
+		t.Fatalf("repeated capture omitted the recovery instruction: %v", err)
+	}
+	t.Setenv(name, "synthetic-reset-key")
+	t.Setenv(legacyAgentEnv, "")
+	fresh, err := TakeEnvironment(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Resolve(context.Background(), cfg, nil, nil, fresh.Lookup(cfg))
+	if r.SourcePolicy(config.SourceOpenAlex).APIKey != "synthetic-reset-key" {
+		t.Fatal("fresh capture did not use the explicitly reset value")
+	}
+	r = Resolve(context.Background(), cfg, nil, nil, snapshot.Lookup(cfg))
+	if r.SourcePolicy(config.SourceOpenAlex).APIKey != "synthetic-removed-key" {
+		t.Fatal("fresh capture changed the independently owned snapshot")
+	}
+	if _, ok := os.LookupEnv(name); ok {
+		t.Fatal("fresh capture left the reset credential in the child environment")
+	}
+}
+
+func TestTakeEnvironmentNeverConsumedAbsentVariableRemainsMissing(t *testing.T) {
+	const name = "PAPIO_CREDENTIAL_TEST_NEVER_CONSUMED"
+	cfg := config.Default()
+	bindSource(&cfg, config.SourceOpenAlex, "env:"+name)
+	t.Setenv(name, "")
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(legacyAgentEnv, "")
+	snapshot, err := TakeEnvironment(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Resolve(context.Background(), cfg, nil, nil, snapshot.Lookup(cfg))
+	if r.SourcePolicy(config.SourceOpenAlex).APIKey != "" || statusFor(t, r, "sources.openalex").State != "missing" {
+		t.Fatal("a never-consumed absent credential did not remain missing")
+	}
+}
+
+func TestTakeEnvironmentEmptyVariableDoesNotBecomeConsumed(t *testing.T) {
+	const name = "PAPIO_CREDENTIAL_TEST_EMPTY"
+	cfg := config.Default()
+	bindSource(&cfg, config.SourceOpenAlex, "env:"+name)
+	t.Setenv(name, "")
+	t.Setenv(legacyAgentEnv, "")
+	if _, err := TakeEnvironment(cfg); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := TakeEnvironment(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Resolve(context.Background(), cfg, nil, nil, snapshot.Lookup(cfg))
+	if statusFor(t, r, "sources.openalex").State != "missing" {
+		t.Fatal("the removed empty variable did not remain plain missing")
 	}
 }
