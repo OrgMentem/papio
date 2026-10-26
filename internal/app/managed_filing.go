@@ -233,7 +233,7 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 	if err != nil {
 		return ManagedFiling{}, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func(tx *sql.Tx) { _ = tx.Rollback() }(tx)
 	if _, err = tx.ExecContext(ctx, `UPDATE managed_filings SET updated_at = updated_at WHERE job_id = ? AND destination = ?`, jobID, destination); err != nil {
 		return ManagedFiling{}, err
 	}
@@ -279,7 +279,7 @@ func (s *Service) fileManaged(ctx context.Context, jobID, destination string, fo
 	if err != nil {
 		return f, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func(tx *sql.Tx) { _ = tx.Rollback() }(tx)
 	// The short writer fence serializes the publish/receipt with archive.
 	if _, err = tx.ExecContext(ctx, `UPDATE jobs SET acquisition_disposition = acquisition_disposition WHERE id = ?`, jobID); err != nil {
 		return f, err
