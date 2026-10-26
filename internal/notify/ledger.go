@@ -305,25 +305,35 @@ func (l *StoreLedger) ReserveDesktop(ctx context.Context, id int64, now time.Tim
 func (l *StoreLedger) SetDesktopState(ctx context.Context, id int64, state string, now time.Time) (bool, error) {
 	return l.ledger.SetDesktopState(ctx, id, state, now)
 }
-func (l *StoreLedger) ClaimWebhook(ctx context.Context, id int64) (Record, bool, error) {
+func (l *StoreLedger) ClaimWebhook(ctx context.Context, id int64, now time.Time) (Record, bool, error) {
 	if l == nil || l.ledger == nil {
 		return Record{}, false, fmt.Errorf("notification ledger is unavailable")
 	}
-	claimed, err := l.ledger.ClaimWebhook(ctx, id)
+	claimed, err := l.ledger.ClaimWebhook(ctx, id, now)
 	if err != nil || !claimed {
 		return Record{}, claimed, err
-	}
-	if l.store == nil || l.store.DB() == nil {
-		return Record{}, true, fmt.Errorf("notification ledger store is unavailable")
 	}
 	// A concurrent Route can coalesce another event into the same row after
 	// this Route's Upsert returned but before this claim won. The Upsert
 	// snapshot is stale then, so re-read the claimed row and send its
 	// authoritative count and payload. The loser of the claim sends nothing,
 	// and the winner's POST already covers the merged event.
-	fresh, err := l.fetchByID(ctx, id)
+	var fresh Record
+	if l.store == nil || l.store.DB() == nil {
+		err = fmt.Errorf("notification ledger store is unavailable")
+	} else {
+		fresh, err = l.fetchByID(ctx, id)
+	}
 	if err != nil {
-		return Record{}, true, err
+		// Nothing was dispatched: release the claim on a detached bounded
+		// context (the read may have failed because ctx was cancelled), so
+		// the row stays due instead of stranding in sending.
+		settle, cancel := detachedSettle(ctx)
+		defer cancel()
+		if rerr := l.ledger.SetWebhookState(settle, id, "pending", now); rerr != nil {
+			return Record{}, true, fmt.Errorf("%w (releasing the webhook claim: %w)", err, rerr)
+		}
+		return Record{}, false, err
 	}
 	return fresh, true, nil
 }
@@ -367,6 +377,18 @@ func parseNotifyTime(rowID int64, column string, text sql.NullString) (time.Time
 func (l *StoreLedger) SetWebhookState(ctx context.Context, id int64, state string, now time.Time) error {
 	return l.ledger.SetWebhookState(ctx, id, state, now)
 }
+
+// DeferWebhook requeues a claimed webhook leg as pending with a retry time,
+// so a later drain retries the same row under its stable delivery key, while
+// window has not elapsed since the leg first failed. See the store method
+// for the full policy.
+func (l *StoreLedger) DeferWebhook(ctx context.Context, id int64, failedAt, retryAt time.Time, window time.Duration) (bool, error) {
+	if l == nil || l.ledger == nil {
+		return false, fmt.Errorf("notification ledger is unavailable")
+	}
+	return l.ledger.DeferWebhook(ctx, id, failedAt, retryAt, window)
+}
+
 func (l *StoreLedger) SupersedeCheckpoints(ctx context.Context, aggregateKey string, now time.Time) (int, error) {
 	return l.ledger.SupersedeCheckpoints(ctx, aggregateKey, now)
 }

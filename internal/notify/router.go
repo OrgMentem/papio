@@ -4,9 +4,12 @@ package notify
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -38,10 +41,19 @@ type Ledger interface {
 	// can coalesce another event after this Route's Upsert returned but
 	// before its claim won, so the Upsert snapshot can be stale. A merge
 	// after the claim queues a new generation row under its own key instead
-	// of rewriting the claimed snapshot. See the store ClaimWebhook for the
-	// full policy.
-	ClaimWebhook(context.Context, int64) (Record, bool, error)
+	// of rewriting the claimed snapshot. A deferred leg is not claimable
+	// before its retry time (the time argument), so the claim itself
+	// enforces the backoff. See the store ClaimWebhook for the full policy.
+	ClaimWebhook(context.Context, int64, time.Time) (Record, bool, error)
 	SetWebhookState(context.Context, int64, string, time.Time) error
+	// DeferWebhook requeues a claimed leg as pending with a retry time, so a
+	// later drain retries the same row under its stable delivery key. The
+	// router calls it for provable non-delivery (dial, DNS, or certificate
+	// failures, 429/503) instead of settling failed. It reports false, and
+	// leaves the row for the caller to settle failed, once the window has
+	// elapsed since the leg first failed. Both times are webhook-owned:
+	// available_at stays the desktop leg's.
+	DeferWebhook(ctx context.Context, id int64, failedAt, retryAt time.Time, window time.Duration) (bool, error)
 	SupersedeCheckpoints(context.Context, string, time.Time) (int, error)
 	LatestCheckpoint(context.Context, string) (Record, bool, error)
 }
@@ -228,32 +240,52 @@ func (r *Router) Route(ctx context.Context, intent Intent) error {
 	// hours, supersession, or rate state. Immediate legs dispatch now; digest
 	// legs are drained by RunDue.
 	//
-	// Webhook delivery is at-most-once per ledger row. The router claims the
-	// pending leg before its POST, so a replayed intent, a concurrent Route,
-	// or a restart after the claim cannot POST the same row twice. A crash
-	// between claim and settle leaves sending, which never becomes due
-	// again: the delivery may be lost but is never duplicated. The claimed
-	// snapshot is immutable: a concurrent Route that lands after the claim
-	// queues its event under a new generation row with its own delivery
-	// key, so the second POST never reuses the first key. Local ledger state
-	// cannot give exactly-once across a lost HTTP response, so every POST
-	// carries the stable per-row delivery key for receiver correlation.
-	if webhookState == "pending" && categoryPolicy.Webhook != "digest" && r.webhook != nil && record.WebhookState == "pending" {
-		claimedRow, claimed, err := r.ledger.ClaimWebhook(ctx, record.ID)
-		if err != nil {
-			return err
-		}
-		if claimed {
-			event := claimedRow.Intent.Detail
-			event.Count = claimedRow.Count
-			event.Message = ComposeMessage(claimedRow.Intent.Category, claimedRow.Count, event, claimedRow.Intent.Message)
-			event.DeliveryKey = WebhookDeliveryKey(claimedRow.ID)
-			if err := r.deliverWebhook(ctx, event); err != nil {
-				if serr := r.ledger.SetWebhookState(ctx, claimedRow.ID, "failed", now); serr != nil {
-					return serr
-				}
-				r.audit(ctx, "notify.webhook_failed", claimedRow, "webhook_failed")
-			} else if err := r.ledger.SetWebhookState(ctx, claimedRow.ID, "attempted", now); err != nil {
+	// Webhook delivery is at-most-once per row and per delivery key. The
+	// router claims the pending leg before its POST, so a replayed intent, a
+	// concurrent Route, or a restart after the claim cannot POST the same row
+	// twice. A retryable failure (a dial, DNS, or certificate error or a
+	// 429/503 answer, all provable non-delivery) requeues the row as pending
+	// with a backoff, so the drain retries it under the same key; any other
+	// failure — an EOF or reset after the request went out, any other
+	// endpoint answer — settles the leg as failed instead. A crash between
+	// claim and settle leaves sending, which never becomes due again: the
+	// delivery may be lost but is never duplicated. The claimed snapshot is
+	// immutable: a concurrent Route that lands after the claim queues its
+	// event under a new generation row with its own delivery key, so the
+	// second POST never reuses the first key. Local ledger state cannot give
+	// exactly-once across a lost HTTP response, so every POST carries the
+	// stable per-row delivery key for receiver correlation. A row still
+	// undelivered a day after its first failure settles failed, so an outage
+	// that never clears stays visible instead of retrying forever.
+	//
+	// A failed immediate POST is the caller's error to handle: producers that
+	// retry from durable state (the watch alert path, the action reminder)
+	// treat it as not delivered and route again, so a lost alert never reads
+	// as alerted. A deferred row is the drain's to retry once its backoff
+	// passes: Route does not POST it early, and reports the deferral so the
+	// producer does not mark it delivered either. A replay that finds its
+	// row settled failed reports the failure again for the same reason.
+	if webhookState == "pending" && categoryPolicy.Webhook != "digest" && r.webhook != nil {
+		switch {
+		case record.WebhookState == "failed":
+			return errWebhookFailedReplay
+		case record.WebhookState != "pending":
+			// Claimed or delivered by a concurrent Route: nothing to
+			// dispatch from this snapshot.
+		case record.WebhookAttemptedAt.After(now):
+			return errWebhookRetryDeferred
+		default:
+			claimedRow, claimed, err := r.ledger.ClaimWebhook(ctx, record.ID, now)
+			if err != nil {
+				return err
+			}
+			if !claimed {
+				// The row moved between the snapshot and the claim: a
+				// concurrent Route or drain claimed, deferred, or settled
+				// it. Only a confirmed delivery may read as success.
+				return r.lostClaimOutcome(ctx, record.ID)
+			}
+			if err := r.sendWebhookLeg(ctx, claimedRow, now); err != nil {
 				return err
 			}
 		}
@@ -304,14 +336,21 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	var deliveryErr error
 	if dueWebhook, ok := r.ledger.(webhookDueLedger); ok && r.webhook != nil {
 		webhooks, err := dueWebhook.DueWebhook(ctx, now, 100)
 		if err != nil {
 			return err
 		}
 		for _, row := range webhooks {
-			if r.policy.For(row.Intent.Category).Webhook != "digest" {
+			if r.policy.For(row.Intent.Category).Webhook == "off" {
 				continue
+			}
+			// A cancelled drain claims nothing: DueWebhook on the store
+			// already fails on a dead context, and this keeps ledgers that
+			// ignore cancellation to the same contract.
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			// Same at-most-once claim as immediate legs: only the drain that
 			// wins the pending-to-sending claim POSTs. A crash between claim
@@ -319,26 +358,27 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 			// returns, so a restart cannot duplicate the POST. The claimed
 			// snapshot is immutable: a concurrent Route after the claim
 			// queues a new generation row under its own key.
-			claimedRow, claimed, err := r.ledger.ClaimWebhook(ctx, row.ID)
+			//
+			// The drain also retries deferred immediate legs: request
+			// outcomes and publication notices have no producer retry, so
+			// leaving a deferred row to Route would strand it. A recorded
+			// delivery failure does not stop the pass, because the row is
+			// already requeued or settled; it is returned after the desktop
+			// drain. A ledger write failure stops the pass at once.
+			claimedRow, claimed, err := r.ledger.ClaimWebhook(ctx, row.ID, now)
 			if err != nil {
 				return err
 			}
 			if !claimed {
 				continue
 			}
-			event := claimedRow.Intent.Detail
-			event.Count = claimedRow.Count
-			event.Message = ComposeMessage(claimedRow.Intent.Category, claimedRow.Count, event, claimedRow.Intent.Message)
-			event.DeliveryKey = WebhookDeliveryKey(claimedRow.ID)
-			if err := r.deliverWebhook(ctx, event); err != nil {
-				if serr := r.ledger.SetWebhookState(ctx, claimedRow.ID, "failed", now); serr != nil {
-					return serr
+			if err := r.sendWebhookLeg(ctx, claimedRow, now); err != nil {
+				if !deliveryFailed(err) {
+					return err
 				}
-				r.audit(ctx, "notify.webhook_failed", claimedRow, "webhook_failed")
-				continue
-			}
-			if err := r.ledger.SetWebhookState(ctx, claimedRow.ID, "attempted", now); err != nil {
-				return err
+				if deliveryErr == nil {
+					deliveryErr = err
+				}
 			}
 		}
 	}
@@ -444,7 +484,7 @@ func (r *Router) RunDueAt(ctx context.Context, now time.Time) error {
 		}
 		r.audit(ctx, "notify.attempted", row, "attempted")
 	}
-	return nil
+	return deliveryErr
 }
 
 type desktopAvailabilitySetter interface {
@@ -511,14 +551,15 @@ func (r *Router) sendEvent(ctx context.Context, sender Sender, event Event) {
 
 // deliverWebhook POSTs one claimed webhook event and reports the endpoint
 // outcome. Senders that implement SendEventResult give a real signal, so a
-// transport error or non-2xx status settles the leg as failed instead of
-// attempted. Legacy senders keep fire-and-forget and always report success.
+// transport error or non-2xx status settles the leg instead of attempted.
+// Legacy senders keep fire-and-forget and always report success. A context
+// that is already done skips the dispatch and reports errWebhookNotDispatched.
 func (r *Router) deliverWebhook(ctx context.Context, event Event) error {
 	if r == nil || r.webhook == nil {
 		return fmt.Errorf("notification webhook is unavailable")
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errWebhookNotDispatched, err)
 	}
 	if reporter, ok := r.webhook.(webhookResultSender); ok {
 		return reporter.SendEventResult(ctx, event)
@@ -527,14 +568,236 @@ func (r *Router) deliverWebhook(ctx context.Context, event Event) error {
 	return nil
 }
 
-func (r *Router) audit(ctx context.Context, kind string, row Record, reason string) {
+// errWebhookNotDispatched reports a webhook send that stopped before any
+// request went out, because its context was already done. Nothing reached
+// the endpoint, so the claim is released rather than settled failed.
+var errWebhookNotDispatched = errors.New("webhook not dispatched")
+
+// webhookRowReader re-reads one ledger row. Production StoreLedger and the
+// test ledgers implement it.
+type webhookRowReader interface {
+	GetByID(context.Context, int64) (Record, error)
+}
+
+// lostClaimOutcome reports a Route whose claim lost to a concurrent change.
+// It returns success only when the row's webhook leg is confirmed delivered;
+// a leg still in flight, deferred, or failed is a delivery failure, so a
+// producer that retries from durable state does not record a receipt.
+func (r *Router) lostClaimOutcome(ctx context.Context, id int64) error {
+	reader, ok := r.ledger.(webhookRowReader)
+	if !ok {
+		return nil
+	}
+	row, err := reader.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	switch row.WebhookState {
+	case "attempted", "delivered":
+		return nil
+	case "failed":
+		return errWebhookFailedReplay
+	default:
+		return fmt.Errorf("%w: the webhook leg is %s, not delivered", errWebhookDelivery, row.WebhookState)
+	}
+}
+
+// webhookRetryBackoff paces drain retries of one provably undelivered row:
+// long enough to let a restarting endpoint recover, short enough that a
+// digest still arrives the same day.
+const webhookRetryBackoff = 5 * time.Minute
+
+// webhookRetryExpiry caps the retry loop: a row still undelivered a day
+// after its first failure settles failed, so an outage that never clears
+// stays visible instead of retrying forever.
+const webhookRetryExpiry = 24 * time.Hour
+
+// retryableWebhookError reports provable non-delivery: the request never
+// reached the endpoint, so retrying under the same delivery key cannot
+// duplicate. Only dial, DNS, and certificate failures (the request was never
+// sent) and 429/503 answers (explicitly retryable) qualify. Any other
+// failure — an EOF or reset after the request went out, any other endpoint
+// answer — may mean the receiver processed the POST, so the leg settles
+// terminal failed instead. Context errors never qualify: a POST cancelled
+// in flight may have arrived.
+func retryableWebhookError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var status *WebhookStatusError
+	if errors.As(err, &status) {
+		return status.StatusCode == http.StatusTooManyRequests || status.StatusCode == http.StatusServiceUnavailable
+	}
+	return provableNonDelivery(err)
+}
+
+// provableNonDelivery reports transport failures where the request was never
+// sent: dial errors (connection refused, unreachable network, DNS failures)
+// and certificate verification failures, which end the TLS handshake before
+// any request byte is written. Anything later in the exchange — a TLS alert
+// or an EOF or reset after the request went out, a stalled response — may
+// have reached the endpoint.
+func provableNonDelivery(err error) bool {
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return true
+	}
+	var verify *tls.CertificateVerificationError
+	if errors.As(err, &verify) {
+		return true
+	}
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
+
+// webhookCause names a delivery failure for the audit record without quoting
+// the endpoint URL, whose path can carry a secret. A non-2xx answer carries
+// its status; a dial, DNS, or certificate failure carries its category; any
+// other transport failure stays a generic transport error.
+func webhookCause(err error) string {
+	var status *WebhookStatusError
+	if errors.As(err, &status) {
+		return fmt.Sprintf("endpoint answered HTTP %d", status.StatusCode)
+	}
+	if errors.Is(err, context.Canceled) {
+		return "the request was cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "the request timed out"
+	}
+	if provableNonDelivery(err) {
+		return webhookTransportCause(err)
+	}
+	return "transport error"
+}
+
+// webhookTransportCause names a provable non-delivery without the URL that
+// the underlying error quotes.
+func webhookTransportCause(err error) string {
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "DNS lookup failed"
+	}
+	var verify *tls.CertificateVerificationError
+	if errors.As(err, &verify) {
+		return "TLS certificate rejected"
+	}
+	return "connection failed"
+}
+
+// errWebhookDelivery is the delivery failure sendWebhookLeg reports. Route
+// surfaces it to producers that retry from durable state; the drain returns
+// it so the scheduler sees the failed pass. The row is already requeued or
+// settled either way; a ledger write failure is returned unwrapped.
+var errWebhookDelivery = errors.New("delivering webhook notification")
+
+// errWebhookRetryDeferred reports a Route for a deferred row: only the drain
+// POSTs it, once its backoff passes, so the producer must not read the
+// notification as delivered. It wraps errWebhookDelivery.
+var errWebhookRetryDeferred = fmt.Errorf("%w: retry deferred until the backoff passes", errWebhookDelivery)
+
+// errWebhookFailedReplay reports a Route whose event is already stored in a
+// row whose webhook leg settled failed: the notification was never confirmed
+// delivered, so the producer must not read it as delivered. It wraps
+// errWebhookDelivery.
+var errWebhookFailedReplay = fmt.Errorf("%w: the webhook leg already failed", errWebhookDelivery)
+
+// deliveryFailed reports whether err is a recorded delivery failure rather
+// than a ledger write failure the scheduler must see.
+func deliveryFailed(err error) bool {
+	return errors.Is(err, errWebhookDelivery)
+}
+
+// webhookSettleTimeout bounds each detached ledger write that records a
+// webhook outcome, so a shutdown cannot hang on it.
+var webhookSettleTimeout = 5 * time.Second
+
+// detachedSettle returns the context that records a webhook outcome: it
+// survives the caller's cancellation and has its own short deadline. Callers
+// create it after the POST returns, so a slow send cannot spend it.
+func detachedSettle(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), webhookSettleTimeout)
+}
+
+// sendWebhookLeg POSTs one claimed webhook event and records the outcome. It
+// reports the delivery error wrapped in errWebhookDelivery so Route surfaces
+// it to producers that retry from durable state and the drain fails the
+// pass for the scheduler: the row is already requeued or settled, and a
+// ledger write failure is returned unwrapped so the two stay apart.
+//
+// A send that stopped before any request went out (errWebhookNotDispatched:
+// the context was already done when the dispatch began, in the router or in
+// the sender) releases the claim to pending on a detached context with a
+// short timeout, so the next drain resends the row: nothing was delivered,
+// so this cannot duplicate. A cancellation that lands while the POST is in
+// flight is ambiguous and settles failed. Settles and the audit row run
+// detached with a short timeout that starts after the POST returns, so a
+// shutdown after a real POST still records the outcome without hanging the
+// drain.
+func (r *Router) sendWebhookLeg(ctx context.Context, claimedRow Record, now time.Time) error {
+	event := claimedRow.Intent.Detail
+	event.Count = claimedRow.Count
+	event.Message = ComposeMessage(claimedRow.Intent.Category, claimedRow.Count, event, claimedRow.Intent.Message)
+	event.DeliveryKey = WebhookDeliveryKey(claimedRow.ID)
+	sendErr := r.deliverWebhook(ctx, event)
+	settle, cancel := detachedSettle(ctx)
+	defer cancel()
+	if sendErr == nil {
+		return r.ledger.SetWebhookState(settle, claimedRow.ID, "attempted", now)
+	}
+	if errors.Is(sendErr, errWebhookNotDispatched) {
+		if rerr := r.ledger.SetWebhookState(settle, claimedRow.ID, "pending", now); rerr != nil {
+			return rerr
+		}
+		return sendErr
+	}
+	if ctx.Err() != nil {
+		// The POST may have gone out before the cancellation landed, so
+		// at-most-once wins over retry: settle the ambiguous leg as failed
+		// on the detached context instead of stranding it in sending.
+		if serr := r.ledger.SetWebhookState(settle, claimedRow.ID, "failed", now); serr != nil {
+			return serr
+		}
+		r.audit(settle, "notify.webhook_failed", claimedRow, "webhook_failed", webhookCause(sendErr))
+		return fmt.Errorf("%w: %w", errWebhookDelivery, sendErr)
+	}
+	cause := webhookCause(sendErr)
+	if retryableWebhookError(sendErr) {
+		// Provable non-delivery: requeue the row so the drain retries it
+		// under the same key after the backoff, unless the retry window
+		// since the first failure has run out.
+		deferred, derr := r.ledger.DeferWebhook(settle, claimedRow.ID, now, now.Add(webhookRetryBackoff), webhookRetryExpiry)
+		if derr != nil {
+			return derr
+		}
+		if deferred {
+			r.audit(settle, "notify.webhook_failed", claimedRow, "webhook_failed", cause)
+			return fmt.Errorf("%w: %w", errWebhookDelivery, sendErr)
+		}
+		cause += "; retry window expired"
+	}
+	if serr := r.ledger.SetWebhookState(settle, claimedRow.ID, "failed", now); serr != nil {
+		return serr
+	}
+	r.audit(settle, "notify.webhook_failed", claimedRow, "webhook_failed", cause)
+	return fmt.Errorf("%w: %w", errWebhookDelivery, sendErr)
+}
+
+func (r *Router) audit(ctx context.Context, kind string, row Record, reason string, cause ...string) {
 	if r.activity == nil {
 		return
 	}
 	// The audit trail is advisory: it explains a routing decision after the
 	// fact. A failed write must not change the decision itself, so the error is
 	// discarded here deliberately rather than propagated into delivery.
-	_ = r.activity.RecordSystemEvent(ctx, kind, map[string]any{"category": row.Intent.Category, "event_kind": row.Intent.EventKind, "aggregate_key": row.Intent.AggregateKey, "phase": row.Intent.Phase, "count": row.Count, "reason": reason})
+	detail := map[string]any{"category": row.Intent.Category, "event_kind": row.Intent.EventKind, "aggregate_key": row.Intent.AggregateKey, "phase": row.Intent.Phase, "count": row.Count, "reason": reason}
+	if len(cause) > 0 && cause[0] != "" {
+		detail["cause"] = cause[0]
+	}
+	_ = r.activity.RecordSystemEvent(ctx, kind, detail)
 }
 
 // ErrPreviewCountUnrepresentable reports a preview count a category can never

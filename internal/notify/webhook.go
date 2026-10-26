@@ -63,14 +63,16 @@ func (w *Webhook) SendEvent(ctx context.Context, event Event) {
 
 // SendEventResult posts one bounded structured notification and reports the
 // delivery outcome. A nil or cancelled context, a transport error, or a
-// non-2xx status is a failure. Success is any 2xx status after the request
-// was accepted by the endpoint.
+// non-2xx status is a failure. A context that is already done stops before
+// any request goes out and reports errWebhookNotDispatched, so the router
+// can release the claim instead of settling an ambiguous failure. Success is
+// any 2xx status after the request was accepted by the endpoint.
 func (w *Webhook) SendEventResult(ctx context.Context, event Event) error {
 	if ctx == nil {
-		return context.Canceled
+		return fmt.Errorf("%w: %w", errWebhookNotDispatched, context.Canceled)
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errWebhookNotDispatched, err)
 	}
 
 	bounded, cancel := context.WithTimeout(ctx, notificationTimeout)

@@ -6,9 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,11 +24,14 @@ import (
 type routerLedger struct {
 	next                    int64
 	rows                    map[int64]Record
+	firstFailed             map[int64]time.Time
 	failSetDesktopAvailable error
 	failSetDesktopState     error
 }
 
-func newRouterLedger() *routerLedger { return &routerLedger{rows: map[int64]Record{}} }
+func newRouterLedger() *routerLedger {
+	return &routerLedger{rows: map[int64]Record{}, firstFailed: map[int64]time.Time{}}
+}
 func (l *routerLedger) Upsert(_ context.Context, r Record) (Record, error) {
 	for id, old := range l.rows {
 		if old.Intent.Category == r.Intent.Category && old.Intent.EventKind == r.Intent.EventKind && old.Intent.AggregateKey == r.Intent.AggregateKey && old.Intent.Phase == r.Intent.Phase && old.Intent.WindowStart.Equal(r.Intent.WindowStart) {
@@ -73,6 +81,13 @@ func isFakePureReplay(stored, incoming Record) bool {
 func (l *routerLedger) UpsertWebhookGeneration(ctx context.Context, r Record) (Record, error) {
 	for id, old := range l.rows {
 		if sameFakeWebhookIdentity(old, r) && old.Intent.WindowStart.Equal(r.Intent.WindowStart) {
+			// Mirror the store rule: a deferred pending row returns
+			// unchanged for a byte-identical retry, so a producer that
+			// re-routes while the drain owns the retry does not inflate
+			// the count.
+			if old.WebhookState == "pending" && !old.WebhookAttemptedAt.IsZero() && isFakePureReplay(old, r) {
+				return old, nil
+			}
 			if old.WebhookState == "" || old.WebhookState == "pending" {
 				old.Count += r.Count
 				old.LastAt = r.LastAt
@@ -172,7 +187,8 @@ func (l *routerLedger) DueDesktop(_ context.Context, now time.Time, limit int) (
 func (l *routerLedger) DueWebhook(_ context.Context, now time.Time, limit int) ([]Record, error) {
 	out := []Record{}
 	for _, r := range l.rows {
-		if r.WebhookState == "pending" && !r.AvailableAt.After(now) {
+		deferred := !r.WebhookAttemptedAt.IsZero()
+		if r.WebhookState == "pending" && ((!deferred && !r.AvailableAt.After(now)) || (deferred && !r.WebhookAttemptedAt.After(now))) {
 			out = append(out, r)
 		}
 	}
@@ -221,9 +237,12 @@ func (l *routerLedger) SetDesktopState(_ context.Context, id int64, state string
 	l.rows[id] = r
 	return true, nil
 }
-func (l *routerLedger) ClaimWebhook(_ context.Context, id int64) (Record, bool, error) {
+
+// ClaimWebhook mirrors the store rule: a pending leg is claimable unless a
+// deferral put its retry time after now.
+func (l *routerLedger) ClaimWebhook(_ context.Context, id int64, now time.Time) (Record, bool, error) {
 	r, ok := l.rows[id]
-	if !ok || r.WebhookState != "pending" {
+	if !ok || r.WebhookState != "pending" || r.WebhookAttemptedAt.After(now) {
 		return Record{}, false, nil
 	}
 	r.WebhookState = "sending"
@@ -235,6 +254,27 @@ func (l *routerLedger) SetWebhookState(_ context.Context, id int64, state string
 	r.WebhookState = state
 	l.rows[id] = r
 	return nil
+}
+
+// DeferWebhook mirrors the store rule: only a claimed sending row returns to
+// pending, with the retry time in WebhookAttemptedAt, and only while window
+// has not elapsed since its first failure; settled rows are left alone.
+func (l *routerLedger) DeferWebhook(_ context.Context, id int64, failedAt, retryAt time.Time, window time.Duration) (bool, error) {
+	r := l.rows[id]
+	if r.WebhookState != "sending" {
+		return false, nil
+	}
+	first, seen := l.firstFailed[id]
+	if seen && !first.After(failedAt.Add(-window)) {
+		return false, nil
+	}
+	if !seen {
+		l.firstFailed[id] = failedAt
+	}
+	r.WebhookState = "pending"
+	r.WebhookAttemptedAt = retryAt
+	l.rows[id] = r
+	return true, nil
 }
 
 func (l *routerLedger) GetByID(_ context.Context, id int64) (Record, error) {
@@ -677,6 +717,25 @@ type countingActivity struct {
 
 func (c *countingActivity) RecordSystemEvent(_ context.Context, _ string, _ map[string]any) error {
 	*c.count++
+	return nil
+}
+
+// recordingActivity captures the router's advisory audit records so tests can
+// assert a failure was recorded without reading the store activity table.
+type recordingActivity struct {
+	failures []recordedFailure
+}
+
+type recordedFailure struct {
+	kind  string
+	cause string
+}
+
+func (a *recordingActivity) RecordSystemEvent(_ context.Context, kind string, detail map[string]any) error {
+	if kind == "notify.webhook_failed" {
+		cause, _ := detail["cause"].(string)
+		a.failures = append(a.failures, recordedFailure{kind: kind, cause: cause})
+	}
 	return nil
 }
 
@@ -1332,7 +1391,7 @@ func TestDigestWebhookClaimPreventsRestartDuplicate(t *testing.T) {
 		t.Fatalf("pending digest rows = %d, want one", len(due))
 	}
 	// Simulate a crash after the claim but before the POST settled.
-	_, claimed, err := ledger.ClaimWebhook(ctx, due[0].ID)
+	_, claimed, err := ledger.ClaimWebhook(ctx, due[0].ID, now.Add(time.Hour))
 	if err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
@@ -1385,9 +1444,68 @@ func TestDigestWebhookDeliversOnceWithStableKey(t *testing.T) {
 	}
 }
 
-// Failed endpoint responses settle visibly as failed for both immediate and
-// digest legs, never as attempted.
-func TestWebhookFailureSettlesFailedState(t *testing.T) {
+// A refused dial never reaches the endpoint, so it requeues the row as
+// pending instead of settling failed, and the failure reaches the caller:
+// producers that retry from durable state (the watch alert path) must not
+// record the alert as delivered. A response failure after the request went
+// out (an EOF mid-body) may mean the receiver processed it, so it settles
+// terminal failed instead.
+func TestImmediateWebhookDialRefusedRequeuesPendingAndSurfacesError(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	dialRefused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	webhook := &resultWebhookSender{err: dialRefused}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err == nil {
+		t.Fatal("Route = nil error, want the webhook delivery failure")
+	} else if !strings.Contains(err.Error(), "webhook") {
+		t.Fatalf("Route error = %q, want it to name the webhook leg", err)
+	}
+	if webhook.calls != 1 {
+		t.Fatalf("immediate delivery calls = %d, want one attempt", webhook.calls)
+	}
+	for _, row := range ledger.rows {
+		if row.WebhookState != "pending" {
+			t.Fatalf("webhook_state = %q, want pending so the drain retries", row.WebhookState)
+		}
+		if !row.WebhookAttemptedAt.Equal(now.Add(webhookRetryBackoff)) {
+			t.Fatalf("retry time = %s, want the retry backoff %s", row.WebhookAttemptedAt, now.Add(webhookRetryBackoff))
+		}
+		if !row.AvailableAt.Equal(now) {
+			t.Fatalf("available_at = %s, want the desktop leg's %s kept", row.AvailableAt, now)
+		}
+	}
+}
+
+// Mid-body response failures are ambiguous: an EOF or reset after the request
+// went out may mean the receiver processed it, so the leg settles terminal
+// failed instead of retrying under the same key.
+func TestImmediateWebhookMidBodyEOFSettlesFailed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	midBodyEOF := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("unexpected EOF")}
+	webhook := &resultWebhookSender{err: midBodyEOF}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err == nil {
+		t.Fatal("Route = nil error, want the webhook delivery failure")
+	}
+	for _, row := range ledger.rows {
+		if row.WebhookState != "failed" {
+			t.Fatalf("webhook_state = %q, want failed for an ambiguous response failure", row.WebhookState)
+		}
+	}
+}
+
+// The drain redelivers a requeued immediate row once its backoff passes: an
+// immediate category such as a request outcome has no producer retry of its
+// own, so leaving the row to Route would strand it. A byte-identical
+// producer Route inside the backoff window does not POST under the deferred
+// key: the retry returns the deferred row without redelivering, and Route
+// reports the deferral so the caller retries instead of marking the alert
+// delivered.
+func TestDigestDrainRetriesRequeuedImmediateRow(t *testing.T) {
 	ctx := context.Background()
 	db, err := openTestStore(ctx, t)
 	if err != nil {
@@ -1395,31 +1513,58 @@ func TestWebhookFailureSettlesFailedState(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	webhook := &resultWebhookSender{err: errors.New("endpoint returned 503")}
-	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
-	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
-		t.Fatal(err)
+	dialRefused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	webhook := &resultWebhookSender{err: dialRefused}
+	ledger := NewStoreLedger(db)
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err == nil {
+		t.Fatal("Route = nil error, want the webhook delivery failure")
 	}
 	if webhook.calls != 1 {
 		t.Fatalf("immediate delivery calls = %d, want one attempt", webhook.calls)
-	}
-	rows, err := NewStoreLedger(db).DueWebhook(ctx, now.Add(time.Hour), 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 0 {
-		t.Fatalf("failed immediate leg is still due: %+v", rows)
 	}
 	var id int64
 	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	if got := webhookStateColumn(t, db, id); got != "failed" {
-		t.Fatalf("immediate webhook_state = %q, want failed so the outage stays visible", got)
+	if got := webhookStateColumn(t, db, id); got != "pending" {
+		t.Fatalf("webhook_state = %q, want pending so the drain retries", got)
+	}
+	// A byte-identical producer retry inside the backoff window does not
+	// POST: it is the router's own retry of the same event, so it returns
+	// the deferred row without redelivering and Route skips the immediate
+	// dispatch for the not-due row, reporting the deferral so the caller
+	// retries instead of marking the alert delivered.
+	if err := router.Route(ctx, immediateTestIntent(now)); !deliveryFailed(err) {
+		t.Fatalf("retry Route inside the backoff = %v, want the deferred delivery failure, not nil", err)
+	}
+	if n := countIntentRows(t, db); n != 1 {
+		t.Fatalf("ledger rows = %d, want the single deferred row", n)
+	}
+	if webhook.calls != 1 {
+		t.Fatalf("immediate delivery calls = %d, want only the first attempt", webhook.calls)
+	}
+	// Once the backoff passes the drain POSTs the deferred row under its
+	// stable key. The endpoint recovers.
+	webhook.err = nil
+	clock := now.Add(webhookRetryBackoff + time.Minute)
+	if err := router.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 2 {
+		t.Fatalf("webhook events = %d, want the failed attempt plus the drain retry", len(webhook.events))
+	}
+	if got := webhook.events[1].DeliveryKey; got == "" || got != WebhookDeliveryKey(id) {
+		t.Fatalf("retry delivery key = %q, want the stable key %q", got, WebhookDeliveryKey(id))
+	}
+	if got := webhookStateColumn(t, db, id); got != "attempted" {
+		t.Fatalf("webhook_state = %q, want attempted after the drain retry", got)
 	}
 }
 
-func TestDigestWebhookFailureSettlesFailedState(t *testing.T) {
+// A row still undelivered a day after its first failure settles failed, so an
+// outage that never clears stays visible instead of retrying forever.
+func TestDigestWebhookRetryWindowExpiresToFailed(t *testing.T) {
 	ctx := context.Background()
 	db, err := openTestStore(ctx, t)
 	if err != nil {
@@ -1428,35 +1573,251 @@ func TestDigestWebhookFailureSettlesFailedState(t *testing.T) {
 	defer db.Close()
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	clock := now
-	webhook := &resultWebhookSender{err: errors.New("connection refused")}
+	webhook := &resultWebhookSender{err: &WebhookStatusError{StatusCode: 503, Status: "503 Service Unavailable"}}
 	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
 		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
 	}}
 	ledger := NewStoreLedger(db)
-	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }})
+	recorder := &recordingActivity{}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Activity: recorder, Now: func() time.Time { return clock }})
 	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
 		t.Fatal(err)
 	}
+	drain := func() {
+		t.Helper()
+		if err := router.RunDueAt(ctx, clock); !deliveryFailed(err) {
+			t.Fatalf("RunDueAt = %v, want the recorded delivery failure", err)
+		}
+	}
 	clock = now.Add(time.Hour)
-	if err := router.RunDueAt(ctx, clock); err != nil {
-		t.Fatal(err)
+	drain()
+	if len(recorder.failures) != 1 || recorder.failures[0].cause == "" {
+		t.Fatalf("audit failures = %+v, want the failed POST recorded with its cause", recorder.failures)
 	}
-	if webhook.calls != 1 {
-		t.Fatalf("digest delivery calls = %d, want one attempt", webhook.calls)
-	}
-	due, err := ledger.DueWebhook(ctx, clock.Add(time.Hour), 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(due) != 0 {
-		t.Fatalf("failed digest leg is still due: %+v", due)
-	}
+	// The endpoint stays down past the retry window: the next due drain
+	// settles the row failed with the cause audited.
+	clock = now.Add(webhookRetryExpiry + 2*time.Hour)
+	drain()
 	var id int64
 	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	if got := webhookStateColumn(t, db, id); got != "failed" {
-		t.Fatalf("digest webhook_state = %q, want failed so the outage stays visible", got)
+		t.Fatalf("webhook_state after the window = %q, want failed so the outage stays visible", got)
+	}
+	if last := recorder.failures[len(recorder.failures)-1]; !strings.Contains(last.cause, "retry window expired") {
+		t.Fatalf("audit cause = %q, want the expiry named", last.cause)
+	}
+	due, err := ledger.DueWebhook(ctx, clock.Add(24*time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due rows after the window = %d, want none retried", len(due))
+	}
+	if webhook.calls != 2 {
+		t.Fatalf("digest delivery calls = %d, want the first attempt plus the expiry attempt", webhook.calls)
+	}
+}
+
+// An endpoint answer that rejects the payload settles the immediate leg as
+// failed instead of requeuing: the receiver has the bytes, so a retry would
+// resend them. The failure still reaches the caller.
+func TestImmediateWebhookClientErrorSettlesFailed(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	webhook := &resultWebhookSender{err: &WebhookStatusError{StatusCode: 400, Status: "400 Bad Request"}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err == nil {
+		t.Fatal("Route = nil error, want the rejected POST surfaced")
+	}
+	for _, row := range ledger.rows {
+		if row.WebhookState != "failed" {
+			t.Fatalf("webhook_state = %q, want failed for a rejected payload", row.WebhookState)
+		}
+	}
+	due, err := ledger.DueWebhook(ctx, now.Add(24*time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due rows after a rejection = %d, want none retried", len(due))
+	}
+}
+
+// A 503 digest POST requeues the row with a backoff and the next drain sends
+// exactly one POST under the same delivery key. The digest is never marked
+// failed while the outage may not have delivered anything.
+func TestDigestWebhookRetryableFailureRetriesUnderSameKey(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &resultWebhookSender{err: &WebhookStatusError{StatusCode: 503, Status: "503 Service Unavailable"}}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	ledger := NewStoreLedger(db)
+	recorder := &recordingActivity{}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Activity: recorder, Now: func() time.Time { return clock }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(time.Hour)
+	if err := router.RunDueAt(ctx, clock); !deliveryFailed(err) {
+		t.Fatalf("RunDueAt = %v, want the recorded delivery failure", err)
+	}
+	if webhook.calls != 1 {
+		t.Fatalf("digest delivery calls = %d, want one attempt", webhook.calls)
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "pending" {
+		t.Fatalf("digest webhook_state = %q, want pending so the drain retries", got)
+	}
+	var retryAt string
+	if err := db.DB().QueryRowContext(ctx, `SELECT webhook_attempted_at FROM notification_intents WHERE id=?`, id).Scan(&retryAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryAt != store.FormatTime(clock.Add(webhookRetryBackoff)) {
+		t.Fatalf("retry time = %q, want the retry backoff %q", retryAt, store.FormatTime(clock.Add(webhookRetryBackoff)))
+	}
+	due, err := ledger.DueWebhook(ctx, clock, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due rows inside the backoff = %d, want none", len(due))
+	}
+	if len(recorder.failures) != 1 || recorder.failures[0].cause == "" {
+		t.Fatalf("audit failures = %+v, want the failed POST recorded with its cause", recorder.failures)
+	}
+	// After the backoff the endpoint recovers: the same row delivers once
+	// under the same key and settles attempted.
+	key := webhook.events[0].DeliveryKey
+	webhook.err = nil
+	clock = clock.Add(webhookRetryBackoff + time.Minute)
+	if err := router.RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 2 {
+		t.Fatalf("webhook events = %d, want the failed attempt plus the retry", len(webhook.events))
+	}
+	if got := webhook.events[1].DeliveryKey; got == "" || got != key {
+		t.Fatalf("retry delivery key = %q, want the stable key %q", got, key)
+	}
+	if got := webhookStateColumn(t, db, id); got != "attempted" {
+		t.Fatalf("digest webhook_state = %q, want attempted after the retry", got)
+	}
+	if err := router.RunDueAt(ctx, clock.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 2 {
+		t.Fatalf("webhook events after second drain = %d, want no replay", len(webhook.events))
+	}
+}
+
+// A drain cancelled between claim and POST must not strand the row in
+// sending: the cancellation proves nothing went out, so the claim reverts to
+// pending and the next live drain sends exactly one POST.
+func TestRunDueAtCancelledDrainRevertsClaim(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &recordingEventSender{}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	ledger := NewStoreLedger(db)
+	drain, cancel := context.WithCancel(ctx)
+	cancelling := &cancelOnClaimLedger{StoreLedger: ledger, cancel: cancel}
+	router := NewRouter(RouterOptions{Ledger: cancelling, Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(time.Hour)
+	if err := router.RunDueAt(drain, clock); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunDueAt on a cancelled drain = %v, want context.Canceled", err)
+	}
+	if len(webhook.events) != 0 {
+		t.Fatalf("webhook events on a cancelled drain = %d, want no POST", len(webhook.events))
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "pending" {
+		t.Fatalf("webhook_state after a cancelled drain = %q, want pending so the row resends", got)
+	}
+	if err := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }}).RunDueAt(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if len(webhook.events) != 1 {
+		t.Fatalf("webhook events after recovery = %d, want exactly one POST", len(webhook.events))
+	}
+	if got := webhookStateColumn(t, db, id); got != "attempted" {
+		t.Fatalf("webhook_state after recovery = %q, want attempted", got)
+	}
+}
+
+// cancelOnClaimLedger cancels the drain context from inside ClaimWebhook, so
+// the cancellation lands exactly between claim and POST: the daemon-stop
+// interleaving a graceful shutdown can hit every pass.
+type cancelOnClaimLedger struct {
+	*StoreLedger
+	cancel context.CancelFunc
+	once   bool
+}
+
+func (l *cancelOnClaimLedger) ClaimWebhook(ctx context.Context, id int64, now time.Time) (Record, bool, error) {
+	row, claimed, err := l.StoreLedger.ClaimWebhook(ctx, id, now)
+	if claimed && !l.once {
+		l.once = true
+		l.cancel()
+	}
+	return row, claimed, err
+}
+
+// A drain that starts cancelled never claims: the due row stays pending for
+// the next live drain instead of settling failed for a POST that never ran.
+func TestRunDueAtAlreadyCancelledDrainNeverClaims(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	ledger := newRouterLedger()
+	webhook := &recordingEventSender{}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return clock }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	clock = now.Add(time.Hour)
+	if err := router.RunDueAt(cancelled, clock); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunDueAt on a cancelled context = %v, want context.Canceled", err)
+	}
+	if len(webhook.events) != 0 {
+		t.Fatalf("webhook events on a cancelled drain = %d, want no POST", len(webhook.events))
+	}
+	for _, row := range ledger.rows {
+		if row.WebhookState != "pending" {
+			t.Fatalf("webhook_state after a cancelled drain = %q, want pending so the row resends", row.WebhookState)
+		}
 	}
 }
 
@@ -1470,12 +1831,12 @@ type mergeBeforeClaimLedger struct {
 	merged bool
 }
 
-func (l *mergeBeforeClaimLedger) ClaimWebhook(ctx context.Context, id int64) (Record, bool, error) {
+func (l *mergeBeforeClaimLedger) ClaimWebhook(ctx context.Context, id int64, now time.Time) (Record, bool, error) {
 	if !l.merged && l.merge != nil {
 		l.merged = true
 		l.merge(id)
 	}
-	return l.routerLedger.ClaimWebhook(ctx, id)
+	return l.routerLedger.ClaimWebhook(ctx, id, now)
 }
 
 func TestImmediateWebhookSendsClaimedCountAfterConcurrentMerge(t *testing.T) {
@@ -1604,7 +1965,7 @@ func TestStorePendingDigestGrowthAfterWebhookClaimOpensNewGeneration(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+	if _, claimed, err := ledger.ClaimWebhook(ctx, first.ID, now); err != nil || !claimed {
 		t.Fatalf("claim = %v, %v", claimed, err)
 	}
 	if err := ledger.SetWebhookState(ctx, first.ID, "attempted", now); err != nil {
@@ -1835,5 +2196,286 @@ func TestImmediateWebhookSecondRouteOpensNewGeneration(t *testing.T) {
 	}
 	if total := webhook.events[0].Count + webhook.events[1].Count; total != 2 {
 		t.Fatalf("total delivered = %d, want 2 across both generations", total)
+	}
+}
+
+// slowWebhookSender accepts every POST after a delay, the shape of a slow
+// endpoint that answers just inside the sender's own timeout.
+type slowWebhookSender struct {
+	delay time.Duration
+	calls int
+}
+
+func (s *slowWebhookSender) Send(context.Context, string) {}
+func (s *slowWebhookSender) SendEventResult(context.Context, Event) error {
+	s.calls++
+	time.Sleep(s.delay)
+	return nil
+}
+
+// The settle deadline starts after the POST returns: a send slower than the
+// settle timeout still records the delivery instead of stranding the row in
+// sending.
+func TestSlowWebhookSendStillSettlesAttempted(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	previous := webhookSettleTimeout
+	webhookSettleTimeout = 50 * time.Millisecond
+	defer func() { webhookSettleTimeout = previous }()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &slowWebhookSender{delay: 4 * webhookSettleTimeout}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatalf("Route after a slow accepted POST = %v, want nil", err)
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "attempted" {
+		t.Fatalf("webhook_state after a slow accepted POST = %q, want attempted", got)
+	}
+}
+
+// deferBeforeClaimLedger lets the drain claim and defer the row between the
+// Route's due snapshot and its own claim: the interleaving where a stale
+// snapshot could POST inside the backoff.
+type deferBeforeClaimLedger struct {
+	*StoreLedger
+	now  time.Time
+	done bool
+}
+
+func (l *deferBeforeClaimLedger) ClaimWebhook(ctx context.Context, id int64, now time.Time) (Record, bool, error) {
+	if !l.done {
+		l.done = true
+		if _, claimed, err := l.StoreLedger.ClaimWebhook(ctx, id, l.now); err != nil || !claimed {
+			return Record{}, false, fmt.Errorf("drain claim = %v: %w", claimed, err)
+		}
+		if deferred, err := l.DeferWebhook(ctx, id, l.now, l.now.Add(webhookRetryBackoff), webhookRetryExpiry); err != nil || !deferred {
+			return Record{}, false, fmt.Errorf("drain defer = %v: %w", deferred, err)
+		}
+	}
+	return l.StoreLedger.ClaimWebhook(ctx, id, now)
+}
+
+// A Route holding a due snapshot cannot claim a row the drain deferred after
+// that snapshot was read: the claim checks the retry time atomically, so no
+// POST goes out inside the backoff, and the lost claim reports a delivery
+// failure instead of success so a producer records no receipt.
+func TestImmediateWebhookClaimRespectsConcurrentDeferral(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &resultWebhookSender{}
+	ledger := &deferBeforeClaimLedger{StoreLedger: NewStoreLedger(db), now: now}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); !deliveryFailed(err) {
+		t.Fatalf("Route after losing the claim to a deferral = %v, want the delivery failure", err)
+	}
+	if webhook.calls != 0 {
+		t.Fatalf("webhook calls = %d, want no POST inside the drain's backoff", webhook.calls)
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "pending" {
+		t.Fatalf("webhook_state = %q, want the deferred row still pending for the drain", got)
+	}
+}
+
+// Retries and their expiry run on webhook-owned times. Quiet hours or a
+// reminder upsert can move the shared available_at later, but the deferred
+// row still retries once its own backoff passes, and the retry window still
+// closes a day after the first failure.
+func TestDigestWebhookRetryIgnoresDesktopAvailability(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	clock := now
+	webhook := &resultWebhookSender{err: &WebhookStatusError{StatusCode: 503, Status: "503 Service Unavailable"}}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	recorder := &recordingActivity{}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: policy, Activity: recorder, Now: func() time.Time { return clock }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	moveAvailability := func(at time.Time) {
+		t.Helper()
+		if _, err := db.DB().ExecContext(ctx, `UPDATE notification_intents SET available_at=? WHERE id=?`, store.FormatTime(at), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstFailure := now.Add(time.Hour)
+	clock = firstFailure
+	if err := router.RunDueAt(ctx, clock); !deliveryFailed(err) {
+		t.Fatalf("first drain = %v, want the recorded delivery failure", err)
+	}
+	// The desktop leg's availability moves eight hours out; the webhook
+	// retry still comes due after its own backoff.
+	moveAvailability(clock.Add(8 * time.Hour))
+	clock = clock.Add(webhookRetryBackoff + time.Minute)
+	if err := router.RunDueAt(ctx, clock); !deliveryFailed(err) {
+		t.Fatalf("retry drain = %v, want the recorded delivery failure", err)
+	}
+	if webhook.calls != 2 {
+		t.Fatalf("webhook calls = %d, want the retry despite the moved availability", webhook.calls)
+	}
+	// Moving the availability again cannot extend the retry window: the
+	// first drain past a day since the first failure settles the row.
+	clock = firstFailure.Add(webhookRetryExpiry + time.Minute)
+	moveAvailability(clock)
+	if err := router.RunDueAt(ctx, clock); !deliveryFailed(err) {
+		t.Fatalf("expiry drain = %v, want the recorded delivery failure", err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "failed" {
+		t.Fatalf("webhook_state a day after the first failure = %q, want failed", got)
+	}
+	if last := recorder.failures[len(recorder.failures)-1]; !strings.Contains(last.cause, "retry window expired") {
+		t.Fatalf("audit cause = %q, want the expiry named", last.cause)
+	}
+}
+
+// A producer replay that finds its row already settled failed reports the
+// failure again: the notification was never confirmed, so a watch retry
+// must not mark the alert delivered.
+func TestImmediateWebhookFailedReplayReportsFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &resultWebhookSender{err: &WebhookStatusError{StatusCode: 400, Status: "400 Bad Request"}}
+	router := NewRouter(RouterOptions{Ledger: NewStoreLedger(db), Webhook: webhook, Policy: immediateTestPolicy(), Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); !deliveryFailed(err) {
+		t.Fatalf("first Route = %v, want the delivery failure", err)
+	}
+	if err := router.Route(ctx, immediateTestIntent(now)); !deliveryFailed(err) {
+		t.Fatalf("replay Route of a failed row = %v, want the delivery failure, not nil", err)
+	}
+	if webhook.calls != 1 {
+		t.Fatalf("webhook calls = %d, want the replay to send nothing", webhook.calls)
+	}
+}
+
+// A read that fails after the claim committed (a context cancelled between
+// the two, here forced by a trigger that corrupts the claimed row) must
+// release the claim: nothing was dispatched, so the row stays due instead of
+// stranding in sending, which DueWebhook never returns again.
+func TestClaimReleasedWhenPostClaimReadFails(t *testing.T) {
+	ctx := context.Background()
+	db, err := openTestStore(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	webhook := &resultWebhookSender{}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	ledger := NewStoreLedger(db)
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return now }})
+	if err := router.Route(ctx, immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `CREATE TRIGGER corrupt_on_claim AFTER UPDATE OF webhook_state ON notification_intents
+		WHEN NEW.webhook_state = 'sending'
+		BEGIN UPDATE notification_intents SET desktop_sent_payload_json = 'not json' WHERE id = NEW.id; END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.RunDueAt(ctx, now.Add(time.Hour)); err == nil {
+		t.Fatal("RunDueAt = nil, want the post-claim read failure")
+	}
+	if webhook.calls != 0 {
+		t.Fatalf("webhook calls = %d, want no POST after a failed read", webhook.calls)
+	}
+	var id int64
+	if err := db.DB().QueryRowContext(ctx, `SELECT id FROM notification_intents LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookStateColumn(t, db, id); got != "pending" {
+		t.Fatalf("webhook_state after a failed post-claim read = %q, want pending so the row stays due", got)
+	}
+}
+
+// lateCancelContext reports cancellation from its cancelAt-th Err call on,
+// so a test can land a cancellation between two checks on the send path.
+type lateCancelContext struct {
+	context.Context
+	mu       sync.Mutex
+	calls    int
+	cancelAt int
+}
+
+func (c *lateCancelContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls >= c.cancelAt {
+		return context.Canceled
+	}
+	return nil
+}
+
+// A cancellation that stops the send before any request goes out is not an
+// ambiguous delivery: the claim returns to pending so the next drain sends
+// the row, instead of settling failed. Here the cancellation lands after
+// the router's own check, inside the production sender's pre-request check.
+func TestWebhookSendSkippedByCancellationReleasesClaim(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ledger := newRouterLedger()
+	webhook := &Webhook{URL: server.URL, Client: server.Client()}
+	policy := Policy{DigestEvery: time.Hour, Categories: map[Category]CategoryPolicy{
+		CategoryRequestOutcome: {Desktop: "off", Webhook: "digest", Window: time.Minute},
+	}}
+	router := NewRouter(RouterOptions{Ledger: ledger, Webhook: webhook, Policy: policy, Now: func() time.Time { return now }})
+	if err := router.Route(context.Background(), immediateTestIntent(now)); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	for rowID := range ledger.rows {
+		id = rowID
+	}
+	claimed, ok, err := ledger.ClaimWebhook(context.Background(), id, now.Add(time.Hour))
+	if err != nil || !ok {
+		t.Fatalf("claim = %v, %v, want true", ok, err)
+	}
+	ctx := &lateCancelContext{Context: context.Background(), cancelAt: 2}
+	if err := router.sendWebhookLeg(ctx, claimed, now.Add(time.Hour)); !errors.Is(err, context.Canceled) || deliveryFailed(err) {
+		t.Fatalf("sendWebhookLeg = %v, want the cancellation, not a recorded delivery failure", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("endpoint requests = %d, want none for a skipped dispatch", n)
+	}
+	if got := ledger.rows[id].WebhookState; got != "pending" {
+		t.Fatalf("webhook_state after a skipped dispatch = %q, want pending so the drain resends", got)
 	}
 }

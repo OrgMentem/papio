@@ -615,15 +615,15 @@ func TestNotificationLedgerClaimWebhookIsAtMostOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := ledger.ClaimWebhook(ctx, row.ID)
+	claimed, err := ledger.ClaimWebhook(ctx, row.ID, now)
 	if err != nil || !claimed {
 		t.Fatalf("first claim = %v, %v, want true", claimed, err)
 	}
-	again, err := ledger.ClaimWebhook(ctx, row.ID)
+	again, err := ledger.ClaimWebhook(ctx, row.ID, now)
 	if err != nil || again {
 		t.Fatalf("second claim = %v, %v, want false so concurrent drains cannot POST twice", again, err)
 	}
-	if missing, err := ledger.ClaimWebhook(ctx, row.ID+999); err != nil || missing {
+	if missing, err := ledger.ClaimWebhook(ctx, row.ID+999, now); err != nil || missing {
 		t.Fatalf("missing claim = %v, %v, want false", missing, err)
 	}
 	due, err := ledger.DueWebhook(ctx, now.Add(time.Hour), 10)
@@ -653,8 +653,119 @@ func TestNotificationLedgerClaimWebhookIsAtMostOnce(t *testing.T) {
 	if len(due) != 0 {
 		t.Fatalf("failed leg is still due: %+v", due)
 	}
-	if settled, err := ledger.ClaimWebhook(ctx, row.ID); err != nil || settled {
+	if settled, err := ledger.ClaimWebhook(ctx, row.ID, now); err != nil || settled {
 		t.Fatalf("claim after failure = %v, %v, want false", settled, err)
+	}
+}
+
+// DeferWebhook requeues a claimed leg as pending with a webhook-owned retry
+// time and records the first failure once. The retry time gates both
+// DueWebhook and ClaimWebhook, whatever happens to the desktop leg's
+// available_at. Once the window has elapsed since the first failure the row
+// is not deferred again. Only the claim holder's sending row moves: settled
+// rows and unknown IDs stay put.
+func TestNotificationLedgerDeferWebhookRequeuesClaim(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, seededDataDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ledger := db.Notifications()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	const window = 24 * time.Hour
+	rec := NotificationRecord{Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:defer", Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now, AvailableAt: now, Count: 1, PayloadJSON: `{"count":1}`}
+	row, err := ledger.UpsertWebhookGeneration(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := ledger.ClaimWebhook(ctx, row.ID, now); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v, want true", claimed, err)
+	}
+	retryAt := now.Add(5 * time.Minute)
+	if deferred, err := ledger.DeferWebhook(ctx, row.ID, now, retryAt, window); err != nil || !deferred {
+		t.Fatalf("defer = %v, %v, want true", deferred, err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_state"); got != "pending" {
+		t.Fatalf("webhook_state after defer = %q, want pending", got)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_attempted_at"); got != formatNotificationTime(retryAt) {
+		t.Fatalf("webhook_attempted_at after defer = %q, want the retry time %q", got, formatNotificationTime(retryAt))
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_first_failed_at"); got != formatNotificationTime(now) {
+		t.Fatalf("webhook_first_failed_at after defer = %q, want the failure time %q", got, formatNotificationTime(now))
+	}
+	if got := notificationColumn(t, db, row.ID, "available_at"); got != formatNotificationTime(now) {
+		t.Fatalf("available_at after defer = %q, want the desktop leg's %q kept", got, formatNotificationTime(now))
+	}
+	due, err := ledger.DueWebhook(ctx, now.Add(time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("deferred leg is due inside the backoff: %+v", due)
+	}
+	// A caller holding the due snapshot from before the deferral cannot
+	// claim inside the backoff: the claim itself checks the retry time.
+	if claimed, err := ledger.ClaimWebhook(ctx, row.ID, now.Add(time.Minute)); err != nil || claimed {
+		t.Fatalf("claim inside the backoff = %v, %v, want false", claimed, err)
+	}
+	// The producer's byte-identical retry inside the backoff returns the
+	// deferred row unchanged instead of growing its count.
+	replayed, err := ledger.UpsertWebhookGeneration(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ID != row.ID || replayed.Count != 1 {
+		t.Fatalf("replay into the deferred row = id %d count %d, want id %d count 1", replayed.ID, replayed.Count, row.ID)
+	}
+	// Quiet hours or a reminder upsert can move the shared available_at
+	// later; the retry still comes due on its own webhook-owned time.
+	if _, err := db.db.ExecContext(ctx, `UPDATE notification_intents SET available_at=? WHERE id=?`, formatNotificationTime(now.Add(8*time.Hour)), row.ID); err != nil {
+		t.Fatal(err)
+	}
+	due, err = ledger.DueWebhook(ctx, retryAt, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != row.ID {
+		t.Fatalf("due rows after the backoff = %+v, want the deferred row %d", due, row.ID)
+	}
+	// A later deferral keeps the first failure time, and once the window
+	// has elapsed since it the row is no longer deferred.
+	later := now.Add(time.Hour)
+	if claimed, err := ledger.ClaimWebhook(ctx, row.ID, later); err != nil || !claimed {
+		t.Fatalf("claim after the backoff = %v, %v, want true", claimed, err)
+	}
+	if deferred, err := ledger.DeferWebhook(ctx, row.ID, later, later.Add(5*time.Minute), window); err != nil || !deferred {
+		t.Fatalf("second defer = %v, %v, want true", deferred, err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_first_failed_at"); got != formatNotificationTime(now) {
+		t.Fatalf("webhook_first_failed_at after a second defer = %q, want the first failure %q kept", got, formatNotificationTime(now))
+	}
+	expired := now.Add(window)
+	if claimed, err := ledger.ClaimWebhook(ctx, row.ID, expired); err != nil || !claimed {
+		t.Fatalf("claim at the window = %v, %v, want true", claimed, err)
+	}
+	if deferred, err := ledger.DeferWebhook(ctx, row.ID, expired, expired.Add(5*time.Minute), window); err != nil || deferred {
+		t.Fatalf("defer past the window = %v, %v, want false", deferred, err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_state"); got != "sending" {
+		t.Fatalf("webhook_state after an expired defer = %q, want sending for the caller to settle", got)
+	}
+	// A settled row is not the claim holder's: deferring it moves nothing.
+	if err := ledger.SetWebhookState(ctx, row.ID, "failed", expired); err != nil {
+		t.Fatal(err)
+	}
+	if deferred, err := ledger.DeferWebhook(ctx, row.ID, expired, expired.Add(time.Hour), window); err != nil || deferred {
+		t.Fatalf("defer of a settled row = %v, %v, want false", deferred, err)
+	}
+	if got := notificationColumn(t, db, row.ID, "webhook_state"); got != "failed" {
+		t.Fatalf("webhook_state after deferring a settled row = %q, want failed", got)
+	}
+	// An unknown ID moves nothing and reports no error.
+	if deferred, err := ledger.DeferWebhook(ctx, row.ID+999, retryAt, retryAt, window); err != nil || deferred {
+		t.Fatalf("deferring a missing row = %v, %v, want false, nil", deferred, err)
 	}
 }
 
@@ -673,7 +784,7 @@ func TestNotificationLedgerClaimWebhookSuccessStampsAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := ledger.ClaimWebhook(ctx, row.ID); err != nil || !claimed {
+	if claimed, err := ledger.ClaimWebhook(ctx, row.ID, now); err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
 	settledAt := now.Add(time.Minute)
@@ -703,7 +814,7 @@ func TestNotificationLedgerPostClaimMergeRedirectsToNewGeneration(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID, now); err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
 	before := notificationColumn(t, db, first.ID, "payload_json")
@@ -743,7 +854,7 @@ func TestNotificationLedgerPostClaimMergeRedirectsWithHeldDesktop(t *testing.T) 
 	if applied, err := ledger.SetDesktopState(ctx, first.ID, "suppressed_presence", now); err != nil || !applied {
 		t.Fatalf("suppression transition = %v, %v, want true", applied, err)
 	}
-	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID, now); err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
 	second, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "decision_opened", EventKind: "action.opened", AggregateKey: "decision:held", Phase: "opened", WindowStart: now, FirstAt: now, LastAt: now.Add(time.Minute), AvailableAt: now.Add(time.Minute), Count: 1, PayloadJSON: `{"count":1,"message":"second"}`})
@@ -774,7 +885,7 @@ func TestNotificationLedgerIdenticalPayloadWithLaterTimeOpensNewGeneration(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID, now); err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
 	second, err := ledger.UpsertWebhookGeneration(ctx, NotificationRecord{Category: "request_outcome", EventKind: "request.outcome", AggregateKey: "job:distinct", Phase: "terminal", WindowStart: now, FirstAt: now, LastAt: now.Add(time.Minute), AvailableAt: now.Add(time.Minute), Count: 1, PayloadJSON: `{"count":1}`})
@@ -809,7 +920,7 @@ func TestNotificationLedgerSettledRetryReturnsSameGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID, now); err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
 	if err := ledger.SetWebhookState(ctx, first.ID, "attempted", now.Add(time.Minute)); err != nil {
@@ -848,7 +959,7 @@ func TestNotificationLedgerRedirectedGenerationRetryMatchesOwnGeneration(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := ledger.ClaimWebhook(ctx, first.ID); err != nil || !claimed {
+	if claimed, err := ledger.ClaimWebhook(ctx, first.ID, now); err != nil || !claimed {
 		t.Fatalf("claim = %v, %v, want true", claimed, err)
 	}
 	if err := ledger.SetWebhookState(ctx, first.ID, "attempted", now.Add(time.Minute)); err != nil {
@@ -865,7 +976,7 @@ func TestNotificationLedgerRedirectedGenerationRetryMatchesOwnGeneration(t *test
 	if second.ID == first.ID {
 		t.Fatalf("late event reused settled row %d, want a fresh generation", first.ID)
 	}
-	if claimed, err := ledger.ClaimWebhook(ctx, second.ID); err != nil || !claimed {
+	if claimed, err := ledger.ClaimWebhook(ctx, second.ID, now); err != nil || !claimed {
 		t.Fatalf("generation claim = %v, %v, want true", claimed, err)
 	}
 	if err := ledger.SetWebhookState(ctx, second.ID, "attempted", secondAt.Add(time.Minute)); err != nil {
