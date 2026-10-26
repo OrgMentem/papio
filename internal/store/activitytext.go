@@ -133,6 +133,13 @@ func ActivityText(kind string, detail map[string]any) string {
 			}
 			return "Waiting for Zotero desktop"
 		case "queued":
+			if activityDetailString(detail, "reason") == "citation_metadata_unavailable" {
+				text := "Waiting for citation metadata (source unavailable)"
+				if retryAt := activityDetailString(detail, "retry_at"); retryAt != "" {
+					text += "; retry at " + retryAt
+				}
+				return clampActivityText(text)
+			}
 			return "Queued for Zotero (Zotero desktop is ready)"
 		default:
 			return "Zotero import attempted"

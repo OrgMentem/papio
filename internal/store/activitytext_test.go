@@ -46,6 +46,8 @@ func TestActivityTextCoversWrittenEventKinds(t *testing.T) {
 		{"zotio.auto_import", map[string]any{"status": "waiting", "reason": "zotero_busy"}, "Waiting for Zotero desktop (Zotero is busy)"},
 		// Zotero opened: the paper waits only for its turn in the paced pass.
 		{"zotio.auto_import", map[string]any{"status": "queued", "reason": "zotero_ready"}, "Queued for Zotero (Zotero desktop is ready)"},
+		{"zotio.auto_import", map[string]any{"status": "queued", "reason": "citation_metadata_unavailable", "retry_at": "2026-10-26T12:00:00.000000000Z"}, "Waiting for citation metadata (source unavailable); retry at 2026-10-26T12:00:00.000000000Z"},
+		{"zotio.auto_import", map[string]any{"status": "queued", "reason": "citation_metadata_unavailable"}, "Waiting for citation metadata (source unavailable)"},
 		{"zotio.collection_filing", map[string]any{"status": "applied"}, "Filed into Zotero collection"},
 		// A failed follow-up read "Filed into Zotero collection" and "Zotero
 		// metadata enriched" for job_cb931061… on 2026-09-24, while Zotero

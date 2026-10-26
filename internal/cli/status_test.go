@@ -392,3 +392,22 @@ func TestStatusPreservesBrowserRejectionReason(t *testing.T) {
 		t.Fatalf("operator rejection becomes an access failure: %+v", got)
 	}
 }
+
+func TestStatusRendersCitationMetadataWaitAndRetryTime(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	const retryAt = "2026-10-26T13:00:00.000000000Z"
+	rows := []job.Row{{ID: "metadata", State: job.StateReady, UpdatedAt: now.Format(time.RFC3339Nano), Work: work.Work{Title: "A paper"}}}
+	details := map[string]api.JobDetail{"metadata": {Events: []map[string]any{
+		{"kind": "zotio.auto_import", "detail": map[string]any{"status": "queued", "reason": "zotero_ready"}},
+		{"kind": "zotio.auto_import", "detail": map[string]any{"status": "queued", "reason": "citation_metadata_unavailable", "retry_at": retryAt}},
+	}}}
+	snapshot := buildStatusSnapshot(rows, details, now, config.Config{})
+	var out bytes.Buffer
+	if err := renderStatusRefresh(&out, snapshot, false); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	if !strings.Contains(text, "citation metadata (source unavailable)") || !strings.Contains(text, retryAt) || strings.Contains(text, "Zotero desktop is ready") {
+		t.Fatalf("status did not describe the metadata wait: %s", text)
+	}
+}

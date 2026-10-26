@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -69,6 +70,38 @@ const readyImportScanLimit = 200
 // the pacing floor applied between applies.
 const maxImportsPerPass = 3
 
+// citationStoreError means import preparation failed before the importer ran.
+// It is not a metadata-source outage and does not spend an import attempt.
+type citationStoreError struct{ err error }
+
+func (e *citationStoreError) Error() string {
+	return fmt.Sprintf("reading or storing citation metadata: %v", e.err)
+}
+
+func (e *citationStoreError) Unwrap() error { return e.err }
+
+func importErrorIsDeferred(detail map[string]any) bool {
+	return importErrorIsInterruptedApply(detail) || detail["error_class"] == "citation_store_unavailable"
+}
+
+// citationRetryAt bounds repeated preparation failures with the import backoff
+// ladder. A provider's later budget reset still takes precedence.
+func citationRetryAt(events []map[string]any, reason string, now, sourceRetry time.Time) time.Time {
+	consecutive := 0
+	for _, event := range events {
+		if event["kind"] != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := event["detail"].(map[string]any)
+		if detail["reason"] == reason {
+			consecutive = min(consecutive+1, len(importRetryDelays)-1)
+		} else {
+			consecutive = 0
+		}
+	}
+	return laterTime(now.Add(importRetryDelays[consecutive]), sourceRetry)
+}
+
 // EnsureCitationMetadata fills a ready job's citation identity from its DOI
 // before an import is attempted, and is why an import can recover from a gap
 // that used to be permanent.
@@ -90,29 +123,32 @@ const maxImportsPerPass = 3
 // the operator-driven backfill reaches the importer without passing through it,
 // and the already-capped jobs are reachable ONLY through the backfill.
 //
-// Best-effort by construction: enrichment must never fail an import that could
-// otherwise succeed, and enrichDOIWork already absorbs budget refusals and
-// post-wire failures. It logs when the gap survives the attempt, because a
-// paper that stays unfilable needs a reason the operator can read.
-func (s *Service) EnsureCitationMetadata(ctx context.Context, jobID string) {
+// A failed or refused lookup defers the import. A successful lookup with no
+// citation still reaches normal bundle validation, which can report the gap.
+func (s *Service) EnsureCitationMetadata(ctx context.Context, jobID string) error {
 	if s == nil || s.Discovery == nil || s.Jobs == nil {
-		return
+		return nil
 	}
 	row, err := s.Jobs.Get(ctx, jobID)
-	if err != nil || row == nil {
-		return
+	if err != nil {
+		return &citationStoreError{err: err}
 	}
-	if strings.TrimSpace(row.Work.Title) != "" || strings.TrimSpace(row.Work.DOI) == "" {
-		return
+	if row == nil || strings.TrimSpace(row.Work.Title) != "" || strings.TrimSpace(row.Work.DOI) == "" {
+		return nil
 	}
-	if _, err := s.enrichDOIWork(ctx, row); err != nil {
+	if _, err := s.enrichDOICitation(ctx, row); err != nil {
 		log.Printf("papio: citation enrichment for job %s failed: %v", jobID, err)
-		return
+		var unavailable *zotio.CitationMetadataUnavailableError
+		if !errors.As(err, &unavailable) {
+			return &citationStoreError{err: err}
+		}
+		return err
 	}
 	if strings.TrimSpace(row.Work.Title) == "" {
 		log.Printf("papio: no citation metadata available for job %s (doi %s); import will fail bundle validation",
 			jobID, row.Work.DOI)
 	}
+	return nil
 }
 
 // ImportRetrier re-drives auto-import for ready jobs whose Zotero import has not
@@ -311,10 +347,10 @@ func settledImport(events []map[string]any) (status, parentKey, attachmentKey st
 // failures accumulate, after which the job is left import_failed. A missing or
 // skipped outcome retries: the inline import never recorded a result (a dropped
 // event insert) or ran before Zotio was configured. A waiting outcome retries
-// and spends no attempt: the import waited for a closed Zotero desktop. So
-// does a queued one: it waited, and Zotero desktop now accepts saves. An error
-// that only reports an earlier interrupted apply (importErrorIsInterruptedApply)
-// spends no attempt either.
+// and spends no attempt: the import waited for a closed Zotero desktop. Queued
+// outcomes also spend no attempt, including waits for citation metadata.
+// Interrupted applies and citation store failures happen outside a new import
+// attempt, so their error outcomes spend no attempt either.
 func importNeedsRetry(events []map[string]any) bool {
 	var status string
 	errorCount := 0
@@ -324,7 +360,7 @@ func importNeedsRetry(events []map[string]any) bool {
 		}
 		detail, _ := event["detail"].(map[string]any)
 		status, _ = detail["status"].(string)
-		if status == "error" && !importErrorIsInterruptedApply(detail) {
+		if status == "error" && !importErrorIsDeferred(detail) {
 			errorCount++
 		}
 	}
@@ -343,21 +379,28 @@ func importRetryDue(events []map[string]any, now time.Time) bool {
 	failures := 0
 	var lastFailure string
 	var lastInterrupted string
+	var metadataRetry string
 	for _, event := range events {
 		if kind, _ := event["kind"].(string); kind != "zotio.auto_import" {
 			continue
 		}
 		detail, _ := event["detail"].(map[string]any)
 		status, _ := detail["status"].(string)
+		metadataRetry, _ = detail["retry_at"].(string)
 		switch {
 		case status == "error" && importErrorIsInterruptedApply(detail):
 			lastInterrupted, _ = event["at"].(string)
+		case status == "error" && detail["error_class"] == "citation_store_unavailable":
+			lastInterrupted = ""
 		case status == "error":
 			failures++
 			lastFailure, _ = event["at"].(string)
 		default:
 			lastInterrupted = ""
 		}
+	}
+	if at, err := time.Parse(time.RFC3339Nano, metadataRetry); err == nil && now.Before(at) {
+		return false
 	}
 	if lastInterrupted != "" {
 		if at, err := time.Parse(time.RFC3339Nano, lastInterrupted); err == nil && now.Before(at.Add(interruptedApplyRetryDelay)) {

@@ -1606,6 +1606,15 @@ func (s *Service) typedSiblings(ctx context.Context, row *job.Row) ([]resolver.C
 // charged against the bounded retry budget, or a job that keeps failing later
 // re-runs it every cycle for free. Enrichment never fails the job.
 func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) (retryPlan, error) {
+	plan, err := s.enrichDOICitation(ctx, row)
+	var unavailable *zotio.CitationMetadataUnavailableError
+	if errors.As(err, &unavailable) {
+		return plan, nil // Acquisition can still succeed without citation metadata.
+	}
+	return plan, err
+}
+
+func (s *Service) enrichDOICitation(ctx context.Context, row *job.Row) (retryPlan, error) {
 	var plan retryPlan
 	if s.Discovery == nil || strings.TrimSpace(row.Work.Title) != "" || strings.TrimSpace(row.Work.DOI) == "" {
 		return plan, nil
@@ -1615,13 +1624,18 @@ func (s *Service) enrichDOIWork(ctx context.Context, row *job.Row) (retryPlan, e
 	}
 	discovered, err := s.Discovery.LookupWork(ctx, row.Work.DOI)
 	if plan.observeBudgetRefusal(err) {
-		return plan, nil // admission refused inside sourcegate.Client: no request was made
+		return plan, &zotio.CitationMetadataUnavailableError{Err: err, RetryAt: laterTime(plan.at(), plan.advisory)}
 	}
 	plan.observeSourceCalled() // admission passed: the request reached the wire (the rare
 	// pre-wire seedURL-construction failure is charged too — bounded over-charge,
 	// vs. a post-wire 404/decode failure going uncharged, which is unbounded)
+	if errors.Is(err, discovery.ErrWorkNotFound) {
+		return plan, nil
+	}
 	if err != nil {
-		return plan, nil // post-wire failure; enrichment never fails the job
+		delay, _ := resolver.Temporary(err)
+		at := plan.observeResolverTemporary(s.Now(), delay, s.RetryDelay)
+		return plan, &zotio.CitationMetadataUnavailableError{Err: err, RetryAt: at}
 	}
 	changed, err := s.Jobs.EnrichWorkRequestMetadata(
 		ctx, row.WorkRequestID, discovered.Work.Title, discovered.Work.Authors, discovered.Work.Year,
@@ -1855,6 +1869,11 @@ func (s *Service) enrich(ctx context.Context, row *job.Row, anchor job.Submitted
 			} else {
 				if finishErr := s.Jobs.FinishAttempt(ctx, attempt, "failed", 0, safeType(err)); finishErr != nil {
 					return plan, finishErr
+				}
+				// Without an identifier, an unsuccessful lookup is not proof
+				// that no identifier exists. Keep the bounded retry path open.
+				if !row.Work.HasFetchableIdentifier() {
+					plan.observeResolverTemporary(s.Now(), 0, s.RetryDelay)
 				}
 			}
 			// Metadata enrichment is optional: one source's failure degrades
@@ -5493,7 +5512,8 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutco
 	if disposition, dispositionErr := s.Jobs.Disposition(ctx, row.ID); dispositionErr != nil || disposition.Disposition == job.DispositionArchived {
 		return importNotAttempted
 	}
-	if events, err := s.Jobs.Events(eventCtx, row.ID); err == nil && (!importNeedsRetry(events) || !importRetryDue(events, s.Now())) {
+	events, eventsErr := s.Jobs.Events(eventCtx, row.ID)
+	if eventsErr == nil && (!importNeedsRetry(events) || !importRetryDue(events, s.Now())) {
 		return importNotAttempted
 	}
 	// A connector save cannot succeed while Zotero desktop is closed, so
@@ -5510,6 +5530,27 @@ func (s *Service) autoImportReady(ctx context.Context, row *job.Row) importOutco
 	detail["attachment_key"] = attachmentKey
 	if err != nil {
 		if ctx.Err() != nil {
+			return importAttempted
+		}
+		var metadataErr *zotio.CitationMetadataUnavailableError
+		var storeErr *citationStoreError
+		if errors.As(err, &metadataErr) || errors.As(err, &storeErr) {
+			reason := "citation_metadata_unavailable"
+			sourceRetry := time.Time{}
+			if metadataErr != nil {
+				detail["status"] = "queued"
+				sourceRetry = metadataErr.RetryAt
+			} else {
+				reason = "citation_store_unavailable"
+				detail["status"] = "error"
+				detail["error_class"] = reason
+			}
+			detail["reason"] = reason
+			detail["error_message"] = zotio.SanitizeErrorHint(err.Error())
+			detail["error_hint"] = detail["error_message"]
+			detail["retry_at"] = store.FormatTime(citationRetryAt(events, reason, s.Now(), sourceRetry))
+			_ = s.Jobs.RecordEvent(eventCtx, row.ID, "zotio.auto_import", detail)
+			// Preparation still spends this pass's work slot, not an import attempt.
 			return importAttempted
 		}
 		class, hint, httpStatus := autoImportErrorInfo(err)

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"papio/internal/agentjson"
 	"papio/internal/job"
@@ -111,8 +112,21 @@ type ImportBackfillImporter interface {
 // deliberately not part of ImportBackfillImporter — a plain importer stays a
 // valid caller, and this package never learns what a metadata source is.
 type citationRepairer interface {
-	EnsureCitationMetadata(ctx context.Context, jobID string)
+	EnsureCitationMetadata(ctx context.Context, jobID string) error
 }
+
+// CitationMetadataUnavailableError defers an import whose required citation
+// lookup failed or was refused, without spending an import attempt.
+type CitationMetadataUnavailableError struct {
+	Err     error
+	RetryAt time.Time
+}
+
+func (e *CitationMetadataUnavailableError) Error() string {
+	return fmt.Sprintf("citation metadata lookup unavailable: %v", e.Err)
+}
+
+func (e *CitationMetadataUnavailableError) Unwrap() error { return e.Err }
 
 // ImportBackfill selects stranded ready jobs oldest-first, classifies them, and
 // optionally imports them through PlanAndApply. Dry-run is the default: no
@@ -196,7 +210,20 @@ func (s *Service) ImportBackfill(ctx context.Context, req ImportBackfillRequest,
 		// behaviour exactly.
 		if req.Apply {
 			if repairer, ok := importer.(citationRepairer); ok {
-				repairer.EnsureCitationMetadata(ctx, candidate.JobID)
+				if err := repairer.EnsureCitationMetadata(ctx, candidate.JobID); err != nil {
+					outcome := ImportBackfillItem{
+						JobID: candidate.JobID, CreatedAt: candidate.CreatedAt,
+						Status: "error", Error: importBackfillItemError(err),
+					}
+					var unavailable *CitationMetadataUnavailableError
+					if errors.As(err, &unavailable) {
+						outcome.Status = "queued"
+						outcome.Reason = "citation_metadata_unavailable"
+					}
+					result.Summary.Failed++
+					result.Failed = append(result.Failed, outcome)
+					continue
+				}
 			}
 		}
 		class, reason, parentKey, classifyErr := s.classifyImportBackfillJob(ctx, candidate.JobID, ownedParents, ownershipKnown)

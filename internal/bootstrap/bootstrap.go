@@ -232,15 +232,17 @@ type citationEnrichingImporter struct {
 }
 
 func (c citationEnrichingImporter) PlanAndApply(ctx context.Context, jobID string) (status, parentKey, attachmentKey string, err error) {
-	c.svc.EnsureCitationMetadata(ctx, jobID)
+	if err := c.svc.EnsureCitationMetadata(ctx, jobID); err != nil {
+		return "", "", "", err
+	}
 	return c.next.PlanAndApply(ctx, jobID)
 }
 
 // EnsureCitationMetadata satisfies zotio's optional citationRepairer, which the
 // import backfill uses to close a metadata gap BEFORE it classifies a job as an
 // expected failure and skips the importer entirely.
-func (c citationEnrichingImporter) EnsureCitationMetadata(ctx context.Context, jobID string) {
-	c.svc.EnsureCitationMetadata(ctx, jobID)
+func (c citationEnrichingImporter) EnsureCitationMetadata(ctx context.Context, jobID string) error {
+	return c.svc.EnsureCitationMetadata(ctx, jobID)
 }
 
 func waitAutoImportRetry(ctx context.Context, delay time.Duration) error {

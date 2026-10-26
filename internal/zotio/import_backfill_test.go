@@ -492,15 +492,17 @@ func TestImportBackfillMarshalJSONNormalizesNullSlices(t *testing.T) {
 // what the daemon wires in production (bootstrap.citationEnrichingImporter).
 type repairingImporter struct {
 	trackingImporter
-	repaired []string
-	repair   func(jobID string)
+	repaired  []string
+	repair    func(jobID string)
+	repairErr error
 }
 
-func (r *repairingImporter) EnsureCitationMetadata(_ context.Context, jobID string) {
+func (r *repairingImporter) EnsureCitationMetadata(_ context.Context, jobID string) error {
 	r.repaired = append(r.repaired, jobID)
 	if r.repair != nil {
 		r.repair(jobID)
 	}
+	return r.repairErr
 }
 
 // A ready job whose classification will refuse it (here: no exportable bundle)
@@ -843,5 +845,45 @@ func TestValidateImportBackfillCursorRejections(t *testing.T) {
 	err = service.ValidateImportBackfillCursor(ctx, "job_cursor_missing")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("absent anchor = %v, want a not-found error", err)
+	}
+}
+
+func TestImportBackfillDistinguishesCitationOutageFromStoreFailure(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		err    error
+		status string
+		reason string
+	}{
+		{"source", fmt.Errorf("repair: %w", &CitationMetadataUnavailableError{Err: errors.New("HTTP 503")}), "queued", "citation_metadata_unavailable"},
+		{"store_read", errors.New("reading work request: database unavailable"), "error", ""},
+		{"store_write", errors.New("persisting work metadata: database unavailable"), "error", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := storetest.DataDir(t)
+			db, err := store.Open(ctx, dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			seedImportBackfillJob(t, ctx, db, "job_repair_failure", store.FormatTime(time.Now().Add(-time.Hour)), true, "pass", "")
+			service := importBackfillService(t, dataDir, db, &planCLI{})
+			importer := &repairingImporter{repairErr: test.err}
+			result, err := service.ImportBackfill(ctx, ImportBackfillRequest{Apply: true, Limit: 5}, importer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Summary.Failed != 1 || len(result.Failed) != 1 {
+				t.Fatalf("repair result = %+v", result)
+			}
+			outcome := result.Failed[0]
+			if outcome.Status != test.status || outcome.Reason != test.reason || outcome.Error == "" {
+				t.Fatalf("repair outcome = %+v, want %s/%s", outcome, test.status, test.reason)
+			}
+			if len(importer.calls) != 0 {
+				t.Fatalf("import ran after repair failure: %v", importer.calls)
+			}
+		})
 	}
 }

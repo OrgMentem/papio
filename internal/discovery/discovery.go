@@ -38,6 +38,9 @@ const (
 	MaxLimit     = maxLimit
 )
 
+// ErrWorkNotFound means the source answered the DOI lookup with no record.
+var ErrWorkNotFound = errors.New("discovery: DOI was not found")
+
 const slimFields = "id,doi,title,display_name,publication_year,authorships,primary_location,open_access,cited_by_count"
 
 // HTTPClient is the injected HTTP dependency used to call OpenAlex.
@@ -339,7 +342,7 @@ func (c *Client) LookupWork(ctx context.Context, doi string) (DiscoveredWork, er
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
-		return DiscoveredWork{}, fmt.Errorf("discovery: OpenAlex DOI %q was not found", normalized)
+		return DiscoveredWork{}, fmt.Errorf("discovery: OpenAlex DOI %q was not found: %w", normalized, ErrWorkNotFound)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return DiscoveredWork{}, fmt.Errorf("discovery: OpenAlex returned HTTP %d looking up DOI %q", resp.StatusCode, normalized)

@@ -254,8 +254,7 @@ func buildStatusSnapshot(rows []job.Row, details map[string]api.JobDetail, now t
 				// A wait for Zotero is not a failed import: say what ends it.
 				item.Guidance = zoteroWaitingGuidance(autoImportReason(detail.Events))
 			case "queued":
-				// The wait ended; the paced import pass reaches it next.
-				item.Guidance = "Zotero desktop is ready. papio adds these papers within minutes."
+				item.Guidance = queuedImportGuidance(detail.Events)
 			}
 		}
 		groups[group] = append(groups[group], item)
@@ -514,4 +513,18 @@ func groupStatusJobs(items []statusJob) [][]statusJob {
 func statusTTY(out io.Writer) bool {
 	file, ok := out.(interface{ Fd() uintptr })
 	return ok && (isatty.IsTerminal(file.Fd()) || isatty.IsCygwinTerminal(file.Fd()))
+}
+
+func queuedImportGuidance(events []map[string]any) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i]["kind"] != "zotio.auto_import" {
+			continue
+		}
+		detail, _ := events[i]["detail"].(map[string]any)
+		if detail["reason"] == "citation_metadata_unavailable" {
+			return store.ActivityText("zotio.auto_import", detail)
+		}
+		break
+	}
+	return "Zotero desktop is ready. papio adds these papers within minutes."
 }

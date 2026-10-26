@@ -642,3 +642,28 @@ func TestReportSettledUsesCanonicalTerminalOutcomes(t *testing.T) {
 		t.Fatal("an empty report settles vacuously")
 	}
 }
+
+func TestBatchReportRendersCitationMetadataWaitAndRetryTime(t *testing.T) {
+	const retryAt = "2026-10-26T13:00:00.000000000Z"
+	manifest := &Manifest{
+		SchemaVersion: SchemaVersion, ID: "batch-metadata", CreatedAt: "2026-10-26T12:00:00Z",
+		Works: []ManifestWork{manifestWork("wr-metadata", "job-metadata", "submitted", "Metadata outage")},
+	}
+	jobs := fakeJobs{
+		rows: map[string]*job.Row{"job-metadata": {ID: "job-metadata", State: job.StateReady, Policy: job.Policy{AutoImport: true}}},
+		events: map[string][]map[string]any{"job-metadata": {
+			{"kind": "zotio.auto_import", "detail": map[string]any{"status": "queued", "reason": "citation_metadata_unavailable", "retry_at": retryAt}},
+		}},
+	}
+	report, err := BuildReport(context.Background(), manifest, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := report.Works[0]; item.Outcome != OutcomeAcquired || item.Reason != "citation_metadata_unavailable" {
+		t.Fatalf("metadata outcome = %+v", item)
+	}
+	text := Markdown(report)
+	if !strings.Contains(text, "citation metadata (source unavailable)") || !strings.Contains(text, retryAt) || strings.Contains(text, "Zotero desktop is ready") {
+		t.Fatalf("batch report did not describe the metadata wait: %s", text)
+	}
+}
