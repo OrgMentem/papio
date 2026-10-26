@@ -616,11 +616,19 @@ func TestIdentityRejectsPrefixCollisionsBetweenIdentifiers(t *testing.T) {
 // their text). A byline printing a DIFFERENT year is evidence against, and
 // dropping the year gate entirely would accept a same-author neighbour.
 func TestIdentityDistinguishesAnAbsentYearFromAContradictedOne(t *testing.T) {
-	target := work.Work{Title: "Machine Learning Methods for Cancer Diagnosis", Authors: []string{"Alice Smith"}, Year: 2024}
-	if got := MatchIdentity("Machine Learning Methods for Cancer Prognosis\nAlice Smith\n2023\n", target); got.Result != IdentityReview {
+	target := work.Work{Title: "Psychological safety and learning behavior in work teams", Authors: []string{"Amy Edmondson"}, Year: 1999}
+	// The glued words preserve the printed title but leave only learning,
+	// behavior, and teams as token matches (3/5). This clears the title threshold
+	// without bypassing the year-conflict check for complete token matches.
+	byline := "PsychologicalSafety and Learning Behavior in Work Teams\nAmy Edmondson\n"
+	got := MatchIdentity(byline+"1997\n", target)
+	if got.Result != IdentityReview {
 		t.Fatalf("result = %+v, want review when the byline is dated differently", got)
 	}
-	if got := MatchIdentity("Machine Learning Methods for Cancer Diagnosis\nAlice Smith\n", target); got.Result != IdentityPass {
+	if !strings.Contains(strings.Join(got.Evidence, " "), "front matter is dated differently to the requested year 1999") {
+		t.Fatalf("evidence = %v, want the year conflict to explain the review", got.Evidence)
+	}
+	if got := MatchIdentity(byline, target); got.Result != IdentityPass {
 		t.Fatalf("result = %+v, want pass when the byline simply carries no year", got)
 	}
 }
