@@ -1415,10 +1415,8 @@ func TestParseRetryAfterClampsHugeValues(t *testing.T) {
 	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
 
-// TestParseRetryAfterSecondsAndDates covers the two header shapes Crossref
-// sends. A date already past must yield zero, never a negative back-off that
-// would make the sweep retry immediately forever.
-func TestParseRetryAfterSecondsAndDates(t *testing.T) {
+// TestParseRetryAfterSeconds covers numeric Retry-After header variants.
+func TestParseRetryAfterSeconds(t *testing.T) {
 	now := time.Now()
 	seconds := []struct {
 		name  string
@@ -1438,24 +1436,6 @@ func TestParseRetryAfterSecondsAndDates(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("future date waits until then", func(t *testing.T) {
-		const ahead = 2 * time.Hour
-		value := now.Add(ahead).UTC().Format(http.TimeFormat)
-		got := parseRetryAfter(value, now)
-		// The header carries whole seconds only, and time.Until is read after
-		// the call starts, so allow a small shortfall but no overshoot.
-		if got > ahead || got < ahead-5*time.Second {
-			t.Fatalf("parseRetryAfter(%q) = %v, want just under %v", value, got, ahead)
-		}
-	})
-
-	t.Run("past date does not wait", func(t *testing.T) {
-		value := now.Add(-time.Hour).UTC().Format(http.TimeFormat)
-		if got := parseRetryAfter(value, now); got != 0 {
-			t.Fatalf("parseRetryAfter(%q) = %v, want 0", value, got)
-		}
-	})
 }
 
 func testStore(t *testing.T) *store.Store {

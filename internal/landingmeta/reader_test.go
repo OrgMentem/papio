@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"papio/internal/resolvers/resolvertest"
 )
 
 // doFunc adapts a plain function to the HTTPClient interface for tests that
@@ -252,4 +254,8 @@ func TestPDFURLForReturnsErrorOnNilBodyWithoutPanicking(t *testing.T) {
 	if !strings.Contains(err.Error(), "response body is missing") {
 		t.Fatalf("error = %q, want to contain %q", err.Error(), "response body is missing")
 	}
+}
+
+func TestParseRetryAfterClampsHugeValues(t *testing.T) {
+	resolvertest.CheckParseRetryAfterClampsHugeValues(t, parseRetryAfter)
 }
