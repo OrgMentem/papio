@@ -6,7 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 )
+
+const resolutionTimeout = 30 * time.Second
 
 // Binding names a consumer, its explicit reference and accepted record kinds.
 // Legacy is considered only when Reference is empty; it is never a fallback.
@@ -64,7 +67,11 @@ func (r *Resolution) Statuses() []Status {
 // references are read once per resolution so their consumers see one snapshot.
 // lookupEnv should read a previously captured environment; the bootstrap caller
 // owns scrubbing those variables before it launches any worker or store helper.
+// One overall deadline bounds waiting for an earlier store call to release its
+// gate. A transient ErrBusy must not permanently disable later bindings.
 func Resolve(ctx context.Context, bindings []Binding, reader Reader, lookupEnv func(string) (string, bool)) *Resolution {
+	ctx, cancel := context.WithTimeout(ctx, resolutionTimeout)
+	defer cancel()
 	r := &Resolution{records: make(map[string]Record), statuses: make([]Status, 0, len(bindings))}
 	targets := make(map[string]int)
 	for _, binding := range bindings {
@@ -114,7 +121,7 @@ func Resolve(ctx context.Context, bindings []Binding, reader Reader, lookupEnv f
 					if reader == nil {
 						value.err = ErrUnavailable
 					} else {
-						value.record, value.err = reader.Load(ctx, binding.Reference)
+						value.record, value.err = loadForResolution(ctx, reader, binding.Reference)
 					}
 					storeCache[binding.Reference] = value
 				}
@@ -151,4 +158,24 @@ func Resolve(ctx context.Context, bindings []Binding, reader Reader, lookupEnv f
 		r.statuses = append(r.statuses, status)
 	}
 	return r
+}
+
+func loadForResolution(ctx context.Context, reader Reader, reference string) (Record, error) {
+	record, err := reader.Load(ctx, reference)
+	if !errors.Is(err, ErrBusy) {
+		return record, err
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return Record{}, ctx.Err()
+		case <-ticker.C:
+			record, err = reader.Load(ctx, reference)
+			if !errors.Is(err, ErrBusy) {
+				return record, err
+			}
+		}
+	}
 }

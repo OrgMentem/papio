@@ -159,6 +159,7 @@ func TestJobsDiagnoseNamesTheSiblingAnOpenedHandoffIsQueuedBehind(t *testing.T) 
 			cfg.AccessMode = config.ModeConservative
 			cfg.DataDir = storetest.DataDir(t)
 			cfg.Browser.AdoptionRoot = filepath.Join(cfg.DataDir, "adoptions")
+			t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 			system, err := bootstrap.New(ctx, cfg)
 			if err != nil {
 				t.Fatal(err)

@@ -185,7 +185,7 @@ func checkCredentials(cfg config.Config, add func(string, string, string, string
 			if status != Skip {
 				remediation = "use papio config credentials status and papio config credentials set " + resolved.Target + "; restart the daemon after changing credentials"
 				if state == "unavailable" && source == "keyring" {
-					remediation = "run Papio in the signed-in user's session with an unlocked credential store, then use papio config credentials status; an explicit environment reference supports headless use"
+					remediation = "run Papio in the signed-in user's session with an unlocked credential store, then use papio config credentials status and restart the daemon; status checks the store, not the running daemon's credentials; an explicit environment reference supports headless use"
 				}
 			}
 		}

@@ -883,3 +883,51 @@ func TestInitPrintsNoDeliveryVerdictWithoutConfig(t *testing.T) {
 		t.Fatalf("init must print nothing when no profile has document_delivery configured:\n%s", out)
 	}
 }
+
+func TestInitPreservesConcurrentCredentialBinding(t *testing.T) {
+	home := initHome(t)
+	path := filepath.Join(home, ".config", "papio", "config.toml")
+	load := isolatedInitConfigLoader(t, home)
+	cfg, _, err := load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	const reference = "keyring:0123456789abcdef0123456789abcdef"
+	deps := initTestDependencies(t, home)
+	deps.LoadConfig = func(path string) (config.Config, bool, error) {
+		stale, exists, err := load(path)
+		if err != nil {
+			return stale, exists, err
+		}
+		current, err := config.Load(path)
+		if err != nil {
+			return stale, exists, err
+		}
+		source := current.Sources[config.SourceOpenAlex]
+		source.CredentialRef = reference
+		current.Sources[config.SourceOpenAlex] = source
+		return stale, exists, config.Save(current, path)
+	}
+	bootstrapped := false
+	deps.Bootstrap = func(context.Context, config.Config) (io.Closer, error) {
+		bootstrapped = true
+		return initTestCloser{}, nil
+	}
+	_, err = runInitForTest(t, path, deps, "--non-interactive", "--email", "reader@example.test", "--skip-browser")
+	if !errors.Is(err, config.ErrConfigChanged) {
+		t.Errorf("concurrent config edit: got %v, want ErrConfigChanged", err)
+	}
+	current, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Sources[config.SourceOpenAlex].CredentialRef != reference {
+		t.Fatal("init overwrote the concurrent credential binding")
+	}
+	if bootstrapped {
+		t.Fatal("init continued after a concurrent configuration change")
+	}
+}

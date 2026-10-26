@@ -292,3 +292,44 @@ func TestNewStoresShareOneGateWithoutOSAccess(t *testing.T) {
 		t.Fatal("new store bypassed gate")
 	}
 }
+
+func TestResolveWaitsForSlowReadBeforeLoadingNextBinding(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	first := testReference
+	second := "keyring:" + strings.Repeat("b", 32)
+	record := Record{Kind: KindCORE, APIKey: "synthetic-ready-key"}
+	encoded, err := Encode(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testStore(backend{load: func(_, ref string) (string, error) {
+		if ref == first {
+			<-release
+		}
+		return encoded, nil
+	}})
+	s.timeout = 20 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r := Resolve(ctx, []Binding{
+		{Target: "first", Reference: first, Kinds: []Kind{KindCORE}},
+		{Target: "second", Reference: second, Kinds: []Kind{KindCORE}},
+	}, readerFunc(func(ctx context.Context, ref string) (Record, error) {
+		value, err := s.Load(ctx, ref)
+		if ref == second && errors.Is(err, ErrBusy) {
+			// The OS finishes its abandoned read only after the next binding
+			// encounters the gate. Resolution must wait and try that binding.
+			unblock()
+		}
+		return value, err
+	}), nil)
+	if r.Statuses()[0].State != "unavailable" {
+		t.Fatal("the timed-out read must remain unavailable in this snapshot")
+	}
+	if got, ok := r.Record("second"); !ok || got != record || r.Statuses()[1].State != "ready" {
+		t.Fatal("a completed slow read disabled the next credential binding")
+	}
+}

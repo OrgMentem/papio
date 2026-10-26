@@ -17,6 +17,7 @@ import (
 	"papio/internal/agentcredential"
 	"papio/internal/config"
 	"papio/internal/credential"
+	"papio/internal/runtimecredential"
 )
 
 type fakeCredentialConfigStore struct {
@@ -1282,5 +1283,28 @@ func TestCredentialConfigDeleteMissingRecordIsNotFound(t *testing.T) {
 	}
 	if !strings.Contains(f.out.String(), `"not_found"`) || strings.Contains(f.out.String(), `"deleted"`) {
 		t.Fatalf("delete output = %q, want outcome not_found", f.out.String())
+	}
+}
+
+func TestPrepareCredentialEnvironmentPreservesConsumedVariableError(t *testing.T) {
+	const name = "PAPIO_CLI_TEST_CONSUMED_SECRET"
+	t.Setenv(name, "synthetic-consumed-key")
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
+	cfg := config.Default()
+	source := cfg.Sources[config.SourceOpenAlex]
+	source.CredentialRef = "env:" + name
+	cfg.Sources[config.SourceOpenAlex] = source
+	deps := credentialConfigDependencies{prepareEnv: takeCredentialCommandEnvironment}
+	if _, err := prepareCredentialEnvironment(deps, cfg, ""); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
+	_, err := prepareCredentialEnvironment(deps, cfg, "")
+	var consumed *runtimecredential.EnvironmentAlreadyConsumedError
+	if !errors.Is(err, runtimecredential.ErrEnvironmentAlreadyConsumed) || !errors.As(err, &consumed) || consumed.Name != name {
+		t.Fatalf("credential command lost the consumed-variable diagnostic: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reuse the EnvironmentSnapshot") {
+		t.Fatal("credential command lost the snapshot reuse instruction")
 	}
 }

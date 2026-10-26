@@ -142,6 +142,7 @@ func TestOpenAlexEnricherClientIsObserved(t *testing.T) {
 	openAlex.Enabled = true
 	openAlex.APIKey = "private-key"
 	cfg.Sources[config.SourceOpenAlex] = openAlex
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	system, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)

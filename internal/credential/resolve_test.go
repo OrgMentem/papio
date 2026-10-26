@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 type readerFunc func(context.Context, string) (Record, error)
@@ -33,7 +34,9 @@ func TestResolveAuthoritativeReferencesNeverFallBack(t *testing.T) {
 		{"ready", Record{Kind: KindCORE, APIKey: "synthetic-selected"}, nil, "ready"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := Resolve(context.Background(), []Binding{{Target: "sources.core", Reference: testReference, Kinds: []Kind{KindCORE}, Legacy: legacy}}, readerFunc(func(context.Context, string) (Record, error) { return tc.record, tc.err }), nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			r := Resolve(ctx, []Binding{{Target: "sources.core", Reference: testReference, Kinds: []Kind{KindCORE}, Legacy: legacy}}, readerFunc(func(context.Context, string) (Record, error) { return tc.record, tc.err }), nil)
 			statuses := r.Statuses()
 			if len(statuses) != 1 || statuses[0] != (Status{"sources.core", testReference, "keyring", tc.state}) {
 				t.Fatalf("incorrect diagnostic: %#v", statuses)

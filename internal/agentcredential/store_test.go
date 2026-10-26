@@ -296,3 +296,26 @@ func TestNewStoresShareOneGateWithoutOSAccess(t *testing.T) {
 		t.Fatalf("new store bypassed gate: %v", err)
 	}
 }
+
+func TestDispatchCanceledHelperStartDoesNotFallBack(t *testing.T) {
+	for _, op := range []string{opLoad, opSave, opDelete} {
+		t.Run(op, func(t *testing.T) {
+			calls := 0
+			s := testStore(backend{
+				load:   func(string, string) (string, error) { calls++; return "synthetic-key", nil },
+				save:   func(string, string, string) error { calls++; return nil },
+				delete: func(string, string) error { calls++; return nil },
+			})
+			s.helper = t.TempDir() + "/missing-helper"
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			value, err := s.dispatch(ctx, op, testProfile, "synthetic-key")
+			if value != "" || !sameSentinel(err, context.Canceled) {
+				t.Fatalf("canceled helper dispatch: value empty=%v err=%v", value == "", err)
+			}
+			if calls != 0 {
+				t.Fatal("canceled helper dispatch accessed the in-process credential store")
+			}
+		})
+	}
+}

@@ -22,6 +22,7 @@ func TestSystemWiresAndClosesPreviewServer(t *testing.T) {
 	cfg.DataDir = storetest.DataDir(t)
 	cfg.PDF.OCREnabled = false
 	cfg.Zotio.AutoEnrich = false
+	t.Setenv("PAPIO_TYPESAFE_API_KEY", "")
 	system, err := New(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
