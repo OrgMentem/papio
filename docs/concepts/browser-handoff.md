@@ -174,7 +174,7 @@ others wait, visibly, instead of silently taking over:
 - Quitting that browser releases the slot immediately; one that stops
   responding (crashed browser) yields to a live waiting session within about
   ten seconds.
-- `papio doctor` and `papio status` report when other browsers are waiting.
+- `papio doctor` reports when other browsers are waiting; `papio browser sessions` lists them.
 
 That slot decides where *papio* sends work **it** starts. It does not decide
 where you are allowed to act. Anything you initiate yourself — **Acquire this
@@ -329,11 +329,18 @@ provider's login jump straight to your institution's sign-in page instead of
 stopping at a “Where are you from?” chooser. A ProQuest account ID causes *papio* to append `?accountid=` to
 the resolver link, which can unlock the institution's ProQuest route.
 
-An `openathens_domain` changes the first route for a DOI. *papio* builds
-`https://go.openathens.net/redirector/<domain>?url=https://doi.org/<doi>` from the
-configured domain and the job's validated DOI, never from a page, and offers it
-before the OpenURL route when the publisher behind the DOI has a packaged
-adapter. The redirector is a server redirect: it signs in to the publisher with
+An `openathens_domain` adds nine DOI registrant prefixes to the publisher-first
+routes. PsychiatryOnline `10.1176`, ACS `10.1021`, and Science `10.1126` already
+go before the OpenURL route without OpenAthens. The additional prefixes cover
+publisher pages with measured redirector support: Elsevier `10.1016`, T&F
+`10.1080`, SAGE `10.1177`, APA PsycNet `10.1037`, Wiley `10.1002`/`10.1111`,
+OUP `10.1093`, Cambridge `10.1017`, and Nature `10.1038`. Other publishers with
+packaged adapters still start at the OpenURL route.
+
+With an `openathens_domain`, *papio* wraps all these publisher-first routes in
+`https://go.openathens.net/redirector/<domain>?url=https://doi.org/<doi>`.
+It builds the URL from the configured domain and the job's validated DOI,
+never from a page. The redirector is a server redirect: it signs in to the publisher with
 your institution's identity provider and then opens the article. The extension
 treats that URL as a hop, not a sign-in page; `login.openathens.net`,
 `connect.openathens.net` and identity-provider pages remain sign-in pages. When the
