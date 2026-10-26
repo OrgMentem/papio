@@ -20,9 +20,11 @@ const (
 	// DefaultURL is the raw file committed in the papio repository. A 404 there
 	// means nothing has been published, which is the normal state.
 	DefaultURL = "https://raw.githubusercontent.com/OrgMentem/papio/main/control/adapter-control.json"
-	// CheckEvery is the cadence of the fetch. It reuses the release check's
-	// cadence: one request a day, recorded whether or not it succeeds.
+	// CheckEvery is the normal cadence after a successful fetch.
 	CheckEvery = 24 * time.Hour
+	// retryEvery bounds recovery delays without fetching on every maintenance
+	// tick when the endpoint is down or the held document cannot be trusted.
+	retryEvery = 5 * time.Minute
 	// fetchTimeout matches the release checker's HTTP client.
 	fetchTimeout = 10 * time.Second
 )
@@ -66,8 +68,8 @@ func ValidateURL(raw string) error {
 	return fmt.Errorf("adapter control URL %q must use https (http is allowed only for a loopback host)", raw)
 }
 
-// Runner fetches the published document on the release check's cadence. It
-// satisfies the daemon's maintenance-runner interface.
+// Runner fetches the published document daily, with shorter recovery retries.
+// It satisfies the daemon's maintenance-runner interface.
 type Runner struct {
 	Service *Service
 	URL     string
@@ -95,6 +97,9 @@ func (r *Runner) RunDue(ctx context.Context) error {
 	}
 	current := now().UTC()
 	status := r.Service.Status()
+	if r.Service.Snapshot().State == StateUnavailable || status.LastOutcome == OutcomeFetchFailed {
+		every = min(every, retryEvery)
+	}
 	// A future timestamp (clock rollback, restored data directory) is not recent.
 	if last := status.LastAttemptAt; !last.IsZero() && !last.After(current) && current.Sub(last) < every {
 		return nil

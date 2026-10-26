@@ -397,6 +397,95 @@ func TestRunnerKeepsTheDailyCadenceAndNeedsAKey(t *testing.T) {
 	}
 }
 
+func TestRunnerRepairsUnavailableControlBeforeTheDailyCadence(t *testing.T) {
+	ctx := context.Background()
+	body := signed(t, 7, []string{"wiley@0.1.0"}, nil)
+	server, hits := controlServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	})
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+	runner := &adaptercontrol.Runner{Service: openService(t, dir), URL: server.URL, Now: func() time.Time { return now }}
+	if err := runner.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, adaptercontrol.DocumentFileName), []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.Service = openService(t, dir)
+	if got := runner.Service.Snapshot(); got.State != adaptercontrol.StateUnavailable {
+		t.Fatalf("damaged control = %+v", got)
+	}
+	now = now.Add(time.Hour)
+	if err := runner.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := openService(t, dir).Snapshot()
+	if got.State != adaptercontrol.StateCurrent || got.Sequence != 7 || !got.RevisionSuspended("wiley@0.1.0") {
+		t.Fatalf("control was not repaired and persisted: %+v", got)
+	}
+	if status := runner.Service.Status(); status.LastOutcome != adaptercontrol.OutcomePublished || !status.LastSuccessAt.Equal(now) {
+		t.Fatalf("repair status = %+v", status)
+	}
+	now = now.Add(time.Hour)
+	if err := runner.RunDue(ctx); err != nil || hits.Load() != 2 {
+		t.Fatalf("repaired control did not resume daily cadence: hits %d, err %v", hits.Load(), err)
+	}
+}
+
+func TestRunnerRecoveryRetriesArePacedAndSurviveRestart(t *testing.T) {
+	for _, unavailable := range []bool{false, true} {
+		name := "fetch_failed"
+		if unavailable {
+			name = "unavailable"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			if unavailable {
+				if err := os.WriteFile(filepath.Join(dir, adaptercontrol.DocumentFileName), []byte("garbage"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			body := signed(t, 8, []string{"wiley@0.1.0"}, nil)
+			var recovered atomic.Bool
+			server, hits := controlServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if !recovered.Load() {
+					if unavailable {
+						http.NotFound(w, r)
+					} else {
+						http.Error(w, "outage", http.StatusServiceUnavailable)
+					}
+					return
+				}
+				_, _ = w.Write(body)
+			})
+			now := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+			runner := &adaptercontrol.Runner{Service: openService(t, dir), URL: server.URL, Now: func() time.Time { return now }}
+			if err := runner.RunDue(ctx); err != nil {
+				t.Fatal(err)
+			}
+			recovered.Store(true)
+			runner.Service = openService(t, dir)
+			now = now.Add(time.Minute)
+			if err := runner.RunDue(ctx); err != nil || hits.Load() != 1 {
+				t.Fatalf("recovery retried without backoff: hits %d, err %v", hits.Load(), err)
+			}
+			now = now.Add(4 * time.Minute)
+			if err := runner.RunDue(ctx); err != nil {
+				t.Fatal(err)
+			}
+			got := runner.Service.Snapshot()
+			if got.State != adaptercontrol.StateCurrent || got.Sequence != 8 || !got.RevisionSuspended("wiley@0.1.0") {
+				t.Fatalf("recovery did not accept the published suspension: %+v", got)
+			}
+			if status := runner.Service.Status(); status.LastOutcome != adaptercontrol.OutcomePublished || !status.LastSuccessAt.Equal(now) {
+				t.Fatalf("recovery status = %+v", status)
+			}
+		})
+	}
+}
+
 func TestValidateURL(t *testing.T) {
 	for _, ok := range []string{adaptercontrol.DefaultURL, "https://example.org/c.json", "http://127.0.0.1:8080/c.json", "http://localhost/c.json", "http://[::1]:9/c.json"} {
 		if err := adaptercontrol.ValidateURL(ok); err != nil {

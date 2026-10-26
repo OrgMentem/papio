@@ -5,6 +5,7 @@ package doctor
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"papio/internal/adaptercontrol"
 	"papio/internal/browser"
@@ -44,10 +45,14 @@ func daemonControlCheck(in AdapterControlInput) Check {
 	fetch := fetchSummary(in)
 	switch snapshot.State {
 	case adaptercontrol.StateUnavailable:
+		remediation := "keep the daemon running for the next control fetch, then run papio doctor again; restore a trusted copy of the data directory if fetching cannot repair it"
+		if in.FetchURL == "" {
+			remediation = "enable [updates] check and restart the daemon to fetch valid control, or restore a trusted copy of the data directory"
+		}
 		return Check{
 			Name: name, Status: Fail,
 			Detail:      "the stored adapter control cannot be trusted, so every browser withholds automatic downloads: " + snapshot.Reason + ". " + fetch,
-			Remediation: "run papio doctor again after the next control fetch; if it persists, remove " + adaptercontrol.DocumentFileName + " from the data directory (browsers that already accepted control keep refusing automation until a valid higher sequence arrives)",
+			Remediation: remediation,
 		}
 	case adaptercontrol.StateCurrent:
 		if len(snapshot.Revisions) == 0 && len(snapshot.Domains) == 0 {
@@ -106,17 +111,27 @@ func fetchSummary(in AdapterControlInput) string {
 	if failedFetch(status.LastOutcome) {
 		text += "; the held control was not changed"
 	}
+	if status.LastSuccessAt.IsZero() {
+		text += "; no successful fetch is recorded"
+	} else {
+		text += fmt.Sprintf("; last successful fetch %s ago", time.Since(status.LastSuccessAt).Round(time.Minute))
+	}
 	return text + "."
 }
 
 func browserControlCheck(in AdapterControlInput) (Check, bool) {
-	if len(in.Sessions) == 0 || !in.Snapshot.Mandatory() {
+	if len(in.Sessions) == 0 {
 		return Check{}, false
 	}
 	const name = "adapter control (browser)"
 	var problems []string
 	remediation := ""
 	for _, session := range in.Sessions {
+		// A fresh install needs no control, but a browser can remember control
+		// that this daemon no longer holds. Its refusal still needs a diagnosis.
+		if !in.Snapshot.Mandatory() && (!session.Resolved || session.Outcome == "applied") {
+			continue
+		}
 		label := fmt.Sprintf("session %s (extension v%s)", shortID(session.ID), session.ExtensionVersion)
 		switch {
 		case !session.Capable:
@@ -126,14 +141,23 @@ func browserControlCheck(in AdapterControlInput) (Check, bool) {
 			problems = append(problems, label+" has not reported yet")
 		case session.Outcome != "applied":
 			problems = append(problems, fmt.Sprintf("%s refused control (%s)", label, session.Outcome))
+			if session.Outcome == "missing" {
+				problems[len(problems)-1] += ": the daemon supplies no control, and the browser cannot safely treat this as a fresh install"
+			}
 			if remediation == "" {
 				remediation = "a browser that saw a higher sequence than this daemon holds refuses automation: restore the daemon's data directory or wait for the next control fetch"
+				if in.FetchURL == "" {
+					remediation = "restore the daemon's data directory or enable [updates] check and restart the daemon to fetch valid control"
+				}
 			}
 		case in.Snapshot.State == adaptercontrol.StateCurrent && session.Sequence < in.Snapshot.Sequence:
 			problems = append(problems, fmt.Sprintf("%s applied sequence %d, behind %d", label, session.Sequence, in.Snapshot.Sequence))
 		}
 	}
 	if len(problems) == 0 {
+		if !in.Snapshot.Mandatory() {
+			return Check{}, false
+		}
 		return Check{Name: name, Status: Pass, Detail: fmt.Sprintf("every connected browser applied control sequence %d", in.Snapshot.Sequence)}, true
 	}
 	return Check{

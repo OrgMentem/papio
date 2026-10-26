@@ -108,7 +108,11 @@ func TestAdapterControlBrowserCheckReportsEachUnappliedSession(t *testing.T) {
 	}
 	// Nothing published: no per-session check at all, so a fresh install is quiet.
 	quiet := controlInput(adaptercontrol.StateNone, 0, nil, nil)
-	quiet.Sessions = in.Sessions
+	quiet.Sessions = []browser.AdapterControlSession{
+		{ID: "fresh-session", ExtensionVersion: "0.16.0", Capable: true, Resolved: true, Outcome: "applied"},
+		{ID: "waiting-session", ExtensionVersion: "0.16.0", Capable: true},
+		{ID: "old-session", ExtensionVersion: "0.15.0"},
+	}
 	for _, c := range AdapterControlChecks(quiet) {
 		if c.Name == "adapter control (browser)" {
 			t.Fatalf("a daemon with no control reported a browser check: %+v", c)
@@ -129,5 +133,54 @@ func TestAdapterControlCheckWarnsWhenTheFetchFailed(t *testing.T) {
 		if check.Status != Warn || !strings.Contains(check.Detail, adaptercontrol.OutcomeFetchFailed) {
 			t.Errorf("state %s: check = %+v, want warn naming the failed fetch", in.Snapshot.State, check)
 		}
+	}
+}
+
+func TestAdapterControlBrowserCheckReportsRefusalWithoutDaemonControl(t *testing.T) {
+	for _, outcome := range []string{"missing", "rolled_back", "verification_failed"} {
+		t.Run(outcome, func(t *testing.T) {
+			in := controlInput(adaptercontrol.StateNone, 0, nil, nil)
+			in.Sessions = []browser.AdapterControlSession{
+				{ID: "refusing-session", ExtensionVersion: "0.16.0", Capable: true, Resolved: true, Outcome: outcome},
+			}
+			check := controlCheck(t, AdapterControlChecks(in), "adapter control (browser)")
+			if check.Status != Warn || !strings.Contains(check.Detail, outcome) || !strings.Contains(check.Detail, "withheld") {
+				t.Fatalf("browser refusal = %+v", check)
+			}
+			if outcome == "missing" && !strings.Contains(check.Detail, "daemon supplies no control") {
+				t.Fatalf("missing refusal has no cause: %+v", check)
+			}
+			if !strings.Contains(check.Remediation, "restore") || !strings.Contains(check.Remediation, "fetch") {
+				t.Fatalf("browser refusal has no recovery advice: %+v", check)
+			}
+		})
+	}
+}
+
+func TestAdapterControlUnavailableRemediationPreservesControl(t *testing.T) {
+	in := controlInput(adaptercontrol.StateUnavailable, 0, nil, nil)
+	check := controlCheck(t, AdapterControlChecks(in), "adapter control")
+	if strings.Contains(check.Remediation, "remove") || !strings.Contains(check.Remediation, "next control fetch") {
+		t.Fatalf("unsafe recovery advice: %+v", check)
+	}
+	in.FetchURL = ""
+	check = controlCheck(t, AdapterControlChecks(in), "adapter control")
+	if !strings.Contains(check.Remediation, "enable [updates] check") {
+		t.Fatalf("disabled fetching has no recovery advice: %+v", check)
+	}
+}
+
+func TestAdapterControlCheckReportsLastSuccessfulFetchAge(t *testing.T) {
+	in := controlInput(adaptercontrol.StateCurrent, 4, nil, nil)
+	in.Status.LastOutcome = adaptercontrol.OutcomeFetchFailed
+	in.Status.LastSuccessAt = time.Now().Add(-48 * time.Hour)
+	check := controlCheck(t, AdapterControlChecks(in), "adapter control")
+	if !strings.Contains(check.Detail, "last successful fetch 48h0m0s ago") {
+		t.Fatalf("missing successful fetch age: %+v", check)
+	}
+	in.Status.LastSuccessAt = time.Time{}
+	check = controlCheck(t, AdapterControlChecks(in), "adapter control")
+	if !strings.Contains(check.Detail, "no successful fetch is recorded") {
+		t.Fatalf("missing absent success diagnosis: %+v", check)
 	}
 }
