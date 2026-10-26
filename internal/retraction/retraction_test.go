@@ -1649,3 +1649,127 @@ func TestRunDueSweepsStaleTemps(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A truncated library export is an incomplete read, never a smaller library:
+// the sweep keeps the previous notices, keeps their acknowledgements, and
+// records the condition as a fetch error instead of passing.
+func TestTruncatedLibraryExportKeepsNoticesAndAcks(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	exportPath := filepath.Join(dir, "library.bib")
+	const exportBody = "@article{only,\n  title = {Only paper},\n  doi = {10.1234/library-only},\n}\n"
+	if err := os.WriteFile(exportPath, []byte(exportBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog := NewLibraryCatalog([]config.LibrarySource{{
+		Name: "export", Kind: config.LibraryKindFile, Path: exportPath,
+		Format: "bibtex", Claim: config.LibraryClaimRecordPresent,
+	}}, nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRetractionDataset(t, w, csvNotice{
+			title: "Dataset title", noticeDOI: "10.2000/notice",
+			workDOI: "10.1234/library-only", nature: "retraction",
+		})
+	}))
+	defer server.Close()
+	dataDir := t.TempDir()
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	notifier := &recordingNotifier{}
+	jobs := testStore(t)
+	newSentinel := func() *Sentinel {
+		return New(Options{
+			Store: jobs, Budgets: &recordingBudget{}, Policy: config.Source{Enabled: true},
+			Client: server.Client(), BaseURL: server.URL, DataDir: dataDir,
+			Notifier: notifier, Scope: config.RetractionScopeLibrary, LibraryDOIs: catalog,
+			Now: func() time.Time { return now },
+		})
+	}
+	readNotices := func() (cache, bool) {
+		sentinel := newSentinel()
+		sentinel.mu.Lock()
+		defer sentinel.mu.Unlock()
+		return sentinel.readCache()
+	}
+	ackCount := func() int {
+		var count int
+		if err := jobs.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM retraction_acks`).Scan(&count); err != nil {
+			t.Fatalf("count acks: %v", err)
+		}
+		return count
+	}
+	if err := newSentinel().RunDue(ctx); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	first, ok := readNotices()
+	if !ok || len(first.Notices) != 1 {
+		t.Fatalf("first cache = %#v, ok = %v; want one notice", first, ok)
+	}
+	var noticedAt time.Time
+	for _, finding := range first.Notices {
+		noticedAt = finding.NoticedAt
+	}
+	if noticedAt.IsZero() {
+		t.Fatal("first notice carries no noticed-at date")
+	}
+	if len(notifier.events) != 1 {
+		t.Fatalf("events after first sweep = %d, want exactly one", len(notifier.events))
+	}
+	items, err := newSentinel().SnapshotItems(ctx, nil)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("inbox after first sweep = %#v, %v; want one notice", items, err)
+	}
+	applied, err := newSentinel().AcknowledgeRetraction(ctx, items[0].ID)
+	if err != nil || !applied {
+		t.Fatalf("acknowledge library notice = %v, %v", applied, err)
+	}
+	if got := ackCount(); got != 1 {
+		t.Fatalf("acks after acknowledge = %d, want 1", got)
+	}
+
+	// Sweep 2 reads the export while it is truncated to zero bytes.
+	if err := os.WriteFile(exportPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(25 * time.Hour)
+	if err := newSentinel().RunDue(ctx); err != nil {
+		t.Fatalf("truncated sweep: %v", err)
+	}
+	second, ok := readNotices()
+	if !ok || len(second.Notices) != 1 {
+		t.Fatalf("truncated cache = %#v, ok = %v; want the previous notice kept", second, ok)
+	}
+	if second.LastFetchError == "" {
+		t.Fatal("truncated sweep recorded no fetch error, so doctor would still pass")
+	}
+	if got := ackCount(); got != 1 {
+		t.Fatalf("acks after truncated sweep = %d, want the acknowledgement kept", got)
+	}
+	if items, err := newSentinel().SnapshotItems(ctx, nil); err != nil || len(items) != 0 {
+		t.Fatalf("inbox after truncated sweep = %#v, %v; want nothing (still acknowledged)", items, err)
+	}
+	if len(notifier.events) != 1 {
+		t.Fatalf("events after truncated sweep = %d, want no re-notification", len(notifier.events))
+	}
+
+	// Sweep 3 reads the restored export: the notice returns without a new
+	// notification and keeps its original noticed-at date.
+	if err := os.WriteFile(exportPath, []byte(exportBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(25 * time.Hour)
+	if err := newSentinel().RunDue(ctx); err != nil {
+		t.Fatalf("restored sweep: %v", err)
+	}
+	third, ok := readNotices()
+	if !ok || len(third.Notices) != 1 {
+		t.Fatalf("restored cache = %#v, ok = %v; want one notice", third, ok)
+	}
+	for _, finding := range third.Notices {
+		if !finding.NoticedAt.Equal(noticedAt) {
+			t.Fatalf("restored NoticedAt = %v, want the original %v", finding.NoticedAt, noticedAt)
+		}
+	}
+	if len(notifier.events) != 1 {
+		t.Fatalf("events after restored sweep = %d, want no re-notification of an acknowledged notice", len(notifier.events))
+	}
+}

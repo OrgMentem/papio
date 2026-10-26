@@ -1022,3 +1022,80 @@ func TestCloseDoesNotWaitForAStalledReadOrRestartIt(t *testing.T) {
 		t.Fatalf("readers started = %d, want the single stuck one", got)
 	}
 }
+
+// Holdings input without a configured format never means JSONL: blank input
+// is an empty library, a `%`-comment-headed BibTeX export still detects, and
+// anything else undetectable fails closed naming the fix instead of jsonl.
+func TestHoldingsFormatDetectedWithoutConfiguredFormat(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	unformatted := func(name, path string) *fileProvider {
+		t.Helper()
+		provider, err := NewProvider(config.LibrarySource{
+			Name: name, Kind: config.LibraryKindFile, Path: path,
+			Claim: config.LibraryClaimRecordPresent,
+		}, time.Now)
+		if err != nil {
+			t.Fatalf("NewProvider: %v", err)
+		}
+		return provider.(*fileProvider)
+	}
+
+	blank := writeFile(t, dir, "export", "  \n")
+	if _, health := unformatted("blank", blank).Lookup(ctx, []ownership.Query{doiQuery("10.1000/one")}); !health.Complete || health.EntryCount != 0 || health.FailureCode != "" {
+		t.Fatalf("blank health = %+v, want a complete empty library", health)
+	}
+
+	commented := writeFile(t, dir, "refs", "% Encoding: UTF-8\n"+oneEntryBibTeX("10.1000/one"))
+	claims, health := unformatted("commented", commented).Lookup(ctx, []ownership.Query{doiQuery("10.1000/one")})
+	if !health.Complete {
+		t.Fatalf("commented health = %+v, want a complete detected load", health)
+	}
+	if len(claims[0]) != 1 {
+		t.Fatalf("commented claims = %+v, want the BibTeX entry past its header", claims)
+	}
+
+	gibberish := writeFile(t, dir, "notes", "just some words\n")
+	if _, health := unformatted("gibberish", gibberish).Lookup(ctx, []ownership.Query{doiQuery("10.1000/one")}); health.Complete || health.FailureCode != ownership.FailureParse {
+		t.Fatalf("gibberish health = %+v, want an incomplete parse failure", health)
+	}
+	if _, err := EnumerateBibliographicRecords(ctx, fileSource(gibberish, "")); err == nil || !strings.Contains(err.Error(), "cannot detect format") || strings.Contains(err.Error(), "jsonl") {
+		t.Fatalf("gibberish error = %v; want a cannot-detect-format error, not a jsonl one", err)
+	}
+}
+
+// The file provider has its own refresh path, separate from commandProvider:
+// a restart must not erase its protection against a cleanly parsed fragment.
+func TestFileCollapseBaselineSurvivesProviderRestart(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	path := writeFile(t, t.TempDir(), "library.bib", sourceRecordsWithOneDOI(100))
+	source := fileSource(path, "bibtex")
+	queries := []ownership.Query{doiQuery("10.1000/one")}
+	first, err := NewProviderWithDataDir(source, time.Now, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, health := first.Lookup(ctx, queries); !health.Complete || health.EntryCount != 100 {
+		t.Fatalf("initial health = %+v, want 100 complete entries", health)
+	}
+	if err := first.(*fileProvider).Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte(oneEntryBibTeX("10.1000/one")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewProviderWithDataDir(source, time.Now, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = restarted.(*fileProvider).Close() }()
+	claims, health := restarted.Lookup(ctx, queries)
+	if health.Complete || health.FailureCode != ownership.FailureCountCollapse {
+		t.Fatalf("restart health = %+v, want incomplete count_collapse", health)
+	}
+	if len(claims[0]) != 0 {
+		t.Fatalf("restart claims = %+v, want none from the rejected fragment", claims)
+	}
+}

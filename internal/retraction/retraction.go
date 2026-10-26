@@ -48,6 +48,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/notify"
+	"papio/internal/ownershipsnapshot"
 	"papio/internal/resolver"
 	"papio/internal/store"
 	"papio/internal/triage"
@@ -208,28 +209,64 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		return nil
 	}
 
-	corpus, libraryIncomplete, err := s.corpusWorks(ctx)
+	corpus, libraryIncomplete, libraryCount, libraryErr, err := s.corpusWorks(ctx)
 	if err != nil {
 		return err
 	}
 	previous := validNotices(cached.Notices)
+	prevLibraryCount := 0
+	if ok {
+		prevLibraryCount = cached.LibraryCount
+	}
+
+	// A collapsed export remains incomplete until consecutive complete reads
+	// report the same smaller count over at least 72 hours. Restored exports,
+	// different counts, and failed enumerations reset this persisted window.
+	collapse := cached.LibraryCollapse
+	cached.LibraryCollapse = ownershipsnapshot.CollapseObservation{}
+	if libraryErr == nil && !libraryIncomplete && s.scope == config.RetractionScopeLibrary && s.libraryDOIs != nil && ok {
+		isCollapse := (libraryCount == 0 && prevLibraryCount > 0) ||
+			(prevLibraryCount >= libraryCountCollapseFloor && libraryCount*10 < prevLibraryCount)
+		if isCollapse && !collapse.Accept(libraryCount, now) {
+			cached.LibraryCollapse = collapse
+			libraryErr = fmt.Errorf("retraction: library enumeration collapsed from %d to %d DOIs; awaiting 72 hours of consistent reads", prevLibraryCount, libraryCount)
+		}
+	}
+	if libraryErr != nil {
+		libraryIncomplete = true
+	}
+
 	current := make(map[string]Finding)
 	addCurrent := func(finding Finding) {
 		if prior, exists := current[finding.DOI]; !exists || prefer(finding, prior) {
 			current[finding.DOI] = finding
 		}
 	}
+
 	var lastFetchErr error
+	if libraryErr != nil {
+		lastFetchErr = libraryErr
+	}
 	if len(corpus) != 0 {
 		if err := s.budgets.Acquire(ctx, config.SourceRetractionWatch, s.policy, 0); err != nil {
-			return fmt.Errorf("retraction: acquire Retraction Watch budget: %w", err)
+			budgetErr := fmt.Errorf("retraction: acquire Retraction Watch budget: %w", err)
+			// Enumeration already changed the collapse observation. Preserve
+			// that change even when the budget prevents the dataset lookup.
+			s.recordFetchFailure(cached, ok, now, budgetErr)
+			return budgetErr
 		}
 		updates, sourceErr, lookupErr := s.lookup(ctx, corpus)
 		if lookupErr != nil {
 			s.recordFetchFailure(cached, ok, now, lookupErr)
 			return lookupErr
 		}
-		lastFetchErr = sourceErr
+		if sourceErr != nil {
+			if lastFetchErr != nil {
+				lastFetchErr = fmt.Errorf("%w; %w", lastFetchErr, sourceErr)
+			} else {
+				lastFetchErr = sourceErr
+			}
+		}
 		for doi, records := range updates {
 			local := corpus[doi]
 			for _, update := range records {
@@ -264,6 +301,17 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 	notices := make(map[string]Finding, len(findings))
 	for _, finding := range findings {
 		notices[findingKey(finding)] = finding
+	}
+	if libraryIncomplete && ok {
+		// The enumeration is partial: an empty read, a collapse, or a page
+		// bound. Previously published notices stay current rather than
+		// vanishing with the unread half of the library; their delivery
+		// markers below keep them from re-notifying.
+		for key, finding := range previous {
+			if _, exists := notices[key]; !exists {
+				notices[key] = finding
+			}
+		}
 	}
 
 	s.mu.Lock()
@@ -315,6 +363,14 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		repairScanID = scanID
 	}
 	nextCache := cache{Version: cacheVersion, CheckedAt: now, ScanID: scanID, Notices: notices, Notified: nextNotified, Truncated: truncated}
+	nextCache.LibraryCollapse = cached.LibraryCollapse
+	if !libraryIncomplete && s.scope == config.RetractionScopeLibrary && s.libraryDOIs != nil {
+		// Accept the smaller baseline only after the confirmation window;
+		// transient truncations never replace the last good count.
+		nextCache.LibraryCount = libraryCount
+	} else if ok {
+		nextCache.LibraryCount = prevLibraryCount
+	}
 	if lastFetchErr != nil {
 		nextCache.LastFetchError = boundedFetchError(lastFetchErr)
 		nextCache.LastFetchErrorAt = now
@@ -323,9 +379,13 @@ func (s *Sentinel) RunDue(ctx context.Context) error {
 		s.mu.Unlock()
 		return fmt.Errorf("retraction: write cache: %w", err)
 	}
-	if err := s.pruneAcks(ctx, notices); err != nil {
-		s.mu.Unlock()
-		return err
+	if !truncated {
+		// A partial enumeration cannot tell a resolved notice from an unread
+		// one, so its acknowledgements stay until a complete sweep decides.
+		if err := s.pruneAcks(ctx, notices); err != nil {
+			s.mu.Unlock()
+			return err
+		}
 	}
 	s.mu.Unlock()
 	if len(repair) > 0 {
@@ -671,21 +731,30 @@ type libraryTruncationReporter interface {
 	libraryTruncated() bool
 }
 
-func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, bool, error) {
+// libraryCountCollapseFloor is the smallest previous library count at which a
+// sudden collapse reads as a torn export rather than an ordinary edit. Below
+// it, a large proportional drop is unremarkable. It mirrors the holdings
+// collapse floor in internal/ownershipsnapshot.
+const libraryCountCollapseFloor = 20
+
+// corpusWorks merges the ready jobs with every library DOI. A library
+// enumeration failure is not fatal: the ready corpus still sweeps, and the
+// caller keeps the previous notices for the unread half of the library.
+func (s *Sentinel) corpusWorks(ctx context.Context) (corpus map[string]readyWork, libraryIncomplete bool, libraryCount int, libraryErr error, err error) {
 	ready, err := s.readyWorks(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, nil, err
 	}
-	corpus := make(map[string]readyWork, len(ready))
+	corpus = make(map[string]readyWork, len(ready))
 	for _, item := range ready {
 		corpus[item.DOI] = item
 	}
 	if s.scope != config.RetractionScopeLibrary || s.libraryDOIs == nil {
-		return corpus, false, nil
+		return corpus, false, 0, nil, nil
 	}
 	dois, err := s.libraryDOIs.LibraryDOIs(ctx)
 	if err != nil {
-		return nil, false, fmt.Errorf("retraction: enumerate library DOIs: %w", err)
+		return corpus, true, 0, fmt.Errorf("retraction: enumerate library DOIs: %w", err), nil
 	}
 	titles, _ := s.libraryDOIs.(libraryDOITitleProvider)
 	for _, raw := range dois {
@@ -701,11 +770,11 @@ func (s *Sentinel) corpusWorks(ctx context.Context) (map[string]readyWork, bool,
 			corpus[doi] = readyWork{DOI: doi, Title: title}
 		}
 	}
-	incomplete := false
+	libraryCount = len(dois)
 	if reporter, ok := s.libraryDOIs.(libraryTruncationReporter); ok {
-		incomplete = reporter.libraryTruncated()
+		libraryIncomplete = reporter.libraryTruncated()
 	}
-	return corpus, incomplete, nil
+	return corpus, libraryIncomplete, libraryCount, nil, nil
 }
 
 type update struct {
@@ -1136,6 +1205,12 @@ type cache struct {
 	// Truncated marks a sweep whose findings exceeded maxNotices, so Notices
 	// is not the complete set and must never authorise removing a tag.
 	Truncated bool `json:"truncated,omitempty"`
+	// LibraryCount is the library DOI count of the last complete library
+	// enumeration. The next sweep treats an empty or sharply collapsed
+	// enumeration against it as an incomplete read, so a half-written export
+	// keeps the previous notices instead of deleting them.
+	LibraryCount    int                                   `json:"library_count,omitempty"`
+	LibraryCollapse ownershipsnapshot.CollapseObservation `json:"library_collapse"`
 }
 
 func (s *Sentinel) cachePath() string {

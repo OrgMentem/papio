@@ -61,6 +61,14 @@ type commandProvider struct {
 	owner  context.Context
 	cancel context.CancelFunc
 	closed bool
+
+	// persistDir is the daemon data directory holding the last good entry
+	// count. It seeds the collapse guard until the first successful run,
+	// when the in-memory previous snapshot is still nil.
+	persistDir    string
+	baselineCount int
+	hasBaseline   bool
+	collapse      CollapseObservation
 }
 
 // commandSettings resolves the argv and bounds shared by the provider and by
@@ -86,13 +94,13 @@ func commandSettings(source config.LibrarySource) ([]string, config.LibraryComma
 	return argv, limits, nil
 }
 
-func newCommandProvider(name string, source config.LibrarySource, artifact string, now func() time.Time) (*commandProvider, error) {
+func newCommandProvider(name string, source config.LibrarySource, artifact string, now func() time.Time, dataDir string) (*commandProvider, error) {
 	argv, limits, err := commandSettings(source)
 	if err != nil {
 		return nil, fmt.Errorf("library source %q: %w", name, err)
 	}
 	owner, cancel := context.WithCancel(context.Background())
-	return &commandProvider{
+	provider := &commandProvider{
 		name:     name,
 		argv:     argv,
 		format:   bibparse.Format(source.Format),
@@ -101,7 +109,10 @@ func newCommandProvider(name string, source config.LibrarySource, artifact strin
 		now:      now,
 		owner:    owner,
 		cancel:   cancel,
-	}, nil
+	}
+	provider.persistDir = dataDir
+	provider.baselineCount, provider.hasBaseline, provider.collapse = loadHoldingsBaseline(dataDir, name)
+	return provider, nil
 }
 
 // Close stops the provider: it kills a running command's process tree, waits
@@ -190,14 +201,16 @@ func (p *commandProvider) begin() (*pendingRefresh, *snapshot, string) {
 	p.pending = pend
 	p.runs++
 	previous := p.current
+	baselineCount, hasBaseline := p.baselineCount, p.hasBaseline
 	// The run belongs to the provider, not to this waiter: an abandoned wait
 	// cannot cancel the run later lookups are already sharing, while Close and
 	// the command's own timeout still bound it.
 	go func() {
-		snap, failure := p.run(p.owner, previous)
+		snap, failure := p.run(p.owner, previous, baselineCount, hasBaseline)
 		p.mu.Lock()
 		if failure == "" {
 			p.current, p.failure, p.failedAt = snap, "", time.Time{}
+			p.baselineCount, p.hasBaseline = snap.entryCount, true
 			pend.snap, pend.complete = snap, true
 		} else {
 			p.failure, p.failedAt = failure, p.now()
@@ -211,8 +224,17 @@ func (p *commandProvider) begin() (*pendingRefresh, *snapshot, string) {
 }
 
 // run executes the command once and indexes its stdout. It publishes nothing:
-// the caller decides what a success or failure changes.
-func (p *commandProvider) run(ctx context.Context, previous *snapshot) (*snapshot, string) {
+// the caller decides what a success or failure changes. The baseline seeds
+// the collapse comparison until the first successful run, when previous is
+// still nil.
+func (p *commandProvider) run(ctx context.Context, previous *snapshot, baselineCount int, hasBaseline bool) (*snapshot, string) {
+	keepObservation := false
+	defer func() {
+		if !keepObservation && p.collapse.Since != "" {
+			p.collapse = CollapseObservation{}
+			saveHoldingsBaseline(p.persistDir, p.name, baselineCount, p.collapse)
+		}
+	}()
 	data, failure := runCommand(ctx, p.argv, p.limits.Timeout, p.limits.MaxOutputBytes)
 	if failure != "" {
 		return nil, failure
@@ -221,11 +243,19 @@ func (p *commandProvider) run(ctx context.Context, previous *snapshot) (*snapsho
 	if failure != "" {
 		return nil, failure
 	}
-	if collapsed(previous, len(records)) {
-		// A command killed mid-export can exit cleanly with a fraction of the
-		// library; accepting it would quietly disable de-duplication.
+	collapseBase := previous
+	if collapseBase == nil || collapseBase.entryCount < collapseFloor {
+		if hasBaseline && baselineCount >= collapseFloor {
+			collapseBase = &snapshot{entryCount: baselineCount}
+		}
+	}
+	if collapsed(collapseBase, len(records)) && !p.collapse.Accept(len(records), p.now()) {
+		keepObservation = true
+		saveHoldingsBaseline(p.persistDir, p.name, collapseBase.entryCount, p.collapse)
 		return nil, ownership.FailureCountCollapse
 	}
+	p.collapse = CollapseObservation{}
+	saveHoldingsBaseline(p.persistDir, p.name, len(records), p.collapse)
 	return &snapshot{
 		index:      ownership.BuildIndex(entriesFromRecords(records, p.artifact)),
 		loadedAt:   p.now(),

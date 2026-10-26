@@ -11,7 +11,10 @@
 package ownershipsnapshot
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -57,6 +60,20 @@ const collapseFloor = 20
 // "file" or "command". A PDF-folder scanner is planned (ADR-0008); unknown
 // kinds are rejected here rather than silently ignored.
 func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.Provider, error) {
+	return newFileBackedProvider(source, now, "")
+}
+
+// NewProviderWithDataDir builds the holdings provider for one configured
+// source and persists its last good entry count in the data directory, so the
+// count-collapse guard survives a daemon restart. The first refresh after a
+// restart then rejects a truncated export instead of publishing it as the
+// whole library. A missing or damaged baseline file only weakens that first
+// guard; lookups still answer from the freshly read export.
+func NewProviderWithDataDir(source config.LibrarySource, now func() time.Time, dataDir string) (ownership.Provider, error) {
+	return newFileBackedProvider(source, now, dataDir)
+}
+
+func newFileBackedProvider(source config.LibrarySource, now func() time.Time, dataDir string) (ownership.Provider, error) {
 	if now == nil {
 		now = time.Now
 	}
@@ -71,7 +88,7 @@ func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.P
 	switch source.Kind {
 	case config.LibraryKindFile:
 	case config.LibraryKindCommand:
-		provider, err := newCommandProvider(name, source, artifact, now)
+		provider, err := newCommandProvider(name, source, artifact, now, dataDir)
 		if err != nil {
 			return nil, err
 		}
@@ -85,7 +102,7 @@ func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.P
 	}
 	empty := &snapshot{index: ownership.BuildIndex(nil)}
 	owner, cancel := context.WithCancel(context.Background())
-	return &fileProvider{
+	provider := &fileProvider{
 		name:     name,
 		path:     path,
 		format:   bibparse.Format(source.Format),
@@ -97,7 +114,10 @@ func NewProvider(source config.LibrarySource, now func() time.Time) (ownership.P
 		identity: fileIdentity,
 		owner:    owner,
 		cancel:   cancel,
-	}, nil
+	}
+	provider.persistDir = dataDir
+	provider.baselineCount, provider.hasBaseline, provider.collapse = loadHoldingsBaseline(dataDir, name)
+	return provider, nil
 }
 
 // expandHome mirrors config's normalization so callers that construct a
@@ -207,6 +227,14 @@ type fileProvider struct {
 	owner  context.Context
 	cancel context.CancelFunc
 	closed bool
+
+	// persistDir is the daemon data directory holding the last good entry
+	// count. It seeds the collapse guard on the first refresh after a
+	// restart, when the in-memory previous index is still the empty starter.
+	persistDir    string
+	baselineCount int
+	hasBaseline   bool
+	collapse      CollapseObservation
 }
 
 // pendingRefresh is one filesystem refresh shared by every Lookup that
@@ -354,6 +382,13 @@ func (p *fileProvider) currentSnapshot() *snapshot {
 // nil.
 func (p *fileProvider) refreshSnapshot(ctx context.Context) (*snapshot, bool, string) {
 	previous := p.currentSnapshot()
+	keepObservation := false
+	defer func() {
+		if !keepObservation && p.collapse.Since != "" {
+			p.collapse = CollapseObservation{}
+			saveHoldingsBaseline(p.persistDir, p.name, p.baselineCount, p.collapse)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return previous, false, ownership.FailureTimeout
 	}
@@ -428,10 +463,18 @@ func (p *fileProvider) refreshSnapshot(ctx context.Context) (*snapshot, bool, st
 	}
 	index := ownership.BuildIndex(entriesFromRecords(records, p.artifact))
 
-	if collapsed(previous, len(records)) {
-		// A truncated or half-written export parses cleanly and simply contains
-		// less. Accepting it would quietly disable de-duplication.
-		return previous, false, ownership.FailureCountCollapse
+	// The in-memory previous index is the empty starter until the first
+	// successful refresh, so after a restart only the persisted baseline can
+	// still recognise a truncated export. It seeds the comparison, never the
+	// claims: a collapsed read keeps answering from the starter index.
+	collapseBase := previous
+	if collapseBase == nil || collapseBase.entryCount < collapseFloor {
+		p.mu.RLock()
+		baselineCount, hasBaseline := p.baselineCount, p.hasBaseline
+		p.mu.RUnlock()
+		if hasBaseline && baselineCount >= collapseFloor {
+			collapseBase = &snapshot{entryCount: baselineCount}
+		}
 	}
 
 	// Parsing is deliberately finished before the last pathname check: a
@@ -440,6 +483,12 @@ func (p *fileProvider) refreshSnapshot(ctx context.Context) (*snapshot, bool, st
 	if failure := p.pathStillMatches(ctx, after, data); failure != "" {
 		return previous, false, failure
 	}
+	if collapsed(collapseBase, len(records)) && !p.collapse.Accept(len(records), p.now()) {
+		keepObservation = true
+		saveHoldingsBaseline(p.persistDir, p.name, collapseBase.entryCount, p.collapse)
+		return previous, false, ownership.FailureCountCollapse
+	}
+	p.collapse = CollapseObservation{}
 
 	next := &snapshot{
 		index:      index,
@@ -447,27 +496,132 @@ func (p *fileProvider) refreshSnapshot(ctx context.Context) (*snapshot, bool, st
 		loadedAt:   p.now(),
 		entryCount: len(records),
 	}
+	saveHoldingsBaseline(p.persistDir, p.name, len(records), p.collapse)
 	p.mu.Lock()
 	p.current = next
+	p.baselineCount, p.hasBaseline = len(records), true
 	p.mu.Unlock()
 	return next, true, ""
 }
 
 // parseHoldings decodes one export with the tolerant holdings rules shared by
 // every loader. An empty format is detected from pathHint (empty for command
-// output) and content. A structural parse error is FailureParse; a library
-// with no entries is a real, successfully read state — someone who has just
-// started — and must stay distinguishable from a source papio could not read.
-// Acquisition treats the same input as an error; holdings does not.
+// output) and content, without the batch JSONL default: holdings can never be
+// JSONL, so blank input is an empty library and undetectable content is a
+// parse failure rather than a misleading jsonl error. A structural parse
+// error is FailureParse; a library with no entries is a real, successfully
+// read state — someone who has just started — and must stay distinguishable
+// from a source papio could not read. Acquisition treats the same input as an
+// error; holdings does not.
 func parseHoldings(format bibparse.Format, pathHint string, data []byte) ([]bibparse.Record, string) {
 	if strings.TrimSpace(string(format)) == "" {
-		format = bibparse.Detect(pathHint, data)
+		if isBlankExport(data) {
+			return nil, ""
+		}
+		detected := bibparse.Detect(pathHint, stripLeadingBibTeXComments(data))
+		if detected == bibparse.FormatJSONL {
+			return nil, ownership.FailureParse
+		}
+		format = detected
 	}
 	records, err := bibparse.ParseRecords(format, data)
 	if err != nil && !errors.Is(err, bibparse.ErrNoEntries) {
 		return nil, ownership.FailureParse
 	}
 	return records, ""
+}
+
+// isBlankExport reports input with no content to classify. Only callers with
+// no configured format reach for it: an explicitly formatted blank export
+// already parses to zero records through its own parser.
+func isBlankExport(data []byte) bool {
+	return len(bytes.Trim(data, " \t\r\n\ufeff")) == 0
+}
+
+// stripLeadingBibTeXComments drops leading `%`-to-end-of-line comments so a
+// BibTeX export with an encoding header still sniffs as BibTeX. Only leading
+// lines are comments: a `%` later in the file belongs to the entries.
+func stripLeadingBibTeXComments(data []byte) []byte {
+	rest := bytes.TrimLeft(data, " \t\r\n\ufeff")
+	for len(rest) > 0 && rest[0] == '%' {
+		i := bytes.IndexByte(rest, '\n')
+		if i < 0 {
+			return nil
+		}
+		rest = bytes.TrimLeft(rest[i+1:], " \t\r\n\ufeff")
+	}
+	return rest
+}
+
+// holdingsBaselineVersion versions the per-source last-good count files in the
+// data directory.
+const holdingsBaselineVersion = 1
+
+// holdingsBaseline persists one source's last good entry count across daemon
+// restarts. Only the count is needed: it seeds the collapse comparison, never
+// the claims, so a stale or foreign file cannot suppress an acquisition.
+type holdingsBaseline struct {
+	Version    int                 `json:"version"`
+	Source     string              `json:"source"`
+	EntryCount int                 `json:"entry_count"`
+	Collapse   CollapseObservation `json:"collapse"`
+}
+
+func holdingsBaselinePath(dataDir, name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return filepath.Join(dataDir, fmt.Sprintf("library-holdings-%x.json", sum))
+}
+
+func loadHoldingsBaseline(dataDir, name string) (int, bool, CollapseObservation) {
+	if strings.TrimSpace(dataDir) == "" {
+		return 0, false, CollapseObservation{}
+	}
+	data, err := os.ReadFile(holdingsBaselinePath(dataDir, name))
+	if err != nil {
+		return 0, false, CollapseObservation{}
+	}
+	var baseline holdingsBaseline
+	if err := json.Unmarshal(data, &baseline); err != nil {
+		return 0, false, CollapseObservation{}
+	}
+	if baseline.Version != holdingsBaselineVersion || baseline.Source != name || baseline.EntryCount < 0 {
+		return 0, false, CollapseObservation{}
+	}
+	return baseline.EntryCount, true, baseline.Collapse
+}
+
+func saveHoldingsBaseline(dataDir, name string, count int, observation CollapseObservation) {
+	if strings.TrimSpace(dataDir) == "" || count < 0 {
+		return
+	}
+	data, err := json.Marshal(holdingsBaseline{Version: holdingsBaselineVersion, Source: name, EntryCount: count, Collapse: observation})
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return
+	}
+	if err := os.Chmod(dataDir, 0o700); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(dataDir, ".library-holdings-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(tmpName, holdingsBaselinePath(dataDir, name))
 }
 
 // entriesFromRecords indexes each record's DOI, arXiv, and PMID identifiers

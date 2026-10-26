@@ -354,6 +354,13 @@ The default preserves the earlier job-scoped behavior. An upgrade does not
 silently disclose a wider DOI corpus. This strict-mode section requires a
 daemon version that recognizes it.
 
+An empty or sharply reduced library export can indicate an unfinished write.
+The sweep keeps earlier notices and acknowledgements while it confirms the
+smaller size. Consecutive complete reads must report the same smaller DOI count
+over at least 72 hours before the sweep accepts it. A restored export, a
+different count, or an enumeration failure resets that window. The cache keeps
+the confirmation state across daemon restarts.
+
 ## `[zotio]`
 
 | Key | Type | Default | Effect and constraints |
@@ -429,6 +436,13 @@ acquisition. After a failure, *papio* waits up to 30 seconds (or
 `refresh_seconds`, if shorter) before it runs the command again. When the last
 successful run is older than `refresh_seconds` plus 15 minutes, its results are
 no longer shown at all.
+
+Both file and command sources keep their last good entry count in `data_dir`.
+A drop below one tenth of a previous count of at least 20 entries makes the
+source incomplete. This protects against truncated exports even after a
+restart. An intentional reduction becomes complete after consecutive successful
+reads report the same smaller count over at least 72 hours. A restored export,
+a different count, or a failed read resets that confirmation window.
 
 Matching is exact on identifiers represented by the source format. No format
 supports every identifier, and titles are never matched. ISBN is excluded,

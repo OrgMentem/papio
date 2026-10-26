@@ -84,7 +84,7 @@ func defaultDoctorDependencies(opt *options) doctor.IntegrationDependencies {
 func probeLibrarySources(ctx context.Context, cfg config.Config) ([]doctor.LibrarySourceStatus, error) {
 	statuses := make([]doctor.LibrarySourceStatus, 0, len(cfg.Library.Sources))
 	for _, source := range cfg.Library.Sources {
-		provider, err := ownershipsnapshot.NewProvider(source, time.Now)
+		provider, err := ownershipsnapshot.NewProviderWithDataDir(source, time.Now, cfg.DataDir)
 		if err != nil {
 			statuses = append(statuses, doctor.LibrarySourceStatus{Name: source.Name, FailureCode: "not_configured"})
 			continue
