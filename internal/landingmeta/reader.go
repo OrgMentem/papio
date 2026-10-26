@@ -9,6 +9,11 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"papio/internal/resolver"
 )
 
 // readerUserAgent identifies this fetch to the publisher landing page. It is
@@ -47,14 +52,11 @@ func NewReader(client HTTPClient, maxBytes int64) *Reader {
 	return &Reader{client: client, maxBytes: maxBytes}
 }
 
-// PDFURLFor fetches landingURL and returns the citation_pdf_url it
-// advertises. Returns ("", nil) when the page advertises none, when
-// landingURL itself is unusable (not https, unparseable, non-HTML,
-// non-2xx), or when the page could only be read up to the byte cap — none
-// of those are the caller's problem, they just mean "no PDF found here." A
-// genuine transport failure (DNS, TLS, connection refused, ...) returns a
-// non-nil error; a conflicting pair of citation_pdf_url tags on the page
-// returns ErrConflictingPDFURL, unchanged from PDFURL.
+// PDFURLFor fetches landingURL and returns the citation_pdf_url it advertises.
+// An unusable URL, permanent HTTP failure, non-HTML response, or page without
+// a usable tag returns ("", nil). Transport failures and HTTP 408/429/5xx
+// return a resolver.TemporaryError so the caller can retry the landing page.
+// Conflicting citation_pdf_url tags return ErrConflictingPDFURL.
 func (r *Reader) PDFURLFor(ctx context.Context, landingURL string) (string, error) {
 	parsed, err := url.Parse(landingURL)
 	if err != nil || parsed.Scheme != "https" {
@@ -83,7 +85,7 @@ func (r *Reader) PDFURLFor(ctx context.Context, landingURL string) (string, erro
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("landingmeta: fetch %s: %w", landingURL, err)
+		return "", &resolver.TemporaryError{Err: fmt.Errorf("landingmeta: fetch %s: %w", landingURL, err)}
 	}
 	if resp == nil {
 		return "", fmt.Errorf("landingmeta: empty HTTP response for %s", landingURL)
@@ -93,6 +95,13 @@ func (r *Reader) PDFURLFor(ctx context.Context, landingURL string) (string, erro
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode >= 500 && resp.StatusCode <= 599) {
+		return "", &resolver.TemporaryError{
+			Err:        fmt.Errorf("landingmeta: returned HTTP %d", resp.StatusCode),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", nil
 	}
@@ -122,11 +131,12 @@ func (r *Reader) PDFURLFor(ctx context.Context, landingURL string) (string, erro
 	// citation_pdf_url lives in <head>, and PDFURL stops scanning at </head>
 	// regardless, so truncating here at maxBytes never costs us the tag —
 	// it only ever cuts off body content PDFURL wasn't going to look at.
-	// Read errors (a connection dropped mid-response) are treated the same
-	// way as hitting the cap: parse whatever bytes arrived and return
-	// whatever they advertise, rather than failing a fetch that may have
-	// already delivered the one tag we needed.
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, r.maxBytes))
+	// A failed read is not evidence that the page advertises no PDF. Retry
+	// the complete page rather than accept an incomplete set of head tags.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, r.maxBytes))
+	if err != nil {
+		return "", &resolver.TemporaryError{Err: fmt.Errorf("landingmeta: read response: %w", err)}
+	}
 
 	// Resolve against the FINAL URL, not landingURL. resp.Request.URL is the
 	// URL of the last request actually sent, i.e. post-redirect. This is
@@ -145,4 +155,18 @@ func (r *Reader) PDFURLFor(ctx context.Context, landingURL string) (string, erro
 	}
 
 	return PDFURL(body, baseURL)
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds >= 0 {
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds > int64(maxDuration/time.Second) {
+			return maxDuration
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil && when.After(now) {
+		return when.Sub(now)
+	}
+	return 0
 }

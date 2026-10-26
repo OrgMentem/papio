@@ -433,7 +433,7 @@ func safeEvidenceValue(value string) string {
 func decodeBoundedJSON(body io.Reader, max int64, destination any) error {
 	payload, err := io.ReadAll(io.LimitReader(body, max+1))
 	if err != nil {
-		return err
+		return &resolver.TemporaryError{Err: err}
 	}
 	if int64(len(payload)) > max {
 		return errors.New("response exceeds size limit")

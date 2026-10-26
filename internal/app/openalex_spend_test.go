@@ -745,21 +745,21 @@ func TestCrossrefNeverAnonymous(t *testing.T) {
 	}
 }
 
-// A candidate's bearer URL is a third-party file host, not the OpenAlex API:
-// that site keeps reserving and deferring under the bare source name.
-func TestCandidateDownloadStaysBareSource(t *testing.T) {
+// A file host's failure must not close the metadata API for unrelated jobs.
+func TestCandidateDownloadDoesNotDeferSourceAPI(t *testing.T) {
 	svc, jobs := newTestService(t)
 	ctx := context.Background()
 	svc.RetryDelay = time.Millisecond
 	svc.Budgets = budget.New(jobs.S)
 	keyed := config.Source{Enabled: true, APIKey: "private-key"}
 	svc.Config.Sources[config.SourceOpenAlex] = keyed
-	svc.Resolvers = []ResolverEntry{{Adapter: &fakeResolver{name: config.SourceOpenAlex, cands: []resolver.Candidate{{
+	adapter := &fakeResolver{name: config.SourceOpenAlex, cands: []resolver.Candidate{{
 		Source: config.SourceOpenAlex, URL: "https://files.example/article.pdf", Version: resolver.VersionPublished,
 		AccessBasis: resolver.AccessOpen, ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
-	}}}, Policy: keyed}}
+	}}}
+	svc.Resolvers = []ResolverEntry{{Adapter: adapter, Policy: keyed}}
 	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
-		return fetch.Result{}, &fetch.Error{Class: fetch.ClassRetryable, HTTPStatus: 503, Msg: "host busy"}
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassRetryable, HTTPStatus: 503, RetryAfter: 2 * time.Hour, Msg: "host busy"}
 	}
 	svc.Validate = passValidation()
 	id, err := svc.Submit(ctx, doiRequest("wr_candidate_bare"))
@@ -777,8 +777,8 @@ func TestCandidateDownloadStaysBareSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bare.NextAllowedAt == nil {
-		t.Fatalf("bare-source snapshot = %+v, want the candidate retry deferred here", bare)
+	if bare.NextAllowedAt != nil {
+		t.Fatalf("bare-source snapshot = %+v, want no API gate from a file host's failure", bare)
 	}
 	quota, err := svc.Budgets.Snapshot(ctx, config.SourceOpenAlex+"_quota", keyed)
 	if err != nil {
@@ -793,6 +793,24 @@ func TestCandidateDownloadStaysBareSource(t *testing.T) {
 	}
 	if parked.State != job.StateRetryWait {
 		t.Fatalf("state = %s, want retry_wait after a retryable candidate failure", parked.State)
+	}
+	request := doiRequest("wr_candidate_other_work")
+	request.Identifiers.DOI = "10.1000/other-work"
+	secondID, err := svc.Submit(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := jobs.Get(ctx, secondID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.cands = nil
+	calls := adapter.calls
+	if err := svc.Process(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.calls != calls+1 {
+		t.Fatalf("resolver calls = %d, want %d: another job must reach the API", adapter.calls, calls+1)
 	}
 }
 
