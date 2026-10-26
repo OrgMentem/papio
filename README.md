@@ -395,7 +395,7 @@ any subcommand.
 <details>
 <summary>Top-level commands</summary>
 
-`acquire` · `actions` · `activity` · `adapter` · `artifacts` · `batch` · `bench` · `browser` · `bundle` · `config` · `daemon`
+`acquire` · `actions` · `activity` · `adapter` · `artifacts` · `batch` · `bench` · `browser` · `bundle` · `campaign` · `config` · `daemon`
 · `delivery` · `doctor` · `drive` · `export` · `failures` · `grabs` · `inbox` · `init` · `jobs` · `mcp` · `native-host` · `notify` · `pulse` · `search` · `status` · `stats`
 · `version` · `watch` · `zotio`
 
