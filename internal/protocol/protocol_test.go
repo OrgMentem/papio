@@ -1623,6 +1623,41 @@ func TestHandoffLinkRejectsInvalidWireShapes(t *testing.T) {
 	}
 }
 
+func TestAcquisitionBundleValidatesEntitlementRef(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(corpusDir(t, "valid"), "acquisition-bundle-v2-entitlement.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		ref  string
+		ok   bool
+	}{
+		{"omitted", "", true},
+		{"source", "entitlement:source:elsevier", true},
+		{"sha256", "entitlement:sha256:" + strings.Repeat("a", 64), true},
+		{"raw account", "raw-account-123", false},
+		{"short hash", "entitlement:sha256:abc", false},
+		{"proxy URL", "https://proxy.example/x", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bundle, err := DecodeAcquisitionBundle(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bundle.Candidate.Entitlement.EntitlementRef = tc.ref
+			err = bundle.Validate()
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("valid entitlement reference rejected: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "invalid candidate.entitlement.entitlement_ref") {
+				t.Fatalf("invalid entitlement reference: got %v, want entitlement_ref error", err)
+			}
+		})
+	}
+}
+
 // TestEntitlementWireShapeIsCaseInsensitive pins the fail-open a review found
 // in the guard itself. encoding/json matches struct fields case-insensitively,
 // so `"Entitlement": null` populates the decoded struct — while a raw map
