@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -412,7 +413,8 @@ func TestBrowserReloadPropagatesOutputFailure(t *testing.T) {
 
 func TestBrowserSessionsEmptyPointsAtTheNativeHostLog(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	root := NewInProcessRoot(&stdout, &stderr, config.Config{DataDir: "/data/papio"}, func(_ context.Context, _ string, _ any, result any) error {
+	dataDir := t.TempDir()
+	root := NewInProcessRoot(&stdout, &stderr, config.Config{DataDir: dataDir}, func(_ context.Context, _ string, _ any, result any) error {
 		*result.(*browserSessionsResult) = browserSessionsResult{}
 		return nil
 	})
@@ -420,7 +422,7 @@ func TestBrowserSessionsEmptyPointsAtTheNativeHostLog(t *testing.T) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("sessions: %v", err)
 	}
-	for _, want := range []string{"no browser is connected now", "/data/papio/native-host.log", "papio native-host status", "papio doctor"} {
+	for _, want := range []string{"no browser is connected now", filepath.Join(dataDir, "native-host.log"), "papio native-host status", "papio doctor"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
 		}

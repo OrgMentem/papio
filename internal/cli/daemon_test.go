@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"papio/internal/config"
 	"papio/internal/daemon"
+	"papio/internal/ipc"
 )
 
 // TestDaemonLeavesTheStoreToTheDaemonThatOwnsItsSocket pins the single
@@ -172,28 +174,30 @@ func TestDaemonStopReportsAnAlreadyStoppedDaemonAsSuccess(t *testing.T) {
 // TestDaemonControlSurfacesUnreachableSocketErrors pins that a dial error that
 // is not "no socket" or "refused" (here EACCES) is an error, not an absent daemon.
 func TestDaemonControlSurfacesUnreachableSocketErrors(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
-	}
 	dataDir := shortSocketDir(t)
-	locked := filepath.Join(dataDir, "locked")
-	if err := os.Mkdir(locked, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(locked, 0); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
-	socket := filepath.Join(locked, "papio.sock")
-	for _, sub := range []string{"stop", "status"} {
-		root, out, _ := daemonControlRoot(dataDir)
-		root.SetArgs([]string{"daemon", sub, "--socket", socket})
-		err := root.ExecuteContext(context.Background())
-		if err == nil {
-			t.Fatalf("daemon %s succeeded with output %q, want the dial error", sub, out.String())
-		}
-		if !errors.Is(err, fs.ErrPermission) {
-			t.Fatalf("daemon %s error = %v, want a permission error", sub, err)
+	socket := filepath.Join(dataDir, "papio.sock")
+	// A directory's POSIX mode cannot deny access to a Windows named pipe.
+	// Inject each transport's dial-error shape at the existing RPC boundary.
+	for _, dialErr := range []error{
+		&net.OpError{Op: "dial", Net: "unix", Err: fs.ErrPermission},
+		&os.PathError{Op: "open", Path: socket, Err: fs.ErrPermission},
+	} {
+		for _, sub := range []string{"stop", "status"} {
+			var out, errOut bytes.Buffer
+			want := ipc.Unreachable(fmt.Errorf("dial ipc daemon: %w", dialErr))
+			root := newRoot(&options{
+				out:          &out,
+				errOut:       &errOut,
+				configLoader: func(string) (config.Config, error) { return config.Config{DataDir: dataDir}, nil },
+				rpcCall: func(context.Context, string, string, any, any) error {
+					return want
+				},
+			})
+			root.SetArgs([]string{"daemon", sub, "--socket", socket})
+			err := root.ExecuteContext(context.Background())
+			if !errors.Is(err, want) || !errors.Is(err, fs.ErrPermission) {
+				t.Fatalf("daemon %s error = %v, output = %q; want the original permission error %v", sub, err, out.String(), want)
+			}
 		}
 	}
 }

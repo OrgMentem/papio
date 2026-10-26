@@ -86,7 +86,7 @@ func TestSaveBacksUpPreviousBytesBeforeReplacing(t *testing.T) {
 	}
 	wantBackup = BackupPath(filepath.Join(wantBackup, "config.toml"))
 	backup, err = SaveIfUnchangedWithBackup(cfg, path, snapshot)
-	if err != nil || backup != wantBackup {
+	if err != nil || (backup != wantBackup && !(runtime.GOOS == "windows" && strings.EqualFold(backup, wantBackup))) {
 		t.Fatalf("backup = %q, %v; want %q", backup, err, wantBackup)
 	}
 	if got := mustRead(t, backup); !bytes.Equal(got, old) {

@@ -122,17 +122,18 @@ func TestSupplyPDFRefusesInputBeforeCallingTheDaemon(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name  string
-		jobID string
-		path  string
-		want  string
+		name    string
+		jobID   string
+		path    string
+		want    string
+		wantErr error
 	}{
-		{"not a PDF", "job_01", notPDF, "not a PDF file"},
-		{"directory", "job_01", dir, "is a directory"},
-		{"symlink", "job_01", link, "symbolic link"},
-		{"oversized", "job_01", oversized, "fetch.max_bytes"},
-		{"missing", "job_01", filepath.Join(dir, "missing.pdf"), "no such file"},
-		{"job id escapes", "../escape", pdf, "invalid job id"},
+		{"not a PDF", "job_01", notPDF, "not a PDF file", nil},
+		{"directory", "job_01", dir, "is a directory", nil},
+		{"symlink", "job_01", link, "symbolic link", nil},
+		{"oversized", "job_01", oversized, "fetch.max_bytes", nil},
+		{"missing", "job_01", filepath.Join(dir, "missing.pdf"), "", os.ErrNotExist},
+		{"job id escapes", "../escape", pdf, "invalid job id", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := supplyPDFConfig(t, limit)
@@ -143,6 +144,9 @@ func TestSupplyPDFRefusesInputBeforeCallingTheDaemon(t *testing.T) {
 			})
 			root.SetArgs([]string{"jobs", "supply-pdf", tc.jobID, tc.path})
 			err := root.ExecuteContext(context.Background())
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("supply-pdf %s = %v; want %v", tc.path, err, tc.wantErr)
+			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("supply-pdf %s = %v; want an error naming %q", tc.path, err, tc.want)
 			}

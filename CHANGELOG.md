@@ -281,6 +281,10 @@ execution records kept during the initial build.
   task in the inbox no longer shows a `Diagnosis` line.
 
 ### Fixed
+- **Windows daemon controls explain a missing named pipe.** `papio daemon status`
+  reports that no daemon runs, or names the daemon's startup phase, instead of
+  returning a raw pipe error. `papio daemon stop` succeeds when no daemon runs
+  and explains when an existing daemon is still upgrading its database.
 - **`papio doctor` reports when missing adapter control blocks browser
   automation.** It no longer reports a passing check when the browser refuses
   automation, or advises deleting the control file. It also shows the age of

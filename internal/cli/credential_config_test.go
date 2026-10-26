@@ -920,14 +920,10 @@ func TestPendingCredentialJournalIsScopedToConfig(t *testing.T) {
 	if pendingCredentialPath(first) == pendingCredentialPath(second) {
 		t.Fatal("two configs share a pending credential journal")
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	relative, err := filepath.Rel(cwd, first)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Relative paths cannot cross Windows drive letters. Use the config's
+	// directory as the working directory on every platform.
+	t.Chdir(dir)
+	relative := "first.toml"
 	if pendingCredentialPath(relative) != pendingCredentialPath(first) {
 		t.Fatal("relative and absolute config paths use different journals")
 	}
