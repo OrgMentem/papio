@@ -1165,6 +1165,34 @@ func TestDocumentDeliveryConfigValidationFailsClosed(t *testing.T) {
 			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu:8443/request\"\nallowed_hosts = [\"forms.example.edu:8443\"]\n",
 		},
 		{
+			name:    "listed port rejects a different destination port",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu:9443/request\"\nallowed_hosts = [\"forms.example.edu:8443\"]\n",
+			wantErr: "not allowed by allowed_hosts",
+		},
+		{
+			name: "explicit HTTPS port matches portless destination",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu/request\"\nallowed_hosts = [\"forms.example.edu:443\"]\n",
+		},
+		{
+			name:    "bracketed IPv4 is rejected",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://192.0.2.1/request\"\nallowed_hosts = [\"[192.0.2.1]:443\"]\n",
+			wantErr: "must be a bare hostname",
+		},
+		{
+			name:    "oversized port is rejected",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu/request\"\nallowed_hosts = [\"forms.example.edu:123456\"]\n",
+			wantErr: "must be a bare hostname",
+		},
+		{
+			name:    "nonnumeric port is rejected",
+			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu/request\"\nallowed_hosts = [\"forms.example.edu:8a\"]\n",
+			wantErr: "must be a bare hostname",
+		},
+		{
+			name: "bracketed IPv6 with matching port",
+			body: "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://[2001:db8::1]:8443/request\"\nallowed_hosts = [\"[2001:db8::1]:8443\"]\n",
+		},
+		{
 			name:    "scheme in allowed host is rejected",
 			body:    "[browser.document_delivery]\nkind = \"custom\"\nbase_url = \"https://forms.example.edu/request\"\nallowed_hosts = [\"https://forms.example.edu\"]\n",
 			wantErr: "allowed_hosts entry \"https://forms.example.edu\" must be a bare hostname",

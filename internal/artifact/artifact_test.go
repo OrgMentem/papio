@@ -185,6 +185,48 @@ func stagedFixture(t *testing.T) (s *Store, temp, sha string) {
 	return s, temp, sha
 }
 
+func TestPromoteRejectsCorruptExistingDestination(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		name := "hardlink"
+		if fallback {
+			name = "fallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			if fallback {
+				original := linkFile
+				linkFile = func(oldname, newname string) error {
+					return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EOPNOTSUPP}
+				}
+				t.Cleanup(func() { linkFile = original })
+			}
+			for _, corrupt := range []string{"", "wrong content"} {
+				t.Run("content="+corrupt, func(t *testing.T) {
+					s, temp, sha := stagedFixture(t)
+					dest, err := s.ArtifactPath(sha)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(dest, []byte(corrupt), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if _, created, err := s.Promote(temp, sha); err == nil || !strings.Contains(err.Error(), "existing artifact") || created {
+						t.Fatalf("promotion = created %v, error %v; want corruption refusal", created, err)
+					}
+					if got, err := os.ReadFile(dest); err != nil || string(got) != corrupt {
+						t.Fatalf("destination = %q, %v; want unchanged corrupt bytes", got, err)
+					}
+					if got, err := os.ReadFile(temp); err != nil || !bytes.Equal(got, stagedFixtureBody) {
+						t.Fatalf("quarantine = %q, %v; want preserved valid bytes", got, err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestPromoteFallsBackWhenHardLinksUnsupported(t *testing.T) {
 	s, temp, sha := stagedFixture(t)
 

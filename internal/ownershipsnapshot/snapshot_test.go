@@ -498,6 +498,49 @@ func TestGrowthDuringReadIsBoundedAndRejected(t *testing.T) {
 	}
 }
 
+func TestInPlaceRewriteDuringReadRetainsPreviousSnapshot(t *testing.T) {
+	for _, mode := range []string{"short_read", "same_length_rewrite"} {
+		t.Run(mode, func(t *testing.T) {
+			one := oneEntryBibTeX("10.1000/one")
+			two := oneEntryBibTeX("10.1000/two")
+			path := writeFile(t, t.TempDir(), "refs.bib", one)
+			provider := newTestProvider(t, path, config.LibraryClaimPDFPresent, time.Now)
+			queries := []ownership.Query{doiQuery("10.1000/one"), doiQuery("10.1000/two")}
+			if claims, health := provider.Lookup(context.Background(), queries); !health.Complete || len(claims[0]) != 1 {
+				t.Fatalf("initial snapshot = %+v, %+v", claims, health)
+			}
+			if err := os.WriteFile(path, []byte(two+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.read = func(ctx context.Context, reader io.Reader) ([]byte, error) {
+				if mode == "short_read" {
+					// A valid prefix lacks the final byte of the opened export.
+					return readBounded(ctx, io.LimitReader(reader, int64(len(two))))
+				}
+				if err := os.WriteFile(path, []byte(one+"\n"), 0o600); err != nil {
+					return nil, err
+				}
+				later := info.ModTime().Add(time.Second)
+				if err := os.Chtimes(path, later, later); err != nil {
+					return nil, err
+				}
+				return readBounded(ctx, reader)
+			}
+			claims, health := provider.Lookup(context.Background(), queries)
+			if health.Complete || health.FailureCode != ownership.FailureUnreadable {
+				t.Fatalf("health = %+v, want unreadable incomplete snapshot", health)
+			}
+			if len(claims[0]) != 1 || !claims[0][0].Stale || len(claims[1]) != 0 {
+				t.Fatalf("claims = %+v, want previous stale snapshot", claims)
+			}
+		})
+	}
+}
+
 func TestNonRegularSourceIsUnreadableWithoutReading(t *testing.T) {
 	provider := newTestProvider(t, t.TempDir(), config.LibraryClaimPDFPresent, time.Now)
 	read := false

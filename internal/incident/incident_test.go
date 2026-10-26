@@ -153,6 +153,38 @@ func TestAggregateBuildsImmutableDecisiveObservations(t *testing.T) {
 	}
 }
 
+func TestAggregateCaptureMatchesDriveEpoch(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		name := "top_level"
+		if nested {
+			name = "detail_drive_epoch"
+		}
+		t.Run(name, func(t *testing.T) {
+			event := func(kind, epoch string, detail map[string]any) map[string]any {
+				result := map[string]any{"kind": kind, "at": "2026-08-01T00:00:03Z", "detail": detail}
+				if nested {
+					detail["drive_epoch"] = epoch
+				} else {
+					result["drive_attempt_id"] = epoch
+				}
+				return result
+			}
+			matching := event("browser.page_capture", "a1", map[string]any{"host": "old.example.edu", "safety_domain": "old", "x": true})
+			foreign := event("browser.page_capture", "a2", map[string]any{"host": "new.example.org", "safety_domain": "new", "y": true})
+			outcome := event("browser.provider_outcome", "a1", map[string]any{"outcome": "ui_changed"})
+			key := []byte("incident-test-key")
+			want := Aggregate(key, []JobObservation{{JobID: "job-1", Events: []map[string]any{matching, outcome}}})
+			got := Aggregate(key, []JobObservation{{JobID: "job-1", Events: []map[string]any{matching, foreign, outcome}}})
+			if len(want) != 1 || len(got) != 1 {
+				t.Fatalf("groups = %+v, want %+v", got, want)
+			}
+			if got[0].HostFamily != "example.edu" || got[0].Fingerprint != want[0].Fingerprint {
+				t.Fatalf("foreign drive changed decisive context: got %+v, want %+v", got[0], want[0])
+			}
+		})
+	}
+}
+
 func TestAggregateCaptureOnlyAndLateCaptureDoNotInventOrRewrite(t *testing.T) {
 	events := []map[string]any{
 		{"kind": "browser.page_capture", "at": "2026-08-01T00:00:01Z", "detail": map[string]any{"host": "capture.example.edu", "adapter_id": "a"}},
