@@ -3,6 +3,7 @@ package job
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -58,6 +59,82 @@ func acquireDrive(t *testing.T, js *Store, id EffectPermitIdentity, domain strin
 		t.Fatalf("acquire outcome=%v permit=%+v err=%v", outcome, p, err)
 	}
 	return p
+}
+
+func TestEffectPermitUniqueRaceCommit(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		for _, failCommit := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stale=%t/failCommit=%t", stale, failCommit), func(t *testing.T) {
+				js := testStore(t)
+				ctx := context.Background()
+				jobID := permitJob(t, js, "permit-unique-race")
+				holder := 1
+				if stale {
+					holder = 2
+				}
+				parent := 1
+				if failCommit {
+					parent = 2
+				}
+				// RAISE(FAIL) preserves the trigger's writes, so the collision
+				// lookup sees a winner that the initial lookup could not see.
+				// The deferred foreign key fails only when admission commits.
+				for _, statement := range []string{
+					`CREATE TABLE permit_race_parent (id INTEGER PRIMARY KEY)`,
+					`INSERT INTO permit_race_parent VALUES (1)`,
+					`CREATE TABLE permit_race_child (
+						parent_id INTEGER REFERENCES permit_race_parent(id) DEFERRABLE INITIALLY DEFERRED
+					)`,
+					fmt.Sprintf(`CREATE TRIGGER permit_race BEFORE INSERT ON effect_permits
+						WHEN NEW.id != 'race-winner'
+						BEGIN
+							INSERT INTO effect_permits (
+								id, job_id, job_attempt_revision, browser_holder_generation,
+								safety_domain_id, effect_kind, slot_index, drive_attempt_id,
+								ordinal, strategy, revision, status, lease_until, created_at, updated_at
+							) VALUES (
+								'race-winner', NEW.job_id, NEW.job_attempt_revision, %d,
+								NEW.safety_domain_id, NEW.effect_kind, NEW.slot_index, NEW.drive_attempt_id,
+								NEW.ordinal, NEW.strategy, NEW.revision, NEW.status,
+								NEW.lease_until, NEW.created_at, NEW.updated_at
+							);
+							INSERT INTO permit_race_child VALUES (%d);
+							SELECT RAISE(FAIL, 'unique race injected');
+						END`, holder, parent),
+				} {
+					if _, err := js.S.DB().ExecContext(ctx, statement); err != nil {
+						t.Fatal(err)
+					}
+				}
+				permit, outcome, err := js.AcquireEffectPermit(ctx, EffectPermitAcquireInput{
+					Identity:           driveIdentity(jobID, "race-attempt", 1, "fallback"),
+					JobAttemptRevision: 1, BrowserHolderGeneration: 1,
+					SafetyDomainID: "race-domain", LeaseUntil: time.Now().Add(time.Minute),
+					Authorization: EffectPermitEvent{Kind: "effect.authorized"},
+				})
+				if failCommit {
+					if permit != nil || outcome != EffectPermitStaleOutcome || err == nil ||
+						!strings.Contains(strings.ToLower(err.Error()), "foreign key constraint failed") ||
+						errors.Unwrap(err) == nil {
+						t.Fatalf("failed commit permit=%+v outcome=%v err=%v", permit, outcome, err)
+					}
+					return
+				}
+				wantOutcome := EffectPermitDuplicate
+				var wantErr error
+				if stale {
+					wantOutcome, wantErr = EffectPermitStaleOutcome, ErrEffectPermitStale
+				}
+				if permit == nil || permit.ID != "race-winner" || outcome != wantOutcome || !errors.Is(err, wantErr) {
+					t.Fatalf("committed race permit=%+v outcome=%v err=%v", permit, outcome, err)
+				}
+				saved, err := js.GetEffectPermit(ctx, permit.ID)
+				if err != nil || saved == nil || saved.ID != permit.ID {
+					t.Fatalf("committed winner=%+v err=%v", saved, err)
+				}
+			})
+		}
+	}
 }
 
 func TestEffectPermitOccupancyAndIdentity(t *testing.T) {

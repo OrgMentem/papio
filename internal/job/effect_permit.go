@@ -614,13 +614,14 @@ func (js *Store) AcquireEffectPermit(ctx context.Context, in EffectPermitAcquire
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			existing, _ := scanPermit(tx.QueryRowContext(ctx, permitSelect+` WHERE `+where, args...))
 			if existing != nil {
+				if commitErr := tx.Commit(); commitErr != nil {
+					return nil, EffectPermitStaleOutcome, fmt.Errorf("committing effect permit unique-race result: %w", commitErr)
+				}
 				if existing.JobAttemptRevision != in.JobAttemptRevision ||
 					existing.BrowserHolderGeneration != in.BrowserHolderGeneration ||
 					existing.SafetyDomainID != in.SafetyDomainID {
-					_ = tx.Commit()
 					return existing, EffectPermitStaleOutcome, ErrEffectPermitStale
 				}
-				_ = tx.Commit()
 				return existing, EffectPermitDuplicate, nil
 			}
 			return nil, EffectPermitBusyOutcome, ErrEffectPermitBusy
