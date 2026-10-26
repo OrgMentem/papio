@@ -40,7 +40,7 @@ column lists anything else sent.
 | `doi.org` | your `email`, in the User-Agent | Confirming that a DOI exists before an institutional handoff | **On** |
 | Your institution's configured delivery API (`document_delivery.base_url` — ILLiad in v1) | your `api_key`, `patron_ref`, and the request's bibliographic identifiers | Submitting or polling one of your document-delivery requests | Off — requires configuration |
 | `api.openalex.org` | your `email`, your API key | `papio search` and watches (the default discovery backend) | **On** |
-| `api.openalex.org` | your `email`, your API key | Resolving | Off — requires `[sources.openalex] enabled = true` |
+| `api.openalex.org` | your `email`, your API key | Resolving | **On** (disable with `[sources.openalex] enabled = false`) |
 | `api.core.ac.uk` | your API key | Resolving | Off |
 | `api.crossref.org` (TDM) | your subscriber token | Resolving | Off |
 | `api.semanticscholar.org` | your API key, if set | Resolving a DOI, arXiv ID, or PMID, and `papio search` when configured | **On** |
@@ -56,8 +56,8 @@ column lists anything else sent.
 ### Important details
 
 **Email address.** The `email` setting is sent to services that require or accept
-it. Unpaywall and OpenAlex require an email address. Crossref and DOI lookup use it
-when configured. Leaving it empty prevents Unpaywall and OpenAlex lookups.
+it. Unpaywall and OpenAlex require an email address. Crossref metadata, Retraction Watch, and DOI lookup use it
+when configured. The open_books repositories receive it in the `User-Agent` (IRIS on by default; OAPEN when `open_books.oapen` is on). Leaving it empty prevents Unpaywall and OpenAlex lookups.
 
 **Retraction checks.** Retraction checks download the Retraction Watch dataset and match the DOIs of papers *papio* acquired (or, with `retraction.scope = "library"`, your wider library) locally on your machine; the request carries no library DOIs, only your configured `email` as a `mailto` parameter when one is set. Disable them with
 `[sources.retraction_watch] enabled = false`. With `zotio.retraction_tags = true`, a verified retraction is also written into your own Zotero library as the `papio:retracted` tag; that step looks up each retracted DOI through your local zotio and sends nothing to a third party.

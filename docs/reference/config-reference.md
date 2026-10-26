@@ -167,7 +167,7 @@ no local model runtime ships yet. Credential setup is currently a CLI command.
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `access_mode` | string | empty | Required before acquisition. Allowed values are `conservative`, `assisted`, and `delegated`; a fresh guided `papio init` chooses `conservative`. Conservative records institutional OpenURL availability without opening a handoff; assisted and delegated can route eligible exhaustion to browser handoff. |
-| `email` | string | empty | Contact identity for polite API pools. **Sent to third parties**: as a query parameter to Unpaywall (required) and OpenAlex (required), to Crossref when set, and in the `User-Agent` of DOI-registration lookups. See [Privacy](../privacy.md). Doctor fails when an enabled source that needs one (Unpaywall, OpenAlex) has no email; OpenAlex without an API key runs on the smaller anonymous allowance instead, and doctor warns. |
+| `email` | string | empty | Contact identity for polite API pools. **Sent to third parties**: as a query parameter to Unpaywall (required) and OpenAlex (required), to Crossref metadata and Retraction Watch when set, in the `User-Agent` of DOI-registration lookups when set, and in the `User-Agent` of open_books repository lookups (IRIS by default; OAPEN when `open_books.oapen` is on). See [Privacy](../privacy.md) for the full recipient table. Doctor fails when an enabled source that needs one (Unpaywall, OpenAlex) has no email; OpenAlex without an API key runs on the smaller anonymous allowance instead, and doctor warns. |
 | `data_dir` | path string | `~/.local/share/papio` (Windows: `%LOCALAPPDATA%\papio`) | Private writable data directory for the database, artifacts, and socket. Browser-download adoption does not follow this directory: the adoption root defaults to `<your download folder>/papio` (see `[browser] download_adoption_root`), while the historical `<data_dir>/adoptions` path remains drain-only for files already sitting there. |
 
 ## `[fetch]`
@@ -175,7 +175,7 @@ no local model runtime ships yet. Credential setup is currently a CLI command.
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
 | `max_bytes` | integer bytes | `104857600` (100 MiB) | Maximum artifact-download size, and the largest file `papio jobs supply-pdf` accepts. It must be at least `1048576` (1 MiB). |
-| `timeout_seconds` | integer seconds | `120` | Fetch deadline. It must be at least 5 seconds. |
+| `timeout_seconds` | integer seconds | `120` | Fetch deadline. It must be in 5..3600 seconds. |
 | `allow_http_loopback` | boolean | `false` | Development and test override that permits HTTP loopback. Doctor warns while it is enabled; production policy is HTTPS-only. |
 
 ## `[host_suppression]`
@@ -227,11 +227,11 @@ the configuration change.
 | `shibboleth_entity_id` | string URL | empty | Default institution's Shibboleth IdP entityID (`https://`). When set, a provider login wall is auto-routed to this IdP (skipping the WAYF selector). Empty disables federated login-routing for the default profile. |
 | `proquest_account_id` | string digits | empty | Default institution's ProQuest account id (digits, max 64). When set, *papio* appends `?accountid=<id>` to unlock the institution's ProQuest link-resolver without a manual sign-in. Empty disables the append. During `papio init` you may paste a ProQuest URL containing `accountid=` instead of the bare id. |
 | `openathens_domain` | string domain | empty | Default institution's OpenAthens organisation domain: the `<domain>` in `go.openathens.net/redirector/<domain>`, such as `example.edu`. It must be a bare lowercase DNS name of at least two labels (letters, digits, hyphens and dots; no scheme, slash, port or query) and is rejected at load otherwise. When set, *papio* sends the DOI browser route through `https://go.openathens.net/redirector/<domain>?url=https://doi.org/<doi>`. That redirector signs in to the publisher with your institution's identity provider and then opens the article, so a paper whose publisher has a packaged adapter reaches its page without the library's discovery layer. *papio* offers it first and falls back to the `openurl_base_url` route when it parks without a PDF. Empty disables it. Built only from this value and the job's validated DOI — never from a page. Because config is strict-mode, deploy the binary that knows this key before you add it. See [Use your library's OpenAthens link](../guide/user-guide.md#use-your-librarys-openathens-link). |
-| `libkey_mode` | string | empty | LibKey routing for the default institution: empty or `off` disables it; `link` routes DOI/PMID handoffs through the keyless `libkey.io/libraries/<id>/<doi-or-pmid>` institution link ahead of the bare OpenURL resolver, falling back to OpenURL for works without a DOI or PMID and whenever LibKey is unavailable. `api` is reserved and rejected (not implemented). Requires `libkey_library_id` when set to `link`. |
+| `libkey_mode` | string | empty | LibKey routing for the default institution: empty or `off` disables it; `link` routes DOI/PMID handoffs through the keyless `libkey.io/libraries/<id>/<doi-or-pmid>` institution link ahead of the bare OpenURL resolver, falling back to OpenURL for works without a DOI or PMID and whenever LibKey is unavailable. `api` is reserved and rejected (not implemented). `link` requires both a positive `libkey_library_id` and a non-empty `openurl_base_url` on the default institution. |
 | `libkey_library_id` | integer | `0` | The institution's numeric Third Iron library id — the number in its BrowZine/LibKey.io URL (`…/libraries/<id>/…`). Required (positive) when `libkey_mode = "link"`; setting it without `link` mode is rejected rather than left silently dead. |
 | `default_resolver` | string | empty | Named `[browser.resolvers.<name>]` profile used when a request omits `resolver` (e.g. `papio acquire` without `--resolver`). Empty preserves the historical default institution. Must name a configured profile — the implicit `default` profile (when `openurl_base_url` is set) or a `[browser.resolvers.<name>]` key; an unconfigured name is rejected at load. |
 | `download_adoption_root` | path string | empty | Root for browser-download adoption; adoption is confined to a job subdirectory beneath it. When empty the effective value is `<your download folder>/papio` — on macOS `~/Downloads/papio`, on Linux/BSD the XDG `XDG_DOWNLOAD_DIR` folder (falling back to `~/Downloads`), on Windows the `Downloads` known folder. It must be a `papio` directory inside the folder your browser downloads into: Chrome can only steer a download to a path relative to its own download directory, so any other root adopts nothing at all, silently. `papio init` creates the effective root, and `papio doctor`'s `adoption_root` check fails and names the resolved path when it is unreachable. |
-| `action_expiry_seconds` | integer seconds | `1800` | Browser-handoff expiry and the initial age before an open human action is reminded. Later reminders double their per-action interval through 24 hours. It must not be negative. |
+| `action_expiry_seconds` | integer seconds | `1800` | Browser-handoff expiry and the initial age before an open human action is reminded. Later reminders double their per-action interval through 24 hours. It must be in 0..2592000 seconds (30 days). |
 | `native_viewer_helper` | removed | — | Removed. It named the macOS helper program that saved a PDF from Firefox's viewer; the extension now saves that PDF itself. A config that still sets it loads, the value is ignored, and `papio doctor` warns with `config_ignored_settings`. Delete the line. |
 
 
@@ -250,7 +250,7 @@ native messaging host installs on the first run.
 
 Named resolver profiles are per-institution tables keyed by a lowercase
 alphanumeric name; `default` is reserved for the implicit top-level
-institution and is rejected at load if used as a profile key. Each carries
+institution and is rejected at load if used as a profile key. A name that matches a packaged provider route hint (a provider family such as `sage-doi-pdf`, or an exact route revision) is also rejected at load. Each carries
 its own OpenURL base and, optionally, the same `shibboleth_entity_id`,
 `proquest_account_id`, `openathens_domain`, `libkey_mode`, and `libkey_library_id` fields as the
 default `[browser]` institution — so a multi-institution user routes each
@@ -558,7 +558,7 @@ Configures the `open_books` source, which finds an open-access copy of a book fr
 
 | Key | Type | Default | Effect and constraints |
 | --- | --- | --- | --- |
-| `stale_after_seconds` | integer seconds | `604800` (7 days) | How long an open human action may wait before listings report it stale. `0` selects the default; a negative value is rejected. `papio actions list` marks stale rows (`stale` and `age_seconds` in `--json`), and nothing else happens: *papio* never cancels, expires, or sweeps a handoff on a timer. |
+| `stale_after_seconds` | integer seconds | `604800` (7 days) | How long an open human action may wait before listings report it stale. `0` selects the default; a negative value is rejected, and values above 31536000 seconds (365 days) are rejected. `papio actions list` marks stale rows (`stale` and `age_seconds` in `--json`), and nothing else happens: *papio* never cancels, expires, or sweeps a handoff on a timer. |
 
 This is deliberately not `browser.action_expiry_seconds`. That one (30 minutes by
 default) is a *reminder* cadence — how soon to nudge you again about an open
