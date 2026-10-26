@@ -101,6 +101,7 @@ func SearchUnowned(ctx context.Context, source Source, request UnownedRequest, c
 		}
 		seen[key] = true
 	}
+	var unsupported error
 	for cursor.Source < len(selected) && len(result.Works) < params.Limit && result.Pages < UnownedPageBudget && cursor.Scanned < UnownedScanCeiling {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -124,6 +125,15 @@ func SearchUnowned(ctx context.Context, source Source, request UnownedRequest, c
 				return result, err
 			}
 			page = SourcePage{Source: current.Name(), State: value.State, Works: withSource(value.Works, current.Name()), Next: value.Next}
+		}
+		if errors.Is(page.Err, ErrUnsupportedParams) {
+			unsupported = page.Err
+			if params.Source != "" || len(selected) == 1 {
+				return result, page.Err
+			}
+			cursor.Source++
+			cursor.Next = ""
+			continue
 		}
 		result.Pages++
 		summary := page
@@ -180,6 +190,9 @@ func SearchUnowned(ctx context.Context, source Source, request UnownedRequest, c
 		default:
 			return result, errors.New("invalid discovery page state")
 		}
+	}
+	if unsupported != nil && result.Pages == 0 && request.Continuation == "" {
+		return result, unsupported
 	}
 	result.TotalScanned = cursor.Scanned
 	result.Partial = result.Partial || cursor.Incomplete

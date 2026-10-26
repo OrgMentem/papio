@@ -4,6 +4,7 @@ package watch
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -12,8 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"papio/internal/app"
 	"papio/internal/batch"
+	"papio/internal/config"
 	"papio/internal/discovery"
+	"papio/internal/job"
 	"papio/internal/ownership"
 	"papio/internal/protocol"
 	"papio/internal/store"
@@ -710,7 +714,7 @@ func TestRunDueExecutesOnlyDueWatches(t *testing.T) {
 		DataDir: t.TempDir(), Now: func() time.Time { return now },
 	}
 	if err := runner.RunDue(ctx); err != nil {
-		t.Fatalf("RunDue() error = %v, want nil (per-watch failures are recorded, not returned)", err)
+		t.Fatalf("RunDue() error = %v, want nil", err)
 	}
 	gotDue, err := watches.Get(ctx, due.ID)
 	if err != nil {
@@ -752,7 +756,7 @@ func TestRunDueExecutesOnlyDueWatches(t *testing.T) {
 	}
 }
 
-func TestRunDueSwallowsPerWatchFailureAndContinues(t *testing.T) {
+func TestRunDueReturnsPerWatchFailureAndContinues(t *testing.T) {
 	ctx := context.Background()
 	watches := testStore(t)
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
@@ -781,8 +785,8 @@ func TestRunDueSwallowsPerWatchFailureAndContinues(t *testing.T) {
 		Store: watches, Discovery: failingDiscovery, Lookup: lookup, Submitter: &fakeSubmitter{},
 		DataDir: t.TempDir(), Now: func() time.Time { return now },
 	}
-	if err := runner.RunDue(ctx); err != nil {
-		t.Fatalf("RunDue() error = %v, want nil (per-watch failures are swallowed via RecordFailure, not returned)", err)
+	if err := runner.RunDue(ctx); err == nil || !strings.Contains(err.Error(), "OpenAlex unavailable") {
+		t.Fatalf("RunDue() error = %v, want the failed watch's discovery error", err)
 	}
 	if callCount != 2 {
 		t.Fatalf("discovery calls = %d, want 2 (RunDue must continue after first failure)", callCount)
@@ -1337,5 +1341,230 @@ func TestRunnerAcquireDigestPartialFailureNamesQueuedCount(t *testing.T) {
 	}
 	if want := "queued 1 of 2 digest works before failing: resolver offline; the queued works left the digest — see papio jobs list"; err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
+	}
+}
+
+type watchDiscoveryFunc func(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error)
+
+func (f watchDiscoveryFunc) Search(ctx context.Context, params discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+	return f(ctx, params)
+}
+
+func TestRunDueRemovalDuringDiscoveryPreventsAcquisition(t *testing.T) {
+	for _, guarded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("guarded=%t", guarded), func(t *testing.T) {
+			ctx := context.Background()
+			watches := testStore(t)
+			watched := createWatch(t, watches, CreateInput{
+				Kind: KindDiscovery, Mode: ModeAcquire, Query: "removed", CadenceHours: 24, PerRunCap: 2,
+			})
+			entered, release := make(chan struct{}), make(chan struct{})
+			released := false
+			defer func() {
+				if !released {
+					close(release)
+				}
+			}()
+			cfg := config.Default()
+			cfg.AccessMode = "conservative"
+			runner := &Runner{
+				Store: watches,
+				Discovery: watchDiscoveryFunc(func(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+					close(entered)
+					<-release
+					return papers("removed", 0, 2), nil
+				}),
+				Lookup: &doiOwnership{}, DataDir: t.TempDir(),
+				Submitter: &app.Service{Config: cfg, Jobs: &job.Store{S: watches.S}},
+			}
+			finished := make(chan error, 1)
+			go func() { finished <- runner.RunDue(ctx) }()
+			<-entered
+			var err error
+			if guarded {
+				err = watches.RemoveIfNoPendingDigest(ctx, watched.ID, false)
+			} else {
+				err = watches.Remove(ctx, watched.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(release)
+			released = true
+			if err := <-finished; !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("removed watch run error = %v, want sql.ErrNoRows", err)
+			}
+			var jobs int
+			if err := watches.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&jobs); err != nil {
+				t.Fatal(err)
+			}
+			if jobs != 0 {
+				t.Fatalf("jobs after removal = %d, want none", jobs)
+			}
+		})
+	}
+}
+
+func TestRunDueRecordsExpiredContextFailureAndStops(t *testing.T) {
+	ctx := context.Background()
+	watches := testStore(t)
+	first := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "expires", CadenceHours: 24, PerRunCap: 1,
+	})
+	second := createWatch(t, watches, CreateInput{
+		Kind: KindDiscovery, Mode: ModeAlert, Query: "not started", CadenceHours: 24, PerRunCap: 1,
+	})
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	runCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	runner := &Runner{
+		Store: watches, Lookup: &doiOwnership{}, Now: func() time.Time { return now },
+		Discovery: watchDiscoveryFunc(func(ctx context.Context, _ discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}),
+	}
+	if err := runner.RunDue(runCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RunDue error = %v, want the expired context failure", err)
+	}
+	stored, err := watches.Get(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ConsecutiveFailures != 1 || stored.LastError == "" || stored.LastRunAt != store.FormatTime(now) {
+		t.Fatalf("failed watch = %+v, want a durable failure and advanced cadence", stored)
+	}
+	unstarted, err := watches.Get(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unstarted.ConsecutiveFailures != 0 || unstarted.LastRunAt != "" {
+		t.Fatalf("unstarted watch = %+v, want no failure charged to it", unstarted)
+	}
+}
+
+func TestAcquireWatchDeduplicatesSubmittedWorkIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		first, second protocol.Identifiers
+	}{
+		{
+			name:   "arxiv version",
+			first:  protocol.Identifiers{ArXiv: "2301.00001v2"},
+			second: protocol.Identifiers{ArXiv: "2301.00001v3"},
+		},
+		{
+			name:   "arxiv gains DOI",
+			first:  protocol.Identifiers{ArXiv: "2301.00001v2"},
+			second: protocol.Identifiers{ArXiv: "2301.00001v3", DOI: "10.1000/published"},
+		},
+		{
+			name:   "DOI gains OpenAlex",
+			first:  protocol.Identifiers{DOI: "10.1000/published"},
+			second: protocol.Identifiers{DOI: "10.1000/published", OpenAlex: "W2741809807"},
+		},
+		{
+			name:   "backend omits DOI",
+			first:  protocol.Identifiers{DOI: "10.1000/published", OpenAlex: "W2741809807"},
+			second: protocol.Identifiers{OpenAlex: "W2741809807"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			watches := testStore(t)
+			watched := createWatch(t, watches, CreateInput{
+				Kind: KindDiscovery, Mode: ModeAcquire, Query: "stable work", CadenceHours: 24, PerRunCap: 1,
+			})
+			discovered := func(ids protocol.Identifiers) discovery.DiscoveredWork {
+				return discovery.DiscoveredWork{
+					Work: work.Work{
+						DOI: ids.DOI, ArXiv: ids.ArXiv, Title: "Stable Work", Authors: []string{"Ada"}, Year: 2026,
+					},
+					OpenAlexID: ids.OpenAlex,
+				}
+			}
+			source := &fakeDiscovery{works: []discovery.DiscoveredWork{discovered(test.first)}}
+			notifier := &fakeNotifier{}
+			cfg := config.Default()
+			cfg.AccessMode = "conservative"
+			runner := &Runner{
+				Store: watches, Discovery: source, Lookup: &doiOwnership{}, Notifier: notifier,
+				Submitter: &app.Service{Config: cfg, Jobs: &job.Store{S: watches.S}}, DataDir: t.TempDir(),
+			}
+			first, err := runner.Run(ctx, watched.ID)
+			if err != nil || first.Queued != 1 {
+				t.Fatalf("first run = %+v, %v", first, err)
+			}
+			if _, err := watches.S.DB().ExecContext(ctx, `UPDATE jobs SET state = 'unavailable'`); err != nil {
+				t.Fatal(err)
+			}
+			// Recreate the runner so deduplication must use durable receipts.
+			runner = &Runner{
+				Store: watches, Discovery: source, Lookup: &doiOwnership{}, Notifier: notifier,
+				Submitter: runner.Submitter, DataDir: runner.DataDir,
+			}
+			source.works = []discovery.DiscoveredWork{discovered(test.second)}
+			second, err := runner.Run(ctx, watched.ID)
+			if err != nil || second.Queued != 0 {
+				t.Fatalf("second run = %+v, %v, want no new submission", second, err)
+			}
+			var jobs int
+			if err := watches.S.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&jobs); err != nil {
+				t.Fatal(err)
+			}
+			if jobs != 1 || len(notifier.messages) != 1 {
+				t.Fatalf("jobs = %d, notifications = %q, want one acquisition only", jobs, notifier.messages)
+			}
+		})
+	}
+}
+
+type emptyWatchPageSource struct{}
+
+func (emptyWatchPageSource) Name() string { return "openalex" }
+
+func (emptyWatchPageSource) Search(context.Context, discovery.SearchParams) ([]discovery.DiscoveredWork, error) {
+	return nil, nil
+}
+
+func (emptyWatchPageSource) SearchPage(context.Context, discovery.SearchParams, string) (discovery.Page, error) {
+	return discovery.Page{State: discovery.PageExhausted}, nil
+}
+
+func TestCitationWatchSkipsUnsupportedBackendsWithoutDegradation(t *testing.T) {
+	for _, filters := range []Filters{
+		{Cites: "10.1000/seed"},
+		{CitedBy: "10.1000/seed"},
+	} {
+		t.Run(watchSnowballLabel(filters), func(t *testing.T) {
+			ctx := context.Background()
+			watches := testStore(t)
+			watched := createWatch(t, watches, CreateInput{
+				Kind: KindDiscovery, Mode: ModeAlert, Filters: filters, CadenceHours: 24, PerRunCap: 1,
+			})
+			sources := []discovery.Source{
+				discovery.NewArxivWithOptions(discovery.ArxivOptions{}),
+				emptyWatchPageSource{},
+			}
+			multi := discovery.NewMulti(sources...)
+			now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+			runner := &Runner{
+				Store: watches, Discovery: multi, Lookup: &doiOwnership{}, Now: func() time.Time { return now },
+			}
+			result, err := runner.Run(ctx, watched.ID)
+			if err != nil || result.Degraded {
+				t.Fatalf("citation run = %+v, %v, want a complete scan", result, err)
+			}
+			stored, err := watches.Get(ctx, watched.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.LastError != "" || stored.LastRunAt != store.FormatTime(now) || stored.ConsecutiveFailures != 0 {
+				t.Fatalf("citation watch = %+v, want a successful run", stored)
+			}
+			if failures := multi.LastFailures(); len(failures) != 0 {
+				t.Fatalf("backend failures = %+v, want no failure for an unsupported capability", failures)
+			}
+		})
 	}
 }

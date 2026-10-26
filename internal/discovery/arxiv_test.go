@@ -4,6 +4,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -126,15 +127,19 @@ func TestArxivCitationSnowballDeclinesWithoutRequest(t *testing.T) {
 	defer server.Close()
 
 	backend := NewArxivWithOptions(ArxivOptions{Client: http.DefaultClient, BaseURL: server.URL})
-	works, failures, err := NewMulti(backend).SearchPartial(context.Background(), SearchParams{Cites: "10.1000/seed"})
-	if err == nil {
-		t.Fatal("citation snowball succeeded, want backend refusal")
+	multi := NewMulti(backend)
+	works, failures, err := multi.SearchPartial(context.Background(), SearchParams{Cites: "10.1000/seed"})
+	if !errors.Is(err, ErrUnsupportedParams) {
+		t.Fatalf("citation snowball error = %v, want ErrUnsupportedParams", err)
 	}
 	if works != nil {
 		t.Fatalf("works = %+v, want nil", works)
 	}
-	if len(failures) != 1 || failures[0].Source != "arxiv" || !strings.Contains(failures[0].Message, "citation snowball") {
-		t.Fatalf("failures = %+v, want one arxiv BackendFailure", failures)
+	if len(failures) != 0 {
+		t.Fatalf("failures = %+v, want no backend failure for a capability refusal", failures)
+	}
+	if retained := multi.LastFailures(); len(retained) != 0 {
+		t.Fatalf("retained failures = %+v, want none", retained)
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("HTTP requests = %d, want 0", got)

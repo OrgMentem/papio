@@ -5,6 +5,7 @@ package watch
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -218,6 +219,8 @@ func (r *Runner) submitDigestEntriesLocked(ctx context.Context, watchID int64, e
 	if len(entries) == 0 {
 		return 0, nil
 	}
+	r.Store.submissionMu.Lock()
+	defer r.Store.submissionMu.Unlock()
 	watch, err := r.Store.Get(ctx, watchID)
 	if err != nil {
 		return 0, err
@@ -435,8 +438,8 @@ func (r *Runner) ClearDigest(ctx context.Context, watchID int64) (int, error) {
 }
 
 // RunDue serially executes all watches due at the current time. Per-watch
-// failures are recorded by runWatch and intentionally do not stop later due
-// watches or crash the daemon scheduler.
+// failures are recorded and returned without stopping later due watches,
+// unless the caller's context has expired.
 func (r *Runner) RunDue(ctx context.Context) error {
 	if r == nil || r.Store == nil {
 		return errors.New("watch runner is not configured")
@@ -447,10 +450,17 @@ func (r *Runner) RunDue(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var failures []error
 	for _, watch := range watches {
-		_, _ = r.runWatch(ctx, watch)
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, err)
+			break
+		}
+		if _, err := r.runWatch(ctx, watch); err != nil {
+			failures = append(failures, fmt.Errorf("watch %d: %w", watch.ID, err))
+		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func (r *Runner) runWatch(ctx context.Context, watch Watch) (*RunResult, error) {
@@ -459,7 +469,9 @@ func (r *Runner) runWatch(ctx context.Context, watch Watch) (*RunResult, error) 
 	if err == nil {
 		return result, nil
 	}
-	failure, recordErr := r.Store.RecordFailure(ctx, watch.ID, runStart, err)
+	recorded, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	failure, recordErr := r.Store.RecordFailure(recorded, watch.ID, runStart, err)
 	if recordErr != nil {
 		return result, fmt.Errorf("%w (recording watch failure: %w)", err, recordErr)
 	}
@@ -824,17 +836,17 @@ func (r *Runner) newWork(ctx context.Context, watch Watch, works []discovery.Dis
 		// terminal) that the once-only submission will not replace. Drop it
 		// before the per-run cap so it neither takes a slot nor is announced
 		// as newly queued.
-		ids := make([]string, len(fresh))
+		works := make([]protocol.WorkRequest, len(fresh))
 		for i, request := range fresh {
-			ids[i] = batch.RequestID(fmt.Sprintf("watch-%d", watch.ID), request.Work)
+			works[i] = request.Work
 		}
-		submitted, err := r.Store.SubmittedRequests(ctx, ids)
+		submitted, err := r.Store.SubmittedWorks(ctx, watch.ID, works)
 		if err != nil {
 			return nil, nil, err
 		}
-		kept := fresh[:0:0]
+		kept := fresh[:0]
 		for i, request := range fresh {
-			if _, done := submitted[ids[i]]; !done {
+			if !submitted[i] {
 				kept = append(kept, request)
 			}
 		}
@@ -953,6 +965,12 @@ func (r *Runner) alertIntent(watch Watch, pending []DigestEntry, runStart time.T
 func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Time) (*RunResult, error) {
 	result := &RunResult{WatchID: watch.ID}
 	if watch.Kind == KindBackfill {
+		// Backfill owns its submission loop, so fence the whole queue call.
+		r.Store.submissionMu.Lock()
+		defer r.Store.submissionMu.Unlock()
+		if _, err := r.Store.Get(ctx, watch.ID); err != nil {
+			return result, err
+		}
 		sourceName, err := r.Store.genericBackfillSource(ctx, watch.ID)
 		if err != nil {
 			return result, err
@@ -1093,7 +1111,10 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 		// a job that reached a terminal state, so later cadences cannot
 		// re-run acquisition for a work the watch already queued.
 		request := manifest.Works[i].Work
-		jobID, err := r.Submitter.SubmitOnceWithAutoImport(ctx, request, &autoImport)
+		jobID, err := r.submitWatchWork(ctx, watch.ID, request, &autoImport)
+		if errors.Is(err, sql.ErrNoRows) {
+			return result, err
+		}
 		if err != nil {
 			manifest.Works[i].Status = "submission_failed"
 			manifest.Works[i].Error = storedError(err)
@@ -1143,6 +1164,17 @@ func (r *Runner) executeBody(ctx context.Context, watch Watch, runStart time.Tim
 	return result, nil
 }
 
+// submitWatchWork fences each new acquisition against removal. Removal may
+// finish during discovery, but cannot return while a submission is in flight.
+func (r *Runner) submitWatchWork(ctx context.Context, watchID int64, request protocol.WorkRequest, autoImport *bool) (string, error) {
+	r.Store.submissionMu.Lock()
+	defer r.Store.submissionMu.Unlock()
+	if _, err := r.Store.Get(ctx, watchID); err != nil {
+		return "", err
+	}
+	return r.Submitter.SubmitOnceWithAutoImport(ctx, request, autoImport)
+}
+
 type discoveredRequest struct {
 	Work       protocol.WorkRequest
 	Discovered discovery.DiscoveredWork
@@ -1168,16 +1200,7 @@ func appendDiscoveredRequests(requests []discoveredRequest, seen map[string]stru
 		if doi == "" && arXiv == "" && (openAlexID == "" || title == "" || len(authors) == 0 || discovered.Work.Year == 0) {
 			continue
 		}
-		keys := make([]string, 0, 3)
-		if doi != "" {
-			keys = append(keys, "doi:"+doi)
-		}
-		if arXiv != "" {
-			keys = append(keys, "arxiv:"+arXiv)
-		}
-		if openAlexID != "" {
-			keys = append(keys, "openalex:"+openAlexID)
-		}
+		keys := submissionIdentityKeys(&protocol.Identifiers{DOI: doi, ArXiv: arXiv, OpenAlex: openAlexID})
 		duplicate := false
 		for _, key := range keys {
 			if _, found := seen[key]; found {

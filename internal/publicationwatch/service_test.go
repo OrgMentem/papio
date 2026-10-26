@@ -445,3 +445,35 @@ func TestPublicationFailedScanKeepsCadenceAndErrorAcrossRestart(t *testing.T) {
 		t.Fatalf("failed scan created notice: %+v, %v", notices, err)
 	}
 }
+
+func TestPublicationRunDueAfterClockRollback(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	id, _, _ := acquiredFixture(t, db, "preprint")
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	relations := &fixtureRelations{}
+	s := NewService(db, relations, nil, nil)
+	s.Now = func() time.Time { return now.Add(30 * 24 * time.Hour) }
+	watched, err := s.Add(ctx, AddInput{JobID: id, CadenceHours: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Run(ctx, watched.ID); err != nil {
+		t.Fatal(err)
+	}
+	relations.edges = []enrich.PublicationRelation{{
+		SourceDOI: "10.1000/preprint", TargetDOI: "10.1000/published", Type: "is-preprint-of", Provider: "fixture",
+	}}
+	s.Now = func() time.Time { return now }
+	if err := s.RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	notices, err := s.Notices(ctx, watched.ID)
+	if err != nil || len(notices) != 1 || notices[0].TargetDOI != "10.1000/published" {
+		t.Fatalf("notices after clock rollback = %+v, %v, want the newly published work", notices, err)
+	}
+	stored, err := s.List(ctx)
+	if err != nil || len(stored) != 1 || stored[0].LastRunAt != store.FormatTime(now) {
+		t.Fatalf("watch after clock rollback = %+v, %v, want the corrected run time", stored, err)
+	}
+}

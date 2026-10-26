@@ -279,7 +279,8 @@ func (s *Service) RunDue(ctx context.Context) error {
 				failures = append(failures, err)
 				continue
 			}
-			if s.now().Sub(last) < time.Duration(w.CadenceHours)*time.Hour {
+			now := s.now()
+			if !last.After(now) && now.Sub(last) < time.Duration(w.CadenceHours)*time.Hour {
 				continue
 			}
 		}

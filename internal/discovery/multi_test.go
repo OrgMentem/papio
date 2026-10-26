@@ -243,3 +243,65 @@ func TestMergeWorksNarrowedTitleKey(t *testing.T) {
 		}
 	})
 }
+
+func TestMultiUnsupportedCitationSearchDoesNotRecordBackendFailures(t *testing.T) {
+	for _, mode := range []string{"partial", "paged", "unowned"} {
+		for _, selection := range []string{"mixed", "unsupported only", "named unsupported"} {
+			t.Run(mode+"/"+selection, func(t *testing.T) {
+				sources := []Source{
+					NewArxivWithOptions(ArxivOptions{}),
+					NewSemanticScholarWithOptions(SemanticScholarOptions{}),
+				}
+				works := []DiscoveredWork{{Work: work.Work{DOI: "10.1000/related", Title: "Related Work"}}}
+				if selection != "unsupported only" {
+					if mode == "partial" {
+						sources = append(sources, &fakeSource{name: "openalex", works: works})
+					} else {
+						sources = append(sources, &fakePageSource{name: "openalex", page: Page{State: PageExhausted, Works: works}})
+					}
+				}
+				multi := NewMulti(sources...)
+				params := SearchParams{RelatedTo: "10.1000/seed", Limit: 5}
+				if selection == "named unsupported" {
+					params.Source = "arxiv"
+				}
+				var got []DiscoveredWork
+				var err error
+				switch mode {
+				case "partial":
+					var failures []BackendFailure
+					got, failures, err = multi.SearchPartial(context.Background(), params)
+					if len(failures) != 0 {
+						t.Fatalf("search failures = %+v, want none for unsupported capabilities", failures)
+					}
+				case "paged":
+					var page MultiPage
+					page, err = multi.SearchPages(context.Background(), params, nil)
+					got = page.Works
+					for _, source := range page.Sources {
+						if source.State == PageFailed {
+							t.Fatalf("failed source = %+v, want unsupported capabilities skipped", source)
+						}
+					}
+				case "unowned":
+					var result UnownedResult
+					result, err = SearchUnowned(context.Background(), multi, UnownedRequest{Search: params}, nil)
+					got = result.Works
+					if result.Partial || result.Truncated {
+						t.Fatalf("unowned result = %+v, want no incomplete scan for a capability refusal", result)
+					}
+				}
+				if selection == "mixed" {
+					if err != nil || len(got) != 1 || got[0].Work.DOI != "10.1000/related" {
+						t.Fatalf("mixed search = %+v, %v, want the supported backend's work", got, err)
+					}
+				} else if err == nil {
+					t.Fatal("a search with no capable backend must return an error")
+				}
+				if failures := multi.LastFailures(); len(failures) != 0 {
+					t.Fatalf("retained backend failures = %+v, want none", failures)
+				}
+			})
+		}
+	}
+}
