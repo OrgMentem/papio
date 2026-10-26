@@ -3630,6 +3630,80 @@ test("resolveDownloadURL (api): fetches the aggregator JSON and extracts the PDF
   }
 });
 
+test("resolveDownloadURL (api): aggregator fetch carries an abort signal", async () => {
+  const win = new Window({ url: "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details" });
+  win.document.body.innerHTML = "<div id='v'></div>";
+  const seen: unknown[] = [];
+  const prev = { document: globalThis.document, location: globalThis.location, fetch: globalThis.fetch };
+  Object.assign(globalThis, {
+    document: win.document,
+    location: { href: "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details" },
+    fetch: async (...args: unknown[]) => {
+      seen.push(args[1]);
+      return { ok: true, json: async () => ({ url: "https://content.ebscohost.com/cds/retrieve?content=TOKEN" }) } as Response;
+    },
+  });
+  try {
+    const url = await resolveDownloadURL(
+      "#v",
+      "/c/([^/]+)/viewer/pdf/([^/?#]+)",
+      "https://research.ebsco.com/api/researcher-edge-aggregator/v1/records/{2}/fulltext/pdf?sourceRecordId={2}&opid={1}&intent=view",
+      "url",
+    );
+    expect(url).toBe("https://content.ebscohost.com/cds/retrieve?content=TOKEN");
+    expect(seen).toHaveLength(1);
+    expect((seen[0] as { signal?: unknown } | undefined)?.signal).toBeInstanceOf(AbortSignal);
+  } finally {
+    Object.assign(globalThis, prev);
+  }
+});
+
+test("resolveDownloadURL (api): a hanging aggregator fetch resolves null once the bound fires", async () => {
+  const win = new Window({ url: "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details" });
+  win.document.body.innerHTML = "<div id='v'></div>";
+  const timers: Array<() => void> = [];
+  const prev = {
+    document: globalThis.document,
+    location: globalThis.location,
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+  };
+  Object.assign(globalThis, {
+    document: win.document,
+    location: { href: "https://research.ebsco.com/c/6to2aa/viewer/pdf/mhqkskujrf?route=details" },
+    // A provider endpoint that accepts the connection and then hangs: it
+    // never resolves until the abort signal fires.
+    fetch: (...args: unknown[]) => {
+      const { promise, reject } = Promise.withResolvers<never>();
+      const signal = (args[1] as { signal?: AbortSignal } | undefined)?.signal;
+      signal?.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")), { once: true });
+      return promise;
+    },
+    setTimeout: ((fn: () => void) => {
+      timers.push(fn);
+      return timers.length;
+    }) as typeof setTimeout,
+    clearTimeout: (() => {}) as typeof clearTimeout,
+  });
+  try {
+    const pending = resolveDownloadURL(
+      "#v",
+      "/c/([^/]+)/viewer/pdf/([^/?#]+)",
+      "https://research.ebsco.com/api/researcher-edge-aggregator/v1/records/{2}/fulltext/pdf?sourceRecordId={2}&opid={1}&intent=view",
+      "url",
+    );
+    for (let i = 0; i < 200 && timers.length === 0; i += 1) await Promise.resolve();
+    // No bound armed means no abort signal was threaded: the old code would
+    // hang here instead of resolving null.
+    expect(timers.length).toBeGreaterThan(0);
+    for (const timer of timers) timer();
+    expect(await pending).toBeNull();
+  } finally {
+    Object.assign(globalThis, prev);
+  }
+});
+
 test("cross-origin api download is relocated into papio/<job>/ via the ID bound at onCreated", async () => {
   const h = makeMapHarness();
   // Chrome fires onCreated (pre-redirect) before asking for the filename.
