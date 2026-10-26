@@ -207,24 +207,37 @@ func (s *Service) LookupWorks(ctx context.Context, request LookupWorksRequest) (
 		ownedKeys = append(ownedKeys, key)
 	}
 	sort.Strings(ownedKeys)
-	var missing []MissingPDFItem
-	var missingErr error
+	missing := make(map[string]bool, len(ownedKeys))
 	if keyed, ok := s.CLI.(interface {
 		MissingPDFKeys(context.Context, []string) ([]MissingPDFItem, error)
 	}); ok {
-		missing, missingErr = keyed.MissingPDFKeys(ctx, ownedKeys)
+		// The work bound (50) is not the key bound: a full batch of
+		// duplicate-heavy works crosses 50 keys, and one call would fail
+		// the whole lookup. Chunk through 50-key calls the same way
+		// keepMissingPDFs does.
+		for _, batch := range batchKeys(ownedKeys) {
+			items, err := keyed.MissingPDFKeys(ctx, batch)
+			if err != nil {
+				return nil, fmt.Errorf("reading Zotio missing-PDF queue: %w", err)
+			}
+			for _, item := range items {
+				if owned[item.Key] {
+					missing[item.Key] = true
+				}
+			}
+		}
 	} else {
-		missing, missingErr = s.CLI.MissingPDF(ctx, "", 500)
-	}
-	if missingErr != nil {
-		return nil, fmt.Errorf("reading Zotio missing-PDF queue: %w", missingErr)
-	}
-	missingKeys := make(map[string]bool, len(missing))
-	for _, item := range missing {
-		if owned[item.Key] {
-			missingKeys[item.Key] = true
+		items, err := s.CLI.MissingPDF(ctx, "", 500)
+		if err != nil {
+			return nil, fmt.Errorf("reading Zotio missing-PDF queue: %w", err)
+		}
+		for _, item := range items {
+			if owned[item.Key] {
+				missing[item.Key] = true
+			}
 		}
 	}
+	missingKeys := missing
 	for i, keys := range workKeys {
 		if len(keys) == 0 {
 			continue
@@ -265,16 +278,23 @@ func (s *Service) itemsHoldingPDF(ctx context.Context, keys []string) (map[strin
 	}
 	sort.Strings(unique)
 	var missing []MissingPDFItem
-	var err error
 	if keyed, ok := s.CLI.(interface {
 		MissingPDFKeys(context.Context, []string) ([]MissingPDFItem, error)
 	}); ok {
-		missing, err = keyed.MissingPDFKeys(ctx, unique)
+		// zotio bounds one keyed read at 50 keys; chunk like LookupWorks.
+		for _, batch := range batchKeys(unique) {
+			items, err := keyed.MissingPDFKeys(ctx, batch)
+			if err != nil {
+				return nil, false
+			}
+			missing = append(missing, items...)
+		}
 	} else {
-		missing, err = s.CLI.MissingPDF(ctx, "", 500)
-	}
-	if err != nil {
-		return nil, false
+		items, err := s.CLI.MissingPDF(ctx, "", 500)
+		if err != nil {
+			return nil, false
+		}
+		missing = items
 	}
 	holding := make(map[string]bool, len(unique))
 	for _, key := range unique {
@@ -289,9 +309,10 @@ func (s *Service) itemsHoldingPDF(ctx context.Context, keys []string) (map[strin
 // itemsConfirmedHoldingPDF narrows itemsHoldingPDF to items that still exist.
 // The missing-PDF queue lists only existing items, so a parent the operator
 // deleted or merged away is absent from it exactly like one that holds a PDF.
-// A key whose item zotio cannot read is dropped: the caller then plans the
-// import normally, and the plan surfaces the missing parent instead of the job
-// being filed as already in the library.
+// Fail-closed: a key whose item zotio cannot read stays unknown (the caller
+// defers the import instead of planning a mutation), because a transient
+// `items get` failure on an item that already holds the PDF would otherwise
+// plan a second `attachments add` and put a duplicate PDF on the item.
 func (s *Service) itemsConfirmedHoldingPDF(ctx context.Context, keys []string) (map[string]bool, bool) {
 	holding, known := s.itemsHoldingPDF(ctx, keys)
 	if !known {
@@ -301,7 +322,15 @@ func (s *Service) itemsConfirmedHoldingPDF(ctx context.Context, keys []string) (
 		if !holds {
 			continue
 		}
-		if _, err := s.CLI.GetItem(ctx, key); err != nil {
+		item, err := s.CLI.GetItem(ctx, key)
+		if err != nil {
+			if isZotioNotFound(err) {
+				delete(holding, key)
+				continue
+			}
+			return nil, false
+		}
+		if item == nil {
 			delete(holding, key)
 		}
 	}

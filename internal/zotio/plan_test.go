@@ -57,10 +57,14 @@ type planCLI struct {
 	applyArgs  []string
 	enrichArgs []string
 	callOrder  []string
-	// desktopDown makes DesktopStatus report a closed desktop; parentGone
-	// makes GetItem report a deleted item.
-	desktopDown bool
-	parentGone  bool
+	// desktopDown makes DesktopStatus report a closed desktop;
+	// desktopUnsupported makes it report ErrDesktopPresenceUnsupported, as an
+	// older zotio without the presence commands does; parentGone makes
+	// GetItem report a deleted item; getItemErr makes it fail transiently.
+	desktopDown        bool
+	desktopUnsupported bool
+	parentGone         bool
+	getItemErr         error
 }
 
 func (c *planCLI) Preflight(context.Context) (*PreflightResult, error) {
@@ -73,6 +77,9 @@ func (c *planCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, er
 	return nil, fmt.Errorf("unexpected MissingPDF")
 }
 func (c *planCLI) GetItem(_ context.Context, key string) (*Item, error) {
+	if c.getItemErr != nil {
+		return nil, c.getItemErr
+	}
 	if c.parentGone {
 		return nil, fmt.Errorf("Zotio item %s not found", key)
 	}
@@ -80,8 +87,11 @@ func (c *planCLI) GetItem(_ context.Context, key string) (*Item, error) {
 }
 
 // DesktopStatus answers the optional presence capability: a desktop that
-// answers, unless the test closes it.
+// answers, unless the test closes it or runs an older zotio.
 func (c *planCLI) DesktopStatus(context.Context) (DesktopStatus, error) {
+	if c.desktopUnsupported {
+		return DesktopStatus{}, ErrDesktopPresenceUnsupported
+	}
 	if c.desktopDown {
 		return DesktopStatus{State: "stopped"}, nil
 	}
@@ -631,6 +641,9 @@ func TestPlanAndApplyFilesPolicyCollectionWithoutRollingBackImport(t *testing.T)
 		preview:       `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
 		apply:         `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
 		collectionErr: errors.New("collection service unavailable"),
+		// The keyed skip reads the missing-PDF queue: the item still lacks
+		// its PDF, so the attach this test exercises proceeds.
+		missing: func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "AB12CD34"}}, nil },
 	}
 	service, jobID := readyPlanService(t, "AB12CD34", cli)
 	row, err := service.Bundle.Jobs.Get(context.Background(), jobID)
@@ -743,6 +756,9 @@ func TestPlanAndApplyAutoEnrichesAppliedParentOnce(t *testing.T) {
 	cli := &planCLI{
 		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
 		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+		// The keyed skip reads the missing-PDF queue: the item still lacks
+		// its PDF, so the attach this test exercises proceeds.
+		missing: func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "AB12CD34"}}, nil },
 	}
 	service, jobID := readyPlanService(t, "AB12CD34", cli)
 	service.AutoEnrich = true
@@ -784,6 +800,9 @@ func TestPlanAndApplyAutoEnrichFailureLeavesImportApplied(t *testing.T) {
 		preview:   `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
 		apply:     `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
 		enrichErr: errors.New("enrichment unavailable"),
+		// The keyed skip reads the missing-PDF queue: the item still lacks
+		// its PDF, so the attach this test exercises proceeds.
+		missing: func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "AB12CD34"}}, nil },
 	}
 	service, jobID := readyPlanService(t, "AB12CD34", cli)
 	service.AutoEnrich = true
@@ -806,6 +825,9 @@ func TestPlanAndApplyAutoEnrichCanBeDisabled(t *testing.T) {
 	cli := &planCLI{
 		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
 		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+		// The keyed skip reads the missing-PDF queue: the item still lacks
+		// its PDF, so the attach this test exercises proceeds.
+		missing: func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "AB12CD34"}}, nil },
 	}
 	service, jobID := readyPlanService(t, "AB12CD34", cli)
 	enablePlanAutoImport(t, service, jobID, "")
@@ -1186,6 +1208,36 @@ func TestPlanAndApplySkipsWhenLibraryAlreadyHasPDF(t *testing.T) {
 	}
 	if row.State != job.StateImported {
 		t.Fatalf("state = %s, want imported", row.State)
+	}
+}
+
+// A failed ownership lookup on the identifier route must not read as "not
+// owned" and plan a create: the library may already hold the paper, and a
+// blind create would duplicate it. The import errors for the retrier
+// instead. On the old code the error was swallowed and the create ran.
+func TestPlanAndApplyDefersUnkeyedItemWhenOwnershipLookupFails(t *testing.T) {
+	ctx := context.Background()
+	broken := &lookupFailCLI{}
+	broken.manifest = reconcileManifest
+	broken.preview = reconcilePreview
+	broken.apply = reconcileCreated
+	service, jobID := readyPlanService(t, "", broken)
+	status, _, _, err := service.PlanAndApply(ctx, jobID)
+	if err == nil {
+		t.Fatal("PlanAndApply err = nil, want the ownership lookup failure to defer the import")
+	}
+	if status == "duplicate" || status == "applied" {
+		t.Fatalf("status = %q, want no import outcome on an unknown library", status)
+	}
+	if broken.previewCalls != 0 || broken.applyCalls != 0 {
+		t.Fatalf("preview=%d apply=%d, want no Zotero mutation planned on an unknown library", broken.previewCalls, broken.applyCalls)
+	}
+	row, err := service.Bundle.Jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State == job.StateImported {
+		t.Fatal("job imported although library ownership could not be read")
 	}
 }
 
@@ -1658,6 +1710,16 @@ func TestAttachStagingBasename(t *testing.T) {
 			want: strings.Repeat("a", attachTitleMaxBytes) + suffix,
 		},
 		{
+			name: "Windows-invalid characters become dashes",
+			work: work.Work{DOI: "10.1000/x", Title: `Is it true? A <b> "quoted" | b * c`},
+			want: "Is it true- A -b- -quoted- - b - c.pdf",
+		},
+		{
+			name: "Windows reserved device name is prefixed",
+			work: work.Work{DOI: "10.1000/x", Title: "CON"},
+			want: "_CON.pdf",
+		},
+		{
 			name:    "dots and spaces use the identifier fallback",
 			work:    work.Work{DOI: "10.1108/jhom-12-2019-0353", Title: " ... "},
 			want:    "10.1108%2Fjhom-12-2019-0353.pdf",
@@ -1682,6 +1744,25 @@ func TestAttachStagingBasename(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("attachStagingBasename() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		base string
+		want bool
+	}{
+		{"CON", "CON", true},
+		{"NUL with extension", "NUL.txt", true},
+		{"COM1", "COM1", true},
+		{"LPT9", "LPT9", true},
+		{"ordinary title", "Is it true", false},
+		{"COM10 is not reserved", "COM10", false},
+		{"prefix of reserved", "CONCERT", false},
+	} {
+		t.Run("reserved/"+tc.name, func(t *testing.T) {
+			if got := isWindowsReservedName(tc.base); got != tc.want {
+				t.Fatalf("isWindowsReservedName(%q) = %t, want %t", tc.base, got, tc.want)
 			}
 		})
 	}

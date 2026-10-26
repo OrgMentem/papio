@@ -165,7 +165,10 @@ func (s *Service) ImportBackfill(ctx context.Context, req ImportBackfillRequest,
 		result.Failed = []ImportBackfillItem{}
 	}
 
-	ownedParents, ownershipKnown := s.resolveImportBackfillOwnership(ctx, candidates)
+	ownedParents, ownershipKnown, ownershipErr := s.resolveImportBackfillOwnership(ctx, candidates)
+	if ownershipErr != nil {
+		return nil, ownershipErr
+	}
 	if !ownershipKnown {
 		result.Summary.AlreadyOwnedUndetermined = true
 	} else {
@@ -451,10 +454,12 @@ func (s *Service) classifyImportBackfillJob(ctx context.Context, jobID string, o
 // resolveImportBackfillOwnership batches LookupWorks the same way apply does so
 // dry-run can report real already-owned counts without one sync per job. For
 // 200 jobs this is four LookupWorks calls (50 works each), each doing one
-// mirror sync — roughly four syncs total, not 200.
-func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates []importBackfillCandidate) (map[string]string, bool) {
+// mirror sync — roughly four syncs total, not 200. The returned error
+// distinguishes a failed lookup from an unconfigured Zotio: callers report
+// the former instead of blaming "not configured".
+func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates []importBackfillCandidate) (map[string]string, bool, error) {
 	if s == nil || s.CLI == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	ownedParents := make(map[string]string, len(candidates))
 	// Jobs that already carry a Zotero item key used to be dropped here, on the
@@ -470,12 +475,14 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 	const batchSize = 50
 	batchJobs := make([]string, 0, batchSize)
 	batchWorks := make([]LookupWork, 0, batchSize)
+	var flushErr error
 	flush := func() bool {
 		if len(batchWorks) == 0 {
 			return true
 		}
 		result, err := s.LookupWorks(ctx, LookupWorksRequest{Works: batchWorks})
 		if err != nil {
+			flushErr = err
 			return false
 		}
 		for i, jobID := range batchJobs {
@@ -493,7 +500,7 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 	for _, candidate := range candidates {
 		row, err := s.Bundle.Jobs.Get(ctx, candidate.JobID)
 		if err != nil {
-			return nil, false
+			return nil, false, err
 		}
 		if key := strings.TrimSpace(row.ZotioItemKey); key != "" {
 			keyedJobs[candidate.JobID] = key
@@ -506,26 +513,28 @@ func (s *Service) resolveImportBackfillOwnership(ctx context.Context, candidates
 		batchWorks = append(batchWorks, LookupWorkFrom(row.Work))
 		if len(batchWorks) == batchSize {
 			if !flush() {
-				return nil, false
+				return nil, false, flushErr
 			}
 		}
 	}
 	if !flush() {
-		return nil, false
+		return nil, false, flushErr
 	}
-	if !s.markKeyedItemsHoldingPDF(ctx, keyedJobs, ownedParents) {
-		return nil, false
+	if err := s.markKeyedItemsHoldingPDF(ctx, keyedJobs, ownedParents); err != nil {
+		return nil, false, err
 	}
-	return ownedParents, true
+	return ownedParents, true, nil
 }
 
 // markKeyedItemsHoldingPDF answers ownership for jobs whose Zotero item is
 // already known. It shares one definition of "holds a PDF" with the
 // auto-import skip so the dry-run's prediction and apply's behaviour cannot
-// diverge — they were two separate exclusions of the same jobs before.
-func (s *Service) markKeyedItemsHoldingPDF(ctx context.Context, keyedJobs, ownedParents map[string]string) bool {
+// diverge — they were two separate exclusions of the same jobs before. It
+// returns an error instead of a bare false so a failed confirmation reads
+// as the lookup failure it is, not as an unconfigured Zotio.
+func (s *Service) markKeyedItemsHoldingPDF(ctx context.Context, keyedJobs, ownedParents map[string]string) error {
 	if len(keyedJobs) == 0 {
-		return true
+		return nil
 	}
 	keys := make([]string, 0, len(keyedJobs))
 	for _, key := range keyedJobs {
@@ -533,14 +542,14 @@ func (s *Service) markKeyedItemsHoldingPDF(ctx context.Context, keyedJobs, owned
 	}
 	holding, known := s.itemsConfirmedHoldingPDF(ctx, keys)
 	if !known {
-		return false
+		return fmt.Errorf("reading zotio item attachments for keyed jobs")
 	}
 	for jobID, key := range keyedJobs {
 		if holding[key] {
 			ownedParents[jobID] = key
 		}
 	}
-	return true
+	return nil
 }
 
 func importBackfillStatusAlreadyInLibrary(status string) bool {

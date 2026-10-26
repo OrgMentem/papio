@@ -4,6 +4,7 @@ package zotio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -227,6 +228,9 @@ func TestImportBackfillApplyIdempotentReplay(t *testing.T) {
 	cli := &planCLI{
 		preview: `{"ok":true,"mode":"preview","plan":{"summary":{"planned":1,"no_op":0,"invalid":0}},"result":null}`,
 		apply:   `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"AB12CD34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`,
+		// The keyed skip reads the missing-PDF queue: the item still lacks
+		// its PDF, so the attach this test exercises proceeds.
+		missing: func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "AB12CD34"}}, nil },
 	}
 	service, jobID := readyPlanService(t, "AB12CD34", cli)
 	enableAutoImportPolicy(t, ctx, service.Store, jobID)
@@ -413,6 +417,32 @@ func TestImportBackfillDryRunOwnershipUndeterminedWithoutCLI(t *testing.T) {
 	}
 }
 
+// A failed ownership lookup is not an unconfigured Zotio: dry-run must
+// surface the error instead of blaming "not configured" and marking every
+// candidate would-import with undetermined ownership.
+func TestImportBackfillDryRunSurfacesOwnershipLookupError(t *testing.T) {
+	ctx := context.Background()
+	broken := &lookupFailCLI{}
+	service, jobID := readyPlanService(t, "", broken)
+	enableAutoImportPolicy(t, ctx, service.Store, jobID)
+	if _, err := service.ImportBackfill(ctx, ImportBackfillRequest{Limit: 10}, nil); err == nil {
+		t.Fatal("ImportBackfill err = nil, want the ownership lookup failure surfaced")
+	}
+}
+
+// lookupFailCLI fails the items-find path that feeds LookupWorks, so the
+// ownership lookup breaks while the CLI stays configured.
+type lookupFailCLI struct {
+	planCLI
+}
+
+func (c *lookupFailCLI) RunJSON(ctx context.Context, args ...string) (json.RawMessage, error) {
+	if strings.Contains(strings.Join(args, " "), "items find") {
+		return nil, errors.New("looking up Zotio doi: boom")
+	}
+	return c.planCLI.RunJSON(ctx, args...)
+}
+
 func TestImportBackfillDuplicateJobResolutionReported(t *testing.T) {
 	ctx := context.Background()
 	service, jobOne := readyPlanService(t, "", &planCLI{})
@@ -525,15 +555,49 @@ func TestImportBackfillOffersRepairBeforeClassifying(t *testing.T) {
 	}
 }
 
-// queueCLI reports zotio's missing-PDF queue. It deliberately does not
-// implement MissingPDFKeys, so this exercises the whole-queue fallback.
+// queueCLI reports zotio's missing-PDF queue through both the historical
+// whole-queue read and the keyed read, mirroring the real client's support
+// for both shapes.
 type queueCLI struct {
 	planCLI
-	missing []MissingPDFItem
+	missing   []MissingPDFItem
+	missingFn func() ([]MissingPDFItem, error)
+	keyCalls  int
 }
 
 func (c *queueCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, error) {
+	if c.missingFn != nil {
+		return c.missingFn()
+	}
 	return c.missing, nil
+}
+
+func (c *queueCLI) MissingPDFKeys(_ context.Context, keys []string) ([]MissingPDFItem, error) {
+	// The real client refuses more than 50 keys per call (client.go).
+	if len(keys) == 0 || len(keys) > 50 {
+		return nil, fmt.Errorf("missing-PDF key lookup requires 1..50 item keys")
+	}
+	c.keyCalls++
+	var items []MissingPDFItem
+	if c.missingFn != nil {
+		var err error
+		if items, err = c.missingFn(); err != nil {
+			return nil, err
+		}
+	} else {
+		items = c.missing
+	}
+	wanted := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		wanted[key] = true
+	}
+	var out []MissingPDFItem
+	for _, item := range items {
+		if wanted[item.Key] {
+			out = append(out, item)
+		}
+	}
+	return out, nil
 }
 
 func seedItemKey(t *testing.T, ctx context.Context, db *store.Store, jobID, itemKey string) {
@@ -589,6 +653,43 @@ func TestImportBackfillOwnsKeyedItemHoldingPDF(t *testing.T) {
 	}
 	if len(result.AlreadyOwned) != 0 {
 		t.Fatalf("already owned items = %#v, want none: the attach is still owed", result.AlreadyOwned)
+	}
+}
+
+// zotio refuses more than 50 keys in one keyed missing-PDF read. Keyed
+// ownership must chunk its keys, or a set over the bound fails the read and,
+// now that the failure propagates, aborts the whole backfill. The public
+// pass caps a run at 50 candidates, so the resolver is driven directly with
+// a larger set; it is the seam any larger caller would reach.
+func TestKeyedOwnershipChunksKeysOverTheFiftyKeyBound(t *testing.T) {
+	ctx := context.Background()
+	dataDir := storetest.DataDir(t)
+	db, err := store.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	created := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+	var candidates []importBackfillCandidate
+	for i := range 60 {
+		jobID := fmt.Sprintf("job_keyed_bulk_%02d", i)
+		seedImportBackfillJob(t, ctx, db, jobID, created, true, "pass", "")
+		seedItemKey(t, ctx, db, jobID, fmt.Sprintf("K%07d", i))
+		candidates = append(candidates, importBackfillCandidate{JobID: jobID, CreatedAt: created})
+	}
+	// Every item holds its PDF: the queue names only an unrelated item.
+	cli := &queueCLI{missing: []MissingPDFItem{{Key: "OTHERKEY"}}}
+	service := importBackfillService(t, dataDir, db, cli)
+	owned, known, err := service.resolveImportBackfillOwnership(ctx, candidates)
+	if err != nil || !known {
+		t.Fatalf("ownership over 60 keyed jobs = known %t, err %v; want a chunked read and no error", known, err)
+	}
+	if cli.keyCalls < 2 {
+		t.Fatalf("keyed missing-PDF calls = %d, want at least 2 for 60 keys", cli.keyCalls)
+	}
+	if len(owned) != 60 {
+		t.Fatalf("owned = %d jobs, want all 60 holding their PDF", len(owned))
 	}
 }
 
@@ -659,6 +760,49 @@ func TestPlanAndApplyDoesNotSkipKeyedItemWhoseParentIsGone(t *testing.T) {
 	}
 	if row.State == job.StateImported {
 		t.Fatal("job imported although its parent item no longer exists")
+	}
+}
+
+// A transient `items get` failure on an item that holds the PDF must not
+// plan a second `attachments add`: the queue absence then means "unknown",
+// so the job errors for the retrier instead of duplicating the PDF. On the
+// old code the error was swallowed, the attach ran, and the item ended with
+// two PDFs.
+func TestPlanAndApplyDefersKeyedItemWhenGetItemFailsTransiently(t *testing.T) {
+	ctx := context.Background()
+	cli := &planCLI{
+		preview: reconcilePreview,
+		apply:   reconcileAttached,
+		missing: func() ([]MissingPDFItem, error) { return nil, nil },
+	}
+	service, jobID := readyPlanService(t, "AB12CD34", cli)
+	cli.getItemErr = errors.New("reading Zotio item AB12CD34: zotio command timed out after 30s")
+	status, _, _, err := service.PlanAndApply(ctx, jobID)
+	if err == nil {
+		t.Fatal("PlanAndApply err = nil, want the transient read failure to defer the import")
+	}
+	if status == "duplicate" {
+		t.Fatal("status = duplicate although the item read failed transiently")
+	}
+	if cli.previewCalls != 0 || cli.applyCalls != 0 {
+		t.Fatalf("preview=%d apply=%d, want no Zotero mutation planned on an unknown item", cli.previewCalls, cli.applyCalls)
+	}
+	row, err := service.Bundle.Jobs.Get(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State == job.StateImported {
+		t.Fatal("job imported although the parent item could not be confirmed")
+	}
+
+	// The same item reads fine on retry: the job then settles as a duplicate.
+	cli.getItemErr = nil
+	status, parentKey, _, err := service.PlanAndApply(ctx, jobID)
+	if err != nil {
+		t.Fatalf("retry PlanAndApply = %v, want the owned item to short-circuit", err)
+	}
+	if status != "duplicate" || parentKey != "AB12CD34" {
+		t.Fatalf("status=%q parent=%q, want duplicate on the known item", status, parentKey)
 	}
 }
 

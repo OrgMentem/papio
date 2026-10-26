@@ -159,11 +159,15 @@ const attachTitleMaxBytes = 180
 // sanitizedTitleBasename reduces a paper title to one safe path component, or
 // returns "" when nothing usable survives. It removes the separators and the
 // control bytes a title can carry - a title is third-party metadata, so it is
-// attacker-influenced in exactly the way a captured filename is.
+// attacker-influenced in exactly the way a captured filename is. It also
+// replaces the Windows-invalid name characters (< > " | ? *) and avoids
+// Windows reserved device names (CON, NUL, COM1..), because staged files must
+// materialize on every supported target; os.Rename fails on Windows when the
+// target holds one.
 func sanitizedTitleBasename(title string) string {
 	cleaned := strings.Map(func(r rune) rune {
 		switch {
-		case r == '/' || r == '\\' || r == ':':
+		case r == '/' || r == '\\' || r == ':' || r == '<' || r == '>' || r == '"' || r == '|' || r == '?' || r == '*':
 			return '-'
 		case r < 0x20 || r == 0x7f:
 			return ' '
@@ -175,11 +179,41 @@ func sanitizedTitleBasename(title string) string {
 	if cleaned == "" {
 		return ""
 	}
+	if isWindowsReservedName(cleaned) {
+		cleaned = "_" + cleaned
+	}
 	for len(cleaned) > attachTitleMaxBytes {
 		cleaned = cleaned[:len(cleaned)-1]
 	}
 	for !utf8.ValidString(cleaned) {
 		cleaned = cleaned[:len(cleaned)-1]
 	}
-	return strings.Trim(cleaned, " .")
+	cleaned = strings.Trim(cleaned, " .")
+	if cleaned == "" {
+		return ""
+	}
+	if isWindowsReservedName(cleaned) {
+		cleaned = "_" + cleaned
+	}
+	return cleaned
+}
+
+// isWindowsReservedName reports whether base is a Windows reserved device
+// name, with or without an extension: CON, PRN, AUX, NUL, COM1-9, LPT1-9.
+func isWindowsReservedName(base string) bool {
+	name := base
+	if i := strings.IndexByte(name, '.'); i >= 0 {
+		name = name[:i]
+	}
+	upper := strings.ToUpper(name)
+	switch upper {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(upper) == 4 && (strings.HasPrefix(upper, "COM") || strings.HasPrefix(upper, "LPT")) {
+		if upper[3] >= '1' && upper[3] <= '9' {
+			return true
+		}
+	}
+	return false
 }

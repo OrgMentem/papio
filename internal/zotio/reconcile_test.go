@@ -233,9 +233,78 @@ func TestAmbiguousCreateReconcilesAgainstTheLibrary(t *testing.T) {
 	})
 }
 
-// A successful mirror sync does not prove that Zotero desktop uploaded or even
-// holds the earlier connector save. With the desktop not answering, an empty
-// library must not reopen the plan: a second create would duplicate the item.
+// An older zotio that cannot report desktop presence can never supply the
+// desktop evidence reconcile waits for — but an empty mirror still proves
+// nothing, because a connector save may have succeeded locally before the
+// timeout and not synced yet. The row holds past the settle window without
+// reopening: a second create would duplicate the item.
+func TestAmbiguousCreateStaysAmbiguousWhenDesktopPresenceIsUnsupported(t *testing.T) {
+	cli := &planCLI{manifest: reconcileManifest, preview: reconcilePreview, apply: reconcileCreated}
+	service, jobID := readyPlanService(t, "", cli)
+	plan := cancelledApply(t, service, cli, jobID)
+	cli.desktopUnsupported = true
+	advance(service, ambiguousSettleWindow+time.Minute)
+	if _, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256); !isUnconfirmed(err) {
+		t.Fatalf("apply with unsupported presence err = %v, want unconfirmed", err)
+	}
+	if cli.applyCalls != 1 {
+		t.Fatalf("apply re-ran the create without desktop evidence: applyCalls = %d", cli.applyCalls)
+	}
+	if status := recordedStatus(t, service, plan); status != "ambiguous" {
+		t.Fatalf("recorded status = %q, want ambiguous", status)
+	}
+	if state := jobState(t, service, jobID); state == job.StateImported {
+		t.Fatal("job imported although the earlier save was never confirmed")
+	}
+}
+
+// The uncloseable gap must not hold forever either. Past the presence hold
+// the row settles into a countable human-action error — the operator checks
+// Zotero and upgrades zotio — instead of another unconfirmed outcome that
+// retries every five minutes without spending the import budget.
+func TestAmbiguousUnsupportedPresenceAgesIntoHumanAction(t *testing.T) {
+	cli := &planCLI{manifest: reconcileManifest, preview: reconcilePreview, apply: reconcileCreated}
+	service, jobID := readyPlanService(t, "", cli)
+	plan := cancelledApply(t, service, cli, jobID)
+	cli.desktopUnsupported = true
+	advance(service, ambiguousPresenceHoldMax+time.Hour)
+	_, err := service.Apply(context.Background(), plan.ID, plan.ConfirmationSHA256)
+	if err == nil || isUnconfirmed(err) {
+		t.Fatalf("apply past the presence hold err = %v, want a countable human-action error", err)
+	}
+	// The app's retry pass skips only the interrupted-apply classes when it
+	// counts the import budget; any other class spends an attempt, which is
+	// what ends the five-minute loop.
+	if class := ErrorInfoFrom(err).Class; class == ErrorClassZotioApplyUnconfirmed || class == ErrorClassReservationConflict {
+		t.Fatalf("human-action error class = %q, want a class that spends the import budget", class)
+	}
+	// The stored hint is what the event and the batch report show, and it is
+	// cut at maxErrorHintBytes: the instruction must survive whole.
+	service.recordAutoImportEvent(context.Background(), jobID, "failed", "", "", err)
+	detail, _ := latestZotioEvent(t, service, jobID, "zotio.auto_import")
+	hint, _ := detail["error_hint"].(string)
+	if len(hint) > maxErrorHintBytes {
+		t.Fatalf("stored hint is %d bytes, over the %d-byte cap: %q", len(hint), maxErrorHintBytes, hint)
+	}
+	for _, want := range []string{"check Zotero", "upgrade zotio"} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("stored hint = %q, want it to name %q", hint, want)
+		}
+	}
+	if class, _ := detail["error_class"].(string); class == ErrorClassZotioApplyUnconfirmed || class == ErrorClassReservationConflict {
+		t.Fatalf("stored error_class = %q, want a class that spends the import budget", class)
+	}
+	if cli.applyCalls != 1 {
+		t.Fatalf("settling the hold re-ran the create: applyCalls = %d", cli.applyCalls)
+	}
+	if status := recordedStatus(t, service, plan); status != "ambiguous" {
+		t.Fatalf("recorded status = %q, want the row left ambiguous", status)
+	}
+	if state := jobState(t, service, jobID); state == job.StateImported {
+		t.Fatal("job imported although the earlier save was never confirmed")
+	}
+}
+
 func TestAmbiguousCreateStaysUnconfirmedWithoutDesktopEvidence(t *testing.T) {
 	cli := &planCLI{manifest: reconcileManifest, preview: reconcilePreview, apply: reconcileCreated}
 	service, jobID := readyPlanService(t, "", cli)

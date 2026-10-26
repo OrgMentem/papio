@@ -337,6 +337,70 @@ func TestLookupWorksClassifiesOwnedByPMID(t *testing.T) {
 	}
 }
 
+// keyedLookupCLI answers the MissingPDFKeys path with per-batch fixtures and
+// counts the calls, so a key set over the 50-key command bound must arrive as
+// several calls. MissingPDF falls back to an error: reaching it means the
+// service did not take the keyed path.
+type keyedLookupCLI struct {
+	fakeCLI
+	missingByKey map[string]bool
+	keyCalls     [][]string
+}
+
+func (c *keyedLookupCLI) MissingPDFKeys(_ context.Context, keys []string) ([]MissingPDFItem, error) {
+	c.keyCalls = append(c.keyCalls, append([]string(nil), keys...))
+	var missing []MissingPDFItem
+	for _, key := range keys {
+		if c.missingByKey[key] {
+			missing = append(missing, MissingPDFItem{Key: key})
+		}
+	}
+	return missing, nil
+}
+
+func (c *keyedLookupCLI) MissingPDF(context.Context, string, int) ([]MissingPDFItem, error) {
+	return nil, errors.New("must use MissingPDFKeys for keyed lookups")
+}
+
+// A full 50-work batch whose works mostly match two items each crosses the
+// 50-key MissingPDFKeys bound. LookupWorks must chunk the key set through
+// several calls and still classify every work, instead of failing the whole
+// lookup with the command's bounds error.
+func TestLookupWorksBatchesOwnedKeysOverFifty(t *testing.T) {
+	works := make([]LookupWork, 0, 30)
+	find := make(map[string]json.RawMessage, 30)
+	missingByKey := map[string]bool{}
+	for i := range 30 {
+		suffix := strings.ToLower(string(rune('A'+i/26)) + string(rune('A'+i%26)))
+		doi := "10.1000/batch" + strings.Repeat("00", 6) + suffix
+		a := "B" + strings.Repeat("0", 5) + string(rune('A'+i/26)) + string(rune('A'+i%26))
+		b := "C" + strings.Repeat("0", 5) + string(rune('A'+i/26)) + string(rune('A'+i%26))
+		find["doi:"+doi] = json.RawMessage(`[{"key":"` + a + `","data":{}},{"key":"` + b + `","data":{}}]`)
+		works = append(works, LookupWork{DOI: doi})
+		missingByKey[a] = true
+		missingByKey[b] = true
+	}
+	cli := &keyedLookupCLI{missingByKey: missingByKey}
+	cli.find = find
+	result, err := (&Service{CLI: cli}).LookupWorks(context.Background(), LookupWorksRequest{Works: works})
+	if err != nil {
+		t.Fatalf("LookupWorks with 60 owned keys = %v, want chunked calls and no error", err)
+	}
+	if len(cli.keyCalls) < 2 {
+		t.Fatalf("MissingPDFKeys calls = %d, want at least 2 batches for 60 keys", len(cli.keyCalls))
+	}
+	for _, batch := range cli.keyCalls {
+		if len(batch) > 50 {
+			t.Fatalf("MissingPDFKeys batch of %d keys exceeds the 50-key bound", len(batch))
+		}
+	}
+	for i, w := range result.Works {
+		if w.Status != OwnershipOwnedMissingPDF {
+			t.Fatalf("work %d = %+v, want owned-missing-PDF", i, w)
+		}
+	}
+}
+
 // Regression: repeat backfill runs re-counted items whose deterministic
 // request already had a live job, turning stuck jobs into recurring
 // "queued 1" notifications. Live requests must report as skipped.

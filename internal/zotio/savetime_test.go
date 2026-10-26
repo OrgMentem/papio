@@ -289,7 +289,10 @@ func TestCommittedConflictAttachesToTheCommittedItemAndNeverCreatesAgain(t *test
 	}
 
 	// Once the mirror shows the committed item, the PDF goes to that item.
+	// The queue lists it as missing its PDF: the create saved the item but
+	// not the file, which is why the attach is owed.
 	cli.found = `[{"key":"PA12RE34","data":{"key":"PA12RE34","itemType":"journalArticle"}}]`
+	cli.missing = func() ([]MissingPDFItem, error) { return []MissingPDFItem{{Key: "PA12RE34"}}, nil }
 	cli.apply = `{"ok":true,"mode":"apply","plan":{"summary":{"planned":1}},"result":{"summary":{"applied":1,"no_op":0,"conflicts":0,"failed":0},"items":[{"key":"PA12RE34","status":"applied","reason":{"item_key":"AT56CH90","upload":"uploaded"}}]}}`
 	status, parentKey, _, err := service.PlanAndApply(context.Background(), jobID)
 	if err != nil || status != "applied" || parentKey != "PA12RE34" {
