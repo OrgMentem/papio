@@ -42,8 +42,9 @@ func TestRankIsDeterministicAndPolicyOrdered(t *testing.T) {
 
 func TestRankHonorsDesiredVersion(t *testing.T) {
 	cands := []Candidate{
-		{Source: "unpaywall", URL: "https://u/pub", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 0.95},
-		{Source: "arxiv", URL: "https://a/pre", Version: VersionPreprint, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 0.95},
+		{Source: "unpaywall", URL: "https://u/pub", Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 0.95, Direct: true},
+		{Source: "core", URL: "https://c/acc", Version: VersionAccepted, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 0.95, Direct: true},
+		{Source: "arxiv", URL: "https://a/pre", Version: VersionPreprint, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: 0.95, Direct: true},
 	}
 	ranked, _ := Rank(VersionPreprint, cands)
 	if ranked[0].Version != VersionPreprint {
@@ -52,6 +53,37 @@ func TestRankHonorsDesiredVersion(t *testing.T) {
 	ranked, _ = Rank("any", cands)
 	if ranked[0].Version != VersionPublished {
 		t.Fatalf("desired any but first = %s, want published preference", ranked[0].Version)
+	}
+	// An accepted-manuscript request must surface the accepted candidate
+	// first when all three versions are otherwise tied: without this row a
+	// refactor that ranks published above accepted passes the suite and
+	// silently serves the publisher version to --desired-version accepted.
+	ranked, _ = Rank(VersionAccepted, cands)
+	for i, want := range []string{VersionAccepted, VersionPublished, VersionPreprint} {
+		if ranked[i].Version != want {
+			t.Fatalf("desired accepted order[%d] = %s, want %s", i, ranked[i].Version, want)
+		}
+	}
+}
+
+// The confidence-bucket edges must order the higher bucket first: the old
+// fixtures used only 0.95 and 0.4, so a shift of the 0.7 or 0.5 boundary
+// passed green.
+func TestRankConfidenceBucketEdgePrefersHigherBucket(t *testing.T) {
+	base := func(conf float64, rawURL string) Candidate {
+		return Candidate{Source: "unpaywall", URL: rawURL, Version: VersionPublished, AccessBasis: AccessOpen, ReuseLicense: "unknown", IdentityConfidence: conf, Direct: true}
+	}
+	for _, tc := range []struct {
+		high, low float64
+	}{
+		{high: 0.7, low: 0.69},
+		{high: 0.5, low: 0.49},
+	} {
+		ranked, _ := Rank("any", []Candidate{base(tc.low, "https://u/low"), base(tc.high, "https://u/high")})
+		if ranked[0].IdentityConfidence != tc.high || ranked[1].IdentityConfidence != tc.low {
+			t.Fatalf("bucket edge order = [%v %v], want [%v %v]",
+				ranked[0].IdentityConfidence, ranked[1].IdentityConfidence, tc.high, tc.low)
+		}
 	}
 }
 
