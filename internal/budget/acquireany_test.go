@@ -69,6 +69,8 @@ func TestAcquireAnyFallsBackOnQuotaGate(t *testing.T) {
 	}
 }
 
+// An ordinary gate is not a credential-switch licence: AcquireAny must return
+// the durable, non-quota refusal without spending another identity's allowance.
 func TestAcquireAnyOrdinaryGateNoFallback(t *testing.T) {
 	m := testManager(t)
 	ctx := context.Background()
@@ -89,6 +91,9 @@ func TestAcquireAnyOrdinaryGateNoFallback(t *testing.T) {
 	}
 	if deferred.Advisory {
 		t.Fatalf("deferral = %+v, want the durable gate", deferred)
+	}
+	if deferred.Quota {
+		t.Fatalf("deferred.Quota = true, want an ordinary gate")
 	}
 	anonSnap, err := m.Snapshot(ctx, "openalex", anon)
 	if err != nil {
@@ -246,30 +251,6 @@ func TestAcquireAnyFallsBackWhenTheFloorLandsAfterItsPreCheck(t *testing.T) {
 	}
 	if anonSnap.RequestsInWindow != 1 {
 		t.Fatalf("anonymous reservations = %d, want the admitted call metered here", anonSnap.RequestsInWindow)
-	}
-}
-
-// An ordinary gate is NOT a credential-switch licence: it says this source is
-// unavailable no matter who asks, so AcquireAny must return it rather than
-// spending a second identity's allowance on a refusal that has nothing to do
-// with quota.
-func TestAcquireAnyDoesNotFallBackOnAnOrdinaryGate(t *testing.T) {
-	m := testManager(t)
-	keyed, anon := keyedAndAnon()
-	ctx := context.Background()
-	if err := m.Defer(ctx, "openalex", keyed, time.Now().UTC().Add(6*time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	chosen, err := m.AcquireAny(ctx, "openalex", []config.Source{keyed, anon}, 0)
-	var deferred *ErrDeferred
-	if !errors.As(err, &deferred) {
-		t.Fatalf("AcquireAny = %v, want the ordinary gate returned", err)
-	}
-	if deferred.Quota {
-		t.Fatalf("deferred.Quota = true, want an ordinary gate")
-	}
-	if chosen.APIKey != keyed.APIKey {
-		t.Fatalf("chosen = %+v, want the keyed identity that was actually refused", chosen)
 	}
 }
 
