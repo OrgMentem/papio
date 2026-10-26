@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1143,6 +1144,51 @@ func seedValidatingCandidate(t *testing.T, svc *Service, jobs *job.Store, wrName
 	sum := sha256.Sum256(body)
 	sha := hex.EncodeToString(sum[:])
 	return row, candidate, body, tempPath, sha
+}
+
+func TestValidationPDFInfoFailureKeepsCandidate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake worker is a POSIX shell script")
+	}
+	ctx := t.Context()
+	svc, jobs := newTestService(t)
+	row, candidate, body, tempPath, sha := seedValidatingCandidate(t, svc, jobs,
+		"wr_pdfinfo_unavailable", "pdfinfo-unavailable", "pdfinfo-unavailable")
+	worker := filepath.Join(t.TempDir(), "worker")
+	if err := os.WriteFile(worker, []byte("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"Valid\":true,\"Pages\":2}'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pdfinfo := filepath.Join(t.TempDir(), "missing-pdfinfo")
+	svc.Validate = func(ctx context.Context, path, mime string, target work.Work) (pdf.ValidationReport, error) {
+		return pdf.Validate(ctx, pdf.ValidationInput{
+			Path: path, DeclaredMIME: mime, WorkerBinary: worker, Target: target,
+		}, pdf.ValidationOptions{Structural: pdf.StructuralOptions{PDFInfoPath: pdfinfo}})
+	}
+	accepted, parked, err := svc.validateCandidate(ctx, row, candidate, fetch.Result{
+		TempPath: tempPath, SHA256: sha, SizeBytes: int64(len(body)),
+		SniffedMIME: "application/pdf", ContentType: "application/pdf",
+	})
+	if err != nil || accepted || !parked {
+		t.Fatalf("accepted=%v parked=%v err=%v, want indeterminate validation parked for review", accepted, parked, err)
+	}
+	got, err := jobs.Get(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.StateNeedsReview {
+		t.Fatalf("state=%s, want needs_review", got.State)
+	}
+	stored, err := jobs.GetCandidate(ctx, candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "skipped" {
+		t.Fatalf("candidate status=%s, want skipped rather than invalid", stored.Status)
+	}
+	retained, err := os.ReadFile(tempPath)
+	if err != nil || string(retained) != string(body) {
+		t.Fatalf("quarantine file changed or disappeared: err=%v", err)
+	}
 }
 
 func TestValidationPersistsArtifactMetadataBeforePromotion(t *testing.T) {
