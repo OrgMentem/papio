@@ -178,6 +178,10 @@ func TestArtifactsTextRejectsBadRangesAndByteCaps(t *testing.T) {
 		"negative":        {"job_id": id, "first_page": -1},
 		"over the cap":    {"job_id": id, "max_bytes": pdf.MaxTextBytes + 1},
 		"negative budget": {"job_id": id, "max_bytes": -1},
+		// An explicit zero is not the omitted-cap default: the CLI refuses
+		// --max-bytes 0, so the RPC refuses max_bytes 0 the same way
+		// instead of silently serving the full default read.
+		"explicit zero budget": {"job_id": id, "max_bytes": 0},
 	} {
 		rpcErr := callMethod(t, router, "artifacts.text_v1", params, nil)
 		if rpcErr == nil || rpcErr.Code != "invalid_argument" {

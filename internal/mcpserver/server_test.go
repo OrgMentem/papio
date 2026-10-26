@@ -178,6 +178,114 @@ func TestAcquireBatchCreatesReportableCLICompatibleManifest(t *testing.T) {
 	}
 }
 
+// TestAcquireBatchKeepsOutputWhenSubmitPartiallyFails pins the agent-facing
+// half of the partial-failure contract: batch.Submit returns (output,
+// firstErr) when jobs were created but a later per-work read failed, and the
+// tool must surface the batch id and the created jobs alongside the error —
+// not an error alone that leaves the caller unable to wait on the work.
+// Deleting the output-preserving branch from handleAcquireBatch (returning
+// only the error text) fails this test.
+func TestAcquireBatchKeepsOutputWhenSubmitPartiallyFails(t *testing.T) {
+	cfg := config.Default()
+	cfg.AccessMode = config.ModeConservative
+	cfg.DataDir = storetest.DataDir(t)
+	system, err := bootstrap.New(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = system.Close() })
+
+	now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	fake := &fakeRPC{handler: func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "zotio.lookup_works":
+			return zotio.LookupWorksResult{Works: []zotio.WorkOwnership{
+				{Status: zotio.OwnershipNotOwned},
+				{Status: zotio.OwnershipNotOwned},
+			}}, nil
+		case "acquire.submit_v2":
+			var input struct {
+				Request protocol.WorkRequest `json:"request"`
+			}
+			if err := json.Unmarshal(params, &input); err != nil {
+				return nil, err
+			}
+			result, err := system.App.SubmitWithOptionsAs(context.Background(), job.PrincipalMCP, input.Request,
+				app.SubmitOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return struct {
+				JobID    string `json:"job_id"`
+				Existing bool   `json:"existing"`
+			}{JobID: result.JobID, Existing: result.Existing}, nil
+		case "jobs.get":
+			// One work's state read fails after its job was created, the
+			// exact shape batch.Submit reports as (output, firstErr).
+			var input struct {
+				JobID string `json:"job_id"`
+			}
+			if err := json.Unmarshal(params, &input); err != nil {
+				return nil, err
+			}
+			row, err := system.Jobs.Get(context.Background(), input.JobID)
+			if err != nil {
+				return nil, err
+			}
+			if row.Work.DOI == "10.1000/partial-state" {
+				return nil, fmt.Errorf("injected: state read failed for %s", input.JobID)
+			}
+			return struct {
+				Job *job.Row `json:"job"`
+			}{Job: row}, nil
+		default:
+			return nil, fmt.Errorf("unexpected method %q", method)
+		}
+	}}
+	c := newTestClient(t, system, toolDependencies{
+		caller: callerFunc(fake.Call),
+		now:    func() time.Time { return now },
+		wait:   waitForPoll,
+	}, nil)
+
+	res := callTool(t, c, "papio_acquire_batch", map[string]any{
+		"works": []any{
+			map[string]any{"doi": "10.1000/partial-ok", "title": "Partial OK"},
+			map[string]any{"doi": "10.1000/partial-state", "title": "Partial state"},
+		},
+		"label": "partial",
+	})
+	if !res.IsError {
+		t.Fatalf("partial failure should report an error: %+v", res)
+	}
+	text := resultText(res)
+	var output batch.SubmitOutput
+	if err := json.Unmarshal([]byte(strings.SplitN(text, "\n", 2)[0]), &output); err != nil {
+		// The batch id must be recoverable from the payload itself: the
+		// error text alone names the work, not the batch.
+		t.Fatalf("partial-failure result carries no batch payload: %q (%v)", text, err)
+	}
+	if output.BatchID == "" {
+		t.Fatalf("partial-failure result has no batch id: %q", text)
+	}
+	if len(output.Submitted) != 2 {
+		t.Fatalf("partial-failure result lost submissions: %+v", output)
+	}
+	ids := map[string]bool{}
+	for _, submitted := range output.Submitted {
+		if submitted.JobID == "" {
+			t.Fatalf("partial-failure result names a jobless submission: %+v", output.Submitted)
+		}
+		ids[submitted.JobID] = true
+	}
+	if len(ids) != 2 {
+		t.Fatalf("partial-failure result lost a job id: %+v", output.Submitted)
+	}
+	if !strings.Contains(text, output.BatchID) {
+		t.Fatalf("partial-failure error text %q does not name batch %q", text, output.BatchID)
+	}
+}
+
 func TestBatchWaitToolSettlesAndTimesOut(t *testing.T) {
 	t.Run("settles", func(t *testing.T) {
 		now := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)

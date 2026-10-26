@@ -213,6 +213,40 @@ func TestValidateArgs(t *testing.T) {
 	if err := validateArgs("alpha --secret"); err == nil {
 		t.Errorf("raw flag token accepted in args")
 	}
+	// An unterminated quote is not a token: the caller must see a parse
+	// error, never an executed command with the quote silently removed.
+	for _, bad := range []string{`acquire '10.1000/foo`, `acquire "10.1000/foo`, `alpha\`} {
+		if err := validateArgs(bad); err == nil {
+			t.Errorf("validateArgs(%q) accepted malformed quoting", bad)
+		}
+	}
+}
+
+// TestValidateArgsRejectsUnterminatedQuotesWithoutExecution pins the agent
+// safety half of the fix: malformed args fail before any command runs, so a
+// truncated identifier can never execute as a different positional value.
+func TestValidateArgsRejectsUnterminatedQuotesWithoutExecution(t *testing.T) {
+	for _, args := range []string{`'10.1000/foo`, `"10.1000/foo`} {
+		if err := validateArgs(args); err == nil || (!strings.Contains(err.Error(), "unterminated") && !strings.Contains(err.Error(), "escape")) {
+			t.Fatalf("validateArgs(%q) = %v, want an unterminated-quote error", args, err)
+		}
+		var req mcplib.CallToolRequest
+		req.Params.Name = "parent child"
+		req.Params.Arguments = map[string]any{"name": "parent child", "args": args}
+		res, handlerErr := commandRunHandler(testFactory())(context.Background(), req)
+		if handlerErr != nil {
+			t.Fatalf("command_run(%q) handler error: %v", args, handlerErr)
+		}
+		if !res.IsError {
+			t.Fatalf("command_run(%q) succeeded: malformed args reached the command", args)
+		}
+		if got := resultText(res); !strings.Contains(got, "unterminated") {
+			t.Fatalf("command_run(%q) error = %q, want the quote error", args, got)
+		}
+		if got := resultText(res); strings.Contains(got, "child args=") {
+			t.Fatalf("command_run(%q) executed the command: %q", args, got)
+		}
+	}
 }
 
 func TestCliArgsFromMCP(t *testing.T) {
@@ -231,10 +265,18 @@ func TestCliArgsFromMCP(t *testing.T) {
 }
 
 func TestSplitShellArgs(t *testing.T) {
-	got := splitShellArgs(`a "b c" 'd e' f\ g`)
+	got, err := splitShellArgs(`a "b c" 'd e' f\ g`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"a", "b c", "d e", "f g"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("splitShellArgs = %v, want %v", got, want)
+	}
+	for _, bad := range []string{`a 'b c`, `a "b c`, `a b\`} {
+		if _, err := splitShellArgs(bad); err == nil {
+			t.Fatalf("splitShellArgs(%q) accepted malformed quoting", bad)
+		}
 	}
 }
 
