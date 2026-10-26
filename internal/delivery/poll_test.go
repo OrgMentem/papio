@@ -543,6 +543,38 @@ func TestPollContractDriftDisablesPolling(t *testing.T) {
 	}
 }
 
+func TestPollInvalidStoredReferenceDisablesPollingWithoutError(t *testing.T) {
+	svc, clock := testServiceClock(t)
+	ctx := context.Background()
+	req := newLiveRequest(t, svc, "invalid-reference", *clock)
+	if err := svc.RecordPoll(ctx, req.ID, "TN-42", clock.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	req, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A nil client also proves that malformed references never reach HTTP.
+	result, err := svc.Poll(ctx, req, PollDeps{})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if result.Settled || result.State != StateSubmitted || !result.NextCheckAt.After(*clock) {
+		t.Fatalf("Poll = %+v, want live request with polling disabled", result)
+	}
+	got, err := svc.Get(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProviderReference != "TN-42" || got.State != StateSubmitted ||
+		got.LastPollErrorClass != PollErrorClassInvalidReference || got.ConsecutivePollFailures != 1 {
+		t.Fatalf("stored request = %+v, want unchanged reference/state and one invalid-reference failure", got)
+	}
+	if _, err := svc.Poll(ctx, got, PollDeps{}); err != nil {
+		t.Fatalf("repeat Poll: %v", err)
+	}
+}
+
 // --- 404 propagation delay and reconciliation ---------------------------
 
 func TestPoll404BeforeAnySuccessIsPropagationDelayNotUnknownOutcome(t *testing.T) {

@@ -32,9 +32,8 @@ import (
 // SQLite store (the same setup newTestService in app_test.go uses) plus a
 // delivery.Service over that same store, so tests can inspect
 // delivery_requests rows directly rather than only observing job state.
-// Fetch/Validate are wired to fail the test if ever called: every test here
-// exhausts candidates by resolving zero of them, so the fetch/validate loop
-// must never run.
+// Fetch defaults to failing the test: most delivery tests resolve zero
+// candidates. Tests of candidate exhaustion replace it explicitly.
 func newDeliveryTestService(t *testing.T) (*Service, *job.Store, *delivery.Service) {
 	t.Helper()
 	ctx := context.Background()
@@ -387,6 +386,130 @@ func TestExhaustedCandidatesAutoCapableProfileSubmitsAndParksPending(t *testing.
 
 	if n := gateEventCount(t, jobs, id); n != 1 {
 		t.Fatalf("delivery.gate_evaluated events = %d, want exactly 1", n)
+	}
+}
+
+func TestExhaustedDownloadsAutoSubmitAndParkPending(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts.Add(1)
+		}
+		_, _ = w.Write([]byte(`{"TransactionNumber":4821,"TransactionStatus":"Awaiting Request Processing"}`))
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
+	svc.Resolvers = []ResolverEntry{{
+		Adapter: &fakeResolver{name: "fixture", cands: []resolver.Candidate{{
+			Source: "fixture", URL: "https://example.test/paper.pdf",
+			Version: resolver.VersionPublished, AccessBasis: resolver.AccessOpen,
+			ReuseLicense: "unknown", Direct: true, IdentityConfidence: 1,
+		}}},
+		Policy: config.Source{Enabled: true},
+	}}
+	fetches := 0
+	svc.Fetch = func(context.Context, resolver.Candidate, string) (fetch.Result, error) {
+		fetches++
+		return fetch.Result{}, &fetch.Error{Class: fetch.ClassInvalid, HTTPStatus: http.StatusNotFound, Msg: "permanent HTTP response"}
+	}
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_exhausted_downloads", "10.1000/exhausted-downloads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatalf("Process after exhausted downloads: %v", err)
+	}
+	if fetches != 1 || posts.Load() != 1 {
+		t.Fatalf("fetches = %d, posts = %d; want one of each", fetches, posts.Load())
+	}
+	request, err := deliverySvc.GetByJobID(ctx, id)
+	if err != nil || request == nil {
+		t.Fatalf("delivery request = %+v, %v", request, err)
+	}
+	if request.State != delivery.StateSubmitted || request.ProviderReference != "4821" {
+		t.Fatalf("delivery request = %+v, want submitted with reference 4821", request)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil || got.State != job.StateRetryWait {
+		t.Fatalf("job = %+v, %v; want retry_wait", got, err)
+	}
+}
+
+func TestProcessInvalidStoredDeliveryReferenceOpensReconciliation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid provider reference must not reach the provider")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	svc, jobs, deliverySvc := newAutoCapableDeliveryService(t, server)
+	ctx := context.Background()
+	id, err := svc.Submit(ctx, deliveryWorkRequest("wr_invalid_delivery_ref", "10.1000/invalid-delivery-ref"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := deliverySvc.Create(ctx, delivery.CreateRequest{
+		JobID: id, InstitutionProfile: "default", Provider: "illiad",
+		RequestClass: "digital_journal_article", WorkIdentity: "doi:10.1000/invalid-delivery-ref",
+		State: delivery.StatePending, ProviderReference: "TN-42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatalf("Process with stored invalid reference: %v", err)
+	}
+	got, err := jobs.Get(ctx, id)
+	if err != nil || got.State != job.StateAwaitingHuman {
+		t.Fatalf("job = %+v, %v; want awaiting_human", got, err)
+	}
+	stored, err := deliverySvc.Get(ctx, request.ID)
+	if err != nil || stored.LastPollErrorClass != delivery.PollErrorClassInvalidReference {
+		t.Fatalf("delivery request = %+v, %v; want invalid-reference failure", stored, err)
+	}
+	actions, err := jobs.ListHumanActionsForJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, action := range actions {
+		if action.Action.Kind == job.ActionKindDocumentDelivery && action.Action.Status == "open" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no open document_delivery reconciliation action")
+	}
+	result, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: id, Operation: DeliveryConfirmRequestExists, ProviderReference: "42",
+	})
+	if err != nil {
+		t.Fatalf("correct reference: %v", err)
+	}
+	if result.Request.LastPollErrorClass != "" || result.Request.ConsecutivePollFailures != 0 {
+		t.Fatalf("corrected request retains invalid-reference failure: %+v", result.Request)
+	}
+	if err := jobs.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	row, err = jobs.ClaimNext(ctx, "w", time.Minute)
+	if err != nil || row == nil {
+		t.Fatalf("claim corrected request = %+v, %v", row, err)
+	}
+	if err := svc.Process(ctx, row); err != nil {
+		t.Fatalf("early Process after correction: %v", err)
+	}
+	got, err = jobs.Get(ctx, id)
+	if err != nil || got.State != job.StateRetryWait {
+		t.Fatalf("corrected job = %+v, %v; want retry_wait", got, err)
 	}
 }
 
@@ -2953,19 +3076,24 @@ func TestReconcileDeliveryConfirmExistsAndRefusals(t *testing.T) {
 	}); err == nil {
 		t.Fatal("confirm-exists without a provider reference was accepted")
 	}
+	if _, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
+		JobID: id, Operation: DeliveryConfirmRequestExists, ProviderReference: "TN-42",
+	}); !errors.Is(err, ErrDeliveryInvalidProviderReference) {
+		t.Fatalf("non-numeric reference err = %v, want ErrDeliveryInvalidProviderReference", err)
+	}
 	// Every refusal above must leave the parked job and its open action alone.
 	if parked, err := jobs.Get(ctx, id); err != nil || parked.State != job.StateAwaitingHuman {
 		t.Fatalf("job after refusals = %+v, %v; want still awaiting_human", parked, err)
 	}
 
 	result, err := svc.ReconcileDelivery(ctx, DeliveryReconciliationInput{
-		JobID: id, Operation: DeliveryConfirmRequestExists, ProviderReference: "T-4242",
+		JobID: id, Operation: DeliveryConfirmRequestExists, ProviderReference: "4242",
 	})
 	if err != nil {
 		t.Fatalf("confirm-exists: %v", err)
 	}
 	if result.JobState != job.StateRetryWait || result.Request == nil ||
-		result.Request.State != delivery.StatePending || result.Request.ProviderReference != "T-4242" {
+		result.Request.State != delivery.StatePending || result.Request.ProviderReference != "4242" {
 		t.Fatalf("confirm-exists result = %+v", result)
 	}
 	after, err := jobs.Get(ctx, id)

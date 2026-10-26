@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"papio/internal/app"
@@ -436,8 +437,8 @@ func deliveryAction(ctx context.Context, raw json.RawMessage, system *bootstrap.
 		}
 		return marshal(DeliveryActionResult{JobID: params.JobID, Operation: params.Operation, Detail: detail})
 	case deliveryOpConfirmRequestExists:
-		if strings.TrimSpace(params.ProviderReference) == "" {
-			return badParams(errors.New("provider_reference is required for confirm_request_exists"))
+		if number, err := strconv.Atoi(params.ProviderReference); err != nil || number <= 0 {
+			return badParams(app.ErrDeliveryInvalidProviderReference)
 		}
 		return deliveryConfirmRequestExists(ctx, system, params.JobID, params.ProviderReference)
 	case deliveryOpConfirmRequestAbsent:
@@ -474,6 +475,8 @@ func deliveryReconcile(ctx context.Context, system *bootstrap.System, jobID, ope
 			return nil, &ipc.RPCError{Code: "precondition_failed", Message: "document delivery is not configured"}
 		case errors.Is(err, app.ErrDeliveryRequestNotFound), errors.Is(err, app.ErrDeliveryReconciliationNotFound):
 			return nil, &ipc.RPCError{Code: "not_found", Message: err.Error()}
+		case errors.Is(err, app.ErrDeliveryInvalidProviderReference):
+			return badParams(err)
 		default:
 			return failure(err)
 		}

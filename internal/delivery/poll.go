@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math/rand/v2"
 	"strconv"
 	"strings"
@@ -63,6 +62,7 @@ const (
 	PollErrorClassContractDrift            = "contract_drift"
 	PollErrorClassNotFoundPropagationDelay = "not_found_propagation_delay"
 	PollErrorClassNotFoundReconciling      = "not_found_reconciling"
+	PollErrorClassInvalidReference         = "invalid_provider_reference"
 )
 
 // Well-known, terminal-meaning ILLiad TransactionStatus values. ILLiad
@@ -220,8 +220,10 @@ func (s *Service) Poll(ctx context.Context, req *Request, deps PollDeps) (PollRe
 		}
 	}
 	number, convErr := strconv.Atoi(req.ProviderReference)
-	if convErr != nil {
-		return PollResult{}, fmt.Errorf("delivery: poll: request %d has a non-numeric provider reference %q", req.ID, req.ProviderReference)
+	if convErr != nil || number <= 0 {
+		// Old rows can predate ingress validation. Keep the request live,
+		// disable this poll, and let the owning job ask for reconciliation.
+		return s.recordPollFailureAt(ctx, req, now, PollErrorClassInvalidReference, now.Add(pollDisabledDelay))
 	}
 	txn, err := deps.Client.GetTransaction(ctx, number)
 	if err != nil {

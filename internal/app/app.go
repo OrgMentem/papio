@@ -2984,9 +2984,10 @@ const (
 )
 
 var (
-	ErrDeliveryNotConfigured          = errors.New("delivery: document delivery is not configured")
-	ErrDeliveryRequestNotFound        = errors.New("delivery: no request for this job")
-	ErrDeliveryReconciliationNotFound = errors.New("delivery: no open document_delivery action for this job")
+	ErrDeliveryNotConfigured            = errors.New("delivery: document delivery is not configured")
+	ErrDeliveryRequestNotFound          = errors.New("delivery: no request for this job")
+	ErrDeliveryReconciliationNotFound   = errors.New("delivery: no open document_delivery action for this job")
+	ErrDeliveryInvalidProviderReference = errors.New("delivery: provider reference must be a positive transaction number")
 
 	// ErrCompensationIncomplete marks the one failure shape where the operator's
 	// verb COMMITTED and only its follow-up write failed. Every seam must tell
@@ -3046,8 +3047,8 @@ func (s *Service) ReconcileDelivery(ctx context.Context, input DeliveryReconcili
 
 	switch input.Operation {
 	case DeliveryConfirmRequestExists:
-		if strings.TrimSpace(input.ProviderReference) == "" {
-			return DeliveryReconciliationResult{}, errors.New("delivery: provider reference is required")
+		if number, err := strconv.Atoi(input.ProviderReference); err != nil || number <= 0 {
+			return DeliveryReconciliationResult{}, ErrDeliveryInvalidProviderReference
 		}
 		profile, err := s.Delivery.ResolveGateProfileFor(ctx, request.InstitutionProfile)
 		if err != nil {
@@ -3499,6 +3500,19 @@ func illiadTransactionRequest(w work.Work, patronRef, idempotencyKey string) ill
 // makes this a genuine duplicate — Decision 1 forbids a second attempt
 // there, so it routes to reconciliation instead.
 func (s *Service) submitDeliveryRequest(ctx context.Context, row *job.Row, from, profileName string, dd *config.DocumentDelivery, requestClass, workIdentity, key string, profile delivery.GateProfile) (*delivery.Request, error) {
+	// Exhausted downloads arrive in fetching. Return to the submission owner
+	// state before creating a row, so both submission CAS guards still apply.
+	if from == job.StateFetching {
+		if err := s.Jobs.Transition(ctx, row.ID, from, job.StateResolving, deliveryCutoverDetail(ctx, map[string]any{
+			"reason": "document_delivery_submission",
+		})); err != nil {
+			if errors.Is(err, job.ErrConflict) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		from = job.StateResolving
+	}
 	duplicate := false
 	created, err := s.Delivery.Create(ctx, delivery.CreateRequest{
 		JobID:              row.ID,
@@ -3638,8 +3652,23 @@ func (s *Service) submitToProvider(ctx context.Context, row *job.Row, from strin
 		return created, err
 	}
 	if !reserved {
-		return created, fmt.Errorf("%w: delivery request %d can no longer be submitted for job %s: the request was cancelled or resolved, or the job is no longer resolving; nothing was sent to the provider",
-			job.ErrConflict, created.ID, row.ID)
+		current, err := s.Jobs.Get(ctx, row.ID)
+		if err != nil {
+			return created, err
+		}
+		if current.State != from {
+			return created, nil
+		}
+		// Another writer changed the request. Re-read its outcome on the next
+		// pass, rather than ending the worker or sending an unreserved POST.
+		err = s.Jobs.Transition(ctx, row.ID, from, job.StateRetryWait, deliveryCutoverDetail(ctx, map[string]any{
+			"reason":              string(job.RetryReasonDocumentDeliveryPending),
+			"delivery_request_id": created.ID,
+		}), job.WithRetryAt(s.Now().Add(time.Minute)))
+		if errors.Is(err, job.ErrConflict) {
+			err = nil
+		}
+		return created, err
 	}
 	// Commit an ambiguous classification before the irreversible provider
 	// request. Only a proven pre-send failure below can narrow it.
@@ -3938,6 +3967,9 @@ func (s *Service) joinDeliveryPoll(ctx context.Context, row *job.Row, from strin
 	})
 	if err != nil {
 		return err
+	}
+	if existing.LastPollErrorClass == delivery.PollErrorClassInvalidReference {
+		return s.openDeliveryReconciliationAction(ctx, row, from, existing)
 	}
 	if result.Settled {
 		if result.State == delivery.StateFulfilled {

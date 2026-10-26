@@ -17344,7 +17344,7 @@ func TestDeliveryReconcileConfirmExistsConvergesDriftAndReplaysAsNoOp(t *testing
 	}
 	request := protocol.DeliveryReconcilePayload{
 		RequestID: "request-bridge-delivery-exists",
-		JobID:     jobID, Operation: "confirm_request_exists", ProviderReference: "new-reference",
+		JobID:     jobID, Operation: "confirm_request_exists", ProviderReference: "4242",
 	}
 	first := deliveryReconcileResult(t, b, request)
 	if first.Outcome != "applied" || first.Detail != "" {
@@ -17355,7 +17355,7 @@ func TestDeliveryReconcileConfirmExistsConvergesDriftAndReplaysAsNoOp(t *testing
 	if err != nil || row == nil {
 		t.Fatalf("delivery row after confirm exists = %#v, %v", row, err)
 	}
-	if row.State != delivery.StatePending || row.ProviderReference != "new-reference" || row.NextCheckAt == "" {
+	if row.State != delivery.StatePending || row.ProviderReference != "4242" || row.NextCheckAt == "" {
 		t.Fatalf("delivery row after confirm exists = %+v, want pending/new reference/scheduled poll", row)
 	}
 	jobRow, err := jobs.Get(ctx, jobID)

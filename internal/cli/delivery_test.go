@@ -180,11 +180,11 @@ func TestDeliveryActionOperations(t *testing.T) {
 		},
 		{
 			name:        "confirm-exists sends the provider reference",
-			args:        []string{"delivery", "confirm-exists", "job_01", "TN-42"},
+			args:        []string{"delivery", "confirm-exists", "job_01", "42"},
 			operation:   "confirm_request_exists",
-			providerRef: "TN-42",
+			providerRef: "42",
 			result:      api.DeliveryActionResult{JobID: "job_01", Operation: "confirm_request_exists", JobState: "retry_wait"},
-			wantExact:   "job_01: confirmed pending with reference TN-42; job is now retry_wait\n",
+			wantExact:   "job_01: confirmed pending with reference 42; job is now retry_wait\n",
 		},
 		{
 			name:      "confirm-absent reports the job state without a reference",
