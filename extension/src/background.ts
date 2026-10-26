@@ -12764,14 +12764,50 @@ export class Bridge {
     while (true) {
       const loaded = await this.pageBulkRecovery.load();
       const cohort = loaded.cohorts[cohortID];
-      if (cohort === undefined || cohort.unresolved === undefined) return;
+      if (cohort === undefined) return;
       if (
         !(this.store.daemonFeatures ?? []).includes(PAGE_BULK_COHORT_V2_FEATURE)
       )
         return;
-      const index = cohort.unresolved.chunk_index;
+      const totalChunks = Math.ceil(cohort.cohort_total / 50);
+      if (cohort.next_chunk >= totalChunks) return;
+      let index: number;
+      if (cohort.unresolved === undefined) {
+        index = cohort.next_chunk;
+      } else {
+        if (cohort.next_chunk !== cohort.unresolved.chunk_index) return;
+        index = cohort.unresolved.chunk_index;
+      }
       const keys = chunkKeysFor(cohort, index);
-      const finalChunk = index === Math.ceil(cohort.cohort_total / 50) - 1;
+      const finalChunk = index === totalChunks - 1;
+      let unresolved = cohort.unresolved;
+      if (unresolved === undefined || unresolved.chunk_index !== index) {
+        const requestID = this.correlation.createRequestID();
+        const digest = await pageBulkPayloadDigest({
+          scan_id: cohort.scan_id,
+          cohort_id: cohort.cohort_id,
+          source: cohort.source,
+          cohort_total: cohort.cohort_total,
+          chunk_index: index,
+          final_chunk: finalChunk,
+          canonical_keys: keys,
+        });
+        unresolved = {
+          request_id: requestID,
+          chunk_index: index,
+          payload_digest: digest,
+        };
+        try {
+          await this.pageBulkRecovery.put({
+            ...cohort,
+            next_chunk: index,
+            unresolved,
+            updated_at: new Date(this.deps.now()).toISOString(),
+          });
+        } catch {
+          return;
+        }
+      }
       const result = await this.requestCorrelated("page_bulk_submit_v2_request", {
         scan_id: cohort.scan_id,
         cohort_id: cohort.cohort_id,
@@ -12780,7 +12816,7 @@ export class Bridge {
         chunk_index: index,
         final_chunk: finalChunk,
         canonical_keys: keys,
-      }, { requestID: cohort.unresolved.request_id });
+      }, { requestID: unresolved.request_id });
       if (
         result.kind !== "response" ||
         result.payload === undefined ||
@@ -12789,7 +12825,7 @@ export class Bridge {
         return;
       const payload = result.payload;
       if (
-        payload["request_id"] !== cohort.unresolved.request_id ||
+        payload["request_id"] !== unresolved.request_id ||
         payload["scan_id"] !== cohort.scan_id ||
         payload["cohort_id"] !== cohort.cohort_id ||
         payload["chunk_index"] !== index ||
@@ -12797,11 +12833,12 @@ export class Bridge {
       )
         return;
       let applied = false;
+      const sendID = unresolved.request_id;
       try {
         await this.pageBulkRecovery.update(cohortID, (current) => {
           if (
             current.next_chunk !== index ||
-            current.unresolved?.request_id !== cohort.unresolved?.request_id
+            current.unresolved?.request_id !== sendID
           )
             return current;
           applied = true;

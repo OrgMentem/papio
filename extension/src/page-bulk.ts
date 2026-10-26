@@ -717,17 +717,28 @@ function render(): void {
 // -----------------------------------------------------------------------
 
 
-async function loadGrabStatus(): Promise<void> {
+async function loadGrabStatus(requestGeneration: number): Promise<void> {
   const grabRow = state.rows.find((row) => row.kind === "pdf_grab" && row.grabID !== null);
-  if (grabRow?.grabID === null || grabRow === undefined) return;
+  if (grabRow === undefined || grabRow.grabID === null) return;
+  const requestGrabID: string = grabRow.grabID;
+  // A rescan replaces the rows outright while an earlier grab-status RPC is
+  // still in flight. The document generation names the snapshot and the grab
+  // id names the grab within it; a reply for any other pair is stale and must
+  // not overwrite the current grab's state.
+  const isCurrent = (): boolean =>
+    state.snapshot !== null &&
+    state.snapshot.documentGeneration === requestGeneration &&
+    state.rows.some((row) => row.kind === "pdf_grab" && row.grabID === requestGrabID);
   let response: unknown;
   try {
-    response = await runtimeMessage("papio.pageBulk.grabStatus", { grab_id: grabRow.grabID });
+    response = await runtimeMessage("papio.pageBulk.grabStatus", { grab_id: requestGrabID });
   } catch (error) {
+    if (!isCurrent()) return;
     state.grabState = "identifying";
     state.grabDetail = thrownErrorMessage(error);
     return;
   }
+  if (!isCurrent()) return;
   if (!isRecord(response) || response["ok"] !== true) {
     state.grabState = "identifying";
     state.grabDetail = errorFromResponse(response);
@@ -750,7 +761,7 @@ async function loadGrabStatus(): Promise<void> {
     state.grabDetail = typeof response["detail"] === "string" ? response["detail"] : "The PDF grab download was abandoned";
     return;
   }
-  state.grabID = typeof response["grab_id"] === "string" ? response["grab_id"] : grabRow.grabID;
+  state.grabID = typeof response["grab_id"] === "string" ? response["grab_id"] : requestGrabID;
   state.grabState = durable;
   state.grabDetail = typeof response["detail"] === "string" ? response["detail"] : null;
 }
@@ -773,9 +784,11 @@ async function loadStatus(): Promise<void> {
   if (state.snapshot === null) return;
   statusRetryPending = false;
   const requestGeneration = state.snapshot.documentGeneration;
+  const requestSnapshot: WorkspaceSnapshot = state.snapshot;
   state.statusError = null;
   render();
-  await loadGrabStatus();
+  await loadGrabStatus(requestGeneration);
+  if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;
   if (state.grabDetail === CONNECTION_LOST_COPY) {
     state.statusError = CONNECTION_LOST_COPY;
     scheduleStatusRetry(requestGeneration);
@@ -783,6 +796,7 @@ async function loadStatus(): Promise<void> {
     return;
   }
   if (state.rows.length === 0 || state.rows.every((row) => row.kind === "pdf_grab")) {
+    if (state.snapshot.documentGeneration !== requestGeneration) return;
     state.statusLoaded = true;
     render();
     return;
@@ -790,12 +804,14 @@ async function loadStatus(): Promise<void> {
   const identifiers: PageBulkIdentifier[] = state.rows
     .filter((row): row is RowState & { identifier: DetectedPaper["identifier"] } => row.kind === "identifier" && row.identifier !== null)
     .map((row) => ({ local_id: row.localId, kind: row.identifier.kind, value: row.identifier.value }));
+  const requestScanID = requestSnapshot.scanId;
+  const requestHint = requestSnapshot.renderedRecordCountHint;
   let response: unknown;
   try {
     response = await runtimeMessage("papio.pageBulk.status", {
-      scan_id: state.snapshot.scanId,
+      scan_id: requestScanID,
       identifiers,
-      ...(state.snapshot.renderedRecordCountHint !== null ? { rendered_record_count_hint: state.snapshot.renderedRecordCountHint } : {}),
+      ...(requestHint !== null ? { rendered_record_count_hint: requestHint } : {}),
     });
   } catch (error) {
     if (state.snapshot === null || state.snapshot.documentGeneration !== requestGeneration) return;

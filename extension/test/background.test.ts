@@ -52,6 +52,11 @@ import {
   type PageBulkSnapshot,
 } from "../src/page-scan";
 import {
+  chunkKeysFor,
+  pageBulkPayloadDigest,
+  PageBulkCohortRecovery,
+} from "../src/page-bulk-recovery";
+import {
   planExecution,
   planGeneric,
   type GenericCandidate,
@@ -16584,6 +16589,234 @@ test("papio.pageBulk.submit happy dispatch forwards the request to the bridge an
   });
   expect(received).toEqual(request);
 });
+
+test("a page-bulk v2 resume that stopped between a commit and the next put sends every remaining chunk", async () => {
+  const h = makeHarness();
+  h.backend.store = { ...h.backend.store, daemonFeatures: ["page_bulk_cohort_v2"] };
+  const total = 130;
+  const keys = Array.from({ length: total }, (_, index) => `work:resume-${index}`);
+  const cohortID = "cohort_resume_0001";
+  const source = { kind: "browser_page" as const, origin: "https://scholar.example.edu", detector: "generic-identifiers/1" };
+  const values: Record<string, unknown> = {};
+  const storage = {
+    async get(key: string): Promise<Record<string, unknown>> {
+      return key in values ? { [key]: values[key] } : {};
+    },
+    async set(value: Record<string, unknown>): Promise<void> {
+      Object.assign(values, value);
+    },
+  };
+  const recovery = new PageBulkCohortRecovery(storage, () => h.clock.now);
+  // Chunk 0 already committed; the worker stopped before minting the
+  // unresolved record for chunk 1. The old resume read this state and
+  // returned without sending anything.
+  await recovery.replace({
+    version: 1,
+    cohorts: {
+      [cohortID]: {
+        cohort_id: cohortID,
+        scan_id: "scan-1",
+        source,
+        cohort_total: total,
+        canonical_keys: keys,
+        next_chunk: 1,
+        updated_at: new Date(h.clock.now).toISOString(),
+      },
+    },
+  });
+  const sent: { chunk: number; requestID: string; final: boolean }[] = [];
+  h.deps.pageBulkRecovery = recovery;
+  // A new worker over the same durable recovery storage, as after a
+  // native-port drop or worker death. The restart helper rebinds the live
+  // port accessor, so hello_ack on the restarted harness reaches the new
+  // bridge and fires its resume.
+  const restarted = restartWorker(h);
+  restarted.bridge.requestPageBulkSubmit = async () => {
+    throw new Error("submit path must not run during a resume test");
+  };
+  restarted.bridge.requestCorrelated = (async (...args: unknown[]) => {
+    const payload = args[1] as Record<string, unknown>;
+    const options = args[2] as { requestID?: string } | undefined;
+    // The real correlation layer injects options.requestID as the wire
+    // request_id; the stub must echo it the same way or the resume's
+    // request_id validation fails and the loop stops after one chunk.
+    const wireID = options?.requestID ?? (payload["request_id"] as string);
+    const chunk = payload["chunk_index"] as number;
+    sent.push({ chunk, requestID: wireID, final: payload["final_chunk"] as boolean });
+    const replyKeys = chunkKeysFor({ canonical_keys: keys }, chunk);
+    expect(payload["cohort_id"]).toBe(cohortID);
+    expect(payload["canonical_keys"]).toEqual(replyKeys);
+    return {
+      kind: "response",
+      payload: {
+        request_id: wireID,
+        scan_id: "scan-1",
+        cohort_id: cohortID,
+        chunk_index: chunk,
+        final_chunk: payload["final_chunk"],
+        batch_id: "batch_resume_1",
+        submitted: replyKeys.length,
+        joined: 0,
+        already_owned: 0,
+        invalid: 0,
+      },
+    };
+  }) as typeof restarted.bridge.requestCorrelated;
+  await restarted.bridge.start();
+  const timersBefore = restarted.timers.length;
+  await restarted.port.inbound(
+    helloAck({ daemon_version: CURRENT_DAEMON, features: ["page_bulk_cohort_v2"] }),
+  );
+  // hello_ack schedules the resume off-chain via setTimeout(0); the harness
+  // queues timers instead of firing them, so drain the new 0ms timers to
+  // actually run the resume, then settle the floating promise chain.
+  const resumeTimers = restarted.timers.slice(timersBefore).filter((timer) => timer.ms === 0);
+  expect(resumeTimers.length).toBeGreaterThan(0);
+  for (const timer of resumeTimers) await timer.fn();
+  // The resume's chunk digest goes through crypto.subtle, which needs real
+  // event-loop turns that the microtask-only settle() cannot provide. This
+  // poll is the allowed integration-test exception: it waits on the
+  // async digest chain, not a guessed debounce delay.
+  for (let attempt = 0; attempt < 100 && sent.length < 2; attempt += 1) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 5);
+    await promise;
+  }
+  // Chunk 1 (50 keys) and the final chunk 2 (30 keys) both go out with
+  // distinct request ids; the final commit removes the recovery entry.
+  expect(sent.map((entry) => entry.chunk)).toEqual([1, 2]);
+  expect(new Set(sent.map((entry) => entry.requestID)).size).toBe(2);
+  expect(sent.at(-1)?.final).toBe(true);
+  const remaining = await recovery.load();
+  expect(remaining.cohorts[cohortID]).toBeUndefined();
+  const digests = await Promise.all(
+    sent.map((entry) =>
+      pageBulkPayloadDigest({
+        scan_id: "scan-1",
+        cohort_id: cohortID,
+        source,
+        cohort_total: total,
+        chunk_index: entry.chunk,
+        final_chunk: entry.final,
+        canonical_keys: chunkKeysFor({ canonical_keys: keys }, entry.chunk),
+      }),
+    ),
+  );
+  expect(digests).toHaveLength(2);
+});
+
+test.each(["complete", "refused"] as const)(
+  "page-bulk v2 replays its persisted unresolved request and resumes the remaining chunks: %s",
+  async (outcome) => {
+    const h = makeHarness();
+    const cohortID = "cohort_resume_unresolved";
+    const requestID = "request_persisted_chunk_1";
+    const keys = Array.from({ length: 180 }, (_, index) => `work:unresolved-${index}`);
+    const source = {
+      kind: "browser_page" as const,
+      origin: "https://scholar.example.edu",
+      detector: "generic-identifiers/1",
+    };
+    const values: Record<string, unknown> = {};
+    const recovery = new PageBulkCohortRecovery({
+      async get(key) {
+        return key in values ? { [key]: structuredClone(values[key]) } : {};
+      },
+      async set(value) {
+        Object.assign(values, structuredClone(value));
+      },
+    }, () => h.clock.now);
+    await recovery.put({
+      cohort_id: cohortID,
+      scan_id: "scan-unresolved",
+      source,
+      cohort_total: keys.length,
+      canonical_keys: keys,
+      next_chunk: 1,
+      unresolved: {
+        request_id: requestID,
+        chunk_index: 1,
+        payload_digest: await pageBulkPayloadDigest({
+          scan_id: "scan-unresolved",
+          cohort_id: cohortID,
+          source,
+          cohort_total: keys.length,
+          chunk_index: 1,
+          final_chunk: false,
+          canonical_keys: keys.slice(50, 100),
+        }),
+      },
+      updated_at: new Date(h.clock.now).toISOString(),
+    });
+    h.deps.pageBulkRecovery = recovery;
+    const restarted = restartWorker(h);
+    await restarted.bridge.start();
+    await restarted.port.inbound(helloAck({
+      daemon_version: CURRENT_DAEMON,
+      features: ["page_bulk_cohort_v2"],
+    }));
+    const sent: { chunk: number; requestID: string; keys: string[]; final: boolean }[] = [];
+    restarted.bridge.requestCorrelated = async (kind, payload, options) => {
+      expect(kind).toBe("page_bulk_submit_v2_request");
+      const chunk = payload["chunk_index"] as number;
+      const wireID = options?.requestID;
+      expect(typeof wireID).toBe("string");
+      if (wireID === undefined) throw new Error("missing durable request id");
+      const persisted = (await recovery.load()).cohorts[cohortID];
+      expect(persisted?.next_chunk).toBe(chunk);
+      expect(persisted?.unresolved?.request_id).toBe(wireID);
+      expect(payload["canonical_keys"]).toEqual(keys.slice(chunk * 50, (chunk + 1) * 50));
+      sent.push({
+        chunk,
+        requestID: wireID,
+        keys: payload["canonical_keys"] as string[],
+        final: payload["final_chunk"] as boolean,
+      });
+      if (outcome === "refused" && chunk === 2) {
+        return { kind: "response", code: "cohort_conflict", message: "Cohort rejected" };
+      }
+      return {
+        kind: "response",
+        payload: {
+          request_id: wireID,
+          scan_id: "scan-unresolved",
+          cohort_id: cohortID,
+          chunk_index: chunk,
+          final_chunk: payload["final_chunk"],
+          batch_id: "batch_unresolved",
+          submitted: (payload["canonical_keys"] as string[]).length,
+          joined: 0,
+          already_owned: 0,
+          invalid: 0,
+        },
+      };
+    };
+    // Await the whole recovery pass, including crypto.subtle and the final
+    // storage commit. The hello timer remains queued in this harness.
+    // Expose the concrete bridge's private recovery pass as a test seam.
+    const internals = restarted.bridge as unknown as {
+      resumePageBulkCohort(id: string): Promise<void>;
+    };
+    await internals.resumePageBulkCohort(cohortID);
+
+    expect(sent.map((entry) => entry.chunk)).toEqual(outcome === "complete" ? [1, 2, 3] : [1, 2]);
+    expect(sent[0]?.requestID).toBe(requestID);
+    expect(new Set(sent.map((entry) => entry.requestID)).size).toBe(sent.length);
+    const remaining = (await recovery.load()).cohorts[cohortID];
+    if (outcome === "complete") {
+      expect(sent.flatMap((entry) => entry.keys)).toEqual(keys.slice(50));
+      expect(sent.map((entry) => entry.final)).toEqual([false, false, true]);
+      expect(remaining).toBeUndefined();
+    } else {
+      expect(remaining).toMatchObject({
+        canonical_keys: keys,
+        next_chunk: 2,
+        unresolved: { request_id: sent[1]!.requestID, chunk_index: 2 },
+      });
+      expect(sent.every((entry) => !entry.final)).toBe(true);
+    }
+  },
+);
 
 test("papio.pageBulk.grabPdf routes a steering grab through the native port and identifies its download", async () => {
   const h = makeHarness();
